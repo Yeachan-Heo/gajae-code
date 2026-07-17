@@ -5,6 +5,7 @@ import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@gajae
 import { $env, sanitizeText } from "@gajae-code/utils";
 import { type AppKeybinding, KEYBINDINGS } from "../../config/keybindings";
 import { isSettingsInitialized, settings } from "../../config/settings";
+import { normalizeBusyPromptMode } from "../../config/settings-schema";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, parseSkillInvocations } from "../../extensibility/skills";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
@@ -677,6 +678,14 @@ export class InputController {
 				return true;
 			});
 		}
+		for (const key of this.ctx.keybindings.getKeys("app.message.oppositeBusyMode")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				if (!this.ctx.session.isStreaming || this.ctx.session.isCompacting) return false;
+				if (!this.ctx.editor.getText().trim()) return false;
+				void this.handleOppositeBusyPromptSubmit();
+				return true;
+			});
+		}
 		for (const key of this.ctx.keybindings.getKeys("app.stt.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
 				this.#executeAction("app.stt.toggle");
@@ -1252,7 +1261,7 @@ export class InputController {
 	 * completes (in submission order). Only consulted while streaming.
 	 */
 	#busyStreamingBehavior(): "steer" | "followUp" {
-		return this.ctx.settings.get("busyPromptMode") === "steer" ? "steer" : "followUp";
+		return normalizeBusyPromptMode(this.ctx.settings.get("busyPromptMode")) === "steer" ? "steer" : "followUp";
 	}
 
 	/**
@@ -1388,6 +1397,34 @@ export class InputController {
 	/** Send editor text explicitly as a queued next-turn message. */
 	async handleQueueSubmit(): Promise<void> {
 		return this.handleFollowUp();
+	}
+
+	/** Submit once using the opposite of the configured busy prompt mode. */
+	async handleOppositeBusyPromptSubmit(): Promise<void> {
+		const text = this.ctx.editor.getText().trim();
+		if (!text || !this.ctx.session.isStreaming || this.ctx.session.isCompacting) return;
+
+		const streamingBehavior =
+			normalizeBusyPromptMode(this.ctx.settings.get("busyPromptMode")) === "steer" ? "followUp" : "steer";
+		if (await this.#invokeSkillCommand(text, streamingBehavior)) return;
+
+		const pendingImages = this.ctx.pendingImages;
+		const images = this.#visiblePendingImagesForText(text) ?? [];
+		this.ctx.editor.addToHistory(text);
+		this.ctx.editor.setText("");
+		this.#clearPendingImagesIfOwnedBy(pendingImages);
+		await this.ctx.withLocalSubmission(
+			text,
+			() =>
+				this.ctx.session.prompt(text, {
+					streamingBehavior,
+					images: images.length > 0 ? images : undefined,
+					...(streamingBehavior === "followUp" ? { followUpQueuePolicy: "sequential" as const } : {}),
+				}),
+			{ imageCount: images.length },
+		);
+		this.ctx.updatePendingMessagesDisplay();
+		this.ctx.ui.requestRender();
 	}
 
 	restoreLatestQueuedMessageToEditor(): number {

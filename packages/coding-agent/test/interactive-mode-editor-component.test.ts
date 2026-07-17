@@ -16,7 +16,7 @@ import type {
 } from "../src/extensibility/extensions";
 import { CustomEditor } from "../src/modes/components/custom-editor";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
-import { InteractiveMode } from "../src/modes/interactive-mode";
+import { DEFAULT_COMPOSER_PLACEHOLDER, InteractiveMode } from "../src/modes/interactive-mode";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { associateSessionMessageEntryId, type SessionContext, SessionManager } from "../src/session/session-manager";
@@ -420,10 +420,6 @@ describe("InteractiveMode.setEditorComponent", () => {
 				.anchors.some(anchor => anchor?.id === `${liveId}:content:0:text`),
 		).toBe(true);
 	});
-	function expectedNewlineShortcutHint(): string {
-		const shortcut = process.platform === "win32" ? "Alt+Enter/Ctrl+J" : "Shift+Enter/Ctrl+J";
-		return `${shortcut}: New line`;
-	}
 
 	it("keeps the composer right border inside a trailing gutter for CJK input", () => {
 		mode.editor.focused = true;
@@ -444,31 +440,58 @@ describe("InteractiveMode.setEditorComponent", () => {
 		return `${shortcut}: Queue`;
 	}
 
-	it("shows busy steering and queueing hints only while work is active", () => {
-		let rendered = mode.editor.render(160).map(stripRenderControls).join("\n");
-		expect(rendered).toContain("Type your message...");
-		expect(rendered).toContain(expectedNewlineShortcutHint());
-		expect(rendered).toContain("Ctrl+C: Clear");
-		expect(rendered).toContain("Ctrl+R: Search history");
-		expect(rendered).toContain("Shift+Tab: Reasoning");
-		expect(rendered).not.toContain("Enter: Steer");
-		expect(rendered).not.toContain(expectedQueueShortcutHint());
+	function expectedOppositeBusyModeHint(action: "Steer" | "Queue"): string {
+		return process.platform === "darwin" ? ` · Command+Enter: ${action} once` : "";
+	}
+
+	function renderedPlaceholder(): string {
+		const line = mode.editor
+			.render(320)
+			.map(stripRenderControls)
+			.find(candidate => candidate.includes("Type your message..."));
+		if (!line) throw new Error("expected rendered composer placeholder");
+		const start = line.indexOf("Type your message...");
+		const end = line.lastIndexOf("│");
+		return line.slice(start, end > start ? end : undefined).trimEnd();
+	}
+
+	it("renders idle, streaming, and compaction composer placeholders with exact precedence", () => {
+		expect(renderedPlaceholder()).toBe(DEFAULT_COMPOSER_PLACEHOLDER);
 
 		(session.agent as unknown as { state: { isStreaming: boolean } }).state.isStreaming = true;
 		mode.updateEditorChrome();
 
-		rendered = mode.editor.render(160).map(stripRenderControls).join("\n");
-		expect(rendered).toContain("Type your message...");
-		expect(rendered).toContain("Enter: Steer");
-		expect(rendered).toContain(expectedQueueShortcutHint());
+		expect(renderedPlaceholder()).toBe(
+			`${DEFAULT_COMPOSER_PLACEHOLDER} · Enter: Steer · ${expectedQueueShortcutHint()}${expectedOppositeBusyModeHint("Queue")}`,
+		);
 
-		(session.agent as unknown as { state: { isStreaming: boolean } }).state.isStreaming = false;
+		mode.settings.set("busyPromptMode", "queue");
+		mode.updateEditorChrome();
+		expect(renderedPlaceholder()).toBe(
+			`${DEFAULT_COMPOSER_PLACEHOLDER} · Enter: Queue · ${expectedQueueShortcutHint()}${expectedOppositeBusyModeHint("Steer")}`,
+		);
+
+		(session.agent as unknown as { state: { isStreaming: boolean } }).state.isStreaming = true;
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => true });
+		mode.updateEditorChrome();
+		expect(renderedPlaceholder()).toBe(`${DEFAULT_COMPOSER_PLACEHOLDER} · Enter: Queue after compaction`);
+	});
+
+	it("renders a remapped queue chord and omits it when both queue bindings are disabled", () => {
+		(session.agent as unknown as { state: { isStreaming: boolean } }).state.isStreaming = true;
+		const getKeys = vi.spyOn(mode.keybindings, "getKeys").mockImplementation(action => {
+			if (action === "app.message.followUp") return ["ctrl+shift+q"];
+			if (action === "app.message.queue") return ["alt+q"];
+			return [];
+		});
 		mode.updateEditorChrome();
 
-		rendered = mode.editor.render(160).map(stripRenderControls).join("\n");
-		expect(rendered).toContain("Type your message...");
-		expect(rendered).not.toContain("Enter: Steer");
-		expect(rendered).not.toContain(expectedQueueShortcutHint());
+		const remappedHint = process.platform === "darwin" ? "Ctrl+Shift+Q: Queue" : "Alt+Q: Queue";
+		expect(renderedPlaceholder()).toBe(`${DEFAULT_COMPOSER_PLACEHOLDER} · Enter: Steer · ${remappedHint}`);
+
+		getKeys.mockReturnValue([]);
+		mode.updateEditorChrome();
+		expect(renderedPlaceholder()).toBe(`${DEFAULT_COMPOSER_PLACEHOLDER} · Enter: Steer`);
 	});
 
 	it("renders the composer directly below the status line without hook widgets", async () => {

@@ -42,6 +42,7 @@ Set an action to an empty array to disable it:
 | `app.editor.external` | `Ctrl+G` | Edit the draft in `$VISUAL` / `$EDITOR` |
 | `app.message.followUp` | _(none)_ | Optional remap for a follow-up message; `Ctrl+Enter` is reserved for editor newline |
 | `app.message.queue` | `Alt+Enter` (`Alt+Q` on darwin/win32) | Explicitly queue a message for the next turn |
+| `app.message.oppositeBusyMode` | `Command+Enter` (macOS) | Submit one message using the opposite of `busyPromptMode` |
 | `app.message.dequeue` | `Alt+Up` | Dequeue a queued message back into the editor |
 
 | `app.clipboard.copyLine` | `Alt+Shift+L` | Copy the current line |
@@ -51,7 +52,8 @@ Set an action to an empty array to disable it:
 
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
 
-On macOS and native Windows terminals, GJC defaults `app.message.queue` to `Alt+Q`; Windows Terminal and PowerShell commonly reserve `Alt+Enter` for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
+On macOS and native Windows terminals, GJC defaults `app.message.queue` to `Alt+Q`; other platforms use `Alt+Enter`. Windows Terminal and PowerShell commonly reserve `Alt+Enter` for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
+While the agent is streaming on macOS, `Command+Enter` submits the current message once using the opposite of `busyPromptMode`: configured `steer` queues that message, while configured `queue` steers it into the active turn. The shortcut is inactive while idle or compacting and is remappable through `app.message.oppositeBusyMode`.
 
 In the main GJC composer, plain `PageUp` / `PageDown` page the visible transcript viewport instead of browsing prompt history; use `Up` / `Down` or `Ctrl+R` for prompt history. Autocomplete and selector surfaces still use `PageUp` / `PageDown` for list paging while they have focus.
 
@@ -139,6 +141,7 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.editor.external` | ctrl+g | composer |
 | `app.message.followUp` | _(none)_ | composer |
 | `app.message.queue` | alt+q (darwin/win32) / alt+enter (linux) | composer |
+| `app.message.oppositeBusyMode` | super+enter (darwin) | composer |
 | `app.message.dequeue` | alt+up, alt+down | composer |
 | `app.clipboard.pasteImage` | ctrl+v (darwin/linux) / alt+v (win32) | composer |
 | `app.clipboard.copyLine` | alt+shift+l | composer |

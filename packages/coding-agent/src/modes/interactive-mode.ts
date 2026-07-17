@@ -33,6 +33,7 @@ import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import { type AppKeybinding, KeybindingsManager } from "../config/keybindings";
 import { isSettingsInitialized, type Settings, settings } from "../config/settings";
+import { normalizeBusyPromptMode } from "../config/settings-schema";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import type {
 	ExtensionUIContext,
@@ -178,6 +179,7 @@ const FRIENDLY_KEY_PARTS: Record<string, string> = {
 	enter: "Enter",
 	meta: process.platform === "darwin" ? "Command" : "Meta",
 	option: "Option",
+	super: process.platform === "darwin" ? "Command" : "Super",
 	shift: "Shift",
 };
 
@@ -1079,10 +1081,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
 	}
 
-	#isPromptDeliveryBusy(): boolean {
-		return this.session.isStreaming || this.session.isCompacting;
-	}
-
 	#getFirstKeyForAction(action: AppKeybinding): string | undefined {
 		return this.keybindings.getKeys(action)[0];
 	}
@@ -1095,13 +1093,28 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#getFirstKeyForAction(preferredAction) ?? this.#getFirstKeyForAction(fallbackAction);
 	}
 
+	#getOppositeBusyModeShortcut(): string | undefined {
+		return this.#getFirstKeyForAction("app.message.oppositeBusyMode");
+	}
+
 	#getComposerPlaceholder(): string {
-		if (!this.#isPromptDeliveryBusy()) return DEFAULT_COMPOSER_PLACEHOLDER;
-		const enterAction = this.settings.get("busyPromptMode") === "steer" ? "Steer" : "Queue";
-		const parts = [`Enter: ${enterAction}`];
-		const queueKey = this.#getMessageQueueShortcut();
-		if (queueKey) parts.push(`${formatShortcutForPlaceholder(queueKey)}: Queue`);
-		return `${DEFAULT_COMPOSER_PLACEHOLDER} · ${parts.join(" · ")}`;
+		if (this.session.isCompacting) {
+			return `${DEFAULT_COMPOSER_PLACEHOLDER} · Enter: Queue after compaction`;
+		}
+		if (this.session.isStreaming) {
+			const enterAction =
+				normalizeBusyPromptMode(this.settings.get("busyPromptMode")) === "steer" ? "Steer" : "Queue";
+			const parts = [`Enter: ${enterAction}`];
+			const queueKey = this.#getMessageQueueShortcut();
+			if (queueKey) parts.push(`${formatShortcutForPlaceholder(queueKey)}: Queue`);
+			const oppositeKey = this.#getOppositeBusyModeShortcut();
+			if (oppositeKey) {
+				const oppositeAction = enterAction === "Steer" ? "Queue" : "Steer";
+				parts.push(`${formatShortcutForPlaceholder(oppositeKey)}: ${oppositeAction} once`);
+			}
+			return `${DEFAULT_COMPOSER_PLACEHOLDER} · ${parts.join(" · ")}`;
+		}
+		return DEFAULT_COMPOSER_PLACEHOLDER;
 	}
 
 	#getWelcomeReservedRows(width: number): number {

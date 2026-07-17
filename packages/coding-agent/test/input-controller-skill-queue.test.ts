@@ -85,6 +85,7 @@ function createStubInputControllerContext(opts: {
 	skillCommands: Map<string, Skill>;
 	isStreaming: boolean;
 	busyPromptMode?: "steer" | "queue";
+	isCompacting?: boolean;
 }) {
 	let editorText = "";
 	const editor: StubEditor = {
@@ -107,6 +108,8 @@ function createStubInputControllerContext(opts: {
 	const updatePendingMessagesDisplay = vi.fn();
 	const requestRender = vi.fn();
 	const showError = vi.fn();
+	const showStatus = vi.fn();
+	const queueCompactionMessage = vi.fn();
 
 	const ctx = {
 		editor,
@@ -115,7 +118,7 @@ function createStubInputControllerContext(opts: {
 		session: {
 			sessionId: "stub-session",
 			isStreaming: opts.isStreaming,
-			isCompacting: false,
+			isCompacting: opts.isCompacting ?? false,
 			isBashRunning: false,
 			isEvalRunning: false,
 			extensionRunner: undefined,
@@ -131,6 +134,7 @@ function createStubInputControllerContext(opts: {
 			getCwd: () => process.cwd(),
 		},
 		showError,
+		showStatus,
 		updatePendingMessagesDisplay,
 		// Defaults that InputController touches on submit but don't matter here.
 		isBashMode: false,
@@ -138,11 +142,21 @@ function createStubInputControllerContext(opts: {
 		pendingImages: [],
 		isBackgrounded: false,
 		compactionQueuedMessages: [],
+		queueCompactionMessage,
 		locallySubmittedUserSignatures: new Set<string>(),
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage, sendCustomMessage, prompt };
+	return {
+		ctx,
+		editor,
+		enqueueCustomMessageDisplay,
+		promptCustomMessage,
+		sendCustomMessage,
+		prompt,
+		queueCompactionMessage,
+		showStatus,
+	};
 }
 
 describe("InputController #invokeSkillCommand (E1-E3)", () => {
@@ -359,11 +373,9 @@ describe("InputController busyPromptMode + skill commands (issue #434)", () => {
 		vi.restoreAllMocks();
 	});
 
-	// Skill-command-specific routing. Free-text Enter routing and the Ctrl+Enter
-	// keybinding are covered in input-controller-busy-prompt-mode.test.ts; the
-	// E1 case above already covers the default (steer) skill path.
+	// Skill commands use the same busy-mode routing as free text.
 	it("queue: Enter on a skill command while streaming queues it as followUp", async () => {
-		const { ctx, editor, enqueueCustomMessageDisplay } = createStubInputControllerContext({
+		const { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage } = createStubInputControllerContext({
 			skillCommands,
 			isStreaming: true,
 			busyPromptMode: "queue",
@@ -374,6 +386,47 @@ describe("InputController busyPromptMode + skill commands (issue #434)", () => {
 		await editor.onSubmit?.("/skill:test-skill go");
 
 		expect(enqueueCustomMessageDisplay).toHaveBeenCalledWith("/skill:test-skill go", "followUp");
+		const call = promptCustomMessage.mock.calls[0];
+		expect(call?.[0].details.__pendingDisplayTag).toBe("sk-test-0");
+		expect(call?.[1]).toEqual({ streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
+	});
+
+	it("queues skill commands locally as steer during compaction", async () => {
+		const { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage, queueCompactionMessage } =
+			createStubInputControllerContext({
+				skillCommands,
+				isStreaming: true,
+				busyPromptMode: "queue",
+				isCompacting: true,
+			});
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("/skill:test-skill compact");
+
+		expect(queueCompactionMessage).toHaveBeenCalledWith("/skill:test-skill compact", "steer");
+		expect(enqueueCustomMessageDisplay).not.toHaveBeenCalled();
+		expect(promptCustomMessage).not.toHaveBeenCalled();
+	});
+
+	it("rejects image-bearing skill commands during compaction", async () => {
+		const { ctx, editor, promptCustomMessage, queueCompactionMessage, showStatus } = createStubInputControllerContext(
+			{
+				skillCommands,
+				isStreaming: true,
+				busyPromptMode: "queue",
+				isCompacting: true,
+			},
+		);
+		ctx.pendingImages = [{ type: "image", data: "image-data", mimeType: "image/png" }];
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("/skill:test-skill inspect [image 1]");
+
+		expect(showStatus).toHaveBeenCalledWith("Compaction in progress. Retry after it completes to send images.");
+		expect(queueCompactionMessage).not.toHaveBeenCalled();
+		expect(promptCustomMessage).not.toHaveBeenCalled();
 	});
 });
 

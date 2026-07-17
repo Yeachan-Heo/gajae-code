@@ -7,6 +7,8 @@ import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "@gajae-
 import { getCustomThemesDir, getProjectAgentDir, logger, Snowflake } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { withFileLock } from "../src/config/file-lock";
+import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
+import { getSettingDef } from "../src/modes/components/settings-defs";
 import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 
 describe("Settings", () => {
@@ -555,5 +557,43 @@ describe("Settings", () => {
 		const migration = schema?.properties?.session?.properties?.directoryMigration;
 		expect(migration?.default).toBe("copy-retain");
 		expect(migration?.enum).toEqual(["copy-retain", "disabled"]);
+	});
+
+	describe("busy prompt mode", () => {
+		it("derives the Interaction enum from the canonical schema", () => {
+			expect(SETTINGS_SCHEMA.busyPromptMode).toMatchObject({
+				type: "enum",
+				values: ["steer", "queue"],
+				default: "steer",
+				ui: { tab: "interaction" },
+			});
+			expect(getSettingDef("busyPromptMode")).toMatchObject({
+				path: "busyPromptMode",
+				type: "enum",
+				values: ["steer", "queue"],
+				tab: "interaction",
+			});
+		});
+		it("defaults invalid and absent values to steer while preserving queue", () => {
+			expect(Settings.isolated().get("busyPromptMode")).toBe("steer");
+			expect(Settings.isolated({ busyPromptMode: "queue" }).get("busyPromptMode")).toBe("queue");
+			expect(Settings.isolated({ busyPromptMode: "steer" }).get("busyPromptMode")).toBe("steer");
+			expect(Settings.isolated({ busyPromptMode: "later" }).get("busyPromptMode")).toBe("steer");
+			expect(Settings.isolated({ busyPromptMode: { mode: "queue" } }).get("busyPromptMode")).toBe("steer");
+		});
+
+		it("warns once for malformed persisted values without rewriting them", async () => {
+			await writeSettings({ busyPromptMode: { mode: "queue" } });
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("busyPromptMode")).toBe("steer");
+			expect(settings.get("busyPromptMode")).toBe("steer");
+			expect(warnSpy).toHaveBeenCalledTimes(1);
+			expect(warnSpy).toHaveBeenCalledWith("Settings: invalid busyPromptMode; using steer", {
+				value: { mode: "queue" },
+			});
+			expect(await readSettings()).toEqual({ busyPromptMode: { mode: "queue" } });
+		});
 	});
 });

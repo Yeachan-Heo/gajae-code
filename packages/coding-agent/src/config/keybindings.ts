@@ -32,6 +32,7 @@ interface AppKeybindings {
 	"app.editor.external": true;
 	"app.message.followUp": true;
 	"app.message.queue": true;
+	"app.message.oppositeBusyMode": true;
 	"app.message.dequeue": true;
 	"app.clipboard.pasteImage": true;
 	"app.clipboard.copyLine": true;
@@ -75,6 +76,10 @@ export function defaultMessageQueueKeysForPlatform(platform: NodeJS.Platform = p
 
 export function defaultClipboardPasteImageKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId {
 	return platform === "win32" ? "alt+v" : "ctrl+v";
+}
+
+export function defaultOppositeBusyModeKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId[] {
+	return platform === "darwin" ? ["super+enter"] : [];
 }
 
 /**
@@ -140,7 +145,11 @@ export const KEYBINDINGS = {
 	},
 	"app.message.followUp": {
 		defaultKeys: [],
-		description: "Send follow-up message (no default; Ctrl+Enter submits)",
+		description: "Send follow-up message (no default; Ctrl+Enter remains editor newline unless remapped)",
+	},
+	"app.message.oppositeBusyMode": {
+		defaultKeys: defaultOppositeBusyModeKeysForPlatform(),
+		description: "Submit once using the opposite busy prompt mode",
 	},
 	"app.message.queue": {
 		defaultKeys: defaultMessageQueueKeysForPlatform(),
