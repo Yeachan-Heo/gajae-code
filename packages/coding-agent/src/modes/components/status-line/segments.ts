@@ -8,6 +8,7 @@ import { shortenPath } from "../../../tools/render-utils";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
 import { getContextUsageLevel, getContextUsageThemeColor } from "./context-thresholds";
+import { getPetColor, getPetFrame, resolvePetMood } from "./pet";
 import type { RenderedSegment, SegmentContext, StatusLineSegment, StatusLineSegmentId } from "./types";
 
 export type { SegmentContext } from "./types";
@@ -75,6 +76,22 @@ const legacyPiSegment: StatusLineSegment = {
 	id: "pi",
 	render(_ctx) {
 		return gajaeSegment.render(_ctx);
+	},
+};
+
+// Mood-reactive gajae pet: alarmed on latched job failures, claw-wiggling
+// while the agent streams, tired under heavy context pressure, chill otherwise.
+const petSegment: StatusLineSegment = {
+	id: "pet",
+	render(ctx) {
+		const mood = resolvePetMood({
+			jobsFailed: ctx.jobs.worstState === "failed",
+			streaming: ctx.session.isStreaming === true,
+			// Unknown context usage (null) counts as no pressure.
+			contextLevel: getContextUsageLevel(ctx.contextPercent ?? 0, ctx.contextWindow),
+		});
+		const frame = getPetFrame(mood, theme.getSymbolPreset(), Date.now());
+		return { content: theme.fg(getPetColor(mood), frame), visible: true };
 	},
 };
 
@@ -579,6 +596,7 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	cache_write: cacheWriteSegment,
 	session_name: sessionNameSegment,
 	usage: usageSegment,
+	pet: petSegment,
 };
 
 export function renderSegment(id: StatusLineSegmentId, ctx: SegmentContext): RenderedSegment {
