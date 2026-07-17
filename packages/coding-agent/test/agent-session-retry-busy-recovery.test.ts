@@ -1,6 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { scheduler } from "node:timers/promises";
 import { Agent, AgentBusyError } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
@@ -12,16 +11,6 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { TempDir } from "@gajae-code/utils";
 
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
-
-function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-	// Uses a real timer (not the mocked scheduler.wait) so it survives the
-	// scheduler.wait spy that skips retry backoff.
-	let timer: NodeJS.Timeout;
-	const timeout = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(new Error(`TIMEOUT (session wedged busy): ${label}`)), ms);
-	});
-	return Promise.race([p, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
-}
 
 /**
  * Regression: a retryable provider error schedules an auto-retry `continue()`
@@ -53,7 +42,6 @@ describe("AgentSession auto-retry busy recovery", () => {
 		}
 		authStorage.close();
 		tempDir.removeSync();
-		vi.restoreAllMocks();
 	});
 
 	it("does not wedge the session busy when the scheduled retry continue throws", async () => {
@@ -98,15 +86,14 @@ describe("AgentSession auto-retry busy recovery", () => {
 			modelRegistry,
 		});
 
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
 
 		// The owning prompt must settle instead of hanging on the dead retry promise.
-		await withTimeout(session.prompt("first message"), 5_000, "prompt(first)");
-		await withTimeout(session.waitForIdle(), 5_000, "waitForIdle");
+		await session.prompt("first message");
+		await session.waitForIdle();
 
 		expect(continueFailed).toBe(true);
 		expect(session.isStreaming).toBe(false);
@@ -116,7 +103,7 @@ describe("AgentSession auto-retry busy recovery", () => {
 
 		// The actual user-visible symptom: subsequent prompts must work, not throw
 		// AgentBusyError forever.
-		await withTimeout(session.prompt("second message"), 5_000, "prompt(second)");
+		await session.prompt("second message");
 		expect(session.isStreaming).toBe(false);
 	});
 
@@ -157,17 +144,16 @@ describe("AgentSession auto-retry busy recovery", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
-		await withTimeout(session.prompt("first message"), 5_000, "prompt(first)");
-		await withTimeout(session.waitForIdle(), 5_000, "waitForIdle(first)");
+		await session.prompt("first message");
+		await session.waitForIdle();
 		expect(session.isStreaming).toBe(false);
 		expect(session.isRetrying).toBe(false);
 
 		// A fresh prompt whose first turn errors retryably must auto-retry and recover,
 		// proving the abandoned retry did not poison the retry machinery.
-		await withTimeout(session.prompt("second message"), 5_000, "prompt(second)");
-		await withTimeout(session.waitForIdle(), 5_000, "waitForIdle(second)");
+		await session.prompt("second message");
+		await session.waitForIdle();
 		expect(session.isStreaming).toBe(false);
 		expect(session.isRetrying).toBe(false);
 		const last = session.agent.state.messages.at(-1) as AssistantMessage | undefined;
@@ -208,14 +194,13 @@ describe("AgentSession auto-retry busy recovery", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
 		const busyErrors: string[] = [];
 		const tryPrompt = async (text: string) => {
-			await withTimeout(session!.prompt(text), 5_000, `prompt(${text})`).catch((err: Error) => {
+			await session!.prompt(text).catch((err: Error) => {
 				if (err instanceof AgentBusyError) busyErrors.push(err.message);
 			});
-			await withTimeout(session!.waitForIdle(), 5_000, `waitForIdle(${text})`);
+			await session!.waitForIdle();
 		};
 
 		await tryPrompt("first message");
@@ -297,15 +282,14 @@ describe("AgentSession auto-retry busy recovery", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
 
-		await withTimeout(session.prompt("first message"), 5_000, "prompt(first)");
-		await withTimeout(session.waitForIdle(), 5_000, "waitForIdle");
+		await session.prompt("first message");
+		await session.waitForIdle();
 
 		expect(recovered).toBe(true);
 		expect(session.isStreaming).toBe(false);
@@ -313,7 +297,7 @@ describe("AgentSession auto-retry busy recovery", () => {
 		// Retry success is surfaced exactly once (resolved at message_end, idempotent at agent_end).
 		expect(retryEndEvents.filter(event => event.success === true)).toHaveLength(1);
 
-		await withTimeout(session.prompt("second message"), 5_000, "prompt(second)");
+		await session.prompt("second message");
 		expect(session.isStreaming).toBe(false);
 	});
 });

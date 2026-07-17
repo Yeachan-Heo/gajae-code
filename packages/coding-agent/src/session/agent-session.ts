@@ -460,6 +460,8 @@ export interface AgentSessionConfig {
 	slashCommands?: FileSlashCommand[];
 	/** Extension runner (created in main.ts with wrapped tools) */
 	extensionRunner?: ExtensionRunner;
+	/** Override first-party worker integration dispatch for embedded hosts and deterministic lifecycle tests. */
+	workerIntegrationRequest?: () => Promise<void>;
 
 	/** Loaded skills (already discovered by SDK) */
 	skills?: Skill[];
@@ -1119,10 +1121,15 @@ export class WorkerIntegrationRequestScheduler {
 
 	#start(): void {
 		this.#pending = false;
-		// Isolate request rejections so flush() can never reject or deadlock: the
-		// request is expected to handle/log its own errors, but a throwing generic
-		// request must still clear #inFlight and drain any trailing pending run.
-		this.#inFlight = this.request()
+		// Invoke synchronously so enqueue retains its existing single-flight timing,
+		// while converting a synchronous generic request throw into a settled promise.
+		let request: Promise<void>;
+		try {
+			request = this.request();
+		} catch {
+			request = Promise.resolve();
+		}
+		this.#inFlight = request
 			.catch(() => {})
 			.finally(() => {
 				this.#inFlight = undefined;
@@ -1477,11 +1484,8 @@ export class AgentSession {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 
 	#turnIndex = 0;
-	#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(async () => {
-		await requestGjcWorkerIntegrationAttempt(this.sessionManager.getCwd(), process.env).catch(error => {
-			logger.warn("GJC team worker integration request failed", { error: String(error) });
-		});
-	});
+	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler;
+	#workerIntegrationRequestedForTurn = false;
 	// First-party internal before-agent-start contributors (not user hooks).
 	#beforeAgentStartContributors: BeforeAgentStartContributor[] = [];
 
@@ -1622,6 +1626,11 @@ export class AgentSession {
 	// the successor or proves it cannot. Holds prevent a false idle event while
 	// preserving the predecessor for cancellation and preflight failures.
 	#pendingAgentEndContinuationHolds = new Map<symbol, AgentSessionEvent>();
+	#sessionSettlementPromise: Promise<void> | undefined;
+	#sessionSettlementResolve: (() => void) | undefined;
+	#agentEndPublicationInFlight = 0;
+	#agentEndPublicationPromise: Promise<void> = Promise.resolve();
+	#agentEndHandlingPromise: Promise<void> = Promise.resolve();
 
 	#obfuscator: SecretObfuscator | undefined;
 	#checkpointState: CheckpointState | undefined = undefined;
@@ -1800,6 +1809,7 @@ export class AgentSession {
 				if (candidatePending === pending) this.#pendingAgentEndContinuationHolds.delete(candidate);
 			}
 		}
+		this.#resolveSessionSettlement();
 		return pending;
 	}
 
@@ -1827,6 +1837,35 @@ export class AgentSession {
 		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
 	}
 
+	#isSessionSettlementPending(): boolean {
+		return (
+			this.#promptInFlightCount > 0 ||
+			this.#agentEventHandlersInFlight > 0 ||
+			this.#agentEndPublicationInFlight > 0 ||
+			this.#pendingAgentEndContinuationHolds.size > 0 ||
+			this.#pendingAgentEndEmit !== undefined
+		);
+	}
+
+	#resolveSessionSettlement(): void {
+		if (this.#isSessionSettlementPending() || !this.#sessionSettlementResolve) return;
+		const resolve = this.#sessionSettlementResolve;
+		this.#sessionSettlementResolve = undefined;
+		this.#sessionSettlementPromise = undefined;
+		resolve();
+	}
+
+	async #waitForSessionSettlement(): Promise<void> {
+		while (this.#isSessionSettlementPending()) {
+			if (!this.#sessionSettlementPromise) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				this.#sessionSettlementPromise = promise;
+				this.#sessionSettlementResolve = resolve;
+			}
+			await this.#sessionSettlementPromise;
+		}
+	}
+
 	#endInFlight(): void {
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
@@ -1840,25 +1879,50 @@ export class AgentSession {
 		if (
 			this.#promptInFlightCount > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
-			this.#queuedExtensionEventCount > 0 ||
 			this.#pendingAgentEndContinuationHolds.size > 0
 		)
 			return;
 		const pending = this.#pendingAgentEndEmit;
-		if (!pending) return;
+		if (!pending) {
+			this.#resolveSessionSettlement();
+			return;
+		}
 		this.#pendingAgentEndEmit = undefined;
-		// Persist before notifying synchronous subscribers: a subscriber may start a
-		// successor prompt from agent_end, whose running state must serialize after
-		// this terminal boundary rather than be overwritten by it.
-		this.#persistRuntimeStateInBackground(pending);
-		this.#emit(pending);
-		void this.#queueExtensionEvent(pending);
+		this.#agentEndPublicationInFlight++;
+		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending);
+		void this.#agentEndPublicationPromise;
+	}
+
+	async #publishDeferredAgentEnd(pending: AgentSessionEvent): Promise<void> {
+		try {
+			// Worker integration is first-party lifecycle persistence, not an extension
+			// hook. Make it durable before publishing the terminal boundary while user
+			// extension delivery remains asynchronous.
+			await this.#flushWorkerIntegrationForAgentEnd();
+			// Persist before notifying synchronous subscribers: a subscriber may start a
+			// successor prompt from agent_end, whose running state must serialize after
+			// this terminal boundary rather than be overwritten by it.
+			this.#persistRuntimeStateInBackground(pending);
+			this.#emit(pending);
+			void this.#queueExtensionEvent(pending, undefined, true);
+		} finally {
+			this.#agentEndPublicationInFlight = Math.max(0, this.#agentEndPublicationInFlight - 1);
+			this.#resolveSessionSettlement();
+		}
 	}
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(
+			config.workerIntegrationRequest ??
+				(async () => {
+					await requestGjcWorkerIntegrationAttempt(this.sessionManager.getCwd(), process.env).catch(error => {
+						logger.warn("GJC team worker integration request failed", { error: String(error) });
+					});
+				}),
+		);
 		this.notificationSessionController = config.notificationSessionController;
 		this.taskDepth = config.taskDepth ?? 0;
 		// Register this session with the process-wide resource GC (idle/RSS browser-tab eviction
@@ -2582,10 +2646,14 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners */
+	/** Emit an event to all listeners without letting one subscriber poison lifecycle settlement. */
 	#emit(event: AgentSessionEvent): void {
-		for (const l of this.#eventListenerSnapshot) {
-			l(event);
+		for (const listener of this.#eventListenerSnapshot) {
+			try {
+				listener(event);
+			} catch (error) {
+				logger.warn("Agent session event subscriber failed", { event: event.type, error: String(error) });
+			}
 		}
 	}
 
@@ -2604,7 +2672,11 @@ export class AgentSession {
 
 	#queuedExtensionEvents: Promise<void> = Promise.resolve();
 
-	#queueExtensionEvent(event: AgentSessionEvent, turnGeneration?: number): Promise<void> {
+	#queueExtensionEvent(
+		event: AgentSessionEvent,
+		turnGeneration?: number,
+		workerIntegrationSettled = false,
+	): Promise<void> {
 		// Streaming events observed after turn_end belong to no live extension turn.
 		// Events already queued before that boundary must drain in FIFO order, unless
 		// a successor turn replaces their generation while a handler is still running.
@@ -2619,7 +2691,7 @@ export class AgentSession {
 			turnGeneration === undefined || turnGeneration === this.#extensionTurnGeneration;
 		const emit = async () => {
 			if (!belongsToCurrentTurn()) return;
-			await this.#emitExtensionEvent(event, belongsToCurrentTurn);
+			await this.#emitExtensionEvent(event, belongsToCurrentTurn, workerIntegrationSettled);
 		};
 		const queued = this.#queuedExtensionEvents.then(emit, emit);
 		this.#queuedExtensionEvents = queued.catch(() => {});
@@ -2632,6 +2704,8 @@ export class AgentSession {
 	}
 
 	#trackAgentEvent = async (event: AgentEvent): Promise<void> => {
+		const agentEndHandled = event.type === "agent_end" ? Promise.withResolvers<void>() : undefined;
+		if (agentEndHandled) this.#agentEndHandlingPromise = agentEndHandled.promise;
 		this.#agentEventHandlersInFlight++;
 		try {
 			await this.#handleAgentEvent(event);
@@ -2640,6 +2714,7 @@ export class AgentSession {
 		} finally {
 			this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
 			this.#flushPendingAgentEnd();
+			agentEndHandled?.resolve();
 		}
 	};
 
@@ -2670,6 +2745,12 @@ export class AgentSession {
 			}
 			return;
 		}
+		if (event.type === "turn_start") {
+			this.#workerIntegrationRequestedForTurn = false;
+		} else if (event.type === "turn_end" && !this.#workerIntegrationRequestedForTurn) {
+			this.#workerIntegrationRequestedForTurn = true;
+			this.#requestWorkerIntegrationAttempt();
+		}
 		// A maintenance agent_end is an internal checkpoint only while another
 		// continuation will follow. An aborted maintenance run is its terminal
 		// settlement and must reach public subscribers.
@@ -2681,10 +2762,7 @@ export class AgentSession {
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
 		// from abort while either barrier is active permits a successor to race the
 		// prior prompt's cleanup.
-		if (
-			event.type === "agent_end" &&
-			(this.#promptInFlightCount > 0 || this.#agentEventHandlersInFlight > 0 || this.#queuedExtensionEventCount > 0)
-		) {
+		if (event.type === "agent_end" && (this.#promptInFlightCount > 0 || this.#agentEventHandlersInFlight > 0)) {
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
@@ -4244,13 +4322,25 @@ export class AgentSession {
 		await this.#workerIntegrationScheduler.flush();
 	}
 
-	/** Emit extension events based on session events */
-	async #emitExtensionEvent(event: AgentSessionEvent, continueWhile?: () => boolean): Promise<void> {
-		if (event.type === "turn_end") {
+	async #flushWorkerIntegrationForAgentEnd(): Promise<void> {
+		if (!this.#workerIntegrationRequestedForTurn) {
 			this.#requestWorkerIntegrationAttempt();
 		}
-		if (event.type === "agent_end") {
+		try {
 			await this.#flushWorkerIntegrationAttempt();
+		} finally {
+			this.#workerIntegrationRequestedForTurn = false;
+		}
+	}
+
+	/** Emit extension events based on session events */
+	async #emitExtensionEvent(
+		event: AgentSessionEvent,
+		continueWhile?: () => boolean,
+		workerIntegrationSettled = false,
+	): Promise<void> {
+		if (event.type === "agent_end" && !workerIntegrationSettled) {
+			await this.#flushWorkerIntegrationForAgentEnd();
 		}
 		if (!this.#extensionRunner) return;
 		if (event.type === "agent_start") {
@@ -4524,6 +4614,8 @@ export class AgentSession {
 		]);
 		if (!disposeIdleSettled) this.agent.forceAbort("Session disposed");
 		await admissionClosed;
+		await this.#agentEndPublicationPromise;
+		await this.#queuedExtensionEvents;
 		this.#workflowGateEmitter?.fence?.();
 		this.#pendingBackgroundExchanges = [];
 		this.yieldQueue.clear();
@@ -4699,10 +4791,21 @@ export class AgentSession {
 		return this.agent.state.isStreaming || this.#promptInFlightCount > 0;
 	}
 
-	/** Wait until streaming and deferred recovery work are fully settled. */
+	/** Wait until streaming and session settlement work are fully settled. */
 	async waitForIdle(): Promise<void> {
-		await this.agent.waitForIdle();
-		await this.#waitForPostPromptRecovery();
+		while (true) {
+			await this.agent.waitForIdle();
+			await this.#waitForPostPromptRecovery();
+			await this.#waitForSessionSettlement();
+			if (
+				!this.agent.state.isStreaming &&
+				!this.#retryPromise &&
+				!this.#ttsrResumePromise &&
+				!this.#postPromptTasksPromise &&
+				!this.#isSessionSettlementPending()
+			)
+				return;
+		}
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
@@ -5842,6 +5945,7 @@ export class AgentSession {
 				);
 			}
 			this.#endInFlight();
+			await this.#waitForSessionSettlement();
 		}
 	}
 
@@ -6727,6 +6831,7 @@ export class AgentSession {
 			admissionLease?: SessionAdmissionLease;
 		},
 	): Promise<void> {
+		await this.#agentEndPublicationPromise;
 		this.#beginInFlight();
 		const predecessorAgentEndHold =
 			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
@@ -6975,6 +7080,12 @@ export class AgentSession {
 			}
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 			this.#endInFlight();
+			if (options?.skipPostPromptRecoveryWait) {
+				await this.#agentEndPublicationPromise;
+			} else {
+				await this.#agentEndHandlingPromise;
+				await this.#agentEndPublicationPromise;
+			}
 		}
 	}
 

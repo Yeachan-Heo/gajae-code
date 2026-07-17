@@ -60,11 +60,23 @@ describe("AgentSession steer-on-interrupt", () => {
 		return s.agent.state.messages.filter(m => m.role === "assistant").length;
 	}
 
+	async function promptAndWaitForAssistant(s: AgentSession, text: string): Promise<void> {
+		const assistantEnded = Promise.withResolvers<void>();
+		const unsubscribe = s.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "assistant") assistantEnded.resolve();
+		});
+		try {
+			await Promise.all([s.prompt(text), assistantEnded.promise]);
+			await s.waitForIdle();
+		} finally {
+			unsubscribe();
+		}
+	}
+
 	it("resumes queued steering after a user interrupt", async () => {
 		session = buildSession([{ content: ["first done"] }, { content: ["handled steering"] }]);
 
-		await session.prompt("first task");
-		await session.waitForIdle();
+		await promptAndWaitForAssistant(session, "first task");
 		expect(assistantCount(session)).toBe(1);
 
 		// User queues a steer, then interrupts.
@@ -82,8 +94,7 @@ describe("AgentSession steer-on-interrupt", () => {
 	it("delivers a steer queued while the agent is idle without a user interrupt", async () => {
 		session = buildSession([{ content: ["first done"] }, { content: ["handled steering"] }]);
 
-		await session.prompt("first task");
-		await session.waitForIdle();
+		await promptAndWaitForAssistant(session, "first task");
 		expect(assistantCount(session)).toBe(1);
 
 		// A steer lands while no live agent loop is running (the busy/unwind window
@@ -104,8 +115,7 @@ describe("AgentSession steer-on-interrupt", () => {
 	it("does not resume queued steering after a non-user abort", async () => {
 		session = buildSession([{ content: ["first done"] }, { content: ["should not run"] }]);
 
-		await session.prompt("first task");
-		await session.waitForIdle();
+		await promptAndWaitForAssistant(session, "first task");
 		expect(assistantCount(session)).toBe(1);
 
 		session.agent.steer(userMessage("queued steer"));

@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { scheduler } from "node:timers/promises";
 import { Agent, type AgentOptions } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
@@ -60,7 +59,6 @@ describe("AgentSession managed fallback cancellation completion", () => {
 		await session?.dispose();
 		authStorage.close();
 		tempDir.removeSync();
-		vi.restoreAllMocks();
 	});
 
 	function createSession(streamFn: AgentOptions["streamFn"]): void {
@@ -89,12 +87,16 @@ describe("AgentSession managed fallback cancellation completion", () => {
 
 	it("clears streaming state and emits one cancelled completion when aborted during an attempt", async () => {
 		const pending = new AssistantMessageEventStream();
-		createSession(() => pending);
+		const streamEntered = Promise.withResolvers<void>();
+		createSession(() => {
+			streamEntered.resolve();
+			return pending;
+		});
 		const requestTerminalSpy = vi.spyOn(session!.agent, "requestRunTerminal");
 		const events: AgentSessionEvent[] = [];
 		session!.subscribe(event => events.push(event));
 		const run = session!.prompt("abort active attempt");
-		for (let i = 0; i < 20 && session!.agent.activeRunId === undefined; i += 1) await Bun.sleep(1);
+		await streamEntered.promise;
 		expect(session!.agent.activeRunId).toBeDefined();
 		await session!.abort();
 		await run;
@@ -112,23 +114,29 @@ describe("AgentSession managed fallback cancellation completion", () => {
 			),
 		).toBe(false);
 		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "cancelled" });
+		requestTerminalSpy.mockRestore();
 	});
 
-	it("preserves an accepted completion when a subscriber aborts after its message_end", async () => {
+	it("waitForIdle flushes an accepted agent_end deferred by a subscriber abort", async () => {
 		createSession((model, context, options) =>
 			createMockModel({ responses: [{ content: ["accepted"] }] }).stream(model, context, options),
 		);
 		const events: AgentSessionEvent[] = [];
+		const messageEnd = Promise.withResolvers<void>();
 		let abort: Promise<void> | undefined;
 		session!.subscribe(event => {
 			events.push(event);
 			if (event.type === "message_end" && event.message.role === "assistant") {
 				abort ??= session!.abort();
+				messageEnd.resolve();
 			}
 		});
 
-		await session!.prompt("accept then abort");
+		const run = session!.prompt("accept then abort");
+		await messageEnd.promise;
+		await session!.waitForIdle();
 		await abort;
+		await run;
 		await session!.waitForIdle();
 
 		const agentEnds = events.filter(event => event.type === "agent_end");
@@ -171,19 +179,15 @@ describe("AgentSession managed fallback cancellation completion", () => {
 	});
 
 	it("clears streaming state and emits one cancelled completion when aborted during backoff", async () => {
-		let enteredBackoff!: () => void;
-		const backoff = new Promise<void>(resolve => {
-			enteredBackoff = resolve;
-		});
-		vi.spyOn(scheduler, "wait").mockImplementation(async (_delay, { signal }: { signal?: AbortSignal } = {}) => {
-			enteredBackoff();
-			await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
-		});
+		const backoff = Promise.withResolvers<void>();
 		createSession(model => failingStream(model));
 		const events: AgentSessionEvent[] = [];
-		session!.subscribe(event => events.push(event));
+		session!.subscribe(event => {
+			events.push(event);
+			if (event.type === "auto_retry_start") backoff.resolve();
+		});
 		const run = session!.prompt("abort fallback backoff");
-		await backoff;
+		await backoff.promise;
 		await session!.abort();
 		await run;
 		await session!.waitForIdle();

@@ -153,8 +153,7 @@ async function runContinuation(
 		});
 	}
 	harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [] });
-	await flush();
-	await Bun.sleep(0);
+	await harness.session.waitForIdle();
 	harness.mode.finishPendingSubmission(submission);
 }
 
@@ -275,7 +274,7 @@ describe("goal continuation repeated timeout guard", () => {
 		harness.session.agent.emitExternalEvent({ type: "agent_start" });
 		continuationTimers = [];
 		harness.session.agent.emitExternalEvent({ type: "agent_end", messages: [] });
-		await flush();
+		await harness.session.waitForIdle();
 		await runContinuation(harness, [timeout()]);
 		const next = harness.mode.getUserInput();
 		await advanceGoalContinuation();
