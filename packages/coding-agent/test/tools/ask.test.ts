@@ -2385,7 +2385,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		);
 
 		const gateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Timeline"] })),
 		};
 		await new AskTool(
@@ -2403,7 +2403,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 	it("emits deep-interview question gates by default and honors ralplan approval overrides", async () => {
 		const defaultGateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
 		};
 		await new AskTool(
@@ -2423,7 +2423,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		);
 
 		const ralplanGateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Approve execution via ultragoal"] })),
 		};
 		await new AskTool(
@@ -2452,10 +2452,10 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {
 		// Regression: a durable workflow-gate emitter now exists for every session and
-		// its isUnattended() is always true. Attended TUI asks must still use the local
+		// its supportsRemoteGateAnswers() is always true. Attended TUI asks must still use the local
 		// selector instead of stranding on emitGate() waiting for a remote responder.
 		const gateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["no"] })),
 		};
 		const select = vi.fn(async () => "yes");

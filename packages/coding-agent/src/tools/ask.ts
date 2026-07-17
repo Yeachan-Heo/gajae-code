@@ -759,12 +759,13 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		};
 		const gateEmitter = this.session.getWorkflowGateEmitter?.();
 		// A durable workflow-gate emitter now exists for every session, and its
-		// isUnattended() is always true, so it can no longer signal "no local UI".
-		// The workflow gate is only the headless (non-TUI) answer path: when a real
-		// interactive UI is present, prefer it — otherwise attended TUI asks would
-		// route to emitGate() and hang forever waiting on a remote responder.
+		// supportsRemoteGateAnswers() is always true, so it can no longer signal
+		// "no local UI". The workflow gate is only the headless (non-TUI) answer
+		// path: when a real interactive UI is present, prefer it — otherwise
+		// attended TUI asks would route to emitGate() and hang forever waiting on
+		// a remote responder.
 		const hasInteractiveUi = context?.hasUI === true && !!context.ui;
-		const canUseWorkflowGate = !hasInteractiveUi && gateEmitter?.isUnattended() === true;
+		const canUseWorkflowGate = !hasInteractiveUi && gateEmitter?.supportsRemoteGateAnswers() === true;
 		// Headless fallback: SDK workflow gates are the non-TUI answer path.
 		if (!canUseWorkflowGate && (!context?.hasUI || !context.ui)) {
 			context?.abort();

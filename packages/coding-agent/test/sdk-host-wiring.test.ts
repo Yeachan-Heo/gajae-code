@@ -3012,7 +3012,7 @@ test("SDK host omits direct workflow controls for a legacy workflow-gate emitter
 	dirs.push(cwd);
 	const sessionId = `legacy-workflow-gate-${Date.now()}`;
 	const legacyEmitter = {
-		isUnattended: () => true,
+		supportsRemoteGateAnswers: () => true,
 		emitGate: async () => undefined,
 		resolveGate: async () => ({
 			gate_id: "legacy-gate",

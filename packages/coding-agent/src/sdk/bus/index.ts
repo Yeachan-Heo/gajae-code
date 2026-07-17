@@ -3193,7 +3193,7 @@ export function createNotificationsExtension(
 				}
 				const gate = runtime?.workflowGate;
 				const workflowGateActive =
-					gate?.isUnattended?.() === true &&
+					gate?.supportsRemoteGateAnswers?.() === true &&
 					typeof gate.onGateEmitted === "function" &&
 					typeof gate.resolveGateFromNotification === "function";
 				const gateId = gatePresentations.routeFor(reply.id);
