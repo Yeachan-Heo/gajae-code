@@ -1,5 +1,4 @@
 import * as fsSync from "node:fs";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { logger, postmortem } from "@gajae-code/utils";
@@ -241,10 +240,8 @@ function writeStateFileSync(stateFile: string, payload: Record<string, unknown>)
 	fsSync.writeFileSync(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
 }
 
-async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
-	await fs.mkdir(path.dirname(stateFile), { recursive: true });
-	await Bun.write(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
-}
+
+const postmortemCleanupFence = new Set<string>();
 
 export async function persistCoordinatorRuntimeStateFromEvent(
 	event: RuntimeStateEvent,
@@ -252,10 +249,13 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 ): Promise<void> {
 	const stateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	if (!stateFile) return;
+	const stateFileKey = path.resolve(stateFile);
+	if (postmortemCleanupFence.has(stateFileKey)) return;
 	const state = stateForEvent(event);
 	if (!state) return;
 	const now = new Date().toISOString();
 	const previous = readPreviousPayload(stateFile);
+	if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload)) return;
 	const finalResponse = finalResponseForEvent(event);
 	const payload = {
 		...basePayload({ context, previous, state, now, source: "agent_session_event", event: event.type, reason: null }),
@@ -271,8 +271,9 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 				}
 			: {}),
 	};
+	// Postmortem cleanup is synchronous; do not yield between reading the prior state and writing this event.
 	try {
-		await writeStateFile(stateFile, payload);
+		writeStateFileSync(stateFile, payload);
 	} catch (error) {
 		logger.warn("Failed to persist coordinator runtime state", { error: String(error), stateFile });
 	}
@@ -307,6 +308,7 @@ export function persistCoordinatorRuntimeStateFromPostmortem(
 	};
 	try {
 		writeStateFileSync(stateFile, payload);
+		postmortemCleanupFence.add(path.resolve(stateFile));
 	} catch (error) {
 		logger.warn("Failed to persist coordinator runtime state during postmortem", { error: String(error), stateFile });
 	}

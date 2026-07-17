@@ -182,4 +182,78 @@ describe("coordinator runtime state sidecar", () => {
 		});
 		expect(payload.source).not.toBe("process_postmortem");
 	});
+
+	it("does not let an in-flight event overwrite postmortem recovery evidence", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "interrupted-session";
+
+		const eventWrite = persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId: "interrupted-session", cwd: root, sessionFile: null },
+		);
+		persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+			sessionId: "interrupted-session",
+			cwd: root,
+			sessionFile: null,
+		});
+		await eventWrite;
+
+		const payload = JSON.parse(await Bun.file(stateFile).text());
+		expect(payload).toMatchObject({
+			state: "errored",
+			source: "process_postmortem",
+			reason: "sigterm",
+		});
+	});
+	it("does not let a late event overwrite postmortem recovery evidence", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "interrupted-session";
+
+		persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+			sessionId: "interrupted-session",
+			cwd: root,
+			sessionFile: null,
+		});
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId: "interrupted-session", cwd: root, sessionFile: null },
+		);
+
+		const payload = JSON.parse(await Bun.file(stateFile).text());
+		expect(payload).toMatchObject({
+			state: "errored",
+			source: "process_postmortem",
+			reason: "sigterm",
+		});
+	});
+	it("preserves launch-error evidence from late event writes", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "launch-error-session";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "launch-error-session",
+				state: "errored",
+				final_response: { source: "launch_error", text: "Launch failed" },
+			}),
+		);
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{ sessionId: "launch-error-session", cwd: root, sessionFile: null },
+		);
+
+		const payload = JSON.parse(await Bun.file(stateFile).text());
+		expect(payload).toMatchObject({
+			state: "errored",
+			final_response: { source: "launch_error", text: "Launch failed" },
+		});
+	});
 });
