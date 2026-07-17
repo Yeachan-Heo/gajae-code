@@ -331,6 +331,15 @@ Project executor override body.
 
 		expect(systemPrompt).toContain("Delegate large implementation slices to `executor`");
 		expect(systemPrompt).not.toContain("<role-agent-surface>");
+		expect(systemPrompt).toContain("explicitly requests ultragoal execution");
+		expect(systemPrompt).toContain("that request is execution approval");
+		expect(systemPrompt).toContain("do not re-ask whether to start");
+		expect(systemPrompt).toContain("that request is approval: invoke it immediately");
+		expect(ultragoal).toContain("## Explicit start is approval");
+		expect(ultragoal).toContain("that is execution approval");
+		expect(ultragoal).toContain("Do not re-prompt with \"should I start?\"");
+		expect(ultragoal).toContain("only inferred");
+		expect(ultragoal).toContain("run `ralplan` first");
 		expect(ultragoal).toContain("Role agents return implementation/review evidence");
 	});
 
@@ -404,6 +413,10 @@ Project executor override body.
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
+		expect(routing).toContain("explicitly requests ultragoal execution");
+		expect(routing).toContain("that request is execution approval");
+		expect(routing).toContain("do not re-ask whether to start");
+		expect(routing).toContain("that request is approval: invoke it immediately");
 		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(6);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});

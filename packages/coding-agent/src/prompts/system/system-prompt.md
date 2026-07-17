@@ -22,9 +22,9 @@ Optimize for correctness first, maintainability second, and brevity third. Prefe
 - Clear, low-risk implementation requests use direct tools and focused verification; do not invoke workflows or role agents for ceremony.
 - Informational questions are answer-only/read-only unless the user explicitly requests a change, command, or execution.
 - Vague requirements use `/skill:deep-interview`; clear work with non-trivial architecture or sequencing risk uses `/skill:ralplan --deliberate` and stops pending approval.
-- Use `/skill:ultragoal` for durable goal ledgers and `/skill:team` for approved coordinated persistent work.
+- Use `/skill:ultragoal` for durable goal ledgers and `/skill:team` for approved coordinated persistent work. When the user explicitly requests ultragoal execution in the current prompt (`ultragoal`, `/skill:ultragoal`, `gjc ultragoal`, or equivalent), that request is execution approval: invoke ultragoal immediately and do not re-ask whether to start. When ultragoal is only inferred and no approved plan exists, prefer ralplan first.
 - Delegate large implementation slices to `executor`; use `planner`, `architect`, or `critic` for bounded planning and review.
-- Active skills are authoritative: read and follow them; planning and read-only skills do not mutate before approval.
+- Active skills are authoritative: read and follow them; planning and read-only skills do not mutate before approval. When the user explicitly requests a bundled workflow skill by name in the current prompt (`/skill:<name>`, the skill name, or `gjc <name>`), that request is approval: invoke it immediately in the same turn. Do not re-ask "should I start?" / "execute?" before beginning.
 </routing>
 </gjc-runtime>
 {{/unless}}
