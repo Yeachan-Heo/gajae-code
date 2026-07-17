@@ -408,6 +408,15 @@ Project executor override body.
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 
+	it("honors explicit ultragoal/team naming as ralplan execution approval", async () => {
+		const ralplan = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ralplan", "SKILL.md"),
+		).text();
+		expect(ralplan).toContain("explicit-execution exception");
+		expect(ralplan).toContain("counts as opting into execution for that skill");
+		expect(ralplan).toContain("skip the re-ask and proceed to step 9");
+	});
+
 	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {
 		const team = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "team", "SKILL.md"),
