@@ -20,6 +20,14 @@ Callable activation requires all of:
 
 When disabled, every action including `screenshot` returns `COMPUTER_DISABLED`. Disabled catalog/listing paths do not construct `ComputerController`, start hotkeys, probe Screen Recording, probe Accessibility, capture screenshots, or expose the callable schema to `search_tool_bm25`.
 
+## Managed tmux ownership
+
+On Apple Silicon macOS, a new GJC-managed tmux session starts a private packaged computer-owner helper before tmux is created. A packaged GJC launched inside an existing tmux session starts the same helper during root startup. The inner GJC process holds an authenticated Unix-socket lease and routes normal `computer` actions through that helper, so Screen Recording and Accessibility/PostEvent authority remain attached to the packaged GJC identity across tmux detach and reattach.
+
+The broker is local-only, hidden from public CLI help, and fail-closed. Its socket lives in a mode-`0700` temporary directory, requires a random per-launch token, accepts one leased client, serializes actions, and exits when the inner GJC lease closes. Screenshot bytes are transported in memory and are never persisted by the broker. Native supervisor, kill-switch, permission, display-epoch, coordinate, and release-all enforcement remain authoritative in the helper process.
+
+Direct launches without managed broker metadata keep the existing in-process native controller. A managed session marked as broker-required never silently falls back to the in-process controller when its helper is missing, unclaimed, disconnected, or unavailable; only computer actions fail closed while the rest of the session remains usable.
+
 ## Inputs
 
 The model action object uses an exact snake_case discriminated schema. CamelCase fields are rejected.
@@ -63,6 +71,10 @@ Stable computer error codes include:
 - `COMPUTER_DISPLAY_STALE`
 - `COMPUTER_COORD_INVALID`
 - `COMPUTER_CANCELLED`
+- `COMPUTER_BROKER_UNAVAILABLE` — the required packaged owner could not be started, claimed, or reached; a managed session never falls back to an inner native controller.
+- `COMPUTER_BROKER_TIMEOUT` — the broker lease or action exceeded its bounded deadline.
+
+Broker authentication and framing failures are internal transport errors and are not public configuration surfaces.
 
 TS handles settings/platform exposure and UX mapping. Native `execute_action` remains the side-effect authority for supervisor state, permissions, display freshness, coordinate validation, cancellation, and release-all behavior.
 

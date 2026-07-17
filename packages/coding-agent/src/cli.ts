@@ -8,6 +8,7 @@ import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
+import { COMPUTER_BROKER_CLI_FLAG, runComputerBrokerServerFromEnvironment } from "./gjc-runtime/computer-broker";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -297,8 +298,12 @@ export function routeRootArgv(argv: readonly string[]): string[] {
 			: ["launch", ...normalizedArgv];
 }
 
+export interface RunCliDependencies {
+	reexecWithScrubbedMallocEnv?: () => Promise<number | null>;
+	runComputerBrokerFromEnvironment?: typeof runComputerBrokerServerFromEnvironment;
+}
 /** Run the CLI with the given argv (no `process.argv` prefix). */
-export async function runCli(argv: string[]): Promise<void> {
+export async function runCli(argv: string[], dependencies: RunCliDependencies = {}): Promise<void> {
 	// macOS malloc-env launch boundary. Re-exec once with a scrubbed environment
 	// BEFORE any fast path or subprocess spawn, so the startup env snapshot Bun hands
 	// to every child lane (Bun.spawn defaults, node:child_process, native PTY, tmux
@@ -312,13 +317,26 @@ export async function runCli(argv: string[]): Promise<void> {
 		process.env.GJC_MALLOC_ENV_REEXEC === undefined &&
 		(process.env.MallocStackLogging !== undefined || process.env.MallocStackLoggingNoCompact !== undefined)
 	) {
-		const { reexecWithScrubbedMallocEnv } = await import("./cli/malloc-env-guard");
-		const code = await reexecWithScrubbedMallocEnv();
+		const code = dependencies.reexecWithScrubbedMallocEnv
+			? await dependencies.reexecWithScrubbedMallocEnv()
+			: await import("./cli/malloc-env-guard").then(module => module.reexecWithScrubbedMallocEnv());
 		if (code !== null) {
 			process.exitCode = code;
 			return;
 		}
-		// Re-exec could not be spawned; fall through and run in this process.
+		if (argv[0] === COMPUTER_BROKER_CLI_FLAG) {
+			process.exitCode = 1;
+			return;
+		}
+		// Re-exec could not be spawned; public commands fall through in this process.
+	}
+	if (argv[0] === COMPUTER_BROKER_CLI_FLAG) {
+		if (argv.length !== 1) {
+			process.exitCode = 1;
+			return;
+		}
+		await (dependencies.runComputerBrokerFromEnvironment ?? runComputerBrokerServerFromEnvironment)();
+		return;
 	}
 	if (isTmuxOwnerIsolationCliArgv(argv)) {
 		await runTmuxOwnerIsolationCliFromStdin();

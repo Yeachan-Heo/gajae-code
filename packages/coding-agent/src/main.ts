@@ -35,6 +35,7 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { acquireComputerBrokerLeaseFromEnvironment } from "./gjc-runtime/computer-broker";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
@@ -1023,6 +1024,7 @@ export interface RunRootCommandDependencies {
 	selectResumeSession?: SelectResumeSession;
 	openExistingSessionStrict?: OpenExistingSessionStrict;
 	initializeSettings?: typeof Settings.init;
+	acquireComputerBrokerLease?: typeof acquireComputerBrokerLeaseFromEnvironment;
 }
 
 export async function runRootCommand(
@@ -1036,6 +1038,7 @@ export async function runRootCommand(
 	let bareResumeSessionManager: SessionManager | undefined;
 	let bareResumeAction: "continue-tail" | "open-idle" | undefined;
 
+	await (deps.acquireComputerBrokerLease ?? acquireComputerBrokerLeaseFromEnvironment)().catch(() => undefined);
 	if (isBareResume(parsedArgs)) {
 		if (hasBareResumeConflict(parsedArgs)) {
 			process.stderr.write(`${BARE_RESUME_CONFLICT_ERROR}\n`);

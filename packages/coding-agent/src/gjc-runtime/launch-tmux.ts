@@ -5,6 +5,11 @@ import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils/dirs";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
+import {
+	type ComputerBrokerLaunch,
+	GJC_COMPUTER_BROKER_REQUIRED_ENV,
+	startComputerBrokerForTmux,
+} from "./computer-broker";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
@@ -107,6 +112,10 @@ export interface TmuxLaunchContext {
 	ownerIsolationProbe?: OwnerIsolationProbeSync;
 	/** Test seam for deterministic default-probe caller cgroup classification. */
 	callerCgroupReader?: () => string | null;
+	/** Starts the managed macOS computer broker immediately before tmux creation. */
+	computerBrokerStarter?: typeof startComputerBrokerForTmux;
+	/** Test seam for supported managed-computer launch architecture. */
+	architecture?: NodeJS.Architecture;
 }
 
 export interface TmuxSpawnResult {
@@ -158,6 +167,8 @@ export interface TmuxLaunchPlan {
 	/** Safe server identity proven immediately after creation. */
 	createdServerIdentity?: { pid: number; startTime: string };
 	isPsmux: boolean;
+	/** Environment additions held by the inner managed process's broker lease. */
+	computerBrokerEnvironment?: Record<string, string>;
 	platform: NodeJS.Platform;
 }
 
@@ -1046,6 +1057,7 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
 				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: plan.tmuxCommand,
+				...(plan.computerBrokerEnvironment ?? {}),
 			},
 			// Linux managed owner close signals the pane PID. Do not place the exit-marker shell
 			// in front of it; `buildInnerCommand` therefore execs the GJC owner directly.
@@ -1408,23 +1420,55 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", existingTarget], attachOptions);
 		if (attached.exitCode === 0) return true;
 	}
+	let computerBroker: ComputerBrokerLaunch | null = null;
+	const brokerEligible = context.spawnSync === undefined || context.computerBrokerStarter !== undefined;
+	const computerBrokerStarter =
+		context.computerBrokerStarter ?? (context.spawnSync === undefined ? startComputerBrokerForTmux : undefined);
+	if (brokerEligible && plan.platform === "darwin" && (context.architecture ?? process.arch) === "arm64") {
+		plan.computerBrokerEnvironment = { [GJC_COMPUTER_BROKER_REQUIRED_ENV]: "1" };
+		try {
+			computerBroker = computerBrokerStarter?.({ env, cwd: plan.cwd }) ?? null;
+			if (computerBroker)
+				plan.computerBrokerEnvironment = {
+					...plan.computerBrokerEnvironment,
+					...computerBroker.environment,
+				};
+			else
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					"macOS computer broker unavailable; computer actions will fail closed in this tmux session.\n",
+				);
+		} catch {
+			(context.diagnosticWriter ?? safeStderrWrite)(
+				"macOS computer broker unavailable; computer actions will fail closed in this tmux session.\n",
+			);
+		}
+	}
 	try {
 		prepareManagedOwnerLifecycle(plan, context);
 	} catch (error) {
+		computerBroker?.dispose();
 		(context.diagnosticWriter ?? safeStderrWrite)(`tmux owner lifecycle publication failed: ${String(error)}`);
 		return true;
 	}
 	if (!plan.sessionId || !plan.sessionStateFile || !plan.ownerGeneration || !plan.tmuxCommand) {
+		computerBroker?.dispose();
 		(context.diagnosticWriter ?? safeStderrWrite)("tmux required ownership metadata was unavailable");
 		return true;
 	}
-	const created = createIsolatedTmuxSession(
-		plan,
-		rawSpawnSync,
-		newSessionOptions,
-		context.diagnosticWriter ?? safeStderrWrite,
-		ownerIsolationProbe,
-	);
+	let created: TmuxSpawnResult;
+	try {
+		created = createIsolatedTmuxSession(
+			plan,
+			rawSpawnSync,
+			newSessionOptions,
+			context.diagnosticWriter ?? safeStderrWrite,
+			ownerIsolationProbe,
+		);
+	} catch (error) {
+		computerBroker?.dispose();
+		throw error;
+	}
+	if (created.exitCode !== 0) computerBroker?.dispose();
 	if (created.exitCode === 0 && !plan.isPsmux && !plan.createdSessionId) {
 		// Native tmux must atomically disclose its immutable `$N` identity. Do not
 		// downgrade to the reusable session name or mutate the unidentified session.

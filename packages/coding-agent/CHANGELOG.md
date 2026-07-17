@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- macOS computer actions in new GJC-managed tmux sessions now run through a private packaged pre-tmux owner, preserving Screen Recording and Accessibility/PostEvent authority across detach and reattach while retaining native supervisor, kill-switch, display-epoch, and fail-closed cleanup enforcement.
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
 - Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
 - Coordinator MCP operational calls now canonically bootstrap or reuse the agent-global SDK broker when discovery is absent or stale, while coordinator/hermes JSON checks report catalog and broker-discovery readiness separately without mutating broker state (#2552).

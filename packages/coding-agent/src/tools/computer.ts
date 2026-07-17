@@ -5,6 +5,12 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { ImageContent } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import {
+	type ComputerBrokerMethod,
+	type ComputerControllerLike,
+	createComputerBrokerControllerFromEnvironment,
+	initializeComputerBrokerLeaseFromEnvironment,
+} from "../gjc-runtime/computer-broker";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { markScreenshotFallbackDirCreatedForGc } from "./computer-gc";
@@ -124,18 +130,6 @@ export interface ComputerToolDetails {
 	meta?: OutputMeta;
 }
 
-type NativeController = {
-	screenshot?: () => Promise<NativeScreenshot> | NativeScreenshot;
-	click?: (expectedEpoch: number | undefined, x: number, y: number, button?: string) => void;
-	doubleClick?: (expectedEpoch: number | undefined, x: number, y: number, button?: string) => void;
-	move?: (expectedEpoch: number | undefined, x: number, y: number) => void;
-	drag?: (expectedEpoch: number | undefined, x: number, y: number, toX: number, toY: number, button?: string) => void;
-	scroll?: (expectedEpoch: number | undefined, x: number, y: number, scrollX: number, scrollY: number) => void;
-	type?: (expectedEpoch: number | undefined, text: string) => void;
-	keypress?: (expectedEpoch: number | undefined, keys: string[]) => void;
-	wait?: (expectedEpoch: number | undefined, ms: number) => void;
-};
-
 type NativeScreenshot = {
 	png?: Uint8Array | Buffer | ArrayBuffer | string;
 	widthPx?: number;
@@ -148,7 +142,7 @@ type NativeScreenshot = {
 	captureId?: string;
 };
 
-export type ComputerControllerFactory = () => NativeController;
+export type ComputerControllerFactory = () => ComputerControllerLike;
 
 export const COMPUTER_DISABLED_CODE = "COMPUTER_DISABLED";
 
@@ -161,8 +155,11 @@ const NATIVE_ERROR_CODES = new Set([
 	"COMPUTER_CANCELLED",
 ]);
 
-function createNativeComputerController(): NativeController {
-	const natives = require("@gajae-code/natives") as { ComputerController?: new () => NativeController };
+function createNativeComputerController(): ComputerControllerLike {
+	const brokerController = createComputerBrokerControllerFromEnvironment();
+	if (brokerController) return brokerController;
+
+	const natives = require("@gajae-code/natives") as { ComputerController?: new () => ComputerControllerLike };
 	if (!natives.ComputerController) {
 		throw new ToolError("ComputerController is unavailable in @gajae-code/natives.", {
 			code: "COMPUTER_UNAVAILABLE",
@@ -245,7 +242,9 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): ComputerTool | null {
-		return isComputerCallable(session) ? new ComputerTool(session) : null;
+		if (!isComputerCallable(session)) return null;
+		initializeComputerBrokerLeaseFromEnvironment();
+		return new ComputerTool(session);
 	}
 
 	get description(): string {
@@ -403,15 +402,12 @@ function rememberLatestScreenshot(session: ToolSession, screenshot: ComputerScre
 }
 
 function captureScreenshot(
-	controller: NativeController,
+	controller: ComputerControllerLike,
 	deadline: ComputerDeadline | undefined,
 	signal?: AbortSignal,
 ): Promise<unknown> {
 	return runComputerOperation(
-		() => {
-			if (!controller.screenshot) missingNativeMethod("screenshot", "screenshot");
-			return controller.screenshot();
-		},
+		() => invokeComputerController(controller, "screenshot", "screenshot", [], deadline, signal),
 		deadline,
 		signal,
 	);
@@ -421,6 +417,24 @@ function missingNativeMethod(action: string, method: string): never {
 	throw new ToolError(`COMPUTER_UNAVAILABLE: Native ComputerController.${method} is unavailable for ${action}.`, {
 		code: "COMPUTER_UNAVAILABLE",
 	});
+}
+
+function invokeComputerController(
+	controller: ComputerControllerLike,
+	action: string,
+	method: ComputerBrokerMethod,
+	args: unknown[],
+	deadline: ComputerDeadline | undefined,
+	signal?: AbortSignal,
+): unknown {
+	if (controller.brokerInvoke)
+		return controller.brokerInvoke(method, args, {
+			timeoutMs: remainingComputerTimeoutMs(deadline),
+			signal,
+		});
+	const nativeMethod = controller[method];
+	if (typeof nativeMethod !== "function") missingNativeMethod(action, method);
+	return (nativeMethod as (...values: unknown[]) => unknown).apply(controller, args);
 }
 
 function shouldCapturePostActionScreenshot(
@@ -510,7 +524,7 @@ async function runComputerOperation<T>(
 }
 
 function dispatchComputerAction(
-	controller: NativeController,
+	controller: ComputerControllerLike,
 	params: SingleComputerParams,
 	deadline: ComputerDeadline | undefined,
 	context?: ScreenshotContext,
@@ -521,45 +535,78 @@ function dispatchComputerAction(
 		() => {
 			switch (params.action) {
 				case "screenshot":
-					if (!controller.screenshot) missingNativeMethod("screenshot", "screenshot");
-					return controller.screenshot();
+					return invokeComputerController(controller, "screenshot", "screenshot", [], deadline, signal);
 				case "click":
 					validatePointerCoordinates("click", params.x, params.y, context);
-					if (!controller.click) missingNativeMethod("click", "click");
-					return controller.click(expectedEpoch, params.x, params.y, params.button ?? "left");
+					return invokeComputerController(
+						controller,
+						"click",
+						"click",
+						[expectedEpoch, params.x, params.y, params.button ?? "left"],
+						deadline,
+						signal,
+					);
 				case "double_click":
 					validatePointerCoordinates("double_click", params.x, params.y, context);
-					if (!controller.doubleClick) missingNativeMethod("double_click", "doubleClick");
-					return controller.doubleClick(expectedEpoch, params.x, params.y, params.button ?? "left");
+					return invokeComputerController(
+						controller,
+						"double_click",
+						"doubleClick",
+						[expectedEpoch, params.x, params.y, params.button ?? "left"],
+						deadline,
+						signal,
+					);
 				case "move":
 					validatePointerCoordinates("move", params.x, params.y, context);
-					if (!controller.move) missingNativeMethod("move", "move");
-					return controller.move(expectedEpoch, params.x, params.y);
+					return invokeComputerController(
+						controller,
+						"move",
+						"move",
+						[expectedEpoch, params.x, params.y],
+						deadline,
+						signal,
+					);
 				case "drag":
 					validatePointerCoordinates("drag start", params.x, params.y, context);
 					validatePointerCoordinates("drag end", params.to_x, params.to_y, context);
-					if (!controller.drag) missingNativeMethod("drag", "drag");
-					return controller.drag(
-						expectedEpoch,
-						params.x,
-						params.y,
-						params.to_x,
-						params.to_y,
-						params.button ?? "left",
+					return invokeComputerController(
+						controller,
+						"drag",
+						"drag",
+						[expectedEpoch, params.x, params.y, params.to_x, params.to_y, params.button ?? "left"],
+						deadline,
+						signal,
 					);
 				case "scroll":
 					validatePointerCoordinates("scroll", params.x, params.y, context);
-					if (!controller.scroll) missingNativeMethod("scroll", "scroll");
-					return controller.scroll(expectedEpoch, params.x, params.y, params.scroll_x, params.scroll_y);
+					return invokeComputerController(
+						controller,
+						"scroll",
+						"scroll",
+						[expectedEpoch, params.x, params.y, params.scroll_x, params.scroll_y],
+						deadline,
+						signal,
+					);
 				case "type":
-					if (!controller.type) missingNativeMethod("type", "type");
-					return controller.type(undefined, params.text);
+					return invokeComputerController(controller, "type", "type", [undefined, params.text], deadline, signal);
 				case "keypress":
-					if (!controller.keypress) missingNativeMethod("keypress", "keypress");
-					return controller.keypress(undefined, params.keys);
+					return invokeComputerController(
+						controller,
+						"keypress",
+						"keypress",
+						[undefined, params.keys],
+						deadline,
+						signal,
+					);
 				case "wait":
-					if (!controller.wait) missingNativeMethod("wait", "wait");
-					return controller.wait(undefined, capWaitMs(params.ms, remainingComputerTimeoutMs(deadline)));
+					return invokeComputerController(
+						controller,
+						"wait",
+						"wait",
+						[undefined, capWaitMs(params.ms, remainingComputerTimeoutMs(deadline))],
+						deadline,
+						signal,
+					);
 			}
 		},
 		deadline,
@@ -575,7 +622,7 @@ interface BatchDispatchResult {
 }
 
 async function dispatchBatchComputerActions(
-	controller: NativeController,
+	controller: ComputerControllerLike,
 	actions: readonly SingleComputerParams[],
 	timeoutMs: number | undefined,
 	hotkey?: string,
