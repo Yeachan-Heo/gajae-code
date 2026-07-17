@@ -26,6 +26,11 @@ export enum Reason {
 const callbackList: ((reason: Reason) => Promise<void> | void)[] = [];
 // Tracks cleanup run state (to prevent recursion/reentry issues)
 let cleanupStage: "idle" | "running" | "complete" = "idle";
+let cleanupPromise: Promise<void> | undefined;
+
+function isSignalReason(reason: Reason): boolean {
+	return reason === Reason.SIGINT || reason === Reason.SIGTERM || reason === Reason.SIGHUP;
+}
 
 /**
  * Internal: runs all registered cleanup callbacks for the given reason.
@@ -42,27 +47,41 @@ function runCleanup(reason: Reason): Promise<void> {
 			if (reason === Reason.EXIT) {
 				return Promise.resolve();
 			}
+			if (isSignalReason(reason) && cleanupPromise) {
+				return cleanupPromise;
+			}
 			logger.error("Cleanup invoked recursively", { stack: new Error().stack });
 			return Promise.resolve();
 		case "complete":
 			return Promise.resolve();
 	}
 
-	// Call .cleanup() for each callback that is still "armed".
-	// Use Promise.try to handle sync/async, but only those armed.
-	const promises = callbackList.toReversed().map(callback => {
-		return Promise.try(() => callback(reason));
-	});
-
-	return Promise.allSettled(promises).then(results => {
+	const deferred = Promise.withResolvers<void>();
+	cleanupPromise = deferred.promise;
+	void (async () => {
+		// Call .cleanup() for each callback that is still "armed".
+		// Use Promise.try to handle sync/async, but only those armed.
+		const promises = callbackList.toReversed().map(callback => {
+			return Promise.try(() => callback(reason));
+		});
+		const results = await Promise.allSettled(promises);
 		for (const result of results) {
 			if (result.status === "rejected") {
 				const err = result.reason instanceof Error ? result.reason : new Error(String(result.reason));
 				logger.error("Cleanup callback failed", { err, stack: err.stack });
 			}
 		}
-		cleanupStage = "complete";
-	});
+	})().then(
+		() => {
+			cleanupStage = "complete";
+			deferred.resolve();
+		},
+		error => {
+			cleanupStage = "complete";
+			deferred.reject(error);
+		},
+	);
+	return cleanupPromise;
 }
 
 // Register signal and error event handlers to trigger cleanup before exit.
@@ -82,8 +101,11 @@ function formatFatalError(label: string, err: Error): string {
 if (isMainThread) {
 	process
 		.on("SIGINT", async () => {
-			await runCleanup(Reason.SIGINT);
-			process.exit(130); // 128 + SIGINT (2)
+			try {
+				await runCleanup(Reason.SIGINT);
+			} finally {
+				process.exit(130); // 128 + SIGINT (2)
+			}
 		})
 		.on("SIGUSR1", () => {
 			if (inspectorOpened) return;
@@ -109,12 +131,18 @@ if (isMainThread) {
 			void runCleanup(Reason.EXIT); // fire and forget (exit imminent)
 		})
 		.on("SIGTERM", async () => {
-			await runCleanup(Reason.SIGTERM);
-			process.exit(143); // 128 + SIGTERM (15)
+			try {
+				await runCleanup(Reason.SIGTERM);
+			} finally {
+				process.exit(143); // 128 + SIGTERM (15)
+			}
 		})
 		.on("SIGHUP", async () => {
-			await runCleanup(Reason.SIGHUP);
-			process.exit(129); // 128 + SIGHUP (1)
+			try {
+				await runCleanup(Reason.SIGHUP);
+			} finally {
+				process.exit(129); // 128 + SIGHUP (1)
+			}
 		});
 } else {
 	// Worker thread: only register exit handler for cleanup.

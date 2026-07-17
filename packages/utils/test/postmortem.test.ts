@@ -57,6 +57,15 @@ describe("postmortem cleanup re-entry", () => {
 		expect(combinedOutput(result)).toContain('"stack"');
 	});
 
+	it("waits for in-flight cleanup when a second signal arrives", async () => {
+		const result = await runScenario("signal-reentry-while-running");
+
+		expect(result.exitCode).toBe(129);
+		expect(parseResult(result.stdout).count).toBe(1);
+		expect(result.stdout).toContain('"reason":"sighup"');
+		expect(hasRecursiveCleanupError(combinedOutput(result))).toBe(false);
+	});
+
 	it("keeps completed cleanup a no-op when the exit handler fires", async () => {
 		const result = await runScenario("completed-cleanup-exit-noop");
 

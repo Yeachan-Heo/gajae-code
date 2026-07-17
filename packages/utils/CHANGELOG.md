@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Consecutive termination signals now await the same in-flight postmortem cleanup instead of letting the later signal exit early and truncate registered teardown callbacks.
+
 ## [0.8.2] - 2026-07-06
 
 ### Fixed

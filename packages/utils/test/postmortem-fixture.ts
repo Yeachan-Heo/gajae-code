@@ -42,6 +42,19 @@ async function runNonExitRecursiveCleanup(): Promise<void> {
 	writeResult({ count });
 }
 
+async function runSignalReentryWhileRunning(): Promise<void> {
+	let count = 0;
+	postmortem.register("fixture-signal-reentry", async reason => {
+		count++;
+		await Bun.sleep(100);
+		writeResult({ count, reason });
+	});
+
+	setTimeout(() => process.emit("SIGTERM"), 20);
+	process.emit("SIGHUP");
+	await Bun.sleep(1_000);
+}
+
 async function runCompletedCleanupExitNoop(): Promise<void> {
 	let count = 0;
 	const exitListener = getPostmortemExitListener();
@@ -62,6 +75,9 @@ switch (scenario) {
 		break;
 	case "non-exit-recursive-cleanup":
 		await runNonExitRecursiveCleanup();
+		break;
+	case "signal-reentry-while-running":
+		await runSignalReentryWhileRunning();
 		break;
 	case "completed-cleanup-exit-noop":
 		await runCompletedCleanupExitNoop();
