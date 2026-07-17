@@ -924,26 +924,48 @@ function appendAnthropicRateLimitEvidence(bodyText: string, headers: Headers): s
 	return bodyText.includes(suffix) ? bodyText : `${bodyText}${suffix}`;
 }
 
-// Bounded fallback retry policy (PR #2444 review): a unified-limit rejection
-// may be downgraded from exhaustion to a SHORT bounded retry, but only when
-// the response proves the full Anthropic unified-rejection shape (status,
-// strictly parsed fallback fraction, and the exact error class). The retry
-// budget and delay are explicit constants enforced per client instance as a
-// sliding window (the SDK mints a fresh AbortSignal per attempt, so request
-// identity is not observable at the fetch layer; a per-client window is
-// strictly more conservative -- shared budget can only reduce retries). The
-// worst case per client is ANTHROPIC_FALLBACK_MAX_RETRIES extra attempts per
-// ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS, spaced ANTHROPIC_FALLBACK_RETRY_DELAY_MS
-// apart -- never an unbounded burst, and never triggered by a lone header on
-// an arbitrary 429.
+// Bounded fallback retry policy (#2444/#2464 reviews): a unified-limit
+// rejection may be downgraded from exhaustion to a SHORT bounded retry, but
+// only when the response proves the captured unified-rejection shape AND the
+// provider hint is oversized (small/absent hints keep their original
+// handling). The wrapper performs the wait ITSELF via an abort-aware sleep
+// and re-fetches -- the SDK never sees the downgraded 429, so no forced
+// non-abortable SDK sleep, no Response reconstruction, and no interaction
+// with the SDK retry budget.
+//
+// Budget scope, stated honestly: PROCESS-WIDE. Every streamAnthropic call
+// builds a fresh client+wrapper, so any per-wrapper state would silently be
+// per-call; a module-level sliding window is the smallest scope that
+// actually bounds aggregate amplification. Worst case across the whole
+// process: ANTHROPIC_FALLBACK_MAX_RETRIES extra requests per
+// ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS, regardless of concurrency.
 const ANTHROPIC_FALLBACK_MAX_RETRIES = 2;
 const ANTHROPIC_FALLBACK_RETRY_DELAY_MS = 2_000;
 const ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS = 60_000;
+
+let anthropicFallbackDowngradeTimes: number[] = [];
+
+// Consume one downgrade slot from the process-wide window; false = budget
+// spent (caller falls through to the exhaustion fast-path).
+function takeAnthropicFallbackBudget(now: number): boolean {
+	anthropicFallbackDowngradeTimes = anthropicFallbackDowngradeTimes.filter(
+		time => now - time < ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS,
+	);
+	if (anthropicFallbackDowngradeTimes.length >= ANTHROPIC_FALLBACK_MAX_RETRIES) return false;
+	anthropicFallbackDowngradeTimes.push(now);
+	return true;
+}
+
+export function resetAnthropicFallbackRetryBudgetForTests(): void {
+	anthropicFallbackDowngradeTimes = [];
+}
 
 type Anthropic429Class = "ordinary" | "usage_exhaustion" | "fallback_retryable";
 
 // The unified-limit error class: rate_limit_error + the "request would
 // exceed" phrasing, WITHOUT out_of_credits (credits exhaustion is terminal).
+// FAIL-CLOSED on non-JSON/malformed bodies: without a parseable typed error
+// the class cannot be proven, so no downgrade (#2464 finding 2).
 function isUnifiedRateLimitBody(bodyText: string): boolean {
 	try {
 		const parsed = JSON.parse(bodyText) as unknown;
@@ -956,7 +978,7 @@ function isUnifiedRateLimitBody(bodyText: string): boolean {
 			!/out_of_credits/i.test(message)
 		);
 	} catch {
-		return /request would exceed your account.?s rate limit/i.test(bodyText) && !/out_of_credits/i.test(bodyText);
+		return false;
 	}
 }
 
@@ -970,6 +992,23 @@ function verifiedFallbackPercentage(headers: Headers): number | undefined {
 	const value = Number.parseFloat(raw);
 	if (!Number.isFinite(value) || value <= 0 || value > 1) return undefined;
 	return value;
+}
+
+// Matches the shapes actually captured in the field: the incident carried
+// BOTH `anthropic-ratelimit-unified-status: rejected` and
+// `anthropic-ratelimit-unified-5h-status: rejected`; window-scoped variants
+// (5h/7d/...) count on their own so a capture that only carries a window
+// status still qualifies (#2464 finding 1).
+function hasUnifiedRejectedStatus(headers: Headers): boolean {
+	for (const [name, value] of headers) {
+		if (
+			/^anthropic-ratelimit-unified(-[a-z0-9_]+)?-status$/i.test(name) &&
+			value.trim().toLowerCase() === "rejected"
+		) {
+			return true;
+		}
+	}
+	return false;
 }
 
 function classifyAnthropic429(
@@ -991,21 +1030,23 @@ function classifyAnthropic429(
 			const message = getStringProperty(error, "message") ?? getStringProperty(parsed, "message") ?? bodyText;
 			return /rate_limit_error/i.test(type ?? "") && /out_of_credits/i.test(message);
 		} catch {
-			return /out_of_credits/i.test(bodyText);
+			return /request would exceed your account.?s rate limit|out_of_credits/i.test(bodyText);
 		}
 	})();
 	if (!oversizedRetryAfter && !unifiedBody && !legacyBodyMatch) return "ordinary";
 
-	// Downgrade to a bounded retry ONLY for the fully verified unified
-	// rejection: rejected unified status + strict in-range fallback fraction
-	// + the exact unified error class. Field evidence (2026-07-16):
+	// Downgrade ONLY when every dial of the captured incident shape is
+	// proven AND the hint is oversized -- a small/absent hint needs no
+	// rescue, so it keeps the original exhaustion handling (#2464 finding 3).
+	// Field evidence (2026-07-16): unified-status=rejected AND
 	// unified-5h-status=rejected, retry-after=13262s, fallback-percentage=0.5,
 	// overage=org_level_disabled -- requests succeeded again within minutes,
 	// while the old behavior declared the session terminally exhausted after
 	// a single attempt.
 	if (
 		unifiedBody &&
-		headers.get("anthropic-ratelimit-unified-status")?.trim().toLowerCase() === "rejected" &&
+		oversizedRetryAfter &&
+		hasUnifiedRejectedStatus(headers) &&
 		verifiedFallbackPercentage(headers) !== undefined
 	) {
 		return "fallback_retryable";
@@ -1013,55 +1054,52 @@ function classifyAnthropic429(
 	return "usage_exhaustion";
 }
 
+// Effective retry hint with the SDK's own precedence: retry-after-ms first
+// (milliseconds), then retry-after (seconds or HTTP-date via
+// getRetryAfterMsFromHeaders).
+function effectiveRetryAfterMs(headers: Headers): number | undefined {
+	const msRaw = headers.get("retry-after-ms");
+	if (msRaw !== null) {
+		const ms = Number.parseFloat(msRaw);
+		if (Number.isFinite(ms) && ms >= 0) return ms;
+	}
+	return getRetryAfterMsFromHeaders(headers);
+}
+
 function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDelayMs: number | undefined): FetchImpl {
 	const retryDelayCapMs = maxRetryDelayMs ?? ANTHROPIC_RETRY_DELAY_CAP_MS;
-	// Sliding downgrade budget per client instance (see the policy comment
-	// above the constants). Timestamps of recent downgrades; pruned on use.
-	let fallbackDowngradeTimes: number[] = [];
-	return Object.assign(
-		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			const response = await baseFetch(input, init);
-			if (response.status !== 429 || retryDelayCapMs === 0) return response;
+	const wrapped = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+		const response = await baseFetch(input, init);
+		if (response.status !== 429 || retryDelayCapMs === 0) return response;
 
-			const headers = new Headers(response.headers);
-			const retryAfterMs = getRetryAfterMsFromHeaders(headers);
-			const bodyText = await response
-				.clone()
-				.text()
-				.catch(() => "");
-			const classification = classifyAnthropic429(bodyText, headers, retryAfterMs, retryDelayCapMs);
-			if (classification === "ordinary") return response;
+		const headers = new Headers(response.headers);
+		const retryAfterMs = effectiveRetryAfterMs(headers);
+		const bodyText = await response
+			.clone()
+			.text()
+			.catch(() => "");
+		const classification = classifyAnthropic429(bodyText, headers, retryAfterMs, retryDelayCapMs);
+		if (classification === "ordinary") return response;
 
-			if (classification === "fallback_retryable") {
-				const now = Date.now();
-				fallbackDowngradeTimes = fallbackDowngradeTimes.filter(
-					time => now - time < ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS,
-				);
-				if (fallbackDowngradeTimes.length < ANTHROPIC_FALLBACK_MAX_RETRIES) {
-					fallbackDowngradeTimes.push(now);
-					// Override the provider's worst-case reset hint (the SDK obeys
-					// retry-after verbatim, which would mean a silent multi-hour
-					// sleep) with the explicit bounded delay. The ORIGINAL body
-					// stream is passed through untouched -- only headers change.
-					headers.set("retry-after-ms", String(ANTHROPIC_FALLBACK_RETRY_DELAY_MS));
-					headers.delete("retry-after");
-					return new Response(response.body, {
-						status: response.status,
-						statusText: response.statusText,
-						headers,
-					});
-				}
-			}
+		if (classification === "fallback_retryable" && takeAnthropicFallbackBudget(Date.now())) {
+			// The wrapper waits and re-fetches itself: scheduler.wait is
+			// signal-aware (rejects promptly on abort), the SDK never sees
+			// the downgraded 429 (its retry budget and non-abortable sleep
+			// stay untouched), and no Response is reconstructed. Recursion
+			// is bounded by the process-wide budget above.
+			const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+			await scheduler.wait(ANTHROPIC_FALLBACK_RETRY_DELAY_MS, { signal: signal ?? undefined });
+			return wrapped(input, init);
+		}
 
-			headers.set("x-should-retry", "false");
-			return new Response(appendAnthropicRateLimitEvidence(bodyText, headers), {
-				status: response.status,
-				statusText: response.statusText,
-				headers,
-			});
-		},
-		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
-	);
+		headers.set("x-should-retry", "false");
+		return new Response(appendAnthropicRateLimitEvidence(bodyText, headers), {
+			status: response.status,
+			statusText: response.statusText,
+			headers,
+		});
+	};
+	return Object.assign(wrapped, baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {});
 }
 
 // The Anthropic SDK logs malformed SSE frames directly before rethrowing them.
