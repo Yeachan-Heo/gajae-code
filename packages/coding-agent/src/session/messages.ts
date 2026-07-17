@@ -35,6 +35,14 @@ import { formatOutputNotice } from "../tools/output-meta";
  * Encode untrusted values embedded in prompt markup. Control and bidi characters
  * become visible escape sequences so they cannot alter markup structure or display.
  */
+/** Neutralize system-reminder tag sequences so embedded file content cannot escape authority framing. */
+export function neutralizeSystemReminderTags(value: string): string {
+	return value
+		.replace(/<\/?system-reminder\b[^>]*>/gi, match => match.replaceAll("<", "&lt;").replaceAll(">", "&gt;"))
+		.replace(/<\/?system\b[^>]*>/gi, match => match.replaceAll("<", "&lt;").replaceAll(">", "&gt;"))
+		.replace(/<\/?developer\b[^>]*>/gi, match => match.replaceAll("<", "&lt;").replaceAll(">", "&gt;"));
+}
+
 export function escapePromptMetadata(value: string, options: { preserveNewlines?: boolean } = {}): string {
 	return value.replace(/[&<>"\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/g, char => {
 		if (options.preserveNewlines && (char === "\n" || char === "\t")) return char;
@@ -392,7 +400,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					const fileContents = m.files
 						.map(file => {
 							const inner = file.content
-								? `\n${file.content.replace(/<\/system-reminder>/gi, "&lt;/system-reminder>")}\n`
+								? `\n${neutralizeSystemReminderTags(file.content)}\n`
 								: "\n";
 							return `<file path="${escapePromptMetadata(file.path)}">${inner}</file>`;
 						})

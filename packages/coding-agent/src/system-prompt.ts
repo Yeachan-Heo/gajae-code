@@ -15,7 +15,7 @@ import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
 import volatileProjectContextTemplate from "./prompts/system/volatile-project-context.md" with { type: "text" };
-import { escapePromptMetadata } from "./session/messages";
+import { escapePromptMetadata, neutralizeSystemReminderTags } from "./session/messages";
 import { DEFAULT_ESSENTIAL_TOOL_NAMES } from "./tools";
 import { shortenPath } from "./tools/render-utils";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
@@ -235,13 +235,18 @@ export interface LoadContextFilesOptions {
 function dedupeExactContextFiles(
 	contextFiles: Array<{ path: string; content: string; depth?: number }>,
 ): Array<{ path: string; content: string; depth?: number }> {
+	const sanitized = contextFiles.map(file => ({
+		...file,
+		path: escapePromptMetadata(file.path),
+		content: neutralizeSystemReminderTags(file.content),
+	}));
 	const lastIndexByContent = new Map<string, number>();
-	for (const [index, file] of contextFiles.entries()) {
+	for (const [index, file] of sanitized.entries()) {
 		// Keep the closest matching context entry when content is byte-for-byte identical.
 		lastIndexByContent.set(file.content, index);
 	}
 
-	return contextFiles.filter((file, index) => lastIndexByContent.get(file.content) === index);
+	return sanitized.filter((file, index) => lastIndexByContent.get(file.content) === index);
 }
 
 /**
