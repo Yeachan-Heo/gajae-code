@@ -71,4 +71,4 @@ export interface LoadFromCandidatesResult<T> {
 
 export function loadFromCandidates<T>(input: LoadFromCandidatesInput<T>): LoadFromCandidatesResult<T>;
 
-export function loadNative(): Record<string, unknown>;
+export function loadNative<T extends Record<string, unknown> = Record<string, unknown>>(): T;

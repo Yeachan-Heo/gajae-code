@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { ComputerController } from "@gajae-code/natives";
+import { loadNative } from "@gajae-code/natives/loader-state";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import {
 	GATE0_LIFECYCLE_TIMEOUT_MS,
@@ -30,6 +30,10 @@ export interface Gate0NativeController {
 	gate0RequestScreenRecording(): boolean;
 	gate0HarmlessProbe(): { screenshot: boolean; accessibility: boolean; pointerMoveRestore: boolean };
 }
+
+type Gate0NativeBindings = Record<string, unknown> & {
+	ComputerController: new () => Gate0NativeController;
+};
 
 /** The sole redacted schema emitted by the hidden Gate-0 dispatcher. */
 export interface Gate0Result {
@@ -92,7 +96,8 @@ const GATE0_MARKERS = new Set<Gate0LifecycleMarker>([
 ]);
 
 function nativeController(): Gate0NativeController {
-	return new ComputerController() as Gate0NativeController;
+	const { ComputerController } = loadNative<Gate0NativeBindings>();
+	return new ComputerController();
 }
 
 function result(
