@@ -53,6 +53,22 @@ export declare class MacOSPowerAssertion {
 }
 
 /**
+ * Streaming on-device speech recognition session (macOS).
+ *
+ * `start()` opens the microphone through `AVAudioEngine`, streams buffers to
+ * `SFSpeechRecognizer`, and reports `partial` / `level` events until either
+ * `stop()` (graceful — emits one terminal `final` event) or `cancel()`
+ * (silent abort). On non-macOS platforms `start()` fails with an error.
+ */
+export declare class MacSpeechSession {
+  static start(options: MacSpeechStartOptions, callback: (err: null | Error, event: MacSpeechEvent) => void): MacSpeechSession
+  /** Graceful stop — the terminal `final` event arrives via the callback. */
+  stop(): void
+  /** Hard cancel — suppresses all further events, including `final`. */
+  cancel(): void
+}
+
+/**
  * In-process, session-independent lifecycle **control** server exposed to TS.
  *
  * Transport-only: it authenticates (handshake + per-frame), forwards valid
@@ -1349,6 +1365,77 @@ export interface MacOSPowerAssertionOptions {
   user?: boolean
   /** `caffeinate -d`: prevent the display from idle-sleeping. */
   display?: boolean
+}
+
+/**
+ * Current speech-recognition authorization status:
+ * `"authorized" | "denied" | "restricted" | "notDetermined"`.
+ * Returns `null` on non-macOS platforms.
+ */
+export declare function macSpeechAuthorizationStatus(): string | null
+
+/**
+ * One streaming event delivered to the JS callback of a
+ * [`MacSpeechSession`].
+ */
+export interface MacSpeechEvent {
+  /** `"partial"` | `"final"` | `"level"` | `"error"`. */
+  kind: string
+  /** Transcription text for `partial` / `final` events. */
+  text?: string
+  /** Normalized input level (0..1) for `level` events. */
+  level?: number
+  /** Human-readable failure description for `error` events. */
+  message?: string
+}
+
+/**
+ * Trigger the speech-recognition permission prompt.
+ *
+ * The callback receives the resolved status exactly once (see module docs
+ * for the CLI-safe completion strategy). On non-macOS platforms the
+ * callback fires immediately with `"notDetermined"`.
+ */
+export declare function macSpeechRequestAuthorization(callback: (err: null | Error, status: string) => void): void
+
+/** Options for starting a [`MacSpeechSession`]. */
+export interface MacSpeechStartOptions {
+  /**
+   * BCP-47 locale identifier (e.g. `"ko-KR"`). Defaults to the system
+   * locale when omitted.
+   */
+  locale?: string
+  /**
+   * Require on-device recognition (no audio leaves the machine). When the
+   * locale has no on-device support, session start fails with an `error`
+   * event instead of silently falling back to Apple servers. Default: true.
+   */
+  onDeviceOnly?: boolean
+  /**
+   * Domain vocabulary (identifiers, file names, product terms) passed to
+   * the recognizer as `contextualStrings` to bias recognition.
+   */
+  contextualStrings?: Array<string>
+  /** Ask the recognizer to add punctuation (macOS 13+). Default: true. */
+  punctuation?: boolean
+}
+
+/**
+ * Report Apple speech backend capability for a locale.
+ * All fields are `false` on non-macOS platforms.
+ */
+export declare function macSpeechSupport(locale?: string | undefined | null): MacSpeechSupport
+
+/** Locale capability report for the Apple speech backend. */
+export interface MacSpeechSupport {
+  /** Platform is macOS and the recognizer class is present. */
+  platform: boolean
+  /** A recognizer exists for the requested locale. */
+  locale: boolean
+  /** The recognizer currently reports itself available (assets present). */
+  available: boolean
+  /** The locale supports on-device (private) recognition. */
+  onDevice: boolean
 }
 
 /** A single match in the content. */
