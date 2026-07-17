@@ -178,3 +178,54 @@ describe("silent-input hint", () => {
 		controller.cancel(options);
 	});
 });
+
+describe("silence auto-stop endpointing", () => {
+	test("auto-finalizes after speech followed by sustained silence", async () => {
+		script.finalText = "auto stopped text";
+		let clock = 0;
+		const controller = new STTController({ now: () => clock });
+		const { inserted, editor, options } = harness();
+		await controller.toggle(editor, options);
+
+		// Speak (activity), then go silent past the window.
+		lastSession?.options.onLevel?.(0.5);
+		lastSession?.options.onPartial?.("auto stopped text");
+		clock = 4_000;
+		lastSession?.options.onLevel?.(0.01);
+		await new Promise(r => setTimeout(r, 20));
+
+		expect(controller.state).toBe("idle");
+		expect(inserted).toEqual(["auto stopped text"]);
+	});
+
+	test("never auto-stops before any speech, regardless of elapsed time", async () => {
+		let clock = 0;
+		const controller = new STTController({ now: () => clock });
+		const { editor, options } = harness();
+		await controller.toggle(editor, options);
+
+		clock = 60_000;
+		lastSession?.options.onLevel?.(0.01);
+		await new Promise(r => setTimeout(r, 20));
+
+		expect(controller.state).toBe("recording");
+		controller.cancel(options);
+	});
+
+	test("continued speech keeps the session alive past the window", async () => {
+		let clock = 0;
+		const controller = new STTController({ now: () => clock });
+		const { editor, options } = harness();
+		await controller.toggle(editor, options);
+
+		lastSession?.options.onLevel?.(0.5);
+		clock = 2_000;
+		lastSession?.options.onLevel?.(0.5); // still talking — activity refreshed
+		clock = 4_000;
+		lastSession?.options.onLevel?.(0.5);
+		await new Promise(r => setTimeout(r, 20));
+
+		expect(controller.state).toBe("recording");
+		controller.cancel(options);
+	});
+});
