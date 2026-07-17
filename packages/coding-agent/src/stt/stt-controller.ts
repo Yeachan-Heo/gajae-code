@@ -8,6 +8,8 @@ export type SttState = "idle" | "recording" | "transcribing";
 
 /** All-zero input for this long while recording triggers the dead-mic hint. */
 const SILENT_INPUT_HINT_AFTER_MS = 3_000;
+/** Levels above this count as voice activity for auto-stop endpointing. */
+const VOICE_ACTIVITY_LEVEL = 0.12;
 export const SILENT_INPUT_HINT =
 	"No microphone signal — your terminal may lack microphone permission (System Settings → Privacy & Security → Microphone).";
 
@@ -38,6 +40,13 @@ export class STTController {
 	#listeningStartedAt = 0;
 	#sawInputSignal = false;
 	#silentHintShown = false;
+	/** Auto-stop endpointing: last time voice activity (level or partial) was seen. */
+	#lastVoiceActivityAt = 0;
+	/** Auto-stop arms only after the user has actually said something. */
+	#hasSpoken = false;
+	#autoStopArmed = false;
+	#activeEditor: Editor | null = null;
+	#activeOptions: ToggleOptions | null = null;
 	/** Injectable clock so silence-window tests never touch global Date.now. */
 	#now: () => number;
 
@@ -64,7 +73,7 @@ export class STTController {
 		try {
 			switch (this.#state) {
 				case "idle":
-					await this.#startListening(options);
+					await this.#startListening(editor, options);
 					break;
 				case "recording":
 					await this.#stopAndInsert(editor, options);
@@ -96,7 +105,26 @@ export class STTController {
 		return true;
 	}
 
-	async #startListening(options: ToggleOptions): Promise<void> {
+	/**
+	 * Silence endpointing: once the user has spoken, sustained silence for
+	 * `stt.autoStopSeconds` finalizes the session as if the toggle key was
+	 * pressed. Never fires before speech, so ambient noise cannot cut off a
+	 * session that has not started.
+	 */
+	#maybeAutoStop(generation: number): void {
+		if (!this.#autoStopArmed || !this.#hasSpoken || this.#state !== "recording") return;
+		if (generation !== this.#generation || this.#toggling) return;
+		const seconds = (settings.get("stt.autoStopSeconds") as number | undefined) ?? 2.5;
+		if (seconds <= 0) return;
+		if (this.#now() - this.#lastVoiceActivityAt < seconds * 1000) return;
+		const editor = this.#activeEditor;
+		const options = this.#activeOptions;
+		if (!editor || !options) return;
+		this.#autoStopArmed = false;
+		void this.toggle(editor, options);
+	}
+
+	async #startListening(editorForSession: Editor, options: ToggleOptions): Promise<void> {
 		const generation = ++this.#generation;
 		try {
 			const preference = (settings.get("stt.backend") as SttBackendPreference | undefined) ?? "auto";
@@ -117,11 +145,20 @@ export class STTController {
 				},
 				onPartial: text => {
 					if (generation === this.#generation && this.#state === "recording") {
+						if (text.trim().length > 0) {
+							this.#hasSpoken = true;
+							this.#lastVoiceActivityAt = this.#now();
+						}
 						options.onPartial?.(formatGhostTranscript(text));
 					}
 				},
 				onLevel: level => {
 					if (generation === this.#generation && this.#state === "recording") {
+						if (level >= VOICE_ACTIVITY_LEVEL) {
+							this.#hasSpoken = true;
+							this.#lastVoiceActivityAt = this.#now();
+						}
+						this.#maybeAutoStop(generation);
 						if (level > 0) this.#sawInputSignal = true;
 						else if (
 							!this.#sawInputSignal &&
@@ -148,8 +185,13 @@ export class STTController {
 			}
 			this.#session = session;
 			this.#listeningStartedAt = this.#now();
+			this.#lastVoiceActivityAt = this.#now();
 			this.#sawInputSignal = false;
 			this.#silentHintShown = false;
+			this.#hasSpoken = false;
+			this.#autoStopArmed = ((settings.get("stt.autoStopSeconds") as number | undefined) ?? 2.5) > 0;
+			this.#activeEditor = editorForSession;
+			this.#activeOptions = options;
 			this.#setState("recording", options);
 			logger.debug("STT listening", { backend: backend.id });
 		} catch (err) {

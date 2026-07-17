@@ -1423,6 +1423,15 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"stt.autoStopSeconds": {
+		type: "number",
+		default: 2.5,
+		ui: {
+			tab: "interaction",
+			label: "Voice Auto-Stop (seconds)",
+			description: "Finalize voice input after this much silence once you have spoken (0 disables)",
+		},
+	},
 	"stt.language": {
 		type: "string",
 		default: "en",
