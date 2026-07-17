@@ -1,6 +1,7 @@
 import { Box, Markdown, Spacer, Text } from "@gajae-code/tui";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import type { BranchSummaryMessage } from "../../session/messages";
+import { EXPAND_HINT_TEXT } from "../../tools/render-utils";
 
 /**
  * Component that renders a branch summary message with collapsed/expanded state.
@@ -39,7 +40,7 @@ export class BranchSummaryMessageComponent extends Box {
 				}),
 			);
 		} else {
-			this.addChild(new Text(theme.fg("customMessageText", "Branch summary (ctrl+o to expand)"), 0, 0));
+			this.addChild(new Text(theme.fg("customMessageText", `Branch summary (${EXPAND_HINT_TEXT})`), 0, 0));
 		}
 	}
 }

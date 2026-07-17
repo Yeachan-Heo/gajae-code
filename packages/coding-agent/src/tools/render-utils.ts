@@ -75,8 +75,10 @@ export const TRUNCATE_LENGTHS = {
 	SHORT: 40,
 } as const;
 
-/** Standard expand hint text */
-export const EXPAND_HINT = "(Ctrl+O for more)";
+/** Standard expand hint text (plain, no theme brackets). */
+export const EXPAND_HINT_TEXT = "ctrl+o to expand";
+/** Bracket-wrapped default used by formatExpandHint via theme brackets. */
+export const EXPAND_HINT = EXPAND_HINT_TEXT;
 
 // =============================================================================
 // Text Truncation Utilities

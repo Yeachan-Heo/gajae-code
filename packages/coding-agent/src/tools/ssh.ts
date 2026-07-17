@@ -20,6 +20,7 @@ import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } fro
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
+import { EXPAND_HINT_TEXT } from "./render-utils";
 
 const sshSchema = z.object({
 	host: z.string().describe("ssh host"),
@@ -266,7 +267,7 @@ export const sshToolRenderer = {
 							outputLines.push(
 								uiTheme.fg(
 									"dim",
-									`… (${skippedCount} earlier lines, showing ${visualLines.length} of ${totalVisualLines}) (ctrl+o to expand)`,
+									`… (${skippedCount} earlier lines, showing ${visualLines.length} of ${totalVisualLines}) (${EXPAND_HINT_TEXT})`,
 								),
 							);
 						}
@@ -281,7 +282,7 @@ export const sshToolRenderer = {
 						const remaining = outputLinesRaw.length - maxLines;
 						outputLines.push(...displayLines.map(line => uiTheme.fg("toolOutput", line)));
 						if (remaining > 0) {
-							outputLines.push(uiTheme.fg("dim", `… (${remaining} more lines) (ctrl+o to expand)`));
+							outputLines.push(uiTheme.fg("dim", `… (${remaining} more lines) (${EXPAND_HINT_TEXT})`));
 						}
 					}
 				}
