@@ -143,3 +143,38 @@ describe("STTController", () => {
 		expect(partials).toEqual([null]);
 	});
 });
+
+describe("silent-input hint", () => {
+	test("warns once after sustained all-zero levels, never after real signal", async () => {
+		const { SILENT_INPUT_HINT } = await import("../src/stt/stt-controller");
+		let clock = 0;
+		const controller = new STTController({ now: () => clock });
+		const { events, editor, options } = harness();
+		await controller.toggle(editor, options);
+
+		// Zero levels before the window elapses: no hint yet.
+		lastSession?.options.onLevel?.(0);
+		expect(events.filter(e => e === `status:${SILENT_INPUT_HINT}`)).toHaveLength(0);
+
+		// Window elapses, then more zero levels: hint exactly once.
+		clock = 4_000;
+		lastSession?.options.onLevel?.(0);
+		lastSession?.options.onLevel?.(0);
+		expect(events.filter(e => e === `status:${SILENT_INPUT_HINT}`)).toHaveLength(1);
+
+		controller.cancel(options);
+	});
+
+	test("no hint when the mic delivers signal", async () => {
+		const { SILENT_INPUT_HINT } = await import("../src/stt/stt-controller");
+		let clock = 0;
+		const controller = new STTController({ now: () => clock });
+		const { events, editor, options } = harness();
+		await controller.toggle(editor, options);
+		lastSession?.options.onLevel?.(0.4);
+		clock = 10_000;
+		lastSession?.options.onLevel?.(0);
+		expect(events.filter(e => e === `status:${SILENT_INPUT_HINT}`)).toHaveLength(0);
+		controller.cancel(options);
+	});
+});
