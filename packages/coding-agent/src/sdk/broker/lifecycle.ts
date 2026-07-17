@@ -4,6 +4,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
+import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import { resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
@@ -944,7 +945,7 @@ function exactUnlinkLifecycleFile(
 	file: string,
 	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string },
 	plannedPath: string,
-): ReturnType<typeof native.exactUnlink> {
+): NativeExactUnlinkResult {
 	return native.exactUnlink(file, { ...identity, quarantineName: path.basename(plannedPath) });
 }
 
@@ -1565,7 +1566,7 @@ async function reconcileLifecycleCleanup(
 			continue;
 		}
 		let activePath: string | undefined;
-		let captured: ReturnType<typeof captureLifecycleFile>;
+		let captured: LifecycleFileCapture | undefined;
 		let foundUnauthorized = false;
 		for (const candidate of candidates) {
 			try {

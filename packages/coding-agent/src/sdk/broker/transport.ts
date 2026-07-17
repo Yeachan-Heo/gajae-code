@@ -38,12 +38,24 @@ function send(socket: ServerWebSocket<unknown>, frame: Record<string, unknown>):
 function sendError(socket: ServerWebSocket<unknown>, id: string | undefined, code: string, message: string): void {
 	send(socket, { type: "broker_response", ...(id === undefined ? {} : { id }), ok: false, error: { code, message } });
 }
+/**
+ * Concrete surface of the Bun HTTP server used by {@link BrokerTransport}.
+ * Named explicitly (per AGENTS.md, which forbids inferred return types)
+ * instead of deriving the type from `Bun.serve`, and limited to the members
+ * this transport actually touches: bound port, websocket upgrade, and stop.
+ */
+interface BrokerHttpServer {
+	readonly port: number | undefined;
+	upgrade(request: Request, options: { data?: undefined }): boolean;
+	stop(closeActiveConnections?: boolean): Promise<void>;
+}
+
 /** Loopback-only WebSocket transport for the agent-global SDK broker. */
 export class BrokerTransport {
 	readonly #broker: Broker;
 	readonly #token: string;
 	readonly #requestedPort: number;
-	#server: ReturnType<typeof Bun.serve> | null = null;
+	#server: BrokerHttpServer | null = null;
 	#port = 0;
 	constructor(broker: Broker, token: string, port = 0) {
 		this.#broker = broker;
