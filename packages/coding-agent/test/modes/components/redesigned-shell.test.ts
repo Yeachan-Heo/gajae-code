@@ -13,7 +13,7 @@ import { resolveWelcomeLogoMode } from "@gajae-code/coding-agent/modes/interacti
 import { getEditorTheme, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { type TUI, visibleWidth } from "@gajae-code/tui";
-import { StatusLineComponent } from "../../../src/modes/components/status-line";
+import { StatusLineComponent } from "../../../src/modes/components/tool-status-header";
 
 function createFooterSession(): AgentSession {
 	return {

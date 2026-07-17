@@ -1,7 +1,7 @@
 import type { StatusLinePreset, StatusLineSegmentId, StatusLineSeparatorStyle } from "../../../config/settings-schema";
 import type { AgentSession } from "../../../session/agent-session";
 import type { JobsSnapshot } from "../../jobs-observer";
-import type { StatusLineSegmentOptions, StatusLineSettings } from "../status-line";
+import type { StatusLineSegmentOptions, StatusLineSettings } from "../tool-status-header";
 
 export type {
 	StatusLinePreset,

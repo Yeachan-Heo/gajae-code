@@ -1099,6 +1099,57 @@ describe("shared Telegram setup poller-contention policy", () => {
 	});
 });
 
+test("Discord setup prompts missing values and commits them atomically", async () => {
+	const settings = setupSettings();
+	const prompts: Array<[string, boolean]> = [];
+	const values = ["discord-secret", "app", "guild", "channel"];
+	await runNotifyCommand(
+		{ action: "setup", provider: "discord", rawArgs: [] },
+		{
+			settings,
+			setupInteractive: true,
+			valuePrompt: async (label, masked) => {
+				prompts.push([label, masked]);
+				return values.shift() ?? "";
+			},
+			ensureProviderDaemon: async () => "attached",
+		},
+	);
+	expect(prompts).toEqual([
+		["discord-bot-token: ", true],
+		["discord-application-id: ", false],
+		["discord-guild-id: ", false],
+		["discord-parent-channel-id: ", false],
+	]);
+	expect(getNotificationConfig(settings).discord).toMatchObject({
+		botToken: "discord-secret",
+		applicationId: "app",
+		guildId: "guild",
+		parentChannelId: "channel",
+	});
+});
+
+test("interactive Discord setup validates prompted required values before persistence", async () => {
+	for (const prompted of ["   ", "--redact"]) {
+		const settings = setupSettings();
+		await expect(
+			runNotifyCommand(
+				{ action: "setup", provider: "discord", rawArgs: [] },
+				{
+					settings,
+					setupInteractive: true,
+					valuePrompt: async () => prompted,
+				},
+			),
+		).rejects.toThrow(prompted.trim() ? "must not start with --" : "is required");
+		expect(getNotificationConfig(settings).discord?.botToken).toBeUndefined();
+	}
+});
+
+test("notify parser rejects flag values that look like flags and unknown subcommands", () => {
+	expect(parseNotifyArgs(["notify", "setup", "discord", "--discord-bot-token", "--redact"])).toBeUndefined();
+	expect(parseNotifyArgs(["notify", "bogus"])).toBeUndefined();
+});
 test("CLI setup reports atomic persistence failure without an enabled success message", async () => {
 	const settings = setupSettings({
 		"notifications.enabled": true,

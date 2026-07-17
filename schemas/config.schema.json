@@ -837,7 +837,7 @@
 				},
 				"maxDelayMs": {
 					"type": "number",
-					"description": "Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+					"description": "Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 					"default": 300000
 				},
 				"requestMaxRetries": {

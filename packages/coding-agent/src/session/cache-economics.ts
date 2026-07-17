@@ -128,18 +128,32 @@ export function computeCacheMissCostSummary(
 		return undefined;
 	if (usage.input <= 0 && cacheWriteCostUsd <= 0) return undefined;
 	if (!hasMaterialEvidence(usage, [inputCostUsd, cacheReadCostUsd, cacheWriteCostUsd])) return undefined;
-	if (inputCostUsd <= 0 && cacheWriteCostUsd <= 0) return undefined;
+	const hasAllZeroModelPrices =
+		basis.kind === "current-model-estimate" &&
+		basis.pricing.input === 0 &&
+		basis.pricing.cacheRead === 0 &&
+		basis.pricing.cacheWrite === 0;
+	if (inputCostUsd <= 0 && cacheWriteCostUsd <= 0 && !hasAllZeroModelPrices) return undefined;
 
 	const totalReusableInput = usage.input + usage.cacheRead;
 	const cacheHitRate = totalReusableInput > 0 ? usage.cacheRead / totalReusableInput : undefined;
-	const missPremiumUsd =
+	const inputMissPremiumUsd =
 		basis.kind === "current-model-estimate" &&
 		positiveFinite(basis.pricing.input) &&
 		positiveFinite(basis.pricing.cacheRead) &&
 		basis.pricing.input > basis.pricing.cacheRead &&
 		usage.input > 0
 			? ((basis.pricing.input - basis.pricing.cacheRead) * usage.input) / TOKENS_PER_MILLION
-			: undefined;
+			: 0;
+	const cacheWritePremiumUsd =
+		basis.kind === "current-model-estimate" &&
+		positiveFinite(basis.pricing.cacheWrite) &&
+		positiveFinite(basis.pricing.cacheRead) &&
+		basis.pricing.cacheWrite > basis.pricing.cacheRead &&
+		usage.cacheWrite > 0
+			? ((basis.pricing.cacheWrite - basis.pricing.cacheRead) * usage.cacheWrite) / TOKENS_PER_MILLION
+			: 0;
+	const missPremiumUsd = inputMissPremiumUsd + cacheWritePremiumUsd;
 
 	return {
 		inputTokens: usage.input,
@@ -179,14 +193,17 @@ export function buildCacheBehaviorWarning(
 	usage: Usage | undefined,
 	model: { cost: CacheEconomicsModelCost } | undefined | null,
 ): CacheBehaviorWarning | undefined {
-	const summary = model
-		? computeCacheMissCostSummary(usage, { kind: "current-model-estimate", pricing: model.cost })
-		: undefined;
+	if (!model) return undefined;
+	const summary = computeCacheMissCostSummary(usage, {
+		kind: "current-model-estimate",
+		pricing: model.cost,
+	});
 	if (!summary) return undefined;
+	const tokenOnlyPricing = model.cost.input === 0 && model.cost.cacheRead === 0 && model.cost.cacheWrite === 0;
 	if (
 		summary.inputTokens >= LARGE_INPUT_TOKENS &&
 		(summary.cacheHitRate === undefined || summary.cacheHitRate < 0.25) &&
-		summary.inputCostUsd >= EXPENSIVE_MISS_COST_USD
+		(tokenOnlyPricing || summary.inputCostUsd >= EXPENSIVE_MISS_COST_USD)
 	) {
 		// Attribute by observable cache activity rather than asserting a cause (#2020).
 		const noCacheActivity = summary.cacheReadTokens <= 0 && summary.cacheWriteTokens <= 0;
@@ -228,7 +245,7 @@ export function buildCacheBehaviorWarning(
 	}
 	if (
 		summary.cacheWriteTokens >= LARGE_CACHE_WRITE_TOKENS &&
-		summary.cacheWriteCostUsd >= EXPENSIVE_MISS_COST_USD &&
+		(tokenOnlyPricing || summary.cacheWriteCostUsd >= EXPENSIVE_MISS_COST_USD) &&
 		// Only claim reuse is insufficient when reads actually fail to cover the
 		// writes; a large write that is being read back is healthy, not a spike.
 		summary.cacheReadTokens < summary.cacheWriteTokens

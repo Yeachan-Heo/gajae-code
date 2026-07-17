@@ -210,7 +210,7 @@ describe("AgentSession resilient retry", () => {
 		expect(waitSpy).toHaveBeenCalled();
 	});
 
-	it("retries unknown / no-code errors", async () => {
+	it("retries unknown / no-code errors within retry.maxRetries", async () => {
 		session = buildSession({
 			responses: [{ throw: "weird unclassified glitch zzz" }, { content: ["recovered"] }],
 		});
@@ -221,7 +221,7 @@ describe("AgentSession resilient retry", () => {
 		await session.waitForIdle();
 
 		expect(retryStartEvents).toHaveLength(1);
-		expect(retryStartEvents[0].unbounded).toBe(true);
+		expect(retryStartEvents[0].unbounded).toBe(false);
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(lastAssistant(session).stopReason).toBe("stop");

@@ -112,7 +112,6 @@ modelBindings:
 - `azure-openai-responses`
 - `bedrock-converse-stream`
 - `anthropic-messages`
-- `bedrock-converse-stream`
 - `google-generative-ai`
 - `google-vertex`
 - `google-gemini-cli`
@@ -281,7 +280,7 @@ providers:
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
-- `discovery.type`: `ollama`, `llama.cpp`, or `lm-studio`
+- `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, or `openai-models-list`
 - `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` (`ttl: "1h"`) because the ~5m default is too fragile for long-running subagent workflows. The 1h marker is only emitted on the canonical Anthropic API (`api.anthropic.com`) for models advertising `supportsLongCacheRetention`; proxies, gateways, and incapable models fall back to the default ephemeral (~5m) breakpoint. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
 
 ## OpenAI-compatible proxy configuration
@@ -469,9 +468,10 @@ When multiple concrete variants share a canonical id, resolution uses:
 
 1. availability and auth
 2. `config.yml` `modelProviderOrder`
-3. existing registry/provider order if `modelProviderOrder` is unset
+3. the lowest combined `cost.input + cost.cacheRead`
+4. existing registry/provider order if the earlier ranks tie
 
-Disabled or unauthenticated providers are skipped.
+Disabled or unauthenticated providers are skipped. A session that resolves a canonical selector keeps its concrete variant across discovery refreshes; it changes only after an explicit concrete selection or when that variant is no longer available.
 
 Session state and transcripts continue to record the concrete provider/model that actually executed the turn.
 

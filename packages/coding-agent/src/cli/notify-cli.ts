@@ -75,6 +75,7 @@ export interface NotifyCommandDeps {
 	tokenPrompt?: () => Promise<string>;
 	setExitCode?: (code: number) => void;
 	exitProcess?: (code: number) => void;
+	valuePrompt?: (label: string, masked: boolean) => Promise<string>;
 	/** Optional daemon ownership facts collected by an embedding host. */
 	setupPreflight?: TelegramSetupPreflight;
 	/** Injectable timers and cancellation for setup pairing. */
@@ -99,6 +100,27 @@ export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
 			const i = rest.indexOf(name);
 			return i >= 0 ? rest[i + 1] : undefined;
 		};
+		const valueFlags = [
+			"--token",
+			"--chat-id",
+			"--discord-bot-token",
+			"--discord-application-id",
+			"--discord-guild-id",
+			"--discord-parent-channel-id",
+			"--slack-bot-token",
+			"--slack-app-token",
+			"--slack-workspace-id",
+			"--slack-channel-id",
+			"--slack-authorized-user-id",
+		];
+		if (
+			valueFlags.some(name => {
+				const index = rest.indexOf(name);
+				const value = index >= 0 ? rest[index + 1] : undefined;
+				return index >= 0 && (!value || value.startsWith("--"));
+			})
+		)
+			return undefined;
 		const provider = rest[0]?.startsWith("--") ? undefined : rest[0];
 		if (provider !== undefined && provider !== "telegram" && provider !== "discord" && provider !== "slack") {
 			return undefined;
@@ -144,7 +166,7 @@ export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
 		};
 	}
 
-	return { action: "status", rawArgs: args.slice(1) };
+	return undefined;
 }
 
 export async function runNotifyCommand(cmd: NotifyCommandArgs, deps: NotifyCommandDeps = {}): Promise<void> {
@@ -221,22 +243,41 @@ async function runSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promis
 
 function requiredSetupValue(value: string | undefined, flag: string): string {
 	if (!value?.trim()) throw new Error(`${flag} is required for non-interactive setup.`);
+	if (value.trim().startsWith("--")) throw new Error(`${flag} must not start with --.`);
 	return value.trim();
 }
 
+async function promptSetupValue(
+	value: string | undefined,
+	flag: string,
+	masked: boolean,
+	deps: NotifyCommandDeps,
+): Promise<string> {
+	if (value?.trim()) return requiredSetupValue(value, flag);
+	if (!resolveSetupInteractive(deps)) return requiredSetupValue(value, flag);
+	return requiredSetupValue(await (deps.valuePrompt ?? promptForValue)(`${flag.slice(2)}: `, masked), flag);
+}
+
 async function runDiscordSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promise<void> {
-	const botToken = requiredSetupValue(cmd.discordBotToken, "--discord-bot-token");
-	const applicationId = requiredSetupValue(cmd.discordApplicationId, "--discord-application-id");
-	const guildId = requiredSetupValue(cmd.discordGuildId, "--discord-guild-id");
-	const parentChannelId = requiredSetupValue(cmd.discordParentChannelId, "--discord-parent-channel-id");
+	const botToken = await promptSetupValue(cmd.discordBotToken, "--discord-bot-token", true, deps);
+	const applicationId = await promptSetupValue(cmd.discordApplicationId, "--discord-application-id", false, deps);
+	const guildId = await promptSetupValue(cmd.discordGuildId, "--discord-guild-id", false, deps);
+	const parentChannelId = await promptSetupValue(
+		cmd.discordParentChannelId,
+		"--discord-parent-channel-id",
+		false,
+		deps,
+	);
 	const settings = await getSettings(deps);
-	settings.set("notifications.discord.botToken", botToken);
-	settings.set("notifications.discord.applicationId", applicationId);
-	settings.set("notifications.discord.guildId", guildId);
-	settings.set("notifications.discord.parentChannelId", parentChannelId);
-	settings.set("notifications.enabled", true);
-	if (cmd.redact) settings.set("notifications.redact", true);
-	await settings.flushOrThrow();
+	const patches: SettingsAtomicPatch[] = [
+		{ path: "notifications.discord.botToken", op: "set", value: botToken },
+		{ path: "notifications.discord.applicationId", op: "set", value: applicationId },
+		{ path: "notifications.discord.guildId", op: "set", value: guildId },
+		{ path: "notifications.discord.parentChannelId", op: "set", value: parentChannelId },
+		{ path: "notifications.enabled", op: "set", value: true },
+	];
+	if (cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
+	await settings.commitAtomicBatch(patches);
 	const daemon = await ensureConfiguredProviderDaemon("discord", settings, deps);
 	process.stdout.write(
 		`Discord notifications enabled. botToken=${maskToken(botToken)} applicationId=${applicationId} guildId=${guildId} parentChannelId=${parentChannelId} daemon=${daemon}\n`,
@@ -244,20 +285,24 @@ async function runDiscordSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps):
 }
 
 async function runSlackSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promise<void> {
-	const botToken = requiredSetupValue(cmd.slackBotToken, "--slack-bot-token");
-	const appToken = requiredSetupValue(cmd.slackAppToken, "--slack-app-token");
-	const workspaceId = requiredSetupValue(cmd.slackWorkspaceId, "--slack-workspace-id");
-	const channelId = requiredSetupValue(cmd.slackChannelId, "--slack-channel-id");
+	const botToken = await promptSetupValue(cmd.slackBotToken, "--slack-bot-token", true, deps);
+	const appToken = await promptSetupValue(cmd.slackAppToken, "--slack-app-token", true, deps);
+	const workspaceId = await promptSetupValue(cmd.slackWorkspaceId, "--slack-workspace-id", false, deps);
+	const channelId = await promptSetupValue(cmd.slackChannelId, "--slack-channel-id", false, deps);
 	const authorizedUserId = cmd.slackAuthorizedUserId?.trim() || undefined;
 	const settings = await getSettings(deps);
-	settings.set("notifications.slack.botToken", botToken);
-	settings.set("notifications.slack.appToken", appToken);
-	settings.set("notifications.slack.workspaceId", workspaceId);
-	settings.set("notifications.slack.channelId", channelId);
-	settings.set("notifications.slack.authorizedUserId", authorizedUserId);
-	settings.set("notifications.enabled", true);
-	if (cmd.redact) settings.set("notifications.redact", true);
-	await settings.flushOrThrow();
+	const patches: SettingsAtomicPatch[] = [
+		{ path: "notifications.slack.botToken", op: "set", value: botToken },
+		{ path: "notifications.slack.appToken", op: "set", value: appToken },
+		{ path: "notifications.slack.workspaceId", op: "set", value: workspaceId },
+		{ path: "notifications.slack.channelId", op: "set", value: channelId },
+		authorizedUserId === undefined
+			? { path: "notifications.slack.authorizedUserId", op: "unset" }
+			: { path: "notifications.slack.authorizedUserId", op: "set", value: authorizedUserId },
+		{ path: "notifications.enabled", op: "set", value: true },
+	];
+	if (cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
+	await settings.commitAtomicBatch(patches);
 	const daemon = await ensureConfiguredProviderDaemon("slack", settings, deps);
 	process.stdout.write(
 		`Slack notifications enabled. botToken=${maskToken(botToken)} appToken=${maskToken(appToken)} workspaceId=${workspaceId} channelId=${channelId} authorizedUserId=${authorizedUserId ?? "(unset; inbound denied)"} daemon=${daemon}\n`,
@@ -437,7 +482,8 @@ type TokenPromptInput = NodeJS.ReadStream & {
 
 type TokenPromptOutput = Pick<NodeJS.WriteStream, "write">;
 
-export async function promptForToken(
+async function promptForMaskedValue(
+	label: string,
 	input: TokenPromptInput = process.stdin,
 	output: TokenPromptOutput = process.stdout,
 ): Promise<string> {
@@ -448,7 +494,7 @@ export async function promptForToken(
 		throw new Error("notify setup requires a TTY with raw input support unless setupToken is injected.");
 	}
 
-	output.write("Telegram BotFather token: ");
+	output.write(label);
 	const wasRaw = input.isRaw === true;
 	input.setRawMode(true);
 
@@ -501,6 +547,26 @@ export async function promptForToken(
 		input.once("error", onError);
 		input.resume();
 	});
+}
+
+export async function promptForToken(
+	input: TokenPromptInput = process.stdin,
+	output: TokenPromptOutput = process.stdout,
+): Promise<string> {
+	return await promptForMaskedValue("Telegram BotFather token: ", input, output);
+}
+
+async function promptForValue(label: string, masked: boolean): Promise<string> {
+	if (masked) return await promptForMaskedValue(label);
+	if (!process.stdin.isTTY) {
+		throw new Error("notify setup requires an interactive TTY unless all setup values are supplied as flags.");
+	}
+	const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+	try {
+		return (await rl.question(label)).trim();
+	} finally {
+		rl.close();
+	}
 }
 
 function resolveSetupInteractive(deps: NotifyCommandDeps): boolean {

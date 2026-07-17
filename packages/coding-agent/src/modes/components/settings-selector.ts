@@ -33,9 +33,9 @@ import {
 import { createPetSelectItems, getPetUnavailableWarning, isPetAvailable } from "./pet-capability";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
 import { getSettingsForTab, type SettingDef } from "./settings-defs";
-import type { StatusLineSegmentOptions } from "./status-line";
 import { getPreset } from "./status-line/presets";
 import { ALL_SEGMENT_IDS } from "./status-line/segments";
+import type { StatusLineSegmentOptions } from "./tool-status-header";
 
 /**
  * A submenu component for selecting from a list of options.

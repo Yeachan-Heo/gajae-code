@@ -277,6 +277,8 @@ export interface ToolSession {
 	bashRestrictionProfile?: BashRestrictionProfile;
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
+	/** Throw instead of warn when toolNames contains an unknown name. */
+	strictToolNames?: boolean;
 	/** Get artifacts directory for artifact:// URLs */
 	getArtifactsDir?: () => string | null;
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
@@ -657,6 +659,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		requestedTools.push("yield");
 	}
 
+	if (requestedTools) {
+		const unknownToolNames = requestedTools.filter(name => !allToolsByRequestName.has(name));
+		if (unknownToolNames.length > 0) {
+			const message = `Unknown tool name${unknownToolNames.length === 1 ? "" : "s"}: ${unknownToolNames.join(", ")}`;
+			if (session.strictToolNames) throw new Error(message);
+			logger.warn(message);
+		}
+	}
 	const filteredRequestedTools = requestedTools
 		?.map(name => allToolsByRequestName.get(name))
 		.filter((entry): entry is [string, ToolFactory] => entry !== undefined)

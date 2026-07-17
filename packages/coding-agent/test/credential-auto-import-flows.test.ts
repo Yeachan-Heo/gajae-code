@@ -640,7 +640,7 @@ describe("credential auto-import state classification and compatibility", () => 
 		});
 	}
 
-	test("accepted and declined real state suppress restart discovery", async () => {
+	test("accepted state is version-pinned while declined state remains durable", async () => {
 		const acceptedAgentDir = await createTemporaryAgentDir();
 		let acceptedDiscoveryReads = 0;
 		const acceptedAuthStorage = {
@@ -664,7 +664,7 @@ describe("credential auto-import state classification and compatibility", () => 
 			version: "1.2.4",
 			agentDir: acceptedAgentDir,
 		});
-		expect(acceptedDiscoveryReads).toBe(1);
+		expect(acceptedDiscoveryReads).toBe(2);
 
 		const declinedAgentDir = await createTemporaryAgentDir();
 		const declinedStore = createCredentialAutoImportStateStore(declinedAgentDir);
@@ -678,6 +678,17 @@ describe("credential auto-import state classification and compatibility", () => 
 				return discovery([oauthCredential()]);
 			},
 			version: "1.2.3",
+			agentDir: declinedAgentDir,
+		});
+		expect(declinedDiscoveryReads).toBe(0);
+		await runStartupCredentialAutoImportIfNeeded({
+			authStorage: acceptedAuthStorage as never,
+			modelRegistry: { refresh: async () => {} } as never,
+			discover: async () => {
+				declinedDiscoveryReads += 1;
+				return discovery([oauthCredential()]);
+			},
+			version: "1.2.4",
 			agentDir: declinedAgentDir,
 		});
 		expect(declinedDiscoveryReads).toBe(0);
@@ -1163,7 +1174,10 @@ describe("bare /login external credential import gate", () => {
 				expect(first.settingsReads).toEqual(["read"]);
 				expect(firstDiscoveryReads).toBe(confirm ? 2 : 1);
 				expect(await readCredentialAutoImportState(agentDir)).toEqual({
-					state: { initialImportResolution: resolution },
+					state: {
+						initialImportResolution: resolution,
+						...(resolution === "accepted" ? { lastImportVersion: VERSION } : {}),
+					},
 					problems: [],
 					unreadable: false,
 				});

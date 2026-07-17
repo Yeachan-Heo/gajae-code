@@ -63,6 +63,35 @@ function failedStream(model: Model): AssistantMessageEventStream {
 	return stream;
 }
 
+function otherTransportFailureStream(model: Model, errorMessage: string): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage & { transportFailure: { kind: "transport"; status: number } } = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage,
+			errorStatus: 418,
+			timestamp: Date.now(),
+			transportFailure: { kind: "transport", status: 418 },
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+
 describe("AgentSession managed fallback attempt transaction", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -168,6 +197,23 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		expect(session!.messages).toContainEqual(
 			expect.objectContaining({ role: "assistant", errorMessage: terminal.errorMessage }),
 		);
+	});
+
+	it("bounds typed-other managed failures without promoting quota or transient prose", async () => {
+		const errorMessage = "rate limit exceeded; retry after the transient timeout";
+		const calls: string[] = [];
+		createSession(model => {
+			calls.push(selector(model));
+			return otherTransportFailureStream(model, errorMessage);
+		}, 1);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("do not classify opaque transport prose");
+		await session!.waitForIdle();
+
+		expect(calls).toHaveLength(2);
+		expect(events).toContainEqual(expect.objectContaining({ type: "model_fallback_switched", reason: "unknown" }));
 	});
 
 	it("finalizes exhausted when every fallback tail entry is unavailable during resolution", async () => {

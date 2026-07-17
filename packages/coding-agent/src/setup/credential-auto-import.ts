@@ -211,7 +211,8 @@ export function isCredentialAutoImportStateResolvedForVersion(
 	version: string,
 ): boolean {
 	return (
-		state.initialImportResolution !== undefined ||
+		state.initialImportResolution === "declined" ||
+		(state.initialImportResolution === "accepted" && state.lastImportVersion === undefined) ||
 		(state.lastImportVersion !== undefined && state.lastImportVersion === version)
 	);
 }

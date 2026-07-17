@@ -4,7 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelCache } from "@gajae-code/ai";
 import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	type ModelLookupRegistry,
+	resolveModelOverride,
+	resolveModelOverrideWithAuthFallback,
+} from "@gajae-code/coding-agent/config/model-resolver";
+import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
 import { $credentialEnv, hookFetch, Snowflake } from "@gajae-code/utils";
@@ -626,6 +631,74 @@ describe("ModelRegistry", () => {
 			expect(resolved?.id).toBe("anthropic/claude-sonnet-4.5");
 		});
 
+		test("keeps available canonical variants sticky across refreshes and releases unavailable variants", async () => {
+			const alpha = providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			const beta = providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			writeRawModelsJson({ alpha, beta });
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const initial = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: true,
+				candidates: registry.getAvailable(),
+				sessionId: "session-a",
+			});
+			expect(initial).toBeDefined();
+
+			await Bun.sleep(10);
+			writeRawModelsJson({ beta, alpha });
+			await registry.refresh("offline");
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: registry.getAvailable(),
+					sessionId: "session-a",
+				}),
+			).toMatchObject({ provider: initial!.provider, id: initial!.id });
+
+			const { apiKey: _apiKey, ...unavailableInitialProvider } = initial!.provider === "alpha" ? alpha : beta;
+			await Bun.sleep(10);
+			writeRawModelsJson(
+				initial!.provider === "alpha"
+					? { beta, alpha: unavailableInitialProvider }
+					: { beta: unavailableInitialProvider, alpha },
+			);
+			await registry.refresh("offline");
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: registry.getAvailable(),
+					sessionId: "session-a",
+				})?.provider,
+			).not.toBe(initial!.provider);
+		});
+
+		test("bounds session canonical variants to 64 entries", () => {
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+				beta: providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const initial = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: true,
+				candidates: registry.getAvailable(),
+				sessionId: "session-0",
+			});
+			for (let index = 1; index < 65; index += 1) {
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: registry.getAvailable(),
+					sessionId: `session-${index}`,
+				});
+			}
+			const reversedCandidates = [...registry.getAvailable()].reverse();
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: reversedCandidates,
+					sessionId: "session-0",
+				}),
+			).not.toBe(initial);
+		});
+
 		test("prefers vision-capable variant over configured provider order", async () => {
 			await Settings.init({
 				inMemory: true,
@@ -648,6 +721,135 @@ describe("ModelRegistry", () => {
 
 			expect(resolved?.input.includes("image")).toBe(true);
 			expect(resolved?.provider).toBe("anthropic");
+		});
+		test("caches available models until disabled providers change", async () => {
+			await Settings.init({ inMemory: true });
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const initial = registry.getAvailable();
+			expect(registry.getAvailable()).toBe(initial);
+
+			settings.setDisabledProviders(["anthropic"]);
+			expect(registry.getAvailable()).not.toBe(initial);
+		});
+
+		test("invalidates available models when a runtime API-key override is set", async () => {
+			await Settings.init({ inMemory: true });
+			const previous = process.env.XAI_API_KEY;
+			delete process.env.XAI_API_KEY;
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const initial = registry.getAvailable();
+				expect(initial.some(model => model.provider === "xai")).toBe(false);
+				authStorage.setRuntimeApiKey("xai", "runtime-test-key");
+				expect(registry.getAvailable()).not.toBe(initial);
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+			} finally {
+				if (previous === undefined) delete process.env.XAI_API_KEY;
+				else process.env.XAI_API_KEY = previous;
+			}
+		});
+
+		test("refreshes available models when an API-key environment variable changes", async () => {
+			await Settings.init({ inMemory: true });
+			const previous = process.env.XAI_API_KEY;
+			delete process.env.XAI_API_KEY;
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const initial = registry.getAvailable();
+				expect(initial.some(model => model.provider === "xai")).toBe(false);
+				process.env.XAI_API_KEY = "environment-test-key";
+				expect(registry.getAvailable()).not.toBe(initial);
+				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
+			} finally {
+				if (previous === undefined) delete process.env.XAI_API_KEY;
+				else process.env.XAI_API_KEY = previous;
+			}
+		});
+
+		test("keeps a session canonical variant while it remains available", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const initial = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: false,
+				candidates: registry.getAll(),
+				sessionId: "sticky-session",
+			});
+			const resolved = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: false,
+				candidates: registry.getAll().reverse(),
+				sessionId: "sticky-session",
+			});
+			expect(resolved).toBe(initial);
+		});
+		test("seeds isolated child canonical scopes from a concrete parent model", async () => {
+			const alpha = providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			const beta = providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			writeRawModelsJson({ alpha, beta });
+			const parentRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			const parentModel = parentRegistry.find("alpha", "anthropic/claude-sonnet-4.5");
+			expect(parentModel).toBeDefined();
+			const parentActiveModelPattern = `${parentModel!.provider}/${parentModel!.id}`;
+
+			// A fresh registry has no in-memory parent session stickiness, but its
+			// persisted concrete active model still seeds the child scope.
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const alphaModel = registry.find("alpha", "anthropic/claude-sonnet-4.5")!;
+			const betaModel = registry.find("beta", "anthropic/claude-sonnet-4.5")!;
+			const childA = "subagent:parent-session:child-a";
+			const childB = "subagent:parent-session:child-b";
+			const lookup: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey"> = {
+				getAvailable: () => registry.getAvailable(),
+				resolveCanonicalModel: registry.resolveCanonicalModel.bind(registry),
+				seedCanonicalVariant: registry.seedCanonicalVariant.bind(registry),
+				getApiKey: async model => (model.provider === "alpha" ? "test-key" : undefined),
+			};
+			const resumed = await resolveModelOverrideWithAuthFallback(
+				["claude-sonnet-4-5"],
+				parentActiveModelPattern,
+				lookup,
+				undefined,
+				"parent-session",
+				undefined,
+				childA,
+			);
+			expect(resumed.model).toBe(alphaModel);
+			// The child-first canonical lookup must not populate the parent scope.
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: registry.getAvailable().reverse(),
+					sessionId: "parent-session",
+				}),
+			).toBe(betaModel);
+			expect(registry.seedCanonicalVariant(childB, betaModel)).toBe(true);
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: registry.getAvailable(),
+					sessionId: childB,
+				}),
+			).toBe(betaModel);
+			// Repeated attempts for a child retain its own seeded variant.
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: registry.getAvailable().reverse(),
+					sessionId: childA,
+				}),
+			).toBe(alphaModel);
+
+			const explicit = resolveModelOverride(["beta/anthropic/claude-sonnet-4.5"], registry, undefined, childA);
+			expect(explicit.model).toBe(betaModel);
+			const fallback = await resolveModelOverrideWithAuthFallback(
+				["beta/anthropic/claude-sonnet-4.5"],
+				parentActiveModelPattern,
+				lookup,
+				undefined,
+				"parent-session",
+				undefined,
+				childA,
+			);
+			expect(fallback.model).toBe(alphaModel);
+			expect(fallback.authFallbackUsed).toBe(true);
 		});
 	});
 

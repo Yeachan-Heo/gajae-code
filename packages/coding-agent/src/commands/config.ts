@@ -5,7 +5,7 @@ import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { type ConfigAction, type ConfigCommandArgs, runConfigCommand } from "../cli/config-cli";
 import { initTheme } from "../modes/theme/theme";
 
-const ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "init-xdg"];
+const ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "init-xdg", "doctor"];
 
 export default class Config extends Command {
 	static description = "Manage configuration settings";

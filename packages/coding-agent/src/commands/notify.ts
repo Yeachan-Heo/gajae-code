@@ -12,9 +12,8 @@ export default class Notify extends Command {
 
 	static args = {
 		action: Args.string({
-			description: "Notify action",
+			description: "Notify action (setup|status|health|test|recovery|daemon-internal)",
 			required: false,
-			options: ACTIONS,
 		}),
 		extra: Args.string({
 			description: "Provider or additional internal args",
@@ -49,7 +48,12 @@ export default class Notify extends Command {
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Notify);
-		const action = (args.action ?? "status") as NotifyAction;
+		const action = args.action ?? "status";
+		if (!ACTIONS.includes(action as NotifyAction)) {
+			console.error(`Unknown notify action: ${action}`);
+			console.error(`Valid actions: ${ACTIONS.join(", ")}`);
+			process.exit(1);
+		}
 		const extra = Array.isArray(args.extra) ? args.extra : args.extra ? [args.extra] : [];
 		const flagRec = flags as Record<string, unknown>;
 		const ownerId = flagRec["owner-id"] as string | undefined;
@@ -72,7 +76,7 @@ export default class Notify extends Command {
 		}
 
 		const cmd: NotifyCommandArgs = {
-			action,
+			action: action as NotifyAction,
 			smoke: flags.smoke,
 			rawArgs,
 			provider: provider === "telegram" || provider === "discord" || provider === "slack" ? provider : undefined,

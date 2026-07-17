@@ -227,7 +227,6 @@ describe("notify Discord and Slack setup", () => {
 					slackAppToken,
 					slackWorkspaceId: "workspace",
 					slackChannelId: "channel",
-					slackAuthorizedUserId: "slack-user",
 				},
 				{
 					settings,
@@ -241,7 +240,8 @@ describe("notify Discord and Slack setup", () => {
 			process.stdout.write = originalSetupWrite;
 		}
 		expect(settings.get("notifications.slack.botToken")).toBe(slackBotToken);
-		expect(settings.get("notifications.slack.authorizedUserId")).toBe("slack-user");
+		expect(settings.get("notifications.slack.authorizedUserId")).toBeUndefined();
+		expect(setupWrites.join("")).toContain("authorizedUserId=(unset; inbound denied)");
 		expect(setupWrites.join("")).toContain("daemon=owner_spawned");
 		expect(setupWrites.join("")).not.toContain(slackBotToken);
 		expect(setupWrites.join("")).not.toContain(slackAppToken);

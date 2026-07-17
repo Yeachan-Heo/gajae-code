@@ -171,6 +171,24 @@ describe("cache economics", () => {
 		expect(summary?.missPremiumUsd).toBeUndefined();
 	});
 
+	it("includes cache-write re-write premium in the miss premium", () => {
+		const summary = computeCacheMissCostSummary(usageWithoutPersistedCosts({ input: 20_000, cacheWrite: 10_000 }), {
+			kind: "current-model-estimate",
+			pricing: { input: 3, cacheRead: 0.3, cacheWrite: 3.75 },
+		});
+
+		expect(summary?.missPremiumUsd).toBeCloseTo(0.0885);
+	});
+
+	it("uses token-only warning gates for all-zero-priced models", () => {
+		const warning = buildCacheBehaviorWarning(
+			noPersistedCost({ input: 20_000 }),
+			modelWithCost({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
+		);
+
+		expect(warning?.code).toBe("provider_side_cache_miss");
+	});
+
 	it("prioritizes miss premium warnings and caps transcript warnings", () => {
 		const state = { warningsEmitted: 0 };
 		const warningUsage = {

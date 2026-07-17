@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
-import { StatusLineComponent } from "../src/modes/components/status-line";
+import { StatusLineComponent } from "../src/modes/components/tool-status-header";
 import { initTheme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import * as git from "../src/utils/git";

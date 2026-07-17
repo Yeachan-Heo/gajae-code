@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import {
 	type Keybinding,
@@ -304,13 +304,14 @@ function toKeybindingsConfig(value: unknown): KeybindingsConfig {
 
 	const config: KeybindingsConfig = {};
 	for (const [key, val] of Object.entries(value)) {
-		if (val === undefined) {
-			config[key] = undefined;
-		} else if (typeof val === "string") {
-			config[key] = val as KeyId;
-		} else if (Array.isArray(val) && val.every(v => typeof v === "string")) {
-			config[key] = val as KeyId[];
+		if (!(key in KEYBINDINGS) && !isLegacyKeybindingName(key)) {
+			logger.info("Ignoring unknown keybinding entry", { key });
+			continue;
 		}
+		if (val === undefined) config[key] = undefined;
+		else if (typeof val === "string") config[key] = val as KeyId;
+		else if (Array.isArray(val) && val.every(v => typeof v === "string")) config[key] = val as KeyId[];
+		else logger.info("Ignoring malformed keybinding entry", { key });
 	}
 	return config;
 }
@@ -381,28 +382,27 @@ function loadRawConfig(filePath: string): unknown {
 	}
 }
 
-/**
- * Migrate keybindings config file from old format to new.
- * Reads from agentDir/keybindings.json, migrates old names, and writes back.
- */
+/** Migrate legacy keybindings once, preserving the original file as .bak. */
 function loadKeybindingsConfig(filePath: string, writeBack: boolean): KeybindingsConfig {
 	const rawConfig = loadRawConfig(filePath);
-
-	if (rawConfig === null) {
-		return {};
-	}
-
-	const { config: migratedConfig, migrated } = migrateKeybindingNames(rawConfig);
+	if (rawConfig === null) return {};
+	const markerPath = `${filePath}.migration-v1`;
+	const { config: migratedConfig, migrated } = existsSync(markerPath)
+		? { config: toKeybindingsConfig(rawConfig), migrated: false }
+		: migrateKeybindingNames(rawConfig);
 	if (writeBack && migrated) {
 		const ordered = orderKeybindingsConfig(migratedConfig);
+		const tempPath = `${filePath}.${process.pid}.tmp`;
 		try {
-			writeFileSync(filePath, `${JSON.stringify(ordered, null, 2)}\n`, "utf-8");
+			copyFileSync(filePath, `${filePath}.bak`);
+			writeFileSync(tempPath, `${JSON.stringify(ordered, null, 2)}\n`, "utf-8");
+			renameSync(tempPath, filePath);
+			writeFileSync(markerPath, "v1\n", "utf-8");
 			logger.debug("Migrated keybindings config", { path: filePath });
 		} catch (error) {
 			logger.warn("Failed to write migrated keybindings config", { path: filePath, error: String(error) });
 		}
 	}
-
 	return migratedConfig;
 }
 

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:te
 import * as fs from "node:fs";
 import { getProjectDir, setProjectDir } from "@gajae-code/utils";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
-import { StatusLineComponent } from "../src/modes/components/status-line";
+import { StatusLineComponent } from "../src/modes/components/tool-status-header";
 import { EMPTY_JOBS_SNAPSHOT } from "../src/modes/jobs-observer";
 import { initTheme, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";

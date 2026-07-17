@@ -23,13 +23,9 @@ function lastAssistant(session: AgentSession): AssistantMessage {
 }
 
 /**
- * Contract: transient/unknown errors (rate limit, overloaded, 5xx, network)
- * retry forever with exponential backoff. A provider-supplied `retry-after`
- * is honored even when it exceeds `retry.maxDelayMs` (the cap is a ceiling for
- * the exponential backoff, not a give-up trigger). Observability is provided
- * via `auto_retry_start`/`auto_retry_end` events (with `unbounded: true`) so a
- * subagent is never silently hung. Terminal coded errors (auth/400/not-found)
- * and the usage-limit rotation path keep their bounded behavior.
+ * Contract: legacy transient retries have unbounded attempts with delays capped
+ * at `retry.maxDelayMs`; unknown errors use the finite retry budget. Provider
+ * retry hints take precedence over computed backoff and are capped at that maximum.
  */
 describe("AgentSession retry delay cap", () => {
 	let tempDir: TempDir;
@@ -54,14 +50,13 @@ describe("AgentSession retry delay cap", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("retries transient rate limits past retry.maxDelayMs, honoring retry-after", async () => {
+	it("caps legacy retry-after delays at retry.maxDelayMs", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
 			throw new Error("Expected bundled Anthropic test model to exist");
 		}
 
-		// 11.18M ms == ~3.1 hours, matching the report on the original incident.
-		// Under the resilient-retry contract this is honored, not bailed on.
+		// The provider asks for more than three hours; the session cap wins.
 		const rateLimitError =
 			'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit. Please try again later."}} retry-after-ms=11180000';
 
@@ -109,13 +104,12 @@ describe("AgentSession retry delay cap", () => {
 		await session.prompt("Trigger rate limit with long retry-after");
 		await session.waitForIdle();
 
-		// The retry loop runs (does NOT bail): original call + one retry.
+		// The transient retry loop runs once and its delay is capped.
 		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryStartEvents[0].unbounded).toBe(true);
-		// The long provider retry-after is honored, not capped to maxDelayMs.
-		expect(retryStartEvents[0].delayMs).toBe(11180000);
-		expect(waitSpy).toHaveBeenCalledWith(11180000, expect.anything());
+		expect(retryStartEvents[0].delayMs).toBe(100);
+		expect(waitSpy).toHaveBeenCalledWith(retryStartEvents[0].delayMs, expect.anything());
 		// Successful retry emits a success end event and recovers.
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
@@ -124,7 +118,7 @@ describe("AgentSession retry delay cap", () => {
 		expect(session.isRetrying).toBe(false);
 	});
 
-	it("fails fast on model-limit 429 instead of entering unbounded retry", async () => {
+	it("bounds unknown model-limit errors instead of entering an unbounded retry", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
 			throw new Error("Expected bundled Anthropic test model to exist");
@@ -176,15 +170,14 @@ describe("AgentSession retry delay cap", () => {
 		await session.prompt("Trigger model limit with long retry-after");
 		await session.waitForIdle();
 
-		expect(requestedModels).toEqual([`${model.provider}/${model.id}`]);
-		expect(retryStartEvents).toHaveLength(0);
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`, `${model.provider}/${model.id}`]);
+		expect(retryStartEvents).toHaveLength(1);
 		expect(retryEndEvents).toHaveLength(1);
-		expect(retryEndEvents[0]).toMatchObject({ success: false, attempt: 1 });
-		expect(retryEndEvents[0].finalError).toContain("exceeds retry.maxDelayMs");
-		expect(waitSpy).not.toHaveBeenCalled();
+		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(waitSpy).toHaveBeenCalled();
 
 		const last = lastAssistant(session);
-		expect(last.stopReason).toBe("error");
+		expect(last.stopReason).toBe("stop");
 		expect(session.isStreaming).toBe(false);
 		expect(session.isRetrying).toBe(false);
 	});

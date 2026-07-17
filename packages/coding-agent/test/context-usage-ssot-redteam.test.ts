@@ -17,7 +17,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { StatusLineComponent } from "../src/modes/components/status-line";
+import { StatusLineComponent } from "../src/modes/components/tool-status-header";
 
 const contextWindow = 200_000;
 const sessions: AgentSession[] = [];

@@ -278,7 +278,11 @@ export const SETTINGS_SCHEMA = {
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
-	"notifications.telegram.botToken": { type: "string", default: undefined },
+	"notifications.telegram.botToken": {
+		type: "string",
+		default: undefined,
+		validate: (value: unknown) => typeof value === "string",
+	},
 	"notifications.telegram.chatId": { type: "string", default: undefined },
 	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
 	"notifications.telegram.rich.enabled": {
@@ -1156,7 +1160,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			label: "Max Retry Delay",
 			description:
-				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+				"Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 		},
 	},
 	"retry.requestMaxRetries": {

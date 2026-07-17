@@ -12,7 +12,7 @@ const originalSessionIdEnv = process.env.GJC_COORDINATOR_SESSION_ID;
 let getProjectDir: typeof import("@gajae-code/utils").getProjectDir;
 let setProjectDir: typeof import("@gajae-code/utils").setProjectDir;
 let originalProjectDir: string;
-let StatusLineComponent: typeof import("../src/modes/components/status-line").StatusLineComponent;
+let StatusLineComponent: typeof import("../src/modes/components/tool-status-header").StatusLineComponent;
 let gitUtils: typeof import("../src/modes/components/status-line/git-utils");
 let ToolExecutionComponent: typeof import("../src/modes/components/tool-execution").ToolExecutionComponent;
 let EventController: typeof import("../src/modes/controllers/event-controller").EventController;
@@ -28,7 +28,7 @@ beforeAll(async () => {
 	originalProjectDir = getProjectDir();
 	const { Settings } = await import("../src/config/settings");
 	await Settings.init({ inMemory: true, cwd: os.tmpdir() });
-	({ StatusLineComponent } = await import("../src/modes/components/status-line"));
+	({ StatusLineComponent } = await import("../src/modes/components/tool-status-header"));
 	gitUtils = await import("../src/modes/components/status-line/git-utils");
 	({ ToolExecutionComponent } = await import("../src/modes/components/tool-execution"));
 	({ EventController, __eventControllerPerfCounters: eventControllerPerfCounters } = await import(

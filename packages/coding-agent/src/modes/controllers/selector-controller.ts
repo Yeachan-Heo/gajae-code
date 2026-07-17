@@ -141,10 +141,10 @@ import {
 import { SessionObserverOverlayComponent } from "../components/session-observer-overlay";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
-import type { StatusLineSettings } from "../components/status-line";
 import { ThemeSelectorComponent } from "../components/theme-selector";
 import { ThinkingSelectorComponent } from "../components/thinking-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
+import type { StatusLineSettings } from "../components/tool-status-header";
 import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { JobsObserver } from "../jobs-observer";
@@ -1022,6 +1022,7 @@ export class SelectorController {
 					await this.ctx.session.modelRegistry.refresh("offline");
 					await this.ctx.notifyConfigChanged?.();
 					this.ctx.showStatus(formatProviderSetupResult(result));
+					wizard.complete();
 					done();
 					this.ctx.ui.requestRender();
 				} catch (err) {
@@ -2338,7 +2339,10 @@ export class SelectorController {
 								if (handledCandidates || (secondCandidates.length === 0 && secondSourceFailures.length === 0)) {
 									let persisted = false;
 									try {
-										persisted = await stateStore.write({ initialImportResolution: "accepted" });
+										persisted = await stateStore.write({
+											initialImportResolution: "accepted",
+											lastImportVersion: VERSION,
+										});
 									} catch {
 										logger.warn("Credential auto-import state persistence failed", {
 											classification: "state-write-failed",

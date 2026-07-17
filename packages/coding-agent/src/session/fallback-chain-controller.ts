@@ -1,4 +1,4 @@
-export type FallbackTriggerClass = "rate_limit" | "quota" | "auth" | "server" | "other";
+import type { FallbackTriggerClass } from "@gajae-code/ai/utils/fallback-transport";
 
 /** Immutable configured fallback intent. Transient attempt state never belongs here. */
 export interface ConfiguredFallbackChain {
@@ -27,7 +27,9 @@ export class FallbackChainController {
 	activeIndex = 0;
 	attemptsUsed = 0;
 	tried: FallbackFailure[] = [];
+
 	#attemptStarted = false;
+	#totalAttemptsUsed = 0;
 	skips: Array<{ selector: string; reason: string }> = [];
 	exhaustedForTurn = false;
 
@@ -38,6 +40,10 @@ export class FallbackChainController {
 		this.chain = { ...chain, entries: [...chain.entries] };
 		this.maxAttempts = maxAttempts;
 		if (this.chain.entries.length === 0) this.exhaustedForTurn = true;
+	}
+
+	get totalAttemptsUsed(): number {
+		return this.#totalAttemptsUsed;
 	}
 
 	currentSelector(): string | undefined {
@@ -53,13 +59,20 @@ export class FallbackChainController {
 	/** Charge an upstream request at its concrete transport boundary. */
 	onAttemptStarted(): void {
 		if (!this.currentSelector() || this.exhaustedForTurn) return;
+		if (this.#totalAttemptsUsed >= this.maxAttempts * this.chain.entries.length) {
+			this.activeIndex = this.chain.entries.length;
+			this.exhaustedForTurn = true;
+			return;
+		}
 		this.attemptsUsed += 1;
+		this.#totalAttemptsUsed += 1;
 		this.#attemptStarted = true;
 	}
 
-	/** Start a logically new request without losing its sticky selected entry. */
+	/** Start a logically new request with a fresh fallback-chain budget. */
 	resetAttemptBudget(): void {
 		this.attemptsUsed = 0;
+		this.#totalAttemptsUsed = 0;
 		this.tried = [];
 		this.#attemptStarted = false;
 	}
@@ -69,6 +82,7 @@ export class FallbackChainController {
 		this.activeIndex = Math.min(Math.max(0, activeIndex), this.chain.entries.length);
 		this.skips = [...skips];
 		this.attemptsUsed = 0;
+		this.#totalAttemptsUsed = 0;
 		this.#attemptStarted = false;
 		this.exhaustedForTurn = this.activeIndex >= this.chain.entries.length;
 	}
@@ -76,9 +90,17 @@ export class FallbackChainController {
 	onAttemptFailure(triggerClass: FallbackTriggerClass, reason: string): FallbackFailureResult {
 		const selector = this.currentSelector();
 		if (!selector || this.exhaustedForTurn) return "exhausted";
-		if (!this.#attemptStarted) this.attemptsUsed += 1;
+		if (!this.#attemptStarted) {
+			this.attemptsUsed += 1;
+			this.#totalAttemptsUsed += 1;
+		}
 		this.#attemptStarted = false;
 		this.tried.push({ selector, triggerClass, reason });
+		if (this.#totalAttemptsUsed >= this.maxAttempts * this.chain.entries.length) {
+			this.activeIndex = this.chain.entries.length;
+			this.exhaustedForTurn = true;
+			return "exhausted";
+		}
 		if (this.attemptsUsed < this.maxAttempts) return "retry";
 		return this.advance() ? "advance" : "exhausted";
 	}
@@ -95,6 +117,25 @@ export class FallbackChainController {
 		return true;
 	}
 
+	/**
+	 * Restore the entry that just advanced when credential rotation permits a retry.
+	 * The chain-wide budget and failure history remain charged.
+	 */
+	restorePreviousEntryForRetry(): boolean {
+		if (
+			this.activeIndex === 0 ||
+			this.exhaustedForTurn ||
+			this.#totalAttemptsUsed >= this.maxAttempts * this.chain.entries.length
+		) {
+			return false;
+		}
+		this.activeIndex -= 1;
+		this.attemptsUsed = 0;
+		this.exhaustedForTurn = false;
+		this.#attemptStarted = false;
+		return true;
+	}
+
 	isExhausted(): boolean {
 		return this.exhaustedForTurn;
 	}
@@ -106,6 +147,7 @@ export class FallbackChainController {
 	resetSticky(): void {
 		this.activeIndex = 0;
 		this.attemptsUsed = 0;
+		this.#totalAttemptsUsed = 0;
 		this.tried = [];
 		this.skips = [];
 		this.exhaustedForTurn = this.chain.entries.length === 0;

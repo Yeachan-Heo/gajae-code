@@ -1,6 +1,5 @@
-import { Container, type SelectItem, SelectList } from "@gajae-code/tui";
-import { getSelectListTheme } from "../../modes/theme/theme";
-import { DynamicBorder } from "./dynamic-border";
+import { Container, type SelectItem, type SelectList } from "@gajae-code/tui";
+import { FramedSelect } from "./chrome";
 
 /**
  * Component that renders a queue mode selector with borders
@@ -24,30 +23,14 @@ export class QueueModeSelectorComponent extends Container {
 			{ value: "all", label: "all", description: "Process all queued messages at once" },
 		];
 
-		// Add top border
-		this.addChild(new DynamicBorder());
-
-		// Create selector
-		this.#selectList = new SelectList(queueModes, 2, getSelectListTheme());
-
-		// Preselect current mode
-		const currentIndex = queueModes.findIndex(item => item.value === currentMode);
-		if (currentIndex !== -1) {
-			this.#selectList.setSelectedIndex(currentIndex);
-		}
-
-		this.#selectList.onSelect = item => {
-			onSelect(item.value as "all" | "one-at-a-time");
-		};
-
-		this.#selectList.onCancel = () => {
-			onCancel();
-		};
-
-		this.addChild(this.#selectList);
-
-		// Add bottom border
-		this.addChild(new DynamicBorder());
+		const framed = FramedSelect(undefined, queueModes, {
+			maxVisible: 2,
+			selectedValue: currentMode,
+			onSelect: item => onSelect(item.value as "all" | "one-at-a-time"),
+			onCancel,
+		});
+		this.#selectList = framed.selectList;
+		this.addChild(framed.container);
 	}
 
 	getSelectList(): SelectList {

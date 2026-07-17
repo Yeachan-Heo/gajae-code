@@ -50,7 +50,9 @@ export const OpenAICompatSchema = z.object({
 	toolStrictMode: z.enum(["all_strict", "none"]).optional(),
 });
 
-const EffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
+export const GJC_MODEL_EFFORT_IDS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const GJC_MODEL_ASSIGNMENT_TARGET_IDS = ["default", "executor", "architect", "planner", "critic"] as const;
+export const EffortSchema = z.enum(GJC_MODEL_EFFORT_IDS);
 const CacheRetentionSchema = z.enum(["none", "short", "long"]);
 
 const ThinkingControlModeSchema = z.enum([
@@ -85,9 +87,8 @@ export const ModelBindingsSchema = z.object({
 	agentModelOverrides: z.record(z.string(), stringOrNonEmptyArray(PermissiveModelSelectorSchema)).optional(),
 });
 
-export const ProfileRoleSchema = z.enum(["default", "executor", "architect", "planner", "critic"]);
-
-const ProfileModelSelectorPattern = "^[^,/]+/[^,:]+(?::(?:minimal|low|medium|high|xhigh|max))?$";
+export const ProfileRoleSchema = z.enum(GJC_MODEL_ASSIGNMENT_TARGET_IDS);
+export const ProfileModelSelectorPattern = `^[^,/]+/[^,:]+(?::(?:${EffortSchema.options.join("|")}))?$`;
 
 export const ProfileModelSelectorSchema = z
 	.string()

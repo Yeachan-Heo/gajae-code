@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import type { ContextUsage } from "../src/extensibility/extensions/types";
-import { StatusLineComponent } from "../src/modes/components/status-line";
+import { StatusLineComponent } from "../src/modes/components/tool-status-header";
 import { initTheme, theme } from "../src/modes/theme/theme";
 import { computeContextBreakdown, renderContextUsage } from "../src/modes/utils/context-usage";
 import type { AgentSession } from "../src/session/agent-session";

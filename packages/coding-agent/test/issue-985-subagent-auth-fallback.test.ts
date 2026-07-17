@@ -87,6 +87,43 @@ function createMockRegistry(options: MockRegistryOptions): ModelLookupRegistry &
 }
 
 describe("issue #985: subagent dispatch auth fallback", () => {
+	test("uses the parent session's canonical stickiness for bare subagent overrides only", async () => {
+		const registry = {
+			getAvailable: () => [parentModel, unauthedTaskModel],
+			getApiKey: async () => "sk-test-token",
+			resolveCanonicalModel: (canonicalId: string, options?: { sessionId?: string }) => {
+				if (canonicalId !== "task-canonical") return undefined;
+				return options?.sessionId === "parent-session" ? parentModel : unauthedTaskModel;
+			},
+		} as unknown as ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> };
+
+		const bare = await resolveModelOverrideWithAuthFallback(
+			["task-canonical"],
+			undefined,
+			registry,
+			undefined,
+			"parent-session",
+		);
+		const explicit = await resolveModelOverrideWithAuthFallback(
+			["opencode-zen/qwen3.6-plus-free"],
+			undefined,
+			registry,
+			undefined,
+			"parent-session",
+		);
+		const parentFallback = await resolveModelOverrideWithAuthFallback(
+			["unknown-task-model"],
+			"task-canonical",
+			registry,
+			undefined,
+			"parent-session",
+		);
+
+		expect(parentFallback.model).toBe(parentModel);
+		expect(bare.model).toBe(parentModel);
+		expect(explicit.model).toBe(unauthedTaskModel);
+	});
+
 	test("falls back to parent active model when resolved subagent model has no auth", async () => {
 		const registry = createMockRegistry({
 			models: [parentModel, unauthedTaskModel],

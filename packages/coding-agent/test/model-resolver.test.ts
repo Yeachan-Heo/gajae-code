@@ -472,6 +472,21 @@ describe("parseModelPattern", () => {
 			expect(result.model?.provider).toBe("github-copilot");
 			expect(result.model?.id).toBe("anthropic/claude-sonnet-4.5");
 		});
+
+		test("forwards session identity for canonical resolution", () => {
+			let sessionId: string | undefined;
+			const result = resolveModelRoleValue("claude-sonnet-4-5", canonicalVariantModels, {
+				modelRegistry: {
+					resolveCanonicalModel: (_canonicalId, options) => {
+						sessionId = options?.sessionId;
+						return canonicalVariantModels[0];
+					},
+				},
+				sessionId: "stable-session-id",
+			});
+			expect(result.model).toBe(canonicalVariantModels[0]);
+			expect(sessionId).toBe("stable-session-id");
+		});
 	});
 });
 

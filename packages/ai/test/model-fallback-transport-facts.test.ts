@@ -95,6 +95,20 @@ describe("fallback transport facts", () => {
 			kind: "transport",
 			providerCode: "invalid_api_key",
 		});
+		const topLevelAnthropic = transportFailureFacts({ status: 429, type: "rate_limit_error" });
+		expect(topLevelAnthropic).toMatchObject({ anthropicErrorType: "rate_limit_error" });
+		expect(classifyFallbackTrigger(topLevelAnthropic)).toEqual({ class: "rate_limit" });
+	});
+
+	it("preserves first-party typed error codes and classifies bare 5xx without prose", () => {
+		const anthropic = transportFailureFacts({ status: 429, error: { type: "rate_limit_error" } });
+		const openai = transportFailureFacts({ status: 401, error: { code: "invalid_api_key" } });
+
+		expect(anthropic).toMatchObject({ anthropicErrorType: "rate_limit_error" });
+		expect(classifyFallbackTrigger(anthropic)).toEqual({ class: "rate_limit" });
+		expect(openai).toMatchObject({ openaiErrorCode: "invalid_api_key" });
+		expect(classifyFallbackTrigger(openai)).toEqual({ class: "auth" });
+		expect(classifyFallbackTrigger({ kind: "transport", status: 500 })).toEqual({ class: "server" });
 	});
 
 	it("retains only retry-signal headers as a structured-cloneable plain record", () => {

@@ -110,6 +110,17 @@ export interface SettingsOptions {
 	overrides?: Partial<Record<SettingPath, unknown>>;
 }
 
+function summarizeSettingsOptions(options: SettingsOptions | null): {
+	optionKeys: string[];
+	overrideKeys: string[];
+} {
+	if (!options) return { optionKeys: [], overrideKeys: [] };
+	return {
+		optionKeys: Object.keys(options).sort(),
+		overrideKeys: Object.keys(options.overrides ?? {}).sort(),
+	};
+}
+
 /** Additional layer setup for {@link Settings.isolated}. */
 export interface IsolatedSettingsOptions {
 	/** Initial runtime overrides. Notification paths are rejected. */
@@ -397,8 +408,17 @@ export class Settings implements NotificationSettingsReader {
 	 * Call once at startup before accessing `settings`.
 	 */
 	static init(options: SettingsOptions = {}): Promise<Settings> {
-		if (globalInstancePromise) return globalInstancePromise;
+		if (globalInstancePromise) {
+			if (JSON.stringify(options) !== JSON.stringify(globalInitOptions)) {
+				logger.warn("Settings.init called again with different options; reusing existing settings instance", {
+					initialOptions: summarizeSettingsOptions(globalInitOptions),
+					requestedOptions: summarizeSettingsOptions(options),
+				});
+			}
+			return globalInstancePromise;
+		}
 
+		globalInitOptions = structuredClone(options);
 		const instance = new Settings(options);
 		const promise = instance.#load();
 		globalInstancePromise = promise;
@@ -670,7 +690,23 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	async commitAtomicBatch(patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> {
 		if (!this.#persist || !this.#configPath) {
-			throw new Error("commitAtomicBatch requires persistent Settings with a config.yml path.");
+			for (const patch of patches) {
+				if (!Object.hasOwn(SETTINGS_SCHEMA, patch.path)) {
+					throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
+				}
+				if (patch.op === "set" && patch.value === undefined) {
+					throw new TypeError(`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`);
+				}
+			}
+			for (const patch of patches) {
+				if (patch.op === "set") this.set(patch.path, patch.value as never);
+				else this.unset(patch.path);
+			}
+			return {
+				revisions: [],
+				restore: async () => ({ status: "discarded" }),
+				discard: () => {},
+			};
 		}
 
 		const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
@@ -2014,6 +2050,7 @@ export function onAppendOnlyModeChanged(cb: (value: string) => void): () => void
 
 let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
+let globalInitOptions: SettingsOptions | null = null;
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;
@@ -2026,6 +2063,7 @@ export function isSettingsInitialized(): boolean {
 export function resetSettingsForTest(): void {
 	globalInstance = null;
 	globalInstancePromise = null;
+	globalInitOptions = null;
 }
 
 /**

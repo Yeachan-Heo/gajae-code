@@ -42,7 +42,7 @@ Current retryable inputs are regex/string-classified:
 - provider-suggested retry wording, including OpenAI `retry your request` failures
 - network/connection/socket failures, refused/closed connections, upstream connect/reset-before-headers, socket hang up, timeout/timed out, fetch failed, terminated, retry delay wording, and unexpected socket close messages
 
-This is string-pattern classification, not typed provider error codes.
+Managed fallback uses structured transport facts and typed provider error codes when available. A structured classification of `other` becomes the bounded `unknown` fallback class; error prose cannot promote it to quota or transient. Regex classification is retained only as a legacy fallback.
 
 ## Retry lifecycle and state transitions
 
@@ -59,10 +59,10 @@ Flow (`#handleRetryableError`):
 2. If `retry.enabled === false`, stop immediately (`false`, no retry started).
 3. Increment `#retryAttempt`.
 4. Create `#retryPromise` once (first attempt in a chain).
-5. If attempt exceeded `retry.maxRetries`, emit final failure event and stop.
-6. Compute base delay: `retry.baseDelayMs * 2^(attempt-1)`.
-7. For usage-limit errors, parse retry hints and call auth storage (`markUsageLimitReached(...)`); if credential switching succeeds, force delay to `0`, otherwise use a larger retry-after/backoff hint when present.
-8. If no credential switch occurred, advance an eligible ordered role-array fallback chain and force delay to `0` on a model switch. The selected fallback entry remains sticky across later user prompts.
+5. Transient errors retry without an attempt limit; unknown/no-code errors stop after `retry.maxRetries`.
+6. Compute exponential full-jitter delay capped at `retry.maxDelayMs`; legacy parsed provider retry-after values override computed backoff and are capped at `retry.maxDelayMs`, while managed typed Retry-After values are intentionally uncapped.
+7. For usage-limit errors, call auth storage (`markUsageLimitReached(...)`); if credential switching succeeds, force delay to `0`, otherwise use the applicable backoff.
+8. Eligible ordered role-array fallback chains advance on entry-budget exhaustion. A selected fallback entry remains sticky until the head selector's rate-limit cooldown expires, when `retry.fallbackRevertPolicy: cooldown-expiry` probes it again on a new turn.
 9. Emit `auto_retry_start`.
 10. Remove the trailing assistant error message from agent runtime state (kept in persisted session history).
 11. Sleep with abort support.
@@ -95,13 +95,13 @@ Attempt numbering:
 - start events use current attempt (1-based)
 - max-exceeded end event reports `attempt: this.#retryAttempt - 1` (last attempted retry count)
 
-Backoff sequence with default settings:
+Backoff uses capped exponential full jitter. With default settings the maximum jitter windows are:
 
 - attempt 1: 2000 ms
 - attempt 2: 4000 ms
 - attempt 3: 8000 ms
 
-Delay override inputs can come from parsed retry headers (`retry-after-ms`, `retry-after`, `x-ratelimit-reset-ms`, `x-ratelimit-reset`) or usage-limit backoff. Credential/model fallback switches set delay to `0`; otherwise parsed hints can extend the exponential local delay.
+`retry.maxDelayMs` caps every legacy session retry delay, including provider retry-after hints, which otherwise take precedence over computed backoff. Managed fallback intentionally does not cap typed Retry-After values because it retries within its separate per-entry budget. Legacy transient errors have unbounded attempts; unknown/no-code errors are bounded by `retry.maxRetries`.
 
 ## Abort mechanics
 
@@ -192,7 +192,7 @@ Final failure surfacing:
 
 Retry stops and will not auto-continue when any of these occur:
 
-- `retry.enabled` is false
+- `retry.enabled` is false, or legacy retry settings have not been explicitly configured (`legacyRetryConfigured` fail-closed gate)
 - error is not retry-classified
 - error is context overflow (delegated to compaction path)
 - max retries exceeded
@@ -203,7 +203,7 @@ A new retry chain can still start later on a future retryable error after counte
 
 ## Operational caveats
 
-- Classification is regex text matching; provider-specific structured errors are not used here.
+- Managed fallback uses typed transport facts and provider error codes; regex text matching is limited to the legacy retry path.
 - Retry strips the failing assistant error from **runtime context** before re-continue, but session history still keeps that error entry.
 - SDK clients observe retry state through session events and state updates.
 - Fallback state is driven by the configured ordered role array and remains on a selected fallback entry across later user prompts. A real model change emits the canonical `model_fallback_switched` event rather than a legacy retry-fallback event.

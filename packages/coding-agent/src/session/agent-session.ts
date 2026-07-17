@@ -97,7 +97,11 @@ import {
 	resolveServiceTier,
 	streamSimple,
 } from "@gajae-code/ai";
-import { beginAttempt, classifyFallbackTrigger } from "@gajae-code/ai/utils/fallback-transport";
+import {
+	beginAttempt,
+	classifyFallbackTrigger,
+	type FallbackTriggerClass,
+} from "@gajae-code/ai/utils/fallback-transport";
 
 export interface ForkContextSeedMetadata {
 	sourceSessionId: string;
@@ -151,6 +155,7 @@ import type { Rule } from "../capability/rule";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	isAuthenticated,
+	kNoAuth,
 	MODEL_ROLE_IDS,
 	type ModelRegistry,
 } from "../config/model-registry";
@@ -311,9 +316,9 @@ import {
 } from "./default-model-selection";
 import {
 	type ConfiguredFallbackChain,
+	cappedExponentialWithFullJitter,
 	effectiveFallbackDelay,
 	FallbackChainController,
-	type FallbackTriggerClass,
 } from "./fallback-chain-controller";
 
 export { DefaultModelSelectionRecoveryError } from "./default-model-selection";
@@ -3325,7 +3330,9 @@ export class AgentSession {
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			if (this.#isRetryableError(msg)) {
-				const didRetry = await this.#handleRetryableError(msg);
+				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
+					.transportFailure;
+				const didRetry = await this.#handleRetryableError(msg, false, transportFailure);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
 			}
 			if (this.#retryAttempt > 0) {
@@ -8829,6 +8836,7 @@ export class AgentSession {
 				settings: this.settings,
 				matchPreferences,
 				modelRegistry: this.#modelRegistry,
+				sessionId: this.sessionId,
 			});
 			if (!resolved.model) continue;
 
@@ -10931,6 +10939,7 @@ export class AgentSession {
 			settings: this.settings,
 			matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 			modelRegistry: this.#modelRegistry,
+			sessionId: this.sessionId,
 		});
 	}
 
@@ -11589,7 +11598,10 @@ export class AgentSession {
 				classification === "first_event_timeout"
 			);
 		}
-		const trigger = classifyFallbackTrigger({ message: message.errorMessage, status: message.errorStatus });
+		const transportFailure = (message as AssistantMessage & { transportFailure?: TransportFailureFacts })
+			.transportFailure;
+		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
+		if (transportFailure) return true;
 		if (
 			trigger.class === "rate_limit" ||
 			trigger.class === "quota" ||
@@ -11680,8 +11692,8 @@ export class AgentSession {
 	/**
 	 * Ordered retry classification: typed safety stop (surface) -> legacy safety stop
 	 * (surface) -> overflow (compaction) -> terminal (surface) -> usage_limit
-	 * (rotation) -> first_event_timeout (bounded retry) -> transient (retry) ->
-	 * unknown (retry).
+	 * (rotation) -> first_event_timeout (bounded retry) -> transient (unbounded retry) ->
+	 * unknown (bounded retry).
 	 */
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
 		if (message.stopReason !== "error") return "none";
@@ -11692,8 +11704,8 @@ export class AgentSession {
 		// "sensitive") are deterministic for the submitted context: replaying
 		// the identical conversation re-triggers the identical refusal, so an
 		// auto-retry loop can never succeed and only re-bills the full context
-		// on every attempt (#1655). Surface immediately instead of joining the
-		// unbounded "unknown" retry class.
+		// on every attempt (#1655). Surface immediately instead of entering the
+		// bounded unknown retry class.
 		if (isLegacyProviderSafetyStopMessage(err)) return "terminal";
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return "overflow";
@@ -11807,12 +11819,19 @@ export class AgentSession {
 	}
 
 	async #resetDefaultFallbackForNewTurn(): Promise<void> {
-		if (!this.#defaultFallbackExhaustedLastTurn) return;
 		const controller = this.#defaultFallbackChain();
-		this.#defaultFallbackExhaustedLastTurn = false;
-		controller.resetForNewTurn();
-		if (controller.chain.entries.length > 1) {
-			await this.#advanceDefaultFallback(controller, "new_turn", 0);
+		if (this.#defaultFallbackExhaustedLastTurn) {
+			this.#defaultFallbackExhaustedLastTurn = false;
+			controller.resetForNewTurn();
+			if (controller.chain.entries.length > 1) await this.#advanceDefaultFallback(controller, "new_turn", 0);
+			return;
+		}
+		if (
+			this.settings.get("retry.fallbackRevertPolicy") === "cooldown-expiry" &&
+			controller.activeIndex > 0 &&
+			this.#modelRegistry.getSelectorSuppressionStatus(controller.chain.entries[0] ?? "") === "expired"
+		) {
+			controller.resetForNewTurn();
 		}
 	}
 
@@ -11911,13 +11930,18 @@ export class AgentSession {
 	): { class: FallbackTriggerClass; retryAfterMs?: number } | undefined {
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
 		if (transport.class !== "other") return transport;
+		// Managed fallback receives authoritative transport facts from the request
+		// boundary. Once those facts classify as other, error prose must not upgrade
+		// the failure into an unbounded transient or quota retry.
+		if (transportFailure) return { class: "unknown" };
 		const classification = this.#classifyErrorForRetry(message);
 		if (allowLegacyUsageLimit && classification === "usage_limit") {
 			return { class: "quota" };
 		}
-		if (classification === "transient" || classification === "first_event_timeout" || classification === "unknown") {
-			return { class: "server", retryAfterMs: transport.retryAfterMs };
+		if (classification === "transient" || classification === "first_event_timeout") {
+			return { class: "server" };
 		}
+		if (classification === "unknown") return { class: "unknown" };
 		return undefined;
 	}
 
@@ -11933,6 +11957,7 @@ export class AgentSession {
 				settings: this.settings,
 				matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
 				modelRegistry: this.#modelRegistry,
+				sessionId: this.sessionId,
 			});
 			if (!resolved.model) {
 				controller.onResolutionSkip("unknown_model");
@@ -11944,7 +11969,7 @@ export class AgentSession {
 				continue;
 			}
 			const key = await this.#modelRegistry.getApiKey(resolved.model, this.sessionId);
-			if (!key) {
+			if (!isAuthenticated(key) && key !== kNoAuth) {
 				controller.onResolutionSkip("unauthenticated");
 				continue;
 			}
@@ -12008,22 +12033,25 @@ export class AgentSession {
 		return `Model fallback chain exhausted; models tried: ${tried}; models skipped: ${skipped}`;
 	}
 
-	async #markFailedManagedCredential(trigger: { class: FallbackTriggerClass; retryAfterMs?: number }): Promise<void> {
-		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit"))
-			return;
-
+	async #markFailedManagedCredential(trigger: {
+		class: FallbackTriggerClass;
+		retryAfterMs?: number;
+	}): Promise<boolean> {
+		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit")) {
+			return false;
+		}
 		const authStorage = this.#modelRegistry.authStorage;
 		if (trigger.class === "auth") {
 			const apiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
-			if (isAuthenticated(apiKey)) {
-				await authStorage.invalidateCredentialMatching(this.model.provider, apiKey, { sessionId: this.sessionId });
-			}
-			return;
+			if (!isAuthenticated(apiKey)) return false;
+			return authStorage.invalidateCredentialMatching(this.model.provider, apiKey, { sessionId: this.sessionId });
 		}
-
-		await authStorage.markUsageLimitReached(this.model.provider, this.sessionId, {
+		if (authStorage.hasRuntimeApiKey(this.model.provider)) return false;
+		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
+		const rotated = await authStorage.markUsageLimitReached(this.model.provider, this.sessionId, {
 			retryAfterMs: trigger.retryAfterMs,
 		});
+		return rotated && (await this.#modelRegistry.getApiKey(this.model, this.sessionId)) !== activeApiKey;
 	}
 
 	/** Handle retryable errors with exponential backoff. */
@@ -12050,14 +12078,22 @@ export class AgentSession {
 		// fail-closed behavior for generic provider errors. Explicit retry
 		// settings opt into the resilient legacy retry path.
 		if (!managedFallback && (!retrySettings.enabled || !legacyRetryConfigured)) return false;
-		const legacyClassification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
-		const legacyUnbounded = legacyClassification === "transient" || legacyClassification === "unknown";
+		const classification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
+		const legacyUnbounded = classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
-		const outcome = managedFallback
+		let outcome = managedFallback
 			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-			: !legacyUnbounded && attemptsUsed > retrySettings.maxRetries
-				? "exhausted"
-				: "retry";
+			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+				? "retry"
+				: "exhausted";
+		const credentialRotated =
+			managedFallback &&
+			outcome === "advance" &&
+			(trigger.class === "quota" || trigger.class === "rate_limit") &&
+			(await this.#markFailedManagedCredential(trigger));
+		if (credentialRotated && controller.restorePreviousEntryForRetry()) {
+			outcome = "retry";
+		}
 		if (outcome === "exhausted") {
 			if (managedFallback) {
 				const errorMessage = this.#fallbackExhaustionError(controller);
@@ -12074,27 +12110,21 @@ export class AgentSession {
 		const retryAfterMs =
 			trigger.retryAfterMs ?? (managedFallback ? undefined : this.#parseRetryAfterMsFromError(errorMessage));
 		const delayMs =
-			outcome === "advance"
+			credentialRotated || outcome === "advance"
 				? 0
 				: managedFallback
 					? effectiveFallbackDelay(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed, retryAfterMs)
 					: retryAfterMs !== undefined
-						? Math.max(retrySettings.baseDelayMs * 2 ** Math.max(0, attemptsUsed - 1), retryAfterMs)
-						: retrySettings.baseDelayMs * 2 ** Math.max(0, attemptsUsed - 1);
-		if (!managedFallback && !legacyUnbounded && retrySettings.maxDelayMs > 0 && delayMs > retrySettings.maxDelayMs) {
-			this.#retryAttempt = 0;
-			await this.#emitSessionEvent({
-				type: "auto_retry_end",
-				success: false,
-				attempt: attemptsUsed,
-				finalError: `Provider requested ${delayMs}ms wait, exceeds retry.maxDelayMs (${retrySettings.maxDelayMs}ms). Original error: ${errorMessage}`,
-			});
-			this.#resolveRetry();
-			return false;
+						? Math.min(retryAfterMs, retrySettings.maxDelayMs)
+						: cappedExponentialWithFullJitter(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed);
+
+		if (managedFallback && trigger.class === "rate_limit" && trigger.retryAfterMs !== undefined) {
+			const selector = controller.currentSelector();
+			if (selector) this.#modelRegistry.suppressSelector(selector, Date.now() + trigger.retryAfterMs);
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
-			if (managedFallback) await this.#markFailedManagedCredential(trigger);
+			if (managedFallback && !credentialRotated) await this.#markFailedManagedCredential(trigger);
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
 			if (outcome === "advance") {
@@ -12139,7 +12169,7 @@ export class AgentSession {
 				maxAttempts: managedFallback ? controller.maxAttempts : retrySettings.maxRetries,
 				delayMs,
 				errorMessage,
-				unbounded: !managedFallback && legacyUnbounded,
+				unbounded: managedFallback ? false : legacyUnbounded,
 			});
 
 			const messages = this.agent.state.messages;

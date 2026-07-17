@@ -17,7 +17,7 @@ For process-isolated TypeScript integrations, install `@gajae-code/bridge-client
 
 ## Entry points
 
-`@gajae-code/coding-agent` exports the SDK APIs from the package root (and also via `@gajae-code/coding-agent/sdk`).
+`@gajae-code/coding-agent/sdk` is the canonical entry point for embedders. The package root exports the same SDK APIs for convenience.
 
 Core exports for embedders:
 
@@ -241,7 +241,7 @@ Related APIs:
 
 ```ts
 const { session } = await createAgentSession({
-  toolNames: ["read", "grep", "find", "write"],
+  toolNames: ["read", "search", "find", "write"],
   requireYieldTool: true,
 });
 ```
@@ -332,7 +332,7 @@ const { session } = await createAgentSession({
   modelRegistry,
   settings,
   sessionManager: SessionManager.inMemory(),
-  toolNames: ["read", "grep", "find", "edit", "write"],
+  toolNames: ["read", "search", "find", "edit", "write"],
   enableLsp: true,
 });
 
