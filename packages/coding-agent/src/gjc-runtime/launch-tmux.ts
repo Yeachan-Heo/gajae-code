@@ -1437,7 +1437,8 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					"macOS computer broker unavailable; computer actions will fail closed in this tmux session.\n",
 				);
-		} catch {
+		} catch (error) {
+			if (error instanceof Error && "code" in error && error.code === "COMPUTER_BROKER_CLEANUP_FAILED") throw error;
 			(context.diagnosticWriter ?? safeStderrWrite)(
 				"macOS computer broker unavailable; computer actions will fail closed in this tmux session.\n",
 			);

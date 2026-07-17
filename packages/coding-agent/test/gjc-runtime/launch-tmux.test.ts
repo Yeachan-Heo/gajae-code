@@ -3221,6 +3221,31 @@ describe("tmux owner isolation launch gate", () => {
 		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_TOKEN");
 	});
 
+	it("propagates broker cleanup failures before creating tmux", () => {
+		const cleanupError = Object.assign(new Error("cleanup failed"), { code: "COMPUTER_BROKER_CLEANUP_FAILED" });
+		expect(() =>
+			launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello"], tmux: true }),
+				rawArgs: ["--tmux", "hello"],
+				cwd: launchTestRoot,
+				env: {},
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "darwin",
+				architecture: "arm64",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+				computerBrokerStarter: () => {
+					throw cleanupError;
+				},
+				spawnSync: () => {
+					throw new Error("tmux must not start");
+				},
+			}),
+		).toThrow(cleanupError);
+	});
+
 	it("starts a fresh broker after an existing-session attach fails", () => {
 		const events: string[] = [];
 		const start = vi.fn(() => {

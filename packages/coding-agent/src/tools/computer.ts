@@ -983,16 +983,14 @@ async function writeComputerAuditLog(session: ToolSession, details: ComputerTool
 	if (!session.settings.get("computer.auditLog.enabled")) return;
 	const sessionFile = session.getSessionFile();
 	if (!sessionFile) return;
-	const auditDirectory = path.dirname(sessionFile);
-	if (!(await isSecureComputerAuditDirectory(auditDirectory))) return;
-	const auditPath = path.join(auditDirectory, ".computer-audit.jsonl");
-	const record = auditRecordFromDetails(details);
-	if (details.steps) {
-		for (const step of details.steps) {
-			await writeComputerAuditLog(session, step);
-		}
-	}
 	try {
+		const auditDirectory = path.dirname(sessionFile);
+		if (!(await isSecureComputerAuditDirectory(auditDirectory))) return;
+		const auditPath = path.join(auditDirectory, ".computer-audit.jsonl");
+		const record = auditRecordFromDetails(details);
+		if (details.steps) {
+			for (const step of details.steps) await writeComputerAuditLog(session, step);
+		}
 		await appendComputerAuditRecord(auditPath, record);
 	} catch {
 		// Audit logging is best-effort; do not let it fail the action.

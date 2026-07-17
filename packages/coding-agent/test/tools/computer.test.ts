@@ -11,6 +11,7 @@ import {
 	GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV,
 	GJC_COMPUTER_BROKER_PGID_ENV,
 	GJC_COMPUTER_BROKER_PID_ENV,
+	GJC_COMPUTER_BROKER_REQUIRED_ENV,
 	GJC_COMPUTER_BROKER_SOCKET_ENV,
 	GJC_COMPUTER_BROKER_START_ENV,
 	GJC_COMPUTER_BROKER_TOKEN_ENV,
@@ -54,6 +55,7 @@ const brokerEnvironmentKeys = [
 	GJC_COMPUTER_BROKER_TOKEN_ENV,
 	GJC_COMPUTER_BROKER_DIR_ENV,
 	GJC_COMPUTER_BROKER_PID_ENV,
+	GJC_COMPUTER_BROKER_REQUIRED_ENV,
 	GJC_COMPUTER_BROKER_START_ENV,
 	GJC_COMPUTER_BROKER_EXECUTABLE_ENV,
 	GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV,
@@ -246,6 +248,24 @@ describe("computer tool gating", () => {
 		setComputerControllerFactoryForTests(undefined);
 		setComputerPlatformForTests(undefined);
 		setComputerArchForTests(undefined);
+	});
+
+	it("registers the computer tool when a required broker is unavailable", async () => {
+		const previousEnvironment = snapshotBrokerEnvironment();
+		try {
+			for (const key of brokerEnvironmentKeys) delete process.env[key];
+			process.env[GJC_COMPUTER_BROKER_REQUIRED_ENV] = "1";
+			setComputerPlatformForTests("darwin");
+			setComputerArchForTests("arm64");
+			const tool = ComputerTool.createIf(createSession(Settings.isolated({ "computer.enabled": true })));
+			expect(tool).toBeInstanceOf(ComputerTool);
+			if (!tool) throw new Error("expected computer tool");
+			const result = await tool.execute("required-broker-unavailable", { action: "screenshot" });
+			expect(result.isError).toBe(true);
+			expect(result.details?.code).toBe("COMPUTER_BROKER_UNAVAILABLE");
+		} finally {
+			restoreBrokerEnvironment(previousEnvironment);
+		}
 	});
 
 	it("selects the broker controller and initializes its ownership lease during tool creation", async () => {
@@ -1274,6 +1294,18 @@ describe("computer tool dispatch", () => {
 			);
 			await linkedTool.execute("audit-parent-symlink", { action: "wait", ms: 1 });
 			await expect(fs.stat(path.join(redirectedDirectory, ".computer-audit.jsonl"))).rejects.toThrow();
+
+			const missingDirectoryTool = new ComputerTool(
+				createSession(
+					Settings.isolated({ "computer.enabled": true, "computer.auditLog.enabled": true }),
+					path.join(tmpDir, "missing-directory", "session.jsonl"),
+				),
+			);
+			const missingDirectoryResult = await missingDirectoryTool.execute("audit-missing-parent", {
+				action: "wait",
+				ms: 1,
+			});
+			expect(missingDirectoryResult.isError).not.toBe(true);
 		} finally {
 			await fs.rm(tmpDir, { recursive: true, force: true });
 		}

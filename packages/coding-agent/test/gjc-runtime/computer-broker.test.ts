@@ -216,6 +216,7 @@ describe("computer broker", () => {
 		expect(() => createComputerBrokerControllerFromEnvironment()).toThrow(
 			"Computer broker is required but unavailable",
 		);
+		expect(() => initializeComputerBrokerLeaseFromEnvironment()).not.toThrow();
 	});
 
 	it("never pathname-closes a production broker after post-listen failure", () => {
@@ -364,6 +365,33 @@ describe("computer broker", () => {
 			}),
 		).toBeNull();
 		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+	});
+
+	it("reaps a helper that exits after TERM without escalating to KILL", () => {
+		const pid = 42_426;
+		const identity = staticProcessIdentity(pid);
+		const signals: NodeJS.Signals[] = [];
+		let termSent = false;
+		const child = fakeBrokerChild(pid, signal => {
+			signals.push(signal);
+			if (signal === "SIGTERM") termSent = true;
+			return true;
+		});
+		const spawn = ((_command: string, _args: readonly string[], _options: childProcess.SpawnOptions) =>
+			child) as typeof childProcess.spawn;
+		expect(
+			startComputerBrokerForTmux({
+				isCompiledBinary: () => true,
+				spawn,
+				startupTimeoutMs: 1,
+				readProcessIdentity: () => identity,
+				isProcessAlive: () => true,
+				reapChildProcess: () => termSent,
+				termTimeoutMs: 1,
+				killTimeoutMs: 1,
+			}),
+		).toBeNull();
+		expect(signals).toEqual(["SIGTERM"]);
 	});
 
 	it.if(process.platform === "darwin")("never sends the lease token to a mismatched peer incarnation", async () => {
@@ -684,6 +712,53 @@ describe("computer broker", () => {
 		await closeServer(server);
 		fs.rmSync(directory, { recursive: true, force: true });
 	});
+
+	it.if(process.platform === "darwin")(
+		"evicts timed-out screenshots without exhausting pending requests",
+		async () => {
+			const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-timeout-eviction-"));
+			const socketPath = path.join(directory, "broker.sock");
+			const token = "b".repeat(64);
+			const server = net.createServer(socket => {
+				const frames = socketFrames(socket);
+				void (async () => {
+					await frames.next();
+					socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
+					const abandonedIds: string[] = [];
+					for (let index = 0; index < 130; index++) {
+						const request = (await frames.next()) as { id: string };
+						abandonedIds.push(request.id);
+					}
+					await Bun.sleep(10);
+					for (const id of abandonedIds)
+						socket.write(`${JSON.stringify({ version: 1, type: "response", id, ok: true, result: null })}\n`);
+					const finalRequest = (await frames.next()) as { id: string };
+					socket.write(
+						`${JSON.stringify({ version: 1, type: "response", id: finalRequest.id, ok: true, result: null })}\n`,
+					);
+				})().catch(() => socket.destroy());
+			});
+			await listen(server, socketPath);
+			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			setBrokerIdentityEnvironment();
+			const controller = createComputerBrokerControllerFromEnvironment();
+			if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
+			for (let index = 0; index < 130; index++) {
+				try {
+					await controller.brokerInvoke("screenshot", [], { timeoutMs: 1 });
+					throw new Error("expected screenshot timeout");
+				} catch (error) {
+					expect((error as { code?: string }).code).toBe("COMPUTER_CANCELLED");
+				}
+			}
+			expect(await controller.brokerInvoke("wait", [null, 1], { timeoutMs: 500 })).toBeNull();
+			disposeComputerBrokerLease();
+			await closeServer(server);
+			fs.rmSync(directory, { recursive: true, force: true });
+		},
+	);
 
 	it.if(process.platform === "darwin")(
 		"roundtrips screenshots and input while preserving redacted native errors",

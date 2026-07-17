@@ -196,6 +196,44 @@ pub fn darwin_process_identity(pid: i32) -> napi::Result<DarwinProcessIdentity> 
 	}
 }
 
+/// Non-blockingly reap an exited direct child on macOS.
+///
+/// Returns `true` only when `waitpid` proved that this caller reaped the exact
+/// child PID. `ECHILD` is not treated as exit because the PID may have been
+/// reused by a process that is not our child.
+#[napi(js_name = "darwinReapChildProcess")]
+pub fn darwin_reap_child_process(pid: i32) -> napi::Result<bool> {
+	#[cfg(target_os = "macos")]
+	{
+		if pid <= 0 {
+			return Err(napi::Error::new(
+				napi::Status::InvalidArg,
+				"Process ID must be positive".to_string(),
+			));
+		}
+		let mut status = 0;
+		// SAFETY: `status` is a valid writable integer and `WNOHANG` makes this
+		// exact-child wait non-blocking.
+		let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+		if result == pid {
+			return Ok(true);
+		}
+		if result == 0 {
+			return Ok(false);
+		}
+		let error = std::io::Error::last_os_error();
+		if error.raw_os_error() == Some(libc::ECHILD) {
+			return Ok(false);
+		}
+		Err(napi::Error::from_reason("unable to reap child process"))
+	}
+	#[cfg(not(target_os = "macos"))]
+	{
+		let _ = pid;
+		Err(napi::Error::from_reason("Child process reaping is only supported on macOS"))
+	}
+}
+
 /// Return the process ID of the peer connected to a Unix-domain socket (macOS).
 ///
 /// The kernel resolves the peer from the connected socket descriptor; this

@@ -21,6 +21,7 @@ type NativeComputerModule = {
 	computerScreenshot: () => ComputerScreenshot;
 	unixSocketPeerPid: (fd: number) => number;
 	darwinProcessIdentity: (pid: number) => { startToken: string; executable: string; pgid: number; parentPid: number };
+	darwinReapChildProcess: (pid: number) => boolean;
 };
 
 type SocketWithInternalHandle = {
@@ -147,12 +148,27 @@ describe.if(isMacOS)("Unix socket peer PID napi binding", () => {
 	});
 
 	it("returns a microsecond process incarnation and executable path", async () => {
-		const { darwinProcessIdentity } = await loadNativeComputerModule();
+		const { darwinProcessIdentity, darwinReapChildProcess } = await loadNativeComputerModule();
 		const identity = darwinProcessIdentity(process.pid);
 		expect(identity.startToken).toMatch(/^\d+:\d+$/);
 		expect(path.isAbsolute(identity.executable)).toBe(true);
 		expect(identity.pgid).toBeGreaterThan(0);
 		expect(identity.parentPid).toBeGreaterThan(0);
 		expect(() => darwinProcessIdentity(-1)).toThrow();
+		expect(darwinReapChildProcess(process.pid)).toBe(false);
+		expect(() => darwinReapChildProcess(-1)).toThrow();
+	});
+
+	it("reaps an exited direct child without event-loop progress", async () => {
+		const { darwinReapChildProcess } = await loadNativeComputerModule();
+		const child = Bun.spawn(["/usr/bin/true"], { stdout: "ignore", stderr: "ignore" });
+		child.unref();
+		const deadline = Date.now() + 1_000;
+		let reaped = false;
+		while (!reaped && Date.now() < deadline) {
+			reaped = darwinReapChildProcess(child.pid);
+			if (!reaped) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+		}
+		expect(reaped).toBe(true);
 	});
 });

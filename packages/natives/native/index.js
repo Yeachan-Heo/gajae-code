@@ -36,6 +36,7 @@ export const canonicalExistingDirectoryIdentity = nativeBindings.canonicalExisti
 export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
 export const darwinProcessIdentity = nativeBindings.darwinProcessIdentity;
+export const darwinReapChildProcess = nativeBindings.darwinReapChildProcess;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
 export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;

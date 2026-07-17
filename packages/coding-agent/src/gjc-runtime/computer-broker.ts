@@ -92,6 +92,7 @@ type ComputerNativeBindings = Record<string, unknown> & {
 	ComputerController: new () => ComputerControllerLike;
 	unixSocketPeerPid(fd: number): number;
 	darwinProcessIdentity(pid: number): { startToken: string; executable: string; pgid: number; parentPid: number };
+	darwinReapChildProcess(pid: number): boolean;
 };
 
 function createNativeComputerController(): ComputerControllerLike {
@@ -117,6 +118,7 @@ export type ComputerBrokerProcessIdentity = {
 
 type ProcessIdentityReader = (pid: number) => ComputerBrokerProcessIdentity | null;
 type ProcessAliveReader = (pid: number) => boolean;
+type ChildProcessReaper = (pid: number) => boolean;
 
 export interface StartComputerBrokerOptions {
 	env?: NodeJS.ProcessEnv;
@@ -127,6 +129,7 @@ export interface StartComputerBrokerOptions {
 	spawn?: typeof childProcess.spawn;
 	readProcessIdentity?: ProcessIdentityReader;
 	isProcessAlive?: ProcessAliveReader;
+	reapChildProcess?: ChildProcessReaper;
 	termTimeoutMs?: number;
 	killTimeoutMs?: number;
 }
@@ -592,6 +595,7 @@ function secureRuntimeDirectory(config: { socket: string; directory: string }, r
 }
 
 const MAX_PENDING_REQUESTS = 128;
+const MAX_ABANDONED_REQUESTS = 256;
 type PendingRequest = {
 	resolve(value: unknown): void;
 	reject(error: BrokerError): void;
@@ -600,6 +604,15 @@ let leaseSocket: net.Socket | undefined;
 let leaseConfiguration: string | undefined;
 let leaseReadyPromise: Promise<void> | undefined;
 const pendingRequests = new Map<string, PendingRequest>();
+const abandonedRequestIds = new Set<string>();
+
+function rememberAbandonedRequest(id: string): void {
+	if (abandonedRequestIds.size >= MAX_ABANDONED_REQUESTS) {
+		const oldest = abandonedRequestIds.values().next().value;
+		if (oldest !== undefined) abandonedRequestIds.delete(oldest);
+	}
+	abandonedRequestIds.add(id);
+}
 
 function clearLease(socket: net.Socket, error: BrokerError): void {
 	if (leaseSocket !== socket) return;
@@ -608,6 +621,7 @@ function clearLease(socket: net.Socket, error: BrokerError): void {
 	leaseReadyPromise = undefined;
 	for (const pending of pendingRequests.values()) pending.reject(error);
 	pendingRequests.clear();
+	abandonedRequestIds.clear();
 }
 
 function ensureComputerBrokerLease(config: {
@@ -691,7 +705,10 @@ function ensureComputerBrokerLease(config: {
 				const frame = responseFrame(parseFrame(line, MAX_RESPONSE_BYTES));
 				if (!frame) throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response.");
 				const pending = pendingRequests.get(frame.id);
-				if (!pending) throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response.");
+				if (!pending) {
+					if (abandonedRequestIds.delete(frame.id)) continue;
+					throw new BrokerError("COMPUTER_BROKER_PROTOCOL", "Invalid computer broker response.");
+				}
 				pendingRequests.delete(frame.id);
 				if (frame.ok) pending.resolve(frame.result);
 				else pending.reject(new BrokerError(frame.error.code, frame.error.message));
@@ -717,9 +734,13 @@ function ensureComputerBrokerLease(config: {
 
 /** Starts and retains the persistent ownership lease for this inner GJC process. */
 export function initializeComputerBrokerLeaseFromEnvironment(): void {
-	const config = requiredBrokerEnvironment(process.env);
-	if (!config) return;
-	void ensureComputerBrokerLease(config).catch(() => undefined);
+	try {
+		const config = requiredBrokerEnvironment(process.env);
+		if (!config) return;
+		void ensureComputerBrokerLease(config).catch(() => undefined);
+	} catch {
+		// Registration stays available; required broker failures surface on invocation.
+	}
 }
 
 function bootstrapAmbientTmuxBroker(env: NodeJS.ProcessEnv): void {
@@ -770,17 +791,50 @@ async function request(
 			? MAX_REQUEST_DEADLINE_MS
 			: Math.max(1, Math.min(Math.ceil(requestedTimeoutMs), MAX_REQUEST_DEADLINE_MS));
 	const deadlineAtMs = requestedTimeoutMs === undefined ? null : Date.now() + timeoutMs;
-	const pending = Promise.withResolvers<unknown>();
+	const result = Promise.withResolvers<unknown>();
+	let cancellationTimer: NodeJS.Timeout | undefined;
+	let removeAbortListener: (() => void) | undefined;
+	const cleanup = (): void => {
+		if (cancellationTimer) clearTimeout(cancellationTimer);
+		removeAbortListener?.();
+	};
+	const pending: PendingRequest = {
+		resolve: value => {
+			cleanup();
+			result.resolve(value);
+		},
+		reject: error => {
+			cleanup();
+			result.reject(error);
+		},
+	};
 	pendingRequests.set(id, pending);
+	const abandonable = method === "screenshot" || method === "wait";
+	const abandon = (): void => {
+		if (pendingRequests.get(id) !== pending) return;
+		pendingRequests.delete(id);
+		rememberAbandonedRequest(id);
+		pending.reject(new BrokerError("COMPUTER_CANCELLED", "Computer broker request was cancelled."));
+	};
+	if (abandonable && requestedTimeoutMs !== undefined) {
+		cancellationTimer = setTimeout(abandon, timeoutMs);
+		cancellationTimer.unref();
+	}
+	if (abandonable && options.signal) {
+		const onAbort = (): void => abandon();
+		options.signal.addEventListener("abort", onAbort, { once: true });
+		removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+		if (options.signal.aborted) abandon();
+	}
 	try {
 		socket.write(
 			`${JSON.stringify({ version: PROTOCOL_VERSION, type: "request", token: config.token, id, method, args, deadlineAtMs })}\n`,
 		);
 	} catch {
-		pendingRequests.delete(id);
-		throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost.");
+		if (pendingRequests.get(id) === pending) pendingRequests.delete(id);
+		pending.reject(new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost."));
 	}
-	return pending.promise;
+	return result.promise;
 }
 
 function resultScreenshot(value: unknown): ComputerScreenshot {
@@ -1151,6 +1205,14 @@ function processAlive(pid: number): boolean {
 	}
 }
 
+function reapChildProcess(pid: number): boolean {
+	try {
+		return loadNative<ComputerNativeBindings>().darwinReapChildProcess(pid);
+	} catch {
+		return false;
+	}
+}
+
 function terminate(
 	child: childProcess.ChildProcess,
 	config: { socket: string; directory: string },
@@ -1158,12 +1220,13 @@ function terminate(
 	runtimeIdentity: RuntimePathIdentity,
 	readIdentity: ProcessIdentityReader,
 	isAlive: ProcessAliveReader,
+	reapChild: ChildProcessReaper,
 	termTimeoutMs: number,
 	killTimeoutMs: number,
 ): void {
 	const pid = child.pid;
 	const identityState = (): "missing" | "match" | "mismatch" => {
-		if (pid === undefined || !isAlive(pid)) return "missing";
+		if (pid === undefined || reapChild(pid) || !isAlive(pid)) return "missing";
 		return identity && sameProcessIdentity(identity, readIdentity(pid)) ? "match" : "mismatch";
 	};
 	const requireSignalTarget = (): boolean => {
@@ -1190,22 +1253,22 @@ function terminate(
 		}
 		return true;
 	};
-	const waitForExit = (timeoutMs: number): void => {
-		if (pid === undefined) return;
+	const waitForExit = (timeoutMs: number): boolean => {
+		if (pid === undefined) return true;
 		const deadline = Date.now() + timeoutMs;
-		while (isAlive(pid) && Date.now() < deadline) sleepSynchronously(10);
+		do {
+			if (reapChild(pid) || !isAlive(pid)) return true;
+			if (Date.now() < deadline) sleepSynchronously(10);
+		} while (Date.now() < deadline);
+		return reapChild(pid) || !isAlive(pid);
 	};
 
-	if (send("SIGTERM")) {
-		waitForExit(termTimeoutMs);
+	if (send("SIGTERM") && !waitForExit(termTimeoutMs)) {
 		const afterTerm = identityState();
 		if (afterTerm === "mismatch")
 			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
-		if (afterTerm === "match" && send("SIGKILL")) {
-			waitForExit(killTimeoutMs);
-			if (identityState() !== "missing")
-				throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
-		}
+		if (afterTerm === "match" && send("SIGKILL") && !waitForExit(killTimeoutMs) && identityState() !== "missing")
+			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
 	}
 	removeRuntimeDirectory(config, runtimeIdentity);
 }
@@ -1252,6 +1315,7 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 	const config = { socket, directory };
 	const readIdentity = options.readProcessIdentity ?? processIdentity;
 	const isAlive = options.isProcessAlive ?? processAlive;
+	const reapChild = options.reapChildProcess ?? reapChildProcess;
 	const termTimeoutMs = Math.max(1, Math.min(options.termTimeoutMs ?? TERM_TIMEOUT_MS, TERM_TIMEOUT_MS));
 	const killTimeoutMs = Math.max(1, Math.min(options.killTimeoutMs ?? KILL_TIMEOUT_MS, KILL_TIMEOUT_MS));
 	let runtimeIdentity: RuntimePathIdentity | undefined;
@@ -1299,6 +1363,7 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 				runtimeIdentity,
 				readIdentity,
 				isAlive,
+				reapChild,
 				termTimeoutMs,
 				killTimeoutMs,
 			);
@@ -1328,6 +1393,7 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 					readyRuntimeIdentity,
 					readIdentity,
 					isAlive,
+					reapChild,
 					termTimeoutMs,
 					killTimeoutMs,
 				);
@@ -1344,6 +1410,7 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 					runtimeIdentity,
 					readIdentity,
 					isAlive,
+					reapChild,
 					termTimeoutMs,
 					killTimeoutMs,
 				);

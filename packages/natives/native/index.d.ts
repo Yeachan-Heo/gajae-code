@@ -675,6 +675,15 @@ export interface DarwinProcessIdentity {
 }
 
 /**
+ * Non-blockingly reap an exited direct child on macOS.
+ *
+ * Returns `true` only when `waitpid` proved that this caller reaped the exact
+ * child PID. `ECHILD` is not treated as exit because the PID may have been
+ * reused by a process that is not our child.
+ */
+export declare function darwinReapChildProcess(pid: number): boolean
+
+/**
  * Detect macOS system appearance via CoreFoundation.
  * Returns `"dark"` or `"light"` on macOS, `null` on other platforms.
  */
