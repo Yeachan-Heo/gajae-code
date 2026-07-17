@@ -102,9 +102,10 @@ const managedAttemptTextEncoder = new TextEncoder();
 const ABORTED: unique symbol = Symbol("agent-loop-aborted");
 function managedContextOverflow(message: AssistantMessage, config: AgentLoopConfig): boolean {
 	const transportFailure = managedTransportFailure(message);
-	return (
-		message.stopReason === "error" && classifyContextOverflow(message, transportFailure, config.model.contextWindow)
-	);
+	// Managed empty-stop responses may be repaired by the managed shell below; only
+	// typed/error overflows are discardable before that normalization boundary.
+	if (config.fallbackManaged && message.stopReason !== "error") return false;
+	return classifyContextOverflow(message, transportFailure, config.model.contextWindow);
 }
 
 /** Managed fallback owns retry policy; only attached typed transport facts may discard an attempt. */
