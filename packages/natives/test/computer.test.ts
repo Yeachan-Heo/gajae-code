@@ -1,30 +1,19 @@
 import { describe, expect, it } from "bun:test";
 
+import { ComputerController, computerScreenshot } from "../native/index.js";
+
 const isMacOS = process.platform === "darwin";
+const SCREEN_RECORDING_PERMISSION_ERROR = "screen capture failed; the Screen Recording permission may not be granted";
 
-type NativeComputerModule = {
-	ComputerController: new () => Record<string, unknown>;
-	computerScreenshot: () => {
-		widthPx: number;
-		heightPx: number;
-		scaleX: number;
-		scaleY: number;
-		png: Uint8Array;
-		displayEpoch: number;
-		captureId: number;
-	};
-};
-
-async function loadNativeComputerModule(): Promise<NativeComputerModule> {
-	return (await import("../native/index.js")) as unknown as NativeComputerModule;
+function isScreenRecordingPermissionError(error: unknown): boolean {
+	return error instanceof Error && error.message === SCREEN_RECORDING_PERMISSION_ERROR;
 }
 
 describe.if(isMacOS)("ComputerController napi binding", () => {
-	it("exists with expected methods", async () => {
-		const { ComputerController } = await loadNativeComputerModule();
+	it("exists with expected methods", () => {
 		const controller = new ComputerController();
 		expect(controller).toBeInstanceOf(ComputerController);
-		for (const method of [
+		const methods = [
 			"screenshot",
 			"click",
 			"doubleClick",
@@ -34,25 +23,55 @@ describe.if(isMacOS)("ComputerController napi binding", () => {
 			"type",
 			"keypress",
 			"wait",
-		]) {
+			"gate0PermissionStatus",
+			"gate0RequestScreenRecording",
+			"gate0HarmlessProbe",
+		] as const;
+		for (const method of methods) {
 			expect(typeof controller[method]).toBe("function");
 		}
 	});
-});
 
+	it("returns the redacted Gate-0 permission-status shape without prompting", () => {
+		const controller = new ComputerController();
+		const status = controller.gate0PermissionStatus();
+		expect(status).toEqual({
+			accessibility: expect.any(Boolean),
+			screenRecording: expect.any(Boolean),
+		});
+	});
+
+	it("returns only the redacted harmless-probe shape", () => {
+		const controller = new ComputerController();
+		const status = controller.gate0PermissionStatus();
+		const probe = controller.gate0HarmlessProbe();
+
+		expect(probe).toEqual({
+			screenshot: expect.any(Boolean),
+			accessibility: expect.any(Boolean),
+			pointerMoveRestore: expect.any(Boolean),
+		});
+		expect(probe.accessibility).toBe(status.accessibility);
+		if (status.screenRecording) {
+			expect(probe.screenshot).toBe(true);
+		}
+		if (status.accessibility) {
+			expect(probe.pointerMoveRestore).toBe(true);
+		}
+	});
+});
 // The native `computerScreenshot` binding is macOS-only and captures the real
-// primary display, so it requires the Screen Recording permission. Gate on
-// platform and skip gracefully when capture is unavailable in the environment.
+// primary display, so only its exact missing-permission error is skipped.
 describe.if(isMacOS)("computer screenshot napi binding", () => {
-	it("returns a decodable PNG whose dimensions match the descriptor", async () => {
-		const { computerScreenshot } = await loadNativeComputerModule();
-		let shot: ReturnType<NativeComputerModule["computerScreenshot"]>;
+	it("returns a decodable PNG whose dimensions match the descriptor", () => {
+		let shot: ReturnType<typeof computerScreenshot>;
 		try {
 			shot = computerScreenshot();
 		} catch (err) {
-			// Screen Recording not granted to this process — surfaced, not silent.
-			console.warn(`skipping: computerScreenshot unavailable (${String(err)})`);
-			return;
+			if (isScreenRecordingPermissionError(err)) {
+				return;
+			}
+			throw err;
 		}
 
 		expect(shot.widthPx).toBeGreaterThan(0);

@@ -1,18 +1,19 @@
 //! N-API controller surface for macOS computer-use.
 //!
-//! Side-effecting methods are thin adapters: they construct an [`InputAction`]
-//! and delegate to [`execute_input`]. No direct input controller methods are
-//! called from this module.
+//! Normal side-effecting methods are thin adapters: they construct an
+//! [`InputAction`] and delegate to [`execute_input`]. The explicit Gate-0 probe
+//! is the sole exception: it performs a bounded move-and-restore experiment.
 
 use napi::bindgen_prelude::Uint8Array;
 use napi_derive::napi;
 
 use crate::computer::{
-	ComputerScreenshot,
+	ComputerScreenshot, Gate0HarmlessProbeResult, Gate0PermissionStatus,
 	capture::capture_primary_display,
 	executor::{DisplayContext, ExecError, InputAction, MacPermissionGate, execute_input},
 	hotkey,
-	input::{MouseButton, guarded_controller},
+	input::{MouseButton, guarded_controller, harmless_move_restore},
+	permissions,
 	supervisor::Supervisor,
 };
 
@@ -41,6 +42,36 @@ impl ComputerController {
 			display_epoch: frame.display_epoch as f64,
 			capture_id:    frame.capture_id,
 		})
+	}
+
+	/// Return the non-prompting combined Accessibility + PostEvent TCC state for
+	/// the hidden Gate-0 experiment.
+	#[napi(js_name = "gate0PermissionStatus")]
+	pub fn gate0_permission_status(&self) -> Gate0PermissionStatus {
+		let status = permissions::preflight();
+		Gate0PermissionStatus {
+			accessibility:    permissions::gate0_input_injection_granted(),
+			screen_recording: status.screen_recording,
+		}
+	}
+
+	/// Explicitly request Screen Recording access for the hidden Gate-0
+	/// experiment. Normal controller initialization and screenshot paths never
+	/// call this.
+	#[napi(js_name = "gate0RequestScreenRecording")]
+	pub fn gate0_request_screen_recording(&self) -> bool {
+		permissions::request_screen_recording_access()
+	}
+
+	/// Run the hidden Gate-0 probe without returning screenshot bytes or cursor
+	/// coordinates. The pointer path moves exactly one logical pixel and
+	/// restores the original location without clicking, typing, or holding
+	/// input state.
+	#[napi(js_name = "gate0HarmlessProbe")]
+	pub fn gate0_harmless_probe(&self) -> Gate0HarmlessProbeResult {
+		let screenshot = capture_primary_display().is_ok();
+		let accessibility = permissions::gate0_input_injection_granted();
+		gate0_harmless_probe_result(screenshot, accessibility, gate0_pointer_move_restore)
 	}
 
 	#[napi]
@@ -172,6 +203,37 @@ fn parse_button(button: Option<String>) -> napi::Result<MouseButton> {
 	}
 }
 
+fn gate0_harmless_probe_result(
+	screenshot: bool,
+	input_authority: bool,
+	pointer_probe: impl FnOnce() -> bool,
+) -> Gate0HarmlessProbeResult {
+	let pointer_move_restore = input_authority && pointer_probe();
+	Gate0HarmlessProbeResult { screenshot, accessibility: input_authority, pointer_move_restore }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::gate0_harmless_probe_result;
+
+	#[test]
+	fn gate0_skips_pointer_execution_without_combined_authority() {
+		for authority in [false, true] {
+			let mut calls = 0;
+			let result = gate0_harmless_probe_result(true, authority, || {
+				calls += 1;
+				true
+			});
+			assert_eq!(result.accessibility, authority);
+			assert_eq!(result.pointer_move_restore, authority);
+			assert_eq!(calls, usize::from(authority));
+		}
+	}
+}
+
+fn gate0_pointer_move_restore() -> bool {
+	harmless_move_restore().unwrap_or(false)
+}
 fn epoch_from_f64(value: f64) -> u64 {
 	if value.is_finite() && value >= 0.0 {
 		value as u64

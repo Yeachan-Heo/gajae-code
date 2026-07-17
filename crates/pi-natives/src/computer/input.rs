@@ -3,9 +3,8 @@
 //! # Safety model
 //! Input is **runtime-gated**: [`InputController::guarded`] refuses to
 //! construct unless Accessibility is granted (see [`super::permissions`]), so
-//! no event can be posted while the TCC gate is closed. This module is also
-//! **not** wired to napi or the model surface yet — per the approved plan,
-//! input is exposed only after the kill-switch supervisor is proven live.
+//! no event can be posted while the TCC gate is closed. The Gate-0 harmless
+//! probe is separately bounded and reports only redacted boolean results.
 //!
 //! # Testability
 //! All event *orchestration* (action → low-level event sequence, held
@@ -16,6 +15,244 @@
 //! in a granted `gjc` session, not from a non-TCC-trusted test binary.
 
 use super::coords::{CoordError, LogicalPoint, NormalizedDisplay};
+
+const CURSOR_TOLERANCE: f64 = 0.49;
+const CURSOR_COMPARISON_EPSILON: f64 = 1e-9;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CursorBounds {
+	min_x: f64,
+	max_x: f64,
+	min_y: f64,
+	max_y: f64,
+}
+
+impl CursorBounds {
+	fn move_target(self, original: LogicalPoint) -> Option<LogicalPoint> {
+		if !self.min_x.is_finite()
+			|| !self.max_x.is_finite()
+			|| !self.min_y.is_finite()
+			|| !self.max_y.is_finite()
+			|| self.min_x >= self.max_x
+			|| self.min_y >= self.max_y
+			|| !original.x.is_finite()
+			|| !original.y.is_finite()
+			|| original.x < self.min_x
+			|| original.x >= self.max_x
+			|| original.y < self.min_y
+			|| original.y >= self.max_y
+		{
+			return None;
+		}
+		if original.x + 1.0 < self.max_x {
+			Some(LogicalPoint { x: original.x + 1.0, y: original.y })
+		} else if original.x - 1.0 >= self.min_x {
+			Some(LogicalPoint { x: original.x - 1.0, y: original.y })
+		} else if original.y + 1.0 < self.max_y {
+			Some(LogicalPoint { x: original.x, y: original.y + 1.0 })
+		} else if original.y - 1.0 >= self.min_y {
+			Some(LogicalPoint { x: original.x, y: original.y - 1.0 })
+		} else {
+			None
+		}
+	}
+}
+
+const PROBE_DEADLINE_MS: u64 = 100;
+const PROBE_POLL_MS: u64 = 1;
+
+trait HarmlessMoveBackend {
+	type Error;
+
+	fn current_cursor_position(&mut self) -> Result<LogicalPoint, Self::Error>;
+	fn cursor_bounds(&mut self, at: LogicalPoint) -> Result<CursorBounds, Self::Error>;
+	fn warp_cursor(&mut self, to: LogicalPoint) -> Result<(), Self::Error>;
+	fn post_move(&mut self, to: LogicalPoint) -> Result<(), Self::Error>;
+	fn monotonic_millis(&mut self) -> u64;
+	fn sleep_millis(&mut self, millis: u64);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupConfirmation {
+	NotRequired,
+	Confirmed,
+	ConfirmedAfterEventFailure,
+	Unconfirmed,
+}
+
+#[derive(Debug, PartialEq)]
+struct HarmlessMoveVerification<E> {
+	primary: Result<bool, E>,
+	cleanup: CleanupConfirmation,
+}
+
+fn is_near(actual: LogicalPoint, expected: LogicalPoint) -> bool {
+	(actual.x - expected.x).abs() <= CURSOR_TOLERANCE + CURSOR_COMPARISON_EPSILON
+		&& (actual.y - expected.y).abs() <= CURSOR_TOLERANCE + CURSOR_COMPARISON_EPSILON
+}
+
+fn is_distinct_from(actual: LogicalPoint, opposite: LogicalPoint) -> bool {
+	!is_near(actual, opposite)
+}
+
+fn before_deadline<B: HarmlessMoveBackend>(backend: &mut B, deadline: u64) -> bool {
+	backend.monotonic_millis() < deadline
+}
+
+fn poll<B: HarmlessMoveBackend>(backend: &mut B, deadline: u64) -> bool {
+	let now = backend.monotonic_millis();
+	if now >= deadline {
+		return false;
+	}
+	backend.sleep_millis((deadline - now).min(PROBE_POLL_MS));
+	before_deadline(backend, deadline)
+}
+
+enum Observation<E> {
+	Stable,
+	Unsafe,
+	Deadline,
+	Error(E),
+}
+
+/// Observe `expected` twice, separated by a bounded poll. `pending` is safe to
+/// wait through (for example, the original point while a target event arrives),
+/// but it is never accepted as confirmation.
+fn observe_stable<B: HarmlessMoveBackend>(
+	backend: &mut B,
+	expected: LogicalPoint,
+	opposite: LogicalPoint,
+	deadline: u64,
+	pending: LogicalPoint,
+) -> Observation<B::Error> {
+	let mut seen_expected = false;
+	while before_deadline(backend, deadline) {
+		let current = match backend.current_cursor_position() {
+			Ok(current) => current,
+			Err(error) => return Observation::Error(error),
+		};
+		if !before_deadline(backend, deadline) {
+			return Observation::Deadline;
+		}
+		if is_near(current, expected) && is_distinct_from(current, opposite) {
+			if seen_expected {
+				return Observation::Stable;
+			}
+			seen_expected = true;
+		} else if !is_near(current, pending) || !is_distinct_from(current, expected) {
+			return Observation::Unsafe;
+		} else {
+			seen_expected = false;
+		}
+		if !poll(backend, deadline) {
+			break;
+		}
+	}
+	Observation::Deadline
+}
+
+/// The only restoration path. It never warps unless target was observed
+/// stably, and it confirms original twice under the single probe deadline.
+fn restore_cursor<B: HarmlessMoveBackend>(
+	backend: &mut B,
+	original: LogicalPoint,
+	target: LogicalPoint,
+	deadline: u64,
+) -> CleanupConfirmation {
+	for _ in 0..2 {
+		if !before_deadline(backend, deadline) {
+			return CleanupConfirmation::Unconfirmed;
+		}
+		let current = match backend.current_cursor_position() {
+			Ok(current) => current,
+			Err(_) => return CleanupConfirmation::Unconfirmed,
+		};
+		if !before_deadline(backend, deadline) {
+			return CleanupConfirmation::Unconfirmed;
+		}
+		if is_near(current, original) && is_distinct_from(current, target) {
+			return match observe_stable(backend, original, target, deadline, target) {
+				Observation::Stable => CleanupConfirmation::Confirmed,
+				Observation::Unsafe | Observation::Deadline | Observation::Error(_) => {
+					CleanupConfirmation::Unconfirmed
+				},
+			};
+		}
+		if !is_near(current, target) || !is_distinct_from(current, original) {
+			return CleanupConfirmation::Unconfirmed;
+		}
+		if backend.warp_cursor(original).is_err() {
+			continue;
+		}
+		// Event creation failure does not bypass bounded readback confirmation.
+		let post_failed = backend.post_move(original).is_err();
+		match observe_stable(backend, original, target, deadline, target) {
+			Observation::Stable if post_failed => {
+				return CleanupConfirmation::ConfirmedAfterEventFailure;
+			},
+			Observation::Stable => return CleanupConfirmation::Confirmed,
+			Observation::Unsafe | Observation::Deadline | Observation::Error(_) => {
+				return CleanupConfirmation::Unconfirmed;
+			},
+		}
+	}
+	CleanupConfirmation::Unconfirmed
+}
+
+fn verify_harmless_move_restore<B: HarmlessMoveBackend>(
+	backend: &mut B,
+) -> HarmlessMoveVerification<B::Error> {
+	let deadline = backend.monotonic_millis().saturating_add(PROBE_DEADLINE_MS);
+	let original = match backend.current_cursor_position() {
+		Ok(original) => original,
+		Err(error) => {
+			return HarmlessMoveVerification {
+				primary: Err(error),
+				cleanup: CleanupConfirmation::NotRequired,
+			};
+		},
+	};
+	let target = match backend.cursor_bounds(original) {
+		Ok(bounds) => match bounds.move_target(original) {
+			Some(target) => target,
+			None => {
+				return HarmlessMoveVerification {
+					primary: Ok(false),
+					cleanup: CleanupConfirmation::NotRequired,
+				};
+			},
+		},
+		Err(error) => {
+			return HarmlessMoveVerification {
+				primary: Err(error),
+				cleanup: CleanupConfirmation::NotRequired,
+			};
+		},
+	};
+	if let Err(error) = backend.warp_cursor(target) {
+		return HarmlessMoveVerification {
+			primary: Err(error),
+			cleanup: CleanupConfirmation::NotRequired,
+		};
+	}
+	let target_post_error = backend.post_move(target).err();
+	let observed = observe_stable(backend, target, original, deadline, original);
+	let cleanup = match observed {
+		Observation::Stable => restore_cursor(backend, original, target, deadline),
+		Observation::Unsafe | Observation::Deadline | Observation::Error(_) => {
+			CleanupConfirmation::Unconfirmed
+		},
+	};
+	let primary = match target_post_error {
+		Some(error) => Err(error),
+		None => match observed {
+			Observation::Stable => Ok(cleanup == CleanupConfirmation::Confirmed),
+			Observation::Unsafe | Observation::Deadline => Ok(false),
+			Observation::Error(error) => Err(error),
+		},
+	};
+	HarmlessMoveVerification { primary, cleanup }
+}
 
 /// A mouse button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,7 +518,10 @@ impl<S: EventSink> InputController<S> {
 }
 
 #[cfg(target_os = "macos")]
-pub use mac::{MacEventSink, current_cursor_position, guarded_controller};
+pub use mac::{
+	CursorPositionError, HarmlessMoveError, MacEventSink, current_cursor_position,
+	guarded_controller, harmless_move_restore,
+};
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -290,11 +530,26 @@ mod mac {
 
 	use std::ffi::c_void;
 
-	use super::{EventSink, InputController, MouseButton};
-	use crate::computer::{
-		coords::LogicalPoint,
-		permissions::{PermissionError, require_accessibility_for_input},
+	use super::{
+		CursorBounds, EventSink, HarmlessMoveBackend, InputController, LogicalPoint, MouseButton,
 	};
+	use crate::computer::permissions::{
+		PermissionError, gate0_input_injection_granted, require_accessibility_for_input,
+	};
+
+	#[repr(C)]
+	#[derive(Clone, Copy)]
+	struct CgSize {
+		width:  f64,
+		height: f64,
+	}
+
+	#[repr(C)]
+	#[derive(Clone, Copy)]
+	struct CgRect {
+		origin: CgPoint,
+		size:   CgSize,
+	}
 
 	#[repr(C)]
 	#[derive(Clone, Copy)]
@@ -354,6 +609,13 @@ mod mac {
 		fn CGEventCreate(source: CgEventSourceRef) -> CgEventRef;
 		fn CGEventGetLocation(event: CgEventRef) -> CgPoint;
 		fn CGWarpMouseCursorPosition(new_cursor_position: CgPoint) -> i32;
+		fn CGGetDisplaysWithPoint(
+			point: CgPoint,
+			max_displays: u32,
+			displays: *mut u32,
+			display_count: *mut u32,
+		) -> i32;
+		fn CGDisplayBounds(display: u32) -> CgRect;
 		fn CFRelease(cf: *const c_void);
 	}
 
@@ -365,9 +627,61 @@ mod mac {
 		}
 	}
 
+	/// Failure while obtaining the global cursor position.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub enum CursorPositionError {
+		/// Core Graphics could not create the event used to read the cursor.
+		EventCreateFailed,
+	}
+
+	impl std::fmt::Display for CursorPositionError {
+		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			write!(f, "Core Graphics could not read the cursor position")
+		}
+	}
+
+	impl std::error::Error for CursorPositionError {}
+
+	/// Failure during the bounded Gate-0 cursor move-and-restore experiment.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub enum HarmlessMoveError {
+		/// The cursor position could not be observed.
+		CursorPosition(CursorPositionError),
+		/// Core Graphics could not identify the display containing the cursor.
+		DisplayLookupFailed(i32),
+		/// Core Graphics could not create the synthetic mouse-move event.
+		MouseEventCreateFailed,
+		/// Core Graphics rejected a cursor warp.
+		WarpFailed(i32),
+	}
+
+	impl From<CursorPositionError> for HarmlessMoveError {
+		fn from(value: CursorPositionError) -> Self {
+			Self::CursorPosition(value)
+		}
+	}
+
+	impl std::fmt::Display for HarmlessMoveError {
+		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			match self {
+				Self::CursorPosition(error) => std::fmt::Display::fmt(error, f),
+				Self::DisplayLookupFailed(status) => {
+					write!(f, "Core Graphics display lookup failed ({status})")
+				},
+				Self::MouseEventCreateFailed => {
+					write!(f, "Core Graphics could not create the synthetic mouse-move event")
+				},
+				Self::WarpFailed(status) => write!(f, "Core Graphics cursor warp failed ({status})"),
+			}
+		}
+	}
+
+	impl std::error::Error for HarmlessMoveError {}
+
 	/// CGEvent-backed sink. Holds an event source for the session.
 	pub struct MacEventSink {
-		source: CgEventSourceRef,
+		source:  CgEventSourceRef,
+		started: std::time::Instant,
 	}
 
 	impl MacEventSink {
@@ -375,20 +689,106 @@ mod mac {
 			// SAFETY: `CGEventSourceCreate` returns an owned source (or null,
 			// which CGEvent creation tolerates); released on drop.
 			let source = unsafe { CGEventSourceCreate(SOURCE_COMBINED_SESSION) };
-			Self { source }
+			Self { source, started: std::time::Instant::now() }
 		}
 
-		fn post_mouse(&self, at: LogicalPoint, event_type: u32, button: u32) {
+		fn checked_mouse_event(event: CgEventRef) -> Result<CgEventRef, HarmlessMoveError> {
+			if event.is_null() {
+				Err(HarmlessMoveError::MouseEventCreateFailed)
+			} else {
+				Ok(event)
+			}
+		}
+
+		fn post_mouse_checked(
+			&self,
+			at: LogicalPoint,
+			event_type: u32,
+			button: u32,
+		) -> Result<(), HarmlessMoveError> {
 			let position = CgPoint { x: at.x, y: at.y };
 			// SAFETY: `source` is the owned event source; the created event is
 			// posted and released exactly once.
 			unsafe {
-				let event = CGEventCreateMouseEvent(self.source, event_type, position, button);
-				if !event.is_null() {
-					CGEventPost(HID_EVENT_TAP, event);
-					CFRelease(event.cast_const());
-				}
+				let event = Self::checked_mouse_event(CGEventCreateMouseEvent(
+					self.source,
+					event_type,
+					position,
+					button,
+				))?;
+				CGEventPost(HID_EVENT_TAP, event);
+				CFRelease(event.cast_const());
 			}
+			Ok(())
+		}
+
+		fn post_mouse(&self, at: LogicalPoint, event_type: u32, button: u32) {
+			let _ = self.post_mouse_checked(at, event_type, button);
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::{HarmlessMoveError, MacEventSink};
+
+		#[test]
+		fn null_mouse_event_is_rejected_before_post_or_release() {
+			assert_eq!(
+				MacEventSink::checked_mouse_event(std::ptr::null_mut()),
+				Err(HarmlessMoveError::MouseEventCreateFailed)
+			);
+		}
+	}
+
+	impl HarmlessMoveBackend for MacEventSink {
+		type Error = HarmlessMoveError;
+
+		fn current_cursor_position(&mut self) -> Result<LogicalPoint, Self::Error> {
+			current_cursor_position().map_err(Into::into)
+		}
+
+		fn cursor_bounds(&mut self, at: LogicalPoint) -> Result<CursorBounds, Self::Error> {
+			let mut display = 0;
+			let mut count = 0;
+			// SAFETY: output pointers reference initialized local storage and allow exactly
+			// one display.
+			let status = unsafe {
+				CGGetDisplaysWithPoint(CgPoint { x: at.x, y: at.y }, 1, &mut display, &mut count)
+			};
+			if status != 0 || count != 1 {
+				return Err(HarmlessMoveError::DisplayLookupFailed(status));
+			}
+			// SAFETY: `display` was returned by Core Graphics and `CGDisplayBounds` is a
+			// pure query.
+			let bounds = unsafe { CGDisplayBounds(display) };
+			Ok(CursorBounds {
+				min_x: bounds.origin.x,
+				max_x: bounds.origin.x + bounds.size.width,
+				min_y: bounds.origin.y,
+				max_y: bounds.origin.y + bounds.size.height,
+			})
+		}
+
+		fn monotonic_millis(&mut self) -> u64 {
+			self.started.elapsed().as_millis() as u64
+		}
+
+		fn sleep_millis(&mut self, millis: u64) {
+			std::thread::sleep(std::time::Duration::from_millis(millis));
+		}
+
+		fn warp_cursor(&mut self, to: LogicalPoint) -> Result<(), Self::Error> {
+			// SAFETY: pure Core Graphics cursor warp to a finite logical point.
+			let status = unsafe { CGWarpMouseCursorPosition(CgPoint { x: to.x, y: to.y }) };
+			if status == 0 {
+				Ok(())
+			} else {
+				Err(HarmlessMoveError::WarpFailed(status))
+			}
+		}
+
+		fn post_move(&mut self, to: LogicalPoint) -> Result<(), Self::Error> {
+			self.post_mouse_checked(to, MOUSE_MOVED, BTN_LEFT)
 		}
 	}
 
@@ -475,26 +875,46 @@ mod mac {
 	}
 
 	/// Read the current global cursor position in logical points (top-left
-	/// origin). Used to verify mouse-move injection without clicking.
-	#[must_use]
-	pub fn current_cursor_position() -> LogicalPoint {
+	/// origin).
+	///
+	/// # Errors
+	/// Returns [`CursorPositionError::EventCreateFailed`] rather than
+	/// substituting a coordinate when Core Graphics cannot create the read
+	/// event.
+	pub fn current_cursor_position() -> Result<LogicalPoint, CursorPositionError> {
 		// SAFETY: `CGEventCreate(null)` returns an event whose location is the
 		// current cursor; it is released after the read.
 		unsafe {
 			let event = CGEventCreate(std::ptr::null_mut());
 			if event.is_null() {
-				return LogicalPoint { x: 0.0, y: 0.0 };
+				return Err(CursorPositionError::EventCreateFailed);
 			}
 			let location = CGEventGetLocation(event);
 			CFRelease(event.cast_const());
-			LogicalPoint { x: location.x, y: location.y }
+			Ok(LogicalPoint { x: location.x, y: location.y })
 		}
+	}
+
+	/// Move the cursor one in-bounds logical pixel, post one checked mouse-move
+	/// event, observe the result, then restore and re-observe the original
+	/// location.
+	pub fn harmless_move_restore() -> Result<bool, HarmlessMoveError> {
+		if !gate0_input_injection_granted() {
+			return Ok(false);
+		}
+		let verification = super::verify_harmless_move_restore(&mut MacEventSink::new());
+		verification
+			.primary
+			.map(|moved| moved && verification.cleanup == super::CleanupConfirmation::Confirmed)
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{EventSink, InputController, InputError, MouseButton, SinkOp, key_code_for};
+	use super::{
+		CursorBounds, EventSink, HarmlessMoveBackend, InputController, InputError, MouseButton,
+		SinkOp, key_code_for, verify_harmless_move_restore,
+	};
 	use crate::computer::coords::{LogicalPoint, NormalizedDisplay};
 
 	#[derive(Default)]
@@ -527,6 +947,334 @@ mod tests {
 	fn display() -> NormalizedDisplay {
 		// 200x100 physical px at 2x => clicks map to logical /2.
 		NormalizedDisplay::new(200, 100, 2.0, 2.0, 0.0, 0.0)
+	}
+
+	struct FakeHarmlessMoveBackend {
+		bounds:              Option<CursorBounds>,
+		reads:               Vec<Result<LogicalPoint, &'static str>>,
+		read_clock_advances: Vec<u64>,
+		warps:               Vec<Result<(), &'static str>>,
+		warp_targets:        Vec<LogicalPoint>,
+		post_results:        Vec<Result<(), &'static str>>,
+		posts:               Vec<LogicalPoint>,
+		now:                 u64,
+	}
+
+	impl HarmlessMoveBackend for FakeHarmlessMoveBackend {
+		type Error = &'static str;
+
+		fn current_cursor_position(&mut self) -> Result<LogicalPoint, Self::Error> {
+			let result = self.reads.remove(0);
+			if !self.read_clock_advances.is_empty() {
+				self.now += self.read_clock_advances.remove(0);
+			}
+			result
+		}
+
+		fn cursor_bounds(&mut self, _at: LogicalPoint) -> Result<CursorBounds, Self::Error> {
+			self.bounds.ok_or("no display")
+		}
+
+		fn warp_cursor(&mut self, to: LogicalPoint) -> Result<(), Self::Error> {
+			self.warp_targets.push(to);
+			self.warps.remove(0)
+		}
+
+		fn post_move(&mut self, to: LogicalPoint) -> Result<(), Self::Error> {
+			self.posts.push(to);
+			self.post_results.remove(0)
+		}
+
+		fn monotonic_millis(&mut self) -> u64 {
+			self.now
+		}
+
+		fn sleep_millis(&mut self, millis: u64) {
+			self.now += millis;
+		}
+	}
+
+	fn point(x: f64, y: f64) -> LogicalPoint {
+		LogicalPoint { x, y }
+	}
+	fn bounds() -> CursorBounds {
+		CursorBounds { min_x: 0.0, max_x: 10.0, min_y: 0.0, max_y: 10.0 }
+	}
+	fn fake(
+		reads: Vec<Result<LogicalPoint, &'static str>>,
+		warps: Vec<Result<(), &'static str>>,
+		posts: Vec<Result<(), &'static str>>,
+	) -> FakeHarmlessMoveBackend {
+		FakeHarmlessMoveBackend {
+			bounds: Some(bounds()),
+			reads,
+			read_clock_advances: vec![],
+			warps,
+			warp_targets: vec![],
+			post_results: posts,
+			posts: vec![],
+			now: 0,
+		}
+	}
+
+	#[test]
+	fn harmless_move_requires_stable_delayed_target_and_restore_under_one_deadline() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut backend = fake(
+			vec![
+				Ok(original),
+				Ok(original),
+				Ok(target),
+				Ok(target),
+				Ok(target),
+				Ok(original),
+				Ok(original),
+			],
+			vec![Ok(()), Ok(())],
+			vec![Ok(()), Ok(())],
+		);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Ok(true));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Confirmed);
+		assert_eq!(backend.posts, vec![target, original]);
+		assert_eq!(backend.now, 3);
+	}
+
+	#[test]
+	fn harmless_move_deadline_is_shared_and_early_original_does_not_confirm_cleanup() {
+		let original = point(5.0, 5.0);
+		let reads =
+			std::iter::repeat_n(Ok(original), super::PROBE_DEADLINE_MS as usize + 1).collect();
+		let mut backend = fake(reads, vec![Ok(())], vec![Ok(())]);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Ok(false));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+		assert_eq!(backend.now, super::PROBE_DEADLINE_MS);
+		assert_eq!(backend.warp_targets.len(), 1);
+	}
+
+	#[test]
+	fn harmless_move_preserves_primary_event_error_and_records_confirmed_cleanup() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut backend = fake(
+			vec![Ok(original), Ok(target), Ok(target), Ok(target), Ok(original), Ok(original)],
+			vec![Ok(()), Ok(())],
+			vec![Err("target event"), Ok(())],
+		);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Err("target event"));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Confirmed);
+	}
+
+	#[test]
+	fn harmless_move_preserves_target_event_failure_when_cleanup_is_unconfirmed() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut backend = fake(
+			vec![Ok(original), Ok(target), Ok(target), Ok(point(50.0, 50.0))],
+			vec![Ok(()), Ok(())],
+			vec![Err("target event"), Ok(())],
+		);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Err("target event"));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+	}
+
+	#[test]
+	fn harmless_move_event_or_read_failure_without_safe_target_is_unconfirmed() {
+		let original = point(5.0, 5.0);
+		let mut backend = fake(vec![Ok(original), Err("target read")], vec![Ok(())], vec![Ok(())]);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Err("target read"));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+		assert_eq!(backend.warp_targets, vec![point(6.0, 5.0)]);
+	}
+
+	#[test]
+	fn harmless_move_restore_event_failure_still_confirms_readback() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut backend = fake(
+			vec![Ok(original), Ok(target), Ok(target), Ok(target), Ok(original), Ok(original)],
+			vec![Ok(()), Ok(())],
+			vec![Ok(()), Err("restore event")],
+		);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Ok(false));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::ConfirmedAfterEventFailure);
+	}
+
+	#[test]
+	fn harmless_move_retries_restore_at_most_twice_then_fails_closed() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut backend = fake(
+			vec![Ok(original), Ok(target), Ok(target), Ok(target), Ok(target)],
+			vec![Ok(()), Err("restore"), Err("restore")],
+			vec![Ok(())],
+		);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Ok(false));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+		assert_eq!(backend.warp_targets, vec![target, original, original]);
+	}
+
+	#[test]
+	fn harmless_move_recovers_when_first_restore_warp_fails() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut backend = fake(
+			vec![
+				Ok(original),
+				Ok(target),
+				Ok(target),
+				Ok(target),
+				Ok(target),
+				Ok(original),
+				Ok(original),
+			],
+			vec![Ok(()), Err("restore"), Ok(())],
+			vec![Ok(()), Ok(())],
+		);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Ok(true));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Confirmed);
+		assert_eq!(backend.warp_targets, vec![target, original, original]);
+	}
+
+	#[test]
+	fn harmless_move_fails_initial_read_and_target_warp_without_cleanup() {
+		let mut read_error = fake(vec![Err("initial")], vec![], vec![]);
+		assert_eq!(verify_harmless_move_restore(&mut read_error).primary, Err("initial"));
+		let mut warp_error = fake(vec![Ok(point(5.0, 5.0))], vec![Err("warp")], vec![]);
+		assert_eq!(verify_harmless_move_restore(&mut warp_error).primary, Err("warp"));
+	}
+
+	#[test]
+	fn harmless_move_rejects_interference_and_exact_tolerance_boundaries_on_both_axes() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		assert!(super::is_near(point(5.49, 5.49), original));
+		assert!(super::is_near(point(5.48, 5.48), original));
+		assert!(!super::is_near(point(5.491, 5.0), original));
+		assert!(!super::is_near(point(5.0, 5.491), original));
+		for interference in [point(5.5, 5.0), point(50.0, 50.0)] {
+			let mut backend = fake(vec![Ok(original), Ok(interference)], vec![Ok(())], vec![Ok(())]);
+			let result = verify_harmless_move_restore(&mut backend);
+			assert_eq!(result.primary, Ok(false));
+			assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+			assert_eq!(backend.warp_targets, vec![target]);
+		}
+	}
+
+	#[test]
+	fn harmless_move_does_not_restore_after_interference_before_first_restore_warp() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut backend = fake(
+			vec![Ok(original), Ok(target), Ok(target), Ok(point(50.0, 50.0))],
+			vec![Ok(()), Ok(())],
+			vec![Ok(())],
+		);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Ok(false));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+		assert_eq!(backend.warp_targets, vec![target]);
+	}
+
+	#[test]
+	fn harmless_move_does_not_retry_restore_after_interference() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut backend = fake(
+			vec![Ok(original), Ok(target), Ok(target), Ok(target), Ok(point(50.0, 50.0))],
+			vec![Ok(()), Err("restore")],
+			vec![Ok(())],
+		);
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Ok(false));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+		assert_eq!(backend.warp_targets, vec![target, original]);
+	}
+
+	#[test]
+	fn harmless_move_rejects_read_error_and_deadline_before_restoration() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut read_error = fake(
+			vec![Ok(original), Ok(target), Ok(target), Err("restore read")],
+			vec![Ok(()), Ok(())],
+			vec![Ok(())],
+		);
+		let result = verify_harmless_move_restore(&mut read_error);
+		assert_eq!(result.primary, Ok(false));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+		assert_eq!(read_error.warp_targets, vec![target]);
+
+		let mut deadline =
+			fake(vec![Ok(original), Ok(target), Ok(target), Ok(target)], vec![Ok(()), Ok(())], vec![
+				Ok(()),
+			]);
+		deadline.read_clock_advances = vec![0, 0, 98, 1];
+		let result = verify_harmless_move_restore(&mut deadline);
+		assert_eq!(result.primary, Ok(false));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+		assert_eq!(deadline.warp_targets, vec![target]);
+	}
+
+	#[test]
+	fn harmless_move_rejects_observation_read_that_crosses_deadline() {
+		let original = point(5.0, 5.0);
+		let target = point(6.0, 5.0);
+		let mut backend =
+			fake(vec![Ok(original), Ok(target), Ok(target)], vec![Ok(())], vec![Ok(())]);
+		backend.read_clock_advances = vec![0, 0, super::PROBE_DEADLINE_MS];
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Ok(false));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::Unconfirmed);
+		assert_eq!(backend.warp_targets, vec![target]);
+	}
+
+	#[test]
+	fn cursor_bounds_selects_every_cardinal_target_and_rejects_invalid_candidates() {
+		assert_eq!(bounds().move_target(point(5.0, 5.0)), Some(point(6.0, 5.0)),);
+		assert_eq!(
+			CursorBounds { min_x: 4.0, max_x: 6.0, min_y: 0.0, max_y: 10.0 }
+				.move_target(point(5.0, 5.0)),
+			Some(point(4.0, 5.0)),
+		);
+		assert_eq!(
+			CursorBounds { min_x: 5.0, max_x: 6.0, min_y: 0.0, max_y: 10.0 }
+				.move_target(point(5.0, 5.0)),
+			Some(point(5.0, 6.0)),
+		);
+		assert_eq!(
+			CursorBounds { min_x: 5.0, max_x: 6.0, min_y: 5.0, max_y: 7.0 }
+				.move_target(point(5.0, 6.0)),
+			Some(point(5.0, 5.0)),
+		);
+		for invalid in [
+			CursorBounds { min_x: 0.0, max_x: 1.0, min_y: 0.0, max_y: 1.0 },
+			CursorBounds { min_x: f64::NAN, max_x: 10.0, min_y: 0.0, max_y: 10.0 },
+			CursorBounds { min_x: 0.0, max_x: f64::INFINITY, min_y: 0.0, max_y: 10.0 },
+			CursorBounds { min_x: 0.0, max_x: 0.0, min_y: 0.0, max_y: 10.0 },
+			CursorBounds { min_x: 0.0, max_x: 10.0, min_y: 1.0, max_y: 1.0 },
+		] {
+			assert_eq!(invalid.move_target(point(5.0, 5.0)), None);
+		}
+		assert_eq!(bounds().move_target(point(10.0, 5.0)), None);
+	}
+
+	#[test]
+	fn harmless_move_returns_bounds_lookup_error_without_warping() {
+		let mut backend = fake(vec![Ok(point(5.0, 5.0))], vec![], vec![]);
+		backend.bounds = None;
+		let result = verify_harmless_move_restore(&mut backend);
+		assert_eq!(result.primary, Err("no display"));
+		assert_eq!(result.cleanup, super::CleanupConfirmation::NotRequired);
+		assert!(backend.warp_targets.is_empty());
 	}
 
 	#[test]
@@ -696,7 +1444,7 @@ mod live_tests {
 		let expected = display
 			.to_logical_point(target_px, target_py)
 			.expect("center is in bounds");
-		let pos = current_cursor_position();
+		let pos = current_cursor_position().expect("cursor position should be readable");
 		let dx = (pos.x - expected.x).abs();
 		let dy = (pos.y - expected.y).abs();
 		assert!(
