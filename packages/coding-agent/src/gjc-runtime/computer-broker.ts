@@ -826,10 +826,15 @@ async function request(
 		removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
 		if (options.signal.aborted) abandon();
 	}
+	if (pendingRequests.get(id) !== pending) return result.promise;
+	const requestLine = `${JSON.stringify({ version: PROTOCOL_VERSION, type: "request", token: config.token, id, method, args, deadlineAtMs })}\n`;
+	if (Buffer.byteLength(requestLine) > MAX_REQUEST_BYTES) {
+		pendingRequests.delete(id);
+		pending.reject(new BrokerError("COMPUTER_BROKER_FRAME_TOO_LARGE", "Computer broker request was too large."));
+		return result.promise;
+	}
 	try {
-		socket.write(
-			`${JSON.stringify({ version: PROTOCOL_VERSION, type: "request", token: config.token, id, method, args, deadlineAtMs })}\n`,
-		);
+		socket.write(requestLine);
 	} catch {
 		if (pendingRequests.get(id) === pending) pendingRequests.delete(id);
 		pending.reject(new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was lost."));

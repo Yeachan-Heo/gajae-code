@@ -713,6 +713,41 @@ describe("computer broker", () => {
 		fs.rmSync(directory, { recursive: true, force: true });
 	});
 
+	it.if(process.platform === "darwin")("rejects oversized requests without losing the lease", async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-oversized-request-"));
+		const socketPath = path.join(directory, "broker.sock");
+		const token = "c".repeat(64);
+		const server = net.createServer(socket => {
+			const frames = socketFrames(socket);
+			void (async () => {
+				await frames.next();
+				socket.write(`${JSON.stringify({ version: 1, type: "lease_ack", ok: true })}\n`);
+				const request = (await frames.next()) as { id: string; method: string };
+				expect(request.method).toBe("wait");
+				socket.write(
+					`${JSON.stringify({ version: 1, type: "response", id: request.id, ok: true, result: null })}\n`,
+				);
+			})().catch(() => socket.destroy());
+		});
+		await listen(server, socketPath);
+		process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+		process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+		process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+		setBrokerIdentityEnvironment();
+		const controller = createComputerBrokerControllerFromEnvironment();
+		if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
+		try {
+			await controller.brokerInvoke("type", [null, "x".repeat(70 * 1024)]);
+			throw new Error("expected oversized request rejection");
+		} catch (error) {
+			expect((error as { code?: string }).code).toBe("COMPUTER_BROKER_FRAME_TOO_LARGE");
+		}
+		expect(await controller.brokerInvoke("wait", [null, 1], { timeoutMs: 500 })).toBeNull();
+		disposeComputerBrokerLease();
+		await closeServer(server);
+		fs.rmSync(directory, { recursive: true, force: true });
+	});
+
 	it.if(process.platform === "darwin")(
 		"evicts timed-out screenshots without exhausting pending requests",
 		async () => {
