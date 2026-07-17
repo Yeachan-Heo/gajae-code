@@ -135,4 +135,41 @@ describe("SessionSdkHost", () => {
 		});
 		await host.stop();
 	});
+
+	test("contains disconnected structured-error delivery failures without unhandled rejections", async () => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		let failSends = 0;
+		const host = new SessionSdkHost({
+			sessionId: "sess-disconnect",
+			stateRoot: "/tmp/gjc-sdk-host-disconnect",
+			token: "tok",
+			sendFrame: () => {
+				// Fail the success response and the subsequent structured-error delivery.
+				if (failSends < 2) {
+					failSends += 1;
+					throw new Error("connection closed");
+				}
+			},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+		});
+		await host.start();
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			receive("c1", { type: "event_replay", id: "r1", sinceGeneration: 0, sinceSeq: 0 });
+			await new Promise(resolve => setTimeout(resolve, 0));
+			await new Promise(resolve => setTimeout(resolve, 0));
+			expect(failSends).toBe(2);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			await host.stop();
+		}
+	});
 });

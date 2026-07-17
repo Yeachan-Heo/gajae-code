@@ -181,6 +181,19 @@ export class SessionSdkHost {
 		await this.#options.sendFrame(connectionId, frame);
 	}
 
+	/**
+	 * Best-effort delivery for structured error frames. When the original failure
+	 * was already a disconnected/dead connection, a second send must not escape
+	 * the fire-and-forget `#onFrame` callback as an unhandled rejection.
+	 */
+	async #sendBestEffort(connectionId: string, frame: SdkFrame): Promise<void> {
+		try {
+			await this.#send(connectionId, frame);
+		} catch {
+			// Per-connection delivery only; never rethrow into fire-and-forget handlers.
+		}
+	}
+
 	async #onFrame(connectionId: string, frame: SdkFrame): Promise<void> {
 		try {
 			switch (frame.type) {
@@ -298,7 +311,9 @@ export class SessionSdkHost {
 					return;
 			}
 		} catch (error) {
-			await this.#send(connectionId, errorFrame(connectionId, frame, error));
+			// Structured error delivery is best-effort: if the client already
+			// disconnected, do not escalate a second send failure process-wide.
+			await this.#sendBestEffort(connectionId, errorFrame(connectionId, frame, error));
 		}
 	}
 	#observeRequest(kind: "control" | "query", connectionId: string, frame: SdkFrame): void {

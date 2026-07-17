@@ -5,6 +5,10 @@
 ### Fixed
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
 
+
+### Fixed
+- SDK host response delivery to a disconnected client no longer escalates a second structured-error send failure into a process-level unhandled rejection; failures stay local to that connection.
+
 ### Fixed
 - Palette slash commands now run only from an empty composer; drafts are never touched.
 - Aborting a session without an enabled active goal no longer suppresses the first reminder when a goal is activated later; active-goal abort suppression is one-shot, goal-owned, and clears across inactive or replacement-goal transitions (#2436).
