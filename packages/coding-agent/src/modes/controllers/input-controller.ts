@@ -390,7 +390,11 @@ export class InputController {
 			this.ctx.editor.setCustomKeyHandler(key, () => this.handleForegroundToolBackgroundFold());
 		}
 
+		// Tab on an empty composer accepts the pending ghost-text prompt suggestion.
+		this.ctx.editor.onTab = (text: string) => this.ctx.promptSuggestion?.tryAcceptOnTab(text) === true;
+
 		this.ctx.editor.onChange = (text: string) => {
+			this.ctx.promptSuggestion?.notifyEditorChanged(text);
 			const wasBashMode = this.ctx.isBashMode;
 			const wasBashNoContext = this.ctx.isBashNoContext;
 			const wasPythonMode = this.ctx.isPythonMode;
@@ -1250,6 +1254,7 @@ export class InputController {
 			moveCursorToMessageStart: () => this.ctx.editor.moveToMessageStart(),
 			moveCursorToLineStart: () => this.ctx.editor.moveToLineStart(),
 			moveCursorToLineEnd: () => this.ctx.editor.moveToLineEnd(),
+			getPromptSuggestion: () => this.ctx.promptSuggestion?.current ?? null,
 		});
 	}
 

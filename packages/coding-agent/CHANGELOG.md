@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in prompt suggestions (Claude Code-style ghost-text autocomplete): with the `promptSuggestions` setting enabled, a smol-model prediction of your likely next prompt renders as dim ghost text in the empty composer after each agent turn; Tab accepts it, typing dismisses it, and a new turn clears it. Predictions are heuristically gated (silence on evaluative/meta/agent-voice/overlong output) and never generated while the composer has text or a turn is streaming.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

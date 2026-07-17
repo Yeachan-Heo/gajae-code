@@ -32,6 +32,7 @@ import type { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import type { IrcObservationLedger } from "./irc-observation-ledger";
 import type { OAuthManualInputManager } from "./oauth-manual-input";
+import type { PromptSuggestionController } from "./prompt-suggestion-controller";
 import type { Theme } from "./theme/theme";
 import type { ParsedIrcMessage } from "./utils/irc-message";
 
@@ -149,6 +150,8 @@ export interface InteractiveModeContext {
 	skillCommands: Map<string, Skill>;
 	oauthManualInput: OAuthManualInputManager;
 	todoPhases: TodoPhase[];
+	/** Ghost-text next-prompt prediction; absent in ACP/lightweight test contexts. */
+	promptSuggestion?: PromptSuggestionController;
 
 	// Lifecycle
 	init(): Promise<void>;
