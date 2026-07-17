@@ -10,10 +10,7 @@ const repoRoot = path.resolve(import.meta.dir, "../../..", "..");
 
 describe("subagent await doctrine single source", () => {
 	test("runtime surfaces import the shared doctrine text", () => {
-		const subagentTool = fs.readFileSync(
-			path.join(repoRoot, "packages/coding-agent/src/tools/subagent.ts"),
-			"utf8",
-		);
+		const subagentTool = fs.readFileSync(path.join(repoRoot, "packages/coding-agent/src/tools/subagent.ts"), "utf8");
 		const taskIndex = fs.readFileSync(path.join(repoRoot, "packages/coding-agent/src/task/index.ts"), "utf8");
 		expect(subagentTool).toContain("SUBAGENT_AWAIT_TIMEOUT_DOCTRINE");
 		expect(taskIndex).toContain("SUBAGENT_AWAIT_TIMEOUT_DOCTRINE");

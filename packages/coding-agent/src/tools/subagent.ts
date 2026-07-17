@@ -1,10 +1,10 @@
-import { SUBAGENT_AWAIT_TIMEOUT_DOCTRINE } from "../task/subagent-await-doctrine";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
+import { SUBAGENT_AWAIT_TIMEOUT_DOCTRINE } from "../task/subagent-await-doctrine";
 import type { AgentProgress, AgentSource, TaskToolDetails } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";

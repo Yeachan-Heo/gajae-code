@@ -19,9 +19,6 @@ import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@gajae
 import type { Model, Usage } from "@gajae-code/ai";
 import { $env, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
-import {
-	SUBAGENT_AWAIT_TIMEOUT_DOCTRINE,
-} from "./subagent-await-doctrine";
 import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner } from "../async";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
@@ -30,6 +27,7 @@ import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "tex
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
 import { formatBytes, formatDuration } from "../tools/render-utils";
+import { SUBAGENT_AWAIT_TIMEOUT_DOCTRINE } from "./subagent-await-doctrine";
 import {
 	type AgentDefinition,
 	type AgentProgress,
