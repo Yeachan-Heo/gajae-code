@@ -29,9 +29,10 @@ use tokio::{
 	sync::mpsc,
 };
 use tokio_tungstenite::tungstenite::{
-	Message,
+	Error, Message,
 	handshake::server::{ErrorResponse, Request, Response},
 	http::StatusCode,
+	protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +42,7 @@ use crate::{
 		LifecycleClientMessage, LifecycleErrorReason, LifecycleServerMessage, LifecycleStatus,
 		SessionLifecycleError,
 	},
+	query::REQUEST_FRAME_BYTES,
 	server::{token_from_query, tokens_match},
 };
 
@@ -239,8 +241,19 @@ async fn handle_conn(stream: TcpStream, state: Arc<ControlState>, cancel: Cancel
 		}
 	};
 
-	let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, auth).await else {
-		return;
+	// Tungstenite applies the frame ceiling from the frame header, before it
+	// accumulates the payload into a message or this server parses/forwards it.
+	let ws_config = WebSocketConfig {
+		max_message_size: Some(REQUEST_FRAME_BYTES),
+		max_frame_size: Some(REQUEST_FRAME_BYTES),
+		..WebSocketConfig::default()
+	};
+	let ws = tokio::select! {
+		() = cancel.cancelled() => return,
+		accepted = tokio_tungstenite::accept_hdr_async_with_config(stream, auth, Some(ws_config)) => {
+			let Ok(ws) = accepted else { return };
+			ws
+		},
 	};
 
 	let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
@@ -254,27 +267,37 @@ async fn handle_conn(stream: TcpStream, state: Arc<ControlState>, cancel: Cancel
 			() = cancel.cancelled() => break,
 			incoming = read.next() => {
 				match incoming {
-					Some(Ok(Message::Text(text))) => {
-						if !handle_text(
-							text.as_str(),
-							&state,
-							connection_id,
-							&route_tx,
-							&mut owned,
-							&mut write,
-						).await {
-							break;
-						}
+				Some(Ok(Message::Text(text))) => {
+					if text.len() > REQUEST_FRAME_BYTES {
+						let _ = reject_frame(&mut write, CloseCode::Size, "request frame exceeds 256 KiB").await;
+						break;
 					}
-					Some(Ok(Message::Ping(payload))) => {
-						if write.send(Message::Pong(payload)).await.is_err() {
-							break;
-						}
+					if !handle_text(
+						text.as_str(),
+						&state,
+						connection_id,
+						&route_tx,
+						&mut owned,
+						&mut write,
+					)
+					.await
+					{
+						break;
 					}
-					Some(Ok(Message::Close(_))) | None => break,
-					Some(Ok(_)) => {}
-					Some(Err(_)) => break,
 				}
+				Some(Ok(Message::Ping(payload))) => {
+					if write.send(Message::Pong(payload)).await.is_err() {
+						break;
+					}
+				}
+				Some(Ok(Message::Close(_))) | None => break,
+				Some(Ok(_)) => {},
+				Some(Err(Error::Capacity(_))) => {
+					let _ = reject_frame(&mut write, CloseCode::Size, "request frame exceeds 256 KiB").await;
+					break;
+				},
+				Some(Err(_)) => break,
+			}
 			}
 			response = route_rx.recv() => {
 				let Some(response) = response else { break };
@@ -373,6 +396,16 @@ where
 	}
 	owned.insert(id.to_owned());
 	state.lifecycle_tx.send(msg).is_ok()
+}
+
+async fn reject_frame<S>(write: &mut S, code: CloseCode, reason: &'static str) -> Result<(), ()>
+where
+	S: SinkExt<Message> + Unpin,
+{
+	write
+		.send(Message::Close(Some(CloseFrame { code, reason: reason.into() })))
+		.await
+		.map_err(|_| ())
 }
 
 async fn send_lifecycle<S>(write: &mut S, msg: &LifecycleServerMessage) -> Result<(), ()>
@@ -674,6 +707,62 @@ mod tests {
 			},
 			other => panic!("expected close response, got {other:?}"),
 		}
+	}
+	#[tokio::test]
+	async fn control_oversized_text_frame_closes_only_the_offending_client() {
+		let handle = start_control(ControlServerConfig::new("control-token", "daemon-1"))
+			.await
+			.expect("start");
+		let mut rx = handle.take_lifecycle_receiver().expect("receiver");
+
+		let url = format!("ws://{}/?token=control-token", handle.addr());
+		let (mut oversized, _) = connect_async(&url).await.expect("connect oversized");
+		let (mut healthy, _) = connect_async(&url).await.expect("connect healthy");
+
+		// Wait for the server to register both authenticated clients.
+		let mut connected = false;
+		for _ in 0..40 {
+			if handle.client_count() == 2 {
+				connected = true;
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+		}
+		assert!(connected, "both control clients must connect before the test proceeds");
+
+		// Client A sends a frame one byte over the 256 KiB ceiling.
+		oversized
+			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1)))
+			.await
+			.expect("send oversized text frame");
+		match tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
+			.await
+			.expect("oversized client was not closed within 2s")
+		{
+			Some(Ok(Message::Close(Some(frame)))) => {
+				assert_eq!(frame.code, CloseCode::Size);
+			},
+			Some(Err(_)) | None => {},
+			Some(Ok(message)) => panic!("unexpected non-close message: {message:?}"),
+		}
+
+		// The oversized frame must not have been forwarded to the host.
+		assert!(
+			rx.try_recv().is_err(),
+			"oversized lifecycle frame must not be forwarded to the host"
+		);
+
+		// Client B remains functional: a valid close frame is forwarded to the host.
+		healthy
+			.send(Message::Text(close_frame("lc_healthy", "control-token")))
+			.await
+			.expect("send healthy lifecycle frame");
+		let forwarded = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+			.await
+			.expect("healthy frame timed out")
+			.expect("healthy frame channel closed");
+		assert_eq!(forwarded.request_id(), Some("lc_healthy"));
+		handle.stop();
 	}
 	#[tokio::test]
 	async fn non_loopback_bind_is_refused() {
