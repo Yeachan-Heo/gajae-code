@@ -135,10 +135,7 @@ export async function collectRepoVocabulary(cwd: string, cap = DEFAULT_VOCABULAR
 	void collect.then(vocabulary => vocabularyCache.set(cwd, { at: Date.now(), vocabulary }));
 
 	// Never delay listening start beyond the budget — fall back to no bias.
-	return Promise.race([
-		collect,
-		new Promise<string[]>(resolve => setTimeout(() => resolve([]), COLLECT_BUDGET_MS)),
-	]);
+	return Promise.race([collect, new Promise<string[]>(resolve => setTimeout(() => resolve([]), COLLECT_BUDGET_MS))]);
 }
 
 /** Test hook — reset the per-cwd vocabulary cache. */

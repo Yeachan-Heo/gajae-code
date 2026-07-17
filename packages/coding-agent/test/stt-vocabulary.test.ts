@@ -50,3 +50,18 @@ describe("vocabularyToWhisperPrompt", () => {
 		expect(vocabularyToWhisperPrompt(many).length).toBeLessThanOrEqual(600);
 	});
 });
+
+describe("bundlePathFromExecutablePath", () => {
+	test("extracts the app bundle root", async () => {
+		const { bundlePathFromExecutablePath } = await import("../src/stt/backends/apple");
+		expect(bundlePathFromExecutablePath("/Applications/Orca.app/Contents/MacOS/Orca")).toBe("/Applications/Orca.app");
+		expect(bundlePathFromExecutablePath("/Applications/Otty.app/Contents/MacOS/Otty")).toBe("/Applications/Otty.app");
+	});
+
+	test("returns null for plain CLI chains", async () => {
+		const { bundlePathFromExecutablePath } = await import("../src/stt/backends/apple");
+		expect(bundlePathFromExecutablePath("/usr/bin/login")).toBeNull();
+		expect(bundlePathFromExecutablePath("/opt/homebrew/bin/tmux")).toBeNull();
+		expect(bundlePathFromExecutablePath("")).toBeNull();
+	});
+});
