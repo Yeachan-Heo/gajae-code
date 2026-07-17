@@ -47,7 +47,7 @@ function createControllerContext() {
 			getAvailableModelProfileNames: () => [],
 			getModelProfiles: () => new Map(),
 			resolveCanonicalModel: () => undefined,
-			getApiKey: vi.fn(async () => "key"),
+			getApiKey: vi.fn(async (): Promise<string | undefined> => "key"),
 		},
 		async setModel(
 			nextModel: Model,
