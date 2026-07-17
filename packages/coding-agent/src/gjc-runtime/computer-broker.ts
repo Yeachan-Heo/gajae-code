@@ -13,6 +13,11 @@ export const GJC_COMPUTER_BROKER_SOCKET_ENV = "GJC_COMPUTER_BROKER_SOCKET";
 export const GJC_COMPUTER_BROKER_TOKEN_ENV = "GJC_COMPUTER_BROKER_TOKEN";
 export const GJC_COMPUTER_BROKER_DIR_ENV = "GJC_COMPUTER_BROKER_DIR";
 export const GJC_COMPUTER_BROKER_REQUIRED_ENV = "GJC_COMPUTER_BROKER_REQUIRED";
+export const GJC_COMPUTER_BROKER_PID_ENV = "GJC_COMPUTER_BROKER_PID";
+export const GJC_COMPUTER_BROKER_START_ENV = "GJC_COMPUTER_BROKER_START";
+export const GJC_COMPUTER_BROKER_EXECUTABLE_ENV = "GJC_COMPUTER_BROKER_EXECUTABLE";
+export const GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV = "GJC_COMPUTER_BROKER_EXECUTABLE_SHA256";
+export const GJC_COMPUTER_BROKER_PGID_ENV = "GJC_COMPUTER_BROKER_PGID";
 
 const PROTOCOL_VERSION = 1;
 const MAX_REQUEST_BYTES = 64 * 1024;
@@ -85,6 +90,8 @@ export type ComputerControllerLike = {
 
 type ComputerNativeBindings = Record<string, unknown> & {
 	ComputerController: new () => ComputerControllerLike;
+	unixSocketPeerPid(fd: number): number;
+	darwinProcessIdentity(pid: number): { startToken: string; executable: string; pgid: number };
 };
 
 function createNativeComputerController(): ComputerControllerLike {
@@ -97,12 +104,29 @@ export interface ComputerBrokerLaunch {
 	dispose(): void;
 }
 
+export type ComputerBrokerProcessIdentity = {
+	pid: number;
+	start: string;
+	executable: string;
+	/** SHA-256 of the canonical executable path; bounded and stable across identity checks. */
+	executableSha256: string;
+	pgid: number;
+};
+
+type ProcessIdentityReader = (pid: number) => ComputerBrokerProcessIdentity | null;
+type ProcessAliveReader = (pid: number) => boolean;
+
 export interface StartComputerBrokerOptions {
 	env?: NodeJS.ProcessEnv;
 	cwd?: string;
 	startupTimeoutMs?: number;
 	isCompiledBinary?: () => boolean;
+	helperExecutable?: string;
 	spawn?: typeof childProcess.spawn;
+	readProcessIdentity?: ProcessIdentityReader;
+	isProcessAlive?: ProcessAliveReader;
+	termTimeoutMs?: number;
+	killTimeoutMs?: number;
 }
 
 interface RequestFrame {
@@ -399,15 +423,84 @@ async function execute(controller: ComputerControllerLike, frame: RequestFrame):
 	return null;
 }
 
-function validBrokerEnvironment(env: NodeJS.ProcessEnv): { socket: string; token: string; directory: string } | null {
+function processIdentity(pid: number): ComputerBrokerProcessIdentity | null {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+	try {
+		const identity = loadNative<ComputerNativeBindings>().darwinProcessIdentity(pid);
+		const executable = fs.realpathSync(identity.executable);
+		const executableSha256 = crypto.createHash("sha256").update(executable, "utf8").digest("hex");
+		if (!/^\d+:\d+$/.test(identity.startToken) || !Number.isSafeInteger(identity.pgid) || identity.pgid <= 0)
+			return null;
+		return { pid, start: identity.startToken, executable, executableSha256, pgid: identity.pgid };
+	} catch {
+		return null;
+	}
+}
+
+function sameProcessIdentity(
+	expected: ComputerBrokerProcessIdentity,
+	actual: ComputerBrokerProcessIdentity | null,
+): boolean {
+	return (
+		actual !== null &&
+		actual.pid === expected.pid &&
+		actual.start === expected.start &&
+		actual.executable === expected.executable &&
+		actual.executableSha256 === expected.executableSha256 &&
+		actual.pgid === expected.pgid
+	);
+}
+
+function identityEnvironment(identity: ComputerBrokerProcessIdentity): Record<string, string> {
+	return {
+		[GJC_COMPUTER_BROKER_PID_ENV]: String(identity.pid),
+		[GJC_COMPUTER_BROKER_START_ENV]: identity.start,
+		[GJC_COMPUTER_BROKER_EXECUTABLE_ENV]: identity.executable,
+		[GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV]: identity.executableSha256,
+		[GJC_COMPUTER_BROKER_PGID_ENV]: String(identity.pgid),
+	};
+}
+
+function environmentProcessIdentity(env: NodeJS.ProcessEnv): ComputerBrokerProcessIdentity | null {
+	const pid = Number(env[GJC_COMPUTER_BROKER_PID_ENV]);
+	const start = env[GJC_COMPUTER_BROKER_START_ENV];
+	const executable = env[GJC_COMPUTER_BROKER_EXECUTABLE_ENV];
+	const executableSha256 = env[GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV];
+	const pgid = Number(env[GJC_COMPUTER_BROKER_PGID_ENV]);
+	if (
+		!Number.isSafeInteger(pid) ||
+		pid <= 0 ||
+		!start ||
+		!executable ||
+		!path.isAbsolute(executable) ||
+		!executableSha256 ||
+		!/^[a-f0-9]{64}$/.test(executableSha256) ||
+		!Number.isSafeInteger(pgid) ||
+		pgid <= 0
+	)
+		return null;
+	return { pid, start, executable, executableSha256, pgid };
+}
+
+function validBrokerEnvironment(
+	env: NodeJS.ProcessEnv,
+	requireIdentity = false,
+): { socket: string; token: string; directory: string; identity?: ComputerBrokerProcessIdentity } | null {
 	const socket = env[GJC_COMPUTER_BROKER_SOCKET_ENV];
 	const token = env[GJC_COMPUTER_BROKER_TOKEN_ENV];
 	const directory = env[GJC_COMPUTER_BROKER_DIR_ENV];
 	const required = env[GJC_COMPUTER_BROKER_REQUIRED_ENV];
 	if (required !== undefined && required !== "1")
 		throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker configuration is unavailable.");
+	const hasIdentityMetadata = [
+		GJC_COMPUTER_BROKER_PID_ENV,
+		GJC_COMPUTER_BROKER_START_ENV,
+		GJC_COMPUTER_BROKER_EXECUTABLE_ENV,
+		GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV,
+		GJC_COMPUTER_BROKER_PGID_ENV,
+	].some(key => env[key] !== undefined);
 	if (socket === undefined && token === undefined && directory === undefined) {
-		if (required === "1")
+		if (required === "1" || hasIdentityMetadata)
 			throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker is required but unavailable.");
 		return null;
 	}
@@ -420,7 +513,20 @@ function validBrokerEnvironment(env: NodeJS.ProcessEnv): { socket: string; token
 		path.basename(socket) !== "broker.sock"
 	)
 		throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker configuration is unavailable.");
-	return { socket, token, directory };
+	const identity = environmentProcessIdentity(env);
+	if (requireIdentity && !identity)
+		throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker configuration is unavailable.");
+	return { socket, token, directory, ...(identity ? { identity } : {}) };
+}
+
+function requiredBrokerEnvironment(
+	env: NodeJS.ProcessEnv,
+): { socket: string; token: string; directory: string; identity: ComputerBrokerProcessIdentity } | null {
+	const config = validBrokerEnvironment(env, true);
+	if (!config) return null;
+	if (!config.identity)
+		throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker configuration is unavailable.");
+	return { ...config, identity: config.identity };
 }
 
 function secureRuntimeDirectory(config: { socket: string; directory: string }, requireSocket: boolean): void {
@@ -433,7 +539,7 @@ function secureRuntimeDirectory(config: { socket: string; directory: string }, r
 			directory.isSymbolicLink() ||
 			!directory.isDirectory() ||
 			(typeof process.getuid === "function" && directory.uid !== process.getuid()) ||
-			(directory.mode & 0o077) !== 0
+			(directory.mode & 0o777) !== 0o700
 		)
 			throw new Error("unsafe_directory");
 		if (!requireSocket) return;
@@ -441,7 +547,8 @@ function secureRuntimeDirectory(config: { socket: string; directory: string }, r
 		if (
 			socket.isSymbolicLink() ||
 			!socket.isSocket() ||
-			(typeof process.getuid === "function" && socket.uid !== process.getuid())
+			(typeof process.getuid === "function" && socket.uid !== process.getuid()) ||
+			(socket.mode & 0o777) !== 0o600
 		)
 			throw new Error("unsafe_socket");
 	} catch {
@@ -468,7 +575,11 @@ function clearLease(socket: net.Socket, error: BrokerError): void {
 	pendingRequests.clear();
 }
 
-function ensureComputerBrokerLease(config: { socket: string; token: string }): Promise<void> {
+function ensureComputerBrokerLease(config: {
+	socket: string;
+	token: string;
+	identity: ComputerBrokerProcessIdentity;
+}): Promise<void> {
 	secureRuntimeDirectory({ socket: config.socket, directory: path.dirname(config.socket) }, true);
 	const identity = `${config.socket}\u0000${config.token}`;
 	if (leaseSocket && leaseConfiguration === identity && !leaseSocket.destroyed && leaseReadyPromise)
@@ -502,9 +613,26 @@ function ensureComputerBrokerLease(config: { socket: string; token: string }): P
 	leaseSocket = socket;
 	leaseConfiguration = identity;
 	leaseReadyPromise = promise;
-	socket.once("connect", () =>
-		socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, type: "lease", token: config.token })}\n`),
-	);
+	socket.once("connect", () => {
+		try {
+			const fd = (socket as unknown as { _handle?: { fd?: unknown } })._handle?.fd;
+			if (typeof fd !== "number" || !Number.isSafeInteger(fd) || fd < 0)
+				throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection was unavailable.");
+			const peerPid = loadNative<ComputerNativeBindings>().unixSocketPeerPid(fd);
+			if (peerPid !== config.identity.pid || !sameProcessIdentity(config.identity, processIdentity(peerPid)))
+				throw new BrokerError(
+					"COMPUTER_BROKER_UNAVAILABLE",
+					"Computer broker connection identity was unavailable.",
+				);
+			socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, type: "lease", token: config.token })}\n`);
+		} catch (error) {
+			fail(
+				error instanceof BrokerError
+					? error
+					: new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker connection identity was unavailable."),
+			);
+		}
+	});
 	socket.on("data", (chunk: Buffer) => {
 		let frames: string[];
 		try {
@@ -554,7 +682,7 @@ function ensureComputerBrokerLease(config: { socket: string; token: string }): P
 
 /** Starts and retains the persistent ownership lease for this inner GJC process. */
 export function initializeComputerBrokerLeaseFromEnvironment(): void {
-	const config = validBrokerEnvironment(process.env);
+	const config = requiredBrokerEnvironment(process.env);
 	if (!config) return;
 	void ensureComputerBrokerLease(config).catch(() => undefined);
 }
@@ -575,7 +703,7 @@ function bootstrapAmbientTmuxBroker(env: NodeJS.ProcessEnv): void {
 
 export async function acquireComputerBrokerLeaseFromEnvironment(): Promise<void> {
 	bootstrapAmbientTmuxBroker(process.env);
-	const config = validBrokerEnvironment(process.env);
+	const config = requiredBrokerEnvironment(process.env);
 	if (!config) return;
 	await ensureComputerBrokerLease(config);
 }
@@ -588,7 +716,7 @@ export function disposeComputerBrokerLease(): void {
 }
 
 async function request(
-	config: { socket: string; token: string },
+	config: { socket: string; token: string; identity: ComputerBrokerProcessIdentity },
 	method: ComputerBrokerMethod,
 	args: unknown[],
 	options: ComputerBrokerInvokeOptions = {},
@@ -657,7 +785,7 @@ function resultScreenshot(value: unknown): ComputerScreenshot {
 
 /** Returns null only when no broker environment exists; a partial or required broker environment fails closed. */
 export function createComputerBrokerControllerFromEnvironment(): ComputerControllerLike | null {
-	const config = validBrokerEnvironment(process.env);
+	const config = requiredBrokerEnvironment(process.env);
 	if (!config) return null;
 	const invoke = async (
 		method: ComputerBrokerMethod,
@@ -685,20 +813,98 @@ export function createComputerBrokerControllerFromEnvironment(): ComputerControl
 	};
 }
 
-function removeRuntimeDirectory(config: { socket: string; directory: string }): void {
+export type ComputerBrokerRuntimeIdentity = {
+	directory: { dev: number; ino: number };
+	socket?: { dev: number; ino: number };
+};
+type RuntimePathIdentity = ComputerBrokerRuntimeIdentity;
+type QuarantinedRuntimePath = {
+	directory: string;
+	socket: string;
+	identity: RuntimePathIdentity;
+};
+
+function pathIdentity(target: string): { dev: number; ino: number } | null {
 	try {
-		if (path.dirname(config.socket) === config.directory && path.basename(config.socket) === "broker.sock")
-			fs.unlinkSync(config.socket);
-	} catch {}
-	try {
-		fs.rmdirSync(config.directory);
-	} catch {}
+		const stat = fs.lstatSync(target);
+		return { dev: stat.dev, ino: stat.ino };
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+		throw error;
+	}
 }
+
+function samePathIdentity(
+	expected: { dev: number; ino: number },
+	actual: { dev: number; ino: number } | null,
+): boolean {
+	return actual !== null && actual.dev === expected.dev && actual.ino === expected.ino;
+}
+
+function captureRuntimePathIdentity(config: { socket: string; directory: string }): RuntimePathIdentity | null {
+	const directory = pathIdentity(config.directory);
+	if (!directory) return null;
+	const socket = pathIdentity(config.socket);
+	return { directory, ...(socket ? { socket } : {}) };
+}
+
+function quarantineRuntimeDirectory(
+	config: { socket: string; directory: string },
+	identity: RuntimePathIdentity,
+): QuarantinedRuntimePath | null {
+	if (path.dirname(config.socket) !== config.directory || path.basename(config.socket) !== "broker.sock")
+		throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+	const currentDirectory = pathIdentity(config.directory);
+	if (!currentDirectory) return null;
+	if (!samePathIdentity(identity.directory, currentDirectory))
+		throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+	if (identity.socket) {
+		const currentSocket = pathIdentity(config.socket);
+		if (currentSocket && !samePathIdentity(identity.socket, currentSocket))
+			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+	}
+	const quarantinedDirectory = `${config.directory}.cleanup-${crypto.randomBytes(16).toString("hex")}`;
+	fs.renameSync(config.directory, quarantinedDirectory);
+	if (!samePathIdentity(identity.directory, pathIdentity(quarantinedDirectory)))
+		throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+	const quarantinedSocket = path.join(quarantinedDirectory, "broker.sock");
+	if (identity.socket) {
+		const movedSocket = pathIdentity(quarantinedSocket);
+		if (movedSocket && !samePathIdentity(identity.socket, movedSocket))
+			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+	}
+	return { directory: quarantinedDirectory, socket: quarantinedSocket, identity };
+}
+
+function removeQuarantinedRuntime(runtime: QuarantinedRuntimePath): void {
+	if (runtime.identity.socket) {
+		const socket = pathIdentity(runtime.socket);
+		if (socket && !samePathIdentity(runtime.identity.socket, socket))
+			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+		if (socket) fs.unlinkSync(runtime.socket);
+	}
+	const directory = pathIdentity(runtime.directory);
+	if (directory && !samePathIdentity(runtime.identity.directory, directory))
+		throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+	if (directory) fs.rmdirSync(runtime.directory);
+}
+
+function removeRuntimeDirectory(config: { socket: string; directory: string }, identity: RuntimePathIdentity): void {
+	const quarantined = quarantineRuntimeDirectory(config, identity);
+	if (quarantined) removeQuarantinedRuntime(quarantined);
+}
+
+export const computerBrokerTestSeams = {
+	captureRuntimePathIdentity,
+	removeRuntimeDirectory,
+	processIdentity,
+};
 
 export interface RunComputerBrokerServerOptions {
 	env?: NodeJS.ProcessEnv;
 	controller?: ComputerControllerLike;
 	startupTimeoutMs?: number;
+	closeServerForTests?: boolean;
 }
 
 /** Runs the hidden helper. It terminates as soon as its owner lease is closed. */
@@ -709,12 +915,14 @@ export async function runComputerBrokerServerFromEnvironment(
 	if (!config) throw new BrokerError("COMPUTER_BROKER_UNAVAILABLE", "Computer broker configuration is unavailable.");
 	secureRuntimeDirectory(config, false);
 	const controller = options.controller ?? createNativeComputerController();
+	const closeServerForTests = options.closeServerForTests ?? options.controller !== undefined;
 	let lease: net.Socket | undefined;
 	let actionTail = Promise.resolve();
 	const clients = new Set<net.Socket>();
 	const done = Promise.withResolvers<void>();
 	let closed = false;
 	let startupTimer: NodeJS.Timeout | undefined;
+	let runtimeIdentity: RuntimePathIdentity | undefined;
 	const closeAll = (): void => {
 		if (closed) return;
 		closed = true;
@@ -723,9 +931,31 @@ export async function runComputerBrokerServerFromEnvironment(
 		void actionTail
 			.catch(() => undefined)
 			.then(() => {
-				server.close(() => removeRuntimeDirectory(config));
-				removeRuntimeDirectory(config);
-				done.resolve();
+				try {
+					if (!runtimeIdentity)
+						throw new BrokerError(
+							"COMPUTER_BROKER_CLEANUP_FAILED",
+							"Computer broker cleanup could not be confirmed.",
+						);
+					const quarantined = quarantineRuntimeDirectory(config, runtimeIdentity);
+					if (!closeServerForTests) {
+						server.unref();
+						if (quarantined) removeQuarantinedRuntime(quarantined);
+						done.resolve();
+						return;
+					}
+					server.close(() => {
+						try {
+							if (quarantined) removeQuarantinedRuntime(quarantined);
+							done.resolve();
+						} catch (error) {
+							done.reject(error);
+						}
+					});
+				} catch (error) {
+					server.unref();
+					done.reject(error);
+				}
 			});
 	};
 	const server = net.createServer(socket => {
@@ -847,6 +1077,11 @@ export async function runComputerBrokerServerFromEnvironment(
 	server.listen(config.socket, () => {
 		try {
 			fs.chmodSync(config.socket, 0o600);
+			const directory = pathIdentity(config.directory);
+			const socket = pathIdentity(config.socket);
+			if (!directory || !socket)
+				throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker runtime path was unavailable.");
+			runtimeIdentity = { directory, socket };
 			listening.resolve();
 		} catch (error) {
 			server.close();
@@ -872,25 +1107,63 @@ function processAlive(pid: number): boolean {
 	}
 }
 
-function terminate(child: childProcess.ChildProcess, config: { socket: string; directory: string }): void {
+function terminate(
+	child: childProcess.ChildProcess,
+	config: { socket: string; directory: string },
+	identity: ComputerBrokerProcessIdentity | null,
+	runtimeIdentity: RuntimePathIdentity,
+	readIdentity: ProcessIdentityReader,
+	isAlive: ProcessAliveReader,
+	termTimeoutMs: number,
+	killTimeoutMs: number,
+): void {
 	const pid = child.pid;
-	if (pid !== undefined && processAlive(pid)) {
-		try {
-			child.kill("SIGTERM");
-		} catch {}
-		const termDeadline = Date.now() + TERM_TIMEOUT_MS;
-		while (processAlive(pid) && Date.now() < termDeadline) sleepSynchronously(10);
-		if (processAlive(pid)) {
-			try {
-				child.kill("SIGKILL");
-			} catch {}
-			const killDeadline = Date.now() + KILL_TIMEOUT_MS;
-			while (processAlive(pid) && Date.now() < killDeadline) sleepSynchronously(10);
-		}
-		if (processAlive(pid))
+	const identityState = (): "missing" | "match" | "mismatch" => {
+		if (pid === undefined || !isAlive(pid)) return "missing";
+		return identity && sameProcessIdentity(identity, readIdentity(pid)) ? "match" : "mismatch";
+	};
+	const requireSignalTarget = (): boolean => {
+		const first = identityState();
+		if (first === "missing") return false;
+		if (first !== "match")
 			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+		const immediate = identityState();
+		if (immediate === "missing") return false;
+		if (immediate !== "match")
+			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+		return true;
+	};
+	const send = (signal: NodeJS.Signals): boolean => {
+		if (!requireSignalTarget()) return false;
+		try {
+			if (!child.kill(signal) && identityState() !== "missing")
+				throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+		} catch (error) {
+			if (identityState() === "missing") return false;
+			throw error instanceof BrokerError
+				? error
+				: new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+		}
+		return true;
+	};
+	const waitForExit = (timeoutMs: number): void => {
+		if (pid === undefined) return;
+		const deadline = Date.now() + timeoutMs;
+		while (isAlive(pid) && Date.now() < deadline) sleepSynchronously(10);
+	};
+
+	if (send("SIGTERM")) {
+		waitForExit(termTimeoutMs);
+		const afterTerm = identityState();
+		if (afterTerm === "mismatch")
+			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+		if (afterTerm === "match" && send("SIGKILL")) {
+			waitForExit(killTimeoutMs);
+			if (identityState() !== "missing")
+				throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker cleanup could not be confirmed.");
+		}
 	}
-	removeRuntimeDirectory(config);
+	removeRuntimeDirectory(config, runtimeIdentity);
 }
 
 function socketReady(config: { socket: string; directory: string }): boolean {
@@ -921,16 +1194,25 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 	const env = options.env ?? process.env;
 	const cwd = options.cwd ?? process.cwd();
 	if (!(options.isCompiledBinary ?? isCompiledBinary)()) return null;
-	const helper = process.execPath;
+	const helper = options.helperExecutable ?? process.execPath;
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-"));
 	const socket = path.join(directory, "broker.sock");
 	const token = crypto.randomBytes(32).toString("hex");
 	const config = { socket, directory };
+	const readIdentity = options.readProcessIdentity ?? processIdentity;
+	const isAlive = options.isProcessAlive ?? processAlive;
+	const termTimeoutMs = Math.max(1, Math.min(options.termTimeoutMs ?? TERM_TIMEOUT_MS, TERM_TIMEOUT_MS));
+	const killTimeoutMs = Math.max(1, Math.min(options.killTimeoutMs ?? KILL_TIMEOUT_MS, KILL_TIMEOUT_MS));
+	let runtimeIdentity: RuntimePathIdentity | undefined;
 	let child: childProcess.ChildProcess | undefined;
+	let childIdentity: ComputerBrokerProcessIdentity | null = null;
 	try {
 		fs.chmodSync(directory, 0o700);
-		const command = helper;
-		child = (options.spawn ?? childProcess.spawn)(command, [COMPUTER_BROKER_CLI_FLAG], {
+		const directoryIdentity = pathIdentity(directory);
+		if (!directoryIdentity)
+			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker runtime path was unavailable.");
+		runtimeIdentity = { directory: directoryIdentity };
+		child = (options.spawn ?? childProcess.spawn)(helper, [COMPUTER_BROKER_CLI_FLAG], {
 			cwd,
 			detached: true,
 			stdio: "ignore",
@@ -944,14 +1226,35 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 		});
 		const deadline =
 			Date.now() + Math.max(1, Math.min(options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS));
+		while (!childIdentity && Date.now() < deadline) {
+			if (spawnFailed || spawnedChild.exitCode !== null || spawnedChild.pid === undefined) break;
+			childIdentity = readIdentity(spawnedChild.pid);
+			if (!childIdentity) sleepSynchronously(10);
+		}
+		if (!childIdentity)
+			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker identity was unavailable.");
 		while (!socketReady(config) && Date.now() < deadline) {
 			if (spawnFailed || spawnedChild.exitCode !== null) break;
 			sleepSynchronously(10);
 		}
 		if (!socketReady(config)) {
-			terminate(spawnedChild, config);
+			terminate(
+				spawnedChild,
+				config,
+				childIdentity,
+				runtimeIdentity,
+				readIdentity,
+				isAlive,
+				termTimeoutMs,
+				killTimeoutMs,
+			);
 			return null;
 		}
+		const socketIdentity = pathIdentity(socket);
+		if (!socketIdentity)
+			throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker runtime path was unavailable.");
+		const readyRuntimeIdentity = { directory: directoryIdentity, socket: socketIdentity };
+		runtimeIdentity = readyRuntimeIdentity;
 		let disposed = false;
 		return {
 			environment: {
@@ -959,16 +1262,43 @@ export function startComputerBrokerForTmux(options: StartComputerBrokerOptions =
 				[GJC_COMPUTER_BROKER_SOCKET_ENV]: socket,
 				[GJC_COMPUTER_BROKER_TOKEN_ENV]: token,
 				[GJC_COMPUTER_BROKER_DIR_ENV]: directory,
+				...identityEnvironment(childIdentity),
 			},
 			dispose: () => {
 				if (disposed) return;
 				disposed = true;
-				terminate(spawnedChild, config);
+				terminate(
+					spawnedChild,
+					config,
+					childIdentity,
+					readyRuntimeIdentity,
+					readIdentity,
+					isAlive,
+					termTimeoutMs,
+					killTimeoutMs,
+				);
 			},
 		};
-	} catch {
-		if (child) terminate(child, config);
-		else removeRuntimeDirectory(config);
+	} catch (error) {
+		let cleanupError: unknown;
+		try {
+			if (child && runtimeIdentity)
+				terminate(
+					child,
+					config,
+					childIdentity,
+					runtimeIdentity,
+					readIdentity,
+					isAlive,
+					termTimeoutMs,
+					killTimeoutMs,
+				);
+			else if (runtimeIdentity) removeRuntimeDirectory(config, runtimeIdentity);
+		} catch (caught) {
+			cleanupError = caught;
+		}
+		if (cleanupError instanceof BrokerError) throw cleanupError;
+		if (error instanceof BrokerError && error.code === "COMPUTER_BROKER_CLEANUP_FAILED") throw error;
 		return null;
 	}
 }

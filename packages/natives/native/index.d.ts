@@ -659,6 +659,19 @@ export interface ControlEndpoint {
  */
 export declare function copyToClipboard(text: string): void
 
+/** Return the kernel-backed incarnation identity for a macOS process. */
+export declare function darwinProcessIdentity(pid: number): DarwinProcessIdentity
+
+/** Kernel-backed macOS process identity used to prevent PID-reuse signaling. */
+export interface DarwinProcessIdentity {
+  /** Microsecond-resolution process start token (`seconds:microseconds`). */
+  startToken: string
+  /** Canonical executable path reported by `proc_pidpath`. */
+  executable: string
+  /** Process group identifier. */
+  pgid: number
+}
+
 /**
  * Detect macOS system appearance via CoreFoundation.
  * Returns `"dark"` or `"light"` on macOS, `null` on other platforms.
@@ -1884,6 +1897,14 @@ export declare function supportsLanguage(lang: string): boolean
 export declare function truncateLinesToWidth(lines: Array<string>, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): Array<string>
 
 export declare function truncateToWidth(text: string, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): string
+
+/**
+ * Return the process ID of the peer connected to a Unix-domain socket (macOS).
+ *
+ * The kernel resolves the peer from the connected socket descriptor; this
+ * never falls back to the current process ID or another inferred identity.
+ */
+export declare function unixSocketPeerPid(fd: number): number
 
 export declare function verifyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult
 

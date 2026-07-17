@@ -5,8 +5,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
+	computerBrokerTestSeams,
 	GJC_COMPUTER_BROKER_DIR_ENV,
+	GJC_COMPUTER_BROKER_EXECUTABLE_ENV,
+	GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV,
+	GJC_COMPUTER_BROKER_PGID_ENV,
+	GJC_COMPUTER_BROKER_PID_ENV,
 	GJC_COMPUTER_BROKER_SOCKET_ENV,
+	GJC_COMPUTER_BROKER_START_ENV,
 	GJC_COMPUTER_BROKER_TOKEN_ENV,
 } from "@gajae-code/coding-agent/gjc-runtime/computer-broker";
 import {
@@ -41,6 +47,39 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 
 function sleep(ms: number): Promise<void> {
 	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+const brokerEnvironmentKeys = [
+	GJC_COMPUTER_BROKER_SOCKET_ENV,
+	GJC_COMPUTER_BROKER_TOKEN_ENV,
+	GJC_COMPUTER_BROKER_DIR_ENV,
+	GJC_COMPUTER_BROKER_PID_ENV,
+	GJC_COMPUTER_BROKER_START_ENV,
+	GJC_COMPUTER_BROKER_EXECUTABLE_ENV,
+	GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV,
+	GJC_COMPUTER_BROKER_PGID_ENV,
+] as const;
+
+function snapshotBrokerEnvironment(): Map<(typeof brokerEnvironmentKeys)[number], string | undefined> {
+	return new Map(brokerEnvironmentKeys.map(key => [key, process.env[key]]));
+}
+
+function restoreBrokerEnvironment(snapshot: Map<(typeof brokerEnvironmentKeys)[number], string | undefined>): void {
+	for (const key of brokerEnvironmentKeys) {
+		const value = snapshot.get(key);
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+}
+
+function setCurrentBrokerIdentityEnvironment(): void {
+	const identity = computerBrokerTestSeams.processIdentity(process.pid);
+	if (!identity) throw new Error("expected current process identity");
+	process.env[GJC_COMPUTER_BROKER_PID_ENV] = String(identity.pid);
+	process.env[GJC_COMPUTER_BROKER_START_ENV] = identity.start;
+	process.env[GJC_COMPUTER_BROKER_EXECUTABLE_ENV] = identity.executable;
+	process.env[GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV] = identity.executableSha256;
+	process.env[GJC_COMPUTER_BROKER_PGID_ENV] = String(identity.pgid);
 }
 
 function crc32(bytes: Uint8Array): number {
@@ -213,11 +252,7 @@ describe("computer tool gating", () => {
 		const runtimeDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "computer-broker-tool-test-"));
 		const socketPath = path.join(runtimeDirectory, "broker.sock");
 		const token = "a".repeat(64);
-		const previousEnvironment = {
-			socket: process.env[GJC_COMPUTER_BROKER_SOCKET_ENV],
-			token: process.env[GJC_COMPUTER_BROKER_TOKEN_ENV],
-			directory: process.env[GJC_COMPUTER_BROKER_DIR_ENV],
-		};
+		const previousEnvironment = snapshotBrokerEnvironment();
 		const sockets = new Set<net.Socket>();
 		let leases = 0;
 		const requests: string[] = [];
@@ -265,6 +300,7 @@ describe("computer tool gating", () => {
 			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
 			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
 			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = runtimeDirectory;
+			setCurrentBrokerIdentityEnvironment();
 			setComputerPlatformForTests("darwin");
 			setComputerArchForTests("arm64");
 			setComputerControllerFactoryForTests(undefined);
@@ -302,21 +338,12 @@ describe("computer tool gating", () => {
 			});
 			await closed.promise;
 			await fs.rm(runtimeDirectory, { recursive: true, force: true });
-			if (previousEnvironment.socket === undefined) delete process.env[GJC_COMPUTER_BROKER_SOCKET_ENV];
-			else process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = previousEnvironment.socket;
-			if (previousEnvironment.token === undefined) delete process.env[GJC_COMPUTER_BROKER_TOKEN_ENV];
-			else process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = previousEnvironment.token;
-			if (previousEnvironment.directory === undefined) delete process.env[GJC_COMPUTER_BROKER_DIR_ENV];
-			else process.env[GJC_COMPUTER_BROKER_DIR_ENV] = previousEnvironment.directory;
+			restoreBrokerEnvironment(previousEnvironment);
 		}
 	});
 
 	it("does not fall back to the native controller when broker configuration is invalid", async () => {
-		const previousEnvironment = {
-			socket: process.env[GJC_COMPUTER_BROKER_SOCKET_ENV],
-			token: process.env[GJC_COMPUTER_BROKER_TOKEN_ENV],
-			directory: process.env[GJC_COMPUTER_BROKER_DIR_ENV],
-		};
+		const previousEnvironment = snapshotBrokerEnvironment();
 		try {
 			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = "/tmp/broker.sock";
 			delete process.env[GJC_COMPUTER_BROKER_TOKEN_ENV];
@@ -333,12 +360,7 @@ describe("computer tool gating", () => {
 			expect(result.isError).toBe(true);
 			expect(result.details?.code).toBe("COMPUTER_BROKER_UNAVAILABLE");
 		} finally {
-			if (previousEnvironment.socket === undefined) delete process.env[GJC_COMPUTER_BROKER_SOCKET_ENV];
-			else process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = previousEnvironment.socket;
-			if (previousEnvironment.token === undefined) delete process.env[GJC_COMPUTER_BROKER_TOKEN_ENV];
-			else process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = previousEnvironment.token;
-			if (previousEnvironment.directory === undefined) delete process.env[GJC_COMPUTER_BROKER_DIR_ENV];
-			else process.env[GJC_COMPUTER_BROKER_DIR_ENV] = previousEnvironment.directory;
+			restoreBrokerEnvironment(previousEnvironment);
 		}
 	});
 

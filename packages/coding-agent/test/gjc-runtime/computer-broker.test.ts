@@ -1,15 +1,23 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import type * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
 	acquireComputerBrokerLeaseFromEnvironment,
+	type ComputerBrokerProcessIdentity,
+	computerBrokerTestSeams,
 	createComputerBrokerControllerFromEnvironment,
 	disposeComputerBrokerLease,
 	GJC_COMPUTER_BROKER_DIR_ENV,
+	GJC_COMPUTER_BROKER_EXECUTABLE_ENV,
+	GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV,
+	GJC_COMPUTER_BROKER_PGID_ENV,
+	GJC_COMPUTER_BROKER_PID_ENV,
 	GJC_COMPUTER_BROKER_REQUIRED_ENV,
 	GJC_COMPUTER_BROKER_SOCKET_ENV,
+	GJC_COMPUTER_BROKER_START_ENV,
 	GJC_COMPUTER_BROKER_TOKEN_ENV,
 	initializeComputerBrokerLeaseFromEnvironment,
 	runComputerBrokerServerFromEnvironment,
@@ -21,6 +29,11 @@ const brokerEnv = [
 	GJC_COMPUTER_BROKER_TOKEN_ENV,
 	GJC_COMPUTER_BROKER_DIR_ENV,
 	GJC_COMPUTER_BROKER_REQUIRED_ENV,
+	GJC_COMPUTER_BROKER_PID_ENV,
+	GJC_COMPUTER_BROKER_START_ENV,
+	GJC_COMPUTER_BROKER_EXECUTABLE_ENV,
+	GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV,
+	GJC_COMPUTER_BROKER_PGID_ENV,
 ] as const;
 const original = new Map(brokerEnv.map(key => [key, process.env[key]]));
 
@@ -32,6 +45,21 @@ afterEach(() => {
 		else process.env[key] = value;
 	}
 });
+
+function currentBrokerIdentity(): ComputerBrokerProcessIdentity {
+	const identity = computerBrokerTestSeams.processIdentity(process.pid);
+	if (!identity) throw new Error("expected current process identity");
+	return identity;
+}
+
+function setBrokerIdentityEnvironment(): void {
+	const identity = currentBrokerIdentity();
+	process.env[GJC_COMPUTER_BROKER_PID_ENV] = String(identity.pid);
+	process.env[GJC_COMPUTER_BROKER_START_ENV] = identity.start;
+	process.env[GJC_COMPUTER_BROKER_EXECUTABLE_ENV] = identity.executable;
+	process.env[GJC_COMPUTER_BROKER_EXECUTABLE_SHA256_ENV] = identity.executableSha256;
+	process.env[GJC_COMPUTER_BROKER_PGID_ENV] = String(identity.pgid);
+}
 
 function line(socketPath: string, frame: unknown): Promise<unknown> {
 	const pending = Promise.withResolvers<unknown>();
@@ -93,7 +121,10 @@ function socketFrames(socket: net.Socket): { next(): Promise<unknown> } {
 
 async function waitForSocket(socketPath: string): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
-		if (fs.existsSync(socketPath)) return;
+		try {
+			const stat = fs.lstatSync(socketPath);
+			if (stat.isSocket() && (stat.mode & 0o777) === 0o600) return;
+		} catch {}
 		await Bun.sleep(5);
 	}
 	throw new Error("broker socket did not start");
@@ -116,6 +147,28 @@ async function closeServer(server: net.Server): Promise<void> {
 	await closed.promise;
 }
 
+function fakeBrokerChild(pid: number, onKill: (signal: NodeJS.Signals) => boolean): childProcess.ChildProcess {
+	let child: childProcess.ChildProcess;
+	child = {
+		pid,
+		exitCode: null,
+		unref: () => child,
+		once: () => child,
+		kill: (signal?: NodeJS.Signals | number) => onKill(typeof signal === "string" ? signal : "SIGTERM"),
+	} as unknown as childProcess.ChildProcess;
+	return child;
+}
+
+function staticProcessIdentity(pid: number): ComputerBrokerProcessIdentity {
+	return {
+		pid,
+		start: "100:200",
+		executable: "/tmp/gjc-test-helper",
+		executableSha256: "a".repeat(64),
+		pgid: pid,
+	};
+}
+
 describe("computer broker", () => {
 	it("does not create a controller without broker environment", () => {
 		for (const key of brokerEnv) delete process.env[key];
@@ -132,6 +185,24 @@ describe("computer broker", () => {
 		expect(() => createComputerBrokerControllerFromEnvironment()).not.toThrow("a".repeat(64));
 	});
 
+	it("fails closed when configured broker identity metadata is incomplete", () => {
+		process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = "/tmp/gjc-computer-broker/broker.sock";
+		process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = "a".repeat(64);
+		process.env[GJC_COMPUTER_BROKER_DIR_ENV] = "/tmp/gjc-computer-broker";
+		delete process.env[GJC_COMPUTER_BROKER_PID_ENV];
+		expect(() => createComputerBrokerControllerFromEnvironment()).toThrow(
+			"Computer broker configuration is unavailable",
+		);
+	});
+
+	it("fails closed when identity metadata exists without broker paths", () => {
+		for (const key of brokerEnv) delete process.env[key];
+		process.env[GJC_COMPUTER_BROKER_PID_ENV] = String(process.pid);
+		expect(() => createComputerBrokerControllerFromEnvironment()).toThrow(
+			"Computer broker is required but unavailable",
+		);
+	});
+
 	it("fails closed when managed tmux marks the broker required but unavailable", () => {
 		delete process.env[GJC_COMPUTER_BROKER_SOCKET_ENV];
 		delete process.env[GJC_COMPUTER_BROKER_TOKEN_ENV];
@@ -144,6 +215,134 @@ describe("computer broker", () => {
 
 	it("refuses source-mode managed tmux ownership", () => {
 		expect(startComputerBrokerForTmux({ env: {}, isCompiledBinary: () => false })).toBeNull();
+	});
+
+	it("deletes only the captured broker runtime inode", () => {
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-cleanup-"));
+		const directory = path.join(base, "owner");
+		const socket = path.join(directory, "broker.sock");
+		fs.mkdirSync(directory, { mode: 0o700 });
+		fs.writeFileSync(socket, "owner");
+		fs.chmodSync(socket, 0o600);
+		const identity = computerBrokerTestSeams.captureRuntimePathIdentity({ socket, directory });
+		if (!identity) throw new Error("expected runtime identity");
+		computerBrokerTestSeams.removeRuntimeDirectory({ socket, directory }, identity);
+		expect(fs.existsSync(directory)).toBe(false);
+		fs.rmSync(base, { recursive: true, force: true });
+	});
+
+	it("refuses to delete replacement broker paths", () => {
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-replaced-"));
+		const directory = path.join(base, "owner");
+		const moved = path.join(base, "moved-owner");
+		const socket = path.join(directory, "broker.sock");
+		fs.mkdirSync(directory, { mode: 0o700 });
+		fs.writeFileSync(socket, "owner");
+		fs.chmodSync(socket, 0o600);
+		const identity = computerBrokerTestSeams.captureRuntimePathIdentity({ socket, directory });
+		if (!identity) throw new Error("expected runtime identity");
+		fs.renameSync(directory, moved);
+		fs.mkdirSync(directory, { mode: 0o700 });
+		fs.writeFileSync(socket, "replacement");
+		fs.chmodSync(socket, 0o600);
+		expect(() => computerBrokerTestSeams.removeRuntimeDirectory({ socket, directory }, identity)).toThrow(
+			"Computer broker cleanup could not be confirmed",
+		);
+		expect(fs.readFileSync(socket, "utf8")).toBe("replacement");
+		expect(fs.readFileSync(path.join(moved, "broker.sock"), "utf8")).toBe("owner");
+		fs.rmSync(base, { recursive: true, force: true });
+	});
+
+	it("never signals a reused broker PID", () => {
+		const pid = 42_424;
+		const originalIdentity = staticProcessIdentity(pid);
+		const replacementIdentity = { ...originalIdentity, start: "100:201" };
+		const signals: NodeJS.Signals[] = [];
+		let identityReads = 0;
+		let runtimeDirectory: string | undefined;
+		const child = fakeBrokerChild(pid, signal => {
+			signals.push(signal);
+			return true;
+		});
+		const spawn = ((_command: string, _args: readonly string[], options: childProcess.SpawnOptions) => {
+			runtimeDirectory = options.env?.[GJC_COMPUTER_BROKER_DIR_ENV];
+			return child;
+		}) as typeof childProcess.spawn;
+		try {
+			expect(() =>
+				startComputerBrokerForTmux({
+					isCompiledBinary: () => true,
+					spawn,
+					startupTimeoutMs: 1,
+					readProcessIdentity: () => (identityReads++ === 0 ? originalIdentity : replacementIdentity),
+					isProcessAlive: () => true,
+					termTimeoutMs: 1,
+					killTimeoutMs: 1,
+				}),
+			).toThrow("Computer broker cleanup could not be confirmed");
+			expect(signals).toEqual([]);
+		} finally {
+			if (runtimeDirectory) fs.rmSync(runtimeDirectory, { recursive: true, force: true });
+		}
+	});
+
+	it("revalidates one broker incarnation before TERM and KILL", () => {
+		const pid = 42_425;
+		const identity = staticProcessIdentity(pid);
+		const signals: NodeJS.Signals[] = [];
+		let alive = true;
+		const child = fakeBrokerChild(pid, signal => {
+			signals.push(signal);
+			if (signal === "SIGKILL") alive = false;
+			return true;
+		});
+		const spawn = ((_command: string, _args: readonly string[], _options: childProcess.SpawnOptions) =>
+			child) as typeof childProcess.spawn;
+		expect(
+			startComputerBrokerForTmux({
+				isCompiledBinary: () => true,
+				spawn,
+				startupTimeoutMs: 1,
+				readProcessIdentity: () => identity,
+				isProcessAlive: () => alive,
+				termTimeoutMs: 1,
+				killTimeoutMs: 1,
+			}),
+		).toBeNull();
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+	});
+
+	it.if(process.platform === "darwin")("never sends the lease token to a mismatched peer incarnation", async () => {
+		for (const mismatch of ["pid", "start"] as const) {
+			const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-computer-broker-peer-"));
+			const socketPath = path.join(directory, "broker.sock");
+			const token = mismatch === "pid" ? "4".repeat(64) : "5".repeat(64);
+			let received = Buffer.alloc(0);
+			const connectionClosed = Promise.withResolvers<void>();
+			const server = net.createServer(socket => {
+				socket.on("data", chunk => {
+					received = Buffer.concat([received, typeof chunk === "string" ? Buffer.from(chunk) : chunk]);
+				});
+				socket.once("close", connectionClosed.resolve);
+			});
+			await listen(server, socketPath);
+			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
+			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
+			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			setBrokerIdentityEnvironment();
+			if (mismatch === "pid") process.env[GJC_COMPUTER_BROKER_PID_ENV] = String(process.pid + 100_000);
+			else process.env[GJC_COMPUTER_BROKER_START_ENV] = "0:0";
+			try {
+				await acquireComputerBrokerLeaseFromEnvironment();
+				throw new Error("expected broker identity rejection");
+			} catch (error) {
+				expect((error as { code?: string }).code).toBe("COMPUTER_BROKER_UNAVAILABLE");
+			}
+			await connectionClosed.promise;
+			expect(received.byteLength).toBe(0);
+			await closeServer(server);
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	it.if(process.platform === "darwin")("removes an unclaimed broker after the startup deadline", async () => {
@@ -185,6 +384,7 @@ describe("computer broker", () => {
 			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
 			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
 			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			setBrokerIdentityEnvironment();
 			try {
 				await acquireComputerBrokerLeaseFromEnvironment();
 				throw new Error("expected lease failure");
@@ -213,7 +413,8 @@ describe("computer broker", () => {
 			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
 			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socket;
 			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
-			const server = runComputerBrokerServerFromEnvironment();
+			setBrokerIdentityEnvironment();
+			const server = runComputerBrokerServerFromEnvironment({ controller: {} });
 			await waitForSocket(socket);
 			const rejected = await line(socket, {
 				version: 1,
@@ -281,6 +482,7 @@ describe("computer broker", () => {
 			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
 			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
 			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			setBrokerIdentityEnvironment();
 			const typed: string[] = [];
 			const server = runComputerBrokerServerFromEnvironment({
 				controller: {
@@ -352,6 +554,7 @@ describe("computer broker", () => {
 			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
 			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
 			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			setBrokerIdentityEnvironment();
 			const controller = createComputerBrokerControllerFromEnvironment();
 			if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
 			expect(await controller.brokerInvoke("wait", [null, 1])).toBe("응답🙂");
@@ -380,6 +583,7 @@ describe("computer broker", () => {
 		process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
 		process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
 		process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+		setBrokerIdentityEnvironment();
 		const controller = createComputerBrokerControllerFromEnvironment();
 		if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
 		try {
@@ -410,6 +614,7 @@ describe("computer broker", () => {
 		process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
 		process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socketPath;
 		process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+		setBrokerIdentityEnvironment();
 		const controller = createComputerBrokerControllerFromEnvironment();
 		if (!controller?.brokerInvoke) throw new Error("expected broker invocation");
 		const outcomes = await Promise.allSettled([
@@ -435,6 +640,7 @@ describe("computer broker", () => {
 			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
 			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socket;
 			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			setBrokerIdentityEnvironment();
 			const calls: unknown[][] = [];
 			const waitStarted = Promise.withResolvers<void>();
 			let moveCalls = 0;
@@ -544,6 +750,7 @@ describe("computer broker", () => {
 		process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
 		process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socket;
 		process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+		setBrokerIdentityEnvironment();
 		const waitStarted = Promise.withResolvers<void>();
 		let moveCalls = 0;
 		const server = runComputerBrokerServerFromEnvironment({
@@ -585,6 +792,7 @@ describe("computer broker", () => {
 			process.env[GJC_COMPUTER_BROKER_DIR_ENV] = directory;
 			process.env[GJC_COMPUTER_BROKER_SOCKET_ENV] = socket;
 			process.env[GJC_COMPUTER_BROKER_TOKEN_ENV] = token;
+			setBrokerIdentityEnvironment();
 			const actionStarted = Promise.withResolvers<void>();
 			const releaseAction = Promise.withResolvers<void>();
 			const server = runComputerBrokerServerFromEnvironment({
