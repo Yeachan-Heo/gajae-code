@@ -11,7 +11,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $flag, isBunTestRuntime, logger, Snowflake } from "@gajae-code/utils";
+import { $env, isBunTestRuntime, logger, Snowflake } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import { $ } from "bun";
 import { Settings } from "../../config/settings";
@@ -23,7 +23,30 @@ import { ensurePythonRuntime, filterEnv, type PythonRuntimeOptions } from "./run
 export type { KernelDisplayOutput, PythonStatusEvent } from "./display";
 export { renderKernelDisplay } from "./display";
 
-const TRACE_IPC = $flag("PI_PYTHON_IPC_TRACE");
+/**
+ * Truthy set for boolean-style Python env flags. Case-insensitive: `1`,
+ * `true`, `yes` (and `on`/`y`) are treated as true; everything else is false.
+ * Mirrors the canonical resolver in `tools/index.ts` so this module can
+ * dual-read `GJC_*` / `PI_*` names without importing the tools barrel (which
+ * would create a circular import at top-level `TRACE_IPC` evaluation).
+ */
+const PYTHON_TRUTHY = new Set(["1", "true", "yes", "on", "y"]);
+
+/** True when `value` is a non-empty string matching a truthy boolean token. */
+function isTruthyPythonFlag(value: string | undefined): boolean {
+	return value !== undefined && PYTHON_TRUTHY.has(value.trim().toLowerCase());
+}
+
+/**
+ * Resolve a boolean Python env flag preferring the `GJC_` name and falling back
+ * to the legacy `PI_` name. Either truthy value wins (OR semantics).
+ */
+function resolvePythonFlag(gjcName: string, piName: string): boolean {
+	return isTruthyPythonFlag($env[gjcName]) || isTruthyPythonFlag($env[piName]);
+}
+
+// Dual-read: `GJC_PYTHON_IPC_TRACE` is preferred, then legacy `PI_PYTHON_IPC_TRACE`.
+const TRACE_IPC = resolvePythonFlag("GJC_PYTHON_IPC_TRACE", "PI_PYTHON_IPC_TRACE");
 
 // Cache the runner script on disk so the subprocess loads it normally. Cached
 // per script hash so installs don't race across versions.
@@ -125,7 +148,7 @@ export async function checkPythonKernelAvailability(
 	cwd: string,
 	runtimeOptions?: PythonRuntimeOptions,
 ): Promise<PythonKernelAvailability> {
-	if (isBunTestRuntime() || $flag("PI_PYTHON_SKIP_CHECK")) {
+	if (isBunTestRuntime() || resolvePythonFlag("GJC_PYTHON_SKIP_CHECK", "PI_PYTHON_SKIP_CHECK")) {
 		return { ok: true };
 	}
 	try {

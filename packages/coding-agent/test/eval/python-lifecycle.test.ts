@@ -5,7 +5,7 @@ import type {
 	KernelExecuteResult,
 	KernelShutdownResult,
 } from "@gajae-code/coding-agent/eval/py/kernel";
-import { PythonKernel } from "@gajae-code/coding-agent/eval/py/kernel";
+import { checkPythonKernelAvailability, PythonKernel } from "@gajae-code/coding-agent/eval/py/kernel";
 import { TempDir } from "@gajae-code/utils";
 
 const originalStart = PythonKernel.start;
@@ -201,5 +201,77 @@ describe("python eval lifecycle", () => {
 			}
 			await unrelated.exited.catch(() => undefined);
 		}
+	});
+});
+describe("python kernel env-var dual-read (GJC_* preferred, PI_* fallback)", () => {
+	// `checkPythonKernelAvailability` short-circuits on `isBunTestRuntime()`
+	// (NODE_ENV/BUN_ENV === "test"), which would mask the skip-check branch.
+	// These tests neutralize the test-runtime guard inside a scoped window and
+	// restore it in finally so the real GJC/PI skip-check branch is exercised.
+	const SKIP_ENV_KEYS = [
+		"GJC_PYTHON_SKIP_CHECK",
+		"PI_PYTHON_SKIP_CHECK",
+		"GJC_PYTHON_IPC_TRACE",
+		"PI_PYTHON_IPC_TRACE",
+	] as const;
+	const originalNodeEnv = Bun.env.NODE_ENV;
+	const originalBunEnv = Bun.env.BUN_ENV;
+
+	function clearSkipEnv(): void {
+		for (const key of SKIP_ENV_KEYS) delete Bun.env[key];
+	}
+
+	function neutralizeTestRuntime(): void {
+		// Force isBunTestRuntime() false so the skip-check env var is the
+		// sole gate, not the test-runtime short-circuit.
+		delete Bun.env.NODE_ENV;
+		delete Bun.env.BUN_ENV;
+	}
+
+	function restoreTestRuntime(): void {
+		Bun.env.NODE_ENV = originalNodeEnv;
+		Bun.env.BUN_ENV = originalBunEnv;
+	}
+
+	afterEach(() => {
+		clearSkipEnv();
+		restoreTestRuntime();
+	});
+
+	it("honors GJC_PYTHON_SKIP_CHECK=1 and returns ok without spawning Python", async () => {
+		clearSkipEnv();
+		neutralizeTestRuntime();
+		Bun.env.GJC_PYTHON_SKIP_CHECK = "1";
+		using tempDir = TempDir.createSync("@gjc-python-skipcheck-gjc-");
+		const availability = await checkPythonKernelAvailability(tempDir.path());
+		expect(availability.ok).toBe(true);
+	});
+
+	it("still honors legacy PI_PYTHON_SKIP_CHECK=1 as a fallback", async () => {
+		clearSkipEnv();
+		neutralizeTestRuntime();
+		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+		using tempDir = TempDir.createSync("@gjc-python-skipcheck-pi-");
+		const availability = await checkPythonKernelAvailability(tempDir.path());
+		expect(availability.ok).toBe(true);
+	});
+
+	it("OR semantics: GJC=0 with PI=1 still skips the check", async () => {
+		clearSkipEnv();
+		neutralizeTestRuntime();
+		Bun.env.GJC_PYTHON_SKIP_CHECK = "0";
+		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+		using tempDir = TempDir.createSync("@gjc-python-skipcheck-or-");
+		const availability = await checkPythonKernelAvailability(tempDir.path());
+		expect(availability.ok).toBe(true);
+	});
+
+	it("accepts truthy tokens true/yes for GJC_PYTHON_SKIP_CHECK (case-insensitive)", async () => {
+		clearSkipEnv();
+		neutralizeTestRuntime();
+		Bun.env.GJC_PYTHON_SKIP_CHECK = "YES";
+		using tempDir = TempDir.createSync("@gjc-python-skipcheck-yes-");
+		const availability = await checkPythonKernelAvailability(tempDir.path());
+		expect(availability.ok).toBe(true);
 	});
 });

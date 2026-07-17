@@ -1,6 +1,6 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai";
-import { $env, $flag, logger } from "@gajae-code/utils";
+import { $env, logger } from "@gajae-code/utils";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
@@ -500,18 +500,76 @@ export interface EvalBackendsAllowance {
 }
 
 /**
- * Parse PI_PY / PI_JS environment variables. Each is a boolean flag; unset
- * means "not specified, defer to settings". Returns null when neither is set
+ * Truthy set for boolean-style Python env flags. Case-insensitive: `1`,
+ * `true`, `yes` (and `on`/`y`) are treated as true; everything else is false.
+ */
+const PYTHON_TRUTHY = new Set(["1", "true", "yes", "on", "y"]);
+
+/** True when `value` is a non-empty string matching a truthy boolean token. */
+function isTruthyFlag(value: string | undefined): boolean {
+	return value !== undefined && PYTHON_TRUTHY.has(value.trim().toLowerCase());
+}
+
+/**
+ * Parse the `GJC_PY` multi-value token into per-backend booleans.
+ *
+ * Tokens (case-insensitive):
+ * - `0` / `bash` → JavaScript only (`{ py: false, js: true }`)
+ * - `1` / `py`   → Python only (`{ py: true, js: false }`)
+ * - `js`         → JavaScript only (`{ py: false, js: true }`)
+ * - `mix` / `both` → both backends (`{ py: true, js: true }`)
+ *
+ * Returns `null` when `GJC_PY` is unset, empty, or holds an unrecognized
+ * token, so the caller can fall back to the legacy `PI_PY` / `PI_JS` flags or
+ * per-key settings. This matches the documented contract that invalid values
+ * are ignored.
+ */
+export function parseGjcPy(env: Record<string, string | undefined>): { py: boolean; js: boolean } | null {
+	const raw = env.GJC_PY;
+	if (raw === undefined) return null;
+	const token = raw.trim().toLowerCase();
+	if (token === "") return null;
+	switch (token) {
+		case "0":
+		case "bash":
+			return { py: false, js: true };
+		case "1":
+		case "py":
+			return { py: true, js: false };
+		case "js":
+			return { py: false, js: true };
+		case "mix":
+		case "both":
+			return { py: true, js: true };
+		default:
+			return null;
+	}
+}
+
+/**
+ * Parse legacy `PI_PY` / `PI_JS` boolean flags. Each is a boolean flag; unset
+ * means "not specified, defer to settings". Returns `null` when neither is set
  * so the caller can fall through to `readEvalBackendsAllowance` per key.
  */
-function getEvalBackendsFromEnv(): EvalBackendsAllowance | null {
-	const pyEnv = $env.PI_PY;
-	const jsEnv = $env.PI_JS;
+function parseLegacyEvalEnvFlags(env: Record<string, string | undefined>): EvalBackendsAllowance | null {
+	const pyEnv = env.PI_PY;
+	const jsEnv = env.PI_JS;
 	if (pyEnv === undefined && jsEnv === undefined) return null;
 	return {
-		python: pyEnv === undefined ? true : $flag("PI_PY"),
-		js: jsEnv === undefined ? true : $flag("PI_JS"),
+		python: pyEnv === undefined ? true : isTruthyFlag(pyEnv),
+		js: jsEnv === undefined ? true : isTruthyFlag(jsEnv),
 	};
+}
+
+/**
+ * Resolve eval-backend allowance from environment only. `GJC_PY` wins when set
+ * to a recognized token; otherwise the legacy `PI_PY` / `PI_JS` flags apply.
+ * Returns `null` when no env override is set so the caller can defer to settings.
+ */
+export function resolveEvalBackendsFromEnv(env: Record<string, string | undefined>): EvalBackendsAllowance | null {
+	const gjc = parseGjcPy(env);
+	if (gjc) return { python: gjc.py, js: gjc.js };
+	return parseLegacyEvalEnvFlags(env);
 }
 
 /** Read per-backend allowance from settings (defaults true). */
@@ -523,11 +581,40 @@ export function readEvalBackendsAllowance(session: ToolSession): EvalBackendsAll
 }
 
 /**
- * Materialize the active eval backend allowance: PI_PY / PI_JS env flags
- * override the per-key settings; otherwise settings (defaults true) win.
+ * Materialize the active eval backend allowance. `GJC_PY` takes precedence
+ * over the legacy `PI_PY` / `PI_JS` env flags, which in turn override the
+ * per-key settings (defaults true). When no env override is set, settings win.
  */
 export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance {
-	return getEvalBackendsFromEnv() ?? readEvalBackendsAllowance(session);
+	return resolveEvalBackendsFromEnv($env) ?? readEvalBackendsAllowance(session);
+}
+
+/**
+ * Resolve the Python skip-check flag. `GJC_PYTHON_SKIP_CHECK` is preferred;
+ * falls back to legacy `PI_PYTHON_SKIP_CHECK`. Truthy values: `1`, `true`,
+ * `yes` (case-insensitive).
+ */
+export function resolvePythonSkipCheck(env: Record<string, string | undefined>): boolean {
+	return isTruthyFlag(env.GJC_PYTHON_SKIP_CHECK) || isTruthyFlag(env.PI_PYTHON_SKIP_CHECK);
+}
+
+/**
+ * Resolve the Python IPC trace flag. `GJC_PYTHON_IPC_TRACE` is preferred;
+ * falls back to legacy `PI_PYTHON_IPC_TRACE`. Truthy values: `1`, `true`,
+ * `yes` (case-insensitive).
+ */
+export function resolvePythonIpcTrace(env: Record<string, string | undefined>): boolean {
+	return isTruthyFlag(env.GJC_PYTHON_IPC_TRACE) || isTruthyFlag(env.PI_PYTHON_IPC_TRACE);
+}
+
+/**
+ * Resolve the gated Python integration-test gate. Uses OR semantics:
+ * `GJC_PYTHON_INTEGRATION === "1"` OR `PI_PYTHON_INTEGRATION === "1"` enables
+ * it. A truthy value on either name opts the tests in, so `GJC=0, PI=1` is
+ * still true. Truthy values: `1`, `true`, `yes` (case-insensitive).
+ */
+export function resolvePythonIntegrationGate(env: Record<string, string | undefined>): boolean {
+	return isTruthyFlag(env.GJC_PYTHON_INTEGRATION) || isTruthyFlag(env.PI_PYTHON_INTEGRATION);
 }
 
 /**
