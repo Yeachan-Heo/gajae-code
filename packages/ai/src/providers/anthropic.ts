@@ -924,32 +924,27 @@ function appendAnthropicRateLimitEvidence(bodyText: string, headers: Headers): s
 	return bodyText.includes(suffix) ? bodyText : `${bodyText}${suffix}`;
 }
 
-function isAnthropicUsageExhaustionResponse(
-	bodyText: string,
-	headers: Headers,
-	retryAfterMs: number | undefined,
-	retryDelayCapMs: number,
-): boolean {
-	const overageReason = headers.get("anthropic-ratelimit-unified-overage-disabled-reason")?.toLowerCase();
-	if (overageReason === "out_of_credits") return true;
-	// A unified-limit rejection that still advertises fallback capacity is a
-	// rolling/probabilistic rejection, not exhaustion-until-reset: Anthropic
-	// keeps accepting a fraction of requests (fallback-percentage) while the
-	// window drains. Observed in the field: unified-5h-status=rejected,
-	// retry-after=13262s, fallback-percentage=0.5,
-	// overage-disabled-reason=org_level_disabled -- requests succeeded again
-	// within minutes, while this function declared the session terminally
-	// exhausted (both via the retry-after cap below and the "request would
-	// exceed" body match). Such responses get a bounded retry instead (the
-	// wrapper below strips the worst-case retry-after hint so the SDK's
-	// default exponential backoff applies). out_of_credits stays terminal
-	// above: no fallback fraction saves missing credits.
-	const fallbackPercentage = Number.parseFloat(
-		headers.get("anthropic-ratelimit-unified-fallback-percentage") ?? "",
-	);
-	if (Number.isFinite(fallbackPercentage) && fallbackPercentage > 0) return false;
-	if (retryAfterMs !== undefined && retryAfterMs > retryDelayCapMs) return true;
+// Bounded fallback retry policy (PR #2444 review): a unified-limit rejection
+// may be downgraded from exhaustion to a SHORT bounded retry, but only when
+// the response proves the full Anthropic unified-rejection shape (status,
+// strictly parsed fallback fraction, and the exact error class). The retry
+// budget and delay are explicit constants enforced per client instance as a
+// sliding window (the SDK mints a fresh AbortSignal per attempt, so request
+// identity is not observable at the fetch layer; a per-client window is
+// strictly more conservative -- shared budget can only reduce retries). The
+// worst case per client is ANTHROPIC_FALLBACK_MAX_RETRIES extra attempts per
+// ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS, spaced ANTHROPIC_FALLBACK_RETRY_DELAY_MS
+// apart -- never an unbounded burst, and never triggered by a lone header on
+// an arbitrary 429.
+const ANTHROPIC_FALLBACK_MAX_RETRIES = 2;
+const ANTHROPIC_FALLBACK_RETRY_DELAY_MS = 2_000;
+const ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS = 60_000;
 
+type Anthropic429Class = "ordinary" | "usage_exhaustion" | "fallback_retryable";
+
+// The unified-limit error class: rate_limit_error + the "request would
+// exceed" phrasing, WITHOUT out_of_credits (credits exhaustion is terminal).
+function isUnifiedRateLimitBody(bodyText: string): boolean {
 	try {
 		const parsed = JSON.parse(bodyText) as unknown;
 		const error = isRecord(parsed) ? parsed.error : undefined;
@@ -957,15 +952,72 @@ function isAnthropicUsageExhaustionResponse(
 		const message = getStringProperty(error, "message") ?? getStringProperty(parsed, "message") ?? bodyText;
 		return (
 			/rate_limit_error/i.test(type ?? "") &&
-			(/request would exceed your account.?s rate limit/i.test(message) || /out_of_credits/i.test(message))
+			/request would exceed your account.?s rate limit/i.test(message) &&
+			!/out_of_credits/i.test(message)
 		);
 	} catch {
-		return /request would exceed your account.?s rate limit|out_of_credits/i.test(bodyText);
+		return /request would exceed your account.?s rate limit/i.test(bodyText) && !/out_of_credits/i.test(bodyText);
 	}
+}
+
+// Strictly parsed fallback fraction: the COMPLETE trimmed value must be a
+// plain decimal within (0, 1] (observed provider value: 0.5). Numeric
+// prefixes ("0.5junk"), out-of-range values ("101"), and non-finite values
+// are all rejected -- a malformed header must never loosen retry policy.
+function verifiedFallbackPercentage(headers: Headers): number | undefined {
+	const raw = headers.get("anthropic-ratelimit-unified-fallback-percentage")?.trim();
+	if (!raw || !/^\d+(\.\d+)?$/.test(raw)) return undefined;
+	const value = Number.parseFloat(raw);
+	if (!Number.isFinite(value) || value <= 0 || value > 1) return undefined;
+	return value;
+}
+
+function classifyAnthropic429(
+	bodyText: string,
+	headers: Headers,
+	retryAfterMs: number | undefined,
+	retryDelayCapMs: number,
+): Anthropic429Class {
+	const overageReason = headers.get("anthropic-ratelimit-unified-overage-disabled-reason")?.toLowerCase();
+	if (overageReason === "out_of_credits") return "usage_exhaustion";
+
+	const oversizedRetryAfter = retryAfterMs !== undefined && retryAfterMs > retryDelayCapMs;
+	const unifiedBody = isUnifiedRateLimitBody(bodyText);
+	const legacyBodyMatch = (() => {
+		try {
+			const parsed = JSON.parse(bodyText) as unknown;
+			const error = isRecord(parsed) ? parsed.error : undefined;
+			const type = getStringProperty(error, "type") ?? getStringProperty(parsed, "type");
+			const message = getStringProperty(error, "message") ?? getStringProperty(parsed, "message") ?? bodyText;
+			return /rate_limit_error/i.test(type ?? "") && /out_of_credits/i.test(message);
+		} catch {
+			return /out_of_credits/i.test(bodyText);
+		}
+	})();
+	if (!oversizedRetryAfter && !unifiedBody && !legacyBodyMatch) return "ordinary";
+
+	// Downgrade to a bounded retry ONLY for the fully verified unified
+	// rejection: rejected unified status + strict in-range fallback fraction
+	// + the exact unified error class. Field evidence (2026-07-16):
+	// unified-5h-status=rejected, retry-after=13262s, fallback-percentage=0.5,
+	// overage=org_level_disabled -- requests succeeded again within minutes,
+	// while the old behavior declared the session terminally exhausted after
+	// a single attempt.
+	if (
+		unifiedBody &&
+		headers.get("anthropic-ratelimit-unified-status")?.trim().toLowerCase() === "rejected" &&
+		verifiedFallbackPercentage(headers) !== undefined
+	) {
+		return "fallback_retryable";
+	}
+	return "usage_exhaustion";
 }
 
 function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDelayMs: number | undefined): FetchImpl {
 	const retryDelayCapMs = maxRetryDelayMs ?? ANTHROPIC_RETRY_DELAY_CAP_MS;
+	// Sliding downgrade budget per client instance (see the policy comment
+	// above the constants). Timestamps of recent downgrades; pruned on use.
+	let fallbackDowngradeTimes: number[] = [];
 	return Object.assign(
 		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			const response = await baseFetch(input, init);
@@ -977,23 +1029,28 @@ function wrapAnthropicFetchForBoundedRateLimits(baseFetch: FetchImpl, maxRetryDe
 				.clone()
 				.text()
 				.catch(() => "");
-			if (!isAnthropicUsageExhaustionResponse(bodyText, headers, retryAfterMs, retryDelayCapMs)) {
-				// Non-exhaustion 429 with an oversized retry-after (today that is
-				// exactly the fallback-capacity case): the SDK obeys retry-after
-				// VERBATIM ("If the API asks us to wait ..., just do what it
-				// says"), so passing it through would trade the old fail-fast for
-				// a silent multi-hour sleep. Drop the worst-case hint and let the
-				// SDK spend its bounded default backoff (0.5s..8s exponential).
-				if (retryAfterMs !== undefined && retryAfterMs > retryDelayCapMs) {
+			const classification = classifyAnthropic429(bodyText, headers, retryAfterMs, retryDelayCapMs);
+			if (classification === "ordinary") return response;
+
+			if (classification === "fallback_retryable") {
+				const now = Date.now();
+				fallbackDowngradeTimes = fallbackDowngradeTimes.filter(
+					time => now - time < ANTHROPIC_FALLBACK_BUDGET_WINDOW_MS,
+				);
+				if (fallbackDowngradeTimes.length < ANTHROPIC_FALLBACK_MAX_RETRIES) {
+					fallbackDowngradeTimes.push(now);
+					// Override the provider's worst-case reset hint (the SDK obeys
+					// retry-after verbatim, which would mean a silent multi-hour
+					// sleep) with the explicit bounded delay. The ORIGINAL body
+					// stream is passed through untouched -- only headers change.
+					headers.set("retry-after-ms", String(ANTHROPIC_FALLBACK_RETRY_DELAY_MS));
 					headers.delete("retry-after");
-					headers.delete("retry-after-ms");
-					return new Response(bodyText, {
+					return new Response(response.body, {
 						status: response.status,
 						statusText: response.statusText,
 						headers,
 					});
 				}
-				return response;
 			}
 
 			headers.set("x-should-retry", "false");

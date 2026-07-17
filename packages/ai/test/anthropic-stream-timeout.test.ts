@@ -206,40 +206,47 @@ describe("anthropic first-event timeout retries", () => {
 		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
 	});
 
-	it("keeps retrying unified-limit 429s that still advertise fallback capacity", async () => {
+	// Shared builder for unified-limit 429 mocks; header overrides let the
+	// adversarial cases below flip one dial at a time.
+	const unifiedRejection429 = (headerOverrides: Record<string, string | null> = {}, message?: string) => {
+		const headers: Record<string, string> = {
+			"content-type": "application/json",
+			"retry-after": "13262",
+			"anthropic-ratelimit-unified-status": "rejected",
+			"anthropic-ratelimit-unified-5h-status": "rejected",
+			"anthropic-ratelimit-unified-fallback-percentage": "0.5",
+			"anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+		};
+		for (const [name, value] of Object.entries(headerOverrides)) {
+			if (value === null) delete headers[name];
+			else headers[name] = value;
+		}
+		return new Response(
+			JSON.stringify({
+				type: "error",
+				error: {
+					type: "rate_limit_error",
+					message: message ?? "This request would exceed your account's rate limit. Please try again later.",
+				},
+			}),
+			{ status: 429, headers },
+		);
+	};
+
+	it("gives verified fallback-capacity rejections a bounded retry", async () => {
 		// Field incident (2026-07-16): unified-5h-status=rejected with
 		// fallback-percentage=0.5 and overage merely org-disabled. Requests
 		// succeeded again within minutes (the unified window is rolling and a
-		// fraction of requests keeps being accepted), but the exhaustion
-		// fast-path saw retry-after=13262s (> cap) plus the "request would
-		// exceed" body text and declared the session terminally exhausted
-		// after a single attempt. With fallback capacity advertised, the
-		// wrapper must strip the worst-case retry-after hint (the SDK obeys
-		// retry-after verbatim, so passthrough would sleep for hours) and let
-		// the SDK spend its bounded default backoff budget instead.
+		// fraction keeps being accepted), but the exhaustion fast-path saw
+		// retry-after=13262s (> cap) plus the "request would exceed" body and
+		// declared the session terminally exhausted after ONE attempt. The
+		// verified shape now gets a bounded retry with an explicit short
+		// delay (the SDK obeys retry-after verbatim, so the worst-case hint
+		// is overridden, never passed through).
 		let attempts = 0;
 		const fetchMock = (async () => {
 			attempts += 1;
-			return new Response(
-				JSON.stringify({
-					type: "error",
-					error: {
-						type: "rate_limit_error",
-						message: "This request would exceed your account's rate limit. Please try again later.",
-					},
-				}),
-				{
-					status: 429,
-					headers: {
-						"content-type": "application/json",
-						"retry-after": "13262",
-						"anthropic-ratelimit-unified-status": "rejected",
-						"anthropic-ratelimit-unified-5h-status": "rejected",
-						"anthropic-ratelimit-unified-fallback-percentage": "0.5",
-						"anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
-					},
-				},
-			);
+			return unifiedRejection429();
 		}) as FetchImpl;
 
 		const result = await streamAnthropic(model, context, {
@@ -248,13 +255,123 @@ describe("anthropic first-event timeout retries", () => {
 			requestMaxRetries: 1,
 		}).result();
 
-		// Bounded retry happened (initial + 1) instead of a single-shot
-		// terminal failure; the final error stays an honest 429.
+		// Bounded retry happened (initial + 1 = SDK budget) instead of a
+		// single-shot terminal failure; the final error stays an honest 429.
 		expect(attempts).toBe(2);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorStatus).toBe(429);
 		expect(result.errorMessage).toContain("rate_limit_error");
 	});
+
+	it("caps the fallback retry budget below the SDK retry budget", async () => {
+		// SDK budget 5 retries, wrapper budget ANTHROPIC_FALLBACK_MAX_RETRIES=2:
+		// exactly 3 attempts total, then the exhaustion fast-path (with the
+		// appended header evidence) stops the SDK -- never a six-request burst.
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			return unifiedRejection429();
+		}) as FetchImpl;
+
+		const result = await streamAnthropic(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			requestMaxRetries: 5,
+		}).result();
+
+		expect(attempts).toBe(3);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(429);
+		expect(result.errorMessage).toContain("anthropic-ratelimit-unified-fallback-percentage=0.5");
+	}, 15_000);
+
+	it("fails fast when the unified rejection shape is not fully proven", async () => {
+		// One dial off the verified shape at a time -- every variant must keep
+		// the original single-attempt fail-fast (a lone or malformed header
+		// must never loosen retry policy).
+		const variants: Array<Record<string, string | null>> = [
+			{ "anthropic-ratelimit-unified-fallback-percentage": "0.5junk" },
+			{ "anthropic-ratelimit-unified-fallback-percentage": "101" },
+			{ "anthropic-ratelimit-unified-fallback-percentage": "0" },
+			{ "anthropic-ratelimit-unified-fallback-percentage": "Infinity" },
+			{ "anthropic-ratelimit-unified-status": "allowed" },
+			{ "anthropic-ratelimit-unified-status": null },
+		];
+		for (const overrides of variants) {
+			let attempts = 0;
+			const fetchMock = (async () => {
+				attempts += 1;
+				return unifiedRejection429(overrides);
+			}) as FetchImpl;
+			const result = await streamAnthropic(model, context, {
+				apiKey: "test-key",
+				fetch: fetchMock,
+				requestMaxRetries: 3,
+			}).result();
+			expect(attempts).toBe(1);
+			expect(result.stopReason).toBe("error");
+			expect(result.errorStatus).toBe(429);
+		}
+	});
+
+	it("does not let fallback headers change unrelated 429 error classes", async () => {
+		// An arbitrary 429 (small retry-after, non-unified error class) with
+		// spoofed fallback headers passes through UNTOUCHED: the SDK's own
+		// default 429 handling applies, and the wrapper neither strips nor
+		// rewrites anything (cross-provider safety: the wrapper is installed
+		// for every Anthropic-compatible auth path).
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			return new Response(
+				JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }),
+				{
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						"retry-after": "1",
+						"anthropic-ratelimit-unified-status": "rejected",
+						"anthropic-ratelimit-unified-fallback-percentage": "0.5",
+					},
+				},
+			);
+		}) as FetchImpl;
+		const providerRetryWait = vi.fn(async () => {});
+		const result = await streamAnthropic(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			requestMaxRetries: 1,
+			providerRetryWait,
+		}).result();
+		// SDK default: 429 is retryable, honors the small retry-after as-is.
+		// (Provider-level transient retries may add attempts on top of the
+		// SDK's; the point is that the wrapper touched NOTHING -- no header
+		// stripping, no exhaustion stamp, so the error class survives.)
+		expect(attempts).toBeGreaterThanOrEqual(2);
+		expect(result.errorStatus).toBe(429);
+		expect(result.errorMessage).toContain("Overloaded");
+	});
+
+	it("aborting during the bounded fallback backoff stops further attempts", async () => {
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			return unifiedRejection429();
+		}) as FetchImpl;
+		const controller = new AbortController();
+		const pending = streamAnthropic(model, context, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			requestMaxRetries: 5,
+			signal: controller.signal,
+		}).result();
+		setTimeout(() => controller.abort(), 100);
+		const result = await pending;
+		// The abort lands during the first bounded backoff: no burst of
+		// further attempts (at most the one in-flight follow-up).
+		expect(attempts).toBeLessThanOrEqual(2);
+		expect(result.stopReason === "aborted" || result.stopReason === "error").toBe(true);
+	}, 15_000);
 
 	it("still fails fast when fallback is advertised but credits are out", async () => {
 		let attempts = 0;
