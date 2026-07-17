@@ -262,6 +262,7 @@ function taskNeedsNative(key: string): boolean {
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||
 		key === "deep-interview-runtime" ||
+		key === "bridge-client-sdk-package-smoke" ||
 		key.startsWith("test:")
 	);
 }

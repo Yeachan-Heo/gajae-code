@@ -723,6 +723,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
+		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
 	});
 
 	test("release evidence source changes select contract, dry-run, and focused evidence coverage once", () => {
@@ -836,6 +837,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
+		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 	});
