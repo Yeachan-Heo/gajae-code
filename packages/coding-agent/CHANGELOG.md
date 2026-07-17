@@ -36,6 +36,8 @@
 - Connected MCP server instructions now remain untrusted user-role data instead of entering the cached system prompt; hostile file paths, working directories, and workspace-tree metadata are structurally encoded, and volatile project context is removed from durable session history between requests.
 - Restored the strict G002 public-surface quarantine by removing the default README advertisement for the private coordinator MCP runtime.
 
+- Interactive transcript rebuilds now render the complete active-branch history: compaction no longer erases pre-summary user prompts and assistant turns from the chat display, while the provider context keeps using the compacted summary.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

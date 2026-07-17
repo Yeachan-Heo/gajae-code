@@ -5984,6 +5984,14 @@ export class AgentSession {
 		const context = deobfuscateSessionContext(this.sessionManager.buildSessionContext(), this.#obfuscator);
 		return { ...context, messages: this.#withoutEphemeralCustomMessages(context.messages) };
 	}
+	/**
+	 * Build the complete active-branch transcript for the interactive UI.
+	 * Provider context remains compacted through buildDisplaySessionContext().
+	 */
+	buildTranscriptSessionContext(): SessionContext {
+		const context = deobfuscateSessionContext(this.sessionManager.buildTranscriptContext(), this.#obfuscator);
+		return { ...context, messages: this.#withoutEphemeralCustomMessages(context.messages) };
+	}
 
 	/** Convert session messages using the same pre-LLM pipeline as the active session. */
 	async convertMessagesToLlm(messages: AgentMessage[], signal?: AbortSignal): Promise<Message[]> {

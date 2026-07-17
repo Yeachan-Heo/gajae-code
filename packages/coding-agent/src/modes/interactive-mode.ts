@@ -1230,7 +1230,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void {
 		prepareTranscriptRebuild(this.ui, policy);
 		this.chatContainer.clear();
-		const context = this.session.buildDisplaySessionContext();
+		const context = this.session.buildTranscriptSessionContext();
 		this.renderSessionContext(context);
 	}
 
