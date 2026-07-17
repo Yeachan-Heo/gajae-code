@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
+import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, Usage } from "@gajae-code/ai";
 import { BtwController } from "@gajae-code/coding-agent/modes/controllers/btw-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -29,6 +30,7 @@ function createAssistantMessage(text: string): AssistantMessage {
 
 interface RunEphemeralTurnArgs {
 	promptText: string;
+	contextMessages?: readonly AgentMessage[];
 	onTextDelta?: (delta: string) => void;
 	signal?: AbortSignal;
 }
@@ -157,5 +159,108 @@ describe("BtwController", () => {
 		await controller.start("Anything?");
 		expect(runEphemeralTurn).not.toHaveBeenCalled();
 		expect(ctx.showError).toHaveBeenCalled();
+	});
+	it("replays completed retained turns as raw user and returned assistant messages", async () => {
+		const firstAssistant = createAssistantMessage("First answer");
+		const runEphemeralTurn = vi
+			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
+			.mockResolvedValueOnce({ replyText: "First answer", assistantMessage: firstAssistant })
+			.mockResolvedValueOnce({ replyText: "Second answer", assistantMessage: createAssistantMessage("Second answer") });
+		const ctx = makeCtx(makeFakeSession(runEphemeralTurn));
+		const controller = new BtwController(ctx);
+
+		await controller.startRetained("  First question?  ");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(controller.hasOpenRetainedThread()).toBe(true);
+		expect(controller.isRetainedTurnInFlight()).toBe(false);
+		expect(await controller.submitRetainedFollowUp("Second question?")).toBe("accepted");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const secondCall = runEphemeralTurn.mock.calls[1]?.[0];
+		expect(secondCall?.promptText).toContain("<btw-r>");
+		expect(secondCall?.contextMessages).toHaveLength(2);
+		const firstContextMessage = secondCall?.contextMessages?.[0];
+		expect(firstContextMessage).toMatchObject({
+			role: "user",
+			content: [{ type: "text", text: "First question?" }],
+			attribution: "user",
+		});
+		expect(secondCall?.contextMessages?.[1]).toBe(firstAssistant);
+		expect(controller.isRetainedTurnInFlight()).toBe(false);
+	});
+
+	it("rejects retained follow-ups while a request is in flight", async () => {
+		const runEphemeralTurn = vi.fn(async () => new Promise<RunEphemeralTurnResult>(() => {}));
+		const ctx = makeCtx(makeFakeSession(runEphemeralTurn));
+		const controller = new BtwController(ctx);
+
+		await controller.startRetained("First?");
+		expect(await controller.submitRetainedFollowUp("Second?")).toBe("busy");
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+		expect(ctx.showStatus).toHaveBeenCalledWith(expect.stringContaining("still answering"));
+	});
+	it("blocks one-shot replacement and retained re-entry while a retained thread is open", async () => {
+		const runEphemeralTurn = vi.fn(async () => new Promise<RunEphemeralTurnResult>(() => {}));
+		const ctx = makeCtx(makeFakeSession(runEphemeralTurn));
+		const controller = new BtwController(ctx);
+
+		await controller.startRetained("First?");
+		await controller.start("One-shot?");
+		await controller.startRetained("Replacement?");
+
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+		expect(controller.hasOpenRetainedThread()).toBe(true);
+		expect(ctx.showStatus).toHaveBeenCalledTimes(2);
+	});
+
+	it("keeps retained complete and error panels open until Escape", async () => {
+		const runEphemeralTurn = vi
+			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
+			.mockResolvedValueOnce({ replyText: "Answer", assistantMessage: createAssistantMessage("Answer") })
+			.mockRejectedValueOnce(new Error("boom"));
+		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn)));
+
+		await controller.startRetained("First?");
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(controller.hasActiveRequest()).toBe(true);
+		expect(controller.isRetainedTurnInFlight()).toBe(false);
+
+		expect(await controller.submitRetainedFollowUp("Second?")).toBe("accepted");
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(controller.hasOpenRetainedThread()).toBe(true);
+		expect(controller.isRetainedTurnInFlight()).toBe(false);
+
+		expect(controller.handleEscape()).toBe(true);
+		expect(controller.hasOpenRetainedThread()).toBe(false);
+	});
+	it("lets /btw-r replace an open one-shot /btw panel", async () => {
+		const signals: AbortSignal[] = [];
+		const runEphemeralTurn = vi
+			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
+			.mockImplementationOnce(async args => {
+				signals.push(args.signal as AbortSignal);
+				return new Promise(() => {});
+			})
+			.mockImplementationOnce(async args => {
+				signals.push(args.signal as AbortSignal);
+				return { replyText: "retained", assistantMessage: createAssistantMessage("retained") };
+			});
+		const btwContainer = new Container();
+		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn), btwContainer));
+
+		await controller.start("One-shot?");
+		await controller.startRetained("Retained?");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(2);
+		expect(signals[0]?.aborted).toBe(true);
+		expect(controller.hasOpenRetainedThread()).toBe(true);
+		expect(btwContainer.children).toHaveLength(1);
 	});
 });

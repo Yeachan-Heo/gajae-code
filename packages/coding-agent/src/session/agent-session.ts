@@ -12997,15 +12997,19 @@ export class AgentSession {
 	 * does not block on, or interfere with, any in-flight main turn.  The
 	 * session's history and persisted state are NOT modified by this call.
 	 *
-	 * Used by `respondAsBackground` (IRC) and `BtwController` (`/btw`) to share
-	 * the snapshot + stream pipeline.  The snapshot includes any in-flight
-	 * streaming assistant text so the model sees the half-finished response
-	 * rather than missing context.
+	 * Used by `respondAsBackground` (IRC) and `BtwController` (`/btw`, `/btw-r`)
+	 * to share the snapshot + stream pipeline. Optional `contextMessages` are
+	 * caller-owned side-thread turns replayed after roster prepend and before
+	 * the current virtual prompt. The snapshot includes any in-flight streaming
+	 * assistant text so the model sees the half-finished response rather than
+	 * missing context.
 	 */
 	async runEphemeralTurn(args: {
 		promptText: string;
 		onTextDelta?: (delta: string) => void;
 		signal?: AbortSignal;
+		/** Completed caller-owned side-thread messages replayed before this turn's prompt. */
+		contextMessages?: readonly AgentMessage[];
 		/** Defer the successful roster-claim commit until the caller accepts its exchange. */
 		deferRosterCommit?: boolean;
 	}): Promise<{
@@ -13033,12 +13037,16 @@ export class AgentSession {
 			if (rosterClaim && !rosterMessage) {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
-			let snapshot = this.#buildEphemeralSnapshot(args.promptText, rosterMessage ? [rosterMessage] : undefined);
+			let snapshot = this.#buildEphemeralSnapshot(
+				args.promptText,
+				args.contextMessages,
+				rosterMessage ? [rosterMessage] : undefined,
+			);
 			let llmMessages = await this.convertMessagesToLlm(snapshot, args.signal);
 			if (rosterMessage && !this.#isCurrentIrcRosterClaim(rosterClaim!.token, rosterClaim!.epoch)) {
 				this.#releaseIrcRosterClaim(rosterClaim!.token, rosterClaim!.epoch);
 				// Conversion is asynchronous, so rebuild without a claim invalidated while it awaited.
-				snapshot = this.#buildEphemeralSnapshot(args.promptText);
+				snapshot = this.#buildEphemeralSnapshot(args.promptText, args.contextMessages);
 				llmMessages = await this.convertMessagesToLlm(snapshot, args.signal);
 			}
 			const context: Context = {
@@ -13120,7 +13128,11 @@ export class AgentSession {
 	 * the partial response in context, then appends the prompt as a virtual
 	 * user message.
 	 */
-	#buildEphemeralSnapshot(promptText: string, prependMessages?: AgentMessage[]): AgentMessage[] {
+	#buildEphemeralSnapshot(
+		promptText: string,
+		contextMessages?: readonly AgentMessage[],
+		prependMessages?: readonly AgentMessage[],
+	): AgentMessage[] {
 		const messages = [...this.messages];
 		const streaming = this.agent.state.streamMessage;
 		if (streaming && streaming.role === "assistant") {
@@ -13152,6 +13164,7 @@ export class AgentSession {
 			}
 		}
 		if (prependMessages) messages.push(...prependMessages);
+		if (contextMessages) messages.push(...contextMessages);
 		messages.push({
 			role: "user",
 			content: [{ type: "text", text: promptText }],

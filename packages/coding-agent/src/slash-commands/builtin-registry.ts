@@ -1468,6 +1468,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "btw-r",
+		description: "Start an ephemeral retained side chat using the current session context",
+		inlineHint: "<question>",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			const question = command.text.slice(`/${command.name}`.length).trim();
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleBtwRCommand(question);
+		},
+	},
+	{
 		name: "retry",
 		priority: 70,
 		description: "Retry or continue the last interrupted turn",

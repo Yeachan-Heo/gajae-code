@@ -4,14 +4,17 @@ import { executeBuiltinSlashCommand } from "@gajae-code/coding-agent/slash-comma
 
 function createRuntime() {
 	const handleBtwCommand = vi.fn(async () => {});
+	const handleBtwRCommand = vi.fn(async () => {});
 	const setText = vi.fn();
 	return {
 		handleBtwCommand,
+		handleBtwRCommand,
 		setText,
 		runtime: {
 			ctx: {
 				editor: { setText } as unknown as InteractiveModeContext["editor"],
 				handleBtwCommand,
+				handleBtwRCommand,
 			} as unknown as InteractiveModeContext,
 			handleBackgroundCommand: () => {},
 		},
@@ -39,5 +42,14 @@ describe("/btw slash command", () => {
 
 		expect(handled).toBe(true);
 		expect(harness.handleBtwCommand).toHaveBeenCalledWith("explain why the cache reuse matters here");
+	});
+	it("registers /btw-r and preserves its full question suffix", async () => {
+		const harness = createRuntime();
+
+		const handled = await executeBuiltinSlashCommand("/btw-r explain this in more detail", harness.runtime);
+
+		expect(handled).toBe(true);
+		expect(harness.setText).toHaveBeenCalledWith("");
+		expect(harness.handleBtwRCommand).toHaveBeenCalledWith("explain this in more detail");
 	});
 });
