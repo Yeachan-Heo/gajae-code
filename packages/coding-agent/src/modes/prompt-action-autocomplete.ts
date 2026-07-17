@@ -44,6 +44,11 @@ interface PromptActionAutocompleteOptions {
 	moveCursorToMessageStart: () => void;
 	moveCursorToLineStart: () => void;
 	moveCursorToLineEnd: () => void;
+	/**
+	 * Ghost-text next-prompt prediction shown in the empty composer as a dim
+	 * inline hint (Tab accepts it via the editor's onTab handler).
+	 */
+	getPromptSuggestion?: () => string | null;
 }
 
 function fuzzyMatch(query: string, target: string): boolean {
@@ -186,11 +191,18 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	#baseProvider: CombinedAutocompleteProvider;
 	#actions: PromptActionDefinition[];
 	#commands: SlashCommand[];
+	#getPromptSuggestion: (() => string | null) | undefined;
 
-	constructor(commands: SlashCommand[], basePath: string, actions: PromptActionDefinition[]) {
+	constructor(
+		commands: SlashCommand[],
+		basePath: string,
+		actions: PromptActionDefinition[],
+		getPromptSuggestion?: () => string | null,
+	) {
 		this.#baseProvider = new CombinedAutocompleteProvider(commands, basePath);
 		this.#actions = actions;
 		this.#commands = commands;
+		this.#getPromptSuggestion = getPromptSuggestion;
 	}
 
 	async getSuggestions(
@@ -302,6 +314,11 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	}
 
 	getInlineHint(lines: string[], cursorLine: number, cursorCol: number): string | null {
+		// An empty composer renders the pending prompt suggestion as ghost text.
+		if (lines.every(line => line === "")) {
+			const suggestion = this.#getPromptSuggestion?.();
+			if (suggestion) return suggestion;
+		}
 		return this.#baseProvider.getInlineHint?.(lines, cursorLine, cursorCol) ?? null;
 	}
 	trySyncSlashCompletion(textBeforeCursor: string): { items: AutocompleteItem[]; prefix: string } | null {
@@ -456,5 +473,10 @@ export function createPromptActionAutocompleteProvider(
 		},
 	];
 
-	return new PromptActionAutocompleteProvider(options.commands, options.basePath, actions);
+	return new PromptActionAutocompleteProvider(
+		options.commands,
+		options.basePath,
+		actions,
+		options.getPromptSuggestion,
+	);
 }

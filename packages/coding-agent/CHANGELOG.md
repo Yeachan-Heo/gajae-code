@@ -34,6 +34,9 @@
 ### Fixed
 - Connected MCP server instructions now remain untrusted user-role data instead of entering the cached system prompt; hostile file paths, working directories, and workspace-tree metadata are structurally encoded, and volatile project context is removed from durable session history between requests.
 - Restored the strict G002 public-surface quarantine by removing the default README advertisement for the private coordinator MCP runtime.
+### Added
+
+- Added opt-in prompt suggestions (Claude Code-style ghost-text autocomplete): with the `promptSuggestions` setting enabled, a smol-model prediction of your likely next prompt renders as dim ghost text in the empty composer after each agent turn; Tab accepts it, typing dismisses it, and a new turn clears it. Predictions are heuristically gated (silence on evaluative/meta/agent-voice/overlong output) and never generated while the composer has text or a turn is streaming.
 
 ## [0.11.1] - 2026-07-16
 
