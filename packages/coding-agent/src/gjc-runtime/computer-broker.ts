@@ -869,6 +869,11 @@ function pathIdentity(target: string): { dev: number; ino: number } | null {
 	}
 }
 
+function abandonServerAfterListenFailure(server: net.Server, closeServerForTests: boolean): void {
+	if (closeServerForTests) server.close();
+	else server.unref();
+}
+
 function samePathIdentity(
 	expected: { dev: number; ino: number },
 	actual: { dev: number; ino: number } | null,
@@ -933,6 +938,7 @@ export const computerBrokerTestSeams = {
 	captureRuntimePathIdentity,
 	removeRuntimeDirectory,
 	processIdentity,
+	abandonServerAfterListenFailure,
 };
 
 export interface RunComputerBrokerServerOptions {
@@ -951,6 +957,9 @@ export async function runComputerBrokerServerFromEnvironment(
 	secureRuntimeDirectory(config, false);
 	const controller = options.controller ?? createNativeComputerController();
 	const closeServerForTests = options.closeServerForTests ?? options.controller !== undefined;
+	const initialDirectoryIdentity = pathIdentity(config.directory);
+	if (!initialDirectoryIdentity)
+		throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker runtime path was unavailable.");
 	let lease: net.Socket | undefined;
 	let actionTail = Promise.resolve();
 	const clients = new Set<net.Socket>();
@@ -1114,12 +1123,12 @@ export async function runComputerBrokerServerFromEnvironment(
 			fs.chmodSync(config.socket, 0o600);
 			const directory = pathIdentity(config.directory);
 			const socket = pathIdentity(config.socket);
-			if (!directory || !socket)
+			if (!samePathIdentity(initialDirectoryIdentity, directory) || !socket)
 				throw new BrokerError("COMPUTER_BROKER_CLEANUP_FAILED", "Computer broker runtime path was unavailable.");
-			runtimeIdentity = { directory, socket };
+			runtimeIdentity = { directory: initialDirectoryIdentity, socket };
 			listening.resolve();
 		} catch (error) {
-			server.close();
+			abandonServerAfterListenFailure(server, closeServerForTests);
 			listening.reject(error);
 		}
 	});

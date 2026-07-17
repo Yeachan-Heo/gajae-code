@@ -218,6 +218,22 @@ describe("computer broker", () => {
 		);
 	});
 
+	it("never pathname-closes a production broker after post-listen failure", () => {
+		const calls: string[] = [];
+		let server: net.Server;
+		server = {
+			close: () => {
+				calls.push("close");
+				return server;
+			},
+			unref: () => {
+				calls.push("unref");
+				return server;
+			},
+		} as net.Server;
+		computerBrokerTestSeams.abandonServerAfterListenFailure(server, false);
+		expect(calls).toEqual(["unref"]);
+	});
 	it("refuses source-mode managed tmux ownership", () => {
 		expect(startComputerBrokerForTmux({ env: {}, isCompiledBinary: () => false })).toBeNull();
 	});
