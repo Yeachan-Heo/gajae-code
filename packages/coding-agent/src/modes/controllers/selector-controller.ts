@@ -1177,6 +1177,7 @@ export class SelectorController {
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
 						},
+						onUpdate: () => this.ctx.ui.requestRender(),
 					},
 					notificationsOperations,
 				);

@@ -134,6 +134,7 @@ export interface NotificationsEditorOperations {
 
 export interface NotificationsSettingsEditorCallbacks {
 	onCancel?: () => void;
+	onUpdate?: () => void;
 }
 
 type EditorMode =
@@ -280,6 +281,10 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 	/** Current state is exposed for selector lifecycle coordination and focused tests. */
 	get mode(): EditorMode {
 		return this.#mode;
+	}
+
+	#requestUpdate(): void {
+		this.callbacks.onUpdate?.();
 	}
 
 	invalidate(): void {
@@ -610,6 +615,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#status = "ERROR — Cancellable notification operation failed safely; retry when ready.";
 			} finally {
 				if (this.#cancellableWork === pending) this.#cancellableWork = undefined;
+				this.#requestUpdate();
 			}
 		})();
 		this.#cancellableWork = pending;
@@ -652,6 +658,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				}
 			} finally {
 				if (!this.#disposed) this.#guarded = false;
+				this.#requestUpdate();
 			}
 		})();
 	}
@@ -1384,9 +1391,11 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			if (this.#disposed || sequence !== this.#loadSequence) return;
 			this.#state = state;
 			if (state.health) this.#status = `${statusLabel(state.health.overall)} — ${this.#healthSummary(state.health)}`;
+			this.#requestUpdate();
 		} catch {
 			if (this.#disposed || sequence !== this.#loadSequence) return;
 			this.#status = "WARNING — Notification status is temporarily unavailable; refresh health to retry.";
+			this.#requestUpdate();
 		}
 	}
 }

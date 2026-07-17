@@ -90,6 +90,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 	healthGate: Deferred<NotificationHealthReport> | undefined;
 	recoverFailure = false;
 	testGate: Deferred<{ ok: boolean; adapter: "telegram"; chatId: string | undefined; detail: string }> | undefined;
+	commitPreferencesGate: Deferred<{ message: string }> | undefined;
 	preflightSignal: AbortSignal | undefined;
 	healthSignal: AbortSignal | undefined;
 	removedTelegram = false;
@@ -204,6 +205,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 	}
 
 	async commitPreferences(preferences: NotificationsEditorPreferences) {
+		if (this.commitPreferencesGate) await this.commitPreferencesGate.promise;
 		this.committedPreferences.push({ ...preferences });
 		this.state.preferences = { ...preferences };
 		this.state.status.redact = preferences.redact;
@@ -308,6 +310,28 @@ describe("NotificationsSettingsEditorComponent", () => {
 				streamingEnabled: false,
 			},
 		]);
+	});
+
+	it("requests a render when guarded preference save completes asynchronously", async () => {
+		const operations = new FakeNotificationsOperations();
+		operations.commitPreferencesGate = deferred();
+		let updates = 0;
+		const component = new NotificationsSettingsEditorComponent(operations, { onUpdate: () => (updates += 1) });
+		await flush();
+
+		select(component, 10);
+		component.handleInput("\n");
+		component.handleInput("\n");
+		select(component, 6);
+		component.handleInput("\n");
+
+		expect(render(component)).toContain("PENDING");
+		const beforeComplete = updates;
+		operations.commitPreferencesGate.resolve({ message: "Preferences saved." });
+		await flush();
+
+		expect(updates).toBeGreaterThan(beforeComplete);
+		expect(render(component)).toContain("OK");
 	});
 
 	it("guides pairing discovery without a chat ID and accurately labels supplied-chat validation", async () => {
