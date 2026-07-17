@@ -2224,10 +2224,27 @@ export class AgentSession {
 	async buildForkContextSeed(options: ForkContextSeedOptions): Promise<ForkContextSeed> {
 		const normalizeCap = (value: number, maximum: number): number => {
 			if (!Number.isFinite(value)) return 1;
-			return Math.min(maximum, Math.max(1, Math.trunc(value)));
+			return Math.min(maximum, Math.max(0, Math.trunc(value)));
 		};
 		const maxMessages = normalizeCap(options.maxMessages, 500);
 		const maxTokens = normalizeCap(options.maxTokens, Number.MAX_SAFE_INTEGER);
+		if (maxMessages <= 0 || maxTokens <= 0) {
+			return {
+				messages: [],
+				agentMessages: [],
+				metadata: {
+					sourceSessionId: this.sessionId,
+					parentMessageCount: this.messages.length,
+					includedMessages: 0,
+					skippedMessages: 0,
+					approximateTokens: 0,
+					maxMessages,
+					maxTokens,
+					skippedReasons: {},
+				},
+				cacheIdentity: options.cacheIdentity ?? this.sessionId,
+			};
+		}
 		const transformedMessages = await this.#transformContext([...this.messages], options.signal);
 		const convertedMessages = await this.#convertToLlm(transformedMessages);
 		const providerMessages = this.model
@@ -2377,7 +2394,11 @@ export class AgentSession {
 					continue;
 				}
 				const messageTokens = estimateMessageTokensHeuristic(sanitized);
-				if (tokenBudgetExhausted || approximateTokens + messageTokens > maxTokens) {
+				if (tokenBudgetExhausted) {
+					skippedMessages++;
+					continue;
+				}
+				if (approximateTokens + messageTokens > maxTokens) {
 					if (selected.length === 0) {
 						const truncated = truncateMessageToTokenBudget(sanitized);
 						if (truncated.tokens <= maxTokens) {
