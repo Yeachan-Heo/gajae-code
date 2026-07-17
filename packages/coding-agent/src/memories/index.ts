@@ -249,6 +249,7 @@ async function runPhase1(options: {
 
 		const claims = claimStage1Jobs(db, {
 			nowSec,
+			cwd: session.sessionManager.getCwd(),
 			threadScanLimit: config.threadScanLimit,
 			maxRolloutsPerStartup: config.maxRolloutsPerStartup,
 			maxRolloutAgeDays: config.maxRolloutAgeDays,
