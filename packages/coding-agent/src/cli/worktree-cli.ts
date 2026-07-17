@@ -16,25 +16,12 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getWorktreesDir, isEnoent } from "@gajae-code/utils";
+import { getWorktreesDir } from "@gajae-code/utils/dirs";
 import chalk from "chalk";
 import * as git from "../utils/git";
+import { scanWorktrees, type WorktreeEntry } from "./worktree-scanner";
 
-type WorktreeKind = "pr-checkout" | "task-isolation" | "empty" | "stray";
-
-export interface WorktreeEntry {
-	/** Absolute path to the worktree dir (or stray container) under `~/.gjc/wt/`. */
-	path: string;
-	/** Classification of what we found on disk. */
-	kind: WorktreeKind;
-	/** Parent repo root, when this is a registered git worktree. */
-	parentRepo?: string;
-	/** Branch name extracted from the parent's tracking file, when available. */
-	branch?: string;
-	/** When set, the entry is unhealthy and `gjc worktree clear` will remove it. */
-	orphanReason?: string;
-}
-
+export type { WorktreeEntry } from "./worktree-scanner";
 export interface ListWorktreesOptions {
 	json: boolean;
 }
@@ -146,131 +133,6 @@ export async function clearWorktrees(options: ClearWorktreesOptions): Promise<vo
 	}
 	console.log(chalk.dim(`\n${succeeded} removed${failed > 0 ? ` · ${chalk.red(`${failed} failed`)}` : ""}`));
 	if (failed > 0) process.exitCode = 1;
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Scanner
-// ───────────────────────────────────────────────────────────────────────────
-
-async function scanWorktrees(): Promise<WorktreeEntry[]> {
-	const root = getWorktreesDir();
-	let topLevel: string[];
-	try {
-		topLevel = await fs.readdir(root);
-	} catch (err) {
-		if (isEnoent(err)) return [];
-		throw err;
-	}
-
-	const entries: WorktreeEntry[] = [];
-	for (const name of topLevel) {
-		const dir = path.join(root, name);
-		const stat = await fs.stat(dir).catch(() => null);
-		if (!stat?.isDirectory()) continue;
-
-		const direct = await classifyDir(dir);
-		if (direct) {
-			entries.push(direct);
-			continue;
-		}
-
-		// Legacy nesting: ~/.gjc/wt/<encoded-project>/<branch-or-id>
-		let children: string[];
-		try {
-			children = await fs.readdir(dir);
-		} catch {
-			continue;
-		}
-		let nested = 0;
-		for (const child of children) {
-			const childDir = path.join(dir, child);
-			const childStat = await fs.stat(childDir).catch(() => null);
-			if (!childStat?.isDirectory()) continue;
-			const childClassified = await classifyDir(childDir);
-			if (childClassified) {
-				entries.push(childClassified);
-				nested += 1;
-			}
-		}
-		if (nested === 0) {
-			entries.push({
-				path: dir,
-				kind: children.length === 0 ? "empty" : "stray",
-				orphanReason: children.length === 0 ? "empty directory" : "no recognizable worktree contents",
-			});
-		}
-	}
-	return entries;
-}
-
-async function classifyDir(dir: string): Promise<WorktreeEntry | null> {
-	const gitEntry = path.join(dir, ".git");
-	const gitStat = await fs.stat(gitEntry).catch(() => null);
-	if (gitStat?.isFile()) {
-		return classifyPrCheckout(dir, gitEntry);
-	}
-	const mergedStat = await fs.stat(path.join(dir, "merged")).catch(() => null);
-	if (mergedStat?.isDirectory()) {
-		return {
-			path: dir,
-			kind: "task-isolation",
-			orphanReason: "task-isolation leftover (no live task owns it)",
-		};
-	}
-	return null;
-}
-
-async function classifyPrCheckout(dir: string, gitEntry: string): Promise<WorktreeEntry> {
-	let contents: string;
-	try {
-		contents = await fs.readFile(gitEntry, "utf8");
-	} catch (err) {
-		return {
-			path: dir,
-			kind: "pr-checkout",
-			orphanReason: `cannot read .git file: ${err instanceof Error ? err.message : String(err)}`,
-		};
-	}
-	const match = /^gitdir:\s*(.+?)\s*$/m.exec(contents);
-	const parentGitDir = match?.[1];
-	if (!parentGitDir) {
-		return { path: dir, kind: "pr-checkout", orphanReason: "malformed .git file (no gitdir line)" };
-	}
-	// parentGitDir is `<parent-repo>/.git/worktrees/<name>`; back out the repo root.
-	const parentRepo = path.dirname(path.dirname(path.dirname(parentGitDir)));
-	const branch = await readWorktreeBranch(path.join(parentGitDir, "HEAD"));
-
-	const parentDirStat = await fs.stat(parentGitDir).catch(() => null);
-	if (!parentDirStat?.isDirectory()) {
-		return {
-			path: dir,
-			kind: "pr-checkout",
-			parentRepo,
-			branch,
-			orphanReason: "parent repo no longer tracks this worktree",
-		};
-	}
-	const parentRepoStat = await fs.stat(parentRepo).catch(() => null);
-	if (!parentRepoStat?.isDirectory()) {
-		return {
-			path: dir,
-			kind: "pr-checkout",
-			parentRepo,
-			branch,
-			orphanReason: "parent repo missing",
-		};
-	}
-	return { path: dir, kind: "pr-checkout", parentRepo, branch };
-}
-
-async function readWorktreeBranch(headFile: string): Promise<string | undefined> {
-	try {
-		const head = (await fs.readFile(headFile, "utf8")).trim();
-		const refMatch = /^ref:\s*refs\/heads\/(.+)$/.exec(head);
-		return refMatch?.[1];
-	} catch {
-		return undefined;
-	}
 }
 
 function formatEntryDetail(entry: WorktreeEntry): string {
