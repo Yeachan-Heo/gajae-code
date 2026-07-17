@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+
+### Fixed
+- Workflow state receipts now stamp the real `.gjc/_session-*/state/...` paths instead of the legacy `.gjc/state/sessions/...` layout, so doctor/operator tooling follows paths that actually exist.
+
 ### Fixed
 - Palette slash commands now run only from an empty composer; drafts are never touched.
 - Aborting a session without an enabled active goal no longer suppresses the first reminder when a goal is activated later; active-goal abort suppression is one-shot, goal-owned, and clears across inactive or replacement-goal transitions (#2436).

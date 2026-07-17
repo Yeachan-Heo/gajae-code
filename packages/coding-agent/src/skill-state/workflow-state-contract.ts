@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { activeSnapshotPath, modeStatePath } from "../gjc-runtime/session-layout";
 import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill, SKILL_ACTIVE_STATE_FILE } from "./active-state";
 import { WORKFLOW_STATE_RECEIPT_FRESH_MS, WORKFLOW_STATE_RECEIPT_VERSION } from "./workflow-state-version";
 
@@ -55,9 +56,6 @@ function safeString(value: unknown): string {
 	return typeof value === "string" ? value : "";
 }
 
-function encodePathSegment(value: string): string {
-	return encodeURIComponent(value).replaceAll(".", "%2E");
-}
 
 export function workflowModeStateFileName(skill: CanonicalGjcWorkflowSkill): string {
 	return `${skill}-state.json`;
@@ -66,14 +64,8 @@ export function workflowModeStateFileName(skill: CanonicalGjcWorkflowSkill): str
 export function workflowStateStoragePath(cwd: string, skill: CanonicalGjcWorkflowSkill, sessionId?: string): string {
 	const normalizedSessionId = safeString(sessionId).trim();
 	if (normalizedSessionId) {
-		return path.join(
-			cwd,
-			".gjc",
-			"state",
-			"sessions",
-			encodePathSegment(normalizedSessionId),
-			workflowModeStateFileName(skill),
-		);
+		// Canonical session layout is `.gjc/_session-{id}/state/<skill>-state.json`.
+		return modeStatePath(cwd, normalizedSessionId, skill);
 	}
 	return path.join(cwd, ".gjc", "state", workflowModeStateFileName(skill));
 }
@@ -81,14 +73,8 @@ export function workflowStateStoragePath(cwd: string, skill: CanonicalGjcWorkflo
 export function workflowActiveStatePath(cwd: string, sessionId?: string): string {
 	const normalizedSessionId = safeString(sessionId).trim();
 	if (normalizedSessionId) {
-		return path.join(
-			cwd,
-			".gjc",
-			"state",
-			"sessions",
-			encodePathSegment(normalizedSessionId),
-			SKILL_ACTIVE_STATE_FILE,
-		);
+		// Canonical HUD snapshot is `.gjc/_session-{id}/state/skill-active-state.json`.
+		return activeSnapshotPath(cwd, normalizedSessionId);
 	}
 	return path.join(cwd, ".gjc", "state", SKILL_ACTIVE_STATE_FILE);
 }
