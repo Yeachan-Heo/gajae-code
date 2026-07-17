@@ -40,6 +40,7 @@ pub mod keys;
 pub mod linediff;
 pub mod sdk;
 pub mod sixel;
+pub mod speech;
 pub use pi_ast::language;
 
 pub mod power;
