@@ -220,6 +220,7 @@ function createContext(): {
 		toggleTodoExpansion: vi.fn(),
 		handleHotkeysCommand: vi.fn(),
 		handleSTTToggle: vi.fn(),
+		handleSTTEscape: vi.fn(() => false),
 		handleBtwEscape,
 		handleBtwCommand,
 		hasActiveBtw,

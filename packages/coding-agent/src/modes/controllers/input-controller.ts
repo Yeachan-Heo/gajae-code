@@ -270,6 +270,12 @@ export class InputController {
 				this.#resetEscapeGestures();
 				return;
 			}
+			// An active voice session owns Esc: cancel listening/transcribing
+			// without aborting agent work or clearing the editor.
+			if (this.ctx.handleSTTEscape()) {
+				this.#resetEscapeGestures();
+				return;
+			}
 			if (this.#steerConsumePending) {
 				this.#resetEscapeGestures();
 				if (this.ctx.session.hasQueuedSteering) {

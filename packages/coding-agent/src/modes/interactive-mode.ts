@@ -76,7 +76,7 @@ import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions } from "../session/session-manager";
 import { formatDuration } from "../slash-commands/helpers/format";
-import { STTController, type SttState } from "../stt";
+import { pushLevel, renderLevelSparkline, STTController, type SttState } from "../stt";
 import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
@@ -444,6 +444,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#sttController: STTController | undefined;
 	#voiceAnimationInterval: NodeJS.Timeout | undefined;
 	#voiceHue = 0;
+	#voiceLevels: number[] = [];
 	#voicePreviousShowHardwareCursor: boolean | null = null;
 	#voicePreviousUseTerminalCursor: boolean | null = null;
 	#resizeHandler?: () => void;
@@ -2726,26 +2727,59 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.#sttController) {
 			this.#sttController = new STTController();
 		}
-		await this.#sttController.toggle(this.editor, {
+		await this.#sttController.toggle(this.editor, this.#sttToggleOptions());
+	}
+
+	/**
+	 * Cancel an active voice session (Esc while listening/transcribing).
+	 * Returns true when the key press was consumed.
+	 */
+	handleSTTEscape(): boolean {
+		if (!this.#sttController || this.#sttController.state === "idle") return false;
+		return this.#sttController.cancel(this.#sttToggleOptions());
+	}
+
+	#sttToggleOptions() {
+		return {
 			showWarning: (msg: string) => this.showWarning(msg),
 			showStatus: (msg: string) => this.showStatus(msg),
+			cwd: this.sessionManager.getCwd(),
+			onPartial: (text: string | null) => {
+				this.editor.inlineOverlayHint = text ?? undefined;
+				this.ui.requestRender();
+			},
+			onLevel: (level: number) => {
+				pushLevel(this.#voiceLevels, level);
+				this.#renderVoiceStatus();
+			},
 			onStateChange: (state: SttState) => {
 				if (state === "recording") {
 					this.#voicePreviousShowHardwareCursor = this.ui.getShowHardwareCursor();
 					this.#voicePreviousUseTerminalCursor = this.editor.getUseTerminalCursor();
 					this.ui.setShowHardwareCursor(false);
 					this.editor.setUseTerminalCursor(false);
+					this.#voiceLevels.length = 0;
+					this.#renderVoiceStatus();
 					this.#startMicAnimation();
 				} else if (state === "transcribing") {
 					this.#stopMicAnimation();
 					this.#setMicCursor({ r: 200, g: 200, b: 200 });
+					this.showStatus("Transcribing…");
 				} else {
 					this.#cleanupMicAnimation();
+					this.editor.inlineOverlayHint = undefined;
 				}
 				this.updateEditorChrome();
 				this.ui.requestRender();
 			},
-		});
+		};
+	}
+
+	#renderVoiceStatus(): void {
+		const language = (settings.get("stt.language") as string | undefined) ?? "";
+		const languageLabel = language && language !== "auto" ? ` (${language})` : "";
+		const meter = renderLevelSparkline(this.#voiceLevels);
+		this.showStatus(`${theme.icon.mic} listening${languageLabel} ${meter}  alt+h done · esc cancel`);
 	}
 
 	#setMicCursor(color: { r: number; g: number; b: number }): void {
