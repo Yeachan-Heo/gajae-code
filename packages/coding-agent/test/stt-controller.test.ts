@@ -229,3 +229,19 @@ describe("silence auto-stop endpointing", () => {
 		controller.cancel(options);
 	});
 });
+
+describe("sequential sessions append", () => {
+	test("second session's transcript never replaces the first insert", async () => {
+		script.finalText = "first sentence";
+		const controller = new STTController();
+		const { inserted, editor, options } = harness();
+		await controller.toggle(editor, options);
+		await controller.toggle(editor, options); // finalize #1
+
+		script.finalText = "second sentence";
+		await controller.toggle(editor, options);
+		await controller.toggle(editor, options); // finalize #2
+
+		expect(inserted).toEqual(["first sentence", "second sentence"]);
+	});
+});

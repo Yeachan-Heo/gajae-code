@@ -2812,12 +2812,24 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * when the key press was consumed.
 	 */
 	handleSTTSubmit(typedText: string): boolean {
-		if (this.#sttController?.state !== "recording") return false;
 		const controller = this.#sttController;
+		if (!controller || controller.state === "idle") return false;
 		void (async () => {
-			// Finalize through the normal toggle path — transcript lands in the
-			// (already reset) composer via insertText.
-			await controller.toggle(this.editor, this.#sttToggleOptions());
+			if (controller.state === "recording") {
+				// Finalize through the normal toggle path — transcript lands in the
+				// (already reset) composer via insertText.
+				await controller.toggle(this.editor, this.#sttToggleOptions());
+			} else {
+				// Finalization already in flight (silence auto-stop or a prior
+				// toggle). Racing the normal submit here would send the composer's
+				// existing text away and let the incoming transcript land in an
+				// empty composer — the "my earlier text got overwritten" bug.
+				// Wait for the transcript to land, then submit everything at once.
+				const deadline = Date.now() + 20_000;
+				while (controller.state !== "idle" && Date.now() < deadline) {
+					await new Promise(resolve => setTimeout(resolve, 50));
+				}
+			}
 			const transcript = this.editor.getText().trim();
 			const combined = [typedText.trim(), transcript].filter(Boolean).join(" ");
 			this.editor.setText("");
