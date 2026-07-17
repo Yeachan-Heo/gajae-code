@@ -497,6 +497,12 @@ mod platform {
 		}
 	}
 
+	#[cfg(target_os = "netbsd")]
+	fn stat_mtime_ns(stat: &libc::stat) -> i128 {
+		i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtimensec)
+	}
+
+	#[cfg(not(target_os = "netbsd"))]
 	fn stat_mtime_ns(stat: &libc::stat) -> i128 {
 		i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtime_nsec)
 	}
