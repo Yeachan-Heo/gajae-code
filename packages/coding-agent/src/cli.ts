@@ -8,6 +8,11 @@ import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
+import {
+	gate0InternalErrorResult,
+	runComputerBrokerGate0,
+	runComputerBrokerGate0FromEnvironment,
+} from "./gjc-runtime/computer-broker-gate0";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -297,8 +302,14 @@ export function routeRootArgv(argv: readonly string[]): string[] {
 			: ["launch", ...normalizedArgv];
 }
 
+export interface RunCliDependencies {
+	reexecWithScrubbedMallocEnv?: () => Promise<number | null>;
+	runGate0FromEnvironment?: typeof runComputerBrokerGate0FromEnvironment;
+	writeGate0Output?: (value: string) => void;
+}
+
 /** Run the CLI with the given argv (no `process.argv` prefix). */
-export async function runCli(argv: string[]): Promise<void> {
+export async function runCli(argv: string[], dependencies: RunCliDependencies = {}): Promise<void> {
 	// macOS malloc-env launch boundary. Re-exec once with a scrubbed environment
 	// BEFORE any fast path or subprocess spawn, so the startup env snapshot Bun hands
 	// to every child lane (Bun.spawn defaults, node:child_process, native PTY, tmux
@@ -312,13 +323,32 @@ export async function runCli(argv: string[]): Promise<void> {
 		process.env.GJC_MALLOC_ENV_REEXEC === undefined &&
 		(process.env.MallocStackLogging !== undefined || process.env.MallocStackLoggingNoCompact !== undefined)
 	) {
-		const { reexecWithScrubbedMallocEnv } = await import("./cli/malloc-env-guard");
+		const reexecWithScrubbedMallocEnv =
+			dependencies.reexecWithScrubbedMallocEnv ??
+			(await import("./cli/malloc-env-guard")).reexecWithScrubbedMallocEnv;
 		const code = await reexecWithScrubbedMallocEnv();
 		if (code !== null) {
 			process.exitCode = code;
 			return;
 		}
-		// Re-exec could not be spawned; fall through and run in this process.
+		if (argv[0] === "--internal-computer-gate0") {
+			(dependencies.writeGate0Output ?? (value => process.stdout.write(value)))(
+				`${JSON.stringify(gate0InternalErrorResult())}\n`,
+			);
+			process.exitCode = 1;
+			return;
+		}
+	}
+	if (argv[0] === "--internal-computer-gate0") {
+		if (argv.length !== 1) {
+			(dependencies.writeGate0Output ?? (value => process.stdout.write(value)))(
+				`${JSON.stringify(await runComputerBrokerGate0(undefined))}\n`,
+			);
+			process.exitCode = 1;
+			return;
+		}
+		await (dependencies.runGate0FromEnvironment ?? runComputerBrokerGate0FromEnvironment)();
+		return;
 	}
 	if (isTmuxOwnerIsolationCliArgv(argv)) {
 		await runTmuxOwnerIsolationCliFromStdin();

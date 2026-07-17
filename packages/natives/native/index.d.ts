@@ -3,6 +3,24 @@
 export declare class ComputerController {
   constructor()
   screenshot(): ComputerScreenshot
+  /**
+   * Return the non-prompting combined Accessibility + PostEvent TCC state for
+   * the hidden Gate-0 experiment.
+   */
+  gate0PermissionStatus(): Gate0PermissionStatus
+  /**
+   * Explicitly request Screen Recording access for the hidden Gate-0
+   * experiment. Normal controller initialization and screenshot paths never
+   * call this.
+   */
+  gate0RequestScreenRecording(): boolean
+  /**
+   * Run the hidden Gate-0 probe without returning screenshot bytes or cursor
+   * coordinates. The pointer path moves exactly one logical pixel and
+   * restores the original location without clicking, typing, or holding
+   * input state.
+   */
+  gate0HarmlessProbe(): Gate0HarmlessProbeResult
   click(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void
   doubleClick(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void
   move(expectedEpoch: number | undefined | null, x: number, y: number): void
@@ -793,6 +811,27 @@ export interface FuzzyFindResult {
   matches: Array<FuzzyFindMatch>
   /** Total number of matches found (may exceed `matches.len()`). */
   totalMatches: number
+}
+
+/**
+ * Redacted Gate-0 harmless-probe outcome. No desktop data or coordinates are
+ * returned.
+ */
+export interface Gate0HarmlessProbeResult {
+  /** Whether a screenshot could be captured and immediately discarded. */
+  screenshot: boolean
+  /** Whether Accessibility was granted when the probe ran. */
+  accessibility: boolean
+  /** Whether the cursor moved one logical pixel and was restored. */
+  pointerMoveRestore: boolean
+}
+
+/** Redacted Gate-0 TCC status. This contains grant state only. */
+export interface Gate0PermissionStatus {
+  /** Whether Accessibility input injection is granted. */
+  accessibility: boolean
+  /** Whether Screen Recording capture is granted. */
+  screenRecording: boolean
 }
 
 /** Get list of supported languages. */

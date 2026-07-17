@@ -4,8 +4,9 @@
 //! Two distinct TCC permissions gate the computer tool:
 //! - **Screen Recording** — required for `screenshot` capture (see
 //!   [`super::capture`]).
-//! - **Accessibility** — required for input injection (click/type/etc.). This
-//!   is a *separate* grant from Screen Recording.
+//! - **Accessibility** and **PostEvent** — together required by Gate-0 to
+//!   establish synthetic input authority; this is separate from Screen
+//!   Recording.
 //!
 //! This module performs non-prompting preflight checks and can open the correct
 //! System Settings pane so the user can grant a missing permission, then retry.
@@ -27,6 +28,12 @@ unsafe extern "C" {
 	/// Returns whether the current process already has Screen Recording access,
 	/// without prompting.
 	fn CGPreflightScreenCaptureAccess() -> bool;
+	/// Returns whether the current process can post synthetic input events,
+	/// without prompting. Available on macOS 10.15 and later.
+	fn CGPreflightPostEventAccess() -> bool;
+	/// Requests Screen Recording access for the current process. This may prompt
+	/// the user and must only be called by an explicit, hidden experiment.
+	fn CGRequestScreenCaptureAccess() -> bool;
 }
 
 /// A TCC permission the computer tool depends on.
@@ -95,12 +102,46 @@ pub fn accessibility_granted() -> bool {
 	unsafe { AXIsProcessTrusted() }
 }
 
+/// Whether the process can post synthetic input events (no prompt).
+#[must_use]
+pub fn post_event_granted() -> bool {
+	// SAFETY: `CGPreflightPostEventAccess` takes no arguments and only reads the
+	// current process's PostEvent TCC state.
+	unsafe { CGPreflightPostEventAccess() }
+}
+
+/// Whether both Accessibility and PostEvent authority are available for Gate-0
+/// synthetic input. This pure seam keeps the combined authority contract
+/// independently testable.
+#[must_use]
+pub const fn gate0_capabilities_granted(accessibility: bool, post_event: bool) -> bool {
+	accessibility && post_event
+}
+
+/// Whether the current process has both non-prompting TCC capabilities Gate-0
+/// needs to establish synthetic input authority.
+#[must_use]
+pub fn gate0_input_injection_granted() -> bool {
+	gate0_capabilities_granted(accessibility_granted(), post_event_granted())
+}
+
 /// Whether the process already has Screen Recording access (no prompt).
 #[must_use]
 pub fn screen_recording_granted() -> bool {
 	// SAFETY: `CGPreflightScreenCaptureAccess` takes no arguments and only reads
 	// the current process's capture-access state.
 	unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+/// Explicitly request Screen Recording access for the current process.
+///
+/// This is the sole prompting TCC seam. Normal computer preflight and capture
+/// paths must use [`screen_recording_granted`] instead.
+#[must_use]
+pub fn request_screen_recording_access() -> bool {
+	// SAFETY: `CGRequestScreenCaptureAccess` takes no arguments and requests the
+	// current process's TCC grant.
+	unsafe { CGRequestScreenCaptureAccess() }
 }
 
 /// Read the current grant state for both required permissions.
@@ -154,7 +195,7 @@ pub fn require_screen_recording_for_capture() -> Result<(), PermissionError> {
 
 #[cfg(test)]
 mod tests {
-	use super::{TccPermission, preflight};
+	use super::{TccPermission, gate0_capabilities_granted, preflight};
 
 	#[test]
 	fn settings_urls_target_the_privacy_panes() {
@@ -168,6 +209,14 @@ mod tests {
 				.settings_url()
 				.contains("Privacy_ScreenCapture")
 		);
+	}
+
+	#[test]
+	fn gate0_requires_accessibility_and_post_event_authority() {
+		assert!(gate0_capabilities_granted(true, true));
+		assert!(!gate0_capabilities_granted(true, false));
+		assert!(!gate0_capabilities_granted(false, true));
+		assert!(!gate0_capabilities_granted(false, false));
 	}
 
 	/// Reports the live TCC grant state. Ignored by default (result depends on

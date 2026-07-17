@@ -7,12 +7,9 @@
 //! `wait`).
 //!
 //! # Status
-//! Slice 1 foundation. Only the framework-free coordinate contract
-//! ([`coords`]) ships so far; it is unit-testable without a display or granted
-//! TCC permissions. The native capture/input backend, the kill-switch
-//! supervisor + event-tap lifecycle, and the napi `ComputerController` surface
-//! land in later slices. See `docs/computer-use/` for the approved spec, the
-//! consensus plan, and the architecture decision record.
+//! Native capture, input, supervision, and the napi `ComputerController` exist.
+//! The only input exposed for Gate-0 is a hidden, bounded harmless probe; the
+//! production broker and public computer-use surface remain out of scope.
 //!
 //! # Architecture
 //! ```text
@@ -73,6 +70,27 @@ pub struct ComputerScreenshot {
 	pub display_epoch: f64,
 	/// Process-local opaque capture id.
 	pub capture_id:    u32,
+}
+
+/// Redacted Gate-0 TCC status. This contains grant state only.
+#[napi(object)]
+pub struct Gate0PermissionStatus {
+	/// Whether Accessibility input injection is granted.
+	pub accessibility:    bool,
+	/// Whether Screen Recording capture is granted.
+	pub screen_recording: bool,
+}
+
+/// Redacted Gate-0 harmless-probe outcome. No desktop data or coordinates are
+/// returned.
+#[napi(object)]
+pub struct Gate0HarmlessProbeResult {
+	/// Whether a screenshot could be captured and immediately discarded.
+	pub screenshot:           bool,
+	/// Whether Accessibility was granted when the probe ran.
+	pub accessibility:        bool,
+	/// Whether the cursor moved one logical pixel and was restored.
+	pub pointer_move_restore: bool,
 }
 
 /// Capture the primary display for JS callers (macOS).
