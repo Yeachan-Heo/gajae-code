@@ -23,7 +23,6 @@ import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner } from "
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
-import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
@@ -48,7 +47,7 @@ import type { LocalProtocolOptions } from "../internal-urls";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
-import { runSubprocess } from "./executor";
+import { renderSubagentUserPrompt, runSubprocess } from "./executor";
 import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
@@ -87,11 +86,8 @@ interface TaskResumeDescriptor {
 function isTaskResumeDescriptor(value: unknown): value is TaskResumeDescriptor {
 	return typeof value === "object" && value !== null && "task" in value && "params" in value;
 }
-function renderSubagentUserPrompt(assignment: string, simpleMode: TaskSimpleMode): string {
-	return prompt.render(subagentUserPromptTemplate, {
-		assignment: assignment.trim(),
-		independentMode: simpleMode === "independent",
-	});
+function renderTaskAssignment(assignment: string, simpleMode: TaskSimpleMode): string {
+	return renderSubagentUserPrompt(assignment, simpleMode === "independent");
 }
 function createUsageTotals(): Usage {
 	return {
@@ -517,7 +513,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agent: params.agent,
 				agentSource: fallbackAgentSource,
 				status: "pending",
-				task: renderSubagentUserPrompt(assignment, simpleMode),
+				task: renderTaskAssignment(assignment, simpleMode),
 				assignment,
 				description: taskItem.description,
 				recentTools: [],
@@ -1251,7 +1247,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					agent: agentName,
 					agentSource: agent.source,
 					status: "pending",
-					task: renderSubagentUserPrompt(assignment, simpleMode),
+					task: renderTaskAssignment(assignment, simpleMode),
 					assignment,
 					recentTools: [],
 					recentOutput: [],
@@ -1316,7 +1312,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const result = await runSubprocess({
 						cwd: this.session.cwd,
 						agent: effectiveAgent,
-						task: renderSubagentUserPrompt(task.assignment, simpleMode),
+						task: renderTaskAssignment(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
 						context: sharedContext,
 						description: task.description,
@@ -1380,7 +1376,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						cwd: this.session.cwd,
 						worktree: isolationDir,
 						agent: effectiveAgent,
-						task: renderSubagentUserPrompt(task.assignment, simpleMode),
+						task: renderTaskAssignment(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
 						context: sharedContext,
 						description: task.description,
@@ -1493,7 +1489,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						id: task.id,
 						agent: agent.name,
 						agentSource: agent.source,
-						task: renderSubagentUserPrompt(assignment, simpleMode),
+						task: renderTaskAssignment(assignment, simpleMode),
 						assignment,
 						description: task.description,
 						exitCode: 1,
@@ -1533,7 +1529,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					id: task.id,
 					agent: agentName,
 					agentSource: agent.source,
-					task: renderSubagentUserPrompt(assignment, simpleMode),
+					task: renderTaskAssignment(assignment, simpleMode),
 					assignment,
 					description: task.description,
 					exitCode: 1,

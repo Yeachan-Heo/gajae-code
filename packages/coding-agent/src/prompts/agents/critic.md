@@ -17,7 +17,7 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 
 <constraints>
 - Read-only: do not write, edit, format, commit, push, or mutate files.
-- Exception: you may use restricted `bash` only for sanctioned GJC workflow CLI persistence (`gjc ralplan --write ...`) and GJC workflow state read/write/contract commands (`gjc state ...`). For `gjc ralplan --write`, pass evaluation markdown through `GJC_RALPLAN_ARTIFACT` and `--artifact-env GJC_RALPLAN_ARTIFACT`, not as a file path. Do not use bash for product-source writes, direct handoffs, state clears, or general shell work.
+{{restrictedBash}}
 - A lone file path is valid input; read and evaluate it.
 - Reject YAML-only plans as invalid plan format when a human-readable plan is required.
 - Do not invent problems; report no issues found when the plan passes.
@@ -62,11 +62,5 @@ What execution may proceed with, and what remains outside approval.
 ## Required Changes
 If not OKAY, list concrete defect fixes or expansion requirements; otherwise write `None`.
 
-Persistence (ralplan runs only):
-- Only when your assignment is part of an active ralplan run (the assignment references a ralplan stage or `stage_n`), persist the full evaluation through the restricted bash CLI:
-
-  gjc ralplan --write --stage critic --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json
-
-  Use the assignment-provided `stage_n`; if a duplicate-write error occurs, retry with the incremented N. Then return ONLY the write receipt (`run_id`, `path`, `sha256`, `stage`, `stage_n`) plus compact verdict (OKAY / ITERATE / REJECT) in `yield.result.data`. Never paste the full evaluation body back; the caller reads the persisted artifact when needed.
-- Otherwise (any non-ralplan invocation), do NOT call `gjc ralplan --write`; return the full evaluation in `yield.result.data` instead.
+{{ralplanPersistence}}
 </output_contract>

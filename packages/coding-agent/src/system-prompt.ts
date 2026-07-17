@@ -10,11 +10,13 @@ import { contextFileCapability } from "./capability/context-file";
 import { systemPromptCapability } from "./capability/system-prompt";
 import type { SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
-import { loadSkills, type Skill } from "./extensibility/skills";
+import type { Skill } from "./extensibility/skills";
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
 import volatileProjectContextTemplate from "./prompts/system/volatile-project-context.md" with { type: "text" };
+import { escapePromptMetadata } from "./session/messages";
+import { DEFAULT_ESSENTIAL_TOOL_NAMES } from "./tools";
 import { shortenPath } from "./tools/render-utils";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -360,14 +362,8 @@ export interface BuildSystemPromptOptions {
 	rules?: Array<{ name: string; description?: string; path: string; globs?: string[] }>;
 	/** Intent field name injected into every tool schema. If set, explains the field in the prompt. */
 	intentField?: string;
-	/** Whether MCP tool discovery is active for this prompt build. */
-	mcpDiscoveryMode?: boolean;
-	/** Discoverable MCP server summaries to advertise when discovery mode is active. */
-	mcpDiscoveryServerSummaries?: string[];
-	/** Whether built-in tool discovery ("all" mode) is active; enables the tool-discovery prompt block. */
+	/** Whether built-in tool discovery is active; enables the tool-discovery prompt block. */
 	toolDiscoveryActive?: boolean;
-	/** Hidden discoverable tools to advertise (name + one-line summary) when tool discovery is active. */
-	discoverableTools?: Array<{ name: string; summary: string }>;
 	/** Encourage the agent to delegate via tasks unless changes are trivial. */
 	eagerTasks?: boolean;
 	/** Rules with alwaysApply=true — their full content is injected into the prompt. */
@@ -402,13 +398,16 @@ export function buildVolatileProjectContext(options: BuildVolatileProjectContext
 	return prompt
 		.render(volatileProjectContextTemplate, {
 			date,
-			cwd: shortenPath(resolvedCwd.replace(/\\/g, "/")),
-			workspaceTree: options.workspaceTree ?? {
-				rootPath: resolvedCwd,
-				rendered: "",
-				truncated: false,
-				totalLines: 0,
-				agentsMdFiles: [],
+			cwd: escapePromptMetadata(shortenPath(resolvedCwd.replace(/\\/g, "/"))),
+			workspaceTree: {
+				...(options.workspaceTree ?? {
+					rootPath: resolvedCwd,
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				}),
+				rendered: escapePromptMetadata(options.workspaceTree?.rendered ?? "", { preserveNewlines: true }),
 			},
 		})
 		.trim();
@@ -426,18 +425,13 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		appendSystemPrompt,
 		pluginAppendices,
 		repeatToolDescriptions = false,
-		skillsSettings,
 		toolNames: providedToolNames,
 		cwd,
 		contextFiles: providedContextFiles,
-		skills: providedSkills,
 		rules,
 		alwaysApplyRules,
 		intentField,
-		mcpDiscoveryMode = false,
-		mcpDiscoveryServerSummaries = [],
 		toolDiscoveryActive = false,
-		discoverableTools = [],
 		eagerTasks = false,
 		secretsEnabled = false,
 		workspaceTree: providedWorkspaceTree,
@@ -450,7 +444,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedAppendPrompt: undefined as string | undefined,
 		systemPromptCustomization: null as string | null,
 		contextFiles: dedupeExactContextFiles(providedContextFiles ?? []),
-		skills: providedSkills ?? ([] as Skill[]),
 		workspaceTree: {
 			rootPath: resolvedCwd,
 			rendered: "",
@@ -500,14 +493,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			: logger.time("buildWorkspaceTree", () =>
 					buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
 				);
-	const skillsPromise: Promise<Skill[]> =
-		providedSkills !== undefined
-			? Promise.resolve(providedSkills)
-			: skillsSettings?.enabled !== false
-				? loadSkills({ ...skillsSettings, cwd: resolvedCwd }).then(result => result.skills)
-				: Promise.resolve([]);
 
-	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFiles, , workspaceTree] =
+	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFiles, workspaceTree] =
 		await Promise.all([
 			withDeadline(
 				"customPrompt",
@@ -527,7 +514,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles).then(
 				dedupeExactContextFiles,
 			),
-			withDeadline("loadSkills", skillsPromise, prepDefaults.skills),
 			withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
 		]);
 	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
@@ -565,8 +551,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			// Tools map provided
 			toolNames = Array.from(tools.keys());
 		} else {
-			// Use defaults
-			toolNames = ["read", "bash", "eval", "edit", "write"]; // TODO: Why?
+			// Use the same essential-tool baseline as a default session.
+			toolNames = [...DEFAULT_ESSENTIAL_TOOL_NAMES];
 		}
 	}
 
@@ -580,10 +566,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		label: tools?.get(name)?.label ?? "",
 		description: tools?.get(name)?.description ?? "",
 	}));
-
-	// Runtime skills are discovered by `skill_discovery` and loaded narrowly through
-	// `skill`; do not dump the full custom skill catalog into the core prompt.
-	const filteredSkills: Skill[] = [];
 
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
@@ -605,7 +587,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles,
 		agentsMdSearch: { files: agentsMdFiles },
 		workspaceTree,
-		skills: filteredSkills,
 		rules: rules ?? [],
 		alwaysApplyRules: injectedAlwaysApplyRules,
 		date,
@@ -613,11 +594,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd: promptCwd,
 		intentTracing: !!intentField,
 		intentField: intentField ?? "",
-		mcpDiscoveryMode: mcpDiscoveryMode && hasHiddenToolDiscoveryTool,
-		hasMCPDiscoveryServers: mcpDiscoveryServerSummaries.length > 0,
-		mcpDiscoveryServerSummaries,
 		toolDiscoveryActive: toolDiscoveryActive && hasHiddenToolDiscoveryTool,
-		discoverableTools,
 		eagerTasks,
 		secretsEnabled,
 		subagent,

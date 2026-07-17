@@ -30,7 +30,7 @@ import {
 } from "../session-directory";
 import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
-
+import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
 	LifecycleCleanupProof,
 	LifecycleDurableEffectsReceipt,
@@ -59,6 +59,9 @@ const MAX_READY_TIMEOUT_MS = 60_000;
 const POLL_MS = 50;
 const CLOSE_TIMEOUT_MS = 2_000;
 const MAX_RECEIVED_AT_SKEW_MS = 5_000;
+const MAX_LIFECYCLE_METADATA_BYTES = 4096;
+const MAX_EFFECT_MARKER_LENGTH = 128;
+const MAX_PROCESS_INCARNATION_LENGTH = 256;
 
 export interface LifecycleDeadlines {
 	receivedAt: number;
@@ -671,15 +674,25 @@ function hasObservedProcessExit(pid: number): boolean {
 
 function isEffectMarker(value: unknown): value is EffectMarker {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-	const marker = value as Partial<EffectMarker>;
+	const marker = value as Record<string, unknown>;
 	return (
 		typeof marker.pid === "number" &&
 		Number.isSafeInteger(marker.pid) &&
 		marker.pid > 0 &&
 		typeof marker.effectMarker === "string" &&
-		marker.effectMarker.length > 0 &&
+		/^[A-Za-z0-9._-]+$/.test(marker.effectMarker) &&
+		marker.effectMarker.length <= MAX_EFFECT_MARKER_LENGTH &&
 		typeof marker.incarnation === "string" &&
-		marker.incarnation.length > 0
+		marker.incarnation.length > 0 &&
+		marker.incarnation.length <= MAX_PROCESS_INCARNATION_LENGTH
+	);
+}
+
+function isExactEffectMarker(value: unknown): value is EffectMarker {
+	return (
+		isEffectMarker(value) &&
+		Object.keys(value).length === 3 &&
+		Object.keys(value).every(key => key === "pid" || key === "effectMarker" || key === "incarnation")
 	);
 }
 
@@ -689,8 +702,10 @@ function sameEffectMarker(left: EffectMarker, right: EffectMarker): boolean {
 
 async function readEffectMarker(file: string): Promise<EffectMarker | undefined> {
 	try {
-		const marker: unknown = JSON.parse(await fs.readFile(file, "utf8"));
-		return isEffectMarker(marker) ? marker : undefined;
+		const captured = captureLifecycleFile(file, true, true);
+		if (!captured) return undefined;
+		const marker: unknown = parseLifecycleJson(captured.bytes);
+		return isExactEffectMarker(marker) ? marker : undefined;
 	} catch {
 		return undefined;
 	}
@@ -899,11 +914,11 @@ async function readLifecycleFailureArtifact(
 		const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
 		if (bytesRead > 4096) return undefined;
 		const raw = bytes.subarray(0, bytesRead);
-		const value: unknown = JSON.parse(raw.toString("utf8"));
+		const value: unknown = parseLifecycleJson(raw);
 		if (
 			!isLifecycleFailureArtifact(value) ||
 			!sameEffectMarker(value, expected) ||
-			canonicalJson(value) !== raw.toString("utf8")
+			canonicalJson(value) !== decodeLifecycleUtf8(raw)
 		)
 			return undefined;
 		return {
@@ -962,22 +977,27 @@ function lifecycleCleanupPlan(
 		lifecycleMarkerPath(root, id),
 	];
 	const files: LifecycleCleanupFile[] = candidates.flatMap(file => {
-		const captured = captureLifecycleFile(file, true);
+		const captured = captureLifecycleFile(
+			file,
+			true,
+			file === lifecycleMarkerPath(root, id) || file === lifecycleReadyPath(root, id),
+		);
+
 		if (!captured) return [];
 		if (file === lifecycleMarkerPath(root, id) || file === lifecycleReadyPath(root, id)) {
 			let marker: unknown;
 			try {
-				marker = JSON.parse(captured.bytes.toString("utf8"));
+				marker = parseLifecycleJson(captured.bytes);
 			} catch {
 				throw new Error("Lifecycle marker changed before cleanup intent persistence.");
 			}
-			if (!isEffectMarker(marker) || !sameEffectMarker(marker, expected))
+			if (!isExactEffectMarker(marker) || !sameEffectMarker(marker, expected))
 				throw new Error("Lifecycle marker changed before cleanup intent persistence.");
 		}
 		if (file.endsWith(`${id}.json`)) {
 			let endpoint: { pid?: unknown };
 			try {
-				endpoint = JSON.parse(captured.bytes.toString("utf8")) as { pid?: unknown };
+				endpoint = parseLifecycleJson(captured.bytes) as { pid?: unknown };
 			} catch {
 				throw new Error("Lifecycle endpoint changed before cleanup intent persistence.");
 			}
@@ -1007,84 +1027,543 @@ function lifecycleCleanupPlan(
 	return { phase: "lifecycle", sessionId: id, metadataRoot: root, lifecycleFiles: files };
 }
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isCanonicalLifecycleCleanupOriginal(root: string, id: string, original: string): boolean {
+	const directory = path.join(path.resolve(root), "sdk");
+	if (path.dirname(original) !== directory) return false;
+	const basename = path.basename(original);
+	return (
+		basename === `${id}.json` ||
+		basename === `${id}.lifecycle.json` ||
+		basename === `${id}.lifecycle.ready.json` ||
+		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json$`).test(basename)
+	);
+}
+
+function lifecycleCleanupHasMixedMetadataSchema(cleanup: CleanupEvidence): boolean {
+	return [
+		cleanup.metadataIdentity,
+		cleanup.metadataPath,
+		cleanup.metadataAttempt,
+		cleanup.plannedMetadataPath,
+		cleanup.detachedMetadataPath,
+		cleanup.metadataCompleted,
+	].some(value => value !== undefined);
+}
+
+function isCleanupIdentity(value: unknown): value is BrokerCleanupIdentity {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const identity = value as Record<string, unknown>;
+	return (
+		Object.keys(identity).length === 5 &&
+		Object.keys(identity).every(
+			key => key === "dev" || key === "ino" || key === "size" || key === "mtimeNs" || key === "sha256",
+		) &&
+		typeof identity.dev === "string" &&
+		/^\d+$/.test(identity.dev) &&
+		typeof identity.ino === "string" &&
+		/^\d+$/.test(identity.ino) &&
+		typeof identity.size === "number" &&
+		Number.isSafeInteger(identity.size) &&
+		identity.size >= 0 &&
+		typeof identity.mtimeNs === "string" &&
+		/^\d+$/.test(identity.mtimeNs) &&
+		typeof identity.sha256 === "string" &&
+		/^[a-f0-9]{64}$/.test(identity.sha256)
+	);
+}
+
+function isLifecycleCleanupFile(value: unknown): value is LifecycleCleanupFile {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const file = value as Record<string, unknown>;
+	const allowed = new Set(["path", "identity", "attempt", "plannedPath", "detachedPath", "completed"]);
+	return (
+		Object.keys(file).every(key => allowed.has(key)) &&
+		typeof file.path === "string" &&
+		file.path.length > 0 &&
+		typeof file.plannedPath === "string" &&
+		file.plannedPath.length > 0 &&
+		isCleanupIdentity(file.identity) &&
+		typeof file.attempt === "number" &&
+		Number.isSafeInteger(file.attempt) &&
+		file.attempt > 0 &&
+		(file.detachedPath === undefined || (typeof file.detachedPath === "string" && file.detachedPath.length > 0)) &&
+		(file.completed === undefined || file.completed === true)
+	);
+}
+
+function isLifecycleCleanupEvidence(cleanup: CleanupEvidence): boolean {
+	if (typeof cleanup !== "object" || cleanup === null || Array.isArray(cleanup)) return false;
+	const record = cleanup as Record<string, unknown>;
+	const allowed = new Set(["phase", "sessionId", "metadataRoot", "lifecycleDeleteMetadata", "lifecycleFiles"]);
+	return (
+		Object.keys(record).every(key => allowed.has(key)) &&
+		record.phase === "lifecycle" &&
+		typeof record.sessionId === "string" &&
+		isCanonicalSessionId(record.sessionId) &&
+		typeof record.metadataRoot === "string" &&
+		record.metadataRoot.length > 0 &&
+		Array.isArray(record.lifecycleFiles) &&
+		record.lifecycleFiles.length > 0 &&
+		record.lifecycleFiles.length <= 4 &&
+		(record.lifecycleDeleteMetadata === undefined || record.lifecycleDeleteMetadata === true) &&
+		record.lifecycleFiles.every(isLifecycleCleanupFile)
+	);
+}
+
+function validateLifecycleCleanupShape(cleanup: CleanupEvidence): BrokerResponse | undefined {
+	if (
+		!isLifecycleCleanupEvidence(cleanup) ||
+		lifecycleCleanupHasMixedMetadataSchema(cleanup) ||
+		(cleanup.lifecycleDeleteMetadata === true && cleanup.lifecycleFiles!.length > 2)
+	)
+		return fail("terminal_uncertain", "Lifecycle cleanup replay lacks a complete unambiguous schema.");
+	const files = cleanup.lifecycleFiles!;
+	const paths = new Set<string>();
+	for (const file of files) {
+		if (!validateLifecycleCleanupFile(cleanup.metadataRoot!, cleanup.sessionId!, file))
+			return fail("terminal_uncertain", "Lifecycle cleanup replay contains an invalid path authority.");
+		const entryPaths = new Map<string, "path" | "plannedPath" | "detachedPath">();
+		for (const [field, candidate] of [
+			["path", file.path],
+			["plannedPath", file.plannedPath],
+			["detachedPath", file.detachedPath],
+		] as const) {
+			if (candidate === undefined) continue;
+			const resolved = path.resolve(candidate);
+			const previousField = entryPaths.get(resolved);
+			if (previousField !== undefined) {
+				if (
+					(previousField === "plannedPath" && field === "detachedPath") ||
+					(previousField === "detachedPath" && field === "plannedPath")
+				)
+					continue;
+				return fail("terminal_uncertain", "Lifecycle cleanup replay contains duplicate path authority.");
+			}
+			entryPaths.set(resolved, field);
+			if (paths.has(resolved))
+				return fail("terminal_uncertain", "Lifecycle cleanup replay contains duplicate path authority.");
+			paths.add(resolved);
+		}
+	}
+	return undefined;
+}
+
 function validateLifecycleCleanupFile(root: string, id: string, file: LifecycleCleanupFile): boolean {
 	const directory = path.join(path.resolve(root), "sdk");
 	const original = path.resolve(file.path);
 	const planned = path.resolve(file.plannedPath);
 	if (
-		path.dirname(original) !== directory ||
+		!isCanonicalLifecycleCleanupOriginal(root, id, original) ||
 		path.dirname(planned) !== directory ||
 		!path.basename(planned).startsWith(".gjc-delete-") ||
-		(file.attempt !== undefined && (!Number.isSafeInteger(file.attempt) || file.attempt < 1)) ||
-		(![`${id}.json`, `${id}.lifecycle.json`, `${id}.lifecycle.ready.json`].includes(path.basename(original)) &&
-			!path.basename(original).startsWith(`${id}.lifecycle.failure.`)) ||
 		(file.detachedPath !== undefined && path.dirname(path.resolve(file.detachedPath)) !== directory)
 	)
 		return false;
-	return cleanupIdentity(file.identity) !== undefined;
+	return isCleanupIdentity(file.identity);
 }
 
-function metadataCleanupPlan(
-	metadataRoot: string,
-	id: string,
-	metadataPath: string,
-	identity: BrokerCleanupIdentity,
-): CleanupEvidence {
+function lifecycleCleanupCandidates(file: LifecycleCleanupFile): string[] {
+	return [file.path, file.detachedPath, file.plannedPath].filter(
+		(value, index, values): value is string => typeof value === "string" && values.indexOf(value) === index,
+	);
+}
+
+function lifecycleMetadataReplayFiles(cleanup: CleanupEvidence): LifecycleCleanupFile[] | undefined {
+	if (cleanup.lifecycleDeleteMetadata !== true) return undefined;
+	return cleanup.lifecycleFiles?.length ? cleanup.lifecycleFiles : undefined;
+}
+
+function absentLifecyclePath(file: string): boolean {
+	try {
+		fsSync.lstatSync(file);
+		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT";
+	}
+}
+
+function isLifecycleCleanupResponse(value: LifecycleFileCapture | BrokerResponse | undefined): value is BrokerResponse {
+	return typeof value === "object" && value !== null && "ok" in value;
+}
+
+function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerResponse | undefined {
+	const files = lifecycleMetadataReplayFiles(cleanup);
+	if (!files) return undefined;
+	const root = path.resolve(cleanup.metadataRoot!);
+	const id = cleanup.sessionId!;
+	const markerPath = lifecycleMarkerPath(root, id);
+	const readyPath = lifecycleReadyPath(root, id);
+	const authorities = new Set<string>();
+	const candidates = new Set<string>();
+	for (const file of files) {
+		const authority = path.resolve(file.path);
+		if ((authority !== markerPath && authority !== readyPath) || authorities.has(authority))
+			return fail("terminal_uncertain", "Lifecycle metadata replay contains duplicate or non-canonical authority.");
+		authorities.add(authority);
+		for (const candidate of lifecycleCleanupCandidates(file)) {
+			const resolved = path.resolve(candidate);
+			if (candidates.has(resolved))
+				return fail("terminal_uncertain", "Lifecycle metadata replay contains duplicate candidate authority.");
+			candidates.add(resolved);
+		}
+	}
+	const markerEntry = files.find(file => path.resolve(file.path) === markerPath);
+	const readyEntry = files.find(file => path.resolve(file.path) === readyPath);
+	const capture = (file: string): LifecycleFileCapture | undefined | BrokerResponse => {
+		try {
+			return captureLifecycleFile(file, true, true);
+		} catch {
+			return fail("terminal_uncertain", "Lifecycle metadata sibling could not be safely inspected.");
+		}
+	};
+	const marker = capture(markerPath);
+	const ready = capture(readyPath);
+	if (isLifecycleCleanupResponse(marker)) return marker;
+	if (isLifecycleCleanupResponse(ready)) return ready;
+	if (marker && (!markerEntry || !sameLifecycleCleanupIdentity(marker.identity, markerEntry.identity)))
+		return fail("terminal_uncertain", "Lifecycle marker sibling lacks exact replay authority.");
+	if (ready && (!readyEntry || !sameLifecycleCleanupIdentity(ready.identity, readyEntry.identity)))
+		return fail("terminal_uncertain", "Lifecycle readiness sibling lacks exact replay authority.");
+	for (const file of files) {
+		let activeCandidates = 0;
+		for (const candidate of lifecycleCleanupCandidates(file)) {
+			let current: LifecycleFileCapture | undefined;
+			try {
+				current = captureLifecycleFile(candidate, true, true);
+			} catch {
+				return fail("terminal_uncertain", "Lifecycle metadata candidate could not be safely inspected.");
+			}
+			if (!current) continue;
+			if (!sameLifecycleCleanupIdentity(current.identity, file.identity))
+				return fail("terminal_uncertain", "Lifecycle metadata candidate lacks exact replay authority.");
+			activeCandidates++;
+		}
+		if (file.completed && activeCandidates > 0)
+			return fail(
+				"terminal_uncertain",
+				"Lifecycle cleanup receipt marks a metadata target complete while a candidate remains.",
+			);
+		if (!file.completed && activeCandidates > 1)
+			return fail("terminal_uncertain", "Lifecycle metadata replay has multiple active candidates.");
+	}
+	if (ready && !markerEntry)
+		return fail("terminal_uncertain", "Lifecycle readiness metadata lacks canonical marker authority.");
+	if (!ready) return undefined;
+	let readyMarker: EffectMarker;
+	try {
+		const value: unknown = parseLifecycleJson(ready.bytes);
+		if (!isExactEffectMarker(value)) throw new Error("invalid ready marker");
+
+		readyMarker = value;
+	} catch {
+		return fail("terminal_uncertain", "Lifecycle readiness metadata ownership could not be verified.");
+	}
+	if (!markerEntry)
+		return fail("terminal_uncertain", "Lifecycle readiness metadata lacks canonical marker authority.");
+	if (!marker) {
+		if (createHash("sha256").update(canonicalJson(readyMarker)).digest("hex") !== markerEntry.identity.sha256)
+			return fail(
+				"terminal_uncertain",
+				"Lifecycle readiness metadata is not bound to the completed marker authority.",
+			);
+		return undefined;
+	}
+	try {
+		const value: unknown = parseLifecycleJson(marker.bytes);
+		if (!isExactEffectMarker(value) || !sameEffectMarker(value, readyMarker)) throw new Error("mismatched marker");
+	} catch {
+		return fail("terminal_uncertain", "Lifecycle metadata siblings do not share one owner marker.");
+	}
+	return undefined;
+}
+
+function lifecycleMetadataReplayAbsent(cleanup: CleanupEvidence): boolean {
+	const files = lifecycleMetadataReplayFiles(cleanup);
+	if (!files) return true;
+	const root = path.resolve(cleanup.metadataRoot!);
+	const id = cleanup.sessionId!;
+	const required = new Set<string>([lifecycleMarkerPath(root, id), lifecycleReadyPath(root, id)]);
+	for (const file of files) for (const candidate of lifecycleCleanupCandidates(file)) required.add(candidate);
+	return [...required].every(absentLifecyclePath);
+}
+
+/**
+ * Base dev persisted metadata cleanup one file at a time. Accept only its
+ * identity-bound marker receipt and translate it into the current replay plan.
+ */
+function hasExactLegacyMetadataCleanupKeys(cleanup: CleanupEvidence): boolean {
+	if (typeof cleanup !== "object" || cleanup === null || Array.isArray(cleanup)) return false;
+	const allowed = new Set([
+		"phase",
+		"sessionId",
+		"metadataRoot",
+		"metadataIdentity",
+		"metadataPath",
+		"metadataAttempt",
+		"plannedMetadataPath",
+		"detachedMetadataPath",
+		"metadataCompleted",
+	]);
+	return Object.keys(cleanup as Record<string, unknown>).every(key => allowed.has(key));
+}
+
+function legacyMetadataCleanupPlan(cleanup: CleanupEvidence): CleanupEvidence | undefined {
+	if (
+		!hasExactLegacyMetadataCleanupKeys(cleanup) ||
+		cleanup.phase !== "metadata" ||
+		typeof cleanup.sessionId !== "string" ||
+		!isCanonicalSessionId(cleanup.sessionId) ||
+		typeof cleanup.metadataRoot !== "string" ||
+		cleanup.metadataRoot.length === 0 ||
+		typeof cleanup.metadataPath !== "string" ||
+		cleanup.metadataPath.length === 0 ||
+		!cleanup.metadataIdentity ||
+		typeof cleanup.plannedMetadataPath !== "string" ||
+		cleanup.plannedMetadataPath.length === 0 ||
+		(cleanup.detachedMetadataPath !== undefined &&
+			(typeof cleanup.detachedMetadataPath !== "string" || cleanup.detachedMetadataPath.length === 0)) ||
+		(cleanup.metadataCompleted !== undefined && cleanup.metadataCompleted !== true)
+	)
+		return undefined;
+	const root = path.resolve(cleanup.metadataRoot);
+	const directory = path.join(root, "sdk");
+	const markerPath = lifecycleMarkerPath(root, cleanup.sessionId);
+	const readyPath = lifecycleReadyPath(root, cleanup.sessionId);
+	const metadataPath = path.resolve(cleanup.metadataPath);
+	const plannedPath = path.resolve(cleanup.plannedMetadataPath);
+	const detachedPath = cleanup.detachedMetadataPath && path.resolve(cleanup.detachedMetadataPath);
+	if (
+		metadataPath !== markerPath ||
+		path.dirname(plannedPath) !== directory ||
+		!path.basename(plannedPath).startsWith(".gjc-delete-") ||
+		(detachedPath !== undefined && path.dirname(detachedPath) !== directory) ||
+		(cleanup.metadataAttempt !== undefined &&
+			(!Number.isSafeInteger(cleanup.metadataAttempt) || cleanup.metadataAttempt < 1))
+	)
+		return undefined;
+	const persistedIdentity = cleanupIdentity(cleanup.metadataIdentity);
+	if (!persistedIdentity) return undefined;
+
+	const captureExactRegular = (
+		file: string,
+	): { kind: "absent" } | { kind: "present"; capture: LifecycleFileCapture } | undefined => {
+		try {
+			const stat = fsSync.lstatSync(file);
+			if (stat.isSymbolicLink() || !stat.isFile()) return undefined;
+			const capture = captureLifecycleFile(file, true, true);
+
+			return capture ? { kind: "present", capture } : undefined;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : undefined;
+		}
+	};
+
+	const markerCandidates = [metadataPath, detachedPath, plannedPath].filter(
+		(candidate, index, candidates): candidate is string =>
+			typeof candidate === "string" && candidates.indexOf(candidate) === index,
+	);
+	let activeMarker: LifecycleFileCapture | undefined;
+	for (const candidate of markerCandidates) {
+		const current = captureExactRegular(candidate);
+		if (!current) return undefined;
+		if (current.kind === "absent") continue;
+		if (!sameLifecycleCleanupIdentity(current.capture.identity, serializeCleanupIdentity(persistedIdentity)))
+			return undefined;
+		if (activeMarker) return undefined;
+		activeMarker = current.capture;
+	}
+	const markerCompleted = !activeMarker;
+	// Legacy receipts can crash after exact marker unlink and before recording metadataCompleted.
+	// With every authorized marker candidate absent, only the persisted marker digest may bind a ready sibling.
+	let marker: EffectMarker | undefined;
+	if (activeMarker) {
+		try {
+			const value: unknown = parseLifecycleJson(activeMarker.bytes);
+			if (!isExactEffectMarker(value)) return undefined;
+
+			marker = value;
+		} catch {
+			return undefined;
+		}
+	}
+
+	const ready = captureExactRegular(readyPath);
+	if (!ready) return undefined;
+	let readyMarker: EffectMarker | undefined;
+	if (ready.kind === "present") {
+		try {
+			const value: unknown = parseLifecycleJson(ready.capture.bytes);
+			if (!isExactEffectMarker(value)) return undefined;
+
+			readyMarker = value;
+		} catch {
+			return undefined;
+		}
+		if (marker && !sameEffectMarker(marker, readyMarker)) return undefined;
+		if (!marker && createHash("sha256").update(canonicalJson(readyMarker)).digest("hex") !== persistedIdentity.sha256)
+			return undefined;
+	}
+
 	return {
-		phase: "metadata",
-		sessionId: id,
-		metadataRoot,
-		metadataPath,
-		metadataIdentity: identity,
-		metadataAttempt: 1,
-		plannedMetadataPath: path.join(
-			path.dirname(metadataPath),
-			`.gjc-delete-${randomUUID()}-${path.basename(metadataPath)}`,
-		),
+		phase: "lifecycle",
+		sessionId: cleanup.sessionId,
+		metadataRoot: root,
+		lifecycleDeleteMetadata: true,
+		lifecycleFiles: [
+			{
+				path: metadataPath,
+				identity: serializeCleanupIdentity({
+					...(activeMarker?.identity ?? persistedIdentity),
+					size: Number((activeMarker?.identity ?? persistedIdentity).size),
+				}),
+				attempt: cleanup.metadataAttempt ?? 1,
+				plannedPath,
+				...(detachedPath ? { detachedPath } : {}),
+				...(markerCompleted ? { completed: true as const } : {}),
+			},
+			...(ready.kind === "present"
+				? [
+						{
+							path: readyPath,
+							identity: serializeCleanupIdentity({
+								...ready.capture.identity,
+								size: Number(ready.capture.identity.size),
+							}),
+							attempt: 1,
+							plannedPath: path.join(directory, `.gjc-delete-${randomUUID()}-${path.basename(readyPath)}`),
+						},
+					]
+				: []),
+		],
 	};
 }
 
-function validateMetadataCleanupPlan(cleanup: CleanupEvidence, id: string): boolean {
-	return (
-		cleanup.phase === "metadata" &&
-		typeof cleanup.metadataRoot === "string" &&
-		typeof cleanup.metadataPath === "string" &&
-		(cleanup.metadataAttempt === undefined ||
-			(Number.isSafeInteger(cleanup.metadataAttempt) && cleanup.metadataAttempt >= 1)) &&
-		typeof cleanup.plannedMetadataPath === "string" &&
-		path.resolve(cleanup.metadataPath) === path.resolve(lifecycleMarkerPath(cleanup.metadataRoot, id)) &&
-		path.dirname(path.resolve(cleanup.plannedMetadataPath)) === path.dirname(path.resolve(cleanup.metadataPath)) &&
-		path.basename(cleanup.plannedMetadataPath).startsWith(".gjc-delete-") &&
-		(cleanup.detachedMetadataPath === undefined ||
-			path.dirname(path.resolve(cleanup.detachedMetadataPath)) === path.dirname(path.resolve(cleanup.metadataPath)))
+function lifecycleDeleteMetadataCleanupPlan(
+	metadataRoot: string,
+	id: string,
+	files: ReadonlyArray<{ metadataPath: string; metadata: LifecycleFileCapture }>,
+): CleanupEvidence {
+	return {
+		phase: "lifecycle",
+		sessionId: id,
+		metadataRoot,
+		lifecycleDeleteMetadata: true,
+		lifecycleFiles: files.map(({ metadataPath, metadata }) => ({
+			path: metadataPath,
+			identity: serializeCleanupIdentity({
+				dev: metadata.identity.dev,
+				ino: metadata.identity.ino,
+				size: Number(metadata.identity.size),
+				mtimeNs: metadata.identity.mtimeNs,
+				sha256: metadata.identity.sha256,
+			}),
+			attempt: 1,
+			plannedPath: path.join(
+				path.dirname(metadataPath),
+				`.gjc-delete-${randomUUID()}-${path.basename(metadataPath)}`,
+			),
+		})),
+	};
+}
+
+type LifecycleDeleteMetadataPreflight = { cleanup: CleanupEvidence } | BrokerResponse;
+
+/**
+ * Capture lifecycle metadata before deleting any saved user data. A fresh delete
+ * may only clean metadata owned by one dead lifecycle process.
+ */
+function preflightLifecycleDeleteMetadata(
+	root: string,
+	id: string,
+	record: { pid: number } | undefined,
+	readIncarnation: (pid: number) => string | undefined,
+): LifecycleDeleteMetadataPreflight {
+	const metadataPaths = [lifecycleMarkerPath(root, id), lifecycleReadyPath(root, id)];
+	const lifecycleMetadata: Array<{
+		metadataPath: string;
+		metadata: LifecycleFileCapture;
+		marker: EffectMarker;
+	}> = [];
+	for (const metadataPath of metadataPaths) {
+		let metadata: LifecycleFileCapture | undefined;
+		try {
+			metadata = captureLifecycleFile(metadataPath, true, true);
+		} catch {
+			return fail("terminal_uncertain", "Lifecycle metadata path is occupied by an unsafe object.");
+		}
+		if (!metadata) continue;
+		let marker: unknown;
+		try {
+			marker = parseLifecycleJson(metadata.bytes);
+		} catch {
+			return fail("terminal_uncertain", "Lifecycle metadata ownership could not be verified.");
+		}
+		if (
+			!isExactEffectMarker(marker) ||
+			(record && marker.pid !== record.pid) ||
+			observeProcess(marker.pid, marker.incarnation, readIncarnation) !== "exited"
+		)
+			return fail("terminal_uncertain", "Lifecycle metadata ownership could not be verified.");
+		lifecycleMetadata.push({ metadataPath, metadata, marker });
+	}
+	const canonicalLifecycleMarker = lifecycleMetadata.find(
+		metadata => metadata.metadataPath === lifecycleMarkerPath(root, id),
 	);
+	const lifecycleReadyMarker = lifecycleMetadata.find(
+		metadata => metadata.metadataPath === lifecycleReadyPath(root, id),
+	);
+	if (lifecycleReadyMarker && !canonicalLifecycleMarker)
+		return fail(
+			"terminal_uncertain",
+			"Lifecycle readiness metadata lacks canonical marker authority for fresh cleanup.",
+		);
+	if (
+		canonicalLifecycleMarker &&
+		lifecycleReadyMarker &&
+		!sameEffectMarker(canonicalLifecycleMarker.marker, lifecycleReadyMarker.marker)
+	)
+		return fail("terminal_uncertain", "Lifecycle metadata siblings do not share one owner marker.");
+	return { cleanup: lifecycleDeleteMetadataCleanupPlan(root, id, lifecycleMetadata) };
 }
 
 async function reconcileLifecycleCleanup(
 	broker: Broker,
 	identity: string,
 	cleanup: CleanupEvidence,
+	completion: BrokerResponse = fail("spawn_failed", "No ready SDK endpoint remains available."),
 ): Promise<BrokerResponse> {
-	if (
-		cleanup.phase !== "lifecycle" ||
-		!cleanup.sessionId ||
-		!isCanonicalSessionId(cleanup.sessionId) ||
-		!cleanup.metadataRoot ||
-		!Array.isArray(cleanup.lifecycleFiles) ||
-		cleanup.lifecycleFiles.length === 0
-	)
-		return fail("terminal_uncertain", "Lifecycle cleanup replay lacks immutable identity-bound intent.");
-	let activeCleanup = cleanup;
+	const shapeValidation = validateLifecycleCleanupShape(cleanup);
+	if (shapeValidation) return shapeValidation;
+	let activeCleanup =
+		cleanup.lifecycleDeleteMetadata === true || completion.ok
+			? { ...cleanup, lifecycleDeleteMetadata: true as const }
+			: cleanup;
+	const metadataReplayValidation = validateLifecycleMetadataReplay(activeCleanup);
+	if (metadataReplayValidation) return metadataReplayValidation;
 	for (let index = 0; index < activeCleanup.lifecycleFiles!.length; index++) {
 		const file = activeCleanup.lifecycleFiles![index];
 		if (!validateLifecycleCleanupFile(activeCleanup.metadataRoot!, activeCleanup.sessionId!, file))
 			return fail("terminal_uncertain", "Lifecycle cleanup replay contains an invalid path authority.");
-		if (file.completed) continue;
-
-		const candidates = [file.path, file.detachedPath, file.plannedPath].filter(
-			(value, candidateIndex, values): value is string =>
-				typeof value === "string" && values.indexOf(value) === candidateIndex,
-		);
+		const candidates = lifecycleCleanupCandidates(file);
+		if (file.completed) {
+			for (const candidate of candidates) {
+				try {
+					fsSync.lstatSync(candidate);
+					return fail(
+						"terminal_uncertain",
+						"Lifecycle cleanup receipt marks a target complete while an authorized candidate remains.",
+					);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+						return fail("terminal_uncertain", "Lifecycle cleanup completion could not be safely inspected.");
+				}
+			}
+			continue;
+		}
 		let activePath: string | undefined;
 		let captured: ReturnType<typeof captureLifecycleFile>;
 		let foundUnauthorized = false;
@@ -1100,7 +1579,8 @@ async function reconcileLifecycleCleanup(
 				foundUnauthorized = true;
 				continue;
 			}
-			const current = captureLifecycleFile(candidate);
+			const current = captureLifecycleFile(candidate, true, true);
+
 			if (!current) {
 				foundUnauthorized = true;
 				continue;
@@ -1169,8 +1649,10 @@ async function reconcileLifecycleCleanup(
 		});
 		lifecycleCleanupHooksForTest.get(broker)?.();
 	}
+	if (!lifecycleMetadataReplayAbsent(activeCleanup))
+		return fail("terminal_uncertain", "Lifecycle metadata replay left an authorized sibling behind.");
 	await syncDirectory(path.join(activeCleanup.metadataRoot!, "sdk"));
-	return fail("spawn_failed", "No ready SDK endpoint remains available.");
+	return completion;
 }
 
 async function readSessionLifecycleFailure(
@@ -1216,22 +1698,35 @@ async function hasOwnedReadinessEvidence(
 	);
 }
 
-function captureLifecycleFile(
-	file: string,
-	requireRegular = false,
-):
-	| {
-			bytes: Buffer;
-			identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string };
-			digest: string;
-	  }
-	| undefined {
+type LifecycleFileCapture = {
+	bytes: Buffer;
+	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string };
+	digest: string;
+};
+
+function captureLifecycleFile(file: string, requireRegular = false, bounded = false): LifecycleFileCapture | undefined {
 	let descriptor: number | undefined;
 	try {
+		const preflight = bounded ? fsSync.lstatSync(file, { bigint: true }) : undefined;
+		if (
+			preflight &&
+			(!preflight.isFile() || preflight.size === 0n || preflight.size > BigInt(MAX_LIFECYCLE_METADATA_BYTES))
+		) {
+			if (requireRegular) throw new Error("Lifecycle metadata is not a bounded regular file.");
+			return undefined;
+		}
 		descriptor = fsSync.openSync(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
 		const stat = fsSync.fstatSync(descriptor, { bigint: true });
-		if (!stat.isFile()) {
-			if (requireRegular) throw new Error("Lifecycle cleanup candidate is not an exact regular file.");
+		if (
+			!stat.isFile() ||
+			(bounded &&
+				(stat.size === 0n ||
+					stat.size > BigInt(MAX_LIFECYCLE_METADATA_BYTES) ||
+					!preflight ||
+					stat.dev !== preflight.dev ||
+					stat.ino !== preflight.ino))
+		) {
+			if (requireRegular) throw new Error("Lifecycle cleanup candidate is not an exact bounded regular file.");
 			return undefined;
 		}
 		const bytes = fsSync.readFileSync(descriptor);
@@ -1290,7 +1785,7 @@ async function removeOwnedLifecycleArtifacts(root: string, id: string, expected:
 	if (endpoint && endpointSource) {
 		let parsed: { pid?: unknown };
 		try {
-			parsed = JSON.parse(endpoint.bytes.toString("utf8")) as { pid?: unknown };
+			parsed = parseLifecycleJson(endpoint.bytes) as { pid?: unknown };
 		} catch {
 			return false;
 		}
@@ -1310,7 +1805,7 @@ async function removeOwnedLifecycleArtifacts(root: string, id: string, expected:
 	const currentMarker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!currentMarker || !sameEffectMarker(currentMarker, expected)) return false;
 	const readyPath = lifecycleReadyPath(root, id);
-	const ready = captureLifecycleFile(readyPath);
+	const ready = captureLifecycleFile(readyPath, true, true);
 	if (ready && createHash("sha256").update(ready.bytes).digest("hex") !== ready.digest) return false;
 	// Readiness mutation is deferred to the same ledger-backed cleanup transaction.
 	return true;
@@ -2440,92 +2935,13 @@ async function executeLifecycleResponse(
 		if (record?.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be deleted safely.");
 		if (record?.live) return fail("live_session", "Refusing to delete a live session; close it first.");
-		if (cleanup?.phase === "metadata") {
-			const metadataIdentity = cleanupIdentity(cleanup.metadataIdentity);
-			if (!metadataIdentity || !validateMetadataCleanupPlan(cleanup, id))
-				return fail("terminal_uncertain", "Metadata cleanup replay lacks an exact lifecycle marker authority.");
-			const metadataCandidates = [
-				cleanup.metadataPath!,
-				cleanup.detachedMetadataPath,
-				cleanup.plannedMetadataPath!,
-			].filter(
-				(value, index, values): value is string => typeof value === "string" && values.indexOf(value) === index,
-			);
-			let activePath: string | undefined;
-			let marker: ReturnType<typeof captureLifecycleFile>;
-			let foundUnauthorized = false;
-			for (const candidate of metadataCandidates) {
-				try {
-					const stat = fsSync.lstatSync(candidate);
-					if (stat.isSymbolicLink() || !stat.isFile()) {
-						foundUnauthorized = true;
-						continue;
-					}
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-					foundUnauthorized = true;
-					continue;
-				}
-				const current = captureLifecycleFile(candidate);
-				if (!current) {
-					foundUnauthorized = true;
-					continue;
-				}
-				if (
-					current.identity.dev === metadataIdentity.dev &&
-					current.identity.ino === metadataIdentity.ino &&
-					current.identity.size === BigInt(metadataIdentity.size) &&
-					current.identity.mtimeNs === metadataIdentity.mtimeNs &&
-					current.identity.sha256 === metadataIdentity.sha256 &&
-					!activePath
-				) {
-					activePath = candidate;
-					marker = current;
-				} else {
-					foundUnauthorized = true;
-				}
-			}
-			if (foundUnauthorized)
-				return fail("terminal_uncertain", "Lifecycle metadata marker changed before deferred cleanup.");
-			if (!marker || !activePath) {
-				const completedCleanup = { ...cleanup, metadataCompleted: true as const };
-				await broker.ledger.transition(identity, "effect_started", {
-					response: fail(
-						"cleanup_pending",
-						"Lifecycle metadata cleanup completion was durably reconciled.",
-						completedCleanup,
-					),
-				});
-				return { ok: true, result: { sessionId: id } };
-			}
-			let activeCleanup = cleanup;
-			if (cleanup.detachedMetadataPath || activePath === cleanup.plannedMetadataPath) {
-				activeCleanup = {
-					...cleanup,
-					detachedMetadataPath: activePath,
-					metadataAttempt: (cleanup.metadataAttempt ?? 1) + 1,
-					plannedMetadataPath: path.join(
-						path.dirname(cleanup.metadataPath!),
-						`.gjc-delete-${randomUUID()}-${path.basename(cleanup.metadataPath!)}`,
-					),
-				};
-				await broker.ledger.transition(identity, "effect_started", {
-					response: fail(
-						"cleanup_pending",
-						"Lifecycle metadata retry cleanup is preauthorized for durable reconciliation.",
-						activeCleanup,
-					),
-				});
-			}
-			const result = exactUnlinkLifecycleFile(activePath, marker.identity, activeCleanup.plannedMetadataPath!);
-			if (result.ok) return { ok: true, result: { sessionId: id } };
-			return fail("cleanup_pending", `Lifecycle metadata cleanup remains pending: ${result.code ?? "unknown"}`, {
-				...activeCleanup,
-				...(result.detachedPath ? { detachedMetadataPath: result.detachedPath } : {}),
-			});
-		}
 		const validated = await validateDeletePath(broker, input, id, record, cleanup);
 		if ("ok" in validated) return validated;
+		const metadataPreflight = preflightLifecycleDeleteMetadata(validated.metadataRoot, id, record, value =>
+			processIncarnationForBroker(broker, value),
+		);
+		if ("ok" in metadataPreflight) return metadataPreflight;
+		const metadataCleanup = metadataPreflight.cleanup;
 		let cleanupTarget: VerifiedSessionDeleteTarget = {
 			...validated.target,
 			...(validated.target.plannedArtifactsPath &&
@@ -2702,42 +3118,8 @@ async function executeLifecycleResponse(
 				},
 			);
 
-		if (record)
-			await broker.index.append({
-				type: "session_closed",
-				sessionId: id,
-				locator: record.locator,
-				endpointGeneration: record.endpointGeneration,
-				pid: record.pid,
-			});
-		const metadataPath = lifecycleMarkerPath(validated.metadataRoot, id);
-		if (fsSync.existsSync(metadataPath)) {
-			const stat = fsSync.lstatSync(metadataPath);
-			if (stat.isSymbolicLink() || !stat.isFile())
-				return fail("terminal_uncertain", "Lifecycle metadata path is occupied by an unsafe object.");
-		}
-		const metadata = captureLifecycleFile(metadataPath);
-		if (metadata) {
-			let marker: unknown;
-			try {
-				marker = JSON.parse(metadata.bytes.toString("utf8"));
-			} catch {
-				return fail("terminal_uncertain", "Lifecycle metadata ownership could not be verified.");
-			}
-			if (!isEffectMarker(marker) || (record && marker.pid !== record.pid) || !hasObservedProcessExit(marker.pid))
-				return fail("terminal_uncertain", "Lifecycle metadata ownership could not be verified.");
-			const metadataCleanup = metadataCleanupPlan(
-				validated.metadataRoot,
-				id,
-				metadataPath,
-				serializeCleanupIdentity({
-					dev: metadata.identity.dev,
-					ino: metadata.identity.ino,
-					size: Number(metadata.identity.size),
-					mtimeNs: metadata.identity.mtimeNs,
-					sha256: metadata.identity.sha256,
-				}),
-			);
+		const completion = { ok: true, result: { sessionId: id } } as const;
+		if (metadataCleanup.lifecycleFiles?.length) {
 			await broker.ledger.transition(identity, "effect_started", {
 				intendedSessionId: id,
 				response: fail(
@@ -2746,18 +3128,18 @@ async function executeLifecycleResponse(
 					metadataCleanup,
 				),
 			});
-			const result = exactUnlinkLifecycleFile(metadataPath, metadata.identity, metadataCleanup.plannedMetadataPath!);
-			if (!result.ok)
-				return fail(
-					"cleanup_pending",
-					`Saved session was deleted but lifecycle metadata cleanup is pending: ${result.code ?? "unknown"}`,
-					{
-						...metadataCleanup,
-						...(result.detachedPath ? { detachedMetadataPath: result.detachedPath } : {}),
-					},
-				);
+			const reconciled = await reconcileLifecycleCleanup(broker, identity, metadataCleanup, completion);
+			if (!reconciled.ok) return reconciled;
 		}
-		return { ok: true, result: { sessionId: id } };
+		if (record)
+			await broker.index.append({
+				type: "session_closed",
+				sessionId: id,
+				locator: record.locator,
+				endpointGeneration: record.endpointGeneration,
+				pid: record.pid,
+			});
+		return completion;
 	}
 	return fail("invalid_input", "Unknown lifecycle operation.");
 }
@@ -2822,6 +3204,35 @@ async function exactCleanupProof(
 		: undefined;
 }
 
+function validateLifecycleDeleteMetadataBinding(
+	broker: Broker,
+	operation: string,
+	input: Input,
+	identity: string,
+	cleanup: CleanupEvidence,
+): BrokerResponse | undefined {
+	if (operation !== "session.delete")
+		return fail("terminal_uncertain", "Lifecycle delete metadata cleanup is not authorized for this operation.");
+	const requestedId = sessionId(input);
+	const cwd = lifecycleCwd(input);
+	const requestedRoot = stateRoot(input, cwd);
+	if (
+		!requestedId ||
+		!isCanonicalSessionId(requestedId) ||
+		!cwd ||
+		!requestedRoot ||
+		!hasDefaultStateRoot(cwd, requestedRoot) ||
+		cleanup.sessionId !== requestedId ||
+		!cleanup.metadataRoot ||
+		path.resolve(cleanup.metadataRoot) !== requestedRoot
+	)
+		return fail("terminal_uncertain", "Lifecycle delete metadata cleanup does not match the normalized request.");
+	const recordedRoot = broker.ledger.get(identity)?.effectIntent?.stateRoot;
+	if (recordedRoot && path.resolve(recordedRoot) !== requestedRoot)
+		return fail("terminal_uncertain", "Lifecycle delete metadata cleanup does not match the recorded workspace.");
+	return undefined;
+}
+
 export interface LifecycleExecutionOutcome {
 	response: BrokerResponse;
 	durableEffects?: LifecycleDurableEffectsReceipt;
@@ -2837,7 +3248,56 @@ export async function executeLifecycle(
 	identity: string,
 	cleanup?: CleanupEvidence,
 ): Promise<LifecycleExecutionOutcome> {
-	if (cleanup?.phase === "lifecycle") return { response: await reconcileLifecycleCleanup(broker, identity, cleanup) };
+	if (cleanup?.phase === "metadata") {
+		if (operation !== "session.delete")
+			return {
+				response: fail(
+					"terminal_uncertain",
+					"Legacy metadata cleanup is not authorized for this lifecycle operation.",
+				),
+			};
+		const migrated = legacyMetadataCleanupPlan(cleanup);
+		if (!migrated)
+			return {
+				response: fail(
+					"terminal_uncertain",
+					"Legacy metadata cleanup replay lacks immutable identity-bound intent.",
+				),
+			};
+		const binding = validateLifecycleDeleteMetadataBinding(broker, operation, input, identity, migrated);
+		if (binding) return { response: binding };
+		await broker.ledger.transition(identity, "effect_started", {
+			response: fail(
+				"cleanup_pending",
+				"Legacy lifecycle metadata cleanup is preauthorized for durable reconciliation.",
+				migrated,
+			),
+		});
+		return {
+			response: await reconcileLifecycleCleanup(broker, identity, migrated, {
+				ok: true,
+				result: { sessionId: migrated.sessionId },
+			}),
+		};
+	}
+	if (cleanup?.phase === "lifecycle") {
+		const shapeValidation = validateLifecycleCleanupShape(cleanup);
+		if (shapeValidation) return { response: shapeValidation };
+		if (cleanup.lifecycleDeleteMetadata === true || operation === "session.delete") {
+			const binding = validateLifecycleDeleteMetadataBinding(broker, operation, input, identity, cleanup);
+			if (binding) return { response: binding };
+		}
+		return {
+			response: await reconcileLifecycleCleanup(
+				broker,
+				identity,
+				cleanup,
+				operation === "session.delete"
+					? { ok: true, result: { sessionId: cleanup.sessionId } }
+					: fail("spawn_failed", "No ready SDK endpoint remains available."),
+			),
+		};
+	}
 	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup);
 	const entry = broker.ledger.get(identity);
 	const priorDurableEffects = entry?.durableEffects;

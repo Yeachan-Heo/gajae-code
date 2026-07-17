@@ -5,6 +5,8 @@
  */
 import { parseFrontmatter, prompt } from "@gajae-code/utils";
 import { parseAgentFields } from "../discovery/helpers";
+import ralplanPersistenceTemplate from "../prompts/agent-fragments/ralplan-persistence.md" with { type: "text" };
+import restrictedBashTemplate from "../prompts/agent-fragments/restricted-bash.md" with { type: "text" };
 // Embed agent markdown files at build time
 import architectMd from "../prompts/agents/architect.md" with { type: "text" };
 import criticMd from "../prompts/agents/critic.md" with { type: "text" };
@@ -33,8 +35,24 @@ interface EmbeddedAgentDef {
 	template: string;
 }
 
+const ULTRAGOAL_RED_TEAM_OPEN = "__GJC_ULTRAGOAL_RED_TEAM_OPEN__";
+const ULTRAGOAL_RED_TEAM_CLOSE = "__GJC_ULTRAGOAL_RED_TEAM_CLOSE__";
+
 function buildAgentContent(def: EmbeddedAgentDef): string {
-	const body = prompt.render(def.template);
+	const restrictedBash = prompt.render(restrictedBashTemplate);
+	const ralplanPersistence = prompt.render(ralplanPersistenceTemplate, {
+		stage: def.frontmatter?.name ?? def.fileName.replace(/\.md$/, ""),
+	});
+	const template =
+		def.fileName === "executor.md"
+			? def.template
+					.replace("{{#if ultragoalRedTeam}}", ULTRAGOAL_RED_TEAM_OPEN)
+					.replace("{{/if}}", ULTRAGOAL_RED_TEAM_CLOSE)
+			: def.template;
+	const body = prompt
+		.render(template, { restrictedBash, ralplanPersistence })
+		.replace(ULTRAGOAL_RED_TEAM_OPEN, "{{#if ultragoalRedTeam}}")
+		.replace(ULTRAGOAL_RED_TEAM_CLOSE, "{{/if}}");
 	if (!def.frontmatter) return body;
 	return prompt.render(agentFrontmatterTemplate, { ...def.frontmatter, body });
 }

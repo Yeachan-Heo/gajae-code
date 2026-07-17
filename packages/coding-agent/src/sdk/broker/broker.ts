@@ -25,6 +25,7 @@ import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
 	type LifecycleStartupFailureReceipt,
+	type LifecycleState,
 } from "./lifecycle-ledger";
 import { type IndexedSession, SessionIndex } from "./session-index";
 import { BrokerTransport } from "./transport";
@@ -127,6 +128,8 @@ export type BrokerCleanupEvidence = {
 	plannedTranscriptPath?: string;
 	/** Fully identity-bound startup-failure cleanup plan, persisted before any detach. */
 	lifecycleFiles?: BrokerLifecycleCleanupFile[];
+	/** Delete metadata receipts authorize only the canonical marker/ready sibling pair. */
+	lifecycleDeleteMetadata?: true;
 };
 export type BrokerResponse =
 	| { ok: true; result?: unknown; indexSeq?: number }
@@ -143,6 +146,16 @@ export type BrokerResponse =
 			startupFailure?: LifecycleStartupFailureReceipt;
 	  };
 const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({ ok: false, error: { code, message } });
+
+function isCleanupPending(response: BrokerResponse): boolean {
+	return !response.ok && response.error.code === "cleanup_pending" && response.error.cleanup !== undefined;
+}
+
+function lifecycleResponseState(response: BrokerResponse): LifecycleState {
+	if (response.ok) return "terminal_ok";
+	if (isCleanupPending(response)) return "effect_started";
+	return response.error.code === "terminal_uncertain" ? "terminal_uncertain" : "terminal_error";
+}
 
 type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
@@ -674,7 +687,7 @@ export class Broker {
 				const cleanup = replay.error.cleanup;
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
-				await this.ledger.transition(identity, response.ok ? "terminal_ok" : "terminal_error", {
+				await this.ledger.transition(identity, lifecycleResponseState(response), {
 					response,
 					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
@@ -690,7 +703,7 @@ export class Broker {
 					return replay ?? error("terminal_uncertain", "prior lifecycle operation outcome is uncertain");
 				const outcome = await executeLifecycle(this, operation, input, identity, replay.error.cleanup);
 				const response = outcome.response;
-				await this.ledger.transition(identity, response.ok ? "terminal_ok" : "terminal_error", {
+				await this.ledger.transition(identity, lifecycleResponseState(response), {
 					response,
 					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
@@ -701,26 +714,18 @@ export class Broker {
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
-			await this.ledger.transition(
-				identity,
-				response.ok
-					? "terminal_ok"
-					: response.error.code === "terminal_uncertain"
-						? "terminal_uncertain"
-						: "terminal_error",
-				{
-					resultSessionId:
-						response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
-							? (response.result as { sessionId: string }).sessionId
-							: undefined,
-					response,
-					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
-					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
-					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
-				},
-			);
-			const reopenedLedger = await new LifecycleLedger(this.settings.agentDir).open();
-			const persisted = reopenedLedger.get(identity);
+			await this.ledger.transition(identity, lifecycleResponseState(response), {
+				resultSessionId:
+					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
+						? (response.result as { sessionId: string }).sessionId
+						: undefined,
+				response,
+				responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+				...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
+				...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
+			});
+			if (isCleanupPending(response)) return response;
+			const persisted = await this.ledger.readTerminal(identity, requestHash);
 			const expectedResponseDigest = createHash("sha256").update(canonicalJson(response)).digest("hex");
 			const persistenceVerified =
 				persisted?.responseDigest === expectedResponseDigest &&

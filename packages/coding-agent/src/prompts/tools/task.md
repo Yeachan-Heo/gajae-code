@@ -7,7 +7,7 @@ Launches subagents to parallelize workflows.
 {{else}}
 - Use `subagent` action `inspect` or `list` to snapshot manager state.
 {{/if}}
-- To wait or cancel, use the `subagent` tool; its await/cancel doctrine applies (never cancel just because an await timed out).
+- To wait or cancel, use the `subagent` tool; its await/cancel doctrine is authoritative.
 
 {{#if ircEnabled}}
 Subagents have no conversation history, but they can reach you and their siblings live via the `irc` tool. Front-load every fact, file path, and direction they need in {{#if contextEnabled}}`context` or `assignment`{{else}}each `assignment`{{/if}}.

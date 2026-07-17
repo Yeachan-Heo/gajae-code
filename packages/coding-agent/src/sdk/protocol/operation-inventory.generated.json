@@ -2988,79 +2988,7 @@
 		]
 	},
 	{
-		"sourceId": "agent_session:isMCPDiscoveryEnabled",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
-	},
-	{
-		"sourceId": "agent_session:getDiscoverableMCPTools",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "include",
-		"sdkId": "tools.list",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
-	},
-	{
-		"sourceId": "agent_session:getDiscoverableMCPSearchIndex",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
-	},
-	{
 		"sourceId": "agent_session:getSelectedMCPToolNames",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
-	},
-	{
-		"sourceId": "agent_session:activateDiscoveredMCPTools",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",

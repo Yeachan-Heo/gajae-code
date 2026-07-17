@@ -66,10 +66,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:hasForegroundBashBackgroundRequestHandler":
 		"internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:requestForegroundBashBackground": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:isMCPDiscoveryEnabled": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:getDiscoverableMCPSearchIndex": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSelectedMCPToolNames": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:activateDiscoveredMCPTools": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:isToolDiscoveryEnabled": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getDiscoverableToolSearchIndex": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSelectedDiscoveredToolNames": "internal accessor/plumbing, not a user-facing control seam",
@@ -221,7 +218,6 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:setTodoPhases": "todo.replace",
 	"agent_session:getQueuedMessageEntries": "queue.messages.list",
 	"agent_session:getAllToolNames": "tools.list",
-	"agent_session:getDiscoverableMCPTools": "tools.list",
 	"agent_session:getDiscoverableTools": "tools.list",
 	"agent_session:sendUserMessage": "turn.steer",
 	"agent_session:reload": "runtime.reload",

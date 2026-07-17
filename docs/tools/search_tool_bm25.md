@@ -43,7 +43,7 @@
 
 ## Flow
 1. `SearchToolBm25Tool.createIf()` in `packages/coding-agent/src/tools/search-tool-bm25.ts` exposes the tool only when `tools.discoveryMode !== "off"` and the session implements discovery hooks.
-2. `description` is rendered from `packages/coding-agent/src/prompts/tools/search-tool-bm25.md` via `renderSearchToolBm25Description()`, using the current discoverable-tool list plus per-server summary/count.
+2. `description` is rendered once from `packages/coding-agent/src/prompts/tools/search-tool-bm25.md` via zero-argument `renderSearchToolBm25Description()` and remains static across discovery activations.
 3. `execute()` re-checks capability and settings:
    - missing discovery hooks -> `ToolError("Tool discovery is unavailable in this session.")`
    - discovery disabled -> `ToolError("Tool discovery is disabled. Enable tools.discoveryMode or mcp.discoveryMode to use search_tool_bm25.")`
@@ -62,10 +62,8 @@
   - `tools.discoveryMode = "all"`: searches hidden discoverable built-ins.
 - Search-index source:
   - generic cached discoverable index from the session
-  - rebuilt ad hoc from the current discoverable-tool list if neither cache path works
-- Activation backend:
-  - generic `activateDiscoveredTools()`
-  - legacy `activateDiscoveredMCPTools()` fallback
+  - rebuilt ad hoc from the current discoverable-tool list when no cached generic index is available
+- Activation backend: generic `activateDiscoveredTools()`
 
 ## Side Effects
 - Session state

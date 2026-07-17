@@ -1292,20 +1292,20 @@ async function materializeReadUrlCacheEntry(
 	session: ToolSession,
 	entry: ReadUrlCacheEntry,
 ): Promise<ReadUrlCacheEntry | null> {
+	if (entry.output.length > 0) return entry;
 	if (entry.artifactId) {
 		const artifactOutput = await readArtifactOutput(session, entry.artifactId);
 		if (artifactOutput !== null) {
 			return { ...entry, output: artifactOutput };
 		}
 	}
-
-	return entry.output.length > 0 ? entry : null;
+	return null;
 }
 
 async function persistReadUrlArtifact(session: ToolSession, output: string): Promise<string | undefined> {
 	const { path: artifactPath, id } = (await session.allocateOutputArtifact?.("read")) ?? {};
 	if (!artifactPath) return undefined;
-	await Bun.write(artifactPath, output);
+	await Bun.write(artifactPath, wrapUntrustedContent(output));
 	return id;
 }
 
@@ -1379,6 +1379,13 @@ export async function loadReadUrlCacheEntry(
 	return fresh;
 }
 
+const UNTRUSTED_CONTENT_OPEN = "<untrusted-content>";
+const UNTRUSTED_CONTENT_CLOSE = "</untrusted-content>";
+
+export function wrapUntrustedContent(content: string): string {
+	return `${UNTRUSTED_CONTENT_OPEN}\n${content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")}\n${UNTRUSTED_CONTENT_CLOSE}`;
+}
+
 function buildUrlReadOutput(result: FetchRenderResult, content: string): string {
 	let output = "";
 	output += `URL: ${result.finalUrl}\n`;
@@ -1413,7 +1420,7 @@ export async function executeReadUrl(
 		truncated: Boolean(cacheEntry.details.truncated || needsArtifact),
 	};
 
-	const contentBlocks: Array<TextContent | ImageContent> = [{ type: "text", text: output }];
+	const contentBlocks: Array<TextContent | ImageContent> = [{ type: "text", text: wrapUntrustedContent(output) }];
 	if (cacheEntry.image) {
 		contentBlocks.push({ type: "image", data: cacheEntry.image.data, mimeType: cacheEntry.image.mimeType });
 	}

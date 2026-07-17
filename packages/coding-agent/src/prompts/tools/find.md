@@ -29,6 +29,6 @@ For open-ended searches requiring multiple rounds of globbing and searching, del
 </avoid>
 
 <critical>
-- You MUST use the built-in Find tool for every file-name lookup. NEVER shell out to `find`, `fd`, `locate`, `ls`, or `git ls-files` via Bash — they ignore `.gitignore`, blow past result limits, and waste tokens.
-- If you catch yourself typing `find -name`, `fd`, or `ls **/*.ext` in a Bash command, stop and re-issue the lookup through the Find tool with a glob pattern instead.
+- Use separate array entries for multiple path globs.
+- Set `gitignore: false` only when ignored files are intentionally in scope.
 </critical>

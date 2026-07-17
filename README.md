@@ -247,7 +247,7 @@ gjc setup defaults --check
 | Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
 | OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
-| External controller / bot | SDK WebSocket for a live session; Coordinator MCP (`gjc mcp-serve coordinator`) for multi-session orchestration; `gjc daemon session` CLI for scripts | External controllers drive GJC through the SDK's loopback WebSocket protocol (`docs/sdk.md`) or Coordinator MCP, not scrollback scraping. |
+| External controller / bot | SDK WebSocket for a live session; `gjc daemon session` CLI for scripts | External controllers use the SDK loopback protocol (`docs/sdk.md`) or its daemon CLI client, not scrollback scraping. Plugin-specific integrations remain opt-in and use their own configured contracts. |
 
 For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For external-control readiness, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For the wire protocol and machine interfaces, see [`docs/sdk.md`](docs/sdk.md).
 
