@@ -4,6 +4,8 @@ import transcribeScript from "./transcribe.py" with { type: "text" };
 export interface TranscribeOptions {
 	modelName?: string;
 	language?: string;
+	/** Domain vocabulary bias passed to whisper as `initial_prompt`. */
+	initialPrompt?: string;
 	signal?: AbortSignal;
 }
 
@@ -41,7 +43,9 @@ export async function transcribe(audioPath: string, options?: TranscribeOptions)
 
 	logger.debug("Transcribing with Python whisper", { pythonCmd, audioPath, modelName, language });
 
-	const proc = Bun.spawn([pythonCmd, "-c", transcribeScript, audioPath, modelName, language], {
+	const argv = [pythonCmd, "-c", transcribeScript, audioPath, modelName, language];
+	if (options?.initialPrompt) argv.push(options.initialPrompt);
+	const proc = Bun.spawn(argv, {
 		stdout: "pipe",
 		stderr: "pipe",
 	});

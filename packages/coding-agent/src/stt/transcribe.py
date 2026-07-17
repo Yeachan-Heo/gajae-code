@@ -3,7 +3,7 @@
 Reads WAV directly via Python's wave module (no ffmpeg needed).
 Resamples to 16kHz mono float32 and passes to whisper as a numpy array.
 
-Usage: python transcribe.py <audio.wav> <model_name> <language>
+Usage: python transcribe.py <audio.wav> <model_name> <language> [initial_prompt]
 Prints transcribed text to stdout.
 """
 
@@ -60,9 +60,11 @@ def main() -> None:
         print(f"Invalid language code: {language}", file=sys.stderr)
         sys.exit(1)
 
+    initial_prompt = sys.argv[4] if len(sys.argv) > 4 else None
+
     audio = load_wav(audio_path)
     model = whisper.load_model(model_name)
-    result = model.transcribe(audio, language=language)
+    result = model.transcribe(audio, language=language, initial_prompt=initial_prompt or None)
     print(result["text"].strip())
 
 

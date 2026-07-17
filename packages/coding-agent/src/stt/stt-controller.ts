@@ -1,11 +1,8 @@
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
-import { logger, Snowflake } from "@gajae-code/utils";
+import { logger } from "@gajae-code/utils";
 import { settings } from "../config/settings";
-import { ensureSTTDependencies } from "./downloader";
-import { type RecordingHandle, startRecording, verifyRecordingFile } from "./recorder";
-import { transcribe } from "./transcriber";
+import { resolveSttBackend, type SttBackendId, type SttBackendPreference, type SttSession } from "./backends";
+import { formatGhostTranscript } from "./level-meter";
+import { collectRepoVocabulary } from "./vocabulary";
 
 export type SttState = "idle" | "recording" | "transcribing";
 
@@ -13,6 +10,12 @@ interface ToggleOptions {
 	showWarning(msg: string): void;
 	showStatus(msg: string): void;
 	onStateChange(state: SttState): void;
+	/** Streaming ghost transcript; `null` clears the overlay. */
+	onPartial?(text: string | null): void;
+	/** Normalized input level 0..1 for the meter. */
+	onLevel?(level: number): void;
+	/** Repository root used for vocabulary collection. */
+	cwd?: string;
 }
 
 interface Editor {
@@ -21,15 +24,19 @@ interface Editor {
 
 export class STTController {
 	#state: SttState = "idle";
-	#recordingHandle: RecordingHandle | null = null;
-	#tempFile: string | null = null;
-	#depsResolved = false;
+	#session: SttSession | null = null;
+	#backendId: SttBackendId | null = null;
 	#toggling = false;
 	#disposed = false;
-	#transcriptionAbort: AbortController | null = null;
+	/** Guards late async events after cancel/dispose. */
+	#generation = 0;
 
 	get state(): SttState {
 		return this.#state;
+	}
+
+	get backendId(): SttBackendId | null {
+		return this.#backendId;
 	}
 
 	#setState(state: SttState, options: ToggleOptions): void {
@@ -43,10 +50,10 @@ export class STTController {
 		try {
 			switch (this.#state) {
 				case "idle":
-					await this.#startRecording(options);
+					await this.#startListening(options);
 					break;
 				case "recording":
-					await this.#stopAndTranscribe(editor, options);
+					await this.#stopAndInsert(editor, options);
 					break;
 				case "transcribing":
 					options.showStatus("Transcription in progress...");
@@ -57,71 +64,97 @@ export class STTController {
 		}
 	}
 
-	async #startRecording(options: ToggleOptions): Promise<void> {
-		if (!this.#depsResolved) {
-			try {
-				options.showStatus("Checking STT dependencies...");
-				await ensureSTTDependencies({
-					modelName: settings.get("stt.modelName") as string | undefined,
-					onProgress: p => options.showStatus(p.stage + (p.percent != null ? ` (${p.percent}%)` : "")),
-				});
-				options.showStatus("");
-				this.#depsResolved = true;
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : "Failed to setup STT dependencies";
-				options.showWarning(msg);
-				logger.error("STT dependency setup failed", { error: msg });
+	/**
+	 * Cancel the active voice session (Esc). Returns true when there was an
+	 * active session to cancel — callers use this to decide whether the key
+	 * press was consumed.
+	 */
+	cancel(options: ToggleOptions): boolean {
+		if (this.#state === "idle" || !this.#session) return false;
+		this.#generation += 1;
+		const session = this.#session;
+		this.#session = null;
+		void session.cancel().catch(() => {});
+		options.onPartial?.(null);
+		this.#setState("idle", options);
+		options.showStatus("Voice input cancelled.");
+		logger.debug("STT session cancelled", { backend: this.#backendId });
+		return true;
+	}
+
+	async #startListening(options: ToggleOptions): Promise<void> {
+		const generation = ++this.#generation;
+		try {
+			const preference = (settings.get("stt.backend") as SttBackendPreference | undefined) ?? "auto";
+			const language = settings.get("stt.language") as string | undefined;
+			const { backend, fallbackNote } = await resolveSttBackend(preference, language);
+			if (fallbackNote) options.showStatus(fallbackNote);
+			this.#backendId = backend.id;
+
+			// Vocabulary is best-effort and bounded; never block listening on it.
+			const vocabulary = options.cwd ? await collectRepoVocabulary(options.cwd) : [];
+
+			const session = await backend.start({
+				language,
+				modelName: settings.get("stt.modelName") as string | undefined,
+				vocabulary,
+				onStatus: msg => {
+					if (generation === this.#generation) options.showStatus(msg);
+				},
+				onPartial: text => {
+					if (generation === this.#generation && this.#state === "recording") {
+						options.onPartial?.(formatGhostTranscript(text));
+					}
+				},
+				onLevel: level => {
+					if (generation === this.#generation && this.#state === "recording") {
+						options.onLevel?.(level);
+					}
+				},
+				onError: message => {
+					if (generation !== this.#generation) return;
+					this.#session = null;
+					options.onPartial?.(null);
+					this.#setState("idle", options);
+					options.showWarning(message);
+				},
+			});
+			if (this.#disposed || generation !== this.#generation) {
+				void session.cancel().catch(() => {});
 				return;
 			}
-		}
-		const id = Snowflake.next();
-		this.#tempFile = path.join(os.tmpdir(), `gjc-stt-${id}.wav`);
-
-		try {
-			this.#recordingHandle = await startRecording(this.#tempFile);
+			this.#session = session;
 			this.#setState("recording", options);
-			logger.debug("STT recording started", { tempFile: this.#tempFile });
+			logger.debug("STT listening", { backend: backend.id });
 		} catch (err) {
-			this.#tempFile = null;
-			const msg = err instanceof Error ? err.message : "Failed to start recording";
+			const msg = err instanceof Error ? err.message : "Failed to start voice input";
 			options.showWarning(msg);
-			logger.error("STT recording failed to start", { error: msg });
+			logger.error("STT session failed to start", { error: msg });
 		}
 	}
 
-	async #stopAndTranscribe(editor: Editor, options: ToggleOptions): Promise<void> {
-		const handle = this.#recordingHandle;
-		const tempFile = this.#tempFile;
-		this.#recordingHandle = null;
-
-		if (!handle || !tempFile) {
+	async #stopAndInsert(editor: Editor, options: ToggleOptions): Promise<void> {
+		const session = this.#session;
+		this.#session = null;
+		if (!session) {
 			this.#setState("idle", options);
 			return;
 		}
-
+		const generation = this.#generation;
+		this.#setState("transcribing", options);
 		try {
-			await handle.stop();
-			// Validate the recording produced a usable file
-			await verifyRecordingFile(tempFile);
-			this.#setState("transcribing", options);
-
-			const sttSettings = {
-				modelName: settings.get("stt.modelName") as string | undefined,
-				language: settings.get("stt.language") as string | undefined,
-			};
-			this.#transcriptionAbort = new AbortController();
-			const text = await transcribe(tempFile, { ...sttSettings, signal: this.#transcriptionAbort.signal });
-			this.#transcriptionAbort = null;
-			if (this.#disposed) return;
+			const text = (await session.stop()).trim();
+			if (this.#disposed || generation !== this.#generation) return;
+			options.onPartial?.(null);
 			if (text.length > 0) {
 				editor.insertText(text);
 				options.showStatus("");
 			} else {
 				options.showStatus("No speech detected.");
 			}
-			if (!this.#disposed) this.#setState("idle", options);
 		} catch (err) {
-			if (this.#disposed) return;
+			if (this.#disposed || generation !== this.#generation) return;
+			options.onPartial?.(null);
 			if (err instanceof DOMException && err.name === "AbortError") {
 				this.#setState("idle", options);
 				return;
@@ -129,32 +162,18 @@ export class STTController {
 			const msg = err instanceof Error ? err.message : "Transcription failed";
 			options.showWarning(msg);
 			logger.error("STT transcription failed", { error: msg });
-			this.#setState("idle", options);
 		} finally {
-			try {
-				await fs.rm(tempFile, { force: true });
-			} catch {
-				// best effort cleanup
-			}
-			this.#tempFile = null;
+			if (!this.#disposed && generation === this.#generation) this.#setState("idle", options);
 		}
 	}
 
 	dispose(): void {
 		this.#disposed = true;
-		if (this.#transcriptionAbort) {
-			this.#transcriptionAbort.abort();
-			this.#transcriptionAbort = null;
-		}
-		if (this.#recordingHandle) {
-			this.#recordingHandle.stop().catch(() => {});
-			this.#recordingHandle = null;
-		}
-		if (this.#tempFile) {
-			fs.rm(this.#tempFile, { force: true }).catch(() => {});
-			this.#tempFile = null;
+		this.#generation += 1;
+		if (this.#session) {
+			void this.#session.cancel().catch(() => {});
+			this.#session = null;
 		}
 		this.#state = "idle";
-		this.#depsResolved = false;
 	}
 }
