@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -35,6 +35,73 @@ async function exists(p: string): Promise<boolean> {
 	}
 }
 
+/**
+ * Create a bare-but-working local git repo served by `git daemon`, returning a
+ * `git://127.0.0.1:<port>/<subdir>` URL that `resolveGit` clones with argv-only
+ * `git clone --depth 1 -- <url> <dest>`. Uses a fixed high port with
+ * `--reuseaddr` and `--export-all` so no per-repo `git-daemon-export-ok` dance
+ * is needed. Returns null if `git daemon` is unavailable so callers can skip.
+ */
+async function mkGitDaemonRepo(manifest: object): Promise<{ url: string; stop: () => void } | null> {
+	if (spawnSync("git", ["daemon", "--help"], { stdio: "ignore" }).status !== 0) return null;
+	const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-git-src-"));
+	tempDirs.push(base);
+	const repoDir = path.join(base, "plugin-repo");
+	await fs.mkdir(repoDir, { recursive: true });
+	await fs.writeFile(
+		path.join(repoDir, "gajae-plugin.json"),
+		JSON.stringify(manifest),
+	);
+	await fs.writeFile(path.join(repoDir, "README.md"), "# git-sourced plugin\n");
+	const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+	if (spawnSync("git", ["init", "-q", "-b", "main"], { cwd: repoDir, env: gitEnv }).status !== 0) return null;
+	if (spawnSync("git", ["add", "-A"], { cwd: repoDir, env: gitEnv }).status !== 0) return null;
+	if (spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: repoDir, env: gitEnv }).status !== 0) return null;
+
+	const port = "19418";
+	const daemon = spawn(
+		"git",
+		["daemon", "--base-path=" + base, "--export-all", "--listen=127.0.0.1", `--port=${port}`, "--reuseaddr"],
+		{ stdio: "ignore", detached: true },
+	);
+	// Poll until the daemon actually accepts connections (bind/ready can lag the
+	// spawn on busy or CI hosts); give up after ~3s so the test fails fast rather
+	// than hanging on a clone to a half-bound socket.
+	const ready = await new Promise<boolean>(resolve => {
+		const startedAt = Date.now();
+		const probe = () => {
+			const child = spawn("git", ["ls-remote", `git://127.0.0.1:${port}/plugin-repo`, "HEAD"], {
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let settled = false;
+			child.on("error", () => {});
+			child.on("close", code => {
+				if (settled) return;
+				settled = true;
+				if (code === 0) resolve(true);
+				else if (Date.now() - startedAt > 3000) resolve(false);
+				else setTimeout(probe, 100);
+			});
+		};
+		probe();
+	});
+	if (!ready) {
+		try {
+			process.kill(-daemon.pid!, "SIGTERM");
+		} catch {
+			daemon.kill("SIGTERM");
+		}
+		return null;
+	}
+	const stop = () => {
+		try {
+			process.kill(-daemon.pid!, "SIGTERM");
+		} catch {
+			daemon.kill("SIGTERM");
+		}
+	};
+	return { url: `git://127.0.0.1:${port}/plugin-repo`, stop };
+}
 describe("GJC plugin installer", () => {
 	test("installs a local-path bundle into the project scope", async () => {
 		const cwd = await mkProjectCwd();
@@ -123,5 +190,52 @@ describe("GJC plugin installer", () => {
 		expect(await isGjcPluginBundleSource(tarball)).toBe(true);
 		const registry = await readRegistry("project", cwd);
 		expect(registry.plugins[0]?.source.kind).toBe("tarball");
+	});
+	test("installs a git source bundle via a local git daemon", async () => {
+		const served = await mkGitDaemonRepo({
+			kind: "gajae-code-plugin",
+			name: "git-source-bundle",
+			version: "1.0.0",
+			subskills: [],
+			tools: [],
+			hooks: [],
+			mcps: [],
+			system_appendix: [{ name: "git-policy", content: "policy body" }],
+			"agent-appendix": [],
+		});
+		if (!served) return; // git daemon unavailable; skip without failing.
+		const cwd = await mkProjectCwd();
+		try {
+			const result = await installGjcPluginBundle(served.url, { scope: "project", cwd });
+			expect(result.status).toBe("installed");
+			expect(result.entry.source.kind).toBe("git");
+			expect(result.entry.source.uri).toBe(served.url);
+
+			const installedDir = path.join(cwd, ".gjc", "gjc-plugins", "git-source-bundle");
+			expect(await exists(path.join(installedDir, "gajae-plugin.json"))).toBe(true);
+
+			const registry = await readRegistry("project", cwd);
+			expect(registry.plugins.map(p => p.name)).toEqual(["git-source-bundle"]);
+			expect(registry.plugins[0]?.source.kind).toBe("git");
+			expect(typeof registry.plugins[0]?.source.sha).toBe("string");
+		} finally {
+			served.stop();
+		}
+	});
+
+	test("an invalid git source maps stderr to GjcPluginLoadError(install_conflict)", async () => {
+		// A refused connection produces a git stderr line; runGit must surface it
+		// as GjcPluginLoadError(install_conflict) with the stderr in the message.
+		const cwd = await mkProjectCwd();
+		// Port 1 is privileged/refused on every OS — guaranteed non-existent repo.
+		const badUrl = "git://127.0.0.1:1/no-such-repo.git";
+		await expect(installGjcPluginBundle(badUrl, { scope: "project", cwd })).rejects.toMatchObject({
+			code: "install_conflict",
+			name: "GjcPluginLoadError",
+		});
+		// Nothing installed.
+		const registry = await readRegistry("project", cwd);
+		expect(registry.plugins).toEqual([]);
+		expect(await exists(path.join(cwd, ".gjc", "gjc-plugins", "no-such-repo"))).toBe(false);
 	});
 });
