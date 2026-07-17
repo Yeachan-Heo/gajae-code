@@ -87,6 +87,33 @@ function makeNoisePng(width: number, height: number): Buffer {
 	]);
 }
 
+function makeFlatPng(width: number, height: number): Buffer {
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 6;
+	const stride = 1 + width * 4;
+	const raw = Buffer.alloc(stride * height);
+	for (let y = 0; y < height; y += 1) {
+		const row = y * stride;
+		raw[row] = 0;
+		for (let x = 0; x < width; x += 1) {
+			const offset = row + 1 + x * 4;
+			raw[offset] = 0x33;
+			raw[offset + 1] = 0x66;
+			raw[offset + 2] = 0x99;
+			raw[offset + 3] = 0xff;
+		}
+	}
+	return Buffer.concat([
+		Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+		pngChunk("IHDR", ihdr),
+		pngChunk("IDAT", zlibSync(raw)),
+		pngChunk("IEND", Buffer.alloc(0)),
+	]);
+}
+
 describe("computer tool schema", () => {
 	const validCases = [
 		{ action: "screenshot" },
@@ -461,6 +488,88 @@ describe("computer tool dispatch", () => {
 		expect(artifactPath).toBeTruthy();
 		if (!artifactPath) throw new Error("expected persisted screenshot path");
 		expect((await fs.stat(artifactPath)).size).toBe(600 * 1024);
+	});
+
+	it("bounds large-dimension screenshots that fit the byte budget while preserving the full-resolution artifact", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeFlatPng(2400, 1600);
+		expect(png.length).toBeLessThan(5 * 1024 * 1024);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 2400, heightPx: 1600, png }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("large-dims-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		const image = result.content.find(block => block.type === "image");
+		expect(image).toBeTruthy();
+		if (image?.type !== "image") throw new Error("expected inline image");
+		const { width, height } = await new Bun.Image(Buffer.from(image.data, "base64")).metadata();
+		expect(width).toBeLessThanOrEqual(1568);
+		expect(height).toBeLessThanOrEqual(1568);
+		const artifactPath = result.details?.screenshot?.path;
+		expect(artifactPath).toBeTruthy();
+		if (!artifactPath) throw new Error("expected persisted screenshot path");
+		expect((await fs.readFile(artifactPath)).equals(png)).toBe(true);
+	});
+
+	it("appends the coordinate-mapping note when the inline screenshot was scaled", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeFlatPng(2400, 1600);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 2400, heightPx: 1600, png }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("scaled-note-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		expect(textOf(result)).toContain("original 2400x1600");
+		expect(textOf(result)).toContain("displayed at");
+	});
+
+	it("returns small in-spec screenshots byte-identical without a dimension note", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeFlatPng(800, 600);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 800, heightPx: 600, png }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("small-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		const image = result.content.find(block => block.type === "image");
+		expect(image).toBeTruthy();
+		if (image?.type !== "image") throw new Error("expected inline image");
+		expect(image.data).toBe(png.toString("base64"));
+		expect(image.mimeType).toBe("image/png");
+		expect(textOf(result)).not.toContain("displayed at");
+	});
+
+	it("recompresses dimension-safe screenshots that are not comfortably under the byte budget", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeNoisePng(1024, 1024);
+		expect(png.length).toBeGreaterThan((5 * 1024 * 1024) / 4);
+		expect(png.length).toBeLessThan(5 * 1024 * 1024);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 1024, heightPx: 1024, png }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("compact-budget-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		const image = result.content.find(block => block.type === "image");
+		expect(image).toBeTruthy();
+		if (image?.type !== "image") throw new Error("expected inline image");
+		expect(Buffer.byteLength(image.data, "base64")).toBeLessThan(png.length);
+		expect(textOf(result)).not.toContain("displayed at");
 	});
 
 	it("persists screenshot fallbacks in private per-session directories with restrictive file modes", async () => {

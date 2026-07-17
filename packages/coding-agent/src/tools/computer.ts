@@ -6,7 +6,7 @@ import type { ImageContent } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
-import { resizeImage } from "../utils/image-resize";
+import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { markScreenshotFallbackDirCreatedForGc } from "./computer-gc";
 import type { ToolSession } from "./index";
 import type { OutputMeta } from "./output-meta";
@@ -701,11 +701,16 @@ async function inlineImageContentFromNativeResult(
 	details: ComputerToolDetails,
 	session: ToolSession,
 ): Promise<ImageContent | undefined> {
+	// Anthropic rejects requests carrying more than 20 images when any image
+	// exceeds 2000px per dimension ("many-image requests"), so gating on bytes
+	// alone is not enough: an in-budget full-resolution capture can still brick
+	// the session once enough screenshots accumulate in history. Always route
+	// through resizeImage (its fast path returns already-small images
+	// untouched) and tell the model how to map coordinates back to the native
+	// screenshot frame when the inline image was scaled.
 	const image = fullResolutionImageContentFromNativeResult(value);
 	if (!image) return undefined;
 	const maxBytes = getInlineScreenshotMaxBytes(session);
-	const originalBytes = Buffer.byteLength(image.data, "base64");
-	if (originalBytes <= maxBytes) return image;
 
 	try {
 		const resized = await resizeImage(image, {
@@ -715,6 +720,8 @@ async function inlineImageContentFromNativeResult(
 			jpegQuality: COMPUTER_INLINE_SCREENSHOT_JPEG_QUALITY,
 		});
 		if (resized.buffer.length <= maxBytes) {
+			const note = formatDimensionNote(resized);
+			if (note) details.message = `${details.message} ${note}`;
 			return { type: "image", data: resized.data, mimeType: resized.mimeType };
 		}
 	} catch {
