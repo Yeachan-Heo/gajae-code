@@ -338,7 +338,10 @@ export interface InteractiveModeContext {
 	handleBackgroundCommand(): void;
 	handleImagePaste(): Promise<boolean>;
 	handleBtwCommand(question: string): Promise<void>;
+	handleBtwRCommand(question: string): Promise<void>;
 	hasActiveBtw(): boolean;
+	hasActiveBtwR(): boolean;
+	handleBtwRFollowUp(question: string): Promise<"accepted" | "busy" | "closed">;
 	handleBtwEscape(): boolean;
 	cycleThinkingLevel(): void;
 	cycleRoleModel(options?: { temporary?: boolean }): Promise<void>;

@@ -752,6 +752,16 @@ export class InputController {
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
 		text = text.trim();
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
+		if (this.ctx.hasActiveBtwR()) {
+			if (!text) return;
+			if (text === "." || text === "c") {
+				if ((await this.ctx.handleBtwRFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
+					this.ctx.editor.setText("");
+				}
+				return;
+			}
+		}
+
 
 		// Empty submit while streaming with queued messages: flush queues immediately
 		if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
@@ -794,6 +804,8 @@ export class InputController {
 		}
 
 		if (!text) return;
+		const wasSlashOrigin = text.startsWith("/");
+
 
 		// Handle built-in slash commands
 		const slashResult = await executeBuiltinSlashCommand(text, {
@@ -815,6 +827,12 @@ export class InputController {
 		// a few lines below at the streaming branch). Explicit queue shortcuts
 		// route through `handleFollowUp` and dispatch as `followUp`.
 		if (await this.#invokeSkillCommand(text, this.#busyStreamingBehavior(), composer)) {
+			return;
+		}
+		if (this.ctx.hasActiveBtwR() && !wasSlashOrigin) {
+			if ((await this.ctx.handleBtwRFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
+				this.ctx.editor.setText("");
+			}
 			return;
 		}
 
@@ -1357,6 +1375,12 @@ export class InputController {
 	async handleFollowUp(): Promise<void> {
 		const text = this.ctx.editor.getText().trim();
 		if (!text) return;
+		if (this.ctx.hasActiveBtwR()) {
+			if ((await this.ctx.handleBtwRFollowUp(text)) === "accepted") {
+				this.ctx.editor.setText("");
+			}
+			return;
+		}
 
 		// Compaction first: while compacting, queue free text and `/skill:*`
 		// commands in the compaction-local queue. `flushCompactionQueue`
