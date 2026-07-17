@@ -63,7 +63,7 @@ const BASE_CFG: NotificationConfig = {
 		enabled: false,
 	},
 	streaming: {
-		enabled: false,
+		enabled: true,
 	},
 	topics: {
 		nameTemplate: undefined,
@@ -137,7 +137,7 @@ describe("notifications config", () => {
 				enabled: false,
 			},
 			streaming: {
-				enabled: false,
+				enabled: true,
 			},
 			topics: {
 				nameTemplate: undefined,

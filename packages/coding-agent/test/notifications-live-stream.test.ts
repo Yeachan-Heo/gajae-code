@@ -183,8 +183,8 @@ test("rapid live updates are throttled to a single frame within the interval", a
 	expect(live().length).toBe(1); // later updates fall inside the throttle window
 });
 
-test("no live frames are emitted when streaming is disabled, and finalized carries no messageRef", async () => {
-	setEnv({ GJC_NOTIFICATIONS: "1" }); // GJC_NOTIFICATIONS_STREAM unset -> off
+test("GJC_NOTIFICATIONS_STREAM=0 disables live frames, and finalized carries no messageRef", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM: "0" });
 	const { handlers, ctx, frames } = await bootSession();
 
 	await handlers.get("message_update")!(assistant("should not stream"), ctx);
@@ -200,9 +200,9 @@ test("no live frames are emitted when streaming is disabled, and finalized carri
 	expect(final.messageRef).toBeUndefined();
 });
 
-test("global Telegram streaming setting enables live frames without the env opt-in", async () => {
+test("default Telegram streaming setting enables live frames without the env opt-in", async () => {
 	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
-	const { handlers, ctx, frames } = await bootSession({ "notifications.telegram.streaming.enabled": true });
+	const { handlers, ctx, frames } = await bootSession();
 
 	await handlers.get("message_update")!(assistant("settings enabled stream"), ctx);
 	await waitFor(

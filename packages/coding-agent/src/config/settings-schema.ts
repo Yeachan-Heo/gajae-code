@@ -297,7 +297,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"notifications.telegram.streaming.enabled": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "notifications",
 			label: "Telegram Message Streaming",
