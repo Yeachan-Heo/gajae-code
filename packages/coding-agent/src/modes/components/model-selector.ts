@@ -334,6 +334,8 @@ export class ModelSelectorComponent extends Container {
 	#selectedActionIndex: number = 0;
 	#pendingThinkingChoice?: PendingThinkingChoice;
 	#selectedThinkingIndex: number = 0;
+	#assignmentState: "idle" | "assigning" = "idle";
+	#closeAfterAssignment = false;
 
 	// Preset landing state
 	#viewMode: ModelSelectorViewMode = "presets";
@@ -1469,6 +1471,12 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.#assignmentState === "assigning") {
+			if (getKeybindings().matches(keyData, "tui.select.cancel")) {
+				this.#closeAfterAssignment = true;
+			}
+			return;
+		}
 		if (this.#pendingThinkingChoice) {
 			this.#handleThinkingMenuInput(keyData);
 			return;
@@ -1833,23 +1841,49 @@ export class ModelSelectorComponent extends Container {
 				? item.selector
 				: formatModelSelectorValue(item.selector, selectedThinkingLevel);
 
-		// Update local state for UI
-		for (const targetRole of roles ?? [role]) {
-			this.#roles[targetRole] = { model: item.model, thinkingLevel: selectedThinkingLevel };
-		}
-
-		// Notify caller (for updating agent state if needed)
-		this.#onSelectCallback({
+		const selection: Extract<ModelSelectorSelection, { kind: "assignment" }> = {
 			kind: "assignment",
 			model: item.model,
 			role,
 			roles,
 			thinkingLevel: selectedThinkingLevel,
 			selector: selectorValue,
-		});
+		};
+		if (this.#isTrackedSingleAssignment(selection)) {
+			void this.#handleTrackedAssignment(selection);
+			return;
+		}
+
+		// Update local state for UI
+		for (const targetRole of roles ?? [role]) {
+			this.#roles[targetRole] = { model: item.model, thinkingLevel: selectedThinkingLevel };
+		}
+
+		// Notify caller (for updating agent state if needed)
+		this.#onSelectCallback(selection);
 
 		// Update list to show new badges
 		this.#updateList();
+	}
+	#isTrackedSingleAssignment(selection: Extract<ModelSelectorSelection, { kind: "assignment" }>): boolean {
+		return selection.role !== null && selection.roles === undefined;
+	}
+
+	async #handleTrackedAssignment(selection: Extract<ModelSelectorSelection, { kind: "assignment" }>): Promise<void> {
+		if (this.#assignmentState !== "idle") return;
+		this.#assignmentState = "assigning";
+		this.#tui.requestRender();
+		try {
+			await Promise.resolve(this.#onSelectCallback(selection));
+		} catch {
+			// The controller reports tracked assignment failures before rethrowing.
+		} finally {
+			this.#assignmentState = "idle";
+			const shouldClose = this.#closeAfterAssignment;
+			this.#closeAfterAssignment = false;
+			if (shouldClose) this.#onCancelCallback();
+			else this.#tui.requestRender();
+		}
 	}
 
 	getSearchInput(): Input {

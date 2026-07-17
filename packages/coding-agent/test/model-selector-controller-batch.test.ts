@@ -80,6 +80,7 @@ function createControllerContext() {
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 		notifyConfigChanged: vi.fn(async () => {}),
+		restoreComposer: vi.fn(),
 	};
 	return {
 		ctx,
@@ -96,6 +97,23 @@ async function openSelector(ctx: ReturnType<typeof createControllerContext>["ctx
 	new SelectorController(ctx as never).showModelSelector();
 	return ctx.editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 }
+async function settleSelectorInput(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+}
+
+async function openReadySelector(ctx: Parameters<typeof openSelector>[0]): Promise<ModelSelectorComponent> {
+	const selector = await openSelector(ctx);
+	await settleSelectorInput();
+	return selector;
+}
+
+function selectMenuAction(selector: ModelSelectorComponent, actionIndex: number): void {
+	selector.handleInput("\n");
+	for (let index = 0; index < actionIndex; index += 1) selector.handleInput("\x1b[B");
+	selector.handleInput("\n");
+}
 
 describe("SelectorController model batch assignments", () => {
 	beforeAll(async () => {
@@ -108,66 +126,173 @@ describe("SelectorController model batch assignments", () => {
 			executor: "provider-a/profile-executor:medium",
 			architect: "provider-a/profile-architect:low",
 		});
-		const selector = await openSelector(ctx);
+		const selector = await openReadySelector(ctx);
 
-		await selector.__testSelectAssignment({
-			model: selectedModel,
-			role: "default",
-			roles: ["executor", "architect", "planner", "critic"],
-			thinkingLevel: ThinkingLevel.Low,
-			selector: "provider-a/selected:low",
-		});
+		selectMenuAction(selector, 5);
+		await settleSelectorInput();
 
 		expect(setModelCalls).toEqual([]);
 		expect(settings.getModelRole("default")).toBe("provider-a/original-default:medium");
 		expect(settings.get("task.agentModelOverrides")).toEqual({
-			executor: "provider-a/selected:low",
-			architect: "provider-a/selected:low",
-			planner: "provider-a/selected:low",
-			critic: "provider-a/selected:low",
+			executor: "provider-a/selected",
+			architect: "provider-a/selected",
+			planner: "provider-a/selected",
+			critic: "provider-a/selected",
 		});
 
 		settings.clearOverride("task.agentModelOverrides");
 		expect(settings.get("task.agentModelOverrides")).toEqual({
-			executor: "provider-a/selected:low",
-			architect: "provider-a/selected:low",
-			planner: "provider-a/selected:low",
-			critic: "provider-a/selected:low",
+			executor: "provider-a/selected",
+			architect: "provider-a/selected",
+			planner: "provider-a/selected",
+			critic: "provider-a/selected",
 		});
 		expect(ctx.showStatus).toHaveBeenCalledWith(
-			"Role-agent models set to provider-a/selected:low for EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
+			"Role-agent models set to provider-a/selected for EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		);
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
 	test("all targets selection writes DEFAULT plus every role-agent override", async () => {
 		const { ctx, settings, setModelCalls } = createControllerContext();
-		const selector = await openSelector(ctx);
+		const selector = await openReadySelector(ctx);
 
-		await selector.__testSelectAssignment({
-			model: selectedModel,
-			role: "default",
-			roles: ["default", "executor", "architect", "planner", "critic"],
-			thinkingLevel: ThinkingLevel.High,
-			selector: "provider-a/selected:high",
-		});
+		selectMenuAction(selector, 6);
+		await settleSelectorInput();
 
 		expect(setModelCalls).toEqual([
 			{
 				model: selectedModel,
 				role: "default",
-				options: { cause: "user-selection", selector: "provider-a/selected", thinkingLevel: ThinkingLevel.High },
+				options: { cause: "user-selection", selector: "provider-a/selected", thinkingLevel: ThinkingLevel.Inherit },
 			},
 		]);
-		expect(settings.getModelRole("default")).toBe("provider-a/selected:high");
+		expect(settings.getModelRole("default")).toBe("provider-a/selected");
 		expect(settings.get("task.agentModelOverrides")).toEqual({
-			executor: "provider-a/selected:high",
-			architect: "provider-a/selected:high",
-			planner: "provider-a/selected:high",
-			critic: "provider-a/selected:high",
+			executor: "provider-a/selected",
+			architect: "provider-a/selected",
+			planner: "provider-a/selected",
+			critic: "provider-a/selected",
 		});
 		expect(ctx.showStatus).toHaveBeenCalledWith(
-			"All model targets set to provider-a/selected:high for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
+			"All model targets set to provider-a/selected for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
 		);
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
+	test("individual DEFAULT assignment stays open until cancel", async () => {
+		const { ctx, settings } = createControllerContext();
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 0);
+		await settleSelectorInput();
+
+		expect(settings.getModelRole("default")).toBe("provider-a/selected");
+		expect(ctx.restoreComposer).not.toHaveBeenCalled();
+
+		selector.handleInput("\x1b");
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
+	test("serializes consecutive named role assignments on the mounted selector", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		const firstGate = Promise.withResolvers<string>();
+		const secondGate = Promise.withResolvers<string>();
+		session.modelRegistry.getApiKey
+			.mockImplementationOnce(async () => await firstGate.promise)
+			.mockImplementationOnce(async () => await secondGate.promise);
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 1);
+		expect(session.modelRegistry.getApiKey).toHaveBeenCalledTimes(1);
+		firstGate.resolve("key");
+		await settleSelectorInput();
+
+		selectMenuAction(selector, 2);
+		expect(session.modelRegistry.getApiKey).toHaveBeenCalledTimes(2);
+		secondGate.resolve("key");
+		await settleSelectorInput();
+
+		expect(settings.get("task.agentModelOverrides")).toMatchObject({
+			executor: "provider-a/selected",
+			architect: "provider-a/selected",
+		});
+		expect(ctx.restoreComposer).not.toHaveBeenCalled();
+	});
+	test("suppresses pending menu input and defers repeated cancel once through successful assignment", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		const gate = Promise.withResolvers<string>();
+		session.modelRegistry.getApiKey.mockImplementation(async () => await gate.promise);
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 1);
+		selector.handleInput("\n");
+		selector.handleInput("\x1b");
+		selector.handleInput("\x1b");
+		expect(session.modelRegistry.getApiKey).toHaveBeenCalledTimes(1);
+
+		gate.resolve("key");
+		await settleSelectorInput();
+
+		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/selected" });
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+	});
+	test("reports rejected and missing-key tracked assignments before one deferred restore", async () => {
+		for (const apiKeyResult of [
+			async (): Promise<string | undefined> => {
+				throw new Error("credential rejected");
+			},
+			async (): Promise<string | undefined> => undefined,
+		]) {
+			const { ctx, session } = createControllerContext();
+			const order: string[] = [];
+			ctx.showError.mockImplementation(() => order.push("error"));
+			ctx.ui.requestRender.mockImplementation(() => order.push("render"));
+			ctx.restoreComposer.mockImplementation(() => order.push("restore"));
+			session.modelRegistry.getApiKey.mockImplementation(async () => await apiKeyResult());
+			const selector = await openReadySelector(ctx);
+			const refreshRoleAssignments = selector.refreshRoleAssignments.bind(selector);
+			vi.spyOn(selector, "refreshRoleAssignments").mockImplementation(options => {
+				order.push("refresh");
+				refreshRoleAssignments(options);
+			});
+			order.length = 0;
+
+			selectMenuAction(selector, 1);
+			selector.handleInput("\x1b");
+			selector.handleInput("\x1b");
+			await settleSelectorInput();
+
+			expect(ctx.showError).toHaveBeenCalledTimes(1);
+			expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+			const errorIndex = order.indexOf("error");
+			const refreshIndex = order.indexOf("refresh");
+			const restoreIndex = order.indexOf("restore");
+			const refreshRenderIndex = order.indexOf("render", refreshIndex);
+			expect(errorIndex).toBeLessThan(refreshIndex);
+			expect(refreshIndex).toBeLessThan(refreshRenderIndex);
+			expect(refreshRenderIndex).toBeLessThan(restoreIndex);
+		}
+	});
+	test("refreshes tracked assignment truth after failure and permits retry", async () => {
+		const { ctx, settings, session } = createControllerContext();
+		const failure = Promise.withResolvers<string>();
+		const success = Promise.withResolvers<string>();
+		session.modelRegistry.getApiKey
+			.mockImplementationOnce(async () => await failure.promise)
+			.mockImplementationOnce(async () => await success.promise);
+		const selector = await openReadySelector(ctx);
+
+		selectMenuAction(selector, 1);
+		failure.reject(new Error("credential rejected"));
+		await settleSelectorInput();
+		expect(ctx.showError).toHaveBeenCalledTimes(1);
+		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/original-executor:low" });
+
+		selectMenuAction(selector, 1);
+		success.resolve("key");
+		await settleSelectorInput();
+
+		expect(session.modelRegistry.getApiKey).toHaveBeenCalledTimes(2);
+		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/selected" });
 	});
 
 	test("temporary selection replaces the live fallback chain with the selected model", async () => {

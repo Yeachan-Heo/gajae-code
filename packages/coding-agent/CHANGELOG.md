@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 - Palette slash commands now run only from an empty composer; drafts are never touched.
+- Individual default and named-role model assignments now keep the model selector open for consecutive choices, while batch assignments retain their existing close-on-success behavior.
 - Aborting a session without an enabled active goal no longer suppresses the first reminder when a goal is activated later; active-goal abort suppression is one-shot, goal-owned, and clears across inactive or replacement-goal transitions (#2436).
 - Palette slash submissions no longer clear or rewrite composer text, cursor state, history, or pending images created while an asynchronous input hook is awaiting; canonical keyboard submission cleanup remains unchanged (#2441).
 - Dead browser-tab recovery now expires descriptors without releasing replacement, revived, or differently owned tabs, while exactly-once teardown closes stale targets and releases browser holds without refcount underflow (#2437).

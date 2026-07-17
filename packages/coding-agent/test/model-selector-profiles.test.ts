@@ -133,6 +133,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		updateEditorBorderColor: vi.fn(),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
+		restoreComposer: vi.fn(),
 	};
 	return { ctx, settings, session, flush, setCalls };
 }
@@ -387,6 +388,7 @@ describe("model selector profiles", () => {
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/alternate" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
 	test("Set as default persists and flushes modelProfile.default", async () => {
@@ -399,6 +401,7 @@ describe("model selector profiles", () => {
 		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
 		expect(flush).toHaveBeenCalledTimes(1);
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
 	test("credential failure shows error and leaves model and overrides unchanged", async () => {
