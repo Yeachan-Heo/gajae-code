@@ -497,24 +497,15 @@ mod platform {
 		}
 	}
 
-	#[cfg(any(
-		target_os = "macos",
-		target_os = "ios",
-		target_os = "freebsd",
-		target_os = "openbsd",
-		target_os = "netbsd"
-	))]
+	// libc 0.2.186 unified the BSD/Apple `st_mtimespec` timespec field into
+	// flat `st_mtime` + nanosecond fields; only NetBSD spells the nanosecond
+	// field without an underscore.
+	#[cfg(target_os = "netbsd")]
 	fn stat_mtime_ns(stat: &libc::stat) -> i128 {
-		i128::from(stat.st_mtimespec.tv_sec) * 1_000_000_000 + i128::from(stat.st_mtimespec.tv_nsec)
+		i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtimensec)
 	}
 
-	#[cfg(not(any(
-		target_os = "macos",
-		target_os = "ios",
-		target_os = "freebsd",
-		target_os = "openbsd",
-		target_os = "netbsd"
-	)))]
+	#[cfg(not(target_os = "netbsd"))]
 	fn stat_mtime_ns(stat: &libc::stat) -> i128 {
 		i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtime_nsec)
 	}
