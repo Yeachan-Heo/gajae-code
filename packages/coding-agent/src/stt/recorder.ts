@@ -58,7 +58,7 @@ async function startSoxRecording(outputPath: string): Promise<RecordingHandle> {
 	};
 }
 
-async function startFFmpegRecording(outputPath: string): Promise<RecordingHandle> {
+async function startFFmpegRecording(outputPath: string, macosAudioDevice = ":default"): Promise<RecordingHandle> {
 	let args: string[];
 	if (isWindows) {
 		const device = await detectWindowsAudioDevice();
@@ -78,12 +78,16 @@ async function startFFmpegRecording(outputPath: string): Promise<RecordingHandle
 			outputPath,
 		];
 	} else if (process.platform === "darwin") {
+		// ":0" is the first *enumerated* avfoundation audio device, not the
+		// system default — on machines with virtual devices (BlackHole,
+		// Loopback) that records pure silence. ":default" targets the actual
+		// default input; the caller falls back to ":0" if it fails to start.
 		args = [
 			"ffmpeg",
 			"-f",
 			"avfoundation",
 			"-i",
-			":0",
+			macosAudioDevice,
 			"-ar",
 			"16000",
 			"-ac",
@@ -311,6 +315,14 @@ export async function startRecording(outputPath: string): Promise<RecordingHandl
 				case "sox":
 					return await startSoxRecording(outputPath);
 				case "ffmpeg":
+					if (process.platform === "darwin") {
+						try {
+							return await startFFmpegRecording(outputPath, ":default");
+						} catch {
+							// Older ffmpeg builds without ":default" support.
+							return await startFFmpegRecording(outputPath, ":0");
+						}
+					}
 					return await startFFmpegRecording(outputPath);
 				case "arecord":
 					return await startArecordRecording(outputPath);
