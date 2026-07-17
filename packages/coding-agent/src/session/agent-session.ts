@@ -5639,6 +5639,13 @@ export class AgentSession {
 	buildDisplaySessionContext(): SessionContext {
 		return deobfuscateSessionContext(this.sessionManager.buildSessionContext(), this.#obfuscator);
 	}
+	/**
+	 * Build the complete active-branch transcript for the interactive UI.
+	 * Provider context remains compacted through buildDisplaySessionContext().
+	 */
+	buildTranscriptSessionContext(): SessionContext {
+		return deobfuscateSessionContext(this.sessionManager.buildTranscriptContext(), this.#obfuscator);
+	}
 
 	/** Convert session messages using the same pre-LLM pipeline as the active session. */
 	async convertMessagesToLlm(messages: AgentMessage[], signal?: AbortSignal): Promise<Message[]> {

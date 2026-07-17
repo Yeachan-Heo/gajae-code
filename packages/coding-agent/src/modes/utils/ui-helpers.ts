@@ -806,7 +806,7 @@ export class UiHelpers {
 		this.ctx.pendingPythonComponents = [];
 
 		// Reuse a pre-built context when available (e.g. from navigateTree) to avoid a second O(N) walk.
-		const context = prebuiltContext ?? this.ctx.sessionManager.buildSessionContext();
+		const context = prebuiltContext ?? this.ctx.session.buildTranscriptSessionContext();
 		this.ctx.renderSessionContext(context, {
 			updateFooter: true,
 			populateHistory: true,

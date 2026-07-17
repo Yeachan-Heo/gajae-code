@@ -180,6 +180,31 @@ describe("buildSessionContext", () => {
 			expect((ctx.messages[3] as any).content).toBe("third");
 			expect((ctx.messages[4] as any).content[0].text).toBe("response3");
 		});
+		it("preserves compacted user prompts for transcript rendering", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "first"),
+				msg("2", "1", "assistant", "response1"),
+				msg("3", "2", "user", "second"),
+				msg("4", "3", "assistant", "response2"),
+				compaction("5", "4", "Summary of first two turns", "3"),
+				msg("6", "5", "user", "third"),
+				msg("7", "6", "assistant", "response3"),
+			];
+
+			const ctx = buildSessionContext(entries, undefined, undefined, "test", {
+				includeCompactedHistory: true,
+			});
+
+			expect(ctx.messages.map(message => message.role)).toEqual([
+				"user",
+				"assistant",
+				"user",
+				"assistant",
+				"user",
+				"assistant",
+			]);
+			expect((ctx.messages[0] as any).content).toBe("first");
+		});
 
 		it("handles compaction keeping from first message", () => {
 			const entries: SessionEntry[] = [

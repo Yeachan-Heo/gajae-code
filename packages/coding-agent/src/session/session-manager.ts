@@ -829,11 +829,20 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
  * If leafId is provided, walks from that entry to root.
  * Handles compaction and branch summaries along the path.
  */
+export interface BuildSessionContextOptions {
+	/**
+	 * Preserve messages compacted out of the provider context for transcript rendering.
+	 * This must stay false for LLM requests, which require the compacted summary.
+	 */
+	includeCompactedHistory?: boolean;
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 	sessionIdentityNamespace = "legacy-session",
+	options: BuildSessionContextOptions = {},
 ): SessionContext {
 	// Build uuid index if not available
 	if (!byId) {
@@ -1030,7 +1039,7 @@ export function buildSessionContext(
 		}
 	};
 
-	if (compaction) {
+	if (compaction && !options.includeCompactedHistory) {
 		const providerPayload: ProviderPayload | undefined = (() => {
 			const candidate = compaction.preserveData?.openaiRemoteCompaction;
 			if (!candidate || typeof candidate !== "object") return undefined;
@@ -5331,6 +5340,17 @@ export class SessionManager {
 		this.#sessionContextLeafRevision = this.#leafRevision;
 		this.#sessionContextReplayMetadataRevision = this.#replayMetadataRevision;
 		return cloneSessionContext(context);
+	}
+	/**
+	 * Build the complete active-branch transcript for display.
+	 *
+	 * Unlike buildSessionContext(), this retains messages summarized out of the
+	 * provider context so transcript rebuilds never erase a user's prompt.
+	 */
+	buildTranscriptContext(): SessionContext {
+		return buildSessionContext(this.getBranch(), this.#leafId, undefined, this.#sessionId, {
+			includeCompactedHistory: true,
+		});
 	}
 
 	#getActivePathEntriesForProviderContext(fromId?: string | null): SessionEntry[] {

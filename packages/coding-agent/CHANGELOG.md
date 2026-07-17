@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Interactive transcript rebuilds now render the complete active-branch history: compaction no longer erases pre-summary user prompts and assistant turns from the chat display, while the provider context keeps using the compacted summary.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed
