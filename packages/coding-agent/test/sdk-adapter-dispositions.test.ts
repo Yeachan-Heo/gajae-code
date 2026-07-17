@@ -90,6 +90,7 @@ const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"session.export_html": "invalid_request",
 	"auth.login": "operation_not_session_owned",
 	"skill.invoke": "invalid_input",
+	"mode.plan.set": "unavailable",
 };
 const expectedGlobalErrors: Readonly<Record<string, string>> = {
 	"session.create": "invalid_input",
