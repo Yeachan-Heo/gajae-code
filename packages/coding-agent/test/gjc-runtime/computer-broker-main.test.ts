@@ -86,9 +86,11 @@ it("fails the hidden broker closed when malloc scrub re-exec is unavailable", as
 	const previousMalloc = process.env.MallocStackLogging;
 	const previousMarker = process.env.GJC_MALLOC_ENV_REEXEC;
 	const previousExitCode = process.exitCode;
+	const previousPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 	let reexecs = 0;
 	let runs = 0;
 	try {
+		Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
 		process.env.MallocStackLogging = "1";
 		delete process.env.GJC_MALLOC_ENV_REEXEC;
 		process.exitCode = undefined;
@@ -110,5 +112,6 @@ it("fails the hidden broker closed when malloc scrub re-exec is unavailable", as
 		if (previousMarker === undefined) delete process.env.GJC_MALLOC_ENV_REEXEC;
 		else process.env.GJC_MALLOC_ENV_REEXEC = previousMarker;
 		process.exitCode = previousExitCode;
+		if (previousPlatform) Object.defineProperty(process, "platform", previousPlatform);
 	}
 });
