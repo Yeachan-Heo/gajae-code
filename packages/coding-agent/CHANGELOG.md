@@ -9,6 +9,13 @@
 
 ### Fixed
 - SDK host response delivery to a disconnected client no longer escalates a second structured-error send failure into a process-level unhandled rejection; failures stay local to that connection.
+### Added
+- `/voice` slash command that starts speech-to-text without a keychord (macOS terminals often type `˙` for Option+H unless the terminal sends Option as Meta).
+
+### Fixed
+- macOS speech-to-text now records from the system default input device instead of the first enumerated avfoundation device; machines with virtual audio devices (BlackHole, Loopback) silently recorded pure silence.
+- ffmpeg recordings flush per packet, so the recording file grows in real time instead of buffering many seconds of audio invisibly.
+- Fresh macOS checkouts can start the TUI again: `acl_get_fd` reporting "no ACL present" (NULL+ENOENT) is no longer treated as an owner-only security failure.
 
 ### Fixed
 - Palette slash commands now run only from an empty composer; drafts are never touched.

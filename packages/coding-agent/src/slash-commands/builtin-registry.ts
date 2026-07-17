@@ -1139,6 +1139,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "voice",
+		description: "Start voice input (same as the stt toggle keybinding)",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.editor.setText("");
+			void runtime.ctx.handleSTTToggle();
+		},
+	},
+	{
 		name: "tools",
 		description: "Show tools currently visible to the agent",
 		acpDescription: "Show available tools",
