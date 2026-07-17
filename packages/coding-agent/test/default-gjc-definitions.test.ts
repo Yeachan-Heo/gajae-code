@@ -403,9 +403,21 @@ Project executor override body.
 		expect(routing).toContain("`/skill:ralplan --deliberate`");
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
+		expect(routing).toContain("explicitly requests team execution");
+		expect(routing).toContain("that request is execution approval");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
 		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(6);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
+	});
+
+
+	it("treats explicit team requests as execution approval", async () => {
+		const team = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "team", "SKILL.md"),
+		).text();
+		expect(team).toContain("## Explicit start is approval");
+		expect(team).toContain("that is execution approval");
+		expect(team).toContain("Do not re-prompt with \"should I start?\"");
 	});
 
 	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {

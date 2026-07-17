@@ -7,6 +7,12 @@ source: "forked from upstream team skill and rebranded for GJC"
 
 # Team Skill
 
+## Explicit start is approval
+
+When the user explicitly asks to run team in the current prompt — `team`, `/skill:team`, `gjc team`, or an equivalent direct execution request — that is execution approval. Start the coordinated team workflow immediately. Do not re-prompt with "should I start?", "execute?", or other pre-start approval options.
+
+This override applies only to the pre-start consent gate. After launch, keep the existing worker/lifecycle/shutdown discipline.
+
 `$team` is the tmux-based multi-worker execution mode for GJC. It starts real GJC worker CLI sessions by splitting the current tmux leader window and coordinates them through `.gjc/_session-{sessionid}/state/team/...` files plus CLI team interop (`gjc team api ...`) and state files.
 
 This skill is operationally sensitive. Treat it as an operator workflow, not a generic prompt pattern. In GJC App or plain outside-tmux sessions, do not present `$team` / `gjc team` as directly available; launch GJC CLI from shell first, or stay on the nearest app-safe surface until the user explicitly wants the tmux runtime.
