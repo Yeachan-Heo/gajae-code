@@ -89,6 +89,7 @@ import type {
 	UsageReport,
 } from "@gajae-code/ai";
 import {
+	classifyContextOverflow,
 	clearAnthropicFastModeFallback,
 	getSupportedEfforts,
 	isContextOverflow,
@@ -100,6 +101,7 @@ import {
 import {
 	beginAttempt,
 	classifyFallbackTrigger,
+	type FallbackAttemptToken,
 	type FallbackTriggerClass,
 } from "@gajae-code/ai/utils/fallback-transport";
 
@@ -572,9 +574,9 @@ export interface AgentSessionConfig {
 type MidRunMaintenanceLifecycle = Parameters<NonNullable<AgentLoopConfig["maintainContext"]>>[1];
 
 type AutoCompactionTerminalStatus =
-	| { kind: "compacted" }
+	| { kind: "compacted"; continuationScheduled?: boolean }
 	| { kind: "aborted"; source: "signal" | "hook" }
-	| { kind: "skipped" }
+	| { kind: "skipped"; continuationScheduled?: boolean }
 	| { kind: "failed" };
 
 /** Options for AgentSession.prompt() */
@@ -1458,6 +1460,7 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#defaultFallbackController: FallbackChainController | undefined;
+	#overflowMaintenanceAttempts = 0;
 	#defaultFallbackExhaustedLastTurn = false;
 	#fallbackInvocationId = 0;
 	// Todo completion reminder state
@@ -3397,7 +3400,7 @@ export class AgentSession {
 			this.#resolveRetry();
 
 			const compactionTask = this.#checkCompaction(msg);
-			this.#trackPostPromptTask(compactionTask);
+			this.#trackPostPromptTask(compactionTask.then(() => undefined));
 			await compactionTask;
 			// Check for incomplete todos only after a final assistant stop, not intermediate tool-use turns.
 			const hasToolCalls = msg.content.some(content => content.type === "toolCall");
@@ -3616,7 +3619,10 @@ export class AgentSession {
 		const messages = this.agent.state.messages;
 		const lastMsg = messages.at(-1);
 		const contextWindow = this.model?.contextWindow ?? 0;
-		if (lastMsg?.role === "assistant" && isContextOverflow(lastMsg as AssistantMessage, contextWindow)) {
+		if (
+			lastMsg?.role === "assistant" &&
+			classifyContextOverflow(lastMsg as AssistantMessage, lastMsg.transportFailure, contextWindow)
+		) {
 			this.agent.replaceMessages(messages.slice(0, -1));
 		}
 	}
@@ -3628,7 +3634,7 @@ export class AgentSession {
 		return compactionSettings.autoContinue === false ? "auto_continue_disabled_non_resumable_tail" : undefined;
 	}
 
-	#scheduleOverflowRetryContinuation(generation: number): void {
+	#scheduleOverflowRetryContinuation(generation: number): boolean {
 		this.#stripOverflowFailedTurnForRetry();
 		if (this.#isResumableAgentTail()) {
 			this.#scheduleAgentContinue({
@@ -3639,16 +3645,17 @@ export class AgentSession {
 				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
 				onError: error => this.#logCompactionContinuationError("overflow_retry", error),
 			});
-			return;
+			return true;
 		}
 
 		const compactionSettings = this.settings.getGroup("compaction");
 		if (compactionSettings.autoContinue !== false) {
 			this.#scheduleAutoContinuePrompt(generation);
-			return;
+			return true;
 		}
 
 		this.#logCompactionContinuationSkipped("overflow_retry", "auto_continue_disabled_non_resumable_tail");
+		return false;
 	}
 
 	#scheduleAutoContinuePrompt(generation: number): void {
@@ -6940,6 +6947,7 @@ export class AgentSession {
 				await this.#resetDefaultFallbackForNewTurn();
 				await this.#ensureDefaultFallbackResolution();
 				this.#defaultFallbackChain().resetAttemptBudget();
+				this.#overflowMaintenanceAttempts = 0;
 				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			}
 			// Flush any pending bash messages before the new prompt
@@ -10041,17 +10049,17 @@ export class AgentSession {
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
-	async #checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<void> {
+	async #checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
 		// Safety stops are terminal and must not trigger context maintenance.
 		if (
 			assistantMessage.errorKind === "provider_safety_stop" ||
 			(assistantMessage.errorMessage !== undefined &&
 				isLegacyProviderSafetyStopMessage(assistantMessage.errorMessage))
 		) {
-			return;
+			return false;
 		}
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
-		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return;
+		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
 		const contextWindow = this.model?.contextWindow ?? 0;
 		const generation = this.#promptGeneration;
 		// Skip overflow check if the message came from a different model.
@@ -10067,7 +10075,13 @@ export class AgentSession {
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const errorIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
-		if (sameModel && !errorIsFromBeforeCompaction && isContextOverflow(assistantMessage, contextWindow)) {
+		if (
+			sameModel &&
+			!errorIsFromBeforeCompaction &&
+			classifyContextOverflow(assistantMessage, assistantMessage.transportFailure, contextWindow)
+		) {
+			this.#overflowMaintenanceAttempts += 1;
+			if (this.#overflowMaintenanceAttempts > 1) return false;
 			// Remove the error message from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
@@ -10081,24 +10095,23 @@ export class AgentSession {
 				// Retry on the promoted (larger) model without compacting
 				this.#scheduleAgentContinue({ delayMs: 100, generation, suppressPredecessorAgentEnd: true });
 
-				return;
+				return true;
 			}
 
 			// No promotion target available fall through to compaction
 			const compactionSettings = this.settings.getGroup("compaction");
 			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
-				await this.#runAutoCompaction("overflow", true);
-			} else {
-				this.#scheduleOverflowRetryContinuation(generation);
+				const status = await this.#runAutoCompaction("overflow", true);
+				return "continuationScheduled" in status && status.continuationScheduled === true;
 			}
-			return;
+			return this.#scheduleOverflowRetryContinuation(generation);
 		}
 		const compactionSettings = this.settings.getGroup("compaction");
-		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return;
+		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return false;
 
 		// Case 2: Threshold - turn succeeded but context is getting large
 		// Skip if this was an error (non-overflow errors don't have usage data)
-		if (assistantMessage.stopReason === "error") return;
+		if (assistantMessage.stopReason === "error") return false;
 		let contextTokens = calculateContextTokens(assistantMessage.usage);
 		// Model maxTokens is a capability ceiling, not a per-turn reservation.
 		// Auto maintenance should track actual context fullness.
@@ -10107,7 +10120,8 @@ export class AgentSession {
 		// which breaks the provider prompt-cache prefix mid-epoch. Only prune at a
 		// sanctioned maintenance boundary, i.e. when the un-pruned context already
 		// crosses the compaction threshold. Pruning may then avert full compaction.
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) return;
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens))
+			return true;
 		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
 			relaxedMinimum: 0,
 		});
@@ -10130,6 +10144,7 @@ export class AgentSession {
 				await this.#runAutoCompaction("threshold", false);
 			}
 		}
+		return true;
 	}
 
 	/**
@@ -11541,8 +11556,9 @@ export class AgentSession {
 					continuationSkipReason,
 				});
 				if (willRetry) {
-					this.#scheduleOverflowRetryContinuation(generation);
-				} else if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
+					return { kind: "skipped", continuationScheduled: this.#scheduleOverflowRetryContinuation(generation) };
+				}
+				if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 					this.#scheduleAgentContinue({
 						delayMs: 100,
 						generation,
@@ -11776,8 +11792,9 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 
 			if (willRetry) {
-				this.#scheduleOverflowRetryContinuation(generation);
-			} else if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
+				return { kind: "compacted", continuationScheduled: this.#scheduleOverflowRetryContinuation(generation) };
+			}
+			if (continueAfterMaintenance && reason !== "idle" && this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.
 				this.#scheduleAgentContinue({
@@ -11854,8 +11871,9 @@ export class AgentSession {
 
 	#isRetryableError(message: AssistantMessage): boolean {
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
+		const transportFailure = message.transportFailure;
 		const contextWindow = this.model?.contextWindow ?? 0;
-		if (isContextOverflow(message, contextWindow)) return false;
+		if (classifyContextOverflow(message, transportFailure, contextWindow)) return false;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
 		if (!managedFallback) {
 			const classification = this.#classifyErrorForRetry(message);
@@ -11866,8 +11884,6 @@ export class AgentSession {
 				classification === "first_event_timeout"
 			);
 		}
-		const transportFailure = (message as AssistantMessage & { transportFailure?: TransportFailureFacts })
-			.transportFailure;
 		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
 		if (transportFailure) return true;
 		if (
@@ -11976,7 +11992,7 @@ export class AgentSession {
 		// bounded unknown retry class.
 		if (isLegacyProviderSafetyStopMessage(err)) return "terminal";
 		const contextWindow = this.model?.contextWindow ?? 0;
-		if (isContextOverflow(message, contextWindow)) return "overflow";
+		if (classifyContextOverflow(message, message.transportFailure, contextWindow)) return "overflow";
 		if (isLocalModelEndpoint(this.model) && this.#isLocalProviderAvailabilityErrorMessage(err)) {
 			return "local_unavailable";
 		}
@@ -12067,7 +12083,7 @@ export class AgentSession {
 
 	#managedFallbackPromptOptions(): {
 		fallbackManaged?: boolean;
-		nextFallbackAttempt?: (model: Model) => ReturnType<typeof beginAttempt>;
+		nextFallbackAttempt?: (model: Model) => FallbackAttemptToken;
 		onManagedAttemptAccepted?: () => void;
 		onManagedAttemptOutcome?: (
 			outcome: ManagedAttemptOutcome,
@@ -12081,7 +12097,10 @@ export class AgentSession {
 				controller.onAttemptStarted();
 				return beginAttempt(formatModelString(model), String(++this.#fallbackInvocationId));
 			},
-			onManagedAttemptAccepted: () => controller.resetAttemptBudget(),
+			onManagedAttemptAccepted: () => {
+				controller.resetAttemptBudget();
+				this.#overflowMaintenanceAttempts = 0;
+			},
 			onManagedAttemptOutcome: outcome => this.#handleManagedAttemptOutcome(outcome),
 		};
 	}
@@ -12164,6 +12183,24 @@ export class AgentSession {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return { type: "terminal", terminal: { stopReason: outcome.reason } };
 		}
+		if (outcome.type === "context_overflow_discarded") {
+			// The provider invocation happened, but overflow is context maintenance rather
+			// than a fallback-policy failure. Keep the logical run owner and do not charge,
+			// switch, suppress, or route through retry handling.
+			this.#defaultFallbackChain().discardStartedAttempt();
+			return {
+				type: "maintenance",
+				continuation: async ownership => {
+					if (!ownership.isCurrent()) return;
+					const successorScheduled = await this.#checkCompaction(outcome.message);
+					if (successorScheduled || !ownership.isCurrent()) return;
+					this.agent.requestRunTerminal(ownership.logicalRunId, {
+						stopReason: "error",
+						messages: [outcome.message],
+					});
+				},
+			};
+		}
 		return this.#handleRetryableError(
 			outcome.failure.message,
 			true,
@@ -12196,7 +12233,7 @@ export class AgentSession {
 		allowLegacyUsageLimit: boolean,
 		transportFailure?: TransportFailureFacts,
 	): { class: FallbackTriggerClass; retryAfterMs?: number } | undefined {
-		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return undefined;
+		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
 		if (transport.class !== "other") return transport;
 		// Managed fallback receives authoritative transport facts from the request
