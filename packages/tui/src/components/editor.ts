@@ -425,6 +425,12 @@ export class Editor implements Component, Focusable {
 	cursorOverride: string | undefined;
 	/** Display width of the cursorOverride glyph (needed because override may contain ANSI escapes). */
 	cursorOverrideWidth: number | undefined;
+	/**
+	 * Display-only ghost text rendered dim after the cursor (e.g. a streaming
+	 * voice transcript). Takes priority over autocomplete inline hints; never
+	 * part of the buffer. Set to `undefined` to clear.
+	 */
+	inlineOverlayHint: string | undefined;
 	#promptGutter: string | undefined;
 	#inputPrefix: string | undefined;
 	#inputPrefixWidth = 0;
@@ -3016,6 +3022,11 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 	 * Checks selected autocomplete item's hint first, then falls back to provider.
 	 */
 	#getInlineHint(): string | null {
+		// Display-only overlay (e.g. streaming voice transcript) wins over
+		// autocomplete hints.
+		if (this.inlineOverlayHint !== undefined && this.inlineOverlayHint.length > 0) {
+			return this.inlineOverlayHint;
+		}
 		// Check selected autocomplete item for a hint
 		if (this.#autocompleteState && this.#autocompleteList) {
 			const selected = this.#autocompleteList.getSelectedItem();
