@@ -497,24 +497,6 @@ mod platform {
 		}
 	}
 
-	#[cfg(any(
-		target_os = "macos",
-		target_os = "ios",
-		target_os = "freebsd",
-		target_os = "openbsd",
-		target_os = "netbsd"
-	))]
-	fn stat_mtime_ns(stat: &libc::stat) -> i128 {
-		i128::from(stat.st_mtimespec.tv_sec) * 1_000_000_000 + i128::from(stat.st_mtimespec.tv_nsec)
-	}
-
-	#[cfg(not(any(
-		target_os = "macos",
-		target_os = "ios",
-		target_os = "freebsd",
-		target_os = "openbsd",
-		target_os = "netbsd"
-	)))]
 	fn stat_mtime_ns(stat: &libc::stat) -> i128 {
 		i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtime_nsec)
 	}
