@@ -7,9 +7,16 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@gajae-code/agent-core";
+import type {
+	AgentEvent,
+	AgentIdentity,
+	AgentMessage,
+	AgentTelemetryConfig,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
-import type { ServiceTier } from "@gajae-code/ai";
+import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
+import type { Message, Model, ServiceTier } from "@gajae-code/ai";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
@@ -26,6 +33,7 @@ import { sessionRoot } from "../gjc-runtime/session-layout";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
+import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
 import { createAgentSession, discoverAuthStorage } from "../sdk";
@@ -109,6 +117,51 @@ function getReportFindingKey(value: unknown): string | null {
 	return `${filePath}:${lineStart}:${lineEnd}:${priority ?? ""}:${title}`;
 }
 
+const FORK_CONTEXT_MINIMUM_RESERVED_OUTPUT_TOKENS = 4_096;
+const FORK_CONTEXT_FIXED_PROMPT_AND_TOOL_OVERHEAD_TOKENS = 4_096;
+
+export function trimForkContextSeedForModel(seed: ForkContextSeed, model: Model | undefined): ForkContextSeed {
+	const contextWindow = model?.contextWindow;
+	if (!contextWindow || contextWindow <= 0) return seed;
+	const reservedOutputTokens = Math.max(
+		FORK_CONTEXT_MINIMUM_RESERVED_OUTPUT_TOKENS,
+		model && Number.isFinite(model.maxTokens) ? Math.max(0, Math.trunc(model.maxTokens)) : 0,
+	);
+	const ceiling = Math.max(
+		0,
+		Math.trunc(contextWindow) - reservedOutputTokens - FORK_CONTEXT_FIXED_PROMPT_AND_TOOL_OVERHEAD_TOKENS,
+	);
+	const maxTokens = Math.min(seed.metadata.maxTokens, ceiling);
+	const skippedReasons = { ...seed.metadata.skippedReasons };
+	let skippedMessages = seed.metadata.skippedMessages;
+	let approximateTokens = 0;
+	const messages: Message[] = [];
+	for (let i = seed.messages.length - 1; i >= 0; i--) {
+		const message = seed.messages[i]!;
+		const tokens = estimateMessageTokensHeuristic(message);
+		if (maxTokens <= 0 || approximateTokens + tokens > maxTokens) {
+			skippedMessages++;
+			skippedReasons["child-context-ceiling"] = (skippedReasons["child-context-ceiling"] ?? 0) + 1;
+			continue;
+		}
+		messages.unshift(message);
+		approximateTokens += tokens;
+	}
+	return {
+		...seed,
+		messages,
+		agentMessages: messages.map(message => structuredClone(message) as AgentMessage),
+		metadata: {
+			...seed.metadata,
+			includedMessages: messages.length,
+			skippedMessages,
+			approximateTokens,
+			maxTokens,
+			skippedReasons,
+		},
+	};
+}
+
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	cwd: string;
@@ -182,6 +235,10 @@ export interface ExecutorOptions {
 	/** Skills to autoload via sendCustomMessage before the first prompt */
 	autoloadSkills?: Skill[];
 	forkContextSeed?: ForkContextSeed;
+}
+
+export function renderSubagentUserPrompt(assignment: string, independentMode: boolean): string {
+	return prompt.render(subagentUserPromptTemplate, { assignment: assignment.trim(), independentMode });
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -1281,6 +1338,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (model?.contextWindow && model.contextWindow > 0) {
 				progress.contextWindow = model.contextWindow;
 			}
+			const forkContextSeed = options.forkContextSeed
+				? trimForkContextSeedForModel(options.forkContextSeed, model)
+				: undefined;
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
@@ -1354,8 +1414,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
 
 			const forkContextNotice =
-				options.forkContextSeed && options.forkContextSeed.metadata.includedMessages > 0
-					? `This subagent was started with a forked snapshot of the parent conversation. Included ${options.forkContextSeed.metadata.includedMessages} message(s), skipped ${options.forkContextSeed.metadata.skippedMessages}, approximately ${options.forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live.${ircEnabled ? " Use IRC for live coordination." : " Rely on the explicit assignment and supplied context for coordination."}`
+				forkContextSeed && forkContextSeed.metadata.includedMessages > 0
+					? `This subagent was started with a forked snapshot of the parent conversation. Included ${forkContextSeed.metadata.includedMessages} message(s), skipped ${forkContextSeed.metadata.skippedMessages}, approximately ${forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live.${ircEnabled ? " Use IRC for live coordination." : " Rely on the explicit assignment and supplied context for coordination."}`
 					: "";
 
 			const agentSubskillBlock = await buildAgentSubskillInjection({
@@ -1392,7 +1452,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					workspaceTree: options.workspaceTree,
 					systemPrompt: defaultPrompt => {
 						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-							agent: agent.systemPrompt,
+							agent: prompt.render(agent.systemPrompt, {
+								ultragoalRedTeam: /ultragoal\s+completion\s+(?:qa|red-team)|executorQa/i.test(
+									options.assignment ?? task,
+								),
+							}),
 							context: options.context?.trim() ?? "",
 							worktree: worktree ?? "",
 							outputSchema: normalizedOutputSchema,
@@ -1433,7 +1497,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					enableMCP,
 					localProtocolOptions: options.localProtocolOptions,
 					telemetry: subagentTelemetry,
-					forkContextSeed: options.forkContextSeed,
+					forkContextSeed,
 					agentRegistry,
 					shouldPause: () => pauseRequested,
 				}),

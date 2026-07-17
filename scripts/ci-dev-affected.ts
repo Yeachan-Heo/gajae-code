@@ -262,6 +262,7 @@ function taskNeedsNative(key: string): boolean {
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||
 		key === "deep-interview-runtime" ||
+		key === "bridge-client-sdk-package-smoke" ||
 		key.startsWith("test:")
 	);
 }
@@ -435,6 +436,20 @@ async function resolveBaseRef(): Promise<string> {
 	const baseSha = Bun.env.GITHUB_BASE_SHA?.trim();
 	const baseRef = Bun.env.GITHUB_BASE_REF?.trim();
 
+	// A PR event supplies its immutable base commit. Prefer it over the mutable
+	// branch ref: the base branch can be force-pushed after the event is queued,
+	// leaving the current origin/<baseRef> unrelated to the checked-out PR head.
+	if (eventName === "pull_request" && baseSha && !ZERO_SHA.test(baseSha)) {
+		return baseSha;
+	}
+	if (eventName === "pull_request" && baseRef) {
+		const mergeBase = await $`git merge-base HEAD ${`origin/${baseRef}`}`.cwd(repoRoot).quiet().nothrow();
+		if (mergeBase.exitCode === 0) {
+			const value = mergeBase.stdout.toString().trim();
+			if (value !== "") return value;
+		}
+		return `origin/${baseRef}`;
+	}
 	if (baseSha && !ZERO_SHA.test(baseSha)) {
 		return baseSha;
 	}

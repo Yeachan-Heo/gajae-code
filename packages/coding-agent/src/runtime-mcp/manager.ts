@@ -1424,7 +1424,7 @@ export class MCPManager {
 	}
 
 	/**
-	 * Get all server instructions (for system prompt injection).
+	 * Get connected-server instructions for request-scoped untrusted user-role context.
 	 */
 	getServerInstructions(): Map<string, string> {
 		if (this.#toolsOnly) return new Map();

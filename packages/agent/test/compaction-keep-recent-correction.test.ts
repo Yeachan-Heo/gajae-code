@@ -43,11 +43,11 @@ function makeUsage(input: number): Usage {
 }
 
 /** 40 alternating turns; last assistant carries usage. */
-function buildEntries(lastUsageInput = 500): SessionEntry[] {
+function buildEntries(lastUsageInput = 500, turns = 40): SessionEntry[] {
 	const entries: SessionEntry[] = [];
-	for (let i = 0; i < 40; i++) {
+	for (let i = 0; i < turns; i++) {
 		entries.push(userEntry(`u${i}`, line(i)));
-		const isLast = i === 39;
+		const isLast = i === turns - 1;
 		entries.push(assistantEntry(`a${i}`, line(i), isLast ? makeUsage(lastUsageInput) : undefined));
 	}
 	return entries;
@@ -101,5 +101,31 @@ describe("prepareCompaction keep-window token correction (Finding 7)", () => {
 			expect(prep?.tokenCorrection.ratio).toBe(1);
 			expect(prep?.tokenCorrection.keepRecentTokensCorrected).toBe(100);
 		}
+	});
+});
+
+describe("prepareCompaction scaled keep window", () => {
+	test("a 200k context window keeps at least 25% of the window", () => {
+		// 8k turns (~160k heuristic tokens) so history extends beyond the scaled keep window.
+		const prep = prepareCompaction(buildEntries(500, 8_000), settings(100), { contextWindow: 200_000 });
+		expect(prep).toBeDefined();
+		expect(prep?.tokenCorrection.keepRecentTokensCorrected).toBe(60_000);
+		expect(prep?.recentMessages.length ?? 0).toBeGreaterThanOrEqual(5_000);
+	});
+
+	test("caps scaled retention below an explicit threshold with reserve headroom", () => {
+		const configured = {
+			...settings(40_000),
+			thresholdTokens: 50_000,
+			reserveTokens: 16_384,
+		};
+		const prep = prepareCompaction(buildEntries(500, 8_000), configured, { contextWindow: 200_000 });
+		expect(prep).toBeDefined();
+		expect(prep?.tokenCorrection.keepRecentTokensCorrected).toBe(20_000);
+	});
+
+	test("a context window below 66k uses the legacy fixed keepRecentTokens value", () => {
+		const prep = prepareCompaction(buildEntries(), settings(100), { contextWindow: 65_000 });
+		expect(prep?.tokenCorrection.keepRecentTokensCorrected).toBe(100);
 	});
 });

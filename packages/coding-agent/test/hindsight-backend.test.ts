@@ -117,6 +117,39 @@ describe("hindsightBackend.start", () => {
 		expect(session.getHindsightSessionState()?.bankId).toBeTruthy();
 	});
 
+	it("flushes queued retains before replacing the state that owns the session", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+		});
+		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockResolvedValue({} as never);
+		const session = makeFakeSession({ sessionId: "s-replace" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		const previous = session.getHindsightSessionState()!;
+		previous.enqueueRetain("must flush before state replacement");
+
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+
+		expect(retainBatchSpy).toHaveBeenCalledWith(
+			previous.bankId,
+			expect.arrayContaining([expect.objectContaining({ content: "must flush before state replacement" })]),
+			expect.objectContaining({ async: true }),
+		);
+		expect(session.getHindsightSessionState()).not.toBe(previous);
+	});
+
 	it("rekeys state when the same AgentSession gets a new session id (resume/switch)", async () => {
 		const settings = Settings.isolated({
 			"memory.backend": "hindsight",
@@ -170,6 +203,105 @@ describe("hindsightBackend.start", () => {
 		entries.push({ role: "user", text: "second user message that is long enough" });
 		entries.push({ role: "assistant", text: "second reply that is long enough" });
 		session.emit({ type: "agent_end", messages: [] });
+		await Bun.sleep(0);
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("retains only unretained full-session turns under the stable document id", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.retainEveryNTurns": 1,
+		});
+		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockResolvedValue({} as never);
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
+		const entries: Array<{ role: "user" | "assistant"; text: string }> = [
+			{ role: "user", text: "first user message that is long enough" },
+			{ role: "assistant", text: "first assistant reply that is long enough" },
+		];
+		const session = makeFakeSession({ sessionId: "s-delta", entries });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+
+		session.emit({ type: "agent_end", messages: [] });
+		await Bun.sleep(0);
+		entries.push(
+			{ role: "user", text: "second user message that is long enough" },
+			{ role: "assistant", text: "second assistant reply that is long enough" },
+		);
+		session.emit({ type: "agent_end", messages: [] });
+		await Bun.sleep(0);
+
+		expect(retainSpy).toHaveBeenCalledTimes(2);
+		const [, firstTranscript, firstOptions] = retainSpy.mock.calls[0];
+		const [, secondTranscript, secondOptions] = retainSpy.mock.calls[1];
+		expect(firstTranscript).toContain("first user message");
+		expect(secondTranscript).toContain("second user message");
+		expect(secondTranscript).not.toContain("first user message");
+		expect(secondOptions?.documentId).toBe(firstOptions?.documentId);
+		expect(firstOptions?.updateMode).toBe("append");
+		expect(secondOptions?.updateMode).toBe("append");
+	});
+
+	it("skips transcript extraction and upload when the full-session delta is empty", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+		});
+		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockResolvedValue({} as never);
+		const session = makeFakeSession({ sessionId: "s-empty-delta" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		const state = session.getHindsightSessionState()!;
+		state.lastRetainedTurn = 1;
+
+		const retained = await state.retainSession([{ role: "user", content: "already retained user message" }]);
+		expect(retained).toBe(false);
+		expect(retainSpy).not.toHaveBeenCalled();
+	});
+
+	it("coalesces concurrent agent_end retains while one upload is in flight", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.retainEveryNTurns": 1,
+		});
+		let release!: () => void;
+		const retainSpy = vi.spyOn(HindsightApi.prototype, "retain").mockImplementation(
+			() =>
+				new Promise(resolve => {
+					release = () => resolve({} as never);
+				}),
+		);
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
+		const entries = [
+			{ role: "user" as const, text: "user message that is long enough" },
+			{ role: "assistant" as const, text: "assistant reply that is long enough" },
+		];
+		const session = makeFakeSession({ sessionId: "s-in-flight", entries });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+
+		session.emit({ type: "agent_end", messages: [] });
+		session.emit({ type: "agent_end", messages: [] });
+		await Bun.sleep(0);
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+		release();
 		await Bun.sleep(0);
 		expect(retainSpy).toHaveBeenCalledTimes(1);
 	});
@@ -331,11 +463,12 @@ describe("hindsightBackend first-turn injection", () => {
 		);
 		expect(block).toContain("<memories>");
 		expect(block).toContain("Can prefers concise communication");
+		expect(block).not.toContain("Current time:");
 		expect(session.getHindsightSessionState()?.hasRecalledForFirstTurn).toBe(true);
 		expect(session.getHindsightSessionState()?.lastRecallSnippet).toBe(block);
 	});
 
-	it("keeps the <memories> wrapper in buildDeveloperInstructions", async () => {
+	it("keeps recall out of developer instructions", async () => {
 		const settings = Settings.isolated({
 			"memory.backend": "hindsight",
 			"hindsight.apiUrl": "http://localhost:8888",
@@ -348,21 +481,16 @@ describe("hindsightBackend first-turn injection", () => {
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
-
 		const state = session.getHindsightSessionState();
 		expect(state).toBeDefined();
 		state!.lastRecallSnippet = "<memories>\nremembered fact\n</memories>";
 
 		const prompt = await hindsightBackend.buildDeveloperInstructions("/tmp", settings, session as never);
-		expect(prompt).toContain("<memories>");
-		expect(prompt).toContain("</memories>");
-		expect(prompt).toContain("remembered fact");
+		expect(prompt).not.toContain("<memories>\nremembered fact");
+		expect(state!.getRecallSnippet()).toContain("remembered fact");
 	});
 
-	it("places the <mental_models> block above the <memories> recall block in developer instructions", async () => {
-		// Stable, curated semantic memory must come first so the LLM's prior is
-		// anchored on it; the volatile per-turn recall block follows. Ordering
-		// is part of the integration's behavioural contract.
+	it("keeps only the <mental_models> block in developer instructions", async () => {
 		const settings = Settings.isolated({
 			"memory.backend": "hindsight",
 			"hindsight.apiUrl": "http://localhost:8888",
@@ -382,15 +510,8 @@ describe("hindsightBackend first-turn injection", () => {
 		state!.lastRecallSnippet = "<memories>\nrecalled fact\n</memories>";
 
 		const prompt = await hindsightBackend.buildDeveloperInstructions("/tmp", settings, session as never);
-		expect(prompt).toBeDefined();
-		// `<memories>` and `<mental_models>` are mentioned in STATIC_INSTRUCTIONS
-		// bullets too. Match the actual injected block opener (tag + newline)
-		// to disambiguate documentation prose from the injected payloads.
-		const mmIdx = prompt!.indexOf("<mental_models>\n");
-		const memIdx = prompt!.indexOf("<memories>\n");
-		expect(mmIdx).toBeGreaterThanOrEqual(0);
-		expect(memIdx).toBeGreaterThanOrEqual(0);
-		expect(mmIdx).toBeLessThan(memIdx);
+		expect(prompt).toContain("<mental_models>\n# User Preferences");
+		expect(prompt).not.toContain("<memories>\nrecalled fact");
 	});
 
 	it("reloadMentalModelsForSession refreshes the cached snippet and base prompt", async () => {
@@ -445,6 +566,39 @@ describe("hindsightBackend first-turn injection", () => {
 		expect(state!.mentalModelsSnippet).toContain("prefers concise prose");
 		expect(state!.mentalModelsLoadedAt).toBeGreaterThan(initialLoadedAt - 1000);
 		expect(refreshSpy.mock.calls.length).toBeGreaterThan(callsBefore);
+	});
+
+	it("does not refresh the base prompt when a TTL reload has unchanged content", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.mentalModelsEnabled": true,
+			"hindsight.mentalModelRefreshIntervalMs": 0,
+		});
+		const session = makeFakeSession({ sessionId: "s-unchanged-ttl" });
+		const listSpy = vi.spyOn(HindsightApi.prototype, "listMentalModels").mockResolvedValue({
+			items: [{ id: "prefs", bank_id: "bank", name: "Preferences", content: "use tabs" }],
+		} as never);
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		await session.getHindsightSessionState()?.mentalModelsLoadPromise;
+		session.refreshBaseSystemPrompt.mockClear();
+
+		session.emit({ type: "agent_end", messages: [] });
+		await Bun.sleep(0);
+		expect(session.refreshBaseSystemPrompt).not.toHaveBeenCalled();
+
+		listSpy.mockResolvedValue({
+			items: [{ id: "prefs", bank_id: "bank", name: "Preferences", content: "use spaces" }],
+		} as never);
+		session.emit({ type: "agent_end", messages: [] });
+		await Bun.sleep(0);
+		expect(session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
 	});
 
 	it("reloadMentalModelsForSession returns false on subagent aliases", async () => {

@@ -79,6 +79,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).not.toContain("uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830");
 		expect(workflow.match(/uses: actions\/cache\/restore@0057852bfaa89a56745cba8c7296529d2fc39830/g)).toHaveLength(4);
 		expect(workflow.match(/save-if: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/dev' \}\}/g)).toHaveLength(3);
+		const aggregateWorkflow = workflow.slice(workflow.indexOf("  affected:\n"));
+		expect(aggregateWorkflow).toContain("name: Validate canonical affected plan");
+		expect(aggregateWorkflow).toContain("run: bun scripts/ci-dev-affected.ts --validate-plan");
 	});
 
 	test("aggregate result truth table rejects every missing, failed, cancelled, and unplanned dependency", () => {
@@ -360,6 +363,31 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(missingHead.exitCode).toBe(1);
 		expect(missingHead.stderr).toContain("source head");
 		expect(missingHead.stderr).toContain("is not available");
+	});
+
+	test("PR planning uses the event base SHA when the mutable base ref has moved", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-pr-base-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+		const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
+		// Shard checkouts are depth-one, so use the canonical head as an available
+		// event-base commit while the mutable base ref deliberately does not exist.
+		const base = head;
+		const result = await runScript(["--matrix-json"], "", {
+			GITHUB_EVENT_NAME: "pull_request",
+			GITHUB_BASE_REF: "ci-dev-affected-base-ref-moved",
+			GITHUB_BASE_SHA: base,
+			GITHUB_SHA: "f".repeat(40),
+			CI_DEV_SOURCE_SHA: head,
+			GITHUB_OUTPUT: outputFile,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(JSON.parse(result.stdout.trim())).toBeInstanceOf(Array);
+		const output = await Bun.file(outputFile).text();
+		expect(output).toContain(`plan_source_sha=${head}`);
+		expect(output).toContain("plan_digest=");
+		expect(await Bun.file(path.join(repoRoot, ".ci-dev-affected-plan.json")).exists()).toBe(true);
 	});
 
 	test("Cargo selection includes transitive dependents and never emits vendored shards", async () => {
@@ -697,6 +725,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
+		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
 	});
 
 	test("release evidence source changes select contract, dry-run, and focused evidence coverage once", () => {
@@ -810,6 +839,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
+		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 	});

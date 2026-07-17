@@ -113,6 +113,82 @@ describe("staleness supersession ordering", () => {
 		expect(ids).not.toContain(newRead.id);
 	});
 
+	it("supersedes all-but-latest repeated idempotent bash test commands", () => {
+		const entries: SessionEntry[] = [];
+		const oldest = pair(entries, "c1", "bash", { command: "bun   test packages/agent" });
+		const middle = pair(entries, "c2", "bash", { command: "bun test packages/agent" });
+		const latest = pair(entries, "c3", "bash", { command: "bun test packages/agent" });
+		const ids = prunedIds(entries, { ...EAGER, protectTokens: 1_000_000 });
+		expect(ids).toContain(oldest.id);
+		expect(ids).toContain(middle.id);
+		expect(ids).not.toContain(latest.id);
+	});
+
+	it("does not supersede idempotent bash commands run from different directories", () => {
+		const entries: SessionEntry[] = [];
+		const first = pair(entries, "c1", "bash", { command: "bun test packages/agent", cwd: "/repo-a" });
+		const second = pair(entries, "c2", "bash", { command: "bun test packages/agent", cwd: "/repo-b" });
+		const ids = prunedIds(entries, { ...EAGER, protectTokens: 1_000_000 });
+		expect(ids).not.toContain(first.id);
+		expect(ids).not.toContain(second.id);
+	});
+
+	it("does not supersede non-allowlisted bash commands", () => {
+		const entries: SessionEntry[] = [];
+		const oldest = pair(entries, "c1", "bash", { command: "git log --oneline" });
+		const latest = pair(entries, "c2", "bash", { command: "git log --oneline" });
+		const ids = prunedIds(entries, { ...EAGER, protectTokens: 1_000_000 });
+		expect(ids).not.toContain(oldest.id);
+		expect(ids).not.toContain(latest.id);
+	});
+
+	it("a later containing read range supersedes an earlier contained range", () => {
+		const entries: SessionEntry[] = [];
+		const contained = pair(entries, "c1", "read", { path: "src/a.ts:50-100" });
+		const containing = pair(entries, "c2", "read", { path: "src/a.ts:1-200" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(contained.id);
+		expect(ids).not.toContain(containing.id);
+	});
+
+	it("does not let a bounded bare selector supersede an unseen distant range", () => {
+		const entries: SessionEntry[] = [];
+		const distant = pair(entries, "c1", "read", { path: "src/a.ts:10000-10050" });
+		const bounded = pair(entries, "c2", "read", { path: "src/a.ts:1" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(distant.id);
+		expect(ids).not.toContain(bounded.id);
+	});
+
+	it("lets a raw read supersede an earlier contained range", () => {
+		const entries: SessionEntry[] = [];
+		const ranged = pair(entries, "c1", "read", { path: "src/a.ts:10000-10050" });
+		const raw = pair(entries, "c2", "read", { path: "src/a.ts:raw" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).toContain(ranged.id);
+		expect(ids).not.toContain(raw.id);
+	});
+
+	it("partially overlapping read ranges do not supersede each other", () => {
+		const entries: SessionEntry[] = [];
+		const first = pair(entries, "c1", "read", { path: "src/a.ts:50-100" });
+		const overlap = pair(entries, "c2", "read", { path: "src/a.ts:75-125" });
+		const ids = prunedIds(entries, EAGER);
+		expect(ids).not.toContain(first.id);
+		expect(ids).not.toContain(overlap.id);
+	});
+
+	it("uses relaxed minimum for over-threshold pruning without changing the default", () => {
+		const entries: SessionEntry[] = [];
+		pair(entries, "c1", "read", { path: "src/a.ts" }, 62_000);
+		pair(entries, "c2", "read", { path: "src/a.ts" }, 62_000);
+		expect(pruneToolOutputs(entries, DEFAULT_PRUNE_CONFIG).prunedCount).toBe(0);
+		const result = pruneToolOutputs(entries, DEFAULT_PRUNE_CONFIG, { relaxedMinimum: 0 });
+		expect(result.tokensSaved).toBeGreaterThanOrEqual(15_000);
+		expect(result.tokensSaved).toBeLessThan(DEFAULT_PRUNE_CONFIG.minimumSavings);
+		expect(result.prunedCount).toBe(1);
+	});
+
 	it("a later identical search supersedes the earlier one; different patterns are independent", () => {
 		const entries: SessionEntry[] = [];
 		const oldSearch = pair(entries, "c1", "search", { pattern: "foo", paths: ["src"] });

@@ -427,9 +427,14 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 
 		const seed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 10_000 });
 		expect(seed.cacheIdentity).toBe(parent.sessionId);
-		expect(seed.messages).toHaveLength(2);
+		expect(seed.messages).toHaveLength(3);
 		expect(seed.metadata.skippedReasons["developer-role"]).toBe(1);
-		expect(seed.metadata.skippedReasons["tool-result-role"]).toBe(1);
+		const inheritedToolDigest = seed.messages.at(-1);
+		expect(inheritedToolDigest).toMatchObject({
+			role: "user",
+			content: [{ type: "text", text: "[tool result: bash]\nparent tool output" }],
+		});
+		expect(seed.metadata.approximateTokens).toBeGreaterThan(0);
 		expect(seed.agentMessages).toEqual(seed.messages);
 		expect(seed.messages.every(message => !("providerPayload" in message))).toBe(true);
 		const inheritedAssistant = seed.messages.find(message => message.role === "assistant");
@@ -488,12 +493,26 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		}
 		expect(parent.providerSessionState.size).toBe(1);
 		expect(parentCloseSpy).not.toHaveBeenCalled();
-		expect(child.messages.slice(0, 2)).toEqual(seed.agentMessages);
+		expect(child.messages.slice(0, seed.agentMessages.length)).toEqual(seed.agentMessages);
 
 		parent.agent.appendMessage({ role: "user", content: "oversized ".repeat(5_000), timestamp: Date.now() });
 		const boundedSeed = await parent.buildForkContextSeed({ maxMessages: 10, maxTokens: 1 });
 		expect(boundedSeed.messages).toHaveLength(0);
 		expect(boundedSeed.metadata.skippedReasons["token-limit"]).toBeGreaterThan(0);
+
+		parent.agent.appendMessage({ role: "user", content: "Preserve this prompt", timestamp: Date.now() + 1 });
+		parent.agent.appendMessage(createStaleAssistantMessage("oversized assistant ".repeat(5_000)));
+		const lastTurnSeed = await parent.buildForkContextSeed({
+			maxMessages: 2,
+			maxTokens: 100,
+			preserveLatestUser: true,
+		});
+		expect(lastTurnSeed.messages.map(message => message.role)).toEqual(["user", "assistant"]);
+		expect(getTextContent(lastTurnSeed.messages[0]!)).toContain("Preserve this prompt");
+		expect(lastTurnSeed.metadata.approximateTokens).toBeLessThanOrEqual(100);
+		expect(lastTurnSeed.metadata.includedMessages + lastTurnSeed.metadata.skippedMessages).toBe(
+			lastTurnSeed.metadata.parentMessageCount,
+		);
 	});
 
 	it("propagates appendOnlyPrefixSnapshot through buildForkContextSeed when append-only mode is active", async () => {

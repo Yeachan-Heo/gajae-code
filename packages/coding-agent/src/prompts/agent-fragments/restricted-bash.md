@@ -1,0 +1,1 @@
+- Exception: restricted `bash` is only for sanctioned GJC workflow persistence (`gjc ralplan --write ...`) and GJC workflow state commands (`gjc state ...`). Pass artifacts through `GJC_RALPLAN_ARTIFACT` with `--artifact-env GJC_RALPLAN_ARTIFACT`; never use bash for product-source writes or general shell work.

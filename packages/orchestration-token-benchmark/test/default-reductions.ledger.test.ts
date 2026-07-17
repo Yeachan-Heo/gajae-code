@@ -48,7 +48,7 @@ function extractFullForkFraction(taskSource: string): number {
 }
 
 function extractFullForkFallback(taskSource: string): number {
-	const match = /: ([0-9_]+);\n}/.exec(taskSource);
+	const match = /const fallback =[\s\S]*?:\s*([0-9_]+);/.exec(taskSource);
 	if (!match?.[1]) throw new Error("Missing full fork-context fallback");
 	return Number(match[1].replaceAll("_", ""));
 }

@@ -11,14 +11,7 @@ import {
 import { prompt } from "@gajae-code/utils";
 import Handlebars from "handlebars";
 import * as z from "zod/v4";
-
-const baseGitContext = {
-	isRepo: true,
-	currentBranch: "feature/tests",
-	mainBranch: "main",
-	status: "M packages/coding-agent/src/prompts/system/custom-system-prompt.md",
-	commits: "abc123 Fix tests",
-};
+import { getBundledAgent } from "../src/task/agents";
 
 const systemPromptsDir = path.resolve(import.meta.dir, "../src/prompts/system");
 
@@ -41,7 +34,6 @@ const baseRenderContext: prompt.TemplateContext = {
 	editToolName: "edit",
 	environment: [{ label: "OS", value: "Darwin" }],
 	finalPlanFilePath: "local://PLAN_FINAL.md",
-	git: baseGitContext,
 	intentField: INTENT_FIELD,
 	intentTracing: true,
 	iterative: true,
@@ -58,7 +50,6 @@ const baseRenderContext: prompt.TemplateContext = {
 	request: "Create an agent to review prompt templates",
 	retryCount: 1,
 	rules: [{ name: "rs-no-unwrap", description: "Avoid unwrap", globs: ["**/*.rs"] }],
-	skills: [{ name: "system-prompts", description: "Prompt design skill" }],
 	systemPromptCustomization: "System customization",
 	toolInfo: [{ name: "read", label: "Read", description: "Reads files" }],
 	toolRefs: {
@@ -110,6 +101,18 @@ async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
 	}
 }
 
+test("executor red-team block renders only for ultragoal completion QA assignments", () => {
+	const executor = getBundledAgent("executor");
+	expect(executor).toBeDefined();
+
+	const ordinary = prompt.render(executor!.systemPrompt, { ultragoalRedTeam: false });
+	expect(ordinary).not.toContain("<ultragoal_red_team_mode>");
+
+	const redTeam = prompt.render(executor!.systemPrompt, { ultragoalRedTeam: true });
+	expect(redTeam).toContain("<ultragoal_red_team_mode>");
+	expect(redTeam).toContain("executorQa");
+});
+
 describe("system Handlebars prompt templates", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -125,51 +128,20 @@ describe("system Handlebars prompt templates", () => {
 		}
 	});
 
-	test("custom-system-prompt renders project section for context and git combinations", async () => {
+	test("custom-system-prompt renders only project context", async () => {
 		const templatePath = path.join(systemPromptsDir, "custom-system-prompt.md");
 		const template = await Bun.file(templatePath).text();
-
-		const both = prompt.render(template, {
-			...baseRenderContext,
-			contextFiles: [{ path: "a.txt", content: "A" }],
-			git: { ...baseGitContext, isRepo: true },
-		});
-		expect(both).toContain("<project>");
-		expect(both).toContain("## Context");
-		expect(both).toContain("## Version Control");
 
 		const contextOnly = prompt.render(template, {
 			...baseRenderContext,
 			contextFiles: [{ path: "a.txt", content: "A" }],
-			git: { isRepo: false },
 		});
 		expect(contextOnly).toContain("<project>");
 		expect(contextOnly).toContain("## Context");
-		expect(contextOnly).not.toContain("## Version Control");
+		expect(contextOnly).not.toContain("Version Control");
 
-		const gitOnly = prompt.render(template, {
-			...baseRenderContext,
-			contextFiles: [],
-			git: {
-				isRepo: true,
-				currentBranch: "feature/tests",
-				mainBranch: "main",
-				status: "clean",
-				commits: "abc123 test commit",
-			},
-		});
-		expect(gitOnly).toContain("<project>");
-		expect(gitOnly).not.toContain("## Context");
-		expect(gitOnly).toContain("## Version Control");
-
-		const neither = prompt.render(template, {
-			...baseRenderContext,
-			contextFiles: [],
-			git: { isRepo: false },
-		});
-		expect(neither).not.toContain("<project>");
-		expect(neither).not.toContain("## Context");
-		expect(neither).not.toContain("## Version Control");
+		const empty = prompt.render(template, { ...baseRenderContext, contextFiles: [] });
+		expect(empty).not.toContain("<project>");
 	});
 
 	test("subagent system owns shared context while user prompt only owns assignment", async () => {
@@ -202,18 +174,15 @@ describe("system Handlebars prompt templates", () => {
 		const full = prompt.render(template, { ...baseRenderContext, subagent: false });
 		const sub = prompt.render(template, { ...baseRenderContext, subagent: true });
 
-		// Top-level agent keeps the workflow surface, routing, and soul blocks.
+		// Top-level agent keeps concise routing and soul blocks.
 		expect(full).toContain("<gjc-runtime>");
-		expect(full).toContain("<public-workflow-surface>");
 		expect(full).toContain("<routing>");
 		expect(full).toContain("<soul>");
+		expect(full).not.toContain("<role-agent-surface>");
 
-		// Subagent base prompt drops workflow-surface/routing/self-awareness and soul.
+		// Subagent base prompt drops runtime routing and soul.
 		expect(sub).not.toContain("<gjc-runtime>");
-		expect(sub).not.toContain("<public-workflow-surface>");
-		expect(sub).not.toContain("<role-agent-surface>");
 		expect(sub).not.toContain("<routing>");
-		expect(sub).not.toContain("<self-awareness>");
 		expect(sub).not.toContain("<soul>");
 
 		// Required repo/tool/completion constraints remain for subagents.
@@ -232,21 +201,17 @@ describe("system Handlebars prompt templates", () => {
 		const reduction = 1 - subBytes / fullBytes;
 		expect(reduction).toBeGreaterThanOrEqual(0.25);
 	});
-	test("system-prompt renders MCP discovery hint when enabled", async () => {
+	test("system-prompt omits obsolete MCP discovery plumbing", async () => {
 		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
 		const template = await Bun.file(templatePath).text();
-
 		const rendered = prompt.render(template, {
 			...baseRenderContext,
 			mcpDiscoveryMode: true,
-			hasMCPDiscoveryServers: true,
-			mcpDiscoveryServerSummaries: ["github (2 tools)", "slack (1 tool)"],
+			mcpDiscoveryServerSummaries: ["github (2 tools)"],
 		});
 
-		expect(rendered).toContain("<discovery>");
-		expect(rendered).toContain("Discoverable MCP servers in this session: github (2 tools), slack (1 tool).");
-		expect(rendered).not.toContain("Example discoverable MCP tools:");
-		expect(rendered).toContain("call `search_tool_bm25` before concluding no such tool exists");
+		expect(rendered).not.toContain("<discovery>");
+		expect(rendered).not.toContain("Discoverable MCP servers");
 	});
 
 	test("system-prompt renders tool-discovery block with discoverable tools when active", async () => {
@@ -256,16 +221,14 @@ describe("system Handlebars prompt templates", () => {
 		const rendered = prompt.render(template, {
 			...baseRenderContext,
 			toolDiscoveryActive: true,
-			discoverableTools: [
-				{ name: "browser", summary: "Control a headless browser" },
-				{ name: "todo_write", summary: "Manage a phased task list" },
-			],
+			discoverableTools: [{ name: "browser", summary: "Control a headless browser" }],
 		});
 
 		expect(rendered).toContain("<tool-discovery>");
 		expect(rendered).toContain("`search_tool_bm25`");
-		expect(rendered).toContain("- `browser` — Control a headless browser");
-		expect(rendered).toContain("- `todo_write` — Manage a phased task list");
+		expect(rendered).toContain("Discoverable capabilities include browser automation");
+		expect(rendered).not.toContain("Discoverable tools:");
+		expect(rendered).not.toContain("Control a headless browser");
 
 		const disabled = prompt.render(template, { ...baseRenderContext, toolDiscoveryActive: false });
 		expect(disabled).not.toContain("<tool-discovery>");
@@ -279,10 +242,8 @@ describe("system Handlebars prompt templates", () => {
 
 		expect(rendered).toContain("<detached-subagents>");
 		expect(rendered).toContain("Normal `task` launches return immediately as detached background subagents");
-		expect(rendered).toContain("Use `subagent` to list, inspect, await with `timeout_ms`, or cancel");
-		expect(rendered).toContain("If an await timeout elapses, the subagent is still running; this is not a failure.");
-		expect(rendered).toContain("never cancel just because an await timed out");
-		expect(rendered).toContain("`job` remains the generic background-job tool");
+		expect(rendered).toContain("its await/cancel doctrine is authoritative");
+		expect(rendered).not.toContain("never cancel just because an await timed out");
 	});
 
 	test("system-prompt bounds long-form media ingestion before fallback drafting", async () => {
@@ -305,13 +266,10 @@ describe("system Handlebars prompt templates", () => {
 		const template = await Bun.file(templatePath).text();
 		const rendered = prompt.render(template, baseRenderContext);
 
-		expect(countOccurrences(rendered, "Informational questions, bare `?`, and unambiguous explanatory prompts")).toBe(
-			1,
-		);
-		expect(rendered).toContain("answer-only/read-only");
-		expect(rendered).toContain("unless the user explicitly asks to change, run, implement, or execute something");
-		expect(rendered).toMatch(/Clear, low-risk implementation request\s+→\s+implement directly/i);
-		expect(rendered).toMatch(/Ambiguous implementation asks[\s\S]*require clarification[\s\S]*before mutation/i);
+		expect(countOccurrences(rendered, "Informational questions are answer-only/read-only")).toBe(1);
+		expect(rendered).toContain("unless the user explicitly requests a change, command, or execution");
+		expect(rendered).toContain("Clear, low-risk implementation requests use direct tools");
+		expect(rendered).toContain("Vague requirements use `/skill:deep-interview`");
 	});
 
 	test("keeps system and project as separate ordered blocks; volatile facts excluded from stable prefix", async () => {

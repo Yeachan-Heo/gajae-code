@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -454,10 +453,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 			throw new Error("Expected custom message to convert to an LLM message");
 		}
 
-		// Anchor = total context tokens of the last successful assistant
-		// (input 100 + output 10): the next request replays that assistant's
-		// own output, so prompt-only anchoring would undercount it.
-		expect(usage.tokens).toBe(110 + estimateMessageTokensHeuristic(llmCustomMessage));
+		// The 110-token usage anchor is retained, followed by the 1,500-token custom
+		// message delta: 110 + 1,500 = 1,610.
+		expect(usage.tokens).toBe(1610);
 	});
 
 	it("skips error/aborted assistants when anchoring context estimates", () => {
@@ -501,10 +499,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 		if (!llmAborted) {
 			throw new Error("Expected aborted message to convert to an LLM message");
 		}
-		// The aborted turn's partial usage must not anchor the estimate; it is
-		// charged heuristically as trailing context after the last successful
-		// anchor (total 540).
-		expect(usage.tokens).toBe(540 + estimateMessageTokensHeuristic(llmAborted));
+		// The 540-token successful usage anchor is retained, followed by the
+		// aborted trailing message's 750-token display estimate: 540 + 750 = 1,290.
+		expect(usage.tokens).toBe(1290);
 	});
 
 	it("excludes the anchor assistant's own output from the token-correction denominator", async () => {
@@ -548,6 +545,42 @@ describe("AgentSession auto-compaction queue resume", () => {
 		// raw ratio would be ~0.13 and clamp to 0.5.
 		expect(ratio).toBeGreaterThan(1);
 		expect(ratio).toBeLessThanOrEqual(2);
+	});
+
+	it("keeps context usage available after compaction with a usage anchor", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.keepRecentTokens", 1);
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "anchored response" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 110,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage({ role: "user", content: "u".repeat(4_000), timestamp: Date.now() });
+		sessionManager.appendMessage(assistant);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.compact();
+
+		// P0 regression (#2342 gate): a truthy-number knownAnchor previously made
+		// this path call calculateContextTokens(undefined) and throw. Post-compaction
+		// with no post-boundary assistant, the documented contract is
+		// tokens: null / source: "unknown" — never a throw.
+		const usage = session.getContextUsage();
+		expect(usage).toBeDefined();
+		expect(usage?.tokens).toBeNull();
+		expect(usage?.source).toBe("unknown");
 	});
 
 	it("runs pre-prompt handoff maintenance before sending the oversized prompt", async () => {

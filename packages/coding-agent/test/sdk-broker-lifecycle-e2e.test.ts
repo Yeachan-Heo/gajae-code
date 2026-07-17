@@ -7,10 +7,12 @@ import { NotificationServer } from "@gajae-code/natives";
 import { openLifecycleSessionManager, runSessionHost } from "../src/commands/sdk";
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
-import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
+import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
 	deriveLifecycleDeadlines,
+	executeLifecycle,
 	hasValidLifecycleDeadlines,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
@@ -19,12 +21,14 @@ import {
 	setProcessIncarnationForTest,
 	writeSessionLifecycleFailure,
 } from "../src/sdk/broker/lifecycle";
+import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { runSdkSessionCli } from "../src/sdk/cli";
 import { SdkClient } from "../src/sdk/client";
 import { readSdkBrokerDiscovery } from "../src/sdk/client/discovery";
 import { createSdkMcpServer } from "../src/sdk/mcp";
+import { listManagedSessionCandidates, resolveManagedSessionScope } from "../src/sdk/session-directory";
 import { sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -65,6 +69,37 @@ function canonicalJson(value: unknown): string {
 		.join(",")}}`;
 }
 
+async function snapshotDeleteSurface(
+	sessionPath: string,
+): Promise<{ transcript: Buffer; artifacts: string | undefined }> {
+	const artifactsPath = sessionPath.slice(0, -6);
+	const digestTree = async (directory: string): Promise<string> => {
+		const entries = await fs.readdir(directory, { withFileTypes: true });
+		const parts = await Promise.all(
+			entries
+				.sort((left, right) => left.name.localeCompare(right.name))
+				.map(async entry => {
+					const entryPath = path.join(directory, entry.name);
+					if (entry.isDirectory()) return `d:${entry.name}:${await digestTree(entryPath)}`;
+					if (entry.isFile())
+						return `f:${entry.name}:${createHash("sha256")
+							.update(await fs.readFile(entryPath))
+							.digest("hex")}`;
+
+					return `other:${entry.name}`;
+				}),
+		);
+		return createHash("sha256").update(parts.join("\n")).digest("hex");
+	};
+	return {
+		transcript: await fs.readFile(sessionPath),
+		artifacts: await digestTree(artifactsPath).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}),
+	};
+}
+
 test("startup diagnostics redact identifier-prefixed assignment secrets before bounded truncation", () => {
 	const secret = "credential-value";
 	const message = sanitizeSdkStartupMessage(
@@ -101,6 +136,128 @@ test("ledger restart quarantines terminal response and durable-effect digest cor
 		);
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("fatal lifecycle JSON decoding rejects malformed UTF-8 without mutating valid non-ASCII data", () => {
+	const valid = Buffer.from('{"message":"résumé"}', "utf8");
+	expect(parseLifecycleJson(valid)).toEqual({ message: "résumé" });
+	const malformed = Buffer.concat([Buffer.from('{"message":"ok'), Buffer.from([0xc3, 0x28]), Buffer.from('"}')]);
+	expect(() => parseLifecycleJson(malformed)).toThrow();
+	expect(valid.equals(Buffer.from('{"message":"résumé"}', "utf8"))).toBe(true);
+});
+
+test("ledger reopen bounds malformed persisted rows before they gain cleanup authority", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-bounds-"));
+	const ledgerPath = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+	const corruptPath = `${ledgerPath}.corrupt`;
+	const cleanupSentinel = path.join(agentDir, "cleanup-sentinel");
+	try {
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin("safe", "request");
+		await fs.writeFile(cleanupSentinel, "preserve");
+		const validRow = JSON.parse((await fs.readFile(ledgerPath, "utf8")).trim()) as Record<string, unknown>;
+		const malformedUtf8 = Buffer.concat([
+			Buffer.from(`${JSON.stringify({ ...validRow, identity: "malformed" }).slice(0, -2)}"`),
+			Buffer.from([0xc3, 0x28]),
+			Buffer.from("}\n"),
+		]);
+		await fs.appendFile(ledgerPath, malformedUtf8);
+		const malformedBroker = new Broker({ agentDir });
+		await malformedBroker.start();
+		expect((await malformedBroker.ledger.begin("safe", "request")).kind).toBe("terminal_uncertain");
+		await malformedBroker.stop();
+		expect(await fs.readFile(cleanupSentinel, "utf8")).toBe("preserve");
+		expect((await fs.readFile(corruptPath)).includes(Buffer.from([0xc3, 0x28]))).toBe(true);
+
+		for (const [identity, response] of [
+			[
+				"deep",
+				{
+					nested: Array.from({ length: 66 }, () => ({ value: "x" })).reduce(
+						(value, _next) => ({ next: value }),
+						{},
+					),
+				},
+			],
+			[
+				"wide",
+				{ fields: Object.fromEntries(Array.from({ length: 1_025 }, (_, index) => [`field-${index}`, index])) },
+			],
+		] as const) {
+			await fs.appendFile(ledgerPath, `${JSON.stringify({ ...validRow, identity, response })}\n`);
+		}
+		const boundedBroker = new Broker({ agentDir });
+		await boundedBroker.start();
+		expect((await boundedBroker.ledger.begin("safe", "request")).kind).toBe("terminal_uncertain");
+		await boundedBroker.stop();
+		expect(await fs.readFile(cleanupSentinel, "utf8")).toBe("preserve");
+		const quarantined = await fs.readFile(corruptPath, "utf8");
+		expect(quarantined).toContain('"identity":"deep"');
+		expect(quarantined).toContain('"identity":"wide"');
+
+		const expectOpenFailure = async (name: string, content: string, message: string) => {
+			const boundedAgentDir = path.join(agentDir, name);
+			const boundedLedgerPath = path.join(boundedAgentDir, "sdk", "lifecycle-ledger.jsonl");
+			await fs.mkdir(path.dirname(boundedLedgerPath), { recursive: true });
+			await fs.writeFile(boundedLedgerPath, content);
+			await expect(
+				new LifecycleLedger(boundedAgentDir, {
+					maxLineBytes: 64 * 1024,
+					maxBytes: 512 * 1024,
+					maxRows: 100,
+				}).open(),
+			).rejects.toThrow(message);
+		};
+		await expectOpenFailure("line-bound", "x".repeat(64 * 1024 + 1), "maximum byte length");
+		await expectOpenFailure("row-bound", "{}\n".repeat(101), "maximum row count");
+		await expectOpenFailure("file-bound", "x".repeat(512 * 1024 + 1), "maximum file byte length");
+		expect(await fs.readFile(cleanupSentinel, "utf8")).toBe("preserve");
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("legacy metadata cleanup rejects mixed lifecycle and arbitrary receipt keys before mutation", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-legacy-metadata-allowlist-"));
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "legacy-allowlist";
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const marker = canonicalJson({ pid: process.pid, effectMarker: "legacy", incarnation: "legacy" });
+	try {
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		await fs.writeFile(markerPath, marker);
+		await fs.writeFile(readyPath, marker);
+		const [stat, bytes] = await Promise.all([fs.stat(markerPath, { bigint: true }), fs.readFile(markerPath)]);
+		const cleanup: BrokerCleanupEvidence = {
+			phase: "metadata",
+			sessionId,
+			metadataRoot: stateRoot,
+			metadataPath: markerPath,
+			metadataIdentity: {
+				dev: stat.dev.toString(),
+				ino: stat.ino.toString(),
+				size: Number(stat.size),
+				mtimeNs: stat.mtimeNs.toString(),
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+			},
+			plannedMetadataPath: path.join(stateRoot, "sdk", `.gjc-delete-${sessionId}.lifecycle.json`),
+		};
+		for (const extra of [{ lifecycleFiles: [] }, { lifecycleDeleteMetadata: true }, { arbitrary: true }]) {
+			const outcome = await executeLifecycle(
+				new Broker({ agentDir: path.join(root, "agent") }),
+				"session.delete",
+				{},
+				"legacy-allowlist",
+				{ ...cleanup, ...extra } as BrokerCleanupEvidence,
+			);
+			expect(outcome.response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(await fs.readFile(markerPath, "utf8")).toBe(marker);
+			expect(await fs.readFile(readyPath, "utf8")).toBe(marker);
+		}
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
 	}
 });
 
@@ -731,6 +888,1165 @@ test("broker rejects a cross-workspace cold fork source before spawning", async 
 	}
 });
 
+test("broker rejects duplicate owned source candidates before spawning", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-duplicate-owned-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const spawnedPath = path.join(root, "spawned");
+	const command = path.join(root, "spawned.js");
+	const broker = new Broker({ agentDir });
+	const previousCommand = process.env.GJC_SDK_SESSION_COMMAND;
+	const previousRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
+	const previousSessionId = process.env.GJC_SESSION_ID;
+	try {
+		const scopeResult = await resolveManagedSessionScope({ cwd: root, agentDir });
+		expect(scopeResult.kind).toBe("resolved");
+		if (scopeResult.kind !== "resolved") throw new Error(scopeResult.message);
+		const createDuplicate = async (suffix: string) => {
+			process.env.GJC_LIFECYCLE_REQUEST_ID = `duplicate-prepare-${suffix}`;
+			process.env.GJC_SESSION_ID = "duplicate-owned-source";
+			const session = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+			await session.ensureOnDisk();
+			const sourcePath = session.getSessionFile();
+			if (!sourcePath) throw new Error("Expected duplicate owned source path.");
+			const duplicatePath = path.join(scopeResult.scope.directoryPath, `duplicate-${suffix}.jsonl`);
+			await fs.rename(sourcePath, duplicatePath);
+			return { path: duplicatePath, bytes: await fs.readFile(duplicatePath) };
+		};
+		const first = await createDuplicate("a");
+		const second = await createDuplicate("b");
+		delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+		delete process.env.GJC_SESSION_ID;
+		const inventory = await listManagedSessionCandidates({ scope: scopeResult.scope });
+		expect(inventory.kind).toBe("complete");
+		if (inventory.kind !== "complete") throw new Error(inventory.message);
+		expect(inventory.owned.filter(candidate => candidate.sessionId === "duplicate-owned-source")).toHaveLength(2);
+		const candidatePathsBefore = inventory.owned.map(candidate => candidate.path).sort();
+		const ledgerRowsBefore = (
+			await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8").catch(() => "")
+		)
+			.split("\n")
+			.filter(Boolean);
+		await fs.writeFile(
+			command,
+			`require("fs").writeFileSync(${JSON.stringify(spawnedPath)}, "spawned"); setInterval(() => {}, 1000);`,
+		);
+		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${command}`;
+		await broker.start();
+		expect(
+			await broker.handleRequest(
+				"session.fork",
+				{ cwd: root, stateRoot, sourceSessionId: "duplicate-owned-source" },
+				"duplicate-owned-source-request",
+			),
+		).toEqual({
+			ok: false,
+			error: {
+				code: "invalid_input",
+				message: "Source saved session does not match the requested workspace and session id.",
+			},
+		});
+		await expect(fs.access(spawnedPath)).rejects.toThrow();
+		expect(await fs.readFile(first.path)).toEqual(first.bytes);
+		expect(await fs.readFile(second.path)).toEqual(second.bytes);
+		await expect(fs.access(path.join(stateRoot, "sdk", "duplicate-owned-source.json"))).rejects.toThrow();
+		await expect(fs.access(path.join(stateRoot, "sdk", "duplicate-owned-source.lifecycle.json"))).rejects.toThrow();
+		const afterInventory = await listManagedSessionCandidates({ scope: scopeResult.scope });
+		expect(afterInventory.kind).toBe("complete");
+		if (afterInventory.kind !== "complete") throw new Error(afterInventory.message);
+		expect(afterInventory.owned.map(candidate => candidate.path).sort()).toEqual(candidatePathsBefore);
+		const ledgerRowsAfter = (
+			await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8").catch(() => "")
+		)
+			.split("\n")
+			.filter(Boolean)
+			.slice(ledgerRowsBefore.length)
+			.map(line => JSON.parse(line) as { state?: string });
+		expect(ledgerRowsAfter.some(row => row.state === "effect_started")).toBe(false);
+		const registrations = (await new SessionIndex(agentDir).open())
+			.listSessions()
+			.sessions.filter(session => session.sessionId === "duplicate-owned-source");
+		expect(registrations).toHaveLength(0);
+	} finally {
+		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		if (previousRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+		else process.env.GJC_LIFECYCLE_REQUEST_ID = previousRequestId;
+		if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
+		else process.env.GJC_SESSION_ID = previousSessionId;
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("broker directly resumes and forks a canonical cold saved session with scoped cleanup", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-canonical-cold-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const broker = new Broker({ agentDir });
+	try {
+		const scopeResult = await resolveManagedSessionScope({ cwd: root, agentDir });
+		expect(scopeResult.kind).toBe("resolved");
+		if (scopeResult.kind !== "resolved") throw new Error(scopeResult.message);
+		const sourceDir = SessionManager.getDefaultSessionDir(root, agentDir);
+		expect(sourceDir).toBe(scopeResult.scope.directoryPath);
+		const source = SessionManager.create(root, sourceDir);
+		await source.ensureOnDisk();
+		const sourceId = source.getSessionId();
+		const sourcePath = source.getSessionFile();
+		if (!sourcePath) throw new Error("Expected canonical saved source path.");
+		const assertCanonicalSource = async () => {
+			const inventory = await listManagedSessionCandidates({ scope: scopeResult.scope });
+			expect(inventory.kind).toBe("complete");
+			if (inventory.kind !== "complete") throw new Error(inventory.message);
+			const candidates = inventory.owned.filter(
+				candidate => candidate.sessionId === sourceId && candidate.path === sourcePath,
+			);
+			expect(candidates).toHaveLength(1);
+			expect(path.dirname(candidates[0]!.path)).toBe(scopeResult.scope.directoryPath);
+			return candidates[0]!;
+		};
+		const sourceCandidate = await assertCanonicalSource();
+		await broker.start();
+		const resumed = await broker.handleRequest(
+			"session.resume",
+			{ cwd: root, stateRoot, sessionId: sourceId, sessionPath: sourcePath },
+			"canonical-cold-resume",
+		);
+		expect(resumed).toMatchObject({ ok: true, result: { sessionId: sourceId } });
+		const resumedSourceCandidate = await assertCanonicalSource();
+		expect(resumedSourceCandidate.identity).toMatchObject({ canonicalPath: sourcePath, sessionId: sourceId });
+		expect(resumedSourceCandidate.identity).not.toEqual(sourceCandidate.identity);
+		expect(
+			await broker.handleRequest("session.close", { sessionId: sourceId }, "canonical-cold-resume-close"),
+		).toMatchObject({
+			ok: true,
+			result: { sessionId: sourceId },
+		});
+		await waitFor(
+			async () =>
+				(await fs.access(path.join(stateRoot, "sdk", `${sourceId}.json`)).then(
+					() => false,
+					() => true,
+				))
+					? true
+					: undefined,
+			"canonical resume endpoint cleanup",
+		);
+		expect(
+			await fs.access(path.join(stateRoot, "sdk", `${sourceId}.lifecycle.json`)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(true);
+		expect(
+			await fs.access(path.join(stateRoot, "sdk", `${sourceId}.lifecycle.ready.json`)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(true);
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId: sourceId })).toMatchObject({
+			ok: false,
+			error: { code: "resource_gone" },
+		});
+		const resumedSourceBytes = await fs.readFile(sourcePath);
+
+		const forkSourceCandidate = await assertCanonicalSource();
+
+		const forked = await broker.handleRequest(
+			"session.fork",
+			{ cwd: root, stateRoot, sourceSessionId: sourceId, sourceSessionPath: sourcePath },
+			"canonical-cold-fork",
+		);
+		expect(forked).toMatchObject({ ok: true });
+		if (!forked.ok) throw new Error(forked.error.message);
+		const forkResult = forked.result as { sessionId?: unknown };
+		const forkId = String(forkResult.sessionId);
+		expect(forkId).not.toBe(sourceId);
+		const inventory = await listManagedSessionCandidates({ scope: scopeResult.scope });
+		expect(inventory.kind).toBe("complete");
+		if (inventory.kind !== "complete") throw new Error(inventory.message);
+		const forkCandidates = inventory.owned.filter(candidate => candidate.sessionId === forkId);
+		expect(forkCandidates).toHaveLength(1);
+		const forkCandidate = forkCandidates[0]!;
+		expect(path.dirname(forkCandidate.path)).toBe(scopeResult.scope.directoryPath);
+		expect(forkCandidate.identity.sessionId).toBe(forkId);
+		expect(
+			await broker.handleRequest("session.close", { sessionId: forkId }, "canonical-cold-fork-close"),
+		).toMatchObject({
+			ok: true,
+			result: { sessionId: forkId },
+		});
+		await waitFor(
+			async () =>
+				(await fs.access(path.join(stateRoot, "sdk", `${forkId}.json`)).then(
+					() => false,
+					() => true,
+				))
+					? true
+					: undefined,
+			"canonical fork endpoint cleanup",
+		);
+		expect(
+			await fs.access(path.join(stateRoot, "sdk", `${forkId}.lifecycle.json`)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(true);
+		expect(
+			await fs.access(path.join(stateRoot, "sdk", `${forkId}.lifecycle.ready.json`)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(true);
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId: forkId })).toMatchObject({
+			ok: false,
+			error: { code: "resource_gone" },
+		});
+		expect(
+			await broker.handleRequest(
+				"session.delete",
+				{ cwd: root, stateRoot, sessionId: forkId, sessionPath: forkCandidate.path },
+				"canonical-cold-fork-delete",
+			),
+		).toMatchObject({ ok: true, result: { sessionId: forkId } });
+		expect(
+			await fs.access(forkCandidate.path).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+		expect(
+			await fs.access(path.join(stateRoot, "sdk", `${forkId}.lifecycle.json`)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+		expect(
+			await fs.access(path.join(stateRoot, "sdk", `${forkId}.lifecycle.ready.json`)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+		const afterDelete = await listManagedSessionCandidates({ scope: scopeResult.scope });
+		expect(afterDelete.kind).toBe("complete");
+		if (afterDelete.kind !== "complete") throw new Error(afterDelete.message);
+		expect(afterDelete.owned.some(candidate => candidate.sessionId === forkId)).toBe(false);
+		expect(await fs.readFile(sourcePath)).toEqual(resumedSourceBytes);
+		expect((await assertCanonicalSource()).identity).toEqual(forkSourceCandidate.identity);
+		expect(
+			await broker.handleRequest(
+				"session.delete",
+				{ cwd: root, stateRoot, sessionId: sourceId, sessionPath: sourcePath },
+				"canonical-cold-resume-delete",
+			),
+		).toMatchObject({ ok: true, result: { sessionId: sourceId } });
+		expect(
+			await fs.access(sourcePath).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+		expect(
+			await fs.access(path.join(stateRoot, "sdk", `${sourceId}.lifecycle.json`)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+		expect(
+			await fs.access(path.join(stateRoot, "sdk", `${sourceId}.lifecycle.ready.json`)).then(
+				() => true,
+				() => false,
+			),
+		).toBe(false);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("broker replays one identity-bound lifecycle metadata cleanup plan after the first delete detach", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-delete-metadata-crash-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const saved = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+	let crashing: Broker | undefined;
+	let reopened: Broker | undefined;
+	try {
+		await saved.ensureOnDisk();
+		const sessionId = saved.getSessionId();
+		const sessionPath = saved.getSessionFile();
+		if (!sessionPath) throw new Error("Expected persisted delete transcript.");
+		await saved.close();
+
+		crashing = new Broker({ agentDir });
+		await crashing.start();
+		await expect(
+			crashing.handleRequest(
+				"session.resume",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				"delete-metadata-resume",
+			),
+		).resolves.toMatchObject({ ok: true, result: { sessionId } });
+		await expect(
+			crashing.handleRequest("session.close", { sessionId }, "delete-metadata-close"),
+		).resolves.toMatchObject({
+			ok: true,
+			result: { sessionId },
+		});
+		await waitFor(
+			async () =>
+				(await fs.access(path.join(stateRoot, "sdk", `${sessionId}.json`)).then(
+					() => false,
+					() => true,
+				))
+					? true
+					: undefined,
+			"delete metadata endpoint cleanup",
+		);
+		const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+		const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+		await expect(fs.stat(markerPath)).resolves.toBeDefined();
+		await expect(fs.stat(readyPath)).resolves.toBeDefined();
+		setLifecycleCleanupHookForTest(crashing, () => {
+			throw new Error("simulated crash after first delete metadata detach");
+		});
+		const deleteInput = { cwd: root, stateRoot, sessionId, sessionPath };
+		await expect(crashing.handleRequest("session.delete", deleteInput, "delete-metadata-crash")).rejects.toThrow(
+			"simulated crash after first delete metadata detach",
+		);
+		const rows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		const persisted = rows.findLast(row => row.state === "effect_started");
+		const cleanup = (
+			persisted?.response as { error?: { cleanup?: { phase?: unknown; lifecycleFiles?: unknown[] } } } | undefined
+		)?.error?.cleanup;
+		expect(cleanup).toMatchObject({ phase: "lifecycle" });
+		expect(cleanup?.lifecycleFiles).toHaveLength(2);
+		expect(cleanup?.lifecycleFiles).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ path: markerPath, identity: expect.any(Object) }),
+				expect.objectContaining({ path: readyPath, identity: expect.any(Object) }),
+			]),
+		);
+		await expect(fs.stat(markerPath)).rejects.toThrow();
+		await expect(fs.stat(readyPath)).resolves.toBeDefined();
+
+		await crashing.stop();
+		crashing = undefined;
+		reopened = new Broker({ agentDir });
+		await reopened.start();
+		await expect(
+			reopened.handleRequest("session.delete", deleteInput, "delete-metadata-crash"),
+		).resolves.toMatchObject({
+			ok: true,
+			result: { sessionId },
+		});
+		await expect(fs.stat(markerPath)).rejects.toThrow();
+		await expect(fs.stat(readyPath)).rejects.toThrow();
+	} finally {
+		await crashing?.stop();
+		await reopened?.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("broker uses incarnation-aware observations before fresh lifecycle metadata cleanup", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-delete-incarnation-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const broker = new Broker({ agentDir });
+	try {
+		await broker.start();
+		for (const [name, observedIncarnation, expectedOk] of [
+			["reused", "replacement-incarnation", true],
+			["matching", "closed-incarnation", false],
+			["unreadable", undefined, false],
+		] as const) {
+			const saved = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+			await saved.ensureOnDisk();
+			const sessionId = saved.getSessionId();
+			const sessionPath = saved.getSessionFile();
+			if (!sessionPath) throw new Error("Expected persisted delete transcript.");
+			await saved.close();
+			const marker = {
+				pid: process.pid,
+				effectMarker: `closed-${name}`,
+				incarnation: "closed-incarnation",
+			};
+			const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+			const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+			await fs.mkdir(path.dirname(markerPath), { recursive: true });
+			await Promise.all([
+				fs.writeFile(markerPath, canonicalJson(marker)),
+				fs.writeFile(readyPath, canonicalJson(marker)),
+			]);
+			expect(() => process.kill(marker.pid, 0)).not.toThrow();
+			const surfaceBeforeDelete = await snapshotDeleteSurface(sessionPath);
+			setProcessIncarnationForTest(broker, () => observedIncarnation);
+			const result = await broker.handleRequest(
+				"session.delete",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				`delete-incarnation-${name}`,
+			);
+			if (expectedOk) {
+				expect(result).toMatchObject({ ok: true, result: { sessionId } });
+				await expect(fs.stat(sessionPath)).rejects.toThrow();
+				await expect(fs.stat(markerPath)).rejects.toThrow();
+				await expect(fs.stat(readyPath)).rejects.toThrow();
+			} else {
+				expect(result).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+				expect(await snapshotDeleteSurface(sessionPath)).toEqual(surfaceBeforeDelete);
+				await expect(fs.readFile(markerPath, "utf8")).resolves.toBe(canonicalJson(marker));
+				await expect(fs.readFile(readyPath, "utf8")).resolves.toBe(canonicalJson(marker));
+			}
+		}
+	} finally {
+		setProcessIncarnationForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+test("broker refuses fresh lifecycle cleanup when ready sibling has a different owner marker", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-mismatched-ready-cleanup-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const saved = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+	const broker = new Broker({ agentDir });
+	try {
+		await saved.ensureOnDisk();
+		const sessionId = saved.getSessionId();
+		const sessionPath = saved.getSessionFile();
+		if (!sessionPath) throw new Error("Expected persisted delete transcript.");
+		await saved.close();
+		const artifactsPath = sessionPath.slice(0, -6);
+		await fs.mkdir(path.join(artifactsPath, "nested"), { recursive: true });
+		await fs.writeFile(path.join(artifactsPath, "nested", "preserve.txt"), "preserve mismatch artifacts");
+
+		await broker.start();
+		await expect(
+			broker.handleRequest(
+				"session.resume",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				"mismatched-ready-resume",
+			),
+		).resolves.toMatchObject({ ok: true, result: { sessionId } });
+		await expect(
+			broker.handleRequest("session.close", { sessionId }, "mismatched-ready-close"),
+		).resolves.toMatchObject({
+			ok: true,
+			result: { sessionId },
+		});
+		await waitFor(
+			async () =>
+				(await fs.access(path.join(stateRoot, "sdk", `${sessionId}.json`)).then(
+					() => false,
+					() => true,
+				))
+					? true
+					: undefined,
+			"mismatched ready endpoint cleanup",
+		);
+		const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+		const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+		const marker = JSON.parse(await fs.readFile(markerPath, "utf8")) as {
+			pid: number;
+			effectMarker: string;
+			incarnation: string;
+		};
+		await fs.writeFile(readyPath, JSON.stringify({ ...marker, effectMarker: "different-ready-owner" }));
+		const surfaceBeforeDelete = await snapshotDeleteSurface(sessionPath);
+
+		await expect(
+			broker.handleRequest(
+				"session.delete",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				"mismatched-ready-delete",
+			),
+		).resolves.toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		await expect(fs.stat(markerPath)).resolves.toBeDefined();
+		await expect(fs.stat(readyPath)).resolves.toBeDefined();
+		expect(await snapshotDeleteSurface(sessionPath)).toEqual(surfaceBeforeDelete);
+
+		const rows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(
+			rows.some(
+				row =>
+					((row.response as { error?: { cleanup?: { phase?: unknown } } } | undefined)?.error?.cleanup?.phase ??
+						null) === "lifecycle",
+			),
+		).toBe(false);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("broker preserves ready-only lifecycle metadata without canonical marker authority during fresh delete", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ready-only-cleanup-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const saved = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+	const broker = new Broker({ agentDir });
+	try {
+		await saved.ensureOnDisk();
+		const sessionId = saved.getSessionId();
+		const sessionPath = saved.getSessionFile();
+		if (!sessionPath) throw new Error("Expected persisted delete transcript.");
+		await saved.close();
+		const artifactsPath = sessionPath.slice(0, -6);
+		await fs.mkdir(path.join(artifactsPath, "nested"), { recursive: true });
+		await fs.writeFile(path.join(artifactsPath, "nested", "preserve.txt"), "preserve ready-only artifacts");
+
+		const deadOwner = Bun.spawn([process.execPath, "-e", ""]);
+		await deadOwner.exited;
+		const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+		const readyMarker = {
+			pid: deadOwner.pid,
+			effectMarker: "ready-only-dead-owner",
+			incarnation: "ready-only-dead-incarnation",
+		};
+		await fs.mkdir(path.dirname(readyPath), { recursive: true });
+		await fs.writeFile(readyPath, canonicalJson(readyMarker));
+		const surfaceBeforeDelete = await snapshotDeleteSurface(sessionPath);
+
+		await broker.start();
+		await expect(
+			broker.handleRequest(
+				"session.delete",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				"ready-only-fresh-delete",
+			),
+		).resolves.toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		await expect(fs.readFile(readyPath, "utf8")).resolves.toBe(canonicalJson(readyMarker));
+		expect(await snapshotDeleteSurface(sessionPath)).toEqual(surfaceBeforeDelete);
+		const rows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		expect(
+			rows.some(
+				row =>
+					((row.response as { error?: { cleanup?: { phase?: unknown } } } | undefined)?.error?.cleanup?.phase ??
+						null) === "lifecycle",
+			),
+		).toBe(false);
+		expect(rows.some(row => (row.response as { ok?: unknown } | undefined)?.ok === true)).toBe(false);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("broker replays an unmarked base metadata cleanup receipt and rejects a replaced ready sibling after marker loss", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-metadata-replay-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "legacy-metadata-replay";
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const plannedPath = path.join(stateRoot, "sdk", `.gjc-delete-base-${sessionId}.lifecycle.json`);
+	const request = { cwd: root, stateRoot, sessionId };
+	const key = "base-metadata-cleanup-replay";
+	let broker: Broker | undefined;
+	try {
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		const marker = { pid: process.pid, effectMarker: "base", incarnation: "base" };
+		await fs.writeFile(markerPath, canonicalJson(marker));
+		await fs.writeFile(readyPath, canonicalJson(marker));
+		const [stat, bytes] = await Promise.all([fs.stat(markerPath, { bigint: true }), fs.readFile(markerPath)]);
+		const target = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
+		const identity = await deriveIdempotencyIdentity(agentDir, "session.delete", key, target);
+		const requestHash = createHash("sha256")
+			.update(canonicalJson({ operation: "session.delete", input: request }))
+			.digest("hex");
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin(identity, requestHash);
+		await ledger.transition(identity, "effect_started", {
+			response: {
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					message: "Base metadata cleanup is pending.",
+					cleanup: {
+						phase: "metadata",
+						sessionId,
+						metadataRoot: stateRoot,
+						metadataPath: markerPath,
+						metadataIdentity: {
+							dev: stat.dev.toString(),
+							ino: stat.ino.toString(),
+							size: Number(stat.size),
+							mtimeNs: stat.mtimeNs.toString(),
+							sha256: createHash("sha256").update(bytes).digest("hex"),
+						},
+						metadataAttempt: 1,
+						plannedMetadataPath: plannedPath,
+					},
+				},
+			},
+		});
+		await fs.unlink(markerPath);
+
+		broker = new Broker({ agentDir });
+		await broker.start();
+		setLifecycleCleanupHookForTest(broker, () => {
+			throw new Error("simulated crash after legacy ready cleanup");
+		});
+		await expect(broker.handleRequest("session.delete", request, key)).rejects.toThrow(
+			"simulated crash after legacy ready cleanup",
+		);
+		await expect(fs.stat(markerPath)).rejects.toThrow();
+		await expect(fs.stat(readyPath)).rejects.toThrow();
+		const rows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		const preUnlinkPlan = rows.some(row => {
+			const cleanup = (
+				row.response as
+					| {
+							error?: {
+								cleanup?: { phase?: unknown; lifecycleFiles?: Array<{ path?: unknown; completed?: unknown }> };
+							};
+					  }
+					| undefined
+			)?.error?.cleanup;
+			return (
+				cleanup?.phase === "lifecycle" &&
+				cleanup.lifecycleFiles?.some(file => file.path === readyPath && file.completed === undefined) === true
+			);
+		});
+		expect(preUnlinkPlan).toBe(true);
+		const migrated = rows.findLast(row => row.state === "effect_started" && row.response);
+		expect((migrated?.response as { error?: { cleanup?: unknown } } | undefined)?.error?.cleanup).toMatchObject({
+			phase: "lifecycle",
+			sessionId,
+			lifecycleFiles: [
+				expect.objectContaining({ path: markerPath, plannedPath, completed: true }),
+				expect.objectContaining({ path: readyPath, identity: expect.any(Object), completed: true }),
+			],
+		});
+		await broker.stop();
+		broker = new Broker({ agentDir });
+		await broker.start();
+		await expect(broker.handleRequest("session.delete", request, key)).resolves.toEqual({
+			ok: true,
+			result: { sessionId },
+		});
+		await expect(fs.stat(readyPath)).rejects.toThrow();
+		await broker.stop();
+		broker = undefined;
+
+		const mismatchedSessionId = "legacy-metadata-mismatched-ready";
+		const mismatchedMarkerPath = path.join(stateRoot, "sdk", `${mismatchedSessionId}.lifecycle.json`);
+		const mismatchedReadyPath = path.join(stateRoot, "sdk", `${mismatchedSessionId}.lifecycle.ready.json`);
+		const mismatchedPlannedPath = path.join(
+			stateRoot,
+			"sdk",
+			`.gjc-delete-base-${mismatchedSessionId}.lifecycle.json`,
+		);
+		const replacedReady = {
+			pid: process.pid + 1,
+			effectMarker: "replaced-ready-owner",
+			incarnation: "replaced-ready-incarnation",
+		};
+		await fs.writeFile(mismatchedMarkerPath, canonicalJson(marker));
+		await fs.writeFile(mismatchedReadyPath, canonicalJson(replacedReady));
+		const [mismatchedStat, mismatchedBytes] = await Promise.all([
+			fs.stat(mismatchedMarkerPath, { bigint: true }),
+			fs.readFile(mismatchedMarkerPath),
+		]);
+		const mismatchedRequest = { sessionId: mismatchedSessionId };
+		const mismatchedKey = "base-metadata-mismatched-ready";
+		const mismatchedIdentity = await deriveIdempotencyIdentity(
+			agentDir,
+			"session.delete",
+			mismatchedKey,
+			createHash("sha256").update(canonicalJson(mismatchedRequest)).digest("hex"),
+		);
+		const mismatchedLedger = await new LifecycleLedger(agentDir).open();
+		await mismatchedLedger.begin(
+			mismatchedIdentity,
+			createHash("sha256")
+				.update(canonicalJson({ operation: "session.delete", input: mismatchedRequest }))
+				.digest("hex"),
+		);
+		await mismatchedLedger.transition(mismatchedIdentity, "effect_started", {
+			response: {
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					message: "Base metadata cleanup is pending.",
+					cleanup: {
+						phase: "metadata",
+						sessionId: mismatchedSessionId,
+						metadataRoot: stateRoot,
+						metadataPath: mismatchedMarkerPath,
+						metadataIdentity: {
+							dev: mismatchedStat.dev.toString(),
+							ino: mismatchedStat.ino.toString(),
+							size: Number(mismatchedStat.size),
+							mtimeNs: mismatchedStat.mtimeNs.toString(),
+							sha256: createHash("sha256").update(mismatchedBytes).digest("hex"),
+						},
+						plannedMetadataPath: mismatchedPlannedPath,
+					},
+				},
+			},
+		});
+		await fs.unlink(mismatchedMarkerPath);
+		broker = new Broker({ agentDir });
+		await broker.start();
+		await expect(broker.handleRequest("session.delete", mismatchedRequest, mismatchedKey)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		await expect(fs.stat(mismatchedMarkerPath)).rejects.toThrow();
+		await expect(fs.readFile(mismatchedReadyPath, "utf8")).resolves.toBe(canonicalJson(replacedReady));
+	} finally {
+		await broker?.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("broker rejects a corrupt completed lifecycle cleanup receipt when its ready sibling remains", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-completed-lifecycle-replay-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "completed-lifecycle-replay";
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const request = { cwd: root, stateRoot, sessionId };
+	const key = "completed-lifecycle-replay";
+	let broker: Broker | undefined;
+	try {
+		const marker = {
+			pid: process.pid,
+			effectMarker: "completed-replay",
+			incarnation: "completed-replay",
+		};
+
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		await fs.writeFile(markerPath, canonicalJson(marker));
+		await fs.writeFile(readyPath, canonicalJson(marker));
+		const [markerStat, markerBytes, readyBytes] = await Promise.all([
+			fs.stat(markerPath, { bigint: true }),
+			fs.readFile(markerPath),
+			fs.readFile(readyPath),
+		]);
+		const target = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
+		const identity = await deriveIdempotencyIdentity(agentDir, "session.delete", key, target);
+		const requestHash = createHash("sha256")
+			.update(canonicalJson({ operation: "session.delete", input: request }))
+			.digest("hex");
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin(identity, requestHash);
+		await ledger.transition(identity, "effect_started", {
+			response: {
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					message: "Lifecycle cleanup is pending.",
+					cleanup: {
+						phase: "lifecycle",
+						sessionId,
+						metadataRoot: stateRoot,
+						lifecycleFiles: [
+							{
+								path: markerPath,
+								identity: {
+									dev: markerStat.dev.toString(),
+									ino: markerStat.ino.toString(),
+									size: Number(markerStat.size),
+									mtimeNs: markerStat.mtimeNs.toString(),
+									sha256: createHash("sha256").update(markerBytes).digest("hex"),
+								},
+								attempt: 1,
+								plannedPath: path.join(
+									path.dirname(markerPath),
+									`.gjc-delete-marker-${sessionId}.lifecycle.json`,
+								),
+
+								completed: true,
+							},
+						],
+					},
+				},
+			},
+		});
+		await fs.unlink(markerPath);
+		broker = new Broker({ agentDir });
+		await broker.start();
+		await expect(broker.handleRequest("session.delete", request, key)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		await expect(fs.stat(markerPath)).rejects.toThrow();
+		await expect(fs.readFile(readyPath)).resolves.toEqual(readyBytes);
+	} finally {
+		await broker?.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("broker rejects malformed lifecycle cleanup receipts without mutating metadata", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-malformed-lifecycle-replay-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "malformed-lifecycle-replay";
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const request = { cwd: root, stateRoot, sessionId };
+	const marker = canonicalJson({
+		pid: process.pid,
+		effectMarker: "malformed-replay",
+		incarnation: "malformed-replay",
+	});
+	const broker = new Broker({ agentDir });
+	try {
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		await fs.writeFile(markerPath, marker);
+		await fs.writeFile(readyPath, marker);
+		await broker.start();
+		const identity = {
+			dev: "1",
+			ino: "1",
+			size: 1,
+			mtimeNs: "1",
+			sha256: "a".repeat(64),
+		};
+		const validFile = {
+			path: markerPath,
+			identity,
+			attempt: 1,
+			plannedPath: path.join(stateRoot, "sdk", ".gjc-delete-malformed-marker"),
+		};
+		const malformed = [
+			{ lifecycleFiles: [null] },
+			{ lifecycleFiles: [{}] },
+			{ lifecycleFiles: [validFile], lifecycleDeleteMetadata: false },
+			{ lifecycleFiles: [{ ...validFile, completed: "true" }] },
+			{ lifecycleFiles: [{ ...validFile, metadataPath: markerPath }] },
+		] as const;
+		for (const [index, fragment] of malformed.entries()) {
+			const response = await executeLifecycle(
+				broker,
+				"session.delete",
+				request,
+				`malformed-lifecycle-replay-${index}`,
+				{
+					phase: "lifecycle",
+					sessionId,
+					metadataRoot: stateRoot,
+					...fragment,
+				} as unknown as BrokerCleanupEvidence,
+			);
+			expect(response.response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		}
+		expect(await fs.readFile(markerPath, "utf8")).toBe(marker);
+		expect(await fs.readFile(readyPath, "utf8")).toBe(marker);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("broker rejects oversized lifecycle marker and readiness receipts before hashing or unlinking", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-oversized-lifecycle-replay-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "oversized-lifecycle-replay";
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const request = { cwd: root, stateRoot, sessionId };
+	const broker = new Broker({ agentDir });
+	const capture = async (file: string) => {
+		const [stat, bytes] = await Promise.all([fs.stat(file, { bigint: true }), fs.readFile(file)]);
+		return {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			size: Number(stat.size),
+			mtimeNs: stat.mtimeNs.toString(),
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		};
+	};
+	const cleanup = async (): Promise<BrokerCleanupEvidence> => ({
+		phase: "lifecycle",
+		sessionId,
+		metadataRoot: stateRoot,
+		lifecycleDeleteMetadata: true,
+		lifecycleFiles: [
+			{
+				path: markerPath,
+				identity: await capture(markerPath),
+				attempt: 1,
+				plannedPath: path.join(stateRoot, "sdk", ".gjc-delete-oversized-marker"),
+			},
+			{
+				path: readyPath,
+				identity: await capture(readyPath),
+				attempt: 1,
+				plannedPath: path.join(stateRoot, "sdk", ".gjc-delete-oversized-ready"),
+			},
+		],
+	});
+	try {
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		const valid = canonicalJson({
+			pid: process.pid,
+			effectMarker: "oversized-replay",
+			incarnation: "oversized-replay",
+		});
+		await fs.writeFile(markerPath, `${valid}${" ".repeat(4096)}`);
+		await fs.writeFile(readyPath, valid);
+		await broker.start();
+		let response = await executeLifecycle(broker, "session.delete", request, "oversized-marker", await cleanup());
+		expect(response.response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		expect((await fs.stat(markerPath)).size).toBeGreaterThan(4096);
+		await fs.writeFile(markerPath, valid);
+		await fs.writeFile(readyPath, `${valid}${" ".repeat(4096)}`);
+		response = await executeLifecycle(broker, "session.delete", request, "oversized-ready", await cleanup());
+		expect(response.response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		expect((await fs.stat(readyPath)).size).toBeGreaterThan(4096);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("broker rejects duplicate lifecycle marker replay authorities without unlinking siblings", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-duplicate-lifecycle-replay-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "duplicate-lifecycle-replay";
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const request = { cwd: root, stateRoot, sessionId };
+	const key = "duplicate-lifecycle-replay";
+	let broker: Broker | undefined;
+	try {
+		const marker = { pid: process.pid, effectMarker: "duplicate-replay", incarnation: "duplicate-replay" };
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		await fs.writeFile(markerPath, canonicalJson(marker));
+		await fs.writeFile(readyPath, canonicalJson(marker));
+		const [markerStat, markerBytes, readyBytes] = await Promise.all([
+			fs.stat(markerPath, { bigint: true }),
+			fs.readFile(markerPath),
+			fs.readFile(readyPath),
+		]);
+		const identity = await deriveIdempotencyIdentity(
+			agentDir,
+			"session.delete",
+			key,
+			createHash("sha256").update(canonicalJson({ sessionId })).digest("hex"),
+		);
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin(
+			identity,
+			createHash("sha256")
+				.update(canonicalJson({ operation: "session.delete", input: request }))
+				.digest("hex"),
+		);
+		const cleanupFile = (plannedPath: string) => ({
+			path: markerPath,
+			identity: {
+				dev: markerStat.dev.toString(),
+				ino: markerStat.ino.toString(),
+				size: Number(markerStat.size),
+				mtimeNs: markerStat.mtimeNs.toString(),
+				sha256: createHash("sha256").update(markerBytes).digest("hex"),
+			},
+			attempt: 1,
+			plannedPath,
+		});
+		await ledger.transition(identity, "effect_started", {
+			response: {
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					message: "Lifecycle cleanup is pending.",
+					cleanup: {
+						phase: "lifecycle",
+						lifecycleDeleteMetadata: true,
+						sessionId,
+						metadataRoot: stateRoot,
+						lifecycleFiles: [
+							cleanupFile(path.join(stateRoot, "sdk", ".gjc-delete-one")),
+							cleanupFile(path.join(stateRoot, "sdk", ".gjc-delete-two")),
+						],
+					},
+				},
+			},
+		});
+		broker = new Broker({ agentDir });
+		await broker.start();
+		await expect(broker.handleRequest("session.delete", request, key)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		await expect(fs.readFile(markerPath)).resolves.toEqual(markerBytes);
+		await expect(fs.readFile(readyPath)).resolves.toEqual(readyBytes);
+	} finally {
+		await broker?.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+test("broker rejects a ready-only lifecycle replay entry without marker authority", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ready-only-replay-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "ready-only-lifecycle-replay";
+	const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const request = { cwd: root, stateRoot, sessionId };
+	const key = "ready-only-lifecycle-replay";
+	let broker: Broker | undefined;
+	try {
+		const marker = { pid: process.pid, effectMarker: "ready-only-replay", incarnation: "ready-only-replay" };
+		await fs.mkdir(path.dirname(readyPath), { recursive: true });
+		await fs.writeFile(readyPath, canonicalJson(marker));
+		const [readyStat, readyBytes] = await Promise.all([fs.stat(readyPath, { bigint: true }), fs.readFile(readyPath)]);
+		const identity = await deriveIdempotencyIdentity(
+			agentDir,
+			"session.delete",
+			key,
+			createHash("sha256").update(canonicalJson({ sessionId })).digest("hex"),
+		);
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin(
+			identity,
+			createHash("sha256")
+				.update(canonicalJson({ operation: "session.delete", input: request }))
+				.digest("hex"),
+		);
+		await ledger.transition(identity, "effect_started", {
+			response: {
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					message: "Lifecycle cleanup is pending.",
+					cleanup: {
+						phase: "lifecycle",
+						lifecycleDeleteMetadata: true,
+						sessionId,
+						metadataRoot: stateRoot,
+						lifecycleFiles: [
+							{
+								path: readyPath,
+								identity: {
+									dev: readyStat.dev.toString(),
+									ino: readyStat.ino.toString(),
+									size: Number(readyStat.size),
+									mtimeNs: readyStat.mtimeNs.toString(),
+									sha256: createHash("sha256").update(readyBytes).digest("hex"),
+								},
+								attempt: 1,
+								plannedPath: path.join(stateRoot, "sdk", ".gjc-delete-ready-only"),
+							},
+						],
+					},
+				},
+			},
+		});
+		broker = new Broker({ agentDir });
+		await broker.start();
+		await expect(broker.handleRequest("session.delete", request, key)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		await expect(fs.readFile(readyPath)).resolves.toEqual(readyBytes);
+	} finally {
+		await broker?.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+test("broker fails closed when a lifecycle ready sibling is swapped after marker reconciliation", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lifecycle-swap-replay-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "lifecycle-swap-replay";
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const preservePath = path.join(root, "preserve-ready-user-data");
+	const request = { cwd: root, stateRoot, sessionId };
+	const key = "lifecycle-swap-replay";
+	let broker: Broker | undefined;
+	try {
+		const marker = { pid: process.pid, effectMarker: "swap-replay", incarnation: "swap-replay" };
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		await fs.writeFile(markerPath, canonicalJson(marker));
+		await fs.writeFile(readyPath, canonicalJson(marker));
+		await fs.writeFile(preservePath, "preserve this user data");
+		const captures = await Promise.all(
+			[markerPath, readyPath].map(async file => ({
+				path: file,
+				stat: await fs.stat(file, { bigint: true }),
+				bytes: await fs.readFile(file),
+			})),
+		);
+		const identity = await deriveIdempotencyIdentity(
+			agentDir,
+			"session.delete",
+			key,
+			createHash("sha256").update(canonicalJson({ sessionId })).digest("hex"),
+		);
+		const ledger = await new LifecycleLedger(agentDir).open();
+		await ledger.begin(
+			identity,
+			createHash("sha256")
+				.update(canonicalJson({ operation: "session.delete", input: request }))
+				.digest("hex"),
+		);
+		await ledger.transition(identity, "effect_started", {
+			response: {
+				ok: false,
+				error: {
+					code: "cleanup_pending",
+					message: "Lifecycle cleanup is pending.",
+					cleanup: {
+						phase: "lifecycle",
+						lifecycleDeleteMetadata: true,
+						sessionId,
+						metadataRoot: stateRoot,
+						lifecycleFiles: captures.map(({ path: file, stat, bytes }) => ({
+							path: file,
+							identity: {
+								dev: stat.dev.toString(),
+								ino: stat.ino.toString(),
+								size: Number(stat.size),
+								mtimeNs: stat.mtimeNs.toString(),
+								sha256: createHash("sha256").update(bytes).digest("hex"),
+							},
+							attempt: 1,
+							plannedPath: path.join(stateRoot, "sdk", `.gjc-delete-swap-${path.basename(file)}`),
+						})),
+					},
+				},
+			},
+		});
+		broker = new Broker({ agentDir });
+		await broker.start();
+		setLifecycleCleanupHookForTest(broker, () => {
+			writeFileSync(readyPath, "replaced before unlink");
+			renameSync(preservePath, `${preservePath}.moved`);
+			writeFileSync(preservePath, "preserve this user data");
+		});
+		await expect(broker.handleRequest("session.delete", request, key)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		await expect(fs.readFile(readyPath, "utf8")).resolves.toBe("replaced before unlink");
+		await expect(fs.readFile(preservePath, "utf8")).resolves.toBe("preserve this user data");
+	} finally {
+		await broker?.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
 test("broker terminalizes default command resolver failures", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-resolver-failure-"));
 	const agentDir = path.join(root, "agent");
@@ -1144,11 +2460,15 @@ test("broker records the resolved worktree state root and preserves pre-child pr
 test("broker fails closed when the reopened terminal ledger cannot reproduce its response", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ledger-mismatch-"));
 	const broker = new Broker({ agentDir });
-	const originalOpen = LifecycleLedger.prototype.open;
+	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
 	try {
 		await broker.start();
-		LifecycleLedger.prototype.open = async () => ({ get: () => undefined }) as unknown as LifecycleLedger;
-		const response = await broker.handleRequest("session.unknown", {}, "ledger-mismatch");
+		LifecycleLedger.prototype.readTerminal = async () => undefined;
+		const response = await broker.handleRequest(
+			"session.unknown",
+			{ sessionId: "ledger-mismatch" },
+			"ledger-mismatch",
+		);
 		expect(response).toEqual({
 			ok: false,
 			error: {
@@ -1158,7 +2478,7 @@ test("broker fails closed when the reopened terminal ledger cannot reproduce its
 			},
 		});
 	} finally {
-		LifecycleLedger.prototype.open = originalOpen;
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
@@ -1921,3 +3241,251 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);
+
+test("lifecycle cleanup rejects transplanted and ambiguous receipts before mutation", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-cleanup-receipt-"));
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "cleanup-receipt";
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		await fs.writeFile(markerPath, "preserve lifecycle receipt bytes");
+		const stat = await fs.stat(markerPath, { bigint: true });
+		const bytes = await fs.readFile(markerPath);
+		const file = (plannedPath: string) => ({
+			path: markerPath,
+			identity: {
+				dev: stat.dev.toString(),
+				ino: stat.ino.toString(),
+				size: Number(stat.size),
+				mtimeNs: stat.mtimeNs.toString(),
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+			},
+			attempt: 1,
+			plannedPath,
+		});
+		const deleteCleanup: BrokerCleanupEvidence = {
+			phase: "lifecycle",
+			lifecycleDeleteMetadata: true,
+			sessionId,
+			metadataRoot: stateRoot,
+			lifecycleFiles: [file(path.join(stateRoot, "sdk", ".gjc-delete-cleanup"))],
+		};
+		for (const [operation, input] of [
+			["session.delete", { cwd: root, stateRoot, sessionId: "other-cleanup-receipt" }],
+			[
+				"session.delete",
+				{ cwd: path.join(root, "other"), stateRoot: path.join(root, "other", ".gjc", "state"), sessionId },
+			],
+			["session.create", { cwd: root, stateRoot }],
+		] as const) {
+			const result = await executeLifecycle(broker, operation, input, "cleanup-receipt", deleteCleanup);
+			expect(result.response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(await fs.readFile(markerPath)).toEqual(bytes);
+		}
+		const duplicate: BrokerCleanupEvidence = {
+			phase: "lifecycle",
+			sessionId,
+			metadataRoot: stateRoot,
+			lifecycleFiles: [
+				file(path.join(stateRoot, "sdk", ".gjc-delete-one")),
+				file(path.join(stateRoot, "sdk", ".gjc-delete-two")),
+			],
+		};
+		const mixed: BrokerCleanupEvidence = {
+			...duplicate,
+			metadataPath: markerPath,
+			lifecycleFiles: [file(path.join(stateRoot, "sdk", ".gjc-delete-mixed"))],
+		};
+		const shared: BrokerCleanupEvidence = {
+			phase: "lifecycle",
+			sessionId,
+			metadataRoot: stateRoot,
+			lifecycleFiles: [{ ...file(path.join(stateRoot, "sdk", ".gjc-delete-shared")), detachedPath: markerPath }],
+		};
+		for (const cleanup of [duplicate, mixed, shared]) {
+			const result = await executeLifecycle(
+				broker,
+				"session.create",
+				{ cwd: root, stateRoot },
+				"cleanup-receipt",
+				cleanup,
+			);
+			expect(result.response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(await fs.readFile(markerPath)).toEqual(bytes);
+		}
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("lifecycle cleanup receipt parser rejects hostile bounded inputs without touching user data", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-hostile-lifecycle-receipt-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "hostile-lifecycle-receipt";
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const transcriptPath = path.join(root, "user.jsonl");
+	const artifactsPath = transcriptPath.slice(0, -6);
+	const request = { cwd: root, stateRoot, sessionId };
+	const broker = new Broker({ agentDir });
+	const outsidePlannedPath = path.join(root, "outside-planned");
+	const outsideDetachedPath = path.join(root, "outside-detached");
+	const outsideMarkerPath = path.join(root, "outside-marker");
+	const outsideReadyPath = path.join(root, "outside-ready");
+	const marker = canonicalJson({ pid: process.pid, effectMarker: "hostile-replay", incarnation: "hostile-replay" });
+	const capture = async (file: string) => {
+		const [stat, bytes] = await Promise.all([fs.stat(file, { bigint: true }), fs.readFile(file)]);
+		return {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			size: Number(stat.size),
+			mtimeNs: stat.mtimeNs.toString(),
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		};
+	};
+	const cleanup = async (): Promise<BrokerCleanupEvidence> => ({
+		phase: "lifecycle",
+		sessionId,
+		metadataRoot: stateRoot,
+		lifecycleDeleteMetadata: true,
+		lifecycleFiles: [
+			{
+				path: markerPath,
+				identity: await capture(markerPath),
+				attempt: 1,
+				plannedPath: path.join(stateRoot, "sdk", ".gjc-delete-hostile-marker"),
+			},
+			{
+				path: readyPath,
+				identity: await capture(readyPath),
+				attempt: 1,
+				plannedPath: path.join(stateRoot, "sdk", ".gjc-delete-hostile-ready"),
+			},
+		],
+	});
+	const restoreBoundSiblings = async (value = marker) => {
+		await Promise.all([fs.rm(markerPath, { force: true }), fs.rm(readyPath, { force: true })]);
+		await Promise.all([fs.writeFile(markerPath, value), fs.writeFile(readyPath, value)]);
+	};
+	let preserved: { transcript: Buffer; artifacts: string | undefined };
+	const assertPreserved = async () => expect(await snapshotDeleteSurface(transcriptPath)).toEqual(preserved);
+	const reject = async (name: string, evidence: BrokerCleanupEvidence) => {
+		const siblingBytes = await Promise.all([fs.readFile(markerPath), fs.readFile(readyPath)]);
+		const started = Date.now();
+		const outcome = await executeLifecycle(broker, "session.delete", request, `hostile-lifecycle-${name}`, evidence);
+		expect(outcome.response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		expect(Date.now() - started).toBeLessThan(1_000);
+		expect(await Promise.all([fs.readFile(markerPath), fs.readFile(readyPath)])).toEqual(siblingBytes);
+		await assertPreserved();
+	};
+	try {
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		await fs.writeFile(transcriptPath, "preserve user transcript\n");
+		await fs.mkdir(artifactsPath);
+		await fs.writeFile(path.join(artifactsPath, "artifact.txt"), "preserve user artifact\n");
+		await Promise.all([
+			fs.writeFile(outsidePlannedPath, "preserve planned target\n"),
+			fs.writeFile(outsideDetachedPath, "preserve detached target\n"),
+			fs.writeFile(outsideMarkerPath, "preserve marker target\n"),
+			fs.writeFile(outsideReadyPath, "preserve ready target\n"),
+		]);
+		await restoreBoundSiblings();
+		preserved = await snapshotDeleteSurface(transcriptPath);
+		await broker.start();
+
+		const valid = await cleanup();
+		const nested = { value: 0 } as { value: number | { value: unknown } };
+		for (let depth = 0; depth < 16; depth++) nested.value = { value: nested.value };
+		const excessiveCardinality: BrokerCleanupEvidence = {
+			...valid,
+			lifecycleFiles: [...valid.lifecycleFiles!, ...valid.lifecycleFiles!, valid.lifecycleFiles![0]],
+		};
+		const deepExtraEntry = {
+			...valid,
+			lifecycleFiles: [{ ...valid.lifecycleFiles![0], unexpected: nested }, valid.lifecycleFiles![1]],
+		} as unknown as BrokerCleanupEvidence;
+		const mixedLegacyEntry = {
+			...valid,
+			metadataPath: markerPath,
+			metadataIdentity: valid.lifecycleFiles![0].identity,
+		} as unknown as BrokerCleanupEvidence;
+		const duplicateAuthority: BrokerCleanupEvidence = {
+			...valid,
+			lifecycleFiles: [
+				valid.lifecycleFiles![0],
+				{ ...valid.lifecycleFiles![0], plannedPath: valid.lifecycleFiles![1].plannedPath },
+			],
+		};
+		for (const [name, evidence] of [
+			["excessive-array", excessiveCardinality],
+			["deep-extra-entry", deepExtraEntry],
+			["mixed-legacy-entry", mixedLegacyEntry],
+			["duplicate-authority", duplicateAuthority],
+		] as const)
+			await reject(name, evidence);
+
+		for (const [name, corruptPath] of [
+			["corrupt-marker", markerPath],
+			["corrupt-ready", readyPath],
+		] as const) {
+			await restoreBoundSiblings();
+			await fs.writeFile(corruptPath, Buffer.from([0xc3, 0x28]));
+			await reject(name, await cleanup());
+			await expect(fs.readFile(corruptPath)).resolves.toEqual(Buffer.from([0xc3, 0x28]));
+		}
+
+		for (const [name, siblingPath, outsidePath] of [
+			["marker-symlink", markerPath, outsideMarkerPath],
+			["ready-symlink", readyPath, outsideReadyPath],
+		] as const) {
+			await restoreBoundSiblings();
+			await fs.rm(siblingPath);
+			await fs.symlink(outsidePath, siblingPath);
+			await reject(name, await cleanup());
+			expect((await fs.lstat(siblingPath)).isSymbolicLink()).toBe(true);
+			await expect(fs.readFile(outsidePath, "utf8")).resolves.toContain("preserve");
+		}
+
+		await restoreBoundSiblings();
+		const traversal = await cleanup();
+		traversal.lifecycleFiles![0].plannedPath = path.join(stateRoot, "sdk", "..", "outside-planned");
+		await reject("planned-traversal", traversal);
+		const detachedOutside = await cleanup();
+		detachedOutside.lifecycleFiles![1].detachedPath = outsideDetachedPath;
+		await reject("detached-outside", detachedOutside);
+		await expect(fs.readFile(outsidePlannedPath, "utf8")).resolves.toBe("preserve planned target\n");
+		await expect(fs.readFile(outsideDetachedPath, "utf8")).resolves.toBe("preserve detached target\n");
+
+		const oversizedField = canonicalJson({
+			pid: process.pid,
+			effectMarker: "x".repeat(3_500),
+			incarnation: "hostile-replay",
+		});
+		expect(Buffer.byteLength(oversizedField)).toBeLessThanOrEqual(4096);
+		await restoreBoundSiblings(oversizedField);
+		await reject("oversized-field", await cleanup());
+		await expect(fs.readFile(markerPath, "utf8")).resolves.toBe(oversizedField);
+		await expect(fs.readFile(readyPath, "utf8")).resolves.toBe(oversizedField);
+
+		await restoreBoundSiblings();
+		await broker.ledger.begin("hostile-lifecycle-control", "hostile-lifecycle-control-request");
+		const control = await executeLifecycle(
+			broker,
+			"session.delete",
+			request,
+			"hostile-lifecycle-control",
+			await cleanup(),
+		);
+		expect(control.response).toEqual({ ok: true, result: { sessionId } });
+		await expect(fs.lstat(markerPath)).rejects.toThrow();
+		await expect(fs.lstat(readyPath)).rejects.toThrow();
+		await assertPreserved();
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

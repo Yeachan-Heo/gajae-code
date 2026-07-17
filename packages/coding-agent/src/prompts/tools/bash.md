@@ -40,12 +40,12 @@ Use it only for sanctioned GJC workflow CLI persistence or state read/write/cont
 
 <critical>
 {{#when restrictionProfile "==" "read-only"}}
-- Use read-only bash only for approved inspection commands that are materially better than `read`, `search`, or `find`; the tool itself blocks non-approved commands and unsafe shell shapes.
+- Use read-only bash only for approved inspection commands that are materially better than dedicated tools; unsafe shell shapes are blocked.
 {{else}}
-- NEVER use Linux coreutils (`cat`, `head`, `tail`, `less`, `more`, `ls`, `grep`, `rg`, `awk`, `sed`, `find`, `fd`, etc.) when a dedicated tool suffices — ALWAYS prefer `read`, `search`, `find`, `edit`, `write`.
+- Use bash only for terminal operations that dedicated tools do not cover.
 {{/when}}
-- NEVER pipe through `| head -n N` or `| tail -n N` — output is already truncated with the full result available via `artifact://<id>`.
-- NEVER redirect with `2>&1` or `2>/dev/null` — stdout and stderr are already merged.
+- Never pipe through `| head -n N` or `| tail -n N` — output is already truncated with the full result available via `artifact://<id>`.
+- Never redirect with `2>&1` or `2>/dev/null` — stdout and stderr are already merged.
 </critical>
 
 <output>

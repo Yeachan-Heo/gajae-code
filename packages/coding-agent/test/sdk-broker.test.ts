@@ -1035,14 +1035,14 @@ describe("SDK broker identity and discovery", () => {
 		}
 	});
 
-	it("persists an identity-bound metadata quarantine plan before a failed exact detach", async () => {
+	it("retries cleanup pending after restart, then reopens and exactly replays successful metadata cleanup", async () => {
 		const dir = await temp();
 		const cwd = path.join(dir, "workspace");
 		const stateRoot = path.join(cwd, ".gjc", "state");
 		const sessionId = "metadata-cleanup-pending";
 		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
 		const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
-		const broker = new Broker({ agentDir: dir });
+		let broker = new Broker({ agentDir: dir });
 		const originalUnlink = native.exactUnlink;
 		let detachedQ1: string | undefined;
 		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
@@ -1072,11 +1072,15 @@ describe("SDK broker identity and discovery", () => {
 				error: {
 					code: "cleanup_pending",
 					cleanup: {
-						phase: "metadata",
-						metadataPath: markerPath,
-						metadataIdentity: expect.objectContaining({ sha256: expect.any(String) }),
-						plannedMetadataPath: expect.stringMatching(/\.gjc-delete-.*\.lifecycle\.json$/),
-						detachedMetadataPath: expect.stringMatching(/\.gjc-delete-.*\.lifecycle\.json$/),
+						phase: "lifecycle",
+						lifecycleFiles: [
+							expect.objectContaining({
+								path: markerPath,
+								identity: expect.objectContaining({ sha256: expect.any(String) }),
+								plannedPath: detachedQ1,
+								detachedPath: detachedQ1,
+							}),
+						],
 					},
 				},
 			});
@@ -1093,9 +1097,13 @@ describe("SDK broker identity and discovery", () => {
 					response: expect.objectContaining({
 						error: expect.objectContaining({
 							cleanup: expect.objectContaining({
-								phase: "metadata",
-								metadataIdentity: expect.objectContaining({ sha256: expect.any(String) }),
-								plannedMetadataPath: expect.stringMatching(/\.gjc-delete-.*\.lifecycle\.json$/),
+								phase: "lifecycle",
+								lifecycleFiles: [
+									expect.objectContaining({
+										identity: expect.objectContaining({ sha256: expect.any(String) }),
+										plannedPath: expect.stringMatching(/\.gjc-delete-.*\.lifecycle\.json$/),
+									}),
+								],
 							}),
 						}),
 					}),
@@ -1103,6 +1111,9 @@ describe("SDK broker identity and discovery", () => {
 			);
 			if (!detachedQ1) throw new Error("Missing persisted Q1 metadata path");
 			vi.restoreAllMocks();
+			await broker.stop();
+			broker = new Broker({ agentDir: dir });
+			await broker.start();
 			let plannedQ2: string | undefined;
 			const replay = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
 				if (pathname === detachedQ1) {
@@ -1119,11 +1130,12 @@ describe("SDK broker identity and discovery", () => {
 									| undefined,
 						)
 						.map(error => error?.cleanup as Record<string, unknown> | undefined)
-						.findLast(
-							cleanup =>
-								cleanup?.detachedMetadataPath === detachedQ1 && cleanup?.plannedMetadataPath !== detachedQ1,
-						);
-					plannedQ2 = pendingCleanup?.plannedMetadataPath as string | undefined;
+						.findLast(cleanup => {
+							const file = (cleanup?.lifecycleFiles as Record<string, unknown>[] | undefined)?.[0];
+							return file?.detachedPath === detachedQ1 && file?.plannedPath !== detachedQ1;
+						});
+					plannedQ2 = (pendingCleanup?.lifecycleFiles as Record<string, unknown>[] | undefined)?.[0]
+						?.plannedPath as string | undefined;
 					expect(plannedQ2).toEqual(expect.any(String));
 					expect(plannedQ2).not.toBe(detachedQ1);
 					expect((identity as { quarantineName?: string }).quarantineName).toBe(path.basename(plannedQ2!));
@@ -1143,6 +1155,16 @@ describe("SDK broker identity and discovery", () => {
 			}
 			expect(plannedQ2).toEqual(expect.any(String));
 			expect(await fs.stat(detachedQ1).catch(() => undefined)).toBeUndefined();
+			await broker.stop();
+			broker = new Broker({ agentDir: dir });
+			await broker.start();
+			expect(
+				await broker.handleRequest(
+					"session.delete",
+					{ sessionId, sessionPath, cwd },
+					"metadata-cleanup-pending-key",
+				),
+			).toMatchObject({ ok: true, result: { sessionId } });
 		} finally {
 			vi.restoreAllMocks();
 			await broker.stop();

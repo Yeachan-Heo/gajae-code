@@ -6,6 +6,7 @@ import {
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	estimateEntryTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
@@ -355,14 +356,13 @@ describe("remote compaction setting", () => {
 		const completeSimpleSpy = vi.spyOn(ai, "completeSimple");
 		completeSimpleSpy
 			.mockResolvedValueOnce(createAssistantMessage("History summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Turn prefix summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Short summary"));
+			.mockResolvedValueOnce(createAssistantMessage("Turn prefix summary"));
 
 		await compact(preparation, model, "test-api-key", undefined, undefined, {
 			initiatorOverride: "agent",
 		});
 
-		expect(completeSimpleSpy).toHaveBeenCalledTimes(3);
+		expect(completeSimpleSpy).toHaveBeenCalledTimes(2);
 		for (const call of completeSimpleSpy.mock.calls) {
 			const options = call[2] as { initiatorOverride?: string } | undefined;
 			expect(options?.initiatorOverride).toBe("agent");
@@ -405,15 +405,14 @@ describe("remote compaction setting", () => {
 		const completeSpy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(createAssistantMessage("Local history summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Local turn summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Local short summary"));
+			.mockResolvedValueOnce(createAssistantMessage("Local turn summary"));
 
 		const result = await compact(preparation, model, "test-api-key");
 
 		expect(fetchSpy).not.toHaveBeenCalled();
-		expect(completeSpy).toHaveBeenCalledTimes(3);
+		expect(completeSpy).toHaveBeenCalledTimes(2);
 		expect(result.summary).toContain("Local history summary");
-		expect(result.shortSummary).toBe("Local short summary");
+		expect(result.shortSummary).toBe("Local history summary");
 	});
 
 	it("preserves prior compaction items and encrypted reasoning for OpenAI remote compaction", async () => {
@@ -961,6 +960,24 @@ describe("findCutPoint", () => {
 		expect(result.firstKeptEntryIndex).toBe(3);
 		expect(result.isSplitTurn).toBe(true);
 		expect(result.turnStartIndex).toBe(2);
+	});
+	it("counts custom-message content when retaining the recent context window", () => {
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("old turn")),
+			{
+				type: "custom_message",
+				id: "custom-context",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				customType: "goal-context",
+				content: "x".repeat(400),
+				display: false,
+			},
+			createMessageEntry(createUserMessage("new turn")),
+		];
+
+		expect(estimateEntryTokens(entries[1]!)).toBeGreaterThanOrEqual(100);
+		expect(findCutPoint(entries, 0, entries.length, 100).firstKeptEntryIndex).toBe(1);
 	});
 });
 

@@ -91,7 +91,8 @@ describe("AgentSession startup continuation", () => {
 				const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(() => completion.promise);
 				const continuation = session.continuePersistedHistory();
 
-				await Promise.resolve();
+				for (let attempt = 0; attempt < 100 && continueSpy.mock.calls.length === 0; attempt += 1)
+					await Bun.sleep(1);
 				expect(continueSpy).toHaveBeenCalledTimes(1);
 				let settled = false;
 				void continuation.then(() => {

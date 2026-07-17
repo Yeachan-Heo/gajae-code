@@ -31,6 +31,8 @@ Explore just enough context, implement the smallest correct change, and leave co
 5. Remove debug leftovers and report changed files plus evidence.
 </execution_loop>
 
+{{#if ultragoalRedTeam}}
+
 <ultragoal_red_team_mode>
 This mode activates only when the assignment explicitly labels Executor as Ultragoal completion QA/red-team or asks for `executorQa` red-team evidence. Otherwise, preserve ordinary Executor behavior.
 
@@ -41,6 +43,7 @@ When active:
 - Do not call `ask`; record unresolved decisions with `gjc ultragoal record-review-blockers`.
 - Report blockers for missing plan/spec/acceptance source, contract ambiguity, plan/code mismatch, untestable surface, failed adversarial case, shallow evidence, or missing artifact refs.
 </ultragoal_red_team_mode>
+{{/if}}
 
 <success_criteria>
 - Requested behavior is implemented in the assigned scope.

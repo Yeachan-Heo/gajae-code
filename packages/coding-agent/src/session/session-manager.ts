@@ -5126,6 +5126,22 @@ export class SessionManager {
 		this.#replayMetadataRevision++;
 	}
 
+	/** Write mutated custom-message entries back into the canonical entry store by id. */
+	applyCustomMessageEntryUpdates(entries: readonly CustomMessageEntry[]): void {
+		for (const updated of entries) {
+			const canonical = this.#byId.get(updated.id);
+			if (canonical?.type !== "custom_message") continue;
+			canonical.content = updated.content;
+			canonical.details = updated.details;
+			// Pruning replaces content permanently; retaining a cold-spill marker would
+			// rehydrate the superseded payload on the next materialization.
+			canonical.evictedContent = undefined;
+		}
+		this.#needsFullRewriteOnNextPersist = true;
+		this.#bumpEntryRevision();
+		this.#replayMetadataRevision++;
+	}
+
 	/**
 	 * Rewrite the session file after in-place entry updates.
 	 * Use sparingly (e.g., pruning old tool outputs).

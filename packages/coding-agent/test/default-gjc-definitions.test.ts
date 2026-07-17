@@ -18,6 +18,7 @@ import { parseInternalUrl } from "@gajae-code/coding-agent/internal-urls/parse";
 import { SkillProtocolHandler } from "@gajae-code/coding-agent/internal-urls/skill-protocol";
 import { getBundledAgent } from "@gajae-code/coding-agent/task/agents";
 import { discoverAgents } from "@gajae-code/coding-agent/task/discovery";
+import { prompt } from "@gajae-code/utils";
 
 const tempRoots: string[] = [];
 const roleAgentNames = ["architect", "critic", "executor", "planner"] as const;
@@ -252,6 +253,21 @@ describe("default GJC definitions", () => {
 		expect(critic?.systemPrompt).toContain("OKAY");
 		expect(critic?.systemPrompt).toContain("REJECT");
 	});
+	it("renders shared ralplan partials while keeping the default executor prompt unchanged", () => {
+		const executor = getBundledAgent("executor");
+		const planner = getBundledAgent("planner");
+		const architect = getBundledAgent("architect");
+		const critic = getBundledAgent("critic");
+
+		expect(prompt.render(executor?.systemPrompt ?? "", { ultragoalRedTeam: false })).not.toContain(
+			"<ultragoal_red_team_mode>",
+		);
+		for (const agent of [planner, architect, critic]) {
+			expect(agent?.systemPrompt).toContain("GJC_RALPLAN_ARTIFACT");
+			expect(agent?.systemPrompt).toContain(`--stage ${agent?.name}`);
+			expect(agent?.systemPrompt).toContain("restricted `bash`");
+		}
+	});
 
 	it("makes installed project workflow skills discoverable without installing project agent stubs", async () => {
 		await withTempHome(async home => {
@@ -305,7 +321,7 @@ Project executor override body.
 		});
 	});
 
-	it("documents role-agent delegation in system and ultragoal prompts", async () => {
+	it("keeps role-agent routing concise in the system prompt", async () => {
 		const systemPrompt = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "prompts", "system", "system-prompt.md"),
 		).text();
@@ -313,54 +329,9 @@ Project executor override body.
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
 		).text();
 
-		for (const name of roleAgentNames) {
-			expect(systemPrompt).toContain(name);
-			expect(ultragoal).toContain(name);
-		}
-		expect(systemPrompt).toContain("delegate bounded slices to `executor`");
-		expect(systemPrompt).toContain("committed repo-visible `.gjc` defaults are not the source of truth");
-		expect(ultragoal).toContain("run `ralplan` first");
+		expect(systemPrompt).toContain("Delegate large implementation slices to `executor`");
+		expect(systemPrompt).not.toContain("<role-agent-surface>");
 		expect(ultragoal).toContain("Role agents return implementation/review evidence");
-		expect(ultragoal).toContain("await timeout only limits the leader's wait");
-		expect(ultragoal).toContain("must not be used as a cancellation reason");
-		expect(ultragoal).toContain("the subagent has actually failed");
-		expect(ultragoal).toContain("gone off-track");
-		expect(ultragoal).toContain("become unrecoverably wrong");
-		expect(ultragoal).toContain("Native executor parallelism contract");
-		expect(ultragoal).toContain("MUST use native `executor` parallelism");
-		expect(ultragoal).toContain("SHOULD prefer parallel `executor` subagents");
-		expect(ultragoal).toContain("MUST NOT mutate `.gjc/_session-{sessionid}/ultragoal`");
-		expect(ultragoal).toContain("target files/surfaces");
-		expect(ultragoal).toContain("independence assumptions");
-		expect(ultragoal).toContain("allowed coordination channel");
-		expect(ultragoal).toContain("conflict-escalation rule");
-		expect(ultragoal).toContain("expected evidence");
-		expect(ultragoal).toContain("terminal status");
-		expect(ultragoal).toContain("failed, timed-out, or contract-violating slices");
-		expect(ultragoal).toContain("durable ledger evidence");
-		expect(ultragoal).toContain("reassign, retry, or collapse");
-		expect(ultragoal).toContain("targeted verification");
-		expect(ultragoal).toContain("cleaner + architect + executor QA/red-team gate");
-		expect(ultragoal).toContain("Runtime-backed pipelined scheduling");
-		expect(ultragoal).toContain("--goal-metadata-json");
-		expect(ultragoal).toContain("aggregate mode only");
-		expect(ultragoal).toContain("pipeline-validation-contracts");
-		expect(ultragoal).toContain("skill-fragments/ultragoal/pipeline-validation-contracts.md");
-		expect(ultragoal).toContain("Team is not auto-launched");
-		expect(ultragoal).toContain("not a hidden pipeline scheduler");
-
-		const contracts = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(fragment =>
-			fragment.relativePath.endsWith("pipeline-validation-contracts.md"),
-		)!;
-		expect(contracts.content).toContain("start-pipeline-overlap");
-		expect(contracts.content).toContain("join-pipeline-overlap");
-		expect(contracts.content).toContain("rebaseline-pipeline-overlap");
-		expect(contracts.content).toContain("At most one eligible next goal");
-		expect(contracts.content).toContain("G(N) remains active");
-		expect(contracts.content).toContain("clean join");
-		expect(contracts.content).toContain("quarantine and re-baseline");
-		expect(contracts.content).toContain("unattributable change-set paths");
-		expect(contracts.content).toContain("fail closed");
 	});
 
 	it("documents validation-batch granularity, contract, and intra-goal lane parallelism in the ultragoal prompt", async () => {
@@ -426,37 +397,15 @@ Project executor override body.
 		const routing = extractPromptSection(systemPrompt, "routing");
 		const decomposition = extractPromptSection(systemPrompt, "decomposition");
 
-		expect(routing).toMatch(/Clear,\s+low-risk implementation request\s+→\s+implement directly/i);
-		expect(routing).toMatch(/simple clear implementation requests[\s\S]*direct tools[\s\S]*default launch path/i);
-		expect(routing).toMatch(/workflow-intent-diff[\s\S]*CustomEntry[\s\S]*does not participate in LLM context/i);
-		expect(routing).toMatch(/clear,\s+bounded,\s+and low-risk[\s\S]*smallest correct change[\s\S]*verify/i);
-		expect(routing).toMatch(/Small verification needs[\s\S]*do not make[\s\S]*planning workflow/i);
-		expect(routing).toMatch(/Architecture\/sequence risk[\s\S]*`ralplan --deliberate`/i);
-		expect(routing).toMatch(/Vague requirements[\s\S]*`deep-interview`/i);
-		expect(routing).toMatch(/Durable goal ledger[\s\S]*`ultragoal`/i);
-		expect(routing).toMatch(
-			/root-cause phase schema[\s\S]*only[\s\S]*contradiction[\s\S]*regression[\s\S]*high-risk transition/i,
-		);
-		for (const escalationTrigger of [
-			"Vague requirements",
-			"non-trivial architecture/sequence risk",
-			"Durable goal ledger",
-			"coordinated persistent workers",
-		]) {
-			expect(routing).toContain(escalationTrigger);
-		}
-
-		expect(routing).toMatch(
-			/Informational questions, bare `\?`, and unambiguous explanatory prompts[\s\S]*answer-only\/read-only/i,
-		);
-		expect(routing).toMatch(/unless the user explicitly asks to change, run, implement, or execute/i);
-		expect(routing).toMatch(/Ambiguous implementation asks[\s\S]*require clarification[\s\S]*before mutation/i);
+		expect(routing).toContain("Clear, low-risk implementation requests use direct tools");
+		expect(routing).toContain("Informational questions are answer-only/read-only");
+		expect(routing).toContain("Vague requirements use `/skill:deep-interview`");
+		expect(routing).toContain("`/skill:ralplan --deliberate`");
+		expect(routing).toContain("`/skill:ultragoal`");
+		expect(routing).toContain("`/skill:team`");
+		expect(routing).toContain("Delegate large implementation slices to `executor`");
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(6);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
-		expect(decomposition).toMatch(/Do not delegate[\s\S]*single-line typos[\s\S]*known-location fixes/i);
-		const simpleRequestRule = routing.split("\n").find(line => line.includes("simple clear implementation requests"));
-		expect(simpleRequestRule).toBeDefined();
-		expect(simpleRequestRule).not.toMatch(/use `deep-interview`|use `ralplan`|use `ultragoal`|use `team`|delegate/i);
-		expect(simpleRequestRule).toMatch(/Do not invoke/i);
 	});
 
 	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {

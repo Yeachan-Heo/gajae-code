@@ -31,6 +31,27 @@ import type { LoadedSubskillActivation } from "../extensibility/gjc-plugins";
 import type { OutputMeta } from "../tools/output-meta";
 import { formatOutputNotice } from "../tools/output-meta";
 
+/**
+ * Encode untrusted values embedded in prompt markup. Control and bidi characters
+ * become visible escape sequences so they cannot alter markup structure or display.
+ */
+export function escapePromptMetadata(value: string, options: { preserveNewlines?: boolean } = {}): string {
+	return value.replace(/[&<>"\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/g, char => {
+		if (options.preserveNewlines && (char === "\n" || char === "\t")) return char;
+		switch (char) {
+			case "&":
+				return "&amp;";
+			case "<":
+				return "&lt;";
+			case ">":
+				return "&gt;";
+			case '"':
+				return "&quot;";
+			default:
+				return `\\u${char.codePointAt(0)!.toString(16).padStart(4, "0")}`;
+		}
+	});
+}
 export const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
 
 export interface SkillPromptDetails {
@@ -370,8 +391,10 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "fileMention": {
 					const fileContents = m.files
 						.map(file => {
-							const inner = file.content ? `\n${file.content}\n` : "\n";
-							return `<file path="${file.path}">${inner}</file>`;
+							const inner = file.content
+								? `\n${file.content.replace(/<\/system-reminder>/gi, "&lt;/system-reminder>")}\n`
+								: "\n";
+							return `<file path="${escapePromptMetadata(file.path)}">${inner}</file>`;
 						})
 						.join("\n\n");
 					const content: (TextContent | ImageContent)[] = [

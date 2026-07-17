@@ -76,6 +76,16 @@ describe("estimateToolOutputPruneSavings (Finding 13)", () => {
 		expect(estimate.tokensSaved).toBe(0);
 		expect(estimate.prunableCount).toBe(0);
 	});
+
+	test("uses an explicit relaxed minimum for threshold compaction only", () => {
+		const entries = [toolEntry("old1", bigText("old1", 200)), toolEntry("old2", bigText("old2", 200))];
+		const highMin: PruneConfig = { ...config, minimumSavings: 10_000_000 };
+
+		expect(estimateToolOutputPruneSavings(entries, highMin).tokensSaved).toBe(0);
+		const relaxed = estimateToolOutputPruneSavings(entries, highMin, { relaxedMinimum: 0 });
+		expect(relaxed.tokensSaved).toBeGreaterThan(0);
+		expect(pruneToolOutputs(entries, highMin, { relaxedMinimum: 0 }).tokensSaved).toBe(relaxed.tokensSaved);
+	});
 });
 
 describe("shouldRunMaintenancePrune (Finding 13)", () => {

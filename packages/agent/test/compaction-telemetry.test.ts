@@ -120,23 +120,19 @@ function makePreparation(overrides: Partial<CompactionPreparation> = {}): Compac
 }
 
 describe("compaction oneshot telemetry", () => {
-	it("tags compact() chat spans with compaction_summary + compaction_short_summary", async () => {
+	it("uses one LLM request and derives shortSummary from the main summary", async () => {
 		const spy = vi
 			.spyOn(ai, "completeSimple")
-			.mockResolvedValueOnce(makeAssistantMessage("history summary text", makeUsage(200, 90, 10, 5)))
-			.mockResolvedValueOnce(makeAssistantMessage("short summary text"));
+			.mockResolvedValueOnce(makeAssistantMessage("history summary text", makeUsage(200, 90, 10, 5)));
 
 		const telemetry = resolveTelemetry(makeTelemetryConfig(), "session-1");
-		await compact(makePreparation(), MODEL, "test-api-key", undefined, undefined, { telemetry });
-
-		expect(spy).toHaveBeenCalledTimes(2);
+		const result = await compact(makePreparation(), MODEL, "test-api-key", undefined, undefined, { telemetry });
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(result.shortSummary).toBe("history summary text");
 		const chats = chatSpans(exporter.getFinishedSpans());
-		expect(chats).toHaveLength(2);
-
+		expect(chats).toHaveLength(1);
 		const historySpan = spansByOneshotKind(chats, "compaction_summary")[0];
-		const shortSpan = spansByOneshotKind(chats, "compaction_short_summary")[0];
 		expect(historySpan).toBeDefined();
-		expect(shortSpan).toBeDefined();
 		expect(historySpan?.name).toBe("chat mock-model");
 		expect(historySpan?.attributes[GenAIAttr.ConversationId]).toBe("conv-compaction");
 		expect(historySpan?.attributes[GenAIAttr.RequestModel]).toBe("mock-model");
@@ -145,8 +141,7 @@ describe("compaction oneshot telemetry", () => {
 		expect(historySpan?.attributes[PiGenAIAttr.AgentStepNumber]).toBe(-1);
 		expect(historySpan?.status.code).not.toBe(SpanStatusCode.ERROR);
 	});
-
-	it("emits three chat spans for split-turn preparation (history + turn-prefix + short)", async () => {
+	it("emits two chat spans for split-turn preparation (history + turn-prefix)", async () => {
 		const spy = vi.spyOn(ai, "completeSimple").mockResolvedValue(makeAssistantMessage("ok"));
 
 		const telemetry = resolveTelemetry(makeTelemetryConfig(), "session-split");
@@ -156,21 +151,17 @@ describe("compaction oneshot telemetry", () => {
 		});
 		await compact(preparation, MODEL, "test-api-key", undefined, undefined, { telemetry });
 
-		expect(spy).toHaveBeenCalledTimes(3);
+		expect(spy).toHaveBeenCalledTimes(2);
 		const chats = chatSpans(exporter.getFinishedSpans());
-		expect(chats).toHaveLength(3);
+		expect(chats).toHaveLength(2);
 		expect(spansByOneshotKind(chats, "compaction_summary")).toHaveLength(1);
 		expect(spansByOneshotKind(chats, "compaction_turn_prefix")).toHaveLength(1);
-		expect(spansByOneshotKind(chats, "compaction_short_summary")).toHaveLength(1);
+		expect(spansByOneshotKind(chats, "compaction_short_summary")).toHaveLength(0);
 	});
-
 	it("emits no spans when telemetry is undefined", async () => {
-		vi.spyOn(ai, "completeSimple")
-			.mockResolvedValueOnce(makeAssistantMessage("history"))
-			.mockResolvedValueOnce(makeAssistantMessage("short"));
+		vi.spyOn(ai, "completeSimple").mockResolvedValueOnce(makeAssistantMessage("history"));
 
 		await compact(makePreparation(), MODEL, "test-api-key", undefined, undefined);
-
 		expect(exporter.getFinishedSpans()).toHaveLength(0);
 	});
 

@@ -29,7 +29,6 @@ import {
 	withOpenAiRemoteCompactionPreserveData,
 } from "./openai";
 import autoHandoffThresholdFocusPrompt from "./prompts/auto-handoff-threshold-focus.md" with { type: "text" };
-import compactionShortSummaryPrompt from "./prompts/compaction-short-summary.md" with { type: "text" };
 import compactionSummaryPrompt from "./prompts/compaction-summary.md" with { type: "text" };
 import compactionTurnPrefixPrompt from "./prompts/compaction-turn-prefix.md" with { type: "text" };
 import compactionUpdateSummaryPrompt from "./prompts/compaction-update-summary.md" with { type: "text" };
@@ -510,7 +509,8 @@ function collectMessageFragments(message: AgentMessage): { fragments: string[]; 
 	}
 
 	switch (message.role) {
-		case "user": {
+		case "user":
+		case "custom": {
 			const content = (message as { content: string | Array<{ type: string; text?: string }> }).content;
 			if (typeof content === "string") {
 				fragments.push(content);
@@ -710,8 +710,6 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type !== "message") continue;
-
 		// Estimate this message's size
 		const messageTokens = estimateEntryTokens(entry);
 		accumulatedTokens += messageTokens;
@@ -769,8 +767,6 @@ const SUMMARIZATION_PROMPT = prompt.render(compactionSummaryPrompt);
 
 const UPDATE_SUMMARIZATION_PROMPT = prompt.render(compactionUpdateSummaryPrompt);
 
-const SHORT_SUMMARY_PROMPT = prompt.render(compactionShortSummaryPrompt);
-
 const HANDOFF_DOCUMENT_PROMPT = prompt.render(handoffDocumentPrompt);
 
 export const AUTO_HANDOFF_THRESHOLD_FOCUS = prompt.render(autoHandoffThresholdFocusPrompt);
@@ -796,8 +792,7 @@ export interface SummaryOptions {
 	/**
 	 * Optional telemetry handle. When provided, every LLM call emitted during
 	 * compaction is wrapped in an OTEL chat span tagged with
-	 * `pi.gen_ai.oneshot.kind` (`compaction_summary`, `compaction_short_summary`,
-	 * or `compaction_turn_prefix`). `undefined` keeps the call paths zero-cost.
+	 * `pi.gen_ai.oneshot.kind` (`compaction_summary` or `compaction_turn_prefix`).
 	 */
 	telemetry?: AgentTelemetry;
 	authCredentialType?: "api_key" | "oauth";
@@ -1054,66 +1049,11 @@ export async function generateHandoff(
 		.join("\n");
 }
 
-async function generateShortSummary(
-	recentMessages: AgentMessage[],
-	historySummary: string | undefined,
-	model: Model,
-	reserveTokens: number,
-	apiKey: string,
-	signal?: AbortSignal,
-	options?: SummaryOptions,
-): Promise<string> {
-	const maxTokens = Math.min(512, Math.floor(0.2 * reserveTokens));
-	const llmMessages = (options?.convertToLlm ?? convertToLlm)(recentMessages);
-	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
-
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (historySummary) {
-		promptText += `<previous-summary>\n${historySummary}\n</previous-summary>\n\n`;
-	}
-	promptText += formatAdditionalContext(options?.extraContext);
-	promptText += SHORT_SUMMARY_PROMPT;
-
-	if (options?.remoteEndpoint) {
-		const remote = await requestRemoteCompaction(
-			options.remoteEndpoint,
-			{
-				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-				prompt: promptText,
-			},
-			signal,
-		);
-		return remote.summary;
-	}
-
-	const response = await instrumentedCompleteSimple(
-		model,
-		{
-			systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
-			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-		},
-		{
-			maxTokens,
-			signal,
-			apiKey,
-			reasoning: Effort.High,
-			initiatorOverride: options?.initiatorOverride,
-			metadata: options?.metadata,
-			sessionId: options?.sessionId,
-			providerSessionState: options?.providerSessionState,
-			preferWebsockets: options?.preferWebsockets,
-		},
-		{ telemetry: options?.telemetry, oneshotKind: "compaction_short_summary" },
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Short summary failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	return response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map(c => c.text)
-		.join("\n");
+/** Derive a display summary locally to avoid a second compaction LLM request. */
+function deriveShortSummary(summary: string): string {
+	const firstParagraph = summary.trim().split(/\n\s*\n/, 1)[0] ?? "";
+	const maxLength = 2_000;
+	return firstParagraph.length <= maxLength ? firstParagraph : `${firstParagraph.slice(0, maxLength - 1)}…`;
 }
 
 // ============================================================================
@@ -1163,6 +1103,11 @@ export interface PrepareCompactionOptions {
 	 * (the confounded raw promptTokens/estimatedTokens quotient is never used).
 	 */
 	tokenCorrectionRatio?: number;
+	/**
+	 * Model context-window size. Windows below 66k retain the legacy fixed
+	 * keepRecentTokens behavior; larger windows scale the keep window to 30%.
+	 */
+	contextWindow?: number;
 }
 
 export function prepareCompaction(
@@ -1193,13 +1138,42 @@ export function prepareCompaction(
 	// counts system+tools+full history while estimatedTokens counted only the
 	// post-boundary slice, so it was confounded and only ever shrank the window.
 	// Here the correction is bidirectional and clamped to [0.5, 2].
-	const keepRecentTokens = settings.keepRecentTokens;
+	const configuredKeepRecentTokens = settings.keepRecentTokens;
+	const contextWindow = options.contextWindow;
+	const thresholdSafeKeepRecentTokens =
+		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 1
+			? Math.max(
+					1,
+					resolveThresholdTokens(contextWindow, settings) - effectiveReserveTokens(contextWindow, settings, 0),
+				)
+			: configuredKeepRecentTokens;
+	const keepRecentTokens = Math.min(configuredKeepRecentTokens, thresholdSafeKeepRecentTokens);
+	// Preserve the legacy fixed window for smaller models. At 66k and above,
+	// retain up to 30% of the model context, but never enough to leave the
+	// post-compaction prompt immediately above its configured threshold.
+	const scaledKeepRecentTokens =
+		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow >= 66_000
+			? Math.min(thresholdSafeKeepRecentTokens, Math.max(keepRecentTokens, Math.floor(contextWindow * 0.3)))
+			: keepRecentTokens;
 	const rawRatio = options.tokenCorrectionRatio;
 	const appliedRatio =
 		rawRatio !== undefined && Number.isFinite(rawRatio) && rawRatio > 0
 			? Math.min(TOKEN_CORRECTION_MAX_RATIO, Math.max(TOKEN_CORRECTION_MIN_RATIO, rawRatio))
 			: 1;
-	const keepRecentTokensCorrected = Math.max(1, Math.round(keepRecentTokens / appliedRatio));
+	// Preserve an explicit keep floor that already covers the whole history: manual
+	// and emergency callers rely on prepareCompaction returning undefined rather
+	// than manufacturing a summary with no useful reduction. Otherwise, a scaled
+	// window that exceeds a short history falls back to the threshold-safe floor.
+	const historyTokens = pathEntries
+		.slice(boundaryStart, boundaryEnd)
+		.reduce((tokens, entry) => tokens + estimateEntryTokens(entry), 0);
+	const effectiveKeepRecentTokens =
+		configuredKeepRecentTokens > historyTokens
+			? configuredKeepRecentTokens
+			: scaledKeepRecentTokens > keepRecentTokens && scaledKeepRecentTokens > historyTokens
+				? keepRecentTokens
+				: scaledKeepRecentTokens;
+	const keepRecentTokensCorrected = Math.max(1, Math.round(effectiveKeepRecentTokens / appliedRatio));
 
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokensCorrected);
 
@@ -1437,28 +1411,10 @@ export async function compact(
 		summary = "No prior history.";
 	}
 
-	const shortSummary = await generateShortSummary(
-		recentMessages,
-		summary,
-		model,
-		settings.reserveTokens,
-		apiKey,
-		signal,
-		{
-			extraContext: options?.extraContext,
-			remoteEndpoint: summaryOptions.remoteEndpoint,
-			initiatorOverride: summaryOptions.initiatorOverride,
-			metadata: summaryOptions.metadata,
-			telemetry: summaryOptions.telemetry,
-			sessionId: summaryOptions.sessionId,
-			providerSessionState: summaryOptions.providerSessionState,
-			preferWebsockets: summaryOptions.preferWebsockets,
-		},
-	);
-
 	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary = upsertFileOperations(summary, readFiles, modifiedFiles);
+	const shortSummary = deriveShortSummary(summary);
 
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no ID - session may need migration");

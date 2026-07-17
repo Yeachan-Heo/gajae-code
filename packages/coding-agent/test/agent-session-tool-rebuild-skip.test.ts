@@ -274,10 +274,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(rebuildCount).toBe(2);
 	});
 
-	it("rebuilds when MCP server instructions text changes", async () => {
-		// `rebuildSystemPrompt` embeds per-server `instructions` text into the appended
-		// prompt. The signature must include this so a server upgrade that changes
-		// instructions while keeping tools constant still triggers a rebuild.
+	it("does not rebuild the system prompt when request-scoped MCP instructions change", async () => {
+		// Server instructions are request-scoped untrusted user data, so changing them
+		// must not invalidate or rebuild the cached system prompt.
 		let rebuildCount = 0;
 		const instructions = new Map<string, string>([["nucleus", "v1 instructions"]]);
 		const { session } = newSession(
@@ -296,15 +295,14 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.refreshMCPTools([tool]);
 		expect(rebuildCount).toBe(1);
 
-		// Mutate the live instructions map (callers return the live reference).
+		// Mutating or adding live server instructions does not affect the system prompt.
 		instructions.set("nucleus", "v2 instructions");
 		await session.refreshMCPTools([tool]);
-		expect(rebuildCount).toBe(2);
+		expect(rebuildCount).toBe(1);
 
-		// Adding a new server's instructions also triggers rebuild.
 		instructions.set("glean", "glean instructions");
 		await session.refreshMCPTools([tool]);
-		expect(rebuildCount).toBe(3);
+		expect(rebuildCount).toBe(1);
 	});
 
 	it("rebuilds when a discoverable (inactive) registry tool's metadata changes", async () => {
@@ -458,12 +456,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			setSystemTime(); // restore real time
 		}
 	});
-	it("does not rebuild when MCP server instructions change only beyond the 4000-char truncation boundary", async () => {
-		// `rebuildSystemPrompt` (sdk/session.ts) truncates each server instruction to 4000 chars
-		// before embedding it. The `getMcpServerInstructions` callback must therefore
-		// return pre-truncated strings so the signature hashes exactly what the prompt
-		// builder uses. Changes beyond char 4000 cannot affect rendered prompt bytes
-		// and must NOT trigger a rebuild.
+	it("does not rebuild for MCP instruction changes at any truncation boundary", async () => {
+		// Instruction truncation applies to request-scoped untrusted data and is not
+		// part of the stable system-prompt signature.
 		const prefix = "A".repeat(4000);
 		const instructions = new Map<string, string>([["nucleus", `${prefix}_tail_v1`]]);
 		let rebuildCount = 0;
@@ -493,9 +488,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.refreshMCPTools([tool]);
 		expect(rebuildCount).toBe(1);
 
-		// Mutate within the first 4000 chars: truncated string differs → rebuild.
+		// Mutating within the first 4000 chars also leaves the system prompt unchanged.
 		instructions.set("nucleus", `${"B".repeat(4000)}_tail_v2`);
 		await session.refreshMCPTools([tool]);
-		expect(rebuildCount).toBe(2);
+		expect(rebuildCount).toBe(1);
 	});
 });

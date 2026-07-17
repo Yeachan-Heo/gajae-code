@@ -172,7 +172,7 @@ describe("maintenance call transport forwarding (#736)", () => {
 		expect(captured[0]?.preferWebsockets).toBe(true);
 	});
 
-	it("compact() forwards transport fields to BOTH the history summary and the short summary", async () => {
+	it("compact() forwards transport fields to the history summary (short summary is derived locally, #2335)", async () => {
 		const captured = spyCompleteSimple();
 		const providerSessionState = new Map<string, ProviderSessionState>();
 
@@ -182,8 +182,9 @@ describe("maintenance call transport forwarding (#736)", () => {
 			preferWebsockets: true,
 		});
 
-		// history summary + short summary
-		expect(captured).toHaveLength(2);
+		// history summary only: shortSummary is derived from the main summary
+		// without a dedicated LLM roundtrip (#2335).
+		expect(captured).toHaveLength(1);
 		for (const options of captured) {
 			expect(options.sessionId).toBe("turn-session-4");
 			expect(options.providerSessionState).toBe(providerSessionState);
