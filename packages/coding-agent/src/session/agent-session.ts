@@ -11854,6 +11854,8 @@ export class AgentSession {
 
 	#isRetryableError(message: AssistantMessage): boolean {
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
+		const contextWindow = this.model?.contextWindow ?? 0;
+		if (isContextOverflow(message, contextWindow)) return false;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
 		if (!managedFallback) {
 			const classification = this.#classifyErrorForRetry(message);
@@ -12194,6 +12196,7 @@ export class AgentSession {
 		allowLegacyUsageLimit: boolean,
 		transportFailure?: TransportFailureFacts,
 	): { class: FallbackTriggerClass; retryAfterMs?: number } | undefined {
+		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return undefined;
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
 		if (transport.class !== "other") return transport;
 		// Managed fallback receives authoritative transport facts from the request
@@ -12347,6 +12350,7 @@ export class AgentSession {
 		const classification = managedFallback ? undefined : this.#classifyErrorForRetry(message);
 		const legacyUnbounded = classification === "transient";
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome = managedFallback
 			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
 			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
@@ -12384,9 +12388,8 @@ export class AgentSession {
 						? Math.min(retryAfterMs, retrySettings.maxDelayMs)
 						: cappedExponentialWithFullJitter(retrySettings.baseDelayMs, retrySettings.maxDelayMs, attemptsUsed);
 
-		if (managedFallback && trigger.class === "rate_limit" && trigger.retryAfterMs !== undefined) {
-			const selector = controller.currentSelector();
-			if (selector) this.#modelRegistry.suppressSelector(selector, Date.now() + trigger.retryAfterMs);
+		if (managedFallback && trigger.class === "rate_limit" && trigger.retryAfterMs !== undefined && failedSelector) {
+			this.#modelRegistry.suppressSelector(failedSelector, Date.now() + trigger.retryAfterMs);
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {

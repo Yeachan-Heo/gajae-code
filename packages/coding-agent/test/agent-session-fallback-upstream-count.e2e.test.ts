@@ -50,6 +50,36 @@ function rateLimitStream(model: Model): AssistantMessageEventStream {
 	return stream;
 }
 
+function typedRateLimitStream(model: Model, retryAfterMs: number): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage & {
+			transportFailure: { kind: "transport"; status: number; headers: Record<string, string> };
+		} = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "rate limit exceeded",
+			errorStatus: 429,
+			timestamp: Date.now(),
+			transportFailure: { kind: "transport", status: 429, headers: { "retry-after-ms": String(retryAfterMs) } },
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
 function successfulStream(model: Model, content = "Recovered"): AssistantMessageEventStream {
 	return createMockModel({ responses: [{ content: [content] }] }).stream(model, {
 		systemPrompt: [],
@@ -165,6 +195,33 @@ describe("AgentSession managed fallback upstream request counts", () => {
 				attemptsUsed: 3,
 			}),
 		]);
+	});
+
+	it("suppresses the rate-limited head and returns to it when the cooldown expires", async () => {
+		const calls: string[] = [];
+		let primaryAttempts = 0;
+		const { primary, fallback } = createSession(1, (model, _context, _options) => {
+			calls.push(selector(model));
+			if (selector(model) === selector(primary) && primaryAttempts++ === 0) {
+				return typedRateLimitStream(model, 1);
+			}
+			return successfulStream(model, "Recovered");
+		});
+		const suppressSpy = vi.spyOn(modelRegistry, "suppressSelector");
+
+		await session!.prompt("Switch after a rate limit");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(suppressSpy).toHaveBeenCalledWith(selector(primary), expect.any(Number));
+		expect(modelRegistry.getSelectorSuppressionStatus(selector(fallback))).toBe("none");
+		await Bun.sleep(5);
+
+		await session!.prompt("Return after cooldown expiry");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(fallback), selector(primary)]);
+		expect(session!.model).toMatchObject({ provider: primary.provider, id: primary.id });
 	});
 
 	it("emits one switch when an exhausted chain restarts with an unavailable head", async () => {

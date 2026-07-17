@@ -92,6 +92,36 @@ function otherTransportFailureStream(model: Model, errorMessage: string): Assist
 	return stream;
 }
 
+function typedOverflowStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage & {
+			transportFailure: { kind: "transport"; status: number; openaiErrorCode: string };
+		} = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "context_length_exceeded: prompt exceeds the context window",
+			errorStatus: 400,
+			timestamp: Date.now(),
+			transportFailure: { kind: "transport", status: 400, openaiErrorCode: "context_length_exceeded" },
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
 describe("AgentSession managed fallback attempt transaction", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -214,6 +244,33 @@ describe("AgentSession managed fallback attempt transaction", () => {
 
 		expect(calls).toHaveLength(2);
 		expect(events).toContainEqual(expect.objectContaining({ type: "model_fallback_switched", reason: "unknown" }));
+	});
+
+	it("routes typed managed context overflow to compaction without consuming fallback attempts", async () => {
+		const calls: string[] = [];
+		let attempts = 0;
+		const { primary, fallback } = createSession(model => {
+			calls.push(selector(model));
+			return attempts++ === 0
+				? typedOverflowStream(model)
+				: createMockModel({ responses: [{ content: ["Recovered after compaction"] }] }).stream(model, {
+						systemPrompt: [],
+						messages: [],
+						tools: [],
+					});
+		}, 1);
+		session!.settings.set("compaction.enabled", true);
+		session!.settings.set("compaction.autoContinue", false);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Route typed context overflow to compaction");
+		await session!.waitForIdle();
+
+		expect(calls).toContain(selector(primary));
+		expect(calls).not.toContain(selector(fallback));
+		expect(events).toContainEqual(expect.objectContaining({ type: "auto_compaction_start", reason: "overflow" }));
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
 	});
 
 	it("finalizes exhausted when every fallback tail entry is unavailable during resolution", async () => {
