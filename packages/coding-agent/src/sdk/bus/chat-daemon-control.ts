@@ -1,4 +1,4 @@
-import { spawn as childProcessSpawn, spawnSync } from "node:child_process";
+import { spawn as childProcessSpawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -12,6 +12,7 @@ import type {
 	DaemonStatus,
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
+import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
 
 export type ChatDaemonKind = "discord" | "slack";
@@ -120,28 +121,6 @@ function defaultSignal(pid: number, signal: NodeJS.Signals): void {
 	try {
 		process.kill(pid, signal);
 	} catch {}
-}
-function defaultPidIncarnation(pid: number): string | undefined {
-	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-	if (process.platform === "linux") {
-		try {
-			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-			return `linux:${
-				stat
-					.slice(stat.lastIndexOf(")") + 2)
-					.trim()
-					.split(/\s+/)[19]
-			}`;
-		} catch {
-			return undefined;
-		}
-	}
-	if (process.platform === "darwin") {
-		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
-		const startedAt = result.status === 0 ? result.stdout.trim() : "";
-		return startedAt ? `darwin:${startedAt}` : undefined;
-	}
-	return undefined;
 }
 function runtimeInfo(execPath?: string): DaemonRuntimeInfo {
 	const rt = resolveGjcRuntimeSpawnInfo(execPath ?? process.execPath);
@@ -377,7 +356,7 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		);
 	}
 	private incarnation(pid: number): string | undefined {
-		return (this.deps.pidIncarnation ?? defaultPidIncarnation)(pid);
+		return (this.deps.pidIncarnation ?? processIncarnation)(pid);
 	}
 	private isLiveState(state: ChatDaemonState): boolean {
 		return (
@@ -541,7 +520,7 @@ export async function acquireChatDaemonOwnership(input: {
 	const pid = input.pid ?? process.pid;
 	const probe: ChatDaemonOwnershipProbe = {
 		pidAlive: input.pidAlive ?? defaultPidAlive,
-		pidIncarnation: input.pidIncarnation ?? defaultPidIncarnation,
+		pidIncarnation: input.pidIncarnation ?? processIncarnation,
 	};
 	const incarnation = input.incarnation ?? probe.pidIncarnation(pid) ?? "unavailable";
 	await fs.promises.mkdir(paths.dir, { recursive: true, mode: 0o700 });
@@ -631,9 +610,9 @@ async function isStaleChatDaemonLock(lock: string, probe: ChatDaemonOwnershipPro
 		const currentIncarnation = probe.pidIncarnation(owner.pid);
 		return (
 			!probe.pidAlive(owner.pid) ||
-			(currentIncarnation !== undefined &&
-				owner.incarnation !== "unavailable" &&
-				currentIncarnation !== owner.incarnation)
+			(owner.incarnation !== "unavailable" &&
+				(!isProcessIncarnation(owner.incarnation) ||
+					(currentIncarnation !== undefined && currentIncarnation !== owner.incarnation)))
 		);
 	}
 	const stat = await fs.promises.stat(lock).catch(() => undefined);
