@@ -278,6 +278,57 @@ describe("AgentSession message pipeline", () => {
 		expect(idleResolved).toBe(true);
 	});
 
+	it("waitForIdle waits for an active prompt to finalize and handle its deferred terminal event", async () => {
+		const promptStarted = Promise.withResolvers<void>();
+		const releasePrompt = Promise.withResolvers<void>();
+		const terminalHandlerStarted = Promise.withResolvers<void>();
+		const releaseTerminalHandler = Promise.withResolvers<void>();
+		const extensionEmit = vi.fn(async (event: { type: string }) => {
+			if (event.type !== "agent_end") return;
+			terminalHandlerStarted.resolve();
+			await releaseTerminalHandler.promise;
+		});
+		const agent = createAgent();
+		agent.state.model = { provider: "test", id: "test" } as never;
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: { getApiKey: async () => "key" } as never,
+			extensionRunner: {
+				emit: extensionEmit,
+				emitBeforeAgentStart: async () => undefined,
+				hasHandlers: (eventType: string) => eventType === "agent_end",
+			} as never,
+		});
+		sessions.push(session);
+
+		vi.spyOn(agent, "prompt").mockImplementation(async () => {
+			promptStarted.resolve();
+			agent.emitExternalEvent({ type: "agent_end", messages: [] } as never);
+			await releasePrompt.promise;
+		});
+
+		const prompt = session.prompt("active prompt");
+		await promptStarted.promise;
+		const idle = session.waitForIdle();
+		let idleResolved = false;
+		void idle.then(() => {
+			idleResolved = true;
+		});
+		await Bun.sleep(0);
+
+		expect(idleResolved).toBe(false);
+		releasePrompt.resolve();
+		await terminalHandlerStarted.promise;
+		await Bun.sleep(0);
+		expect(idleResolved).toBe(false);
+
+		releaseTerminalHandler.resolve();
+		await Promise.all([prompt, idle]);
+		expect(extensionEmit).toHaveBeenCalledWith({ type: "agent_end", messages: [] });
+	});
+
 	it("drains pre-terminal reasoning summaries through slow extension handlers and drops post-terminal updates", async () => {
 		const firstStarted = Promise.withResolvers<void>();
 		const releaseFirst = Promise.withResolvers<void>();

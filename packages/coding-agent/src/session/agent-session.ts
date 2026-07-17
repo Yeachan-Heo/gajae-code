@@ -1612,6 +1612,8 @@ export class AgentSession {
 		nonEditDeterminations: 0,
 	};
 	#promptInFlightCount = 0;
+	#promptInFlightIdlePromise: Promise<void> | undefined;
+	#resolvePromptInFlightIdle: (() => void) | undefined;
 	#agentEventHandlersInFlight = 0;
 	#agentEventHandlersIdlePromise: Promise<void> | undefined;
 	#resolveAgentEventHandlersIdle: (() => void) | undefined;
@@ -1756,8 +1758,10 @@ export class AgentSession {
 	}
 
 	#beginInFlight(): void {
-		this.#promptInFlightCount++;
-		if (this.#promptInFlightCount === 1) {
+		if (this.#promptInFlightCount++ === 0) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			this.#promptInFlightIdlePromise = promise;
+			this.#resolvePromptInFlightIdle = resolve;
 			this.#acquirePowerAssertion();
 		}
 	}
@@ -1834,6 +1838,9 @@ export class AgentSession {
 	#endInFlight(): void {
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount === 0) {
+			this.#resolvePromptInFlightIdle?.();
+			this.#resolvePromptInFlightIdle = undefined;
+			this.#promptInFlightIdlePromise = undefined;
 			this.#releasePowerAssertion();
 			this.#flushPendingBackgroundExchanges();
 			this.#flushPendingAgentEnd();
@@ -4655,6 +4662,7 @@ export class AgentSession {
 	async waitForIdle(): Promise<void> {
 		while (true) {
 			await this.agent.waitForIdle();
+			await this.#promptInFlightIdlePromise;
 			await this.#waitForAgentEventHandlers();
 			await this.#waitForPostPromptRecovery();
 
@@ -4664,6 +4672,7 @@ export class AgentSession {
 			if (
 				!this.agent.state.isStreaming &&
 				!this.#agentEventHandlersIdlePromise &&
+				!this.#promptInFlightIdlePromise &&
 				this.#queuedExtensionEventCount === 0 &&
 				!this.#retryPromise &&
 				!this.#ttsrResumePromise &&
