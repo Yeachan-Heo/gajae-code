@@ -36,6 +36,8 @@
 - Connected MCP server instructions now remain untrusted user-role data instead of entering the cached system prompt; hostile file paths, working directories, and workspace-tree metadata are structurally encoded, and volatile project context is removed from durable session history between requests.
 - Restored the strict G002 public-surface quarantine by removing the default README advertisement for the private coordinator MCP runtime.
 
+- `createAgentSession` now closes the factory-owned credential store on dispose, releasing the `agent.db` SQLite WAL/SHM handles that leaked a connection per embedded session and, on Windows, blocked agent-directory removal with `EBUSY`. Embedder-supplied `authStorage`/`modelRegistry` instances remain open for the embedder.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed
