@@ -189,6 +189,14 @@ parking_lot = "0.12.5"
 rayon = "1.12"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["full"] }
+# ──────────────────────────────────────────────────────────────────────────────
+# macOS frameworks (Speech / AVFAudio via generated Objective-C bindings)
+# ──────────────────────────────────────────────────────────────────────────────
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = "0.3"
+objc2-speech = "0.3"
+objc2-avf-audio = "0.3"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Serialization & Data Formats
