@@ -8,7 +8,9 @@ import { fuzzyMatch } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import chalk from "chalk";
 import { parseThinkingLevel, resolveThinkingLevelForModel } from "../thinking";
-import { isAuthenticated, kNoAuth, MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-registry";
+import { isAuthenticatedOrKeyless } from "./model-auth";
+import { compareEquivalentModelVariants } from "./model-equivalence";
+import { MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-registry";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { Settings } from "./settings";
 
@@ -259,13 +261,9 @@ function pickPreferredModel(candidates: Model<Api>[], context: ModelPreferenceCo
 			return (aProviderUsage ?? Number.POSITIVE_INFINITY) - (bProviderUsage ?? Number.POSITIVE_INFINITY);
 		}
 
-		// Prefer vision-capable variants over configured provider/registration order
-		// so an ambiguous id never resolves to a text-only namesake when a
-		// vision-capable variant of the same id is available.
-		const aVision = a.input.includes("image") ? 0 : 1;
-		const bVision = b.input.includes("image") ? 0 : 1;
-		if (aVision !== bVision) {
-			return aVision - bVision;
+		const variantRank = compareEquivalentModelVariants(a, b, { finalize: false });
+		if (variantRank !== 0) {
+			return variantRank;
 		}
 
 		const aDeprioritized = context.deprioritizedProviders.has(a.provider);
@@ -274,9 +272,7 @@ function pickPreferredModel(candidates: Model<Api>[], context: ModelPreferenceCo
 			return aDeprioritized ? 1 : -1;
 		}
 
-		const aOrder = context.modelOrder.get(aKey) ?? 0;
-		const bOrder = context.modelOrder.get(bKey) ?? 0;
-		return aOrder - bOrder;
+		return compareEquivalentModelVariants(a, b, { modelOrder: context.modelOrder });
 	})[0];
 }
 
@@ -338,6 +334,34 @@ function findExactCanonicalModelMatch(
 }
 
 /**
+ * Resolve an unqualified exact alias through its canonical record so it uses
+ * the registry's equivalent-variant ranking rather than generic fuzzy policy.
+ */
+function findExactEquivalentModelMatch(
+	modelReference: string,
+	availableModels: Model<Api>[],
+	modelRegistry: CanonicalModelRegistry | undefined,
+	sessionId?: string,
+): Model<Api> | undefined {
+	if (!modelRegistry?.getCanonicalId || !modelRegistry.resolveCanonicalModel) return undefined;
+	const trimmedReference = modelReference.trim();
+	if (!trimmedReference || trimmedReference.includes("/")) return undefined;
+	const exactMatches = availableModels.filter(model => model.id.toLowerCase() === trimmedReference.toLowerCase());
+	if (exactMatches.length === 0) return undefined;
+	const canonicalIds = new Set(
+		exactMatches
+			.map(model => modelRegistry.getCanonicalId!(model))
+			.filter((canonicalId): canonicalId is string => Boolean(canonicalId)),
+	);
+	if (canonicalIds.size !== 1) return undefined;
+	return modelRegistry.resolveCanonicalModel([...canonicalIds][0]!, {
+		availableOnly: false,
+		candidates: availableModels,
+		sessionId,
+	});
+}
+
+/**
  * Try to match a pattern to a model from the available models list.
  * Returns the matched model or undefined if no match found.
  */
@@ -362,6 +386,16 @@ function tryMatchModel(
 	);
 	if (exactCanonicalMatch) {
 		return exactCanonicalMatch;
+	}
+
+	const exactEquivalentMatch = findExactEquivalentModelMatch(
+		modelPattern,
+		availableModels,
+		options?.modelRegistry,
+		options?.sessionId,
+	);
+	if (exactEquivalentMatch) {
+		return exactEquivalentMatch;
 	}
 
 	// Exact ID match (case-insensitive) — this must happen before provider-scoped
@@ -822,7 +856,7 @@ export async function resolveModelChainWithAuth(
 			}
 		}
 		const key = await modelRegistry.getApiKey(candidate.model, sessionId);
-		if (key === kNoAuth || isAuthenticated(key)) {
+		if (isAuthenticatedOrKeyless(key)) {
 			return { ...candidate, activeIndex, skips };
 		}
 		skips.push({ selector, reason: "unauthenticated" });
@@ -908,7 +942,7 @@ export async function resolveModelOverrideWithAuthFallback(
 			}
 		}
 		const key = await modelRegistry.getApiKey(candidate.model, authSessionId);
-		if (key === kNoAuth || isAuthenticated(key)) {
+		if (isAuthenticatedOrKeyless(key)) {
 			return { ...candidate, requestedModel: candidate.model, authFallbackUsed: false, activeIndex, skips };
 		}
 		skips.push({ selector: pattern, reason: "unauthenticated" });
@@ -919,7 +953,7 @@ export async function resolveModelOverrideWithAuthFallback(
 		: { explicitThinkingLevel: false };
 	if (fallback.model) {
 		const fallbackKey = await modelRegistry.getApiKey(fallback.model, authSessionId);
-		if (fallbackKey === kNoAuth || isAuthenticated(fallbackKey)) {
+		if (isAuthenticatedOrKeyless(fallbackKey)) {
 			const isParentSubstitution = requestedModel === undefined || !modelsAreEqual(fallback.model, requestedModel);
 			return {
 				...fallback,

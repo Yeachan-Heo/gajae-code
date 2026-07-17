@@ -6,6 +6,7 @@ import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelC
 import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type ModelLookupRegistry,
+	resolveModelFromString,
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "@gajae-code/coding-agent/config/model-resolver";
@@ -18,6 +19,19 @@ describe("model roles", () => {
 	test("default is the only built-in model role", () => {
 		expect(MODEL_ROLE_IDS).toEqual(["default"]);
 	});
+});
+
+test("package exports keep extracted model helpers internal", () => {
+	const packageJson = JSON.parse(fs.readFileSync(path.resolve(import.meta.dir, "../package.json"), "utf8")) as {
+		exports: Record<string, unknown>;
+	};
+
+	expect(packageJson.exports["./config/model-auth"]).toBeNull();
+	expect(packageJson.exports["./config/model-bindings-applier"]).toBeNull();
+	expect(packageJson.exports["./config/model-discovery-manager"]).toBeNull();
+	expect(packageJson.exports["./config/model-equivalence"]).toBeUndefined();
+	expect(packageJson.exports["./config/*"]).toBeDefined();
+	expect(packageJson.exports["./*"]).toBeDefined();
 });
 
 describe("ModelRegistry", () => {
@@ -721,6 +735,52 @@ describe("ModelRegistry", () => {
 
 			expect(resolved?.input.includes("image")).toBe(true);
 			expect(resolved?.provider).toBe("anthropic");
+		});
+		test("ranks bare aliases and canonical ids identically across provider order conflicts", async () => {
+			await Settings.init({
+				inMemory: true,
+				overrides: { modelProviderOrder: ["beta", "alpha"] },
+			});
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "claude-sonnet-4.5" }]),
+				beta: providerConfig("https://beta.example.com/v1", [{ id: "claude-sonnet-4.5" }]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = [registry.find("alpha", "claude-sonnet-4.5")!, registry.find("beta", "claude-sonnet-4.5")!];
+			const variants = registry.getCanonicalVariants("claude-sonnet-4-5", { candidates });
+			const canonical = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: false,
+				candidates,
+			});
+			const bare = resolveModelFromString("claude-sonnet-4.5", candidates, undefined, registry);
+
+			// Vision, canonical exactness, source, and input plus cache-read cost all tie.
+			// Provider rank must win even though alpha appears first in catalog order.
+			expect(variants).toHaveLength(2);
+			expect(variants.every(variant => variant.model.id !== "claude-sonnet-4-5")).toBe(true);
+			expect(new Set(variants.map(variant => variant.source)).size).toBe(1);
+			expect(variants.map(variant => variant.model.cost.input + variant.model.cost.cacheRead)).toEqual([0, 0]);
+			expect(canonical).toMatchObject({ provider: "beta", id: "claude-sonnet-4.5" });
+			expect(bare).toBe(canonical);
+		});
+		test("keeps an explicitly seeded canonical variant sticky for a session", () => {
+			writeRawModelsJson({
+				demo: providerConfig("https://demo.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const demoVariant = registry
+				.getCanonicalVariants("claude-sonnet-4-5")
+				.find(entry => entry.model.provider === "demo");
+
+			expect(demoVariant).toBeDefined();
+			expect(registry.seedCanonicalVariant("session", demoVariant!.model)).toBe(true);
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: false,
+					candidates: registry.getAll(),
+					sessionId: "session",
+				}),
+			).toBe(demoVariant!.model);
 		});
 		test("caches available models until disabled providers change", async () => {
 			await Settings.init({ inMemory: true });
@@ -2318,6 +2378,48 @@ describe("ModelRegistry", () => {
 			expect(gemma?.maxTokens).toBe(8192);
 			expect(gemma?.input).toEqual(["text"]);
 			expect(gemma?.reasoning).toBe(false);
+		});
+
+		test("keeps the newest same-provider discovery result when overlapping refreshes complete out of order", async () => {
+			writeRawModelsJson({
+				race: {
+					baseUrl: "https://race.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const firstResponse = Promise.withResolvers<Response>();
+			const firstRequest = Promise.withResolvers<void>();
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://race.example.com/v1/models");
+				requests += 1;
+				if (requests === 1) {
+					firstRequest.resolve();
+					return firstResponse.promise;
+				}
+				return new Response(JSON.stringify({ data: [{ id: "new-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const firstRefresh = registry.refreshProvider("race", "online");
+			await firstRequest.promise;
+			await registry.refreshProvider("race", "online");
+			firstResponse.resolve(
+				new Response(JSON.stringify({ data: [{ id: "old-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await firstRefresh;
+
+			expect(registry.getProviderDiscoveryState("race")?.models).toEqual(["new-model"]);
+			expect(registry.find("race", "new-model")).toBeDefined();
+			expect(registry.find("race", "old-model")).toBeUndefined();
 		});
 
 		test("discovery failure does not fail model registry refresh", async () => {

@@ -142,6 +142,12 @@
 			"import": "./src/sdk/bus/*.ts"
 		},
 		"./session/internal/*": null,
+		"./config/model-auth": null,
+		"./config/model-auth.js": null,
+		"./config/model-bindings-applier": null,
+		"./config/model-bindings-applier.js": null,
+		"./config/model-discovery-manager": null,
+		"./config/model-discovery-manager.js": null,
 		"./*": {
 			"types": "./src/*.ts",
 			"import": "./src/*.ts"
