@@ -4,8 +4,8 @@ export declare class ComputerController {
   constructor()
   screenshot(): ComputerScreenshot
   /**
-   * Return the non-prompting combined Accessibility + PostEvent TCC state for
-   * the hidden Gate-0 experiment.
+   * Return the non-prompting combined Accessibility + `PostEvent` TCC state
+   * for the hidden Gate-0 experiment.
    */
   gate0PermissionStatus(): Gate0PermissionStatus
   /**

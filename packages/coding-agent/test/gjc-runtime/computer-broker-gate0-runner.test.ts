@@ -13,11 +13,20 @@ import {
 	type Gate0Receipt,
 	invokeExperiment,
 	loadReceiptSigner,
+	loadRestartProof,
+	persistReceiptAndConsumeProof,
+	type RestartProof,
 	readSourceRevision,
 	releaseArtifact,
+	removeRestartProof,
+	restartProofFile,
+	restartProofPayload,
+	restartRequestCode,
 	runBoundedCommand,
 	runCellContinuity,
 	runCellExperimentPair,
+	validRestartProof,
+	writeRestartProof,
 } from "../../scripts/computer-broker-live-e2e";
 
 const SCRIPT = path.resolve(import.meta.dir, "../../scripts/computer-broker-live-e2e.ts");
@@ -31,6 +40,7 @@ async function evidenceRoot(): Promise<string> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-gate0-runner-"));
 	roots.push(root);
 	await fs.mkdir(path.join(root, "receipts"), { mode: 0o700 });
+	await fs.mkdir(path.join(root, "request-proofs"), { mode: 0o700 });
 	await fs.mkdir(path.join(root, "trusted-signers"), { mode: 0o700 });
 	const pair = generateKeyPairSync("ed25519");
 	const privatePem = pair.privateKey.export({ type: "pkcs8", format: "pem" });
@@ -90,6 +100,44 @@ function experiment(phase: "probe" | "A1" | "A2", success = true): ExperimentRes
 
 function successfulPair(topology: "A1" | "A2") {
 	return { probe: experiment("probe"), lifecycle: experiment(topology) };
+}
+
+function restartProof(overrides: Partial<RestartProof> = {}): RestartProof {
+	return {
+		schemaVersion: 1,
+		kind: "screen-recording-restart-request",
+		gate: 0,
+		collectionId: COLLECTION_ID,
+		cell: { topology: "A1", macos: "26", host: "ghostty", arch: "arm64" },
+		artifact: {
+			identity: "packages/coding-agent/dist/gjc",
+			sourceRevision: REVISION,
+			sha256: BASELINE_SHA,
+		},
+		codesign: { verified: true, signing: "adhoc" },
+		requestedAt: new Date().toISOString(),
+		request: { attempted: true, code: "permission_pending" },
+		...overrides,
+	};
+}
+
+async function writeSignedRestartProofAt(
+	root: string,
+	expectedCell: RestartProof["cell"],
+	proof: RestartProof,
+): Promise<void> {
+	const privateKey = await fs.readFile(path.join(root, "receipt-signing.key"));
+	const publicKey = createPublicKey(await fs.readFile(path.join(root, "receipt-signing.pub.pem")));
+	const keyId = createHash("sha256")
+		.update(publicKey.export({ type: "spki", format: "der" }) as Buffer)
+		.digest("hex");
+	const value = sign(null, restartProofPayload(proof), privateKey).toString("base64");
+	const target = path.join(root, "request-proofs", restartProofFile(COLLECTION_ID, expectedCell));
+	await fs.writeFile(
+		target,
+		`${canonicalJson({ proof, signature: { algorithm: "ed25519", keyId, value } } as never)}\n`,
+		{ mode: 0o600 },
+	);
 }
 
 async function writeReceipt(root: string, receipt: Gate0Receipt, signature?: string): Promise<void> {
@@ -975,6 +1023,126 @@ describe("computer broker Gate-0 receipt runner", () => {
 		const release = await acquireExperimentLock(root);
 		await release();
 		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("accepts only explicit pending or granted restart request results", () => {
+		const pending = experiment("probe", false);
+		pending.requestAttempted = true;
+		pending.code = "permission_pending";
+		pending.permission.screenRecording = false;
+		expect(restartRequestCode(pending)).toBe("permission_pending");
+
+		const granted = experiment("probe");
+		granted.requestAttempted = true;
+		expect(restartRequestCode(granted)).toBe("ok");
+
+		expect(() => restartRequestCode(experiment("probe"))).toThrow("restart request contract");
+		pending.permission.screenRecording = true;
+		expect(() => restartRequestCode(pending)).toThrow("restart request contract");
+	});
+
+	it("roundtrips an exact signed restart proof and refuses overwrite", async () => {
+		const root = await evidenceRoot();
+		const proof = restartProof();
+		expect(validRestartProof(proof)).toBe(true);
+		expect(validRestartProof({ ...proof, extra: true })).toBe(false);
+		await writeRestartProof(root, proof);
+		expect(await loadRestartProof(root, COLLECTION_ID, proof.cell)).toEqual(proof);
+		await expect(writeRestartProof(root, proof)).rejects.toMatchObject({ code: "EEXIST" });
+	});
+
+	it("rejects tampered, noncanonical, and untrusted restart proofs", async () => {
+		const tamperedRoot = await evidenceRoot();
+		const proof = restartProof();
+		await writeRestartProof(tamperedRoot, proof);
+		const file = path.join(tamperedRoot, "request-proofs", restartProofFile(COLLECTION_ID, proof.cell));
+		const tampered = JSON.parse(await fs.readFile(file, "utf8"));
+		tampered.proof.request.code = "ok";
+		await fs.writeFile(file, `${canonicalJson(tampered)}\n`, { mode: 0o600 });
+		await expect(loadRestartProof(tamperedRoot, COLLECTION_ID, proof.cell)).rejects.toThrow("signature is invalid");
+
+		const noncanonicalRoot = await evidenceRoot();
+		await writeRestartProof(noncanonicalRoot, proof);
+		const noncanonicalFile = path.join(
+			noncanonicalRoot,
+			"request-proofs",
+			restartProofFile(COLLECTION_ID, proof.cell),
+		);
+		const noncanonical = JSON.parse(await fs.readFile(noncanonicalFile, "utf8"));
+		noncanonical.signature.value += "=";
+		await fs.writeFile(noncanonicalFile, `${canonicalJson(noncanonical)}\n`, { mode: 0o600 });
+		await expect(loadRestartProof(noncanonicalRoot, COLLECTION_ID, proof.cell)).rejects.toThrow(
+			"receipt signature is invalid",
+		);
+
+		const untrustedRoot = await evidenceRoot();
+		await writeRestartProof(untrustedRoot, proof);
+		const untrustedFile = path.join(untrustedRoot, "request-proofs", restartProofFile(COLLECTION_ID, proof.cell));
+		const untrusted = JSON.parse(await fs.readFile(untrustedFile, "utf8"));
+		await fs.unlink(path.join(untrustedRoot, "trusted-signers", `${untrusted.signature.keyId}.pem`));
+		await expect(loadRestartProof(untrustedRoot, COLLECTION_ID, proof.cell)).rejects.toThrow(
+			"required evidence path is missing",
+		);
+	});
+
+	it("rejects stale and exact-cell-mismatched restart proofs", async () => {
+		const staleRoot = await evidenceRoot();
+		const stale = restartProof({ requestedAt: new Date(Date.now() - 31 * 24 * 60 * 60_000).toISOString() });
+		await writeRestartProof(staleRoot, stale);
+		await expect(loadRestartProof(staleRoot, COLLECTION_ID, stale.cell)).rejects.toThrow(
+			"timestamp is outside the collection window",
+		);
+
+		const mismatchRoot = await evidenceRoot();
+		const expected = restartProof().cell;
+		const mismatch = restartProof({
+			collectionId: "gate0-other-collection",
+			cell: { ...expected, host: "terminal" },
+		});
+		await writeSignedRestartProofAt(mismatchRoot, expected, mismatch);
+		await expect(loadRestartProof(mismatchRoot, COLLECTION_ID, expected)).rejects.toThrow(
+			"does not match the requested cell",
+		);
+	});
+
+	it("preserves restart proof on receipt failure and consumes it only after receipt success", async () => {
+		const root = await evidenceRoot();
+		const proof = restartProof();
+		const proofPath = path.join(root, "request-proofs", restartProofFile(COLLECTION_ID, proof.cell));
+		await writeRestartProof(root, proof);
+		await expect(
+			persistReceiptAndConsumeProof(root, cell("A1", "26", "ghostty"), proof, {
+				writeReceipt: async () => {
+					throw new Error("receipt write failed");
+				},
+				removeRestartProof,
+			}),
+		).rejects.toThrow("receipt write failed");
+		expect((await fs.lstat(proofPath)).isFile()).toBe(true);
+
+		await persistReceiptAndConsumeProof(root, cell("A1", "26", "ghostty"), proof);
+		await expect(fs.lstat(proofPath)).rejects.toMatchObject({ code: "ENOENT" });
+		expect((await fs.readdir(path.join(root, "receipts"))).length).toBe(1);
+	});
+
+	it("runs both post-restart continuity probes without another Screen Recording request", async () => {
+		const requests: boolean[] = [];
+		await runCellContinuity(
+			{ path: "baseline", sha256: BASELINE_SHA },
+			"A1",
+			{
+				build: async () => {},
+				readArtifact: async () => ({ path: "updated", sha256: UPDATED_SHA }),
+				codesign: async () => ({ verified: true, signing: "adhoc" }),
+				sourceRevision: async () => REVISION,
+				runPair: async (_artifact, _topology, _invoke, request) => {
+					requests.push(request === true);
+					return successfulPair("A1");
+				},
+			},
+			false,
+		);
+		expect(requests).toEqual([false, false]);
 	});
 
 	it("uses exactly one permission request across baseline and updated continuity", async () => {

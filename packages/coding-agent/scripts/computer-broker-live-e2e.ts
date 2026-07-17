@@ -54,6 +54,23 @@ interface SignedReceipt {
 	receipt: Gate0Receipt;
 	signature: { algorithm: "ed25519"; keyId: string; value: string };
 }
+
+export interface RestartProof {
+	schemaVersion: 1;
+	kind: "screen-recording-restart-request";
+	gate: 0;
+	collectionId: string;
+	cell: Gate0Receipt["cell"];
+	artifact: { identity: "packages/coding-agent/dist/gjc"; sourceRevision: string; sha256: string };
+	codesign: CodeSignSummary;
+	requestedAt: string;
+	request: { attempted: true; code: "permission_pending" | "ok" };
+}
+
+interface SignedRestartProof {
+	proof: RestartProof;
+	signature: { algorithm: "ed25519"; keyId: string; value: string };
+}
 export interface ReleaseArtifact {
 	path: string;
 	sha256: string;
@@ -106,6 +123,8 @@ const EXPERIMENT_LOCK_NAME = "experiment.lock";
 const INVOCATION_TIMEOUT_MS = 15_000;
 const BUILD_TIMEOUT_MS = 15 * 60_000;
 const COLLECTION_WINDOW_MS = 30 * 24 * 60 * 60_000;
+const RESTART_PROOFS_NAME = "request-proofs";
+
 const REPO_ROOT = path.resolve(import.meta.dir, "../../..");
 
 export class Gate0RunnerError extends Error {
@@ -169,6 +188,11 @@ export function canonicalJson(value: JsonValue): string {
 function receiptPayload(receipt: Gate0Receipt): Buffer {
 	return Buffer.from(canonicalJson(receipt as unknown as JsonValue));
 }
+
+export function restartProofPayload(proof: RestartProof): Buffer {
+	return Buffer.from(canonicalJson(proof as unknown as JsonValue));
+}
+
 function keyId(publicDer: Buffer): string {
 	return createHash("sha256").update(publicDer).digest("hex");
 }
@@ -214,7 +238,7 @@ async function ensureEvidenceRoot(root: string): Promise<void> {
 	}
 	await fs.chmod(root, 0o700);
 	await secureDirectory(root);
-	for (const name of ["receipts", TRUSTED_SIGNERS_NAME]) {
+	for (const name of ["receipts", RESTART_PROOFS_NAME, TRUSTED_SIGNERS_NAME]) {
 		const target = path.join(root, name);
 		await fs.mkdir(target, { recursive: true, mode: 0o700 });
 		await fs.chmod(target, 0o700);
@@ -541,6 +565,7 @@ export async function runCellContinuity(
 	artifact: ReleaseArtifact,
 	topology: Topology,
 	dependencies: RunCellContinuityDependencies = {},
+	baselineRequest = true,
 ): Promise<RunCellContinuityResult> {
 	const runPair = dependencies.runPair ?? runCellExperimentPair,
 		build = dependencies.build ?? buildReleaseArtifact,
@@ -551,8 +576,9 @@ export async function runCellContinuity(
 	const baselineCodesign = await codesign(artifact.path);
 	if (!baselineCodesign.verified || baselineCodesign.signing !== "adhoc")
 		fail("baseline release artifact must have a verified ad-hoc signature");
-	const baselinePair = await runPair(artifact.path, topology, undefined, true);
-	if (!pairSucceeded(baselinePair, true)) fail("baseline hidden experiment failed");
+	const baselinePair = await runPair(artifact.path, topology, undefined, baselineRequest);
+
+	if (!pairSucceeded(baselinePair, baselineRequest)) fail("baseline hidden experiment failed");
 	await build();
 	const postBuildRevision = await source();
 	if (postBuildRevision !== sourceRevision) fail("source revision changed during rebuild");
@@ -641,6 +667,216 @@ async function writeReceipt(root: string, receipt: Gate0Receipt): Promise<void> 
 	await fs.writeFile(temporary, `${canonicalJson(signed as unknown as JsonValue)}\n`, { mode: 0o600, flag: "wx" });
 	await fs.rename(temporary, destination);
 }
+export function restartProofFile(collection: string, cell: Gate0Receipt["cell"]): string {
+	const name = `${collection}-${cell.topology}-${cell.macos}-${cell.host}-${cell.arch}.json`;
+	if (name.length > 255 || !/^[A-Za-z0-9][A-Za-z0-9._-]+\.json$/.test(name)) fail("restart proof filename is unsafe");
+	return name;
+}
+
+function sameCell(left: Gate0Receipt["cell"], right: Gate0Receipt["cell"]): boolean {
+	return (
+		left.topology === right.topology &&
+		left.macos === right.macos &&
+		left.host === right.host &&
+		left.arch === right.arch
+	);
+}
+
+export function validRestartProof(value: unknown): value is RestartProof {
+	if (
+		!isRecord(value) ||
+		!hasExactKeys(value, [
+			"artifact",
+			"cell",
+			"codesign",
+			"collectionId",
+			"gate",
+			"kind",
+			"request",
+			"requestedAt",
+			"schemaVersion",
+		])
+	)
+		return false;
+	const { artifact, cell, codesign, request } = value;
+	return (
+		value.schemaVersion === 1 &&
+		value.kind === "screen-recording-restart-request" &&
+		value.gate === 0 &&
+		typeof value.collectionId === "string" &&
+		/^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$/.test(value.collectionId) &&
+		isRecord(cell) &&
+		hasExactKeys(cell, ["arch", "host", "macos", "topology"]) &&
+		TOPOLOGY_VALUES.has(cell.topology as Topology) &&
+		MACOS_VALUES.has(cell.macos as Macos) &&
+		HOST_VALUES.has(cell.host as Host) &&
+		cell.arch === "arm64" &&
+		isRecord(artifact) &&
+		hasExactKeys(artifact, ["identity", "sha256", "sourceRevision"]) &&
+		artifact.identity === "packages/coding-agent/dist/gjc" &&
+		typeof artifact.sourceRevision === "string" &&
+		/^[a-f0-9]{40,64}$/.test(artifact.sourceRevision) &&
+		typeof artifact.sha256 === "string" &&
+		/^[a-f0-9]{64}$/.test(artifact.sha256) &&
+		validCodeSign(codesign) &&
+		typeof value.requestedAt === "string" &&
+		!Number.isNaN(Date.parse(value.requestedAt)) &&
+		isRecord(request) &&
+		hasExactKeys(request, ["attempted", "code"]) &&
+		request.attempted === true &&
+		(request.code === "permission_pending" || request.code === "ok")
+	);
+}
+
+export async function writeRestartProof(root: string, proof: RestartProof): Promise<void> {
+	const local = await signer(root);
+	const signed: SignedRestartProof = {
+		proof,
+		signature: {
+			algorithm: "ed25519",
+			keyId: local.id,
+			value: sign(null, restartProofPayload(proof), local.privateKey).toString("base64"),
+		},
+	};
+	const destination = path.join(root, RESTART_PROOFS_NAME, restartProofFile(proof.collectionId, proof.cell));
+	await fs.writeFile(destination, `${canonicalJson(signed as unknown as JsonValue)}\n`, { mode: 0o600, flag: "wx" });
+}
+
+async function validateRestartProofDirectory(root: string): Promise<void> {
+	const directory = path.join(root, RESTART_PROOFS_NAME);
+	await secureDirectory(directory);
+	for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+		if (entry.isSymbolicLink() || !entry.isFile()) fail("restart proof path is unsafe");
+		await secureFile(path.join(directory, entry.name), true);
+	}
+}
+
+export async function loadRestartProof(
+	root: string,
+	collection: string,
+	cell: Gate0Receipt["cell"],
+): Promise<RestartProof | null> {
+	const directory = path.join(root, RESTART_PROOFS_NAME);
+	await validateRestartProofDirectory(root);
+	const proofPath = path.join(directory, restartProofFile(collection, cell));
+	try {
+		await fs.lstat(proofPath);
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+		throw error;
+	}
+	await secureFile(proofPath, true);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(await fs.readFile(proofPath, "utf8"));
+	} catch {
+		fail("restart proof is unreadable");
+	}
+	if (
+		!isRecord(parsed) ||
+		!hasExactKeys(parsed, ["proof", "signature"]) ||
+		!validRestartProof(parsed.proof) ||
+		!isRecord(parsed.signature) ||
+		!hasExactKeys(parsed.signature, ["algorithm", "keyId", "value"]) ||
+		parsed.signature.algorithm !== "ed25519" ||
+		typeof parsed.signature.value !== "string"
+	)
+		fail("restart proof is malformed");
+	const publicKey = await trustedPublicKey(root, parsed.signature.keyId);
+	const signature = canonicalEd25519Signature(parsed.signature.value);
+	if (!verify(null, restartProofPayload(parsed.proof), publicKey, signature))
+		fail("restart proof signature is invalid");
+	const requested = Date.parse(parsed.proof.requestedAt);
+	const now = Date.now();
+	if (now - requested > COLLECTION_WINDOW_MS || requested > now + 60_000)
+		fail("restart proof timestamp is outside the collection window");
+	if (parsed.proof.collectionId !== collection || !sameCell(parsed.proof.cell, cell))
+		fail("restart proof does not match the requested cell");
+	return parsed.proof;
+}
+
+export async function removeRestartProof(root: string, proof: RestartProof): Promise<void> {
+	const target = path.join(root, RESTART_PROOFS_NAME, restartProofFile(proof.collectionId, proof.cell));
+	await secureFile(target, true);
+	await fs.unlink(target);
+}
+
+export function restartRequestCode(result: ExperimentResult): RestartProof["request"]["code"] {
+	if (
+		result.phase !== "probe" ||
+		result.ancestry.kind !== "outer_owner" ||
+		result.lifecycle.length !== 0 ||
+		result.requestAttempted !== true ||
+		(result.code !== "permission_pending" && result.code !== "ok") ||
+		(result.code === "permission_pending" && result.permission.screenRecording) ||
+		(result.code === "ok" && (!result.permission.screenRecording || !result.permission.accessibility))
+	)
+		fail("hidden experiment result does not match the restart request contract");
+	return result.code;
+}
+
+export interface PersistReceiptDependencies {
+	writeReceipt?: (root: string, receipt: Gate0Receipt) => Promise<void>;
+	removeRestartProof?: (root: string, proof: RestartProof) => Promise<void>;
+}
+
+export async function persistReceiptAndConsumeProof(
+	root: string,
+	receipt: Gate0Receipt,
+	proof: RestartProof | null,
+	dependencies: PersistReceiptDependencies = {},
+): Promise<void> {
+	await (dependencies.writeReceipt ?? writeReceipt)(root, receipt);
+	if (proof) await (dependencies.removeRestartProof ?? removeRestartProof)(root, proof);
+}
+
+async function requestCell(args: string[]): Promise<void> {
+	const cell = parseCell(args),
+		collection = collectionId();
+	validateEnvironment(cell);
+	const root = evidenceRoot();
+	await ensureEvidenceRoot(root);
+	const releaseLock = await acquireExperimentLock(root);
+	try {
+		const artifact = await releaseArtifact(requireFlag(args, "artifact"));
+		const sourceRevision = await readSourceRevision();
+		const codesign = await codesignSummary(artifact.path);
+		if (!codesign.verified || codesign.signing !== "adhoc")
+			fail("release artifact must have a verified ad-hoc signature");
+		const existing = await loadRestartProof(root, collection, cell);
+		if (existing) fail("restart proof already exists for this cell");
+		const result = experimentResult(await invokeExperiment(artifact.path, { operation: "probe", request: true }));
+		const requestCode = restartRequestCode(result);
+		const currentArtifact = await releaseArtifact(artifact.path);
+		const currentSource = await readSourceRevision();
+		const currentCodesign = await codesignSummary(currentArtifact.path);
+		if (
+			currentArtifact.sha256 !== artifact.sha256 ||
+			currentSource !== sourceRevision ||
+			!currentCodesign.verified ||
+			currentCodesign.signing !== "adhoc" ||
+			currentCodesign.signing !== codesign.signing ||
+			currentCodesign.verified !== codesign.verified
+		)
+			fail("artifact, source, or codesign state changed during restart request collection");
+		const proof: RestartProof = {
+			schemaVersion: 1,
+			kind: "screen-recording-restart-request",
+			gate: 0,
+			collectionId: collection,
+			cell,
+			artifact: { identity: "packages/coding-agent/dist/gjc", sourceRevision, sha256: artifact.sha256 },
+			codesign,
+			requestedAt: new Date().toISOString(),
+			request: { attempted: true, code: requestCode },
+		};
+		await writeRestartProof(root, proof);
+		process.stdout.write(`${canonicalJson({ gate: 0, cell, restartRequired: true } as JsonValue)}\n`);
+	} finally {
+		await releaseLock();
+	}
+}
+
 async function runCell(args: string[]): Promise<void> {
 	const cell = parseCell(args),
 		collection = collectionId();
@@ -650,9 +886,22 @@ async function runCell(args: string[]): Promise<void> {
 	const releaseLock = await acquireExperimentLock(root);
 	try {
 		const startedAt = new Date().toISOString(),
-			artifact = await releaseArtifact(requireFlag(args, "artifact")),
-			continuity = await runCellContinuity(artifact, cell.topology);
-		if (!continuity.baselinePair.probe.requestAttempted)
+			artifact = await releaseArtifact(requireFlag(args, "artifact"));
+		const proof = await loadRestartProof(root, collection, cell);
+		if (proof) {
+			const sourceRevision = await readSourceRevision();
+			const codesign = await codesignSummary(artifact.path);
+			if (
+				proof.artifact.sourceRevision !== sourceRevision ||
+				proof.artifact.sha256 !== artifact.sha256 ||
+				!validCodeSign(codesign) ||
+				codesign.signing !== proof.codesign.signing ||
+				codesign.verified !== proof.codesign.verified
+			)
+				fail("restart proof does not match the current artifact, source, or codesign state");
+		}
+		const continuity = await runCellContinuity(artifact, cell.topology, {}, !proof);
+		if (!proof && !continuity.baselinePair.probe.requestAttempted)
 			fail("baseline did not exercise the explicit Screen Recording request");
 		const receipt: Gate0Receipt = {
 			schemaVersion: 1,
@@ -671,13 +920,13 @@ async function runCell(args: string[]): Promise<void> {
 			permissions: {
 				screenRecordingGranted: continuity.updatedPair.lifecycle.permission.screenRecording,
 				accessibilityGranted: continuity.updatedPair.lifecycle.permission.accessibility,
-				requestAttempted: continuity.baselinePair.probe.requestAttempted,
+				requestAttempted: proof ? true : continuity.baselinePair.probe.requestAttempted,
 			},
 			ancestry: continuity.updatedPair.lifecycle.ancestry,
 			lifecycle: { markers: continuity.updatedPair.lifecycle.lifecycle },
 			result: { success: true, code: "ok" },
 		};
-		await writeReceipt(root, receipt);
+		await persistReceiptAndConsumeProof(root, receipt, proof);
 		process.stdout.write(`${canonicalJson({ gate: 0, cell, result: receipt.result } as JsonValue)}\n`);
 	} finally {
 		await releaseLock();
@@ -894,9 +1143,10 @@ export async function aggregate(args: string[], dependencies: AggregateDependenc
 }
 async function main(argv: string[]): Promise<void> {
 	const [command, ...args] = argv;
+	if (command === "request-cell") return requestCell(args);
 	if (command === "run-cell") return runCell(args);
 	if (command === "aggregate") return aggregate(args);
-	fail("expected run-cell or aggregate");
+	fail("expected request-cell, run-cell, or aggregate");
 }
 if (import.meta.main)
 	main(process.argv.slice(2)).catch(error => {
