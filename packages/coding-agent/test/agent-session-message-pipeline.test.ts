@@ -234,6 +234,50 @@ describe("AgentSession message pipeline", () => {
 		);
 	});
 
+	it("waitForIdle waits for a continuation's terminal agent_end handler", async () => {
+		const handlerStarted = Promise.withResolvers<void>();
+		const releaseHandler = Promise.withResolvers<void>();
+		const extensionEmit = vi.fn(async (event: { type: string }) => {
+			if (event.type !== "agent_end") return;
+			handlerStarted.resolve();
+			await releaseHandler.promise;
+		});
+		const session = new AgentSession({
+			agent: createAgent(),
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+			extensionRunner: {
+				emit: extensionEmit,
+				hasHandlers: (eventType: string) => eventType === "agent_end",
+			} as never,
+		});
+		sessions.push(session);
+
+		const successor = createAssistantMessage("continuation complete");
+		vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [successor] });
+			await handlerStarted.promise;
+		});
+		session.agent.state.messages.push(createAssistantMessage("predecessor"));
+
+		await session.followUp("continue");
+		const idle = session.waitForIdle();
+		let idleResolved = false;
+		void idle.then(() => {
+			idleResolved = true;
+		});
+		await handlerStarted.promise;
+		await Bun.sleep(0);
+
+		expect(extensionEmit).toHaveBeenCalledWith({ type: "agent_end", messages: [successor] });
+		expect(idleResolved).toBe(false);
+
+		releaseHandler.resolve();
+		await idle;
+		expect(idleResolved).toBe(true);
+	});
+
 	it("drains pre-terminal reasoning summaries through slow extension handlers and drops post-terminal updates", async () => {
 		const firstStarted = Promise.withResolvers<void>();
 		const releaseFirst = Promise.withResolvers<void>();

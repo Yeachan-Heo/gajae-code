@@ -2564,8 +2564,16 @@ export class AgentSession {
 	}
 
 	async #waitForAgentEventHandlers(): Promise<void> {
-		while (this.#agentEventHandlersIdlePromise) {
-			await this.#agentEventHandlersIdlePromise;
+		while (true) {
+			if (this.#agentEventHandlersIdlePromise) {
+				await this.#agentEventHandlersIdlePromise;
+				continue;
+			}
+			if (this.#queuedExtensionEventCount > 0) {
+				await this.#queuedExtensionEvents;
+				continue;
+			}
+			return;
 		}
 	}
 
@@ -4643,11 +4651,27 @@ export class AgentSession {
 		return this.agent.state.isStreaming || this.#promptInFlightCount > 0;
 	}
 
-	/** Wait until streaming and deferred recovery work are fully settled. */
+	/** Wait until streaming, async event handling, and deferred recovery work are fully settled. */
 	async waitForIdle(): Promise<void> {
-		await this.agent.waitForIdle();
-		await this.#waitForAgentEventHandlers();
-		await this.#waitForPostPromptRecovery();
+		while (true) {
+			await this.agent.waitForIdle();
+			await this.#waitForAgentEventHandlers();
+			await this.#waitForPostPromptRecovery();
+
+			// Recovery can start a continuation whose terminal event handler outlives
+			// the recovery task. A full pass must therefore observe every barrier idle
+			// at once before reporting quiescence.
+			if (
+				!this.agent.state.isStreaming &&
+				!this.#agentEventHandlersIdlePromise &&
+				this.#queuedExtensionEventCount === 0 &&
+				!this.#retryPromise &&
+				!this.#ttsrResumePromise &&
+				!this.#postPromptTasksPromise
+			) {
+				return;
+			}
+		}
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
