@@ -58,11 +58,12 @@ jobs:
       - name: Upload canonical affected plan
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .ci-dev-affected-plan.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
   windows-dev-doctor:
     name: Windows dev:doctor
@@ -152,7 +153,7 @@ jobs:
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .
       - run: bun scripts/ci-dev-affected.ts --validate-plan
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
@@ -181,12 +182,13 @@ jobs:
       - name: Upload native addon(s)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-native-${{ github.run_id }}
           path: |
             packages/natives/native/pi_natives.linux-x64-baseline.node
             packages/natives/native/pi_natives.linux-x64-modern.node
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
   # One shard per planned task on the broad runner. Native build tasks are
   # excluded (they run in affected-native); shards that load the native addon at
@@ -235,7 +237,7 @@ jobs:
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .
       - run: bun scripts/ci-dev-affected.ts --validate-plan
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
@@ -269,7 +271,7 @@ jobs:
         if: ${{ matrix.native }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-native-${{ github.run_id }}
           path: packages/natives/native
       - name: Run affected task shard
         env:
@@ -285,11 +287,12 @@ jobs:
       - name: Upload shard completion receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-shard-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          name: dev-affected-shard-${{ github.run_id }}-${{ strategy.job-index }}
           path: .ci-dev-shard-receipts/${{ strategy.job-index }}.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
 
   # Branch protection must keep requiring this stable aggregate status. It validates
@@ -323,7 +326,7 @@ jobs:
       - name: Download canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .
       - name: Validate canonical affected plan
         run: bun scripts/ci-dev-affected.ts --validate-plan
@@ -331,7 +334,7 @@ jobs:
         if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          pattern: dev-affected-shard-${{ github.run_id }}-${{ github.run_attempt }}-*
+          pattern: dev-affected-shard-${{ github.run_id }}-*
           path: .ci-dev-shard-receipts
           merge-multiple: true
       - name: Validate canonical shard completion

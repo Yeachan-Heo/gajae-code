@@ -46,12 +46,19 @@ describe("planTasks command shape (issue #622)", () => {
 });
 
 describe("dev-ci canonical-plan workflow contract", () => {
-	test("binds the canonical plan to its checked-out source and validates it before aggregate decisions", async () => {
+	test("binds canonical artifacts to the run so attempt-2 consumers reuse attempt-1 producers safely", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow.match(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/g)).toHaveLength(5);
 		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(5);
-		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}");
-		expect(workflow.match(/\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g)).toHaveLength(8);
+		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}");
+		expect(workflow).toContain("name: dev-affected-native-${{ github.run_id }}");
+		expect(workflow).toContain("name: dev-affected-shard-${{ github.run_id }}-${{ strategy.job-index }}");
+		expect(workflow).toContain("pattern: dev-affected-shard-${{ github.run_id }}-*");
+		expect(workflow).not.toContain("github.run_attempt");
+		expect(workflow.match(/overwrite: true/g)).toHaveLength(3);
+		expect(workflow.match(/dev-affected-plan-\$\{\{ github\.run_id \}\}/g)).toHaveLength(4);
+		expect(workflow.match(/dev-affected-native-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
+		expect(workflow.match(/dev-affected-shard-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
 		expect(workflow).toContain("include-hidden-files: true");
 		expect(workflow.match(/include-hidden-files: true/g)).toHaveLength(2);
 		expect(workflow).toContain("CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}");
