@@ -17,10 +17,10 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import type { ToolSession } from ".";
 import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } from "./output-meta";
+import { EXPAND_HINT_TEXT } from "./render-utils";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
-import { EXPAND_HINT_TEXT } from "./render-utils";
 
 const sshSchema = z.object({
 	host: z.string().describe("ssh host"),
