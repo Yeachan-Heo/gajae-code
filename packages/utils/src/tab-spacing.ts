@@ -13,6 +13,9 @@ export const DEFAULT_TAB_WIDTH = 3;
 const EDITORCONFIG_NAME = ".editorconfig";
 
 let defaultTabWidth = DEFAULT_TAB_WIDTH;
+type TabWidthChangeListener = (width: number) => void;
+
+const tabWidthChangeListeners = new Set<TabWidthChangeListener>();
 
 const editorConfigCache = new Map<string, ParsedEditorConfig>();
 const editorConfigChainCache = new Map<string, ChainEntry[]>();
@@ -278,13 +281,25 @@ function resolveEditorConfigTabWidth(match: EditorConfigMatch | undefined, fallb
 
 	return undefined;
 }
+export function onDefaultTabWidthChange(listener: TabWidthChangeListener): () => void {
+	tabWidthChangeListeners.add(listener);
+	return () => {
+		tabWidthChangeListeners.delete(listener);
+	};
+}
 
 export function getDefaultTabWidth(): number {
 	return defaultTabWidth;
 }
 
 export function setDefaultTabWidth(width: number): void {
-	defaultTabWidth = clampTabWidth(width);
+	const next = clampTabWidth(width);
+	if (defaultTabWidth === next) return;
+	defaultTabWidth = next;
+	indentationCache.clear();
+	for (const listener of tabWidthChangeListeners) {
+		listener(next);
+	}
 }
 
 /**

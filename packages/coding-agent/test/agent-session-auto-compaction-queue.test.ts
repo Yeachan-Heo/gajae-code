@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -54,6 +53,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 			[
 				"export default function(pi) {",
 				'\tpi.on("session_before_compact", async (event) => {',
+				`\t\tconst signals = globalThis.${runtimeSignalStoreKey} ?? (globalThis.${runtimeSignalStoreKey} = []);`,
+				'\t\tsignals.push("ratio:" + (event.preparation.tokenCorrection?.ratio ?? "none"));',
 				"\t\treturn {",
 				"\t\t\tcompaction: {",
 				'\t\t\t\tsummary: "compacted",',
@@ -155,6 +156,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			modelRegistry,
 			extensionRunner,
 		});
+		session.setResourceSampler(() => ({ heapUsedBytes: 0, providerBytes: 0, messageCount: 0, imageBytes: 0 }));
 	});
 
 	afterEach(async () => {
@@ -167,6 +169,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	it("resumes after threshold compaction when only agent-level queued messages exist", async () => {
+		vi.useRealTimers();
+
 		session.agent.followUp({
 			role: "custom",
 			customType: "test",
@@ -212,7 +216,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
 		// Wait for compaction completion, then verify waitForIdle blocks on queued continuation.
-		await compactionDone;
+		await withTimeout(compactionDone, 1000, "Threshold queued compaction timed out");
 		await Promise.resolve();
 		const idlePromise = session.waitForIdle();
 		let idleResolved = false;
@@ -221,8 +225,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		});
 		await Promise.resolve();
 		expect(idleResolved).toBe(false);
-		vi.advanceTimersByTime(200);
-		await idlePromise;
+		await withTimeout(idlePromise, 1000, "Queued continuation did not become idle");
 
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		const runtimeSignals = getRuntimeSignals();
@@ -450,7 +453,134 @@ describe("AgentSession auto-compaction queue resume", () => {
 			throw new Error("Expected custom message to convert to an LLM message");
 		}
 
-		expect(usage.tokens).toBe(100 + estimateMessageTokensHeuristic(llmCustomMessage));
+		// The 110-token usage anchor is retained, followed by the 1,500-token custom
+		// message delta: 110 + 1,500 = 1,610.
+		expect(usage.tokens).toBe(1610);
+	});
+
+	it("skips error/aborted assistants when anchoring context estimates", () => {
+		const usageOf = (input: number, output: number) => ({
+			input,
+			output,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: input + output,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const base = {
+			role: "assistant" as const,
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			timestamp: Date.now(),
+		};
+		const anchored: AssistantMessage = {
+			...base,
+			content: [{ type: "text", text: "ok" }],
+			stopReason: "stop",
+			usage: usageOf(500, 40),
+		};
+		const aborted: AssistantMessage = {
+			...base,
+			content: [{ type: "text", text: "partial output ".repeat(200) }],
+			stopReason: "aborted",
+			usage: usageOf(9999, 0),
+		};
+
+		sessionManager.appendMessage(anchored);
+		sessionManager.appendMessage(aborted);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		const usage = session.getContextUsage();
+		if (!usage) {
+			throw new Error("Expected context usage to be available");
+		}
+		const llmAborted = convertToLlm([aborted])[0];
+		if (!llmAborted) {
+			throw new Error("Expected aborted message to convert to an LLM message");
+		}
+		// The 540-token successful usage anchor is retained, followed by the
+		// aborted trailing message's 750-token display estimate: 540 + 750 = 1,290.
+		expect(usage.tokens).toBe(1290);
+	});
+
+	it("excludes the anchor assistant's own output from the token-correction denominator", async () => {
+		vi.useRealTimers();
+		// Keep window small so prepareCompaction actually finds a cut point.
+		session.settings.set("compaction.keepRecentTokens", 1000);
+		const anchor: AssistantMessage = {
+			role: "assistant",
+			// Large assistant output: before the fix it inflated the correction
+			// denominator even though it is the anchor request's *response*, not
+			// part of that request's prompt, collapsing the ratio toward the
+			// 0.5 clamp and growing the kept window.
+			content: [{ type: "text", text: "a".repeat(40_000) }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1500,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1600,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage({ role: "user", content: "u".repeat(4000), timestamp: Date.now() });
+		sessionManager.appendMessage(anchor);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.compact();
+
+		const ratioSignal = getRuntimeSignals().find(signal => signal.startsWith("ratio:"));
+		if (!ratioSignal) {
+			throw new Error("Expected session_before_compact to report a correction ratio");
+		}
+		const ratio = Number(ratioSignal.slice("ratio:".length));
+		// prompt tokens 1500 vs ~1k-token heuristic prompt prefix → ratio well
+		// above 1. With the assistant's 40k-char output in the denominator the
+		// raw ratio would be ~0.13 and clamp to 0.5.
+		expect(ratio).toBeGreaterThan(1);
+		expect(ratio).toBeLessThanOrEqual(2);
+	});
+
+	it("keeps context usage available after compaction with a usage anchor", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.keepRecentTokens", 1);
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "anchored response" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 100,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 110,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage({ role: "user", content: "u".repeat(4_000), timestamp: Date.now() });
+		sessionManager.appendMessage(assistant);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.compact();
+
+		// P0 regression (#2342 gate): a truthy-number knownAnchor previously made
+		// this path call calculateContextTokens(undefined) and throw. Post-compaction
+		// with no post-boundary assistant, the documented contract is
+		// tokens: null / source: "unknown" — never a throw.
+		const usage = session.getContextUsage();
+		expect(usage).toBeDefined();
+		expect(usage?.tokens).toBeNull();
+		expect(usage?.source).toBe("unknown");
 	});
 
 	it("runs pre-prompt handoff maintenance before sending the oversized prompt", async () => {
@@ -500,6 +630,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	it("forwards todo reminder lifecycle signals to extensions", async () => {
+		vi.useRealTimers();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 
 		session.setTodoPhases([
@@ -539,7 +670,16 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await Promise.resolve();
 
 		expect(getRuntimeSignals()).toContain("todo:1/3");
-		await session.waitForIdle();
+		await withTimeout(
+			(async () => {
+				while (continueSpy.mock.calls.length === 0) {
+					await Bun.sleep(5);
+				}
+			})(),
+			1000,
+			"Todo reminder continuation did not run",
+		);
+		await withTimeout(session.waitForIdle(), 1000, "Todo reminder continuation did not become idle");
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 	});
 });

@@ -179,6 +179,8 @@ export interface AgentStartEvent {
 export interface AgentEndEvent {
 	type: "agent_end";
 	messages: AgentMessage[];
+	/** Indicates whether the loop ended normally, suspended, cancelled, or entered maintenance. */
+	stopReason?: "completed" | "paused" | "cancelled" | "maintenance";
 }
 
 /** Fired at the start of each turn */

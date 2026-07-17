@@ -17,7 +17,7 @@
   - `packages/coding-agent/src/task/simple-mode.ts` — `default` / `schema-free` / `independent` field gating.
   - `packages/coding-agent/src/internal-urls/agent-protocol.ts` — resolve `agent://<id>` to saved subagent output.
   - `packages/coding-agent/src/tools/index.ts` — tool registration and recursion-depth gating.
-  - `packages/coding-agent/src/sdk.ts` — child-session router/tool wiring and per-subagent `AgentOutputManager`.
+  - `packages/coding-agent/src/sdk/session.ts` — child-session router/tool wiring and per-subagent `AgentOutputManager`.
   - `docs/task-agent-discovery.md` — deeper discovery and precedence notes.
   - `docs/handoff-generation-pipeline.md` — session artifact/handoff persistence patterns used by the wider session layer.
 
@@ -107,7 +107,7 @@ Artifacts and side channels:
 15. `runSubprocess(...)` in `packages/coding-agent/src/task/executor.ts` creates a child agent session with:
    - isolated settings snapshot via `Settings.isolated(...)`, forcing `async.enabled = false` and `bash.autoBackground.enabled = false`
    - child `agentId` / `parentTaskPrefix` equal to the allocated task id
-   - child internal URL router and `AgentOutputManager` from `packages/coding-agent/src/sdk.ts`
+   - child internal URL router and `AgentOutputManager` from `packages/coding-agent/src/sdk/session.ts`
    - the shared `context`, optional `context.md` reference, optional isolation worktree path, output schema, and IRC peer roster in the system prompt template
 16. Child tool availability is derived from the agent definition plus runtime guards:
    - explicit `agent.tools` if provided

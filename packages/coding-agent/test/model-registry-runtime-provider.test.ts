@@ -372,7 +372,7 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(getCustomApi("custom-runtime-api")).toBeDefined();
 
 		// Custom API registry is separate from model registry — verify it persists
-		// Note: refresh clears+re-registers source registrations via sdk.ts,
+		// Note: refresh clears+re-registers source registrations via sdk/session.ts,
 		// but the custom API registry itself is not cleared by refresh()
 		await registry.refresh("offline");
 

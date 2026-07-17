@@ -14,22 +14,38 @@ import {
 import { formatBytes } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
-import type { SessionInfo } from "../../session/session-manager";
+import type { ResumeSessionIdentity, ResumeTailInspection, SessionInfo } from "../../session/session-manager";
 import { DynamicBorder } from "./dynamic-border";
 import { HookSelectorComponent } from "./hook-selector";
 
-/**
- * Custom session list component with multi-line items and search
- */
+export interface SelectedSession {
+	kind: "selected";
+	path: string;
+	identity: ResumeSessionIdentity;
+	action: "continue-tail" | "open-idle";
+}
+
+export interface CancelledSessionSelection {
+	kind: "cancelled";
+}
+
+export type SessionSelectionResult = SelectedSession | CancelledSessionSelection;
+export type SessionInspector = (sessionPath: string) => Promise<ResumeTailInspection>;
+
+type SelectorState =
+	| { kind: "browsing" }
+	| { kind: "checking"; session: SessionInfo; token: number }
+	| { kind: "confirming"; session: SessionInfo; token: number; identity: ResumeSessionIdentity }
+	| { kind: "settled" };
+
 class SessionList implements Component {
 	#filteredSessions: SessionInfo[] = [];
-	#selectedIndex: number = 0;
-	readonly #searchInput: Input;
-	onSelect?: (sessionPath: string) => void;
+	#selectedIndex = 0;
+	readonly #searchInput = new Input();
+	#inputFrozen = false;
+	onSelect?: (session: SessionInfo) => void;
 	onCancel?: () => void;
 	onExit: () => void = () => {};
-	#maxVisible: number = 5; // Max sessions visible (each session is 3 lines: msg + metadata + blank)
-
 	onDeleteRequest?: (session: SessionInfo) => void;
 
 	constructor(
@@ -37,255 +53,173 @@ class SessionList implements Component {
 		private readonly showCwd = false,
 	) {
 		this.#filteredSessions = allSessions;
-		this.#searchInput = new Input();
-
-		// Handle Enter in search input - select current item
 		this.#searchInput.onSubmit = () => {
-			if (this.#filteredSessions[this.#selectedIndex]) {
-				const selected = this.#filteredSessions[this.#selectedIndex];
-				if (this.onSelect) {
-					this.onSelect(selected.path);
-				}
-			}
+			const selected = this.#filteredSessions[this.#selectedIndex];
+			if (selected) this.onSelect?.(selected);
 		};
 	}
 
+	setInputFrozen(frozen: boolean): void {
+		this.#inputFrozen = frozen;
+	}
+
 	#clampSelectedIndex(): void {
-		if (this.#filteredSessions.length === 0) {
-			this.#selectedIndex = 0;
-			return;
-		}
-		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, this.#filteredSessions.length - 1));
+		this.#selectedIndex =
+			this.#filteredSessions.length === 0
+				? 0
+				: Math.max(0, Math.min(this.#selectedIndex, this.#filteredSessions.length - 1));
 	}
 
 	#filterSessions(query: string): void {
-		this.#filteredSessions = fuzzyFilter(this.allSessions, query, session => {
-			const parts = [
+		this.#filteredSessions = fuzzyFilter(this.allSessions, query, session =>
+			[
 				session.id,
 				session.title ?? "",
 				session.cwd ?? "",
 				session.firstMessage ?? "",
 				session.allMessagesText,
 				session.path,
-			];
-			return parts.filter(Boolean).join(" ");
-		});
+			]
+				.filter(Boolean)
+				.join(" "),
+		);
 		this.#clampSelectedIndex();
 	}
 
 	removeSession(sessionPath: string): void {
-		const index = this.allSessions.findIndex(s => s.path === sessionPath);
+		const index = this.allSessions.findIndex(session => session.path === sessionPath);
 		if (index === -1) return;
 		this.allSessions.splice(index, 1);
-		// Re-filter to update filteredSessions
 		this.#filterSessions(this.#searchInput.getValue());
 	}
 
-	invalidate(): void {
-		// No cached state to invalidate currently
-	}
+	invalidate(): void {}
 
 	render(width: number): string[] {
-		const lines: string[] = [];
-
-		// Render search input
-		lines.push(...this.#searchInput.render(width));
-		lines.push(""); // Blank line after search
-
+		const lines = [...this.#searchInput.render(width), ""];
 		if (this.#filteredSessions.length === 0) {
-			if (this.showCwd) {
-				// "All" scope - no sessions anywhere that match filter
-				lines.push(truncateToWidth(theme.fg("muted", "  No sessions found"), width));
-			} else {
-				// "Current folder" scope - hint to try "all"
-				lines.push(
-					truncateToWidth(theme.fg("muted", "  No sessions in current folder. Press Tab to view all."), width),
-				);
-			}
+			lines.push(
+				truncateToWidth(
+					theme.fg(
+						"muted",
+						this.showCwd ? "  No sessions found" : "  No sessions in current folder. Press Tab to view all.",
+					),
+					width,
+				),
+			);
 			return lines;
 		}
-
-		// Format dates
 		const formatDate = (date: Date): string => {
-			const now = new Date();
-			const diffMs = now.getTime() - date.getTime();
-			const diffMins = Math.floor(diffMs / 60000);
-			const diffHours = Math.floor(diffMs / 3600000);
-			const diffDays = Math.floor(diffMs / 86400000);
-
-			if (diffMins < 1) return "just now";
-			if (diffMins < 60) return `${diffMins} minute${diffMins !== 1 ? "s" : ""} ago`;
-			if (diffHours < 24) return `${diffHours} hour${diffHours !== 1 ? "s" : ""} ago`;
-			if (diffDays === 1) return "1 day ago";
-			if (diffDays < 7) return `${diffDays} days ago`;
-
-			return date.toLocaleDateString();
+			const minutes = Math.floor((Date.now() - date.getTime()) / 60000);
+			if (minutes < 1) return "just now";
+			if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+			const hours = Math.floor(minutes / 60);
+			if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+			const days = Math.floor(hours / 24);
+			return days === 1 ? "1 day ago" : days < 7 ? `${days} days ago` : date.toLocaleDateString();
 		};
-
-		// Calculate visible range with scrolling
-		const startIndex = Math.max(
+		const maxVisible = 5;
+		const start = Math.max(
 			0,
-			Math.min(
-				this.#selectedIndex - Math.floor(this.#maxVisible / 2),
-				this.#filteredSessions.length - this.#maxVisible,
-			),
+			Math.min(this.#selectedIndex - Math.floor(maxVisible / 2), this.#filteredSessions.length - maxVisible),
 		);
-		const endIndex = Math.min(startIndex + this.#maxVisible, this.#filteredSessions.length);
-
-		// Render visible sessions (2-3 lines per session + blank line)
-		for (let i = startIndex; i < endIndex; i++) {
-			const session = this.#filteredSessions[i];
-			const isSelected = i === this.#selectedIndex;
-
-			// Normalize first message to single line
-			const normalizedMessage = session.firstMessage.replace(/\n/g, " ").trim();
-
-			// First line: cursor + title (or first message if no title)
-			const cursorSymbol = `${theme.nav.cursor} `;
-			const cursorWidth = visibleWidth(cursorSymbol);
-			const cursor = isSelected ? theme.fg("accent", cursorSymbol) : padding(cursorWidth);
-			const maxWidth = width - cursorWidth; // Account for cursor width
-
-			if (session.title) {
-				// Has title: show title on first line, dimmed first message on second line
-				const truncatedTitle = truncateToWidth(session.title, maxWidth);
-				const titleLine = cursor + (isSelected ? theme.bold(truncatedTitle) : truncatedTitle);
-				lines.push(titleLine);
-
-				// Second line: dimmed first message preview
-				const truncatedPreview = truncateToWidth(normalizedMessage, maxWidth);
-				lines.push(`  ${theme.fg("dim", truncatedPreview)}`);
-			} else {
-				// No title: show first message as main line
-				const truncatedMsg = truncateToWidth(normalizedMessage, maxWidth);
-				const messageLine = cursor + (isSelected ? theme.bold(truncatedMsg) : truncatedMsg);
-				lines.push(messageLine);
-			}
-
-			// Metadata line: date + file size
-			const modified = formatDate(session.modified);
-			const metadata = `  ${modified} ${theme.sep.dot} ${formatBytes(session.size)}`;
-			const metadataLine = theme.fg("dim", truncateToWidth(metadata, width));
-
-			lines.push(metadataLine);
-			lines.push(""); // Blank line between sessions
+		const end = Math.min(start + maxVisible, this.#filteredSessions.length);
+		for (let index = start; index < end; index++) {
+			const session = this.#filteredSessions[index];
+			const selected = index === this.#selectedIndex;
+			const cursor = `${theme.nav.cursor} `;
+			const cursorWidth = visibleWidth(cursor);
+			const prefix = selected ? theme.fg("accent", cursor) : padding(cursorWidth);
+			const message = session.firstMessage.replace(/\n/g, " ").trim();
+			const title = truncateToWidth(session.title ?? message, width - cursorWidth);
+			lines.push(prefix + (selected ? theme.bold(title) : title));
+			if (session.title) lines.push(`  ${theme.fg("dim", truncateToWidth(message, width - cursorWidth))}`);
+			lines.push(
+				theme.fg(
+					"dim",
+					truncateToWidth(
+						`  ${formatDate(session.modified)} ${theme.sep.dot} ${formatBytes(session.size)}`,
+						width,
+					),
+				),
+			);
+			lines.push("");
 		}
-
-		// Add scroll indicator if needed
-		if (startIndex > 0 || endIndex < this.#filteredSessions.length) {
-			const scrollText = `  (${this.#selectedIndex + 1}/${this.#filteredSessions.length})`;
-			const scrollInfo = theme.fg("muted", truncateToWidth(scrollText, width));
-			lines.push(scrollInfo);
-		}
-
-		// Add keybinding hint
-		lines.push("");
-		lines.push(theme.fg("muted", "  [Del to delete, Enter to select, Esc to cancel]"));
-
+		if (start > 0 || end < this.#filteredSessions.length)
+			lines.push(theme.fg("muted", `  (${this.#selectedIndex + 1}/${this.#filteredSessions.length})`));
+		lines.push(
+			"",
+			theme.fg("muted", "  [Del to delete selected transcript/artifacts, Enter to select, Esc to cancel]"),
+		);
 		return lines;
 	}
 
 	handleInput(keyData: string): void {
-		const moveSelection = (delta: number): void => {
-			if (this.#filteredSessions.length === 0) return;
-			this.#selectedIndex += delta;
-			this.#clampSelectedIndex();
-		};
-
-		// Delete key - request delete confirmation from parent
-		if (matchesKey(keyData, "delete")) {
-			const selected = this.#filteredSessions[this.#selectedIndex];
-			if (selected && this.onDeleteRequest) {
-				this.onDeleteRequest(selected);
-			}
-			return;
-		}
-
-		// Up arrow
-		if (matchesKey(keyData, "up")) {
-			moveSelection(-1);
-			return;
-		}
-		// Down arrow
-		if (matchesKey(keyData, "down")) {
-			moveSelection(1);
-			return;
-		}
-		// Page up - jump up by maxVisible items
-		if (matchesKey(keyData, "pageUp")) {
-			moveSelection(-this.#maxVisible);
-			return;
-		}
-		// Page down - jump down by maxVisible items
-		if (matchesKey(keyData, "pageDown")) {
-			moveSelection(this.#maxVisible);
-			return;
-		}
-		// Enter
-		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
-			const selected = this.#filteredSessions[this.#selectedIndex];
-			if (selected && this.onSelect) {
-				this.onSelect(selected.path);
-			}
-			return;
-		}
-		// Escape - cancel
 		if (matchesAppInterrupt(keyData)) {
-			if (this.onCancel) {
-				this.onCancel();
-			}
+			this.onCancel?.();
 			return;
 		}
-		// Ctrl+C - exit
 		if (matchesKey(keyData, "ctrl+c")) {
 			this.onExit();
 			return;
 		}
-		// Pass everything else to search input
-		this.#searchInput.handleInput(keyData);
-		this.#filterSessions(this.#searchInput.getValue());
+		if (this.#inputFrozen) return;
+		const move = (delta: number): void => {
+			if (this.#filteredSessions.length === 0) return;
+			this.#selectedIndex += delta;
+			this.#clampSelectedIndex();
+		};
+		if (matchesKey(keyData, "delete")) {
+			const selected = this.#filteredSessions[this.#selectedIndex];
+			if (selected) this.onDeleteRequest?.(selected);
+		} else if (matchesKey(keyData, "up")) move(-1);
+		else if (matchesKey(keyData, "down")) move(1);
+		else if (matchesKey(keyData, "pageUp")) move(-5);
+		else if (matchesKey(keyData, "pageDown")) move(5);
+		else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+			const selected = this.#filteredSessions[this.#selectedIndex];
+			if (selected) this.onSelect?.(selected);
+		} else {
+			this.#searchInput.handleInput(keyData);
+			this.#filterSessions(this.#searchInput.getValue());
+		}
 	}
 }
 
-/**
- * Component that renders a session selector with optional confirmation dialog
- */
+/** A one-shot resume consent selector. It never opens or mutates sessions. */
 export class SessionSelectorComponent extends Container {
 	#sessionList: SessionList;
 	#confirmationDialog: HookSelectorComponent | null = null;
-	#messageContainer: Container;
-	#onDelete?: (session: SessionInfo) => Promise<boolean>;
+	#messageContainer = new Container();
 	#onRequestRender?: () => void;
+	#state: SelectorState = { kind: "browsing" };
+	#nextToken = 0;
 
 	constructor(
 		sessions: SessionInfo[],
-		onSelect: (sessionPath: string) => void,
-		onCancel: () => void,
-		onExit: () => void,
-		onDelete?: (session: SessionInfo) => Promise<boolean>,
+		private readonly onSelect: (sessionPath: string) => void,
+		private readonly onCancel: () => void,
+		private readonly onExit: () => void,
+		private readonly onDelete?: (session: SessionInfo) => Promise<boolean>,
+		private readonly inspector?: SessionInspector,
+		private readonly onSelection?: (selection: SessionSelectionResult) => void,
 	) {
 		super();
-
-		this.#messageContainer = new Container();
-		this.#onDelete = onDelete;
-		// Add header
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(theme.bold("Resume Session"), 1, 0));
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 		this.addChild(this.#messageContainer);
-		// Create session list
 		this.#sessionList = new SessionList(sessions);
-		this.#sessionList.onSelect = onSelect;
-		this.#sessionList.onCancel = onCancel;
-		this.#sessionList.onExit = onExit;
-		this.#sessionList.onDeleteRequest = (session: SessionInfo) => {
-			this.#showDeleteConfirmation(session);
+		this.#sessionList.onSelect = session => {
+			if (this.inspector) void this.#inspect(session);
+			else this.onSelect(session.path);
 		};
+		this.#sessionList.onCancel = () => this.#cancel();
+		this.#sessionList.onExit = () => this.#exit();
+		this.#sessionList.onDeleteRequest = session => this.#showDeleteConfirmation(session);
 		this.addChild(this.#sessionList);
-
-		// Add bottom border
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());
 	}
@@ -293,60 +227,127 @@ export class SessionSelectorComponent extends Container {
 	setOnRequestRender(callback: () => void): void {
 		this.#onRequestRender = callback;
 	}
-
 	#clearError(): void {
 		this.#messageContainer.clear();
 	}
-
 	#showError(message: string): void {
 		this.#messageContainer.clear();
-		this.#messageContainer.addChild(new Text(theme.fg("error", `Error: ${replaceTabs(message)}`), 1, 0));
+		this.#messageContainer.addChild(
+			new Text(theme.fg("error", `Error: ${replaceTabs(message).slice(0, 200)}`), 1, 0),
+		);
 		this.#messageContainer.addChild(new Spacer(1));
 	}
-
-	#showDeleteConfirmation(session: SessionInfo): void {
-		const displayName = session.title || session.firstMessage.slice(0, 40) || session.id;
-		this.#confirmationDialog = new HookSelectorComponent(
-			`Delete session?\n${displayName}`,
-			["Yes", "No"],
-			async (option: string) => {
-				if (option === "Yes" && this.#onDelete) {
-					this.#clearError();
-					try {
-						const deleted = await this.#onDelete(session);
-						if (deleted) {
-							this.#sessionList.removeSession(session.path);
-						}
-					} catch (err) {
-						this.#showError(err instanceof Error ? err.message : String(err));
-					}
-				}
-				// Close confirmation dialog
-				this.removeChild(this.#confirmationDialog!);
-				this.#confirmationDialog = null;
-				// Request rerender
-				this.#onRequestRender?.();
-			},
-			() => {
-				// Cancel - close confirmation dialog
-				this.removeChild(this.#confirmationDialog!);
-				this.#confirmationDialog = null;
-				// Request rerender
-				this.#onRequestRender?.();
-			},
-		);
-		// Show confirmation dialog
-		this.addChild(this.#confirmationDialog);
+	#requestRender(): void {
+		this.#onRequestRender?.();
 	}
 
-	handleInput(keyData: string): void {
-		if (this.#confirmationDialog) {
-			this.#confirmationDialog.handleInput(keyData);
-		} else {
-			this.#sessionList.handleInput(keyData);
+	#settle(selection: SessionSelectionResult): void {
+		if (this.#state.kind === "settled") return;
+		this.#state = { kind: "settled" };
+		this.#sessionList.setInputFrozen(true);
+		const dialog = this.#confirmationDialog;
+		this.#confirmationDialog = null;
+		if (dialog) this.removeChild(dialog);
+		if (this.onSelection) this.onSelection(selection);
+		else if (selection.kind === "selected") this.onSelect(selection.path);
+		else this.onCancel();
+	}
+	#cancel(): void {
+		if (this.#state.kind === "settled") return;
+		if (this.#state.kind === "checking") this.#nextToken++;
+		this.#settle({ kind: "cancelled" });
+	}
+	#exit(): void {
+		if (this.#state.kind !== "settled") this.#nextToken++;
+		this.#state = { kind: "settled" };
+		this.#sessionList.setInputFrozen(true);
+		this.onExit();
+	}
+	async #inspect(session: SessionInfo): Promise<void> {
+		const inspector = this.inspector;
+		if (!inspector || this.#state.kind !== "browsing") return;
+		const token = ++this.#nextToken;
+		this.#state = { kind: "checking", session, token };
+		this.#sessionList.setInputFrozen(true);
+		this.#clearError();
+		this.#requestRender();
+		try {
+			const inspection = await inspector(session.path);
+			if (this.#state.kind !== "checking" || this.#state.token !== token) return;
+			if (inspection.kind === "error") {
+				this.#state = { kind: "browsing" };
+				this.#sessionList.setInputFrozen(false);
+				this.#showError(`Unable to inspect session (${inspection.reason}).`);
+				this.#requestRender();
+				return;
+			}
+			if (inspection.kind === "terminal") {
+				this.#settle({ kind: "selected", path: session.path, identity: inspection.identity, action: "open-idle" });
+				return;
+			}
+			this.#showResumeConfirmation(session, token, inspection.identity);
+		} catch (error) {
+			if (this.#state.kind !== "checking" || this.#state.token !== token) return;
+			this.#state = { kind: "browsing" };
+			this.#sessionList.setInputFrozen(false);
+			this.#showError(error instanceof Error ? error.message : String(error));
+			this.#requestRender();
 		}
 	}
-
+	#showResumeConfirmation(session: SessionInfo, token: number, identity: ResumeSessionIdentity): void {
+		this.#state = { kind: "confirming", session, token, identity };
+		const dialog = new HookSelectorComponent(
+			"Resume this session?",
+			["Yes", "No"],
+			option => {
+				if (this.#confirmationDialog !== dialog || this.#state.kind !== "confirming") return;
+				if (option === "Yes")
+					this.#settle({ kind: "selected", path: session.path, identity, action: "continue-tail" });
+				else this.#settle({ kind: "cancelled" });
+			},
+			() => this.#settle({ kind: "cancelled" }),
+			{ acceleratorMap: { y: "Yes", n: "No" } },
+		);
+		this.#confirmationDialog = dialog;
+		this.addChild(dialog);
+		this.#requestRender();
+	}
+	#showDeleteConfirmation(session: SessionInfo): void {
+		if (this.#state.kind !== "browsing" || this.#confirmationDialog) return;
+		const displayName = session.title || session.firstMessage.slice(0, 40) || session.id;
+		let deleting = false;
+		const dialog = new HookSelectorComponent(
+			`Delete selected session transcript and artifacts?\n${displayName}\nThis cannot be undone. Other sessions and topic/history metadata are not deleted.`,
+			["Yes", "No"],
+			async option => {
+				if (this.#confirmationDialog !== dialog || deleting) return;
+				if (option === "Yes" && this.onDelete) {
+					deleting = true;
+					this.#clearError();
+					try {
+						if (await this.onDelete(session)) this.#sessionList.removeSession(session.path);
+					} catch (error) {
+						this.#showError(error instanceof Error ? error.message : String(error));
+					}
+				}
+				this.removeChild(dialog);
+				this.#confirmationDialog = null;
+				this.#requestRender();
+			},
+			() => {
+				if (this.#confirmationDialog !== dialog || deleting) return;
+				this.removeChild(dialog);
+				this.#confirmationDialog = null;
+				this.#requestRender();
+			},
+		);
+		this.#confirmationDialog = dialog;
+		this.addChild(dialog);
+	}
+	handleInput(keyData: string): void {
+		if (this.#confirmationDialog) this.#confirmationDialog.handleInput(keyData);
+		else this.#sessionList.handleInput(keyData);
+	}
 	getSessionList(): SessionList {
 		return this.#sessionList;
 	}

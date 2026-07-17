@@ -1,6 +1,4 @@
 # Build context for the pi-root `Dockerfile` (gajae-code/pi:dev). Shadows
-# .dockerignore for this file only. Robogjc uses Dockerfile.robogjc +
-# Dockerfile.robogjc.dockerignore alongside.
 
 # Heavy build outputs — must never reach the build context. `target/` alone is
 # >100 GB on a dev machine.
@@ -8,6 +6,10 @@ target/
 **/node_modules
 dist/
 runs/
+assets/
+issues/
+.plans/
+geobench/
 
 # Per-host scratch the pi codebase uses for parallel agents / worktrees.
 .fallow/
@@ -52,11 +54,6 @@ packages/natives/native/.build/
 packages/natives/native/pi_natives.darwin-*.node
 packages/natives/native/pi_natives.dev.node
 packages/ai/test/.temp-images/
-python/gjc-rpc/src/gjc_rpc.egg-info/
-python/robogjc/data/
-python/robogjc/.cache/
-python/robogjc/src/robogjc/static/
-python/robogjc/web/dist/
 
 # Scratch files the repo creates ad-hoc.
 syntax.jsonl

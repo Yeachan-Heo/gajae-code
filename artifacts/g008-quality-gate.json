@@ -1,0 +1,107 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "Final targeted architect review closed the last session.delete symlink blocker and returned CLEAR / APPROVE — QA PASS (agent://149-G008SymlinkClear); prior full review dispositions are recorded in agent://147-G008AbsoluteFinal.",
+    "commands": ["architect review agent://147-G008AbsoluteFinal", "architect review agent://149-G008SymlinkClear"],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "Current production topology, full adapter receipts, lifecycle postconditions, rollback consumption, Rust transport, TypeScript, canonicalization, inventory, and Telegram gates pass; cleaner PASS at agent://148-G008CleanerFinal.",
+    "e2eCommands": [
+      "bun test test/sdk-machine-lifecycle-topology.test.ts",
+      "bun test test/sdk-adapter-dispositions.test.ts",
+      "bun test test/sdk-host-wiring.test.ts test/sdk-query-pagination.test.ts test/sdk-downgrade-rollback.test.ts"
+    ],
+    "redTeamCommands": [
+      "bun test test/sdk-broker-lifecycle-e2e.test.ts test/sdk-broker.test.ts",
+      "cargo test -p gjc-sdk",
+      "bun scripts/verify-gjc-sdk-canonicalization.ts --self-test"
+    ],
+    "artifactRefs": [
+      {
+        "id": "lifecycle-cli-replay",
+        "schemaVersion": 1,
+        "kind": "cli-replay",
+        "replaySafe": true,
+        "timeoutMs": 600000,
+        "replayExempt": {
+          "reasonCode": "non_deterministic_external",
+          "reason": "The lifecycle topology command spawns and terminates real detached session-host subprocesses with nondeterministic ports and process identifiers, so gate replay is delegated to the recorded structural QA artifact.",
+          "approvedBy": "executor-qa",
+          "fallbackArtifactRefs": ["lifecycle-pty-capture"]
+        },
+        "command": ["bun", "test", "test/sdk-machine-lifecycle-topology.test.ts"],
+        "cwd": "packages/coding-agent",
+        "expectedExitCode": 0,
+        "path": "artifacts/g008-lifecycle-cli-replay.json",
+        "description": "Replayable shipped ACP, MCP, and daemon lifecycle topology suite",
+        "inlineEvidence": "Three shipped machine interfaces completed valid G03-G07 effects with readiness, replay/conflict, close, and deletion postconditions."
+      },
+      {
+        "id": "lifecycle-pty-capture",
+        "schemaVersion": 1,
+        "kind": "pty-capture",
+        "path": "artifacts/g008-lifecycle-pty-capture.txt",
+        "description": "Terminal capture of the shipped lifecycle topology suite"
+      },
+      {
+        "id": "g008-final-report",
+        "schemaVersion": 1,
+        "kind": "failure-mode-test",
+        "path": "artifacts/g008-final-qa-report.json",
+        "description": "Final adversarial verification report for G008",
+        "inlineEvidence": "Final report records current passing gates, clearance receipts, and all resolved adversarial blockers."
+      }
+    ],
+    "contractCoverage": [
+      {
+        "id": "g008-production-cutover",
+        "contractRef": "G008:B3-B8:AC2",
+        "obligation": "All shipped external machine interfaces use the canonical SDK with real session controls, bounded queries, safe lifecycle semantics, and no direct session bypass",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["machine-lifecycle"],
+        "adversarialCaseRefs": ["lifecycle-and-security-redteam"]
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "id": "machine-lifecycle",
+        "surface": "cli",
+        "contractRef": "G008:B8:AC2",
+        "invocation": "Run shipped ACP stdio, mcp-serve sdk stdio, and daemon session CLI through valid G03-G07 operations",
+        "verdict": "passed",
+        "artifactRefs": ["lifecycle-cli-replay"]
+      }
+    ],
+    "adversarialCases": [
+      {
+        "id": "lifecycle-and-security-redteam",
+        "contractRef": "G008:B3-B8:AC2",
+        "scenario": "Exercise oversized frames, wrong boundaries, nested secrets, permission-provider loss, PID reuse, failed termination, delete path escapes, cursor corruption/UTF-8 offsets, and pinned rollback consumption",
+        "expectedBehavior": "Every boundary fails closed with typed outcomes while valid production flows remain complete and resumable",
+        "verdict": "passed",
+        "artifactRefs": ["g008-final-report"]
+      }
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "All architecture and QA findings were fixed and the final current-state verification rerun is green.",
+    "fullRerun": true,
+    "rerunCommands": [
+      "bun test test/sdk-adapter-dispositions.test.ts",
+      "bun test test/sdk-machine-lifecycle-topology.test.ts",
+      "bun test test/sdk-broker-lifecycle-e2e.test.ts test/sdk-broker.test.ts",
+      "bun run check:types",
+      "cargo test -p gjc-sdk"
+    ],
+    "blockers": []
+  }
+}

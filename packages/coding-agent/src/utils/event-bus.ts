@@ -1,7 +1,7 @@
 import { logger } from "@gajae-code/utils";
 
 export class EventBus {
-	readonly #listeners = new Map<string, Set<(data: unknown) => void>>();
+	readonly #listeners = new Map<string, Set<(data: unknown) => void | PromiseLike<void>>>();
 
 	emit(channel: string, data: unknown): void {
 		const handlers = this.#listeners.get(channel);
@@ -12,13 +12,18 @@ export class EventBus {
 		}
 	}
 
-	on(channel: string, handler: (data: unknown) => void): () => void {
+	on(channel: string, handler: (data: unknown) => void | PromiseLike<void>): () => void {
 		if (!this.#listeners.has(channel)) {
 			this.#listeners.set(channel, new Set());
 		}
-		const safeHandler = async (data: unknown) => {
+		const safeHandler = (data: unknown): void => {
 			try {
-				await handler(data);
+				const result = handler(data);
+				if (result && typeof result.then === "function") {
+					Promise.resolve(result).catch(err => {
+						logger.error("Event handler error", { channel, error: String(err) });
+					});
+				}
 			} catch (err) {
 				logger.error("Event handler error", { channel, error: String(err) });
 			}

@@ -3,7 +3,7 @@
  * Replaces per-provider JSON files with a single cache.db.
  */
 import { Database } from "bun:sqlite";
-import { getModelDbPath } from "@gajae-code/utils";
+import { getModelDbPath } from "@gajae-code/utils/dirs";
 import type { Api, Model } from "./types";
 
 const CACHE_SCHEMA_VERSION = 3;
@@ -64,6 +64,16 @@ function getDb(dbPath?: string): Database {
 	sharedDb = db;
 	sharedDbPath = resolvedPath;
 	return db;
+}
+
+/** Close the shared cache only when it owns the exact requested database path. */
+export function closeModelCache(dbPath?: string): boolean {
+	const resolvedPath = dbPath ?? getModelDbPath();
+	if (!sharedDb || sharedDbPath !== resolvedPath) return false;
+	sharedDb.close();
+	sharedDb = null;
+	sharedDbPath = null;
+	return true;
 }
 
 function migrateCacheSchema(db: Database): void {

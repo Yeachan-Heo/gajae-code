@@ -27,6 +27,24 @@ describe("AgentOutputManager", () => {
 		expect(await mgr.allocateBatch(["Alpha", "Beta"])).toEqual(["3-Alpha", "4-Beta"]);
 	});
 
+	it("reserves ids from session sidecar artifacts without markdown outputs", async () => {
+		const dir = await makeArtifactsDir(["0-Foo.jsonl", "1-Bar.patch"]);
+		const mgr = new AgentOutputManager(() => dir);
+
+		expect(await mgr.allocate("Alpha")).toBe("2-Alpha");
+	});
+
+	it("reserves nested child ids from sidecar artifacts under the parent prefix", async () => {
+		const dir = await makeArtifactsDir([
+			"0-Parent.0-Child.jsonl",
+			"0-Parent.1-Review.patch",
+			"1-Other.9-Ignored.jsonl",
+		]);
+		const mgr = new AgentOutputManager(() => dir, { parentPrefix: "0-Parent" });
+
+		expect(await mgr.allocate("Next")).toBe("0-Parent.2-Next");
+	});
+
 	it("does not reuse or duplicate ids when allocations race on a shared instance", async () => {
 		// Regression: #ensureInitialized previously set a boolean flag BEFORE the
 		// awaited readdir, so a second concurrent allocate short-circuited init and

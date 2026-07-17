@@ -10,10 +10,13 @@ import { contextFileCapability } from "./capability/context-file";
 import { systemPromptCapability } from "./capability/system-prompt";
 import type { SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
-import { loadSkills, type Skill } from "./extensibility/skills";
+import type { Skill } from "./extensibility/skills";
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
+import volatileProjectContextTemplate from "./prompts/system/volatile-project-context.md" with { type: "text" };
+import { escapePromptMetadata } from "./session/messages";
+import { DEFAULT_ESSENTIAL_TOOL_NAMES } from "./tools";
 import { shortenPath } from "./tools/render-utils";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -242,9 +245,12 @@ function dedupeExactContextFiles(
 }
 
 /**
- * Load all project context files using the capability API.
+ * Load all context files using the capability API.
  * Returns {path, content, depth} entries for all discovered context files.
- * Files are sorted by depth (descending) so files closer to cwd appear last/more prominent.
+ * Native user-global files (`~/.gjc/agent/AGENTS.md`) come first, then project
+ * files sorted by depth (descending) so files closer to cwd appear last/more
+ * prominent. User-home files from foreign providers (`~/.claude/CLAUDE.md`,
+ * `~/.codex/AGENTS.md`, …) stay excluded — only gjc's own user config applies.
  */
 export async function loadProjectContextFiles(
 	options: LoadContextFilesOptions = {},
@@ -252,28 +258,32 @@ export async function loadProjectContextFiles(
 	const resolvedCwd = options.cwd ?? getProjectDir();
 
 	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd });
+	const items = result.items as ContextFile[];
+
+	// Native user-global context applies everywhere and is least specific, so it
+	// renders first — project files rendered later take precedence over it.
+	const userFiles = items
+		.filter(item => item.level === "user" && item._source.provider === "native")
+		.map(item => ({ path: item.path, content: item.content }));
 
 	// Convert project-level ContextFile items and preserve depth info
-	const files = result.items
-		.filter(item => (item as ContextFile).level === "project")
-		.map(item => {
-			const contextFile = item as ContextFile;
-			return {
-				path: contextFile.path,
-				content: contextFile.content,
-				depth: contextFile.depth,
-			};
-		});
+	const projectFiles = items
+		.filter(item => item.level === "project")
+		.map(item => ({
+			path: item.path,
+			content: item.content,
+			depth: item.depth,
+		}));
 
 	// Sort by depth (descending): higher depth (farther from cwd) comes first,
 	// so files closer to cwd appear later and are more prominent
-	files.sort((a, b) => {
+	projectFiles.sort((a, b) => {
 		const depthA = a.depth ?? -1;
 		const depthB = b.depth ?? -1;
 		return depthB - depthA;
 	});
 
-	return dedupeExactContextFiles(files);
+	return dedupeExactContextFiles([...userFiles, ...projectFiles]);
 }
 
 /**
@@ -352,14 +362,8 @@ export interface BuildSystemPromptOptions {
 	rules?: Array<{ name: string; description?: string; path: string; globs?: string[] }>;
 	/** Intent field name injected into every tool schema. If set, explains the field in the prompt. */
 	intentField?: string;
-	/** Whether MCP tool discovery is active for this prompt build. */
-	mcpDiscoveryMode?: boolean;
-	/** Discoverable MCP server summaries to advertise when discovery mode is active. */
-	mcpDiscoveryServerSummaries?: string[];
-	/** Whether built-in tool discovery ("all" mode) is active; enables the tool-discovery prompt block. */
+	/** Whether built-in tool discovery is active; enables the tool-discovery prompt block. */
 	toolDiscoveryActive?: boolean;
-	/** Hidden discoverable tools to advertise (name + one-line summary) when tool discovery is active. */
-	discoverableTools?: Array<{ name: string; summary: string }>;
 	/** Encourage the agent to delegate via tasks unless changes are trivial. */
 	eagerTasks?: boolean;
 	/** Rules with alwaysApply=true — their full content is injected into the prompt. */
@@ -368,12 +372,45 @@ export interface BuildSystemPromptOptions {
 	secretsEnabled?: boolean;
 	/** Pre-loaded workspace tree (skips discovery if provided). May be a Promise to allow early kick-off. */
 	workspaceTree?: WorkspaceTree | Promise<WorkspaceTree>;
+	/**
+	 * Render a trimmed role-agent base prompt for subagent sessions: omits the
+	 * workflow-surface/routing/self-awareness (`<gjc-runtime>`) and `<soul>` blocks
+	 * that only apply to the top-level interactive/print agent. Tool safety, repo
+	 * safety, and the completion contract are retained. Default: false.
+	 */
+	subagent?: boolean;
 }
 
 /** Result of building provider-facing system prompt messages. */
 export interface BuildSystemPromptResult {
 	/** Ordered system prompt blocks. Providers should preserve entries as distinct messages/blocks. */
 	systemPrompt: string[];
+}
+export interface BuildVolatileProjectContextOptions {
+	cwd?: string;
+	date?: string;
+	workspaceTree?: WorkspaceTree;
+}
+
+export function buildVolatileProjectContext(options: BuildVolatileProjectContextOptions = {}): string {
+	const resolvedCwd = options.cwd ?? getProjectDir();
+	const date = options.date ?? new Date().toISOString().slice(0, 10);
+	return prompt
+		.render(volatileProjectContextTemplate, {
+			date,
+			cwd: escapePromptMetadata(shortenPath(resolvedCwd.replace(/\\/g, "/"))),
+			workspaceTree: {
+				...(options.workspaceTree ?? {
+					rootPath: resolvedCwd,
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				}),
+				rendered: escapePromptMetadata(options.workspaceTree?.rendered ?? "", { preserveNewlines: true }),
+			},
+		})
+		.trim();
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -388,21 +425,17 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		appendSystemPrompt,
 		pluginAppendices,
 		repeatToolDescriptions = false,
-		skillsSettings,
 		toolNames: providedToolNames,
 		cwd,
 		contextFiles: providedContextFiles,
-		skills: providedSkills,
 		rules,
 		alwaysApplyRules,
 		intentField,
-		mcpDiscoveryMode = false,
-		mcpDiscoveryServerSummaries = [],
 		toolDiscoveryActive = false,
-		discoverableTools = [],
 		eagerTasks = false,
 		secretsEnabled = false,
 		workspaceTree: providedWorkspaceTree,
+		subagent = false,
 	} = options;
 	const resolvedCwd = cwd ?? getProjectDir();
 
@@ -411,7 +444,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedAppendPrompt: undefined as string | undefined,
 		systemPromptCustomization: null as string | null,
 		contextFiles: dedupeExactContextFiles(providedContextFiles ?? []),
-		skills: providedSkills ?? ([] as Skill[]),
 		workspaceTree: {
 			rootPath: resolvedCwd,
 			rendered: "",
@@ -461,14 +493,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			: logger.time("buildWorkspaceTree", () =>
 					buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
 				);
-	const skillsPromise: Promise<Skill[]> =
-		providedSkills !== undefined
-			? Promise.resolve(providedSkills)
-			: skillsSettings?.enabled !== false
-				? loadSkills({ ...skillsSettings, cwd: resolvedCwd }).then(result => result.skills)
-				: Promise.resolve([]);
 
-	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFiles, skills, workspaceTree] =
+	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFiles, workspaceTree] =
 		await Promise.all([
 			withDeadline(
 				"customPrompt",
@@ -488,7 +514,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles).then(
 				dedupeExactContextFiles,
 			),
-			withDeadline("loadSkills", skillsPromise, prepDefaults.skills),
 			withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
 		]);
 	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
@@ -526,26 +551,21 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			// Tools map provided
 			toolNames = Array.from(tools.keys());
 		} else {
-			// Use defaults
-			toolNames = ["read", "bash", "eval", "edit", "write"]; // TODO: Why?
+			// Use the same essential-tool baseline as a default session.
+			toolNames = [...DEFAULT_ESSENTIAL_TOOL_NAMES];
 		}
 	}
 
 	// Build tool descriptions for system prompt rendering.
 	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
+	const hasHiddenToolDiscoveryTool = Object.hasOwn(toolRefs, "search_tool_bm25");
 	const toolInfo = toolNames.map(name => ({
 		name: toolPromptNames.get(name) ?? name,
 		internalName: name,
 		label: tools?.get(name)?.label ?? "",
 		description: tools?.get(name)?.description ?? "",
 	}));
-
-	// Filter skills for the rendered system prompt:
-	// - require the `read` tool so the model can actually fetch skill content;
-	// - drop skills with frontmatter `hide: true` (still loadable via skill:// and /skill:<name>).
-	const hasRead = tools?.has("read");
-	const filteredSkills = hasRead ? skills.filter(skill => skill.hide !== true) : [];
 
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
@@ -567,7 +587,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles,
 		agentsMdSearch: { files: agentsMdFiles },
 		workspaceTree,
-		skills: filteredSkills,
 		rules: rules ?? [],
 		alwaysApplyRules: injectedAlwaysApplyRules,
 		date,
@@ -575,13 +594,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd: promptCwd,
 		intentTracing: !!intentField,
 		intentField: intentField ?? "",
-		mcpDiscoveryMode,
-		hasMCPDiscoveryServers: mcpDiscoveryServerSummaries.length > 0,
-		mcpDiscoveryServerSummaries,
-		toolDiscoveryActive,
-		discoverableTools,
+		toolDiscoveryActive: toolDiscoveryActive && hasHiddenToolDiscoveryTool,
 		eagerTasks,
 		secretsEnabled,
+		subagent,
 	};
 	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
 	const systemPrompt = [rendered];

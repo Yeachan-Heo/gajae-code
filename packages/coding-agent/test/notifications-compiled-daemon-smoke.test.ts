@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildTelegramDaemonSpawnArgs, daemonPaths } from "../src/notifications/telegram-daemon";
+import { devEntrypoints, releaseEntrypoints } from "../scripts/compile-args";
+import { buildChatDaemonSpawnArgs } from "../src/sdk/bus/chat-daemon-control";
+import { buildTelegramDaemonSpawnArgs, daemonPaths } from "../src/sdk/bus/telegram-daemon";
 
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 
@@ -13,7 +15,8 @@ describe("compiled daemon smoke coverage", () => {
 
 	async function runWithTimeout(
 		command: string[],
-		opts: { cwd: string },
+		opts: { cwd: string; env?: Record<string, string | undefined> },
+
 		timeoutMs: number,
 	): Promise<{
 		exitCode: number | null;
@@ -22,7 +25,8 @@ describe("compiled daemon smoke coverage", () => {
 		timedOut: boolean;
 	}> {
 		const proc = Bun.spawn(command, {
-			...opts,
+			cwd: opts.cwd,
+			...(opts.env ? { env: opts.env } : {}),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -42,37 +46,62 @@ describe("compiled daemon smoke coverage", () => {
 		]);
 		return { exitCode, stdout, stderr, timedOut };
 	}
+	const cliEntrypoint = path.join(repoRoot, "packages/coding-agent/src/cli.ts");
+
+	function rootCliStaticImports(source: string): string[] {
+		const importsFrom = Array.from(source.matchAll(/^import[\s\S]*?from\s+["']([^"']+)["'];?$/gm), match => match[1]);
+		const sideEffectImports = Array.from(source.matchAll(/^import\s+["']([^"']+)["'];?$/gm), match => match[1]);
+		return [...importsFrom, ...sideEffectImports];
+	}
+
+	test("root CLI defers the chat daemon bus graph while the hidden daemon child still spawns", async () => {
+		const agentDir = tempDir("gjc-chat-daemon-root-entry-");
+		const cwd = tempDir("gjc-chat-daemon-root-cwd-");
+		const configPath = path.join(agentDir, "config.yml");
+		const config = "notifications:\n  enabled: false\n";
+		fs.writeFileSync(configPath, config);
+		try {
+			const staticImports = rootCliStaticImports(fs.readFileSync(cliEntrypoint, "utf8"));
+			expect(staticImports).not.toContain("./sdk/bus/chat-daemon-cli");
+
+			const result = await runWithTimeout(
+				[
+					"bun",
+					"run",
+					cliEntrypoint,
+					"daemon",
+					"discord-internal",
+					"--owner-id",
+					`${process.pid}-root-entry-test`,
+					"--agent-dir",
+					agentDir,
+				],
+				{ cwd },
+				10_000,
+			);
+			expect(result.timedOut).toBe(false);
+			expect(`${result.exitCode}\n${result.stdout}\n${result.stderr}`).toStartWith("0\n");
+			expect(fs.readFileSync(configPath, "utf8")).toBe(config);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
 
 	async function buildCompiledDaemonSmokeBinary(outPath: string): Promise<void> {
-		const proc = Bun.spawn(
-			[
-				"bun",
-				"build",
-				"--compile",
-				"--no-compile-autoload-bunfig",
-				"--no-compile-autoload-dotenv",
-				"--no-compile-autoload-tsconfig",
-				"--no-compile-autoload-package-json",
-				"--keep-names",
-				"--define",
-				'process.env.PI_COMPILED="true"',
-				"--root",
-				".",
-				"--external",
-				"mupdf",
-				"./packages/coding-agent/src/cli.ts",
-				"./packages/coding-agent/src/notifications/telegram-daemon-cli.ts",
-				"--outfile",
-				outPath,
-			],
-			{ cwd: repoRoot, stdout: "pipe", stderr: "pipe" },
-		);
+		const proc = Bun.spawn(["bun", "run", "build"], {
+			cwd: path.join(repoRoot, "packages/coding-agent"),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
 		const [exitCode, stdout, stderr] = await Promise.all([
 			proc.exited,
 			new Response(proc.stdout).text(),
 			new Response(proc.stderr).text(),
 		]);
 		expect(`${exitCode}\n${stdout}\n${stderr}`).toStartWith("0\n");
+		fs.copyFileSync(path.join(repoRoot, "packages/coding-agent/dist/gjc"), outPath);
+		fs.chmodSync(outPath, 0o755);
 	}
 
 	test("hidden daemon CLI smoke creates and removes its temp lock without leaking tokens", async () => {
@@ -116,35 +145,75 @@ describe("compiled daemon smoke coverage", () => {
 		expect(fs.readdirSync(paths.dir).filter(name => name.includes(".smoke."))).toEqual([]);
 	});
 
-	test("compiled binary with daemon CLI entrypoint starts root version and daemon smoke", async () => {
+	test("source chat worker reads disabled config without modifying it", async () => {
+		const agentDir = tempDir("gjc-chat-daemon-disabled-");
+		const configPath = path.join(agentDir, "config.yml");
+		const config = "notifications:\n  enabled: false\n";
+		fs.writeFileSync(configPath, config);
+		try {
+			const result = await runWithTimeout(
+				[
+					"bun",
+					"run",
+					path.join(repoRoot, "packages/coding-agent/src/cli.ts"),
+					"daemon",
+					"discord-internal",
+					"--owner-id",
+					`${process.pid}-test`,
+					"--agent-dir",
+					agentDir,
+				],
+				{ cwd: repoRoot },
+				10_000,
+			);
+			expect(result.timedOut).toBe(false);
+			expect(`${result.exitCode}\n${result.stdout}\n${result.stderr}`).toStartWith("0\n");
+			expect(fs.readFileSync(configPath, "utf8")).toBe(config);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+	test("compiled binary preserves the shipped chat worker entrypoint", async () => {
 		const temp = tempDir("gjc-compiled-daemon-binary-");
 		const binaryPath = path.join(temp, "gjc-repro");
 		try {
 			await buildCompiledDaemonSmokeBinary(binaryPath);
-			const version = await runWithTimeout([binaryPath, "--version"], { cwd: temp }, 10_000);
-			expect(version.timedOut).toBe(false);
-			expect(`${version.exitCode}\n${version.stdout}\n${version.stderr}`).toStartWith("0\ngjc/");
-
-			const smoke = await runWithTimeout(
-				[binaryPath, "notify", "daemon-internal", "--smoke"],
-				{ cwd: temp },
+			const nativeVersion = (
+				JSON.parse(fs.readFileSync(path.join(repoRoot, "packages/natives/package.json"), "utf8")) as {
+					version: string;
+				}
+			).version;
+			const xdgDataHome = path.join(temp, "xdg");
+			const nativeCache = path.join(xdgDataHome, "gjc", "natives", nativeVersion);
+			fs.mkdirSync(nativeCache, { recursive: true });
+			const nativeSrcDir = path.join(repoRoot, "packages/natives/native");
+			for (const nativeFile of fs.readdirSync(nativeSrcDir)) {
+				if (/^pi_natives\..*\.node$/.test(nativeFile)) {
+					fs.copyFileSync(path.join(nativeSrcDir, nativeFile), path.join(nativeCache, nativeFile));
+				}
+			}
+			const version = await runWithTimeout(
+				[binaryPath, "--version"],
+				{ cwd: temp, env: { ...process.env, XDG_DATA_HOME: xdgDataHome } },
 				10_000,
 			);
-			expect(smoke.timedOut).toBe(false);
-			expect(`${smoke.exitCode}\n${smoke.stdout}\n${smoke.stderr}`).toStartWith("0\n");
+			expect(version.timedOut).toBe(false);
+			expect(`${version.exitCode}\n${version.stdout}\n${version.stderr}`).toStartWith("0\ngjc/");
 		} finally {
 			fs.rmSync(temp, { recursive: true, force: true });
 		}
-	});
+	}, 300_000);
 
-	test("build scripts preserve the dynamic daemon entrypoint for compiled binaries", () => {
-		const devBuildScript = fs.readFileSync(
-			path.join(repoRoot, "packages/coding-agent/scripts/build-binary.ts"),
-			"utf8",
+	test("compile entrypoint lists preserve the dynamic daemon entrypoint for compiled binaries", () => {
+		expect(devEntrypoints).toEqual(
+			expect.arrayContaining(["./src/sdk/bus/telegram-daemon-cli.ts", "./src/sdk/bus/chat-daemon-cli.ts"]),
 		);
-		const releaseBuildScript = fs.readFileSync(path.join(repoRoot, "scripts/ci-release-build-binaries.ts"), "utf8");
-		expect(devBuildScript).toContain("telegram-daemon-cli.ts");
-		expect(releaseBuildScript).toContain("telegram-daemon-cli.ts");
+		expect(releaseEntrypoints).toEqual(
+			expect.arrayContaining([
+				"./packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts",
+				"./packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts",
+			]),
+		);
 	});
 
 	test("compiled-mode spawn args self-spawn the binary without a script prefix and carry a reload warning", () => {
@@ -161,5 +230,19 @@ describe("compiled daemon smoke coverage", () => {
 		expect(runtime.mode).toBe("compiled");
 		expect(runtime.reloadPicksUpSourceEdits).toBe(false);
 		expect(runtime.warning).toContain("Rebuild");
+	});
+
+	test("compiled chat spawn self-invokes daemon internal workers without a source entrypoint", () => {
+		for (const kind of ["discord", "slack"] as const) {
+			const { command, args, runtime } = buildChatDaemonSpawnArgs({
+				kind,
+				execPath: "/opt/gjc/gjc",
+				ownerId: "owner-1",
+				agentDir: "/tmp/agent",
+			});
+			expect(command).toBe("/opt/gjc/gjc");
+			expect(args).toEqual(expect.arrayContaining(["daemon", `${kind}-internal`, "--owner-id", "owner-1"]));
+			expect(runtime.mode).toBe("compiled");
+		}
 	});
 });

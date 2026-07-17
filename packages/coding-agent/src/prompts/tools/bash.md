@@ -40,12 +40,12 @@ Use it only for sanctioned GJC workflow CLI persistence or state read/write/cont
 
 <critical>
 {{#when restrictionProfile "==" "read-only"}}
-- Use read-only bash only for approved inspection commands that are materially better than `read`, `search`, or `find`; the tool itself blocks non-approved commands and unsafe shell shapes.
+- Use read-only bash only for approved inspection commands that are materially better than dedicated tools; unsafe shell shapes are blocked.
 {{else}}
-- NEVER use Linux coreutils (`cat`, `head`, `tail`, `less`, `more`, `ls`, `grep`, `rg`, `awk`, `sed`, `find`, `fd`, etc.) when a dedicated tool suffices — ALWAYS prefer `read`, `search`, `find`, `edit`, `write`.
+- Use bash only for terminal operations that dedicated tools do not cover.
 {{/when}}
-- NEVER pipe through `| head -n N` or `| tail -n N` — output is already truncated with the full result available via `artifact://<id>`.
-- NEVER redirect with `2>&1` or `2>/dev/null` — stdout and stderr are already merged.
+- Never pipe through `| head -n N` or `| tail -n N` — output is already truncated with the full result available via `artifact://<id>`.
+- Never redirect with `2>&1` or `2>/dev/null` — stdout and stderr are already merged.
 </critical>
 
 <output>
@@ -57,7 +57,7 @@ Use it only for sanctioned GJC workflow CLI persistence or state read/write/cont
 {{#if asyncEnabled}}
 # Timeout and async
 
-- `timeout` (seconds) caps the **wall-clock duration** of the command. When it elapses the process is killed and the call returns with a timeout annotation. Range: `1`–`3600`s; default `300`s (see `clampTimeout("bash", …)` in `tool-timeouts.ts`).
+- `timeout` (seconds) caps the **wall-clock duration** of the command. When it elapses the process is killed and the call returns with a timeout annotation. Range: `1`–`3600`s; default `300`s.
 - `async: true` only defers **reporting** of the result — it does NOT disable, extend, or detach the timeout. A daemon started with `async: true` is still killed when `timeout` elapses, regardless of how long the agent waits before reading the result.
 - For long-running daemons (dev servers, watchers): either pass an explicit large `timeout` (up to `3600`), or fully detach the process from this shell using `nohup …  &` / `setsid … &` / `disown` so it survives independent of the bash call's lifecycle.
 {{/if}}

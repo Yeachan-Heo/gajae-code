@@ -4,9 +4,8 @@
 #
 # Stages:
 #   natives-builder — Rust + Bun → pi_natives.linux-<arch>.node
-#   wheel-builder   — gjc_rpc Python wheel
-#   pi-base         — python + bun + rustup launcher + natives + gjc_rpc
-#                     + /usr/local/bin/gjc shim
+#   pi-base         — python + bun + natives + /usr/local/bin/gjc shim
+#   pi-dev          — pi-base + build toolchain (build-essential, rustup)
 #   pi-runtime      — pi-base + pi source + bun install      (DEFAULT, runnable)
 #
 # Build:
@@ -17,9 +16,6 @@
 #     docker run --rm gajae-code/pi:dev --help
 #     docker run --rm -it -v "$PWD":/work gajae-code/pi:dev cli    # interactive gjc
 #
-# Consume as a base in another Dockerfile (see Dockerfile.robogjc):
-#     ARG PI_BASE=gajae-code/pi:dev
-#     FROM ${PI_BASE} AS pi-base
 ###############################################################################
 
 ARG BUN_VERSION=1.3.14
@@ -53,7 +49,6 @@ COPY --parents \
     Cargo.toml Cargo.lock rust-toolchain.toml \
     packages/*/package.json \
     packages/tsconfig.workspace.json \
-    python/robogjc/web/package.json \
     crates/*/Cargo.toml \
     /pi/
 
@@ -78,27 +73,12 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cp packages/natives/native/pi_natives.linux-*.node /out/
 
 ############################
-# 2) wheel-builder — gjc-rpc wheel
-############################
-FROM python:3.12-slim-bookworm AS wheel-builder
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --upgrade pip build
-
-WORKDIR /src
-COPY python/gjc-rpc /src
-RUN python -m build --wheel --outdir /out
 
 ############################
-# 3) pi-base — python + bun + rustup + natives + gjc_rpc + gjc shim
+# 2) pi-base — python + bun + natives + gjc shim
 #
-# Sharable runtime base. Derived images (pi-runtime below, Dockerfile.robogjc)
-# extend this and overlay their own source tree. Default PI_ROOT=/work/pi is
-# friendly to derived images that mount a host pi checkout there; pi-runtime
-# overrides it to /pi because its source is baked in.
+# Sharable runtime base. `pi-runtime` below uses this stage and overrides
+# `PI_ROOT` to `/pi` because its source is baked in.
 ############################
 FROM python:3.12-slim-bookworm AS pi-base
 
@@ -109,36 +89,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     BUN_INSTALL=/opt/bun \
     PI_ROOT=/work/pi \
-    CARGO_HOME=/data/cache/cargo \
-    CARGO_TARGET_DIR=/data/cache/cargo-target \
-    RUSTUP_HOME=/data/cache/rustup \
-    PATH=/opt/bun/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+    PATH=/opt/bun/bin:/usr/local/bin:/usr/bin:/bin
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git curl ca-certificates unzip openssh-client tini sqlite3 \
-        build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
     && /opt/bun/bin/bun --version
 
-# Rustup launcher only — the real toolchain is fetched lazily into RUSTUP_HOME
-# on first cargo invocation, driven by pi's `rust-toolchain.toml`. Keeps the
-# image small while sharing the toolchain across reboots when /data is mounted.
-RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
-    && CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup-bootstrap \
-       sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain none --profile minimal \
-    && rm -f /tmp/rustup-init.sh \
-    && rm -rf /usr/local/rustup-bootstrap \
-    && /usr/local/cargo/bin/rustup --version
 
 # pi-natives addon: pi's loader probes /opt/bun/bin as a fallback path.
 COPY --from=natives-builder /out/pi_natives.linux-*.node /opt/bun/bin/
 
-# gjc-rpc Python wheel.
-COPY --from=wheel-builder /out/*.whl /tmp/wheels/
-RUN pip install /tmp/wheels/gjc_rpc-*.whl && rm -rf /tmp/wheels
 
 # `gjc` shim — runs the coding-agent CLI against $PI_ROOT via Bun. Derived
 # images override PI_ROOT to point at wherever their pi source lives.
@@ -155,7 +119,30 @@ RUN printf '%s\n' \
     && chmod +x /usr/local/bin/gjc
 
 ############################
-# 4) pi-runtime — pi-base + pi source + bun install (DEFAULT)
+# 4) pi-dev — pi-base + build toolchain for derived development images
+############################
+FROM pi-base AS pi-dev
+
+ENV CARGO_HOME=/data/cache/cargo \
+    CARGO_TARGET_DIR=/data/cache/cargo-target \
+    RUSTUP_HOME=/data/cache/rustup \
+    PATH=/opt/bun/bin:/data/cache/cargo/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rustup launcher only — the real toolchain is fetched lazily into RUSTUP_HOME
+# on first cargo invocation, driven by pi's `rust-toolchain.toml`.
+RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup-bootstrap \
+       sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain none --profile minimal \
+    && rm -f /tmp/rustup-init.sh \
+    && rm -rf /usr/local/rustup-bootstrap \
+    && /usr/local/cargo/bin/rustup --version
+
+############################
+# 5) pi-runtime — pi-base + pi source + bun install (DEFAULT)
 #
 # A self-contained, runnable gjc image. `docker run gajae-code/pi:dev --help`
 # Just Works without a host checkout.
@@ -172,7 +159,6 @@ COPY --parents \
     tsconfig.base.json tsconfig.json \
     packages/*/package.json \
     packages/tsconfig.workspace.json \
-    python/robogjc/web/package.json \
     /pi/
 
 RUN bun install --frozen-lockfile --ignore-scripts

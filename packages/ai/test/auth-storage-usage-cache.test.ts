@@ -163,6 +163,31 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 		expect(calls).toBe(1);
 	});
 
+	it("suppresses provider and account details for secret-safe callers", async () => {
+		storage.close();
+		const debug = vi.fn();
+		const warn = vi.fn();
+		storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+			usageLogger: { debug, warn },
+		});
+		await storage.reload();
+		const secret = "credential-sentinel@example.invalid";
+		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async (_params, context) => {
+			expect(context.logger).toBeUndefined();
+			return makeReport(secret);
+		});
+
+		const reports = await storage.fetchUsageReports({
+			baseUrlResolver: () => `https://${secret}`,
+			logDetails: false,
+		});
+
+		expect(anthropicReports(reports)).toHaveLength(1);
+		expect(debug).not.toHaveBeenCalled();
+		expect(warn).not.toHaveBeenCalled();
+	});
+
 	it("does NOT cache a failure when no previous good value exists — retries next poll", async () => {
 		let calls = 0;
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async () => {

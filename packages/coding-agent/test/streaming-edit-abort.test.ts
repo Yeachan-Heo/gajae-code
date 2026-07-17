@@ -83,6 +83,7 @@ async function createSession(
 	tempDir: string,
 	streamFn: Agent["streamFn"],
 	tool: AgentTool,
+	obfuscator?: { deobfuscate(text: string): string; deobfuscateObject<T>(value: T): T; hasSecrets(): boolean },
 ): Promise<{ agent: Agent; session: AgentSession; authStorage: AuthStorage }> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	const agent = new Agent({
@@ -108,6 +109,7 @@ async function createSession(
 			sessionManager,
 			settings,
 			modelRegistry,
+			obfuscator: obfuscator as never,
 		}),
 		authStorage,
 	};
@@ -196,6 +198,71 @@ function createStreamForDiff(
 			if (aborted) return;
 
 			const finalCall = createToolCall(toolCallId, { path, diff: diffSoFar });
+			const finalMessage = createAssistantMessage([finalCall], "toolUse");
+			stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: finalCall, partial: finalMessage });
+			stream.push({ type: "done", reason: "toolUse", message: finalMessage });
+			callIndex++;
+		});
+
+		return stream;
+	};
+}
+
+function createStreamForToolCallArgs(
+	name: string,
+	id: string,
+	argsByDelta: Record<string, unknown>[],
+	abortSignalRef: { current?: AbortSignal },
+): Agent["streamFn"] {
+	let callIndex = 0;
+	return (_model, _context, options) => {
+		abortSignalRef.current = options?.signal;
+		const stream = new AssistantMessageEventStream();
+		let aborted = false;
+		const currentArgs = () => argsByDelta.at(-1) ?? {};
+
+		const notifyAbort = () => {
+			if (aborted) return;
+			aborted = true;
+			const partialCall = { ...createToolCall(id, currentArgs()), name };
+			stream.push({
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: "",
+				partial: createAssistantMessage([partialCall], "stop"),
+			});
+			stream.push({ type: "error", reason: "aborted", error: createAssistantMessage([], "aborted") });
+		};
+
+		options?.signal?.addEventListener("abort", notifyAbort, { once: true });
+
+		queueMicrotask(() => {
+			if (callIndex > 0) {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "done" }], "stop"),
+				});
+				callIndex++;
+				return;
+			}
+
+			stream.push({ type: "start", partial: createAssistantMessage([], "stop") });
+			const startCall = { ...createToolCall(id, {}), name };
+			stream.push({ type: "toolcall_start", contentIndex: 0, partial: createAssistantMessage([startCall], "stop") });
+			for (const args of argsByDelta) {
+				if (aborted) return;
+				const partialCall = { ...createToolCall(id, args), name };
+				stream.push({
+					type: "toolcall_delta",
+					contentIndex: 0,
+					delta: "x",
+					partial: createAssistantMessage([partialCall], "stop"),
+				});
+			}
+			if (aborted) return;
+
+			const finalCall = { ...createToolCall(id, currentArgs()), name };
 			const finalMessage = createAssistantMessage([finalCall], "toolUse");
 			stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: finalCall, partial: finalMessage });
 			stream.push({ type: "done", reason: "toolUse", message: finalMessage });
@@ -421,6 +488,390 @@ it("aborts auto-generated file edits as soon as the path is available", async ()
 		releaseCheck.resolve();
 		checkSpy.mockRestore();
 		abortSpy.mockRestore();
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("processes append-only streaming diffs linearly and dedupes guard invocation", async () => {
+	const lineCount = 40;
+	const original = `${Array.from({ length: lineCount }, (_, index) => `line-${index}`).join("\n")}\n`;
+	await Bun.write(path.join(tempDir, "sample.txt"), original);
+	const chunks = ["@@\n"];
+	for (let index = 0; index < lineCount; index++) {
+		chunks.push(`-line-${index}\n`, `+line-${index}-new\n`);
+	}
+	const finalSize = chunks.join("").length;
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForDiff("sample.txt", chunks, abortSignalRef);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(false);
+		expect(session.streamingEditDebugCounters.guardRuns).toBe(chunks.length + 1);
+		expect(session.streamingEditDebugCounters.processedChars).toBeLessThanOrEqual(finalSize + 1);
+		expect(session.streamingEditDebugCounters.checkedRemovedLines).toBe(lineCount);
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("aborts when a bad removed line appears in the first completed suffix", async () => {
+	await Bun.write(path.join(tempDir, "sample.txt"), "alpha\nbeta\n");
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForDiff("sample.txt", ["@@\n", "-omega\n", "+beta2\n"], abortSignalRef);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(true);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).toBe("aborted");
+		expect(session.streamingEditDebugCounters.checkedRemovedLines).toBe(1);
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("aborts when a bad removed line appears only in a later suffix", async () => {
+	await Bun.write(path.join(tempDir, "sample.txt"), "alpha\nbeta\n");
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForDiff("sample.txt", ["@@\n", "-alpha\n", "+alpha2\n", "-omega\n"], abortSignalRef);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(true);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).toBe("aborted");
+		expect(session.streamingEditDebugCounters.checkedRemovedLines).toBe(2);
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("falls back to a full check when a streaming diff mutates non-append", async () => {
+	await Bun.write(path.join(tempDir, "sample.txt"), "alpha\nbeta\n");
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForToolCallArgs(
+		"edit",
+		"call_edit_non_append",
+		[
+			{ path: "sample.txt", diff: "@@\n-alpha\n" },
+			{ path: "sample.txt", diff: "@@\n-omega\n" },
+		],
+		abortSignalRef,
+	);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(true);
+		expect(session.streamingEditDebugCounters.fullChecks).toBeGreaterThanOrEqual(1);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).toBe("aborted");
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("uses full-diff fallback with obfuscator and preserves abort correctness", async () => {
+	await Bun.write(path.join(tempDir, "sample.txt"), "real-secret\n");
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForDiff("sample.txt", ["@@\n", "-masked-secret\n"], abortSignalRef);
+	const obfuscator = {
+		hasSecrets: () => true,
+		deobfuscate: (text: string) => text.replaceAll("masked-secret", "missing-secret"),
+		deobfuscateObject: <T>(value: T) => value,
+	};
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool, obfuscator);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(true);
+		expect(session.streamingEditDebugCounters.fullChecks).toBeGreaterThanOrEqual(1);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).toBe("aborted");
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("caches non-update edit verdicts and skips later deltas", async () => {
+	await Bun.write(path.join(tempDir, "sample.txt"), "alpha\n");
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForToolCallArgs(
+		"edit",
+		"call_edit_create",
+		[
+			{ path: "sample.txt", diff: "@@\n-alpha\n", op: "create" },
+			{ path: "sample.txt", diff: "@@\n-omega\n", op: "create" },
+		],
+		abortSignalRef,
+	);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(false);
+		expect(session.streamingEditDebugCounters.guardRuns).toBe(1);
+		expect(session.streamingEditDebugCounters.processedChars).toBe(0);
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+it("G013 SEAM-ABORT catches a bad removed line completed exactly at the processed suffix seam", async () => {
+	await Bun.write(path.join(tempDir, "sample.txt"), "alpha\nbeta\n");
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForDiff("sample.txt", ["@@\n", "-omega", "\n+beta2\n"], abortSignalRef);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(true);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).toBe("aborted");
+		expect(session.streamingEditDebugCounters.checkedRemovedLines).toBe(1);
+		expect(session.streamingEditDebugCounters.processedChars).toBeLessThanOrEqual("@@\n-omega\n+beta2\n".length);
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("G013 PARTIAL-LINE-DEFER waits for a bad removed line newline before aborting", async () => {
+	await Bun.write(path.join(tempDir, "sample.txt"), "alpha\nbeta\n");
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const releaseFinalChunk = Promise.withResolvers<void>();
+	let afterPartial: { aborted: boolean; checkedRemovedLines: number } | undefined;
+	const streamFn: Agent["streamFn"] = (_model, _context, options) => {
+		abortSignalRef.current = options?.signal;
+		const stream = new AssistantMessageEventStream();
+		const toolCallId = "call_edit_partial_defer";
+		let diffSoFar = "";
+		let aborted = false;
+		options?.signal?.addEventListener(
+			"abort",
+			() => {
+				aborted = true;
+				const partialCall = createToolCall(toolCallId, { path: "sample.txt", diff: diffSoFar });
+				stream.push({
+					type: "toolcall_delta",
+					contentIndex: 0,
+					delta: "",
+					partial: createAssistantMessage([partialCall], "stop"),
+				});
+				stream.push({ type: "error", reason: "aborted", error: createAssistantMessage([], "aborted") });
+			},
+			{ once: true },
+		);
+
+		queueMicrotask(async () => {
+			stream.push({ type: "start", partial: createAssistantMessage([], "stop") });
+			stream.push({
+				type: "toolcall_start",
+				contentIndex: 0,
+				partial: createAssistantMessage([createToolCall(toolCallId, { path: "sample.txt", diff: "" })], "stop"),
+			});
+			diffSoFar = "@@\n-omega";
+			stream.push({
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: diffSoFar,
+				partial: createAssistantMessage(
+					[createToolCall(toolCallId, { path: "sample.txt", diff: diffSoFar })],
+					"stop",
+				),
+			});
+			await Bun.sleep(0);
+			afterPartial = {
+				aborted: options?.signal?.aborted ?? false,
+				checkedRemovedLines: 0,
+			};
+			await releaseFinalChunk.promise;
+			if (aborted) return;
+			diffSoFar += "\n";
+			const finalCall = createToolCall(toolCallId, { path: "sample.txt", diff: diffSoFar });
+			stream.push({
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: "\n",
+				partial: createAssistantMessage([finalCall], "stop"),
+			});
+			if (aborted) return;
+			stream.push({
+				type: "toolcall_end",
+				contentIndex: 0,
+				toolCall: finalCall,
+				partial: createAssistantMessage([finalCall], "toolUse"),
+			});
+			stream.push({ type: "done", reason: "toolUse", message: createAssistantMessage([finalCall], "toolUse") });
+		});
+		return stream;
+	};
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		const promptPromise = session.prompt("apply patch");
+		while (!afterPartial) await Bun.sleep(0);
+		expect(afterPartial).toEqual({ aborted: false, checkedRemovedLines: 0 });
+		expect(abortSignalRef.current?.aborted ?? false).toBe(false);
+		expect(session.streamingEditDebugCounters.checkedRemovedLines).toBe(0);
+
+		releaseFinalChunk.resolve();
+		await promptPromise;
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(true);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).toBe("aborted");
+		expect(session.streamingEditDebugCounters.checkedRemovedLines).toBe(1);
+	} finally {
+		releaseFinalChunk.resolve();
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("G013 ABORT-MIDDLE catches a bad removed line in a middle suffix", async () => {
+	await Bun.write(path.join(tempDir, "sample.txt"), "alpha\nbeta\ngamma\n");
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForDiff(
+		"sample.txt",
+		["@@\n", "-alpha\n", "+alpha2\n", "-omega\n", "+omega2\n", "-gamma\n"],
+		abortSignalRef,
+	);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(true);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).toBe("aborted");
+		expect(session.streamingEditDebugCounters.checkedRemovedLines).toBe(2);
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("G013 APPEND-ONLY-LINEAR handles 100 growing valid deltas without quadratic processing", async () => {
+	const lineCount = 50;
+	const original = `${Array.from({ length: lineCount }, (_, index) => `line-${index}`).join("\n")}\n`;
+	await Bun.write(path.join(tempDir, "sample.txt"), original);
+	const chunks = Array.from({ length: lineCount }, (_, index) => `-line-${index}\n+line-${index}-new\n`);
+	const finalDiff = `@@\n${chunks.join("")}`;
+	const deltas = Array.from({ length: 100 }, (_, index) =>
+		finalDiff.slice(0, Math.ceil((finalDiff.length * (index + 1)) / 100)),
+	);
+	const argsByDelta = deltas.map(diff => ({ path: "sample.txt", diff }));
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForToolCallArgs("edit", "call_edit_linear_100", argsByDelta, abortSignalRef);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(false);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).not.toBe("aborted");
+		expect(session.streamingEditDebugCounters.guardRuns).toBe(101);
+		expect(session.streamingEditDebugCounters.checkedRemovedLines).toBe(lineCount);
+		expect(session.streamingEditDebugCounters.processedChars).toBeLessThanOrEqual(finalDiff.length + 1);
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("G013 NON-EDIT-SKIP caches non-edit verdict and never aborts later bad-looking deltas", async () => {
+	await Bun.write(path.join(tempDir, "sample.txt"), "alpha\n");
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForToolCallArgs(
+		"bash",
+		"call_non_edit_skip",
+		[
+			{ path: "sample.txt", diff: "@@\n-omega\n" },
+			{ path: "sample.txt", diff: "@@\n-still-missing\n" },
+		],
+		abortSignalRef,
+	);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("run command");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(false);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).not.toBe("aborted");
+		expect(session.streamingEditDebugCounters.nonEditDeterminations).toBe(1);
+		expect(session.streamingEditDebugCounters.guardRuns).toBe(0);
+	} finally {
+		try {
+			await session.dispose();
+		} finally {
+			authStorage.close();
+		}
+	}
+});
+
+it("G013 NO-FALSE-ABORT accepts a fully valid large edit", async () => {
+	const lineCount = 200;
+	const original = `${Array.from({ length: lineCount }, (_, index) => `valid-${index}`).join("\n")}\n`;
+	await Bun.write(path.join(tempDir, "sample.txt"), original);
+	const chunks = [
+		"@@\n",
+		...Array.from({ length: lineCount }, (_, index) => `-valid-${index}\n+valid-${index}-new\n`),
+	];
+	const abortSignalRef: { current?: AbortSignal } = {};
+	const streamFn = createStreamForDiff("sample.txt", chunks, abortSignalRef);
+	const { session, authStorage } = await createSession(tempDir, streamFn, editTool);
+
+	try {
+		await session.prompt("apply patch");
+
+		expect(abortSignalRef.current?.aborted ?? false).toBe(false);
+		expect(lastAssistantMessage(session.state.messages)?.stopReason).not.toBe("aborted");
+		expect(session.streamingEditDebugCounters.checkedRemovedLines).toBe(lineCount);
+	} finally {
 		try {
 			await session.dispose();
 		} finally {

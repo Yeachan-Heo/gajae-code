@@ -14,6 +14,7 @@ const publicGuidanceFiles = [
 	"packages/coding-agent/src/prompts/tools/bash.md",
 	"packages/coding-agent/src/prompts/tools/irc.md",
 	"packages/coding-agent/src/prompts/tools/read.md",
+	"packages/coding-agent/src/hindsight/backend.ts",
 ];
 
 const publicDocsToolDir = path.join(repoRoot, "docs/tools");

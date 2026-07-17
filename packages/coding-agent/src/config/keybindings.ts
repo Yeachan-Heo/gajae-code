@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import {
 	type Keybinding,
@@ -41,6 +41,7 @@ interface AppKeybindings {
 	"app.session.fork": true;
 	"app.session.resume": true;
 	"app.session.observe": true;
+	"app.session.dashboard": true;
 	"app.jobs.open": true;
 	"app.session.togglePath": true;
 	"app.session.toggleSort": true;
@@ -52,6 +53,14 @@ interface AppKeybindings {
 	"app.plan.toggle": true;
 	"app.history.search": true;
 	"app.stt.toggle": true;
+	"app.irc.sidebar.toggle": true;
+	"app.transcript.browse": true;
+	"app.transcript.prevTurn": true;
+	"app.transcript.nextTurn": true;
+	"app.mode.cycle": true;
+	"app.tasks.toggle": true;
+	"app.queue.togglePane": true;
+	"app.message.sendNow": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
@@ -61,7 +70,11 @@ declare module "@gajae-code/tui" {
 }
 
 export function defaultMessageQueueKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId {
-	return platform === "win32" ? "alt+q" : "alt+enter";
+	return platform === "win32" || platform === "darwin" ? "alt+q" : "alt+enter";
+}
+
+export function defaultClipboardPasteImageKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId {
+	return platform === "win32" ? "alt+v" : "ctrl+v";
 }
 
 /**
@@ -138,7 +151,7 @@ export const KEYBINDINGS = {
 		description: "Select queued message to edit",
 	},
 	"app.clipboard.pasteImage": {
-		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
+		defaultKeys: defaultClipboardPasteImageKeysForPlatform(),
 		description: "Paste image from clipboard",
 	},
 	"app.clipboard.copyLine": {
@@ -169,6 +182,10 @@ export const KEYBINDINGS = {
 		defaultKeys: "ctrl+s",
 		description: "Observe subagent sessions",
 	},
+	"app.session.dashboard": {
+		defaultKeys: [],
+		description: "Show all persisted sessions dashboard",
+	},
 
 	"app.jobs.open": {
 		defaultKeys: "alt+j",
@@ -188,11 +205,11 @@ export const KEYBINDINGS = {
 	},
 	"app.session.delete": {
 		defaultKeys: "ctrl+d",
-		description: "Delete session",
+		description: "Delete current session transcript/artifacts",
 	},
 	"app.session.deleteNoninvasive": {
 		defaultKeys: "ctrl+backspace",
-		description: "Delete session (non-invasive)",
+		description: "Delete selected session transcript/artifacts (non-invasive)",
 	},
 	"app.tree.foldOrUp": {
 		defaultKeys: ["ctrl+left", "alt+left"],
@@ -213,6 +230,38 @@ export const KEYBINDINGS = {
 	"app.stt.toggle": {
 		defaultKeys: "alt+h",
 		description: "Toggle speech-to-text",
+	},
+	"app.irc.sidebar.toggle": {
+		defaultKeys: "alt+i",
+		description: "Toggle IRC sidebar",
+	},
+	"app.transcript.browse": {
+		defaultKeys: [],
+		description: "Browse the transcript",
+	},
+	"app.transcript.prevTurn": {
+		defaultKeys: [],
+		description: "Jump to previous user turn",
+	},
+	"app.transcript.nextTurn": {
+		defaultKeys: [],
+		description: "Jump to next user turn",
+	},
+	"app.mode.cycle": {
+		defaultKeys: [],
+		description: "Cycle interaction mode",
+	},
+	"app.tasks.toggle": {
+		defaultKeys: "alt+t",
+		description: "Toggle tasks pane",
+	},
+	"app.queue.togglePane": {
+		defaultKeys: [],
+		description: "Toggle message queue pane",
+	},
+	"app.message.sendNow": {
+		defaultKeys: [],
+		description: "Send message immediately",
 	},
 } as const satisfies KeybindingDefinitions;
 
@@ -299,13 +348,14 @@ function toKeybindingsConfig(value: unknown): KeybindingsConfig {
 
 	const config: KeybindingsConfig = {};
 	for (const [key, val] of Object.entries(value)) {
-		if (val === undefined) {
-			config[key] = undefined;
-		} else if (typeof val === "string") {
-			config[key] = val as KeyId;
-		} else if (Array.isArray(val) && val.every(v => typeof v === "string")) {
-			config[key] = val as KeyId[];
+		if (!(key in KEYBINDINGS) && !isLegacyKeybindingName(key)) {
+			logger.info("Ignoring unknown keybinding entry", { key });
+			continue;
 		}
+		if (val === undefined) config[key] = undefined;
+		else if (typeof val === "string") config[key] = val as KeyId;
+		else if (Array.isArray(val) && val.every(v => typeof v === "string")) config[key] = val as KeyId[];
+		else logger.info("Ignoring malformed keybinding entry", { key });
 	}
 	return config;
 }
@@ -376,28 +426,27 @@ function loadRawConfig(filePath: string): unknown {
 	}
 }
 
-/**
- * Migrate keybindings config file from old format to new.
- * Reads from agentDir/keybindings.json, migrates old names, and writes back.
- */
+/** Migrate legacy keybindings once, preserving the original file as .bak. */
 function loadKeybindingsConfig(filePath: string, writeBack: boolean): KeybindingsConfig {
 	const rawConfig = loadRawConfig(filePath);
-
-	if (rawConfig === null) {
-		return {};
-	}
-
-	const { config: migratedConfig, migrated } = migrateKeybindingNames(rawConfig);
+	if (rawConfig === null) return {};
+	const markerPath = `${filePath}.migration-v1`;
+	const { config: migratedConfig, migrated } = existsSync(markerPath)
+		? { config: toKeybindingsConfig(rawConfig), migrated: false }
+		: migrateKeybindingNames(rawConfig);
 	if (writeBack && migrated) {
 		const ordered = orderKeybindingsConfig(migratedConfig);
+		const tempPath = `${filePath}.${process.pid}.tmp`;
 		try {
-			writeFileSync(filePath, `${JSON.stringify(ordered, null, 2)}\n`, "utf-8");
+			copyFileSync(filePath, `${filePath}.bak`);
+			writeFileSync(tempPath, `${JSON.stringify(ordered, null, 2)}\n`, "utf-8");
+			renameSync(tempPath, filePath);
+			writeFileSync(markerPath, "v1\n", "utf-8");
 			logger.debug("Migrated keybindings config", { path: filePath });
 		} catch (error) {
 			logger.warn("Failed to write migrated keybindings config", { path: filePath, error: String(error) });
 		}
 	}
-
 	return migratedConfig;
 }
 

@@ -1,5 +1,5 @@
 import type { Message, TextContent } from "@gajae-code/ai";
-import type { SessionContext } from "../session/session-manager";
+import { type SessionContext, transferSessionMessageIdentity } from "../session/session-manager";
 import { compileSecretRegex } from "./regex";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -281,7 +281,9 @@ export function deobfuscateSessionContext(
 ): SessionContext {
 	if (!obfuscator?.hasSecrets()) return sessionContext;
 	const messages = obfuscator.deobfuscateObject(sessionContext.messages);
-	return messages === sessionContext.messages ? sessionContext : { ...sessionContext, messages };
+	if (messages === sessionContext.messages) return sessionContext;
+	transferSessionMessageIdentity(sessionContext.messages, messages);
+	return { ...sessionContext, messages };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

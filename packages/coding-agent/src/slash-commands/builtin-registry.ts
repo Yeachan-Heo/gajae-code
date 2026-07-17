@@ -1,17 +1,18 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { ThinkingLevel } from "@gajae-code/agent-core";
+import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, modelsAreEqual } from "@gajae-code/ai";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
-import { Spacer, Text } from "@gajae-code/tui";
+import { PET_SKINS, type PetMode, Spacer, Text } from "@gajae-code/tui";
 import { setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
-import { materializeActiveModelProfileAssignment } from "../config/model-profile-activation";
+import { materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	type GjcModelAssignmentTargetId,
 } from "../config/model-registry";
+
 import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
@@ -22,7 +23,22 @@ import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../
 import { resolveMemoryBackend } from "../memory-backend";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { theme } from "../modes/theme/theme";
-import type { InteractiveModeContext } from "../modes/types";
+import {
+	type ComposerSubmissionOptions,
+	canApplyComposerSubmission,
+	type InteractiveModeContext,
+} from "../modes/types";
+import {
+	buildNotificationStatusReport,
+	checkNotificationHealth,
+	formatNotificationHealthReport,
+	formatNotificationRecoveryReport,
+	formatNotificationStatusReport,
+	formatNotificationTestResult,
+	recoverNotifications,
+	sendNotificationTest,
+} from "../sdk/bus/notification-service";
+import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
@@ -31,10 +47,11 @@ import {
 	parseProviderCompatibility,
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
+import { getDisplayChangelogEntries } from "../utils/changelog";
 import { buildContextReportText } from "./helpers/context-report";
 import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
-import { commandConsumed, errorMessage, parseSlashCommand, usage } from "./helpers/parse";
+import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
 import { handleSshAcp } from "./helpers/ssh";
 import { buildUsageReportText } from "./helpers/usage-report";
 import type {
@@ -49,7 +66,36 @@ import type {
 export type { BuiltinSlashCommand, SubcommandDef } from "./types";
 
 /** TUI-specific runtime accepted by `executeBuiltinSlashCommand`. */
-export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime;
+export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime & {
+	composer?: ComposerSubmissionOptions;
+};
+
+function canClearComposer(runtime: BuiltinSlashCommandRuntime): boolean {
+	return canApplyComposerSubmission(runtime.composer, runtime.ctx.editor);
+}
+
+const PET_COMMAND_OPTIONS: ReadonlyArray<{ name: string; mode: PetMode; description: string }> = [
+	{ name: "off", mode: "off", description: "Hide the pet" },
+	{ name: "RedGajae", mode: "red", description: PET_SKINS.red.description },
+	{ name: "BlueGajae", mode: "blue", description: PET_SKINS.blue.description },
+];
+const PET_COMMAND_HINT = `[${PET_COMMAND_OPTIONS.map(option => option.name).join("|")}]`;
+/**
+ * Deprecated inputs kept accepted for compatibility (`/pet on|red|blue`).
+ * Display, completion, and inline hints stay canonical (`PET_COMMAND_OPTIONS`).
+ */
+const PET_COMMAND_DEPRECATED_INPUTS: Readonly<Record<string, PetMode>> = {
+	on: "red",
+	red: "red",
+	blue: "blue",
+};
+
+type GjcModelBatchAssignmentTargetId = "all-role-agents" | "all-targets";
+type ParsedModelCommandArgs =
+	| { kind: "summary" }
+	| { kind: "assign"; targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId; selector: string };
+
+const GJC_MODEL_ROLE_AGENT_TARGET_IDS: GjcModelAssignmentTargetId[] = ["executor", "architect", "planner", "critic"];
 
 function fastStatusRoleTargets(): Array<{ id: GjcModelAssignmentTargetId; label: string; isSubagentRole: boolean }> {
 	return GJC_MODEL_ASSIGNMENT_TARGET_IDS.map(id => ({
@@ -57,6 +103,32 @@ function fastStatusRoleTargets(): Array<{ id: GjcModelAssignmentTargetId; label:
 		label: GJC_MODEL_ASSIGNMENT_TARGETS[id].tag ?? id.toUpperCase(),
 		isSubagentRole: GJC_MODEL_ASSIGNMENT_TARGETS[id].settingsPath === "task.agentModelOverrides",
 	}));
+}
+
+function toSlashCommandRuntime(runtime: TuiSlashCommandRuntime): SlashCommandRuntime {
+	const ctx = runtime.ctx;
+	return {
+		session: ctx.session,
+		sessionManager: ctx.sessionManager,
+		settings: ctx.settings,
+		cwd: ctx.sessionManager.getCwd(),
+		output: (text: string) => {
+			ctx.showStatus(text);
+		},
+		refreshCommands: () => ctx.refreshSlashCommandState(),
+		reloadPlugins: async () => {
+			const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
+			clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+			await ctx.refreshSlashCommandState();
+			await ctx.session.refreshSshTool({ activateIfAvailable: true });
+		},
+		notifyTitleChanged: () => {
+			ctx.statusLine.invalidate();
+			ctx.updateEditorBorderColor();
+			ctx.ui.requestRender();
+		},
+		notifyConfigChanged: () => ctx.notifyConfigChanged?.(),
+	};
 }
 
 function parseProviderSetupSlashArgs(args: string): {
@@ -146,22 +218,37 @@ function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
 	return lines.join("\n");
 }
 
-function parseModelCommandArgs(args: string): { targetId: GjcModelAssignmentTargetId; selector: string } {
+function parseModelCommandArgs(args: string): ParsedModelCommandArgs {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
 	const first = tokens[0]?.toLowerCase();
-	const explicitTarget = GJC_MODEL_ASSIGNMENT_TARGET_IDS.includes(first as GjcModelAssignmentTargetId)
-		? (first as GjcModelAssignmentTargetId)
-		: undefined;
+	if (first === "roles" || first === "assignments") return { kind: "summary" };
+
+	const parseTarget = (
+		token: string | undefined,
+	): GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId | undefined => {
+		const normalized = token?.toLowerCase();
+		if (GJC_MODEL_ASSIGNMENT_TARGET_IDS.includes(normalized as GjcModelAssignmentTargetId)) {
+			return normalized as GjcModelAssignmentTargetId;
+		}
+		if (normalized === "all-role-agents" || normalized === "all-targets") return normalized;
+		return undefined;
+	};
+
+	if (first === "assign") {
+		const targetId = parseTarget(tokens[1]);
+		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" ") };
+		return { kind: "assign", targetId: "default", selector: tokens.slice(1).join(" ") };
+	}
+
+	const explicitTarget = parseTarget(first);
 	if (explicitTarget) {
-		return { targetId: explicitTarget, selector: tokens.slice(1).join(" ") };
+		return { kind: "assign", targetId: explicitTarget, selector: tokens.slice(1).join(" ") };
 	}
 	if (first === "set") {
-		const second = tokens[1]?.toLowerCase();
-		if (GJC_MODEL_ASSIGNMENT_TARGET_IDS.includes(second as GjcModelAssignmentTargetId)) {
-			return { targetId: second as GjcModelAssignmentTargetId, selector: tokens.slice(2).join(" ") };
-		}
+		const targetId = parseTarget(tokens[1]);
+		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" ") };
 	}
-	return { targetId: "default", selector: args.trim() };
+	return { kind: "assign", targetId: "default", selector: args.trim() };
 }
 
 function splitExplicitThinkingSelector(selector: string): { baseSelector: string; thinkingLevel?: ThinkingLevel } {
@@ -296,21 +383,121 @@ async function resolveModelCommandSelection(
 	};
 }
 
+function getModelAssignmentTargetIds(
+	targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId,
+): GjcModelAssignmentTargetId[] {
+	if (targetId === "all-role-agents") return [...GJC_MODEL_ROLE_AGENT_TARGET_IDS];
+	if (targetId === "all-targets") return [...GJC_MODEL_ASSIGNMENT_TARGET_IDS];
+	return [targetId];
+}
+
+function formatModelAssignmentSuccess(
+	targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId,
+	selector: string,
+): string {
+	if (targetId === "all-role-agents") {
+		return `Role-agent models set to ${selector} for EXECUTOR, ARCHITECT, PLANNER, CRITIC.`;
+	}
+	if (targetId === "all-targets") {
+		return `All model targets set to ${selector} for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.`;
+	}
+	if (targetId === "default") return `Default model set to ${selector}.`;
+	return `${targetId} agent model set to ${selector}.`;
+}
+
 function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: string): string {
 	return [
 		currentModelLine,
 		formatModelAssignmentSummary(runtime),
-		"ACP/text mode: use /model <model> for DEFAULT, or /model <target> <model> for EXECUTOR, ARCHITECT, PLANNER, or CRITIC.",
+		"Use /model <model> for DEFAULT, or /model <target> <model[:effort]> for EXECUTOR, ARCHITECT, PLANNER, or CRITIC.",
 		formatModelOnboardingGuidance(),
 	]
 		.filter((line): line is string => Boolean(line))
 		.join("\n\n");
 }
 
+const EFFORT_COMMAND_INPUT_HINT = "[inherit|off|minimal|low|medium|high|xhigh|max]";
+const EFFORT_COMMAND_ACCEPTED_VALUES = ["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+function effortCommandUsage(prefix?: string): string {
+	return [prefix, `Usage: /effort ${EFFORT_COMMAND_INPUT_HINT}`]
+		.filter((line): line is string => Boolean(line))
+		.join("\n");
+}
+
+function formatEffortStatus(runtime: SlashCommandRuntime): string {
+	const current = runtime.session.thinkingLevel ?? ThinkingLevel.Off;
+	const configuredDefault = runtime.settings.get("defaultThinkingLevel");
+	const supported = runtime.session.getAvailableThinkingLevels();
+	return [
+		`Current effective effort: ${current}`,
+		`Configured default effort: ${configuredDefault}`,
+		`Accepted values: ${EFFORT_COMMAND_ACCEPTED_VALUES.join(", ")}`,
+		`Current-model supported levels: ${supported.length > 0 ? supported.join(", ") : "(none reported)"}`,
+	].join("\n");
+}
+
+async function handleEffortCommand(
+	command: ParsedSlashCommand,
+	runtime: SlashCommandRuntime,
+): Promise<SlashCommandResult> {
+	const tokens = command.args.trim().split(/\s+/).filter(Boolean);
+	if (tokens.length === 0) {
+		await runtime.output(formatEffortStatus(runtime));
+		return commandConsumed();
+	}
+	if (tokens.length !== 1) {
+		return usage(effortCommandUsage("Invalid effort input."), runtime);
+	}
+
+	const requestedToken = tokens[0];
+	const requestedLevel = parseThinkingLevel(requestedToken);
+	if (!requestedToken || !requestedLevel) {
+		return usage(effortCommandUsage(`Invalid effort: ${tokens[0] ?? ""}.`), runtime);
+	}
+
+	const levelToApply =
+		requestedLevel === ThinkingLevel.Inherit ? runtime.settings.get("defaultThinkingLevel") : requestedLevel;
+	runtime.session.setThinkingLevel(levelToApply, false);
+	const effectiveLevel = runtime.session.thinkingLevel ?? ThinkingLevel.Off;
+	const requestedLabel =
+		requestedLevel === ThinkingLevel.Inherit ? `${requestedLevel} (${levelToApply})` : requestedLevel;
+	const clampedSuffix =
+		effectiveLevel === levelToApply ? "" : ` Requested ${levelToApply}; effective ${effectiveLevel}.`;
+	await runtime.output(
+		`Reasoning effort set to ${requestedLabel}. Effective effort: ${effectiveLevel}.${clampedSuffix}`,
+	);
+	return commandConsumed();
+}
+
 function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.statusLine.invalidate();
 	ctx.updateEditorTopBorder();
 	ctx.ui.requestRender();
+}
+
+type ChangelogCommandArgs = { showFull: boolean } | { error: string };
+
+function parseChangelogCommandArgs(args: string): ChangelogCommandArgs {
+	const normalized = args.trim().toLowerCase();
+	if (!normalized) return { showFull: false };
+	if (normalized === "full" || normalized === "--full") return { showFull: true };
+	return { error: "Usage: /changelog [full|--full]" };
+}
+
+function buildChangelogCommandOutput(showFull: boolean): string {
+	const allEntries = getDisplayChangelogEntries();
+	const entriesToShow = showFull ? allEntries : allEntries.slice(0, 3);
+	const changelogMarkdown =
+		entriesToShow.length > 0
+			? [...entriesToShow]
+					.reverse()
+					.map(entry => entry.content)
+					.join("\n\n")
+			: "No changelog entries found.";
+	const title = showFull ? "Full Changelog" : "Recent Changes";
+	const hint = showFull ? "" : "\n\nUse `/changelog --full` to view the complete changelog.";
+	return `${title}\n\n${changelogMarkdown}${hint}`;
 }
 
 const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashCommandRuntime): SlashCommandResult => {
@@ -320,6 +507,66 @@ const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashComma
 };
 
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
+	{
+		name: "notify",
+		priority: 30,
+		description: "Notification status, health, test, recovery, and session on/off",
+		acpDescription: "Notification status, health, test, recovery, and session on/off",
+		subcommands: [
+			{ name: "on", description: "Enable notifications for this session" },
+			{ name: "off", description: "Disable notifications for this session" },
+			{ name: "status", description: "Show notification configuration (no secrets)" },
+			{ name: "health", description: "Config, daemon-ownership and endpoint health" },
+			{ name: "test", description: "Send a test notification", usage: "[message]" },
+			{ name: "recovery", description: "Clear dead-owner locks and stale endpoint files" },
+			{ name: "setup", description: "How to pair a Telegram bot (run in a terminal)" },
+		],
+		inlineHint: "[on|off|status|health|test|recovery|setup]",
+		acpInputHint: "[on|off|status|health|test|recovery|setup]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const { verb, rest } = parseSubcommand(command.args);
+			const action = verb || "status";
+			// `on`/`off` are session-local runtime controls owned by the
+			// notifications extension command (`api.registerCommand("notify")`),
+			// which holds the live per-session server/disable state. Pass them
+			// through untouched — never consume them — so this builtin cannot
+			// shadow that control. Everything below is config/service diagnostics
+			// the extension does not implement, so the builtin owns them exclusively
+			// (and the extension therefore never consumes them).
+			if (action === "on" || action === "off") {
+				return { prompt: command.text };
+			}
+			const stateRoot = path.join(runtime.cwd, ".gjc", "state");
+			switch (action) {
+				case "status":
+					await runtime.output(formatNotificationStatusReport(buildNotificationStatusReport(runtime.settings)));
+					return commandConsumed();
+				case "health": {
+					const report = await checkNotificationHealth({ settings: runtime.settings, stateRoot });
+					await runtime.output(formatNotificationHealthReport(report));
+					return commandConsumed();
+				}
+				case "test": {
+					const result = await sendNotificationTest({ settings: runtime.settings, text: rest || undefined });
+					await runtime.output(formatNotificationTestResult(result));
+					return commandConsumed();
+				}
+				case "recovery": {
+					const report = await recoverNotifications({ settings: runtime.settings, stateRoot });
+					await runtime.output(formatNotificationRecoveryReport(report));
+					return commandConsumed();
+				}
+				case "setup":
+					return usage(
+						"Run `gjc notify setup` in a terminal to pair a Telegram bot token with a private chat (interactive; requires a TTY).",
+						runtime,
+					);
+				default:
+					return usage(`Usage: /notify [on|off|status|health|test|recovery|setup] (got "${action}")`, runtime);
+			}
+		},
+	},
 	{
 		name: "settings",
 		priority: 40,
@@ -335,6 +582,36 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showThemeSelector();
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "pet",
+		description: "Gajae pet living beside the composer",
+		subcommands: PET_COMMAND_OPTIONS.map(option => ({ name: option.name, description: option.description })),
+		inlineHint: PET_COMMAND_HINT,
+		allowArgs: true,
+		handleTui: (command, runtime) => {
+			const ctx = runtime.ctx;
+			const raw = command.args?.trim().toLowerCase() ?? "";
+			const arg =
+				PET_COMMAND_OPTIONS.find(option => option.name.toLowerCase() === raw)?.mode ??
+				PET_COMMAND_DEPRECATED_INPUTS[raw];
+			if (!raw) {
+				ctx.showPetSelector();
+				ctx.editor.setText("");
+				return;
+			}
+			if (arg) {
+				// The shared commit policy rechecks capability, persists only on
+				// acceptance, and surfaces the actionable warning on rejection.
+				if (ctx.setPetMode(arg)) {
+					const name = arg === "off" ? "Gajae pet hidden" : `${PET_SKINS[arg].label} is here`;
+					ctx.showStatus(name);
+				}
+			} else {
+				ctx.showStatus(`Usage: /pet ${PET_COMMAND_HINT}`, { dim: true });
+			}
+			ctx.editor.setText("");
 		},
 	},
 	{
@@ -372,9 +649,16 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		acpDescription: "Show current model selection",
 		inlineHint: "[target] <model>",
 		acpInputHint: "[target] <model>",
+		allowArgs: true,
 		handle: async (command, runtime) => {
 			if (command.args) {
 				const parsedArgs = parseModelCommandArgs(command.args);
+				if (parsedArgs.kind === "summary") {
+					await runtime.output(formatModelAssignmentSummary(runtime));
+					return commandConsumed();
+				}
+
+				const targetIds = getModelAssignmentTargetIds(parsedArgs.targetId);
 				const modelId = parsedArgs.selector;
 				if (!modelId) {
 					return usage(
@@ -388,24 +672,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				}
 				const { selection } = resolution;
 				try {
-					const persistedSelector = formatModelSelectorValue(selection.selector, selection.thinkingLevel);
-					if (parsedArgs.targetId === "default") {
-						await runtime.session.setModel(selection.model, "default", {
-							selector: selection.selector,
-							thinkingLevel: selection.thinkingLevel,
-						});
-						materializeActiveModelProfileAssignment({
-							session: runtime.session,
-							settings: runtime.settings,
-							role: parsedArgs.targetId,
-							selector: persistedSelector,
-						});
-						if (selection.thinkingLevel) {
-							runtime.session.setThinkingLevel(selection.thinkingLevel);
-						}
-						await runtime.output(`Default model set to ${persistedSelector}.`);
-						await runtime.notifyTitleChanged?.();
-					} else {
+					const includesDefault = targetIds.includes("default");
+					const includesRoleAgent = targetIds.some(role => role !== "default");
+					if (includesRoleAgent) {
 						const apiKey = await runtime.session.modelRegistry.getApiKey(
 							selection.model,
 							runtime.session.sessionId,
@@ -413,31 +682,61 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						if (!apiKey) {
 							throw new Error(`No API key for ${selection.model.provider}/${selection.model.id}`);
 						}
-						const overrides = runtime.settings.get("task.agentModelOverrides");
+					}
+
+					const overrides = runtime.settings.get("task.agentModelOverrides");
+					const assignments = new Map<GjcModelAssignmentTargetId, string>();
+					const existingDefaultThinkingLevel =
+						selection.thinkingLevel !== undefined
+							? selection.thinkingLevel
+							: runtime.session.getActiveModelProfile?.()
+								? undefined
+								: extractExplicitThinkingSelector(runtime.settings.getModelRole("default"), runtime.settings);
+					const persistedSelector = formatModelSelectorValue(selection.selector, existingDefaultThinkingLevel);
+					for (const targetId of targetIds) {
+						if (targetId === "default") {
+							assignments.set(targetId, persistedSelector);
+							continue;
+						}
 						const thinkingLevel =
-							selection.thinkingLevel ??
-							extractExplicitThinkingSelector(overrides[parsedArgs.targetId], runtime.settings);
-						const roleSelector = formatModelSelectorValue(selection.selector, thinkingLevel);
-						const materializedProfile = materializeActiveModelProfileAssignment({
-							session: runtime.session,
-							settings: runtime.settings,
-							role: parsedArgs.targetId,
-							selector: roleSelector,
+							selection.thinkingLevel ?? extractExplicitThinkingSelector(overrides[targetId], runtime.settings);
+						assignments.set(targetId, formatModelSelectorValue(selection.selector, thinkingLevel));
+					}
+
+					if (includesDefault) {
+						await runtime.session.setModel(selection.model, "default", {
+							selector: selection.selector,
+							thinkingLevel: existingDefaultThinkingLevel,
+							cause: "user-selection",
 						});
-						if (!materializedProfile) {
-							const target = GJC_MODEL_ASSIGNMENT_TARGETS[parsedArgs.targetId];
+						if (existingDefaultThinkingLevel) {
+							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
+						}
+					}
+
+					const materializedProfile = materializeActiveModelProfileAssignments({
+						session: runtime.session,
+						settings: runtime.settings,
+						assignments,
+					});
+					if (!materializedProfile) {
+						for (const [targetId, selector] of assignments) {
+							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
 							if (target.settingsPath === "modelRoles") {
-								runtime.settings.setModelRole(parsedArgs.targetId, roleSelector);
+								runtime.settings.setModelRole(targetId, selector);
 							} else {
-								runtime.settings.set("task.agentModelOverrides", {
-									...overrides,
-									[parsedArgs.targetId]: roleSelector,
-								});
+								runtime.settings.setAgentModelOverride(targetId, selector);
 							}
 						}
-						runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
-						await runtime.output(`${parsedArgs.targetId} agent model set to ${roleSelector}.`);
 					}
+					runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
+					await runtime.output(
+						formatModelAssignmentSuccess(
+							parsedArgs.targetId,
+							assignments.get(targetIds[0] ?? "default") ?? persistedSelector,
+						),
+					);
+					if (includesDefault) await runtime.notifyTitleChanged?.();
 					await runtime.notifyConfigChanged?.();
 					return commandConsumed();
 				} catch (err) {
@@ -454,8 +753,42 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			);
 			return commandConsumed();
 		},
-		handleTui: (_command, runtime) => {
+		handleTui: async (command, runtime) => {
+			if (command.args.trim()) {
+				const result = await BUILTIN_SLASH_COMMAND_LOOKUP.get(command.name)?.handle?.(
+					command,
+					toSlashCommandRuntime(runtime),
+				);
+				runtime.ctx.statusLine.invalidate();
+				runtime.ctx.updateEditorBorderColor();
+				runtime.ctx.editor.setText("");
+				runtime.ctx.ui.requestRender();
+				return result;
+			}
 			runtime.ctx.showModelSelector();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "effort",
+		description: "Show or set model reasoning effort",
+		acpDescription: "Show or set model reasoning effort",
+		inlineHint: EFFORT_COMMAND_INPUT_HINT,
+		acpInputHint: EFFORT_COMMAND_INPUT_HINT,
+		allowArgs: true,
+		handle: handleEffortCommand,
+		handleTui: async (command, runtime) => {
+			if (command.args.trim()) {
+				const result = await handleEffortCommand(command, toSlashCommandRuntime(runtime));
+				runtime.ctx.statusLine.invalidate();
+				runtime.ctx.updateEditorBorderColor();
+				runtime.ctx.updateEditorTopBorder();
+				runtime.ctx.editor.setText("");
+				runtime.ctx.ui.requestRender();
+				return result;
+			}
+
+			runtime.ctx.showEffortSelector();
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -605,23 +938,52 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "session",
 		priority: 88,
-		description: "Show current session info or delete current session",
+		description: "Show session info or delete the current session transcript/artifacts",
 		acpDescription: "Show session information",
 		acpInputHint: "info|delete",
 		subcommands: [
 			{ name: "info", description: "Show current session id, title, and workspace" },
-			{ name: "delete", description: "Delete current session and return to selector" },
+			{ name: "delete", description: "Delete current session transcript and artifacts" },
 		],
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			if (!command.args || command.args === "info") {
-				await runtime.output(
-					[
-						`Session: ${runtime.session.sessionId}`,
-						`Title: ${runtime.session.sessionName}`,
-						`CWD: ${runtime.cwd}`,
-					].join("\n"),
-				);
+				const stats = runtime.session.getSessionStats();
+				const lines = [
+					`Session: ${runtime.session.sessionId}`,
+					`Title: ${runtime.session.sessionName}`,
+					`CWD: ${runtime.cwd}`,
+					"",
+					"Tokens",
+					`Input: ${stats.tokens.input.toLocaleString()}`,
+					`Output: ${stats.tokens.output.toLocaleString()}`,
+				];
+				if (stats.tokens.cacheRead > 0) {
+					lines.push(`Cache Read: ${stats.tokens.cacheRead.toLocaleString()}`);
+				}
+				if (stats.tokens.cacheWrite > 0) {
+					lines.push(`Cache Write: ${stats.tokens.cacheWrite.toLocaleString()}`);
+				}
+				lines.push(`Total: ${stats.tokens.total.toLocaleString()}`);
+				if (stats.cost > 0 || stats.premiumRequests > 0) {
+					lines.push("", "Cost");
+					if (stats.cost > 0) {
+						lines.push(`Total: ${stats.cost.toFixed(4)}`);
+					}
+					if (stats.premiumRequests > 0) {
+						lines.push(`Premium Requests: ${stats.premiumRequests.toLocaleString()}`);
+					}
+				}
+				const cacheMissSummary = stats.costBreakdown
+					? computeCacheMissCostSummary(stats.tokens, {
+							kind: "persisted-aggregate",
+							costBreakdown: stats.costBreakdown,
+						})
+					: undefined;
+				if (cacheMissSummary) {
+					lines.push("", "Cache Miss Cost", ...formatCacheMissSummaryLines(cacheMissSummary));
+				}
+				await runtime.output(lines.join("\n"));
 				return commandConsumed();
 			}
 			if (command.args === "delete") {
@@ -639,7 +1001,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					return usage(`Failed to delete session: ${errorMessage(err)}`, runtime);
 				}
 				await runtime.output(
-					`Session deleted: ${sessionFile}. Use ACP \`session/load\` to switch to another session.`,
+					[
+						`Deleted current session transcript and artifacts: ${sessionFile}`,
+						"Other sessions and topic/history metadata were not deleted.",
+					].join("\n"),
 				);
 				return commandConsumed();
 			}
@@ -694,6 +1059,20 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "transcript",
+		description: "Browse the current session transcript",
+		acpDescription: "Browse the current session transcript",
+		handle: async (_command, runtime) => {
+			await runtime.output("Transcript browsing is available in the interactive TUI.");
+			return commandConsumed();
+		},
+		handleTui: (_command, runtime) => {
+			if (runtime.ctx.isTranscriptViewerOpen()) return;
+			runtime.ctx.showTranscriptViewer();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "context",
 		description: "Show active context token usage breakdown",
 		acpDescription: "Show active context token usage breakdown",
@@ -716,6 +1095,29 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: async (_command, runtime) => {
 			await runtime.ctx.handleUsageCommand();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "changelog",
+		description: "Show release notes and changelog entries",
+		inlineHint: "[full|--full]",
+		subcommands: [{ name: "full", description: "Show complete changelog" }],
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const parsed = parseChangelogCommandArgs(command.args);
+			if ("error" in parsed) return usage(parsed.error, runtime);
+			await runtime.output(buildChangelogCommandOutput(parsed.showFull));
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			const parsed = parseChangelogCommandArgs(command.args);
+			if ("error" in parsed) {
+				runtime.ctx.showError(parsed.error);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			await runtime.ctx.handleChangelogCommand(parsed.showFull);
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -792,8 +1194,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			if (args === "login" || args.startsWith("login ")) {
+				const providerId = args.slice("login".length).trim();
+				const loginCommand = providerId ? `/login ${providerId}` : "/login [provider-id]";
 				await runtime.output(
-					"Use the terminal UI /login selector for browser, device-code, or manual callback provider login.",
+					`Open the terminal UI and run ${loginCommand} for OAuth/subscription account login. Paste callbacks with /login <redirect URL or code>.`,
 				);
 				return commandConsumed();
 			}
@@ -967,6 +1371,22 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "clear",
+		priority: 97,
+		description: "Clear context while preserving this session ID",
+		acpDescription: "Clear context while preserving this session ID",
+		handle: async (_command, runtime) => {
+			const beforeSessionId = runtime.session.sessionId;
+			await runtime.session.clearContext();
+			await runtime.output(`Context cleared. Session preserved: ${beforeSessionId}`);
+			return commandConsumed();
+		},
+		handleTui: async (_command, runtime) => {
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleContextClearCommand();
+		},
+	},
+	{
 		name: "new",
 		priority: 96,
 		description: "Start a new session",
@@ -1047,6 +1467,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		description: "Resume a previous session",
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showSessionSelector();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "sessions",
+		priority: 91,
+		description: "Show all persisted sessions (read-only)",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.showSessionsDashboard();
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -1226,6 +1655,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "exit",
+		aliases: ["quit"],
 		description: "Exit the application",
 		handleTui: shutdownHandlerTui,
 	},
@@ -1291,7 +1721,9 @@ export async function executeBuiltinSlashCommand(
 		const diagnostic = formatUnknownBuiltinSlashCommandDiagnostic(parsed.name);
 		if (!diagnostic) return false;
 		runtime.ctx.showError(diagnostic);
-		runtime.ctx.editor.setText("");
+		if (canClearComposer(runtime)) {
+			runtime.ctx.editor.setText("");
+		}
 		return true;
 	}
 	if (parsed.args.length > 0 && !command.allowArgs) {
@@ -1303,31 +1735,12 @@ export async function executeBuiltinSlashCommand(
 		return true;
 	}
 	if (command.handle) {
-		// No TUI-specific override → adapt the ACP/text-mode `handle` to the
-		// TUI by routing `runtime.output` through `ctx.showStatus`, clearing
-		// the editor after the call, and reusing the active session's plugin
-		// reload pipeline. Spec authors get a single body usable from either
-		// dispatcher without forcing every TUI test to construct the full
-		// `SlashCommandRuntime` shape.
 		const ctx = runtime.ctx;
-		const adapted: SlashCommandRuntime = {
-			session: ctx.session,
-			sessionManager: ctx.sessionManager,
-			settings: ctx.settings,
-			cwd: ctx.sessionManager.getCwd(),
-			output: (text: string) => {
-				ctx.showStatus(text);
-			},
-			refreshCommands: () => ctx.refreshSlashCommandState(),
-			reloadPlugins: async () => {
-				const projectPath = await resolveActiveProjectRegistryPath(ctx.sessionManager.getCwd());
-				clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
-				await ctx.refreshSlashCommandState();
-				await ctx.session.refreshSshTool({ activateIfAvailable: true });
-			},
-		};
+		const adapted = toSlashCommandRuntime(runtime);
 		const result = await command.handle(parsed, adapted);
-		ctx.editor.setText("");
+		if (canClearComposer(runtime)) {
+			ctx.editor.setText("");
+		}
 		if (result && typeof result === "object" && "prompt" in result) return result.prompt;
 		return true;
 	}

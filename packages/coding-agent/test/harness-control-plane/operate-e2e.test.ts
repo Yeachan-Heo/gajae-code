@@ -6,15 +6,15 @@ import * as path from "node:path";
 import type { FinalizeChecks } from "../../src/harness-control-plane/finalize";
 import { operate } from "../../src/harness-control-plane/operate";
 import type { VanishEvidence } from "../../src/harness-control-plane/receipts";
-import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
+import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
 import { nextAllowedActions } from "../../src/harness-control-plane/state-machine";
 import { appendEvent, readEvents, readReceiptIndex } from "../../src/harness-control-plane/storage";
 import type { EventEnvelope, HarnessLifecycle, Observation, Severity } from "../../src/harness-control-plane/types";
 
-class FakeRpc implements HarnessRpc {
+class FakeTransport implements HarnessSessionTransport {
 	cursor = 0;
-	state: RpcStateSnapshot = { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 };
-	async getState(): Promise<RpcStateSnapshot> {
+	state: SessionStateSnapshot = { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 };
+	async getState(): Promise<SessionStateSnapshot> {
 		return this.state;
 	}
 	eventCursor(): number {
@@ -76,8 +76,8 @@ function baseOpts(observer: () => Promise<Observation>) {
 		sessionId: SID,
 		workspace: "/ws",
 		branch: "feat/x",
-		rpc: new FakeRpc(),
-		rpcFactory: () => new FakeRpc(),
+		transport: new FakeTransport(),
+		transportFactory: () => new FakeTransport(),
 		observe: observer,
 		preserve: (_ws: string) => ({
 			gitDelta: "dirty" as const,

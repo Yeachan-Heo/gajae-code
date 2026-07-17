@@ -40,13 +40,22 @@ describe("createAgentSession wires getAskAnswerSource into built-in AskTool", ()
 			settings: Settings.isolated(),
 			hasUI: true,
 		});
+		session.setWorkflowGateEmitter(undefined);
 
 		try {
 			const order: string[] = [];
 			registerAskAnswerSource(session.sessionId, {
-				awaitAnswer: () => {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: async () => {
 					order.push("remote");
-					return new Promise<string | undefined>(() => {});
+					return {
+						source: "remote" as const,
+						interaction: { kind: "value" as const, value: "yes" },
+						settle: async settlement =>
+							settlement.kind === "commit"
+								? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 1 } }
+								: { kind: "resolved_without_commit" as const },
+					};
 				},
 			});
 

@@ -27,6 +27,10 @@ function formatFileList(files: string[]): string {
 	return files.length === 0 ? "(none)" : files.join(", ");
 }
 
+function isBenchmarkRuntimeFile(file: string): boolean {
+	return /^\.gjc\/_session-[^/]+\//.test(file.split(path.sep).join("/"));
+}
+
 function createCompactDiff(expected: string, actual: string, contextLines = 3): string {
 	const changes = diffLines(expected, actual);
 	const output: string[] = [];
@@ -91,7 +95,7 @@ export async function verifyExpectedFileSubset(
 	try {
 		const expectedFixtureFiles = await listFiles(expectedDir);
 		const expectedFiles = files?.length ? files.slice().sort() : expectedFixtureFiles;
-		const actualFiles = await listFiles(actualDir);
+		const actualFiles = (await listFiles(actualDir)).filter(file => !isBenchmarkRuntimeFile(file));
 
 		const missingFiles = expectedFiles.filter(file => !actualFiles.includes(file));
 		const extraFiles = actualFiles.filter(file => !expectedFiles.includes(file));

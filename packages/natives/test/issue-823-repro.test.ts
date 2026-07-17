@@ -31,9 +31,14 @@ import {
 	detectCompiledBinary,
 	getAddonFilenames,
 	getOptionalPackageNames,
+	loadFromCandidates,
 	resolveLoaderCandidates,
 	resolveOptionalPackageNativeDirs,
 } from "../native/loader-state.js";
+
+function validateCurrentSentinel(bindings: Record<string, unknown>) {
+	if (typeof bindings.__piNativesVCurrent !== "function") throw new Error("missing current version sentinel");
+}
 
 describe("issue 823: standalone-binary native loader path resolution", () => {
 	it("detects compiled-binary mode from embedded-addon presence when env and url markers are absent", () => {
@@ -175,5 +180,147 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 
 		expect(dirs).toEqual(["/repo/node_modules/@gajae-code/natives-darwin-arm64/native"]);
 		expect(getOptionalPackageNames("freebsd-x64")).toEqual([]);
+	});
+	it("prefers the current workspace addon over a stale optional package addon", () => {
+		const localDir = "/repo/packages/natives/native";
+		const optionalDir = "/repo/node_modules/@gajae-code/natives-linux-x64/native";
+		const filename = "pi_natives.linux-x64-modern.node";
+		const local = path.join(localDir, filename);
+		const optional = path.join(optionalDir, filename);
+		const candidates = resolveLoaderCandidates({
+			addonFilenames: [filename],
+			isCompiledBinary: false,
+			isWorkspaceLoad: true,
+			optionalPackageNativeDirs: [optionalDir],
+			nativeDir: localDir,
+			execDir: "/usr/bin",
+			versionedDir: "/home/u/.gjc/natives/14.5.2",
+			userDataDir: "/home/u/.local/bin",
+		});
+		const loaded = loadFromCandidates({
+			candidates,
+			requireCandidate: candidate =>
+				candidate === local ? { __piNativesVCurrent: () => undefined } : { __piNativesVStale: () => undefined },
+			validateCandidate: validateCurrentSentinel,
+			describeCandidate: candidate => candidate,
+		});
+
+		expect(candidates.indexOf(local)).toBeLessThan(candidates.indexOf(optional));
+		expect(loaded.bindings).toEqual({ __piNativesVCurrent: expect.any(Function) });
+		expect(loaded.errors).toEqual([]);
+	});
+
+	it("keeps workspace precedence when local and optional addons have the same sentinel", () => {
+		const local = "/repo/packages/natives/native/pi_natives.linux-x64.node";
+		const optional = "/repo/node_modules/@gajae-code/natives-linux-x64/native/pi_natives.linux-x64.node";
+		const attempted: string[] = [];
+		const loaded = loadFromCandidates({
+			candidates: [local, optional],
+			requireCandidate: candidate => {
+				attempted.push(candidate);
+				return { __piNativesVCurrent: () => undefined };
+			},
+			validateCandidate: validateCurrentSentinel,
+			describeCandidate: candidate => candidate,
+		});
+
+		expect(loaded.bindings).toEqual({ __piNativesVCurrent: expect.any(Function) });
+		expect(attempted).toEqual([local]);
+	});
+
+	it("continues from a stale optional addon to a current local addon", () => {
+		const optional = "/repo/node_modules/@gajae-code/natives-linux-x64/native/pi_natives.linux-x64.node";
+		const local = "/repo/packages/natives/native/pi_natives.linux-x64.node";
+		const loaded = loadFromCandidates({
+			candidates: [optional, local],
+			requireCandidate: candidate =>
+				candidate === local ? { __piNativesVCurrent: () => undefined } : { __piNativesVStale: () => undefined },
+			validateCandidate: validateCurrentSentinel,
+			describeCandidate: candidate => candidate,
+		});
+
+		expect(loaded.bindings).toEqual({ __piNativesVCurrent: expect.any(Function) });
+		expect(loaded.errors).toEqual([`${optional}: missing current version sentinel`]);
+	});
+
+	it("falls back to a matching optional addon when no local addon is available", () => {
+		const local = "/repo/packages/natives/native/pi_natives.linux-x64.node";
+		const optional = "/repo/node_modules/@gajae-code/natives-linux-x64/native/pi_natives.linux-x64.node";
+		const loaded = loadFromCandidates({
+			candidates: [local, optional],
+			requireCandidate: candidate => {
+				if (candidate === optional) return { __piNativesVCurrent: () => undefined };
+				throw new Error("not found");
+			},
+			validateCandidate: validateCurrentSentinel,
+			describeCandidate: candidate => candidate,
+		});
+
+		expect(loaded.bindings).toEqual({ __piNativesVCurrent: expect.any(Function) });
+		expect(loaded.errors).toEqual([`${local}: not found`]);
+	});
+
+	it("loads a matching optional addon", () => {
+		const optional = "/repo/node_modules/@gajae-code/natives-linux-x64/native/pi_natives.linux-x64.node";
+		const loaded = loadFromCandidates({
+			candidates: [optional],
+			requireCandidate: () => ({ __piNativesVCurrent: () => undefined }),
+			validateCandidate: validateCurrentSentinel,
+			describeCandidate: candidate => candidate,
+		});
+
+		expect(loaded.bindings).toEqual({ __piNativesVCurrent: expect.any(Function) });
+		expect(loaded.errors).toEqual([]);
+	});
+
+	it("aggregates diagnostics when every candidate has an incompatible sentinel", () => {
+		const staleOptional = "/repo/node_modules/@gajae-code/natives-linux-x64/native/pi_natives.linux-x64.node";
+		const staleLegacy = "/usr/bin/pi_natives.linux-x64.node";
+		const loaded = loadFromCandidates({
+			candidates: [staleOptional, staleLegacy],
+			requireCandidate: () => ({ __piNativesVStale: () => undefined }),
+			validateCandidate: validateCurrentSentinel,
+			describeCandidate: candidate => candidate,
+		});
+
+		expect(loaded.bindings).toBeNull();
+		expect(loaded.errors).toEqual([
+			`${staleOptional}: missing current version sentinel`,
+			`${staleLegacy}: missing current version sentinel`,
+		]);
+	});
+
+	it("continues from an incompatible modern addon to a current baseline addon", () => {
+		const modern = "/repo/packages/natives/native/pi_natives.linux-x64-modern.node";
+		const baseline = "/repo/packages/natives/native/pi_natives.linux-x64-baseline.node";
+		const loaded = loadFromCandidates({
+			candidates: [modern, baseline],
+			requireCandidate: candidate =>
+				candidate === baseline ? { __piNativesVCurrent: () => undefined } : { __piNativesVStale: () => undefined },
+			validateCandidate: validateCurrentSentinel,
+			describeCandidate: candidate => candidate,
+		});
+
+		expect(loaded.bindings).toEqual({ __piNativesVCurrent: expect.any(Function) });
+		expect(loaded.errors).toEqual([`${modern}: missing current version sentinel`]);
+	});
+
+	it("preserves Windows staging ahead of package candidates", () => {
+		const filename = "pi_natives.win32-x64-baseline.node";
+		const versionedDir = "C:\\Users\\u\\AppData\\Local\\gjc\\14.5.2";
+		const optionalDir = "C:\\repo\\node_modules\\@gajae-code\\natives-win32-x64\\native";
+		const candidates = resolveLoaderCandidates({
+			addonFilenames: [filename],
+			isCompiledBinary: false,
+			stageFromNodeModules: true,
+			optionalPackageNativeDirs: [optionalDir],
+			nativeDir: "C:\\repo\\node_modules\\@gajae-code\\natives\\native",
+			execDir: "C:\\gjc",
+			versionedDir,
+			userDataDir: "C:\\Users\\u\\AppData\\Local\\gjc",
+		});
+
+		expect(candidates[0]).toBe(path.join(versionedDir, filename));
+		expect(candidates.indexOf(path.join(optionalDir, filename))).toBeGreaterThan(0);
 	});
 });

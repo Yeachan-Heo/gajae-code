@@ -105,6 +105,24 @@ const modelSegment: StatusLineSegment = {
 				}
 			}
 		}
+		// Show the context-window token percentage right next to the model /
+		// reasoning effort (rather than as a trailing segment) so it stays
+		// grouped with the model it describes. Disable per-preset with
+		// `segmentOptions.model.showContextPercent: false`. Suppressed
+		// automatically when a standalone context_pct segment is also in the
+		// active layout, so the value is never shown twice.
+		if (opts.showContextPercent !== false && ctx.contextPctSegmentActive !== true) {
+			const pct = ctx.contextPercent;
+			const window = ctx.contextWindow;
+			if (window > 0) {
+				if (typeof pct === "number" && Number.isFinite(pct)) {
+					const color = getContextUsageThemeColor(getContextUsageLevel(pct, window));
+					content += `${theme.sep.dot}${theme.fg(color, `${pct.toFixed(1)}%`)}`;
+				} else {
+					content += `${theme.sep.dot}${theme.fg("statusLineContext", "?")}`;
+				}
+			}
+		}
 
 		return { content: theme.fg("statusLineModel", content), visible: true };
 	},
@@ -368,11 +386,14 @@ const contextPctSegment: StatusLineSegment = {
 	render(ctx) {
 		const pct = ctx.contextPercent;
 		const window = ctx.contextWindow;
+		const knownPct = typeof pct === "number" && Number.isFinite(pct) ? pct : undefined;
 
 		const autoIcon = ctx.autoCompactEnabled && theme.icon.auto ? ` ${theme.icon.auto}` : "";
-		const text = `${pct.toFixed(1)}%/${formatNumber(window)}${autoIcon}`;
-
-		const color = getContextUsageThemeColor(getContextUsageLevel(pct, window));
+		const text = `${knownPct === undefined ? "?" : `${knownPct.toFixed(1)}%`}/${formatNumber(window)}${autoIcon}`;
+		const color =
+			knownPct === undefined
+				? "statusLineContext"
+				: getContextUsageThemeColor(getContextUsageLevel(knownPct, window));
 		const content = withIcon(theme.icon.context, theme.fg(color, text));
 
 		return { content, visible: true };

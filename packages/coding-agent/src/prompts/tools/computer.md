@@ -6,7 +6,7 @@
 
 - Disabled means disabled: when the tool is disabled (`computer.alwaysOn=false` with `computer.enabled` unset/false) or the platform is unsupported, every action including `screenshot` fails with `COMPUTER_DISABLED` and captures nothing.
 - Callable only on Apple Silicon macOS (`arm64` darwin); available by default there, with `computer.alwaysOn=false` as the off-switch and `computer.enabled=true` as the manual enable path.
-- Native execution remains supervisor-gated. If the stop/suspend supervisor is unavailable, stale, suspended, permissioned off, display-stale, or cancelled, the action fails closed with a `COMPUTER_*` code.
+- Native execution remains supervisor-gated. If the stop/suspend supervisor is unavailable, stale, suspended, permissioned off, display-stale, or cancelled, the action fails closed with a `COMPUTER_*` code. Coordinate actions carry the latest known screenshot display epoch when one is available so display-topology changes fail with `COMPUTER_DISPLAY_STALE`.
 - Respect the user's stop/suspend request immediately. Do not loop desktop actions after a stop/suspend/error.
 - The user can stop or suspend the session at any time with the configured kill-switch hotkey (default `Control+Option+Command+Escape`). If you see `COMPUTER_CANCELLED` or `COMPUTER_SUPERVISOR_NOT_LIVE`, stop and wait for the user.
 
@@ -14,7 +14,7 @@
 
 Coordinates are screenshot pixels, not CSS pixels and not normalized fractions. Use the latest successful `screenshot` dimensions and origin/scale metadata as the coordinate frame. Do not guess coordinates outside the screenshot bounds.
 
-When you send a sequence of actions in one `batch` call, pointer coordinates in later steps are validated against the most recent screenshot from that batch. If a coordinate is out of bounds, the batch stops and reports `COMPUTER_COORD_INVALID`. Always capture a fresh screenshot before acting if the display may have changed.
+For stale-display protection to apply, derive pointer coordinates from a successful screenshot in the same tool session; a screenshot-first `batch` is preferred because later coordinate steps are validated against that screenshot and carry its display epoch into native execution. If a coordinate is out of bounds, the batch stops and reports `COMPUTER_COORD_INVALID`. Always capture a fresh screenshot before acting if the display may have changed.
 
 ## Actions
 

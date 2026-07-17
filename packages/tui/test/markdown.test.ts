@@ -27,6 +27,14 @@ describe("renderInlineMarkdown", () => {
 
 		expect(plain).toBe("1. Review against a base branch (PR Style)");
 	});
+	it("omits HTML comments from inline markdown", () => {
+		const rendered = renderInlineMarkdown("alpha<!-- -->beta", defaultMarkdownTheme);
+		const plain = rendered.replace(/\x1b\[[0-9;]*m/g, "");
+
+		expect(plain).toBe("alphabeta");
+		const commentOnly = renderInlineMarkdown("<!-- -->", defaultMarkdownTheme).replace(/\x1b\[[0-9;]*m/g, "");
+		expect(commentOnly).toBe("");
+	});
 
 	it("returns empty string for undefined input (streaming guard)", () => {
 		// During streaming, partial JSON can leave option label fields as undefined.
@@ -1150,6 +1158,40 @@ bar`,
 				joinedPlain.includes("hidden content") || joinedPlain.includes("<thinking>"),
 				"Should render HTML-like tags or their content as text, not hide them",
 			).toBeTruthy();
+		});
+
+		it("should omit HTML comments while preserving non-comment HTML-like text", () => {
+			const markdown = new Markdown(
+				"Before\n\n<!-- react text separator -->\n\nAfter <thinking>visible</thinking><!-- -->tail",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const lines = markdown.render(80);
+			const plainLines = lines.map(stripTerminalSequences);
+			const joinedPlain = plainLines.join(" ");
+
+			expect(joinedPlain).not.toContain("<!--");
+			expect(joinedPlain).not.toContain("-->");
+			expect(joinedPlain).toContain("Before");
+			expect(joinedPlain).toContain("After");
+			expect(joinedPlain).toContain("visible");
+			expect(joinedPlain).toContain("tail");
+			expect(joinedPlain).toContain("<thinking>");
+			expect(joinedPlain).toContain("</thinking>");
+
+			const mixedMarkdown = new Markdown(
+				"<!-- leading --> <div>html stays visible</div>",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+			const mixedPlain = mixedMarkdown.render(80).map(stripTerminalSequences).join(" ");
+
+			expect(mixedPlain).not.toContain("<!--");
+			expect(mixedPlain).not.toContain("-->");
+			expect(mixedPlain).toContain("<div>html stays visible</div>");
 		});
 
 		it("should render HTML tags in code blocks correctly", () => {

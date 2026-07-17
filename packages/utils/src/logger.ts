@@ -11,8 +11,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
-import winston from "winston";
-import DailyRotateFile from "winston-daily-rotate-file";
+import type * as winston from "winston";
 import { getLogsDir } from "./dirs";
 
 /** Ensure a logs directory exists; return the resolved path. */
@@ -23,28 +22,59 @@ function ensureDir(dir: string): string {
 	return dir;
 }
 
-/** Custom format that includes pid and flattens metadata */
-const logFormat = winston.format.combine(
-	winston.format.timestamp({ format: "YYYY-MM-DDTHH:mm:ss.SSSZ" }),
-	winston.format.printf(({ timestamp, level, message, ...meta }) => {
-		const entry: Record<string, unknown> = {
-			timestamp,
-			level,
-			pid: process.pid,
-			message,
-		};
-		// Flatten metadata into entry
-		for (const [key, value] of Object.entries(meta)) {
-			if (key !== "level" && key !== "timestamp" && key !== "message") {
-				entry[key] = value;
+type WinstonModule = typeof import("winston");
+type DailyRotateFileCtor = typeof import("winston-daily-rotate-file");
+type Logger = winston.Logger;
+type Transport = winston.transport;
+type LogLevel = "error" | "warn" | "info" | "debug";
+type LogRecord = { level: LogLevel; message: string; context?: Record<string, unknown> };
+
+let winstonModule: WinstonModule | undefined;
+let dailyRotateFileCtor: DailyRotateFileCtor | undefined;
+let winstonLogger: Logger | undefined;
+let loggerInit: Promise<Logger> | undefined;
+let flushingBufferedLogs = false;
+const bufferedLogs: LogRecord[] = [];
+/** Cap pre-init buffering so a hung/failed winston import cannot grow heap unboundedly. */
+const MAX_BUFFERED_LOGS = 10_000;
+let transportOptions: { console?: boolean; file?: boolean | string } = { file: true };
+
+async function loadLoggingModules(): Promise<{ winston: WinstonModule; DailyRotateFile: DailyRotateFileCtor }> {
+	if (!winstonModule || !dailyRotateFileCtor) {
+		const [winstonImport, dailyRotateFileImport] = await Promise.all([
+			import("winston"),
+			import("winston-daily-rotate-file"),
+		]);
+		winstonModule = (winstonImport.default ?? winstonImport) as WinstonModule;
+		dailyRotateFileCtor = dailyRotateFileImport.default;
+	}
+	return { winston: winstonModule, DailyRotateFile: dailyRotateFileCtor };
+}
+
+/** Build the JSON log formatter after winston is loaded. */
+function makeLogFormat(winston: WinstonModule): winston.Logform.Format {
+	return winston.format.combine(
+		winston.format.timestamp({ format: "YYYY-MM-DDTHH:mm:ss.SSSZ" }),
+		winston.format.printf(({ timestamp, level, message, ...meta }) => {
+			const entry: Record<string, unknown> = {
+				timestamp,
+				level,
+				pid: process.pid,
+				message,
+			};
+			// Flatten metadata into entry
+			for (const [key, value] of Object.entries(meta)) {
+				if (key !== "level" && key !== "timestamp" && key !== "message") {
+					entry[key] = value;
+				}
 			}
-		}
-		return JSON.stringify(entry);
-	}),
-);
+			return JSON.stringify(entry);
+		}),
+	);
+}
 
 /** Build a rotating file transport, materializing the target directory lazily. */
-function makeFileTransport(dir?: string): winston.transport {
+function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): Transport {
 	return new DailyRotateFile({
 		dirname: ensureDir(dir ?? getLogsDir()),
 		filename: "gjc.%DATE%.log",
@@ -55,18 +85,83 @@ function makeFileTransport(dir?: string): winston.transport {
 	});
 }
 
-function makeConsoleTransport(): winston.transport {
-	return new winston.transports.Console({ format: logFormat });
+function makeConsoleTransport(winston: WinstonModule): Transport {
+	return new winston.transports.Console({ format: makeLogFormat(winston) });
+}
+
+function applyTransports(
+	logger: Logger,
+	modules: { winston: WinstonModule; DailyRotateFile: DailyRotateFileCtor },
+): void {
+	logger.clear();
+	if (transportOptions.file) {
+		logger.add(
+			makeFileTransport(
+				modules.DailyRotateFile,
+				typeof transportOptions.file === "string" ? transportOptions.file : undefined,
+			),
+		);
+	}
+	if (transportOptions.console) logger.add(makeConsoleTransport(modules.winston));
 }
 
 /** The winston logger instance. Default: file ON (TUI-safe), console OFF. */
-const winstonLogger = winston.createLogger({
-	level: "debug",
-	format: logFormat,
-	transports: [makeFileTransport()],
-	// Don't exit on error - logging failures shouldn't crash the app
-	exitOnError: false,
-});
+async function getWinstonLogger(): Promise<Logger> {
+	if (winstonLogger) return winstonLogger;
+	loggerInit ??= (async () => {
+		const modules = await loadLoggingModules();
+		const logger = modules.winston.createLogger({
+			level: "debug",
+			format: makeLogFormat(modules.winston),
+			transports: [],
+			// Don't exit on error - logging failures shouldn't crash the app
+			exitOnError: false,
+		});
+		applyTransports(logger, modules);
+		winstonLogger = logger;
+		flushBufferedLogs();
+		return logger;
+	})();
+	return loggerInit;
+}
+
+function flushBufferedLogs(): void {
+	if (!winstonLogger || flushingBufferedLogs) return;
+	flushingBufferedLogs = true;
+	try {
+		// Loop: records buffered by reentrant writes during a flush pass (e.g.
+		// a transport callback that logs) are drained by the next pass instead
+		// of being stranded forever.
+		while (bufferedLogs.length > 0) {
+			for (const record of bufferedLogs.splice(0)) {
+				winstonLogger[record.level](record.message, record.context);
+			}
+		}
+	} finally {
+		flushingBufferedLogs = false;
+	}
+}
+
+function writeLog(level: LogLevel, message: string, context?: Record<string, unknown>): void {
+	try {
+		if (winstonLogger && !flushingBufferedLogs) {
+			winstonLogger[level](message, context);
+			return;
+		}
+		bufferedLogs.push({ level, message, context });
+		if (bufferedLogs.length > MAX_BUFFERED_LOGS) {
+			bufferedLogs.splice(0, bufferedLogs.length - MAX_BUFFERED_LOGS);
+		}
+		void getWinstonLogger().catch(() => {
+			bufferedLogs.length = 0;
+			// Allow a later write to retry initialization instead of pinning a
+			// rejected promise forever.
+			loggerInit = undefined;
+		});
+	} catch {
+		// Silently ignore logging failures
+	}
+}
 
 /**
  * Replace the active log transports. Pass `console: true, file: false` for
@@ -74,11 +169,20 @@ const winstonLogger = winston.createLogger({
  * logs piped into a process supervisor instead of the rotating file.
  */
 export function setTransports(opts: { console?: boolean; file?: boolean | string }): void {
-	winstonLogger.clear();
-	if (opts.file) {
-		winstonLogger.add(makeFileTransport(typeof opts.file === "string" ? opts.file : undefined));
+	transportOptions = opts;
+	if (winstonLogger && winstonModule && dailyRotateFileCtor) {
+		applyTransports(winstonLogger, { winston: winstonModule, DailyRotateFile: dailyRotateFileCtor });
+	} else if (loggerInit) {
+		// Init in flight: re-apply once it settles so the new options can never
+		// be silently skipped by an ordering race inside the init closure.
+		void loggerInit
+			.then(logger => {
+				if (winstonModule && dailyRotateFileCtor) {
+					applyTransports(logger, { winston: winstonModule, DailyRotateFile: dailyRotateFileCtor });
+				}
+			})
+			.catch(() => {});
 	}
-	if (opts.console) winstonLogger.add(makeConsoleTransport());
 }
 
 /**
@@ -87,11 +191,7 @@ export function setTransports(opts: { console?: boolean; file?: boolean | string
  * @param context - The context to log.
  */
 export function error(message: string, context?: Record<string, unknown>): void {
-	try {
-		winstonLogger.error(message, context);
-	} catch {
-		// Silently ignore logging failures
-	}
+	writeLog("error", message, context);
 }
 
 /**
@@ -100,11 +200,7 @@ export function error(message: string, context?: Record<string, unknown>): void 
  * @param context - The context to log.
  */
 export function warn(message: string, context?: Record<string, unknown>): void {
-	try {
-		winstonLogger.warn(message, context);
-	} catch {
-		// Silently ignore logging failures
-	}
+	writeLog("warn", message, context);
 }
 
 /**
@@ -113,11 +209,7 @@ export function warn(message: string, context?: Record<string, unknown>): void {
  * @param context - The context to log.
  */
 export function info(message: string, context?: Record<string, unknown>): void {
-	try {
-		winstonLogger.info(message, context);
-	} catch {
-		// Silently ignore logging failures
-	}
+	writeLog("info", message, context);
 }
 
 /**
@@ -126,11 +218,7 @@ export function info(message: string, context?: Record<string, unknown>): void {
  * @param context - The context to log.
  */
 export function debug(message: string, context?: Record<string, unknown>): void {
-	try {
-		winstonLogger.debug(message, context);
-	} catch {
-		// Silently ignore logging failures
-	}
+	writeLog("debug", message, context);
 }
 
 const LOGGED_TIMING_THRESHOLD_MS = 0.5;

@@ -113,6 +113,52 @@ describe("deep-interview assistant render middleware", () => {
 		expect(rendered).toContain("한국어 기준을 명확히 합니다");
 		expect(rendered).not.toContain("\\u");
 	});
+
+	it("keeps structured progress rows semantically anchorable", () => {
+		const raw = [
+			"Round 6 complete.",
+			"",
+			"| Dimension | Score | Weight | Weighted | Gap |",
+			"|-----------|-------|--------|----------|-----|",
+			"| Goal | 0.90 | 0.40 | 0.36 | Clear |",
+			"| Constraints | 0.70 | 0.30 | 0.21 | 한국어 기준 유지 |",
+			"| **Ambiguity** | | | **20%** | |",
+			"",
+			"**Next target:** 검토 기준",
+		].join("\n");
+		const component = new AssistantMessageComponent(
+			createAssistantMessage(raw),
+			false,
+			undefined,
+			"assistant:entry:deep-interview-progress",
+		);
+		const rendered = component.renderWithViewportAnchors(40);
+		const titleRow = rendered.lines.findIndex(line => Bun.stripANSI(line).includes("Round 6 complete"));
+		const koreanRow = rendered.lines.findIndex(line => Bun.stripANSI(line).includes("한국어 기준 유지"));
+		expect(titleRow).toBeGreaterThanOrEqual(0);
+		expect(koreanRow).toBeGreaterThanOrEqual(0);
+		expect(rendered.anchors[titleRow]?.id).toBe("assistant:entry:deep-interview-progress:content:0:text");
+		expect(rendered.anchors[koreanRow]?.id).toBe("assistant:entry:deep-interview-progress:content:0:text");
+		const semanticRows = rendered.anchors.filter(anchor => anchor !== null);
+		expect(semanticRows.length).toBeGreaterThan(3);
+		for (let index = 1; index < semanticRows.length; index++) {
+			expect(semanticRows[index].graphemeStart).toBeGreaterThanOrEqual(semanticRows[index - 1].graphemeEnd);
+			expect(semanticRows[index].cellStart).toBeGreaterThanOrEqual(semanticRows[index - 1].cellEnd);
+		}
+		const selected = rendered.anchors[koreanRow];
+		if (!selected) throw new Error("Expected semantic Korean row");
+		const narrow = component.renderWithViewportAnchors(18);
+		const resolved = narrow.anchors.find(
+			anchor =>
+				anchor?.id === selected.id &&
+				anchor.graphemeStart <= selected.graphemeStart &&
+				anchor.graphemeEnd > selected.graphemeStart &&
+				anchor.cellStart <= selected.cellStart &&
+				anchor.cellEnd > selected.cellStart,
+		);
+		expect(resolved).not.toBeNull();
+		expect(resolved).not.toBeUndefined();
+	});
 });
 
 describe("deep-interview render middleware null-safety", () => {

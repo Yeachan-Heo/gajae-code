@@ -40,6 +40,7 @@ import {
 	resolveConfiguredModelPatterns,
 	resolveModelOverride,
 } from "../../config/model-resolver";
+import { type ModelSelectorValue, selectorHead } from "../../config/model-selector-value";
 import { Settings } from "../../config/settings";
 import agentCreationArchitectPrompt from "../../prompts/system/agent-creation-architect.md" with { type: "text" };
 import agentCreationUserPrompt from "../../prompts/system/agent-creation-user.md" with { type: "text" };
@@ -82,6 +83,35 @@ interface AgentDashboardModelContext {
 	modelRegistry?: ModelRegistry;
 	activeModelPattern?: string;
 	defaultModelPattern?: string;
+}
+
+export function resolveAgentCreationModel(
+	modelPatterns: string[],
+	modelRegistry: ModelRegistry,
+	settings: Settings | undefined,
+) {
+	const { model } = resolveModelOverride(modelPatterns, modelRegistry, settings);
+	if (model) return model;
+	if (modelPatterns.length > 0) {
+		throw new Error(`Configured model selector(s) did not resolve: ${modelPatterns.join(", ")}.`);
+	}
+
+	const fallbackModel = modelRegistry.getAvailable()[0];
+	if (!fallbackModel) {
+		throw new Error("No available model to generate agent specification.");
+	}
+	return fallbackModel;
+}
+
+export function updateAgentModelOverride(
+	overrides: Record<string, ModelSelectorValue>,
+	agentName: string,
+	rawValue: string,
+): Record<string, ModelSelectorValue> {
+	const value = rawValue.trim();
+	if (value) return { ...overrides, [agentName]: value };
+	const { [agentName]: _, ...remainingOverrides } = overrides;
+	return remainingOverrides;
 }
 
 const SOURCE_ORDER: Record<AgentSource, number> = {
@@ -370,7 +400,7 @@ export class AgentDashboard extends Container {
 				.map(agent => ({
 					...agent,
 					disabled: disabled.has(agent.name),
-					overrideModel: overrides[agent.name]?.trim() || undefined,
+					overrideModel: selectorHead(overrides[agent.name])?.trim() || undefined,
 				}));
 
 			this.#tabs = this.#buildTabs(this.#allAgents);
@@ -465,16 +495,10 @@ export class AgentDashboard extends Container {
 		this.#settingsManager.set("task.disabledAgents", disabled);
 	}
 
-	#persistModelOverrides(): void {
+	#persistModelOverride(agentName: string, rawValue: string): void {
 		if (!this.#settingsManager) return;
-		const overrides: Record<string, string> = {};
-		for (const agent of this.#allAgents) {
-			const value = agent.overrideModel?.trim();
-			if (value) {
-				overrides[agent.name] = value;
-			}
-		}
-		this.#settingsManager.set("task.agentModelOverrides", overrides);
+		const overrides = this.#settingsManager.get("task.agentModelOverrides");
+		this.#settingsManager.set("task.agentModelOverrides", updateAgentModelOverride(overrides, agentName, rawValue));
 	}
 
 	#toggleSelectedAgent(): void {
@@ -506,7 +530,7 @@ export class AgentDashboard extends Container {
 		if (!selected) return;
 		const value = rawValue.trim();
 		selected.overrideModel = value || undefined;
-		this.#persistModelOverrides();
+		this.#persistModelOverride(selected.name, value);
 		this.#editingAgentName = null;
 		this.#editInput = null;
 		this.#applyFilters();
@@ -587,12 +611,7 @@ export class AgentDashboard extends Container {
 				settings?.getModelRole("default"),
 			settings,
 		);
-		const { model } = resolveModelOverride(modelPatterns, modelRegistry, settings);
-		const fallbackModel = modelRegistry.getAvailable()[0];
-		const selectedModel = model ?? fallbackModel;
-		if (!selectedModel) {
-			throw new Error("No available model to generate agent specification.");
-		}
+		const selectedModel = resolveAgentCreationModel(modelPatterns, modelRegistry, settings);
 
 		const systemPrompt = prompt.render(agentCreationArchitectPrompt, { TASK_TOOL_NAME: "task" });
 		const userPrompt = prompt.render(agentCreationUserPrompt, { request: description });
@@ -605,6 +624,7 @@ export class AgentDashboard extends Container {
 			model: selectedModel,
 			systemPrompt: [systemPrompt],
 			hasUI: false,
+			notificationHostModeSupported: false,
 			enableLsp: false,
 			enableMCP: false,
 			disableExtensionDiscovery: true,

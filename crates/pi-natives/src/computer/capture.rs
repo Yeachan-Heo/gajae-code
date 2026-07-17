@@ -48,6 +48,7 @@ struct CgRect {
 
 type CgDirectDisplayId = u32;
 type CgImageRef = *mut c_void;
+type CgDisplayModeRef = *mut c_void;
 type CgColorSpaceRef = *mut c_void;
 type CgContextRef = *mut c_void;
 
@@ -64,6 +65,10 @@ unsafe extern "C" {
 	fn CGDisplayCreateImage(display: CgDirectDisplayId) -> CgImageRef;
 	fn CGDisplayPixelsWide(display: CgDirectDisplayId) -> usize;
 	fn CGDisplayPixelsHigh(display: CgDirectDisplayId) -> usize;
+	fn CGDisplayCopyDisplayMode(display: CgDirectDisplayId) -> CgDisplayModeRef;
+	fn CGDisplayModeGetPixelWidth(mode: CgDisplayModeRef) -> usize;
+	fn CGDisplayModeGetPixelHeight(mode: CgDisplayModeRef) -> usize;
+	fn CGDisplayModeRelease(mode: CgDisplayModeRef);
 	fn CGImageGetWidth(image: CgImageRef) -> usize;
 	fn CGImageGetHeight(image: CgImageRef) -> usize;
 	fn CGImageRelease(image: CgImageRef);
@@ -109,6 +114,8 @@ impl fmt::Display for CaptureError {
 impl std::error::Error for CaptureError {}
 
 static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
+const JS_SAFE_INTEGER_BITS: u32 = 53;
+const DISPLAY_EPOCH_MASK: u64 = (1_u64 << JS_SAFE_INTEGER_BITS) - 1;
 
 /// A captured primary-display frame.
 pub struct CapturedFrame {
@@ -131,15 +138,11 @@ pub struct CapturedFrame {
 pub fn capture_primary_display() -> Result<CapturedFrame, CaptureError> {
 	// SAFETY: pure Core Graphics geometry queries for the active primary display;
 	// no image capture occurs before `CGDisplayCreateImage` below.
-	let (display_id, display) = unsafe {
+	let (display_id, bounds) = unsafe {
 		let id = CGMainDisplayID();
-		let bounds = CGDisplayBounds(id);
-		let pixels_wide = CGDisplayPixelsWide(id);
-		let pixels_high = CGDisplayPixelsHigh(id);
-		(id, display_descriptor(pixels_wide, pixels_high, bounds))
+		(id, CGDisplayBounds(id))
 	};
 
-	let display_epoch = display_epoch(&display);
 	let capture_id = next_capture_id();
 
 	// SAFETY: `display_id` is a valid primary-display id. The returned image is
@@ -149,7 +152,7 @@ pub fn capture_primary_display() -> Result<CapturedFrame, CaptureError> {
 		return Err(CaptureError::CaptureFailed);
 	}
 
-	let result = frame_from_image(image, display, display_epoch, capture_id);
+	let result = frame_from_image(image, bounds, capture_id);
 
 	// SAFETY: `image` is non-null (checked above) and not used after release.
 	unsafe { CGImageRelease(image) };
@@ -166,8 +169,7 @@ pub fn current_display_epoch() -> u64 {
 /// `image`; the caller owns its lifetime.
 fn frame_from_image(
 	image: CgImageRef,
-	display: NormalizedDisplay,
-	display_epoch: u64,
+	bounds: CgRect,
 	capture_id: u32,
 ) -> Result<CapturedFrame, CaptureError> {
 	// SAFETY: `image` is non-null per the caller's check.
@@ -175,6 +177,9 @@ fn frame_from_image(
 	if width == 0 || height == 0 {
 		return Err(CaptureError::CaptureFailed);
 	}
+
+	let display = display_descriptor(width, height, bounds);
+	let display_epoch = display_epoch(&display);
 
 	let bytes_per_row = width * BYTES_PER_PIXEL;
 	let mut buffer = vec![0u8; bytes_per_row * height];
@@ -235,8 +240,26 @@ fn current_display_descriptor() -> NormalizedDisplay {
 	unsafe {
 		let display_id = CGMainDisplayID();
 		let bounds = CGDisplayBounds(display_id);
-		display_descriptor(CGDisplayPixelsWide(display_id), CGDisplayPixelsHigh(display_id), bounds)
+		let (width, height) = display_mode_pixels(display_id)
+			.unwrap_or_else(|| (CGDisplayPixelsWide(display_id), CGDisplayPixelsHigh(display_id)));
+		display_descriptor(width, height, bounds)
 	}
+}
+
+unsafe fn display_mode_pixels(display_id: CgDirectDisplayId) -> Option<(usize, usize)> {
+	// SAFETY: Core Graphics returns either null or an owned display-mode reference
+	// for this display id. Non-null references are released exactly once below.
+	let mode = unsafe { CGDisplayCopyDisplayMode(display_id) };
+	if mode.is_null() {
+		return None;
+	}
+	// SAFETY: `mode` is non-null and valid until released below.
+	let width = unsafe { CGDisplayModeGetPixelWidth(mode) };
+	// SAFETY: `mode` is non-null and valid until released below.
+	let height = unsafe { CGDisplayModeGetPixelHeight(mode) };
+	// SAFETY: `mode` is non-null and is not used after release.
+	unsafe { CGDisplayModeRelease(mode) };
+	(width > 0 && height > 0).then_some((width, height))
 }
 
 fn display_descriptor(width: usize, height: usize, bounds: CgRect) -> NormalizedDisplay {
@@ -260,7 +283,10 @@ fn display_epoch(display: &NormalizedDisplay) -> u64 {
 	display.scale_y.to_bits().hash(&mut hasher);
 	display.origin_x.to_bits().hash(&mut hasher);
 	display.origin_y.to_bits().hash(&mut hasher);
-	hasher.finish()
+	// The N-API surface transports display epochs as JavaScript numbers. Keep the
+	// hash within the 53-bit safe-integer range so screenshot -> action roundtrips
+	// exactly and the stale-display gate can compare epochs without false rejects.
+	hasher.finish() & DISPLAY_EPOCH_MASK
 }
 
 fn next_capture_id() -> u32 {
@@ -280,7 +306,16 @@ fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, CaptureEr
 
 #[cfg(test)]
 mod tests {
-	use super::capture_primary_display;
+	use super::{capture_primary_display, current_display_epoch, display_epoch};
+	use crate::computer::coords::NormalizedDisplay;
+
+	#[test]
+	fn display_epoch_roundtrips_through_javascript_number() {
+		let display = NormalizedDisplay::new(3024, 1964, 2.0, 2.0, -1728.0, 0.0);
+		let epoch = display_epoch(&display);
+
+		assert_eq!((epoch as f64) as u64, epoch);
+	}
 
 	/// Exercises the real OS capture path, so it is ignored by default and run
 	/// explicitly (`cargo test -p pi-natives --ignored`) on a macOS host with
@@ -295,6 +330,7 @@ mod tests {
 		let decoded = image::load_from_memory(&frame.png).expect("captured bytes decode as PNG");
 		assert_eq!(decoded.width(), frame.display.width_px);
 		assert_eq!(decoded.height(), frame.display.height_px);
+		assert_eq!(current_display_epoch(), frame.display_epoch);
 
 		let rgba = decoded.to_rgba8();
 		let first = rgba.pixels().next().copied();

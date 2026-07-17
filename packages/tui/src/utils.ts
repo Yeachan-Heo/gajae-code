@@ -3,16 +3,32 @@ import {
 	type ExtractSegmentsResult,
 	extractSegments as nativeExtractSegments,
 	sliceWithWidth as nativeSliceWithWidth,
+	truncateLinesToWidth as nativeTruncateLinesToWidth,
 	truncateToWidth as nativeTruncateToWidth,
+	visibleWidth as nativeVisibleWidth,
+	visibleWidths as nativeVisibleWidths,
 	wrapTextWithAnsi as nativeWrapTextWithAnsi,
 	type SliceResult,
 } from "@gajae-code/natives";
-import { getDefaultTabWidth, getIndentation } from "@gajae-code/utils";
+import { getDefaultTabWidth, getIndentation, onDefaultTabWidthChange } from "@gajae-code/utils";
 import { renderMetrics } from "./metrics";
 
 export { Ellipsis } from "@gajae-code/natives";
 
 export { getDefaultTabWidth, getIndentation } from "@gajae-code/utils";
+/** Test-only performance counters for advisory baseline tests. */
+export const __textHelperPerfCounters = {
+	truncateToWidthCalls: 0,
+	wrapTextWithAnsiCalls: 0,
+	truncateLinesToWidthCalls: 0,
+	visibleWidthsCalls: 0,
+	reset(): void {
+		this.truncateToWidthCalls = 0;
+		this.wrapTextWithAnsiCalls = 0;
+		this.truncateLinesToWidthCalls = 0;
+		this.visibleWidthsCalls = 0;
+	},
+};
 
 function recordTextHelper<T>(name: string, fn: () => T): T {
 	if (!renderMetrics.enabled) return fn();
@@ -24,6 +40,18 @@ function recordTextHelper<T>(name: string, fn: () => T): T {
 	}
 }
 
+let cachedTabWidth: number | undefined;
+
+function getCachedTabWidth(): number {
+	cachedTabWidth ??= getDefaultTabWidth();
+	return cachedTabWidth;
+}
+
+export function invalidateTabWidthCache(): void {
+	cachedTabWidth = undefined;
+}
+onDefaultTabWidthChange(invalidateTabWidthCache);
+
 export function isPrintableAscii(text: string): boolean {
 	for (let i = 0; i < text.length; i++) {
 		const code = text.charCodeAt(i);
@@ -33,7 +61,7 @@ export function isPrintableAscii(text: string): boolean {
 }
 
 export function sliceWithWidth(line: string, startCol: number, length: number, strict?: boolean | null): SliceResult {
-	return nativeSliceWithWidth(line, startCol, length, strict ?? null, getDefaultTabWidth());
+	return nativeSliceWithWidth(line, startCol, length, strict ?? null, getCachedTabWidth());
 }
 
 export function truncateToWidth(
@@ -42,6 +70,7 @@ export function truncateToWidth(
 	ellipsisKind?: Ellipsis | null,
 	pad?: boolean | null,
 ): string {
+	__textHelperPerfCounters.truncateToWidthCalls += 1;
 	// Guard nullish napi inputs: napi-rs 3 on the Windows prebuilt rejects
 	// `null` for `Option<u8>` (Ellipsis) / `Option<bool>` (pad) (issue #848),
 	// and `maxWidth` is a required `u32` that throws on `null`/`undefined`
@@ -60,12 +89,34 @@ export function truncateToWidth(
 		safeWidth,
 		resolvedEllipsis ?? Ellipsis.Unicode,
 		pad ?? false,
-		getDefaultTabWidth(),
+		getCachedTabWidth(),
+	);
+}
+
+export function truncateLinesToWidth(
+	lines: readonly string[],
+	maxWidth: number,
+	ellipsisKind?: Ellipsis | null,
+	pad?: boolean | null,
+): string[] {
+	__textHelperPerfCounters.truncateLinesToWidthCalls += 1;
+	const safeWidth = Number.isFinite(maxWidth) ? Math.max(0, Math.trunc(maxWidth)) : 0;
+	let resolvedEllipsis: Ellipsis | null | undefined | string = ellipsisKind;
+	if (typeof resolvedEllipsis === "string") {
+		resolvedEllipsis = resolvedEllipsis === "" ? Ellipsis.Omit : Ellipsis.Unicode;
+	}
+	return nativeTruncateLinesToWidth(
+		lines.map(line => (typeof line === "string" ? line : String(line ?? ""))),
+		safeWidth,
+		resolvedEllipsis ?? Ellipsis.Unicode,
+		pad ?? false,
+		getCachedTabWidth(),
 	);
 }
 
 export function wrapTextWithAnsi(text: string, width: number): string[] {
-	return nativeWrapTextWithAnsi(text, width, getDefaultTabWidth());
+	__textHelperPerfCounters.wrapTextWithAnsiCalls += 1;
+	return nativeWrapTextWithAnsi(text, width, getCachedTabWidth());
 }
 
 export function extractSegments(
@@ -75,7 +126,7 @@ export function extractSegments(
 	afterLen: number,
 	strictAfter: boolean,
 ): ExtractSegmentsResult {
-	return nativeExtractSegments(line, beforeEnd, afterStart, afterLen, strictAfter, getDefaultTabWidth());
+	return nativeExtractSegments(line, beforeEnd, afterStart, afterLen, strictAfter, getCachedTabWidth());
 }
 
 // Pre-allocated space buffer for padding
@@ -113,9 +164,141 @@ const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 export function getSegmenter(): Intl.Segmenter {
 	return segmenter;
 }
+
+export interface ViewportAnchorSpan {
+	graphemeStart: number;
+	graphemeEnd: number;
+	cellStart: number;
+	cellEnd: number;
+}
+
+export interface ViewportAnchorAnnotation {
+	text: string;
+	nextGrapheme: number;
+	nextCell: number;
+	token: string;
+}
+
+// APC marker for viewport anchors. Must NOT start with "\x1b_G": that is the
+// Kitty graphics prefix and TERMINAL.isImageLine() would misclassify every
+// annotated line as an image line, which skips wrapping (issue: assistant
+// prose overflowing the terminal on Kitty-protocol terminals).
+export const VIEWPORT_ANCHOR_PREFIX = "\x1b_AGJC_ANCHOR:";
+const VIEWPORT_ANCHOR_SUFFIX = "\x1b\\";
+
+function ansiSequenceEnd(text: string, start: number): number {
+	if (text[start] !== "\x1b" || start + 1 >= text.length) return start;
+	const kind = text[start + 1];
+	if (kind === "[") {
+		let index = start + 2;
+		while (index < text.length) {
+			const code = text.charCodeAt(index++);
+			if (code >= 0x40 && code <= 0x7e) return index;
+		}
+		return text.length;
+	}
+	if (kind === "]" || kind === "_" || kind === "P" || kind === "^" || kind === "X") {
+		const bel = text.indexOf("\x07", start + 2);
+		const st = text.indexOf("\x1b\\", start + 2);
+		if (bel < 0) return st < 0 ? text.length : st + 2;
+		if (st < 0) return bel + 1;
+		return Math.min(bel + 1, st + 2);
+	}
+	return Math.min(text.length, start + 2);
+}
+
+/**
+ * Tag every visible grapheme with an APC marker that survives ANSI-aware
+ * wrapping. The marker contains source grapheme and monotonic cell offsets.
+ */
+export function annotateViewportAnchorGraphemes(
+	text: string,
+	startGrapheme = 0,
+	startCell = 0,
+	token = crypto.randomUUID(),
+): ViewportAnchorAnnotation {
+	let result = "";
+	let grapheme = startGrapheme;
+	let cell = startCell;
+	let textStart = 0;
+	const appendVisible = (visible: string): void => {
+		for (const part of segmenter.segment(visible)) {
+			if (part.segment === "\n" || part.segment === "\r") {
+				result += part.segment;
+				continue;
+			}
+			const cellEnd = cell + Math.max(1, visibleWidth(part.segment));
+			result += `${part.segment}${VIEWPORT_ANCHOR_PREFIX}${token}:${grapheme}:${grapheme + 1}:${cell}:${cellEnd}${VIEWPORT_ANCHOR_SUFFIX}`;
+			grapheme += 1;
+			cell = cellEnd;
+		}
+	};
+	for (let index = 0; index < text.length; ) {
+		if (text[index] !== "\x1b") {
+			index += 1;
+			continue;
+		}
+		appendVisible(text.slice(textStart, index));
+		const end = ansiSequenceEnd(text, index);
+		result += text.slice(index, end);
+		index = end;
+		textStart = end;
+	}
+	appendVisible(text.slice(textStart));
+	return { text: result, nextGrapheme: grapheme, nextCell: cell, token };
+}
+
+/** Remove viewport anchor markers and return the exact marked span for each row. */
+export function extractViewportAnchorRows(
+	lines: readonly string[],
+	token: string,
+): { lines: string[]; spans: Array<ViewportAnchorSpan | null> } {
+	const markerRegex = new RegExp(`\\x1b_AGJC_ANCHOR:${token}:(\\d+):(\\d+):(\\d+):(\\d+)\\x1b\\\\`, "g");
+	const cleanLines: string[] = [];
+	const spans: Array<ViewportAnchorSpan | null> = [];
+	for (const line of lines) {
+		let span: ViewportAnchorSpan | null = null;
+		const clean = line.replace(markerRegex, (_marker, start, end, cellStart, cellEnd) => {
+			const candidate = {
+				graphemeStart: Number(start),
+				graphemeEnd: Number(end),
+				cellStart: Number(cellStart),
+				cellEnd: Number(cellEnd),
+			};
+			if (!span) {
+				span = candidate;
+			} else {
+				span.graphemeStart = Math.min(span.graphemeStart, candidate.graphemeStart);
+				span.graphemeEnd = Math.max(span.graphemeEnd, candidate.graphemeEnd);
+				span.cellStart = Math.min(span.cellStart, candidate.cellStart);
+				span.cellEnd = Math.max(span.cellEnd, candidate.cellEnd);
+			}
+			return "";
+		});
+		cleanLines.push(clean);
+		spans.push(span);
+	}
+	return { lines: cleanLines, spans };
+}
 function normalizeForWidth(str: string): string {
 	const normalized = str.normalize("NFC");
 	return normalized === str ? str : normalized;
+}
+
+function hasUnpairedSurrogate(str: string): boolean {
+	for (let index = 0; index < str.length; index++) {
+		const code = str.charCodeAt(index);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = str.charCodeAt(index + 1);
+			if (next >= 0xdc00 && next <= 0xdfff) {
+				index += 1;
+				continue;
+			}
+			return true;
+		}
+		if (code >= 0xdc00 && code <= 0xdfff) return true;
+	}
+	return false;
 }
 export function visibleWidthRaw(str: string): number {
 	if (!str) {
@@ -124,7 +307,7 @@ export function visibleWidthRaw(str: string): number {
 	if (str.length === 1) {
 		const code = str.charCodeAt(0);
 		if (code >= 0x20 && code <= 0x7e) return 1;
-		if (code === 9) return getDefaultTabWidth();
+		if (code === 9) return getCachedTabWidth();
 	}
 
 	let tabCount = 0;
@@ -138,12 +321,11 @@ export function visibleWidthRaw(str: string): number {
 		}
 	}
 	if (isPureAscii) {
-		return str.length + tabCount * (getDefaultTabWidth() - 1);
+		return str.length + tabCount * (getCachedTabWidth() - 1);
 	}
-
 	const normalized = normalizeForWidth(str);
-	if (tabCount === 0) return Bun.stringWidth(normalized);
-	return Bun.stringWidth(normalized.replaceAll("\t", " ".repeat(getDefaultTabWidth())));
+	const text = tabCount === 0 ? normalized : normalized.replaceAll("\t", " ".repeat(getCachedTabWidth()));
+	return nativeVisibleWidth(text, getCachedTabWidth());
 }
 
 /**
@@ -152,6 +334,22 @@ export function visibleWidthRaw(str: string): number {
 export function visibleWidth(str: string): number {
 	if (!renderMetrics.enabled) return visibleWidthRaw(str);
 	return recordTextHelper("text.visibleWidth", () => visibleWidthRaw(str));
+}
+
+export function visibleWidthsNative(lines: readonly string[]): number[] {
+	__textHelperPerfCounters.visibleWidthsCalls += 1;
+	const safeLines = lines.map(line => (typeof line === "string" ? line : String(line ?? "")));
+	const widths = nativeVisibleWidths(safeLines, getCachedTabWidth());
+	for (let index = 0; index < safeLines.length; index++) {
+		const line = safeLines[index]!;
+		if (hasUnpairedSurrogate(line)) widths[index] = visibleWidthRaw(line);
+	}
+	return widths;
+}
+
+export function visibleWidths(lines: readonly string[]): number[] {
+	if (!renderMetrics.enabled) return visibleWidthsNative(lines);
+	return recordTextHelper("text.visibleWidths", () => visibleWidthsNative(lines));
 }
 
 const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;

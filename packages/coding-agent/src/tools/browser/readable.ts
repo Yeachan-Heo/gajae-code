@@ -1,5 +1,5 @@
 import { Readability } from "@mozilla/readability";
-import { parseHTML } from "linkedom";
+import { parseHtmlLazy } from "../../utils/linkedom";
 import { htmlToBasicMarkdown } from "../../web/scrapers/types";
 
 export type ReadableFormat = "text" | "markdown";
@@ -31,7 +31,7 @@ export async function extractReadableFromHtml(
 	url: string,
 	format: ReadableFormat,
 ): Promise<ReadableResult | null> {
-	const { document } = parseHTML(html);
+	const { document } = await parseHtmlLazy(html);
 
 	// --- Primary: Readability article extraction ---
 	const article = new Readability(document).parse();

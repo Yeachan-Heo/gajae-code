@@ -1,6 +1,7 @@
 import { DEFAULT_MAX_BYTES, OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
+import { ToolError } from "../../tools/tool-errors";
 import { executeInVmContext, type JsDisplayOutput } from "./context-manager";
 
 export interface JsExecutorOptions {
@@ -117,7 +118,12 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 				displayOutputs,
 			};
 		}
-		const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
+		const message =
+			error instanceof ToolError || (error instanceof Error && error.name === "ToolError")
+				? error.message
+				: error instanceof Error
+					? (error.stack ?? error.message)
+					: String(error);
 		outputSink.push(message);
 		const summary = await outputSink.dump();
 		return {

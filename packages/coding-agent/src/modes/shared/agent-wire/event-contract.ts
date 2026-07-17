@@ -3,8 +3,8 @@
  * for AgentSession events and bounded owner observations.
  *
  * Two distinct consumer-facing shapes, deliberately NOT collapsed into one:
- * - `AgentWireEventPayload`: rich, full `AgentSessionEvent` for renderers
- *   (ACP SDK notifications, RPC/Bridge event frames).
+ * - `AgentWireEventPayload`: rich, full `AgentSessionEvent` for event
+ *   consumers on any agent-wire transport.
  * - `AgentWireOwnerObservation`: bounded/redacted owner evidence for control
  *   planes (Harness). Never carries assistant text, message deltas, raw tool
  *   args, raw command output, raw tool results, answers, or oversize strings.
@@ -13,6 +13,8 @@
  * an `AgentSessionEvent` variant fails typecheck until it is registered, and so
  * conformance tests can assert fixture coverage equals the registry exactly.
  */
+
+import type { AssistantMessageEvent } from "@gajae-code/ai";
 import type { AgentSessionEvent } from "../../../session/agent-session";
 
 /** Wire protocol version. Bump on breaking envelope/semantic changes. */
@@ -43,14 +45,13 @@ const AGENT_SESSION_EVENT_TYPE_REGISTRY: Record<AgentWireEventType, true> = {
 	auto_compaction_end: true,
 	auto_retry_start: true,
 	auto_retry_end: true,
-	retry_fallback_applied: true,
-	retry_fallback_succeeded: true,
 	ttsr_triggered: true,
 	todo_reminder: true,
 	todo_auto_clear: true,
 	irc_message: true,
 	subagent_steer_message: true,
 	notice: true,
+	model_fallback_switched: true,
 	thinking_level_changed: true,
 	goal_updated: true,
 };
@@ -61,13 +62,32 @@ export const AGENT_WIRE_EVENT_TYPES: readonly AgentWireEventType[] = Object.keys
 ) as AgentWireEventType[];
 
 /**
- * Rich event payload. Carries the full `AgentSessionEvent` so renderers (ACP,
- * RPC, Bridge) can present message content, tool args/results, todo state, etc.
+ * Rich event payload. Carries the full `AgentSessionEvent` so event consumers
+ * can present message content, tool args/results, todo state, and related data.
  */
 export interface AgentWireEventPayload {
 	event_type: AgentWireEventType;
 	event: AgentSessionEvent;
 }
+export type AgentWireCompactAssistantMessageEvent = AssistantMessageEvent extends infer TEvent
+	? TEvent extends { type: string }
+		? Omit<TEvent, "partial" | "message" | "error">
+		: never
+	: never;
+
+export interface AgentWireCompactMessageUpdatePayload {
+	event_type: "message_update";
+	/** Compact opt-in payload: delta-only update plus minimal routing metadata. */
+	compact: true;
+	message_id: string | null;
+	content_index: number | null;
+	assistantMessageEvent: AgentWireCompactAssistantMessageEvent;
+	/** Full message checkpoint, snapshotted synchronously when this frame is enqueued. */
+	checkpoint_message?: Extract<AgentSessionEvent, { type: "message_update" }>["message"];
+	checkpoint_reason?: "periodic";
+}
+
+export type AgentWireEventFramePayload = AgentWireEventPayload | AgentWireCompactMessageUpdatePayload;
 
 /**
  * Bounded observed-signal vocabulary surfaced to owner control planes. Mirrors
@@ -99,7 +119,7 @@ export interface AgentWireOwnerObservation {
 	eventType?: AgentWireEventType;
 	/** Set when this observation derives from a non-event wire frame. */
 	frameType?: string;
-	/** Owner event kind (e.g. `rpc_tool_started`). */
+	/** Owner event kind (for example, a tool-started observation). */
 	kind: string;
 	/** Bounded observed signal, or null when the frame carries no signal. */
 	signal: AgentWireObservedSignal | null;
@@ -146,3 +166,4 @@ export interface AgentWireFrameEnvelope<TType extends AgentWireFrameType = Agent
 
 /** An `AgentSessionEvent` serialized into a versioned wire frame. */
 export type AgentWireEventFrame = AgentWireFrameEnvelope<"event", AgentWireEventPayload>;
+export type AgentWireCompactEventFrame = AgentWireFrameEnvelope<"event", AgentWireEventFramePayload>;

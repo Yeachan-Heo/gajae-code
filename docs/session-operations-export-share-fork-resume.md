@@ -180,6 +180,12 @@ Startup `--fork` is resolved before normal session creation:
 3. Other values resolve like resumable session ids via current scope and then global search when allowed.
 4. The forked file is created in the current cwd/session-dir scope and becomes the active session manager for startup.
 
+### Managed directory migration during session operations
+
+Default persistent creates and forks write only to the managed v2 workspace scope. A resume/list operation may surface a validated legacy candidate for the same canonical workspace identity; with `session.directoryMigration: "copy-retain"`, the migration path copies it into v2 and retains the source. It never replaces an existing destination, and a migration tombstone prevents completed/retired legacy work from being retried as fresh work. `disabled` leaves legacy data in place.
+
+The migration path does not delete legacy sessions or artifacts automatically. It fails closed on conflicting bindings, changed source identity, unsafe artifact trees, or unavailable owner-only path security; it does not claim authentication or protection against hostile concurrent filesystem races. Explicit `--session-dir` remains an operator-selected override.
+
 ## Resume and continue
 
 ## Interactive `/resume`

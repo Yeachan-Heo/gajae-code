@@ -108,9 +108,10 @@ export function resolveEquivalentPath(inputPath: string): string {
 	}
 }
 
-export function normalizePathForComparison(inputPath: string): string {
-	const resolvedPath = resolveEquivalentPath(inputPath);
-	return process.platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath;
+export function normalizePathForComparison(inputPath: string, platform: NodeJS.Platform = process.platform): string {
+	const pathApi = platform === "win32" ? path.win32 : path;
+	const resolvedPath = platform === process.platform ? resolveEquivalentPath(inputPath) : pathApi.resolve(inputPath);
+	return platform === "win32" ? resolvedPath.toLowerCase() : resolvedPath;
 }
 
 export function pathIsWithin(root: string, candidate: string): boolean {

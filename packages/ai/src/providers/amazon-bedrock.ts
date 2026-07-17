@@ -7,7 +7,7 @@
  * Bun's native `HTTPS_PROXY` support.
  */
 
-import { $env, $flag, extractHttpStatusFromError, fetchWithRetry } from "@gajae-code/utils";
+import { $credentialEnv, $env, $flag, extractHttpStatusFromError, fetchWithRetry } from "@gajae-code/utils";
 import type { Effort } from "../model-thinking";
 import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "../model-thinking";
 import { calculateCost } from "../models";
@@ -30,6 +30,7 @@ import type {
 } from "../types";
 import { normalizeToolCallId, resolveCacheRetention, sanitizeJsonStrings } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
@@ -39,8 +40,10 @@ import {
 	markToolChoiceIncapability,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { isValidBedrockBearerToken } from "./aws-credential-config";
 import { resolveAwsCredentials } from "./aws-credentials";
 import { decodeEventStream } from "./aws-eventstream";
+import type { AwsCredentials } from "./aws-sigv4";
 import { signRequest } from "./aws-sigv4";
 import { transformMessages } from "./transform-messages";
 
@@ -162,6 +165,8 @@ interface MetadataEvent {
 	};
 }
 
+type BedrockAuthMode = { kind: "bearer"; token: string } | { kind: "sigv4"; credentials: AwsCredentials };
+
 export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 	model: Model<"bedrock-converse-stream">,
 	context: Context,
@@ -233,34 +238,44 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				body: commandInput,
 			};
 
-			let credentials: { accessKeyId: string; secretAccessKey: string; sessionToken?: string };
-			if ($flag("AWS_BEDROCK_SKIP_AUTH")) {
-				credentials = { accessKeyId: "dummy-access-key", secretAccessKey: "dummy-secret-key" };
-			} else {
-				credentials = await resolveAwsCredentials({
-					profile: options.profile,
-					region,
-					signal: options.signal,
-				});
+			const bearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
+			if (bearerToken && !isValidBedrockBearerToken(bearerToken)) {
+				throw new Error("AWS_BEARER_TOKEN_BEDROCK contains unsafe control characters.");
 			}
-
+			const authMode: BedrockAuthMode = bearerToken
+				? { kind: "bearer", token: bearerToken }
+				: {
+						kind: "sigv4",
+						credentials: $flag("AWS_BEDROCK_SKIP_AUTH")
+							? { accessKeyId: "dummy-access-key", secretAccessKey: "dummy-secret-key" }
+							: await resolveAwsCredentials({ profile: options.profile, region, signal: options.signal }),
+					};
 			const bodyText = JSON.stringify(commandInput);
 			const body = new TextEncoder().encode(bodyText);
 			const baseHeaders: Record<string, string> = {
 				"content-type": "application/json",
 				accept: "application/vnd.amazon.eventstream",
 			};
-			const signed = await signRequest({
-				method: "POST",
-				host,
-				path: urlPath,
-				body,
-				region,
-				service: "bedrock",
-				credentials,
-				headers: baseHeaders,
-			});
-			const requestHeaders: Record<string, string> = { ...baseHeaders, ...signed };
+			const buildRequestHeaders = async (requestBody: Uint8Array): Promise<Record<string, string>> => {
+				const headers = new Headers(baseHeaders);
+				if (authMode.kind === "bearer") {
+					headers.set("authorization", `Bearer ${authMode.token}`);
+					return Object.fromEntries(headers);
+				}
+				const signed = await signRequest({
+					method: "POST",
+					host,
+					path: urlPath,
+					body: requestBody,
+					region,
+					service: "bedrock",
+					credentials: authMode.credentials,
+					headers: baseHeaders,
+				});
+				for (const [name, value] of Object.entries(signed)) headers.set(name, value);
+				return Object.fromEntries(headers);
+			};
+			const requestHeaders = await buildRequestHeaders(body);
 			const sentForcedToolChoice = Boolean(toolConfig?.toolChoice?.any || toolConfig?.toolChoice?.tool);
 			let fallbackRan = false;
 			const retryWithoutForcedToolChoice = async (reason: string) => {
@@ -279,20 +294,10 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 				stripBedrockForcedToolChoiceForRetry(commandInput);
 				const retryBodyText = JSON.stringify(commandInput);
 				const retryBody = new TextEncoder().encode(retryBodyText);
-				const retrySigned = await signRequest({
-					method: "POST",
-					host,
-					path: urlPath,
-					body: retryBody,
-					region,
-					service: "bedrock",
-					credentials,
-					headers: baseHeaders,
-				});
 				if (rawRequestDump) rawRequestDump.body = commandInput;
 				return fetchWithRetry(url, {
 					method: "POST",
-					headers: { ...baseHeaders, ...retrySigned },
+					headers: await buildRequestHeaders(retryBody),
 					body: retryBody,
 					signal: options.signal,
 					maxAttempts: 1,
@@ -313,7 +318,12 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					new Error(`Bedrock HTTP ${response.status}: ${errBody.slice(0, 1000)}`),
 					response.status,
 				);
-				if (firstTokenTime === undefined && !fallbackRan && isForcedToolChoiceUnsupportedError(error, true)) {
+				if (
+					firstTokenTime === undefined &&
+					!fallbackRan &&
+					!options.fallbackManaged &&
+					isForcedToolChoiceUnsupportedError(error, true)
+				) {
 					response = await retryWithoutForcedToolChoice(error.message);
 				} else {
 					throw error;
@@ -345,6 +355,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 							firstTokenTime === undefined &&
 							sentForcedToolChoice &&
 							!fallbackRan &&
+							!options.fallbackManaged &&
 							isForcedToolChoiceUnsupportedError(error, true)
 						) {
 							response = await retryWithoutForcedToolChoice(error.message);
@@ -428,6 +439,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error);
 			const baseMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			// Enrich error with thinking block diagnostics for signature-related failures
 			let diagnostics = "";

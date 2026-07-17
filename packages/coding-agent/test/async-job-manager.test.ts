@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 
 describe("AsyncJobManager", () => {
@@ -393,6 +393,30 @@ describe("AsyncJobManager", () => {
 		expect(evictCount).toBe(1);
 		expect(manager.getMonitorTombstone(jobId, { ownerId: "0-Test" })?.jobId).toBe(jobId);
 		expect(manager.getMonitorTombstone(jobId, { ownerId: "other" })).toBeUndefined();
+	});
+
+	test("eviction sweeps expired monitor tombstones", async () => {
+		const clock = spyOn(Date, "now").mockReturnValue(0);
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		try {
+			const expiredJobId = manager.register("bash", "expired monitor", async () => "done", {
+				metadata: { monitor: true },
+			});
+			await manager.waitForAll();
+			expect(manager.getMonitorTombstone(expiredJobId)?.expiresAt).toBe(5 * 60_000);
+
+			clock.mockReturnValue(5 * 60_000 + 1);
+			manager.register("bash", "new monitor", async () => "done", {
+				id: "new-monitor",
+				metadata: { monitor: true },
+			});
+			await manager.waitForAll();
+
+			expect(manager.getMonitorTombstone(expiredJobId)).toBeUndefined();
+		} finally {
+			clock.mockRestore();
+			await manager.dispose();
+		}
 	});
 
 	test("purgeMonitorTombstone after eviction returns found and runs purge once", async () => {

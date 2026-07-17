@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { TopicRegistry } from "../src/notifications/topic-registry";
+import { TopicRegistry } from "../src/sdk/bus/topic-registry";
 
 describe("TopicRegistry", () => {
 	test("creates a topic once and reuses it on resume", async () => {
@@ -34,6 +34,109 @@ describe("TopicRegistry", () => {
 		expect(reg.needsIdentity("s1")).toBe(false);
 	});
 
+	test("separates rename detection from successful name commit", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic(
+			"s1",
+			async () => "t1",
+			() => 1000,
+			"GJC abc123",
+		);
+
+		expect(reg.needsRename("s1", "repo/main")).toBe(true);
+		expect(reg.needsRename("missing", "repo/main")).toBe(false);
+
+		reg.markNameApplied("s1", "repo/main");
+		expect(reg.needsRename("s1", "repo/main")).toBe(false);
+		expect(reg.get("s1")?.name).toBe("repo/main");
+		expect(reg.get("s1")?.nameOwner).toBeUndefined();
+	});
+
+	test("user-owned names block daemon renames and survive serialization", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic(
+			"s1",
+			async () => "t1",
+			() => 1000,
+			"repo/main",
+		);
+		reg.markIdentityKey("s1", "repo\0main");
+
+		expect(reg.markUserName("s1", "My focus", 1)).toBe("updated");
+		expect(reg.needsRename("s1", "repo/main - Generated title")).toBe(false);
+		expect(reg.userOwnedName("s1")).toBe("My focus");
+		expect(reg.userNameToReconcile("s1")).toBe("My focus");
+		reg.markNameApplied("s1", "repo/main - Generated title");
+		expect(reg.userOwnedName("s1")).toBe("My focus");
+		expect(reg.markUserName("s1", "Latest focus", 2)).toBe("updated");
+		expect(reg.markUserName("s1", "Duplicate focus", 2)).toBe("duplicate");
+		expect(reg.markUserName("s1", "Stale focus", 1)).toBe("stale");
+		expect(reg.markUserNameReconciled("s1", "My focus")).toBe(false);
+		expect(reg.userNameToReconcile("s1")).toBe("Latest focus");
+		expect(reg.markUserName("s1", "My focus", 3)).toBe("updated");
+
+		expect(reg.markUserNameReconciled("s1", "My focus")).toBe(true);
+		const reloaded = new TopicRegistry(reg.serialize());
+		expect(reloaded.userOwnedName("s1")).toBe("My focus");
+		expect(reloaded.userNameToReconcile("s1")).toBeUndefined();
+		expect(reloaded.get("s1")?.identityKey).toBe("repo\0main");
+		expect(reloaded.needsRename("s1", "repo/main - Another title")).toBe(false);
+	});
+
+	test.each([
+		["empty name", { name: "", userNameUpdateId: 3 }],
+		["whitespace name", { name: " \t\n ", userNameUpdateId: 3 }],
+		["negative update id", { name: "Blocked name", userNameUpdateId: -1 }],
+		["missing update id", { name: "Missing source id" }],
+	])("malformed persisted user authority (%s) falls back to daemon naming", (_name, fields) => {
+		const reg = new TopicRegistry({
+			topics: {
+				bad: {
+					topicId: "bad",
+					identitySent: false,
+					createdAt: 1,
+					nameOwner: "user",
+					nameReconcilePending: true,
+					...fields,
+				},
+			},
+		});
+		expect(reg.needsRename("bad", "Generated name")).toBe(true);
+		expect(reg.get("bad")?.nameOwner).toBeUndefined();
+		expect(reg.get("bad")?.nameReconcilePending).toBeUndefined();
+		expect(reg.get("bad")?.userNameUpdateId).toBeUndefined();
+	});
+
+	test("retains valid user authority and normalizes legacy name state", () => {
+		const reg = new TopicRegistry({
+			topics: {
+				legacy: {
+					topicId: "legacy",
+					identitySent: false,
+					createdAt: 1,
+					name: "Legacy name",
+					userNameUpdateId: 99,
+					identityKey: "repo\0legacy",
+				},
+				user: {
+					topicId: "user",
+					identitySent: false,
+					createdAt: 1,
+					name: "Preserved name",
+					nameOwner: "user",
+					nameReconcilePending: true,
+					userNameUpdateId: 3,
+				},
+			},
+		});
+		expect(reg.needsRename("legacy", "Generated name")).toBe(true);
+		expect(reg.get("legacy")?.userNameUpdateId).toBeUndefined();
+		expect(reg.get("legacy")?.identityKey).toBe("repo\0legacy");
+		expect(reg.markUserName("legacy", "Another user name", 1)).toBe("updated");
+		expect(reg.userOwnedName("user")).toBe("Preserved name");
+		expect(reg.userNameToReconcile("user")).toBe("Preserved name");
+	});
+
 	test("resolves session for a topic id (inbound routing)", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "t-99");
@@ -60,6 +163,20 @@ describe("TopicRegistry", () => {
 		expect(reloaded.needsIdentity("s1")).toBe(false);
 		expect(reloaded.sessionForTopic("t1")).toBe("s1");
 	});
+	test("persists a monotonic SDK replay cursor across daemon restarts", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "t1");
+		expect(reg.replayCursor("s1")).toBeUndefined();
+		expect(reg.markReplayCursor("s1", 2, 7)).toBe(true);
+		expect(reg.markReplayCursor("s1", 2, 6)).toBe(false);
+		expect(reg.markReplayCursor("s1", 1, 99)).toBe(false);
+
+		const reloaded = new TopicRegistry(reg.serialize());
+		expect(reloaded.replayCursor("s1")).toEqual({ generation: 2, seq: 7 });
+		expect(reloaded.markReplayCursor("s1", 3, 1)).toBe(true);
+		expect(reloaded.replayCursor("s1")).toEqual({ generation: 3, seq: 1 });
+	});
+
 	test("concurrent getOrCreateTopic for one session creates exactly one topic (no race)", async () => {
 		const reg = new TopicRegistry();
 		let creates = 0;

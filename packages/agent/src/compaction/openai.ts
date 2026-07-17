@@ -24,6 +24,8 @@ import type { AssistantMessage, Message, Model } from "@gajae-code/ai/types";
 import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
+	neutralizeReservedControlTokens,
+	neutralizeResponsesInputControlTokens,
 	normalizeResponsesToolCallId,
 } from "@gajae-code/ai/utils";
 import { $env, logger } from "@gajae-code/utils";
@@ -479,10 +481,12 @@ export async function requestOpenAiRemoteCompaction(
 	const endpoint = resolveOpenAiCompactEndpoint(model, options?.authCredentialType);
 	const request: OpenAiRemoteCompactionRequest = {
 		model: model.id,
-		input: trimOpenAiCompactInput(
-			compactInput,
-			resolveOpenAiCompactInputBudget(model.contextWindow, model.maxTokens),
-			instructions,
+		input: neutralizeResponsesInputControlTokens(
+			trimOpenAiCompactInput(
+				compactInput,
+				resolveOpenAiCompactInputBudget(model.contextWindow, model.maxTokens),
+				instructions,
+			),
 		),
 		instructions,
 	};
@@ -510,18 +514,14 @@ export async function requestOpenAiRemoteCompaction(
 	});
 
 	if (!response.ok) {
-		const errorText = await response.text().catch(() => "");
-		logger.warn("OpenAI remote compaction failed", {
-			endpoint,
-			status: response.status,
-			statusText: response.statusText,
-			errorText,
-		});
 		throw new Error(`Remote compaction failed (${response.status} ${response.statusText})`);
 	}
 
-	const data = (await response.json()) as { output?: unknown[] } | undefined;
-	const rawOutput = data?.output ?? [];
+	const data = (await response.json()) as { output?: unknown } | undefined;
+	if (!Array.isArray(data?.output)) {
+		throw new Error(`Remote compaction response malformed output (outputType=${typeof data?.output})`);
+	}
+	const rawOutput = data.output;
 	const replacementHistory = rawOutput.filter(
 		(item): item is Record<string, unknown> =>
 			!!item && typeof item === "object" && shouldKeepOpenAiCompactOutputItem(item as Record<string, unknown>),
@@ -535,15 +535,9 @@ export async function requestOpenAiRemoteCompaction(
 		const outputTypes = rawOutput.map(item =>
 			typeof item === "object" && item !== null ? (item as Record<string, unknown>).type : typeof item,
 		);
-		logger.warn("Remote compaction response missing compaction item", {
-			endpoint,
-			model: model.id,
-			provider: model.provider,
-			rawOutputLength: rawOutput.length,
-			outputTypes,
-			replacementHistoryLength: replacementHistory.length,
-		});
-		throw new Error("Remote compaction response missing compaction item");
+		throw new Error(
+			`Remote compaction response missing compaction item (rawOutputLength=${rawOutput.length}, outputTypes=${outputTypes.join(",")}, replacementHistoryLength=${replacementHistory.length})`,
+		);
 	}
 	return { provider: model.provider, replacementHistory, compactionItem };
 }
@@ -553,21 +547,21 @@ export async function requestRemoteCompaction(
 	request: RemoteCompactionRequest,
 	signal?: AbortSignal,
 ): Promise<RemoteCompactionResponse> {
+	// The prompt embeds the serialized transcript, which can carry leaked Harmony
+	// control-token markers (e.g. `<|channel|>analysis`) from model output; a
+	// gpt-5.6-backed summarization endpoint rejects those with `Request blocked`.
+	const sanitizedRequest: RemoteCompactionRequest = {
+		systemPrompt: neutralizeReservedControlTokens(request.systemPrompt),
+		prompt: neutralizeReservedControlTokens(request.prompt),
+	};
 	const response = await fetch(endpoint, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify(request),
+		body: JSON.stringify(sanitizedRequest),
 		signal,
 	});
 
 	if (!response.ok) {
-		const errorText = await response.text().catch(() => "");
-		logger.warn("Remote compaction failed", {
-			endpoint,
-			status: response.status,
-			statusText: response.statusText,
-			errorText,
-		});
 		throw new Error(`Remote compaction failed (${response.status} ${response.statusText})`);
 	}
 

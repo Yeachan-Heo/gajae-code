@@ -29,7 +29,8 @@ The extension runner already treats `InputEventResult.handled === true` as termi
 
 - command: `ouroboros`
 - arguments: `dispatch`, then the full submitted input text
-- recursion guard variable: `_OUROBOROS_GJC_BRIDGE_DEPTH`
+- recursion guard variable: the Ouroboros bridge recursion-depth environment variable
+
 - continue/pass-through exit code: `78`
 
 Exit-code mapping:
@@ -42,7 +43,7 @@ Exit-code mapping:
 
 ## Recursion guard
 
-Before dispatch, the helper sets `_OUROBOROS_GJC_BRIDGE_DEPTH` to the next numeric depth and restores the previous value after dispatch finishes. A current numeric depth of `0` or `1` is dispatchable, which preserves concurrent independent interactive inputs while marking child dispatcher processes with depth `1`. A current numeric depth greater than `1`, or any non-empty non-numeric value, returns `{}` without dispatching.
+Before dispatch, the helper increments the Ouroboros bridge recursion-depth environment variable and restores its previous value after dispatch finishes. A current numeric depth of `0` or `1` is dispatchable, which preserves concurrent independent interactive inputs while marking child dispatcher processes with depth `1`. A current numeric depth greater than `1`, or any non-empty non-numeric value, returns `{}` without dispatching.
 
 This means the bridge allows exactly one inherited bridge-marked dispatcher level and blocks recursive re-entry from deeper bridge-marked children. The guard also passes through `event.source === "extension"` to avoid extension-originated messages re-entering the bridge.
 

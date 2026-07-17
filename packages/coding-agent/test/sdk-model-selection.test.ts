@@ -1,32 +1,42 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { createAgentSession, type ExtensionFactory } from "@gajae-code/coding-agent/sdk";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 
+setDefaultTimeout(20_000);
+
 describe("createAgentSession deferred model pattern resolution", () => {
 	let tempDir: string;
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		resetSettingsForTest();
 		tempDir = path.join(os.tmpdir(), `pi-sdk-model-selection-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
+		authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		registerRuntimeProvider(modelRegistry);
 	});
 
 	afterEach(() => {
+		resetSettingsForTest();
+		authStorage?.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
 
-	const providerExtension: ExtensionFactory = pi => {
-		pi.registerProvider("runtime-provider", {
-			baseUrl: "https://runtime.example.com/v1",
+	function registerRuntimeProvider(target: ModelRegistry): void {
+		target.registerProvider("runtime-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
 			apiKey: "RUNTIME_KEY",
 			api: "openai-completions",
 			models: [
@@ -47,29 +57,137 @@ describe("createAgentSession deferred model pattern resolution", () => {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: 128000,
 					maxTokens: 8192,
+					thinking: {
+						minLevel: Effort.Minimal,
+						maxLevel: Effort.High,
+						mode: "effort",
+						defaultLevel: Effort.Low,
+					},
+				},
+				{
+					id: "runtime-global-b",
+					name: "Runtime Global B",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+					thinking: {
+						minLevel: Effort.Minimal,
+						maxLevel: Effort.High,
+						mode: "effort",
+						defaultLevel: Effort.Low,
+					},
+				},
+				{
+					id: "runtime-policy-c",
+					name: "Runtime Policy C",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+					thinking: {
+						minLevel: Effort.Minimal,
+						maxLevel: Effort.High,
+						mode: "effort",
+						defaultLevel: Effort.Low,
+					},
 				},
 			],
 		});
-	};
+	}
 
-	function buildSessionOptions(modelPattern: string) {
+	function buildSessionOptions(modelPattern?: string, sessionManager: SessionManager = SessionManager.inMemory()) {
 		return {
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			disableExtensionDiscovery: true,
-			extensions: [providerExtension],
+			extensions: [],
 			skills: [],
 			contextFiles: [],
 			promptTemplates: [],
 			slashCommands: [],
 			enableMCP: false,
 			enableLsp: false,
+			workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+			toolNames: [],
+			rules: [],
+			modelRegistry,
 			modelPattern,
 		};
 	}
 
-	test("resolves explicit modelPattern after extension providers register", async () => {
+	test("uses the machine-global default selector and its effective suffix for a fresh session", async () => {
+		// Given a durable machine-global B selector
+		await Bun.write(
+			path.join(tempDir, "config.yml"),
+			"modelRoles:\n  default: runtime-provider/runtime-global-b:high\n",
+		);
+		const settings = await Settings.init({ cwd: tempDir, agentDir: tempDir });
+
+		// When a fresh session starts without an explicit model
+		const { session } = await createAgentSession({ ...buildSessionOptions(), settings });
+
+		// Then it consumes both the global model and effective thinking suffix
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "runtime-provider/runtime-global-b:high",
+		});
+		expect(session.model?.id).toBe("runtime-global-b");
+		expect(session.thinkingLevel).toBe(Effort.High);
+		await session.dispose();
+	});
+
+	test("uses project default role C instead of machine-global B for a fresh session", async () => {
+		// Given global B and a project-scoped C override
+		await Bun.write(
+			path.join(tempDir, "config.yml"),
+			"modelRoles:\n  default: runtime-provider/runtime-global-b:high\n",
+		);
+		await Bun.write(
+			path.join(tempDir, ".gjc", "config.yml"),
+			"modelRoles:\n  default: runtime-provider/runtime-policy-c:low\n",
+		);
+		const settings = await Settings.init({ cwd: tempDir, agentDir: tempDir });
+
+		// When a fresh project session starts without an explicit model
+		const { session } = await createAgentSession({ ...buildSessionOptions(), settings });
+
+		// Then project C and its suffix outrank global B
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "runtime-provider/runtime-global-b:high",
+		});
+		expect(settings.getModelRole("default")).toBe("runtime-provider/runtime-policy-c:low");
+		expect(session.model?.id).toBe("runtime-policy-c");
+		expect(session.thinkingLevel).toBe(Effort.Low);
+		await session.dispose();
+	});
+
+	test("restores resumed transcript C instead of machine-global B", async () => {
+		// Given global B and a resumed transcript that records C with medium thinking
+		await Bun.write(
+			path.join(tempDir, "config.yml"),
+			"modelRoles:\n  default: runtime-provider/runtime-global-b:high\n",
+		);
+		const settings = await Settings.init({ cwd: tempDir, agentDir: tempDir });
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendModelChange("runtime-provider/runtime-policy-c", "default");
+		sessionManager.appendThinkingLevelChange(Effort.Medium);
+
+		// When the recorded transcript resumes without an explicit model
+		const { session } = await createAgentSession({ ...buildSessionOptions(undefined, sessionManager), settings });
+
+		// Then transcript C and its recorded thinking level outrank global B
+		expect(settings.getGlobal("modelRoles")).toEqual({
+			default: "runtime-provider/runtime-global-b:high",
+		});
+		expect(session.model?.id).toBe("runtime-policy-c");
+		expect(session.thinkingLevel).toBe(Effort.Medium);
+		await session.dispose();
+	});
+
+	test("resolves explicit modelPattern after runtime providers are available", async () => {
 		const { session, modelFallbackMessage } = await createAgentSession(
 			buildSessionOptions("runtime-provider/runtime-model"),
 		);
@@ -78,6 +196,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		expect(session.model?.provider).toBe("runtime-provider");
 		expect(session.model?.id).toBe("runtime-model");
 		expect(modelFallbackMessage).toBeUndefined();
+		await session.dispose();
 	});
 
 	test("does not silently fallback when explicit modelPattern is unresolved", async () => {
@@ -87,6 +206,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 
 		expect(session.model).toBeUndefined();
 		expect(modelFallbackMessage).toBe('Model "missing-provider/missing-model" not found');
+		await session.dispose();
 	});
 
 	test("does not apply default role thinking override when modelPattern is explicit", async () => {
@@ -101,6 +221,30 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		expect(session.model?.provider).toBe("runtime-provider");
 		expect(session.model?.id).toBe("runtime-reasoning-model");
 		expect(session.thinkingLevel).toBe("off");
+		await session.dispose();
+	});
+
+	test("uses model defaultLevel when default thinking is not configured", async () => {
+		const { session } = await createAgentSession(buildSessionOptions("runtime-provider/runtime-reasoning-model"));
+
+		expect(session.model?.provider).toBe("runtime-provider");
+		expect(session.model?.id).toBe("runtime-reasoning-model");
+		expect(session.thinkingLevel).toBe(Effort.Low);
+		await session.dispose();
+	});
+
+	test("uses explicit defaultThinkingLevel over model defaultLevel", async () => {
+		const settings = Settings.isolated({ defaultThinkingLevel: Effort.Minimal });
+
+		const { session } = await createAgentSession({
+			...buildSessionOptions("runtime-provider/runtime-reasoning-model"),
+			settings,
+		});
+
+		expect(session.model?.provider).toBe("runtime-provider");
+		expect(session.model?.id).toBe("runtime-reasoning-model");
+		expect(session.thinkingLevel).toBe(Effort.Minimal);
+		await session.dispose();
 	});
 
 	test("selects the settings default model without synchronously validating auth", async () => {
@@ -134,6 +278,9 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				slashCommands: [],
 				enableMCP: false,
 				enableLsp: false,
+				workspaceTree: { rootPath: tempDir, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+				toolNames: [],
+				rules: [],
 			});
 
 			try {
@@ -200,6 +347,73 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				reason: "auth_unavailable",
 				thinkingLevel: Effort.High,
 			});
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("restores the configured default-chain head over legacy models.default on resume", async () => {
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		// Legacy scalar model diverges from the configured chain head.
+		sessionManager.appendModelChange("runtime-provider/runtime-reasoning-model", "default");
+		sessionManager.appendConfiguredModelChain({
+			role: "default",
+			entries: ["runtime-provider/runtime-model", "runtime-provider/runtime-reasoning-model"],
+			origin: "model_selection",
+			explicitHead: true,
+		});
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await sessionManager.close();
+
+		authStorage.setRuntimeApiKey("runtime-provider", "test-key");
+		const resumedManager = await SessionManager.open(sessionFile, tempDir);
+		const { session } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			sessionManager: resumedManager,
+		});
+
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-model");
+		} finally {
+			await session.dispose();
+		}
+	});
+	test("falls back to the global default without seeding an exhausted persisted controller", async () => {
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		sessionManager.appendConfiguredModelChain({
+			role: "default",
+			entries: ["missing-provider/first", "missing-provider/second"],
+			origin: "model_selection",
+			explicitHead: true,
+		});
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await sessionManager.close();
+
+		authStorage.setRuntimeApiKey("runtime-provider", "test-key");
+		const settings = Settings.isolated();
+		settings.setModelRole("default", "runtime-provider/runtime-model");
+		const resumedManager = await SessionManager.open(sessionFile, tempDir);
+		const { session } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			settings,
+			sessionManager: resumedManager,
+		});
+
+		try {
+			expect(session.model).toMatchObject({ provider: "runtime-provider", id: "runtime-model" });
+			expect(session.getConfiguredModelChain("default")).toEqual([
+				"missing-provider/first",
+				"missing-provider/second",
+			]);
 		} finally {
 			await session.dispose();
 		}

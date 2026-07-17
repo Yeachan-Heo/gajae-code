@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import type { GcContext } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 import { tmuxSessionsGcAdapter } from "@gajae-code/coding-agent/gjc-runtime/tmux-gc";
+import { __setMutationServerProofForTests } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 
 const env = { GJC_TMUX_COMMAND: "tmux-test" };
 const project = "/tmp/gjc-project";
@@ -37,6 +38,8 @@ function sessionLine(overrides: {
 	project?: string;
 	sessionId?: string;
 	sessionStateFile?: string;
+	ownerGeneration?: string;
+	nativeSessionId?: string;
 }): string {
 	return [
 		overrides.name,
@@ -52,12 +55,16 @@ function sessionLine(overrides: {
 		overrides.project ?? "",
 		overrides.sessionId ?? "",
 		overrides.sessionStateFile ?? "",
+		overrides.ownerGeneration ?? "generation-1",
+		"",
+		overrides.nativeSessionId ?? "$1",
 	].join("\t");
 }
 
 describe("tmux GC safety", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+		__setMutationServerProofForTests(null);
 	});
 
 	it("classifies attached/live tagged sessions with stale metadata as non-removable and does not prune", async () => {
@@ -124,14 +131,22 @@ describe("tmux GC safety", () => {
 		expect(calls).not.toContainEqual(["tmux-test", "kill-session", "-t", "=unrelated_orphan"]);
 	});
 
-	it("prunes detached pane-less sessions only when their runtime marker is terminal", async () => {
+	it("classifies terminal detached sessions but refuses prune without exact server proof", async () => {
 		spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
 		const stateFile = "/tmp/gjc-terminal-marker.json";
 		await Bun.write(
 			stateFile,
-			JSON.stringify({ schema_version: 1, session_id: "session-1", state: "completed", cwd: project }),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "session-1",
+				state: "completed",
+				cwd: project,
+				workdir: project,
+				session_file: null,
+			}),
 		);
 		const calls: string[][] = [];
+		__setMutationServerProofForTests(() => ({ pid: 1, startTime: "test" }));
 		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
 		spawnSyncSpy.mockImplementation((cmd: string[]) => {
 			calls.push(cmd);
@@ -149,12 +164,14 @@ describe("tmux GC safety", () => {
 					}),
 				);
 			}
+			if (cmd.includes("display-message") && cmd.at(-1) === "#{session_id}") return spawnResult(0, "$1\n");
 			if (cmd.includes("show-options")) {
 				const option = cmd.at(-1);
 				if (option === "@gjc-profile") return spawnResult(0, "1\n");
 				if (option === "@gjc-project") return spawnResult(0, `${project}\n`);
 				if (option === "@gjc-branch") return spawnResult(0, "main\n");
 				if (option === "@gjc-session-id") return spawnResult(0, "session-1\n");
+				if (option === "@gjc-owner-generation") return spawnResult(0, "generation-1\n");
 				if (option === "@gjc-session-state-file") return spawnResult(0, `${stateFile}\n`);
 			}
 			return spawnResult(0, "");
@@ -169,8 +186,11 @@ describe("tmux GC safety", () => {
 				removable: true,
 				reason: "terminal_runtime_marker_detached_idle_session",
 			});
-			expect(await tmuxSessionsGcAdapter.prune(record!, ctx())).toEqual({ removed: true });
-			expect(calls).toContainEqual(["tmux-test", "kill-session", "-t", "=gajae_code_done"]);
+			expect(await tmuxSessionsGcAdapter.prune(record!, ctx())).toEqual({
+				removed: false,
+				error: "gjc_tmux_cleanup_target_changed",
+			});
+			expect(calls).not.toContainEqual(["tmux-test", "kill-session", "-t", "=gajae_code_done"]);
 		} finally {
 			await fs.rm(stateFile, { force: true });
 		}
@@ -232,7 +252,14 @@ describe("tmux GC safety", () => {
 		const stateFile = "/tmp/gjc-terminal-attached-marker.json";
 		await Bun.write(
 			stateFile,
-			JSON.stringify({ schema_version: 1, session_id: "session-1", state: "completed", cwd: project }),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "session-1",
+				state: "completed",
+				cwd: project,
+				workdir: project,
+				session_file: null,
+			}),
 		);
 		const calls: string[][] = [];
 		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
@@ -285,6 +312,8 @@ describe("tmux GC safety", () => {
 				session_id: "race-session",
 				state: "completed",
 				cwd: "/tmp/missing-gjc-project",
+				workdir: "/tmp/missing-gjc-project",
+				session_file: null,
 			}),
 		);
 		const calls: string[][] = [];
@@ -308,12 +337,14 @@ describe("tmux GC safety", () => {
 					}),
 				);
 			}
+			if (cmd.includes("display-message") && cmd.at(-1) === "#{session_id}") return spawnResult(0, "$1\n");
 			if (cmd.includes("show-options")) {
 				const option = cmd.at(-1);
 				if (option === "@gjc-profile") return spawnResult(0, "1\n");
 				if (option === "@gjc-project") return spawnResult(0, "/tmp/missing-gjc-project\n");
 				if (option === "@gjc-branch") return spawnResult(0, "stale\n");
 				if (option === "@gjc-session-id") return spawnResult(0, "race-session\n");
+				if (option === "@gjc-owner-generation") return spawnResult(0, "generation-1\n");
 				if (option === "@gjc-session-state-file") return spawnResult(0, `${stateFile}\n`);
 				return spawnResult(0, "\n");
 			}
@@ -349,6 +380,8 @@ describe("tmux GC safety", () => {
 				session_id: "final-race-session",
 				state: "completed",
 				cwd: "/tmp/missing-gjc-project",
+				workdir: "/tmp/missing-gjc-project",
+				session_file: null,
 			}),
 		);
 		const calls: string[][] = [];
@@ -372,12 +405,14 @@ describe("tmux GC safety", () => {
 					}),
 				);
 			}
+			if (cmd.includes("display-message") && cmd.at(-1) === "#{session_id}") return spawnResult(0, "$1\n");
 			if (cmd.includes("show-options")) {
 				const option = cmd.at(-1);
 				if (option === "@gjc-profile") return spawnResult(0, "1\n");
 				if (option === "@gjc-project") return spawnResult(0, "/tmp/missing-gjc-project\n");
 				if (option === "@gjc-branch") return spawnResult(0, "stale\n");
 				if (option === "@gjc-session-id") return spawnResult(0, "final-race-session\n");
+				if (option === "@gjc-owner-generation") return spawnResult(0, "generation-1\n");
 				if (option === "@gjc-session-state-file") return spawnResult(0, `${stateFile}\n`);
 				return spawnResult(0, "\n");
 			}
@@ -413,6 +448,8 @@ describe("tmux GC safety", () => {
 				session_id: "final-pane-race-session",
 				state: "completed",
 				cwd: "/tmp/missing-gjc-project",
+				workdir: "/tmp/missing-gjc-project",
+				session_file: null,
 			}),
 		);
 		const calls: string[][] = [];
@@ -437,12 +474,14 @@ describe("tmux GC safety", () => {
 					}),
 				);
 			}
+			if (cmd.includes("display-message") && cmd.at(-1) === "#{session_id}") return spawnResult(0, "$1\n");
 			if (cmd.includes("show-options")) {
 				const option = cmd.at(-1);
 				if (option === "@gjc-profile") return spawnResult(0, "1\n");
 				if (option === "@gjc-project") return spawnResult(0, "/tmp/missing-gjc-project\n");
 				if (option === "@gjc-branch") return spawnResult(0, "stale\n");
 				if (option === "@gjc-session-id") return spawnResult(0, "final-pane-race-session\n");
+				if (option === "@gjc-owner-generation") return spawnResult(0, "generation-1\n");
 				if (option === "@gjc-session-state-file") return spawnResult(0, `${stateFile}\n`);
 				return spawnResult(0, "\n");
 			}

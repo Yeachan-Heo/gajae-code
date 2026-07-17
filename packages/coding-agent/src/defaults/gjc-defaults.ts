@@ -9,6 +9,9 @@ import deepInterviewSkill from "./gjc/skills/deep-interview/SKILL.md" with { typ
 import ralplanSkill from "./gjc/skills/ralplan/SKILL.md" with { type: "text" };
 import teamSkill from "./gjc/skills/team/SKILL.md" with { type: "text" };
 import aiSlopCleanerFragment from "./gjc/skills/ultragoal/ai-slop-cleaner.md" with { type: "text" };
+import pipelineValidationContractsFragment from "./gjc/skills/ultragoal/pipeline-validation-contracts.md" with {
+	type: "text",
+};
 import ultragoalSkill from "./gjc/skills/ultragoal/SKILL.md" with { type: "text" };
 
 export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
@@ -112,6 +115,12 @@ const DEFAULT_GJC_DEFINITIONS: readonly DefaultGjcDefinition[] = [
 		parentSkillName: "ultragoal",
 		relativePath: "skill-fragments/ultragoal/ai-slop-cleaner.md",
 		content: aiSlopCleanerFragment,
+	},
+	{
+		kind: "skill-fragment",
+		parentSkillName: "ultragoal",
+		relativePath: "skill-fragments/ultragoal/pipeline-validation-contracts.md",
+		content: pipelineValidationContractsFragment,
 	},
 ];
 

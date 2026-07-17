@@ -388,7 +388,7 @@ function benchSessionState(): SessionState {
 			base: "main",
 			issueOrPr: null,
 			processHandle: { kind: "runtime-owner", ownerId: null, pid: null },
-			rpcHandle: { kind: "rpc-subprocess", pid: null, sessionDir: "/tmp/bench" },
+			sdkHandle: { kind: "sdk-session-endpoint", sessionId: "bench-session" },
 			ownerHandle: { leasePath: "/tmp/bench/lease", endpoint: null, heartbeatAt: null },
 			routerHandle: { kind: "default-in-owner", policy: "default", eventsPath: "/tmp/bench/events.jsonl" },
 			viewportHandle: { kind: "event-monitor", tmuxSessionName: null, viewOnly: true },

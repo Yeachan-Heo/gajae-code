@@ -5,12 +5,16 @@
 //! passthrough while a command is running.
 
 #[cfg(windows)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::{
 	collections::HashMap,
 	io::{Read, Write},
 	str,
-	sync::{Arc, Mutex, mpsc},
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicU64, Ordering},
+		mpsc,
+	},
 	time::{Duration, Instant},
 };
 
@@ -87,6 +91,17 @@ const FINAL_READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
 const READER_EVENT_QUEUE_CAPACITY: usize = 1024;
 const READER_LOSS_MARKER_PREFIX: &str = "\n[PTY output truncated: ";
 const TERMINATED_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+static OPENPTY_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[napi]
+pub fn pty_timeout_count() -> u64 {
+	OPENPTY_TIMEOUT_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(any(windows, test))]
+fn record_openpty_timeout() {
+	OPENPTY_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 #[cfg(windows)]
 static WINDOWS_OPENPTY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -452,6 +467,50 @@ impl Drop for WindowsOpenptyAttempt {
 	}
 }
 
+/// Remove the macOS malloc-stack-logging debug vars from a PTY child command.
+///
+/// macOS libmalloc prints `MallocStackLogging: …` to any TTY-attached process
+/// that inherits these vars, and PTY children always have a TTY stderr, so a
+/// contaminated parent would flood the terminal once per child. Applied after
+/// any caller-supplied env so explicit forwarding cannot reintroduce them.
+/// No-op off macOS (the vars are simply absent).
+fn scrub_macos_malloc_stack_logging_env(cmd: &mut CommandBuilder) {
+	cmd.env_remove("MallocStackLogging");
+	cmd.env_remove("MallocStackLoggingNoCompact");
+}
+
+/// Build the PTY child command from a run config.
+///
+/// portable-pty's `CommandBuilder` snapshots the live parent environ, so the
+/// malloc-env scrub here also protects direct SDK/embedder consumers that never
+/// pass through the CLI re-exec guard. Kept as one builder so production and
+/// tests spawn from the exact same command.
+fn build_pty_command(config: &PtyRunConfig) -> CommandBuilder {
+	let shell = config.shell.as_deref().unwrap_or("sh");
+	let mut cmd = CommandBuilder::new(shell);
+	// Use shell-appropriate command execution flags
+	let lower = shell.to_lowercase();
+	if lower.ends_with("cmd.exe") || lower.ends_with("cmd") {
+		cmd.arg("/c");
+	} else if lower.contains("powershell") || lower.contains("pwsh") {
+		cmd.arg("-Command");
+	} else {
+		// sh/bash/zsh/fish etc.
+		cmd.arg("-lc");
+	}
+	cmd.arg(&config.command);
+	if let Some(cwd) = config.cwd.as_ref() {
+		cmd.cwd(cwd);
+	}
+	if let Some(env) = config.env.as_ref() {
+		for (key, value) in env {
+			cmd.env(key, value);
+		}
+	}
+	scrub_macos_malloc_stack_logging_env(&mut cmd);
+	cmd
+}
+
 fn run_pty_sync(
 	config: PtyRunConfig,
 	on_chunk: Option<ThreadsafeFunction<String>>,
@@ -491,6 +550,7 @@ fn run_pty_sync(
 					return Err(Error::from_reason(format!("Failed to open PTY: {e}")));
 				},
 				Err(_) => {
+					record_openpty_timeout();
 					// The worker may be permanently stuck inside ConPTY. Keep the
 					// single-flight gate held after timeout so residual leakage is capped
 					// to one outstanding openpty thread for the process lifetime.
@@ -514,27 +574,7 @@ fn run_pty_sync(
 			.map_err(|err| Error::from_reason(format!("Failed to open PTY: {err}")))?
 	};
 
-	let shell = config.shell.as_deref().unwrap_or("sh");
-	let mut cmd = CommandBuilder::new(shell);
-	// Use shell-appropriate command execution flags
-	let lower = shell.to_lowercase();
-	if lower.ends_with("cmd.exe") || lower.ends_with("cmd") {
-		cmd.arg("/c");
-	} else if lower.contains("powershell") || lower.contains("pwsh") {
-		cmd.arg("-Command");
-	} else {
-		// sh/bash/zsh/fish etc.
-		cmd.arg("-lc");
-	}
-	cmd.arg(&config.command);
-	if let Some(cwd) = config.cwd.as_ref() {
-		cmd.cwd(cwd);
-	}
-	if let Some(env) = config.env.as_ref() {
-		for (key, value) in env {
-			cmd.env(key, value);
-		}
-	}
+	let cmd = build_pty_command(&config);
 	ct.heartbeat()
 		.map_err(|err| Error::from_reason(format!("PTY setup cancelled before spawn: {err}")))?;
 
@@ -897,6 +937,32 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn build_pty_command_scrubs_macos_malloc_stack_logging_env() {
+		let mut env = std::collections::HashMap::new();
+		env.insert("MallocStackLogging".to_string(), "1".to_string());
+		env.insert("MallocStackLoggingNoCompact".to_string(), "1".to_string());
+		env.insert("KEEP_ME".to_string(), "value".to_string());
+		let mut config = test_config("true");
+		config.env = Some(env);
+
+		let cmd = build_pty_command(&config);
+
+		assert!(
+			cmd.get_env("MallocStackLogging").is_none(),
+			"MallocStackLogging must be scrubbed even when explicitly forwarded",
+		);
+		assert!(
+			cmd.get_env("MallocStackLoggingNoCompact").is_none(),
+			"MallocStackLoggingNoCompact must be scrubbed even when explicitly forwarded",
+		);
+		assert_eq!(
+			cmd.get_env("KEEP_ME"),
+			Some(std::ffi::OsStr::new("value")),
+			"unrelated forwarded env vars must be preserved",
+		);
+	}
+
 	#[cfg(unix)]
 	fn process_exists(pid: i32) -> bool {
 		unsafe { libc::kill(pid, 0) == 0 }
@@ -941,6 +1007,17 @@ mod tests {
 				.map_err(|err| Error::from_reason(format!("Failed to write child pid: {err}")))?;
 		}
 		Err(Error::from_reason("simulated post-spawn setup failure"))
+	}
+
+	#[test]
+	fn pty_timeout_counter_increments() {
+		let _guard = PTY_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+		// Delta assertion: the counter is process-global, so other tests (or
+		// real Windows openpty timeouts under plain `cargo test`) may have
+		// already incremented it.
+		let before = pty_timeout_count();
+		record_openpty_timeout();
+		assert_eq!(pty_timeout_count(), before + 1);
 	}
 
 	#[test]

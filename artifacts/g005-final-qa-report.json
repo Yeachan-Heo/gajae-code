@@ -1,0 +1,30 @@
+{
+  "goalId": "G005",
+  "status": "PASS",
+  "scope": "First-class Discord and Slack daemons on the canonical Gajae-Code SDK bus",
+  "verification": {
+    "phaseE": "198 pass, 0 fail, 762 expectations across 13 files",
+    "adapterParity": "546 pass, 0 fail, 1437 expectations; 91 rows per telegram/discord/slack/mcp/acp/daemonCli",
+    "exactManifest": "546 row receipts complete; 91 per adapter",
+    "telegramBaseline": "manifest receipts complete",
+    "typescript": "pass",
+    "schemas": "pass",
+    "canonicalization": "pass; 3 sanctioned server hosts",
+    "rename": "pass",
+    "workspaceBuild": "pass",
+    "rustSdk": "99 passed"
+  },
+  "independentReview": {
+    "architecture": "agent://253-G005StaleRecoveryReview — CLEAR / APPROVE",
+    "qa": "agent://254-G005StaleRecoveryQA — PASS / CLEAR",
+    "cleaner": "agent://257-G005CleanerClearance — PASS / CLEAR / APPROVE"
+  },
+  "contracts": [
+    "Discord and Slack recover durable provider and SDK effects before accepting inbound transport delivery.",
+    "All replayable effects receive bounded autonomous retry; stale effects terminalize with evidence.",
+    "Discord interactions use immutable action publication effect IDs and nonces; callback tokens are never persisted.",
+    "Slack orphan adoption is bound to exact team/channel/root/event/interaction/retry authority.",
+    "Chat policy derives from canonical operation dispositions and fails closed for secrets and prohibited operations.",
+    "Production worker configuration uses the validated config/schema boundary and ownership cleanup is unconditional."
+  ]
+}

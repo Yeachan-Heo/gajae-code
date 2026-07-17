@@ -1,5 +1,4 @@
 import { Command, Flags } from "@gajae-code/utils/cli";
-import { prepareContributionPrep } from "../session/contribution-prep";
 
 function writeText(lines: string[]): void {
 	process.stdout.write(`${lines.join("\n")}\n`);
@@ -19,6 +18,7 @@ export default class ContributionPrep extends Command {
 
 	async run(): Promise<void> {
 		const { flags } = await this.parse(ContributionPrep);
+		const { prepareContributionPrep } = await import("../session/contribution-prep");
 		const cwd = process.cwd();
 		const result = await prepareContributionPrep(
 			{

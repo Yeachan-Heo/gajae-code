@@ -20,6 +20,7 @@ import type {
 } from "../types";
 import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
 import {
@@ -51,6 +52,43 @@ export type {
 export { normalizeSchemaForGoogle };
 
 type GoogleApiType = "google-generative-ai" | "google-gemini-cli" | "google-vertex";
+export const PROVIDER_SAFETY_STOP = "provider_safety_stop";
+
+export function isGoogleCandidateSafetyStopReason(reason: string): boolean {
+	switch (reason) {
+		case "SAFETY":
+		case "IMAGE_SAFETY":
+		case "PROHIBITED_CONTENT":
+		case "IMAGE_PROHIBITED_CONTENT":
+		case "SPII":
+		case "BLOCKLIST":
+		case "RECITATION":
+		case "IMAGE_RECITATION":
+		case "MODEL_ARMOR":
+			return true;
+		default:
+			return false;
+	}
+}
+
+export function isGooglePromptSafetyStopReason(reason: string): boolean {
+	switch (reason) {
+		case "SAFETY":
+		case "IMAGE_SAFETY":
+		case "PROHIBITED_CONTENT":
+		case "BLOCKLIST":
+		case "MODEL_ARMOR":
+		case "JAILBREAK":
+			return true;
+		default:
+			return false;
+	}
+}
+
+export function getGooglePromptBlockReason(promptFeedback: { blockReason?: unknown } | undefined): string | undefined {
+	const blockReason = promptFeedback?.blockReason;
+	return typeof blockReason === "string" && blockReason.length > 0 ? blockReason : undefined;
+}
 
 /**
  * Thinking level for Gemini 3 models. Mirrors Google's `ThinkingLevel` enum values.
@@ -607,9 +645,24 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 		}
 
 		if (candidate?.finishReason) {
-			output.stopReason = mapStopReason(candidate.finishReason);
-			if (output.content.some(b => b.type === "toolCall")) {
-				output.stopReason = "toolUse";
+			if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
+				output.errorKind = PROVIDER_SAFETY_STOP;
+				output.stopReason = "error";
+			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+				output.stopReason = mapStopReason(candidate.finishReason);
+				if (output.stopReason === "stop" && output.content.some(b => b.type === "toolCall")) {
+					output.stopReason = "toolUse";
+				}
+			}
+		}
+
+		const blockReason = getGooglePromptBlockReason(chunk.promptFeedback);
+		if (blockReason) {
+			if (isGooglePromptSafetyStopReason(blockReason)) {
+				output.errorKind = PROVIDER_SAFETY_STOP;
+				output.stopReason = "error";
+			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+				output.stopReason = "error";
 			}
 		}
 
@@ -816,7 +869,11 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 					new Error(`Google API error (${response.status}): ${extractGoogleErrorMessage(errorText)}`),
 					response.status,
 				);
-				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, true)) {
+				if (
+					!options?.fallbackManaged &&
+					firstTokenTime === undefined &&
+					isForcedToolChoiceUnsupportedError(error, true)
+				) {
 					const beforeMark = resolveToolChoice(model, options?.toolChoice);
 					markToolChoiceIncapability(model, "auto", error.message);
 					stream.push({
@@ -886,6 +943,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error);
 			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;

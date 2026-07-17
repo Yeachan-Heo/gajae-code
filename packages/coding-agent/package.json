@@ -1,13 +1,10 @@
 {
 	"type": "module",
 	"name": "@gajae-code/coding-agent",
-	"version": "0.8.1",
+	"version": "0.11.1",
 	"description": "Gajae Code CLI with read, bash, edit, write tools and session management",
 	"homepage": "https://gajae-code.com",
-	"author": "Yeachan-Heo",
-	"contributors": [
-		"Mario Zechner"
-	],
+	"author": "Yeachan-Heo and Gajae Code Contributors",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -32,10 +29,11 @@
 	},
 	"scripts": {
 		"build": "bun scripts/build-binary.ts",
-		"check": "biome check . && bun run check:types",
-		"check:types": "tsgo -p tsconfig.json --noEmit",
+		"check": "biome check . && bun run generate-hotkeys-docs --check && bun run verify:sdk-canonicalization && bun run check:types",
+		"check:types": "tsc -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",
+		"generate-hotkeys-docs": "bun scripts/generate-hotkeys-docs.ts",
 		"bench:context": "bun run bench/context-optimization.bench.ts",
 		"generate-schemas": "bun ../../scripts/generate-json-schemas.ts",
 		"check:schemas": "bun ../../scripts/generate-json-schemas.ts --check",
@@ -46,7 +44,9 @@
 		"prepack": "bun scripts/generate-docs-index.ts",
 		"generate-template": "bun scripts/generate-template.ts",
 		"install:defaults": "bun src/cli.ts setup defaults",
-		"verify:insane-vendor": "bun scripts/verify-insane-vendor.ts"
+		"verify:insane-vendor": "bun scripts/verify-insane-vendor.ts",
+		"verify:sdk-canonicalization": "bun scripts/verify-gjc-sdk-canonicalization.ts",
+		"check:sdk-closure": "bun scripts/generate-sdk-operation-inventory.ts --check && bun scripts/generate-sdk-adapter-parity-manifest.ts --check && bun scripts/run-test-manifest.ts test/manifests/sdk-adapter-parity-v1.json && bun scripts/generate-telegram-baseline-manifest.ts --check && bun scripts/run-test-manifest.ts test/manifests/telegram-baseline-v1.json && bun test test/sdk-downgrade-rollback.test.ts test/sdk-downgrade-unknown-version.test.ts && bun scripts/verify-gjc-sdk-canonicalization.ts --self-test && bun scripts/verify-gjc-sdk-canonicalization.ts && bun scripts/verify-gjc-sdk-rename.ts"
 	},
 	"dependencies": {
 		"@agentclientprotocol/sdk": "catalog:",
@@ -55,6 +55,7 @@
 		"@gajae-code/stats": "catalog:",
 		"@gajae-code/agent-core": "catalog:",
 		"@gajae-code/ai": "catalog:",
+		"@gajae-code/bridge-client": "catalog:",
 		"@gajae-code/natives": "catalog:",
 		"@gajae-code/tui": "catalog:",
 		"@gajae-code/utils": "catalog:",
@@ -74,6 +75,9 @@
 		"zod": "catalog:"
 	},
 	"devDependencies": {
+		"@babel/traverse": "catalog:",
+		"@babel/types": "catalog:",
+		"@types/babel__traverse": "catalog:",
 		"@types/bun": "catalog:",
 		"@types/ws": "catalog:"
 	},
@@ -87,7 +91,11 @@
 		"examples",
 		"README.md",
 		"CHANGELOG.md",
-		"vendor"
+		"vendor",
+		"!vendor/insane-search/engine/tests/**",
+		"!src/export/html/template.html",
+		"!src/export/html/template.css",
+		"!src/export/html/template.js"
 	],
 	"exports": {
 		"./cli": {
@@ -113,6 +121,27 @@
 		"./modes/components/runtime-mcp-add-wizard": null,
 		"./modes/controllers/runtime-mcp-command-controller": null,
 		"./slash-commands/helpers/mcp": null,
+		"./session/session-manager-internal": null,
+		"./session/session-manager-internal.js": null,
+		"./sdk": {
+			"types": "./src/sdk/index.ts",
+			"import": "./src/sdk/index.ts"
+		},
+		"./sdk/models": null,
+		"./sdk/models.js": null,
+		"./sdk/lifecycle-session": null,
+		"./sdk/lifecycle-session.js": null,
+		"./sdk/startup-capability": null,
+		"./sdk/startup-capability.js": null,
+		"./sdk/bus": {
+			"types": "./src/sdk/bus/index.ts",
+			"import": "./src/sdk/bus/index.ts"
+		},
+		"./sdk/bus/*": {
+			"types": "./src/sdk/bus/*.ts",
+			"import": "./src/sdk/bus/*.ts"
+		},
+		"./session/internal/*": null,
 		"./*": {
 			"types": "./src/*.ts",
 			"import": "./src/*.ts"
@@ -393,6 +422,7 @@
 			"types": "./src/hindsight/*.ts",
 			"import": "./src/hindsight/*.ts"
 		},
+		"./modes/shared/agent-wire/*": null,
 		"./modes": {
 			"types": "./src/modes/index.ts",
 			"import": "./src/modes/index.ts"
@@ -436,10 +466,6 @@
 		"./modes/controllers/*": {
 			"types": "./src/modes/controllers/*.ts",
 			"import": "./src/modes/controllers/*.ts"
-		},
-		"./modes/rpc/*": {
-			"types": "./src/modes/rpc/*.ts",
-			"import": "./src/modes/rpc/*.ts"
 		},
 		"./modes/theme/*": {
 			"types": "./src/modes/theme/*.ts",

@@ -1,13 +1,18 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
+	buildActionMarkdown,
 	buildActionMessage,
 	createAliasTable,
 	decodeCallbackData,
 	encodeCallbackData,
 	routeInboundUpdate,
+	runTelegramReferenceClient,
 	sendTelegramHtmlChunks,
 	telegramUpdateToReply,
-} from "../src/notifications/telegram-reference";
+} from "../src/sdk/bus/telegram-reference";
 
 describe("telegram reference client helpers", () => {
 	test("callback data round-trips and stays within 64 bytes", () => {
@@ -159,5 +164,178 @@ describe("telegram reference client helpers", () => {
 	test("telegramUpdateToReply ignores irrelevant updates", () => {
 		expect(telegramUpdateToReply({}, "tok", "a1")).toBeNull();
 		expect(telegramUpdateToReply({ callback_query: { data: "bad" } }, "tok", "a1")).toBeNull();
+	});
+});
+
+describe("buildActionMarkdown", () => {
+	test("ask: heading, blank line, and numbered options as raw markdown", () => {
+		const md = buildActionMarkdown({ kind: "ask", question: "Proceed?", options: ["Yes", "No"] });
+		expect(md).toContain("Proceed?");
+		expect(md).toContain("1. Yes\n2. No");
+		expect(md).not.toContain("<b>");
+	});
+
+	test("ask without options falls back to the free-text hint", () => {
+		const md = buildActionMarkdown({ kind: "ask", question: "Name?" });
+		expect(md).toContain("Name?");
+		expect(md).toContain("(reply with text)");
+	});
+
+	test("idle with and without summary", () => {
+		expect(buildActionMarkdown({ kind: "idle", summary: "done" })).toBe("🟢 Agent idle\ndone");
+		expect(buildActionMarkdown({ kind: "idle" })).toBe("🟢 Agent idle");
+	});
+});
+
+class FakeReferenceWebSocket extends EventTarget {
+	static OPEN = 1;
+	static instances: FakeReferenceWebSocket[] = [];
+
+	readyState = 0;
+	sent: string[] = [];
+
+	constructor(readonly url: string) {
+		super();
+		FakeReferenceWebSocket.instances.push(this);
+	}
+
+	send(data: string): void {
+		this.sent.push(data);
+	}
+
+	emitOpen(): void {
+		this.readyState = FakeReferenceWebSocket.OPEN;
+		this.dispatchEvent(new Event("open"));
+	}
+
+	emitMessage(data: unknown): void {
+		this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(data) }));
+	}
+
+	close(): void {
+		this.readyState = 3;
+		this.dispatchEvent(new Event("close"));
+	}
+}
+
+type ReferenceFetchCall = {
+	url: string;
+	body: unknown;
+};
+
+function createReferenceClientFixture() {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-reference-test-"));
+	const endpointFile = path.join(directory, "endpoint.json");
+	fs.writeFileSync(endpointFile, JSON.stringify({ url: "ws://reference.test", token: "discovery token" }));
+
+	const calls: ReferenceFetchCall[] = [];
+	let releasePoll: (() => void) | undefined;
+	const fetchImpl = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+		calls.push({ url: String(input), body: init?.body });
+		return new Promise<Response>(resolve => {
+			releasePoll = () => resolve(new Response(JSON.stringify({ ok: true, result: [] })));
+		});
+	}) as typeof fetch;
+
+	return {
+		calls,
+		endpointFile,
+		fetchImpl,
+		cleanup: () => fs.rmSync(directory, { force: true, recursive: true }),
+		releasePoll: () => releasePoll?.(),
+	};
+}
+
+async function stopReferenceClient(
+	client: Promise<void> | undefined,
+	fixture: ReturnType<typeof createReferenceClientFixture>,
+) {
+	FakeReferenceWebSocket.instances[0]?.close();
+	fixture.releasePoll();
+	if (client) await client;
+}
+
+describe("telegram reference client negotiation", () => {
+	test("sends the protocol-v3 ask-controls ClientHello when the WebSocket opens", async () => {
+		const originalWebSocket = globalThis.WebSocket;
+		const fixture = createReferenceClientFixture();
+		let client: Promise<void> | undefined;
+
+		try {
+			FakeReferenceWebSocket.instances = [];
+			globalThis.WebSocket = FakeReferenceWebSocket as unknown as typeof WebSocket;
+			client = runTelegramReferenceClient({
+				botToken: "bot-token",
+				chatId: "chat-id",
+				endpointFile: fixture.endpointFile,
+				apiBase: "https://telegram.test",
+				fetchImpl: fixture.fetchImpl,
+			});
+
+			const socket = FakeReferenceWebSocket.instances[0]!;
+			expect(socket.url).toBe("ws://reference.test/?token=discovery%20token");
+			socket.emitOpen();
+
+			expect(socket.sent).toHaveLength(1);
+			const hello = JSON.parse(socket.sent[0]!);
+			expect(hello).toMatchObject({ type: "hello", protocolVersion: 3 });
+			expect(hello.capabilities).toContain("ask_controls_v1");
+		} finally {
+			await stopReferenceClient(client, fixture);
+			globalThis.WebSocket = originalWebSocket;
+			fixture.cleanup();
+		}
+	});
+
+	test("treats action_unavailable as a diagnostic without Telegram sends or WebSocket replies", async () => {
+		const originalWebSocket = globalThis.WebSocket;
+		const originalWarn = console.warn;
+		const fixture = createReferenceClientFixture();
+		const diagnostics: string[] = [];
+		let resolveDiagnostic: (() => void) | undefined;
+		const diagnostic = new Promise<void>(resolve => {
+			resolveDiagnostic = resolve;
+		});
+		let client: Promise<void> | undefined;
+
+		try {
+			FakeReferenceWebSocket.instances = [];
+			globalThis.WebSocket = FakeReferenceWebSocket as unknown as typeof WebSocket;
+			console.warn = (...args: unknown[]) => {
+				diagnostics.push(args.map(String).join(" "));
+				resolveDiagnostic?.();
+			};
+			client = runTelegramReferenceClient({
+				botToken: "bot-token",
+				chatId: "chat-id",
+				endpointFile: fixture.endpointFile,
+				apiBase: "https://telegram.test",
+				fetchImpl: fixture.fetchImpl,
+			});
+
+			const socket = FakeReferenceWebSocket.instances[0]!;
+			socket.emitOpen();
+			expect(fixture.calls.map(call => call.url)).toEqual(["https://telegram.test/botbot-token/getUpdates"]);
+
+			socket.emitMessage({
+				type: "action_unavailable",
+				id: "a1",
+				sessionId: "s1",
+				reason: "missing_capability",
+				requiredCapabilities: ["ask_controls_v1"],
+			});
+			await diagnostic;
+
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]).toContain("ask_controls_v1");
+			expect(fixture.calls.map(call => call.url)).toEqual(["https://telegram.test/botbot-token/getUpdates"]);
+			expect(fixture.calls.filter(call => /\/(?:sendMessage|sendPhoto)$/.test(call.url))).toEqual([]);
+			expect(socket.sent).toHaveLength(1);
+		} finally {
+			await stopReferenceClient(client, fixture);
+			console.warn = originalWarn;
+			globalThis.WebSocket = originalWebSocket;
+			fixture.cleanup();
+		}
 	});
 });

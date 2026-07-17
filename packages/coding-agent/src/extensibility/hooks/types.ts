@@ -45,7 +45,7 @@ export type { ExecOptions, ExecResult } from "../../exec/exec";
 
 /**
  * UI context for hooks to request interactive UI from the harness.
- * Each mode (interactive, RPC, print) provides its own implementation.
+ * Interactive and headless callers provide their own implementation.
  */
 // fallow-ignore-next-line code-duplication
 // Parallel to ExtensionUIContext: hooks expose a deliberately narrower UI

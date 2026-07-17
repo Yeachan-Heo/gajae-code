@@ -122,11 +122,12 @@ async function seedTeamWorker(
 	return workerDir;
 }
 
-async function collectSingle(adapter: GcStoreAdapter, ctx: GcContext): Promise<GcRecord> {
+async function collectRecord(adapter: GcStoreAdapter, ctx: GcContext, recordPath: string): Promise<GcRecord> {
 	const result = await adapter.collect(ctx);
 	expect(result.errors).toEqual([]);
-	expect(result.records).toHaveLength(1);
-	return result.records[0]!;
+	const record = result.records.find(candidate => candidate.path === recordPath);
+	expect(record).toBeDefined();
+	return record!;
 }
 
 function fakeAdapter(
@@ -183,9 +184,9 @@ describe("gc red-team invariants", () => {
 		const workerDir = await seedTeamWorker(base, registryDir, "w-eperm", EPERM_PID);
 		const ctx = ctxFor(base, registryDir, adversarialProbe);
 
-		const harnessRec = await collectSingle(harnessLeasesGcAdapter, ctx);
-		const fileLockRec = await collectSingle(fileLocksGcAdapter, ctx);
-		const teamRec = await collectSingle(teamWorkersGcAdapter, ctx);
+		const harnessRec = await collectRecord(harnessLeasesGcAdapter, ctx, harnessLease);
+		const fileLockRec = await collectRecord(fileLocksGcAdapter, ctx, lockDir);
+		const teamRec = await collectRecord(teamWorkersGcAdapter, ctx, workerDir);
 
 		for (const rec of [harnessRec, fileLockRec, teamRec]) {
 			expect(rec.pid_status).toBe("eperm");
@@ -222,11 +223,16 @@ describe("gc red-team invariants", () => {
 			ctx,
 			true,
 		);
-		const records = [report.stores.harness_leases[0]!, report.stores.file_locks[0]!, report.stores.team_workers[0]!];
+		const records = [
+			report.stores.harness_leases.find(record => record.path === leaseFile),
+			report.stores.file_locks.find(record => record.path === lockDir),
+			report.stores.team_workers.find(record => record.path === workerDir),
+		];
 		for (const rec of records) {
-			expect(rec.removable).toBe(false);
-			expect(rec.action).toBe("none");
-			expect(["alive", "unknown"]).toContain(rec.pid_status ?? "none");
+			expect(rec).toBeDefined();
+			expect(rec?.removable).toBe(false);
+			expect(rec?.action).toBe("none");
+			expect(["alive", "unknown"]).toContain(rec?.pid_status ?? "none");
 		}
 		expect(report.counts.removed).toBe(0);
 		expect(report.counts.failed).toBe(0);

@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai";
-import type { Component, Container, EditorTheme, Loader, Spacer, Text, TUI } from "@gajae-code/tui";
+import type { Component, Container, EditorTheme, Loader, SlashCommand, Spacer, Text, TUI } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../config/keybindings";
 import type { Settings } from "../config/settings";
 import type {
@@ -14,6 +14,7 @@ import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { MCPManager } from "../runtime-mcp";
+import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
@@ -21,19 +22,25 @@ import type { CredentialAutoImportOptions } from "../setup/credential-auto-impor
 import type { LspStartupServerInfo } from "../tools";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
+import type { CommandPaletteAction } from "./components/command-palette";
 import type { CustomEditor } from "./components/custom-editor";
 import type { EvalExecutionComponent } from "./components/eval-execution";
+import type { PetMode } from "./components/gajae-pet-widget";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent } from "./components/hook-selector";
-import type { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
+import type { StatusLineComponent } from "./components/tool-status-header";
+import type { IrcObservationLedger } from "./irc-observation-ledger";
 import type { OAuthManualInputManager } from "./oauth-manual-input";
 import type { Theme } from "./theme/theme";
+import type { ParsedIrcMessage } from "./utils/irc-message";
 
+export type TranscriptRebuildPolicy = "replace-identity" | "reconcile-same-transcript";
 export type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
+	followUpQueuePolicy?: "sequential";
 };
 
 export type SubmittedUserInput = {
@@ -45,6 +52,17 @@ export type SubmittedUserInput = {
 	started: boolean;
 };
 
+export type ComposerSubmissionOptions = Readonly<{
+	ownsComposer: boolean;
+	editor: CustomEditor;
+}>;
+
+export function canApplyComposerSubmission(
+	options: ComposerSubmissionOptions | undefined,
+	editor: CustomEditor,
+): boolean {
+	return options === undefined || (options.ownsComposer && editor === options.editor);
+}
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned";
 
 export type TodoItem = {
@@ -58,6 +76,14 @@ export type TodoPhase = {
 	name: string;
 	tasks: TodoItem[];
 };
+
+export type IrcArrivalSnapshot = Readonly<{
+	panelVisible: boolean;
+	/** User-requested open state; may be true while the panel yields at narrow widths. */
+	panelRequestedVisible: boolean;
+	sidebarAvailable: boolean;
+	resolvedToggleKey: string | null;
+}>;
 
 export interface InteractiveModeContext {
 	// UI access
@@ -83,6 +109,11 @@ export interface InteractiveModeContext {
 	mcpManager?: MCPManager;
 	lspServers?: LspStartupServerInfo[];
 
+	/** Shared controller query; absent in ACP/lightweight test contexts. */
+	getCurrentSessionNotificationStatus?(): NotificationSessionStatus | undefined;
+	/** Toggle only the current session; absent in ACP/lightweight test contexts. */
+	setCurrentSessionNotificationsEnabled?(enabled: boolean): Promise<NotificationSessionReconcileResult | undefined>;
+	readonly ircLedger: IrcObservationLedger;
 	// State
 	isInitialized: boolean;
 	isBackgrounded: boolean;
@@ -116,6 +147,7 @@ export interface InteractiveModeContext {
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined;
 	locallySubmittedUserSignatures: Set<string>;
+	optimisticInjectedSignatures: Map<string, number>;
 	lastSigintTime: number;
 	lastEscapeTime: number;
 	lastComposerClearEscapeTime: number;
@@ -154,19 +186,37 @@ export interface InteractiveModeContext {
 	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
 	updatePendingMessagesDisplay(): void;
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void;
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void;
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
 	flushPendingModelSwitch(): Promise<void>;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;
-	startPendingSubmission(input: {
-		text: string;
-		images?: ImageContent[];
-		customType?: string;
-		display?: boolean;
-	}): SubmittedUserInput;
+	/**
+	 * Commit a pet mode through the shared result-returning policy: capability
+	 * is rechecked immediately before mutation and the preference persists only
+	 * on acceptance. Returns whether the commit was accepted.
+	 */
+	setPetMode(mode: PetMode): boolean;
+	/** Live-preview a pet skin during a selector without persisting. */
+	previewPetMode(mode: PetMode): void;
+	/**
+	 * Commit a settings-overlay pet change without re-mounting the composer.
+	 * Same shared commit policy and result semantics as `setPetMode`.
+	 */
+	commitPetPreviewMode(mode: PetMode): boolean;
+	/** Re-mount the composer (pet-aware) after an overlay/selector closes. */
+	restoreComposer(): void;
+	startPendingSubmission(
+		input: {
+			text: string;
+			images?: ImageContent[];
+			customType?: string;
+			display?: boolean;
+		},
+		options?: ComposerSubmissionOptions,
+	): SubmittedUserInput;
 	cancelPendingSubmission(): boolean;
 	markPendingSubmissionStarted(input: SubmittedUserInput): boolean;
 	finishPendingSubmission(input: SubmittedUserInput): void;
@@ -185,21 +235,34 @@ export interface InteractiveModeContext {
 	withLocalSubmission<T>(text: string, fn: () => Promise<T>, options?: { imageCount?: number }): Promise<T>;
 	isKnownSlashCommand(text: string): boolean;
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): Component[];
+	addLiveIrcObservationToChat(message: ParsedIrcMessage, arrival: IrcArrivalSnapshot): Component[];
+	removeRenderedIrcInlineComponents(observationId: string): readonly Component[] | undefined;
+	resetRenderedIrcInlineComponents(): readonly (readonly Component[])[];
 	renderSessionContext(
 		sessionContext: SessionContext,
 		options?: { updateFooter?: boolean; populateHistory?: boolean },
 	): void;
-	renderInitialMessages(prebuiltContext?: SessionContext, options?: { preserveExistingChat?: boolean }): void;
+	rebuildInitialMessages(
+		policy: TranscriptRebuildPolicy,
+		prebuiltContext?: SessionContext,
+		options?: { preserveExistingChat?: boolean },
+	): void;
 	getUserMessageText(message: Message): string;
+	getAssistantViewportAnchorId?(message: AssistantMessage): string;
 	findLastAssistantMessage(): AssistantMessage | undefined;
 	extractAssistantText(message: AssistantMessage): string;
 	updateEditorTopBorder(): void;
 	updateEditorBorderColor(): void;
-	rebuildChatFromMessages(): void;
+	rebuildChatFromMessages(policy: TranscriptRebuildPolicy): void;
 	setTodos(todos: TodoItem[] | TodoPhase[]): void;
 	reloadTodos(): Promise<void>;
 	toggleTodoExpansion(): void;
 
+	// IRC sidebar
+	toggleIrcSidebar(): void;
+	captureIrcArrivalSnapshot(): IrcArrivalSnapshot;
+	applyIrcSidebarAvailability(enabled: boolean): void;
+	resetIrcSidebarSession(): void;
 	// Command handling
 	handleExportCommand(text: string): Promise<void>;
 	handleShareCommand(): Promise<void>;
@@ -215,8 +278,9 @@ export interface InteractiveModeContext {
 	handleContextCommand(): void;
 	handleDumpCommand(): void;
 	handleDebugTranscriptCommand(): Promise<void>;
-	handleClearCommand(): Promise<void>;
-	handleDropCommand(): Promise<void>;
+	handleClearCommand(): Promise<boolean>;
+	handleContextClearCommand(): Promise<void>;
+	handleDropCommand(): Promise<boolean>;
 	handleForkCommand(): Promise<void>;
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
 	handlePythonCommand(code: string, excludeFromContext?: boolean): Promise<void>;
@@ -234,20 +298,30 @@ export interface InteractiveModeContext {
 		isAuto?: boolean,
 	): Promise<CompactionOutcome>;
 	openInBrowser(urlOrPath: string): void;
+	/** Resolved source of truth for slash autocomplete and command palette entries. */
+	getSlashCommands?(): readonly SlashCommand[];
 	refreshSlashCommandState(cwd?: string): Promise<void>;
 
 	// Selector handling
+	showCommandPalette(
+		commands: SlashCommand[],
+		actions: CommandPaletteAction[],
+		executeSlashCommand: (name: string) => Promise<void>,
+	): void;
 	showSettingsSelector(): void;
 	showThemeSelector(): void;
+	showPetSelector(): void;
 	showHistorySearch(): void;
 	showExtensionsDashboard(): void;
 	showAgentsDashboard(): void;
 	showModelSelector(options?: { temporaryOnly?: boolean }): void;
+	showEffortSelector(): void;
 	showProviderOnboarding(): void;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
 	showUserMessageSelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(): void;
+	showSessionsDashboard(): void;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string, options?: OAuthSelectorOptions): Promise<void>;
@@ -255,6 +329,10 @@ export interface InteractiveModeContext {
 	showDebugSelector(): void;
 	showSessionObserver(): void;
 	showJobsOverlay(): void;
+	showTasksPane(): void;
+	showTranscriptViewer(): void;
+	isTranscriptViewerOpen(): boolean;
+	refreshTranscriptViewer(): void;
 	resetObserverRegistry(): void;
 
 	// Input handling

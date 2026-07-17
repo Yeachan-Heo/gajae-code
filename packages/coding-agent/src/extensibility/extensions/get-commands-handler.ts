@@ -2,8 +2,8 @@
  * Helper for wiring the `getCommands` action of {@link ExtensionAPI}.
  *
  * Centralizes the union over the three slash-command sources the runtime
- * exposes so the five wiring sites (interactive UI, ACP, RPC, print, child
- * task executor) cannot drift:
+ * exposes so the interactive UI, ACP, SDK, print, and child task executor wiring
+ * sites cannot drift:
  *   - extension-registered hook commands (`source: "extension"`)
  *   - prompt commands loaded as `LoadedCustomCommand` — user/project/bundled
  *     custom commands and MCP prompts (`source: "prompt"`)

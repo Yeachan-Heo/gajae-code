@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-15
+
+### Fixed
+
+- Prefer a source-workspace native addon over optional platform packages while validating the current version sentinel on every candidate, so stale local or optional binaries fall through with actionable diagnostics instead of shadowing the active loader (#2168).
+
+### Added
+
+- Added additive SDK v3 workflow-gate bridge APIs (#2171): `registerWorkflowGateAsk` preserves a required nonempty `workflowGateId`; `registerArbitratedAsk` and `retireIfUnclaimed` support exact in-process presentation arbitration without exposing claims, receipts, epochs, routes, or other authority state. Legacy `registerAsk` remains uncorrelated and source-compatible.
+
+### Changed
+
+- Resolved the SDK v3 workflow-gate shipping classification (#2171): `workflowGateId` and Q12 diagnostics are additive SDK v3 surfaces, while `action_needed.id` remains the transient, generic `reply.id` authority. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line; new clients must send it, and mandatory enforcement or removal can occur no earlier than SDK v4 only after at least one full published deprecation release/window with deployed-client notice. Explicit session mismatches fail closed before resolution; mismatched sessions, stale/reissued actions, and unsafe ambiguity never regain authority.
+- Documented release pairing: the `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions (currently `0.10.2`), with the native loader version sentinel enforcing the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+
+### Added
+
+- Added native canonical existing-directory identity and fail-closed owner-only path-security APIs. POSIX identity is lossless UTF-8 canonicalization; Windows resolves local final volume-GUID paths, rejects network paths, and applies/verifies TokenUser protected-DACL security without following reparse points (#2177).
+
+## [0.10.0] - 2026-07-12
+### Fixed
+
+- Preserved two-cell terminal width for Hangul Filler (U+3164), VS16 emoji-presentation graphemes, and emoji-modifier sequences while aligning TUI display-width measurement with native wrapping and truncation (#1979).
+- Fixed the native notifications server to capability-gate controlled asks per connection, default-deny until `ask_controls_v1` negotiation (reset on reconnect), and send additive non-actionable `action_unavailable` frames instead of stripped option buttons to non-capable clients (#2029).
+
+### Changed
+
+- Renamed the native notifications SDK crate from `gjc-notifications` to `gjc-sdk` as part of the Gajae-Code SDK rename. Sessions and daemons must restart together across the upgrade because discovery moved from `.gjc/state/notifications/` to `.gjc/state/sdk/` without dual-scan compatibility.
+
+## [0.9.1] - 2026-07-08
+
+### Changed
+
+- Declared the glibc runtime requirement in Linux platform package metadata.
+
 ## [0.7.9] - 2026-07-01
 
 ### Changed

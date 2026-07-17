@@ -3,8 +3,15 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { SecretObfuscator } from "../src/secrets/obfuscator";
+import { deobfuscateSessionContext, SecretObfuscator } from "../src/secrets/obfuscator";
 import { compileSecretRegex } from "../src/secrets/regex";
+import {
+	associateSessionMessageEntryId,
+	associateSessionMessageViewportAnchorId,
+	getSessionMessageEntryId,
+	getSessionMessageViewportAnchorId,
+	type SessionContext,
+} from "../src/session/session-manager";
 
 describe("compileSecretRegex", () => {
 	it("adds global flag when not provided", () => {
@@ -57,6 +64,38 @@ describe("SecretObfuscator regex behavior", () => {
 			cmd: original.cmd,
 			status: original.status,
 		});
+	});
+});
+
+describe("deobfuscateSessionContext", () => {
+	it("preserves persisted entry identity on cloned messages", () => {
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: "secret" }]);
+		const unchangedMessage = { role: "user" as const, content: "ordinary", timestamp: 1 };
+		const message = { role: "user" as const, content: obfuscator.obfuscate("secret"), timestamp: 2 };
+		associateSessionMessageEntryId(unchangedMessage, "entry-1");
+		associateSessionMessageEntryId(message, "entry-2");
+		associateSessionMessageViewportAnchorId(message, "live-anchor-2");
+		const context: SessionContext = {
+			messages: [unchangedMessage, message],
+			thinkingLevel: "off",
+			models: {},
+			configuredModelChains: {},
+			injectedTtsrRules: [],
+			ttsrMessageCount: 0,
+			selectedMCPToolNames: [],
+			hasPersistedMCPToolSelection: false,
+			mode: "none",
+		};
+
+		const result = deobfuscateSessionContext(context, obfuscator);
+		const resultMessage = result.messages[1];
+		expect(result.messages[0]).toBe(unchangedMessage);
+		expect(getSessionMessageEntryId(result.messages[0])).toBe("entry-1");
+		expect(resultMessage).not.toBe(message);
+		if (resultMessage.role !== "user") throw new Error(`Expected user message, got ${resultMessage.role}`);
+		expect(resultMessage.content).toBe("secret");
+		expect(getSessionMessageEntryId(resultMessage)).toBe("entry-2");
+		expect(getSessionMessageViewportAnchorId(resultMessage)).toBe("live-anchor-2");
 	});
 });
 

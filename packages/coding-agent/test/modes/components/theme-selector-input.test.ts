@@ -60,6 +60,12 @@ describe("ThemeSelectorComponent input handling", () => {
 		expect(selectedThemes).toEqual(["red-claw"]);
 	});
 
+	it("renders the framed selector title", () => {
+		const { component } = createSelector();
+
+		expect(Bun.stripANSI(component.render(160).join("\n"))).toContain("Select theme");
+	});
+
 	it("previews the newly selected theme from focused list navigation", () => {
 		const { component, previewedThemes } = createSelector();
 

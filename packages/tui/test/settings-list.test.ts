@@ -165,4 +165,20 @@ describe("SettingsList", () => {
 
 		expect(Bun.stripANSI(list.render(80).join("\n"))).toContain("→ Only");
 	});
+	it("shrinks labels and clamps values at 48 columns", () => {
+		const list = new SettingsList(
+			[
+				{
+					id: "long",
+					label: "A setting label that exceeds narrow terminals",
+					currentValue: "a value that also exceeds narrow terminals",
+				},
+			],
+			5,
+			testTheme,
+			() => {},
+			() => {},
+		);
+		for (const line of list.render(48)) expect(Bun.stripANSI(line).length).toBeLessThanOrEqual(48);
+	});
 });

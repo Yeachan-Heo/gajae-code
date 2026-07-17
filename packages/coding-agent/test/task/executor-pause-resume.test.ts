@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AgentEvent } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { AsyncJobManager } from "../../src/async/job-manager";
+import { kNoAuth } from "../../src/config/model-registry";
+
 import { Settings } from "../../src/config/settings";
 import type { LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../../src/sdk";
@@ -48,6 +50,9 @@ function createPauseSession(options: CreateAgentSessionOptions, subagentId: stri
 		},
 		getActiveToolNames: () => ["yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},
+		setConfiguredModelChain: () => {},
+		getConfiguredModelChain: () => undefined,
+		seedDefaultFallbackResolution: () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {
@@ -124,6 +129,8 @@ describe("runSubprocess pause/resume integration", () => {
 			settings: Settings.isolated(),
 			modelRegistry: {
 				refresh: async () => {},
+				getAvailable: () => [],
+				getApiKey: async () => kNoAuth,
 			} as unknown as import("../../src/config/model-registry").ModelRegistry,
 			enableLsp: false,
 		});

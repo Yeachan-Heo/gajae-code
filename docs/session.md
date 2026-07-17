@@ -25,13 +25,31 @@ Does not cover `/tree` UI rendering behavior beyond semantics that affect sessio
 
 ## On-Disk Layout
 
-Default session file location:
+Default managed session file location:
 
 ```text
-~/.gjc/agent/sessions/--<cwd-encoded>--/<timestamp>_<sessionId>.jsonl
+~/.gjc/agent/sessions/v2-<52-char-base32-sha256>/<timestamp>_<sessionId>.jsonl
 ```
 
-`<cwd-encoded>` is derived from the working directory by stripping leading slash and replacing `/`, `\\`, and `:` with `-`.
+The `v2-…` component is a fixed-width SHA-256/base32 digest of the native canonical workspace identity (identity version 1); it is **not** a reversible or injective user-facing encoding. The binding file `.gjc-managed-session-scope.v2.json` records the canonical identity and digest. Existing bindings must be regular, canonically encoded files that agree with the resolved identity; a mismatch or unsafe path fails closed.
+
+Identity is platform-specific:
+
+- POSIX paths and supported local aliases that resolve to the same native directory identity share the same v2 scope.
+- On Windows, equivalent supported local path spellings (including drive-letter/case aliases) resolve through the native identity API before the scope is derived.
+- UNC/network workspaces are unsupported and return a `network_unsupported` resolution result; no SMB share is needed or assumed by this design.
+
+The default managed writer creates new data only in v2 scopes. It never writes new legacy-layout data. `--session-dir` is an explicit storage/lookup override and is not a request to derive the default managed scope.
+
+### Legacy migration and retention
+
+Legacy encoded directories are discovered only after validating each candidate's header and workspace identity. With `session.directoryMigration: "copy-retain"` (the default), an eligible legacy session is copied into the v2 scope without replacing an existing destination; the legacy source is retained. Set `session.directoryMigration: "disabled"` to leave legacy candidates unmigrated. Migration is lazy and guarded by a managed lock, binding checks, no-follow/owner-only path checks, and source identity validation; conflicts, unsafe artifacts, or changed sources fail rather than guessing.
+
+Migration does not automatically clean up legacy files, copied files, locks, artifacts, or abandoned data. A migration tombstone records a completed/retired source so repeated scans do not reinterpret it as a new migration request; it is not evidence that the old data was deleted. Artifact copying is bounded and rejects symlinks, hard links, excessive depth, file count, or size.
+
+### Security boundary
+
+Managed storage enforces owner-only directory/file security and refuses unsafe symlinks or malformed bindings on the paths it verifies. This is a local storage-integrity boundary, not authentication, authorization, encryption, or a guarantee against a hostile concurrent local actor/race outside the verified operations. Callers must still protect the agent directory and session contents.
 
 Blob store location:
 

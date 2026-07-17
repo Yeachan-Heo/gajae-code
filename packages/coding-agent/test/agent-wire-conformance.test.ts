@@ -8,7 +8,7 @@ import {
 } from "../src/modes/shared/agent-wire/event-envelope";
 import {
 	observeAgentSessionEvent,
-	observeRpcOutboundFrame,
+	observeAgentWireFrame,
 	toAgentWireEventPayload,
 } from "../src/modes/shared/agent-wire/event-observation";
 import { EVENT_FIXTURES, RAW_SECRET } from "./agent-wire/fixtures";
@@ -28,18 +28,16 @@ const ACP_EMPTY_WHITELIST = new Set([
 	"turn_start",
 	"turn_end",
 	"message_start",
-	"auto_compaction_start",
-	"auto_compaction_end",
 	"auto_retry_start",
 	"auto_retry_end",
-	"retry_fallback_applied",
-	"retry_fallback_succeeded",
 	"ttsr_triggered",
 	"irc_message",
 	"notice",
 	"thinking_level_changed",
 	"goal_updated",
 ]);
+
+const ACP_NOTICE_EVENT_TYPES = ["model_fallback_switched"] as const;
 
 describe("agent-wire conformance matrix", () => {
 	it("fixture coverage equals AGENT_WIRE_EVENT_TYPES exactly", () => {
@@ -67,7 +65,7 @@ describe("agent-wire conformance matrix", () => {
 				expect(JSON.stringify(obs?.evidence ?? {})).not.toContain(RAW_SECRET);
 
 				// Harness via the RPC wire frame delegates to the same observation.
-				const frameObs = observeRpcOutboundFrame(frame as unknown as Record<string, unknown>);
+				const frameObs = observeAgentWireFrame(frame as unknown as Record<string, unknown>);
 				expect(frameObs?.eventType).toBe(type);
 
 				// ACP: whitelist -> []; otherwise a defined projection (may be empty for
@@ -82,7 +80,12 @@ describe("agent-wire conformance matrix", () => {
 	});
 
 	it("ACP produces session updates for the non-whitelisted event types", () => {
-		for (const type of ["tool_execution_start", "tool_execution_end", "todo_reminder"] as const) {
+		for (const type of [
+			"tool_execution_start",
+			"tool_execution_end",
+			"todo_reminder",
+			...ACP_NOTICE_EVENT_TYPES,
+		] as const) {
 			const acp = mapAgentWireEventPayloadToAcpSessionUpdates(toAgentWireEventPayload(EVENT_FIXTURES[type]), "sess");
 			expect(acp.length).toBeGreaterThan(0);
 		}
@@ -130,7 +133,7 @@ describe("agent-wire conformance matrix", () => {
 		];
 		for (const [name, frame, expectedKind] of cases) {
 			it(`observes ${name}`, () => {
-				const obs = observeRpcOutboundFrame(frame);
+				const obs = observeAgentWireFrame(frame);
 				if (expectedKind === null) {
 					expect(obs).toBeNull();
 				} else {

@@ -265,7 +265,7 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		const messageArg = firstCall[0];
 		expect(messageArg.content).toContain("Do the thing.");
 		expect(messageArg.content).toContain("User: from compaction");
-		expect(firstCall[1]).toEqual({ streamingBehavior: "followUp" });
+		expect(firstCall[1]).toEqual({ streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
 		expect(ctx.compactionQueuedMessages).toEqual([]);
 	});
 

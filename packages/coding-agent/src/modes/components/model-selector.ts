@@ -25,9 +25,11 @@ import {
 } from "../../config/model-registry";
 import {
 	formatModelSelectorValue,
+	resolveConfiguredModelPatterns,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../../config/model-resolver";
+import { type ModelSelectorValue, normalizeModelSelectorValue, selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
@@ -96,6 +98,7 @@ export type ModelSelectorSelection =
 			kind: "assignment";
 			model: Model;
 			role: GjcModelAssignmentTargetId | null;
+			roles?: readonly GjcModelAssignmentTargetId[];
 			thinkingLevel?: ThinkingLevel;
 			selector?: string;
 	  }
@@ -120,6 +123,7 @@ export type ModelSelectorSelection =
 interface PendingThinkingChoice {
 	item: ModelItem | CanonicalModelItem;
 	role: GjcModelAssignmentTargetId | null;
+	roles?: readonly GjcModelAssignmentTargetId[];
 	levels: ThinkingLevel[];
 }
 
@@ -225,9 +229,8 @@ function profileRequiredProviders(profile: ModelProfileDefinition): string[] {
 	return [...new Set(profile.requiredProviders)].sort((a, b) => a.localeCompare(b));
 }
 
-function isInheritedRoleSelector(value: string | undefined): boolean {
-	const normalized = value?.trim();
-	return !normalized || normalized === "default" || normalized === "pi/default";
+function isInheritedRoleSelector(value: string): boolean {
+	return value === "default" || value === "pi/default";
 }
 
 function getDefaultAliasThinkingLevel(value: string | undefined): ThinkingLevel | undefined {
@@ -243,28 +246,35 @@ function getSelectorProvider(selector: string): string | undefined {
 
 function deriveRequiredProviders(modelMapping: ModelProfileConfig["model_mapping"]): string[] {
 	const providers = new Set<string>();
-	for (const selector of Object.values(modelMapping)) {
-		const provider = getSelectorProvider(selector);
-		if (provider) providers.add(provider);
+	for (const selectorValue of Object.values(modelMapping)) {
+		for (const selector of normalizeModelSelectorValue(selectorValue)) {
+			const provider = getSelectorProvider(selector);
+			if (provider) providers.add(provider);
+		}
 	}
 	return [...providers].sort((a, b) => a.localeCompare(b));
 }
 
-function sameStringRecord(
-	left: Readonly<Record<string, string | undefined>>,
-	right: Readonly<Record<string, string | undefined>>,
+function sameModelSelectorRecord(
+	left: Readonly<Record<string, ModelSelectorValue | undefined>>,
+	right: Readonly<Record<string, ModelSelectorValue | undefined>>,
 ): boolean {
 	const leftEntries = Object.entries(left)
-		.filter((entry): entry is [string, string] => entry[1] !== undefined)
+		.filter((entry): entry is [string, ModelSelectorValue] => entry[1] !== undefined)
 		.sort(([a], [b]) => a.localeCompare(b));
 	const rightEntries = Object.entries(right)
-		.filter((entry): entry is [string, string] => entry[1] !== undefined)
+		.filter((entry): entry is [string, ModelSelectorValue] => entry[1] !== undefined)
 		.sort(([a], [b]) => a.localeCompare(b));
 	if (leftEntries.length !== rightEntries.length) return false;
 	for (let i = 0; i < leftEntries.length; i++) {
 		const leftEntry = leftEntries[i];
 		const rightEntry = rightEntries[i];
-		if (!leftEntry || !rightEntry || leftEntry[0] !== rightEntry[0] || leftEntry[1] !== rightEntry[1]) {
+		if (
+			!leftEntry ||
+			!rightEntry ||
+			leftEntry[0] !== rightEntry[0] ||
+			!sameStringArray(normalizeModelSelectorValue(leftEntry[1]), normalizeModelSelectorValue(rightEntry[1]))
+		) {
 			return false;
 		}
 	}
@@ -316,6 +326,7 @@ export class ModelSelectorComponent extends Container {
 	#currentModel?: Model;
 	#currentThinkingLevel?: ThinkingLevel;
 	#activeModelProfile?: string;
+	#configuredDefaultChain?: readonly string[];
 	#isFastForProvider: (provider?: string) => boolean = () => false;
 	#isFastForSubagentProvider: (provider?: string) => boolean = () => false;
 	#isCurrentModelFastModeActive: () => boolean = () => false;
@@ -357,6 +368,7 @@ export class ModelSelectorComponent extends Container {
 			isCurrentModelFastModeActive?: () => boolean;
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
+			configuredDefaultChain?: readonly string[];
 		},
 	) {
 		super();
@@ -372,6 +384,7 @@ export class ModelSelectorComponent extends Container {
 		this.#currentModel = _currentModel;
 		this.#currentThinkingLevel = options?.currentThinkingLevel;
 		this.#activeModelProfile = options?.activeModelProfile;
+		this.#configuredDefaultChain = options?.configuredDefaultChain;
 		this.#isFastForProvider = options?.isFastForProvider ?? (() => false);
 		this.#isFastForSubagentProvider = options?.isFastForSubagentProvider ?? (() => false);
 		// Current-model EFFECTIVE fast state. Defaults to intent for the current
@@ -449,6 +462,24 @@ export class ModelSelectorComponent extends Container {
 		});
 	}
 
+	#isActiveDefaultFallback(): boolean {
+		if (!this.#currentModel) return false;
+		const configuredChain =
+			this.#configuredDefaultChain ?? normalizeModelSelectorValue(this.#settings.getModelRole("default"));
+		if (configuredChain.length < 2) return false;
+
+		const allModels = this.#modelRegistry.getAll();
+		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
+		return configuredChain.slice(1).some(selector => {
+			const resolved = resolveModelRoleValue(selector, allModels, {
+				settings: this.#settings,
+				matchPreferences,
+				modelRegistry: this.#modelRegistry,
+			});
+			return resolved.model !== undefined && modelsAreEqual(resolved.model, this.#currentModel);
+		});
+	}
+
 	#loadRoleModels(): void {
 		const allModels = this.#modelRegistry.getAll();
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
@@ -474,7 +505,12 @@ export class ModelSelectorComponent extends Container {
 				};
 			}
 		}
-		if (this.#activeModelProfile && this.#currentModel) {
+		if (
+			((this.#configuredDefaultChain?.length ?? 0) > 0 ||
+				this.#activeModelProfile ||
+				this.#isActiveDefaultFallback()) &&
+			this.#currentModel
+		) {
 			this.#roles.default = {
 				model: this.#currentModel,
 				thinkingLevel: this.#currentThinkingLevel ?? ThinkingLevel.Inherit,
@@ -833,33 +869,57 @@ export class ModelSelectorComponent extends Container {
 		return formatModelSelectorValue(`${this.#currentModel.provider}/${this.#currentModel.id}`, thinkingLevel);
 	}
 
-	#resolveProfileModelSelector(value: string | undefined): string | undefined {
-		const normalized = value?.trim();
-		if (isInheritedRoleSelector(normalized)) return undefined;
+	#resolveProfileModelSelector(value: ModelSelectorValue | undefined): string | string[] | undefined {
+		const resolvedSelectors: string[] = [];
+		for (const configuredSelector of normalizeModelSelectorValue(value)) {
+			if (isInheritedRoleSelector(configuredSelector)) continue;
+			const selectors = resolveConfiguredModelPatterns(configuredSelector, this.#settings);
+			for (const selector of selectors.length > 0 ? selectors : [configuredSelector]) {
+				const resolved = resolveModelRoleValue(selector, this.#modelRegistry.getAll(), {
+					settings: this.#settings,
+					matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
+					modelRegistry: this.#modelRegistry,
+				});
+				if (resolved.model) {
+					resolvedSelectors.push(
+						formatModelSelectorValue(`${resolved.model.provider}/${resolved.model.id}`, resolved.thinkingLevel),
+					);
+					continue;
+				}
 
-		const resolved = resolveModelRoleValue(normalized, this.#modelRegistry.getAll(), {
-			settings: this.#settings,
-			matchPreferences: { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() },
-			modelRegistry: this.#modelRegistry,
-		});
-		if (resolved.model) {
-			return formatModelSelectorValue(`${resolved.model.provider}/${resolved.model.id}`, resolved.thinkingLevel);
+				const inheritedDefaultThinkingLevel = getDefaultAliasThinkingLevel(selector);
+				if (inheritedDefaultThinkingLevel) {
+					const currentSelector = this.#formatCurrentModelSelector(inheritedDefaultThinkingLevel);
+					if (currentSelector) resolvedSelectors.push(currentSelector);
+					continue;
+				}
+
+				// Preserve unresolved chain members verbatim instead of silently
+				// truncating configured fallback tails.
+				resolvedSelectors.push(selector);
+			}
 		}
-
-		const inheritedDefaultThinkingLevel = getDefaultAliasThinkingLevel(normalized);
-		if (inheritedDefaultThinkingLevel) return this.#formatCurrentModelSelector(inheritedDefaultThinkingLevel);
-		return undefined;
+		if (resolvedSelectors.length === 0) return undefined;
+		return resolvedSelectors.length === 1 ? resolvedSelectors[0] : resolvedSelectors;
 	}
 
 	#buildCustomModelProfileSnapshot(): ModelProfileConfig {
 		const modelMapping: ModelProfileConfig["model_mapping"] = {};
-		const currentModelSelector = this.#formatCurrentModelSelector();
-		if (currentModelSelector) {
-			modelMapping.default = currentModelSelector;
+		// Prefer the session's configured default chain so fallback tails are
+		// never dropped from the snapshot; the live model only replaces the head.
+		if (this.#configuredDefaultChain && this.#configuredDefaultChain.length > 0) {
+			const head = this.#formatCurrentModelSelector() ?? this.#configuredDefaultChain[0]!;
+			const tail = this.#configuredDefaultChain.slice(1);
+			modelMapping.default = tail.length > 0 ? [head, ...tail] : head;
 		} else {
-			const defaultRole = this.#settings.getModelRole("default");
-			const defaultSelector = this.#resolveProfileModelSelector(defaultRole);
-			if (defaultSelector) modelMapping.default = defaultSelector;
+			const currentModelSelector = this.#formatCurrentModelSelector();
+			if (currentModelSelector) {
+				modelMapping.default = currentModelSelector;
+			} else {
+				const defaultRole = this.#settings.getModelRole("default");
+				const defaultSelector = this.#resolveProfileModelSelector(defaultRole);
+				if (defaultSelector) modelMapping.default = defaultSelector;
+			}
 		}
 
 		const agentOverrides = this.#settings.get("task.agentModelOverrides");
@@ -878,7 +938,7 @@ export class ModelSelectorComponent extends Container {
 	#findDuplicateGeneratedProfile(snapshot: ModelProfileConfig): ModelProfileDefinition | undefined {
 		for (const profile of this.#modelRegistry.getModelProfiles?.().values() ?? []) {
 			if (
-				sameStringRecord(profile.modelMapping, snapshot.model_mapping) &&
+				sameModelSelectorRecord(profile.modelMapping, snapshot.model_mapping) &&
 				sameStringArray(profile.requiredProviders, snapshot.required_providers)
 			) {
 				return profile;
@@ -1146,7 +1206,7 @@ export class ModelSelectorComponent extends Container {
 			});
 			const label = GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase();
 			this.#listContainer.addChild(
-				new Text(`  ${label}: ${formatClampedModelSelector(selector, resolved.model)}`, 0, 0),
+				new Text(`  ${label}: ${formatClampedModelSelector(selectorHead(selector) ?? "", resolved.model)}`, 0, 0),
 			);
 		}
 		this.#listContainer.addChild(new Spacer(1));
@@ -1360,7 +1420,11 @@ export class ModelSelectorComponent extends Container {
 		for (let i = 0; i < actionCount; i++) {
 			const prefix = i === this.#selectedActionIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[i];
-			const label = `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name})`;
+			const label = role
+				? `Set as ${GJC_MODEL_ASSIGNMENT_TARGETS[role].tag ?? role.toUpperCase()} (${GJC_MODEL_ASSIGNMENT_TARGETS[role].name})`
+				: i === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length
+					? "Set for all role agents"
+					: "Set for all targets";
 			this.#listContainer.addChild(
 				new Text(`${prefix}${i === this.#selectedActionIndex ? theme.fg("accent", label) : label}`, 0, 0),
 			);
@@ -1368,7 +1432,13 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#renderThinkingMenu(choice: PendingThinkingChoice): void {
-		const targetLabel = choice.role === null ? "temporary model" : GJC_MODEL_ASSIGNMENT_TARGETS[choice.role].name;
+		const targetLabel = choice.roles
+			? choice.roles.includes("default")
+				? "all targets"
+				: "all role agents"
+			: choice.role === null
+				? "temporary model"
+				: GJC_MODEL_ASSIGNMENT_TARGETS[choice.role].name;
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(
 			new Text(theme.fg("muted", `  Reasoning for ${targetLabel}: ${choice.item.model.id}`), 0, 0),
@@ -1389,7 +1459,7 @@ export class ModelSelectorComponent extends Container {
 		return this.#roles[role]?.thinkingLevel ?? ThinkingLevel.Inherit;
 	}
 	#getActionCount(_model: Model): number {
-		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length;
+		return GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + 2;
 	}
 
 	#getSelectedItem(): ModelItem | CanonicalModelItem | undefined {
@@ -1660,7 +1730,15 @@ export class ModelSelectorComponent extends Container {
 		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			this.#pendingActionItem = undefined;
 			const role = GJC_MODEL_ASSIGNMENT_TARGET_IDS[this.#selectedActionIndex];
-			if (role) this.#handleSelect(item, role);
+			if (role) {
+				this.#handleSelect(item, role);
+				return;
+			}
+			const roles =
+				this.#selectedActionIndex === GJC_MODEL_ASSIGNMENT_TARGET_IDS.length
+					? (["executor", "architect", "planner", "critic"] as const)
+					: GJC_MODEL_ASSIGNMENT_TARGET_IDS;
+			this.#handleSelect(item, "default", undefined, roles);
 			return;
 		}
 		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
@@ -1687,29 +1765,51 @@ export class ModelSelectorComponent extends Container {
 			const level = choice.levels[this.#selectedThinkingIndex];
 			if (!level) return;
 			this.#pendingThinkingChoice = undefined;
-			this.#handleSelect(choice.item, choice.role, level);
+			this.#handleSelect(choice.item, choice.role, level, choice.roles);
 			return;
 		}
 		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
 			this.#pendingThinkingChoice = undefined;
 			if (choice.role !== null) {
 				this.#pendingActionItem = choice.item;
-				this.#selectedActionIndex = Math.max(0, GJC_MODEL_ASSIGNMENT_TARGET_IDS.indexOf(choice.role));
+				this.#selectedActionIndex = choice.roles
+					? GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + (choice.roles.includes("default") ? 1 : 0)
+					: Math.max(0, GJC_MODEL_ASSIGNMENT_TARGET_IDS.indexOf(choice.role));
 			}
 			this.#updateList();
 		}
+	}
+	#getInitialThinkingChoiceIndex(item: ModelItem | CanonicalModelItem, levels: ThinkingLevel[]): number {
+		const preferred = this.#getPreferredThinkingLevel(item);
+		if (preferred && preferred !== ThinkingLevel.Inherit) {
+			const index = levels.indexOf(preferred);
+			if (index !== -1) return index;
+		}
+		return 0;
+	}
+
+	#getPreferredThinkingLevel(item: ModelItem | CanonicalModelItem): ThinkingLevel | undefined {
+		if (item.thinkingLevel && item.thinkingLevel !== ThinkingLevel.Inherit) {
+			return item.thinkingLevel;
+		}
+		return undefined;
 	}
 
 	#handleSelect(
 		item: ModelItem | CanonicalModelItem,
 		role: GjcModelAssignmentTargetId | null,
 		thinkingLevel?: ThinkingLevel,
+		roles?: readonly GjcModelAssignmentTargetId[],
 	): void {
 		const itemThinkingLevel = thinkingLevel ?? item.thinkingLevel;
 		const hasExplicitThinkingChoice = thinkingLevel !== undefined || item.explicitThinkingLevel === true;
-		if (!hasExplicitThinkingChoice && requiresExplicitThinkingChoice(item.model)) {
-			this.#pendingThinkingChoice = { item, role, levels: getSelectableThinkingLevels(item.model) };
-			this.#selectedThinkingIndex = 0;
+		const needsExplicitThinkingChoice = roles
+			? roles.some(targetRole => requiresExplicitThinkingChoice(item.model, targetRole))
+			: requiresExplicitThinkingChoice(item.model, role);
+		if (!hasExplicitThinkingChoice && needsExplicitThinkingChoice) {
+			const levels = getSelectableThinkingLevels(item.model);
+			this.#pendingThinkingChoice = { item, role, roles, levels };
+			this.#selectedThinkingIndex = this.#getInitialThinkingChoiceIndex(item, levels);
 			this.#updateList();
 			return;
 		}
@@ -1727,17 +1827,23 @@ export class ModelSelectorComponent extends Container {
 		}
 
 		const selectedThinkingLevel = itemThinkingLevel ?? this.#getCurrentRoleThinkingLevel(role);
-		const selectorValue =
-			role === "default" ? item.selector : formatModelSelectorValue(item.selector, selectedThinkingLevel);
+		const selectorValue = roles
+			? formatModelSelectorValue(item.selector, selectedThinkingLevel)
+			: role === "default"
+				? item.selector
+				: formatModelSelectorValue(item.selector, selectedThinkingLevel);
 
 		// Update local state for UI
-		this.#roles[role] = { model: item.model, thinkingLevel: selectedThinkingLevel };
+		for (const targetRole of roles ?? [role]) {
+			this.#roles[targetRole] = { model: item.model, thinkingLevel: selectedThinkingLevel };
+		}
 
 		// Notify caller (for updating agent state if needed)
 		this.#onSelectCallback({
 			kind: "assignment",
 			model: item.model,
 			role,
+			roles,
 			thinkingLevel: selectedThinkingLevel,
 			selector: selectorValue,
 		});
@@ -1752,6 +1858,11 @@ export class ModelSelectorComponent extends Container {
 	async __testSelectProfile(profileName: string, setDefault: boolean): Promise<void> {
 		await this.#onSelectCallback({ kind: "profile", profileName, setDefault });
 	}
+	async __testSelectAssignment(
+		selection: Omit<Extract<ModelSelectorSelection, { kind: "assignment" }>, "kind">,
+	): Promise<void> {
+		await this.#onSelectCallback({ kind: "assignment", ...selection });
+	}
 	async __testSelectPresetAction(profileName: string, action: "rename" | "delete"): Promise<void> {
 		await this.#onSelectCallback({
 			kind: action === "rename" ? "renameProfile" : "deleteProfile",
@@ -1764,8 +1875,10 @@ export class ModelSelectorComponent extends Container {
 	}
 }
 
-function requiresExplicitThinkingChoice(model: Model): boolean {
-	return model.reasoning === true && (model.provider === "openai" || model.provider === "openai-codex");
+function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
+	if (model.reasoning !== true) return false;
+	if (model.provider === "openai" || model.provider === "openai-codex") return true;
+	return role !== null && GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "task.agentModelOverrides";
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {

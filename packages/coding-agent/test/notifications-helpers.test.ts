@@ -7,7 +7,7 @@ import {
 	summaryFromMessage,
 	summaryFromMessages,
 	truncate,
-} from "../src/notifications/helpers";
+} from "../src/sdk/bus/helpers";
 
 describe("notifications helpers", () => {
 	test("truncate keeps short strings and ellipsizes long ones", () => {

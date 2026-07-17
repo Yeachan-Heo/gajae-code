@@ -21,6 +21,11 @@ export interface OpenInEditorOptions {
 	trimTrailingNewline?: boolean;
 }
 
+/** Remove one platform-standard trailing line terminator from editor content. */
+export function trimEditorTrailingNewline(text: string): string {
+	return text.replace(/\r?\n$/, "");
+}
+
 /**
  * Opens `content` in the user's external editor and returns the edited text.
  * Returns `null` if the editor exits with a non-zero code.
@@ -52,7 +57,7 @@ export async function openInEditor(
 			if (options?.trimTrailingNewline === false) {
 				return text;
 			}
-			return text.replace(/\n$/, "");
+			return trimEditorTrailingNewline(text);
 		}
 		return null;
 	} finally {

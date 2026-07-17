@@ -4,7 +4,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { AppendOrMergeResult } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import * as deepInterviewRecorder from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { getThemeByName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import type { AskAnswerRequest, AskAnswerSource, AskRemoteReceipt, ToolSession } from "@gajae-code/coding-agent/tools";
 import { AskTool, askSchema, askToolRenderer } from "@gajae-code/coding-agent/tools/ask";
 import { ToolAbortError } from "@gajae-code/coding-agent/tools/tool-errors";
 import { logger } from "@gajae-code/utils";
@@ -542,6 +542,429 @@ describe("AskTool cancellation", () => {
 	});
 });
 
+describe("AskTool remote semantic settlements", () => {
+	const abortableUi = () =>
+		createContext({
+			select: (_prompt, _options, dialogOptions) =>
+				new Promise<string | undefined>(resolve => {
+					dialogOptions?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+				}),
+			editor: (_title, _prefill, dialogOptions) =>
+				new Promise<string | undefined>(resolve => {
+					dialogOptions?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+				}),
+		});
+
+	it("awaits a committed visible acknowledgement before returning the answer", async () => {
+		const settlementStarted = Promise.withResolvers<void>();
+		const releaseSettlement = Promise.withResolvers<void>();
+		let completed = false;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () =>
+				Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: "yes" },
+					settle: async settlement => {
+						expect(settlement).toEqual({ kind: "commit" });
+						settlementStarted.resolve();
+						await releaseSettlement.promise;
+						return { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 42 } };
+					},
+				}),
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+		const execution = tool
+			.execute(
+				"remote-commit-order",
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+				undefined,
+				undefined,
+				abortableUi(),
+			)
+			.then(result => {
+				completed = true;
+				return result;
+			});
+		await settlementStarted.promise;
+		expect(completed).toBe(false);
+		releaseSettlement.resolve();
+		const result = await execution;
+		expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("yes");
+	});
+
+	for (const ack of [
+		{ status: "failed" as const, reason: "telegram_rejected" as const },
+		{ status: "unknown" as const, reason: "host_timeout" as const },
+	]) {
+		it(`preserves the accepted answer when visible acknowledgement is ${ack.status}`, async () => {
+			let settlements = 0;
+			const source: AskAnswerSource = {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: () =>
+					Promise.resolve({
+						source: "remote" as const,
+						interaction: { kind: "value" as const, value: "yes" },
+						settle: async settlement => {
+							settlements++;
+							expect(settlement).toEqual({ kind: "commit" });
+							return { kind: "committed" as const, ack };
+						},
+					}),
+			};
+			const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+			const result = await tool.execute(
+				`remote-commit-${ack.status}`,
+				{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+				undefined,
+				undefined,
+				abortableUi(),
+			);
+			expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("yes");
+			expect(settlements).toBe(1);
+		});
+	}
+
+	it("atomically selects a same-microtask remote selector receipt over the local value", async () => {
+		const settlements: unknown[] = [];
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () =>
+				Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: "remote" },
+					settle: async settlement => {
+						settlements.push(settlement);
+						return { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 51 } };
+					},
+				}),
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"same-microtask-selector",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label: "remote" }, { label: "local" }] }] },
+			undefined,
+			undefined,
+			createContext({ select: () => Promise.resolve("local") }),
+		);
+		expect(result.details?.selectedOptions).toEqual(["remote"]);
+		expect(settlements).toEqual([{ kind: "commit" }]);
+	});
+
+	it("atomically selects a same-microtask remote editor receipt over local text", async () => {
+		const settlements: unknown[] = [];
+		let requestCount = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () => {
+				if (requestCount++ === 0) return new Promise<AskRemoteReceipt | undefined>(() => {});
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: "remote editor text" },
+					settle: async settlement => {
+						settlements.push(settlement);
+						return { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 52 } };
+					},
+				});
+			},
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"same-microtask-editor",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			createContext({
+				select: (_prompt, options) => Promise.resolve(options[options.length - 1]),
+				editor: () => Promise.resolve("local editor text"),
+			}),
+		);
+		expect(result.details?.customInput).toBe("remote editor text");
+		expect(settlements).toEqual([{ kind: "commit" }]);
+	});
+
+	it("settles a same-microtask remote toggle only after it wins the selector race", async () => {
+		const settlements: unknown[] = [];
+		let remoteCall = 0;
+		let localCall = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () => {
+				const interaction =
+					remoteCall++ === 0
+						? { kind: "value" as const, value: "alpha" }
+						: { kind: "control" as const, controlId: "navigation_forward" as const };
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction,
+					settle: async settlement => {
+						settlements.push(settlement);
+						return settlement.kind === "commit"
+							? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 53 } }
+							: { kind: "resolved_without_commit" as const };
+					},
+				});
+			},
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"same-microtask-toggle",
+			{
+				questions: [
+					{ id: "choice", question: "Choose", multi: true, options: [{ label: "alpha" }, { label: "beta" }] },
+				],
+			},
+			undefined,
+			undefined,
+			createContext({
+				select: () => (localCall++ === 0 ? Promise.resolve("beta") : new Promise<string | undefined>(() => {})),
+			}),
+		);
+		expect(result.details?.selectedOptions).toEqual(["alpha"]);
+		expect(settlements).toEqual([{ kind: "resolve_without_commit", reason: "toggle" }, { kind: "commit" }]);
+	});
+
+	it("settles a same-microtask remote Other transition only after it wins", async () => {
+		const settlements: unknown[] = [];
+		let remoteCall = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: request => {
+				const value =
+					remoteCall++ === 0 ? request.options.find(option => option.includes("Other"))! : "remote custom text";
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value },
+					settle: async settlement => {
+						settlements.push(settlement);
+						return settlement.kind === "commit"
+							? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 54 } }
+							: { kind: "resolved_without_commit" as const };
+					},
+				});
+			},
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"same-microtask-other",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label: "alpha" }, { label: "beta" }] }] },
+			undefined,
+			undefined,
+			createContext({
+				select: () => Promise.resolve("alpha"),
+				editor: () => new Promise<string | undefined>(() => {}),
+			}),
+		);
+		expect(result.details?.customInput).toBe("remote custom text");
+		expect(settlements).toEqual([{ kind: "resolve_without_commit", reason: "other_transition" }, { kind: "commit" }]);
+	});
+
+	it("commits a real option whose label ends with the synthetic Other text", async () => {
+		const label = "Deploy Other (type your own)";
+		const settlements: unknown[] = [];
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () =>
+				Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value: label },
+					settle: async settlement => {
+						settlements.push(settlement);
+						return { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 42 } };
+					},
+				}),
+		};
+		const result = await new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"remote-sentinel-suffix",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label }, { label: "Skip" }] }] },
+			undefined,
+			undefined,
+			abortableUi(),
+		);
+		expect(settlements).toEqual([{ kind: "commit" }]);
+		expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain(label);
+	});
+
+	it("aborts the remote leg and settles a late receipt after tool cancellation", async () => {
+		const late = Promise.withResolvers<AskRemoteReceipt>();
+		const settlement = vi.fn(async () => ({ kind: "resolved_without_commit" as const }));
+		let remoteSignal: AbortSignal | undefined;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: (_request, signal) => {
+				remoteSignal = signal;
+				return late.promise;
+			},
+		};
+		const controller = new AbortController();
+		const context = createContext({
+			select: (_prompt, _options, dialogOptions) =>
+				new Promise<string | undefined>((_resolve, reject) => {
+					dialogOptions?.signal?.addEventListener(
+						"abort",
+						() => reject(new DOMException("Aborted", "AbortError")),
+						{ once: true },
+					);
+					queueMicrotask(() => controller.abort());
+				}),
+		});
+		const execution = new AskTool(createSession({ getAskAnswerSource: () => source })).execute(
+			"remote-tool-abort",
+			{ questions: [{ id: "choice", question: "Choose", options: [{ label: "yes" }] }] },
+			controller.signal,
+			undefined,
+			context,
+		);
+		await expect(execution).rejects.toBeInstanceOf(ToolAbortError);
+		expect(remoteSignal?.aborted).toBe(true);
+		late.resolve({ source: "remote", interaction: { kind: "value", value: "yes" }, settle: settlement });
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(settlement).toHaveBeenCalledWith({ kind: "resolve_without_commit", reason: "aborted" });
+	});
+
+	it("settles multi-select toggles without acknowledgement and commits only Done", async () => {
+		const requests: AskAnswerRequest[] = [];
+		const settlements: unknown[] = [];
+		let call = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: request => {
+				requests.push(request);
+				const interaction =
+					call++ === 0
+						? { kind: "value" as const, value: "alpha" }
+						: { kind: "control" as const, controlId: "navigation_forward" as const };
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction,
+					settle: async (settlement: unknown) => {
+						settlements.push(settlement);
+						return (settlement as { kind: string }).kind === "commit"
+							? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 7 } }
+							: { kind: "resolved_without_commit" as const };
+					},
+				});
+			},
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+		const result = await tool.execute(
+			"remote-multi",
+			{
+				questions: [
+					{ id: "choices", question: "Choose", multi: true, options: [{ label: "alpha" }, { label: "beta" }] },
+				],
+			},
+			undefined,
+			undefined,
+			abortableUi(),
+		);
+		expect(requests[0]?.controls).toEqual([
+			{ id: "navigation_forward", kind: "navigation", label: "Done", enabled: false },
+		]);
+		expect(requests[1]?.controls).toEqual([
+			{ id: "navigation_forward", kind: "navigation", label: "Done", enabled: true },
+		]);
+		expect(settlements).toEqual([{ kind: "resolve_without_commit", reason: "toggle" }, { kind: "commit" }]);
+		expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("alpha");
+	});
+
+	it("uses fresh receipts for Other and clarification transitions without acknowledgement", async () => {
+		for (const mode of ["other", "clarification"] as const) {
+			const requests: AskAnswerRequest[] = [];
+			const settlements: unknown[] = [];
+			let call = 0;
+			const source: AskAnswerSource = {
+				awaitAnswer: async () => undefined,
+				awaitAnswerRequest: request => {
+					requests.push(request);
+					const first =
+						mode === "other"
+							? request.options.find(option => option.includes("Other"))!
+							: request.options.find(option => option.includes("Ask about"))!;
+					const interaction = {
+						kind: "value" as const,
+						value: call++ === 0 ? first : mode === "other" ? "custom text" : "what does this mean?",
+					};
+					return Promise.resolve({
+						source: "remote" as const,
+						interaction,
+						settle: async (settlement: unknown) => {
+							settlements.push(settlement);
+							return (settlement as { kind: string }).kind === "commit"
+								? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 9 } }
+								: { kind: "resolved_without_commit" as const };
+						},
+					});
+				},
+			};
+			const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+			await tool.execute(
+				`remote-${mode}`,
+				{
+					questions: [
+						{
+							id: "q",
+							question: mode === "clarification" ? "Round 1 | Scope | Ambiguity: 50%" : "Choose",
+							options: [{ label: "alpha" }, { label: "beta" }],
+							deepInterview: mode === "clarification" ? deepInterviewMeta() : undefined,
+						},
+					],
+				},
+				undefined,
+				undefined,
+				abortableUi(),
+			);
+			expect(requests[1]?.interaction).toBe(mode === "other" ? "custom_editor" : "clarification_editor");
+			expect(settlements).toEqual(
+				mode === "other"
+					? [{ kind: "resolve_without_commit", reason: "other_transition" }, { kind: "commit" }]
+					: [
+							{ kind: "resolve_without_commit", reason: "clarification_transition" },
+							{ kind: "resolve_without_commit", reason: "clarification_submitted" },
+						],
+			);
+		}
+	});
+
+	it("advances an empty intermediate multi-question selection without acknowledgement", async () => {
+		const settlements: unknown[] = [];
+		let call = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: request => {
+				if (call === 0)
+					expect(request.controls).toEqual([
+						{ id: "navigation_forward", kind: "navigation", label: "Next", enabled: true },
+					]);
+				const interaction =
+					call++ === 0
+						? { kind: "control" as const, controlId: "navigation_forward" as const }
+						: { kind: "value" as const, value: "yes" };
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction,
+					settle: async (settlement: unknown) => {
+						settlements.push(settlement);
+						return (settlement as { kind: string }).kind === "commit"
+							? { kind: "committed" as const, ack: { status: "delivered" as const, messageId: 11 } }
+							: { kind: "resolved_without_commit" as const };
+					},
+				});
+			},
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+		await tool.execute(
+			"remote-empty-next",
+			{
+				questions: [
+					{ id: "first", question: "Choose", multi: true, options: [{ label: "alpha" }] },
+					{ id: "second", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] },
+				],
+			},
+			undefined,
+			undefined,
+			abortableUi(),
+		);
+		expect(settlements).toEqual([{ kind: "resolve_without_commit", reason: "empty_navigation" }, { kind: "commit" }]);
+	});
+});
 describe("AskTool custom input", () => {
 	it("routes custom input through editor and preserves raw multiline strings", async () => {
 		const tool = new AskTool(createSession());
@@ -1929,7 +2352,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("deep-interview round recording failed"));
 	});
 
-	it("passes optional metadata for single, multi-question, and unattended workflow gate asks", async () => {
+	it("passes optional metadata for single, multi-question, and SDK workflow gate asks", async () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as Awaited<ReturnType<typeof deepInterviewRecorder.appendOrMergeDeepInterviewRound>>["record"],
@@ -2025,6 +2448,30 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
 		);
+	});
+
+	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {
+		// Regression: a durable workflow-gate emitter now exists for every session and
+		// its isUnattended() is always true. Attended TUI asks must still use the local
+		// selector instead of stranding on emitGate() waiting for a remote responder.
+		const gateEmitter = {
+			isUnattended: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["no"] })),
+		};
+		const select = vi.fn(async () => "yes");
+		const context = createContext({ select });
+		const result = await new AskTool(
+			createSession({ getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		).execute(
+			"call-attended-no-gate",
+			{ questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }, { label: "no" }] }] },
+			undefined,
+			undefined,
+			context,
+		);
+		expect(gateEmitter.emitGate).not.toHaveBeenCalled();
+		expect(select).toHaveBeenCalledTimes(1);
+		expect(result.details?.selectedOptions).toEqual(["yes"]);
 	});
 
 	it("keeps deepInterview optional and rejects malformed metadata", () => {

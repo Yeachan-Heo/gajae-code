@@ -13,11 +13,8 @@ saveTextLockfile = true
 ".lark" = "text"
 
 [test]
-# bun test does NOT honor .gitignore; prune robogjc's repo clones and
-# scratch dirs so a root-level `bun test` doesn't walk into them.
 pathIgnorePatterns = [
   "**/node_modules/**",
-  "python/robogjc/data/**",
   ".wt/**",
   ".worktrees/**",
 ]

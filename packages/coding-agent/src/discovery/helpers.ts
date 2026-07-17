@@ -180,6 +180,14 @@ export function buildRuleFromMarkdown(
 		rawMode === "never" || rawMode === "prose-only" || rawMode === "tool-only" || rawMode === "always"
 			? rawMode
 			: undefined;
+	const rawRepeatMode = frontmatter.repeatMode;
+	const repeatMode: Rule["repeatMode"] =
+		rawRepeatMode === "once" || rawRepeatMode === "after-gap" ? rawRepeatMode : undefined;
+	const repeatGap =
+		typeof frontmatter.repeatGap === "number" && Number.isInteger(frontmatter.repeatGap) && frontmatter.repeatGap > 0
+			? frontmatter.repeatGap
+			: undefined;
+
 	return {
 		name: resolvedName,
 		path: filePath,
@@ -190,6 +198,8 @@ export function buildRuleFromMarkdown(
 		condition,
 		scope,
 		interruptMode,
+		repeatMode,
+		repeatGap,
 		_source: source,
 	};
 }

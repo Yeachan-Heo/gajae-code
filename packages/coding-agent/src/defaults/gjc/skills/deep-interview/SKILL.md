@@ -2,7 +2,7 @@
 name: deep-interview
 description: Socratic deep interview with mathematical ambiguity gating before explicit execution approval
 argument-hint: "[--trace] [--quick|--standard|--deep] <idea or vague description>"
-pipeline: [deep-interview, plan]
+pipeline: [deep-interview, ralplan]
 handoff-policy: approval-required
 handoff: .gjc/_session-{sessionid}/specs/deep-interview-{slug}.md
 level: 3
@@ -20,6 +20,7 @@ Deep Interview implements Ouroboros-inspired Socratic questioning with mathemati
 - User says "ouroboros", "socratic", "I have a vague idea", "not sure exactly what I want"
 - User wants to avoid "that's not what I meant" outcomes from autonomous execution
 - Task is complex enough that jumping to code would waste cycles on scope discovery
+- User asks for implementation but the target, scope, acceptance criteria, or safety boundary is ambiguous enough that mutation would require guessing
 - User wants mathematically-validated clarity before committing to execution
 - User explicitly requests deep-interview even after being told the request is already clear, bounded, and low-risk
 - User requests a trace/research pre-step before the interview, e.g. `/skill:deep-interview --trace <idea>`
@@ -27,6 +28,7 @@ Deep Interview implements Ouroboros-inspired Socratic questioning with mathemati
 
 <Do_Not_Use_When>
 - User has a detailed, specific request with file paths, function names, or acceptance criteria -- execute directly
+- User has an explicit concrete low-risk implementation request with enough target, scope, and acceptance criteria to execute safely -- execute directly
 - User wants to explore options or brainstorm -- use `ralplan` skill instead
 - User wants a quick fix or single change -- use direct execution, not deep-interview or role-agent delegation
 - User says "just do it" or "skip the questions" without an explicit execution path -- respect their intent by exiting deep-interview, not by writing a `pending approval` spec
@@ -52,6 +54,7 @@ Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demo
 - When the locked topology has multiple active components, score and target each component explicitly so depth-first clarity on one component cannot hide ambiguity in siblings
 - Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts
 - If the user's initial context is oversized, create a concise prompt-safe summary first and wait for that summary before ambiguity scoring, question generation, or downstream execution handoff
+- Route ambiguous implementation asks to clarification, deep-interview, or downstream `ralplan` before mutation; do not infer missing target, scope, acceptance criteria, or safety boundary just to start coding.
 - Do not proceed to execution until ambiguity ≤ the resolved threshold for this run and the user explicitly approves a scoped execution path
 - Treat user wording such as `implementation`, "implementation plan", Korean `구현`, or "구현 계획" as describing the eventual target, not permission to implement now.
 - While still in deep-interview, do not implement, edit/write code, launch implementation workers, or start task/skill/ultragoal implementation; continue interviewing for scope, risks, acceptance criteria, and unknowns.
@@ -94,14 +97,14 @@ Complete this phase before Phase 1, before brownfield exploration, before GJC st
 1. **Prefer pre-resolved native state**:
    - First inspect active deep-interview state with `gjc state deep-interview read --json`.
    - If state contains a finite numeric `threshold` and a non-empty `threshold_source`, use those values, set `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`, and skip optional settings-file reads. This is the normal `/skill:deep-interview` path because the native hook already resolved settings quietly before loading the skill.
-2. **Only if native state lacks a resolved threshold, read threshold settings in precedence order**:
-   - User settings: `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`
-   - Project settings: `./.gjc/settings.json` (overrides user settings)
-   - Read `gjc.deepInterview.ambiguityThreshold` only from files that are known to exist; optional settings-file absence is expected and must not be surfaced as failed `Read` calls.
+2. **Only if native state lacks a resolved threshold, read threshold settings in runtime precedence order**:
+   - YAML config first: read the **single** modern config path the environment selects — `$GJC_CODING_AGENT_DIR/config.yml` when `GJC_CODING_AGENT_DIR` is set, else `$GJC_CONFIG_DIR/agent/config.yml` when `GJC_CONFIG_DIR` is set, else `~/.gjc/agent/config.yml`. Do not cascade through the other YAML locations when the selected one is absent or invalid.
+   - Then JSON settings: project settings `./.gjc/settings.json`, then user settings `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`.
+   - Read `gjc.deepInterview.ambiguityThreshold` only from files that are known to exist; optional config/settings-file absence is expected and must not be surfaced as failed `Read` calls.
    - Do not probe arbitrary ancestor candidates such as `../../.gjc/settings.json`; use the current project `.gjc/settings.json` and user settings only.
 3. **Resolve threshold and source**:
-   - Use the project value when valid; otherwise use the user value when valid; otherwise use the default `0.05`.
-   - Set these run variables exactly: `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` (for example `./.gjc/settings.json`, `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`, or `default`).
+   - Use the first valid configured value in the precedence order above; otherwise use the mode default when a resolution flag was passed: `--quick` = `0.6`, `--standard` = `0.5`, `--deep` = `0.35`; with no resolution flag, use the base default `0.05`.
+   - Set these run variables exactly: `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` (for example `GJC_CODING_AGENT_DIR/config.yml`, `$GJC_CONFIG_DIR/agent/config.yml`, `~/.gjc/agent/config.yml`, `./.gjc/settings.json`, `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`, or the selected mode default).
 4. **Emit the required first line to the user before any other interview announcement**:
 
 ```
@@ -118,7 +121,7 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
 
 Run this gate after the Phase 0 threshold marker and before Phase 1, brownfield exploration, `gjc state write`, Round 0, ambiguity scoring, or spec writing.
 
-If `{{ARGUMENTS}}` is already clear, bounded, low-risk, and asks for a quick fix, single change, known file/symbol edit, explicit command, or direct answer:
+If the user request appended after this skill as the final `User:` line is already clear, bounded, low-risk, and asks for a quick fix, single change, known file/symbol edit, explicit command, or direct answer:
 
 1. **Stop deep-interview immediately**:
    - First inspect current-session state with `gjc state read --mode deep-interview --json` (include `--session-id <current-session-id>` when available).
@@ -147,7 +150,7 @@ Run this phase only when the active deep-interview state or invocation indicates
 
 ## Phase 1: Initialize
 
-1. **Parse the user's idea** from `{{ARGUMENTS}}`
+1. **Parse the user's idea** from the user request appended after this skill as the final `User:` line
 2. **Detect brownfield vs greenfield**:
    - Use focused read/search tools or a canonical read-only role agent (`planner`/`architect`) to check if cwd has existing source code, package files, or git history
    - If source files exist AND the user's idea references modifying/extending something: **brownfield**
@@ -164,7 +167,7 @@ Run this phase only when the active deep-interview state or invocation indicates
    - Inspect the initial idea plus any pasted artifacts, logs, transcripts, or file excerpts for prompt-budget risk before writing state or generating the first question.
    - If the initial context is oversized or likely to crowd out downstream prompts, produce a concise prompt-safe summary that preserves user intent, decisions, constraints, unknowns, cited files/symbols, and any explicit non-goals.
    - Treat the summary as the canonical `initial_idea` and store the raw oversized material only as external/advisory context if it can be referenced safely; do not paste the raw oversized context into question-generation, ambiguity-scoring, spec-crystallization, or execution-handoff prompts.
-   - Wait until the summary exists before ambiguity scoring, weakest-dimension selection, brownfield exploration prompts, or any bridge to `ralplan`, `execution`, `execution`, or `team`.
+   - Wait until the summary exists before ambiguity scoring, weakest-dimension selection, brownfield exploration prompts, or any bridge to `ralplan`, `ultragoal`, or `team`.
 3.7. **Artifact path discipline**:
    - Final specs MUST resolve to `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly.
    - Write final specs and all ephemeral interview artifacts through the active GJC workflow/state CLI when available.
@@ -308,7 +311,7 @@ Build the question generation prompt with:
 
 - `language` from active state when present; apply `language.instruction` to all natural-language user-facing question text, rationale, and options
 
-If any prompt input is too large, summarize it first and then continue from the summary. Do not ask the next the `ask` tool, score ambiguity, or hand off to execution from an over-budget raw transcript.
+If any prompt input is too large, summarize it first and then continue from the summary. Do not ask the next question, score ambiguity, or hand off to execution from an over-budget raw transcript.
 
 **Question targeting strategy:**
 - Identify the active component + dimension pair with the LOWEST clarity score across the locked topology
@@ -680,7 +683,6 @@ Spec structure:
 
 ## Phase 5: Execution Bridge
 
-**Research workflow override:** if `--research-setup` is active, skip the standard execution options below and write a pending-approval spec that names research setup as an unresolved follow-up. Do not invoke deprecated research workflow shims.
 
 After the spec is written, mark it `pending approval` and present execution options via the `ask` tool. Until the user selects an execution option, the deep-interview module MUST NOT run mutation-oriented shell commands, edit source files, commit, push, open PRs, invoke execution skills, or delegate implementation tasks:
 
@@ -945,4 +947,4 @@ See Phase 3 for the full persona set (researcher/contrarian/simplifier, plus arc
 | Extreme ambiguity | Almost nothing known | Early stages, keep going |
 </Advanced>
 
-Task: {{ARGUMENTS}}
+Task: Use the user request appended after this skill as the final `User:` line.

@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "bun:test";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
-import { executeBuiltinSlashCommand } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
+import {
+	executeBuiltinSlashCommand,
+	lookupBuiltinSlashCommand,
+} from "@gajae-code/coding-agent/slash-commands/builtin-registry";
 
 function createRuntimeHarness(options?: {
 	handleSessionCommand?: InteractiveModeContext["handleSessionCommand"];
@@ -105,5 +108,37 @@ describe("/session slash command", () => {
 		await expect(executeBuiltinSlashCommand("/session delete", harness.runtime)).rejects.toBe(deleteError);
 		expect(handleSessionDeleteCommand).toHaveBeenCalledTimes(1);
 		expect(harness.setText).toHaveBeenCalledWith("");
+	});
+
+	it("reports the exact ACP delete target and retained metadata", async () => {
+		const command = lookupBuiltinSlashCommand("session");
+		const output = vi.fn();
+		const dropSession = vi.fn(async () => undefined);
+		const runtime = {
+			cwd: "/tmp/project",
+			output,
+			refreshCommands: vi.fn(),
+			reloadPlugins: vi.fn(),
+			session: { isStreaming: false, sessionId: "session-a", sessionName: "Session A" },
+			sessionManager: {
+				getSessionFile: () => "/tmp/project/sessions/session-a.jsonl",
+				dropSession,
+			},
+			settings: {},
+		};
+
+		const result = await command?.handle?.(
+			{ name: "session", args: "delete", text: "/session delete" },
+			runtime as never,
+		);
+
+		expect(result).toEqual({ consumed: true });
+		expect(dropSession).toHaveBeenCalledWith("/tmp/project/sessions/session-a.jsonl");
+		expect(output).toHaveBeenCalledWith(
+			[
+				"Deleted current session transcript and artifacts: /tmp/project/sessions/session-a.jsonl",
+				"Other sessions and topic/history metadata were not deleted.",
+			].join("\n"),
+		);
 	});
 });

@@ -27,6 +27,8 @@ interface AcpEventMapperOptions {
 	 * before emitting `ToolCallLocation` entries.
 	 */
 	cwd?: string;
+	/** Phase to expose after compaction ends. Prompt-bound compaction resumes responding; idle maintenance returns idle. */
+	compactionEndPhase?: "responding" | "idle";
 }
 
 interface ContentArrayContainer {
@@ -230,18 +232,70 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		}
 		case "todo_auto_clear":
 			return [toSessionNotification(sessionId, { sessionUpdate: "plan", entries: [] })];
+		case "model_fallback_switched":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcModelFallbackSwitched: true,
+						gjcModelFallbackEventId: event.eventId,
+						gjcModelFallbackFrom: event.from,
+						gjcModelFallbackTo: event.to,
+						gjcModelFallbackReason: event.reason,
+						gjcModelFallbackRole: event.role,
+						gjcModelFallbackScope: event.scope,
+						gjcModelFallbackActiveIndex: event.activeIndex,
+						gjcModelFallbackChainLength: event.chainLength,
+						gjcModelFallbackAttemptsUsed: event.attemptsUsed,
+					},
+				}),
+			];
 		// These event types are intentionally not represented as ACP session updates.
 		case "agent_start":
 		case "agent_end":
 		case "turn_start":
 		case "turn_end":
 		case "message_start":
+			return [];
 		case "auto_compaction_start":
-		case "auto_compaction_end":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcPhase: "compacting",
+						gjcCompactionState: "start",
+						gjcCompactionTrigger: event.reason,
+						gjcCompactionAction: event.action,
+						running: true,
+						gjcRunning: true,
+					},
+				}),
+			];
+		case "auto_compaction_end": {
+			const phase = options.compactionEndPhase ?? "responding";
+			const running = phase !== "idle";
+			const meta: Record<string, unknown> = {
+				gjcPhase: phase,
+				gjcCompactionState: "end",
+				gjcCompactionAction: event.action,
+				gjcCompactionAborted: event.aborted,
+				gjcCompactionWillRetry: event.willRetry,
+				running,
+				gjcRunning: running,
+			};
+			if (event.skipped !== undefined) {
+				meta.gjcCompactionSkipped = event.skipped;
+			}
+			if (event.errorMessage !== undefined) {
+				meta.gjcCompactionErrorMessage = event.errorMessage;
+			}
+			if (event.continuationSkipReason !== undefined) {
+				meta.gjcCompactionContinuationSkipReason = event.continuationSkipReason;
+			}
+			return [toSessionNotification(sessionId, { sessionUpdate: "session_info_update", _meta: meta })];
+		}
 		case "auto_retry_start":
 		case "auto_retry_end":
-		case "retry_fallback_applied":
-		case "retry_fallback_succeeded":
 		case "ttsr_triggered":
 		case "irc_message":
 		case "subagent_steer_message":

@@ -120,6 +120,11 @@ describe("pruning cache-epoch invariant", () => {
 		}
 	}
 
+	function seedSubMinimumPrunableHistory(): void {
+		sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		for (let i = 0; i < 18; i++) sessionManager.appendMessage(toolResultMessage(i, 12_000));
+	}
+
 	function prunedEntryCount(): number {
 		return sessionManager.getBranch().filter(entry => {
 			if (entry.type !== "message") return false;
@@ -158,5 +163,14 @@ describe("pruning cache-epoch invariant", () => {
 		// maintenance (pruning, then compaction if still over) is sanctioned.
 		await driveTurnEnd(assistantMessage(190_000));
 		expect(prunedEntryCount()).toBeGreaterThan(0);
+	});
+
+	it("uses sub-normal-minimum output savings to avert threshold compaction", async () => {
+		await createSession();
+		seedSubMinimumPrunableHistory();
+		session.settings.set("compaction.thresholdTokens", 187_000);
+		await driveTurnEnd(assistantMessage(188_000));
+		expect(prunedEntryCount()).toBeGreaterThan(0);
+		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
 	});
 });

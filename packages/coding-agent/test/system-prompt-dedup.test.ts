@@ -22,8 +22,11 @@ describe("SYSTEM.md prompt assembly", () => {
 	let originalHome: string | undefined;
 
 	beforeEach(() => {
-		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-system-prompt-"));
-		tempHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-system-home-"));
+		// Keep project-context fixtures outside the real user HOME even when
+		// TMPDIR points at ~/tmp; walk-up context discovery must not see
+		// host-level /home/bellman/AGENTS.md as a project file.
+		tempDir = fs.mkdtempSync(path.join(path.sep, "tmp", "gjc-system-prompt-"));
+		tempHomeDir = fs.mkdtempSync(path.join(path.sep, "tmp", "gjc-system-home-"));
 		originalHome = process.env.HOME;
 		process.env.HOME = tempHomeDir;
 		vi.spyOn(os, "homedir").mockReturnValue(tempHomeDir);
@@ -86,6 +89,36 @@ describe("SYSTEM.md prompt assembly", () => {
 
 		await expect(loadSystemPromptFiles({ cwd: projectDir })).resolves.toBeNull();
 		await expect(loadProjectContextFiles({ cwd: projectDir })).resolves.toEqual([]);
+	});
+
+	it("loads gjc's own user-global AGENTS.md before project context files", async () => {
+		const projectDir = path.join(tempDir, "project");
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.writeFileSync(path.join(projectDir, "AGENTS.md"), "Project instructions");
+		const userAgentsPath = path.join(tempHomeDir, ".gjc", "agent", "AGENTS.md");
+		fs.mkdirSync(path.dirname(userAgentsPath), { recursive: true });
+		fs.writeFileSync(userAgentsPath, "User-global instructions");
+
+		const files = await loadProjectContextFiles({ cwd: projectDir });
+		const paths = files.map(file => file.path);
+
+		expect(paths[0]).toBe(userAgentsPath);
+		expect(files[0]?.content).toBe("User-global instructions");
+		expect(paths).toContain(path.join(projectDir, "AGENTS.md"));
+	});
+
+	it("includes the native user-global file while still excluding foreign user-home files", async () => {
+		const projectDir = path.join(tempDir, "project");
+		fs.mkdirSync(projectDir, { recursive: true });
+		fs.mkdirSync(path.join(tempHomeDir, ".claude"), { recursive: true });
+		fs.writeFileSync(path.join(tempHomeDir, ".claude", "CLAUDE.md"), "Home Claude instructions");
+		const userAgentsPath = path.join(tempHomeDir, ".gjc", "agent", "AGENTS.md");
+		fs.mkdirSync(path.dirname(userAgentsPath), { recursive: true });
+		fs.writeFileSync(userAgentsPath, "User-global instructions");
+
+		const files = await loadProjectContextFiles({ cwd: projectDir });
+
+		expect(files.map(file => file.path)).toEqual([userAgentsPath]);
 	});
 
 	it("keeps project-level Gemini context files", async () => {

@@ -1,7 +1,7 @@
 /**
  * Read the Docs handler for web-fetch
  */
-import { parseHTML } from "linkedom";
+import { parseHtmlLazy } from "../../utils/linkedom";
 import { buildResult, htmlToBasicMarkdown, loadPage, type RenderResult, type SpecialHandler } from "./types";
 
 export const handleReadTheDocs: SpecialHandler = async (
@@ -39,7 +39,7 @@ export const handleReadTheDocs: SpecialHandler = async (
 	}
 
 	// Parse HTML
-	const root = parseHTML(result.content).document;
+	const root = (await parseHtmlLazy(result.content)).document;
 
 	// Extract main content from common Read the Docs selectors
 	let mainContent =

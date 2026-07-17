@@ -4,6 +4,7 @@
 import type { AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { INTENT_FIELD } from "@gajae-code/agent-core";
 import type { AssistantMessage, Model } from "@gajae-code/ai";
+import { buildCacheEconomicsWarning, type CacheWarningBuildState } from "./cache-economics";
 import {
 	type BashExecutionMessage,
 	type BranchSummaryMessage,
@@ -137,6 +138,7 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 		lines.push("\n");
 	}
 
+	const cacheWarningState: CacheWarningBuildState = { warningsEmitted: 0 };
 	for (const msg of options.messages) {
 		if (msg.role === "user" || msg.role === "developer") {
 			lines.push(msg.role === "developer" ? "## Developer\n" : "## User\n");
@@ -171,6 +173,10 @@ export function formatSessionDumpText(options: FormatSessionDumpTextOptions): st
 					}
 					lines.push("<" + "/invoke>\n");
 				}
+			}
+			const cacheWarning = buildCacheEconomicsWarning(assistantMsg.usage, model, cacheWarningState);
+			if (cacheWarning) {
+				lines.push(cacheWarning);
 			}
 			lines.push("");
 		} else if (msg.role === "toolResult") {

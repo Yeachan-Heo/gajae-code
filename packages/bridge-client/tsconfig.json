@@ -2,6 +2,7 @@
 	"extends": "../tsconfig.workspace.json",
 	"include": [
 		"src",
-		"test"
+		"test",
+		"scripts"
 	]
 }

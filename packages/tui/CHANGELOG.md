@@ -1,8 +1,65 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.11.0] - 2026-07-15
 ### Fixed
 
+- Shared the temporary stdout error listener across terminal instances, preventing `MaxListenersExceededWarning` during repeated TUI start/stop cycles while retaining late detached-PTY error handling.
+- Added a TUI-lifetime terminal cleanup queue so component-owned escape cleanup can be retried after terminal recovery even when the originating component has already been disposed.
+
+### Added
+
+- Added opt-in disabled items to `SelectList` (`SelectItem.disabled`): disabled entries render dimmed; arrow navigation wraps while page navigation clamps and both skip disabled targets; filter resets choose the first enabled item; and programmatic selection searches forward from the requested index before falling back backward. Callbacks never receive disabled entries, while enabled-only arrow/page inputs preserve their existing notification behavior. All-disabled lists keep a null selection while an independent viewport remains navigable, with no cursor and a `(-/N)` scroll position.
+
+## [0.10.2] - 2026-07-14
+### Fixed
+
+- Shared the temporary stdout error listener across terminal instances, preventing `MaxListenersExceededWarning` during repeated TUI start/stop cycles while retaining late detached-PTY error handling.
+- Added a TUI-lifetime terminal cleanup queue so component-owned escape cleanup can be retried after terminal recovery even when the originating component has already been disposed.
+
+### Added
+
+- Added opt-in disabled items to `SelectList` (`SelectItem.disabled`): disabled entries render dimmed; arrow navigation wraps while page navigation clamps and both skip disabled targets; filter resets choose the first enabled item; and programmatic selection searches forward from the requested index before falling back backward. Callbacks never receive disabled entries, while enabled-only arrow/page inputs preserve their existing notification behavior. All-disabled lists keep a null selection while an independent viewport remains navigable, with no cursor and a `(-/N)` scroll position.
+
+## [0.10.1] - 2026-07-13
+### Fixed
+
+- Real interactive terminals now repaint only the visible viewport during forced renders instead of clearing and replaying native scrollback.
+- Terminal graphics protocols are no longer assumed under terminal multiplexers: the blind Kitty fallback for `TERM=tmux-*`/`screen-*` (and detected kitty/iTerm2 protocols leaking through multiplexer env) emitted raw graphics escapes the multiplexer consumed, leaving the Gajae composer pet invisible while its out-of-band cursor writes intermittently corrupted the TUI frame. Image protocols are now unconditionally dropped under tmux/screen/zellij (shared multiplexer predicate with the renderer host policy, including `$TMUX_PANE`, `$STY`, `$ZELLIJ`, and `GJC_TMUX_LAUNCHED`) unless `PI_FORCE_IMAGE_PROTOCOL` explicitly forces a protocol, which remains an expert override.
+- Fixed the startup sixel capability probe's response parsing and authority: XTSMGRAPHICS replies are read per spec (`Ps=0` success; `1/2/3` errors — tmux's `CSI ?2;3;0S` error no longer counts as support), the DA1 device-class parameter is no longer misread as the sixel extension attribute (`CSI ?4;6c` identifies a VT132, not sixel), an explicit `PI_FORCE_IMAGE_PROTOCOL` (including `off`) suppresses probing entirely, and the probe never runs inside a multiplexer because tmux advertises DA1 `;4` from compile-time support regardless of the attached client.
+- A configured Gajae pet now re-applies automatically when the asynchronous sixel probe enables graphics after startup (new `onImageProtocolChanged` subscription), instead of staying hidden until `/pet` is re-run; `/pet` also reports multiplexer graphics suppression explicitly instead of suggesting a different terminal.
+
+## [0.10.0] - 2026-07-12
+### Fixed
+
+- Unified TUI wrapping, truncation, and visible-width measurements on the native grapheme-width engine, preventing Hangul tone marks from causing Korean/CJK layout width drift (#1979).
+
+- Preserved durable transcript semantic anchors at their screen rows when completion removes transient content, including CJK/emoji/ANSI reflow, prefix eviction, provider replacement, explicit exclusion of synthetic/IRC/pinned rows, and supported SSH, tmux, Termux, and Windows terminal paths (#1969).
+
+### Added
+
+- Added transparent Sixel and Kitty real-pixel encoders plus animated 16x16 frame art for the Gajae composer pet.
+- Added an opt-in IRC sidebar split (`alt+i`, remappable): a responsive 70:30 vertical right-hand split that renders Discord-style IRC message blocks through a shared inline/sidebar formatter, with unbounded session backfill and tail-aligned panes. Kitty terminals render inline images inside the split via a cursor-neutral graphics fallback; cursor-advancing protocols (iTerm2, raw Sixel) keep the textual placeholder (#2018).
+
+## [0.9.4] - 2026-07-09
+
+### Fixed
+
+- Markdown terminal rendering now treats HTML comments as invisible markup, preventing React-style `<!-- -->` text separators from leaking into chat output while preserving visible HTML-like model text.
+
+## [0.9.1] - 2026-07-08
+### Fixed
+
+- Native Windows console hosts now use the live-viewport repaint path even when `WT_SESSION` is missing, and full clears avoid `3J` there, preventing Windows Terminal/PowerShell from jumping to the transcript top during forced redraws such as prompt bells and context compaction.
+- Manual viewport paging and resize repaint paths remain stable after terminal resizes, including the Windows/psmux live-viewport path.
+- Kitty inline image repaints now reuse uploaded image data and avoid duplicate placements or transcript overpaint.
+- Empty filtered paste operations no longer leave ghost undo snapshots, and footer git watcher disposal no longer races late watcher creation.
+
+## [0.8.2] - 2026-07-06
+### Fixed
+
+- Fixed backward jump-to-character (`ctrl+alt+]`) matching the character under the cursor when the cursor is at column 0: `lastIndexOf` clamps a negative start position to 0, so the jump stopped in place instead of skipping the cursor position and continuing into earlier lines.
 - GJC-launched psmux panes are now treated as multiplexer sessions even when they do not expose `$TMUX`, so resize and forced redraw paths repaint the live viewport instead of replaying/clearing scrollback and leaving the bottom-pinned composer area above stale blank rows.
 
 ## [0.8.0] - 2026-07-04
@@ -20,6 +77,9 @@
 ### Fixed
 
 - Kept the terminal stdout error handler armed briefly after TUI shutdown so late `EIO`/closed-PTY errors from SSH or Windows Terminal detach do not crash tmux-backed GJC panes.
+### Fixed
+
+- Added an editor right-gutter render option so bordered input chrome can stay one cell inside the terminal edge without changing component width.
 
 ## [0.7.9] - 2026-07-01
 

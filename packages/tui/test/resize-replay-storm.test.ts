@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Text } from "../src/components/text";
-import { TUI } from "../src/tui";
+import { shouldUseViewportRepaintForHost, TUI } from "../src/tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
 // Regression test for the multiplexer scrollback replay storm.
@@ -40,6 +40,35 @@ function distinctReplayedLineMarkers(out: string): number {
 }
 
 describe("multiplexer resize replay storm regression", () => {
+	describe("viewport-sensitive host detection", () => {
+		it("uses viewport repaint for native Windows even when WT_SESSION is missing", () => {
+			expect(shouldUseViewportRepaintForHost({ TERM: "xterm-256color" }, "win32")).toBe(true);
+		});
+
+		it("uses viewport repaint for real process terminals", () => {
+			expect(
+				shouldUseViewportRepaintForHost({ TERM: "xterm-256color" }, "darwin", {
+					includeNativeWindows: false,
+					includeProcessTerminal: true,
+				}),
+			).toBe(true);
+		});
+
+		it("keeps the legacy full-render opt-in scoped to multiplexers", () => {
+			expect(
+				shouldUseViewportRepaintForHost(
+					{ TERM: "tmux-256color", PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER: "1" },
+					"linux",
+				),
+			).toBe(false);
+			expect(
+				shouldUseViewportRepaintForHost(
+					{ WT_SESSION: "windows-terminal", PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER: "1" },
+					"linux",
+				),
+			).toBe(true);
+		});
+	});
 	describe("in a multiplexer (TMUX set)", () => {
 		let origTmux: string | undefined;
 
@@ -55,7 +84,7 @@ describe("multiplexer resize replay storm regression", () => {
 		});
 
 		it("requestResizeRender repaints only the viewport on a height-only change", async () => {
-			const term = new VirtualTerminal(COLS, 30);
+			const term = new VirtualTerminal(COLS, 30, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			tui.start();
 			await term.waitForRender();
@@ -76,7 +105,7 @@ describe("multiplexer resize replay storm regression", () => {
 		});
 
 		it("requestRender(true) is safe in multiplexers (widthChanged guard neutralizes the fake width change)", async () => {
-			const term = new VirtualTerminal(COLS, 30);
+			const term = new VirtualTerminal(COLS, 30, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			tui.start();
 			await term.waitForRender();
@@ -94,11 +123,12 @@ describe("multiplexer resize replay storm regression", () => {
 			// now routes to viewport repaint: at most `rows` distinct lines, never the
 			// full 60-line transcript.
 			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+			expect(out).toContain("\x1b[29A\r");
 
 			tui.stop();
 		});
 		it("viewport-only repaint on a width+height resize (the case from the blocking review)", async () => {
-			const term = new VirtualTerminal(COLS, 30);
+			const term = new VirtualTerminal(COLS, 30, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			tui.start();
 			await term.waitForRender();
@@ -116,6 +146,113 @@ describe("multiplexer resize replay storm regression", () => {
 
 			const out = term.getWriteLog().join("");
 			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+
+			tui.stop();
+		});
+		it("keeps inherited multiplexer markers from changing headless forced renders", async () => {
+			const term = new VirtualTerminal(COLS, 30);
+			const tui = new TUI(term);
+			tui.start();
+			await term.waitForRender();
+			await buildTranscript(tui, term, 60);
+
+			for (let attempt = 0; attempt < 2; attempt++) {
+				term.clearWriteLog();
+				tui.requestRender(true, `test.headless.force.${attempt}`);
+				await term.waitForRender();
+
+				const out = term.getWriteLog().join("");
+				expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+				expect(out).toContain("\x1b[3J");
+			}
+
+			term.clearWriteLog();
+			term.resize(COLS, 20);
+			await term.waitForRender();
+			const resizeOut = term.getWriteLog().join("");
+			expect(distinctReplayedLineMarkers(resizeOut)).toBeGreaterThanOrEqual(55);
+			expect(resizeOut).toContain("\x1b[3J");
+
+			tui.stop();
+		});
+	});
+
+	describe("in Windows Terminal", () => {
+		let origWtSession: string | undefined;
+		let origTermProgram: string | undefined;
+		let origTmux: string | undefined;
+		let origTmuxPane: string | undefined;
+		let origSty: string | undefined;
+		let origZellij: string | undefined;
+		let origLaunched: string | undefined;
+
+		beforeEach(() => {
+			origWtSession = Bun.env.WT_SESSION;
+			origTermProgram = Bun.env.TERM_PROGRAM;
+			origTmux = Bun.env.TMUX;
+			origTmuxPane = Bun.env.TMUX_PANE;
+			origSty = Bun.env.STY;
+			origZellij = Bun.env.ZELLIJ;
+			origLaunched = Bun.env.GJC_TMUX_LAUNCHED;
+			Bun.env.WT_SESSION = "test-windows-terminal-session";
+			delete Bun.env.TMUX;
+			delete Bun.env.TMUX_PANE;
+			delete Bun.env.STY;
+			delete Bun.env.ZELLIJ;
+			delete Bun.env.GJC_TMUX_LAUNCHED;
+		});
+
+		afterEach(() => {
+			if (origWtSession === undefined) delete Bun.env.WT_SESSION;
+			else Bun.env.WT_SESSION = origWtSession;
+			if (origTermProgram === undefined) delete Bun.env.TERM_PROGRAM;
+			else Bun.env.TERM_PROGRAM = origTermProgram;
+			if (origTmux === undefined) delete Bun.env.TMUX;
+			else Bun.env.TMUX = origTmux;
+			if (origTmuxPane === undefined) delete Bun.env.TMUX_PANE;
+			else Bun.env.TMUX_PANE = origTmuxPane;
+			if (origSty === undefined) delete Bun.env.STY;
+			else Bun.env.STY = origSty;
+			if (origZellij === undefined) delete Bun.env.ZELLIJ;
+			else Bun.env.ZELLIJ = origZellij;
+			if (origLaunched === undefined) delete Bun.env.GJC_TMUX_LAUNCHED;
+			else Bun.env.GJC_TMUX_LAUNCHED = origLaunched;
+		});
+
+		it("requestRender(true) repaints only the viewport without clearing scrollback", async () => {
+			const term = new VirtualTerminal(COLS, 30, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			tui.start();
+			await term.waitForRender();
+
+			await buildTranscript(tui, term, 60);
+			term.clearWriteLog();
+
+			// Prompt bells and compaction rebuilds can force a render while the
+			// transcript is long. Windows Terminal must not receive a 2J/H/3J full replay.
+			tui.requestRender(true, "test.windows.force");
+			await term.waitForRender();
+
+			const out = term.getWriteLog().join("");
+			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+			expect(out).not.toContain("\x1b[3J");
+
+			tui.stop();
+		});
+		it("keeps inherited Windows Terminal markers from changing headless forced renders", async () => {
+			const term = new VirtualTerminal(COLS, 30);
+			const tui = new TUI(term);
+			tui.start();
+			await term.waitForRender();
+			await buildTranscript(tui, term, 60);
+			term.clearWriteLog();
+
+			tui.requestRender(true, "test.windows.headless.force");
+			await term.waitForRender();
+
+			const out = term.getWriteLog().join("");
+			expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+			expect(out).toContain("\x1b[3J");
 
 			tui.stop();
 		});
@@ -145,7 +282,7 @@ describe("multiplexer resize replay storm regression", () => {
 		});
 
 		it("treats the launched pane as a multiplexer for forced redraws", async () => {
-			const term = new VirtualTerminal(COLS, 30);
+			const term = new VirtualTerminal(COLS, 30, { isProcessTerminal: true });
 			const tui = new TUI(term);
 			tui.start();
 			await term.waitForRender();
@@ -164,6 +301,75 @@ describe("multiplexer resize replay storm regression", () => {
 		});
 	});
 
+	describe("in Termux", () => {
+		let origTermuxVersion: string | undefined;
+		let origTmux: string | undefined;
+		let origSty: string | undefined;
+		let origZellij: string | undefined;
+		let origLaunched: string | undefined;
+
+		beforeEach(() => {
+			origTermuxVersion = process.env.TERMUX_VERSION;
+			origTmux = process.env.TMUX;
+			origSty = process.env.STY;
+			origZellij = process.env.ZELLIJ;
+			origLaunched = process.env.GJC_TMUX_LAUNCHED;
+			process.env.TERMUX_VERSION = "1";
+			delete process.env.TMUX;
+			delete process.env.STY;
+			delete process.env.ZELLIJ;
+			delete process.env.GJC_TMUX_LAUNCHED;
+		});
+
+		afterEach(() => {
+			if (origTermuxVersion === undefined) delete process.env.TERMUX_VERSION;
+			else process.env.TERMUX_VERSION = origTermuxVersion;
+			if (origTmux === undefined) delete process.env.TMUX;
+			else process.env.TMUX = origTmux;
+			if (origSty === undefined) delete process.env.STY;
+			else process.env.STY = origSty;
+			if (origZellij === undefined) delete process.env.ZELLIJ;
+			else process.env.ZELLIJ = origZellij;
+			if (origLaunched === undefined) delete process.env.GJC_TMUX_LAUNCHED;
+			else process.env.GJC_TMUX_LAUNCHED = origLaunched;
+		});
+
+		it("does not full-clear or replay the transcript on a height-only resize", async () => {
+			const term = new VirtualTerminal(COLS, 30, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			tui.start();
+			await term.waitForRender();
+
+			await buildTranscript(tui, term, 60);
+			term.clearWriteLog();
+
+			term.resize(COLS, 20);
+			await term.waitForRender();
+
+			const out = term.getWriteLog().join("");
+			expect(out).not.toContain("\x1b[3J");
+			expect(distinctReplayedLineMarkers(out)).toBeLessThan(60);
+
+			tui.stop();
+		});
+		it("keeps inherited Termux markers from changing headless height resizes", async () => {
+			const term = new VirtualTerminal(COLS, 30);
+			const tui = new TUI(term);
+			tui.start();
+			await term.waitForRender();
+			await buildTranscript(tui, term, 60);
+			term.clearWriteLog();
+
+			term.resize(COLS, 20);
+			await term.waitForRender();
+
+			const out = term.getWriteLog().join("");
+			expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+			expect(out).toContain("\x1b[3J");
+
+			tui.stop();
+		});
+	});
 	describe("in a plain terminal (no multiplexer markers)", () => {
 		let origTmux: string | undefined;
 		let origTmuxPane: string | undefined;
@@ -171,6 +377,8 @@ describe("multiplexer resize replay storm regression", () => {
 		let origZellij: string | undefined;
 		let origLaunched: string | undefined;
 		let origTerm: string | undefined;
+		let origWtSession: string | undefined;
+		let origTermProgram: string | undefined;
 
 		beforeEach(() => {
 			origTmux = process.env.TMUX;
@@ -179,11 +387,15 @@ describe("multiplexer resize replay storm regression", () => {
 			origZellij = process.env.ZELLIJ;
 			origLaunched = process.env.GJC_TMUX_LAUNCHED;
 			origTerm = process.env.TERM;
+			origWtSession = process.env.WT_SESSION;
+			origTermProgram = process.env.TERM_PROGRAM;
 			delete process.env.TMUX;
 			delete process.env.TMUX_PANE;
 			delete process.env.STY;
 			delete process.env.ZELLIJ;
 			delete process.env.GJC_TMUX_LAUNCHED;
+			delete process.env.WT_SESSION;
+			delete process.env.TERM_PROGRAM;
 			process.env.TERM = "xterm-256color";
 		});
 
@@ -200,9 +412,13 @@ describe("multiplexer resize replay storm regression", () => {
 			else process.env.GJC_TMUX_LAUNCHED = origLaunched;
 			if (origTerm === undefined) delete process.env.TERM;
 			else process.env.TERM = origTerm;
+			if (origWtSession === undefined) delete process.env.WT_SESSION;
+			else process.env.WT_SESSION = origWtSession;
+			if (origTermProgram === undefined) delete process.env.TERM_PROGRAM;
+			else process.env.TERM_PROGRAM = origTermProgram;
 		});
 
-		it("requestRender(true) replays the whole transcript (fullRender + 3J clears scrollback cleanly)", async () => {
+		it("uses the host-appropriate forced redraw policy without multiplexer markers", async () => {
 			const term = new VirtualTerminal(COLS, 30);
 			const tui = new TUI(term);
 			tui.start();
@@ -215,10 +431,19 @@ describe("multiplexer resize replay storm regression", () => {
 			await term.waitForRender();
 
 			const out = term.getWriteLog().join("");
-			// Outside multiplexers fullRender replays every line (and 3J clears the
-			// scrollback, so it is visually clean). This pins that the guard only
-			// changes behavior under multiplexers.
-			expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+			const shouldViewportRepaint = shouldUseViewportRepaintForHost({ TERM: "xterm-256color" }, process.platform, {
+				includeNativeWindows: false,
+			});
+			if (shouldViewportRepaint) {
+				expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
+				expect(out).not.toContain("\x1b[3J");
+			} else {
+				// Outside viewport-sensitive hosts, fullRender replays every line and
+				// 3J clears scrollback cleanly. This pins that non-Windows plain terminals
+				// keep the historical clear/replay path.
+				expect(distinctReplayedLineMarkers(out)).toBeGreaterThanOrEqual(55);
+				expect(out).toContain("\x1b[3J");
+			}
 
 			tui.stop();
 		});

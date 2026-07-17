@@ -8,7 +8,7 @@
 - Key collaborators:
   - `packages/coding-agent/src/tool-discovery/tool-index.ts` — discoverable-tool metadata and BM25 index/search.
   - `packages/coding-agent/src/session/agent-session.ts` — session discovery mode, corpus assembly, activation, cache invalidation.
-  - `packages/coding-agent/src/sdk.ts` — initial hiding of discoverable built-ins and prompt-time discoverable summary.
+  - `packages/coding-agent/src/sdk/session.ts` — initial hiding of discoverable built-ins and prompt-time discoverable summary.
   - `packages/coding-agent/src/tools/index.ts` — tool-session discovery hooks, essential/discoverable load modes, registry wiring.
   - `packages/coding-agent/src/config/settings-schema.ts` — `tools.discoveryMode` and legacy `mcp.discoveryMode` settings.
 
@@ -43,7 +43,7 @@
 
 ## Flow
 1. `SearchToolBm25Tool.createIf()` in `packages/coding-agent/src/tools/search-tool-bm25.ts` exposes the tool only when `tools.discoveryMode !== "off"` and the session implements discovery hooks.
-2. `description` is rendered from `packages/coding-agent/src/prompts/tools/search-tool-bm25.md` via `renderSearchToolBm25Description()`, using the current discoverable-tool list plus per-server summary/count.
+2. `description` is rendered once from `packages/coding-agent/src/prompts/tools/search-tool-bm25.md` via zero-argument `renderSearchToolBm25Description()` and remains static across discovery activations.
 3. `execute()` re-checks capability and settings:
    - missing discovery hooks -> `ToolError("Tool discovery is unavailable in this session.")`
    - discovery disabled -> `ToolError("Tool discovery is disabled. Enable tools.discoveryMode or mcp.discoveryMode to use search_tool_bm25.")`
@@ -62,10 +62,8 @@
   - `tools.discoveryMode = "all"`: searches hidden discoverable built-ins.
 - Search-index source:
   - generic cached discoverable index from the session
-  - rebuilt ad hoc from the current discoverable-tool list if neither cache path works
-- Activation backend:
-  - generic `activateDiscoveredTools()`
-  - legacy `activateDiscoveredMCPTools()` fallback
+  - rebuilt ad hoc from the current discoverable-tool list when no cached generic index is available
+- Activation backend: generic `activateDiscoveredTools()`
 
 ## Side Effects
 - Session state
@@ -108,6 +106,6 @@
   - Built-in entries appear only in `"all"` mode and only for registry tools whose `loadMode === "discoverable"` and are not currently active.
   - Hidden/internal built-ins are intentionally excluded from the built-in corpus: `resolve`, `yield`, `report_finding`, `report_tool_issue` are called out in the `#collectDiscoverableBuiltinTools()` comment.
 - `AgentSession.getDiscoverableTools()` currently assembles built-in discoverable tools.
-- On startup, `packages/coding-agent/src/sdk.ts` hides non-essential discoverable built-ins in `tools.discoveryMode = "all"`; defaults are `read`, `bash`, `edit`, `write`, `search`, and `find` unless `tools.essentialOverride` changes them.
+- On startup, `packages/coding-agent/src/sdk/session.ts` hides non-essential discoverable built-ins in `tools.discoveryMode = "all"`; defaults are `read`, `bash`, `edit`, `write`, `search`, and `find` unless `tools.essentialOverride` changes them.
 - Query tokenization is simple and deterministic: camelCase is split, non-alphanumerics become spaces, tokens are lowercased, and only non-empty alphanumeric tokens survive.
 - Scores are rounded differently by surface: `details.tools[].score` keeps 6 decimals; the TUI line renders 3.

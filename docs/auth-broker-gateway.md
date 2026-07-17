@@ -17,7 +17,7 @@ Source: `packages/ai/src/auth-broker/`, `packages/ai/src/auth-gateway/`, `packag
                 │                                                            │
   developer ──▶ │  ┌──────────────────────────┐    ┌────────────────────┐    │
   laptop /      │  │  gjc auth-broker serve   │◀──▶│  SQLite agent.db    │    │
-  CI / robogjc   │  │  - holds refresh tokens  │    │  (canonical writer)│    │
+  CI          │  │  - holds refresh tokens  │    │  (canonical writer)│    │
                 │  │  - background refresher  │    └────────────────────┘    │
                 │  │  /v1/{snapshot,refresh,…}│                              │
                 │  └─────────┬────────────────┘                              │
@@ -32,7 +32,7 @@ Source: `packages/ai/src/auth-broker/`, `packages/ai/src/auth-gateway/`, `packag
                              │  bearer ($CONFIG_DIR/auth-gateway.token)
                              ▼
                   unauthenticated clients
-                  (llm-git, macOS widget, robogjc containers, IDE plugins, …)
+                  (llm-git, macOS widget, IDE plugins, …)
                                 │
                                 ▼ same path is forwarded with Authorization
                   api.anthropic.com / api.openai.com / …
@@ -135,7 +135,7 @@ The 15 s client window deliberately sits below the broker’s 5 min server cache
 
 ## Operator opt-in
 
-The broker is **off** unless `GJC_AUTH_BROKER_URL` (or `auth.broker.url` in `config.yml`) is set. When set, `discoverAuthStorage` in `packages/coding-agent/src/sdk.ts` swaps the local SQLite credential store for `RemoteAuthCredentialStore` and every API call resolves credentials through the broker.
+The broker is **off** unless `GJC_AUTH_BROKER_URL` (or `auth.broker.url` in `config.yml`) is set. When set, `discoverAuthStorage` in `packages/coding-agent/src/sdk/session.ts` swaps the local SQLite credential store for `RemoteAuthCredentialStore` and every API call resolves credentials through the broker.
 
 ### Environment variables
 

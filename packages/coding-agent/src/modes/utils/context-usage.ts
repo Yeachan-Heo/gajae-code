@@ -3,15 +3,19 @@ import type { CompactionSettings } from "@gajae-code/agent-core/compaction";
 import {
 	effectiveReserveTokens,
 	estimateMessageTokensHeuristic,
-	estimateTextTokensHeuristic,
 	resolveThresholdTokens,
 } from "@gajae-code/agent-core/compaction";
 import type { Model } from "@gajae-code/ai";
 import { formatNumber } from "@gajae-code/utils";
-import type { Skill } from "../../extensibility/skills";
 import type { AgentSession } from "../../session/agent-session";
-import type { Tool } from "../../tools";
+import { computeNonMessageBreakdown } from "../../session/context-estimation";
 import type { theme as Theme } from "../theme/theme";
+
+export {
+	computeNonMessageTokens,
+	estimateSkillsTokens,
+	estimateToolSchemaTokens,
+} from "../../session/context-estimation";
 
 const GRID_COLS = 20;
 const GRID_ROWS = 10;
@@ -38,88 +42,11 @@ export interface ContextBreakdown {
 	contextWindow: number;
 	categories: CategoryInfo[];
 	lastUserTurnTokens: number;
-	usedTokens: number;
+	estimatedCategoryTotal: number;
+	usedTokens: number | null;
+	source: "provider_anchor" | "heuristic" | "unknown";
 	autoCompactBufferTokens: number;
 	freeTokens: number;
-}
-
-export function estimateSkillsTokens(skills: readonly Skill[]): number {
-	const fragments: string[] = [];
-	for (const skill of skills) {
-		// "- name: description\n" wire framing tokenizes ~identically to the
-		// concatenated form, so encode each piece separately and sum.
-		fragments.push(skill.name, skill.description);
-	}
-	return estimateTextTokensHeuristic(fragments);
-}
-
-export function estimateToolSchemaTokens(
-	tools: ReadonlyArray<Pick<Tool, "name" | "description" | "parameters">>,
-): number {
-	const fragments: string[] = [];
-	for (const tool of tools) {
-		fragments.push(tool.name, tool.description);
-		try {
-			fragments.push(JSON.stringify(tool.parameters ?? {}));
-		} catch {
-			// Schema may contain functions or cycles; ignore.
-		}
-	}
-	return estimateTextTokensHeuristic(fragments);
-}
-
-/**
- * Compute just the NON-MESSAGE token total: system prompt (with its skills
- * section subtracted, since skills are tokenized separately) + system context
- * (the rest of the system-prompt array) + tools + skills.
- *
- * Exposed so callers like `StatusLineComponent` can cache the non-message
- * total separately from the message total. Non-message inputs (skills,
- * tools, system prompt) change rarely; the message list grows on every
- * streaming turn. Splitting the two lets the caller refresh each on its own
- * cadence — non-message recomputed only when the inputs identity changes,
- * messages walked incrementally as new entries append.
- */
-export function computeNonMessageTokens(session: AgentSession): number {
-	const parts = computeNonMessageBreakdown(session);
-	return (
-		parts.systemPromptTokens + parts.systemContextTokens + parts.rulesTokens + parts.toolsTokens + parts.skillsTokens
-	);
-}
-
-/**
- * Shared helper for the four non-message token totals. Single source of truth
- * for both `computeNonMessageTokens` (status-line incremental cache) and
- * `computeContextBreakdown` (/context panel). The split avoids drift between
- * the two surfaces — they MUST report the same numbers.
- */
-function computeNonMessageBreakdown(session: AgentSession): {
-	rulesTokens: number;
-	skillsTokens: number;
-	toolsTokens: number;
-	systemContextTokens: number;
-	systemPromptTokens: number;
-} {
-	const skillsTokens = estimateSkillsTokens(session.skills ?? []);
-	const toolsTokens = estimateToolSchemaTokens(session.agent?.state?.tools ?? []);
-	const systemPromptParts = session.systemPrompt ?? [];
-	const rulesTokens = estimateRulesTokens(systemPromptParts);
-	const systemContextTokens = estimateTextTokensHeuristic(systemPromptParts.slice(1));
-	const systemPromptTokens = Math.max(
-		0,
-		estimateTextTokensHeuristic(systemPromptParts[0] ?? "") - skillsTokens - rulesTokens,
-	);
-	return { rulesTokens, skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens };
-}
-
-function estimateRulesTokens(systemPromptParts: readonly string[]): number {
-	const fragments: string[] = [];
-	for (const part of systemPromptParts) {
-		for (const match of part.matchAll(/<rules>[\s\S]*?<\/rules>/g)) {
-			fragments.push(match[0]);
-		}
-	}
-	return fragments.length === 0 ? 0 : estimateTextTokensHeuristic(fragments);
 }
 
 function splitLastUserTurn(messages: readonly AgentMessage[]): {
@@ -198,7 +125,11 @@ export function computeContextBreakdown(
 		},
 	];
 
-	const usedTokens = categories.reduce((sum, c) => sum + c.tokens, 0);
+	const estimatedCategoryTotal = categories.reduce((sum, c) => sum + c.tokens, 0);
+	const contextUsage = session.getContextUsage?.();
+	const source = contextUsage?.source ?? "heuristic";
+	const usedTokens = source === "unknown" ? null : (contextUsage?.tokens ?? estimatedCategoryTotal);
+	const tokensForFreeSpace = usedTokens ?? estimatedCategoryTotal;
 
 	let autoCompactBufferTokens = 0;
 	if (contextWindow > 0) {
@@ -214,16 +145,18 @@ export function computeContextBreakdown(
 			autoCompactBufferTokens = effectiveReserveTokens(contextWindow, compactionSettings);
 		}
 	}
-	autoCompactBufferTokens = Math.min(autoCompactBufferTokens, Math.max(0, contextWindow - usedTokens));
+	autoCompactBufferTokens = Math.min(autoCompactBufferTokens, Math.max(0, contextWindow - tokensForFreeSpace));
 
-	const freeTokens = Math.max(0, contextWindow - usedTokens - autoCompactBufferTokens);
+	const freeTokens = Math.max(0, contextWindow - tokensForFreeSpace - autoCompactBufferTokens);
 
 	return {
 		model,
 		contextWindow,
 		categories,
 		lastUserTurnTokens,
+		estimatedCategoryTotal,
 		usedTokens,
+		source,
 		autoCompactBufferTokens,
 		freeTokens,
 	};
@@ -310,18 +243,48 @@ function percentString(part: number, whole: number, fractionDigits = 1): string 
 
 function buildLegendLines(breakdown: ContextBreakdown, theme: typeof Theme): string[] {
 	const lines: string[] = [];
-	const { model, contextWindow, categories, usedTokens, autoCompactBufferTokens, freeTokens } = breakdown;
+	const {
+		model,
+		contextWindow,
+		categories,
+		estimatedCategoryTotal,
+		usedTokens,
+		source,
+		autoCompactBufferTokens,
+		freeTokens,
+	} = breakdown;
 
 	const modelName = model?.name ?? model?.id ?? "no model";
 	const modelId = model?.id ?? "unknown";
 	const windowLabel = formatNumber(contextWindow).toLowerCase();
+	const totalSourceLabel =
+		source === "provider_anchor"
+			? "provider-reported"
+			: source === "unknown"
+				? "estimated; exact count unknown until next response"
+				: "estimated";
 
 	lines.push(theme.bold(`${modelName}`) + theme.fg("dim", ` (${windowLabel} context)`));
 	lines.push(theme.fg("muted", `${modelId}[${windowLabel}]`));
-	lines.push(
-		`${theme.bold(formatNumber(usedTokens))}${theme.fg("dim", `/${windowLabel} tokens`)}` +
-			theme.fg("muted", ` (${percentString(usedTokens, contextWindow)})`),
-	);
+	if (usedTokens === null) {
+		lines.push(
+			`${theme.bold("unknown")}${theme.fg("dim", `/${windowLabel} tokens`)}` +
+				theme.fg("muted", " (exact count unknown until next response)"),
+		);
+	} else {
+		lines.push(
+			`${theme.bold(formatNumber(usedTokens))}${theme.fg("dim", `/${windowLabel} tokens`)}` +
+				theme.fg("muted", ` (${percentString(usedTokens, contextWindow)}) (${totalSourceLabel})`),
+		);
+	}
+	if (source !== "unknown" && usedTokens !== null && estimatedCategoryTotal !== usedTokens) {
+		lines.push(
+			theme.fg(
+				"muted",
+				`Estimated category total: ${formatNumber(estimatedCategoryTotal)} tokens (composition below is estimated)`,
+			),
+		);
+	}
 	lines.push("");
 	lines.push(theme.fg("muted", "Estimated usage by category"));
 
@@ -334,8 +297,9 @@ function buildLegendLines(breakdown: ContextBreakdown, theme: typeof Theme): str
 	}
 
 	const freeDot = theme.fg("dim", CELL_FREE);
+	const freeLabel = usedTokens === null ? "Free space (estimated)" : "Free space";
 	lines.push(
-		`${freeDot} Free space: ${theme.bold(formatNumber(freeTokens))} ${theme.fg("dim", `(${percentString(freeTokens, contextWindow)})`)}`,
+		`${freeDot} ${freeLabel}: ${theme.bold(formatNumber(freeTokens))} ${theme.fg("dim", `(${percentString(freeTokens, contextWindow)})`)}`,
 	);
 
 	if (autoCompactBufferTokens > 0) {

@@ -4,14 +4,21 @@ import * as path from "node:path";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	type UltragoalGuardState,
+	validateCompletionReceipt,
 	verifyUltragoalDurableCompletionState,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
+import { computeUltragoalPlanGeneration } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-receipt-freshness";
 import {
 	addUltragoalSubgoal,
 	checkpointUltragoalGoal,
 	createUltragoalPlan,
+	hashStructuredValue,
 	readUltragoalPlan,
 	startNextUltragoalGoal,
+	type UltragoalCompletionVerification,
+	type UltragoalGoal,
+	type UltragoalLedgerEvent,
+	type UltragoalPlan,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 
 const TEST_SESSION_ID = "ultragoal-durable-completion-release-test-session";
@@ -140,6 +147,87 @@ async function createTwoGoalPlan(root: string, mode: "aggregate" | "per-story" =
 	});
 }
 
+function reviewedBatchReplacementFixture(options: { multiple?: boolean; staleReplacement?: boolean } = {}): {
+	plan: UltragoalPlan;
+	ledger: UltragoalLedgerEvent[];
+} {
+	const batch = {
+		schemaVersion: 1 as const,
+		batchId: "VB004",
+		memberIds: ["G002", "G003", "G004"],
+		finalGoalId: "G004",
+		mode: "aggregate-only" as const,
+		metadataHash: "batch-metadata",
+	};
+	const ids = ["G001", "G002", "G003", "G004", "G005", "G006", "G007", "G008", ...(options.multiple ? ["G009"] : [])];
+	const plan: UltragoalPlan = {
+		version: 1,
+		brief: "Reviewed validation batch replacement",
+		gjcGoalMode: "aggregate",
+		gjcObjective: "Complete reviewed batch",
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T00:00:00.000Z",
+		goals: ids.map(
+			(id, index): UltragoalGoal => ({
+				id,
+				title: id,
+				objective: id,
+				status: id === "G004" ? "superseded" : "complete",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`,
+				...(batch.memberIds.includes(id) ? { validationBatch: { ...batch } } : {}),
+				...(id === "G008" || id === "G009" ? { steering: { kind: "review_blocker", blockedGoalId: "G004" } } : {}),
+			}),
+		),
+	};
+	const ledger: UltragoalLedgerEvent[] = [];
+	const receiptFor = (goalId: string, receiptKind: "per-goal" | "final-aggregate") => {
+		const goal = plan.goals.find(item => item.id === goalId)!;
+		const eventId = `checkpoint-${goalId}`;
+		const generation = computeUltragoalPlanGeneration({
+			plan,
+			ledger,
+			goal,
+			receiptKind,
+			beforeStatus: "active",
+			excludeEventId: eventId,
+			targetGoalUpdatedAt: goal.updatedAt,
+		});
+		const receipt: UltragoalCompletionVerification = {
+			schemaVersion: 1,
+			receiptId: `receipt-${goalId}`,
+			verifiedAt: goal.updatedAt,
+			goalId,
+			receiptKind,
+			goalStatusBeforeCheckpoint: "active",
+			gjcGoalMode: plan.gjcGoalMode,
+			gjcObjective: plan.gjcObjective,
+			qualityGateHash: hashStructuredValue({}),
+			planGeneration: generation.planGeneration,
+			basis: generation.basis,
+			checkpointLedgerEventId: eventId,
+			...(goalId === "G002" || goalId === "G003"
+				? { validationBatch: { role: "deferred-member" as const, ...batch, changeSetHash: `changes-${goalId}` } }
+				: {}),
+		};
+		goal.completionVerification = receipt;
+		ledger.push({
+			eventId,
+			event: "goal_checkpointed",
+			goalId,
+			status: "complete",
+			qualityGateJson: {},
+			completionVerification: receipt,
+		});
+	};
+	for (const goalId of ["G001", "G002", "G003", "G005", "G007", "G008", ...(options.multiple ? ["G009"] : [])])
+		receiptFor(goalId, "per-goal");
+	receiptFor("G006", "final-aggregate");
+	if (options.staleReplacement)
+		plan.goals.find(goal => goal.id === "G008")!.completionVerification!.qualityGateHash = "stale";
+	return { plan, ledger };
+}
+
 async function completeGoal(root: string, goalId: string): Promise<void> {
 	await startNextUltragoalGoal({ cwd: root });
 	await checkpointUltragoalGoal({
@@ -239,6 +327,53 @@ describe("ultragoal durable completion release state", () => {
 
 		expect(diagnostic.state).toBe("unreadable_fail_closed");
 		expect(isReleaseAllowed(diagnostic.state)).toBe(false);
+	});
+
+	it("accepts deferred G002/G003 receipts only for a fresh G008 review-blocker replacement of superseded G004 during G006 final aggregation", () => {
+		const { plan, ledger } = reviewedBatchReplacementFixture();
+
+		expect(
+			validateCompletionReceipt({
+				plan,
+				ledger,
+				goal: plan.goals.find(goal => goal.id === "G002")!,
+				receiptKind: "per-goal",
+			}).state,
+		).toBe("active_missing_final_receipt");
+		expect(
+			validateCompletionReceipt({
+				plan,
+				ledger,
+				goal: plan.goals.find(goal => goal.id === "G006")!,
+				receiptKind: "final-aggregate",
+			}).state,
+		).toBe("active_verified_complete");
+	});
+
+	it("fails closed when the sole review-blocker replacement receipt is stale", () => {
+		const { plan, ledger } = reviewedBatchReplacementFixture({ staleReplacement: true });
+
+		expect(
+			validateCompletionReceipt({
+				plan,
+				ledger,
+				goal: plan.goals.find(goal => goal.id === "G006")!,
+				receiptKind: "final-aggregate",
+			}).state,
+		).not.toBe("active_verified_complete");
+	});
+
+	it("fails closed when multiple completed review-blocker replacements target the superseded batch final", () => {
+		const { plan, ledger } = reviewedBatchReplacementFixture({ multiple: true });
+
+		expect(
+			validateCompletionReceipt({
+				plan,
+				ledger,
+				goal: plan.goals.find(goal => goal.id === "G006")!,
+				receiptKind: "final-aggregate",
+			}).state,
+		).not.toBe("active_verified_complete");
 	});
 
 	it("documents the complete release predicate matrix", () => {

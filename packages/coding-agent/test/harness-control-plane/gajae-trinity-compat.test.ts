@@ -75,30 +75,6 @@ describe("gajae trinity wire contract", () => {
 		}
 	});
 
-	it("the recorded RPC exchange is replayable JSONL matching the real wire contract", async () => {
-		const text = await Bun.file(path.join(FIXTURES_DIR, "gajae-trinity-rpc-exchange.jsonl")).text();
-		const lines = text.trim().split("\n");
-		const rows = lines.map(line => JSON.parse(line) as { direction: string; frame: Record<string, unknown> });
-		// get_state resolves the session identity from protocol state.
-		expect(rows[0]).toMatchObject({ direction: "send", frame: { id: "state-0001", type: "get_state" } });
-		expect(rows[1]).toMatchObject({
-			direction: "recv",
-			frame: { type: "response", command: "get_state", success: true },
-		});
-		expect((rows[1].frame.data as { sessionId?: string }).sessionId).toBe("gjc-rpc-session-0001");
-		// prompt commands carry `message` (RpcCommand contract) and succeed via response.command.success.
-		expect(rows[2]).toMatchObject({ direction: "send", frame: { id: "cmd-0001", type: "prompt" } });
-		expect(typeof rows[2].frame.message).toBe("string");
-		expect(rows[3]).toMatchObject({
-			direction: "recv",
-			frame: { type: "response", command: "prompt", success: true },
-		});
-		// agent_start arrives strictly after the prompt response — acceptance is a protocol fact.
-		const startIndex = rows.findIndex(r => r.frame.type === "agent_start");
-		const promptResponseIndex = rows.findIndex(r => r.frame.type === "response" && r.frame.command === "prompt");
-		expect(startIndex).toBeGreaterThan(promptResponseIndex);
-	});
-
 	it("the supported-harness seam is unchanged", () => {
 		expect(SUPPORTED_HARNESSES).toEqual(["gajae-code"]);
 	});

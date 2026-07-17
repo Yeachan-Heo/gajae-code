@@ -10,20 +10,12 @@ import {
 	buildDiscoverableToolSearchIndex,
 	type DiscoverableTool,
 	type DiscoverableToolSearchIndex,
-	formatDiscoverableToolServerSummary,
 	searchDiscoverableTools,
-	summarizeDiscoverableTools,
 } from "../tool-discovery/tool-index";
 import { renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from ".";
 import { formatCount, replaceTabs, TRUNCATE_LENGTHS } from "./render-utils";
 import { ToolError } from "./tool-errors";
-
-// Re-export legacy MCP types for back-compat (tests and external callers may reference them)
-export type {
-	DiscoverableMCPSearchIndex,
-	DiscoverableMCPTool,
-} from "../runtime-mcp/discoverable-tool-metadata";
 
 const DEFAULT_LIMIT = 8;
 const TOOL_DISCOVERY_TITLE = "Tool Discovery";
@@ -78,24 +70,9 @@ function buildSearchToolBm25Content(details: SearchToolBm25Details): string {
 	});
 }
 
-/** Get discoverable tools for description rendering. Falls back to empty array on error. */
 function getDiscoverableToolsForDescription(session: ToolSession): DiscoverableTool[] {
 	try {
-		// Prefer generic method; fall back to legacy MCP-only
-		if (session.getDiscoverableTools) {
-			return session.getDiscoverableTools();
-		}
-		// Legacy MCP path — adapt DiscoverableMCPTool (with `description`) → DiscoverableTool.
-		const legacy = session.getDiscoverableMCPTools?.() ?? [];
-		return legacy.map(t => ({
-			name: t.name,
-			label: t.label,
-			summary: t.description,
-			source: "mcp" as const,
-			serverName: t.serverName,
-			mcpToolName: t.mcpToolName,
-			schemaKeys: t.schemaKeys,
-		}));
+		return session.getDiscoverableTools?.() ?? [];
 	} catch {
 		return [];
 	}
@@ -103,36 +80,18 @@ function getDiscoverableToolsForDescription(session: ToolSession): DiscoverableT
 
 function getDiscoverableToolSearchIndexForExecution(session: ToolSession): DiscoverableToolSearchIndex {
 	try {
-		// Prefer generic cached index
-		if (session.getDiscoverableToolSearchIndex) {
-			const cached = session.getDiscoverableToolSearchIndex();
-			if (cached) return cached;
-		}
-		// Legacy MCP: use cached MCP index. Its documents expose `tool.description` as well as
-		// `tool.summary`, so it is structurally compatible with DiscoverableToolSearchIndex.
-		const mcpCached = session.getDiscoverableMCPSearchIndex?.();
-		if (mcpCached) return mcpCached as unknown as DiscoverableToolSearchIndex;
+		const cached = session.getDiscoverableToolSearchIndex?.();
+		if (cached) return cached;
 	} catch {}
 	return buildDiscoverableToolSearchIndex(getDiscoverableToolsForDescription(session));
 }
 
-/** Resolve the effective selected tool names (generic or legacy MCP). */
 function getSelectedToolNames(session: ToolSession): string[] {
-	if (session.getSelectedDiscoveredToolNames) {
-		return session.getSelectedDiscoveredToolNames();
-	}
-	return session.getSelectedMCPToolNames?.() ?? [];
+	return session.getSelectedDiscoveredToolNames?.() ?? [];
 }
 
-/** Activate tools (generic or legacy MCP fallback). */
 async function activateTools(session: ToolSession, toolNames: string[]): Promise<string[]> {
-	if (session.activateDiscoveredTools) {
-		return session.activateDiscoveredTools(toolNames);
-	}
-	if (session.activateDiscoveredMCPTools) {
-		return session.activateDiscoveredMCPTools(toolNames);
-	}
-	return [];
+	return (await session.activateDiscoveredTools?.(toolNames)) ?? [];
 }
 
 type DiscoveryExecutionSession = ToolSession & {
@@ -140,39 +99,19 @@ type DiscoveryExecutionSession = ToolSession & {
 };
 
 function supportsToolDiscoveryExecution(session: ToolSession): session is DiscoveryExecutionSession {
-	// Supports generic discovery
-	if (
+	return (
 		typeof session.isToolDiscoveryEnabled === "function" &&
 		typeof session.getSelectedDiscoveredToolNames === "function" &&
 		typeof session.activateDiscoveredTools === "function"
-	) {
-		return true;
-	}
-	// Supports legacy MCP discovery
-	if (
-		typeof session.isMCPDiscoveryEnabled === "function" &&
-		typeof session.getSelectedMCPToolNames === "function" &&
-		typeof session.activateDiscoveredMCPTools === "function"
-	) {
-		return true;
-	}
-	return false;
+	);
 }
 
 function isDiscoveryEnabled(session: ToolSession): boolean {
-	if (typeof session.isToolDiscoveryEnabled === "function") {
-		return session.isToolDiscoveryEnabled();
-	}
-	return session.isMCPDiscoveryEnabled?.() ?? false;
+	return session.isToolDiscoveryEnabled?.() ?? false;
 }
 
-export function renderSearchToolBm25Description(discoverableTools: DiscoverableTool[] = []): string {
-	const summary = summarizeDiscoverableTools(discoverableTools);
-	return prompt.render(searchToolBm25Description, {
-		discoverableMCPToolCount: summary.toolCount,
-		discoverableMCPServerSummaries: summary.servers.map(formatDiscoverableToolServerSummary),
-		hasDiscoverableMCPServers: summary.servers.length > 0,
-	});
+export function renderSearchToolBm25Description(): string {
+	return prompt.render(searchToolBm25Description, {});
 }
 
 function renderMatchLines(match: SearchToolBm25Match, theme: Theme): string[] {
@@ -209,9 +148,7 @@ export class SearchToolBm25Tool implements AgentTool<typeof searchToolBm25Schema
 	readonly name = "search_tool_bm25";
 	readonly label = "SearchTools";
 	readonly loadMode = "essential";
-	get description(): string {
-		return renderSearchToolBm25Description(getDiscoverableToolsForDescription(this.session));
-	}
+	readonly description = renderSearchToolBm25Description();
 	readonly parameters = searchToolBm25Schema;
 	readonly strict = true;
 

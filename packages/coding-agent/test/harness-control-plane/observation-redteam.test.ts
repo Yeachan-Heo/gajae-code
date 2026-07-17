@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { observeRpcOutboundFrame as mapRpcFrame } from "../../src/modes/shared/agent-wire/event-observation";
+import { observeAgentWireFrame as mapAgentWireFrame } from "../../src/modes/shared/agent-wire/event-observation";
 
 function evt(event: Record<string, unknown>): Record<string, unknown> {
 	return { type: "event", payload: { event_type: event.type, event } };
@@ -12,7 +12,7 @@ function expectNoSecrets(value: unknown, secrets: string[]): void {
 
 describe("observation red-team mapping", () => {
 	it("maps wrapped agent events to expected bounded owner observations", () => {
-		expect(mapRpcFrame(evt({ type: "agent_start" }))).toMatchObject({
+		expect(mapAgentWireFrame(evt({ type: "agent_start" }))).toMatchObject({
 			eventType: "agent_start",
 			kind: "rpc_agent_started",
 			signal: "SessionStart",
@@ -21,7 +21,7 @@ describe("observation red-team mapping", () => {
 		});
 
 		expect(
-			mapRpcFrame(
+			mapAgentWireFrame(
 				evt({
 					type: "tool_execution_start",
 					toolCallId: "test-1",
@@ -38,7 +38,7 @@ describe("observation red-team mapping", () => {
 		});
 
 		expect(
-			mapRpcFrame(
+			mapAgentWireFrame(
 				evt({
 					type: "tool_execution_start",
 					toolCallId: "plain-1",
@@ -55,7 +55,7 @@ describe("observation red-team mapping", () => {
 		});
 
 		expect(
-			mapRpcFrame(
+			mapAgentWireFrame(
 				evt({
 					type: "tool_execution_end",
 					toolCallId: "ok-1",
@@ -73,7 +73,7 @@ describe("observation red-team mapping", () => {
 		});
 
 		expect(
-			mapRpcFrame(
+			mapAgentWireFrame(
 				evt({
 					type: "tool_execution_end",
 					toolCallId: "err-1",
@@ -91,7 +91,7 @@ describe("observation red-team mapping", () => {
 			evidence: { toolId: "err-1", toolName: "bash", status: "error" },
 		});
 
-		expect(mapRpcFrame(evt({ type: "message_update", message: { id: "msg-1" } }))).toMatchObject({
+		expect(mapAgentWireFrame(evt({ type: "message_update", message: { id: "msg-1" } }))).toMatchObject({
 			eventType: "message_update",
 			kind: "rpc_message_activity",
 			signal: null,
@@ -102,21 +102,21 @@ describe("observation red-team mapping", () => {
 	});
 
 	it("enforces strict event envelope boundary for raw flat agent frames", () => {
-		expect(mapRpcFrame({ type: "agent_start" })).toBeNull();
+		expect(mapAgentWireFrame({ type: "agent_start" })).toBeNull();
 		expect(
-			mapRpcFrame({
+			mapAgentWireFrame({
 				type: "tool_execution_start",
 				toolCallId: "raw",
 				toolName: "bash",
 				args: { command: "bun test" },
 			}),
 		).toBeNull();
-		expect(mapRpcFrame({ type: "agent_end", stopReason: "completed" })).toBeNull();
+		expect(mapAgentWireFrame({ type: "agent_end", stopReason: "completed" })).toBeNull();
 	});
 
 	it("keeps flat control frames observable with bounded evidence", () => {
 		expect(
-			mapRpcFrame({ type: "host_tool_call", id: "h1", toolName: "openExternal", args: { secret: "DROP_ME" } }),
+			mapAgentWireFrame({ type: "host_tool_call", id: "h1", toolName: "openExternal", args: { secret: "DROP_ME" } }),
 		).toMatchObject({
 			frameType: "host_tool_call",
 			kind: "rpc_host_tool_call",
@@ -124,7 +124,7 @@ describe("observation red-team mapping", () => {
 			evidence: { id: "h1", toolName: "openExternal" },
 		});
 		expect(
-			mapRpcFrame({
+			mapAgentWireFrame({
 				type: "host_uri_request",
 				id: "u1",
 				operation: "open",
@@ -138,7 +138,7 @@ describe("observation red-team mapping", () => {
 			evidence: { id: "u1", operation: "open", scheme: "file" },
 		});
 		expect(
-			mapRpcFrame({
+			mapAgentWireFrame({
 				type: "workflow_gate",
 				gate_id: "g1",
 				kind: "approval",
@@ -153,7 +153,12 @@ describe("observation red-team mapping", () => {
 			evidence: { gate_id: "g1", kind: "approval", stage: "pending" },
 		});
 		expect(
-			mapRpcFrame({ type: "extension_error", extensionPath: "/ext", event: "activate", error: "SECRET_ERROR" }),
+			mapAgentWireFrame({
+				type: "extension_error",
+				extensionPath: "/ext",
+				event: "activate",
+				error: "SECRET_ERROR",
+			}),
 		).toMatchObject({
 			frameType: "extension_error",
 			kind: "rpc_extension_error",
@@ -165,7 +170,7 @@ describe("observation red-team mapping", () => {
 
 	it("redacts wrapped tool secrets and long extension error messages from evidence", () => {
 		const secrets = ["SECRET_ARG", "SECRET_COMMAND", "SECRET_OUTPUT", "SECRET_EXTENSION_MESSAGE"];
-		const started = mapRpcFrame(
+		const started = mapAgentWireFrame(
 			evt({
 				type: "tool_execution_start",
 				toolCallId: "secret-start",
@@ -173,7 +178,7 @@ describe("observation red-team mapping", () => {
 				args: { command: "echo SECRET_COMMAND", token: "SECRET_ARG" },
 			}),
 		);
-		const ended = mapRpcFrame(
+		const ended = mapAgentWireFrame(
 			evt({
 				type: "tool_execution_end",
 				toolCallId: "secret-end",
@@ -181,7 +186,7 @@ describe("observation red-team mapping", () => {
 				result: { content: [{ type: "text", text: "SECRET_OUTPUT" }], details: { status: "ok" } },
 			}),
 		);
-		const extensionError = mapRpcFrame({
+		const extensionError = mapAgentWireFrame({
 			type: "extension_error",
 			extensionPath: "/ext",
 			event: "activate",
@@ -197,7 +202,7 @@ describe("observation red-team mapping", () => {
 	});
 
 	it("maps wrapped agent_end only to rpc_agent_completed", () => {
-		const mapped = mapRpcFrame(evt({ type: "agent_end", stopReason: "error", messages: [] }));
+		const mapped = mapAgentWireFrame(evt({ type: "agent_end", stopReason: "error", messages: [] }));
 		expect(mapped).toMatchObject({
 			eventType: "agent_end",
 			kind: "rpc_agent_completed",

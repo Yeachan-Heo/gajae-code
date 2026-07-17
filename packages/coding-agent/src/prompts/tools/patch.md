@@ -5,7 +5,7 @@ Patches files given diff hunks. Primary tool for existing-file edits.
 - `@@` — bare header when context lines unique
 - `@@ $ANCHOR` — anchor copied verbatim from file (full line or unique substring)
 **Anchor Selection:**
-1. Otherwise choose highly specific anchor copied from file:
+1. Prefer a bare `@@` when the context lines alone are unique; otherwise choose a highly specific anchor copied from the file:
    - full function signature
    - class declaration
    - unique string literal/error message
@@ -47,7 +47,7 @@ Returns success/failure; on failure, error message indicates:
 - You NEVER use anchors as comments (no line numbers, location labels, placeholders like `@@ @@`)
 - You NEVER place new lines outside the intended block
 - If edit fails or breaks structure, you MUST re-read the file and produce a new patch from current content — you NEVER retry the same diff
-- NEVER use edit to fix indentation, whitespace, or reformat code. Formatting is a single command run once at the end (`bun fmt`, `cargo fmt`, `prettier —write`, etc.)—not N individual edits. If you see inconsistent indentation after an edit, leave it; the formatter will fix all of it in one pass.
+- NEVER use edit to fix indentation, whitespace, or reformat code. Formatting is a single command run once at the end (`bun fmt`, `cargo fmt`, `prettier --write`, etc.)—not N individual edits. If you see inconsistent indentation after an edit, leave it; the formatter will fix all of it in one pass.
 </critical>
 
 <examples>

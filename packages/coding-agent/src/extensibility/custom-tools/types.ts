@@ -47,7 +47,7 @@ export interface CustomToolAPI {
 	exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
 	/** UI methods for user interaction (select, confirm, input, notify, custom) */
 	ui: CustomToolUIContext;
-	/** Whether UI is available (false in print/RPC mode) */
+	/** Whether an interactive UI is available */
 	hasUI: boolean;
 	/** File logger for error/warning/debug messages */
 	logger: typeof import("@gajae-code/utils").logger;

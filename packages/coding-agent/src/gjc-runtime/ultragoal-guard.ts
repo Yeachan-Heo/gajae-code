@@ -2,16 +2,18 @@ import * as fs from "node:fs/promises";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { resolveGjcSessionForRead, SessionResolutionError } from "./session-resolution";
 import {
-	computeUltragoalPlanGeneration,
+	validateDeferredMemberReceiptFresh,
+	validateReceiptFreshBase,
+	validateSupersededFinalAggregateReceipt,
+} from "./ultragoal-receipt-freshness";
+import {
 	getUltragoalPaths,
 	getUltragoalRunCompletionState,
-	hashStructuredValue,
 	readUltragoalLedger,
 	readUltragoalPlan,
 	recordUltragoalNudgeIfBudgetRemaining,
 	resolveUltragoalNudgeBudget,
 	selectUltragoalNudgeTarget,
-	type UltragoalCompletionVerification,
 	type UltragoalGoal,
 	type UltragoalLedgerEvent,
 	type UltragoalNudgeSurface,
@@ -158,8 +160,33 @@ function requiredGoals(plan: UltragoalPlan): UltragoalGoal[] {
 	return plan.goals.filter(goal => goal.status !== "superseded");
 }
 
+/**
+ * Select the goal whose final-aggregate receipt should represent the run.
+ * Prefer a receipt that still validates fresh; several goals can hold
+ * final-aggregate receipts once plan growth (e.g. `steer add_subgoal`) stales
+ * an earlier one and a later checkpoint re-mints. Fall back to the newest
+ * holder (array-last) purely for diagnostics when none validates.
+ */
+function findFinalAggregateReceiptGoal(
+	plan: UltragoalPlan,
+	ledger: readonly UltragoalLedgerEvent[],
+): UltragoalGoal | null {
+	const candidates = [...requiredGoals(plan)]
+		.reverse()
+		.filter(goal => goal.completionVerification?.receiptKind === "final-aggregate");
+	if (candidates.length === 0) return null;
+	return (
+		candidates.find(
+			goal =>
+				validateCompletionReceipt({ plan, ledger, goal, receiptKind: "final-aggregate" }).state ===
+				"active_verified_complete",
+		) ?? candidates[0]!
+	);
+}
+
 function findReceiptGoal(
 	plan: UltragoalPlan,
+	ledger: readonly UltragoalLedgerEvent[],
 	currentObjective: string,
 ): { goal: UltragoalGoal; receiptKind: UltragoalReceiptKind } | null {
 	if (
@@ -167,32 +194,43 @@ function findReceiptGoal(
 		currentObjective === DEFAULT_ULTRAGOAL_OBJECTIVE ||
 		plan.gjcObjectiveAliases?.some(alias => alias === currentObjective)
 	) {
-		const finalGoal = [...requiredGoals(plan)]
-			.reverse()
-			.find(goal => goal.completionVerification?.receiptKind === "final-aggregate");
+		const finalGoal = findFinalAggregateReceiptGoal(plan, ledger);
 		return finalGoal ? { goal: finalGoal, receiptKind: "final-aggregate" } : null;
 	}
 	const storyGoal = plan.goals.find(goal => goal.objective === currentObjective);
 	return storyGoal ? { goal: storyGoal, receiptKind: "per-goal" } : null;
 }
 
-function findLedgerReceiptEvent(
-	ledger: readonly UltragoalLedgerEvent[],
-	receipt: UltragoalCompletionVerification,
-): UltragoalLedgerEvent | null {
+/**
+ * A review-blocker replacement can stand in for a superseded validation-batch
+ * final only while validating the run's final aggregate receipt. Ordinary
+ * per-goal validation continues to require the original batch-close receipt.
+ */
+function hasFreshReviewedBatchFinalReplacement(input: {
+	plan: UltragoalPlan;
+	ledger: readonly UltragoalLedgerEvent[];
+	deferredGoal: UltragoalGoal;
+}): boolean {
+	const finalGoalId = input.deferredGoal.completionVerification?.validationBatch?.finalGoalId;
+	const finalGoal = finalGoalId ? input.plan.goals.find(goal => goal.id === finalGoalId) : undefined;
+	if (finalGoal?.status !== "superseded") return false;
+	const replacements = input.plan.goals.filter(
+		goal =>
+			goal.status === "complete" &&
+			goal.steering?.kind === "review_blocker" &&
+			goal.steering.blockedGoalId === finalGoal.id,
+	);
+	if (replacements.length !== 1) return false;
+	const replacement = replacements[0]!;
+	const receipt = replacement.completionVerification;
+	if (receipt?.receiptKind !== "per-goal") return false;
 	return (
-		ledger.find(event => {
-			if (event.eventId !== receipt.checkpointLedgerEventId) return false;
-			if (event.event !== "goal_checkpointed") return false;
-			if (event.goalId !== receipt.goalId) return false;
-			const eventReceipt = event.completionVerification as UltragoalCompletionVerification | undefined;
-			return (
-				event.status === "complete" &&
-				eventReceipt?.receiptId === receipt.receiptId &&
-				eventReceipt.receiptKind === receipt.receiptKind &&
-				eventReceipt.planGeneration === receipt.planGeneration
-			);
-		}) ?? null
+		validateCompletionReceipt({
+			plan: input.plan,
+			ledger: input.ledger,
+			goal: replacement,
+			receiptKind: "per-goal",
+		}).state === "active_verified_complete"
 	);
 }
 
@@ -210,55 +248,66 @@ export function validateCompletionReceipt(input: {
 			goalId: input.goal.id,
 		};
 	}
-	if (
-		receipt.schemaVersion !== 1 ||
-		receipt.goalId !== input.goal.id ||
-		receipt.receiptKind !== input.receiptKind ||
-		!receipt.planGeneration ||
-		!receipt.checkpointLedgerEventId
-	) {
-		return {
-			state: "active_stale_receipt",
-			message: `Ultragoal ${input.goal.id} receipt is malformed or stale.`,
-			goalId: input.goal.id,
-		};
+	if (receipt.validationBatch?.role === "deferred-member") {
+		return validateDeferredMemberReceiptFresh({
+			plan: input.plan,
+			ledger: input.ledger,
+			goal: input.goal,
+			receipt,
+			receiptKind: input.receiptKind,
+			requireClose: true,
+		});
 	}
-	const event = findLedgerReceiptEvent(input.ledger, receipt);
-	if (!event) {
-		return {
-			state: "active_stale_receipt",
-			message: `Ultragoal ${input.goal.id} receipt ledger event is missing.`,
-			goalId: input.goal.id,
-		};
-	}
-	const generation = computeUltragoalPlanGeneration({
+	const baseDiagnostic = validateReceiptFreshBase({
 		plan: input.plan,
 		ledger: input.ledger,
 		goal: input.goal,
+		receipt,
 		receiptKind: input.receiptKind,
-		beforeStatus: receipt.goalStatusBeforeCheckpoint,
-		excludeEventId: receipt.checkpointLedgerEventId,
 	});
-	if (generation.planGeneration !== receipt.planGeneration) {
-		return {
-			state: "active_stale_receipt",
-			message: `Ultragoal ${input.goal.id} receipt generation is stale.`,
-			goalId: input.goal.id,
-		};
-	}
-	if (hashStructuredValue(event.qualityGateJson) !== receipt.qualityGateHash) {
-		return {
-			state: "active_dirty_quality_gate",
-			message: `Ultragoal ${input.goal.id} receipt quality-gate hash does not match ledger.`,
-			goalId: input.goal.id,
-		};
-	}
-	if (input.goal.updatedAt !== receipt.verifiedAt) {
-		return {
-			state: "active_stale_receipt",
-			message: `Ultragoal ${input.goal.id} receipt target changed after verification.`,
-			goalId: input.goal.id,
-		};
+	if (baseDiagnostic) return baseDiagnostic;
+	if (receipt.validationBatch?.role === "batch-close") {
+		for (const memberId of receipt.validationBatch.memberIds) {
+			const member = input.plan.goals.find(goal => goal.id === memberId);
+			if (
+				!member?.validationBatch ||
+				member.validationBatch.metadataHash !== receipt.validationBatch.memberMetadataHashes[memberId]
+			) {
+				return {
+					state: "active_stale_receipt",
+					message: `Ultragoal ${input.goal.id} batch-close receipt has stale member metadata for ${memberId}.`,
+					goalId: input.goal.id,
+				};
+			}
+			if (memberId === receipt.validationBatch.finalGoalId) continue;
+			const memberReceipt = member.completionVerification;
+			if (memberReceipt?.validationBatch?.role !== "deferred-member") {
+				return {
+					state: "active_missing_final_receipt",
+					message: `Ultragoal ${input.goal.id} batch-close receipt requires deferred member receipt for ${memberId}.`,
+					goalId: input.goal.id,
+				};
+			}
+			const memberDiagnostic = validateDeferredMemberReceiptFresh({
+				plan: input.plan,
+				ledger: input.ledger,
+				goal: member,
+				receipt: memberReceipt,
+				receiptKind: "per-goal",
+				requireClose: false,
+			});
+			if (memberDiagnostic.state !== "active_verified_complete") return memberDiagnostic;
+			if (
+				receipt.validationBatch.memberReceiptIds[memberId] !== memberReceipt.receiptId ||
+				receipt.validationBatch.memberChangeSetHashes[memberId] !== memberReceipt.validationBatch.changeSetHash
+			) {
+				return {
+					state: "active_stale_receipt",
+					message: `Ultragoal ${input.goal.id} batch-close receipt is stale for deferred member ${memberId}.`,
+					goalId: input.goal.id,
+				};
+			}
+		}
 	}
 	if (input.receiptKind === "final-aggregate") {
 		const incomplete = requiredGoals(input.plan).filter(goal => goal.status !== "complete");
@@ -278,12 +327,48 @@ export function validateCompletionReceipt(input: {
 					goalId: input.goal.id,
 				};
 			}
-			const priorDiagnostic = validateCompletionReceipt({
-				plan: input.plan,
-				ledger: input.ledger,
-				goal: priorGoal,
-				receiptKind: "per-goal",
-			});
+			if (
+				priorGoal.completionVerification.validationBatch?.role !== "deferred-member" &&
+				priorGoal.completionVerification.receiptKind === "final-aggregate"
+			) {
+				// A prior goal may hold the run's previous final-aggregate receipt
+				// when plan growth staled it and a later checkpoint re-minted the
+				// aggregate receipt. Accept it as historical evidence for its own
+				// goal instead of demanding an impossible per-goal receipt.
+				const supersededDiagnostic = validateSupersededFinalAggregateReceipt({
+					ledger: input.ledger,
+					goal: priorGoal,
+					receipt: priorGoal.completionVerification,
+				});
+				if (supersededDiagnostic) {
+					return {
+						state: supersededDiagnostic.state,
+						message: `Ultragoal final receipt requires valid historical evidence for ${priorGoal.id}: ${supersededDiagnostic.message}`,
+						goalId: input.goal.id,
+					};
+				}
+				continue;
+			}
+			const priorDiagnostic =
+				priorGoal.completionVerification.validationBatch?.role === "deferred-member"
+					? validateDeferredMemberReceiptFresh({
+							plan: input.plan,
+							ledger: input.ledger,
+							goal: priorGoal,
+							receipt: priorGoal.completionVerification,
+							receiptKind: "per-goal",
+							requireClose: !hasFreshReviewedBatchFinalReplacement({
+								plan: input.plan,
+								ledger: input.ledger,
+								deferredGoal: priorGoal,
+							}),
+						})
+					: validateCompletionReceipt({
+							plan: input.plan,
+							ledger: input.ledger,
+							goal: priorGoal,
+							receiptKind: "per-goal",
+						});
 			if (priorDiagnostic.state !== "active_verified_complete") {
 				return {
 					state: priorDiagnostic.state,
@@ -345,7 +430,7 @@ export async function readUltragoalVerificationState(input: {
 			message: "Ultragoal has blocked or failed goals; record blockers or rerun verification.",
 		};
 	}
-	const receiptTarget = findReceiptGoal(plan, currentObjective);
+	const receiptTarget = findReceiptGoal(plan, ledger, currentObjective);
 	if (!receiptTarget) {
 		// When earlier required goals are already complete but later ones remain, name the
 		// specific blocking goals (a final-aggregate receipt cannot exist yet anyway). Only
@@ -587,9 +672,7 @@ export async function isUltragoalAskBlocked(
 		});
 	}
 
-	const finalReceiptGoal = [...requiredGoals(plan)]
-		.reverse()
-		.find(goal => goal.completionVerification?.receiptKind === "final-aggregate");
+	const finalReceiptGoal = findFinalAggregateReceiptGoal(plan, ledger);
 	if (!finalReceiptGoal) {
 		return activeAskDiagnostic({
 			reason: "Ultragoal aggregate completion is missing a final aggregate receipt.",

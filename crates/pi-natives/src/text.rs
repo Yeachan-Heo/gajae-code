@@ -14,7 +14,7 @@ use napi::{JsString, bindgen_prelude::*};
 use napi_derive::napi;
 use smallvec::{SmallVec, smallvec};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MIN_TAB_WIDTH: u32 = 1;
 const MAX_TAB_WIDTH: u32 = 16;
@@ -27,6 +27,7 @@ fn clamp_tab_width_for_ops(width: u32) -> usize {
 }
 
 /// Ellipsis strategy for [`truncate_to_width`].
+#[derive(Clone, Copy)]
 #[napi]
 pub enum Ellipsis {
 	/// Use a single Unicode ellipsis character ("…").
@@ -41,6 +42,11 @@ fn build_utf16_string(mut data: Vec<u16>) -> Utf16String {
 	while data.last() == Some(&0) {
 		data.pop();
 	}
+	// SAFETY: we know Utf16String == struct(Vec<u16>)
+	unsafe { std::mem::transmute(data) }
+}
+
+fn build_utf16_string_preserve_nul(data: Vec<u16>) -> Utf16String {
 	// SAFETY: we know Utf16String == struct(Vec<u16>)
 	unsafe { std::mem::transmute(data) }
 }
@@ -380,6 +386,11 @@ const fn ascii_cell_width_u16(u: u16, tab_width: usize) -> usize {
 
 #[inline]
 fn char_width_corrected(c: char) -> Option<usize> {
+	// U+3164 is East Asian Wide and xterm-compatible terminals occupy two
+	// cells for it even though unicode-width treats the filler as zero-width.
+	if c == '\u{3164}' {
+		return Some(2);
+	}
 	UnicodeWidthChar::width(c)
 }
 
@@ -388,6 +399,18 @@ fn grapheme_width_str(g: &str, tab_width: usize) -> usize {
 	if g == "\t" {
 		return tab_width;
 	}
+	// `unicode-segmentation` emits CRLF as a single grapheme, but
+	// `UnicodeWidthStr::width("\r\n") == 1` disagrees with this module's
+	// zero-width control-character policy (the ASCII fast path assigns CR and
+	// LF width 0 via `ascii_cell_width_u16`). Without this correction an
+	// unrelated non-ASCII character in the same segment would route CRLF
+	// through the grapheme path and flip its width from 0 to 1, making the
+	// width primitive context-dependent (e.g. `visibleWidth("한\r\n")`). Handle
+	// it before `UnicodeWidthStr` while leaving VS16/modifier/keycap/ZWJ
+	// grapheme handling intact.
+	if g == "\r\n" {
+		return 0;
+	}
 	let mut it = g.chars();
 	let Some(c0) = it.next() else {
 		return 0;
@@ -395,12 +418,12 @@ fn grapheme_width_str(g: &str, tab_width: usize) -> usize {
 	if it.next().is_none() {
 		return char_width_corrected(c0).unwrap_or(0);
 	}
-	// Multi-char grapheme: sum per-char widths. Conjoining Hangul jamo are
-	// kept in grapheme clusters by unicode-segmentation, and their summed
-	// width matches the NFC syllable width terminals render.
-	g.chars()
-		.map(|c| char_width_corrected(c).unwrap_or(0))
-		.sum()
+	// unicode-width's string state machine handles VS16 presentation,
+	// emoji modifiers, ZWJ sequences, and conjoining Hangul jamo as complete
+	// graphemes. Preserve the terminal-specific U+3164 correction because the
+	// crate treats Hangul Filler as zero-width.
+	let filler_correction = g.chars().filter(|c| *c == '\u{3164}').count() * 2;
+	UnicodeWidthStr::width(g) + filler_correction
 }
 
 thread_local! {
@@ -876,47 +899,25 @@ pub fn wrap_text_with_ansi(text: JsString, width: u32, tab_width: u32) -> Result
 /// Truncate text to a visible width, preserving ANSI codes.
 ///
 /// Pads with spaces when requested.
-#[napi]
-pub fn truncate_to_width(
-	text: JsString<'_>,
-	max_width: u32,
-	ellipsis_kind: Option<Ellipsis>,
-	pad: Option<bool>,
-	tab_width: u32,
-) -> Result<Either<JsString<'_>, Utf16String>> {
-	let max_width = max_width as usize;
-	let ellipsis_kind = ellipsis_kind.unwrap_or(Ellipsis::Unicode);
-	let pad = pad.unwrap_or(false);
-	let tab_width = clamp_tab_width_for_ops(tab_width);
-
-	// Keep original handle so we can return it without allocating.
-	let original = text;
-
-	let text_u16 = text.into_utf16()?;
-	let text = text_u16.as_slice();
-
-	// Fast path: early-exit width check
+fn truncate_to_width_u16_impl(
+	text: &[u16],
+	max_width: usize,
+	ellipsis_kind: Ellipsis,
+	pad: bool,
+	tab_width: usize,
+) -> Vec<u16> {
 	let (text_w, exceeded) = visible_width_u16_up_to(text, max_width, tab_width);
 	if !exceeded {
-		if !pad {
-			// Return original JsString handle: zero output allocation.
-			return Ok(Either::A(original));
-		}
-
-		if text_w < max_width {
-			let mut out = Vec::with_capacity(text.len() + (max_width - text_w));
-			out.extend_from_slice(text);
+		let mut out = Vec::with_capacity(text.len() + max_width.saturating_sub(text_w));
+		out.extend_from_slice(text);
+		if pad && text_w < max_width {
 			out.resize(out.len() + (max_width - text_w), b' ' as u16);
-			return Ok(Either::B(build_utf16_string(out)));
 		}
-
-		// Exactly fits and padding requested: return original is still fine.
-		return Ok(Either::A(original));
+		return out;
 	}
 
-	// Map ellipsis kind to UTF-16 data and width
-	const ELLIPSIS_UNICODE: &[u16] = &[0x2026]; // "…"
-	const ELLIPSIS_ASCII: &[u16] = &[0x2e, 0x2e, 0x2e]; // "..."
+	const ELLIPSIS_UNICODE: &[u16] = &[0x2026];
+	const ELLIPSIS_ASCII: &[u16] = &[0x2e, 0x2e, 0x2e];
 	const ELLIPSIS_OMIT: &[u16] = &[];
 
 	let (ellipsis, ellipsis_w): (&[u16], usize) = match ellipsis_kind {
@@ -926,8 +927,6 @@ pub fn truncate_to_width(
 	};
 
 	let target_w = max_width.saturating_sub(ellipsis_w);
-
-	// If ellipsis alone doesn't fit, return ellipsis cut to max_width
 	if target_w == 0 {
 		let mut out = Vec::with_capacity(ellipsis.len().min(max_width * 2));
 		let mut w = 0usize;
@@ -943,15 +942,13 @@ pub fn truncate_to_width(
 		if pad && w < max_width {
 			out.resize(out.len() + (max_width - w), b' ' as u16);
 		}
-		return Ok(Either::B(build_utf16_string(out)));
+		return out;
 	}
 
-	// Main truncation
 	let mut out = Vec::with_capacity(text.len().min(max_width * 2) + ellipsis.len() + 8);
 	let mut w = 0usize;
 	let mut i = 0usize;
 	let text_len = text.len();
-
 	let mut saw_sgr = false;
 
 	while i < text_len {
@@ -1007,7 +1004,6 @@ pub fn truncate_to_width(
 		}
 	}
 
-	// Only reset if we actually copied SGR codes into the output.
 	if saw_sgr {
 		out.extend_from_slice(&[ESC, b'[' as u16, b'0' as u16, b'm' as u16]);
 	}
@@ -1020,7 +1016,82 @@ pub fn truncate_to_width(
 		}
 	}
 
-	Ok(Either::B(build_utf16_string(out)))
+	out
+}
+
+#[napi]
+pub fn truncate_to_width(
+	text: JsString<'_>,
+	max_width: u32,
+	ellipsis_kind: Option<Ellipsis>,
+	pad: Option<bool>,
+	tab_width: u32,
+) -> Result<Either<JsString<'_>, Utf16String>> {
+	let max_width = max_width as usize;
+	let ellipsis_kind = ellipsis_kind.unwrap_or(Ellipsis::Unicode);
+	let pad = pad.unwrap_or(false);
+	let tab_width = clamp_tab_width_for_ops(tab_width);
+
+	// Keep original handle so we can return it without allocating.
+	let original = text;
+
+	let text_u16 = text.into_utf16()?;
+	let text = text_u16.as_slice();
+
+	let (text_w, exceeded) = visible_width_u16_up_to(text, max_width, tab_width);
+	if !exceeded && !pad {
+		return Ok(Either::A(original));
+	}
+	if !exceeded && text_w == max_width {
+		return Ok(Either::A(original));
+	}
+
+	Ok(Either::B(build_utf16_string(truncate_to_width_u16_impl(
+		text,
+		max_width,
+		ellipsis_kind,
+		pad,
+		tab_width,
+	))))
+}
+
+/// Truncate many strings to a visible width, preserving ANSI codes.
+#[napi]
+pub fn truncate_lines_to_width(
+	lines: Vec<JsString>,
+	max_width: u32,
+	ellipsis_kind: Option<Ellipsis>,
+	pad: Option<bool>,
+	tab_width: u32,
+) -> Result<Vec<Utf16String>> {
+	let max_width = max_width as usize;
+	let ellipsis_kind = ellipsis_kind.unwrap_or(Ellipsis::Unicode);
+	let pad = pad.unwrap_or(false);
+	let tab_width = clamp_tab_width_for_ops(tab_width);
+	let mut out = Vec::with_capacity(lines.len());
+	for line in lines {
+		let original = line.into_utf16()?;
+		let text = original.as_slice();
+
+		let (text_w, exceeded) = visible_width_u16_up_to(text, max_width, tab_width);
+		if !exceeded && (!pad || text_w == max_width) {
+			let mut data = text.to_vec();
+			if data.last() == Some(&0) {
+				data.pop();
+			}
+			out.push(build_utf16_string_preserve_nul(data));
+			continue;
+		}
+
+		out.push(build_utf16_string_preserve_nul(truncate_to_width_u16_impl(
+			text,
+			max_width,
+			ellipsis_kind,
+			pad,
+			tab_width,
+		)));
+	}
+	Ok(out)
 }
 
 // ============================================================================
@@ -1348,6 +1419,19 @@ pub fn visible_width(text: JsString, tab_width: u32) -> Result<u32> {
 	let tab_width = clamp_tab_width_for_ops(tab_width);
 	Ok(crate::utils::clamp_u32(visible_width_u16(text_u16.as_slice(), tab_width) as u64))
 }
+
+/// Calculate visible widths of many strings, excluding ANSI escape sequences.
+#[napi]
+pub fn visible_widths(lines: Vec<String>, tab_width: u32) -> Vec<u32> {
+	let tab_width = clamp_tab_width_for_ops(tab_width);
+	lines
+		.into_iter()
+		.map(|line| {
+			let text: Vec<u16> = line.encode_utf16().collect();
+			crate::utils::clamp_u32(visible_width_u16(&text, tab_width) as u64)
+		})
+		.collect()
+}
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1356,12 +1440,109 @@ mod tests {
 		s.encode_utf16().collect()
 	}
 
+	fn truncate_string_for_test(s: &str, width: usize) -> String {
+		String::from_utf16_lossy(&truncate_to_width_u16_impl(
+			&to_u16(s),
+			width,
+			Ellipsis::Omit,
+			false,
+			DEFAULT_TAB_WIDTH,
+		))
+	}
+
 	#[test]
 	fn test_visible_width() {
 		assert_eq!(visible_width_u16(&to_u16("hello"), DEFAULT_TAB_WIDTH), 5);
 		assert_eq!(visible_width_u16(&to_u16("\x1b[31mhello\x1b[0m"), DEFAULT_TAB_WIDTH), 5);
 		assert_eq!(visible_width_u16(&to_u16("\x1b[38;5;196mred\x1b[0m"), DEFAULT_TAB_WIDTH), 3);
 		assert_eq!(visible_width_u16(&to_u16("a\tb"), DEFAULT_TAB_WIDTH), 1 + DEFAULT_TAB_WIDTH + 1);
+		assert_eq!(visible_width_u16(&to_u16("👨‍👩‍👧‍👦"), DEFAULT_TAB_WIDTH), 2);
+		assert_eq!(visible_width_u16(&to_u16("abcd👨‍👩‍👧‍👦wxyz"), DEFAULT_TAB_WIDTH), 10);
+	}
+
+	#[test]
+	fn test_emoji_grapheme_width() {
+		for emoji in ["❤️", "☑️", "↔️", "1️⃣", "👍🏽"] {
+			assert_eq!(visible_width_u16(&to_u16(emoji), DEFAULT_TAB_WIDTH), 2);
+		}
+		assert_eq!(truncate_string_for_test("❤️X", 2), "❤️");
+		assert_eq!(truncate_string_for_test("👍🏽X", 2), "👍🏽");
+	}
+
+	#[test]
+	fn test_hangul_filler_width() {
+		assert_eq!(visible_width_u16(&to_u16("\u{3164}"), DEFAULT_TAB_WIDTH), 2);
+		assert_eq!(truncate_string_for_test("\u{3164}X", 2), "\u{3164}");
+	}
+
+	#[test]
+	fn test_crlf_zero_width_scalar_batch_parity() {
+		// CR and LF are zero-width under the ASCII fast path. The grapheme path
+		// (triggered by any non-ASCII scalar in the same segment) must agree so
+		// the width primitive stays context-independent.
+		assert_eq!(visible_width_u16(&to_u16("\r\n"), DEFAULT_TAB_WIDTH), 0);
+
+		// Korean (한글) and CJK ideographs are East Asian Wide (2 cells each);
+		// the adjacent CRLF must contribute 0 in every position.
+		let cases = [
+			("한\r\n", 2),
+			("\r\n한", 2),
+			("한\r\n글", 4),
+			("가\r나\n다", 6),
+			("字\r\n漢", 4),
+			("한字\r\n漢글", 8),
+			("한\r\n\r\n글", 4),
+		];
+		for (case, expected) in cases {
+			let scalar = visible_width_u16(&to_u16(case), DEFAULT_TAB_WIDTH);
+			let batch = visible_widths(vec![case.to_string()], DEFAULT_TAB_WIDTH as u32);
+			assert_eq!(scalar, expected, "scalar width mismatch for {case:?}");
+			assert_eq!(batch, vec![expected as u32], "batch width mismatch for {case:?}");
+			// The non-ASCII CRLF result must match the pure-ASCII CRLF policy:
+			// removing the CR/LF scalars leaves exactly `expected` cells.
+			let stripped = case.replace(['\r', '\n'], "");
+			assert_eq!(
+				visible_width_u16(&to_u16(&stripped), DEFAULT_TAB_WIDTH),
+				expected,
+				"CR/LF must be zero-width for {case:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn test_crlf_preserves_grapheme_correctness() {
+		// The CRLF correction must not regress VS16/modifier/keycap/ZWJ widths,
+		// including when a CRLF sits next to complex graphemes.
+		let cases = [("❤️\r\n", 2), ("👍🏽\r\n", 2), ("1️⃣\r\n", 2), ("👨‍👩‍👧‍👦\r\n", 2), ("한\r\n👨‍👩‍👧‍👦", 4)];
+		for (case, expected) in cases {
+			assert_eq!(
+				visible_width_u16(&to_u16(case), DEFAULT_TAB_WIDTH),
+				expected,
+				"grapheme width regressed for {case:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn test_batch_internal_parity_cases() {
+		let cases = [
+			("", 0),
+			("plain ascii", 11),
+			("a\tb", 5),
+			("\x1b[31mred\x1b[0m", 3),
+			("한글 jamo 한", 12),
+			("ไทยคำลาวຄໍາ", 10),
+		];
+		for (case, expected_width) in cases {
+			let u16 = to_u16(case);
+			assert_eq!(visible_width_u16(&u16, DEFAULT_TAB_WIDTH), expected_width);
+			assert_eq!(
+				truncate_to_width_u16_impl(&u16, 8, Ellipsis::Omit, false, DEFAULT_TAB_WIDTH),
+				truncate_to_width_u16_impl(&u16, 8, Ellipsis::Omit, false, DEFAULT_TAB_WIDTH),
+			);
+		}
+		assert_eq!(truncate_string_for_test("\x1b[31mred text\x1b[0m", 5), "\x1b[31mred t\x1b[0m");
+		assert_eq!(truncate_string_for_test("abcd👨‍👩‍👧‍👦wxyzz", 10), "abcd👨‍👩‍👧‍👦wxyz");
 	}
 
 	#[test]

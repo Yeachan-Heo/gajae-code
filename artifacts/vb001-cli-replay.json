@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "kind": "cli-replay",
+  "replaySafe": true,
+  "command": ["bun", "test", "test/sdk-removed-ingresses.test.ts"],
+  "cwd": "packages/coding-agent",
+  "env": { "LC_ALL": "C" },
+  "timeoutMs": 120000,
+  "expectedExitCode": 0,
+  "recordedStdout": "bun test v1.3.14 (0d9b296a)\n\n 3 pass\n 0 fail\n 15 expect() calls\nRan 3 tests across 1 file. [2.61s]\n",
+  "recordedStderr": "",
+  "invariants": [
+    { "type": "substring", "value": "3 pass" },
+    { "type": "substring", "value": "0 fail" },
+    { "type": "not_substring", "value": "FAIL" }
+  ]
+}

@@ -1,0 +1,87 @@
+{
+	"schemaVersion": 2,
+	"kind": "cli-dogfood-test-report",
+	"story": "G002 dogfood GJC from source before releasing 0.10.1",
+	"checkout": "dev (post-G004), run via bun packages/coding-agent/src/cli.ts",
+	"surfaces": [
+		{
+			"id": "version",
+			"invocation": "bun packages/coding-agent/src/cli.ts --version",
+			"observed": "gjc/0.10.0\n",
+			"verdict": "passed",
+			"note": "0.10.0 expected pre-bump; release script performs the 0.10.1 bump"
+		},
+		{
+			"id": "print-mode-basic",
+			"invocation": "bun packages/coding-agent/src/cli.ts -p --no-session \"Reply with exactly the word DOGFOOD-OK and nothing else.\"",
+			"observed": "DOGFOOD-OK\nexit=0",
+			"verdict": "passed"
+		},
+		{
+			"id": "print-mode-epipe-post-close-write",
+			"invocation": "bun artifacts/ultragoal-g002-epipe-harness.ts (fail-closed: JSON print mode streams one event per line; the harness destroys the read side after the FIRST line, so every later event write deterministically hits the closed pipe; waits for child close with drained stdio; exits nonzero on crash dump, hang, or non-quiet exit)",
+			"observed": "{ exitCode: 0, signal: null, stdoutLinesBeforeDestroy: 1, destroyedEarly: true, timedOut: false, stderrBytes: 0, crashDump: false, pass: true }, harness exit 0",
+			"verdict": "passed",
+			"note": "Exercises the v0.10.1 EPIPE fix (51b21c16 + 40cc7408 + df190d65) with a guaranteed post-close write. Independent QA also passed harsher immediate-destroy stdout/stderr variants (subagent 6-G002ExecutorQA): both exit 0, no dump, no hang."
+		},
+		{
+			"id": "pipe-early-close-shell",
+			"invocation": "cli.ts -p --no-session \"Count from 1 to 200...\" | head -c 64 (pipefail) — early-close scenario via head, not a full drain",
+			"observed": "pipestatus=0, empty stderr",
+			"verdict": "passed"
+		},
+		{
+			"id": "context-usage-ssot",
+			"invocation": "bun artifacts/ultragoal-g002-context-ssot-harness.ts (fail-closed SDK harness: throws on any violated invariant — heuristic before any anchor, provider_anchor with positive tokens/window and sane percent after one real turn; dispose in finally)",
+			"observed": "{ pass: true, before: { source: heuristic, tokens: 6668 }, after: { source: provider_anchor, tokens: 4778, contextWindow: 1000000, percent: 0.4778 } }, harness exit 0",
+			"verdict": "passed",
+			"note": "Exercises the v0.10.1 SSOT change (96f48793 + 555c94ce + 8487b7f1 + 32ef3942)"
+		},
+		{
+			"id": "rpc-durable-default-selection",
+			"invocation": "bun test test/rpc-socket-server.test.ts (packages/coding-agent) — focused real-process socket lane covering the new durable default-model selection: correlated success, active-stream deferral, durable config/session writes, failure non-mutation, restart precedence",
+			"observed": "part of 43 pass / 0 fail run (with irc-ghost, session-reaper, silent-abort-print-mode)",
+			"verdict": "passed",
+			"note": "Test-backed lane for 82b5159b + ee399f1d + 651f9648 + 3270ac1d + 9f6de882; not duplicated manually per architect recommendation"
+		},
+		{
+			"id": "help-surface",
+			"invocation": "bun packages/coding-agent/src/cli.ts --help",
+			"observed": "full help rendered, exit=0",
+			"verdict": "passed"
+		},
+		{
+			"id": "dev-link-check",
+			"invocation": "bun scripts/dev-link.ts --check",
+			"observed": "gjc resolves to workspace source (cli.ts) — OK; natives load smoke-test ok; exit=0",
+			"verdict": "passed",
+			"note": "Exercises e3e861ce fail-loudly path in its passing direction"
+		}
+	],
+	"intentionalTestBackedExclusions": [
+		{
+			"surface": "TUI multiplexer graphics suppression (8357a84a, 390b9524, 7914a246)",
+			"reason": "Requires a real multiplexer + graphics terminal; deterministic policy is package-tested",
+			"receipt": "bun test test/sixel-probe.test.ts (packages/tui): 15 pass / 0 fail"
+		},
+		{
+			"surface": "IRC delivery ordering / ghost messages (03c1d373)",
+			"reason": "Requires multi-agent session wiring; deterministic ordering is package-tested",
+			"receipt": "bun test test/agent-session-irc-ghost-message.test.ts (packages/coding-agent): included in 43 pass / 0 fail run"
+		},
+		{
+			"surface": "Coordinator idle session reaper (4f0d7aba)",
+			"reason": "Owner-proof TERM integration lane (reaper-owner.integration.test.ts) is Linux-only and skips on this macOS host; scheduler/eligibility logic is platform-neutral and package-tested. Linux receipt comes from release CI.",
+			"receipt": "bun test test/coordinator-mcp/session-reaper.test.ts (packages/coding-agent): included in 43 pass / 0 fail run"
+		},
+		{
+			"surface": "Print-mode owned-stdout EPIPE unit paths (51b21c16 follow-ups)",
+			"reason": "Callback/event EPIPE and post-EPIPE cleanup matrices are package-tested",
+			"receipt": "bun test test/silent-abort-print-mode.test.ts (packages/coding-agent): included in 43 pass / 0 fail run"
+		}
+	],
+	"regressionsFound": [],
+	"operatorNotes": [
+		"gjc status is not a subcommand; invoking it starts an interactive session (expected; state inspection is gjc state)."
+	]
+}

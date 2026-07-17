@@ -1,5 +1,15 @@
 import type { Component } from "../tui";
-import { applyBackgroundToLine, padding, replaceTabs, visibleWidth, wrapTextWithAnsi } from "../utils";
+
+import {
+	annotateViewportAnchorGraphemes,
+	applyBackgroundToLine,
+	extractViewportAnchorRows,
+	padding,
+	replaceTabs,
+	type ViewportAnchorSpan,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "../utils";
 
 /**
  * Text component - displays multi-line text with word wrapping
@@ -14,6 +24,7 @@ export class Text implements Component {
 	#cachedText?: string;
 	#cachedWidth?: number;
 	#cachedLines?: string[];
+	#cachedAnchorSpans?: Array<ViewportAnchorSpan | null>;
 
 	constructor(text: string = "", paddingX: number = 1, paddingY: number = 1, customBgFn?: (text: string) => string) {
 		this.#text = text;
@@ -31,6 +42,7 @@ export class Text implements Component {
 		this.#cachedText = undefined;
 		this.#cachedWidth = undefined;
 		this.#cachedLines = undefined;
+		this.#cachedAnchorSpans = undefined;
 	}
 
 	setCustomBgFn(customBgFn?: (text: string) => string): void {
@@ -38,73 +50,85 @@ export class Text implements Component {
 		this.#cachedText = undefined;
 		this.#cachedWidth = undefined;
 		this.#cachedLines = undefined;
+		this.#cachedAnchorSpans = undefined;
 	}
 
 	invalidate(): void {
 		this.#cachedText = undefined;
 		this.#cachedWidth = undefined;
 		this.#cachedLines = undefined;
+		this.#cachedAnchorSpans = undefined;
 	}
 
 	render(width: number): string[] {
-		// Check cache
-		if (this.#cachedLines && this.#cachedText === this.#text && this.#cachedWidth === width) {
-			return this.#cachedLines;
+		return this.#render(width, false).lines;
+	}
+
+	#render(width: number, includeAnchors: boolean): { lines: string[]; spans?: Array<ViewportAnchorSpan | null> } {
+		if (
+			this.#cachedLines &&
+			this.#cachedText === this.#text &&
+			this.#cachedWidth === width &&
+			(!includeAnchors || this.#cachedAnchorSpans !== undefined)
+		) {
+			return { lines: this.#cachedLines, spans: this.#cachedAnchorSpans };
 		}
 
-		// Don't render anything if there's no actual text
 		if (!this.#text || this.#text.trim() === "") {
 			const result: string[] = [];
 			this.#cachedText = this.#text;
 			this.#cachedWidth = width;
 			this.#cachedLines = result;
-			return result;
+			this.#cachedAnchorSpans = includeAnchors ? [] : undefined;
+			return { lines: result, spans: this.#cachedAnchorSpans };
 		}
 
-		// Replace tabs with 3 spaces
 		const normalizedText = replaceTabs(this.#text);
-
-		// Calculate content width (subtract left/right margins)
 		const contentWidth = Math.max(1, width - this.#paddingX * 2);
+		let wrappedLines: string[];
+		let wrappedSpans: Array<ViewportAnchorSpan | null> | undefined;
+		if (includeAnchors) {
+			const markedText = annotateViewportAnchorGraphemes(normalizedText);
+			const extracted = extractViewportAnchorRows(wrapTextWithAnsi(markedText.text, contentWidth), markedText.token);
+			wrappedLines = extracted.lines;
+			wrappedSpans = extracted.spans;
+		} else {
+			wrappedLines = wrapTextWithAnsi(normalizedText, contentWidth);
+		}
 
-		// Wrap text (this preserves ANSI codes but does NOT pad)
-		const wrappedLines = wrapTextWithAnsi(normalizedText, contentWidth);
-
-		// Add margins and background to each line
 		const leftMargin = padding(this.#paddingX);
 		const rightMargin = padding(this.#paddingX);
 		const contentLines: string[] = [];
-
 		for (const line of wrappedLines) {
-			// Add margins
 			const lineWithMargins = leftMargin + line + rightMargin;
-
-			// Apply background if specified (this also pads to full width)
-			if (this.#customBgFn) {
-				contentLines.push(applyBackgroundToLine(lineWithMargins, width, this.#customBgFn));
-			} else {
-				// No background - just pad to width with spaces
-				const visibleLen = visibleWidth(lineWithMargins);
-				const paddingNeeded = Math.max(0, width - visibleLen);
-				contentLines.push(lineWithMargins + padding(paddingNeeded));
-			}
+			if (this.#customBgFn) contentLines.push(applyBackgroundToLine(lineWithMargins, width, this.#customBgFn));
+			else contentLines.push(lineWithMargins + padding(Math.max(0, width - visibleWidth(lineWithMargins))));
 		}
-
-		// Add top/bottom padding (empty lines)
 		const emptyLine = padding(width);
-		const emptyLines: string[] = [];
-		for (let i = 0; i < this.#paddingY; i++) {
-			const line = this.#customBgFn ? applyBackgroundToLine(emptyLine, width, this.#customBgFn) : emptyLine;
-			emptyLines.push(line);
-		}
-
+		const emptyLines = Array.from({ length: this.#paddingY }, () =>
+			this.#customBgFn ? applyBackgroundToLine(emptyLine, width, this.#customBgFn) : emptyLine,
+		);
 		const result = [...emptyLines, ...contentLines, ...emptyLines];
-
-		// Update cache
+		const spans = wrappedSpans && [...emptyLines.map(() => null), ...wrappedSpans, ...emptyLines.map(() => null)];
 		this.#cachedText = this.#text;
 		this.#cachedWidth = width;
 		this.#cachedLines = result;
+		this.#cachedAnchorSpans = spans;
+		return { lines: result.length > 0 ? result : [""], spans };
+	}
 
-		return result.length > 0 ? result : [""];
+	renderWithViewportAnchorSource(
+		width: number,
+		source: { id: string },
+	): {
+		lines: string[];
+		anchors: Array<({ id: string } & ViewportAnchorSpan) | null>;
+	} {
+		const { lines, spans } = this.#render(width, true);
+		if (!spans) throw new Error("Viewport anchor source render completed without row spans");
+		return {
+			lines,
+			anchors: spans.map(span => (span ? { id: source.id, ...span } : null)),
+		};
 	}
 }

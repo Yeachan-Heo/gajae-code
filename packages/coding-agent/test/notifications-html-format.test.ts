@@ -14,10 +14,10 @@ import {
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 	truncateTelegramHtml,
-} from "../src/notifications/html-format";
-import { TelegramNotificationDaemon } from "../src/notifications/telegram-daemon";
-import { buildActionMessage } from "../src/notifications/telegram-reference";
-import { formatIdentityHeader, renderThreadedFrame } from "../src/notifications/threaded-render";
+} from "../src/sdk/bus/html-format";
+import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import { buildActionMessage } from "../src/sdk/bus/telegram-reference";
+import { formatIdentityHeader, renderThreadedFrame } from "../src/sdk/bus/threaded-render";
 
 describe("escapeHtml (AC2)", () => {
 	test("escapes & < > and escapes & first", () => {
@@ -285,13 +285,18 @@ class CapturingBotApi {
 	}
 }
 
-function makeDaemon(bot: CapturingBotApi, agentDir: string): TelegramNotificationDaemon {
+function makeDaemon(
+	bot: CapturingBotApi,
+	agentDir: string,
+	rich: { enabled: boolean } = { enabled: false },
+): TelegramNotificationDaemon {
 	return new TelegramNotificationDaemon({
 		settings: isolatedSettings(agentDir),
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot as any,
+		rich,
 	});
 }
 
@@ -333,6 +338,15 @@ describe("daemon send sites force parse_mode HTML (AC1)", () => {
 			sessionId: "S",
 			phase: "finalized",
 			text: raw,
+		});
+		// The split is scheduled through the rate-limit pool: the first chunk is
+		// sent on the granted slot and the continuation is re-queued, so a follow-up
+		// flush drains it (one send per token — no single-slot burst).
+		await daemon.handleSessionMessage(fakeSession() as any, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "tail",
 		});
 		const texts = bot.calls
 			.filter(c => c.method === "sendMessage" && c.body.text?.startsWith("a"))

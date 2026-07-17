@@ -4,11 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { Settings } from "../src/config/settings";
-import type {
-	LifecycleControlServer,
-	LifecycleControlServerFactory,
-} from "../src/notifications/lifecycle-control-runtime";
-import { acquireDaemonOwnership, daemonPaths, TelegramNotificationDaemon } from "../src/notifications/telegram-daemon";
+import type { LifecycleControlServer, LifecycleControlServerFactory } from "../src/sdk/bus/lifecycle-control-runtime";
+import { acquireDaemonOwnership, daemonPaths, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 
 function tempAgentDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-owner-test-"));

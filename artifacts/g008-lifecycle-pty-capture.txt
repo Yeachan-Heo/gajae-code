@@ -1,0 +1,10 @@
+[1mCommand:[0m cd packages/coding-agent && bun test test/sdk-machine-lifecycle-topology.test.ts
+[1mExit code:[0m 0
+[32mPASS[0m bun test v1.3.14 (0d9b296a)
+
+ 3 pass
+ 0 fail
+ 152 expect() calls
+Ran 3 tests across 1 file. [26.62s]
+
+Coverage: shipped gjc --mode acp stdio/NDJSON, shipped mcp-serve sdk stdio, and shipped daemon session CLI completed valid G03-G07 lifecycle effects with authenticated session_ready, caller-key replay/conflict, generation/PID-specific close, endpoint removal, process exit, and saved-session deletion.

@@ -1,11 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { AGENT_WIRE_EVENT_TYPES, AGENT_WIRE_PROTOCOL_VERSION } from "../../src/modes/shared/agent-wire/event-contract";
+import * as envelope from "../../src/modes/shared/agent-wire/event-envelope";
 import {
 	AgentWireFrameSequencer,
 	agentSessionEventType,
-	BridgeFrameSequencer,
 	toAgentWireEventFrame,
-	toBridgeEventFrame,
 } from "../../src/modes/shared/agent-wire/event-envelope";
 import { EVENT_FIXTURES } from "./fixtures";
 
@@ -39,10 +38,9 @@ describe("canonical agent-wire envelope", () => {
 		}
 	});
 
-	it("keeps Bridge* names as working aliases of the canonical builders", () => {
-		expect(BridgeFrameSequencer).toBe(AgentWireFrameSequencer);
-		expect(toBridgeEventFrame).toBe(toAgentWireEventFrame);
-		const seq = new BridgeFrameSequencer("sess-3");
-		expect(toBridgeEventFrame(EVENT_FIXTURES.agent_start, seq).payload.event_type).toBe("agent_start");
+	it("does not retain the removed Bridge* compatibility aliases", () => {
+		expect("BridgeFrameSequencer" in envelope).toBe(false);
+		expect("toBridgeEventFrame" in envelope).toBe(false);
+		expect("toBridgeWorkflowGateFrame" in envelope).toBe(false);
 	});
 });

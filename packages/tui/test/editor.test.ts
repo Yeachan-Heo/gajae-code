@@ -2,14 +2,17 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { CURSOR_MARKER } from "@gajae-code/tui";
 import { type AutocompleteProvider, CombinedAutocompleteProvider } from "@gajae-code/tui/autocomplete";
-import { Editor } from "@gajae-code/tui/components/editor";
+import { __editorPerfCounters, Editor } from "@gajae-code/tui/components/editor";
 import { visibleWidth } from "@gajae-code/tui/utils";
-import { setDefaultTabWidth } from "@gajae-code/utils";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings";
 import { defaultEditorTheme } from "./test-themes";
 
 describe("Editor component", () => {
+	const originalTabWidth = getDefaultTabWidth();
+
 	afterEach(() => {
+		setDefaultTabWidth(originalTabWidth);
 		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
 	});
 
@@ -314,6 +317,140 @@ describe("Editor component", () => {
 			editor.handleInput("@");
 
 			await expect(promise).resolves.toBe("@");
+		});
+
+		it("triggers prompt-action autocomplete when typing hash", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const { promise, resolve } = Promise.withResolvers<string>();
+
+			editor.setAutocompleteProvider({
+				async getSuggestions(lines, cursorLine, cursorCol) {
+					const currentLine = lines[cursorLine] ?? "";
+					resolve(currentLine.slice(0, cursorCol));
+					return { items: [{ label: "#undo", value: "#undo" }], prefix: "#" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("#");
+
+			await expect(promise).resolves.toBe("#");
+		});
+
+		it("inserts trigger-leading bracketed paste literally without autocomplete", async () => {
+			const cases = [
+				"# Heading",
+				"/not-a-command prompt",
+				"@literal file mention",
+				":literal shortcode",
+				"./relative/path prompt",
+				"~/literal/path prompt",
+				"# Heading\nbody with /slash and @mention",
+			];
+
+			for (const pasted of cases) {
+				const editor = new Editor(defaultEditorTheme);
+				const suggestionCalls: string[] = [];
+				editor.setAutocompleteProvider({
+					async getSuggestions(lines, cursorLine, cursorCol) {
+						const currentLine = lines[cursorLine] ?? "";
+						suggestionCalls.push(currentLine.slice(0, cursorCol));
+						return { items: [{ label: "suggestion", value: "suggestion" }], prefix: pasted[0] ?? "" };
+					},
+					applyCompletion(lines, cursorLine, cursorCol) {
+						return { lines, cursorLine, cursorCol };
+					},
+				});
+
+				editor.handleInput(`\x1b[200~${pasted}\x1b[201~`);
+				await Bun.sleep(120);
+
+				expect(editor.getText()).toBe(pasted);
+				expect(editor.isShowingAutocomplete()).toBe(false);
+				expect(suggestionCalls).toEqual([]);
+			}
+		});
+
+		it("cancels stale autocomplete before applying bracketed paste", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const pending = Promise.withResolvers<{
+				items: Array<{ label: string; value: string }>;
+				prefix: string;
+			} | null>();
+			let suggestionCalls = 0;
+
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					suggestionCalls += 1;
+					return pending.promise;
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("/");
+			await Bun.sleep(0);
+			expect(suggestionCalls).toBe(1);
+
+			editor.handleInput("\x1b[200~# pasted prompt\x1b[201~");
+			pending.resolve({ items: [{ label: "/help", value: "help" }], prefix: "/" });
+			await Bun.sleep(0);
+
+			expect(editor.getText()).toBe("/# pasted prompt");
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(suggestionCalls).toBe(1);
+		});
+
+		it("closes open autocomplete before applying bracketed paste", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			let suggestionCalls = 0;
+
+			editor.setAutocompleteProvider({
+				async getSuggestions() {
+					suggestionCalls += 1;
+					return { items: [{ label: "/help", value: "help" }], prefix: "/" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("/");
+			await Bun.sleep(0);
+			expect(editor.isShowingAutocomplete()).toBe(true);
+
+			editor.handleInput("\x1b[200~# pasted prompt\x1b[201~");
+			await Bun.sleep(120);
+
+			expect(editor.getText()).toBe("/# pasted prompt");
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(suggestionCalls).toBe(1);
+		});
+
+		it("preserves exact pasted text after existing content", async () => {
+			const editor = new Editor(defaultEditorTheme);
+			const suggestionCalls: string[] = [];
+			editor.setText("prefix");
+			editor.setAutocompleteProvider({
+				async getSuggestions(lines, cursorLine, cursorCol) {
+					const currentLine = lines[cursorLine] ?? "";
+					suggestionCalls.push(currentLine.slice(0, cursorCol));
+					return { items: [{ label: "path", value: "path" }], prefix: "/" };
+				},
+				applyCompletion(lines, cursorLine, cursorCol) {
+					return { lines, cursorLine, cursorCol };
+				},
+			});
+
+			editor.handleInput("\x1b[200~/tmp/copied\x1b[201~");
+			await Bun.sleep(120);
+
+			expect(editor.getText()).toBe("prefix/tmp/copied");
+			expect(editor.isShowingAutocomplete()).toBe(false);
+			expect(suggestionCalls).toEqual([]);
 		});
 
 		it("chains into argument completions after tab-completing slash command names", async () => {
@@ -723,7 +860,57 @@ describe("Editor component", () => {
 				editor.setText("foo\tbar");
 				expect(editor.getText()).toBe("foo     bar");
 			} finally {
-				setDefaultTabWidth(3);
+				setDefaultTabWidth(originalTabWidth);
+			}
+		});
+
+		it("preserves raw tabs inserted through insertText", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.insertText("foo\tbar");
+
+			expect(editor.getText()).toBe("foo\tbar");
+		});
+		it("splits embedded newlines inserted through insertText", () => {
+			const editor = new Editor(defaultEditorTheme);
+			const changes: string[] = [];
+			editor.onChange = text => changes.push(text);
+
+			editor.insertText("a\nb");
+
+			expect(editor.getLines()).toEqual(["a", "b"]);
+			expect(editor.getCursor()).toEqual({ line: 1, col: 1 });
+			expect(changes).toEqual(["a\nb"]);
+		});
+
+		it("keeps suffix text after the final line when insertText inserts newlines mid-line", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("xz");
+			editor.handleInput("\x1b[D"); // Move between x and z
+
+			editor.insertText("a\r\nb\rc");
+
+			expect(editor.getLines()).toEqual(["xa", "b", "cz"]);
+			expect(editor.getCursor()).toEqual({ line: 2, col: 1 });
+		});
+
+		it("recomputes tab-containing input prefix width when the default tab width changes", () => {
+			try {
+				setDefaultTabWidth(2);
+				const editor = new Editor(defaultEditorTheme);
+				editor.setInputPrefix("\t");
+				editor.insertText("wrapped text after tab prefix");
+				editor.render(18);
+
+				setDefaultTabWidth(8);
+				const refreshed = editor.render(18).join("\n");
+				const fresh = new Editor(defaultEditorTheme);
+				fresh.setInputPrefix("\t");
+				fresh.insertText("wrapped text after tab prefix");
+
+				expect(refreshed).toBe(fresh.render(18).join("\n"));
+			} finally {
+				setDefaultTabWidth(originalTabWidth);
 			}
 		});
 
@@ -968,6 +1155,22 @@ describe("Editor component", () => {
 
 			// Line should still be correct width
 			expect(visibleWidth(contentLine)).toBeLessThanOrEqual(width);
+		});
+
+		it("keeps bordered editor chrome inside a configured right gutter", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setRightGutterWidth(1);
+			editor.setInputPrefix("> ");
+			editor.setClosedBorderBox(true);
+			editor.setText("이전 커밋들");
+
+			const lines = editor.render(24).map(line => stripVTControlCharacters(line));
+
+			expect(lines.every(line => visibleWidth(line) === 24)).toBeTrue();
+			expect(lines.every(line => line.endsWith(" "))).toBeTrue();
+			expect(lines[0]!.trimEnd()).toEndWith(defaultEditorTheme.symbols.boxRound.topRight);
+			expect(lines.at(-1)!.trimEnd()).toEndWith(defaultEditorTheme.symbols.boxRound.bottomRight);
+			expect(lines.some(line => line.includes("이전 커밋들") && line.trimEnd().endsWith("|"))).toBeTrue();
 		});
 
 		it("shows cursor at end before wrap and wraps on next char", () => {
@@ -2238,6 +2441,21 @@ describe("Editor component", () => {
 			editor.handleInput("\x1b[B"); // Down to line 1
 			expect(editor.getCursor()).toEqual({ line: 1, col: 15 });
 		});
+		it("does not record a ghost undo snapshot for a paste that filters to nothing", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.handleInput("\x1b[200~hello\x1b[201~");
+			expect(editor.getText()).toBe("hello");
+
+			// A paste of only non-printable characters inserts nothing…
+			editor.handleInput("\x1b[200~\x07\x07\x1b[201~");
+			expect(editor.getText()).toBe("hello");
+
+			// …so a single undo must revert the previous edit, not a no-op snapshot.
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+			expect(editor.getText()).toBe("");
+		});
+
 		it("expands large pasted content literally in getExpandedText", () => {
 			const editor = new Editor(defaultEditorTheme);
 			const pastedText = [
@@ -2324,6 +2542,127 @@ describe("Editor component", () => {
 			// The leading Hangul jamo block (U+1100..U+1112) only appears in
 			// NFD output. The Editor must not leak it after normalization.
 			expect(rendered).not.toMatch(/[\u1100-\u1112]/);
+		});
+	});
+
+	describe("Jump to character", () => {
+		it("jumps backward to an earlier occurrence on the same line", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abca");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 4 });
+
+			editor.handleInput("\x1b[93;7u"); // ctrl+alt+] - enter jump-backward mode
+			editor.handleInput("b");
+
+			expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+		});
+
+		it("jumps backward into the previous line when the cursor is at column 0", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("xa\nab");
+			editor.handleInput("\x01"); // ctrl+a - move to start of current line
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+
+			editor.handleInput("\x1b[93;7u"); // ctrl+alt+] - enter jump-backward mode
+			editor.handleInput("a"); // must skip the 'a' under the cursor
+
+			expect(editor.getCursor()).toEqual({ line: 0, col: 1 });
+		});
+
+		it("stays in place when jumping backward from column 0 with no earlier match", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("xb\nab");
+			editor.handleInput("\x01"); // ctrl+a - move to start of current line
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+
+			editor.handleInput("\x1b[93;7u"); // ctrl+alt+] - enter jump-backward mode
+			editor.handleInput("a"); // only occurrence is under the cursor - no match
+
+			expect(editor.getCursor()).toEqual({ line: 1, col: 0 });
+		});
+
+		it("jumps forward across lines from the cursor position", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("ab\nxa");
+			editor.handleInput("\x1b[A"); // up arrow
+			editor.handleInput("\x01"); // ctrl+a - move to start of current line
+			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+
+			editor.handleInput("\x1b[93;5u"); // ctrl+] - enter jump-forward mode
+			editor.handleInput("a"); // must skip the 'a' under the cursor
+
+			expect(editor.getCursor()).toEqual({ line: 1, col: 1 });
+		});
+	});
+	describe("layout cache", () => {
+		it("patches cursor-only moves without relaying out the whole buffer or remeasuring visible widths", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText(Array.from({ length: 1000 }, (_, i) => `line ${i} content`).join("\n"));
+			editor.render(80);
+
+			__editorPerfCounters.reset();
+			editor.handleInput("\x1b[D");
+			editor.render(80);
+
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBeLessThanOrEqual(1);
+			expect(__editorPerfCounters.visibleWidthMeasurements).toBeLessThanOrEqual(1);
+
+			__editorPerfCounters.reset();
+			editor.handleInput("\x1b[A");
+			editor.render(80);
+
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBeLessThanOrEqual(2);
+			expect(__editorPerfCounters.visibleWidthMeasurements).toBeLessThanOrEqual(2);
+			expect(editor.wrappedLineCacheSize).toBe(1000);
+		});
+
+		it("invalidates on edits and width changes while preserving rendered output", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("alpha\nbeta\ngamma");
+			const first = editor.render(40);
+			expect(stripVTControlCharacters(first.join("\n"))).toContain("gamma");
+
+			__editorPerfCounters.reset();
+			editor.insertText("!");
+			const edited = editor.render(40);
+			expect(stripVTControlCharacters(edited.join("\n"))).toContain("gamma!");
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBe(3);
+
+			__editorPerfCounters.reset();
+			const resized = editor.render(20);
+			expect(stripVTControlCharacters(resized.join("\n"))).toContain("gamma!");
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBe(3);
+		});
+
+		it("keeps cursor rendering stable at wrapped-line boundaries and empty lines", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText(`abcdef ghijkl mnopqr\n\ntrail   `);
+			const freshAtEnd = editor.render(16).join("\n");
+			editor.handleInput("\x1b[D");
+			editor.render(16);
+			editor.handleInput("\x1b[C");
+			const cachedAtEnd = editor.render(16).join("\n");
+			expect(cachedAtEnd).toBe(freshAtEnd);
+
+			editor.handleInput("\x1b[A");
+			const cachedEmpty = editor.render(16).join("\n");
+			const fresh = new Editor(defaultEditorTheme);
+			fresh.setText(editor.getText());
+			fresh.handleInput("\x1b[A");
+			expect(cachedEmpty).toBe(fresh.render(16).join("\n"));
+		});
+
+		it("invalidates placeholder and borderless layout-affecting transitions", () => {
+			const editor = new Editor(defaultEditorTheme);
+			editor.setPlaceholder("type here");
+			expect(stripVTControlCharacters(editor.render(30).join("\n"))).toContain("type here");
+			editor.setPlaceholder("new hint");
+			expect(stripVTControlCharacters(editor.render(30).join("\n"))).toContain("new hint");
+
+			editor.setBorderVisible(false);
+			editor.setPromptGutter("> ");
+			const borderless = stripVTControlCharacters(editor.render(10).join("\n"));
+			expect(borderless).toContain("> ");
 		});
 	});
 });

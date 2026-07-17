@@ -35,6 +35,7 @@ import type {
 	MCPToolsListResult,
 	MCPTransport,
 } from "./types";
+import { MCPExpectedFailure } from "./types";
 
 /** MCP protocol version we support */
 const PROTOCOL_VERSION = "2025-03-26";
@@ -47,6 +48,66 @@ const CLIENT_INFO = {
 	name: "gjc-coding-agent",
 	version: "1.0.0",
 };
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeInitializeResult(value: unknown): MCPInitializeResult {
+	if (
+		!isRecord(value) ||
+		typeof value.protocolVersion !== "string" ||
+		!isRecord(value.capabilities) ||
+		!isRecord(value.serverInfo) ||
+		typeof value.serverInfo.name !== "string" ||
+		typeof value.serverInfo.version !== "string" ||
+		(value.instructions !== undefined && typeof value.instructions !== "string")
+	) {
+		throw new MCPExpectedFailure();
+	}
+
+	return {
+		protocolVersion: value.protocolVersion,
+		capabilities: value.capabilities as MCPServerCapabilities,
+		serverInfo: {
+			name: value.serverInfo.name,
+			version: value.serverInfo.version,
+		},
+		...(value.instructions === undefined ? {} : { instructions: value.instructions }),
+	};
+}
+
+function decodeToolsListResult(value: unknown): MCPToolsListResult {
+	if (
+		!isRecord(value) ||
+		!Array.isArray(value.tools) ||
+		(value.nextCursor !== undefined && typeof value.nextCursor !== "string")
+	) {
+		throw new MCPExpectedFailure();
+	}
+
+	const tools = value.tools.map(tool => {
+		if (
+			!isRecord(tool) ||
+			typeof tool.name !== "string" ||
+			!isRecord(tool.inputSchema) ||
+			tool.inputSchema.type !== "object" ||
+			(tool.inputSchema.properties !== undefined && !isRecord(tool.inputSchema.properties)) ||
+			(tool.inputSchema.required !== undefined &&
+				(!Array.isArray(tool.inputSchema.required) ||
+					!tool.inputSchema.required.every(item => typeof item === "string"))) ||
+			(tool.description !== undefined && typeof tool.description !== "string")
+		) {
+			throw new MCPExpectedFailure();
+		}
+		return {
+			name: tool.name,
+			inputSchema: { ...tool.inputSchema, type: "object" as const },
+			...(tool.description === undefined ? {} : { description: tool.description }),
+		};
+	});
+
+	return value.nextCursor === undefined ? { tools } : { tools, nextCursor: value.nextCursor };
+}
 
 /**
  * Default handler for standard MCP server-to-client requests.
@@ -93,22 +154,22 @@ async function initializeConnection(
 	transport: MCPTransport,
 	options?: {
 		signal?: AbortSignal;
+		/** Whether to advertise the roots/list capability (default: true). */
+		advertiseRoots?: boolean;
 		/** Called after the initialize response (which sets the session ID) but before notifications/initialized. */
 		onInitialized?: () => void | Promise<void>;
 	},
 ): Promise<MCPInitializeResult> {
 	const params: MCPInitializeParams = {
 		protocolVersion: PROTOCOL_VERSION,
-		capabilities: {
-			roots: { listChanged: false },
-		},
+		capabilities: options?.advertiseRoots === false ? {} : { roots: { listChanged: false } },
 		clientInfo: CLIENT_INFO,
 	};
 
-	const result = await transport.request<MCPInitializeResult>(
-		"initialize",
-		params as unknown as Record<string, unknown>,
-		{ signal: options?.signal },
+	const result = decodeInitializeResult(
+		await transport.request<unknown>("initialize", params as unknown as Record<string, unknown>, {
+			signal: options?.signal,
+		}),
 	);
 
 	if (options?.signal?.aborted) {
@@ -135,6 +196,8 @@ export async function connectToServer(
 	config: MCPServerConfig,
 	options?: {
 		signal?: AbortSignal;
+		/** Whether to advertise the roots/list capability (default: true). */
+		advertiseRoots?: boolean;
 		onNotification?: (method: string, params: unknown) => void;
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
 	},
@@ -150,14 +213,14 @@ export async function connectToServer(
 			transport.onNotification = options.onNotification;
 		}
 
-		// Always handle standard MCP server-to-client requests (ping, roots/list).
-		// The initialize request declares roots capability, so we must respond to
-		// roots/list — even for short-lived test connections.
+		// Always install a handler for standard MCP server-to-client requests.
+		// Callers that do not advertise roots can reject roots/list via onRequest.
 		transport.onRequest = options?.onRequest ?? defaultRequestHandler;
 
 		try {
 			const initResult = await initializeConnection(transport, {
 				signal: connectSignal,
+				advertiseRoots: options?.advertiseRoots,
 				async onInitialized() {
 					// Open the SSE stream before sending initialized, so server-to-client
 					// requests triggered by on_initialized (e.g. roots/list) are delivered.
@@ -176,24 +239,36 @@ export async function connectToServer(
 				instructions: initResult.instructions,
 			};
 		} catch (error) {
-			await transport.close();
+			try {
+				await transport.close();
+			} catch {
+				// Preserve the initialization failure when cleanup also fails.
+			}
 			throw error;
 		}
 	};
 
+	const connectionTimeoutMessage = `Connection to MCP server "${name}" timed out after ${timeoutMs}ms`;
+
 	try {
-		return await withTimeout(
-			connect(),
-			timeoutMs,
-			`Connection to MCP server "${name}" timed out after ${timeoutMs}ms`,
-			connectSignal,
-		);
+		return await withTimeout(connect(), timeoutMs, connectionTimeoutMessage, connectSignal);
 	} catch (error) {
 		// If withTimeout rejected (timeout/abort) while connect() was still pending,
 		// abort initialization and wait for transport cleanup before returning.
+		const aborted = options?.signal?.aborted === true;
 		connectAbort.abort(error);
 		if (transport) {
-			await transport.close().catch(() => {});
+			try {
+				await transport.close();
+			} catch {
+				// Preserve the primary connection failure when cleanup also fails.
+			}
+		}
+		if (error instanceof MCPExpectedFailure) {
+			throw error;
+		}
+		if (aborted || (error instanceof Error && error.message === connectionTimeoutMessage)) {
+			throw new MCPExpectedFailure(error);
 		}
 		throw error;
 	}
@@ -225,7 +300,7 @@ export async function listTools(
 			params.cursor = cursor;
 		}
 
-		const result = await connection.transport.request<MCPToolsListResult>("tools/list", params, options);
+		const result = decodeToolsListResult(await connection.transport.request<unknown>("tools/list", params, options));
 		allTools.push(...result.tools);
 		cursor = result.nextCursor;
 	} while (cursor);

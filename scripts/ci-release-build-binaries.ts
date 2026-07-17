@@ -2,6 +2,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { buildReleaseCompileArgs } from "../packages/coding-agent/scripts/compile-args";
 
 interface BinaryTarget {
 	id: string;
@@ -13,32 +14,7 @@ interface BinaryTarget {
 
 const repoRoot = path.join(import.meta.dir, "..");
 const binariesDir = path.join(repoRoot, "packages", "coding-agent", "binaries");
-const entrypoint = "./packages/coding-agent/src/cli.ts";
-// Lazy native tokenizer entrypoint. `agent-core/compaction` loads this from
-// the explicit native entrypoint instead of a package-name dynamic require of
-// `@gajae-code/natives`, because those fail inside Bun standalone `$bunfs`.
-// Listing the module here makes the absolute target path exist in the compiled
-// bunfs.
-const nativeTokenizerEntrypoint = "./packages/natives/native/index.js";
-// Hidden notify daemon CLI. It is loaded dynamically from notify-cli, so Bun
-// standalone only emits it into $bunfs when the file is also listed as an
-// explicit compile entrypoint. The CLI module must stay lightweight at top
-// level; keep heavy daemon runtime imports behind the actual daemon path.
-const telegramDaemonEntrypoint = "./packages/coding-agent/src/notifications/telegram-daemon-cli.ts";
-// Worker entrypoints. Bun's `--compile` static analyzer discovers the
-// literal in `new Worker("…", …)` at each spawn site, but only actually
-// emits the worker into the bunfs root when it is also listed here as an
-// explicit additional entry. Paths are repo-root-relative (matching
-// `--root .` below) so the workers land at
-// `/$bunfs/root/packages/<pkg>/src/<worker>.js`, which is exactly what the
-// literals at the spawn sites resolve to. Keep this in sync with the dev
-// script at `packages/coding-agent/scripts/build-binary.ts`; the
-// `issue-1150-repro` test pins both halves of the contract.
-const workerEntrypoints = [
-	"./packages/stats/src/sync-worker.ts",
-	"./packages/coding-agent/src/tools/browser/tab-worker-entry.ts",
-	"./packages/coding-agent/src/eval/js/worker-entry.ts",
-];
+
 const isDryRun = process.argv.includes("--dry-run");
 const targets: BinaryTarget[] = [
 	{
@@ -130,53 +106,29 @@ async function embedNative(target: BinaryTarget): Promise<void> {
 		return;
 	}
 
-	await runCommand(["bun", "--cwd=packages/natives", "run", "embed:native"], repoRoot, {
+	const embedEnv = {
 		...Bun.env,
 		TARGET_PLATFORM: target.platform,
 		TARGET_ARCH: target.arch,
-	});
+		...(target.arch === "x64" ? { EMBED_VARIANTS: "baseline" } : {}),
+	};
+
+	await runCommand(["bun", "--cwd=packages/natives", "run", "embed:native"], repoRoot, embedEnv);
 }
 
 async function buildBinary(target: BinaryTarget): Promise<void> {
 	console.log(`Building ${target.outfile}...`);
 	await embedNative(target);
+	const compileArgs = buildReleaseCompileArgs(target.target, target.outfile);
 	if (isDryRun) {
-		const compileEntrypoints = [...workerEntrypoints, nativeTokenizerEntrypoint, telegramDaemonEntrypoint].join(" ");
-		console.log(`DRY RUN bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv --no-compile-autoload-tsconfig --no-compile-autoload-package-json --keep-names --define process.env.PI_COMPILED="true" --root . --external mupdf --target=${target.target} ${entrypoint} ${compileEntrypoints} --outfile ${target.outfile}`);
+		console.log(`DRY RUN ${compileArgs.join(" ")}`);
 		return;
 	}
 
 	const buildEnv = shouldAdhocSignDarwinBinary(target)
 		? { ...Bun.env, BUN_NO_CODESIGN_MACHO_BINARY: "1" }
 		: Bun.env;
-	await runCommand(
-		[
-			"bun",
-			"build",
-			"--compile",
-			"--no-compile-autoload-bunfig",
-			"--no-compile-autoload-dotenv",
-			"--no-compile-autoload-tsconfig",
-			"--no-compile-autoload-package-json",
-			"--keep-names",
-			"--define",
-			'process.env.PI_COMPILED="true"',
-			"--root",
-			".",
-			"--external",
-			"mupdf",
-			"--target",
-			target.target,
-			entrypoint,
-			...workerEntrypoints,
-			nativeTokenizerEntrypoint,
-			telegramDaemonEntrypoint,
-			"--outfile",
-			target.outfile,
-		],
-		repoRoot,
-		buildEnv,
-	);
+	await runCommand(compileArgs, repoRoot, buildEnv);
 
 	// Bun 1.3.12 emits a truncated Mach-O signature on darwin builds.
 	if (shouldAdhocSignDarwinBinary(target)) {

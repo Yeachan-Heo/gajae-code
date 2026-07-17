@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDbPath, getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { parseSetupArgs } from "../src/cli/setup-cli";
+import { SqliteAuthCredentialStore } from "../src/session/auth-storage";
 import {
 	addApiCompatibleProvider,
 	findProviderPreset,
@@ -15,6 +17,7 @@ import {
 } from "../src/setup/provider-onboarding";
 
 let tempRoot: string | undefined;
+const originalAgentDir = getAgentDir();
 
 async function tempModelsPath(): Promise<string> {
 	tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-onboarding-"));
@@ -22,6 +25,7 @@ async function tempModelsPath(): Promise<string> {
 }
 
 afterEach(async () => {
+	setAgentDir(originalAgentDir);
 	if (tempRoot) {
 		await fs.rm(tempRoot, { recursive: true, force: true });
 		tempRoot = undefined;
@@ -207,6 +211,54 @@ describe("provider onboarding setup core", () => {
 		expect(parsed.providers.existing?.api).toBe("openai-responses");
 		expect(parsed.providers["claude-proxy"]?.api).toBe("anthropic-messages");
 		expect(parsed.providers["claude-proxy"]?.models.map(model => model.id)).toEqual(["claude-custom"]);
+	});
+
+	it("stores literal keys in AuthStorage instead of models.yml", async () => {
+		const modelsPath = await tempModelsPath();
+		await addApiCompatibleProvider({
+			compatibility: "openai",
+			providerId: "literal-key-provider",
+			baseUrl: "https://api.example.com/v1",
+			apiKey: "literal-secret",
+			models: ["example-model"],
+			modelsPath,
+		});
+		const text = await Bun.file(modelsPath).text();
+		expect(text).not.toContain("literal-secret");
+		const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+		try {
+			expect(store.listAuthCredentials("literal-key-provider")[0]?.credential).toEqual({
+				type: "api_key",
+				key: "literal-secret",
+			});
+		} finally {
+			store.close();
+		}
+	});
+
+	it("stores literal keys in the canonical agent database with a custom models path", async () => {
+		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-provider-onboarding-"));
+		setAgentDir(path.join(tempRoot, "agent"));
+		const modelsPath = path.join(tempRoot, "custom", "models.yml");
+		await addApiCompatibleProvider({
+			compatibility: "openai",
+			providerId: "custom-path-provider",
+			baseUrl: "https://api.example.com/v1",
+			apiKey: "custom-path-secret",
+			models: ["example-model"],
+			modelsPath,
+		});
+
+		const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+		try {
+			expect(store.listAuthCredentials("custom-path-provider")[0]?.credential).toEqual({
+				type: "api_key",
+				key: "custom-path-secret",
+			});
+		} finally {
+			store.close();
+		}
+		expect(await Bun.file(path.join(path.dirname(modelsPath), "agent.db")).exists()).toBe(false);
 	});
 
 	it("rejects remote plaintext HTTP and existing providers unless forced", async () => {

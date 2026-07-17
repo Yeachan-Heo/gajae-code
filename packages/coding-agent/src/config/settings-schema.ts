@@ -1,10 +1,13 @@
 import type { Effort } from "@gajae-code/ai/model-thinking";
+import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
 import { EDIT_MODES } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
+import type { ModelSelectorValue } from "./model-selector-value";
 
 const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as readonly Effort[];
+const DEFAULT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
 
 import {
 	DEFAULT_DISABLED_EXTENSIONS,
@@ -36,7 +39,8 @@ export type SettingTab =
 	| "editing"
 	| "tools"
 	| "tasks"
-	| "providers";
+	| "providers"
+	| "notifications";
 
 /** Tab display metadata - icon is resolved via theme.symbol() */
 export type TabMetadata = { label: string; icon: `tab.${string}` };
@@ -52,6 +56,7 @@ export const SETTING_TABS: SettingTab[] = [
 	"tools",
 	"tasks",
 	"providers",
+	"notifications",
 ];
 
 /** Tab display metadata - icon is a symbol key from theme.ts (tab.*) */
@@ -65,6 +70,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
 	tools: { label: "Tools", icon: "tab.tools" },
 	tasks: { label: "Tasks", icon: "tab.tasks" },
 	providers: { label: "Providers", icon: "tab.providers" },
+	notifications: { label: "Notifications", icon: "tab.providers" },
 };
 
 /** Status line segment identifiers */
@@ -107,6 +113,11 @@ interface UiBase {
 	description: string;
 	/** Condition function name - setting only shown when true */
 	condition?: string;
+	/**
+	 * Persistence owner for settings which must not use the generic immediate
+	 * settings-list write path.
+	 */
+	editing?: "notification-atomic";
 }
 
 interface UiBoolean extends UiBase {}
@@ -169,9 +180,14 @@ interface ArrayDef<T> {
 	ui?: UiBase;
 }
 
+interface RecordValueDef {
+	type: "model-selector-value";
+}
+
 interface RecordDef<T> {
 	type: "record";
 	default: Record<string, T>;
+	valueSchema?: RecordValueDef;
 	ui?: UiBase;
 }
 
@@ -199,7 +215,8 @@ export interface ModelTagsSettings {
 // Typed defaults for array/record settings — named constants avoid `as` casts
 // under `as const` while still letting SettingValue infer the correct element type.
 const EMPTY_STRING_ARRAY: string[] = [];
-const EMPTY_STRING_RECORD: Record<string, string> = {};
+const EMPTY_MODEL_SELECTOR_RECORD: Record<string, ModelSelectorValue> = {};
+const MODEL_SELECTOR_VALUE_SCHEMA = { type: "model-selector-value" } as const;
 const DEFAULT_CYCLE_ORDER: string[] = ["default"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
@@ -253,20 +270,94 @@ export const SETTINGS_SCHEMA = {
 	// per-machine overrides remain trivial.
 	"auth.broker.url": { type: "string", default: undefined },
 	"auth.broker.token": { type: "string", default: undefined },
+	"session.directoryMigration": {
+		type: "enum",
+		values: ["copy-retain", "disabled"] as const,
+		default: "copy-retain",
+	},
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },
-	"notifications.telegram.botToken": { type: "string", default: undefined },
+	"notifications.telegram.botToken": {
+		type: "string",
+		default: undefined,
+		validate: (value: unknown) => typeof value === "string",
+	},
 	"notifications.telegram.chatId": { type: "string", default: undefined },
+	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
+	"notifications.telegram.rich.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Rich Messages",
+			description: "Format Telegram notifications with rich message content.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.richDraft.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Rich Drafts",
+			description: "Include rich draft updates in Telegram notifications.",
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.telegram.topics.nameTemplate": { type: "string", default: undefined },
 	"notifications.discord.botToken": { type: "string", default: undefined },
-	"notifications.discord.channelId": { type: "string", default: undefined },
+	"notifications.discord.applicationId": { type: "string", default: undefined },
+	"notifications.discord.guildId": { type: "string", default: undefined },
+	"notifications.discord.parentChannelId": { type: "string", default: undefined },
 	"notifications.slack.botToken": { type: "string", default: undefined },
+	"notifications.slack.appToken": { type: "string", default: undefined },
+	"notifications.slack.workspaceId": { type: "string", default: undefined },
 	"notifications.slack.channelId": { type: "string", default: undefined },
-	"notifications.redact": { type: "boolean", default: false },
+	"notifications.slack.authorizedUserId": { type: "string", default: undefined },
+	"notifications.redact": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "notifications",
+			label: "Redact Notification Content",
+			description: "Redact sensitive content before notifications are delivered.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.verbosity": {
 		type: "string",
 		default: "lean",
 		validate: (value: string) => value === "lean" || value === "verbose",
+		ui: {
+			tab: "notifications",
+			label: "Notification Verbosity",
+			description: "Choose concise or detailed notification messages.",
+			options: [
+				{ value: "lean", label: "Lean", description: "Send concise notification messages" },
+				{ value: "verbose", label: "Verbose", description: "Send detailed notification messages" },
+			],
+			editing: "notification-atomic",
+		},
+	},
+	"notifications.sessionScope": {
+		type: "string",
+		default: "all",
+		validate: (value: string) => value === "all" || value === "primary",
+		ui: {
+			tab: "notifications",
+			label: "Notification Session Scope",
+			description: "Send notifications from all sessions or only the primary session.",
+			options: [
+				{ value: "all", label: "All Sessions", description: "Allow eligible sessions" },
+				{
+					value: "primary",
+					label: "Primary Session",
+					description: "Limit automatic notifications to the primary session",
+				},
+			],
+			editing: "notification-atomic",
+		},
 	},
 	"notifications.daemon.idleTimeoutMs": {
 		type: "number",
@@ -375,7 +466,7 @@ export const SETTINGS_SCHEMA = {
 
 	disabledExtensions: { type: "array", default: DEFAULT_DISABLED_EXTENSIONS },
 
-	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
+	modelRoles: { type: "record", default: EMPTY_MODEL_SELECTOR_RECORD, valueSchema: MODEL_SELECTOR_VALUE_SCHEMA },
 	"modelProfile.default": {
 		type: "string",
 		default: undefined,
@@ -507,6 +598,25 @@ export const SETTINGS_SCHEMA = {
 			description: "Use the session name color for the editor border and status line gap",
 		},
 	},
+
+	"pet.mode": {
+		type: "enum",
+		values: PET_MODE_IDS,
+		default: "off",
+		ui: {
+			tab: "appearance",
+			label: "Gajae Pet",
+			description: "16x16 real-pixel gajae living beside the composer (sixel/kitty terminals)",
+			options: [
+				{ value: "off", label: "Off", description: "No pet" },
+				...PET_SKIN_IDS.map(id => ({
+					value: id,
+					label: PET_SKINS[id].label,
+					description: PET_SKINS[id].description,
+				})),
+			],
+		},
+	},
 	"statusLine.maxRows": {
 		type: "number",
 		default: 1,
@@ -542,6 +652,42 @@ export const SETTINGS_SCHEMA = {
 				{ value: "200", label: "200 KB", description: "~50K tokens" },
 				{ value: "500", label: "500 KB", description: "~125K tokens" },
 				{ value: "1000", label: "1 MB", description: "~250K tokens" },
+			],
+		},
+	},
+
+	"tools.readArtifactSpillThreshold": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tools",
+			label: "Experimental read-tool artifact spill threshold (KB)",
+			description:
+				"Advanced opt-in only: combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 found no token savings and a lower cache-hit rate at 50 KB, so normal coding sessions should leave this Off unless intentionally measuring large-read behavior.",
+			options: [
+				{ value: "0", label: "Off", description: "Default; no read-specific spill (backstop only)" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
+				{ value: "256", label: "256 KB", description: "~64K tokens" },
+				{ value: "512", label: "512 KB", description: "~128K tokens" },
+				{ value: "1000", label: "1 MB", description: "~250K tokens" },
+			],
+		},
+	},
+
+	"tools.fileMentionInlineBytes": {
+		type: "number",
+		default: 20,
+		ui: {
+			tab: "tools",
+			label: "File-mention inline cap (KB)",
+			description:
+				"Inline byte cap for auto-read `@path` file mentions, deliberately below the read-tool cap so an incidental mention injects a smaller snippet than an explicit read. The full file is still available via the read tool.",
+			options: [
+				{ value: "5", label: "5 KB", description: "~1.25K tokens" },
+				{ value: "10", label: "10 KB", description: "~2.5K tokens" },
+				{ value: "20", label: "20 KB", description: "Default; ~5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens (matches read cap)" },
 			],
 		},
 	},
@@ -619,6 +765,25 @@ export const SETTINGS_SCHEMA = {
 				{ value: "1000", label: "1000 lines", description: "~5K tokens" },
 				{ value: "2000", label: "2000 lines", description: "~10K tokens" },
 				{ value: "5000", label: "5000 lines", description: "~25K tokens" },
+			],
+		},
+	},
+
+	"tools.maxInlineResultBytes": {
+		type: "number",
+		default: 0,
+		ui: {
+			tab: "tools",
+			label: "Max inline tool-result size (KB)",
+			description:
+				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+			options: [
+				{ value: "0", label: "Off", description: "Disabled; no absolute inline cap" },
+				{ value: "20", label: "20 KB", description: "~5K tokens" },
+				{ value: "30", label: "30 KB", description: "~7.5K tokens" },
+				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
+				{ value: "75", label: "75 KB", description: "~19K tokens" },
+				{ value: "100", label: "100 KB", description: "~25K tokens" },
 			],
 		},
 	},
@@ -747,13 +912,13 @@ export const SETTINGS_SCHEMA = {
 	// Reasoning and prompts
 	defaultThinkingLevel: {
 		type: "enum",
-		values: THINKING_EFFORTS,
+		values: DEFAULT_THINKING_LEVELS,
 		default: THINKING_EFFORTS[3],
 		ui: {
 			tab: "model",
 			label: "Thinking Level",
 			description: "Reasoning depth for thinking-capable models",
-			options: [...THINKING_EFFORTS.map(getThinkingLevelMetadata)],
+			options: [...DEFAULT_THINKING_LEVELS.map(getThinkingLevelMetadata)],
 		},
 	},
 
@@ -961,6 +1126,12 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"fallback.maxAttempts": {
+		type: "number",
+		default: 3,
+		validate: (value: number) => Number.isInteger(value) && value > 0,
+	},
+
 	// Retries
 	"retry.enabled": { type: "boolean", default: true },
 
@@ -989,7 +1160,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			label: "Max Retry Delay",
 			description:
-				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+				"Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 		},
 	},
 	"retry.requestMaxRetries": {
@@ -1036,6 +1207,15 @@ export const SETTINGS_SCHEMA = {
 	// Interaction
 	// ────────────────────────────────────────────────────────────────────────
 
+	"mouse.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Mouse Support",
+			description: "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
+		},
+	},
 	// Conversation flow
 	steeringMode: {
 		type: "enum",
@@ -1166,7 +1346,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "interaction",
 			label: "Check for Updates",
-			description: "If false, skip update check",
+			description:
+				"At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
 		},
 	},
 
@@ -1384,6 +1565,15 @@ export const SETTINGS_SCHEMA = {
 	"compaction.autoContinue": { type: "boolean", default: true },
 
 	"compaction.remoteEndpoint": { type: "string", default: undefined },
+
+	// Below-threshold maintenance pruning (Finding 13). Internal/measurement-only:
+	// keep the runtime setting for targeted experiments, but do not expose it in
+	// settings UI. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 showed no
+	// savings and a cache-hit regression; pruning rewrites already-sent history and
+	// can force a provider cache-epoch reset.
+	"compaction.maintenancePruningEnabled": { type: "boolean", default: false },
+
+	"compaction.maintenancePruningMinSavingsTokens": { type: "number", default: 8000 },
 
 	// Idle compaction
 	"compaction.idleEnabled": {
@@ -1658,7 +1848,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "context",
 			label: "TTSR Context Mode",
-			description: "What to do with partial output when TTSR triggers",
+			description:
+				"What to do with partial output when TTSR triggers. 'discard' (recommended) drops the aborted partial turn so it never accumulates in context. 'keep' retains every aborted partial turn, which grows the token footprint each time a rule fires — prefer 'discard' unless you specifically need the partial output.",
 		},
 	},
 
@@ -2096,6 +2287,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"irc.sidebar.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			label: "IRC Sidebar",
+			description: "Enable the IRC message sidebar (opens with the toggle key; starts closed)",
+		},
+	},
+
 	// Optional tools
 
 	"renderMermaid.enabled": {
@@ -2279,6 +2480,39 @@ export const SETTINGS_SCHEMA = {
 			label: "Screenshot directory",
 			description:
 				"Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)",
+		},
+	},
+
+	"browser.profileReuse": {
+		type: "string",
+		default: "auto",
+		validate: (value: string) => value === "auto" || value === "opt-in",
+		ui: {
+			tab: "tools",
+			label: "Profile reuse posture",
+			description:
+				"'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+		},
+	},
+
+	"browser.geo.timezone": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			label: "Geo timezone override",
+			description:
+				"Optional IANA timezone (e.g. 'America/New_York') for headless sessions. Default unset preserves the real timezone. Only set this to a value coherent with your egress (e.g. a proxy region); an incoherent timezone increases bot detection.",
+		},
+	},
+	"browser.geo.locale": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			label: "Geo locale override",
+			description:
+				"Optional UI locale (e.g. 'en-US') for headless sessions. Default unset preserves the real locale. Only set this coherently with your egress region.",
 		},
 	},
 
@@ -2542,6 +2776,15 @@ export const SETTINGS_SCHEMA = {
 	// Tasks
 	// ────────────────────────────────────────────────────────────────────────
 
+	"tasksPane.defaultVisible": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			label: "Tasks Pane Visible By Default",
+			description: "Open the unified tasks pane when the interactive UI starts",
+		},
+	},
 	// Plan mode
 	"plan.enabled": {
 		type: "boolean",
@@ -2805,7 +3048,8 @@ export const SETTINGS_SCHEMA = {
 
 	"task.agentModelOverrides": {
 		type: "record",
-		default: {} as Record<string, string>,
+		default: {} as Record<string, ModelSelectorValue>,
+		valueSchema: MODEL_SELECTOR_VALUE_SCHEMA,
 	},
 
 	"tasks.todoClearDelay": {
@@ -3219,6 +3463,8 @@ export interface CompactionSettings {
 	autoContinue: boolean;
 	remoteEnabled: boolean;
 	remoteEndpoint: string | undefined;
+	maintenancePruningEnabled: boolean;
+	maintenancePruningMinSavingsTokens: number;
 	idleEnabled: boolean;
 	idleThresholdTokens: number;
 	idleTimeoutSeconds: number;
@@ -3341,16 +3587,31 @@ export interface NotificationsSettings {
 	telegram: {
 		botToken: string | undefined;
 		chatId: string | undefined;
+		rich: {
+			enabled: boolean;
+		};
+		richDraft: {
+			enabled: boolean;
+		};
+		topics: {
+			nameTemplate: string | undefined;
+		};
 	};
 	discord: {
 		botToken: string | undefined;
-		channelId: string | undefined;
+		applicationId: string | undefined;
+		guildId: string | undefined;
+		parentChannelId: string | undefined;
 	};
 	slack: {
 		botToken: string | undefined;
+		appToken: string | undefined;
+		workspaceId: string | undefined;
 		channelId: string | undefined;
 	};
 	redact: boolean;
+	verbosity: "lean" | "verbose";
+	sessionScope: "all" | "primary";
 	daemon: {
 		idleTimeoutMs: number;
 	};
@@ -3370,7 +3631,7 @@ export interface GroupTypeMap {
 	statusLine: StatusLineSettings;
 	thinkingBudgets: ThinkingBudgetsSettings;
 	stt: SttSettings;
-	modelRoles: Record<string, string>;
+	modelRoles: Record<string, ModelSelectorValue>;
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];
 	shellMinimizer: ShellMinimizerSettings;

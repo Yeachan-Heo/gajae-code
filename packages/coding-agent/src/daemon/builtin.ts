@@ -1,19 +1,20 @@
 /**
  * Static built-in daemon controller map.
  *
- * Intentionally a static map keyed by daemon kind rather than a mutable plugin
- * registry: there is exactly one kind today (`telegram`). Promote to a richer
- * registry only when a second daemon kind exists.
+ * Controllers are deliberately static rather than a mutable plugin registry.
  */
 
 import type { Settings } from "../config/settings";
-import { type TelegramDaemonControlDeps, TelegramDaemonController } from "../notifications/telegram-daemon-control";
+import { type ChatDaemonControlDeps, ChatDaemonController } from "../sdk/bus/chat-daemon-control";
+import { type TelegramDaemonControlDeps, TelegramDaemonController } from "../sdk/bus/telegram-daemon-control";
 import type { BuiltInDaemonController, DaemonKind } from "./control-types";
 
-export const BUILT_IN_DAEMON_KINDS = ["telegram"] as const satisfies readonly DaemonKind[];
+export const BUILT_IN_DAEMON_KINDS = ["telegram", "discord", "slack"] as const satisfies readonly DaemonKind[];
 
 export interface BuiltInDaemonControllerDeps {
 	telegram?: TelegramDaemonControlDeps;
+	discord?: ChatDaemonControlDeps;
+	slack?: ChatDaemonControlDeps;
 }
 
 export function createBuiltInDaemonControllers(
@@ -22,6 +23,8 @@ export function createBuiltInDaemonControllers(
 ): Record<DaemonKind, BuiltInDaemonController> {
 	return {
 		telegram: new TelegramDaemonController(settings, deps.telegram),
+		discord: new ChatDaemonController(settings, "discord", deps.discord),
+		slack: new ChatDaemonController(settings, "slack", deps.slack),
 	};
 }
 

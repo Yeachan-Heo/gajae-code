@@ -1,3 +1,4 @@
+import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import type { ForkContextMode } from "./types";
 
 export interface ForkContextAdvisory {
@@ -12,13 +13,7 @@ export interface ForkContextAdvisory {
  * many parent-context tokens each mode may clone into the child; the actual
  * cloned amount can never exceed the parent context itself.
  */
-const CLONE_BUDGET_BY_MODE = {
-	none: 0,
-	receipt: 2000,
-	"last-turn": 4000,
-	bounded: 8000,
-	full: 15000,
-} as const satisfies Record<ForkContextMode, number>;
+const CLONE_BUDGET_BY_MODE = FORK_CONTEXT_TOKEN_BUDGET_BY_MODE;
 
 const RECEIPT_TRIGGERS = [
 	{ pattern: /as discussed/i, reason: "prior-session-reference:as-discussed" },

@@ -32,6 +32,7 @@ describe("GJC public CLI command surface", () => {
 			"config",
 			"stats",
 			"notify",
+			"sdk",
 			"daemon",
 			"web-search",
 			"local-provider",
@@ -162,10 +163,38 @@ describe("GJC public CLI command surface", () => {
 
 			expect(result.exitCode, stderr).toBe(0);
 			const payload = JSON.parse(stdout) as { written?: number; targetRoot?: string };
-			expect(payload.written).toBe(8);
+			expect(payload.written).toBe(9);
 			expect(payload.targetRoot).toContain(path.join(home, ".gjc", "agent"));
 		} finally {
 			await fs.rm(home, { recursive: true, force: true });
 		}
 	}, 15_000);
+});
+
+describe("startup login parsing", () => {
+	it("normalizes exact bare and slash login recovery forms", () => {
+		expect(parseArgs(["login"])).toMatchObject({ authBootstrap: true, messages: ["/login"] });
+		expect(parseArgs(["login", "openai-codex"])).toMatchObject({
+			authBootstrap: true,
+			messages: ["/login openai-codex"],
+		});
+		expect(parseArgs(["--no-title", "login", "openai-codex"])).toMatchObject({
+			noTitle: true,
+			authBootstrap: true,
+			messages: ["/login openai-codex"],
+		});
+		expect(parseArgs(["/login"])).toMatchObject({ authBootstrap: true, messages: ["/login"] });
+		expect(parseArgs(["/login", "https://localhost/callback?code=callback"])).toMatchObject({
+			authBootstrap: true,
+			messages: ["/login https://localhost/callback?code=callback"],
+		});
+	});
+
+	it("does not mark ordinary prompts or unsupported login-shaped commands as recovery", () => {
+		expect(parseArgs([]).authBootstrap).toBeUndefined();
+		expect(parseArgs(["/logout", "openai-codex"]).authBootstrap).toBeUndefined();
+		expect(parseArgs(["/provider", "login", "openai-codex"]).authBootstrap).toBeUndefined();
+		expect(parseArgs(["login", "openai-codex", "extra"]).authBootstrap).toBeUndefined();
+		expect(parseArgs(["/login", "openai-codex", "extra"]).authBootstrap).toBeUndefined();
+	});
 });

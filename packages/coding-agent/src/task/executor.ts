@@ -7,9 +7,16 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@gajae-code/agent-core";
+import type {
+	AgentEvent,
+	AgentIdentity,
+	AgentMessage,
+	AgentTelemetryConfig,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
-import type { ServiceTier } from "@gajae-code/ai";
+import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
+import type { Message, Model, ServiceTier } from "@gajae-code/ai";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
@@ -22,9 +29,11 @@ import { runExtensionCompact, runExtensionSetModel } from "../extensibility/exte
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import { buildAgentSubskillInjection, renderAgentPromptAdditions } from "../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
+import { sessionRoot } from "../gjc-runtime/session-layout";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
+import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
 import { createAgentSession, discoverAuthStorage } from "../sdk";
@@ -42,9 +51,11 @@ import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
+import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	hasCompleteUsageCostBreakdown,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	type ModelSubstitutionWarning,
@@ -84,8 +95,13 @@ function normalizeModelPatterns(value: string | string[] | undefined): string[] 
 		.filter(Boolean);
 }
 
-function renderIrcPeerRoster(selfId: string): string {
-	const peers = AgentRegistry.global()
+function getSubagentCanonicalScope(parentSessionId: string | undefined, subagentId: string): string | undefined {
+	if (!parentSessionId) return undefined;
+	return JSON.stringify(["subagent-canonical", parentSessionId, subagentId]);
+}
+
+function renderIrcPeerRoster(agentRegistry: AgentRegistry, selfId: string): string {
+	const peers = agentRegistry
 		.list()
 		.filter(ref => ref.id !== selfId && (ref.status === "running" || ref.status === "idle"));
 	if (peers.length === 0) return "- (no other live agents)";
@@ -104,6 +120,51 @@ function getReportFindingKey(value: unknown): string | null {
 		return null;
 	}
 	return `${filePath}:${lineStart}:${lineEnd}:${priority ?? ""}:${title}`;
+}
+
+const FORK_CONTEXT_MINIMUM_RESERVED_OUTPUT_TOKENS = 4_096;
+const FORK_CONTEXT_FIXED_PROMPT_AND_TOOL_OVERHEAD_TOKENS = 4_096;
+
+export function trimForkContextSeedForModel(seed: ForkContextSeed, model: Model | undefined): ForkContextSeed {
+	const contextWindow = model?.contextWindow;
+	if (!contextWindow || contextWindow <= 0) return seed;
+	const reservedOutputTokens = Math.max(
+		FORK_CONTEXT_MINIMUM_RESERVED_OUTPUT_TOKENS,
+		model && Number.isFinite(model.maxTokens) ? Math.max(0, Math.trunc(model.maxTokens)) : 0,
+	);
+	const ceiling = Math.max(
+		0,
+		Math.trunc(contextWindow) - reservedOutputTokens - FORK_CONTEXT_FIXED_PROMPT_AND_TOOL_OVERHEAD_TOKENS,
+	);
+	const maxTokens = Math.min(seed.metadata.maxTokens, ceiling);
+	const skippedReasons = { ...seed.metadata.skippedReasons };
+	let skippedMessages = seed.metadata.skippedMessages;
+	let approximateTokens = 0;
+	const messages: Message[] = [];
+	for (let i = seed.messages.length - 1; i >= 0; i--) {
+		const message = seed.messages[i]!;
+		const tokens = estimateMessageTokensHeuristic(message);
+		if (maxTokens <= 0 || approximateTokens + tokens > maxTokens) {
+			skippedMessages++;
+			skippedReasons["child-context-ceiling"] = (skippedReasons["child-context-ceiling"] ?? 0) + 1;
+			continue;
+		}
+		messages.unshift(message);
+		approximateTokens += tokens;
+	}
+	return {
+		...seed,
+		messages,
+		agentMessages: messages.map(message => structuredClone(message) as AgentMessage),
+		metadata: {
+			...seed.metadata,
+			includedMessages: messages.length,
+			skippedMessages,
+			approximateTokens,
+			maxTokens,
+			skippedReasons,
+		},
+	};
 }
 
 /** Options for subagent execution */
@@ -149,6 +210,8 @@ export interface ExecutorOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	/** Parent session's registry; shared by child sessions for IRC routing and roster visibility. */
+	agentRegistry?: AgentRegistry;
 	/**
 	 * Live service-tier intent of the parent session (`AgentSession.serviceTier`),
 	 * used as the inherited tier when `task.serviceTier === "inherit"`. Passing the
@@ -177,6 +240,10 @@ export interface ExecutorOptions {
 	/** Skills to autoload via sendCustomMessage before the first prompt */
 	autoloadSkills?: Skill[];
 	forkContextSeed?: ForkContextSeed;
+}
+
+export function renderSubagentUserPrompt(assignment: string, independentMode: boolean): string {
+	return prompt.render(subagentUserPromptTemplate, { assignment: assignment.trim(), independentMode });
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -244,6 +311,51 @@ function previewOffendingData(value: unknown, maxLength = 500): string {
 		serialized = String(value);
 	}
 	return serialized.length > maxLength ? `${serialized.slice(0, maxLength)}…` : serialized;
+}
+const PLACEHOLDER_YIELD_PATTERNS = [
+	/^see (?:the )?message body(?:\b|[\s—:.,-])/i,
+	/^(?:complete\s+\w+\s+)?returned inline(?:\b|[\s—:.,-])/i,
+	/^leader persists(?:\b|[\s—:.,-])/i,
+	/^caller persists(?:\b|[\s—:.,-])/i,
+];
+
+const PLACEHOLDER_YIELD_FIELD_NAMES = new Set([
+	"artifactmarkdown",
+	"finalmarkdown",
+	"fullplan",
+	"markdown",
+	"planmarkdown",
+]);
+
+function looksLikePlaceholderYieldString(value: string): boolean {
+	const trimmed = value.trim();
+	if (trimmed.length === 0 || trimmed.length > 500) return false;
+	return PLACEHOLDER_YIELD_PATTERNS.some(pattern => pattern.test(trimmed));
+}
+
+function normalizePlaceholderYieldFieldName(key: string): string {
+	return key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function findPlaceholderYieldPath(value: unknown, path = "$", depth = 0, inspectStrings = true): string | undefined {
+	if (typeof value === "string") {
+		return inspectStrings && looksLikePlaceholderYieldString(value) ? path : undefined;
+	}
+	if (!value || typeof value !== "object" || depth > 4) return undefined;
+	if (Array.isArray(value)) {
+		for (let i = 0; i < value.length; i++) {
+			const found = findPlaceholderYieldPath(value[i], `${path}[${i}]`, depth + 1, false);
+			if (found) return found;
+		}
+		return undefined;
+	}
+	const record = value as Record<string, unknown>;
+	for (const [key, item] of Object.entries(record)) {
+		const shouldInspectString = PLACEHOLDER_YIELD_FIELD_NAMES.has(normalizePlaceholderYieldFieldName(key));
+		const found = findPlaceholderYieldPath(item, `${path}.${key}`, depth + 1, shouldInspectString);
+		if (found) return found;
+	}
+	return undefined;
 }
 
 function tryParseJsonOutput(text: string): unknown | undefined {
@@ -321,6 +433,8 @@ interface FinalizeSubprocessOutputResult {
 export const SUBAGENT_WARNING_NULL_YIELD = "SYSTEM WARNING: Subagent called yield with null data.";
 export const SUBAGENT_WARNING_MISSING_YIELD =
 	"SYSTEM WARNING: Subagent exited without calling yield tool after 3 reminders.";
+export const SUBAGENT_WARNING_PLACEHOLDER_YIELD =
+	"SYSTEM WARNING: Subagent yield data contains a placeholder instead of the actual result.";
 
 /** Build a schema_violation outcome — surfaced as a non-zero exit so callers treat it as a failure. */
 function buildSchemaViolationOutcome(
@@ -345,6 +459,21 @@ function buildSchemaViolationOutcome(
 		rawOutput = `{"error":"schema_violation","message":${JSON.stringify(headline)}}`;
 	}
 	return { rawOutput, stderr: headline, exitCode: 1 };
+}
+
+function buildPlaceholderYieldOutcome(
+	placeholderPath: string,
+	data: unknown,
+): { rawOutput: string; stderr: string; exitCode: number } {
+	return buildSchemaViolationOutcome(
+		{
+			message:
+				`${SUBAGENT_WARNING_PLACEHOLDER_YIELD} Offending path: ${placeholderPath}. ` +
+				"Return the real payload in yield.result.data or persist a durable artifact receipt.",
+			missingRequired: [],
+		},
+		data,
+	);
 }
 
 export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): FinalizeSubprocessOutputResult {
@@ -376,21 +505,29 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 					stderr = `schema_violation: invalid output schema: ${schemaError}`;
 					exitCode = 1;
 				} else {
-					const verdict = validator ? validator.validate(completeData) : { ok: true as const };
-					if (!verdict.ok) {
-						const outcome = buildSchemaViolationOutcome(verdict, completeData);
+					const placeholderPath = findPlaceholderYieldPath(completeData);
+					if (placeholderPath) {
+						const outcome = buildPlaceholderYieldOutcome(placeholderPath, completeData);
 						rawOutput = outcome.rawOutput;
 						stderr = outcome.stderr;
 						exitCode = outcome.exitCode;
 					} else {
-						try {
-							rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
-						} catch (err) {
-							const errorMessage = err instanceof Error ? err.message : String(err);
-							rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
+						const verdict = validator ? validator.validate(completeData) : { ok: true as const };
+						if (!verdict.ok) {
+							const outcome = buildSchemaViolationOutcome(verdict, completeData);
+							rawOutput = outcome.rawOutput;
+							stderr = outcome.stderr;
+							exitCode = outcome.exitCode;
+						} else {
+							try {
+								rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
+							} catch (err) {
+								const errorMessage = err instanceof Error ? err.message : String(err);
+								rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
+							}
+							exitCode = 0;
+							stderr = "";
 						}
-						exitCode = 0;
-						stderr = "";
 					}
 				}
 			}
@@ -403,21 +540,29 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 		if (fallback) {
 			const completeData = normalizeCompleteData(fallback.data, reportFindings);
 			const { validator } = buildOutputValidator(outputSchema);
-			const verdict = validator ? validator.validate(completeData) : { ok: true as const };
-			if (!verdict.ok) {
-				const outcome = buildSchemaViolationOutcome(verdict, completeData);
+			const placeholderPath = findPlaceholderYieldPath(completeData);
+			if (placeholderPath) {
+				const outcome = buildPlaceholderYieldOutcome(placeholderPath, completeData);
 				rawOutput = outcome.rawOutput;
 				stderr = outcome.stderr;
 				exitCode = outcome.exitCode;
 			} else {
-				try {
-					rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
-				} catch (err) {
-					const errorMessage = err instanceof Error ? err.message : String(err);
-					rawOutput = `{"error":"Failed to serialize fallback completion: ${errorMessage}"}`;
+				const verdict = validator ? validator.validate(completeData) : { ok: true as const };
+				if (!verdict.ok) {
+					const outcome = buildSchemaViolationOutcome(verdict, completeData);
+					rawOutput = outcome.rawOutput;
+					stderr = outcome.stderr;
+					exitCode = outcome.exitCode;
+				} else {
+					try {
+						rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
+					} catch (err) {
+						const errorMessage = err instanceof Error ? err.message : String(err);
+						rawOutput = `{"error":"Failed to serialize fallback completion: ${errorMessage}"}`;
+					}
+					exitCode = 0;
+					stderr = "";
 				}
-				exitCode = 0;
-				stderr = "";
 			}
 		} else if (!hasOutputSchema && allowFallback && rawOutput.trim().length > 0) {
 			exitCode = 0;
@@ -625,6 +770,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				: agent.spawns.join(",");
 
 	const lspEnabled = enableLsp ?? true;
+	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const ircEnabled = options.ircAvailable === true;
 	const contextFileForPrompt = ircEnabled ? undefined : options.contextFile;
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
@@ -663,6 +809,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 	let hasUsage = false;
+	let usageCostBreakdownComplete = true;
 
 	const requestAbort = (reason: AbortReason) => {
 		if (reason === "timeout") {
@@ -829,19 +976,24 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		progress.recentOutput = [];
 	};
 
+	const forwardSubagentEvent = (
+		event: AgentEvent | Extract<AgentSessionEvent, { type: "model_fallback_switched" }>,
+	) => {
+		if (!options.eventBus) return;
+		options.eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, {
+			index,
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			assignment,
+			event,
+		});
+	};
+
 	const processEvent = (event: AgentEvent) => {
 		if (resolved) return;
 
-		if (options.eventBus) {
-			options.eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, {
-				index,
-				agent: agent.name,
-				agentSource: agent.source,
-				task,
-				assignment,
-				event,
-			});
-		}
+		forwardSubagentEvent(event);
 
 		const now = Date.now();
 		let flushProgress = false;
@@ -1029,6 +1181,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						const usageRecord = messageUsage as Record<string, unknown>;
 						const costRecord = (messageUsage as { cost?: Record<string, unknown> }).cost;
 						hasUsage = true;
+						usageCostBreakdownComplete &&= hasCompleteUsageCostBreakdown(usageRecord);
 						accumulatedUsage.input += getNumberField(usageRecord, "input") ?? 0;
 						accumulatedUsage.output += getNumberField(usageRecord, "output") ?? 0;
 						accumulatedUsage.cacheRead += getNumberField(usageRecord, "cacheRead") ?? 0;
@@ -1141,6 +1294,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			checkAbort();
 
+			const canonicalChildScope = getSubagentCanonicalScope(options.parentSessionId, options.subagentId ?? id);
+
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
@@ -1148,6 +1303,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				authFallbackUsed,
 				requestedModel,
 				fallbackReason,
+				activeIndex,
+				parentFallbackSelector,
+				skips,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
@@ -1155,6 +1313,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					modelRegistry,
 					settings,
 					options.parentSessionId,
+					{ managedFallback: true },
+					canonicalChildScope,
 				),
 			);
 			if (model) {
@@ -1186,6 +1346,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (model?.contextWindow && model.contextWindow > 0) {
 				progress.contextWindow = model.contextWindow;
 			}
+			const forkContextSeed = options.forkContextSeed
+				? trimForkContextSeedForModel(options.forkContextSeed, model)
+				: undefined;
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
@@ -1209,6 +1372,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const subagentAgentIdentity: AgentIdentity | undefined = options.parentTelemetry
 				? { id, name: agent.name, description: agent.description }
 				: undefined;
+			let subagentTokenTurn = 0;
+			const tokenLogDir = options.parentSessionId
+				? path.join(sessionRoot(cwd, options.parentSessionId), "token-logs")
+				: undefined;
 			const subagentTelemetry: AgentTelemetryConfig | undefined =
 				options.parentTelemetry && subagentAgentIdentity
 					? {
@@ -1217,6 +1384,27 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							// Clear parent's conversationId; the child loop falls back to
 							// its own AgentLoopConfig.sessionId.
 							conversationId: undefined,
+							// Intentionally REPLACES (does not chain) the parent's onChatUsage:
+							// the parent handler attributes turns to subagentId "root", so
+							// chaining it here would double-log every subagent turn under root.
+							// Subagent turns are attributed to this child's id instead.
+							onChatUsage: async event => {
+								if (!tokenLogDir) return;
+								subagentTokenTurn += 1;
+								await persistTaskTokenLog(
+									taskTokenLogFromUsage(event.usage, {
+										subagentId: id,
+										agent: agent.name,
+										// Monotonic 1-based sequence per subagent session
+										// (event.stepNumber is 0-based and -1 for oneshots).
+										turn: subagentTokenTurn,
+										at: new Date().toISOString(),
+										model: event.model,
+										cost: event.cost,
+									}),
+									{ dir: tokenLogDir },
+								);
+							},
 						}
 					: undefined;
 
@@ -1234,8 +1422,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
 
 			const forkContextNotice =
-				options.forkContextSeed && options.forkContextSeed.metadata.includedMessages > 0
-					? `This subagent was started with a forked snapshot of the parent conversation. Included ${options.forkContextSeed.metadata.includedMessages} message(s), skipped ${options.forkContextSeed.metadata.skippedMessages}, approximately ${options.forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live.${ircEnabled ? " Use IRC for live coordination." : " Rely on the explicit assignment and supplied context for coordination."}`
+				forkContextSeed && forkContextSeed.metadata.includedMessages > 0
+					? `This subagent was started with a forked snapshot of the parent conversation. Included ${forkContextSeed.metadata.includedMessages} message(s), skipped ${forkContextSeed.metadata.skippedMessages}, approximately ${forkContextSeed.metadata.approximateTokens} tokens. The snapshot is not live.${ircEnabled ? " Use IRC for live coordination." : " Rely on the explicit assignment and supplied context for coordination."}`
 					: "";
 
 			const agentSubskillBlock = await buildAgentSubskillInjection({
@@ -1272,12 +1460,16 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					workspaceTree: options.workspaceTree,
 					systemPrompt: defaultPrompt => {
 						const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-							agent: agent.systemPrompt,
+							agent: prompt.render(agent.systemPrompt, {
+								ultragoalRedTeam: /ultragoal\s+completion\s+(?:qa|red-team)|executorQa/i.test(
+									options.assignment ?? task,
+								),
+							}),
 							context: options.context?.trim() ?? "",
 							worktree: worktree ?? "",
 							outputSchema: normalizedOutputSchema,
 							contextFile: contextFileForPrompt,
-							ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
+							ircPeers: ircEnabled ? renderIrcPeerRoster(agentRegistry, id) : "",
 							ircSelfId: ircEnabled ? id : "",
 							forkContext: forkContextNotice,
 						});
@@ -1306,18 +1498,35 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					parentTaskPrefix: id,
 					agentId: id,
 					agentDisplayName: agent.name,
+					agentRosterLabel: options.description,
 					bashAllowedPrefixes: agent.bashAllowedPrefixes,
 					enableLsp: lspEnabled,
 					skipPythonPreflight,
 					enableMCP,
 					localProtocolOptions: options.localProtocolOptions,
 					telemetry: subagentTelemetry,
-					forkContextSeed: options.forkContextSeed,
+					forkContextSeed,
+					agentRegistry,
 					shouldPause: () => pauseRequested,
 				}),
 			);
 
 			activeSession = session;
+			// Each subagent invocation owns a fresh controller; its configured chain
+			// is scoped to this child session and never shares parent sticky state.
+			// Auth-aware resolution can substitute the parent model only after every
+			// override entry was unavailable. Rebase the controller to that concrete
+			// parent selector so its request is never charged to override index zero.
+			session.setConfiguredModelChain(
+				"default",
+				parentFallbackSelector ? [parentFallbackSelector] : modelPatterns,
+				"subagent",
+				agent.name,
+				true,
+			);
+			if (activeIndex !== undefined && !parentFallbackSelector) {
+				session.seedDefaultFallbackResolution(activeIndex, skips);
+			}
 			const liveSubagentId = options.subagentId ?? id;
 			const manager = AsyncJobManager.instance();
 			if (manager) {
@@ -1395,12 +1604,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							pendingExtensionMessages.push(sendPromise);
 						},
 						sendUserMessage: (content, options) => {
-							const sendPromise = session.sendUserMessage(content, options).catch(e => {
+							const send = session.sendUserMessage(content, options);
+							const observedSend = send.catch(e => {
 								logger.error("Extension sendUserMessage failed", {
 									error: e instanceof Error ? e.message : String(e),
 								});
 							});
-							pendingExtensionMessages.push(sendPromise);
+							pendingExtensionMessages.push(observedSend);
+							return send;
 						},
 						appendEntry: (customType, data) => {
 							session.sessionManager.appendCustomEntry(customType, data);
@@ -1410,12 +1621,28 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						},
 						getActiveTools: () => session.getActiveToolNames(),
 						getAllTools: () => session.getAllToolNames(),
+						resolveTool: name => {
+							const tool = session.getToolByName(name);
+							return tool
+								? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields }
+								: undefined;
+						},
 						setActiveTools: (toolNames: string[]) =>
 							session.setActiveToolsByName(toolNames.filter(name => !parentOwnedToolNames.has(name))),
 						getCommands: () => getSessionSlashCommands(session),
 						setModel: model => runExtensionSetModel(session, model),
 						getThinkingLevel: () => session.thinkingLevel,
-						setThinkingLevel: level => session.setThinkingLevel(level),
+						setThinkingLevel: (level, persist) => session.setThinkingLevel(level, persist),
+						getThinkingVisibility: () => session.getThinkingVisibility(),
+						setThinkingVisibility: (visibility, persist) => session.setThinkingVisibility(visibility, persist),
+						cycleThinkingLevel: () => session.cycleThinkingLevel(),
+						setThinkingLevelForControl: (level, persist) => session.setThinkingLevelForControl(level, persist),
+						setThinkingVisibilityForControl: (visibility, persist) =>
+							session.setThinkingVisibilityForControl(visibility, persist),
+						setModelTemporaryForControl: (model, expectedSessionId) =>
+							session.setModelTemporaryForControl(model, expectedSessionId),
+						fetchUsageReportsForControl: () => session.fetchUsageReportsForControl(),
+						getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 						getSessionName: () => session.sessionManager.getSessionName(),
 						setSessionName: async name => {
 							await session.sessionManager.setSessionName(name, "user");
@@ -1426,10 +1653,25 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						isIdle: () => !session.isStreaming,
 						abort: () => session.abort(),
 						hasPendingMessages: () => session.queuedMessageCount > 0,
+						getPendingMessageCounts: () => session.pendingMessageCounts,
+						getTranscript: () => session.getTranscript(),
+						getTranscriptBody: entryId => session.getTranscriptBody(entryId),
+						getGoalState: () => session.getGoalModeState(),
+						getTodoState: () => session.getTodoPhases(),
+						getQueuedMessages: () => session.getQueuedMessageEntries(),
+						getActiveTools: () => session.getActiveToolNames(),
+						getAllTools: () => session.getAllToolNames(),
+						resolveTool: name => {
+							const tool = session.getToolByName(name);
+							return tool
+								? { safeSummary: tool.safeSummary, safeSummaryFields: tool.safeSummaryFields }
+								: undefined;
+						},
 						shutdown: () => {},
 						getContextUsage: () => session.getContextUsage(),
 						getSystemPrompt: () => session.systemPrompt,
 						compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
+						clearContext: () => session.clearContext(),
 					},
 				);
 				extensionRunner.onError(err => {
@@ -1466,6 +1708,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						};
 					}
 					scheduleProgress(true);
+					return;
+				}
+				if (event.type === "model_fallback_switched") {
+					forwardSubagentEvent(event);
 					return;
 				}
 				if (isAgentEvent(event)) {
@@ -1761,6 +2007,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		abortReason: finalAbortReason,
 		paused,
 		usage: hasUsage ? accumulatedUsage : undefined,
+		usageCostBreakdownComplete: hasUsage && usageCostBreakdownComplete ? true : undefined,
 		outputPath,
 		extractedToolData: progress.extractedToolData,
 		retryFailure: progress.retryFailure,

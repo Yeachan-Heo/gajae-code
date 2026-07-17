@@ -26,8 +26,8 @@ html-to-markdown-rs.workspace = true
 icy_sixel.workspace = true
 ignore.workspace = true
 image.workspace = true
-inferno.workspace = true
-gjc-notifications = { path = "../gjc-notifications" }
+inferno = { workspace = true, optional = true }
+gjc-sdk = { path = "../gjc-sdk" }
 memmap2.workspace = true
 napi.workspace = true
 napi-derive.workspace = true
@@ -56,6 +56,7 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true
+windows-sys.workspace = true
 
 [build-dependencies]
 napi-build.workspace = true
@@ -65,3 +66,4 @@ serde_json.workspace = true
 [features]
 default = []
 full-langs = ["pi-ast/full-langs"]
+prof-flamegraph = ["dep:inferno"]

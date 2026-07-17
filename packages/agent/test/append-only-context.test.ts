@@ -457,6 +457,36 @@ describe("AppendOnlyContextManager", () => {
 		expect(result.messages).toEqual([]);
 	});
 
+	it("onPrefixChange fires only for fingerprint changes and chains versions", () => {
+		const changes: { from: string; to: string; version: number }[] = [];
+		const mgr = new AppendOnlyContextManager({ onPrefixChange: info => changes.push(info) });
+		const ctx = makeContext({ systemPrompt: ["Prompt A"], tools: [makeTool("read")] });
+
+		mgr.build(ctx, BUILD_OPTS);
+		expect(changes).toHaveLength(1);
+		expect(changes[0]?.from).toBe("<unbuilt>");
+		expect(changes[0]?.to).not.toBe("<unbuilt>");
+
+		// Cache hit: identical context, no new change event.
+		mgr.build(ctx, BUILD_OPTS);
+		expect(changes).toHaveLength(1);
+
+		mgr.build(makeContext({ systemPrompt: ["Prompt B"], tools: [makeTool("read")] }), BUILD_OPTS);
+		expect(changes).toHaveLength(2);
+
+		mgr.build(makeContext({ systemPrompt: ["Prompt B"], tools: [makeTool("read"), makeTool("write")] }), BUILD_OPTS);
+		expect(changes).toHaveLength(3);
+
+		mgr.build(makeContext({ systemPrompt: ["Prompt B"], tools: [makeTool("read")] }), BUILD_OPTS);
+		expect(changes).toHaveLength(4);
+
+		for (let index = 1; index < changes.length; index += 1) {
+			expect(changes[index]?.from).toBe(changes[index - 1]?.to);
+			expect(changes[index]?.to).not.toBe(changes[index]?.from);
+			expect(changes[index]?.version).toBeGreaterThan(changes[index - 1]?.version ?? 0);
+		}
+	});
+
 	it("build() returns same systemPrompt and tools on subsequent calls", () => {
 		const mgr = new AppendOnlyContextManager();
 		const ctx = makeContext({
@@ -999,7 +1029,7 @@ describe("message sync", () => {
 // ---------------------------------------------------------------------------
 
 describe("intent injection through build()", () => {
-	it("injects required `_i` into tool schemas when intentTracing is true", () => {
+	it("injects optional `_i` into tool schemas when intentTracing is true", () => {
 		const mgr = new AppendOnlyContextManager();
 		const tool = makeTool("read", "Read", {
 			type: "object",
@@ -1012,7 +1042,7 @@ describe("intent injection through build()", () => {
 		const params = result.tools?.[0]?.parameters as { properties?: Record<string, unknown>; required?: string[] };
 		expect(params?.properties).toBeDefined();
 		expect(params!.properties!._i).toBeDefined();
-		expect(params!.required).toContain("_i");
+		expect(params!.required ?? []).not.toContain("_i");
 	});
 
 	it("omits `_i` when intentTracing is false", () => {

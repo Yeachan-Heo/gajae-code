@@ -1,0 +1,57 @@
+// Permissions / notification headless tell.
+//
+// Headless Chrome reports `Notification.permission === "denied"` by default and
+// a matching `permissions.query({name:"notifications"})` state, while a real
+// user browser reports `"default"` / `"prompt"`. Detectors such as CreepJS key
+// on this exact mismatch to flag headless. Normalize both to the human default.
+//
+// Technique adapted (reimplemented) from puppeteer-extra-plugin-stealth
+// (navigator.permissions) — see STEALTH-THIRD-PARTY-NOTICES.md.
+
+try {
+	if (typeof Notification !== "undefined" && Notification.permission === "denied") {
+		Object_defineProperty(Notification, "permission", {
+			get() {
+				return "default";
+			},
+			configurable: true,
+		});
+	}
+} catch (e) {}
+
+try {
+	const permissions = navigator.permissions;
+	const originalQuery = permissions && permissions.query;
+	if (originalQuery && typeof PermissionStatus !== "undefined") {
+		permissions.query = new Window_Proxy(originalQuery, {
+			apply(target, ctx, args) {
+				const params = args[0];
+				if (params && params.name === "notifications") {
+					return Promise_resolve(
+						Object_create(PermissionStatus.prototype, {
+							state: {
+								get() {
+									return "prompt";
+								},
+								enumerable: true,
+								configurable: true,
+							},
+							name: {
+								value: "notifications",
+								enumerable: true,
+								configurable: true,
+							},
+							onchange: {
+								value: null,
+								writable: true,
+								enumerable: true,
+								configurable: true,
+							},
+						}),
+					);
+				}
+				return Reflect.apply(target, ctx, args);
+			},
+		});
+	}
+} catch (e) {}

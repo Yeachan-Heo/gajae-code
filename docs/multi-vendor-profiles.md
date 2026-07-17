@@ -68,7 +68,32 @@ profiles:
       planner:   google-antigravity/gemini-3.1-pro-low:high
       architect: anthropic/claude-opus-4-8:high
       critic:    opencode-go/glm-5.2
+
+  reviewer:              # review/audit stance — the author-mode role split, inverted
+    required_providers: [anthropic, openai-codex, google-antigravity]
+    model_mapping:
+      default:   anthropic/claude-opus-4-8:high                 # aggregator restraint: preserve raw reviewer verdicts
+      executor:  openai-codex/gpt-5.5:high                      # support — repro PoCs, failing tests, harnesses
+      planner:   google-antigravity/gemini-3.1-pro-low:high     # review checklists / audit scoping
+      architect: anthropic/claude-opus-4-8:high                 # lead 1 — primary code-review judge (effective long-context)
+      critic:    openai-codex/gpt-5.5:high                      # lead 2 — merge gate, cross-family vs Claude-authored code
 ```
+
+## Reviewer stance and the external review gate
+
+The profiles above assume an **authoring** stance: `executor` is the lead and `architect`/`critic` verify its work. In a session whose primary job is reviewing or auditing (not writing) code, the roles invert — `architect`/`critic` become the leads and `executor` is support (reproduction PoCs, failing tests). The `reviewer` profile encodes that inversion, with one generalized provenance rule: **the reviewing model family must differ from the family that authored the code under review**, not merely from the session's own executor.
+
+A verified use is the cross-session final review gate: the authoring session launches a fresh, stateless reviewer sub-session so the finished diff is judged without the authoring context:
+
+```sh
+# the one-shot gate needs only a cross-family --model; add --mpreset reviewer as an
+# optional enhancement AFTER installing this profile in ~/.gjc/agent/models.yml:
+gjc -p --no-session --model openai-codex/gpt-5.5:xhigh --tools read,search,find "<review prompt: diff + spec paths, severity findings, final line VERDICT: APPROVE|REQUEST_CHANGES>"
+```
+
+The `--tools` allowlist is part of the contract: it enforces the reviewer's read-only boundary for the built-in tool surface instead of trusting the prompt (the runtime still injects the session `goal` tool unless `goal.enabled` is off — disabling it for the reviewer invocation is **mandatory**, via a dedicated gate directory outside the repo so the reviewed checkout stays clean, see the template — plus `generate_image` when an image credential exists). In this one-shot form the session's `default` model authors the verdict — a tool-restricted print session cannot delegate to the profile's `critic`/`architect` roles — so the explicit cross-family `--model` carries provenance, and the `reviewer` profile itself serves the interactive review-session case (activate it with `--mpreset reviewer` only after copying it into `models.yml`; otherwise activation fails with an unknown-profile error). Profile names in this document live in the user namespace — a user profile overrides a builtin preset only on an exact name match, and a future builtin with the same name would be silently shadowed by your copy.
+
+See [Extragoal local skill template](./extragoal-skill-template.md) for the full gate workflow (verdict contract, findings triage, bounded re-sign loop, secret-scan and injection guards) built on this recipe.
 
 ## Model cheatsheet (by need)
 

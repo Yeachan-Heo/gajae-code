@@ -12,7 +12,6 @@ import {
 } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
-import xterm from "@xterm/headless";
 import { Settings } from "../config/settings";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import type { Theme } from "../modes/theme/theme";
@@ -31,8 +30,6 @@ function normalizeCaptureChunk(chunk: string): string {
 	const normalized = chunk.replace(/\r\n?/gu, "\n");
 	return sanitizeWithOptionalSixelPassthrough(normalized, sanitizeText);
 }
-
-const XtermTerminal = xterm.Terminal;
 
 function normalizeInputForPty(data: string, applicationCursorKeysMode: boolean): string {
 	const kitty = parseKittySequence(data);
@@ -113,6 +110,7 @@ class BashInteractiveOverlayComponent implements Component {
 		private readonly command: string,
 		private readonly uiTheme: Theme,
 		private readonly getTerminalRows: () => number,
+		XtermTerminal: typeof XtermTerminalType,
 	) {
 		this.#terminal = new XtermTerminal({
 			cols: 120,
@@ -305,10 +303,17 @@ export async function runInteractiveBashPty(
 		headBytes: resolveOutputSinkHeadBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
 	});
+	const { default: xterm } = await import("@xterm/headless");
+	const XtermTerminal = xterm.Terminal;
 	const result = await ui.custom<BashInteractiveResult>(
 		(tui, uiTheme, _keybindings, done) => {
 			const session = new PtySession();
-			const component = new BashInteractiveOverlayComponent(options.command, uiTheme, () => tui.terminal.rows);
+			const component = new BashInteractiveOverlayComponent(
+				options.command,
+				uiTheme,
+				() => tui.terminal.rows,
+				XtermTerminal,
+			);
 			component.setSession(session);
 			let finished = false;
 			const finalize = (run: PtyRunResult) => {

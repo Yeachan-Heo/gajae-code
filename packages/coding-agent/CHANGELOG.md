@@ -1,6 +1,288 @@
 # Changelog
 
 ## [Unreleased]
+
+### Fixed
+- Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
+- Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
+
+
+### Fixed
+- SDK host response delivery to a disconnected client no longer escalates a second structured-error send failure into a process-level unhandled rejection; failures stay local to that connection.
+
+### Fixed
+- Palette slash commands now run only from an empty composer; drafts are never touched.
+- Aborting a session without an enabled active goal no longer suppresses the first reminder when a goal is activated later; active-goal abort suppression is one-shot, goal-owned, and clears across inactive or replacement-goal transitions (#2436).
+- Palette slash submissions no longer clear or rewrite composer text, cursor state, history, or pending images created while an asynchronous input hook is awaiting; canonical keyboard submission cleanup remains unchanged (#2441).
+- Dead browser-tab recovery now expires descriptors without releasing replacement, revived, or differently owned tabs, while exactly-once teardown closes stale targets and releases browser holds without refcount underflow (#2437).
+- Local-memory Phase 1 no longer processes history from another working directory.
+
+### Added
+- Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
+- Added a searchable command palette with direct action dispatch; slash commands run only from an empty composer, and drafts are never touched.
+
+### Fixed
+
+- Sessions running a managed model fallback chain no longer wedge with repeated `Retry failed after N attempts: The object can not be cloned.` after a provider HTTP error whose response carried headers. The live `Headers` instance attached to the provider error was not structured-cloneable, so the managed attempt snapshot replaced the real provider failure with a local `DataCloneError` on every model in the chain — misreporting `Model fallback chain exhausted` and permanently failing every subsequent prompt while the provider kept erroring. Transport facts now retain only plain-record retry signals, and the attempt snapshot degrades gracefully instead of failing the attempt.
+
+### Fixed
+- Active deep-interview sessions now resume automatically after a normal assistant stop while ordinary active interviewing remains eligible, using bounded workflow-state continuation; recovery, leak, stale-state, handoff, and crystallization blocks remain Stop-gate handled.
+
+### Changed
+- Removed deprecated `DiscoverableMCPTool`, `DiscoverableMCPSearchIndex`, and related MCP-only discovery helper exports. Use the unified `DiscoverableTool` discovery APIs; the `mcp.discoveryMode` settings alias remains supported.
+
+### Fixed
+- Connected MCP server instructions now remain untrusted user-role data instead of entering the cached system prompt; hostile file paths, working directories, and workspace-tree metadata are structurally encoded, and volatile project context is removed from durable session history between requests.
+- Restored the strict G002 public-surface quarantine by removing the default README advertisement for the private coordinator MCP runtime.
+
+## [0.11.1] - 2026-07-16
+
+### Fixed
+- Published the Windows Bun workflow-gate durability fix that tolerates unsupported `EPERM` directory `fsync` failures after an already-committed atomic rename; the 0.11.0 package changelog described the fix, but the released artifact did not contain it (#2316).
+
+## [0.11.0] - 2026-07-15
+
+### Fixed
+- Discord inbound lease recovery now exposes a deterministic scheduler seam, preserves exponential retry wakeups after transient endpoint lookup failures, and cancels pending recovery exactly on daemon stop instead of relying on wall-clock sleeps in regression coverage.
+- Input-free interactive TTY startup now keeps the TUI reachable when configured model profiles are missing required provider credentials, skips only the blocked profiles, and preserves later `--mpreset` and explicit model/thinking precedence; redirected terminals, input-bearing, resume-continuation, image-only, print/text, and unrelated activation failures remain fail-closed (#2277).
+- Windows Bun runtimes no longer crash while committing the durable workflow-gate store when directory `fsync` reports the unsupported-operation code `EPERM`; unexpected directory-sync failures remain fail-closed.
+- Browser geo settings now propagate coherently across request `Accept-Language`, navigator languages, and `Intl` locale/timezone surfaces; configured managed browsers are isolated by geo/profile posture, concurrent acquisition is serialized, and unset geo preserves Chromium's native locale/timezone instead of injecting a fixed New York profile.
+
+- Cooperative mid-run context maintenance now waits at a cancellation-aware FIFO consumer-drain checkpoint before flushing or rewriting session history. Materialized tool results and steering messages are synchronously canonicalized first; aborted barriers and hook/signal-cancelled compactions settle without rewriting or scheduling a continuation. Promotion, pruning, and compaction each start a clean provider/prompt-cache epoch. Script-aware #2067 unsent-delta accounting remains cache-free and distinct from the lifecycle checkpoint.
+- Classified the cooperative mid-run maintenance driver and token estimator test seams as locked non-public SDK exclusions, restoring deterministic operation-inventory generation and post-merge dev CI coverage.
+- Accepted SDK prompts now deliver correlated `agent_start` and exactly one terminal lifecycle frame directly to the requesting authenticated WebSocket connection while retaining replayable host events. Harness owner observation also waits for every previously accepted frame to finish serial persistence, so message-update storms and polling gaps cannot hide sticky completion evidence (#2169).
+- `/new` now fails closed while owned subagent shutdown is unproven: it preserves the current session identity and shows an actionable cleanup notice. Successful replacement waits for cooperative child cancellation, cancels owner jobs before switching identity, and `/drop` creates the replacement before attempting old-session deletion (#2261).
+
+### Added
+
+- Added the additive SDK Q10 model-catalog DTO: `Q10`, `models.list/current`, `models.list`, and `models.current` now return the same paged registry rows with reasoning/thinking capability metadata and current-model readback. `thinking.validLevels` is an `off`-first canonical menu; sparse raw reasoning descriptors remain available for inspection. The public DTO types are exported from `@gajae-code/coding-agent/sdk`, while undocumented `/sdk/models` deep imports remain unavailable. `inherit` is readback-only and malformed descriptors fail with a safe internal SDK error (#2163).
+- Gajae Pet selection is now terminal-capability aware: unsupported terminals show an actionable warning (with multiplexer-specific guidance for tmux/screen/zellij, including the `PI_FORCE_IMAGE_PROTOCOL=sixel` expert opt-in), `/pet` and Settings disable the unavailable `RedGajae`/`BlueGajae` choices while `off` stays selectable, a saved-but-unavailable choice is identified as `(saved)`, and the public command names are consistent across execution, completion, and inline hints (`/pet RedGajae`, `/pet BlueGajae`, `/pet off`, case-insensitive).
+- Added the standalone `@gajae-code/bridge-client` transport-only v3 SDK package. It exports `SdkClient` and its associated types; `@gajae-code/coding-agent/sdk` remains a compatibility re-export with the exact same class identity. Historical BridgeClient backend protocol, handshake, commands, SSE, and host-control bypass surfaces remain unavailable.
+- Added explicit `--mcp-config <absolute-path>` support for one trusted, tools-only MCP config in top-level standalone sessions without enabling automatic user or project MCP discovery; exact reads reject links and identity changes, and MCP tool-name collisions fail closed.
+- Added additive v3 workflow-gate correlation compatibility surfaces (#2171): explicit Rust workflow-frame readers/registration preserve `workflowGateId` without changing legacy `ActionNeeded`, `ServerMessage`, or `register_ask`; N-API retains `registerAsk` and adds correlated/arbitrated registration and exact unclaimed-retirement APIs. Private presentation leases, routes, claims, receipts, epochs, and endpoint generations remain non-public.
+- Added the versioned, readonly managed session-directory SDK: `SESSION_DIRECTORY_API_VERSION`, `resolveManagedSessionScope`, and `listManagedSessionCandidates` are exported from `@gajae-code/coding-agent/sdk`. The package boundary continues to reject private `session/internal/*` imports. Managed writes use v2 workspace scopes with validated opt-in legacy copy-retain migration (#2177).
+
+### Changed
+- Explicit fold choices from the user shortcut or extension `setToolsExpanded` now pin a block for its component lifetime, so automatic stamping no longer overwrites them; sessions that never toggle are unchanged.
+
+- Renamed the notifications SDK to the Gajae-Code SDK: `docs/notifications-sdk.md` is now `docs/sdk.md`, `src/notifications/` is now `src/sdk/bus/`, and `src/sdk.ts` is now the `src/sdk/` module directory. Old deep-import specifiers no longer resolve.
+- Moved SDK discovery from `.gjc/state/notifications/` to `.gjc/state/sdk/`. Restart sessions and daemons together when upgrading; the runtime does not dual-scan the old and new directories.
+- Removed the `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` external ingress modes. Machine clients must use the SDK WebSocket interfaces documented in `docs/sdk.md`; no RPC or Bridge compatibility path remains.
+- Documented the current GPT-5.6 Codex and combo profile mappings as product judgments, including the durable `opus-codex` `anthropic/claude-sonnet-5` planner override and `fable-opus-codex` `anthropic/claude-opus-4-8:medium` planner.
+- Resolved the SDK v3 workflow-gate shipping classification (#2171): `workflowGateId` and Q12 diagnostics are additive SDK v3 surfaces, while `action_needed.id` remains the transient, generic `reply.id` authority. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line; new clients must send it, and mandatory enforcement or removal can occur no earlier than SDK v4 only after at least one full published deprecation release/window with deployed-client notice. Explicit session mismatches fail closed before resolution; mismatched sessions, stale/reissued actions, and unsafe ambiguity never regain authority.
+- Documented release pairing: the `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions, with the native loader version sentinel enforcing the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+### Fixed
+- Startup continuation now participates in the existing managed fallback and in-flight recovery envelope, preventing a retryable resumed turn from publishing `agent_end`/idle before retry success, exhaustion, cancellation, or startup failure has settled (#2092).
+
+- Fenced SDK WebSocket lifecycle callbacks and request settlement to the owning retry cycle/socket incarnation, so stale open, close, error, message, and timeout delivery cannot reject or corrupt work on a replacement connection; sent mutations remain non-replayed and deterministic race regressions cover the reconnect boundary (#2164).
+- Owned LSP stdin `EPIPE` and `ERR_STREAM_DESTROYED` failures now terminalize and evict only the affected client, reject pending and stale requests with a stable transport-closed error, and permit clean client recreation without suppressing serialization or unrelated sink failures (#2138).
+- Serialized fresh prompt preflight and durable default-model selection through deterministic per-session admission, preventing a later `model.set` from overtaking an earlier prompt while preserving provider-stream and continuation behavior (#2199).
+- Direct SDK broker lifecycle hosts now wait for their session-owned startup capability before publishing lifecycle readiness. Only a `started` capability permits a ready marker; failed startup requires proven process, endpoint, and host cleanup before the broker reports `spawn_failed` with no endpoint available, otherwise it preserves terminal uncertainty (#2168).
+- Isolated default source-mode SDK broker and session-host respawns from caller Bun startup policy. Internal children now use fixed `--no-env-file` plus product-owned config/entrypoint paths, scrub `BUN_OPTIONS` and mutable compiled markers, preserve compiled/custom launch compatibility, and clean up owned broker children on startup failure without leaking launch secrets (#2178).
+## [0.10.2] - 2026-07-14
+
+### Added
+
+- Gajae Pet selection is now terminal-capability aware: unsupported terminals show an actionable warning (with multiplexer-specific guidance for tmux/screen/zellij, including the `PI_FORCE_IMAGE_PROTOCOL=sixel` expert opt-in), `/pet` and Settings disable the unavailable `RedGajae`/`BlueGajae` choices while `off` stays selectable, a saved-but-unavailable choice is identified as `(saved)`, and the public command names are consistent across execution, completion, and inline hints (`/pet RedGajae`, `/pet BlueGajae`, `/pet off`, case-insensitive).
+
+### Changed
+
+- Documented the current GPT-5.6 Codex and combo profile mappings as product judgments, including the durable `opus-codex` `anthropic/claude-sonnet-5` planner override and `fable-opus-codex` `anthropic/claude-opus-4-8:medium` planner.
+- RPC clients can now durably select the machine-global default model and effective thinking level for subsequent messages, while project policy and resumed session history retain precedence; a late live-apply failure now restores the prior runtime model and thinking level without masking the original error.
+
+### Fixed
+
+- Gajae Pet overlays no longer leak images or stale pixels across lifecycle changes: each widget owns a randomized Kitty image ID (deleted on disable, replace, switch, and dispose), the previous Sixel footprint is tracked and erased on movement, resize, and narrow-terminal fallback, replaced pet widgets are disposed before their successors install, and a saved pet preference survives editor replacement while graphics are still unavailable (so a delayed Sixel capability probe can still activate it). Teardown is exception-safe and idempotent: a failed or unavailable terminal write never aborts logical disposal or steals a successor widget's overlay slot, and Sixel/Kitty cleanup authority is retained until the erase is actually delivered so a later mode switch or dispose retries it.
+- Gajae Pet cleanup that fails during final widget disposal is now retained by the TUI for retry, and Kitty image IDs remain reserved until their exact-ID delete is delivered.
+- Fixed `gjc --tmux` startup from GNOME and other VTE terminals by recognizing `vte-spawn-*.scope` only when cgroup metadata proves matching user-manager ancestry (#2159).
+- Fixed native Windows `GJC_TMUX_COMMAND=tmux` resolution when WinGet's `tmux.exe` is a psmux alias with a generic `tmux` banner: GJC now compares executable identity with the installed `psmux.exe`/`pmux.exe` companions and fails closed when identity cannot be established instead of authorizing native-tmux semantics (#2086).
+
+- Accepted or declined initial external credential-import decisions now persist across normal restarts and upgrades, suppressing automatic startup and bare `/login` discovery; same-version legacy markers remain compatible and explicit `/provider` import remains available ([#2117](https://github.com/Yeachan-Heo/gajae-code/issues/2117)).
+
+
+## [0.10.1] - 2026-07-13
+
+### Added
+
+- Added an owner-proof idle session reaper and `gjc_coordinator_stop_session` for ephemeral (delegate-created) coordinator sessions. Termination goes exclusively through the canonical SDK broker `session.close` lifecycle (durable process identity verified before close) — never a raw `process.kill` or tmux control. The reaper re-validates ephemeral and no-active-turn state at close time under the same per-session mutation lock as delegate reuse, and purges coordinator metadata only after SDK closure is verified, retaining it when closure cannot be confirmed (#2080).
+
+- Added an owner-proof idle session reaper and `gjc_coordinator_stop_session` for ephemeral (delegate-created) coordinator sessions. Termination goes exclusively through the owner-proof `forceCloseGjcTmuxSession` path (pid, native session id, owner generation, server key, and start time all verified before SIGTERM) — never a raw `process.kill`. The reaper binds each close to the persisted runtime-state file, re-validates ephemeral and no-active-turn at kill time under the same per-session mutation lock as delegate reuse, and purges state only on verified termination (#2080).
+- SDK clients can now pass an explicit thinking level to `model.set`, atomically applying the effective model and thinking level to the active session and the machine-global default for future sessions, while project policy and resumed session history retain precedence.
+- Context-usage tokens/% now use provider-reported usage as the single source of truth on every surface. `AgentSession.getContextUsage()` returns a source-tagged snapshot (`source: "provider_anchor" | "heuristic" | "unknown"`), and the status-line `context_pct` segment, inline model percentage, and `/context` totals consume that snapshot instead of recomputing an independent heuristic sum — so footer, status line, `/context`, ACP, and RPC can no longer disagree about the same session state. Heuristic estimation now applies only when no provider anchor exists (session start, aborted/error-only turns), and that fallback now includes the fixed system-prompt/tool/skill context it previously omitted. The pre-prompt compaction estimate honors the latest-compaction boundary (never anchors on stale pre-compaction usage totals), unknown post-compaction usage stays unknown (status line renders `?`; ACP omits the `usage_update` instead of reporting `used: 0`), and `/context` labels its total by provenance with a reconciliation line when the estimated category composition diverges from the provider-reported total.
+- Post-durable default-model-selection failures now expose a stable SDK error with bounded `restored`, `partial`, or `unknown` rollback state; preflight and validation errors remain unchanged.
+### Fixed
+- Made SDK host startup publish its runtime and initial identity frame before exposing direct-v3 transport endpoints, preventing early replay/control frames from being dropped or dereferencing uninitialized session state under concurrent test and process load.
+
+- IRC deliveries now accept their exchange batch in the recipient's volatile current-session queue before recipient/main UI observations or sender success. Awaited deliveries generate the reply first, then accept the ordered incoming + auto-reply pair and commit the IRC roster claim before observation; provider failures and sender aborts before acceptance leave no ghost exchange, while observer failures after acceptance are isolated. This is not a durability guarantee: durable history injection remains a later flush and no fsync, recovery, persistent IDs, or deduplication was added.
+- `/model` role-agent assignments now replace active model-profile overrides immediately, so changing architect, critic, planner, or executor models and reasoning levels takes effect in the current session and remains persisted afterward.
+- Print mode now records terminal text-mode errors as exit status 1 (or 78 for context overflow) without bypassing output quiescence or session disposal. It retains JSON event delivery through disposal and suppresses `EPIPE` from its owned stdout; `ERR_STREAM_DESTROYED` is suppressed only after that `EPIPE` has latched, while other output failures remain errors.
+- Preserved clipboard image attachments when the interactive editor clears the composer before dispatching the submit callback, so Alt+V image placeholders still send their image blocks instead of placeholder-only text (#2126).
+- Extension contexts now receive a defensive copy from `getSystemPrompt()` instead of the live mutable system-prompt array, so an in-place mutation by an in-process extension can no longer bypass context-revision tracking and serve stale display-only context-usage estimates.
+- Completed bracketed-paste input now returns a manually paged transcript to live output before the paste is dispatched, including asynchronous consumed and unconsumed paste paths.
+- Prevented orphaned background processes by reaping failed detached harness owners and their exact SDK session children with verified TERM/KILL cleanup, giving only the invocation-scoped transport-close capability permission to break a direct owner-stop cycle while every public stop caller awaits truthful teardown, keeping runtime-owner lease/heartbeat authority live while failed teardown retries, binding broker discovery to OS process incarnations before accepting retained ownership, making isolated ACP and broker subprocess tests stop their exact broker before deleting temporary state, and adding a cooperative Telegram daemon watchdog that stops superseded or non-progressing owners.
+- Preserved clipboard image attachments when the interactive editor clears the composer before dispatching the submit callback, so Alt+V image placeholders still send their image blocks instead of placeholder-only text (#2126).
+- Completed bracketed-paste input now returns a manually paged transcript to live output before the paste is dispatched, including asynchronous consumed and unconsumed paste paths.
+- Telegram `/usage` now includes secret-safe 5-hour and weekly limit summaries when normalized provider data is available, `/reasoning` reports effort/scope/display with compatible controls and accurate help, and `/model` offers owner-authorized one-shot inline buttons with stale/invalid callback safeguards (#2095).
+
+## [0.10.0] - 2026-07-12
+
+### Added
+
+- Added an opt-in `/pet on|off` composer companion with idle gaze, working claw motion, and occasional automatic flex animation on Sixel- and Kitty-graphics terminals.
+- Added Grok 4.5 to the bundled Grok Build catalog with its published 500K context window, multimodal input and token pricing, normalized its official `grok-4.5-latest` and `grok-build-latest` aliases, and limited reasoning effort to the documented `low`, `medium`, and `high` levels.
+
+- Added `notifications.sessionScope` (`all` default | `primary`). Under `primary`, the separate-process child sessions GJC spawns (team workers, harness RPC owners) no longer register their own Telegram forum topic / notification endpoint unless they explicitly opt in (`GJC_NOTIFICATIONS=1`, the `/session_create` path). The default `all` fully preserves current behavior, and user-opened CLI/tmux/headless sessions are never affected. The provenance marker is per-spawn and non-dynastic (consumed once at session startup, never inherited by grandchildren) (#1908).
+- Coordinator MCP `gjc_coordinator_start_session` and the `gjc_delegate_plan`/`gjc_delegate_execute`/`gjc_delegate_team` tools now accept an optional `mpreset` argument that authoritatively activates a GJC model profile for a fresh session, with the same semantics as `gjc --mpreset <profile>` (#2003). The name is resolved through the merged built-in/custom profile registry before launch (so custom profiles keep working), legacy profile aliases are canonicalized exactly like the CLI (e.g. `codex-standard` → `codex-medium`), and the canonical profile is injected into the child startup command so the profile's default and per-role models apply from the first turn; unknown names are rejected with the available-profile listing and never reach a spawned command, and an unreadable/invalid `models.yml` fails closed with a distinct `model_profile_registry_error` rather than silently degrading to built-ins only. An explicit empty/whitespace `mpreset` is rejected rather than treated as omission. The effective profile is recorded on the session and surfaced in coordinator status/readback, reusing a session with a conflicting `mpreset` fails with a stable `mpreset_conflict` reason, and calls that omit `mpreset` keep their current behavior. The existing advisory `model` prompt hint is unchanged, and no machine-wide durable default is introduced (#2066 remains out of scope).
+
+- `notifications.telegram.topics.nameTemplate` configures the Telegram forum-topic title, with `{repo}`, `{branch}`, and `{title}` placeholders, so operators can put the session title first (e.g. `"{title} · {repo}/{branch}"`) and keep concurrent sessions on the same checkout distinguishable in the topic sidebar. The template applies only when every placeholder it references resolves for the session; otherwise the daemon falls back to the built-in `{repo}/{branch} - {title}` composition (and its title/repo/branch fallbacks). Unset preserves the current naming exactly (#1909).
+- Added the IRC chat-room surface: IRC messages persist in the main chat scrollback by default (no 10s TTL) with stable observation ids and a rebuild-aware ledger, and the agent is IRC-aware. Enabling `irc.sidebar.enabled` moves the persistent record into the opt-in `alt+i` sidebar split while inline display stays ephemeral. Message persistence and agent awareness are default-on; the sidebar panel itself is opt-in (#2018).
+- Added a transport-agnostic, secret-safe shared notification service (status, health, test delivery, ownership-protected recovery) consumed by both the `gjc notify` CLI and the cross-mode `/notify` slash command (TUI + ACP), so onboarding and daemon recovery no longer duplicate daemon/config logic per surface. `/notify` now exposes `status|health|test|recovery|setup` and `gjc notify` gains `health`/`test`/`recovery` with `--probe`/`--message` (#2050).
+- Added beginner-safe `gjc daemon` operational shortcuts sharing one operator contract so the guided human surface and machine-readable `--json` never drift: a `restart` alias that resolves to reload-if-running-else-spawn, concise per-daemon output by default with `--verbose`/`-v` for runtime detail and the full roots list, and an actionable structured recovery path when token/chat ownership mismatches instead of a large payload ending in `blocked`. Exit codes stay 0 on success / 1 on failure (#2057).
+- Added fail-closed ACP session deletion: the delete path refuses rather than proceeding when the target session cannot be safely resolved, and retains the inode in the replacement case (#2074).
+- Added the interactive **Notifications** settings tab with masked Telegram setup, global and session controls, health/test/recovery/reconnect actions, atomic preference saves, and safe blocked-owner recovery guidance (#2050).
+
+### Changed
+
+- Migrated the repository type-check and release declaration pipeline to stable TypeScript 7.0.2 with a non-mutating publish-type gate.
+- Rebalanced GPT-5.6 Codex and combo presets around published family tiers and reasoning-effort curves. The executor assignments are informed by descriptive repeated local exact-edit evidence from selected TypeScript tasks; default, planner, architect, and critic assignments remain product judgments rather than benchmark claims.
+- Cache-miss diagnostics now separate actionable, diagnostic-only, and provider-side-suspected causes instead of asserting a user-side fix for every miss (#2020). A large, costly miss with no cache reads or writes is reported as a neutral `Cache notice` marked "provider-side suspected / not user-actionable" (with what GJC cannot determine) rather than telling the user to keep a stable prefix; a miss with reads but no writes is reported as diagnostic-only without asserting a single cause; and the "cache write without enough matching reads" warning now only fires when reads actually fail to cover the writes. The existing miss cost summary and the #1929/#1936 pricing/provenance safeguards are unchanged.
+
+### Fixed
+
+- Fixed native-Windows coordinator/runtime compatibility by treating psmux's successful empty `list-sessions` response as an absent server while keeping malformed rows fail-closed, reading process incarnations through a validated PowerShell start-time query, sharing the existing BOM-free encoded PowerShell pane command, preserving multiline SDK prompts behind semantic readiness, and retaining runtime command/turn acknowledgement identity across Windows-equivalent workspace paths (#2145).
+- The coordinator MCP owner-server probe now recognizes tmux ≥3.7's missing-server diagnostic (`error connecting to <socket> (No such file or directory)`) as an absent server. tmux 3.7 changed the wording from the older `no server running on <socket>`, which the coordinator probe did not match — so a brand-new coordinator socket (which never has a server yet) was misclassified `unverifiable` instead of `absent`, and **every** `gjc_delegate_*` / session create failed closed with `coordinator_tmux_owner_server_unverifiable` on tmux ≥3.7. The coordinator and `gjc` harness probes now match the same no-server wordings the other owner-isolation probes already did.
+- Preserved explicit Telegram forum-topic renames as durable user-owned names, immediately re-asserting delayed edits while retaining restart and rename-race recovery (#1910).
+- Prevented typed provider safety stops from entering automatic retry loops and aligned ACP refusal reporting with the provider-native classification.
+- `gjc resume` now aliases value-less `--resume`, requests confirmation before opening and continues a resumable tail once only; terminal tails open idle, and headless bare resume exits with explicit `--resume <id>` guidance (#1973).
+- Telegram answers to interactive and unattended `ask` prompts now receive a semantic, origin-bound `Selected!` acknowledgement before workflow continuation, with typed multi-select controls, no acknowledgement for toggles/clarifications/skips, at-most-once delivery attempts, and truthful failure/unknown outcomes (#1974).
+- Isolated unsafe Linux/systemd tmux owners into independently proven user scopes before server creation, added generation-bound exact-SIGTERM shutdown verdicts and deduplicated incident/recovery provenance, and removed pane payloads from raw session lifecycle evidence (#1938).
+- Coordinator MCP stdio server now dispatches JSON-RPC requests with bounded concurrency and answers the standard `ping` utility, so a long-running tool call (e.g. `gjc_coordinator_await_turn`, which polls for minutes) no longer starves keepalive on the same channel — without the state/lifecycle races unbounded concurrency would introduce. Same-session mutations (notably `send_prompt`) serialize through a per-session lock so concurrent calls can no longer persist two "active" turns; `ping` is a reserved control frame that bypasses the data-concurrency cap; data-handler fanout is bounded (excess rejected as `server_busy`); `writeLine` failures are terminal instead of poisoning the write chain; and EOF drains in-flight handlers under a bounded timeout before returning.
+- Prevented best-effort coordinator runtime-state persistence from surfacing unhandled rejections when a session root disappears during teardown, preserved public-safe coordinator errors including bounded-concurrent handler failures, bound tmux GC pruning to the collected native session identity and owner generation so same-name replacements are never removed, and preserved subsecond ordering between canonical verdict artifacts and their evidence receipts (#1938).
+- The `browser` `close`/`close all` tool now enforces one end-to-end deadline (the existing `timeout` option, default 30s) across the whole teardown chain — `releaseAllTabs`, `waitForClosed`, `worker.terminate()`, and `releaseBrowser()`/`disposeBrowserHandle()` — so an externally CDP-connected target dying mid-close can no longer hang or terminate the calling agent session. Steps that exceed the shared budget are detached best-effort with their rejections swallowed (no unhandled rejections, no worker/browser/tab registry leaks, timers cleaned up); the tool always settles with a close count or a structured error, and normal live-target close semantics are unchanged (#2027).
+- Pre-prompt context estimates now anchor on the last successful assistant's total usage (input + cache + output) instead of prompt-only tokens, and skip error/aborted turns when picking the anchor, so a large-reasoning turn (e.g. GPT-5.6 Sol at high efforts) no longer vanishes from the estimate right before the next request. The compaction token-correction ratio likewise no longer counts the anchor assistant's own output in its heuristic denominator, since that output was the anchored request's response rather than part of its prompt.
+- The coordinator MCP tmux owner-server probe (`probeServer`: `tmux list-sessions` plus a portable `ps` incarnation read) now tolerates transient spawn failures. Under load a momentary `Bun.spawn` failure (e.g. `EAGAIN`, or a brief tmux/`ps` hiccup) threw straight out of the probe, and because `proveCoordinatorOwnerServer` only retries on non-safe *state* — not on a thrown exception — a single blip aborted the whole delegate immediately with `coordinator_tmux_owner_server_unverifiable` (a ~0.03s hard failure). The probe now surfaces a transient failure as an `unverifiable` state so the existing bounded retry loop can re-probe once it clears; owner isolation is unchanged (`unverifiable` still fails closed, creating no session).
+- Coordinator-created tmux sessions now require an immutable, launch-bound runtime readiness marker before any prompt keys are injected, preventing early input races and preserving recoverable readiness-timeout evidence (#2009).
+- Unsent-context token estimates are now script-aware (CJK characters charged near 1 token/char instead of chars/4), and the per-message delta estimate is no longer cached: the compaction-threshold decision always recomputes from current content, so an in-place mutation (e.g. a same-length ASCII→CJK edit) can never gate the threshold with a stale 4x-undercounted estimate.
+- Capability-gated controlled ask delivery per connection: clients default-deny until they negotiate `ask_controls_v1`, renegotiate after reconnect, and receive the additive non-actionable `action_unavailable` frame instead of stripped option buttons when non-capable (#2029).
+- `NotificationServer#pushFrame` now rejects `ActionNeeded` frames; emit asks and idle notifications through `registerAsk` / `noteIdle` so controlled asks remain capability-gated per connection (#2029).
+- A rolling/in-place upgrade that left a still-live pre-upgrade Telegram daemon owning the lock is now reloaded instead of silently attached. The old daemon speaks the pre-#1999 wire protocol without ask-ack/controls, so its `Selected!` acknowledgements were dropped; an operational `DAEMON_GENERATION` (tied to `NOTIFICATION_PROTOCOL_VERSION`) now flags a fresh live owner running an older generation as reload-required, and the new host registers its session root then hands off through the cooperative SIGTERM/control path (#2028).
+- A numeric gate reply is an option index: an out-of-range index is no longer accepted as free-text `Other`. `mapAnswerToGate` returns a discriminated result and the unattended handler closes the exact claim/receipt and reissues instead of durably accepting or emitting a `Selected!` ack; the JSON-string free-text path is preserved (#2030).
+
+## [0.9.6] - 2026-07-10
+### Changed
+
+- Moved the `codex-eco`/`codex-medium`/`codex-pro` presets and the `opus-codex`/`codex-opencodego`/`fable-opus-codex` combo presets from `gpt-5.5` onto the GPT-5.6 tier family: Sol drives `default` and `architect` on every codex preset (eco `sol:medium`, medium `sol:high`, pro `sol:xhigh`/`sol:max`), with Luna/Terra covering the lighter executor/planner/critic roles by tier.
+### Fixed
+
+- Corrected launch-update guidance: only recognized Bun global installs, recognized Windows npm installs, and supported bundled-installer binaries may use `gjc update`; source checkouts and dev links must use their checkout workflow, while unrecognized package-manager or PATH installs must use their original update method. Successful updates require authoritative post-update version and smoke verification.
+
+### Fixed
+
+- Fixed v0.9.3–v0.9.6 compiled release binaries crashing at first real launch with `Cannot find module '/$bunfs/root/node_modules/handlebars/lib/index.js'` while `--version`/`--help` still worked (#1939). `--minify` silently dropped the handlebars bunfs extra entrypoint; handlebars is now bundled through a statically-traceable `require("handlebars")` in `@gajae-code/utils` prompt rendering (still lazy at runtime), and the fragile extra entrypoint is gone from both release and dev compile args. `--minify` and its startup-RSS win are retained.
+
+## [0.9.5] - 2026-07-09
+### Fixed
+
+- ACP permission prompts now honor `clientCapabilities._meta.gjc.permissionHandling` and the `GJC_ACP_PERMISSION_MODE` fallback, so `auto` and `always-allow` no longer emit `session/request_permission` calls while invalid values fail safely to `prompt`.
+- Model selector batch assignments ("Set for all role agents" / "Set for all targets") now open the reasoning-effort menu whenever any batch target requires an explicit choice (e.g. Anthropic reasoning models like `claude-fable-5`), and the chosen effort plus the full batch survive the menu. Previously the menu never appeared for Anthropic models (silently persisting `:off` selectors for every role agent), and for OpenAI/Codex models picking an effort collapsed the batch to a DEFAULT-only assignment.
+### Added
+
+- ACP clients now receive GJC automatic-compaction start/end state through additive `session_info_update` metadata, including the compaction action, trigger, retry/abort/error outcome, and busy-to-idle phase transitions.
+
+## [0.9.4] - 2026-07-09
+### Fixed
+
+- `RpcClient.onSessionEvent()` now exposes the full renderer-facing agent-wire event stream instead of dropping non-core session events such as notices, todo reminders, retry events, subagent steering, thinking-level changes, and goal updates, while `onEvent()` remains the filtered legacy `AgentEvent` subscription path.
+- Clarified `/session delete` help, confirmation, and completion wording to specify current vs. selected session transcript/artifact deletion and that other sessions plus topic/history metadata are not removed (#1913).
+- Home screen build labels now come from install/build metadata, so release binaries and package installs no longer show a misleading dev build label (#1911).
+
+## [0.9.3] - 2026-07-09
+
+### Fixed
+
+- Stabilized hotfix release checks by making generated docs lazy-load verification independent of Bun's module cache, preserving the docs index sync gate, and polling coordinator MCP watch reconciliation for runtime prompt acknowledgements.
+- Updated macOS-specific queue shortcut and clipboard-temp image paste tests to match the shipped runtime behavior.
+
+## [0.9.2] - 2026-07-09
+### Added
+
+- Added `gjc --credential <selector>` for pinning a stored provider credential by `email:`, `id:`, `account:`, `project:`, or `provider/email:` during a session.
+- Added `--mpreset <profile>` support to Telegram `/session_create`, forwarding both `--mpreset <name>` and `--mpreset=<name>` as split argv to the spawned GJC child.
+- Added the built-in `skill_discovery` tool for runtime discovery of custom project/user skills without injecting the full skill catalog into the core prompt.
+- Pasting or drag-dropping a path to an existing image file now attaches the image and inserts an `[image N]` placeholder, including quoted paths, `file://` URIs, `~/` expansion, spaces, and macOS screenshot narrow no-break spaces.
+- Pasted clipboard-temp image paths now attach as `[image N] source="/path"`, so the model receives both the image payload and the retrievable raw temp file path; ordinary saved image paths remain literal prompt text instead of being consumed into opaque placeholders.
+
+### Changed
+
+- The status line (information bar) token-percentage now renders inline within the model segment, right after the reasoning-effort indicator, instead of as a trailing segment at the far end of the line, so the context usage percentage stays grouped with the model it describes. The standalone `context_pct` segment was removed from the `default`, `default-usage`, `compact`, `full`, `nerd`, `ascii`, and `custom` presets (it remains available for `minimal` and custom configs); the inline percentage is color-coded by context-usage level, can be disabled per-preset with `segmentOptions.model.showContextPercent: false`, and is auto-suppressed when a standalone `context_pct` segment is also active so the value is never shown twice.
+
+### Fixed
+
+- Finalized notification turn mirrors now default to the bounded full-turn cap so Telegram's existing chunked delivery can send long assistant answers instead of receiving an already-truncated 3500-character summary; `GJC_NOTIFICATIONS_TURN_MAX` remains available to lower the cap for summary-style mirrors, and live previews stay capped as one editable message.
+- `gjc --tmux` now wraps the inner GJC command with a durable `tmux-exit.json` marker next to `runtime-state.json`, so a tmux-resident session that exits before normal runtime-state finalization leaves a public-safe exit timestamp/code for silent-vanish diagnosis (#1746).
+- `gjc --tmux` terminal titles now track live tmux session renames while preserving the friendly project/branch title for untouched generated session ids.
+- Telegram session forum-topic renames now remain retryable after a transient `editForumTopic` failure, so topics do not get stuck at the provisional `GJC <session>` name while the daemon incorrectly records the final title locally.
+- `/effort` selector choices now show the current reasoning effort and mirror `/model` by asking whether to apply the selected effort for the current session or save it as the default, including support for persisting `off`. Default model presets also sync their encoded effort into the persisted effort default so later `/effort` defaults are not overwritten on restart.
+- Composer queue submissions (`Alt+Q` / `app.message.queue`) force one-at-a-time follow-up delivery, including replay after compaction, without disabling broader batch mode for other follow-up callers.
+- `--credential` now rejects a missing selector immediately instead of falling through into session launch with no output.
+- `gjc-session` prompt/monitor postmortem helpers now work on macOS's system Bash/Python, so missing tmux sessions write the public-safe `vanished.json` marker and prompt injection exits through the guarded refusal path.
+
+## [0.9.1] - 2026-07-08
+
+### Added
+
+- Added `/effort` to show or set the current model reasoning effort, including a selector UI when run without arguments and validation for invalid effort names.
+- Added `--mpreset <profile>` option to the Telegram `/session_create` command, allowing users to specify a model profile preset when creating a session remotely (e.g. `/session_create path /repo --mpreset codex-eco`). Both `--mpreset <name>` and `--mpreset=<name>` forms are supported.
+- Pasting or drag-dropping a path to any existing image file into the interactive editor now attaches the image and inserts an `[image N]` placeholder instead of leaving the raw path in the prompt. Quoted paths, `file://` URIs, `~/` expansion, spaces, and macOS screenshot narrow no-break spaces are handled when the whole paste is a single supported image file.
+- Added `GJC_NOTIFY=off` as a per-run completion-notification opt-out.
+- Telegram mirror messages now render as native Bot API 10.1 rich messages on by default with a global `/rich on|off` toggle, while failing closed to the previous HTML path.
+
+### Changed
+
+- Upgraded the Extragoal review template with a stronger reviewer lane and optional maximalist N-of-N review recipe.
+- Added `--mpreset <profile>` option to the Telegram `/session_create` command, allowing users to specify a model profile preset when creating a session remotely (e.g. `/session_create path /repo --mpreset codex-eco`). Both `--mpreset <name>` and `--mpreset=<name>` forms are supported. The preset is passed as a regular `--mpreset` CLI flag to the spawned `gjc` child, where the existing `applyStartupModelProfiles` flow activates it.
+- Added the built-in `skill_discovery` tool for runtime discovery of custom project `.gjc/skills` and user `~/.gjc/skills` without injecting the full skill catalog into the core prompt; selected discovered skills are loaded narrowly through the existing `skill` invocation path (#1815).
+- Pasting or drag-dropping a path to any existing image file into the interactive editor now attaches the image and inserts an `[image N]` placeholder instead of leaving the raw path in the prompt. Previously this only worked for clipboard temp files (`/tmp/clipboard-*` or `/var/folders/xx/yy/T/clipboard-*`); terminal drag-drop paths — including shell-escaped spaces and the U+202F narrow no-break space in macOS screenshot names — pasted as long raw path text. Quoted paths, `file://` URIs (decoded via Node's `fileURLToPath` semantics, including Windows drive-letter, `file://localhost`, and UNC forms), and `~/` expansion are handled; the whole paste must be a single path to an existing image file whose content carries a supported image signature (PNG/JPEG/GIF/WEBP), so prose containing paths and non-image files with image-looking extensions are inserted unchanged. When attachment still fails (unsupported content, oversized image, load error), the original pasted text is replayed into the editor instead of being consumed.
+
+### Fixed
+- Composer queue submissions (`Alt+Q` / `app.message.queue`) now force one-at-a-time follow-up delivery for those queued prompts, including replay after compaction, so they do not collapse into one batched model call even when the broader follow-up mode is set to `all`.
+
+- `gjc team` on Windows/psmux now targets the GJC-managed leader session by name instead of trusting the inherited `TMUX_PANE`.
+- Kitty inline images no longer duplicate/stack or paint over transcript text when the diff renderer repaints the image line.
+- Session creation now forwards `--mpreset` as split argv instead of one combined argument.
+- The RPC server restores the duplicate-listen boundary error instead of masking it.
+- Mac Option+Enter no longer collides with the queue-message binding.
+- Telegram completion notifications suppress dot-only messages, and Telegram-originated input is shown immediately and recorded in prompt history.
+- The computer red-team CI gate avoids false positives from non-computer-control changes.
+
+## [0.9.0] - 2026-07-07
+### Added
+
+- Added `/quit` as an alias of the `/exit` slash command, so the near-universal REPL/CLI quit verb shuts the session down instead of silently falling through to the model as a chat message. Like `/exit` it is a TUI-only shutdown: it is not advertised to ACP clients and is not listed as its own autocomplete/help entry.
+- Added a `/clear` slash command that clears the active conversation context while preserving the current session id and durable session history (#1677).
+- Added an Extragoal local skill template (`docs/extragoal-skill-template.md`) documenting an external final review gate on top of `ultragoal` — a fresh-context, cross-family, tool-restricted read-only reviewer with a machine-parsable verdict contract, mandatory bundle secret scan, prompt-injection stance, explicit findings triage, and a bounded re-sign loop — plus a `reviewer` stance profile and cross-session review-gate recipe in `docs/multi-vendor-profiles.md`, pinned by `test/extragoal-template.test.ts`.
+- Added opt-in live turn streaming to the notifications surface. With `GJC_NOTIFICATIONS_STREAM=1` the session WebSocket now emits throttled non-finalized `turn_stream` frames (each carrying a per-turn `messageRef`) as the assistant message streams, and the Telegram threaded daemon edits ONE message in place — via `editMessageText` keyed by `(session, coalesceKey)` — so the finalized text lands on the same message instead of posting a new one. Off by default; without a `messageRef` finalized turns keep their legacy one-message-per-turn behaviour. Throttle interval is `GJC_NOTIFICATIONS_STREAM_INTERVAL_MS` (default 500ms); streamed frames remain suppressed under redaction.
+- Added `GJC_NOTIFICATIONS_TURN_MAX` to raise the finalized `turn_stream` text cap (default 3500 chars, unchanged) so full long turns reach split-capable clients — the Telegram daemon already fans a long finalized turn across multiple messages via `splitTelegramHtml` — instead of being truncated with an ellipsis at the notification layer. The value is clamped to a finite `[280, 40000]` range: a non-finite or non-positive value (unset, `NaN`, `Infinity`, `<= 0`) falls back to the default, so the cap can never be unbounded. Opt-in and off by default (mirror stays a glanceable per-turn summary); live in-progress frames are intentionally NOT raised so a streaming turn stays one editable preview message rather than fanning across sends.
+
+### Fixed
+- Composer-pasted images now follow the visible `[image N]` placeholders at submit time, so deleting a pasted image placeholder with Backspace removes that attachment instead of still sending it to the model or Telegram session mirrors.
+
+- Stopped the Hindsight memory backend from injecting stale public-memory-tool guidance into the system prompt. `hindsight/backend.ts`'s `STATIC_INSTRUCTIONS` still instructed the model to "Use `recall`/`retain`/`reflect`", but those tools were removed from the public surface in #341 — they are unregistered in `BUILTIN_TOOLS`/`HIDDEN_TOOLS` and not discoverable — so every Hindsight-backed session advertised three uncallable tools in its injected `# Memory` block. #341 cleaned the local-memory prompts, public docs, and tool registry but never touched the Hindsight backend's own injected block, and its `public-memory-tool-surface.test.ts` guard list omitted `backend.ts`, so the drift went unnoticed. The block now describes the automatic recall/retain lifecycle instead of naming tools, and the regression test now guards `hindsight/backend.ts`.
+- Task subagent output-ID allocation now reserves numeric prefixes from `.jsonl` session artifacts and `.patch` sidecars as well as final `.md` outputs, preventing resumed or partial subagent runs from reusing an existing artifact stem (#1733).
+- Restored `/changelog` as a built-in slash command, including autocomplete and `/changelog --full`/`/changelog full`, so the What's New prompt no longer points at a missing command.
+- Corrected the Extragoal template's read-only enforcement claim: the `--tools` allowlist governs the built-in tool surface, while the runtime injects the session `goal` tool (when `goal.enabled` is on) and `generate_image` (when an image credential exists) beyond it. Because goal's mutating ops persist session mode state, disabling it is now a mandatory gate precondition (`goal.enabled: false` in the review working directory's `.gjc/config.yml`), and reviewer calls outside the allowlist are gate-failing contract violations.
+- Corrected the GJC dogfood template's user-level install instructions (`docs/gjc-dogfood-skill-template.md`): the documented verbatim `cp` wrote to `~/.gjc/skills/`, which is not the user-level scan location (`~/.gjc/agent/skills/`), and left the YAML frontmatter mid-file, so the scan's required `description` never parsed and the installed skill was silently skipped. The template now documents the same frontmatter-first `sed` extraction into the scanned location that the Extragoal template ships with, pinned by `test/gjc-dogfood-template.test.ts`.
+- Reconciled the skill-template docs with review fixes that raced their merges: the Extragoal reviewer now disables the injected `goal` tool via a dedicated gate directory outside the repository (keeping the reviewed checkout clean, per the #1685 review) instead of an untracked in-repo `.gjc/config.yml`; both the Extragoal and dogfood templates document the one-time skill-discovery enablement (`skills.enabled` plus the install-matched `enablePiUser` **or** `enablePiProject` scan — not both, since the project scan opts every future session into repo-local `.gjc/skills` discovery, per the #1704 review); and the Extragoal template test pins the corrected contract strings.
+- Team worker auto-checkpoints now exclude the entire `.gjc/_session-*/` session subtree instead of nine enumerated subdirectories, so extragoal gate receipts and the session activity marker are no longer committed with `--no-verify` and merged into the leader branch on repos that do not gitignore `.gjc/_session-*/`.
+- The Telegram threaded daemon now schedules each split chunk of an oversized message through the shared rate-limit pool: a granted send slot maps to exactly one Bot API send, and continuation chunks are re-queued (one token each) rather than fanned out against a single token. This keeps a long finalized turn (e.g. raised via `GJC_NOTIFICATIONS_TURN_MAX`) within the documented per-chat rate-limit / round-robin fairness invariant instead of bursting many `sendMessage` calls on one slot.
+- `gjc config list`, `gjc config get`, and `gjc config set` now redact secret-like setting paths even when malformed config files store object, array, boolean, or numeric values there; `--show-secrets` remains the explicit unsafe opt-in (#1738).
+- `gjc ultragoal` now fails with a clean CLI error (exit 1, actionable stderr) instead of crashing with an uncaught `SessionResolutionError` stack dump when no session id is resolvable (missing `GJC_SESSION_ID` / `--session-id`), and `gjc ultragoal --help` no longer requires a resolvable session.
+- Local memory consolidation no longer falls back to the registry's first model (which can be a retired model the provider rejects with 404, permanently failing every phase1/phase2 job). When no model role is configured and the session model is not yet resolved, it now prefers the most recently used model before falling back to registry order.
+- `search` no longer fails schema validation when `paths` is omitted; it defaults to searching the working directory, matching the common repo-wide-search intent.
+- Ultragoal validation-batch tests are now hermetic: they previously ran `computeCheckpointChangeSet` against the enclosing repository, so their hardcoded declared change set only covered the branch that introduced them — failing for any contributor branch or dirty checkout that touches other files. They now use a root outside the git work tree with `CI_DEV_CHANGED_PATHS` pinned to the declared paths.
+- Added a discoverable `bisect` tool that hunts down the commit responsible for a regression by driving `git bisect` with a shell predicate (exit `0` = good, `125` = skip, any other non-zero = bad). It validates preconditions (git repo, clean worktree, `good` is an ancestor of `bad`), resolves the worktree top level once and runs every git command, the predicate, and teardown from that repository root (so it is safe even when invoked from a subdirectory that a candidate commit deletes), and always restores the working tree on completion, error, or abort — running `git bisect reset` and then discarding any tracked-file edits the predicate made (`git reset --hard`) so the promised clean teardown holds even when the predicate mutates tracked files (untracked files the predicate creates are left in place and reported, never deleted). It supports an `invert` mode to find the commit that *fixed* a behavior, bounds the search with `maxSteps` and a per-step `stepTimeoutMs` (a timed-out step counts as a skip), and reports the culprit commit with its author, date, subject, changed files, and every revision it tested.
+
+## [0.8.2] - 2026-07-06
 ### Added
 
 - Queued message selector entries can now be reordered with `Ctrl+Up` / `Ctrl+Down`, with `Ctrl+Shift+Up` / `Ctrl+Shift+Down` still accepted when the terminal forwards them, while keeping the current draft intact.
@@ -8,6 +290,9 @@
 - Added `gjc completion inshellisense`, which generates or installs a Fig/withfig-compatible `gjc` completion spec for Microsoft inshellisense without adding inshellisense as a runtime dependency.
 
 ### Fixed
+- `gjc team` packaged binaries now avoid persisting Bun virtual `/$bunfs/...` entrypoints as worker commands, so tmux worker panes launch through a real executable or the `gjc` fallback instead of immediately disappearing (#1661).
+- `computer` now honors `include_screenshot` and `computer.autoScreenshot` by returning bounded post-action screenshots, and batch steps now respect nested per-step `timeout` values.
+- Custom-provider `gpt-5.5` entries without an explicit `contextWindow` now default to the 272K Codex prompt budget unless the provider uses first-party `openai-responses`, so Codex passthrough proxies (e.g. CLIProxyAPI) compact in time instead of dying with `context_length_exceeded` at ~272K while the registry advertises 1M.
 - `telegram_send` now rejects files over Telegram's document upload limit before reading them into memory or handing them to the notification sink.
 - `telegram_send` now rejects file attachments while Telegram notification redaction is enabled, preventing explicit file sends from bypassing the redaction boundary.
 - Telegram notification daemons now persist consumed update ids so threaded replies are not reinjected after a daemon restart replays old `getUpdates` entries.
@@ -17,6 +302,9 @@
 - Telegram daemon autostart now refuses to attach a new session to a live daemon whose persisted bot-token fingerprint or chat id differs from the current settings, and it avoids registering the session root until ownership is trusted so rotated Telegram credentials cannot keep leaking through the old daemon.
 - Skill autocomplete now supports direct skill-name prefixes after prompt text (for example, `please /ra` → `/skill:ralplan`) while keeping bare `/` menus free of skill entries.
 - `gjc --tmux` on native Windows/psmux now keeps the status line and composer pinned to the bottom after viewport redraws by honoring the GJC tmux launch marker as a multiplexer signal even when `$TMUX` is absent.
+- Provider safety refusals (e.g. Anthropic `stop_reason: "refusal"` → `Refusal (<category>): …`, and `sensitive` → `Content flagged by safety filters`) are now classified as terminal retry errors and surface immediately. They previously fell through to the unbounded `"unknown"` retry class, and because a refusal is deterministic for the submitted context, the session looped refusal → retry → refusal forever — resubmitting the full context every `retry.maxDelayMs` and re-billing it as a prompt-cache write whenever the backoff outlived the cache TTL (#1655).
+- Coordinator event watches now wake on runtime sidecar state changes and emit a bounded `turn.acknowledged` event, so a tmux-resident session that accepts a prompt and then vanishes is durably classified as recoverable `tmux_session_missing_after_prompt_acknowledgement` instead of leaving only a watch registration with no terminal verdict (#1496).
+- Raw tmux-resident sessions now persist public-safe runtime state under their `.gjc/_session-*/runtime/runtime-state.json` even when no coordinator sidecar env is present, so post-ack owner exits leave recoverable `process_exit_before_terminal_state` evidence instead of looking like successful cleanup with no durable output (#1496).
 
 - `gjc config list`, `gjc config get`, and `gjc config set` now redact secret-like string settings by default, with `--show-secrets` as an explicit unsafe opt-in.
 
@@ -98,6 +386,9 @@
 ### Changed
 
 - `web_search` latency overhaul: provider hard timeouts are now class-based (pure search APIs 15s, LLM-mediated providers 120s, Kimi 35s aligned to its upstream 30s budget, replacing the uniform 300s ceiling; an explicitly configured `web_search.timeout` still overrides — the schema default no longer reinstalls 300s), DuckDuckGo is fired as a background hedge 3s into a slower primary so a failing primary falls back to an already-settled result, the Gemini 429/5xx retry-delay budget dropped from 5 minutes to 30 seconds, resolved provider chains are cached per AuthStorage for 60s keyed on the credential generation (availability probes skipped on repeat searches; login/logout invalidates immediately), and `WebSearchTool` prewarms the chain at construction. Measured: hung-primary fallback 301s → 15s, slow-failing-primary fallback ~7s → 6s, repeat chain resolution ~26ms → ~0.01ms.
+### Fixed
+
+- Kept the default composer border one cell inside the terminal edge to avoid the right rounded input corner protruding in narrow/macOS terminal renderers.
 
 ## [0.7.10] - 2026-07-02
 ### Added

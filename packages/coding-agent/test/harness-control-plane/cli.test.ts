@@ -173,27 +173,34 @@ async function seedOwnerDiedBeforeFirstPrompt(sessionId: string): Promise<void> 
 }
 
 describe("gjc harness CLI (foundation)", () => {
-	it("test CLI env cleanup removes overlapping created links and preserves pre-existing links", async () => {
+	it("isolates overlapping workspace links and leaves pre-existing repository links untouched", async () => {
 		const fakeRepo = await mkdtemp(path.join(tmpdir(), "harness-cli-env-repo-"));
 		try {
 			const packageDir = path.join(fakeRepo, "packages", "ai");
 			await mkdir(packageDir, { recursive: true });
 			await writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name: "@gajae-code/ai" }), "utf8");
-			const linkPath = path.join(fakeRepo, "node_modules", "@gajae-code", "ai");
+			const repositoryLink = path.join(fakeRepo, "node_modules", "@gajae-code", "ai");
 
 			const first = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
 			const second = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
-			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
-			first.cleanup();
-			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
-			second.cleanup();
-			expect(await Bun.file(linkPath).exists()).toBe(false);
+			const firstLink = path.join(first.env.NODE_PATH!, "@gajae-code", "ai");
+			const secondLink = path.join(second.env.NODE_PATH!, "@gajae-code", "ai");
+			expect(firstLink).not.toBe(secondLink);
+			expect((await lstat(firstLink)).isSymbolicLink()).toBe(true);
+			expect((await lstat(secondLink)).isSymbolicLink()).toBe(true);
+			expect(await Bun.file(repositoryLink).exists()).toBe(false);
 
-			await mkdir(path.dirname(linkPath), { recursive: true });
-			await symlink(packageDir, linkPath, "dir");
+			first.cleanup();
+			expect(await Bun.file(firstLink).exists()).toBe(false);
+			expect((await lstat(secondLink)).isSymbolicLink()).toBe(true);
+			second.cleanup();
+			expect(await Bun.file(secondLink).exists()).toBe(false);
+
+			await mkdir(path.dirname(repositoryLink), { recursive: true });
+			await symlink(packageDir, repositoryLink, "dir");
 			const withPreexistingLink = createHarnessCliEnv(fakeRepo, {} as NodeJS.ProcessEnv);
 			withPreexistingLink.cleanup();
-			expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
+			expect((await lstat(repositoryLink)).isSymbolicLink()).toBe(true);
 		} finally {
 			await rm(fakeRepo, { recursive: true, force: true });
 		}

@@ -45,7 +45,6 @@ export interface PackageManagerUpdateOptions {
 	expectedVersion: string;
 	runInstall: PackageManagerUpdateRunner;
 	verifyInstalledRuntime: (expectedVersion: string) => Promise<InstalledVersionVerification>;
-	printVerificationResult?: (expectedVersion: string) => Promise<void>;
 	printRecoveredVerification?: (expectedVersion: string) => void;
 }
 
@@ -122,8 +121,11 @@ function isPathInDirectory(filePath: string, directoryPath: string): boolean {
 	return isPathInDirectoryLexical(resolvedFile, dirReal);
 }
 
-type PackageManagerTarget = { manager: "npm"; packageName: string };
-type UpdateTarget = { method: "bun" } | { method: "npm"; packageName: string } | { method: "binary"; path: string };
+export type PackageManagerTarget = { manager: "npm"; packageName: string };
+export type UpdateTarget =
+	| { method: "bun" }
+	| { method: "npm"; packageName: string }
+	| { method: "binary"; path: string };
 
 type PathPlatform = NodeJS.Platform;
 type PackageExists = (packageName: string, packageRoot: string) => boolean;
@@ -423,19 +425,6 @@ export function formatVerificationFailureForTest(
 	return formatVerificationFailure(result, expectedVersion);
 }
 
-/**
- * Print post-update verification result.
- */
-async function printVerification(expectedVersion: string): Promise<void> {
-	const result = await verifyInstalledRuntime(expectedVersion);
-	if (result.ok) {
-		printSuccessfulVerification(expectedVersion);
-		return;
-	}
-	console.log(chalk.yellow(`\nWarning: ${formatVerificationFailure(result, expectedVersion)}`));
-	console.log(chalk.yellow(formatManualUpdateInstructions()));
-}
-
 async function unlinkIfExists(filePath: string): Promise<void> {
 	try {
 		await fs.promises.unlink(filePath);
@@ -499,6 +488,14 @@ function formatPackageManagerInstallFailure(
 	return `${managerName} install failed with exit code ${result.exitCode ?? "unknown"}${outputSuffix}. ${formatVerificationFailure(verification, expectedVersion)}`;
 }
 
+function formatPackageManagerVerificationFailure(
+	managerName: string,
+	verification: InstalledVersionVerification,
+	expectedVersion: string,
+): string {
+	return `${managerName} install exited successfully, but the selected ${APP_NAME} runtime failed verification: ${formatVerificationFailure(verification, expectedVersion)}`;
+}
+
 export async function runPackageManagerUpdateForTest(
 	options: PackageManagerUpdateOptions,
 ): Promise<InstalledVersionVerification> {
@@ -508,8 +505,14 @@ export async function runPackageManagerUpdateForTest(
 async function updateViaPackageManager(options: PackageManagerUpdateOptions): Promise<InstalledVersionVerification> {
 	const result = await options.runInstall(options.expectedVersion);
 	if (result.exitCode === 0) {
-		await (options.printVerificationResult ?? printVerification)(options.expectedVersion);
-		return await options.verifyInstalledRuntime(options.expectedVersion);
+		const verification = await options.verifyInstalledRuntime(options.expectedVersion);
+		if (!verification.ok) {
+			throw new Error(
+				formatPackageManagerVerificationFailure(options.managerName, verification, options.expectedVersion),
+			);
+		}
+		printSuccessfulVerification(options.expectedVersion);
+		return verification;
 	}
 
 	const verification = await options.verifyInstalledRuntime(options.expectedVersion);
@@ -552,31 +555,107 @@ async function updateViaNpm(packageName: string, expectedVersion: string): Promi
 }
 
 /**
- * Download a release binary to a target path, replacing an existing file.
+ * Flush a freshly written file's data to stable storage.
+ *
+ * Critical on network filesystems (e.g. NFS home directories): `pipeline`
+ * resolving does not guarantee the downloaded bytes are durable on the
+ * server, so the post-install `gjc --version` check can exec a binary whose
+ * pages are not yet consistent. The child then faults, the version check
+ * fails, and the update is rolled back with "could not verify updated
+ * version" even though the download itself succeeded. Explicitly fsyncing
+ * before the rename/exec avoids the race.
  */
-async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
-	const binaryName = getBinaryName();
-	const url = buildReleaseBinaryUrl(expectedVersion);
+async function fsyncFile(filePath: string): Promise<void> {
+	const handle = await fs.promises.open(filePath, "r+");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
 
-	const tempPath = `${targetPath}.new`;
-	const backupPath = `${targetPath}.bak`;
-	console.log(chalk.dim(`Downloading ${binaryName}…`));
+export async function fsyncFileForTest(filePath: string): Promise<void> {
+	return fsyncFile(filePath);
+}
 
+/**
+ * Download a release binary to a temp path, throwing a friendly error when the
+ * release asset cannot be fetched.
+ */
+async function downloadBinaryTo(url: string, tempPath: string, binaryName: string): Promise<void> {
 	const response = await fetch(url, { redirect: "follow" });
 	if (!response.ok || !response.body) {
 		throw new Error(formatBinaryDownloadFailureMessage(binaryName, url, response.statusText || response.status));
 	}
 	const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
 	await pipeline(response.body, fileStream);
+}
 
-	console.log(chalk.dim("Installing update..."));
-	const verification = await replaceBinaryForUpdate({
+/** Injectable steps of the binary update flow (seams for testing ordering). */
+export interface BinaryUpdateFlow {
+	download(url: string, tempPath: string): Promise<void>;
+	fsync(filePath: string): Promise<void>;
+	replace(options: BinaryReplacementOptions): Promise<InstalledVersionVerification>;
+	verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification>;
+	/** Best-effort cleanup of the temp file when the flow aborts before replace. */
+	removeTemp?(filePath: string): Promise<void>;
+	/** Called once fsync has succeeded, right before replacement begins. */
+	beforeReplace?(): void;
+}
+
+/**
+ * Orchestrate download → fsync → replace → verify with a strict ordering
+ * contract: the downloaded temp binary MUST be flushed to stable storage
+ * before it is published (renamed into place) or exec'd for verification.
+ *
+ * If fsync fails the temp bytes are not durable, so we abort before
+ * replacement/verification and clean up the temp file rather than installing a
+ * possibly-truncated binary.
+ */
+export async function runBinaryUpdateFlow(
+	targetPath: string,
+	url: string,
+	expectedVersion: string,
+	flow: BinaryUpdateFlow,
+): Promise<InstalledVersionVerification> {
+	const tempPath = `${targetPath}.new`;
+	const backupPath = `${targetPath}.bak`;
+
+	await flow.download(url, tempPath);
+	try {
+		await flow.fsync(tempPath);
+	} catch (err) {
+		if (flow.removeTemp) await flow.removeTemp(tempPath);
+		throw err;
+	}
+
+	flow.beforeReplace?.();
+	return flow.replace({
 		targetPath,
 		tempPath,
 		backupPath,
 		expectedVersion,
-		verifyInstalledVersion: verifyInstalledRuntime,
+		verifyInstalledVersion: flow.verifyInstalledVersion,
 	});
+}
+
+/**
+ * Download a release binary to a target path, replacing an existing file.
+ */
+async function updateViaBinaryAt(targetPath: string, expectedVersion: string): Promise<void> {
+	const binaryName = getBinaryName();
+	const url = buildReleaseBinaryUrl(expectedVersion);
+	console.log(chalk.dim(`Downloading ${binaryName}…`));
+
+	const verification = await runBinaryUpdateFlow(targetPath, url, expectedVersion, {
+		download: (downloadUrl, tempPath) => downloadBinaryTo(downloadUrl, tempPath, binaryName),
+		fsync: fsyncFile,
+		replace: replaceBinaryForUpdate,
+		verifyInstalledVersion: verifyInstalledRuntime,
+		removeTemp: unlinkIfExists,
+		beforeReplace: () => console.log(chalk.dim("Installing update...")),
+	});
+
 	printVerifiedVersion(expectedVersion);
 	if (verification.cleanupWarning) console.warn(chalk.yellow(verification.cleanupWarning));
 	printRestartGuidance();
@@ -585,16 +664,42 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string): P
 /**
  * Run the update command.
  */
-export async function runUpdateCommand(opts: { force: boolean; check: boolean }): Promise<void> {
+export interface UpdateCommandDependencies {
+	getLatestRelease?: () => Promise<ReleaseInfo>;
+	resolveUpdateTarget?: () => Promise<UpdateTarget>;
+	performUpdate?: (target: UpdateTarget, expectedVersion: string) => Promise<void>;
+	refreshInstalledDefaultSkills?: () => Promise<void>;
+	exit?: (code: number) => never;
+}
+
+async function performUpdate(target: UpdateTarget, expectedVersion: string): Promise<void> {
+	if (target.method === "bun") {
+		await updateViaBun(expectedVersion);
+	} else if (target.method === "npm") {
+		await updateViaNpm(target.packageName, expectedVersion);
+	} else {
+		await updateViaBinaryAt(target.path, expectedVersion);
+	}
+}
+
+export async function runUpdateCommand(
+	opts: { force: boolean; check: boolean },
+	deps: UpdateCommandDependencies = {},
+): Promise<void> {
+	const lookupRelease = deps.getLatestRelease ?? getLatestRelease;
+	const resolveTarget = deps.resolveUpdateTarget ?? resolveUpdateTarget;
+	const update = deps.performUpdate ?? performUpdate;
+	const refreshDefaults = deps.refreshInstalledDefaultSkills ?? refreshInstalledDefaultSkills;
+	const exit = deps.exit ?? process.exit;
+
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 
-	// Check for updates
 	let release: ReleaseInfo;
 	try {
-		release = await getLatestRelease();
+		release = await lookupRelease();
 	} catch (err) {
 		console.error(chalk.red(`Failed to check for updates: ${err}`));
-		process.exit(1);
+		return exit(1);
 	}
 
 	const comparison = compareVersions(release.version, VERSION);
@@ -610,27 +715,17 @@ export async function runUpdateCommand(opts: { force: boolean; check: boolean })
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
 	}
 
-	if (opts.check) {
-		// Just check, don't install
-		return;
-	}
+	if (opts.check) return;
 
-	// Choose update method based on the prioritized gjc binary in PATH
 	try {
-		const target = await resolveUpdateTarget();
-		if (target.method === "bun") {
-			await updateViaBun(release.version);
-		} else if (target.method === "npm") {
-			await updateViaNpm(target.packageName, release.version);
-		} else {
-			await updateViaBinaryAt(target.path, release.version);
-		}
+		const target = await resolveTarget();
+		await update(target, release.version);
 	} catch (err) {
 		console.error(chalk.red(`Update failed: ${err}`));
-		process.exit(1);
+		return exit(1);
 	}
 
-	await refreshInstalledDefaultSkills();
+	await refreshDefaults();
 }
 
 /**

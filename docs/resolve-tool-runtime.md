@@ -8,7 +8,7 @@ This document explains how preview/apply workflows are modeled in coding-agent a
 - [`src/tools/ast-edit.ts`](../packages/coding-agent/src/tools/ast-edit.ts)
 - [`src/extensibility/custom-tools/types.ts`](../packages/coding-agent/src/extensibility/custom-tools/types.ts)
 - [`src/extensibility/custom-tools/loader.ts`](../packages/coding-agent/src/extensibility/custom-tools/loader.ts)
-- [`src/sdk.ts`](../packages/coding-agent/src/sdk.ts)
+- [`src/sdk/session.ts`](../packages/coding-agent/src/sdk/session.ts)
 
 ## What `resolve` does
 

@@ -2,11 +2,26 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createNotificationsExtension } from "../src/notifications/index";
-import { readEndpoint } from "../src/notifications/telegram-reference";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
+import { closeModelCache, getBundledModel } from "@gajae-code/ai";
+import { ModelRegistry } from "../src/config/model-registry";
+import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
+import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
+import { createNotificationsExtension } from "../src/sdk/bus/index";
+import { readEndpoint } from "../src/sdk/bus/telegram-reference";
+import { AgentSession } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
+import { SessionManager } from "../src/session/session-manager";
+import { getAskAnswerSource } from "../src/tools/ask-answer-registry";
+import { cleanupFixtureRoot, registerFixtureRuntime } from "./helpers/fixture-broker-cleanup";
+import {
+	createNotificationFixtureRoot,
+	isolatedNotificationSettings,
+	registerNotificationRuntime,
+} from "./helpers/notification-settings";
 
 /**
- * Regression for "notifications SDK spawns a new session instead of renaming":
+ * Regression for "the SDK notification transport spawns a new session instead of renaming":
  * an in-process session id change (`/new`, plan "approve and execute", fork,
  * resume) emits `session_switch` with a new session id. Previously the
  * notifications runtime was keyed only on `session_start`, so the new id had no
@@ -47,11 +62,13 @@ async function withNotifications<T>(fn: () => Promise<T>): Promise<T> {
 
 function createHarness(prefix: string, initialName: string | undefined = "Original") {
 	const handlers = new Map<string, Handler>();
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
 	const api = {
 		on: (event: string, handler: Handler) => {
 			handlers.set(event, handler);
 		},
-		registerCommand: () => {},
+		registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
+			commands.set(name, command),
 		sendUserMessage: () => {},
 	} as never;
 	createNotificationsExtension(api);
@@ -72,9 +89,10 @@ function createHarness(prefix: string, initialName: string | undefined = "Origin
 		},
 	} as never;
 
-	const notifDir = path.join(cwd, ".gjc", "state", "notifications");
+	const notifDir = path.join(cwd, ".gjc", "state", "sdk");
 	return {
 		handlers,
+		commands,
 		ctx,
 		cwd,
 		notifDir,
@@ -119,7 +137,227 @@ async function startAndConnect(harness: ReturnType<typeof createHarness>): Promi
 	return connectFrames(harness.endpoint());
 }
 
-test("session_switch reuses the existing topic instead of spawning a new session", async () => {
+test("session_switch publishes successor SDK authority only after AgentSession restore commits", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-post-commit-switch-"));
+	const agentDir = path.join(cwd, ".gjc", "agent");
+	const authStorage = await AuthStorage.create(path.join(cwd, "testauth.db"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected bundled model");
+	const currentSessionManager = SessionManager.create(cwd, cwd);
+	const targetSessionManager = SessionManager.create(cwd, cwd);
+	targetSessionManager.appendMessage({ role: "user", content: "restored target message", timestamp: Date.now() });
+	targetSessionManager.appendThinkingLevelChange("low");
+	await targetSessionManager.ensureOnDisk();
+	const targetSessionFile = targetSessionManager.getSessionFile();
+	const targetSessionId = targetSessionManager.getSessionId();
+	await targetSessionManager.close();
+	if (!targetSessionFile) throw new Error("Expected persisted target session");
+
+	const handlers = new Map<string, Handler>();
+	const api = {
+		on: (event: string, handler: Handler) => handlers.set(event, handler),
+		registerCommand: () => {},
+		sendUserMessage: async () => {},
+	} as never;
+	createNotificationsExtension(api);
+	const ctx = { cwd, sessionManager: currentSessionManager } as never;
+	const predecessorSessionId = currentSessionManager.getSessionId();
+	const predecessorEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${predecessorSessionId}.json`);
+	const successorEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${targetSessionId}.json`);
+	let session: AgentSession | undefined;
+	let postCommitObserved = false;
+	const extensionRunner = {
+		hasHandlers: () => false,
+		emit: async (event: { type: string; previousSessionFile?: string }) => {
+			if (event.type !== "session_switch") return;
+			postCommitObserved = true;
+			expect(currentSessionManager.getSessionId()).toBe(targetSessionId);
+			expect(session?.agent.state.messages).toEqual(
+				expect.arrayContaining([expect.objectContaining({ role: "user", content: "restored target message" })]),
+			);
+			expect(session?.thinkingLevel).toBe(ThinkingLevel.Low);
+			expect(fs.existsSync(successorEndpoint)).toBe(false);
+			await handlers.get("session_switch")!(event, ctx);
+		},
+	} as unknown as ExtensionRunner;
+
+	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+	registerFixtureRuntime(cleanup, {
+		key: "auth-storage",
+		requiredOwner: "runtime",
+		dispose: async () => authStorage.close(),
+	});
+	registerFixtureRuntime(cleanup, {
+		key: "model-cache",
+		requiredOwner: "runtime",
+		dispose: async () => void closeModelCache(path.join(cwd, "models.db")),
+	});
+	try {
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: currentSessionManager,
+			settings: isolatedNotificationSettings(agentDir),
+			modelRegistry: new ModelRegistry(authStorage, path.join(cwd, "models.yml")),
+			extensionRunner,
+		});
+		registerNotificationRuntime(cleanup, {
+			key: "post-commit-switch",
+			shutdown: async () => {
+				await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+			},
+			dispose: () => session!.dispose(),
+		});
+		await handlers.get("session_start")!({ type: "session_start" }, ctx);
+		await waitFor(() => fs.existsSync(predecessorEndpoint), 4000, "predecessor endpoint");
+
+		expect(await session.switchSession(targetSessionFile)).toBe(true);
+		expect(postCommitObserved).toBe(true);
+		await waitFor(() => fs.existsSync(successorEndpoint), 4000, "successor endpoint");
+		expect(fs.existsSync(predecessorEndpoint)).toBe(false);
+	} finally {
+		await cleanupFixtureRoot(cleanup);
+		expect(cleanup.entries.get("auth-storage")?.phases.dispose).toBe("verified");
+		expect(cleanup.phases.rootAbsent).toBe("verified");
+	}
+}, 30000);
+
+test("turn.prompt preflight rejection returns a correlated failure without an accepted lifecycle", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-preflight-"));
+	tempDirs.push(cwd);
+	const handlers = new Map<string, Handler>();
+	createNotificationsExtension({
+		on: (event: string, handler: Handler) => handlers.set(event, handler),
+		registerCommand: () => {},
+		sendUserMessage: async () => {
+			throw Object.assign(new Error("submission preflight rejected"), { code: "unavailable" });
+		},
+	} as never);
+	const sessionId = `preflight-${process.pid}-${Date.now()}`;
+	const ctx = {
+		cwd,
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getSessionName: () => "Preflight",
+			getArtifactsDir: () => cwd,
+			getCwd: () => cwd,
+		},
+	} as never;
+	await handlers.get("session_start")!({ type: "session_start" }, ctx);
+	const endpointPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointPath), 4000, "preflight endpoint");
+	const { url, token } = readEndpoint(endpointPath);
+	const frames: Array<Record<string, unknown>> = [];
+	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
+	openSockets.push(ws);
+	ws.addEventListener("message", event => frames.push(JSON.parse(String((event as MessageEvent).data))));
+	await new Promise<void>((resolve, reject) => {
+		ws.addEventListener("open", () => resolve(), { once: true });
+		ws.addEventListener("error", () => reject(new Error("WebSocket error")), { once: true });
+	});
+	ws.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "preflight-request",
+			operation: "turn.prompt",
+			input: { text: "will be rejected" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "preflight-request"),
+		4000,
+		"preflight failure response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "preflight-request")).toMatchObject({
+		ok: false,
+		error: { code: "unavailable", message: "submission preflight rejected" },
+	});
+	ws.send(JSON.stringify({ type: "event_replay", id: "preflight-events", sinceGeneration: 1, sinceSeq: 0 }));
+	await waitFor(
+		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "preflight-events"),
+		4000,
+		"preflight lifecycle replay",
+	);
+	const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "preflight-events");
+	expect((replay?.events as Array<Record<string, unknown>>).some(event => event.kind === "agent_start")).toBe(false);
+	expect((replay?.events as Array<Record<string, unknown>>).some(event => event.kind === "agent_end")).toBe(false);
+	expect((replay?.events as Array<Record<string, unknown>>).some(event => event.kind === "agent_failed")).toBe(false);
+	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+}, 30000);
+
+test("accepted turn.prompt submission failures emit a correlated terminal event", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-prompt-terminal-failure-"));
+	tempDirs.push(cwd);
+	const handlers = new Map<string, Handler>();
+	createNotificationsExtension({
+		on: (event: string, handler: Handler) => handlers.set(event, handler),
+		registerCommand: () => {},
+		sendUserMessage: (_content: unknown, options: { onPreflightAccepted?: () => void } | undefined) => {
+			options?.onPreflightAccepted?.();
+			return Promise.reject(Object.assign(new Error("submission failed after acceptance"), { code: "unavailable" }));
+		},
+	} as never);
+	const sessionId = `terminal-failure-${process.pid}-${Date.now()}`;
+	const ctx = {
+		cwd,
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getSessionName: () => "Terminal failure",
+			getArtifactsDir: () => cwd,
+			getCwd: () => cwd,
+		},
+	} as never;
+	await handlers.get("session_start")!({ type: "session_start" }, ctx);
+	const endpointPath = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointPath), 4000, "terminal failure endpoint");
+	const { url, token } = readEndpoint(endpointPath);
+	const frames: Array<Record<string, unknown>> = [];
+	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
+	openSockets.push(ws);
+	ws.addEventListener("message", event => frames.push(JSON.parse(String((event as MessageEvent).data))));
+	await new Promise<void>((resolve, reject) => {
+		ws.addEventListener("open", () => resolve(), { once: true });
+		ws.addEventListener("error", () => reject(new Error("WebSocket error")), { once: true });
+	});
+	ws.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "terminal-failure-request",
+			operation: "turn.prompt",
+			input: { text: "will fail after acknowledgement" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "terminal-failure-request"),
+		4000,
+		"accepted prompt response",
+	);
+	const response = frames.find(
+		frame => frame.type === "control_response" && frame.id === "terminal-failure-request",
+	) as { result?: { commandId?: string; turnId?: string } };
+	expect(response.result).toMatchObject({ accepted: true });
+	ws.send(JSON.stringify({ type: "event_replay", id: "terminal-failure-events", sinceGeneration: 1, sinceSeq: 0 }));
+	await waitFor(
+		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "terminal-failure-events"),
+		4000,
+		"terminal failure lifecycle replay",
+	);
+	const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "terminal-failure-events");
+	expect(replay?.events).toEqual(
+		expect.arrayContaining([
+			expect.objectContaining({
+				kind: "agent_failed",
+				payload: expect.objectContaining({
+					commandId: response.result?.commandId,
+					turnId: response.result?.turnId,
+					error: { code: "unavailable", message: "submission failed after acceptance" },
+				}),
+			}),
+		]),
+	);
+	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+}, 30000);
+
+test("session_switch rotates SDK authority while preserving topic identity", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
 	try {
@@ -151,7 +389,7 @@ test("session_switch reuses the existing topic instead of spawning a new session
 
 		await handlers.get("session_start")!({ type: "session_start" }, ctx);
 
-		const notifDir = path.join(cwd, ".gjc", "state", "notifications");
+		const notifDir = path.join(cwd, ".gjc", "state", "sdk");
 		const originalEndpoint = path.join(notifDir, `${sid}.json`);
 		await waitFor(() => fs.existsSync(originalEndpoint), 4000, "original endpoint file");
 
@@ -173,35 +411,25 @@ test("session_switch reuses the existing topic instead of spawning a new session
 		const previousSessionFile = path.join(cwd, ".gjc", "agent", "sessions", `ts_${previousSessionId}.jsonl`);
 		await handlers.get("session_switch")!({ type: "session_switch", reason: "new", previousSessionFile }, ctx);
 
-		// No new "session": the new id does NOT get its own endpoint discovery file,
-		// and the original server keeps serving.
 		const newEndpoint = path.join(notifDir, `${sid}.json`);
-		expect(fs.existsSync(newEndpoint)).toBe(false);
-		expect(fs.existsSync(originalEndpoint)).toBe(true);
+		await waitFor(() => fs.existsSync(newEndpoint), 4000, "rotated endpoint file");
+		expect(fs.existsSync(originalEndpoint)).toBe(false);
+		const newFrames = await connectFrames(newEndpoint);
 
-		// The existing topic is renamed: an identity_header with the new title is
-		// re-asserted over the SAME socket (the daemon edits the topic in place).
-		await waitFor(
-			() => frames.some(f => f.type === "identity_header" && f.title === "Renamed Plan"),
-			4000,
-			"identity_header rename frame",
-		);
-
-		// The runtime was re-keyed: events for the NEW id keep flowing over the same
-		// socket. Without the re-key, agent_start would find no runtime and emit nothing.
 		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
 		await waitFor(
-			() => frames.some(f => f.type === "activity" && f.state === "busy" && f.sessionId === sid),
+			() => newFrames.some(f => f.type === "activity" && f.state === "busy" && f.sessionId === sid),
 			4000,
-			"busy activity for new session id",
+			"busy activity for rotated session id",
 		);
+		expect(frames.some(f => f.type === "activity" && f.sessionId === sid)).toBe(false);
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
 	}
 }, 30000);
 
-test("session_switch with missing previousSessionFile is a safe no-op", async () => {
+test("session_switch rotates authority without a previous session file", async () => {
 	await withNotifications(async () => {
 		const harness = createHarness("gjc-notif-switch-missing-prev-");
 		const frames = await startAndConnect(harness);
@@ -213,18 +441,34 @@ test("session_switch with missing previousSessionFile is a safe no-op", async ()
 			{ type: "session_switch", previousSessionFile: undefined },
 			harness.ctx,
 		);
-		await sleep(250);
+		await waitFor(() => fs.existsSync(harness.endpoint(harness.sid)), 4000, "rotated endpoint without prior file");
+		expect(fs.existsSync(originalEndpoint)).toBe(false);
+		const rotatedFrames = await connectFrames(harness.endpoint(harness.sid));
 
-		expect(fs.existsSync(originalEndpoint)).toBe(true);
-		expect(fs.existsSync(harness.endpoint(harness.sid))).toBe(false);
-
-		harness.sid = originalId;
 		await harness.handlers.get("agent_start")!({ type: "agent_start" }, harness.ctx);
 		await waitFor(
-			() => frames.some(f => f.type === "activity" && f.state === "busy" && f.sessionId === originalId),
+			() => rotatedFrames.some(f => f.type === "activity" && f.state === "busy" && f.sessionId === harness.sid),
 			4000,
-			"busy activity for original session id",
+			"busy activity for rotated session id",
 		);
+		expect(frames.some(f => f.type === "activity" && f.sessionId === harness.sid)).toBe(false);
+	});
+}, 30000);
+
+test("session_branch rotates endpoint authority", async () => {
+	await withNotifications(async () => {
+		const harness = createHarness("gjc-notif-branch-");
+		await startAndConnect(harness);
+		const originalId = harness.sid;
+		const originalEndpoint = harness.endpoint(originalId);
+		harness.sid = `branch-${originalId}`;
+
+		await harness.handlers.get("session_branch")!(
+			{ type: "session_branch", previousSessionFile: harness.previousSessionFile(originalId) },
+			harness.ctx,
+		);
+		await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "branched endpoint");
+		expect(fs.existsSync(originalEndpoint)).toBe(false);
 	});
 }, 30000);
 
@@ -253,7 +497,7 @@ test("session_switch with matching previous and current ids is a safe no-op", as
 	});
 }, 30000);
 
-test("session_switch with no runtime for previous id is a safe no-op", async () => {
+test("session_switch starts authority when the previous runtime is absent", async () => {
 	await withNotifications(async () => {
 		const harness = createHarness("gjc-notif-switch-no-runtime-");
 		const missingPrevId = `missing-${harness.sid}`;
@@ -263,19 +507,16 @@ test("session_switch with no runtime for previous id is a safe no-op", async () 
 			{ type: "session_switch", previousSessionFile: harness.previousSessionFile(missingPrevId) },
 			harness.ctx,
 		);
-		await sleep(250);
-
-		expect(fs.existsSync(harness.endpoint(newId))).toBe(false);
+		await waitFor(() => fs.existsSync(harness.endpoint(newId)), 4000, "new endpoint after absent prior runtime");
 	});
 }, 30000);
 
-test("session_switch to unnamed session reuses socket without switch identity frame", async () => {
+test("session_switch to unnamed session rotates the endpoint without a title frame", async () => {
 	await withNotifications(async () => {
 		const harness = createHarness("gjc-notif-switch-unnamed-");
-		const frames = await startAndConnect(harness);
+		await startAndConnect(harness);
 		const originalId = harness.sid;
 		const originalEndpoint = harness.endpoint(originalId);
-		const initialFrameCount = frames.length;
 
 		harness.sid = `switch-b-${originalId}`;
 		harness.name = undefined;
@@ -283,25 +524,24 @@ test("session_switch to unnamed session reuses socket without switch identity fr
 			{ type: "session_switch", previousSessionFile: harness.previousSessionFile(originalId) },
 			harness.ctx,
 		);
-		await sleep(250);
-
-		expect(fs.existsSync(originalEndpoint)).toBe(true);
-		expect(fs.existsSync(harness.endpoint(harness.sid))).toBe(false);
-		expect(frames.slice(initialFrameCount).some(f => f.type === "identity_header")).toBe(false);
+		await waitFor(() => fs.existsSync(harness.endpoint(harness.sid)), 4000, "unnamed rotated endpoint");
+		expect(fs.existsSync(originalEndpoint)).toBe(false);
+		const switchedFrames = await connectFrames(harness.endpoint(harness.sid));
+		expect(switchedFrames.some(f => f.type === "identity_header")).toBe(false);
 
 		await harness.handlers.get("agent_end")!({ type: "agent_end" }, harness.ctx);
 		await waitFor(
-			() => frames.some(f => f.type === "activity" && f.state === "idle" && f.sessionId === harness.sid),
+			() => switchedFrames.some(f => f.type === "activity" && f.state === "idle" && f.sessionId === harness.sid),
 			4000,
-			"idle activity for unnamed switched session id",
+			"idle activity for unnamed rotated session id",
 		);
 	});
 }, 30000);
 
-test("session_switch can chain A to B to C while keeping only the original endpoint", async () => {
+test("session_switch can chain A to B to C with one endpoint authority at a time", async () => {
 	await withNotifications(async () => {
 		const harness = createHarness("gjc-notif-switch-chain-");
-		const frames = await startAndConnect(harness);
+		await startAndConnect(harness);
 		const a = harness.sid;
 		const originalEndpoint = harness.endpoint(a);
 		const b = `switch-b-${a}`;
@@ -313,23 +553,23 @@ test("session_switch can chain A to B to C while keeping only the original endpo
 			{ type: "session_switch", previousSessionFile: harness.previousSessionFile(a) },
 			harness.ctx,
 		);
+		await waitFor(() => fs.existsSync(harness.endpoint(b)), 4000, "session B endpoint");
+		expect(fs.existsSync(originalEndpoint)).toBe(false);
 		harness.sid = c;
 		harness.name = "Session C";
 		await harness.handlers.get("session_switch")!(
 			{ type: "session_switch", previousSessionFile: harness.previousSessionFile(b) },
 			harness.ctx,
 		);
-		await sleep(250);
-
-		expect(fs.existsSync(originalEndpoint)).toBe(true);
+		await waitFor(() => fs.existsSync(harness.endpoint(c)), 4000, "session C endpoint");
 		expect(fs.existsSync(harness.endpoint(b))).toBe(false);
-		expect(fs.existsSync(harness.endpoint(c))).toBe(false);
+		const cFrames = await connectFrames(harness.endpoint(c));
 
 		await harness.handlers.get("agent_start")!({ type: "agent_start" }, harness.ctx);
 		await waitFor(
-			() => frames.some(f => f.type === "activity" && f.state === "busy" && f.sessionId === c),
+			() => cFrames.some(f => f.type === "activity" && f.state === "busy" && f.sessionId === c),
 			4000,
-			"busy activity for twice-switched session id",
+			"busy activity for twice-rotated session id",
 		);
 	});
 }, 30000);
@@ -366,4 +606,46 @@ test("session_switch reason=resume starts a fresh runtime for the resumed sessio
 			"busy activity for resumed session id",
 		);
 	});
+}, 30000);
+
+test("session_switch keeps notification resources inactive until notify on rebinds them to the new id", async () => {
+	const previous = process.env.GJC_NOTIFICATIONS;
+	delete process.env.GJC_NOTIFICATIONS;
+	try {
+		const harness = createHarness("gjc-notif-switch-off-");
+		const originalId = harness.sid;
+		await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+		await waitFor(
+			() => fs.existsSync(harness.endpoint(originalId)),
+			4000,
+			"SDK endpoint while notifications are off",
+		);
+		expect(getAskAnswerSource(originalId)).toBeUndefined();
+		expect(getTelegramFileSink(originalId)).toBeUndefined();
+
+		const newId = `switch-on-${originalId}`;
+		harness.sid = newId;
+		await harness.handlers.get("session_switch")!(
+			{ type: "session_switch", previousSessionFile: harness.previousSessionFile(originalId) },
+			harness.ctx,
+		);
+		await waitFor(() => fs.existsSync(harness.endpoint(newId)), 4000, "rebound SDK endpoint");
+		expect(fs.existsSync(harness.endpoint(originalId))).toBe(false);
+		expect(getAskAnswerSource(originalId)).toBeUndefined();
+		expect(getTelegramFileSink(originalId)).toBeUndefined();
+		expect(getAskAnswerSource(newId)).toBeUndefined();
+		expect(getTelegramFileSink(newId)).toBeUndefined();
+
+		process.env.GJC_NOTIFICATIONS = "1";
+		await harness.commands
+			.get("notify")!
+			.handler("on", { ...(harness.ctx as Record<string, unknown>), ui: { notify: () => {} } });
+		expect(getAskAnswerSource(originalId)).toBeUndefined();
+		expect(getTelegramFileSink(originalId)).toBeUndefined();
+		expect(getAskAnswerSource(newId)).toBeDefined();
+		expect(getTelegramFileSink(newId)).toBeDefined();
+	} finally {
+		if (previous === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = previous;
+	}
 }, 30000);

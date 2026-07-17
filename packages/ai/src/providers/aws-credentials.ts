@@ -23,6 +23,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $env, isEnoent, logger } from "@gajae-code/utils";
+import {
+	type AwsIniFile,
+	classifyAwsProfileCapability,
+	parseAwsIni,
+	readAwsStaticEnvironmentCredentials,
+	resolveAwsCredentialSource,
+} from "./aws-credential-config";
 import type { AwsCredentials } from "./aws-sigv4";
 
 export interface ResolvedCredentials extends AwsCredentials {
@@ -48,7 +55,7 @@ interface CacheEntry {
 const cache: Map<string, CacheEntry> = new Map();
 
 export async function resolveAwsCredentials(opts: CredentialResolveOptions = {}): Promise<ResolvedCredentials> {
-	const profile = opts.profile || $env.AWS_PROFILE || "default";
+	const profile = resolveAwsCredentialSource({ profile: opts.profile }).profile;
 	const region = opts.region || $env.AWS_REGION || $env.AWS_DEFAULT_REGION || "us-east-1";
 	const cacheKey = `${profile}\x00${region}`;
 
@@ -62,7 +69,7 @@ export async function resolveAwsCredentials(opts: CredentialResolveOptions = {})
 
 async function resolveFresh(profile: string, region: string, signal?: AbortSignal): Promise<ResolvedCredentials> {
 	// 1. Environment first — matches the AWS SDK chain order.
-	const envCreds = readEnvCredentials();
+	const envCreds = readAwsStaticEnvironmentCredentials();
 	if (envCreds) return envCreds;
 
 	// 2. Profile (static or SSO).
@@ -81,52 +88,10 @@ async function resolveFresh(profile: string, region: string, signal?: AbortSigna
 	);
 }
 
-function readEnvCredentials(): ResolvedCredentials | undefined {
-	const ak = $env.AWS_ACCESS_KEY_ID;
-	const sk = $env.AWS_SECRET_ACCESS_KEY;
-	if (!ak || !sk) return undefined;
-	const token = $env.AWS_SESSION_TOKEN;
-	return token
-		? { accessKeyId: ak, secretAccessKey: sk, sessionToken: token }
-		: { accessKeyId: ak, secretAccessKey: sk };
-}
-
-// ---------- INI parsing ----------
-
-/** Map of section name -> map of key -> value. Section names are stripped of
- * any leading `profile ` (so `~/.aws/config` aligns with `~/.aws/credentials`). */
-type IniFile = Record<string, Record<string, string>>;
-
-function parseIni(text: string): IniFile {
-	const out: IniFile = {};
-	let current: Record<string, string> | null = null;
-	for (const rawLine of text.split(/\r?\n/)) {
-		const line = rawLine.trim();
-		if (!line || line.startsWith("#") || line.startsWith(";")) continue;
-		if (line.startsWith("[") && line.endsWith("]")) {
-			let name = line.slice(1, -1).trim();
-			if (name.startsWith("profile ")) name = name.slice(8).trim();
-			if (name.startsWith("sso-session ")) name = `sso-session:${name.slice(12).trim()}`;
-			let section = out[name];
-			if (!section) {
-				section = {};
-				out[name] = section;
-			}
-			current = section;
-			continue;
-		}
-		if (!current) continue;
-		const eq = line.indexOf("=");
-		if (eq === -1) continue;
-		current[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
-	}
-	return out;
-}
-
-async function readIniFile(p: string): Promise<IniFile | undefined> {
+async function readIniFile(p: string): Promise<AwsIniFile | undefined> {
 	try {
 		const text = await fs.promises.readFile(p, "utf8");
-		return parseIni(text);
+		return parseAwsIni(text);
 	} catch (err) {
 		if (isEnoent(err)) return undefined;
 		throw err;
@@ -140,9 +105,7 @@ async function readProfileCredentials(
 	region: string,
 	signal: AbortSignal | undefined,
 ): Promise<ResolvedCredentials | undefined> {
-	const home = os.homedir();
-	const credentialsPath = $env.AWS_SHARED_CREDENTIALS_FILE || path.join(home, ".aws", "credentials");
-	const configPath = $env.AWS_CONFIG_FILE || path.join(home, ".aws", "config");
+	const { credentialsPath, configPath } = resolveAwsCredentialSource({ profile });
 
 	const credentialsIni = await readIniFile(credentialsPath);
 	const configIni = await readIniFile(configPath);
@@ -152,22 +115,16 @@ async function readProfileCredentials(
 	const merged: Record<string, string> = { ...(configIni?.[profile] ?? {}), ...(credentialsIni?.[profile] ?? {}) };
 	if (Object.keys(merged).length === 0) return undefined;
 
-	if (merged.aws_access_key_id && merged.aws_secret_access_key) {
-		const out: ResolvedCredentials = {
-			accessKeyId: merged.aws_access_key_id,
-			secretAccessKey: merged.aws_secret_access_key,
-		};
+	const capability = classifyAwsProfileCapability(profile, credentialsIni, configIni);
+	if (capability === "static") {
+		const { aws_access_key_id: accessKeyId, aws_secret_access_key: secretAccessKey } = merged;
+		if (!accessKeyId || !secretAccessKey) return undefined;
+		const out: ResolvedCredentials = { accessKeyId, secretAccessKey };
 		if (merged.aws_session_token) out.sessionToken = merged.aws_session_token;
 		return out;
 	}
-
-	if (merged.sso_account_id && merged.sso_role_name) {
-		return readSsoCredentials(merged, configIni, region, signal);
-	}
-
-	if (merged.credential_process) {
-		return readCredentialProcess(profile, merged.credential_process, signal);
-	}
+	if (capability === "sso") return readSsoCredentials(merged, configIni, region, signal);
+	if (capability === "process") return readCredentialProcess(profile, merged.credential_process, signal);
 
 	return undefined;
 }
@@ -181,7 +138,7 @@ interface SsoCachedToken {
 
 async function readSsoCredentials(
 	profileCfg: Record<string, string>,
-	configIni: IniFile | undefined,
+	configIni: AwsIniFile | undefined,
 	defaultRegion: string,
 	signal: AbortSignal | undefined,
 ): Promise<ResolvedCredentials | undefined> {

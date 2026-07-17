@@ -6,7 +6,7 @@ import type { ImageContent } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import computerDescription from "../prompts/tools/computer.md" with { type: "text" };
-import { resizeImage } from "../utils/image-resize";
+import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { markScreenshotFallbackDirCreatedForGc } from "./computer-gc";
 import type { ToolSession } from "./index";
 import type { OutputMeta } from "./output-meta";
@@ -98,7 +98,7 @@ export interface ComputerScreenshotDetails {
 	scaleY?: number;
 	originX?: number;
 	originY?: number;
-	displayEpoch?: string;
+	displayEpoch?: number;
 	captureId?: string;
 	pngBytes?: number;
 	path?: string;
@@ -144,7 +144,7 @@ type NativeScreenshot = {
 	scaleY?: number;
 	originX?: number;
 	originY?: number;
-	displayEpoch?: string;
+	displayEpoch?: number;
 	captureId?: string;
 };
 
@@ -175,6 +175,7 @@ let controllerFactory: ComputerControllerFactory = createNativeComputerControlle
 let platformOverrideForTests: NodeJS.Platform | undefined;
 let archOverrideForTests: NodeJS.Architecture | undefined;
 const screenshotFallbackDirs = new WeakMap<ToolSession, Promise<string>>();
+const latestScreenshotContexts = new WeakMap<ToolSession, ScreenshotContext>();
 
 const COMPUTER_INLINE_SCREENSHOT_MAX_WIDTH = 1568;
 const COMPUTER_INLINE_SCREENSHOT_MAX_HEIGHT = 1568;
@@ -275,12 +276,24 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 			const timeoutSeconds = clampTimeout("computer", params.timeout);
 			const timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
 			const controller = controllerFactory();
-			// Native ComputerController methods are synchronous and accept no AbortSignal,
-			// so cancellation is honored before dispatch and wait() is bounded by timeoutMs.
+			const deadline = createComputerDeadline(timeoutMs);
 			if (params.action === "batch") {
-				const batchResult = await dispatchBatchComputerActions(controller, params.actions, timeoutMs, hotkey);
+				const batchResult = await dispatchBatchComputerActions(
+					controller,
+					params.actions,
+					timeoutMs,
+					hotkey,
+					latestScreenshotContexts.get(this.session),
+					shouldCapturePostActionScreenshot(params, this.session),
+					Boolean(this.session.settings.get("computer.autoScreenshot")),
+					signal,
+					deadline,
+				);
 				details.steps = batchResult.steps;
-				if (batchResult.screenshot) details.screenshot = batchResult.screenshot;
+				if (batchResult.screenshot) {
+					details.screenshot = batchResult.screenshot;
+					rememberLatestScreenshot(this.session, batchResult.screenshot);
+				}
 				details.status = batchResult.failedStep ? "error" : "success";
 				if (batchResult.failedStep) {
 					details.code = batchResult.failedStep.code;
@@ -307,9 +320,21 @@ export class ComputerTool implements AgentTool<typeof computerSchema, ComputerTo
 							.done()
 					: toolResult(details).text(details.message).done();
 			}
-			const result = await dispatchComputerAction(controller, params, timeoutMs);
+			let result = await dispatchComputerAction(
+				controller,
+				params,
+				deadline,
+				latestScreenshotContexts.get(this.session),
+				signal,
+			);
+			if (shouldCapturePostActionScreenshot(params, this.session)) {
+				result = await captureScreenshot(controller, deadline, signal);
+			}
 			const screenshot = normalizeScreenshot(result);
-			if (screenshot) details.screenshot = screenshot;
+			if (screenshot) {
+				details.screenshot = screenshot;
+				rememberLatestScreenshot(this.session, screenshot);
+			}
 			details.status = "success";
 			details.message = describeComputerSuccess(details);
 			if (screenshot) {
@@ -342,6 +367,10 @@ interface CoordinateBounds {
 	originY?: number;
 }
 
+interface ScreenshotContext extends CoordinateBounds {
+	displayEpoch?: number;
+}
+
 function validatePointerCoordinates(action: string, x: number, y: number, bounds: CoordinateBounds | undefined): void {
 	if (!bounds) return;
 	const minX = bounds.originX ?? 0;
@@ -355,40 +384,187 @@ function validatePointerCoordinates(action: string, x: number, y: number, bounds
 	}
 }
 
+function expectedEpochFromContext(context: ScreenshotContext | undefined): number | undefined {
+	return typeof context?.displayEpoch === "number" &&
+		Number.isFinite(context.displayEpoch) &&
+		context.displayEpoch >= 0
+		? context.displayEpoch
+		: undefined;
+}
+
+function rememberLatestScreenshot(session: ToolSession, screenshot: ComputerScreenshotDetails): void {
+	latestScreenshotContexts.set(session, {
+		widthPx: screenshot.widthPx,
+		heightPx: screenshot.heightPx,
+		originX: screenshot.originX,
+		originY: screenshot.originY,
+		displayEpoch: screenshot.displayEpoch,
+	});
+}
+
+function captureScreenshot(
+	controller: NativeController,
+	deadline: ComputerDeadline | undefined,
+	signal?: AbortSignal,
+): Promise<unknown> {
+	return runComputerOperation(
+		() => {
+			if (!controller.screenshot) missingNativeMethod("screenshot", "screenshot");
+			return controller.screenshot();
+		},
+		deadline,
+		signal,
+	);
+}
+
+function missingNativeMethod(action: string, method: string): never {
+	throw new ToolError(`COMPUTER_UNAVAILABLE: Native ComputerController.${method} is unavailable for ${action}.`, {
+		code: "COMPUTER_UNAVAILABLE",
+	});
+}
+
+function shouldCapturePostActionScreenshot(
+	params: Pick<ComputerParams, "action" | "include_screenshot">,
+	session: Pick<ToolSession, "settings">,
+): boolean {
+	return (
+		params.action !== "screenshot" &&
+		(params.include_screenshot === true || Boolean(session.settings.get("computer.autoScreenshot")))
+	);
+}
+
+interface ComputerDeadline {
+	expiresAtMs: number;
+}
+
+class ComputerTimeoutError extends Error {
+	constructor() {
+		super("Computer action timed out.");
+		this.name = "TimeoutError";
+	}
+}
+
+function createComputerDeadline(
+	timeoutMs: number | undefined,
+	parent?: ComputerDeadline,
+): ComputerDeadline | undefined {
+	const localExpiresAt = timeoutMs && timeoutMs > 0 ? performance.now() + timeoutMs : undefined;
+	const parentExpiresAt = parent?.expiresAtMs;
+	const expiresAtMs =
+		localExpiresAt === undefined
+			? parentExpiresAt
+			: parentExpiresAt === undefined
+				? localExpiresAt
+				: Math.min(localExpiresAt, parentExpiresAt);
+	return expiresAtMs === undefined ? undefined : { expiresAtMs };
+}
+
+function remainingComputerTimeoutMs(deadline: ComputerDeadline | undefined): number | undefined {
+	if (!deadline) return undefined;
+	const remaining = Math.ceil(deadline.expiresAtMs - performance.now());
+	if (remaining <= 0) throw new ComputerTimeoutError();
+	return remaining;
+}
+
+function assertComputerDeadline(deadline: ComputerDeadline | undefined): void {
+	remainingComputerTimeoutMs(deadline);
+}
+
+async function runComputerOperation<T>(
+	operation: () => Promise<T> | T,
+	deadline: ComputerDeadline | undefined,
+	signal?: AbortSignal,
+): Promise<T> {
+	throwIfAborted(signal);
+	const timeoutMs = remainingComputerTimeoutMs(deadline);
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	let removeAbortListener: (() => void) | undefined;
+	const operationPromise = Promise.resolve().then(operation);
+	operationPromise.catch(() => undefined);
+	const guards: Array<Promise<never>> = [];
+	if (timeoutMs !== undefined) {
+		guards.push(
+			new Promise((_, reject) => {
+				timeout = setTimeout(() => reject(new ComputerTimeoutError()), timeoutMs);
+			}),
+		);
+	}
+	if (signal) {
+		guards.push(
+			new Promise((_, reject) => {
+				const onAbort = () => reject(new ToolAbortError());
+				signal.addEventListener("abort", onAbort, { once: true });
+				removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+			}),
+		);
+	}
+	try {
+		const result = await (guards.length > 0 ? Promise.race([operationPromise, ...guards]) : operationPromise);
+		throwIfAborted(signal);
+		assertComputerDeadline(deadline);
+		return result;
+	} finally {
+		if (timeout) clearTimeout(timeout);
+		removeAbortListener?.();
+	}
+}
+
 function dispatchComputerAction(
 	controller: NativeController,
 	params: SingleComputerParams,
-	timeoutMs: number | undefined,
-	bounds?: CoordinateBounds,
-): Promise<unknown> | unknown {
-	// expectedEpoch is undefined until lossless epoch transport lands (follow-up):
-	// the native gate skips the stale-display check when the epoch is absent.
-	switch (params.action) {
-		case "screenshot":
-			return controller.screenshot?.();
-		case "click":
-			validatePointerCoordinates("click", params.x, params.y, bounds);
-			return controller.click?.(undefined, params.x, params.y, params.button ?? "left");
-		case "double_click":
-			validatePointerCoordinates("double_click", params.x, params.y, bounds);
-			return controller.doubleClick?.(undefined, params.x, params.y, params.button ?? "left");
-		case "move":
-			validatePointerCoordinates("move", params.x, params.y, bounds);
-			return controller.move?.(undefined, params.x, params.y);
-		case "drag":
-			validatePointerCoordinates("drag start", params.x, params.y, bounds);
-			validatePointerCoordinates("drag end", params.to_x, params.to_y, bounds);
-			return controller.drag?.(undefined, params.x, params.y, params.to_x, params.to_y, params.button ?? "left");
-		case "scroll":
-			validatePointerCoordinates("scroll", params.x, params.y, bounds);
-			return controller.scroll?.(undefined, params.x, params.y, params.scroll_x, params.scroll_y);
-		case "type":
-			return controller.type?.(undefined, params.text);
-		case "keypress":
-			return controller.keypress?.(undefined, params.keys);
-		case "wait":
-			return controller.wait?.(undefined, capWaitMs(params.ms, timeoutMs));
-	}
+	deadline: ComputerDeadline | undefined,
+	context?: ScreenshotContext,
+	signal?: AbortSignal,
+): Promise<unknown> {
+	const expectedEpoch = expectedEpochFromContext(context);
+	return runComputerOperation(
+		() => {
+			switch (params.action) {
+				case "screenshot":
+					if (!controller.screenshot) missingNativeMethod("screenshot", "screenshot");
+					return controller.screenshot();
+				case "click":
+					validatePointerCoordinates("click", params.x, params.y, context);
+					if (!controller.click) missingNativeMethod("click", "click");
+					return controller.click(expectedEpoch, params.x, params.y, params.button ?? "left");
+				case "double_click":
+					validatePointerCoordinates("double_click", params.x, params.y, context);
+					if (!controller.doubleClick) missingNativeMethod("double_click", "doubleClick");
+					return controller.doubleClick(expectedEpoch, params.x, params.y, params.button ?? "left");
+				case "move":
+					validatePointerCoordinates("move", params.x, params.y, context);
+					if (!controller.move) missingNativeMethod("move", "move");
+					return controller.move(expectedEpoch, params.x, params.y);
+				case "drag":
+					validatePointerCoordinates("drag start", params.x, params.y, context);
+					validatePointerCoordinates("drag end", params.to_x, params.to_y, context);
+					if (!controller.drag) missingNativeMethod("drag", "drag");
+					return controller.drag(
+						expectedEpoch,
+						params.x,
+						params.y,
+						params.to_x,
+						params.to_y,
+						params.button ?? "left",
+					);
+				case "scroll":
+					validatePointerCoordinates("scroll", params.x, params.y, context);
+					if (!controller.scroll) missingNativeMethod("scroll", "scroll");
+					return controller.scroll(expectedEpoch, params.x, params.y, params.scroll_x, params.scroll_y);
+				case "type":
+					if (!controller.type) missingNativeMethod("type", "type");
+					return controller.type(undefined, params.text);
+				case "keypress":
+					if (!controller.keypress) missingNativeMethod("keypress", "keypress");
+					return controller.keypress(undefined, params.keys);
+				case "wait":
+					if (!controller.wait) missingNativeMethod("wait", "wait");
+					return controller.wait(undefined, capWaitMs(params.ms, remainingComputerTimeoutMs(deadline)));
+			}
+		},
+		deadline,
+		signal,
+	);
 }
 
 interface BatchDispatchResult {
@@ -403,21 +579,34 @@ async function dispatchBatchComputerActions(
 	actions: readonly SingleComputerParams[],
 	timeoutMs: number | undefined,
 	hotkey?: string,
+	initialContext?: ScreenshotContext,
+	includeBatchScreenshot = false,
+	autoScreenshot = false,
+	signal?: AbortSignal,
+	deadline?: ComputerDeadline,
 ): Promise<BatchDispatchResult> {
 	const steps: ComputerToolDetails[] = [];
 	let lastScreenshot: ComputerScreenshotDetails | undefined;
 	let lastScreenshotSource: unknown;
-	let bounds: CoordinateBounds | undefined;
+	let context = initialContext;
 	for (const single of actions) {
 		const stepDetails = detailsFromParams(single);
 		try {
-			const result = await dispatchComputerAction(controller, single, timeoutMs, bounds);
+			throwIfAborted(signal);
+			assertComputerDeadline(deadline);
+			const stepTimeoutMs = stepTimeoutFromParams(single, timeoutMs);
+			const stepDeadline = createComputerDeadline(stepTimeoutMs, deadline);
+			let result = await dispatchComputerAction(controller, single, stepDeadline, context, signal);
+			if (single.action !== "screenshot" && (single.include_screenshot === true || autoScreenshot)) {
+				result = await captureScreenshot(controller, stepDeadline, signal);
+			}
+
 			const screenshot = normalizeScreenshot(result);
 			if (screenshot) {
 				stepDetails.screenshot = screenshot;
 				lastScreenshot = screenshot;
 				lastScreenshotSource = result;
-				bounds = screenshot;
+				context = screenshot;
 			}
 			stepDetails.status = "success";
 			stepDetails.message = describeComputerSuccess(stepDetails);
@@ -437,7 +626,17 @@ async function dispatchBatchComputerActions(
 		}
 		steps.push(stepDetails);
 	}
+	if (includeBatchScreenshot) {
+		lastScreenshotSource = await captureScreenshot(controller, deadline, signal);
+		lastScreenshot = normalizeScreenshot(lastScreenshotSource) ?? lastScreenshot;
+	}
 	return { steps, screenshot: lastScreenshot, screenshotSource: lastScreenshotSource };
+}
+
+function stepTimeoutFromParams(params: SingleComputerParams, batchTimeoutMs: number | undefined): number | undefined {
+	if (params.timeout === undefined) return batchTimeoutMs;
+	const timeoutSeconds = clampTimeout("computer", params.timeout);
+	return timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
 }
 
 function detailsFromParams(params: ComputerParams): ComputerToolDetails {
@@ -476,10 +675,14 @@ function normalizeScreenshot(value: unknown): ComputerScreenshotDetails | undefi
 		scaleY: shot.scaleY,
 		originX: shot.originX,
 		originY: shot.originY,
-		displayEpoch: shot.displayEpoch,
+		displayEpoch: normalizeDisplayEpoch(shot.displayEpoch),
 		captureId: shot.captureId,
 		pngBytes: getPngByteLength(shot.png),
 	};
+}
+
+function normalizeDisplayEpoch(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 function fullResolutionImageContentFromNativeResult(value: unknown): ImageContent | undefined {
@@ -498,11 +701,16 @@ async function inlineImageContentFromNativeResult(
 	details: ComputerToolDetails,
 	session: ToolSession,
 ): Promise<ImageContent | undefined> {
+	// Anthropic rejects requests carrying more than 20 images when any image
+	// exceeds 2000px per dimension ("many-image requests"), so gating on bytes
+	// alone is not enough: an in-budget full-resolution capture can still brick
+	// the session once enough screenshots accumulate in history. Always route
+	// through resizeImage (its fast path returns already-small images
+	// untouched) and tell the model how to map coordinates back to the native
+	// screenshot frame when the inline image was scaled.
 	const image = fullResolutionImageContentFromNativeResult(value);
 	if (!image) return undefined;
 	const maxBytes = getInlineScreenshotMaxBytes(session);
-	const originalBytes = Buffer.byteLength(image.data, "base64");
-	if (originalBytes <= maxBytes) return image;
 
 	try {
 		const resized = await resizeImage(image, {
@@ -512,6 +720,8 @@ async function inlineImageContentFromNativeResult(
 			jpegQuality: COMPUTER_INLINE_SCREENSHOT_JPEG_QUALITY,
 		});
 		if (resized.buffer.length <= maxBytes) {
+			const note = formatDimensionNote(resized);
+			if (note) details.message = `${details.message} ${note}`;
 			return { type: "image", data: resized.data, mimeType: resized.mimeType };
 		}
 	} catch {

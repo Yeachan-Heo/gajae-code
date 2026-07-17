@@ -57,6 +57,7 @@ import {
 } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { isFoundryEnabled } from "../utils/foundry";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
@@ -586,15 +587,12 @@ const ANTHROPIC_BUILTIN_TOOL_NAMES = new Set(["web_search", "code_execution", "t
 export const applyClaudeToolPrefix = (name: string, prefixOverride: string = claudeToolPrefix) => {
 	if (!prefixOverride) return name;
 	if (ANTHROPIC_BUILTIN_TOOL_NAMES.has(name.toLowerCase())) return name;
-	const prefix = prefixOverride.toLowerCase();
-	if (name.toLowerCase().startsWith(prefix)) return name;
 	return `${prefixOverride}${name}`;
 };
 
 export const stripClaudeToolPrefix = (name: string, prefixOverride: string = claudeToolPrefix) => {
 	if (!prefixOverride) return name;
-	const prefix = prefixOverride.toLowerCase();
-	if (!name.toLowerCase().startsWith(prefix)) return name;
+	if (!name.startsWith(prefixOverride)) return name;
 	return name.slice(prefixOverride.length);
 };
 
@@ -1325,6 +1323,43 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				| (ToolCall & { partialJson: string })
 			) & { index: number };
 			const blocks = output.content as Block[];
+			const blocksByAnthropicIndex = new Map<number, Block>();
+			// Derive from the ACTUAL request shape, not the option default: the request
+			// only sends `display: "summarized"` on specific paths (adaptive display is
+			// omitted for models where supportsAdaptiveThinkingDisplay is false). Defaulting
+			// to summarized would mislabel raw thinking as a provider-displayable summary.
+			const summarizedThinking =
+				(params.thinking as { display?: AnthropicThinkingDisplay } | undefined)?.display === "summarized";
+			const reasoningBuffers = new WeakMap<object, string>();
+			const getBlockByAnthropicIndex = (anthropicIndex: number) => {
+				const block = blocksByAnthropicIndex.get(anthropicIndex);
+				if (!block) return { block: undefined, contentIndex: -1 };
+				return { block, contentIndex: blocks.indexOf(block) };
+			};
+			const trackBlockByAnthropicIndex = (anthropicIndex: number, block: Block) => {
+				// A duplicate start for an active index is a provider-envelope violation;
+				// finalize the orphaned block so no internal stream fields leak into output.
+				const orphaned = blocksByAnthropicIndex.get(anthropicIndex);
+				if (orphaned) {
+					if (orphaned.type === "toolCall" && orphaned.partialJson.trim()) {
+						orphaned.arguments = parseStreamingJson(orphaned.partialJson);
+					}
+					delete (orphaned as { index?: number }).index;
+					delete (orphaned as { partialJson?: string }).partialJson;
+				}
+				blocksByAnthropicIndex.set(anthropicIndex, block);
+			};
+			const resetOutputForRetry = () => {
+				output.content.length = 0;
+				output.responseId = undefined;
+				output.errorKind = undefined;
+				output.errorStatus = undefined;
+				output.errorMessage = strictFallbackErrorMessage;
+				output.providerPayload = undefined;
+				output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
+				output.stopReason = "stop";
+				firstTokenTime = undefined;
+			};
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
 			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
 			stream.push({ type: "start", partial: output });
@@ -1334,6 +1369,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let providerRetryAttempt = 0;
 			let thinkingRepairAttempted = false;
 			while (true) {
+				// Retries reset output.content; drop stale block correlations from the aborted attempt.
+				blocksByAnthropicIndex.clear();
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
 				const firstEventTimeoutAbortError = new Error(
 					"Anthropic stream timed out while waiting for the first event",
@@ -1342,6 +1379,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				const { requestSignal } = activeAbortTracker;
 				const anthropicRequest = client.messages.create({ ...params, stream: true }, { signal: requestSignal });
 				let streamedReplayUnsafeContent = false;
+				let sawProviderSafetyStop = false;
 
 				try {
 					const {
@@ -1368,6 +1406,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						abortSignal: options?.signal,
 					})) {
 						sawEvent = true;
+						if (sawProviderSafetyStop) {
+							if (event.type === "message_stop") {
+								sawTerminalEnvelope = true;
+							}
+							continue;
+						}
 
 						if (event.type === "message_start") {
 							if (sawMessageStart) {
@@ -1403,6 +1447,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									index: event.index,
 								};
 								output.content.push(block);
+								trackBlockByAnthropicIndex(event.index, block);
 								stream.push({
 									type: "text_start",
 									contentIndex: output.content.length - 1,
@@ -1416,11 +1461,25 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									index: event.index,
 								};
 								output.content.push(block);
+								trackBlockByAnthropicIndex(event.index, block);
+								// Emit thinking_start FIRST so a reasoning item is open before any
+								// summary-start: the Responses SSE encoder only accepts a summary
+								// start when state.open.kind === "reasoning", otherwise the
+								// reasoning_summary_part.added frame is dropped and deltas arrive
+								// out of order.
 								stream.push({
 									type: "thinking_start",
 									contentIndex: output.content.length - 1,
 									partial: output,
 								});
+								if (summarizedThinking) {
+									reasoningBuffers.set(block, "");
+									stream.push({
+										type: "reasoning_summary_start",
+										contentIndex: output.content.length - 1,
+										partial: output,
+									});
+								}
 							} else if (event.content_block.type === "redacted_thinking") {
 								const block: Block = {
 									type: "redactedThinking",
@@ -1428,6 +1487,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									index: event.index,
 								};
 								output.content.push(block);
+								trackBlockByAnthropicIndex(event.index, block);
 							} else if (event.content_block.type === "tool_use") {
 								streamedReplayUnsafeContent = true;
 								const block: Block = {
@@ -1441,6 +1501,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									index: event.index,
 								};
 								output.content.push(block);
+								trackBlockByAnthropicIndex(event.index, block);
 								stream.push({
 									type: "toolcall_start",
 									contentIndex: output.content.length - 1,
@@ -1449,8 +1510,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							}
 						} else if (event.type === "content_block_delta") {
 							if (event.delta.type === "text_delta") {
-								const index = blocks.findIndex(b => b.index === event.index);
-								const block = blocks[index];
+								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "text") {
 									block.text += event.delta.text;
 									stream.push({
@@ -1461,20 +1521,29 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									});
 								}
 							} else if (event.delta.type === "thinking_delta") {
-								const index = blocks.findIndex(b => b.index === event.index);
-								const block = blocks[index];
+								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
 									block.thinking += event.delta.thinking;
-									stream.push({
-										type: "thinking_delta",
-										contentIndex: index,
-										delta: event.delta.thinking,
-										partial: output,
-									});
+									if (summarizedThinking) {
+										const summary = (reasoningBuffers.get(block) ?? "") + event.delta.thinking;
+										reasoningBuffers.set(block, summary);
+										stream.push({
+											type: "reasoning_summary_delta",
+											contentIndex: index,
+											delta: event.delta.thinking,
+											partial: output,
+										});
+									} else {
+										stream.push({
+											type: "thinking_delta",
+											contentIndex: index,
+											delta: event.delta.thinking,
+											partial: output,
+										});
+									}
 								}
 							} else if (event.delta.type === "input_json_delta") {
-								const index = blocks.findIndex(b => b.index === event.index);
-								const block = blocks[index];
+								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "toolCall") {
 									block.partialJson += event.delta.partial_json;
 									block.arguments = parseStreamingJson(block.partialJson);
@@ -1486,17 +1555,16 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									});
 								}
 							} else if (event.delta.type === "signature_delta") {
-								const index = blocks.findIndex(b => b.index === event.index);
-								const block = blocks[index];
+								const { block } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
 									block.thinkingSignature = block.thinkingSignature || "";
 									block.thinkingSignature += event.delta.signature;
 								}
 							}
 						} else if (event.type === "content_block_stop") {
-							const index = blocks.findIndex(b => b.index === event.index);
-							const block = blocks[index];
+							const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 							if (block) {
+								blocksByAnthropicIndex.delete(event.index);
 								delete (block as { index?: number }).index;
 								if (block.type === "text") {
 									stream.push({
@@ -1506,6 +1574,21 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "thinking") {
+									if (summarizedThinking) {
+										const summaryText = reasoningBuffers.get(block) ?? "";
+										const mutable = block as {
+											provenance?: "summary" | "raw" | "mixed";
+											summaryText?: string;
+										};
+										if (mutable.summaryText === undefined) mutable.summaryText = summaryText;
+										if (mutable.provenance === undefined) mutable.provenance = "summary";
+										stream.push({
+											type: "reasoning_summary_end",
+											contentIndex: index,
+											content: summaryText,
+											partial: output,
+										});
+									}
 									stream.push({
 										type: "thinking_end",
 										contentIndex: index,
@@ -1513,7 +1596,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "toolCall") {
-									block.arguments = parseStreamingJson(block.partialJson);
+									if (block.partialJson.trim()) {
+										block.arguments = parseStreamingJson(block.partialJson);
+									}
 									delete (block as { partialJson?: string }).partialJson;
 									stream.push({
 										type: "toolcall_end",
@@ -1525,26 +1610,34 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							}
 						} else if (event.type === "message_delta") {
 							const rawStopReason = event.delta.stop_reason as string | null | undefined;
+							const stopDetails = event.delta.stop_details;
+							const isProviderSafetyStop =
+								rawStopReason === "refusal" || rawStopReason === "sensitive" || stopDetails?.type === "refusal";
 							if (rawStopReason) {
-								output.stopReason = mapStopReason(rawStopReason);
+								output.stopReason = isProviderSafetyStop ? "error" : mapStopReason(rawStopReason);
 								sawTerminalEnvelope = true;
 							}
-							const stopDetails = event.delta.stop_details;
-							if (stopDetails && stopDetails.type === "refusal") {
-								const explanation = stopDetails.explanation?.trim();
-								const category = stopDetails.category;
-								const label = category ? `Refusal (${category})` : "Refusal";
-								output.errorMessage = explanation ? `${label}: ${explanation}` : label;
+							if (isProviderSafetyStop) {
+								sawProviderSafetyStop = true;
+								sawTerminalEnvelope = true;
+								output.stopReason = "error";
+								output.errorKind = "provider_safety_stop";
+								if (stopDetails?.type === "refusal") {
+									const explanation = stopDetails.explanation?.trim();
+									const category = stopDetails.category;
+									const label = category ? `Refusal (${category})` : "Refusal";
+									output.errorMessage = explanation ? `${label}: ${explanation}` : label;
+								} else if (!output.errorMessage) {
+									output.errorMessage =
+										rawStopReason === "refusal"
+											? "Refusal (no details provided)"
+											: "Content flagged by safety filters";
+								}
 							} else if (output.stopReason === "error" && !output.errorMessage) {
-								// Anthropic flagged an error-class stop (refusal / sensitive) without
-								// populating stop_details. Surface the raw reason instead of falling
-								// through to the generic "unknown error" string when we throw below.
-								output.errorMessage =
-									rawStopReason === "refusal"
-										? "Refusal (no details provided)"
-										: rawStopReason === "sensitive"
-											? "Content flagged by safety filters"
-											: `Anthropic stream ended with stop_reason: ${rawStopReason ?? "unknown"}`;
+								// Anthropic flagged an error-class stop without populating stop_details.
+								// Surface the raw reason instead of falling through to the generic
+								// "unknown error" string when we throw below.
+								output.errorMessage = `Anthropic stream ended with stop_reason: ${rawStopReason ?? "unknown"}`;
 							}
 							if (event.usage.input_tokens != null) {
 								output.usage.input = event.usage.input_tokens;
@@ -1587,31 +1680,30 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					break;
 				} catch (streamError) {
 					const streamFailure = activeAbortTracker.getLocalAbortReason() ?? streamError;
+					if (sawProviderSafetyStop) {
+						throw streamFailure;
+					}
 					if (
+						!options?.fallbackManaged &&
 						!disableStrictTools &&
 						firstTokenTime === undefined &&
 						hasStrictAnthropicTools(params) &&
 						isAnthropicStrictGrammarTooLargeError(streamFailure)
 					) {
 						strictFallbackErrorMessage = await finalizeErrorMessage(streamFailure, rawRequestDump);
-						output.errorMessage = strictFallbackErrorMessage;
 						if (providerSessionState) {
 							providerSessionState.strictToolsDisabled = true;
 						}
 						disableStrictTools = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.responseId = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetOutputForRetry();
 						continue;
 					}
 					if (
 						!droppedForcedToolChoice &&
 						firstTokenTime === undefined &&
+						!options?.fallbackManaged &&
 						isSentForcedAnthropicToolChoice(params.tool_choice) &&
 						isForcedToolChoiceUnsupportedError(streamFailure, true)
 					) {
@@ -1634,15 +1726,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						droppedForcedToolChoice = true;
 						params = await prepareParams({ dropForcedToolChoice: true });
 						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.responseId = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetOutputForRetry();
 						continue;
 					}
 					if (
+						!options?.fallbackManaged &&
 						!thinkingRepairAttempted &&
 						firstTokenTime === undefined &&
 						isAnthropicThinkingBlockMutationError(streamFailure)
@@ -1654,15 +1742,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						thinkingRepairAttempted = true;
 						params = await prepareParams({ repairLatestAssistantThinking: true });
 						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.responseId = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetOutputForRetry();
 						continue;
 					}
 					if (
+						!options?.fallbackManaged &&
 						!dropFastMode &&
 						resolveServiceTier(options?.serviceTier, model.provider) === "priority" &&
 						firstTokenTime === undefined &&
@@ -1678,12 +1762,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						dropFastMode = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.responseId = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetOutputForRetry();
 						continue;
 					}
 					const isTransientEnvelopeFailure =
@@ -1705,13 +1784,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					} else {
 						await scheduler.wait(delayMs, { signal: options?.signal });
 					}
-					output.content.length = 0;
-					output.responseId = undefined;
-					output.errorMessage = strictFallbackErrorMessage;
-					output.providerPayload = undefined;
-					output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-					output.stopReason = "stop";
-					firstTokenTime = undefined;
+					resetOutputForRetry();
 				}
 			}
 
@@ -1730,7 +1803,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const firstEventTimeoutError = activeAbortTracker.getLocalAbortReason();
 			output.stopReason = activeAbortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
+			output.transportFailure = transportFailureFacts(error);
+			if (output.errorKind !== "provider_safety_stop" || !output.errorMessage) {
+				output.errorMessage =
+					firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
+			}
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
@@ -2243,7 +2320,11 @@ function buildParams(
 		params.tools = convertTools(
 			context.tools,
 			isOAuthToken,
-			disableStrictTools || model.provider === "github-copilot",
+			// The Claude Code OAuth surface mishandles `strict: true` tools:
+			// streamed tool_use blocks arrive with empty/undefined arguments and
+			// occasionally corrupted names (works with PI_NO_STRICT=1). Never
+			// request strict tool use on OAuth requests.
+			disableStrictTools || isOAuthToken || model.provider === "github-copilot",
 			getAnthropicCompat(model).supportsEagerToolInputStreaming,
 		);
 	}

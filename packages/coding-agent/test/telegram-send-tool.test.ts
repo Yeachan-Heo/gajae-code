@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
-import { registerTelegramFileSink } from "../src/notifications/attachment-registry";
+import { registerTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import type { ToolSession } from "../src/tools";
 import { TelegramSendTool } from "../src/tools/telegram-send";
 

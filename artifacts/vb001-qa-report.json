@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "kind": "package/test-report",
+  "status": "blocked",
+  "e2eStatus": "partial_pass",
+  "redTeamStatus": "blocked",
+  "generatedAt": "2026-07-11",
+  "contractCoverage": [
+    {
+      "ac": "AC1",
+      "verdict": "passed",
+      "evidence": [
+        "bun test test/sdk-removed-ingresses.test.ts: 3 pass, 0 fail; direct --mode rpc, rpc-ui, and bridge invocations each exited 2 and printed the typed removal message plus USAGE.",
+        "bun scripts/verify-gjc-sdk-canonicalization.ts and --self-test: GJC SDK canonicalization verification passed (3 sanctioned server hosts)."
+      ]
+    },
+    {
+      "ac": "AC2",
+      "verdict": "blocked",
+      "evidence": [
+        "bun test test/sdk-host-wiring.test.ts test/sdk-query-pagination.test.ts test/sdk-reverse-rpc.test.ts test/sdk-protocol-conformance.test.ts: 22 pass, 0 fail, 142 assertions. Covers live v3 host replay/query, unknown_operation, tampered cursor invalid_cursor, and expired heartbeat lease_expired.",
+        "cargo test -p gjc-sdk wrong_token_is_rejected: 1 passed; inbound_user_message_wrong_token_is_dropped: 1 passed (0.30s).",
+        "No executed live oversized-frame rejection proof exists. Source inspection found REQUEST_FRAME_BYTES=256 KiB in crates/gjc-sdk/src/query.rs but the WS accept path uses accept_hdr_async without an observed max-message-size guard."
+      ]
+    },
+    {
+      "ac": "AC3",
+      "verdict": "passed",
+      "evidence": [
+        "bun test test/notifications-telegram-daemon.test.ts: 113 pass, 0 fail, 442 assertions.",
+        "bun scripts/generate-telegram-baseline-manifest.ts --check exited 0."
+      ]
+    },
+    {
+      "ac": "AC4",
+      "verdict": "passed",
+      "evidence": [
+        "bun test test/sdk-daemon-cli-e2e.test.ts: validates unknown operation rejected before connection, get_endpoint refused without credential flag, and no endpoint connections for refused operation (10 combined daemon/MCP test passes).",
+        "Direct subprocess: daemon session control live --op config.patch --json-input containing apiToken exited 2 with {code:secret_field_forbidden, message: Secret values must use --json-input-file or --json-input-stdin.}.",
+        "Brokerless live endpoint invocation returned sessions plus warning {code:broker_unavailable, message:Listed endpoint files because the broker is unavailable.}."
+      ]
+    },
+    {
+      "ac": "AC5",
+      "verdict": "not_applicable",
+      "reason": "Phase E scope — deferred per plan/spec"
+    },
+    {
+      "ac": "AC6/G02",
+      "verdict": "passed",
+      "evidence": [
+        "bun test test/sdk-mcp-adapter.test.ts: MCP G02 and prohibited-operation tests assert zero WebSocket sends.",
+        "bun test test/sdk-adapter-dispositions.test.ts --test-name-pattern AD-(M-C01|M-G02|L-C01|L-G02|A-C38): 5 pass, 0 fail, 14 assertions; selected MCP/Daemon-CLI/ACP parity rows exercised real fixture receipts."
+      ]
+    },
+    {
+      "ac": "AC7",
+      "verdict": "passed",
+      "evidence": [
+        "bun scripts/verify-gjc-sdk-rename.ts: GJC SDK rename verification passed.",
+        "bun test test/sdk-downgrade-rollback.test.ts test/sdk-downgrade-unknown-version.test.ts: 3 pass, 0 fail, 23 assertions; rollback test creates a detached worktree at the pinned pre-Phase-B commit and executes its old endpoint reader."
+      ]
+    },
+    {
+      "ac": "AC8",
+      "verdict": "passed",
+      "evidence": [
+        "bun test test/sdk-skills.test.ts test/sdk-workflow-gate-emitter.test.ts test/sdk-operation-matrix.test.ts test/sdk-acp-adapter.test.ts: 13 pass, 0 fail, 1116 assertions; exercises remote skill and workflow-gate operation contracts."
+      ]
+    }
+  ],
+  "surfaceEvidence": [
+    { "surface": "CLI", "command": "bun test test/sdk-removed-ingresses.test.ts", "actualOutput": "3 pass, 0 fail" },
+    { "surface": "SDK live host/protocol", "command": "bun test test/sdk-host-wiring.test.ts test/sdk-query-pagination.test.ts test/sdk-reverse-rpc.test.ts test/sdk-protocol-conformance.test.ts", "actualOutput": "22 pass, 0 fail, 142 expect() calls" },
+    { "surface": "Rust loopback WS", "command": "cargo test -p gjc-sdk wrong_token_is_rejected; cargo test -p gjc-sdk inbound_user_message_wrong_token_is_dropped", "actualOutput": "1 passed; 1 passed" },
+    { "surface": "Telegram", "command": "bun test test/notifications-telegram-daemon.test.ts", "actualOutput": "113 pass, 0 fail" },
+    { "surface": "Daemon-CLI/MCP", "command": "bun test test/sdk-daemon-cli-e2e.test.ts test/sdk-mcp-adapter.test.ts", "actualOutput": "10 pass, 0 fail" },
+    { "surface": "Package", "command": "bun scripts/build-sdk-package-smoke.ts", "actualOutput": "SDK package smoke passed (root: 574, sdk: 39)." }
+  ],
+  "adversarialCases": [
+    { "id": "removed-ingresses", "verdict": "passed", "actualOutput": "rpc, rpc-ui, bridge direct commands: exit 2; typed removal error; USAGE." },
+    { "id": "wrong-token-ws", "verdict": "passed", "actualOutput": "Rust wrong_token_is_rejected and inbound_user_message_wrong_token_is_dropped both passed." },
+    { "id": "unknown-operation", "verdict": "passed", "actualOutput": "SDK host and daemon CLI fixture return unknown_operation before endpoint send." },
+    { "id": "tampered-cursor", "verdict": "passed", "actualOutput": "sdk-query-pagination test passed invalid_cursor assertion." },
+    { "id": "expired-lease-heartbeat", "verdict": "passed", "actualOutput": "sdk-reverse-rpc test passed lease_expired heartbeat assertion." },
+    { "id": "oversized-frame", "verdict": "blocked", "actualOutput": "No live oversized WS frame rejection was executed or evidenced; observed only a 256 KiB query constant, not ingress enforcement." },
+    { "id": "secret-in-argv", "verdict": "passed", "actualOutput": "CLI exited 2 with secret_field_forbidden and did not echo vb001-secret." },
+    { "id": "broker-absent-fallback", "verdict": "passed", "actualOutput": "Brokerless list emitted live endpoint and broker_unavailable fallback warning." },
+    { "id": "mcp-g02-zero-send", "verdict": "passed", "actualOutput": "sdk-mcp-adapter test passed G02 rejection with send count 0." }
+  ],
+  "artifactRefs": [
+    "artifacts/vb001-cli-replay.json",
+    "artifacts/vb001-qa-report.json"
+  ],
+  "blockers": [
+    {
+      "id": "VB001-AC2-OVERSIZED-FRAME",
+      "severity": "high",
+      "description": "The requested oversized-frame adversarial proof is absent. The executed suite proves query/reverse payload bounds but not a live WS ingress rejection. The reviewed Rust accept path did not show a message-size limit.",
+      "attemptedFixes": [
+        "Ran protocol, host-wiring, query pagination, and reverse-lease suites.",
+        "Ran Rust wrong-token live-loopback tests.",
+        "Inspected crates/gjc-sdk/src/query.rs and server.rs to locate an existing oversized-frame test or ingress limit."
+      ]
+    }
+  ]
+}

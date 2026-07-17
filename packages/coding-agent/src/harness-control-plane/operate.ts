@@ -19,7 +19,7 @@ import {
 	type VanishEvidence,
 	validateReceipt,
 } from "./receipts";
-import { type HarnessRpc, singleFlightAccept } from "./rpc-adapter";
+import { type HarnessSessionTransport, singleFlightAccept } from "./session-transport";
 import { writeReceiptImmutable } from "./storage";
 import {
 	DEFAULT_RETRY_BUDGET,
@@ -35,10 +35,10 @@ export interface OperateOptions {
 	sessionId: string;
 	workspace: string;
 	branch: string;
-	rpc: HarnessRpc;
-	/** Factory used to (re)create the RPC subprocess on restart recovery. Defaults to reusing `rpc`. */
-	rpcFactory?: () => HarnessRpc;
-	/** Bounded observation provider (scripted in tests; real = git + rpc state). */
+	transport: HarnessSessionTransport;
+	/** Factory used to recreate an SDK transport on restart recovery. Defaults to reusing `transport`. */
+	transportFactory?: () => HarnessSessionTransport;
+	/** Bounded observation provider (scripted in tests; real = git + SDK session state). */
 	observe: () => Promise<Observation>;
 	/** Real dirty-worktree preservation; injectable for tests. Defaults to git stash/diff capture. */
 	preserve?: (workspace: string) => PreserveResult;
@@ -71,7 +71,7 @@ export async function operate(goal: string, opts: OperateOptions): Promise<Opera
 	const vanishReceiptIds: string[] = [];
 	const blockers: string[] = [];
 
-	let rpc = opts.rpc;
+	let transport = opts.transport;
 
 	const now = (): string => new Date(opts.clock ? opts.clock() : Date.now()).toISOString();
 	let lifecycle: HarnessLifecycle = "started";
@@ -118,7 +118,7 @@ export async function operate(goal: string, opts: OperateOptions): Promise<Opera
 	};
 
 	const submit = async (): Promise<boolean> => {
-		const acc = await singleFlightAccept(rpc, goal, acceptanceTimeoutMs);
+		const acc = await singleFlightAccept(transport, goal, acceptanceTimeoutMs);
 		await emit(acc.accepted ? "info" : "warn", acc.accepted ? "prompt_accepted" : "prompt_not_accepted", {
 			reason: acc.reason,
 		});
@@ -160,11 +160,11 @@ export async function operate(goal: string, opts: OperateOptions): Promise<Opera
 			accepted = await submit();
 		} else if (decision.classification === "restart-clean") {
 			budget.zeroDeltaVanish = Math.max(0, budget.zeroDeltaVanish - 1);
-			rpc = opts.rpcFactory ? opts.rpcFactory() : rpc;
+			transport = opts.transportFactory ? opts.transportFactory() : transport;
 			accepted = await submit();
 		} else if (decision.classification === "restart-preserve-delta") {
 			budget.dirtyVanishPreserve = Math.max(0, budget.dirtyVanishPreserve - 1);
-			rpc = opts.rpcFactory ? opts.rpcFactory() : rpc;
+			transport = opts.transportFactory ? opts.transportFactory() : transport;
 			accepted = await submit();
 		} else if (decision.classification === "fallback-codex-exec") {
 			lifecycle = "blocked";

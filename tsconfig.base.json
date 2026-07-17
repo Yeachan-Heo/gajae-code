@@ -23,7 +23,6 @@
 		"emitDecoratorMetadata": true,
 		"useDefineForClassFields": false,
 		"types": ["bun", "assets"],
-		"typeRoots": ["./types", "./node_modules/@types"],
-		"assumeChangesOnlyAffectDirectDependencies": true
+		"typeRoots": ["./types", "./node_modules/@types"]
 	}
 }

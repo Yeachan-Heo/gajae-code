@@ -38,6 +38,7 @@ import {
 import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { toFirepassWireModelId, toFireworksWireModelId } from "../utils/fireworks-model-id";
 import {
 	type CapturedHttpErrorResponse,
@@ -72,6 +73,7 @@ import {
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
+import { wrapOpenAIFetchForBoundedRateLimits } from "./openai-bounded-rate-limits";
 import { detectOpenAICompat, type ResolvedOpenAICompat, resolveOpenAICompat } from "./openai-completions-compat";
 import {
 	applyOpenAIRequestTransformBody,
@@ -331,6 +333,19 @@ function isCompiledGrammarTooLargeStrictError(
 		/too large/i.test(messageParts)
 	);
 }
+function hasContentFilterSafetyCode(capturedErrorResponse: CapturedHttpErrorResponse | undefined): boolean {
+	const bodyJson = capturedErrorResponse?.bodyJson;
+	if (typeof bodyJson !== "object" || bodyJson === null || Array.isArray(bodyJson)) return false;
+	if (Reflect.get(bodyJson, "code") === "content_filter") return true;
+
+	const error = Reflect.get(bodyJson, "error");
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		!Array.isArray(error) &&
+		Reflect.get(error, "code") === "content_filter"
+	);
+}
 
 // LIMITATION: The think tag parser uses naive string matching for <think>/<thinking> tags.
 // If MiniMax models output these literal strings in code blocks, XML examples, or explanations,
@@ -454,6 +469,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				options?.authCredentialType,
 				options?.requestMaxRetries,
 				options?.sessionId,
+				options?.maxRetryDelayMs,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			getCapturedErrorResponse = captureErrorResponse;
@@ -497,13 +513,18 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				openaiStream = await callWithCopilotModelRetry(() => createCompletionsStream(), {
 					provider: model.provider,
 					signal: requestSignal,
+					fallbackManaged: options?.fallbackManaged,
 				});
 			} catch (error) {
 				const capturedErrorResponse = getCapturedErrorResponse();
 				const sentForcedToolChoice = isForcedToolChoice(
 					(rawRequestDump?.body as { tool_choice?: unknown } | undefined)?.tool_choice,
 				);
-				if (firstTokenTime === undefined && isForcedToolChoiceUnsupportedError(error, sentForcedToolChoice)) {
+				if (
+					!options?.fallbackManaged &&
+					firstTokenTime === undefined &&
+					isForcedToolChoiceUnsupportedError(error, sentForcedToolChoice)
+				) {
 					const reason = await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse);
 					markToolChoiceIncapability(model, "auto", reason);
 					const resolvedToolChoice = resolveToolChoice(model, options?.toolChoice);
@@ -519,6 +540,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					});
 					openaiStream = await createCompletionsStream();
 				} else if (
+					!options?.fallbackManaged &&
 					isOpenRouterAnthropicModel(model) &&
 					!disableStrictTools &&
 					isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
@@ -531,7 +553,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					disableStrictTools = true;
 					openaiStream = await createCompletionsStream("none");
 				} else {
-					if (!shouldRetryWithoutStrictTools(error, capturedErrorResponse, appliedToolStrictMode, context.tools)) {
+					if (
+						options?.fallbackManaged ||
+						!shouldRetryWithoutStrictTools(error, capturedErrorResponse, appliedToolStrictMode, context.tools)
+					) {
 						throw error;
 					}
 					openaiStream = await createCompletionsStream("none");
@@ -718,6 +743,13 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				const calls = kimiHealer.drainCompleted();
 				for (const call of calls) emitHealedToolCall(call);
 			};
+			let providerSafetyStop = false;
+			const markProviderSafetyStop = (errorMessage?: string): void => {
+				providerSafetyStop = true;
+				output.errorKind = "provider_safety_stop";
+				output.stopReason = "error";
+				if (errorMessage) output.errorMessage = errorMessage;
+			};
 
 			for await (const chunk of iterateWithIdleTimeout(openaiStream, {
 				watchdog: firstEventWatchdog,
@@ -749,13 +781,23 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 
 				if (choice.finish_reason) {
 					const finishReasonResult = mapStopReason(choice.finish_reason);
-					output.stopReason = finishReasonResult.stopReason;
-					if (finishReasonResult.errorMessage) {
-						output.errorMessage = finishReasonResult.errorMessage;
+					if (choice.finish_reason === "content_filter") {
+						markProviderSafetyStop(finishReasonResult.errorMessage);
+					} else if (!providerSafetyStop) {
+						output.stopReason = finishReasonResult.stopReason;
+						if (finishReasonResult.errorMessage) {
+							output.errorMessage = finishReasonResult.errorMessage;
+						}
 					}
 				}
 
 				if (choice.delta) {
+					if (typeof choice.delta.refusal === "string" && choice.delta.refusal.length > 0) {
+						appendTextDelta(choice.delta.refusal);
+						if (!providerSafetyStop) {
+							markProviderSafetyStop("Provider returned a safety refusal");
+						}
+					}
 					const normalizedDeltaText = normalizeStreamingContentText(choice.delta.content);
 					if (normalizedDeltaText.length > 0) {
 						if (!firstTokenTime) firstTokenTime = Date.now();
@@ -925,15 +967,20 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 		} catch (error) {
 			for (const block of output.content) delete (block as any).index;
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
+			const capturedErrorResponse = getCapturedErrorResponse?.();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error) ?? getCapturedErrorResponse?.()?.status;
+			output.errorStatus = extractHttpStatusFromError(error) ?? capturedErrorResponse?.status;
+			output.transportFailure = transportFailureFacts(error, capturedErrorResponse);
 			output.errorMessage =
 				firstEventTimeoutError?.message ??
-				(await finalizeErrorMessage(error, rawRequestDump, getCapturedErrorResponse?.()));
+				(await finalizeErrorMessage(error, rawRequestDump, capturedErrorResponse));
 			// Some providers via OpenRouter include extra details here.
 			const rawMetadata = (error as { error?: { metadata?: { raw?: string } } })?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
+			if (hasContentFilterSafetyCode(capturedErrorResponse)) {
+				output.errorKind = "provider_safety_stop";
+			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -956,6 +1003,7 @@ async function createClient(
 	authCredentialType?: OpenAICompletionsOptions["authCredentialType"],
 	requestMaxRetries?: number,
 	sessionId?: string,
+	maxRetryDelayMs?: number,
 ): Promise<{
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -1063,8 +1111,9 @@ async function createClient(
 		},
 		baseFetch.preconnect ? { preconnect: baseFetch.preconnect } : {},
 	);
+	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(wrappedFetch, maxRetryDelayMs);
 	const transformedFetch = wrapFetchForOpenAIRequestTransform(
-		wrappedFetch,
+		boundedFetch,
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);

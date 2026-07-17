@@ -1,0 +1,101 @@
+{
+  "grade": "C",
+  "findings_count": 9,
+  "severity_breakdown": { "P0": 0, "P1": 1, "P2": 4, "P3": 4 },
+  "top_3_leverage": [
+    "Fix argument/template plumbing first: remove or render `{{ARGUMENTS}}` in the deep-interview skill so the core intake/suitability path receives the actual user request.",
+    "Remove dead workflow surfaces and stale aliases in one pass: `plan` skill, `--research-setup`, `gjc sparkshell`, and `team_cleanup` currently point agents at commands/skills that are not implemented in the inspected runtime.",
+    "Make canonical contracts match runtime: document actual deep-interview threshold/mode precedence and the full Ultragoal `executorQa` replay schema so agents can satisfy strict validators without relying on hidden implementation details."
+  ],
+  "positives": [
+    "Ralplan stage names in the SKILL (`planner`, `architect`, `critic`, `revision`, `post-interview`, `adr`, `final`) match `KNOWN_STAGES` in `ralplan-runtime.ts`, and the writer/pending-approval behavior is accurately described.",
+    "The SKILL handoff snippets that write `current_phase:\"handoff\"` align with the SkillTool chain guard and the state runtime's atomic `handoff` verb.",
+    "Core state recovery guidance (`gjc state clear --force --mode <skill>`) matches the implemented state command surface and mode handling.",
+    "Plugin skill references for GJC delegation and GJC session helpers are mostly backed by implementation: coordinator delegate tools/env vars exist, and the session helper scripts/docs are present.",
+    "The Ultragoal `executorQa` section captures the main strict-gate shape: `architectReview`, `executorQa`, `iteration`, live-surface proof, conditional computer-use suite, and matrix fields are broadly consistent with runtime validation."
+  ],
+  "findings": [
+    {
+      "title": "Replace unrendered {{ARGUMENTS}} placeholders in deep-interview",
+      "priority": "P1",
+      "confidence": 0.95,
+      "file_path": "packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+      "line_start": 124,
+      "line_end": 153,
+      "body": "`deep-interview/SKILL.md` still instructs the agent to inspect and parse `{{ARGUMENTS}}` (lines 124 and 153) and ends with `Task: {{ARGUMENTS}}`, but `buildSkillPromptMessage()` does not render skill bodies as templates; it appends the real args only as a footer line `User: <args>` (`packages/coding-agent/src/extensibility/skills.ts:415-421`). As a result, these placeholders reach the model literally and can break the suitability gate and idea parsing. Replace the placeholders with references to the appended `User:` arguments, or intentionally render skill bodies with an args context and test that path."
+    },
+    {
+      "title": "Document the actual deep-interview threshold precedence",
+      "priority": "P2",
+      "confidence": 0.9,
+      "file_path": "packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+      "line_start": 100,
+      "line_end": 107,
+      "body": "The SKILL fallback path says to read only `[$GJC_CONFIG_DIR|~/.gjc]/settings.json` and `./.gjc/settings.json`, with project settings overriding user settings and defaulting to `0.05`. The runtime also checks modern YAML config first (`GJC_CODING_AGENT_DIR/config.yml`, `$GJC_CONFIG_DIR/agent/config.yml`, or `~/.gjc/agent/config.yml`) before project/user JSON (`deep-interview-runtime.ts:382-415`), and `--quick|--standard|--deep` map to `0.6/0.5/0.35` when no configured threshold exists (`deep-interview-runtime.ts:36-41, 524-550`). Update the SKILL so agents fallback to the same sources and explain the mode thresholds, or change runtime precedence to match the documented contract."
+    },
+    {
+      "title": "Remove the unsupported deep-interview --research-setup branch",
+      "priority": "P3",
+      "confidence": 0.92,
+      "file_path": "packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+      "line_start": 686,
+      "line_end": 686,
+      "body": "The Phase 5 bridge branches on `--research-setup`, but the native command exposes `quick`, `standard`, `deep`, `trace`, threshold/session/write/spec/handoff/deliberate/force/json flags only (`packages/coding-agent/src/commands/deep-interview.ts:7-26`), and the runtime rejects unknown flags during normal invocation. This is a dead workflow shim reference that can send agents down an impossible branch. Delete the branch or add a real, tested `--research-setup` flag and state contract."
+    },
+    {
+      "title": "Remove stale references to a nonexistent Plan skill",
+      "priority": "P2",
+      "confidence": 0.93,
+      "file_path": "packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md",
+      "line_start": 110,
+      "line_end": 110,
+      "body": "Ralplan tells the agent to follow the \"Plan skill's full documentation,\" and deep-interview frontmatter still declares `pipeline: [deep-interview, plan]`. The bundled GJC skill registry is exactly `deep-interview`, `ralplan`, `team`, and `ultragoal` (`packages/coding-agent/src/defaults/gjc-defaults.ts:15, 76-84`); there is no bundled `plan` skill to invoke or read. Replace these references with `ralplan` or remove them so agents do not search for or rely on a dead skill."
+    },
+    {
+      "title": "Remove nonexistent team cleanup and sparkshell commands",
+      "priority": "P2",
+      "confidence": 0.88,
+      "file_path": "packages/coding-agent/src/defaults/gjc/skills/team/SKILL.md",
+      "line_start": 348,
+      "line_end": 414,
+      "body": "The Team skill recommends `gjc sparkshell --tmux-pane ...` and describes a `team_cleanup` state-server cleanup path, but `sparkshell` is not registered in the GJC CLI command table (`packages/coding-agent/src/cli.ts:20-54`), and the Team workflow manifest exposes only `start`, `list`, `status`, `monitor`, `resume`, `shutdown`, and `api` as team positional verbs (`packages/coding-agent/src/gjc-runtime/workflow-manifest.ts:423-425`). Either implement/document these surfaces in-repo, or replace the guidance with existing `gjc team status|monitor|shutdown|api` and supported state cleanup commands."
+    },
+    {
+      "title": "Fix garbled deep-interview sentences before they reach agents",
+      "priority": "P3",
+      "confidence": 0.97,
+      "file_path": "packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+      "line_start": 314,
+      "line_end": 314,
+      "body": "There are obvious prompt text defects: line 314 says \"Do not ask the next the `ask` tool,\" and line 170 lists `ralplan`, `execution`, `execution`, or `team`. These are not implementation contracts; they are prompt bugs that burn attention and make the intended branch unclear. Rewrite the first as \"Do not ask the next question, score ambiguity, or hand off…\" and replace the duplicated `execution` targets with the real workflow names (`ralplan`, `ultragoal`, `team`) or a single generic \"execution workflow.\""
+    },
+    {
+      "title": "Normalize deep-interview to the canonical prompt tag vocabulary",
+      "priority": "P3",
+      "confidence": 0.86,
+      "file_path": "packages/coding-agent/src/defaults/gjc/skills/deep-interview/SKILL.md",
+      "line_start": 13,
+      "line_end": 44,
+      "body": "The corpus target specifies canonical tags as `<instruction>`, `<critical>`, `<output>`, `<examples>`, and `<conditions>`, but this SKILL uses legacy UpperCamel tags such as `<Purpose>`, `<Use_When>`, `<Do_Not_Use_When>`, `<Why_This_Exists>`, and `<Execution_Policy>`. That diverges from the prompt vocabulary used elsewhere and from the formatter's lowercase XML-tag convention, increasing token cost without a consistent parser/reader signal. Convert these sections to Markdown headings or canonical lowercase tags."
+    },
+    {
+      "title": "Complete the canonical executorQa CLI replay contract",
+      "priority": "P2",
+      "confidence": 0.87,
+      "file_path": "packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md",
+      "line_start": 268,
+      "line_end": 329,
+      "body": "Executor now falls back to the Ultragoal SKILL for the canonical `executorQa` contract (`packages/coding-agent/src/prompts/agents/executor.md:38`), but the SKILL only documents exact `recordedStdout` matching and a minimal JSON example. The runtime accepts and validates additional schema that materially changes behavior: `cwd`, safe `env`, `timeoutMs`, `expectedExitCode`, `normalization`, `recordedStderr`, and `invariants`; when `invariants` are present, validation checks substring/regex/not-substring invariants instead of exact stdout equality (`ultragoal-runtime.ts:2535-2583, 2737-2750`). Document the full accepted schema and the invariant-vs-stdout rule in the SKILL, or remove the undocumented runtime path so the canonical contract is complete."
+    },
+    {
+      "title": "Resolve the contradictory Ultragoal cleaner/verification order",
+      "priority": "P3",
+      "confidence": 0.91,
+      "file_path": "packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md",
+      "line_start": 258,
+      "line_end": 263,
+      "body": "The mandatory completion gate first says to run targeted verification, then immediately says to run the ai-slop-cleaner \"before verification and red-team,\" followed by \"Rerun verification.\" This leaves agents unsure whether the cleaner precedes the first verification or only precedes the final verification/red-team pass. Make the sequence explicit, e.g. \"optional initial smoke → cleaner → full verification → architect/executor QA,\" or move the cleaner step before the first verification if that is the intended contract."
+    }
+  ],
+  "verification": "Read-only audit only. Inspected bundled/plugin SKILL.md files, prompt modules, and runtime contract code with read/search; no formatters, tests, or mutation commands were run."
+}

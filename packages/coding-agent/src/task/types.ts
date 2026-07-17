@@ -320,6 +320,8 @@ export interface SingleResult {
 	paused?: boolean;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
 	usage?: Usage;
+	/** True only when every usage-contributing assistant supplied a complete, non-negative raw cost breakdown. */
+	usageCostBreakdownComplete?: true;
 	/** Output path for the task result */
 	outputPath?: string;
 	/** Patch path for isolated worktree output */
@@ -353,6 +355,28 @@ export interface SingleResult {
 	forkContextAdvisory?: { recommendedMode: ForkContextMode; reasons: string[] };
 }
 
+/** True only for complete, factual five-bucket cost accounting. */
+export function hasCompleteUsageCostBreakdown(usage: unknown): boolean {
+	if (!usage || typeof usage !== "object") return false;
+	const cost = (usage as { cost?: unknown }).cost;
+	if (!cost || typeof cost !== "object") return false;
+	return ["input", "output", "cacheRead", "cacheWrite", "total"].every(key => {
+		const value = (cost as Record<string, unknown>)[key];
+		return typeof value === "number" && Number.isFinite(value) && value >= 0;
+	});
+}
+
+/** True only when every usage-contributing result has explicit, complete cost provenance. */
+export function hasCompleteAggregateUsageCostBreakdown(
+	results: readonly Pick<SingleResult, "usage" | "usageCostBreakdownComplete">[],
+): boolean {
+	return results.every(
+		result =>
+			result.usage === undefined ||
+			(result.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(result.usage)),
+	);
+}
+
 /** Tool details for TUI rendering */
 export interface TaskToolDetails {
 	projectAgentsDir: string | null;
@@ -360,6 +384,8 @@ export interface TaskToolDetails {
 	totalDurationMs: number;
 	/** Aggregated usage across all subagents. */
 	usage?: Usage;
+	/** True only when every usage-contributing subagent supplied a complete raw cost breakdown. */
+	usageCostBreakdownComplete?: true;
 	/** Aggregate cloned tokens copied into fork-context seeds across subagents. */
 	forkContextClonedTokens?: number;
 	roiSummary?: {

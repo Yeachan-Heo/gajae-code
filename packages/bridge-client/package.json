@@ -1,10 +1,10 @@
 {
 	"type": "module",
 	"name": "@gajae-code/bridge-client",
-	"version": "0.8.1",
-	"description": "TypeScript client SDK for the GJC backend bridge protocol",
+	"version": "0.11.1",
+	"description": "Transport-only v3 SDK WebSocket client",
 	"homepage": "https://gajae-code.com",
-	"author": "Yeachan-Heo",
+	"author": "Yeachan-Heo and Gajae Code Contributors",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -15,15 +15,16 @@
 		"url": "https://github.com/Yeachan-Heo/gajae-code/issues"
 	},
 	"keywords": [
-		"gjc",
-		"bridge",
-		"sdk"
+		"sdk",
+		"websocket",
+		"transport",
+		"client"
 	],
 	"main": "./src/index.ts",
 	"types": "./src/index.ts",
 	"scripts": {
 		"check": "biome check . && bun run check:types",
-		"check:types": "tsgo -p tsconfig.json --noEmit",
+		"check:types": "tsc -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",
 		"fix": "biome check --write --unsafe .",
@@ -42,10 +43,6 @@
 		".": {
 			"types": "./src/index.ts",
 			"import": "./src/index.ts"
-		},
-		"./*": {
-			"types": "./src/*.ts",
-			"import": "./src/*.ts"
 		}
 	}
 }

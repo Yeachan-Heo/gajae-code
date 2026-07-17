@@ -137,6 +137,7 @@ export function claimStage1Jobs(
 	db: Database,
 	params: {
 		nowSec: number;
+		cwd: string;
 		threadScanLimit: number;
 		maxRolloutsPerStartup: number;
 		maxRolloutAgeDays: number;
@@ -149,6 +150,7 @@ export function claimStage1Jobs(
 ): Stage1Claim[] {
 	const {
 		nowSec,
+		cwd,
 		threadScanLimit,
 		maxRolloutsPerStartup,
 		maxRolloutAgeDays,
@@ -168,8 +170,10 @@ export function claimStage1Jobs(
 	let runningCount = runningCountRow?.count ?? 0;
 	if (runningCount >= runningConcurrencyCap) return [];
 	const candidateRows = db
-		.prepare("SELECT id, updated_at, rollout_path, cwd, source_kind FROM threads ORDER BY updated_at DESC LIMIT ?")
-		.all(threadScanLimit) as Array<{
+		.prepare(
+			"SELECT id, updated_at, rollout_path, cwd, source_kind FROM threads WHERE cwd = ? ORDER BY updated_at DESC LIMIT ?",
+		)
+		.all(cwd, threadScanLimit) as Array<{
 		id: string;
 		updated_at: number;
 		rollout_path: string;

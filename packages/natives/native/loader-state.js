@@ -146,6 +146,7 @@ export function shouldStageNodeModulesAddon({ platform, isCompiledBinary, native
  *   addonFilenames: string[];
  *   isCompiledBinary: boolean;
  *   stageFromNodeModules?: boolean;
+ *   isWorkspaceLoad?: boolean;
  *   optionalPackageNativeDirs?: string[];
  *   nativeDir: string;
  *   execDir: string;
@@ -158,12 +159,14 @@ export function resolveLoaderCandidates({
 	addonFilenames,
 	isCompiledBinary,
 	stageFromNodeModules = false,
+	isWorkspaceLoad = false,
 	optionalPackageNativeDirs = [],
 	nativeDir,
 	execDir,
 	versionedDir,
 	userDataDir,
 }) {
+	const workspaceCandidates = addonFilenames.map(filename => path.join(nativeDir, filename));
 	const optionalPackageCandidates = optionalPackageNativeDirs.flatMap(optionalNativeDir =>
 		addonFilenames.map(filename => path.join(optionalNativeDir, filename)),
 	);
@@ -171,7 +174,10 @@ export function resolveLoaderCandidates({
 		path.join(nativeDir, filename),
 		path.join(execDir, filename),
 	]);
-	const baseReleaseCandidates = [...optionalPackageCandidates, ...legacyReleaseCandidates];
+	const legacyExecCandidates = addonFilenames.map(filename => path.join(execDir, filename));
+	const baseReleaseCandidates = isWorkspaceLoad
+		? [...workspaceCandidates, ...optionalPackageCandidates, ...legacyExecCandidates]
+		: [...optionalPackageCandidates, ...legacyReleaseCandidates];
 	const compiledCandidates = addonFilenames.flatMap(filename => [
 		path.join(versionedDir, filename),
 		path.join(userDataDir, filename),
@@ -186,6 +192,35 @@ export function resolveLoaderCandidates({
 		releaseCandidates = baseReleaseCandidates;
 	}
 	return [...new Set(releaseCandidates)];
+}
+
+/**
+ * Deterministically try candidate paths in order using injected operations.
+ * This leaves file loading and compatibility policy at the call site while
+ * making fallback behavior testable without a native addon on disk.
+ *
+ * @template T
+ * @param {{
+ *   candidates: string[];
+ *   requireCandidate: (candidate: string) => T;
+ *   validateCandidate: (bindings: T, candidate: string) => void;
+ *   describeCandidate: (candidate: string) => string;
+ * }} input
+ * @returns {{ bindings: T | null; errors: string[] }}
+ */
+export function loadFromCandidates({ candidates, requireCandidate, validateCandidate, describeCandidate }) {
+	const errors = [];
+	for (const candidate of candidates) {
+		try {
+			const bindings = requireCandidate(candidate);
+			validateCandidate(bindings, candidate);
+			return { bindings, errors };
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			errors.push(`${describeCandidate(candidate)}: ${message}`);
+		}
+	}
+	return { bindings: null, errors };
 }
 
 // =========================================================================
@@ -342,12 +377,6 @@ function maybeStageNodeModulesAddon(ctx, errors) {
 }
 
 function validateLoadedBindings(ctx, bindings, candidate) {
-	// In workspace dev (running out of `packages/natives/native/` rather than a
-	// `node_modules` install or a compiled bundle) the local `.node` only gains
-	// the renamed sentinel after `bun --cwd=packages/natives run build`. Skip
-	// validation there so a stale post-pull dev tree boots while the rebuild
-	// completes; install and compiled-binary paths still validate.
-	if (ctx.isWorkspaceLoad) return;
 	if (typeof bindings[ctx.versionSentinelExport] === "function") return;
 	throw new Error(
 		`Loaded ${candidate} but it does not expose the @gajae-code/natives@${ctx.packageVersion} ` +
@@ -405,6 +434,8 @@ function initLoaderContext(require_) {
 		isCompiledBinary,
 		nativeDir,
 	});
+	const isWorkspaceLoad =
+		!isCompiledBinary && !nativeDir.includes("\\node_modules\\") && !nativeDir.includes("/node_modules/");
 
 	const selectedVariant = resolveCpuVariant(getVariantOverride());
 	const addonFilenames = getAddonFilenames({ tag: platformTag, arch: process.arch, variant: selectedVariant });
@@ -419,6 +450,7 @@ function initLoaderContext(require_) {
 		addonFilenames,
 		isCompiledBinary,
 		stageFromNodeModules,
+		isWorkspaceLoad,
 		optionalPackageNativeDirs,
 		nativeDir,
 		execDir,
@@ -434,8 +466,6 @@ function initLoaderContext(require_) {
 	// turns the silent `<sym> is not a function` crash from a Windows
 	// locked-file update into an actionable load-time error.
 	const versionSentinelExport = `__piNativesV${packageVersion.replace(/[^A-Za-z0-9]/g, "_")}`;
-	const isWorkspaceLoad =
-		!isCompiledBinary && !nativeDir.includes("\\node_modules\\") && !nativeDir.includes("/node_modules/");
 
 	return {
 		platformTag,
@@ -450,7 +480,6 @@ function initLoaderContext(require_) {
 		addonLabel,
 		candidates,
 		versionSentinelExport,
-		isWorkspaceLoad,
 	};
 }
 
@@ -464,16 +493,14 @@ export function loadNative() {
 	const prepended = [embeddedCandidate, stagedCandidate].filter(c => typeof c === "string");
 	const runtimeCandidates = prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
 
-	for (const candidate of runtimeCandidates) {
-		try {
-			const bindings = require_(candidate);
-			validateLoadedBindings(ctx, bindings, candidate);
-			return bindings;
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			errors.push(`${candidate}: ${message}`);
-		}
-	}
+	const loaded = loadFromCandidates({
+		candidates: runtimeCandidates,
+		requireCandidate: candidate => require_(candidate),
+		validateCandidate: (bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate),
+		describeCandidate: candidate => candidate,
+	});
+	if (loaded.bindings) return loaded.bindings;
+	errors.push(...loaded.errors);
 
 	if (!SUPPORTED_PLATFORMS.includes(ctx.platformTag)) {
 		throw new Error(

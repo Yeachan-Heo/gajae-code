@@ -5,9 +5,8 @@
 {{#if appendPrompt}}
 {{appendPrompt}}
 {{/if}}
-{{#ifAny contextFiles.length git.isRepo}}
-<project>
 {{#if contextFiles.length}}
+<project>
 ## Context
 <instructions>
 {{#list contextFiles join="\n"}}
@@ -16,28 +15,7 @@
 </file>
 {{/list}}
 </instructions>
-{{/if}}
-{{#if git.isRepo}}
-## Version Control
-Snapshot; does not update during conversation.
-Current branch: {{git.currentBranch}}
-Main branch: {{git.mainBranch}}
-{{git.status}}
-### History
-{{git.commits}}
-{{/if}}
 </project>
-{{/ifAny}}
-{{#if skills.length}}
-Skills are specialized knowledge. Scan descriptions for your task domain.
-If a task-specific instruction applies, you MUST read the referenced local file before proceeding.
-<skills>
-{{#list skills join="\n"}}
-<skill name="{{name}}">
-{{description}}
-</skill>
-{{/list}}
-</skills>
 {{/if}}
 {{#if alwaysApplyRules.length}}
 {{#each alwaysApplyRules}}

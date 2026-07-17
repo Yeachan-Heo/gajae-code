@@ -118,4 +118,19 @@ describe("Google Gemini CLI tool choice", () => {
 		expect(bodies[1]?.customInjected).toBe("kept");
 		expectSingleCleanFallbackEvents(events);
 	});
+
+	it("does not retry forced tool choice in managed mode", async () => {
+		let calls = 0;
+		const result = await streamGoogleGeminiCli({ ...model, id: "managed-runtime-gemini-cli" }, context, {
+			apiKey: JSON.stringify({ token: "token", projectId: "project" }),
+			toolChoice: "required",
+			fallbackManaged: true,
+			fetch: async () => {
+				calls += 1;
+				return createErrorResponse("forced tool_choice is not supported");
+			},
+		}).result();
+		expect(calls).toBe(1);
+		expect(result.stopReason).toBe("error");
+	});
 });

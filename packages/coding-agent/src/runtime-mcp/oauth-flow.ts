@@ -8,10 +8,28 @@
 import type { OAuthCallbackFlowOptions } from "@gajae-code/ai/utils/oauth/callback-server";
 import { OAuthCallbackFlow } from "@gajae-code/ai/utils/oauth/callback-server";
 import type { OAuthController, OAuthCredentials } from "@gajae-code/ai/utils/oauth/types";
+import { MCPExpectedFailure } from "./types";
 
 const DEFAULT_PORT = 3000;
 const CALLBACK_PATH = "/callback";
 const CALLBACK_BIND_HOSTNAME = "127.0.0.1";
+type RefreshTokenResponse = {
+	access_token: string;
+	refresh_token?: string;
+	expires_in?: number;
+};
+
+function isRefreshTokenResponse(value: unknown): value is RefreshTokenResponse {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const payload = value as Record<string, unknown>;
+	return (
+		typeof payload.access_token === "string" &&
+		payload.access_token.length > 0 &&
+		(payload.refresh_token === undefined || typeof payload.refresh_token === "string") &&
+		(payload.expires_in === undefined ||
+			(typeof payload.expires_in === "number" && Number.isFinite(payload.expires_in) && payload.expires_in >= 0))
+	);
+}
 
 function isLoopbackHostname(hostname: string): boolean {
 	return hostname === "localhost" || hostname === "127.0.0.1";
@@ -384,22 +402,34 @@ export async function refreshMCPOAuthToken(
 	if (clientId) params.set("client_id", clientId);
 	if (clientSecret) params.set("client_secret", clientSecret);
 
-	const response = await fetch(tokenUrl, {
-		method: "POST",
-		headers: { "Content-Type": "application/x-www-form-urlencoded" },
-		body: params.toString(),
-	});
-
-	if (!response.ok) {
-		const text = await response.text();
-		throw new Error(`MCP OAuth refresh failed: ${response.status} ${text}`);
+	let response: Response;
+	try {
+		response = await fetch(tokenUrl, {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: params.toString(),
+		});
+	} catch (error) {
+		throw new MCPExpectedFailure(error);
 	}
 
-	const data = (await response.json()) as {
-		access_token: string;
-		refresh_token?: string;
-		expires_in?: number;
-	};
+	if (!response.ok) {
+		let text: string;
+		try {
+			text = await response.text();
+		} catch (error) {
+			throw new MCPExpectedFailure(error);
+		}
+		throw new MCPExpectedFailure(new Error(`MCP OAuth refresh failed: ${response.status} ${text}`));
+	}
+
+	let data: unknown;
+	try {
+		data = await response.json();
+	} catch {
+		throw new MCPExpectedFailure();
+	}
+	if (!isRefreshTokenResponse(data)) throw new MCPExpectedFailure();
 	const expiresIn = data.expires_in ?? 3600;
 	return {
 		access: data.access_token,

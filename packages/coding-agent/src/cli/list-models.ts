@@ -191,7 +191,7 @@ export async function runListModelsCommand(options: RunListModelsOptions): Promi
 		process.stderr.write(`Failed to load extension: ${extPath}: ${error}\n`);
 	}
 
-	// Mirror sdk.ts: drain pending provider registrations into the registry.
+	// Mirror sdk/session.ts: drain pending provider registrations into the registry.
 	const activeSources = extensionsResult.extensions.map(extension => extension.path);
 	modelRegistry.syncExtensionSources(activeSources);
 	for (const sourceId of new Set(activeSources)) {

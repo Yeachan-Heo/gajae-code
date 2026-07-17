@@ -238,10 +238,11 @@ export async function listMCPServers(filePath: string): Promise<string[]> {
 }
 
 /**
- * Set a server's autoload flag (connect automatically at session startup).
+ * Set a server's autoload flag for explicit runtime MCP consumers.
  *
- * Autoload defaults to true, so turning it on removes the key to keep the
- * config file free of redundant fields; turning it off writes `autoload: false`.
+ * Autoload defaults to true for consumers that honor it, so turning it on
+ * removes the key to keep the config file free of redundant fields; turning it
+ * off writes `autoload: false`.
  *
  * @throws Error if the server doesn't exist
  */

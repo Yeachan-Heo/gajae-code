@@ -26,8 +26,28 @@ const finalPlanContractPatterns = [
 
 const criticApprovalContractPatterns = [
 	/Any non-`OKAY` Critic verdict \(`ITERATE` or `REJECT`\)/u,
-	/until Critic returns `OKAY`/u,
-	/without `OKAY`/u,
+	/until Critic returns `OKAY` \*\*and\*\* Architect is `CLEAR`\/`APPROVE`/u,
+	/without Critic `OKAY` plus Architect `CLEAR`\/`APPROVE`/u,
+	/After the review join gate has both Critic `OKAY` and Architect `CLEAR`\/`APPROVE`/u,
+	/re-check the review join gate \(Critic `OKAY` plus Architect `CLEAR`\/`APPROVE`/u,
+] as const;
+
+const ralplanReviewPipelineContractPatterns = [
+	/Review fan-out after Planner persistence/u,
+	/launch fresh Architect and Critic review lanes against the same immutable Planner receipt\/path\/sha\/stage_n/u,
+	/Plan-only Critic lane/u,
+	/does not consume Architect output/u,
+	/Sequential fallback/u,
+	/await the Architect result before issuing that Architect-dependent Critic pass/u,
+	/Review join gate/u,
+	/both Architect and Critic receipts\/verdicts exist for the same Planner artifact\/pass/u,
+	/Architect and Critic MAY run in the same parallel batch only for the plan-only Critic lane/u,
+] as const;
+
+const staleReviewPipelineContractPatterns = [
+	/Steps 3 and 4 MUST run sequentially/u,
+	/Do NOT issue both agent Task calls in the same parallel batch/u,
+	/Always await the Architect result before issuing the Critic Task/u,
 	/After Critic returns `OKAY`/u,
 ] as const;
 
@@ -67,6 +87,13 @@ describe("ralplan decision artifacts", () => {
 
 		for (const pattern of criticApprovalContractPatterns) {
 			expect(content).toMatch(pattern);
+		}
+
+		for (const pattern of ralplanReviewPipelineContractPatterns) {
+			expect(content).toMatch(pattern);
+		}
+		for (const pattern of staleReviewPipelineContractPatterns) {
+			expect(content).not.toMatch(pattern);
 		}
 		for (const pattern of staleCriticApprovalPatterns) {
 			expect(content).not.toMatch(pattern);

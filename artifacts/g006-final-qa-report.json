@@ -1,0 +1,34 @@
+{
+  "goalId": "G006",
+  "status": "PASS",
+  "scope": "Structural SDK-only closure, exact parity, rollback, release enforcement, and aggregate AC1-AC8 verification",
+  "verification": {
+    "sdkClosure": "pass; inventory freshness, parity freshness/execution, Telegram freshness/execution, downgrade and unknown-version proofs, canonicalization self-test/current scan, rename, and plugin exactness",
+    "operationInventory": "288 reviewed records; TypeScript AST discovery; 10 tests, 203 expectations",
+    "adapterParity": "9 behavioral commands plus 546 exact rows; 91 rows per telegram/discord/slack/mcp/acp/daemonCli",
+    "telegramBaseline": "41 behavioral commands",
+    "downgrade": "4 tests, 51 expectations; true pinned pretrain executable plus unknown-version proof",
+    "canonicalization": "pass; unconditional retired-tree rejection; 3 sanctioned server hosts",
+    "plugins": "12 exact generated files; 17 gates",
+    "releaseWorkflow": "13 tests, 75 expectations; tag binary and npm publication require successful sdk_closure",
+    "typescript": "pass",
+    "schemas": "pass",
+    "workspaceBuild": "pass",
+    "rustSdk": "99 passed"
+  },
+  "independentReview": {
+    "architectureAndQa": "agent://313-G006DefinitiveClosureApproval — CLEAR / PASS / APPROVE",
+    "priorArchitecture": "agent://301-G006AbsoluteFinalArchitecture — CLEAR / APPROVE",
+    "adversarialClosure": "agents 302, 306, 307, 308, 309, and 310 supplied counterexamples that were fixed before final approval"
+  },
+  "contracts": [
+    "The TUI remains in-process while every external machine and chat surface uses the canonical Gajae-Code SDK bus.",
+    "Retired RPC, Bridge, unattended, Python RPC/Robogjc, bridge-client, and executable compatibility fixtures are absent and structurally blocked from return.",
+    "Six adapters implement the exact 91-operation registry disposition contract and execute required behavioral suites.",
+    "Telegram retains an exact generated 41-command no-regression baseline.",
+    "Operation seams are discovered structurally through the TypeScript AST and fail closed when unreviewed.",
+    "Tag binary and npm publication require the complete SDK closure gate to succeed.",
+    "Pinned old-executable rollback and unknown-version handling remain executable release evidence.",
+    "Generated plugin content is exact, SDK-native, and rejects stale extra installable files."
+  ]
+}

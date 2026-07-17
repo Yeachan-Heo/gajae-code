@@ -55,22 +55,35 @@ const SEPARATOR_DISPLAY: Record<string, string> = {
 	colon: ":",
 };
 
+type OutputFormat = "table" | "md" | "csv" | "json";
+type SortField = "sep" | "model" | "task" | "edit" | "tokens";
+
+function isOutputFormat(value: string | undefined): value is OutputFormat {
+	return value === "table" || value === "md" || value === "csv" || value === "json";
+}
+
+function isSortField(value: string | undefined): value is SortField {
+	return value === "sep" || value === "model" || value === "task" || value === "edit" || value === "tokens";
+}
+
 const args = process.argv.slice(2);
 const dirs: string[] = [];
-let format: "table" | "md" | "csv" | "json" = "table";
-let sortBy: "sep" | "model" | "task" | "edit" | "tokens" = "sep";
+let format: OutputFormat = "table";
+let sortBy: SortField = "sep";
 let aggregate = false;
 
 for (let i = 0; i < args.length; i++) {
-	const a = args[i];
-	if (a === "--format") {
-		format = args[++i] as typeof format;
-	} else if (a === "--sort") {
-		sortBy = args[++i] as typeof sortBy;
-	} else if (a === "--aggregate") {
+	const arg = args[i];
+	if (arg === "--format") {
+		const value = args[++i];
+		if (isOutputFormat(value)) format = value;
+	} else if (arg === "--sort") {
+		const value = args[++i];
+		if (isSortField(value)) sortBy = value;
+	} else if (arg === "--aggregate") {
 		aggregate = true;
-	} else if (!a.startsWith("--")) {
-		dirs.push(a);
+	} else if (!arg.startsWith("--")) {
+		dirs.push(arg);
 	}
 }
 

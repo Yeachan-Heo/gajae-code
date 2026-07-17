@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { AGENT_WIRE_EVENT_TYPES } from "../../src/modes/shared/agent-wire/event-contract";
 import {
 	observeAgentSessionEvent,
-	observeRpcOutboundFrame,
+	observeAgentWireFrame,
 	toAgentWireEventPayload,
 } from "../../src/modes/shared/agent-wire/event-observation";
 import { EVENT_FIXTURES, RAW_SECRET } from "./fixtures";
@@ -63,12 +63,12 @@ describe("agent-wire event observation", () => {
 
 	describe("non-event wire frames", () => {
 		it("ignores ready and successful response frames", () => {
-			expect(observeRpcOutboundFrame({ type: "ready" })).toBeNull();
-			expect(observeRpcOutboundFrame({ type: "response", command: "prompt", success: true })).toBeNull();
+			expect(observeAgentWireFrame({ type: "ready" })).toBeNull();
+			expect(observeAgentWireFrame({ type: "response", command: "prompt", success: true })).toBeNull();
 		});
 
 		it("observes failed responses with a bounded code", () => {
-			const observation = observeRpcOutboundFrame({
+			const observation = observeAgentWireFrame({
 				type: "response",
 				command: "prompt",
 				id: "r1",
@@ -81,29 +81,29 @@ describe("agent-wire event observation", () => {
 
 		it("delegates event frames to the canonical event observer", () => {
 			const frame = { type: "event", payload: toAgentWireEventPayload(EVENT_FIXTURES.tool_execution_start) };
-			const observation = observeRpcOutboundFrame(frame as Record<string, unknown>);
+			const observation = observeAgentWireFrame(frame as Record<string, unknown>);
 			expect(observation?.eventType).toBe("tool_execution_start");
 			expect(observation?.signal).toBe("tool-call");
 		});
 
 		it("observes extension, host-tool, host-uri, and workflow-gate frames", () => {
-			expect(observeRpcOutboundFrame({ type: "extension_ui_request", id: "u1", method: "confirm" })?.kind).toBe(
+			expect(observeAgentWireFrame({ type: "extension_ui_request", id: "u1", method: "confirm" })?.kind).toBe(
 				"rpc_extension_request",
 			);
-			expect(observeRpcOutboundFrame({ type: "host_tool_call", id: "h1", toolName: "echo" })?.signal).toBe(
+			expect(observeAgentWireFrame({ type: "host_tool_call", id: "h1", toolName: "echo" })?.signal).toBe(
 				"tool-call",
 			);
 			expect(
-				observeRpcOutboundFrame({ type: "host_uri_request", id: "u2", operation: "read", scheme: "db" })?.evidence
+				observeAgentWireFrame({ type: "host_uri_request", id: "u2", operation: "read", scheme: "db" })?.evidence
 					.scheme,
 			).toBe("db");
-			const gate = observeRpcOutboundFrame({ type: "workflow_gate", gate_id: "g1", kind: "approval", stage: "pre" });
+			const gate = observeAgentWireFrame({ type: "workflow_gate", gate_id: "g1", kind: "approval", stage: "pre" });
 			expect(gate?.semantic).toBe(true);
 			expect(gate?.evidence.gate_id).toBe("g1");
 		});
 
 		it("never leaks raw content from extension errors", () => {
-			const observation = observeRpcOutboundFrame({
+			const observation = observeAgentWireFrame({
 				type: "extension_error",
 				extensionPath: "/x",
 				event: "session_start",

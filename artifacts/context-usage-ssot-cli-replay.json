@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "kind": "cli-replay",
+  "replaySafe": true,
+  "command": ["bun", "-e", "console.log('ultragoal-cli-ok')"],
+  "cwd": ".",
+  "env": {
+    "LC_ALL": "C"
+  },
+  "timeoutMs": 30000,
+  "expectedExitCode": 0,
+  "recordedStdout": "ultragoal-cli-ok\n",
+  "recordedStderr": "",
+  "invariants": [
+    {
+      "type": "substring",
+      "value": "ultragoal-cli-ok"
+    },
+    {
+      "type": "not-substring",
+      "value": "error"
+    }
+  ]
+}

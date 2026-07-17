@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import * as fs from "node:fs/promises";
+import type * as fsTypes from "node:fs";
 import * as path from "node:path";
 
 export interface BaselineViolation {
@@ -57,7 +58,7 @@ function isLiveSurface(relativePath: string): boolean {
 }
 
 async function collectFiles(root: string, dir = root): Promise<string[]> {
-	let entries: fs.Dirent[];
+	let entries: fsTypes.Dirent[];
 	try {
 		entries = await fs.readdir(dir, { withFileTypes: true });
 	} catch {

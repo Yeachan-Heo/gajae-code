@@ -1,15 +1,18 @@
 // Core TUI interfaces and classes
 
+export * from "./animation-scheduler";
 // Autocomplete support
 export * from "./autocomplete";
 // Components
 export * from "./components/box";
 export * from "./components/cancellable-loader";
 export * from "./components/editor";
+export * from "./components/gajae-pet";
 export * from "./components/image";
 export * from "./components/input";
 export * from "./components/loader";
 export * from "./components/markdown";
+export * from "./components/secret-input";
 export * from "./components/select-list";
 export * from "./components/settings-list";
 export * from "./components/spacer";

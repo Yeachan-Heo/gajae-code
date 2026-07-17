@@ -121,6 +121,31 @@ describe("Hindsight tool factories", () => {
 	});
 });
 
+describe("Hindsight recall injection", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+		registeredState = undefined;
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		registeredState = undefined;
+	});
+
+	it("keeps recall eligible until the provider injection is accepted", () => {
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		registerState(client);
+		registeredState!.lastRecallSnippet = "<memories>fact</memories>";
+		expect(registeredState!.getRecallSnippetForInjection()).toBe("<memories>fact</memories>");
+		// A cancelled preflight only reads the snippet; a retry must still receive it.
+		expect(registeredState!.getRecallSnippetForInjection()).toBe("<memories>fact</memories>");
+		expect(registeredState!.markRecallSnippetInjected("<memories>fact</memories>")).toBe(true);
+		expect(registeredState!.getRecallSnippetForInjection()).toBeUndefined();
+		registeredState!.lastRecallSnippet = "<memories>updated fact</memories>";
+		expect(registeredState!.getRecallSnippetForInjection()).toBe("<memories>updated fact</memories>");
+	});
+});
+
 describe("retain.execute", () => {
 	beforeEach(() => {
 		resetSettingsForTest();
@@ -200,6 +225,43 @@ describe("retain.execute", () => {
 		expect(source).toBe("Hindsight");
 		expect(message).toContain("HTTP 503");
 		expect(message).toContain("1 memory");
+	});
+
+	it("drains a retain queued during an in-flight flush before it resolves", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const { promise, resolve } = Promise.withResolvers<Awaited<ReturnType<HindsightApi["retainBatch"]>>>();
+		const retainBatchSpy = vi
+			.spyOn(HindsightApi.prototype, "retainBatch")
+			.mockImplementationOnce(async () => await promise)
+			.mockResolvedValue({} as never);
+		registerState(client, settings);
+
+		registeredState!.enqueueRetain("first");
+		const flush = registeredState!.flushRetainQueue();
+		while (retainBatchSpy.mock.calls.length === 0) await Promise.resolve();
+		registeredState!.enqueueRetain("trailing");
+		resolve({} as never);
+		await flush;
+
+		expect(retainBatchSpy).toHaveBeenCalledTimes(2);
+		expect(retainBatchSpy.mock.calls.map(([, items]) => items.map(item => item.content))).toEqual([
+			["first"],
+			["trailing"],
+		]);
+	});
+
+	it("flushes pending retains during disposal and rejects later enqueues", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockResolvedValue({} as never);
+		registerState(client, settings);
+
+		registeredState!.enqueueRetain("retain before disposal");
+		await registeredState!.dispose();
+
+		expect(retainBatchSpy).toHaveBeenCalledTimes(1);
+		expect(() => registeredState!.enqueueRetain("after disposal")).toThrow(/closed/i);
 	});
 
 	it("throws when no per-session state is registered", async () => {

@@ -150,13 +150,16 @@ function buildAsciiTable(columns: string[], rows: SqliteRow[]): string {
 	return lines.map(line => truncateToWidth(replaceTabs(line), MAX_RENDER_WIDTH)).join("\n");
 }
 
+const DECIMAL_INTEGER_PATTERN = /^[+-]?\d+$/;
+
 function parseLimit(value: string | null, fallback: number): number {
 	if (value === null || value.trim().length === 0) {
 		return fallback;
 	}
 
-	const parsed = Number.parseInt(value, 10);
-	if (!Number.isFinite(parsed) || parsed < 1) {
+	const normalizedValue = value.trim();
+	const parsed = Number(normalizedValue);
+	if (!DECIMAL_INTEGER_PATTERN.test(normalizedValue) || !Number.isFinite(parsed) || parsed < 1) {
 		throw new ToolError(`SQLite limit must be a positive integer; got '${value}'`);
 	}
 	return Math.min(parsed, MAX_QUERY_LIMIT);
@@ -167,8 +170,9 @@ function parseOffset(value: string | null): number {
 		return 0;
 	}
 
-	const parsed = Number.parseInt(value, 10);
-	if (!Number.isFinite(parsed) || parsed < 0) {
+	const normalizedValue = value.trim();
+	const parsed = Number(normalizedValue);
+	if (!DECIMAL_INTEGER_PATTERN.test(normalizedValue) || !Number.isFinite(parsed) || parsed < 0) {
 		throw new ToolError(`SQLite offset must be a non-negative integer; got '${value}'`);
 	}
 	return parsed;

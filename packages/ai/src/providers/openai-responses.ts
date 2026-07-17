@@ -33,12 +33,15 @@ import {
 	createOpenAIResponsesHistoryPayload,
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
+	isInvalidPromptError,
+	neutralizeResponsesInputControlTokens,
 	normalizeSystemPrompts,
 	resolveCacheRetention,
 	sanitizeOpenAIResponsesHistoryItemsForReplay,
 } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import {
 	createWatchdog,
@@ -71,6 +74,7 @@ import {
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
 import { compactGrammarDefinition } from "./grammar";
+import { wrapOpenAIFetchForBoundedRateLimits } from "./openai-bounded-rate-limits";
 import {
 	applyOpenAIRequestTransformBody,
 	applyOpenAIRequestTransformHeaders,
@@ -274,6 +278,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				options?.fetch,
 				options?.authCredentialType,
 				options?.requestMaxRetries,
+				options?.maxRetryDelayMs,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
@@ -296,9 +301,12 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 					await notifyProviderResponse(options, response, model, request_id);
 					return data;
 				},
-				{ provider: model.provider, signal: requestSignal },
+				{ provider: model.provider, signal: requestSignal, fallbackManaged: options?.fallbackManaged },
 			).catch(async error => {
-				if (!isForcedToolChoiceUnsupportedError(error, isForcedOpenAIResponsesToolChoice(params.tool_choice))) {
+				if (
+					options?.fallbackManaged ||
+					!isForcedToolChoiceUnsupportedError(error, isForcedOpenAIResponsesToolChoice(params.tool_choice))
+				) {
 					throw error;
 				}
 				const reason = await finalizeErrorMessage(error, rawRequestDump);
@@ -377,8 +385,25 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error);
 			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
+			// Explicitly mark the poisoned-history rejection so the shared
+			// `invalid_prompt` contract is present even when the SDK error surfaces
+			// only a message (no structured code). This keeps the responses
+			// transport's classification uniform with the codex transport's
+			// non-retryable event set and lets the session-level circuit breaker
+			// key on one durable marker instead of per-transport string matching.
+			if (
+				output.stopReason === "error" &&
+				!output.transportFailure?.providerCode &&
+				(isInvalidPromptError(error) || isInvalidPromptError(output.errorMessage))
+			) {
+				output.transportFailure = {
+					...(output.transportFailure ?? { kind: "transport" }),
+					providerCode: "invalid_prompt",
+				};
+			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -400,6 +425,7 @@ function createClient(
 	fetchOverride?: FetchImpl,
 	authCredentialType?: OpenAIResponsesOptions["authCredentialType"],
 	requestMaxRetries?: number,
+	maxRetryDelayMs?: number,
 ): {
 	client: OpenAI;
 	copilotPremiumRequests: number | undefined;
@@ -446,8 +472,9 @@ function createClient(
 		headers["x-client-request-id"] ??= sessionId;
 	}
 	const baseFetch = fetchOverride ?? fetch;
+	const boundedFetch = wrapOpenAIFetchForBoundedRateLimits(baseFetch, maxRetryDelayMs);
 	const transformedFetch = wrapFetchForOpenAIRequestTransform(
-		baseFetch,
+		boundedFetch,
 		model.requestTransform,
 		`Gajae-Code/${packageJson.version}`,
 	);
@@ -489,7 +516,7 @@ function buildParams(
 		strictResponsesPairing,
 		providerSessionState,
 	);
-	const messages: ResponseInput = [...conversationMessages];
+	const messages: ResponseInput = neutralizeResponsesInputControlTokens(conversationMessages);
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
 	if (isComposerHarnessModel(model.id)) {

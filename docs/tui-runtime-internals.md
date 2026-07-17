@@ -96,12 +96,11 @@ This keeps key parsing/editor mechanics in `packages/tui` and mode semantics in 
 2. Composite visible overlays (if any).
 3. Extract and strip `CURSOR_MARKER` from visible viewport lines.
 4. Append segment reset suffixes for non-image lines.
-5. Choose full repaint vs differential patch:
-   - first frame
-   - width change
-   - shrink with `clearOnShrink` enabled and no overlays
-   - edits above previous viewport
-6. For differential updates, patch only changed line range and clear stale trailing lines when needed.
+5. Choose a viewport repaint, full repaint, or differential patch:
+   - real process terminals repaint the visible viewport for width/height changes, forced renders, and edits above the live viewport so native scrollback is not cleared/replayed; host markers refine policy only after this process-terminal capability is established;
+   - virtual/headless terminals retain full clear/replay regardless of inherited terminal-host environment markers, keeping historical buffer repair deterministic;
+   - steady-state visible changes use differential patches, including viewport repaint when a contraction exposes earlier transcript rows.
+6. For differential updates, patch only changed line ranges and clear stale trailing lines when needed.
 7. Reposition hardware cursor for IME support.
 
 Render writes use synchronized output mode (`CSI ? 2026 h/l`) to reduce flicker/tearing.
@@ -112,28 +111,26 @@ Critical safety checks in `TUI`:
 
 - Non-image rendered lines are expected to fit terminal width; the differential path truncates overwide lines as a last-resort guard and can write debug diagnostics when redraw debugging is enabled.
 - Overlay compositing includes defensive truncation and post-composite width guarding.
-- Width changes force full redraw because wrapping semantics change.
+- Width changes re-render wrapped content; real process terminals limit emission to the visible viewport because their native scrollback position is not observable.
 - Cursor position is clamped before movement.
 
 These constraints are runtime guards plus component conventions; renderers should still return width-safe lines rather than rely on truncation.
 
-## Virtual viewport (opt-in, `PI_TUI_VIRTUAL_VIEWPORT`)
+## Virtual viewport (default-on, `PI_TUI_VIRTUAL_VIEWPORT`)
 
-By default `#doRender` normalizes/truncates and diffs the full rendered transcript every frame (`O(total lines)`), which becomes a per-frame cost on very long sessions / weak hardware.
+By default `#doRender` reuses the previous normalized off-screen prefix and only normalizes/diffs the visible window (terminal rows + a small overscan) when the terminal width is unchanged and the off-screen raw prefix is unchanged from the previous frame. This bounds steady-state append/edit work on very long sessions / weak hardware while preserving byte-identical output.
 
-Setting `PI_TUI_VIRTUAL_VIEWPORT=1` enables an opt-in fast path: when the terminal width is unchanged and the off-screen raw prefix is unchanged from the previous frame (compared by raw value equality per line, which short-circuits to a fast reference check when components return stable string instances for unchanged lines), the previous frame's normalized prefix is reused and only the visible window (terminal rows + a small overscan) is re-normalized, with the differential diff starting at the window boundary. Output is byte-identical to the default path (reused entries are deterministic normalizations of identical raw lines), so it is a pure performance toggle.
-
-The flag defaults to **off** because it changes a core render path; enable it to reduce per-frame normalize/diff cost on huge transcripts. Any width change, off-screen edit, forced render (`requestRender(true)`), or first frame transparently falls back to the full path. `PI_TUI_METRICS` exposes `lineCounts` gauges (`rendered`, `normalized`, `measured`, `diffed`, and `offscreenScan`) to observe the bound.
+Set `PI_TUI_VIRTUAL_VIEWPORT=0` (or `false`) to opt out and restore the legacy path that normalizes/truncates and diffs the full rendered transcript every frame (`O(total lines)`). The fast path compares the off-screen raw prefix by raw value equality per line, which short-circuits to a fast reference check when components return stable string instances for unchanged lines; reused entries are deterministic normalizations of identical raw lines. Any width change, off-screen edit, forced render (`requestRender(true)`), or first frame transparently falls back to the full path. `PI_TUI_METRICS` exposes `lineCounts` gauges (`rendered`, `normalized`, `measured`, `diffed`, and `offscreenScan`) to observe the bound.
 
 ## Resize handling
 
-Resize events are event-driven from `ProcessTerminal` to `TUI.requestRender()`.
+Resize events are event-driven from `ProcessTerminal` to `TUI.requestResizeRender()`.
 
 Effects:
 
-- Width changes trigger full redraw.
-- Height changes trigger full redraw except in Termux and terminal multiplexers, where the renderer avoids scrollback-hostile full replays.
-- Viewport/top tracking (`#previousViewportTop`, `#maxLinesRendered`) avoids invalid relative cursor math when content or terminal size changes.
+- Real process terminals repaint only the visible viewport on width/height changes, avoiding scrollback-hostile clear/replay cycles; known host markers and the legacy multiplexer override refine this process-terminal policy.
+- Virtual/headless terminals retain full redraw regardless of inherited host markers for deterministic buffer repair.
+- Viewport/top tracking avoids invalid relative cursor math when content or terminal size changes.
 - Overlay visibility can depend on terminal dimensions (`OverlayOptions.visible`); focus is corrected when overlays become non-visible after resize.
 
 ## Streaming and incremental UI updates

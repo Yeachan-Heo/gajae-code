@@ -12,10 +12,10 @@
  * swapped in later without changing callers.
  */
 import { createHash } from "node:crypto";
-import type { RpcJsonSchema, RpcWorkflowGateValidationError } from "../../rpc/rpc-types";
+import type { JsonSchema, WorkflowGateValidationError } from "./workflow-gate-types";
 
 /** Keywords this wrapper understands. Any other keyword is rejected. */
-const SUPPORTED_KEYWORDS = new Set<keyof RpcJsonSchema>([
+const SUPPORTED_KEYWORDS = new Set<keyof JsonSchema>([
 	"type",
 	"enum",
 	"const",
@@ -65,7 +65,7 @@ export function canonicalJson(value: unknown): string {
 	return `{${entries.join(",")}}`;
 }
 
-export function schemaHash(schema: RpcJsonSchema): string {
+export function schemaHash(schema: JsonSchema): string {
 	return createHash("sha256").update(canonicalJson(schema)).digest("hex");
 }
 
@@ -74,7 +74,7 @@ function answerHashOf(answer: unknown): string {
 }
 
 /** Validate the schema *shape*. Throws WorkflowGateSchemaError on any problem. */
-export function assertSupportedGateSchema(schema: RpcJsonSchema): void {
+export function assertSupportedGateSchema(schema: JsonSchema): void {
 	const serialized = canonicalJson(schema);
 	if (Buffer.byteLength(serialized, "utf8") > GATE_SCHEMA_LIMITS.maxSchemaBytes) {
 		throw new WorkflowGateSchemaError(`schema exceeds ${GATE_SCHEMA_LIMITS.maxSchemaBytes} bytes`);
@@ -82,7 +82,7 @@ export function assertSupportedGateSchema(schema: RpcJsonSchema): void {
 	walkSchema(schema, 0, "#");
 }
 
-function walkSchema(schema: RpcJsonSchema, depth: number, path: string): void {
+function walkSchema(schema: JsonSchema, depth: number, path: string): void {
 	if (depth > GATE_SCHEMA_LIMITS.maxDepth) {
 		throw new WorkflowGateSchemaError(`schema nesting exceeds depth ${GATE_SCHEMA_LIMITS.maxDepth} at ${path}`);
 	}
@@ -90,7 +90,7 @@ function walkSchema(schema: RpcJsonSchema, depth: number, path: string): void {
 		throw new WorkflowGateSchemaError(`schema node at ${path} must be an object`);
 	}
 	for (const key of Object.keys(schema)) {
-		if (!SUPPORTED_KEYWORDS.has(key as keyof RpcJsonSchema)) {
+		if (!SUPPORTED_KEYWORDS.has(key as keyof JsonSchema)) {
 			throw new WorkflowGateSchemaError(`unsupported keyword "${key}" at ${path}`);
 		}
 	}
@@ -148,7 +148,7 @@ function walkSchema(schema: RpcJsonSchema, depth: number, path: string): void {
 		if (propKeys.length > GATE_SCHEMA_LIMITS.maxProperties) {
 			throw new WorkflowGateSchemaError(`properties at ${path} exceed ${GATE_SCHEMA_LIMITS.maxProperties}`);
 		}
-		for (const k of propKeys) walkSchema(schema.properties[k] as RpcJsonSchema, depth + 1, `${path}/properties/${k}`);
+		for (const k of propKeys) walkSchema(schema.properties[k] as JsonSchema, depth + 1, `${path}/properties/${k}`);
 	}
 	if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== "boolean") {
 		if (
@@ -166,7 +166,7 @@ function walkSchema(schema: RpcJsonSchema, depth: number, path: string): void {
 		if (branches !== undefined) {
 			if (!Array.isArray(branches)) throw new WorkflowGateSchemaError(`${combiner} at ${path} must be an array`);
 			for (let i = 0; i < branches.length; i++)
-				walkSchema(branches[i] as RpcJsonSchema, depth + 1, `${path}/${combiner}/${i}`);
+				walkSchema(branches[i] as JsonSchema, depth + 1, `${path}/${combiner}/${i}`);
 		}
 	}
 }
@@ -175,7 +175,7 @@ type SchemaError = { path: string; keyword: string; message: string; expected?: 
 
 /** A compiled, cached validator for one schema. */
 export interface CompiledGateSchema {
-	readonly schema: RpcJsonSchema;
+	readonly schema: JsonSchema;
 	readonly hash: string;
 	validate(answer: unknown): SchemaError[];
 }
@@ -183,7 +183,7 @@ export interface CompiledGateSchema {
 const compileCache = new Map<string, CompiledGateSchema>();
 
 /** Compile (and cache) a validator for a schema. Asserts shape on first compile. */
-export function compileGateSchema(schema: RpcJsonSchema): CompiledGateSchema {
+export function compileGateSchema(schema: JsonSchema): CompiledGateSchema {
 	const hash = schemaHash(schema);
 	const cached = compileCache.get(hash);
 	if (cached) return cached;
@@ -206,7 +206,7 @@ export function compileGateSchema(schema: RpcJsonSchema): CompiledGateSchema {
 	return compiled;
 }
 
-function typeMatches(type: NonNullable<RpcJsonSchema["type"]>, value: unknown): boolean {
+function typeMatches(type: NonNullable<JsonSchema["type"]>, value: unknown): boolean {
 	switch (type) {
 		case "string":
 			return typeof value === "string";
@@ -225,7 +225,7 @@ function typeMatches(type: NonNullable<RpcJsonSchema["type"]>, value: unknown): 
 	}
 }
 
-function validateValue(schema: RpcJsonSchema, value: unknown, path: string, errors: SchemaError[]): void {
+function validateValue(schema: JsonSchema, value: unknown, path: string, errors: SchemaError[]): void {
 	if (schema.type !== undefined && !typeMatches(schema.type, value)) {
 		errors.push({ path, keyword: "type", message: `expected ${schema.type}`, expected: schema.type });
 		return;
@@ -318,7 +318,7 @@ function validateValue(schema: RpcJsonSchema, value: unknown, path: string, erro
 		}
 		if (schema.items) {
 			for (let i = 0; i < value.length; i++)
-				validateValue(schema.items as RpcJsonSchema, value[i], `${path}/${i}`, errors);
+				validateValue(schema.items as JsonSchema, value[i], `${path}/${i}`, errors);
 		}
 	}
 	for (const combiner of ["oneOf", "anyOf"] as const) {
@@ -336,13 +336,13 @@ function validateValue(schema: RpcJsonSchema, value: unknown, path: string, erro
 
 /**
  * Validate an answer against a compiled gate schema. Returns `null` on success
- * or a typed {@link RpcWorkflowGateValidationError} on mismatch.
+ * or a typed {@link WorkflowGateValidationError} on mismatch.
  */
 export function validateGateAnswer(
 	compiled: CompiledGateSchema,
 	gateId: string,
 	answer: unknown,
-): RpcWorkflowGateValidationError | null {
+): WorkflowGateValidationError | null {
 	const errors = compiled.validate(answer);
 	if (errors.length === 0) return null;
 	return { code: "invalid_workflow_gate_answer", gate_id: gateId, schema_hash: compiled.hash, errors };

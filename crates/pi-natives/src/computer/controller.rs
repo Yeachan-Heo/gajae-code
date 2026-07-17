@@ -10,7 +10,7 @@ use napi_derive::napi;
 use crate::computer::{
 	ComputerScreenshot,
 	capture::capture_primary_display,
-	executor::{ExecError, InputAction, MacDisplayContext, MacPermissionGate, execute_input},
+	executor::{DisplayContext, ExecError, InputAction, MacPermissionGate, execute_input},
 	hotkey,
 	input::{MouseButton, guarded_controller},
 	supervisor::Supervisor,
@@ -125,6 +125,7 @@ impl ComputerController {
 		let frame =
 			capture_primary_display().map_err(|err| napi::Error::from_reason(format!("{err}")))?;
 		let display = frame.display;
+		let display_ctx = CapturedDisplayContext { epoch: frame.display_epoch };
 		let mut controller = guarded_controller()
 			.map_err(|err| napi_error("COMPUTER_PERMISSION_REQUIRED", err.to_string()))?;
 		let cancel = || Supervisor::global().is_suspended();
@@ -132,13 +133,23 @@ impl ComputerController {
 			&action,
 			Supervisor::global(),
 			&MacPermissionGate,
-			&MacDisplayContext,
+			&display_ctx,
 			expected_epoch.map(epoch_from_f64),
 			&display,
 			&mut controller,
 			&cancel,
 		)
 		.map_err(exec_error)
+	}
+}
+
+struct CapturedDisplayContext {
+	epoch: u64,
+}
+
+impl DisplayContext for CapturedDisplayContext {
+	fn current_epoch(&self) -> u64 {
+		self.epoch
 	}
 }
 

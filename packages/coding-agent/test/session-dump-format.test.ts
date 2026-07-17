@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { AssistantMessage, Usage } from "@gajae-code/ai";
+import type { AssistantMessage, Model, Usage } from "@gajae-code/ai";
 import { formatSessionDumpText } from "@gajae-code/coding-agent/session/session-dump-format";
 
 const zeroUsage: Usage = {
@@ -16,6 +16,56 @@ const zeroUsage: Usage = {
 		total: 0,
 	},
 };
+
+function pricedModel(): Model {
+	return {
+		id: "claude",
+		name: "Claude",
+		api: "anthropic-messages",
+		provider: "anthropic",
+		baseUrl: "https://example.test",
+		reasoning: true,
+		input: ["text"],
+		cost: {
+			input: 3,
+			output: 15,
+			cacheRead: 0.3,
+			cacheWrite: 3.75,
+		},
+		contextWindow: 200_000,
+		maxTokens: 64_000,
+	};
+}
+
+function assistantWithUsage(usage: Usage, timestamp: number): AssistantMessage {
+	return {
+		role: "assistant",
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude",
+		usage,
+		stopReason: "stop",
+		timestamp,
+		content: [{ type: "text", text: `assistant ${timestamp}` }],
+	};
+}
+
+function cacheWarningUsage(): Usage {
+	return {
+		...zeroUsage,
+		input: 20_000,
+		cacheRead: 1_000,
+		cacheWrite: 2_000,
+		totalTokens: 23_000,
+	};
+}
+
+function cacheWarningUsageWithoutInputCost(): Usage {
+	return {
+		...cacheWarningUsage(),
+		cost: { output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } as Usage["cost"],
+	};
+}
 
 function assistantWithProxyAsk(): AssistantMessage {
 	return {
@@ -122,5 +172,63 @@ describe("formatSessionDumpText tool calls", () => {
 		expect(dumped).toContain('name="unsafe&lt;key"');
 		expect(dumped).toContain("readable Korean: 한글 &amp; raw &lt;tag&gt;");
 		expect(dumped).not.toContain("\\ud55c");
+	});
+});
+
+describe("formatSessionDumpText cache warnings", () => {
+	it("renders a cache warning after assistant content when pricing supports it", () => {
+		const dumped = formatSessionDumpText({
+			messages: [assistantWithUsage(cacheWarningUsageWithoutInputCost(), 1)],
+			model: pricedModel(),
+			thinkingLevel: null,
+		});
+
+		expect(dumped).toContain(
+			"assistant 1\nCache warning: large uncached input with low cache reuse ($0.06); next step:",
+		);
+	});
+
+	it("does not reprice an explicit persisted input cost of zero", () => {
+		const dumped = formatSessionDumpText({
+			messages: [assistantWithUsage(cacheWarningUsage(), 1)],
+			model: pricedModel(),
+			thinkingLevel: null,
+		});
+
+		expect(dumped).not.toContain("$0.06");
+		expect(dumped).not.toContain("Cache warning:");
+	});
+
+	it("omits cache warnings when model pricing is unavailable", () => {
+		const usage = cacheWarningUsageWithoutInputCost();
+		const withPricing = formatSessionDumpText({
+			messages: [assistantWithUsage(usage, 1)],
+			model: pricedModel(),
+			thinkingLevel: null,
+		});
+		expect(withPricing).toContain("Cache warning:");
+
+		const withoutPricing = formatSessionDumpText({
+			messages: [assistantWithUsage(usage, 1)],
+			model: null,
+			thinkingLevel: null,
+		});
+		expect(withoutPricing).not.toContain("Cache warning:");
+	});
+
+	it("caps cache warnings at three assistant turns", () => {
+		const dumped = formatSessionDumpText({
+			messages: [
+				assistantWithUsage(cacheWarningUsageWithoutInputCost(), 1),
+				assistantWithUsage(cacheWarningUsageWithoutInputCost(), 2),
+				assistantWithUsage(cacheWarningUsageWithoutInputCost(), 3),
+				assistantWithUsage(cacheWarningUsageWithoutInputCost(), 4),
+			],
+			model: pricedModel(),
+			thinkingLevel: null,
+		});
+
+		expect(dumped.match(/Cache warning:/g)?.length).toBe(3);
+		expect(dumped).toContain("assistant 4");
 	});
 });

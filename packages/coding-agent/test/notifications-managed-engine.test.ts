@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Settings } from "../src/config/settings";
-import { ManagedNotificationDaemon, type ManagedNotificationDaemonFs } from "../src/notifications/managed-daemon";
+import { ManagedNotificationDaemon, type ManagedNotificationDaemonFs } from "../src/sdk/bus/managed-daemon";
 
 class TestDaemon extends ManagedNotificationDaemon {
 	constructor(fsImpl: ManagedNotificationDaemonFs) {

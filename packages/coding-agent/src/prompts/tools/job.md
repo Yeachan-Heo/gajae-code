@@ -1,6 +1,6 @@
 Inspects, waits, or cancels async jobs.
 
-Background job results are delivered automatically when complete. Running job output stays quiet by default to avoid flooding the conversation; use `tail` when you explicitly want to show/reopen retained output. Reach for this tool only when you need to inspect or intervene.
+Background job results are delivered automatically when complete. Jobs that back task subagents should be controlled via the `subagent` tool when it is available; use `job` for non-subagent jobs (async bash, monitors) and as a compatibility fallback. Running job output stays quiet by default to avoid flooding the conversation; use `tail` when you explicitly want to show/reopen retained output. Reach for this tool only when you need to inspect or intervene.
 
 In the interactive TUI, supported managed foreground bash can be folded into a background job by pressing `Ctrl+B` twice while it is running. Raw shell `Ctrl+Z`/`bg` is not the supported path inside GJC because it bypasses job ownership and output-routing contracts.
 
@@ -16,7 +16,7 @@ Show the retained output buffer for one or more background jobs without waiting.
 - Prefer `tail` over polling when you only need to peek at progress, so the conversation can continue without flooding the TUI.
 
 ## `poll: [id, …]`
-Block until the specified jobs finish or the wait window elapses.
+Block until the specified jobs finish or the wait window (~30 s, not configurable) elapses.
 - Use when you are genuinely blocked on a result and have no other work to do.
 - Returns the current snapshot when the timer elapses; running jobs remain running.
 - Completed jobs include their final output in the returned snapshot.

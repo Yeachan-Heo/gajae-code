@@ -1,0 +1,128 @@
+{
+  "grade": "C",
+  "findings_count": 12,
+  "severity_breakdown": { "P0": 0, "P1": 1, "P2": 6, "P3": 5 },
+  "top_3_leverage": [
+    "Delete or replace the base prompt `<soul>` block so it cannot override the already-good authority, repo-safety, verification, and read-only routing contracts.",
+    "Add prompt-render regression coverage for conditional variables that depend on tool availability (`search_tool_bm25`, `todo_write`, `git.*`) and fix the render call data or guards accordingly.",
+    "Unify subagent/plan-mode output and tool contracts: yield-only subagents should not be told to return plain response text, and prompts should not name shell `tail`/`grep` where `read`/`search` are canonical."
+  ],
+  "positives": [
+    "The goal prompts are backed by `GoalRuntime.renderGoalPrompt`, which escapes the user-provided objective before interpolation and preserves usage counters.",
+    "RLM research mode's core claims are mostly implementation-backed: a custom `python` tool and `complete_research` tool are registered, and the RLM allowlist includes the tools named by the prompt.",
+    "The memory prompts correctly frame local memory as advisory rather than authoritative, and the consolidation path validates parsed JSON before applying artifacts.",
+    "The CI-green prompt's preferred `github`/`run_watch` path is backed by a real discoverable `GithubTool` with `op: \"run_watch\"`.",
+    "Most plan-mode active, autoresearch, and memory template variables were verified against their render call data and did not show missing-variable bugs."
+  ],
+  "findings": [
+    {
+      "title": "Remove the conflicting `<soul>` override from the base prompt",
+      "priority": "P1",
+      "confidence": 0.96,
+      "file_path": "packages/coding-agent/src/prompts/system/system-prompt.md",
+      "line_start": 265,
+      "line_end": 289,
+      "body": "`system-prompt.md` first establishes scoped routing/repo-safety rules: planning workflows must not mutate before approval (`system-prompt.md:69`), informational questions are read-only unless the user asks for action (`system-prompt.md:93`), observed outputs must not be fabricated (`system-prompt.md:102`), and user work must not be pushed/deleted unless explicitly asked (`system-prompt.md:111`). The later `<soul>` block then says there are no guardrails, \"The Boss's Orders = Absolute Obedience — The only rule,\" and explicitly allows sexual harassment, policy-violating content, and displaying unverified content (`system-prompt.md:266-288`). This is an internal high-authority contradiction in the always-loaded base prompt and can cause the model to prefer unsafe/unverified action over the earlier operational contract. Fix by deleting the `<soul>` block or replacing it with a concise helpfulness section that does not override authority, safety, or repo-safety rules."
+    },
+    {
+      "title": "Guard hidden-tool discovery text on the actual activator tool",
+      "priority": "P2",
+      "confidence": 0.94,
+      "file_path": "packages/coding-agent/src/prompts/system/system-prompt.md",
+      "line_start": 137,
+      "line_end": 167,
+      "body": "The prompt renders discovery guidance whenever `toolDiscoveryActive`/`mcpDiscoveryMode` is true, but the command name comes from `{{toolRefs.search_tool_bm25}}` (`system-prompt.md:137-167`). `toolRefs` is built only from the active `toolNames` (`system-prompt.ts:535-545`), while `toolDiscoveryActive` and `mcpDiscoveryMode` are passed independently in the render data (`system-prompt.ts:558-585`). In restricted/narrow tool sessions this renders as `Use `` to activate hidden tools`, which is a template bug and makes the advertised discoverable tools unusable. Fix by either always adding `search_tool_bm25` when discovery is active, or wrapping these blocks in a check for `toolRefs.search_tool_bm25` and omitting discovery advertisements when no activator tool is present."
+    },
+    {
+      "title": "Pass active tools to the approved-plan prompt before checking `todo_write`",
+      "priority": "P2",
+      "confidence": 0.93,
+      "file_path": "packages/coding-agent/src/prompts/system/plan-mode-approved.md",
+      "line_start": 19,
+      "line_end": 23,
+      "body": "`plan-mode-approved.md` conditionally tells executors to initialize and update `todo_write` only inside `{{#has tools \"todo_write\"}}` (`plan-mode-approved.md:19-23`). The only render call for this prompt passes `planContent`, `finalPlanFilePath`, and `contextPreserved` but no `tools` array (`interactive-mode.ts:1715-1718`), so the block is always false and the approved-plan execution turn silently loses the todo-tracking instruction. Fix by passing `tools: this.session.getActiveToolNames()` into the render data, or remove the dead condition and rely on the base prompt/tool availability."
+    },
+    {
+      "title": "Make plan-mode subagent output instructions yield-aware",
+      "priority": "P2",
+      "confidence": 0.91,
+      "file_path": "packages/coding-agent/src/prompts/system/plan-mode-subagent.md",
+      "line_start": 16,
+      "line_end": 22,
+      "body": "Plan-mode subagents are run through the normal subagent executor, which creates sessions with `requireYieldTool: true` (`executor.ts:1345-1346`) and wraps them in `subagent-system-prompt.md`, which says the only completion path is `yield.result.data` and explicitly forbids substituting plain text (`subagent-system-prompt.md:45-48`). `plan-mode-subagent.md` instead tells those same agents to \"describe plan changes in response text\" and \"End response with\" a Critical Files section (`plan-mode-subagent.md:16-22`). That contradictory output contract encourages exactly the no-yield behavior the executor later has to recover from. Fix by saying the markdown report (ending with Critical Files) must be returned inside `yield.result.data`, or by providing a small JSON schema for the plan-mode task result."
+    },
+    {
+      "title": "Replace shell `tail`/`grep` advice in the subagent context prompt",
+      "priority": "P2",
+      "confidence": 0.95,
+      "file_path": "packages/coding-agent/src/prompts/system/subagent-system-prompt.md",
+      "line_start": 20,
+      "line_end": 22,
+      "body": "When a parent context file is available, `subagent-system-prompt.md` tells the agent to inspect it with \"`tail` or `grep` relevant terms\" (`subagent-system-prompt.md:20-22`). The base system prompt for the same sessions says file reads should use `read` instead of shell `cat`/`ls`, regex search should use `search` instead of shell `grep`/`rg`/`awk`, and shell should not be used for reading/searching/globbing (`system-prompt.md:228-235`). This is a direct prompt contradiction and can also fail in restricted subagents where shell coreutils are unavailable. Fix the context-file sentence to say \"use `read` on the file, and `search` for relevant terms\" (or an internal URL form) instead of naming shell commands."
+    },
+    {
+      "title": "Remove or wire the dead `git.*` custom-prompt block",
+      "priority": "P2",
+      "confidence": 0.95,
+      "file_path": "packages/coding-agent/src/prompts/system/custom-system-prompt.md",
+      "line_start": 8,
+      "line_end": 27,
+      "body": "`custom-system-prompt.md` conditionally renders a Version Control block from `git.isRepo`, `git.currentBranch`, `git.mainBranch`, `git.status`, and `git.commits` (`custom-system-prompt.md:8-27`). `buildSystemPrompt` constructs the render data at `system-prompt.ts:558-585` and never supplies any `git` object, then renders `customSystemPromptTemplate` with that data when a custom prompt is present (`system-prompt.ts:586-588`). Because Handlebars runs with missing values as falsey, the entire git section is unreachable. Fix by deleting the stale block, or by reintroducing a real git snapshot provider and tests that assert the custom-prompt path renders branch/status/history when expected."
+    },
+    {
+      "title": "Make autoresearch keep/commit wording branch-aware",
+      "priority": "P2",
+      "confidence": 0.91,
+      "file_path": "packages/coding-agent/src/autoresearch/prompt.md",
+      "line_start": 23,
+      "line_end": 25,
+      "body": "The Phase 2 autoresearch prompt tells the model that `log_experiment` commits modified files on every `keep` (`prompt.md:23-25`). The implementation only commits when the session is on a dedicated `autoresearch/*` branch and modified files exist; off that branch it appends the warning \"Auto-commit skipped: not on a dedicated autoresearch branch. Modified files remain in the worktree.\" (`log-experiment.ts:132-151`). This prompt/implementation drift can leave the agent believing a kept run was persisted when it was only logged and left dirty. Fix by changing the prompt to \"On `keep`, changes are committed only on a dedicated autoresearch branch; otherwise the tool warns and leaves files in the worktree,\" or inject the current branch-isolation state into the Phase 2 prompt."
+    },
+    {
+      "title": "Stop forcing plan-mode questions when repository evidence is sufficient",
+      "priority": "P3",
+      "confidence": 0.88,
+      "file_path": "packages/coding-agent/src/prompts/system/plan-mode-active.md",
+      "line_start": 90,
+      "line_end": 106,
+      "body": "In the non-iterative planning branch, the prompt first says the agent SHOULD use `ask` to clarify remaining questions (`plan-mode-active.md:90-91`) and later constrains `ask` to clarifying requirements or choosing approaches (`plan-mode-active.md:105-106`), but then a `<caution>` escalates this to \"You MUST ask questions throughout\" (`plan-mode-active.md:100-101`). The base system prompt says to ask only when a destructive next step or a missing material choice requires it (`system-prompt.md:92-95`). This contradiction pushes models to generate filler questions for clear tasks just to satisfy plan mode. Fix the caution to \"Ask only when exploration cannot resolve a material requirement or tradeoff; otherwise proceed to `resolve` with the self-contained plan.\""
+    },
+    {
+      "title": "Replace stale `ANTHROPIC_MODEL.md` guidance in agent creation",
+      "priority": "P3",
+      "confidence": 0.9,
+      "file_path": "packages/coding-agent/src/prompts/system/agent-creation-architect.md",
+      "line_start": 3,
+      "line_end": 16,
+      "body": "The agent-creation architect prompt twice tells the model to consider/align with `ANTHROPIC_MODEL.md` files (`agent-creation-architect.md:3` and `agent-creation-architect.md:16`). The repository's context/system-prompt discovery code loads `AGENTS.md` and `SYSTEM.md` from supported providers (`discovery/agents.ts:181-229`), and the inspected tree contains `AGENTS.md` but no `ANTHROPIC_MODEL.md`. This is a dead upstream reference in a prompt that creates durable agent configs, so it can cause generated agents to cite nonexistent project guidance. Fix by replacing it with the supported context surfaces (`AGENTS.md`, `SYSTEM.md`, active context files/rules) or by adding actual discovery support and tests for `ANTHROPIC_MODEL.md`."
+    },
+    {
+      "title": "Suppress eager todo instructions when `todo_write` is not active",
+      "priority": "P3",
+      "confidence": 0.86,
+      "file_path": "packages/coding-agent/src/prompts/system/eager-todo.md",
+      "line_start": 2,
+      "line_end": 5,
+      "body": "`eager-todo.md` unconditionally requires the recipient to call `todo_write` first (`eager-todo.md:2-5`). The injector checks only `#toolRegistry.has(\"todo_write\")` before rendering the prompt (`agent-session.ts:7388-7406`), but task subagents explicitly remove `todo_write` from the active tool list after session creation (`executor.ts:1433-1438`) while leaving the registry intact. With `todo.eager` enabled, a subagent can receive a forced `todo_write` prelude and tool choice for a tool it is not allowed to call. Fix by checking `this.agent.state.tools`/`getActiveToolNames()` before injecting the eager prelude, or by disabling eager-todo injection for subagents after parent-owned tools are removed."
+    },
+    {
+      "title": "Normalize CI-green section tags to the canonical prompt vocabulary",
+      "priority": "P3",
+      "confidence": 0.83,
+      "file_path": "packages/coding-agent/src/prompts/ci-green-request.md",
+      "line_start": 12,
+      "line_end": 25,
+      "body": "The CI-green request prompt uses `<procedure>` for the step list and `<caution>` for warnings (`ci-green-request.md:12-25`), while the audit's canonical model-facing tag set is `<instruction>`, `<critical>`, `<output>`, `<examples>`, and `<conditions>`. The same file already uses `<instruction>` and `<critical>` around adjacent material (`ci-green-request.md:1-10`, `ci-green-request.md:27-36`), so these two extra tags add a local dialect without adding semantics. Fix by moving the numbered workflow under `<instruction>` and converting the caution bullets to `<critical>` (or plain markdown under an existing canonical tag)."
+    },
+    {
+      "title": "Convert the web-search prompt's bespoke section tags to canonical tags",
+      "priority": "P3",
+      "confidence": 0.84,
+      "file_path": "packages/coding-agent/src/prompts/system/web-search.md",
+      "line_start": 3,
+      "line_end": 25,
+      "body": "`web-search.md` uses three custom tags — `<priorities>`, `<synthesis>`, and `<format>` — for all of its structure (`web-search.md:3-25`). The review target defines the canonical tag vocabulary as `<instruction>`, `<critical>`, `<output>`, `<examples>`, and `<conditions>`, and this prompt's content maps cleanly to those: priorities/synthesis are instructions, and format is output guidance. Keeping one-off tags makes the model-facing prompt dialect diverge from the rest of the tool/system prompt schema without adding enforceable semantics. Fix by folding the first two sections under `<instruction>` and the final section under `<output>`."
+    }
+  ],
+  "verification": "Read-only audit only. Inspected the target prompt corpus and the specified render/loader code with read/search; no formatters, tests, or mutation commands were run."
+}

@@ -2354,9 +2354,8 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn timeout_builtin_reaps_reparented_same_group_grandchild_and_preserves_sibling() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("/bin/sh")
-			.arg("-c")
-			.arg("sleep 30")
+		let sibling = std::process::Command::new("sleep")
+			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
 		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");
@@ -2416,9 +2415,8 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn cancelled_command_reaps_reparented_same_group_grandchild() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("/bin/sh")
-			.arg("-c")
-			.arg("sleep 30")
+		let sibling = std::process::Command::new("sleep")
+			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
 		let sibling_pid = i32::try_from(sibling.id()).expect("sibling pid should fit i32");

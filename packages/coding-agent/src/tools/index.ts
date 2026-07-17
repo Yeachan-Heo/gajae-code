@@ -10,7 +10,7 @@ import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
 import { LspTool } from "../lsp";
-import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/unattended-session";
+import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type {
@@ -34,6 +34,7 @@ import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import type { BashRestrictionProfile } from "./bash-allowed-prefixes";
+import { BisectTool } from "./bisect";
 import { BrowserTool } from "./browser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
@@ -55,6 +56,7 @@ import { reportFindingTool } from "./review";
 import { SearchTool } from "./search";
 import { SearchToolBm25Tool } from "./search-tool-bm25";
 import { SkillTool } from "./skill";
+import { SkillDiscoveryTool } from "./skill-discovery";
 import { loadSshTool } from "./ssh";
 import { SubagentTool } from "./subagent";
 import { TelegramSendTool } from "./telegram-send";
@@ -72,6 +74,7 @@ export * from "./ask";
 export * from "./ast-edit";
 export * from "./ast-grep";
 export * from "./bash";
+export * from "./bisect";
 export * from "./browser";
 export * from "./calculator";
 export * from "./checkpoint";
@@ -93,6 +96,7 @@ export * from "./review";
 export * from "./search";
 export * from "./search-tool-bm25";
 export * from "./skill";
+export * from "./skill-discovery";
 export * from "./ssh";
 export * from "./subagent";
 export * from "./telegram-send";
@@ -110,7 +114,6 @@ export type ContextFileEntry = {
 	depth?: number;
 };
 
-export type { DiscoverableMCPTool } from "../runtime-mcp/discoverable-tool-metadata";
 export type {
 	DiscoverableTool,
 	DiscoverableToolSearchIndex,
@@ -118,16 +121,92 @@ export type {
 	DiscoverableToolSource,
 } from "../tool-discovery/tool-index";
 
+/** A typed remote action available to an ask answer source. */
+export type AskRemoteControlId = "navigation_forward";
+
+export interface AskRemoteControl {
+	id: AskRemoteControlId;
+	kind: "navigation";
+	label: "Next" | "Done";
+	enabled: boolean;
+}
+
+export interface AskAnswerRequest {
+	question: string;
+	options: string[];
+	interaction: "selector" | "custom_editor" | "clarification_editor";
+	controls: readonly AskRemoteControl[];
+}
+
+export type AskRemoteInteraction =
+	| { kind: "value"; value: string }
+	| { kind: "control"; controlId: AskRemoteControlId };
+
+export type AskSettlement =
+	| { kind: "commit" }
+	| {
+			kind: "resolve_without_commit";
+			reason:
+				| "toggle"
+				| "other_transition"
+				| "clarification_transition"
+				| "clarification_submitted"
+				| "empty_navigation"
+				| "back_navigation"
+				| "cancelled"
+				| "aborted"
+				| "timed_out"
+				| "exception"
+				| "shutdown";
+	  }
+	| {
+			kind: "invalid";
+			reason:
+				| "invalid_option"
+				| "invalid_control"
+				| "invalid_structured_answer"
+				| "empty_custom"
+				| "empty_clarification";
+	  };
+
+export type AskSelectedAckOutcome =
+	| { status: "delivered"; messageId: number }
+	| {
+			status: "failed";
+			reason:
+				| "unsupported"
+				| "no_participant"
+				| "ambiguous_participant"
+				| "route_missing"
+				| "expired"
+				| "cancelled"
+				| "telegram_rejected"
+				| "session_closed";
+	  }
+	| { status: "unknown"; reason: "transport_ambiguous" | "origin_disconnected" | "host_timeout" | "shutdown" };
+
+export type AskSettlementResult =
+	| { kind: "committed"; ack: AskSelectedAckOutcome }
+	| { kind: "resolved_without_commit" }
+	| { kind: "invalid_closed" };
+
+export interface AskRemoteReceipt {
+	source: "remote";
+	interaction: AskRemoteInteraction;
+	settle(value: AskSettlement): Promise<AskSettlementResult>;
+}
+
+export type AskAnswerSourceResult = AskRemoteReceipt | string | undefined;
+
 /**
- * Source of remote answers for interactive asks (e.g. a Telegram reply routed
- * through the notifications SDK). Lets a pending ask resolve without RPC mode.
+ * Source of remote answers for interactive asks. `awaitAnswer` remains the legacy
+ * wire for existing integrations; typed sources opt into `awaitAnswerRequest`.
+ * This keeps a string-only source from accidentally acquiring acknowledgement
+ * authority while allowing SDK-routed interactions to settle durably.
  */
 export interface AskAnswerSource {
-	/**
-	 * Race a remote answer against the local UI for one question. Resolves with the
-	 * chosen option label or free-text answer, or `undefined` to defer to local UI.
-	 */
 	awaitAnswer(question: string, options: string[], signal?: AbortSignal): Promise<string | undefined>;
+	awaitAnswerRequest?(request: AskAnswerRequest, signal?: AbortSignal): Promise<AskAnswerSourceResult>;
 }
 
 /** Session context for tool factories */
@@ -198,6 +277,8 @@ export interface ToolSession {
 	bashRestrictionProfile?: BashRestrictionProfile;
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
+	/** Throw instead of warn when toolNames contains an unknown name. */
+	strictToolNames?: boolean;
 	/** Get artifacts directory for artifact:// URLs */
 	getArtifactsDir?: () => string | null;
 	/** Get the ArtifactManager backing this session (shared across parent + subagents). */
@@ -226,12 +307,11 @@ export interface ToolSession {
 	getPlanModeState?: () => PlanModeState | undefined;
 	/** Goal mode state (if active or paused) */
 	getGoalModeState?: () => GoalModeState | undefined;
-	/** Unattended workflow-gate emitter (present only when unattended mode is negotiated). */
+	/** SDK workflow-gate emitter, when a remote gate responder is connected. */
 	getWorkflowGateEmitter?: () => WorkflowGateEmitter | undefined;
 	/**
-	 * Optional remote answer source for interactive asks. When present, the ask
-	 * tool races the local UI selection against a remote answer (e.g. a Telegram
-	 * reply via the notifications SDK) so asks can be answered without RPC mode.
+	 * Optional SDK-routed answer source for interactive asks. When present, the
+	 * tool races the local UI selection against the remote SDK answer.
 	 * No-op when undefined: the ask path behaves exactly as before.
 	 */
 	getAskAnswerSource?: () => AskAnswerSource | undefined;
@@ -247,18 +327,6 @@ export interface ToolSession {
 	getTodoPhases?: () => TodoPhase[];
 	/** Replace cached todo phases for this session. */
 	setTodoPhases?: (phases: TodoPhase[]) => void;
-	/** Whether MCP tool discovery is active for this session. */
-	isMCPDiscoveryEnabled?: () => boolean;
-	/** Get hidden-but-discoverable MCP tools for search_tool_bm25 prompts and fallbacks.
-	 * @deprecated Use getDiscoverableTools with source filter instead. */
-	getDiscoverableMCPTools?: () => import("../runtime-mcp/discoverable-tool-metadata").DiscoverableMCPTool[];
-	/** Get the cached discoverable MCP search index for search_tool_bm25 execution.
-	 * @deprecated Use getDiscoverableToolSearchIndex instead. */
-	getDiscoverableMCPSearchIndex?: () => import("../tool-discovery/tool-index").DiscoverableMCPSearchIndex;
-	/** Get MCP tools activated by prior search_tool_bm25 calls. */
-	getSelectedMCPToolNames?: () => string[];
-	/** Merge MCP tool selections into the active session tool set. */
-	activateDiscoveredMCPTools?: (toolNames: string[]) => Promise<string[]>;
 	// ── Generic tool discovery (unified — covers built-in + MCP + extension) ──
 	/** Whether any form of tool discovery is active (tools.discoveryMode !== "off" or mcp.discoveryMode). */
 	isToolDiscoveryEnabled?: () => boolean;
@@ -387,6 +455,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	render_mermaid: s => new RenderMermaidTool(s),
 	ask: AskTool.createIf,
 	debug: DebugTool.createIf,
+	bisect: s => new BisectTool(s),
 	eval: s => new EvalTool(s),
 	calc: s => new CalculatorTool(s),
 	ssh: loadSshTool,
@@ -408,6 +477,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	todo_write: s => new TodoWriteTool(s),
 	web_search: s => new WebSearchTool(s),
 	search_tool_bm25: SearchToolBm25Tool.createIf,
+	skill_discovery: SkillDiscoveryTool.createIf,
 	telegram_send: TelegramSendTool.createIf,
 	write: s => new WriteTool(s),
 	skill: SkillTool.createIf,
@@ -567,6 +637,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "search_tool_bm25") return discoveryActive;
 		if (name === "calc") return session.settings.get("calc.enabled");
 		if (name === "skill") return session.settings.get("skill.enabled");
+		if (name === "skill_discovery") return session.settings.get("skill.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "computer") return isComputerCallable(session);
 		if (name === "checkpoint" || name === "rewind") return session.settings.get("checkpoint.enabled");
@@ -588,6 +659,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		requestedTools.push("yield");
 	}
 
+	if (requestedTools) {
+		const unknownToolNames = requestedTools.filter(name => !allToolsByRequestName.has(name));
+		if (unknownToolNames.length > 0) {
+			const message = `Unknown tool name${unknownToolNames.length === 1 ? "" : "s"}: ${unknownToolNames.join(", ")}`;
+			if (session.strictToolNames) throw new Error(message);
+			logger.warn(message);
+		}
+	}
 	const filteredRequestedTools = requestedTools
 		?.map(name => allToolsByRequestName.get(name))
 		.filter((entry): entry is [string, ToolFactory] => entry !== undefined)

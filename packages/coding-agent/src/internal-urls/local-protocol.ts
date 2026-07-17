@@ -145,37 +145,56 @@ export class LocalProtocolHandler implements ProtocolHandler {
 	readonly immutable = false;
 
 	static #override: LocalProtocolOptions | undefined;
+	static #ownedOverrides: Array<{ options: LocalProtocolOptions }> = [];
 
 	/**
-	 * Install a process-global override that wins over the AgentRegistry-based
-	 * derivation. Used by SDK consumers that wire `localProtocolOptions` on
-	 * `createAgentSession` and by subagents that share their parent's root.
+	 * Install an explicit local-protocol mapping owned by the caller.
+	 *
+	 * The most recently installed live mapping wins. The returned disposer removes
+	 * only this registration and is safe to call more than once.
+	 */
+	static installOverride(value: LocalProtocolOptions): () => void {
+		const registration = { options: value };
+		LocalProtocolHandler.#ownedOverrides.push(registration);
+		let disposed = false;
+		return () => {
+			if (disposed) return;
+			disposed = true;
+			const index = LocalProtocolHandler.#ownedOverrides.indexOf(registration);
+			if (index !== -1) LocalProtocolHandler.#ownedOverrides.splice(index, 1);
+		};
+	}
+
+	/**
+	 * Install a process-global test override that wins over owned and registry
+	 * mappings. Prefer {@link installOverride} for lifecycle-bound production use.
 	 */
 	static setOverride(value: LocalProtocolOptions | undefined): void {
 		LocalProtocolHandler.#override = value;
 	}
 
-	/** Reset the process-global override. Test-only. */
+	/** Reset all process-global local-protocol overrides. Test-only. */
 	static resetOverrideForTests(): void {
 		LocalProtocolHandler.#override = undefined;
+		LocalProtocolHandler.#ownedOverrides = [];
 	}
 
 	/**
 	 * Returns the active local-protocol options.
 	 *
 	 * Resolution order:
-	 * 1. Explicit override installed via {@link setOverride} (used by subagents
-	 *    that share their parent's root and by SDK consumers with a custom
-	 *    artifacts/session id mapping).
-	 * 2. The main session in `AgentRegistry.global()`. Its `SessionManager`
-	 *    supplies both `getArtifactsDir` and `getSessionId`.
+	 * 1. Direct test override installed via {@link setOverride}.
+	 * 2. The most recently installed live owned override.
+	 * 3. A live main session in `AgentRegistry.global()`.
 	 */
 	static resolveOptions(): LocalProtocolOptions | undefined {
 		const override = LocalProtocolHandler.#override;
 		if (override) return override;
+		const ownedOverride = LocalProtocolHandler.#ownedOverrides.at(-1)?.options;
+		if (ownedOverride) return ownedOverride;
 		const main = AgentRegistry.global()
 			.list()
-			.find(ref => ref.kind === "main");
+			.find(ref => ref.kind === "main" && ref.session && (ref.status === "running" || ref.status === "idle"));
 		const sessionManager = main?.session?.sessionManager;
 		if (!sessionManager) return undefined;
 		return {

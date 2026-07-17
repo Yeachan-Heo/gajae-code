@@ -26,6 +26,7 @@ import {
 import { type EditTask, loadTasksFromDir, validateFixturesFromDir } from "./tasks";
 
 const COLOR_ENABLED = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+const BENCHMARK_THINKING_LEVELS = new Set<string>([ThinkingLevel.Off, ...THINKING_EFFORTS]);
 
 const ANSI = {
 	reset: "\x1b[0m",
@@ -54,9 +55,7 @@ function rateColor(percent: number): string {
 }
 
 function parseThinkingLevel(value: string | null | undefined): ResolvedThinkingLevel | undefined {
-	return value !== undefined &&
-		value !== null &&
-		[ThinkingLevel.Off, ...THINKING_EFFORTS].includes(value as ResolvedThinkingLevel)
+	return value !== undefined && value !== null && BENCHMARK_THINKING_LEVELS.has(value)
 		? (value as ResolvedThinkingLevel)
 		: undefined;
 }

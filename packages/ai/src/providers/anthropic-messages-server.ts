@@ -417,6 +417,62 @@ function mapStopReasonOut(reason: StopReason): "end_turn" | "max_tokens" | "tool
 	}
 }
 
+/**
+ * True when `signature` is one of OUR serialized OpenAI Responses reasoning-item
+ * envelopes (produced by the Responses/Codex decoders as
+ * `JSON.stringify(reasoningItem)` with `type: "reasoning"`). Such an envelope is
+ * NOT a valid Anthropic thinking signature and may embed raw chain-of-thought in
+ * `content[]`, so it must never be forwarded on Anthropic egress. Genuine opaque
+ * Anthropic signatures and any non-envelope string return false (fail safe).
+ */
+function isSerializedResponsesReasoningItem(signature: string): boolean {
+	try {
+		const parsed: unknown = JSON.parse(signature);
+		return (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			!Array.isArray(parsed) &&
+			(parsed as { type?: unknown }).type === "reasoning"
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * A thinking-block signature safe to emit on Anthropic egress: cross-protocol
+ * serialized Responses reasoning envelopes are omitted (they can carry raw CoT);
+ * genuine opaque Anthropic signatures round-trip unchanged.
+ */
+function safeThinkingSignature(signature: string | undefined): string | undefined {
+	if (!signature) return undefined;
+	if (isSerializedResponsesReasoningItem(signature)) return undefined;
+	return signature;
+}
+
+function isResponsesFamilyApi(api: AssistantMessage["api"]): boolean {
+	return api === "openai-responses" || api === "openai-codex-responses";
+}
+
+function safeThinkingText(content: ThinkingContent, api: AssistantMessage["api"]): string | undefined {
+	if (isResponsesFamilyApi(api) && content.provenance === undefined) return undefined;
+	if (content.provenance === "raw") return undefined;
+	if (content.provenance === "mixed") return content.summaryText;
+	if (content.provenance === "summary") return content.summaryText ?? content.thinking;
+	return content.thinking;
+}
+
+function hasRawOrMixedThinking(partial: AssistantMessage, contentIndex: number): boolean {
+	const content = partial.content[contentIndex];
+	return content?.type === "thinking" && (content.provenance === "raw" || content.provenance === "mixed");
+}
+
+/** Responses-family reasoning is untrusted until output_item.done assigns provenance. */
+function hasUnfinalizedResponsesThinking(partial: AssistantMessage, contentIndex: number): boolean {
+	const content = partial.content[contentIndex];
+	return content?.type !== "thinking" || (isResponsesFamilyApi(partial.api) && content.provenance === undefined);
+}
+
 function encodeContentBlocks(message: AssistantMessage): Record<string, unknown>[] {
 	const blocks: Record<string, unknown>[] = [];
 	for (const c of message.content) {
@@ -425,8 +481,11 @@ function encodeContentBlocks(message: AssistantMessage): Record<string, unknown>
 				blocks.push({ type: "text", text: c.text });
 				break;
 			case "thinking": {
-				const b: Record<string, unknown> = { type: "thinking", thinking: c.thinking };
-				if (c.thinkingSignature) b.signature = c.thinkingSignature;
+				const thinking = safeThinkingText(c, message.api);
+				if (thinking === undefined) break;
+				const b: Record<string, unknown> = { type: "thinking", thinking };
+				const sig = safeThinkingSignature(c.thinkingSignature);
+				if (sig) b.signature = sig;
 				blocks.push(b);
 				break;
 			}
@@ -495,6 +554,12 @@ export function encodeStream(
 			const messageId = newMessageId();
 			let started = false;
 			const open = new Map<number, OpenBlock>();
+			// contentIndexes that already streamed a reasoning summary delta, so a
+			// final-only reasoning_summary_end does not duplicate streamed summary text.
+			const summaryDeltaSeen = new Set<number>();
+			// Responses assigns reasoning provenance only at output_item.done. Keep its
+			// pre-classification bytes out of this public compatibility stream.
+			const pendingThinkingDeltas = new Map<number, string[]>();
 
 			const ensureStart = (partial: AssistantMessage) => {
 				if (started) return;
@@ -522,6 +587,30 @@ export function encodeStream(
 				if (!open.has(index)) return;
 				controller.enqueue(sseFrame("content_block_stop", { type: "content_block_stop", index }));
 				open.delete(index);
+			};
+
+			const openThinking = (partial: AssistantMessage, index: number) => {
+				if (open.has(index)) return;
+				ensureStart(partial);
+				open.set(index, { index, kind: "thinking" });
+				controller.enqueue(
+					sseFrame("content_block_start", {
+						type: "content_block_start",
+						index,
+						content_block: { type: "thinking", thinking: "" },
+					}),
+				);
+			};
+
+			const writeThinkingDelta = (index: number, thinking: string) => {
+				if (thinking.length === 0) return;
+				controller.enqueue(
+					sseFrame("content_block_delta", {
+						type: "content_block_delta",
+						index,
+						delta: { type: "thinking_delta", thinking },
+					}),
+				);
 			};
 
 			try {
@@ -555,18 +644,73 @@ export function encodeStream(
 							closeBlock(ev.contentIndex);
 							break;
 						case "thinking_start": {
-							ensureStart(ev.partial);
-							open.set(ev.contentIndex, { index: ev.contentIndex, kind: "thinking" });
-							controller.enqueue(
-								sseFrame("content_block_start", {
-									type: "content_block_start",
-									index: ev.contentIndex,
-									content_block: { type: "thinking", thinking: "" },
-								}),
-							);
+							if (hasRawOrMixedThinking(ev.partial, ev.contentIndex)) break;
+							if (hasUnfinalizedResponsesThinking(ev.partial, ev.contentIndex)) {
+								pendingThinkingDeltas.set(ev.contentIndex, []);
+								break;
+							}
+							openThinking(ev.partial, ev.contentIndex);
 							break;
 						}
-						case "thinking_delta":
+						case "thinking_delta": {
+							if (hasRawOrMixedThinking(ev.partial, ev.contentIndex)) break;
+							if (hasUnfinalizedResponsesThinking(ev.partial, ev.contentIndex)) {
+								const deltas = pendingThinkingDeltas.get(ev.contentIndex) ?? [];
+								deltas.push(ev.delta);
+								pendingThinkingDeltas.set(ev.contentIndex, deltas);
+								break;
+							}
+							writeThinkingDelta(ev.contentIndex, ev.delta);
+							break;
+						}
+						case "thinking_end": {
+							const unfinalized = hasUnfinalizedResponsesThinking(ev.partial, ev.contentIndex);
+							const rawOrMixed = hasRawOrMixedThinking(ev.partial, ev.contentIndex);
+							const pending = pendingThinkingDeltas.get(ev.contentIndex);
+							pendingThinkingDeltas.delete(ev.contentIndex);
+							if (rawOrMixed || unfinalized) {
+								closeBlock(ev.contentIndex);
+								break;
+							}
+							if (pending) {
+								openThinking(ev.partial, ev.contentIndex);
+								for (const delta of pending) writeThinkingDelta(ev.contentIndex, delta);
+							}
+							const c = ev.partial.content[ev.contentIndex];
+							const sig = c?.type === "thinking" ? safeThinkingSignature(c.thinkingSignature) : undefined;
+							if (sig) {
+								controller.enqueue(
+									sseFrame("content_block_delta", {
+										type: "content_block_delta",
+										index: ev.contentIndex,
+										delta: { type: "signature_delta", signature: sig },
+									}),
+								);
+							}
+							closeBlock(ev.contentIndex);
+							break;
+						}
+						case "reasoning_summary_start": {
+							// Provider-displayable summary reasoning surfaces as this format's
+							// native thinking channel. Open the thinking block if a thinking_start
+							// did not already (summary-only streams emit no thinking_start).
+							if (!open.has(ev.contentIndex)) {
+								ensureStart(ev.partial);
+								open.set(ev.contentIndex, { index: ev.contentIndex, kind: "thinking" });
+								controller.enqueue(
+									sseFrame("content_block_start", {
+										type: "content_block_start",
+										index: ev.contentIndex,
+										content_block: { type: "thinking", thinking: "" },
+									}),
+								);
+							}
+							break;
+						}
+						case "reasoning_summary_delta":
+							// Only a non-whitespace delta counts as a delivered summary; a bare
+							// separator ("\n\n") must not suppress a later final-only end content.
+							if (ev.delta.trim().length > 0) summaryDeltaSeen.add(ev.contentIndex);
 							controller.enqueue(
 								sseFrame("content_block_delta", {
 									type: "content_block_delta",
@@ -575,18 +719,31 @@ export function encodeStream(
 								}),
 							);
 							break;
-						case "thinking_end": {
-							const c = ev.partial.content[ev.contentIndex];
-							if (c?.type === "thinking" && c.thinkingSignature) {
+						case "reasoning_summary_end": {
+							// Final-only summary: text arrives only on the end event with no prior
+							// deltas. Ensure the thinking block is open, then surface the content as
+							// a thinking_delta (skip when deltas already streamed to avoid dup). The
+							// thinking block is closed by the subsequent thinking_end.
+							if (ev.content.length > 0 && !summaryDeltaSeen.has(ev.contentIndex)) {
+								if (!open.has(ev.contentIndex)) {
+									ensureStart(ev.partial);
+									open.set(ev.contentIndex, { index: ev.contentIndex, kind: "thinking" });
+									controller.enqueue(
+										sseFrame("content_block_start", {
+											type: "content_block_start",
+											index: ev.contentIndex,
+											content_block: { type: "thinking", thinking: "" },
+										}),
+									);
+								}
 								controller.enqueue(
 									sseFrame("content_block_delta", {
 										type: "content_block_delta",
 										index: ev.contentIndex,
-										delta: { type: "signature_delta", signature: c.thinkingSignature },
+										delta: { type: "thinking_delta", thinking: ev.content },
 									}),
 								);
 							}
-							closeBlock(ev.contentIndex);
 							break;
 						}
 						case "toolcall_start": {
@@ -621,6 +778,7 @@ export function encodeStream(
 							break;
 						case "done": {
 							for (const idx of [...open.keys()]) closeBlock(idx);
+							pendingThinkingDeltas.clear();
 							controller.enqueue(
 								sseFrame("message_delta", {
 									type: "message_delta",
@@ -636,6 +794,7 @@ export function encodeStream(
 						}
 						case "error": {
 							const msg = ev.error.errorMessage ?? "stream error";
+							pendingThinkingDeltas.clear();
 							controller.enqueue(
 								sseFrame("error", { type: "error", error: { type: "api_error", message: msg } }),
 							);
@@ -645,10 +804,12 @@ export function encodeStream(
 					}
 				}
 				// stream ended without explicit done; close gracefully
+				pendingThinkingDeltas.clear();
 				for (const idx of [...open.keys()]) closeBlock(idx);
 				controller.enqueue(sseFrame("message_stop", { type: "message_stop" }));
 				controller.close();
 			} catch (err) {
+				pendingThinkingDeltas.clear();
 				controller.enqueue(
 					sseFrame("error", {
 						type: "error",

@@ -22,6 +22,11 @@ export interface RuleFrontmatter {
 	scope?: string | string[];
 	/** Per-rule TTSR interrupt mode override. */
 	interruptMode?: "never" | "prose-only" | "tool-only" | "always";
+	/** Per-rule TTSR repeat mode override. */
+	repeatMode?: "once" | "after-gap";
+	/** Per-rule TTSR repeat gap override. */
+	repeatGap?: number;
+
 	[key: string]: unknown;
 }
 
@@ -47,6 +52,10 @@ export interface Rule {
 	scope?: string[];
 	/** Per-rule TTSR interrupt mode override (falls back to global ttsr.interruptMode). */
 	interruptMode?: "never" | "prose-only" | "tool-only" | "always";
+	/** Per-rule TTSR repeat mode override (falls back to global ttsr.repeatMode). */
+	repeatMode?: "once" | "after-gap";
+	/** Per-rule TTSR repeat gap override (falls back to global ttsr.repeatGap). */
+	repeatGap?: number;
 	/** Source metadata */
 	_source: SourceMeta;
 }

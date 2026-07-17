@@ -1,6 +1,15 @@
-export const WORKFLOW_INTENT_DIFF_CUSTOM_TYPE = "workflow-intent-diff";
+import {
+	buildWorkflowIntentReport,
+	type WorkflowClaimsLedger,
+	type WorkflowConsensusReport,
+} from "./workflow-intent-report";
 
-export type WorkflowIntentRoute = "direct" | "deep-interview" | "ralplan" | "ultragoal" | "team";
+export const WORKFLOW_INTENT_DIFF_CUSTOM_TYPE = "workflow-intent-diff";
+export const WORKFLOW_INTENT_ROUTES = ["direct", "deep-interview", "ralplan", "ultragoal", "team"] as const;
+export const WORKFLOW_ESCALATION_ROUTES = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
+
+export type WorkflowIntentRoute = (typeof WORKFLOW_INTENT_ROUTES)[number];
+export type WorkflowEscalationRoute = (typeof WORKFLOW_ESCALATION_ROUTES)[number];
 export type DirectTrackingMode = "custom-entry-only" | "not-direct";
 export type RootCausePhaseStatus = "active" | "inactive";
 
@@ -9,13 +18,15 @@ export interface WorkflowIntentDiff {
 	readonly route: WorkflowIntentRoute;
 	readonly reason: string;
 	readonly directTracking: DirectTrackingMode;
-	readonly recommendedSkill?: Exclude<WorkflowIntentRoute, "direct">;
+	readonly recommendedSkill?: WorkflowEscalationRoute;
 	readonly recommendedInvocation?: string;
 	readonly triggers: readonly string[];
 	readonly rootCausePhase: {
 		readonly status: RootCausePhaseStatus;
 		readonly triggers: readonly string[];
 	};
+	readonly claimsLedger: WorkflowClaimsLedger;
+	readonly consensusReport: WorkflowConsensusReport;
 	readonly promptPreview: string;
 }
 
@@ -182,6 +193,19 @@ export function buildWorkflowIntentDiff(text: string): WorkflowIntentDiff | null
 	const rootCauseTriggers = collectRootCauseTriggers(text);
 	const rootCauseActive = rootCauseTriggers.length > 0;
 	const direct = route.route === "direct";
+	const rootCauseStatus: RootCausePhaseStatus = rootCauseActive ? "active" : "inactive";
+	const rootCausePhase = {
+		status: rootCauseStatus,
+		triggers: rootCauseTriggers,
+	};
+	const report = buildWorkflowIntentReport({
+		route: route.route,
+		reason: route.reason,
+		direct,
+		recommendedInvocation: route.recommendedInvocation,
+		triggers: route.triggers,
+		rootCausePhase,
+	});
 
 	return {
 		version: 1,
@@ -190,10 +214,9 @@ export function buildWorkflowIntentDiff(text: string): WorkflowIntentDiff | null
 		directTracking: direct ? "custom-entry-only" : "not-direct",
 		...(direct ? {} : { recommendedSkill: route.route, recommendedInvocation: route.recommendedInvocation }),
 		triggers: route.triggers,
-		rootCausePhase: {
-			status: rootCauseActive ? "active" : "inactive",
-			triggers: rootCauseTriggers,
-		},
+		rootCausePhase,
+		claimsLedger: report.claimsLedger,
+		consensusReport: report.consensusReport,
 		promptPreview,
 	};
 }

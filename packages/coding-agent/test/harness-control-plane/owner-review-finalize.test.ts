@@ -6,17 +6,17 @@ import { callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import type { FinalizeChecks } from "../../src/harness-control-plane/finalize";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
 import type { ReviewFailureEvidence, ReviewVerdictEvidence } from "../../src/harness-control-plane/receipts";
-import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
+import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
 import { readReceiptIndex, writeSessionState } from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
 
-class FakeRpc implements HarnessRpc {
+class FakeTransport implements HarnessSessionTransport {
 	cursor = 0;
 	#assistantText: string | null;
 	constructor(assistantText: string | null) {
 		this.#assistantText = assistantText;
 	}
-	async getState(): Promise<RpcStateSnapshot> {
+	async getState(): Promise<SessionStateSnapshot> {
 		return { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 };
 	}
 	eventCursor(): number {
@@ -98,7 +98,7 @@ describe("owner review-only finalize via live RPC assistant text", () => {
 		owner = new RuntimeOwner({
 			root,
 			sessionId: SID,
-			rpc: new FakeRpc("Detailed review.\nVerdict: REQUEST_CHANGES"),
+			transport: new FakeTransport("Detailed review.\nVerdict: REQUEST_CHANGES"),
 			finalizeChecks: passingChecks,
 		});
 		const info = await owner.start();
@@ -116,7 +116,7 @@ describe("owner review-only finalize via live RPC assistant text", () => {
 		owner = new RuntimeOwner({
 			root,
 			sessionId: SID,
-			rpc: new FakeRpc("All checks pass. APPROVE_MERGE_READY"),
+			transport: new FakeTransport("All checks pass. APPROVE_MERGE_READY"),
 			finalizeChecks: passingChecks,
 		});
 		const info = await owner.start();
@@ -132,7 +132,7 @@ describe("owner review-only finalize via live RPC assistant text", () => {
 		owner = new RuntimeOwner({
 			root,
 			sessionId: SID,
-			rpc: new FakeRpc("I am still thinking about this and have no recommendation."),
+			transport: new FakeTransport("I am still thinking about this and have no recommendation."),
 			finalizeChecks: passingChecks,
 		});
 		const info = await owner.start();
@@ -152,7 +152,7 @@ describe("owner review-only finalize via live RPC assistant text", () => {
 		owner = new RuntimeOwner({
 			root,
 			sessionId: SID,
-			rpc: new FakeRpc("Verdict: REQUEST_CHANGES"),
+			transport: new FakeTransport("Verdict: REQUEST_CHANGES"),
 			finalizeChecks: passingChecks,
 		});
 		const info = await owner.start();

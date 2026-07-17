@@ -13,7 +13,7 @@ import { resolveWelcomeLogoMode } from "@gajae-code/coding-agent/modes/interacti
 import { getEditorTheme, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { type TUI, visibleWidth } from "@gajae-code/tui";
-import { StatusLineComponent } from "../../../src/modes/components/status-line";
+import { StatusLineComponent } from "../../../src/modes/components/tool-status-header";
 
 function createFooterSession(): AgentSession {
 	return {
@@ -49,7 +49,12 @@ function createFooterSession(): AgentSession {
 				},
 			],
 		},
-		getContextUsage: () => ({ contextWindow: 200_000, percent: 42.5 }),
+		getContextUsage: () => ({
+			tokens: 85_000,
+			contextWindow: 200_000,
+			percent: 42.5,
+			source: "provider_anchor" as const,
+		}),
 		getGoalModeState: () => undefined,
 		getAsyncJobSnapshot: () => ({ running: [] }),
 		isFastModeActive: () => false,
@@ -219,6 +224,7 @@ describe("redesigned interactive shell chrome", () => {
 
 		expect(statusRendered).toContain("very-long-model-name-for-footer-budget");
 		expect(statusRendered).toContain("forge-session");
+		expect(statusRendered).toMatch(/very-long-model-name-for-footer-budget[^\n]*\d+(\.\d+)?%/);
 		expect(editorRendered).toContain("› draft");
 		expect(editorRendered).not.toContain("very-long-model-name-for-footer-budget");
 		expect(editorRendered).not.toContain("╭");
@@ -289,13 +295,7 @@ describe("redesigned interactive shell chrome", () => {
 
 	it("keeps the default status preset dense and pulse-forward", () => {
 		expect(STATUS_LINE_PRESETS.default.leftSegments).toEqual(["model", "mode", "git", "pr", "path"]);
-		expect(STATUS_LINE_PRESETS.default.rightSegments).toEqual([
-			"session_name",
-			"jobs",
-			"token_rate",
-			"context_pct",
-			"cost",
-		]);
+		expect(STATUS_LINE_PRESETS.default.rightSegments).toEqual(["session_name", "jobs", "token_rate", "cost"]);
 		expect(STATUS_LINE_PRESETS.default.segmentOptions?.path?.maxLength).toBe(32);
 	});
 
@@ -306,7 +306,6 @@ describe("redesigned interactive shell chrome", () => {
 			"jobs",
 			"token_rate",
 			"usage",
-			"context_pct",
 			"cost",
 		]);
 		expect(STATUS_LINE_PRESETS["default-usage"].segmentOptions).toEqual(STATUS_LINE_PRESETS.default.segmentOptions);

@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getWorktreesDir } from "@gajae-code/utils/dirs";
+import { SPAWN_PROVENANCE_ENV } from "../sdk/bus/config";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -22,8 +24,10 @@ import {
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxUntaggedSessionHint,
+	GJC_TMUX_ACTIVE_SESSION_ENV,
 	GJC_TMUX_PROFILE_OPTION,
 	GJC_TMUX_PROFILE_VALUE,
+	resolveGjcTmuxBinary,
 	resolveGjcTmuxCommand,
 } from "./tmux-common";
 
@@ -204,6 +208,7 @@ export type GjcTeamNotificationDeliveryState =
 	| "acknowledged";
 
 export type GjcTeamPaneAttemptResult = "sent" | "queued" | "deferred" | "failed";
+export type GjcTeamMailboxDeliveryTransportKind = "sdk" | "pane";
 
 export interface GjcTeamNotification {
 	id: string;
@@ -219,6 +224,36 @@ export interface GjcTeamNotification {
 	created_at: string;
 	updated_at: string;
 	replay_count: number;
+}
+export interface GjcTeamMailboxDeliveryInput {
+	team_name: string;
+	state_dir: string;
+	config: GjcTeamConfig;
+	notification: GjcTeamNotification;
+	message: GjcTeamMailboxMessage;
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+}
+export type GjcTeamMailboxDeliveryResult =
+	| { transport: "sdk"; state: GjcTeamNotificationDeliveryState; reason?: string }
+	| { transport: "pane"; state: GjcTeamPaneAttemptResult; reason?: string };
+export interface GjcTeamMailboxDeliveryTransport {
+	deliverMailboxMessage(input: GjcTeamMailboxDeliveryInput): Promise<GjcTeamMailboxDeliveryResult | null>;
+}
+
+let gjcTeamMailboxDeliveryTransport: GjcTeamMailboxDeliveryTransport | undefined;
+
+export function setGjcTeamMailboxDeliveryTransport(transport: GjcTeamMailboxDeliveryTransport | undefined): () => void {
+	const previous = gjcTeamMailboxDeliveryTransport;
+	gjcTeamMailboxDeliveryTransport = transport;
+	return () => {
+		gjcTeamMailboxDeliveryTransport = previous;
+	};
+}
+export function setGjcTeamMailboxDeliveryTransportForTest(
+	transport: GjcTeamMailboxDeliveryTransport | undefined,
+): () => void {
+	return setGjcTeamMailboxDeliveryTransport(transport);
 }
 
 export interface GjcTeamNotificationSummary {
@@ -256,6 +291,8 @@ export interface GjcTeamStartOptions {
 	cwd?: string;
 	env?: NodeJS.ProcessEnv;
 	dryRun?: boolean;
+	platform?: NodeJS.Platform;
+	mailboxDeliveryTransport?: GjcTeamMailboxDeliveryTransport;
 }
 
 export interface GjcTeamApiClaimResult {
@@ -491,6 +528,10 @@ export interface GjcWorkerIntegrationAttemptRequestResult {
 	fingerprint?: string;
 	head?: string | null;
 	status?: GjcWorkerCheckpointClassification["kind"];
+}
+
+export interface GjcWorkerIntegrationAttemptOptions {
+	signal?: AbortSignal;
 }
 
 function isGjcTeamTaskStatus(value: string): value is GjcTeamTaskStatus {
@@ -1055,6 +1096,22 @@ async function readConfig(dir: string): Promise<GjcTeamConfig> {
 		team_state_root: config.team_state_root ?? config.state_root,
 		worker_cli_plan: config.worker_cli_plan ?? Array.from({ length: config.worker_count }, () => "gjc"),
 	};
+}
+const WORKER_INTEGRATION_CONFIG_CACHE_TTL_MS = 100;
+type WorkerIntegrationConfigCacheEntry = { checkedAt: number; mtimeMs: number; config: GjcTeamConfig };
+const workerIntegrationConfigCache = new Map<string, WorkerIntegrationConfigCacheEntry>();
+
+async function readConfigForWorkerIntegration(dir: string): Promise<GjcTeamConfig> {
+	const configPath = path.join(dir, "config.json");
+	const nowMs = Date.now();
+	const stat = await fs.stat(configPath);
+	const cached = workerIntegrationConfigCache.get(configPath);
+	if (cached && cached.mtimeMs === stat.mtimeMs && nowMs - cached.checkedAt <= WORKER_INTEGRATION_CONFIG_CACHE_TTL_MS)
+		return cached.config;
+	const config = await readConfig(dir);
+	workerIntegrationConfigCache.set(configPath, { checkedAt: nowMs, mtimeMs: stat.mtimeMs, config });
+
+	return config;
 }
 async function readPhase(dir: string): Promise<GjcTeamPhase> {
 	const phase = await readJsonFile<{ current_phase?: GjcTeamPhase }>(path.join(dir, "phase.json"));
@@ -1704,6 +1761,34 @@ function runGitResult(cwd: string, args: string[]): GitResult {
 		stderr: result.stderr.toString().trim(),
 	};
 }
+async function runGitResultAsync(cwd: string, args: string[], signal?: AbortSignal): Promise<GitResult> {
+	const result = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const kill = () => {
+		try {
+			result.kill("SIGKILL");
+		} catch {}
+	};
+	if (signal?.aborted) kill();
+	else signal?.addEventListener("abort", kill, { once: true });
+	try {
+		const [exitCode, stdout, stderr] = await Promise.all([
+			result.exited,
+			new Response(result.stdout).text(),
+			new Response(result.stderr).text(),
+		]);
+		return {
+			ok: exitCode === 0 && !signal?.aborted,
+			stdout: stdout.trim(),
+			stderr: signal?.aborted ? "worker integration request aborted" : stderr.trim(),
+		};
+	} finally {
+		signal?.removeEventListener("abort", kill);
+	}
+}
+async function tryRunGitAsync(cwd: string, args: string[], signal?: AbortSignal): Promise<string | null> {
+	const result = await runGitResultAsync(cwd, args, signal);
+	return result.ok ? result.stdout : null;
+}
 function runGit(cwd: string, args: string[]): string {
 	const result = runGitResult(cwd, args);
 	if (result.ok) return result.stdout;
@@ -1778,18 +1863,41 @@ function findWorktreePath(repoRoot: string, worktreePath: string): string | null
 		if (line.startsWith("worktree ") && path.resolve(line.slice("worktree ".length)) === resolved) return resolved;
 	return null;
 }
+export function resolveWorkerWorktreePath(input: {
+	repoRoot: string;
+	stateDir: string;
+	teamName: string;
+	workerId: string;
+	platform: NodeJS.Platform;
+	isPsmux: boolean;
+}): string {
+	if (input.platform === "win32" && input.isPsmux) {
+		const slug = stableHash([input.repoRoot, input.stateDir, input.teamName].join("\0")).slice(0, 12);
+		return path.join(getWorktreesDir(), `team-${slug}-${input.workerId}`);
+	}
+	return path.join(input.stateDir, "worktrees", input.workerId);
+}
 async function ensureWorkerWorktree(
 	cwd: string,
 	dir: string,
 	teamName: string,
 	worker: GjcTeamWorker,
 	mode: GjcTeamWorktreeMode,
+	platform: NodeJS.Platform,
+	isPsmux: boolean,
 ): Promise<GjcTeamWorker> {
 	if (!mode.enabled) return worker;
 	if (!isGitRepository(cwd)) throw new Error(`team_worktree_requires_git_repo:${cwd}`);
 	const repoRoot = runGit(cwd, ["rev-parse", "--show-toplevel"]);
 	const baseRef = runGit(repoRoot, ["rev-parse", "HEAD"]);
-	const worktreePath = path.join(dir, "worktrees", worker.id);
+	const worktreePath = resolveWorkerWorktreePath({
+		repoRoot,
+		stateDir: dir,
+		teamName,
+		workerId: worker.id,
+		platform,
+		isPsmux,
+	});
 	const existing = findWorktreePath(repoRoot, worktreePath);
 	let created = false;
 	const branchName = mode.detached
@@ -1857,16 +1965,22 @@ function tagTmuxSessionAsGjcLeader(tmuxCommand: string, sessionName: string): bo
 function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEnv): GjcTmuxLeaderContext {
 	if (Bun.which(tmuxCommand) === null)
 		throw new Error(buildTeamTmuxLeaderRequirementMessage(`tmux_not_installed:${tmuxCommand}`));
-	const paneTarget = env.TMUX_PANE?.trim();
-	const args = paneTarget
-		? ["display-message", "-p", "-t", paneTarget, "#S:#I #{pane_id}"]
+	// Prefer the explicit GJC-managed session name propagated by `gjc --tmux`
+	// (GJC_TMUX_ACTIVE_SESSION). Under psmux on Windows the inherited TMUX_PANE
+	// can resolve to the wrong/default session, so querying the tagged session
+	// by name is authoritative for GJC-launched leaders. Fall back to TMUX_PANE,
+	// then to the ambient session, to keep native tmux/WSL flows unchanged.
+	const activeSession = env[GJC_TMUX_ACTIVE_SESSION_ENV]?.trim();
+	const displayTarget = activeSession ? buildGjcTmuxExactOptionTarget(activeSession, { env }) : env.TMUX_PANE?.trim();
+	const args = displayTarget
+		? ["display-message", "-p", "-t", displayTarget, "#S:#I #{pane_id}"]
 		: ["display-message", "-p", "#S:#I #{pane_id}"];
 	const result = Bun.spawnSync([tmuxCommand, ...args], { stdout: "pipe", stderr: "pipe" });
 	if (result.exitCode !== 0) {
 		// Distinguish "you are not inside any tmux session" from a genuine tmux
 		// query failure so the caller gets actionable guidance instead of raw
 		// tmux stderr. `gjc team` needs a tmux leader; outside tmux there is none.
-		const insideTmux = Boolean(env.TMUX?.trim() || env.TMUX_PANE?.trim());
+		const insideTmux = Boolean(env.TMUX?.trim() || env.TMUX_PANE?.trim() || activeSession);
 		const stderr = result.stderr.toString().trim();
 		throw new Error(
 			buildTeamTmuxLeaderRequirementMessage(
@@ -1896,6 +2010,34 @@ function readCurrentTmuxLeaderContext(tmuxCommand: string, env: NodeJS.ProcessEn
 	}
 	return { sessionName, windowIndex, leaderPaneId, target: `${sessionName}:${windowIndex}` };
 }
+function isBunVirtualPath(candidate: string | undefined): boolean {
+	const normalized = candidate?.trim().replace(/\\/g, "/").toLowerCase();
+	return (
+		normalized === "/$bunfs" ||
+		normalized?.startsWith("/$bunfs/") === true ||
+		normalized === "b:/~bun" ||
+		normalized?.startsWith("b:/~bun/") === true
+	);
+}
+
+function isAbsoluteRealPath(candidate: string | undefined, pathModule: typeof path): candidate is string {
+	const normalized = candidate?.trim();
+	return Boolean(normalized && !isBunVirtualPath(normalized) && pathModule.isAbsolute(normalized));
+}
+function isGjcExecutablePath(candidate: string | undefined, pathModule: typeof path): candidate is string {
+	return isAbsoluteRealPath(candidate, pathModule) && /^gjc(?:[._-]|$)/i.test(pathModule.basename(candidate.trim()));
+}
+
+function formatWorkerExecutable(platform: NodeJS.Platform, executable: string): string {
+	return (platform === "win32" ? powershellQuote : shellQuote)(executable);
+}
+
+function unresolvedWorkerAuthorityError(): Error {
+	return new Error(
+		"Unable to determine the GJC worker executable from this invocation. Set GJC_TEAM_WORKER_COMMAND to the exact GJC command, or launch GJC from a real executable path instead of a Bun virtual path.",
+	);
+}
+
 export function resolveGjcWorkerCommand(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
@@ -1904,20 +2046,34 @@ export function resolveGjcWorkerCommand(
 	execPath = process.execPath,
 ): string {
 	const explicit = env.GJC_TEAM_WORKER_COMMAND?.trim();
-	if (explicit) return explicit;
-	const entrypoint = argv[1];
-	if (!entrypoint) return "gjc";
-	const pathModule = platform === "win32" ? path.win32 : path;
-	const resolvedEntrypoint = pathModule.isAbsolute(entrypoint) ? entrypoint : pathModule.resolve(cwd, entrypoint);
-	if (platform === "win32") {
-		if (entrypoint.endsWith(".ts") || entrypoint.endsWith(".js") || entrypoint.endsWith(".mjs"))
-			return `${powershellQuote(execPath)} ${powershellQuote(resolvedEntrypoint)}`;
-		if (pathModule.basename(entrypoint).startsWith("gjc")) return powershellQuote(resolvedEntrypoint);
-		return "gjc";
+	if (explicit) {
+		if (isBunVirtualPath(explicit)) throw unresolvedWorkerAuthorityError();
+		return explicit;
 	}
-	if (entrypoint.endsWith(".ts")) return `${shellQuote(execPath)} ${shellQuote(resolvedEntrypoint)}`;
-	if (path.basename(entrypoint).startsWith("gjc")) return shellQuote(path.resolve(cwd, entrypoint));
-	return "gjc";
+
+	const pathModule = platform === "win32" ? path.win32 : path.posix;
+	const runtime = argv[0]?.trim();
+	const entrypoint = argv[1]?.trim();
+	const sourceEntrypoint = entrypoint && !isBunVirtualPath(entrypoint) && /\.(?:[cm]?[jt]s)$/i.test(entrypoint);
+
+	if (sourceEntrypoint) {
+		const sourceRuntime = isAbsoluteRealPath(runtime, pathModule)
+			? runtime
+			: isAbsoluteRealPath(execPath, pathModule)
+				? execPath.trim()
+				: undefined;
+		if (!sourceRuntime) throw unresolvedWorkerAuthorityError();
+		const absoluteEntrypoint = pathModule.isAbsolute(entrypoint) ? entrypoint : pathModule.resolve(cwd, entrypoint);
+		if (!isAbsoluteRealPath(absoluteEntrypoint, pathModule)) throw unresolvedWorkerAuthorityError();
+		return `${formatWorkerExecutable(platform, sourceRuntime)} ${formatWorkerExecutable(platform, absoluteEntrypoint)}`;
+	}
+
+	const executable =
+		(isGjcExecutablePath(entrypoint, pathModule) ? entrypoint : undefined) ??
+		(isGjcExecutablePath(execPath, pathModule) ? execPath.trim() : undefined) ??
+		(isGjcExecutablePath(runtime, pathModule) ? runtime : undefined);
+	if (!executable) throw unresolvedWorkerAuthorityError();
+	return formatWorkerExecutable(platform, executable);
 }
 /** @internal Exported for unit tests. */
 export function buildWorkerCommand(
@@ -1962,6 +2118,11 @@ export function buildWorkerCommand(
 		envAssignment("GJC_TEAM_STATE_ROOT", config.state_root),
 		envAssignment("GJC_TEAM_LEADER_CWD", config.leader.cwd),
 		envAssignment("GJC_TEAM_DISPLAY_NAME", config.display_name),
+		// Canonical GJC spawn-provenance marker so `notifications.sessionScope =
+		// "primary"` suppresses the worker's own notification endpoint/topic. The
+		// value is informational (leader session id, falling back to the team name
+		// so it is always non-blank); presence is what marks the worker.
+		envAssignment(SPAWN_PROVENANCE_ENV, config.leader.session_id.trim() || config.team_name),
 		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
 	];
 	const joined = platform === "win32" ? envLines.join(" ") : envLines.join(" ");
@@ -2295,6 +2456,9 @@ async function appendCommitHygieneEntries(config: GjcTeamConfig, entries: GjcTea
 function resolveHead(cwd: string): string | null {
 	return tryRunGit(cwd, ["rev-parse", "HEAD"]);
 }
+async function resolveHeadAsync(cwd: string, signal?: AbortSignal): Promise<string | null> {
+	return tryRunGitAsync(cwd, ["rev-parse", "HEAD"], signal);
+}
 function isAncestor(cwd: string, ancestor: string, descendant: string): boolean {
 	return runGitResult(cwd, ["merge-base", "--is-ancestor", ancestor, descendant]).ok;
 }
@@ -2314,6 +2478,14 @@ function listConflictFiles(cwd: string): string[] {
 		.map(line => line.trim())
 		.filter(Boolean);
 }
+async function listConflictFilesAsync(cwd: string, signal?: AbortSignal): Promise<string[]> {
+	const result = await runGitResultAsync(cwd, ["diff", "--name-only", "--diff-filter=U"], signal);
+	if (!result.ok || !result.stdout) return [];
+	return result.stdout
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean);
+}
 
 export type GjcWorkerCheckpointClassification =
 	| { kind: "clean"; files: string[] }
@@ -2323,17 +2495,14 @@ export type GjcWorkerCheckpointClassification =
 	| { kind: "git_error"; files: string[]; detail: string };
 
 const UNMERGED_GIT_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
-const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [
-	".gjc/_session-*/state/",
-	".gjc/_session-*/logs/",
-	".gjc/_session-*/reports/",
-	".gjc/_session-*/runtime/",
-	".gjc/_session-*/ultragoal/",
-	".gjc/_session-*/plans/",
-	".gjc/_session-*/specs/",
-	".gjc/_session-*/rlm/",
-	".gjc/_session-*/audit/",
-];
+// Every generated/runtime artifact for a GJC session lives under
+// `.gjc/_session-{id}/...` (see session-layout.ts), so worker auto-checkpoints
+// exclude the whole session subtree instead of enumerating its subdirectories.
+// The enumerated form drifted: subtrees outside the list (for example the
+// extragoal gate receipts from docs/extragoal-skill-template.md, or the
+// session-root `.session-activity.json` marker) were auto-committed and merged
+// into the leader branch on projects that do not gitignore `.gjc/_session-*/`.
+const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [".gjc/_session-*/"];
 
 function parsePorcelainStatusFiles(stdout: string): string[] {
 	return stdout
@@ -2376,6 +2545,29 @@ export function classifyWorkerCheckpointStatus(cwd: string): GjcWorkerCheckpoint
 		.filter(Boolean)
 		.some(line => UNMERGED_GIT_STATUS_CODES.has(line.slice(0, 2)));
 	const conflictFiles = listConflictFiles(cwd);
+	if (hasUnmergedStatus || conflictFiles.length > 0) {
+		return { kind: "conflicted", files: conflictFiles.length > 0 ? conflictFiles : files };
+	}
+	const classified = classifyGjcTeamCheckpointFiles(files);
+	if (classified.eligible.length === 0 && classified.protected.length > 0)
+		return { kind: "protected_only", files: classified.protected };
+	return { kind: "eligible", files: classified.eligible };
+}
+export async function classifyWorkerCheckpointStatusAsync(
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<GjcWorkerCheckpointClassification> {
+	const status = await runGitResultAsync(cwd, ["status", "--porcelain", "-uall"], signal);
+	if (!status.ok) {
+		return { kind: "git_error", files: [], detail: status.stderr || status.stdout || "git status failed" };
+	}
+	if (!status.stdout.trim()) return { kind: "clean", files: [] };
+	const files = parsePorcelainStatusFiles(status.stdout);
+	const hasUnmergedStatus = status.stdout
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.some(line => UNMERGED_GIT_STATUS_CODES.has(line.slice(0, 2)));
+	const conflictFiles = await listConflictFilesAsync(cwd, signal);
 	if (hasUnmergedStatus || conflictFiles.length > 0) {
 		return { kind: "conflicted", files: conflictFiles.length > 0 ? conflictFiles : files };
 	}
@@ -2861,6 +3053,7 @@ async function initializeStateDirs(dir: string, workers: GjcTeamWorker[]): Promi
 export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTeamSnapshot> {
 	const cwd = options.cwd ?? process.cwd();
 	const env = options.env ?? process.env;
+	if (options.mailboxDeliveryTransport) setGjcTeamMailboxDeliveryTransport(options.mailboxDeliveryTransport);
 	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
 	const workerCliPlan = resolveGjcTeamWorkerCliPlan(options.workerCount, env);
@@ -2870,7 +3063,9 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const dir = teamDir(stateRoot, teamName);
 	const createdAt = now();
 	const worktreeMode = resolveDefaultWorktreeMode(options.worktreeMode);
-	const tmuxCommand = resolveGjcTmuxCommand(env);
+	const platform = options.platform ?? process.platform;
+	const tmuxBinary = resolveGjcTmuxBinary({ env, platform });
+	const tmuxCommand = tmuxBinary.command;
 	const tmuxContext = options.dryRun
 		? { sessionName: "dry-run", windowIndex: "0", leaderPaneId: "%dry-run-leader", target: "dry-run:0" }
 		: readCurrentTmuxLeaderContext(tmuxCommand, env);
@@ -2879,7 +3074,11 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const workers: GjcTeamWorker[] = [];
 	try {
 		for (const worker of initialWorkers)
-			workers.push(options.dryRun ? worker : await ensureWorkerWorktree(cwd, dir, teamName, worker, worktreeMode));
+			workers.push(
+				options.dryRun
+					? worker
+					: await ensureWorkerWorktree(cwd, dir, teamName, worker, worktreeMode, platform, tmuxBinary.isPsmux),
+			);
 	} catch (error) {
 		await rollbackCreatedWorktrees(workers);
 		throw error;
@@ -3037,19 +3236,47 @@ function workerIntegrationFingerprint(head: string | null, classification: GjcWo
 export async function requestGjcWorkerIntegrationAttempt(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
+	options: GjcWorkerIntegrationAttemptOptions = {},
 ): Promise<GjcWorkerIntegrationAttemptRequestResult> {
 	const teamName = env.GJC_TEAM_NAME?.trim();
 	const worker = env.GJC_TEAM_WORKER_ID?.trim() || env.GJC_TEAM_INTERNAL_WORKER?.split("/").pop()?.trim();
 	if (!teamName || !worker) return { requested: false, reason: "not_worker" };
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
+	const config = await readConfigForWorkerIntegration(dir);
 	const configuredWorker = config.workers.find(candidate => candidate.id === worker);
 	const worktreePath = env.GJC_TEAM_WORKTREE_PATH?.trim() || configuredWorker?.worktree_path;
 	if (!worktreePath || !(await pathExists(worktreePath)))
 		return { requested: false, reason: "missing_worktree", worker, team_name: teamName };
-	const classification = classifyWorkerCheckpointStatus(worktreePath);
-	const head = resolveHead(worktreePath);
+	const [classification, head] = await Promise.all([
+		classifyWorkerCheckpointStatusAsync(worktreePath, options.signal),
+		resolveHeadAsync(worktreePath, options.signal),
+	]);
 	if (classification.kind === "git_error") {
+		const reportWorker = configuredWorker ?? {
+			id: worker,
+			name: worker,
+			index: 0,
+			agent_type: "unknown",
+			role: "unknown",
+			status: "idle",
+			last_heartbeat: now(),
+			assigned_tasks: [],
+		};
+		const detail = classification.detail;
+		await appendIntegrationEvent(dir, "worker_integration_attempt_failed", reportWorker, {
+			worker_name: worker,
+			worktree_path: worktreePath,
+			detail,
+			retryable: true,
+			summary: `retryable worker integration request failure for ${worker}: ${detail}`,
+		});
+		await notifyLeader(
+			config,
+			reportWorker,
+			`INTEGRATION RETRYABLE FAILURE: ${worker} git inspection failed (${detail}). A later turn can retry.`,
+			cwd,
+			env,
+		);
 		return { requested: false, reason: "git_error", worker, team_name: teamName, head, status: classification.kind };
 	}
 	if (classification.kind === "protected_only") {
@@ -3816,12 +4043,59 @@ async function reconcileTeamNotifications(dir: string, config: GjcTeamConfig): P
 	}
 	return summarizeNotifications(await listNotificationRecords(dir));
 }
+async function messageForNotification(
+	dir: string,
+	notification: GjcTeamNotification,
+): Promise<GjcTeamMailboxMessage | null> {
+	if (notification.kind !== "mailbox_message" || notification.source.type !== "message") return null;
+	const mailbox = await readMailbox(dir, notification.recipient);
+	return mailbox.messages.find(message => message.message_id === notification.source.id) ?? null;
+}
+
+async function attemptConfiguredMailboxTransport(
+	dir: string,
+	config: GjcTeamConfig,
+	notification: GjcTeamNotification,
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+): Promise<GjcTeamNotification | null> {
+	if (!gjcTeamMailboxDeliveryTransport) return null;
+	const message = await messageForNotification(dir, notification);
+	if (!message) return null;
+	try {
+		const result = await gjcTeamMailboxDeliveryTransport.deliverMailboxMessage({
+			team_name: config.team_name,
+			state_dir: dir,
+			config,
+			notification,
+			message,
+			cwd,
+			env,
+		});
+		if (!result) return null;
+		if (result.transport === "sdk" && result.state === "failed") return null;
+		return writeNotificationRecord(dir, {
+			...notification,
+			delivery_state: result.state,
+			pane_attempt_result: result.transport === "pane" ? result.state : undefined,
+			pane_attempt_reason: result.reason ?? result.transport,
+			pane_attempt_at: now(),
+			updated_at: now(),
+		});
+	} catch {
+		return null;
+	}
+}
+
 async function attemptPaneNotification(
 	dir: string,
 	config: GjcTeamConfig,
 	notification: GjcTeamNotification,
 	env: NodeJS.ProcessEnv,
+	cwd = process.cwd(),
 ): Promise<GjcTeamNotification> {
+	const transported = await attemptConfiguredMailboxTransport(dir, config, notification, cwd, env);
+	if (transported) return transported;
 	const paneId =
 		notification.recipient === "leader-fixed"
 			? config.leader.pane_id
@@ -3868,6 +4142,7 @@ export async function replayGjcTeamNotifications(
 				replay_count: (notification.replay_count ?? 0) + 1,
 			},
 			env,
+			cwd,
 		);
 		next.push(attempted);
 	}
@@ -3896,8 +4171,13 @@ export async function sendGjcTeamMessage(
 		...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
 	};
 	const written = await writeMailboxMessage(dir, toWorker, message);
+	const existingNotification = await readJsonFile<GjcTeamNotification>(
+		notificationPath(dir, messageNotificationId(config.team_name, toWorker, written.message_id)),
+	);
 	const notification = await createMessageNotification(dir, config.team_name, written);
-	await attemptPaneNotification(dir, config, notification, env);
+	if (!existingNotification) {
+		await attemptPaneNotification(dir, config, notification, env, cwd);
+	}
 	await appendEvent(dir, {
 		type: "message_sent",
 		worker: fromWorker,

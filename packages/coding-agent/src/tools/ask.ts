@@ -36,11 +36,24 @@ import {
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { appendOrMergeDeepInterviewRound, syncDeepInterviewRecorderHud } from "../gjc-runtime/deep-interview-recorder";
 import { deepInterviewStatePath } from "../gjc-runtime/deep-interview-runtime";
-import { gateAnswerToResult, questionToGate } from "../modes/shared/agent-wire/deep-interview-gate";
+import {
+	type AskGateQuestion,
+	gateAnswerToResult,
+	questionToGate,
+} from "../modes/shared/agent-wire/deep-interview-gate";
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { renderStatusLine } from "../tui";
-import type { ToolSession } from ".";
+import type {
+	AskAnswerRequest,
+	AskRemoteControl,
+	AskRemoteInteraction,
+	AskRemoteReceipt,
+	AskSettlement,
+	AskSettlementResult,
+	ToolSession,
+} from ".";
+
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
@@ -112,6 +125,7 @@ export interface AskToolDetails {
 const OTHER_OPTION = "Other (type your own)";
 const ASK_CLARIFICATION_OPTION = "Ask about these choices";
 const RECOMMENDED_SUFFIX = " (Recommended)";
+const REMOTE_NAVIGATION_FORWARD = "\u0000ask-navigation-forward";
 const DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS = Number.MAX_SAFE_INTEGER;
 const DEEP_INTERVIEW_RECORDER_AWAIT_TIMEOUT_MS = 250;
 
@@ -179,6 +193,79 @@ function numberOptionLabels(labels: string[]): string[] {
 	return labels.map(formatNumberedOptionLabel);
 }
 
+/** The only remote navigation control; labels are presentation, never protocol. */
+export function askRemoteControls(input: {
+	multi: boolean;
+	questionIndex: number;
+	questionCount: number;
+	selectedCount: number;
+	hasNonWhitespaceCustom: boolean;
+}): readonly AskRemoteControl[] {
+	if (!input.multi) return [];
+	const final = input.questionIndex === input.questionCount - 1;
+	return [
+		{
+			id: "navigation_forward",
+			kind: "navigation",
+			label: input.questionCount > 1 && !final ? "Next" : "Done",
+			enabled: input.questionCount > 1 || input.selectedCount > 0 || input.hasNonWhitespaceCustom,
+		},
+	];
+}
+
+/** Classify remote input without looking at option labels used for controls. */
+export function classifyAskRemoteInteraction(input: {
+	interaction: AskRemoteInteraction;
+	options: readonly string[];
+	controls: readonly AskRemoteControl[];
+	multi: boolean;
+	selectedCount: number;
+	customInput?: string;
+	clarification?: boolean;
+}): AskSettlement {
+	const interaction = input.interaction;
+	if (interaction.kind === "control") {
+		const control = input.controls.find(candidate => candidate.id === interaction.controlId);
+		if (!control?.enabled || !input.multi) return { kind: "invalid", reason: "invalid_control" };
+		return input.selectedCount > 0 || (input.customInput?.trim().length ?? 0) > 0
+			? { kind: "commit" }
+			: { kind: "resolve_without_commit", reason: "empty_navigation" };
+	}
+	if (input.clarification) {
+		return interaction.value.trim().length > 0
+			? { kind: "resolve_without_commit", reason: "clarification_submitted" }
+			: { kind: "invalid", reason: "empty_clarification" };
+	}
+	if (input.options.includes(interaction.value))
+		return input.multi ? { kind: "resolve_without_commit", reason: "toggle" } : { kind: "commit" };
+	return interaction.value.trim().length > 0 ? { kind: "commit" } : { kind: "invalid", reason: "empty_custom" };
+}
+
+/** A one-shot local receipt used to normalize legacy string answer sources. */
+export function legacyAskReceipt(value: string): {
+	source: "remote";
+	interaction: AskRemoteInteraction;
+	settle(settlement: AskSettlement): Promise<AskSettlementResult>;
+} {
+	let settled: Promise<AskSettlementResult> | undefined;
+	return {
+		interaction: { kind: "value", value },
+		source: "remote",
+		settle(settlement) {
+			if (!settled) {
+				settled = Promise.resolve(
+					settlement.kind === "commit"
+						? { kind: "committed", ack: { status: "failed", reason: "unsupported" } }
+						: settlement.kind === "invalid"
+							? { kind: "invalid_closed" }
+							: { kind: "resolved_without_commit" },
+				);
+			}
+			return settled;
+		},
+	};
+}
+
 // =============================================================================
 // Question Selection Logic
 // =============================================================================
@@ -206,6 +293,11 @@ interface AskSingleQuestionOptions {
 	scrollTitleRows?: number;
 	otherOptionLabel?: string;
 	clarificationOptionLabel?: string;
+	onRemoteState?: (state: {
+		interaction: "selector" | "custom_editor" | "clarification_editor";
+		selectedCount: number;
+		hasNonWhitespaceCustom: boolean;
+	}) => void;
 }
 
 interface UIContext {
@@ -329,14 +421,27 @@ async function askSingleQuestion(
 	// resolve the "Other" label without invoking customInput.onSubmit).
 	const promptForCustomInput = async (): Promise<{ input: string | undefined }> => {
 		const dialogOptions = signal ? { signal } : undefined;
-		const showCustomInput = () => ui.editor("Enter your response:", undefined, dialogOptions, { promptStyle: true });
+		const showCustomInput = () => {
+			options.onRemoteState?.({
+				interaction: "custom_editor",
+				selectedCount: selectedOptions.length,
+				hasNonWhitespaceCustom: (customInput?.trim().length ?? 0) > 0,
+			});
+			return ui.editor("Enter your response:", undefined, dialogOptions, { promptStyle: true });
+		};
 		const input = signal ? await untilAborted(signal, showCustomInput) : await showCustomInput();
 		return { input };
 	};
 	const promptForClarificationInput = async (): Promise<{ input: string | undefined }> => {
 		const dialogOptions = signal ? { signal } : undefined;
-		const showClarificationInput = () =>
-			ui.editor("Ask a clarification question:", undefined, dialogOptions, { promptStyle: true });
+		const showClarificationInput = () => {
+			options.onRemoteState?.({
+				interaction: "clarification_editor",
+				selectedCount: selectedOptions.length,
+				hasNonWhitespaceCustom: false,
+			});
+			return ui.editor("Ask a clarification question:", undefined, dialogOptions, { promptStyle: true });
+		};
 		const input = signal ? await untilAborted(signal, showClarificationInput) : await showClarificationInput();
 		return { input: input !== undefined && input.trim() === "" ? undefined : input };
 	};
@@ -366,6 +471,11 @@ async function askSingleQuestion(
 				opts.push(clarificationOptionLabel);
 			}
 
+			options.onRemoteState?.({
+				interaction: "selector",
+				selectedCount: selected.size,
+				hasNonWhitespaceCustom: (customInput?.trim().length ?? 0) > 0,
+			});
 			const prefix = selected.size > 0 ? `(${selected.size} selected) ` : "";
 			const {
 				choice,
@@ -385,6 +495,10 @@ async function askSingleQuestion(
 				}
 				return { selectedOptions: Array.from(selected), customInput, timedOut, cancelled: true };
 			}
+			if (choice === REMOTE_NAVIGATION_FORWARD) {
+				return { selectedOptions: Array.from(selected), customInput, timedOut, navigation: "forward" };
+			}
+
 			if (choice === doneLabel) break;
 
 			if (choice === otherOptionLabel) {
@@ -432,6 +546,10 @@ async function askSingleQuestion(
 					selected.add(opt);
 				}
 			}
+			if (!opt && choice.trim().length > 0) {
+				customInput = choice;
+				break;
+			}
 
 			if (selectTimedOut) {
 				timedOut = true;
@@ -458,6 +576,11 @@ async function askSingleQuestion(
 			initialIndex = Math.max(0, Math.min(initialIndex, maxIndex));
 		}
 
+		options.onRemoteState?.({
+			interaction: "selector",
+			selectedCount: selectedOptions.length,
+			hasNonWhitespaceCustom: (customInput?.trim().length ?? 0) > 0,
+		});
 		const {
 			choice,
 			timedOut: selectTimedOut,
@@ -469,6 +592,9 @@ async function askSingleQuestion(
 
 		if (arrowNavigation) {
 			return { selectedOptions, customInput, timedOut, navigation: arrowNavigation };
+		}
+		if (choice === REMOTE_NAVIGATION_FORWARD) {
+			return { selectedOptions, customInput, timedOut, navigation: "forward" };
 		}
 		if (choice === undefined) {
 			if (!timedOut) {
@@ -617,10 +743,29 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			activeSkillState: this.session.getActiveSkillState?.(),
 			sessionId: this.session.getSessionId?.() ?? null,
 		});
+		let activeRemoteReceipt: AskRemoteReceipt | undefined;
+		let activeRemoteRequest: AskAnswerRequest | undefined;
+		let remoteGeneration = 0;
+		type RemoteRaceResult = {
+			winner: "remote";
+			value: string;
+			receipt: AskRemoteReceipt;
+			settlement?: AskSettlement;
+		};
+		const settleActiveRemote = async (settlement: AskSettlement): Promise<void> => {
+			const receipt = activeRemoteReceipt;
+			activeRemoteReceipt = undefined;
+			if (receipt) await receipt.settle(settlement);
+		};
 		const gateEmitter = this.session.getWorkflowGateEmitter?.();
-		const canUseWorkflowGate = gateEmitter?.isUnattended() === true;
-
-		// Headless fallback: unattended workflow gates are the non-TUI answer path.
+		// A durable workflow-gate emitter now exists for every session, and its
+		// isUnattended() is always true, so it can no longer signal "no local UI".
+		// The workflow gate is only the headless (non-TUI) answer path: when a real
+		// interactive UI is present, prefer it — otherwise attended TUI asks would
+		// route to emitGate() and hang forever waiting on a remote responder.
+		const hasInteractiveUi = context?.hasUI === true && !!context.ui;
+		const canUseWorkflowGate = !hasInteractiveUi && gateEmitter?.isUnattended() === true;
+		// Headless fallback: SDK workflow gates are the non-TUI answer path.
 		if (!canUseWorkflowGate && (!context?.hasUI || !context.ui)) {
 			context?.abort();
 			throw new ToolAbortError("Ask tool requires interactive mode");
@@ -632,41 +777,114 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
 				const source = this.session.getAskAnswerSource?.();
 				if (!source) return extensionUi.select(prompt, options, dialogOptions);
-				// Race the local UI against a remote answer (e.g. a Telegram reply via the
-				// notifications SDK) so asks can be answered without RPC mode. When the
-				// local UI wins, abort the remote source so it stops waiting and marks the
-				// action resolved-locally. First valid answer wins.
-				// Race the local UI against a remote answer (e.g. a Telegram reply via the
-				// notifications SDK) so asks can be answered without RPC mode. First valid
-				// answer wins; the loser is aborted so neither side is left hanging:
+				// Race the local UI against a remote answer (e.g. an SDK reply) so asks
+				// can be answered without local UI interaction. The first valid answer
+				// wins; the loser is aborted so neither side is left hanging:
 				//   - local wins  -> abort the remote source (marks the action resolved-locally)
 				//   - remote wins -> abort the local selector so the TUI dialog actually closes
 				const remoteController = new AbortController();
 				const localController = new AbortController();
-				// Propagate an external cancel (the tool's signal) to the local selector too.
+				const generation = ++remoteGeneration;
+				// Propagate external cancellation to both race legs and invalidate late replies.
 				const toolSignal = dialogOptions?.signal;
-				if (toolSignal) {
-					if (toolSignal.aborted) localController.abort();
-					else toolSignal.addEventListener("abort", () => localController.abort(), { once: true });
-				}
-				const remote = source.awaitAnswer(prompt, options, remoteController.signal).then(answer => {
-					// undefined is not a valid remote answer (registration failed, or the local
-					// UI already won and aborted us): never settle the race, let the local
-					// selector decide instead of cancelling the ask.
-					if (answer === undefined) return new Promise<string | undefined>(() => {});
+				const abortRace = () => {
+					if (generation === remoteGeneration) remoteGeneration++;
 					localController.abort();
-					return answer;
+					remoteController.abort();
+				};
+				if (toolSignal) {
+					if (toolSignal.aborted) abortRace();
+					else toolSignal.addEventListener("abort", abortRace, { once: true });
+				}
+				const remote = (
+					source.awaitAnswerRequest
+						? source.awaitAnswerRequest(
+								activeRemoteRequest ?? { question: prompt, options, interaction: "selector", controls: [] },
+								remoteController.signal,
+							)
+						: source.awaitAnswer(prompt, options, remoteController.signal)
+				).then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
+					if (answer === undefined) return new Promise<never>(() => {});
+					const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
+					if (generation !== remoteGeneration) {
+						return receipt
+							.settle({ kind: "resolve_without_commit", reason: "aborted" })
+							.then(() => new Promise<never>(() => {}));
+					}
+					const remoteValue = receipt.interaction.kind === "value" ? receipt.interaction.value : undefined;
+					const value = remoteValue ?? REMOTE_NAVIGATION_FORWARD;
+					const selectedValue =
+						remoteValue === undefined
+							? value
+							: (options.find(
+									option =>
+										option === remoteValue ||
+										option === `${theme.checkbox.checked} ${remoteValue}` ||
+										option === `${theme.checkbox.unchecked} ${remoteValue}`,
+								) ?? value);
+					const normalizedRemoteValue = remoteValue?.startsWith(`${theme.checkbox.checked} `)
+						? remoteValue.slice(`${theme.checkbox.checked} `.length)
+						: remoteValue?.startsWith(`${theme.checkbox.unchecked} `)
+							? remoteValue.slice(`${theme.checkbox.unchecked} `.length)
+							: remoteValue;
+					const semanticRemoteValue = normalizedRemoteValue?.replace(/^\s*\d+[.)]\s+/, "");
+					const transitionReason =
+						semanticRemoteValue === OTHER_OPTION
+							? "other_transition"
+							: semanticRemoteValue === ASK_CLARIFICATION_OPTION
+								? "clarification_transition"
+								: undefined;
+					if (transitionReason) {
+						return {
+							winner: "remote" as const,
+							value: selectedValue,
+							receipt,
+							settlement: { kind: "resolve_without_commit", reason: transitionReason },
+						};
+					}
+					if (
+						remoteValue !== undefined &&
+						activeRemoteRequest?.interaction === "selector" &&
+						activeRemoteRequest.controls.length > 0 &&
+						activeRemoteRequest.options.includes(remoteValue)
+					) {
+						return {
+							winner: "remote" as const,
+							value: selectedValue,
+							receipt,
+							settlement: { kind: "resolve_without_commit", reason: "toggle" },
+						};
+					}
+					return { winner: "remote" as const, value: selectedValue, receipt };
 				});
+
 				const local = extensionUi
 					.select(prompt, options, { ...dialogOptions, signal: localController.signal })
 					.then(answer => {
+						if (generation === remoteGeneration) remoteGeneration++;
 						remoteController.abort();
-						return answer;
+						return { winner: "local" as const, value: answer };
+					})
+					.catch(error => {
+						if (generation === remoteGeneration) remoteGeneration++;
+						remoteController.abort();
+						throw error;
 					});
 				// The losing selector may reject when aborted after the race already settled;
 				// swallow that so it is not an unhandled rejection (the race result is unaffected).
 				void local.catch(() => undefined);
-				return Promise.race([local, remote]);
+				return Promise.race([local, remote]).then(async result => {
+					if (result.winner === "remote") {
+						localController.abort();
+						if (result.settlement) await result.receipt.settle(result.settlement);
+						else activeRemoteReceipt = result.receipt;
+					} else {
+						void remote.then(remoteResult =>
+							remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+						);
+					}
+					return result.value;
+				});
 			},
 			editor: (title, prefill, dialogOptions, editorOptions) => {
 				if (!extensionUi) throw new ToolAbortError("Ask tool requires interactive mode");
@@ -677,24 +895,65 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				// reply) instead of blocking on the local-only editor. Mirrors `select`.
 				const remoteController = new AbortController();
 				const localController = new AbortController();
+				const generation = ++remoteGeneration;
 				const toolSignal = dialogOptions?.signal;
-				if (toolSignal) {
-					if (toolSignal.aborted) localController.abort();
-					else toolSignal.addEventListener("abort", () => localController.abort(), { once: true });
-				}
-				const remote = source.awaitAnswer(title, [], remoteController.signal).then(answer => {
-					if (answer === undefined) return new Promise<string | undefined>(() => {});
+				const abortRace = () => {
+					if (generation === remoteGeneration) remoteGeneration++;
 					localController.abort();
-					return answer;
+					remoteController.abort();
+				};
+				if (toolSignal) {
+					if (toolSignal.aborted) abortRace();
+					else toolSignal.addEventListener("abort", abortRace, { once: true });
+				}
+				const remote = (
+					source.awaitAnswerRequest
+						? source.awaitAnswerRequest(
+								activeRemoteRequest ?? {
+									question: title,
+									options: [],
+									interaction: "custom_editor",
+									controls: [],
+								},
+								remoteController.signal,
+							)
+						: source.awaitAnswer(title, [], remoteController.signal)
+				).then((answer): RemoteRaceResult | Promise<RemoteRaceResult> => {
+					if (answer === undefined) return new Promise<never>(() => {});
+					const receipt = typeof answer === "string" ? legacyAskReceipt(answer) : answer;
+					if (generation !== remoteGeneration) {
+						return receipt
+							.settle({ kind: "resolve_without_commit", reason: "aborted" })
+							.then(() => new Promise<never>(() => {}));
+					}
+					const value =
+						receipt.interaction.kind === "control" ? REMOTE_NAVIGATION_FORWARD : receipt.interaction.value;
+					return { winner: "remote" as const, value, receipt };
 				});
 				const local = extensionUi
 					.editor(title, prefill, { ...(dialogOptions ?? {}), signal: localController.signal }, editorOptions)
 					.then(answer => {
+						if (generation === remoteGeneration) remoteGeneration++;
 						remoteController.abort();
-						return answer;
+						return { winner: "local" as const, value: answer };
+					})
+					.catch(error => {
+						if (generation === remoteGeneration) remoteGeneration++;
+						remoteController.abort();
+						throw error;
 					});
 				void local.catch(() => undefined);
-				return Promise.race([local, remote]);
+				return Promise.race([local, remote]).then(result => {
+					if (result.winner === "remote") {
+						activeRemoteReceipt = result.receipt;
+						localController.abort();
+					} else {
+						void remote.then(remoteResult =>
+							remoteResult.receipt.settle({ kind: "resolve_without_commit", reason: "aborted" }),
+						);
+					}
+					return result.value;
+				});
 			},
 		};
 
@@ -720,10 +979,11 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			options?: { previous?: QuestionResult; navigation?: NavigationControls },
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
-			// Unattended (#316/#323/G011): route the question through the workflow-gate
-			// emitter instead of the interactive UI; the external agent answers over RPC.
+			const questionIndex = params.questions.indexOf(q);
+			// Route headless asks through the SDK workflow-gate emitter; a connected
+			// SDK responder supplies the durable answer instead of an interactive UI.
 			if (gateEmitter && canUseWorkflowGate) {
-				const gateQuestion = {
+				const gateQuestion: AskGateQuestion = {
 					id: q.id,
 					question: q.question,
 					options: q.options,
@@ -731,6 +991,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					recommended: q.recommended,
 					deepInterview: q.deepInterview,
 					workflowGate: q.workflowGate,
+					allowEmpty: q.multi === true && params.questions.length > 1,
+					navigationLabel: questionIndex === params.questions.length - 1 ? "Done" : "Next",
 				};
 				const answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
 				const decoded = gateAnswerToResult(gateQuestion, answer);
@@ -753,6 +1015,14 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				const clarificationOptionLabel = shouldNumberOptions
 					? formatNumberedOptionLabel(ASK_CLARIFICATION_OPTION, optionLabels.length + 1)
 					: undefined;
+				const otherOptionLabel = shouldNumberOptions
+					? formatNumberedOptionLabel(OTHER_OPTION, optionLabels.length)
+					: OTHER_OPTION;
+				const remoteSelectorOptions = [
+					...optionLabels,
+					otherOptionLabel,
+					...(clarificationOptionLabel ? [clarificationOptionLabel] : []),
+				];
 				const initialSelection =
 					shouldNumberOptions && options?.previous
 						? {
@@ -763,6 +1033,19 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 								}),
 							}
 						: options?.previous;
+				activeRemoteRequest = {
+					question: displayQuestion,
+					options: remoteSelectorOptions,
+					interaction: "selector",
+					controls: askRemoteControls({
+						multi: q.multi === true,
+						questionIndex,
+						questionCount: params.questions.length,
+						selectedCount: initialSelection?.selectedOptions.length ?? 0,
+						hasNonWhitespaceCustom: (initialSelection?.customInput?.trim().length ?? 0) > 0,
+					}),
+				};
+
 				const {
 					selectedOptions: displaySelectedOptions,
 					customInput,
@@ -777,10 +1060,25 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					initialSelection,
 					navigation: options?.navigation,
 					scrollTitleRows: isDeepInterviewQuestion ? DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS : undefined,
-					otherOptionLabel: shouldNumberOptions
-						? formatNumberedOptionLabel(OTHER_OPTION, optionLabels.length)
-						: undefined,
+					otherOptionLabel,
 					clarificationOptionLabel,
+					onRemoteState: state => {
+						activeRemoteRequest = {
+							question: displayQuestion,
+							options: state.interaction === "selector" ? remoteSelectorOptions : [],
+							interaction: state.interaction,
+							controls:
+								state.interaction === "selector"
+									? askRemoteControls({
+											multi: q.multi === true,
+											questionIndex,
+											questionCount: params.questions.length,
+											selectedCount: state.selectedCount,
+											hasNonWhitespaceCustom: state.hasNonWhitespaceCustom,
+										})
+									: [],
+						};
+					},
 				});
 				const selectedOptions = shouldNumberOptions
 					? displaySelectedOptions.map(selected => {
@@ -788,6 +1086,30 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							return displayIndex >= 0 ? (rawOptionLabels[displayIndex] ?? selected) : selected;
 						})
 					: displaySelectedOptions;
+				if (activeRemoteReceipt) {
+					const settlement: AskSettlement =
+						clarificationQuestion !== undefined
+							? { kind: "resolve_without_commit", reason: "clarification_submitted" }
+							: customInput !== undefined && customInput.trim().length === 0
+								? { kind: "invalid", reason: "empty_custom" }
+								: cancelled
+									? { kind: "resolve_without_commit", reason: "cancelled" }
+									: timedOut
+										? { kind: "resolve_without_commit", reason: "timed_out" }
+										: navigation === "back"
+											? { kind: "resolve_without_commit", reason: "back_navigation" }
+											: navigation === "forward" &&
+													selectedOptions.length === 0 &&
+													(customInput === undefined || customInput.trim().length === 0)
+												? { kind: "resolve_without_commit", reason: "empty_navigation" }
+												: selectedOptions.length > 0 || (customInput?.trim().length ?? 0) > 0
+													? { kind: "commit" }
+													: { kind: "resolve_without_commit", reason: "cancelled" };
+					await settleActiveRemote(settlement);
+					activeRemoteRequest = undefined;
+					if (settlement.kind === "invalid") return askQuestion(q, options);
+				}
+				activeRemoteRequest = undefined;
 				return {
 					optionLabels: rawOptionLabels,
 					selectedOptions,
@@ -798,6 +1120,11 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					timedOut,
 				};
 			} catch (error) {
+				await settleActiveRemote({
+					kind: "resolve_without_commit",
+					reason: error instanceof Error && error.name === "AbortError" ? "aborted" : "exception",
+				});
+				activeRemoteRequest = undefined;
 				if (error instanceof Error && error.name === "AbortError") {
 					throw new ToolAbortError("Ask input was cancelled");
 				}

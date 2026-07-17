@@ -1,0 +1,220 @@
+{
+  "status": "passed",
+  "e2eStatus": "passed",
+  "redTeamStatus": "clean",
+  "evidence": [
+    {
+      "id": "CURSOR-PARITY-FUZZ",
+      "status": "passed",
+      "checks": 1,
+      "maxLayoutLinesProcessed": 2,
+      "maxVisibleWidthMeasurements": 2
+    },
+    {
+      "id": "WRAPPED-CURSOR",
+      "status": "passed",
+      "checks": 1,
+      "maxLayoutLinesProcessed": 1,
+      "maxVisibleWidthMeasurements": 22
+    },
+    {
+      "id": "EDIT-THEN-MOVE",
+      "status": "passed",
+      "checks": 1,
+      "maxLayoutLinesProcessed": 0,
+      "maxVisibleWidthMeasurements": 0
+    },
+    {
+      "id": "RESIZE",
+      "status": "passed",
+      "checks": 1,
+      "maxLayoutLinesProcessed": 1,
+      "maxVisibleWidthMeasurements": 1
+    },
+    {
+      "id": "IME",
+      "status": "passed",
+      "checks": 1,
+      "maxLayoutLinesProcessed": 0,
+      "maxVisibleWidthMeasurements": 0
+    },
+    {
+      "id": "AUTOCOMPLETE",
+      "status": "passed",
+      "checks": 1,
+      "maxLayoutLinesProcessed": 0,
+      "maxVisibleWidthMeasurements": 0
+    },
+    {
+      "id": "PLACEHOLDER-BORDER",
+      "status": "passed",
+      "checks": 1,
+      "maxLayoutLinesProcessed": 0,
+      "maxVisibleWidthMeasurements": 0
+    },
+    {
+      "id": "TAB-WIDTH",
+      "status": "passed",
+      "checks": 1,
+      "maxLayoutLinesProcessed": 0,
+      "maxVisibleWidthMeasurements": 0
+    },
+    {
+      "id": "STRESS-INTERLEAVE",
+      "status": "passed",
+      "checks": 1,
+      "maxLayoutLinesProcessed": 0,
+      "maxVisibleWidthMeasurements": 0
+    }
+  ],
+  "e2eCommands": [
+    "bun test packages/tui/test/g014-editor-layout-cache-redteam.test.ts"
+  ],
+  "redTeamCommands": [
+    "bun test packages/tui/test/g014-editor-layout-cache-redteam.test.ts"
+  ],
+  "artifactPath": "artifacts/g014-qa-report.json",
+  "contractCoverage": [
+    {
+      "contractRef": "G014-1",
+      "obligation": "Cursor-only movement over a 1000-line buffer stays bounded and matches fresh render",
+      "status": "passed",
+      "surfaceEvidenceRefs": [
+        "surface-package-test"
+      ],
+      "adversarialCaseRefs": [
+        "CURSOR-PARITY-FUZZ"
+      ]
+    },
+    {
+      "contractRef": "G014-2",
+      "obligation": "Cached render output including cursor is byte-identical to fresh uncached editor state",
+      "status": "passed",
+      "surfaceEvidenceRefs": [
+        "surface-package-test"
+      ],
+      "adversarialCaseRefs": [
+        "CURSOR-PARITY-FUZZ",
+        "WRAPPED-CURSOR",
+        "EDIT-THEN-MOVE",
+        "RESIZE",
+        "IME",
+        "AUTOCOMPLETE",
+        "PLACEHOLDER-BORDER",
+        "TAB-WIDTH",
+        "STRESS-INTERLEAVE"
+      ]
+    },
+    {
+      "contractRef": "G014-3",
+      "obligation": "Edits, paste, resize, IME, autocomplete, placeholder, border, gutter, prefix, and tab width invalidate correctly",
+      "status": "passed",
+      "surfaceEvidenceRefs": [
+        "surface-package-test"
+      ],
+      "adversarialCaseRefs": [
+        "EDIT-THEN-MOVE",
+        "RESIZE",
+        "IME",
+        "AUTOCOMPLETE",
+        "PLACEHOLDER-BORDER",
+        "TAB-WIDTH",
+        "STRESS-INTERLEAVE"
+      ]
+    },
+    {
+      "contractRef": "G014-4",
+      "obligation": "Cursor patching on wrapped, empty, trailing-whitespace, and chunk-boundary lines is correct",
+      "status": "passed",
+      "surfaceEvidenceRefs": [
+        "surface-package-test"
+      ],
+      "adversarialCaseRefs": [
+        "CURSOR-PARITY-FUZZ",
+        "WRAPPED-CURSOR"
+      ]
+    }
+  ],
+  "surfaceEvidence": [
+    {
+      "id": "surface-package-test",
+      "contractRef": "G014",
+      "surface": "package",
+      "invocation": "bun test packages/tui/test/g014-editor-layout-cache-redteam.test.ts",
+      "verdict": "passed"
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "CURSOR-PARITY-FUZZ",
+      "contractRef": "G014",
+      "scenario": "CURSOR-PARITY-FUZZ",
+      "expectedBehavior": "Cached render equals fresh render; invalidations and bounded cursor-only work hold where applicable",
+      "verdict": "passed"
+    },
+    {
+      "id": "WRAPPED-CURSOR",
+      "contractRef": "G014",
+      "scenario": "WRAPPED-CURSOR",
+      "expectedBehavior": "Cached render equals fresh render; invalidations and bounded cursor-only work hold where applicable",
+      "verdict": "passed"
+    },
+    {
+      "id": "EDIT-THEN-MOVE",
+      "contractRef": "G014",
+      "scenario": "EDIT-THEN-MOVE",
+      "expectedBehavior": "Cached render equals fresh render; invalidations and bounded cursor-only work hold where applicable",
+      "verdict": "passed"
+    },
+    {
+      "id": "RESIZE",
+      "contractRef": "G014",
+      "scenario": "RESIZE",
+      "expectedBehavior": "Cached render equals fresh render; invalidations and bounded cursor-only work hold where applicable",
+      "verdict": "passed"
+    },
+    {
+      "id": "IME",
+      "contractRef": "G014",
+      "scenario": "IME",
+      "expectedBehavior": "Cached render equals fresh render; invalidations and bounded cursor-only work hold where applicable",
+      "verdict": "passed"
+    },
+    {
+      "id": "AUTOCOMPLETE",
+      "contractRef": "G014",
+      "scenario": "AUTOCOMPLETE",
+      "expectedBehavior": "Cached render equals fresh render; invalidations and bounded cursor-only work hold where applicable",
+      "verdict": "passed"
+    },
+    {
+      "id": "PLACEHOLDER-BORDER",
+      "contractRef": "G014",
+      "scenario": "PLACEHOLDER-BORDER",
+      "expectedBehavior": "Cached render equals fresh render; invalidations and bounded cursor-only work hold where applicable",
+      "verdict": "passed"
+    },
+    {
+      "id": "TAB-WIDTH",
+      "contractRef": "G014",
+      "scenario": "TAB-WIDTH",
+      "expectedBehavior": "Cached render equals fresh render; invalidations and bounded cursor-only work hold where applicable",
+      "verdict": "passed"
+    },
+    {
+      "id": "STRESS-INTERLEAVE",
+      "contractRef": "G014",
+      "scenario": "STRESS-INTERLEAVE",
+      "expectedBehavior": "Cached render equals fresh render; invalidations and bounded cursor-only work hold where applicable",
+      "verdict": "passed"
+    }
+  ],
+  "artifactRefs": [
+    {
+      "id": "g014-qa-report",
+      "kind": "api-package-test-report",
+      "description": "artifacts/g014-qa-report.json"
+    }
+  ],
+  "blockers": []
+}

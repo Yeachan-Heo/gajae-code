@@ -22,7 +22,8 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { extname, isAbsolute, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { supportsReasoningEffort } from '../models/catalog.js';
+import { Effort, THINKING_EFFORTS } from '@gajae-code/ai/model-thinking';
+import { getMaxReasoningEffort, supportsReasoningEffort } from '../models/catalog.js';
 
 // ─── Content text extraction ─────────────────────────────────────────────────
 
@@ -266,6 +267,18 @@ function stripUnsupportedTopLevelFields(next: Record<string, unknown>): void {
   delete next.truncation;
 }
 
+function normalizeReasoningEffort(modelId: string, value: unknown): unknown {
+  const effort = value === Effort.Minimal ? Effort.Low : value;
+  if (typeof effort !== 'string') return effort;
+
+  const maxEffort = getMaxReasoningEffort(modelId);
+  if (maxEffort === undefined) return effort;
+
+  const effortIndex = THINKING_EFFORTS.indexOf(effort as Effort);
+  const maxEffortIndex = THINKING_EFFORTS.indexOf(maxEffort);
+  return effortIndex > maxEffortIndex ? maxEffort : effort;
+}
+
 // ─── Main sanitization ────────────────────────────────────────────────────────
 
 /**
@@ -334,7 +347,7 @@ export function sanitizePayload(
   if (supportsReasoningEffort(modelId)) {
     const reasoning = next.reasoning as Record<string, unknown> | undefined;
     if (reasoning) {
-      const effort = reasoning.effort === 'minimal' ? 'low' : reasoning.effort;
+      const effort = normalizeReasoningEffort(modelId, reasoning.effort);
       next.reasoning = reasoning.summary !== undefined ? { effort } : { ...reasoning, effort };
     }
   } else {

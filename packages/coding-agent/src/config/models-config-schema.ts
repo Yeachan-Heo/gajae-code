@@ -1,4 +1,5 @@
 import * as z from "zod/v4";
+import { stringOrNonEmptyArray } from "./model-selector-value";
 
 const OpenRouterRoutingSchema = z.object({
 	only: z.array(z.string()).optional(),
@@ -49,7 +50,9 @@ export const OpenAICompatSchema = z.object({
 	toolStrictMode: z.enum(["all_strict", "none"]).optional(),
 });
 
-const EffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
+export const GJC_MODEL_EFFORT_IDS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const GJC_MODEL_ASSIGNMENT_TARGET_IDS = ["default", "executor", "architect", "planner", "critic"] as const;
+export const EffortSchema = z.enum(GJC_MODEL_EFFORT_IDS);
 const CacheRetentionSchema = z.enum(["none", "short", "long"]);
 
 const ThinkingControlModeSchema = z.enum([
@@ -77,34 +80,25 @@ const RequestTransformSchema = z
 	})
 	.strict();
 
-const ModelBindingsSchema = z.object({
-	modelRoles: z.record(z.string(), z.string().min(1)).optional(),
-	agentModelOverrides: z.record(z.string(), z.string().min(1)).optional(),
-});
-export const ProfileRoleSchema = z.enum(["default", "executor", "architect", "planner", "critic"]);
+const PermissiveModelSelectorSchema = z.string().trim().min(1);
 
-function isValidProfileModelSelector(value: string): boolean {
-	if (value.includes(",")) return false;
-	const slashIdx = value.indexOf("/");
-	if (slashIdx <= 0 || slashIdx === value.length - 1) return false;
-	const provider = value.slice(0, slashIdx);
-	const modelId = value.slice(slashIdx + 1);
-	if (!provider || !modelId) return false;
-	const parts = modelId.split(":");
-	if (parts.length > 2) return false;
-	const [base, suffix] = parts;
-	if (!base) return false;
-	return suffix === undefined || ["minimal", "low", "medium", "high", "xhigh", "max"].includes(suffix);
-}
+export const ModelBindingsSchema = z.object({
+	modelRoles: z.record(z.string(), stringOrNonEmptyArray(PermissiveModelSelectorSchema)).optional(),
+	agentModelOverrides: z.record(z.string(), stringOrNonEmptyArray(PermissiveModelSelectorSchema)).optional(),
+});
+
+export const ProfileRoleSchema = z.enum(GJC_MODEL_ASSIGNMENT_TARGET_IDS);
+export const ProfileModelSelectorPattern = `^[^,/]+/[^,:]+(?::(?:${EffortSchema.options.join("|")}))?$`;
 
 export const ProfileModelSelectorSchema = z
 	.string()
+	.trim()
 	.min(1)
-	.refine(value => isValidProfileModelSelector(value), {
-		message: "Expected provider/modelId with optional :effort suffix",
-	});
-
-export const ProfileModelMappingSchema = z.partialRecord(ProfileRoleSchema, ProfileModelSelectorSchema);
+	.regex(new RegExp(ProfileModelSelectorPattern), "Expected provider/modelId with optional :effort suffix");
+export const ProfileModelMappingSchema = z.partialRecord(
+	ProfileRoleSchema,
+	stringOrNonEmptyArray(ProfileModelSelectorSchema),
+);
 
 export const ProfileDefinitionSchema = z
 	.object({

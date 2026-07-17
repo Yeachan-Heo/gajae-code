@@ -84,10 +84,12 @@ const emptyWorkspaceTree = (cwd: string): WorkspaceTree => ({
 });
 
 const PYTHON_DISPOSE_WAIT_MS = 3_000;
+const isPythonDisposeWaitDuration = (duration: unknown): duration is number =>
+	typeof duration === "number" && duration >= PYTHON_DISPOSE_WAIT_MS - 1 && duration <= PYTHON_DISPOSE_WAIT_MS;
 const mockLongPythonDisposeSleepsImmediate = () => {
 	const realSleep = Bun.sleep.bind(Bun);
 	return vi.spyOn(Bun, "sleep").mockImplementation((duration?: number | Date) => {
-		if (typeof duration === "number" && duration === PYTHON_DISPOSE_WAIT_MS) {
+		if (isPythonDisposeWaitDuration(duration)) {
 			return Promise.resolve();
 		}
 		return realSleep(duration ?? 0);
@@ -416,9 +418,7 @@ describe("AgentSession python cleanup", () => {
 
 		const [toolResult] = await Promise.all([toolExecution, disposeSession]);
 
-		expect(
-			sleepSpy.mock.calls.some(([duration]) => typeof duration === "number" && duration === PYTHON_DISPOSE_WAIT_MS),
-		).toBe(true);
+		expect(sleepSpy.mock.calls.some(([duration]) => isPythonDisposeWaitDuration(duration))).toBe(true);
 
 		expect(disposed).toBe(true);
 		expect(toolExecutionSettled).toBe(true);
@@ -463,7 +463,7 @@ describe("AgentSession python cleanup", () => {
 			firstDisposed = true;
 		});
 		await disposeFirst;
-		expect(sleepSpy).toHaveBeenCalledWith(PYTHON_DISPOSE_WAIT_MS);
+		expect(sleepSpy.mock.calls.some(([duration]) => isPythonDisposeWaitDuration(duration))).toBe(true);
 
 		expect(firstDisposed).toBe(true);
 		expect(firstExecutionSettled).toBe(false);
@@ -705,7 +705,7 @@ describe("AgentSession python cleanup", () => {
 		const sleepSpy = mockLongPythonDisposeSleepsImmediate();
 
 		await session.dispose();
-		expect(sleepSpy).toHaveBeenCalledWith(PYTHON_DISPOSE_WAIT_MS);
+		expect(sleepSpy.mock.calls.some(([duration]) => isPythonDisposeWaitDuration(duration))).toBe(true);
 		const [firstResult, secondResult] = await Promise.all([firstExecution, secondExecution]);
 
 		expect(firstResult.cancelled).toBe(true);

@@ -5,7 +5,7 @@ import type * as fs1 from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
-import type { ImageContent, Model, TextContent } from "@gajae-code/ai";
+import type { ImageContent, Model, TextContent, Tool, UsageReport } from "@gajae-code/ai";
 import type { KeyId } from "@gajae-code/tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@gajae-code/utils";
 import * as Zod from "zod/v4";
@@ -62,7 +62,7 @@ export class ExtensionRuntime implements IExtensionRuntime {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
-	sendUserMessage(): void {
+	sendUserMessage(): Promise<void> {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -79,6 +79,10 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	}
 
 	getAllTools(): string[] {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	resolveTool(): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -99,6 +103,38 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	}
 
 	setThinkingLevel(): void {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	getThinkingVisibility(): "visible" | "hidden" {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	setThinkingVisibility(): void {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	cycleThinkingLevel(): ThinkingLevel | undefined {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	setThinkingLevelForControl(): Promise<void> {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	setThinkingVisibilityForControl(): Promise<void> {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	setModelTemporaryForControl(): Promise<boolean> {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	fetchUsageReportsForControl(): Promise<UsageReport[] | null> {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	getThinkingScopeForControl(): "session" | "global config" {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -204,9 +240,9 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp" },
-	): void {
-		this.runtime.sendUserMessage(content, options);
+		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+	): Promise<void> {
+		return Promise.resolve(this.runtime.sendUserMessage(content, options));
 	}
 
 	appendEntry(customType: string, data?: unknown): void {
@@ -223,6 +259,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	getAllTools(): string[] {
 		return this.runtime.getAllTools();
+	}
+
+	resolveTool(name: string): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined {
+		return this.runtime.resolveTool(name);
 	}
 
 	setActiveTools(toolNames: string[]): Promise<void> {
@@ -243,6 +283,38 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	setThinkingLevel(level: ThinkingLevel, persist?: boolean): void {
 		this.runtime.setThinkingLevel(level, persist);
+	}
+
+	getThinkingVisibility(): "visible" | "hidden" {
+		return this.runtime.getThinkingVisibility();
+	}
+
+	setThinkingVisibility(visibility: "visible" | "hidden", persist?: boolean): void {
+		this.runtime.setThinkingVisibility(visibility, persist);
+	}
+
+	cycleThinkingLevel(): ThinkingLevel | undefined {
+		return this.runtime.cycleThinkingLevel();
+	}
+
+	setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
+		return this.runtime.setThinkingLevelForControl(level, persist);
+	}
+
+	setThinkingVisibilityForControl(visibility: "visible" | "hidden", persist: boolean): Promise<void> {
+		return this.runtime.setThinkingVisibilityForControl(visibility, persist);
+	}
+
+	setModelTemporaryForControl(model: Model, expectedSessionId?: string): Promise<boolean> {
+		return this.runtime.setModelTemporaryForControl(model, expectedSessionId);
+	}
+
+	fetchUsageReportsForControl(): Promise<UsageReport[] | null> {
+		return this.runtime.fetchUsageReportsForControl();
+	}
+
+	getThinkingScopeForControl(): "session" | "global config" {
+		return this.runtime.getThinkingScopeForControl();
 	}
 
 	getSessionName(): string | undefined {

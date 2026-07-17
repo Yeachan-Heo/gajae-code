@@ -16,6 +16,7 @@ import { resolveCurrentBranch } from "./status-line/git-utils";
 export class FooterComponent implements Component {
 	#cachedBranch: string | null | undefined = undefined; // undefined = not checked yet, null = not in git repo, string = branch name
 	#gitWatcher: fs.FSWatcher | null = null;
+	#gitWatcherGeneration = 0;
 	#onBranchChange: (() => void) | null = null;
 	#autoCompactEnabled: boolean = true;
 	#extensionStatuses: Map<string, string> = new Map();
@@ -51,7 +52,10 @@ export class FooterComponent implements Component {
 	}
 
 	#setupGitWatcher(): void {
-		// Clean up existing watcher
+		// Clean up existing watcher. The generation guard below keeps a stale
+		// in-flight resolve — one that dispose() or a newer setup already
+		// superseded — from installing a watcher nothing would ever close.
+		const generation = ++this.#gitWatcherGeneration;
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
@@ -60,7 +64,7 @@ export class FooterComponent implements Component {
 		void git.head
 			.resolve(getProjectDir())
 			.then(head => {
-				if (!head) {
+				if (!head || generation !== this.#gitWatcherGeneration) {
 					return;
 				}
 
@@ -84,6 +88,7 @@ export class FooterComponent implements Component {
 	 * Clean up the file watcher
 	 */
 	dispose(): void {
+		this.#gitWatcherGeneration++;
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
@@ -134,8 +139,8 @@ export class FooterComponent implements Component {
 		// After compaction, tokens are unknown until the next LLM response.
 		const contextUsage = this.session.getContextUsage();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
-		const contextPercentValue = contextUsage?.percent ?? 0;
-		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
+		const contextPercentValue = contextUsage?.percent;
+		const contextPercent = typeof contextPercentValue === "number" ? contextPercentValue.toFixed(1) : "?";
 
 		// Replace home directory with ~
 		let pwd = shortenPath(getProjectDir());
@@ -183,7 +188,7 @@ export class FooterComponent implements Component {
 			contextPercent === "?"
 				? `?/${formatNumber(contextWindow)}${autoIndicator}`
 				: `${contextPercent}%/${formatNumber(contextWindow)}${autoIndicator}`;
-		if (contextUsage?.percent !== null && contextUsage?.percent !== undefined) {
+		if (typeof contextPercentValue === "number") {
 			const color = getContextUsageThemeColor(getContextUsageLevel(contextPercentValue, contextWindow));
 			contextPercentStr =
 				color === "statusLineContext" ? contextPercentDisplay : theme.fg(color, contextPercentDisplay);

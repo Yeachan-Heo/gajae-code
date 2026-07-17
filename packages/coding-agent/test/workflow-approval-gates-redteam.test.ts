@@ -5,11 +5,22 @@ import {
 	decodeApproval,
 	decodeExecution,
 	executionGate,
-} from "@gajae-code/coding-agent/modes/shared/agent-wire/approval-gate";
+} from "../src/modes/shared/agent-wire/approval-gate";
 import {
+	type GateContinuation,
 	MemoryGateStore,
 	WorkflowGateBroker,
-} from "@gajae-code/coding-agent/modes/shared/agent-wire/workflow-gate-broker";
+} from "../src/modes/shared/agent-wire/workflow-gate-broker";
+
+function activeContinuation(): GateContinuation {
+	const activeGateIds = new Set<string>();
+	return {
+		activate: gate => activeGateIds.add(gate.gate_id),
+		terminalProof: "not_published",
+		isLive: gateId => activeGateIds.has(gateId),
+		release: gateId => activeGateIds.delete(gateId),
+	};
+}
 
 function expectApprovalError(answer: unknown, code: ApprovalGateError["code"]): void {
 	try {
@@ -59,7 +70,7 @@ describe("approvalGate red-team coercion checks (#317)", () => {
 				advanced.push(answer);
 			},
 		});
-		const gate = broker.openGate(approvalGate());
+		const gate = broker.openGate(approvalGate(), activeContinuation());
 
 		const resolution = await broker.resolve({
 			gate_id: gate.gate_id,
@@ -86,7 +97,7 @@ describe("approvalGate red-team coercion checks (#317)", () => {
 				advanced.push(answer);
 			},
 		});
-		const gate = broker.openGate(approvalGate());
+		const gate = broker.openGate(approvalGate(), activeContinuation());
 
 		const invalid = await broker.resolve({ gate_id: gate.gate_id, answer: { decision: " approve " } });
 		expect(invalid.status).toBe("rejected");
@@ -108,7 +119,7 @@ describe("approvalGate red-team coercion checks (#317)", () => {
 				advanced.push(answer);
 			},
 		});
-		const gate = broker.openGate(approvalGate());
+		const gate = broker.openGate(approvalGate(), activeContinuation());
 
 		const resolution = await broker.resolve({ gate_id: gate.gate_id, answer: { decision: "request-changes" } });
 		expect(resolution.status).toBe("accepted");
@@ -142,7 +153,7 @@ describe("executionGate red-team coercion checks (#317)", () => {
 				advanced.push(answer);
 			},
 		});
-		const gate = broker.openGate(executionGate());
+		const gate = broker.openGate(executionGate(), activeContinuation());
 
 		const resolution = await broker.resolve({ gate_id: gate.gate_id, answer: { decision: "decline", reason: 7 } });
 		expect(resolution.status).toBe("rejected");

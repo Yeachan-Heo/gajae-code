@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "purpose": "Self-contained, offline stealth-detector fixtures for the anti-detection benchmark suite. Deterministic and CI-gating; no external/CDN fetches at test time.",
+  "fixtures": [
+    {
+      "file": "sannysoft-probe.html",
+      "modeledOn": "bot.sannysoft.com (fingerprint signal set)",
+      "note": "First-party reimplementation of the public boolean signal set (webdriver, plugins, languages, chrome runtime, permissions, webgl vendor/renderer). NOT a verbatim copy of the third-party site.",
+      "emits": "window.__stealthProbe (RawProbe shape from src/tools/browser/benchmark/detector-report.ts)"
+    }
+  ],
+  "refreshProcedure": "When the public detector signal sets change, update the probe checks in the fixture HTML and re-record baseline.json against the current browser tool. Bump schemaVersion on a breaking probe-shape change. Keep fixtures self-contained (inline JS only, zero network).",
+  "networkPolicy": "offline-only",
+  "license": "Fixtures are first-party (repository license). Signal semantics are inspired by public detectors used under fair-use for interoperability testing."
+}

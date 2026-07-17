@@ -1,9 +1,13 @@
-import { beforeAll, describe, expect, it, vi } from "bun:test";
+import { beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+
 import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
 import { InputController } from "../src/modes/controllers/input-controller";
 import { initTheme } from "../src/modes/theme/theme";
-import type { CompactionQueuedMessage, InteractiveModeContext } from "../src/modes/types";
+import type { CompactionQueuedMessage, ComposerSubmissionOptions, InteractiveModeContext } from "../src/modes/types";
 import type { QueuedMessageEditEntry } from "../src/session/agent-session";
 
 type FakeEditor = {
@@ -40,7 +44,11 @@ type FakeEditor = {
 	clearCustomKeyHandlers(): void;
 };
 
-async function createContext(options?: { busyPromptMode?: "steer" | "queue"; followUpKeys?: string[] }) {
+async function createContext(options?: {
+	busyPromptMode?: "steer" | "queue";
+	followUpKeys?: string[];
+	ircSidebarToggleKeys?: string[];
+}) {
 	let editorText = "";
 	const keyMap: Record<string, string[]> = {
 		"app.model.selectTemporary": ["ctrl+y"],
@@ -48,6 +56,7 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		"app.message.queue": ["alt+enter"],
 		"app.message.followUp": options?.followUpKeys ?? [],
 		"app.message.dequeue": ["alt+up", "alt+down"],
+		"app.irc.sidebar.toggle": options?.ircSidebarToggleKeys ?? ["alt+i"],
 	};
 
 	const setActionKeys = vi.fn();
@@ -56,6 +65,23 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 	const updatePendingMessagesDisplay = vi.fn();
 	const handleBashCommand = vi.fn(async () => {});
 	const showStatus = vi.fn();
+	const onInputCallback = vi.fn();
+	const toggleIrcSidebar = vi.fn();
+	const startPendingSubmission = vi.fn(
+		(
+			input: {
+				text: string;
+				images?: InteractiveModeContext["pendingImages"];
+				customType?: string;
+				display?: boolean;
+			},
+			_options?: ComposerSubmissionOptions,
+		) => ({
+			...input,
+			cancelled: false,
+			started: true,
+		}),
+	);
 	const compactionQueuedMessages: CompactionQueuedMessage[] = [];
 	const sessionQueuedMessages: string[] = [];
 	const queueCompactionMessage = vi.fn((text: string, mode: "steer" | "followUp") => {
@@ -141,6 +167,7 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			isGeneratingHandoff: false,
 			isBashRunning: false,
 			isEvalRunning: false,
+			messages: [],
 			abortBash: vi.fn(),
 			extensionRunner: undefined,
 			prompt,
@@ -150,6 +177,7 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			getQueuedMessageEntries,
 			removeQueuedMessageForEditing,
 			moveQueuedMessageForEditing,
+			getRoleModelCycleCandidateCount: vi.fn(() => 0),
 		} as unknown as InteractiveModeContext["session"],
 		keybindings: {
 			getKeys(action: string) {
@@ -159,6 +187,9 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		pendingImages: [],
 		compactionQueuedMessages,
 		queueCompactionMessage,
+		onInputCallback,
+		startPendingSubmission,
+		flushPendingBashComponents: vi.fn(),
 		settings: {
 			get(path: string) {
 				if (path === "images.autoResize") return false;
@@ -169,6 +200,9 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		sessionManager: {
 			getCwd() {
 				return "/";
+			},
+			getSessionName() {
+				return "test-session";
 			},
 		} as unknown as InteractiveModeContext["sessionManager"],
 		locallySubmittedUserSignatures: new Set<string>(),
@@ -209,6 +243,7 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		showUserMessageSelector: vi.fn(),
 		showSessionSelector: vi.fn(),
 		handleSTTToggle: vi.fn(),
+		toggleIrcSidebar,
 		showDebugSelector: vi.fn(),
 		showHistorySearch: vi.fn(),
 		toggleThinkingBlockVisibility: vi.fn(),
@@ -217,6 +252,8 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 		handleBashCommand,
 		showWarning: vi.fn(),
 		showStatus,
+		showError: vi.fn(),
+
 		hasActiveBtw: vi.fn(() => false),
 	} as unknown as InteractiveModeContext;
 
@@ -228,6 +265,8 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			setActionKeys,
 			showModelSelector,
 			prompt,
+			onInputCallback,
+			startPendingSubmission,
 			updatePendingMessagesDisplay,
 			handleBashCommand,
 			showStatus,
@@ -237,6 +276,7 @@ async function createContext(options?: { busyPromptMode?: "steer" | "queue"; fol
 			getQueuedMessageEntries,
 			removeQueuedMessageForEditing,
 			moveQueuedMessageForEditing,
+			toggleIrcSidebar,
 		},
 		queues: {
 			compactionQueuedMessages,
@@ -251,6 +291,55 @@ beforeAll(() => {
 });
 
 describe("InputController keybinding setup", () => {
+	it("reports model, streaming, and unfinished action availability", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			isStreaming: boolean;
+			model: { reasoning?: boolean } | undefined;
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		const controller = new InputController(ctx);
+
+		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.model.cycleForward")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.session.togglePath")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.transcript.browse")).toBe(false);
+
+		session.model = { reasoning: true };
+		session.getRoleModelCycleCandidateCount.mockReturnValue(2);
+		session.isStreaming = true;
+		await Promise.resolve();
+		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(true);
+		expect(controller.actionRegistry.isAvailable("app.model.cycleForward")).toBe(true);
+
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(true);
+	});
+
+	it("enables model cycling from configured role candidates without a model scope", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			scopedModels: unknown[];
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		session.scopedModels = [];
+		session.getRoleModelCycleCandidateCount.mockReturnValue(2);
+
+		expect(new InputController(ctx).actionRegistry.isAvailable("app.model.cycleForward")).toBe(true);
+	});
+
+	it("disables model cycling when a model scope has one cycleable candidate", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			scopedModels: unknown[];
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		session.scopedModels = [{}, {}];
+		session.getRoleModelCycleCandidateCount.mockReturnValue(1);
+
+		expect(new InputController(ctx).actionRegistry.isAvailable("app.model.cycleBackward")).toBe(false);
+	});
+
 	it("registers temporary and persisted model selector actions separately", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const controller = new InputController(ctx);
@@ -264,10 +353,45 @@ describe("InputController keybinding setup", () => {
 		expect(editor.onSelectModelTemporary).not.toBe(editor.onSelectModel);
 
 		editor.onSelectModelTemporary?.();
+		await Bun.sleep(0);
 		editor.onSelectModel?.();
+		await Bun.sleep(0);
 
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(1, { temporaryOnly: true });
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
+	});
+
+	it("registers the default IRC sidebar shortcut and consumes its dispatch", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+			([key]) => key === "alt+i",
+		);
+		expect(registration).toBeDefined();
+		const handler = registration?.[1] as () => boolean;
+
+		expect(handler()).toBe(true);
+		expect(spies.toggleIrcSidebar).toHaveBeenCalledTimes(1);
+	});
+
+	it("registers remapped IRC sidebar shortcuts", async () => {
+		const { InputController, ctx, editor } = await createContext({ ircSidebarToggleKeys: ["ctrl+alt+i"] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		expect(editor.setCustomKeyHandler).toHaveBeenCalledWith("ctrl+alt+i", expect.any(Function));
+		expect(editor.setCustomKeyHandler).not.toHaveBeenCalledWith("alt+i", expect.any(Function));
+	});
+
+	it("does not register a sidebar handler when its binding is explicitly empty", async () => {
+		const { InputController, ctx, editor } = await createContext({ ircSidebarToggleKeys: [] });
+		new InputController(ctx).setupKeyHandlers();
+
+		expect(editor.setCustomKeyHandler).not.toHaveBeenCalledWith("alt+i", expect.any(Function));
 	});
 
 	it("registers an explicit queue action separately from immediate submit", async () => {
@@ -286,6 +410,7 @@ describe("InputController keybinding setup", () => {
 		expect(ctx.locallySubmittedUserSignatures.has("queue after current response\u00000")).toBe(true);
 		expect(spies.prompt).toHaveBeenCalledWith("queue after current response", {
 			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
@@ -331,6 +456,7 @@ describe("InputController keybinding setup", () => {
 		await Bun.sleep(0);
 		expect(spies.prompt).toHaveBeenCalledWith("follow up from shortcut", {
 			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
 		});
 	});
 
@@ -370,8 +496,9 @@ describe("InputController keybinding setup", () => {
 
 	it("queues explicit message action during compaction", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
-		const session = ctx.session as unknown as { isCompacting: boolean };
+		const session = ctx.session as unknown as { isCompacting: boolean; isStreaming: boolean };
 		session.isCompacting = true;
+		session.isStreaming = true;
 		editor.setText("queue while compacting via shortcut");
 		const controller = new InputController(ctx);
 
@@ -570,6 +697,169 @@ describe("InputController keybinding setup", () => {
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
+	it("omits pasted image attachments when their placeholders were deleted", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const deletedImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "deleted-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [deletedImage];
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("send text after deleting the pasted image");
+
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "send text after deleting the pasted image",
+			images: undefined,
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "send text after deleting the pasted image",
+			images: undefined,
+			cancelled: false,
+			started: true,
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("submits only pasted images whose placeholders remain", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const firstImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "first-image",
+			mimeType: "image/png",
+		};
+		const secondImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "second-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [firstImage, secondImage];
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("describe only [image 2]");
+
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "describe only [image 2]",
+			images: [secondImage],
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "describe only [image 2]",
+			images: [secondImage],
+			cancelled: false,
+			started: true,
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
+	it("keeps pasted clipboard images when submit reset fires before the submit callback", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "clipboard-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [image];
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+
+		editor.setText("describe [image 1]");
+		editor.setText("");
+		editor.onChange?.("");
+		await editor.onSubmit?.("describe [image 1]");
+
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "describe [image 1]",
+			images: [image],
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "describe [image 1]",
+			images: [image],
+			cancelled: false,
+			started: true,
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("preserves successor composer images while an input extension is awaiting", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const firstImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "first-image",
+			mimeType: "image/png",
+		};
+		const secondImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "second-image",
+			mimeType: "image/png",
+		};
+		const extension = Promise.withResolvers<void>();
+		const emitInput = vi.fn(async () => {
+			await extension.promise;
+			return undefined;
+		});
+		(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = {
+			hasHandlers: () => true,
+			getShortcuts: () => [],
+			emitInput,
+		};
+		ctx.pendingImages = [firstImage];
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+
+		editor.setText("");
+		editor.onChange?.("");
+		const firstSubmit = editor.onSubmit?.("describe [image 1]");
+		expect(emitInput).toHaveBeenCalledTimes(1);
+
+		ctx.pendingImages = [...ctx.pendingImages, secondImage];
+		editor.setText("follow up [image 2]");
+		await Promise.resolve();
+		expect(ctx.pendingImages).toEqual([firstImage, secondImage]);
+
+		extension.resolve();
+		await firstSubmit;
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "describe [image 1]",
+			images: [firstImage],
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(ctx.pendingImages).toEqual([firstImage, secondImage]);
+
+		await editor.onSubmit?.("follow up [image 2]");
+		expect(spies.startPendingSubmission.mock.calls[1]?.[0]).toEqual({
+			text: "follow up [image 2]",
+			images: [secondImage],
+		});
+		expect(spies.startPendingSubmission.mock.calls[1]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("still clears pending images after the composer is manually emptied", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "clipboard-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [image];
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		editor.setText("");
+		editor.onChange?.("");
+		expect(ctx.pendingImages).toEqual([image]);
+
+		await Promise.resolve();
+
+		expect(ctx.pendingImages).toEqual([]);
+	});
 
 	it("marks streaming follow-up submissions as local", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
@@ -583,6 +873,7 @@ describe("InputController keybinding setup", () => {
 		expect(ctx.locallySubmittedUserSignatures.has("follow up after current response\u00000")).toBe(true);
 		expect(spies.prompt).toHaveBeenCalledWith("follow up after current response", {
 			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
@@ -636,8 +927,8 @@ describe("InputController pasted clipboard image paths", () => {
 	const RED_1X1_PNG_BASE64 =
 		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
-	it("attaches terminal-pasted clipboard temp images and inserts a compact placeholder", async () => {
-		const imagePath = `/tmp/clipboard-2026-06-04-120441-${process.pid.toString(36)}CAC144E7.png`;
+	it("attaches terminal-pasted clipboard temp images and preserves the source path in the placeholder", async () => {
+		const imagePath = path.join(os.tmpdir(), `clipboard-2026-06-04-120441-${process.pid.toString(36)}CAC144E7.png`);
 		await Bun.write(imagePath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
 		try {
 			const { InputController, ctx, editor, spies } = await createContext();
@@ -647,7 +938,7 @@ describe("InputController pasted clipboard image paths", () => {
 			const handled = await editor.onPasteText?.(`${imagePath}\n`);
 
 			expect(handled).toBe(true);
-			expect(editor.getText()).toBe("[image 1] ");
+			expect(editor.getText()).toBe(`[image 1] source=${JSON.stringify(imagePath)} `);
 			expect(ctx.pendingImages).toHaveLength(1);
 			expect(ctx.pendingImages[0]?.mimeType).toBe("image/png");
 			expect(spies.showStatus).toHaveBeenCalledWith(`Attached image: ${imagePath.split("/").at(-1)}`, { dim: true });

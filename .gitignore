@@ -75,16 +75,9 @@ pi-*.html
 # Generated files
 packages/coding-agent/src/internal-urls/docs-index.generated.ts
 /runs/
-python/gjc-rpc/src/gjc_rpc.egg-info/
 # parallel-agent worktrees
 .wt/
 CPU*.md
 packages/coding-agent/binaries/
 
-# robogjc runtime state
-python/robogjc/data/
-python/robogjc/.cache/
-python/robogjc/src/robogjc/static/
-python/robogjc/web/dist/
-python/robogjc/.env
 .release-040-artifacts/

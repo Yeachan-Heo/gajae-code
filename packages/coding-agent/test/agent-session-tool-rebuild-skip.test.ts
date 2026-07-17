@@ -197,6 +197,42 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(rebuildCount).toBe(2);
 	});
 
+	it("retries an identical MCP refresh after a superseding explicit rebuild fails", async () => {
+		// Given
+		const firstRebuildEntered = Promise.withResolvers<void>();
+		const releaseFirstRebuild = Promise.withResolvers<void>();
+		const explicitRefreshError = new Error("explicit rebuild failed");
+		let rebuildCount = 0;
+		const { session } = newSession(async toolNames => {
+			const rebuild = ++rebuildCount;
+			if (rebuild === 1) {
+				firstRebuildEntered.resolve();
+				await releaseFirstRebuild.promise;
+			}
+			if (rebuild === 2) throw explicitRefreshError;
+			return `tools:${toolNames.join(",")}`;
+		});
+		const tool = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search");
+
+		// When
+		const firstRefresh = session.refreshMCPTools([tool]);
+		await firstRebuildEntered.promise;
+		let explicitFailure: unknown;
+		try {
+			await session.refreshBaseSystemPrompt();
+		} catch (error) {
+			explicitFailure = error;
+		}
+		expect(explicitFailure).toBe(explicitRefreshError);
+		releaseFirstRebuild.resolve();
+		await firstRefresh;
+		await session.refreshMCPTools([tool]);
+
+		// Then
+		expect(rebuildCount).toBe(3);
+		expect(session.systemPrompt).toEqual(["tools:read,mcp__nucleus_search"]);
+	});
+
 	it("ignores incidental insertion order in the refresh argument", async () => {
 		let rebuildCount = 0;
 		const { session } = newSession(async toolNames => {
@@ -238,10 +274,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(rebuildCount).toBe(2);
 	});
 
-	it("rebuilds when MCP server instructions text changes", async () => {
-		// `rebuildSystemPrompt` embeds per-server `instructions` text into the appended
-		// prompt. The signature must include this so a server upgrade that changes
-		// instructions while keeping tools constant still triggers a rebuild.
+	it("does not rebuild the system prompt when request-scoped MCP instructions change", async () => {
+		// Server instructions are request-scoped untrusted user data, so changing them
+		// must not invalidate or rebuild the cached system prompt.
 		let rebuildCount = 0;
 		const instructions = new Map<string, string>([["nucleus", "v1 instructions"]]);
 		const { session } = newSession(
@@ -260,15 +295,14 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.refreshMCPTools([tool]);
 		expect(rebuildCount).toBe(1);
 
-		// Mutate the live instructions map (callers return the live reference).
+		// Mutating or adding live server instructions does not affect the system prompt.
 		instructions.set("nucleus", "v2 instructions");
 		await session.refreshMCPTools([tool]);
-		expect(rebuildCount).toBe(2);
+		expect(rebuildCount).toBe(1);
 
-		// Adding a new server's instructions also triggers rebuild.
 		instructions.set("glean", "glean instructions");
 		await session.refreshMCPTools([tool]);
-		expect(rebuildCount).toBe(3);
+		expect(rebuildCount).toBe(1);
 	});
 
 	it("rebuilds when a discoverable (inactive) registry tool's metadata changes", async () => {
@@ -387,10 +421,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.refreshMCPTools([dynamicTool]);
 		expect(rebuildCount).toBe(baseline + 1);
 	});
-	it("rebuilds when the calendar date rolls over between tool-stable MCP refreshes", async () => {
-		// `buildSystemPrompt` injects today's date into the prompt body.
-		// A session spanning midnight must not serve yesterday's date after an MCP
-		// reconnect that happens to bring an identical tool set.
+	it("does not rebuild when only the calendar date rolls over between tool-stable MCP refreshes", async () => {
+		// Date/cwd/workspace-tree are volatile per-turn context, not stable system
+		// prompt inputs. A midnight rollover must not perturb the MCP tool signature.
 		setSystemTime(new Date("2025-01-01T23:59:58Z"));
 		try {
 			let rebuildCount = 0;
@@ -411,23 +444,21 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			// Advance past midnight.
 			setSystemTime(new Date("2025-01-02T00:00:01Z"));
 
-			// Same tools, new calendar day: date segment changed, must rebuild.
+			// Same tools, new calendar day: skip because volatile date/cwd/tree
+			// context is intentionally excluded from the stable tool signature.
 			await session.refreshMCPTools([tool]);
-			expect(rebuildCount).toBe(2);
+			expect(rebuildCount).toBe(1);
 
 			// Same tools, same new day: skip again.
 			await session.refreshMCPTools([tool]);
-			expect(rebuildCount).toBe(2);
+			expect(rebuildCount).toBe(1);
 		} finally {
 			setSystemTime(); // restore real time
 		}
 	});
-	it("does not rebuild when MCP server instructions change only beyond the 4000-char truncation boundary", async () => {
-		// `rebuildSystemPrompt` (sdk.ts) truncates each server instruction to 4000 chars
-		// before embedding it. The `getMcpServerInstructions` callback must therefore
-		// return pre-truncated strings so the signature hashes exactly what the prompt
-		// builder uses. Changes beyond char 4000 cannot affect rendered prompt bytes
-		// and must NOT trigger a rebuild.
+	it("does not rebuild for MCP instruction changes at any truncation boundary", async () => {
+		// Instruction truncation applies to request-scoped untrusted data and is not
+		// part of the stable system-prompt signature.
 		const prefix = "A".repeat(4000);
 		const instructions = new Map<string, string>([["nucleus", `${prefix}_tail_v1`]]);
 		let rebuildCount = 0;
@@ -438,7 +469,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			},
 			{
 				getMcpServerInstructions: () => {
-					// Mirror what sdk.ts does: truncate to 4000 chars before returning.
+					// Mirror what sdk/session.ts does: truncate to 4000 chars before returning.
 					const out = new Map<string, string>();
 					for (const [name, text] of instructions) {
 						out.set(name, text.length > 4000 ? text.slice(0, 4000) : text);
@@ -457,9 +488,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.refreshMCPTools([tool]);
 		expect(rebuildCount).toBe(1);
 
-		// Mutate within the first 4000 chars: truncated string differs → rebuild.
+		// Mutating within the first 4000 chars also leaves the system prompt unchanged.
 		instructions.set("nucleus", `${"B".repeat(4000)}_tail_v2`);
 		await session.refreshMCPTools([tool]);
-		expect(rebuildCount).toBe(2);
+		expect(rebuildCount).toBe(1);
 	});
 });

@@ -1,0 +1,16 @@
+{
+  "status": "errored_context_recovered",
+  "agent_id": "3-SkillMiscPrompts",
+  "session_file": "<local-gjc-session-jsonl-redacted>",
+  "tool_calls": 82,
+  "report_finding_count": 0,
+  "yield_count": 0,
+  "terminal_error": "429 rate_limit_error after repeated stream stalls",
+  "canonical_recovered_artifacts": [
+    "recovered-context/3-SkillMiscPrompts.recovered.md",
+    "recovered-context/3-SkillMiscPrompts.findings.json",
+    "recovery-summary.md"
+  ],
+  "verdict": null,
+  "note": "The earlier agent:// read returned a duplicate AgentPrompts-like JSON, but direct JSONL inspection shows 3-SkillMiscPrompts errored without yield and without report_finding. Treat that earlier return as an invalid retrieval artifact, not a skill/misc report."
+}

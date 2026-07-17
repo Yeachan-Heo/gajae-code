@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { createDiscordAdapter, createSlackAdapter } from "../src/notifications/chat-adapters";
-import { NotificationPresentationEngine, type NotificationReplyRoute } from "../src/notifications/engine";
+import { createDiscordAdapter, createSlackAdapter } from "../src/sdk/bus/chat-adapters";
+import { NotificationPresentationEngine, type NotificationReplyRoute } from "../src/sdk/bus/engine";
 
 const secretCorpus = [
 	"raw prompt body",

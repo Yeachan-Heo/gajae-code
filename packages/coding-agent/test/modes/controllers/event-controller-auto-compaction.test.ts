@@ -14,7 +14,7 @@ type AutoCompactionFixture = {
 	flushCompactionQueue: Mock<(options: { willRetry: boolean }) => Promise<void>>;
 	loaderStop: Mock<() => void>;
 	statusContainerClear: Mock<() => void>;
-	rebuildChatFromMessages: Mock<() => void>;
+	rebuildChatFromMessages: Mock<(policy: "replace-identity" | "reconcile-same-transcript") => void>;
 };
 
 function createFixture(): AutoCompactionFixture {
@@ -34,8 +34,9 @@ function createFixture(): AutoCompactionFixture {
 	const flushCompactionQueue = vi.fn(async () => {
 		order.push("flushCompactionQueue");
 	});
-	const rebuildChatFromMessages = vi.fn(() => {
-		order.push("rebuildChatFromMessages");
+	const prepareViewportAnchorForTranscriptRebuild = vi.fn();
+	const rebuildChatFromMessages = vi.fn((policy: "replace-identity" | "reconcile-same-transcript") => {
+		order.push(`rebuildChatFromMessages:${policy}`);
 	});
 
 	const ctx = {
@@ -60,6 +61,8 @@ function createFixture(): AutoCompactionFixture {
 			requestRender: vi.fn(() => {
 				order.push("ui.requestRender");
 			}),
+			prepareViewportAnchorForTranscriptRebuild,
+			resetViewportAnchorIntent: vi.fn(),
 		},
 		showStatus,
 		showWarning,
@@ -113,6 +116,7 @@ describe("EventController auto-compaction overflow status", () => {
 		expect(fixture.showStatus).toHaveBeenCalledWith("Context overflow maintenance completed");
 		expect(fixture.showWarning).not.toHaveBeenCalled();
 		expect(fixture.order.indexOf("loader.stop")).toBeLessThan(fixture.order.indexOf("showStatus"));
+		expect(fixture.rebuildChatFromMessages).toHaveBeenCalledWith("reconcile-same-transcript");
 		expect(fixture.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: true });
 	});
 
@@ -147,6 +151,7 @@ describe("EventController auto-compaction overflow status", () => {
 		expect(fixture.loaderStop).toHaveBeenCalledTimes(1);
 		expect(fixture.ctx.autoCompactionLoader).toBeUndefined();
 		expect(fixture.rebuildChatFromMessages).toHaveBeenCalledTimes(1);
+		expect(fixture.rebuildChatFromMessages).toHaveBeenCalledWith("reconcile-same-transcript");
 		expect(fixture.showStatus).toHaveBeenCalledWith(
 			"Context overflow recovery skipped: auto_continue_disabled_non_resumable_tail",
 		);

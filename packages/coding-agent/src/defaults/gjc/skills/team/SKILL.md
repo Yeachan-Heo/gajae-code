@@ -112,7 +112,7 @@ Before launching `gjc team`, require a grounded context snapshot:
    - unknowns/open questions
    - likely codebase touchpoints
 4. If ambiguity remains high, gather brownfield facts with focused repo inspection or a canonical read-only role agent first, then run `$deep-interview --quick <task>` before team launch.
-5. If current correctness depends on official docs, version-aware framework guidance, best practices, or external dependency behavior, auto-delegate `researcher` as an evidence lane before or alongside worker launch instead of relying on repo-local recall alone.
+5. If current correctness depends on official docs, version-aware framework guidance, best practices, or external dependency behavior, gather evidence before or alongside worker launch using supported surfaces only: focused repo inspection for local facts, `planner` for broad context mapping/sequencing, `architect` for architecture or external-doc-risk assessment, and direct web/search tools when configured.
 
 Do not start the worker pane until this gate is satisfied; if forced to proceed quickly, state explicit scope/risk limitations in the launch report.
 
@@ -311,10 +311,10 @@ Worker protocol:
 Useful runtime env vars:
 
 - `GJC_TMUX_COMMAND` / `GJC_TEAM_TMUX_COMMAND`
-  - tmux binary/name override (default `tmux` on POSIX, `psmux` / `pmux` / `tmux` on native Windows when one of those resolves on PATH). `GJC_TMUX_COMMAND` applies to every GJC tmux flow; `GJC_TEAM_TMUX_COMMAND` is honored as an alias by the team path. Both resolve through the same resolver, so the team leader and `gjc session ...` always target the same multiplexer. These values are executable path/name overrides, not shell command lines; do not include flags such as `psmux -L <namespace>` in the env var.
-  - Native Windows psmux support: psmux is the supported tmux-compatible multiplexer for native Windows `gjc --tmux`, `gjc session`, and `gjc team`. Psmux can be exposed as `psmux.exe` or as its `tmux.exe`/`pmux.exe` aliases. GJC probes `psmux` / `pmux` / `tmux` on Windows PATH, picks the first that resolves, and treats that binary as the multiplexer. Worker commands on Windows are emitted with PowerShell-safe `$env:VAR = 'value';` assignments so psmux's ConPTY panes inherit `GJC_TEAM_*` correctly.
-  - Multiplexer detection knobs (Windows): `GJC_PSMUX_COMMAND` forces a wrapper to be treated as psmux, `GJC_PSMUX_DETECTION=off` skips detection, `GJC_PSMUX_FORCE_DETECT=1` re-probes every call. The mouse / set-clipboard / mode-style UX profile is filtered out for psmux; the `@gjc-profile` ownership tag and branch / project / session identity markers still round-trip and are required for `gjc session` and `gjc team`.
-  - Windows psmux namespace boundary: psmux `-c <path>` cwd/start-directory flags do not isolate the server namespace; psmux uses the tmux-compatible global `-L <namespace>` flag for isolated server instances. GJC does not currently expose structured runtime `-L` support, because launch, `gjc session`, and `gjc team` must all carry the same namespace prefix together. If you need isolated psmux servers, start `psmux -L <namespace>` yourself before `gjc --tmux` and let GJC attach to it; do not pass `-L` through `GJC_TMUX_COMMAND`.
+  - tmux executable override (default `tmux` on POSIX; `psmux` / `pmux` / `tmux` resolution on native Windows). `GJC_TMUX_COMMAND` applies to every GJC tmux flow; `GJC_TEAM_TMUX_COMMAND` is honored as a team-path alias. Values are executable paths/names, not shell command lines.
+  - Native Windows psmux boundary: a generic-banner `tmux.exe` alias is classified by matching its executable identity with resolved `psmux.exe` / `pmux.exe` companions. Unresolved or conflicting identity evidence fails closed with `gjc_tmux_provider_ambiguous`; `GJC_PSMUX_COMMAND` must resolve to the same executable identity as the selected alias.
+  - Managed psmux session creation, attachment, lifecycle mutation, and team startup remain unsupported because psmux cannot provide the immutable native session identity required by the owner-isolation contract. Use WSL or verified native tmux for live team workers.
+  - Windows psmux namespace boundary: psmux uses the tmux-compatible global `-L <namespace>` flag for server isolation, but GJC does not accept flags in `GJC_TMUX_COMMAND` or expose structured runtime `-L` support.
 - `GJC_TEAM_WORKER_COMMAND`
   - worker command override (default resolves to active GJC entrypoint or `gjc`)
 - `GJC_TEAM_STATE_ROOT`
@@ -343,14 +343,15 @@ Use only after checking `gjc team status <team>` and state evidence:
    - `.gjc/_session-{sessionid}/state/team/<team>/config.json`
    - `.gjc/_session-{sessionid}/state/team/<team>/tasks/task-1.json`
    - `.gjc/_session-{sessionid}/state/team/<team>/mailbox/worker-1.json`
-2. Capture pane tail to confirm current worker state:
-   - `tmux capture-pane -t %<worker-pane> -p -S -120`
-   - If a larger-tail read or bounded summary would help, prefer explicit opt-in inspection via `gjc sparkshell --tmux-pane %<worker-pane> --tail-lines 400` before improvising extra tmux commands.
-3. If the pane is stuck in an interactive state, safely return to idle prompt first:
-   - optional interrupt `C-c` or escape flow (CLI-specific) once, then re-check pane capture
+2. Use supported team surfaces before manual pane intervention:
+   - `gjc team status <team>` for current recorded state
+   - `gjc team monitor <team>` when a live monitor/update loop is needed
+   - `gjc team api <team>` only for documented programmatic operations
+3. If the recorded worker pane is stuck in an interactive state, safely return to idle prompt first:
+   - optional interrupt `C-c` or escape flow (CLI-specific) once, then re-check `gjc team status <team>` and relevant state files
 4. Send one concise trigger only when runtime/state checks show manual prompt input is needed:
    - `tmux send-keys -t %<worker-pane> "continue current task; report status" C-m`
-5. Re-check pane output, task state, worker mailbox, and `gjc team status <team>`.
+5. Re-check task state, worker mailbox, and `gjc team status <team>`.
 
 ### Shutdown reports success but stale worker panes remain
 
@@ -372,8 +373,9 @@ tmux list-panes -F '#{pane_id}	#{pane_current_command}	#{pane_start_command}'
 tmux kill-pane -t %450
 tmux kill-pane -t %451
 
-# 3) Remove stale team state only after preserving needed evidence, using the state runtime
-# cleanup verb documented by the current manifest
+# 3) Shut down recorded team state/workers through the supported team runtime
+# Replace <team-name> with the team from `gjc team list` / `gjc team status`.
+gjc team shutdown <team-name>
 
 # 4) Retry
 gjc team executor "fresh retry"
@@ -396,7 +398,7 @@ When operating this skill, provide concrete progress evidence:
 
 Do not claim success without file/pane evidence.
 Do not claim clean completion if shutdown occurred with `in_progress>0`.
-Use `gjc sparkshell --tmux-pane ...` as an explicit opt-in operator aid for pane inspection and summaries; keep raw `tmux capture-pane` evidence available for manual intervention and proof.
+Use `gjc team status <team>` and `gjc team monitor <team>` as the supported operator aids for status inspection; keep raw state-file or pane evidence available for manual intervention and proof.
 
 ## Programmatic Team Orchestration
 
@@ -405,14 +407,15 @@ Use the `gjc team ...` CLI as the supported team-launch surface. For automation,
 ### Supported current surfaces
 
 - **`gjc team ...` CLI** — Primary method for interactive or automated team orchestration. Use this when you want direct tmux-pane visibility or a scriptable launch path.
+- **`gjc team status <team>`** — Read current team/task/worker state.
+- **`gjc team monitor <team>`** — Follow live progress through the supported runtime surface.
+- **`gjc team shutdown <team>`** — Stop recorded active workers and move the team toward terminal state.
+- **`gjc team api <team>`** — Use only for documented programmatic operations exposed by the team runtime.
 - **Team state files** — Inspect `.gjc/_session-{sessionid}/state/team/<team>/` when you need status, task, or mailbox evidence after launch.
 
 ### Cleanup distinction
 
-Two cleanup paths exist and must not be confused:
-
-- `team_cleanup` (**state-server**): Deletes team state **files** on disk (`.gjc/_session-{sessionid}/state/team/<team>/`). Use after a team run is fully complete.
-- tmux/session cleanup: Use the documented `gjc team` shutdown / cleanup flow when you need to stop the worker pane or clean up an interrupted run.
+Use `gjc team shutdown <team>` for recorded active workers. After shutdown reports a terminal state and required evidence is preserved, use supported `gjc state ...` session/mode cleanup commands only when you are intentionally clearing state; do not delete team state by hand during an active run. Use manual tmux/session cleanup only for verified stale panes that are not handled by the documented shutdown flow.
 
 ### Automation example
 

@@ -13,6 +13,7 @@ import {
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
 import { formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
 import { $ } from "bun";
+import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
 import { reset as resetCapabilities } from "../../capability";
 import { clearClaudePluginRootsCache } from "../../discovery/helpers";
@@ -39,6 +40,7 @@ import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
+import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../../session/cache-economics";
 import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
@@ -47,6 +49,7 @@ import { getDisplayChangelogEntries } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
+import { prepareTranscriptRebuild } from "../utils/ui-helpers";
 
 function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown: string): void {
 	ctx.chatContainer.addChild(new Spacer(1));
@@ -400,7 +403,7 @@ export class CommandController {
 		{
 			const setting = this.ctx.settings.get("provider.appendOnlyContext") ?? "auto";
 			const provider = this.ctx.session.model?.provider;
-			const mode = setting === "on" ? true : setting === "off" ? false : provider === "deepseek";
+			const mode = resolveAppendOnlyMode(setting, provider ?? "");
 			const activeLabel = mode ? theme.fg("success", "active") : theme.fg("dim", "inactive");
 			const settingLabel = setting === "auto" ? `${setting} (${provider ?? "?"})` : setting;
 			info += `${theme.fg("dim", "Append-Only:")} ${activeLabel} (setting: ${settingLabel})\n`;
@@ -425,12 +428,29 @@ export class CommandController {
 				info += `${theme.fg("dim", "Premium Requests:")} ${normalizedPremiumRequests.toLocaleString()}\n`;
 			}
 		}
+		const cacheMissSummary = stats.costBreakdown
+			? computeCacheMissCostSummary(stats.tokens, {
+					kind: "persisted-aggregate",
+					costBreakdown: stats.costBreakdown,
+				})
+			: undefined;
+		if (cacheMissSummary) {
+			info += `\n${theme.bold("Cache Miss Cost")}`;
+			for (const line of formatCacheMissSummaryLines(cacheMissSummary)) {
+				const separator = line.indexOf(":");
+				if (separator === -1) {
+					info += `\n${line}`;
+				} else {
+					info += `\n${theme.fg("dim", `${line.slice(0, separator)}:`)}${line.slice(separator + 1)}`;
+				}
+			}
+			info += `\n`;
+		}
 
 		if (this.ctx.lspServers && this.ctx.lspServers.length > 0) {
 			info += `\n${theme.bold("LSP Servers")}\n`;
 			for (const server of this.ctx.lspServers) {
-				const statusColor =
-					server.status === "ready" ? "success" : server.status === "connecting" ? "warning" : "error";
+				const statusColor = server.status === "ready" ? "success" : server.status === "error" ? "error" : "warning";
 				const statusText =
 					server.status === "error" && server.error ? `${server.status}: ${server.error}` : server.status;
 				info += `${theme.fg("dim", `${server.name}:`)} ${theme.fg(statusColor, statusText)} ${theme.fg("dim", `(${server.fileTypes.join(", ")})`)}\n`;
@@ -540,7 +560,7 @@ export class CommandController {
 		const title = showFull ? "Full Changelog" : "Recent Changes";
 		const hint = showFull
 			? ""
-			: `\n\n${theme.fg("dim", "Use")} ${theme.bold("/changelog full")} ${theme.fg("dim", "to view the complete changelog.")}`;
+			: `\n\n${theme.fg("dim", "Use")} ${theme.bold("/changelog --full")} ${theme.fg("dim", "to view the complete changelog.")}`;
 
 		this.ctx.chatContainer.addChild(new Spacer(1));
 		this.ctx.chatContainer.addChild(new DynamicBorder());
@@ -566,7 +586,7 @@ export class CommandController {
 			`| Start a fresh session | \`${sessionNewKey}\` or \`/new\` |`,
 			"| Resume another session | `/resume` |",
 			"| Show session details | `/session info` |",
-			"| Delete current session | `/session delete` |",
+			"| Delete current session transcript/artifacts | `/session delete` |",
 			"| Select a model | `/model` or `Ctrl+L` |",
 			"| Show all shortcuts | `?` on an empty prompt or `/hotkeys` |",
 			"",
@@ -896,7 +916,43 @@ export class CommandController {
 		}
 	}
 
-	async #runNewSessionFlow(options?: NewSessionOptions, label: string = "New session started"): Promise<void> {
+	async #runNewSessionFlow(options?: NewSessionOptions, label: string = "New session started"): Promise<boolean> {
+		if (!(await this.ctx.session.newSession(options))) return false;
+
+		if (this.ctx.loadingAnimation) {
+			this.ctx.loadingAnimation.stop();
+			this.ctx.loadingAnimation = undefined;
+		}
+		this.ctx.statusContainer.clear();
+		this.ctx.resetIrcSidebarSession();
+		this.ctx.resetObserverRegistry();
+		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+
+		this.ctx.statusLine.invalidate();
+		this.ctx.statusLine.setSessionStartTime(Date.now());
+		this.ctx.updateEditorTopBorder();
+		this.ctx.updateEditorBorderColor();
+		this.ctx.ui.requestRender();
+
+		prepareTranscriptRebuild(this.ctx.ui, "replace-identity");
+		this.ctx.chatContainer.clear();
+		this.ctx.pendingMessagesContainer.clear();
+		this.ctx.compactionQueuedMessages = [];
+		this.ctx.streamingComponent = undefined;
+		this.ctx.streamingMessage = undefined;
+		this.ctx.pendingTools.clear();
+
+		this.ctx.chatContainer.addChild(new Text(`${theme.fg("accent", `${theme.status.success} ${label}`)}`, 1, 0));
+		await this.ctx.reloadTodos();
+		this.ctx.ui.requestRender();
+		return true;
+	}
+
+	async handleClearCommand(): Promise<boolean> {
+		return this.#runNewSessionFlow();
+	}
+
+	async handleContextClearCommand(): Promise<void> {
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
@@ -909,8 +965,7 @@ export class CommandController {
 				await Bun.sleep(10);
 			}
 		}
-		if (!(await this.ctx.session.newSession(options))) return;
-		this.ctx.resetObserverRegistry();
+		if (!(await this.ctx.session.clearContext())) return;
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 
 		this.ctx.statusLine.invalidate();
@@ -919,6 +974,7 @@ export class CommandController {
 		this.ctx.updateEditorBorderColor();
 		this.ctx.ui.requestRender();
 
+		prepareTranscriptRebuild(this.ctx.ui, "replace-identity");
 		this.ctx.chatContainer.clear();
 		this.ctx.pendingMessagesContainer.clear();
 		this.ctx.compactionQueuedMessages = [];
@@ -926,21 +982,19 @@ export class CommandController {
 		this.ctx.streamingMessage = undefined;
 		this.ctx.pendingTools.clear();
 
-		this.ctx.chatContainer.addChild(new Text(`${theme.fg("accent", `${theme.status.success} ${label}`)}`, 1, 0));
+		this.ctx.chatContainer.addChild(
+			new Text(`${theme.fg("accent", `${theme.status.success} Context cleared`)}`, 1, 0),
+		);
 		await this.ctx.reloadTodos();
 		this.ctx.ui.requestRender();
 	}
 
-	async handleClearCommand(): Promise<void> {
-		await this.#runNewSessionFlow();
-	}
-
-	async handleDropCommand(): Promise<void> {
+	async handleDropCommand(): Promise<boolean> {
 		if (!this.ctx.sessionManager.getSessionFile()) {
 			this.ctx.showError("Nothing to drop (in-memory session)");
-			return;
+			return false;
 		}
-		await this.#runNewSessionFlow({ drop: true }, "Session dropped");
+		return this.#runNewSessionFlow({ drop: true }, "Session dropped");
 	}
 
 	async handleForkCommand(): Promise<void> {
@@ -959,6 +1013,7 @@ export class CommandController {
 			this.ctx.showError("Fork failed (session not persisted or cancelled)");
 			return;
 		}
+		this.ctx.resetIrcSidebarSession();
 
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorTopBorder();
@@ -1182,7 +1237,7 @@ export class CommandController {
 					: undefined;
 			await this.ctx.session.compact(instructions, options);
 
-			this.ctx.rebuildChatFromMessages();
+			this.ctx.rebuildChatFromMessages("reconcile-same-transcript");
 
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
@@ -1242,9 +1297,10 @@ export class CommandController {
 				this.ctx.showError("Handoff cancelled");
 				return;
 			}
+			this.ctx.resetIrcSidebarSession();
 
 			// Rebuild chat from the new session (which now contains the handoff document)
-			this.ctx.rebuildChatFromMessages();
+			this.ctx.rebuildChatFromMessages("replace-identity");
 
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();

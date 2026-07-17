@@ -3,7 +3,7 @@ import {
 	NotificationOperatorRuntime,
 	OperatorBackoffPolicy,
 	OperatorEventRouter,
-} from "../src/notifications/operator-runtime";
+} from "../src/sdk/bus/operator-runtime";
 
 describe("notification operator runtime core", () => {
 	test("tracks lifecycle and aborts the active operation on cooperative stop", () => {

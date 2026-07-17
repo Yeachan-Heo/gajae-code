@@ -1,21 +1,38 @@
 import { describe, expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { parseDaemonArgs, runDaemonCommand } from "../src/cli/daemon-cli";
+import { parseDaemonArgs, runDaemonCommand, UnknownDaemonKindError } from "../src/cli/daemon-cli";
 import { Settings } from "../src/config/settings";
 import { createBuiltInDaemonControllers, selectDaemonControllers } from "../src/daemon/builtin";
 import type { BuiltInDaemonController, DaemonOperationResult, DaemonStatus } from "../src/daemon/control-types";
+import {
+	DAEMON_ACTION_ALIASES,
+	formatDaemonResult,
+	formatDaemonStatus,
+	OWNERSHIP_MISMATCH_MESSAGE,
+	ownershipMismatchRecovery,
+	resolveDaemonAction,
+} from "../src/daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../src/daemon/runtime";
-import { tokenFingerprint } from "../src/notifications/config";
-import { daemonPaths } from "../src/notifications/telegram-daemon";
+import {
+	acquireChatDaemonOwnership,
+	buildChatDaemonSpawnArgs,
+	ChatDaemonController,
+	chatDaemonPaths,
+	ensureDiscordDaemon,
+	ensureSlackDaemon,
+} from "../src/sdk/bus/chat-daemon-control";
+import { tokenFingerprint } from "../src/sdk/bus/config";
+import { daemonPaths } from "../src/sdk/bus/telegram-daemon";
 import {
 	clearTelegramControlRequest,
 	readTelegramControlRequest,
 	TelegramDaemonController,
 	writeTelegramControlRequest,
-} from "../src/notifications/telegram-daemon-control";
-import { TopicRegistry } from "../src/notifications/topic-registry";
+} from "../src/sdk/bus/telegram-daemon-control";
+import { TopicRegistry } from "../src/sdk/bus/topic-registry";
 
 const BOT_TOKEN = "123456:secret-token";
 
@@ -92,48 +109,169 @@ describe("daemon runtime detection", () => {
 		expect(compiled.warning).toContain("Rebuild");
 		expect(compiled.argsPrefix).toEqual([]);
 	});
+
+	test("chat daemon spawn uses source and compiled command forms", () => {
+		const source = buildChatDaemonSpawnArgs({
+			kind: "discord",
+			ownerId: "owner-source",
+			agentDir: "/tmp/agent",
+			execPath: "/usr/local/bin/bun",
+		});
+		expect(source.args).toEqual(expect.arrayContaining(["daemon", "discord-internal", "--owner-id", "owner-source"]));
+		expect(source.runtime.mode).toBe("source");
+
+		const compiled = buildChatDaemonSpawnArgs({
+			kind: "slack",
+			ownerId: "owner-compiled",
+			agentDir: "/tmp/agent",
+			execPath: "/opt/gjc/gjc",
+		});
+		expect(compiled.command).toBe("/opt/gjc/gjc");
+		expect(compiled.args[0]).toBe("daemon");
+		expect(compiled.args).toEqual(expect.arrayContaining(["slack-internal", "--agent-dir", "/tmp/agent"]));
+		expect(compiled.runtime.mode).toBe("compiled");
+	});
 });
 
 describe("static built-in controller map", () => {
-	test("createBuiltInDaemonControllers exposes telegram only", () => {
+	test("createBuiltInDaemonControllers exposes every built-in kind", () => {
 		const s = settings(tempAgentDir());
 		const map = createBuiltInDaemonControllers(s);
-		expect(Object.keys(map)).toEqual(["telegram"]);
+		expect(Object.keys(map)).toEqual(["telegram", "discord", "slack"]);
 		expect(map.telegram).toBeInstanceOf(TelegramDaemonController);
+		expect(map.discord).toBeInstanceOf(ChatDaemonController);
+		expect(map.slack).toBeInstanceOf(ChatDaemonController);
 	});
 
-	test("selectDaemonControllers resolves default, all, and rejects unknown kinds", () => {
+	test("selectDaemonControllers defaults to Telegram, selects all kinds, and rejects unknown kinds", () => {
 		const s = settings(tempAgentDir());
 		expect(selectDaemonControllers(s, undefined, false)).toHaveLength(1);
 		expect(selectDaemonControllers(s, ["telegram"], false)).toHaveLength(1);
-		expect(selectDaemonControllers(s, undefined, true)).toHaveLength(1);
-		// Unknown kinds are rejected by the static map.
+		expect(selectDaemonControllers(s, undefined, true).map(controller => controller.kind)).toEqual([
+			"telegram",
+			"discord",
+			"slack",
+		]);
 		expect(() => selectDaemonControllers(s, ["mystery" as never], false)).toThrow(/unknown daemon kind/);
 	});
 });
 
 describe("parseDaemonArgs", () => {
-	test("parses action, kind, and flags", () => {
+	test("parses all kinds and internal worker flags", () => {
 		const parsed = parseDaemonArgs([
 			"daemon",
 			"reload",
 			"telegram",
+			"discord",
+			"slack",
+			"--all",
 			"--json",
 			"--force",
 			"--graceful-timeout-ms",
 			"1500",
 		]);
-		expect(parsed).toBeTruthy();
-		expect(parsed?.action).toBe("reload");
-		expect(parsed?.kinds).toEqual(["telegram"]);
-		expect(parsed?.json).toBe(true);
-		expect(parsed?.force).toBe(true);
-		expect(parsed?.gracefulTimeoutMs).toBe(1500);
+		expect(parsed).toMatchObject({
+			action: "reload",
+			kinds: ["telegram", "discord", "slack"],
+			all: true,
+			json: true,
+			force: true,
+			gracefulTimeoutMs: 1500,
+		});
+
+		expect(
+			parseDaemonArgs(["daemon", "discord-internal", "--smoke", "--owner-id", "owner", "--agent-dir", "/tmp/a"]),
+		).toMatchObject({
+			action: "discord-internal",
+			smoke: true,
+			ownerId: "owner",
+			agentDir: "/tmp/a",
+		});
 	});
 
 	test("defaults to status and ignores non-daemon argv", () => {
 		expect(parseDaemonArgs(["notify", "status"])).toBeUndefined();
 		expect(parseDaemonArgs(["daemon"])?.action).toBe("status");
+	});
+
+	test("unknown kinds throw a typed error before settings initialization", async () => {
+		await expect(
+			runDaemonCommand({ action: "status", kinds: ["mystery" as never], all: false, json: false, force: false }),
+		).rejects.toBeInstanceOf(UnknownDaemonKindError);
+	});
+
+	test("resolves the restart alias to reload and parses --verbose/-v", () => {
+		expect(parseDaemonArgs(["daemon", "restart"])?.action).toBe("reload");
+		expect(parseDaemonArgs(["daemon", "restart", "telegram"])?.kinds).toEqual(["telegram"]);
+		expect(parseDaemonArgs(["daemon", "status", "--verbose"])?.verbose).toBe(true);
+		expect(parseDaemonArgs(["daemon", "status", "-v"])?.verbose).toBe(true);
+		expect(parseDaemonArgs(["daemon", "status"])?.verbose).toBe(false);
+	});
+});
+
+describe("daemon operator contract", () => {
+	test("resolveDaemonAction maps canonical verbs and the restart alias", () => {
+		expect(resolveDaemonAction("status")).toBe("status");
+		expect(resolveDaemonAction("reload")).toBe("reload");
+		expect(resolveDaemonAction("restart")).toBe("reload");
+		expect(DAEMON_ACTION_ALIASES.restart).toBe("reload");
+		expect(resolveDaemonAction("bogus")).toBeUndefined();
+		expect(resolveDaemonAction(undefined)).toBeUndefined();
+	});
+
+	test("formatDaemonStatus stays concise by default and expands under verbose", () => {
+		const status: DaemonStatus = {
+			kind: "telegram",
+			configured: true,
+			health: "running",
+			pid: 7,
+			ownerId: "o1",
+			startedAt: 0,
+			heartbeatAt: 0,
+			roots: ["/a", "/b"],
+			rootCount: 2,
+			runtime: { mode: "source", execPath: "/usr/bin/node", reloadPicksUpSourceEdits: true },
+		};
+		const concise = formatDaemonStatus(status);
+		expect(concise).toBe("telegram: running (pid 7, owner o1, 2 roots)");
+		expect(concise).not.toContain("/a");
+
+		const verbose = formatDaemonStatus(status, { verbose: true });
+		expect(verbose).toContain("runtime: source (/usr/bin/node)");
+		expect(verbose).toContain("roots: 2");
+		expect(verbose).toContain("- /a");
+		expect(verbose).toContain("- /b");
+	});
+
+	test("formatDaemonStatus reports an unconfigured daemon without runtime noise", () => {
+		const status: DaemonStatus = {
+			kind: "telegram",
+			configured: false,
+			health: "not_configured",
+			runtime: { mode: "source", execPath: "/usr/bin/node", reloadPicksUpSourceEdits: true },
+		};
+		expect(formatDaemonStatus(status)).toBe("telegram: not configured");
+	});
+
+	test("formatDaemonResult renders the ownership-mismatch recovery steps", () => {
+		const recovery = ownershipMismatchRecovery();
+		expect(recovery.reason).toBe("ownership_mismatch");
+		expect(recovery.steps.length).toBeGreaterThan(0);
+
+		const result: DaemonOperationResult = {
+			kind: "telegram",
+			action: "reload",
+			ok: false,
+			warnings: [],
+			message: OWNERSHIP_MISMATCH_MESSAGE,
+			recovery,
+		};
+		const rendered = formatDaemonResult(result);
+		expect(rendered).toContain("telegram reload: failed");
+		expect(rendered).toContain(OWNERSHIP_MISMATCH_MESSAGE);
+		expect(rendered).toContain("to recover:");
+		expect(rendered).toContain("1. ");
+		for (const step of recovery.steps) expect(rendered).toContain(step);
 	});
 });
 
@@ -167,6 +305,24 @@ describe("TelegramDaemonController.status", () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(Settings.isolated({}) as Settings, agentDir);
 		const status = await new TelegramDaemonController(s).status();
+		expect(status.configured).toBe(false);
+		expect(status.health).toBe("not_configured");
+	});
+
+	test("reports not_configured for blank Telegram credentials even when another adapter is configured", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.telegram.botToken": " ",
+				"notifications.telegram.chatId": "\t",
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.parentChannelId": "discord-channel",
+			}) as Settings,
+			agentDir,
+		);
+		const status = await new TelegramDaemonController(s).status();
+
 		expect(status.configured).toBe(false);
 		expect(status.health).toBe("not_configured");
 	});
@@ -359,26 +515,17 @@ describe("TelegramDaemonController.reload", () => {
 		expect(oldAliveAtSpawn).toBe(false);
 	});
 
-	test("rejects an unknown kind with a clean error and exit code 1", async () => {
-		const prevExit = process.exitCode;
-		const orig = process.stderr.write.bind(process.stderr);
-		let err = "";
-		process.stderr.write = ((chunk: unknown): boolean => {
-			err += String(chunk);
-			return true;
-		}) as typeof process.stderr.write;
-		try {
-			await runDaemonCommand(
+	test("rejects an unknown kind with a typed error", async () => {
+		await expect(
+			runDaemonCommand(
 				{ action: "status", kinds: ["bogus" as never], all: false, json: true, force: false },
 				{ controllers: undefined },
-			);
-		} finally {
-			process.stderr.write = orig;
-		}
-		expect(err).toContain("Unknown daemon kind(s): bogus");
-		expect(process.exitCode).toBe(1);
-		// Reset so this expected non-zero exitCode does not leak into the test runner's exit status.
-		process.exitCode = typeof prevExit === "number" ? prevExit : 0;
+			),
+		).rejects.toMatchObject({
+			message: "Unknown daemon kind(s): bogus. Known kinds: telegram, discord, slack.",
+			kinds: ["bogus"],
+			knownKinds: ["telegram", "discord", "slack"],
+		});
 	});
 
 	test("reload with no running daemon spawns a fresh one (spawnIfStopped default)", async () => {
@@ -422,6 +569,429 @@ describe("TelegramDaemonController.stop", () => {
 		expect(result.ok).toBe(true);
 		expect(spawnCalls).toBe(0);
 	});
+});
+
+describe("ChatDaemonController ownership safety", () => {
+	test("does not signal a reused PID incarnation", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.applicationId": "app",
+				"notifications.discord.guildId": "guild",
+				"notifications.discord.parentChannelId": "parent",
+			}) as Settings,
+			agentDir,
+		);
+		const identity = crypto
+			.createHash("sha256")
+			.update(["discord-token", "app", "guild", "parent", "false", "lean"].join("\0"))
+			.digest("hex")
+			.slice(0, 16);
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "discord",
+				pid: 77,
+				ownerId: "owner-a",
+				identity,
+				incarnation: "original",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: true,
+			}),
+		);
+		const signals: NodeJS.Signals[] = [];
+		const result = await new ChatDaemonController(s, "discord", {
+			pidAlive: pid => pid === 77,
+			pidIncarnation: () => "reused",
+			sendSignal: (_pid, signal) => signals.push(signal),
+		}).stop();
+		expect(result.ok).toBe(true);
+		expect(signals).toEqual([]);
+	});
+
+	test("reports a live PID with a disconnected provider as stale", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.applicationId": "app",
+				"notifications.discord.guildId": "guild",
+				"notifications.discord.parentChannelId": "parent",
+			}) as Settings,
+			agentDir,
+		);
+		const identity = crypto
+			.createHash("sha256")
+			.update(["discord-token", "app", "guild", "parent", "false", "lean"].join("\0"))
+			.digest("hex")
+			.slice(0, 16);
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "discord",
+				pid: 77,
+				ownerId: "owner-a",
+				identity,
+				incarnation: "stable",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: false,
+			}),
+		);
+		expect(
+			(
+				await new ChatDaemonController(s, "discord", {
+					pidAlive: () => true,
+					pidIncarnation: () => "stable",
+				}).status()
+			).health,
+		).toBe("stale");
+	});
+
+	test("attaches to a matching live owner without restarting it", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.applicationId": "app",
+				"notifications.discord.guildId": "guild",
+				"notifications.discord.parentChannelId": "parent",
+			}) as Settings,
+			agentDir,
+		);
+		const identity = crypto
+			.createHash("sha256")
+			.update(["discord-token", "app", "guild", "parent", "false", "lean"].join("\0"))
+			.digest("hex")
+			.slice(0, 16);
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "discord",
+				pid: 81,
+				ownerId: "owner-a",
+				identity,
+				incarnation: "stable",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: true,
+			}),
+		);
+		let spawns = 0;
+		expect(
+			await ensureDiscordDaemon(s, {
+				pidAlive: pid => pid === 81,
+				pidIncarnation: () => "stable",
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			}),
+		).toBe("attached");
+		expect(spawns).toBe(0);
+	});
+
+	test("terminates an incarnation-verified changed owner before spawning", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.discord.botToken": "new-token",
+				"notifications.discord.applicationId": "app",
+				"notifications.discord.guildId": "guild",
+				"notifications.discord.parentChannelId": "parent",
+			}) as Settings,
+			agentDir,
+		);
+		const oldIdentity = crypto
+			.createHash("sha256")
+			.update(["old-token", "app", "guild", "parent", "false", "lean"].join("\0"))
+			.digest("hex")
+			.slice(0, 16);
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "discord",
+				pid: 82,
+				ownerId: "owner-a",
+				identity: oldIdentity,
+				incarnation: "stable",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: true,
+			}),
+		);
+		const alive = new Set([82]);
+		const signals: NodeJS.Signals[] = [];
+		let spawns = 0;
+		expect(
+			await ensureDiscordDaemon(s, {
+				pidAlive: pid => alive.has(pid),
+				pidIncarnation: () => "stable",
+				sleep: async () => undefined,
+				sendSignal: (_pid, signal) => {
+					signals.push(signal);
+					alive.delete(82);
+				},
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			}),
+		).toBe("owner_spawned");
+		expect(signals).toEqual(["SIGTERM"]);
+		expect(spawns).toBe(1);
+	});
+
+	test("does not signal after the owner changes before TERM", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.slack.botToken": "slack-token",
+				"notifications.slack.appToken": "app-token",
+				"notifications.slack.workspaceId": "workspace",
+				"notifications.slack.channelId": "channel",
+			}) as Settings,
+			agentDir,
+		);
+		const identity = crypto
+			.createHash("sha256")
+			.update(["slack-token", "app-token", "workspace", "channel", "", "false", "lean"].join("\0"))
+			.digest("hex")
+			.slice(0, 16);
+		const paths = chatDaemonPaths(agentDir, "slack");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "slack",
+				pid: 78,
+				ownerId: "owner-a",
+				identity,
+				incarnation: "stable",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: true,
+			}),
+		);
+		let reads = 0;
+		const originalReadFile = fs.promises.readFile;
+		fs.promises.readFile = (async (...args: Parameters<typeof fs.promises.readFile>) => {
+			if (String(args[0]) === paths.state && ++reads === 2)
+				return Buffer.from(
+					JSON.stringify({
+						version: 1,
+						kind: "slack",
+						pid: 78,
+						ownerId: "owner-b",
+						identity,
+						incarnation: "stable",
+						startedAt: Date.now(),
+						heartbeatAt: Date.now(),
+						transportHealthy: true,
+					}),
+				);
+			return await originalReadFile(...args);
+		}) as typeof fs.promises.readFile;
+		try {
+			const result = await new ChatDaemonController(s, "slack", {
+				pidAlive: () => true,
+				pidIncarnation: () => "stable",
+				sendSignal: () => {
+					throw new Error("must not signal");
+				},
+			}).stop();
+			expect(result.ok).toBe(false);
+			expect(result.message).toContain("ownership changed");
+		} finally {
+			fs.promises.readFile = originalReadFile;
+		}
+	});
+});
+
+describe("Chat daemon owner-lock publication", () => {
+	test("does not reclaim a fresh empty owner lock before state publication", async () => {
+		const agentDir = tempAgentDir();
+		const paths = chatDaemonPaths(agentDir, "discord");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const originalOpen = fs.promises.open;
+		let paused = false;
+		fs.promises.open = (async (...args: Parameters<typeof fs.promises.open>) => {
+			const handle = await originalOpen(...args);
+			if (!paused && args[0] === paths.lock && args[1] === "wx") {
+				paused = true;
+				entered.resolve();
+				await release.promise;
+			}
+			return handle;
+		}) as typeof fs.promises.open;
+		try {
+			const first = acquireChatDaemonOwnership({
+				agentDir,
+				kind: "discord",
+				ownerId: "owner-a",
+				pid: process.pid,
+				identity: "identity",
+				incarnation: "test",
+			});
+			await entered.promise;
+			expect(
+				await acquireChatDaemonOwnership({
+					agentDir,
+					kind: "discord",
+					ownerId: "owner-b",
+					pid: process.pid,
+					identity: "identity",
+					incarnation: "test",
+				}),
+			).toBe(false);
+			release.resolve();
+			expect(await first).toBe(true);
+			expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("owner-a");
+		} finally {
+			fs.promises.open = originalOpen;
+		}
+	});
+
+	test("recovers a dead recorded owner lock", async () => {
+		const agentDir = tempAgentDir();
+		const paths = chatDaemonPaths(agentDir, "slack");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 2_147_483_647, incarnation: "old", createdAt: 1 }));
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "slack",
+				pid: 2_147_483_647,
+				ownerId: "old",
+				identity: "old",
+				incarnation: "old",
+				startedAt: 1,
+				heartbeatAt: 1,
+			}),
+		);
+		expect(
+			await acquireChatDaemonOwnership({
+				agentDir,
+				kind: "slack",
+				ownerId: "new",
+				pid: process.pid,
+				identity: "identity",
+				incarnation: "test",
+			}),
+		).toBe(true);
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("new");
+	});
+
+	test("recovers a crashed reclaim owner with a reused PID incarnation", async () => {
+		const agentDir = tempAgentDir();
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		const crashedOwner = { pid: 91, incarnation: "previous-incarnation", createdAt: 1 };
+		fs.writeFileSync(paths.lock, JSON.stringify(crashedOwner));
+		fs.writeFileSync(`${paths.lock}.reclaim`, JSON.stringify(crashedOwner));
+		const probe = {
+			pidAlive: (pid: number) => pid === 91,
+			pidIncarnation: (pid: number) => (pid === 91 ? "replacement-incarnation" : undefined),
+		};
+
+		expect(
+			await acquireChatDaemonOwnership({
+				agentDir,
+				kind: "discord",
+				ownerId: "new",
+				pid: 92,
+				identity: "identity",
+				incarnation: "new-incarnation",
+				...probe,
+			}),
+		).toBe(true);
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("new");
+		expect(fs.existsSync(`${paths.lock}.reclaim`)).toBe(false);
+	});
+
+	test("does not steal a fresh reclaim lock owned by a live incarnation", async () => {
+		const agentDir = tempAgentDir();
+		const paths = chatDaemonPaths(agentDir, "slack");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 82, incarnation: "dead", createdAt: 1 }));
+		const liveReclaim = `${JSON.stringify({ pid: 81, incarnation: "live-incarnation", createdAt: Date.now() })}\n`;
+		fs.writeFileSync(`${paths.lock}.reclaim`, liveReclaim);
+		const probe = {
+			pidAlive: (pid: number) => pid === 81,
+			pidIncarnation: (pid: number) => (pid === 81 ? "live-incarnation" : undefined),
+		};
+
+		expect(
+			await acquireChatDaemonOwnership({
+				agentDir,
+				kind: "slack",
+				ownerId: "new",
+				pid: 83,
+				identity: "identity",
+				incarnation: "new-incarnation",
+				...probe,
+			}),
+		).toBe(false);
+		expect(fs.readFileSync(paths.lock, "utf8")).toContain("82");
+		expect(fs.readFileSync(`${paths.lock}.reclaim`, "utf8")).toBe(liveReclaim);
+	});
+});
+
+test("configured chat providers auto-start while incomplete providers do not", async () => {
+	const agentDir = tempAgentDir();
+	const configured = setPrivateAgentDir(
+		Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.applicationId": "app",
+			"notifications.discord.guildId": "guild",
+			"notifications.discord.parentChannelId": "parent",
+		}) as Settings,
+		agentDir,
+	);
+	let spawns = 0;
+	expect(
+		await ensureDiscordDaemon(configured, {
+			spawn: () => {
+				spawns++;
+				return { unref() {} };
+			},
+		}),
+	).toBe("owner_spawned");
+	expect(spawns).toBe(1);
+	const incomplete = setPrivateAgentDir(
+		Settings.isolated({ "notifications.enabled": true, "notifications.slack.botToken": "bot" }) as Settings,
+		tempAgentDir(),
+	);
+	expect(
+		await ensureSlackDaemon(incomplete, {
+			spawn: () => {
+				throw new Error("must not spawn");
+			},
+		}),
+	).toBe("disabled");
 });
 
 describe("runDaemonCommand", () => {
@@ -477,6 +1047,35 @@ describe("runDaemonCommand", () => {
 		);
 		expect(out).toContain("telegram reload: ok");
 		expect(out).toContain("reloaded telegram daemon");
+	});
+
+	test("a refused reload surfaces recovery guidance and exits non-zero", async () => {
+		const prevExit = process.exitCode;
+		const status: DaemonStatus = {
+			kind: "telegram",
+			configured: true,
+			health: "stopped",
+			runtime: { mode: "source", execPath: "/usr/bin/node", reloadPicksUpSourceEdits: true },
+		};
+		const result: DaemonOperationResult = {
+			kind: "telegram",
+			action: "reload",
+			ok: false,
+			warnings: [],
+			message: OWNERSHIP_MISMATCH_MESSAGE,
+			recovery: ownershipMismatchRecovery(),
+		};
+		const out = await captureStdout(() =>
+			runDaemonCommand(
+				{ action: "reload", kinds: ["telegram"], all: false, json: false, force: false },
+				{ controllers: [fakeController(status, result)] },
+			),
+		);
+		expect(out).toContain("telegram reload: failed");
+		expect(out).toContain("to recover:");
+		expect(process.exitCode).toBe(1);
+		// Reset so this expected non-zero exitCode does not leak into the runner's exit status.
+		process.exitCode = typeof prevExit === "number" ? prevExit : 0;
 	});
 });
 

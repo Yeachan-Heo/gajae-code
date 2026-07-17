@@ -23,6 +23,51 @@ import { EventEmitter } from "events";
 const ESC = "\x1b";
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+const SGR_QUARANTINE_MAX_BYTES = 256;
+const SGR_QUARANTINE_TIMEOUT_MS = 100;
+
+/** True for complete SGR mouse CSI reports. These remain control input, never text. */
+export function isSgrMouseSequence(sequence: string): boolean {
+	return /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(sequence);
+}
+
+/** True when a buffered sequence begins an SGR mouse report, valid or not. */
+function isSgrMousePrefix(sequence: string): boolean {
+	return sequence.startsWith(`${ESC}[<`);
+}
+
+function isUtf8LeadByte(byte: number): boolean {
+	return byte >= 0xc2 && byte <= 0xf4;
+}
+
+function endsWithIncompleteUtf8Sequence(data: Buffer): boolean {
+	if (data.length === 0) return false;
+
+	let index = data.length - 1;
+	let continuationCount = 0;
+	while (index >= 0) {
+		const byte = data[index]!;
+		if (byte < 0x80 || byte > 0xbf) break;
+		continuationCount++;
+		index--;
+	}
+
+	if (index < 0) {
+		return continuationCount > 0;
+	}
+
+	const lead = data[index]!;
+	let expectedLength = 0;
+	if (lead >= 0xc2 && lead <= 0xdf) expectedLength = 2;
+	else if (lead >= 0xe0 && lead <= 0xef) expectedLength = 3;
+	else if (lead >= 0xf0 && lead <= 0xf4) expectedLength = 4;
+
+	return expectedLength > 0 && continuationCount + 1 < expectedLength;
+}
+
+function legacyMetaSequence(byte: number): string {
+	return `\x1b${String.fromCharCode(byte - 128)}`;
+}
 
 /**
  * Check if a string is a complete escape sequence or needs more data
@@ -104,19 +149,9 @@ function isCompleteCsiSequence(data: string): "complete" | "incomplete" {
 		// Format: ESC[<B;X;Ym or ESC[<B;X;YM
 		if (payload.startsWith("<")) {
 			// Must have format: <digits;digits;digits[Mm]
-			const mouseMatch = /^<\d+;\d+;\d+[Mm]$/.test(payload);
-			if (mouseMatch) {
-				return "complete";
-			}
-			// If it ends with M or m but doesn't match the pattern, still incomplete
-			if (lastChar === "M" || lastChar === "m") {
-				// Check if we have the right structure
-				const parts = payload.slice(1, -1).split(";");
-				if (parts.length === 3 && parts.every(p => /^\d+$/.test(p))) {
-					return "complete";
-				}
-			}
-
+			// SGR-looking reports remain terminal control input even when malformed.
+			// Treat their final byte as complete so trailing user input is preserved.
+			if (lastChar === "M" || lastChar === "m") return "complete";
 			return "incomplete";
 		}
 
@@ -268,6 +303,12 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	// split across two stdin events) reassemble correctly instead of emitting
 	// U+FFFD. Reset on clear()/destroy(); never finalized on normal flush.
 	#decoder = new StringDecoder("utf8");
+	#decoderHasPendingUtf8 = false;
+	#pendingSingleUtf8LeadByte: number | undefined;
+	#sgrQuarantine = false;
+	#sgrQuarantineBytes = 0;
+	#sgrQuarantineSemicolons = 0;
+	#sgrQuarantineHasDigit = false;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -275,8 +316,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	}
 
 	process(data: string | Buffer): void {
-		// Clear any pending timeout
-		if (this.#timeout) {
+		// Do not cancel a bounded SGR quarantine while waiting for its final byte.
+		if (this.#timeout && !this.#sgrQuarantine) {
 			clearTimeout(this.#timeout);
 			this.#timeout = undefined;
 		}
@@ -286,22 +327,51 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		let str: string;
 		let decodedFromBuffer = false;
 		if (Buffer.isBuffer(data)) {
-			// Legacy 8-bit meta: an isolated high byte (0x80-0xFF) is treated
-			// as ESC + (byte - 128) for Alt/meta compatibility, BEFORE UTF-8
-			// decoding. This is the one documented exception to UTF-8 boundary
-			// decoding — a lone high byte that is also a valid UTF-8 lead byte
-			// is still read as meta — so such a byte is never fed to the decoder.
-			if (data.length === 1 && data[0]! > 127) {
-				const byte = data[0]! - 128;
-				str = `\x1b${String.fromCharCode(byte)}`;
+			let bytes = data;
+			const hadPendingUtf8 = this.#decoderHasPendingUtf8 || this.#pendingSingleUtf8LeadByte !== undefined;
+
+			if (this.#pendingSingleUtf8LeadByte !== undefined) {
+				const nextByte = data[0];
+				if (nextByte !== undefined && nextByte >= 0x80 && nextByte <= 0xbf) {
+					bytes = Buffer.concat([Buffer.from([this.#pendingSingleUtf8LeadByte]), data]);
+					this.#pendingSingleUtf8LeadByte = undefined;
+				} else {
+					const pendingMeta = this.#consumePendingSingleUtf8LeadAsMeta();
+					if (pendingMeta !== undefined) {
+						this.#emitDataSequence(pendingMeta);
+					}
+				}
+			}
+
+			if (bytes.length === 1 && bytes[0]! > 127 && !this.#decoderHasPendingUtf8) {
+				const byte = bytes[0]!;
+				if (isUtf8LeadByte(byte)) {
+					this.#pendingSingleUtf8LeadByte = byte;
+					this.#decoderHasPendingUtf8 = true;
+					this.#timeout = setTimeout(() => {
+						const sequence = this.#consumePendingSingleUtf8LeadAsMeta();
+						if (sequence !== undefined) {
+							this.#emitDataSequence(sequence);
+						}
+					}, this.#timeoutMs);
+					return;
+				}
+				str = legacyMetaSequence(byte);
 			} else {
 				// Decode through the persistent StringDecoder so a multi-byte
 				// sequence split across chunks (e.g. a 3-byte Korean syllable)
 				// is reassembled instead of emitting U+FFFD.
-				str = this.#decoder.write(data);
+				str = this.#decoder.write(bytes);
 				decodedFromBuffer = true;
+				const allContinuationBytes = bytes.every(byte => byte >= 0x80 && byte <= 0xbf);
+				this.#decoderHasPendingUtf8 =
+					endsWithIncompleteUtf8Sequence(bytes) && !(hadPendingUtf8 && str.length > 0 && allContinuationBytes);
 			}
 		} else {
+			const pendingMeta = this.#consumePendingSingleUtf8LeadAsMeta();
+			if (pendingMeta !== undefined) {
+				this.#emitDataSequence(pendingMeta);
+			}
 			str = data;
 		}
 
@@ -314,6 +384,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				this.#emitDataSequence("");
 			}
 			return;
+		}
+
+		if (this.#sgrQuarantine) {
+			str = this.#consumeSgrQuarantine(str);
+			if (str.length === 0) return;
 		}
 
 		this.#buffer += str;
@@ -348,6 +423,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				for (const sequence of result.sequences) {
 					this.#emitDataSequence(sequence);
 				}
+				if (result.remainder.length > 0) {
+					this.#emitDataSequence(result.remainder);
+				}
 			}
 
 			this.#pendingKittyPrintableCodepoint = undefined;
@@ -378,13 +456,17 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#buffer = result.remainder;
 
 		for (const sequence of result.sequences) {
+			if (isSgrMousePrefix(sequence) && !isSgrMouseSequence(sequence)) continue;
 			this.#emitDataSequence(sequence);
 		}
 
 		if (this.#buffer.length > 0) {
 			this.#timeout = setTimeout(() => {
+				if (isSgrMousePrefix(this.#buffer)) {
+					this.#beginSgrQuarantine();
+					return;
+				}
 				const flushed = this.flush();
-
 				for (const sequence of flushed) {
 					this.#emitDataSequence(sequence);
 				}
@@ -392,6 +474,83 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 	}
 
+	#beginSgrQuarantine(): void {
+		const suffix = this.#buffer.slice(3);
+		let semicolons = 0;
+		let hasDigit = false;
+		for (let index = 0; index < suffix.length; index += 1) {
+			const char = suffix[index]!;
+			if (/\d/u.test(char)) {
+				hasDigit = true;
+				continue;
+			}
+			if (char === ";" && hasDigit && semicolons < 2) {
+				semicolons += 1;
+				hasDigit = false;
+				continue;
+			}
+			const remainder = suffix.slice(index);
+			this.#buffer = "";
+			this.#pendingKittyPrintableCodepoint = undefined;
+			if (remainder) this.process(remainder);
+			return;
+		}
+		this.#buffer = "";
+		this.#pendingKittyPrintableCodepoint = undefined;
+		this.#sgrQuarantine = true;
+		this.#sgrQuarantineBytes = suffix.length;
+		this.#sgrQuarantineSemicolons = semicolons;
+		this.#sgrQuarantineHasDigit = hasDigit;
+		this.#timeout = setTimeout(() => this.#endSgrQuarantine(), SGR_QUARANTINE_TIMEOUT_MS);
+	}
+
+	#endSgrQuarantine(): void {
+		if (this.#timeout) clearTimeout(this.#timeout);
+		this.#timeout = undefined;
+		this.#sgrQuarantine = false;
+		this.#sgrQuarantineBytes = 0;
+		this.#sgrQuarantineSemicolons = 0;
+		this.#sgrQuarantineHasDigit = false;
+	}
+
+	#consumeSgrQuarantine(data: string): string {
+		for (let index = 0; index < data.length; index += 1) {
+			const char = data[index]!;
+			if (this.#sgrQuarantineBytes >= SGR_QUARANTINE_MAX_BYTES) {
+				let resume = index;
+				while (resume < data.length && /[\d;]/u.test(data[resume]!)) resume += 1;
+				if (resume < data.length && /[Mm]/u.test(data[resume]!)) resume += 1;
+				this.#endSgrQuarantine();
+				return data.slice(resume);
+			}
+			if (/\d/u.test(char)) {
+				this.#sgrQuarantineHasDigit = true;
+				this.#sgrQuarantineBytes += 1;
+				continue;
+			}
+			if (char === ";" && this.#sgrQuarantineHasDigit && this.#sgrQuarantineSemicolons < 2) {
+				this.#sgrQuarantineSemicolons += 1;
+				this.#sgrQuarantineHasDigit = false;
+				this.#sgrQuarantineBytes += 1;
+				continue;
+			}
+			if ((char === "M" || char === "m") && this.#sgrQuarantineSemicolons === 2 && this.#sgrQuarantineHasDigit) {
+				this.#endSgrQuarantine();
+				return data.slice(index + 1);
+			}
+			this.#endSgrQuarantine();
+			return data.slice(index);
+		}
+		return "";
+	}
+
+	#consumePendingSingleUtf8LeadAsMeta(): string | undefined {
+		const byte = this.#pendingSingleUtf8LeadByte;
+		if (byte === undefined) return undefined;
+		this.#pendingSingleUtf8LeadByte = undefined;
+		this.#decoderHasPendingUtf8 = false;
+		return legacyMetaSequence(byte);
+	}
 	#emitDataSequence(sequence: string): void {
 		const rawCodepoint = sequence.length === 1 ? sequence.codePointAt(0) : undefined;
 		if (rawCodepoint !== undefined && rawCodepoint === this.#pendingKittyPrintableCodepoint) {
@@ -408,12 +567,21 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			clearTimeout(this.#timeout);
 			this.#timeout = undefined;
 		}
+		if (this.#sgrQuarantine) this.#endSgrQuarantine();
+
+		const pendingMeta = this.#consumePendingSingleUtf8LeadAsMeta();
 
 		if (this.#buffer.length === 0) {
-			return [];
+			return pendingMeta === undefined ? [] : [pendingMeta];
 		}
 
-		const sequences = [this.#buffer];
+		if (isSgrMousePrefix(this.#buffer)) {
+			this.#buffer = "";
+			this.#pendingKittyPrintableCodepoint = undefined;
+			return pendingMeta === undefined ? [] : [pendingMeta];
+		}
+
+		const sequences = pendingMeta === undefined ? [this.#buffer] : [pendingMeta, this.#buffer];
 		this.#buffer = "";
 		this.#pendingKittyPrintableCodepoint = undefined;
 		return sequences;
@@ -428,10 +596,16 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#pasteMode = false;
 		this.#pasteBuffer = "";
 		this.#pendingKittyPrintableCodepoint = undefined;
+		this.#sgrQuarantine = false;
+		this.#sgrQuarantineBytes = 0;
+		this.#sgrQuarantineSemicolons = 0;
+		this.#sgrQuarantineHasDigit = false;
 		// Drop any incomplete multi-byte sequence the decoder is holding so a
 		// stale partial prefix cannot combine with future input. destroy()
 		// resets the decoder by calling clear().
 		this.#decoder = new StringDecoder("utf8");
+		this.#decoderHasPendingUtf8 = false;
+		this.#pendingSingleUtf8LeadByte = undefined;
 	}
 
 	getBuffer(): string {

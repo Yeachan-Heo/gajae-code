@@ -1,7 +1,7 @@
 import * as z from "zod/v4";
+import { isRetiredModelKey } from "../../model-retirements";
 import { getAntigravityUserAgent } from "../../providers/google-gemini-headers";
 import type { Model } from "../../types";
-import { toPositiveNumber } from "../../utils";
 
 const DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS = [
 	"https://daily-cloudcode-pa.googleapis.com",
@@ -162,6 +162,12 @@ export interface FetchAntigravityDiscoveryModelsOptions {
 	signal?: AbortSignal;
 	/** Optional fetch implementation override for tests. */
 	fetcher?: typeof fetch;
+	/**
+	 * Provider id the caller assigns to returned models. Scopes retired-selector
+	 * filtering (e.g. `google-gemini-cli` reuses this helper and remaps rows).
+	 * Default: `google-antigravity`.
+	 */
+	targetProvider?: "google-antigravity" | "google-gemini-cli";
 }
 
 /**
@@ -174,6 +180,7 @@ export async function fetchAntigravityDiscoveryModels(
 	options: FetchAntigravityDiscoveryModelsOptions,
 ): Promise<Model<"google-gemini-cli">[] | null> {
 	const fetcher = options.fetcher ?? fetch;
+	const targetProvider = options.targetProvider ?? "google-antigravity";
 	const endpoints = options.endpoint
 		? [trimTrailingSlashes(options.endpoint)]
 		: DEFAULT_ANTIGRAVITY_DISCOVERY_ENDPOINTS.map(trimTrailingSlashes);
@@ -214,7 +221,7 @@ export async function fetchAntigravityDiscoveryModels(
 		const models: Model<"google-gemini-cli">[] = [];
 
 		for (const [modelId, model] of Object.entries(parsed.models ?? {})) {
-			if (ANTIGRAVITY_DISCOVERY_DENYLIST.has(modelId)) {
+			if (ANTIGRAVITY_DISCOVERY_DENYLIST.has(modelId) || isRetiredModelKey(targetProvider, modelId)) {
 				continue;
 			}
 			if (model.isInternal === true) {
@@ -254,6 +261,13 @@ function parseAntigravityDiscoveryResponse(value: unknown): AntigravityDiscovery
 		return null;
 	}
 	return parsed.data;
+}
+
+function toPositiveNumber(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+		return fallback;
+	}
+	return value;
 }
 
 function trimTrailingSlashes(value: string): string {

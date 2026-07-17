@@ -1,6 +1,7 @@
 Vim-style `edit` mode. The tool name stays `edit`; every call requires `file`, and the buffer loads automatically on first use.
 - `{"file": "path"}` - view file
 - `{"file": "path", "steps": [{"kbd": ["…"], "insert": "…"}]}` - edit file
+- `pause` (optional boolean) - a "paused" call skips the auto-save after its steps and may leave the last step in INSERT mode; the buffer stays open for the next call. Non-paused calls auto-save once after all steps complete.
 
 **Multi-location edits: always edit highest line number first (bottom-up).** Each insert shifts lines below it.
 

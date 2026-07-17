@@ -190,6 +190,7 @@ describe("BashTool through AgentSession runs children in their own session (e2e)
 			modelRegistry,
 			toolRegistry: new Map([[bashTool.name, bashTool as unknown as AgentTool]]),
 		});
+		session.setSdkPermissionMode("allow");
 	});
 
 	afterEach(async () => {

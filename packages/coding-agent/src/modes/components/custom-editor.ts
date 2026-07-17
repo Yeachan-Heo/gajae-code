@@ -123,6 +123,11 @@ export class CustomEditor extends Editor {
 		this.#actionKeys.set(action, [...keys]);
 	}
 
+	/** Returns whether a built-in editor action consumes this configured key before custom handlers. */
+	hasActionKey(key: KeyId): boolean {
+		return [...this.#actionKeys.values()].some(keys => keys.includes(key));
+	}
+
 	#matchesAction(data: string, action: ConfigurableEditorAction): boolean {
 		const keys = this.#actionKeys.get(action);
 		if (!keys) return false;
@@ -182,6 +187,7 @@ export class CustomEditor extends Editor {
 	dispose(): void {
 		this.#clearPendingPasteState();
 		this.#pasteHandler = new BracketedPasteHandler();
+		super.dispose();
 	}
 
 	#drainPendingPasteInput(initialInput?: string): void {
@@ -242,6 +248,7 @@ export class CustomEditor extends Editor {
 			const paste = this.#pasteHandler.process(data);
 			if (paste.handled) {
 				if (paste.pasteContent !== undefined) {
+					this.onViewportFollowLive?.();
 					this.#handleBracketedPaste(paste.pasteContent, paste.remaining);
 				}
 				return;
@@ -395,7 +402,7 @@ export class CustomEditor extends Editor {
 			}
 		}
 
-		// Pass to parent for normal handling
+		// Pass to parent for normal handling.
 		super.handleInput(data);
 	}
 }

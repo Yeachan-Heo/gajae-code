@@ -2,7 +2,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type BuildSidecar, type CandidateAddon, verifyDefaultLanguageSet } from "./embed-guard";
 
-const reset = process.argv.includes("--reset");
+export type EmbeddedAddonVariant = CandidateAddon["variant"];
+
+const validEmbedVariants = new Set<EmbeddedAddonVariant>(["modern", "baseline", "default"]);
 const outputPath = path.join(import.meta.dir, "../native/embedded-addon.js");
 const packageJsonPath = path.join(import.meta.dir, "../package.json");
 const nativeDir = path.join(import.meta.dir, "../native");
@@ -30,9 +32,51 @@ const stubContent = `
 /** @type {EmbeddedAddon|null} */
 export const embeddedAddon = null;
 `;
-if (reset) {
-	await Bun.write(outputPath, stubContent);
-	process.exit(0);
+
+export function parseEmbedVariants(value: string | undefined): Set<EmbeddedAddonVariant> | null {
+	if (!value) {
+		return null;
+	}
+
+	const variants = value
+		.split(",")
+		.map(variant => variant.trim())
+		.filter(Boolean);
+	const unknownVariants = variants.filter(variant => !validEmbedVariants.has(variant as EmbeddedAddonVariant));
+	if (unknownVariants.length > 0) {
+		throw new Error(
+			`Invalid EMBED_VARIANTS value(s): ${unknownVariants.join(", ")}. Valid values are: modern, baseline, default.`,
+		);
+	}
+
+	return new Set(variants as EmbeddedAddonVariant[]);
+}
+
+export function buildCandidateList(targetArch: string, platformTag: string): CandidateAddon[] {
+	return targetArch === "x64"
+		? [
+				{ variant: "modern", filename: `pi_natives.${platformTag}-modern.node` },
+				{ variant: "baseline", filename: `pi_natives.${platformTag}-baseline.node` },
+			]
+		: [{ variant: "default", filename: `pi_natives.${platformTag}.node` }];
+}
+
+export function filterCandidatesByVariant(
+	candidates: CandidateAddon[],
+	requestedVariants: Set<EmbeddedAddonVariant> | null,
+	platformTag: string,
+): CandidateAddon[] {
+	if (!requestedVariants) {
+		return candidates;
+	}
+
+	const filtered = candidates.filter(candidate => requestedVariants.has(candidate.variant));
+	if (filtered.length === 0) {
+		throw new Error(
+			`EMBED_VARIANTS selected no candidates for ${platformTag}. Requested: ${[...requestedVariants].join(", ")}; available variants for target: ${candidates.map(candidate => candidate.variant).join(", ")}.`,
+		);
+	}
+	return filtered;
 }
 
 async function readBuildSidecar(candidatePath: string): Promise<BuildSidecar | null> {
@@ -54,55 +98,60 @@ async function fileExists(filePath: string): Promise<boolean> {
 		throw err;
 	}
 }
-const targetPlatform = Bun.env.TARGET_PLATFORM || process.platform;
-const targetArch = Bun.env.TARGET_ARCH || process.arch;
-const platformTag = `${targetPlatform}-${targetArch}`;
-const hostPlatformTag = `${process.platform}-${process.arch}`;
-const candidates: CandidateAddon[] =
-	targetArch === "x64"
-		? [
-				{ variant: "modern", filename: `pi_natives.${platformTag}-modern.node` },
-				{ variant: "baseline", filename: `pi_natives.${platformTag}-baseline.node` },
-			]
-		: [{ variant: "default", filename: `pi_natives.${platformTag}.node` }];
 
-const available: CandidateAddon[] = [];
-for (const candidate of candidates) {
-	const candidatePath = path.join(nativeDir, candidate.filename);
-	if (await fileExists(candidatePath)) {
-		await verifyDefaultLanguageSet(candidate, candidatePath, {
-			platformTag,
-			hostPlatformTag,
-			readBuildSidecar,
-			loadNativeAddon: candidatePath =>
-				require(candidatePath) as { nativeBuildInfo?: () => { languageSet?: string } },
-			warn: message => console.warn(message),
-		});
-		available.push(candidate);
+async function embedNative(): Promise<void> {
+	if (process.argv.includes("--reset")) {
+		await Bun.write(outputPath, stubContent);
+		return;
 	}
-}
 
-if (available.length === 0) {
-	const expected = candidates.map(candidate => `  - ${candidate.filename}`).join("\n");
-	throw new Error(`No native addons found for ${platformTag}. Expected one of:\n${expected}`);
-}
-const packageJson = (await Bun.file(packageJsonPath).json()) as { version: string };
+	const targetPlatform = Bun.env.TARGET_PLATFORM || process.platform;
+	const targetArch = Bun.env.TARGET_ARCH || process.arch;
+	const platformTag = `${targetPlatform}-${targetArch}`;
+	const hostPlatformTag = `${process.platform}-${process.arch}`;
+	const candidates = filterCandidatesByVariant(
+		buildCandidateList(targetArch, platformTag),
+		parseEmbedVariants(Bun.env.EMBED_VARIANTS),
+		platformTag,
+	);
 
-const imports = available
-	.map(
-		(candidate, index) =>
-			`import addonPath${index} from ${JSON.stringify(`../native/${candidate.filename}`)} with { type: "file" };`,
-	)
-	.join("\n");
+	const available: CandidateAddon[] = [];
+	for (const candidate of candidates) {
+		const candidatePath = path.join(nativeDir, candidate.filename);
+		if (await fileExists(candidatePath)) {
+			await verifyDefaultLanguageSet(candidate, candidatePath, {
+				platformTag,
+				hostPlatformTag,
+				readBuildSidecar,
+				loadNativeAddon: candidatePath =>
+					require(candidatePath) as { nativeBuildInfo?: () => { languageSet?: string } },
+				warn: message => console.warn(message),
+			});
+			available.push(candidate);
+		}
+	}
 
-const files = available
-	.map(
-		(candidate, index) =>
-			`\t\t{ variant: ${JSON.stringify(candidate.variant)}, filename: ${JSON.stringify(candidate.filename)}, filePath: addonPath${index} },`,
-	)
-	.join("\n");
+	if (available.length === 0) {
+		const expected = candidates.map(candidate => `  - ${candidate.filename}`).join("\n");
+		throw new Error(`No native addons found for ${platformTag}. Expected one of:\n${expected}`);
+	}
+	const packageJson = (await Bun.file(packageJsonPath).json()) as { version: string };
 
-const content = `
+	const imports = available
+		.map(
+			(candidate, index) =>
+				`import addonPath${index} from ${JSON.stringify(`../native/${candidate.filename}`)} with { type: "file" };`,
+		)
+		.join("\n");
+
+	const files = available
+		.map(
+			(candidate, index) =>
+				`\t\t{ variant: ${JSON.stringify(candidate.variant)}, filename: ${JSON.stringify(candidate.filename)}, filePath: addonPath${index} },`,
+		)
+		.join("\n");
+
+	const content = `
 // AUTOGENERATED FILE -- DO NOT EDIT DIRECTLY
 // See scripts/embed-native.ts
 
@@ -125,12 +174,17 @@ const content = `
 ${imports}
 
 export const embeddedAddon = {
-\tplatformTag: ${JSON.stringify(platformTag)},
-\tversion: ${JSON.stringify(packageJson.version)},
-\tfiles: [
+	platformTag: ${JSON.stringify(platformTag)},
+	version: ${JSON.stringify(packageJson.version)},
+	files: [
 ${files}
-\t],
+	],
 };
 `;
 
-await Bun.write(outputPath, content);
+	await Bun.write(outputPath, content);
+}
+
+if (import.meta.main) {
+	await embedNative();
+}

@@ -6,9 +6,9 @@ import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMeta
 import type { KeyId } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import type { ModelRegistry } from "../../config/model-registry";
-import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/unattended-session";
+import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import { type Theme, theme } from "../../modes/theme/theme";
-import type { SessionManager } from "../../session/session-manager";
+import { createReadonlySessionManager, type SessionManager } from "../../session/session-manager";
 import type {
 	AfterProviderResponseEvent,
 	BeforeAgentStartEvent,
@@ -111,6 +111,8 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 				: TEvent extends { type: "session.compacting" }
 					? SessionCompactingResult | undefined
 					: undefined;
+type Handler = Extension["handlers"] extends Map<string, Array<infer T>> ? T : never;
+type IndexedHandler = { ext: Extension; handler: Handler };
 
 export type NewSessionHandler = (options?: {
 	parentSession?: string;
@@ -173,15 +175,49 @@ const noOpUIContext: ExtensionUIContext = {
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
+	#handlersByEvent: Map<string, IndexedHandler[]> = new Map();
+
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
 	#waitForIdleFn: () => Promise<void> = async () => {};
 	#abortFn: () => void = () => {};
 	#hasPendingMessagesFn: () => boolean = () => false;
+	#getPendingMessageCountsFn: () => { steering: number; followUp: number; nextTurn: number } = () => ({
+		steering: 0,
+		followUp: 0,
+		nextTurn: 0,
+	});
 	#getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#getWorkflowGateFn: () => WorkflowGateEmitter | undefined = () => undefined;
+	#clearContextFn: () => Promise<boolean> = async () => false;
+	#getTranscriptFn: ExtensionContext["getTranscript"] = () => [];
+	#getTranscriptBodyFn: ExtensionContext["getTranscriptBody"] = () => undefined;
+	#getGoalStateFn: ExtensionContext["getGoalState"] = () => undefined;
+	#getTodoStateFn: ExtensionContext["getTodoState"] = () => undefined;
+	#getQueuedMessagesFn: ExtensionContext["getQueuedMessages"] = () => [];
+	#getActiveToolsFn: ExtensionContext["getActiveTools"] = () => [];
+	#getAllToolsFn: ExtensionContext["getAllTools"] = () => [];
+	#getResolveToolFn: ExtensionContext["resolveTool"] = () => undefined;
+	#cycleModelFn: ExtensionContextActions["cycleModel"] = undefined;
+	#cycleThinkingLevelFn: ExtensionContextActions["cycleThinkingLevel"] = undefined;
+	#setQueueModeFn: ExtensionContextActions["setQueueMode"] = undefined;
+	#getSkillStateFn: ExtensionContextActions["getSkillState"] = undefined;
+	#getConfigItemsFn: ExtensionContextActions["getConfigItems"] = undefined;
+	#getBranchCandidatesFn: ExtensionContextActions["getBranchCandidates"] = undefined;
+	#getExtensionsFn: ExtensionContextActions["getExtensions"] = undefined;
+	#getArtifactFn: ExtensionContextActions["getArtifact"] = undefined;
+	#getArtifactRangeFn: ExtensionContextActions["getArtifactRange"] = undefined;
+
+	#getJobsFn: ExtensionContextActions["getJobs"] = undefined;
+	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
+	#setSdkPermissionProviderFn: ExtensionContextActions["setSdkPermissionProvider"] = undefined;
+
+	#invokeSkillFn: ExtensionContextActions["invokeSkill"] = undefined;
+	#setPlanModeFn: ExtensionContextActions["setPlanMode"] = undefined;
+	#operateGoalFn: ExtensionContextActions["operateGoal"] = undefined;
+
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	#branchHandler: BranchHandler = async () => ({ cancelled: false });
 	#navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -208,6 +244,24 @@ export class ExtensionRunner {
 		private readonly sessionMetadata?: ExtensionContext["sessionMetadata"],
 	) {
 		this.#uiContext = noOpUIContext;
+		this.#handlersByEvent = ExtensionRunner.#indexHandlers(extensions);
+	}
+
+	static #indexHandlers(extensions: Extension[]): Map<string, IndexedHandler[]> {
+		const handlersByEvent = new Map<string, IndexedHandler[]>();
+		for (const ext of extensions) {
+			for (const [eventType, handlers] of ext.handlers) {
+				let indexedHandlers = handlersByEvent.get(eventType);
+				if (!indexedHandlers) {
+					indexedHandlers = [];
+					handlersByEvent.set(eventType, indexedHandlers);
+				}
+				for (const handler of handlers) {
+					indexedHandlers.push({ ext, handler });
+				}
+			}
+		}
+		return handlersByEvent;
 	}
 
 	initialize(
@@ -222,11 +276,20 @@ export class ExtensionRunner {
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.getActiveTools = actions.getActiveTools;
 		this.runtime.getAllTools = actions.getAllTools;
+		this.runtime.resolveTool = actions.resolveTool ?? (() => undefined);
 		this.runtime.setActiveTools = actions.setActiveTools;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.getThinkingVisibility = actions.getThinkingVisibility;
+		this.runtime.setThinkingVisibility = actions.setThinkingVisibility;
+		this.runtime.cycleThinkingLevel = actions.cycleThinkingLevel;
+		this.runtime.setThinkingLevelForControl = actions.setThinkingLevelForControl;
+		this.runtime.setThinkingVisibilityForControl = actions.setThinkingVisibilityForControl;
+		this.runtime.setModelTemporaryForControl = actions.setModelTemporaryForControl;
+		this.runtime.fetchUsageReportsForControl = actions.fetchUsageReportsForControl;
+		this.runtime.getThinkingScopeForControl = actions.getThinkingScopeForControl;
 		this.runtime.getSessionName = actions.getSessionName;
 		this.runtime.setSessionName = actions.setSessionName;
 
@@ -235,9 +298,37 @@ export class ExtensionRunner {
 		this.#isIdleFn = contextActions.isIdle;
 		this.#abortFn = contextActions.abort;
 		this.#hasPendingMessagesFn = contextActions.hasPendingMessages;
+		this.#getPendingMessageCountsFn =
+			contextActions.getPendingMessageCounts ?? (() => ({ steering: 0, followUp: 0, nextTurn: 0 }));
 		this.#shutdownHandler = contextActions.shutdown;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 		this.#getWorkflowGateFn = contextActions.getWorkflowGate ?? (() => undefined);
+		this.#clearContextFn = contextActions.clearContext ?? (async () => false);
+		this.#getTranscriptFn = contextActions.getTranscript ?? (() => []);
+		this.#getTranscriptBodyFn = contextActions.getTranscriptBody ?? (() => undefined);
+		this.#getGoalStateFn = contextActions.getGoalState ?? (() => undefined);
+		this.#getTodoStateFn = contextActions.getTodoState ?? (() => undefined);
+		this.#getQueuedMessagesFn = contextActions.getQueuedMessages ?? (() => []);
+		this.#getActiveToolsFn = contextActions.getActiveTools ?? (() => []);
+		this.#getAllToolsFn = contextActions.getAllTools ?? (() => []);
+		this.#getResolveToolFn = contextActions.resolveTool ?? (() => undefined);
+		this.#cycleModelFn = contextActions.cycleModel;
+		this.#cycleThinkingLevelFn = contextActions.cycleThinkingLevel;
+		this.#setQueueModeFn = contextActions.setQueueMode;
+		this.#getSkillStateFn = contextActions.getSkillState;
+		this.#invokeSkillFn = contextActions.invokeSkill;
+		this.#setPlanModeFn = contextActions.setPlanMode;
+		this.#operateGoalFn = contextActions.operateGoal;
+
+		this.#getConfigItemsFn = contextActions.getConfigItems;
+		this.#getBranchCandidatesFn = contextActions.getBranchCandidates;
+		this.#getExtensionsFn = contextActions.getExtensions;
+		this.#getArtifactFn = contextActions.getArtifact;
+		this.#getArtifactRangeFn = contextActions.getArtifactRange;
+
+		this.#getJobsFn = contextActions.getJobs;
+		this.#sdkControlFn = contextActions.sdkControl;
+		this.#setSdkPermissionProviderFn = contextActions.setSdkPermissionProvider;
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -275,8 +366,8 @@ export class ExtensionRunner {
 	 * Forward a `credential_disabled` event from `AuthStorage` to extension handlers.
 	 *
 	 * If {@link initialize} has not yet run, the event is buffered and replayed once
-	 * initialize wires the runtime/UI context. This matters because mode controllers
-	 * (interactive, RPC, ACP, print, subagent) call `initialize()` AFTER `createAgentSession`
+	 * initialize wires the runtime/UI context. This matters because session frontends
+	 * (interactive, ACP, print, and subagent) call `initialize()` AFTER `createAgentSession`
 	 * returns, but `AuthStorage` can fire `credential_disabled` during startup model probes
 	 * inside `createAgentSession()`. Without deferral, extension handlers would observe
 	 * `hasUI=false`, an unset model, and no-op runtime actions on exactly the headline
@@ -396,13 +487,7 @@ export class ExtensionRunner {
 	}
 
 	hasHandlers(eventType: string): boolean {
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get(eventType);
-			if (handlers && handlers.length > 0) {
-				return true;
-			}
-		}
-		return false;
+		return (this.#handlersByEvent.get(eventType)?.length ?? 0) > 0;
 	}
 
 	getMessageRenderer(customType: string): MessageRenderer | undefined {
@@ -458,7 +543,7 @@ export class ExtensionRunner {
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
-			sessionManager: this.sessionManager,
+			sessionManager: createReadonlySessionManager(this.sessionManager),
 			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
 			get model() {
@@ -467,10 +552,53 @@ export class ExtensionRunner {
 			isIdle: () => this.#isIdleFn(),
 			abort: () => this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
+			getPendingMessageCounts: () => this.#getPendingMessageCountsFn(),
+			getTranscript: () => this.#getTranscriptFn(),
+			getTranscriptBody: entryId => this.#getTranscriptBodyFn(entryId),
+			getGoalState: () => this.#getGoalStateFn(),
+			getTodoState: () => this.#getTodoStateFn(),
+			getQueuedMessages: () => this.#getQueuedMessagesFn(),
+			getActiveTools: () => this.#getActiveToolsFn(),
+			getAllTools: () => this.#getAllToolsFn(),
+			resolveTool: name => this.#getResolveToolFn(name),
+			cycleModel: async () => await this.#cycleModelFn?.(),
+			cycleThinkingLevel: () => this.#cycleThinkingLevelFn?.(),
+			setQueueMode: (kind, mode) => this.#setQueueModeFn?.(kind, mode) ?? false,
+			invokeSkill: async (name, args) => await this.#invokeSkillFn?.(name, args),
+
+			setPlanMode: on => this.#setPlanModeFn?.(on),
+			operateGoal: async (op, objective) => await this.#operateGoalFn?.(op, objective),
+
+			getSkillState: () => this.#getSkillStateFn?.(),
+			getConfigItems: () => this.#getConfigItemsFn?.(),
+			getBranchCandidates: () => this.#getBranchCandidatesFn?.(),
+			getExtensions: () => this.#getExtensionsFn?.(),
+			getArtifact: id => this.#getArtifactFn?.(id),
+			getArtifactRange: (id, offset, length) => this.#getArtifactRangeFn?.(id, offset, length),
+
+			getJobs: () => this.#getJobsFn?.(),
+			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
+			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
+			sdkBindings: () => [
+				...(this.#cycleModelFn ? ["cycleModel"] : []),
+				...(this.#cycleThinkingLevelFn ? ["cycleThinkingLevel"] : []),
+				...(this.#setQueueModeFn ? ["setQueueMode"] : []),
+				...(this.#getSkillStateFn ? ["getSkillState"] : []),
+				...(this.#getConfigItemsFn ? ["getConfigItems"] : []),
+				...(this.#getBranchCandidatesFn ? ["getBranchCandidates"] : []),
+				...(this.#getExtensionsFn ? ["getExtensions"] : []),
+				...(this.#getArtifactRangeFn ? ["getArtifactRange"] : []),
+				...(this.#getJobsFn ? ["getJobs"] : []),
+				...(this.#sdkControlFn ? ["sdkControl"] : []),
+				...(this.#invokeSkillFn ? ["invokeSkill"] : []),
+				...(this.#setPlanModeFn ? ["setPlanMode"] : []),
+				...(this.#operateGoalFn ? ["operateGoal"] : []),
+			],
 			shutdown: () => this.#shutdownHandler(),
-			getSystemPrompt: () => this.#getSystemPromptFn(),
+			getSystemPrompt: () => [...this.#getSystemPromptFn()],
 			hasQueuedMessages: () => this.#hasPendingMessagesFn(), // deprecated alias
 			workflowGate: this.#getWorkflowGateFn(),
+			clearContext: () => this.#clearContextFn(),
 		};
 	}
 
@@ -511,11 +639,17 @@ export class ExtensionRunner {
 		ext: Extension,
 		timeoutMs: number,
 	): Promise<TResult | undefined> {
+		let timeout: ReturnType<typeof setTimeout> | undefined;
 		try {
-			const handlerResult = await Promise.race([
-				Promise.resolve(handler(event, ctx)),
-				Bun.sleep(timeoutMs).then(() => EXTENSION_HANDLER_TIMEOUT),
-			]);
+			const timeoutPromise = new Promise<typeof EXTENSION_HANDLER_TIMEOUT>(resolve => {
+				timeout = setTimeout(() => resolve(EXTENSION_HANDLER_TIMEOUT), timeoutMs);
+			});
+			const handlerResult = await Promise.race([Promise.resolve(handler(event, ctx)), timeoutPromise]);
+			if (timeout !== undefined) {
+				clearTimeout(timeout);
+				timeout = undefined;
+			}
+
 			if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {
 				const error = `handler timed out after ${timeoutMs}ms`;
 				logger.warn("Extension handler timed out", {
@@ -541,36 +675,37 @@ export class ExtensionRunner {
 				stack,
 			});
 			return undefined;
+		} finally {
+			if (timeout !== undefined) {
+				clearTimeout(timeout);
+			}
 		}
 	}
 
-	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+	async emit<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		continueWhile?: () => boolean,
+	): Promise<RunnerEmitResult<TEvent>> {
+		const handlers = this.#handlersByEvent.get(event.type) ?? [];
+		if (handlers.length === 0) return undefined as RunnerEmitResult<TEvent>;
+
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | SessionCompactingResult | undefined;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get(event.type);
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
 
-			for (const handler of handlers) {
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-
-				if (this.#isSessionBeforeEvent(event) && handlerResult) {
-					result = handlerResult as SessionBeforeEventResult;
-					if (result.cancel) {
-						return result as RunnerEmitResult<TEvent>;
-					}
+			if (this.#isSessionBeforeEvent(event) && handlerResult) {
+				result = handlerResult as SessionBeforeEventResult;
+				if (result.cancel) {
+					return result as RunnerEmitResult<TEvent>;
 				}
+			}
 
-				if (event.type === "session.compacting" && handlerResult) {
-					result = handlerResult as SessionCompactingResult;
-				}
+			if (event.type === "session.compacting" && handlerResult) {
+				result = handlerResult as SessionCompactingResult;
 			}
 		}
 
@@ -578,36 +713,34 @@ export class ExtensionRunner {
 	}
 
 	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
+		const handlers = this.#handlersByEvent.get("tool_result") ?? [];
+		if (handlers.length === 0) return undefined;
+
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = { ...event };
 		let modified = false;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("tool_result");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			const handlerResult = (await this.#runHandlerWithTimeout(
+				handler,
+				currentEvent,
+				ctx,
+				ext,
+				extensionHandlerTimeoutMs,
+			)) as ToolResultEventResult | undefined;
+			if (!handlerResult) continue;
 
-			for (const handler of handlers) {
-				const handlerResult = (await this.#runHandlerWithTimeout(
-					handler,
-					currentEvent,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				)) as ToolResultEventResult | undefined;
-				if (!handlerResult) continue;
-
-				if (handlerResult.content !== undefined) {
-					currentEvent.content = handlerResult.content;
-					modified = true;
-				}
-				if (handlerResult.details !== undefined) {
-					currentEvent.details = handlerResult.details;
-					modified = true;
-				}
-				if (handlerResult.isError !== undefined) {
-					currentEvent.isError = handlerResult.isError;
-					modified = true;
-				}
+			if (handlerResult.content !== undefined) {
+				currentEvent.content = handlerResult.content;
+				modified = true;
+			}
+			if (handlerResult.details !== undefined) {
+				currentEvent.details = handlerResult.details;
+				modified = true;
+			}
+			if (handlerResult.isError !== undefined) {
+				currentEvent.isError = handlerResult.isError;
+				modified = true;
 			}
 		}
 
@@ -621,34 +754,32 @@ export class ExtensionRunner {
 	}
 
 	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
+		const handlers = this.#handlersByEvent.get("tool_call") ?? [];
+		if (handlers.length === 0) return undefined;
+
 		const ctx = this.createContext();
 		let result: ToolCallEventResult | undefined;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("tool_call");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			try {
+				const handlerResult = await handler(event, ctx);
 
-			for (const handler of handlers) {
-				try {
-					const handlerResult = await handler(event, ctx);
-
-					if (handlerResult) {
-						result = handlerResult as ToolCallEventResult;
-						if (result.block) {
-							return result;
-						}
+				if (handlerResult) {
+					result = handlerResult as ToolCallEventResult;
+					if (result.block) {
+						return result;
 					}
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					const stack = err instanceof Error ? err.stack : undefined;
-					this.emitError({
-						extensionPath: ext.path,
-						event: "tool_call",
-						error: message,
-						stack,
-					});
-					return { block: true, reason: `Extension ${ext.path} failed: ${message}` };
 				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				const stack = err instanceof Error ? err.stack : undefined;
+				this.emitError({
+					extensionPath: ext.path,
+					event: "tool_call",
+					error: message,
+					stack,
+				});
+				return { block: true, reason: `Extension ${ext.path} failed: ${message}` };
 			}
 		}
 
@@ -667,23 +798,15 @@ export class ExtensionRunner {
 		event: UserBashEvent | UserPythonEvent,
 		eventName: "user_bash" | "user_python",
 	): Promise<R | undefined> {
+		const handlers = this.#handlersByEvent.get(eventName) ?? [];
+		if (handlers.length === 0) return undefined;
+
 		const ctx = this.createContext();
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get(eventName);
-			if (!handlers || handlers.length === 0) continue;
-
-			for (const handler of handlers) {
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-				if (handlerResult) {
-					return handlerResult as R;
-				}
+		for (const { ext, handler } of handlers) {
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			if (handlerResult) {
+				return handlerResult as R;
 			}
 		}
 
@@ -698,35 +821,26 @@ export class ExtensionRunner {
 		promptPaths: Array<{ path: string; extensionPath: string }>;
 		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
+		const handlers = this.#handlersByEvent.get("resources_discover") ?? [];
+		if (handlers.length === 0) return { skillPaths: [], promptPaths: [], themePaths: [] };
 		const ctx = this.createContext();
 		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
 		const themePaths: Array<{ path: string; extensionPath: string }> = [];
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("resources_discover");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			const result = handlerResult as ResourcesDiscoverResult | undefined;
 
-			for (const handler of handlers) {
-				const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-				const result = handlerResult as ResourcesDiscoverResult | undefined;
-
-				if (result?.skillPaths?.length) {
-					skillPaths.push(...result.skillPaths.map(path => ({ path, extensionPath: ext.path })));
-				}
-				if (result?.promptPaths?.length) {
-					promptPaths.push(...result.promptPaths.map(path => ({ path, extensionPath: ext.path })));
-				}
-				if (result?.themePaths?.length) {
-					themePaths.push(...result.themePaths.map(path => ({ path, extensionPath: ext.path })));
-				}
+			if (result?.skillPaths?.length) {
+				skillPaths.push(...result.skillPaths.map(path => ({ path, extensionPath: ext.path })));
+			}
+			if (result?.promptPaths?.length) {
+				promptPaths.push(...result.promptPaths.map(path => ({ path, extensionPath: ext.path })));
+			}
+			if (result?.themePaths?.length) {
+				themePaths.push(...result.themePaths.map(path => ({ path, extensionPath: ext.path })));
 			}
 		}
 
@@ -737,41 +851,35 @@ export class ExtensionRunner {
 	async emitInput(
 		text: string,
 		images: ImageContent[] | undefined,
-		source: "interactive" | "rpc" | "extension",
+		source: "interactive" | "sdk" | "extension",
 	): Promise<InputEventResult> {
+		const handlers = this.#handlersByEvent.get("input") ?? [];
+		if (handlers.length === 0) return {};
+
 		const ctx = this.createContext();
 		let currentText = text;
 		let currentImages = images;
 
-		for (const ext of this.extensions) {
-			for (const handler of ext.handlers.get("input") ?? []) {
-				const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
-				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
-					| InputEventResult
-					| undefined;
-				if (result?.handled) return result;
-				if (result?.text !== undefined) {
-					currentText = result.text;
-					currentImages = result.images ?? currentImages;
-				}
+		for (const { ext, handler } of handlers) {
+			const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
+			const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
+				| InputEventResult
+				| undefined;
+			if (result?.handled) return result;
+			if (result?.text !== undefined) {
+				currentText = result.text;
+				currentImages = result.images ?? currentImages;
 			}
 		}
+
 		return currentText !== text || currentImages !== images ? { text: currentText, images: currentImages } : {};
 	}
 
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		const handlers = this.#handlersByEvent.get("context") ?? [];
+		if (handlers.length === 0) return messages;
+
 		const ctx = this.createContext();
-
-		// Check if any extensions actually have context handlers before cloning
-		let hasContextHandlers = false;
-		for (const ext of this.extensions) {
-			if (ext.handlers.get("context")?.length) {
-				hasContextHandlers = true;
-				break;
-			}
-		}
-		if (!hasContextHandlers) return messages;
-
 		let currentMessages: AgentMessage[];
 		try {
 			currentMessages = structuredClone(messages);
@@ -782,23 +890,12 @@ export class ExtensionRunner {
 			currentMessages = [...messages];
 		}
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("context");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			const event: ContextEvent = { type: "context", messages: currentMessages };
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 
-			for (const handler of handlers) {
-				const event: ContextEvent = { type: "context", messages: currentMessages };
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-
-				if (handlerResult && (handlerResult as ContextEventResult).messages) {
-					currentMessages = (handlerResult as ContextEventResult).messages!;
-				}
+			if (handlerResult && (handlerResult as ContextEventResult).messages) {
+				currentMessages = (handlerResult as ContextEventResult).messages!;
 			}
 		}
 
@@ -806,28 +903,20 @@ export class ExtensionRunner {
 	}
 
 	async emitBeforeProviderRequest(payload: unknown): Promise<BeforeProviderRequestEventResult> {
+		const handlers = this.#handlersByEvent.get("before_provider_request") ?? [];
+		if (handlers.length === 0) return payload;
+
 		const ctx = this.createContext();
 		let currentPayload = payload;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("before_provider_request");
-			if (!handlers || handlers.length === 0) continue;
-
-			for (const handler of handlers) {
-				const event: BeforeProviderRequestEvent = {
-					type: "before_provider_request",
-					payload: currentPayload,
-				};
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-				if (handlerResult !== undefined) {
-					currentPayload = handlerResult;
-				}
+		for (const { ext, handler } of handlers) {
+			const event: BeforeProviderRequestEvent = {
+				type: "before_provider_request",
+				payload: currentPayload,
+			};
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
+			if (handlerResult !== undefined) {
+				currentPayload = handlerResult;
 			}
 		}
 
@@ -835,22 +924,20 @@ export class ExtensionRunner {
 	}
 
 	async emitAfterProviderResponse(response: ProviderResponseMetadata, _model?: Model): Promise<void> {
+		const handlers = this.#handlersByEvent.get("after_provider_response") ?? [];
+		if (handlers.length === 0) return;
+
 		const ctx = this.createContext();
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("after_provider_response");
-			if (!handlers || handlers.length === 0) continue;
-
-			for (const handler of handlers) {
-				const event: AfterProviderResponseEvent = {
-					type: "after_provider_response",
-					status: response.status,
-					headers: response.headers,
-					requestId: response.requestId,
-					metadata: response.metadata,
-				};
-				await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
-			}
+		for (const { ext, handler } of handlers) {
+			const event: AfterProviderResponseEvent = {
+				type: "after_provider_response",
+				status: response.status,
+				headers: response.headers,
+				requestId: response.requestId,
+				metadata: response.metadata,
+			};
+			await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 		}
 	}
 
@@ -859,39 +946,31 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		systemPrompt: string[],
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
+		const handlers = this.#handlersByEvent.get("before_agent_start") ?? [];
+		if (handlers.length === 0) return undefined;
+
 		const ctx = this.createContext();
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
 		let currentSystemPrompt = systemPrompt;
 		let systemPromptModified = false;
 
-		for (const ext of this.extensions) {
-			const handlers = ext.handlers.get("before_agent_start");
-			if (!handlers || handlers.length === 0) continue;
+		for (const { ext, handler } of handlers) {
+			const event: BeforeAgentStartEvent = {
+				type: "before_agent_start",
+				prompt,
+				images,
+				systemPrompt: currentSystemPrompt,
+			};
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 
-			for (const handler of handlers) {
-				const event: BeforeAgentStartEvent = {
-					type: "before_agent_start",
-					prompt,
-					images,
-					systemPrompt: currentSystemPrompt,
-				};
-				const handlerResult = await this.#runHandlerWithTimeout(
-					handler,
-					event,
-					ctx,
-					ext,
-					extensionHandlerTimeoutMs,
-				);
-
-				if (handlerResult) {
-					const result = handlerResult as BeforeAgentStartEventResult;
-					if (result.message) {
-						messages.push(result.message);
-					}
-					if (result.systemPrompt !== undefined) {
-						currentSystemPrompt = result.systemPrompt;
-						systemPromptModified = true;
-					}
+			if (handlerResult) {
+				const result = handlerResult as BeforeAgentStartEventResult;
+				if (result.message) {
+					messages.push(result.message);
+				}
+				if (result.systemPrompt !== undefined) {
+					currentSystemPrompt = result.systemPrompt;
+					systemPromptModified = true;
 				}
 			}
 		}

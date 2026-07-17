@@ -1,6 +1,40 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.11.1] - 2026-07-16
+
+### Fixed
+
+- Hardened the managed fallback attempt snapshot: staged agent events and assistant partials were cloned with a bare `structuredClone`, so a single non-cloneable value in a staged payload (e.g. a live `Headers` inside `transportFailure`) threw `DataCloneError` ("The object can not be cloned."), masked the real provider outcome, and deterministically failed every attempt until the fallback chain exhausted. The snapshot now degrades to a cycle-aware sanitizing deep clone that always returns a detached, JSON-serializable value (unsupported leaves become placeholders), so event-time replay semantics are preserved and no local snapshot failure can masquerade as a provider attempt failure. Byte accounting in the provisional buffer measures the raw event before the snapshot duplicates it (over-limit payloads are rejected pre-clone), re-measures degraded snapshots so the retained sanitized form is what gets accounted, and uses the sanitized detached form as the cycle-safe estimator for cyclic payloads.
+- Enforced the managed fallback authority boundary for local staging failures: `ManagedAttemptBufferOverflowError` no longer carries a synthetic provider-like `503` status, so exceeding the provisional event buffer limit (like any other local snapshot failure) is non-retryable, never converts into `transportFailure { kind: "transport", status: 503 }` evidence, and never rotates or consumes the model fallback chain — it surfaces as an explicit local error instead. Only original typed provider transport facts may authorize provider fallback.
+- Added a bounded, neutralize-only `invalid_prompt` circuit breaker to the agent loop (#2282). A poisoned-history rejection (`Request blocked (code=invalid_prompt)`) is a deterministic content fault: re-sending the same history re-triggers it, so uncontrolled session auto-retry would burn its budget re-poisoning the model. On the first `invalid_prompt` of a run, leaked reserved control tokens are neutralized in place across history (no item is ever dropped). If that changes the outgoing bytes, the turn is resent exactly once with the repaired history; if neutralization cannot change anything, the run fails fast immediately with no resend. The repaired history is persisted for a clean resume, the breaker fires at most once per run (budget = one repaired resend), and it is scoped to the non-managed session path since managed fallback owns its own retry policy.
+
+## [0.10.2] - 2026-07-14
+
+### Fixed
+
+- Extended the gpt-5.6 `Request blocked (code=invalid_prompt)` fix to the compaction paths that bypass the streaming transport. Remote OpenAI compaction (`/responses/compact`, `compaction.remoteEnabled` default on — the "remote compact task" in openai/codex#32028) built its native `input` from reasoning signatures, verbatim history items, and message/tool text without neutralizing leaked Harmony control-token markers (e.g. `<|channel|>analysis`), so gpt-5.6 rejected the compaction request and, on retry, could escalate to account-level blocking. `requestOpenAiRemoteCompaction` now neutralizes reserved control tokens across the whole outgoing `input`, and the generic `requestRemoteCompaction` prompt/systemPrompt are neutralized too. Local summarization was already covered by the streaming-transport request-boundary fix.
+
+### Changed
+
+- `AgentLoopConfig.maintainContext` now receives a required cancellation-aware lifecycle (`signal`, `awaitEventDrain(invocationSignal)`). Agent loops compose the run and maintenance-invocation signals and pass that single signal to EventStream's FIFO consumer-drain barrier, so cancellation removes the pending drain at its owner instead of racing an orphaned wait.
+
+## [0.10.0] - 2026-07-12
+
+### Fixed
+
+- The native-free token heuristic is now script-aware: common-BMP CJK characters (Hangul, unified/compat Han, Kana, CJK punctuation, full-width forms) are charged at 1 token each (measured o200k_base upper bound 0.96 tokens/char) and supplementary code points (surrogate pairs: rare Han extensions, emoji) at 1 token per code point, instead of chars/4 for everything. The old estimate undercounted Korean/CJK-heavy unsent context by 2–4x and could delay threshold compaction past the provider window; ASCII estimates are unchanged. `boundConversationTextForSummary` now derives its truncation cut from the text's own estimated token density, validates the complete assembled excerpt (elision marker included) against the estimator, and fails closed — bare marker only when the marker itself fits the budget, otherwise an empty excerpt, including when the computed input budget is non-positive — instead of assuming 4 chars/token and returning over-budget or unbounded text.
+
+- A tool call for a name absent from the active tool set now appends a recovery hint pointing at `search_tool_bm25` (gated on a callable `search_tool_bm25`, matched by internal name or `customWireName`), so a model no longer abandons a discoverable tool such as `task` after a bare "Tool <name> not found"; the base error wording stays byte-for-byte stable when discovery is unavailable (#2042).
+
+## [0.9.2] - 2026-07-09
+
+### Fixed
+
+- Follow-up queues can now mark individual messages as one-at-a-time, so interactive composer queues can remain sequential without disabling the existing batch mode for other callers.
+
+## [0.8.2] - 2026-07-06
 ### Added
 
 - Agent queues now expose ordered move helpers for steering and follow-up messages so callers can reorder pending work without removing and re-adding messages.

@@ -310,5 +310,5 @@ Same as `definition`, but sends `textDocument/implementation` and reports `imple
 - `reload` does not recreate a client immediately after killing it; the next request triggers reinitialization.
 - `workspace/applyEdit` can apply edits initiated by the server outside the direct tool action result path.
 - `detectLspmux()` can be disabled with `GJC_DISABLE_LSPMUX=1`; only `rust-analyzer` is in `DEFAULT_SUPPORTED_SERVERS`.
-- Startup LSP warmup (`discoverStartupLspServers(cwd)` in `sdk.ts`) is gated on `enableLsp && options.hasUI && settings.get("lsp.diagnosticsOnWrite")` — print/RPC/ACP/script sessions skip it and let `getOrCreateClient()` cold-start servers on demand. See `docs/sdk.md` § Startup performance.
+- Startup LSP warmup (`discoverStartupLspServers(cwd)` in `sdk.ts`) is gated on `enableLsp && options.hasUI && settings.get("lsp.diagnosticsOnWrite")` — print, ACP, and script sessions skip it and let `getOrCreateClient()` cold-start servers on demand. See `docs/sdk-embedding.md` § Startup performance.
 - `configCache` is per-process and never auto-invalidated; config changes require a fresh process to be observed by `getConfig()` callers.

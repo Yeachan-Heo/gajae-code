@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getWorktreesDir } from "@gajae-code/utils/dirs";
 import { sessionReportsDir, teamStateRoot } from "../../src/gjc-runtime/session-layout";
 import {
 	buildWorkerCommand,
@@ -20,7 +21,10 @@ import {
 	resolveGjcTeamWorkerCli,
 	resolveGjcTeamWorkerCliPlan,
 	resolveGjcWorkerCommand,
+	resolveWorkerWorktreePath,
 	sendGjcTeamMessage,
+	setGjcTeamMailboxDeliveryTransport,
+	setGjcTeamMailboxDeliveryTransportForTest,
 	shutdownGjcTeam,
 	startGjcTeam,
 	transitionGjcTeamTask,
@@ -61,6 +65,7 @@ async function createFakeTmuxBin(
 		gjcProfile?: boolean;
 		untaggableProfile?: boolean;
 		commandName?: string;
+		versionOutput?: string;
 	} = {},
 ): Promise<string> {
 	const binDir = path.join(root, ".test-bin");
@@ -70,6 +75,9 @@ async function createFakeTmuxBin(
 	const script = `#!/usr/bin/env bash
 echo "$@" >> ${JSON.stringify(logPath)}
 case "$1" in
+  -V|--version)
+    echo ${JSON.stringify(options.versionOutput ?? "tmux 3.3.5")}
+    ;;
   display-message)
     ${
 			options.failDisplay
@@ -86,6 +94,8 @@ case "$1" in
       %2) echo "test-session:0 %2" ;;
       %9) echo "other-session:0 %9" ;;
       %1) echo "test-session:0 %1" ;;
+      =test-session:*|=test-session|test-session:*|test-session) echo "test-session:0 %1" ;;
+      =other-session:*|=other-session|other-session:*|other-session) echo "other-session:0 %9" ;;
       *) echo "test-session:0 %1" ;;
     esac
     `
@@ -218,7 +228,12 @@ function artifactCompletionEvidence(summary = "Completed by artifact review") {
 	};
 }
 
+let resetMailboxTransport: (() => void) | undefined;
+
 afterEach(async () => {
+	resetMailboxTransport?.();
+	resetMailboxTransport = undefined;
+	setGjcTeamMailboxDeliveryTransport(undefined);
 	if (cleanupRoot) {
 		for (const session of [
 			"gjc-worktree-team",
@@ -267,6 +282,49 @@ describe("native gjc team runtime", () => {
 		const telemetry = await Bun.file(path.join(snapshot.state_dir, "telemetry.jsonl")).text();
 		expect(telemetry).toContain("Native gjc team dry-run state initialized");
 		expect(telemetry).toContain('"dry_run":true');
+	});
+
+	it("uses a short default worker worktree root on Windows psmux", () => {
+		const repoRoot = path.resolve("C:/Users/alice/source/really/deep/repository");
+		const stateDir = path.join(
+			repoRoot,
+			".gjc",
+			"_session-019f40f8-b6df-7000-8529-9227933daf5a",
+			"state",
+			"team",
+			"windows-psmux-team",
+		);
+
+		const workerPath = resolveWorkerWorktreePath({
+			repoRoot,
+			stateDir,
+			teamName: "windows-psmux-team",
+			workerId: "worker-1",
+			platform: "win32",
+			isPsmux: true,
+		});
+
+		expect(workerPath.startsWith(getWorktreesDir())).toBe(true);
+		expect(workerPath).toContain("team-");
+		expect(workerPath.endsWith("worker-1")).toBe(true);
+		expect(workerPath).not.toContain("_session-019f40f8-b6df-7000-8529-9227933daf5a");
+		expect(workerPath).not.toContain(`${path.sep}state${path.sep}team${path.sep}`);
+	});
+
+	it("keeps the session-scoped worker worktree root outside Windows psmux", () => {
+		const repoRoot = path.resolve("/tmp/gjc-team-runtime");
+		const stateDir = path.join(repoRoot, ".gjc", "_session-test-session", "state", "team", "posix-team");
+
+		const workerPath = resolveWorkerWorktreePath({
+			repoRoot,
+			stateDir,
+			teamName: "posix-team",
+			workerId: "worker-1",
+			platform: "linux",
+			isPsmux: false,
+		});
+
+		expect(workerPath).toBe(path.join(stateDir, "worktrees", "worker-1"));
 	});
 
 	it("separates managed worker lifecycle from worker-reported status", async () => {
@@ -425,6 +483,55 @@ describe("native gjc team runtime", () => {
 		expect(command).toContain("; & 'C:\\Program Files\\gjc\\gjc.exe'");
 		expect(command).not.toContain("; 'C:\\Program Files\\gjc\\gjc.exe' ");
 		expect(command).toContain("'You are worker-1 in gjc team win-team.");
+	});
+
+	it("marks worker commands with the canonical GJC spawn-provenance env var", () => {
+		const base = {
+			team_name: "prov-team",
+			display_name: "prov-team",
+			requested_name: "prov-team",
+			task: "Do work",
+			agent_type: "executor",
+			worker_count: 1,
+			max_workers: 1,
+			state_root: "/state",
+			worker_command: "gjc",
+			worker_cli_plan: ["gjc"],
+			tmux_command: "tmux",
+			tmux_session: "sess",
+			tmux_session_name: "sess",
+			tmux_target: "sess:0",
+			workspace_mode: "direct",
+			dry_run: false,
+			leader: { session_id: "leader-xyz", pane_id: "%1", cwd: "/repo" },
+			leader_cwd: "/repo",
+			team_state_root: "/state",
+			workers: [],
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+		} satisfies GjcTeamConfig;
+		const worker = {
+			id: "worker-1",
+			name: "worker-1",
+			index: 1,
+			agent_type: "executor",
+			role: "executor",
+			status: "starting",
+			last_heartbeat: "2026-01-01T00:00:00.000Z",
+			assigned_tasks: [],
+		} satisfies GjcTeamWorker;
+
+		// POSIX: the marker carries the leader session id.
+		const posix = buildWorkerCommand(base, worker, "linux");
+		expect(posix).toContain("GJC_SPAWNED_BY_SESSION='leader-xyz'");
+
+		// Falls back to the (always non-blank) team name when the leader has no id,
+		// so presence-based suppression still marks the worker.
+		const noLeaderId = { ...base, leader: { ...base.leader, session_id: "  " } } satisfies GjcTeamConfig;
+		expect(buildWorkerCommand(noLeaderId, worker, "linux")).toContain("GJC_SPAWNED_BY_SESSION='prov-team'");
+
+		// Windows env assignment form is emitted too.
+		expect(buildWorkerCommand(base, worker, "win32")).toContain("$env:GJC_SPAWNED_BY_SESSION = 'leader-xyz';");
 	});
 
 	it("resolves Windows JavaScript entrypoints through an executable runtime", async () => {
@@ -602,6 +709,38 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).not.toContain("send-keys -l");
 	});
 
+	it("targets the GJC-managed leader session from GJC_TMUX_ACTIVE_SESSION over a stale TMUX_PANE", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Resolve leader from active session, not stale pane",
+			teamName: "active-session-team",
+			cwd: cleanupRoot,
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				PATH: process.env.PATH ?? "",
+				GJC_TEAM_WORKER_COMMAND: "true",
+				GJC_TEAM_TMUX_COMMAND: fakeTmux,
+				// A stale/ambiguous inherited pane points at the wrong session; the
+				// explicit GJC-managed session name must win so workers land in the
+				// intended leader session (issue #531).
+				TMUX_PANE: "%9",
+				GJC_TMUX_ACTIVE_SESSION: "test-session",
+			},
+		});
+
+		const config = await Bun.file(path.join(snapshot.state_dir, "config.json")).json();
+		expect(config.tmux_session).toBe("test-session");
+		expect(config.tmux_target).toBe("test-session:0");
+		expect(config.leader.pane_id).toBe("%1");
+		expect(snapshot.tmux_target).toBe("test-session:0");
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("display-message -p -t =test-session: #S:#I #{pane_id}");
+		expect(tmuxLog).not.toContain("display-message -p -t %9 #S:#I #{pane_id}");
+	});
+
 	it("starts multiple runtime workers before tmux state mutation", async () => {
 		cleanupRoot = await createGitRepo();
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
@@ -658,6 +797,37 @@ describe("native gjc team runtime", () => {
 		expect(tmuxLog).toContain("send-keys -l -t %2");
 		expect(tmuxLog).toContain("worker-startup-ack");
 		expect(tmuxLog).toContain("send-keys -t %2 Enter");
+	});
+
+	it("uses the short worker worktree root for Windows psmux even when -V prints a generic tmux banner", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakePsmux = await createFakeTmuxBin(cleanupRoot, { commandName: "psmux", versionOutput: "tmux 3.3.5" });
+
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Start Windows psmux worker",
+			teamName: "windows-generic-psmux-team",
+			cwd: cleanupRoot,
+			platform: "win32",
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				PATH: process.env.PATH ?? "",
+				GJC_TEAM_WORKER_COMMAND: "true",
+				GJC_TEAM_TMUX_COMMAND: fakePsmux,
+			},
+		});
+
+		const workerPath = snapshot.workers[0]?.worktree_path ?? "";
+		expect(workerPath.startsWith(getWorktreesDir())).toBe(true);
+		expect(workerPath).toContain("team-");
+		expect(workerPath).toContain("worker-1");
+		expect(workerPath).not.toContain("_session-test-session");
+		expect(workerPath).not.toContain(`${path.sep}state${path.sep}team${path.sep}`);
+
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("split-window -h -t %1 -d -P -F #{pane_id} -c ");
+		expect(tmuxLog).toContain("send-keys -l -t %2");
 	});
 	it("distributes explicit markdown lane sections into worker-owned initial tasks", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
@@ -2172,6 +2342,185 @@ describe("native gjc team runtime", () => {
 		expect(notifications.delivery_states[0]).toBe("acknowledged");
 	});
 
+	it("routes team mailbox notifications through the configured transport seam", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const delivered: Array<{ teamName: string; messageId: string; body: string }> = [];
+		await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: "Notification transport seam",
+			teamName: "transport-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+			mailboxDeliveryTransport: {
+				async deliverMailboxMessage(input) {
+					delivered.push({
+						teamName: input.team_name,
+						messageId: input.message.message_id,
+						body: input.message.body,
+					});
+					return { transport: "sdk", state: "sent", reason: "test-sdk" };
+				},
+			},
+		});
+
+		const message = await sendGjcTeamMessage(
+			"transport-team",
+			"worker-1",
+			"worker-2",
+			"hello through sdk seam",
+			cleanupRoot,
+			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+			"transport-key",
+		);
+		const duplicate = await sendGjcTeamMessage(
+			"transport-team",
+			"worker-1",
+			"worker-2",
+			"hello through sdk seam",
+			cleanupRoot,
+			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+			"transport-key",
+		);
+		const notifications = (await executeGjcTeamApiOperation(
+			"notification-list",
+			{ team_name: "transport-team" },
+			cleanupRoot,
+			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+		)) as { delivery_states: string[]; notification_ids: string[] };
+
+		expect(duplicate.message_id).toBe(message.message_id);
+		expect(delivered).toEqual([
+			{ teamName: "transport-team", messageId: message.message_id, body: "hello through sdk seam" },
+		]);
+		expect(notifications.delivery_states).toEqual(["sent"]);
+	});
+
+	it("falls back to pane delivery when the configured mailbox transport is unavailable", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: "Notification transport fallback",
+			teamName: "transport-fallback-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+		});
+		resetMailboxTransport = setGjcTeamMailboxDeliveryTransportForTest({
+			async deliverMailboxMessage() {
+				throw new Error("sdk unavailable");
+			},
+		});
+
+		await sendGjcTeamMessage("transport-fallback-team", "worker-1", "worker-2", "fallback please", cleanupRoot, {
+			PATH: "",
+			GJC_SESSION_ID: TEST_SESSION_ID,
+		});
+		const notifications = (await executeGjcTeamApiOperation(
+			"notification-list",
+			{ team_name: "transport-fallback-team" },
+			cleanupRoot,
+			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+		)) as { delivery_states: string[] };
+
+		expect(notifications.delivery_states).toEqual(["sent"]);
+	});
+
+	it("does not redeliver idempotent duplicates for queued or deferred transport records", async () => {
+		for (const state of ["queued", "deferred"] as const) {
+			cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+			await startGjcTeam({
+				workerCount: 2,
+				agentType: "executor",
+				task: `Notification transport ${state} duplicate guard`,
+				teamName: `transport-${state}-team`,
+				cwd: cleanupRoot,
+				dryRun: true,
+				env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+			});
+			let attempts = 0;
+			resetMailboxTransport = setGjcTeamMailboxDeliveryTransportForTest({
+				async deliverMailboxMessage() {
+					attempts += 1;
+					return { transport: "sdk", state, reason: `test-sdk-${state}` };
+				},
+			});
+
+			const message = await sendGjcTeamMessage(
+				`transport-${state}-team`,
+				"worker-1",
+				"worker-2",
+				`hello ${state}`,
+				cleanupRoot,
+				{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+				`transport-${state}-key`,
+			);
+			const duplicate = await sendGjcTeamMessage(
+				`transport-${state}-team`,
+				"worker-1",
+				"worker-2",
+				`hello ${state}`,
+				cleanupRoot,
+				{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+				`transport-${state}-key`,
+			);
+			const notifications = (await executeGjcTeamApiOperation(
+				"notification-list",
+				{ team_name: `transport-${state}-team` },
+				cleanupRoot,
+				{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+			)) as { delivery_states: string[] };
+
+			expect(duplicate.message_id).toBe(message.message_id);
+			expect(attempts).toBe(1);
+			expect(notifications.delivery_states).toEqual([state]);
+			resetMailboxTransport?.();
+			resetMailboxTransport = undefined;
+			await fs.rm(cleanupRoot, { recursive: true, force: true });
+			cleanupRoot = undefined;
+		}
+	});
+
+	it("falls back to pane delivery when the configured mailbox transport returns failed", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: "Notification transport explicit failure fallback",
+			teamName: "transport-failed-fallback-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: { GJC_SESSION_ID: TEST_SESSION_ID, PATH: "" },
+		});
+		let attempts = 0;
+		resetMailboxTransport = setGjcTeamMailboxDeliveryTransportForTest({
+			async deliverMailboxMessage() {
+				attempts += 1;
+				return { transport: "sdk", state: "failed", reason: "test-sdk-failed" };
+			},
+		});
+
+		await sendGjcTeamMessage(
+			"transport-failed-fallback-team",
+			"worker-1",
+			"worker-2",
+			"fallback after explicit failure",
+			cleanupRoot,
+			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+		);
+		const notifications = (await executeGjcTeamApiOperation(
+			"notification-list",
+			{ team_name: "transport-failed-fallback-team" },
+			cleanupRoot,
+			{ PATH: "", GJC_SESSION_ID: TEST_SESSION_ID },
+		)) as { delivery_states: string[] };
+
+		expect(attempts).toBe(1);
+		expect(notifications.delivery_states).toEqual(["sent"]);
+	});
+
 	it("rejects path-like worker ids and reports lifecycle nudges without automatic worker action", async () => {
 		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
 		await startGjcTeam({
@@ -2265,9 +2614,19 @@ describe("native gjc team runtime", () => {
 	it("checkpoint classification excludes GJC runtime paths from worker auto-commits", async () => {
 		const protectedTeamPath = `.gjc/_session-${TEST_SESSION_ID}/state/team/demo/worker.json`;
 		const protectedReportPath = `.gjc/_session-${TEST_SESSION_ID}/reports/team-commit-hygiene/demo.ledger.json`;
-		expect(classifyGjcTeamCheckpointFiles(["src/feature.ts", protectedTeamPath, protectedReportPath])).toEqual({
+		const protectedGatePath = `.gjc/_session-${TEST_SESSION_ID}/extragoal/gate-1.md`;
+		const protectedActivityPath = `.gjc/_session-${TEST_SESSION_ID}/.session-activity.json`;
+		expect(
+			classifyGjcTeamCheckpointFiles([
+				"src/feature.ts",
+				protectedTeamPath,
+				protectedReportPath,
+				protectedGatePath,
+				protectedActivityPath,
+			]),
+		).toEqual({
 			eligible: ["src/feature.ts"],
-			protected: [protectedTeamPath, protectedReportPath],
+			protected: [protectedTeamPath, protectedReportPath, protectedGatePath, protectedActivityPath],
 		});
 
 		cleanupRoot = await createGitRepo();
@@ -2789,49 +3148,77 @@ describe("buildWorkerCommand prompt normalization", () => {
 	});
 });
 
-describe("resolveGjcWorkerCommand bun prefix for script entrypoints", () => {
-	const origArgv = process.argv;
-	afterEach(() => {
-		process.argv = origArgv;
+describe("resolveGjcWorkerCommand invocation authority", () => {
+	it("reuses a real standalone executable from the invocation on POSIX and Windows", () => {
+		expect(
+			resolveGjcWorkerCommand("/repo", {}, "linux", ["/opt/gjc/gjc", "/$bunfs/root/gjc-linux-x64"], "/$bunfs/exec"),
+		).toBe("'/opt/gjc/gjc'");
+		expect(
+			resolveGjcWorkerCommand(
+				"C:\\repo",
+				{},
+				"win32",
+				["B:\\~BUN\\bun.exe", "\\$bunfs\\root\\gjc-windows-x64.exe"],
+				"C:\\Program Files\\GJC\\gjc.exe",
+			),
+		).toBe("'C:\\Program Files\\GJC\\gjc.exe'");
 	});
 
-	it("prepends the bun runtime when argv[1] ends in .js", async () => {
-		process.argv = ["C:\\Users\\withfox\\.bun\\bin\\bun.exe", "C:\\repo\\packages\\coding-agent\\bin\\gjc.js"];
-		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		// Pass win32 + a Windows-shaped execPath explicitly: the bun-prefix
-		// invariant is Windows-only — on POSIX a bare `node bin/gjc.js` works
-		// because node IS the script interpreter, so the prefix would be
-		// redundant noise. The execPath override keeps the test assertion
-		// stable across POSIX runners (which have a bare `bun`, no `.exe`).
-		const out = resolveGjcWorkerCommand(
+	it("preserves the exact source runtime and script argv", () => {
+		expect(
+			resolveGjcWorkerCommand(
+				"C:\\repo",
+				{},
+				"win32",
+				["C:\\Program Files\\Bun\\bun.exe", ".\\packages\\coding-agent\\src\\cli.ts"],
+				"C:\\different\\bun.exe",
+			),
+		).toBe("'C:\\Program Files\\Bun\\bun.exe' 'C:\\repo\\packages\\coding-agent\\src\\cli.ts'");
+		expect(
+			resolveGjcWorkerCommand(
+				"/repo",
+				{},
+				"linux",
+				["/opt/bun/bin/bun", "./packages/coding-agent/src/cli.ts"],
+				"/different/bun",
+			),
+		).toBe("'/opt/bun/bin/bun' '/repo/packages/coding-agent/src/cli.ts'");
+	});
+
+	it("rejects a different GJC discovered only through PATH", () => {
+		expect(() =>
+			resolveGjcWorkerCommand(
+				"/repo",
+				{ PATH: "/different-gjc/bin" },
+				"linux",
+				["/$bunfs/root/gjc", "/$bunfs/root/gjc-linux-x64"],
+				"/$bunfs/exec",
+			),
+		).toThrow("Unable to determine the GJC worker executable");
+	});
+
+	it("fails closed with actionable guidance when only Bun virtual paths exist", () => {
+		expect(() =>
+			resolveGjcWorkerCommand(
+				"C:\\repo",
+				{},
+				"win32",
+				["B:\\~BUN\\bun.exe", "\\$bunfs\\root\\gjc-windows-x64.exe"],
+				"B:\\~BUN\\exec",
+			),
+		).toThrow("Set GJC_TEAM_WORKER_COMMAND");
+	});
+
+	it("never emits Bun virtual paths into a PowerShell worker command", () => {
+		const command = resolveGjcWorkerCommand(
 			"C:\\repo",
-			process.env,
+			{},
 			"win32",
-			process.argv,
-			"C:\\Users\\withfox\\.bun\\bin\\bun.exe",
+			["B:\\~BUN\\bun.exe", "\\$bunfs\\root\\gjc-windows-x64.exe"],
+			"C:\\Program Files\\GJC\\gjc.exe",
 		);
-		// Result must reference bun.exe AND the original .js path; without
-		// the bun prefix, Windows would dispatch the .js file through the
-		// .js file association (cscript.exe), which fails immediately with
-		// a Windows Script Host JScript error dialog.
-		expect(out).toContain("bun.exe");
-		expect(out).toContain("bin\\gjc.js");
-		expect(out.indexOf("bun.exe")).toBeLessThan(out.indexOf("gjc.js"));
-	});
 
-	it("prepends the bun runtime when argv[1] ends in .mjs", async () => {
-		process.argv = ["bun", "/repo/packages/coding-agent/src/cli.mjs"];
-		const { resolveGjcWorkerCommand } = await import("../../src/gjc-runtime/team-runtime");
-		// pass win32 + a Windows-shaped execPath explicitly so the test is
-		// portable across POSIX runners (which have a bare `bun`, no `.exe`).
-		const out = resolveGjcWorkerCommand(
-			"/repo",
-			process.env,
-			"win32",
-			process.argv,
-			"C:\\Users\\withfox\\.bun\\bin\\bun.exe",
-		);
-		expect(out).toContain("bun");
-		expect(out).toContain("cli.mjs");
+		expect(command).toBe("'C:\\Program Files\\GJC\\gjc.exe'");
+		expect(command).not.toMatch(/B:\/~BUN|B:\\~BUN|\/\$bunfs|\\\$bunfs/i);
 	});
 });

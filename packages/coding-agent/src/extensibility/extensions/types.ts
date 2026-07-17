@@ -7,6 +7,7 @@
  * - Register commands, keyboard shortcuts, and CLI flags
  * - Interact with the user via UI primitives
  */
+
 import type { AgentMessage, AgentToolResult, AgentToolUpdateCallback, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionResult } from "@gajae-code/agent-core/compaction";
 import type {
@@ -20,7 +21,9 @@ import type {
 	SimpleStreamOptions,
 	Static,
 	TextContent,
+	Tool,
 	TSchema,
+	UsageReport,
 } from "@gajae-code/ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
 import type * as piCodingAgent from "@gajae-code/coding-agent";
@@ -32,8 +35,13 @@ import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { CustomEditor } from "../../modes/components/custom-editor";
-import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/unattended-session";
+import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
+import type {
+	ClientBridgePermissionOption,
+	ClientBridgePermissionOutcome,
+	ClientBridgePermissionToolCall,
+} from "../../session/client-bridge";
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type {
@@ -114,7 +122,7 @@ export interface ExtensionUIDialogOptions {
 	/**
 	 * For interactive TUI select dialogs, render the focused option across
 	 * multiple rows instead of truncating it. This is a select-only rendering
-	 * hint; non-TUI bridges (RPC, ACP) drop it and do not serialize it.
+	 * hint; non-TUI clients (SDK, ACP) drop it and do not serialize it.
 	 */
 	wrapFocused?: boolean;
 	/**
@@ -128,7 +136,7 @@ export interface ExtensionUIDialogOptions {
 	 * inline: selecting it keeps the title and option list on screen and opens
 	 * a free-text input below the list. Submitting calls `onSubmit` with the
 	 * typed text and resolves the select with `optionLabel`; Escape returns to
-	 * option selection. Non-TUI bridges (RPC, ACP) drop it; callers must keep
+	 * option selection. Non-TUI clients (SDK, ACP) drop it; callers must keep
 	 * a fallback path for selects that resolve `optionLabel` without invoking
 	 * `onSubmit`.
 	 */
@@ -164,7 +172,7 @@ export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | un
 
 /**
  * UI context for extensions to request interactive UI.
- * Each mode (interactive, RPC, print) provides its own implementation.
+ * Interactive, SDK, and headless callers provide their own implementation.
  */
 // fallow-ignore-next-line code-duplication
 // Parallel to HookUIContext: extensions expose a strictly larger UI surface
@@ -264,7 +272,11 @@ export interface ExtensionUIContext {
 	/** Get current tool output expansion state. */
 	getToolsExpanded(): boolean;
 
-	/** Set tool output expansion state. */
+	/**
+	 * Set tool output expansion state. This is an explicit fold choice, pinning
+	 * existing tool and read components for their renderer instance lifetime,
+	 * the same as the user shortcut.
+	 */
 	setToolsExpanded(expanded: boolean): void;
 }
 
@@ -272,12 +284,22 @@ export interface ExtensionUIContext {
 // Extension Context
 // ============================================================================
 
+export interface ExtensionTranscriptEntry {
+	id: string;
+	role: string;
+	textSummary: string;
+	ts: string;
+	body?: string;
+}
+
 export interface ContextUsage {
-	/** Estimated context tokens, or null if unknown (e.g. right after compaction, before next LLM response). */
+	/** Context tokens, or null if unknown (e.g. right after compaction, before next LLM response). */
 	tokens: number | null;
 	contextWindow: number;
 	/** Context usage as percentage of context window, or null if tokens is unknown. */
 	percent: number | null;
+	/** Provenance: "provider_anchor" = anchored on provider-reported usage (+ heuristic trailing delta); "heuristic" = no provider anchor available, full estimate; "unknown" = post-compaction, no post-compaction provider response yet. */
+	source: "provider_anchor" | "heuristic" | "unknown";
 }
 
 export interface CompactOptions {
@@ -307,7 +329,7 @@ export interface ExtensionContext {
 	getContextUsage(): ContextUsage | undefined;
 	/** Compact the session context (interactive mode shows UI). */
 	compact(instructionsOrOptions?: string | CompactOptions): Promise<void>;
-	/** Whether UI is available (false in print/RPC mode) */
+	/** Whether an interactive UI is available */
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
@@ -325,17 +347,67 @@ export interface ExtensionContext {
 	abort(): void;
 	/** Whether there are queued messages waiting */
 	hasPendingMessages(): boolean;
+	/** Typed pending-message counts per queue (steering, follow-up, next-turn). */
+	getPendingMessageCounts(): { steering: number; followUp: number; nextTurn: number };
+	/** Read-only session data exposed to extensions and the SDK host. */
+	getTranscript(): ExtensionTranscriptEntry[];
+	getTranscriptBody(entryId: string): string | undefined;
+	getGoalState(): unknown;
+	getTodoState(): unknown;
+	getQueuedMessages(): unknown[];
+	getActiveTools(): string[];
+	getAllTools(): string[];
+	/** Resolve display-safe metadata for a configured tool without exposing its implementation. */
+	resolveTool(name: string): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
+	/** Session control seams used by the SDK host. */
+	cycleModel(): Promise<{ model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined>;
+	cycleThinkingLevel(): ThinkingLevel | undefined;
+	setQueueMode(kind: "steering" | "follow_up" | "interrupt", mode: unknown): boolean;
+	getSkillState(): unknown;
+	getConfigItems(): unknown;
+	getBranchCandidates(): unknown;
+	getExtensions(): unknown;
+	getArtifact(id: string): Uint8Array | string | undefined | Promise<Uint8Array | string | undefined>;
+	getArtifactRange?(
+		id: string,
+		offset: number,
+		length: number,
+	):
+		| { bytes: Uint8Array; totalBytes: number }
+		| undefined
+		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
+
+	getJobs(): unknown;
+	/** Typed skill and mode controls exposed to the SDK host. */
+	invokeSkill?(name: string, args?: string): Promise<unknown>;
+	setPlanMode?(on: boolean): unknown;
+	operateGoal?(op: "create" | "get" | "resume" | "pause" | "complete" | "drop", objective?: string): Promise<unknown>;
+
+	/** Typed nonvisual session controls exposed to the SDK host. */
+	sdkControl?(operation: string, input: Record<string, unknown>): unknown | Promise<unknown>;
+	/** Install a permission callback backed by a live SDK reverse provider lease. */
+	setSdkPermissionProvider?(
+		provider:
+			| ((
+					toolCall: ClientBridgePermissionToolCall,
+					options: ClientBridgePermissionOption[],
+					signal?: AbortSignal,
+			  ) => Promise<ClientBridgePermissionOutcome>)
+			| undefined,
+	): void;
+	/** Names of session SDK seams actually installed by the active runtime. */
+	sdkBindings?(): readonly string[];
+
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string[];
 	/** @deprecated Use hasPendingMessages() instead */
 	hasQueuedMessages(): boolean;
-	/**
-	 * Unattended workflow-gate bridge. Present only when the session runs in
-	 * unattended/RPC mode; `undefined` in interactive/TUI mode (notify-only).
-	 */
+	/** SDK workflow-gate bridge, when a session has a remote gate responder. */
 	workflowGate?: WorkflowGateEmitter;
+	/** Clear the active conversation while preserving the saved session identity. */
+	clearContext(): Promise<boolean>;
 }
 
 /**
@@ -524,6 +596,26 @@ export interface MessageUpdateEvent {
 	assistantMessageEvent: AssistantMessageEvent;
 }
 
+export interface ReasoningSummaryStartEvent {
+	type: "reasoning_summary_start";
+	message: AgentMessage;
+	contentIndex: number;
+}
+
+export interface ReasoningSummaryDeltaEvent {
+	type: "reasoning_summary_delta";
+	message: AgentMessage;
+	contentIndex: number;
+	delta: string;
+}
+
+export interface ReasoningSummaryEndEvent {
+	type: "reasoning_summary_end";
+	message: AgentMessage;
+	contentIndex: number;
+	content: string;
+}
+
 /** Fired when a message ends */
 export interface MessageEndEvent {
 	type: "message_end";
@@ -609,12 +701,12 @@ export interface UserPythonEvent {
 // Input Events
 // ============================================================================
 
-/** Fired when the user submits input (interactive mode only). */
+/** Fired when input enters through an interactive, SDK, or extension source. */
 export interface InputEvent {
 	type: "input";
 	text: string;
 	images?: ImageContent[];
-	source: "interactive" | "rpc" | "extension";
+	source: "interactive" | "sdk" | "extension";
 }
 
 // ============================================================================
@@ -773,6 +865,9 @@ export type ExtensionEvent =
 	| MessageStartEvent
 	| MessageUpdateEvent
 	| MessageEndEvent
+	| ReasoningSummaryStartEvent
+	| ReasoningSummaryDeltaEvent
+	| ReasoningSummaryEndEvent
 	| ToolExecutionStartEvent
 	| ToolExecutionUpdateEvent
 	| ToolExecutionEndEvent
@@ -934,6 +1029,9 @@ export interface ExtensionAPI {
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;
 	on(event: "message_update", handler: ExtensionHandler<MessageUpdateEvent>): void;
+	on(event: "reasoning_summary_start", handler: ExtensionHandler<ReasoningSummaryStartEvent>): void;
+	on(event: "reasoning_summary_delta", handler: ExtensionHandler<ReasoningSummaryDeltaEvent>): void;
+	on(event: "reasoning_summary_end", handler: ExtensionHandler<ReasoningSummaryEndEvent>): void;
 	on(event: "message_end", handler: ExtensionHandler<MessageEndEvent>): void;
 	on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): void;
 	on(event: "tool_execution_update", handler: ExtensionHandler<ToolExecutionUpdateEvent>): void;
@@ -1024,8 +1122,8 @@ export interface ExtensionAPI {
 	/** Send a user message to the agent, or queue it when deliverAs is set. */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp" },
-	): void;
+		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+	): Promise<void>;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
@@ -1038,6 +1136,8 @@ export interface ExtensionAPI {
 
 	/** Get all configured tools (built-in + extension tools). */
 	getAllTools(): string[];
+	/** Resolve display-safe metadata for a configured tool without exposing its implementation. */
+	resolveTool(name: string): Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 
 	/** Set the active tools by name. */
 	setActiveTools(toolNames: string[]): Promise<void>;
@@ -1052,7 +1152,31 @@ export interface ExtensionAPI {
 	getThinkingLevel(): ThinkingLevel | undefined;
 
 	/** Set thinking level for the current session. */
-	setThinkingLevel(level: ThinkingLevel): void;
+	setThinkingLevel(level: ThinkingLevel, persist?: boolean): void;
+
+	/** Get whether thinking output is visible in the current session. */
+	getThinkingVisibility(): "visible" | "hidden";
+
+	/** Set whether thinking output is visible for the current session. */
+	setThinkingVisibility(visibility: "visible" | "hidden", persist?: boolean): void;
+
+	/** Cycle the current model's available thinking levels. */
+	cycleThinkingLevel(): ThinkingLevel | undefined;
+
+	/** Set thinking level from a session or durable global control surface. */
+	setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void>;
+
+	/** Set thinking visibility from a session or durable global control surface. */
+	setThinkingVisibilityForControl(visibility: "visible" | "hidden", persist: boolean): Promise<void>;
+
+	/** Set the model for this session only. Returns false when it is unavailable. */
+	setModelTemporaryForControl(model: Model, expectedSessionId?: string): Promise<boolean>;
+
+	/** Fetch provider usage through the session's canonical provider resolution. */
+	fetchUsageReportsForControl(): Promise<UsageReport[] | null>;
+
+	/** Report whether the current effort follows global config or a session override. */
+	getThinkingScopeForControl(): "session" | "global config";
 
 	/** Get the current session name. */
 	getSessionName(): string | undefined;
@@ -1207,14 +1331,15 @@ export type SendMessageHandler = <T = unknown>(
 
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
-	options?: { deliverAs?: "steer" | "followUp" },
-) => void;
+	options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+) => void | Promise<void>;
 
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
 export type GetActiveToolsHandler = () => string[];
 
 export type GetAllToolsHandler = () => string[];
+export type ResolveToolHandler = (name: string) => Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 
 export type GetCommandsHandler = () => SlashCommandInfo[];
 
@@ -1222,9 +1347,28 @@ export type SetActiveToolsHandler = (toolNames: string[]) => Promise<void>;
 
 export type SetModelHandler = (model: Model) => Promise<boolean>;
 
+export type CycleThinkingLevelHandler = () => ThinkingLevel | undefined;
+
+export type SetThinkingLevelForControlHandler = (level: ThinkingLevel, persist: boolean) => Promise<void>;
+
+export type SetThinkingVisibilityForControlHandler = (
+	visibility: "visible" | "hidden",
+	persist: boolean,
+) => Promise<void>;
+
+export type SetModelTemporaryForControlHandler = (model: Model, expectedSessionId?: string) => Promise<boolean>;
+
+export type FetchUsageReportsForControlHandler = () => Promise<UsageReport[] | null>;
+
+export type GetThinkingScopeForControlHandler = () => "session" | "global config";
+
 export type GetThinkingLevelHandler = () => ThinkingLevel | undefined;
 
 export type SetThinkingLevelHandler = (level: ThinkingLevel, persist?: boolean) => void;
+
+export type GetThinkingVisibilityHandler = () => "visible" | "hidden";
+
+export type SetThinkingVisibilityHandler = (visibility: "visible" | "hidden", persist?: boolean) => void;
 
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
@@ -1241,11 +1385,20 @@ export interface ExtensionActions {
 	setLabel: (targetId: string, label: string | undefined) => void;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
+	resolveTool: ResolveToolHandler;
 	setActiveTools: SetActiveToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
+	getThinkingVisibility: GetThinkingVisibilityHandler;
+	setThinkingVisibility: SetThinkingVisibilityHandler;
+	cycleThinkingLevel: CycleThinkingLevelHandler;
+	setThinkingLevelForControl: SetThinkingLevelForControlHandler;
+	setThinkingVisibilityForControl: SetThinkingVisibilityForControlHandler;
+	setModelTemporaryForControl: SetModelTemporaryForControlHandler;
+	fetchUsageReportsForControl: FetchUsageReportsForControlHandler;
+	getThinkingScopeForControl: GetThinkingScopeForControlHandler;
 	getSessionName: () => string | undefined;
 	setSessionName: (name: string) => Promise<void>;
 }
@@ -1256,12 +1409,58 @@ export interface ExtensionContextActions {
 	isIdle: () => boolean;
 	abort: () => void;
 	hasPendingMessages: () => boolean;
+	/** Typed pending-message counts per queue; optional for embedders without a counted queue. */
+	getPendingMessageCounts?: () => { steering: number; followUp: number; nextTurn: number };
+	getTranscript?: () => ExtensionTranscriptEntry[];
+	getTranscriptBody?: (entryId: string) => string | undefined;
+	getGoalState?: () => unknown;
+	getTodoState?: () => unknown;
+	getQueuedMessages?: () => unknown[];
+	getActiveTools?: () => string[];
+	getAllTools?: () => string[];
+	resolveTool?: (name: string) => Pick<Tool, "safeSummary" | "safeSummaryFields"> | undefined;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
-	/** Unattended workflow-gate bridge (present only in unattended/RPC mode). */
+	/** SDK workflow-gate bridge, when a session has a remote gate responder. */
 	getWorkflowGate?: () => WorkflowGateEmitter | undefined;
+	/** Clear the active conversation while preserving the saved session identity. */
+	clearContext?: () => Promise<boolean>;
+	/** Session control and query seams exposed to the per-session SDK host. */
+	cycleModel?: () => Promise<{ model: Model; thinkingLevel: ThinkingLevel | undefined } | undefined>;
+	cycleThinkingLevel?: () => ThinkingLevel | undefined;
+	setQueueMode?: (kind: "steering" | "follow_up" | "interrupt", mode: unknown) => boolean;
+	getSkillState?: () => unknown;
+	getConfigItems?: () => unknown;
+	getBranchCandidates?: () => unknown;
+	getExtensions?: () => unknown;
+	getArtifact?: (id: string) => Uint8Array | string | undefined | Promise<Uint8Array | string | undefined>;
+	getArtifactRange?: (
+		id: string,
+		offset: number,
+		length: number,
+	) =>
+		| { bytes: Uint8Array; totalBytes: number }
+		| undefined
+		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
+	getJobs?: () => unknown;
+	setSdkPermissionProvider?: (
+		provider:
+			| ((
+					toolCall: ClientBridgePermissionToolCall,
+					options: ClientBridgePermissionOption[],
+					signal?: AbortSignal,
+			  ) => Promise<ClientBridgePermissionOutcome>)
+			| undefined,
+	) => void;
+	sdkControl?: (operation: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
+	invokeSkill?: (name: string, args?: string) => Promise<unknown>;
+	setPlanMode?: (on: boolean) => unknown;
+	operateGoal?: (
+		op: "create" | "get" | "resume" | "pause" | "complete" | "drop",
+		objective?: string,
+	) => Promise<unknown>;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

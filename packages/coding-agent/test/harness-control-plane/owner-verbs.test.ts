@@ -5,13 +5,13 @@ import * as path from "node:path";
 import { callEndpoint } from "../../src/harness-control-plane/control-endpoint";
 import type { FinalizeChecks } from "../../src/harness-control-plane/finalize";
 import { RuntimeOwner } from "../../src/harness-control-plane/owner";
-import type { HarnessRpc, RpcStateSnapshot } from "../../src/harness-control-plane/rpc-adapter";
+import type { HarnessSessionTransport, SessionStateSnapshot } from "../../src/harness-control-plane/session-transport";
 import { readEvents, readReceiptIndex, writeSessionState } from "../../src/harness-control-plane/storage";
 import { SESSION_SCHEMA_VERSION, type SessionHandle, type SessionState } from "../../src/harness-control-plane/types";
 
-class FakeRpc implements HarnessRpc {
+class FakeTransport implements HarnessSessionTransport {
 	cursor = 0;
-	async getState(): Promise<RpcStateSnapshot> {
+	async getState(): Promise<SessionStateSnapshot> {
 		return { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 };
 	}
 	eventCursor(): number {
@@ -77,7 +77,7 @@ describe("owner-dispatched recover / validate / operate", () => {
 		owner = new RuntimeOwner({
 			root,
 			sessionId: SID,
-			rpc: new FakeRpc(),
+			transport: new FakeTransport(),
 			finalizeChecks: passingChecks,
 			validationCommands: [{ name: "typecheck", command: "true" }],
 		});
@@ -90,7 +90,7 @@ describe("owner-dispatched recover / validate / operate", () => {
 	});
 
 	it("recover observes + classifies and returns a deterministic decision", async () => {
-		owner = new RuntimeOwner({ root, sessionId: SID, rpc: new FakeRpc() });
+		owner = new RuntimeOwner({ root, sessionId: SID, transport: new FakeTransport() });
 		const info = await owner.start();
 		const res = (await callEndpoint(info.socketPath, { verb: "recover", input: {} })) as Record<string, unknown>;
 		const decision = (res.evidence as Record<string, unknown>).decision as Record<string, unknown>;
@@ -102,7 +102,7 @@ describe("owner-dispatched recover / validate / operate", () => {
 		owner = new RuntimeOwner({
 			root,
 			sessionId: SID,
-			rpc: new FakeRpc(),
+			transport: new FakeTransport(),
 			finalizeChecks: passingChecks,
 			validationCommands: [{ name: "t", command: "true" }],
 		});

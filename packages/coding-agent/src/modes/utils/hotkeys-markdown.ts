@@ -54,6 +54,7 @@ export function buildHotkeysMarkdown(bindings: HotkeysMarkdownBindings): string 
 		`| \`${appKey(bindings, "app.editor.external")}\` | Edit message in external editor |`,
 		`| \`${appKey(bindings, "app.clipboard.pasteImage")}\` | Paste image from clipboard |`,
 		`| \`${appKey(bindings, "app.stt.toggle")}\` | Toggle speech-to-text recording |`,
+		`| \`${appKey(bindings, "app.irc.sidebar.toggle")}\` | Toggle IRC sidebar |`,
 		"| `?` | Show help / shortcuts |",
 		"| `#` | Prompt actions (command-palette style actions) |",
 		"| `/` | Slash commands (try `/help` or `/new`) |",

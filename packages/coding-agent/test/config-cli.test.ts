@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
-import { runConfigCommand } from "../src/cli/config-cli";
+import { inspectConfigFile, runConfigCommand } from "../src/cli/config-cli";
 import { resetSettingsForTest } from "../src/config/settings";
 
 let testAgentDir = "";
@@ -161,6 +161,67 @@ describe("config CLI schema coverage", () => {
 			expect(JSON.stringify(listPayload)).not.toContain(apiSecret);
 		});
 
+		it("redacts non-string secret-like values from get and list JSON loaded from config", async () => {
+			const configPath = path.join(testAgentDir, "config.yml");
+			await Bun.write(
+				configPath,
+				[
+					"auth:",
+					"  broker:",
+					"    token:",
+					"      - broker-token-object-secret-123",
+					"hindsight:",
+					"  apiToken:",
+					"    nested: hindsight-api-token-object-secret-123",
+					"",
+				].join("\n"),
+			);
+			resetSettingsForTest();
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+			await runConfigCommand({ action: "get", key: "auth.broker.token", flags: { json: true } });
+			await runConfigCommand({ action: "list", flags: { json: true } });
+
+			const getPayload = JSON.parse(String(logSpy.mock.calls.at(-2)?.[0])) as { value: unknown };
+			const listPayload = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as Record<string, { value: unknown }>;
+
+			expect(getPayload.value).toBe("<redacted>");
+			expect(listPayload["auth.broker.token"]?.value).toBe("<redacted>");
+			expect(listPayload["hindsight.apiToken"]?.value).toBe("<redacted>");
+			expect(JSON.stringify(getPayload)).not.toContain("broker-token-object-secret-123");
+			expect(JSON.stringify(listPayload)).not.toContain("broker-token-object-secret-123");
+			expect(JSON.stringify(listPayload)).not.toContain("hindsight-api-token-object-secret-123");
+		});
+
+		it("shows non-string secret-like values with the explicit unsafe opt-in", async () => {
+			const configPath = path.join(testAgentDir, "config.yml");
+			await Bun.write(
+				configPath,
+				[
+					"auth:",
+					"  broker:",
+					"    token:",
+					"      - broker-token-array-secret-456",
+					"hindsight:",
+					"  apiToken:",
+					"    nested: hindsight-api-token-object-secret-456",
+					"",
+				].join("\n"),
+			);
+			resetSettingsForTest();
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+			await runConfigCommand({ action: "get", key: "auth.broker.token", flags: { json: true, showSecrets: true } });
+			await runConfigCommand({ action: "list", flags: { json: true, showSecrets: true } });
+
+			const getPayload = JSON.parse(String(logSpy.mock.calls.at(-2)?.[0])) as { value: unknown };
+			const listPayload = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as Record<string, { value: unknown }>;
+
+			expect(getPayload.value).toEqual(["broker-token-array-secret-456"]);
+			expect(listPayload["auth.broker.token"]?.value).toEqual(["broker-token-array-secret-456"]);
+			expect(listPayload["hindsight.apiToken"]?.value).toEqual({ nested: "hindsight-api-token-object-secret-456" });
+		});
+
 		it("keeps non-secret booleans visible while redacting secret-shaped keys in text output", async () => {
 			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 			const secret = "telegram-token-secret-456";
@@ -203,4 +264,23 @@ describe("config CLI schema coverage", () => {
 			expect(getPayload.value).toBe(secret);
 		});
 	});
+});
+
+describe("config doctor", () => {
+	it("reports typoed settings from a fixture config", async () => {
+		const configPath = path.join(testAgentDir, "config.yml");
+		await fs.writeFile(configPath, "compaction:\n  enabled: true\n  enabld: false\n");
+		const report = await inspectConfigFile(configPath);
+		expect(report.unknownKeys).toContain("compaction.enabld");
+	});
+});
+
+it("redacts invalid secret settings in doctor output", async () => {
+	const configPath = path.join(testAgentDir, "config.yml");
+	const secret = "doctor-secret-token";
+	await fs.writeFile(configPath, `notifications:\n  telegram:\n    botToken: [${secret}]\n`);
+
+	const report = await inspectConfigFile(configPath);
+	expect(report.invalidValues).toContainEqual({ path: "notifications.telegram.botToken", value: "<redacted>" });
+	expect(JSON.stringify(report)).not.toContain(secret);
 });

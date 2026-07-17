@@ -1,11 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { AGENT_WIRE_EVENT_TYPES, AGENT_WIRE_PROTOCOL_VERSION } from "../../src/modes/shared/agent-wire/event-contract";
+import * as envelope from "../../src/modes/shared/agent-wire/event-envelope";
 import {
 	AgentWireFrameSequencer,
 	agentSessionEventType,
-	BridgeFrameSequencer,
 	toAgentWireEventFrame,
-	toBridgeEventFrame,
 } from "../../src/modes/shared/agent-wire/event-envelope";
 import { EVENT_FIXTURES } from "./fixtures";
 
@@ -15,14 +14,6 @@ const PINNED_CORRELATED_FRAME_KEYS = [...PINNED_EVENT_FRAME_KEYS, "correlation_i
 
 function sortedKeys(value: object): string[] {
 	return Object.keys(value).sort();
-}
-
-function normalizeVolatileFrameFields(frame: ReturnType<typeof toAgentWireEventFrame>) {
-	return {
-		...frame,
-		frame_id: "<frame-id>",
-		seq: "<seq>",
-	};
 }
 
 describe("canonical agent-wire envelope red-team", () => {
@@ -91,16 +82,13 @@ describe("canonical agent-wire envelope red-team", () => {
 		expect(frames.map(frame => frame.seq)).toEqual(frames.map((_, index) => index + 1));
 	});
 
-	it("keeps Bridge* exports as identical aliases of canonical builders", () => {
-		expect(BridgeFrameSequencer).toBe(AgentWireFrameSequencer);
-		expect(toBridgeEventFrame).toBe(toAgentWireEventFrame);
+	it("does not resurrect the removed Bridge* compatibility aliases", () => {
+		expect("BridgeFrameSequencer" in envelope).toBe(false);
+		expect("toBridgeEventFrame" in envelope).toBe(false);
 
 		const canonical = toAgentWireEventFrame(EVENT_FIXTURES.notice, new AgentWireFrameSequencer("alias-session"));
-		const bridge = toBridgeEventFrame(EVENT_FIXTURES.notice, new BridgeFrameSequencer("alias-session"));
-
-		expect(normalizeVolatileFrameFields(bridge)).toEqual(normalizeVolatileFrameFields(canonical));
-		expect(sortedKeys(bridge)).toEqual(PINNED_EVENT_FRAME_KEYS);
-		expect(sortedKeys(bridge.payload)).toEqual(PINNED_EVENT_PAYLOAD_KEYS);
+		expect(sortedKeys(canonical)).toEqual(PINNED_EVENT_FRAME_KEYS);
+		expect(sortedKeys(canonical.payload)).toEqual(PINNED_EVENT_PAYLOAD_KEYS);
 	});
 
 	it("preserves payload event references and derives payload event_type for every registered event", () => {

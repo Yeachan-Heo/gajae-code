@@ -1,0 +1,12 @@
+{
+	"schemaVersion": 1,
+	"kind": "cli-replay",
+	"replaySafe": true,
+	"command": ["git", "status", "--porcelain"],
+	"cwd": ".",
+	"env": { "LC_ALL": "C" },
+	"timeoutMs": 30000,
+	"expectedExitCode": 0,
+	"recordedStdout": "",
+	"recordedStderr": ""
+}

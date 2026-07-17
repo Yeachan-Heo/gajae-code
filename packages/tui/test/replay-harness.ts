@@ -42,6 +42,7 @@ export interface ReplayResult {
 	finalViewport: string[];
 	scrollback: string[];
 	writeCount: number;
+	writeLog: string[];
 	turns: number;
 	/** Perceived-latency metrics (advisory wall-clock proxy, never CPU self-time). */
 	latency: ReplayLatencyMetrics;
@@ -294,7 +295,7 @@ export async function runReplay(fixture: ReplayFixture, opts: ReplayOptions = {}
 		evidenceClass: "wall-clock-proxy",
 	};
 
-	return { metrics, finalViewport, scrollback, writeCount, turns: turnIndex, latency };
+	return { metrics, finalViewport, scrollback, writeCount, writeLog: term.getWriteLog(), turns: turnIndex, latency };
 }
 
 /**

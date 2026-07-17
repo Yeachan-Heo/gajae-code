@@ -7,16 +7,14 @@
  *  - ultragoal execution sign-off -> `workflow_gate` { kind: "execution" } whose
  *    answer is approve / decline (+ optional reason).
  *
- * Gates remain mandatory; the external agent substitutes for the human at the
- * answer boundary only. Declining / requesting changes is honored and is NEVER
- * silently treated as approval.
+ * Gates remain mandatory; the remote SDK client answers at the gate boundary.
+ * Declining / requesting changes is honored and is NEVER silently treated as approval.
  *
- * This is the pure mapping primitive; routing ralplan/ultragoal through it when
- * an unattended controller + gate broker are attached is wired with the transport
- * in #321 and exercised end-to-end by #323.
+ * This is the pure mapping primitive used by SDK-native workflow gate emitters.
  */
-import type { RpcJsonSchema, RpcWorkflowGateContext } from "../../rpc/rpc-types";
+
 import type { OpenGateInput } from "./workflow-gate-broker";
+import type { JsonSchema, WorkflowGateContext } from "./workflow-gate-types";
 
 export type ApprovalDecision = "approve" | "request-changes" | "reject";
 export type ExecutionDecision = "approve" | "decline";
@@ -57,8 +55,8 @@ const APPROVAL_DECISIONS: ApprovalDecision[] = ["approve", "request-changes", "r
 const EXECUTION_DECISIONS: ExecutionDecision[] = ["approve", "decline"];
 
 /** Build the ralplan `pending approval` -> `workflow_gate { kind: "approval" }` open-input. */
-export function approvalGate(context: RpcWorkflowGateContext = {}): OpenGateInput {
-	const schema: RpcJsonSchema = {
+export function approvalGate(context: WorkflowGateContext = {}): OpenGateInput {
+	const schema: JsonSchema = {
 		type: "object",
 		properties: {
 			decision: { type: "string", enum: APPROVAL_DECISIONS },
@@ -77,8 +75,8 @@ export function approvalGate(context: RpcWorkflowGateContext = {}): OpenGateInpu
 }
 
 /** Build the ultragoal execution sign-off -> `workflow_gate { kind: "execution" }` open-input. */
-export function executionGate(context: RpcWorkflowGateContext = {}): OpenGateInput {
-	const schema: RpcJsonSchema = {
+export function executionGate(context: WorkflowGateContext = {}): OpenGateInput {
+	const schema: JsonSchema = {
 		type: "object",
 		properties: {
 			decision: { type: "string", enum: EXECUTION_DECISIONS },

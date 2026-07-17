@@ -68,11 +68,11 @@ describe("Sakana Fugu provider support", () => {
 			const authStorage = new AuthStorage(store);
 			await authStorage.login("fugu", {
 				onAuth: info => {
-					expect(info.url).toBe("https://fugu.sakana.ai/");
+					expect(info.url).toBe("https://console.sakana.ai/api-keys");
 				},
 				onPrompt: async prompt => {
 					expect(prompt.message).toContain("Sakana Fugu");
-					return " fugu-test-key ";
+					return " fish-test-key ";
 				},
 			});
 
@@ -80,10 +80,10 @@ describe("Sakana Fugu provider support", () => {
 				"https://api.sakana.ai/v1/models",
 				expect.objectContaining({
 					method: "GET",
-					headers: { Authorization: "Bearer fugu-test-key" },
+					headers: { Authorization: "Bearer fish-test-key" },
 				}),
 			);
-			expect(await authStorage.getApiKey("fugu")).toBe("fugu-test-key");
+			expect(await authStorage.getApiKey("fugu")).toBe("fish-test-key");
 		} finally {
 			store.close();
 			await fs.rm(tempDir, { recursive: true, force: true });

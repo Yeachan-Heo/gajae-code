@@ -1,6 +1,5 @@
-import { Container, type SelectItem, SelectList } from "@gajae-code/tui";
-import { getSelectListTheme } from "../../modes/theme/theme";
-import { DynamicBorder } from "./dynamic-border";
+import { Container, type SelectItem, type SelectList } from "@gajae-code/tui";
+import { FramedSelect } from "./chrome";
 
 /**
  * Component that renders a theme selector.
@@ -27,34 +26,15 @@ export class ThemeSelectorComponent extends Container {
 			description: name === currentTheme ? "(current)" : undefined,
 		}));
 
-		// Add top border
-		this.addChild(new DynamicBorder());
-
-		// Create selector
-		this.#selectList = new SelectList(themeItems, 10, getSelectListTheme());
-
-		// Preselect current theme
-		const currentIndex = themes.indexOf(currentTheme);
-		if (currentIndex !== -1) {
-			this.#selectList.setSelectedIndex(currentIndex);
-		}
-
-		this.#selectList.onSelect = item => {
-			onSelect(item.value);
-		};
-
-		this.#selectList.onCancel = () => {
-			onCancel();
-		};
-
-		this.#selectList.onSelectionChange = item => {
-			this.#onPreview(item.value);
-		};
-
-		this.addChild(this.#selectList);
-
-		// Add bottom border
-		this.addChild(new DynamicBorder());
+		const framed = FramedSelect("Select theme", themeItems, {
+			maxVisible: 10,
+			selectedValue: currentTheme,
+			onSelect: item => onSelect(item.value),
+			onCancel,
+			onSelectionChange: item => this.#onPreview(item.value),
+		});
+		this.#selectList = framed.selectList;
+		this.addChild(framed.container);
 	}
 
 	getSelectList(): SelectList {

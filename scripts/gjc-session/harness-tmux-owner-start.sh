@@ -6,7 +6,7 @@ usage() {
 Usage: harness-tmux-owner-start.sh <session-name> <workspace> [issue-or-pr] [branch-label] [base]
 
 Starts a GJC harness control-plane session with its RuntimeOwner resident inside tmux.
-Use this for harness/RPC dogfooding when the owner process must remain operator-visible.
+Use this for SDK/harness ownership debugging when the owner process must remain operator-visible.
 
 Env:
   GJC_HARNESS_STATE_ROOT  default: ~/.local/state/gjc-harness-tmux/<session-name>
@@ -62,10 +62,8 @@ input="$(node -e 'const [workspace, branch, base, issueOrPr, sessionId] = proces
 ) >"/tmp/${session_name}.gjc-start.json"
 
 tmux kill-session -t "$session_name" 2>/dev/null || true
-tmux new-session -d -s "$session_name" -n owner
-cmd="cd '$workspace' && export GJC_HARNESS_STATE_ROOT='$root' && echo 'GJC tmux owner starting: $sid' && gjc harness __owner --session '$sid'"
-tmux send-keys -t "$session_name":0.0 -l -- "$cmd"
-tmux send-keys -t "$session_name":0.0 Enter
+printf -v owner_command '%q ' env "GJC_HARNESS_STATE_ROOT=$root" gjc harness __owner --session "$sid"
+tmux new-session -d -s "$session_name" -n owner -c "$workspace" "exec $owner_command"
 
 for _ in $(seq 1 30); do
   if GJC_HARNESS_STATE_ROOT="$root" gjc harness observe --session "$sid" --json >"/tmp/${session_name}.gjc-observe.json" 2>/dev/null; then
@@ -79,4 +77,4 @@ done
 cat "/tmp/${session_name}.gjc-start.json"
 cat "/tmp/${session_name}.gjc-observe.json"
 printf '\nSESSION_ID=%s\nSTATE_ROOT=%s\nTMUX_SERVER=default\nTMUX_SESSION=%s\n' "$sid" "$root" "$session_name"
-printf 'MONITOR_CAPTURE=tmux capture-pane -p -J -t %q:0.0 -S -200\n' "$session_name"
+printf 'MACHINE_CONTROL=Coordinator MCP, ACP, or Gajae-Code SDK\n'

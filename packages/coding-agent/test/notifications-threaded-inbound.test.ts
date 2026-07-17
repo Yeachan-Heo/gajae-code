@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { decideThreadedInbound, type ThreadedInboundCtx } from "../src/notifications/threaded-inbound";
+import { decideThreadedInbound, type ThreadedInboundCtx } from "../src/sdk/bus/threaded-inbound";
 
 function ctx(overrides: Partial<ThreadedInboundCtx> = {}): ThreadedInboundCtx {
 	return {

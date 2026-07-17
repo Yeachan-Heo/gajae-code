@@ -3,7 +3,7 @@
  *
  * Extension-facing APIs accept `string | CompactOptions`, but `AgentSession.compact`
  * takes two positional arguments `(instructions, options)`. This helper splits the
- * union so the same adapter can be reused by print-mode, rpc-mode, and the executor.
+ * union so the same adapter can be reused by print, SDK, ACP, and executor callers.
  */
 import type { Model } from "@gajae-code/ai";
 import type { CompactOptions } from "./types";
@@ -24,7 +24,7 @@ export async function runExtensionCompact(
 
 interface SetModelCapableSession {
 	modelRegistry: { getApiKey(model: Model): Promise<string | undefined> };
-	setModel(model: Model): Promise<unknown>;
+	setModel(model: Model, role?: string, options?: { cause?: string }): Promise<unknown>;
 }
 
 /**
@@ -35,6 +35,6 @@ interface SetModelCapableSession {
 export async function runExtensionSetModel(session: SetModelCapableSession, model: Model): Promise<boolean> {
 	const key = await session.modelRegistry.getApiKey(model);
 	if (!key) return false;
-	await session.setModel(model);
+	await session.setModel(model, "default", { cause: "user-selection" });
 	return true;
 }

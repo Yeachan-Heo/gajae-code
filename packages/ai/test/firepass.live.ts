@@ -67,7 +67,7 @@ async function runEffort(label: string, reasoning: "xhigh" | undefined) {
 		}
 	}
 
-	// Cast through the wrapper to defeat tsgo's control-flow narrowing, which assumes
+	// Cast through the wrapper to defeat the compiler's control-flow narrowing, which assumes
 	// `captured.value` is always null because the closure-side mutation is invisible.
 	const snapshot = (captured as { value: CapturedRequest | null }).value;
 	const parsedBody = snapshot?.body ? JSON.parse(snapshot.body) : null;

@@ -5,11 +5,15 @@ import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import type { GoalModeState } from "@gajae-code/coding-agent/goals/state";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 describe("AgentSession active goal reminders", () => {
@@ -50,13 +54,13 @@ describe("AgentSession active goal reminders", () => {
 		tempDir.removeSync();
 	});
 
-	function setActiveGoal(): void {
+	function setActiveGoal(id = "goal-1", objective = "Ship the idle reminder fix"): void {
 		session.setGoalModeState({
 			enabled: true,
 			mode: "active",
 			goal: {
-				id: "goal-1",
-				objective: "Ship the idle reminder fix",
+				id,
+				objective,
 				status: "active",
 				tokensUsed: 0,
 				timeUsedSeconds: 0,
@@ -70,6 +74,7 @@ describe("AgentSession active goal reminders", () => {
 		const assistantMessage = { ...createAssistantMessage("I stopped."), timestamp };
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+		await Bun.sleep(50);
 		for (let i = 0; i < 20; i++) await Promise.resolve();
 		await session.waitForIdle();
 	}
@@ -83,6 +88,53 @@ describe("AgentSession active goal reminders", () => {
 		}).length;
 	}
 
+	it("skips turn-start token baseline scan when goal accounting is inactive", async () => {
+		const statsSpy = vi.spyOn(session, "getSessionStats");
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+
+		expect(statsSpy).not.toHaveBeenCalled();
+	});
+
+	it("captures turn-start token baseline when a goal is active", async () => {
+		setActiveGoal();
+		const statsSpy = vi.spyOn(session, "getSessionStats");
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+
+		expect(statsSpy).toHaveBeenCalled();
+		expect(session.goalRuntime.snapshot.turnSnapshot?.activeGoalId).toBe("goal-1");
+	});
+
+	it("does not reuse an active-goal baseline after goal mode is disabled", async () => {
+		setActiveGoal();
+		const statsSpy = vi.spyOn(session, "getSessionStats");
+
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(statsSpy).toHaveBeenCalledTimes(1);
+
+		session.setGoalModeState({
+			enabled: false,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "Ship the idle reminder fix",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
+		});
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+
+		expect(statsSpy).toHaveBeenCalledTimes(1);
+	});
+
 	it("continues after an assistant stop when an active goal remains uncleared", async () => {
 		setActiveGoal();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
@@ -94,6 +146,87 @@ describe("AgentSession active goal reminders", () => {
 		const reminder = session.agent.state.messages.find(message => message.role === "developer");
 		expect(JSON.stringify(reminder?.content)).toContain("Ship the idle reminder fix");
 		expect(JSON.stringify(reminder?.content)).toContain('goal({op:\\"complete\\"})');
+	});
+
+	it("does not let an abort without an active goal suppress a later goal reminder", async () => {
+		await session.abort();
+		setActiveGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+	});
+
+	it("suppresses only the first reminder after aborting an active goal", async () => {
+		setActiveGoal();
+		await session.abort();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(developerReminderCount()).toBe(0);
+
+		await emitAssistantStop(126);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+	});
+
+	it("clears active-goal abort suppression after an inactive reminder evaluation", async () => {
+		setActiveGoal();
+		await session.abort();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		session.setGoalModeState(undefined);
+		await emitAssistantStop(125);
+		setActiveGoal();
+		await emitAssistantStop(126);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+	});
+
+	it("lets a later inactive abort clear suppression from an earlier active-goal abort", async () => {
+		setActiveGoal();
+		await session.abort();
+		session.setGoalModeState(undefined);
+		await session.abort();
+		setActiveGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+	});
+
+	it("does not transfer abort suppression to a replacement goal", async () => {
+		setActiveGoal("goal-1", "First goal");
+		await session.abort();
+		setActiveGoal("goal-2", "Replacement goal");
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
+		expect(JSON.stringify(session.agent.state.messages.find(message => message.role === "developer"))).toContain(
+			"Replacement goal",
+		);
+	});
+
+	it("clears abort suppression when the aborted goal is paused and re-enabled", async () => {
+		setActiveGoal();
+		await session.abort();
+		await session.goalRuntime.pauseGoal();
+		await session.goalRuntime.resumeGoal();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		await emitAssistantStop(125);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(developerReminderCount()).toBe(1);
 	});
 
 	it("continues after a successful yield when an active goal remains uncleared", async () => {
@@ -186,5 +319,40 @@ describe("AgentSession active goal reminders", () => {
 
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(developerReminderCount()).toBe(0);
+	});
+	it("contains background coordinator state persistence failures without leaking sidecar data", async () => {
+		const stateFile = path.join(tempDir.path(), "corrupt-runtime-state.json");
+		await Bun.write(stateFile, '{"private_payload":"must-not-reach-logs"}');
+		const previousStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const previousSessionId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = session.sessionId;
+		const deliveredEvents: string[] = [];
+		session.subscribe(event => deliveredEvents.push(event.type));
+		let resolveWarning: (() => void) | undefined;
+		const warningLogged = new Promise<void>(resolve => {
+			resolveWarning = resolve;
+		});
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation((message, metadata) => {
+			if (message === "Failed to persist coordinator runtime state" && metadata?.event === "turn_start")
+				resolveWarning?.();
+		});
+
+		try {
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			expect(deliveredEvents).toEqual(["turn_start"]);
+			await Promise.race([
+				warningLogged,
+				Bun.sleep(1_000).then(() => {
+					throw new Error("Timed out waiting for coordinator runtime-state failure containment");
+				}),
+			]);
+			expect(warnSpy).toHaveBeenCalledWith("Failed to persist coordinator runtime state", { event: "turn_start" });
+		} finally {
+			if (previousStateFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = previousStateFile;
+			if (previousSessionId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = previousSessionId;
+		}
 	});
 });

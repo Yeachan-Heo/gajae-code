@@ -19,6 +19,7 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import {
 	createWatchdog,
@@ -35,6 +36,7 @@ import {
 	markToolChoiceIncapability,
 	resolveToolChoice,
 } from "../utils/tool-choice-capability";
+import { wrapOpenAIFetchForBoundedRateLimits } from "./openai-bounded-rate-limits";
 import { normalizeOpenAIResponsesPromptCacheKey, supportsDeveloperRole } from "./openai-responses";
 import {
 	appendResponsesToolResultMessages,
@@ -139,7 +141,10 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			try {
 				openaiStream = await client.responses.create(params, { signal: requestSignal });
 			} catch (error) {
-				if (!isForcedToolChoiceUnsupportedError(error, isForcedAzureResponsesToolChoice(params.tool_choice))) {
+				if (
+					!isForcedToolChoiceUnsupportedError(error, isForcedAzureResponsesToolChoice(params.tool_choice)) ||
+					options?.fallbackManaged
+				) {
 					throw error;
 				}
 				const reason = await finalizeErrorMessage(error, rawRequestDump);
@@ -203,6 +208,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
+			output.transportFailure = transportFailureFacts(error);
 			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
@@ -272,7 +278,7 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 
 	const { baseUrl, apiVersion } = resolveAzureConfig(model, options);
 
-	const baseFetch = options?.fetch ?? fetch;
+	const baseFetch = wrapOpenAIFetchForBoundedRateLimits(options?.fetch ?? fetch, options?.maxRetryDelayMs);
 	const onSseEvent = options?.onSseEvent;
 	return new AzureOpenAI({
 		apiKey,

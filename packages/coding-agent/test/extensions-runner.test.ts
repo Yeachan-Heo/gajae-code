@@ -56,6 +56,35 @@ describe("ExtensionRunner", () => {
 		};
 	};
 
+	describe("safe tool resolver", () => {
+		it("exposes only tool safe-summary metadata through extension context", () => {
+			const safeSummary = (kind: "args" | "result", value: unknown) =>
+				kind === "args" ? `safe:${String(value)}` : undefined;
+			const resolver = vi.fn((name: string) =>
+				name === "safe-tool"
+					? { safeSummary, safeSummaryFields: { args: ["path"], result: ["status"] } }
+					: undefined,
+			);
+			const runner = new ExtensionRunner(
+				[],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize({} as never, { resolveTool: resolver } as never);
+
+			const ctx = runner.createContext();
+			expect(ctx.resolveTool("safe-tool")).toEqual({
+				safeSummary,
+				safeSummaryFields: { args: ["path"], result: ["status"] },
+			});
+			expect(ctx.resolveTool("unknown-tool")).toBeUndefined();
+			expect(resolver).toHaveBeenCalledWith("safe-tool");
+			expect(resolver).toHaveBeenCalledWith("unknown-tool");
+		});
+	});
+
 	describe("shortcut conflicts", () => {
 		it("warns when extension shortcut conflicts with built-in", async () => {
 			const extCode = `
@@ -676,6 +705,121 @@ describe("ExtensionRunner", () => {
 
 			warnSpy.mockRestore();
 		});
+
+		it("does not emit timeout errors for fast handlers", async () => {
+			const extPath = path.join(tempDir.path(), "fast-timeout.ts");
+			fs.writeFileSync(
+				extPath,
+				`
+					export default function(pi) {
+						pi.on("session_start", async () => "ok");
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions([extPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError(err => {
+				errors.push(err);
+			});
+			testSetExtensionHandlerTimeoutMs(10);
+
+			await runner.emit({ type: "session_start" });
+			await Bun.sleep(20);
+
+			expect(warnSpy).not.toHaveBeenCalledWith("Extension handler timed out", expect.any(Object));
+			expect(errors).toEqual([]);
+
+			warnSpy.mockRestore();
+		});
+	});
+
+	describe("system prompt boundary", () => {
+		it("returns a defensive copy so extension mutation cannot touch the live prompt", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("session_start", async (_event, ctx) => {
+						const prompt = ctx.getSystemPrompt();
+						if (prompt[0] !== "base prompt block") {
+							throw new Error("expected the live prompt content");
+						}
+						prompt[0] = "mutated-by-extension";
+						prompt.push("appended-by-extension");
+					});
+				}
+			`;
+			const explicitExtensionPath = path.join(tempDir.path(), "system-prompt-mutation.ts");
+			fs.writeFileSync(explicitExtensionPath, extCode);
+
+			const livePrompt = ["base prompt block", "second block"];
+			const result = await loadTestExtensions([explicitExtensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					resolveTool: () => undefined,
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getThinkingVisibility: () => "visible",
+					setThinkingVisibility: () => {},
+					cycleThinkingLevel: () => undefined,
+					setThinkingLevelForControl: async () => {},
+					setThinkingVisibilityForControl: async () => {},
+					setModelTemporaryForControl: async () => false,
+					fetchUsageReportsForControl: async () => null,
+					getThinkingScopeForControl: () => "global config",
+					getSessionName: () => sessionManager.getSessionName(),
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => livePrompt,
+				},
+			);
+
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError(err => {
+				errors.push(err);
+			});
+
+			await runner.emit({ type: "session_start" });
+
+			expect(errors).toEqual([]);
+			expect(livePrompt).toEqual(["base prompt block", "second block"]);
+
+			// The command context inherits the same defensive-copy getter.
+			const commandPrompt = runner.createCommandContext().getSystemPrompt();
+			commandPrompt[0] = "mutated-via-command-context";
+			expect(livePrompt).toEqual(["base prompt block", "second block"]);
+		});
 	});
 
 	describe("session name API", () => {
@@ -709,11 +853,20 @@ describe("ExtensionRunner", () => {
 					setLabel: () => {},
 					getActiveTools: () => [],
 					getAllTools: () => [],
+					resolveTool: () => undefined,
 					setActiveTools: async () => {},
 					getCommands: () => [],
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
+					getThinkingVisibility: () => "visible",
+					setThinkingVisibility: () => {},
+					cycleThinkingLevel: () => undefined,
+					setThinkingLevelForControl: async () => {},
+					setThinkingVisibilityForControl: async () => {},
+					setModelTemporaryForControl: async () => false,
+					fetchUsageReportsForControl: async () => null,
+					getThinkingScopeForControl: () => "global config",
 					getSessionName: () => sessionManager.getSessionName(),
 					setSessionName: async name => {
 						await sessionManager.setSessionName(name);
@@ -735,6 +888,69 @@ describe("ExtensionRunner", () => {
 
 			expect(sessionManager.getSessionName()).toBe("Named by extension");
 			expect(sessionManager.getHeader()?.title).toBe("Named by extension");
+		});
+
+		it("routes counted pending-message queues through createContext and zero-falls-back when omitted", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("session_start", () => {});
+				}
+			`;
+			const explicitExtensionPath = path.join(tempDir.path(), "pending-counts.ts");
+			fs.writeFileSync(explicitExtensionPath, extCode);
+			const result = await loadTestExtensions([explicitExtensionPath]);
+			const runtimeActions = {
+				sendMessage: () => {},
+				sendUserMessage: () => {},
+				appendEntry: () => {},
+				setLabel: () => {},
+				getActiveTools: () => [],
+				getAllTools: () => [],
+				resolveTool: () => undefined,
+				setActiveTools: async () => {},
+				getCommands: () => [],
+				setModel: async () => false,
+				getThinkingLevel: () => undefined,
+				setThinkingLevel: () => {},
+				getThinkingVisibility: () => "visible" as const,
+				setThinkingVisibility: () => {},
+				cycleThinkingLevel: () => undefined,
+				setThinkingLevelForControl: async () => {},
+				setThinkingVisibilityForControl: async () => {},
+				setModelTemporaryForControl: async () => false,
+				fetchUsageReportsForControl: async () => null,
+				getThinkingScopeForControl: () => "global config" as const,
+				getSessionName: () => undefined,
+				setSessionName: async () => {},
+			};
+			const baseContextActions = {
+				getModel: () => undefined,
+				isIdle: () => true,
+				abort: () => {},
+				hasPendingMessages: () => true,
+				shutdown: () => {},
+				getContextUsage: () => undefined,
+				compact: async () => {},
+				getSystemPrompt: () => [],
+			};
+
+			// Wired: the counted provider is surfaced verbatim on the created context.
+			const wired = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			wired.initialize(runtimeActions, {
+				...baseContextActions,
+				getPendingMessageCounts: () => ({ steering: 2, followUp: 1, nextTurn: 3 }),
+			});
+			expect(wired.createContext().getPendingMessageCounts()).toEqual({ steering: 2, followUp: 1, nextTurn: 3 });
+
+			// Omitted: every initialize applies the explicit zero fallback, never a stale provider.
+			wired.initialize(runtimeActions, baseContextActions);
+			expect(wired.createContext().getPendingMessageCounts()).toEqual({ steering: 0, followUp: 0, nextTurn: 0 });
 		});
 
 		it("keeps session naming unavailable during extension load", async () => {
@@ -774,6 +990,111 @@ describe("ExtensionRunner", () => {
 
 			expect(runner.hasHandlers("tool_call")).toBe(true);
 			expect(runner.hasHandlers("agent_end")).toBe(false);
+		});
+
+		it("returns true for other indexed event types and false when no handlers exist", async () => {
+			let result = await loadTestExtensions();
+			let runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			expect(runner.hasHandlers("before_provider_request")).toBe(false);
+
+			const extCode = `
+				export default function(pi) {
+					pi.on("before_provider_request", async (event) => event.payload);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "before-provider-request-handler.ts"), extCode);
+
+			result = await loadTestExtensions();
+			runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
+
+			expect(runner.hasHandlers("before_provider_request")).toBe(true);
+		});
+
+		it("reports message_update handlers for agent-session fast path predicate", async () => {
+			let result = await loadTestExtensions();
+			let runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			expect(runner.hasHandlers("message_update")).toBe(false);
+
+			const extCode = `
+				export default function(pi) {
+					pi.on("message_update", async () => undefined);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "message-update-handler.ts"), extCode);
+
+			result = await loadTestExtensions();
+			runner = new ExtensionRunner(result.extensions, result.runtime, tempDir.path(), sessionManager, modelRegistry);
+
+			expect(runner.hasHandlers("message_update")).toBe(true);
+		});
+	});
+
+	describe("handler dispatch index", () => {
+		it("returns without creating context when an event has no handlers", async () => {
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const messages = [{ role: "user", content: "hello" }] as Parameters<ExtensionRunner["emitContext"]>[0];
+			const createContextSpy = vi.spyOn(runner, "createContext");
+
+			await expect(runner.emitContext(messages)).resolves.toBe(messages);
+
+			expect(createContextSpy).not.toHaveBeenCalled();
+		});
+
+		it("preserves extension order then handler order within each extension", async () => {
+			const orderPath = path.join(tempDir.path(), "order.json");
+			const extensionCode = (labels: string[]) => `
+				import * as fs from "node:fs";
+
+				export default function(pi) {
+					${labels
+						.map(
+							label => `pi.on("session_start", async () => {
+								const order = fs.existsSync(${JSON.stringify(orderPath)})
+									? JSON.parse(fs.readFileSync(${JSON.stringify(orderPath)}, "utf8"))
+									: [];
+								order.push(${JSON.stringify(label)});
+								fs.writeFileSync(${JSON.stringify(orderPath)}, JSON.stringify(order));
+							});`,
+						)
+						.join("\n")}
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "ordered-a.ts"), extensionCode(["a1", "a2"]));
+			fs.writeFileSync(path.join(extensionsDir, "ordered-b.ts"), extensionCode(["b1", "b2"]));
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			await runner.emit({ type: "session_start" });
+
+			expect(JSON.parse(fs.readFileSync(orderPath, "utf8"))).toEqual(["a1", "a2", "b1", "b2"]);
 		});
 	});
 
@@ -923,11 +1244,20 @@ describe("ExtensionRunner", () => {
 					setLabel: () => {},
 					getActiveTools: () => [],
 					getAllTools: () => [],
+					resolveTool: () => undefined,
 					setActiveTools: async () => {},
 					getCommands: () => [],
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
+					getThinkingVisibility: () => "visible",
+					setThinkingVisibility: () => {},
+					cycleThinkingLevel: () => undefined,
+					setThinkingLevelForControl: async () => {},
+					setThinkingVisibilityForControl: async () => {},
+					setModelTemporaryForControl: async () => false,
+					fetchUsageReportsForControl: async () => null,
+					getThinkingScopeForControl: () => "global config",
 					getSessionName: () => sessionManager.getSessionName(),
 					setSessionName: async () => {},
 				},

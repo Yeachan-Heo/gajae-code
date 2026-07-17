@@ -1,10 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { Browser } from "puppeteer-core";
+import {
+	__resetDeadTabRecoveryForTest,
+	__setDeadTabRecoveryDepsForTest,
+	registerDeadTabRecovery,
+} from "../../src/tools/browser/dead-tab-recovery";
 import type { BrowserHandle, BrowserKindTag } from "../../src/tools/browser/registry";
 import {
 	clearTabsForTest,
 	getTab,
 	listTabsForGc,
+	releaseDeadTabForRecovery,
 	releaseTab,
 	releaseTabIfGcEligible,
 	setTabForTest,
@@ -97,10 +103,12 @@ function installTab(opts: InstallOpts): {
 describe("tab-supervisor GC primitives", () => {
 	beforeEach(() => {
 		clearTabsForTest();
+		__resetDeadTabRecoveryForTest();
 	});
 	afterEach(() => {
 		clearTabsForTest();
 		vi.restoreAllMocks();
+		__resetDeadTabRecoveryForTest();
 	});
 
 	it("evicts an idle headless tab: worker terminated, browser closed, tab removed", async () => {
@@ -124,7 +132,6 @@ describe("tab-supervisor GC primitives", () => {
 		{ label: "in-flight", opts: { name: "a", kindTag: "headless", lastUsedAt: NOW - 5000, pendingCount: 1 } },
 		{ label: "recently used", opts: { name: "a", kindTag: "headless", lastUsedAt: NOW } },
 		{ label: "idle exactly at threshold", opts: { name: "a", kindTag: "headless", lastUsedAt: NOW - IDLE_MS } },
-		{ label: "dead", opts: { name: "a", kindTag: "headless", lastUsedAt: NOW - 5000, state: "dead" } },
 	];
 
 	for (const { label, opts } of protectedCases) {
@@ -153,6 +160,40 @@ describe("tab-supervisor GC primitives", () => {
 		expect(close).toHaveBeenCalledTimes(1);
 		expect(handle.refCount).toBe(0);
 		expect(getTab("a")).toBeUndefined();
+	});
+
+	it("retains a dead tab during its live recovery TTL, then GC releases that exact tab", async () => {
+		let now = NOW;
+		__setDeadTabRecoveryDepsForTest({ now: () => now });
+		const { close } = installTab({ name: "dead", kindTag: "headless", lastUsedAt: NOW - 5000, state: "dead" });
+		const dead = getTab("dead")!;
+		registerDeadTabRecovery("dead", dead.ownerId, { dead }, 100);
+		expect(await releaseTabIfGcEligible("dead", { now: () => now, idleMs: IDLE_MS })).toBe(false);
+		expect(getTab("dead")).toBe(dead);
+		now += 100;
+		expect(await releaseTabIfGcEligible("dead", { now: () => now, idleMs: IDLE_MS })).toBe(true);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(getTab("dead")).toBeUndefined();
+	});
+
+	it("closes an orphaned headless target during ordinary dead-tab release", async () => {
+		const { handle } = installTab({ name: "dead", kindTag: "headless", lastUsedAt: NOW - 5000, state: "dead" });
+		const closeTarget = vi.fn(async () => {});
+		(handle.browser as unknown as { targets(): unknown[] }).targets = () => [
+			{ _targetId: "target-1", page: async () => ({ close: closeTarget }) },
+		];
+		expect(await releaseTab("dead")).toBe(true);
+		expect(closeTarget).toHaveBeenCalledTimes(1);
+	});
+
+	it("exact dead-session release cannot remove a same-name replacement", async () => {
+		const { handle } = installTab({ name: "tab", kindTag: "headless", lastUsedAt: NOW, state: "dead" });
+		const dead = getTab("tab")!;
+		const replacement = { ...dead, state: "alive", releasing: undefined } as TabSession;
+		setTabForTest(replacement);
+		expect(await releaseDeadTabForRecovery("tab", dead, dead.ownerId)).toBe(false);
+		expect(getTab("tab")).toBe(replacement);
+		expect(handle.refCount).toBe(1);
 	});
 
 	it("listTabsForGc reflects live tab fields without exposing the map", () => {

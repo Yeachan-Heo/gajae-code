@@ -57,6 +57,7 @@ describe("memories/storage", () => {
 
 		const claims = claimStage1Jobs(db, {
 			nowSec,
+			cwd: PROJECT_CWD,
 			threadScanLimit: 100,
 			maxRolloutsPerStartup: 10,
 			maxRolloutAgeDays: 30,
@@ -68,6 +69,55 @@ describe("memories/storage", () => {
 		});
 
 		expect(claims.map(claim => claim.threadId)).toEqual(["eligible-thread"]);
+		closeMemoryDb(db);
+	});
+	test("claimStage1Jobs scopes candidates by cwd before applying the scan limit", () => {
+		const db = openMemoryDb(dbPath);
+		const nowSec = 1_800_000_000;
+		const projectACwd = "/repo/a";
+		const projectBCwd = "/repo/b";
+		upsertThreads(db, [
+			{
+				id: "project-a-thread",
+				updatedAt: nowSec - 13 * 60 * 60,
+				rolloutPath: "/tmp/project-a.jsonl",
+				cwd: projectACwd,
+				sourceKind: "cli",
+			},
+			{
+				id: "project-b-thread",
+				updatedAt: nowSec - 12 * 60 * 60,
+				rolloutPath: "/tmp/project-b.jsonl",
+				cwd: projectBCwd,
+				sourceKind: "cli",
+			},
+		]);
+
+		const projectAClaims = claimStage1Jobs(db, {
+			nowSec,
+			cwd: projectACwd,
+			threadScanLimit: 1,
+			maxRolloutsPerStartup: 10,
+			maxRolloutAgeDays: 30,
+			minRolloutIdleHours: 12,
+			leaseSeconds: 120,
+			runningConcurrencyCap: 8,
+			workerId: "test-worker-a",
+		});
+		expect(projectAClaims.map(claim => claim.threadId)).toEqual(["project-a-thread"]);
+
+		const projectBClaims = claimStage1Jobs(db, {
+			nowSec,
+			cwd: projectBCwd,
+			threadScanLimit: 1,
+			maxRolloutsPerStartup: 10,
+			maxRolloutAgeDays: 30,
+			minRolloutIdleHours: 12,
+			leaseSeconds: 120,
+			runningConcurrencyCap: 8,
+			workerId: "test-worker-b",
+		});
+		expect(projectBClaims.map(claim => claim.threadId)).toEqual(["project-b-thread"]);
 		closeMemoryDb(db);
 	});
 

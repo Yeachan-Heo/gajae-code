@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { Browser } from "puppeteer-core";
 import { Settings } from "../../src/config/settings";
 import type { BrowserHandle, BrowserKindTag } from "../../src/tools/browser/registry";
@@ -141,6 +141,10 @@ function registerSession(overrides: Record<string, unknown> = {}): void {
 }
 
 describe("resource GC red-team safety invariants", () => {
+	beforeEach(() => {
+		clearTabsForTest();
+		__resetResourceGcForTest();
+	});
 	afterEach(() => {
 		clearTabsForTest();
 		__resetResourceGcForTest();

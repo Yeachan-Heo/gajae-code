@@ -1,8 +1,9 @@
+import { applyFinalCodexGpt56ContextCap } from "./context-cap-policy";
 import { readModelCache, writeModelCache } from "./model-cache";
+import { isRetiredModel, isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import type { Api, Model, Provider } from "./types";
-import { isRecord } from "./utils";
 
 const DEFAULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
@@ -85,13 +86,20 @@ function passModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 	}
 	const out: Model<TApi>[] = [];
 	for (const item of value) {
-		if (item === null || typeof item !== "object" || typeof (item as { id: unknown }).id !== "string") {
+		if (item === null || typeof item !== "object") {
+			continue;
+		}
+		const candidate = item as { id?: unknown; provider?: unknown };
+		if (typeof candidate.id !== "string") {
+			continue;
+		}
+		if (typeof candidate.provider === "string" && isRetiredModelKey(candidate.provider, candidate.id)) {
 			continue;
 		}
 		out.push(enrichModelThinking(item as Model<TApi>));
 	}
 	applyGeneratedModelPolicies(out as Model<Api>[]);
-	return out;
+	return applyFinalCodexGpt56ContextCap(out);
 }
 
 /**
@@ -154,11 +162,13 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const cacheModels = dynamicFetchSucceeded ? [] : normalizeModelList<TApi>(cache?.models ?? []);
 	const dynamicModels = fetchedDynamicModels ?? [];
 	const mergedWithCache = mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), cacheModels);
-	const models = mergeDynamicModels(mergedWithCache, dynamicModels);
+	const models = applyFinalCodexGpt56ContextCap(mergeDynamicModels(mergedWithCache, dynamicModels));
 	const dynamicAuthoritative = !hasDynamicFetcher || dynamicFetchSucceeded || shouldUseFreshCacheAsAuthoritative;
 	if (shouldFetchFromNetwork) {
 		if (dynamicFetchSucceeded) {
-			const snapshotModels = mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), dynamicModels);
+			const snapshotModels = applyFinalCodexGpt56ContextCap(
+				mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), dynamicModels),
+			);
 			writeModelCache(options.providerId, now(), snapshotModels, true, staticFingerprint, dbPath);
 		} else {
 			// Dynamic fetch failed — update cache with a non-authoritative snapshot so
@@ -167,9 +177,11 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			writeModelCache(
 				options.providerId,
 				now(),
-				mergeDynamicModels(
-					mergeModelSources(staticModels, modelsDevModels),
-					normalizeModelList<TApi>(latestCache?.models ?? cache?.models ?? []),
+				applyFinalCodexGpt56ContextCap(
+					mergeDynamicModels(
+						mergeModelSources(staticModels, modelsDevModels),
+						normalizeModelList<TApi>(latestCache?.models ?? cache?.models ?? []),
+					),
 				),
 				false,
 				staticFingerprint,
@@ -382,11 +394,11 @@ function normalizeModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 	}
 	const models: Model<TApi>[] = [];
 	for (const item of value) {
-		if (isModelLike(item)) {
+		if (isModelLike(item) && !isRetiredModel(item)) {
 			models.push(enrichModelThinking(item as Model<TApi>));
 		}
 	}
-	return models;
+	return applyFinalCodexGpt56ContextCap(models);
 }
 
 function isModelLike(value: unknown): value is Model<Api> {
@@ -439,6 +451,10 @@ function isModelLike(value: unknown): value is Model<Api> {
 		return false;
 	}
 	return true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
 }
 
 function isModelInputArray(value: unknown): value is ("text" | "image")[] {

@@ -5,6 +5,10 @@ import {
 	type ModelLookupRegistry,
 	resolveModelOverrideWithAuthFallback,
 } from "@gajae-code/coding-agent/config/model-resolver";
+import {
+	type ConfiguredFallbackChain,
+	FallbackChainController,
+} from "@gajae-code/coding-agent/session/fallback-chain-controller";
 
 /**
  * Regression test for #985.
@@ -46,6 +50,14 @@ const unauthedTaskModel: Model<Api> = {
 	maxTokens: 8192,
 };
 
+const cursorTaskModel: Model<Api> = {
+	...unauthedTaskModel,
+	id: "cursor-task",
+	name: "Cursor Task",
+	api: "cursor-agent",
+	provider: "cursor",
+};
+
 const sharedModel: Model<Api> = {
 	id: "shared-id",
 	name: "Shared",
@@ -75,6 +87,43 @@ function createMockRegistry(options: MockRegistryOptions): ModelLookupRegistry &
 }
 
 describe("issue #985: subagent dispatch auth fallback", () => {
+	test("uses the parent session's canonical stickiness for bare subagent overrides only", async () => {
+		const registry = {
+			getAvailable: () => [parentModel, unauthedTaskModel],
+			getApiKey: async () => "sk-test-token",
+			resolveCanonicalModel: (canonicalId: string, options?: { sessionId?: string }) => {
+				if (canonicalId !== "task-canonical") return undefined;
+				return options?.sessionId === "parent-session" ? parentModel : unauthedTaskModel;
+			},
+		} as unknown as ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> };
+
+		const bare = await resolveModelOverrideWithAuthFallback(
+			["task-canonical"],
+			undefined,
+			registry,
+			undefined,
+			"parent-session",
+		);
+		const explicit = await resolveModelOverrideWithAuthFallback(
+			["opencode-zen/qwen3.6-plus-free"],
+			undefined,
+			registry,
+			undefined,
+			"parent-session",
+		);
+		const parentFallback = await resolveModelOverrideWithAuthFallback(
+			["unknown-task-model"],
+			"task-canonical",
+			registry,
+			undefined,
+			"parent-session",
+		);
+
+		expect(parentFallback.model).toBe(parentModel);
+		expect(bare.model).toBe(parentModel);
+		expect(explicit.model).toBe(unauthedTaskModel);
+	});
+
 	test("falls back to parent active model when resolved subagent model has no auth", async () => {
 		const registry = createMockRegistry({
 			models: [parentModel, unauthedTaskModel],
@@ -93,6 +142,76 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.requestedModel?.provider).toBe("opencode-zen");
 		expect(result.requestedModel?.id).toBe("qwen3.6-plus-free");
 		expect(result.fallbackReason).toBe("auth_unavailable");
+		expect(result.parentFallbackSelector).toBe("deepseek/deepseek-v4-pro");
+	});
+
+	test("rebases the fallback controller to the concrete parent after every override is unauthenticated", async () => {
+		const registry = createMockRegistry({
+			models: [parentModel, unauthedTaskModel],
+			authedProviders: new Set(["deepseek"]),
+		});
+		const result = await resolveModelOverrideWithAuthFallback(
+			["qwen3.6-plus-free", "opencode-zen/qwen3.6-plus-free"],
+			"deepseek/deepseek-v4-pro",
+			registry,
+		);
+
+		expect(result.parentFallbackSelector).toBe("deepseek/deepseek-v4-pro");
+		const controller = new FallbackChainController(
+			{
+				role: "default",
+				entries: [result.parentFallbackSelector!],
+				origin: "subagent",
+				explicitHead: true,
+			} satisfies ConfiguredFallbackChain,
+			1,
+		);
+		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-pro");
+		expect(controller.attemptsUsed).toBe(0);
+	});
+
+	test("rebases to the parent when every override selector is unknown", async () => {
+		const registry = createMockRegistry({
+			models: [parentModel],
+			authedProviders: new Set(["deepseek"]),
+		});
+		const result = await resolveModelOverrideWithAuthFallback(
+			["unknown/first", "unknown/second"],
+			"deepseek/deepseek-v4-pro",
+			registry,
+		);
+
+		expect(result.requestedModel).toBeUndefined();
+		expect(result.parentFallbackSelector).toBe("deepseek/deepseek-v4-pro");
+		const controller = new FallbackChainController(
+			{ role: "default", entries: [result.parentFallbackSelector!], origin: "subagent", explicitHead: true },
+			1,
+		);
+		expect(controller.onAttemptFailure("server", "500")).toBe("exhausted");
+		expect(controller.tried).toEqual([
+			{ selector: "deepseek/deepseek-v4-pro", triggerClass: "server", reason: "500" },
+		]);
+	});
+
+	test("rebases to a keyless parent fallback", async () => {
+		const registry: ModelLookupRegistry & { getApiKey(model: Model<Api>): Promise<string | undefined> } = {
+			getAvailable: () => [parentModel, unauthedTaskModel],
+			getApiKey: async (model: Model<Api>) => (model.provider === "deepseek" ? kNoAuth : undefined),
+		} as never;
+		const result = await resolveModelOverrideWithAuthFallback(
+			["qwen3.6-plus-free"],
+			"deepseek/deepseek-v4-pro",
+			registry,
+		);
+
+		expect(result.model).toBe(parentModel);
+		expect(result.parentFallbackSelector).toBe("deepseek/deepseek-v4-pro");
+		const controller = new FallbackChainController(
+			{ role: "default", entries: [result.parentFallbackSelector!], origin: "subagent", explicitHead: true },
+			1,
+		);
+		expect(controller.onAttemptFailure("server", "500")).toBe("exhausted");
+		expect(controller.tried[0]?.selector).toBe("deepseek/deepseek-v4-pro");
 	});
 
 	test("does not fall back when resolved subagent model has working auth", async () => {
@@ -206,4 +325,24 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		expect(result.model?.provider).toBe("opencode-zen");
 		expect(sessionIds).toEqual(["parent-session"]);
 	});
+});
+
+test("skips a Cursor subagent chain head when managed fallback is enabled", async () => {
+	const registry = createMockRegistry({
+		models: [cursorTaskModel, parentModel],
+		authedProviders: new Set(["cursor", "deepseek"]),
+	});
+
+	const result = await resolveModelOverrideWithAuthFallback(
+		["cursor/cursor-task", "deepseek/deepseek-v4-pro"],
+		undefined,
+		registry,
+		undefined,
+		undefined,
+		{ managedFallback: true },
+	);
+
+	expect(result.model).toBe(parentModel);
+	expect(result.activeIndex).toBe(1);
+	expect(result.skips[0]?.reason).toContain("cannot be used in a retryable fallback chain");
 });

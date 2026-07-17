@@ -93,7 +93,7 @@ describe("ooo bridge runner red-team", () => {
 		const runner = runnerWith(handler);
 
 		expect(await runner.emitInput("ooo status", undefined, "interactive")).toEqual({ handled: true });
-		expect(await runner.emitInput("ooo status", undefined, "rpc")).toEqual({});
+		expect(await runner.emitInput("ooo status", undefined, "sdk")).toEqual({});
 		expect(await runner.emitInput("ooo status", undefined, "extension")).toEqual({});
 		expect(dispatchSpy).toHaveBeenCalledTimes(1);
 	});

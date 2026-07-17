@@ -13,7 +13,7 @@ These instructions teach a Hermes-style coordinator how to operate GJC through t
    If a second task is needed while one turn is active, pass `queue: true`; the next queued turn is promoted after the active turn is reported terminal.
 5. If GJC asks a structured question, use `{{TOOL_PREFIX}}_list_questions` and answer with `{{TOOL_PREFIX}}_submit_question_answer`.
 6. Use `{{TOOL_PREFIX}}_report_status` for coordinator-visible status and final reports.
-7. Use `{{TOOL_PREFIX}}_read_tail` only as advisory debug output when structured turn state is insufficient.
+7. Use `{{TOOL_PREFIX}}_read_tail` only to inspect the latest assistant response through the SDK when structured turn state is insufficient; it never reads terminal output.
 
 ## Prefer high-level delegation
 
@@ -39,11 +39,9 @@ The Hermes bridge does not choose a model/provider. Generated setup configures `
 
 Provider-specific commands are examples only, never product defaults.
 
-## Visible routed-session fallback
+## Human-visible TUI boundary
 
-If a Hermes/OpenClaw/Clawhip-style operator needs a human-visible, channel-routed GJC pane instead of a pure Coordinator MCP session, use the visible session pattern in [`docs/gjc-session-clawhip-routing.md`](../../../../../../docs/gjc-session-clawhip-routing.md).
-
-Use that pattern only when the router must watch tmux output, send stale-session alerts, or inject follow-up prompts into the same visible pane. The short version is: prepare a dedicated worktree, register a stable tmux session through the host router, start interactive `gjc`, wait for TUI readiness, inject the task prompt separately, and verify actual tool/work activity before reporting acceptance.
+A human may choose to run the local TUI in tmux for terminal visibility. That terminal is not a controller API: Hermes/OpenClaw/Clawhip-style operators must not inject prompts into, scrape, or route machine decisions through a tmux pane. Use the Coordinator MCP tools above for every external control and viewing operation.
 
 Do not put private channel ids, mention targets, socket names, tokens, or local routing policy into portable setup output. Keep those in the host/operator deployment.
 

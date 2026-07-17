@@ -8,7 +8,7 @@
 - Key collaborators:
   - `packages/utils/src/mermaid-ascii.ts` — thin wrapper over renderer package.
   - `packages/coding-agent/src/tools/index.ts` — tool registration and enablement gate.
-  - `packages/coding-agent/src/sdk.ts` — session-facing artifact allocation hook.
+  - `packages/coding-agent/src/sdk/session.ts` — session-facing artifact allocation hook.
   - `packages/coding-agent/src/session/session-manager.ts` — persistent-session artifact path allocation.
   - `packages/coding-agent/src/session/artifacts.ts` — artifact filename generation and writes.
 - Related user/runtime doc: `docs/render-mermaid.md`
@@ -73,7 +73,7 @@ No image path, SVG, PNG, or binary payload is returned. Stored artifacts are pla
 ## Errors
 - `renderMermaidAscii()` is not wrapped in a local `try/catch`; renderer exceptions propagate out of `execute()`.
 - Invalid Mermaid syntax therefore fails the tool call rather than returning partial output.
-- Artifact allocation failures inside the SDK hook are swallowed there and converted to `{}` in `packages/coding-agent/src/sdk.ts`; rendering still succeeds, just without a saved artifact.
+- Artifact allocation failures inside the SDK hook are swallowed there and converted to `{}` in `packages/coding-agent/src/sdk/session.ts`; rendering still succeeds, just without a saved artifact.
 - Artifact write failures from `Bun.write()` are not caught in the tool and will fail the call.
 
 ## Notes

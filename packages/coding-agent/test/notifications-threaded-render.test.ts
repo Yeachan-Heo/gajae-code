@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { formatContextUpdate, formatIdentityHeader, renderThreadedFrame } from "../src/notifications/threaded-render";
+import { formatContextUpdate, formatIdentityHeader, renderThreadedFrame } from "../src/sdk/bus/threaded-render";
 
 describe("renderThreadedFrame", () => {
 	test("identity_header renders pinned bullets with identity flag", () => {
@@ -25,6 +25,32 @@ describe("renderThreadedFrame", () => {
 		const send = renderThreadedFrame({ type: "turn_stream", sessionId: "s", phase: "finalized", text: "done" });
 		expect(send).toMatchObject({ method: "sendMessage", lane: "finalized", text: "done" });
 		expect(send?.coalesceKey).toBeUndefined();
+	});
+
+	test("finalized turn_stream suppresses dot-only placeholders", () => {
+		expect(
+			renderThreadedFrame({ type: "turn_stream", sessionId: "s", phase: "finalized", text: "." }),
+		).toBeUndefined();
+		expect(
+			renderThreadedFrame({ type: "turn_stream", sessionId: "s", phase: "finalized", text: " . \n" }),
+		).toBeUndefined();
+		expect(
+			renderThreadedFrame({ type: "turn_stream", sessionId: "s", phase: "finalized", text: "   " }),
+		).toBeUndefined();
+	});
+
+	test("finalized turn_stream preserves meaningful completion summaries", () => {
+		const send = renderThreadedFrame({
+			type: "turn_stream",
+			sessionId: "s",
+			phase: "finalized",
+			text: "Background job completed: tests passed",
+		});
+		expect(send).toMatchObject({
+			method: "sendMessage",
+			lane: "finalized",
+			text: "Background job completed: tests passed",
+		});
 	});
 
 	test("live turn_stream uses live lane and a coalesce key from messageRef", () => {
@@ -109,6 +135,58 @@ describe("renderThreadedFrame", () => {
 		expect(send?.text).toContain("redact off");
 	});
 
+	test("control_command_result renders escaped status output", () => {
+		const send = renderThreadedFrame({
+			type: "control_command_result",
+			sessionId: "s",
+			status: "ok",
+			message: "Context: <25>/100 (25.0%)",
+		});
+		expect(send?.lane).toBe("idle");
+		expect(send?.text).toContain("✅ Context: &lt;25&gt;/100 (25.0%)");
+	});
+
+	test("tool_activity edits a started bubble with its terminal result", () => {
+		const started = renderThreadedFrame({
+			type: "tool_activity",
+			sessionId: "s",
+			toolCallId: "call-7",
+			toolName: "shell",
+			phase: "started",
+			argsSummary: "bun test",
+		});
+		const completed = renderThreadedFrame({
+			type: "tool_activity",
+			sessionId: "s",
+			toolCallId: "call-7",
+			toolName: "shell",
+			phase: "completed",
+			resultSummary: "passed",
+		});
+		expect(started).toMatchObject({ lane: "live", coalesceKey: "tool:call-7", editable: true });
+		expect(completed).toMatchObject({ lane: "finalized", coalesceKey: "tool:call-7", editable: true });
+		expect(started?.text).toContain("⚙ shell — started");
+		expect(completed?.text).toContain("⚙ shell — ok");
+		expect(completed?.richMarkdown).toBeUndefined();
+	});
+
+	test("reasoning_summary converts markdown once and remains editable", () => {
+		const send = renderThreadedFrame({
+			type: "reasoning_summary",
+			sessionId: "s",
+			turnRef: "turn-9",
+			text: "<unsafe> & **bold**",
+		});
+		expect(send).toMatchObject({ lane: "finalized", coalesceKey: "reason:turn-9", editable: true });
+		expect(send?.text).toBe("&lt;unsafe&gt; &amp; <b>bold</b>");
+		expect(send?.text).not.toContain("&amp;lt;");
+		expect(send?.richMarkdown).toBeUndefined();
+	});
+	test("reasoning_summary without a turnRef sends a fresh finalized message", () => {
+		const send = renderThreadedFrame({ type: "reasoning_summary", sessionId: "s", text: "safe summary" });
+		expect(send).toMatchObject({ lane: "finalized", editable: false });
+		expect(send?.coalesceKey).toBeUndefined();
+	});
 	test("unknown frame types render nothing", () => {
 		expect(renderThreadedFrame({ type: "some_future_frame", sessionId: "s" })).toBeUndefined();
 		expect(renderThreadedFrame({ sessionId: "s" })).toBeUndefined();
@@ -116,5 +194,56 @@ describe("renderThreadedFrame", () => {
 
 	test("formatIdentityHeader tolerates missing fields", () => {
 		expect(formatIdentityHeader({ sessionId: "s" })).toContain("• repo: <code>?</code>");
+	});
+});
+
+describe("renderThreadedFrame rich final-answer marker", () => {
+	// The rich delivery marker (`richMarkdown`) is derived ONLY from a frame's
+	// `finalAnswer` bit - never inferred from `phase` - and carries the RAW
+	// markdown (pre-HTML), so the daemon can promote a rich final answer while
+	// `text` stays the HTML-rendered fallback.
+	test("a finalAnswer turn_stream carries the raw markdown as richMarkdown", () => {
+		const raw = "**bold** answer with `code` and a [link](https://example.com)";
+		const send = renderThreadedFrame({
+			type: "turn_stream",
+			sessionId: "s",
+			phase: "finalized",
+			finalAnswer: true,
+			text: raw,
+		});
+		expect(send?.richMarkdown).toBe(raw);
+		// richMarkdown is the RAW markdown, not the HTML-rendered `text`.
+		expect(send?.text).not.toBe(raw);
+		expect(send?.text).toContain("<b>bold</b>");
+	});
+
+	test("a finalized turn_stream with finalAnswer:false has no richMarkdown", () => {
+		const send = renderThreadedFrame({
+			type: "turn_stream",
+			sessionId: "s",
+			phase: "finalized",
+			finalAnswer: false,
+			text: "done",
+		});
+		expect(send?.lane).toBe("finalized");
+		expect(send?.richMarkdown).toBeUndefined();
+	});
+
+	test("a finalized turn_stream without finalAnswer has no richMarkdown (marker not inferred from phase)", () => {
+		const send = renderThreadedFrame({ type: "turn_stream", sessionId: "s", phase: "finalized", text: "done" });
+		expect(send?.lane).toBe("finalized");
+		expect(send?.richMarkdown).toBeUndefined();
+	});
+
+	test("a live turn_stream has no richMarkdown", () => {
+		const send = renderThreadedFrame({
+			type: "turn_stream",
+			sessionId: "s",
+			phase: "live",
+			text: "partial",
+			messageRef: "m-7",
+		});
+		expect(send?.lane).toBe("live");
+		expect(send?.richMarkdown).toBeUndefined();
 	});
 });

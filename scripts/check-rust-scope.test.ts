@@ -4,7 +4,7 @@ import * as path from "node:path";
 const repoRoot = path.join(import.meta.dir, "..");
 
 describe("Rust scope guard", () => {
-	test("allowlists the notifications SDK Rust core with a native transport rationale", async () => {
+	test("allowlists the Gajae-Code SDK Rust core with a native transport rationale", async () => {
 		const proc = Bun.spawn(["bun", "scripts/check-rust-scope.ts"], {
 			cwd: repoRoot,
 			stdout: "pipe",
@@ -18,8 +18,8 @@ describe("Rust scope guard", () => {
 
 		expect(stderr).toBe("");
 		expect(exitCode).toBe(0);
-		expect(stdout).toContain("crates/gjc-notifications");
-		expect(stdout).toContain("Notifications SDK Rust core");
+		expect(stdout).toContain("crates/gjc-sdk");
+		expect(stdout).toContain("Gajae-Code SDK Rust core");
 		expect(stdout).toContain("loopback WebSocket transport");
 		expect(stdout).toContain("planned N-API integration");
 	});

@@ -5,11 +5,6 @@ Continue work on the active goal.
 <objective>
 {{objective}}
 </objective>
-
-Usage:
-- Tokens used: {{tokensUsed}}
-- Time used: {{timeUsedSeconds}} seconds
-
 This is an autonomous continuation. The objective persists across turns; do not redefine success around a smaller, easier, or already-completed subset.
 
 Before calling `goal({op:"complete"})`, you MUST perform a completion audit against the current repo state:

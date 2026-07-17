@@ -6,9 +6,12 @@ import {
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	estimateEntryTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
+	type RemoteCompactionFallbackHealthEvent,
+	type RemoteCompactionFallbackHealthHooks,
 	resolveThresholdTokens,
 	shouldCompact,
 } from "@gajae-code/agent-core/compaction/compaction";
@@ -345,7 +348,7 @@ describe("remote compaction setting", () => {
 		];
 		const preparation = prepareCompaction(entries, {
 			...DEFAULT_COMPACTION_SETTINGS,
-			keepRecentTokens: 1000,
+			keepRecentTokens: 1,
 			remoteEnabled: false,
 		});
 		if (!preparation) throw new Error("Expected compaction preparation");
@@ -353,14 +356,13 @@ describe("remote compaction setting", () => {
 		const completeSimpleSpy = vi.spyOn(ai, "completeSimple");
 		completeSimpleSpy
 			.mockResolvedValueOnce(createAssistantMessage("History summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Turn prefix summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Short summary"));
+			.mockResolvedValueOnce(createAssistantMessage("Turn prefix summary"));
 
 		await compact(preparation, model, "test-api-key", undefined, undefined, {
 			initiatorOverride: "agent",
 		});
 
-		expect(completeSimpleSpy).toHaveBeenCalledTimes(3);
+		expect(completeSimpleSpy).toHaveBeenCalledTimes(2);
 		for (const call of completeSimpleSpy.mock.calls) {
 			const options = call[2] as { initiatorOverride?: string } | undefined;
 			expect(options?.initiatorOverride).toBe("agent");
@@ -383,7 +385,7 @@ describe("remote compaction setting", () => {
 		];
 		const preparation = prepareCompaction(entries, {
 			...DEFAULT_COMPACTION_SETTINGS,
-			keepRecentTokens: 1000,
+			keepRecentTokens: 1,
 			remoteEnabled: false,
 			remoteEndpoint: "https://compaction.example.test/summarize",
 		});
@@ -403,15 +405,14 @@ describe("remote compaction setting", () => {
 		const completeSpy = vi
 			.spyOn(ai, "completeSimple")
 			.mockResolvedValueOnce(createAssistantMessage("Local history summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Local turn summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Local short summary"));
+			.mockResolvedValueOnce(createAssistantMessage("Local turn summary"));
 
 		const result = await compact(preparation, model, "test-api-key");
 
 		expect(fetchSpy).not.toHaveBeenCalled();
-		expect(completeSpy).toHaveBeenCalledTimes(3);
+		expect(completeSpy).toHaveBeenCalledTimes(2);
 		expect(result.summary).toContain("Local history summary");
-		expect(result.shortSummary).toBe("Local short summary");
+		expect(result.shortSummary).toBe("Local history summary");
 	});
 
 	it("preserves prior compaction items and encrypted reasoning for OpenAI remote compaction", async () => {
@@ -460,7 +461,7 @@ describe("remote compaction setting", () => {
 
 		const preparation = prepareCompaction(entries, {
 			...DEFAULT_COMPACTION_SETTINGS,
-			keepRecentTokens: 1000,
+			keepRecentTokens: 1,
 			remoteEnabled: true,
 		});
 		expect(preparation).toBeDefined();
@@ -511,6 +512,129 @@ describe("remote compaction setting", () => {
 				compactionItem: { type: "compaction", encrypted_content: "new_encrypted" },
 			},
 		});
+	});
+
+	it("reports OpenAI remote compaction fallback and recovery through the session-owned health hook", async () => {
+		const model = getBundledModel("openai", "gpt-5.1");
+		if (!model) throw new Error("Expected openai/gpt-5.1 model to exist");
+
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(
+				createOpenAiAssistantMessage("Answer 1", model, createMockUsage(0, 100, 9000, 0), "encrypted_reasoning"),
+			),
+			createMessageEntry(createUserMessage("Turn 2")),
+		];
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1,
+			remoteEnabled: true,
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const fetchSpy = vi
+			.fn()
+			.mockReturnValueOnce(new Response("remote down", { status: 500, statusText: "Bad Gateway" }))
+			.mockReturnValueOnce(
+				new Response(JSON.stringify({ output: { type: "compaction" } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			)
+			.mockReturnValueOnce(
+				new Response(JSON.stringify({ output: [{ type: "message", role: "assistant" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			)
+			.mockReturnValueOnce(
+				new Response(JSON.stringify({ output: [{ type: "compaction", encrypted_content: "new_encrypted" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+		using _hook = hookFetch(fetchSpy);
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("Local summary"));
+		const events: RemoteCompactionFallbackHealthEvent[] = [];
+		const health: RemoteCompactionFallbackHealthHooks = {
+			recordRemoteCompactionFallback(event) {
+				events.push(event);
+			},
+		};
+
+		await compact(preparation, model, "test-api-key", undefined, undefined, {
+			remoteCompactionFallbackHealth: health,
+		});
+		await compact(preparation, model, "test-api-key", undefined, undefined, {
+			remoteCompactionFallbackHealth: health,
+		});
+		await compact(preparation, model, "test-api-key", undefined, undefined, {
+			remoteCompactionFallbackHealth: health,
+		});
+		await compact(preparation, model, "test-api-key", undefined, undefined, {
+			remoteCompactionFallbackHealth: health,
+		});
+
+		expect(events).toEqual([
+			{
+				kind: "fallback",
+				error: "Remote compaction failed (500 Bad Gateway)",
+				model: model.id,
+				provider: model.provider,
+			},
+			{
+				kind: "fallback",
+				error: "Remote compaction response malformed output (outputType=object)",
+				model: model.id,
+				provider: model.provider,
+			},
+			{
+				kind: "fallback",
+				error: "Remote compaction response missing compaction item (rawOutputLength=1, outputTypes=message, replacementHistoryLength=1)",
+				model: model.id,
+				provider: model.provider,
+			},
+			{ kind: "success", model: model.id, provider: model.provider },
+		]);
+	});
+
+	it("does not report remote compaction cancellation as fallback health", async () => {
+		const model = getBundledModel("openai", "gpt-5.1");
+		if (!model) throw new Error("Expected openai/gpt-5.1 model to exist");
+
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(
+				createOpenAiAssistantMessage("Answer 1", model, createMockUsage(0, 100, 9000, 0), "encrypted_reasoning"),
+			),
+			createMessageEntry(createUserMessage("Turn 2")),
+		];
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1,
+			remoteEnabled: true,
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const abortError = Object.assign(new Error("operation aborted"), { name: "AbortError" });
+		const fetchSpy = vi.fn().mockRejectedValueOnce(abortError);
+		using _hook = hookFetch(fetchSpy);
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("Local summary"));
+		const events: RemoteCompactionFallbackHealthEvent[] = [];
+		const health: RemoteCompactionFallbackHealthHooks = {
+			recordRemoteCompactionFallback(event) {
+				events.push(event);
+			},
+		};
+
+		await expect(
+			compact(preparation, model, "test-api-key", undefined, undefined, {
+				remoteCompactionFallbackHealth: health,
+			}),
+		).rejects.toThrow("operation aborted");
+
+		expect(events).toEqual([]);
+		expect(completeSpy).not.toHaveBeenCalled();
 	});
 	it("prefers persisted assistant native history snapshots for OpenAI remote compaction", async () => {
 		const model = getBundledModel("openai", "gpt-5.1");
@@ -744,7 +868,7 @@ describe("remote compaction setting", () => {
 
 		const preparation = prepareCompaction(entries, {
 			...DEFAULT_COMPACTION_SETTINGS,
-			keepRecentTokens: 1000,
+			keepRecentTokens: 1,
 			remoteEnabled: true,
 		});
 		if (!preparation) throw new Error("Expected compaction preparation");
@@ -836,6 +960,24 @@ describe("findCutPoint", () => {
 		expect(result.firstKeptEntryIndex).toBe(3);
 		expect(result.isSplitTurn).toBe(true);
 		expect(result.turnStartIndex).toBe(2);
+	});
+	it("counts custom-message content when retaining the recent context window", () => {
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("old turn")),
+			{
+				type: "custom_message",
+				id: "custom-context",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				customType: "goal-context",
+				content: "x".repeat(400),
+				display: false,
+			},
+			createMessageEntry(createUserMessage("new turn")),
+		];
+
+		expect(estimateEntryTokens(entries[1]!)).toBeGreaterThanOrEqual(100);
+		expect(findCutPoint(entries, 0, entries.length, 100).firstKeptEntryIndex).toBe(1);
 	});
 });
 

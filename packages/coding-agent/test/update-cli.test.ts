@@ -3,16 +3,21 @@ import * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	buildReleaseBinaryUrlForTest,
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
+	fsyncFileForTest,
 	replaceBinaryForUpdate,
 	resolveNpmManagedTargetForTest,
 	resolveUpdateMethodForTest,
+	runBinaryUpdateFlow,
 	runPackageManagerUpdateForTest,
+	runUpdateCommand,
 } from "../src/cli/update-cli";
+import { initTheme } from "../src/modes/theme/theme";
 
 const tempDirs: string[] = [];
 const repoRoot = path.resolve(import.meta.dir, "../../..");
@@ -204,6 +209,60 @@ describe("update-cli package-manager verification", () => {
 		}
 	});
 
+	it("verifies a zero-exit install once and prints success and restart guidance once", async () => {
+		await initTheme();
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		let verificationCalls = 0;
+		try {
+			const result = await runPackageManagerUpdateForTest({
+				managerName: "bun",
+				expectedVersion: "0.7.8",
+				runInstall: async () => ({ exitCode: 0, text: () => "installed" }),
+				verifyInstalledRuntime: async expectedVersion => {
+					verificationCalls += 1;
+					return { ok: true, actual: expectedVersion, path: "/Users/test/.bun/bin/gjc" };
+				},
+			});
+
+			expect(result.ok).toBe(true);
+			expect(verificationCalls).toBe(1);
+			expect(output.filter(line => line.includes("Updated to 0.7.8"))).toHaveLength(1);
+			expect(output.filter(line => line.includes("Restart gjc to use the new version"))).toHaveLength(1);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
+	it("rejects a zero-exit stale install with verification-specific diagnostics and no success output", async () => {
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		let verificationCalls = 0;
+		try {
+			await expect(
+				runPackageManagerUpdateForTest({
+					managerName: "bun",
+					expectedVersion: "0.7.8",
+					runInstall: async () => ({ exitCode: 0, text: () => "installed" }),
+					verifyInstalledRuntime: async () => {
+						verificationCalls += 1;
+						return { ok: false, actual: "0.7.7", path: "/Users/test/.bun/bin/gjc" };
+					},
+				}),
+			).rejects.toThrow("bun install exited successfully, but the selected gjc runtime failed verification");
+			expect(verificationCalls).toBe(1);
+			expect(output.join("\n")).not.toContain("install failed with exit code 0");
+			expect(output.filter(line => line.includes("Updated to"))).toHaveLength(0);
+			expect(output.filter(line => line.includes("Restart gjc"))).toHaveLength(0);
+		} finally {
+			logSpy.mockRestore();
+		}
+	});
+
 	it("keeps package-manager nonzero failures hard when runtime verification does not prove the update landed", async () => {
 		await expect(
 			runPackageManagerUpdateForTest({
@@ -220,6 +279,127 @@ describe("update-cli package-manager verification", () => {
 				}),
 			}),
 		).rejects.toThrow("Fail extracting tarball");
+	});
+});
+
+describe("update-cli command verification failures", () => {
+	it("exits without refreshing defaults when a zero-exit install leaves a stale runtime", async () => {
+		const output: string[] = [];
+		const errors: string[] = [];
+		const exitCodes: number[] = [];
+		const sentinel = new Error("exit");
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => {
+			errors.push(String(message));
+		});
+		let verificationCalls = 0;
+		let refreshCalls = 0;
+		try {
+			await expect(
+				runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => ({ tag: "v999.0.0", version: "999.0.0" }),
+						resolveUpdateTarget: async () => ({ method: "bun" }),
+						performUpdate: async (_target, expectedVersion) => {
+							await runPackageManagerUpdateForTest({
+								managerName: "bun",
+								expectedVersion,
+								runInstall: async () => ({ exitCode: 0, text: () => "installed" }),
+								verifyInstalledRuntime: async () => {
+									verificationCalls += 1;
+									return { ok: false, actual: "0.0.1", path: "/test/gjc" };
+								},
+							});
+						},
+						refreshInstalledDefaultSkills: async () => {
+							refreshCalls += 1;
+						},
+						exit: code => {
+							exitCodes.push(code);
+							throw sentinel;
+						},
+					},
+				),
+			).rejects.toBe(sentinel);
+			expect(verificationCalls).toBe(1);
+			expect(exitCodes).toEqual([1]);
+			expect(refreshCalls).toBe(0);
+			expect(errors.join("\n")).toContain(
+				"install exited successfully, but the selected gjc runtime failed verification",
+			);
+			expect(errors.join("\n")).toContain("still reports 0.0.1 (expected 999.0.0)");
+			expect(errors.join("\n")).not.toContain("install failed with exit code 0");
+			expect(output.filter(line => line.includes("Updated to") || line.includes("Restart gjc"))).toHaveLength(0);
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("exits without refreshing defaults when a zero-exit install fails its smoke test", async () => {
+		const output: string[] = [];
+		const errors: string[] = [];
+		const exitCodes: number[] = [];
+		const sentinel = new Error("exit");
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => {
+			errors.push(String(message));
+		});
+		let verificationCalls = 0;
+		let refreshCalls = 0;
+		try {
+			await expect(
+				runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => ({ tag: "v999.0.0", version: "999.0.0" }),
+						resolveUpdateTarget: async () => ({ method: "bun" }),
+						performUpdate: async (_target, expectedVersion) => {
+							await runPackageManagerUpdateForTest({
+								managerName: "bun",
+								expectedVersion,
+								runInstall: async () => ({ exitCode: 0, text: () => "installed" }),
+								verifyInstalledRuntime: async () => {
+									verificationCalls += 1;
+									return {
+										ok: false,
+										actual: "999.0.0",
+										path: "/test/gjc",
+										smokeTestFailed: true,
+										smokeTestOutput: "native addon mismatch",
+									};
+								},
+							});
+						},
+						refreshInstalledDefaultSkills: async () => {
+							refreshCalls += 1;
+						},
+						exit: code => {
+							exitCodes.push(code);
+							throw sentinel;
+						},
+					},
+				),
+			).rejects.toBe(sentinel);
+			expect(verificationCalls).toBe(1);
+			expect(exitCodes).toEqual([1]);
+			expect(refreshCalls).toBe(0);
+			expect(errors.join("\n")).toContain("--smoke-test failed");
+			expect(errors.join("\n")).toContain("native addon mismatch");
+			expect(errors.join("\n")).toContain(
+				"install exited successfully, but the selected gjc runtime failed verification",
+			);
+			expect(errors.join("\n")).not.toContain("install failed with exit code 0");
+			expect(output.filter(line => line.includes("Updated to") || line.includes("Restart gjc"))).toHaveLength(0);
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
 	});
 });
 
@@ -303,5 +483,126 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(targetPath).text()).toBe("new binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+});
+
+describe("update-cli download durability", () => {
+	it("fsyncs a written file without altering its contents", async () => {
+		const dir = await makeTempDir();
+		const filePath = path.join(dir, "gjc.new");
+		await Bun.write(filePath, "downloaded binary bytes");
+
+		await fsyncFileForTest(filePath);
+
+		expect(await Bun.file(filePath).text()).toBe("downloaded binary bytes");
+	});
+
+	it("rejects when the target file does not exist", async () => {
+		const dir = await makeTempDir();
+		await expect(fsyncFileForTest(path.join(dir, "missing.new"))).rejects.toThrow();
+	});
+
+	it("closes the fsync file descriptor on success", async () => {
+		const close = vi.fn(async () => {});
+		const open = vi.spyOn(fsNode.promises, "open").mockResolvedValue({
+			sync: async () => {},
+			close,
+		} as unknown as Awaited<ReturnType<typeof fsNode.promises.open>>);
+		try {
+			await fsyncFileForTest("/irrelevant/path");
+			expect(close).toHaveBeenCalledTimes(1);
+		} finally {
+			open.mockRestore();
+		}
+	});
+
+	it("closes the fsync file descriptor even when sync fails", async () => {
+		const close = vi.fn(async () => {});
+		const open = vi.spyOn(fsNode.promises, "open").mockResolvedValue({
+			sync: async () => {
+				throw new Error("EIO: sync failed");
+			},
+			close,
+		} as unknown as Awaited<ReturnType<typeof fsNode.promises.open>>);
+		try {
+			await expect(fsyncFileForTest("/irrelevant/path")).rejects.toThrow("sync failed");
+			expect(close).toHaveBeenCalledTimes(1);
+		} finally {
+			open.mockRestore();
+		}
+	});
+});
+
+describe("update-cli binary update flow", () => {
+	it("downloads, fsyncs, then replaces and verifies in that order", async () => {
+		const calls: string[] = [];
+		const targetPath = "/opt/gjc/bin/gjc";
+		const flow: BinaryUpdateFlow = {
+			download: async (url, tempPath) => {
+				calls.push(`download ${url} -> ${tempPath}`);
+			},
+			fsync: async filePath => {
+				calls.push(`fsync ${filePath}`);
+			},
+			replace: async options => {
+				calls.push(`replace ${options.tempPath} -> ${options.targetPath}`);
+				return options.verifyInstalledVersion(options.expectedVersion);
+			},
+			verifyInstalledVersion: async expected => {
+				calls.push(`verify ${expected}`);
+				return { ok: true, actual: expected, path: targetPath };
+			},
+			removeTemp: async filePath => {
+				calls.push(`removeTemp ${filePath}`);
+			},
+			beforeReplace: () => {
+				calls.push("beforeReplace");
+			},
+		};
+
+		const result = await runBinaryUpdateFlow(targetPath, "https://example.test/gjc", "1.2.3", flow);
+
+		expect(result.ok).toBe(true);
+		expect(calls).toEqual([
+			`download https://example.test/gjc -> ${targetPath}.new`,
+			`fsync ${targetPath}.new`,
+			"beforeReplace",
+			`replace ${targetPath}.new -> ${targetPath}`,
+			"verify 1.2.3",
+		]);
+		expect(calls).not.toContain(`removeTemp ${targetPath}.new`);
+	});
+
+	it("aborts before replacement/verification when fsync fails", async () => {
+		const calls: string[] = [];
+		const targetPath = "/opt/gjc/bin/gjc";
+		const flow: BinaryUpdateFlow = {
+			download: async (_url, tempPath) => {
+				calls.push(`download ${tempPath}`);
+			},
+			fsync: async () => {
+				calls.push("fsync");
+				throw new Error("EIO: fsync failed");
+			},
+			replace: async () => {
+				calls.push("replace");
+				return { ok: true };
+			},
+			verifyInstalledVersion: async () => {
+				calls.push("verify");
+				return { ok: true };
+			},
+			removeTemp: async filePath => {
+				calls.push(`removeTemp ${filePath}`);
+			},
+		};
+
+		await expect(runBinaryUpdateFlow(targetPath, "https://example.test/gjc", "1.2.3", flow)).rejects.toThrow(
+			"fsync failed",
+		);
+
+		expect(calls).toEqual([`download ${targetPath}.new`, "fsync", `removeTemp ${targetPath}.new`]);
+		expect(calls).not.toContain("replace");
+		expect(calls).not.toContain("verify");
 	});
 });

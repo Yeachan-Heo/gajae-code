@@ -9,6 +9,7 @@ import {
 	streamGoogleGeminiCli,
 } from "../src/providers/google-gemini-cli";
 import type { Context, Model, TJsonSchema } from "../src/types";
+import { classifyFallbackTrigger } from "../src/utils/fallback-transport";
 import { getOAuthApiKey } from "../src/utils/oauth";
 
 function createModel(provider: "google-gemini-cli" | "google-antigravity"): Model<"google-gemini-cli"> {
@@ -259,7 +260,7 @@ describe("Google Gemini CLI alignment", () => {
 			let fetchCalls = 0;
 			using _hook = hookFetch(async () => {
 				fetchCalls += 1;
-				return new Response('{"error":{"message":"busy"}}', {
+				return new Response('{"error":{"code":"server_error","message":"busy"}}', {
 					status: 503,
 					headers: { "retry-after": "120" },
 				});
@@ -275,6 +276,20 @@ describe("Google Gemini CLI alignment", () => {
 			expect(fetchCalls).toBe(1);
 			expect(result.stopReason).toBe("error");
 			expect(result.errorMessage).toContain("Cloud Code Assist API error (503)");
+			expect(result.transportFailure).toMatchObject({
+				kind: "transport",
+				status: 503,
+				providerCode: "server_error",
+			});
+			expect(result.transportFailure?.headers).toEqual({ "retry-after": "120" });
+			expect(classifyFallbackTrigger(result.transportFailure)).toEqual({ class: "server", retryAfterMs: 120_000 });
+		});
+
+		it("does not attach transport facts to non-transport errors", async () => {
+			const result = await streamGoogleGeminiCli(createModel("google-gemini-cli"), createContext(), {}).result();
+
+			expect(result.stopReason).toBe("error");
+			expect(result.transportFailure).toBeUndefined();
 		});
 	});
 });

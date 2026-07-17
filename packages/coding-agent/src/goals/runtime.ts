@@ -101,8 +101,6 @@ export function renderGoalPrompt(kind: GoalPromptKind, goal: Goal): string {
 	const template = kind === "active" ? goalModeActivePrompt : goalContinuationPrompt;
 	return prompt.render(template, {
 		objective: escapeXmlText(goal.objective),
-		tokensUsed: String(goal.tokensUsed),
-		timeUsedSeconds: String(goal.timeUsedSeconds),
 	});
 }
 
@@ -137,6 +135,10 @@ export class GoalRuntime {
 	#hasAccountingState(): boolean {
 		const state = normalizeGoalModeState(this.#host.getState());
 		return Boolean(state?.enabled && isAccountingStatus(state.goal));
+	}
+
+	shouldTrackTurnBaseline(): boolean {
+		return this.#hasAccountingState();
 	}
 
 	async #withAccounting<T>(fn: () => Promise<T> | T): Promise<T> {
@@ -179,6 +181,12 @@ export class GoalRuntime {
 		if (this.#turnSnapshot) {
 			this.#turnSnapshot.activeGoalId = goal.id;
 			this.#turnSnapshot.baselineUsage = { ...this.#host.getCurrentUsage() };
+		} else {
+			this.#turnSnapshot = {
+				turnId: `activation-${goal.id}`,
+				activeGoalId: goal.id,
+				baselineUsage: { ...this.#host.getCurrentUsage() },
+			};
 		}
 	}
 

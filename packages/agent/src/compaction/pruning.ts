@@ -267,6 +267,56 @@ function readBasePath(path: string): string {
 	return base;
 }
 
+type ReadLineRange = { start: number; end: number };
+
+const DEFAULT_READ_LINE_LIMIT = 500;
+
+/** Parse trailing read selectors using the read tool's actual bounded default. */
+function readLineRanges(path: string): ReadLineRange[] {
+	let target = path;
+	let raw = false;
+	while (/:(?:raw|conflicts)$/.test(target)) {
+		raw ||= target.endsWith(":raw");
+		target = target.replace(/:(?:raw|conflicts)$/, "");
+	}
+	const match = target.match(/:(\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)$/);
+	if (!match) return raw ? [{ start: 1, end: Number.POSITIVE_INFINITY }] : [];
+	return match[1].split(",").flatMap(part => {
+		const range = part.match(/^(\d+)(?:([-+])(\d+))?$/);
+		if (!range) return [];
+		const start = Number(range[1]);
+		const end =
+			range[2] === "+"
+				? start + Number(range[3]) - 1
+				: range[2] === "-"
+					? Number(range[3])
+					: start + DEFAULT_READ_LINE_LIMIT - 1;
+		return start > 0 && end >= start ? [{ start, end }] : [];
+	});
+}
+
+function strictlyContainsReadRange(container: ReadLineRange, contained: ReadLineRange): boolean {
+	return (
+		container.start <= contained.start &&
+		container.end >= contained.end &&
+		(container.start < contained.start || container.end > contained.end)
+	);
+}
+
+function readSupersedesRead(
+	later: ToolCall,
+	earlier: ToolCall,
+	lineRangesByCall: ReadonlyMap<ToolCall, ReadLineRange[]>,
+): boolean {
+	const laterRanges = lineRangesByCall.get(later);
+	const earlierRanges = lineRangesByCall.get(earlier);
+	return (
+		laterRanges?.length === 1 &&
+		earlierRanges?.length === 1 &&
+		strictlyContainsReadRange(laterRanges[0], earlierRanges[0])
+	);
+}
+
 /**
  * Stable identity for "the same logical lookup": same tool re-targeting the
  * same subject. A later result with the same key supersedes earlier ones.
@@ -275,9 +325,23 @@ function readBasePath(path: string): string {
  * (`skip`) and result-shaping flags (`i`, `gitignore`): a later page or a
  * differently-shaped search complements earlier output, it does not replace it.
  */
+const IDEMPOTENT_BASH_COMMAND =
+	/^(?:(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:test|build)\b|git\s+status\b|cargo\s+build\b|(?:make|just)\s+build\b)/;
+
+function normalizedIdempotentBashCommand(call: ToolCall): string | undefined {
+	if (call.name !== "bash") return undefined;
+	const command = call.arguments.command;
+	if (typeof command !== "string") return undefined;
+	const normalized = command.trim().replace(/\s+/g, " ");
+	if (/[;&|]/.test(normalized) || !IDEMPOTENT_BASH_COMMAND.test(normalized)) return undefined;
+	return JSON.stringify([normalized, typeof call.arguments.cwd === "string" ? call.arguments.cwd : undefined]);
+}
+
 function toolTargetKey(call: ToolCall): string | undefined {
 	const path = toolCallPath(call);
 	if (path !== undefined) return JSON.stringify([call.name, "path", path]);
+	const command = normalizedIdempotentBashCommand(call);
+	if (command !== undefined) return JSON.stringify([call.name, "command", command]);
 	const pattern = call.arguments.pattern;
 	if (typeof pattern === "string" && pattern.length > 0) {
 		const paths = call.arguments.paths;
@@ -372,8 +436,9 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 		}
 	}
 
+	type ResultMeta = { key?: string; call: ToolCall; message: ToolResultMessage };
 	const lastResultIndexByKey = new Map<string, number>();
-	const resultMeta = new Map<number, { key?: string; call: ToolCall; message: ToolResultMessage }>();
+	const resultMeta = new Map<number, ResultMeta>();
 	const lastEditIndexByPath = new Map<string, number>();
 
 	for (let i = 0; i < entries.length; i++) {
@@ -432,6 +497,31 @@ function buildStalenessIndex(entries: SessionEntry[]): StalenessIndex {
 			for (const lookupPath of lookupPaths) {
 				const editIndex = lastEditIndexByPath.get(lookupPath);
 				if (editIndex !== undefined && editIndex > index) {
+					staleResultIndices.add(index);
+					break;
+				}
+			}
+		}
+	}
+
+	const readsByBasePath = new Map<string, Array<[number, ResultMeta]>>();
+	const lineRangesByCall = new Map<ToolCall, ReadLineRange[]>();
+	for (const [index, meta] of resultMeta) {
+		if (meta.call.name !== "read") continue;
+		const path = toolCallPath(meta.call);
+		if (!path) continue;
+		lineRangesByCall.set(meta.call, readLineRanges(path));
+		const basePath = readBasePath(path);
+		const group = readsByBasePath.get(basePath);
+		if (group) group.push([index, meta]);
+		else readsByBasePath.set(basePath, [[index, meta]]);
+	}
+	for (const reads of readsByBasePath.values()) {
+		if (reads.length < 2) continue;
+		for (let earlier = 0; earlier < reads.length - 1; earlier++) {
+			const [index, meta] = reads[earlier];
+			for (let later = earlier + 1; later < reads.length; later++) {
+				if (readSupersedesRead(reads[later][1].call, meta.call, lineRangesByCall)) {
 					staleResultIndices.add(index);
 					break;
 				}
@@ -527,14 +617,29 @@ export function pruneAssistantToolArguments(
 	return { argumentPrunedCount: candidates.length, argumentTokensSaved, prunedEntries };
 }
 
-export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = DEFAULT_PRUNE_CONFIG): PruneResult {
+interface ToolOutputPruneCandidate {
+	entry: SessionMessageEntry;
+	tokens: number;
+	notice: string;
+	savings: number;
+}
+
+/**
+ * Read-only pass that collects the tool-result entries that {@link pruneToolOutputs}
+ * would prune, plus the total estimated token savings. Shared by the mutating
+ * prune and the non-mutating {@link estimateToolOutputPruneSavings} so the
+ * maintenance gate (Finding 13) can decide whether pruning is worth a cache-epoch
+ * reset without rewriting history.
+ */
+function collectToolOutputPruneCandidates(
+	entries: SessionEntry[],
+	config: PruneConfig,
+): { candidates: ToolOutputPruneCandidate[]; tokensSaved: number } {
 	let accumulatedTokens = 0;
-	let tokensSaved = 0;
-	let prunedCount = 0;
 
 	const { staleResultIndices } = buildStalenessIndex(entries);
 	const staleOverridable = new Set(config.staleOverridableTools ?? []);
-	const candidates: Array<{ entry: SessionMessageEntry; tokens: number; notice: string; savings: number }> = [];
+	const candidates: ToolOutputPruneCandidate[] = [];
 
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
@@ -574,13 +679,73 @@ export function pruneToolOutputs(entries: SessionEntry[], config: PruneConfig = 
 		accumulatedTokens += tokens;
 	}
 
+	let tokensSaved = 0;
 	for (const candidate of candidates) {
 		tokensSaved += candidate.savings;
 	}
+	return { candidates, tokensSaved };
+}
 
-	if (tokensSaved < config.minimumSavings || candidates.length === 0) {
+function minimumSavings(config: PruneConfig, options: PruneToolOutputsOptions = {}): number {
+	const relaxedMinimum = options.relaxedMinimum;
+	return typeof relaxedMinimum === "number" && Number.isFinite(relaxedMinimum)
+		? Math.min(config.minimumSavings, Math.max(0, relaxedMinimum))
+		: config.minimumSavings;
+}
+
+/**
+ * Estimate the token savings {@link pruneToolOutputs} would achieve, without
+ * mutating any entry. Returns 0 savings when below the configured minimum so the
+ * caller sees the same gate the real prune enforces.
+ */
+export function estimateToolOutputPruneSavings(
+	entries: SessionEntry[],
+	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
+	options: PruneToolOutputsOptions = {},
+): { prunableCount: number; tokensSaved: number } {
+	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
+	if (tokensSaved < minimumSavings(config, options) || candidates.length === 0) {
+		return { prunableCount: 0, tokensSaved: 0 };
+	}
+	return { prunableCount: candidates.length, tokensSaved };
+}
+
+/**
+ * Evidence gate for below-threshold maintenance pruning (Finding 13). Pruning
+ * forces a prompt-cache-epoch reset, so it only runs when opted in AND the
+ * estimated stale savings clear a high minimum AND exceed the one-time reset
+ * cost (so the reclaim pays the reset back). Default-off/blocked until live
+ * evidence justifies enabling.
+ */
+export function shouldRunMaintenancePrune(args: {
+	enabled: boolean;
+	estimatedSavings: number;
+	minSavings: number;
+	cacheEpochResetCost: number;
+}): boolean {
+	if (!args.enabled) return false;
+	if (args.estimatedSavings < args.minSavings) return false;
+	return args.estimatedSavings > args.cacheEpochResetCost;
+}
+
+export interface PruneToolOutputsOptions {
+	/** Lower the usual minimum only when the caller is already over its compaction threshold. */
+	relaxedMinimum?: number;
+}
+
+export function pruneToolOutputs(
+	entries: SessionEntry[],
+	config: PruneConfig = DEFAULT_PRUNE_CONFIG,
+	options: PruneToolOutputsOptions = {},
+): PruneResult {
+	const { candidates, tokensSaved } = collectToolOutputPruneCandidates(entries, config);
+	const minimum = minimumSavings(config, options);
+
+	if (tokensSaved < minimum || candidates.length === 0) {
 		return { prunedCount: 0, tokensSaved: 0, prunedEntries: [] };
 	}
+
+	let prunedCount = 0;
 
 	const prunedAt = Date.now();
 	const prunedEntries: SessionMessageEntry[] = [];

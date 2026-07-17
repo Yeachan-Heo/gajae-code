@@ -127,15 +127,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -529,15 +523,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -913,15 +901,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -1357,15 +1339,9 @@
         "appliesToVerbs": [
           "handoff"
         ],
-        "enumValues": [
-          "deep-interview",
-          "ralplan",
-          "ultragoal",
-          "team"
-        ],
         "name": "to",
         "required": true,
-        "type": "enum"
+        "type": "string"
       },
       {
         "appliesToVerbs": [
@@ -1437,6 +1413,13 @@
       },
       {
         "appliesToVerbs": [
+          "create-goals"
+        ],
+        "name": "validation-batch-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
           "complete-goals"
         ],
         "name": "retry-failed",
@@ -1473,9 +1456,90 @@
           "checkpoint",
           "record-review-blockers",
           "steer",
-          "classify-blocker"
+          "classify-blocker",
+          "rebaseline-pipeline-overlap"
         ],
         "name": "evidence",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "create-goals"
+        ],
+        "name": "goal-metadata-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "start-pipeline-overlap"
+        ],
+        "name": "prior-goal-id",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "start-pipeline-overlap"
+        ],
+        "name": "next-goal-id",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "start-pipeline-overlap"
+        ],
+        "name": "review-handles-json",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "start-pipeline-overlap"
+        ],
+        "name": "qa-handles-json",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "start-pipeline-overlap"
+        ],
+        "name": "implementation-handle-json",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "join-pipeline-overlap",
+          "rebaseline-pipeline-overlap"
+        ],
+        "name": "overlap-id",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "join-pipeline-overlap"
+        ],
+        "name": "review-result-json",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "join-pipeline-overlap"
+        ],
+        "name": "qa-result-json",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "rebaseline-pipeline-overlap"
+        ],
+        "name": "target-state-json",
         "required": true,
         "type": "string"
       },
@@ -1498,6 +1562,14 @@
           "classify-blocker"
         ],
         "name": "goal-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "rebaseline-pipeline-overlap"
+        ],
+        "name": "goal-id",
+        "required": true,
         "type": "string"
       },
       {
@@ -1612,7 +1684,10 @@
           "checkpoint",
           "record-review-blockers",
           "steer",
-          "classify-blocker"
+          "classify-blocker",
+          "start-pipeline-overlap",
+          "join-pipeline-overlap",
+          "rebaseline-pipeline-overlap"
         ],
         "name": "json",
         "type": "boolean"
@@ -1695,6 +1770,18 @@
       },
       {
         "name": "classify-blocker",
+        "surface": "command-positional"
+      },
+      {
+        "name": "start-pipeline-overlap",
+        "surface": "command-positional"
+      },
+      {
+        "name": "join-pipeline-overlap",
+        "surface": "command-positional"
+      },
+      {
+        "name": "rebaseline-pipeline-overlap",
         "surface": "command-positional"
       },
       {

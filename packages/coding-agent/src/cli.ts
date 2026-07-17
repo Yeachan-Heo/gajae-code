@@ -4,8 +4,11 @@
  * CLI entry point — registers all commands explicitly and delegates to the
  * lightweight CLI runner from pi-utils.
  */
+import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
+import { runFixtureReport } from "./cli/fixture-report";
+import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -38,6 +41,7 @@ export const commands: CommandEntry[] = [
 	{ name: "config", load: () => import("./commands/config").then(m => m.default) },
 	{ name: "stats", load: () => import("./commands/stats").then(m => m.default) },
 	{ name: "notify", load: () => import("./commands/notify").then(m => m.default) },
+	{ name: "sdk", load: () => import("./commands/sdk").then(m => m.default) },
 	{ name: "daemon", load: () => import("./commands/daemon").then(m => m.default) },
 	{ name: "web-search", aliases: ["q"], load: () => import("./commands/web-search").then(m => m.default) },
 	{ name: "local-provider", load: () => import("./commands/local-provider").then(m => m.default) },
@@ -76,11 +80,35 @@ async function installRuntimeGlobals(): Promise<void> {
 	// `HTTP2Unsupported`. See @gajae-code/ai/utils/h2-fetch for details.
 	installH2Fetch();
 
-	// Strip macOS malloc-stack-logging env vars before any subprocess is spawned.
-	// Otherwise every child bun process (subagents, plugin installs, ptree spawns,
-	// etc.) prints a `MallocStackLogging: can't turn off …` warning to stderr.
+	const { warnIfMacOSNoFileLimitTooLow } = await import("./cli/nofile-limit");
+	warnIfMacOSNoFileLimitTooLow();
+
+	// Secondary in-process scrub of the macOS malloc-stack-logging vars. The real
+	// boundary is the darwin re-exec guard at the top of runCli(): Bun snapshots the
+	// spawn-default environment at startup, so deleting these here does NOT clean the
+	// env children inherit by default — it only tidies `process.env` for code that
+	// reads it directly. Kept as belt-and-braces for the rare re-exec-unavailable
+	// fallback; managed spawns already use filterProcessEnv and the native PTY lane
+	// strips them independently.
 	delete process.env.MallocStackLogging;
 	delete process.env.MallocStackLoggingNoCompact;
+}
+
+function isStatsHelpFastPath(argv: string[]): boolean {
+	return argv[0] === "stats" && (argv.includes("--help") || argv.includes("-h"));
+}
+
+function showStatsFastHelp(): void {
+	process.stdout.write(`Usage: ${APP_NAME} stats [options]
+
+View usage statistics
+
+Options:
+  -p, --port <number>   Port for the dashboard server (default: 3847)
+  -j, --json            Output stats as JSON
+  -s, --summary         Print summary to console
+  -h, --help            Show this help
+`);
 }
 
 function isNotifyDaemonInternalFastPath(argv: string[]): boolean {
@@ -94,6 +122,30 @@ async function runNotifyDaemonInternalFastPath(argv: string[]): Promise<void> {
 		throw new Error("invalid notify daemon-internal fast path");
 	}
 	await runNotifyCommand(cmd);
+}
+
+function isChatDaemonInternalFastPath(argv: string[]): boolean {
+	return argv[0] === "daemon" && (argv[1] === "discord-internal" || argv[1] === "slack-internal");
+}
+
+async function runChatDaemonInternalFastPath(argv: string[]): Promise<void> {
+	const action = argv[1];
+	if (action !== "discord-internal" && action !== "slack-internal") {
+		throw new Error("invalid chat daemon internal fast path");
+	}
+	const { runChatDaemonInternal } = await import("./sdk/bus/chat-daemon-cli");
+	await runChatDaemonInternal(action === "discord-internal" ? "discord" : "slack", argv.slice(2));
+}
+
+function rootFixtureArg(argv: string[]): { present: boolean; id: string | undefined } {
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		// Stop at the first subcommand token so a `--fixture` flag belonging to a
+		// subcommand never hijacks the root fast-path into fixture-report mode.
+		if (isSubcommand(arg)) return { present: false, id: undefined };
+		if (arg === "--fixture") return { present: true, id: argv[i + 1] };
+	}
+	return { present: false, id: undefined };
 }
 
 function hasRootFastFlag(argv: string[], flags: readonly string[]): boolean {
@@ -131,12 +183,17 @@ export class RootHelpCommand extends Command {
 		default: Flags.boolean({ description: "Persist --mpreset as the default model profile" }),
 		provider: Flags.string({ description: "Provider to use (legacy; prefer --model)" }),
 		"api-key": Flags.string({ description: "API key (defaults to env vars)" }),
+		credential: Flags.string({
+			description:
+				"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/email:<addr>",
+		}),
 		"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 		"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
+		"mcp-config": Flags.string({ description: "Tools-only MCP config file (absolute path)" }),
 		"allow-home": Flags.boolean({ description: "Allow starting in ~ without auto-switching to a temp dir" }),
 		mode: Flags.string({
-			description: "Output mode: text (default), json, rpc, acp, rpc-ui, or bridge",
-			options: ["text", "json", "rpc", "acp", "rpc-ui", "bridge"],
+			description: "Output mode: text (default), json, or acp",
+			options: ["text", "json", "acp"],
 		}),
 		print: Flags.boolean({ char: "p", description: "Non-interactive mode: process prompt and exit" }),
 		continue: Flags.boolean({ char: "c", description: "Continue previous session" }),
@@ -176,6 +233,7 @@ export class RootHelpCommand extends Command {
 		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
+		`# Pin a stored credential for this session\n  ${APP_NAME} --credential email:me@example.com`,
 		`# Activate a model profile for this session\n  ${APP_NAME} --mpreset codex-medium`,
 		`# Persist a model profile as the default\n  ${APP_NAME} --mpreset opencodego --default`,
 		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/--path--/session.jsonl`,
@@ -223,14 +281,74 @@ async function runSmokeTest(): Promise<void> {
 	process.stdout.write("smoke-test: ok\n");
 }
 
+/** Normalize the sole `gjc resume` alias into the value-less launch intent. */
+export function normalizeResumeAlias(argv: readonly string[]): string[] {
+	return argv.length === 1 && argv[0] === "resume" ? ["--resume"] : [...argv];
+}
+
+/** Apply the same default-launch routing used by runCli after root fast paths. */
+export function routeRootArgv(argv: readonly string[]): string[] {
+	const normalizedArgv = normalizeResumeAlias(argv);
+	const first = normalizedArgv[0];
+	return first === "--help" || first === "-h" || first === "--version" || first === "-v" || first === "help"
+		? normalizedArgv
+		: isSubcommand(first)
+			? normalizedArgv
+			: ["launch", ...normalizedArgv];
+}
+
 /** Run the CLI with the given argv (no `process.argv` prefix). */
 export async function runCli(argv: string[]): Promise<void> {
+	// macOS malloc-env launch boundary. Re-exec once with a scrubbed environment
+	// BEFORE any fast path or subprocess spawn, so the startup env snapshot Bun hands
+	// to every child lane (Bun.spawn defaults, node:child_process, native PTY, tmux
+	// owner, plugin installs, subagents) is clean. This runs ahead of the
+	// tmux-owner-isolation and notify-daemon fast paths so those lanes execute inside
+	// the already-scrubbed process too. The cheap inline predicate keeps the common
+	// (uncontaminated / non-darwin) path free of extra module loads; the guard module
+	// (MACOS_MALLOC_ENV_VARS / GJC_MALLOC_ENV_REEXEC) loads only when a re-exec is due.
+	if (
+		process.platform === "darwin" &&
+		process.env.GJC_MALLOC_ENV_REEXEC === undefined &&
+		(process.env.MallocStackLogging !== undefined || process.env.MallocStackLoggingNoCompact !== undefined)
+	) {
+		const { reexecWithScrubbedMallocEnv } = await import("./cli/malloc-env-guard");
+		const code = await reexecWithScrubbedMallocEnv();
+		if (code !== null) {
+			process.exitCode = code;
+			return;
+		}
+		// Re-exec could not be spawned; fall through and run in this process.
+	}
+	if (isTmuxOwnerIsolationCliArgv(argv)) {
+		await runTmuxOwnerIsolationCliFromStdin();
+		return;
+	}
 	if (isNotifyDaemonInternalFastPath(argv)) {
 		await runNotifyDaemonInternalFastPath(argv);
 		return;
 	}
+	if (isChatDaemonInternalFastPath(argv)) {
+		await runChatDaemonInternalFastPath(argv);
+		return;
+	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();
+		return;
+	}
+	const fixtureArg = rootFixtureArg(argv);
+	if (fixtureArg.present) {
+		const id = fixtureArg.id;
+		if (!id || id.startsWith("-")) {
+			process.stderr.write(`${APP_NAME} --fixture requires a fixture id\n`);
+			process.exitCode = 1;
+			return;
+		}
+		process.exitCode = await runFixtureReport(id);
+		return;
+	}
+	if (isStatsHelpFastPath(argv)) {
+		showStatsFastHelp();
 		return;
 	}
 	if (hasRootHelpFlag(argv)) {
@@ -250,13 +368,7 @@ export async function runCli(argv: string[]): Promise<void> {
 	await installRuntimeGlobals();
 	// --help and --version are handled by run() directly, don't rewrite those.
 	// Everything else that isn't a known subcommand routes to "launch".
-	const first = argv[0];
-	const runArgv =
-		first === "--help" || first === "-h" || first === "--version" || first === "-v" || first === "help"
-			? argv
-			: isSubcommand(first)
-				? argv
-				: ["launch", ...argv];
+	const runArgv = routeRootArgv(argv);
 	return run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp });
 }
 

@@ -28,6 +28,7 @@ import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-respo
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
 import type { OpenAIResponsesOptions } from "./providers/openai-responses";
 import type { AssistantMessageEventStream } from "./utils/event-stream";
+import type { FallbackAttemptToken, TransportFailureFacts } from "./utils/fallback-transport";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream";
 
@@ -76,6 +77,23 @@ export type ThinkingControlMode =
 	| "google-level"
 	| "anthropic-adaptive"
 	| "anthropic-budget-effort";
+
+/** Canonical runtime vocabulary for provider thinking transports. */
+export const THINKING_CONTROL_MODES = [
+	"effort",
+	"budget",
+	"google-level",
+	"anthropic-adaptive",
+	"anthropic-budget-effort",
+] as const satisfies readonly ThinkingControlMode[];
+
+type _CheckThinkingControlModes = [
+	Exclude<ThinkingControlMode, (typeof THINKING_CONTROL_MODES)[number]>,
+	Exclude<(typeof THINKING_CONTROL_MODES)[number], ThinkingControlMode>,
+] extends [never, never]
+	? true
+	: false;
+true satisfies _CheckThinkingControlModes;
 
 /** Per-model thinking capabilities used to clamp and map user-facing effort levels. */
 export interface ThinkingConfig {
@@ -306,6 +324,10 @@ export interface StreamOptions {
 	maxTokens?: number;
 	signal?: AbortSignal;
 	apiKey?: string;
+	/** Disables all transport-level replay; the fallback controller owns retries. */
+	fallbackManaged?: boolean;
+	/** Opaque token returned by beginAttempt for a managed transport invocation. */
+	fallbackAttempt?: FallbackAttemptToken;
 	/**
 	 * Called when a provider returns 401 before any replay-unsafe assistant
 	 * event has been emitted. Returning a different key retries the provider
@@ -466,6 +488,9 @@ export interface ThinkingContent {
 	thinking: string;
 	thinkingSignature?: string; // e.g., for OpenAI responses, the reasoning item ID
 	itemId?: string; // item.id from output_item.added, used to match output_item.done
+	readonly provenance?: "summary" | "raw" | "mixed";
+	readonly summaryText?: string;
+	readonly rawText?: string;
 }
 
 export interface RedactedThinkingContent {
@@ -552,6 +577,7 @@ export interface Usage {
 }
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+export type AssistantErrorKind = "provider_safety_stop";
 
 export interface OpenAIResponsesHistoryPayload {
 	type: "openaiResponsesHistory";
@@ -594,8 +620,11 @@ export interface AssistantMessage {
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
+	errorKind?: AssistantErrorKind;
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
+	/** Typed upstream failure facts retained for retry classification without parsing errorMessage. */
+	transportFailure?: TransportFailureFacts;
 	/**
 	 * Stable identifiers for request features the provider silently dropped
 	 * during this turn (e.g. `"priority"`). Set when a server-side rejection
@@ -703,6 +732,13 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	 * calls route correctly. Absent for regular JSON function tools.
 	 */
 	customWireName?: string;
+	/**
+	 * Optional safe projection for tool arguments or results. Extensions use this
+	 * only for explicitly opt-in, display-safe summaries.
+	 */
+	safeSummary?: (kind: "args" | "result", value: unknown) => string | undefined;
+	/** Allowlisted argument/result field names for a safe fallback summary. */
+	safeSummaryFields?: { args?: string[]; result?: string[] };
 }
 
 export interface Context {
@@ -719,6 +755,9 @@ export type AssistantMessageEvent =
 	| { type: "thinking_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "thinking_end"; contentIndex: number; content: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "reasoning_summary_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "reasoning_summary_end"; contentIndex: number; content: string; partial: AssistantMessage }
 	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
@@ -937,10 +976,9 @@ export interface Model<TApi extends Api = any> {
 	 * (or compatible) host; `headers.Authorization` (or `apiKey` resolved by
 	 * the registry) carries the gateway bearer.
 	 *
-	 * Used by containerized gjc installs (e.g. robogjc slots) to route every
-	 * LLM call through a sidecar gateway that holds the real provider
-	 * credentials. The model's other metadata (pricing, context window,
-	 * thinking config, …) still resolves locally; only the streaming
+	 * Used by containerized GJC installs to route every LLM call through a
+	 * sidecar gateway that holds the real provider credentials. The model's other
+	 * metadata (pricing, context window, thinking config, …) still resolves locally; only the streaming
 	 * dispatch is redirected.
 	 */
 	transport?: "pi-native";

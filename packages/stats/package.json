@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/stats",
-	"version": "0.8.1",
+	"version": "0.11.1",
 	"description": "Local observability dashboard for pi AI usage statistics",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo",
@@ -31,7 +31,7 @@
 		"build": "bun run build.ts",
 		"dev": "bun run src/index.ts",
 		"check": "biome check . && bun run check:types",
-		"check:types": "tsgo -p tsconfig.json --noEmit && tsgo -p tsconfig.client.json --noEmit",
+		"check:types": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
 		"lint": "biome lint .",
 		"fix": "biome check --write --unsafe .",
 		"fmt": "biome format --write ."

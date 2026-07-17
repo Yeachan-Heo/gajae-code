@@ -1,10 +1,32 @@
 import { describe, expect, it } from "bun:test";
 import { adviseForkContextMode } from "../../src/task/fork-context-advisory";
+import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "../../src/task/fork-context-budget";
 import type { ForkContextMode } from "../../src/task/types";
 
 const FORK_CONTEXT_MODES: ForkContextMode[] = ["none", "receipt", "last-turn", "bounded", "full"];
 
 describe("fork context advisory", () => {
+	it("uses the shared fork-context token budgets", () => {
+		expect(FORK_CONTEXT_TOKEN_BUDGET_BY_MODE).toEqual({
+			none: 0,
+			receipt: 2000,
+			"last-turn": 4000,
+			bounded: 8000,
+			full: 15000,
+		});
+	});
+
+	it("pins advisory clone ceilings to the shared no-drift budget map", () => {
+		const estimates = adviseForkContextMode({
+			assignment: "x",
+			parentContextTokens: Number.MAX_SAFE_INTEGER,
+		}).estimatedClonedTokens;
+		expect(estimates.none).toBe(FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.none);
+		expect(estimates.receipt).toBe(FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.receipt);
+		expect(estimates["last-turn"]).toBe(FORK_CONTEXT_TOKEN_BUDGET_BY_MODE["last-turn"]);
+		expect(estimates.bounded).toBe(FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.bounded);
+		expect(estimates.full).toBe(FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.full);
+	});
 	it("defaults to no inherited context (zero parent clones zero in every mode)", () => {
 		const advisory = adviseForkContextMode({ assignment: "Implement the scoped helper." });
 

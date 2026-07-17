@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage, ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
-import { computeLineHash, formatSessionDumpText, RpcClient } from "@gajae-code/coding-agent";
+import { computeLineHash, formatSessionDumpText } from "@gajae-code/coding-agent";
 import { prompt } from "@gajae-code/utils";
 import { diffLines } from "diff";
 import { formatDirectory } from "./formatter";
@@ -23,7 +23,6 @@ import { verifyExpectedFileSubset, verifyExpectedFiles } from "./verify";
 const REPO_ROOT = path.resolve(import.meta.dir, "..", "..", "..");
 const RUNS_DIR = path.join(REPO_ROOT, "runs");
 const TMP = path.join(RUNS_DIR, `rb-${Math.random().toString(36).slice(2, 10)}`);
-const CLI_PATH = Bun.fileURLToPath(import.meta.resolve("@gajae-code/coding-agent/cli"));
 
 function formatLogPath(logFile: string): string {
 	const relativePath = path.relative(REPO_ROOT, logFile);
@@ -999,31 +998,19 @@ async function runSingleTask(
 				config.editFuzzyThreshold === "auto" ? "auto" : String(config.editFuzzyThreshold);
 		process.env.PI_NO_TITLE = "1";
 
-		const useInProcess = config.inProcess !== false;
-		const client: BenchmarkClient = useInProcess
-			? new InProcessClient({
-					cwd,
-					model: config.model,
-					appendSystemPrompt: buildBenchmarkSystemPrompt({ multiFile: false, config }),
-					tools: [...BENCHMARK_TOOL_NAMES],
-					editVariant: config.editVariant,
-					editFuzzy: config.editFuzzy,
-					editFuzzyThreshold: config.editFuzzyThreshold,
-					shared,
-				})
-			: (() => {
-					const rpc = new RpcClient({
-						cliPath: CLI_PATH,
-						cwd,
-						provider: config.provider,
-						model: config.model,
-						args: sessionSetup.rpcArgs,
-						env: { ...process.env } as Record<string, string>,
-					});
-					return Object.assign(rpc, {
-						dispose: async () => rpc[Symbol.dispose](),
-					}) as unknown as BenchmarkClient;
-				})();
+		if (config.inProcess === false) {
+			throw new Error("The RPC benchmark client was removed; the benchmark now runs in-process only.");
+		}
+		const client: BenchmarkClient = new InProcessClient({
+			cwd,
+			model: config.model,
+			appendSystemPrompt: buildBenchmarkSystemPrompt({ multiFile: false, config }),
+			tools: [...BENCHMARK_TOOL_NAMES],
+			editVariant: config.editVariant,
+			editFuzzy: config.editFuzzy,
+			editFuzzyThreshold: config.editFuzzyThreshold,
+			shared,
+		});
 
 		try {
 			await client.start();

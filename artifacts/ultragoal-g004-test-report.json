@@ -1,0 +1,41 @@
+{
+	"schemaVersion": 1,
+	"kind": "package-test-report",
+	"story": "G004 resolve G001 release-prep review blockers",
+	"headCommit": "84a4585a6de2abbaafd6ad66f6a71df666851618",
+	"fixCommits": [
+		"6a62bf3b fix(coding-agent): return a defensive copy from extension getSystemPrompt()",
+		"84a4585a test(coding-agent): make the system-prompt defensive-copy regression test real"
+	],
+	"suites": [
+		{
+			"command": "bun test test/extensions-runner.test.ts test/context-usage-ssot-redteam.test.ts test/status-line-context-cache.test.ts",
+			"cwd": "packages/coding-agent",
+			"result": "61 pass / 0 fail / 167 expect() calls across 3 files"
+		},
+		{
+			"command": "bunx tsc -p tsconfig.json --noEmit",
+			"cwd": "packages/coding-agent",
+			"result": "clean"
+		},
+		{
+			"command": "bunx biome check src/extensibility/extensions/runner.ts src/modes/controllers/extension-ui-controller.ts src/session/agent-session.ts test/extensions-runner.test.ts",
+			"cwd": "packages/coding-agent",
+			"result": "Checked 4 files. No fixes applied."
+		}
+	],
+	"mutationExperiment": {
+		"description": "Reverted the defensive spread at runner.ts:487 via sd, reran the suite, restored the file.",
+		"withCopyRemoved": "1 fail: expect(livePrompt) received [\"mutated-by-extension\", \"second block\", \"appended-by-extension\"]",
+		"withCopyRestored": "29 pass / 0 fail"
+	},
+	"reviewReceipts": {
+		"architectResign": "subagent 4-G001ResignArchitect: architectureStatus CLEAR, productStatus CLEAR, codeStatus CLEAR, recommendation APPROVE, blockers []",
+		"executorQa": "subagent 3-G001FinalExecutorQA: e2eStatus passed, redTeamStatus passed, blockers []",
+		"priorRounds": [
+			"subagent 0-G001ArchitectReview: CLEAR/CLEAR/WATCH APPROVE, LOW finding fixed in 6a62bf3b",
+			"subagent 1-G001ExecutorQA: 3 blockers -> artifact committed; stashes rebutted (pre-v0.10.0 historical); private 0.0.1 packages rebutted (release.ts skips private)",
+			"subagent 2-G001FinalArchitectReview: MEDIUM vacuous-test blocker -> fixed in 84a4585a"
+		]
+	}
+}

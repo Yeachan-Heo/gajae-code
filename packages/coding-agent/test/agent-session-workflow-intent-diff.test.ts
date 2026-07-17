@@ -8,18 +8,10 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { type CustomEntry, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import type { WorkflowIntentDiff } from "@gajae-code/coding-agent/workflow/workflow-intent-diff";
 import { TempDir } from "@gajae-code/utils";
 
-type WorkflowIntentDiffEntry = CustomEntry<{
-	readonly route: string;
-	readonly recommendedSkill?: string;
-	readonly recommendedInvocation?: string;
-	readonly directTracking: string;
-	readonly rootCausePhase: {
-		readonly status: string;
-		readonly triggers: readonly string[];
-	};
-}>;
+type WorkflowIntentDiffEntry = CustomEntry<WorkflowIntentDiff>;
 
 describe("AgentSession workflow intent-diff tracking", () => {
 	let tempDir: TempDir;
@@ -77,6 +69,43 @@ describe("AgentSession workflow intent-diff tracking", () => {
 			directTracking: "custom-entry-only",
 			rootCausePhase: { status: "inactive", triggers: [] },
 		});
+		expect(entry?.data?.claimsLedger.claims).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "workflow-route",
+					evidence: expect.arrayContaining(["route: direct", "trigger: low-risk direct"]),
+				}),
+				expect.objectContaining({
+					id: "root-cause-phase",
+					evidence: expect.arrayContaining(["root-cause: inactive"]),
+				}),
+			]),
+		);
+		expect(entry?.data?.consensusReport).toMatchObject({
+			version: 1,
+			route: "direct",
+			confidence: "high",
+			escalationGate: {
+				status: "not-required",
+				reason: "clear low-risk prompt stays on direct implementation path",
+			},
+		});
+		expect(entry?.data?.consensusReport.observerSignals).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					observer: "intent-router",
+					conclusion: "direct",
+				}),
+				expect.objectContaining({
+					observer: "root-cause-schema",
+					conclusion: "inactive",
+				}),
+				expect.objectContaining({
+					observer: "escalation-gate",
+					conclusion: "not-required",
+				}),
+			]),
+		);
 		expect(session.agent.state.messages).not.toEqual(
 			expect.arrayContaining([expect.objectContaining({ customType: "workflow-intent-diff" })]),
 		);
@@ -93,7 +122,23 @@ describe("AgentSession workflow intent-diff tracking", () => {
 			recommendedInvocation: "/skill:ralplan --deliberate",
 			directTracking: "not-direct",
 			rootCausePhase: { status: "active" },
+			consensusReport: {
+				route: "ralplan",
+				confidence: "high",
+				escalationGate: {
+					status: "required",
+					reason: "/skill:ralplan --deliberate",
+				},
+			},
 		});
+		expect(combinedRisk?.data?.claimsLedger.claims).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "escalation-gate",
+					evidence: expect.arrayContaining(["escalation: required", "invocation: /skill:ralplan --deliberate"]),
+				}),
+			]),
+		);
 		expect(combinedRisk?.data?.rootCausePhase.triggers).toEqual(
 			expect.arrayContaining(["regression", "high-risk transition"]),
 		);

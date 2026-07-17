@@ -454,7 +454,7 @@ export class WorkerCore {
 			});
 			if (payload.mode === "headless") {
 				this.#page = await this.#browser.newPage();
-				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
+				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null }, payload.geo);
 				await applyViewport(this.#page, payload.viewport);
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 				if (payload.url) {

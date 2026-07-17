@@ -13,7 +13,12 @@
  */
 import { describe, expect, it } from "bun:test";
 import { type SkillPromptDetails, stripInternalDetailsFields } from "@gajae-code/coding-agent/session/messages";
-import { type CustomMessageEntry, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	type CustomMessageEntry,
+	getSessionMessageEntryId,
+	SessionManager,
+	transferSessionMessageIdentity,
+} from "@gajae-code/coding-agent/session/session-manager";
 
 const SKILL_TYPE = "skill-prompt";
 
@@ -26,6 +31,26 @@ function readPersistedCustomMessageEntry<T>(session: SessionManager, id: string)
 	return entry as CustomMessageEntry<T>;
 }
 
+describe("SessionManager message entry identity", () => {
+	it("preserves entry IDs across cached context clones", () => {
+		const session = SessionManager.inMemory();
+		const firstEntryId = session.appendMessage({ role: "user", content: "duplicate", timestamp: 1 });
+		const secondEntryId = session.appendMessage({ role: "user", content: "duplicate", timestamp: 1 });
+		const first = session.buildSessionContext();
+		const second = session.buildSessionContext();
+
+		expect(first.messages[0]).not.toBe(second.messages[0]);
+		expect(getSessionMessageEntryId(first.messages[0])).toBe(firstEntryId);
+		expect(getSessionMessageEntryId(first.messages[1])).toBe(secondEntryId);
+		expect(getSessionMessageEntryId(second.messages[0])).toBe(firstEntryId);
+		expect(getSessionMessageEntryId(second.messages[1])).toBe(secondEntryId);
+	});
+
+	it("rejects positional transfer across different message counts", () => {
+		const message = { role: "user" as const, content: "message", timestamp: 1 };
+		expect(() => transferSessionMessageIdentity([message], [])).toThrow("1 source and 0 target messages");
+	});
+});
 describe("SessionManager.appendCustomMessageEntry (allowlist strip + persistence contract)", () => {
 	it("F1: strips __pendingDisplayTag from persisted details while preserving all other SkillPromptDetails fields", () => {
 		const session = SessionManager.inMemory();

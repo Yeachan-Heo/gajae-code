@@ -1,18 +1,13 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import CoordinatorCommand from "../src/commands/coordinator";
-import McpServeCommand from "../src/commands/mcp-serve";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 } from "../src/coordinator/contract";
-import { createCoordinatorSafetyPolicy } from "../src/coordinator-mcp/safety";
 import { createCoordinatorMcpServer, handleCoordinatorMcpRequest } from "../src/coordinator-mcp/server";
-
-const ORIGINAL_STDOUT_WRITE = process.stdout.write.bind(process.stdout);
 
 async function withTempRoot(run: (root: string) => Promise<void>): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-mcp-"));
@@ -23,570 +18,55 @@ async function withTempRoot(run: (root: string) => Promise<void>): Promise<void>
 	}
 }
 
-async function runCommand(argv: string[]): Promise<string> {
-	let output = "";
-	const writeSpy = spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
-		output += chunk.toString();
-		return true;
-	});
-	try {
-		const command = new McpServeCommand(argv, { bin: "gjc", version: "0.0.0-test", commands: new Map() });
-		await command.run();
-		return output;
-	} finally {
-		writeSpy.mockRestore();
-	}
-}
-
-async function runHermesCommand(argv: string[]): Promise<string> {
-	let output = "";
-	const writeSpy = spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
-		output += chunk.toString();
-		return true;
-	});
-	try {
-		const command = new CoordinatorCommand(argv, { bin: "gjc", version: "0.0.0-test", commands: new Map() });
-		await command.run();
-		return output;
-	} finally {
-		writeSpy.mockRestore();
-	}
-}
-
-afterEach(() => {
-	process.stdout.write = ORIGINAL_STDOUT_WRITE;
-	process.exitCode = 0;
-});
-
-describe("gjc mcp-serve coordinator", () => {
-	it("exposes a checkable Hermes MCP command and rejects unknown subcommands as JSON", async () => {
-		const ok = JSON.parse(await runCommand(["coordinator", "--check", "--json"]));
-		expect(ok).toEqual({
-			ok: true,
-			server: { name: COORDINATOR_MCP_SERVER_NAME, protocolVersion: COORDINATOR_MCP_PROTOCOL_VERSION },
-			readOnly: true,
-			tools: [...COORDINATOR_MCP_TOOL_NAMES],
-		});
-
-		const rejected = JSON.parse(await runCommand(["bogus", "--json"]));
-		expect(rejected).toEqual({ ok: false, reason: "unknown_mcp_serve_subcommand", subcommand: "bogus" });
-		expect(process.exitCode).toBe(1);
-		process.exitCode = 0;
-	});
-
-	it("exposes the same Hermes contract through the read-only CLI adapter", async () => {
-		const ok = JSON.parse(await runHermesCommand(["--json"]));
-		expect(ok).toEqual({
-			ok: true,
-			server: { name: COORDINATOR_MCP_SERVER_NAME, protocolVersion: COORDINATOR_MCP_PROTOCOL_VERSION },
-			readOnly: true,
-			tools: [...COORDINATOR_MCP_TOOL_NAMES],
-		});
-
-		const tools = JSON.parse(await runHermesCommand(["tools", "--json"]));
-		expect(tools).toEqual({ ok: true, tools: [...COORDINATOR_MCP_TOOL_NAMES] });
-	});
-
-	it("implements initialize, tools/list, and read-only mutating rejection", async () => {
-		const env = { GJC_COORDINATOR_MCP_REPO: "repo-a" };
-		const initialize = await handleCoordinatorMcpRequest({ jsonrpc: "2.0", id: 1, method: "initialize" }, { env });
-		expect(initialize).toEqual({
-			jsonrpc: "2.0",
-			id: 1,
-			result: {
-				protocolVersion: "2024-11-05",
-				capabilities: { tools: {}, prompts: {}, resources: {} },
-				serverInfo: { name: "gjc-coordinator-mcp", version: expect.any(String) },
-			},
-		});
-
-		const listed = await handleCoordinatorMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { env });
-		expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toContain("gjc_coordinator_report_status");
-		const prompts = await handleCoordinatorMcpRequest({ jsonrpc: "2.0", id: 20, method: "prompts/list" }, { env });
-		expect(prompts.result.prompts).toEqual([]);
-
-		const resources = await handleCoordinatorMcpRequest(
-			{ jsonrpc: "2.0", id: 21, method: "resources/list" },
-			{ env },
-		);
-		expect(resources.result.resources).toEqual([]);
-
-		const called = await handleCoordinatorMcpRequest(
-			{
+describe("canonical SDK coordinator compatibility handler", () => {
+	it("serves initialization and the canonical tool inventory", async () => {
+		await withTempRoot(async root => {
+			const env = { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root };
+			const initialized = await handleCoordinatorMcpRequest(
+				{ jsonrpc: "2.0", id: 1, method: "initialize" },
+				{ env },
+			);
+			expect(initialized).toMatchObject({
 				jsonrpc: "2.0",
-				id: 3,
-				method: "tools/call",
-				params: { name: "gjc_coordinator_start_session", arguments: { cwd: process.cwd(), allow_mutation: true } },
-			},
-			{ env },
-		);
-		const payload = JSON.parse(called.result.content[0].text);
-		expect(payload).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled:sessions" });
-	});
-
-	it("requires startup mutation class and per-call allow_mutation for mutating tools", async () => {
-		await withTempRoot(async root => {
-			let created = false;
-			const env = {
-				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
-				GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES: "session",
-			};
-			const missingPerCall = await handleCoordinatorMcpRequest(
-				{
-					jsonrpc: "2.0",
-					id: 1,
-					method: "tools/call",
-					params: { name: "gjc_coordinator_start_session", arguments: { cwd: root } },
-				},
-				{
-					env,
-					createSession: () => {
-						created = true;
-						return { name: "x", attached: false, windows: 1, panes: 1, bindings: "root", createdAt: "now" };
-					},
-				},
-			);
-			expect(JSON.parse(missingPerCall.result.content[0].text)).toEqual({
-				ok: false,
-				reason: "coordinator_mutation_call_not_allowed:sessions",
-			});
-
-			const allowed = await handleCoordinatorMcpRequest(
-				{
-					jsonrpc: "2.0",
-					id: 2,
-					method: "tools/call",
-					params: { name: "gjc_coordinator_start_session", arguments: { cwd: root, allow_mutation: true } },
-				},
-				{
-					env,
-					createSession: () => {
-						created = true;
-						return { name: "x", attached: false, windows: 1, panes: 1, bindings: "root", createdAt: "now" };
-					},
-				},
-			);
-			expect(created).toBe(true);
-			const allowedPayload = JSON.parse(allowed.result.content[0].text);
-			expect(allowedPayload).toMatchObject({
-				ok: true,
-				session: {
-					session_id: "x",
-					name: "x",
-					attached: false,
-					windows: 1,
-					panes: 1,
-					bindings: "root",
-					created_at: "now",
-					createdAt: "now",
-				},
-				session_state: {
-					session_id: "x",
-					state: "ready_for_input",
-					ready_for_input: true,
+				id: 1,
+				result: {
+					protocolVersion: COORDINATOR_MCP_PROTOCOL_VERSION,
+					serverInfo: { name: COORDINATOR_MCP_SERVER_NAME, version: expect.any(String) },
+					capabilities: { tools: {}, prompts: {}, resources: {} },
 				},
 			});
-		});
-	});
-
-	it("canonicalizes workdir roots and rejects traversal plus symlink escapes", async () => {
-		await withTempRoot(async root => {
-			const outside = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-outside-"));
-			try {
-				const link = path.join(root, "escape");
-				await fs.symlink(outside, link);
-				const policy = await createCoordinatorSafetyPolicy({
-					env: { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root },
-				});
-				expect(await policy.resolveWorkdir(path.join(root, "..", path.basename(root)))).toBe(root);
-				await expect(policy.resolveWorkdir(path.join(root, "..", path.basename(outside)))).rejects.toThrow(
-					"workdir_outside_allowed_roots",
-				);
-				await expect(policy.resolveWorkdir(link)).rejects.toThrow("workdir_outside_allowed_roots");
-			} finally {
-				await fs.rm(outside, { recursive: true, force: true });
-			}
-		});
-	});
-
-	it("bounds artifact reads and denies unsafe roots", async () => {
-		await withTempRoot(async root => {
-			const artifact = path.join(root, "artifact.txt");
-			await Bun.write(artifact, "🙂🙂abcdef");
-			const byteCap = 5;
-			const env = {
-				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
-				GJC_COORDINATOR_MCP_ARTIFACT_MAX_BYTES: String(byteCap),
-			};
-			const server = await createCoordinatorMcpServer({ env });
-			const read = await server.callTool("gjc_coordinator_read_artifact", { path: artifact });
-			expect(read.ok).toBe(true);
-			expect(read.path).toBe(artifact);
-			expect(read.bytes).toBeLessThanOrEqual(byteCap);
-			expect(read.truncated).toBe(true);
-			expect(Buffer.byteLength(String(read.text))).toBeLessThanOrEqual(byteCap);
-			await expect(
-				server.callTool("gjc_coordinator_read_artifact", { path: path.join(os.tmpdir(), "missing.txt") }),
-			).resolves.toEqual({
-				ok: false,
-				reason: "artifact_outside_allowed_roots",
-			});
-		});
-	});
-
-	it("runs a generic controller lifecycle smoke without provider credentials or local config", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const artifact = path.join(root, "result.txt");
-			await Bun.write(artifact, "generic controller evidence");
-			const env = {
-				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
-				GJC_COORDINATOR_MCP_MUTATIONS: "sessions,questions,reports",
-				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
-				GJC_COORDINATOR_MCP_PROFILE: "generic-controller",
-				GJC_COORDINATOR_MCP_REPO: "repo-a",
-			};
-			const server = await createCoordinatorMcpServer({
-				env,
-				services: {
-					startSession: input => ({
-						name: "generic-controller-session",
-						cwd: input.cwd,
-						createdAt: "now",
-					}),
-				},
-			});
-
-			const listed = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+			const listed = await handleCoordinatorMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" }, { env });
 			expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
 				...COORDINATOR_MCP_TOOL_NAMES,
 			]);
-			for (const tool of listed.result.tools as Array<{ name: string; inputSchema: { type?: string } }>) {
-				expect(tool.inputSchema.type).toBe("object");
-			}
-
-			const deniedStart = await server.callTool("gjc_coordinator_start_session", { cwd: root });
-			expect(deniedStart).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed:sessions" });
-
-			const started = await server.callTool("gjc_coordinator_start_session", {
-				cwd: root,
-				allow_mutation: true,
-			});
-			expect(started).toMatchObject({
-				ok: true,
-				session: { session_id: "generic-controller-session", cwd: root },
-				session_state: { state: "ready_for_input" },
-			});
-
-			const sent = await server.callTool("gjc_coordinator_send_prompt", {
-				session_id: "generic-controller-session",
-				prompt: "Run a mocked generic controller task.",
-				allow_mutation: true,
-			});
-			expect(sent).toMatchObject({
-				ok: true,
-				session_id: "generic-controller-session",
-				status: "active",
-			});
-			const turnId = String(sent.turn_id);
-
-			const activeConflict = await server.callTool("gjc_coordinator_send_prompt", {
-				session_id: "generic-controller-session",
-				prompt: "Second prompt should be protected.",
-				allow_mutation: true,
-			});
-			expect(activeConflict).toMatchObject({ ok: false, reason: "active_turn_exists", active_turn_id: turnId });
-
-			const queued = await server.callTool("gjc_coordinator_send_prompt", {
-				session_id: "generic-controller-session",
-				prompt: "Queued follow-up.",
-				queue: true,
-				allow_mutation: true,
-			});
-			expect(queued).toMatchObject({ ok: true, status: "queued", queued: true, active_turn_id: turnId });
-
-			const questionDir = path.join(stateRoot, "generic-controller", "repo-a", "questions");
-			await fs.mkdir(questionDir, { recursive: true });
-			await Bun.write(
-				path.join(questionDir, "question-1.json"),
-				JSON.stringify({
-					question_id: "question-1",
-					session_id: "generic-controller-session",
-					turn_id: turnId,
-					status: "pending",
-				}),
+			const promptTool = listed.result.tools.find(
+				(tool: { name: string }) => tool.name === "gjc_coordinator_send_prompt",
 			);
-			const questionAnswer = await server.callTool("gjc_coordinator_submit_question_answer", {
-				session_id: "generic-controller-session",
-				turn_id: turnId,
-				question_id: "question-1",
-				answer: { decision: "approve" },
-				allow_mutation: true,
-			});
-			expect(questionAnswer).toMatchObject({ ok: true, question: { status: "answered" } });
-
-			const reported = await server.callTool("gjc_coordinator_report_status", {
-				session_id: "generic-controller-session",
-				turn_id: turnId,
-				status: "completed",
-				summary: "Mocked lifecycle completed.",
-				evidence_paths: [artifact],
-				allow_mutation: true,
-			});
-			expect(reported).toMatchObject({
-				ok: true,
-				turn: { status: "completed", final_response: { text: "Mocked lifecycle completed." } },
-				promoted_turn: { status: "active" },
-			});
-
-			const readTurn = await server.callTool("gjc_coordinator_read_turn", {
-				session_id: "generic-controller-session",
-				turn_id: turnId,
-			});
-			expect(readTurn).toMatchObject({ ok: true, turn: { status: "completed" } });
-
-			const reports = await server.callTool("gjc_coordinator_read_coordination_status");
-			expect(reports.ok).toBe(true);
-			expect((reports.reports as Array<{ status?: string }>).some(report => report.status === "completed")).toBe(
-				true,
-			);
-		});
-	});
-});
-
-describe("coordinator delegate tools", () => {
-	const delegateNames = ["gjc_delegate_plan", "gjc_delegate_execute", "gjc_delegate_team"] as const;
-
-	function delegateEnv(root: string, stateRoot: string, mutations = "sessions") {
-		return {
-			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
-			GJC_COORDINATOR_MCP_MUTATIONS: mutations,
-			GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
-			GJC_COORDINATOR_MCP_PROFILE: "delegate",
-			GJC_COORDINATOR_MCP_REPO: "repo-a",
-		};
-	}
-
-	function delegateServices() {
-		return {
-			startSession: (input: { cwd: string }) => ({
-				name: "delegate-session",
-				cwd: input.cwd,
-				createdAt: "now",
-			}),
-		};
-	}
-
-	it("lists the three delegate tools in tools/list without provider credentials", async () => {
-		await withTempRoot(async root => {
-			const server = await createCoordinatorMcpServer({ env: { GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root } });
-			const listed = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "tools/list" });
-			const names = (listed.result.tools as Array<{ name: string }>).map(tool => tool.name);
-			for (const delegate of delegateNames) {
-				expect(names).toContain(delegate);
-			}
+			expect(promptTool.inputSchema.required).toEqual(expect.arrayContaining(["idempotency_key", "allow_mutation"]));
 		});
 	});
 
-	it("rejects delegate when startup mutation class is disabled", async () => {
+	it("preserves mutation authorization and read-only artifact boundaries", async () => {
 		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const server = await createCoordinatorMcpServer({
+			const artifact = path.join(root, "result.txt");
+			await Bun.write(artifact, "coordinator artifact");
+			const server = createCoordinatorMcpServer({
 				env: {
 					GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
-					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
-					GJC_COORDINATOR_MCP_PROFILE: "delegate",
-					GJC_COORDINATOR_MCP_REPO: "repo-a",
-				},
-				services: delegateServices(),
-			});
-			const denied = await server.callTool("gjc_delegate_plan", {
-				cwd: root,
-				task: "Plan it",
-				allow_mutation: true,
-			});
-			expect(denied).toEqual({ ok: false, reason: "coordinator_mutation_class_disabled:sessions" });
-		});
-	});
-
-	it("rejects delegate when per-call allow_mutation is missing", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const server = await createCoordinatorMcpServer({
-				env: delegateEnv(root, stateRoot),
-				services: delegateServices(),
-			});
-			const denied = await server.callTool("gjc_delegate_execute", { cwd: root, task: "Run it" });
-			expect(denied).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed:sessions" });
-		});
-	});
-
-	it("rejects delegate when no workdir roots are configured", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const server = await createCoordinatorMcpServer({
-				env: {
 					GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
-					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
-					GJC_COORDINATOR_MCP_PROFILE: "delegate",
-					GJC_COORDINATOR_MCP_REPO: "repo-a",
 				},
-				services: delegateServices(),
 			});
-			const denied = await server.callTool("gjc_delegate_plan", { cwd: root, task: "x", allow_mutation: true });
-			expect(denied).toEqual({ ok: false, reason: "coordinator_workdir_roots_required" });
-		});
-	});
-
-	it("rejects delegate when cwd is outside allowed roots", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const server = await createCoordinatorMcpServer({
-				env: delegateEnv(root, stateRoot),
-				services: delegateServices(),
-			});
-			const denied = await server.callTool("gjc_delegate_plan", {
-				cwd: os.tmpdir(),
-				task: "x",
-				allow_mutation: true,
-			});
-			expect(denied.ok).toBe(false);
-			expect(String(denied.reason)).toContain("coordinator_workdir_outside_allowed_roots");
-		});
-	});
-
-	it("rejects delegate when neither task nor prompt is provided", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const server = await createCoordinatorMcpServer({
-				env: delegateEnv(root, stateRoot),
-				services: delegateServices(),
-			});
-			const denied = await server.callTool("gjc_delegate_plan", { cwd: root, allow_mutation: true });
-			expect(denied).toEqual({ ok: false, reason: "task_required" });
-		});
-	});
-
-	it("starts a fresh session and sends a workflow-tagged turn", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const server = await createCoordinatorMcpServer({
-				env: delegateEnv(root, stateRoot),
-				services: delegateServices(),
-			});
-			const result = await server.callTool("gjc_delegate_plan", {
-				cwd: root,
-				task: "Draft a plan for the parser.",
-				allow_mutation: true,
-			});
-			expect(result).toMatchObject({
+			expect(
+				await server.callTool("gjc_coordinator_start_session", { cwd: root, idempotency_key: "start-1" }),
+			).toEqual({ ok: false, reason: "coordinator_mutation_call_not_allowed:sessions" });
+			expect(await server.callTool("gjc_coordinator_read_artifact", { path: artifact })).toMatchObject({
 				ok: true,
-				workflow: "plan",
-				tool_name: "gjc_delegate_plan",
-				session_id: "delegate-session",
-				status: "active",
+				text: "coordinator artifact",
 			});
-			expect(String((result.turn as { prompt?: { text?: string } }).prompt?.text)).toContain("/skill:ralplan");
-			expect(String((result.turn as { prompt?: { text?: string } }).prompt?.text)).toContain(
-				"Draft a plan for the parser.",
-			);
-		});
-	});
-
-	it("returns session_cwd_mismatch when reusing a session from a different cwd", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const sub = path.join(root, "sub");
-			await fs.mkdir(sub, { recursive: true });
-			const server = await createCoordinatorMcpServer({
-				env: delegateEnv(root, stateRoot),
-				services: delegateServices(),
+			expect(await server.callTool("gjc_coordinator_read_artifact", { path: os.tmpdir() })).toEqual({
+				ok: false,
+				reason: "artifact_outside_allowed_roots",
 			});
-			const fresh = await server.callTool("gjc_delegate_plan", {
-				cwd: root,
-				task: "First task.",
-				allow_mutation: true,
-			});
-			const sessionId = String(fresh.session_id);
-			const mismatch = await server.callTool("gjc_delegate_execute", {
-				cwd: sub,
-				session_id: sessionId,
-				task: "Different cwd should be rejected.",
-				allow_mutation: true,
-			});
-			expect(mismatch).toEqual({ ok: false, reason: "session_cwd_mismatch", session_id: sessionId });
-		});
-	});
-
-	it("protects an active turn and supports queue and force on reuse", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const server = await createCoordinatorMcpServer({
-				env: delegateEnv(root, stateRoot),
-				services: delegateServices(),
-			});
-			const first = await server.callTool("gjc_delegate_plan", { cwd: root, task: "First.", allow_mutation: true });
-			const sessionId = String(first.session_id);
-			const turnId = String(first.turn_id);
-
-			const conflict = await server.callTool("gjc_delegate_execute", {
-				cwd: root,
-				session_id: sessionId,
-				task: "Second.",
-				allow_mutation: true,
-			});
-			expect(conflict).toMatchObject({ ok: false, reason: "active_turn_exists", active_turn_id: turnId });
-
-			const queued = await server.callTool("gjc_delegate_execute", {
-				cwd: root,
-				session_id: sessionId,
-				task: "Queued.",
-				queue: true,
-				allow_mutation: true,
-			});
-			expect(queued).toMatchObject({ ok: true, status: "queued", queued: true, active_turn_id: turnId });
-		});
-	});
-
-	it("appends a delegation.started event visible and filterable via watch_events", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const server = await createCoordinatorMcpServer({
-				env: delegateEnv(root, stateRoot),
-				services: delegateServices(),
-			});
-			await server.callTool("gjc_delegate_team", { cwd: root, task: "Parallel work.", allow_mutation: true });
-			const events = await server.callTool("gjc_coordinator_watch_events", {
-				event_types: ["delegation.started"],
-				timeout_ms: 0,
-			});
-			expect(events.ok).toBe(true);
-			const kinds = (events.events as Array<{ kind: string; metadata?: Record<string, unknown> }>).map(e => e.kind);
-			expect(kinds).toContain("delegation.started");
-			const delegation = (events.events as Array<{ kind: string; metadata?: Record<string, unknown> }>).find(
-				e => e.kind === "delegation.started",
-			);
-			expect(delegation?.metadata).toMatchObject({ workflow: "team", tool_name: "gjc_delegate_team" });
-		});
-	});
-	it("surfaces a bounded timeout from await_completion when the turn stays active", async () => {
-		await withTempRoot(async root => {
-			const stateRoot = path.join(root, ".state");
-			const server = await createCoordinatorMcpServer({
-				env: delegateEnv(root, stateRoot),
-				services: delegateServices(),
-			});
-			const result = await server.callTool("gjc_delegate_execute", {
-				cwd: root,
-				task: "Long task.",
-				allow_mutation: true,
-				await_completion: true,
-				timeout_ms: 0,
-			});
-			expect(result.ok).toBe(false);
-			expect(result.awaited).toBe(true);
-			expect(result.timed_out).toBe(true);
-			expect(result.reason).toBe("timeout");
 		});
 	});
 });

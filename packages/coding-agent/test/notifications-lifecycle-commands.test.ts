@@ -8,7 +8,7 @@ import {
 	normalizeLifecyclePath,
 	parseLifecycleCommand,
 	validateLifecycleTarget,
-} from "@gajae-code/coding-agent/notifications/lifecycle-commands";
+} from "@gajae-code/coding-agent/sdk/bus/lifecycle-commands";
 
 describe("lifecycle command parser (G009)", () => {
 	it("detects lifecycle command text", () => {
@@ -201,6 +201,7 @@ describe("lifecycle command parser (G009)", () => {
 			"close_refused",
 			"not_found",
 			"terminal_uncertain",
+			"unsupported_platform",
 		] as const;
 		for (const reason of reasons) {
 			const out = formatLifecycleOutcome({
@@ -235,5 +236,76 @@ describe("lifecycle command parser (G009)", () => {
 		});
 		expect(amb).toContain("a");
 		expect(amb).toContain("b");
+	});
+	it("formats unsupported platform with the exact safe lifecycle copy", () => {
+		const output = formatLifecycleOutcome({
+			type: "session_lifecycle_error",
+			requestId: "request-1",
+			status: "error",
+			reason: "unsupported_platform",
+			message: "ignored",
+		});
+		expect(output).toBe(
+			"Remote session lifecycle is unavailable on this psmux host because GJC cannot prove immutable session identity. No lifecycle action was performed. Use a local GJC terminal with a supported tmux provider.",
+		);
+		expect(output).not.toContain("request-1");
+		expect(output).not.toContain("chat");
+		expect(output).not.toContain("token");
+		expect(output).not.toContain("/");
+	});
+
+	it("preserves legacy ambiguous candidate path output", () => {
+		const output = formatLifecycleOutcome({
+			type: "session_lifecycle_error",
+			requestId: "r",
+			status: "error",
+			reason: "ambiguous_target",
+			message: "multiple",
+			candidates: [{ sessionId: "a", path: "/legacy/path" }],
+		});
+		expect(output).toBe("❓ Multiple sessions match — reply with the exact id:\n• a (/legacy/path)");
+	});
+
+	it("parses --mpreset for all create target kinds (space-separated)", () => {
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset codex-eco")).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+			modelPreset: "codex-eco",
+		});
+		expect(parseLifecycleCommand("/session_create dir /new/dir --mpreset claude-opus")).toEqual({
+			kind: "create",
+			target: { kind: "plain_dir", path: "/new/dir" },
+			modelPreset: "claude-opus",
+		});
+		expect(parseLifecycleCommand("/session_create worktree /repo feat/x --mpreset opencodego")).toEqual({
+			kind: "create",
+			target: { kind: "worktree", repo: "/repo", branch: "feat/x" },
+			modelPreset: "opencodego",
+		});
+	});
+
+	it("parses --mpreset=<name> (equals-separated) form", () => {
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset=codex-medium")).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+			modelPreset: "codex-medium",
+		});
+	});
+
+	it("omits modelPreset when --mpreset is not given", () => {
+		const out = parseLifecycleCommand("/session_create path /repo");
+		expect(out.kind).toBe("create");
+		if (out.kind === "create") {
+			expect(out.modelPreset).toBeUndefined();
+		}
+	});
+
+	it("rejects injection-shaped --mpreset values", () => {
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset 'bad;rm'").kind).toBe("reject");
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset a$(whoami)").kind).toBe("reject");
+	});
+
+	it("usage text includes --mpreset", () => {
+		expect(lifecycleUsage()).toContain("--mpreset");
 	});
 });

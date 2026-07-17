@@ -90,6 +90,55 @@ describe("AgentSession context promotion", () => {
 		}
 		throw new Error("Timed out waiting for condition");
 	}
+	async function expectSafetyStopToSkipContextPromotion(typed: boolean): Promise<void> {
+		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
+		const codexModel = modelRegistry.find("openai-codex", "gpt-5.5");
+		if (!sparkModel || !codexModel) {
+			throw new Error("Expected codex spark and codex models to exist");
+		}
+
+		const agent = new Agent({
+			initialState: {
+				model: sparkModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"contextPromotion.enabled": true,
+			}),
+			modelRegistry,
+		});
+		const promptSpy = vi.spyOn(agent, "prompt").mockResolvedValue();
+		const continueSpy = vi.spyOn(agent, "continue").mockResolvedValue();
+		const closeSpy = vi.fn();
+		session.providerSessionState.set("openai-codex-responses", {
+			close: closeSpy,
+		} satisfies ProviderSessionState);
+
+		const safetyStopMessage: AssistantMessage = {
+			...createOverflowMessage(sparkModel, "Refusal: prompt is too long"),
+			...(typed ? { errorKind: "provider_safety_stop" as const } : {}),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: safetyStopMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [safetyStopMessage] });
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		await session.waitForIdle();
+		await Bun.sleep(120);
+		await session.waitForIdle();
+
+		expect(session.model?.provider).toBe(sparkModel.provider);
+		expect(session.model?.id).toBe(sparkModel.id);
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(closeSpy).not.toHaveBeenCalled();
+		expect(session.providerSessionState.size).toBe(1);
+	}
 
 	it("promotes to a larger-context model on overflow and clears codex websocket session state", async () => {
 		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
@@ -119,8 +168,9 @@ describe("AgentSession context promotion", () => {
 			modelRegistry,
 		});
 
+		const originalMap = session.providerSessionState;
 		const closeSpy = vi.fn();
-		session.providerSessionState.set("openai-codex-responses", {
+		originalMap.set("openai-codex-responses", {
 			close: closeSpy,
 		} satisfies ProviderSessionState);
 
@@ -132,10 +182,33 @@ describe("AgentSession context promotion", () => {
 
 		expect(session.model?.provider).toBe(codexModel.provider);
 		expect(session.model?.id).toBe(codexModel.id);
+		// Context promotion is a temporary operation: the prior provider session is
+		// suspended (non-destructive), not closed, during the switch.
+		expect(closeSpy).toHaveBeenCalledTimes(0);
+		const promotedMap = session.providerSessionState;
+		const promotedClose = vi.fn();
+		promotedMap.set("promoted", { close: promotedClose } satisfies ProviderSessionState);
+
+		await session.setModelTemporary(sparkModel, undefined, {
+			cause: "temporary-operation",
+			reason: "context-promotion",
+		});
+		expect(session.providerSessionState).toBe(originalMap);
+		expect(promotedClose).toHaveBeenCalledTimes(1);
+		expect(closeSpy).toHaveBeenCalledTimes(0);
+
+		// A subsequent permanent model change commits the restored provider session
+		// exactly once.
+		await session.setModel(codexModel, "default", { cause: "user-selection" });
 		expect(closeSpy).toHaveBeenCalledTimes(1);
-		expect(session.providerSessionState.size).toBe(0);
 	});
 
+	it("does not promote or continue typed provider safety stops", async () => {
+		await expectSafetyStopToSkipContextPromotion(true);
+	});
+	it("does not promote or continue legacy provider safety stops", async () => {
+		await expectSafetyStopToSkipContextPromotion(false);
+	});
 	it("promotes on 413 payload-too-large overflow errors", async () => {
 		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
 		const codexModel = modelRegistry.find("openai-codex", "gpt-5.5");
@@ -246,8 +319,11 @@ describe("AgentSession context promotion", () => {
 
 		expect(session.model?.provider).toBe(codexModel.provider);
 		expect(session.model?.id).toBe(codexModel.id);
+		// Manual temporary switch suspends the prior provider session (non-destructive).
+		expect(closeSpy).toHaveBeenCalledTimes(0);
+		// Committing via a permanent selection closes the suspended session exactly once.
+		await session.setModel(codexModel, "default", { cause: "user-selection" });
 		expect(closeSpy).toHaveBeenCalledTimes(1);
-		expect(session.providerSessionState.size).toBe(0);
 	});
 
 	it("clears codex provider session state when branching rewrites history", async () => {

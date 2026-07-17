@@ -1,0 +1,351 @@
+{
+	"schemaVersion": 1,
+	"kind": "api-package-test-report",
+	"story": "G015 cached PI_DEBUG_REDRAW + carried line-width metadata",
+	"status": "passed",
+	"e2eStatus": "passed",
+	"redTeamStatus": "passed",
+	"evidence": [
+		{
+			"id": "DEBUG-OFF-ZERO-COST",
+			"status": "passed",
+			"details": {
+				"scenario": "Unset PI_DEBUG_REDRAW across diff, viewport repaint, full render, and multiplexer resize paths",
+				"expectedBehavior": "At most construction-time env read and no debug append writes",
+				"counters": {
+					"debugRedrawEnvReads": 0,
+					"debugRedrawAppendWrites": 0,
+					"differentialGuardVisibleWidthCalls": 0
+				},
+				"appendSpyCalls": 0
+			}
+		},
+		{
+			"id": "DEBUG-ON-LOGS",
+			"status": "passed",
+			"details": {
+				"scenario": "PI_DEBUG_REDRAW enabled before TUI construction",
+				"expectedBehavior": "Debug append counter and captured log content are non-empty",
+				"counters": {
+					"debugRedrawEnvReads": 1,
+					"debugRedrawAppendWrites": 2,
+					"differentialGuardVisibleWidthCalls": 0
+				},
+				"writes": [
+					"[2026-07-17T07:22:55.913Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n",
+					"[2026-07-17T07:22:55.941Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n"
+				]
+			}
+		},
+		{
+			"id": "WIDTH-REUSE",
+			"status": "passed",
+			"details": {
+				"scenario": "Re-render unchanged normalized over-width lines",
+				"expectedBehavior": "Differential guard uses carried widths and performs zero fallback visibleWidth calls",
+				"reuseCounters": {
+					"debugRedrawEnvReads": 0,
+					"debugRedrawAppendWrites": 0,
+					"differentialGuardVisibleWidthCalls": 0
+				},
+				"viewport": [
+					"界界界界界界",
+					"界界界界界界"
+				]
+			}
+		},
+		{
+			"id": "OVER-WIDTH-TRUNCATION",
+			"status": "passed",
+			"details": {
+				"scenario": "Changed over-width line is normalized, cached, then checked by the differential truncation guard",
+				"expectedBehavior": "Carried width avoids fallback measurement while the viewport still contains correctly truncated width-12 content",
+				"truncationCounters": {
+					"debugRedrawEnvReads": 0,
+					"debugRedrawAppendWrites": 0,
+					"differentialGuardVisibleWidthCalls": 0
+				},
+				"truncated": "界界界界界界",
+				"truncatedWidth": 12
+			}
+		},
+		{
+			"id": "PARITY",
+			"status": "passed",
+			"details": {
+				"scenario": "Legacy full normalization reference vs default cached/viewport path for append, wide line, resize",
+				"expectedBehavior": "Viewport and terminal write bytes match exactly",
+				"referenceWrites": 11,
+				"candidateWrites": 11
+			}
+		},
+		{
+			"id": "STALE-WIDTH",
+			"status": "passed",
+			"details": {
+				"scenario": "Default tab width changes after a cached line containing a tab has been rendered",
+				"expectedBehavior": "TUI cache invalidates and re-renders with truncation appropriate to the new tab width",
+				"width2Line": "a   b",
+				"width6Line": "a",
+				"width2VisibleWidth": 5,
+				"width6VisibleWidth": 1
+			}
+		},
+		{
+			"id": "ZWJ-BOUNDARY",
+			"status": "passed",
+			"details": {
+				"scenario": "Family ZWJ cluster lands exactly at and one cell beyond the terminal boundary",
+				"expectedBehavior": "The normalization hot path uses Bun/terminal cluster width and does not prematurely truncate the exact-boundary line",
+				"exactBoundary": "abcd👨‍👩‍👧‍👦wxyzz",
+				"overBoundary": "abcd👨‍👩‍👧‍👦wxyzz!",
+				"expectedOverBoundary": "abcd👨‍👩‍👧‍👦wxyzz",
+				"viewport": [
+					"abcd👨‍👩‍👧‍👦wxy",
+					"zz"
+				],
+				"exactWidth": 11,
+				"overWidth": 12,
+				"writeBytesIncludesExact": true,
+				"writeBytesIncludesOverReference": true
+			}
+		}
+	],
+	"e2eCommands": [
+		"bun test packages/tui/test/g015-debug-width-redteam.test.ts"
+	],
+	"redTeamCommands": [
+		"bun test packages/tui/test/g015-debug-width-redteam.test.ts"
+	],
+	"artifactPath": "artifacts/g015-qa-report.json",
+	"contractCoverage": [
+		{
+			"contractRef": "G015-1",
+			"obligation": "PI_DEBUG_REDRAW is cached at construction; frame paths do not re-read env and do not write debug logs when disabled.",
+			"status": "passed",
+			"surfaceEvidenceRefs": [
+				"package-debug-off"
+			],
+			"adversarialCaseRefs": [
+				"DEBUG-OFF-ZERO-COST"
+			]
+		},
+		{
+			"contractRef": "G015-2",
+			"obligation": "PI_DEBUG_REDRAW enabled still emits redraw debug logs with content.",
+			"status": "passed",
+			"surfaceEvidenceRefs": [
+				"package-debug-on"
+			],
+			"adversarialCaseRefs": [
+				"DEBUG-ON-LOGS"
+			]
+		},
+		{
+			"contractRef": "G015-3",
+			"obligation": "Differential/repaint truncation guard reuses carried widths for normalized cached lines and only measures uncached lines.",
+			"status": "passed",
+			"surfaceEvidenceRefs": [
+				"package-width-reuse"
+			],
+			"adversarialCaseRefs": [
+				"WIDTH-REUSE"
+			]
+		},
+		{
+			"contractRef": "G015-4",
+			"obligation": "Over-width lines are still correctly truncated, including after width/tab-width changes that invalidate cached width metadata.",
+			"status": "passed",
+			"surfaceEvidenceRefs": [
+				"package-truncation"
+			],
+			"adversarialCaseRefs": [
+				"OVER-WIDTH-TRUNCATION",
+				"STALE-WIDTH"
+			]
+		},
+		{
+			"contractRef": "G015-5",
+			"obligation": "Render output remains byte-identical to reference output across append, wide-line, and resize scenarios.",
+			"status": "passed",
+			"surfaceEvidenceRefs": [
+				"package-parity"
+			],
+			"adversarialCaseRefs": [
+				"PARITY"
+			]
+		}
+	],
+	"surfaceEvidence": [
+		{
+			"id": "package-debug-off",
+			"contractRef": "G015-1",
+			"surface": "package",
+			"invocation": "TUI render frames with PI_DEBUG_REDRAW unset",
+			"verdict": "passed"
+		},
+		{
+			"id": "package-debug-on",
+			"contractRef": "G015-2",
+			"surface": "package",
+			"invocation": "TUI render with PI_DEBUG_REDRAW=1 and appendFileSync spy",
+			"verdict": "passed"
+		},
+		{
+			"id": "package-width-reuse",
+			"contractRef": "G015-3",
+			"surface": "package",
+			"invocation": "Differential render of cached wide lines using TUI render counters",
+			"verdict": "passed"
+		},
+		{
+			"id": "package-truncation",
+			"contractRef": "G015-4",
+			"surface": "package",
+			"invocation": "Virtual terminal viewport inspection for uncached over-width and tab-width changed lines",
+			"verdict": "passed"
+		},
+		{
+			"id": "package-parity",
+			"contractRef": "G015-5",
+			"surface": "package",
+			"invocation": "Controlled reference-vs-candidate render comparisons",
+			"verdict": "passed"
+		}
+	],
+	"adversarialCases": [
+		{
+			"id": "DEBUG-OFF-ZERO-COST",
+			"contractRef": "G015-1",
+			"scenario": "Unset PI_DEBUG_REDRAW across diff, viewport repaint, full render, and multiplexer resize paths",
+			"expectedBehavior": "At most construction-time env read and no debug append writes",
+			"verdict": "passed",
+			"details": {
+				"scenario": "Unset PI_DEBUG_REDRAW across diff, viewport repaint, full render, and multiplexer resize paths",
+				"expectedBehavior": "At most construction-time env read and no debug append writes",
+				"counters": {
+					"debugRedrawEnvReads": 0,
+					"debugRedrawAppendWrites": 0,
+					"differentialGuardVisibleWidthCalls": 0
+				},
+				"appendSpyCalls": 0
+			}
+		},
+		{
+			"id": "DEBUG-ON-LOGS",
+			"contractRef": "G015-2",
+			"scenario": "PI_DEBUG_REDRAW enabled before TUI construction",
+			"expectedBehavior": "Debug append counter and captured log content are non-empty",
+			"verdict": "passed",
+			"details": {
+				"scenario": "PI_DEBUG_REDRAW enabled before TUI construction",
+				"expectedBehavior": "Debug append counter and captured log content are non-empty",
+				"counters": {
+					"debugRedrawEnvReads": 1,
+					"debugRedrawAppendWrites": 2,
+					"differentialGuardVisibleWidthCalls": 0
+				},
+				"writes": [
+					"[2026-07-17T07:22:55.913Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n",
+					"[2026-07-17T07:22:55.941Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n"
+				]
+			}
+		},
+		{
+			"id": "WIDTH-REUSE",
+			"contractRef": "G015-3",
+			"scenario": "Re-render unchanged normalized over-width lines",
+			"expectedBehavior": "Differential guard uses carried widths and performs zero fallback visibleWidth calls",
+			"verdict": "passed",
+			"details": {
+				"scenario": "Re-render unchanged normalized over-width lines",
+				"expectedBehavior": "Differential guard uses carried widths and performs zero fallback visibleWidth calls",
+				"reuseCounters": {
+					"debugRedrawEnvReads": 0,
+					"debugRedrawAppendWrites": 0,
+					"differentialGuardVisibleWidthCalls": 0
+				},
+				"viewport": [
+					"界界界界界界",
+					"界界界界界界"
+				]
+			}
+		},
+		{
+			"id": "OVER-WIDTH-TRUNCATION",
+			"contractRef": "G015-4",
+			"scenario": "Changed over-width line is normalized, cached, then checked by the differential truncation guard",
+			"expectedBehavior": "Carried width avoids fallback measurement while the viewport still contains correctly truncated width-12 content",
+			"verdict": "passed",
+			"details": {
+				"scenario": "Changed over-width line is normalized, cached, then checked by the differential truncation guard",
+				"expectedBehavior": "Carried width avoids fallback measurement while the viewport still contains correctly truncated width-12 content",
+				"truncationCounters": {
+					"debugRedrawEnvReads": 0,
+					"debugRedrawAppendWrites": 0,
+					"differentialGuardVisibleWidthCalls": 0
+				},
+				"truncated": "界界界界界界",
+				"truncatedWidth": 12
+			}
+		},
+		{
+			"id": "PARITY",
+			"contractRef": "G015-5",
+			"scenario": "Legacy full normalization reference vs default cached/viewport path for append, wide line, resize",
+			"expectedBehavior": "Viewport and terminal write bytes match exactly",
+			"verdict": "passed",
+			"details": {
+				"scenario": "Legacy full normalization reference vs default cached/viewport path for append, wide line, resize",
+				"expectedBehavior": "Viewport and terminal write bytes match exactly",
+				"referenceWrites": 11,
+				"candidateWrites": 11
+			}
+		},
+		{
+			"id": "STALE-WIDTH",
+			"contractRef": "G015-4",
+			"scenario": "Default tab width changes after a cached line containing a tab has been rendered",
+			"expectedBehavior": "TUI cache invalidates and re-renders with truncation appropriate to the new tab width",
+			"verdict": "passed",
+			"details": {
+				"scenario": "Default tab width changes after a cached line containing a tab has been rendered",
+				"expectedBehavior": "TUI cache invalidates and re-renders with truncation appropriate to the new tab width",
+				"width2Line": "a   b",
+				"width6Line": "a",
+				"width2VisibleWidth": 5,
+				"width6VisibleWidth": 1
+			}
+		},
+		{
+			"id": "ZWJ-BOUNDARY",
+			"contractRef": "G015-4",
+			"scenario": "Family ZWJ cluster lands exactly at and one cell beyond the terminal boundary",
+			"expectedBehavior": "The normalization hot path uses Bun/terminal cluster width and does not prematurely truncate the exact-boundary line",
+			"verdict": "passed",
+			"details": {
+				"scenario": "Family ZWJ cluster lands exactly at and one cell beyond the terminal boundary",
+				"expectedBehavior": "The normalization hot path uses Bun/terminal cluster width and does not prematurely truncate the exact-boundary line",
+				"exactBoundary": "abcd👨‍👩‍👧‍👦wxyzz",
+				"overBoundary": "abcd👨‍👩‍👧‍👦wxyzz!",
+				"expectedOverBoundary": "abcd👨‍👩‍👧‍👦wxyzz",
+				"viewport": [
+					"abcd👨‍👩‍👧‍👦wxy",
+					"zz"
+				],
+				"exactWidth": 11,
+				"overWidth": 12,
+				"writeBytesIncludesExact": true,
+				"writeBytesIncludesOverReference": true
+			}
+		}
+	],
+	"artifactRefs": [
+		{
+			"id": "g015-vitest-output",
+			"kind": "api-package-test-report",
+			"description": "Focused bun test output for packages/tui/test/g015-debug-width-redteam.test.ts plus structured assertions in this report."
+		}
+	],
+	"blockers": []
+}

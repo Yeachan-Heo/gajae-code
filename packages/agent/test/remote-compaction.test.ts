@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildOpenAiNativeHistory, requestOpenAiRemoteCompaction } from "@gajae-code/agent-core/compaction/openai";
+import {
+	buildOpenAiNativeHistory,
+	requestOpenAiRemoteCompaction,
+	requestRemoteCompaction,
+} from "@gajae-code/agent-core/compaction/openai";
 import type { AssistantMessage, Model, ToolResultMessage } from "@gajae-code/ai/types";
 import { hookFetch } from "@gajae-code/utils";
 
@@ -169,6 +173,46 @@ describe("remote compaction input trimming", () => {
 		expect(requestInput?.some(item => item.type === "custom_tool_call")).toBe(false);
 		expect(requestInput?.some(item => item.type === "custom_tool_call_output")).toBe(false);
 	});
+
+	test("neutralizes leaked Harmony control tokens in the remote compaction request input", async () => {
+		let requestInput: Array<Record<string, unknown>> | undefined;
+		using _hook = hookFetch(async (_input, init) => {
+			const body = JSON.parse(String(init?.body)) as { input: Array<Record<string, unknown>> };
+			requestInput = body.input;
+			return Response.json({
+				output: [{ type: "compaction_summary", summary: "compact" }],
+			});
+		});
+
+		// Remote compaction (/responses/compact) bypasses the streaming transport, so
+		// leaked `<|channel|>analysis` markers in reasoning/text/tool content would
+		// otherwise reach gpt-5.6 verbatim and return `Request blocked`.
+		await requestOpenAiRemoteCompaction(
+			makeOpenAiModel(),
+			"test-key",
+			[
+				{
+					type: "reasoning",
+					summary: [{ type: "summary_text", text: "Plan.<|channel|>analysis<|message|>go" }],
+				},
+				{
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: "hi<|recipient|>functions.bash" }],
+				},
+				{ type: "function_call_output", call_id: "c1", output: "done<|call|>" },
+			],
+			"compact",
+		);
+
+		const serialized = JSON.stringify(requestInput);
+		expect(serialized).not.toContain("<|channel|>");
+		expect(serialized).not.toContain("<|message|>");
+		expect(serialized).not.toContain("<|recipient|>");
+		expect(serialized).not.toContain("<|call|>");
+		expect(serialized).toContain("<\u200b|channel|>");
+		expect(serialized).toContain("Plan.");
+	});
 });
 
 describe("remote compaction endpoint", () => {
@@ -251,5 +295,36 @@ describe("requestOpenAiRemoteCompaction abort", () => {
 		queueMicrotask(() => controller.abort());
 
 		await expect(promise).rejects.toThrow();
+	});
+});
+
+describe("remote compaction invalid_prompt termination (issue #2282)", () => {
+	test("neutralizes the prompt and fails fast without retry when the endpoint returns invalid_prompt", async () => {
+		let fetchCalls = 0;
+		let sentBody: string | undefined;
+		using _hook = hookFetch(async (_input, init) => {
+			fetchCalls += 1;
+			sentBody = String(init?.body);
+			return new Response(JSON.stringify({ error: { code: "invalid_prompt", message: "Request blocked" } }), {
+				status: 400,
+				statusText: "Bad Request",
+			});
+		});
+
+		await expect(
+			requestRemoteCompaction("https://compact.example.com/responses/compact", {
+				systemPrompt: "system<|channel|>analysis",
+				prompt: "transcript<|message|>leak",
+			}),
+		).rejects.toThrow(/Remote compaction failed \(400/);
+
+		// Single-shot by construction: the poisoned rejection terminates immediately,
+		// it is never retried into an account-level block.
+		expect(fetchCalls).toBe(1);
+		// The outgoing request was neutralized (the repair) before it was sent.
+		expect(sentBody).toBeDefined();
+		expect(sentBody).not.toContain("<|channel|>");
+		expect(sentBody).not.toContain("<|message|>");
+		expect(sentBody).toContain("<\u200b|channel|>");
 	});
 });

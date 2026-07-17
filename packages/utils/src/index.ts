@@ -1,5 +1,6 @@
 export { createAbortableStream, once, untilAborted } from "./abortable";
 export * from "./async";
+export * from "./broken-pipe";
 export * from "./color";
 export * from "./dirs";
 export * from "./env";

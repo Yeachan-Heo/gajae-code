@@ -228,6 +228,6 @@ The two systems intersect only indirectly (both reduce session JSONL bloat) but 
 - [`src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts) — artifact directory copy during interactive fork.
 - [`src/internal-urls/artifact-protocol.ts`](../packages/coding-agent/src/internal-urls/artifact-protocol.ts) — `artifact://` resolver.
 - [`src/internal-urls/agent-protocol.ts`](../packages/coding-agent/src/internal-urls/agent-protocol.ts) — `agent://` resolver + JSON extraction.
-- [`src/sdk.ts`](../packages/coding-agent/src/sdk.ts) — internal URL router wiring and artifacts-dir resolver.
+- [`src/sdk/session.ts`](../packages/coding-agent/src/sdk/session.ts) — internal URL router wiring and artifacts-dir resolver.
 - [`src/task/output-manager.ts`](../packages/coding-agent/src/task/output-manager.ts) — session-scoped agent output ID allocation for `agent://`.
 - [`src/task/executor.ts`](../packages/coding-agent/src/task/executor.ts) — subagent output artifact writes (`<id>.md`) and temp artifact directory fallback.

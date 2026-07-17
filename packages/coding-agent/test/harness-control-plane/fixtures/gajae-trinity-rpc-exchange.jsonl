@@ -1,6 +1,0 @@
-{"direction":"send","frame":{"id":"state-0001","type":"get_state"}}
-{"direction":"recv","frame":{"id":"state-0001","type":"response","command":"get_state","success":true,"data":{"sessionId":"gjc-rpc-session-0001","isStreaming":false,"isCompacting":false,"messageCount":0,"queuedMessageCount":0}}}
-{"direction":"send","frame":{"id":"cmd-0001","type":"prompt","message":"Fix the failing unit test in the intake parser"}}
-{"direction":"recv","frame":{"id":"cmd-0001","type":"response","command":"prompt","success":true}}
-{"direction":"recv","frame":{"type":"agent_start"}}
-{"direction":"recv","frame":{"type":"agent_end"}}

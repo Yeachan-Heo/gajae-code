@@ -275,16 +275,12 @@ describe("deep-interview mutation guard", () => {
 		}
 	});
 
-	it("never blocks bash during active deep-interview, even targeting .gjc or product code", async () => {
+	it("blocks mutating bash targets during active deep-interview", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveDeepInterview(cwd);
 
 		for (const command of [
 			"rm .gjc/state/deep-interview-state.json",
-			"mkdir -p .gjc/specs",
-			"cp source.md .gjc/specs/deep-interview-x.md",
-			"sed -i 's/a/b/' .gjc/plans/plan.md",
-			"cat source.md > .gjc/specs/deep-interview-x.md",
 			"tee src/product.ts",
 			"cat <<EOF > src/product.ts\nx\nEOF",
 		]) {
@@ -294,8 +290,23 @@ describe("deep-interview mutation guard", () => {
 				tool: tool("bash"),
 				args: { command },
 			});
+			expect(decision.blocked).toBe(true);
+			expect(decision.targets.length).toBeGreaterThan(0);
+		}
+
+		for (const command of [
+			"mkdir -p .gjc/specs",
+			"cp source.md .gjc/specs/deep-interview-x.md",
+			"cat source.md > .gjc/specs/deep-interview-x.md",
+		]) {
+			const decision = await getDeepInterviewMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
 			expect(decision.blocked).toBe(false);
-			expect(decision.targets).toEqual([]);
+			expect(decision.targets.length).toBeGreaterThan(0);
 		}
 	});
 
@@ -609,16 +620,22 @@ describe("deep-interview mutation guard", () => {
 		expect(decision.blocked).toBe(false);
 	});
 
-	it("never blocks bash during a planning phase, including compound/redirected/newline commands", async () => {
+	it("blocks product-mutating bash during a planning phase but allows sanctioned gjc and artifact writes", async () => {
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "ralplan", "planner");
 
 		for (const command of [
 			"gjc ralplan --write --stage planner --artifact /tmp/p.md ; tee src/product.ts",
+			"echo x > src/product.ts",
+			"gjc state read && echo x | tee src/product.ts",
 			"gjc state read && echo x > .gjc/state/foo.json",
 			"gjc ralplan --write --stage planner --artifact /tmp/p.md\ntouch src/product.ts",
 			"gjc state read\nrm .gjc/state/foo.json",
-			"gjc ralplan --write --stage planner --artifact /tmp/p.md",
+			"sed -i s/a/b/ src/product.ts",
+			'python -c \'open("src/product.ts", "w").write("x")\'',
+			"dd if=/dev/null of=src/product.ts",
+			"truncate -s 0 src/product.ts",
+			'python <<PY\nopen("src/product.ts", "w").write("x")\nPY',
 		]) {
 			const decision = await getDeepInterviewMutationDecision({
 				cwd,
@@ -626,7 +643,20 @@ describe("deep-interview mutation guard", () => {
 				tool: tool("bash"),
 				args: { command },
 			});
-			expect(decision.blocked).toBe(false);
+			expect(decision.blocked).toBe(true);
+		}
+
+		for (const command of [
+			"gjc ralplan --write --stage planner --artifact /tmp/p.md",
+			"cat sample.md > .gjc/specs/deep-interview-sample.md",
+		]) {
+			const allowed = await getDeepInterviewMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("bash"),
+				args: { command },
+			});
+			expect(allowed.blocked).toBe(false);
 		}
 	});
 

@@ -17,7 +17,7 @@ It reflects the current implementation, including partial semantics and metadata
 - [`../src/discovery/cursor.ts`](../packages/coding-agent/src/discovery/cursor.ts)
 - [`../src/discovery/windsurf.ts`](../packages/coding-agent/src/discovery/windsurf.ts)
 - [`../src/discovery/cline.ts`](../packages/coding-agent/src/discovery/cline.ts)
-- [`../src/sdk.ts`](../packages/coding-agent/src/sdk.ts)
+- [`../src/sdk/session.ts`](../packages/coding-agent/src/sdk/session.ts)
 - [`../src/system-prompt.ts`](../packages/coding-agent/src/system-prompt.ts)
 - [`../src/internal-urls/rule-protocol.ts`](../packages/coding-agent/src/internal-urls/rule-protocol.ts)
 - [`../src/utils/frontmatter.ts`](../packages/coding-agent/src/utils/frontmatter.ts)

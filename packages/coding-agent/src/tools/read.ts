@@ -53,6 +53,7 @@ import {
 	type ReadUrlToolDetails,
 	renderReadUrlCall,
 	renderReadUrlResult,
+	wrapUntrustedContent,
 } from "./fetch";
 import { applyListLimit } from "./list-limit";
 import {
@@ -487,6 +488,38 @@ const readSchema = z
 
 export type ReadToolInput = z.infer<typeof readSchema>;
 
+const UNSAFE_SUMMARY_PATH =
+	/(?:\b(?:https?|wss?):\/\/|\b(?:api[-_ ]?key|access[-_ ]?token|bearer|secret|password)\b|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{12,})/i;
+
+/** Project paths and output sizes without exposing read content or remote URLs. */
+export function summarizeReadToolActivity(kind: "args" | "result", value: unknown): string | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	if (kind === "args") {
+		const readPath = record.path;
+		if (
+			typeof readPath !== "string" ||
+			readPath.length === 0 ||
+			readPath.length > 100 ||
+			UNSAFE_SUMMARY_PATH.test(readPath)
+		) {
+			return undefined;
+		}
+		return readPath;
+	}
+	if (!Array.isArray(record.content)) return undefined;
+	const text = record.content
+		.filter(
+			(block): block is { type: unknown; text: unknown } =>
+				typeof block === "object" && block !== null && "type" in block && "text" in block,
+		)
+		.filter(block => block.type === "text" && typeof block.text === "string")
+		.map(block => block.text as string)
+		.join("\n");
+	const lines = text.length === 0 ? 0 : text.split("\n").length;
+	return `${lines} lines, ${Buffer.byteLength(text, "utf-8")} bytes`;
+}
+
 export interface ReadToolDetails {
 	kind?: "file" | "url";
 	truncation?: TruncationResult;
@@ -667,6 +700,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly parameters = readSchema;
 	readonly nonAbortable = true;
 	readonly strict = true;
+	readonly safeSummary = summarizeReadToolActivity;
 
 	readonly #autoResizeImages: boolean;
 	readonly #defaultLimit: number;
@@ -788,6 +822,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			ignoreResultLimits?: boolean;
 			raw?: boolean;
 			immutable?: boolean;
+			wrapUntrusted?: boolean;
 		},
 	): AgentToolResult<ReadToolDetails> {
 		const displayMode = resolveFileDisplayMode(this.session, { raw: options.raw, immutable: options.immutable });
@@ -893,7 +928,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			outputText = formatText(truncation.content, startLineDisplay);
 		}
 
-		resultBuilder.text(outputText);
+		resultBuilder.text(options.wrapUntrusted ? wrapUntrustedContent(outputText) : outputText);
 		if (truncationInfo) {
 			resultBuilder.truncation(truncationInfo.result, truncationInfo.options);
 		}
@@ -1469,6 +1504,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					sourceUrl: cached.details.finalUrl,
 					entityLabel: "URL output",
 					immutable: true,
+					wrapUntrusted: true,
 				});
 			}
 			return executeReadUrl(this.session, { path: parsedUrlTarget.path, raw: parsedUrlTarget.raw }, signal);

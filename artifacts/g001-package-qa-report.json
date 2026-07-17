@@ -1,0 +1,67 @@
+{
+	"schemaVersion": 1,
+	"kind": "package-consumer-report",
+	"story": "G001 Phase A — rename gajae-code-sdk",
+	"pass": 2,
+	"generatedAt": "2026-07-10T12:55:00Z",
+	"note": "Pass-2 adversarial cases re-executed by the Ultragoal leader after the QA subagent stalled and was cancelled; pass-1 subagent evidence retained where still valid.",
+	"cases": [
+		{
+			"id": "required-file-flag-token-bypass",
+			"scenario": "Manifest whose required file appears only as a non-positional argv token (bun test --timeout <file>)",
+			"expected": "Runner fails closed before execution",
+			"verdict": "passed",
+			"evidence": "run-test-manifest exit=1: 'Manifest required file is not an executable command: packages/coding-agent/test/notifications-chat-adapters.test.ts'"
+		},
+		{
+			"id": "required-omitted-from-commands",
+			"scenario": "Manifest omitting chat-adapters from commands while keeping the required list",
+			"expected": "Runner fails closed",
+			"verdict": "passed",
+			"evidence": "run-test-manifest exit=1 with the same required-file diagnostic"
+		},
+		{
+			"id": "required-file-excluded",
+			"scenario": "Attacker excludes chat-adapters with a rationalized exclusion",
+			"expected": "Generator --check fails (exclusion cannot satisfy required coverage)",
+			"verdict": "passed",
+			"evidence": "generate-telegram-baseline-manifest --check exit=1 listing notifications-chat-adapters.test.ts among missing files"
+		},
+		{
+			"id": "required-omitted-entirely",
+			"scenario": "Hand-edited manifest omitting chat-adapters from both commands and required",
+			"expected": "Generator --check catches via discovery comparison",
+			"verdict": "passed",
+			"evidence": "generate-telegram-baseline-manifest --check exit=1 listing all 40 missing discovered files"
+		},
+		{
+			"id": "stale-path-scan",
+			"scenario": "Structural rename scanner plus docs-index embedded filenames check",
+			"expected": "Scanner passes; index embeds sdk.md and sdk-embedding.md, not notifications-sdk.md",
+			"verdict": "passed",
+			"evidence": "verify-gjc-sdk-rename.ts: 'GJC SDK rename verification passed.'; EMBEDDED_DOC_FILENAMES check: sdk.md=true, sdk-embedding.md=true, notifications-sdk.md=false"
+		},
+		{
+			"id": "telegram-regression-spot",
+			"scenario": "Heaviest Telegram suite after all fixes",
+			"expected": "No regression",
+			"verdict": "passed",
+			"evidence": "bun test notifications-telegram-daemon.test.ts: 113 pass, 0 fail"
+		},
+		{
+			"id": "export-surface",
+			"scenario": "Public SDK exports preserved; legacy deep-import rejected (pass-1 evidence, unchanged surface)",
+			"expected": "sdk + sdk/bus resolve; old notifications subpath fails",
+			"verdict": "passed",
+			"evidence": "Pass-1: createAgentSession=function via @gajae-code/coding-agent/sdk; legacy notifications/lifecycle-commands import rejected; pass-2 sdk-package-exports.test.ts still green (83 focused tests)"
+		},
+		{
+			"id": "discovery-split",
+			"scenario": "Native NotificationServer endpoint under <root>/sdk with 0600 + token; no legacy dir (pass-1 evidence, native binding unchanged since rebuild)",
+			"expected": "state/sdk endpoints; agent-dir notifications control plane intact",
+			"verdict": "passed",
+			"evidence": "Pass-1: endpointPath=<temp>/sdk/red-team-session.json mode=600 tokenPresent=true legacyNotificationsDir=false"
+		}
+	],
+	"summary": { "total": 8, "passed": 8, "failed": 0 }
+}

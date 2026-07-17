@@ -2,6 +2,18 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $credentialEnv, $env, $pickCredentialEnv, extractHttpStatusFromError } from "@gajae-code/utils";
+import { assertManagedAttempt } from "./utils/fallback-transport";
+
+const managedAttemptValidated = Symbol("managedAttemptValidated");
+
+function hasValidatedManagedAttempt(options: object | undefined): boolean {
+	return (options as Record<symbol, unknown> | undefined)?.[managedAttemptValidated] === true;
+}
+
+function markManagedAttemptValidated<T extends object>(options: T): T {
+	return Object.assign(options, { [managedAttemptValidated]: true });
+}
+
 import { getCustomApi } from "./api-registry";
 import type { Effort } from "./model-thinking";
 import {
@@ -11,23 +23,21 @@ import {
 } from "./model-thinking";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
+import {
+	hasResolvableAwsProfileSource,
+	isValidBedrockBearerToken,
+	readAwsStaticEnvironmentCredentials,
+} from "./providers/aws-credential-config";
 import type { CursorOptions } from "./providers/cursor";
-import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
-import { isKimiModel, streamKimi } from "./providers/kimi";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
-import { streamPiNative } from "./providers/pi-native-client";
 // Heavy provider stream functions are imported lazily via register-builtins,
-// which wraps each provider module in a dynamic import. This keeps the
-// AWS SDK, google-auth-library, @google/genai, @bufbuild/protobuf, and
-// other provider SDKs out of the CLI startup parse graph. The
-// gitlab-duo / kimi / synthetic providers stay eager because their modules
-// export routing predicates (isGitLabDuoModel, isKimiModel, isSyntheticModel)
-// that must be callable synchronously before streaming begins, and their
-// modules are thin wrappers with no heavy SDK dependencies.
+// which wraps each provider module in a dynamic import. Thin provider routing
+// modules are also loaded lazily below by returning an outer stream and piping
+// the dynamically imported inner stream into it.
 import {
 	streamAnthropic,
 	streamAzureOpenAIResponses,
@@ -41,7 +51,6 @@ import {
 	streamOpenAICompletions,
 	streamOpenAIResponses,
 } from "./providers/register-builtins";
-import { isSyntheticModel, streamSynthetic } from "./providers/synthetic";
 import type {
 	Api,
 	AssistantMessage,
@@ -129,28 +138,12 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 			return "<authenticated>";
 		}
 	},
-	// Amazon Bedrock supports multiple credential sources:
-	// 1. AWS_PROFILE - named profile from ~/.aws/credentials
-	// 2. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY - standard IAM keys
-	// 3. AWS_BEARER_TOKEN_BEDROCK - Bedrock API keys (bearer token)
-	// 4. AWS_CONTAINER_CREDENTIALS_* - ECS/Task IAM role credentials
-	// 5. AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN - IRSA (EKS) web identity
+	// Advertise only credential sources implemented by the Bedrock request path.
+	// ECS and IRSA remain unavailable until matching resolvers are implemented.
 	"amazon-bedrock": () => {
-		const awsProfile = $credentialEnv("AWS_PROFILE");
-		const awsAccessKeyId = $credentialEnv("AWS_ACCESS_KEY_ID");
-		const awsSecretAccessKey = $credentialEnv("AWS_SECRET_ACCESS_KEY");
-		const awsBearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
-		const hasEcsCredentials =
-			!!$credentialEnv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") ||
-			!!$credentialEnv("AWS_CONTAINER_CREDENTIALS_FULL_URI");
-		const hasWebIdentity = !!$credentialEnv("AWS_WEB_IDENTITY_TOKEN_FILE") && !!$credentialEnv("AWS_ROLE_ARN");
-		if (
-			awsProfile ||
-			(awsAccessKeyId && awsSecretAccessKey) ||
-			awsBearerToken ||
-			hasEcsCredentials ||
-			hasWebIdentity
-		) {
+		const bearerToken = $credentialEnv("AWS_BEARER_TOKEN_BEDROCK");
+		if (bearerToken) return isValidBedrockBearerToken(bearerToken) ? "<authenticated>" : undefined;
+		if (readAwsStaticEnvironmentCredentials() || hasResolvableAwsProfileSource()) {
 			return "<authenticated>";
 		}
 	},
@@ -240,6 +233,45 @@ export function formatProviderCredentialHint(provider: string): string {
 	}
 	return parts.join(" ");
 }
+function pipeAssistantStream(
+	outer: AssistantMessageEventStream,
+	inner: AssistantMessageEventStream,
+	signal?: AbortSignal,
+): void {
+	void (async () => {
+		try {
+			for await (const event of inner) {
+				outer.push(event);
+				// The inner provider stream owns abort semantics (it receives the
+				// same signal), but stop forwarding as soon as the consumer
+				// aborted so a misbehaving inner stream cannot keep the pipe
+				// buffering events indefinitely.
+				if (signal?.aborted && !outer.done) {
+					outer.end(await inner.result());
+					return;
+				}
+			}
+			if (!outer.done) outer.end(await inner.result());
+		} catch (error) {
+			outer.fail(error);
+		}
+	})();
+}
+
+function streamFromLazyImport(
+	createInner: () => Promise<AssistantMessageEventStream>,
+	signal?: AbortSignal,
+): AssistantMessageEventStream {
+	const outer = new AssistantMessageEventStream();
+	void (async () => {
+		try {
+			pipeAssistantStream(outer, await createInner(), signal);
+		} catch (error) {
+			outer.fail(error);
+		}
+	})();
+	return outer;
+}
 
 /**
  * Build an actionable "missing API key" error for a provider, used by the
@@ -256,21 +288,31 @@ export function stream<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
+	if (!hasValidatedManagedAttempt(options)) assertManagedAttempt(options);
+	if (options?.fallbackManaged) {
+		options = { ...options, requestMaxRetries: 0, streamMaxRetries: 0 } as OptionsForApi<TApi>;
+	}
 	// Check custom API registry first (extension-provided APIs like "vertex-Anthropic model-api")
 	const customApiProvider = getCustomApi(model.api);
 	if (customApiProvider) {
 		return customApiProvider.stream(model, context, options as StreamOptions);
 	}
 
-	if (isGitLabDuoModel(model)) {
+	if (model.provider === "gitlab-duo") {
 		const apiKey = (options as StreamOptions | undefined)?.apiKey || getEnvApiKey(model.provider);
 		if (!apiKey) {
 			throw new Error(formatMissingApiKeyError(model.provider));
 		}
-		return streamGitLabDuo(model, context, {
-			...(options as SimpleStreamOptions | undefined),
-			apiKey,
-		});
+		return streamFromLazyImport(
+			async () => {
+				const { streamGitLabDuo } = await import("./providers/gitlab-duo");
+				return streamGitLabDuo(model, context, {
+					...(options as SimpleStreamOptions | undefined),
+					apiKey,
+				});
+			},
+			(options as StreamOptions | undefined)?.signal,
+		);
 	}
 
 	// Vertex AI uses Application Default Credentials, not API keys
@@ -369,6 +411,16 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	assertManagedAttempt(options);
+	if (options?.fallbackManaged) {
+		options = {
+			...options,
+			requestMaxRetries: 0,
+			streamMaxRetries: 0,
+			onAuthError: undefined,
+		};
+		options = markManagedAttemptValidated(options);
+	}
 	const retryApiKey = options?.onAuthError ? (options.apiKey ?? getEnvApiKey(model.provider)) : undefined;
 	if (retryApiKey) {
 		const outer = new AssistantMessageEventStream();
@@ -446,7 +498,10 @@ export function streamSimple<TApi extends Api>(
 	// extension-registered APIs can't accidentally override a configured
 	// pi-native transport.
 	if (model.transport === "pi-native") {
-		return streamPiNative(model, context, options);
+		return streamFromLazyImport(async () => {
+			const { streamPiNative } = await import("./providers/pi-native-client");
+			return streamPiNative(model, context, options);
+		}, options?.signal);
 	}
 
 	// Check custom API registry (extension-provided APIs)
@@ -471,31 +526,40 @@ export function streamSimple<TApi extends Api>(
 	}
 
 	// GitLab Duo - wraps Anthropic/OpenAI behind GitLab AI Gateway direct access tokens
-	if (isGitLabDuoModel(model)) {
-		return streamGitLabDuo(model, context, {
-			...options,
-			apiKey,
-		});
+	if (model.provider === "gitlab-duo") {
+		return streamFromLazyImport(async () => {
+			const { streamGitLabDuo } = await import("./providers/gitlab-duo");
+			return streamGitLabDuo(model, context, {
+				...options,
+				apiKey,
+			});
+		}, options?.signal);
 	}
 
 	// Kimi Code - route to dedicated handler that wraps OpenAI or Anthropic API
-	if (isKimiModel(model)) {
-		// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
-		return streamKimi(model as Model<"openai-completions">, context, {
-			...options,
-			apiKey,
-			format: options?.kimiApiFormat ?? "anthropic",
-		});
+	if (model.provider === "kimi-code") {
+		return streamFromLazyImport(async () => {
+			const { streamKimi } = await import("./providers/kimi");
+			// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
+			return streamKimi(model as Model<"openai-completions">, context, {
+				...options,
+				apiKey,
+				format: options?.kimiApiFormat ?? "anthropic",
+			});
+		}, options?.signal);
 	}
 
 	// Synthetic - route to dedicated handler that wraps OpenAI or Anthropic API
-	if (isSyntheticModel(model)) {
-		// Pass raw SimpleStreamOptions - streamSynthetic handles mapping internally
-		return streamSynthetic(model as Model<"openai-completions">, context, {
-			...options,
-			apiKey,
-			format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
-		});
+	if (model.provider === "synthetic") {
+		return streamFromLazyImport(async () => {
+			const { streamSynthetic } = await import("./providers/synthetic");
+			// Pass raw SimpleStreamOptions - streamSynthetic handles mapping internally
+			return streamSynthetic(model as Model<"openai-completions">, context, {
+				...options,
+				apiKey,
+				format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
+			});
+		}, options?.signal);
 	}
 
 	const providerOptions = mapOptionsForApi(model, options, apiKey);
@@ -624,12 +688,14 @@ function mapOptionsForApi<TApi extends Api>(
 		maxTokens: options?.maxTokens || Math.min(model.maxTokens, 32000),
 		signal: options?.signal,
 		apiKey: apiKey || options?.apiKey,
+		fallbackManaged: options?.fallbackManaged,
+		fallbackAttempt: options?.fallbackAttempt,
 		cacheRetention: options?.cacheRetention ?? model.cacheRetention,
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
-		requestMaxRetries: options?.requestMaxRetries,
-		streamMaxRetries: options?.streamMaxRetries,
+		requestMaxRetries: options?.fallbackManaged ? 0 : options?.requestMaxRetries,
+		streamMaxRetries: options?.fallbackManaged ? 0 : options?.streamMaxRetries,
 		metadata: options?.metadata,
 		sessionId: options?.sessionId,
 		providerSessionState: options?.providerSessionState,
@@ -637,6 +703,7 @@ function mapOptionsForApi<TApi extends Api>(
 		onResponse: options?.onResponse,
 		onSseEvent: options?.onSseEvent,
 		execHandlers: options?.execHandlers,
+		[managedAttemptValidated]: hasValidatedManagedAttempt(options),
 	};
 
 	switch (model.api) {

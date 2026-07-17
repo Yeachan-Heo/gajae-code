@@ -6,6 +6,7 @@ import {
 	Container,
 	Ellipsis,
 	ImageProtocol,
+	isTerminalGraphicsFallbackActive,
 	type Loader,
 	TERMINAL,
 	Text,
@@ -16,7 +17,12 @@ import {
 import { sanitizeText } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
 import type { TruncationMeta } from "../../tools/output-meta";
-import { getSixelLineMask, isSixelPassthroughEnabled, sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
+import {
+	containsSixelSequence,
+	getSixelLineMask,
+	isSixelPassthroughEnabled,
+	sanitizeWithOptionalSixelPassthrough,
+} from "../../utils/sixel";
 import {
 	buildExecutionFrame,
 	buildStatusFooter,
@@ -41,6 +47,7 @@ export class BashExecutionComponent extends Container {
 	#truncation?: TruncationMeta;
 	#expanded = false;
 	#displayDirty = false;
+	#displayBuiltWithGraphicsFallback: boolean | undefined;
 	#chunkGate = false;
 	#contentContainer: Container;
 	#headerText: Text;
@@ -135,7 +142,8 @@ export class BashExecutionComponent extends Container {
 	}
 
 	override render(width: number): string[] {
-		if (this.#displayDirty) {
+		const fallbackActive = isTerminalGraphicsFallbackActive();
+		if (this.#displayDirty || this.#displayBuiltWithGraphicsFallback !== fallbackActive) {
 			this.#displayDirty = false;
 			this.#updateDisplay();
 		}
@@ -143,16 +151,16 @@ export class BashExecutionComponent extends Container {
 	}
 
 	#updateDisplay(): void {
+		const fallbackActive = isTerminalGraphicsFallbackActive();
 		const availableLines = this.#outputLines;
-
-		// Apply preview truncation based on expanded state
-		const previewLogicalLines = availableLines.slice(-PREVIEW_LINES);
-		const hiddenLineCount = availableLines.length - previewLogicalLines.length;
 		const sixelLineMask =
-			TERMINAL.imageProtocol === ImageProtocol.Sixel && isSixelPassthroughEnabled()
+			fallbackActive || (TERMINAL.imageProtocol === ImageProtocol.Sixel && isSixelPassthroughEnabled())
 				? getSixelLineMask(availableLines)
 				: undefined;
 		const hasSixelOutput = sixelLineMask?.some(Boolean) ?? false;
+		const selectedLines =
+			this.#expanded || (hasSixelOutput && !fallbackActive) ? availableLines : availableLines.slice(-PREVIEW_LINES);
+		const hiddenLineCount = availableLines.length - selectedLines.length;
 
 		// Rebuild content container
 		// Detach (not dispose): #headerText and the running #loader are persistent,
@@ -165,15 +173,36 @@ export class BashExecutionComponent extends Container {
 		this.#contentContainer.addChild(this.#headerText);
 
 		// Output
-		if (availableLines.length > 0) {
-			if (this.#expanded || hasSixelOutput) {
-				const displayText = availableLines
-					.map((line, index) => (sixelLineMask?.[index] ? line : theme.fg("muted", line)))
+		if (selectedLines.length > 0) {
+			if (fallbackActive && hasSixelOutput) {
+				const displayLines: string[] = [];
+				const selectedStart = availableLines.length - selectedLines.length;
+				for (const [selectedIndex, line] of selectedLines.entries()) {
+					const index = selectedStart + selectedIndex;
+					if (sixelLineMask?.[index]) {
+						// Emit one placeholder per visible SIXEL block: at a true sequence
+						// start, at the top of a collapsed slice that begins mid-sequence,
+						// or when the line itself opens a new sequence.
+						const isBlockStart = selectedIndex === 0 || !sixelLineMask[index - 1] || containsSixelSequence(line);
+						if (isBlockStart) {
+							displayLines.push(theme.fg("muted", "[SIXEL image hidden while IRC sidebar is visible]"));
+						}
+					} else {
+						displayLines.push(theme.fg("muted", line));
+					}
+				}
+				this.#contentContainer.addChild(new Text(`\n${displayLines.join("\n")}`, 1, 0));
+			} else if (this.#expanded || hasSixelOutput) {
+				const displayText = selectedLines
+					.map((line, selectedIndex) => {
+						const index = availableLines.length - selectedLines.length + selectedIndex;
+						return sixelLineMask?.[index] ? line : theme.fg("muted", line);
+					})
 					.join("\n");
 				this.#contentContainer.addChild(new Text(`\n${displayText}`, 1, 0));
 			} else {
 				// Use shared visual truncation utility, recomputed per render width
-				const styledOutput = previewLogicalLines.map(line => theme.fg("muted", line)).join("\n");
+				const styledOutput = selectedLines.map(line => theme.fg("muted", line)).join("\n");
 				this.#contentContainer.addChild(createCollapsedPreview(`\n${styledOutput}`, PREVIEW_LINES));
 			}
 		}
@@ -187,10 +216,11 @@ export class BashExecutionComponent extends Container {
 				exitCode: this.#exitCode,
 				truncation: this.#truncation,
 				hiddenLineCount,
-				suppressHiddenCount: hasSixelOutput,
+				suppressHiddenCount: hasSixelOutput && !fallbackActive,
 			});
 			if (footer) this.#contentContainer.addChild(footer);
 		}
+		this.#displayBuiltWithGraphicsFallback = fallbackActive;
 	}
 
 	#clampDisplayLine(line: string): string {

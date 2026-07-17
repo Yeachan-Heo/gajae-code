@@ -44,7 +44,10 @@ const searchSchema = z
 		paths: z
 			.array(z.string().describe("file, directory, glob, or internal URL to search"))
 			.min(1)
-			.describe("files, directories, globs, or internal URLs to search"),
+			.optional()
+			.describe(
+				"files, directories, globs, or internal URLs to search (defaults to the working directory when omitted)",
+			),
 		i: z.boolean().optional().describe("case-insensitive search"),
 		gitignore: z.boolean().optional().describe("respect gitignore"),
 		skip: z
@@ -236,7 +239,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 		_onUpdate?: AgentToolUpdateCallback<SearchToolDetails>,
 		_toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<SearchToolDetails>> {
-		const { pattern, paths, i, gitignore, skip } = params;
+		const { pattern, i, gitignore, skip } = params;
+		// Recurring real-world failure mode: models omit `paths` for repo-wide
+		// searches. Default to the working directory instead of failing the call.
+		const paths = params.paths ?? ["."];
 
 		return untilAborted(signal, async () => {
 			const normalizedPattern = pattern.trim();

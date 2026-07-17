@@ -7,7 +7,6 @@ import type { AssistantMessage, UserMessage } from "@gajae-code/ai";
 import { exportFromFile, exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
 import { BlobStore, EphemeralBlobStore, externalizeImageDataSync } from "@gajae-code/coding-agent/session/blob-store";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
-import { logger } from "@gajae-code/utils";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -262,12 +261,11 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		await sm.close();
 	});
 
-	it("keeps existing durable image missing-blob fallback semantics", async () => {
+	it("keeps durable image missing-blob fallback public-safe", async () => {
 		const root = makeTempDir();
 		const blobs = new BlobStore(path.join(root, "blobs"));
 		const ref = externalizeImageDataSync(blobs, Buffer.from("image-bytes").toString("base64"));
 		const sm = SessionManager.create(root, path.join(root, "sessions"));
-		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		sm.appendMessage({
 			role: "user",
 			content: [{ type: "image", data: ref, mimeType: "image/png" }],
@@ -289,8 +287,11 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 					e.type === "message" && e.message.role === "user",
 			);
 		if (!user) throw new Error("Expected user entry");
-		expect(JSON.stringify(user.message.content)).toContain(ref);
-		expect(warnSpy).toHaveBeenCalled();
+		const serialized = JSON.stringify(user.message.content);
+		expect(serialized).toContain("Session resident imageData blob missing");
+		expect(serialized).toContain("original content unavailable");
+		expect(serialized).not.toContain(ref);
+		expect(serialized).not.toContain("__gjcResidentBlob");
 		await reopened.close();
 	});
 });

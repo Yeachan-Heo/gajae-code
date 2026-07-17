@@ -20,8 +20,14 @@ export interface SelectItem {
 	value: string;
 	label: string;
 	description?: string;
-	/** Dim hint text shown inline after cursor when this item is selected */
+	/** Autocomplete hint consumed by Editor; SelectList does not render it. */
 	hint?: string;
+	/**
+	 * Renders dimmed and can never be selected: navigation skips it, selection
+	 * callbacks never fire for it, and a list whose visible items are all
+	 * disabled reports no selection (`getSelectedItem()` returns `null`).
+	 */
+	disabled?: boolean;
 }
 
 export interface SelectListTheme {
@@ -49,7 +55,10 @@ export interface SelectListLayoutOptions {
 
 export class SelectList implements Component {
 	#filteredItems: ReadonlyArray<SelectItem>;
+	/** Index of the selected enabled item, or `-1` when no enabled item exists. */
 	#selectedIndex: number = 0;
+	/** First rendered item while selection is absent. */
+	#viewportStartIndex: number = 0;
 
 	onSelect?: (item: SelectItem) => void;
 	onCancel?: () => void;
@@ -62,16 +71,26 @@ export class SelectList implements Component {
 		private readonly layout: SelectListLayoutOptions = {},
 	) {
 		this.#filteredItems = items;
+		this.#selectedIndex = this.#firstEnabledIndex();
+		this.#syncViewportToIndex(Math.max(0, this.#selectedIndex));
 	}
 
 	setFilter(filter: string): void {
 		this.#filteredItems = this.items.filter(item => item.value.toLowerCase().startsWith(filter.toLowerCase()));
-		// Reset selection when filter changes
-		this.#selectedIndex = 0;
+		this.#selectedIndex = this.#firstEnabledIndex();
+		this.#syncViewportToIndex(Math.max(0, this.#selectedIndex));
 	}
 
 	setSelectedIndex(index: number): void {
-		this.#selectedIndex = Math.max(0, Math.min(index, this.#filteredItems.length - 1));
+		if (this.#filteredItems.length === 0) {
+			this.#selectedIndex = -1;
+			this.#viewportStartIndex = 0;
+			return;
+		}
+		const clamped = Math.max(0, Math.min(index, this.#filteredItems.length - 1));
+		this.#selectedIndex =
+			this.#findEnabledIndex(clamped, 1, false) ?? this.#findEnabledIndex(clamped, -1, false) ?? -1;
+		this.#syncViewportToIndex(this.#selectedIndex >= 0 ? this.#selectedIndex : clamped);
 	}
 
 	invalidate(): void {
@@ -89,11 +108,10 @@ export class SelectList implements Component {
 
 		const primaryColumnWidth = this.#getPrimaryColumnWidth();
 
-		// Calculate visible range with scrolling
-		const startIndex = Math.max(
-			0,
-			Math.min(this.#selectedIndex - Math.floor(this.maxVisible / 2), this.#filteredItems.length - this.maxVisible),
-		);
+		// Calculate visible range with scrolling. Selection owns the viewport when
+		// present; otherwise navigation moves an independent viewport anchor.
+		const startIndex =
+			this.#selectedIndex >= 0 ? this.#startIndexForSelection(this.#selectedIndex) : this.#clampedViewportStart();
 		const endIndex = Math.min(startIndex + this.maxVisible, this.#filteredItems.length);
 
 		// Render visible items
@@ -101,14 +119,16 @@ export class SelectList implements Component {
 			const item = this.#filteredItems[i];
 			if (!item) continue;
 
-			const isSelected = i === this.#selectedIndex;
+			const isSelected = i === this.#selectedIndex && !item.disabled;
 			const descriptionText = item.description ? sanitizeSingleLine(item.description) : undefined;
 			lines.push(this.#renderItem(item, isSelected, width, descriptionText, primaryColumnWidth));
 		}
 
-		// Add scroll indicators if needed
+		// Add scroll indicators if needed. With no selectable item the position
+		// is reported as "-" so an all-disabled list never claims a selection.
 		if (startIndex > 0 || endIndex < this.#filteredItems.length) {
-			const scrollText = `  (${this.#selectedIndex + 1}/${this.#filteredItems.length})`;
+			const position = this.#selectedIndex >= 0 ? `${this.#selectedIndex + 1}` : "-";
+			const scrollText = `  (${position}/${this.#filteredItems.length})`;
 			// Truncate if too long for terminal
 			lines.push(this.theme.scrollInfo(truncateToWidth(scrollText, width - 2, Ellipsis.Omit)));
 		}
@@ -126,30 +146,19 @@ export class SelectList implements Component {
 			}
 			return;
 		}
-		// Up arrow - wrap to bottom when at top
 		if (kb.matches(keyData, "tui.select.up")) {
-			this.#selectedIndex = this.#selectedIndex === 0 ? this.#filteredItems.length - 1 : this.#selectedIndex - 1;
-			this.#notifySelectionChange();
-		}
-		// Down arrow - wrap to top when at bottom
-		else if (kb.matches(keyData, "tui.select.down")) {
-			this.#selectedIndex = this.#selectedIndex === this.#filteredItems.length - 1 ? 0 : this.#selectedIndex + 1;
-			this.#notifySelectionChange();
-		}
-		// PageUp - jump up by one visible page
-		else if (kb.matches(keyData, "tui.select.pageUp")) {
-			this.#selectedIndex = Math.max(0, this.#selectedIndex - this.maxVisible);
-			this.#notifySelectionChange();
-		}
-		// PageDown - jump down by one visible page
-		else if (kb.matches(keyData, "tui.select.pageDown")) {
-			this.#selectedIndex = Math.min(this.#filteredItems.length - 1, this.#selectedIndex + this.maxVisible);
-			this.#notifySelectionChange();
+			this.#moveSelection(-1);
+		} else if (kb.matches(keyData, "tui.select.down")) {
+			this.#moveSelection(1);
+		} else if (kb.matches(keyData, "tui.select.pageUp")) {
+			this.#movePage(-1);
+		} else if (kb.matches(keyData, "tui.select.pageDown")) {
+			this.#movePage(1);
 		}
 		// Enter
 		else if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
 			const selectedItem = this.#filteredItems[this.#selectedIndex];
-			if (selectedItem && this.onSelect) {
+			if (selectedItem && !selectedItem.disabled && this.onSelect) {
 				this.onSelect(selectedItem);
 			}
 		}
@@ -184,6 +193,9 @@ export class SelectList implements Component {
 
 			if (remainingWidth > MIN_DESCRIPTION_WIDTH) {
 				const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, Ellipsis.Omit);
+				if (item.disabled) {
+					return this.theme.description(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
+				}
 				if (isSelected) {
 					return this.theme.selectedText(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
 				}
@@ -195,6 +207,9 @@ export class SelectList implements Component {
 
 		const maxWidth = width - prefixWidth - 2;
 		const truncatedValue = this.#truncatePrimary(item, isSelected, maxWidth, maxWidth);
+		if (item.disabled) {
+			return this.theme.description(`${prefix}${truncatedValue}`);
+		}
 		if (isSelected) {
 			return this.theme.selectedText(`${prefix}${truncatedValue}`);
 		}
@@ -242,15 +257,105 @@ export class SelectList implements Component {
 		return sanitizeSingleLine(item.label || item.value);
 	}
 
+	/** First enabled index, or `-1` when every filtered item is disabled. */
+	#firstEnabledIndex(): number {
+		return this.#filteredItems.findIndex(item => !item.disabled);
+	}
+
+	#findEnabledIndex(start: number, direction: 1 | -1, wrap: boolean): number | undefined {
+		for (let step = 0; step < this.#filteredItems.length; step++) {
+			let index = start + step * direction;
+			if (index < 0 || index >= this.#filteredItems.length) {
+				if (!wrap) return undefined;
+				index = (index + this.#filteredItems.length) % this.#filteredItems.length;
+			}
+			if (!this.#filteredItems[index]?.disabled) return index;
+		}
+		return undefined;
+	}
+
+	#moveSelection(direction: 1 | -1): void {
+		if (this.#filteredItems.length === 0) return;
+		if (this.#selectedIndex < 0 && this.#firstEnabledIndex() < 0) {
+			this.#moveViewport(direction, true);
+			return;
+		}
+		const start =
+			this.#selectedIndex < 0
+				? direction === 1
+					? 0
+					: this.#filteredItems.length - 1
+				: (this.#selectedIndex + direction + this.#filteredItems.length) % this.#filteredItems.length;
+		const next = this.#findEnabledIndex(start, direction, true);
+		if (next === undefined) return;
+		if (next === this.#selectedIndex) {
+			// Preserve the legacy enabled-only callback contract while suppressing
+			// no-op previews when disabled entries collapse navigation to one item.
+			if (this.#allItemsEnabled()) this.#notifySelectionChange();
+			return;
+		}
+		this.#selectedIndex = next;
+		this.#syncViewportToIndex(next);
+		this.#notifySelectionChange();
+	}
+
+	#movePage(direction: 1 | -1): void {
+		if (this.#filteredItems.length === 0) return;
+		if (this.#selectedIndex < 0 && this.#firstEnabledIndex() < 0) {
+			this.#moveViewport(direction * this.maxVisible, false);
+			return;
+		}
+		const from = this.#selectedIndex < 0 ? (direction === 1 ? -1 : this.#filteredItems.length) : this.#selectedIndex;
+		const target = Math.max(0, Math.min(this.#filteredItems.length - 1, from + direction * this.maxVisible));
+		const next =
+			this.#findEnabledIndex(target, direction, false) ??
+			this.#findEnabledIndex(target, direction === 1 ? -1 : 1, false);
+		if (next === undefined) return;
+		if (next === this.#selectedIndex) {
+			if (this.#allItemsEnabled()) this.#notifySelectionChange();
+			return;
+		}
+		this.#selectedIndex = next;
+		this.#syncViewportToIndex(next);
+		this.#notifySelectionChange();
+	}
+
+	#allItemsEnabled(): boolean {
+		return this.#filteredItems.every(item => !item.disabled);
+	}
+
+	#maxViewportStart(): number {
+		return Math.max(0, this.#filteredItems.length - this.maxVisible);
+	}
+
+	#clampedViewportStart(): number {
+		return Math.max(0, Math.min(this.#viewportStartIndex, this.#maxViewportStart()));
+	}
+
+	#startIndexForSelection(index: number): number {
+		return Math.max(0, Math.min(index - Math.floor(this.maxVisible / 2), this.#maxViewportStart()));
+	}
+
+	#syncViewportToIndex(index: number): void {
+		this.#viewportStartIndex = this.#startIndexForSelection(index);
+	}
+
+	#moveViewport(delta: number, wrap: boolean): void {
+		const maxStart = this.#maxViewportStart();
+		if (maxStart === 0) return;
+		const next = this.#viewportStartIndex + delta;
+		this.#viewportStartIndex = wrap ? (next + maxStart + 1) % (maxStart + 1) : Math.max(0, Math.min(next, maxStart));
+	}
+
 	#notifySelectionChange(): void {
 		const selectedItem = this.#filteredItems[this.#selectedIndex];
-		if (selectedItem && this.onSelectionChange) {
+		if (selectedItem && !selectedItem.disabled && this.onSelectionChange) {
 			this.onSelectionChange(selectedItem);
 		}
 	}
 
 	getSelectedItem(): SelectItem | null {
 		const item = this.#filteredItems[this.#selectedIndex];
-		return item || null;
+		return item && !item.disabled ? item : null;
 	}
 }

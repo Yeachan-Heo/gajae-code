@@ -34,6 +34,33 @@ const CLASS_RE = /^export declare class (\w+)/gm;
 // Match `export declare function name(...)`. Same shape rationale.
 const FUNCTION_RE = /^export declare function (\w+)/gm;
 
+// These platform-gated classes remain named ESM exports and declarations on
+// every platform so cross-platform consumers can import the package without
+// conditional export syntax. The native binding is available only where its
+// platform implementation is built.
+const COMPATIBILITY_CLASSES = ["ComputerController"];
+
+const COMPUTER_CONTROLLER_DECLARATION = `/**
+ * macOS computer-use controller.
+ *
+ * This declaration and the named JS export are available on every platform so
+ * consumers can import them portably; the native controller itself is built
+ * only on macOS.
+ */
+export declare class ComputerController {
+  constructor()
+  screenshot(): ComputerScreenshot
+  click(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void
+  doubleClick(expectedEpoch: number | undefined | null, x: number, y: number, button?: string | undefined | null): void
+  move(expectedEpoch: number | undefined | null, x: number, y: number): void
+  drag(expectedEpoch: number | undefined | null, x: number, y: number, toX: number, toY: number, button?: string | undefined | null): void
+  scroll(expectedEpoch: number | undefined | null, x: number, y: number, scrollX: number, scrollY: number): void
+  type(expectedEpoch: number | undefined | null, text: string): void
+  keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
+  wait(expectedEpoch: number | undefined | null, ms: number): void
+}
+
+`;
 interface EnumExport {
 	name: string;
 	entries: string[];
@@ -74,8 +101,48 @@ function collectMatches(dts: string, re: RegExp): string[] {
 	return names;
 }
 
+function applyPathIdentityTypes(dts: string): string {
+	const identity = `export type NativeCanonicalDirectoryIdentity =
+	| { ok: true; platform: "posix" | "win32"; canonicalPath: string; code?: never }
+	| {
+			ok: false;
+			platform?: never;
+			canonicalPath?: never;
+			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
+	  }`;
+	const security = `export type NativeOwnerOnlySecurityResult =
+	| { ok: true; code?: never }
+	| {
+			ok: false;
+			code:
+				| "not_found"
+				| "not_directory"
+				| "network_unsupported"
+				| "reparse_point"
+				| "acl_unavailable"
+				| "acl_apply_failed"
+				| "acl_verify_failed"
+				| "io_error";
+	  }`;
+	return dts
+		.replace(
+			/^export declare function canonicalExistingDirectoryIdentity\([^\n]*$/m,
+			"export declare function canonicalExistingDirectoryIdentity(path: string | Uint8Array): NativeCanonicalDirectoryIdentity",
+		)
+		.replace(
+			/^export declare function applyOwnerOnlyPathSecurity\([^\n]*$/m,
+			'export declare function applyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult',
+		)
+		.replace(
+			/^export declare function verifyOwnerOnlyPathSecurity\([^\n]*$/m,
+			'export declare function verifyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult',
+		)
+		.replace(/export interface NativeCanonicalDirectoryIdentity \{[\s\S]*?\n\}/, identity)
+		.replace(/export interface NativeOwnerOnlySecurityResult \{[\s\S]*?\n\}/, security);
+}
+
 function buildGeneratedBlock(dts: string): string {
-	const classes = collectMatches(dts, CLASS_RE);
+	const classes = [...new Set([...COMPATIBILITY_CLASSES, ...collectMatches(dts, CLASS_RE)])];
 	const functions = collectMatches(dts, FUNCTION_RE);
 	const enums = collectEnums(dts);
 
@@ -108,10 +175,42 @@ function buildGeneratedBlock(dts: string): string {
 	return `${MARKER_START}\n${lines.join("\n")}\n${MARKER_END}`;
 }
 
+function patchCompatibilityDeclarations(dts: string): string {
+	let patched = dts;
+	if (!/^export declare class ComputerController\b/m.test(patched)) {
+		patched = patched.replace("/* eslint-disable */\n", `/* eslint-disable */\n${COMPUTER_CONTROLLER_DECLARATION}`);
+	}
+	return patched
+		.replace(
+			"/** The action id being answered (the real broker `gate_id` for asks). */",
+			"/** The transient action/presentation id being answered, not a durable gate id. */",
+		)
+		.replace(
+			"/** Public status of exact direct retirement. Claims and receipts remain native. */\nexport interface RetireIfUnclaimedResult {\n  status: string\n}",
+			'/** Public status of exact direct retirement. Claims and receipts remain native. */\nexport interface RetireIfUnclaimedResult {\n  status: "retired" | "already_terminal" | "claimed" | "stale"\n}',
+		)
+		.replace(
+			"/**\n * Private in-process presentation identity used for exact direct retirement.\n * It is never emitted to SDK clients or persisted.\n */",
+			"/**\n * Opaque in-process capability returned by `registerArbitratedAsk`.\n * Pass it unchanged to `retireIfUnclaimed`; do not construct, persist,\n * inspect, or treat it as workflow-gate authority.\n */",
+		)
+		.replace(
+			"Register an ask and return an in-memory-only exact presentation lease for\n   * a subsequent direct retirement attempt. A supplied `workflowGateId` is\n   * preserved.",
+			"Register an ask and return an opaque in-process capability. Pass it\n   * unchanged to `retireIfUnclaimed`; do not construct, persist, inspect, or\n   * treat it as workflow-gate authority. A supplied `workflowGateId` is preserved.",
+		)
+		.replace(
+			"Atomically terminalize this exact presentation lease. The typed status\n   * proves whether the lease retired, was already terminal, was claimed, or\n   * became stale without exposing claims, receipts, or registration state.",
+			"Atomically terminalize the exact presentation named by an opaque lease.\n   * The typed status proves whether it retired, was already terminal, was\n   * claimed, or became stale without exposing claims, receipts, registration\n   * state, or workflow-gate authority.",
+		)
+		.replace(
+			"Legacy id-only local termination is unsafe for arbitrated presentations.\n   * Use [`Self::retire_if_unclaimed`] with the exact lease instead.",
+			"Resolve a legacy/non-arbitrated action locally (the CLI/TUI answered).\n   * Arbitrated presentations require `retireIfUnclaimed` with the opaque exact\n   * lease, so id-only local resolution fails closed for those presentations.",
+		);
+}
+
 export async function generateEnumExports(): Promise<void> {
-	const dts = await Bun.file(dtsPath).text();
+	const generatedDts = await Bun.file(dtsPath).text();
 	const existing = await Bun.file(jsPath).text();
-	const generatedBlock = buildGeneratedBlock(dts);
+	const generatedBlock = buildGeneratedBlock(generatedDts);
 
 	// Patch the generated block in place. `native/index.js` is the hand-edited
 	// loader; only the block between MARKER_START and MARKER_END is owned by
@@ -131,10 +230,14 @@ export async function generateEnumExports(): Promise<void> {
 
 	// Also fix the .d.ts: replace `const enum` with `enum` so TS allows
 	// assigning string literals to enum types without casts.
-	const constEnumCount = (dts.match(/export (?:declare )?const enum/g) ?? []).length;
-	const dtsContent = dts
-		.replaceAll("export const enum", "export declare enum")
-		.replaceAll("export declare const enum", "export declare enum");
+	const constEnumCount = (generatedDts.match(/export (?:declare )?const enum/g) ?? []).length;
+	const dtsContent = patchCompatibilityDeclarations(
+		applyPathIdentityTypes(
+			generatedDts
+				.replaceAll("export const enum", "export declare enum")
+				.replaceAll("export declare const enum", "export declare enum"),
+		),
+	);
 	await Bun.write(dtsPath, dtsContent);
 
 	const symbolCount = (generatedBlock.match(/^export const /gm) ?? []).length;

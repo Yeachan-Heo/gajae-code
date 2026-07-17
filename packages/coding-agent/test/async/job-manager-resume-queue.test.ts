@@ -231,6 +231,33 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
+	test("a fenced queued owner remains queued while a later foreign owner resumes", async () => {
+		const { manager, completions } = makeManager({ maxRunningJobs: 1 });
+		installResumeRunner(manager);
+		const a = spawnControllable(manager, "A", "owner-a");
+		expect(manager.pauseSubagent("A").ok).toBe(true);
+		a.release();
+		await manager.waitForAll();
+		const c = spawnControllable(manager, "C", "owner-c");
+		expect(manager.pauseSubagent("C").ok).toBe(true);
+		c.release();
+		await manager.waitForAll();
+		const b = spawnControllable(manager, "B", "owner-b");
+		expect(manager.resumeSubagent("A").queued).toBe(true);
+		expect(manager.resumeSubagent("C").queued).toBe(true);
+		const lease = manager.beginOwnerSubagentShutdown("owner-a")!;
+		expect(manager.resumeSubagent("A")).toMatchObject({ ok: false, reason: "owner_shutdown_in_progress" });
+		b.release();
+		await manager.waitForAll();
+		expect(manager.getSubagentRecord("A")?.status).toBe("queued");
+		expect(manager.getSubagentRecord("C")?.status).toBe("completed");
+		expect(completions.map(completion => completion.text)).toContain("resumed:C");
+		const proof = await manager.cancelAndProveOwnerSubagents(lease, { timeoutMs: 50 });
+		expect(proof).toMatchObject({ confirmed: true, terminalIds: ["A"], unresolvedIds: [] });
+		manager.finishOwnerSubagentShutdown(lease, "release");
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
 	test("cancelSubagent on a paused subagent marks cancelled but keeps the record (AC10)", async () => {
 		const { manager } = makeManager();
 		const a = spawnControllable(manager, "A");

@@ -50,7 +50,7 @@ export interface StateWriterReceiptContext {
 	skill: CanonicalGjcWorkflowSkill;
 	owner: WorkflowStateMutationOwner;
 	command: string;
-	sessionId?: string;
+	sessionId: string;
 	mutationId?: string;
 	nowIso?: string;
 	verb?: string;
@@ -267,7 +267,7 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 		content_sha256: {
 			algorithm: "sha256",
 			value: workflowEnvelopeContentSha256(envelope),
-			covered_path: filePath,
+			covered_path: path.resolve(filePath),
 			computed_at: computedAt,
 		},
 	};
@@ -302,6 +302,18 @@ function requireSessionId(sessionScope: string | ActiveSessionScope | undefined,
 
 function activeStateDir(cwd: string, sessionScope?: string | ActiveSessionScope): string {
 	return layoutActiveStateDir(cwd, requireSessionId(sessionScope, "activeStateDir"));
+}
+
+type ActiveStateCacheInvalidator = (cwd?: string, sessionId?: string) => void;
+var activeStateCacheInvalidator: ActiveStateCacheInvalidator | undefined;
+
+export function setActiveStateCacheInvalidator(invalidator: ActiveStateCacheInvalidator): void {
+	activeStateCacheInvalidator = invalidator;
+}
+
+function invalidateActiveStateCacheForScope(cwd: string, sessionScope?: string | ActiveSessionScope): void {
+	const sessionId = typeof sessionScope === "string" ? sessionScope : sessionScope?.sessionId;
+	activeStateCacheInvalidator?.(cwd, sessionId);
 }
 
 function activeSnapshotPath(cwd: string, sessionScope?: string | ActiveSessionScope): string {
@@ -979,6 +991,7 @@ export async function writeActiveEntry(
 				persistedSourceRevision(entry) || persistedSourceRevision(await readJsonIfPresent(filePath)) + 1,
 		},
 	);
+	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return filePath;
 }
 
@@ -1003,6 +1016,7 @@ export async function removeActiveEntry(
 			}
 			const deleted = await atomicRemove(filePath);
 			if (deleted) await maybeAudit(filePath, options);
+			if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
 			return { path: filePath, deleted };
 		},
 		options?.lock,
@@ -1049,6 +1063,7 @@ export async function rebuildActiveSnapshot(
 			...entries.map(entry => persistedSourceRevision(entry)),
 		),
 	});
+	invalidateActiveStateCacheForScope(cwd, sessionScope);
 	return snapshotPath;
 }
 

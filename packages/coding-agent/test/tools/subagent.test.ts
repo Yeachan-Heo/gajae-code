@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -107,6 +107,159 @@ describe("SubagentTool", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
+	it("consumes a watched completion before unwatch can redeliver it", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				delivered.push(jobId);
+			},
+			retentionMs: 10_000,
+		});
+		AsyncJobManager.setInstance(manager);
+		const tool = new SubagentTool(createSession());
+		const gate = Promise.withResolvers<string>();
+		manager.register("task", "live completion", async () => gate.promise, {
+			id: "job-live-completion",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-LiveCompletion",
+					agent: "executor",
+					agentSource: "bundled",
+					description: "live completion",
+					assignment: "Complete while watched.",
+				},
+			},
+		});
+		setTimeout(() => gate.resolve("completed while watched"), 5);
+
+		const result = await tool.execute("subagent-await-live-completion", {
+			action: "await",
+			ids: ["0-LiveCompletion"],
+			timeout_ms: 100,
+		});
+		await Bun.sleep(10);
+
+		expect(result.details?.awaitOutcome).toBe("completed");
+		expect(result.details?.subagents[0]?.resultText).toContain("completed while watched");
+		expect(delivered).toEqual([]);
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("interrupts only a live parent await and leaves the child running", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const acknowledgeDeliveries = vi.spyOn(manager, "acknowledgeDeliveries");
+		const child = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "interruptible subagent", async () => child.promise, {
+			id: "job-interruptible",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-Interruptible", agent: "executor", agentSource: "bundled" } },
+		});
+		const terminalJobId = manager.register("task", "already complete subagent", async () => "already complete", {
+			id: "job-already-complete",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-AlreadyComplete", agent: "executor", agentSource: "bundled" } },
+		});
+		await manager.getJob(terminalJobId)?.promise;
+
+		const controller = new AbortController();
+		const awaiting = tool.execute(
+			"subagent-await-interrupt",
+			{ action: "await", ids: ["0-Interruptible", "0-AlreadyComplete"], timeout_ms: 10_000 },
+
+			controller.signal,
+		);
+		controller.abort();
+		const receipt = await awaiting;
+
+		expect(receipt.details?.awaitOutcome).toBe("interrupted");
+		expect(receipt.details?.interrupted).toBe(true);
+		expect(receipt.details?.subagents[0]?.status).toBe("running");
+		expect(receipt.details?.subagents[0]?.guidance).toContain("continues");
+		expect(receipt.details?.subagents.find(snapshot => snapshot.id === "0-AlreadyComplete")?.status).toBe(
+			"completed",
+		);
+		expect(
+			receipt.details?.subagents.find(snapshot => snapshot.id === "0-AlreadyComplete")?.guidance,
+		).toBeUndefined();
+		expect(getText(receipt)).toContain("Subagent await interrupted");
+		expect(manager.getJob(jobId)?.status).toBe("running");
+		expect(acknowledgeDeliveries).not.toHaveBeenCalled();
+
+		child.resolve("child finished after parent interruption");
+		await manager.getJob(jobId)?.promise;
+		expect(manager.getJob(jobId)?.status).toBe("completed");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("treats pre-aborted live awaits as interrupted but terminal-only awaits as ordinary", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const child = Promise.withResolvers<string>();
+		const liveJobId = manager.register("task", "live subagent", async () => child.promise, {
+			id: "job-pre-aborted-live",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-PreAbortedLive", agent: "executor", agentSource: "bundled" } },
+		});
+		const terminalJobId = manager.register("task", "terminal subagent", async () => "done", {
+			id: "job-pre-aborted-terminal",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-PreAbortedTerminal", agent: "executor", agentSource: "bundled" } },
+		});
+		await manager.getJob(terminalJobId)?.promise;
+		const controller = new AbortController();
+		controller.abort();
+
+		const live = await tool.execute(
+			"subagent-await-pre-aborted-live",
+			{ action: "await", ids: ["0-PreAbortedLive"], timeout_ms: 10_000 },
+			controller.signal,
+		);
+		const terminal = await tool.execute(
+			"subagent-await-pre-aborted-terminal",
+			{ action: "await", ids: ["0-PreAbortedTerminal"], timeout_ms: 10_000 },
+			controller.signal,
+		);
+
+		expect(live.details?.awaitOutcome).toBe("interrupted");
+		expect(live.details?.interrupted).toBe(true);
+		expect(manager.getJob(liveJobId)?.status).toBe("running");
+		expect(terminal.details?.awaitOutcome).toBeUndefined();
+		expect(terminal.details?.interrupted).toBeUndefined();
+
+		child.resolve("done");
+		await manager.getJob(liveJobId)?.promise;
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("uses the final stable-id snapshot when completion wins the await race", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const child = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "race subagent", async () => child.promise, {
+			id: "job-race",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-Race", agent: "executor", agentSource: "bundled" } },
+		});
+		const controller = new AbortController();
+		const awaiting = tool.execute(
+			"subagent-await-race",
+			{ action: "await", ids: ["0-Race"], timeout_ms: 10_000 },
+			controller.signal,
+		);
+		child.resolve("final result");
+		await manager.getJob(jobId)?.promise;
+		const receipt = await awaiting;
+		controller.abort();
+
+		expect(receipt.details?.awaitOutcome).toBe("completed");
+		expect(receipt.details?.interrupted).toBeUndefined();
+		expect(receipt.details?.subagents[0]?.status).toBe("completed");
+		expect(receipt.details?.subagents[0]?.resultText).toContain("final result");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
 	it("await timeout is non-terminal and guides continued observation instead of shutdown", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());
@@ -140,6 +293,8 @@ describe("SubagentTool", () => {
 		const guidance = result.details?.subagents[0]?.guidance ?? "";
 
 		expect(result.details?.subagents[0]?.status).toBe("running");
+		expect(result.details?.awaitOutcome).toBe("timed_out");
+		expect(result.details?.interrupted).toBeUndefined();
 		expect(guidance).toContain("Still running");
 		expect(guidance).toContain("not a failure");
 		expect(guidance).toContain("never cancel just because an await timed out");

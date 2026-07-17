@@ -5,7 +5,7 @@
  */
 export const GEMINI_CLI_VERSION_ENV = "GJC_AI_GEMINI_CLI_VERSION";
 export const LEGACY_GEMINI_CLI_VERSION_ENV = "PI_AI_GEMINI_CLI_VERSION";
-export const DEFAULT_GEMINI_CLI_VERSION = "0.49.0";
+export const DEFAULT_GEMINI_CLI_VERSION = "0.50.0";
 
 export function getGeminiCliUserAgent(modelId = "gemini-3.1-pro-preview"): string {
 	const version =

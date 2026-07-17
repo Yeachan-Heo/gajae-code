@@ -4,6 +4,83 @@
 
 ### Fixed
 
+- `transportFailureFacts` now reduces transport headers to a plain record containing only the retained retry signals (`retry-after`, `retry-after-ms`). Providers attach these facts to error `AssistantMessage`s, and the previous shape carried the live fetch/SDK `Headers` instance — which is not structured-cloneable (`structuredClone` throws `DataCloneError`, "The object can not be cloned." under Bun) and not JSON-serializable (persisted as `{}` in session files, silently dropping the retry hint). Under a managed model fallback chain, snapshotting such an error message replaced the real provider failure with the local clone error and exhausted the whole chain. Normalization is idempotent (re-running facts on facts is structurally stable; errors carrying only unretained headers with no status/code now yield no facts instead of an empty facts object), Retry-After classification (`classifyFallbackTrigger`) is unchanged, and arbitrary response headers no longer reach persisted facts.
+
+## [0.11.0] - 2026-07-15
+### Added
+
+- Exported the canonical thinking-control mode runtime vocabulary so packed SDK consumers can validate provider metadata against the same public `@gajae-code/ai` contract.
+
+### Fixed
+
+- Fixed frequent `Request blocked (code=invalid_prompt)` failures on gpt-5.6 (Sol/Terra/Luna) subagent, default-agent, and compaction turns (ref openai/codex#32028, oh-my-pi#5184). Leaked Harmony control-token markers (e.g. `<|channel|>analysis`) were only neutralized on the replayed-history payload path, so markers in assistant reasoning summaries, live-converted message/tool-output text, and user-authored content reached the OpenAI Responses and OpenAI-codex-responses transports verbatim and wedged the session (the poisoned item was re-sent every turn). Both transports now neutralize reserved control tokens across the entire outgoing `input` array at the request boundary via an idempotent zero-width-space insertion that keeps the text human-readable.
+
+- Closed the remaining `Request blocked (code=invalid_prompt)` wedge on gpt-5.6 caused by header-form leaked Harmony markers. The reserved-control-token sanitizer only matched the simple `<|ident|>` shape, so a header-form marker carrying a recipient (e.g. `<|assistant to=functions.bash|>`) survived every sanitizer path (replay, request boundary, compaction) and kept re-poisoning history even after the earlier fixes. The pattern now also matches the scoped header grammar — a known Harmony role (`system`/`developer`/`user`/`assistant`/`tool`) plus a `to=<recipient>` assignment with unbounded recipient length — while leaving ordinary delimiter/pipe text untouched (arbitrary `<|foo bar=baz|>`, F# `value <| f |> g`, compact `sum<|a+b|>c`, and multi-line bodies never match). The simple branch remains a strict superset of the prior identifier-only pattern (#2267).
+
+- Made the `Request blocked (code=invalid_prompt)` classification explicit and shared across transports (#2282). `invalid_prompt` was only non-retryable by omission — it appeared in neither the codex retryable nor non-retryable event set, and the plain OpenAI Responses transport surfaced it as a generic error with no durable marker. It is now in the codex `CODEX_NON_RETRYABLE_EVENT_CODES` set (code and message forms), the Responses error path tags `transportFailure.providerCode = "invalid_prompt"`, and a new exported `isInvalidPromptError` predicate is the single contract both transports and the session-level circuit breaker key on. Ordinary control-token / pipe text (F# `value <| f |> g`, `sum<|a+b|>c`, `<|foo bar=baz|>`) is unaffected; genuinely transient errors (`server_error`, `model_error`) stay retryable.
+
+## [0.10.2] - 2026-07-14
+
+### Fixed
+
+- Fixed frequent `Request blocked (code=invalid_prompt)` failures on gpt-5.6 (Sol/Terra/Luna) subagent, default-agent, and compaction turns (ref openai/codex#32028, oh-my-pi#5184). Leaked Harmony control-token markers (e.g. `<|channel|>analysis`) were only neutralized on the replayed-history payload path, so markers in assistant reasoning summaries, live-converted message/tool-output text, and user-authored content reached the OpenAI Responses and OpenAI-codex-responses transports verbatim and wedged the session (the poisoned item was re-sent every turn). Both transports now neutralize reserved control tokens across the entire outgoing `input` array at the request boundary via an idempotent zero-width-space insertion that keeps the text human-readable.
+
+## [0.10.0] - 2026-07-12
+### Fixed
+
+- Made Bedrock model visibility reflect credential-only static/shared AWS sources with supported profile shapes, authenticated real bearer-token requests, and stopped advertising unsupported ECS/IRSA sources (#1934).
+- Added a typed provider safety-stop classification across Anthropic, OpenAI-compatible, and Google streams so callers can distinguish policy terminations from generic provider errors without parsing display text.
+
+## [0.9.6] - 2026-07-10
+### Fixed
+
+- Normalized the GPT-5.6 Sol/Terra/Luna context window to the 373K usable prompt budget on both OpenAI and OpenAI code transports (was 1,050K / 272K), matching the live openai-codex catalog.
+
+## [0.9.5] - 2026-07-09
+### Added
+
+- Added GPT-5.6 Sol, Terra, and Luna catalog/parser support for OpenAI and OpenAI code transports, including `low` through canonical `max` reasoning efforts, verified pricing/limits, and GPT-5.6 cache-write pricing (#1925; OmX #3103).
+
+### Fixed
+
+- Stopped requesting `strict: true` tool use on Anthropic OAuth requests: the Claude Code OAuth surface mishandles strict tools, returning tool calls with empty/undefined arguments and occasionally corrupted tool names. API-key requests keep strict tool use; `PI_NO_STRICT=1` is no longer needed as a workaround.
+
+## [0.9.4] - 2026-07-09
+### Fixed
+
+- Preserved Anthropic OAuth tool-call names and streamed arguments across interleaved tool-use blocks, preventing prefixed tool names and partial JSON deltas from being dropped or misattributed.
+- Embedded `models.json` via a `with { type: "file" }` import so compiled release binaries load the bundled model catalog from bunfs instead of crashing at startup with `Cannot find module './packages/ai/src/models.json'` (v0.9.3 regression, #1914).
+
+## [0.9.2] - 2026-07-09
+### Added
+
+- Added runtime credential selectors so callers can pin stored multi-account credentials by id, email, account id, or project id instead of using automatic rotation/ranking.
+
+### Fixed
+
+- Refreshed the default Gemini CLI impersonation version to 0.50.0 so the spoofed User-Agent freshness gate passes for the 0.9.2 release.
+- Hid the non-callable `google-antigravity/gemini-3.1-pro-high` selector from bundled, dynamic, and cached Antigravity catalogs after live Cloud Code Assist calls returned HTTP 400; `google-antigravity/gemini-3.1-pro-low:high` remains the working high-thinking path.
+- Preserved Anthropic tool-use arguments supplied on `content_block_start` when no `input_json_delta` chunks follow, preventing finished tool calls from collapsing back to `{}`.
+- Refreshed the default Gemini CLI impersonation version to 0.50.0 so the spoofed User-Agent freshness gate passes for the 0.9.2 release.
+
+## [0.9.1] - 2026-07-08
+
+### Fixed
+
+- Unified the Cursor client version used across provider requests and discovery.
+- Detected ZAI weekly limit exhaustion as a structured rate-limit condition.
+- Pointed Sakana Fugu OAuth/login guidance at the Sakana platform console and documented the `fish_` key prefix expectation.
+
+## [0.9.0] - 2026-07-07
+
+### Fixed
+
+- Capped OpenCode Go Kimi reasoning efforts that the Go chat-completions endpoint rejects (`kimi-k2.5:minimal` → `low`, `kimi-k2.7-code:xhigh|max` → `high`) and degraded forced `tool_choice` for those models so Kimi Go sessions and title-generation turns no longer fail with generic upstream 400s.
+
+## [0.8.2] - 2026-07-06
+
+### Fixed
+
 - Refreshed matching existing OAuth credentials during `importCredentialIfAbsent` and cleared provider usage caches after the write, so external credential import no longer keeps stale tokens or stale usage-limit reports for the same account.
 
 ## [0.7.9] - 2026-07-01
@@ -363,7 +440,7 @@
 
 - Added `onAuthError` to `StreamOptions` and wired `streamSimple()` to retry once with a replacement API key when the first provider response is a 401 before any assistant events are emitted
 - Added generation-aware snapshot metadata (`generation`, `serverNowMs`, `refresher`, and `rotatesInMs`) to auth-broker snapshot responses to support client-side credential-rotation planning
-- Added `transport: "pi-native"` on `Model` and the matching `streamPiNative` client. When `model.transport === "pi-native"`, `streamSimple` short-circuits the per-provider dispatch and POSTs the canonical `Context` to the auth-gateway's `POST /v1/pi/stream` endpoint. The response is SSE-framed `AssistantMessageEvent`s parsed by `readSseJson` and pushed verbatim into the local `AssistantMessageEventStream` — no wire-format translation, no partial-stripping reconstruction. Used by containerized gjc installs (robogjc slots, swarm extension, etc.) to route every LLM call through a credential-holding sidecar; the slot itself never sees the real provider tokens. Server-controlled fields (`apiKey`, `signal`, `fetch`, lifecycle callbacks, the provider-session map) are stripped from the wire body — `apiKey` rides in the `Authorization` header as the gateway bearer.
+- Added `transport: "pi-native"` on `Model` and the matching `streamPiNative` client. When `model.transport === "pi-native"`, `streamSimple` short-circuits the per-provider dispatch and POSTs the canonical `Context` to the auth-gateway's `POST /v1/pi/stream` endpoint. The response is SSE-framed `AssistantMessageEvent`s parsed by `readSseJson` and pushed verbatim into the local `AssistantMessageEventStream` — no wire-format translation, no partial-stripping reconstruction. Used by containerized GJC deployments and swarm extensions to route every LLM call through a credential-holding sidecar; the container never sees the real provider tokens. Server-controlled fields (`apiKey`, `signal`, `fetch`, lifecycle callbacks, the provider-session map) are stripped from the wire body — `apiKey` rides in the `Authorization` header as the gateway bearer.
 - Added `POST /v1/pi/stream` to the auth-gateway. Same auth + abort + model-resolution + openai-code-compat + prefix-cache plumbing as the foreign-wire routes; only the wire-format translation is skipped. Request body is `{ modelId, context, options?, stream? }` where `context` is the canonical pi-ai `Context` and `options` is `SimpleStreamOptions` with non-serializable fields stripped. Response is SSE-framed `AssistantMessageEvent` (terminated by `data: [DONE]`) when streaming, or `{ message: AssistantMessage }` JSON when `stream: false`.
 - Added Vertex AI authentication via Google Application Default Credentials from `GOOGLE_APPLICATION_CREDENTIALS`, `~/.config/gcloud/application_default_credentials.json`, or metadata server tokens, with token caching and refresh skew control via `GOOGLE_VERTEX_REFRESH_SKEW_MS`
 - Added support for Anthropic image message parts with `type: "url"` and `type: "file"` sources
@@ -382,7 +459,7 @@
 - Added `AuthStorageOptions.refreshOAuthCredential` override so a remote-store client can route every OAuth refresh through the broker instead of the local OAuth endpoint.
 - Added `REMOTE_REFRESH_SENTINEL` (`"__remote__"`) — the wire placeholder substituted for OAuth refresh tokens in broker snapshots; clients never see the real refresh token.
 - Exposed the OAuth provider catalog (`getOAuthProviders`, `OAuthProvider`, `OAuthProviderInfo`) and `refreshOAuthToken` through the package barrel so the coding-agent CLI can target them without reaching into `utils/oauth`.
-- Added the auth-gateway subsystem (`@gajae-code/ai/auth-gateway`) — a forward-proxy that sits between unauthenticated clients (the macOS usage widget, llm-git, robogjc containers, …) and the broker. Clients send standard provider-format requests; the gateway parses them into gjc's canonical `Context`, dispatches through pi-ai's `streamSimple()`, and translates the canonical event stream back to the matching wire format. `Authorization` is injected server-side so access tokens never leave the gateway host. Wire surface:
+- Added the auth-gateway subsystem (`@gajae-code/ai/auth-gateway`) — a forward-proxy that sits between unauthenticated clients (the macOS usage widget, llm-git, containerized GJC deployments, …) and the broker. Clients send standard provider-format requests; the gateway parses them into gjc's canonical `Context`, dispatches through pi-ai's `streamSimple()`, and translates the canonical event stream back to the matching wire format. `Authorization` is injected server-side so access tokens never leave the gateway host. Wire surface:
 - `GET  /healthz` — unauth liveness.
 - `GET  /v1/usage` — aggregated provider usage; 5-min per-credential cache via `AuthStorage.fetchUsageReports`.
 - `GET  /v1/models` — model catalog (scoped to providers with credentials).

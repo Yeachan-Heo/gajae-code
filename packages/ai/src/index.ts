@@ -4,6 +4,7 @@ export * from "./auth-broker";
 export { type AuthGatewayBootOptions, type ModelResolver, startAuthGateway } from "./auth-gateway/server";
 export * from "./auth-gateway/types";
 export * from "./auth-storage";
+export * from "./context-cap-policy";
 export * from "./model-cache";
 export * from "./model-manager";
 export * from "./model-thinking";
@@ -41,6 +42,7 @@ export * from "./usage/zai";
 export * from "./utils/anthropic-auth";
 export * from "./utils/discovery";
 export * from "./utils/event-stream";
+export * from "./utils/fallback-transport";
 export * from "./utils/h2-fetch";
 export * from "./utils/oauth";
 export type {

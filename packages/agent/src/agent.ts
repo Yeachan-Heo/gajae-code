@@ -20,9 +20,11 @@ import {
 	type ToolChoice,
 	type ToolResultMessage,
 } from "@gajae-code/ai";
+import { extractHttpStatusFromError } from "@gajae-code/utils";
 import { agentLoop, agentLoopContinue } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { HarmonyAuditEvent } from "./harmony-leak";
+import { assertImagePlaceholdersHavePayload } from "./image-placeholder-guard";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -31,9 +33,42 @@ import type {
 	AgentState,
 	AgentTool,
 	AgentToolContext,
+	ManagedAttemptContinuation,
+	ManagedAttemptContinuationOwnership,
+	ManagedAttemptDecision,
+	ManagedAttemptOutcome,
+	ManagedLogicalRunId,
+	RunTerminalRequest,
 	StreamFn,
 	ToolCallContext,
 } from "./types";
+
+function assertUserImagePlaceholdersHavePayload(messages: readonly AgentMessage[]): void {
+	for (const message of messages) {
+		if (!("role" in message) || message.role !== "user") continue;
+		const content = message.content;
+		if (typeof content === "string") {
+			assertImagePlaceholdersHavePayload(content, undefined);
+			continue;
+		}
+		if (!Array.isArray(content)) continue;
+		const text = content
+			.filter(part => part.type === "text")
+			.map(part => part.text)
+			.join("\n");
+		assertImagePlaceholdersHavePayload(text, content);
+	}
+}
+
+/**
+ * Whether persisted history ends at a point where a new model turn can resume.
+ * Assistant-ended histories require an in-memory queued message and are handled
+ * separately by `Agent.continue()`.
+ */
+export function canContinuePersistedHistory(messages: readonly AgentMessage[]): boolean {
+	const lastMessage = messages.at(-1);
+	return lastMessage !== undefined && lastMessage.role !== "assistant";
+}
 
 /**
  * Default convertToLlm: Keep only LLM-compatible messages, convert attachments.
@@ -58,6 +93,13 @@ function refreshToolChoiceForActiveTools(
 				: toolChoice.name;
 
 	return tools.some(tool => tool.name === toolName) ? toolChoice : undefined;
+}
+
+export class ManagedCursorInvariantError extends Error {
+	constructor(message: string = "Managed Cursor attempt received a provider-side tool result") {
+		super(message);
+		this.name = "ManagedCursorInvariantError";
+	}
 }
 
 export class AgentBusyError extends Error {
@@ -248,6 +290,16 @@ export interface AgentOptions {
 
 export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
+	/** Disable transport replay; fallback accounting is owned by the caller. */
+	fallbackManaged?: boolean;
+	/** Called synchronously after this invocation claims the agent run, before asynchronous provider work. */
+	onRunAccepted?: () => void;
+	/** Called once immediately before every managed upstream request. */
+	nextFallbackAttempt?: AgentLoopConfig["nextFallbackAttempt"];
+	/** Called after a managed upstream request is accepted and committed. */
+	onManagedAttemptAccepted?: AgentLoopConfig["onManagedAttemptAccepted"];
+	/** Receives a discarded managed attempt without exposing assistant lifecycle events. */
+	onManagedAttemptOutcome?: AgentLoopConfig["onManagedAttemptOutcome"];
 }
 
 /** Buffered Cursor tool result with text position at time of call */
@@ -255,6 +307,11 @@ interface CursorToolResultEntry {
 	toolResult: ToolResultMessage;
 	textLengthAtCall: number;
 }
+
+export type AgentQueueSnapshot = {
+	steering: AgentMessage[];
+	followUp: AgentMessage[];
+};
 
 export class Agent {
 	#state: AgentState = {
@@ -268,6 +325,7 @@ export class Agent {
 		pendingToolCalls: new Set<string>(),
 		error: undefined,
 	};
+	#contextRevision = 0;
 
 	#listeners = new Set<(e: AgentEvent) => void>();
 	#abortController?: AbortController;
@@ -275,6 +333,7 @@ export class Agent {
 	#transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	#steeringQueue: AgentMessage[] = [];
 	#followUpQueue: AgentMessage[] = [];
+	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
 	#interruptMode: "immediate" | "wait";
@@ -302,6 +361,8 @@ export class Agent {
 	#resolveRunningPrompt?: () => void;
 	#runSequence = 0;
 	#activeRunId?: number;
+	#continuationGeneration = 0;
+	#activeFallbackManaged = false;
 	#kimiApiFormat?: "openai" | "anthropic";
 	#preferWebsockets?: boolean;
 	#transformToolCallArguments?: (args: Record<string, unknown>, toolName: string) => Record<string, unknown>;
@@ -315,6 +376,7 @@ export class Agent {
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
 	#shouldPause?: AgentLoopConfig["shouldPause"];
+	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 
@@ -324,6 +386,8 @@ export class Agent {
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
+	#terminalizedLogicalRunIds = new Set<ManagedLogicalRunId>();
+	#managedLogicalRunOwner?: ManagedLogicalRunId;
 
 	streamFn: StreamFn;
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
@@ -611,6 +675,10 @@ export class Agent {
 		return this.#state;
 	}
 
+	get contextRevision(): number {
+		return this.#contextRevision;
+	}
+
 	get appendOnlyContext(): AppendOnlyContextManager | undefined {
 		return this.#appendOnlyContext;
 	}
@@ -644,6 +712,10 @@ export class Agent {
 
 	setShouldPause(fn: AgentLoopConfig["shouldPause"] | undefined): void {
 		this.#shouldPause = fn;
+	}
+
+	setMaintainContext(fn: AgentLoopConfig["maintainContext"] | undefined): void {
+		this.#maintainContext = fn;
 	}
 
 	emitExternalEvent(event: AgentEvent) {
@@ -793,10 +865,12 @@ export class Agent {
 	// State mutators
 	setSystemPrompt(v: string[]) {
 		this.#state.systemPrompt = v;
+		this.#contextRevision++;
 	}
 
-	setModel(m: Model) {
+	setModel(m: Model | undefined) {
 		this.#state.model = m;
+		this.#contextRevision++;
 	}
 
 	setThinkingLevel(l: Effort | undefined) {
@@ -829,10 +903,12 @@ export class Agent {
 
 	setTools(t: AgentTool<any>[]) {
 		this.#state.tools = t;
+		this.#contextRevision++;
 	}
 
 	replaceMessages(ms: AgentMessage[]) {
 		this.#state.messages = ms.slice();
+		this.#contextRevision++;
 	}
 
 	appendMessage(m: AgentMessage) {
@@ -840,12 +916,14 @@ export class Agent {
 		// N is O(N+M), not O(M*N). Consumers read state.messages fresh; run() snapshots
 		// via slice() at the API boundary, so no caller relies on per-append array identity.
 		this.#state.messages.push(m);
+		this.#contextRevision++;
 	}
 
 	popMessage(): AgentMessage | undefined {
 		const messages = this.#state.messages.slice(0, -1);
 		const removed = this.#state.messages.at(-1);
 		this.#state.messages = messages;
+		this.#contextRevision++;
 
 		if (removed && this.#state.streamMessage === removed) {
 			this.#state.streamMessage = null;
@@ -855,18 +933,35 @@ export class Agent {
 	}
 
 	/**
+	 * For callers that mutate committed messages or the system prompt in place
+	 * outside Agent-owned mutators.
+	 */
+	touchContext(): void {
+		this.#contextRevision++;
+	}
+
+	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 * Delivered after current tool execution, skips remaining tools.
 	 */
 	steer(m: AgentMessage) {
+		assertUserImagePlaceholdersHavePayload([m]);
 		this.#steeringQueue.push(m);
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 * Delivered only when agent has no more tool calls or steering messages.
+	 *
+	 * `forceOneAtATime` lets UI composer queues preserve prompt-by-prompt
+	 * delivery even when the session-wide follow-up mode is set to `all` for
+	 * other integration paths.
 	 */
-	followUp(m: AgentMessage) {
+	followUp(m: AgentMessage, options?: { forceOneAtATime?: boolean }) {
+		assertUserImagePlaceholdersHavePayload([m]);
+		if (options?.forceOneAtATime) {
+			this.#followUpForceOneAtATime.add(m);
+		}
 		this.#followUpQueue.push(m);
 	}
 
@@ -919,6 +1014,20 @@ export class Agent {
 		this.#followUpQueue = [...messages, ...this.#followUpQueue];
 	}
 
+	/** Snapshot both executable queues as one atomic session-level view. */
+	snapshotQueues(): AgentQueueSnapshot {
+		return {
+			steering: this.#steeringQueue.slice(),
+			followUp: this.#followUpQueue.slice(),
+		};
+	}
+
+	/** Replace both executable queues with a prior snapshot. */
+	restoreQueues(snapshot: AgentQueueSnapshot): void {
+		this.#steeringQueue = snapshot.steering.slice();
+		this.#followUpQueue = snapshot.followUp.slice();
+	}
+
 	#dequeueSteeringMessages(): AgentMessage[] {
 		if (this.#steeringMode === "one-at-a-time") {
 			if (this.#steeringQueue.length > 0) {
@@ -942,8 +1051,18 @@ export class Agent {
 			}
 			return [];
 		}
-		const followUp = this.#followUpQueue.slice();
-		this.#followUpQueue = [];
+
+		const first = this.#followUpQueue[0];
+		if (!first) return [];
+		if (this.#followUpForceOneAtATime.has(first)) {
+			this.#followUpQueue = this.#followUpQueue.slice(1);
+			return [first];
+		}
+
+		const forcedIndex = this.#followUpQueue.findIndex(message => this.#followUpForceOneAtATime.has(message));
+		const takeCount = forcedIndex === -1 ? this.#followUpQueue.length : forcedIndex;
+		const followUp = this.#followUpQueue.slice(0, takeCount);
+		this.#followUpQueue = this.#followUpQueue.slice(takeCount);
 		return followUp;
 	}
 
@@ -1008,6 +1127,7 @@ export class Agent {
 
 	clearMessages() {
 		this.#state.messages = [];
+		this.#contextRevision++;
 	}
 
 	abort() {
@@ -1020,23 +1140,30 @@ export class Agent {
 	 * #runLoop guards every state mutation with a run id.
 	 */
 	forceAbort(reason = "Force aborted"): boolean {
-		const hadActiveRun = this.#runningPrompt !== undefined || this.#state.isStreaming;
+		const runId = this.#activeRunId;
+		const managedLogicalRunId = this.#managedLogicalRunOwner;
+		const hadActiveRun = runId !== undefined && (this.#runningPrompt !== undefined || this.#state.isStreaming);
 		if (!hadActiveRun) return false;
 
 		this.#abortController?.abort(reason);
-		this.#activeRunId = undefined;
+		this.#continuationGeneration++;
 		this.#state.isStreaming = false;
 		this.#state.streamMessage = null;
 		this.#state.pendingToolCalls = new Set<string>();
 		this.#abortController = undefined;
 		this.#cursorToolResultBuffer = [];
+		this.#managedLogicalRunOwner = undefined;
 
 		const resolve = this.#resolveRunningPrompt;
 		this.#runningPrompt = undefined;
 		this.#resolveRunningPrompt = undefined;
+		this.#activeRunId = undefined;
 		resolve?.();
-
-		this.#emit({ type: "agent_end", messages: [] });
+		if (this.#activeFallbackManaged) {
+			this.requestRunTerminal(managedLogicalRunId ?? runId, { stopReason: "cancelled" });
+		} else {
+			this.#finalizeRun(runId, { type: "agent_end", messages: [] });
+		}
 		return true;
 	}
 
@@ -1044,11 +1171,56 @@ export class Agent {
 		return this.#runningPrompt ?? Promise.resolve();
 	}
 
+	/** The active per-attempt run identifier. */
+	get activeRunId(): number | undefined {
+		return this.#activeRunId;
+	}
+
+	/**
+	 * Stable identifier for the active managed logical run, shared by every retry
+	 * attempt. Pass this value to requestRunTerminal(); never retain activeRunId
+	 * for managed terminal completion.
+	 */
+	get currentManagedLogicalRunId(): ManagedLogicalRunId | undefined {
+		return this.#managedLogicalRunOwner;
+	}
+
+	/**
+	 * Request terminal completion through the single logical-run keyed finalizer.
+	 *
+	 * For managed runs, logicalRunId must be currentManagedLogicalRunId from any
+	 * attempt in the retry chain. Non-managed runs use their activeRunId. Terminal
+	 * requests with messages emit a committed message_start/message_end lifecycle
+	 * for each diagnostic before agent_end. Requests without messages (such as
+	 * cancellation) emit only agent_end.
+	 */
+	requestRunTerminal(logicalRunId: ManagedLogicalRunId, request: RunTerminalRequest): boolean {
+		if (this.#terminalizedLogicalRunIds.has(logicalRunId)) return false;
+		this.#finalizeRun(
+			logicalRunId,
+			{
+				type: "agent_end",
+				messages: request.messages ?? [],
+				...(request.stopReason === "cancelled" ? { stopReason: "cancelled" as const } : {}),
+			},
+			() => {
+				for (const message of request.messages ?? []) {
+					this.#emit({ type: "message_start", message });
+					this.appendMessage(message);
+					this.#emit({ type: "message_end", message });
+				}
+			},
+		);
+		return true;
+	}
+
 	reset() {
 		this.#state.messages = [];
+		this.#contextRevision++;
 		this.#state.isStreaming = false;
 		this.#state.streamMessage = null;
 		this.#state.pendingToolCalls = new Set<string>();
+		this.#managedLogicalRunOwner = undefined;
 		this.#state.error = undefined;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
@@ -1100,13 +1272,19 @@ export class Agent {
 			promptOptions = imagesOrOptions as AgentPromptOptions | undefined;
 		}
 
+		assertUserImagePlaceholdersHavePayload(msgs);
+		if (this.#managedLogicalRunOwner !== undefined) {
+			this.requestRunTerminal(this.#managedLogicalRunOwner, { stopReason: "cancelled" });
+			this.#managedLogicalRunOwner = undefined;
+		}
+
 		await this.#runLoop(msgs, promptOptions);
 	}
 
 	/**
 	 * Continue from current context (used for retries and resuming queued messages).
 	 */
-	async continue() {
+	async continue(options?: AgentPromptOptions) {
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1118,20 +1296,24 @@ export class Agent {
 		if (messages[messages.length - 1].role === "assistant") {
 			const queuedSteering = this.#dequeueSteeringMessages();
 			if (queuedSteering.length > 0) {
-				await this.#runLoop(queuedSteering, { skipInitialSteeringPoll: true });
+				await this.#runLoop(queuedSteering, { ...options, skipInitialSteeringPoll: true });
 				return;
 			}
 
 			const queuedFollowUp = this.#dequeueFollowUpMessages();
 			if (queuedFollowUp.length > 0) {
-				await this.#runLoop(queuedFollowUp);
+				await this.#runLoop(queuedFollowUp, options);
 				return;
 			}
 
 			throw new Error("Cannot continue from message role: assistant");
 		}
 
-		await this.#runLoop(undefined);
+		if (!canContinuePersistedHistory(messages)) {
+			throw new Error("No messages to continue from");
+		}
+
+		await this.#runLoop(undefined, options);
 	}
 
 	/**
@@ -1150,18 +1332,41 @@ export class Agent {
 		this.#resolveRunningPrompt = resolve;
 
 		const runId = ++this.#runSequence;
+		const continuationGeneration = ++this.#continuationGeneration;
 		this.#activeRunId = runId;
 		const abortController = new AbortController();
 		this.#abortController = abortController;
 		this.#state.isStreaming = true;
 		this.#state.streamMessage = null;
 		this.#state.error = undefined;
+		options?.onRunAccepted?.();
 
-		// Clear Cursor tool result buffer at start of each run
+		const fallbackManaged = options?.fallbackManaged === true;
+		const managedLogicalRunOwner = fallbackManaged ? (this.#managedLogicalRunOwner ?? runId) : undefined;
+		const startsManagedLogicalRun = fallbackManaged && this.#managedLogicalRunOwner === undefined;
+		if (startsManagedLogicalRun) {
+			this.#managedLogicalRunOwner = managedLogicalRunOwner;
+			this.#emit({ type: "agent_start" });
+		}
+		if (fallbackManaged && this.#cursorToolResultBuffer.length > 0) {
+			const error = new ManagedCursorInvariantError(
+				"Managed Cursor attempt started with buffered provider-side tool results",
+			);
+			this.#state.isStreaming = false;
+			this.#abortController = undefined;
+			this.#activeRunId = undefined;
+			this.#runningPrompt = undefined;
+			this.#resolveRunningPrompt = undefined;
+			resolve();
+			this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: "error" });
+			this.#managedLogicalRunOwner = undefined;
+			throw error;
+		}
+		// Each run gets a fresh buffer only after managed stale-state validation.
 		this.#cursorToolResultBuffer = [];
+		this.#activeFallbackManaged = fallbackManaged;
 
 		const reasoning = this.#state.thinkingLevel;
-
 		const context: AgentContext = {
 			systemPrompt: this.#state.systemPrompt,
 			messages: this.#state.messages.slice(),
@@ -1169,7 +1374,7 @@ export class Agent {
 		};
 
 		const cursorOnToolResult =
-			this.#cursorExecHandlers || this.#cursorOnToolResult
+			!fallbackManaged && (this.#cursorExecHandlers || this.#cursorOnToolResult)
 				? async (message: ToolResultMessage) => {
 						let finalMessage = message;
 						if (this.#activeRunId !== runId) {
@@ -1186,7 +1391,6 @@ export class Agent {
 								}
 							} catch {}
 						}
-						// Buffer tool result with current text length for correct ordering later.
 						// Cursor executes tools server-side during streaming, so the assistant message
 						// already incorporates results. We buffer here and emit in correct order
 						// when the assistant message ends.
@@ -1198,7 +1402,10 @@ export class Agent {
 
 		const getToolChoice = () =>
 			this.#getToolChoice?.() ?? refreshToolChoiceForActiveTools(options?.toolChoice, this.#state.tools);
-		const cursorExecHandlers = this.#cursorExecHandlersForRun(runId);
+		const cursorExecHandlers = fallbackManaged ? undefined : this.#cursorExecHandlersForRun(runId);
+		let managedDecision: ManagedAttemptDecision | undefined;
+		let managedOutcome: ManagedAttemptOutcome | undefined;
+		let maintenanceInterrupted = false;
 
 		const config: AgentLoopConfig = {
 			model,
@@ -1221,6 +1428,21 @@ export class Agent {
 			maxRetryDelayMs: this.#maxRetryDelayMs,
 			requestMaxRetries: this.#requestMaxRetries,
 			streamMaxRetries: this.#streamMaxRetries,
+			...(fallbackManaged
+				? {
+						fallbackManaged: true,
+						nextFallbackAttempt: options?.nextFallbackAttempt,
+						onManagedAttemptAccepted: options?.onManagedAttemptAccepted,
+						onManagedAttemptOutcome: async outcome => {
+							managedOutcome = outcome;
+							managedDecision = (await options?.onManagedAttemptOutcome?.(outcome)) ?? {
+								type: "terminal",
+								terminal: { stopReason: outcome.type === "run_terminal" ? outcome.reason : "error" },
+							};
+							return managedDecision;
+						},
+					}
+				: {}),
 			kimiApiFormat: this.#kimiApiFormat,
 			preferWebsockets: this.#preferWebsockets,
 			convertToLlm: this.#convertToLlm,
@@ -1239,8 +1461,8 @@ export class Agent {
 				context.systemPrompt = this.#state.systemPrompt;
 				context.tools = this.#state.tools;
 			},
-			cursorExecHandlers,
-			cursorOnToolResult,
+			...(cursorExecHandlers ? { cursorExecHandlers } : {}),
+			...(cursorOnToolResult ? { cursorOnToolResult } : {}),
 			transformToolCallArguments: this.#transformToolCallArguments,
 			intentTracing: this.#intentTracing,
 			appendOnlyContext: this.#appendOnlyContext,
@@ -1309,6 +1531,12 @@ export class Agent {
 				if (this.#activeRunId !== runId) return false;
 				return this.#shouldPause?.() === true;
 			},
+			maintainContext: this.#maintainContext
+				? async (context, lifecycle) => {
+						if (this.#activeRunId !== runId) return "not-needed";
+						return (await this.#maintainContext?.(context, lifecycle)) ?? "not-needed";
+					}
+				: undefined,
 			telemetry: this.#telemetry,
 		};
 
@@ -1316,8 +1544,8 @@ export class Agent {
 
 		try {
 			const stream = messages
-				? agentLoop(messages, context, config, abortController.signal, this.streamFn)
-				: agentLoopContinue(context, config, abortController.signal, this.streamFn);
+				? agentLoop(messages, context, config, abortController.signal, this.streamFn, !fallbackManaged)
+				: agentLoopContinue(context, config, abortController.signal, this.streamFn, !fallbackManaged);
 
 			for await (const event of stream) {
 				if (this.#activeRunId !== runId) {
@@ -1337,6 +1565,9 @@ export class Agent {
 						break;
 
 					case "message_end":
+						if (fallbackManaged && this.#cursorToolResultBuffer.length > 0) {
+							throw new ManagedCursorInvariantError();
+						}
 						partial = null;
 						// Check if this is an assistant message with buffered Cursor tool results.
 						// If so, split the message to emit tool results at the correct position.
@@ -1369,9 +1600,18 @@ export class Agent {
 						break;
 
 					case "agent_end":
+						if (fallbackManaged && managedOutcome) {
+							continue;
+						}
 						this.#state.isStreaming = false;
 						this.#state.streamMessage = null;
-						break;
+						if (event.stopReason === "maintenance") {
+							maintenanceInterrupted = true;
+							this.#emit(event);
+							continue;
+						}
+						this.#finalizeRun(managedLogicalRunOwner ?? runId, event);
+						continue;
 				}
 
 				// Emit to listeners
@@ -1380,6 +1620,15 @@ export class Agent {
 
 			if (this.#activeRunId !== runId) {
 				return;
+			}
+			if (managedOutcome) {
+				if (managedDecision?.type === "terminal") {
+					this.requestRunTerminal(managedLogicalRunOwner ?? runId, managedDecision.terminal);
+				} else if (managedOutcome.type === "run_terminal") {
+					this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: managedOutcome.reason });
+				} else if (managedDecision?.type !== "retry") {
+					this.#finalizeRun(managedLogicalRunOwner ?? runId);
+				}
 			}
 
 			// Handle any remaining partial message
@@ -1419,22 +1668,58 @@ export class Agent {
 				},
 				stopReason: abortController.signal.aborted ? "aborted" : "error",
 				errorMessage: err?.message || String(err),
+				errorStatus: extractHttpStatusFromError({ status: err?.errorStatus }) ?? extractHttpStatusFromError(err),
 				timestamp: Date.now(),
 			} as AgentMessage;
 
-			this.appendMessage(errorMsg);
 			this.#state.error = err?.message || String(err);
-			this.#emit({ type: "agent_end", messages: [errorMsg] });
+			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
+				stopReason: abortController.signal.aborted ? "cancelled" : "error",
+				messages: [errorMsg],
+			});
 		} finally {
+			let continuation: ManagedAttemptContinuation | undefined;
+			if (managedOutcome?.type === "retryable_discarded" && managedDecision?.type === "retry") {
+				continuation = managedDecision.continuation;
+			}
+			const ownership: ManagedAttemptContinuationOwnership = {
+				runId,
+				logicalRunId: managedLogicalRunOwner ?? runId,
+				generation: continuationGeneration,
+				isCurrent: () => this.#continuationGeneration === continuationGeneration && this.#activeRunId === undefined,
+			};
 			if (this.#activeRunId === runId) {
 				this.#state.isStreaming = false;
 				this.#state.streamMessage = null;
 				this.#state.pendingToolCalls = new Set<string>();
 				this.#abortController = undefined;
 				this.#activeRunId = undefined;
+				this.#activeFallbackManaged = false;
 				this.#resolveRunningPrompt?.();
 				this.#runningPrompt = undefined;
 				this.#resolveRunningPrompt = undefined;
+			}
+			if (
+				fallbackManaged &&
+				!continuation &&
+				!maintenanceInterrupted &&
+				this.#managedLogicalRunOwner === managedLogicalRunOwner
+			) {
+				this.#managedLogicalRunOwner = undefined;
+			}
+			if (continuation && ownership.isCurrent()) {
+				try {
+					await continuation(ownership);
+					if (this.#activeRunId === undefined && this.#managedLogicalRunOwner === managedLogicalRunOwner) {
+						this.#managedLogicalRunOwner = undefined;
+					}
+				} catch (err) {
+					if (ownership.isCurrent()) {
+						this.#state.error = err instanceof Error ? err.message : String(err);
+						this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: "error" });
+						if (this.#managedLogicalRunOwner === managedLogicalRunOwner) this.#managedLogicalRunOwner = undefined;
+					}
+				}
 			}
 		}
 	}
@@ -1446,6 +1731,20 @@ export class Agent {
 	}
 
 	/** Calculate total text length from an assistant message's content blocks */
+	#finalizeRun(
+		logicalRunId: ManagedLogicalRunId,
+		event?: Extract<AgentEvent, { type: "agent_end" }>,
+		beforeEvent?: () => void,
+	): void {
+		if (this.#terminalizedLogicalRunIds.has(logicalRunId)) return;
+		this.#terminalizedLogicalRunIds.add(logicalRunId);
+		if (this.#terminalizedLogicalRunIds.size > 256) {
+			this.#terminalizedLogicalRunIds.delete(this.#terminalizedLogicalRunIds.values().next().value!);
+		}
+		beforeEvent?.();
+		if (event) this.#emit(event);
+	}
+
 	#getAssistantTextLength(message: AgentMessage | null): number {
 		if (message?.role !== "assistant" || !Array.isArray(message.content)) {
 			return 0;

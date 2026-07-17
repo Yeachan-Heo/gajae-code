@@ -21,19 +21,21 @@ import type {
 	ClientBridgePermissionToolCall,
 	ClientBridgeTerminalHandle,
 } from "../../session/client-bridge";
+import { resolveAcpPermissionMode } from "./permission-mode";
+
+export { type AcpPermissionMode, resolveAcpPermissionMode } from "./permission-mode";
 
 export function createAcpClientBridge(
 	connection: AgentSideConnection,
 	sessionId: string,
 	clientCapabilities: ClientCapabilities | undefined,
 ): ClientBridge {
+	const promptPermission = resolveAcpPermissionMode(clientCapabilities) === "prompt";
 	const capabilities: ClientBridgeCapabilities = {
 		readTextFile: clientCapabilities?.fs?.readTextFile === true,
 		writeTextFile: clientCapabilities?.fs?.writeTextFile === true,
 		terminal: clientCapabilities?.terminal === true,
-		// Permission requests are always usable on the connection; gating is
-		// the agent's policy choice rather than a client capability.
-		requestPermission: true,
+		requestPermission: promptPermission,
 	};
 
 	const bridge: ClientBridge = { capabilities, deferAgentInitiatedTurns: true };
@@ -65,8 +67,10 @@ export function createAcpClientBridge(
 			createTerminalHandle(connection, sessionId, params);
 	}
 
-	bridge.requestPermission = (toolCall, options, signal) =>
-		requestPermission(connection, sessionId, toolCall, options, signal);
+	if (promptPermission) {
+		bridge.requestPermission = (toolCall, options, signal) =>
+			requestPermission(connection, sessionId, toolCall, options, signal);
+	}
 
 	return bridge;
 }

@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "checks": [
+    {
+      "id": "broker-token-agent-global-blast-radius",
+      "description": "The broker token is intentionally agent-global: it authorizes only the loopback broker, while session endpoints retain their own credentials.",
+      "kind": "assertion"
+    },
+    {
+      "id": "broker-discovery-file-permissions",
+      "description": "Broker discovery is written as mode 0600 in a mode 0700 SDK directory.",
+      "kind": "assertion"
+    },
+    {
+      "id": "broker-identity-file-permissions",
+      "description": "The broker identity key is written as mode 0600 in a mode 0700 SDK directory.",
+      "kind": "assertion"
+    },
+    {
+      "id": "broker-loopback-only",
+      "description": "The broker binds and advertises only 127.0.0.1.",
+      "kind": "assertion"
+    },
+    {
+      "id": "broker-token-rotation-on-stale-takeover",
+      "description": "A replacement broker receives a newly generated discovery token after its predecessor releases a stale lock.",
+      "kind": "assertion"
+    },
+    {
+      "id": "broker-per-session-token-separation",
+      "description": "Per-session endpoint tokens remain separate from the agent-global broker token and are not accepted as broker credentials.",
+      "kind": "assertion"
+    },
+    {
+      "id": "broker-status-token-redaction",
+      "description": "Status output uses the redacted discovery representation and never emits the broker token.",
+      "kind": "negative-test"
+    },
+    {
+      "id": "broker-non-loopback-negative-test",
+      "description": "No non-loopback broker URL is advertised, and a wrong-token WebSocket upgrade is rejected.",
+      "kind": "negative-test"
+    }
+  ]
+}

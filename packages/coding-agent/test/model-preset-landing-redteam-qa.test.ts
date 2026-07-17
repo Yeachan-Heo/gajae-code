@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { Effort, type Model } from "@gajae-code/ai";
-import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
+import { BUILTIN_MODEL_PROFILES, type ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	ModelSelectorComponent,
@@ -32,6 +32,25 @@ const anthropicModel = model("anthropic", "claude-opus-4-8");
 const minimaxModel = model("minimax-code", "minimax-v3");
 const noSuffixModel = model("provider-a", "default");
 
+const builtinCodexModels = [
+	model("openai-codex", "gpt-5.6-terra", Effort.Low),
+	model("openai-codex", "gpt-5.6-luna", Effort.Low),
+	model("openai-codex", "gpt-5.6-sol", Effort.Low),
+];
+const builtinComboModels = [
+	model("anthropic", "claude-opus-4-8", Effort.Low),
+	model("anthropic", "claude-fable-5", Effort.Low),
+	model("anthropic", "claude-sonnet-5"),
+	model("opencode-go", "deepseek-v4-pro"),
+	model("opencode-go", "kimi-k2.6"),
+	model("opencode-go", "mimo-v2.5-pro"),
+];
+
+function builtinProfile(name: string): ModelProfileDefinition {
+	const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === name);
+	if (!profile) throw new Error(`Missing built-in profile: ${name}`);
+	return profile;
+}
 const codexEco: ModelProfileDefinition = {
 	name: "codex-eco",
 	requiredProviders: ["openai-codex"],
@@ -93,8 +112,22 @@ function createRegistry(
 	return {
 		refresh: vi.fn(async () => {}),
 		getError: () => undefined,
-		getAvailable: () => [codexModel, anthropicModel, minimaxModel, noSuffixModel],
-		getAll: () => [codexModel, anthropicModel, minimaxModel, noSuffixModel],
+		getAvailable: () => [
+			codexModel,
+			anthropicModel,
+			minimaxModel,
+			noSuffixModel,
+			...builtinCodexModels,
+			...builtinComboModels,
+		],
+		getAll: () => [
+			codexModel,
+			anthropicModel,
+			minimaxModel,
+			noSuffixModel,
+			...builtinCodexModels,
+			...builtinComboModels,
+		],
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,
@@ -288,6 +321,36 @@ describe("preset landing adversarial QA", () => {
 		text = normalizeRenderedText(suffixless.render(260).join("\n"));
 		expect(text).toContain("DEFAULT: provider-a/default");
 		expect(text).not.toContain("DEFAULT: provider-a/default:");
+	});
+
+	test("built-in Codex Eco preview preserves the Terra and Luna role models", async () => {
+		const selector = createSelector({ profiles: [builtinProfile("codex-eco")] });
+		await rendered(selector);
+		selector.refreshPresetProfiles("codex-eco");
+
+		const text = await rendered(selector);
+		expect(text).toContain("DEFAULT: openai-codex/gpt-5.6-terra");
+		expect(text).toContain("EXECUTOR: openai-codex/gpt-5.6-luna");
+		expect(text).toContain("PLANNER: openai-codex/gpt-5.6-luna");
+		expect(text).toContain("CRITIC: openai-codex/gpt-5.6-terra");
+		expect(text).toContain("ARCHITECT: openai-codex/gpt-5.6-terra");
+		expect(text).not.toContain("gpt-5.6-sol");
+	});
+
+	test("built-in Codex + OpenCodeGo preview preserves provider role models", async () => {
+		const selector = createSelector({
+			authenticatedProviders: ["openai-codex", "opencode-go"],
+			profiles: [builtinProfile("codex-opencodego")],
+		});
+		await rendered(selector);
+		selector.refreshPresetProfiles("codex-opencodego");
+
+		const text = await rendered(selector);
+		expect(text).toContain("DEFAULT: openai-codex/gpt-5.6-sol");
+		expect(text).toContain("EXECUTOR: opencode-go/deepseek-v4-pro");
+		expect(text).toContain("PLANNER: opencode-go/kimi-k2.6");
+		expect(text).toContain("CRITIC: opencode-go/mimo-v2.5-pro");
+		expect(text).toContain("ARCHITECT: openai-codex/gpt-5.6-sol");
 	});
 
 	test("#688 Down crossing a group boundary lands on the destination group header", async () => {

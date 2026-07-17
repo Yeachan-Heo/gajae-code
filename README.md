@@ -32,9 +32,23 @@
   <img src="assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
 </p>
 
-**Mobile answers for coding agents** — Gajae-Code now ships a configure-once notifications SDK and managed Telegram reference daemon. Each session exposes a loopback WebSocket discovery file and a generic `action_needed`/`reply` protocol so Telegram, Discord, Slack, mobile apps, or local tools can surface pending asks and route answers back without terminal scraping.
+**Mobile answers for coding agents** — Gajae-Code ships a configure-once
+[Gajae-Code SDK](docs/sdk.md) and managed Telegram reference daemon. In a running
+GJC session, open `/settings` → **Notifications** to configure or reconfigure
+Telegram, manage health/test/recovery/reconnect, toggle global or current-session
+delivery, and remove Telegram without disturbing Discord or Slack. Telegram tokens
+are masked on entry and never displayed afterward.
 
-The bundled Telegram flow adds a threaded per-session surface with context updates, live/finalized output, image attachments, inline buttons, free-text replies, typing indicators, and double-check acknowledgements. `gjc daemon` keeps one safe long-poll owner per bot token so new sessions attach cleanly instead of tripping Telegram 409 conflicts.
+For headless setup and automation, `gjc notify setup|status|health|test|recovery`
+remains authoritative. Each session exposes a loopback WebSocket discovery file
+and a generic `action_needed`/`reply` protocol so Telegram, Discord, Slack, mobile
+apps, or local tools can surface pending asks and route answers back without
+terminal scraping. The bundled Telegram flow adds a Threaded Mode per-session
+surface with context updates, live/finalized output, image attachments, inline
+buttons, free-text replies, typing indicators, and double-check acknowledgements.
+`gjc daemon` keeps one safe long-poll owner per bot token so new sessions attach
+cleanly instead of tripping Telegram 409 conflicts; a foreign owner is never taken
+over.
 
 ## Research and desktop-control highlights
 
@@ -52,7 +66,7 @@ The bundled Telegram flow adds a threaded per-session surface with context updat
 
 ## Website
 
-Visit **[gajae-code.com](https://gajae-code.com)** for the Gajae Code landing page, quick-start guide, architecture overview, harness notes, bridge/RPC docs, skills, receipts, remote-control design, and troubleshooting.
+Visit **[gajae-code.com](https://gajae-code.com)** for the Gajae Code landing page, quick-start guide, architecture overview, harness notes, SDK docs, skills, receipts, remote-control design, and troubleshooting.
 
 ## What is Gajae-Code?
 
@@ -233,9 +247,9 @@ gjc setup defaults --check
 | Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
 | OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
-| External controller / bot | `gjc --mode rpc` for a subprocess worker, or Bridge/HTTPS surfaces where configured | External controllers drive GJC through generic RPC/bridge contracts, not scrollback scraping. |
+| External controller / bot | SDK WebSocket for a live session; `gjc daemon session` CLI for scripts | External controllers use the SDK loopback protocol (`docs/sdk.md`) or its daemon CLI client, not scrollback scraping. Plugin-specific integrations remain opt-in and use their own configured contracts. |
 
-For standalone MCP support boundaries, see [`docs/standalone-mcp.md`](docs/standalone-mcp.md). For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For the readiness classification across RPC, ACP, and Bridge/HTTPS surfaces, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For lower-level protocol details, see [`docs/hermes-mcp-bridge.md`](docs/hermes-mcp-bridge.md), [`docs/rpc.md`](docs/rpc.md), and [`docs/bridge.md`](docs/bridge.md).
+For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For external-control readiness, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For the wire protocol and machine interfaces, see [`docs/sdk.md`](docs/sdk.md).
 
 ## Configuration
 
@@ -250,6 +264,12 @@ retry:
 ```
 
 `requestMaxRetries` applies before a stream is established. `streamMaxRetries` applies only to replay-safe transient stream failures. Invalid auth, unsupported models/providers, malformed requests, context overflow, user aborts, and permanent quota failures remain fail-fast.
+
+### Launch-time updates
+
+Interactive startup checks the npm registry for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch. For a recognized Bun global install, use `gjc update` or `bun install -g @gajae-code/coding-agent@latest`. For a recognized Windows npm install, use `gjc update` or the original npm package workflow. For a supported standalone binary installed by the bundled installer, use `gjc update` or rerun the documented platform installer. For a source checkout or `dev:link` executable, update, pull, build, and link through that checkout's original workflow. For unrecognized npm, pnpm, other package-manager installs, or unknown PATH targets, use the original package manager or install method.
+
+Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Registry or network failures are ignored so they do not block startup.
 
 ### Good to read together
 

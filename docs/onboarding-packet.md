@@ -4,7 +4,7 @@ This packet is a docs-only, public-safe context seed for the `gajae-code` reposi
 
 ## Purpose in one paragraph
 
-Gajae-Code is the `gjc` coding-agent CLI and supporting monorepo. The product centers on a small public workflow loop: clarify with `deep-interview`, plan with `ralplan`, execute and verify through `ultragoal`, and use `team` only when parallel tmux workers are useful. The main product package is `packages/coding-agent/`; supporting packages provide LLM/provider access, agent runtime, TUI rendering, native helpers, stats, utilities, benchmarks, and Python RPC/bot integrations.
+Gajae-Code is the `gjc` coding-agent CLI and supporting monorepo. The product centers on a small public workflow loop: clarify with `deep-interview`, plan with `ralplan`, execute and verify through `ultragoal`, and use `team` only when parallel tmux workers are useful. The main product package is `packages/coding-agent/`; supporting packages provide LLM/provider access, agent runtime, TUI rendering, native helpers, stats, utilities, benchmarks, and SDK machine interfaces.
 
 ## Fixed public surface
 
@@ -24,7 +24,7 @@ Do not add a fifth default skill, fifth public role agent, new command, new conf
 | ---------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | CLI bootstrap    | `packages/coding-agent/src/cli.ts`                   | Registers top-level CLI commands and routes default launch behavior.                              |
 | Session launch   | `packages/coding-agent/src/main.ts`                  | Converts CLI/runtime settings into agent-session creation and mode dispatch.                      |
-| Agent assembly   | `packages/coding-agent/src/sdk.ts`                   | Loads settings, default skills, rules, tools, auth/model state, system prompt, and agent runtime. |
+| Agent assembly   | `packages/coding-agent/src/sdk/session.ts`           | Loads settings, default skills, rules, tools, auth/model state, system prompt, and agent runtime. |
 | Built-in tools   | `packages/coding-agent/src/tools/index.ts`           | Registers file, shell, edit, search, browser, task/subagent, and related public coding-harness tools. Memory backends are private integrations, not public tools. |
 | Default skills   | `packages/coding-agent/src/defaults/gjc-defaults.ts` | Embeds and installs the four default workflow skills plus deep-interview fragments.               |
 | Role agents      | `packages/coding-agent/src/task/agents.ts`           | Embeds bundled task-agent prompts; tests enforce public role-agent expectations.                  |
@@ -41,8 +41,7 @@ Do not add a fifth default skill, fifth public role agent, new command, new conf
 - `packages/utils/` — shared TypeScript utilities, logging, formatting, process helpers, JSON/frontmatter, and sanitization.
 - `packages/stats/` — local observability dashboard and session/model usage aggregation.
 - `packages/typescript-edit-benchmark/` — TypeScript edit benchmark tooling.
-- `python/gjc-rpc/` — Python client for `gjc --mode rpc`.
-- `python/robogjc/` — GitHub triage/fix bot that drives `gjc --mode rpc`; this subtree has its own `AGENTS.md`.
+- External machine clients use the SDK WebSocket interface documented in `docs/sdk.md`; `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` were removed.
 
 ## Build, test, and validation commands
 
@@ -67,11 +66,10 @@ Repository rule: do not run `tsc` or `npx tsc`; use the Bun scripts above.
 
 - **Default surface expansion:** `packages/coding-agent/src/defaults/gjc/skills/`, `packages/coding-agent/src/defaults/gjc-defaults.ts`, `packages/coding-agent/src/prompts/agents/`, and model-assignment tests are contract-heavy. Changes here can accidentally alter the fixed four-skills/four-agents shape.
 - **CLI commands:** `packages/coding-agent/src/cli.ts` and `packages/coding-agent/src/commands/` define visible behavior. Adding commands or aliases is a product-surface change.
-- **Runtime/session assembly:** `packages/coding-agent/src/main.ts`, `packages/coding-agent/src/sdk.ts`, discovery, settings, tools, and system-prompt paths can affect every session.
+- **Runtime/session assembly:** `packages/coding-agent/src/main.ts`, `packages/coding-agent/src/sdk/session.ts`, discovery, settings, tools, and system-prompt paths can affect every session.
 - **TUI/logging:** Avoid `console.log`, `console.warn`, or `console.error` inside `packages/coding-agent/`; use the centralized logger to avoid corrupting TUI rendering.
 - **Secrets/auth/config:** Keep `docs/secrets.md`, auth broker/gateway code, settings, and environment-variable docs public-safe. Do not expose tokens or private infrastructure.
 - **Native/Rust build:** `packages/natives/` and `crates/*` can require platform-specific toolchains and CI artifact behavior.
-- **Python bot subtree:** `python/robogjc/` has its own local instructions and trust boundaries.
 - **Generated model data:** Do not edit `packages/ai/src/models.json` directly; update generators/descriptors/resolvers and regenerate with `bun --cwd=packages/ai run generate-models`.
 
 ## Unknowns worth preserving

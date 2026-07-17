@@ -53,6 +53,77 @@ export function isNotificationSuppressed(): boolean {
 	return value === "off" || value === "0" || value === "false";
 }
 
+const MULTIPLEXER_DISABLED_ENV_VALUES = new Set(["0", "false", "off", "no"]);
+
+function multiplexerEnvEnabled(value: string | undefined): boolean {
+	const normalized = value?.trim().toLowerCase();
+	return normalized !== undefined && normalized.length > 0 && !MULTIPLEXER_DISABLED_ENV_VALUES.has(normalized);
+}
+
+/**
+ * Returns whether the process runs under a terminal multiplexer (tmux, GNU
+ * screen, or zellij). Recognizes the same host markers as the renderer's
+ * multiplexer predicate in tui.ts so capability selection and viewport-repaint
+ * policy agree on what counts as a multiplexed host. Multiplexers intercept
+ * graphics escapes and OSC 8 hyperlinks instead of forwarding them to the
+ * outer terminal.
+ */
+export function isUnderTerminalMultiplexer(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	if (
+		multiplexerEnvEnabled(env.TMUX) ||
+		multiplexerEnvEnabled(env.TMUX_PANE) ||
+		multiplexerEnvEnabled(env.STY) ||
+		multiplexerEnvEnabled(env.ZELLIJ) ||
+		multiplexerEnvEnabled(env.GJC_TMUX_LAUNCHED)
+	) {
+		return true;
+	}
+	const term = env.TERM?.trim().toLowerCase() ?? "";
+	return term.startsWith("tmux") || term.startsWith("screen");
+}
+
+let terminalGraphicsFallbackDepth = 0;
+let cursorNeutralImageAllowedDepth = 0;
+
+export interface TerminalGraphicsFallbackOptions {
+	/**
+	 * Permit cursor-neutral image escapes (kitty `a=p,C=1` placements) to render
+	 * inside this fallback scope. Cursor-advancing protocols (iTerm2/SIXEL)
+	 * remain suppressed. A nested scope without this option revokes the
+	 * permission for its own subtree.
+	 */
+	allowCursorNeutralImages?: boolean;
+}
+
+/**
+ * Synchronously suppress terminal graphics while rendering a text-only surface.
+ * Nested scopes remain active until the outermost scope exits.
+ */
+export function withTerminalGraphicsFallback<T>(fn: () => T, options?: TerminalGraphicsFallbackOptions): T {
+	terminalGraphicsFallbackDepth++;
+	const allow = options?.allowCursorNeutralImages === true;
+	if (allow) cursorNeutralImageAllowedDepth++;
+	try {
+		return fn();
+	} finally {
+		if (allow) cursorNeutralImageAllowedDepth--;
+		terminalGraphicsFallbackDepth--;
+	}
+}
+
+/** Returns whether terminal graphics are currently suppressed by a render scope. */
+export function isTerminalGraphicsFallbackActive(): boolean {
+	return terminalGraphicsFallbackDepth > 0;
+}
+
+/**
+ * Returns whether cursor-neutral image escapes may render despite an active
+ * graphics-fallback scope. True only when every active fallback scope opted in.
+ */
+export function isCursorNeutralImagePermittedInFallback(): boolean {
+	return terminalGraphicsFallbackDepth > 0 && cursorNeutralImageAllowedDepth === terminalGraphicsFallbackDepth;
+}
+
 function getForcedImageProtocol(): ImageProtocol | null | undefined {
 	const raw = $env.PI_FORCE_IMAGE_PROTOCOL?.trim().toLowerCase();
 	if (!raw) return undefined;
@@ -61,6 +132,15 @@ function getForcedImageProtocol(): ImageProtocol | null | undefined {
 	if (raw === "sixel") return ImageProtocol.Sixel;
 	if (raw === "off" || raw === "none" || raw === "0" || raw === "false") return null;
 	return null;
+}
+
+/**
+ * Returns whether PI_FORCE_IMAGE_PROTOCOL explicitly configures the image
+ * protocol, including an explicit "off". An explicit configuration is
+ * authoritative: runtime capability probes must not override it.
+ */
+export function isImageProtocolForced(): boolean {
+	return getForcedImageProtocol() !== undefined;
 }
 
 function parseMajorMinorVersion(versionRaw?: string): { major: number; minor: number } | null {
@@ -95,7 +175,7 @@ function getFallbackImageProtocol(terminalId: TerminalId): ImageProtocol | null 
 	if (!process.stdout.isTTY) return null;
 	if (terminalId === "vscode" || terminalId === "alacritty") return null;
 	const term = Bun.env.TERM?.toLowerCase() ?? "";
-	if (term.includes("screen") || term.includes("tmux") || term.includes("ghostty")) {
+	if (term.includes("ghostty")) {
 		return ImageProtocol.Kitty;
 	}
 	return null;
@@ -178,10 +258,10 @@ export const TERMINAL = (() => {
 			);
 		}
 	}
+	const underMultiplexer = isUnderTerminalMultiplexer();
 	// tmux and screen multiplexers do not reliably forward OSC 8 hyperlinks
 	// to the outer terminal, so force them off regardless of detected terminal.
-	const term = Bun.env.TERM?.toLowerCase() ?? "";
-	if (resolved.hyperlinks && (Bun.env.TMUX || term.startsWith("tmux") || term.startsWith("screen"))) {
+	if (resolved.hyperlinks && underMultiplexer) {
 		resolved = new TerminalInfo(
 			resolved.id,
 			resolved.imageProtocol,
@@ -190,6 +270,17 @@ export const TERMINAL = (() => {
 			resolved.notifyProtocol,
 		);
 	}
+	// Multiplexers (tmux/screen/zellij) consume raw kitty/iTerm2 graphics
+	// escapes instead of forwarding them (no DCS passthrough wrapping is
+	// emitted), so a detected image protocol draws nothing while its
+	// out-of-band cursor writes corrupt the frame. Graphics are therefore
+	// unconditionally suppressed under a multiplexer; the runtime sixel probe
+	// never runs there (tmux advertises DA1 ";4" from compile-time support
+	// regardless of the attached client), and PI_FORCE_IMAGE_PROTOCOL=sixel
+	// is the only opt-in for chains that render sixel end-to-end.
+	if (resolved.imageProtocol && forcedImageProtocol === undefined && underMultiplexer) {
+		resolved = new TerminalInfo(resolved.id, null, resolved.trueColor, resolved.hyperlinks, resolved.notifyProtocol);
+	}
 	return resolved;
 })();
 
@@ -197,11 +288,35 @@ type MutableTerminalInfo = {
 	imageProtocol: ImageProtocol | null;
 };
 
+type ImageProtocolChangeListener = (imageProtocol: ImageProtocol | null) => void;
+const imageProtocolChangeListeners = new Set<ImageProtocolChangeListener>();
+
+/**
+ * Subscribe to runtime image-protocol changes (e.g. the asynchronous sixel
+ * capability probe enabling graphics after startup). Returns an unsubscribe
+ * function. Listeners fire only on actual changes.
+ */
+export function onImageProtocolChanged(listener: ImageProtocolChangeListener): () => void {
+	imageProtocolChangeListeners.add(listener);
+	return () => {
+		imageProtocolChangeListeners.delete(listener);
+	};
+}
+
 /**
  * Override terminal image protocol at runtime after capability probes complete.
  */
 export function setTerminalImageProtocol(imageProtocol: ImageProtocol | null): void {
-	(TERMINAL as unknown as MutableTerminalInfo).imageProtocol = imageProtocol;
+	const mutable = TERMINAL as unknown as MutableTerminalInfo;
+	if (mutable.imageProtocol === imageProtocol) return;
+	mutable.imageProtocol = imageProtocol;
+	for (const listener of imageProtocolChangeListeners) {
+		try {
+			listener(imageProtocol);
+		} catch {
+			// Listener failures must not break protocol switching.
+		}
+	}
 }
 
 export function getTerminalInfo(terminalId: TerminalId): TerminalInfo {
@@ -222,6 +337,40 @@ export interface ImageRenderOptions {
 	maxWidthCells?: number;
 	maxHeightCells?: number;
 	preserveAspectRatio?: boolean;
+	/**
+	 * Kitty-only: stable placement id (`p=`). Re-emitting the same image id +
+	 * placement id *replaces* the existing placement instead of stacking a new
+	 * copy, which makes diff-renderer repaints idempotent. Callers that render
+	 * a persistent component should allocate one id per component instance.
+	 */
+	placementId?: number;
+	/**
+	 * Kitty-only: stable image id (`i=`). Defaults to a content hash of the
+	 * base64 payload ({@link kittyImageId}). Pass a precomputed id to avoid
+	 * re-hashing large payloads on every render.
+	 */
+	imageId?: number;
+	/**
+	 * Kitty-only: sink for the out-of-band data transmission (`a=t`) emitted
+	 * the first time an image id is rendered. Defaults to the process-wide
+	 * writer configured via {@link setKittyTransmitWriter} (stdout).
+	 */
+	onTransmit?: (sequence: string) => void;
+}
+
+/**
+ * Derive a stable 32-bit non-zero kitty image id (`i=`) from image content
+ * (FNV-1a over the base64 payload). Identical content maps to the same id, so
+ * retransmission replaces the stored image instead of accumulating copies.
+ */
+export function kittyImageId(base64Data: string): number {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < base64Data.length; i++) {
+		hash ^= base64Data.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	hash >>>= 0;
+	return hash === 0 ? 1 : hash;
 }
 
 // Default cell dimensions - updated by TUI when terminal responds to query
@@ -241,6 +390,7 @@ export function encodeKitty(
 		columns?: number;
 		rows?: number;
 		imageId?: number;
+		placementId?: number;
 	} = {},
 ): string {
 	const CHUNK_SIZE = 4096;
@@ -249,7 +399,13 @@ export function encodeKitty(
 
 	if (options.columns) params.push(`c=${options.columns}`);
 	if (options.rows) params.push(`r=${options.rows}`);
-	if (options.imageId) params.push(`i=${options.imageId}`);
+	if (options.imageId) {
+		params.push(`i=${options.imageId}`);
+		// A placement id is only meaningful together with an image id. Same
+		// i= + p= replaces the previous placement (kitty graphics spec), so
+		// re-emitting this sequence never duplicates the image on screen.
+		if (options.placementId) params.push(`p=${options.placementId}`);
+	}
 
 	if (base64Data.length <= CHUNK_SIZE) {
 		return `\x1b_G${params.join(",")};${base64Data}\x1b\\`;
@@ -276,6 +432,86 @@ export function encodeKitty(
 	}
 
 	return chunks.join("");
+}
+
+/** Kitty image ids already uploaded to the terminal in this process. */
+const transmittedKittyImageIds = new Set<number>();
+
+/** Test hook: forget which kitty image ids were transmitted. */
+export function resetKittyTransmissions(): void {
+	transmittedKittyImageIds.clear();
+}
+
+let kittyTransmitWriter: (sequence: string) => void = sequence => {
+	process.stdout.write(sequence);
+};
+
+/**
+ * Override where out-of-band kitty data transmissions (`a=t`) are written.
+ * The default writes directly to stdout: a transmit-only escape is
+ * cursor-neutral (it uploads pixel data without drawing anything), so the
+ * only ordering requirement is that it reaches the terminal before the
+ * placement escape that references it — which the synchronous write during
+ * render guarantees. Tests use this to capture transmissions.
+ */
+export function setKittyTransmitWriter(writer: (sequence: string) => void): void {
+	kittyTransmitWriter = writer;
+}
+
+/**
+ * Encode a kitty transmit-only (`a=t`) escape: uploads image data under a
+ * stable id without creating a placement. Chunked at 4096 bytes per spec.
+ *
+ * This is deliberately separate from placement: re-sending data (`a=t`/`a=T`)
+ * for an existing image id deletes the image and ALL of its placements, so
+ * data must be uploaded exactly once per id and repaints must go through
+ * {@link encodeKittyPlacement} only.
+ */
+export function encodeKittyTransmit(base64Data: string, imageId: number): string {
+	const CHUNK_SIZE = 4096;
+	const params = ["a=t", "f=100", "q=2", `i=${imageId}`];
+
+	if (base64Data.length <= CHUNK_SIZE) {
+		return `\x1b_G${params.join(",")};${base64Data}\x1b\\`;
+	}
+
+	const chunks: string[] = [];
+	let offset = 0;
+	let isFirst = true;
+
+	while (offset < base64Data.length) {
+		const chunk = base64Data.slice(offset, offset + CHUNK_SIZE);
+		const isLast = offset + CHUNK_SIZE >= base64Data.length;
+
+		if (isFirst) {
+			chunks.push(`\x1b_G${params.join(",")},m=1;${chunk}\x1b\\`);
+			isFirst = false;
+		} else if (isLast) {
+			chunks.push(`\x1b_Gm=0;${chunk}\x1b\\`);
+		} else {
+			chunks.push(`\x1b_Gm=1;${chunk}\x1b\\`);
+		}
+
+		offset += CHUNK_SIZE;
+	}
+
+	return chunks.join("");
+}
+
+/**
+ * Encode a kitty placement-only (`a=p`) escape referencing previously
+ * transmitted data. Re-emitting the same i=/p= pair replaces that one
+ * placement (never stacks, never touches sibling placements), and C=1
+ * keeps the cursor where it is so the escape can be emitted from the
+ * component's first row without cursor-up tricks.
+ */
+export function encodeKittyPlacement(options: {
+	imageId: number;
+	placementId: number;
+	columns: number;
+	rows: number;
+}): string {
+	return `\x1b_Ga=p,i=${options.imageId},p=${options.placementId},c=${options.columns},r=${options.rows},C=1,q=2\x1b\\`;
 }
 
 export function encodeITerm2(
@@ -485,11 +721,23 @@ export function getImageDimensions(base64Data: string, mimeType: string): ImageD
 	return null;
 }
 
+export interface RenderedImage {
+	sequence: string;
+	rows: number;
+	/**
+	 * True when the escape neither moves the cursor nor carries pixel data
+	 * (kitty `a=p,C=1` placements). Cursor-neutral sequences can be emitted
+	 * from the component's first row; cursor-advancing protocols
+	 * (iTerm2/SIXEL) must draw from the last reserved row instead.
+	 */
+	cursorNeutral?: boolean;
+}
+
 export function renderImage(
 	base64Data: string,
 	imageDimensions: ImageDimensions,
 	options: ImageRenderOptions = {},
-): { sequence: string; rows: number } | null {
+): RenderedImage | null {
 	if (!TERMINAL.imageProtocol) {
 		return null;
 	}
@@ -498,11 +746,20 @@ export function renderImage(
 	const fit = calculateImageFit(imageDimensions, options, cellDims);
 
 	if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
-		const sequence = encodeKitty(base64Data, {
-			columns: fit.columns,
-			rows: fit.rows,
-		});
-		return { sequence, rows: fit.rows };
+		const imageId = options.imageId ?? kittyImageId(base64Data);
+		const placementId = options.placementId ?? 1;
+		// Upload data once per image id (out-of-band; the transmit escape is
+		// cursor-neutral), then return only a tiny placement escape. Repaints
+		// re-emit just the placement, which replaces/moves that placement —
+		// re-sending data (a=T/a=t) for an existing id would delete the image
+		// and ALL of its placements (breaking sibling components showing the
+		// same content) and would re-send multi-MB payloads on every repaint.
+		if (!transmittedKittyImageIds.has(imageId)) {
+			transmittedKittyImageIds.add(imageId);
+			(options.onTransmit ?? kittyTransmitWriter)(encodeKittyTransmit(base64Data, imageId));
+		}
+		const sequence = encodeKittyPlacement({ imageId, placementId, columns: fit.columns, rows: fit.rows });
+		return { sequence, rows: fit.rows, cursorNeutral: true };
 	}
 
 	if (TERMINAL.imageProtocol === ImageProtocol.Sixel) {

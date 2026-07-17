@@ -137,8 +137,26 @@ describe("AsyncJobManager bounded dispose and delivery", () => {
 		}
 		const state = manager.getDeliveryState();
 		expect(state.queued).toBe(0);
-		expect(state.deadLettered).toBe(120);
+		expect(state.deadLettered).toBe(50);
 		expect(attempts).toBeLessThanOrEqual(120 * 3);
+	});
+
+	test("eviction removes dead-letter records for retained jobs", async () => {
+		const manager = new AsyncJobManager({
+			onJobComplete: () => new Promise<void>(() => {}),
+			maxRunningJobs: 102,
+			retentionMs: 0,
+		});
+		try {
+			for (let i = 0; i < 102; i += 1) {
+				manager.register("task", `evicted ${i}`, async () => "done", { id: `evicted-${i}` });
+			}
+			await manager.waitForAll();
+
+			expect(manager.getDeliveryState().deadLettered).toBe(0);
+		} finally {
+			await manager.dispose({ timeoutMs: 50 });
+		}
 	});
 
 	test("terminal eviction purges live terminal state while retaining durable resume metadata", async () => {

@@ -5,7 +5,6 @@ import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { htmlToMarkdown } from "@gajae-code/natives";
 import { type Component, Text } from "@gajae-code/tui";
 import { $which, ptree, truncate } from "@gajae-code/utils";
-import { parseHTML } from "linkedom";
 import type { Settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
@@ -15,6 +14,7 @@ import { DEFAULT_MAX_BYTES, truncateHead } from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
+import { parseHtmlLazy } from "../utils/linkedom";
 import { ensureTool } from "../utils/tools-manager";
 import { INSANE_NOTES, tryInsaneFetch } from "../web/insane/bridge";
 import { validatePublicHttpUrl, validatePublicHttpUrlForInsane } from "../web/insane/url-guard";
@@ -483,9 +483,9 @@ function cleanFeedText(text: string): string {
 /**
  * Parse RSS/Atom feed to markdown
  */
-function parseFeedToMarkdown(content: string, maxItems = 10): string {
+async function parseFeedToMarkdown(content: string, maxItems = 10): Promise<string> {
 	try {
-		const doc = parseHTML(content).document;
+		const doc = (await parseHtmlLazy(content)).document;
 
 		// Try RSS
 		const channel = doc.querySelector("channel");
@@ -1026,7 +1026,7 @@ async function renderUrl(
 	}
 
 	if (isFeed || (isXml && (rawContent.includes("<rss") || rawContent.includes("<feed")))) {
-		const parsed = parseFeedToMarkdown(rawContent);
+		const parsed = await parseFeedToMarkdown(rawContent);
 		const output = finalizeOutput(parsed);
 		return {
 			url,
@@ -1119,7 +1119,7 @@ async function renderUrl(
 			const altResult = await loadPage(resolved, { timeout, signal });
 			if (altResult.ok && altResult.content.trim().length > 200) {
 				notes.push(`Used feed alternate: ${resolved}`);
-				const parsed = parseFeedToMarkdown(altResult.content);
+				const parsed = await parseFeedToMarkdown(altResult.content);
 				const output = finalizeOutput(parsed);
 				return {
 					url,
@@ -1292,20 +1292,20 @@ async function materializeReadUrlCacheEntry(
 	session: ToolSession,
 	entry: ReadUrlCacheEntry,
 ): Promise<ReadUrlCacheEntry | null> {
+	if (entry.output.length > 0) return entry;
 	if (entry.artifactId) {
 		const artifactOutput = await readArtifactOutput(session, entry.artifactId);
 		if (artifactOutput !== null) {
 			return { ...entry, output: artifactOutput };
 		}
 	}
-
-	return entry.output.length > 0 ? entry : null;
+	return null;
 }
 
 async function persistReadUrlArtifact(session: ToolSession, output: string): Promise<string | undefined> {
 	const { path: artifactPath, id } = (await session.allocateOutputArtifact?.("read")) ?? {};
 	if (!artifactPath) return undefined;
-	await Bun.write(artifactPath, output);
+	await Bun.write(artifactPath, wrapUntrustedContent(output));
 	return id;
 }
 
@@ -1379,6 +1379,13 @@ export async function loadReadUrlCacheEntry(
 	return fresh;
 }
 
+const UNTRUSTED_CONTENT_OPEN = "<untrusted-content>";
+const UNTRUSTED_CONTENT_CLOSE = "</untrusted-content>";
+
+export function wrapUntrustedContent(content: string): string {
+	return `${UNTRUSTED_CONTENT_OPEN}\n${content.replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")}\n${UNTRUSTED_CONTENT_CLOSE}`;
+}
+
 function buildUrlReadOutput(result: FetchRenderResult, content: string): string {
 	let output = "";
 	output += `URL: ${result.finalUrl}\n`;
@@ -1413,7 +1420,7 @@ export async function executeReadUrl(
 		truncated: Boolean(cacheEntry.details.truncated || needsArtifact),
 	};
 
-	const contentBlocks: Array<TextContent | ImageContent> = [{ type: "text", text: output }];
+	const contentBlocks: Array<TextContent | ImageContent> = [{ type: "text", text: wrapUntrustedContent(output) }];
 	if (cacheEntry.image) {
 		contentBlocks.push({ type: "image", data: cacheEntry.image.data, mimeType: cacheEntry.image.mimeType });
 	}

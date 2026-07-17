@@ -1,9 +1,18 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { visibleWidth } from "@gajae-code/tui";
 import { WelcomeComponent } from "../src/modes/components/welcome";
 import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
 
+const originalBuildChannel = process.env.GJC_BUILD_CHANNEL;
+
+afterEach(() => {
+	if (originalBuildChannel === undefined) {
+		delete process.env.GJC_BUILD_CHANNEL;
+	} else {
+		process.env.GJC_BUILD_CHANNEL = originalBuildChannel;
+	}
+});
 beforeAll(async () => {
 	const theme = await getThemeByName("red-claw");
 	if (!theme) throw new Error("Failed to load red-claw theme");
@@ -57,6 +66,25 @@ describe("WelcomeComponent viewport sizing", () => {
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBe(200);
 		}
+	});
+
+	it("renders the build label from metadata instead of defaulting to dev", () => {
+		const welcome = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii", {
+			buildLabel: "release build",
+		});
+		const rendered = welcome.render(120).map(stripRenderControls).join("\n");
+
+		expect(rendered).toContain("gjc v1.2.3 · release build · GJC Forge");
+		expect(rendered).not.toContain("dev build");
+	});
+
+	it("renders the production metadata resolver label when no override is provided", () => {
+		process.env.GJC_BUILD_CHANNEL = "release";
+		const welcome = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii");
+		const rendered = welcome.render(120).map(stripRenderControls).join("\n");
+
+		expect(rendered).toContain("gjc v1.2.3 · release build · GJC Forge");
+		expect(rendered).not.toContain("dev build");
 	});
 
 	it("splits the forge and details columns evenly on wide viewports", () => {

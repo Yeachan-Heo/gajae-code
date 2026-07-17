@@ -52,6 +52,7 @@ interface GoldenFixture {
 	rows: number;
 	coverage: string[];
 	env?: Record<string, string | undefined>;
+	isProcessTerminal?: boolean;
 	imageProtocol?: ImageProtocol | null;
 	run(tui: TUI, term: VirtualTerminal): Promise<void>;
 }
@@ -239,6 +240,7 @@ export const RENDER_GOLDEN_FIXTURES: GoldenFixture[] = [
 		cols: 32,
 		rows: 5,
 		env: { TMUX: "golden-tmux", PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER: undefined },
+		isProcessTerminal: true,
 		coverage: ["multiplexer repaint", "TMUX env branch", "offscreen change", "no 3J scrollback clear"],
 		async run(tui, term) {
 			const lines = Array.from({ length: 16 }, (_v, i) => `mux-line-${String(i).padStart(2, "0")}`);
@@ -258,6 +260,7 @@ export const RENDER_GOLDEN_FIXTURES: GoldenFixture[] = [
 		cols: 42,
 		rows: 10,
 		env: { TERMUX_VERSION: "golden-termux" },
+		isProcessTerminal: true,
 		coverage: [
 			"Termux height branch",
 			"TERMUX_VERSION env branch",
@@ -325,7 +328,9 @@ export async function captureRenderGolden(fixture: GoldenFixture): Promise<Rende
 			terminalCapabilities.setTerminalImageProtocol(fixture.imageProtocol);
 		}
 
-		const term = new VirtualTerminal(fixture.cols, fixture.rows);
+		const term = new VirtualTerminal(fixture.cols, fixture.rows, {
+			isProcessTerminal: fixture.isProcessTerminal,
+		});
 		tui = new TUI(term);
 		tui.start();
 		await fixture.run(tui, term);

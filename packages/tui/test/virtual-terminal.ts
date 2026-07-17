@@ -16,7 +16,10 @@ export class VirtualTerminal implements Terminal {
 	private _columns: number;
 	private _rows: number;
 
-	constructor(columns = 80, rows = 24) {
+	#isProcessTerminal = false;
+
+	constructor(columns = 80, rows = 24, options: { isProcessTerminal?: boolean } = {}) {
+		this.#isProcessTerminal = options.isProcessTerminal === true;
 		this._columns = columns;
 		this._rows = rows;
 
@@ -84,6 +87,10 @@ export class VirtualTerminal implements Terminal {
 
 	get available(): boolean {
 		return true;
+	}
+
+	get isProcessTerminal(): boolean {
+		return this.#isProcessTerminal;
 	}
 
 	onAppearanceChange(_callback: (appearance: TerminalAppearance) => void): void {

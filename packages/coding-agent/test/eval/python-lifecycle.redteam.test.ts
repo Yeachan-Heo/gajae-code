@@ -136,15 +136,15 @@ describe("python eval lifecycle red-team", () => {
 		const unrelated = Bun.spawn(["/bin/sh", "-c", "sleep 30"], { stdout: "ignore", stderr: "ignore" });
 		let childPid: number | undefined;
 		try {
-			const result = await executePython("%%bash\n(sleep 30) &\necho owned_child:$!\nwait", {
+			const pidFile = `${tempDir.path()}/owned-child.pid`;
+			const result = await executePython(`%%bash\n(sleep 30) &\nprintf '%s' "$!" > "${pidFile}"\nwait`, {
 				cwd: tempDir.path(),
 				sessionId: "redteam-bash-descendant-timeout",
 				kernelMode: "session",
 				timeoutMs: 500,
 			});
-			const match = result.output.match(/owned_child:(\d+)/);
-			expect(match).not.toBeNull();
-			childPid = Number(match?.[1]);
+			childPid = Number(await Bun.file(pidFile).text());
+			expect(Number.isSafeInteger(childPid) && childPid > 0).toBe(true);
 			expect(result.cancelled).toBe(true);
 			expect(await waitForProcessGone(childPid)).toBe(true);
 			expect(isProcessAlive(unrelated.pid)).toBe(true);

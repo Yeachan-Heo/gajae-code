@@ -23,6 +23,8 @@ import {
 } from "./render-utils";
 import { type SubagentSnapshot, type SubagentToolDetails, subagentAwaitRenderedStateSignature } from "./subagent";
 
+export { subagentAwaitRenderedStateSignature } from "./subagent";
+
 const PREVIEW_LINES_COLLAPSED = 1;
 const PREVIEW_LINES_EXPANDED = 4;
 const PREVIEW_LINE_WIDTH = 80;
@@ -128,7 +130,7 @@ function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spin
 		theme,
 		snapshot.status === "running" ? spinnerFrame : undefined,
 	);
-	const id = theme.fg("muted", snapshot.id);
+	const id = theme.fg("muted", truncateToWidth(replaceTabs(snapshot.id), PREVIEW_LINE_WIDTH, Ellipsis.Unicode));
 	const status = theme.fg("dim", snapshot.status);
 	const duration = theme.fg("dim", formatDuration(snapshot.durationMs));
 	return `${icon} ${id} ${status} ${duration}`;
@@ -195,7 +197,12 @@ function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolea
 		}
 	}
 
-	if (snapshot.guidance) lines.push(`  ${theme.fg("dim", snapshot.guidance)}`);
+	if (snapshot.guidance) {
+		for (const line of getPreviewLines(snapshot.guidance, 1, PREVIEW_LINE_WIDTH, Ellipsis.Unicode)) {
+			lines.push(`  ${theme.fg("dim", replaceTabs(line))}`);
+		}
+	}
+
 	return lines;
 }
 
@@ -218,6 +225,7 @@ export const subagentToolRenderer = {
 		}
 
 		const runningCount = subagents.filter(s => s.status === "running").length;
+		const interrupted = result.details?.interrupted === true;
 
 		// Each snapshot's rendered-state signature is constant for this component
 		// instance, so compute them at most once; the heavy per-subagent bodies are
@@ -232,11 +240,12 @@ export const subagentToolRenderer = {
 				// it is never gated by the heavy body cache.
 				const header = renderStatusLine(
 					{
-						icon: runningCount > 0 ? "info" : "success",
-						spinnerFrame: runningCount > 0 ? options.spinnerFrame : undefined,
-						title: "Subagent",
-						description:
-							runningCount > 0
+						icon: interrupted ? "warning" : runningCount > 0 ? "info" : "success",
+						spinnerFrame: !interrupted && runningCount > 0 ? options.spinnerFrame : undefined,
+						title: interrupted ? "Subagent await interrupted" : "Subagent",
+						description: interrupted
+							? "child subagents continue"
+							: runningCount > 0
 								? `awaiting ${runningCount} of ${subagents.length}`
 								: `${subagents.length} ${subagents.length === 1 ? "subagent" : "subagents"}`,
 					},
@@ -249,7 +258,9 @@ export const subagentToolRenderer = {
 					out.push(truncateToWidth(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`, width, Ellipsis.Omit));
 				}
 
-				snapshotSignatures ??= subagents.map(snapshot => subagentAwaitRenderedStateSignature([snapshot]));
+				snapshotSignatures ??= subagents.map(snapshot =>
+					subagentAwaitRenderedStateSignature([snapshot], result.details),
+				);
 				subagents.forEach((snapshot, index) => {
 					// Fresh per-subagent status line (cheap), then the cached heavy body.
 					out.push(

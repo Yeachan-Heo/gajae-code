@@ -1,10 +1,12 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import type { AgentMessage } from "@gajae-code/agent-core";
+import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
+import type { Usage } from "@gajae-code/ai";
 import { Settings } from "../src/config/settings";
 import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
+import { executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import * as sshConfig from "../src/ssh/config-writer";
 
 interface FakeAcpBuiltinSession {
@@ -15,6 +17,8 @@ interface FakeAcpBuiltinSession {
 	sessionId: string;
 	sessionName: string;
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
+	thinkingLevel: ThinkingLevel | undefined;
+	thinkingLevelCalls: Array<{ thinkingLevel: ThinkingLevel | undefined; persist: boolean | undefined }>;
 	toggleFastMode(): boolean;
 	setFastMode(enabled: boolean): void;
 	isFastModeEnabled(): boolean;
@@ -23,6 +27,19 @@ interface FakeAcpBuiltinSession {
 	resolveRoleModelWithThinking(role: string): { model?: { provider: string; id: string } };
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
+	getSessionStats: () => {
+		sessionFile: string | undefined;
+		sessionId: string;
+		userMessages: number;
+		assistantMessages: number;
+		toolCalls: number;
+		toolResults: number;
+		totalMessages: number;
+		tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+		premiumRequests: number;
+		cost: number;
+		costBreakdown?: Usage["cost"];
+	};
 	getAsyncJobSnapshot: (opts?: { recentLimit?: number }) => { running: unknown[]; recent: unknown[] } | null;
 	formatSessionAsText: () => string;
 	getLastAssistantText: () => string | undefined;
@@ -34,7 +51,14 @@ interface FakeAcpBuiltinSession {
 			options?: { candidates?: Array<{ provider: string; id: string; contextWindow?: number }> },
 		) => { provider: string; id: string; contextWindow?: number } | undefined;
 	};
-	model: { provider: string; id: string; contextWindow?: number } | undefined;
+	model:
+		| {
+				provider: string;
+				id: string;
+				contextWindow?: number;
+				cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+		  }
+		| undefined;
 	agent: {
 		state: {
 			tools: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
@@ -55,8 +79,9 @@ interface FakeAcpBuiltinSession {
 	compact(args?: string): Promise<void>;
 	getContextUsage(): { tokens?: number; contextWindow: number } | undefined;
 	getAvailableModels(): Array<{ provider: string; id: string; contextWindow?: number }>;
+	getAvailableThinkingLevels(): ThinkingLevel[];
 	setModel(model: unknown): Promise<void>;
-	setThinkingLevel(thinkingLevel: unknown): void;
+	setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean): void;
 }
 
 function createRuntime() {
@@ -70,6 +95,8 @@ function createRuntime() {
 		sessionId: "fake-session-id",
 		sessionName: "Fake Session",
 		_todoPhases: [],
+		thinkingLevel: ThinkingLevel.Low,
+		thinkingLevelCalls: [],
 		toggleFastMode() {
 			this.fastMode = !this.fastMode;
 			return this.fastMode;
@@ -112,6 +139,18 @@ function createRuntime() {
 		},
 		async refreshBaseSystemPrompt() {},
 		getAsyncJobSnapshot: () => null,
+		getSessionStats: () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 0,
+			assistantMessages: 0,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 0,
+			tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			premiumRequests: 0,
+			cost: 0,
+		}),
 		formatSessionAsText: () => "",
 		getLastAssistantText: () => undefined,
 		messages: [],
@@ -129,8 +168,12 @@ function createRuntime() {
 		async compact(_args?: string) {},
 		getContextUsage: () => undefined,
 		getAvailableModels: () => [] as Array<{ provider: string; id: string; contextWindow?: number }>,
+		getAvailableThinkingLevels: () => [ThinkingLevel.Low, ThinkingLevel.Medium, ThinkingLevel.High],
 		async setModel(_model: unknown) {},
-		setThinkingLevel(_thinkingLevel: unknown) {},
+		setThinkingLevel(thinkingLevel: ThinkingLevel | undefined, persist?: boolean) {
+			this.thinkingLevel = thinkingLevel;
+			this.thinkingLevelCalls.push({ thinkingLevel, persist });
+		},
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};
 	const typedSession = session as unknown as AgentSession & FakeAcpBuiltinSession;
@@ -312,6 +355,24 @@ describe("ACP builtin slash commands", () => {
 		expect(result).toBe(false);
 	});
 
+	it("changelog: advertises and renders recent or full changelog output", async () => {
+		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(command => command.name === "changelog");
+		expect(advertised?.description).toBe("Show release notes and changelog entries");
+		expect(advertised?.input?.hint).toBe("[full|--full]");
+
+		const recent = createRuntime();
+		await expect(executeAcpBuiltinSlashCommand("/changelog", recent.runtime)).resolves.toEqual({ consumed: true });
+		expect(recent.output[0]).toContain("Recent Changes");
+		expect(recent.output[0]).toContain("Use `/changelog --full`");
+
+		const full = createRuntime();
+		await expect(executeAcpBuiltinSlashCommand("/changelog --full", full.runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(full.output[0]).toContain("Full Changelog");
+		expect(full.output[0]).not.toContain("Use `/changelog --full`");
+	});
+
 	// /jobs
 	it("jobs: shows informative message when snapshot is null", async () => {
 		const { output, runtime } = createRuntime();
@@ -409,13 +470,14 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).not.toContain("Quick");
 	});
 
-	it("model: returns ACP usage message when args provided", async () => {
+	it("model: returns model usage message when args cannot resolve", async () => {
 		const { output, runtime } = createRuntime();
 
 		const result = await executeAcpBuiltinSlashCommand("/model claude-3-5-sonnet", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(output[0]?.toLowerCase()).toContain("acp");
+		expect(output[0]).toContain("Unknown model: claude-3-5-sonnet");
+		expect(output[0]).toContain("/model <target> <model[:effort]>");
 	});
 
 	it("model: applies known id and emits both title + config change notifications", async () => {
@@ -436,6 +498,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: undefined,
 		});
@@ -455,6 +518,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
 		});
@@ -472,6 +536,7 @@ describe("ACP builtin slash commands", () => {
 
 		expect(result).toEqual({ consumed: true });
 		expect(setModelSpy).toHaveBeenCalledWith(available[0], "default", {
+			cause: "user-selection",
 			selector: "anthropic/claude-3-5-sonnet",
 			thinkingLevel: "low",
 		});
@@ -535,6 +600,33 @@ describe("ACP builtin slash commands", () => {
 		});
 	});
 
+	it("model: updates the live role-agent override when a runtime profile is active", async () => {
+		const { runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
+		runtime.settings.set("task.agentModelOverrides", {
+			executor: "anthropic/persisted-executor:low",
+		});
+		runtime.settings.override("task.agentModelOverrides", {
+			executor: "anthropic/profile-executor:high",
+			planner: "anthropic/profile-planner:low",
+		});
+
+		const result = await executeAcpBuiltinSlashCommand("/model planner anthropic/claude-3-5-sonnet:high", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/profile-executor:high",
+			planner: "anthropic/claude-3-5-sonnet:high",
+		});
+
+		runtime.settings.clearOverride("task.agentModelOverrides");
+
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/persisted-executor:low",
+			planner: "anthropic/claude-3-5-sonnet:high",
+		});
+	});
+
 	it("model: preserves canonical selectors for text role-agent assignments", async () => {
 		const { output, runtime, session } = createRuntime();
 		const available = [{ provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 }];
@@ -551,6 +643,44 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("executor agent model set to claude-sonnet:low");
 	});
 
+	it("model: TUI args assign a role-agent target instead of reopening the selector", async () => {
+		const { runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];
+
+		const statuses: string[] = [];
+		let configNotified = 0;
+		const showModelSelector = spyOn({ showModelSelector() {} }, "showModelSelector");
+		const ctx = {
+			session: runtime.session,
+			sessionManager: runtime.sessionManager,
+			settings: runtime.settings,
+			showStatus: (text: string) => statuses.push(text),
+			showError: (_text: string) => {},
+			showModelSelector,
+			editor: { setText: spyOn({ setText(_text: string) {} }, "setText") },
+			statusLine: { invalidate: spyOn({ invalidate() {} }, "invalidate") },
+			updateEditorBorderColor: spyOn({ updateEditorBorderColor() {} }, "updateEditorBorderColor"),
+			ui: { requestRender: spyOn({ requestRender() {} }, "requestRender") },
+			refreshSlashCommandState: async () => {},
+			notifyConfigChanged: () => {
+				configNotified++;
+			},
+		};
+
+		const result = await executeBuiltinSlashCommand("/model executor anthropic/claude-3-5-sonnet:low", {
+			ctx: ctx as never,
+			handleBackgroundCommand: () => {},
+		});
+
+		expect(result).toBe(true);
+		expect(showModelSelector).not.toHaveBeenCalled();
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/claude-3-5-sonnet:low",
+		});
+		expect(statuses[0]).toContain("executor agent model set to anthropic/claude-3-5-sonnet:low");
+		expect(configNotified).toBe(1);
+	});
+
 	it("model: does not emit config change when id is unknown", async () => {
 		const { runtime } = createRuntime();
 		let configNotified = 0;
@@ -561,6 +691,154 @@ describe("ACP builtin slash commands", () => {
 		await executeAcpBuiltinSlashCommand("/model nonexistent", runtime);
 
 		expect(configNotified).toBe(0);
+	});
+
+	it("effort: advertises ACP command with the exact accepted-value hint and no thinking alias", () => {
+		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(command => command.name === "effort");
+		expect(advertised?.description).toBe("Show or set model reasoning effort");
+		expect(advertised?.input?.hint).toBe("[inherit|off|minimal|low|medium|high|xhigh|max]");
+		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "thinking")).toBe(false);
+	});
+
+	it("effort: bare command reports current, default, accepted values, and supported guidance", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.thinkingLevel = ThinkingLevel.Medium;
+		runtime.settings.set("defaultThinkingLevel", ThinkingLevel.High);
+		session.getAvailableThinkingLevels = () => [ThinkingLevel.Low, ThinkingLevel.High];
+
+		const result = await executeAcpBuiltinSlashCommand("/effort", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Current effective effort: medium");
+		expect(output[0]).toContain("Configured default effort: high");
+		expect(output[0]).toContain("Accepted values: inherit, off, minimal, low, medium, high, xhigh, max");
+		expect(output[0]).toContain("Current-model supported levels: low, high");
+	});
+
+	it("effort: inherit applies configured default to the current session without persistence", async () => {
+		const { output, runtime, session } = createRuntime();
+		runtime.settings.set("defaultThinkingLevel", ThinkingLevel.High);
+
+		const result = await executeAcpBuiltinSlashCommand("/effort inherit", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(session.thinkingLevelCalls).toEqual([{ thinkingLevel: ThinkingLevel.High, persist: false }]);
+		expect(output[0]).toContain("Reasoning effort set to inherit (high)");
+		expect(output[0]).toContain("Effective effort: high");
+	});
+
+	it("effort: off and typed efforts set the current session without persistence", async () => {
+		const { runtime, session } = createRuntime();
+
+		const offResult = await executeAcpBuiltinSlashCommand("/effort off", runtime);
+		const xhighResult = await executeAcpBuiltinSlashCommand("/effort xhigh", runtime);
+
+		expect(offResult).toEqual({ consumed: true });
+		expect(xhighResult).toEqual({ consumed: true });
+		expect(session.thinkingLevelCalls).toEqual([
+			{ thinkingLevel: ThinkingLevel.Off, persist: false },
+			{ thinkingLevel: ThinkingLevel.XHigh, persist: false },
+		]);
+	});
+
+	it("effort: accepts parseable efforts outside current-model guidance and reports requested/effective clamp", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.getAvailableThinkingLevels = () => [ThinkingLevel.Low];
+		session.setThinkingLevel = (thinkingLevel, persist) => {
+			session.thinkingLevelCalls.push({ thinkingLevel, persist });
+			session.thinkingLevel = ThinkingLevel.Low;
+		};
+
+		const result = await executeAcpBuiltinSlashCommand("/effort max", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(session.thinkingLevelCalls).toEqual([{ thinkingLevel: ThinkingLevel.Max, persist: false }]);
+		expect(output[0]).toContain("Requested max; effective low.");
+	});
+
+	it("effort: invalid and malformed inputs consume with usage and do not mutate thinking level", async () => {
+		for (const command of ["/effort turbo", "/effort low high"]) {
+			const { output, runtime, session } = createRuntime();
+
+			const result = await executeAcpBuiltinSlashCommand(command, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(session.thinkingLevelCalls).toEqual([]);
+			expect(output[0]).toContain("Usage: /effort [inherit|off|minimal|low|medium|high|xhigh|max]");
+		}
+	});
+
+	it("effort: /thinking is not resolved as an effort alias", async () => {
+		const { output, runtime } = createRuntime();
+
+		const result = await executeAcpBuiltinSlashCommand("/thinking high", runtime);
+
+		expect(result).toBe(false);
+		expect(output).toEqual([]);
+	});
+	it("effort: TUI bare command opens selector instead of printing status", async () => {
+		const { runtime } = createRuntime();
+		const statuses: string[] = [];
+		const showEffortSelector = spyOn({ showEffortSelector() {} }, "showEffortSelector");
+		const ctx = {
+			session: runtime.session,
+			sessionManager: runtime.sessionManager,
+			settings: runtime.settings,
+			showStatus: (text: string) => statuses.push(text),
+			showError: (_text: string) => {},
+			showEffortSelector,
+			editor: { setText: spyOn({ setText(_text: string) {} }, "setText") },
+			statusLine: { invalidate: spyOn({ invalidate() {} }, "invalidate") },
+			updateEditorBorderColor: spyOn({ updateEditorBorderColor() {} }, "updateEditorBorderColor"),
+			updateEditorTopBorder: spyOn({ updateEditorTopBorder() {} }, "updateEditorTopBorder"),
+			ui: { requestRender: spyOn({ requestRender() {} }, "requestRender") },
+			refreshSlashCommandState: async () => {},
+		};
+
+		const result = await executeBuiltinSlashCommand("/effort", {
+			ctx: ctx as never,
+			handleBackgroundCommand: () => {},
+		});
+
+		expect(result).toBe(true);
+		expect(showEffortSelector).toHaveBeenCalledTimes(1);
+		expect(statuses).toEqual([]);
+		expect(ctx.editor.setText).toHaveBeenCalledWith("");
+	});
+
+	it("effort: TUI args delegate to shared typed handler and do not open selector", async () => {
+		const { runtime, session } = createRuntime();
+		const statuses: string[] = [];
+		const showEffortSelector = spyOn({ showEffortSelector() {} }, "showEffortSelector");
+		const ctx = {
+			session: runtime.session,
+			sessionManager: runtime.sessionManager,
+			settings: runtime.settings,
+			showStatus: (text: string) => statuses.push(text),
+			showError: (_text: string) => {},
+			showEffortSelector,
+			editor: { setText: spyOn({ setText(_text: string) {} }, "setText") },
+			statusLine: { invalidate: spyOn({ invalidate() {} }, "invalidate") },
+			updateEditorBorderColor: spyOn({ updateEditorBorderColor() {} }, "updateEditorBorderColor"),
+			updateEditorTopBorder: spyOn({ updateEditorTopBorder() {} }, "updateEditorTopBorder"),
+			ui: { requestRender: spyOn({ requestRender() {} }, "requestRender") },
+			refreshSlashCommandState: async () => {},
+		};
+
+		const result = await executeBuiltinSlashCommand("/effort high", {
+			ctx: ctx as never,
+			handleBackgroundCommand: () => {},
+		});
+
+		expect(result).toBe(true);
+		expect(showEffortSelector).not.toHaveBeenCalled();
+		expect(session.thinkingLevelCalls).toEqual([{ thinkingLevel: ThinkingLevel.High, persist: false }]);
+		expect(statuses[0]).toContain("Reasoning effort set to high");
+		expect(ctx.statusLine.invalidate).toHaveBeenCalled();
+		expect(ctx.updateEditorBorderColor).toHaveBeenCalled();
+		expect(ctx.updateEditorTopBorder).toHaveBeenCalled();
+		expect(ctx.ui.requestRender).toHaveBeenCalled();
+		expect(ctx.editor.setText).toHaveBeenCalledWith("");
 	});
 	it("does not advertise /copy to ACP clients", () => {
 		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "copy")).toBe(false);
@@ -574,7 +852,6 @@ describe("ACP builtin slash commands", () => {
 			"/tree",
 			"/branch",
 			"/browser",
-			"/changelog",
 			"/plan",
 			"/share",
 			"/hotkeys",
@@ -599,6 +876,90 @@ describe("ACP builtin slash commands", () => {
 });
 
 describe("session lifecycle commands", () => {
+	it("/session info: reports persisted aggregate cache costs without selected-model repricing", async () => {
+		const { output, session, runtime } = createRuntime();
+		session.getSessionStats = () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 1,
+			assistantMessages: 1,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 2,
+			tokens: { input: 2_000, output: 500, cacheRead: 1_000_000, cacheWrite: 40_000, total: 1_042_500 },
+			premiumRequests: 0,
+			cost: 0.67,
+			costBreakdown: { input: 0.52, output: 0, cacheRead: 0.03, cacheWrite: 0.12, total: 0.67 },
+		});
+
+		const result = await executeAcpBuiltinSlashCommand("/session info", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Tokens\nInput: 2,000\nOutput: 500\nCache Read: 1,000,000");
+		expect(output[0]).toContain("Cost\nTotal: 0.6700");
+		expect(output[0]).toContain("Cache Miss Cost\nUncached Input Cost: $0.52");
+		expect(output[0]).toContain("Cache Write Cost: $0.12");
+		expect(output[0]).not.toContain("Estimated Miss Premium");
+
+		session.model = {
+			provider: "test",
+			id: "expensive-selected-model",
+			cost: { input: 100, output: 15, cacheRead: 0.01, cacheWrite: 100 },
+		};
+		await expect(executeAcpBuiltinSlashCommand("/session info", runtime)).resolves.toEqual({ consumed: true });
+		expect(output[1]).toBe(output[0]);
+	});
+
+	it("/session info: does not price material usage when aggregate provenance is absent", async () => {
+		const absentBreakdown = createRuntime();
+		absentBreakdown.session.getSessionStats = () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 1,
+			assistantMessages: 1,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 2,
+			tokens: { input: 2_000, output: 500, cacheRead: 1_000_000, cacheWrite: 40_000, total: 1_042_500 },
+			premiumRequests: 0,
+			cost: 0,
+		});
+		absentBreakdown.session.model = {
+			provider: "test",
+			id: "expensive-selected-model",
+			cost: { input: 100, output: 100, cacheRead: 0.01, cacheWrite: 100 },
+		};
+
+		await expect(executeAcpBuiltinSlashCommand("/session info", absentBreakdown.runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(absentBreakdown.output[0]).toContain("Cache Read: 1,000,000");
+		expect(absentBreakdown.output[0]).not.toContain("Cache Miss Cost");
+	});
+
+	it("/session info: omits cache miss summary without a complete persisted aggregate breakdown", async () => {
+		const unpriced = createRuntime();
+		unpriced.session.getSessionStats = () => ({
+			sessionFile: undefined,
+			sessionId: "fake-session-id",
+			userMessages: 1,
+			assistantMessages: 1,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 2,
+			tokens: { input: 2_000, output: 500, cacheRead: 1_000_000, cacheWrite: 0, total: 1_002_500 },
+			premiumRequests: 0,
+			cost: 0,
+			costBreakdown: { input: 0.52, output: 0, cacheRead: 0.03, cacheWrite: Number.NaN, total: 0.67 },
+		});
+
+		await expect(executeAcpBuiltinSlashCommand("/session info", unpriced.runtime)).resolves.toEqual({
+			consumed: true,
+		});
+		expect(unpriced.output[0]).toContain("Cache Read: 1,000,000");
+		expect(unpriced.output[0]).not.toContain("Cache Miss Cost");
+	});
+
 	it("/session delete: returns in-memory usage when no sessionFile", async () => {
 		const { output, runtime } = createRuntime();
 		const result = await executeAcpBuiltinSlashCommand("/session delete", runtime);

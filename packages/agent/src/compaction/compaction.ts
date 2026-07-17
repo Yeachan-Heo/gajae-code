@@ -5,6 +5,7 @@
  * and after compaction the session is reloaded.
  */
 
+import * as os from "node:os";
 import {
 	type AssistantMessage,
 	Effort,
@@ -28,7 +29,6 @@ import {
 	withOpenAiRemoteCompactionPreserveData,
 } from "./openai";
 import autoHandoffThresholdFocusPrompt from "./prompts/auto-handoff-threshold-focus.md" with { type: "text" };
-import compactionShortSummaryPrompt from "./prompts/compaction-short-summary.md" with { type: "text" };
 import compactionSummaryPrompt from "./prompts/compaction-summary.md" with { type: "text" };
 import compactionTurnPrefixPrompt from "./prompts/compaction-turn-prefix.md" with { type: "text" };
 import compactionUpdateSummaryPrompt from "./prompts/compaction-update-summary.md" with { type: "text" };
@@ -143,6 +143,18 @@ export interface CompactionSettings {
 	remoteEndpoint?: string;
 }
 
+export type RemoteCompactionFallbackHealthEvent =
+	| { kind: "success"; model: string; provider: string }
+	| { kind: "fallback"; model: string; provider: string; error: string };
+
+export interface RemoteCompactionFallbackHealthHooks {
+	recordRemoteCompactionFallback(event: RemoteCompactionFallbackHealthEvent): void;
+}
+
+function isAbortError(error: unknown): boolean {
+	return error instanceof Error && error.name === "AbortError";
+}
+
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	strategy: "context-full",
@@ -237,7 +249,13 @@ export function shouldCompact(
 }
 
 /** Reason a compaction was triggered. `token` is the normal user-configurable path; the rest are emergency floors. */
-export type CompactionTriggerReason = "token" | "heap" | "providerBytes" | "messageCount" | "imageBytes";
+export type CompactionTriggerReason =
+	| "token"
+	| "heap"
+	| "retainedMemory"
+	| "providerBytes"
+	| "messageCount"
+	| "imageBytes";
 
 /** A point-in-time resource sample. Supplied by an injectable sampler so tests never read real RSS. */
 export interface EmergencyCompactionSample {
@@ -249,6 +267,14 @@ export interface EmergencyCompactionSample {
 	messageCount: number;
 	/** Approximate inline image bytes in the provider context. */
 	imageBytes: number;
+	/** Bytes retained by session resident image sentinels; separate from provider-visible bytes. */
+	sessionResidentImageBytes?: number;
+	/** Bytes retained by non-provider materialized/session-local caches. */
+	materializedResidentBytes?: number;
+	/** Number of live TUI chat-container children. */
+	tuiChatChildren?: number;
+	/** Bytes retained by TUI render caches. */
+	tuiCachedRenderBytes?: number;
 }
 
 export interface EmergencyCompactionLimits {
@@ -256,6 +282,40 @@ export interface EmergencyCompactionLimits {
 	providerBytes: number;
 	messageCount: number;
 	imageBytes: number;
+	retainedMemoryBytes?: number;
+	retainedMemoryDiagnosticBytes?: number;
+	tuiChatChildren?: number;
+	tuiChatChildrenDiagnostic?: number;
+}
+
+const MAX_EMERGENCY_HEAP_FLOOR_BYTES = 1_536 * 1024 * 1024; // 1.5 GiB resident heap
+const EMERGENCY_RETAINED_MEMORY_BYTES = 128 * 1024 * 1024;
+const DIAGNOSTIC_RETAINED_MEMORY_BYTES = 64 * 1024 * 1024;
+const EMERGENCY_TUI_CHAT_CHILDREN = 1000;
+const DIAGNOSTIC_TUI_CHAT_CHILDREN = 700;
+let retainedMemoryDiagnosticActive = false;
+let tuiChatChildrenDiagnosticActive = false;
+
+export function resetEmergencyRetainedMemoryDiagnosticsForTests(): void {
+	retainedMemoryDiagnosticActive = false;
+	tuiChatChildrenDiagnosticActive = false;
+}
+
+export function resolveEmergencyCompactionLimits(totalMemoryBytes: number = os.totalmem()): EmergencyCompactionLimits {
+	// Invalid or non-positive total memory (bad injection, exotic platform)
+	// must never disable the heap floor — fall back to the fixed 1.5 GiB cap.
+	const safeTotal =
+		Number.isFinite(totalMemoryBytes) && totalMemoryBytes > 0 ? totalMemoryBytes : Number.POSITIVE_INFINITY;
+	return {
+		heapUsedBytes: Math.min(MAX_EMERGENCY_HEAP_FLOOR_BYTES, Math.floor(0.5 * safeTotal)),
+		providerBytes: 24 * 1024 * 1024, // 24 MiB serialized provider context
+		messageCount: 4000,
+		imageBytes: 64 * 1024 * 1024, // 64 MiB inline image bytes
+		retainedMemoryBytes: EMERGENCY_RETAINED_MEMORY_BYTES,
+		retainedMemoryDiagnosticBytes: DIAGNOSTIC_RETAINED_MEMORY_BYTES,
+		tuiChatChildren: EMERGENCY_TUI_CHAT_CHILDREN,
+		tuiChatChildrenDiagnostic: DIAGNOSTIC_TUI_CHAT_CHILDREN,
+	};
 }
 
 /**
@@ -263,23 +323,43 @@ export interface EmergencyCompactionLimits {
  * long session on weak hardware compacts before OOM even when token-based compaction is
  * disabled or its threshold is set too high. They are NOT user-tunable down to zero.
  */
-export const DEFAULT_EMERGENCY_COMPACTION_LIMITS: EmergencyCompactionLimits = {
-	heapUsedBytes: 1_536 * 1024 * 1024, // 1.5 GiB resident heap
-	providerBytes: 24 * 1024 * 1024, // 24 MiB serialized provider context
-	messageCount: 4000,
-	imageBytes: 64 * 1024 * 1024, // 64 MiB inline image bytes
-};
+export const DEFAULT_EMERGENCY_COMPACTION_LIMITS: EmergencyCompactionLimits = resolveEmergencyCompactionLimits();
 
 /**
- * Returns the first emergency limit exceeded (heap > providerBytes > imageBytes > messageCount),
- * or null when none is. Pure and sampler-injected; the caller routes the result through the
+ * Returns the first emergency limit exceeded (heap > retainedMemory > providerBytes > imageBytes > messageCount),
+ * or null when none is. Pure apart from retained-memory diagnostics; the caller routes the result through the
  * normal pair-safe `compact()` cut logic so a tool_use/tool_result pair is never split.
  */
 export function emergencyCompactionReason(
 	sample: EmergencyCompactionSample,
-	limits: EmergencyCompactionLimits = DEFAULT_EMERGENCY_COMPACTION_LIMITS,
+	limits: EmergencyCompactionLimits = resolveEmergencyCompactionLimits(),
 ): CompactionTriggerReason | null {
+	const retainedMemoryBytes = (sample.materializedResidentBytes ?? 0) + (sample.tuiCachedRenderBytes ?? 0);
+	const tuiChatChildren = sample.tuiChatChildren ?? 0;
+	const retainedDiagnostic =
+		retainedMemoryBytes >= (limits.retainedMemoryDiagnosticBytes ?? DIAGNOSTIC_RETAINED_MEMORY_BYTES);
+	const childDiagnostic = tuiChatChildren >= (limits.tuiChatChildrenDiagnostic ?? DIAGNOSTIC_TUI_CHAT_CHILDREN);
+	if (retainedDiagnostic && !retainedMemoryDiagnosticActive) {
+		logger.warn("Emergency compaction retained-memory diagnostic threshold crossed", {
+			retainedMemoryBytes,
+			limitBytes: limits.retainedMemoryDiagnosticBytes ?? DIAGNOSTIC_RETAINED_MEMORY_BYTES,
+		});
+	}
+	if (childDiagnostic && !tuiChatChildrenDiagnosticActive) {
+		logger.warn("Emergency compaction TUI chat-child diagnostic threshold crossed", {
+			tuiChatChildren,
+			limit: limits.tuiChatChildrenDiagnostic ?? DIAGNOSTIC_TUI_CHAT_CHILDREN,
+		});
+	}
+	retainedMemoryDiagnosticActive = retainedDiagnostic;
+	tuiChatChildrenDiagnosticActive = childDiagnostic;
+
 	if (sample.heapUsedBytes > limits.heapUsedBytes) return "heap";
+	if (
+		retainedMemoryBytes >= (limits.retainedMemoryBytes ?? EMERGENCY_RETAINED_MEMORY_BYTES) ||
+		tuiChatChildren >= (limits.tuiChatChildren ?? EMERGENCY_TUI_CHAT_CHILDREN)
+	)
+		return "retainedMemory";
 	if (sample.providerBytes > limits.providerBytes) return "providerBytes";
 	if (sample.imageBytes > limits.imageBytes) return "imageBytes";
 	if (sample.messageCount > limits.messageCount) return "messageCount";
@@ -315,7 +395,7 @@ export function resolveThresholdTokens(
  * Image content has no tokenizer representation; charge a fixed estimate
  * matching what providers typically bill for inline images.
  */
-const IMAGE_TOKEN_ESTIMATE = 1200;
+export const IMAGE_TOKEN_ESTIMATE = 1200;
 /**
  * Estimate tokens for collected message fragments using the native-free
  * heuristic. Provider usage is the authoritative anchor for context-changing
@@ -336,7 +416,61 @@ function countCollectedMessageFragments(collected: { fragments: string[]; extra:
 const HEURISTIC_BYTES_PER_TOKEN = 4;
 
 /**
- * Native-free chars/4 token estimate for a message. This is the only message
+ * Token-dense character weight for the script-aware heuristic.
+ *
+ * Common-BMP CJK blocks (Hangul, unified/compat Han, Kana, CJK punctuation,
+ * full-width forms) tokenize at ~0.6–1.0 tokens per character under
+ * o200k-class BPE vocabularies (measured o200k_base: Hangul prose 0.604,
+ * spaceless Hangul 0.964, Han 0.793, Kana 0.740 tokens/char — versus the
+ * 0.25 the chars/4 heuristic assumes). Each such character is charged 1
+ * token: an upper bound for these measured blocks whose only failure mode is
+ * compacting slightly early, while undercounting risks overflowing the
+ * provider window.
+ *
+ * Surrogate code units are charged 0.5 each, i.e. 1 token per supplementary
+ * code point (supplementary Han extensions, emoji, and other astral chars).
+ * That is a floor rather than an upper bound — rare ideographs and emoji can
+ * cost several tokens — but it is strictly safer than the 0.5-per-pair the
+ * plain chars/4 rule produced.
+ */
+function tokenDenseCharWeight(text: string): { weight: number; units: number } {
+	let weight = 0;
+	let units = 0;
+	for (let i = 0; i < text.length; i++) {
+		const c = text.charCodeAt(i);
+		if (
+			(c >= 0x1100 && c <= 0x11ff) || // Hangul Jamo
+			(c >= 0x3000 && c <= 0x303f) || // CJK symbols & punctuation
+			(c >= 0x3040 && c <= 0x30ff) || // Hiragana & Katakana
+			(c >= 0x3130 && c <= 0x318f) || // Hangul compatibility Jamo
+			(c >= 0x3400 && c <= 0x4dbf) || // CJK ideographs extension A
+			(c >= 0x4e00 && c <= 0x9fff) || // CJK unified ideographs
+			(c >= 0xac00 && c <= 0xd7af) || // Hangul syllables
+			(c >= 0xf900 && c <= 0xfaff) || // CJK compatibility ideographs
+			(c >= 0xff00 && c <= 0xffef) // Half/full-width forms
+		) {
+			weight += 1;
+			units += 1;
+		} else if (c >= 0xd800 && c <= 0xdfff) {
+			// Surrogate half: a supplementary code point contributes two units.
+			weight += 0.5;
+			units += 1;
+		}
+	}
+	return { weight, units };
+}
+
+/**
+ * Script-aware native-free token estimate for a plain string fragment:
+ * token-dense characters cost ~1 token each, everything else chars/4.
+ */
+function estimateFragmentTokensHeuristic(fragment: string): { dense: number; otherChars: number } {
+	const { weight, units } = tokenDenseCharWeight(fragment);
+	return { dense: weight, otherChars: fragment.length - units };
+}
+
+/**
+ * Native-free token estimate for a message. This is the only message
  * token estimator: provider usage (see {@link calculatePromptTokens}) anchors
  * the already-sent context, and this covers unsent/trailing deltas, per-entry
  * budgeting, and display surfaces. Callers add a conservative inflation factor
@@ -344,24 +478,23 @@ const HEURISTIC_BYTES_PER_TOKEN = 4;
  */
 export function estimateMessageTokensHeuristic(message: AgentMessage): number {
 	const { fragments, extra } = collectMessageFragments(message);
-	let bytes = 0;
-	for (const fragment of fragments) {
-		bytes += fragment.length;
-	}
-	return extra + Math.ceil(bytes / HEURISTIC_BYTES_PER_TOKEN);
+	return extra + estimateTextTokensHeuristic(fragments);
 }
 
 /**
- * Native-free chars/4 token estimate for plain string fragments. Fragment-level
- * counterpart of {@link estimateMessageTokensHeuristic}.
+ * Script-aware native-free token estimate for plain string fragments.
+ * Fragment-level counterpart of {@link estimateMessageTokensHeuristic}.
  */
 export function estimateTextTokensHeuristic(fragments: string | readonly string[]): number {
-	if (typeof fragments === "string") return Math.ceil(fragments.length / HEURISTIC_BYTES_PER_TOKEN);
-	let bytes = 0;
-	for (const fragment of fragments) {
-		bytes += fragment.length;
+	const list = typeof fragments === "string" ? [fragments] : fragments;
+	let dense = 0;
+	let otherChars = 0;
+	for (const fragment of list) {
+		const counts = estimateFragmentTokensHeuristic(fragment);
+		dense += counts.dense;
+		otherChars += counts.otherChars;
 	}
-	return Math.ceil(bytes / HEURISTIC_BYTES_PER_TOKEN);
+	return Math.ceil(dense + Math.max(0, otherChars) / HEURISTIC_BYTES_PER_TOKEN);
 }
 
 /** Shared content walk for both the native and heuristic estimators. */
@@ -376,7 +509,8 @@ function collectMessageFragments(message: AgentMessage): { fragments: string[]; 
 	}
 
 	switch (message.role) {
-		case "user": {
+		case "user":
+		case "custom": {
 			const content = (message as { content: string | Array<{ type: string; text?: string }> }).content;
 			if (typeof content === "string") {
 				fragments.push(content);
@@ -576,8 +710,6 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type !== "message") continue;
-
 		// Estimate this message's size
 		const messageTokens = estimateEntryTokens(entry);
 		accumulatedTokens += messageTokens;
@@ -635,8 +767,6 @@ const SUMMARIZATION_PROMPT = prompt.render(compactionSummaryPrompt);
 
 const UPDATE_SUMMARIZATION_PROMPT = prompt.render(compactionUpdateSummaryPrompt);
 
-const SHORT_SUMMARY_PROMPT = prompt.render(compactionShortSummaryPrompt);
-
 const HANDOFF_DOCUMENT_PROMPT = prompt.render(handoffDocumentPrompt);
 
 export const AUTO_HANDOFF_THRESHOLD_FOCUS = prompt.render(autoHandoffThresholdFocusPrompt);
@@ -662,8 +792,7 @@ export interface SummaryOptions {
 	/**
 	 * Optional telemetry handle. When provided, every LLM call emitted during
 	 * compaction is wrapped in an OTEL chat span tagged with
-	 * `pi.gen_ai.oneshot.kind` (`compaction_summary`, `compaction_short_summary`,
-	 * or `compaction_turn_prefix`). `undefined` keeps the call paths zero-cost.
+	 * `pi.gen_ai.oneshot.kind` (`compaction_summary` or `compaction_turn_prefix`).
 	 */
 	telemetry?: AgentTelemetry;
 	authCredentialType?: "api_key" | "oauth";
@@ -677,6 +806,78 @@ export interface SummaryOptions {
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
+	/** Session-owned health sink for remote-compaction fallback transition logging. */
+	remoteCompactionFallbackHealth?: RemoteCompactionFallbackHealthHooks;
+}
+
+/**
+ * Cap the serialized conversation fed to a summarization request so the request
+ * itself fits inside the model's context window.
+ *
+ * Without this, summarizing a near-full context serializes (nearly) the entire
+ * history back into a single summary request; on strict backends (e.g.
+ * OpenAI-code/Codex `context_length_exceeded`) that request itself overflows and
+ * throws, so context-overflow recovery cannot produce a summary and the agent
+ * fails to compact-and-continue — a non-interactive `gjc -p` run then terminates
+ * on the very overflow the recovery was meant to absorb.
+ *
+ * The budget reserves the summary's own output tokens plus prompt/system/template
+ * overhead, and applies a conservative safety factor for estimator error on
+ * dense text (the reason the original overflow was missed).
+ * Truncation keeps the head (origin/goals) and the tail (most recent state) and
+ * elides the middle; it is a last resort that only triggers when the input would
+ * otherwise not fit.
+ */
+export function boundConversationTextForSummary(
+	conversationText: string,
+	model: Model,
+	outputMaxTokens: number,
+): string {
+	const contextWindow = model.contextWindow;
+	if (!Number.isFinite(contextWindow) || contextWindow <= 0) return conversationText;
+
+	const OVERHEAD_TOKENS = 4096;
+	const SAFETY_FACTOR = 0.6;
+	const inputBudgetTokens = Math.floor(
+		(contextWindow - Math.max(0, outputMaxTokens) - OVERHEAD_TOKENS) * SAFETY_FACTOR,
+	);
+	const totalEstimatedTokens = estimateTextTokensHeuristic(conversationText);
+	const assemble = (head: string, tail: string): string => {
+		const elided = conversationText.length - head.length - tail.length;
+		return `${head}\n\n[... ${elided} characters of older conversation elided so this summarization request fits within the model context window ...]\n\n${tail}`;
+	};
+	const bareMarker = assemble("", "");
+	const fitsBudget = (candidate: string) => estimateTextTokensHeuristic(candidate) <= inputBudgetTokens;
+	if (inputBudgetTokens <= 0) {
+		// A window this small cannot fit any excerpt (not even the marker).
+		// Fail closed with an empty excerpt rather than submitting text into a
+		// request that is guaranteed to overflow.
+		return "";
+	}
+	if (totalEstimatedTokens <= inputBudgetTokens) return conversationText;
+
+	// Derive the character budget from the text's own measured token density
+	// instead of assuming 4 chars/token: a CJK-heavy conversation runs near
+	// 1 token/char, and a fixed 4-chars/token cut would overshoot the budget
+	// by up to ~4x — re-overflowing the very request this bound protects.
+	// Verify the complete assembled candidate (elision marker included)
+	// against the estimator and shrink until it fits.
+	const charsPerToken = conversationText.length / totalEstimatedTokens;
+	let budgetChars = Math.floor(inputBudgetTokens * charsPerToken);
+	for (let attempt = 0; attempt < 12 && budgetChars > 0; attempt++) {
+		const headChars = Math.floor(budgetChars * 0.35);
+		const tailChars = Math.max(0, budgetChars - headChars);
+		const head = conversationText.slice(0, headChars);
+		const tail = tailChars > 0 ? conversationText.slice(conversationText.length - tailChars) : "";
+		const assembled = assemble(head, tail);
+		if (fitsBudget(assembled)) return assembled;
+		budgetChars = Math.floor(budgetChars * 0.8);
+	}
+	// All attempts overshot (adversarially non-uniform density, or a budget
+	// smaller than the marker itself). Fail closed: return the bare marker
+	// only when it fits the budget, else an empty excerpt — never an
+	// over-budget result.
+	return fitsBudget(bareMarker) ? bareMarker : "";
 }
 
 export async function generateSummary(
@@ -703,7 +904,7 @@ export async function generateSummary(
 	// Serialize conversation to text so model doesn't try to continue it
 	// Convert to LLM messages first (handles custom app messages when caller provides a transformer).
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
 
 	// Build the prompt with conversation wrapped in tags
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
@@ -848,66 +1049,11 @@ export async function generateHandoff(
 		.join("\n");
 }
 
-async function generateShortSummary(
-	recentMessages: AgentMessage[],
-	historySummary: string | undefined,
-	model: Model,
-	reserveTokens: number,
-	apiKey: string,
-	signal?: AbortSignal,
-	options?: SummaryOptions,
-): Promise<string> {
-	const maxTokens = Math.min(512, Math.floor(0.2 * reserveTokens));
-	const llmMessages = (options?.convertToLlm ?? convertToLlm)(recentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (historySummary) {
-		promptText += `<previous-summary>\n${historySummary}\n</previous-summary>\n\n`;
-	}
-	promptText += formatAdditionalContext(options?.extraContext);
-	promptText += SHORT_SUMMARY_PROMPT;
-
-	if (options?.remoteEndpoint) {
-		const remote = await requestRemoteCompaction(
-			options.remoteEndpoint,
-			{
-				systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-				prompt: promptText,
-			},
-			signal,
-		);
-		return remote.summary;
-	}
-
-	const response = await instrumentedCompleteSimple(
-		model,
-		{
-			systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT],
-			messages: [{ role: "user", content: [{ type: "text", text: promptText }], timestamp: Date.now() }],
-		},
-		{
-			maxTokens,
-			signal,
-			apiKey,
-			reasoning: Effort.High,
-			initiatorOverride: options?.initiatorOverride,
-			metadata: options?.metadata,
-			sessionId: options?.sessionId,
-			providerSessionState: options?.providerSessionState,
-			preferWebsockets: options?.preferWebsockets,
-		},
-		{ telemetry: options?.telemetry, oneshotKind: "compaction_short_summary" },
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Short summary failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	return response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map(c => c.text)
-		.join("\n");
+/** Derive a display summary locally to avoid a second compaction LLM request. */
+function deriveShortSummary(summary: string): string {
+	const firstParagraph = summary.trim().split(/\n\s*\n/, 1)[0] ?? "";
+	const maxLength = 2_000;
+	return firstParagraph.length <= maxLength ? firstParagraph : `${firstParagraph.slice(0, maxLength - 1)}…`;
 }
 
 // ============================================================================
@@ -934,11 +1080,40 @@ export interface CompactionPreparation {
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
 	settings: CompactionSettings;
+	/**
+	 * Diagnostics for the keep-window token correction (Finding 7). `ratio` is the
+	 * clamped heuristic→actual correction that was applied (1 when none supplied);
+	 * `keepRecentTokensCorrected` is the heuristic budget findCutPoint actually used.
+	 */
+	tokenCorrection: { ratio: number; keepRecentTokensCorrected: number };
+}
+
+/** Bounds for the keep-window token correction (Finding 7): never trust a ratio
+ * beyond 2x in either direction so a bad estimate cannot balloon or collapse the
+ * kept window. */
+export const TOKEN_CORRECTION_MIN_RATIO = 0.5;
+export const TOKEN_CORRECTION_MAX_RATIO = 2;
+
+export interface PrepareCompactionOptions {
+	/**
+	 * Observed heuristic→actual token correction for the post-boundary keep window
+	 * (actualTokens / chars-4-heuristicTokens), supplied by the caller from per-turn
+	 * Usage deltas or a stable-prefix-subtracted comparison. Clamped to
+	 * [0.5, 2] and applied bidirectionally. When omitted, no correction is applied
+	 * (the confounded raw promptTokens/estimatedTokens quotient is never used).
+	 */
+	tokenCorrectionRatio?: number;
+	/**
+	 * Model context-window size. Windows below 66k retain the legacy fixed
+	 * keepRecentTokens behavior; larger windows scale the keep window to 30%.
+	 */
+	contextWindow?: number;
 }
 
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	options: PrepareCompactionOptions = {},
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -956,17 +1131,51 @@ export function prepareCompaction(
 
 	const lastUsage = getLastAssistantUsage(pathEntries);
 	const tokensBefore = lastUsage ? calculateContextTokens(lastUsage) : 0;
-	let keepRecentTokens = settings.keepRecentTokens;
-	if (lastUsage) {
-		const estimatedTokens = estimateEntriesTokens(pathEntries, boundaryStart, boundaryEnd);
-		const promptTokens = calculatePromptTokens(lastUsage);
-		const ratio = estimatedTokens > 0 ? promptTokens / estimatedTokens : 0;
-		if (Number.isFinite(ratio) && ratio > 1) {
-			keepRecentTokens = Math.max(1, Math.floor(keepRecentTokens / ratio));
-		}
-	}
 
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokens);
+	// Correct the keep-window budget for the chars/4 heuristic error using the
+	// caller-supplied observed ratio (actual/heuristic). The legacy raw
+	// promptTokens/estimatedTokens quotient is intentionally NOT used: promptTokens
+	// counts system+tools+full history while estimatedTokens counted only the
+	// post-boundary slice, so it was confounded and only ever shrank the window.
+	// Here the correction is bidirectional and clamped to [0.5, 2].
+	const configuredKeepRecentTokens = settings.keepRecentTokens;
+	const contextWindow = options.contextWindow;
+	const thresholdSafeKeepRecentTokens =
+		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 1
+			? Math.max(
+					1,
+					resolveThresholdTokens(contextWindow, settings) - effectiveReserveTokens(contextWindow, settings, 0),
+				)
+			: configuredKeepRecentTokens;
+	const keepRecentTokens = Math.min(configuredKeepRecentTokens, thresholdSafeKeepRecentTokens);
+	// Preserve the legacy fixed window for smaller models. At 66k and above,
+	// retain up to 30% of the model context, but never enough to leave the
+	// post-compaction prompt immediately above its configured threshold.
+	const scaledKeepRecentTokens =
+		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow >= 66_000
+			? Math.min(thresholdSafeKeepRecentTokens, Math.max(keepRecentTokens, Math.floor(contextWindow * 0.3)))
+			: keepRecentTokens;
+	const rawRatio = options.tokenCorrectionRatio;
+	const appliedRatio =
+		rawRatio !== undefined && Number.isFinite(rawRatio) && rawRatio > 0
+			? Math.min(TOKEN_CORRECTION_MAX_RATIO, Math.max(TOKEN_CORRECTION_MIN_RATIO, rawRatio))
+			: 1;
+	// Preserve an explicit keep floor that already covers the whole history: manual
+	// and emergency callers rely on prepareCompaction returning undefined rather
+	// than manufacturing a summary with no useful reduction. Otherwise, a scaled
+	// window that exceeds a short history falls back to the threshold-safe floor.
+	const historyTokens = pathEntries
+		.slice(boundaryStart, boundaryEnd)
+		.reduce((tokens, entry) => tokens + estimateEntryTokens(entry), 0);
+	const effectiveKeepRecentTokens =
+		configuredKeepRecentTokens > historyTokens
+			? configuredKeepRecentTokens
+			: scaledKeepRecentTokens > keepRecentTokens && scaledKeepRecentTokens > historyTokens
+				? keepRecentTokens
+				: scaledKeepRecentTokens;
+	const keepRecentTokensCorrected = Math.max(1, Math.round(effectiveKeepRecentTokens / appliedRatio));
+
+	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokensCorrected);
 
 	// Get ID of first kept entry
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
@@ -1034,6 +1243,7 @@ export function prepareCompaction(
 		previousPreserveData,
 		fileOps,
 		settings,
+		tokenCorrection: { ratio: appliedRatio, keepRecentTokensCorrected },
 	};
 }
 
@@ -1083,6 +1293,7 @@ export async function compact(
 		sessionId: options?.sessionId,
 		providerSessionState: options?.providerSessionState,
 		preferWebsockets: options?.preferWebsockets,
+		remoteCompactionFallbackHealth: options?.remoteCompactionFallbackHealth,
 	};
 
 	let preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined);
@@ -1109,12 +1320,28 @@ export async function compact(
 					{ authCredentialType: options?.authCredentialType },
 				);
 				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
-			} catch (err) {
-				logger.warn("OpenAI remote compaction failed, falling back to local summarization", {
-					error: err instanceof Error ? err.message : String(err),
+				summaryOptions.remoteCompactionFallbackHealth?.recordRemoteCompactionFallback({
+					kind: "success",
 					model: model.id,
 					provider: model.provider,
 				});
+			} catch (err) {
+				if (signal?.aborted || isAbortError(err)) throw err;
+				const error = err instanceof Error ? err.message : String(err);
+				if (summaryOptions.remoteCompactionFallbackHealth) {
+					summaryOptions.remoteCompactionFallbackHealth.recordRemoteCompactionFallback({
+						kind: "fallback",
+						error,
+						model: model.id,
+						provider: model.provider,
+					});
+				} else {
+					logger.warn("OpenAI remote compaction failed, falling back to local summarization", {
+						error,
+						model: model.id,
+						provider: model.provider,
+					});
+				}
 			}
 		}
 	}
@@ -1184,28 +1411,10 @@ export async function compact(
 		summary = "No prior history.";
 	}
 
-	const shortSummary = await generateShortSummary(
-		recentMessages,
-		summary,
-		model,
-		settings.reserveTokens,
-		apiKey,
-		signal,
-		{
-			extraContext: options?.extraContext,
-			remoteEndpoint: summaryOptions.remoteEndpoint,
-			initiatorOverride: summaryOptions.initiatorOverride,
-			metadata: summaryOptions.metadata,
-			telemetry: summaryOptions.telemetry,
-			sessionId: summaryOptions.sessionId,
-			providerSessionState: summaryOptions.providerSessionState,
-			preferWebsockets: summaryOptions.preferWebsockets,
-		},
-	);
-
 	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary = upsertFileOperations(summary, readFiles, modifiedFiles);
+	const shortSummary = deriveShortSummary(summary);
 
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no ID - session may need migration");
@@ -1235,7 +1444,7 @@ async function generateTurnPrefixSummary(
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 
 	const llmMessages = (options?.convertToLlm ?? convertToLlm)(messages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = boundConversationTextForSummary(serializeConversation(llmMessages), model, maxTokens);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [
 		{

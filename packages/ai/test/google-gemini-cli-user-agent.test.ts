@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { getGeminiCliUserAgent } from "../src/providers/google-gemini-cli";
+import { DEFAULT_GEMINI_CLI_VERSION } from "../src/providers/google-gemini-headers";
 
 describe("Google Gemini CLI user agent", () => {
 	const originalGjcVersion = process.env.GJC_AI_GEMINI_CLI_VERSION;
@@ -22,7 +23,9 @@ describe("Google Gemini CLI user agent", () => {
 		delete process.env.GJC_AI_GEMINI_CLI_VERSION;
 		delete process.env.PI_AI_GEMINI_CLI_VERSION;
 
-		expect(getGeminiCliUserAgent("gemini-2.5-flash")).toContain("GeminiCLI/0.49.0/gemini-2.5-flash");
+		expect(getGeminiCliUserAgent("gemini-2.5-flash")).toContain(
+			`GeminiCLI/${DEFAULT_GEMINI_CLI_VERSION}/gemini-2.5-flash`,
+		);
 	});
 
 	it("prefers the documented GJC Gemini CLI version override", () => {

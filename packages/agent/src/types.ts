@@ -25,11 +25,82 @@ export type StreamFn = (
 	...args: Parameters<typeof streamSimple>
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
+/** Stable identifier for a managed logical run, shared by all of its retry attempts. */
+export type ManagedLogicalRunId = number;
+
+/** Terminal completion requested for a logical run. */
+export interface RunTerminalRequest {
+	stopReason: "cancelled" | "error" | "exhausted";
+	messages?: AgentMessage[];
+}
+
+/**
+ * Ownership token supplied when Agent invokes a retry continuation.
+ *
+ * A continuation MUST verify `isCurrent()` immediately before starting a
+ * follow-up invocation and abandon the retry when it returns false. The token
+ * becomes invalid when its originating run is force-aborted or superseded.
+ * Coding-agent retry continuations must accept this argument and must not call
+ * `agent.continue()` after ownership has been lost.
+ */
+export interface ManagedAttemptContinuationOwnership {
+	/** Per-attempt run-loop id; use only for attempt-local ownership checks. */
+	readonly runId: number;
+	/** Stable managed logical-run id; use for all terminal completion requests. */
+	readonly logicalRunId: ManagedLogicalRunId;
+	readonly generation: number;
+	isCurrent(): boolean;
+}
+
+/** Runs after a discarded attempt is idle, only while its ownership token remains current. */
+export type ManagedAttemptContinuation = (ownership: ManagedAttemptContinuationOwnership) => void | Promise<void>;
+
+/** Decision returned by managed fallback policy for one provisional attempt. */
+export type ManagedAttemptDecision =
+	| { type: "retry"; continuation: ManagedAttemptContinuation }
+	| { type: "terminal"; terminal: RunTerminalRequest };
+
+/** Structured result for one managed upstream invocation. */
+export type ManagedAttemptOutcome =
+	| {
+			type: "retryable_discarded";
+			failure: {
+				message: AssistantMessage;
+				/** Exact provider transport facts, including retry headers, for fallback policy. */
+				transportFailure?: import("@gajae-code/ai").TransportFailureFacts;
+			};
+	  }
+	| { type: "run_terminal"; reason: "cancelled" | "error" | "exhausted" };
+
+export type ManagedAttemptOutcomeHandler = (
+	outcome: ManagedAttemptOutcome,
+) => ManagedAttemptDecision | Promise<ManagedAttemptDecision>;
+
+/**
+ * Outcome of a cooperative mid-run context-maintenance checkpoint (see
+ * {@link AgentLoopConfig.maintainContext}). Any value other than "not-needed"
+ * means the checkpoint mutated (or attempted to mutate) durable context, so the
+ * loop ends the current run without the lossy `agent_end` finalization and the
+ * maintenance owner resumes the run on the rewritten context.
+ */
+export type MidRunMaintenanceOutcome = "not-needed" | "pruned" | "compacted" | "promoted" | "failed" | "aborted";
+
 /**
  * Configuration for the agent loop.
  */
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
+	/**
+	 * Supplies a fresh opaque token at each concrete managed transport invocation.
+	 * The callback runs at the stream boundary so controller accounting matches
+	 * upstream request count, including multi-step tool turns.
+	 */
+	nextFallbackAttempt?: (model: Model) => SimpleStreamOptions["fallbackAttempt"];
+	/** Called after a managed upstream request is accepted and committed. */
+	onManagedAttemptAccepted?: () => void | Promise<void>;
+
+	/** Receives a managed invocation outcome without publishing provisional lifecycle events. */
+	onManagedAttemptOutcome?: ManagedAttemptOutcomeHandler;
 
 	/**
 	 * When to interrupt tool execution for steering messages.
@@ -160,6 +231,33 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Use this when tool availability or the system prompt can change mid-turn.
 	 */
 	syncContextBeforeModelCall?: (context: AgentContext) => void | Promise<void>;
+
+	/**
+	 * Cooperative mid-run context-maintenance checkpoint.
+	 *
+	 * Invoked at the top of every loop iteration AFTER pending tool-result /
+	 * steering messages have been materialized into durable context and BEFORE
+	 * {@link syncContextBeforeModelCall} and the model call. This is the only
+	 * boundary where the full unsent context (tool results + dequeued steering)
+	 * is already durable, so a long uninterrupted tool loop can be bounded here
+	 * before it grows past the provider window.
+	 *
+	 * The callback owns the maintenance decision (prune / compact / promote) and
+	 * receives the minimal cancellation-aware lifecycle: `signal` is the
+	 * non-optional loop signal, and `awaitEventDrain(invocationSignal)` waits for
+	 * prior event consumer bodies with loop and invocation cancellation composed.
+	 * Any outcome other than "not-needed" ends the current run with
+	 * `agent_end.stopReason === "maintenance"` (NOT the lossy pause / completed
+	 * finalization); the callback's continuation owner resumes the run on the
+	 * rewritten context.
+	 */
+	maintainContext?: (
+		context: AgentContext,
+		lifecycle: {
+			signal: AbortSignal;
+			awaitEventDrain: (invocationSignal: AbortSignal) => Promise<void>;
+		},
+	) => Promise<MidRunMaintenanceOutcome> | MidRunMaintenanceOutcome;
 
 	/**
 	 * Optional transform applied to tool call arguments before execution.
@@ -357,7 +455,7 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
  */
 export interface AgentState {
 	systemPrompt: string[];
-	model: Model;
+	model: Model | undefined;
 	thinkingLevel?: Effort;
 	tools: AgentTool<any>[];
 	messages: AgentMessage[]; // Can include attachments + custom message types
@@ -470,8 +568,10 @@ export type AgentEvent =
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
-			/** Indicates whether the loop ended normally or suspended at a pause checkpoint. */
-			stopReason?: "completed" | "paused";
+			/** Indicates whether the loop ended normally, suspended, cancelled, or entered maintenance. */
+			stopReason?: "completed" | "paused" | "cancelled" | "maintenance";
+			/** Present iff `stopReason === "maintenance"`; the maintenance outcome. */
+			maintenanceOutcome?: MidRunMaintenanceOutcome;
 			/** Present iff `AgentTelemetryConfig` was supplied on this run. */
 			telemetry?: AgentRunSummary;
 			coverage?: AgentRunCoverage;

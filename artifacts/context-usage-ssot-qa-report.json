@@ -1,0 +1,270 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "round": 4,
+  "commit": "32ef394225013d21f5c709953701197ab1d62c68",
+  "rounds": [
+    {
+      "round": 0,
+      "commit": "96f48793",
+      "outcome": "C4 failed: timestamp-less stale provider usage could cross a compaction boundary (RT-TS-001)."
+    },
+    {
+      "round": 2,
+      "commit": "555c94ce60331d013cc3ee6883c023fb0f81efaa",
+      "outcome": "All targeted regression and adversarial probes passed; no new defects found."
+    },
+    {
+      "round": 3,
+      "commit": "8487b7f130996860d9de7572bfa050ace47a0505",
+      "outcome": "All five explicit invalidation paths passed. Two deliberate in-place cache-key blind spots were reproduced and classified as hardening notes after reachability review; no new production defect found."
+    },
+    {
+      "round": 4,
+      "commit": "32ef394225013d21f5c709953701197ab1d62c68",
+      "verification": {
+        "bunTest": {
+          "files": 13,
+          "pass": 288,
+          "skip": 2,
+          "fail": 0,
+          "assertions": 1220
+        },
+        "pythonUnittest": {
+          "tests": 7,
+          "failures": 0,
+          "errors": 0
+        },
+        "spotProbe": {
+          "verdict": "pass",
+          "scenario": "A real AgentSession returns two ContextUsage snapshots; the first snapshot's tokens and percent are mutated before the second read.",
+          "observed": "The second snapshot retained its original tokens and percent, and estimateCount was stable across the warm read."
+        },
+        "cliReplay": {
+          "artifact": "artifacts/context-usage-ssot-cli-replay.json",
+          "verdict": "pass",
+          "observedStdout": "ultragoal-cli-ok\n"
+        }
+      },
+      "finalContracts": {
+        "C1": "pass",
+        "C2": "pass",
+        "C3": "pass",
+        "C4": "pass",
+        "C5": "pass"
+      },
+      "outcome": "Full focused regression union, Python RPC regression suite, immutable snapshot/cache adversarial probe, and CLI replay all passed; C1-C5 pass."
+    }
+  ],
+  "surfaceEvidence": [
+    {
+      "command": "bun test packages/coding-agent/test/agent-session-context-usage-ssot.test.ts packages/coding-agent/test/context-usage-cross-surface.test.ts packages/coding-agent/test/context-usage-ssot-redteam.test.ts packages/coding-agent/test/status-line-context-cache.test.ts packages/coding-agent/test/status-line-model-percent.test.ts packages/coding-agent/test/compaction.test.ts packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts packages/coding-agent/test/acp-agent.test.ts packages/coding-agent/test/rpc-get-state-payload.test.ts",
+      "files": 9,
+      "pass": 179,
+      "skip": 2,
+      "fail": 0,
+      "assertions": 635
+    },
+    {
+      "command": "bun test packages/coding-agent/test/context-usage-ssot-redteam.test.ts",
+      "files": 1,
+      "pass": 20,
+      "skip": 0,
+      "fail": 0,
+      "assertions": 67
+    }
+  ],
+  "suites": [
+    {
+      "command": "bun test packages/coding-agent/test/agent-session-context-usage-ssot.test.ts packages/coding-agent/test/context-usage-cross-surface.test.ts packages/coding-agent/test/context-usage-ssot-redteam.test.ts packages/coding-agent/test/status-line-context-cache.test.ts packages/coding-agent/test/status-line-model-percent.test.ts packages/coding-agent/test/compaction.test.ts packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts packages/coding-agent/test/acp-agent.test.ts packages/coding-agent/test/rpc-get-state-payload.test.ts",
+      "pass": 179,
+      "skip": 2,
+      "fail": 0
+    },
+    {
+      "command": "bun test packages/coding-agent/test/context-usage-ssot-redteam.test.ts",
+      "pass": 20,
+      "skip": 0,
+      "fail": 0
+    }
+  ],
+  "contractCoverage": [
+    {
+      "id": "C1",
+      "contract": "Anchored total is provider usage plus only the heuristic trailing delta.",
+      "verdict": "pass",
+      "evidence": [
+        "packages/coding-agent/test/agent-session-context-usage-ssot.test.ts verifies provider total plus trailing messages.",
+        "packages/coding-agent/test/context-usage-ssot-redteam.test.ts verifies zero-usage, aborted, and error turns are estimated after the positive anchor."
+      ]
+    },
+    {
+      "id": "C2",
+      "contract": "The no-anchor heuristic includes fixed system, tool, and skill context.",
+      "verdict": "pass",
+      "evidence": [
+        "packages/coding-agent/test/agent-session-context-usage-ssot.test.ts verifies full heuristic totals for aborted/error-only sessions and session start.",
+        "packages/coding-agent/test/context-usage-ssot-redteam.test.ts verifies an anchor-less snapshot exceeds message-only estimation."
+      ]
+    },
+    {
+      "id": "C3",
+      "contract": "Unknown stays unknown end-to-end: breakdown usedTokens is null, report renders unknown, ACP omits it, and RPC preserves null.",
+      "verdict": "pass",
+      "evidence": [
+        "packages/coding-agent/test/agent-session-context-usage-ssot.test.ts and context-usage-cross-surface.test.ts cover post-compaction unknown usage.",
+        "packages/coding-agent/test/context-usage-ssot-redteam.test.ts verifies nullable breakdown usage, estimated non-negative free space, and unknown report text.",
+        "packages/coding-agent/test/acp-agent.test.ts and rpc-get-state-payload.test.ts cover ACP omission and RPC forwarding."
+      ]
+    },
+    {
+      "id": "C4",
+      "contract": "Anchors must be strictly after the latest compaction boundary; absent, NaN, and boundary-equal timestamps are rejected, while later non-anchor turns do not mask a valid anchor.",
+      "verdict": "pass",
+      "evidence": [
+        "packages/coding-agent/test/context-usage-ssot-redteam.test.ts: RT-TS-001 rejects timestamp-less stale usage with a real AgentSession.",
+        "packages/coding-agent/test/agent-session-context-usage-ssot.test.ts rejects stale, equal-boundary, and NaN timestamps and preserves earlier valid anchors.",
+        "packages/coding-agent/test/context-usage-ssot-redteam.test.ts runs real compact() and verifies the cached snapshot becomes unknown after its new compaction boundary."
+      ]
+    },
+    {
+      "id": "C5",
+      "contract": "Cross-surface values retain source/provenance parity, including heuristic snapshots copied verbatim into the breakdown.",
+      "verdict": "pass",
+      "evidence": [
+        "packages/coding-agent/test/context-usage-cross-surface.test.ts covers status line, context panel/report, and provider/unknown parity.",
+        "packages/coding-agent/test/context-usage-ssot-redteam.test.ts verifies breakdown.usedTokens equals the real heuristic getContextUsage().tokens snapshot exactly.",
+        "packages/coding-agent/test/status-line-context-cache.test.ts and status-line-model-percent.test.ts cover footer/status-line usage rendering and cache consumption."
+      ]
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "RT-TS-001",
+      "scenario": "A timestamp-less assistant persisted after a compaction entry represents stale pre-compaction usage.",
+      "expected": "Reject it and return unknown usage.",
+      "verdict": "pass",
+      "notes": "Real AgentSession returned { tokens: null, percent: null, source: unknown }."
+    },
+    {
+      "id": "RT-NOBOUND-002",
+      "scenario": "A timestamp-less positive-usage assistant exists in a session with no compaction boundary.",
+      "expected": "Accept it as a provider anchor for compatible legacy sessions.",
+      "verdict": "pass",
+      "notes": "Real AgentSession returned the provider total and source provider_anchor."
+    },
+    {
+      "id": "RT-MASK-003",
+      "scenario": "A positive post-compaction anchor is followed by zero-usage success, aborted, and error assistants.",
+      "expected": "Use the earlier positive anchor and estimate every later message as trailing context.",
+      "verdict": "pass",
+      "notes": "Observed provider total plus the heuristic deltas for all three later turns."
+    },
+    {
+      "id": "RT-2COMP-004",
+      "scenario": "A provider anchor falls after the first compaction but before a second, followed by a valid post-second-compaction anchor.",
+      "expected": "Reject the intermediate anchor and use the anchor strictly after the latest boundary.",
+      "verdict": "pass",
+      "notes": "Real AgentSession selected only the 150,000-token post-latest-boundary anchor."
+    },
+    {
+      "id": "RT-UNKNOWN-005",
+      "scenario": "computeContextBreakdown receives source unknown with null tokens.",
+      "expected": "Keep usedTokens null, derive non-negative free space from estimated categories, and render unknown.",
+      "verdict": "pass",
+      "notes": "usedTokens was null; freeTokens matched the clamped estimated-space arithmetic; rendered report contained unknown."
+    },
+    {
+      "id": "RT-PARITY-006",
+      "scenario": "A real session has no assistant usage anchor.",
+      "expected": "The context breakdown copies the heuristic ContextUsage snapshot exactly, including fixed context.",
+      "verdict": "pass",
+      "notes": "breakdown.usedTokens equaled getContextUsage().tokens and exceeded message-only estimation."
+    },
+    {
+      "id": "RT-DIVERGENCE-007",
+      "scenario": "Compare anchored display estimation with the anchor-less pre-prompt compaction estimator.",
+      "expected": "The display path uses the provider anchor; the anchor-less pre-prompt path inflates fixed and message estimates and can cross a threshold above display usage.",
+      "verdict": "pass",
+      "notes": "Anchored display returned the exact provider total. For an anchor-less real AgentSession, the derived compaction estimate exceeded display-with-pending usage and the midpoint threshold triggered auto_compaction_start before prompt dispatch."
+    },
+    {
+      "id": "RT-PY-SOURCE-008",
+      "scenario": "Python RPC parser receives an invalid contextUsage.source or an older payload without source.",
+      "expected": "Reject invalid values and default missing source to heuristic.",
+      "verdict": "pass",
+      "notes": "Prior round evidence: python3.11 unittest ran 7 tests, including invalid-source rejection and missing-source heuristic default coverage."
+    },
+    {
+      "id": "RT-CACHE-STALE-001",
+      "scenario": "Mutate a non-last user message's content in place after a warm heuristic snapshot, without changing message length, last-message fingerprint, or SessionManager revisions.",
+      "expected": "Determine whether the key returns a stale snapshot and assess production reachability.",
+      "verdict": "hardening-note",
+      "reachability": "Reproduced: the warm ContextUsage object was returned while an independent real AgentSession with the mutated history estimated more tokens. First-party AgentSession retry/truncation/compaction paths use replaceMessages(), and ordinary agent events append SessionManager entries, which bump entry and leaf revisions. No first-party non-last content mutation path was found. Arbitrary in-process consumers can mutate the public message references, but extension contexts do not expose them.",
+      "notes": "Not recorded as a production defect under the observed first-party mutation contract."
+    },
+    {
+      "id": "RT-CACHE-STALE-002",
+      "scenario": "Attach provider usage to the last assistant after a warm read, then flip its stopReason to aborted.",
+      "expected": "Both changes invalidate the cached value through the last-message fingerprint.",
+      "verdict": "pass",
+      "reachability": "Normal streaming/finalization mutates the active tail; usageTokens and stopReason are explicitly represented in the fingerprint.",
+      "notes": "Observed heuristic -> provider_anchor after usage attachment, then provider_anchor -> heuristic after the stopReason flip."
+    },
+    {
+      "id": "RT-CACHE-STALE-003",
+      "scenario": "replaceMessages() keeps the count and last-message shape but replaces all message objects while changing earlier content.",
+      "expected": "The new last object's WeakMap identity invalidates the cache.",
+      "verdict": "pass",
+      "reachability": "Production retry truncation, compaction rebuilds, branch/session restore, and roster filtering use replaceMessages().",
+      "notes": "SessionManager revisions were unchanged; getContextUsage() returned a new, larger snapshot solely because the replacement last object received a new fingerprint identity."
+    },
+    {
+      "id": "RT-CACHE-STALE-004",
+      "scenario": "Warm a snapshot and invoke real AgentSession.compact() mid-session.",
+      "expected": "The compaction append advances the revision key and the snapshot flips to unknown until a later assistant response.",
+      "verdict": "pass",
+      "reachability": "Production compaction appends a compaction entry through SessionManager, whose append path bumps entry and leaf revisions.",
+      "notes": "The test used the real public compact() flow with a hook-provided summary to avoid an LLM call; the post-compaction result was { tokens: null, percent: null, source: unknown }."
+    },
+    {
+      "id": "RT-CACHE-STALE-005",
+      "scenario": "Switch models while retaining the same context window.",
+      "expected": "model.id invalidates the cached snapshot even when the numerical context window is unchanged.",
+      "verdict": "pass",
+      "reachability": "Model selection and temporary fallback paths update the agent model; model.id is intentionally part of the key.",
+      "notes": "A new ContextUsage value object was computed with the same tokens and 200,000-token window."
+    },
+    {
+      "id": "RT-CACHE-STALE-006",
+      "scenario": "Replace the first system-prompt block in place with same-length CJK text after warming an anchor-less snapshot.",
+      "expected": "Determine whether the lengths-only non-message key misses a token-estimate change and assess reachability.",
+      "verdict": "hardening-note",
+      "reachability": "Reproduced: 1,000 ASCII characters and 1,000 CJK characters have the same key lengths but different heuristic token estimates, and the warm snapshot was returned. First-party paths use agent.setSystemPrompt() with rebuilt arrays; no first-party in-place part assignment was found. Third-party extensions receive getSystemPrompt(): string[] backed by this live array, so an extension can make this mutation despite the getter-oriented API.",
+      "notes": "Not recorded as a production defect under the requested hardening-note classification; its external-extension exposure should be considered if that API is expected to be mutation-safe."
+    },
+    {
+      "id": "RT-CACHE-STALE-007",
+      "scenario": "Repeatedly grow the last assistant text block after each getContextUsage() read.",
+      "expected": "Every read reflects the new tail content length.",
+      "verdict": "pass",
+      "reachability": "Streaming updates the active tail in place; contentLength and blockCount cover this hot path.",
+      "notes": "Three successive live assistant block expansions each returned a new, larger heuristic snapshot."
+    }
+  ],
+  "hardeningNotes": [
+    {
+      "id": "RT-CACHE-STALE-001",
+      "summary": "The cache key intentionally omits non-last message content, so direct non-last in-place mutations can return a stale snapshot.",
+      "verdict": "unreachable-hardening-note",
+      "productionReachability": "No first-party mutation route found; regular history rewrites replace the message array and persisted events bump SessionManager revisions."
+    },
+    {
+      "id": "RT-CACHE-STALE-006",
+      "summary": "The non-message key records only system-prompt part count and lengths, so same-length rewrites can return a stale token estimate.",
+      "verdict": "hardening-note",
+      "productionReachability": "No first-party in-place prompt-part rewrite found, but ExtensionContext.getSystemPrompt() exposes the live mutable string[] to in-process extensions."
+    }
+  ],
+  "defectsFound": []
+}

@@ -1,11 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
 import path from "node:path";
-import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
-import { zSessionNotification } from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
-import type { Model } from "@gajae-code/ai";
-import { AcpAgent } from "../src/modes/acp/acp-agent";
+import type { SessionNotification } from "@agentclientprotocol/sdk";
+import acpProtocolSchema from "@agentclientprotocol/sdk/schema/schema.json" with { type: "json" };
+import { fromJSONSchema } from "zod/v4";
+import type * as z from "zod/v4/core";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -13,9 +11,14 @@ import {
 	normalizeReplayToolArguments,
 } from "../src/modes/acp/acp-event-mapper";
 import { toAgentWireEventPayload } from "../src/modes/shared/agent-wire/event-envelope";
-import type { AgentSession, AgentSessionEvent } from "../src/session/agent-session";
-import { SessionManager } from "../src/session/session-manager";
+import type { AgentSessionEvent } from "../src/session/agent-session";
 import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-schema";
+
+const zSessionNotification = fromJSONSchema({
+	$schema: acpProtocolSchema.$schema,
+	$ref: "#/$defs/SessionNotification",
+	$defs: acpProtocolSchema.$defs,
+} as unknown as z.JSONSchema.JSONSchema);
 
 function makeAssistantMessage(text: string) {
 	return {
@@ -46,55 +49,6 @@ function expectAcpNotifications(updates: SessionNotification[]): void {
 	for (const update of updates) {
 		expectAcpStructure(zSessionNotification, update);
 	}
-}
-
-const TEST_MODEL: Model = {
-	id: "claude-sonnet-4-20250514",
-	name: "Claude Sonnet",
-	api: "anthropic-messages",
-	provider: "anthropic",
-	baseUrl: "https://example.invalid",
-	reasoning: true,
-	input: ["text", "image"],
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	contextWindow: 200_000,
-	maxTokens: 8_192,
-};
-
-class ReplayTestSession {
-	sessionManager: SessionManager;
-	sessionId: string;
-	model: Model | undefined = TEST_MODEL;
-	thinkingLevel: string | undefined;
-	customCommands: [] = [];
-	skills: [] = [];
-	extensionRunner = undefined;
-	settings = { get: (_key: string) => false };
-
-	constructor(cwd: string, sessionDir?: string) {
-		this.sessionManager = SessionManager.create(cwd, sessionDir);
-		this.sessionId = this.sessionManager.getSessionId();
-	}
-
-	getAvailableModels(): Model[] {
-		return [TEST_MODEL];
-	}
-
-	getAvailableThinkingLevels(): ReadonlyArray<string> {
-		return [];
-	}
-
-	getPlanModeState(): undefined {
-		return undefined;
-	}
-
-	setClientBridge(_bridge: unknown): void {}
-
-	subscribe(_listener: (event: AgentSessionEvent) => void): () => void {
-		return () => {};
-	}
-
-	async refreshMCPTools(_tools: unknown): Promise<void> {}
 }
 
 describe("ACP event mapper", () => {
@@ -165,6 +119,124 @@ describe("ACP event mapper", () => {
 				"session-1",
 			),
 		).toEqual([]);
+	});
+
+	it("maps model fallback switches to one ACP session notice", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "model_fallback_switched",
+				eventId: "fallback-1",
+				from: "anthropic/claude-sonnet",
+				to: "openai/gpt-5",
+				reason: "rate_limit",
+				role: "default",
+				scope: "session",
+				activeIndex: 1,
+				chainLength: 2,
+				attemptsUsed: 3,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		expect(updates[0]!.update).toEqual({
+			sessionUpdate: "session_info_update",
+			_meta: {
+				gjcModelFallbackSwitched: true,
+				gjcModelFallbackEventId: "fallback-1",
+				gjcModelFallbackFrom: "anthropic/claude-sonnet",
+				gjcModelFallbackTo: "openai/gpt-5",
+				gjcModelFallbackReason: "rate_limit",
+				gjcModelFallbackRole: "default",
+				gjcModelFallbackScope: "session",
+				gjcModelFallbackActiveIndex: 1,
+				gjcModelFallbackChainLength: 2,
+				gjcModelFallbackAttemptsUsed: 3,
+			},
+		});
+	});
+
+	it("maps automatic compaction lifecycle events to ACP session metadata", () => {
+		const start = mapAgentSessionEventToAcpSessionUpdates(
+			{ type: "auto_compaction_start", reason: "threshold", action: "context-full" } as AgentSessionEvent,
+			"session-1",
+		);
+		const end = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: undefined,
+				aborted: false,
+				willRetry: true,
+				skipped: true,
+				errorMessage: "retrying after maintenance",
+				continuationSkipReason: "auto_continue_disabled_non_resumable_tail",
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(start).toEqual([
+			{
+				sessionId: "session-1",
+				update: {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcPhase: "compacting",
+						gjcCompactionState: "start",
+						gjcCompactionTrigger: "threshold",
+						gjcCompactionAction: "context-full",
+						running: true,
+						gjcRunning: true,
+					},
+				},
+			},
+		]);
+		expect(end).toEqual([
+			{
+				sessionId: "session-1",
+				update: {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcPhase: "responding",
+						gjcCompactionState: "end",
+						gjcCompactionAction: "context-full",
+						gjcCompactionAborted: false,
+						gjcCompactionWillRetry: true,
+						gjcCompactionSkipped: true,
+						gjcCompactionErrorMessage: "retrying after maintenance",
+						gjcCompactionContinuationSkipReason: "auto_continue_disabled_non_resumable_tail",
+						running: true,
+						gjcRunning: true,
+					},
+				},
+			},
+		]);
+		expectAcpNotifications([...start, ...end]);
+	});
+
+	it("returns idle metadata when compaction finishes outside a prompt", () => {
+		const [notification] = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "auto_compaction_end",
+				action: "handoff",
+				result: undefined,
+				aborted: true,
+				willRetry: false,
+			} as AgentSessionEvent,
+			"session-1",
+			{ compactionEndPhase: "idle" },
+		);
+
+		expect(notification?.update._meta).toMatchObject({
+			gjcPhase: "idle",
+			gjcCompactionState: "end",
+			gjcCompactionAction: "handoff",
+			gjcCompactionAborted: true,
+			running: false,
+			gjcRunning: false,
+		});
+		expectAcpNotifications(notification ? [notification] : []);
 	});
 
 	it("emits final assistant text when no text deltas were observed", () => {
@@ -615,90 +687,6 @@ describe("ACP event mapper", () => {
 		}
 	});
 
-	it("replays assistant tool_use input through the ACP dispatcher without wrapping", async () => {
-		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-acp-replay-contract-"));
-		const cwd = path.join(root, "cwd");
-		const sessionDir = path.join(root, "sessions");
-		const initialSessionDir = path.join(root, "initial-session");
-		const updates: SessionNotification[] = [];
-		const sessions: ReplayTestSession[] = [];
-		const abortController = new AbortController();
-		try {
-			await fs.promises.mkdir(cwd, { recursive: true });
-			const connection = {
-				sessionUpdate: async (notification: SessionNotification) => {
-					updates.push(notification);
-				},
-				signal: abortController.signal,
-				closed: Promise.resolve(),
-			} as unknown as AgentSideConnection;
-			const agent = new AcpAgent(
-				connection,
-				async (sessionCwd: string) => {
-					const session = new ReplayTestSession(sessionCwd, sessionDir);
-					sessions.push(session);
-					return session as unknown as AgentSession;
-				},
-				new ReplayTestSession(cwd, initialSessionDir) as unknown as AgentSession,
-			);
-			const created = await agent.newSession({ cwd, mcpServers: [] });
-			const session = sessions[0]!;
-			session.sessionManager.appendMessage({
-				role: "assistant",
-				content: [
-					{
-						type: "tool_use",
-						id: "toolu_replay_input",
-						name: "bash",
-						input: { command: "echo hi" },
-					},
-				],
-				usage: {
-					input: 10,
-					output: 5,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 15,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				api: "anthropic-messages",
-				provider: "anthropic",
-				model: "claude-sonnet-4-20250514",
-				stopReason: "stop",
-				timestamp: Date.now(),
-			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
-			session.sessionManager.appendMessage({
-				role: "toolResult",
-				toolCallId: "toolu_replay_input",
-				toolName: "bash",
-				content: [{ type: "text", text: "done" }],
-				details: { terminalId: "term-replay" },
-				isError: false,
-				timestamp: Date.now(),
-			});
-
-			updates.length = 0;
-			await agent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] });
-
-			expectAcpNotifications(updates);
-			const toolCall = updates.find(update => update.update.sessionUpdate === "tool_call")?.update as
-				| { rawInput?: unknown; content?: unknown }
-				| undefined;
-			const finalUpdate = updates.find(update => update.update.sessionUpdate === "tool_call_update")?.update as
-				| { content?: unknown }
-				| undefined;
-
-			expect(toolCall?.rawInput).toEqual({ command: "echo hi" });
-			expect(toolCall?.rawInput).not.toEqual({ input: { command: "echo hi" } });
-			expect(toolCall?.content).toEqual([{ type: "content", content: { type: "text", text: "$ echo hi" } }]);
-			expect(finalUpdate?.content).toContainEqual({ type: "content", content: { type: "text", text: "$ echo hi" } });
-			expect(finalUpdate?.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
-			expect(finalUpdate?.content).toContainEqual({ type: "terminal", terminalId: "term-replay" });
-		} finally {
-			abortController.abort();
-			await fs.promises.rm(root, { recursive: true, force: true });
-		}
-	});
 	it("builds replayed bash tool calls from JSON string arguments", () => {
 		const replayArgs = normalizeReplayToolArguments(JSON.stringify({ command: "npm test", cwd: "/repo" }));
 		const update = buildToolCallStartUpdate({

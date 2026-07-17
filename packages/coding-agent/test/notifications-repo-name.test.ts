@@ -2,7 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readGitRepoName } from "../src/notifications/index";
+import { readGitRepoName } from "../src/sdk/bus/index";
 
 const tmpRoots: string[] = [];
 

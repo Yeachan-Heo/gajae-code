@@ -16,6 +16,7 @@ export type AgentKind = "main" | "sub";
 export interface AgentRef {
 	id: string;
 	displayName: string;
+	rosterLabel?: string;
 	kind: AgentKind;
 	parentId?: string;
 	status: AgentStatus;
@@ -35,6 +36,7 @@ type RegistryListener = (event: RegistryEvent) => void;
 export interface RegisterInput {
 	id: string;
 	displayName: string;
+	rosterLabel?: string;
 	kind: AgentKind;
 	parentId?: string;
 	session: AgentSession | null;
@@ -65,6 +67,7 @@ export class AgentRegistry {
 		const ref: AgentRef = {
 			id: input.id,
 			displayName: input.displayName,
+			rosterLabel: input.rosterLabel,
 			kind: input.kind,
 			parentId: input.parentId,
 			status: input.status ?? "running",

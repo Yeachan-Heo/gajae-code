@@ -1,0 +1,16 @@
+{
+	"schemaVersion": 1,
+	"kind": "cli-replay",
+	"replaySafe": true,
+	"command": ["bun", "-e", "console.log(\"g001-phase-a-cli-ok\")"],
+	"cwd": ".",
+	"env": { "LC_ALL": "C" },
+	"timeoutMs": 30000,
+	"expectedExitCode": 0,
+	"recordedStdout": "g001-phase-a-cli-ok\n",
+	"recordedStderr": "",
+	"invariants": [
+		{ "type": "substring", "value": "g001-phase-a-cli-ok" },
+		{ "type": "not_substring", "value": "error" }
+	]
+}

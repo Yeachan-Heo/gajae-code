@@ -1,0 +1,60 @@
+{
+  "status": "passed",
+  "e2eStatus": "passed",
+  "redTeamStatus": "passed",
+  "evidence": "Current full check:sdk-closure, AST inventory, release workflow, TypeScript, schema, workspace build, Rust SDK, removed-ingress, extension-source, harness, coordinator, and production-host evidence pass.",
+  "e2eCommands": [
+    "bun run check:sdk-closure",
+    "bun run check:types",
+    "bun run check:schemas",
+    "bun run build",
+    "cargo test -p gjc-sdk"
+  ],
+  "redTeamCommands": [
+    "bun packages/coding-agent/scripts/verify-gjc-sdk-canonicalization.ts --self-test",
+    "bun test packages/coding-agent/test/sdk-operation-inventory.test.ts",
+    "bun test scripts/release-publish-order.test.ts",
+    "bun test packages/coding-agent/test/sdk-removed-ingresses.test.ts packages/coding-agent/test/bot-integration-docs.test.ts"
+  ],
+  "artifactRefs": [
+    {
+      "id": "g006-final-report",
+      "schemaVersion": 1,
+      "kind": "failure-mode-test",
+      "path": "artifacts/g006-final-qa-report.json",
+      "description": "Definitive current-state G006 and aggregate AC1-AC8 verification report",
+      "inlineEvidence": "Records structural canonicalization, exact six-adapter parity, Telegram baseline, downgrade, AST inventory, release fencing, plugin exactness, and independent approval."
+    }
+  ],
+  "contractCoverage": [
+    {
+      "id": "g006-sdk-only-closure",
+      "contractRef": "G006:AC1-AC8",
+      "obligation": "Ship the canonical SDK as the only external control/viewing bus while preserving in-process TUI behavior, exact six-adapter parity, Telegram no-regression, rollback safety, first-class chat daemons, remote workflows, and release-enforced structural closure",
+      "status": "covered",
+      "surfaceEvidenceRefs": ["aggregate-sdk-closure"],
+      "adversarialCaseRefs": ["retired-ingress-and-release-bypass-redteam"]
+    }
+  ],
+  "surfaceEvidence": [
+    {
+      "id": "aggregate-sdk-closure",
+      "surface": "release",
+      "contractRef": "G006:AC1-AC8",
+      "invocation": "Run check:sdk-closure plus types, schemas, workspace build, and Rust SDK tests",
+      "verdict": "passed",
+      "artifactRefs": ["g006-final-report"]
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "retired-ingress-and-release-bypass-redteam",
+      "contractRef": "G006:AC1",
+      "scenario": "Attempt wildcard-published retired modules, renamed bridge package identity, neutral executable RPC fixtures, stale plugin extras, dead runtime RPC APIs, formatting-sensitive operation seams, and tag-publication gate bypasses",
+      "expectedBehavior": "Every retired source/import/package/fixture is rejected, every operation seam is reviewed, plugin files are exact, and tag binary/npm publication requires successful complete SDK closure",
+      "verdict": "passed",
+      "artifactRefs": ["g006-final-report"]
+    }
+  ],
+  "blockers": []
+}

@@ -1,13 +1,15 @@
 /**
  * CLI argument parsing and help display
  */
+import * as path from "node:path";
 import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai";
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@gajae-code/utils";
+import { CliParseError } from "@gajae-code/utils/cli";
 import chalk from "chalk";
 import { parseEffort } from "../thinking";
 import { BUILTIN_TOOLS } from "../tools";
 
-export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui" | "bridge";
+export type Mode = "text" | "json" | "acp";
 
 export interface Args {
 	cwd?: string;
@@ -20,8 +22,10 @@ export interface Args {
 	mpreset?: string;
 	default?: boolean;
 	apiKey?: string;
+	credential?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
+	mcpConfig?: string;
 	thinking?: Effort;
 	continue?: boolean;
 	resume?: string | true;
@@ -30,7 +34,6 @@ export interface Args {
 	mode?: Mode;
 	noSession?: boolean;
 	sessionDir?: string;
-	rpcListen?: string;
 	providerSessionId?: string;
 	fork?: string;
 	models?: string[];
@@ -56,6 +59,8 @@ export interface Args {
 	fileArgs: string[];
 	/** Retained for test/runtime compatibility; extension-defined flags are no longer parsed. */
 	unknownFlags: Map<string, boolean | string>;
+	/** Exact interactive startup login intent, recognized before model-profile activation. */
+	authBootstrap?: true;
 }
 
 function isStartupSlashCommandArg(arg: string | undefined): boolean {
@@ -65,6 +70,13 @@ function isStartupSlashCommandArg(arg: string | undefined): boolean {
 		arg === "/provicer" ||
 		arg?.startsWith("/provicer:") === true
 	);
+}
+
+function isStartupLoginCommandArg(args: readonly string[], index: number): boolean {
+	const command = args[index];
+	if (command !== "/login" && command !== "login") return false;
+	const argumentCount = args.length - index - 1;
+	return argumentCount === 0 || (argumentCount === 1 && !args[index + 1].startsWith("-"));
 }
 
 export function parseArgs(args: string[]): Args {
@@ -77,6 +89,12 @@ export function parseArgs(args: string[]): Args {
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
 
+		if (isStartupLoginCommandArg(args, i)) {
+			result.authBootstrap = true;
+			const loginCommand = arg === "login" ? "/login" : arg;
+			result.messages.push([loginCommand, ...args.slice(i + 1)].join(" "));
+			break;
+		}
 		if (isStartupSlashCommandArg(arg)) {
 			result.messages.push(args.slice(i).join(" "));
 			break;
@@ -99,15 +117,15 @@ export function parseArgs(args: string[]): Args {
 			result.allowHome = true;
 		} else if (arg === "--mode" && i + 1 < args.length) {
 			const mode = args[++i];
-			if (
-				mode === "text" ||
-				mode === "json" ||
-				mode === "rpc" ||
-				mode === "acp" ||
-				mode === "rpc-ui" ||
-				mode === "bridge"
-			) {
+			if (mode === "text" || mode === "json" || mode === "acp") {
 				result.mode = mode;
+			} else {
+				const removed = mode === "rpc" || mode === "rpc-ui" || mode === "bridge";
+				throw new CliParseError(
+					removed
+						? `--mode ${mode} was removed; external control now uses the Gajae-Code SDK (docs/sdk.md)`
+						: `invalid --mode value: ${mode} (expected text, json, or acp)`,
+				);
 			}
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
@@ -136,18 +154,31 @@ export function parseArgs(args: string[]): Args {
 			result.default = true;
 		} else if (arg === "--api-key" && i + 1 < args.length) {
 			result.apiKey = args[++i];
+		} else if (arg === "--credential") {
+			const next = args[i + 1];
+			if (!next || next.startsWith("-")) {
+				throw new CliParseError("--credential requires <selector>");
+			}
+			result.credential = args[++i];
 		} else if (arg === "--system-prompt" && i + 1 < args.length) {
 			result.systemPrompt = args[++i];
 		} else if (arg === "--append-system-prompt" && i + 1 < args.length) {
 			result.appendSystemPrompt = args[++i];
+		} else if (arg === "--mcp-config") {
+			if (result.mcpConfig !== undefined) {
+				throw new CliParseError("--mcp-config can only be specified once");
+			}
+			const next = args[i + 1];
+			if (!next || next.startsWith("-") || !path.isAbsolute(next)) {
+				throw new CliParseError("--mcp-config requires <absolute-path>");
+			}
+			result.mcpConfig = args[++i];
 		} else if (arg === "--provider-session-id" && i + 1 < args.length) {
 			result.providerSessionId = args[++i];
 		} else if (arg === "--no-session") {
 			result.noSession = true;
 		} else if (arg === "--session-dir" && i + 1 < args.length) {
 			result.sessionDir = args[++i];
-		} else if (arg === "--listen" && i + 1 < args.length) {
-			result.rpcListen = args[++i];
 		} else if (arg === "--models" && i + 1 < args.length) {
 			result.models = args[++i].split(",").map(s => s.trim());
 		} else if (arg === "--no-tools") {
@@ -210,6 +241,14 @@ export function parseArgs(args: string[]): Args {
 
 	if (result.default && !result.mpreset) {
 		throw new Error("--default requires --mpreset <name>");
+	}
+	if (
+		result.mcpConfig !== undefined &&
+		(result.mode === "acp" || result.listModels !== undefined || result.export !== undefined)
+	) {
+		throw new CliParseError(
+			"--mcp-config is only supported in standalone interactive, tmux, print, text, or json modes.",
+		);
 	}
 
 	return result;

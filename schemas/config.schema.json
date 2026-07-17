@@ -26,6 +26,20 @@
 			},
 			"additionalProperties": false
 		},
+		"session": {
+			"type": "object",
+			"properties": {
+				"directoryMigration": {
+					"type": "string",
+					"enum": [
+						"copy-retain",
+						"disabled"
+					],
+					"default": "copy-retain"
+				}
+			},
+			"additionalProperties": false
+		},
 		"notifications": {
 			"type": "object",
 			"properties": {
@@ -41,6 +55,42 @@
 						},
 						"chatId": {
 							"type": "string"
+						},
+						"activation": {
+							"type": "object",
+							"additionalProperties": true,
+							"default": {}
+						},
+						"rich": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Format Telegram notifications with rich message content.",
+									"default": true
+								}
+							},
+							"additionalProperties": false
+						},
+						"richDraft": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Include rich draft updates in Telegram notifications.",
+									"default": false
+								}
+							},
+							"additionalProperties": false
+						},
+						"topics": {
+							"type": "object",
+							"properties": {
+								"nameTemplate": {
+									"type": "string"
+								}
+							},
+							"additionalProperties": false
 						}
 					},
 					"additionalProperties": false
@@ -51,7 +101,13 @@
 						"botToken": {
 							"type": "string"
 						},
-						"channelId": {
+						"applicationId": {
+							"type": "string"
+						},
+						"guildId": {
+							"type": "string"
+						},
+						"parentChannelId": {
 							"type": "string"
 						}
 					},
@@ -63,7 +119,16 @@
 						"botToken": {
 							"type": "string"
 						},
+						"appToken": {
+							"type": "string"
+						},
+						"workspaceId": {
+							"type": "string"
+						},
 						"channelId": {
+							"type": "string"
+						},
+						"authorizedUserId": {
 							"type": "string"
 						}
 					},
@@ -71,11 +136,18 @@
 				},
 				"redact": {
 					"type": "boolean",
+					"description": "Redact sensitive content before notifications are delivered.",
 					"default": false
 				},
 				"verbosity": {
 					"type": "string",
+					"description": "Choose concise or detailed notification messages.",
 					"default": "lean"
+				},
+				"sessionScope": {
+					"type": "string",
+					"description": "Send notifications from all sessions or only the primary session.",
+					"default": "all"
 				},
 				"daemon": {
 					"type": "object",
@@ -181,7 +253,24 @@
 		},
 		"modelRoles": {
 			"type": "object",
-			"additionalProperties": true,
+			"additionalProperties": {
+				"anyOf": [
+					{
+						"type": "string",
+						"minLength": 1,
+						"pattern": "\\S"
+					},
+					{
+						"type": "array",
+						"minItems": 1,
+						"items": {
+							"type": "string",
+							"minLength": 1,
+							"pattern": "\\S"
+						}
+					}
+				]
+			},
 			"default": {}
 		},
 		"modelProfile": {
@@ -330,6 +419,22 @@
 			},
 			"additionalProperties": false
 		},
+		"pet": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"type": "string",
+					"enum": [
+						"off",
+						"red",
+						"blue"
+					],
+					"description": "16x16 real-pixel gajae living beside the composer (sixel/kitty terminals)",
+					"default": "off"
+				}
+			},
+			"additionalProperties": false
+		},
 		"tools": {
 			"type": "object",
 			"properties": {
@@ -337,6 +442,16 @@
 					"type": "number",
 					"description": "Tool output above this size is saved as an artifact; tail is kept inline",
 					"default": 50
+				},
+				"readArtifactSpillThreshold": {
+					"type": "number",
+					"description": "Advanced opt-in only: combined-size cap for `read` output across all requested ranges. Above this the full output is saved as an artifact and a bounded head+tail snippet is kept inline. Live layofflabs/gpt-5.5 medium evidence on 2026-07-07 found no token savings and a lower cache-hit rate at 50 KB, so normal coding sessions should leave this Off unless intentionally measuring large-read behavior.",
+					"default": 0
+				},
+				"fileMentionInlineBytes": {
+					"type": "number",
+					"description": "Inline byte cap for auto-read `@path` file mentions, deliberately below the read-tool cap so an incidental mention injects a smaller snippet than an explicit read. The full file is still available via the read tool.",
+					"default": 20
 				},
 				"artifactTailBytes": {
 					"type": "number",
@@ -357,6 +472,11 @@
 					"type": "number",
 					"description": "Maximum lines of tail content kept inline when output spills to artifact",
 					"default": 500
+				},
+				"maxInlineResultBytes": {
+					"type": "number",
+					"description": "Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+					"default": 0
 				},
 				"intentTracing": {
 					"type": "boolean",
@@ -477,6 +597,7 @@
 		"defaultThinkingLevel": {
 			"type": "string",
 			"enum": [
+				"off",
 				"minimal",
 				"low",
 				"medium",
@@ -665,8 +786,35 @@
 				},
 				"agentModelOverrides": {
 					"type": "object",
-					"additionalProperties": true,
+					"additionalProperties": {
+						"anyOf": [
+							{
+								"type": "string",
+								"minLength": 1,
+								"pattern": "\\S"
+							},
+							{
+								"type": "array",
+								"minItems": 1,
+								"items": {
+									"type": "string",
+									"minLength": 1,
+									"pattern": "\\S"
+								}
+							}
+						]
+					},
 					"default": {}
+				}
+			},
+			"additionalProperties": false
+		},
+		"fallback": {
+			"type": "object",
+			"properties": {
+				"maxAttempts": {
+					"type": "number",
+					"default": 3
 				}
 			},
 			"additionalProperties": false
@@ -689,7 +837,7 @@
 				},
 				"maxDelayMs": {
 					"type": "number",
-					"description": "Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+					"description": "Maximum wait between retries, in ms. Legacy retries clamp provider Retry-After hints to this value; managed fallback honors typed Retry-After hints even when they exceed it.",
 					"default": 300000
 				},
 				"requestMaxRetries": {
@@ -715,6 +863,17 @@
 					],
 					"description": "When to return to the primary model after a fallback",
 					"default": "cooldown-expiry"
+				}
+			},
+			"additionalProperties": false
+		},
+		"mouse": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Enable SGR mouse wheel scrolling and overlay row selection. Disabled in tmux and screen.",
+					"default": false
 				}
 			},
 			"additionalProperties": false
@@ -808,7 +967,7 @@
 				},
 				"checkUpdate": {
 					"type": "boolean",
-					"description": "If false, skip update check",
+					"description": "At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
 					"default": true
 				}
 			},
@@ -964,6 +1123,14 @@
 				},
 				"remoteEndpoint": {
 					"type": "string"
+				},
+				"maintenancePruningEnabled": {
+					"type": "boolean",
+					"default": false
+				},
+				"maintenancePruningMinSavingsTokens": {
+					"type": "number",
+					"default": 8000
 				},
 				"idleEnabled": {
 					"type": "boolean",
@@ -1219,7 +1386,7 @@
 						"discard",
 						"keep"
 					],
-					"description": "What to do with partial output when TTSR triggers",
+					"description": "What to do with partial output when TTSR triggers. 'discard' (recommended) drops the aborted partial turn so it never accumulates in context. 'keep' retains every aborted partial turn, which grows the token footprint each time a rule fires — prefer 'discard' unless you specifically need the partial output.",
 					"default": "discard"
 				},
 				"interruptMode": {
@@ -1596,6 +1763,17 @@
 					"type": "boolean",
 					"description": "Enable agent-to-agent IRC messaging via the irc tool",
 					"default": true
+				},
+				"sidebar": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Enable the IRC message sidebar (opens with the toggle key; starts closed)",
+							"default": true
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false
@@ -1804,6 +1982,25 @@
 					"type": "string",
 					"description": "Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)"
 				},
+				"profileReuse": {
+					"type": "string",
+					"description": "'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+					"default": "auto"
+				},
+				"geo": {
+					"type": "object",
+					"properties": {
+						"timezone": {
+							"type": "string",
+							"description": "Optional IANA timezone (e.g. 'America/New_York') for headless sessions. Default unset preserves the real timezone. Only set this to a value coherent with your egress (e.g. a proxy region); an incoherent timezone increases bot detection."
+						},
+						"locale": {
+							"type": "string",
+							"description": "Optional UI locale (e.g. 'en-US') for headless sessions. Default unset preserves the real locale. Only set this coherently with your egress region."
+						}
+					},
+					"additionalProperties": false
+				},
 				"gc": {
 					"type": "object",
 					"properties": {
@@ -1952,6 +2149,17 @@
 				"notificationDebounceMs": {
 					"type": "number",
 					"default": 500
+				}
+			},
+			"additionalProperties": false
+		},
+		"tasksPane": {
+			"type": "object",
+			"properties": {
+				"defaultVisible": {
+					"type": "boolean",
+					"description": "Open the unified tasks pane when the interactive UI starts",
+					"default": false
 				}
 			},
 			"additionalProperties": false

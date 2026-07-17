@@ -1,7 +1,7 @@
 import type { StatusLinePreset, StatusLineSegmentId, StatusLineSeparatorStyle } from "../../../config/settings-schema";
 import type { AgentSession } from "../../../session/agent-session";
 import type { JobsSnapshot } from "../../jobs-observer";
-import type { StatusLineSegmentOptions, StatusLineSettings } from "../status-line";
+import type { StatusLineSegmentOptions, StatusLineSettings } from "../tool-status-header";
 
 export type {
 	StatusLinePreset,
@@ -39,8 +39,14 @@ export interface SegmentContext {
 		cost: number;
 		tokensPerSecond: number | null;
 	};
-	contextPercent: number;
+	contextPercent: number | null;
 	contextWindow: number;
+	/**
+	 * True when a standalone `context_pct` segment is also part of the active
+	 * layout. The model segment suppresses its inline percentage in that case to
+	 * avoid showing the same value twice.
+	 */
+	contextPctSegmentActive?: boolean;
 	autoCompactEnabled: boolean;
 	subagentCount: number;
 	jobs: JobsSnapshot;

@@ -8,117 +8,22 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection, InitializeRequest } from "@agentclientprotocol/sdk";
-import { zInitializeResponse } from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
-import type { Model } from "@gajae-code/ai";
+import acpProtocolSchema from "@agentclientprotocol/sdk/schema/schema.json" with { type: "json" };
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { fromJSONSchema } from "zod/v4";
+import type * as z from "zod/v4/core";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { ACP_TERMINAL_AUTH_FLAG, prepareAcpTerminalAuthArgs } from "../src/modes/acp/terminal-auth";
-import type { AgentSession } from "../src/session/agent-session";
-import { SessionManager } from "../src/session/session-manager";
 import { expectAcpStructure } from "./helpers/acp-schema";
-
-const TEST_MODELS: Model[] = [
-	{
-		id: "claude-sonnet-4-20250514",
-		name: "Claude Sonnet",
-		api: "anthropic-messages",
-		provider: "anthropic",
-		baseUrl: "https://example.invalid",
-		reasoning: true,
-		input: ["text", "image"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 200_000,
-		maxTokens: 8_192,
-	},
-];
-
-class FakeAgentSession {
-	sessionManager: SessionManager;
-	sessionId: string;
-	agent: { sessionId: string; waitForIdle: () => Promise<void> };
-	model: Model | undefined = TEST_MODELS[0];
-	thinkingLevel: string | undefined;
-	customCommands: [] = [];
-	extensionRunner = undefined;
-	isStreaming = false;
-	queuedMessageCount = 0;
-	systemPrompt = "system";
-	disposed = false;
-	settings = { get: (_path: string) => false };
-
-	constructor(cwd: string) {
-		this.sessionManager = SessionManager.create(cwd);
-		this.sessionId = this.sessionManager.getSessionId();
-		this.agent = { sessionId: this.sessionId, waitForIdle: async () => {} };
-	}
-
-	get sessionName(): string {
-		return this.sessionManager.getHeader()?.title ?? `Session ${this.sessionId}`;
-	}
-
-	get modelRegistry(): { getApiKey: (model: Model) => Promise<string> } {
-		return { getApiKey: async (_model: Model) => "test-key" };
-	}
-
-	getAvailableModels(): Model[] {
-		return TEST_MODELS;
-	}
-
-	getAvailableThinkingLevels(): ReadonlyArray<string> {
-		return ["low", "medium", "high"];
-	}
-
-	setThinkingLevel(): void {}
-	async setModel(): Promise<void> {}
-	subscribe(): () => void {
-		return () => {};
-	}
-	async prompt(): Promise<void> {}
-	async abort(): Promise<void> {}
-	async refreshMCPTools(): Promise<void> {}
-	getContextUsage(): undefined {
-		return undefined;
-	}
-	async switchSession(): Promise<boolean> {
-		return false;
-	}
-	async dispose(): Promise<void> {
-		this.disposed = true;
-		await this.sessionManager.close();
-	}
-	async reload(): Promise<void> {}
-	async newSession(): Promise<boolean> {
-		return false;
-	}
-	async branch(): Promise<{ cancelled: boolean }> {
-		return { cancelled: false };
-	}
-	async navigateTree(): Promise<{ cancelled: boolean }> {
-		return { cancelled: false };
-	}
-	getActiveToolNames(): string[] {
-		return [];
-	}
-	getAllToolNames(): string[] {
-		return [];
-	}
-	setActiveToolsByName(): void {}
-	setClientBridge(): void {}
-	getPlanModeState(): undefined {
-		return undefined;
-	}
-	setPlanModeState(): void {}
-	async sendCustomMessage(): Promise<void> {}
-	async sendUserMessage(): Promise<void> {}
-	async compact(): Promise<void> {}
-	async fork(): Promise<boolean> {
-		return false;
-	}
-}
 
 const cleanupRoots: string[] = [];
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+const zInitializeResponse = fromJSONSchema({
+	$schema: acpProtocolSchema.$schema,
+	$ref: "#/$defs/InitializeResponse",
+	$defs: acpProtocolSchema.$defs,
+} as unknown as z.JSONSchema.JSONSchema);
 
 afterEach(async () => {
 	if (originalAgentDir) {
@@ -148,9 +53,7 @@ async function createAgent(): Promise<AcpAgent> {
 		closed: Promise.withResolvers<void>().promise,
 	} as unknown as AgentSideConnection;
 
-	const initialSession = new FakeAgentSession(cwd);
-	const factory = async (next: string): Promise<AgentSession> => new FakeAgentSession(next) as unknown as AgentSession;
-	return new AcpAgent(connection, factory, initialSession as unknown as AgentSession);
+	return new AcpAgent(connection, { agentDir });
 }
 
 function buildInitializeRequest(overrides: Partial<InitializeRequest> = {}): InitializeRequest {
@@ -227,22 +130,23 @@ describe("ACP initialize conformance", () => {
 		expect(response.agentInfo!.version).toBe(pkg.version);
 	});
 
-	it("preserves the agentCapabilities contract clients depend on", async () => {
+	it("advertises only SDK-backed ACP capabilities", async () => {
 		const agent = await createAgent();
 		const response = await agent.initialize(buildInitializeRequest());
 		expectAcpStructure(zInitializeResponse, response);
 		expect(response.agentCapabilities).toEqual(
 			expect.objectContaining({
 				loadSession: true,
-				mcpCapabilities: expect.objectContaining({ http: true, sse: true }),
 				promptCapabilities: expect.objectContaining({ embeddedContext: true, image: true }),
 				sessionCapabilities: expect.objectContaining({
 					list: expect.any(Object),
 					fork: expect.any(Object),
 					resume: expect.any(Object),
 					close: expect.any(Object),
+					delete: expect.any(Object),
 				}),
 			}),
 		);
+		expect(response.agentCapabilities).not.toHaveProperty("mcpCapabilities");
 	});
 });

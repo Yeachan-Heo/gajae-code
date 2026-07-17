@@ -11,6 +11,26 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 
+function isRetryableRemoveError(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	const code = (error as { code?: unknown }).code;
+	return code === "EBUSY" || code === "ENOTEMPTY";
+}
+
+async function removeTempDirWithRetry(dir: TempDir): Promise<void> {
+	for (let attempt = 0; attempt < 20; attempt += 1) {
+		try {
+			dir.removeSync();
+			return;
+		} catch (error) {
+			if (attempt === 19 || !isRetryableRemoveError(error)) {
+				throw error;
+			}
+			await Bun.sleep(50 * (attempt + 1));
+		}
+	}
+}
+
 /**
  * Issue #434 — queued prompts while the agent is busy.
  *
@@ -39,7 +59,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			session = undefined;
 		}
 		authStorage.close();
-		tempDir.removeSync();
+		await removeTempDirWithRetry(tempDir);
 	});
 
 	function buildSession(responses: MockHandler[]): AgentSession {
@@ -106,6 +126,35 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		expect(session.getQueuedMessages().followUp).toEqual(["p2", "p3"]);
 		expect(session.getQueuedMessages().steering).toEqual([]);
 		expect(assistantCount(session)).toBe(0);
+
+		gate.resolve();
+		await first;
+		await session.waitForIdle();
+
+		expect(userTexts(session)).toEqual(["p1", "p2", "p3"]);
+		expect(assistantCount(session)).toBe(3);
+		expect(session.queuedMessageCount).toBe(0);
+	});
+
+	it("keeps explicit composer queue prompts sequential even when follow-up mode batches", async () => {
+		const gate = Promise.withResolvers<void>();
+		session = buildSession([
+			async () => {
+				await gate.promise;
+				return { content: ["turn 1"] };
+			},
+			{ content: ["turn 2"] },
+			{ content: ["turn 3"] },
+		]);
+		session.setFollowUpMode("all");
+
+		const first = session.prompt("p1");
+		await waitUntil(() => session!.isStreaming);
+
+		await session.prompt("p2", { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
+		await session.prompt("p3", { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
+
+		expect(session.getQueuedMessages().followUp).toEqual(["p2", "p3"]);
 
 		gate.resolve();
 		await first;

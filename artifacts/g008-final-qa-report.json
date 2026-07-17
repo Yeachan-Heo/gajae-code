@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "kind": "failure-mode-test",
+  "status": "passed",
+  "e2eStatus": "passed",
+  "redTeamStatus": "passed",
+  "generatedAt": "2026-07-11",
+  "architectVerdict": "CLEAR / APPROVE — QA PASS",
+  "architectReceipt": "agent://149-G008SymlinkClear",
+  "cleanerReceipt": "agent://148-G008CleanerFinal",
+  "verification": [
+    { "command": "bun test test/sdk-adapter-dispositions.test.ts", "result": "273 pass, 0 fail, 323 expect() calls" },
+    { "command": "bun test test/sdk-machine-lifecycle-topology.test.ts", "result": "3 pass, 0 fail, 152 expect() calls" },
+    { "command": "bun test test/sdk-broker-lifecycle-e2e.test.ts test/sdk-broker.test.ts", "result": "14 pass, 0 fail, 55 expect() calls" },
+    { "command": "bun test test/sdk-host-wiring.test.ts test/sdk-query-pagination.test.ts test/sdk-downgrade-rollback.test.ts", "result": "30 pass, 0 fail, 193 expect() calls" },
+    { "command": "bun run check:types", "result": "passed" },
+    { "command": "bun scripts/verify-gjc-sdk-canonicalization.ts --self-test", "result": "passed; 3 sanctioned server hosts" },
+    { "command": "bun scripts/generate-sdk-operation-inventory.ts --check", "result": "passed; 324 records, pending=0" },
+    { "command": "cargo test -p gjc-sdk", "result": "99 passed, 0 failed" },
+    { "command": "bun scripts/run-test-manifest.ts test/manifests/telegram-baseline-v1.json", "result": "passed full Telegram baseline" }
+  ],
+  "adversarialCoverage": [
+    "oversized per-session frames isolated",
+    "nested authorization/credential secret rejection",
+    "permission provider disconnect remains fail-closed",
+    "lifecycle replay/conflict/readiness/close/delete through shipped ACP/MCP/daemon",
+    "PID incarnation reuse and terminal uncertainty",
+    "session delete cross-ID/outside-root/symlink escape",
+    "arbitrary UTF-8 byte offsets and oversized root/item pagination",
+    "pinned old product consumes transformed endpoint and replies through it"
+  ],
+  "blockers": []
+}

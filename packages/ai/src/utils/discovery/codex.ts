@@ -1,10 +1,10 @@
 import * as z from "zod/v4";
+import { resolveCodexGpt56DiscoveryContext } from "../../context-cap-policy";
 import { CODEX_BASE_URL, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "../../providers/openai-codex/constants";
 import type { Model } from "../../types";
 import { isRecord } from "../../utils";
 
 const DEFAULT_MODEL_LIST_PATHS = ["/codex/models", "/models"] as const;
-const DEFAULT_CONTEXT_WINDOW = 272_000;
 const DEFAULT_MAX_TOKENS = 128_000;
 const DEFAULT_CODEX_CLIENT_VERSION = "0.99.0";
 const NPM_CODEX_LATEST_URL = "https://registry.npmjs.org/@openai%2Fcodex/latest";
@@ -258,7 +258,8 @@ function normalizeCodexModelEntry(entry: unknown, baseUrl: string): NormalizedCo
 	}
 
 	const name = toNonEmptyString(payload.display_name) ?? slug;
-	const contextWindow = toPositiveInt(payload.context_window) ?? DEFAULT_CONTEXT_WINDOW;
+	const modelIdentity = { id: slug, api: "openai-codex-responses", provider: "openai-codex" } as const;
+	const contextWindow = resolveCodexGpt56DiscoveryContext(modelIdentity, payload.context_window);
 	const maxTokens = Math.min(DEFAULT_MAX_TOKENS, contextWindow);
 	const reasoning = supportsReasoning(payload.default_reasoning_level, payload.supported_reasoning_levels);
 	const input = normalizeInputModalities(payload.input_modalities);
@@ -344,16 +345,6 @@ function toNonEmptyString(value: unknown): string | null {
 	}
 	const trimmed = value.trim();
 	return trimmed.length > 0 ? trimmed : null;
-}
-
-function toPositiveInt(value: unknown): number | null {
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		return null;
-	}
-	if (value <= 0) {
-		return null;
-	}
-	return Math.trunc(value);
 }
 
 function toFiniteNumber(value: unknown): number | null {

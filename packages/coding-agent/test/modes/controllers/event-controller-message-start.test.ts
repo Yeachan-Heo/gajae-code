@@ -1,10 +1,12 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import type { TextContent, UserMessage } from "@gajae-code/ai";
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
+import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
 import type { CustomMessage } from "@gajae-code/coding-agent/session/messages";
+
 import { Container } from "@gajae-code/tui";
 
 beforeAll(() => {
@@ -24,6 +26,7 @@ function createContext(options: {
 	editorText: string;
 	optimisticSignature?: string;
 	locallySubmittedSignatures?: string[];
+	injectedSignatures?: Array<[string, number]>;
 }) {
 	let currentEditorText = options.editorText;
 	const setText = vi.fn((text: string) => {
@@ -52,6 +55,7 @@ function createContext(options: {
 						.join(""),
 		optimisticUserMessageSignature: options.optimisticSignature,
 		locallySubmittedUserSignatures: new Set<string>(options.locallySubmittedSignatures ?? []),
+		optimisticInjectedSignatures: new Map<string, number>(options.injectedSignatures ?? []),
 	} as unknown as InteractiveModeContext;
 	return { ctx, editor, setText, addMessageToChat, updatePendingMessagesDisplay };
 }
@@ -118,6 +122,98 @@ describe("EventController message_start (user role)", () => {
 		expect(setText).not.toHaveBeenCalled();
 		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
 	});
+
+	it("prefers local optimistic slot over matching injected map entry", async () => {
+		const message = createUserMessage("coexisting optimistic");
+		const signature = "coexisting optimistic\u00000";
+		const { ctx, setText, addMessageToChat } = createContext({
+			editorText: "",
+			optimisticSignature: signature,
+			locallySubmittedSignatures: [signature],
+			injectedSignatures: [[signature, 1]],
+		});
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({ type: "message_start", message });
+
+		expect(addMessageToChat).not.toHaveBeenCalled();
+		expect(setText).not.toHaveBeenCalled();
+		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
+		expect(ctx.optimisticInjectedSignatures.get(signature)).toBe(1);
+		expect(ctx.optimisticInjectedSignatures.size).toBe(1);
+	});
+
+	it("consumes a pending injected optimistic signature and preserves the draft", async () => {
+		// Injected (e.g. Telegram) messages record a pending injected optimistic signature
+		// (counting Map) via applyInjectedUserSubmission. message_start must consume it,
+		// skip the duplicate chat add, and NOT clear the local draft.
+		const message = createUserMessage("remote injected");
+		const signature = "remote injected\u00000";
+		const { ctx, editor, setText, addMessageToChat } = createContext({
+			editorText: "local draft in progress",
+			injectedSignatures: [[signature, 1]],
+		});
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({ type: "message_start", message });
+
+		expect(addMessageToChat).not.toHaveBeenCalled();
+		expect(setText).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("local draft in progress");
+		expect(ctx.optimisticInjectedSignatures.size).toBe(0);
+	});
+
+	it("de-dupes two back-to-back idle injections without duplicating chat or clearing the draft", async () => {
+		// Regression for the single-slot race: two idle injections were optimistically
+		// rendered before the first message_start; with a single slot the first message_start
+		// re-added a duplicate bubble and cleared the draft. The counting Map fixes this.
+		const first = createUserMessage("first remote");
+		const second = createUserMessage("second remote");
+		const { ctx, editor, setText, addMessageToChat } = createContext({
+			editorText: "local draft in progress",
+			injectedSignatures: [
+				["first remote\u00000", 1],
+				["second remote\u00000", 1],
+			],
+		});
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({ type: "message_start", message: first });
+		await controller.handleEvent({ type: "message_start", message: second });
+
+		// Neither injected message_start re-adds a bubble (both were rendered optimistically).
+		expect(addMessageToChat).not.toHaveBeenCalled();
+		// The local draft is never cleared by either injected message_start.
+		expect(setText).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("local draft in progress");
+		// Both pending injected signatures are fully consumed.
+		expect(ctx.optimisticInjectedSignatures.size).toBe(0);
+	});
+
+	it("consumes only the injected map and leaves a coexisting local optimistic slot untouched", async () => {
+		// Coexistence guard: a local optimistic submission is pending (single slot) while an
+		// injected message with a DIFFERENT signature arrives. The injected message_start must
+		// consume only the injected map entry and must NOT clear the unrelated local slot.
+		const injectedMessage = createUserMessage("remote injected");
+		const injectedSignature = "remote injected\u00000";
+		const localSignature = "local pending\u00000";
+		const { ctx, editor, setText, addMessageToChat } = createContext({
+			editorText: "local draft in progress",
+			optimisticSignature: localSignature,
+			injectedSignatures: [[injectedSignature, 1]],
+		});
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({ type: "message_start", message: injectedMessage });
+
+		expect(addMessageToChat).not.toHaveBeenCalled();
+		expect(setText).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("local draft in progress");
+		// The local optimistic slot is NOT cleared by the injected match.
+		expect(ctx.optimisticUserMessageSignature).toBe(localSignature);
+		// The injected entry is consumed.
+		expect(ctx.optimisticInjectedSignatures.size).toBe(0);
+	});
 });
 
 function createIrcMessage(timestamp: number): CustomMessage<{ from: string; message: string }> {
@@ -140,14 +236,28 @@ function createIrcContext() {
 		updateEditorTopBorder: vi.fn(),
 		ui: { requestRender },
 		chatContainer,
+		settings: { get: () => true },
+		captureIrcArrivalSnapshot: () => ({
+			panelVisible: true,
+			panelRequestedVisible: true,
+			sidebarAvailable: true,
+			resolvedToggleKey: "Alt+I",
+		}),
+		ircLedger: new IrcObservationLedger(),
 		session: {},
 	} as unknown as InteractiveModeContext;
 	const helpers = new UiHelpers(ctx);
+	ctx.removeRenderedIrcInlineComponents = observationId => helpers.removeRenderedIrcInlineComponents(observationId);
+	ctx.resetRenderedIrcInlineComponents = () => helpers.resetRenderedIrcInlineComponents();
 	const addMessageToChat: InteractiveModeContext["addMessageToChat"] = vi.fn((message, options) =>
 		helpers.addMessageToChat(message, options),
 	);
 	ctx.addMessageToChat = addMessageToChat;
-	return { ctx, chatContainer, requestRender, addMessageToChat };
+	const addLiveIrcObservationToChat: InteractiveModeContext["addLiveIrcObservationToChat"] = vi.fn(
+		(message, arrival) => helpers.addLiveIrcObservationToChat(message, arrival),
+	);
+	ctx.addLiveIrcObservationToChat = addLiveIrcObservationToChat;
+	return { ctx, chatContainer, requestRender, addMessageToChat, addLiveIrcObservationToChat };
 }
 
 describe("EventController IRC expiry", () => {
@@ -178,13 +288,13 @@ describe("EventController IRC expiry", () => {
 	it("does not schedule duplicate expiry for duplicate IRC events", async () => {
 		vi.useFakeTimers();
 		const message = createIrcMessage(2);
-		const { ctx, chatContainer, addMessageToChat } = createIrcContext();
+		const { ctx, chatContainer, addLiveIrcObservationToChat } = createIrcContext();
 		const controller = new EventController(ctx);
 
 		await controller.handleEvent({ type: "irc_message", message });
 		await controller.handleEvent({ type: "irc_message", message });
 
-		expect(addMessageToChat).toHaveBeenCalledTimes(1);
+		expect(addLiveIrcObservationToChat).toHaveBeenCalledTimes(1);
 		expect(chatContainer.children).toHaveLength(2);
 		vi.advanceTimersByTime(10_000);
 		expect(chatContainer.children).toHaveLength(0);

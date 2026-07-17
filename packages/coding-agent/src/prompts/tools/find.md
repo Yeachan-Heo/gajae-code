@@ -25,10 +25,10 @@ Matching file paths sorted by modification time (most recent first). Truncated a
 </examples>
 
 <avoid>
-For open-ended searches requiring multiple rounds of globbing and searching, you MUST use Task tool instead.
+For open-ended searches requiring multiple rounds of globbing and searching, delegate a bounded fact-finding task to an appropriate canonical role agent (`planner` for sequencing/context maps or `architect` for read-only architecture assessment) instead.
 </avoid>
 
 <critical>
-- You MUST use the built-in Find tool for every file-name lookup. NEVER shell out to `find`, `fd`, `locate`, `ls`, or `git ls-files` via Bash — they ignore `.gitignore`, blow past result limits, and waste tokens.
-- If you catch yourself typing `find -name`, `fd`, or `ls **/*.ext` in a Bash command, stop and re-issue the lookup through the Find tool with a glob pattern instead.
+- Use separate array entries for multiple path globs.
+- Set `gitignore: false` only when ignored files are intentionally in scope.
 </critical>

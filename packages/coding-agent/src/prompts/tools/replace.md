@@ -12,25 +12,6 @@ Returns success/failure status. On success, file modified in place with replacem
 </output>
 
 <critical>
-- You MUST read the file at least once in the conversation before editing. Tool errors if you attempt edit without reading file first.
+- You MUST read the file at least once in the conversation before editing.
+- Use Replace when the _content itself_ identifies the location. For position-addressed changes (append, insert at line N, delete a line range), use the `write` or line-anchored edit tools — NEVER `cat`/`sed` pipelines.
 </critical>
-
-<bash-alternatives>
-Replace for content-addressed changes—you identify \_what* to change by its text.
-
-For position-addressed or pattern-addressed changes, bash more efficient:
-
-|Operation|Command|
-|---|---|
-|Append to file|`cat >> file <<'EOF'`…`EOF`|
-|Prepend to file|`{ cat - file; } <<'EOF' > tmp && mv tmp file`|
-|Delete lines N-M|`sed -i 'N,Md' file`|
-|Insert after line N|`sed -i 'Na\text' file`|
-|Regex replace|`sd 'pattern' 'replacement' file`|
-|Bulk replace across files|`sd 'pattern' 'replacement' **/*.ts`|
-|Copy lines N-M to another file|`sed -n 'N,Mp' src >> dest`|
-|Move lines N-M to another file|`sed -n 'N,Mp' src >> dest && sed -i 'N,Md' src`|
-
-Use Replace when _content itself_ identifies location.
-Use bash when _position_ or _pattern_ identifies what to change.
-</bash-alternatives>

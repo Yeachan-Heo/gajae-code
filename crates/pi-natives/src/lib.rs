@@ -38,13 +38,14 @@ pub mod highlight;
 pub mod html;
 pub mod keys;
 pub mod linediff;
-pub mod notifications;
+pub mod sdk;
 pub mod sixel;
 pub use pi_ast::language;
 
 pub mod power;
 
 pub mod iso;
+pub mod path_identity;
 pub mod prof;
 pub mod ps;
 pub mod pty;
@@ -73,5 +74,5 @@ use napi_derive::napi;
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_8_1")]
+#[napi(js_name = "__piNativesV0_11_1")]
 pub const fn pi_natives_version_sentinel() {}

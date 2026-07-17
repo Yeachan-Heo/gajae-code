@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { type RateLimitItem, RateLimitPool } from "../src/notifications/rate-limit-pool";
+import { type RateLimitItem, RateLimitPool } from "../src/sdk/bus/rate-limit-pool";
 
 function item(
 	sessionId: string,
@@ -70,6 +70,37 @@ describe("RateLimitPool", () => {
 		pool.submit(item("s2", "live", "b", "k"));
 		pool.submit(item("s1", "live", "c", "other"));
 		expect(pool.pending).toBe(3);
+	});
+
+	test("expires elapsed items before granting without consuming their token", () => {
+		const pool = new RateLimitPool<string>({ capacity: 1, refillPerSec: 0, now: () => 0 });
+		pool.submit({ ...item("s1", "ask", "expired"), itemId: "receipt-expired", deadlineAt: 100 });
+		pool.submit({ ...item("s2", "ask", "live"), itemId: "receipt-live", deadlineAt: 200 });
+
+		const result = pool.drainWithExpired(100);
+		expect(result.expired.map(i => i.payload)).toEqual(["expired"]);
+		expect(result.granted.map(i => i.payload)).toEqual(["live"]);
+		expect(pool.availableTokens(100)).toBe(0);
+		expect(pool.drain(200)).toEqual([]);
+	});
+
+	test("removes exactly the identified queued item and returns its payload", () => {
+		const pool = new RateLimitPool<string>({ capacity: 2, refillPerSec: 0, now: () => 0 });
+		pool.submit({ ...item("s1", "ask", "first"), itemId: "receipt-1" });
+		pool.submit({ ...item("s1", "ask", "second"), itemId: "receipt-2" });
+
+		expect(pool.removeById("receipt-2")).toMatchObject({ itemId: "receipt-2", payload: "second" });
+		expect(pool.removeById("receipt-2")).toBeUndefined();
+		expect(pool.drain(0).map(i => i.payload)).toEqual(["first"]);
+	});
+
+	test("does not coalesce identified jobs", () => {
+		const pool = new RateLimitPool<string>({ capacity: 2, refillPerSec: 0, now: () => 0 });
+		pool.submit({ ...item("s1", "ask", "first", "same-key"), itemId: "receipt-1" });
+		pool.submit({ ...item("s1", "ask", "second", "same-key"), itemId: "receipt-2" });
+
+		expect(pool.pending).toBe(2);
+		expect(pool.drain(0).map(i => i.payload)).toEqual(["first", "second"]);
 	});
 
 	test("removes matching queued items without consuming tokens", () => {

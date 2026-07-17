@@ -6,18 +6,59 @@
 import { createInterface } from "node:readline/promises";
 import { APP_NAME } from "@gajae-code/utils/dirs";
 import chalk from "chalk";
-import type { Settings } from "../config/settings";
-import { getNotificationConfig, maskToken } from "../notifications/config";
+import { Settings, type SettingsAtomicPatch } from "../config/settings";
+import { type EnsureChatDaemonResult, ensureDiscordDaemon, ensureSlackDaemon } from "../sdk/bus/chat-daemon-control";
+import { getNotificationConfig, maskToken, tokenFingerprint } from "../sdk/bus/config";
+import {
+	clearTelegramActivationMarker,
+	createTelegramActivationMarker,
+	observedTelegramActivationMarker,
+	type ProposedTelegramIdentity,
+	persistTelegramActivationMarker,
+	proposedTelegramIdentity,
+	reconcileCommittedTelegramConfiguration,
+} from "../sdk/bus/notification-orchestration";
+import {
+	buildNotificationStatusReport,
+	checkNotificationHealth,
+	formatNotificationHealthReport,
+	formatNotificationRecoveryReport,
+	formatNotificationStatusReport,
+	formatNotificationTestResult,
+	recoverNotifications,
+	sanitizeDiagnostic,
+	sendNotificationTest,
+} from "../sdk/bus/notification-service";
+import { ensureTelegramDaemonRunningDetailed, readDaemonState } from "../sdk/bus/telegram-daemon";
+import { runDaemonInternal } from "../sdk/bus/telegram-daemon-cli";
+import {
+	runTelegramSetup as runTelegramPairingSetup,
+	type TelegramSetupPreflight,
+	type TelegramSetupTimers,
+} from "../sdk/bus/telegram-setup";
 
-export type NotifyAction = "setup" | "status" | "daemon-internal";
+export type NotifyAction = "setup" | "status" | "health" | "test" | "recovery" | "daemon-internal";
+export type NotifySetupProvider = "telegram" | "discord" | "slack";
 
 export interface NotifyCommandArgs {
 	action: NotifyAction;
 	smoke?: boolean;
 	rawArgs: string[];
+	provider?: NotifySetupProvider;
 	token?: string;
 	chatId?: string;
+	discordBotToken?: string;
+	discordApplicationId?: string;
+	discordGuildId?: string;
+	discordParentChannelId?: string;
+	slackBotToken?: string;
+	slackAppToken?: string;
+	slackWorkspaceId?: string;
+	slackChannelId?: string;
+	slackAuthorizedUserId?: string;
 	redact?: boolean;
+	probe?: boolean;
+	message?: string;
 }
 
 export interface NotifyCommandDeps {
@@ -31,44 +72,21 @@ export interface NotifyCommandDeps {
 	setupRedact?: boolean;
 	setupInteractive?: boolean;
 	threadedModePrompt?: (message: string) => Promise<string>;
+	tokenPrompt?: () => Promise<string>;
+	setExitCode?: (code: number) => void;
+	exitProcess?: (code: number) => void;
+	valuePrompt?: (label: string, masked: boolean) => Promise<string>;
+	/** Optional daemon ownership facts collected by an embedding host. */
+	setupPreflight?: TelegramSetupPreflight;
+	/** Injectable timers and cancellation for setup pairing. */
+	setupTimers?: TelegramSetupTimers;
+	setupAbortSignal?: AbortSignal;
+	setupPidAlive?: (pid: number) => boolean;
+	ensureProviderDaemon?: (
+		provider: "discord" | "slack",
+		settings: Settings,
+	) => Promise<EnsureChatDaemonResult | "failed">;
 }
-
-interface TelegramApiResponse<T> {
-	ok: boolean;
-	result?: T;
-	description?: string;
-}
-
-interface TelegramUpdate {
-	update_id: number;
-	message?: {
-		chat?: {
-			id?: number | string;
-			type?: string;
-		};
-	};
-}
-
-interface TelegramUser {
-	id: number;
-	is_bot?: boolean;
-	first_name?: string;
-	username?: string;
-	has_topics_enabled?: boolean;
-	allows_users_to_create_topics?: boolean;
-}
-
-interface TelegramChat {
-	id?: number | string;
-	type?: string;
-}
-
-type ThreadedModeState = "enabled" | "disabled" | "unknown";
-type ThreadedModeFinalLabel = "verified" | "unverified" | "unknown";
-
-const DEFAULT_API_BASE = "https://api.telegram.org";
-const DEFAULT_POLL_TIMEOUT_MS = 60_000;
-const DEFAULT_POLL_INTERVAL_MS = 1_000;
 
 export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
 	if (args.length === 0 || args[0] !== "notify") {
@@ -82,12 +100,62 @@ export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
 			const i = rest.indexOf(name);
 			return i >= 0 ? rest[i + 1] : undefined;
 		};
+		const valueFlags = [
+			"--token",
+			"--chat-id",
+			"--discord-bot-token",
+			"--discord-application-id",
+			"--discord-guild-id",
+			"--discord-parent-channel-id",
+			"--slack-bot-token",
+			"--slack-app-token",
+			"--slack-workspace-id",
+			"--slack-channel-id",
+			"--slack-authorized-user-id",
+		];
+		if (
+			valueFlags.some(name => {
+				const index = rest.indexOf(name);
+				const value = index >= 0 ? rest[index + 1] : undefined;
+				return index >= 0 && (!value || value.startsWith("--"));
+			})
+		)
+			return undefined;
+		const provider = rest[0]?.startsWith("--") ? undefined : rest[0];
+		if (provider !== undefined && provider !== "telegram" && provider !== "discord" && provider !== "slack") {
+			return undefined;
+		}
 		return {
 			action,
 			rawArgs: rest,
+			...(provider ? { provider } : {}),
 			token: flag("--token"),
 			chatId: flag("--chat-id"),
+			...(flag("--discord-bot-token") ? { discordBotToken: flag("--discord-bot-token") } : {}),
+			...(flag("--discord-application-id") ? { discordApplicationId: flag("--discord-application-id") } : {}),
+			...(flag("--discord-guild-id") ? { discordGuildId: flag("--discord-guild-id") } : {}),
+			...(flag("--discord-parent-channel-id")
+				? { discordParentChannelId: flag("--discord-parent-channel-id") }
+				: {}),
+			...(flag("--slack-bot-token") ? { slackBotToken: flag("--slack-bot-token") } : {}),
+			...(flag("--slack-app-token") ? { slackAppToken: flag("--slack-app-token") } : {}),
+			...(flag("--slack-workspace-id") ? { slackWorkspaceId: flag("--slack-workspace-id") } : {}),
+			...(flag("--slack-channel-id") ? { slackChannelId: flag("--slack-channel-id") } : {}),
+			...(flag("--slack-authorized-user-id") ? { slackAuthorizedUserId: flag("--slack-authorized-user-id") } : {}),
 			redact: rest.includes("--redact"),
+		};
+	}
+	if (action === "health" || action === "test" || action === "recovery") {
+		const rest = args.slice(2);
+		const flag = (name: string): string | undefined => {
+			const i = rest.indexOf(name);
+			return i >= 0 ? rest[i + 1] : undefined;
+		};
+		return {
+			action,
+			rawArgs: rest,
+			probe: rest.includes("--probe"),
+			message: flag("--message"),
 		};
 	}
 	if (action === "daemon-internal") {
@@ -98,13 +166,13 @@ export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
 		};
 	}
 
-	return { action: "status", rawArgs: args.slice(1) };
+	return undefined;
 }
 
 export async function runNotifyCommand(cmd: NotifyCommandArgs, deps: NotifyCommandDeps = {}): Promise<void> {
 	switch (cmd.action) {
 		case "setup":
-			await runSetup({
+			await runSetup(cmd, {
 				...deps,
 				setupToken: deps.setupToken ?? cmd.token,
 				setupChatId: deps.setupChatId ?? cmd.chatId,
@@ -114,76 +182,308 @@ export async function runNotifyCommand(cmd: NotifyCommandArgs, deps: NotifyComma
 		case "status":
 			await runStatus(deps);
 			return;
-		case "daemon-internal": {
-			const m = await import("../notifications/telegram-daemon-cli");
+		case "health":
+			await runHealth(deps, cmd);
+			return;
+		case "test":
+			await runTest(deps, cmd);
+			return;
+		case "recovery":
+			await runRecovery(deps);
+			return;
+		case "daemon-internal":
 			if (cmd.smoke) {
-				await m.runDaemonSmoke();
+				await runDaemonInternal(["--smoke"]);
 			} else {
-				await m.runDaemonInternal(cmd.rawArgs);
+				await runDaemonInternal(cmd.rawArgs);
 			}
 			return;
+	}
+}
+
+export async function runNotifyCliCommand(cmd: NotifyCommandArgs, deps: NotifyCommandDeps = {}): Promise<void> {
+	try {
+		await runNotifyCommand(cmd, deps);
+	} catch (error) {
+		if (cmd.action !== "setup" || !(error instanceof Error)) {
+			throw error;
 		}
+
+		const cancelled =
+			error.message === "Telegram bot token prompt cancelled." || error.message === "Telegram setup cancelled.";
+		process.stderr.write(cancelled ? "Notify setup cancelled.\n" : `Error: ${error.message}\n`);
+		const code = cancelled ? 130 : 1;
+		if (deps.setExitCode) {
+			deps.setExitCode(code);
+		} else {
+			process.exitCode = code;
+		}
+		const exitProcess = deps.exitProcess ?? (deps.setExitCode ? undefined : process.exit);
+		exitProcess?.(code);
 	}
 }
 
 async function getSettings(deps: NotifyCommandDeps): Promise<Settings> {
 	if (deps.settings) return deps.settings;
-	const { Settings } = await import("../config/settings");
 	return await Settings.init();
 }
 
-async function runSetup(deps: NotifyCommandDeps): Promise<void> {
+async function runSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promise<void> {
+	const provider = cmd.provider ?? "telegram";
+	if (provider === "discord") {
+		await runDiscordSetup(cmd, deps);
+		return;
+	}
+	if (provider === "slack") {
+		await runSlackSetup(cmd, deps);
+		return;
+	}
+	await runTelegramSetup(cmd, deps);
+}
+
+function requiredSetupValue(value: string | undefined, flag: string): string {
+	if (!value?.trim()) throw new Error(`${flag} is required for non-interactive setup.`);
+	if (value.trim().startsWith("--")) throw new Error(`${flag} must not start with --.`);
+	return value.trim();
+}
+
+async function promptSetupValue(
+	value: string | undefined,
+	flag: string,
+	masked: boolean,
+	deps: NotifyCommandDeps,
+): Promise<string> {
+	if (value?.trim()) return requiredSetupValue(value, flag);
+	if (!resolveSetupInteractive(deps)) return requiredSetupValue(value, flag);
+	return requiredSetupValue(await (deps.valuePrompt ?? promptForValue)(`${flag.slice(2)}: `, masked), flag);
+}
+
+async function runDiscordSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promise<void> {
+	const botToken = await promptSetupValue(cmd.discordBotToken, "--discord-bot-token", true, deps);
+	const applicationId = await promptSetupValue(cmd.discordApplicationId, "--discord-application-id", false, deps);
+	const guildId = await promptSetupValue(cmd.discordGuildId, "--discord-guild-id", false, deps);
+	const parentChannelId = await promptSetupValue(
+		cmd.discordParentChannelId,
+		"--discord-parent-channel-id",
+		false,
+		deps,
+	);
 	const settings = await getSettings(deps);
-	const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
-	const apiBase = deps.apiBase ?? DEFAULT_API_BASE;
-	const token = deps.setupToken ?? (await promptForToken());
-	if (!token.trim()) {
-		throw new Error("Telegram bot token is required.");
-	}
+	const patches: SettingsAtomicPatch[] = [
+		{ path: "notifications.discord.botToken", op: "set", value: botToken },
+		{ path: "notifications.discord.applicationId", op: "set", value: applicationId },
+		{ path: "notifications.discord.guildId", op: "set", value: guildId },
+		{ path: "notifications.discord.parentChannelId", op: "set", value: parentChannelId },
+		{ path: "notifications.enabled", op: "set", value: true },
+	];
+	if (cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
+	await settings.commitAtomicBatch(patches);
+	const daemon = await ensureConfiguredProviderDaemon("discord", settings, deps);
+	process.stdout.write(
+		`Discord notifications enabled. botToken=${maskToken(botToken)} applicationId=${applicationId} guildId=${guildId} parentChannelId=${parentChannelId} daemon=${daemon}\n`,
+	);
+}
 
-	const user = await getMe(fetchImpl, apiBase, token);
-	const threadedState = await verifyThreadedMode(fetchImpl, apiBase, token, user, {
+async function runSlackSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promise<void> {
+	const botToken = await promptSetupValue(cmd.slackBotToken, "--slack-bot-token", true, deps);
+	const appToken = await promptSetupValue(cmd.slackAppToken, "--slack-app-token", true, deps);
+	const workspaceId = await promptSetupValue(cmd.slackWorkspaceId, "--slack-workspace-id", false, deps);
+	const channelId = await promptSetupValue(cmd.slackChannelId, "--slack-channel-id", false, deps);
+	const authorizedUserId = cmd.slackAuthorizedUserId?.trim() || undefined;
+	const settings = await getSettings(deps);
+	const patches: SettingsAtomicPatch[] = [
+		{ path: "notifications.slack.botToken", op: "set", value: botToken },
+		{ path: "notifications.slack.appToken", op: "set", value: appToken },
+		{ path: "notifications.slack.workspaceId", op: "set", value: workspaceId },
+		{ path: "notifications.slack.channelId", op: "set", value: channelId },
+		authorizedUserId === undefined
+			? { path: "notifications.slack.authorizedUserId", op: "unset" }
+			: { path: "notifications.slack.authorizedUserId", op: "set", value: authorizedUserId },
+		{ path: "notifications.enabled", op: "set", value: true },
+	];
+	if (cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
+	await settings.commitAtomicBatch(patches);
+	const daemon = await ensureConfiguredProviderDaemon("slack", settings, deps);
+	process.stdout.write(
+		`Slack notifications enabled. botToken=${maskToken(botToken)} appToken=${maskToken(appToken)} workspaceId=${workspaceId} channelId=${channelId} authorizedUserId=${authorizedUserId ?? "(unset; inbound denied)"} daemon=${daemon}\n`,
+	);
+}
+
+async function ensureConfiguredProviderDaemon(
+	provider: "discord" | "slack",
+	settings: Settings,
+	deps: NotifyCommandDeps,
+): Promise<EnsureChatDaemonResult | "failed"> {
+	try {
+		if (deps.ensureProviderDaemon) return await deps.ensureProviderDaemon(provider, settings);
+		return provider === "discord" ? await ensureDiscordDaemon(settings) : await ensureSlackDaemon(settings);
+	} catch {
+		return "failed";
+	}
+}
+
+async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promise<void> {
+	const settings = await getSettings(deps);
+	const token = deps.setupToken ?? cmd.token ?? (await (deps.tokenPrompt ?? promptForToken)());
+	if (!token.trim()) throw new Error("Telegram bot token is required.");
+
+	const result = await runTelegramPairingSetup({
+		token,
+		preflight: deps.setupPreflight ?? (await resolveSetupPreflight(settings, deps)),
+		revalidatePreflight: async () => deps.setupPreflight ?? (await resolveSetupPreflight(settings, deps)),
+		chatId: deps.setupChatId,
 		interactive: resolveSetupInteractive(deps),
-		prompt: deps.threadedModePrompt ?? promptForThreadedMode,
+		threadedModePrompt: deps.threadedModePrompt ?? promptForThreadedMode,
+		pollTimeoutMs: deps.pollTimeoutMs,
+		pollIntervalMs: deps.pollIntervalMs,
+		signal: deps.setupAbortSignal,
+		deps: {
+			fetchImpl: deps.fetchImpl ?? globalThis.fetch,
+			apiBase: deps.apiBase,
+			timers: deps.setupTimers,
+		},
+		onEvent: event => {
+			const output = event.kind === "rejected_chat" ? process.stderr : process.stdout;
+			output.write(event.message);
+		},
 	});
-	process.stdout.write(
-		"Token validated. Message your bot now from the private Telegram chat to pair notifications.\n",
-	);
-
-	let chatId: string;
-	if (deps.setupChatId?.trim()) {
-		chatId = deps.setupChatId.trim();
-		await verifyPrivateChatId(fetchImpl, apiBase, token, chatId);
-		process.stdout.write(`Using provided chat id ${chatId} (non-interactive).\n`);
-	} else {
-		const stale = await getUpdates(fetchImpl, apiBase, token, { timeout: 0, allowed_updates: ["message"] });
-		const offset = nextOffset(stale);
-		chatId = await waitForPrivateChat(fetchImpl, apiBase, token, {
-			offset,
-			pollTimeoutMs: deps.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS,
-			pollIntervalMs: deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
-		});
+	if (!result.ok) throw new Error(result.detail);
+	if (result.pairingSource === "provided") {
+		process.stdout.write(`Using provided chat id ${result.chatId} (non-interactive).\n`);
 	}
+	try {
+		const proposedIdentity = deps.setupPreflight
+			? proposedIdentityFromSetupPreflight(deps.setupPreflight, token.trim(), result.chatId)
+			: await proposedTelegramIdentity({
+					settings,
+					botToken: token.trim(),
+					chatId: result.chatId,
+					chatDisplay: result.chatId,
+				});
+		if (proposedIdentity.status === "foreign" || proposedIdentity.status === "unknown") {
+			throw new Error(
+				"Telegram activation was not saved because the current daemon owner has an untrusted identity.",
+			);
+		}
 
-	settings.set("notifications.telegram.botToken", token);
-	settings.set("notifications.telegram.chatId", chatId);
-	settings.set("notifications.enabled", true);
-	if (deps.setupRedact) settings.set("notifications.redact", true);
-	await settings.flush();
-
+		const inactiveMarkerToClear = observedTelegramActivationMarker(settings, token.trim(), result.chatId);
+		const patches: SettingsAtomicPatch[] = [
+			{ path: "notifications.telegram.botToken", op: "set", value: token.trim() },
+			{ path: "notifications.telegram.chatId", op: "set", value: result.chatId },
+			{ path: "notifications.enabled", op: "set", value: true },
+		];
+		if (deps.setupRedact ?? cmd.redact) patches.push({ path: "notifications.redact", op: "set", value: true });
+		const receipt = await settings.commitAtomicBatch(patches);
+		const activationMarker = createTelegramActivationMarker({
+			botToken: token.trim(),
+			chatId: result.chatId,
+			state: "blocked",
+			reason: "identity_mismatch",
+		});
+		const activation = await reconcileCommittedTelegramConfiguration({
+			receipt,
+			inactiveMarkerToClear,
+			activation: {
+				// The CLI does not host a session endpoint. The settings editor supplies
+				// its live controller here; a CLI identity block therefore has no local
+				// endpoint to stop before the durable rollback below.
+				controller: {
+					enterBlockedRuntime: async () => undefined,
+					clearBlockedRuntime: async () => undefined,
+					reconcileCurrentSession: async () => undefined,
+				},
+				reconnect: async () =>
+					await ensureTelegramDaemonRunningDetailed({
+						settings,
+						cwd: process.cwd(),
+						sessionId: `notify-cli-${process.pid}`,
+					}),
+				persistInactive: async marker => await persistTelegramActivationMarker(settings, marker),
+				clearInactive: async marker => await clearTelegramActivationMarker(settings, marker),
+				marker: activationMarker,
+			},
+		});
+		if (activation.status === "blocked_identity") {
+			const restored = await activation.restore();
+			const detail =
+				restored.status === "restored"
+					? "Telegram activation was blocked by a foreign daemon; previous settings were restored."
+					: restored.status === "still_blocked"
+						? "Telegram activation remains blocked by a foreign daemon; previous settings were restored."
+						: restored.status === "conflict"
+							? "Telegram activation was blocked and settings changed concurrently; refusing to report setup success."
+							: "Telegram activation was blocked; refusing to report setup success.";
+			throw new Error(detail);
+		}
+	} catch (error) {
+		const detail = sanitizeDiagnostic(error instanceof Error ? error.message : "unknown persistence failure", token);
+		throw new Error(`Unable to persist and activate Telegram notification settings: ${detail}`);
+	}
 	process.stdout.write(
-		`Notifications enabled. botToken=${maskToken(token)} chatId=${chatId} threaded=${threadedLabel(threadedState)}\n`,
+		`Notifications enabled. botToken=${maskToken(token)} chatId=${result.chatId} threaded=${result.threadedLabel}\n`,
 	);
+}
+
+function proposedIdentityFromSetupPreflight(
+	preflight: TelegramSetupPreflight,
+	botToken: string,
+	chatId: string,
+): ProposedTelegramIdentity {
+	const daemon = preflight.daemon;
+	if (!daemon?.live) return { status: "absent" };
+	if (typeof daemon.tokenFingerprint !== "string" || typeof daemon.chatId !== "string") {
+		return { status: "unknown" };
+	}
+	return daemon.tokenFingerprint === tokenFingerprint(botToken) && daemon.chatId === chatId
+		? { status: "same" }
+		: { status: "foreign" };
+}
+
+async function resolveSetupPreflight(settings: Settings, deps: NotifyCommandDeps): Promise<TelegramSetupPreflight> {
+	if (deps.setupPreflight) return deps.setupPreflight;
+	const cfg = getNotificationConfig(settings);
+	try {
+		const state = await readDaemonState(settings);
+		if (!state) return { storedChatId: cfg.chatId };
+		const validPid = Number.isSafeInteger(state.pid) && state.pid > 0;
+		// Owner-proof: only block discovery for a daemon we can positively prove is
+		// live (present state with a valid, alive pid). A malformed/no-pid record is
+		// not evidence of a live poller, mirroring recoverNotifications' semantics.
+		if (!validPid) return { storedChatId: cfg.chatId };
+		return {
+			storedChatId: cfg.chatId,
+			daemon: {
+				live: (deps.setupPidAlive ?? daemonPidAlive)(state.pid),
+				tokenFingerprint: typeof state.tokenFingerprint === "string" ? state.tokenFingerprint : undefined,
+				chatId: typeof state.chatId === "string" ? state.chatId : undefined,
+			},
+		};
+	} catch {
+		// A state read failure is not proof of a live daemon; proceed normally. The
+		// daemon's own 409 handling remains the backstop against poller contention.
+		return { storedChatId: cfg.chatId };
+	}
+}
+
+function daemonPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
 }
 
 type TokenPromptInput = NodeJS.ReadStream & {
 	isRaw?: boolean;
 	setRawMode?: (mode: boolean) => unknown;
+	pause?: () => unknown;
 };
 
 type TokenPromptOutput = Pick<NodeJS.WriteStream, "write">;
 
-export async function promptForToken(
+async function promptForMaskedValue(
+	label: string,
 	input: TokenPromptInput = process.stdin,
 	output: TokenPromptOutput = process.stdout,
 ): Promise<string> {
@@ -194,7 +494,7 @@ export async function promptForToken(
 		throw new Error("notify setup requires a TTY with raw input support unless setupToken is injected.");
 	}
 
-	output.write("Telegram BotFather token: ");
+	output.write(label);
 	const wasRaw = input.isRaw === true;
 	input.setRawMode(true);
 
@@ -206,6 +506,7 @@ export async function promptForToken(
 			input.off("data", onData);
 			input.off("error", onError);
 			input.setRawMode?.(wasRaw);
+			input.pause?.();
 			output.write("\n");
 		};
 
@@ -248,75 +549,24 @@ export async function promptForToken(
 	});
 }
 
-const THREADED_ENABLED_SUCCESS =
-	"Telegram Threaded Mode capability verified for this bot. GJC will request a private-chat topic per session; if Telegram ever refuses topic creation, notifications fall back to this flat chat with a one-time nudge.\n";
-
-const THREADED_MISSING_WARNING =
-	"Warning: Telegram getMe did not include has_topics_enabled, so GJC cannot verify private-chat Threaded Mode capability for this bot. Setup will continue; update Telegram/Bot API support or re-run setup if per-session topics fail.\n";
-
-const THREADED_NONINTERACTIVE_WARNING =
-	"Warning: Telegram Threaded Mode capability is OFF for this bot. Setup will be saved because this run is non-interactive, but per-session Telegram delivery may fail closed until the bot owner enables Threaded Mode in @BotFather. GJC cannot enable it through the Bot API.\n";
-
-const THREADED_DISABLED_GUIDANCE =
-	"Telegram Threaded Mode is OFF for this bot. GJC needs Telegram private-chat topics so each session can use its own thread.\n" +
-	"GJC cannot enable this through the Bot API. Open @BotFather, select this bot, enable Threaded Mode / forum topics for private chats, then return here.\n" +
-	"Telegram may require an additional Stars purchase fee for private-chat topics.\n";
-
-const THREADED_DISABLED_PROMPT =
-	"Press Enter after enabling Threaded Mode, or type skip to finish setup with a warning: ";
-
-const THREADED_STILL_OFF = "Telegram still reports Threaded Mode OFF for this bot.\n";
-
-const THREADED_RETRY_PROMPT = "Press Enter to check again, or type skip to finish setup with a warning: ";
-
-const THREADED_SKIP_WARNING =
-	"Warning: continuing without verified Telegram Threaded Mode capability. Setup will be saved, but per-session Telegram delivery may fail closed until Threaded Mode is enabled in BotFather.\n";
-
-const THREADED_INVALID_INPUT = "Type Enter to retry or skip to continue with a warning.\n";
-
-const THREADED_RETRY_INPUTS = new Set(["", "y", "yes", "r", "retry"]);
-const THREADED_SKIP_INPUTS = new Set(["s", "skip", "n", "no"]);
-
-function isTelegramUser(value: unknown): value is TelegramUser {
-	return Boolean(value) && typeof value === "object" && typeof (value as { id?: unknown }).id === "number";
+export async function promptForToken(
+	input: TokenPromptInput = process.stdin,
+	output: TokenPromptOutput = process.stdout,
+): Promise<string> {
+	return await promptForMaskedValue("Telegram BotFather token: ", input, output);
 }
 
-async function getMe(fetchImpl: typeof fetch, apiBase: string, token: string): Promise<TelegramUser> {
-	const user = await callTelegram<unknown>(fetchImpl, apiBase, token, "getMe", {});
-	if (!isTelegramUser(user)) {
-		throw new Error("Telegram getMe returned invalid Telegram response: missing valid User result.");
+async function promptForValue(label: string, masked: boolean): Promise<string> {
+	if (masked) return await promptForMaskedValue(label);
+	if (!process.stdin.isTTY) {
+		throw new Error("notify setup requires an interactive TTY unless all setup values are supplied as flags.");
 	}
-	return user;
-}
-
-async function verifyPrivateChatId(
-	fetchImpl: typeof fetch,
-	apiBase: string,
-	token: string,
-	chatId: string,
-): Promise<void> {
-	const chat = (await callTelegram<unknown>(fetchImpl, apiBase, token, "getChat", { chat_id: chatId })) as
-		| TelegramChat
-		| undefined;
-	if (!chat || typeof chat !== "object") {
-		throw new Error("Telegram getChat returned invalid Telegram response: missing valid Chat result.");
+	const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+	try {
+		return (await rl.question(label)).trim();
+	} finally {
+		rl.close();
 	}
-	if (chat.type !== "private") {
-		const type = typeof chat.type === "string" && chat.type ? chat.type : "unknown";
-		throw new Error(`Provided chat id ${chatId} is a ${type} chat; pairing requires a private Telegram chat.`);
-	}
-}
-
-function threadedModeState(user: TelegramUser): ThreadedModeState {
-	if (user.has_topics_enabled === true) return "enabled";
-	if (user.has_topics_enabled === false) return "disabled";
-	return "unknown";
-}
-
-function threadedLabel(state: ThreadedModeState): ThreadedModeFinalLabel {
-	if (state === "enabled") return "verified";
-	if (state === "disabled") return "unverified";
-	return "unknown";
 }
 
 function resolveSetupInteractive(deps: NotifyCommandDeps): boolean {
@@ -334,174 +584,84 @@ async function promptForThreadedMode(message: string): Promise<string> {
 	}
 }
 
-async function verifyThreadedMode(
-	fetchImpl: typeof fetch,
-	apiBase: string,
-	token: string,
-	initialUser: TelegramUser,
-	opts: { interactive: boolean; prompt: (message: string) => Promise<string> },
-): Promise<ThreadedModeState> {
-	const classify = (user: TelegramUser): ThreadedModeState | undefined => {
-		const state = threadedModeState(user);
-		if (state === "enabled") {
-			process.stdout.write(THREADED_ENABLED_SUCCESS);
-			return "enabled";
-		}
-		if (state === "unknown") {
-			process.stdout.write(THREADED_MISSING_WARNING);
-			return "unknown";
-		}
-		return undefined;
-	};
-
-	const initial = classify(initialUser);
-	if (initial) return initial;
-
-	if (!opts.interactive) {
-		process.stdout.write(THREADED_NONINTERACTIVE_WARNING);
-		return "disabled";
-	}
-
-	process.stdout.write(THREADED_DISABLED_GUIDANCE);
-	let firstPrompt = true;
-	for (;;) {
-		const answer = (await opts.prompt(firstPrompt ? THREADED_DISABLED_PROMPT : THREADED_RETRY_PROMPT))
-			.trim()
-			.toLowerCase();
-		firstPrompt = false;
-		if (THREADED_SKIP_INPUTS.has(answer)) {
-			process.stdout.write(THREADED_SKIP_WARNING);
-			return "disabled";
-		}
-		if (!THREADED_RETRY_INPUTS.has(answer)) {
-			process.stdout.write(THREADED_INVALID_INPUT);
-			continue;
-		}
-		const resolved = classify(await getMe(fetchImpl, apiBase, token));
-		if (resolved) return resolved;
-		process.stdout.write(THREADED_STILL_OFF);
-	}
-}
-
 async function runStatus(deps: NotifyCommandDeps): Promise<void> {
 	const settings = await getSettings(deps);
-	const cfg = getNotificationConfig(settings);
+	const report = buildNotificationStatusReport(settings);
 	process.stdout.write(
-		`${chalk.bold("Notifications")}\n` +
-			`  enabled: ${cfg.enabled}\n` +
-			`  telegram.botToken: ${maskToken(cfg.botToken)}\n` +
-			`  telegram.chatId: ${cfg.chatId ?? "(unset)"}\n` +
-			`  discord.botToken: ${maskToken(cfg.discord.botToken)}\n` +
-			`  discord.channelId: ${cfg.discord.channelId ?? "(unset)"}\n` +
-			`  slack.botToken: ${maskToken(cfg.slack.botToken)}\n` +
-			`  slack.channelId: ${cfg.slack.channelId ?? "(unset)"}\n` +
-			`  redact: ${cfg.redact}\n`,
+		`${chalk.bold("Notifications")}\n${formatNotificationStatusReport(report).split("\n").slice(1).join("\n")}\n`,
 	);
 }
 
-async function waitForPrivateChat(
-	fetchImpl: typeof fetch,
-	apiBase: string,
-	token: string,
-	opts: { offset: number | undefined; pollTimeoutMs: number; pollIntervalMs: number },
-): Promise<string> {
-	const deadline = Date.now() + opts.pollTimeoutMs;
-	let offset = opts.offset;
-	let sawRejectedChatType: string | undefined;
-
-	while (Date.now() <= deadline) {
-		const updates = await getUpdates(fetchImpl, apiBase, token, { offset, timeout: 0, allowed_updates: ["message"] });
-		offset = nextOffset(updates, offset);
-		for (const update of updates) {
-			const chat = update.message?.chat;
-			if (!chat) continue;
-			if (chat.type === "private" && chat.id !== undefined) {
-				return String(chat.id);
-			}
-			if (chat.type === "group" || chat.type === "supergroup" || chat.type === "channel") {
-				sawRejectedChatType = chat.type;
-				process.stderr.write(
-					`Rejected ${chat.type} chat. Pairing requires a private Telegram chat with the bot.\n`,
-				);
-			}
-		}
-		if (opts.pollIntervalMs > 0) {
-			await new Promise(resolve =>
-				setTimeout(resolve, Math.min(opts.pollIntervalMs, Math.max(0, deadline - Date.now()))),
-			);
-		}
-	}
-
-	if (sawRejectedChatType) {
-		throw new Error(`Pairing rejected ${sawRejectedChatType} chat; message the bot from a private chat.`);
-	}
-	throw new Error("Timed out waiting for a private Telegram message to pair notifications.");
-}
-
-function nextOffset(updates: TelegramUpdate[], fallback?: number): number | undefined {
-	let max = fallback === undefined ? undefined : fallback - 1;
-	for (const update of updates) {
-		if (typeof update.update_id === "number" && (max === undefined || update.update_id > max)) {
-			max = update.update_id;
-		}
-	}
-	return max === undefined ? fallback : max + 1;
-}
-
-async function getUpdates(
-	fetchImpl: typeof fetch,
-	apiBase: string,
-	token: string,
-	params: Record<string, unknown>,
-): Promise<TelegramUpdate[]> {
-	return await callTelegram<TelegramUpdate[]>(fetchImpl, apiBase, token, "getUpdates", params);
-}
-
-async function callTelegram<T>(
-	fetchImpl: typeof fetch,
-	apiBase: string,
-	token: string,
-	method: string,
-	body: Record<string, unknown>,
-): Promise<T> {
-	const response = await fetchImpl(`${apiBase.replace(/\/$/, "")}/bot${token}/${method}`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(body),
+async function runHealth(deps: NotifyCommandDeps, cmd: NotifyCommandArgs): Promise<void> {
+	const settings = await getSettings(deps);
+	const report = await checkNotificationHealth({
+		settings,
+		probe: cmd.probe,
+		deps: { fetchImpl: deps.fetchImpl, apiBase: deps.apiBase },
 	});
-	let payload: TelegramApiResponse<T>;
-	try {
-		payload = (await response.json()) as TelegramApiResponse<T>;
-	} catch {
-		throw new Error(`Telegram ${method} returned invalid JSON.`);
-	}
-	if (!response.ok || !payload.ok) {
-		throw new Error(`Telegram ${method} failed: ${payload.description ?? response.statusText}`);
-	}
-	return payload.result as T;
+	process.stdout.write(`${formatNotificationHealthReport(report)}\n`);
+	if (report.overall === "error" && deps.setExitCode) deps.setExitCode(1);
+	else if (report.overall === "error") process.exitCode = 1;
+}
+
+async function runTest(deps: NotifyCommandDeps, cmd: NotifyCommandArgs): Promise<void> {
+	const settings = await getSettings(deps);
+	const result = await sendNotificationTest({
+		settings,
+		text: cmd.message,
+		deps: { fetchImpl: deps.fetchImpl, apiBase: deps.apiBase },
+	});
+	process.stdout.write(`${formatNotificationTestResult(result)}\n`);
+	if (!result.ok && deps.setExitCode) deps.setExitCode(1);
+	else if (!result.ok) process.exitCode = 1;
+}
+
+async function runRecovery(deps: NotifyCommandDeps): Promise<void> {
+	const settings = await getSettings(deps);
+	const report = await recoverNotifications({ settings });
+	process.stdout.write(`${formatNotificationRecoveryReport(report)}\n`);
 }
 
 export function printNotifyHelp(): void {
-	process.stdout.write(`${chalk.bold(`${APP_NAME} notify`)} - Configure Telegram notifications
+	process.stdout.write(`${chalk.bold(`${APP_NAME} notify`)} - Configure Telegram, Discord, or Slack notifications
+
+${chalk.bold("Interactive path:")}
+  In a running GJC session, use /settings → Notifications for setup, health, test, recovery,
+  reconnect, global enable/disable, adapter-local Telegram removal, and session on/off.
+  The CLI subcommands below remain the authoritative headless and automation fallback.
 
 ${chalk.bold("Usage:")}
-  ${APP_NAME} notify setup
-  ${APP_NAME} notify setup --token <botToken> --chat-id <chatId> [--redact]
+  ${APP_NAME} notify setup [telegram]
+  ${APP_NAME} notify setup discord --discord-bot-token <token> --discord-application-id <id> --discord-guild-id <id> --discord-parent-channel-id <id>
+  ${APP_NAME} notify setup slack --slack-bot-token <token> --slack-app-token <token> --slack-workspace-id <id> --slack-channel-id <id> [--slack-authorized-user-id <id>]
   ${APP_NAME} notify status
+  ${APP_NAME} notify health [--probe]
+  ${APP_NAME} notify test [--message <text>]
+  ${APP_NAME} notify recovery
 
 ${chalk.bold("Subcommands:")}
-  setup     Pair a Telegram bot token with a private chat and verify Threaded Mode capability
+  setup     Pair Telegram or save complete non-interactive Discord/Slack notification settings
   status    Show notification configuration without secrets
+  health    Report config, daemon-ownership and endpoint health (--probe adds a Telegram reachability check)
+  test      Send a one-off test notification through the configured Telegram adapter
+  recovery  Clear dead-owner daemon locks and stale per-session endpoint files (never touches a live owner)
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} notify setup
   ${APP_NAME} notify setup --token <botToken> --chat-id <chatId> [--redact]
+  ${APP_NAME} notify setup discord --discord-bot-token <token> --discord-application-id <id> --discord-guild-id <id> --discord-parent-channel-id <id>
+  ${APP_NAME} notify setup slack --slack-bot-token <token> --slack-app-token <token> --slack-workspace-id <id> --slack-channel-id <id> [--slack-authorized-user-id <id>]
   ${APP_NAME} notify status
+  ${APP_NAME} notify health --probe
+  ${APP_NAME} notify test --message "hello from gjc"
+  ${APP_NAME} notify recovery
 
 ${chalk.bold("Threaded Mode:")}
   GJC uses Telegram private-chat topics for per-session threads. Setup verifies the bot
-  capability via getMe.has_topics_enabled. If it is off, enable Threaded Mode in @BotFather;
-  bots cannot toggle it through the Bot API. If Telegram refuses topic creation at runtime,
-  GJC delivers flat to the paired private chat and nudges you to enable Threaded Mode.
+  capability via getMe.has_topics_enabled. Enable Threaded Mode in @BotFather > Bot Settings
+  > Threads Settings; bots cannot toggle it through the Bot API. If Telegram refuses topic
+  creation at runtime, GJC delivers flat to the paired private chat with outbound notifications
+  and inline ask buttons only, then nudges you to enable Threaded Mode for free-text replies
+  and session commands.
 `);
 }

@@ -1,4 +1,4 @@
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, stat } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
@@ -29,6 +29,56 @@ interface GjcNativeHookDispatchOptions {
 	stateDir?: string;
 	effectiveSkillConfig?: EffectiveSkillConfigInput;
 	configPaths?: string[];
+}
+
+interface ConfigCacheEntry {
+	fingerprint: string;
+	value: EffectiveSkillConfigInput;
+}
+
+const effectiveSkillConfigCache = new Map<string, ConfigCacheEntry>();
+let effectiveSkillConfigResolutionCount = 0;
+
+async function configPathFingerprint(configPaths: readonly string[]): Promise<string> {
+	const parts: string[] = [];
+	for (const configPath of configPaths) {
+		try {
+			const stats = await stat(configPath);
+			parts.push(`${configPath}:${stats.mtimeMs}:${stats.size}`);
+		} catch (error) {
+			if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+				parts.push(`${configPath}:missing`);
+				continue;
+			}
+			parts.push(`${configPath}:unavailable`);
+		}
+	}
+	return parts.join("|");
+}
+
+function configCacheKey(input: {
+	cwd: string;
+	configPaths: readonly string[];
+	sessionId?: string;
+	threadId?: string;
+	stateDir?: string;
+}): string {
+	return JSON.stringify({
+		cwd: input.cwd,
+		configPaths: input.configPaths,
+		sessionId: input.sessionId ?? "",
+		threadId: input.threadId ?? "",
+		stateDir: input.stateDir ?? "",
+	});
+}
+
+export function clearGjcNativeSkillHookCachesForTesting(): void {
+	effectiveSkillConfigCache.clear();
+	effectiveSkillConfigResolutionCount = 0;
+}
+
+export function getGjcNativeSkillHookCacheStatsForTesting(): { effectiveSkillConfigResolutions: number } {
+	return { effectiveSkillConfigResolutions: effectiveSkillConfigResolutionCount };
 }
 
 function readNestedRecord(value: Record<string, unknown>, key: string): Record<string, unknown> {
@@ -114,20 +164,46 @@ async function resolveEffectiveSkillConfig(
 	cwd: string,
 	override?: EffectiveSkillConfigInput,
 	configPaths?: string[],
+	cacheContext: { sessionId?: string; threadId?: string; stateDir?: string } = {},
 ): Promise<EffectiveSkillConfigInput> {
 	if (override) return override;
+	const resolvedConfigPaths = resolveConfigPaths(cwd, configPaths);
+	const cacheKey = configCacheKey({ cwd, configPaths: resolvedConfigPaths, ...cacheContext });
+	const fingerprint = await configPathFingerprint(resolvedConfigPaths);
+	const cached = effectiveSkillConfigCache.get(cacheKey);
+	if (cached?.fingerprint === fingerprint) {
+		return cached.value;
+	}
 	try {
+		effectiveSkillConfigResolutionCount += 1;
 		let config = buildDefaultEffectiveSkillConfig();
-		for (const configPath of resolveConfigPaths(cwd, configPaths)) {
+		for (const configPath of resolvedConfigPaths) {
 			const raw = await readRawConfig(configPath);
 			if (raw) config = mergeRawSkillConfig(config, raw);
 		}
+		effectiveSkillConfigCache.set(cacheKey, { fingerprint, value: config });
 		return config;
 	} catch {
-		return {
+		const unavailableConfig = {
 			unavailableReason: "config unavailable",
 		};
+		effectiveSkillConfigCache.set(cacheKey, { fingerprint, value: unavailableConfig });
+		return unavailableConfig;
 	}
+}
+
+export async function resolveGjcNativeSkillConfigForTesting(input: {
+	cwd: string;
+	configPaths?: string[];
+	sessionId?: string;
+	threadId?: string;
+	stateDir?: string;
+}): Promise<EffectiveSkillConfigInput> {
+	return await resolveEffectiveSkillConfig(input.cwd, undefined, input.configPaths, {
+		sessionId: input.sessionId,
+		threadId: input.threadId,
+		stateDir: input.stateDir,
+	});
 }
 
 function safeString(value: unknown): string {
@@ -141,6 +217,34 @@ function readHookEventName(payload: HookPayload): GjcNativeHookEventName | null 
 
 function readPromptText(payload: HookPayload): string {
 	return safeString(payload.prompt ?? payload.user_prompt ?? payload.userPrompt).trim();
+}
+
+const QUESTION_ONLY_ADVISORY_CONTEXT =
+	"Question-only prompt advisory: Treat bare '?' and unambiguous informational questions as answer-only/read-only; do not modify files, run commands, or execute workflow changes unless the user explicitly asks for action.";
+
+const QUESTION_EXPLICIT_ACTION_PATTERN =
+	/\b(add|apply|build|change|commit|create|delete|edit|execute|fix|implement|install|merge|modify|move|patch|refactor|remove|rename|replace|run|ship|start|stop|test|update|write)\b/i;
+const QUESTION_START_PATTERN =
+	/^(what|why|how|when|where|who|which|does|do|did|is|are|was|were|can|could|should|would)\b/i;
+
+function classifyQuestionOnlyPrompt(prompt: string): string | null {
+	const normalized = prompt.trim().replace(/\s+/g, " ");
+	if (!normalized) {
+		return null;
+	}
+	if (normalized === "?") {
+		return QUESTION_ONLY_ADVISORY_CONTEXT;
+	}
+	if (!normalized.endsWith("?")) {
+		return null;
+	}
+	if (QUESTION_EXPLICIT_ACTION_PATTERN.test(normalized)) {
+		return null;
+	}
+	if (!QUESTION_START_PATTERN.test(normalized)) {
+		return null;
+	}
+	return QUESTION_ONLY_ADVISORY_CONTEXT;
 }
 
 function readSessionId(payload: HookPayload): string | undefined {
@@ -193,7 +297,11 @@ export async function dispatchGjcNativeSkillHook(
 				})
 			: null;
 		const effectiveSkillConfig = skillState
-			? await resolveEffectiveSkillConfig(cwd, options.effectiveSkillConfig, options.configPaths)
+			? await resolveEffectiveSkillConfig(cwd, options.effectiveSkillConfig, options.configPaths, {
+					sessionId: readSessionId(payload),
+					threadId: readThreadId(payload),
+					stateDir: options.stateDir,
+				})
 			: undefined;
 		const activeUltragoalContext = skillState
 			? null
@@ -221,6 +329,7 @@ export async function dispatchGjcNativeSkillHook(
 		const additionalContext = [
 			skillState ? buildSkillActivationAdditionalContext(skillState, effectiveSkillConfig) : activeUltragoalContext,
 			recoveryContext,
+			classifyQuestionOnlyPrompt(prompt),
 		]
 			.filter((value): value is string => Boolean(value))
 			.join(" ");
@@ -251,6 +360,17 @@ export async function dispatchGjcNativeSkillHook(
 	}
 
 	return { hookEventName, outputJson: null };
+}
+
+export async function runGjcNativeSkillHookInProcess(payload: HookPayload): Promise<string> {
+	const result = await dispatchGjcNativeSkillHook(payload);
+	if (result.outputJson) {
+		return `${JSON.stringify(result.outputJson)}\n`;
+	}
+	if (result.hookEventName === "Stop") {
+		return "{}\n";
+	}
+	return "";
 }
 
 async function readStdinJson(): Promise<{ payload: HookPayload; parseError: Error | null }> {

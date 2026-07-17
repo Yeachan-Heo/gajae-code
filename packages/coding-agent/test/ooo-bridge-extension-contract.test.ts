@@ -184,7 +184,7 @@ describe("ooo bridge extension contract", () => {
 
 		expect(await handler(input("ooo status", "interactive"), context())).toEqual({ handled: true });
 		expect(await handler(input("ooo status", undefined), context())).toEqual({ handled: true });
-		expect(await handler(input("ooo status", "rpc"), context())).toEqual({});
+		expect(await handler(input("ooo status", "sdk"), context())).toEqual({});
 		expect(await handler(input("ooo status", "extension"), context())).toEqual({});
 		expect(dispatchSpy).toHaveBeenCalledTimes(2);
 	});

@@ -56,6 +56,74 @@ describe("verifyExpectedFiles", () => {
 		}
 	});
 
+	it("ignores GJC session runtime metadata created inside the benchmark workspace", async () => {
+		const { expectedDir, actualDir, cleanup } = await createTempDirs();
+		try {
+			await Bun.write(path.join(expectedDir, "index.ts"), "export const value = 1;\n");
+			await Bun.write(path.join(actualDir, "index.ts"), "export const value = 1;\n");
+			await Bun.write(path.join(actualDir, ".gjc", "_session-123", "runtime-state.json"), "{}\n");
+
+			const result = await verifyExpectedFiles(expectedDir, actualDir);
+
+			expect(result.success).toBe(true);
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("does not reinterpret literal backslashes as separators on POSIX", async () => {
+		if (path.sep !== "/") return;
+
+		const { expectedDir, actualDir, cleanup } = await createTempDirs();
+		try {
+			await Bun.write(path.join(expectedDir, "index.ts"), "export const value = 1;\n");
+			await Bun.write(path.join(actualDir, "index.ts"), "export const value = 1;\n");
+			await Bun.write(path.join(actualDir, ".gjc\\_session-123\\runtime-state.json"), "{}\n");
+
+			const result = await verifyExpectedFiles(expectedDir, actualDir);
+
+			expect(result.success).toBe(false);
+			expect(result.error).toContain("Unexpected files: .gjc\\_session-123\\runtime-state.json");
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("does not ignore files that only resemble a session directory", async () => {
+		const { expectedDir, actualDir, cleanup } = await createTempDirs();
+		try {
+			await Bun.write(path.join(expectedDir, "index.ts"), "export const value = 1;\n");
+			await Bun.write(path.join(actualDir, "index.ts"), "export const value = 1;\n");
+			await Bun.write(path.join(actualDir, ".gjc", "_session-decoy.json"), "{}\n");
+
+			const result = await verifyExpectedFiles(expectedDir, actualDir);
+
+			expect(result.success).toBe(false);
+			expect(result.error).toContain(`Unexpected files: ${path.join(".gjc", "_session-decoy.json")}`);
+		} finally {
+			await cleanup();
+		}
+	});
+	it("reports shared GJC files as unexpected alongside session runtime metadata", async () => {
+		const { expectedDir, actualDir, cleanup } = await createTempDirs();
+		try {
+			await Bun.write(path.join(expectedDir, "index.ts"), "export const value = 1;\n");
+			await Bun.write(path.join(actualDir, "index.ts"), "export const value = 1;\n");
+			await Bun.write(path.join(actualDir, ".gjc", "_session-123", "runtime-state.json"), "{}\n");
+			await Bun.write(path.join(actualDir, ".gjc", "agents", "foo.md"), "# Agent\n");
+			await Bun.write(path.join(actualDir, ".gjc", "mcp.json"), "{}\n");
+
+			const result = await verifyExpectedFiles(expectedDir, actualDir);
+
+			expect(result.success).toBe(false);
+			expect(result.error).toContain(
+				`Unexpected files: ${path.join(".gjc", "agents", "foo.md")}, ${path.join(".gjc", "mcp.json")}`,
+			);
+		} finally {
+			await cleanup();
+		}
+	});
+
 	it("fails with diff output when formatted content differs", async () => {
 		const { expectedDir, actualDir, cleanup } = await createTempDirs();
 		try {

@@ -22,9 +22,11 @@ export {
 } from "./default-reductions.ledger";
 export {
 	type DeltaReport,
+	LIVE_DEFAULT_CANDIDATE_FIXTURE_PAIRS,
 	LIVE_RUNNER_SCHEMA_VERSION,
 	type LiveRunDelta,
 	LiveRunnerError,
+	type LiveRunnerFixturePair,
 	type LiveRunnerOptions,
 	type LiveRunRegression,
 	type LiveRunReport,

@@ -3,18 +3,15 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type AgentTool, INTENT_FIELD } from "@gajae-code/agent-core";
-import { buildSystemPrompt, buildSystemPromptToolMetadata } from "@gajae-code/coding-agent/system-prompt";
+import {
+	buildSystemPrompt,
+	buildSystemPromptToolMetadata,
+	buildVolatileProjectContext,
+} from "@gajae-code/coding-agent/system-prompt";
 import { prompt } from "@gajae-code/utils";
 import Handlebars from "handlebars";
 import * as z from "zod/v4";
-
-const baseGitContext = {
-	isRepo: true,
-	currentBranch: "feature/tests",
-	mainBranch: "main",
-	status: "M packages/coding-agent/src/prompts/system/custom-system-prompt.md",
-	commits: "abc123 Fix tests",
-};
+import { getBundledAgent } from "../src/task/agents";
 
 const systemPromptsDir = path.resolve(import.meta.dir, "../src/prompts/system");
 
@@ -37,7 +34,6 @@ const baseRenderContext: prompt.TemplateContext = {
 	editToolName: "edit",
 	environment: [{ label: "OS", value: "Darwin" }],
 	finalPlanFilePath: "local://PLAN_FINAL.md",
-	git: baseGitContext,
 	intentField: INTENT_FIELD,
 	intentTracing: true,
 	iterative: true,
@@ -54,7 +50,6 @@ const baseRenderContext: prompt.TemplateContext = {
 	request: "Create an agent to review prompt templates",
 	retryCount: 1,
 	rules: [{ name: "rs-no-unwrap", description: "Avoid unwrap", globs: ["**/*.rs"] }],
-	skills: [{ name: "system-prompts", description: "Prompt design skill" }],
 	systemPromptCustomization: "System customization",
 	toolInfo: [{ name: "read", label: "Read", description: "Reads files" }],
 	toolRefs: {
@@ -106,6 +101,18 @@ async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
 	}
 }
 
+test("executor red-team block renders only for ultragoal completion QA assignments", () => {
+	const executor = getBundledAgent("executor");
+	expect(executor).toBeDefined();
+
+	const ordinary = prompt.render(executor!.systemPrompt, { ultragoalRedTeam: false });
+	expect(ordinary).not.toContain("<ultragoal_red_team_mode>");
+
+	const redTeam = prompt.render(executor!.systemPrompt, { ultragoalRedTeam: true });
+	expect(redTeam).toContain("<ultragoal_red_team_mode>");
+	expect(redTeam).toContain("executorQa");
+});
+
 describe("system Handlebars prompt templates", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -121,51 +128,20 @@ describe("system Handlebars prompt templates", () => {
 		}
 	});
 
-	test("custom-system-prompt renders project section for context and git combinations", async () => {
+	test("custom-system-prompt renders only project context", async () => {
 		const templatePath = path.join(systemPromptsDir, "custom-system-prompt.md");
 		const template = await Bun.file(templatePath).text();
-
-		const both = prompt.render(template, {
-			...baseRenderContext,
-			contextFiles: [{ path: "a.txt", content: "A" }],
-			git: { ...baseGitContext, isRepo: true },
-		});
-		expect(both).toContain("<project>");
-		expect(both).toContain("## Context");
-		expect(both).toContain("## Version Control");
 
 		const contextOnly = prompt.render(template, {
 			...baseRenderContext,
 			contextFiles: [{ path: "a.txt", content: "A" }],
-			git: { isRepo: false },
 		});
 		expect(contextOnly).toContain("<project>");
 		expect(contextOnly).toContain("## Context");
-		expect(contextOnly).not.toContain("## Version Control");
+		expect(contextOnly).not.toContain("Version Control");
 
-		const gitOnly = prompt.render(template, {
-			...baseRenderContext,
-			contextFiles: [],
-			git: {
-				isRepo: true,
-				currentBranch: "feature/tests",
-				mainBranch: "main",
-				status: "clean",
-				commits: "abc123 test commit",
-			},
-		});
-		expect(gitOnly).toContain("<project>");
-		expect(gitOnly).not.toContain("## Context");
-		expect(gitOnly).toContain("## Version Control");
-
-		const neither = prompt.render(template, {
-			...baseRenderContext,
-			contextFiles: [],
-			git: { isRepo: false },
-		});
-		expect(neither).not.toContain("<project>");
-		expect(neither).not.toContain("## Context");
-		expect(neither).not.toContain("## Version Control");
+		const empty = prompt.render(template, { ...baseRenderContext, contextFiles: [] });
+		expect(empty).not.toContain("<project>");
 	});
 
 	test("subagent system owns shared context while user prompt only owns assignment", async () => {
@@ -190,21 +166,52 @@ describe("system Handlebars prompt templates", () => {
 		expect(subagentUser).not.toContain("[CONTEXT]");
 		expect(subagentUser).not.toContain("Shared task background");
 	});
-	test("system-prompt renders MCP discovery hint when enabled", async () => {
+
+	test("system-prompt trims workflow/soul blocks for subagents while retaining safety contracts", async () => {
 		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
 		const template = await Bun.file(templatePath).text();
 
+		const full = prompt.render(template, { ...baseRenderContext, subagent: false });
+		const sub = prompt.render(template, { ...baseRenderContext, subagent: true });
+
+		// Top-level agent keeps concise routing and soul blocks.
+		expect(full).toContain("<gjc-runtime>");
+		expect(full).toContain("<routing>");
+		expect(full).toContain("<soul>");
+		expect(full).not.toContain("<role-agent-surface>");
+
+		// Subagent base prompt drops runtime routing and soul.
+		expect(sub).not.toContain("<gjc-runtime>");
+		expect(sub).not.toContain("<routing>");
+		expect(sub).not.toContain("<soul>");
+
+		// Required repo/tool/completion constraints remain for subagents.
+		expect(sub).toContain("<completion-contract>");
+		expect(sub).toContain("<repo-safety>");
+		expect(sub).toContain("<tools>");
+		expect(sub).toContain("<authority>");
+
+		// No shared-cache-identity assertion is introduced (Phase 2, gated on prefix factoring).
+		expect(sub.toLowerCase()).not.toContain("cache identity");
+		expect(sub.toLowerCase()).not.toContain("shared cache");
+
+		// Measured byte reduction target: >= 25%.
+		const fullBytes = Buffer.byteLength(full);
+		const subBytes = Buffer.byteLength(sub);
+		const reduction = 1 - subBytes / fullBytes;
+		expect(reduction).toBeGreaterThanOrEqual(0.25);
+	});
+	test("system-prompt omits obsolete MCP discovery plumbing", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
 		const rendered = prompt.render(template, {
 			...baseRenderContext,
 			mcpDiscoveryMode: true,
-			hasMCPDiscoveryServers: true,
-			mcpDiscoveryServerSummaries: ["github (2 tools)", "slack (1 tool)"],
+			mcpDiscoveryServerSummaries: ["github (2 tools)"],
 		});
 
-		expect(rendered).toContain("<discovery>");
-		expect(rendered).toContain("Discoverable MCP servers in this session: github (2 tools), slack (1 tool).");
-		expect(rendered).not.toContain("Example discoverable MCP tools:");
-		expect(rendered).toContain("call `search_tool_bm25` before concluding no such tool exists");
+		expect(rendered).not.toContain("<discovery>");
+		expect(rendered).not.toContain("Discoverable MCP servers");
 	});
 
 	test("system-prompt renders tool-discovery block with discoverable tools when active", async () => {
@@ -214,16 +221,14 @@ describe("system Handlebars prompt templates", () => {
 		const rendered = prompt.render(template, {
 			...baseRenderContext,
 			toolDiscoveryActive: true,
-			discoverableTools: [
-				{ name: "browser", summary: "Control a headless browser" },
-				{ name: "todo_write", summary: "Manage a phased task list" },
-			],
+			discoverableTools: [{ name: "browser", summary: "Control a headless browser" }],
 		});
 
 		expect(rendered).toContain("<tool-discovery>");
 		expect(rendered).toContain("`search_tool_bm25`");
-		expect(rendered).toContain("- `browser` — Control a headless browser");
-		expect(rendered).toContain("- `todo_write` — Manage a phased task list");
+		expect(rendered).toContain("Discoverable capabilities include browser automation");
+		expect(rendered).not.toContain("Discoverable tools:");
+		expect(rendered).not.toContain("Control a headless browser");
 
 		const disabled = prompt.render(template, { ...baseRenderContext, toolDiscoveryActive: false });
 		expect(disabled).not.toContain("<tool-discovery>");
@@ -237,37 +242,69 @@ describe("system Handlebars prompt templates", () => {
 
 		expect(rendered).toContain("<detached-subagents>");
 		expect(rendered).toContain("Normal `task` launches return immediately as detached background subagents");
-		expect(rendered).toContain("Use `subagent` to list, inspect, await with `timeout_ms`, or cancel");
-		expect(rendered).toContain("If an await timeout elapses, the subagent is still running; this is not a failure.");
-		expect(rendered).toContain("never cancel just because an await timed out");
-		expect(rendered).toContain("`job` remains the generic background-job tool");
+		expect(rendered).toContain("its await/cancel doctrine is authoritative");
+		expect(rendered).not.toContain("never cancel just because an await timed out");
 	});
 
-	test("buildSystemPrompt keeps system and project as separate ordered blocks with date context in project", async () => {
+	test("system-prompt bounds long-form media ingestion before fallback drafting", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+		const rendered = prompt.render(template, baseRenderContext);
+
+		expect(rendered).toContain("<media-ingestion>");
+		expect(rendered).toContain("For YouTube, podcasts, webinars, screen recordings");
+		expect(rendered).toContain('Do not let "recover the full transcript" silently replace');
+		expect(rendered).toContain("transcript/caption retrieval fails after two attempts");
+		expect(rendered).toContain("produce an evidence-scoped draft");
+		expect(rendered).toContain("Evidence used");
+		expect(rendered).toContain("Limitations");
+		expect(rendered).toContain("Never spend an extended turn repeatedly trying to ingest the same blocked video");
+	});
+
+	test("system-prompt distinguishes informational questions from explicit implementation requests", async () => {
+		const templatePath = path.join(systemPromptsDir, "system-prompt.md");
+		const template = await Bun.file(templatePath).text();
+		const rendered = prompt.render(template, baseRenderContext);
+
+		expect(countOccurrences(rendered, "Informational questions are answer-only/read-only")).toBe(1);
+		expect(rendered).toContain("unless the user explicitly requests a change, command, or execution");
+		expect(rendered).toContain("Clear, low-risk implementation requests use direct tools");
+		expect(rendered).toContain("Vague requirements use `/skill:deep-interview`");
+	});
+
+	test("keeps system and project as separate ordered blocks; volatile facts excluded from stable prefix", async () => {
 		await withTempDir(async dir => {
+			const workspaceTree = {
+				rootPath: dir,
+				rendered: ".\n  - src/        1m",
+				truncated: false,
+				totalLines: 2,
+				agentsMdFiles: [],
+			};
 			const { systemPrompt } = await buildSystemPrompt({
 				cwd: dir,
 				contextFiles: [],
 				skills: [],
 				rules: [],
 				toolNames: ["read"],
-				workspaceTree: {
-					rootPath: dir,
-					rendered: ".\n  - src/        1m",
-					truncated: false,
-					totalLines: 2,
-					agentsMdFiles: [],
-				},
+				workspaceTree,
 			});
 
 			expect(systemPrompt).toHaveLength(2);
 			expect(systemPrompt[0]).toContain("<completion-contract>");
 			expect(systemPrompt[0]).not.toContain("current working directory");
 			expect(systemPrompt[1]).toContain("<workstation>");
-			expect(systemPrompt[1]).toContain("<workspace-tree>");
-			expect(systemPrompt[1]).toContain("Today is ");
-			expect(systemPrompt[1]).toContain(`current working directory is '${dir}'.`);
-			expect(systemPrompt[1].indexOf("</workspace-tree>")).toBeLessThan(systemPrompt[1].indexOf("Today is "));
+			// Volatile facts must NOT appear in the stable system prefix anymore.
+			expect(systemPrompt[1]).not.toContain("<workspace-tree>");
+			expect(systemPrompt[1]).not.toContain("Today is ");
+			expect(systemPrompt[1]).not.toContain("current working directory is");
+
+			// They are delivered via the per-turn volatile context instead.
+			const volatile = buildVolatileProjectContext({ cwd: dir, workspaceTree });
+			expect(volatile).toContain("<workspace-tree>");
+			expect(volatile).toContain("Today is ");
+			expect(volatile).toContain(`current working directory is '${dir}'.`);
+			expect(volatile.indexOf("</workspace-tree>")).toBeLessThan(volatile.indexOf("Today is "));
 		});
 	});
 	test("buildSystemPrompt wires SYSTEM.md customization without replacing the base prompt", async () => {
@@ -299,29 +336,32 @@ describe("system Handlebars prompt templates", () => {
 		});
 	});
 
-	test("buildSystemPrompt renders workspace tree after directory context in project prompt", async () => {
+	test("renders workspace tree in the per-turn volatile context, not the stable project prompt", async () => {
 		await withTempDir(async dir => {
+			const workspaceTree = {
+				rootPath: dir,
+				rendered: ".\n  - src/        1m",
+				truncated: true,
+				totalLines: 2,
+				agentsMdFiles: ["packages/coding-agent/AGENTS.md"],
+			};
 			const { systemPrompt } = await buildSystemPrompt({
 				cwd: dir,
 				contextFiles: [],
 				skills: [],
 				rules: [],
 				toolNames: ["read"],
-				workspaceTree: {
-					rootPath: dir,
-					rendered: ".\n  - src/        1m",
-					truncated: true,
-					totalLines: 2,
-					agentsMdFiles: ["packages/coding-agent/AGENTS.md"],
-				},
+				workspaceTree,
 			});
 
 			const projectPrompt = systemPrompt[1] ?? "";
+			// The stable project prompt no longer carries the mtime-sorted tree.
+			expect(projectPrompt).not.toContain("<workspace-tree>");
 
-			expect(projectPrompt).toContain("<workspace-tree>");
-			expect(projectPrompt).toContain("Working directory layout (sorted by mtime, recent first; depth ≤ 3):");
-			expect(projectPrompt).toContain("(some entries elided to keep the tree short");
-			expect(projectPrompt.indexOf("</dir-context>")).toBeLessThan(projectPrompt.indexOf("<workspace-tree>"));
+			const volatile = buildVolatileProjectContext({ cwd: dir, workspaceTree });
+			expect(volatile).toContain("<workspace-tree>");
+			expect(volatile).toContain("Working directory layout (sorted by mtime, recent first; depth ≤ 3):");
+			expect(volatile).toContain("(some entries elided to keep the tree short");
 		});
 	});
 

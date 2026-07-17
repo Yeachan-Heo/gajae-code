@@ -42,10 +42,10 @@ function createActiveGoalState() {
 function createDiscoverySessionHooks(): Partial<ToolSession> {
 	const selected: string[] = [];
 	return {
-		isMCPDiscoveryEnabled: () => true,
-		getDiscoverableMCPTools: () => [],
-		getSelectedMCPToolNames: () => [...selected],
-		activateDiscoveredMCPTools: async toolNames => {
+		isToolDiscoveryEnabled: () => true,
+		getDiscoverableTools: () => [],
+		getSelectedDiscoveredToolNames: () => [...selected],
+		activateDiscoveredTools: async toolNames => {
 			const activated: string[] = [];
 			for (const name of toolNames) {
 				if (!selected.includes(name)) {

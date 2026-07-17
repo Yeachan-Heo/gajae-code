@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { auditPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
+import { initialPhaseForSkill } from "../../src/skill-state/initial-phase";
+import { buildWorkflowStateReceipt } from "../../src/skill-state/workflow-state-contract";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -118,6 +120,72 @@ describe("G5 gjc state receipts", () => {
 			);
 			expect(handoffEntries).toHaveLength(2);
 			for (const entry of handoffEntries) expectAuditEntry(entry, "handoff");
+		});
+	});
+});
+
+describe("workflow receipt path contract", () => {
+	it("uses session-layout receipt paths for every workflow mode", async () => {
+		await withTempCwd(async cwd => {
+			const sessionId = "receipt/session.id";
+			for (const skill of ["deep-interview", "ralplan", "ultragoal", "team"] as const) {
+				const result = await runNativeStateCommand(
+					[
+						"write",
+						"--mode",
+						skill,
+						"--session-id",
+						sessionId,
+						"--input",
+						JSON.stringify({ current_phase: initialPhaseForSkill(skill) }),
+					],
+					cwd,
+				);
+				expect(result.status).toBe(0);
+				const cli = JSON.parse(result.stdout ?? "{}") as Record<string, unknown>;
+				const storagePath = modeStatePath(cwd, sessionId, skill);
+				const activePath = path.join(path.dirname(storagePath), "skill-active-state.json");
+				const state = await readJson(storagePath);
+				const receipt = state.receipt as Record<string, unknown>;
+				const statePath = receipt.state_path as string;
+				const checksum = receipt.content_sha256 as Record<string, unknown>;
+
+				expect(path.normalize(cli.state_path as string)).toBe(path.normalize(receipt.state_path as string));
+				expect(path.normalize(receipt.state_path as string)).toBe(path.normalize(activePath));
+				expect(path.normalize(receipt.storage_path as string)).toBe(path.normalize(storagePath));
+				expect(path.normalize(checksum.covered_path as string)).toBe(
+					path.normalize(receipt.storage_path as string),
+				);
+				await expect(fs.stat(statePath)).resolves.toBeDefined();
+				await expect(fs.stat(storagePath)).resolves.toBeDefined();
+			}
+		});
+	});
+
+	it("rejects missing receipt sessions instead of constructing a default path", async () => {
+		expect(() =>
+			buildWorkflowStateReceipt({
+				cwd: process.cwd(),
+				skill: "ralplan",
+				owner: "gjc-state-cli",
+				command: "gjc state ralplan write",
+				sessionId: " ",
+			}),
+		).toThrow("non-empty GJC session id");
+
+		await withTempCwd(async cwd => {
+			const sessionId = process.env.GJC_SESSION_ID;
+			delete process.env.GJC_SESSION_ID;
+			try {
+				const result = await runNativeStateCommand(
+					["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "planner" })],
+					cwd,
+				);
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("session id is required");
+			} finally {
+				if (sessionId !== undefined) process.env.GJC_SESSION_ID = sessionId;
+			}
 		});
 	});
 });

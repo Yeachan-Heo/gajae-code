@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Agent, type AgentTool, ThinkingLevel } from "@gajae-code/agent-core";
-import type { SimpleStreamOptions } from "@gajae-code/ai";
+import type { ImageContent, SimpleStreamOptions } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createAssistantMessage } from "./helpers";
@@ -47,6 +47,45 @@ describe("Agent", () => {
 		expect(agent.state.messages[agent.state.messages.length - 1].role).toBe("assistant");
 	});
 
+	it("continue() honors forced one-at-a-time follow-ups even when batching is enabled", async () => {
+		const mock = createMockModel({
+			responses: [{ content: ["Processed 1"] }, { content: ["Processed 2"] }],
+		});
+		const agent = new Agent({ streamFn: mock.stream, followUpMode: "all" });
+
+		agent.replaceMessages([
+			{
+				role: "user",
+				content: [{ type: "text", text: "Initial" }],
+				timestamp: Date.now() - 10,
+			},
+			createAssistantMessage([{ type: "text", text: "Initial response" }]),
+		]);
+
+		agent.followUp(
+			{
+				role: "user",
+				content: [{ type: "text", text: "Queued follow-up 1" }],
+				timestamp: Date.now(),
+			},
+			{ forceOneAtATime: true },
+		);
+		agent.followUp(
+			{
+				role: "user",
+				content: [{ type: "text", text: "Queued follow-up 2" }],
+				timestamp: Date.now() + 1,
+			},
+			{ forceOneAtATime: true },
+		);
+
+		await expect(agent.continue()).resolves.toBeUndefined();
+
+		const recentMessages = agent.state.messages.slice(-4);
+		expect(recentMessages.map(m => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
+		expect(mock.calls.length).toBe(2);
+	});
+
 	it("continue() should keep one-at-a-time steering semantics from assistant tail", async () => {
 		const mock = createMockModel({
 			responses: [{ content: ["Processed 1"] }, { content: ["Processed 2"] }],
@@ -80,6 +119,34 @@ describe("Agent", () => {
 		expect(mock.calls.length).toBe(2);
 	});
 
+	it("prompt() rejects image-placeholder-only text without image payload", async () => {
+		const mock = createMockModel({ responses: [{ content: ["unreachable"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+
+		await expect(agent.prompt("[image 1]")).rejects.toThrow("#paste-image");
+		await expect(agent.prompt("[image 1]\n[image 2]", [])).rejects.toThrow("@path/to/image.png");
+		expect(mock.calls).toHaveLength(0);
+	});
+
+	it("prompt() allows image-placeholder-only text when image payload is attached", async () => {
+		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		const image: ImageContent = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
+
+		await expect(agent.prompt("[image 1]", [image])).resolves.toBeUndefined();
+
+		expect(mock.calls).toHaveLength(1);
+		expect(mock.calls[0].context.messages[0].content).toEqual([{ type: "text", text: "[image 1]" }, image]);
+	});
+
+	it("prompt() allows normal text that mentions an image placeholder", async () => {
+		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+
+		await expect(agent.prompt("Please explain why [image 1] is missing.")).resolves.toBeUndefined();
+
+		expect(mock.calls).toHaveLength(1);
+	});
 	it("prompt() refreshes tools and system prompt between same-turn model calls", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		type Details = { value: string };
@@ -297,5 +364,39 @@ describe("Agent", () => {
 		agent.setMetadataResolver(undefined);
 		expect(agent.metadataForProvider("any")).toEqual({ user_id: "static" });
 		expect(agent.metadata).toEqual({ user_id: "static" });
+	});
+	it("preserves HTTP status from thrown transport errors", async () => {
+		for (const [property, status] of [
+			["errorStatus", 401],
+			["status", 502],
+		] as const) {
+			const mock = createMockModel();
+			const streamFn = async () => {
+				throw Object.assign(new Error("transport failed"), { [property]: status });
+			};
+			const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+
+			await agent.prompt("hello");
+
+			const message = agent.state.messages.at(-1);
+			expect(message?.role).toBe("assistant");
+			if (message?.role !== "assistant") throw new Error("Expected synthesized assistant error");
+			expect(message.errorStatus).toBe(status);
+		}
+	});
+
+	it("prioritizes errorStatus over HTTP status mentioned in a transport error message", async () => {
+		const mock = createMockModel();
+		const streamFn = async () => {
+			throw Object.assign(new Error("request failed after HTTP 502"), { errorStatus: 401 });
+		};
+		const agent = new Agent({ initialState: { model: mock.model }, streamFn });
+
+		await agent.prompt("hello");
+
+		const message = agent.state.messages.at(-1);
+		expect(message?.role).toBe("assistant");
+		if (message?.role !== "assistant") throw new Error("Expected synthesized assistant error");
+		expect(message.errorStatus).toBe(401);
 	});
 });

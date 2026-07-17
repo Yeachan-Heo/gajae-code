@@ -115,6 +115,17 @@ export interface ModeChangeEntry extends SessionEntryBase {
 	data?: Record<string, unknown>;
 }
 
+export interface ConfiguredModelChainEntry extends SessionEntryBase {
+	type: "configured_model_chain";
+	role: string;
+	entries: readonly string[];
+	origin: string;
+	identity?: string;
+	explicitHead: boolean;
+	/** Whether this entry removes the configured chain for its role. */
+	cleared?: boolean;
+}
+
 export interface CustomCompactionSessionEntries {}
 
 export type SessionEntry =
@@ -131,6 +142,7 @@ export type SessionEntry =
 	| MCPToolSelectionEntry
 	| SessionInitEntry
 	| ModeChangeEntry
+	| ConfiguredModelChainEntry
 	| CustomCompactionSessionEntries[keyof CustomCompactionSessionEntries];
 
 export interface ReadonlySessionManager {

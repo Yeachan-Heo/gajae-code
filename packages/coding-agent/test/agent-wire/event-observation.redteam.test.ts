@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { AGENT_WIRE_EVENT_TYPES } from "../../src/modes/shared/agent-wire/event-contract";
-import { observeAgentSessionEvent, observeRpcOutboundFrame } from "../../src/modes/shared/agent-wire/event-observation";
+import { observeAgentSessionEvent, observeAgentWireFrame } from "../../src/modes/shared/agent-wire/event-observation";
 import { EVENT_FIXTURES } from "./fixtures";
 
 const SECRET_MARKERS = [
@@ -61,7 +61,6 @@ describe("agent-wire event observation red-team", () => {
 			{ type: "tool_execution_end", toolCallId: null, toolName: {}, result: LONG_SECRET, isError: "yes" },
 			{ type: "auto_retry_start", attempt: "first", errorMessage: LONG_SECRET },
 			{ type: "auto_retry_end", success: "true", attempt: null },
-			{ type: "retry_fallback_applied", role: { text: LONG_SECRET } },
 			{ type: "ttsr_triggered", rules: null },
 			{ type: "notice", level: 17, message: LONG_SECRET, source: { raw: LONG_SECRET } },
 			{ type: "goal_updated", goal: LONG_SECRET },
@@ -128,13 +127,13 @@ describe("agent-wire event observation red-team", () => {
 		];
 
 		for (const frame of frames) {
-			expect(() => observeRpcOutboundFrame(frame as Record<string, unknown>)).not.toThrow();
-			expect(observeRpcOutboundFrame(frame as Record<string, unknown>)).toBeNull();
+			expect(() => observeAgentWireFrame(frame as Record<string, unknown>)).not.toThrow();
+			expect(observeAgentWireFrame(frame as Record<string, unknown>)).toBeNull();
 		}
 	});
 
 	it("bounds failed response object and string errors", () => {
-		const objectError = observeRpcOutboundFrame({
+		const objectError = observeAgentWireFrame({
 			type: "response",
 			command: `prompt ${LONG_SECRET}`,
 			id: "r-object",
@@ -145,7 +144,7 @@ describe("agent-wire event observation red-team", () => {
 		expect(String(objectError?.evidence.code ?? "").length).toBeLessThanOrEqual(200);
 		assertBoundedAndRedacted(objectError);
 
-		const stringError = observeRpcOutboundFrame({
+		const stringError = observeAgentWireFrame({
 			type: "response",
 			command: "prompt",
 			id: "r-string",

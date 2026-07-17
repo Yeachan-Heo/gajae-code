@@ -14,6 +14,7 @@ Performs structural AST-aware rewrites via native ast-grep.
 </instruction>
 
 <output>
+- Output is a **staged preview** — nothing touches disk until you call `resolve` with `action: "apply"`; call `resolve` with `action: "discard"` to reject the staged rewrite
 - Replacement summary, per-file replacement counts, and change diffs as `-LINE+ID|before` / `+LINE+ID|after` lines
 - Parse issues when files cannot be processed
 </output>

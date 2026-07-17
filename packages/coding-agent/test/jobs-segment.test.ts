@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
-import { StatusLineComponent } from "../src/modes/components/status-line";
 import { STATUS_LINE_PRESETS } from "../src/modes/components/status-line/presets";
 import { renderSegment, type SegmentContext } from "../src/modes/components/status-line/segments";
+import { StatusLineComponent } from "../src/modes/components/tool-status-header";
 import { EMPTY_JOBS_SNAPSHOT, type JobsSnapshot } from "../src/modes/jobs-observer";
 import { initTheme } from "../src/modes/theme/theme";
 

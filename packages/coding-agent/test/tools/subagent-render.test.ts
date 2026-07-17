@@ -3,7 +3,11 @@ import type { Theme } from "../../src/modes/theme/theme";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import type { AgentProgress } from "../../src/task/types";
 import type { SubagentSnapshot, SubagentToolDetails } from "../../src/tools/subagent";
-import { subagentBodyCacheTestHooks, subagentToolRenderer } from "../../src/tools/subagent-render";
+import {
+	subagentAwaitRenderedStateSignature,
+	subagentBodyCacheTestHooks,
+	subagentToolRenderer,
+} from "../../src/tools/subagent-render";
 
 let theme: Theme;
 
@@ -270,6 +274,38 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("Model: anthropic/claude-opus-4-8");
 		expect(out).toContain("requested openai-codex/gpt-5.5");
 		expect(out).toContain("fell back");
+	});
+});
+
+describe("interrupted await receipts", () => {
+	it("renders the interruption state and bounded sanitized active guidance", () => {
+		const unsafeGuidance = `Inspect\t${"x".repeat(400)}`;
+		const details: SubagentToolDetails = {
+			interrupted: true,
+			awaitOutcome: "interrupted",
+			subagents: [
+				snapshot({ id: "0-Running\tUnsafe", status: "running", guidance: unsafeGuidance }),
+				snapshot({ id: "0-Terminal", status: "completed" }),
+			],
+		};
+		const out = render(details);
+
+		expect(out).toContain("Subagent await interrupted");
+		expect(out).toContain("child subagents continue");
+		expect(out).toMatch(/0-Running\s+Unsafe/);
+		expect(out).not.toContain("\t");
+		expect(out).not.toContain("x".repeat(200));
+		expect(out).not.toContain("0-Terminal\n  Inspect");
+	});
+
+	it("includes changed interruption guidance in the receipt signature and body cache key", () => {
+		const active = snapshot({ id: "0-Await", guidance: "Await interrupted; inspect it." });
+		const terminal = snapshot({ id: "0-Await", guidance: undefined });
+
+		expect(subagentAwaitRenderedStateSignature([active])).not.toBe(subagentAwaitRenderedStateSignature([terminal]));
+		expect(subagentAwaitRenderedStateSignature([terminal])).not.toBe(
+			subagentAwaitRenderedStateSignature([terminal], { awaitOutcome: "interrupted", interrupted: true }),
+		);
 	});
 });
 

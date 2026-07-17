@@ -145,7 +145,12 @@ export default class Session extends Command {
 			}
 
 			if (action === "force-close" || action === "force-remove") {
-				const closed = forceCloseGjcTmuxSession(sessionName, process.env, flags["session-id"], flags["state-file"]);
+				const closed = await forceCloseGjcTmuxSession(
+					sessionName,
+					process.env,
+					flags["session-id"],
+					flags["state-file"],
+				);
 				if (json) {
 					writeJson({ ok: true, session: sessionJson(closed) });
 					return;

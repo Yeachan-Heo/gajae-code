@@ -1,4 +1,12 @@
-import { type Component, Container, Markdown, Spacer, Text } from "@gajae-code/tui";
+import {
+	type Component,
+	Container,
+	Markdown,
+	Spacer,
+	Text,
+	type ViewportAnchorRender,
+	type ViewportAnchorSource,
+} from "@gajae-code/tui";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 
 // OSC 133 shell integration: marks prompt zones for terminal multiplexers
@@ -10,8 +18,11 @@ const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
  * Component that renders a user message
  */
 export class UserMessageComponent extends Container {
-	constructor(text: string, synthetic = false) {
+	#viewportAnchorSource?: ViewportAnchorSource;
+
+	constructor(text: string, synthetic = false, viewportAnchorId?: string) {
 		super();
+		if (viewportAnchorId) this.#viewportAnchorSource = { id: viewportAnchorId };
 		const bgColor = (value: string) => theme.bg("userMessageBg", value);
 		const color = synthetic
 			? (value: string) => theme.fg("dim", value)
@@ -19,7 +30,9 @@ export class UserMessageComponent extends Container {
 		this.addChild(new Spacer(1));
 		const label = synthetic ? "replay" : "user";
 		this.addChild(new Text(theme.bold(theme.fg("accent", label)), 1, 0));
-		this.addChild(new PromptZoneMarkdown(text, bgColor, color));
+		const prompt = new PromptZoneMarkdown(text, bgColor, color);
+		this.addChild(prompt);
+		if (this.#viewportAnchorSource) this.setViewportAnchorSource(prompt, this.#viewportAnchorSource);
 	}
 }
 
@@ -37,15 +50,19 @@ class PromptZoneMarkdown implements Component {
 		this.#markdown.invalidate();
 	}
 
-	render(width: number): string[] {
-		const lines = this.#markdown.render(width);
-		if (lines.length === 0) {
-			return lines;
-		}
-
+	#withPromptZone(lines: string[]): string[] {
+		if (lines.length === 0) return lines;
 		const zoned = [...lines];
 		zoned[0] = OSC133_ZONE_START + zoned[0];
 		zoned[zoned.length - 1] = `${zoned[zoned.length - 1]}${OSC133_ZONE_END}${OSC133_ZONE_FINAL}`;
 		return zoned;
+	}
+
+	renderWithViewportAnchorSource(width: number, source: ViewportAnchorSource): ViewportAnchorRender {
+		const rendered = this.#markdown.renderWithViewportAnchorSource(width, source);
+		return { lines: this.#withPromptZone(rendered.lines), anchors: rendered.anchors };
+	}
+	render(width: number): string[] {
+		return this.#withPromptZone(this.#markdown.render(width));
 	}
 }

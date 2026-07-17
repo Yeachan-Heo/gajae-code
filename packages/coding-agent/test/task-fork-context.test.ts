@@ -6,9 +6,11 @@ import { parseAgentFields } from "../src/discovery/helpers";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src/sdk";
 import * as sdkModule from "../src/sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../src/session/agent-session";
-import { TaskTool } from "../src/task";
+import { resolveForkContextMaxTokens, TaskTool } from "../src/task";
 import { getBundledAgent } from "../src/task/agents";
 import * as discoveryModule from "../src/task/discovery";
+import { trimForkContextSeedForModel } from "../src/task/executor";
+import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "../src/task/fork-context-budget";
 import type { AgentDefinition, TaskParams } from "../src/task/types";
 import { getTaskSchema, taskSchema } from "../src/task/types";
 import type { ToolSession } from "../src/tools";
@@ -160,6 +162,18 @@ function createSeed(text = "seed"): ForkContextSeed {
 		cacheIdentity: "parent-cache-id",
 	};
 }
+
+test("normalizes invalid fork-context token caps and enforces the child context ceiling", () => {
+	expect(resolveForkContextMaxTokens(Number.NaN, { contextWindow: 1_000 } as Model)).toBe(150);
+	expect(resolveForkContextMaxTokens(Number.POSITIVE_INFINITY, undefined)).toBe(15_000);
+	expect(resolveForkContextMaxTokens(0.5, undefined)).toBe(1);
+	const seed = createSeed("seed ".repeat(2_000));
+	seed.metadata.maxTokens = 10_000;
+	const trimmed = trimForkContextSeedForModel(seed, { contextWindow: 1_000 } as Model);
+	expect(trimmed.messages).toEqual([]);
+	expect(trimmed.metadata.maxTokens).toBe(0);
+	expect(trimmed.metadata.skippedReasons["child-context-ceiling"]).toBe(1);
+});
 
 describe("fork context policy surface", () => {
 	afterEach(() => {
@@ -398,7 +412,7 @@ describe("fork context policy surface", () => {
 			],
 		});
 
-		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 50, maxTokens: 250, signal: undefined });
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 50, maxTokens: 8000, signal: undefined });
 		expect(getOptions()?.forkContextSeed).toBe(seed);
 		expect(getOptions()?.providerSessionId).toBeUndefined();
 		expect(getOptions()?.providerSessionState).toBeUndefined();
@@ -464,9 +478,82 @@ describe("fork context policy surface", () => {
 			],
 		});
 
-		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 3, maxTokens: 250, signal: undefined });
+		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 3, maxTokens: 8000, signal: undefined });
 	});
 
+	test("uses shared advisory token budgets for receipt, last-turn, bounded, and none fork-context seeds", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const seedBuilder = vi.fn(async () => createSeed());
+		const { getOptions } = mockCreateAgentSession();
+		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "NoForkSeed",
+					description: "seed",
+					assignment: "Use no inherited context.",
+					inheritContext: "none",
+				},
+			],
+		});
+		expect(FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.none).toBe(0);
+		expect(seedBuilder).not.toHaveBeenCalled();
+		expect(getOptions()?.forkContextSeed).toBeUndefined();
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "ReceiptForkSeed",
+					description: "seed",
+					assignment: "Use receipt context.",
+					inheritContext: "receipt",
+				},
+			],
+		});
+		expect(seedBuilder).toHaveBeenLastCalledWith({
+			maxMessages: 1,
+			maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.receipt,
+			signal: undefined,
+		});
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "LastTurnForkSeed",
+					description: "seed",
+					assignment: "Use last turn context.",
+					inheritContext: "last-turn",
+				},
+			],
+		});
+		expect(seedBuilder).toHaveBeenLastCalledWith({
+			maxMessages: 2,
+			maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE["last-turn"],
+			preserveLatestUser: true,
+			signal: undefined,
+		});
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "BoundedForkSeedBudget",
+					description: "seed",
+					assignment: "Use bounded context.",
+					inheritContext: "bounded",
+				},
+			],
+		});
+		expect(seedBuilder).toHaveBeenLastCalledWith({
+			maxMessages: 50,
+			maxTokens: FORK_CONTEXT_TOKEN_BUDGET_BY_MODE.bounded,
+			signal: undefined,
+		});
+	});
 	test("uses reduced model-window fallback for full fork-context seeds", async () => {
 		mockAgents([createAgent("executor", "allowed")]);
 		const seed = createSeed();

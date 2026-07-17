@@ -55,6 +55,9 @@ function createYieldingSession(output: string): AgentSession {
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},
+		setConfiguredModelChain: () => {},
+		getConfiguredModelChain: () => undefined,
+		seedDefaultFallbackResolution: () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {

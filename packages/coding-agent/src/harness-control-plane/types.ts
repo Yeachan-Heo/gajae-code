@@ -155,7 +155,7 @@ export interface SessionHandle {
 	base: string | null;
 	issueOrPr: string | null;
 	processHandle: { kind: "runtime-owner"; ownerId: string | null; pid: number | null };
-	rpcHandle: { kind: "rpc-subprocess"; pid: number | null; sessionDir: string };
+	sdkHandle: { kind: "sdk-session-endpoint"; sessionId: string };
 	ownerHandle: { leasePath: string; endpoint: string | null; heartbeatAt: string | null };
 	routerHandle: { kind: "default-in-owner"; policy: string; eventsPath: string };
 	viewportHandle: { kind: "event-monitor"; tmuxSessionName: string | null; viewOnly: true };

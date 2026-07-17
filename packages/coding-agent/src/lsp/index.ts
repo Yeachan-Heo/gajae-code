@@ -82,7 +82,7 @@ export type { LspToolDetails } from "./types";
 
 export interface LspStartupServerInfo {
 	name: string;
-	status: "connecting" | "ready" | "error";
+	status: "idle" | "connecting" | "ready" | "error";
 	fileTypes: string[];
 	error?: string;
 }
@@ -102,7 +102,7 @@ export function discoverStartupLspServers(cwd: string): LspStartupServerInfo[] {
 	const config = loadConfig(cwd);
 	return getLspServers(config).map(([name, serverConfig]) => ({
 		name,
-		status: "connecting",
+		status: "idle",
 		fileTypes: serverConfig.fileTypes,
 	}));
 }

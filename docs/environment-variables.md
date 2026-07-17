@@ -135,23 +135,21 @@ When `ANTHROPIC_MODEL_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to
 
 ### Amazon Bedrock
 
-| Variable                                                                        | Default / behavior                                                                            |
-| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `AWS_REGION`                                                                    | Primary region source                                                                         |
-| `AWS_DEFAULT_REGION`                                                            | Fallback if `AWS_REGION` unset                                                                |
-| `AWS_PROFILE`                                                                   | Enables named profile auth path                                                               |
-| `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`                                   | Enables IAM key auth path                                                                     |
-| `AWS_BEARER_TOKEN_BEDROCK`                                                      | Enables bearer token auth path                                                                |
-| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` / `AWS_CONTAINER_CREDENTIALS_FULL_URI` | Enables ECS task credential path                                                              |
-| `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`                                  | Enables web identity auth path                                                                |
-| `AWS_BEDROCK_SKIP_AUTH`                                                         | If `1`, injects dummy credentials (proxy/non-auth scenarios)                                  |
-| `AWS_BEDROCK_FORCE_HTTP1`                                                       | If `1`, forces Node HTTP/1 request handler                                                    |
-| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`                                      | Routes Bedrock runtime and AWS SSO credential calls through the configured proxy using HTTP/1 |
-| `NO_PROXY`                                                                      | Excludes matching hosts from proxy routing when a proxy variable is configured                |
+| Variable | Default / behavior |
+| --- | --- |
+| `AWS_REGION` | Primary region source |
+| `AWS_DEFAULT_REGION` | Fallback if `AWS_REGION` is unset |
+| `AWS_BEARER_TOKEN_BEDROCK` | Uses bearer-token authentication (`Authorization: Bearer <token>`) instead of SigV4 |
+| `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` + optional `AWS_SESSION_TOKEN` | Static environment credentials for SigV4 authentication |
+| `AWS_PROFILE` | Selects a named `~/.aws/credentials` / `~/.aws/config` profile; static, SSO, and `credential_process` profiles are supported |
+| `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE` | Override the named profile credentials and config file paths |
+| `AWS_EC2_METADATA_DISABLED` | Set to `true` to disable the final EC2 IMDSv2 credential fallback |
+| `AWS_BEDROCK_SKIP_AUTH` | Truthy values (`1`, `y`, `true`, `yes`, or `on`, case-insensitive) use dummy SigV4 credentials for non-auth proxy scenarios |
+| `HTTPS_PROXY` | Honored by Bun's native HTTPS proxy support |
 
 Region fallback in provider code: `options.region` → `AWS_REGION` → `AWS_DEFAULT_REGION` → `us-east-1`.
 
-Credential fallback order is static env (`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` plus optional `AWS_SESSION_TOKEN`), named profile / SSO / `credential_process`, then EC2 IMDSv2. `models.yml` Bedrock entries use `api: bedrock-converse-stream` and do not require `apiKey` or `apiKeyEnv` because the provider signs requests from this AWS chain.
+Authentication uses `AWS_BEARER_TOKEN_BEDROCK` when set; otherwise credential fallback order is complete static environment credentials, the selected named profile (static, SSO, or `credential_process`), then EC2 IMDSv2 unless `AWS_EC2_METADATA_DISABLED=true`. Region and IMDS controls use the normal merged environment, including project `cwd/.env`; bearer tokens, static credentials, profiles, and credential file selectors use the credential environment, so project `cwd/.env` credential values are excluded. ECS task credentials and IRSA/web-identity credentials are not implemented. `models.yml` Bedrock entries use `api: bedrock-converse-stream` and do not require `apiKey` or `apiKeyEnv` because the provider authenticates through this AWS chain.
 
 ### Azure OpenAI Responses
 
@@ -250,21 +248,17 @@ This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a 
 | `GJC_TMUX_COMMAND` | tmux binary/name override for every GJC tmux flow (`GJC_TEAM_TMUX_COMMAND` is honored as a team-path alias). This is not a shell command line; include only the executable path/name, not flags. |
 | `GJC_TMUX_PROFILE` | Set `0`/`false`/`off` to apply only the required ownership tags and skip the scroll/mouse/clipboard profile |
 | `GJC_MOUSE` | Set `0`/`false`/`off` to skip `mouse on`, leaving wheel scrolling to the host terminal instead of tmux copy-mode |
-| `GJC_PSMUX_COMMAND` | Force the resolved multiplexer to be treated as psmux (skips the version-banner probe). Useful when the binary is a thin wrapper that does not advertise `psmux` in `-V` output. |
-| `GJC_PSMUX_DETECTION` | Set `0`/`false`/`off` to skip psmux detection entirely. GJC falls back to treating the resolved command as plain tmux. |
+| `GJC_PSMUX_COMMAND` | Identifies a psmux wrapper for Windows alias resolution. The value must resolve to the same executable identity as the selected `tmux` command; unresolved or conflicting evidence fails closed. |
+| `GJC_PSMUX_DETECTION` | Set `0`/`false`/`off` to skip banner-based psmux detection. Executable-name and alias-identity safety checks still apply. |
 | `GJC_PSMUX_FORCE_DETECT` | Set `1`/`true`/`on` to re-probe the multiplexer on every call instead of caching the per-process verdict. |
 
-#### Windows psmux support
+#### Windows psmux detection boundary
 
-On native Windows, [psmux](https://github.com/psmux/psmux) is the supported tmux-compatible multiplexer for `gjc --tmux`, `gjc session`, and `gjc team`. Psmux may be installed as `psmux.exe` or through its `tmux.exe` / `pmux.exe` aliases; the same guidance applies when `GJC_TMUX_COMMAND` is left at the default `tmux` but the executable on PATH is actually psmux.
+On native Windows, [psmux](https://github.com/psmux/psmux) may be installed as `psmux.exe`, `pmux.exe`, or a `tmux.exe` alias. The alias can report only a generic `tmux 3.3.6` banner, so GJC compares the selected `tmux.exe` executable identity with resolved `psmux.exe` / `pmux.exe` companions. A matching identity is classified as psmux; distinct identities preserve native-tmux semantics.
 
-Detection runs once per process: GJC walks `psmux`, then `pmux`, then `tmux` on Windows PATH, picks the first binary that resolves, and probes it with `<binary> -V`. The probe verdict is cached for the lifetime of the process. The cached verdict keys off the resolved binary path, so renaming or installing a different binary in the same PATH slot still gets re-probed on next launch.
+If the selected command, an explicit `GJC_PSMUX_COMMAND`, or a resolved companion cannot be identified consistently, GJC reports `gjc_tmux_provider_ambiguous` and refuses before applying native-tmux target or mutation semantics. Correct `PATH`, set `GJC_TMUX_COMMAND` to a verified executable, or make `GJC_PSMUX_COMMAND` resolve to the same wrapper identity.
 
-The probe matches the `psmux` and `pmux` substrings in the version banner. If psmux is installed under a custom wrapper that hides the version banner, set `GJC_PSMUX_COMMAND` to that wrapper path so the multiplexer is treated as psmux without a probe. To turn detection off entirely (for example to debug a non-psmux Windows tmux port), set `GJC_PSMUX_DETECTION=off`.
-
-Native Windows `gjc --tmux` builds a real PowerShell-encoded plan when psmux is on PATH: `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ...` invokes gjc inside a psmux-managed session, the same ownership-tag (`@gjc-profile`) and project/branch/session-identity markers round-trip via `set-option` / `show-options` / `list-sessions -F`, and `gjc team` spawns worker panes via `split-window` against the same psmux session. Worker commands are emitted with PowerShell-safe `$env:VAR = 'value';` assignments so psmux's ConPTY panes inherit `GJC_TEAM_*` correctly.
-
-The `mouse`, `set-clipboard`, and `mode-style` UX profile options are filtered out of the emitted profile when the resolved multiplexer is psmux because psmux historically does not round-trip those keys; the `@gjc-profile` ownership tag and the branch / project / session identity markers are still emitted because those are the ones that gate `gjc session` and `gjc team`. If you want the full UX profile on Windows, set `GJC_TMUX_COMMAND=tmux` against a real tmux binary (via WSL or a separate install).
+Managed psmux creation, attachment, lifecycle mutation, and team startup remain unsupported because psmux does not provide the immutable native session identity required by GJC's owner-isolation contract. Use WSL with native tmux, or another verified native tmux installation, for those managed flows. `/pet` separately reports actionable multiplexer graphics guidance when image escapes are unavailable.
 
 #### Windows psmux namespace boundary
 
@@ -309,7 +303,7 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 | `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/coordinator-mcp`). |
 | `GJC_COORDINATOR_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
 | `GJC_COORDINATOR_MCP_REPO` | Optional repo namespace for session/question/report state. Missing scope never widens to global session enumeration. |
-| `GJC_COORDINATOR_MCP_SESSION_COMMAND` | GJC-compatible command used by mutating session startup to launch a detached tmux session. `gjc setup hermes` renders this to `gjc --worktree` by default so Hermes-installed configs start real GJC work in a GJC-managed worktree while preserving GJC project/session resume identity. Explicit values are preserved as user intent. When manually omitted, mutating session startup fails closed unless a service adapter is injected. |
+| `GJC_COORDINATOR_MCP_SESSION_COMMAND` | Optional **typed SDK lifecycle selector**, never a shell command that the coordinator executes. The only supported values are exactly `gjc` and `gjc --worktree [name]`; the latter optionally selects the GJC-managed worktree name. Wrapper binaries, shell syntax, model/provider flags, tmux flags, and other legacy command shapes fail closed before session creation. `gjc setup hermes` renders `gjc --worktree` by default. When omitted, SDK lifecycle creation still uses the requested coordinator workdir; no coordinator-owned tmux startup or prompt injection is performed. |
 | `GJC_COORDINATOR_MCP_SETUP_MANAGED_BY` | Marker written by `gjc setup hermes` for safe managed config updates. |
 | `GJC_COORDINATOR_MCP_SETUP_SCHEMA_VERSION` | Managed setup schema version written by `gjc setup hermes`. |
 | `GJC_COORDINATOR_MCP_SETUP_SIGNATURE` | Deterministic managed setup signature used to detect safe updates versus unmanaged conflicts. |
@@ -453,7 +447,6 @@ Extra conditional behavior:
 | `GJC_TIMING`                  | If set (any non-empty value), prints a hierarchical timing-span tree to **stderr** via `logger.printTimings()`. In interactive mode the tree prints once the agent is ready (before the TUI starts); in print mode it prints after the whole prompt batch completes. Print-mode prompts are wrapped in `print:prompt:initial` / `print:prompt:next` spans so each user message shows up as its own row. `GJC_TIMING=x` exits the process with code 0 right after printing in interactive mode (use to measure cold startup only). `GJC_TIMING=full` lists every module-load entry instead of just the top N. |
 | `GJC_PACKAGE_DIR`             | Overrides package asset base dir resolution (docs/examples/changelog path lookup)                  |
 | `GJC_DISABLE_LSPMUX`          | If `1`, disables lspmux detection/integration and forces direct LSP server spawning                |
-| `GJC_RPC_EMIT_TITLE`          | Boolean-like flag enabling title events in RPC mode                                                |
 | `SMITHERY_URL`               | Smithery web URL override (default `https://smithery.ai`)                                          |
 | `SMITHERY_API_URL`           | Smithery API base URL override (default `https://api.smithery.ai`)                                 |
 | `PUPPETEER_EXECUTABLE_PATH`  | Browser tool Chromium executable override                                                          |
@@ -521,7 +514,9 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 
 | Variable                  | Behavior                                                                              |
 | ------------------------- | ------------------------------------------------------------------------------------- |
-| `GJC_NOTIFICATIONS`        | `off` / `0` / `false` suppress desktop notifications                                  |
+| `GJC_NOTIFICATIONS`       | `0` is a hard notification runtime opt-out; `1` explicitly enables the generic current-session path even without a globally configured adapter. |
+| `GJC_NOTIFICATIONS_TOKEN` | An explicit generic current-session opt-in token. It has the same runtime precedence as `GJC_NOTIFICATIONS=1`; it does not supply or override global Telegram credentials. |
+| `GJC_NOTIFY`              | `off` / `0` / `false` suppresses the notification control surface for this process, including completion notifications; global config is untouched and child processes inherit it. It wins over explicit notification opt-in. Use it for non-interactive runs (`gjc -p --no-session`) that must remain silent. |
 | `GJC_TUI_WRITE_LOG`        | If set, logs TUI writes to file                                                       |
 | `GJC_HARDWARE_CURSOR`      | If `1`, enables hardware cursor mode                                                  |
 | `GJC_CLEAR_ON_SHRINK`      | If `1`, clears empty rows when content shrinks                                        |
@@ -543,25 +538,9 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 
 ---
 
-## 11) Bridge mode (`--mode bridge`)
+## 11) Removed ingress modes
 
-Consumed by `packages/coding-agent/src/modes/bridge/*`. The bridge is a
-network-reachable control surface and is **secure-by-default**: it refuses to
-start without TLS and a bearer token, and the 0.3.1 default endpoint matrix
-fail-closes session events, commands, controller ownership, UI responses, host
-tool results, and host URI results. See `docs/bridge.md` for protocol details.
-
-| Variable | Required | Default | Behavior |
-| --- | --- | --- | --- |
-| `GJC_BRIDGE_TOKEN` | Yes | — | Bearer token required on authenticated endpoints. **Secret — never commit.** |
-| `GJC_BRIDGE_TLS_CERT` | Yes | — | Path to the TLS certificate (PEM). Startup fails closed if cert/key are missing (TLS is mandatory, including loopback). |
-| `GJC_BRIDGE_TLS_KEY` | Yes | — | Path to the TLS private key (PEM). **Secret — never commit; `chmod 600`.** |
-| `GJC_BRIDGE_HOST` | No | `127.0.0.1` | Bind hostname. |
-| `GJC_BRIDGE_PORT` | No | `4077` | Bind port (1–65535). |
-| `GJC_BRIDGE_SCOPES` | No | `prompt` | Parsed for dormant command-surface compatibility. Valid scopes: `prompt`, `control`, `bash`, `export`, `session`, `model`, `message:read`, `host_tools`, `host_uri`, `admin`. The default endpoint matrix still advertises no accepted scopes and rejects commands before scope checks. |
-
-Local development with a self-signed certificate must add the local CA to the
-client trust store; there is no plaintext or certificate-verification-bypass mode.
+`--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. The retired bridge-prefixed variables and `GJC_RPC_EMIT_TITLE` are not runtime configuration variables. Use the [SDK machine interface](./sdk.md) for external machine control.
 
 ---
 
@@ -573,6 +552,5 @@ Treat these as secrets; do not log or commit them:
 - Cloud credentials (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS` path may expose service-account material)
 - Search/provider auth vars (`EXA_API_KEY`, `BRAVE_API_KEY`, `PERPLEXITY_API_KEY`, Anthropic search keys)
 - Foundry mTLS material (`ANTHROPIC_MODEL_CODE_CLIENT_CERT`, `ANTHROPIC_MODEL_CODE_CLIENT_KEY`, `NODE_EXTRA_CA_CERTS` when it points to private CA bundles)
-- Bridge auth/TLS material (`GJC_BRIDGE_TOKEN` and the `GJC_BRIDGE_TLS_KEY` private key; never commit cert/key/token material)
 
 Python runtime also explicitly strips many common key vars before spawning kernel subprocesses (`packages/coding-agent/src/eval/py/runtime.ts`).

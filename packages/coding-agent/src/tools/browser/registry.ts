@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
@@ -12,6 +13,9 @@ import {
 	waitForCdp,
 } from "./attach";
 import { BROWSER_PROTOCOL_TIMEOUT_MS, launchHeadlessBrowser, loadPuppeteer, type UserAgentOverride } from "./launch";
+import { defaultDiscoveryEnv } from "./profile-discovery";
+import type { ProfileReusePosture } from "./profile-posture";
+import { resolveProfileReuse } from "./profile-reuse";
 
 export type BrowserKind =
 	| { kind: "headless"; headless: boolean }
@@ -29,9 +33,15 @@ export type BrowserKind =
 
 export type BrowserKindTag = BrowserKind["kind"];
 
+export interface BrowserGeo {
+	readonly timezone?: string;
+	readonly locale?: string;
+}
+
 export interface BrowserHandle {
 	key: string;
 	kind: BrowserKind;
+	readonly geo?: BrowserGeo;
 	browser: Browser;
 	cdpUrl?: string;
 	pid?: number;
@@ -43,6 +53,7 @@ export interface BrowserHandle {
 type SpawnedChromeProfileKind = Extract<BrowserKind, { kind: "chrome-profile" }>;
 
 const browsers = new Map<string, BrowserHandle>();
+const browserOpenPromises = new Map<string, Promise<BrowserHandle>>();
 
 /**
  * Upper bound on the CDP `browser.close()` round-trip during a forced (signal-path)
@@ -51,10 +62,10 @@ const browsers = new Map<string, BrowserHandle>();
  */
 const HEADLESS_FORCE_CLOSE_GRACE_MS = 1_500;
 
-function browserKey(kind: BrowserKind): string {
+function browserKey(kind: BrowserKind, geo?: BrowserGeo, profileReuse?: ProfileReusePosture): string {
 	switch (kind.kind) {
 		case "headless":
-			return `headless:${kind.headless ? "1" : "0"}`;
+			return `headless:${kind.headless ? "1" : "0"}:${profileReuse ?? "synthetic"}:${geo?.timezone ?? ""}:${geo?.locale ?? ""}`;
 		case "spawned":
 			return `spawned:${kind.path}`;
 		case "chrome-profile":
@@ -69,28 +80,90 @@ export interface AcquireBrowserOptions {
 	viewport?: { width: number; height: number; deviceScaleFactor?: number };
 	appArgs?: string[];
 	signal?: AbortSignal;
+	/**
+	 * Profile-reuse posture for the default headless path (from settings
+	 * `browser.profileReuse`, resolved by the settings-aware caller). When set,
+	 * the headless browser may warm up from an isolated copy of the user's real
+	 * Chrome profile (see profile-reuse.ts). Omitted = synthetic session.
+	 */
+	profileReuse?: ProfileReusePosture;
+	/**
+	 * Opt-in geo alignment for the default headless path (from settings
+	 * `browser.geo.*`). Default unset = no-op (real timezone/locale preserved).
+	 */
+	geo?: BrowserGeo;
+}
+
+function normalizeGeo(geo: AcquireBrowserOptions["geo"]): BrowserGeo | undefined {
+	const timezone = geo?.timezone
+		? new Intl.DateTimeFormat(undefined, { timeZone: geo.timezone }).resolvedOptions().timeZone
+		: undefined;
+	const locale = geo?.locale ? Intl.getCanonicalLocales(geo.locale)[0] : undefined;
+	return timezone || locale ? Object.freeze({ timezone, locale }) : undefined;
+}
+
+export function browserKeyForTest(
+	kind: BrowserKind,
+	opts: Pick<AcquireBrowserOptions, "geo" | "profileReuse">,
+): string {
+	const geo = kind.kind === "headless" ? normalizeGeo(opts.geo) : undefined;
+	return browserKey(kind, geo, opts.profileReuse);
 }
 
 export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
-	const key = browserKey(kind);
+	const geo = kind.kind === "headless" ? normalizeGeo(opts.geo) : undefined;
+	const key = browserKey(kind, geo, opts.profileReuse);
 	const existing = browsers.get(key);
 	if (existing) {
 		if (existing.browser.connected) return existing;
 		browsers.delete(key);
 		await disposeBrowserHandle(existing, { kill: false });
 	}
+	const pending = browserOpenPromises.get(key);
+	if (pending) return await pending;
 
-	const handle = await openBrowserHandle(kind, opts);
-	browsers.set(key, handle);
-	return handle;
+	const opening = openBrowserHandle(kind, opts, geo, key).then(handle => {
+		browsers.set(key, handle);
+		return handle;
+	});
+	browserOpenPromises.set(key, opening);
+	try {
+		return await opening;
+	} finally {
+		if (browserOpenPromises.get(key) === opening) browserOpenPromises.delete(key);
+	}
 }
 
-async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
+async function openBrowserHandle(
+	kind: BrowserKind,
+	opts: AcquireBrowserOptions,
+	geo: BrowserGeo | undefined,
+	key: string,
+): Promise<BrowserHandle> {
 	if (kind.kind === "headless") {
-		const browser = await launchHeadlessBrowser({ headless: kind.headless, viewport: opts.viewport });
+		let profileWarmupDir: string | undefined;
+		if (opts.profileReuse) {
+			const reuse = resolveProfileReuse({
+				posture: opts.profileReuse,
+				discoveryEnv: defaultDiscoveryEnv(fs.existsSync),
+			});
+			if (reuse.warning) logger.warn(reuse.warning);
+			if (reuse.mode === "real" && reuse.warmupDir) {
+				profileWarmupDir = reuse.warmupDir;
+			}
+		}
+		const browser = await launchHeadlessBrowser({
+			headless: kind.headless,
+			viewport: opts.viewport,
+			profileWarmupDir,
+			...(geo ? { geo } : {}),
+		});
 		return {
-			key: browserKey(kind),
+			key,
+
 			kind,
+			geo,
+
 			browser,
 			refCount: 0,
 			stealth: { browserSession: null, override: null },
@@ -106,7 +179,8 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
 		return {
-			key: browserKey(kind),
+			key,
+
 			kind,
 			browser,
 			cdpUrl,
@@ -254,6 +328,7 @@ export async function openChromeProfileHandle(
 	}
 	return {
 		key: browserKey(kind),
+
 		kind,
 		browser,
 		cdpUrl,
@@ -320,6 +395,7 @@ async function openSpawnedBrowserHandle(
 	}
 	return {
 		key: browserKey(kind),
+
 		kind,
 		browser,
 		cdpUrl,
@@ -337,7 +413,7 @@ export function holdBrowser(handle: BrowserHandle): void {
 export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
 	handle.refCount = Math.max(0, handle.refCount - 1);
 	if (handle.refCount === 0) {
-		browsers.delete(handle.key);
+		if (browsers.get(handle.key) === handle) browsers.delete(handle.key);
 		await disposeBrowserHandle(handle, opts);
 	}
 }

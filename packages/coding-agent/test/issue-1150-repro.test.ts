@@ -27,6 +27,10 @@ describe("issue #1150 — release-build script must list all worker --compile en
 	const repoRoot = path.resolve(import.meta.dir, "../../..");
 	const ciScriptPath = path.join(repoRoot, "scripts/ci-release-build-binaries.ts");
 	const devScriptPath = path.join(repoRoot, "packages/coding-agent/scripts/build-binary.ts");
+	// Both build scripts now consume the shared compile-arg builder; the
+	// worker-entrypoint literals are pinned there so release and dev args
+	// cannot drift apart.
+	const compileArgsPath = path.join(repoRoot, "packages/coding-agent/scripts/compile-args.ts");
 
 	// Repo-root-relative literals — both the runtime `new Worker(...)`
 	// spawn site and the `--compile` entry must use this exact string for
@@ -37,31 +41,47 @@ describe("issue #1150 — release-build script must list all worker --compile en
 		"./packages/coding-agent/src/eval/js/worker-entry.ts",
 	];
 
-	it("scripts/ci-release-build-binaries.ts lists every worker as an explicit --compile entrypoint", async () => {
-		const source = await Bun.file(ciScriptPath).text();
+	it("shared compile-args builder lists every worker as an explicit release --compile entrypoint", async () => {
+		const source = await Bun.file(compileArgsPath).text();
 		for (const entry of workerEntrypoints) {
 			expect(
 				source.includes(`"${entry}"`),
-				`scripts/ci-release-build-binaries.ts must include "${entry}" as a --compile entrypoint so Bun emits the worker into bunfs in the published binary`,
+				`packages/coding-agent/scripts/compile-args.ts must include "${entry}" in releaseEntrypoints so Bun emits the worker into bunfs in the published binary`,
 			).toBe(true);
 		}
 	});
 
-	it("packages/coding-agent/scripts/build-binary.ts lists every worker as an explicit --compile entrypoint", async () => {
+	it("scripts/ci-release-build-binaries.ts consumes the shared release compile args", async () => {
+		const source = await Bun.file(ciScriptPath).text();
+		expect(
+			source.includes("buildReleaseCompileArgs"),
+			"scripts/ci-release-build-binaries.ts must build its --compile args via buildReleaseCompileArgs so the worker-entrypoint contract holds for shipped artifacts",
+		).toBe(true);
+	});
+
+	it("shared compile-args builder lists every dev worker --compile entrypoint", async () => {
 		// Dev script's cwd is packages/coding-agent and its `--root ../..`
 		// resolves to repo root, so its entry strings are package-relative
 		// (not repo-relative) but produce the same bunfs path.
-		const devEntrypoints = [
+		const devWorkerEntrypoints = [
 			"../stats/src/sync-worker.ts",
 			"./src/tools/browser/tab-worker-entry.ts",
 			"./src/eval/js/worker-entry.ts",
 		];
-		const source = await Bun.file(devScriptPath).text();
-		for (const entry of devEntrypoints) {
+		const source = await Bun.file(compileArgsPath).text();
+		for (const entry of devWorkerEntrypoints) {
 			expect(
 				source.includes(`"${entry}"`),
-				`packages/coding-agent/scripts/build-binary.ts must include "${entry}" as a --compile entrypoint so dev binaries match release binaries`,
+				`packages/coding-agent/scripts/compile-args.ts must include "${entry}" in devEntrypoints so dev binaries match release binaries`,
 			).toBe(true);
 		}
+	});
+
+	it("packages/coding-agent/scripts/build-binary.ts consumes the shared dev compile args", async () => {
+		const source = await Bun.file(devScriptPath).text();
+		expect(
+			source.includes("buildDevCompileArgs"),
+			"packages/coding-agent/scripts/build-binary.ts must build its --compile args via buildDevCompileArgs so dev binaries match release binaries",
+		).toBe(true);
 	});
 });

@@ -33,6 +33,10 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 	return result.content.map(c => c.text ?? "").join("\n");
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function crc32(bytes: Uint8Array): number {
 	let crc = 0xffffffff;
 	for (const byte of bytes) {
@@ -79,6 +83,33 @@ function makeNoisePng(width: number, height: number): Buffer {
 		Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 		pngChunk("IHDR", ihdr),
 		pngChunk("IDAT", zlibSync(raw, { level: 0 })),
+		pngChunk("IEND", Buffer.alloc(0)),
+	]);
+}
+
+function makeFlatPng(width: number, height: number): Buffer {
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 6;
+	const stride = 1 + width * 4;
+	const raw = Buffer.alloc(stride * height);
+	for (let y = 0; y < height; y += 1) {
+		const row = y * stride;
+		raw[row] = 0;
+		for (let x = 0; x < width; x += 1) {
+			const offset = row + 1 + x * 4;
+			raw[offset] = 0x33;
+			raw[offset + 1] = 0x66;
+			raw[offset + 2] = 0x99;
+			raw[offset + 3] = 0xff;
+		}
+	}
+	return Buffer.concat([
+		Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+		pngChunk("IHDR", ihdr),
+		pngChunk("IDAT", zlibSync(raw)),
 		pngChunk("IEND", Buffer.alloc(0)),
 	]);
 }
@@ -258,7 +289,7 @@ describe("computer tool dispatch", () => {
 		setComputerControllerFactoryForTests(() => ({
 			screenshot: () => {
 				calls.push({ method: "screenshot", args: [] });
-				return { widthPx: 20, heightPx: 10, png: new Uint8Array([1, 2, 3]), captureId: "cap-1" };
+				return { widthPx: 20, heightPx: 10, png: new Uint8Array([1, 2, 3]), displayEpoch: 42, captureId: "cap-1" };
 			},
 			doubleClick: (...args) => {
 				calls.push({ method: "doubleClick", args });
@@ -278,7 +309,13 @@ describe("computer tool dispatch", () => {
 		await tool.execute("drag", { action: "drag", x: 1, y: 2, to_x: 3, to_y: 4 });
 		await tool.execute("scroll", { action: "scroll", x: 1, y: 2, scroll_x: 5, scroll_y: -6 });
 
-		expect(shot.details?.screenshot).toMatchObject({ widthPx: 20, heightPx: 10, pngBytes: 3, captureId: "cap-1" });
+		expect(shot.details?.screenshot).toMatchObject({
+			widthPx: 20,
+			heightPx: 10,
+			displayEpoch: 42,
+			pngBytes: 3,
+			captureId: "cap-1",
+		});
 		expect(shot.content.some(block => block.type === "image")).toBe(true);
 		const image = shot.content.find(block => block.type === "image");
 		expect(image).toMatchObject({ type: "image", mimeType: "image/png", data: "AQID" });
@@ -286,9 +323,103 @@ describe("computer tool dispatch", () => {
 		expect(await fs.stat(shot.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
 		expect(calls.map(call => call.method)).toEqual(["screenshot", "doubleClick", "drag", "scroll"]);
 		// Positional native ABI: (expectedEpoch, x, y, ...rest)
-		expect(calls[1].args).toEqual([undefined, 1, 2, "right"]);
-		expect(calls[2].args).toEqual([undefined, 1, 2, 3, 4, "left"]);
-		expect(calls[3].args).toEqual([undefined, 1, 2, 5, -6]);
+		expect(calls[1].args).toEqual([42, 1, 2, "right"]);
+		expect(calls[2].args).toEqual([42, 1, 2, 3, 4, "left"]);
+		expect(calls[3].args).toEqual([42, 1, 2, 5, -6]);
+	});
+
+	it("does not invent a display epoch before any screenshot context exists", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: Array<{ method: string; args: unknown[] }> = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: (...args) => {
+				calls.push({ method: "click", args });
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("click", { action: "click", x: 1, y: 2 });
+
+		expect(result.isError).not.toBe(true);
+		expect(calls).toEqual([{ method: "click", args: [undefined, 1, 2, "left"] }]);
+	});
+
+	it("fails closed when native controller methods are missing", async () => {
+		const cases: Array<{ name: string; params: Parameters<ComputerTool["execute"]>[1]; method: string }> = [
+			{ name: "screenshot", params: { action: "screenshot" }, method: "screenshot" },
+			{ name: "click", params: { action: "click", x: 1, y: 2 }, method: "click" },
+			{ name: "double-click", params: { action: "double_click", x: 1, y: 2 }, method: "doubleClick" },
+			{ name: "move", params: { action: "move", x: 1, y: 2 }, method: "move" },
+			{ name: "drag", params: { action: "drag", x: 1, y: 2, to_x: 3, to_y: 4 }, method: "drag" },
+			{ name: "scroll", params: { action: "scroll", x: 1, y: 2, scroll_x: 0, scroll_y: -1 }, method: "scroll" },
+			{ name: "type", params: { action: "type", text: "hello" }, method: "type" },
+			{ name: "keypress", params: { action: "keypress", keys: ["Meta", "K"] }, method: "keypress" },
+			{ name: "wait", params: { action: "wait", ms: 1 }, method: "wait" },
+		];
+
+		for (const testCase of cases) {
+			setComputerPlatformForTests("darwin");
+			setComputerArchForTests("arm64");
+			setComputerControllerFactoryForTests(() => ({}));
+			const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+			const result = await tool.execute(`missing-${testCase.name}`, testCase.params);
+
+			expect(result.isError).toBe(true);
+			expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
+			expect(textOf(result)).toContain(`ComputerController.${testCase.method} is unavailable`);
+		}
+	});
+
+	it("fails closed when a requested post-action screenshot method is missing", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls.push("click");
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("missing-post-action-shot", {
+			action: "click",
+			x: 1,
+			y: 2,
+			include_screenshot: true,
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
+		expect(textOf(result)).toContain("ComputerController.screenshot is unavailable");
+		expect(calls).toEqual(["click"]);
+	});
+
+	it("fails closed when batch auto-screenshot requires a missing screenshot method", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls.push("click");
+			},
+		}));
+		const tool = new ComputerTool(
+			createSession(Settings.isolated({ "computer.enabled": true, "computer.autoScreenshot": true })),
+		);
+
+		const result = await tool.execute("missing-batch-auto-shot", {
+			action: "batch",
+			actions: [{ action: "click", x: 1, y: 2 }],
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_UNAVAILABLE");
+		expect(result.details?.steps).toHaveLength(1);
+		expect(result.details?.steps?.[0]?.code).toBe("COMPUTER_UNAVAILABLE");
+		expect(textOf(result)).toContain("ComputerController.screenshot is unavailable");
+		expect(calls).toEqual(["click"]);
 	});
 
 	it("bounds oversized screenshot images sent inline while preserving the full-resolution artifact", async () => {
@@ -359,6 +490,88 @@ describe("computer tool dispatch", () => {
 		expect((await fs.stat(artifactPath)).size).toBe(600 * 1024);
 	});
 
+	it("bounds large-dimension screenshots that fit the byte budget while preserving the full-resolution artifact", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeFlatPng(2400, 1600);
+		expect(png.length).toBeLessThan(5 * 1024 * 1024);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 2400, heightPx: 1600, png }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("large-dims-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		const image = result.content.find(block => block.type === "image");
+		expect(image).toBeTruthy();
+		if (image?.type !== "image") throw new Error("expected inline image");
+		const { width, height } = await new Bun.Image(Buffer.from(image.data, "base64")).metadata();
+		expect(width).toBeLessThanOrEqual(1568);
+		expect(height).toBeLessThanOrEqual(1568);
+		const artifactPath = result.details?.screenshot?.path;
+		expect(artifactPath).toBeTruthy();
+		if (!artifactPath) throw new Error("expected persisted screenshot path");
+		expect((await fs.readFile(artifactPath)).equals(png)).toBe(true);
+	});
+
+	it("appends the coordinate-mapping note when the inline screenshot was scaled", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeFlatPng(2400, 1600);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 2400, heightPx: 1600, png }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("scaled-note-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		expect(textOf(result)).toContain("original 2400x1600");
+		expect(textOf(result)).toContain("displayed at");
+	});
+
+	it("returns small in-spec screenshots byte-identical without a dimension note", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeFlatPng(800, 600);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 800, heightPx: 600, png }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("small-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		const image = result.content.find(block => block.type === "image");
+		expect(image).toBeTruthy();
+		if (image?.type !== "image") throw new Error("expected inline image");
+		expect(image.data).toBe(png.toString("base64"));
+		expect(image.mimeType).toBe("image/png");
+		expect(textOf(result)).not.toContain("displayed at");
+	});
+
+	it("recompresses dimension-safe screenshots that are not comfortably under the byte budget", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const png = makeNoisePng(1024, 1024);
+		expect(png.length).toBeGreaterThan((5 * 1024 * 1024) / 4);
+		expect(png.length).toBeLessThan(5 * 1024 * 1024);
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => ({ widthPx: 1024, heightPx: 1024, png }),
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("compact-budget-shot", { action: "screenshot" });
+
+		expect(result.isError).not.toBe(true);
+		const image = result.content.find(block => block.type === "image");
+		expect(image).toBeTruthy();
+		if (image?.type !== "image") throw new Error("expected inline image");
+		expect(Buffer.byteLength(image.data, "base64")).toBeLessThan(png.length);
+		expect(textOf(result)).not.toContain("displayed at");
+	});
+
 	it("persists screenshot fallbacks in private per-session directories with restrictive file modes", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
@@ -389,6 +602,176 @@ describe("computer tool dispatch", () => {
 		}
 	});
 
+	it("captures a bounded post-action screenshot when include_screenshot is requested", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls.push("click");
+			},
+			screenshot: () => {
+				calls.push("screenshot");
+				return { widthPx: 40, heightPx: 30, png: new Uint8Array([4, 5, 6]) };
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("click-shot", { action: "click", x: 1, y: 2, include_screenshot: true });
+
+		expect(result.isError).not.toBe(true);
+		expect(calls).toEqual(["click", "screenshot"]);
+		expect(result.details?.screenshot).toMatchObject({ widthPx: 40, heightPx: 30, pngBytes: 3 });
+		expect(result.content.find(block => block.type === "image")).toMatchObject({
+			type: "image",
+			mimeType: "image/png",
+			data: "BAUG",
+		});
+	});
+
+	it("uses computer.autoScreenshot for post-action screenshots", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			type: () => {
+				calls.push("type");
+			},
+			screenshot: () => {
+				calls.push("screenshot");
+				return { widthPx: 80, heightPx: 60, png: new Uint8Array([7, 8, 9]) };
+			},
+		}));
+		const tool = new ComputerTool(
+			createSession(Settings.isolated({ "computer.enabled": true, "computer.autoScreenshot": true })),
+		);
+
+		const result = await tool.execute("auto-shot", { action: "type", text: "hello" });
+
+		expect(result.isError).not.toBe(true);
+		expect(calls).toEqual(["type", "screenshot"]);
+		expect(result.details?.screenshot).toMatchObject({ widthPx: 80, heightPx: 60, pngBytes: 3 });
+		expect(result.content.find(block => block.type === "image")).toMatchObject({ data: "BwgJ" });
+	});
+
+	it("captures batch and per-step screenshots according to explicit options", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		let capture = 0;
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: () => {
+				calls.push("click");
+			},
+			type: () => {
+				calls.push("type");
+			},
+			screenshot: () => {
+				capture += 1;
+				calls.push(`screenshot-${capture}`);
+				return { widthPx: 100 + capture, heightPx: 50 + capture, png: new Uint8Array([capture]) };
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("batch-shot", {
+			action: "batch",
+			include_screenshot: true,
+			actions: [
+				{ action: "click", x: 1, y: 2, include_screenshot: true },
+				{ action: "type", text: "done" },
+			],
+		});
+
+		expect(result.isError).not.toBe(true);
+		expect(calls).toEqual(["click", "screenshot-1", "type", "screenshot-2"]);
+		expect(result.details?.steps?.[0]?.screenshot).toMatchObject({ widthPx: 101, heightPx: 51 });
+		expect(result.details?.steps?.[1]?.screenshot).toBeUndefined();
+		expect(result.details?.screenshot).toMatchObject({ widthPx: 102, heightPx: 52 });
+		expect(result.content.find(block => block.type === "image")).toMatchObject({ data: "Ag==" });
+	});
+
+	it("honors nested per-step timeout values inside batches", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const waits: number[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			wait: (_expectedEpoch, ms) => {
+				waits.push(ms);
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("batch-timeouts", {
+			action: "batch",
+			timeout: 5,
+			actions: [
+				{ action: "wait", ms: 10_000 },
+				{ action: "wait", ms: 10_000, timeout: 1 },
+			],
+		});
+
+		expect(result.isError).not.toBe(true);
+		expect(waits).toEqual([5_000, 1_000]);
+	});
+
+	it("times out slow native promises instead of reporting success", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: async () => {
+				calls.push("screenshot-start");
+				await sleep(1_100);
+				calls.push("screenshot-end");
+				return { widthPx: 10, heightPx: 10, png: new Uint8Array([1, 2, 3]) };
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const started = Date.now();
+		const result = await tool.execute("slow-shot", { action: "screenshot", timeout: 1 });
+
+		expect(Date.now() - started).toBeLessThan(1_090);
+		expect(result.isError).toBe(true);
+		expect(result.details?.code).toBe("COMPUTER_CANCELLED");
+		expect(calls).toEqual(["screenshot-start"]);
+	});
+
+	it("honors abort signals between batch steps", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: string[] = [];
+		setComputerControllerFactoryForTests(() => ({
+			click: async () => {
+				calls.push("click-start");
+				await sleep(80);
+				calls.push("click-end");
+			},
+			type: () => {
+				calls.push("type");
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 20);
+
+		await expect(
+			tool.execute(
+				"abort-batch",
+				{
+					action: "batch",
+					actions: [
+						{ action: "click", x: 1, y: 2 },
+						{ action: "type", text: "skipped" },
+					],
+				},
+				controller.signal,
+			),
+		).rejects.toThrow("Operation aborted");
+		expect(calls).toEqual(["click-start"]);
+	});
+
 	it("executes batch actions sequentially and reports per-step results", async () => {
 		setComputerPlatformForTests("darwin");
 		setComputerArchForTests("arm64");
@@ -396,7 +779,7 @@ describe("computer tool dispatch", () => {
 		setComputerControllerFactoryForTests(() => ({
 			screenshot: () => {
 				calls.push({ method: "screenshot", args: [] });
-				return { widthPx: 100, heightPx: 50, png: new Uint8Array([1, 2, 3]) };
+				return { widthPx: 100, heightPx: 50, png: new Uint8Array([1, 2, 3]), displayEpoch: 99 };
 			},
 			click: (...args) => {
 				calls.push({ method: "click", args });
@@ -423,6 +806,45 @@ describe("computer tool dispatch", () => {
 		expect(result.details?.screenshot?.path).toBeTruthy();
 		expect(await fs.stat(result.details?.screenshot?.path ?? "")).toMatchObject({ size: 3 });
 		expect(calls.map(call => call.method)).toEqual(["screenshot", "click", "type"]);
+		expect(calls[1].args).toEqual([99, 10, 20, "left"]);
+		expect(calls[2].args).toEqual([undefined, "hello"]);
+	});
+
+	it("stops batch when native reports a stale display", async () => {
+		setComputerPlatformForTests("darwin");
+		setComputerArchForTests("arm64");
+		const calls: Array<{ method: string; args: unknown[] }> = [];
+		setComputerControllerFactoryForTests(() => ({
+			screenshot: () => {
+				calls.push({ method: "screenshot", args: [] });
+				return { widthPx: 100, heightPx: 50, png: new Uint8Array([1, 2, 3]), displayEpoch: 123 };
+			},
+			click: (...args) => {
+				calls.push({ method: "click", args });
+				const error = new Error("COMPUTER_DISPLAY_STALE: display epoch changed") as Error & {
+					code: string;
+				};
+				error.code = "GenericFailure";
+				throw error;
+			},
+			type: (...args) => {
+				calls.push({ method: "type", args });
+			},
+		}));
+		const tool = new ComputerTool(createSession(Settings.isolated({ "computer.enabled": true })));
+
+		const result = await tool.execute("batch", {
+			action: "batch",
+			actions: [{ action: "screenshot" }, { action: "click", x: 10, y: 20 }, { action: "type", text: "skipped" }],
+		});
+
+		expect(result.isError).toBe(true);
+		expect(result.details?.steps).toHaveLength(2);
+		expect(result.details?.steps?.[0]?.status).toBe("success");
+		expect(result.details?.steps?.[1]?.code).toBe("COMPUTER_DISPLAY_STALE");
+		expect(result.details?.code).toBe("COMPUTER_DISPLAY_STALE");
+		expect(calls.map(call => call.method)).toEqual(["screenshot", "click"]);
+		expect(calls[1].args).toEqual([123, 10, 20, "left"]);
 	});
 
 	it("stops batch execution on first failure and reports the failing step", async () => {

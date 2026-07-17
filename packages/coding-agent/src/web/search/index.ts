@@ -91,7 +91,7 @@ function formatCount(label: string, count: number): string {
 }
 
 /** Format response for LLM consumption */
-function formatForLLM(response: SearchResponse): string {
+export function formatSearchResponseForLlm(response: SearchResponse): string {
 	const parts: string[] = [];
 
 	if (response.answer) {
@@ -138,7 +138,7 @@ function formatForLLM(response: SearchResponse): string {
 		}
 	}
 
-	return parts.join("\n");
+	return `<untrusted-content>\n${parts.join("\n").replace(/<\/untrusted-content>/gi, "&lt;/untrusted-content>")}\n</untrusted-content>`;
 }
 
 interface ExecuteSearchOptions {
@@ -248,7 +248,7 @@ async function executeSearch(
 					response = await provider.search({ ...baseSearchParams, signal });
 				}
 
-				const text = formatForLLM(response);
+				const text = formatSearchResponseForLlm(response);
 				const warning = failures.length > 0 ? formatFallbackWarning(failures, provider) : undefined;
 
 				return {

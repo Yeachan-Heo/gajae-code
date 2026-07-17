@@ -27,15 +27,20 @@ export const PtySession = nativeBindings.PtySession;
 export const Shell = nativeBindings.Shell;
 
 // functions
-export const __piNativesV0_8_1 = nativeBindings.__piNativesV0_8_1;
+export const __piNativesV0_11_1 = nativeBindings.__piNativesV0_11_1;
 export const applyBashFixups = nativeBindings.applyBashFixups;
+export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
 export const astEdit = nativeBindings.astEdit;
 export const astGrep = nativeBindings.astGrep;
+export const canonicalExistingDirectoryIdentity = nativeBindings.canonicalExistingDirectoryIdentity;
 export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
 export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;
+export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
+export const exactRestore = nativeBindings.exactRestore;
+export const exactUnlink = nativeBindings.exactUnlink;
 export const executeShell = nativeBindings.executeShell;
 export const extractSegments = nativeBindings.extractSegments;
 export const fuzzyFind = nativeBindings.fuzzyFind;
@@ -65,13 +70,19 @@ export const matchesLegacySequence = nativeBindings.matchesLegacySequence;
 export const nativeBuildInfo = nativeBindings.nativeBuildInfo;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
+export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard;
+export const renameNoReplacePath = nativeBindings.renameNoReplacePath;
 export const search = nativeBindings.search;
 export const sliceWithWidth = nativeBindings.sliceWithWidth;
+export const snapshotDirectoryTree = nativeBindings.snapshotDirectoryTree;
 export const summarizeCode = nativeBindings.summarizeCode;
 export const supportsLanguage = nativeBindings.supportsLanguage;
+export const truncateLinesToWidth = nativeBindings.truncateLinesToWidth;
 export const truncateToWidth = nativeBindings.truncateToWidth;
+export const verifyOwnerOnlyPathSecurity = nativeBindings.verifyOwnerOnlyPathSecurity;
 export const visibleWidth = nativeBindings.visibleWidth;
+export const visibleWidths = nativeBindings.visibleWidths;
 export const wrapTextWithAnsi = nativeBindings.wrapTextWithAnsi;
 
 // string/numeric enums (napi-rs string_enum produces TS-only const enum)

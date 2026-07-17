@@ -97,7 +97,11 @@ describe("prompt action autocomplete", () => {
 		const provider = createNoopProvider([
 			{ name: "grok-build-usage", description: "Advanced provider diagnostics" },
 			{ name: "settings", description: "Open settings and preferences", priority: 40 },
-			{ name: "session", description: "Show current session info or delete current session", priority: 88 },
+			{
+				name: "session",
+				description: "Show session info or delete the current session transcript/artifacts",
+				priority: 88,
+			},
 			{ name: "resume", description: "Resume a previous session", priority: 92 },
 			{ name: "new", description: "Start a new session", priority: 96 },
 			{ name: "help", description: "Learn commands and beginner workflows", priority: 100 },
@@ -114,7 +118,7 @@ describe("prompt action autocomplete", () => {
 			"grok-build-usage",
 		]);
 		expect(suggestions?.items.find(item => item.value === "session")?.description).toBe(
-			"Show current session info or delete current session",
+			"Show session info or delete the current session transcript/artifacts",
 		);
 	});
 
