@@ -9,6 +9,12 @@ source: "forked from upstream ultragoal skill and rebranded for GJC"
 
 Use when the user asks for `ultragoal`, `create-goals`, `complete-goals`, durable multi-goal planning, or sequential execution over GJC goal mode.
 
+## Explicit start is approval
+
+When the user explicitly asks to run ultragoal in the current prompt — `ultragoal`, `/skill:ultragoal`, `gjc ultragoal`, "ultragoal 실행", or an equivalent direct execution request — that is execution approval. Start immediately: materialize goals from the brief and drive execution. Do not re-prompt with "should I start?", "execute?", or other pre-start approval options.
+
+This override applies only to the pre-start consent gate. During an active run, keep the existing blocker/pause/`ask` discipline.
+
 ## Purpose
 
 `ultragoal` turns a brief into repo-native durable artifacts and then drives execution through the unified `goal` tool as a UX bridge only. `goals.json` is the canonical source of goal identity and state; `ledger.jsonl` is the canonical proof stream for checkpoints, receipts, blockers, steering, and reviews. The inline `goal` tool and goal-mode-request create-bridge exist only to keep the agent's interactive loop focused on the current aggregate or story objective. Completion is verified purely from durable `goals.json` plus fresh `ledger.jsonl` receipts, never from inline goal state. The agent, not the CLI or hooks, calls `goal({"op":"complete"})` or `goal({"op":"drop"})` after durable run completion or cleanup; CLI commands and hooks never mutate goal state.
@@ -199,7 +205,7 @@ Forced-delegation rules:
 
 When delegating with native subagents, an await timeout only limits the leader's wait. It is not subagent failure evidence and must not be used as a cancellation reason; inspect or continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 
-If an Ultragoal request has no approved plan or consensus artifact, run `ralplan` first and preserve its PRD, test spec, role roster, and verification guidance in the Ultragoal ledger. Do not silently substitute ad-hoc execution for missing planning.
+If ultragoal was only inferred (the user did not explicitly request it) and there is no approved plan or consensus artifact, run `ralplan` first and preserve its PRD, test spec, role roster, and verification guidance in the Ultragoal ledger. Do not silently substitute ad-hoc execution for missing planning on inferred routes. When the user explicitly requested ultragoal, skip the pre-start approval ask and begin execution from the current brief/plan without detouring through a second consent prompt.
 
 The Ultragoal leader owns `.gjc/_session-{sessionid}/ultragoal/goals.json` and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`. Role agents return implementation/review evidence; they do not checkpoint Ultragoal or mutate goal state.
 

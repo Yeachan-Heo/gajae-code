@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Explicit user requests for `ultragoal` (`ultragoal`, `/skill:ultragoal`, `gjc ultragoal`, or equivalent) are now treated as execution approval: the agent starts immediately and no longer re-asks whether to begin. The ralplan-first detour remains only for inferred ultragoal routes without an approved plan.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

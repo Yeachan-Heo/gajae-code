@@ -319,6 +319,14 @@ Project executor override body.
 		}
 		expect(systemPrompt).toContain("delegate bounded slices to `executor`");
 		expect(systemPrompt).toContain("committed repo-visible `.gjc` defaults are not the source of truth");
+		expect(systemPrompt).toContain("explicitly requests ultragoal execution");
+		expect(systemPrompt).toContain("that request is execution approval");
+		expect(systemPrompt).toContain("do not re-ask whether to start");
+		expect(systemPrompt).toContain("that request is approval: invoke it immediately");
+		expect(ultragoal).toContain("## Explicit start is approval");
+		expect(ultragoal).toContain("that is execution approval");
+		expect(ultragoal).toContain("Do not re-prompt with \"should I start?\"");
+		expect(ultragoal).toContain("only inferred");
 		expect(ultragoal).toContain("run `ralplan` first");
 		expect(ultragoal).toContain("Role agents return implementation/review evidence");
 		expect(ultragoal).toContain("await timeout only limits the leader's wait");

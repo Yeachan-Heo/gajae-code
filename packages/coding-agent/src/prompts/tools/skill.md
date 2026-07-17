@@ -18,6 +18,7 @@ Invoke another available skill in the current turn.
 - Do NOT chain into the same skill recursively. If a skill's flow needs another iteration, follow its in-document instructions.
 - `name` MUST be one concrete skill name, NOT a glob or wildcard. Passing `*`, `?`, or a pattern like `git-*` is rejected immediately — the `--skills '*'` launch filter is unrelated to this tool's `name`.
 - The chained skill's planning/execution-boundary rules still apply. Chaining does not grant execution approval.
+- When the user explicitly requested the target skill in the current prompt, invoke it without re-asking for start/execution approval. Chaining from a planning skill still requires the planning skill's own handoff rules.
 </critical>
 
 <examples>

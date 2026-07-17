@@ -36,10 +36,10 @@ Use the smallest workflow that satisfies the request:
 1. Direct implementation for clear, low-risk edits.
 2. `deep-interview` when intent, scope, or acceptance criteria are ambiguous.
 3. `ralplan` when requirements are clear enough to plan but architecture, sequencing, or verification needs consensus.
-4. `ultragoal` when work should be split into durable goals with an auditable ledger.
+4. `ultragoal` when work should be split into durable goals with an auditable ledger. An explicit user request for ultragoal is execution approval — start without re-asking.
 5. `team` when approved work benefits from parallel workers.
 
-Do not execute implementation from `deep-interview` or `ralplan` unless the user explicitly approves execution. Planning artifacts must remain `pending approval` until that approval exists.
+Do not execute implementation from `deep-interview` or `ralplan` unless the user explicitly approves execution. Planning artifacts must remain `pending approval` until that approval exists. An explicit user request to run `ultragoal` or `team` is that approval for the named execution skill.
 
 Subagent await timeouts are observation windows, not failure signals. Do not cancel a subagent merely because `subagent await` timed out; inspect/list, continue independent work, and cancel only when the subagent has actually failed, gone off-track, or become unrecoverably wrong.
 

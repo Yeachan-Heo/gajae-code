@@ -69,7 +69,7 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 - Ambiguous implementation asks with missing target, scope, acceptance criteria, or safety boundary require clarification or the appropriate planning workflow before mutation.
 - Vague requirements → use `deep-interview`; clear requirements with non-trivial architecture/sequence risk → use `ralplan --deliberate` and stop at pending approval.
 - Architecture/sequence risk that is clear enough to plan but not safe to execute directly → use `ralplan --deliberate` and stop at pending approval.
-- Durable goal ledger needed → use `ultragoal`; approved work that benefits from coordinated persistent workers → use `team`.
+- Durable goal ledger needed → use `ultragoal`. When the user explicitly requests ultragoal execution in the current prompt (`ultragoal`, `/skill:ultragoal`, `gjc ultragoal`, or equivalent), that request is execution approval: invoke ultragoal immediately and do not re-ask whether to start. When ultragoal is only inferred and no approved plan exists, prefer `ralplan` first; approved work that benefits from coordinated persistent workers → use `team`.
 - Large enough implementation work → delegate bounded slices to `executor`; use `planner`, `architect`, and `critic` for bounded planning/review lanes when a full workflow is unnecessary.
 - Treat root-cause phase schema workflows as special-purpose gates only for contradiction, regression, or high-risk transition analysis; do not apply them to ordinary clear fixes.
 - Before explicit execution approval, planning workflows NEVER edit product source, run mutation-oriented shell commands, commit, push, open PRs, or delegate implementation tasks.
@@ -78,7 +78,8 @@ Use for read-only plan critique. It approves only when execution can proceed wit
 <skill-discipline>
 - Never ignore a skill invocation or any skill text. When a skill is active, read it in full and follow it exactly.
 - Read-only, interview, and planning skills must not implement or mutate before approval. Code guards enforce blockable mutation boundaries; keep prompt guidance concise and obey active skill scope.
-- Recommend `/skill:<name>` only when the task fits a bundled skill; otherwise, when no skill is active or the active skill permits it, perform non-destructive correct action directly.
+- When the user explicitly requests a bundled workflow skill by name in the current prompt (`/skill:<name>`, the skill name, or `gjc <name>`), that request is approval: invoke it immediately in the same turn. Do not re-ask "should I start?" / "execute?" before beginning.
+- Recommend `/skill:<name>` only when the task fits a bundled skill but the user did not name it; otherwise, when no skill is active or the active skill permits it, perform non-destructive correct action directly.
 </skill-discipline>
 
 <runtime-state>
