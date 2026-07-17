@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@gajae-code/agent-core";
+import type { AssistantMessage } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import btwRUserPrompt from "../../prompts/system/btw-r-user.md" with { type: "text" };
 import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
@@ -85,7 +86,7 @@ export class BtwController {
 
 	async submitRetainedFollowUp(question: string): Promise<RetainedFollowUpResult> {
 		const request = this.#activeRequest;
-		if (!request || request.mode !== "retained") {
+		if (request?.mode !== "retained") {
 			return "closed";
 		}
 		if (request.inFlight) {
@@ -166,15 +167,7 @@ export class BtwController {
 			});
 			if (!this.#isActiveRequest(request)) return;
 			request.inFlight = false;
-			request.contextMessages.push(
-				{
-					role: "user",
-					content: [{ type: "text", text: request.question }],
-					attribution: "user",
-					timestamp: Date.now(),
-				},
-				assistantMessage,
-			);
+			this.#appendRetainedExchange(request, assistantMessage);
 			if (replyText) request.component.setAnswer(replyText);
 			request.component.markComplete();
 		} catch (error) {
@@ -184,8 +177,45 @@ export class BtwController {
 				request.component.markAborted();
 				return;
 			}
-			request.component.markError(error instanceof Error ? error.message : String(error));
+			const message = error instanceof Error ? error.message : String(error);
+			// Keep the failed user turn visible to later follow-ups so "try again"
+			// still sees the question that remains on the retained panel.
+			this.#appendRetainedExchange(request, this.#errorAssistantMessage(message));
+			request.component.markError(message);
 		}
+	}
+
+	#appendRetainedExchange(request: BtwRequest, assistantMessage: AgentMessage): void {
+		request.contextMessages.push(
+			{
+				role: "user",
+				content: [{ type: "text", text: request.question }],
+				attribution: "user",
+				timestamp: Date.now(),
+			},
+			assistantMessage,
+		);
+	}
+
+	#errorAssistantMessage(message: string): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [{ type: "text", text: `Error: ${message}` }],
+			api: "btw-r",
+			provider: "btw-r",
+			model: "btw-r",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			timestamp: Date.now(),
+			errorMessage: message,
+		};
 	}
 
 	#closeActiveRequest(options: { abort: boolean }): void {
