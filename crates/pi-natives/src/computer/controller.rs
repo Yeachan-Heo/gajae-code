@@ -44,8 +44,8 @@ impl ComputerController {
 		})
 	}
 
-	/// Return the non-prompting combined Accessibility + PostEvent TCC state for
-	/// the hidden Gate-0 experiment.
+	/// Return the non-prompting combined Accessibility + `PostEvent` TCC state
+	/// for the hidden Gate-0 experiment.
 	#[napi(js_name = "gate0PermissionStatus")]
 	pub fn gate0_permission_status(&self) -> Gate0PermissionStatus {
 		let status = permissions::preflight();
@@ -212,25 +212,6 @@ fn gate0_harmless_probe_result(
 	Gate0HarmlessProbeResult { screenshot, accessibility: input_authority, pointer_move_restore }
 }
 
-#[cfg(test)]
-mod tests {
-	use super::gate0_harmless_probe_result;
-
-	#[test]
-	fn gate0_skips_pointer_execution_without_combined_authority() {
-		for authority in [false, true] {
-			let mut calls = 0;
-			let result = gate0_harmless_probe_result(true, authority, || {
-				calls += 1;
-				true
-			});
-			assert_eq!(result.accessibility, authority);
-			assert_eq!(result.pointer_move_restore, authority);
-			assert_eq!(calls, usize::from(authority));
-		}
-	}
-}
-
 fn gate0_pointer_move_restore() -> bool {
 	harmless_move_restore().unwrap_or(false)
 }
@@ -248,4 +229,23 @@ fn exec_error(err: ExecError) -> napi::Error {
 
 fn napi_error(code: &'static str, reason: String) -> napi::Error {
 	napi::Error::new(napi::Status::GenericFailure, format!("{code}: {reason}"))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::gate0_harmless_probe_result;
+
+	#[test]
+	fn gate0_skips_pointer_execution_without_combined_authority() {
+		for authority in [false, true] {
+			let mut calls = 0;
+			let result = gate0_harmless_probe_result(true, authority, || {
+				calls += 1;
+				true
+			});
+			assert_eq!(result.accessibility, authority);
+			assert_eq!(result.pointer_move_restore, authority);
+			assert_eq!(calls, usize::from(authority));
+		}
+	}
 }

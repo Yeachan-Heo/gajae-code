@@ -4,7 +4,7 @@
 //! Two distinct TCC permissions gate the computer tool:
 //! - **Screen Recording** — required for `screenshot` capture (see
 //!   [`super::capture`]).
-//! - **Accessibility** and **PostEvent** — together required by Gate-0 to
+//! - **Accessibility** and **`PostEvent`** — together required by Gate-0 to
 //!   establish synthetic input authority; this is separate from Screen
 //!   Recording.
 //!
@@ -110,8 +110,8 @@ pub fn post_event_granted() -> bool {
 	unsafe { CGPreflightPostEventAccess() }
 }
 
-/// Whether both Accessibility and PostEvent authority are available for Gate-0
-/// synthetic input. This pure seam keeps the combined authority contract
+/// Whether both Accessibility and `PostEvent` authority are available for
+/// Gate-0 synthetic input. This pure seam keeps the combined authority contract
 /// independently testable.
 #[must_use]
 pub const fn gate0_capabilities_granted(accessibility: bool, post_event: bool) -> bool {
