@@ -40,6 +40,33 @@ function normalizeSkillName(name: string | undefined): string {
 	return (name ?? "").trim();
 }
 
+export function suggestClosestSkillName(requested: string, available: readonly string[]): string | undefined {
+	if (available.length === 0) return undefined;
+	const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+	const target = normalize(requested);
+	if (!target) return undefined;
+	let bestName: string | undefined;
+	let bestScore = -1;
+	for (const name of available) {
+		const candidate = normalize(name);
+		let score = 0;
+		if (candidate === target) return name;
+		if (candidate.startsWith(target) || target.startsWith(candidate)) score += 50;
+		if (candidate.includes(target) || target.includes(candidate)) score += 25;
+		const chars = new Set(candidate);
+		let overlap = 0;
+		for (const ch of target) if (chars.has(ch)) overlap += 1;
+		score += overlap;
+		score -= Math.abs(candidate.length - target.length);
+		if (score > bestScore) {
+			bestScore = score;
+			bestName = name;
+		}
+	}
+	return bestScore >= 8 ? bestName : undefined;
+}
+
+
 const SKILL_NAME_GLOB_PATTERN = /[*?[\]{}]/;
 
 type SkillToolInput = z.infer<typeof skillSchema>;
@@ -125,9 +152,11 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				(await findRuntimeSkillByName(this.#session.cwd, requestedName, this.#getRuntimeSkillPolicy()));
 			if (!skill) {
 				const available = skills.map(s => s.name).sort();
+				const suggestion = suggestClosestSkillName(requestedName, available);
+				const suggestHint = suggestion ? ` Did you mean "${suggestion}"?` : "";
 				const hint =
 					available.length > 0
-						? ` Available: ${available.join(", ")}. Use skill_discovery to find project/user runtime skills.`
+						? `${suggestHint} Available: ${available.join(", ")}. Use skill_discovery to find project/user runtime skills.`
 						: " Use skill_discovery to find project/user runtime skills.";
 				throw new ToolError(`skill tool: unknown skill "${requestedName}".${hint}`);
 			}
