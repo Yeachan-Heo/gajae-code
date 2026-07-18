@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeModelCache } from "../src/model-cache";
+import { readModelCache, writeModelCache } from "../src/model-cache";
 import { resolveProviderModels } from "../src/model-manager";
 import type { Api, Model } from "../src/types";
 
@@ -156,6 +156,73 @@ describe("online-if-uncached model refresh", () => {
 				result.models.map(entry => entry.id),
 				failure,
 			).toEqual(["static"]);
+		}
+	});
+
+	test("does not publish successful dynamic models when the cache guard denies publication", async () => {
+		const providerId = "cache-guard-success-denied";
+		const now = 1_700_000_000_000;
+
+		await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels: [model(providerId, "static")],
+				cacheDbPath,
+				now: () => now,
+				canPublishCache: () => false,
+				fetchDynamicModels: async () => [model(providerId, "dynamic")],
+			},
+			"online",
+		);
+
+		expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toBeNull();
+	});
+
+	test("does not downgrade an authoritative cache when the failed-fetch guard denies publication", async () => {
+		const providerId = "cache-guard-failure-denied";
+		const now = 1_700_000_000_000;
+		const cachedAt = now - CACHE_TTL_MS - 1;
+		const cachedModels = [model(providerId, "cached")];
+		writeModelCache(providerId, cachedAt, cachedModels, true, fingerprint([]), cacheDbPath);
+
+		await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels: [],
+				cacheDbPath,
+				now: () => now,
+				canPublishCache: () => false,
+				fetchDynamicModels: async () => null,
+			},
+			"online",
+		);
+
+		const cache = readModelCache<Api>(providerId, CACHE_TTL_MS * 2, () => now, cacheDbPath);
+		expect(cache).toMatchObject({ authoritative: true, updatedAt: cachedAt, models: cachedModels });
+	});
+
+	test("publishes dynamic models by default and when the cache guard permits it", async () => {
+		const now = 1_700_000_000_000;
+		for (const [providerId, canPublishCache] of [
+			["cache-guard-default", undefined],
+			["cache-guard-allowed", () => true],
+		] as const) {
+			await resolveProviderModels<Api>(
+				{
+					providerId,
+					staticModels: [],
+					cacheDbPath,
+					now: () => now,
+					canPublishCache,
+					fetchDynamicModels: async () => [model(providerId, "dynamic")],
+				},
+				"online",
+			);
+
+			expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toMatchObject({
+				authoritative: true,
+				models: [expect.objectContaining({ id: "dynamic" })],
+			});
 		}
 	});
 });

@@ -6,7 +6,7 @@
  */
 
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
+import type * as path from "node:path";
 import { APP_NAME, getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import chalk from "chalk";
@@ -28,7 +28,7 @@ import { initXdg } from "./commands/init-xdg";
 // Types
 // =============================================================================
 
-export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "init-xdg" | "doctor";
+export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "doctor" | "init-xdg";
 
 export interface ConfigCommandArgs {
 	action: ConfigAction;
@@ -114,7 +114,7 @@ function getSettingValues(def: CliSettingDef): readonly string[] | undefined {
 // Argument Parser
 // =============================================================================
 
-const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "init-xdg", "doctor"];
+const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "doctor", "init-xdg"];
 
 /**
  * Parse config subcommand arguments.
@@ -302,11 +302,11 @@ export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
 		case "path":
 			handlePath();
 			break;
+		case "doctor":
+			handleDoctor(cmd.flags);
+			break;
 		case "init-xdg":
 			await initXdg();
-			break;
-		case "doctor":
-			await handleDoctor(cmd.flags);
 			break;
 	}
 }
@@ -449,6 +449,19 @@ function handlePath(): void {
 	console.log(getAgentDir());
 }
 
+function handleDoctor(flags: { json?: boolean }): void {
+	const report = settings.getSchemaReport();
+	if (flags.json) {
+		console.log(JSON.stringify(report, null, 2));
+		return;
+	}
+	if (report.issues.length === 0) {
+		console.log(chalk.green("Settings schema is healthy."));
+		return;
+	}
+	for (const issue of report.issues) console.log(`${issue.kind}\t${issue.path}\t${issue.detail}`);
+}
+
 type ConfigDoctorReport = {
 	unknownKeys: string[];
 	invalidValues: Array<{ path: string; value: unknown }>;
@@ -480,15 +493,7 @@ function matchesSettingType(path: SettingPath, value: unknown): boolean {
 	}
 }
 
-function isValidSettingValue(path: SettingPath, value: unknown): boolean {
-	if (!matchesSettingType(path, value)) return false;
-	const validate = (SETTINGS_SCHEMA[path] as { validate?: (value: unknown) => boolean }).validate;
-	return validate?.(value) ?? true;
-}
-
-export async function inspectConfigFile(
-	configPath = path.join(getAgentDir(), "config.yml"),
-): Promise<ConfigDoctorReport> {
+export async function inspectConfigFile(configPath: string): Promise<ConfigDoctorReport> {
 	const report: ConfigDoctorReport = { unknownKeys: [], invalidValues: [], legacyShapes: [] };
 	try {
 		const raw = YAML.parse(await fs.readFile(configPath, "utf8"));
@@ -498,7 +503,7 @@ export async function inspectConfigFile(
 		}
 		for (const [settingPath, value] of flattenConfig(raw)) {
 			if (!ALL_SETTING_PATHS.includes(settingPath as SettingPath)) report.unknownKeys.push(settingPath);
-			else if (!isValidSettingValue(settingPath as SettingPath, value))
+			else if (!matchesSettingType(settingPath as SettingPath, value))
 				report.invalidValues.push({ path: settingPath, value: redactConfigValue(settingPath, value) });
 		}
 	} catch (error) {
@@ -506,18 +511,6 @@ export async function inspectConfigFile(
 			report.legacyShapes.push(`unable to parse config: ${String(error)}`);
 	}
 	return report;
-}
-
-async function handleDoctor(flags: { json?: boolean }): Promise<void> {
-	const report = await inspectConfigFile();
-	if (flags.json) console.log(JSON.stringify(report, null, 2));
-	else {
-		console.log(`Unknown keys: ${report.unknownKeys.length ? report.unknownKeys.join(", ") : "none"}`);
-		console.log(
-			`Invalid values: ${report.invalidValues.length ? report.invalidValues.map(item => item.path).join(", ") : "none"}`,
-		);
-		console.log(`Legacy shapes: ${report.legacyShapes.length ? report.legacyShapes.join(", ") : "none"}`);
-	}
 }
 
 // =============================================================================
@@ -532,6 +525,7 @@ ${chalk.bold("Commands:")}
   get <key>          Get a specific setting value
   set <key> <value>  Set a setting value
   reset <key>        Reset a setting to its default value
+  doctor             Report unknown, invalid, and pending settings migrations
   path               Print the config directory path
   init-xdg           Initialize XDG Base Directory structure
   doctor             Report unknown, invalid, and legacy config entries

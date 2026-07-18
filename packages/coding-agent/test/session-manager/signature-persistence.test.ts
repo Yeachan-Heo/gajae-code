@@ -133,8 +133,9 @@ describe("SessionManager signature persistence", () => {
 		});
 	});
 
-	it("rehydrates assistant replay metadata in memory without rewriting the session file", async () => {
+	it("rehydrates assistant replay metadata with an append-only patch", async () => {
 		using tempDir = TempDir.createSync("@pi-session-rehydrate-persistence-");
+		const thinking = "reasoning".repeat(200);
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
 		const providerPayload = {
 			type: "openaiResponsesHistory" as const,
@@ -155,7 +156,7 @@ describe("SessionManager signature persistence", () => {
 		session.appendMessage({
 			role: "assistant",
 			content: [
-				{ type: "thinking", thinking: "reasoning", thinkingSignature: JSON.stringify(providerPayload.items[0]) },
+				{ type: "thinking", thinking, thinkingSignature: JSON.stringify(providerPayload.items[0]) },
 				{ type: "text", text: "done" },
 			],
 			api: "openai-responses",
@@ -178,22 +179,30 @@ describe("SessionManager signature persistence", () => {
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected persisted session file");
 		const persistedBefore = await fs.readFile(sessionFile, "utf8");
-		const initialMtimeMs = (await fs.stat(sessionFile)).mtimeMs;
+		expect(JSON.parse(persistedBefore.split("\n", 1)[0]!).version).toBe(4);
 		await session.close();
 
 		const reloaded = await SessionManager.open(sessionFile);
 		const assistant = getAssistantMessage(reloaded);
 
-		// After rehydration, assistant providerPayload must be stripped to prevent
-		// stale native history replay on warmed sessions.
 		expect(assistant.providerPayload).toBeUndefined();
 		expect(assistant.content[0]).toMatchObject({
 			type: "thinking",
-			thinking: "reasoning",
+			thinking,
 			thinkingSignature: undefined,
 		});
-		expect(await fs.readFile(sessionFile, "utf8")).toBe(persistedBefore);
-		expect((await fs.stat(sessionFile)).mtimeMs).toBe(initialMtimeMs);
+		const persistedAfter = await fs.readFile(sessionFile, "utf8");
+		expect(persistedAfter.startsWith(persistedBefore)).toBe(true);
+		const patch = JSON.parse(persistedAfter.slice(persistedBefore.length));
+		expect(persistedAfter.slice(persistedBefore.length)).toEndWith("\n");
+		expect(patch).toMatchObject({ type: "entry_patch" });
+		expect(patch.patch.message).not.toHaveProperty("providerPayload");
+		expect(patch.patch.message.content[0]).not.toHaveProperty("thinkingSignature");
+		expect(patch.patch.message.content[0]).toMatchObject({ type: "thinking", thinking });
 		await reloaded.close();
+		await reloaded.close();
+		const reopened = await SessionManager.open(sessionFile);
+		expect(getAssistantMessage(reopened).content[0]).toMatchObject({ type: "thinking", thinking });
+		await reopened.close();
 	});
 });

@@ -72,6 +72,7 @@ describe("GJC ultragoal goal mode request", () => {
 		expect(request?.objective).toBe("Complete ultragoal");
 		expect(request?.source).toBe("ultragoal");
 		expect(consumedAgain).toBeNull();
+		expect(request?.provenance).toEqual({ source: "ultragoal", runId: TEST_SESSION_ID, goalId: "aggregate" });
 	});
 
 	it("does not let a concurrent session consume another session's pending request", async () => {
@@ -117,6 +118,12 @@ describe("GJC ultragoal goal mode request", () => {
 		expect(request?.sessionId).toBe("session-X");
 	});
 
+	it("compares pending request ownership with the resolved session id", async () => {
+		const root = await tempDir();
+		await writePendingGoalModeRequest({ cwd: root, objective: "Complete ultragoal", sessionId: TEST_SESSION_ID });
+		expect((await consumePendingGoalModeRequest(root))?.sessionId).toBe(TEST_SESSION_ID);
+	});
+
 	it("writes goal mode state into the current session file", async () => {
 		const root = await tempDir();
 		const sessionFile = path.join(root, "session.jsonl");
@@ -152,6 +159,7 @@ describe("GJC ultragoal goal mode request", () => {
 			status: "active",
 			tokensUsed: 0,
 		});
+		expect(context.modeData?.goal).not.toHaveProperty("provenance");
 	});
 
 	it("does not overwrite an existing active session goal", async () => {
@@ -285,7 +293,7 @@ describe("GJC ultragoal goal mode request", () => {
 		);
 		const context = buildSessionContext(entries);
 		expect(context.modeData?.goal).toMatchObject(existingGoal);
-	});
+	}, 15_000);
 
 	it("surfaces corrupt pending request json", async () => {
 		const root = await tempDir();

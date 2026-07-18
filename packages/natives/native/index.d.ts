@@ -121,8 +121,9 @@ export declare class NotificationServer {
   /** Register the reply callback. Must be called before [`Self::start`]. */
   onReply(callback: (err: null | Error, reply: ReplyEvent) => void): void
   /**
-   * Register the inbound-message callback (free-text injections and in-thread
-   * config commands). Must be called before [`Self::start`].
+   * Register the authenticated inbound-message callback (free-text,
+   * side-question request/cancel, and in-thread config/control commands).
+   * Must be called before [`Self::start`].
    */
   onInbound(callback: (err: null | Error, msg: InboundEvent) => void): void
   /**
@@ -188,13 +189,29 @@ export declare class NotificationServer {
   /**
    * Broadcast an ephemeral threaded-session frame. `frame_json` is a JSON
    * `ServerMessage` (e.g. `identity_header`, `context_update`, `turn_stream`,
-   * `image_attachment`, `session_closed`, `config_update`, `hello`). Not
-   * buffered for replay.
+   * `ephemeral_turn_result`, `image_attachment`, `session_closed`,
+   * `config_update`, `hello`). Not buffered for replay.
    *
    * # Errors
    * Fails if not started or `frame_json` is not a valid `ServerMessage`.
    */
   pushFrame(frameJson: string): void
+  /**
+   * Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
+   * External frames must continue through [`Self::push_frame`] for serde
+   * validation.
+   */
+  pushTurnStreamUnchecked(sessionId: string, phase: string, text: string, finalAnswer?: boolean | undefined | null, messageRef?: string | undefined | null): void
+  /**
+   * Broadcast a file attachment from raw N-API bytes, encoding the unchanged
+   * base64 wire field only in Rust.
+   */
+  pushFileAttachmentUnchecked(sessionId: string, name: string, mime: string | undefined | null, data: Buffer, caption?: string | undefined | null): void
+  /**
+   * Return counters guarding the known-good frame crossing against
+   * regressions.
+   */
+  knownGoodFrameStats(): KnownGoodFrameStats
   /** Send a validated, bounded JSON envelope to one connected v3 SDK client. */
   sendTo(connectionId: string, json: string): void
   /**
@@ -1084,26 +1101,51 @@ export interface HtmlToMarkdownOptions {
 }
 
 /**
- * An inbound message forwarded to the TypeScript host: a free-text injection,
- * in-thread config command, or deterministic control command.
+ * An authenticated inbound message forwarded to the TypeScript host: free-text
+ * injection, ephemeral side-question request/cancel, in-thread config command,
+ * or deterministic control command.
  */
 export interface InboundEvent {
-  /** Inbound kind (`user_message`, `config_command`, or `control_command`). */
+  /**
+   * Inbound kind (`user_message`, `ephemeral_turn`,
+   * `ephemeral_turn_cancel`, `config_command`, or `control_command`).
+   */
   kind: string
+  /**
+   * Server-authenticated identity of the WebSocket connection that delivered
+   * this event.
+   */
+  connectionId: string
   /** The session this inbound belongs to. */
   sessionId: string
-  /** Free-text body (`user_message` only). */
+  /** Free-text body (`user_message` or `ephemeral_turn` only). */
   text?: string
-  /** Telegram update id for dedupe (`user_message` only). */
+  /**
+   * Telegram update id for dedupe (`user_message`, `ephemeral_turn`, or
+   * `ephemeral_turn_cancel` only).
+   */
   updateId?: number
-  /** Originating thread/topic id (`user_message` only). */
+  /**
+   * Originating thread/topic id (`user_message`, `ephemeral_turn`, or
+   * `ephemeral_turn_cancel` only).
+   */
   threadId?: string
+  /**
+   * Originating Telegram message id (`ephemeral_turn` and
+   * `ephemeral_turn_cancel` only).
+   */
+  messageId?: number
   /** Requested verbosity `"lean"|"verbose"` (`config_command` only). */
   verbosity?: string
   /** Requested redaction state (`config_command` only). */
   redact?: boolean
-  /** Client-generated request id (`control_command` only). */
+  /**
+   * Client-generated request id (`ephemeral_turn`, `ephemeral_turn_cancel`,
+   * or `control_command` only).
+   */
   requestId?: string
+  /** Cancellation reason (`ephemeral_turn_cancel` only). */
+  reason?: string
   /** JSON-encoded command payload (`control_command` only). */
   commandJson?: string
   /**
@@ -1253,6 +1295,19 @@ export declare enum KeyEventType {
   Repeat = 2,
   /** Key release event. */
   Release = 3
+}
+
+/** Observable counters for the internal known-good N-API frame lane. */
+export interface KnownGoodFrameStats {
+  /** Frames constructed as `TurnStream` without parsing a JSON string. */
+  knownGoodTurnStreamFrames: number
+  /** JSON serde parses of externally supplied `turn_stream` frames. */
+  turnStreamSerdeValidationParses: number
+  /**
+   * Base64 characters encoded in Rust for `file_attachment` frames (the JS
+   * side crosses raw `Buffer` bytes and never allocates the base64 string).
+   */
+  fileAttachmentRustBase64Chars: number
 }
 
 /** A lifecycle request forwarded to the TypeScript daemon for orchestration. */
@@ -1546,6 +1601,8 @@ export type NativeOwnerOnlySecurityResult =
 				| "acl_unavailable"
 				| "acl_apply_failed"
 				| "acl_verify_failed"
+				| "identity_unavailable"
+				| "owner_mismatch"
 				| "io_error";
 	  }
 

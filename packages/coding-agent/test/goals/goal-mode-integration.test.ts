@@ -120,17 +120,17 @@ describe("InteractiveMode goal mode integration", () => {
 			expect.arrayContaining(["get_goal", "create_goal", "update_goal"]),
 		);
 
-		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.mode.goalModeController.handleCommand("Ship the release");
 
-		expect(harness.mode.goalModeEnabled).toBe(true);
+		expect(harness.mode.goalModeController.enabled).toBe(true);
 		expect(harness.session.getGoalModeState()?.enabled).toBe(true);
 		expect(await toolNamesFor(harness)).toContain("goal");
 
 		vi.spyOn(harness.mode, "showHookSelector").mockResolvedValue("Pause");
-		await harness.mode.handleGoalModeCommand();
+		await harness.mode.goalModeController.handleCommand();
 
-		expect(harness.mode.goalModeEnabled).toBe(false);
-		expect(harness.mode.goalModePaused).toBe(true);
+		expect(harness.mode.goalModeController.enabled).toBe(false);
+		expect(harness.mode.goalModeController.paused).toBe(true);
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("paused");
 		expect(await toolNamesFor(harness)).toContain("goal");
 		expect(await toolNamesFor(harness)).not.toEqual(
@@ -139,48 +139,63 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("replaces the active goal via /goal set", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.mode.goalModeController.handleCommand("Ship the release");
 		const originalGoal = harness.session.getGoalModeState()?.goal;
 		if (!originalGoal) throw new Error("expected active goal");
 
-		await harness.mode.handleGoalModeCommand("set Replace the objective");
+		await harness.mode.goalModeController.handleCommand("set Replace the objective");
 
 		const state = harness.session.getGoalModeState();
 		expect(state?.enabled).toBe(true);
 		expect(state?.goal.objective).toBe("Replace the objective");
 		expect(state?.goal.status).toBe("active");
 		expect(state?.goal.id).not.toBe(originalGoal.id);
-		expect(harness.mode.goalModeEnabled).toBe(true);
+		expect(harness.mode.goalModeController.enabled).toBe(true);
 		expect(await toolNamesFor(harness)).toContain("goal");
 	});
 
 	it("refuses /goal while plan mode is active", async () => {
 		const showWarning = vi.spyOn(harness.mode, "showWarning");
-		harness.mode.planModeEnabled = true;
+		harness.mode.planModeController.setEnabledForCompatibility(true);
 
-		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.mode.goalModeController.handleCommand("Ship the release");
 
 		expect(showWarning).toHaveBeenCalledWith("Exit plan mode first.");
 		expect(harness.session.getGoalModeState()).toBeUndefined();
 	});
 
 	it("refuses /plan while goal mode is active", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.mode.goalModeController.handleCommand("Ship the release");
 		const showWarning = vi.spyOn(harness.mode, "showWarning");
 
-		await harness.mode.handlePlanModeCommand();
+		await harness.mode.planModeController.handleCommand();
 
 		expect(showWarning).toHaveBeenCalledWith("Exit goal mode first.");
-		expect(harness.mode.planModeEnabled).toBe(false);
+		expect(harness.mode.planModeController.enabled).toBe(false);
+	});
+
+	it("refuses /plan after a goal tool creates an active goal", async () => {
+		await harness.mode.init();
+		harness.mode.ui.stop();
+		const goalTool = new GoalTool(harness.toolSession);
+		await goalTool.execute("call-create", { op: "create", objective: "Tool-created goal" });
+		await harness.session.waitForIdle();
+		const showWarning = vi.spyOn(harness.mode, "showWarning");
+
+		await harness.mode.planModeController.handleCommand();
+
+		expect(harness.mode.goalModeController.enabled).toBe(true);
+		expect(showWarning).toHaveBeenCalledWith("Exit goal mode first.");
+		expect(harness.mode.planModeController.enabled).toBe(false);
 	});
 
 	it("rejects a new /goal objective while paused", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.mode.goalModeController.handleCommand("Ship the release");
 		vi.spyOn(harness.mode, "showHookSelector").mockResolvedValue("Pause");
-		await harness.mode.handleGoalModeCommand();
+		await harness.mode.goalModeController.handleCommand();
 		const showWarning = vi.spyOn(harness.mode, "showWarning");
 
-		await harness.mode.handleGoalModeCommand("Replace the objective");
+		await harness.mode.goalModeController.handleCommand("Replace the objective");
 
 		expect(showWarning).toHaveBeenCalledWith(
 			"Resume the current goal first, or drop it before setting a new objective.",
@@ -191,18 +206,18 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("resumes the paused goal via the bare /goal menu", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.mode.goalModeController.handleCommand("Ship the release");
 		const selector = vi.spyOn(harness.mode, "showHookSelector").mockResolvedValueOnce("Pause");
-		await harness.mode.handleGoalModeCommand();
-		expect(harness.mode.goalModePaused).toBe(true);
+		await harness.mode.goalModeController.handleCommand();
+		expect(harness.mode.goalModeController.paused).toBe(true);
 		selector.mockResolvedValueOnce("Resume");
 		const showStatus = vi.spyOn(harness.mode, "showStatus");
 
-		await harness.mode.handleGoalModeCommand();
+		await harness.mode.goalModeController.handleCommand();
 
 		expect(showStatus).toHaveBeenCalledWith("Goal mode resumed.");
-		expect(harness.mode.goalModeEnabled).toBe(true);
-		expect(harness.mode.goalModePaused).toBe(false);
+		expect(harness.mode.goalModeController.enabled).toBe(true);
+		expect(harness.mode.goalModeController.paused).toBe(false);
 		expect(harness.session.getGoalModeState()?.enabled).toBe(true);
 		expect(harness.session.getGoalModeState()?.goal.objective).toBe("Ship the release");
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
@@ -218,10 +233,10 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(result.exitCode).toBe(0);
 		expect(harness.session.getGoalModeState()?.goal.objective).toContain(".gjc/ultragoal/goals.json");
 		expect(harness.session.getActiveToolNames()).toContain("goal");
-	});
+	}, 15_000);
 
 	it("treats budget as objective text instead of a goal budget command", async () => {
-		await harness.mode.handleGoalModeCommand("budget 123");
+		await harness.mode.goalModeController.handleCommand("budget 123");
 
 		const goal = harness.session.getGoalModeState()?.goal;
 		expect(goal?.objective).toBe("budget 123");
@@ -229,7 +244,7 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("keeps the goal tool in the active set after goal({op:drop})", async () => {
-		await harness.mode.handleGoalModeCommand("objective A");
+		await harness.mode.goalModeController.handleCommand("objective A");
 		expect(harness.session.getActiveToolNames()).toContain("goal");
 
 		const goalTool = harness.session.getToolByName("goal");
@@ -247,7 +262,7 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("keeps the goal tool in the active set when goal({op:complete}) flows through getUserInput", async () => {
-		await harness.mode.handleGoalModeCommand("objective A");
+		await harness.mode.goalModeController.handleCommand("objective A");
 		expect(harness.session.getActiveToolNames()).toContain("goal");
 
 		const goalTool = harness.session.getToolByName("goal");
@@ -269,7 +284,7 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("supports create A → drop → create B → get in one session", async () => {
-		await harness.mode.handleGoalModeCommand("objective A");
+		await harness.mode.goalModeController.handleCommand("objective A");
 		expect(harness.session.getActiveToolNames()).toContain("goal");
 
 		const goalTool = harness.session.getToolByName("goal");
@@ -295,7 +310,7 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("keeps the goal tool armed after /goal drop (UI path)", async () => {
-		await harness.mode.handleGoalModeCommand("objective A");
+		await harness.mode.goalModeController.handleCommand("objective A");
 		expect(harness.session.getActiveToolNames()).toContain("goal");
 
 		// The UI path invokes #confirmAndDropGoal which calls #exitGoalMode
@@ -303,17 +318,17 @@ describe("InteractiveMode goal mode integration", () => {
 		// invariant is observable even without mode.init().
 		vi.spyOn(harness.mode, "showHookConfirm").mockResolvedValue(true);
 
-		await harness.mode.handleGoalModeCommand("drop");
-		for (let i = 0; i < 100 && harness.mode.goalModeEnabled; i++) {
+		await harness.mode.goalModeController.handleCommand("drop");
+		for (let i = 0; i < 100 && harness.mode.goalModeController.enabled; i++) {
 			await Bun.sleep(0);
 		}
 
 		expect(harness.session.getActiveToolNames()).toContain("goal");
-		expect(harness.mode.goalModeEnabled).toBe(false);
+		expect(harness.mode.goalModeController.enabled).toBe(false);
 	});
 
 	it("returns completion usage from the goal tool and exits goal mode before the next turn rebuild", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.mode.goalModeController.handleCommand("Ship the release");
 		const appendCustomEntry = vi.spyOn(harness.session.sessionManager, "appendCustomEntry");
 		const goalTool = (await createTools(harness.toolSession, harness.session.getActiveToolNames())).find(
 			tool => tool.name === "goal",
@@ -338,8 +353,8 @@ describe("InteractiveMode goal mode integration", () => {
 		for (let i = 0; i < 100 && harness.session.getGoalModeState() !== undefined; i++) {
 			await Bun.sleep(0);
 		}
-		expect(harness.mode.goalModeEnabled).toBe(false);
-		expect(harness.mode.goalModePaused).toBe(false);
+		expect(harness.mode.goalModeController.enabled).toBe(false);
+		expect(harness.mode.goalModeController.paused).toBe(false);
 		expect(harness.session.getGoalModeState()).toBeUndefined();
 		expect(await toolNamesFor(harness)).toContain("goal");
 		expect(await toolNamesFor(harness)).not.toEqual(
@@ -374,7 +389,7 @@ describe("InteractiveMode goal mode integration", () => {
 		harness = await createGoalHarness({
 			extensionRunner: { emit, getRegisteredCommands: () => [] } as unknown as ExtensionRunner,
 		});
-		await harness.mode.handleGoalModeCommand("Ship the release");
+		await harness.mode.goalModeController.handleCommand("Ship the release");
 
 		const tool = new GoalTool(harness.toolSession);
 		const result = await tool.execute("call-complete", { op: "complete" });
@@ -387,8 +402,8 @@ describe("InteractiveMode goal mode integration", () => {
 	});
 
 	it("does not loop AgentBusyError when a busy/orphaned session triggers goal continuation", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
-		expect(harness.mode.goalModeEnabled).toBe(true);
+		await harness.mode.goalModeController.handleCommand("Ship the release");
+		expect(harness.mode.goalModeController.enabled).toBe(true);
 		expect(harness.session.goalRuntime.buildContinuationPrompt()).toBeTruthy();
 
 		// Simulate a wedged/orphaned turn: the interactive loop is back at
@@ -422,8 +437,8 @@ describe("InteractiveMode goal mode integration", () => {
 		}
 	});
 	it("does not loop AgentBusyError while compaction is in progress", async () => {
-		await harness.mode.handleGoalModeCommand("Ship the release");
-		expect(harness.mode.goalModeEnabled).toBe(true);
+		await harness.mode.goalModeController.handleCommand("Ship the release");
+		expect(harness.mode.goalModeController.enabled).toBe(true);
 		expect(harness.session.goalRuntime.buildContinuationPrompt()).toBeTruthy();
 
 		// Compaction keeps the session busy without necessarily setting isStreaming.

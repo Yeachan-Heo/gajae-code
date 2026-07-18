@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "story": "G006",
+  "e2eStatus": "not-run",
+  "redTeamStatus": "blocked",
+  "counts": {"suitesPassed": 4, "testsPassed": 20, "casesPassed": 2, "casesPartial": 2, "casesFailed": 1, "casesSkipped": 1, "blockers": 1},
+  "suites": [
+    {"command": "bun --cwd packages/tui test test/mouse-sgr.test.ts", "status": "passed", "tests": 4},
+    {"command": "bun --cwd packages/tui test test/g006-ws6-redteam.test.ts", "status": "passed", "tests": 3},
+    {"command": "bun --cwd packages/coding-agent test test/transcript-viewer-overlay.test.ts test/plan-preview-overlay.test.ts", "status": "passed", "tests": 11},
+    {"command": "bun --cwd packages/coding-agent test test/g006-ws6-redteam.test.ts", "status": "passed", "tests": 2}
+  ],
+  "adversarialCases": [
+    {"id": "inertness", "verdict": "partial", "evidence": "TUI calls setMouseEnabled(false); a fragmented valid SGR click dispatches only to handleMouse with no editor input. Exact ProcessTerminal output bytes were not captured because local node-pty posix_spawnp fails."},
+    {"id": "multiplexer-suppression", "verdict": "partial", "evidence": "ProcessTerminal gates mouse enablement with isUnderTerminalMultiplexer(Bun.env); TMUX and TERM=screen* byte-matrix integration is blocked by node-pty."},
+    {"id": "fragmented-and-malformed-sgr", "verdict": "failed", "evidence": "Fragmented valid SGR is one event. Negative-button plus unterminated SGR leaks as focused-component text after timeout; huge coordinates dispatch as x=1e21."},
+    {"id": "wheel-boundaries-and-storm", "verdict": "passed", "evidence": "VirtualTerminal exercised top/bottom scrolling and 100 wheel events without throw; fewer than 20 writes after initial-log reset."},
+    {"id": "click-dispatch-and-overlay-bounds", "verdict": "passed", "evidence": "Transcript ignores header/outside/fullscreen clicks; plan preview ignores header/outside clicks and retains one-based source mapping."},
+    {"id": "cleanup-idempotency", "verdict": "skipped", "evidence": "Requires ProcessTerminal byte capture or POSIX PTY matrix; node-pty posix_spawnp failure prevents it."}
+  ],
+  "blockers": [
+    {"id": "malformed-sgr-leaks-into-focused-editor", "severity": "release-blocker", "repro": "bun --cwd packages/tui test test/g006-ws6-redteam.test.ts", "observed": "Malformed input reaches handleInput as \\u001b[<-1;4;5M\\u001b[<0;4;5; valid huge-coordinate SGR dispatches x=1e21.", "expected": "Malformed SGR must be swallowed without text leakage and invalid coordinates must be ignored or clamped.", "source": "packages/tui/src/stdin-buffer.ts and packages/tui/src/tui.ts"}
+  ]
+}

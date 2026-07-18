@@ -902,6 +902,12 @@ export interface AnthropicCompat extends ToolChoiceCompat {
 	supportsForcedToolChoice?: boolean;
 	/** Whether long prompt-cache retention (`ttl: "1h"`) is supported. Default: true for canonical Anthropic API. */
 	supportsLongCacheRetention?: boolean;
+	/**
+	 * Prompt-cache transport accepted by this Anthropic-compatible endpoint.
+	 * Canonical Anthropic defaults to `"automatic"`; noncanonical endpoints default
+	 * to `"none"` and must explicitly opt into generated `"explicit"` markers.
+	 */
+	promptCacheMode?: "none" | "explicit" | "automatic";
 }
 
 /**

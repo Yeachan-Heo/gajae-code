@@ -1023,6 +1023,7 @@ export interface RunRootCommandDependencies {
 	selectResumeSession?: SelectResumeSession;
 	openExistingSessionStrict?: OpenExistingSessionStrict;
 	initializeSettings?: typeof Settings.init;
+	loadSettingsForScope?: typeof Settings.loadForScope;
 }
 
 export async function runRootCommand(
@@ -1055,10 +1056,6 @@ export async function runRootCommand(
 		await logger.time("maybeAutoChdir", maybeAutoChdir, parsedArgs);
 		autoChdirApplied = true;
 		const resumeCwd = getProjectDir();
-		const resumeMigrationPolicy =
-			(await Settings.loadForScope({ cwd: resumeCwd })).get("session.directoryMigration") === "disabled"
-				? "disabled"
-				: "copy-retain";
 		const sessions = await (deps.listForResumePickerReadOnly ?? SessionManager.listForResumePickerReadOnly)(
 			resumeCwd,
 			parsedArgs.sessionDir,
@@ -1073,6 +1070,12 @@ export async function runRootCommand(
 		if (selection.kind === "cancelled") {
 			return;
 		}
+		const resumeMigrationPolicy =
+			(await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd })).get(
+				"session.directoryMigration",
+			) === "disabled"
+				? "disabled"
+				: "copy-retain";
 		let opened: StrictSessionOpenResult;
 		try {
 			opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(

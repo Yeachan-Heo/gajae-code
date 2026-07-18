@@ -11,6 +11,10 @@ import {
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
+import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
+import type { BrokerDiscovery } from "../sdk/broker/discovery";
+import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
+import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
 import {
@@ -23,9 +27,42 @@ import {
 	assertCoordinatorWorkdir,
 	buildCoordinatorMcpConfig,
 	type CoordinatorMcpConfig,
-	coordinatorNamespacePath,
 	requireCoordinatorMutation,
+	safeOpenCoordinatorArtifact,
 } from "./policy";
+import {
+	answerBindingMatches,
+	type CoordinatorQuestionDiagnosticPublicV1,
+	type CoordinatorQuestionPublicV1,
+	createAnswerBinding,
+	decodeAskGateV1,
+	type ListQuestionsSuccessV1,
+	type PublicReason,
+	projectAskGateQuestion,
+	translateCoordinatorAskAnswer,
+	validateCoordinatorAskAnswer,
+} from "./question-gate-codec";
+import {
+	advanceCreationReceipt,
+	advanceDeletion,
+	bindCreationRequest,
+	type CanonicalCreateIntentV1,
+	type CanonicalReportSnapshotV1,
+	type CanonicalSessionSnapshotV1,
+	type CoordinatorSessionTransactionV1,
+	claimCreationRequest,
+	commitCreationWal,
+	coordinatorStatePaths,
+	createSessionTransaction,
+	deterministicOutboxId,
+	initializeCoordinatorNamespace,
+	recordDeletionIntent,
+	repairProjections,
+	withAdmittedSessionTransaction,
+	withNamespaceRegistry,
+	withSessionTransaction,
+} from "./question-state";
+
 import { createSessionReaper, type ReapableSession, type SessionReaper } from "./session-reaper";
 
 export type { CoordinatorToolName };
@@ -56,6 +93,41 @@ function sinkErrorCode(error: unknown): string | undefined {
 		return undefined;
 	}
 }
+
+type CoordinatorBrokerStage = "ensure" | "read" | "connect" | "request" | "close";
+
+function toCoordinatorBrokerError(stage: CoordinatorBrokerStage, error: unknown): SdkClientError {
+	if (stage === "request" && error instanceof SdkClientError) return error;
+	if (stage === "ensure") {
+		if (error instanceof AggregateError)
+			return new SdkClientError(
+				"broker_cleanup_unverified",
+				"SDK broker bootstrap failed and cleanup was not verified.",
+			);
+		if (error instanceof UnsupportedStateVersionError)
+			return new SdkClientError(
+				"broker_discovery_unsupported",
+				"SDK broker discovery state version is unsupported.",
+			);
+		if (sinkErrorCode(error) === "EACCES" || sinkErrorCode(error) === "EPERM")
+			return new SdkClientError("broker_discovery_access_denied", "SDK broker discovery cannot be accessed.");
+		return new SdkClientError("broker_bootstrap_failed", "SDK broker bootstrap failed.");
+	}
+	if (stage === "read") {
+		if (error instanceof UnsupportedStateVersionError)
+			return new SdkClientError(
+				"broker_discovery_unsupported",
+				"SDK broker discovery state version is unsupported.",
+			);
+		if (sinkErrorCode(error) === "EACCES" || sinkErrorCode(error) === "EPERM")
+			return new SdkClientError("broker_discovery_access_denied", "SDK broker discovery cannot be accessed.");
+		return new SdkClientError("broker_discovery_unavailable", "SDK broker discovery cannot be read.");
+	}
+	return new SdkClientError(
+		stage === "request" ? "broker_request_unavailable" : "broker_transport_unavailable",
+		stage === "request" ? "SDK broker request is unavailable." : "SDK broker transport is unavailable.",
+	);
+}
 interface CoordinatorFinalResponse {
 	text: string | null;
 	format: "markdown";
@@ -78,6 +150,8 @@ interface RuntimeSessionStatePayload extends CoordinatorSessionState {
 
 interface CoordinatorServices {
 	connectSdk?: (url: string, token: string) => Promise<SdkClient>;
+	ensureBroker?: (settings: EnsureBrokerSettings) => Promise<BrokerDiscovery>;
+	readSdkBrokerDiscovery?: (agentDir: string) => Promise<BrokerDiscovery | null>;
 	getAgentDir?: () => string;
 	resolveModelProfiles?: CoordinatorModelProfileLoader;
 	canonicalizePath?: (value: string) => Promise<string>;
@@ -385,11 +459,20 @@ function toolSchema(name: CoordinatorToolName): {
 					session_id: sessionId,
 					turn_id: { type: "string" },
 					question_id: { type: "string" },
+					answer_binding: { type: "string" },
 					answer: {},
 					idempotency_key: idempotencyKey,
 					allow_mutation: allowMutation,
 				},
-				required: ["session_id", "question_id", "answer", "idempotency_key", "allow_mutation"],
+				required: [
+					"session_id",
+					"turn_id",
+					"question_id",
+					"answer_binding",
+					"answer",
+					"idempotency_key",
+					"allow_mutation",
+				],
 			},
 		};
 	}
@@ -439,7 +522,12 @@ function toolSchema(name: CoordinatorToolName): {
 		return {
 			name,
 			description: "List bounded structured questions for coordinator coordination.",
-			inputSchema: { type: "object", properties: { session_id: sessionId, status: { type: "string" } } },
+			inputSchema: {
+				type: "object",
+				properties: { session_id: sessionId, turn_id: { type: "string" }, status: { type: "string" } },
+
+				required: ["session_id"],
+			},
 		};
 	}
 	if (name === "gjc_coordinator_list_artifacts") {
@@ -816,10 +904,6 @@ function publicSdkAcknowledgement(result: RuntimePromptAcknowledgement): Record<
 	};
 }
 
-function publicSdkAccepted(result: unknown): Record<string, unknown> {
-	return acknowledgementPayload(result)?.accepted === true ? { accepted: true } : {};
-}
-
 async function listJsonFiles(dir: string): Promise<unknown[]> {
 	try {
 		const entries = await fs.readdir(dir);
@@ -898,6 +982,22 @@ function publicCoordinatorSession(session: Record<string, unknown>): Record<stri
 	}
 	if (typeof session.ephemeral === "boolean") result.ephemeral = session.ephemeral;
 	if (typeof session.visible === "boolean") result.visible = session.visible;
+	return result;
+}
+
+function publicCoordinatorStatusSession(session: Record<string, unknown>): Record<string, unknown> {
+	const { cwd: _cwd, ...safe } = publicCoordinatorSession(session);
+	return safe;
+}
+
+function capabilityFreeStatusValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(capabilityFreeStatusValue);
+	if (!value || typeof value !== "object") return value;
+	const result: Record<string, unknown> = {};
+	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+		if (/^(?:answer_binding|cwd|path|payload_ref|evidence_paths|artifact_path|state_root)$/i.test(key)) continue;
+		result[key] = capabilityFreeStatusValue(child);
+	}
 	return result;
 }
 
@@ -1242,19 +1342,27 @@ async function writeSessionStateUnlocked(
 		live?: boolean | null;
 		reason?: string | null;
 		source?: CoordinatorSessionState["source"];
+		overwrite?: boolean;
 	} = {},
 ): Promise<CoordinatorSessionState> {
-	const previous = await readSessionState(namespaceDir, sessionId);
+	const previous = options.overwrite ? null : await readSessionState(namespaceDir, sessionId);
+	const hasCurrentTurn = Object.hasOwn(options, "currentTurnId");
+	const hasLastTurn = Object.hasOwn(options, "lastTurnId");
+	const hasLive = Object.hasOwn(options, "live");
 	const payload: CoordinatorSessionState = {
 		schema_version: 1,
 		session_id: sessionId,
 		state,
 		ready_for_input: state === "ready_for_input" || state === "completed",
-		current_turn_id: options.currentTurnId ?? (state === "running" ? (previous?.current_turn_id ?? null) : null),
-		last_turn_id: options.lastTurnId ?? previous?.last_turn_id ?? null,
+		current_turn_id: hasCurrentTurn
+			? (options.currentTurnId ?? null)
+			: state === "running"
+				? (previous?.current_turn_id ?? null)
+				: null,
+		last_turn_id: hasLastTurn ? (options.lastTurnId ?? null) : (previous?.last_turn_id ?? null),
 		updated_at: new Date().toISOString(),
 		source: options.source ?? "coordinator",
-		live: options.live ?? previous?.live ?? null,
+		live: hasLive ? (options.live ?? null) : (previous?.live ?? null),
 		reason: options.reason ?? null,
 	};
 	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);
@@ -1407,6 +1515,7 @@ async function writeSessionState(
 		live?: boolean | null;
 		reason?: string | null;
 		source?: CoordinatorSessionState["source"];
+		overwrite?: boolean;
 	} = {},
 ): Promise<CoordinatorSessionState> {
 	const file = sessionStateFile(namespaceDir, sessionId);
@@ -1416,11 +1525,7 @@ async function writeSessionState(
 	);
 }
 
-async function markTurnFailedForUnavailableSession(
-	namespaceDir: string,
-	turn: TurnRecord,
-	reason: string,
-): Promise<TurnRecord> {
+async function markTurnFailedForUnavailableSession(turn: TurnRecord, reason: string): Promise<TurnRecord> {
 	const timestamp = new Date().toISOString();
 	const failed: TurnRecord = {
 		...turn,
@@ -1438,18 +1543,10 @@ async function markTurnFailedForUnavailableSession(
 		updated_at: timestamp,
 		completed_at: timestamp,
 	};
-	await writeTurnRecord(namespaceDir, failed);
-	await clearActiveTurn(namespaceDir, failed);
-	await writeSessionState(namespaceDir, failed.session_id, "stale", {
-		lastTurnId: failed.turn_id,
-		live: false,
-		reason,
-	});
 	return failed;
 }
 
 async function markTurnTerminalFromSessionState(
-	namespaceDir: string,
 	turn: TurnRecord,
 	sessionState: CoordinatorSessionState,
 ): Promise<TurnRecord> {
@@ -1493,13 +1590,6 @@ async function markTurnTerminalFromSessionState(
 		updated_at: timestamp,
 		completed_at: timestamp,
 	};
-	await writeTurnRecord(namespaceDir, resolved);
-	await clearActiveTurn(namespaceDir, resolved);
-	await writeSessionState(namespaceDir, resolved.session_id, sessionState.state, {
-		lastTurnId: resolved.turn_id,
-		live: sessionState.live,
-		reason: sessionState.reason,
-	});
 	return resolved;
 }
 
@@ -1569,11 +1659,7 @@ function turnAwaitingRuntimeAckExpired(turn: TurnRecord, nowMs: number, ackTimeo
 	return Number.isFinite(deliveredMs) && nowMs - deliveredMs >= ackTimeoutMs;
 }
 
-async function markTurnFailedForUnacknowledgedDelivery(
-	namespaceDir: string,
-	turn: TurnRecord,
-	ackTimeoutMs: number,
-): Promise<TurnRecord> {
+async function markTurnFailedForUnacknowledgedDelivery(turn: TurnRecord, ackTimeoutMs: number): Promise<TurnRecord> {
 	const timestamp = new Date().toISOString();
 	const message = `Tmux key delivery succeeded, but the GJC runtime did not acknowledge the prompt or emit turn_start within ${ackTimeoutMs}ms. The turn never started; stop waiting and inspect/retry the coordinator session.`;
 	const failed: TurnRecord = {
@@ -1618,13 +1704,6 @@ async function markTurnFailedForUnacknowledgedDelivery(
 		updated_at: timestamp,
 		completed_at: timestamp,
 	};
-	await writeTurnRecord(namespaceDir, failed);
-	await clearActiveTurn(namespaceDir, failed);
-	await writeSessionState(namespaceDir, failed.session_id, "stale", {
-		lastTurnId: failed.turn_id,
-		live: failed.liveness.live,
-		reason: PROMPT_ACK_TIMEOUT_REASON,
-	});
 	return failed;
 }
 
@@ -1639,7 +1718,7 @@ async function reconcileRuntimeAcknowledgement(
 		return await markTurnAcknowledgedFromRuntimeState(namespaceDir, turn, sessionState);
 	}
 	if (options.failOnTimeout && turnAwaitingRuntimeAckExpired(turn, Date.now(), ackTimeoutMs)) {
-		return await markTurnFailedForUnacknowledgedDelivery(namespaceDir, turn, ackTimeoutMs);
+		return await markTurnFailedForUnacknowledgedDelivery(turn, ackTimeoutMs);
 	}
 	return turn;
 }
@@ -1813,19 +1892,18 @@ export async function readCoordinatorArtifact(
 ): Promise<Record<string, unknown>> {
 	let handle: fs.FileHandle | null = null;
 	try {
-		const resolved = await assertCoordinatorArtifactPath(config, args.path);
-		handle = await fs.open(resolved.path, "r");
-		const readLimit = resolved.byteCap + 1;
+		handle = await safeOpenCoordinatorArtifact(config, args.path);
+		const readLimit = config.artifactByteCap + 1;
 		const buffer = Buffer.alloc(readLimit);
 		const { bytesRead } = await handle.read(buffer, 0, readLimit, 0);
-		const boundedBytes = buffer.subarray(0, Math.min(bytesRead, resolved.byteCap));
-		const text = decodeUtf8WithinByteCap(boundedBytes, resolved.byteCap);
+		const boundedBytes = buffer.subarray(0, Math.min(bytesRead, config.artifactByteCap));
+		const text = decodeUtf8WithinByteCap(boundedBytes, config.artifactByteCap);
 		return {
 			ok: true,
-			path: resolved.path,
+			path: typeof args.path === "string" ? path.resolve(args.path) : "",
 			text,
 			bytes: Buffer.byteLength(text),
-			truncated: bytesRead > resolved.byteCap,
+			truncated: bytesRead > config.artifactByteCap,
 		};
 	} catch (error) {
 		return {
@@ -1844,7 +1922,436 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	const services = options.services ?? {};
 	const platform = options.platform ?? process.platform;
 	const loadModelProfiles = services.resolveModelProfiles ?? loadCoordinatorModelProfiles;
-	const namespaceDir = coordinatorNamespacePath(config);
+	const namespaceDir = path.join(
+		config.stateRoot,
+		config.namespace.profile ?? "unscoped-profile",
+		config.namespace.repo ?? "unscoped-repo",
+	);
+	const questionPaths = coordinatorStatePaths(config.stateRoot, config.namespace.identity);
+	let questionStateReady: Promise<void> | null = null;
+
+	function ensureQuestionStateReady(): Promise<void> {
+		questionStateReady ??= initializeCoordinatorNamespace(questionPaths);
+		return questionStateReady;
+	}
+
+	function creationDigests(
+		tool: string,
+		idempotencyKey: string,
+		canonicalArgs: Record<string, unknown>,
+	): {
+		keyDigest: string;
+		requestDigest: string;
+	} {
+		return {
+			keyDigest: createHash("sha256").update(`${tool}\0${idempotencyKey}`).digest("hex"),
+			requestDigest: createHash("sha256")
+				.update(canonicalJson({ tool, args: canonicalArgs }))
+				.digest("hex"),
+		};
+	}
+
+	function canonicalCreationSnapshot(session: Record<string, unknown>): CanonicalSessionSnapshotV1 {
+		const now = new Date().toISOString();
+		const sessionId = safeExternalId("session", session.session_id ?? session.sessionId);
+		const cwd = optionalString(session.cwd);
+		const incarnation = optionalString(session.endpoint_incarnation);
+		if (!cwd || !incarnation) throw new Error("state_corrupt");
+		return {
+			schema_version: 1,
+			namespace_id: config.namespace.identity,
+			session_id: sessionId,
+			cwd: path.resolve(cwd),
+			created_at: optionalString(session.created_at) ?? now,
+			updated_at: now,
+			mpreset: optionalString(session.mpreset),
+			source: optionalString(session.source),
+			model: optionalString(session.model),
+			tmux: {
+				session: optionalString(session.tmux_session),
+				window: null,
+				pane: optionalString(session.tmux_target),
+			},
+			broker: {
+				workspace: optionalString(session.broker_workspace),
+				endpoint_url: "",
+				endpoint_generation: typeof session.endpoint_generation === "number" ? session.endpoint_generation : 0,
+				endpoint_incarnation: incarnation,
+			},
+			ephemeral: session.ephemeral === true,
+			visible: session.visible !== false,
+		};
+	}
+
+	function sessionFromCreationSnapshot(snapshot: CanonicalSessionSnapshotV1): Record<string, unknown> {
+		return normalizeSession({
+			session_id: snapshot.session_id,
+			cwd: snapshot.cwd,
+			created_at: snapshot.created_at,
+			...(snapshot.mpreset ? { mpreset: snapshot.mpreset } : {}),
+			...(snapshot.source ? { source: snapshot.source } : {}),
+			...(snapshot.model ? { model: snapshot.model } : {}),
+			tmux_session: snapshot.tmux.session,
+			tmux_target: snapshot.tmux.pane,
+			ephemeral: snapshot.ephemeral,
+			visible: snapshot.visible,
+			broker_workspace: snapshot.broker.workspace,
+			endpoint_generation: snapshot.broker.endpoint_generation,
+			endpoint_incarnation: snapshot.broker.endpoint_incarnation,
+		});
+	}
+
+	async function claimProductionCreation(
+		tool: string,
+		idempotencyKey: string,
+		canonicalArgs: Record<string, unknown>,
+	) {
+		await ensureQuestionStateReady();
+		const { keyDigest, requestDigest } = creationDigests(tool, idempotencyKey, canonicalArgs);
+		return {
+			keyDigest,
+			request: await claimCreationRequest(questionPaths, {
+				key_digest: keyDigest,
+				request_digest: requestDigest,
+				tool,
+			}),
+		};
+	}
+
+	async function ensureQuestionTransaction(sessionId: string): Promise<void> {
+		await ensureQuestionStateReady();
+		try {
+			await withSessionTransaction(questionPaths, sessionId, async () => undefined);
+			return;
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+		}
+		const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+		if (!session) throw new Error("resource_gone");
+		const incarnation = optionalString(session.endpoint_incarnation);
+		const cwd = optionalString(session.cwd);
+		if (!incarnation || !cwd) throw new Error("resource_gone");
+		const now = new Date().toISOString();
+		await createSessionTransaction(questionPaths, {
+			kind: "register",
+			session: {
+				schema_version: 1,
+				namespace_id: config.namespace.identity,
+				session_id: sessionId,
+				cwd: path.resolve(cwd),
+				created_at: optionalString(session.created_at) ?? now,
+				updated_at: now,
+				mpreset: optionalString(session.mpreset),
+				source: optionalString(session.source),
+				model: optionalString(session.model),
+				tmux: {
+					session: optionalString(session.tmux_session),
+					window: null,
+					pane: optionalString(session.tmux_target),
+				},
+				broker: {
+					workspace: optionalString(session.broker_workspace),
+					endpoint_url: "",
+					endpoint_generation: typeof session.endpoint_generation === "number" ? session.endpoint_generation : 0,
+					endpoint_incarnation: incarnation,
+				},
+				ephemeral: session.ephemeral === true,
+				visible: session.visible !== false,
+			},
+			initial_state: "ready_for_input",
+			initial_events: [],
+		});
+	}
+
+	function publicQuestions(
+		transaction: CoordinatorSessionTransactionV1,
+		status: string | null,
+	): CoordinatorQuestionPublicV1[] {
+		return Object.values(transaction.canonical.questions)
+			.filter(
+				question => !status || question.status === status || (status === "open" && question.status === "pending"),
+			)
+			.map(question =>
+				projectAskGateQuestion({
+					question_id: question.question_id,
+					session_id: question.session_id,
+					turn_id: question.turn_id,
+					status: question.status === "resolving" ? "pending" : question.status,
+					stage: question.stage,
+					kind: question.kind,
+					prompt: question.prompt,
+					codec: question.codec,
+					created_at: question.created_at,
+					updated_at: question.updated_at,
+					answered_at: question.answered_at,
+					reason: question.history.at(-1)?.reason ?? null,
+					...(question.status === "pending" ? { answer_binding: question.binding_plaintext } : {}),
+				}),
+			);
+	}
+
+	async function reconcileQuestions(sessionId: string): Promise<ListQuestionsSuccessV1> {
+		const observedAt = new Date().toISOString();
+		const diagnostics: CoordinatorQuestionDiagnosticPublicV1[] = [];
+		const diagnostic = (
+			reason: CoordinatorQuestionDiagnosticPublicV1["reason"],
+			turnId: string | null = null,
+			gateId: string | null = null,
+		) => {
+			if (diagnostics.length < 64)
+				diagnostics.push({
+					schema_version: 1,
+					session_id: sessionId,
+					turn_id: turnId,
+					gate_id: gateId,
+					reason,
+					observed_at: observedAt,
+				});
+		};
+		try {
+			await ensureQuestionTransaction(sessionId);
+			const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+			if (!session) throw new Error("resource_gone");
+			const snapshot = await readCompleteQ12Snapshot(session);
+			const { items, complete, revision } = snapshot;
+			if (!complete) {
+				diagnostic(snapshot.reason ?? "query_unavailable");
+				return {
+					ok: true,
+					schema_version: 1,
+					questions: await withSessionTransaction(questionPaths, sessionId, async tx => publicQuestions(tx, null)),
+					diagnostics,
+					reconciliation: {
+						attempted: true,
+						complete: false,
+						revision,
+						observed_at: observedAt,
+						reason: snapshot.reason ?? "query_unavailable",
+					},
+				};
+			}
+			const projectedTurnQuestions = new Map<string, string[]>();
+			await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+				const seen = new Set<string>();
+				const byRuntimeTurn = new Map<string, Array<(typeof transaction.canonical.turns)[string]>>();
+				for (const turn of Object.values(transaction.canonical.turns)) {
+					const runtimeTurnId = turn.delivery.runtime_turn_id;
+					if (typeof runtimeTurnId !== "string") continue;
+					const owners = byRuntimeTurn.get(runtimeTurnId) ?? [];
+					owners.push(turn);
+					byRuntimeTurn.set(runtimeTurnId, owners);
+				}
+				for (const row of items as WorkflowGateQueryRecord[]) {
+					if (!row || typeof row !== "object" || row.tag !== "pending" || typeof row.gate_id !== "string") {
+						diagnostic("invalid_gate_row");
+						continue;
+					}
+					const gate = row as WorkflowGateQueryRecord & WorkflowGate;
+					const authorityId = createHash("sha256")
+						.update(
+							`${config.namespace.identity}\0${sessionId}\0${transaction.canonical.session.broker.endpoint_incarnation}\0${gate.gate_id}`,
+						)
+						.digest("hex");
+					seen.add(authorityId);
+					const runtimeTurnId = gate.runtime_turn_id;
+					const existing = transaction.canonical.gate_authorities[authorityId];
+					const authority = existing ?? {
+						authority: {
+							namespace_id: config.namespace.identity,
+							session_id: sessionId,
+							endpoint_incarnation: transaction.canonical.session.broker.endpoint_incarnation,
+							gate_id: gate.gate_id,
+						},
+						observation:
+							typeof runtimeTurnId === "string" && runtimeTurnId
+								? {
+										kind: "valid" as const,
+										first_provenance: {
+											runtime_turn_id: runtimeTurnId,
+											gate_created_at: gate.created_at,
+											schema_hash: gate.schema_hash,
+											stage: gate.stage,
+											kind: gate.kind,
+										},
+									}
+								: {
+										kind: "malformed" as const,
+										immutable_observation_digest: createHash("sha256")
+											.update(canonicalJson(row))
+											.digest("hex"),
+										malformed: "missing_runtime_turn" as const,
+									},
+						outcome: { state: "deferred_link" as const, first_seen_at: observedAt },
+						first_seen_at: observedAt,
+						updated_at: observedAt,
+					};
+					transaction.canonical.gate_authorities[authorityId] = authority;
+					if (typeof runtimeTurnId !== "string" || !runtimeTurnId) {
+						authority.outcome = { state: "stale", reason: "missing_runtime_turn" };
+						authority.updated_at = observedAt;
+						diagnostic("missing_runtime_turn", null, gate.gate_id);
+						continue;
+					}
+					if (
+						existing?.observation.kind === "malformed" ||
+						(existing?.observation.kind === "valid" &&
+							(existing.observation.first_provenance.runtime_turn_id !== runtimeTurnId ||
+								existing.observation.first_provenance.gate_created_at !== gate.created_at ||
+								existing.observation.first_provenance.schema_hash !== gate.schema_hash ||
+								existing.observation.first_provenance.stage !== gate.stage ||
+								existing.observation.first_provenance.kind !== gate.kind))
+					) {
+						authority.outcome = { state: "stale", reason: "gate_provenance_changed" };
+						authority.updated_at = observedAt;
+						diagnostic("gate_provenance_changed", null, gate.gate_id);
+						continue;
+					}
+					const owners = byRuntimeTurn.get(runtimeTurnId) ?? [];
+					if (owners.length !== 1) {
+						const watermarkAt = transaction.recovery.prompt_watermark_at;
+						const gateCreatedAt = Date.parse(gate.created_at);
+						const watermarkBeyondGate =
+							watermarkAt !== null && Number.isFinite(gateCreatedAt) && Date.parse(watermarkAt) > gateCreatedAt;
+						const boundedAbsenceProved =
+							watermarkBeyondGate &&
+							Number.isFinite(gateCreatedAt) &&
+							Date.now() - gateCreatedAt >= 5 * 60 * 1000;
+						if (owners.length === 0 && !boundedAbsenceProved) {
+							authority.outcome = { state: "deferred_link", first_seen_at: authority.first_seen_at };
+							authority.updated_at = observedAt;
+							continue;
+						}
+						authority.outcome =
+							owners.length === 0
+								? { state: "ownership_unavailable", reason: "ownership_unavailable" }
+								: { state: "ownership_conflict", reason: "ownership_conflict" };
+						authority.updated_at = observedAt;
+						diagnostic(owners.length === 0 ? "ownership_unavailable" : "ownership_conflict", null, gate.gate_id);
+						continue;
+					}
+					const turn = owners[0]!;
+					if (TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)) {
+						authority.outcome = { state: "stale", reason: "turn_terminal", turn_id: turn.turn_id };
+						authority.updated_at = observedAt;
+						diagnostic("turn_terminal", turn.turn_id, gate.gate_id);
+						continue;
+					}
+					const codec = decodeAskGateV1(gate);
+					if (!codec) {
+						authority.outcome = { state: "stale", reason: "unsupported_gate", turn_id: turn.turn_id };
+						authority.updated_at = observedAt;
+						diagnostic("unsupported_gate", turn.turn_id, gate.gate_id);
+						continue;
+					}
+					if (
+						existing &&
+						existing.outcome.state !== "pending" &&
+						existing.outcome.state !== "answered" &&
+						existing.outcome.state !== "deferred_link"
+					)
+						continue;
+					const questionId =
+						existing?.outcome.state === "pending" || existing?.outcome.state === "answered"
+							? existing.outcome.question_id
+							: gate.gate_id;
+					if (!existing || authority.outcome.state === "deferred_link") {
+						authority.observation = {
+							kind: "valid",
+							first_provenance: {
+								runtime_turn_id: runtimeTurnId,
+								gate_created_at: gate.created_at,
+								schema_hash: gate.schema_hash,
+								stage: gate.stage,
+								kind: gate.kind,
+							},
+						};
+						authority.outcome = { state: "pending", turn_id: turn.turn_id, question_id: questionId };
+					}
+					authority.updated_at = observedAt;
+					transaction.canonical.gate_authorities[authorityId] = authority;
+					if (!transaction.canonical.questions[questionId]) {
+						const binding = createAnswerBinding();
+						transaction.canonical.questions[questionId] = {
+							question_id: questionId,
+							authority_id: authorityId,
+							session_id: sessionId,
+							turn_id: turn.turn_id,
+							endpoint_incarnation: transaction.canonical.session.broker.endpoint_incarnation,
+							stage: gate.stage,
+							kind: gate.kind,
+							prompt: typeof gate.context.prompt === "string" ? gate.context.prompt : "",
+							status: "pending",
+							binding_plaintext: binding,
+							binding_sha256: createHash("sha256").update(binding).digest("hex"),
+							codec,
+							claim_fence_epoch: null,
+							answer_request_id: null,
+							created_at: observedAt,
+							updated_at: observedAt,
+							answered_at: null,
+							history: [{ at: observedAt, status: "pending", reason: null }],
+						};
+						turn.question_ids = [...new Set([...turn.question_ids, questionId])];
+						projectedTurnQuestions.set(turn.turn_id, turn.question_ids);
+					}
+				}
+				if (complete)
+					for (const [authorityId, authority] of Object.entries(transaction.canonical.gate_authorities))
+						if (!seen.has(authorityId) && authority.outcome.state === "pending") {
+							const question = transaction.canonical.questions[authority.outcome.question_id];
+							if (question?.status === "pending") {
+								question.status = "stale";
+								question.updated_at = observedAt;
+								question.history.push({ at: observedAt, status: "stale", reason: "terminal_uncertain" });
+								authority.outcome = {
+									state: "stale",
+									reason: "terminal_uncertain",
+									turn_id: question.turn_id,
+									question_id: question.question_id,
+								};
+								authority.updated_at = observedAt;
+							}
+						}
+			});
+			for (const [turnId, questionIds] of projectedTurnQuestions) {
+				const legacyTurn = await readTurnRecord(namespaceDir, turnId);
+				if (!legacyTurn) continue;
+				legacyTurn.question_ids = questionIds;
+				await writeTurnRecord(namespaceDir, legacyTurn);
+			}
+			return {
+				ok: true,
+				schema_version: 1,
+				questions: await withSessionTransaction(questionPaths, sessionId, async tx => publicQuestions(tx, null)),
+				diagnostics,
+				reconciliation: {
+					attempted: true,
+					complete,
+					revision,
+					observed_at: observedAt,
+					reason: complete ? null : "query_unavailable",
+				},
+			};
+		} catch (error) {
+			if (error instanceof Error && (error.message === "state_corrupt" || error.message === "resource_gone"))
+				throw error;
+			diagnostic("query_unavailable");
+			await ensureQuestionTransaction(sessionId);
+			return {
+				ok: true,
+				schema_version: 1,
+				questions: await withSessionTransaction(questionPaths, sessionId, async tx => publicQuestions(tx, null)),
+				diagnostics,
+				reconciliation: {
+					attempted: true,
+					complete: false,
+					revision: null,
+					observed_at: observedAt,
+					reason: "query_unavailable",
+				},
+			};
+		}
+	}
 	const sessionTransitionTails = new Map<string, Promise<void>>();
 
 	async function withSessionTransition<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
@@ -1884,14 +2391,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		}
 	}
 
-	async function querySession(session: Record<string, unknown>, query: string): Promise<Record<string, unknown>> {
+	async function querySession(
+		session: Record<string, unknown>,
+		query: string,
+		input: Record<string, unknown> = {},
+		cursor?: string,
+	): Promise<Record<string, unknown>> {
 		const endpoint = await resolveSessionEndpoint(session);
 		const client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
 			endpoint.url,
 			endpoint.token,
 		);
 		try {
-			const response = asRecord(await client.query(query));
+			const response = asRecord(await client.query(query, input, cursor));
 			if (response?.ok !== true) {
 				const error = asRecord(response?.error);
 				throw new SdkClientError(
@@ -1902,6 +2414,83 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return response;
 		} finally {
 			await client.close();
+		}
+	}
+
+	async function readCompleteQ12Snapshot(session: Record<string, unknown>): Promise<{
+		items: unknown[];
+		revision: string | null;
+		complete: boolean;
+		reason: "pagination_malformed" | "query_unavailable" | null;
+	}> {
+		const deadline = Date.now() + 5_000;
+		const items: unknown[] = [];
+		const cursors = new Set<string>();
+		let cursor: string | undefined;
+		let revision: string | null = null;
+		let bytes = 0;
+		let client: SdkClient;
+		try {
+			const endpoint = await resolveSessionEndpoint(session);
+			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
+				endpoint.url,
+				endpoint.token,
+			);
+		} catch {
+			return { items: [], revision, complete: false, reason: "query_unavailable" };
+		}
+		try {
+			for (let pageCount = 0; pageCount < 8 && Date.now() <= deadline; pageCount++) {
+				const response = asRecord(await client.query("Q12", {}, cursor));
+				if (response?.ok !== true) return { items: [], revision, complete: false, reason: "query_unavailable" };
+				const page = asRecord(response.page);
+				const pageItems = page?.items;
+				const pageRevision = typeof page?.revision === "string" ? page.revision : null;
+				const complete = page?.complete === true;
+				const preview = page?.preview;
+				const nextCursor = page?.continuationCursor;
+				if (
+					!Array.isArray(pageItems) ||
+					typeof page?.complete !== "boolean" ||
+					!pageRevision ||
+					(complete && (preview === true || (nextCursor !== undefined && nextCursor !== null))) ||
+					(!complete && (preview !== true || typeof nextCursor !== "string" || nextCursor.length === 0))
+				)
+					return { items: [], revision: pageRevision, complete: false, reason: "pagination_malformed" };
+				const validatedCursor = typeof nextCursor === "string" ? nextCursor : undefined;
+				if (revision !== null && revision !== pageRevision)
+					return { items: [], revision: pageRevision, complete: false, reason: "pagination_malformed" };
+				revision = pageRevision;
+				bytes += Buffer.byteLength(JSON.stringify(pageItems));
+				if (items.length + pageItems.length > 64 || bytes > 256 * 1024)
+					return { items: [], revision, complete: false, reason: "pagination_malformed" };
+				items.push(...pageItems);
+				if (complete) {
+					const valid = items.every(item => {
+						if (!item || typeof item !== "object" || Buffer.byteLength(JSON.stringify(item)) > 16 * 1024)
+							return false;
+						const gate = item as WorkflowGateQueryRecord & WorkflowGate;
+						return (
+							gate.tag === "pending" &&
+							typeof gate.gate_id === "string" &&
+							gate.gate_id.length > 0 &&
+							!!decodeAskGateV1(gate)
+						);
+					});
+					return valid
+						? { items, revision, complete: true, reason: null }
+						: { items: [], revision, complete: false, reason: "pagination_malformed" };
+				}
+				if (!validatedCursor || cursors.has(validatedCursor))
+					return { items: [], revision, complete: false, reason: "pagination_malformed" };
+				cursors.add(validatedCursor);
+				cursor = validatedCursor;
+			}
+			return { items: [], revision, complete: false, reason: "pagination_malformed" };
+		} catch {
+			return { items: [], revision, complete: false, reason: "query_unavailable" };
+		} finally {
+			await client.close().catch(() => undefined);
 		}
 	}
 
@@ -1960,6 +2549,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		idempotencyKey: string,
 		canonicalArgs: Record<string, unknown>,
 		operation: () => Promise<Record<string, unknown>>,
+		recoverInProgress = false,
 	): Promise<Record<string, unknown>> {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		const requestDigest = createHash("sha256")
@@ -2000,7 +2590,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						},
 					};
 				}
-				if (existing.state === "in_progress")
+				if (existing.state === "in_progress" && !recoverInProgress)
 					return {
 						ok: false,
 						error: {
@@ -2008,6 +2598,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							message: "prior coordinator mutation outcome is not replayable",
 						},
 					};
+				if (existing.state === "in_progress") {
+					const response = boundedPublicResponse(await operation().catch(error => sdkError(error)));
+					await writeCoordinatorIdempotencyFile(file, {
+						...existing,
+						state: "completed",
+						response,
+						completed_at: new Date().toISOString(),
+					} as CoordinatorToolIdempotencyRecord);
+					return response;
+				}
 				return {
 					ok: false,
 					error: {
@@ -2042,17 +2642,45 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		input: Record<string, unknown>,
 		idempotencyKey?: string,
 	): Promise<unknown> {
-		const discovery = await readSdkBrokerDiscovery(services.getAgentDir?.() ?? getAgentDir());
-		if (!discovery) throw new SdkClientError("not_found", "SDK broker discovery is unavailable.");
-		const client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
-			discovery.url,
-			discovery.token,
-		);
+		const agentDir = services.getAgentDir?.() ?? getAgentDir();
 		try {
-			return await client.global(operation, input, { ...(idempotencyKey ? { idempotencyKey } : {}) });
-		} finally {
-			await client.close();
+			await (services.ensureBroker ?? ensureBroker)({ agentDir });
+		} catch (error) {
+			throw toCoordinatorBrokerError("ensure", error);
 		}
+
+		let discovery: BrokerDiscovery | null;
+		try {
+			discovery = await (services.readSdkBrokerDiscovery ?? readSdkBrokerDiscovery)(agentDir);
+		} catch (error) {
+			throw toCoordinatorBrokerError("read", error);
+		}
+		if (!discovery) throw new SdkClientError("broker_unavailable", "SDK broker is unavailable after bootstrap.");
+
+		let client: SdkClient;
+		try {
+			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
+				discovery.url,
+				discovery.token,
+			);
+		} catch (error) {
+			throw toCoordinatorBrokerError("connect", error);
+		}
+
+		let requestError: SdkClientError | undefined;
+		let result: unknown;
+		try {
+			result = await client.global(operation, input, { ...(idempotencyKey ? { idempotencyKey } : {}) });
+		} catch (error) {
+			requestError = toCoordinatorBrokerError("request", error);
+		}
+		try {
+			await client.close();
+		} catch (error) {
+			if (!requestError) throw toCoordinatorBrokerError("close", error);
+		}
+		if (requestError) throw requestError;
+		return result;
 	}
 
 	function brokerResult(value: unknown): Record<string, unknown> {
@@ -2211,7 +2839,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const id = safeExternalId("session", rawId);
 		return await withSessionTransition(id, async () => {
 			const session = asRecord(await readJsonFile(sessionFile(id)));
-			if (!session) return { ok: false, reason: "unknown_session", closed: false };
+			if (!session) {
+				await ensureQuestionStateReady();
+				const deletion = await withNamespaceRegistry(
+					questionPaths,
+					async registry =>
+						Object.values(registry.deletions).find(
+							entry => entry.session_id === id && entry.phase === "completed",
+						) ?? null,
+				);
+				if (deletion?.safe_response) return deletion.safe_response as { ok: boolean; closed: boolean };
+				return { ok: false, reason: "unknown_session", closed: false };
+			}
+
 			if (session.ephemeral !== true && opts.force !== true)
 				return { ok: false, reason: "not_ephemeral", closed: false };
 			const activeTurn = await readActiveTurn(namespaceDir, id);
@@ -2227,6 +2867,39 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const persistedIncarnation = optionalString(session.endpoint_incarnation);
 			if (!cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
 				return { ok: false, reason: "endpoint_stale", closed: false };
+			const deletionId = `delete:${id}:${persistedIncarnation}`;
+			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+			await ensureQuestionStateReady();
+			await ensureQuestionTransaction(id);
+			await withSessionTransaction(questionPaths, id, async transaction => {
+				const now = new Date().toISOString();
+				transaction.requests.operations[deletionId] = {
+					operation_id: deletionId,
+					tool: "gjc_coordinator_stop_session",
+					key_digest: deletionKey,
+					request_digest: deletionKey,
+					local_id: id,
+					phase: "remote_started",
+					intent: { kind: "reap", endpoint_incarnation: persistedIncarnation },
+					created_at: now,
+					updated_at: now,
+				};
+			});
+			await recordDeletionIntent(questionPaths, {
+				deletion_id: deletionId,
+				session_id: id,
+				endpoint_incarnation: persistedIncarnation,
+				operation_id: deletionId,
+				key_digest: deletionKey,
+				request_digest: deletionKey,
+				close_key: deletionId,
+				phase: "intent",
+				cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
+				authority_digest: deletionKey,
+				created_at: new Date().toISOString(),
+				updated_at: new Date().toISOString(),
+			});
+
 			let workspace = "";
 			try {
 				workspace = await canonicalBrokerWorkspace(cwd);
@@ -2257,6 +2930,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					closed: false,
 				};
 			}
+			await advanceDeletion(questionPaths, deletionId, "broker_closed");
+
 			try {
 				await exactBrokerSessionAuthority(id, workspace);
 				return { ok: false, reason: "endpoint_stale", closed: false };
@@ -2278,6 +2953,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				summary: `Session ${id} closed and reaped${opts.reason ? ` (${opts.reason})` : ""}`,
 				metadata: { reason: opts.reason ?? null, force: opts.force === true, closed: true },
 			});
+			await advanceDeletion(
+				questionPaths,
+				deletionId,
+				"completed",
+				{
+					wal: true,
+					turns: true,
+					reports: false,
+					session: true,
+					events: true,
+				},
+				{ ok: true, closed: true },
+			);
 			return { ok: true, closed: true };
 		});
 	}
@@ -2311,16 +2999,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		},
 		{ idleTtlMs: config.sessionIdleTtlMs, sweepIntervalMs: config.sessionSweepIntervalMs },
 	);
-	async function listQuestions(args: Record<string, unknown>): Promise<unknown[]> {
-		const sessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
-		const status = typeof args.status === "string" && args.status.length > 0 ? args.status : null;
-		return (await listJsonFiles(path.join(namespaceDir, "questions"))).filter(question => {
-			const record = asRecord(question);
-			if (!record) return false;
-			if (sessionId && record.session_id !== sessionId) return false;
-			if (status && record.status !== status) return false;
-			return true;
-		});
+	async function listQuestions(args: Record<string, unknown>): Promise<ListQuestionsSuccessV1> {
+		const sessionId = safeExternalId("session", args.session_id);
+		const reconciled = await reconcileQuestions(sessionId);
+		const status = typeof args.status === "string" && args.status.length > 0 ? args.status : "pending";
+		const turnId = args.turn_id == null ? null : safeTurnId(args.turn_id);
+		return {
+			...reconciled,
+			questions: reconciled.questions
+				.filter(question => question.status === status || (status === "open" && question.status === "pending"))
+				.filter(question => turnId === null || question.turn_id === turnId),
+		};
 	}
 
 	async function validateEvidencePaths(value: unknown): Promise<Array<{ path: string }>> {
@@ -2340,6 +3029,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (sessionId != null && turn.session_id !== safeExternalId("session", sessionId)) {
 			return { ok: false, reason: "turn_session_mismatch" };
 		}
+		await reconcileQuestions(turn.session_id);
 		const session = asRecord(await readJsonFile(sessionFile(turn.session_id)));
 		let resolvedTurn = turn;
 		let advisoryStatus: Record<string, unknown> = {
@@ -2389,10 +3079,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					sessionState.current_turn_id == null)) &&
 			(sessionState.state === "completed" || sessionState.state === "errored")
 		) {
-			resolvedTurn = await markTurnTerminalFromSessionState(namespaceDir, resolvedTurn, sessionState);
+			resolvedTurn = await markTurnTerminalFromSessionState(resolvedTurn, sessionState);
+			await projectTerminalTransition(resolvedTurn, {
+				desiredState: sessionState.state,
+				reason: sessionState.reason ? "terminal_uncertain" : null,
+				live: sessionState.live,
+			});
 			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 		} else if (!session && ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
-			resolvedTurn = await markTurnFailedForUnavailableSession(namespaceDir, resolvedTurn, "session_record_missing");
+			resolvedTurn = await markTurnFailedForUnavailableSession(resolvedTurn, "session_record_missing");
+			await projectTerminalTransition(resolvedTurn, {
+				desiredState: "stale",
+				reason: "session_unavailable",
+				live: false,
+			});
 			sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 		}
 		if (ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
@@ -2403,6 +3103,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				promptAckTimeoutMs,
 			);
 			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
+				await projectTerminalTransition(resolvedTurn, {
+					desiredState: "stale",
+					reason: "terminal_uncertain",
+					live: resolvedTurn.liveness.live,
+				});
 				sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 			}
 		}
@@ -2458,12 +3163,302 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return payload;
 	}
 
+	async function claimCanonicalPrompt(
+		sessionId: string,
+		prompt: string,
+		operation: "turn.prompt" | "turn.follow_up" | "turn.abort_and_prompt",
+		idempotencyKey: string,
+	): Promise<string> {
+		await ensureQuestionTransaction(sessionId);
+		const keyDigest = createHash("sha256").update(`${idempotencyKey}\0${operation}`).digest("hex");
+		const requestDigest = createHash("sha256").update(`${operation}\0${prompt}`).digest("hex");
+		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+			const existing = transaction.requests.prompts[keyDigest];
+			if (existing) {
+				if (existing.request_digest !== requestDigest) throw new Error("idempotency_conflict");
+				if (existing.phase === "remote_started" || existing.phase === "uncertain")
+					throw new Error("terminal_uncertain");
+				return;
+			}
+			const now = new Date().toISOString();
+			transaction.requests.prompts[keyDigest] = {
+				request_id: `prompt:${keyDigest}`,
+				key_digest: keyDigest,
+				request_digest: requestDigest,
+				operation,
+				canonical_prompt: { text: prompt },
+				sdk_idempotency_key: idempotencyKey,
+				phase: "remote_started",
+				created_at: now,
+				updated_at: now,
+			};
+		});
+		return keyDigest;
+	}
+
+	/** Commits terminal fencing, question revocation, report, and promotion together before legacy projection. */
+	async function commitTerminalTransition(
+		turn: TurnRecord,
+		input: {
+			desiredState: CoordinatorSessionStateValue;
+			reason: PublicReason | null;
+			report?: CanonicalReportSnapshotV1;
+			promoteQueuedTurn?: boolean;
+		},
+	): Promise<{ promotedTurnId: string | null; desiredState: CoordinatorSessionStateValue }> {
+		await ensureQuestionTransaction(turn.session_id);
+		return await withAdmittedSessionTransaction(questionPaths, turn.session_id, async transaction => {
+			const terminalEpoch = transaction.revision + 1;
+			transaction.canonical.turns[turn.turn_id] = {
+				schema_version: 1,
+				turn_id: turn.turn_id,
+				session_id: turn.session_id,
+				namespace_id: config.namespace.identity,
+				status: turn.status,
+				prompt: turn.prompt,
+				delivery: { ...turn.delivery },
+				question_ids: Object.values(transaction.canonical.questions)
+					.filter(question => question.turn_id === turn.turn_id)
+					.map(question => question.question_id),
+				final_response: { ...turn.final_response },
+				evidence: turn.evidence,
+				error: turn.error ? { ...turn.error } : null,
+				liveness: { ...turn.liveness },
+				created_at: turn.created_at,
+				updated_at: turn.updated_at,
+				started_at: turn.started_at,
+				completed_at: turn.completed_at,
+				terminal_fence: {
+					epoch: terminalEpoch,
+					status: turn.status,
+					reason: input.reason,
+					at: turn.completed_at ?? turn.updated_at,
+				},
+			};
+			for (const question of Object.values(transaction.canonical.questions)) {
+				if (question.turn_id !== turn.turn_id || question.status === "answered") continue;
+				question.status = "stale";
+				question.claim_fence_epoch = terminalEpoch;
+				question.updated_at = turn.updated_at;
+				question.history.push({
+					at: turn.updated_at,
+					status: "stale",
+					reason: input.reason ?? "terminal_uncertain",
+				});
+			}
+			if (input.report) transaction.canonical.reports[input.report.report_id] = input.report;
+			const next =
+				input.promoteQueuedTurn === false
+					? null
+					: (Object.values(transaction.canonical.turns)
+							.filter(candidate => candidate.status === "queued")
+							.sort((left, right) => left.created_at.localeCompare(right.created_at))[0] ?? null);
+			if (next) {
+				const timestamp = new Date().toISOString();
+				next.status = "active";
+				next.started_at = timestamp;
+				next.updated_at = timestamp;
+			}
+			transaction.canonical.queue.ordered_turn_ids = Object.values(transaction.canonical.turns)
+				.filter(candidate => candidate.status === "queued")
+				.map(candidate => candidate.turn_id);
+			transaction.canonical.queue.active_turn_id = next?.turn_id ?? null;
+			transaction.canonical.queue.selected_promotion = next
+				? { from_turn_id: turn.turn_id, to_turn_id: next.turn_id, revision: terminalEpoch }
+				: null;
+			transaction.canonical.desired_session_state = next ? "running" : input.desiredState;
+			const eventKind = turnEventKind(turn.status) ?? "turn.terminal";
+			const eventId = deterministicOutboxId(turn.session_id, terminalEpoch, eventKind, "turn", turn.turn_id);
+			transaction.outbox[eventId] ??= {
+				id: eventId,
+				transaction_revision: terminalEpoch,
+				kind: eventKind,
+				entity: "turn",
+				entity_id: turn.turn_id,
+				payload: {
+					session_id: turn.session_id,
+					turn_id: turn.turn_id,
+					status: turn.status,
+					created_at: turn.updated_at,
+				},
+				emitted: false,
+			};
+			if (input.report) {
+				const reportEventId = deterministicOutboxId(
+					turn.session_id,
+					terminalEpoch,
+					"report.written",
+					"report",
+					input.report.report_id,
+				);
+				transaction.outbox[reportEventId] ??= {
+					id: reportEventId,
+					transaction_revision: terminalEpoch,
+					kind: "report.written",
+					entity: "report",
+					entity_id: input.report.report_id,
+					payload: {
+						session_id: turn.session_id,
+						turn_id: turn.turn_id,
+						report_id: input.report.report_id,
+						status: input.report.status,
+						created_at: input.report.created_at,
+					},
+					emitted: false,
+				};
+			}
+			return { promotedTurnId: next?.turn_id ?? null, desiredState: next ? "running" : input.desiredState };
+		});
+	}
+
+	function turnFromCanonical(turn: CoordinatorSessionTransactionV1["canonical"]["turns"][string]): TurnRecord {
+		return {
+			schema_version: 1,
+			turn_id: turn.turn_id,
+			session_id: turn.session_id,
+			namespace: config.namespace,
+			status: turn.status as TurnStatus,
+			prompt: turn.prompt as TurnRecord["prompt"],
+			delivery: turn.delivery as TurnRecord["delivery"],
+			question_ids: [...turn.question_ids],
+			final_response: turn.final_response as TurnRecord["final_response"],
+			evidence: [...turn.evidence],
+			error: turn.error as TurnRecord["error"],
+			liveness: turn.liveness as TurnRecord["liveness"],
+			created_at: turn.created_at,
+			updated_at: turn.updated_at,
+			started_at: turn.started_at,
+			completed_at: turn.completed_at,
+		};
+	}
+
+	/** Rebuild every legacy projection from the committed canonical snapshot. */
+	async function repairCanonicalProjections(sessionId: string): Promise<void> {
+		await repairProjections(questionPaths, sessionId, async canonical => {
+			await writeJsonFile(sessionFile(sessionId), sessionFromCreationSnapshot(canonical.session));
+			for (const turn of Object.values(canonical.turns))
+				await writeTurnRecord(namespaceDir, turnFromCanonical(turn));
+			for (const report of Object.values(canonical.reports))
+				await writeJsonFile(path.join(namespaceDir, "reports", `${report.report_id}.json`), report);
+			const canonicalTurnIds = new Set(Object.keys(canonical.turns));
+			for (const entry of await fs.readdir(turnsDir(namespaceDir)).catch(() => [])) {
+				if (!entry.endsWith(".json")) continue;
+				const turnId = entry.slice(0, -5);
+				if (canonicalTurnIds.has(turnId)) continue;
+				const projected = asRecord(await readJsonFile(path.join(turnsDir(namespaceDir), entry)));
+				if (projected?.session_id === sessionId)
+					await fs.rm(path.join(turnsDir(namespaceDir), entry), { force: true });
+			}
+			const reportsDirectory = path.join(namespaceDir, "reports");
+			const canonicalReportIds = new Set(Object.keys(canonical.reports));
+			for (const entry of await fs.readdir(reportsDirectory).catch(() => [])) {
+				if (!entry.endsWith(".json")) continue;
+				const reportId = entry.slice(0, -5);
+				if (canonicalReportIds.has(reportId)) continue;
+				const projected = asRecord(await readJsonFile(path.join(reportsDirectory, entry)));
+				if (projected?.session_id === sessionId) await fs.rm(path.join(reportsDirectory, entry), { force: true });
+			}
+			const activeId = canonical.queue.selected_promotion?.to_turn_id ?? canonical.queue.active_turn_id;
+			const active = activeId ? canonical.turns[activeId] : null;
+			if (active) await writeActiveTurn(namespaceDir, turnFromCanonical(active));
+			else {
+				const prior = await readActiveTurn(namespaceDir, sessionId);
+				if (prior) await clearActiveTurn(namespaceDir, prior);
+			}
+			await writeSessionState(namespaceDir, sessionId, canonical.desired_session_state, {
+				currentTurnId: active?.turn_id ?? null,
+				lastTurnId: canonical.queue.selected_promotion?.from_turn_id ?? null,
+				live: null,
+				reason: null,
+				overwrite: true,
+			});
+		});
+	}
+
+	async function projectTerminalTransition(
+		turn: TurnRecord,
+
+		input: Parameters<typeof commitTerminalTransition>[1] & { live?: boolean | null },
+	): Promise<void> {
+		await commitTerminalTransition(turn, input);
+		await repairCanonicalProjections(turn.session_id);
+	}
+
+	async function commitCanonicalTurn(
+		sessionId: string,
+		turn: TurnRecord,
+		promptKey: string | null = null,
+	): Promise<void> {
+		await ensureQuestionTransaction(sessionId);
+		await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+			const terminal = TERMINAL_TURN_STATUSES.has(turn.status);
+			transaction.canonical.turns[turn.turn_id] = {
+				schema_version: 1,
+				turn_id: turn.turn_id,
+				session_id: sessionId,
+				namespace_id: config.namespace.identity,
+				status: turn.status,
+				prompt: turn.prompt,
+				delivery: { ...turn.delivery },
+				question_ids: Object.values(transaction.canonical.questions)
+					.filter(question => question.turn_id === turn.turn_id)
+					.map(question => question.question_id),
+				final_response: { ...turn.final_response },
+				evidence: turn.evidence,
+				error: turn.error ? { ...turn.error } : null,
+				liveness: { ...turn.liveness },
+				created_at: turn.created_at,
+				updated_at: turn.updated_at,
+				started_at: turn.started_at,
+				completed_at: turn.completed_at,
+				terminal_fence: terminal
+					? {
+							epoch: transaction.revision + 1,
+							status: turn.status,
+							reason: null,
+							at: turn.completed_at ?? turn.updated_at,
+						}
+					: null,
+			};
+			transaction.canonical.queue.ordered_turn_ids = Object.values(transaction.canonical.turns)
+				.filter(candidate => candidate.status === "queued")
+				.map(candidate => candidate.turn_id);
+			transaction.canonical.queue.active_turn_id = terminal
+				? null
+				: turn.delivery.queued
+					? transaction.canonical.queue.active_turn_id
+					: turn.turn_id;
+			transaction.recovery.prompt_watermark_at = turn.updated_at;
+			if (terminal)
+				for (const question of Object.values(transaction.canonical.questions)) {
+					if (question.turn_id !== turn.turn_id || question.status === "answered") continue;
+					question.status = "stale";
+					question.claim_fence_epoch = transaction.revision + 1;
+					question.updated_at = turn.updated_at;
+					question.history.push({ at: turn.updated_at, status: "stale", reason: "terminal_uncertain" });
+				}
+			if (promptKey) {
+				const request = transaction.requests.prompts[promptKey];
+				if (!request) throw new Error("state_corrupt");
+				request.phase = "completed";
+				request.coordinator_turn_id = turn.turn_id;
+				request.runtime_receipt = {
+					accepted: true,
+					command_id: String(turn.delivery.runtime_command_id),
+					turn_id: String(turn.delivery.runtime_turn_id),
+				};
+				request.updated_at = turn.updated_at;
+			}
+		});
+	}
+
 	async function recordAcceptedPrompt(
 		sessionId: string,
 		prompt: string,
 		operation: "turn.prompt" | "turn.follow_up" | "turn.abort_and_prompt",
 		previousActiveTurn: TurnRecord | null,
 		acknowledgement: RuntimePromptAcknowledgement,
+		promptKey: string | null = null,
 	): Promise<TurnRecord> {
 		const timestamp = new Date().toISOString();
 		if (operation === "turn.abort_and_prompt" && previousActiveTurn) {
@@ -2473,8 +3468,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				updated_at: timestamp,
 				completed_at: timestamp,
 			};
-			await writeTurnRecord(namespaceDir, superseded);
-			await clearActiveTurn(namespaceDir, superseded);
+			await projectTerminalTransition(superseded, {
+				desiredState: "running",
+				reason: null,
+				promoteQueuedTurn: false,
+			});
 		}
 		const queued = operation === "turn.follow_up";
 		const turn = makeTurnRecord(config, sessionId, prompt, queued ? "queued" : "active");
@@ -2488,6 +3486,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			state: "acknowledged",
 			attempts: [{ delivered: true, channel: "runtime_ack", created_at: timestamp, reason: null }],
 		};
+		await commitCanonicalTurn(sessionId, turn, promptKey);
 		await writeTurnRecord(namespaceDir, turn);
 		if (!queued) {
 			await writeActiveTurn(namespaceDir, turn);
@@ -2500,48 +3499,50 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return turn;
 	}
 
-	async function promoteNextQueuedTurn(sessionId: string): Promise<TurnRecord | null> {
-		const queuedTurns = (await listJsonFiles(turnsDir(namespaceDir)))
-			.map(turn => asRecord(turn) as TurnRecord | null)
-			.filter(
-				(turn): turn is TurnRecord => turn !== null && turn.session_id === sessionId && turn.status === "queued",
-			)
-			.sort((left, right) => left.created_at.localeCompare(right.created_at));
-		const next = queuedTurns[0];
-		if (!next) return null;
-		const timestamp = new Date().toISOString();
-		const active: TurnRecord = { ...next, status: "active", started_at: timestamp, updated_at: timestamp };
-		await writeTurnRecord(namespaceDir, active);
-		await writeActiveTurn(namespaceDir, active);
-		await writeSessionState(namespaceDir, sessionId, "running", {
-			currentTurnId: active.turn_id,
-			live: null,
-			reason: null,
-		});
-		return active;
-	}
-
 	async function reconcileActiveTurnAcknowledgements(): Promise<void> {
 		const turns = (await listJsonFiles(turnsDir(namespaceDir)))
 			.map(turn => asRecord(turn) as TurnRecord | null)
 			.filter((turn): turn is TurnRecord => turn !== null && ACTIVE_TURN_STATUSES.has(turn.status));
 		for (const turn of turns) {
 			let sessionState = await readSessionState(namespaceDir, turn.session_id);
-			const resolvedTurn = await reconcileRuntimeAcknowledgement(
+			let resolvedTurn = await reconcileRuntimeAcknowledgement(
 				namespaceDir,
 				turn,
 				sessionState,
 				promptAckTimeoutMs,
 				{ failOnTimeout: false },
 			);
-			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) continue;
+			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status)) {
+				await projectTerminalTransition(resolvedTurn, {
+					desiredState: "stale",
+					reason: "terminal_uncertain",
+					live: resolvedTurn.liveness.live,
+				});
+				continue;
+			}
 			if (resolvedTurn !== turn) sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 			const session = asRecord(await readJsonFile(sessionFile(resolvedTurn.session_id)));
 			if (!session) {
-				await markTurnFailedForUnavailableSession(namespaceDir, resolvedTurn, "session_record_missing");
+				resolvedTurn = await markTurnFailedForUnavailableSession(resolvedTurn, "session_record_missing");
+				await projectTerminalTransition(resolvedTurn, {
+					desiredState: "stale",
+					reason: "session_unavailable",
+					live: false,
+				});
 				continue;
 			}
-			await reconcileRuntimeAcknowledgement(namespaceDir, resolvedTurn, sessionState, promptAckTimeoutMs);
+			resolvedTurn = await reconcileRuntimeAcknowledgement(
+				namespaceDir,
+				resolvedTurn,
+				sessionState,
+				promptAckTimeoutMs,
+			);
+			if (!ACTIVE_TURN_STATUSES.has(resolvedTurn.status))
+				await projectTerminalTransition(resolvedTurn, {
+					desiredState: "stale",
+					reason: "terminal_uncertain",
+					live: resolvedTurn.liveness.live,
+				});
 		}
 	}
 
@@ -2556,20 +3557,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const cwd = await canonicalBrokerWorkspace(await assertCoordinatorWorkdir(config, args.cwd));
 				const tmuxSession = optionalString(args.tmux_session) ? safeTmuxSessionName(args.tmux_session) : undefined;
 				const tmuxTarget = optionalString(args.tmux_target) ? safeTmuxTarget(args.tmux_target) : undefined;
+				const canonicalArgs = {
+					session_id: sessionId,
+					cwd,
+					...(tmuxSession ? { tmux_session: tmuxSession } : {}),
+					...(tmuxTarget ? { tmux_target: tmuxTarget } : {}),
+					visible: args.visible !== false,
+					source: optionalString(args.source) ?? "register_session",
+					model: optionalString(args.model),
+					allow_mutation: true,
+				};
 				return await withToolIdempotency(
 					name,
 					idempotencyKey,
-					{
-						session_id: sessionId,
-						cwd,
-						...(tmuxSession ? { tmux_session: tmuxSession } : {}),
-						...(tmuxTarget ? { tmux_target: tmuxTarget } : {}),
-						visible: args.visible !== false,
-						source: optionalString(args.source) ?? "register_session",
-						model: optionalString(args.model),
-						allow_mutation: true,
-					},
+					canonicalArgs,
 					async () => {
+						const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+						if (creation.request.phase === "completed" && creation.request.safe_response)
+							return creation.request.safe_response;
 						const binding = await exactBrokerSessionBinding(sessionId, cwd, idempotencyKey);
 						const session = normalizeSession({
 							session_id: sessionId,
@@ -2583,6 +3588,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							endpoint_generation: binding.endpointGeneration,
 							endpoint_incarnation: binding.endpointIncarnation,
 						});
+						const intent: CanonicalCreateIntentV1 = {
+							kind: "register",
+							session: canonicalCreationSnapshot(session),
+							initial_state: "ready_for_input",
+							initial_events: [],
+						};
+						await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+						await commitCreationWal(questionPaths, creation.keyDigest, intent);
 						await writeJsonFile(sessionFile(sessionId), session);
 						const sessionState = await writeSessionState(namespaceDir, sessionId, "ready_for_input", {
 							live: null,
@@ -2598,13 +3611,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								visible: args.visible !== false,
 							},
 						});
-						return {
+						const response = {
 							ok: true,
 							session: publicCoordinatorSession(session),
 							session_state: publicCoordinatorSessionState(sessionState),
 							registered: true,
 						};
+						await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
+						await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
+						return response;
 					},
+					true,
 				);
 			}
 			if (name === "gjc_coordinator_read_status") {
@@ -2624,7 +3641,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						);
 						return {
 							ok: true,
-							session: publicCoordinatorSession(session),
+							session: publicCoordinatorStatusSession(session),
 							status: brokerLiveness(indexedSession ?? null),
 							session_state: publicCoordinatorSessionState(
 								await readSessionState(namespaceDir, canonicalSessionId),
@@ -2668,7 +3685,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					return sdkError(error);
 				}
 			}
-			if (name === "gjc_coordinator_list_questions") return { ok: true, questions: await listQuestions(args) };
+			if (name === "gjc_coordinator_list_questions") return await listQuestions(args);
 			if (name === "gjc_coordinator_list_artifacts") return { ok: true, roots: config.allowedRoots };
 			if (name === "gjc_coordinator_read_artifact")
 				return await readCoordinatorArtifact(config, { path: args.path });
@@ -2677,14 +3694,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const brokerSessions = await listSessions();
 				const sessionStates = jsonRecords(await listJsonFiles(path.join(namespaceDir, "session-states")));
 				const turns = jsonRecords(await listJsonFiles(turnsDir(namespaceDir)));
-				const questions = jsonRecords(await listQuestions(args));
+				const questions =
+					args.session_id == null
+						? []
+						: (await listQuestions(args)).questions.map(
+								({ answer_binding: _answerBinding, ...question }) => question,
+							);
 				const reports = jsonRecords(await listJsonFiles(path.join(namespaceDir, "reports")));
 				const events = await readCoordinatorEvents(namespaceDir);
-				return {
+				return capabilityFreeStatusValue({
 					ok: true,
 					schema_version: 1,
 					namespace: config.namespace,
-					state_root: namespaceDir,
 					transport: { mcp: "polling", push_subscriptions: false },
 					summary: {
 						sessions: brokerSessions.length,
@@ -2693,7 +3714,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						active_turns: turns.filter(turn => ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus)).length,
 						queued_turns: turns.filter(turn => turn.status === "queued").length,
 						terminal_turns: turns.filter(turn => TERMINAL_TURN_STATUSES.has(turn.status as TurnStatus)).length,
-						open_questions: questions.filter(question => question.status === "open").length,
+						open_questions: questions.filter(question => question.status === "pending").length,
 						reports: reports.length,
 					},
 					sessions: brokerSessions.map(publicBrokerSession),
@@ -2712,10 +3733,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					events: buildCanonicalCoordinatorEvents({ sessionStates, turns, questions, reports }),
 					latest_event_seq: await readLatestEventSeq(namespaceDir),
 					recent_events: eventSummaries(events.slice(-10)),
-				};
+				}) as Record<string, unknown>;
 			}
 			if (name === "gjc_coordinator_watch_events") {
 				await reconcileActiveTurnAcknowledgements();
+				if (args.session_id != null) await reconcileQuestions(safeExternalId("session", args.session_id));
 				const limit = boundedEventLimit(args.limit);
 				const timeoutMs = boundedEventWatchTimeoutMs(args.timeout_ms);
 				let events = await readCoordinatorEvents(namespaceDir);
@@ -2762,29 +3784,31 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					model: typeof args.model === "string" ? args.model : null,
 				});
 				const reusedSessionId = args.session_id == null ? undefined : safeExternalId("session", args.session_id);
+				const canonicalArgs = {
+					cwd: canonicalCwd,
+					task,
+					...(reusedSessionId ? { session_id: reusedSessionId } : {}),
+					queue: args.queue === true,
+					force: args.force === true,
+					mpreset: mpresetResolution.mpreset,
+					model: typeof args.model === "string" ? args.model : null,
+					await_completion: args.await_completion === true,
+					...(args.await_completion === true
+						? { timeout_ms: args.timeout_ms, poll_interval_ms: args.poll_interval_ms }
+						: {}),
+					prompt_alias_ignored: hasTask && hasPrompt,
+					allow_mutation: true,
+				};
 				return await withToolIdempotency(
 					name,
 					idempotencyKey,
-					{
-						cwd: canonicalCwd,
-						task,
-						...(reusedSessionId ? { session_id: reusedSessionId } : {}),
-						queue: args.queue === true,
-						force: args.force === true,
-						mpreset: mpresetResolution.mpreset,
-						model: typeof args.model === "string" ? args.model : null,
-						await_completion: args.await_completion === true,
-						...(args.await_completion === true
-							? { timeout_ms: args.timeout_ms, poll_interval_ms: args.poll_interval_ms }
-							: {}),
-						prompt_alias_ignored: hasTask && hasPrompt,
-						allow_mutation: true,
-					},
+					canonicalArgs,
 					async () => {
 						const delegate = async () => {
 							let sessionId: string;
 							let session: Record<string, unknown>;
 							let reusedSession = false;
+							let creationKey: string | null = null;
 							if (reusedSessionId) {
 								sessionId = reusedSessionId;
 								const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
@@ -2842,31 +3866,66 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								});
 								reusedSession = true;
 							} else {
-								const created = brokerResult(
-									await brokerSession(
-										canonicalCwd,
-										"session.create",
-										{
-											cwd: canonicalCwd,
-											target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
-											...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+								const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+								if (creation.request.phase === "completed" && creation.request.safe_response)
+									return creation.request.safe_response;
+								creationKey = creation.keyDigest;
+								if (creation.request.canonical_create_intent) {
+									session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
+									await bindCreationRequest(
+										questionPaths,
+										creation.keyDigest,
+										creation.request.canonical_create_intent,
+									);
+									await commitCreationWal(
+										questionPaths,
+										creation.keyDigest,
+										creation.request.canonical_create_intent,
+									);
+									sessionId = creation.request.canonical_create_intent.session.session_id;
+								} else {
+									const created = brokerResult(
+										await brokerSession(
+											canonicalCwd,
+											"session.create",
+											{
+												cwd: canonicalCwd,
+												target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
+												...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+											},
+											idempotencyKey,
+										),
+									);
+									sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
+									const createdCwd = await canonicalBrokerWorkspace(
+										optionalString(created.cwd) ?? canonicalCwd,
+									);
+									const binding = await exactBrokerSessionBinding(sessionId, createdCwd, idempotencyKey);
+									session = normalizeSession({
+										session_id: sessionId,
+										cwd: createdCwd,
+										ephemeral: true,
+										created_at: new Date().toISOString(),
+										...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+										broker_workspace: binding.workspace,
+										endpoint_generation: binding.endpointGeneration,
+										endpoint_incarnation: binding.endpointIncarnation,
+									});
+									const intent: CanonicalCreateIntentV1 = {
+										kind: "delegate",
+										workflow: delegateWorkflow,
+										session: canonicalCreationSnapshot(session),
+										remote_create_key: creation.request.remote_create_key,
+										initial_state: "running",
+										initial_prompt: {
+											text: taggedPrompt,
+											caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
 										},
-										idempotencyKey,
-									),
-								);
-								sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
-								const createdCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? canonicalCwd);
-								const binding = await exactBrokerSessionBinding(sessionId, createdCwd, idempotencyKey);
-								session = normalizeSession({
-									session_id: sessionId,
-									cwd: createdCwd,
-									ephemeral: true,
-									created_at: new Date().toISOString(),
-									...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
-									broker_workspace: binding.workspace,
-									endpoint_generation: binding.endpointGeneration,
-									endpoint_incarnation: binding.endpointIncarnation,
-								});
+										initial_events: [],
+									};
+									await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+									await commitCreationWal(questionPaths, creation.keyDigest, intent);
+								}
 							}
 							await writeJsonFile(sessionFile(sessionId), session);
 							const previousActiveTurn = await readActiveTurn(namespaceDir, sessionId);
@@ -2886,6 +3945,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									: args.queue === true
 										? "turn.follow_up"
 										: "turn.prompt";
+							const promptKey = await claimCanonicalPrompt(sessionId, taggedPrompt, operation, idempotencyKey);
 							const result = await controlSession(session, operation, { text: taggedPrompt }, idempotencyKey);
 							const acknowledgement = requirePromptAcknowledgement(result);
 							const turn = await recordAcceptedPrompt(
@@ -2894,6 +3954,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								operation,
 								previousActiveTurn,
 								acknowledgement,
+								promptKey,
 							);
 							await appendCoordinatorEvent(namespaceDir, {
 								kind: "delegation.started",
@@ -2924,6 +3985,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								result: publicSdkAcknowledgement(acknowledgement),
 								...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
 							};
+							if (creationKey) {
+								await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
+								await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
+							}
 							return args.await_completion === true
 								? {
 										...response,
@@ -2938,6 +4003,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						};
 						return reusedSessionId ? await withSessionTransition(reusedSessionId, delegate) : await delegate();
 					},
+					true,
 				);
 			}
 			if (name === "gjc_coordinator_stop_session") {
@@ -2976,46 +4042,79 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					};
 				}
 				const prompt = typeof args.prompt === "string" && args.prompt.length > 0 ? args.prompt : null;
+				const canonicalArgs = {
+					cwd,
+					mpreset: mpresetResolution.mpreset,
+					...(prompt ? { prompt } : {}),
+					allow_mutation: true,
+				};
 				return await withToolIdempotency(
 					name,
 					idempotencyKey,
-					{
-						cwd,
-						mpreset: mpresetResolution.mpreset,
-						...(prompt ? { prompt } : {}),
-						allow_mutation: true,
-					},
+					canonicalArgs,
 					async () => {
-						const created = brokerResult(
-							await brokerSession(
-								cwd,
-								"session.create",
-								{
+						const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+						if (creation.request.phase === "completed" && creation.request.safe_response)
+							return creation.request.safe_response;
+						let created: Record<string, unknown>;
+						let session: Record<string, unknown>;
+						let sessionId: string;
+						if (creation.request.canonical_create_intent) {
+							session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
+							sessionId = creation.request.canonical_create_intent.session.session_id;
+							created = { session_id: sessionId };
+						} else {
+							created = brokerResult(
+								await brokerSession(
 									cwd,
-									target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
-									...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-								},
-								idempotencyKey,
-							),
-						);
-						const sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
-						const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
-						const binding = await exactBrokerSessionBinding(sessionId, sessionCwd, idempotencyKey);
-						const session = normalizeSession({
-							session_id: sessionId,
-							cwd: sessionCwd,
-							...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
-							broker_workspace: binding.workspace,
-							endpoint_generation: binding.endpointGeneration,
-							endpoint_incarnation: binding.endpointIncarnation,
-						});
+									"session.create",
+									{
+										cwd,
+										target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
+										...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+									},
+									idempotencyKey,
+								),
+							);
+							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
+							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
+							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd, idempotencyKey);
+							session = normalizeSession({
+								session_id: sessionId,
+								cwd: sessionCwd,
+								...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+								broker_workspace: binding.workspace,
+								endpoint_generation: binding.endpointGeneration,
+								endpoint_incarnation: binding.endpointIncarnation,
+							});
+						}
+						const intent: CanonicalCreateIntentV1 = {
+							kind: "start",
+							session: canonicalCreationSnapshot(session),
+							remote_create_key: creation.request.remote_create_key,
+							initial_state: prompt ? "running" : "ready_for_input",
+							initial_prompt: prompt
+								? { text: prompt, caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex") }
+								: null,
+							initial_events: [],
+						};
+						await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+						await commitCreationWal(questionPaths, creation.keyDigest, intent);
 						await writeJsonFile(sessionFile(sessionId), session);
 						const lifecycle = publicLifecycleReceipt(created, sessionId);
 						if (prompt) {
+							const promptKey = await claimCanonicalPrompt(sessionId, prompt, "turn.prompt", idempotencyKey);
 							const result = await controlSession(session, "turn.prompt", { text: prompt }, idempotencyKey);
 							const acknowledgement = requirePromptAcknowledgement(result);
-							const turn = await recordAcceptedPrompt(sessionId, prompt, "turn.prompt", null, acknowledgement);
-							return {
+							const turn = await recordAcceptedPrompt(
+								sessionId,
+								prompt,
+								"turn.prompt",
+								null,
+								acknowledgement,
+								promptKey,
+							);
+							const response = {
 								ok: true,
 								session: publicCoordinatorSession(session),
 								session_id: sessionId,
@@ -3030,6 +4129,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								result: publicSdkAcknowledgement(acknowledgement),
 								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 							};
+							await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
+							await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
+							return response;
 						}
 						const sessionState = await writeSessionState(namespaceDir, sessionId, "ready_for_input", {
 							live: null,
@@ -3041,13 +4143,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							summary: `Session ${sessionId} started through SDK lifecycle control`,
 							payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
 						});
-						return {
+						const response = {
 							ok: true,
 							session: publicCoordinatorSession(session),
 							session_state: publicCoordinatorSessionState(sessionState),
 							lifecycle,
 						};
+						await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
+						await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
+						return response;
 					},
+					true,
 				);
 			}
 			if (name === "gjc_coordinator_send_prompt") {
@@ -3093,6 +4199,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									: args.queue === true
 										? "turn.follow_up"
 										: "turn.prompt";
+							const promptKey = await claimCanonicalPrompt(sessionId, prompt, operation, idempotencyKey);
 							const result = await controlSession(currentSession, operation, { text: prompt }, idempotencyKey);
 							const acknowledgement = requirePromptAcknowledgement(result);
 							const turn = await recordAcceptedPrompt(
@@ -3101,6 +4208,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								operation,
 								previousActiveTurn,
 								acknowledgement,
+								promptKey,
 							);
 							return {
 								ok: true,
@@ -3128,37 +4236,383 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				requireCoordinatorMutation(config, "questions", args);
 				const idempotencyKey = requiredIdempotencyKey(args);
 				const sessionId = safeExternalId("session", args.session_id);
-				const questionId = safeExternalId("question", args.question_id);
+				const turnId = safeTurnId(args.turn_id);
+				const questionId = typeof args.question_id === "string" ? args.question_id : "";
+				const answerBinding = typeof args.answer_binding === "string" ? args.answer_binding : "";
 				return await withToolIdempotency(
 					name,
 					idempotencyKey,
 					{
 						session_id: sessionId,
+						turn_id: turnId,
 						question_id: questionId,
+						answer_binding: answerBinding,
 						answer: args.answer,
-						...(args.turn_id == null ? {} : { turn_id: args.turn_id }),
 						allow_mutation: true,
 					},
 					async () => {
-						const session = asRecord(await readJsonFile(sessionFile(sessionId)));
-						if (!session)
+						const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
+						const requestDigest = createHash("sha256")
+							.update(
+								canonicalJson({
+									session_id: sessionId,
+									turn_id: turnId,
+									question_id: questionId,
+									answer_binding: answerBinding,
+									answer: args.answer,
+								}),
+							)
+							.digest("hex");
+						await ensureQuestionTransaction(sessionId);
+						const replay = await withSessionTransaction(questionPaths, sessionId, async transaction => {
+							const request = transaction.requests.answers[keyDigest];
+							if (!request) return null;
+							if (request.request_digest !== requestDigest)
+								return {
+									ok: false,
+									error: {
+										code: "idempotency_conflict",
+										message: "Idempotency key was reused with a different answer request.",
+									},
+								};
+							if (request.phase === "completed" && request.safe_receipt) {
+								const receipt = request.safe_receipt;
+								if (
+									receipt.answer_hash !== request.answer_hash ||
+									receipt.answer_binding_sha256 !== request.answer_binding_sha256 ||
+									receipt.authority_id !== request.authority_id ||
+									receipt.turn_id !== request.turn_id ||
+									receipt.endpoint_incarnation !== request.endpoint_incarnation ||
+									receipt.claim_fence_epoch !== request.claim_fence_epoch
+								)
+									return {
+										ok: false,
+										error: {
+											code: "terminal_uncertain",
+											message: "The stored answer receipt is incomplete.",
+										},
+									};
+								return {
+									ok: true,
+									schema_version: 1,
+									session_id: sessionId,
+									turn_id: turnId,
+									question_id: questionId,
+									operation: "workflow.gate_answer",
+									status: receipt.status,
+									replayed: true,
+									resolved_at: receipt.resolved_at,
+								};
+							}
+							if (request.phase === "uncertain")
+								return {
+									ok: false,
+									error: { code: "terminal_uncertain", message: "The previous answer outcome is uncertain." },
+								};
+							if (request.phase === "rejected" && request.safe_receipt)
+								return {
+									ok: false,
+									schema_version: 1,
+									session_id: sessionId,
+									turn_id: turnId,
+									question_id: questionId,
+									error: { code: "validation_rejected", message: "Answer was rejected by the workflow gate." },
+									question_status: "pending",
+								};
+							return null;
+						});
+						if (replay) return replay;
+
+						const reconciliation = await reconcileQuestions(sessionId);
+						if (!reconciliation.reconciliation.complete)
 							return {
 								ok: false,
-								error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
+								error: { code: "terminal_uncertain", message: "Workflow gate snapshot is incomplete." },
 							};
-						const result = await controlSession(
-							session,
-							"ask.answer",
-							{ id: questionId, answer: args.answer },
-							idempotencyKey,
-						);
-						return {
-							ok: true,
-							session_id: sessionId,
-							operation: "ask.answer",
-							result: publicSdkAccepted(result),
-						};
+						let translated: unknown;
+						let session: Record<string, unknown> | null = null;
+						const claimed = await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+							const question = transaction.canonical.questions[questionId];
+							if (!question)
+								return {
+									response: { ok: false, error: { code: "not_found", message: "Question was not found." } },
+								};
+							if (
+								question.session_id !== sessionId ||
+								question.turn_id !== turnId ||
+								question.endpoint_incarnation !== transaction.canonical.session.broker.endpoint_incarnation
+							)
+								return {
+									response: {
+										ok: false,
+										error: {
+											code: "ownership_mismatch",
+											message: "Question ownership does not match this answer.",
+										},
+									},
+								};
+							const existingRequest = transaction.requests.answers[keyDigest];
+							const recovering =
+								(existingRequest?.phase === "remote_started" || existingRequest?.phase === "accepted") &&
+								existingRequest.request_digest === requestDigest &&
+								existingRequest.question_id === question.question_id &&
+								existingRequest.authority_id === question.authority_id &&
+								existingRequest.turn_id === question.turn_id &&
+								existingRequest.endpoint_incarnation === question.endpoint_incarnation &&
+								existingRequest.answer_binding_sha256 === question.binding_sha256 &&
+								existingRequest.claim_fence_epoch === question.claim_fence_epoch &&
+								question.answer_request_id === existingRequest.request_id;
+							if (question.status === "answered" && !recovering)
+								return {
+									response: {
+										ok: false,
+										error: {
+											code: "idempotency_conflict",
+											message: "Question has already been answered by a different request.",
+										},
+									},
+								};
+
+							if (question.status !== "pending" && !recovering)
+								return {
+									response: {
+										ok: false,
+										error: { code: "resource_gone", message: "Question is no longer answerable." },
+									},
+								};
+							if (!answerBindingMatches(answerBinding, question.binding_plaintext))
+								return {
+									response: {
+										ok: false,
+										error: { code: "ownership_mismatch", message: "Question binding does not match." },
+									},
+								};
+							const answer = validateCoordinatorAskAnswer(question.codec, args.answer);
+							if (!answer)
+								return {
+									response: {
+										ok: false,
+										schema_version: 1,
+										session_id: sessionId,
+										turn_id: turnId,
+										question_id: questionId,
+										error: {
+											code: "validation_rejected",
+											message: "Answer does not match the question schema.",
+										},
+										question_status: "pending",
+									},
+								};
+							const turn = await readTurnRecord(namespaceDir, turnId);
+							const canonicalTurn = transaction.canonical.turns[turnId];
+							const authority = transaction.canonical.gate_authorities[question.authority_id];
+							const runtimeTurnId =
+								authority?.observation.kind === "valid"
+									? authority.observation.first_provenance.runtime_turn_id
+									: null;
+							if (
+								!authority ||
+								!turn ||
+								canonicalTurn?.terminal_fence ||
+								TERMINAL_TURN_STATUSES.has(canonicalTurn?.status as TurnStatus) ||
+								TERMINAL_TURN_STATUSES.has(turn.status) ||
+								turn.delivery.runtime_turn_id !== runtimeTurnId
+							) {
+								if (recovering && existingRequest) {
+									existingRequest.phase = "uncertain";
+									existingRequest.error_code = "terminal_uncertain";
+									existingRequest.updated_at = new Date().toISOString();
+								}
+								return {
+									response: {
+										ok: false,
+										error: {
+											code: recovering ? "terminal_uncertain" : "resource_gone",
+											message: recovering
+												? "The previous answer outcome is uncertain."
+												: "Turn is no longer answerable.",
+										},
+									},
+								};
+							}
+							translated = translateCoordinatorAskAnswer(question.codec, answer);
+							session = asRecord(await readJsonFile(sessionFile(sessionId)));
+							if (!session)
+								return {
+									response: {
+										ok: false,
+										error: { code: "not_found", message: "Coordinator session was not found." },
+									},
+								};
+							if (recovering) {
+								return {
+									response: null,
+									fence: existingRequest.claim_fence_epoch,
+									gateId: authority.authority.gate_id,
+									requestId: existingRequest.sdk_idempotency_key,
+								};
+							}
+							const requestId = `c07:${createHash("sha256")
+								.update(`coordinator-question-v1${question.authority_id}${requestDigest}`)
+								.digest("hex")}`;
+							question.status = "resolving";
+							question.claim_fence_epoch = transaction.revision + 1;
+							question.answer_request_id = requestId;
+							question.updated_at = new Date().toISOString();
+							transaction.requests.answers[keyDigest] = {
+								request_id: requestId,
+								key_digest: keyDigest,
+								request_digest: requestDigest,
+								answer_hash: createHash("sha256").update(canonicalJson(args.answer)).digest("hex"),
+								answer_binding_sha256: question.binding_sha256,
+								authority_id: question.authority_id,
+								question_id: question.question_id,
+								turn_id: question.turn_id,
+								endpoint_incarnation: question.endpoint_incarnation,
+								sdk_idempotency_key: requestId,
+								claim_fence_epoch: question.claim_fence_epoch,
+								phase: "claimed",
+								created_at: question.updated_at,
+								updated_at: question.updated_at,
+							};
+							return {
+								response: null,
+								fence: question.claim_fence_epoch,
+								gateId: authority.authority.gate_id,
+								requestId,
+							};
+						});
+						if (claimed.response) return claimed.response;
+						const gateId = (claimed as { gateId: string }).gateId;
+						await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+							const request = transaction.requests.answers[keyDigest];
+							if (!request || request.claim_fence_epoch !== (claimed as { fence: number }).fence)
+								throw new Error("terminal_uncertain");
+							if (request.phase === "claimed") request.phase = "remote_started";
+							if (request.phase !== "remote_started" && request.phase !== "accepted")
+								throw new Error("terminal_uncertain");
+							request.updated_at = new Date().toISOString();
+						});
+
+						try {
+							const result = await controlSession(
+								session!,
+								"workflow.gate_answer",
+								{ id: gateId, response: translated, expectedSessionId: sessionId },
+								(claimed as { requestId: string }).requestId,
+							);
+							const resolution = asRecord(result);
+							const status = resolution?.status;
+							if (status === "rejected") {
+								await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+									const question = transaction.canonical.questions[questionId];
+									if (
+										question?.status === "resolving" &&
+										question.claim_fence_epoch === (claimed as { fence: number }).fence
+									) {
+										question.status = "pending";
+										question.claim_fence_epoch = null;
+										question.updated_at = new Date().toISOString();
+										question.history.push({
+											at: question.updated_at,
+											status: "pending",
+											reason: "validation_rejected",
+										});
+									}
+									const request = transaction.requests.answers[keyDigest];
+									if (request && question) {
+										request.phase = "rejected";
+										request.safe_receipt = {
+											status: "rejected",
+											answer_hash: request.answer_hash,
+											answer_binding_sha256: request.answer_binding_sha256,
+											authority_id: request.authority_id,
+											turn_id: request.turn_id,
+											endpoint_incarnation: request.endpoint_incarnation,
+											claim_fence_epoch: request.claim_fence_epoch,
+											resolved_at: question.updated_at,
+										};
+										request.updated_at = question.updated_at;
+									}
+								});
+								return {
+									ok: false,
+									schema_version: 1,
+									session_id: sessionId,
+									turn_id: turnId,
+									question_id: questionId,
+									error: { code: "validation_rejected", message: "Answer was rejected by the workflow gate." },
+									question_status: "pending",
+								};
+							}
+							if (status !== "accepted")
+								throw new SdkClientError("terminal_uncertain", "Workflow gate answer was not accepted.");
+							const resolvedAt =
+								typeof resolution?.resolved_at === "string" ? resolution.resolved_at : new Date().toISOString();
+							await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+								const question = transaction.canonical.questions[questionId];
+								if (!question || question.claim_fence_epoch !== (claimed as { fence: number }).fence)
+									throw new Error("terminal_uncertain");
+								question.status = "answered";
+								question.answered_at = resolvedAt;
+								question.updated_at = resolvedAt;
+								question.history.push({ at: resolvedAt, status: "answered", reason: null });
+								const authority = transaction.canonical.gate_authorities[question.authority_id];
+								if (authority)
+									authority.outcome = { state: "answered", turn_id: turnId, question_id: questionId };
+								const request = transaction.requests.answers[keyDigest];
+								if (!request) throw new Error("terminal_uncertain");
+								request.phase = "accepted";
+								request.safe_receipt = {
+									status: "accepted",
+									answer_hash: request.answer_hash,
+									answer_binding_sha256: request.answer_binding_sha256,
+									authority_id: request.authority_id,
+									turn_id: request.turn_id,
+									endpoint_incarnation: request.endpoint_incarnation,
+									claim_fence_epoch: request.claim_fence_epoch,
+									resolved_at: resolvedAt,
+								};
+								request.phase = "completed";
+								request.updated_at = resolvedAt;
+							});
+							return {
+								ok: true,
+								schema_version: 1,
+								session_id: sessionId,
+								turn_id: turnId,
+								question_id: questionId,
+								operation: "workflow.gate_answer",
+								status: "accepted",
+								replayed: false,
+								resolved_at: resolvedAt,
+							};
+						} catch (error) {
+							await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+								const question = transaction.canonical.questions[questionId];
+								if (
+									question?.status === "resolving" &&
+									question.claim_fence_epoch === (claimed as { fence: number }).fence
+								) {
+									question.status = "uncertain";
+									question.updated_at = new Date().toISOString();
+									question.history.push({
+										at: question.updated_at,
+										status: "uncertain",
+										reason: "terminal_uncertain",
+									});
+								}
+								const request = transaction.requests.answers[keyDigest];
+								if (request && question) {
+									request.phase = "uncertain";
+									request.error_code = "terminal_uncertain";
+									request.updated_at = question.updated_at;
+								}
+							});
+							return sdkError(error);
+						}
 					},
+					true,
 				);
 			}
 			if (name === "gjc_coordinator_report_status") {
@@ -3180,6 +4634,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						allow_mutation: true,
 					},
 					async () => {
+						const reportId = `report-${randomUUID()}`;
 						const report = {
 							session_id: sessionId,
 							turn_id: args.turn_id,
@@ -3202,11 +4657,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								turn = {
 									...turn,
 									status: terminalStatus,
-									delivery: {
-										...turn.delivery,
-										prompt_acknowledged: true,
-										state: "acknowledged",
-									},
+									delivery: { ...turn.delivery, prompt_acknowledged: true, state: "acknowledged" },
 									final_response: {
 										text:
 											typeof args.summary === "string"
@@ -3234,22 +4685,44 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									updated_at: timestamp,
 									completed_at: timestamp,
 								};
-								await writeTurnRecord(namespaceDir, turn);
-								await clearActiveTurn(namespaceDir, turn);
-								await writeSessionState(
-									namespaceDir,
-									turn.session_id,
-									terminalStatus === "failed" ? "errored" : "completed",
-									{
-										lastTurnId: turn.turn_id,
-										live: null,
-										reason: terminalStatus === "failed" ? "reported_failure" : null,
-									},
-								);
-								await promoteNextQueuedTurn(turn.session_id);
+								const canonicalReport: CanonicalReportSnapshotV1 = {
+									schema_version: 1,
+									report_id: reportId,
+									operation_id: `report:${idempotencyKey}`,
+									session_id: turn.session_id,
+									turn_id: turn.turn_id,
+									status: String(args.status ?? "unknown"),
+									summary: typeof args.summary === "string" ? args.summary : "",
+									blocker: optionalString(args.blocker),
+									pr_url: optionalString(args.pr_url),
+									evidence_paths: evidence.map(item => item.path),
+									created_at: report.created_at,
+								};
+								await projectTerminalTransition(turn, {
+									desiredState: terminalStatus === "failed" ? "errored" : "completed",
+									reason: terminalStatus === "failed" ? "reported_failure" : null,
+									report: canonicalReport,
+								});
 							}
 						}
-						const reportId = `report-${randomUUID()}`;
+						if (sessionId && (!args.turn_id || !asTerminalTurnStatus(args.status))) {
+							await ensureQuestionTransaction(sessionId);
+							await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
+								transaction.canonical.reports[reportId] = {
+									schema_version: 1,
+									report_id: reportId,
+									operation_id: `report:${idempotencyKey}`,
+									session_id: sessionId,
+									turn_id: typeof args.turn_id === "string" ? args.turn_id : "",
+									status: String(args.status ?? "unknown"),
+									summary: typeof args.summary === "string" ? args.summary : "",
+									blocker: optionalString(args.blocker),
+									pr_url: optionalString(args.pr_url),
+									evidence_paths: evidence.map(item => item.path),
+									created_at: report.created_at,
+								};
+							});
+						}
 						const reportPath = path.join(namespaceDir, "reports", `${reportId}.json`);
 						await writeJsonFile(reportPath, report);
 						await appendCoordinatorEvent(namespaceDir, {

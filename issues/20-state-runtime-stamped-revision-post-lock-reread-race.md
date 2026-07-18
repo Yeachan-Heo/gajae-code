@@ -32,3 +32,7 @@ weaken the monotonic source-revision contract).
 ## References
 - Architect review: `.gjc/_session-.../plans/ralplan/.../stage-04-architect.md` (finding #1)
 - Released in 0.6.5 (sequential case fixed); concurrency hardening tracked here for a later patch.
+
+## Resolution
+
+**Resolved.** The state-runtime locked revision handoff and its interleaving regression are implemented in `packages/coding-agent/src/gjc-runtime/state-runtime.ts` and `packages/coding-agent/test/gjc-runtime/state-runtime.test.ts`.

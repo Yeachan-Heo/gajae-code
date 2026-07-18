@@ -28,6 +28,7 @@ function createAssistantMessage(text: string): AssistantMessage {
 }
 
 interface RunEphemeralTurnArgs {
+	purpose: "btw";
 	promptText: string;
 	onTextDelta?: (delta: string) => void;
 	signal?: AbortSignal;
@@ -43,6 +44,8 @@ function makeFakeSession(
 ): InteractiveModeContext["session"] {
 	return {
 		model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+		abort: vi.fn(),
+		waitForIdle: vi.fn(),
 		runEphemeralTurn,
 	} as unknown as InteractiveModeContext["session"];
 }
@@ -79,6 +82,7 @@ describe("BtwController", () => {
 		const callArg = runEphemeralTurn.mock.calls[0]?.[0];
 		expect(callArg).toBeDefined();
 		expect(callArg?.promptText).toContain("<btw>");
+		expect(callArg?.purpose).toBe("btw");
 		expect(callArg?.promptText).toContain("What changed?");
 		expect(callArg?.signal).toBeInstanceOf(AbortSignal);
 		expect(typeof callArg?.onTextDelta).toBe("function");
@@ -87,15 +91,12 @@ describe("BtwController", () => {
 
 	it("replaces a previous request by aborting it before issuing the next runEphemeralTurn", async () => {
 		const signals: AbortSignal[] = [];
-		let firstRelease!: () => void;
-		const firstPromise = new Promise<RunEphemeralTurnResult>(resolve => {
-			firstRelease = () => resolve({ replyText: "first", assistantMessage: createAssistantMessage("first") });
-		});
+		const first = Promise.withResolvers<RunEphemeralTurnResult>();
 		const runEphemeralTurn = vi
 			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
 			.mockImplementationOnce(async args => {
 				signals.push(args.signal as AbortSignal);
-				return firstPromise;
+				return first.promise;
 			})
 			.mockImplementationOnce(async args => {
 				signals.push(args.signal as AbortSignal);
@@ -116,11 +117,57 @@ describe("BtwController", () => {
 		expect(signals[1]?.aborted).toBe(false);
 		expect(btwContainer.children).toHaveLength(1);
 		// Allow the orphaned first request to finish to keep the test clean.
-		firstRelease();
+		first.resolve({ replyText: "first", assistantMessage: createAssistantMessage("first") });
+	});
+
+	it("suppresses deltas and completion from a replaced request", async () => {
+		const first = Promise.withResolvers<RunEphemeralTurnResult>();
+		const second = Promise.withResolvers<RunEphemeralTurnResult>();
+		let firstArgs: RunEphemeralTurnArgs | undefined;
+		const runEphemeralTurn = vi
+			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
+			.mockImplementationOnce(args => {
+				firstArgs = args;
+				return first.promise;
+			})
+			.mockImplementationOnce(() => second.promise);
+		const btwContainer = new Container();
+		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn), btwContainer));
+
+		await controller.start("Old?");
+		await controller.start("Current?");
+		firstArgs?.onTextDelta?.("late old text");
+		first.resolve({ replyText: "late old answer", assistantMessage: createAssistantMessage("late old answer") });
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const rendered = Bun.stripANSI(btwContainer.render(80).join("\n"));
+		expect(rendered).toContain("Current?");
+		expect(rendered).not.toContain("late old");
+		second.resolve({ replyText: "current", assistantMessage: createAssistantMessage("current") });
+	});
+
+	it("renders a side-request error without invoking main-session lifecycle methods", async () => {
+		const runEphemeralTurn = vi.fn(async () => {
+			throw new Error("side establishment failed");
+		});
+		const session = makeFakeSession(runEphemeralTurn);
+		const btwContainer = new Container();
+		const controller = new BtwController(makeCtx(session, btwContainer));
+
+		await controller.start("Will this work?");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const rendered = Bun.stripANSI(btwContainer.render(80).join("\n"));
+		expect(rendered).toContain("side establishment failed");
+		expect(session.abort).not.toHaveBeenCalled();
+		expect(session.waitForIdle).not.toHaveBeenCalled();
 	});
 
 	it("clears the panel when the active request is dismissed via Escape", async () => {
-		const runEphemeralTurn = vi.fn(async () => new Promise<RunEphemeralTurnResult>(() => {}));
+		const pending = Promise.withResolvers<RunEphemeralTurnResult>();
+		const runEphemeralTurn = vi.fn(() => pending.promise);
 		const btwContainer = new Container();
 		const ctx = makeCtx(makeFakeSession(runEphemeralTurn), btwContainer);
 		const controller = new BtwController(ctx);
@@ -130,6 +177,8 @@ describe("BtwController", () => {
 		expect(controller.handleEscape()).toBe(true);
 		expect(btwContainer.children).toHaveLength(0);
 		expect(controller.hasActiveRequest()).toBe(false);
+		pending.resolve({ replyText: "dismissed", assistantMessage: createAssistantMessage("dismissed") });
+		await Promise.resolve();
 	});
 
 	it("rejects empty questions before issuing the side-channel call", async () => {

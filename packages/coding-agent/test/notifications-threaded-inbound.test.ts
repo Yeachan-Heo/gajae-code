@@ -13,7 +13,10 @@ function ctx(overrides: Partial<ThreadedInboundCtx> = {}): ThreadedInboundCtx {
 describe("decideThreadedInbound (fail-closed injection)", () => {
 	test("injects a valid first-seen text message in a known topic of the paired chat", () => {
 		const decision = decideThreadedInbound(
-			{ update_id: 7, message: { text: "keep going", chat: { id: 42 }, message_thread_id: "topic-1" } },
+			{
+				update_id: 7,
+				message: { message_id: 70, text: "keep going", chat: { id: 42 }, message_thread_id: "topic-1" },
+			},
 			ctx(),
 		);
 		expect(decision).toEqual({
@@ -22,6 +25,7 @@ describe("decideThreadedInbound (fail-closed injection)", () => {
 			text: "keep going",
 			updateId: 7,
 			threadId: "topic-1",
+			messageId: 70,
 		});
 	});
 
@@ -72,10 +76,17 @@ describe("decideThreadedInbound (fail-closed injection)", () => {
 
 	test("accepts numeric chat id and numeric thread id forms", () => {
 		const decision = decideThreadedInbound(
-			{ update_id: 8, message: { text: "go", chat: { id: 42 }, message_thread_id: 1 } },
+			{ update_id: 8, message: { message_id: 80, text: "go", chat: { id: 42 }, message_thread_id: 1 } },
 			ctx({ topicToSession: (t: string) => (t === "1" ? "sess-x" : undefined) }),
 		);
-		expect(decision).toEqual({ kind: "inject", sessionId: "sess-x", text: "go", updateId: 8, threadId: "1" });
+		expect(decision).toEqual({
+			kind: "inject",
+			sessionId: "sess-x",
+			text: "go",
+			updateId: 8,
+			threadId: "1",
+			messageId: 80,
+		});
 	});
 
 	test("injects a photo-only message with an image attachment and empty text", () => {
@@ -85,6 +96,7 @@ describe("decideThreadedInbound (fail-closed injection)", () => {
 				message: {
 					chat: { id: 42 },
 					message_thread_id: "topic-1",
+					message_id: 90,
 					photo: [
 						{ file_id: "small", width: 90, height: 90 },
 						{ file_id: "large", width: 1280, height: 1280 },
@@ -99,6 +111,7 @@ describe("decideThreadedInbound (fail-closed injection)", () => {
 			text: "",
 			updateId: 9,
 			threadId: "topic-1",
+			messageId: 90,
 			attachment: { fileId: "large", kind: "photo", mime: "image/jpeg" },
 		});
 	});
@@ -110,6 +123,7 @@ describe("decideThreadedInbound (fail-closed injection)", () => {
 				message: {
 					chat: { id: 42 },
 					message_thread_id: "topic-1",
+					message_id: 100,
 					caption: "  see attached  ",
 					document: { file_id: "doc-1", mime_type: "application/pdf", file_name: "report.pdf" },
 				},
@@ -122,7 +136,23 @@ describe("decideThreadedInbound (fail-closed injection)", () => {
 			text: "see attached",
 			updateId: 10,
 			threadId: "topic-1",
+			messageId: 100,
 			attachment: { fileId: "doc-1", kind: "document", mime: "application/pdf", fileName: "report.pdf" },
 		});
+	});
+	test.each([
+		undefined,
+		0,
+		-1,
+		1.5,
+		Number.MAX_SAFE_INTEGER + 1,
+		Number.NaN,
+	])("rejects an invalid message id (%p) before injection", message_id => {
+		expect(
+			decideThreadedInbound(
+				{ update_id: 11, message: { message_id, text: "go", chat: { id: 42 }, message_thread_id: "topic-1" } },
+				ctx(),
+			),
+		).toEqual({ kind: "ignore", reason: "missing_message_id" });
 	});
 });

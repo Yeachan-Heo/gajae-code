@@ -57,17 +57,32 @@ export function clampExplicitThinkingLevelForModel(
 	return clampThinkingLevelForModel(model, level);
 }
 
+export interface SelectorThinkingSuffix {
+	selector: string;
+	thinkingLevel?: ThinkingLevel;
+	invalidSuffix?: string;
+}
+
+/** Split the final selector suffix once, preserving colons in model IDs. */
+export function splitSelectorThinkingSuffix(selector: string): SelectorThinkingSuffix {
+	const colonIndex = selector.lastIndexOf(":");
+	if (colonIndex === -1) return { selector };
+
+	const suffix = selector.slice(colonIndex + 1);
+	const thinkingLevel = parseThinkingLevel(suffix);
+	return thinkingLevel
+		? { selector: selector.slice(0, colonIndex), thinkingLevel }
+		: { selector: selector.slice(0, colonIndex), invalidSuffix: suffix };
+}
+
 export function formatClampedModelSelector(selector: string, model: Model | undefined): string {
 	const slashIdx = selector.indexOf("/");
 	if (slashIdx <= 0) return selector;
 	const id = selector.slice(slashIdx + 1);
-	const colonIdx = id.lastIndexOf(":");
-	if (colonIdx === -1) return selector;
-	const suffix = id.slice(colonIdx + 1);
-	const thinkingLevel = parseThinkingLevel(suffix);
+	const { selector: baseId, thinkingLevel } = splitSelectorThinkingSuffix(id);
 	if (!thinkingLevel) return selector;
 	const clamped = clampExplicitThinkingLevelForModel(model, thinkingLevel);
 	return clamped && clamped !== ThinkingLevel.Inherit
-		? `${selector.slice(0, slashIdx + 1)}${id.slice(0, colonIdx)}:${clamped}`
-		: selector.slice(0, slashIdx + 1) + id.slice(0, colonIdx);
+		? `${selector.slice(0, slashIdx + 1)}${baseId}:${clamped}`
+		: selector.slice(0, slashIdx + 1) + baseId;
 }

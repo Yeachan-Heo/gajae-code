@@ -277,6 +277,14 @@ the current authenticated endpoint:
 
 Q12 (`workflow.gates.list`) exposes durable query records and additive SDK v3 diagnostics. A pending record preserves its workflow fields including `gate_id` and adds `id: "pending:<gate_id>"` and `tag: "pending"`. A restart quarantine diagnostic uses `id: "diagnostic:<gate_id>"`, `tag: "quarantined"`, and optional `lifecycle` containing `state: "quarantined"`, its restart reason, `quarantinedAt`, and an optional `supersededByGateId` after a remint. Diagnostics are query-only: they cannot be routed, answered, or promoted. Treat Q12 as the durable status surface, not as generic-reply authority.
 
+### Coordinator MCP question pull loop
+
+The Coordinator MCP bridge is a separate, public-safe pull surface for external coordinators. `gjc_coordinator_list_questions` requires `session_id` and reconciles pending `workflow.gates.list` rows on every call, returning bounded public `questions`, `diagnostics`, and `reconciliation`. It accepts `status: "pending"`; `status: "open"` remains a compatibility alias. Multiple pending rows can be returned. A pending row carries its safe question shape, public option ids, and `answer_binding`, never raw/private gate payloads or values.
+
+`gjc_coordinator_submit_question_answer` requires `session_id`, `turn_id`, `question_id`, `answer_binding`, `answer`, `idempotency_key`, and `allow_mutation: true`. It re-lists/revalidates after restart and resolves through `workflow.gate_answer`, not generic `ask.answer`. An incomplete reconciliation returns `terminal_uncertain`; stale, terminal, missing, or ownership-mismatched rows cannot be answered. Re-list after restart rather than retaining old identifiers. An identical retry with the same idempotency key replays the accepted result; conflicting reuse returns `idempotency_conflict`.
+
+This contract does not change #2549/#2551 or unattended plain-CLI behavior.
+
 ### Rust and N-API compatibility
 
 The Rust `ActionNeeded`, `ServerMessage`, and `register_ask` APIs remain

@@ -8,13 +8,18 @@ import {
 } from "./deep-interview-ambiguity";
 import {
 	answerHash,
+	assertDeepInterviewIntentManifest,
+	createDeepInterviewIntentManifest,
 	type DeepInterviewEstablishedFact,
+	type DeepInterviewIntentItem,
+	type DeepInterviewIntentSubstitution,
 	type DeepInterviewRoundRecord,
 	type DeepInterviewStateEnvelope,
 	type DeepInterviewTriggerMetadata,
 	deriveRoundKey,
 	normalizeDeepInterviewEnvelope,
 	questionHash,
+	reviewDeepInterviewIntent,
 } from "./deep-interview-state";
 import { writeSessionActivityMarker } from "./session-resolution";
 import { readExistingStateForMutation, writeGuardedWorkflowEnvelopeAtomic } from "./state-writer";
@@ -48,6 +53,12 @@ export interface DeepInterviewAnswerInput {
 	ambiguity?: number;
 	selectedOptions?: string[];
 	customInput?: string;
+	intent_contract?: { items: DeepInterviewIntentItem[]; confirmation_options: string[] };
+	intent_review?: {
+		observed_items: DeepInterviewIntentItem[];
+		supporting_substitutions: DeepInterviewIntentSubstitution[];
+		approval_options: string[];
+	};
 }
 
 export interface DeepInterviewScoringInput {
@@ -417,15 +428,64 @@ export async function appendOrMergeDeepInterviewRound(
 ): Promise<{ action: AppendOrMergeAction; record: DeepInterviewRoundRecord; disputedFactIds?: string[] }> {
 	const envelope = await readEnvelope(statePath);
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
-	const shell = buildAnswerShell({ ...input, interviewId });
+	const shell = buildAnswerShell({
+		...input,
+		interviewId,
+		customInput: input.intent_contract || input.intent_review ? undefined : input.customInput,
+	});
 	const rounds = readRounds(envelope);
 	const priorRecord = rounds.find(r => r.round_key === shell.round_key);
 	const result = appendOrMergeRound(rounds, shell);
-	if (result.action === "noop") {
+	const inner = envelope.state as Record<string, unknown>;
+	let intentStateChanged = false;
+	if (input.intent_contract) {
+		if (input.round !== 0 || input.component !== "review-topology" || input.dimension !== "topology")
+			throw new Error("intent contract requires Round 0 topology metadata");
+		const confirmed =
+			input.selectedOptions?.length === 1 &&
+			input.intent_contract.confirmation_options.includes(input.selectedOptions[0]);
+		if (confirmed) {
+			const contract = createDeepInterviewIntentManifest(input.intent_contract.items, {
+				round: 0,
+				answer_hash: shell.answer_hash,
+			});
+			const existingContract = inner.intent_contract;
+			if (existingContract !== undefined) {
+				assertDeepInterviewIntentManifest(existingContract);
+				if (
+					existingContract.digest !== contract.digest ||
+					existingContract.confirmation_answer_hash !== contract.confirmation_answer_hash
+				)
+					throw new Error("locked intent contract cannot be replaced");
+			} else {
+				inner.intent_contract = contract;
+				intentStateChanged = true;
+			}
+		}
+	}
+	if (input.intent_review) {
+		if (input.round <= 0) throw new Error("intent review requires a post-Round-0 answer");
+		const locked = inner.intent_contract;
+		assertDeepInterviewIntentManifest(locked);
+		const approved =
+			input.selectedOptions?.length === 1 && input.intent_review.approval_options.includes(input.selectedOptions[0]);
+		inner.intent_review = reviewDeepInterviewIntent(locked, input.intent_review.observed_items, {
+			status: approved ? "approved" : "pending",
+			supporting_substitutions: input.intent_review.supporting_substitutions,
+			...(approved
+				? {
+						approval_round: input.round,
+						answer_hash: shell.answer_hash,
+						user_answer_evidence: `answer_hash:${shell.answer_hash}`,
+					}
+				: {}),
+		});
+		intentStateChanged = true;
+	}
+	if (result.action === "noop" && !intentStateChanged) {
 		await repairRecorderHudFromPersisted(cwd, statePath, options.sessionId);
 		return { action: result.action, record: result.record };
 	}
-	const inner = envelope.state as Record<string, unknown>;
 	inner.rounds = result.rounds;
 	let disputedFactIds: string[] | undefined;
 	if (result.action === "replaced" && priorRecord?.lifecycle === "scored") {

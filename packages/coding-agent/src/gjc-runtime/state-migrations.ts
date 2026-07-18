@@ -18,7 +18,7 @@ export interface MigrateAndPersistLegacyStateArgs {
 	cwd: string;
 	skill: string;
 	statePath: string;
-	sessionId?: string;
+	sessionId: string;
 }
 
 export interface MigrateAndPersistLegacyStateResult {

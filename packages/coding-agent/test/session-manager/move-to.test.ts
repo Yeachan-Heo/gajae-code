@@ -139,7 +139,11 @@ describe("SessionManager.moveTo", () => {
 		const entries = await loadEntriesFromFile(newFile);
 		const header = getHeader(entries);
 		expect(header?.cwd).toBe(path.resolve(cwdB));
+		expect(JSON.parse(fs.readFileSync(newFile, "utf8").split("\n", 1)[0]!).cwd).toBe(path.resolve(cwdB));
 		expect(hasAssistantEntry(entries)).toBe(true);
+		const reopened = await SessionManager.open(newFile);
+		expect(reopened.getCwd()).toBe(path.resolve(cwdB));
+		await reopened.close();
 	});
 
 	it("does not replace an existing destination transcript", async () => {

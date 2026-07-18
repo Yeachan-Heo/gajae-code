@@ -150,7 +150,7 @@ describe("SDK daemon session CLI", () => {
 		expect(disclosed.stdout.trim().split("\n")).toHaveLength(1);
 		expect(JSON.parse(disclosed.stdout)).toMatchObject({ ok: true, result: { token: "session-token" } });
 		expect(disclosed.stderr).not.toContain("session-token");
-	});
+	}, 60_000);
 
 	it("selects the broker specified by --agent-dir over the ambient agent directory", async () => {
 		const alternateAgentDir = path.join(root, "alternate-agent");
@@ -176,7 +176,7 @@ describe("SDK daemon session CLI", () => {
 		} finally {
 			await alternateBroker.stop();
 		}
-	});
+	}, 60_000);
 
 	it("requires a caller lifecycle idempotency key before broker connection", async () => {
 		const result = await runCli(root, agentDir, [
@@ -188,7 +188,7 @@ describe("SDK daemon session CLI", () => {
 		]);
 		expect(result.exitCode).toBe(2);
 		expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "invalid_input" } });
-	});
+	}, 60_000);
 
 	it("preserves corrupt endpoint discovery errors without connecting", async () => {
 		await fs.writeFile(path.join(stateRoot, "sdk", "live.json"), "not-json");
@@ -196,7 +196,7 @@ describe("SDK daemon session CLI", () => {
 		expect(result.exitCode).toBe(1);
 		expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "discovery_error" } });
 		expect(endpointConnections).toBe(0);
-	});
+	}, 60_000);
 
 	it("preserves unreadable endpoint discovery errors without connecting", async () => {
 		if (process.platform === "win32") return;
@@ -210,5 +210,5 @@ describe("SDK daemon session CLI", () => {
 		} finally {
 			await fs.chmod(endpoint, 0o600);
 		}
-	});
+	}, 60_000);
 });

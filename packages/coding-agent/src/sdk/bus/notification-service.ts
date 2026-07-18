@@ -10,8 +10,11 @@
  * artifacts belonging to a DEAD owner (dead-PID / explicitly-stale). It never
  * touches a live owner's lock/state and never kills a process.
  */
+import * as crypto from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import type { Settings } from "../../config/settings";
 import {
 	getNotificationConfig,
@@ -46,10 +49,32 @@ export function sanitizeDiagnostic(text: string, token?: string): string {
 	return out.replace(TELEGRAM_TOKEN_PATTERN, "<redacted>");
 }
 
+/** Identity evidence required to remove precisely the endpoint that was inspected. */
+export interface NotificationEndpointFileIdentity {
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	sha256: string;
+}
+
+export interface NotificationEndpointFile {
+	bytes: Buffer;
+	identity: NotificationEndpointFileIdentity;
+}
+
+export interface NotificationExactUnlinkResult {
+	ok: boolean;
+	code?: string;
+	detachedPath?: string;
+}
+
 /** Minimal filesystem surface the service needs; injectable for tests. */
 export interface NotificationServiceFs {
 	readdir(dir: string): Promise<string[]>;
 	readFile(file: string, encoding: "utf8"): Promise<string>;
+	readEndpointFile(file: string): Promise<NotificationEndpointFile>;
+	exactUnlink(file: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
 	unlink(file: string): Promise<void>;
 	/**
 	 * Atomically create `file` with O_EXCL semantics: resolves `true` when this
@@ -63,6 +88,47 @@ export interface NotificationServiceFs {
 const nodeServiceFs: NotificationServiceFs = {
 	readdir: dir => fsPromises.readdir(dir),
 	readFile: (file, encoding) => fsPromises.readFile(file, encoding),
+	readEndpointFile: async file => {
+		const before = await fsPromises.lstat(file, { bigint: true });
+		if (!before.isFile() || before.isSymbolicLink()) throw new Error("Endpoint is not a regular file");
+		const noFollow = fsSync.constants.O_NOFOLLOW;
+		const handle = await fsPromises.open(file, fsSync.constants.O_RDONLY | (noFollow ?? 0));
+		try {
+			const opened = await handle.stat({ bigint: true });
+			if (!opened.isFile() || !sameEndpointFileMetadata(before, opened))
+				throw new Error("Endpoint changed before it was opened");
+			const bytes = await handle.readFile();
+			const after = await handle.stat({ bigint: true });
+			const pathname = await fsPromises.lstat(file, { bigint: true });
+			if (
+				!after.isFile() ||
+				!pathname.isFile() ||
+				pathname.isSymbolicLink() ||
+				!sameEndpointFileMetadata(opened, after) ||
+				!sameEndpointFileMetadata(opened, pathname)
+			)
+				throw new Error("Endpoint changed while it was read");
+			return {
+				bytes,
+				identity: {
+					dev: opened.dev,
+					ino: opened.ino,
+					size: opened.size,
+					mtimeNs: opened.mtimeNs,
+					sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+				},
+			};
+		} finally {
+			await handle.close();
+		}
+	},
+	exactUnlink: async (file, identity) => {
+		const result = native.exactUnlink(file, {
+			...identity,
+			quarantineName: `.gjc-delete-notification-endpoint-${crypto.randomUUID()}.json`,
+		});
+		return { ok: result.ok, code: result.code, detachedPath: result.detachedPath };
+	},
 	unlink: file => fsPromises.unlink(file),
 	createExclusive: async file => {
 		try {
@@ -99,7 +165,7 @@ function defaultStateRoot(): string {
 }
 
 function endpointDir(stateRoot: string): string {
-	return path.join(stateRoot, "notifications");
+	return path.join(stateRoot, "sdk");
 }
 
 // --- status -------------------------------------------------------------
@@ -179,6 +245,11 @@ interface EndpointView {
 	stale: boolean;
 }
 
+type EndpointFileRead =
+	| { kind: "endpoint"; view: EndpointView; identity: NotificationEndpointFileIdentity }
+	| { kind: "non-endpoint" }
+	| { kind: "unreadable" };
+
 type EndpointLiveness = "live" | "dead" | "unknown";
 
 /**
@@ -194,25 +265,74 @@ function endpointLiveness(view: EndpointView, pidAlive: (pid: number) => boolean
 	return pidAlive(view.pid) ? "live" : "dead";
 }
 
-async function readEndpointView(fs: NotificationServiceFs, file: string): Promise<EndpointView | undefined> {
+function sameEndpointFileMetadata(
+	left: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint },
+	right: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint },
+): boolean {
+	return (
+		left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs
+	);
+}
+
+function isLifecycleArtifact(record: Record<string, unknown>): boolean {
+	const keys = Object.keys(record);
+	const isEffectMarker =
+		typeof record.pid === "number" &&
+		Number.isSafeInteger(record.pid) &&
+		record.pid > 0 &&
+		typeof record.effectMarker === "string" &&
+		record.effectMarker.length > 0 &&
+		typeof record.incarnation === "string" &&
+		record.incarnation.length > 0;
+	if (isEffectMarker && keys.length === 3) return true;
+	return (
+		isEffectMarker &&
+		typeof record.phase === "string" &&
+		typeof record.reason === "string" &&
+		typeof record.message === "string" &&
+		typeof record.rollback === "object" &&
+		record.rollback !== null
+	);
+}
+function isCanonicalLifecycleArtifactName(name: string): boolean {
+	return (
+		name.endsWith(".lifecycle.json") ||
+		name.endsWith(".lifecycle.ready.json") ||
+		/^.+\.lifecycle\.failure\.[A-Za-z0-9._-]{1,128}\.json$/.test(name)
+	);
+}
+
+function unreadableEndpointResult(file: string): EndpointFileRead {
+	return isCanonicalLifecycleArtifactName(path.basename(file)) ? { kind: "non-endpoint" } : { kind: "unreadable" };
+}
+
+async function readEndpointView(fs: NotificationServiceFs, file: string): Promise<EndpointFileRead> {
+	let endpoint: NotificationEndpointFile;
 	let raw: string;
 	try {
-		raw = await fs.readFile(file, "utf8");
+		endpoint = await fs.readEndpointFile(file);
+		raw = endpoint.bytes.toString("utf8");
 	} catch {
-		return undefined;
+		return unreadableEndpointResult(file);
 	}
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
-		return undefined;
+		return unreadableEndpointResult(file);
 	}
-	if (!parsed || typeof parsed !== "object") return undefined;
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "non-endpoint" };
 	const rec = parsed as Record<string, unknown>;
+	if (isLifecycleArtifact(rec) || typeof rec.url !== "string" || typeof rec.token !== "string")
+		return { kind: "non-endpoint" };
 	return {
-		sessionId: typeof rec.sessionId === "string" ? rec.sessionId : path.basename(file, ".json"),
-		pid: typeof rec.pid === "number" ? rec.pid : undefined,
-		stale: rec.stale === true,
+		kind: "endpoint",
+		view: {
+			sessionId: typeof rec.sessionId === "string" ? rec.sessionId : path.basename(file, ".json"),
+			pid: safePositiveInteger(rec.pid),
+			stale: rec.stale === true,
+		},
+		identity: endpoint.identity,
 	};
 }
 
@@ -288,9 +408,13 @@ async function readDaemonStateFile(
 	}
 }
 
+function isSharedSdkArtifact(name: string): boolean {
+	return name === "broker.json";
+}
+
 async function listEndpointFiles(fs: NotificationServiceFs, dir: string): Promise<string[]> {
 	try {
-		return (await fs.readdir(dir)).filter(name => name.endsWith(".json"));
+		return (await fs.readdir(dir)).filter(name => name.endsWith(".json") && !isSharedSdkArtifact(name));
 	} catch {
 		return [];
 	}
@@ -468,11 +592,13 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 	let unknownEndpoints = 0;
 	let unreadable = 0;
 	for (const name of files) {
-		const view = await readEndpointView(fs, path.join(dir, name));
-		if (!view) {
+		const record = await readEndpointView(fs, path.join(dir, name));
+		if (record.kind === "non-endpoint") continue;
+		if (record.kind === "unreadable") {
 			unreadable += 1;
 			continue;
 		}
+		const view = record.view;
 		switch (endpointLiveness(view, pidAlive)) {
 			case "live":
 				live += 1;
@@ -485,12 +611,18 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 				break;
 		}
 	}
-	const endpoints: EndpointHealth = { total: files.length, live, dead, unknown: unknownEndpoints, unreadable };
+	const endpoints: EndpointHealth = {
+		total: live + dead + unknownEndpoints + unreadable,
+		live,
+		dead,
+		unknown: unknownEndpoints,
+		unreadable,
+	};
 	if (dead > 0 || unreadable > 0) {
 		checks.push({
 			name: "endpoints",
 			level: "warn",
-			detail: `${dead} dead / ${unreadable} unreadable of ${files.length} endpoint file(s); run recovery`,
+			detail: `${dead} dead / ${unreadable} unreadable of ${endpoints.total} endpoint file(s); run recovery`,
 		});
 	} else {
 		checks.push({
@@ -633,6 +765,7 @@ export interface NotificationRecoveryReport {
 	endpointsRemoved: RecoveredEndpoint[];
 	endpointsKept: number;
 	endpointsUnreadable: number;
+	endpointsDetached?: string[];
 	daemon: {
 		action: DaemonRecoveryAction;
 		detail: string;
@@ -699,15 +832,19 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	const dir = endpointDir(stateRoot);
 	const files = await listEndpointFiles(fs, dir);
 	const removed: RecoveredEndpoint[] = [];
+	const detached: string[] = [];
 	let kept = 0;
 	let unreadable = 0;
 	for (const name of files) {
-		const view = await readEndpointView(fs, path.join(dir, name));
-		if (!view) {
+		const file = path.join(dir, name);
+		const record = await readEndpointView(fs, file);
+		if (record.kind === "non-endpoint") continue;
+		if (record.kind === "unreadable") {
 			// Leave unparseable files untouched: they may be mid-write by a live server.
 			unreadable += 1;
 			continue;
 		}
+		const view = record.view;
 		if (endpointLiveness(view, pidAlive) !== "dead") {
 			// Keep live AND unknown (PID-less) endpoints: only positive proof of
 			// death (a stale tombstone or a dead pid) authorizes removal.
@@ -715,8 +852,17 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 			continue;
 		}
 		try {
-			await fs.unlink(path.join(dir, name));
-			removed.push({ sessionId: view.sessionId, pid: view.pid, reason: view.stale ? "stale-flag" : "dead-pid" });
+			const result = await fs.exactUnlink(file, record.identity);
+			if (!result.ok) {
+				if (result.detachedPath) detached.push(result.detachedPath);
+				else kept += 1;
+				continue;
+			}
+			removed.push({
+				sessionId: view.sessionId,
+				pid: view.pid,
+				reason: view.stale ? "stale-flag" : "dead-pid",
+			});
 		} catch {
 			kept += 1;
 		}
@@ -782,10 +928,11 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	}
 
 	return {
-		endpointsScanned: files.length,
+		endpointsScanned: removed.length + kept + unreadable + detached.length,
 		endpointsRemoved: removed,
 		endpointsKept: kept,
 		endpointsUnreadable: unreadable,
+		endpointsDetached: detached,
 		daemon,
 	};
 }
@@ -794,11 +941,12 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 export function formatNotificationRecoveryReport(report: NotificationRecoveryReport): string {
 	const lines = ["Notification recovery"];
 	lines.push(
-		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}`,
+		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}, detached ${report.endpointsDetached?.length ?? 0}`,
 	);
 	for (const ep of report.endpointsRemoved) {
 		lines.push(`    - removed ${ep.sessionId} (pid ${ep.pid ?? "?"}, ${ep.reason})`);
 	}
+	for (const detached of report.endpointsDetached ?? []) lines.push(`    - retained detached endpoint ${detached}`);
 	lines.push(`  daemon: ${report.daemon.action} — ${report.daemon.detail}`);
 	return lines.join("\n");
 }

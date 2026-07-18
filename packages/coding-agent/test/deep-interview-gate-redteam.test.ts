@@ -335,4 +335,111 @@ describe("deep-interview structured metadata red-team", () => {
 		// absent metadata still valid (backward compatible)
 		expect(askSchema.safeParse({ questions: [base] }).success).toBe(true);
 	});
+
+	describe("Round-0 locked intent contracts", () => {
+		const base = { id: "intent-q", question: "Confirm intent", options: [{ label: "Confirm" }] };
+		const validContract = {
+			items: [{ id: "artifact:report", category: "artifact", statement: "Produce an audit report" }],
+			confirmation_options: ["Confirm"],
+		};
+		function parsed(contract: unknown, round = 0) {
+			return askSchema.safeParse({
+				questions: [
+					{
+						...base,
+						deepInterview: {
+							round,
+							component: "review-topology",
+							dimension: "topology",
+							ambiguity: 0.5,
+							intent_contract: contract,
+						},
+					},
+				],
+			}).success;
+		}
+
+		it("accepts a valid Round-0 contract and rejects invalid contract shapes at the ask boundary", () => {
+			expect(parsed(validContract)).toBe(true);
+			expect(parsed(validContract, 1)).toBe(false);
+			expect(
+				askSchema.safeParse({
+					questions: [
+						{
+							...base,
+							deepInterview: {
+								round: 0,
+								component: "unrelated-component",
+								dimension: "topology",
+								ambiguity: 0.5,
+								intent_contract: validContract,
+							},
+						},
+					],
+				}).success,
+			).toBe(false);
+			expect(
+				parsed({ items: [{ id: "artifact:report", category: "unknown", statement: "Produce an audit report" }] }),
+			).toBe(false);
+			expect(
+				parsed({ items: [{ id: "surface:report", category: "artifact", statement: "Produce an audit report" }] }),
+			).toBe(false);
+			expect(parsed({ items: [{ id: "artifact:report", category: "artifact", statement: "" }] })).toBe(false);
+			expect(
+				parsed({ items: [{ id: "artifact:report", category: "artifact", statement: "x".repeat(1_001) }] }),
+			).toBe(false);
+			expect(
+				parsed({ items: [{ id: "artifact:report", category: "artifact", statement: "Produce", extra: true }] }),
+			).toBe(false);
+			expect(
+				parsed({
+					items: Array.from({ length: 65 }, (_, index) => ({
+						id: `artifact:report-${index}`,
+						category: "artifact",
+						statement: "Produce",
+					})),
+				}),
+			).toBe(false);
+		});
+
+		it("accepts bounded post-Round-0 reduction review metadata", () => {
+			const intentReview = {
+				observed_items: [{ id: "artifact:report", category: "artifact", statement: "Produce a report" }],
+				supporting_substitutions: [
+					{
+						removed_id: "surface:review",
+						replacement_ids: ["artifact:report"],
+						rationale: "Report replaces review",
+					},
+				],
+				approval_options: ["Approve reduction"],
+			};
+			const question = (round: number, review: unknown) => ({
+				...base,
+				options: [{ label: "Approve reduction" }, { label: "Revise spec" }],
+				deepInterview: {
+					round,
+					component: "locked-intent",
+					dimension: "constraints",
+					ambiguity: 0.2,
+					intent_review: review,
+				},
+			});
+			expect(askSchema.safeParse({ questions: [question(2, intentReview)] }).success).toBe(true);
+			expect(askSchema.safeParse({ questions: [question(0, intentReview)] }).success).toBe(false);
+			expect(
+				askSchema.safeParse({ questions: [question(2, { ...intentReview, approval_options: [] })] }).success,
+			).toBe(false);
+			expect(
+				askSchema.safeParse({
+					questions: [
+						question(2, {
+							...intentReview,
+							supporting_substitutions: [{ ...intentReview.supporting_substitutions[0], extra: true }],
+						}),
+					],
+				}).success,
+			).toBe(false);
+		});
+	});
 });

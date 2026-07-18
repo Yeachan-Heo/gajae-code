@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "kind": "prompt-trim-eval-test-report",
+  "issue": 2349,
+  "baseCommit": "f229f81d",
+  "measurements": {
+    "packages/coding-agent/src/prompts/tools/browser.md": {
+      "beforeBytes": 8373,
+      "afterBytes": 4111,
+      "beforeTokensApprox": 2093,
+      "afterTokensApprox": 1027,
+      "tokenReductionApprox": 1066,
+      "tokenizer": "floor(utf8Bytes/4) approximation applied identically to before and after"
+    },
+    "packages/coding-agent/src/prompts/tools/hashline.md": {
+      "beforeBytes": 4839,
+      "afterBytes": 3934,
+      "beforeTokensApprox": 1209,
+      "afterTokensApprox": 983,
+      "tokenReductionApprox": 226,
+      "tokenizer": "floor(utf8Bytes/4) approximation applied identically to before and after"
+    }
+  },
+  "fullApiReference": "gjc://tools/browser.md (shipped embedded reference; source docs updated to cover open, close, act, run, all tab.* helpers, browser kinds, and CDP/profile details)",
+  "editEval": {
+    "method": "Targeted edit-runtime suite comparison on an identical corpus. The suites exercise hashline parsing, native hashline, edit diffs, fallbacks, auto-generated regressions, streaming previews, and renderer contracts; focused prompt-description assertions separately verify retained model-facing safety and discoverability obligations.",
+    "command": "bun test test/core/hashline.test.ts test/core/hashline-native.test.ts test/core/hashline-native-nul.test.ts test/edit-diff.test.ts test/edit-diff-fallback.test.ts test/edit-auto-generated-regressions.test.ts test/edit-per-file-diff-content.test.ts test/edit-streaming-preview.test.ts test/tools/edit-diff.test.ts test/tools/edit-renderer.test.ts test/system-prompt-templates.test.ts",
+    "baseline": "167 pass, 0 fail, 465 expect() calls",
+    "trimmed": "167 pass, 0 fail, 465 expect() calls",
+    "verdict": "runtime suite unchanged; prompt-description safety contracts covered separately"
+  },
+  "constraintsHonored": [
+    "No browser or edit tool runtime/API changes; prompt markdown, shipped browser docs, focused prompt contract tests, and this evidence artifact only.",
+    "Hashline retains anchor freshness, multiline boundary, no-replay, blank-line, insertion, deletion, and exact-anchor obligations while removing duplicated prose.",
+    "Browser prompt names the shipped self-serve URI gjc://tools/browser.md and keeps critical CDP/account-access and process-ownership rules in context."
+  ]
+}

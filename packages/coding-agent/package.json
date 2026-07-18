@@ -29,10 +29,11 @@
 	},
 	"scripts": {
 		"build": "bun scripts/build-binary.ts",
-		"check": "biome check . && bun run verify:sdk-canonicalization && bun run check:types",
+		"check": "biome check . && bun run generate-hotkeys-docs --check && bun run verify:sdk-canonicalization && bun run check:types",
 		"check:types": "tsc -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test",
+		"generate-hotkeys-docs": "bun scripts/generate-hotkeys-docs.ts",
 		"bench:context": "bun run bench/context-optimization.bench.ts",
 		"generate-schemas": "bun ../../scripts/generate-json-schemas.ts",
 		"check:schemas": "bun ../../scripts/generate-json-schemas.ts --check",
@@ -68,6 +69,7 @@
 		"linkedom": "catalog:",
 		"lru-cache": "catalog:",
 		"markit-ai": "catalog:",
+		"marked": "catalog:",
 		"puppeteer-core": "catalog:",
 		"turndown": "catalog:",
 		"turndown-plugin-gfm": "catalog:",
@@ -141,6 +143,12 @@
 			"import": "./src/sdk/bus/*.ts"
 		},
 		"./session/internal/*": null,
+		"./config/model-auth": null,
+		"./config/model-auth.js": null,
+		"./config/model-bindings-applier": null,
+		"./config/model-bindings-applier.js": null,
+		"./config/model-discovery-manager": null,
+		"./config/model-discovery-manager.js": null,
 		"./*": {
 			"types": "./src/*.ts",
 			"import": "./src/*.ts"

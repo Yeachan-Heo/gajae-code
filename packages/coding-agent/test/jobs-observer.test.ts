@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { AsyncJobManager } from "../src/async/job-manager";
 import { JobsObserver } from "../src/modes/jobs-observer";
-import { CronTool, resetCronRegistryForTests } from "../src/tools/cron";
+import { CronTool, calculateCronFireTimeMs, resetCronRegistryForTests } from "../src/tools/cron";
 import type { ToolSession } from "../src/tools/index";
 
 const OWNER = "0-Main";
@@ -27,14 +27,14 @@ function registerMonitor(manager: AsyncJobManager, label: string, ownerId = OWNE
 	});
 }
 
-function createCronSession(ownerId = OWNER): ToolSession {
+function createCronSession(ownerId = OWNER, delivery?: () => Promise<void>): ToolSession {
 	return {
 		cwd: process.cwd(),
 		hasUI: false,
 		getSessionId: () => "test-session",
 		getAgentId: () => ownerId,
 		steer: () => {},
-		sendCustomMessage: async () => {},
+		sendCustomMessage: async () => delivery?.(),
 		allocateOutputArtifact: async () => ({}),
 	} as unknown as ToolSession;
 }
@@ -42,6 +42,7 @@ function createCronSession(ownerId = OWNER): ToolSession {
 afterEach(() => {
 	resetCronRegistryForTests();
 	AsyncJobManager.setInstance(undefined);
+	vi.useRealTimers();
 });
 
 describe("JobsObserver", () => {
@@ -169,6 +170,39 @@ describe("JobsObserver", () => {
 		expect(snapshot.worstState).toBe("running");
 		expect(fires).toBeGreaterThanOrEqual(1);
 
+		observer.dispose();
+		await manager.dispose();
+	});
+
+	test("cron firing state remains visible to observers until delivery settles", async () => {
+		const now = new Date("2026-06-02T12:00:10");
+		vi.useFakeTimers({ now });
+		const manager = makeManager();
+		AsyncJobManager.setInstance(manager);
+		const observer = new JobsObserver(manager, OWNER);
+		const delivery = Promise.withResolvers<void>();
+		const tool = new CronTool(createCronSession(OWNER, () => delivery.promise));
+		const result = await tool.execute("call", {
+			op: "create",
+			cron_expression: "1 12 * * *",
+			prompt: "pending delivery",
+			recurring: true,
+		});
+		if (!result.details?.id) throw new Error("Expected cron id");
+		const fireAt = calculateCronFireTimeMs({
+			id: result.details.id,
+			cronExpression: "1 12 * * *",
+			baseMatchMs: new Date("2026-06-02T12:01:00").getTime(),
+			recurring: true,
+			nowMs: now.getTime(),
+		});
+		vi.advanceTimersByTime(fireAt - now.getTime());
+		await Promise.resolve();
+		expect(observer.getSnapshot().crons[0]?.firing).toBe(true);
+		delivery.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(observer.getSnapshot().crons[0]?.firing).toBe(false);
 		observer.dispose();
 		await manager.dispose();
 	});

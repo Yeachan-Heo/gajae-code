@@ -1,3 +1,8 @@
+/**
+ * EXPERIMENTAL: Receipt ingestion is a pure evaluator and is not yet wired to
+ * finalize or retire lifecycle mutation. Callers must not treat its result as
+ * authoritative lifecycle persistence.
+ */
 import type { CompletionEvidence, ReceiptEnvelope, ReviewVerdictEvidence } from "./receipts";
 import { validateReceipt } from "./receipts";
 import { canTransition } from "./state-machine";

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { appendOrMergeDeepInterviewRound } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import { auditPath, modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
@@ -224,9 +225,32 @@ describe("workflow state writer drift guard", () => {
 		expect(seed.status).toBe(0);
 		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
 		await expectPersistedEnvelope(statePath);
+		const blockedWrite = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "drift", "--spec", "# Spec", "--json"],
+			root,
+		);
+		expect(blockedWrite.status).toBe(2);
+		expect(blockedWrite.stderr).toContain("missing Round 0 intent contract");
+		await appendOrMergeDeepInterviewRound(
+			root,
+			statePath,
+			{
+				round: 0,
+				questionId: "intent-confirmation",
+				questionText: "Confirm locked intent",
+				component: "review-topology",
+				dimension: "topology",
+				selectedOptions: ["Confirm"],
+				intent_contract: {
+					items: [{ id: "artifact:drift", category: "artifact", statement: "Persist the writer envelope" }],
+					confirmation_options: ["Confirm"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 
 		const write = await runNativeDeepInterviewCommand(
-			["--write", "--stage", "final", "--slug", "drift", "--spec", "# Spec", "--json"],
+			["--write", "--stage", "final", "--slug", "drift", "--spec", "# Spec\n\nartifact:drift", "--json"],
 			root,
 		);
 		expect(write.status).toBe(0);

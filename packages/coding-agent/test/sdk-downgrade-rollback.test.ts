@@ -191,6 +191,7 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 		strategy: string;
 		sourceEntrypoints: string[];
 		artifactPath: string;
+		artifactPathByPlatform: Record<string, string>;
 		artifactSha256Scope: string;
 		supportedPlatforms: string[];
 		sourceRecovery: PinnedCommitRecovery;
@@ -217,6 +218,13 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 	expect(manifest.artifactPath).toBe("packages/coding-agent/dist/gjc-rollback");
 	expect(manifest.artifactSha256Scope).toContain("executable bytes");
 	expect(manifest.supportedPlatforms).toContain(process.platform);
+	expect(manifest.artifactPathByPlatform).toEqual({
+		darwin: manifest.artifactPath,
+		linux: manifest.artifactPath,
+		win32: `${manifest.artifactPath}.exe`,
+	});
+	const artifactPath = manifest.artifactPathByPlatform[process.platform];
+	if (artifactPath === undefined) throw new Error(`No rollback executable artifact path for ${process.platform}.`);
 	expect(manifest.toolchain.runtime).toBe("bun");
 	expect(manifest.toolchain.version).toBe(Bun.version);
 	expect(manifest.runtimeEnvironment).toEqual({ BUN_OPTIONS: "--preload {transportShim}" });
@@ -258,7 +266,13 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 		const isolatedNodeModules = await fs.lstat(path.join(worktree, "node_modules"));
 		expect(isolatedNodeModules.isSymbolicLink()).toBe(false);
 
-		const nativeBuild = await command(manifest.toolchain.nativeBuild, worktree);
+		const nativeBuild = await command(
+			manifest.toolchain.nativeBuild,
+			worktree,
+			undefined,
+			// Bounded accommodation for documented Windows cold native builds; remains below the outer proof cap.
+			process.platform === "win32" ? 900_000 : 300_000,
+		);
 		expect(nativeBuild.exitCode, nativeBuild.output).toBe(0);
 		const nativeEmbed = await command(manifest.toolchain.nativeEmbed, worktree);
 		expect(nativeEmbed.exitCode, nativeEmbed.output).toBe(0);
@@ -272,16 +286,20 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 			const signed = await command(signCommand, productDirectory);
 			expect(signed.exitCode, signed.output).toBe(0);
 		}
-		const executable = path.join(worktree, manifest.artifactPath);
+		const executable = path.join(worktree, artifactPath);
 		const executableStat = await fs.stat(executable);
 		expect(executableStat.isFile()).toBe(true);
-		expect(executableStat.mode & 0o111).not.toBe(0);
+		if (process.platform === "win32") {
+			expect(path.extname(executable)).toBe(".exe");
+		} else {
+			expect(executableStat.mode & 0o111).not.toBe(0);
+		}
 		const artifactSha256 = createHash("sha256")
 			.update(await fs.readFile(executable))
 			.digest("hex");
 		expect(artifactSha256).toMatch(/^[0-9a-f]{64}$/);
 		console.log(
-			`Pinned pretrain executable commit=${commit} platform=${process.platform} arch=${process.arch} artifact=${manifest.artifactPath} sha256=${artifactSha256}`,
+			`Pinned pretrain executable commit=${commit} platform=${process.platform} arch=${process.arch} artifact=${artifactPath} sha256=${artifactSha256}`,
 		);
 		endpointServer = startOldFormatFakeEndpoint("endpoint-token");
 		const activeEndpointServer = endpointServer;
@@ -306,7 +324,7 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 			pretrainBinary: {
 				baseRef: manifest.baseRef,
 				commit,
-				artifactPath: manifest.artifactPath,
+				artifactPath,
 				artifactSha256,
 				artifactSha256Scope: manifest.artifactSha256Scope,
 			},
@@ -320,13 +338,13 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 			pretrainBinary: {
 				baseRef: manifest.baseRef,
 				commit: manifest.baseRef,
-				artifactPath: manifest.artifactPath,
+				artifactPath,
 				artifactSha256,
 				artifactSha256Scope: manifest.artifactSha256Scope,
 			},
 		});
 
-		expect(report.copied).toContain("state/notifications/rollback-session.json");
+		expect(report.copied).toContain(path.join("state", "notifications", "rollback-session.json"));
 		expect(JSON.parse(await fs.readFile(path.join(output, "report.json"), "utf8"))).toEqual(report);
 		// The transformed rollback dir is a static snapshot; assert the broker discovery
 		// record is present and structurally valid, not that its captured heartbeat is
@@ -396,6 +414,7 @@ globalThis.fetch = async (input, init) => {
 };
 `,
 		);
+		const transportShimSpecifier = transportShim.replaceAll("\\", "/");
 		const ownerId = `${process.pid}-rollback-proof`;
 		const productCommand = expandProductCommand(manifest.productCommand, {
 			executable,
@@ -432,12 +451,14 @@ globalThis.fetch = async (input, init) => {
 				roots: [path.join(output, "state")],
 			}),
 		);
+		// Windows compiled-startup accommodation.
+		const oldProductReadinessTimeoutMs = process.platform === "win32" ? 30_000 : 5_000;
 		const oldProduct = Bun.spawn(productCommand, {
 			cwd: output,
 			env: {
 				...process.env,
 				GJC_CODING_AGENT_DIR: output,
-				BUN_OPTIONS: manifest.runtimeEnvironment.BUN_OPTIONS.replace("{transportShim}", transportShim),
+				BUN_OPTIONS: manifest.runtimeEnvironment.BUN_OPTIONS.replace("{transportShim}", transportShimSpecifier),
 			},
 
 			stdout: "pipe",
@@ -451,14 +472,14 @@ globalThis.fetch = async (input, init) => {
 			const daemonStatePath = path.join(output, "notifications", "telegram-daemon.state.json");
 			await waitFor(
 				async () => (await jsonFile(daemonStatePath))?.pid === oldProduct.pid,
-				5_000,
+				oldProductReadinessTimeoutMs,
 				"old product daemon readiness and ownership mutation",
 			);
 			const daemonState = await jsonFile(daemonStatePath);
 			expect(daemonState).toMatchObject({ ownerId, pid: oldProduct.pid });
 			await waitFor(
 				() => activeEndpointServer.frames.some(frame => frame.type === "hello"),
-				5_000,
+				oldProductReadinessTimeoutMs,
 				"old product discovery of transformed notification endpoint",
 			);
 			await waitFor(
@@ -470,7 +491,7 @@ globalThis.fetch = async (input, init) => {
 							frame.answer === 0 &&
 							frame.token === endpoint.token,
 					),
-				5_000,
+				oldProductReadinessTimeoutMs,
 				"old product Telegram mutation forwarded to transformed session endpoint",
 			);
 			const telegramCalls = (await fs.readFile(transportLog, "utf8"))
@@ -493,13 +514,13 @@ globalThis.fetch = async (input, init) => {
 			).toBe(artifactSha256);
 			const shutdown = await command(shutdownCommand, output, {
 				GJC_CODING_AGENT_DIR: output,
-				BUN_OPTIONS: manifest.runtimeEnvironment.BUN_OPTIONS.replace("{transportShim}", transportShim),
+				BUN_OPTIONS: manifest.runtimeEnvironment.BUN_OPTIONS.replace("{transportShim}", transportShimSpecifier),
 			});
 			expect(shutdown.exitCode, shutdown.output).toBe(0);
 			const controlPath = path.join(daemonDir, "telegram-daemon.control.json");
 			await waitFor(
 				async () => (await jsonFile(controlPath)) === undefined,
-				5_000,
+				oldProductReadinessTimeoutMs,
 				"old product control acknowledgement",
 			);
 			await waitFor(
@@ -512,7 +533,7 @@ globalThis.fetch = async (input, init) => {
 						throw error;
 					}
 				},
-				5_000,
+				oldProductReadinessTimeoutMs,
 				"old product ownership release",
 			);
 		} catch (error) {
@@ -524,12 +545,14 @@ globalThis.fetch = async (input, init) => {
 			throw new Error(
 				`${readinessError instanceof Error ? readinessError.message : String(readinessError)}\n${oldStdout}${oldStderr}`,
 			);
-		expect(exitCode, `${oldStdout}${oldStderr}`).toBe(128 + 15);
+		// Bun reports a signal exit as 128 + signal number on POSIX, while Windows
+		// terminates the compiled process with its platform exit status.
+		expect(exitCode, `${oldStdout}${oldStderr}`).toBe(process.platform === "win32" ? 1 : 128 + 15);
 	} finally {
 		await command(["git", "worktree", "remove", "--force", worktree]);
 		endpointServer?.stop();
 	}
-}, 600_000);
+}, 1_500_000);
 
 test("rollback transformer refuses an unknown source version", async () => {
 	const source = await temp();

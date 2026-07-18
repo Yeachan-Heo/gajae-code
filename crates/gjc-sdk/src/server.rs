@@ -411,9 +411,9 @@ struct ServerState {
 	resolver_available:  AtomicBool,
 	/// Present in forward mode: accepted replies are sent here for the host.
 	reply_tx:            Option<mpsc::UnboundedSender<crate::actions::ClaimedReply>>,
-	/// Always present: inbound free-text injections / in-thread config commands
-	/// forwarded to the host (token-authorized).
-	inbound_tx:          mpsc::UnboundedSender<ClientMessage>,
+	/// Always present: authenticated inbound messages paired with the
+	/// server-assigned connection identity that delivered them.
+	inbound_tx:          mpsc::UnboundedSender<InboundMessage>,
 	/// v3 frames, kept raw so the SDK host owns their protocol semantics.
 	frame_tx:            mpsc::UnboundedSender<(String, String)>,
 	/// Negotiated capability snapshots for host-side per-connection policy.
@@ -429,6 +429,15 @@ struct ServerState {
 	connection_sequence: AtomicU64,
 }
 
+/// An authenticated inbound message paired with its server-assigned connection
+/// id.
+#[derive(Debug)]
+pub struct InboundMessage {
+	pub connection_id: String,
+	pub message:       ClientMessage,
+}
+
+pub type InboundReceiver = mpsc::UnboundedReceiver<InboundMessage>;
 type FrameReceiver = mpsc::UnboundedReceiver<(String, String)>;
 type CapabilityReceiver = mpsc::UnboundedReceiver<CapabilityUpdate>;
 
@@ -444,7 +453,7 @@ pub struct ServerHandle {
 	session_id:    String,
 	state_root:    Option<PathBuf>,
 	reply_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::actions::ClaimedReply>>>>,
-	inbound_rx:    Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>>>>,
+	inbound_rx:    Arc<Mutex<Option<InboundReceiver>>>,
 	frame_rx:      Arc<Mutex<Option<FrameReceiver>>>,
 	capability_rx: Arc<Mutex<Option<CapabilityReceiver>>>,
 	close_rx:      Arc<Mutex<Option<mpsc::UnboundedReceiver<String>>>>,
@@ -651,13 +660,11 @@ impl ServerHandle {
 		self.reply_rx.lock().take()
 	}
 
-	/// Take the receiver of forwarded inbound messages (free-text injections and
-	/// in-thread config commands). Returns the receiver exactly once; subsequent
-	/// calls return `None`.
+	/// Take authenticated inbound messages paired with their server-assigned
+	/// connection identity. Returns the receiver exactly once; subsequent calls
+	/// return `None`.
 	#[must_use]
-	pub fn take_inbound_receiver(
-		&self,
-	) -> Option<tokio::sync::mpsc::UnboundedReceiver<ClientMessage>> {
+	pub fn take_inbound_receiver(&self) -> Option<InboundReceiver> {
 		self.inbound_rx.lock().take()
 	}
 
@@ -1136,7 +1143,7 @@ pub async fn start(config: ServerConfig) -> std::io::Result<ServerHandle> {
 	} else {
 		(None, None)
 	};
-	let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<ClientMessage>();
+	let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundMessage>();
 	let (frame_tx, frame_rx) = mpsc::unbounded_channel();
 	let (cap_tx, cap_rx) = mpsc::unbounded_channel();
 	let (close_tx, close_rx) = mpsc::unbounded_channel();
@@ -1251,6 +1258,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			capabilities::ASK_CONTROLS_V1.into(),
 			capabilities::ASK_SELECTED_ACK_V1.into(),
 			capabilities::TOOL_ACTIVITY_V1.into(),
+			capabilities::EPHEMERAL_TURN_V1.into(),
 		],
 		connection_id:    Some(connection_id.clone()),
 	});
@@ -1564,23 +1572,51 @@ where
 	};
 	let reply = match msg {
 		ClientMessage::Reply(reply) => reply,
-		// Inbound free-text injection / in-thread config command: forward to the
-		// host (token-authorized) and stop. These are not action replies.
+		// Inbound free-text injection / ephemeral side question / in-thread config
+		// command: forward to the host (token-authorized) and stop. These are not
+		// action replies.
 		ClientMessage::UserMessage(u) => {
 			if tokens_match(&u.token, &state.token) {
-				let _ = state.inbound_tx.send(ClientMessage::UserMessage(u));
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       ClientMessage::UserMessage(u),
+				});
+			}
+			return true;
+		},
+		ClientMessage::EphemeralTurn(turn) => {
+			if tokens_match(&turn.token, &state.token) {
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       ClientMessage::EphemeralTurn(turn),
+				});
+			}
+			return true;
+		},
+		ClientMessage::EphemeralTurnCancel(cancel) => {
+			if tokens_match(&cancel.token, &state.token) {
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       ClientMessage::EphemeralTurnCancel(cancel),
+				});
 			}
 			return true;
 		},
 		ClientMessage::ConfigCommand(c) => {
 			if tokens_match(&c.token, &state.token) {
-				let _ = state.inbound_tx.send(ClientMessage::ConfigCommand(c));
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       ClientMessage::ConfigCommand(c),
+				});
 			}
 			return true;
 		},
 		ClientMessage::ControlCommand(c) => {
 			if tokens_match(&c.token, &state.token) {
-				let _ = state.inbound_tx.send(ClientMessage::ControlCommand(c));
+				let _ = state.inbound_tx.send(InboundMessage {
+					connection_id: connection_id.to_owned(),
+					message:       ClientMessage::ControlCommand(c),
+				});
 			}
 			return true;
 		},
@@ -2390,7 +2426,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn push_frame_broadcasts_threaded_frames_and_preserves_ask() {
-		use crate::protocol::{IdentityHeader, TurnPhase, TurnStream};
+		use crate::protocol::{EphemeralTurnResult, IdentityHeader, TurnPhase, TurnStream};
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut ws = connect(&handle, "secret").await;
 		next_server_hello(&mut ws).await;
@@ -2425,6 +2461,25 @@ mod tests {
 				assert_eq!(t.text, "done");
 			},
 			other => panic!("expected turn_stream, got {other:?}"),
+		}
+		handle
+			.push_frame(ServerMessage::EphemeralTurnResult(EphemeralTurnResult {
+				session_id: "s".into(),
+				request_id: "btw:123e4567-e89b-42d3-a456-426614174000".into(),
+				update_id:  7,
+				message_id: 8,
+				thread_id:  "42".into(),
+				status:     crate::protocol::EphemeralTurnStatus::Ok,
+				text:       Some("side answer".into()),
+			}))
+			.unwrap();
+		match next_server_msg(&mut ws).await {
+			ServerMessage::EphemeralTurnResult(result) => {
+				assert_eq!(result.request_id, "btw:123e4567-e89b-42d3-a456-426614174000");
+				assert_eq!(result.update_id, 7);
+				assert_eq!(result.message_id, 8);
+			},
+			other => panic!("expected ephemeral_turn_result, got {other:?}"),
 		}
 
 		// Asks share the connection-local reevaluation path alongside streaming frames.
@@ -2525,6 +2580,7 @@ mod tests {
 			capabilities::ASK_CONTROLS_V1,
 			capabilities::ASK_SELECTED_ACK_V1,
 			capabilities::TOOL_ACTIVITY_V1,
+			capabilities::EPHEMERAL_TURN_V1,
 		]);
 
 		match next_server_msg(&mut ws).await {
@@ -2992,7 +3048,10 @@ mod tests {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut inbound = handle.take_inbound_receiver().expect("inbound rx");
 		let mut ws = connect(&handle, "secret").await;
-		next_server_hello(&mut ws).await;
+		let connection_id = next_server_hello(&mut ws)
+			.await
+			.connection_id
+			.expect("connection id");
 		wait_for_clients(&handle, 1).await;
 		ws.send(Message::Text(
 			serde_json::to_string(&ClientMessage::UserMessage(crate::protocol::UserMessage {
@@ -3012,7 +3071,8 @@ mod tests {
 			.await
 			.expect("inbound timed out")
 			.expect("inbound channel closed");
-		match got {
+		assert_eq!(got.connection_id, connection_id);
+		match got.message {
 			ClientMessage::UserMessage(u) => {
 				assert_eq!(u.text, "keep going");
 				assert_eq!(u.update_id, Some(7));
@@ -3024,11 +3084,191 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn authenticated_ephemeral_turn_forwards_only_to_typed_inbound_receiver() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut inbound = handle.take_inbound_receiver().expect("inbound receiver");
+		let mut frames = handle.take_frame_receiver().expect("frame receiver");
+		let mut ws = connect(&handle, "secret").await;
+		let connection_id = next_server_hello(&mut ws)
+			.await
+			.connection_id
+			.expect("connection id");
+		wait_for_clients(&handle, 1).await;
+		ws.send(Message::Text(
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "secret",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "What changed?",
+			})
+			.to_string()
+			.into(),
+		))
+		.await
+		.unwrap();
+
+		let inbound_turn = tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv())
+			.await
+			.expect("inbound timed out")
+			.expect("inbound channel closed");
+		assert_eq!(inbound_turn.connection_id, connection_id);
+		match inbound_turn.message {
+			ClientMessage::EphemeralTurn(turn) => {
+				assert_eq!(turn.session_id, "s");
+				assert_eq!(turn.token, "secret");
+				assert_eq!(turn.question, "What changed?");
+				assert_eq!(turn.request_id, "btw:123e4567-e89b-42d3-a456-426614174000");
+				assert_eq!(turn.update_id, 7);
+				assert_eq!(turn.message_id, 9);
+				assert_eq!(turn.thread_id, "11");
+			},
+			other => panic!("expected ephemeral_turn, got {other:?}"),
+		}
+
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(300), frames.recv())
+				.await
+				.is_err(),
+			"authenticated ephemeral turns must not be duplicated to the raw frame receiver"
+		);
+
+		for frame in [
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "secret",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "malformed",
+				"unexpected": true,
+			}),
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "wrong",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "wrong token",
+			}),
+		] {
+			ws.send(Message::Text(frame.to_string().into()))
+				.await
+				.unwrap();
+		}
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(300), inbound.recv())
+				.await
+				.is_err(),
+			"malformed and wrong-token frames must not reach inbound receiver"
+		);
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(300), frames.recv())
+				.await
+				.is_err(),
+			"malformed and wrong-token frames must not reach frame receiver"
+		);
+		handle.stop();
+	}
+	#[tokio::test]
+	async fn authenticated_ephemeral_turn_cancel_forwards_full_tuple_to_typed_inbound() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut inbound = handle.take_inbound_receiver().expect("inbound rx");
+		let mut frames = handle.take_frame_receiver().expect("frame rx");
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		wait_for_clients(&handle, 1).await;
+		ws.send(Message::Text(
+			serde_json::json!({
+				"type": "ephemeral_turn_cancel",
+				"sessionId": "s",
+				"token": "secret",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"reason": "daemon_shutdown",
+			})
+			.to_string()
+			.into(),
+		))
+		.await
+		.unwrap();
+
+		let inbound_cancel = tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv())
+			.await
+			.expect("cancel timed out")
+			.expect("inbound channel closed");
+		match inbound_cancel.message {
+			ClientMessage::EphemeralTurnCancel(cancel) => {
+				assert_eq!(cancel.update_id, 7);
+				assert_eq!(cancel.message_id, 9);
+				assert_eq!(cancel.thread_id, "11");
+			},
+			other => panic!("expected ephemeral_turn_cancel, got {other:?}"),
+		}
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(300), frames.recv())
+				.await
+				.is_err(),
+			"authenticated ephemeral turn cancels must not be duplicated to the raw frame receiver"
+		);
+		ws.send(Message::Text(
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "secret",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "strict",
+				"unexpected": true,
+			})
+			.to_string()
+			.into(),
+		))
+		.await
+		.unwrap();
+		ws.send(Message::Text(
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "wrong",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "strict",
+			})
+			.to_string()
+			.into(),
+		))
+		.await
+		.unwrap();
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(300), frames.recv())
+				.await
+				.is_err()
+		);
+		handle.stop();
+	}
+	#[tokio::test]
 	async fn inbound_control_command_forwards_to_host() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut inbound = handle.take_inbound_receiver().expect("inbound rx");
 		let mut ws = connect(&handle, "secret").await;
-		next_server_hello(&mut ws).await;
+		let connection_id = next_server_hello(&mut ws)
+			.await
+			.connection_id
+			.expect("connection id");
 		wait_for_clients(&handle, 1).await;
 		ws.send(Message::Text(
 			serde_json::to_string(&ClientMessage::ControlCommand(crate::protocol::ControlCommand {
@@ -3048,7 +3288,8 @@ mod tests {
 			.await
 			.expect("inbound timed out")
 			.expect("inbound channel closed");
-		match got {
+		assert_eq!(got.connection_id, connection_id);
+		match got.message {
 			ClientMessage::ControlCommand(c) => {
 				assert_eq!(c.request_id, "r1");
 				assert_eq!(c.update_id, Some(8));

@@ -312,7 +312,7 @@ function validArgv(argv: unknown): argv is string[] {
 	);
 }
 
-function isSafeServerProof(
+export function isSafeServerProof(
 	server: TmuxServerProof,
 	platform: NodeJS.Platform = "linux",
 ): server is TmuxServerProof & {
@@ -329,6 +329,17 @@ function isSafeServerProof(
 		nonEmpty(server.startTime) &&
 		(server.cgroup?.classification === "safe" ||
 			(platform !== "linux" && server.cgroup?.classification === "not_applicable"))
+	);
+}
+
+/** Compares the stable identity fields of independently observed tmux servers. */
+export function sameServerIdentity(left: TmuxServerProof, right: TmuxServerProof): boolean {
+	return (
+		left.pid === right.pid &&
+		left.startTime === right.startTime &&
+		left.cgroup?.classification === right.cgroup?.classification &&
+		left.cgroup?.scope === right.cgroup?.scope &&
+		left.cgroup?.diagnostic === right.cgroup?.diagnostic
 	);
 }
 /**

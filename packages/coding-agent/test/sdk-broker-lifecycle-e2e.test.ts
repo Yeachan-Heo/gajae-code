@@ -2926,7 +2926,7 @@ test("shipped sdk session-host-internal stays alive only after a semantic ready 
 				ok: true,
 				page: { items: [{ sessionId }] },
 			});
-			expect(await client.control("mode.plan.set", { on: true })).toMatchObject({ ok: true });
+			await expect(client.control("mode.plan.set", { on: true })).rejects.toMatchObject({ code: "unavailable" });
 		} finally {
 			await client.close();
 		}

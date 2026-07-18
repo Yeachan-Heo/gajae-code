@@ -12,6 +12,8 @@ import { describe, expect, test } from "bun:test";
 import { expandPromptTemplate, type PromptTemplate } from "@gajae-code/coding-agent/config/prompt-templates";
 import { expandSlashCommand, type FileSlashCommand } from "@gajae-code/coding-agent/extensibility/slash-commands";
 import { parseCommandArgs, substituteArgs } from "@gajae-code/coding-agent/utils/command-args";
+import browserDescription from "../src/prompts/tools/browser.md" with { type: "text" };
+import hashlineDescription from "../src/prompts/tools/hashline.md" with { type: "text" };
 
 // ============================================================================
 // substituteArgs
@@ -272,6 +274,33 @@ describe("hashline prompt helpers", () => {
 	test("href should not reuse hline state across prompt renders", () => {
 		expect(expandPrompt('{{hline 1 "const x = 1;"}}\n{{hrefr}}')).toMatch(/^1[a-z]{2}\|const x = 1;\n1[a-z]{2}$/);
 		expect(() => expandPrompt("{{hrefr}}")).toThrow("previous {{hline}}");
+	});
+});
+
+describe("tool prompt descriptions", () => {
+	test("retains browser safety, structured-action, and shipped-reference contracts", () => {
+		expect(browserDescription).toContain("MUST call `open` before `run` or `act`");
+		expect(browserDescription).toContain("Re-observe before referencing them");
+		expect(browserDescription).toContain("MUST observe before taking a screenshot");
+		expect(browserDescription).toContain("`act` — run a list of structured `actions`");
+		expect(browserDescription).toContain("Use `run` only when an `act` verb does not cover what you need");
+		expect(browserDescription).toContain("full browser-account access");
+		expect(browserDescription).toContain("only a Chrome process GJC launched");
+		expect(browserDescription).toContain("NEVER use it for a daily Chrome profile");
+		expect(browserDescription).toContain("cookies and authenticated accounts");
+		expect(browserDescription).toContain("gjc://tools/browser.md");
+		expect(browserDescription).toContain('"action":"run"');
+	});
+
+	test("retains hashline anchor, boundary, and operation-discovery contracts", () => {
+		expect(hashlineDescription).toContain("Anchors reference the file as last read");
+		expect(hashlineDescription).toContain("replay past B");
+		expect(hashlineDescription).toContain("Touching a multiline construct? Widen to the whole thing");
+		expect(hashlineDescription).toContain("To keep a blank line, include one explicit empty payload line");
+		expect(hashlineDescription).toContain("`»{{hrefr 4}}`");
+		expect(hashlineDescription).toContain("`«{{hrefr 5}}`");
+		expect(hashlineDescription).toContain("`≔{{hrefr 5}}`");
+		expect(hashlineDescription).toContain("Copy anchors verbatim");
 	});
 });
 

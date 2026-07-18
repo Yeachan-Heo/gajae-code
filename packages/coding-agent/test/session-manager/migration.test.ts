@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { type FileEntry, migrateSessionEntries } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	CURRENT_SESSION_VERSION,
+	type FileEntry,
+	migrateSessionEntries,
+} from "@gajae-code/coding-agent/session/session-manager";
 
 describe("migrateSessionEntries", () => {
 	it("should add id/parentId to v1 entries", () => {
@@ -25,7 +29,7 @@ describe("migrateSessionEntries", () => {
 		migrateSessionEntries(entries);
 
 		// Header should have version set to current
-		expect((entries[0] as any).version).toBe(3);
+		expect((entries[0] as any).version).toBe(CURRENT_SESSION_VERSION);
 
 		// Entries should have id/parentId
 		const msg1 = entries[1] as any;

@@ -55,6 +55,9 @@ export interface NotificationSettingsSnapshot {
 		botToken?: string;
 		chatId?: string;
 		activation?: Record<string, unknown>;
+		btw: {
+			enabled: boolean;
+		};
 		rich: {
 			enabled: boolean;
 		};
@@ -93,6 +96,97 @@ export interface NotificationSettingsReader {
 	getNotificationSettingsSnapshot(): NotificationSettingsSnapshot;
 	getAgentDir(): string;
 }
+function notificationConfigurationError(): Error {
+	return new Error("gjc_notify_daemon_invalid_configuration");
+}
+
+function notificationSettingsObject(value: unknown): Record<string, unknown> {
+	if (value === undefined) return {};
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw notificationConfigurationError();
+	return value as Record<string, unknown>;
+}
+
+function notificationSettingsString(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value === "string") return value;
+	throw notificationConfigurationError();
+}
+
+function notificationSettingsBoolean(value: unknown, fallback: boolean): boolean {
+	if (value === undefined) return fallback;
+	if (typeof value === "boolean") return value;
+	throw notificationConfigurationError();
+}
+
+function notificationSettingsChoice<T extends string>(value: unknown, fallback: T, choices: readonly T[]): T {
+	if (value === undefined) return fallback;
+	if (typeof value === "string" && choices.includes(value as T)) return value as T;
+	throw notificationConfigurationError();
+}
+
+function notificationIdleTimeoutMs(value: unknown): number {
+	if (value === undefined) return 60_000;
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+	throw notificationConfigurationError();
+}
+
+/**
+ * Validate and snapshot the raw global notification configuration used by both
+ * the interactive host and the lightweight daemon process.
+ */
+export function parseNotificationSettingsSnapshot(rawConfig?: unknown): NotificationSettingsSnapshot {
+	const root = notificationSettingsObject(rawConfig);
+	const notifications = notificationSettingsObject(root.notifications);
+	const telegram = notificationSettingsObject(notifications.telegram);
+	const btw = notificationSettingsObject(telegram.btw);
+	const rich = notificationSettingsObject(telegram.rich);
+	const richDraft = notificationSettingsObject(telegram.richDraft);
+	const topics = notificationSettingsObject(telegram.topics);
+	const activation = readTelegramActivationMarkers(notificationSettingsObject(telegram.activation));
+	const discord = notificationSettingsObject(notifications.discord);
+	const slack = notificationSettingsObject(notifications.slack);
+	const daemon = notificationSettingsObject(notifications.daemon);
+	return {
+		enabled: notificationSettingsBoolean(notifications.enabled, false),
+		telegram: {
+			botToken: notificationSettingsString(telegram.botToken),
+			chatId: notificationSettingsString(telegram.chatId),
+			...(Object.keys(activation).length === 0 ? {} : { activation }),
+			btw: {
+				enabled: notificationSettingsBoolean(btw.enabled, true),
+			},
+			rich: {
+				enabled: notificationSettingsBoolean(rich.enabled, true),
+			},
+			richDraft: {
+				enabled: notificationSettingsBoolean(richDraft.enabled, false),
+			},
+			topics: {
+				nameTemplate: notificationSettingsString(topics.nameTemplate),
+			},
+		},
+		discord: {
+			botToken: notificationSettingsString(discord.botToken),
+			applicationId: notificationSettingsString(discord.applicationId),
+			guildId: notificationSettingsString(discord.guildId),
+			parentChannelId: notificationSettingsString(discord.parentChannelId),
+		},
+		slack: {
+			botToken: notificationSettingsString(slack.botToken),
+			appToken: notificationSettingsString(slack.appToken),
+			workspaceId: notificationSettingsString(slack.workspaceId),
+			channelId: notificationSettingsString(slack.channelId),
+			authorizedUserId: notificationSettingsString(slack.authorizedUserId),
+		},
+		redact: notificationSettingsBoolean(notifications.redact, false),
+		verbosity: notificationSettingsChoice<"lean" | "verbose">(notifications.verbosity, "lean", ["lean", "verbose"]),
+		sessionScope: notificationSettingsChoice<"all" | "primary">(notifications.sessionScope, "all", [
+			"all",
+			"primary",
+		]),
+		idleTimeoutMs: notificationIdleTimeoutMs(daemon.idleTimeoutMs),
+	};
+}
 
 export interface NotificationConfig {
 	enabled: boolean;
@@ -121,6 +215,9 @@ export interface NotificationConfig {
 	 */
 	sessionScope: "all" | "primary";
 	idleTimeoutMs: number;
+	btw: {
+		enabled: boolean;
+	};
 	rich: {
 		enabled: boolean;
 	};
@@ -154,6 +251,7 @@ export function getNotificationConfig(settings: NotificationSettingsReader): Not
 		sessionScope: snapshot.sessionScope,
 		idleTimeoutMs: snapshot.idleTimeoutMs,
 		rich: snapshot.telegram.rich,
+		btw: snapshot.telegram.btw,
 		richDraft: snapshot.telegram.richDraft,
 		topics: snapshot.telegram.topics,
 	};

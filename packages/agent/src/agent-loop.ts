@@ -8,9 +8,9 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
+	classifyContextOverflow,
 	classifyFallbackTrigger,
 	EventStream,
-	isContextOverflow,
 	isZodSchema,
 	streamSimple,
 	type ToolResultMessage,
@@ -100,14 +100,12 @@ class ManagedAttemptSnapshotError extends Error {
 const managedAttemptTextEncoder = new TextEncoder();
 
 const ABORTED: unique symbol = Symbol("agent-loop-aborted");
-/**
- * Detect empty "successful" responses that indicate a proxy-level context
- * overflow (e.g. LiteLLM returning `content: []`, `stopReason: "stop"`, and a
- * fabricated near-zero usage). We delegate to {@link isContextOverflow} which
- * has the threshold constant, so the detection logic stays in one place.
- */
-function isEmptyResponseOverflow(message: AssistantMessage): boolean {
-	return isContextOverflow(message);
+function managedContextOverflow(message: AssistantMessage, config: AgentLoopConfig): boolean {
+	const transportFailure = managedTransportFailure(message);
+	// Managed empty-stop responses may be repaired by the managed shell below; only
+	// typed/error overflows are discardable before that normalization boundary.
+	if (config.fallbackManaged && message.stopReason !== "error") return false;
+	return classifyContextOverflow(message, transportFailure, config.model.contextWindow);
 }
 
 /** Managed fallback owns retry policy; only attached typed transport facts may discard an attempt. */
@@ -175,6 +173,10 @@ function managedFailureOutcome(message: AssistantMessage): ManagedAttemptOutcome
 		type: "retryable_discarded",
 		failure: { message, transportFailure: managedTransportFailure(message) },
 	};
+}
+
+function managedContextOverflowOutcome(message: AssistantMessage): ManagedAttemptOutcome {
+	return { type: "context_overflow_discarded", message };
 }
 
 function managedFailureMessage(error: unknown, config: AgentLoopConfig): AssistantMessage {
@@ -1340,11 +1342,20 @@ async function runLoopBody(
 				harmonyTruncateResumeCount = 0;
 			} catch (err) {
 				if (!(err instanceof HarmonyLeakInterruption)) {
+					const failureMessage = managedFailureMessage(err, config);
+					if (config.fallbackManaged && transaction && managedContextOverflow(failureMessage, config)) {
+						transaction.discard();
+						currentContext.messages.splice(contextMessageCount);
+						newMessages.splice(newMessageCount);
+						await config.onManagedAttemptOutcome?.(managedContextOverflowOutcome(failureMessage));
+						stream.end(newMessages);
+						return;
+					}
 					if (config.fallbackManaged && transaction && managedRetryableFailure(err)) {
 						transaction.discard();
 						currentContext.messages.splice(contextMessageCount);
 						newMessages.splice(newMessageCount);
-						await config.onManagedAttemptOutcome?.(managedFailureOutcome(managedFailureMessage(err, config)));
+						await config.onManagedAttemptOutcome?.(managedFailureOutcome(failureMessage));
 						stream.end(newMessages);
 						return;
 					}
@@ -1419,17 +1430,22 @@ async function runLoopBody(
 				}
 			}
 
+			const overflow = managedContextOverflow(message, config);
+			if (config.fallbackManaged && overflow) {
+				transaction?.discard();
+				currentContext.messages.splice(contextMessageCount);
+				newMessages.splice(newMessageCount);
+				await config.onManagedAttemptOutcome?.(managedContextOverflowOutcome(message));
+				stream.end(newMessages);
+				return;
+			}
+
 			newMessages.push(message);
 			modelHasResponded = true;
 			let steeringMessagesFromExecution: AgentMessage[] | undefined;
 
-			// Detect empty "successful" responses (stopReason "stop" + empty content).
-			// Some proxies (e.g. LiteLLM) return this when the upstream model's context
-			// window is exceeded, fabricating a near-zero usage instead of surfacing an
-			// error. Without this guard the agent loop treats the empty response as a
-			// natural turn completion and stops, leaving the user with a frozen session.
-			// Promote it to an error so the overflow/compaction recovery path can fire.
-			if (message.stopReason === "stop" && message.content.length === 0 && isEmptyResponseOverflow(message)) {
+			// Preserve the historical public error conversion for unmanaged proxy overflows.
+			if (!config.fallbackManaged && message.stopReason === "stop" && message.content.length === 0 && overflow) {
 				message.stopReason = "error";
 				message.errorMessage = message.errorMessage
 					? `${message.errorMessage} | Provider returned an empty response with anomalously low token usage (possible context overflow via proxy)`

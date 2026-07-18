@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "story": "G003",
+  "suites": [
+    {
+      "command": "bun --cwd packages/coding-agent test test/g003-ws2-redteam.test.ts",
+      "status": "failed",
+      "passed": 6,
+      "failed": 1,
+      "assertions": 22,
+      "failure": "InputController.openCommandPalette() opens a new palette when isTranscriptViewerOpen() is true."
+    },
+    {
+      "command": "bun --cwd packages/coding-agent test test/command-palette.test.ts test/status-line-hints.test.ts",
+      "status": "passed",
+      "passed": 5,
+      "failed": 0,
+      "assertions": 20
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "palette-empty-disabled-rapid-close",
+      "verdict": "pass",
+      "evidence": "25 Escape cycles invoked cancellation 25 times; a zero-match Enter and a disabled-only row performed no selection and did not throw."
+    },
+    {
+      "id": "palette-rapid-open-escape-focus",
+      "verdict": "pass",
+      "evidence": "25 controller open/Escape cycles produced 25 overlay hides and 25 composer focus restorations."
+    },
+    {
+      "id": "palette-unicode-narrow-title",
+      "verdict": "pass",
+      "evidence": "The CJK query 設定 matched 設定を開く, and every rendered line for a long title at width 20 was at most 20 visible columns."
+    },
+    {
+      "id": "palette-nonempty-close-before-throw",
+      "verdict": "pass",
+      "evidence": "A draft composer displayed the empty-prompt guard. A throwing app.mode.cycle action recorded hide, composer focus, execute, then registry error reporting in that strict order."
+    },
+    {
+      "id": "palette-transcript-overlay-exclusivity",
+      "verdict": "fail",
+      "evidence": "With isTranscriptViewerOpen() returning true, openCommandPalette() still called ui.showOverlay once."
+    },
+    {
+      "id": "status-hints-zero-unbound-availability-flip",
+      "verdict": "pass",
+      "evidence": "Zero available/bound actions returned an empty segment; unbound app.mode.cycle was absent; changing availability immediately included the bound command-palette action."
+    },
+    {
+      "id": "status-hints-width-and-mode-cycle-availability",
+      "verdict": "pass",
+      "evidence": "At width 80 all emitted hints were complete bound hints within the width. app.mode.cycle was unavailable and did not execute when plan.enabled was false or goal mode was enabled."
+    }
+  ],
+  "blockers": [
+    {
+      "id": "G003-WS2-001",
+      "severity": "high",
+      "title": "Command palette stacks over an already-open transcript viewer",
+      "repro": "Run bun --cwd packages/coding-agent test test/g003-ws2-redteam.test.ts. The test 'does not open a palette over an active transcript overlay' fails: InputController.openCommandPalette() invokes ui.showOverlay even when ctx.isTranscriptViewerOpen() returns true."
+    }
+  ]
+}

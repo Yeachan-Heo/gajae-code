@@ -11,14 +11,19 @@
 //! Call order: construct, [`NotificationServer::on_reply`] (optional), then
 //! [`NotificationServer::start`]. `on_reply` must be registered before `start`.
 
-use std::path::PathBuf;
+use std::{
+	path::PathBuf,
+	sync::atomic::{AtomicU64, Ordering},
+};
 
 use gjc_sdk::{
 	ActionIdentity, ActionNeeded, ClientMessage, ControlServerConfig, ControlServerHandle,
 	LifecycleClientMessage, LifecycleServerMessage, ReplyAnswer, ServerConfig, ServerHandle,
 	ServerMessage, Verbosity,
 	actions::RetireIfUnclaimed,
-	protocol::{SessionReady, decode_workflow_gate_action_needed},
+	protocol::{
+		FileAttachment, SessionReady, TurnPhase, TurnStream, decode_workflow_gate_action_needed,
+	},
 	start_control,
 };
 use napi::{
@@ -28,6 +33,9 @@ use napi::{
 use napi_derive::napi;
 use parking_lot::Mutex;
 
+fn saturating_increment(counter: &AtomicU64) {
+	let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1));
+}
 /// Bound endpoint info returned from [`NotificationServer::start`].
 #[napi(object)]
 pub struct NotificationEndpoint {
@@ -116,31 +124,44 @@ impl From<gjc_sdk::protocol::AskSelectedAckOutcome> for AskSelectedAckOutcomeEve
 	}
 }
 
-/// An inbound message forwarded to the TypeScript host: a free-text injection,
-/// in-thread config command, or deterministic control command.
+/// An authenticated inbound message forwarded to the TypeScript host: free-text
+/// injection, ephemeral side-question request/cancel, in-thread config command,
+/// or deterministic control command.
 #[napi(object)]
 pub struct InboundEvent {
-	/// Inbound kind (`user_message`, `config_command`, or `control_command`).
-	pub kind:         String,
+	/// Inbound kind (`user_message`, `ephemeral_turn`,
+	/// `ephemeral_turn_cancel`, `config_command`, or `control_command`).
+	pub kind:          String,
+	/// Server-authenticated identity of the WebSocket connection that delivered
+	/// this event.
+	pub connection_id: String,
 	/// The session this inbound belongs to.
-	pub session_id:   String,
-	/// Free-text body (`user_message` only).
-	pub text:         Option<String>,
-	/// Telegram update id for dedupe (`user_message` only).
-	pub update_id:    Option<i64>,
-	/// Originating thread/topic id (`user_message` only).
-	pub thread_id:    Option<String>,
+	pub session_id:    String,
+	/// Free-text body (`user_message` or `ephemeral_turn` only).
+	pub text:          Option<String>,
+	/// Telegram update id for dedupe (`user_message`, `ephemeral_turn`, or
+	/// `ephemeral_turn_cancel` only).
+	pub update_id:     Option<i64>,
+	/// Originating thread/topic id (`user_message`, `ephemeral_turn`, or
+	/// `ephemeral_turn_cancel` only).
+	pub thread_id:     Option<String>,
+	/// Originating Telegram message id (`ephemeral_turn` and
+	/// `ephemeral_turn_cancel` only).
+	pub message_id:    Option<i64>,
 	/// Requested verbosity `"lean"|"verbose"` (`config_command` only).
-	pub verbosity:    Option<String>,
+	pub verbosity:     Option<String>,
 	/// Requested redaction state (`config_command` only).
-	pub redact:       Option<bool>,
-	/// Client-generated request id (`control_command` only).
-	pub request_id:   Option<String>,
+	pub redact:        Option<bool>,
+	/// Client-generated request id (`ephemeral_turn`, `ephemeral_turn_cancel`,
+	/// or `control_command` only).
+	pub request_id:    Option<String>,
+	/// Cancellation reason (`ephemeral_turn_cancel` only).
+	pub reason:        Option<String>,
 	/// JSON-encoded command payload (`control_command` only).
-	pub command_json: Option<String>,
+	pub command_json:  Option<String>,
 	/// Inline image attachments forwarded with the message (`user_message`
 	/// only).
-	pub images:       Option<Vec<InboundImageEvent>>,
+	pub images:        Option<Vec<InboundImageEvent>>,
 }
 
 /// One inline image attachment forwarded with an inbound user message.
@@ -168,18 +189,33 @@ type NegotiatedCapabilitiesFn = ThreadsafeFunction<(String, Vec<String>)>;
 /// In-process notification server handle exposed to TypeScript.
 #[napi]
 pub struct NotificationServer {
-	config:                     Mutex<Option<ServerConfig>>,
-	handle:                     Mutex<Option<ServerHandle>>,
+	config: Mutex<Option<ServerConfig>>,
+	handle: Mutex<Option<ServerHandle>>,
 	/// The one current presentation that may be retired only by its exact lease.
 	/// This is private routing state, never workflow-gate authority.
-	arbitrated_presentation:    Mutex<Option<ActionIdentity>>,
-	on_reply:                   Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
-	on_inbound:                 Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
-	on_frame:                   Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
+	arbitrated_presentation: Mutex<Option<ActionIdentity>>,
+	on_reply: Mutex<Option<ThreadsafeFunction<ReplyEvent>>>,
+	on_inbound: Mutex<Option<ThreadsafeFunction<InboundEvent>>>,
+	on_frame: Mutex<Option<ThreadsafeFunction<SdkFrameEvent>>>,
 	on_negotiated_capabilities: Mutex<Option<NegotiatedCapabilitiesFn>>,
-	on_connection_close:        Mutex<Option<ThreadsafeFunction<String>>>,
-	pump_tasks:                 Mutex<Vec<tokio::task::JoinHandle<()>>>,
-	stop_wait:                  tokio::sync::Mutex<()>,
+	on_connection_close: Mutex<Option<ThreadsafeFunction<String>>>,
+	pump_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+	stop_wait: tokio::sync::Mutex<()>,
+	known_good_turn_stream_frames: AtomicU64,
+	turn_stream_serde_validation_parses: AtomicU64,
+	file_attachment_base64_chars: AtomicU64,
+}
+
+/// Observable counters for the internal known-good N-API frame lane.
+#[napi(object)]
+pub struct KnownGoodFrameStats {
+	/// Frames constructed as `TurnStream` without parsing a JSON string.
+	pub known_good_turn_stream_frames:       f64,
+	/// JSON serde parses of externally supplied `turn_stream` frames.
+	pub turn_stream_serde_validation_parses: f64,
+	/// Base64 characters encoded in Rust for `file_attachment` frames (the JS
+	/// side crosses raw `Buffer` bytes and never allocates the base64 string).
+	pub file_attachment_rust_base64_chars:   f64,
 }
 
 #[napi]
@@ -202,16 +238,19 @@ impl NotificationServer {
 		// TS always owns gate resolution, so the core forwards replies.
 		config.forward_replies = true;
 		Self {
-			config:                     Mutex::new(Some(config)),
-			handle:                     Mutex::new(None),
-			arbitrated_presentation:    Mutex::new(None),
-			on_reply:                   Mutex::new(None),
-			on_inbound:                 Mutex::new(None),
-			on_frame:                   Mutex::new(None),
+			config: Mutex::new(Some(config)),
+			handle: Mutex::new(None),
+			arbitrated_presentation: Mutex::new(None),
+			on_reply: Mutex::new(None),
+			on_inbound: Mutex::new(None),
+			on_frame: Mutex::new(None),
 			on_negotiated_capabilities: Mutex::new(None),
-			on_connection_close:        Mutex::new(None),
-			pump_tasks:                 Mutex::new(Vec::new()),
-			stop_wait:                  tokio::sync::Mutex::new(()),
+			on_connection_close: Mutex::new(None),
+			pump_tasks: Mutex::new(Vec::new()),
+			stop_wait: tokio::sync::Mutex::new(()),
+			known_good_turn_stream_frames: AtomicU64::new(0),
+			turn_stream_serde_validation_parses: AtomicU64::new(0),
+			file_attachment_base64_chars: AtomicU64::new(0),
 		}
 	}
 
@@ -221,8 +260,9 @@ impl NotificationServer {
 		*self.on_reply.lock() = Some(callback);
 	}
 
-	/// Register the inbound-message callback (free-text injections and in-thread
-	/// config commands). Must be called before [`Self::start`].
+	/// Register the authenticated inbound-message callback (free-text,
+	/// side-question request/cancel, and in-thread config/control commands).
+	/// Must be called before [`Self::start`].
 	#[napi(ts_args_type = "callback: (err: null | Error, msg: InboundEvent) => void")]
 	pub fn on_inbound(&self, callback: ThreadsafeFunction<InboundEvent>) {
 		*self.on_inbound.lock() = Some(callback);
@@ -303,15 +343,20 @@ impl NotificationServer {
 		let inbound_rx = handle.take_inbound_receiver();
 		if let (Some(tsfn), Some(mut rx)) = (inbound_tsfn, inbound_rx) {
 			let task = napi::tokio::spawn(async move {
-				while let Some(msg) = rx.recv().await {
+				while let Some(gjc_sdk::server::InboundMessage { connection_id, message: msg }) =
+					rx.recv().await
+				{
 					let event = match msg {
 						ClientMessage::UserMessage(u) => InboundEvent {
-							kind:         "user_message".to_owned(),
-							session_id:   u.session_id,
-							text:         Some(u.text),
-							update_id:    u.update_id,
-							thread_id:    u.thread_id,
-							images:       if u.images.is_empty() {
+							connection_id,
+							kind: "user_message".to_owned(),
+							session_id: u.session_id,
+							text: Some(u.text),
+							update_id: u.update_id,
+							thread_id: u.thread_id,
+							message_id: None,
+							reason: None,
+							images: if u.images.is_empty() {
 								None
 							} else {
 								Some(
@@ -321,39 +366,49 @@ impl NotificationServer {
 										.collect(),
 								)
 							},
-							verbosity:    None,
-							redact:       None,
-							request_id:   None,
+							verbosity: None,
+							redact: None,
+							request_id: None,
 							command_json: None,
 						},
+						ClientMessage::EphemeralTurn(turn) => ephemeral_turn_event(connection_id, turn),
+						ClientMessage::EphemeralTurnCancel(cancel) => {
+							ephemeral_turn_cancel_event(connection_id, cancel)
+						},
 						ClientMessage::ConfigCommand(c) => InboundEvent {
-							kind:         "config_command".to_owned(),
-							session_id:   c.session_id,
-							text:         None,
-							update_id:    None,
-							thread_id:    None,
-							verbosity:    c.verbosity.map(|v| match v {
+							connection_id,
+							kind: "config_command".to_owned(),
+							session_id: c.session_id,
+							text: None,
+							update_id: None,
+							thread_id: None,
+							message_id: None,
+							reason: None,
+							verbosity: c.verbosity.map(|v| match v {
 								Verbosity::Lean => "lean".to_owned(),
 								Verbosity::Verbose => "verbose".to_owned(),
 							}),
-							redact:       c.redact,
-							request_id:   None,
+							redact: c.redact,
+							request_id: None,
 							command_json: None,
-							images:       None,
+							images: None,
 						},
 						ClientMessage::ControlCommand(c) => InboundEvent {
-							kind:         "control_command".to_owned(),
-							session_id:   c.session_id,
-							text:         None,
-							update_id:    c.update_id,
-							thread_id:    c.thread_id,
-							verbosity:    None,
-							redact:       None,
-							request_id:   Some(c.request_id),
+							connection_id,
+							kind: "control_command".to_owned(),
+							session_id: c.session_id,
+							text: None,
+							update_id: c.update_id,
+							thread_id: c.thread_id,
+							message_id: None,
+							reason: None,
+							verbosity: None,
+							redact: None,
+							request_id: Some(c.request_id),
 							command_json: Some(
 								serde_json::to_string(&c.command).unwrap_or_else(|_| "null".to_owned()),
 							),
-							images:       None,
+							images: None,
 						},
 						_ => continue,
 					};
@@ -524,8 +579,8 @@ impl NotificationServer {
 
 	/// Broadcast an ephemeral threaded-session frame. `frame_json` is a JSON
 	/// `ServerMessage` (e.g. `identity_header`, `context_update`, `turn_stream`,
-	/// `image_attachment`, `session_closed`, `config_update`, `hello`). Not
-	/// buffered for replay.
+	/// `ephemeral_turn_result`, `image_attachment`, `session_closed`,
+	/// `config_update`, `hello`). Not buffered for replay.
 	///
 	/// # Errors
 	/// Fails if not started or `frame_json` is not a valid `ServerMessage`.
@@ -537,9 +592,86 @@ impl NotificationServer {
 		// N-API `index.d.ts` signature/docs remain byte-stable for issue #2029.
 		let msg: ServerMessage = serde_json::from_str(&frame_json)
 			.map_err(|e| Error::from_reason(format!("invalid frame json: {e}")))?;
+		if matches!(msg, ServerMessage::TurnStream(_)) {
+			saturating_increment(&self.turn_stream_serde_validation_parses);
+		}
 		self
 			.with_handle(|h| h.push_frame(msg))?
 			.map_err(|error| Error::from_reason(error.to_string()))
+	}
+
+	/// Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
+	/// External frames must continue through [`Self::push_frame`] for serde
+	/// validation.
+	#[napi]
+	pub fn push_turn_stream_unchecked(
+		&self,
+		session_id: String,
+		phase: String,
+		text: String,
+		final_answer: Option<bool>,
+		message_ref: Option<String>,
+	) -> Result<()> {
+		let phase = match phase.as_str() {
+			"live" => TurnPhase::Live,
+			"finalized" => TurnPhase::Finalized,
+			_ => return Err(Error::from_reason("invalid turn stream phase")),
+		};
+		saturating_increment(&self.known_good_turn_stream_frames);
+		self
+			.with_handle(|h| {
+				h.push_frame(ServerMessage::TurnStream(TurnStream {
+					session_id,
+					phase,
+					text,
+					final_answer,
+					message_ref,
+				}))
+			})?
+			.map_err(|error| Error::from_reason(error.to_string()))
+	}
+
+	/// Broadcast a file attachment from raw N-API bytes, encoding the unchanged
+	/// base64 wire field only in Rust.
+	#[napi]
+	pub fn push_file_attachment_unchecked(
+		&self,
+		session_id: String,
+		name: String,
+		mime: Option<String>,
+		data: Buffer,
+		caption: Option<String>,
+	) -> Result<()> {
+		self
+			.with_handle(|h| {
+				h.push_frame(ServerMessage::FileAttachment(FileAttachment {
+					session_id,
+					name,
+					mime,
+					data: encode_base64(&data, &self.file_attachment_base64_chars),
+					caption,
+				}))
+			})?
+			.map_err(|error| Error::from_reason(error.to_string()))
+	}
+
+	/// Return counters guarding the known-good frame crossing against
+	/// regressions.
+	#[napi]
+	#[must_use]
+	pub fn known_good_frame_stats(&self) -> KnownGoodFrameStats {
+		let known_good_turn_stream_frames =
+			self.known_good_turn_stream_frames.load(Ordering::Relaxed);
+		let turn_stream_serde_validation_parses = self
+			.turn_stream_serde_validation_parses
+			.load(Ordering::Relaxed);
+		let file_attachment_rust_base64_chars =
+			self.file_attachment_base64_chars.load(Ordering::Relaxed);
+		KnownGoodFrameStats {
+			known_good_turn_stream_frames:       known_good_turn_stream_frames as f64,
+			turn_stream_serde_validation_parses: turn_stream_serde_validation_parses as f64,
+			file_attachment_rust_base64_chars:   file_attachment_rust_base64_chars as f64,
+		}
 	}
 
 	/// Send a validated, bounded JSON envelope to one connected v3 SDK client.
@@ -937,6 +1069,47 @@ impl NotificationControlServer {
 	}
 }
 
+fn ephemeral_turn_event(
+	connection_id: String,
+	turn: gjc_sdk::protocol::EphemeralTurn,
+) -> InboundEvent {
+	InboundEvent {
+		connection_id,
+		kind: "ephemeral_turn".to_owned(),
+		session_id: turn.session_id,
+		text: Some(turn.question),
+		update_id: Some(turn.update_id),
+		thread_id: Some(turn.thread_id),
+		message_id: Some(turn.message_id),
+		verbosity: None,
+		redact: None,
+		request_id: Some(turn.request_id),
+		reason: None,
+		command_json: None,
+		images: None,
+	}
+}
+
+fn ephemeral_turn_cancel_event(
+	connection_id: String,
+	cancel: gjc_sdk::protocol::EphemeralTurnCancel,
+) -> InboundEvent {
+	InboundEvent {
+		connection_id,
+		kind: "ephemeral_turn_cancel".to_owned(),
+		session_id: cancel.session_id,
+		text: None,
+		update_id: Some(cancel.update_id),
+		thread_id: Some(cancel.thread_id),
+		message_id: Some(cancel.message_id),
+		verbosity: None,
+		redact: None,
+		request_id: Some(cancel.request_id),
+		reason: Some("daemon_shutdown".to_owned()),
+		command_json: None,
+		images: None,
+	}
+}
 fn presentation_lease(identity: Option<ActionIdentity>) -> Result<PresentationLease> {
 	let identity =
 		identity.ok_or_else(|| Error::from_reason("action registration did not produce a lease"))?;
@@ -970,6 +1143,55 @@ fn ensure_not_current_arbitrated_presentation(
 #[cfg(test)]
 mod tests {
 	use super::{ActionIdentity, PresentationLease, ensure_not_current_arbitrated_presentation};
+
+	#[test]
+	fn ephemeral_turn_mapping_preserves_question_and_tuple_without_token() {
+		let event =
+			super::ephemeral_turn_event("connection-1".to_owned(), gjc_sdk::protocol::EphemeralTurn {
+				session_id: "session".to_owned(),
+				token:      "secret".to_owned(),
+				request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
+				update_id:  7,
+				message_id: 9,
+				thread_id:  "11".to_owned(),
+				question:   "What changed?".to_owned(),
+			});
+		assert_eq!(event.connection_id, "connection-1");
+		assert_eq!(event.kind, "ephemeral_turn");
+		assert_eq!(event.session_id, "session");
+		assert_eq!(event.text.as_deref(), Some("What changed?"));
+		assert_eq!(event.request_id.as_deref(), Some("btw:123e4567-e89b-42d3-a456-426614174000"));
+		assert_eq!(event.update_id, Some(7));
+		assert_eq!(event.message_id, Some(9));
+		assert_eq!(event.thread_id.as_deref(), Some("11"));
+		assert_eq!(event.reason, None);
+		assert_eq!(event.command_json, None);
+		assert!(event.images.is_none());
+	}
+	#[test]
+	fn ephemeral_turn_cancel_mapping_preserves_tuple_without_token_or_question() {
+		let event = super::ephemeral_turn_cancel_event(
+			"connection-2".to_owned(),
+			gjc_sdk::protocol::EphemeralTurnCancel {
+				session_id: "session".to_owned(),
+				token:      "secret".to_owned(),
+				request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
+				update_id:  7,
+				message_id: 9,
+				thread_id:  "11".to_owned(),
+				reason:     gjc_sdk::protocol::EphemeralTurnCancelReason::DaemonShutdown,
+			},
+		);
+		assert_eq!(event.connection_id, "connection-2");
+		assert_eq!(event.kind, "ephemeral_turn_cancel");
+		assert_eq!(event.session_id, "session");
+		assert_eq!(event.request_id.as_deref(), Some("btw:123e4567-e89b-42d3-a456-426614174000"));
+		assert_eq!(event.update_id, Some(7));
+		assert_eq!(event.message_id, Some(9));
+		assert_eq!(event.thread_id.as_deref(), Some("11"));
+		assert_eq!(event.reason.as_deref(), Some("daemon_shutdown"));
+		assert_eq!(event.text, None);
+	}
 
 	#[test]
 	fn exact_arbitrated_presentation_blocks_local_and_client_id_only_resolution() {
@@ -1126,4 +1348,30 @@ fn parse_reason(reason: Option<&str>) -> gjc_sdk::RejectReason {
 		Some("unauthorized") => RejectReason::Unauthorized,
 		_ => RejectReason::InvalidAnswer,
 	}
+}
+
+/// Encode bytes for the unchanged JSON WebSocket wire schema without allocating
+/// a JavaScript base64 string at the N-API boundary.
+fn encode_base64(bytes: &[u8], chars_counter: &AtomicU64) -> String {
+	const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+	for chunk in bytes.chunks(3) {
+		let first = chunk[0];
+		let second = *chunk.get(1).unwrap_or(&0);
+		let third = *chunk.get(2).unwrap_or(&0);
+		encoded.push(char::from(TABLE[usize::from(first >> 2)]));
+		encoded.push(char::from(TABLE[usize::from((first & 0b0000_0011) << 4 | second >> 4)]));
+		encoded.push(if chunk.len() > 1 {
+			char::from(TABLE[usize::from((second & 0b0000_1111) << 2 | third >> 6)])
+		} else {
+			'='
+		});
+		encoded.push(if chunk.len() > 2 {
+			char::from(TABLE[usize::from(third & 0b0011_1111)])
+		} else {
+			'='
+		});
+	}
+	chars_counter.fetch_add(encoded.len() as u64, Ordering::Relaxed);
+	encoded
 }

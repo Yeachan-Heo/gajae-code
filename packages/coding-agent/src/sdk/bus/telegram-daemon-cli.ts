@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patch";
 import type { Settings } from "../../config/settings";
@@ -7,8 +8,7 @@ import {
 	getNotificationConfig,
 	isTelegramConfigured,
 	type NotificationSettingsReader,
-	type NotificationSettingsSnapshot,
-	readTelegramActivationMarkers,
+	parseNotificationSettingsSnapshot,
 } from "./config";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import {
@@ -53,68 +53,21 @@ function argValue(argv: string[], name: string): string | undefined {
 	const i = argv.indexOf(name);
 	return i >= 0 ? argv[i + 1] : undefined;
 }
-
-function getByPath(obj: unknown, pathSegments: string[]): unknown {
-	let current = obj;
-	for (const segment of pathSegments) {
-		if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
-		current = (current as Record<string, unknown>)[segment];
-	}
-	return current;
-}
-
-function asString(value: unknown): string | undefined {
-	return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function asBoolean(value: unknown, fallback: boolean): boolean {
-	return typeof value === "boolean" ? value : fallback;
-}
-
-function asIdleTimeoutMs(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 60_000;
+const DAEMON_COMPATIBILITY_DIAGNOSTIC_LIMIT = 1;
+let daemonCompatibilityDiagnosticCount = 0;
+function recordDaemonCompatibilityDiagnostic(message: string): void {
+	if (daemonCompatibilityDiagnosticCount >= DAEMON_COMPATIBILITY_DIAGNOSTIC_LIMIT) return;
+	daemonCompatibilityDiagnosticCount++;
+	logger.warn(message);
 }
 
 export function createLightweightDaemonSettings(input: {
 	agentDir: string;
 	rawConfig?: unknown;
 }): LightweightDaemonSettings {
-	const rawConfig = input.rawConfig && typeof input.rawConfig === "object" ? input.rawConfig : {};
-	const activation = readTelegramActivationMarkers(getByPath(rawConfig, ["notifications", "telegram", "activation"]));
-	const getNotificationSettingsSnapshot = (): NotificationSettingsSnapshot => ({
-		enabled: asBoolean(getByPath(rawConfig, ["notifications", "enabled"]), false),
-		telegram: {
-			botToken: asString(getByPath(rawConfig, ["notifications", "telegram", "botToken"])),
-			chatId: asString(getByPath(rawConfig, ["notifications", "telegram", "chatId"])),
-			...(Object.keys(activation).length === 0 ? {} : { activation }),
-			rich: {
-				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "rich", "enabled"]), true),
-			},
-			richDraft: {
-				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "richDraft", "enabled"]), false),
-			},
-			topics: {
-				nameTemplate: asString(getByPath(rawConfig, ["notifications", "telegram", "topics", "nameTemplate"])),
-			},
-		},
-		discord: {
-			botToken: asString(getByPath(rawConfig, ["notifications", "discord", "botToken"])),
-			applicationId: asString(getByPath(rawConfig, ["notifications", "discord", "applicationId"])),
-			guildId: asString(getByPath(rawConfig, ["notifications", "discord", "guildId"])),
-			parentChannelId: asString(getByPath(rawConfig, ["notifications", "discord", "parentChannelId"])),
-		},
-		slack: {
-			botToken: asString(getByPath(rawConfig, ["notifications", "slack", "botToken"])),
-			appToken: asString(getByPath(rawConfig, ["notifications", "slack", "appToken"])),
-			workspaceId: asString(getByPath(rawConfig, ["notifications", "slack", "workspaceId"])),
-			channelId: asString(getByPath(rawConfig, ["notifications", "slack", "channelId"])),
-			authorizedUserId: asString(getByPath(rawConfig, ["notifications", "slack", "authorizedUserId"])),
-		},
-		redact: asBoolean(getByPath(rawConfig, ["notifications", "redact"]), false),
-		verbosity: getByPath(rawConfig, ["notifications", "verbosity"]) === "verbose" ? "verbose" : "lean",
-		sessionScope: getByPath(rawConfig, ["notifications", "sessionScope"]) === "primary" ? "primary" : "all",
-		idleTimeoutMs: asIdleTimeoutMs(getByPath(rawConfig, ["notifications", "daemon", "idleTimeoutMs"])),
-	});
+	const rawConfig = input.rawConfig === undefined ? {} : input.rawConfig;
+	const getNotificationSettingsSnapshot = () => parseNotificationSettingsSnapshot(rawConfig);
+	getNotificationSettingsSnapshot();
 
 	return {
 		get(pathName: string): unknown {
@@ -126,6 +79,8 @@ export function createLightweightDaemonSettings(input: {
 					return snapshot.telegram.botToken;
 				case "notifications.telegram.chatId":
 					return snapshot.telegram.chatId;
+				case "notifications.telegram.btw.enabled":
+					return snapshot.telegram.btw.enabled;
 				case "notifications.discord.botToken":
 					return snapshot.discord.botToken;
 				case "notifications.discord.applicationId":
@@ -243,7 +198,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const ownerId = argValue(argv, "--owner-id");
 	if (!ownerId) throw new Error("missing --owner-id");
 	if (!ownerProcessIsAlive(ownerId, deps)) {
-		process.stderr.write(`GJC notify daemon exiting: owner process from --owner-id ${ownerId} is not alive.\n`);
+		recordDaemonCompatibilityDiagnostic("GJC notify daemon exiting because its owner is not alive");
 		return;
 	}
 	const resolvedAgentDir = agentDir ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
@@ -261,6 +216,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		rich: cfg.rich,
 		richDraft: cfg.richDraft,
 		topics: cfg.topics,
+		btw: cfg.btw,
 		pid: deps.processPid ?? process.pid,
 		control: {
 			shouldStop: async owner => {

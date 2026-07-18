@@ -36,7 +36,7 @@
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `action` | `"open" \| "close" \| "run"` | Yes | Dispatches to the open/close/run path. |
+| `action` | `"open" \| "close" \| "act" \| "run"` | Yes | Dispatches to the open/close/act/run path. |
 | `name` | `string` | No | Tab id. Defaults to `"main"`. Tabs live in a process-global map, so the same name is reused across later calls and in-process subagents until closed. |
 | `timeout` | `number` | No | Tool wall-clock timeout in seconds. Defaults to `30`; clamped to the browser tool range before execution. |
 
@@ -63,6 +63,12 @@
 | --- | --- | --- | --- |
 | `code` | `string` | Yes | Async-function body executed in a VM context with `page`, `browser`, `tab`, `display`, `assert`, `wait`, `console`, timers, `URL`, `TextEncoder`, `TextDecoder`, and `Buffer` in scope. |
 
+### `action: "act"`
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `actions` | non-empty `Array<ActionStep>` | Yes | Structured, ordered interaction steps. Prefer this to `run` for routine navigation and interaction. Verbs: `navigate`, `click`, `type`, `fill`, `select`, `press`, `scroll`, `back`, `wait`, `observe`, `extract`, `screenshot`. `click`/`type` accept an observed numeric `id` or selector; `fill`/`select` require selectors. |
+
 ## Outputs
 The tool returns one result per call; no streaming partial output is emitted from the browser implementation itself.
 
@@ -72,15 +78,16 @@ The tool returns one result per call; no streaming partial output is emitted fro
   1. every `display(value)` call in execution order,
   2. final return value, JSON-stringified unless already a string,
   3. or `Ran code on tab "..."` if nothing else was produced.
+- `act`: the same ordered `content` shape, with per-step results as the final JSON return value, or `Ran <n> action(s) on tab "..."` if no step produced content.
 - `display(value)` coercion in `packages/coding-agent/src/tools/browser/tab-worker.ts`:
   - `{ type: "image", data: string, mimeType: string }` becomes image content,
   - `string` becomes text content,
   - other values become pretty JSON text when serializable, else `String(value)`.
 - `tab.screenshot()` also appends text plus an image content item unless `silent: true`; `details.screenshots` records persisted screenshot metadata `{ dest, mimeType, bytes, width, height }`.
-- `run` `details` includes `action`, `name`, current `browser`/`url` when the tab exists, optional `screenshots`, and `details.result` containing only the concatenated text outputs.
+- `run` and `act` `details` include `action`, `name`, current `browser`/`url` when the tab exists, optional `screenshots`, and `details.result` containing only concatenated text outputs.
 
 ## Flow
-1. `BrowserTool.execute()` (`packages/coding-agent/src/tools/browser.ts`) abort-checks, clamps `timeout` via `clampTimeout("browser", ...)`, defaults `name` to `"main"`, and dispatches on `action`.
+1. `BrowserTool.execute()` (`packages/coding-agent/src/tools/browser.ts`) abort-checks, clamps `timeout` via `clampTimeout("browser", ...)`, defaults `name` to `"main"`, and dispatches `open`, `close`, `act`, or `run`.
 2. `open` resolves browser kind with `resolveBrowserKind()`:
    - `app.cdp_url` → `{ kind: "connected" }` after trimming trailing slashes.
    - `app.browser: "chrome"` → `{ kind: "chrome-profile" }` after resolving `path` and `user_data_dir` against session cwd and copying `profile_directory`, `background`, `no_focus`, and optional `cdp_port`.
@@ -128,10 +135,12 @@ Use this mode when automation needs cookies and login state from a saved Chrome 
 Security and lifecycle rules:
 
 - CDP is bound to `127.0.0.1`; do not expose logged-in profile CDP ports on a public interface. A CDP client has full browser-account access.
+- Saved-profile and attached-CDP automation can read and act with that profile's cookies and authenticated accounts. Use it only when that credentialed access is intentional.
+- Never use generic `app.path` spawning for a daily Chrome profile: it may kill stale same-path processes. Use explicit `app.browser: "chrome"` profile mode, which applies the ownership guards below.
 - A matching already-running profile is reused only when its localhost CDP endpoint responds. A matching profile running normally without CDP is refused with remediation text; GJC does not kill or relaunch it.
 - `background` and `no_focus` add Chromium's `--no-startup-window` launch guard. Focus avoidance is best-effort and platform-dependent; already-visible Chrome windows can still be selected by `target` but are not OS-keyboard/mouse driven.
 - Cleanup disconnects externally-owned CDP endpoints. `kill: true` terminates only the Chrome profile process that GJC launched for this mode.
-10. `run` requires non-empty `code`, looks up the tab with `getTab()`, then delegates to `runInTab()`.
+10. `run` requires non-empty `code`; `act` requires non-empty `actions`, validates and compiles them into injection-safe JSON-parsed code, then both delegate to `runInTab()`.
 11. `runInTabWithSnapshot()` rejects dead tabs and concurrent runs (`Tab ... is busy`), captures session cwd plus optional `browser.screenshotDir`, registers an abort hook, sends a `run` message to the worker, and races the result against `timeoutMs + 750` ms. Timeouts force-kill the tab worker and, for headless tabs, close the orphaned page target.
 12. `WorkerCore.#run()` creates a VM context, exposes the raw Puppeteer `page`/`browser` plus a synthetic `tab` API, and executes `(async () => { ...code... })()` via `vm.runInContext()`.
 13. The `tab` helper API implemented in `#createTabApi()` is:
@@ -171,6 +180,7 @@ Security and lifecycle rules:
 - **Action dispatch**
   - `open` — acquire/reuse browser + tab.
   - `close` — release one tab or all tabs.
+  - `act` — validate and run structured interaction steps; preferred for routine navigation and interaction.
   - `run` — execute JS inside the tab worker.
 - **Browser kind**
   - **Headless**: launches local Chromium with Puppeteer, applies stealth patches, and creates a fresh page per tab.

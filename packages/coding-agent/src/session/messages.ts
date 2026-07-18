@@ -32,25 +32,42 @@ import type { OutputMeta } from "../tools/output-meta";
 import { formatOutputNotice } from "../tools/output-meta";
 
 /**
- * Encode untrusted values embedded in prompt markup. Control and bidi characters
- * become visible escape sequences so they cannot alter markup structure or display.
+ * Encode untrusted values embedded in prompt markup. Control and bidi characters become visible
+ * escape sequences so they cannot alter markup structure or display. Isolated UTF-16 surrogates
+ * are also escaped; valid Unicode pairs remain intact.
  */
 export function escapePromptMetadata(value: string, options: { preserveNewlines?: boolean } = {}): string {
-	return value.replace(/[&<>"\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/g, char => {
-		if (options.preserveNewlines && (char === "\n" || char === "\t")) return char;
-		switch (char) {
-			case "&":
-				return "&amp;";
-			case "<":
-				return "&lt;";
-			case ">":
-				return "&gt;";
-			case '"':
-				return "&quot;";
-			default:
-				return `\\u${char.codePointAt(0)!.toString(16).padStart(4, "0")}`;
-		}
-	});
+	return value.replace(
+		/[&<>"\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/g,
+		(char, offset) => {
+			const code = char.charCodeAt(0);
+			if (
+				(code >= 0xd800 &&
+					code <= 0xdbff &&
+					value.charCodeAt(offset + 1) >= 0xdc00 &&
+					value.charCodeAt(offset + 1) <= 0xdfff) ||
+				(code >= 0xdc00 &&
+					code <= 0xdfff &&
+					value.charCodeAt(offset - 1) >= 0xd800 &&
+					value.charCodeAt(offset - 1) <= 0xdbff)
+			) {
+				return char;
+			}
+			if (options.preserveNewlines && (char === "\n" || char === "\t")) return char;
+			switch (char) {
+				case "&":
+					return "&amp;";
+				case "<":
+					return "&lt;";
+				case ">":
+					return "&gt;";
+				case '"':
+					return "&quot;";
+				default:
+					return `\\u${code.toString(16).padStart(4, "0")}`;
+			}
+		},
+	);
 }
 export const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
 
@@ -136,6 +153,55 @@ function getPrunedToolResultContent(message: ToolResultMessage): (TextContent | 
 	const textBlocks = message.content.filter((content): content is TextContent => content.type === "text");
 	const text = textBlocks.map(block => block.text).join("") || "[Output truncated]";
 	return [{ type: "text", text }];
+}
+
+export const PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES = 4096;
+export const PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES = 4096;
+
+function utf8Prefix(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text, "utf-8") <= maxBytes) return text;
+	let bytes = 0;
+	let end = 0;
+	for (const character of text) {
+		const characterBytes = Buffer.byteLength(character, "utf-8");
+		if (bytes + characterBytes > maxBytes) break;
+		bytes += characterBytes;
+		end += character.length;
+	}
+	return text.slice(0, end);
+}
+
+function utf8Suffix(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text, "utf-8") <= maxBytes) return text;
+	let bytes = 0;
+	let retainedStart = text.length;
+	for (let index = text.length; index > 0; ) {
+		let characterStart = --index;
+		const codeUnit = text.charCodeAt(characterStart);
+		if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff && characterStart > 0) characterStart--;
+		const character = text.slice(characterStart, index + 1);
+		const characterBytes = Buffer.byteLength(character, "utf-8");
+		if (bytes + characterBytes > maxBytes) break;
+		bytes += characterBytes;
+		retainedStart = characterStart;
+		index = characterStart;
+	}
+	return text.slice(retainedStart);
+}
+
+/**
+ * Build the deterministic inline receipt for a tool result saved before the
+ * next provider context is constructed. Byte boundaries never split UTF-8
+ * code points, so head/tail recovery remains readable for emoji and CJK text.
+ */
+export function createPreAdmissionArtifactSpillPreview(fullText: string, artifactId: string, digest: string): string {
+	const totalBytes = Buffer.byteLength(fullText, "utf-8");
+	const head = utf8Prefix(fullText, PRE_ADMISSION_ARTIFACT_SPILL_HEAD_BYTES);
+	const tail = utf8Suffix(fullText, PRE_ADMISSION_ARTIFACT_SPILL_TAIL_BYTES);
+	const retainedBytes = Buffer.byteLength(head, "utf-8") + Buffer.byteLength(tail, "utf-8");
+	const omittedBytes = Math.max(0, totalBytes - retainedBytes);
+	const receipt = `[${omittedBytes} bytes omitted; sha256:${digest}; full output: artifact://${artifactId}]`;
+	return `${head}\n\n${receipt}\n\n${tail}`;
 }
 
 /**
@@ -392,7 +458,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					const fileContents = m.files
 						.map(file => {
 							const inner = file.content
-								? `\n${file.content.replace(/<\/system-reminder>/gi, "&lt;/system-reminder>")}\n`
+								? `\n${escapePromptMetadata(file.content, { preserveNewlines: true })}\n`
 								: "\n";
 							return `<file path="${escapePromptMetadata(file.path)}">${inner}</file>`;
 						})

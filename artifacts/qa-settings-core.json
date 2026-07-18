@@ -1,0 +1,86 @@
+{
+ "schemaVersion": 1,
+ "kind": "api-package-test-report",
+ "commit": "c430291c",
+ "commands": [
+  {
+   "command": "bun test packages/coding-agent/test/settings-manager.test.ts packages/coding-agent/test/settings-global-model-role-flush.test.ts packages/coding-agent/test/settings-retry-fallback-migration.test.ts packages/coding-agent/test/config-cli.test.ts packages/coding-agent/test/config/atomic-yaml-patch.test.ts",
+   "exitCode": 0,
+   "observed": "65 pass, 0 fail, 168 assertions"
+  },
+  {
+   "command": "bun test packages/coding-agent/test/agent-session-default-model-selection.test.ts",
+   "exitCode": 1,
+   "observed": "35 pass, 6 fail; all failures reject /var as an unsafe reparse storage path"
+  },
+  {
+   "command": "TMPDIR=/private/tmp bun test packages/coding-agent/test/agent-session-default-model-selection.test.ts",
+   "exitCode": 1,
+   "observed": "35 pass, 6 fail; all failures reject temporary files with acl_unavailable"
+  },
+  {
+   "command": "git worktree add --detach /private/tmp/gjc-settings-core-origin-dev origin/dev && TMPDIR=/private/tmp bun test packages/coding-agent/test/agent-session-default-model-selection.test.ts",
+   "exitCode": 1,
+   "observed": "origin/dev 9303340f reproduces the same 35 pass, 6 acl_unavailable failures; temporary worktree was removed"
+  },
+  {
+   "command": "bun -e 'reconcileSettingsSchema(...)'",
+   "exitCode": 0,
+   "observed": "custom modelRoles member produces no unknown issue; boolean string is coerced/reported; invalid boolean is reported"
+  },
+  {
+   "command": "bun -e 'applyAtomicYamlPatches receipt restore adversarial replay'",
+   "exitCode": 0,
+   "observed": "sibling role edit survived restore; same-path third write produced conflict on modelRoles.default"
+  },
+  {
+   "command": "git diff --exit-code origin/dev -- packages/coding-agent/src/config/atomic-yaml-patch.ts",
+   "exitCode": 1,
+   "observed": "60-line diff: 55 insertions, 5 deletions"
+  }
+ ],
+ "cases": [
+  {
+   "id": "v0-ask-timeout-migrates-once",
+   "verdict": "passed",
+   "evidence": "settings-manager test migrates ask.timeout 30000 to 30, writes configSchemaVersion 1, then reloads without re-migration."
+  },
+  {
+   "id": "open-record-members-excluded-from-unknown-report",
+   "verdict": "passed",
+   "evidence": "reconcileSettingsSchema({modelRoles:{custom:'vendor/model'}}) returned issues: []."
+  },
+  {
+   "id": "invalid-and-coerced-values-reported-at-startup-and-doctor",
+   "verdict": "passed",
+   "evidence": "Direct reconciliation reports coerced notifications.enabled='false' and invalid notifications.enabled='invalid'; config-cli doctor JSON test asserts the invalid report."
+  },
+  {
+   "id": "two-process-atomic-cas-conflict",
+   "verdict": "passed",
+   "evidence": "settings-global-model-role-flush suite passed its two-process race: one winner, typed AtomicYamlConflictError loser, no loser clobber."
+  },
+  {
+   "id": "path-scoped-receipt-restore",
+   "verdict": "passed",
+   "evidence": "Direct receipt replay preserved modelRoles.planner concurrent-sibling, restored modelRoles.default, then returned conflict paths:[modelRoles.default] after a third same-path write."
+  },
+  {
+   "id": "atomic-yaml-patch-unchanged-vs-dev",
+   "verdict": "failed",
+   "evidence": "git diff --exit-code origin/dev -- packages/coding-agent/src/config/atomic-yaml-patch.ts exited 1; source differs from origin/dev."
+  },
+  {
+   "id": "agent-session-default-model-selection-env-baseline",
+   "verdict": "environment-baseline",
+   "evidence": "Darwin /var unsafe-reparse failures and /private/tmp acl_unavailable failures reproduce unchanged on origin/dev 9303340f: 35 pass, 6 fail. Classified as requested; no production change made."
+  }
+ ],
+ "blockers": [],
+ "status": "passed",
+ "e2eStatus": "passed",
+ "redTeamStatus": "passed",
+ "notes": [
+  "Correction by leader: the non-empty git diff of atomic-yaml-patch.ts vs origin/dev is the #2368 deliverable itself (additive expected-hash CAS preconditions: AtomicYamlExpectedPrecondition, atomicYamlPathHash, precondition check in applyPatchesUnderLock, typed AtomicYamlConflictError), 55 insertions/5 deletions with no wholesale rewrite. The original QA instruction demanding an empty diff was erroneous; the actual constraint is 'do not rewrite atomic-yaml-patch', which is satisfied. All behavioral adversarial cases passed."
+ ]
+}

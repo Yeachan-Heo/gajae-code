@@ -13,6 +13,14 @@ Execution may be in fresh context. Treat the finalized plan as the source of tru
 
 {{planContent}}
 
+{{#if reviewerComments}}
+## Reviewer comments
+
+These comments are guidance to apply during implementation; they do not reopen planning.
+
+{{reviewerComments}}
+{{/if}}
+
 <instruction>
 You MUST execute this plan step by step from `{{finalPlanFilePath}}`. You have full tool access.
 You MUST verify each step before proceeding to the next.

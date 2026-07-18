@@ -12,7 +12,6 @@ import type {
 } from "../extensibility/extensions";
 import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
-import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { MCPManager } from "../runtime-mcp";
 import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
@@ -121,10 +120,6 @@ export interface InteractiveModeContext {
 	isBashNoContext: boolean;
 	toolOutputExpanded: boolean;
 	todoExpanded: boolean;
-	planModeEnabled: boolean;
-	goalModeEnabled: boolean;
-	goalModePaused: boolean;
-	planModePlanFilePath?: string;
 	hideThinkingBlock: boolean;
 	pendingImages: ImageContent[];
 	compactionQueuedMessages: CompactionQueuedMessage[];
@@ -189,7 +184,6 @@ export interface InteractiveModeContext {
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void;
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
-	flushPendingModelSwitch(): Promise<void>;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
 	ensureLoadingAnimation(): void;
@@ -297,7 +291,10 @@ export interface InteractiveModeContext {
 		customInstructionsOrOptions?: string | CompactOptions,
 		isAuto?: boolean,
 	): Promise<CompactionOutcome>;
+
 	openInBrowser(urlOrPath: string): void;
+	/** Resolved source of truth for slash autocomplete and command palette entries. */
+	getSlashCommands?(): readonly SlashCommand[];
 	refreshSlashCommandState(cwd?: string): Promise<void>;
 
 	// Selector handling
@@ -319,6 +316,7 @@ export interface InteractiveModeContext {
 	showUserMessageSelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(): void;
+	showSessionsDashboard(): void;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string, options?: OAuthSelectorOptions): Promise<void>;
@@ -326,6 +324,10 @@ export interface InteractiveModeContext {
 	showDebugSelector(): void;
 	showSessionObserver(): void;
 	showJobsOverlay(): void;
+	showTasksPane(): void;
+	showTranscriptViewer(): void;
+	isTranscriptViewerOpen(): boolean;
+	refreshTranscriptViewer(): void;
 	resetObserverRegistry(): void;
 
 	// Input handling
@@ -345,9 +347,6 @@ export interface InteractiveModeContext {
 	toggleThinkingBlockVisibility(): void;
 	openExternalEditor(): void;
 	registerExtensionShortcuts(): void;
-	handlePlanModeCommand(initialPrompt?: string): Promise<void>;
-	handleGoalModeCommand(rest?: string): Promise<void>;
-	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;
 
 	// Hook UI methods
 	initHooksAndCustomTools(): Promise<void>;
@@ -355,6 +354,14 @@ export interface InteractiveModeContext {
 		reason: "start" | "switch" | "branch" | "tree" | "shutdown",
 		previousSessionFile?: string,
 	): Promise<void>;
+	planModeController: Pick<
+		import("./controllers/plan-mode-controller").PlanModeController,
+		"enabled" | "paused" | "planFilePath" | "handleCommand" | "handleApproval" | "flushPendingModelSwitch"
+	>;
+	goalModeController: Pick<
+		import("./controllers/goal-mode-controller").GoalModeController,
+		"enabled" | "paused" | "handleCommand"
+	>;
 	setHookWidget(key: string, content: ExtensionWidgetContent, options?: ExtensionWidgetOptions): void;
 	setHookStatus(key: string, text: string | undefined): void;
 	showHookSelector(

@@ -248,10 +248,18 @@ I'm reading this as {N} top-level component(s):
 1. {component_name}: {one_sentence_description}
 2. ...
 
-Is that topology right? Should any component be added, removed, merged, split, or explicitly deferred?
+Locked intent:
+- Artifacts: {category-prefixed IDs and concrete outputs}
+- Surfaces: {category-prefixed IDs and user-visible surfaces}
+- Integrations: {category-prefixed IDs and external/system boundaries}
+- Constraints: {category-prefixed IDs and user-locked constraints}
+
+Is that topology and locked intent right? Should any component or intent be added, removed, merged, split, or explicitly deferred?
 ```
 
 Options should include contextually relevant choices such as **Looks right**, **Add/remove/merge components**, **Defer one or more components**, plus free-text, translated/localized according to `language.instruction` when present. This is the only pre-scoring question and preserves the one-question-per-round rule.
+
+The Round 0 `ask` call MUST include `deepInterview.round = 0`, `deepInterview.component = "review-topology"`, `deepInterview.dimension = "topology"`, `deepInterview.intent_contract.items` containing the exact displayed locked-intent items, and `deepInterview.intent_contract.confirmation_options` listing only the displayed affirmative labels that lock the proposal (normally **Looks right**). The runtime recorder canonicalizes and locks this contract only when the user selects one of those labels; correction, deferral, free-text, and clarification answers never lock the pre-question proposal. Do not manually copy raw free text into intent evidence, and do not continue if this required recorder write fails.
 
 3. **Lock topology into state** after the answer. Store a normalized component list and confirmation timestamp:
 
@@ -287,6 +295,10 @@ Options should include contextually relevant choices such as **Looks right**, **
   }
 }
 ```
+
+In the same Round 0 answer, the runtime recorder persists `state.intent_contract` version 1 from `deepInterview.intent_contract.items`. It contains the four exact categories `artifact`, `surface`, `integration`, and `constraint`; every item has a unique category-prefixed ID (for example `surface:review`) and a bounded non-empty statement. The recorder canonically sorts items, persists the full SHA-256 manifest digest, and binds confirmation to a redacted answer-hash reference. The confirmation answer locks this manifest before Round 1; later prose, inferred implementation detail, raw answer content, or a regenerated digest cannot replace it.
+
+Before spec persistence, include every preserved locked ID literally in the final spec. Additions and clarifications need no extra question; the runtime derives and persists a `not_required` review when every locked ID remains. For any proposed missing locked ID, ask one intent-review question through `ask` and include `deepInterview.intent_review` with the proposed `observed_items`, every `supporting_substitution`, and the exact `approval_options` labels that count as approval. The runtime recorder writes `pending` when the user does not approve and writes `approved` only when an approval option is selected, binding the review to the recorder-generated answer hash without storing raw answer text. Approved reductions require every removed ID to map to an observed replacement ID. Spec persistence and handoff fail closed for missing, pending, malformed, stale, or unrecorded reduction review evidence. Intent review approves only that output reduction and never authorizes execution or ralplan handoff.
 
 4. **Legacy state migration:** When resuming an existing `deep-interview` state file that lacks `topology`, treat it as `"status": "legacy_missing"`. If no final `spec_path` exists yet, run Round 0 before the next ambiguity scoring pass and then continue with the existing transcript. If a final spec already exists, do not rewrite history; note in any handoff that topology was not captured for that legacy interview.
 

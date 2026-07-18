@@ -30,7 +30,8 @@
 		"check:types": "tsc -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
 		"test": "bun test test/*.test.ts",
-		"test:perf": "PI_TUI_PERF_GATES=1 bun test test/perf-gates.test.ts",
+		"test:perf": "bun test test/perf-gates.test.ts test/transcript-selection-perf.test.ts",
+		"test:pty": "PI_TUI_PTY_TESTS=1 bun test test/pty/*.test.ts",
 		"fix": "biome check --write --unsafe .",
 		"fmt": "biome format --write ."
 	},
@@ -42,7 +43,8 @@
 	},
 	"devDependencies": {
 		"chalk": "catalog:",
-		"@xterm/headless": "catalog:"
+		"@xterm/headless": "catalog:",
+		"node-pty": "^1.0.0"
 	},
 	"engines": {
 		"bun": ">=1.3.14"

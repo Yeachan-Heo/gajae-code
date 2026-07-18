@@ -171,6 +171,20 @@ describe("retry.fallbackChains migration", () => {
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not be migrated"));
 		expect((await readGlobal()).retry).toBeUndefined();
 	});
+
+	test("does not rewrite a config from a newer schema version", async () => {
+		const futureConfig = {
+			configSchemaVersion: 2,
+			modelRoles: { default: "future/head" },
+			retry: { fallbackChains: { default: ["future/tail"] } },
+		};
+		await writeGlobal(futureConfig);
+
+		const settings = await Settings.init({ agentDir: root, cwd: root });
+		expect(settings.getModelRole("default")).toBe("future/head");
+		await settings.cloneForCwd(root);
+		expect(await readGlobal()).toEqual(futureConfig);
+	});
 });
 
 describe("post-migration ordinary saves", () => {

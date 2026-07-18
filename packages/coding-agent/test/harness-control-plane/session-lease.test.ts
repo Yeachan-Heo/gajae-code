@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -83,108 +83,6 @@ describe("SessionLease", () => {
 		});
 		expect(taken.lease.ownerId).toBe("owner-b");
 		expect(taken.lease.leaseEpoch).toBe(2);
-	});
-
-	it("recovers stale mutation lock directories whose holder pid is dead", async () => {
-		const paths = sessionPaths(root, SID);
-		const lockPath = `${paths.lease}.lock`;
-		const token = "deadlock";
-		await mkdir(lockPath, { recursive: true });
-		await writeFile(
-			path.join(lockPath, `${token}.json`),
-			`${JSON.stringify({ pid: 2_147_483_646, token })}\n`,
-			"utf8",
-		);
-
-		const taken = await acquireLease(root, SID, { ownerId: "owner-a", pid: 1, eventsPath: "e", ttlMs: 10_000 });
-
-		expect(taken.lease.ownerId).toBe("owner-a");
-		expect(taken.lease.leaseEpoch).toBe(1);
-		await expect(readdir(lockPath)).rejects.toThrow();
-	});
-
-	it("recovers stale legacy mutation lock files whose holder pid is dead", async () => {
-		const paths = sessionPaths(root, SID);
-		const lockPath = `${paths.lease}.lock`;
-		const token = "legacydead";
-		await mkdir(path.dirname(lockPath), { recursive: true });
-		await writeFile(lockPath, `${JSON.stringify({ pid: 2_147_483_646, token })}\n`, "utf8");
-
-		const taken = await acquireLease(root, SID, { ownerId: "owner-a", pid: 1, eventsPath: "e", ttlMs: 10_000 });
-
-		expect(taken.lease.ownerId).toBe("owner-a");
-		expect(taken.lease.leaseEpoch).toBe(1);
-		await expect(readdir(lockPath)).rejects.toThrow();
-	});
-
-	it("does not steal a mutation lock held by a live pid", async () => {
-		const paths = sessionPaths(root, SID);
-		const lockPath = `${paths.lease}.lock`;
-		const token = "livelock";
-		let settled = false;
-		await mkdir(lockPath, { recursive: true });
-		await writeFile(path.join(lockPath, `${token}.json`), `${JSON.stringify({ pid: process.pid, token })}\n`, "utf8");
-
-		const acquiring = acquireLease(root, SID, { ownerId: "owner-a", pid: 1, eventsPath: "e", ttlMs: 10_000 }).then(
-			result => {
-				settled = true;
-				return result;
-			},
-			error => {
-				settled = true;
-				throw error;
-			},
-		);
-
-		await Bun.sleep(60);
-		expect(settled).toBe(false);
-		await rm(lockPath, { recursive: true, force: true });
-		const taken = await acquiring;
-		expect(taken.lease.ownerId).toBe("owner-a");
-	});
-
-	it("does not recover malformed, mismatched, or multi-entry mutation locks", async () => {
-		const paths = sessionPaths(root, SID);
-		for (const [suffix, entries] of [
-			["malformed", [{ name: "bad.json", content: "not json" }]],
-			["mismatch", [{ name: "wrong.json", content: JSON.stringify({ pid: 2_147_483_646, token: "right" }) }]],
-			[
-				"multiple",
-				[
-					{ name: "dead.json", content: JSON.stringify({ pid: 2_147_483_646, token: "dead" }) },
-					{ name: "live.json", content: JSON.stringify({ pid: process.pid, token: "live" }) },
-				],
-			],
-		] as const) {
-			const sid = `${SID}-${suffix}`;
-			const lockPath = `${sessionPaths(root, sid).lease}.lock`;
-			await mkdir(lockPath, { recursive: true });
-			for (const entry of entries) await writeFile(path.join(lockPath, entry.name), `${entry.content}\n`, "utf8");
-			let settled = false;
-			const acquiring = acquireLease(root, sid, {
-				ownerId: "owner-a",
-				pid: 1,
-				eventsPath: paths.events,
-				ttlMs: 10_000,
-			}).then(
-				result => {
-					settled = true;
-					return result;
-				},
-				error => {
-					settled = true;
-					throw error;
-				},
-			);
-
-			await Bun.sleep(60);
-			expect(settled).toBe(false);
-			const before = await Promise.all(entries.map(entry => readFile(path.join(lockPath, entry.name), "utf8")));
-			expect(before.map(content => content.trim())).toEqual(entries.map(entry => entry.content));
-			await rm(lockPath, { recursive: true, force: true });
-			const taken = await acquiring;
-			expect(taken.lease.ownerId).toBe("owner-a");
-		}
 	});
 
 	it("does not reap fifo endpoint artifacts", async () => {

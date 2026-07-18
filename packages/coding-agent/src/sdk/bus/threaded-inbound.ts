@@ -63,7 +63,7 @@ export type ThreadedInboundDecision =
 			text: string;
 			updateId: number;
 			threadId: string;
-			messageId?: number;
+			messageId: number;
 			attachment?: InboundAttachment;
 	  }
 	| { kind: "duplicate"; updateId: number }
@@ -118,7 +118,9 @@ export function decideThreadedInbound(update: InboundUpdate, ctx: ThreadedInboun
 	const sessionId = ctx.topicToSession(threadId);
 	if (sessionId === undefined) return { kind: "ignore", reason: "unknown_topic" };
 
-	if (typeof update.update_id !== "number") return { kind: "ignore", reason: "missing_update_id" };
+	if (typeof update.update_id !== "number" || !Number.isSafeInteger(update.update_id) || update.update_id < 0) {
+		return { kind: "ignore", reason: "missing_update_id" };
+	}
 	const updateId = update.update_id;
 	if (ctx.isDuplicate(updateId)) return { kind: "duplicate", updateId };
 
@@ -131,6 +133,9 @@ export function decideThreadedInbound(update: InboundUpdate, ctx: ThreadedInboun
 	const attachment = extractAttachment(message);
 	if (!text && attachment === undefined) return { kind: "ignore", reason: "empty_text" };
 
-	const messageId = typeof message.message_id === "number" ? message.message_id : undefined;
+	if (typeof message.message_id !== "number" || !Number.isSafeInteger(message.message_id) || message.message_id <= 0) {
+		return { kind: "ignore", reason: "missing_message_id" };
+	}
+	const messageId = message.message_id;
 	return { kind: "inject", sessionId, text, updateId, threadId, messageId, attachment };
 }

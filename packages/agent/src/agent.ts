@@ -308,6 +308,11 @@ interface CursorToolResultEntry {
 	textLengthAtCall: number;
 }
 
+export type AgentQueueSnapshot = {
+	steering: AgentMessage[];
+	followUp: AgentMessage[];
+};
+
 export class Agent {
 	#state: AgentState = {
 		systemPrompt: [],
@@ -1009,6 +1014,20 @@ export class Agent {
 		this.#followUpQueue = [...messages, ...this.#followUpQueue];
 	}
 
+	/** Snapshot both executable queues as one atomic session-level view. */
+	snapshotQueues(): AgentQueueSnapshot {
+		return {
+			steering: this.#steeringQueue.slice(),
+			followUp: this.#followUpQueue.slice(),
+		};
+	}
+
+	/** Replace both executable queues with a prior snapshot. */
+	restoreQueues(snapshot: AgentQueueSnapshot): void {
+		this.#steeringQueue = snapshot.steering.slice();
+		this.#followUpQueue = snapshot.followUp.slice();
+	}
+
 	#dequeueSteeringMessages(): AgentMessage[] {
 		if (this.#steeringMode === "one-at-a-time") {
 			if (this.#steeringQueue.length > 0) {
@@ -1607,7 +1626,7 @@ export class Agent {
 					this.requestRunTerminal(managedLogicalRunOwner ?? runId, managedDecision.terminal);
 				} else if (managedOutcome.type === "run_terminal") {
 					this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: managedOutcome.reason });
-				} else if (managedDecision?.type !== "retry") {
+				} else if (managedDecision?.type !== "retry" && managedDecision?.type !== "maintenance") {
 					this.#finalizeRun(managedLogicalRunOwner ?? runId);
 				}
 			}
@@ -1660,7 +1679,10 @@ export class Agent {
 			});
 		} finally {
 			let continuation: ManagedAttemptContinuation | undefined;
-			if (managedOutcome?.type === "retryable_discarded" && managedDecision?.type === "retry") {
+			if (
+				managedOutcome?.type !== "run_terminal" &&
+				(managedDecision?.type === "retry" || managedDecision?.type === "maintenance")
+			) {
 				continuation = managedDecision.continuation;
 			}
 			const ownership: ManagedAttemptContinuationOwnership = {
@@ -1691,7 +1713,18 @@ export class Agent {
 			if (continuation && ownership.isCurrent()) {
 				try {
 					await continuation(ownership);
-					if (this.#activeRunId === undefined && this.#managedLogicalRunOwner === managedLogicalRunOwner) {
+					if (
+						managedDecision?.type === "maintenance" &&
+						this.#terminalizedLogicalRunIds.has(managedLogicalRunOwner ?? runId) &&
+						this.#managedLogicalRunOwner === managedLogicalRunOwner
+					) {
+						this.#managedLogicalRunOwner = undefined;
+					}
+					if (
+						managedDecision?.type !== "maintenance" &&
+						this.#activeRunId === undefined &&
+						this.#managedLogicalRunOwner === managedLogicalRunOwner
+					) {
 						this.#managedLogicalRunOwner = undefined;
 					}
 				} catch (err) {

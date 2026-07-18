@@ -9,6 +9,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { withFileLock } from "../config/file-lock";
+
 import { controlSocketPath, sessionPaths } from "./storage";
 
 export interface SessionLease {
@@ -51,21 +53,8 @@ async function writeLeaseAtomic(file: string, lease: SessionLease): Promise<void
 	await fs.writeFile(tmp, `${JSON.stringify(lease, null, 2)}\n`, "utf8");
 	await fs.rename(tmp, file);
 }
-const LEASE_LOCK_RETRIES = 100;
-const LEASE_LOCK_RETRY_DELAY_MS = 20;
-const LEASE_LOCK_FILE_SUFFIX = ".json";
-
-interface LeaseLockInfo {
-	pid: number;
-	token: string;
-}
-
 function leaseMutationLockPath(root: string, sessionId: string): string {
-	return `${sessionPaths(root, sessionId).lease}.lock`;
-}
-
-function leaseMutationLockFile(lockPath: string, token: string): string {
-	return path.join(lockPath, `${token}${LEASE_LOCK_FILE_SUFFIX}`);
+	return sessionPaths(root, sessionId).lease;
 }
 
 function isOwnedUnixEndpointPath(root: string, sessionId: string, endpointPath: string, fallbackPath: string): boolean {
@@ -77,127 +66,20 @@ function isOwnedUnixEndpointPath(root: string, sessionId: string, endpointPath: 
 		return false;
 	}
 }
-
-function isPathExistsError(error: unknown): boolean {
-	const code = (error as NodeJS.ErrnoException).code;
-	return code === "EEXIST" || code === "ENOTEMPTY" || code === "EISDIR" || code === "ENOTDIR";
-}
-
-function isIgnorableLockDirRemoveError(error: unknown): boolean {
-	const code = (error as NodeJS.ErrnoException).code;
-	return code === "ENOENT" || code === "ENOTEMPTY" || code === "EEXIST";
-}
-
-async function removeEmptyLockDir(lockPath: string): Promise<void> {
-	try {
-		await fs.rmdir(lockPath);
-	} catch (error) {
-		if (!isIgnorableLockDirRemoveError(error)) throw error;
-	}
-}
-
-function parseLeaseLockInfo(raw: string): LeaseLockInfo | null {
-	try {
-		const parsed = JSON.parse(raw) as unknown;
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-		const info = parsed as Record<string, unknown>;
-		return typeof info.pid === "number" && typeof info.token === "string"
-			? { pid: info.pid, token: info.token }
-			: null;
-	} catch {
-		return null;
-	}
-}
-
-async function readLeaseLockInfo(lockFile: string): Promise<LeaseLockInfo | null> {
-	try {
-		return parseLeaseLockInfo(await fs.readFile(lockFile, "utf8"));
-	} catch {
-		return null;
-	}
-}
-
-async function createLeaseMutationLock(lockPath: string, info: LeaseLockInfo): Promise<boolean> {
-	const tmpPath = `${lockPath}.tmp-${info.token}`;
-	await fs.rm(tmpPath, { recursive: true, force: true });
-	await fs.mkdir(tmpPath, { mode: 0o700 });
-	try {
-		await fs.writeFile(leaseMutationLockFile(tmpPath, info.token), `${JSON.stringify(info)}\n`, {
-			encoding: "utf8",
-			mode: 0o600,
-		});
-		await fs.rename(tmpPath, lockPath);
-		return true;
-	} catch (error) {
-		await fs.rm(tmpPath, { recursive: true, force: true });
-		if (isPathExistsError(error)) return false;
-		throw error;
-	}
-}
-
-async function recoverLegacyStaleLeaseLock(lockPath: string): Promise<void> {
-	const info = await readLeaseLockInfo(lockPath);
-	if (!info || defaultPidStatusProbe(info.pid) !== "dead") return;
-	try {
-		await fs.unlink(lockPath);
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code !== "ENOENT" && code !== "EISDIR") throw error;
-	}
-}
-
-async function recoverStaleLeaseMutationLock(lockPath: string): Promise<void> {
-	let entries: string[];
-	try {
-		entries = await fs.readdir(lockPath);
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "ENOENT") return;
-		if (code === "ENOTDIR") {
-			await recoverLegacyStaleLeaseLock(lockPath);
-			return;
-		}
-		throw error;
-	}
-	const lockFiles = entries.filter(entry => entry.endsWith(LEASE_LOCK_FILE_SUFFIX));
-	if (lockFiles.length === 0) {
-		await removeEmptyLockDir(lockPath);
-		return;
-	}
-	if (lockFiles.length !== 1) return;
-	const lockFile = lockFiles[0];
-	const info = await readLeaseLockInfo(path.join(lockPath, lockFile));
-	if (!info || lockFile !== `${info.token}${LEASE_LOCK_FILE_SUFFIX}`) return;
-	if (defaultPidStatusProbe(info.pid) !== "dead") return;
-	// Delete only the stale owner's token-named file; a fresh lock uses a different file name.
-	await fs.rm(path.join(lockPath, lockFile), { force: true });
-	await removeEmptyLockDir(lockPath);
-}
-
-async function releaseLeaseMutationLock(lockPath: string, token: string): Promise<void> {
-	await fs.rm(leaseMutationLockFile(lockPath, token), { force: true });
-	await removeEmptyLockDir(lockPath);
-}
-
-async function acquireLeaseMutationLock(root: string, sessionId: string): Promise<() => Promise<void>> {
+async function withLeaseMutationLock<T>(root: string, sessionId: string, fn: () => Promise<T>): Promise<T> {
 	const lockPath = leaseMutationLockPath(root, sessionId);
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
-	for (let attempt = 0; attempt < LEASE_LOCK_RETRIES; attempt++) {
-		const token = randomBytes(16).toString("hex");
-		const info: LeaseLockInfo = { pid: process.pid, token };
-		if (await createLeaseMutationLock(lockPath, info)) return () => releaseLeaseMutationLock(lockPath, token);
-		await recoverStaleLeaseMutationLock(lockPath);
-		await Bun.sleep(LEASE_LOCK_RETRY_DELAY_MS);
-	}
-	throw new LeaseError(`lease_lock_timeout:${sessionId}`, "lease_lock_timeout");
-}
-
-async function withLeaseMutationLock<T>(root: string, sessionId: string, fn: () => Promise<T>): Promise<T> {
-	const release = await acquireLeaseMutationLock(root, sessionId);
 	try {
-		return await fn();
-	} finally {
-		await release();
+		return await withFileLock(lockPath, fn, {
+			staleMs: 30_000,
+			retries: 100,
+			retryDelayMs: 20,
+		});
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("Failed to acquire lock")) {
+			throw new LeaseError(`lease_lock_timeout:${sessionId}`, "lease_lock_timeout");
+		}
+		throw error;
 	}
 }
 

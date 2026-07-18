@@ -102,7 +102,9 @@ export function questionHash(questionText: string): string {
 }
 
 export function answerHash(selectedOptions: string[] | undefined, customInput: string | undefined): string {
-	return hashContent(JSON.stringify({ selected: selectedOptions ?? [], custom: customInput ?? null }));
+	return createHash("sha256")
+		.update(JSON.stringify({ selected: selectedOptions ?? [], custom: customInput ?? null }))
+		.digest("hex");
 }
 
 /**
@@ -335,9 +337,30 @@ export function mergeDeepInterviewEnvelope(
 	const incomingHasEstablishedFacts =
 		Object.hasOwn(incomingNestedState, "established_facts") || Object.hasOwn(incomingEnvelope, "established_facts");
 	const normalizedIncoming = normalizeDeepInterviewEnvelope(incoming);
-	if (options.replace) return normalizedIncoming;
-
 	const normalizedExisting = normalizeDeepInterviewEnvelope(existing);
+	const existingState = isPlainObject(normalizedExisting.state) ? normalizedExisting.state : {};
+	const incomingState = isPlainObject(normalizedIncoming.state) ? { ...normalizedIncoming.state } : {};
+	if (existingState.intent_contract !== undefined) {
+		assertDeepInterviewIntentManifest(existingState.intent_contract);
+		if (Object.hasOwn(incomingState, "intent_contract")) {
+			if (incomingState.intent_contract === null) throw new Error("locked intent contract cannot be deleted");
+			assertDeepInterviewIntentManifest(incomingState.intent_contract);
+			if (
+				incomingState.intent_contract.digest !== existingState.intent_contract.digest ||
+				incomingState.intent_contract.confirmation_answer_hash !==
+					existingState.intent_contract.confirmation_answer_hash
+			)
+				throw new Error("locked intent contract cannot be replaced");
+		} else {
+			incomingState.intent_contract = existingState.intent_contract;
+		}
+	}
+	if (existingState.intent_contract_required === true) incomingState.intent_contract_required = true;
+	if (options.replace) {
+		normalizedIncoming.state = incomingState;
+		return normalizedIncoming;
+	}
+
 	const merged: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(normalizedExisting)) {
 		if (key !== "state") merged[key] = value;
@@ -348,8 +371,6 @@ export function mergeDeepInterviewEnvelope(
 		else merged[key] = value;
 	}
 
-	const existingState = isPlainObject(normalizedExisting.state) ? normalizedExisting.state : {};
-	const incomingState = isPlainObject(normalizedIncoming.state) ? normalizedIncoming.state : {};
 	const mergedState: Record<string, unknown> = { ...existingState };
 	for (const [key, value] of Object.entries(incomingState)) {
 		if (key === "rounds") continue;
@@ -363,4 +384,295 @@ export function mergeDeepInterviewEnvelope(
 	);
 	merged.state = mergedState;
 	return merged as DeepInterviewStateEnvelope;
+}
+
+export const DEEP_INTERVIEW_INTENT_CATEGORIES = ["artifact", "surface", "integration", "constraint"] as const;
+export type DeepInterviewIntentCategory = (typeof DEEP_INTERVIEW_INTENT_CATEGORIES)[number];
+
+const INTENT_ID_RE = /^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/;
+const ANSWER_HASH_RE = /^[a-f0-9]{64}$/;
+const INTENT_RATIONALE_REF_RE = /^sha256:[a-f0-9]{64}$/;
+const MAX_INTENT_ITEMS = 64;
+const MAX_INTENT_STATEMENT_LENGTH = 1_000;
+const MAX_INTENT_RATIONALE_LENGTH = 500;
+const MAX_INTENT_EVIDENCE_LENGTH = 80;
+
+export interface DeepInterviewIntentItem {
+	id: string;
+	category: DeepInterviewIntentCategory;
+	statement: string;
+}
+
+export interface DeepInterviewIntentManifest {
+	version: 1;
+	items: DeepInterviewIntentItem[];
+	digest: string;
+	confirmation_round: 0;
+	confirmation_answer_hash: string;
+	confirmation_evidence: string;
+}
+
+export interface DeepInterviewIntentSubstitution {
+	removed_id: string;
+	replacement_ids: string[];
+	rationale: string;
+}
+
+export interface DeepInterviewIntentReview {
+	version: 1;
+	status: "not_required" | "pending" | "approved";
+	locked_digest: string;
+	observed_digest: string;
+	removed_locked_ids: string[];
+	supporting_substitutions: DeepInterviewIntentSubstitution[];
+	approval_round?: number;
+	answer_hash?: string;
+	user_answer_evidence?: string;
+}
+
+export function isCanonicalDeepInterviewAnswerHash(value: unknown): value is string {
+	return typeof value === "string" && ANSWER_HASH_RE.test(value);
+}
+
+function isEvidenceReference(value: unknown, answerHashValue: string): value is string {
+	return (
+		typeof value === "string" &&
+		value.length <= MAX_INTENT_EVIDENCE_LENGTH &&
+		value === `answer_hash:${answerHashValue}`
+	);
+}
+
+function assertIntentItem(value: unknown): asserts value is DeepInterviewIntentItem {
+	if (!isPlainObject(value) || Object.keys(value).length !== 3) throw new Error("invalid intent item");
+	const { id, category, statement } = value;
+	if (typeof id !== "string" || !INTENT_ID_RE.test(id)) throw new Error("invalid intent id");
+	if (
+		!DEEP_INTERVIEW_INTENT_CATEGORIES.includes(category as DeepInterviewIntentCategory) ||
+		!id.startsWith(`${category}:`)
+	)
+		throw new Error("invalid intent category");
+	if (typeof statement !== "string" || !statement.trim() || statement.length > MAX_INTENT_STATEMENT_LENGTH)
+		throw new Error(`intent item ${id} requires a bounded statement`);
+}
+
+function canonicalIntentItems(items: readonly DeepInterviewIntentItem[]): DeepInterviewIntentItem[] {
+	return [...items]
+		.map(item => ({ id: item.id.trim(), category: item.category, statement: item.statement.trim() }))
+		.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+export function deepInterviewIntentManifestDigest(items: readonly DeepInterviewIntentItem[]): string {
+	return createHash("sha256")
+		.update(JSON.stringify(canonicalIntentItems(items)))
+		.digest("hex");
+}
+
+export function deepInterviewObservedIntentDigest(ids: readonly string[]): string {
+	return createHash("sha256")
+		.update(JSON.stringify([...new Set(ids)].sort()))
+		.digest("hex");
+}
+
+export function createDeepInterviewIntentManifest(
+	items: readonly DeepInterviewIntentItem[],
+	confirmation: { round: 0; answer_hash: string },
+): DeepInterviewIntentManifest {
+	if (!Array.isArray(items) || items.length === 0 || items.length > MAX_INTENT_ITEMS)
+		throw new Error("intent manifest requires bounded items");
+	if (confirmation.round !== 0 || !isCanonicalDeepInterviewAnswerHash(confirmation.answer_hash))
+		throw new Error("intent confirmation requires Round 0 canonical answer hash");
+	const canonical = canonicalIntentItems(items);
+	const ids = new Set<string>();
+	for (const item of canonical) {
+		assertIntentItem(item);
+		if (ids.has(item.id)) throw new Error(`duplicate intent id: ${item.id}`);
+		ids.add(item.id);
+	}
+	return {
+		version: 1,
+		items: canonical,
+		digest: deepInterviewIntentManifestDigest(canonical),
+		confirmation_round: 0,
+		confirmation_answer_hash: confirmation.answer_hash,
+		confirmation_evidence: `answer_hash:${confirmation.answer_hash}`,
+	};
+}
+
+export function assertDeepInterviewIntentManifest(value: unknown): asserts value is DeepInterviewIntentManifest {
+	if (!isPlainObject(value) || Object.keys(value).length !== 6 || value.version !== 1 || !Array.isArray(value.items))
+		throw new Error("invalid intent contract");
+	const manifest = createDeepInterviewIntentManifest(value.items as DeepInterviewIntentItem[], {
+		round: value.confirmation_round as 0,
+		answer_hash: value.confirmation_answer_hash as string,
+	});
+	if (
+		value.digest !== manifest.digest ||
+		value.confirmation_round !== 0 ||
+		!isEvidenceReference(value.confirmation_evidence, manifest.confirmation_answer_hash)
+	)
+		throw new Error("intent contract integrity mismatch");
+}
+
+export function reviewDeepInterviewIntent(
+	locked: DeepInterviewIntentManifest,
+	observedItems: readonly DeepInterviewIntentItem[],
+	input: Omit<DeepInterviewIntentReview, "version" | "locked_digest" | "observed_digest" | "removed_locked_ids">,
+): DeepInterviewIntentReview {
+	assertDeepInterviewIntentManifest(locked);
+	const observed = createDeepInterviewIntentManifest(observedItems, {
+		round: 0,
+		answer_hash: locked.confirmation_answer_hash,
+	});
+	const observedIds = new Set(observed.items.map(item => item.id));
+	const removed = locked.items
+		.map(item => item.id)
+		.filter(id => !observedIds.has(id))
+		.sort();
+	const substitutions = input.supporting_substitutions;
+	if (!Array.isArray(substitutions)) throw new Error("invalid intent substitutions");
+	const substitutionIds = new Set(substitutions.map(item => item.removed_id));
+	if (substitutionIds.size !== substitutions.length) throw new Error("duplicate intent substitution");
+	for (const substitution of substitutions) {
+		if (!isPlainObject(substitution) || !removed.includes(substitution.removed_id))
+			throw new Error("substitution does not bind removed intent");
+		if (
+			!Array.isArray(substitution.replacement_ids) ||
+			substitution.replacement_ids.length === 0 ||
+			substitution.replacement_ids.some(id => typeof id !== "string" || !observedIds.has(id)) ||
+			typeof substitution.rationale !== "string" ||
+			!substitution.rationale.trim() ||
+			substitution.rationale.length > MAX_INTENT_RATIONALE_LENGTH
+		)
+			throw new Error("invalid intent substitution");
+	}
+	const redactedSubstitutions = substitutions.map(substitution => ({
+		removed_id: substitution.removed_id,
+		replacement_ids: [...new Set(substitution.replacement_ids)].sort(),
+		rationale: `sha256:${createHash("sha256").update(substitution.rationale.trim()).digest("hex")}`,
+	}));
+	if (input.status !== "not_required" && input.status !== "pending" && input.status !== "approved")
+		throw new Error("invalid intent review status");
+	if (input.status === "not_required") {
+		if (
+			removed.length > 0 ||
+			substitutions.length > 0 ||
+			input.approval_round !== undefined ||
+			input.answer_hash !== undefined ||
+			input.user_answer_evidence !== undefined
+		)
+			throw new Error("not_required intent review cannot carry reduction evidence");
+	}
+	if (
+		input.status === "pending" &&
+		(input.approval_round !== undefined ||
+			input.answer_hash !== undefined ||
+			input.user_answer_evidence !== undefined)
+	)
+		throw new Error("pending intent review cannot carry approval evidence");
+	if (input.status === "approved") {
+		if (removed.some(id => !substitutionIds.has(id)))
+			throw new Error("approved intent reduction requires every substitution");
+		if (
+			typeof input.approval_round !== "number" ||
+			!Number.isFinite(input.approval_round) ||
+			!Number.isInteger(input.approval_round) ||
+			input.approval_round <= 0 ||
+			!isCanonicalDeepInterviewAnswerHash(input.answer_hash) ||
+			!isEvidenceReference(input.user_answer_evidence, input.answer_hash)
+		)
+			throw new Error("approved intent reduction requires durable redacted answer evidence");
+	}
+	return {
+		...input,
+		supporting_substitutions: redactedSubstitutions,
+		version: 1,
+		locked_digest: locked.digest,
+		observed_digest: deepInterviewObservedIntentDigest([...observedIds]),
+		removed_locked_ids: removed,
+	};
+}
+
+export function assertDeepInterviewIntentReview(
+	value: unknown,
+	locked: DeepInterviewIntentManifest,
+	observedIds: readonly string[],
+	recordedAnswers: readonly { round: unknown; answer_hash: unknown }[],
+): asserts value is DeepInterviewIntentReview {
+	assertDeepInterviewIntentManifest(locked);
+	if (!isPlainObject(value)) throw new Error("missing or invalid intent review");
+	const allowedKeys = new Set([
+		"version",
+		"status",
+		"locked_digest",
+		"observed_digest",
+		"removed_locked_ids",
+		"supporting_substitutions",
+		"approval_round",
+		"answer_hash",
+		"user_answer_evidence",
+	]);
+	if (Object.keys(value).some(key => !allowedKeys.has(key)) || value.version !== 1)
+		throw new Error("invalid intent review");
+	if (
+		value.locked_digest !== locked.digest ||
+		value.observed_digest !== deepInterviewObservedIntentDigest(observedIds)
+	)
+		throw new Error("stale intent review");
+	const observed = new Set(observedIds);
+	const removed = locked.items
+		.map(item => item.id)
+		.filter(id => !observed.has(id))
+		.sort();
+	if (
+		!Array.isArray(value.removed_locked_ids) ||
+		JSON.stringify([...value.removed_locked_ids].sort()) !== JSON.stringify(removed)
+	)
+		throw new Error("intent review removed IDs mismatch");
+	if (!Array.isArray(value.supporting_substitutions)) throw new Error("invalid intent substitutions");
+	const substitutions = value.supporting_substitutions;
+	const substitutionIds = new Set<string>();
+	for (const substitution of substitutions) {
+		if (!isPlainObject(substitution) || Object.keys(substitution).length !== 3)
+			throw new Error("invalid intent substitution");
+		const { removed_id, replacement_ids, rationale } = substitution;
+		if (
+			typeof removed_id !== "string" ||
+			!removed.includes(removed_id) ||
+			substitutionIds.has(removed_id) ||
+			!Array.isArray(replacement_ids) ||
+			replacement_ids.length === 0 ||
+			replacement_ids.some(id => typeof id !== "string" || !INTENT_ID_RE.test(id) || !observed.has(id)) ||
+			typeof rationale !== "string" ||
+			!INTENT_RATIONALE_REF_RE.test(rationale)
+		)
+			throw new Error("invalid intent substitution");
+		substitutionIds.add(removed_id);
+	}
+	if (value.status === "not_required") {
+		if (
+			removed.length > 0 ||
+			substitutions.length > 0 ||
+			value.approval_round !== undefined ||
+			value.answer_hash !== undefined ||
+			value.user_answer_evidence !== undefined
+		)
+			throw new Error("not_required intent review cannot carry reduction evidence");
+		return;
+	}
+	if (value.status !== "approved") {
+		if (value.status === "pending") throw new Error("intent reduction is pending or unapproved");
+		throw new Error("invalid intent review status");
+	}
+	if (removed.some(id => !substitutionIds.has(id)))
+		throw new Error("approved intent reduction requires every substitution");
+	if (
+		typeof value.approval_round !== "number" ||
+		!Number.isFinite(value.approval_round) ||
+		!Number.isInteger(value.approval_round) ||
+		value.approval_round <= 0 ||
+		!isCanonicalDeepInterviewAnswerHash(value.answer_hash) ||
+		!isEvidenceReference(value.user_answer_evidence, value.answer_hash) ||
+		!recordedAnswers.some(answer => answer.round === value.approval_round && answer.answer_hash === value.answer_hash)
+	)
+		throw new Error("intent review approval evidence is invalid");
 }

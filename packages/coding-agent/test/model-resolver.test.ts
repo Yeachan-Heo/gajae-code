@@ -414,13 +414,12 @@ describe("parseModelPattern", () => {
 			expect(result.warning).toContain("random");
 		});
 
-		test("qwen3-coder:exacto:high:random returns model with undefined thinking level and warning", () => {
+		test("does not recursively consume multiple suffixes", () => {
 			const result = parseModelPattern("qwen/qwen3-coder:exacto:high:random", allModels);
-			expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
+			expect(result.model).toBeUndefined();
 			expect(result.thinkingLevel).toBeUndefined();
 			expect(result.explicitThinkingLevel).toBe(false);
-			expect(result.warning).toContain("Invalid thinking level");
-			expect(result.warning).toContain("random");
+			expect(result.warning).toBeUndefined();
 		});
 	});
 
@@ -749,7 +748,7 @@ describe("resolveCliModel", () => {
 		expect(result.error).toContain("No models available");
 	});
 
-	test("resolves provider-prefixed fuzzy patterns (openrouter/qwen -> openrouter model)", () => {
+	test("fails closed for provider-qualified patterns that do not exactly match", () => {
 		const registry = {
 			getAll: () => allModels,
 		} as unknown as Parameters<typeof resolveCliModel>[0]["modelRegistry"];
@@ -759,9 +758,8 @@ describe("resolveCliModel", () => {
 			modelRegistry: registry,
 		});
 
-		expect(result.error).toBeUndefined();
-		expect(result.model?.provider).toBe("openrouter");
-		expect(result.model?.id).toBe("qwen/qwen3-coder:exacto");
+		expect(result.model).toBeUndefined();
+		expect(result.error).toContain('Model "openrouter/qwen" not found');
 	});
 
 	test("prefers decomposed provider+id over flat id match when ambiguous", () => {
@@ -950,6 +948,16 @@ describe("OpenAI Codex default resolution", () => {
 	});
 });
 
+test("restores only an exact available provider/model candidate", async () => {
+	const fallback = mockModels[0];
+	const result = await restoreModelFromSession("openai", "saved", undefined, false, {
+		getAvailable: () => [fallback],
+		getApiKey: async () => "key",
+	});
+
+	expect(result.model).toBe(fallback);
+	expect(result.fallbackMessage).toContain("model no longer exists");
+});
 describe("expandRoleAlias", () => {
 	test("expands pi/default to the configured default role", () => {
 		const settings = Settings.isolated();

@@ -66,12 +66,14 @@ describe("SDK operation inventory", () => {
 		expect(result.exitCode, output(result)).toBe(0);
 	});
 
-	it("locks private mid-run maintenance test seams out of the public SDK", async () => {
+	it("locks private AgentSession seams out of the public SDK", async () => {
 		const records = (await Bun.file(inventory).json()) as Array<{
 			sourceId: string;
 			decision: string;
 			rationale?: string;
+			exclusionMetadata?: { adapterMappings: string; testIds: string };
 		}>;
+
 		const expected = new Map([
 			[
 				"agent_session:runMidRunMaintenanceForTests",
@@ -81,10 +83,21 @@ describe("SDK operation inventory", () => {
 				"agent_session:estimateMidRunContextTokensForTests",
 				"test-only estimator seam, not a user-facing SDK control seam",
 			],
+			[
+				"agent_session:awaitPendingContextTransformations",
+				"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
+			],
 		]);
 		for (const [sourceId, rationale] of expected) {
 			const record = records.find(candidate => candidate.sourceId === sourceId);
-			expect(record).toEqual(expect.objectContaining({ sourceId, decision: "exclude", rationale }));
+			expect(record).toEqual(
+				expect.objectContaining({
+					sourceId,
+					decision: "exclude",
+					rationale,
+					exclusionMetadata: { adapterMappings: "not_applicable", testIds: "not_applicable" },
+				}),
+			);
 		}
 	});
 
@@ -124,6 +137,27 @@ describe("SDK operation inventory", () => {
 			);
 		});
 	}
+
+	it("fails closed when the slash-command scanner anchor is absent", () => {
+		expect(() => scanSlashCommands('const COMMANDS = [{ name: "goal" }];')).toThrow(
+			"SDK operation inventory scanner: required anchor const BUILTIN_SLASH_COMMAND_REGISTRY was not found.",
+		);
+	});
+
+	it("fails closed when the AgentSession scanner anchor is absent", () => {
+		expect(() => scanAgentSessionMethods("class OtherSession {} ")).toThrow(
+			"SDK operation inventory scanner: required AgentSession class declaration was not found.",
+		);
+	});
+
+	it("fails closed when the AgentSession class body is malformed", () => {
+		expect(() => scanAgentSessionMethods("class AgentSession extends Base")).toThrow(
+			"SDK operation inventory scanner: AgentSession class is missing its opening body delimiter.",
+		);
+		expect(() => scanAgentSessionMethods("class AgentSession { action() {} ")).toThrow(
+			"SDK operation inventory scanner: AgentSession class body is unbalanced.",
+		);
+	});
 
 	it("classifies explicit AgentSession test seams as non-public authority", async () => {
 		const source = await Bun.file(path.join(repoRoot, "packages/coding-agent/src/session/agent-session.ts")).text();

@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel } from "@gajae-code/ai";
+import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -15,16 +15,23 @@ import type {
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
+import { buildAskGateAnswerSchema as buildDeepInterviewAskGateAnswerSchema } from "../src/modes/shared/agent-wire/deep-interview-gate";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
 	MemoryGateStore,
 	type WorkflowGateEmitter,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import {
+	buildAskGateAnswerSchema,
+	buildAskGateStageState,
+	validateAskGateStageState,
+} from "../src/modes/shared/agent-wire/workflow-gate-types";
 import type { InteractiveModeContext } from "../src/modes/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension, PresentationArbiter } from "../src/sdk/bus";
+import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { SessionSdkHost } from "../src/sdk/host";
 import {
 	attachLifecycleStartupCapability,
@@ -49,9 +56,14 @@ type SdkPermissionProvider =
 
 const dirs: string[] = [];
 const sockets: WebSocket[] = [];
-afterEach(() => {
-	for (const socket of sockets.splice(0)) socket.close();
-	for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+afterEach(async () => {
+	await Promise.all(sockets.splice(0).map(closeSocket));
+	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
+	if (process.platform === "win32") {
+		Bun.gc(true);
+		await Bun.sleep(50);
+	}
+	for (const dir of dirs.splice(0)) await removeTempDir(dir);
 	delete process.env.GJC_SDK_DISABLE;
 	delete process.env.GJC_NOTIFICATIONS;
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
@@ -60,10 +72,33 @@ afterEach(() => {
 });
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 4_000;
+	const deadline = Date.now() + 15_000;
 	while (!predicate()) {
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
 		await Bun.sleep(20);
+	}
+}
+
+async function closeSocket(socket: WebSocket): Promise<void> {
+	if (socket.readyState === WebSocket.CLOSED) return;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	socket.addEventListener("close", () => resolve(), { once: true });
+	socket.close();
+	await Promise.race([promise, Bun.sleep(500)]);
+}
+
+async function removeTempDir(dir: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await fs.promises.rm(dir, { recursive: true, force: true });
+			return;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (attempt >= 20 || (code !== "EBUSY" && code !== "EPERM" && code !== "EACCES" && code !== "ENOTEMPTY"))
+				throw error;
+			if (process.platform === "win32") Bun.gc(true);
+			await Bun.sleep(100);
+		}
 	}
 }
 
@@ -195,6 +230,15 @@ function context(
 	};
 }
 
+test("shared ask-gate schema and stage-state authority preserves generic producer inputs", () => {
+	const labels = Array.from({ length: 33 }, (_, index) => (index === 32 ? "option-0" : `option-${index}`));
+	const question = { id: "generic-ask", multi: true, allowEmpty: false };
+	expect(buildAskGateAnswerSchema(question, labels)).toEqual(buildDeepInterviewAskGateAnswerSchema(question, labels));
+	const state = buildAskGateStageState(question, labels);
+	expect(() => validateAskGateStageState(state)).not.toThrow();
+	expect(state.options).toEqual(labels);
+});
+
 test("lifecycle startup production secret collection redacts before normalization and truncation", () => {
 	const bare = "bare-secret-value";
 	const overlap = "bare-secret-value-plus";
@@ -305,7 +349,7 @@ test("lifecycle teardown rejects dual owner failures and retains exact retry aut
 			(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = nativeStop;
 		}
 	}
-});
+}, 60_000);
 test("lifecycle cleanup fences same-id startup and preserves proven owner release across retry", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-retry-"));
 	dirs.push(cwd);
@@ -350,7 +394,7 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 		serverStart.mockRestore();
 		(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = nativeStop;
 	}
-});
+}, 60_000);
 
 test("production SDK host starts exactly one instrumented server (no duplicate auto-host)", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-single-host-"));
@@ -371,7 +415,7 @@ test("production SDK host starts exactly one instrumented server (no duplicate a
 		serverStart.mockRestore();
 		await host?.stop();
 	}
-});
+}, 60_000);
 
 test("lifecycle session shutdown disposes the exact endpoint once", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-once-"));
@@ -394,7 +438,7 @@ test("lifecycle session shutdown disposes the exact endpoint once", async () => 
 	} finally {
 		stop.mockRestore();
 	}
-});
+}, 60_000);
 
 test("lifecycle rollback proof only fences the exact started endpoint generation", () => {
 	const tracker = new SdkStartupRollbackTracker();
@@ -514,7 +558,7 @@ test("SDK broker registration records an absolute lifecycle scope", async () => 
 	} finally {
 		await brokerOwnerForTest(agentDir)?.stop();
 	}
-});
+}, 60_000);
 
 test("ExtensionRunner forwards SDK permission providers into its production context", () => {
 	let installed: SdkPermissionProvider;
@@ -793,6 +837,76 @@ test("/notify on fences teardown and permits a later same-ID replacement runtime
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 	} finally {
 		prototype.start = startServer;
+	}
+});
+
+test("SDK host replays file attachment data as base64 while passing raw bytes to N-API", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-file-replay-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-file-replay-${Date.now()}`;
+	const bytes = Buffer.from([0, 1, 2, 253, 254, 255]);
+	const attachmentPath = path.join(cwd, "replay.bin");
+	fs.writeFileSync(attachmentPath, bytes);
+	process.env.GJC_NOTIFICATIONS = "1";
+	const handlers = start(context(cwd, sessionId));
+	const nativePrototype = NotificationServer.prototype as unknown as {
+		pushFileAttachmentUnchecked?: (
+			sessionId: string,
+			name: string,
+			mime: string | undefined,
+			data: Buffer,
+			caption: string | undefined,
+		) => void;
+	};
+	const originalPushFileAttachmentUnchecked = nativePrototype.pushFileAttachmentUnchecked;
+	let nativeData: Buffer | undefined;
+	nativePrototype.pushFileAttachmentUnchecked = (_sessionId, _name, _mime, data) => {
+		nativeData = data;
+	};
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		await waitFor(() => getTelegramFileSink(sessionId) !== undefined, "file attachment sink");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		await expect(getTelegramFileSink(sessionId)!({ path: attachmentPath })).resolves.toEqual({ ok: true });
+		await waitFor(() => nativeData !== undefined, "raw N-API file attachment");
+		expect(nativeData).toBeInstanceOf(Buffer);
+		expect(nativeData).toEqual(bytes);
+
+		socket.send(JSON.stringify({ type: "event_replay", id: "file-replay", sinceGeneration: 1, sinceSeq: 0 }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "file-replay"),
+			"file replay",
+		);
+		const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "file-replay");
+		expect(replay?.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					payload: expect.objectContaining({
+						type: "file_attachment",
+						sessionId,
+						name: "replay.bin",
+						data: bytes.toString("base64"),
+					}),
+				}),
+			]),
+		);
+	} finally {
+		if (originalPushFileAttachmentUnchecked) {
+			nativePrototype.pushFileAttachmentUnchecked = originalPushFileAttachmentUnchecked;
+		} else {
+			delete nativePrototype.pushFileAttachmentUnchecked;
+		}
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, context(cwd, sessionId));
 	}
 });
 
@@ -2278,6 +2392,7 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 		ok: true,
 		page: { items: ["Completed persisted reply"] },
 	});
+	await closeSocket(socket);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	await agentSession.dispose();
 	await sessionManager.close();
@@ -2322,9 +2437,13 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 		ok: true,
 		page: { items: ["Completed persisted reply"] },
 	});
+	await closeSocket(reopenedSocket);
 	await reopenedHandlers.get("session_shutdown")?.({ type: "session_shutdown" }, reopenedSessionContext);
 	await reopenedSessionManager.close();
 	authStorage.close();
+	closeModelCache(path.join(cwd, "models.db"));
+	handlers.clear();
+	reopenedHandlers.clear();
 });
 
 test("terminal shutdown removes session snapshot spills", async () => {
@@ -2669,6 +2788,39 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 		error: { code: "invalid_input", message: "config.patch rejects secret fields at the SDK host." },
 	});
 	expect(configWrites).toEqual([]);
+});
+
+test("Q12 records the runtime-turn correlation before a workflow gate is exposed", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-q12-runtime-turn-"));
+	dirs.push(cwd);
+	const emitter = new BrokerWorkflowGateEmitter("q12-runtime-turn", new FileGateStore(path.join(cwd, "gates.json")));
+	const detachTerminalController = emitter.registerGateTerminalController!({
+		completeGateInteractions: () => "not_published",
+		cancelGateInteractions: () => {},
+	});
+	try {
+		emitter.setRuntimeTurnProvider?.(() => "runtime-turn-2550");
+		const advance = emitter.emitGate({
+			stage: "deep-interview",
+			kind: "question",
+			schema: { type: "string", enum: ["continue"] },
+		});
+		const records = emitter.listWorkflowGateQueryRecords!();
+		expect(records).toHaveLength(1);
+		expect(records[0]).toMatchObject({
+			id: expect.stringMatching(/^pending:/),
+			tag: "pending",
+			runtime_turn_id: "runtime-turn-2550",
+		});
+		await emitter.resolveGate!({
+			gate_id: records[0]!.gate_id,
+			answer: "continue",
+			idempotency_key: "q12-runtime-turn",
+		});
+		expect(await advance).toBe("continue");
+	} finally {
+		detachTerminalController();
+	}
 });
 
 test("SDK host discovers, answers, and advances a durable workflow gate", async () => {

@@ -20,11 +20,13 @@ Each op line is ONE of:
 - Payload ends at the next `»`, `«`, `≔`, `§`, envelope marker, or EOF.
 - `≔A..B` with no payload deletes the range. To keep a blank line, include one explicit empty payload line.
 - **Payload is only what's NEW relative to your range:**
-  - `≔` replaces inside; NEVER include lines outside.
+  - `≔` replaces inside; NEVER include lines outside or replay past B — extend B if it must go.
   - `»`/`«` adds at the anchor; NEVER repeat line A or neighbors.
   - Payload matching nearby content duplicates — drop it or widen.
-- **Pick a self-contained unit first.** Touching a multiline construct? Widen to the whole thing.
+- **Pick a self-contained unit first.** Touching a multiline construct? Widen to the whole thing; narrow beats wide otherwise.
 - Then smallest op: add → `»`/`«`; delete/replace → `≔`.
+- **Anchors reference the file as last read.** NEVER shift for prior ops, fabricate hashes, or anchor outside the visible region — re-`read` first.
+- **One `»`/`«` op per block, NOT per line.** N lines = ONE op, N payloads. Collapse adjacent ops.
 </rules>
 
 <brace-shapes>
@@ -34,16 +36,6 @@ When braces bound your edit, you SHOULD prefer these shapes:
 - **Insert inside**: anchor on `{` or last interior line; NEVER repeat the braces.
 - **End on `}`**: only when that `}` is part of the change. Otherwise extend or stop earlier.
 </brace-shapes>
-
-<common-failures>
-- **NEVER replay past your range.** Stop before B+1; extend B if it must go.
-- **NEVER duplicate chunks inside one payload.** Caught re-emitting? Rewrite.
-- **Anchor only inside the visible region.** B+1 truncated? Re-`read` first.
-- **You SHOULD prefer the narrowest self-contained edit.** Narrow range beats wide range.
-- **Anchors reference the file as last read.** NEVER shift for prior ops.
-- **One `»`/`«` op per block, NOT per line.** N lines = ONE op, N payloads. Collapse adjacent ops.
-- **NEVER fabricate anchor hashes.** Missing? Re-`read`.
-</common-failures>
 
 <case file="mod.ts">
 {{hline 1 "const TITLE = \"Mr\";"}}
@@ -69,55 +61,21 @@ const TITLE = "Mrs";
 		name?.trim() || "guest",
 	].join(" ");
 
-# Insert AFTER/BEFORE a line
-§mod.ts
-»{{hrefr 4}}
+# Insert after / before a line
+`§mod.ts`
+`»{{hrefr 4}}`
 		"Dr",
-«{{hrefr 5}}
+`«{{hrefr 5}}`
 		"Dr",
-
-# Append to file
-§mod.ts
-»EOF
-export const done = true;
 
 # Delete a line
-§mod.ts
-≔{{hrefr 5}}
+`§mod.ts`
+`≔{{hrefr 5}}`
 
-# Blank a line (replace with LF: the empty payload is the blank line before `»EOF`)
-§mod.ts
-≔{{hrefr 5}}
-
-»EOF
-export const done = true;
+# Replace with one blank line: the empty payload line follows the operation
+`§mod.ts`
+`≔{{hrefr 5}}`
 </examples>
-
-<anti-pattern>
-# WRONG — replaces 2 lines just to add one.
-§mod.ts
-≔{{hrefr 1}}..{{hrefr 2}}
-const TITLE = "Mr";
-const DEBUG = false;
-export function greet(name) {
-# RIGHT — same effect, one-line insert
-§mod.ts
-»{{hrefr 1}}
-const DEBUG = false;
-
-# WRONG — replace from the middle of a larger statement (error-prone)
-§mod.ts
-≔{{hrefr 4}}..{{hrefr 5}}
-		"Dr",
-		name?.trim() || "guest",
-# RIGHT — widen to the full statement
-§mod.ts
-≔{{hrefr 3}}..{{hrefr 6}}
-	return [
-		"Dr",
-		name?.trim() || "guest",
-	].join(" ");
-</anti-pattern>
 
 <critical>
 - Copy anchors verbatim (line number + 2-char hash); NEVER include the `|TEXT` body.

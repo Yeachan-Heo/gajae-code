@@ -18,6 +18,7 @@ import {
 } from "../../modes/types";
 import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
+import { getUserMessageViewportAnchorIds } from "../../session/session-manager";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
@@ -25,7 +26,9 @@ import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } fr
 import { resizeImage } from "../../utils/image-resize";
 import { formatPastedImageReference, resolvePastedImagePath } from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
-import type { CommandPaletteAction } from "../components/command-palette";
+import { ActionRegistry, APP_ACTION_METADATA } from "../action-registry";
+import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } from "../components/command-palette";
+import { QueuePaneComponent } from "../components/queue-pane";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
 
 interface Expandable {
@@ -33,7 +36,9 @@ interface Expandable {
 	setManuallyExpanded?(expanded: boolean): void;
 }
 
-const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+export const INTERACTIVE_ABORT_CLEANUP_TIMEOUT_MS = 5_000;
+export const BACKGROUND_FOLD_DOUBLE_PRESS_MS = 750;
+
 const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
 const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
@@ -44,7 +49,179 @@ function isExpandable(obj: unknown): obj is Expandable {
 }
 
 export class InputController {
-	constructor(private ctx: InteractiveModeContext) {}
+	readonly actionRegistry: ActionRegistry<void>;
+
+	constructor(private ctx: InteractiveModeContext) {
+		this.actionRegistry = new ActionRegistry({
+			context: undefined,
+			showError: actionId => this.ctx.showError(actionId),
+		});
+		this.#registerActions();
+	}
+
+	#registerActions(): void {
+		const callbacks: Partial<Record<(typeof APP_ACTION_METADATA)[number]["id"], () => void | Promise<void>>> = {
+			"app.interrupt": () => this.ctx.editor.onEscape?.(),
+			"app.clear": () => this.handleCtrlC(),
+			"app.exit": () => this.handleCtrlD(),
+			"app.suspend": () => this.handleCtrlZ(),
+			"app.thinking.cycle": () => this.cycleThinkingLevel(),
+			"app.thinking.toggle": () => this.toggleThinkingBlockVisibility(),
+			"app.commandPalette.open": () => this.openCommandPalette(),
+			"app.model.cycleForward": () => this.cycleRoleModel(),
+			"app.model.cycleBackward": () => this.cycleRoleModel({ temporary: true }),
+			"app.model.select": () => this.ctx.showModelSelector(),
+			"app.model.selectTemporary": () => this.ctx.showModelSelector({ temporaryOnly: true }),
+			"app.tools.expand": () => this.toggleToolOutputExpansion(),
+			"app.tool.backgroundFold": () => {
+				this.handleForegroundToolBackgroundFold();
+			},
+			"app.editor.external": () => this.openExternalEditor(),
+			"app.message.followUp": () => this.handleFollowUp(),
+			"app.message.queue": () => this.handleQueueSubmit(),
+			"app.message.dequeue": () => this.handleDequeue(),
+			"app.clipboard.pasteImage": async () => {
+				await this.handleImagePaste();
+			},
+			"app.clipboard.copyLine": () => this.handleCopyCurrentLine(),
+			"app.clipboard.copyPrompt": () => this.handleCopyPrompt(),
+			"app.session.new": async () => {
+				await this.ctx.handleClearCommand();
+			},
+			"app.session.tree": () => this.ctx.showTreeSelector(),
+			"app.session.fork": () => this.ctx.showUserMessageSelector(),
+			"app.session.resume": () => this.ctx.showSessionSelector(),
+			"app.session.observe": async () => {
+				await this.ctx.showSessionObserver();
+			},
+			"app.session.dashboard": () => this.ctx.showSessionsDashboard(),
+			"app.transcript.browse": () => this.ctx.showTranscriptViewer(),
+			"app.jobs.open": () => this.ctx.showJobsOverlay(),
+			"app.plan.toggle": () => this.ctx.planModeController.handleCommand(),
+			"app.mode.cycle": () => this.ctx.planModeController.handleCommand(),
+			"app.history.search": () => this.ctx.showHistorySearch(),
+			"app.stt.toggle": () => this.ctx.handleSTTToggle(),
+			"app.irc.sidebar.toggle": () => this.ctx.toggleIrcSidebar(),
+			"app.transcript.prevTurn": () => this.#jumpTranscriptTurn(-1),
+			"app.transcript.nextTurn": () => this.#jumpTranscriptTurn(1),
+			"app.tasks.toggle": () => this.ctx.showTasksPane(),
+			"app.queue.togglePane": () => this.toggleQueuePane(),
+			"app.message.sendNow": () => this.sendNow(),
+		};
+		for (const metadata of APP_ACTION_METADATA) {
+			const callback = callbacks[metadata.id];
+			this.actionRegistry.register({
+				...metadata,
+				availability: () => Boolean(callback) && this.#isActionAvailable(metadata.id),
+				execute: async () => {
+					if (!callback) throw new Error(`Unavailable action executed: ${metadata.id}`);
+					await callback();
+				},
+			});
+		}
+	}
+
+	#isActionAvailable(id: (typeof APP_ACTION_METADATA)[number]["id"]): boolean {
+		switch (id) {
+			case "app.suspend":
+				return process.platform !== "win32";
+			case "app.thinking.cycle":
+			case "app.thinking.toggle":
+				return Boolean(this.ctx.session.model?.reasoning);
+			case "app.commandPalette.open":
+				return this.ctx.editor.getText().trim().length === 0;
+			case "app.model.cycleForward":
+			case "app.model.cycleBackward":
+				return this.ctx.session.getRoleModelCycleCandidateCount() > 1;
+			case "app.tools.expand":
+				return this.ctx.chatContainer.children.some(isExpandable);
+			case "app.tool.backgroundFold":
+				return Boolean(this.ctx.session.hasForegroundBashBackgroundRequestHandler?.());
+			case "app.editor.external":
+				return Boolean(getEditorCommand());
+			case "app.message.followUp":
+			case "app.message.queue":
+				return (
+					this.ctx.session.isStreaming ||
+					this.ctx.session.isCompacting ||
+					this.ctx.session.isBashRunning ||
+					this.ctx.session.isEvalRunning
+				);
+			case "app.message.dequeue":
+				return this.ctx.session.queuedMessageCount > 0;
+			case "app.clipboard.copyPrompt":
+				return this.ctx.editor.getText().length > 0;
+			case "app.session.tree":
+			case "app.session.fork":
+				return this.ctx.session.messages.length > 0;
+			case "app.plan.toggle":
+				return this.ctx.planModeController.enabled && !this.ctx.goalModeController.enabled;
+			case "app.history.search":
+				return (this.ctx.historyStorage?.getRecent(1).length ?? 0) > 0;
+			case "app.stt.toggle":
+				return Boolean(this.ctx.settings.get("stt.enabled"));
+			case "app.transcript.browse":
+				return this.ctx.session.messages.length > 0;
+			case "app.transcript.prevTurn":
+			case "app.transcript.nextTurn":
+				return getUserMessageViewportAnchorIds(this.ctx.session.messages).length > 0;
+			case "app.mode.cycle":
+				return (
+					Boolean(this.ctx.settings.get("plan.enabled")) &&
+					!this.ctx.goalModeController.enabled &&
+					!this.ctx.goalModeController.paused
+				);
+			case "app.queue.togglePane":
+				return true;
+			case "app.message.sendNow":
+				return (
+					this.ctx.session.isStreaming &&
+					(this.ctx.editor.getText().trim().length > 0 || this.ctx.session.queuedMessageCount > 0)
+				);
+			default:
+				return true;
+		}
+	}
+
+	#executeAction(id: (typeof APP_ACTION_METADATA)[number]["id"]): void {
+		void this.actionRegistry.execute(id);
+	}
+
+	#transcriptTurnAnchorIds: readonly string[] = [];
+	#transcriptTurnPosition = 0;
+
+	#syncTranscriptTurnPosition(): readonly string[] {
+		const anchorIds = getUserMessageViewportAnchorIds(this.ctx.session.messages);
+		if (
+			anchorIds.length !== this.#transcriptTurnAnchorIds.length ||
+			anchorIds.some(id => !this.#transcriptTurnAnchorIds.includes(id))
+		) {
+			const hadAnchors = this.#transcriptTurnAnchorIds.length > 0;
+			const currentAnchorId = this.#transcriptTurnAnchorIds[this.#transcriptTurnPosition];
+			const retainedAnchorIds = this.#transcriptTurnAnchorIds.filter(id => anchorIds.includes(id));
+			this.#transcriptTurnAnchorIds = [
+				...retainedAnchorIds,
+				...anchorIds.filter(id => !retainedAnchorIds.includes(id)),
+			];
+			const currentPosition = currentAnchorId ? this.#transcriptTurnAnchorIds.indexOf(currentAnchorId) : -1;
+			this.#transcriptTurnPosition =
+				currentPosition >= 0
+					? currentPosition
+					: currentAnchorId || hadAnchors
+						? Math.min(this.#transcriptTurnPosition, this.#transcriptTurnAnchorIds.length)
+						: this.#transcriptTurnAnchorIds.length;
+		}
+		return this.#transcriptTurnAnchorIds;
+	}
+
+	#jumpTranscriptTurn(direction: -1 | 1): void {
+		const anchorIds = this.#syncTranscriptTurnPosition();
+		const targetPosition = this.#transcriptTurnPosition + direction;
+		if (targetPosition < 0 || targetPosition >= anchorIds.length) return;
+		if (this.ctx.ui.revealViewportAnchor(anchorIds[targetPosition], "top")) {
+			this.#transcriptTurnPosition = targetPosition;
+		}
+	}
 
 	#lastBackgroundFoldKeyTime = 0;
 	#slashCommands: SlashCommand[] = [];
@@ -341,58 +518,57 @@ export class InputController {
 
 		const clear = () => this.handleCtrlC();
 		this.ctx.editor.setActionKeys("app.clear", this.ctx.keybindings.getKeys("app.clear"));
-		this.ctx.editor.onClear = clear;
+		this.ctx.editor.onClear = () => this.#executeAction("app.clear");
 		this.#registerCommandPaletteAction("app.clear", clear);
 		const exit = () => this.handleCtrlD();
 		this.ctx.editor.setActionKeys("app.exit", this.ctx.keybindings.getKeys("app.exit"));
-		this.ctx.editor.onExit = exit;
+		this.ctx.editor.onExit = () => this.#executeAction("app.exit");
 		this.#registerCommandPaletteAction("app.exit", exit);
 		const suspend = () => this.handleCtrlZ();
 		this.ctx.editor.setActionKeys("app.suspend", this.ctx.keybindings.getKeys("app.suspend"));
-		this.ctx.editor.onSuspend = suspend;
+		this.ctx.editor.onSuspend = () => this.#executeAction("app.suspend");
 		this.#registerCommandPaletteAction("app.suspend", suspend);
 		const cycleThinking = () => this.cycleThinkingLevel();
 		this.ctx.editor.setActionKeys("app.thinking.cycle", this.ctx.keybindings.getKeys("app.thinking.cycle"));
-		this.ctx.editor.onCycleThinkingLevel = cycleThinking;
+		this.ctx.editor.onCycleThinkingLevel = () => this.#executeAction("app.thinking.cycle");
 		this.#registerCommandPaletteAction("app.thinking.cycle", cycleThinking);
 		this.ctx.editor.setActionKeys("app.commandPalette.open", this.ctx.keybindings.getKeys("app.commandPalette.open"));
-		this.ctx.editor.onOpenCommandPalette = () => this.openCommandPalette();
+		this.ctx.editor.onOpenCommandPalette = () => this.#executeAction("app.commandPalette.open");
 		const cycleModelForward = () => this.cycleRoleModel();
 		this.ctx.editor.setActionKeys("app.model.cycleForward", this.ctx.keybindings.getKeys("app.model.cycleForward"));
-		this.ctx.editor.onCycleModelForward = cycleModelForward;
+		this.ctx.editor.onCycleModelForward = () => this.#executeAction("app.model.cycleForward");
 		this.#registerCommandPaletteAction("app.model.cycleForward", cycleModelForward);
 		const cycleModelBackward = () => this.cycleRoleModel({ temporary: true });
 		this.ctx.editor.setActionKeys("app.model.cycleBackward", this.ctx.keybindings.getKeys("app.model.cycleBackward"));
-		this.ctx.editor.onCycleModelBackward = cycleModelBackward;
+		this.ctx.editor.onCycleModelBackward = () => this.#executeAction("app.model.cycleBackward");
 		this.#registerCommandPaletteAction("app.model.cycleBackward", cycleModelBackward);
 		const selectTemporaryModel = () => this.ctx.showModelSelector({ temporaryOnly: true });
 		this.ctx.editor.setActionKeys(
 			"app.model.selectTemporary",
 			this.ctx.keybindings.getKeys("app.model.selectTemporary"),
 		);
-		this.ctx.editor.onSelectModelTemporary = selectTemporaryModel;
+		this.ctx.editor.onSelectModelTemporary = () => this.#executeAction("app.model.selectTemporary");
 		this.#registerCommandPaletteAction("app.model.selectTemporary", selectTemporaryModel);
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ctx.ui.onDebug = () => this.ctx.showDebugSelector();
 		const selectModel = () => this.ctx.showModelSelector();
 		this.ctx.editor.setActionKeys("app.model.select", this.ctx.keybindings.getKeys("app.model.select"));
-		this.ctx.editor.onSelectModel = selectModel;
+		this.ctx.editor.onSelectModel = () => this.#executeAction("app.model.select");
 		this.#registerCommandPaletteAction("app.model.select", selectModel);
 		const searchHistory = () => this.ctx.showHistorySearch();
 		this.ctx.editor.setActionKeys("app.history.search", this.ctx.keybindings.getKeys("app.history.search"));
-		this.ctx.editor.onHistorySearch = searchHistory;
+		this.ctx.editor.onHistorySearch = () => this.#executeAction("app.history.search");
 		this.#registerCommandPaletteAction("app.history.search", searchHistory);
 		const toggleThinking = () => this.ctx.toggleThinkingBlockVisibility();
 		this.ctx.editor.setActionKeys("app.thinking.toggle", this.ctx.keybindings.getKeys("app.thinking.toggle"));
-		this.ctx.editor.onToggleThinking = toggleThinking;
+		this.ctx.editor.onToggleThinking = () => this.#executeAction("app.thinking.toggle");
 		this.#registerCommandPaletteAction("app.thinking.toggle", toggleThinking);
 		const externalEditor = () => this.openExternalEditor();
 		this.ctx.editor.setActionKeys("app.editor.external", this.ctx.keybindings.getKeys("app.editor.external"));
-		this.ctx.editor.onExternalEditor = externalEditor;
+		this.ctx.editor.onExternalEditor = () => this.#executeAction("app.editor.external");
 		this.#registerCommandPaletteAction("app.editor.external", externalEditor);
 		this.ctx.editor.onShowHotkeys = () => this.ctx.handleHotkeysCommand();
-		const pasteImage = () => this.handleImagePaste();
 		const pasteImageFromPalette = async () => {
 			await this.handleImagePaste();
 		};
@@ -400,14 +576,14 @@ export class InputController {
 			"app.clipboard.pasteImage",
 			this.ctx.keybindings.getKeys("app.clipboard.pasteImage"),
 		);
-		this.ctx.editor.onPasteImage = pasteImage;
+		this.ctx.editor.onPasteImage = () => this.actionRegistry.execute("app.clipboard.pasteImage");
 		this.#registerCommandPaletteAction("app.clipboard.pasteImage", pasteImageFromPalette);
 		const copyPrompt = () => this.handleCopyPrompt();
 		this.ctx.editor.setActionKeys(
 			"app.clipboard.copyPrompt",
 			this.ctx.keybindings.getKeys("app.clipboard.copyPrompt"),
 		);
-		this.ctx.editor.onCopyPrompt = copyPrompt;
+		this.ctx.editor.onCopyPrompt = () => this.#executeAction("app.clipboard.copyPrompt");
 		this.#registerCommandPaletteAction("app.clipboard.copyPrompt", copyPrompt);
 		this.ctx.editor.onPasteText = text => this.handleTextPaste(text);
 		this.ctx.editor.onPastePendingInputCleared = (reason, droppedInputCount) => {
@@ -418,15 +594,15 @@ export class InputController {
 		};
 		const expandTools = () => this.toggleToolOutputExpansion();
 		this.ctx.editor.setActionKeys("app.tools.expand", this.ctx.keybindings.getKeys("app.tools.expand"));
-		this.ctx.editor.onExpandTools = expandTools;
+		this.ctx.editor.onExpandTools = () => this.#executeAction("app.tools.expand");
 		this.#registerCommandPaletteAction("app.tools.expand", expandTools);
 		const dequeue = () => this.handleDequeue();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
-		this.ctx.editor.onDequeue = dequeue;
+		this.ctx.editor.onDequeue = () => this.#executeAction("app.message.dequeue");
 		this.#registerCommandPaletteAction("app.message.dequeue", dequeue);
 		const queue = () => this.handleQueueSubmit();
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
-		this.ctx.editor.onQueue = queue;
+		this.ctx.editor.onQueue = () => this.#executeAction("app.message.queue");
 		this.#registerCommandPaletteAction("app.message.queue", queue);
 
 		this.ctx.editor.onViewportPageScroll = direction => this.ctx.ui.scrollViewportPages(direction);
@@ -440,16 +616,16 @@ export class InputController {
 
 		for (const key of this.ctx.keybindings.getKeys("app.irc.sidebar.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
-				this.ctx.toggleIrcSidebar();
+				this.#executeAction("app.irc.sidebar.toggle");
 				return true;
 			});
 		}
 
-		const togglePlanMode = () => this.ctx.handlePlanModeCommand();
+		const togglePlanMode = () => this.ctx.planModeController.handleCommand();
 		this.#registerCommandPaletteAction("app.plan.toggle", togglePlanMode);
 		for (const key of this.ctx.keybindings.getKeys("app.plan.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
-				void togglePlanMode();
+				this.#executeAction("app.plan.toggle");
 				return true;
 			});
 		}
@@ -459,7 +635,7 @@ export class InputController {
 		this.#registerCommandPaletteAction("app.session.new", newSession);
 		for (const key of this.ctx.keybindings.getKeys("app.session.new")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
-				void newSession();
+				this.#executeAction("app.session.new");
 				return true;
 			});
 		}
@@ -469,7 +645,10 @@ export class InputController {
 		};
 		this.#registerCommandPaletteAction("app.session.tree", showTree);
 		for (const key of this.ctx.keybindings.getKeys("app.session.tree")) {
-			this.ctx.editor.setCustomKeyHandler(key, showTree);
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.#executeAction("app.session.tree");
+				return true;
+			});
 		}
 		const forkSession = () => {
 			this.ctx.showUserMessageSelector();
@@ -477,7 +656,10 @@ export class InputController {
 		};
 		this.#registerCommandPaletteAction("app.session.fork", forkSession);
 		for (const key of this.ctx.keybindings.getKeys("app.session.fork")) {
-			this.ctx.editor.setCustomKeyHandler(key, forkSession);
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.#executeAction("app.session.fork");
+				return true;
+			});
 		}
 		const resumeSession = () => {
 			this.ctx.showSessionSelector();
@@ -485,35 +667,51 @@ export class InputController {
 		};
 		this.#registerCommandPaletteAction("app.session.resume", resumeSession);
 		for (const key of this.ctx.keybindings.getKeys("app.session.resume")) {
-			this.ctx.editor.setCustomKeyHandler(key, resumeSession);
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.#executeAction("app.session.resume");
+				return true;
+			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.message.followUp")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
-				if (!this.#isFollowUpShortcutActive()) return false;
-				void this.handleFollowUp();
+				if (!this.actionRegistry.isAvailable("app.message.followUp")) return false;
+				this.#executeAction("app.message.followUp");
 				return true;
 			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.stt.toggle")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handleSTTToggle());
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.#executeAction("app.stt.toggle");
+				return true;
+			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.clipboard.copyLine")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
-				this.handleCopyCurrentLine();
+				this.#executeAction("app.clipboard.copyLine");
 			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.session.observe")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
-				this.ctx.showSessionObserver();
+				this.#executeAction("app.session.observe");
 			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.jobs.open")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
-				this.ctx.showJobsOverlay();
+				this.#executeAction("app.jobs.open");
+			});
+		}
+		for (const key of this.ctx.keybindings.getKeys("app.tasks.toggle")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				this.#executeAction("app.tasks.toggle");
+				return true;
 			});
 		}
 		for (const key of this.ctx.keybindings.getKeys("app.tool.backgroundFold")) {
-			this.ctx.editor.setCustomKeyHandler(key, () => this.handleForegroundToolBackgroundFold());
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				if (!this.actionRegistry.isAvailable("app.tool.backgroundFold")) return false;
+				this.#executeAction("app.tool.backgroundFold");
+				return true;
+			});
 		}
 
 		this.ctx.editor.onChange = (text: string) => {
@@ -769,6 +967,106 @@ export class InputController {
 		process.kill(0, "SIGTSTP");
 	}
 
+	#queuePaneOverlay: ReturnType<typeof this.ctx.ui.showOverlay> | undefined;
+
+	toggleQueuePane(): void {
+		if (this.#queuePaneOverlay) {
+			this.#queuePaneOverlay.hide();
+			this.#queuePaneOverlay = undefined;
+			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.ui.requestRender(true);
+			return;
+		}
+		this.#showQueuePane();
+	}
+
+	#showQueuePane(selectedIndex = 0): void {
+		const entries = this.ctx.session.getQueuedMessageEntries();
+		if (entries.length === 0) {
+			this.ctx.showStatus("No queued messages");
+			return;
+		}
+		const close = () => {
+			this.#queuePaneOverlay?.hide();
+			this.#queuePaneOverlay = undefined;
+			this.ctx.ui.setFocus(this.ctx.editor);
+			this.ctx.ui.requestRender(true);
+		};
+		const refresh = (nextIndex: number) => {
+			this.#queuePaneOverlay?.hide();
+			this.#queuePaneOverlay = undefined;
+			this.#showQueuePane(nextIndex);
+		};
+		const pane = new QueuePaneComponent(entries, {
+			selectedIndex,
+			onDelete: (entry, index) => {
+				const deleted = this.ctx.session.removeQueuedMessageForEditing(entry.id) !== undefined;
+				const remaining = this.ctx.session.getQueuedMessageEntries();
+				this.ctx.updatePendingMessagesDisplay();
+				if (remaining.length === 0) {
+					close();
+					this.ctx.showStatus(deleted ? "Deleted queued message" : "Queued message is no longer available");
+					return;
+				}
+				this.ctx.showStatus(deleted ? "Deleted queued message" : "Queued message is no longer available");
+				refresh(Math.min(index, remaining.length - 1));
+			},
+			onMove: (entry, index, direction) => {
+				const moved = this.ctx.session.moveQueuedMessageForEditing(entry.id, direction);
+				this.ctx.updatePendingMessagesDisplay();
+				this.ctx.showStatus(moved ? "Moved queued message" : "Queued message cannot move further");
+				refresh(Math.max(0, Math.min(index + (direction === "up" ? -1 : 1), entries.length - 1)));
+			},
+			onClose: close,
+		});
+		this.#queuePaneOverlay = this.ctx.ui.showOverlay(pane, {
+			anchor: "bottom-center",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+		});
+		this.ctx.ui.setFocus(pane);
+		this.ctx.ui.requestRender();
+	}
+
+	async sendNow(): Promise<void> {
+		const composerText = this.ctx.editor.getText().trim();
+		let text = composerText;
+		let queuedEntryId: string | undefined;
+		if (!text) {
+			if (this.ctx.session.isCompacting) {
+				this.ctx.showWarning("Cannot send immediately while compaction is in progress");
+				return;
+			}
+			const entry = this.ctx.session.getQueuedMessageEntries()[0];
+			if (!entry) {
+				this.ctx.showStatus("No visible queued message to send");
+				return;
+			}
+			text = entry.text;
+			queuedEntryId = entry.id;
+		}
+		const outcome = await this.ctx.session.cancelAndSubmit(text, { queuedEntryId });
+		if (outcome.kind === "submitted") {
+			if (composerText) this.ctx.clearEditor();
+			this.ctx.updatePendingMessagesDisplay();
+			return;
+		}
+		if (outcome.kind === "rolled_back") {
+			this.ctx.showWarning(
+				outcome.outcome.kind === "timeout"
+					? "Send was cancelled after forced recovery; queued messages were restored"
+					: "Send failed; queued messages were restored",
+			);
+			return;
+		}
+		if (outcome.reason === "compaction") {
+			this.ctx.showWarning("Cannot send immediately while compaction is in progress");
+		} else {
+			this.ctx.showStatus("Send already in progress");
+		}
+	}
+
 	handleDequeue(): void {
 		const entries = this.#getEditableQueuedMessages();
 		if (entries.length === 0) {
@@ -957,15 +1255,6 @@ export class InputController {
 	 */
 	#busyStreamingBehavior(): "steer" | "followUp" {
 		return this.ctx.settings.get("busyPromptMode") === "steer" ? "steer" : "followUp";
-	}
-
-	#isFollowUpShortcutActive(): boolean {
-		return (
-			this.ctx.session.isStreaming ||
-			this.ctx.session.isCompacting ||
-			this.ctx.session.isBashRunning ||
-			this.ctx.session.isEvalRunning
-		);
 	}
 
 	/**
@@ -1215,7 +1504,7 @@ export class InputController {
 		}
 
 		const now = Date.now();
-		if (now - this.#lastBackgroundFoldKeyTime > 750) {
+		if (now - this.#lastBackgroundFoldKeyTime > BACKGROUND_FOLD_DOUBLE_PRESS_MS) {
 			this.#lastBackgroundFoldKeyTime = now;
 			this.ctx.showStatus("Press Ctrl+B again to fold supported foreground bash into a background job");
 			return true;
@@ -1446,30 +1735,90 @@ export class InputController {
 		}
 	}
 
-	openCommandPalette(): void {
+	async #dispatchPaletteSlashCommand(name: string, restoreComposer: () => void): Promise<void> {
 		if (this.#paletteCommandInFlight) {
 			this.ctx.showStatus("A palette command is still running.");
 			return;
 		}
 
-		this.ctx.showCommandPalette(this.#slashCommands, [...this.#commandPaletteActions.values()], async name => {
-			if (this.#paletteCommandInFlight) {
-				this.ctx.showStatus("A palette command is still running.");
-				return;
-			}
+		if (this.ctx.editor.getText() || this.ctx.pendingImages.length > 0) {
+			this.ctx.showStatus("Send or clear the draft before running a palette command.");
+			return;
+		}
 
-			if (this.ctx.editor.getText() || this.ctx.pendingImages.length > 0) {
-				this.ctx.showStatus("Send or clear the draft before running a palette command.");
-				return;
-			}
+		restoreComposer();
+		this.#paletteCommandInFlight = true;
+		try {
+			await this.submitText(`/${name}`, { ownsComposer: false, editor: this.ctx.editor });
+		} finally {
+			this.#paletteCommandInFlight = false;
+		}
+	}
 
-			this.#paletteCommandInFlight = true;
-			try {
-				await this.submitText(`/${name}`, { ownsComposer: false, editor: this.ctx.editor });
-			} finally {
-				this.#paletteCommandInFlight = false;
-			}
-		});
+	openCommandPalette(): void {
+		if (this.ctx.isTranscriptViewerOpen?.()) return;
+		if (this.#paletteCommandInFlight) {
+			this.ctx.showStatus("A palette command is still running.");
+			return;
+		}
+
+		const actions = [...this.#commandPaletteActions.values()];
+		const slashCommands = [...(this.ctx.getSlashCommands?.() ?? this.#slashCommands)];
+		if (!this.ctx.showCommandPalette) {
+			let overlayHandle: ReturnType<typeof this.ctx.ui.showOverlay> | undefined;
+			const close = () => {
+				overlayHandle?.hide();
+				this.ctx.ui.setFocus(this.ctx.editor);
+				this.ctx.ui.requestRender(true);
+			};
+			const entries: CommandPaletteEntry[] = [
+				...this.actionRegistry
+					.all()
+					.filter(action => this.actionRegistry.isAvailable(action.id))
+					.map(action => ({
+						id: `action:${action.id}`,
+						label: action.title,
+						description: action.category,
+						keybinding: action.bindingId
+							? this.ctx.keybindings.getKeys(action.bindingId).join(", ") || undefined
+							: undefined,
+						handler: () => this.actionRegistry.execute(action.id),
+					})),
+				...slashCommands.map(command => ({
+					id: `slash:/${command.name}`,
+					label: `/${command.name}`,
+					description: command.description,
+				})),
+			];
+			const palette = new CommandPalette(
+				entries,
+				entry => {
+					if (entry.handler) {
+						close();
+						void entry.handler();
+					} else {
+						const command = entry.id.slice("slash:/".length);
+						void this.#dispatchPaletteSlashCommand(command, close);
+					}
+				},
+				close,
+			);
+			overlayHandle = this.ctx.ui.showOverlay(palette, {
+				anchor: "bottom-center",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+			});
+			this.ctx.ui.setFocus(palette);
+			this.ctx.ui.requestRender();
+			return;
+		}
+		this.ctx.showCommandPalette(slashCommands, actions, name =>
+			this.#dispatchPaletteSlashCommand(name, () => {
+				this.ctx.ui.setFocus?.(this.ctx.editor);
+				this.ctx.ui.requestRender(true);
+			}),
+		);
 	}
 
 	cycleThinkingLevel(): void {

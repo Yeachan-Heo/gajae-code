@@ -33,15 +33,7 @@ test("napi NotificationServer permits synchronous reentrant host calls during in
 	server.onInbound((_error, message) => {
 		if (message?.kind !== "user_message") return;
 		inbound += 1;
-		server.pushFrame(
-			JSON.stringify({
-				type: "turn_stream",
-				sessionId,
-				phase: "live",
-				text: "inbound",
-				messageRef: `inbound-${message.updateId}`,
-			}),
-		);
+		server.pushTurnStreamUnchecked(sessionId, "live", "inbound", undefined, `inbound-${message.updateId}`);
 	});
 	server.onReply((_error, reply) => {
 		if (!reply) return;
@@ -74,9 +66,7 @@ test("napi NotificationServer permits synchronous reentrant host calls during in
 		const count = 100;
 		for (let i = 0; i < count; i++) {
 			ws.send(JSON.stringify({ type: "user_message", sessionId, text: `message-${i}`, token, updateId: i }));
-			server.pushFrame(
-				JSON.stringify({ type: "turn_stream", sessionId, phase: "live", text: "flood", messageRef: `flood-${i}` }),
-			);
+			server.pushTurnStreamUnchecked(sessionId, "live", "flood", undefined, `flood-${i}`);
 		}
 		server.registerAsk(
 			JSON.stringify({ id: "reply-ask", kind: "ask", sessionId, question: "Reentrant?", options: ["yes"] }),
@@ -85,6 +75,9 @@ test("napi NotificationServer permits synchronous reentrant host calls during in
 		await waitFor(() => inbound === count, "all inbound callbacks");
 		await waitFor(() => markers.size === count * 2, "all interleaved frames");
 		await waitFor(() => replies === 1 && actionResolved, "reentrant reply resolution");
+		const frameStats = server.knownGoodFrameStats();
+		expect(frameStats.knownGoodTurnStreamFrames).toBe(count * 2);
+		expect(frameStats.turnStreamSerdeValidationParses).toBe(0);
 	} finally {
 		ws.close();
 		server.stop();
@@ -146,3 +139,36 @@ test("napi NotificationServer awaited stop releases connected-client state roots
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("napi NotificationServer encodes Buffer file attachments only after the N-API boundary", async () => {
+	const sessionId = `buffer-attachment-${process.pid}-${Date.now()}`;
+	const token = "buffer-token";
+	const server = new NotificationServer(sessionId, token, `/tmp/${sessionId}`, true);
+	const bytes = Buffer.from([0, 1, 2, 253, 254, 255]);
+	const endpoint = await server.start();
+	const ws = await open(endpoint.url, token);
+	let attachment: { type?: string; sessionId?: string; data?: string; name?: string } | undefined;
+	ws.addEventListener("message", event => {
+		const frame = JSON.parse(String(event.data)) as {
+			type?: string;
+			sessionId?: string;
+			data?: string;
+			name?: string;
+		};
+		if (frame.type === "file_attachment") attachment = frame;
+	});
+	try {
+		await waitFor(() => server.clientCount() === 1, "client connection");
+		server.pushFileAttachmentUnchecked(sessionId, "bytes.bin", undefined, bytes, undefined);
+		await waitFor(() => attachment !== undefined, "file attachment");
+		expect(attachment).toEqual({
+			type: "file_attachment",
+			sessionId,
+			name: "bytes.bin",
+			data: bytes.toString("base64"),
+		});
+	} finally {
+		ws.close();
+		await server.stopAndWait();
+	}
+}, 30_000);

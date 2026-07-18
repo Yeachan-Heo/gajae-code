@@ -1,5 +1,6 @@
 {
   "deep-interview": {
+    "canonicalOverrides": [],
     "graphLabel": "Deep Interview",
     "hudFields": [
       "current_phase",
@@ -10,6 +11,7 @@
       "topology"
     ],
     "initialState": "interviewing",
+    "phaseLock": [],
     "retention": [
       {
         "category": "state",
@@ -41,6 +43,14 @@
         "id": "complete",
         "terminal": true
       }
+    ],
+    "stopReleasingPhases": [
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
     ],
     "terminalStates": [
       "handoff",
@@ -318,6 +328,16 @@
     ]
   },
   "ralplan": {
+    "canonicalOverrides": [
+      "final",
+      "handoff",
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
+    ],
     "graphLabel": "Ralplan",
     "hudFields": [
       "current_phase",
@@ -328,6 +348,16 @@
       "plan_path"
     ],
     "initialState": "planner",
+    "phaseLock": [
+      "final",
+      "handoff",
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
+    ],
     "retention": [
       {
         "category": "state",
@@ -377,6 +407,14 @@
         "id": "handoff",
         "terminal": true
       }
+    ],
+    "stopReleasingPhases": [
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
     ],
     "terminalStates": [
       "final",
@@ -704,6 +742,7 @@
     ]
   },
   "team": {
+    "canonicalOverrides": [],
     "graphLabel": "Team",
     "hudFields": [
       "current_phase",
@@ -714,6 +753,7 @@
       "integration"
     ],
     "initialState": "starting",
+    "phaseLock": [],
     "retention": [
       {
         "category": "state",
@@ -773,6 +813,14 @@
         "id": "handoff",
         "terminal": true
       }
+    ],
+    "stopReleasingPhases": [
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
     ],
     "terminalStates": [
       "complete",
@@ -1150,6 +1198,7 @@
     ]
   },
   "ultragoal": {
+    "canonicalOverrides": [],
     "graphLabel": "Ultragoal",
     "hudFields": [
       "current_phase",
@@ -1160,6 +1209,7 @@
       "brief_path"
     ],
     "initialState": "goal-planning",
+    "phaseLock": [],
     "retention": [
       {
         "category": "state",
@@ -1211,6 +1261,14 @@
         "id": "handoff",
         "terminal": true
       }
+    ],
+    "stopReleasingPhases": [
+      "complete",
+      "completed",
+      "failed",
+      "cancelled",
+      "canceled",
+      "inactive"
     ],
     "terminalStates": [
       "missing",
