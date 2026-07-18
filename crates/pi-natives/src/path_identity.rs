@@ -150,7 +150,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 
 fn digest_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
 	let mut hasher = Sha256::new();
-	let mut chunk = [0u8; 64 * 1024];
+	let mut chunk = [0u8; 16 * 1024];
 	loop {
 		let read = reader.read(&mut chunk)?;
 		if read == 0 {
