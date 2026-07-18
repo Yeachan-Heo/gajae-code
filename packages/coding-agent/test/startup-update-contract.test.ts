@@ -405,6 +405,7 @@ describe("startup update contract", () => {
 				runRootCommand(rootArgs(), [], {
 					createAgentSession: async () => sessionResult,
 					discoverAuthStorage: async () => authStorage,
+					stdinIsTTY: () => true,
 					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
 					initTheme: async () => {},
 					readPipedInput: async () => undefined,
@@ -488,6 +489,7 @@ describe("startup update contract", () => {
 				runRootCommand(rootArgs(), [], {
 					createAgentSession: async () => sessionResult,
 					discoverAuthStorage: async () => authStorage,
+					stdinIsTTY: () => true,
 					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
 					initTheme: async () => {},
 					readPipedInput: async () => undefined,
@@ -520,6 +522,7 @@ describe("startup update contract", () => {
 			const root = runRootCommand(rootArgs(), [], {
 				createAgentSession: async () => fakeSessionResult(),
 				discoverAuthStorage: async () => authStorage,
+				stdinIsTTY: () => true,
 				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": true }),
 				startupUpdate: {
 					check: async () => {
@@ -587,6 +590,7 @@ describe("startup update contract", () => {
 					runRootCommand(rootArgs(), [], {
 						createAgentSession: async () => fakeSessionResult(),
 						discoverAuthStorage: async () => authStorage,
+						stdinIsTTY: () => true,
 						settings: Settings.isolated({
 							"marketplace.autoUpdate": "off",
 							"startup.checkUpdate": testCase.enabled,
@@ -639,6 +643,7 @@ describe("startup update contract", () => {
 				runRootCommand(parsed, [], {
 					createAgentSession: async () => fakeSessionResult(),
 					discoverAuthStorage: async () => authStorage,
+					stdinIsTTY: () => true,
 					settings,
 					initTheme: async () => {},
 					readPipedInput: async () => undefined,
@@ -697,6 +702,7 @@ describe("startup update contract", () => {
 				runRootCommand(parsed, [], {
 					createAgentSession: async () => fakeSessionResult(),
 					discoverAuthStorage: async () => authStorage,
+					stdinIsTTY: () => true,
 					settings,
 					initTheme: async () => {},
 					readPipedInput: async () => undefined,

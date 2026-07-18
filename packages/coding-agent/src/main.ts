@@ -100,6 +100,51 @@ export function classifyStartupUpdateRoute(
 	return parsed.mode === "acp" ? "acp" : "text";
 }
 
+export const NON_TTY_NO_INPUT_ERROR =
+	"stdin is not a TTY and no prompt was provided; pass a prompt or @file, pipe input, or use -p/--print for non-interactive runs.";
+
+export interface LaunchDisposition {
+	autoPrint: boolean;
+	isInteractive: boolean;
+	/** Set when an interactive launch is impossible (non-TTY stdin, nothing to run). */
+	nonInteractiveError?: string;
+}
+
+/**
+ * Decides between interactive, auto-print, and fail-fast launches.
+ *
+ * A non-TTY stdin means the TUI can never receive input, so an interactive
+ * launch would execute the initial prompt (real token spend) and then block in
+ * the event loop forever — observed as orphaned `gjc <words> </dev/null`
+ * processes holding session transcripts and sqlite handles for hours.
+ *
+ * On non-TTY stdin, prepared input (positional messages or `@file`
+ * text/images) and piped content degrade to print mode; with nothing to run we
+ * fail fast instead of hanging. Explicit `--print` and `--mode` launches
+ * (rpc/acp/bridge run over non-TTY stdio) are untouched, and TTY launches keep
+ * their current interactive behavior.
+ */
+export function resolveLaunchDisposition(args: {
+	stdinIsTTY: boolean;
+	pipedInput: string | undefined;
+	hasPreparedInput: boolean;
+	print: boolean;
+	mode: string | undefined;
+}): LaunchDisposition {
+	const modeSet = args.mode !== undefined;
+	const autoPrint =
+		!args.print && !modeSet && !args.stdinIsTTY && (args.pipedInput !== undefined || args.hasPreparedInput);
+	const isInteractive = !args.print && !modeSet && !autoPrint;
+	if (isInteractive && !args.stdinIsTTY) {
+		return {
+			autoPrint: false,
+			isInteractive: false,
+			nonInteractiveError: NON_TTY_NO_INPUT_ERROR,
+		};
+	}
+	return { autoPrint, isInteractive };
+}
+
 /** Coordinates the non-blocking update check around the interactive UI lifecycle. */
 export class StartupUpdateOrchestrator {
 	#versionCheckPromise: Promise<string | undefined> | undefined;
@@ -281,8 +326,21 @@ export function resolveAcpStartupOptions(
 	};
 }
 
-async function readPipedInput(): Promise<string | undefined> {
-	if (process.stdin.isTTY !== false) return undefined;
+async function readPipedInput(context: {
+	hasPreparedInput: boolean;
+	protocolMode: boolean;
+	stdinIsTTY: boolean;
+}): Promise<string | undefined> {
+	// Bun reports `undefined` (not `false`) for every non-TTY stdin, so gate on
+	// the positive TTY check rather than `isTTY !== false`.
+	if (context.stdinIsTTY) return undefined;
+	// Protocol handlers (rpc/acp/bridge) own stdin — never consume their bytes.
+	if (context.protocolMode) return undefined;
+	// Prepared positional/@file input must run without waiting on an open pipe
+	// that may never reach EOF; stdin is only read when it is the sole possible
+	// input source. In that case blocking until the writer closes is standard
+	// filter semantics (same as `cat`).
+	if (context.hasPreparedInput) return undefined;
 	try {
 		const text = await Bun.stdin.text();
 		if (text.trim().length === 0) return undefined;
@@ -1014,6 +1072,7 @@ export interface RunRootCommandDependencies {
 	startupUpdate?: { check: () => Promise<string | undefined> };
 	initTheme?: typeof initTheme;
 	readPipedInput?: typeof readPipedInput;
+	stdinIsTTY?: () => boolean;
 	runStartupCredentialAutoImportIfNeeded?: typeof runStartupCredentialAutoImportIfNeeded;
 	getChangelogForDisplay?: typeof getChangelogForDisplay;
 	createInteractiveMode?: CreateInteractiveMode;
@@ -1164,8 +1223,14 @@ export async function runRootCommand(
 	if (parsedArgs.noTitle || parsedArgs.mode === "acp") {
 		Bun.env.PI_NO_TITLE = "1";
 	}
+	const stdinIsTTY = (deps.stdinIsTTY ?? (() => process.stdin.isTTY === true))();
+	const hasPreparedInput = parsedArgs.messages.length > 0 || parsedArgs.fileArgs.length > 0;
 	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
-		const pipedInput = await (deps.readPipedInput ?? readPipedInput)();
+		const pipedInput = await (deps.readPipedInput ?? readPipedInput)({
+			hasPreparedInput,
+			protocolMode: parsedArgs.mode !== undefined,
+			stdinIsTTY,
+		});
 		if (parsedArgs.fileArgs.length === 0) {
 			return { pipedInput, fileText: undefined, fileImages: undefined };
 		}
@@ -1180,7 +1245,20 @@ export async function runRootCommand(
 		fileImages,
 		stdinContent: pipedInput,
 	});
-	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
+	const disposition = resolveLaunchDisposition({
+		stdinIsTTY,
+		pipedInput,
+		hasPreparedInput,
+		print: Boolean(parsedArgs.print),
+		mode: parsedArgs.mode,
+	});
+	if (disposition.nonInteractiveError) {
+		process.stderr.write(`${chalk.red(disposition.nonInteractiveError)}\n`);
+		process.exitCode = 1;
+		if (!deps.suppressProcessExit) process.exit(1);
+		return;
+	}
+	const autoPrint = disposition.autoPrint;
 	const startupUpdateRoute = classifyStartupUpdateRoute(parsedArgs, autoPrint);
 	const startupUpdate = new StartupUpdateOrchestrator(
 		startupUpdateRoute,
