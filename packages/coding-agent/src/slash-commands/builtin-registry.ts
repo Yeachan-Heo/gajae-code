@@ -1181,6 +1181,26 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			runtime.ctx.editor.setText("");
 		},
 	},
+	{
+		name: "branch",
+		description: "Branch from an earlier user message into a new session",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.showUserMessageSelector();
+			if (canClearComposer(runtime)) {
+				runtime.ctx.editor.setText("");
+			}
+		},
+	},
+	{
+		name: "fork",
+		description: "Fork the current session",
+		handleTui: async (_command, runtime) => {
+			if (canClearComposer(runtime)) {
+				runtime.ctx.editor.setText("");
+			}
+			await runtime.ctx.handleForkCommand();
+		},
+	},
 
 	{
 		name: "provider",

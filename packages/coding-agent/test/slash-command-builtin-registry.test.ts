@@ -152,6 +152,45 @@ describe("builtin /copy slash command", () => {
 		expect(sessionCommand?.description).toBe("Show session info or delete the current session transcript/artifacts");
 		expect(sessionCommand?.subcommands?.map(command => command.name)).toEqual(["info", "delete"]);
 	});
+	it("discovers and dispatches session branch and fork commands without clearing unowned drafts", async () => {
+		const events: string[] = [];
+		const showUserMessageSelector = vi.fn();
+		const setText = vi.fn(() => events.push("clear"));
+		const handleForkCommand = vi.fn(async () => {
+			events.push("fork");
+		});
+		const editor = { setText } as unknown as InteractiveModeContext["editor"];
+		const ctx = {
+			showUserMessageSelector,
+			handleForkCommand,
+			editor,
+		} as unknown as InteractiveModeContext;
+		const runtime = { ctx, handleBackgroundCommand: () => undefined };
+
+		const branchCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "branch");
+		const forkCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "fork");
+		expect(branchCommand?.description).toBe("Branch from an earlier user message into a new session");
+		expect(forkCommand?.description).toBe("Fork the current session");
+
+		expect(await executeBuiltinSlashCommand("/branch", runtime)).toBe(true);
+		expect(showUserMessageSelector).toHaveBeenCalledTimes(1);
+		expect(setText).toHaveBeenCalledTimes(1);
+
+		setText.mockClear();
+		expect(await executeBuiltinSlashCommand("/fork", runtime)).toBe(true);
+		expect(handleForkCommand).toHaveBeenCalledTimes(1);
+		expect(setText).toHaveBeenCalledTimes(1);
+		expect(events.slice(-2)).toEqual(["clear", "fork"]);
+
+		setText.mockClear();
+		const paletteRuntime = {
+			...runtime,
+			composer: { ownsComposer: false, editor },
+		};
+		expect(await executeBuiltinSlashCommand("/branch", paletteRuntime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/fork", paletteRuntime)).toBe(true);
+		expect(setText).not.toHaveBeenCalled();
+	});
 
 	it("dispatches zero-argument /copy to the existing copy controller path", async () => {
 		const { runtime, handleCopyCommand, showError, setText } = createTuiRuntime();
