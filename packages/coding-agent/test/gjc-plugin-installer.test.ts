@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
+import { createServer } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -35,72 +36,70 @@ async function exists(p: string): Promise<boolean> {
 	}
 }
 
-/**
- * Create a bare-but-working local git repo served by `git daemon`, returning a
- * `git://127.0.0.1:<port>/<subdir>` URL that `resolveGit` clones with argv-only
- * `git clone --depth 1 -- <url> <dest>`. Uses a fixed high port with
- * `--reuseaddr` and `--export-all` so no per-repo `git-daemon-export-ok` dance
- * is needed. Returns null if `git daemon` is unavailable so callers can skip.
- */
-async function mkGitDaemonRepo(manifest: object): Promise<{ url: string; stop: () => void } | null> {
-	if (spawnSync("git", ["daemon", "--help"], { stdio: "ignore" }).status !== 0) return null;
+async function getAvailablePort(): Promise<number> {
+	const server = createServer();
+	const { promise, resolve, reject } = Promise.withResolvers<number>();
+	server.once("error", reject);
+	server.listen(0, "127.0.0.1", () => {
+		const address = server.address();
+		if (!address || typeof address === "string") {
+			reject(new Error("Failed to allocate a local TCP port"));
+			return;
+		}
+		server.close(error => {
+			if (error) reject(error);
+			else resolve(address.port);
+		});
+	});
+	return promise;
+}
+
+async function mkGitDaemonRepo(manifest: object): Promise<{ url: string; stop: () => Promise<void> }> {
 	const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-git-src-"));
 	tempDirs.push(base);
 	const repoDir = path.join(base, "plugin-repo");
 	await fs.mkdir(repoDir, { recursive: true });
-	await fs.writeFile(
-		path.join(repoDir, "gajae-plugin.json"),
-		JSON.stringify(manifest),
-	);
+	await fs.writeFile(path.join(repoDir, "gajae-plugin.json"), JSON.stringify(manifest));
 	await fs.writeFile(path.join(repoDir, "README.md"), "# git-sourced plugin\n");
-	const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
-	if (spawnSync("git", ["init", "-q", "-b", "main"], { cwd: repoDir, env: gitEnv }).status !== 0) return null;
-	if (spawnSync("git", ["add", "-A"], { cwd: repoDir, env: gitEnv }).status !== 0) return null;
-	if (spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: repoDir, env: gitEnv }).status !== 0) return null;
+	const gitEnv = {
+		...process.env,
+		GIT_AUTHOR_NAME: "t",
+		GIT_AUTHOR_EMAIL: "t@t",
+		GIT_COMMITTER_NAME: "t",
+		GIT_COMMITTER_EMAIL: "t@t",
+	};
+	expect(spawnSync("git", ["init", "-q", "-b", "main"], { cwd: repoDir, env: gitEnv }).status).toBe(0);
+	expect(spawnSync("git", ["add", "-A"], { cwd: repoDir, env: gitEnv }).status).toBe(0);
+	expect(spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: repoDir, env: gitEnv }).status).toBe(0);
 
-	const port = "19418";
+	const port = await getAvailablePort();
+	const url = `git://127.0.0.1:${port}/plugin-repo`;
 	const daemon = spawn(
 		"git",
-		["daemon", "--base-path=" + base, "--export-all", "--listen=127.0.0.1", `--port=${port}`, "--reuseaddr"],
-		{ stdio: "ignore", detached: true },
+		["daemon", `--base-path=${base}`, "--export-all", "--listen=127.0.0.1", `--port=${port}`, "--reuseaddr"],
+		{ stdio: "ignore" },
 	);
-	// Poll until the daemon actually accepts connections (bind/ready can lag the
-	// spawn on busy or CI hosts); give up after ~3s so the test fails fast rather
-	// than hanging on a clone to a half-bound socket.
-	const ready = await new Promise<boolean>(resolve => {
-		const startedAt = Date.now();
-		const probe = () => {
-			const child = spawn("git", ["ls-remote", `git://127.0.0.1:${port}/plugin-repo`, "HEAD"], {
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			let settled = false;
-			child.on("error", () => {});
-			child.on("close", code => {
-				if (settled) return;
-				settled = true;
-				if (code === 0) resolve(true);
-				else if (Date.now() - startedAt > 3000) resolve(false);
-				else setTimeout(probe, 100);
-			});
-		};
-		probe();
-	});
-	if (!ready) {
-		try {
-			process.kill(-daemon.pid!, "SIGTERM");
-		} catch {
+	const startedAt = Date.now();
+	while (true) {
+		if (daemon.exitCode !== null) throw new Error(`git daemon exited before readiness with code ${daemon.exitCode}`);
+		if (spawnSync("git", ["ls-remote", url, "HEAD"], { stdio: "ignore", timeout: 1_000 }).status === 0) break;
+		if (Date.now() - startedAt > 5_000) {
 			daemon.kill("SIGTERM");
+			throw new Error("git daemon did not become ready within 5 seconds");
 		}
-		return null;
+		await Bun.sleep(100);
 	}
-	const stop = () => {
-		try {
-			process.kill(-daemon.pid!, "SIGTERM");
-		} catch {
+
+	return {
+		url,
+		stop: async () => {
+			if (daemon.exitCode !== null) return;
+			const { promise, resolve } = Promise.withResolvers<void>();
+			daemon.once("close", () => resolve());
 			daemon.kill("SIGTERM");
-		}
+			await promise;
+		},
 	};
-	return { url: `git://127.0.0.1:${port}/plugin-repo`, stop };
 }
 describe("GJC plugin installer", () => {
 	test("installs a local-path bundle into the project scope", async () => {
@@ -203,7 +202,6 @@ describe("GJC plugin installer", () => {
 			system_appendix: [{ name: "git-policy", content: "policy body" }],
 			"agent-appendix": [],
 		});
-		if (!served) return; // git daemon unavailable; skip without failing.
 		const cwd = await mkProjectCwd();
 		try {
 			const result = await installGjcPluginBundle(served.url, { scope: "project", cwd });
@@ -219,21 +217,18 @@ describe("GJC plugin installer", () => {
 			expect(registry.plugins[0]?.source.kind).toBe("git");
 			expect(typeof registry.plugins[0]?.source.sha).toBe("string");
 		} finally {
-			served.stop();
+			await served.stop();
 		}
 	});
 
 	test("an invalid git source maps stderr to GjcPluginLoadError(install_conflict)", async () => {
-		// A refused connection produces a git stderr line; runGit must surface it
-		// as GjcPluginLoadError(install_conflict) with the stderr in the message.
 		const cwd = await mkProjectCwd();
-		// Port 1 is privileged/refused on every OS — guaranteed non-existent repo.
-		const badUrl = "git://127.0.0.1:1/no-such-repo.git";
+		const closedPort = await getAvailablePort();
+		const badUrl = `git://127.0.0.1:${closedPort}/no-such-repo.git`;
 		await expect(installGjcPluginBundle(badUrl, { scope: "project", cwd })).rejects.toMatchObject({
 			code: "install_conflict",
 			name: "GjcPluginLoadError",
 		});
-		// Nothing installed.
 		const registry = await readRegistry("project", cwd);
 		expect(registry.plugins).toEqual([]);
 		expect(await exists(path.join(cwd, ".gjc", "gjc-plugins", "no-such-repo"))).toBe(false);
