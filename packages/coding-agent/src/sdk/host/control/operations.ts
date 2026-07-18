@@ -12,7 +12,12 @@ export interface ControlSurface {
 	abort(): Promise<ControlValue> | ControlValue;
 	abortAndPrompt(text: string): Promise<ControlValue> | ControlValue;
 	answerAsk(id: string, answer: ControlValue): Promise<ControlValue> | ControlValue;
-	answerGate(id: string, response: ControlValue, expectedSessionId?: string): Promise<ControlValue> | ControlValue;
+	answerGate(
+		id: string,
+		response: ControlValue,
+		expectedSessionId?: string,
+		idempotencyKey?: string,
+	): Promise<ControlValue> | ControlValue;
 	approvePlan(id: string, choice: ControlValue, expectedSessionId?: string): Promise<ControlValue> | ControlValue;
 	invokeSkill(name: string, args: ControlValue): Promise<ControlValue> | ControlValue;
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;

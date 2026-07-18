@@ -1213,7 +1213,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		// Status action doesn't need a file
 		if (action === "status") {
 			const servers = Object.keys(config.servers);
-			const lspmuxState = await detectLspmux();
+			const lspmuxState = await detectLspmux(this.session.cwd);
 			const lspmuxStatus = lspmuxState.available
 				? lspmuxState.running
 					? "lspmux: active (multiplexing enabled)"

@@ -294,28 +294,30 @@ export class GoalRuntime {
 		await this.#withAccounting(() => this.#flushUsageLocked(currentUsage));
 	}
 
-	#createGoalState(objective: string): GoalModeState {
+	#createGoalState(input: { objective: string; provenance?: Goal["provenance"] }): GoalModeState {
 		const now = this.#now();
 		const goal: Goal = {
 			id: String(Snowflake.next()),
-			objective,
+			objective: input.objective,
 			status: "active",
 			tokensUsed: 0,
 			timeUsedSeconds: 0,
 			createdAt: now,
 			updatedAt: now,
+			...(input.provenance ? { provenance: input.provenance } : {}),
 		};
 		return { enabled: true, mode: "active", goal };
 	}
 
-	async createGoal(input: { objective: string }): Promise<GoalModeState> {
+	async createGoal(input: { objective: string; provenance?: Goal["provenance"] }): Promise<GoalModeState> {
 		const objective = validateGoalObjective(input.objective, "create");
 		return await this.#withAccounting(async () => {
 			const existing = this.#getStateClone();
 			if (existing?.goal && existing.goal.status !== "dropped" && existing.goal.status !== "complete") {
 				throw new Error("cannot create a new goal because this session already has a goal");
 			}
-			const state = this.#createGoalState(objective);
+			const state = this.#createGoalState({ objective, provenance: input.provenance ?? { source: "user" } });
+
 			this.#markActiveAccounting(state.goal);
 			await this.#commitState(state, { persist: "goal" });
 			return state;
@@ -330,7 +332,7 @@ export class GoalRuntime {
 				throw new Error("cannot replace goal because no goal is active");
 			}
 			await this.#flushUsageLocked();
-			const state = this.#createGoalState(objective);
+			const state = this.#createGoalState({ objective, provenance: { source: "user" } });
 			this.#markActiveAccounting(state.goal);
 			await this.#commitState(state, { persist: "goal" });
 			return state;

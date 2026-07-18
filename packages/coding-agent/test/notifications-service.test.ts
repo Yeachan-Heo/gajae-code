@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
 import { tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
-import type { NotificationServiceFs } from "../src/sdk/bus/notification-service";
+import type {
+	NotificationEndpointFileIdentity,
+	NotificationExactUnlinkResult,
+	NotificationServiceFs,
+} from "../src/sdk/bus/notification-service";
 import {
 	buildNotificationStatusReport,
 	checkNotificationHealth,
@@ -28,9 +33,14 @@ function mockFs(
 		 * test simulate a concurrent daemon takeover happening mid-recovery.
 		 */
 		onAcquireExclusive?: (file: string, store: Map<string, string>) => void;
+		/** Fires immediately before identity-bound endpoint deletion. */
+		onExactUnlink?: (file: string, store: Map<string, string>) => void;
+		exactUnlinkResult?: (file: string) => NotificationExactUnlinkResult | undefined;
+		rejectEndpointFiles?: Set<string>;
 	} = {},
 ): { fs: NotificationServiceFs; unlinked: string[]; created: string[]; store: Map<string, string> } {
 	const store = new Map(Object.entries(files));
+	const revisions = new Map<string, number>([...store.keys()].map(file => [file, 1]));
 	const unlinked: string[] = [];
 	const created: string[] = [];
 	const enoent = (): NodeJS.ErrnoException => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
@@ -52,6 +62,43 @@ function mockFs(
 			const value = store.get(file);
 			if (value === undefined) throw enoent();
 			return value;
+		},
+		async readEndpointFile(file) {
+			if (opts.rejectEndpointFiles?.has(file)) throw new Error("Endpoint changed while it was read");
+			const value = store.get(file);
+			if (value === undefined) throw enoent();
+			const bytes = Buffer.from(value);
+			const revision = revisions.get(file) ?? 0;
+			return {
+				bytes,
+				identity: {
+					dev: 1n,
+					ino: BigInt(revision),
+					size: BigInt(bytes.length),
+					mtimeNs: BigInt(revision),
+					sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+				},
+			};
+		},
+		async exactUnlink(file, identity: NotificationEndpointFileIdentity) {
+			opts.onExactUnlink?.(file, store);
+			const configured = opts.exactUnlinkResult?.(file);
+			if (configured) return configured;
+			if (opts.failUnlink?.has(file)) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+			const value = store.get(file);
+			if (value === undefined) throw enoent();
+			const bytes = Buffer.from(value);
+			const revision = revisions.get(file) ?? 0;
+			const matches =
+				identity.dev === 1n &&
+				identity.ino === BigInt(revision) &&
+				identity.size === BigInt(bytes.length) &&
+				identity.mtimeNs === BigInt(revision) &&
+				identity.sha256 === crypto.createHash("sha256").update(bytes).digest("hex");
+			if (!matches) return { ok: false, code: "identity_mismatch" };
+			store.delete(file);
+			unlinked.push(file);
+			return { ok: true };
 		},
 		async unlink(file) {
 			if (opts.failUnlink?.has(file)) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
@@ -141,8 +188,10 @@ describe("notification-service health", () => {
 	test("healthy daemon with fresh heartbeat and matching identity is ok", async () => {
 		const { fs } = mockFs({
 			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, generation: DAEMON_GENERATION }),
-			[path.join("/tmp/gjc-none", "notifications", "session-a.json")]: JSON.stringify({
+			[path.join("/tmp/gjc-none", "sdk", "session-a.json")]: JSON.stringify({
 				sessionId: "session-a",
+				url: "ws://127.0.0.1:3000",
+				token: "endpoint-token",
 				pid: 1000,
 			}),
 		});
@@ -187,6 +236,37 @@ describe("notification-service health", () => {
 		});
 		expect(report.checks.indexOf(hint!)).toBe(report.checks.findIndex(check => check.name === "endpoints") + 1);
 	});
+	test("ignores shared lifecycle, ready, and broker records when discovering endpoints", async () => {
+		const stateRoot = "/tmp/gjc-shared-sdk-state";
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			[path.join(stateRoot, "sdk", "session-a.lifecycle.json")]: JSON.stringify({
+				pid: 1000,
+				effectMarker: "request-a",
+				incarnation: "incarnation-a",
+			}),
+			[path.join(stateRoot, "sdk", "session-b.lifecycle.ready.json")]: JSON.stringify({
+				pid: 999,
+				effectMarker: "request-b",
+				incarnation: "incarnation-b",
+			}),
+			[path.join(stateRoot, "sdk", "partial.lifecycle.ready.json")]: "{",
+			[path.join(stateRoot, "sdk", "partial.lifecycle.failure.request.json")]: "{",
+			[path.join(stateRoot, "sdk", "broker.json")]: JSON.stringify({
+				url: "ws://127.0.0.1:4000",
+				token: "broker-token",
+				pid: 999,
+			}),
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot,
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+
+		expect(report.endpoints).toEqual({ total: 0, live: 0, dead: 0, unknown: 0, unreadable: 0 });
+		expect(report.checks.some(check => check.name === "local_endpoint")).toBe(true);
+	});
 
 	test("suppresses the unavailable endpoint hint for a stopped daemon", async () => {
 		const { fs } = mockFs({ [statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, stoppedAt: 1_495 }) });
@@ -205,9 +285,24 @@ describe("notification-service health", () => {
 		["mismatched", daemonStateJson({ pid: 1000, chatId: "other", heartbeatAt: 1_490 }), undefined, true],
 		["stopped", daemonStateJson({ pid: 1000, heartbeatAt: 1_490, stoppedAt: 1_495 }), undefined, true],
 		["unconfigured", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), undefined, false],
-		["live endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), { sessionId: "s", pid: 1000 }, true],
-		["dead endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), { sessionId: "s", pid: 999 }, true],
-		["unknown endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), { sessionId: "s" }, true],
+		[
+			"live endpoint",
+			daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			{ sessionId: "s", url: "ws://127.0.0.1:3000", token: "endpoint-token", pid: 1000 },
+			true,
+		],
+		[
+			"dead endpoint",
+			daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			{ sessionId: "s", url: "ws://127.0.0.1:3000", token: "endpoint-token", pid: 999 },
+			true,
+		],
+		[
+			"unknown endpoint",
+			daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			{ sessionId: "s", url: "ws://127.0.0.1:3000", token: "endpoint-token" },
+			true,
+		],
 		["unreadable endpoint", daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }), "not-json", true],
 	])("suppresses the local endpoint hint for %s state", async (_name, state, endpoint, configured) => {
 		const rowSettings = Settings.isolated(
@@ -220,7 +315,7 @@ describe("notification-service health", () => {
 				: { "notifications.enabled": false },
 		);
 		const rowStatePath = daemonPaths(rowSettings.getAgentDir()).state;
-		const endpointPath = path.join("/tmp/gjc-none", "notifications", "session-a.json");
+		const endpointPath = path.join("/tmp/gjc-none", "sdk", "session-a.json");
 		const { fs } = mockFs({
 			...(state ? { [rowStatePath]: state } : {}),
 			...(endpoint ? { [endpointPath]: typeof endpoint === "string" ? endpoint : JSON.stringify(endpoint) } : {}),
@@ -287,8 +382,10 @@ describe("notification-service health", () => {
 		for (const generation of malformedGenerationValues) {
 			const { fs } = mockFs({
 				[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, generation }),
-				[path.join("/tmp/gjc-none", "notifications", "session-a.json")]: JSON.stringify({
+				[path.join("/tmp/gjc-none", "sdk", "session-a.json")]: JSON.stringify({
 					sessionId: "session-a",
+					url: "ws://127.0.0.1:3000",
+					token: "endpoint-token",
 					pid: 1000,
 				}),
 			});
@@ -425,13 +522,31 @@ describe("notification-service recovery", () => {
 	});
 	const paths = daemonPaths(settings.getAgentDir());
 	const stateRoot = "/tmp/gjc-recovery-state";
-	const epDir = path.join(stateRoot, "notifications");
+	const epDir = path.join(stateRoot, "sdk");
 
 	test("removes only dead/stale endpoints and never a live owner's lock", async () => {
 		const { fs, unlinked } = mockFs({
-			[path.join(epDir, "live.json")]: JSON.stringify({ sessionId: "live", pid: 1000, stale: false }),
-			[path.join(epDir, "stale.json")]: JSON.stringify({ sessionId: "stale", pid: 1000, stale: true }),
-			[path.join(epDir, "dead.json")]: JSON.stringify({ sessionId: "dead", pid: 777, stale: false }),
+			[path.join(epDir, "live.json")]: JSON.stringify({
+				sessionId: "live",
+				url: "ws://127.0.0.1:3000",
+				token: "endpoint-token",
+				pid: 1000,
+				stale: false,
+			}),
+			[path.join(epDir, "stale.json")]: JSON.stringify({
+				sessionId: "stale",
+				url: "ws://127.0.0.1:3000",
+				token: "endpoint-token",
+				pid: 1000,
+				stale: true,
+			}),
+			[path.join(epDir, "dead.json")]: JSON.stringify({
+				sessionId: "dead",
+				url: "ws://127.0.0.1:3000",
+				token: "endpoint-token",
+				pid: 777,
+				stale: false,
+			}),
 			[path.join(epDir, "broken.json")]: "not json",
 			[paths.state]: daemonStateJson({ pid: 1000 }),
 			[paths.lock]: "lock",
@@ -451,6 +566,121 @@ describe("notification-service recovery", () => {
 		expect(unlinked).not.toContain(paths.lock);
 		expect(formatNotificationRecoveryReport(report)).toContain("left-active");
 	});
+	test("keeps a live endpoint that replaces a dead endpoint before identity-bound deletion", async () => {
+		const endpoint = path.join(epDir, "replaced.json");
+		const liveReplacement = JSON.stringify({
+			sessionId: "replacement",
+			url: "ws://127.0.0.1:3000",
+			token: "endpoint-token",
+			pid: 1000,
+		});
+		const { fs, store, unlinked } = mockFs(
+			{
+				[endpoint]: JSON.stringify({
+					sessionId: "dead",
+					url: "ws://127.0.0.1:3000",
+					token: "endpoint-token",
+					pid: 999,
+				}),
+			},
+			{
+				onExactUnlink: file => {
+					if (file === endpoint) store.set(file, liveReplacement);
+				},
+			},
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+
+		expect(report.endpointsRemoved).toEqual([]);
+		expect(report.endpointsKept).toBe(1);
+		expect(unlinked).toEqual([]);
+		expect(store.get(endpoint)).toBe(liveReplacement);
+	});
+	test("leaves shared lifecycle records untouched while recovering endpoint candidates", async () => {
+		const lifecycle = path.join(epDir, "session-a.lifecycle.json");
+		const ready = path.join(epDir, "session-b.lifecycle.ready.json");
+		const broker = path.join(epDir, "broker.json");
+		const failure = path.join(epDir, "session-c.lifecycle.failure.request-c.json");
+		const partialReady = path.join(epDir, "partial.lifecycle.ready.json");
+		const partialFailure = path.join(epDir, "partial.lifecycle.failure.request.json");
+		const deadEndpoint = path.join(epDir, "dead-endpoint.json");
+		const liveEndpoint = path.join(epDir, "live-endpoint.json");
+		const malformedEndpoint = path.join(epDir, "malformed-endpoint.json");
+		const dottedLifecycleEndpoint = path.join(epDir, "dotted.lifecycle.json");
+		const dottedReadyEndpoint = path.join(epDir, "dotted.ready.json");
+		const { fs, store, unlinked } = mockFs({
+			[lifecycle]: JSON.stringify({ pid: 999, effectMarker: "request-a", incarnation: "incarnation-a" }),
+			[ready]: JSON.stringify({ pid: 1000, effectMarker: "request-b", incarnation: "incarnation-b" }),
+			[failure]: JSON.stringify({
+				pid: 999,
+				effectMarker: "request-c",
+				incarnation: "incarnation-c",
+				phase: "startup",
+				reason: "failed",
+				message: "failed",
+				rollback: {},
+			}),
+			[partialReady]: "{",
+			[partialFailure]: "{",
+			[broker]: JSON.stringify({
+				url: "ws://127.0.0.1:4000",
+				token: "broker-token",
+				pid: 999,
+			}),
+			[deadEndpoint]: JSON.stringify({
+				sessionId: "dead-endpoint",
+				url: "ws://127.0.0.1:3000",
+				token: "endpoint-token",
+				pid: 999,
+			}),
+			[liveEndpoint]: JSON.stringify({
+				sessionId: "live-endpoint",
+				url: "ws://127.0.0.1:3000",
+				token: "endpoint-token",
+				pid: 1000,
+			}),
+			[malformedEndpoint]: "{",
+			[dottedLifecycleEndpoint]: JSON.stringify({
+				sessionId: "dotted.lifecycle",
+				url: "ws://127.0.0.1:3000",
+				token: "endpoint-token",
+				pid: 999,
+			}),
+			[dottedReadyEndpoint]: JSON.stringify({
+				sessionId: "dotted.ready",
+				url: "ws://127.0.0.1:3000",
+				token: "endpoint-token",
+				pid: 1000,
+			}),
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: pid => pid === 1000 },
+		});
+
+		expect(report.endpointsScanned).toBe(5);
+		expect(report.endpointsRemoved.map(endpoint => endpoint.sessionId).sort()).toEqual([
+			"dead-endpoint",
+			"dotted.lifecycle",
+		]);
+		expect(report.endpointsKept).toBe(2);
+		expect(report.endpointsUnreadable).toBe(1);
+		expect(unlinked.sort()).toEqual([deadEndpoint, dottedLifecycleEndpoint].sort());
+		expect(store.has(lifecycle)).toBe(true);
+		expect(store.has(ready)).toBe(true);
+		expect(store.has(failure)).toBe(true);
+		expect(store.has(partialReady)).toBe(true);
+		expect(store.has(partialFailure)).toBe(true);
+		expect(store.has(broker)).toBe(true);
+		expect(store.has(liveEndpoint)).toBe(true);
+		expect(store.has(dottedReadyEndpoint)).toBe(true);
+		expect(store.has(malformedEndpoint)).toBe(true);
+	});
 
 	test("clears the lock of a confirmed-dead owner", async () => {
 		const { fs, unlinked } = mockFs({
@@ -464,6 +694,51 @@ describe("notification-service recovery", () => {
 		});
 		expect(report.daemon.action).toBe("cleared-dead-owner-lock");
 		expect(unlinked).toContain(paths.lock);
+	});
+	test("does not count or remove a rejected link or replacement endpoint", async () => {
+		const endpoint = path.join(epDir, "link.json");
+		const { fs, store, unlinked } = mockFs(
+			{
+				[endpoint]: JSON.stringify({ sessionId: "link", url: "ws://x", token: "t", pid: 999 }),
+			},
+			{ rejectEndpointFiles: new Set([endpoint]) },
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: () => false },
+		});
+
+		expect(report.endpointsUnreadable).toBe(1);
+		expect(report.endpointsRemoved).toEqual([]);
+		expect(unlinked).toEqual([]);
+		expect(store.has(endpoint)).toBe(true);
+	});
+	test("reports a detached endpoint after native post-detach failure for retry", async () => {
+		const endpoint = path.join(epDir, "detached.json");
+		const detached = path.join(epDir, ".gjc-delete-notification-endpoint-retry.json");
+		const { fs, store, unlinked } = mockFs(
+			{
+				[endpoint]: JSON.stringify({ sessionId: "detached", url: "ws://x", token: "t", pid: 999 }),
+				[detached]: JSON.stringify({ retained: true }),
+			},
+			{
+				exactUnlinkResult: file =>
+					file === endpoint ? { ok: false, code: "io_error", detachedPath: detached } : undefined,
+			},
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: () => false },
+		});
+
+		expect(report.endpointsDetached).toEqual([detached]);
+		expect(report.endpointsKept).toBe(0);
+		expect(report.endpointsScanned).toBe(1);
+		expect(formatNotificationRecoveryReport(report)).toContain(`retained detached endpoint ${detached}`);
+		expect(unlinked).toEqual([]);
+		expect(store.has(detached)).toBe(true);
 	});
 
 	test("leaves a lock untouched when required daemon ownership metadata is invalid", async () => {
@@ -487,7 +762,7 @@ describe("notification-service endpoint liveness (owner-proof)", () => {
 		"notifications.telegram.chatId": "12345",
 	});
 	const stateRoot = "/tmp/gjc-liveness-state";
-	const epDir = path.join(stateRoot, "notifications");
+	const epDir = path.join(stateRoot, "sdk");
 
 	test("health treats a PID-less endpoint as unknown, never dead", async () => {
 		const { fs } = mockFs({
@@ -515,6 +790,34 @@ describe("notification-service endpoint liveness (owner-proof)", () => {
 		expect(report.endpointsRemoved).toEqual([]);
 		expect(report.endpointsKept).toBe(1);
 		expect(unlinked).toEqual([]);
+	});
+	test.each([
+		0,
+		-1,
+		1.5,
+		Number.MAX_SAFE_INTEGER + 1,
+	])("recovery keeps invalid pid %p without probing liveness", async pid => {
+		const endpoint = path.join(epDir, `invalid-${pid}.json`);
+		const { fs, unlinked } = mockFs({
+			[endpoint]: JSON.stringify({ url: "ws://x", token: "t", pid }),
+		});
+		let pidAliveCalls = 0;
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: {
+				fs,
+				pidAlive: () => {
+					pidAliveCalls += 1;
+					return false;
+				},
+			},
+		});
+
+		expect(report.endpointsRemoved).toEqual([]);
+		expect(report.endpointsKept).toBe(1);
+		expect(unlinked).toEqual([]);
+		expect(pidAliveCalls).toBe(0);
 	});
 });
 

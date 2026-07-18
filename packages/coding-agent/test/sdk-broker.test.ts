@@ -313,6 +313,51 @@ describe("SDK broker identity and discovery", () => {
 		}
 	});
 
+	it("opens, syncs, and closes the discovery temp file with Windows-safe r+ access", async () => {
+		const dir = await temp();
+		const realOpen = fs.open.bind(fs);
+		const tempModes: unknown[] = [];
+		let syncs = 0;
+		let closes = 0;
+		const spy = vi.spyOn(fs, "open").mockImplementation((async (p: string, ...rest: unknown[]) => {
+			const handle = await (realOpen as (p: string, ...r: unknown[]) => Promise<fs.FileHandle>)(p, ...rest);
+			if (!String(p).endsWith(".tmp")) return handle;
+			tempModes.push(rest[0]);
+			const sync = handle.sync.bind(handle);
+			const close = handle.close.bind(handle);
+			(handle as unknown as { sync: () => Promise<void> }).sync = async () => {
+				syncs++;
+				await sync();
+			};
+			(handle as unknown as { close: () => Promise<void> }).close = async () => {
+				closes++;
+				await close();
+			};
+			return handle;
+		}) as typeof fs.open);
+		try {
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "x",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "secret",
+				startedAt: 1,
+				heartbeatAt: Date.now(),
+			});
+
+			expect(tempModes).toEqual(["r+"]);
+			expect(syncs).toBe(1);
+			expect(closes).toBe(1);
+		} finally {
+			spy.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("does not blanket-tolerate directory fsync failures (tolerance is win32-scoped only)", async () => {
 		if (process.platform === "win32") return;
 		const dir = await temp();

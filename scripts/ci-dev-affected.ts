@@ -258,6 +258,8 @@ function isNativeBuildKey(key: string): boolean {
 function taskNeedsNative(key: string): boolean {
 	return (
 		key === "root-test" ||
+		key === "root-check" ||
+		key === "check:@gajae-code/coding-agent" ||
 		key === "cli-smoke" ||
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||
@@ -448,6 +450,7 @@ async function resolveBaseRef(): Promise<string> {
 			const value = mergeBase.stdout.toString().trim();
 			if (value !== "") return value;
 		}
+		if (baseSha && !ZERO_SHA.test(baseSha)) return baseSha;
 		return `origin/${baseRef}`;
 	}
 	if (baseSha && !ZERO_SHA.test(baseSha)) {

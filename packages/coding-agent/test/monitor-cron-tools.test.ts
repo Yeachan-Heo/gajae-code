@@ -410,6 +410,7 @@ describe("Cron tools", () => {
 			expect(steered).toHaveLength(1);
 			expect(steered[0]?.customType).toBe("cron-fire");
 			expect(steered[0]?.content).toContain("run one");
+			await Promise.resolve();
 			expect(expectText(await list.execute("call", {})).details.jobs).toHaveLength(0);
 		});
 	});
@@ -433,6 +434,7 @@ describe("Cron tools", () => {
 				nowMs: clock.now(),
 			});
 			clock.tick(fireAt - clock.now());
+			await Promise.resolve();
 			expect(expectText(await list.execute("call", {})).details.jobs).toHaveLength(0);
 
 			const deleteResult = await del.execute("call", { id });

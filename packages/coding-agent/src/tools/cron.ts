@@ -58,6 +58,8 @@ export interface CronJobSnapshot {
 	createdAt: number;
 	expiresAt?: number;
 	nextFireAt?: number;
+	/** True while this owner-scoped schedule's delivery is in progress. */
+	firing?: boolean;
 	humanSchedule: string;
 	ownerId?: string;
 }
@@ -444,7 +446,7 @@ function formatCronFireContent(snapshot: CronJobSnapshot): string {
 	return `<task-notification>\nScheduled task ${snapshot.id} fired (${snapshot.humanSchedule}).\n\n${snapshot.prompt}\n</task-notification>`;
 }
 
-function deliverCronFire(record: CronScheduleRecord): void {
+function deliverCronFire(record: CronScheduleRecord): Promise<void> | undefined {
 	const content = formatCronFireContent(record.snapshot);
 	const details = {
 		id: record.snapshot.id,
@@ -455,16 +457,9 @@ function deliverCronFire(record: CronScheduleRecord): void {
 		{ customType: "cron-fire", content, display: false, attribution: "agent", details },
 		{ triggerTurn: true, deliverAs: "followUp" },
 	);
-	if (sendPromise) {
-		void sendPromise.catch(error => {
-			logger.warn("Cron fire delivery failed", {
-				id: record.snapshot.id,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		});
-		return;
-	}
+	if (sendPromise) return sendPromise;
 	record.session.steer?.({ customType: "cron-fire", content, details });
+	return undefined;
 }
 
 function scheduleRecord(ownerId: string | undefined, state: OwnerScheduleState, record: CronScheduleRecord): void {
@@ -509,16 +504,35 @@ function fireRecord(ownerId: string | undefined, state: OwnerScheduleState, id: 
 		deleteRecord(ownerId, id);
 		return;
 	}
+	record.snapshot.firing = true;
+	notifyCronChange();
+	const settle = () => {
+		if (record.disposed) return;
+		record.snapshot.firing = false;
+		notifyCronChange();
+		if (!record.snapshot.recurring) {
+			deleteRecord(ownerId, id);
+			return;
+		}
+		scheduleRecord(ownerId, state, record);
+	};
 	try {
-		deliverCronFire(record);
+		const delivery = deliverCronFire(record);
+		if (delivery) {
+			void delivery.then(settle, error => {
+				logger.warn("Cron fire delivery failed", {
+					id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				settle();
+			});
+		} else {
+			settle();
+		}
 	} catch (error) {
 		logger.warn("Cron fire delivery failed", { id, error: error instanceof Error ? error.message : String(error) });
+		settle();
 	}
-	if (!record.snapshot.recurring) {
-		deleteRecord(ownerId, id);
-		return;
-	}
-	scheduleRecord(ownerId, state, record);
 }
 
 const CRON_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";

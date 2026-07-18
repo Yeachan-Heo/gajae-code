@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
+import { withFileLock } from "../config/file-lock";
 import { sessionRuntimeDir } from "./session-layout";
 import {
 	isValidOwnerIntent,
@@ -734,117 +735,15 @@ async function writeStateFileSync(stateFile: string, payload: Record<string, unk
 	await writeStateFile(stateFile, payload);
 }
 
-interface StateFileLockOwner {
-	pid: number;
-	start_time: string;
-	token: string;
-}
-
-function processStartTime(pid: number): string | null {
+async function withStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
 	try {
-		const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
-		const close = stat.lastIndexOf(")");
-		const fields = stat
-			.slice(close + 1)
-			.trim()
-			.split(/\s+/);
-		return fields[19] ?? null;
-	} catch {
-		return null;
-	}
-}
-
-function validLockOwner(value: unknown): value is StateFileLockOwner {
-	if (!value || typeof value !== "object") return false;
-	const owner = value as Partial<StateFileLockOwner>;
-	return (
-		typeof owner.pid === "number" &&
-		Number.isSafeInteger(owner.pid) &&
-		owner.pid > 0 &&
-		typeof owner.start_time === "string" &&
-		typeof owner.token === "string" &&
-		owner.token.length > 0
-	);
-}
-
-function lockOwnerIsAlive(value: unknown): boolean {
-	if (!validLockOwner(value)) return false;
-	const owner = value;
-	try {
-		process.kill(owner.pid, 0);
+		return await withFileLock(stateFile, operation, { staleMs: 30_000, retries: 12_000, retryDelayMs: 5 });
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-		return true;
-	}
-	const currentStartTime = processStartTime(owner.pid);
-	return currentStartTime === null || currentStartTime === owner.start_time;
-}
-
-async function reclaimStaleStateFileLock(lockFile: string): Promise<void> {
-	let raw: string;
-	try {
-		raw = await fs.readFile(lockFile, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		if (error instanceof Error && error.message.startsWith("Failed to acquire lock")) {
+			throw new PreviousRuntimeStateReadError();
+		}
 		throw error;
 	}
-	let owner: unknown;
-	try {
-		owner = JSON.parse(raw);
-	} catch {
-		owner = null;
-	}
-	if (!validLockOwner(owner)) {
-		const stat = await fs.stat(lockFile);
-		if (Date.now() - stat.mtimeMs < 30_000) return;
-	} else if (lockOwnerIsAlive(owner)) return;
-	try {
-		if ((await fs.readFile(lockFile, "utf8")) === raw) await fs.rm(lockFile);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-	}
-}
-
-async function withStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
-	const lockFile = `${stateFile}.lock`;
-	const owner: StateFileLockOwner = {
-		pid: process.pid,
-		start_time: processStartTime(process.pid) ?? "unknown",
-		token: randomUUID(),
-	};
-	await fs.mkdir(path.dirname(stateFile), { recursive: true });
-	for (let attempt = 0; attempt < 12_000; attempt++) {
-		let handle: fs.FileHandle | undefined;
-		try {
-			handle = await fs.open(lockFile, "wx");
-			try {
-				await handle.writeFile(JSON.stringify(owner));
-			} catch (error) {
-				await handle.close().catch(() => undefined);
-				handle = undefined;
-				await fs.rm(lockFile, { force: true }).catch(() => undefined);
-				throw error;
-			}
-			const outcome = await operation().then(
-				value => ({ ok: true as const, value }),
-				error => ({ ok: false as const, error }),
-			);
-			await handle.close();
-			try {
-				if ((await fs.readFile(lockFile, "utf8")) === JSON.stringify(owner)) await fs.rm(lockFile);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
-			if (!outcome.ok) throw outcome.error;
-			return outcome.value;
-		} catch (error) {
-			if (handle) throw error;
-			if ((error as { code?: unknown }).code !== "EEXIST") throw error;
-			await reclaimStaleStateFileLock(lockFile);
-			await Bun.sleep(5);
-		}
-	}
-	throw new PreviousRuntimeStateReadError();
 }
 
 function coordinatorTransactionLockFile(stateFile: string): string {

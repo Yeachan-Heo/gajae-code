@@ -41,7 +41,7 @@ Set an action to an empty array to disable it:
 | `app.thinking.cycle` | `Shift+Tab` | Cycle thinking level |
 | `app.editor.external` | `Ctrl+G` | Edit the draft in `$VISUAL` / `$EDITOR` |
 | `app.message.followUp` | _(none)_ | Optional remap for a follow-up message; `Ctrl+Enter` is reserved for editor newline |
-| `app.message.queue` | `Alt+Enter` (`Alt+Q` on win32) | Explicitly queue a message for the next turn |
+| `app.message.queue` | `Alt+Enter` (`Alt+Q` on darwin/win32) | Explicitly queue a message for the next turn |
 | `app.message.dequeue` | `Alt+Up` | Dequeue a queued message back into the editor |
 
 | `app.clipboard.copyLine` | `Alt+Shift+L` | Copy the current line |
@@ -51,7 +51,7 @@ Set an action to an empty array to disable it:
 
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
 
-On native Windows terminals, GJC defaults `app.message.queue` to `Alt+Q` because Windows Terminal and PowerShell commonly reserve `Alt+Enter` for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
+On macOS and native Windows terminals, GJC defaults `app.message.queue` to `Alt+Q`; Windows Terminal and PowerShell commonly reserve `Alt+Enter` for fullscreen before GJC can receive it. Users who prefer another chord can remap `app.message.queue` in `~/.gjc/agent/keybindings.json`.
 
 In the main GJC composer, plain `PageUp` / `PageDown` page the visible transcript viewport instead of browsing prompt history; use `Up` / `Down` or `Ctrl+R` for prompt history. Autocomplete and selector surfaces still use `PageUp` / `PageDown` for list paging while they have focus.
 
@@ -121,45 +121,53 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 
 ### Application context (`app.*`)
 
-| Action ID | Default | Notes |
+| Action ID | Default | Domains |
 | --- | --- | --- |
-| `app.interrupt` | `escape` | |
-| `app.clear` | `ctrl+c` | |
-| `app.exit` | `ctrl+d` | |
-| `app.suspend` | `ctrl+z` | |
-| `app.thinking.cycle` | `shift+tab` | |
-| `app.thinking.toggle` | `ctrl+t` | |
-| `app.commandPalette.open` | `ctrl+p` | Open command palette from the editor |
-| `app.model.cycleForward` | `alt+n` | |
-| `app.model.cycleBackward` | `alt+shift+n` | |
-| `app.model.select` | `ctrl+l` | |
-| `app.model.selectTemporary` | `alt+p` | |
-| `app.tools.expand` | `ctrl+o` | |
-| `app.tool.backgroundFold` | `ctrl+b` | |
-| `app.editor.external` | `ctrl+g` | |
-| `app.message.followUp` | _(none)_ | `Ctrl+Enter` remains newline unless the user explicitly remaps this action; while idle the chord still falls through to newline |
-| `app.message.queue` | `alt+enter` (`alt+q` on win32) | platform-aware; avoids the Windows Terminal fullscreen shortcut |
-| `app.message.dequeue` | `alt+up` | |
-| `app.clipboard.pasteImage` | `ctrl+v` (`alt+v` on win32) | platform-aware; single source of truth in `KEYBINDINGS` |
-| `app.clipboard.copyLine` | `alt+shift+l` | registry-backed via input-controller custom handler |
-| `app.clipboard.copyPrompt` | `alt+shift+c` | |
-| `app.session.new` | _(none)_ | command-driven; empty default |
-| `app.session.tree` | _(none)_ | command-driven; empty default |
-| `app.session.fork` | _(none)_ | command-driven; empty default |
-| `app.session.resume` | _(none)_ | command-driven; empty default |
-| `app.session.observe` | `ctrl+s` | also `app.session.toggleSort` (session list) |
-| `app.jobs.open` | `alt+j` | |
-| `app.session.togglePath` | `ctrl+p` | session-list context |
-| `app.session.toggleSort` | `ctrl+s` | session-list context |
-| `app.session.rename` | `ctrl+r` | also `app.history.search` |
-| `app.session.delete` | `ctrl+d` | session-list context |
-| `app.session.deleteNoninvasive` | `ctrl+backspace` | |
-| `app.tree.foldOrUp` | `ctrl+left`, `alt+left` | |
-| `app.tree.unfoldOrDown` | `ctrl+right`, `alt+right` | |
-| `app.plan.toggle` | `alt+shift+p` | |
-| `app.history.search` | `ctrl+r` | |
-| `app.stt.toggle` | `alt+h` | |
-| `app.irc.sidebar.toggle` | `alt+i` | |
+| `app.interrupt` | escape | global |
+| `app.clear` | ctrl+c | global |
+| `app.exit` | ctrl+d | global |
+| `app.suspend` | ctrl+z | global |
+| `app.thinking.cycle` | shift+tab | composer |
+| `app.thinking.toggle` | ctrl+t | composer |
+| `app.commandPalette.open` | ctrl+p | composer |
+| `app.model.cycleForward` | alt+n | composer |
+| `app.model.cycleBackward` | alt+shift+n | composer |
+| `app.model.select` | ctrl+l | composer |
+| `app.model.selectTemporary` | alt+p | composer |
+| `app.tools.expand` | ctrl+o | composer |
+| `app.tool.backgroundFold` | ctrl+b | composer |
+| `app.editor.external` | ctrl+g | composer |
+| `app.message.followUp` | _(none)_ | composer |
+| `app.message.queue` | alt+q (darwin/win32) / alt+enter (linux) | composer |
+| `app.message.dequeue` | alt+up, alt+down | composer |
+| `app.clipboard.pasteImage` | ctrl+v (darwin/linux) / alt+v (win32) | composer |
+| `app.clipboard.copyLine` | alt+shift+l | composer |
+| `app.clipboard.copyPrompt` | alt+shift+c | composer |
+| `app.session.new` | ctrl+n | composer |
+| `app.session.tree` | _(none)_ | composer |
+| `app.session.fork` | _(none)_ | composer |
+| `app.session.resume` | _(none)_ | composer |
+| `app.session.observe` | ctrl+s | composer |
+| `app.session.dashboard` | _(none)_ | composer |
+| `app.jobs.open` | alt+j | composer |
+| `app.session.togglePath` | ctrl+p | selector |
+| `app.session.toggleSort` | ctrl+s | selector |
+| `app.session.rename` | ctrl+r | selector |
+| `app.session.delete` | ctrl+d | selector |
+| `app.session.deleteNoninvasive` | ctrl+backspace | selector |
+| `app.tree.foldOrUp` | ctrl+left, alt+left | selector |
+| `app.tree.unfoldOrDown` | ctrl+right, alt+right | selector |
+| `app.plan.toggle` | alt+shift+p | composer |
+| `app.history.search` | ctrl+r | composer |
+| `app.stt.toggle` | alt+h | composer |
+| `app.irc.sidebar.toggle` | alt+i | composer |
+| `app.transcript.browse` | _(none)_ | composer |
+| `app.transcript.prevTurn` | _(none)_ | composer |
+| `app.transcript.nextTurn` | _(none)_ | composer |
+| `app.mode.cycle` | _(none)_ | composer |
+| `app.tasks.toggle` | alt+t | composer |
+| `app.queue.togglePane` | _(none)_ | composer |
+| `app.message.sendNow` | _(none)_ | composer |
 
 ### Global engine context (`tui.global.*`)
 

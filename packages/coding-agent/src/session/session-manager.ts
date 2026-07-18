@@ -86,7 +86,14 @@ import type {
 } from "./session-storage";
 import { FileSessionStorage, MemorySessionStorage } from "./session-storage";
 
-export const CURRENT_SESSION_VERSION = 3;
+export const CURRENT_SESSION_VERSION = 4;
+
+/**
+ * Version 4 adds append-only patch records. New writers emit v4 headers; v1–v3
+ * transcripts remain readable. Older builds do not apply these records, so they
+ * must not be used to edit a session after a v4 writer has updated it.
+ */
+
 function isUnderProjectGjc(cwd: string, targetPath: string): boolean {
 	const relative = path.relative(path.join(path.resolve(cwd), ".gjc"), path.resolve(targetPath));
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
@@ -196,6 +203,15 @@ export function associateSessionMessageViewportAnchorId(message: AgentMessage, a
 
 export function getSessionMessageViewportAnchorId(message: AgentMessage): string | undefined {
 	return sessionMessageViewportAnchorIds.get(message);
+}
+
+/** Returns registered viewport anchors for durable user messages in session order. */
+export function getUserMessageViewportAnchorIds(messages: readonly AgentMessage[]): string[] {
+	return messages.flatMap(message => {
+		if (message.role !== "user" || message.synthetic) return [];
+		const anchorId = getSessionMessageViewportAnchorId(message);
+		return anchorId ? [anchorId] : [];
+	});
 }
 
 export function transferSessionMessageIdentity(source: AgentMessage[], target: AgentMessage[]): void {
@@ -376,7 +392,22 @@ export type SessionEntry =
 	| ModeChangeEntry
 	| ConfiguredModelChainEntry;
 
-/** Raw file entry (includes header) */
+/** Append-only replacement for mutable fields on the session header. */
+export interface HeaderPatchRecord {
+	type: "header_patch";
+	patch: Partial<Pick<SessionHeader, "title" | "titleSource" | "cwd">>;
+}
+
+/** Append-only replacement for replay metadata on one existing session entry. */
+export interface EntryPatchRecord {
+	type: "entry_patch";
+	entryId: string;
+	patch: Partial<Pick<SessionMessageEntry, "message">>;
+}
+
+export type SessionPatchRecord = HeaderPatchRecord | EntryPatchRecord;
+
+/** Resolved file entries; patch records are applied by parseSessionEntries(). */
 export type FileEntry = SessionHeader | SessionEntry;
 
 export type DefaultModelSelectionStage = {
@@ -520,6 +551,8 @@ export interface SessionInfo {
 	created: Date;
 	modified: Date;
 	messageCount: number;
+	/** True when messageCount was counted from only the bounded list prefix. */
+	messageCountIsEstimate?: boolean;
 	/** File size in bytes on disk; used for compact list rendering. */
 	size: number;
 	firstMessage: string;
@@ -745,18 +778,17 @@ function migrateV2ToV3(entries: FileEntry[]): void {
 }
 
 /**
- * Run all necessary migrations to bring entries to current version.
- * Mutates entries in place. Returns true if any migration was applied.
+ * Run all necessary migrations to bring entries to the current semantic version.
+ * Version 4 adds trailing patch records, so v3 transcripts must be atomically upgraded before they can receive one.
  */
 function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 	const header = entries.find(e => e.type === "session") as SessionHeader | undefined;
 	const version = header?.version ?? 1;
-
 	if (version >= CURRENT_SESSION_VERSION) return false;
-
 	if (version < 2) migrateV1ToV2(entries);
 	if (version < 3) migrateV2ToV3(entries);
-
+	const migratedHeader = entries.find(entry => entry.type === "session") as SessionHeader | undefined;
+	if (migratedHeader) migratedHeader.version = CURRENT_SESSION_VERSION;
 	return true;
 }
 
@@ -774,7 +806,66 @@ function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | un
 
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
-	return parseJsonlLenient<FileEntry>(content);
+	const records = parseJsonlLenient<FileEntry | SessionPatchRecord>(content);
+	const entries: FileEntry[] = [];
+	const entriesById = new Map<string, SessionEntry>();
+	let header: SessionHeader | undefined;
+
+	for (const record of records) {
+		// Patch records are defined only by v4 transcripts. Ignore them before a
+		// v4 header as well: a truncated or malicious prefix must not mutate a
+		// later header/entry when replay catches up.
+		if (record.type === "header_patch") {
+			if (header?.version === CURRENT_SESSION_VERSION && isHeaderPatchRecord(record))
+				applyHeaderPatch(header, record.patch);
+			continue;
+		}
+		if (record.type === "entry_patch") {
+			if (header?.version === CURRENT_SESSION_VERSION && isEntryPatchRecord(record)) {
+				const entry = entriesById.get(record.entryId);
+				if (entry?.type === "message" && record.patch.message) entry.message = record.patch.message;
+			}
+			continue;
+		}
+		entries.push(record);
+		if (record.type === "session") header ??= record;
+		else entriesById.set(record.id, record);
+	}
+	return entries;
+}
+
+function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchRecord {
+	if (
+		record.type !== "header_patch" ||
+		!isRecord(record.patch) ||
+		!Object.keys(record).every(key => key === "type" || key === "patch")
+	)
+		return false;
+	const keys = Object.keys(record.patch);
+	if (!keys.every(key => key === "cwd" || key === "title" || key === "titleSource")) return false;
+	const { cwd, title, titleSource } = record.patch;
+	return (
+		(cwd === undefined || typeof cwd === "string") &&
+		(title === undefined || typeof title === "string") &&
+		(titleSource === undefined || titleSource === "auto" || titleSource === "user")
+	);
+}
+
+function applyHeaderPatch(header: SessionHeader, patch: HeaderPatchRecord["patch"]): void {
+	if (patch.cwd !== undefined) header.cwd = patch.cwd;
+	if (patch.title !== undefined) header.title = patch.title;
+	if (patch.titleSource !== undefined) header.titleSource = patch.titleSource;
+}
+
+function isEntryPatchRecord(record: SessionPatchRecord): record is EntryPatchRecord {
+	return (
+		record.type === "entry_patch" &&
+		typeof record.entryId === "string" &&
+		isRecord(record.patch) &&
+		Object.keys(record).every(key => key === "type" || key === "entryId" || key === "patch") &&
+		Object.keys(record.patch).every(key => key === "message") &&
+		(record.patch.message === undefined || isRecord(record.patch.message))
+	);
 }
 
 function normalizeConfiguredModelChainEntry(entry: unknown): ConfiguredModelChain | undefined {
@@ -1260,7 +1351,7 @@ export async function loadEntriesFromFile(
 		if (isEnoent(err)) return [];
 		throw err;
 	}
-	const entries = parseJsonlLenient<FileEntry>(content);
+	const entries = parseSessionEntries(content);
 
 	// Validate session header
 	if (entries.length === 0) return entries;
@@ -1709,11 +1800,17 @@ async function getSortedSessions(sessionDir: string, storage: SessionStorage): P
 		await Promise.all(
 			files.map(async (path: string) => {
 				try {
-					const content = await storage.readTextPrefix(path, 4096);
+					const buffer = Buffer.allocUnsafe(SESSION_LIST_PREFIX_BYTES);
+					const content = await readSessionListPrefix(path, storage, buffer);
 					const entries = parseJsonlLenient<Record<string, unknown>>(content);
 					if (entries.length === 0) return;
 					const header = entries[0] as Record<string, unknown>;
 					if (header.type !== "session" || typeof header.id !== "string") return;
+					if (header.version === CURRENT_SESSION_VERSION) {
+						for (const patch of await readSessionListTrailingPatches(path, storage, buffer)) {
+							applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
+						}
+					}
 					const mtime = storage.statSync(path).mtimeMs;
 					const firstPrompt = header.title ? undefined : extractFirstUserPrompt(entries);
 					sessions.push(new RecentSessionInfo(path, mtime, header, firstPrompt));
@@ -2945,7 +3042,7 @@ class NdjsonFileWriter {
 	}
 
 	/** Queue a write. Returns a promise so callers can await if needed. */
-	write(entry: FileEntry): Promise<void> {
+	write(entry: FileEntry | SessionPatchRecord): Promise<void> {
 		if (this.#closed || this.#closing) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		const line = `${JSON.stringify(entry)}\n`;
@@ -2961,7 +3058,7 @@ class NdjsonFileWriter {
 	 * queue. Use only when no concurrent async write is in flight (the session-manager
 	 * persist path enforces this via `#flushed`/`#needsFullRewriteOnNextPersist`).
 	 */
-	writeSync(entry: FileEntry): void {
+	writeSync(entry: FileEntry | SessionPatchRecord): void {
 		if (this.#closed || this.#closing) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		const line = `${JSON.stringify(entry)}\n`;
@@ -3156,6 +3253,14 @@ function extractTextFromContent(content: Message["content"]): string {
 }
 
 const SESSION_LIST_PREFIX_BYTES = 4096;
+const SESSION_LIST_TRAILING_PATCH_BYTES = 4096;
+// Hard cap on how many trailing bytes the listers may scan for header patches.
+// moveTo folds cwd patches into line 1 via a full atomic rewrite, so only a
+// recent title patch can live unfolded near EOF; anything buried deeper is
+// folded on the next natural full rewrite. Keeping this bounded preserves the
+// O(SESSION_LIST_PREFIX_BYTES) listing cost that SESSION_LIST_PREFIX_BYTES exists for.
+const SESSION_LIST_TRAILING_PATCH_SCAN_CAP = SESSION_LIST_TRAILING_PATCH_BYTES * 4;
+const SESSION_NAME_MAX_CHARS = 1_000;
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
 const sessionListPrefixDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -3175,6 +3280,69 @@ async function readSessionListPrefix(file: string, storage: SessionStorage, buff
 	}
 }
 
+async function readSessionListTrailingPatches(
+	file: string,
+	storage: SessionStorage,
+	buffer: Buffer,
+): Promise<HeaderPatchRecord["patch"][]> {
+	if (!(storage instanceof FileSessionStorage)) {
+		const content = await storage.readText(file);
+		const entries = parseSessionEntries(content);
+		const header = entries[0] as SessionHeader | undefined;
+		return header?.type === "session" ? [{ cwd: header.cwd, title: header.title }] : [];
+	}
+
+	const size = storage.statSync(file).size;
+	if (size <= SESSION_LIST_PREFIX_BYTES) return [];
+	const latest: HeaderPatchRecord["patch"] = {};
+	let position = size;
+	const scanFloor = Math.max(0, size - SESSION_LIST_TRAILING_PATCH_SCAN_CAP);
+	let trailingFragment = Buffer.alloc(0);
+	const chunkSize = Math.min(buffer.byteLength, SESSION_LIST_TRAILING_PATCH_BYTES);
+	const handle = await fs.promises.open(file, "r");
+	try {
+		while (position > scanFloor && (latest.cwd === undefined || latest.title === undefined)) {
+			const start = Math.max(0, position - chunkSize);
+			const length = position - start;
+			const { bytesRead } = await handle.read(buffer, 0, length, start);
+			const combined = Buffer.concat([buffer.subarray(0, bytesRead), trailingFragment]);
+			let complete = combined;
+			if (start > 0) {
+				const firstNewline = combined.indexOf(0x0a);
+				if (firstNewline === -1) {
+					trailingFragment = combined;
+					position = start;
+					continue;
+				}
+				trailingFragment = combined.subarray(0, firstNewline);
+				complete = combined.subarray(firstNewline + 1);
+			}
+			const lines = complete.toString("utf8").split("\n");
+			for (let index = lines.length - 1; index >= 0; index--) {
+				const line = lines[index];
+				if (!line) continue;
+				try {
+					const record = JSON.parse(line) as SessionPatchRecord;
+					if (!isHeaderPatchRecord(record)) continue;
+					if (latest.cwd === undefined && typeof record.patch.cwd === "string") latest.cwd = record.patch.cwd;
+					if (latest.title === undefined && typeof record.patch.title === "string")
+						latest.title = record.patch.title;
+				} catch {
+					// Ignore malformed or partial records exactly as the canonical loader does.
+				}
+			}
+			position = start;
+		}
+		return latest.cwd === undefined && latest.title === undefined ? [] : [latest];
+	} finally {
+		await handle.close();
+	}
+}
+
+function applySessionListHeaderPatch(header: SessionListHeader, patch: HeaderPatchRecord["patch"]): void {
+	if (typeof patch.cwd === "string") header.cwd = patch.cwd;
+	if (typeof patch.title === "string") header.title = patch.title;
+}
 function decodeJsonStringFragment(value: string): string {
 	const safeValue = value.endsWith("\\") ? value.slice(0, -1) : value;
 	try {
@@ -3258,6 +3426,8 @@ function extractFirstUserMessageFromPrefix(content: string): string | undefined 
 interface SessionListHeader {
 	type: "session";
 	id: string;
+	version?: number;
+
 	cwd?: string;
 	title?: string;
 	parentSession?: string;
@@ -3273,6 +3443,7 @@ function parseSessionListHeader(
 		return {
 			type: "session",
 			id: parsedHeader.id,
+			version: typeof parsedHeader.version === "number" ? parsedHeader.version : undefined,
 			cwd: typeof parsedHeader.cwd === "string" ? parsedHeader.cwd : undefined,
 			title: typeof parsedHeader.title === "string" ? parsedHeader.title : undefined,
 			parentSession: typeof parsedHeader.parentSession === "string" ? parsedHeader.parentSession : undefined,
@@ -3290,6 +3461,7 @@ function parseSessionListHeader(
 	return {
 		type: "session",
 		id,
+		version: Number(extractStringProperty(firstLine, "version")) || undefined,
 		cwd: extractStringProperty(firstLine, "cwd"),
 		title: extractStringProperty(firstLine, "title"),
 		parentSession: extractStringProperty(firstLine, "parentSession"),
@@ -3313,9 +3485,14 @@ async function collectSessionFromFile(
 ): Promise<SessionInfo | undefined> {
 	try {
 		const content = await readSessionListPrefix(file, storage, buffer);
-		const entries = parseJsonlLenient<Record<string, unknown>>(content);
+		const entries = parseSessionEntries(content).map(entry => entry as unknown as Record<string, unknown>);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
+		if (header.version === CURRENT_SESSION_VERSION) {
+			for (const patch of await readSessionListTrailingPatches(file, storage, buffer)) {
+				applySessionListHeaderPatch(header, patch);
+			}
+		}
 
 		let parsedMessageCount = 0;
 		let firstMessage = "";
@@ -3358,6 +3535,7 @@ async function collectSessionFromFile(
 			created: new Date(header.timestamp ?? ""),
 			modified: stats.mtime,
 			messageCount,
+			messageCountIsEstimate: stats.size > SESSION_LIST_PREFIX_BYTES,
 			size: stats.size,
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
@@ -3491,6 +3669,7 @@ export class SessionManager {
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
+
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
 	// When set, take precedence over the lazily-derived per-session manager.
@@ -3719,7 +3898,6 @@ export class SessionManager {
 		this.#fileEntries = this.#fileEntries.map(entry =>
 			prepareEntryForResidentSync(entry, this.#residentBlobStores()),
 		);
-		this.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		this.#buildIndex();
 		this.#bumpAllRevisions();
 		this.#flushed = true;
@@ -3753,12 +3931,12 @@ export class SessionManager {
 			this.#fileEntries = this.#fileEntries.map(entry =>
 				prepareEntryForResidentSync(entry, this.#residentBlobStores()),
 			);
-			this.sanitizeLoadedOpenAIResponsesReplayMetadata();
 
 			this.#buildIndex();
 			this.#bumpAllRevisions();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
+			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		} else {
 			const explicitPath = this.#sessionFile;
 			this.#newSessionSync();
@@ -3878,6 +4056,10 @@ export class SessionManager {
 	async moveTo(newCwd: string): Promise<void> {
 		const resolvedCwd = path.resolve(newCwd);
 		if (resolvedCwd === this.cwd) return;
+		const previousCwd = this.cwd;
+		const previousSessionDir = this.sessionDir;
+		const previousSessionFile = this.#sessionFile;
+		const previousArtifactDir = previousSessionFile?.slice(0, -6);
 
 		const managedSessionsRoot =
 			this.storage instanceof FileSessionStorage ? resolveManagedSessionRoot(this.sessionDir, this.cwd) : undefined;
@@ -3983,27 +4165,63 @@ export class SessionManager {
 			this.#bumpAllRevisions();
 		}
 
-		// Update cwd and sessionDir after the move succeeds.
+		// Update cwd and sessionDir after the physical move succeeds, but roll the move back if metadata persistence fails.
 		this.cwd = resolvedCwd;
 		this.sessionDir = newSessionDir;
 
-		// Update the session header in fileEntries
-		const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
-		if (header) {
-			header.cwd = resolvedCwd;
-			this.#headerExportRevision++;
-		}
-
-		// Rewrite the session file at its new location with updated header.
-		// hadSessionFile: file existed before move → must rewrite to update cwd
-		// hasAssistant: assistant messages in memory but file missing → recreate from memory
-		// Neither true → fresh session, never written → preserve lazy-persist
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
-		if (this.persist && this.#sessionFile && (hadSessionFile || hasAssistant)) {
-			await this.#rewriteFile();
+		try {
+			if (this.persist && this.#sessionFile && hadSessionFile) {
+				await this.#appendHeaderPatch({ cwd: resolvedCwd });
+				await this.#rewriteFile();
+			} else if (this.persist && this.#sessionFile && hasAssistant) {
+				await this.#appendHeaderPatch({ cwd: resolvedCwd });
+				await this.#rewriteFile();
+			} else {
+				await this.#appendHeaderPatch({ cwd: resolvedCwd });
+			}
+		} catch (error) {
+			const failedSessionFile = this.#sessionFile;
+			const failedArtifactDir = failedSessionFile?.slice(0, -6);
+			try {
+				await this.#closePersistWriter().catch(() => {});
+				this.#persistChain = Promise.resolve();
+				this.#persistError = undefined;
+				this.#persistErrorReported = false;
+				if (
+					this.storage instanceof FileSessionStorage &&
+					failedArtifactDir &&
+					previousArtifactDir &&
+					failedArtifactDir !== previousArtifactDir &&
+					fs.existsSync(failedArtifactDir)
+				) {
+					await movePathAcrossDevicesSafe(failedArtifactDir, previousArtifactDir);
+				}
+				if (
+					this.storage instanceof FileSessionStorage &&
+					failedSessionFile &&
+					previousSessionFile &&
+					failedSessionFile !== previousSessionFile &&
+					fs.existsSync(failedSessionFile)
+				) {
+					await movePathAcrossDevicesSafe(failedSessionFile, previousSessionFile);
+				}
+				this.#sessionFile = previousSessionFile;
+				this.cwd = previousCwd;
+				this.sessionDir = previousSessionDir;
+				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+				if (header) applyHeaderPatch(header, { cwd: previousCwd });
+				this.#headerExportRevision++;
+				if (previousSessionFile && this.storage.existsSync(previousSessionFile)) await this.#rewriteFile();
+			} catch (rollbackError) {
+				throw new Error(`Failed to rollback session move: ${toError(rollbackError).message}`, {
+					cause: toError(error),
+				});
+			}
+			throw error;
 		}
 
-		// Update terminal breadcrumb
+		// Update terminal breadcrumb only after the durable cwd transition succeeds.
 		if (this.#sessionFile) {
 			writeTerminalBreadcrumb(resolvedCwd, this.#sessionFile);
 		}
@@ -4371,19 +4589,23 @@ export class SessionManager {
 		}
 	}
 
-	async #rewriteFile(): Promise<void> {
+	async #rewriteFileContents(): Promise<void> {
 		if (!this.persist || !this.#sessionFile) return;
+		await this.#closePersistWriterInternal();
+		const entries = await Promise.all(
+			materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
+				prepareEntryForPersistence(entry, this.#blobStore),
+			),
+		);
+		await this.#writeEntriesAtomically(entries);
+		this.#needsFullRewriteOnNextPersist = false;
+		this.#flushed = true;
+		this.#ensuredOnDisk = true;
+	}
+
+	async #rewriteFile(): Promise<void> {
 		await this.#queuePersistTask(async () => {
-			await this.#closePersistWriterInternal();
-			const entries = await Promise.all(
-				materializeResidentEntriesForPersistenceSync(this.#fileEntries, this.#residentBlobStores()).map(entry =>
-					prepareEntryForPersistence(entry, this.#blobStore),
-				),
-			);
-			await this.#writeEntriesAtomically(entries);
-			this.#needsFullRewriteOnNextPersist = false;
-			this.#flushed = true;
-			this.#ensuredOnDisk = true;
+			await this.#rewriteFileContents();
 		});
 	}
 
@@ -4787,7 +5009,8 @@ export class SessionManager {
 		return name
 			.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
 			.replace(/ +/g, " ")
-			.trim();
+			.trim()
+			.slice(0, SESSION_NAME_MAX_CHARS);
 	}
 
 	/**
@@ -4804,23 +5027,40 @@ export class SessionManager {
 
 		this.#sessionName = sanitized;
 		this.#titleSource = source;
-
-		// Update the in-memory header (so first flush includes title)
-		const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
-		if (header) {
-			header.title = sanitized;
-			header.titleSource = source;
-		}
-		this.#headerExportRevision++;
-
-		// Update the session file header with the title (if already flushed)
-		const sessionFile = this.#sessionFile;
-		if (this.persist && sessionFile && this.storage.existsSync(sessionFile)) {
-			await this.#rewriteFile();
-		}
+		await this.#appendHeaderPatch({ title: sanitized, titleSource: source });
 		return true;
 	}
 
+	async #appendHeaderPatch(patch: HeaderPatchRecord["patch"]): Promise<void> {
+		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		if (!header) return;
+		applyHeaderPatch(header, patch);
+		this.#headerExportRevision++;
+		await this.#persistPatch({ type: "header_patch", patch });
+	}
+
+	async #persistPatch(record: SessionPatchRecord): Promise<void> {
+		if (!this.persist || !this.#sessionFile || !this.storage.existsSync(this.#sessionFile)) return;
+		await this.#queuePersistTask(async () => {
+			const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+			if (this.#needsFullRewriteOnNextPersist || !this.#flushed || (header?.version ?? 1) < CURRENT_SESSION_VERSION)
+				return this.#rewriteFileContents();
+			const writer = this.#ensurePersistWriter();
+			if (!writer) return this.#rewriteFileContents();
+			const persistedRecord =
+				record.type === "entry_patch"
+					? (prepareEntryForPersistenceSync(
+							materializeResidentEntryForPersistenceSync(
+								record as unknown as FileEntry,
+								this.#residentBlobStores(),
+								new Map(),
+							),
+							this.#blobStore,
+						) as unknown as SessionPatchRecord)
+					: record;
+			await writer.write(persistedRecord);
+		});
+	}
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
 		if (this.#persistError) throw this.#persistError;
@@ -4833,6 +5073,7 @@ export class SessionManager {
 			if (!hasAssistant) {
 				// Mark as not flushed so when assistant arrives, all entries get written.
 				this.#flushed = false;
+
 				this.#ensuredOnDisk = false;
 				return;
 			}
@@ -5692,28 +5933,33 @@ export class SessionManager {
 		const marker = entry.type === "message" || entry.type === "custom_message" ? entry.evictedContent : undefined;
 		return marker ? Object.keys(marker.payloads ?? {}).length : 0;
 	}
-	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries. */
+	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries without persisting it. */
 	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
-		let didSanitize = false;
-		for (const entry of this.#fileEntries) {
-			if (entry.type !== "message" || entry.message.role !== "assistant") {
-				continue;
-			}
+		return this.#sanitizeLoadedOpenAIResponsesReplayMetadata().length > 0;
+	}
 
-			const sanitizedMessage = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
-			if (sanitizedMessage === entry.message) {
-				continue;
-			}
-
-			entry.message = sanitizedMessage;
-			didSanitize = true;
+	async #sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist(): Promise<boolean> {
+		const patches = this.#sanitizeLoadedOpenAIResponsesReplayMetadata();
+		for (const patch of patches) {
+			await this.#persistPatch(patch);
 		}
-		if (didSanitize) {
+		return patches.length > 0;
+	}
+
+	#sanitizeLoadedOpenAIResponsesReplayMetadata(): EntryPatchRecord[] {
+		const patches: EntryPatchRecord[] = [];
+		for (const entry of this.#fileEntries) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const sanitizedMessage = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
+			if (sanitizedMessage === entry.message) continue;
+			entry.message = sanitizedMessage;
+			patches.push({ type: "entry_patch", entryId: entry.id, patch: { message: sanitizedMessage } });
+		}
+		if (patches.length > 0) {
 			this.#bumpEntryRevision();
 			this.#replayMetadataRevision++;
 		}
-
-		return didSanitize;
+		return patches;
 	}
 
 	/**
@@ -6458,7 +6704,13 @@ export class SessionManager {
 			await manager.close();
 			return { kind: "error", reason: "identity-mismatch" };
 		}
-		writeTerminalBreadcrumb(manager.cwd, sessionPath);
+		try {
+			await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+			writeTerminalBreadcrumb(manager.cwd, sessionPath);
+		} catch (error) {
+			await manager.close();
+			throw error;
+		}
 		return { kind: "opened", manager };
 	}
 

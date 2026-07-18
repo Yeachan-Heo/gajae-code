@@ -45,6 +45,12 @@ export interface RateLimitItem<T = unknown> {
 	payload: T;
 }
 
+export type RateLimitDisposition = "queued" | "sending" | "accepted" | "rejected" | "ambiguous" | "removed" | "expired";
+export interface RateLimitHandle {
+	itemId: string;
+	settled: Promise<Exclude<RateLimitDisposition, "queued" | "sending">>;
+}
+
 /** Options for {@link RateLimitPool}. */
 export interface RateLimitPoolOptions {
 	/** Burst capacity (max tokens). Default 20 (Telegram per-chat burst). */
@@ -87,6 +93,11 @@ export class RateLimitPool<T = unknown> {
 
 	private tokens: number;
 	private lastRefill: number;
+	private readonly settlements = new Map<
+		string,
+		PromiseWithResolvers<Exclude<RateLimitDisposition, "queued" | "sending">>
+	>();
+
 	private seqCounter = 0;
 
 	constructor(options: RateLimitPoolOptions = {}) {
@@ -116,22 +127,45 @@ export class RateLimitPool<T = unknown> {
 	 * item in the same `(sessionId, lane)` replace its payload (latest wins)
 	 * while preserving FIFO position; identified items are always appended.
 	 */
-	submit(item: RateLimitItem<T>): void {
-		const queue = this.lanes.get(item.lane);
-		if (!queue) throw new Error(`unknown rate-limit lane: ${item.lane}`);
-		if (item.itemId === undefined && item.coalesceKey !== undefined) {
+	submit(item: RateLimitItem<T>): RateLimitHandle {
+		const itemId = item.itemId ?? `rate-limit:${this.seqCounter++}`;
+		const identified = item.itemId === undefined ? { ...item, itemId } : item;
+		const queue = this.lanes.get(identified.lane);
+		if (!queue) throw new Error(`unknown rate-limit lane: ${identified.lane}`);
+		if (item.itemId === undefined && identified.coalesceKey !== undefined) {
 			const existing = queue.find(
-				q =>
-					q.item.itemId === undefined &&
-					q.item.sessionId === item.sessionId &&
-					q.item.coalesceKey === item.coalesceKey,
+				q => q.item.sessionId === identified.sessionId && q.item.coalesceKey === identified.coalesceKey,
 			);
 			if (existing) {
-				existing.item = item;
-				return;
+				this.settle(existing.item.itemId!, "removed");
+				existing.item = identified;
+				return this.handle(itemId);
 			}
 		}
-		queue.push({ item, seq: this.seqCounter++ });
+		queue.push({ item: identified, seq: item.itemId === undefined ? this.seqCounter - 1 : this.seqCounter++ });
+		return this.handle(itemId);
+	}
+
+	/** Settle a stable item after its external transport effect has a known outcome. */
+	settle(itemId: string, disposition: Exclude<RateLimitDisposition, "queued" | "sending">): void {
+		const deferred = this.settlements.get(itemId);
+		if (!deferred) return;
+		this.settlements.delete(itemId);
+		deferred.resolve(disposition);
+	}
+
+	/** Mark a granted item as owned by an external transport effect. */
+	markSending(itemId: string): void {
+		if (!this.settlements.has(itemId)) throw new Error(`unknown rate-limit item: ${itemId}`);
+	}
+
+	private handle(itemId: string): RateLimitHandle {
+		let deferred = this.settlements.get(itemId);
+		if (!deferred) {
+			deferred = Promise.withResolvers<Exclude<RateLimitDisposition, "queued" | "sending">>();
+			this.settlements.set(itemId, deferred);
+		}
+		return { itemId, settled: deferred.promise };
 	}
 
 	/**
@@ -149,7 +183,8 @@ export class RateLimitPool<T = unknown> {
 	 */
 	drainWithExpired(nowMs: number = this.now()): RateLimitDrainResult<T> {
 		this.refill(nowMs);
-		const expired = this.removeWhere(item => item.deadlineAt !== undefined && item.deadlineAt <= nowMs);
+		const expired = this.removeWhere(item => item.deadlineAt !== undefined && item.deadlineAt <= nowMs, "expired");
+
 		const granted: RateLimitItem<T>[] = [];
 		while (this.tokens >= 1) {
 			const next = this.takeNext();
@@ -161,7 +196,10 @@ export class RateLimitPool<T = unknown> {
 	}
 
 	/** Remove queued items matching `predicate` without consuming tokens. Returns removed items in lane/FIFO order. */
-	removeWhere(predicate: (item: RateLimitItem<T>) => boolean): RateLimitItem<T>[] {
+	removeWhere(
+		predicate: (item: RateLimitItem<T>) => boolean,
+		disposition: Exclude<RateLimitDisposition, "queued" | "sending"> = "removed",
+	): RateLimitItem<T>[] {
 		const removed: RateLimitItem<T>[] = [];
 		for (const lane of LANE_PRIORITY) {
 			const queue = this.lanes.get(lane)!;
@@ -170,6 +208,7 @@ export class RateLimitPool<T = unknown> {
 				const queued = queue[read]!;
 				if (predicate(queued.item)) {
 					removed.push(queued.item);
+					this.settle(queued.item.itemId!, disposition);
 				} else {
 					queue[write++] = queued;
 				}
@@ -184,7 +223,11 @@ export class RateLimitPool<T = unknown> {
 		for (const lane of LANE_PRIORITY) {
 			const queue = this.lanes.get(lane)!;
 			const index = queue.findIndex(queued => queued.item.itemId === itemId);
-			if (index >= 0) return queue.splice(index, 1)[0]!.item;
+			if (index >= 0) {
+				const item = queue.splice(index, 1)[0]!.item;
+				this.settle(item.itemId!, "removed");
+				return item;
+			}
 		}
 		return undefined;
 	}
@@ -203,6 +246,7 @@ export class RateLimitPool<T = unknown> {
 			if (queue.length === 0) continue;
 			const picked = this.pickFairIndex(lane, queue);
 			const [removed] = queue.splice(picked, 1);
+			if (removed) this.markSending(removed.item.itemId!);
 			return removed?.item;
 		}
 		return undefined;

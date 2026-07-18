@@ -5,11 +5,11 @@ import {
 	Input,
 	matchesKey,
 	padding,
-	replaceTabs,
 	truncateToWidth,
 	visibleWidth,
 } from "@gajae-code/tui";
-import { theme } from "../../modes/theme/theme";
+import { sanitizeStatusText } from "../shared";
+import { theme } from "../theme/theme";
 import { DynamicBorder } from "./dynamic-border";
 
 export interface CommandPaletteAction {
@@ -21,31 +21,59 @@ export interface CommandPaletteAction {
 export interface CommandPaletteEntry {
 	id: string;
 	label: string;
-	description: string;
+	description?: string;
+	category?: string;
 	keybinding?: string;
+	bindingHint?: string;
 	searchText?: string;
 	handler?: () => void | Promise<void>;
+	disabled?: boolean;
+}
+
+function sanitizePaletteText(text: string): string {
+	return sanitizeStatusText(text.toWellFormed());
+}
+
+function isSafePaletteEntryId(id: string): boolean {
+	return id.length > 0 && !/[\s\u0000-\u001f\u007f-\u009f]/u.test(id);
 }
 
 class CommandPaletteList implements Component {
+	#entries: CommandPaletteEntry[];
 	#filteredEntries: CommandPaletteEntry[];
 	#selectedIndex = 0;
 	readonly #searchInput = new Input();
 	onSelect?: (entry: CommandPaletteEntry) => void;
 	onCancel?: () => void;
 
-	constructor(private readonly entries: CommandPaletteEntry[]) {
-		this.#filteredEntries = entries;
+	constructor(entries: CommandPaletteEntry[]) {
+		this.#entries = entries.map(entry => ({
+			...entry,
+			label: sanitizePaletteText(entry.label),
+			description: sanitizePaletteText(entry.description ?? entry.category ?? ""),
+			category: entry.category === undefined ? undefined : sanitizePaletteText(entry.category),
+			keybinding:
+				entry.keybinding === undefined && entry.bindingHint === undefined
+					? undefined
+					: sanitizePaletteText(entry.keybinding ?? entry.bindingHint ?? ""),
+			bindingHint: entry.bindingHint === undefined ? undefined : sanitizePaletteText(entry.bindingHint),
+			searchText: entry.searchText === undefined ? undefined : sanitizePaletteText(entry.searchText),
+		}));
+		this.#filteredEntries = this.#entries;
 	}
 
 	#filter(query: string): void {
-		this.#filteredEntries = fuzzyFilter(this.entries, query, entry =>
+		this.#filteredEntries = fuzzyFilter(this.#entries, query, entry =>
 			[entry.label, entry.description, entry.keybinding ?? "", entry.searchText ?? ""].join(" "),
 		);
 		this.#selectedIndex = Math.max(0, Math.min(this.#selectedIndex, this.#filteredEntries.length - 1));
 	}
 
 	invalidate(): void {}
+
+	getEntries(): readonly CommandPaletteEntry[] {
+		return this.#filteredEntries;
+	}
 
 	render(width: number): string[] {
 		const lines = [theme.fg("muted", "  Search commands"), ...this.#searchInput.render(width), ""];
@@ -71,12 +99,15 @@ class CommandPaletteList implements Component {
 				1,
 				width - visibleWidth(prefix) - visibleWidth(keybinding) - (keybinding ? 1 : 0),
 			);
-			const label = truncateToWidth(replaceTabs(entry.label), availableLabelWidth);
+			const label = truncateToWidth(entry.label, availableLabelWidth);
 			const labelPadding = padding(Math.max(0, availableLabelWidth - visibleWidth(label)));
+			const renderedLabel = selected ? theme.bold(label) : label;
 			lines.push(
-				prefix + (selected ? theme.bold(label) : label) + labelPadding + (keybinding ? ` ${keybinding}` : ""),
+				entry.disabled
+					? theme.fg("muted", prefix + renderedLabel + labelPadding + (keybinding ? ` ${keybinding}` : ""))
+					: prefix + renderedLabel + labelPadding + (keybinding ? ` ${keybinding}` : ""),
 			);
-			lines.push(theme.fg("dim", truncateToWidth(`  ${replaceTabs(entry.description)}`, width)));
+			lines.push(theme.fg("dim", truncateToWidth(`  ${entry.description ?? ""}`, width)));
 		}
 		if (start > 0 || end < this.#filteredEntries.length) {
 			lines.push(theme.fg("muted", `  (${this.#selectedIndex + 1}/${this.#filteredEntries.length})`));
@@ -100,7 +131,7 @@ class CommandPaletteList implements Component {
 		}
 		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
 			const entry = this.#filteredEntries[this.#selectedIndex];
-			if (entry) this.onSelect?.(entry);
+			if (entry && !entry.disabled && isSafePaletteEntryId(entry.id)) this.onSelect?.(entry);
 			return;
 		}
 		this.#searchInput.handleInput(data);
@@ -121,7 +152,17 @@ export class CommandPaletteComponent extends Container {
 		this.addChild(new DynamicBorder());
 	}
 
+	override render(width: number): string[] {
+		return super.render(width).map(line => truncateToWidth(line, width));
+	}
 	handleInput(data: string): void {
 		this.#list.handleInput(data);
 	}
+
+	getEntries(): readonly CommandPaletteEntry[] {
+		return this.#list.getEntries();
+	}
 }
+
+/** Backward-compatible name retained for extensions and existing call sites. */
+export class CommandPalette extends CommandPaletteComponent {}

@@ -31,6 +31,7 @@ const BASE_CONFIG: NotificationConfig = {
 	rich: { enabled: true },
 	richDraft: { enabled: false },
 	topics: { nameTemplate: undefined },
+	btw: { enabled: true },
 };
 
 type Call = { kind: "start" | "stop" | "daemon"; cwd: string; sessionId: string };

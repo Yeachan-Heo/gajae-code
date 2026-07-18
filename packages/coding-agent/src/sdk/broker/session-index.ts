@@ -2,7 +2,13 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { withFileLock } from "../../config/file-lock";
-import { assertSupportedStateVersion, SDK_STATE_VERSION, UnsupportedStateVersionError } from "./state-version";
+import {
+	assertSupportedSnapshotVersion,
+	assertSupportedStateVersion,
+	SDK_STATE_VERSION,
+	SESSION_INDEX_SNAPSHOT_VERSION,
+	UnsupportedStateVersionError,
+} from "./state-version";
 
 export type SessionIndexEventType =
 	| "host_registered"
@@ -52,18 +58,54 @@ const ROTATE_BYTES = 4 * 1024 * 1024;
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
 	if (!snapshot || typeof snapshot !== "object") return false;
 	const { indexSeq, events } = snapshot as { indexSeq?: unknown; events?: unknown };
-	return (
-		typeof indexSeq === "number" &&
-		Number.isSafeInteger(indexSeq) &&
-		indexSeq >= 0 &&
-		Array.isArray(events) &&
-		events.length === indexSeq &&
-		events.every((event, index) => {
-			if (!event || typeof event !== "object") return false;
-			const { checksum, ...unsigned } = event as SessionIndexEvent;
-			return event.indexSeq === index + 1 && checksum === sessionIndexChecksum(unsigned);
-		})
-	);
+	if (typeof indexSeq !== "number" || !Number.isSafeInteger(indexSeq) || indexSeq < 0) return false;
+	if (!Array.isArray(events)) return false;
+	if (events.length === 0) return indexSeq === 0;
+	// Accept strictly-increasing indexSeq (gaps allowed after compaction), preserving
+	// each event's original checksum. The old contiguous 1..N format is a special case.
+	let previous = 0;
+	for (const event of events) {
+		if (!event || typeof event !== "object") return false;
+		const { checksum, ...unsigned } = event as SessionIndexEvent;
+		if (typeof event.indexSeq !== "number" || !Number.isSafeInteger(event.indexSeq)) return false;
+		if (event.indexSeq <= previous) return false;
+		if (checksum !== sessionIndexChecksum(unsigned)) return false;
+		previous = event.indexSeq;
+	}
+	return previous === indexSeq;
+}
+
+// Compact the event history for a snapshot without renumbering: clients hold indexSeq
+// across calls, so retained events keep their original indexSeq and checksum. Drops
+// terminal+dead sessions entirely, collapses superseded heartbeats to the latest per
+// surviving session, and always retains the global-max indexSeq as the chain anchor.
+function compactEvents(events: SessionIndexEvent[]): SessionIndexEvent[] {
+	if (events.length === 0) return events;
+	const maxIndexSeq = events[events.length - 1]!.indexSeq;
+	const latestBySession = new Map<string, SessionIndexEvent>();
+	for (const event of events) latestBySession.set(event.sessionId, event);
+	const deadTerminal = new Set<string>();
+	for (const [sessionId, latest] of latestBySession) {
+		const terminal = latest.type === "host_unregistered" || latest.type === "session_closed";
+		if (terminal && !alive(latest.pid)) deadTerminal.add(sessionId);
+	}
+	const latestHeartbeatSeq = new Map<string, number>();
+	for (const event of events) {
+		if (event.type === "host_heartbeat" && !deadTerminal.has(event.sessionId)) {
+			latestHeartbeatSeq.set(event.sessionId, event.indexSeq);
+		}
+	}
+	const kept: SessionIndexEvent[] = [];
+	for (const event of events) {
+		if (event.indexSeq === maxIndexSeq) {
+			kept.push(event);
+			continue;
+		}
+		if (deadTerminal.has(event.sessionId)) continue;
+		if (event.type === "host_heartbeat" && latestHeartbeatSeq.get(event.sessionId) !== event.indexSeq) continue;
+		kept.push(event);
+	}
+	return kept;
 }
 
 async function appendSync(file: string, value: string): Promise<void> {
@@ -135,7 +177,7 @@ export class SessionIndex {
 				events?: SessionIndexEvent[];
 				indexSeq?: number;
 			};
-			assertSupportedStateVersion(snapshotFor(this.#agentDir), snapshot);
+			assertSupportedSnapshotVersion(snapshotFor(this.#agentDir), snapshot);
 			if (!isValidSnapshot(snapshot)) throw new Error("invalid snapshot");
 			this.#events = snapshot.events;
 			snapshotSeq = snapshot.indexSeq;
@@ -240,7 +282,11 @@ export class SessionIndex {
 		const tmp = `${file}.${process.pid}.tmp`;
 		await fs.writeFile(
 			tmp,
-			JSON.stringify({ version: SDK_STATE_VERSION, indexSeq: this.indexSeq, events: this.#events }),
+			JSON.stringify({
+				version: SESSION_INDEX_SNAPSHOT_VERSION,
+				indexSeq: this.indexSeq,
+				events: compactEvents(this.#events),
+			}),
 			{
 				mode: 0o600,
 			},

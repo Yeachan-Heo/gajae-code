@@ -381,6 +381,18 @@ describe("Settings", () => {
 		});
 	});
 
+	it("migrates ask.timeout milliseconds once and records schema version one", async () => {
+		await writeSettings({ ask: { timeout: 30_000 } });
+		let settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("ask.timeout")).toBe(30);
+		expect((await readSettings()).configSchemaVersion).toBe(1);
+
+		resetSettingsForTest();
+		settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("ask.timeout")).toBe(30);
+		expect((await readSettings()).ask).toEqual({ timeout: 30 });
+	});
+
 	describe("below-threshold maintenance pruning defaults (Finding 13)", () => {
 		it("keeps maintenance pruning off by default (evidence-gated) with a high min-savings floor", () => {
 			const settings = Settings.isolated();

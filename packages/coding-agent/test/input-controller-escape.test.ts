@@ -975,6 +975,22 @@ describe("InputController command palette", () => {
 
 		expect(ctx.handleChangelogCommand).toHaveBeenCalledTimes(1);
 	});
+	it("dispatches slash commands when the UI focus capability is unavailable", async () => {
+		const { ctx } = createContext();
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		ctx.handleChangelogCommand = vi.fn();
+		(ctx.ui as { setFocus?: (target: unknown) => void }).setFocus = undefined;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.createAutocompleteProvider([{ name: "changelog" }] as SlashCommand[], "");
+		controller.openCommandPalette();
+		const executeSlashCommand = showCommandPalette.mock.calls[0]?.[2] as (name: string) => Promise<void>;
+		await executeSlashCommand("changelog");
+
+		expect(ctx.handleChangelogCommand).toHaveBeenCalledTimes(1);
+	});
 	it("runs action entries with a draft without touching the composer", () => {
 		const { ctx, editor } = createContext();
 		const showCommandPalette = vi.fn();

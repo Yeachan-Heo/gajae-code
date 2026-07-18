@@ -250,6 +250,50 @@ async function runNonPipeUnhandledRejection(): Promise<void> {
 	await Bun.sleep(2_000);
 }
 
+async function runConsecutiveSignalsShareCleanup(): Promise<void> {
+	let count = 0;
+	postmortem.register("fixture-consecutive-signals", async reason => {
+		count++;
+		await Bun.sleep(500);
+		writeResult({ count, reason });
+	});
+
+	setTimeout(() => process.kill(process.pid, "SIGTERM"), 20);
+	process.kill(process.pid, "SIGHUP");
+	await Bun.sleep(5_000);
+}
+
+async function runCleanupDeadlineSignal(): Promise<void> {
+	process.env.GJC_CLEANUP_DEADLINE_MS = "300";
+	postmortem.register("fixture-deadline-signal", async () => {
+		writeResult({ started: true });
+		await new Promise(() => {});
+	});
+
+	process.kill(process.pid, "SIGTERM");
+	await Bun.sleep(10_000);
+}
+
+async function runCleanupDeadlineQuit(): Promise<void> {
+	process.env.GJC_CLEANUP_DEADLINE_MS = "300";
+	postmortem.register("fixture-deadline-quit", async () => {
+		writeResult({ started: true });
+		await new Promise(() => {});
+	});
+
+	await postmortem.quit(7);
+}
+
+async function runCleanupDeadlineFatal(): Promise<void> {
+	process.env.GJC_CLEANUP_DEADLINE_MS = "300";
+	postmortem.register("fixture-deadline-fatal", async () => {
+		writeResult({ started: true });
+		await new Promise(() => {});
+	});
+
+	await throwFromTimer(new Error("fixture: fatal with hung cleanup"));
+}
+
 const scenario = process.argv[2];
 switch (scenario) {
 	case "exit-reentry-while-running":
@@ -257,6 +301,18 @@ switch (scenario) {
 		break;
 	case "non-exit-recursive-cleanup":
 		await runNonExitRecursiveCleanup();
+		break;
+	case "consecutive-signals-share-cleanup":
+		await runConsecutiveSignalsShareCleanup();
+		break;
+	case "cleanup-deadline-signal":
+		await runCleanupDeadlineSignal();
+		break;
+	case "cleanup-deadline-quit":
+		await runCleanupDeadlineQuit();
+		break;
+	case "cleanup-deadline-fatal":
+		await runCleanupDeadlineFatal();
 		break;
 	case "quit-reentry-waits-for-cleanup":
 		await runQuitReentryWaitsForCleanup();

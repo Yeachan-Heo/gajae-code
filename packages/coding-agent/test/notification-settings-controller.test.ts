@@ -1,4 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
 import type { CasReceipt } from "@gajae-code/coding-agent/config/atomic-yaml-patch";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import type {
@@ -45,6 +46,7 @@ function snapshot(overrides: Partial<NotificationSettingsSnapshot> = {}): Notifi
 			botToken: "stored-token",
 			chatId: "stored-chat",
 			rich: { enabled: true },
+			btw: { enabled: true },
 			richDraft: { enabled: false },
 			topics: {},
 		},
@@ -273,7 +275,7 @@ describe("notification settings controller adapter", () => {
 			},
 			recoverNotifications: async input => {
 				serviceCalls.push("recover");
-				expect(input).toMatchObject({ settings, stateRoot: "/workspace/current/.gjc/state" });
+				expect(input).toMatchObject({ settings, stateRoot: path.join("/workspace/current", ".gjc", "state") });
 				return recovery();
 			},
 			unregisterNotificationRoot: async () => ({ root: "/workspace/current/.gjc/state", remainingRoots: 1 }),
@@ -321,7 +323,7 @@ describe("notification settings controller adapter", () => {
 			expect.objectContaining({ sessionManager: ctx.sessionManager }),
 		);
 		expect(healthCalls).toContainEqual(
-			expect.objectContaining({ stateRoot: "/workspace/current/.gjc/state", probe: true, signal }),
+			expect.objectContaining({ stateRoot: path.join("/workspace/current", ".gjc", "state"), probe: true, signal }),
 		);
 		expect(serviceCalls).toEqual(["status", "test", "recover"]);
 

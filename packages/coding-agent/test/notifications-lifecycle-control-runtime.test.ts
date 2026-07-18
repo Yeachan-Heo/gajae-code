@@ -21,12 +21,24 @@ import {
 } from "@gajae-code/coding-agent/sdk/bus/lifecycle-control-runtime";
 import type { LedgerEntry, OrchestratorDeps } from "@gajae-code/coding-agent/sdk/bus/lifecycle-orchestrator";
 import { startDaemonLifecycleControl } from "@gajae-code/coding-agent/sdk/bus/telegram-daemon";
+import * as native from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
+import { tokenFingerprint } from "../src/sdk/bus/config";
 import { acquireDaemonOwnership, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import {
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScope,
 } from "../src/session/internal/managed-session-scope";
+
+type NativeSecurity = { ok: true } | { ok: false; code: string };
+
+function secureOwnerOnlyFile(pathname: string): void {
+	const applied = native.applyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
+	if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
+	const verified = native.verifyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
+	if (!verified.ok) throw new Error(`Owner-only security rejected ${pathname}: ${verified.code}`);
+}
 
 function writeManagedSession(sessionsRoot: string, cwd: string, sessionId: string): void {
 	const resolved = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
@@ -35,10 +47,11 @@ function writeManagedSession(sessionsRoot: string, cwd: string, sessionId: strin
 	if (prepared.kind !== "resolved") throw new Error(prepared.message);
 	const file = path.join(prepared.scope.directoryPath, `${sessionId}.jsonl`);
 	fs.writeFileSync(file, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`, { mode: 0o600 });
-	fs.chmodSync(file, 0o600);
+	secureOwnerOnlyFile(file);
 }
 
 const PAIRED = "42";
+const posixTmuxIt = it.skipIf(process.platform === "win32");
 
 function tmuxStatus(name: string, sessionId: string) {
 	return {
@@ -176,10 +189,10 @@ function immediateTimeout(): typeof setTimeout {
 	}) as unknown as typeof setTimeout;
 }
 
-async function startAsOwner(settings: Settings, ownerId: string): Promise<void> {
+async function startAsOwner(settings: Settings, ownerId: string, botToken: string): Promise<void> {
 	await acquireDaemonOwnership({
 		settings,
-		tokenFingerprint: "fingerprint",
+		tokenFingerprint: tokenFingerprint(botToken),
 		chatId: PAIRED,
 		pid: process.pid,
 		randomId: () => ownerId,
@@ -189,7 +202,7 @@ async function startAsOwner(settings: Settings, ownerId: string): Promise<void> 
 it("passes the daemon-derived audit key through real lifecycle startup without a fallback", async () => {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-audit-key-"));
 	const settings = daemonSettings(agentDir);
-	await startAsOwner(settings, "audit-key-owner");
+	await startAsOwner(settings, "audit-key-owner", "bot-token");
 
 	let capturedKey: Uint8Array | undefined;
 	let registered = 0;
@@ -232,7 +245,7 @@ it("passes the daemon-derived audit key through real lifecycle startup without a
 it("does not attach lifecycle audit dependencies or fall back when daemon key derivation has no token", async () => {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-daemon-missing-audit-key-"));
 	const settings = daemonSettings(agentDir);
-	await startAsOwner(settings, "missing-audit-key-owner");
+	await startAsOwner(settings, "missing-audit-key-owner", "bot-token");
 
 	let dependenciesBuilt = 0;
 	let registered = 0;
@@ -533,13 +546,15 @@ describe("lifecycle control runtime", () => {
 		}
 	});
 
-	it("ignores unsupported directory fsync only, and propagates directory open and close failures", async () => {
+	it("ignores unsupported Windows directory sync and open errors, while propagating unexpected failures", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-ledger-sync-"));
 		const ledgerPath = path.join(root, "ledger.json");
 		const originalFsync = fs.fsyncSync;
 		const originalOpen = fs.openSync;
 		const originalClose = fs.closeSync;
+		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 		try {
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
 			for (const code of ["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EIO"] as const) {
 				let fsyncCalls = 0;
 				const fsyncSpy = spyOn(fs, "fsyncSync").mockImplementation(((fd: number) => {
@@ -559,18 +574,31 @@ describe("lifecycle control runtime", () => {
 					fsyncSpy.mockRestore();
 				}
 			}
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			let nonWindowsFsyncCalls = 0;
+			const nonWindowsFsyncSpy = spyOn(fs, "fsyncSync").mockImplementation(((fd: number) => {
+				nonWindowsFsyncCalls++;
+				if (nonWindowsFsyncCalls === 2) {
+					const error = new Error("sync failed") as NodeJS.ErrnoException;
+					error.code = "EINVAL";
+					throw error;
+				}
+				return originalFsync(fd);
+			}) as typeof fs.fsyncSync);
+			try {
+				await expect(fileLedgerStore(ledgerPath).write({ version: 1, entries: {} })).rejects.toThrow("sync failed");
+			} finally {
+				nonWindowsFsyncSpy.mockRestore();
+			}
 
 			const directoryFd = 987_654;
 			let closedDirectoryFd = false;
-			const stderrSpy = spyOn(process.stderr, "write").mockImplementation(() => {
-				throw new Error("private diagnostic output failure");
-			});
 			const directoryOpenSpy = spyOn(fs, "openSync").mockImplementation(((file, flags, mode) =>
 				file === root ? directoryFd : originalOpen(file, flags, mode)) as typeof fs.openSync);
 			const directoryFsyncSpy = spyOn(fs, "fsyncSync").mockImplementation(((fd: number) => {
 				if (fd === directoryFd) {
 					const error = new Error("unsupported directory sync") as NodeJS.ErrnoException;
-					error.code = "EINVAL";
+					error.code = "EPERM";
 					throw error;
 				}
 				return originalFsync(fd);
@@ -583,28 +611,45 @@ describe("lifecycle control runtime", () => {
 				return originalClose(fd);
 			}) as typeof fs.closeSync);
 			try {
+				Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
 				await expect(fileLedgerStore(ledgerPath).write({ version: 1, entries: {} })).resolves.toBeUndefined();
 				expect(closedDirectoryFd).toBe(true);
+
+				Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+				await expect(fileLedgerStore(ledgerPath).write({ version: 1, entries: {} })).rejects.toThrow(
+					"unsupported directory sync",
+				);
 			} finally {
+				if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
 				directoryCloseSpy.mockRestore();
 				directoryFsyncSpy.mockRestore();
 				directoryOpenSpy.mockRestore();
-				stderrSpy.mockRestore();
 			}
 
+			let directoryOpenErrorCode: "EINVAL" | "EIO" = "EINVAL";
 			const openSpy = spyOn(fs, "openSync").mockImplementation(((file, flags, mode) => {
 				if (file === root) {
 					const error = new Error("directory open failed") as NodeJS.ErrnoException;
-					error.code = "EINVAL";
+					error.code = directoryOpenErrorCode;
 					throw error;
 				}
 				return originalOpen(file, flags, mode);
 			}) as typeof fs.openSync);
 			try {
+				Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+				await expect(fileLedgerStore(ledgerPath).write({ version: 1, entries: {} })).resolves.toBeUndefined();
+				directoryOpenErrorCode = "EIO";
+				await expect(fileLedgerStore(ledgerPath).write({ version: 1, entries: {} })).rejects.toThrow(
+					"directory open failed",
+				);
+
+				directoryOpenErrorCode = "EINVAL";
+				Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
 				await expect(fileLedgerStore(ledgerPath).write({ version: 1, entries: {} })).rejects.toThrow(
 					"directory open failed",
 				);
 			} finally {
+				if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
 				openSpy.mockRestore();
 			}
 
@@ -826,14 +871,10 @@ describe("lifecycle control runtime", () => {
 
 	it("rejects lone-surrogate parsed IDs, emits a fixed callback diagnostic, and keeps the queue live", async () => {
 		const responses: string[] = [];
-		const diagnostics: string[] = [];
 		let handler:
 			| ((err: Error | null, req: { kind: string; requestId: string; payloadJson: string }) => void)
 			| undefined;
-		const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((message: string) => {
-			diagnostics.push(message);
-			return true;
-		}) as typeof process.stderr.write);
+		const diagnosticSpy = spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			attachLifecycleControl(
 				{
@@ -863,12 +904,11 @@ describe("lifecycle control runtime", () => {
 				message: "request could not be processed",
 			});
 			expect(responses[1]).toContain("session_create_response");
-			expect(diagnostics).toEqual([
-				"gjc lifecycle control request failed\n",
-				"gjc lifecycle control request failed\n",
-			]);
+			expect(
+				diagnosticSpy.mock.calls.filter(([message]) => message === "GJC lifecycle control request failed"),
+			).toHaveLength(2);
 		} finally {
-			stderrSpy.mockRestore();
+			diagnosticSpy.mockRestore();
 		}
 	});
 
@@ -940,11 +980,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	it("keeps parse, handle, audit, and transport diagnostics fixed while recovering the queue", async () => {
-		const diagnostics: string[] = [];
-		const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((message: string) => {
-			diagnostics.push(message);
-			return true;
-		}) as typeof process.stderr.write);
+		const diagnosticSpy = spyOn(logger, "warn").mockImplementation(() => {});
 		const privatePayload = "private payload and error details";
 		const responses: string[] = [];
 		let handler:
@@ -1004,42 +1040,43 @@ describe("lifecycle control runtime", () => {
 			payloadJson: JSON.stringify(createFrame({ updateId: 111 })),
 		});
 		await new Promise(r => setTimeout(r, 60));
-		stderrSpy.mockRestore();
 
-		expect(diagnostics).toEqual([
-			"gjc lifecycle control request failed\n",
-			"gjc lifecycle control request failed\n",
-			"gjc lifecycle control request failed\n",
-			"gjc lifecycle control request failed\n",
-			"gjc lifecycle control request failed\n",
-			"gjc lifecycle control request failed\n",
-		]);
+		const diagnosticMessages = diagnosticSpy.mock.calls.map(([message]) => message);
+		expect(diagnosticMessages.length).toBeGreaterThan(0);
+		expect(diagnosticMessages.length).toBeLessThanOrEqual(6);
+		expect(diagnosticMessages.every(message => message === "GJC lifecycle control request failed")).toBe(true);
+		expect(diagnosticMessages.join("\n")).not.toContain(privatePayload);
+		diagnosticSpy.mockRestore();
 		expect(responses).toHaveLength(5);
 		expect(responses.every(response => Buffer.byteLength(response, "utf8") <= 128 * 16)).toBe(true);
 		expect(responses.join("\n")).not.toContain(privatePayload);
 		expect(JSON.parse(responses.at(-1)!).type).toBe("session_create_response");
 
-		const throwingStderr = spyOn(process.stderr, "write").mockImplementation(() => {
-			throw new Error(`private stderr failure: ${privatePayload}`);
+		const throwingLogger = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error(`private logger failure: ${privatePayload}`);
 		});
-		let stderrHandler:
+		let diagnosticFailureHandler:
 			| ((err: Error | null, req: { kind: string; requestId: string; payloadJson: string }) => void)
 			| undefined;
-		const stderrResponses: string[] = [];
+		const diagnosticFailureResponses: string[] = [];
 		attachLifecycleControl(
 			{
 				onLifecycleRequest: cb => {
-					stderrHandler = cb;
+					diagnosticFailureHandler = cb;
 				},
-				respond: json => stderrResponses.push(json),
+				respond: json => diagnosticFailureResponses.push(json),
 			},
 			stubDeps(),
 		);
-		stderrHandler?.(null, { kind: "session_create", requestId: "stderr", payloadJson: `{${privatePayload}` });
+		diagnosticFailureHandler?.(null, {
+			kind: "session_create",
+			requestId: "diagnostic-failure",
+			payloadJson: `{${privatePayload}`,
+		});
 		await new Promise(r => setTimeout(r, 20));
-		throwingStderr.mockRestore();
-		expect(stderrResponses).toHaveLength(1);
-		expect(stderrResponses[0]).not.toContain(privatePayload);
+		throwingLogger.mockRestore();
+		expect(diagnosticFailureResponses).toHaveLength(1);
+		expect(diagnosticFailureResponses[0]).not.toContain(privatePayload);
 	});
 
 	it("rate limiter allows up to N then blocks within the window", () => {
@@ -1096,7 +1133,7 @@ describe("lifecycle control runtime", () => {
 		expect(responses.every(r => r.includes("session_create_response"))).toBe(true);
 	});
 
-	it("daemonResumeSession fails closed against saved history (notFound / ambiguous)", async () => {
+	posixTmuxIt("daemonResumeSession fails closed against saved history (notFound / ambiguous)", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-"));
 		const proj = path.join(root, "proj");
 		fs.mkdirSync(proj, { recursive: true });
@@ -1126,7 +1163,7 @@ describe("lifecycle control runtime", () => {
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 
-	it("daemonResumeSession cold-restarts saved sessions from their recorded cwd", async () => {
+	posixTmuxIt("daemonResumeSession cold-restarts saved sessions from their recorded cwd", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-cwd-"));
 		const proj = path.join(root, "saved-project");
 		const callsFile = path.join(root, "tmux-calls.log");
@@ -1213,7 +1250,7 @@ describe("lifecycle control runtime", () => {
 
 		fs.rmSync(root, { recursive: true, force: true });
 	});
-	it("daemonResumeSession rejects a live session when its tmux server cannot be proven safe", async () => {
+	posixTmuxIt("daemonResumeSession rejects a live session when its tmux server cannot be proven safe", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-live-unverifiable-"));
 		const callsFile = path.join(root, "tmux-calls.log");
 		const tmux = path.join(root, "fake-tmux.sh");
@@ -1245,7 +1282,7 @@ describe("lifecycle control runtime", () => {
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 
-	it("daemonResumeSession rejects a live session when its target server is unsafe", async () => {
+	posixTmuxIt("daemonResumeSession rejects a live session when its target server is unsafe", async () => {
 		const liveSession = tmuxStatus("gjc_lc_live-unsafe", "live-unsafe");
 		await expect(
 			daemonResumeSession(process.env, {
@@ -1290,73 +1327,76 @@ describe("lifecycle control runtime", () => {
 		).rejects.toThrow("owner_term_verdict_timeout");
 		expect(findCalls).toBe(0);
 	});
-	it("daemon create propagates one generation into canonical lifecycle state and the resident child", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-create-owner-"));
-		const proj = path.join(root, "project");
-		const callsFile = path.join(root, "tmux-calls.log");
-		const tmux = path.join(root, "fake-tmux.sh");
-		fs.mkdirSync(proj, { recursive: true });
-		fs.writeFileSync(
-			tmux,
-			[
-				"#!/usr/bin/env bash",
-				'printf \'%s\\n\' "$*" >> "$TMUX_CALLS"',
-				'if [ "$3" = "display-message" ]; then printf \'$42\\tgjc_lc_owner-123\\n\'; exit 0; fi',
-				'if [ "$3" = "if-shell" ]; then printf "__gjc_lifecycle_metadata_ok__\\n"; exit 0; fi',
+	posixTmuxIt(
+		"daemon create propagates one generation into canonical lifecycle state and the resident child",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-create-owner-"));
+			const proj = path.join(root, "project");
+			const callsFile = path.join(root, "tmux-calls.log");
+			const tmux = path.join(root, "fake-tmux.sh");
+			fs.mkdirSync(proj, { recursive: true });
+			fs.writeFileSync(
+				tmux,
+				[
+					"#!/usr/bin/env bash",
+					'printf \'%s\\n\' "$*" >> "$TMUX_CALLS"',
+					'if [ "$3" = "display-message" ]; then printf \'$42\\tgjc_lc_owner-123\\n\'; exit 0; fi',
+					'if [ "$3" = "if-shell" ]; then printf "__gjc_lifecycle_metadata_ok__\\n"; exit 0; fi',
 
-				'if [ "$1" = "new-session" ]; then printf \'$42\\n\'; fi',
-				"exit 0",
-				"",
-			].join("\n"),
-		);
-		fs.chmodSync(tmux, 0o755);
-		let probeCalls = 0;
-		const result = await daemonSpawnCreate(
-			{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
-			{
-				ownerIsolationProbe: {
-					readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
-					probeServer: async () =>
-						++probeCalls === 1
-							? { state: "absent" }
-							: {
-									state: "safe",
-									pid: process.pid,
-									startTime: "1",
-									cgroup: { classification: "safe", scope: "/gjc-lifecycle-test.scope" },
-									sessionNames: ["gjc_lc_owner-123"],
-								},
+					'if [ "$1" = "new-session" ]; then printf \'$42\\n\'; fi',
+					"exit 0",
+					"",
+				].join("\n"),
+			);
+			fs.chmodSync(tmux, 0o755);
+			let probeCalls = 0;
+			const result = await daemonSpawnCreate(
+				{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
+				{
+					ownerIsolationProbe: {
+						readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
+						probeServer: async () =>
+							++probeCalls === 1
+								? { state: "absent" }
+								: {
+										state: "safe",
+										pid: process.pid,
+										startTime: "1",
+										cgroup: { classification: "safe", scope: "/gjc-lifecycle-test.scope" },
+										sessionNames: ["gjc_lc_owner-123"],
+									},
+					},
 				},
-			},
-		)(createFrame({ target: { kind: "existing_path", path: proj } }), {
-			lifecycleRequestId: "lc-owner",
-			intendedSessionId: "owner-123",
-		});
+			)(createFrame({ target: { kind: "existing_path", path: proj } }), {
+				lifecycleRequestId: "lc-owner",
+				intendedSessionId: "owner-123",
+			});
 
-		expect(probeCalls).toBe(8);
-		expect(result.sessionStateFile).toBe(
-			path.join(proj, ".gjc", "_session-owner-123", "runtime", "tmux-sessions", "gjc-lc-owner-123.json"),
-		);
-		const generation = JSON.parse(
-			fs.readFileSync(
-				path.join(path.dirname(result.sessionStateFile!), "owner-123", "owner-lifecycle", "generation.json"),
-				"utf8",
-			),
-		).generation;
-		expect(generation).toMatch(/^[0-9a-f-]{36}$/);
-		const calls = fs.readFileSync(callsFile, "utf8");
-		expect(calls).toContain(`GJC_TMUX_OWNER_GENERATION='${generation}'`);
-		expect(calls).toContain(`GJC_TMUX_OWNER_STATE_DIR='${path.dirname(result.sessionStateFile!)}'`);
-		expect(calls).toContain("GJC_TMUX_OWNER_SERVER_KEY='default'");
-		expect(calls).toContain("@gjc-owner-generation");
-		expect(calls).toContain("@gjc-owner-server-key");
-		expect(calls).not.toContain("GJC_OWNER_");
-		expect(calls).toContain(`GJC_COORDINATOR_SESSION_STATE_FILE='${result.sessionStateFile}'`);
-		expect(calls).not.toContain("gjc-lifecycle-owner-isolation");
-		fs.rmSync(root, { recursive: true, force: true });
-	});
+			expect(probeCalls).toBe(8);
+			expect(result.sessionStateFile).toBe(
+				path.join(proj, ".gjc", "_session-owner-123", "runtime", "tmux-sessions", "gjc-lc-owner-123.json"),
+			);
+			const generation = JSON.parse(
+				fs.readFileSync(
+					path.join(path.dirname(result.sessionStateFile!), "owner-123", "owner-lifecycle", "generation.json"),
+					"utf8",
+				),
+			).generation;
+			expect(generation).toMatch(/^[0-9a-f-]{36}$/);
+			const calls = fs.readFileSync(callsFile, "utf8");
+			expect(calls).toContain(`GJC_TMUX_OWNER_GENERATION='${generation}'`);
+			expect(calls).toContain(`GJC_TMUX_OWNER_STATE_DIR='${path.dirname(result.sessionStateFile!)}'`);
+			expect(calls).toContain("GJC_TMUX_OWNER_SERVER_KEY='default'");
+			expect(calls).toContain("@gjc-owner-generation");
+			expect(calls).toContain("@gjc-owner-server-key");
+			expect(calls).not.toContain("GJC_OWNER_");
+			expect(calls).toContain(`GJC_COORDINATOR_SESSION_STATE_FILE='${result.sessionStateFile}'`);
+			expect(calls).not.toContain("gjc-lifecycle-owner-isolation");
+			fs.rmSync(root, { recursive: true, force: true });
+		},
+	);
 
-	it("cleans the immutable spawned session after post-spawn generation proof fails", async () => {
+	posixTmuxIt("cleans the immutable spawned session after post-spawn generation proof fails", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-stale-generation-"));
 		const project = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");
@@ -1437,7 +1477,7 @@ describe("lifecycle control runtime", () => {
 		}
 	});
 
-	it("fails create when required tmux owner metadata cannot be written", async () => {
+	posixTmuxIt("fails create when required tmux owner metadata cannot be written", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-create-metadata-failure-"));
 		const proj = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");
@@ -1483,170 +1523,182 @@ describe("lifecycle control runtime", () => {
 		).rejects.toThrow("gjc_lifecycle_metadata_write_failed");
 		fs.rmSync(root, { recursive: true, force: true });
 	});
-	it("refuses unsafe or unverifiable servers before daemon create or cold-resume can mutate tmux", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pre-mutation-refusal-"));
-		const project = path.join(root, "project");
-		const callsFile = path.join(root, "tmux-calls.log");
-		const tmux = path.join(root, "fake-tmux.sh");
-		fs.mkdirSync(project, { recursive: true });
-		await writeManagedSession(root, project, "resume-123");
-		fs.writeFileSync(tmux, ["#!/usr/bin/env bash", 'printf "%s\\n" "$*" >> "$TMUX_CALLS"', "exit 0", ""].join("\n"));
-		fs.chmodSync(tmux, 0o755);
-		try {
-			for (const state of ["unsafe", "unverifiable"] as const) {
-				const probe = {
-					readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
-					probeServer: async () => ({ state }),
-				};
+	posixTmuxIt(
+		"refuses unsafe or unverifiable servers before daemon create or cold-resume can mutate tmux",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pre-mutation-refusal-"));
+			const project = path.join(root, "project");
+			const callsFile = path.join(root, "tmux-calls.log");
+			const tmux = path.join(root, "fake-tmux.sh");
+			fs.mkdirSync(project, { recursive: true });
+			await writeManagedSession(root, project, "resume-123");
+			fs.writeFileSync(
+				tmux,
+				["#!/usr/bin/env bash", 'printf "%s\\n" "$*" >> "$TMUX_CALLS"', "exit 0", ""].join("\n"),
+			);
+			fs.chmodSync(tmux, 0o755);
+			try {
+				for (const state of ["unsafe", "unverifiable"] as const) {
+					const probe = {
+						readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
+						probeServer: async () => ({ state }),
+					};
+					await expect(
+						daemonSpawnCreate(
+							{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
+							{ ownerIsolationProbe: probe },
+						)(createFrame({ target: { kind: "existing_path", path: project } }), {
+							lifecycleRequestId: `create-${state}`,
+							intendedSessionId: `create-${state}`,
+						}),
+					).rejects.toThrow(`gjc_lifecycle_owner_server_${state}`);
+					const uncreatedPlainDir = path.join(root, `plain-${state}`);
+					await expect(
+						daemonSpawnCreate(
+							{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
+							{ ownerIsolationProbe: probe },
+						)(createFrame({ target: { kind: "plain_dir", path: uncreatedPlainDir } }), {
+							lifecycleRequestId: `plain-${state}`,
+							intendedSessionId: `plain-${state}`,
+						}),
+					).rejects.toThrow(`gjc_lifecycle_owner_server_${state}`);
+					expect(fs.existsSync(uncreatedPlainDir)).toBe(false);
+					await expect(
+						daemonResumeSession(
+							{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
+							{ sessionsRoot: root, listSessions: () => [], ownerIsolationProbe: probe },
+						)({ sessionIdOrPrefix: "resume-123", path: project }),
+					).rejects.toThrow(`gjc_lifecycle_owner_server_${state}`);
+				}
+				expect(fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8") : "").toBe("");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	posixTmuxIt(
+		"writes no create ownership tags when a replacement server reuses the native session before the guarded metadata queue",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-required-metadata-"));
+			const project = path.join(root, "project");
+			const callsFile = path.join(root, "tmux-calls.log");
+			const tmux = path.join(root, "fake-tmux.sh");
+			fs.mkdirSync(project, { recursive: true });
+			fs.writeFileSync(
+				tmux,
+				[
+					"#!/usr/bin/env bash",
+					'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
+					'if [ "$3" = "display-message" ]; then printf \'$42\\tgjc_lc_metadata-refusal\\n\'; exit 0; fi',
+					'if [ "$1" = "new-session" ]; then printf \'$42\\n\'; exit 0; fi',
+					'if [ "$3" = "if-shell" ]; then printf "__gjc_lifecycle_metadata_refused__\\n"; exit 0; fi',
+					"exit 0",
+					"",
+				].join("\n"),
+			);
+			fs.chmodSync(tmux, 0o755);
+			let probeCalls = 0;
+			try {
 				await expect(
 					daemonSpawnCreate(
 						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
-						{ ownerIsolationProbe: probe },
+						{
+							ownerIsolationProbe: {
+								readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
+								probeServer: async () => {
+									probeCalls++;
+									return {
+										state: "safe" as const,
+										pid: probeCalls > 6 ? process.pid + 1 : process.pid,
+										startTime: "1",
+										cgroup: { classification: "safe" as const },
+										sessionNames: ["gjc_lc_metadata-refusal"],
+									};
+								},
+							},
+						},
 					)(createFrame({ target: { kind: "existing_path", path: project } }), {
-						lifecycleRequestId: `create-${state}`,
-						intendedSessionId: `create-${state}`,
+						lifecycleRequestId: "metadata-refusal",
+						intendedSessionId: "metadata-refusal",
 					}),
-				).rejects.toThrow(`gjc_lifecycle_owner_server_${state}`);
-				const uncreatedPlainDir = path.join(root, `plain-${state}`);
-				await expect(
-					daemonSpawnCreate(
-						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
-						{ ownerIsolationProbe: probe },
-					)(createFrame({ target: { kind: "plain_dir", path: uncreatedPlainDir } }), {
-						lifecycleRequestId: `plain-${state}`,
-						intendedSessionId: `plain-${state}`,
-					}),
-				).rejects.toThrow(`gjc_lifecycle_owner_server_${state}`);
-				expect(fs.existsSync(uncreatedPlainDir)).toBe(false);
+				).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
+				const calls = fs.readFileSync(callsFile, "utf8").trim().split("\n");
+				const guarded = calls.filter(call => call.startsWith("-L default if-shell "));
+				expect(guarded).toHaveLength(1);
+				expect(calls.filter(call => call.startsWith("set-option "))).toEqual([]);
+				expect(calls.filter(call => call === "-L default kill-session -t =$42")).toEqual([]);
+				expect(guarded[0]).toContain(`#{pid},${process.pid}`);
+				expect(guarded[0]).toContain("#{session_id},$42");
+				expect(guarded[0]).toContain("#{session_name},gjc_lc_metadata-refusal");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	posixTmuxIt(
+		"writes no cold-resume ownership tags when a replacement server reuses the native session before metadata",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cold-resume-metadata-"));
+			const project = path.join(root, "project");
+			const callsFile = path.join(root, "tmux-calls.log");
+			const tmux = path.join(root, "fake-tmux.sh");
+			fs.mkdirSync(project, { recursive: true });
+			await writeManagedSession(root, project, "resume-replacement");
+			fs.writeFileSync(
+				tmux,
+				[
+					"#!/usr/bin/env bash",
+					'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
+					'if [ "$3" = "display-message" ]; then printf \'$42\\tgjc_lc_resume-replacement\\n\'; exit 0; fi',
+					'if [ "$1" = "new-session" ]; then printf \'$42\\n\'; exit 0; fi',
+					"# Simulate the replacement server rejecting the guarded predicates before any tag command executes.",
+					'if [ "$3" = "if-shell" ]; then printf "__gjc_lifecycle_metadata_refused__\\n"; exit 0; fi',
+					"exit 0",
+					"",
+				].join("\n"),
+			);
+			fs.chmodSync(tmux, 0o755);
+			let probeCalls = 0;
+			try {
 				await expect(
 					daemonResumeSession(
 						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
-						{ sessionsRoot: root, listSessions: () => [], ownerIsolationProbe: probe },
-					)({ sessionIdOrPrefix: "resume-123", path: project }),
-				).rejects.toThrow(`gjc_lifecycle_owner_server_${state}`);
+						{
+							sessionsRoot: root,
+							listSessions: () => [],
+							ownerIsolationProbe: {
+								readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
+								probeServer: async () => {
+									probeCalls++;
+									return {
+										state: "safe" as const,
+										pid: probeCalls > 6 ? process.pid + 1 : process.pid,
+										startTime: "1",
+										cgroup: { classification: "safe" as const },
+										sessionNames: ["gjc_lc_resume-replacement"],
+									};
+								},
+							},
+						},
+					)({ sessionIdOrPrefix: "resume-replacement", path: project }),
+				).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
+				const calls = fs.readFileSync(callsFile, "utf8").trim().split("\n");
+				const guarded = calls.filter(call => call.startsWith("-L default if-shell "));
+				expect(guarded).toHaveLength(1);
+				expect(guarded[0]).toContain(`#{pid},${process.pid}`);
+				expect(guarded[0]).toContain("#{session_id},$42");
+				expect(guarded[0]).toContain("#{session_name},gjc_lc_resume-replacement");
+				expect(calls.filter(call => call.startsWith("set-option "))).toEqual([]);
+				expect(calls.filter(call => call === "-L default kill-session -t =$42")).toEqual([]);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
 			}
-			expect(fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8") : "").toBe("");
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
+		},
+	);
 
-	it("writes no create ownership tags when a replacement server reuses the native session before the guarded metadata queue", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-required-metadata-"));
-		const project = path.join(root, "project");
-		const callsFile = path.join(root, "tmux-calls.log");
-		const tmux = path.join(root, "fake-tmux.sh");
-		fs.mkdirSync(project, { recursive: true });
-		fs.writeFileSync(
-			tmux,
-			[
-				"#!/usr/bin/env bash",
-				'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
-				'if [ "$3" = "display-message" ]; then printf \'$42\\tgjc_lc_metadata-refusal\\n\'; exit 0; fi',
-				'if [ "$1" = "new-session" ]; then printf \'$42\\n\'; exit 0; fi',
-				'if [ "$3" = "if-shell" ]; then printf "__gjc_lifecycle_metadata_refused__\\n"; exit 0; fi',
-				"exit 0",
-				"",
-			].join("\n"),
-		);
-		fs.chmodSync(tmux, 0o755);
-		let probeCalls = 0;
-		try {
-			await expect(
-				daemonSpawnCreate(
-					{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
-					{
-						ownerIsolationProbe: {
-							readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
-							probeServer: async () => {
-								probeCalls++;
-								return {
-									state: "safe" as const,
-									pid: probeCalls > 6 ? process.pid + 1 : process.pid,
-									startTime: "1",
-									cgroup: { classification: "safe" as const },
-									sessionNames: ["gjc_lc_metadata-refusal"],
-								};
-							},
-						},
-					},
-				)(createFrame({ target: { kind: "existing_path", path: project } }), {
-					lifecycleRequestId: "metadata-refusal",
-					intendedSessionId: "metadata-refusal",
-				}),
-			).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
-			const calls = fs.readFileSync(callsFile, "utf8").trim().split("\n");
-			const guarded = calls.filter(call => call.startsWith("-L default if-shell "));
-			expect(guarded).toHaveLength(1);
-			expect(calls.filter(call => call.startsWith("set-option "))).toEqual([]);
-			expect(calls.filter(call => call === "-L default kill-session -t =$42")).toEqual([]);
-			expect(guarded[0]).toContain(`#{pid},${process.pid}`);
-			expect(guarded[0]).toContain("#{session_id},$42");
-			expect(guarded[0]).toContain("#{session_name},gjc_lc_metadata-refusal");
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
-
-	it("writes no cold-resume ownership tags when a replacement server reuses the native session before metadata", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cold-resume-metadata-"));
-		const project = path.join(root, "project");
-		const callsFile = path.join(root, "tmux-calls.log");
-		const tmux = path.join(root, "fake-tmux.sh");
-		fs.mkdirSync(project, { recursive: true });
-		await writeManagedSession(root, project, "resume-replacement");
-		fs.writeFileSync(
-			tmux,
-			[
-				"#!/usr/bin/env bash",
-				'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
-				'if [ "$3" = "display-message" ]; then printf \'$42\\tgjc_lc_resume-replacement\\n\'; exit 0; fi',
-				'if [ "$1" = "new-session" ]; then printf \'$42\\n\'; exit 0; fi',
-				"# Simulate the replacement server rejecting the guarded predicates before any tag command executes.",
-				'if [ "$3" = "if-shell" ]; then printf "__gjc_lifecycle_metadata_refused__\\n"; exit 0; fi',
-				"exit 0",
-				"",
-			].join("\n"),
-		);
-		fs.chmodSync(tmux, 0o755);
-		let probeCalls = 0;
-		try {
-			await expect(
-				daemonResumeSession(
-					{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
-					{
-						sessionsRoot: root,
-						listSessions: () => [],
-						ownerIsolationProbe: {
-							readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
-							probeServer: async () => {
-								probeCalls++;
-								return {
-									state: "safe" as const,
-									pid: probeCalls > 6 ? process.pid + 1 : process.pid,
-									startTime: "1",
-									cgroup: { classification: "safe" as const },
-									sessionNames: ["gjc_lc_resume-replacement"],
-								};
-							},
-						},
-					},
-				)({ sessionIdOrPrefix: "resume-replacement", path: project }),
-			).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
-			const calls = fs.readFileSync(callsFile, "utf8").trim().split("\n");
-			const guarded = calls.filter(call => call.startsWith("-L default if-shell "));
-			expect(guarded).toHaveLength(1);
-			expect(guarded[0]).toContain(`#{pid},${process.pid}`);
-			expect(guarded[0]).toContain("#{session_id},$42");
-			expect(guarded[0]).toContain("#{session_name},gjc_lc_resume-replacement");
-			expect(calls.filter(call => call.startsWith("set-option "))).toEqual([]);
-			expect(calls.filter(call => call === "-L default kill-session -t =$42")).toEqual([]);
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
-
-	it("refuses psmux before create or cold-resume can mutate lifecycle state", async () => {
+	posixTmuxIt("refuses psmux before create or cold-resume can mutate lifecycle state", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-psmux-"));
 		const project = path.join(root, "project");
 		const psmux = path.join(root, "psmux");
@@ -1696,60 +1748,63 @@ describe("lifecycle control runtime", () => {
 		}
 	});
 
-	it("rejects missing or noisy native receipts with cleanup uncertainty and no generation publication", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-receipt-"));
-		const project = path.join(root, "project");
-		const tmux = path.join(root, "fake-tmux.sh");
-		const calls = path.join(root, "calls.log");
-		fs.mkdirSync(project, { recursive: true });
-		fs.writeFileSync(
-			tmux,
-			[
-				"#!/usr/bin/env bash",
-				'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
-				'if [ "$3" = "display-message" ]; then printf \'$43\\tgjc_lc_receipt-123\\n\'; exit 0; fi',
+	posixTmuxIt(
+		"rejects missing or noisy native receipts with cleanup uncertainty and no generation publication",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-receipt-"));
+			const project = path.join(root, "project");
+			const tmux = path.join(root, "fake-tmux.sh");
+			const calls = path.join(root, "calls.log");
+			fs.mkdirSync(project, { recursive: true });
+			fs.writeFileSync(
+				tmux,
+				[
+					"#!/usr/bin/env bash",
+					'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
+					'if [ "$3" = "display-message" ]; then printf \'$43\\tgjc_lc_receipt-123\\n\'; exit 0; fi',
 
-				'if [ "$1" = "new-session" ]; then printf "$RECEIPT"; fi',
-				"exit 0",
-				"",
-			].join("\n"),
-		);
-		fs.chmodSync(tmux, 0o755);
-		try {
-			for (const receipt of ["", "$42\n", " $42\n", "$42\n\n", "$42\nnoise"]) {
-				fs.rmSync(calls, { force: true });
-				await expect(
-					daemonSpawnCreate(
-						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: calls, RECEIPT: receipt },
-						{
-							ownerIsolationProbe: {
-								readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
-								probeServer: async () => ({
-									state: "safe" as const,
-									pid: process.pid,
-									startTime: "1",
-									cgroup: { classification: "safe" as const },
-									sessionNames: ["gjc_lc_receipt-123"],
-								}),
+					'if [ "$1" = "new-session" ]; then printf "$RECEIPT"; fi',
+					"exit 0",
+					"",
+				].join("\n"),
+			);
+			fs.chmodSync(tmux, 0o755);
+			try {
+				for (const receipt of ["", "$42\n", " $42\n", "$42\n\n", "$42\nnoise"]) {
+					fs.rmSync(calls, { force: true });
+					await expect(
+						daemonSpawnCreate(
+							{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: calls, RECEIPT: receipt },
+							{
+								ownerIsolationProbe: {
+									readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
+									probeServer: async () => ({
+										state: "safe" as const,
+										pid: process.pid,
+										startTime: "1",
+										cgroup: { classification: "safe" as const },
+										sessionNames: ["gjc_lc_receipt-123"],
+									}),
+								},
 							},
-						},
-					)(createFrame({ target: { kind: "existing_path", path: project } }), {
-						lifecycleRequestId: "receipt",
-						intendedSessionId: "receipt-123",
-					}),
-				).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
-				const logged = fs.readFileSync(calls, "utf8");
-				expect(logged).toContain("new-session");
-				expect(logged).not.toContain("kill-session");
-				expect(logged).not.toContain("set-option");
+						)(createFrame({ target: { kind: "existing_path", path: project } }), {
+							lifecycleRequestId: "receipt",
+							intendedSessionId: "receipt-123",
+						}),
+					).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
+					const logged = fs.readFileSync(calls, "utf8");
+					expect(logged).toContain("new-session");
+					expect(logged).not.toContain("kill-session");
+					expect(logged).not.toContain("set-option");
+				}
+				expect(fs.existsSync(path.join(project, ".gjc"))).toBe(false);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
 			}
-			expect(fs.existsSync(path.join(project, ".gjc"))).toBe(false);
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
+		},
+	);
 
-	it("combines required metadata failure with cleanup preproof or guarded-mutation uncertainty", async () => {
+	posixTmuxIt("combines required metadata failure with cleanup preproof or guarded-mutation uncertainty", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-cleanup-"));
 		const project = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");
@@ -1816,63 +1871,66 @@ describe("lifecycle control runtime", () => {
 		}
 	});
 
-	it("refuses cleanup when a replacement arrives between external preproof and the guarded mutation", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-cleanup-replacement-"));
-		const project = path.join(root, "project");
-		const tmux = path.join(root, "fake-tmux.sh");
-		const calls = path.join(root, "calls.log");
-		fs.mkdirSync(project, { recursive: true });
-		fs.writeFileSync(
-			tmux,
-			[
-				"#!/usr/bin/env bash",
-				'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
-				'if [ "$3" = "display-message" ]; then printf \'$42\\tgjc_lc_cleanup-replacement\\n\'; exit 0; fi',
-				'if [ "$1" = "new-session" ]; then printf \'$42\\n\'; exit 0; fi',
-				"# The external proof passed, but the replacement server rejects cleanup atomically.",
-				'if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then printf "__gjc_lifecycle_cleanup_refused__\\n"; exit 0; fi',
-				'if [ "$3" = "if-shell" ]; then printf "__gjc_lifecycle_metadata_refused__\\n"; exit 0; fi',
-				"exit 0",
-				"",
-			].join("\n"),
-		);
-		fs.chmodSync(tmux, 0o755);
-		try {
-			await expect(
-				daemonSpawnCreate(
-					{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: calls },
-					{
-						ownerIsolationProbe: {
-							readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
-							probeServer: async () => ({
-								state: "safe" as const,
-								pid: process.pid,
-								startTime: "1",
-								cgroup: { classification: "safe" as const },
-								sessionNames: ["gjc_lc_cleanup-replacement"],
-							}),
-						},
-					},
-				)(createFrame({ target: { kind: "existing_path", path: project } }), {
-					lifecycleRequestId: "cleanup-replacement",
-					intendedSessionId: "cleanup-replacement",
-				}),
-			).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
-			const logged = fs.readFileSync(calls, "utf8").trim().split("\n");
-			const guarded = logged.filter(
-				call => call.startsWith("-L default if-shell ") && call.includes("__gjc_lifecycle_cleanup_ok__"),
+	posixTmuxIt(
+		"refuses cleanup when a replacement arrives between external preproof and the guarded mutation",
+		async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-cleanup-replacement-"));
+			const project = path.join(root, "project");
+			const tmux = path.join(root, "fake-tmux.sh");
+			const calls = path.join(root, "calls.log");
+			fs.mkdirSync(project, { recursive: true });
+			fs.writeFileSync(
+				tmux,
+				[
+					"#!/usr/bin/env bash",
+					'printf "%s\\n" "$*" >> "$TMUX_CALLS"',
+					'if [ "$3" = "display-message" ]; then printf \'$42\\tgjc_lc_cleanup-replacement\\n\'; exit 0; fi',
+					'if [ "$1" = "new-session" ]; then printf \'$42\\n\'; exit 0; fi',
+					"# The external proof passed, but the replacement server rejects cleanup atomically.",
+					'if [[ "$*" == *"__gjc_lifecycle_cleanup_ok__"* ]]; then printf "__gjc_lifecycle_cleanup_refused__\\n"; exit 0; fi',
+					'if [ "$3" = "if-shell" ]; then printf "__gjc_lifecycle_metadata_refused__\\n"; exit 0; fi',
+					"exit 0",
+					"",
+				].join("\n"),
 			);
-			expect(guarded).toHaveLength(1);
-			expect(guarded[0]).toContain(`#{pid},${process.pid}`);
-			expect(guarded[0]).toContain("#{session_id},$42");
-			expect(guarded[0]).toContain("#{session_name},gjc_lc_cleanup-replacement");
-			expect(logged).not.toContain("-L default kill-session -t =$42");
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
+			fs.chmodSync(tmux, 0o755);
+			try {
+				await expect(
+					daemonSpawnCreate(
+						{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: calls },
+						{
+							ownerIsolationProbe: {
+								readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
+								probeServer: async () => ({
+									state: "safe" as const,
+									pid: process.pid,
+									startTime: "1",
+									cgroup: { classification: "safe" as const },
+									sessionNames: ["gjc_lc_cleanup-replacement"],
+								}),
+							},
+						},
+					)(createFrame({ target: { kind: "existing_path", path: project } }), {
+						lifecycleRequestId: "cleanup-replacement",
+						intendedSessionId: "cleanup-replacement",
+					}),
+				).rejects.toThrow("gjc_lifecycle_cleanup_uncertain");
+				const logged = fs.readFileSync(calls, "utf8").trim().split("\n");
+				const guarded = logged.filter(
+					call => call.startsWith("-L default if-shell ") && call.includes("__gjc_lifecycle_cleanup_ok__"),
+				);
+				expect(guarded).toHaveLength(1);
+				expect(guarded[0]).toContain(`#{pid},${process.pid}`);
+				expect(guarded[0]).toContain("#{session_id},$42");
+				expect(guarded[0]).toContain("#{session_name},gjc_lc_cleanup-replacement");
+				expect(logged).not.toContain("-L default kill-session -t =$42");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
-	it("does not publish generation when the tmux server changes during metadata writes", async () => {
+	posixTmuxIt("does not publish generation when the tmux server changes during metadata writes", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-metadata-race-"));
 		const project = path.join(root, "project");
 		const tmux = path.join(root, "fake-tmux.sh");

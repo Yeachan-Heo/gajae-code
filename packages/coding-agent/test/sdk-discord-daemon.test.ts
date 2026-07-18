@@ -2362,7 +2362,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		await withDaemon(async (daemon, provider, agentDir) => {
 			const conversation = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
 			const effectId = `discord:app:guild:parent:${conversation.threadId}:prune-receipt`;
-			const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+			const journal = new ChatEffectJournal({ agentDir, transport: "discord", maxTerminalEffects: 2 });
 			await journal.enqueue({
 				id: effectId,
 				kind: "discord.inbound.command",
@@ -2403,19 +2403,17 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			});
 			const lease = await journal.claim(effectId, "owner", 60_000);
 			await journal.record(effectId, { owner: "owner", epoch: lease!.epoch }, "terminal");
-			for (let index = 0; index < 127; index++) {
-				const id = `terminal-prune-${index}`;
-				await journal.enqueue({
-					id,
-					kind: "post-message",
-					transport: "discord",
-					sessionId: "session",
-					endpointGeneration: 1,
-					payload: { threadId: conversation.threadId!, content: String(index) },
-				});
-				const terminalLease = await journal.claim(id, "owner", 60_000);
-				await journal.record(id, { owner: "owner", epoch: terminalLease!.epoch }, "terminal");
-			}
+			const id = "terminal-prune-0";
+			await journal.enqueue({
+				id,
+				kind: "post-message",
+				transport: "discord",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: { threadId: conversation.threadId!, content: "0" },
+			});
+			const terminalLease = await journal.claim(id, "owner", 60_000);
+			await journal.record(id, { owner: "owner", epoch: terminalLease!.epoch }, "terminal");
 			const overflowId = "terminal-prune-overflow";
 			await journal.enqueue({
 				id: overflowId,

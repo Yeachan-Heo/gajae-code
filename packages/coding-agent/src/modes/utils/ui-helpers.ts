@@ -292,7 +292,11 @@ export class UiHelpers {
 		const semanticId = getSessionMessageViewportAnchorId(message);
 		if (semanticId) return semanticId;
 		const entryId = getSessionMessageEntryId(message);
-		if (entryId) return `user:entry:${entryId}`;
+		if (entryId) {
+			const id = `user:entry:${entryId}`;
+			associateSessionMessageViewportAnchorId(message, id);
+			return id;
+		}
 		const base = `user:local:${message.timestamp}:${stableSemanticIdPart(JSON.stringify(message.content))}`;
 		const id = this.#viewportAnchorOccurrenceId(message, base);
 		associateSessionMessageViewportAnchorId(message, id);

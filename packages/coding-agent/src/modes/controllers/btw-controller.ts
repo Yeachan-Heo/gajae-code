@@ -59,6 +59,7 @@ export class BtwController {
 		try {
 			const promptText = prompt.render(btwUserPrompt, { question: request.question });
 			const { replyText } = await this.ctx.session.runEphemeralTurn({
+				purpose: "btw",
 				promptText,
 				onTextDelta: delta => {
 					if (this.#isActiveRequest(request)) {

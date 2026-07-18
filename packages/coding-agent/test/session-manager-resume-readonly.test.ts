@@ -212,6 +212,45 @@ describe("SessionManager read-only resume", () => {
 		expect(opened.kind).toBe("opened");
 		if (opened.kind === "error") throw new Error("Expected strict open success");
 		expect(opened.manager.getSessionId()).toBe("session-a");
+		expect(storage.writes).toBe(0);
+	});
+
+	it("reads v4 entry patches without changing the selected transcript", async () => {
+		const root = makeTempDir();
+		const sessionDir = path.join(root, "sessions");
+		const filePath = path.join(sessionDir, "v4.jsonl");
+		const records = [
+			{ type: "session", version: 4, id: "v4", timestamp: new Date(0).toISOString(), cwd: root },
+			{
+				type: "message",
+				id: "message",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				message: { role: "user", content: "before patch", timestamp: 0 },
+			},
+			{
+				type: "entry_patch",
+				entryId: "message",
+				patch: { message: { role: "user", content: "after patch", timestamp: 0 } },
+			},
+		];
+		fs.mkdirSync(sessionDir);
+		fs.writeFileSync(filePath, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		const before = fs.readFileSync(filePath);
+		const beforeMtimeNs = fs.statSync(filePath, { bigint: true }).mtimeNs;
+
+		expect(await SessionManager.listForResumePickerReadOnly(root, sessionDir)).toHaveLength(1);
+		const inspection = await SessionManager.inspectSessionTailReadOnly(filePath);
+		if (inspection.kind === "error") throw new Error("Expected v4 inspection");
+		const opened = await SessionManager.openExistingStrict(inspection.identity, sessionDir);
+		if (opened.kind === "error") throw new Error("Expected v4 strict open");
+		expect(opened.manager.getEntries()).toMatchObject([
+			{ type: "message", message: { role: "user", content: "after patch" } },
+		]);
+		await opened.manager.close();
+
+		expect(fs.readFileSync(filePath)).toEqual(before);
+		expect(fs.statSync(filePath, { bigint: true }).mtimeNs).toBe(beforeMtimeNs);
 	});
 
 	it("exposes descriptor-bound device and inode identity", async () => {
@@ -373,7 +412,7 @@ describe("SessionManager read-only resume", () => {
 		});
 	});
 
-	it("preserves inspected migration state until the first persistence rewrite", async () => {
+	it("preserves inspected migration state until the first v4 persistence rewrite", async () => {
 		const storage = new WriteTrackingStorage();
 		const filePath = "/sessions/legacy-v2.jsonl";
 		const header = {
@@ -408,7 +447,7 @@ describe("SessionManager read-only resume", () => {
 			.trim()
 			.split("\n")
 			.map(line => JSON.parse(line));
-		expect(rewritten[0]).toMatchObject({ type: "session", version: 3 });
+		expect(rewritten[0]).toMatchObject({ type: "session", version: 4 });
 		expect(rewritten).toHaveLength(3);
 		expect(rewritten.every(line => line.type === "session" || typeof line.id === "string")).toBe(true);
 	});

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@gajae-code/ai";
-import { isContextOverflow } from "@gajae-code/ai/utils/overflow";
+import { classifyContextOverflow, isContextOverflow } from "@gajae-code/ai/utils/overflow";
 
 function createErrorMessage(errorMessage: string): AssistantMessage {
 	return {
@@ -137,5 +137,64 @@ describe("isContextOverflow - empty response with low usage (proxy-level overflo
 			stopReason: "length",
 		};
 		expect(isContextOverflow(message)).toBe(false);
+	});
+});
+
+describe("classifyContextOverflow - authoritative transport facts", () => {
+	it("detects opaque OpenAI context_length_exceeded without relying on provider prose", () => {
+		const message = createErrorMessage("");
+		message.errorStatus = 400;
+		expect(
+			classifyContextOverflow(message, {
+				kind: "transport",
+				status: 400,
+				openaiErrorCode: "context_length_exceeded",
+			}),
+		).toBe(true);
+	});
+
+	it.each([
+		{ status: 400, openaiErrorCode: "invalid_request_error" },
+		{ status: 429, openaiErrorCode: "rate_limit_exceeded" },
+	])("does not upgrade typed non-overflow $status failures with hostile overflow prose", transportFailure => {
+		const message = createErrorMessage("context_length_exceeded: context window exceeded");
+		message.errorStatus = transportFailure.status;
+		expect(classifyContextOverflow(message, { kind: "transport", ...transportFailure })).toBe(false);
+	});
+
+	it("keeps authoritative rate-limit status ahead of a contradictory overflow provider code", () => {
+		const message = createErrorMessage("context window exceeded");
+		message.errorStatus = 429;
+		expect(
+			classifyContextOverflow(message, {
+				kind: "transport",
+				status: 429,
+				providerCode: "request_too_large",
+			}),
+		).toBe(false);
+	});
+
+	it.each([
+		{
+			label: "Anthropic request_too_large",
+			transportFailure: { status: 413, anthropicErrorType: "request_too_large" },
+		},
+		{ label: "provider request_too_large", transportFailure: { status: 413, providerCode: "request_too_large" } },
+	])("detects opaque typed $label", ({ transportFailure }) => {
+		const message = createErrorMessage("");
+		message.errorStatus = transportFailure.status;
+		expect(classifyContextOverflow(message, { kind: "transport", ...transportFailure })).toBe(true);
+	});
+
+	it.each([400, 413])("detects typed status-only %i no-body overflow", status => {
+		const message = createErrorMessage("");
+		message.errorStatus = status;
+		expect(classifyContextOverflow(message, { kind: "transport", status })).toBe(true);
+	});
+
+	it("allows unknown typed transport facts to use overflow prose", () => {
+		const message = createErrorMessage("context_length_exceeded: context window exceeded");
+		message.errorStatus = 418;
+		expect(classifyContextOverflow(message, { kind: "transport", status: 418 })).toBe(true);
 	});
 });

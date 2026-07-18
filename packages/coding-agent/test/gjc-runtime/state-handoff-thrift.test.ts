@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
+import { appendOrMergeDeepInterviewRound } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
@@ -156,9 +157,42 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			"{"skill":"deep-interview","resolution":"standard","threshold":0.05,"threshold_source":"flag:explicit","idea":"clarify this idea","state_path":"/tmp/SCRUBBED","handoff":"/skill:deep-interview"}
 			"
 			`);
+		const blockedDeepWrite = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "matrix", "--spec", "# Spec", "--deliberate", "--json"],
+			root,
+		);
+		expect(blockedDeepWrite.status).toBe(2);
+		expect(blockedDeepWrite.stderr).toContain("missing Round 0 intent contract");
+		await appendOrMergeDeepInterviewRound(
+			root,
+			modeStatePath(root, TEST_SESSION_ID, "deep-interview"),
+			{
+				round: 0,
+				questionId: "intent-confirmation",
+				questionText: "Confirm locked intent",
+				component: "review-topology",
+				dimension: "topology",
+				selectedOptions: ["Confirm"],
+				intent_contract: {
+					items: [{ id: "artifact:matrix", category: "artifact", statement: "Preserve the handoff matrix" }],
+					confirmation_options: ["Confirm"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
 
 		const deepWrite = await runNativeDeepInterviewCommand(
-			["--write", "--stage", "final", "--slug", "matrix", "--spec", "# Spec", "--deliberate", "--json"],
+			[
+				"--write",
+				"--stage",
+				"final",
+				"--slug",
+				"matrix",
+				"--spec",
+				"# Spec\n\nartifact:matrix",
+				"--deliberate",
+				"--json",
+			],
 			root,
 		);
 		expect(deepWrite.status).toBe(0);

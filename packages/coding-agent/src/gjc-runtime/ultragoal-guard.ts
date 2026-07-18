@@ -53,10 +53,18 @@ export interface UltragoalAskBlockDiagnostic {
 export interface CurrentGoalLike {
 	objective: string;
 	status?: string;
+	provenance?: { source: "ultragoal"; runId: string; goalId: string } | { source: "user" };
 }
 
-function objectiveMatches(currentObjective: string, plan: UltragoalPlan): boolean {
-	const normalized = currentObjective.trim();
+function objectiveMatches(currentGoal: CurrentGoalLike, plan: UltragoalPlan, sessionId?: string | null): boolean {
+	const provenance = currentGoal.provenance;
+	if (provenance?.source === "ultragoal") {
+		return (
+			provenance.runId === sessionId &&
+			(provenance.goalId === "aggregate" || plan.goals.some(goal => goal.id === provenance.goalId))
+		);
+	}
+	const normalized = currentGoal.objective.trim();
 	if (!normalized) return false;
 	if (normalized === plan.gjcObjective || normalized === DEFAULT_ULTRAGOAL_OBJECTIVE) return true;
 	if (plan.gjcObjectiveAliases?.some(alias => alias === normalized)) return true;
@@ -390,6 +398,8 @@ export async function readUltragoalVerificationState(input: {
 	currentGoal?: CurrentGoalLike | null;
 	sessionId?: string | null;
 }): Promise<UltragoalGuardDiagnostic> {
+	const currentGoal = input.currentGoal;
+
 	const currentObjective = input.currentGoal?.objective?.trim() ?? "";
 	if (!currentObjective) return { state: "inactive", message: "No current goal objective is active." };
 	let plan: UltragoalPlan | null;
@@ -415,7 +425,7 @@ export async function readUltragoalVerificationState(input: {
 		}
 		return { state: "inactive", message: "No Ultragoal plan exists." };
 	}
-	if (!objectiveMatches(currentObjective, plan))
+	if (!currentGoal || !objectiveMatches(currentGoal, plan, input.sessionId))
 		return { state: "unrelated_goal", message: "Current goal is not an active Ultragoal objective." };
 	if (plan.goals.some(goal => goal.status === "review_blocked")) {
 		return {
@@ -430,7 +440,21 @@ export async function readUltragoalVerificationState(input: {
 			message: "Ultragoal has blocked or failed goals; record blockers or rerun verification.",
 		};
 	}
-	const receiptTarget = findReceiptGoal(plan, ledger, currentObjective);
+	const provenance = currentGoal.provenance;
+
+	const receiptTarget =
+		provenance?.source === "ultragoal"
+			? provenance.goalId === "aggregate" || plan.gjcGoalMode === "aggregate"
+				? (() => {
+						const goal = findFinalAggregateReceiptGoal(plan, ledger);
+						return goal ? { goal, receiptKind: "final-aggregate" as const } : null;
+					})()
+				: (() => {
+						const goal = plan.goals.find(item => item.id === provenance.goalId);
+						return goal ? { goal, receiptKind: "per-goal" as const } : null;
+					})()
+			: findReceiptGoal(plan, ledger, currentObjective);
+
 	if (!receiptTarget) {
 		// When earlier required goals are already complete but later ones remain, name the
 		// specific blocking goals (a final-aggregate receipt cannot exist yet anyway). Only
@@ -933,7 +957,7 @@ export async function assertUltragoalDropAllowed(input: {
 	if (!input.currentGoal) return;
 	if (input.currentGoal.status !== "active") return;
 	// Unrelated active goal: not this aggregate run.
-	if (!objectiveMatches(input.currentGoal.objective, plan)) return;
+	if (!objectiveMatches(input.currentGoal, plan, sessionId)) return;
 	// All required stories complete: a legitimate reset, not a give-up.
 	if (getUltragoalRunCompletionState(plan).allComplete) return;
 	const nudge = await consumeUltragoalNudge({

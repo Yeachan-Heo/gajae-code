@@ -4,9 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
 import {
+	AtomicYamlConflictError,
 	type AtomicYamlPatch,
 	AtomicYamlReplaceError,
 	applyAtomicYamlPatches,
+	atomicYamlPathHash,
 } from "../../src/config/atomic-yaml-patch";
 
 const temporaryDirectories: string[] = [];
@@ -72,6 +74,60 @@ describe("atomic YAML patches", () => {
 
 		await applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: "newer" }]);
 		expect(await receipt.restore()).toEqual({ status: "conflict", paths: ["feature.enabled"] });
+	});
+
+	test("does not restore when its receipt is discarded after restore is queued", async () => {
+		const configPath = await configPathForTest();
+		await fs.writeFile(configPath, YAML.stringify({ feature: { enabled: false } }, null, 2));
+		const receipt = await applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: true }]);
+
+		const restore = receipt.restore();
+		receipt.discard();
+
+		expect(await restore).toEqual({ status: "discarded" });
+		expect(await readYaml(configPath)).toEqual({ feature: { enabled: true } });
+	});
+
+	test("reclaims a stale lock with malformed owner metadata", async () => {
+		const configPath = await configPathForTest();
+		const lockPath = `${configPath}.lock`;
+		await fs.mkdir(lockPath);
+		await fs.writeFile(path.join(lockPath, "info"), JSON.stringify({ pid: 0, timestamp: "invalid" }));
+		const staleAt = new Date(Date.now() - 20_000);
+		await fs.utimes(lockPath, staleAt, staleAt);
+
+		await applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: true }]);
+		expect(await readYaml(configPath)).toEqual({ feature: { enabled: true } });
+	});
+
+	test("rejects an expected-hash write after another writer wins", async () => {
+		const configPath = await configPathForTest();
+		const initial = { modelRoles: { default: "provider/original" } };
+		await fs.writeFile(configPath, YAML.stringify(initial, null, 2));
+		const expected = { path: "modelRoles.default", hash: atomicYamlPathHash(initial, "modelRoles.default") };
+		await applyAtomicYamlPatches(configPath, [
+			{ path: "modelRoles.default", op: "set", value: "provider/winner", expected },
+		]);
+		await expect(
+			applyAtomicYamlPatches(configPath, [
+				{ path: "modelRoles.default", op: "set", value: "provider/loser", expected },
+			]),
+		).rejects.toBeInstanceOf(AtomicYamlConflictError);
+		expect(await readYaml(configPath)).toEqual({ modelRoles: { default: "provider/winner" } });
+	});
+
+	test("does not conflate special numeric values with null in expected hashes", async () => {
+		const configPath = await configPathForTest();
+		await fs.writeFile(configPath, YAML.stringify({ feature: { value: null } }, null, 2));
+		const expected = {
+			path: "feature.value",
+			hash: atomicYamlPathHash({ feature: { value: Number.NaN } }, "feature.value"),
+		};
+
+		await expect(
+			applyAtomicYamlPatches(configPath, [{ path: "feature.value", op: "set", value: "winner", expected }]),
+		).rejects.toBeInstanceOf(AtomicYamlConflictError);
+		expect(await readYaml(configPath)).toEqual({ feature: { value: null } });
 	});
 
 	test("rejects ambiguous undefined set patches", () => {

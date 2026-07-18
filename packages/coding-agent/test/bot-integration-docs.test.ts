@@ -146,6 +146,28 @@ describe("external controller integration docs", () => {
 		expect(guide).not.toContain("discord.com/api/webhooks");
 	});
 
+	it("documents the observational coordinator and hermes check contract", async () => {
+		const guide = await readRepoFile("docs", "bot-integration.md");
+		const bridge = await readRepoFile("docs", "hermes-mcp-bridge.md");
+
+		for (const content of [guide, bridge]) {
+			expect(content).toContain("discovery-only");
+			expect(content).toContain("non-mutating");
+			expect(content).toContain("catalog");
+			expect(content).toContain("broker.discovery_status");
+			expect(content).toContain("operational_ready");
+			expect(content).toContain("bootstrap_supported");
+			expect(content).toContain("bootstrap_attempted");
+			expect(content).toContain("unsupported_state_version");
+			expect(content).toContain("discovery_access_denied");
+			expect(content).toContain("discovery_read_failed");
+			expect(content).toContain("does not connect, ensure/bootstrap, write, repair, or delete");
+			expect(content).toContain("human output remains the server/tools summary");
+		}
+		expect(bridge).toContain("identical coordinator check payload");
+		expect(guide).toContain("SDK check behavior is separate and unchanged");
+	});
+
 	it("keeps bot integration docs free of local-only operator details", async () => {
 		const docs = [
 			await readRepoFile("README.md"),

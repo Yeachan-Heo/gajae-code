@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import type { Args } from "../src/cli/args";
 import { parseArgs } from "../src/cli/args";
@@ -182,16 +182,31 @@ describe("bare resume startup gating", () => {
 		expect(pickerCalls).toBe(0);
 		expect(opens).toBe(0);
 
-		await runRootCommand(bareArgs(), [], {
-			suppressProcessExit: true,
-			isResumePickerTerminal: () => true,
-			listForResumePickerReadOnly: async () => [sessionInfo],
-			selectResumeSession: async () => ({ kind: "cancelled" }),
-			openExistingSessionStrict: async () => {
-				opens++;
-				return { kind: "error", reason: "missing" };
-			},
-		});
+		let settingsLoads = 0;
+		const stdoutWrite = spyOn(process.stdout, "write").mockImplementation(() => true);
+		const stderrWrite = spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			await runRootCommand(bareArgs(), [], {
+				suppressProcessExit: true,
+				isResumePickerTerminal: () => true,
+				listForResumePickerReadOnly: async () => [sessionInfo],
+				selectResumeSession: async () => ({ kind: "cancelled" }),
+				loadSettingsForScope: async () => {
+					settingsLoads++;
+					throw new Error("settings must not load after picker cancellation");
+				},
+				openExistingSessionStrict: async () => {
+					opens++;
+					return { kind: "error", reason: "missing" };
+				},
+			});
+		} finally {
+			stdoutWrite.mockRestore();
+			stderrWrite.mockRestore();
+		}
+		expect(settingsLoads).toBe(0);
+		expect(stdoutWrite).not.toHaveBeenCalled();
+		expect(stderrWrite).not.toHaveBeenCalled();
 		expect(opens).toBe(0);
 
 		await runRootCommand(bareArgs(), [], {

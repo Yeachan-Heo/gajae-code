@@ -16,6 +16,7 @@ import {
 	setActiveStateCacheInvalidator,
 	writeActiveEntry,
 } from "../gjc-runtime/state-writer";
+import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import { CANONICAL_GJC_WORKFLOW_SKILLS, type CanonicalGjcWorkflowSkill } from "./canonical-skills";
 import type { WorkflowStateReceipt } from "./workflow-state-contract";
 
@@ -445,29 +446,18 @@ async function readModeStatePhase(
 		const record = parsed as Record<string, unknown>;
 		const phase = safeString(record.current_phase).trim();
 		if (!phase) return undefined;
-		if (record.active === false && !RALPLAN_CANONICAL_PHASE_OVERRIDES.has(phase)) return undefined;
+		if (record.active === false && !getSkillManifest("ralplan").canonicalOverrides.includes(phase)) return undefined;
 		return phase;
 	} catch {
 		return undefined;
 	}
 }
 
-const RALPLAN_CANONICAL_PHASE_OVERRIDES = new Set([
-	"final",
-	"handoff",
-	"complete",
-	"completed",
-	"failed",
-	"cancelled",
-	"canceled",
-	"inactive",
-]);
-
 function withCanonicalRalplanPhase(entry: SkillActiveEntry, canonicalPhase: string | undefined): SkillActiveEntry {
 	if (
 		entry.skill !== "ralplan" ||
 		!canonicalPhase ||
-		!RALPLAN_CANONICAL_PHASE_OVERRIDES.has(canonicalPhase) ||
+		!getSkillManifest("ralplan").canonicalOverrides.includes(canonicalPhase) ||
 		entry.phase === canonicalPhase
 	) {
 		return entry;

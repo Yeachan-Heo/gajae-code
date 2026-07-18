@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentOptions } from "@gajae-code/agent-core";
+import * as compactionModule from "@gajae-code/agent-core/compaction";
 import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -92,6 +93,36 @@ function otherTransportFailureStream(model: Model, errorMessage: string): Assist
 	return stream;
 }
 
+function typedOverflowStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage & {
+			transportFailure: { kind: "transport"; status: number; openaiErrorCode: string };
+		} = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "",
+			errorStatus: 400,
+			timestamp: Date.now(),
+			transportFailure: { kind: "transport", status: 400, openaiErrorCode: "context_length_exceeded" },
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
 describe("AgentSession managed fallback attempt transaction", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -214,6 +245,98 @@ describe("AgentSession managed fallback attempt transaction", () => {
 
 		expect(calls).toHaveLength(2);
 		expect(events).toContainEqual(expect.objectContaining({ type: "model_fallback_switched", reason: "unknown" }));
+	});
+
+	it("routes typed managed context overflow to compaction without consuming fallback attempts", async () => {
+		const calls: string[] = [];
+		let attempts = 0;
+		const { primary, fallback } = createSession(model => {
+			calls.push(selector(model));
+			return attempts++ === 0
+				? typedOverflowStream(model)
+				: createMockModel({ responses: [{ content: ["Recovered after compaction"] }] }).stream(model, {
+						systemPrompt: [],
+						messages: [],
+						tools: [],
+					});
+		}, 1);
+		session!.settings.set("compaction.enabled", true);
+		session!.settings.set("compaction.autoContinue", false);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Route typed context overflow to compaction");
+		await session!.waitForIdle();
+
+		expect(calls).toContain(selector(primary));
+		expect(calls).not.toContain(selector(fallback));
+		expect(events).toContainEqual(expect.objectContaining({ type: "auto_compaction_start", reason: "overflow" }));
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+	});
+
+	it("terminalizes failed managed overflow maintenance and releases the next prompt", async () => {
+		let attempts = 0;
+		const { agent, primary } = createSession((model, context, options) => {
+			attempts += 1;
+			return attempts === 1
+				? typedOverflowStream(model)
+				: createMockModel({ responses: [{ content: ["Independent next prompt"] }] }).stream(
+						model,
+						context,
+						options,
+					);
+		}, 1);
+		session!.settings.set("compaction.enabled", true);
+		session!.settings.set("compaction.autoContinue", false);
+		for (let index = 0; index < 4; index++) {
+			const user = { role: "user" as const, content: `seed ${index}`, timestamp: Date.now() + index * 2 };
+			const assistant: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: `seed response ${index}` }],
+				api: primary.api,
+				provider: primary.provider,
+				model: primary.id,
+				usage: {
+					input: 30_000,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 30_001,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now() + index * 2 + 1,
+			};
+			agent.appendMessage(user);
+			session!.sessionManager.appendMessage(user);
+			agent.appendMessage(assistant);
+			session!.sessionManager.appendMessage(assistant);
+		}
+		const prepareSpy = vi.spyOn(compactionModule, "prepareCompaction").mockImplementation(() => {
+			throw new Error("request_too_large");
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Overflow whose maintenance fails", { skipCompactionCheck: true });
+		await session!.waitForIdle();
+
+		expect(prepareSpy).toHaveBeenCalled();
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(agent.activeRunId).toBeUndefined();
+		expect(agent.currentManagedLogicalRunId).toBeUndefined();
+		expect(attempts).toBe(1);
+		prepareSpy.mockRestore();
+
+		await session!.prompt("Independent next prompt", { skipCompactionCheck: true });
+		await session!.waitForIdle();
+
+		expect(attempts).toBe(2);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "Independent next prompt" }],
+		});
 	});
 
 	it("finalizes exhausted when every fallback tail entry is unavailable during resolution", async () => {

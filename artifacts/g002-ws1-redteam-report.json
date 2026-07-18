@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "story": "G002",
+  "suites": [
+    {
+      "command": "bun --cwd packages/coding-agent test test/g002-ws1-redteam.test.ts",
+      "status": "failed",
+      "passed": 6,
+      "failed": 1,
+      "assertions": 21,
+      "failure": "TranscriptViewerOverlay emits lines wider than a 20-column render width."
+    },
+    {
+      "command": "bun --cwd packages/coding-agent test test/transcript-viewer-overlay.test.ts test/turn-jump.test.ts test/transcript-item-registry.test.ts",
+      "status": "passed",
+      "passed": 15,
+      "failed": 0,
+      "assertions": 42
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "overlay-empty-rapid-close",
+      "verdict": "pass",
+      "evidence": "20 j/k/escape cycles on an empty viewer retained undefined selection, rendered the empty state, and invoked close 20 times."
+    },
+    {
+      "id": "overlay-huge-entry-selection-boundaries",
+      "verdict": "pass",
+      "evidence": "Expanded and paged a 10,000-line entry; repeated j/k clamped at first/last entries and fullscreen rendered content."
+    },
+    {
+      "id": "overlay-copy-raw-fullscreen",
+      "verdict": "pass",
+      "evidence": "copyable:false prevented y/Y clipboard calls; r on plain text and Enter from collapsed state did not throw and entered fullscreen."
+    },
+    {
+      "id": "overlay-narrow-width",
+      "verdict": "fail",
+      "evidence": "render(20) with an unbroken entry produced at least one ANSI-stripped line wider than 20 columns."
+    },
+    {
+      "id": "observer-adapter-parity",
+      "verdict": "pass",
+      "evidence": "Synthetic JSONL observed-session fixture exercised navigation, expansion, session cycling, and escape close through SessionObserverOverlayComponent."
+    },
+    {
+      "id": "turn-jump-boundaries-mutation-reveal-failure",
+      "verdict": "pass",
+      "evidence": "Interleaved jumps did not wrap at the end; eviction reset selection to current anchors; a failed reveal retried the same anchor without position advancement."
+    },
+    {
+      "id": "browse-action-empty-session",
+      "verdict": "pass",
+      "evidence": "app.transcript.browse was unavailable for an empty message list and executed safely for a nonempty list."
+    },
+    {
+      "id": "slash-command-double-overlay",
+      "verdict": "fail",
+      "evidence": "Static call-path review: built-in /transcript directly invokes showTranscriptViewer, InteractiveMode always delegates to SelectorController, and SelectorController always calls ui.showOverlay with no open-overlay guard. Repeating /transcript can stack transcript overlays."
+    }
+  ],
+  "blockers": [
+    {
+      "id": "G002-WS1-001",
+      "severity": "high",
+      "title": "TranscriptViewerOverlay violates narrow-width rendering contract",
+      "repro": "Run bun --cwd packages/coding-agent test test/g002-ws1-redteam.test.ts. The 'renders content within a 20-column viewport' assertion fails. transcript-viewer-overlay.ts renders borders at the requested width but preview content is only sliced using resolveTerminalColumns(), while expanded Markdown has a minimum 40-column render width."
+    },
+    {
+      "id": "G002-WS1-002",
+      "severity": "medium",
+      "title": "Repeated /transcript or browse action can open stacked overlays",
+      "repro": "With a nonempty interactive session, invoke /transcript twice before closing the first viewer. builtin-registry.ts handleTui calls showTranscriptViewer each time; interactive-mode.ts rebuilds/delegates unconditionally; selector-controller.ts showTranscriptViewer unconditionally calls ui.showOverlay and replaces focus without retaining or checking an existing transcript viewer handle."
+    }
+  ]
+}

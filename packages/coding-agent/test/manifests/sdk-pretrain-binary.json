@@ -13,8 +13,13 @@
     "packages/coding-agent/src/notifications/telegram-daemon-cli.ts"
   ],
   "artifactPath": "packages/coding-agent/dist/gjc-rollback",
-  "artifactSha256Scope": "SHA-256 of the freshly compiled, host-signed executable bytes in the isolated pinned worktree, verified immediately before each invocation; no executable artifact is committed.",
-  "supportedPlatforms": ["darwin", "linux"],
+  "artifactPathByPlatform": {
+    "darwin": "packages/coding-agent/dist/gjc-rollback",
+    "linux": "packages/coding-agent/dist/gjc-rollback",
+    "win32": "packages/coding-agent/dist/gjc-rollback.exe"
+  },
+  "artifactSha256Scope": "SHA-256 of the freshly compiled, host-signed executable bytes named by artifactPathByPlatform for the host platform in the isolated pinned worktree, verified immediately before each invocation; no executable artifact is committed.",
+  "supportedPlatforms": ["darwin", "linux", "win32"],
   "toolchain": {
     "runtime": "bun",
     "version": "1.3.14",
@@ -32,5 +37,5 @@
 
   "productCommand": ["{executable}", "notify", "daemon-internal", "--owner-id", "{ownerId}", "--agent-dir", "{agentDir}"],
   "shutdownCommand": ["{executable}", "daemon", "stop", "telegram", "--json", "--graceful-timeout-ms", "5000"],
-  "notes": "The rollback proof creates an isolated detached worktree at baseRef, installs that tree's locked dependencies offline, compiles the old CLI plus Telegram daemon entrypoint, applies host-appropriate signing (macOS ad-hoc codesign; no signing needed on Linux/Windows compiled binaries), hashes its executable bytes, and invokes only that executable. The preload deterministically intercepts only Telegram API fetches."
+  "notes": "The rollback proof creates an isolated detached worktree at baseRef, installs that tree's locked dependencies offline, compiles the old CLI plus Telegram daemon entrypoint, resolves the host executable path (Bun appends .exe on Windows), applies host-appropriate signing (macOS ad-hoc codesign; no signing needed on Linux/Windows compiled binaries), hashes its exact executable bytes, and invokes only that executable. The preload deterministically intercepts only Telegram API fetches."
 }

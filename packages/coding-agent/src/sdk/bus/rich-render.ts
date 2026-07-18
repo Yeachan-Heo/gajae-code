@@ -2,28 +2,20 @@
  * Rich-message promotion for stable non-editable Telegram text sends.
  *
  * When enabled, the daemon promotes eligible finalized `sendMessage` payloads
- * carrying raw markdown to the Bot API `sendRichMessage` method. On any miss or
- * failure the daemon keeps the unchanged HTML `sendMessage` path, so the
- * off-state request bodies are byte-identical.
+ * carrying raw markdown to Bot API `sendRichMessage`. Only an explicit
+ * `{ ok: false }` response selects the unchanged HTML path; ambiguous transport
+ * outcomes remain single-attempt and never fall back.
  */
 
+import { parseRichEligibility } from "./rich-document";
 import type { BotApi } from "./telegram-daemon";
 import type { ThreadedSend } from "./threaded-render";
 
 /**
- * Telegram's hard per-message character ceiling (4096). Surfaced here purely as
- * documentation and a marker for a future native rich-message splitter — it is
- * intentionally NON-BEHAVIORAL and MUST stay that way: nothing in the rich path
- * branches on this value.
- *
- * Overflow is already safe without it. The production final-answer text is capped
- * at 3500 chars upstream (`summaryFromMessage(..., 3500)`), so a promoted
- * `sendRichMessage` never approaches this ceiling; and if the Bot API ever rejects
- * an oversized rich payload it returns `{ ok: false }`, which
- * `deliverRichWithFallback` (below) turns into the chunked HTML `splitTelegramHtml`
- * fallback (each chunk ≤ TELEGRAM_MESSAGE_LIMIT). This constant only marks where a
- * future rich splitter would read its ceiling; wiring it into a branch would change
- * byte-for-byte behavior and is out of scope.
+ * Telegram's hard per-message character ceiling (4096). Final-answer promotion
+ * uses this value to keep oversized Markdown on the existing chunked HTML path.
+ * `/btw` eligibility has its own 32,768-scalar route guard; only a definite
+ * rich rejection may select the correlated HTML path.
  */
 export const RICH_MESSAGE_LIMIT = 4096;
 
@@ -31,8 +23,16 @@ export const RICH_MESSAGE_LIMIT = 4096;
 export function buildRichMessage(
 	raw: string,
 	extras: { reply_markup?: unknown } = {},
-): { rich_message: { markdown: string }; reply_markup?: unknown } {
-	return { rich_message: { markdown: raw }, ...extras };
+): { rich_message: { markdown: string; skip_entity_detection: true }; reply_markup?: unknown } {
+	return { rich_message: { markdown: raw, skip_entity_detection: true }, ...extras };
+}
+/** Telegram message identifiers are strictly positive safe integers. */
+function validMessageId(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+/** Whether `/btw` Markdown may use Bot API 10.1 rich delivery. */
+export function isBtwRichEligible(markdown: string): boolean {
+	return parseRichEligibility(markdown).kind === "eligible";
 }
 
 /**
@@ -56,88 +56,80 @@ export function shouldPromoteRich(input: { enabled?: boolean; send: ThreadedSend
 }
 
 /**
- * Deliver the promoted rich message, falling back to `fallbackDeliver` (the
- * unchanged HTML `sendMessage` loop) on any failure. A failure is either a
- * thrown transport error or a `{ ok: false }` JSON response (the transport
- * returns `res.json()` for JSON methods, so `ok:false` does not throw). On
- * failure exactly one diagnostic is logged before the fallback runs; on success
- * the fallback never runs.
- *
- * Returns the sent message's `message_id` on success (when the response carries
- * one), otherwise `undefined` — including every failure/fallback path and a
- * success whose response omits `result.message_id`. Callers that ignore the
- * return value are unaffected.
+ * Deliver the promoted rich message, falling back to `fallbackDeliver` only
+ * after an explicit `{ ok: false }` response. Transport errors and malformed or
+ * ambiguous responses are logged but never retried or sent again through HTML.
  */
 export async function deliverRichWithFallback(
 	botApi: BotApi,
 	base: { chat_id: string | number; message_thread_id?: number },
 	send: ThreadedSend,
+	signal: AbortSignal,
 	fallbackDeliver: () => Promise<void>,
 	log?: { warn(msg: string): void },
 ): Promise<number | undefined> {
-	let failure: string | undefined;
-	let messageId: number | undefined;
 	try {
-		const res = await botApi.call("sendRichMessage", { ...base, ...buildRichMessage(send.richMarkdown!) });
+		const res = await botApi.call(
+			"sendRichMessage",
+			{ ...base, ...buildRichMessage(send.richMarkdown!) },
+			{ noRetry: true, signal },
+		);
 		if (res !== null && typeof res === "object" && (res as { ok?: unknown }).ok === false) {
 			const description = (res as { description?: unknown }).description;
-			failure = typeof description === "string" && description.length > 0 ? description : "ok:false";
-		} else {
-			const candidate = (res as { result?: { message_id?: unknown } } | null)?.result?.message_id;
-			if (typeof candidate === "number") messageId = candidate;
+			const failure = typeof description === "string" && description.length > 0 ? description : "ok:false";
+			log?.warn(`notifications: sendRichMessage rejected (${failure}); falling back to HTML`);
+			await fallbackDeliver();
+			return undefined;
 		}
+		const candidate = (res as { result?: { message_id?: unknown } } | null)?.result?.message_id;
+		if (validMessageId(candidate)) return candidate;
+		log?.warn("notifications: sendRichMessage outcome ambiguous; not falling back to HTML");
 	} catch (err) {
-		failure = err instanceof Error ? err.message : String(err);
+		const failure = err instanceof Error ? err.message : String(err);
+		log?.warn(`notifications: sendRichMessage failed (${failure}); not falling back to HTML`);
 	}
-	if (failure === undefined) return messageId;
-	log?.warn(`notifications: sendRichMessage failed (${failure}); falling back to HTML`);
-	await fallbackDeliver();
 	return undefined;
 }
 
 /**
  * Deliver an action-needed (ask/idle) message via `sendRichMessage`, falling
- * back to the unchanged HTML chunk loop on any failure. Mirrors
- * {@link deliverRichWithFallback} but takes an explicit markdown body plus an
- * optional top-level `reply_markup` (probe-confirmed: `sendRichMessage` accepts
- * `reply_markup` alongside `rich_message`), and surfaces a structured outcome so
- * the daemon can route inbound replies to the resulting message id.
- *
- * On rich success: returns `{ messageId, usedRich: true, usedFallback: false }`
- * where `messageId` is `res.result.message_id` when present. On a `{ ok:false }`
- * response or a thrown transport error: warns exactly once, runs `htmlFallback`,
- * and returns `{ messageId, usedRich: false, usedFallback: true }` where
- * `messageId` is the fallback's return value (the last HTML chunk's id).
+ * back to the unchanged HTML chunk loop only after an explicit `{ ok:false }`
+ * response. Other outcomes are ambiguous, are logged, and preserve the single
+ * physical rich delivery.
  */
 export async function deliverRichActionWithFallback(
 	botApi: BotApi,
 	base: { chat_id: string | number; message_thread_id?: number },
-	opts: { markdown: string; replyMarkup?: unknown; requireMessageId?: boolean },
+	opts: { markdown: string; replyMarkup?: unknown },
+	signal: AbortSignal,
 	htmlFallback: () => Promise<number | undefined>,
 	log?: { warn(msg: string): void },
 ): Promise<{ messageId?: number; usedRich: boolean; usedFallback: boolean }> {
-	let failure: string | undefined;
-	let messageId: number | undefined;
 	try {
-		const res = await botApi.call("sendRichMessage", {
-			...base,
-			...buildRichMessage(opts.markdown, opts.replyMarkup === undefined ? {} : { reply_markup: opts.replyMarkup }),
-		});
+		const res = await botApi.call(
+			"sendRichMessage",
+			{
+				...base,
+				...buildRichMessage(
+					opts.markdown,
+					opts.replyMarkup === undefined ? {} : { reply_markup: opts.replyMarkup },
+				),
+			},
+			{ noRetry: true, signal },
+		);
 		if (res !== null && typeof res === "object" && (res as { ok?: unknown }).ok === false) {
 			const description = (res as { description?: unknown }).description;
-			failure = typeof description === "string" && description.length > 0 ? description : "ok:false";
-		} else {
-			const candidate = (res as { result?: { message_id?: unknown } } | null)?.result?.message_id;
-			if (typeof candidate === "number") messageId = candidate;
-			// Ask messages MUST be reply-routable: if a rich success carries no numeric
-			// message_id, fall back to HTML so a routable id is guaranteed.
-			else if (opts.requireMessageId) failure = "rich response missing message_id";
+			const failure = typeof description === "string" && description.length > 0 ? description : "ok:false";
+			log?.warn(`notifications: sendRichMessage(action) rejected (${failure}); falling back to HTML`);
+			const fallbackId = await htmlFallback();
+			return { messageId: fallbackId, usedRich: false, usedFallback: true };
 		}
+		const candidate = (res as { result?: { message_id?: unknown } } | null)?.result?.message_id;
+		if (validMessageId(candidate)) return { messageId: candidate, usedRich: true, usedFallback: false };
+		log?.warn("notifications: sendRichMessage(action) outcome ambiguous; not falling back to HTML");
 	} catch (err) {
-		failure = err instanceof Error ? err.message : String(err);
+		const failure = err instanceof Error ? err.message : String(err);
+		log?.warn(`notifications: sendRichMessage(action) failed (${failure}); not falling back to HTML`);
 	}
-	if (failure === undefined) return { messageId, usedRich: true, usedFallback: false };
-	log?.warn(`notifications: sendRichMessage(action) failed (${failure}); falling back to HTML`);
-	const fallbackId = await htmlFallback();
-	return { messageId: fallbackId, usedRich: false, usedFallback: true };
+	return { messageId: undefined, usedRich: true, usedFallback: false };
 }

@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "story": "G001",
+  "suites": [
+    {
+      "command": "bun --cwd packages/coding-agent test test/g001-ws0-redteam.test.ts",
+      "pass": 5,
+      "fail": 0
+    },
+    {
+      "command": "bun --cwd packages/tui test test/g001-ws0-redteam.test.ts",
+      "pass": 3,
+      "fail": 0
+    },
+    {
+      "command": "bun --cwd packages/coding-agent test test/transcript-item-registry.test.ts test/action-registry.test.ts test/keybinding-domains.test.ts test/keybindings-audit.test.ts",
+      "pass": 13,
+      "fail": 0
+    },
+    {
+      "command": "bun --cwd packages/tui test test/viewport-anchor-reveal.test.ts",
+      "pass": 5,
+      "fail": 0
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "transcript-generation-isolation-and-invalid-rebind",
+      "scenario": "Same stream ordinal in distinct generations; endStream for unknown and retired provisional ids.",
+      "expected": "Generations remain isolated; invalid rebinds register nothing; retired payload is unresolvable.",
+      "verdict": "passed"
+    },
+    {
+      "id": "transcript-alias-eviction-rebuild-session-clear",
+      "scenario": "Resolve a stream alias after normal completion, then evict; rebuild and switch sessions.",
+      "expected": "Alias resolves only while its canonical item exists and is cleared by eviction, rebuild, and session change.",
+      "verdict": "passed"
+    },
+    {
+      "id": "transcript-coalesce-conflicting-membership",
+      "scenario": "Replace one read-group membership while another group overlaps a tool ID.",
+      "expected": "Each group retains only its current source and tool membership; no cross-group leakage.",
+      "verdict": "passed"
+    },
+    {
+      "id": "viewport-zero-empty-frame",
+      "scenario": "Reveal with zero terminal dimensions and with no rendered anchor frame.",
+      "expected": "Returns false without throwing.",
+      "verdict": "passed"
+    },
+    {
+      "id": "viewport-extremes-idempotency-and-eviction",
+      "scenario": "Reveal short content at top/center/bottom, repeat a reveal, then remove an anchored row.",
+      "expected": "Short content remains visible, repeated reveal is stable, removed anchor returns false without viewport mutation.",
+      "verdict": "passed"
+    },
+    {
+      "id": "viewport-no-reflow",
+      "scenario": "Reveal an off-screen anchor in width-sensitive text.",
+      "expected": "Rendered anchor lines remain byte-identical before and after reveal.",
+      "verdict": "passed"
+    },
+    {
+      "id": "action-duplicate-and-concurrent-execution",
+      "scenario": "Register identical action twice and invoke a pending async action concurrently.",
+      "expected": "Duplicate registration throws; second execution returns false and cannot interleave.",
+      "verdict": "passed"
+    },
+    {
+      "id": "action-availability-and-rejection-containment",
+      "scenario": "Availability predicate throws, unavailable action is invoked, and execute rejects.",
+      "expected": "Errors are reported through showError, unavailable execute is a no-op, and no rejection escapes execute().",
+      "verdict": "passed"
+    }
+  ],
+  "blockers": []
+}

@@ -6,12 +6,21 @@ import { YAML } from "bun";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
-import { normalizeDeepInterviewEnvelope } from "./deep-interview-state";
+import {
+	assertDeepInterviewIntentReview,
+	type DeepInterviewIntentCategory,
+	type DeepInterviewIntentItem,
+	type DeepInterviewIntentManifest,
+	type DeepInterviewIntentReview,
+	normalizeDeepInterviewEnvelope,
+	reviewDeepInterviewIntent,
+} from "./deep-interview-state";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { modeStatePath, sessionSpecsDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { runNativeStateCommand } from "./state-runtime";
 import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
+import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 
 export * from "./deep-interview-recorder";
 
@@ -30,8 +39,6 @@ export interface DeepInterviewCommandResult {
 	stdout?: string;
 	stderr?: string;
 }
-
-const PATH_COMPONENT_RE = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 
 const DEFAULT_AMBIGUITY_THRESHOLD = 0.05;
 
@@ -105,12 +112,9 @@ interface DeepInterviewTraceSummary {
 
 type DeepInterviewResolution = keyof typeof RESOLUTION_THRESHOLDS;
 
-class DeepInterviewCommandError extends Error {
-	constructor(
-		public readonly exitStatus: number,
-		message: string,
-	) {
-		super(message);
+class DeepInterviewCommandError extends CommandError {
+	constructor(exitStatus: number, message: string) {
+		super(exitStatus, message);
 		this.name = "DeepInterviewCommandError";
 	}
 }
@@ -124,22 +128,6 @@ const VALUE_FLAGS = new Set([
 	"--spec",
 	"--handoff",
 ]);
-
-function flagValue(args: readonly string[], flag: string): string | undefined {
-	const index = args.indexOf(flag);
-	if (index < 0) return undefined;
-	return args[index + 1];
-}
-
-function hasFlag(args: readonly string[], flag: string): boolean {
-	return args.includes(flag);
-}
-
-function assertSafePathComponent(value: string, label: string): void {
-	if (!PATH_COMPONENT_RE.test(value) || value.includes("..")) {
-		throw new DeepInterviewCommandError(2, `invalid path component for --${label}: ${value}`);
-	}
-}
 
 function defaultSpecSlug(now: Date = new Date()): string {
 	const yyyy = now.getUTCFullYear().toString().padStart(4, "0");
@@ -585,6 +573,61 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 	};
 }
 
+function intentIdsInSpec(content: string): string[] {
+	const ids = content.match(/(?:artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}/g) ?? [];
+	return [...new Set(ids)].sort();
+}
+
+function resolveLockedIntentReview(existing: unknown, content: string): DeepInterviewIntentReview | undefined {
+	const envelope = normalizeDeepInterviewEnvelope(existing);
+	const state = envelope.state;
+	if (!state) return undefined;
+	if (state.intent_contract === undefined) {
+		if (state.intent_contract_required === true)
+			throw new DeepInterviewCommandError(
+				2,
+				"deep-interview locked intent blocks spec persistence: missing Round 0 intent contract",
+			);
+		return undefined;
+	}
+	const locked = state.intent_contract as DeepInterviewIntentManifest;
+	const observedIds = intentIdsInSpec(content);
+	const rounds = Array.isArray(state.rounds)
+		? state.rounds
+				.filter(
+					(round): round is Record<string, unknown> =>
+						Boolean(round) && typeof round === "object" && !Array.isArray(round),
+				)
+				.map(round => ({ round: round.round, answer_hash: round.answer_hash }))
+		: [];
+	try {
+		if (state.intent_review === undefined) {
+			if (locked.items.some(item => !observedIds.includes(item.id))) throw new Error("missing intent review");
+			const lockedById = new Map(locked.items.map(item => [item.id, item]));
+			const observedItems: DeepInterviewIntentItem[] = observedIds.map(id => {
+				const existingItem = lockedById.get(id);
+				if (existingItem) return existingItem;
+				return {
+					id,
+					category: id.slice(0, id.indexOf(":")) as DeepInterviewIntentCategory,
+					statement: id,
+				};
+			});
+			return reviewDeepInterviewIntent(locked, observedItems, {
+				status: "not_required",
+				supporting_substitutions: [],
+			});
+		}
+		assertDeepInterviewIntentReview(state.intent_review, locked, observedIds, rounds);
+		return state.intent_review as DeepInterviewIntentReview;
+	} catch (error) {
+		throw new DeepInterviewCommandError(
+			2,
+			`deep-interview locked intent blocks spec persistence: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
 export async function persistDeepInterviewSpec(
 	cwd: string,
 	resolved: ResolvedDeepInterviewSpecWriteArgs,
@@ -599,8 +642,9 @@ export async function persistDeepInterviewSpec(
 	}
 	const existing = existingRead.kind === "valid" ? existingRead.value : {};
 
-	const specPath = path.join(sessionSpecsDir(cwd, resolved.sessionId), `deep-interview-${resolved.slug}.md`);
 	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
+	const intentReview = resolveLockedIntentReview(existing, content);
+	const specPath = path.join(sessionSpecsDir(cwd, resolved.sessionId), `deep-interview-${resolved.slug}.md`);
 	await writeArtifact(specPath, content, {
 		cwd,
 		audit: {
@@ -642,6 +686,10 @@ export async function persistDeepInterviewSpec(
 		spec_persisted_at: createdAt,
 		updated_at: createdAt,
 	}) as Record<string, unknown>;
+	if (intentReview) {
+		const state = payload.state as Record<string, unknown>;
+		state.intent_review = intentReview;
+	}
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
 	await writeWorkflowEnvelopeAtomic(statePath, payload, {
 		cwd,
@@ -694,6 +742,7 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		threshold_source: resolved.thresholdSource,
 		state: {
 			initial_idea: resolved.idea,
+			intent_contract_required: true,
 			rounds: [],
 			established_facts: [],
 			current_ambiguity: 1.0,
@@ -867,7 +916,7 @@ export async function runNativeDeepInterviewCommand(
 				].join("\n");
 		return { status: 0, stdout };
 	} catch (error) {
-		if (error instanceof DeepInterviewCommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
+		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}
 }

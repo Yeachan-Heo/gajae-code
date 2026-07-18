@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { $env, $flag } from "@gajae-code/utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
+import { isUnderTerminalMultiplexer } from "./terminal-capabilities";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
@@ -73,6 +74,9 @@ export interface Terminal {
 
 	// Stop the terminal and restore state
 	stop(): void;
+	// Enable or disable opt-in SGR mouse reporting. Implementations that do not
+	// own a real terminal may ignore this.
+	setMouseEnabled?(enabled: boolean): void;
 
 	/**
 	 * Drain stdin before exiting to prevent Kitty key release events from
@@ -220,6 +224,8 @@ export class ProcessTerminal implements Terminal {
 	#osc11PollTimer?: Timer;
 	#mode2031DebounceTimer?: Timer;
 	#progressTimer?: ReturnType<typeof setInterval>;
+	#mouseEnabled = false;
+	#started = false;
 
 	get isProcessTerminal(): boolean {
 		return true;
@@ -237,9 +243,15 @@ export class ProcessTerminal implements Terminal {
 		this.#appearanceCallbacks.push(callback);
 	}
 
+	setMouseEnabled(enabled: boolean): void {
+		this.#mouseEnabled = enabled && !isUnderTerminalMultiplexer(Bun.env);
+		if (this.#started) this.#safeWrite(this.#mouseEnabled ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
+	}
+
 	start(onInput: (data: string) => void, onResize: () => void): void {
 		this.#inputHandler = onInput;
 		this.#resizeHandler = onResize;
+		this.#started = true;
 
 		// Register for emergency cleanup
 		activeTerminal = this;
@@ -259,6 +271,8 @@ export class ProcessTerminal implements Terminal {
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
+		// SGR mouse reporting is opt-in and never enabled inside tmux or screen.
+		if (this.#mouseEnabled) this.#safeWrite("\x1b[?1000h\x1b[?1006h");
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.#resizeHandler);
@@ -690,6 +704,8 @@ export class ProcessTerminal implements Terminal {
 		}
 
 		// Disable bracketed paste mode
+		this.#started = false;
+		this.#mouseEnabled = false;
 		this.#safeWrite("\x1b[?2004l");
 		this.#safeWrite("\x1b[?1000l");
 		this.#safeWrite("\x1b[?1006l");

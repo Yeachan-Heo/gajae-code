@@ -1,0 +1,80 @@
+{
+  "cases": [
+    {
+      "id": "real-cli-json",
+      "scenario": "Run the frozen miner against the real session store using bun scripts/mine-compaction-history.ts --since 2026-06-01 --json.",
+      "expected": "Exit successfully and emit valid JSON without NaN values.",
+      "actual": "exitCode=0; JSON parsed successfully; integrity={filesScanned:8296,filesFailed:0,linesParsed:894644,linesRejected:0,eventsInvalidTimestamp:0}; weeklyAggregates=7; compactionEvidence=222.",
+      "verdict": "pass"
+    },
+    {
+      "id": "event-week-and-per-event-since",
+      "scenario": "Temp-only patched copy, one session file named started-2026-05-20.jsonl: an assistant turn at 2026-06-02 and compaction at 2026-06-03, invoked with --since 2026-06-01.",
+      "expected": "Both events are retained and bucketed in week 2026-06-01, rather than being excluded or keyed by session start.",
+      "actual": "weeklyAggregates[2026-06-01]={assistantTurns:1,compactions:1,distinctSessions:1}; compactionEvidence includes timestamp 2026-06-03T10:00:00Z.",
+      "verdict": "pass"
+    },
+    {
+      "id": "fixture-event-week-turn",
+      "scenario": "Temp fixture assistant turns dated 2026-07-02 in a session whose file identifies it as started 2026-05-20.",
+      "expected": "Turns contribute to Monday week 2026-06-29, based on their event timestamp.",
+      "actual": "weeklyAggregates[2026-06-29]={assistantTurns:5,compactions:3,reactive:1,proactive:2}; no 2026-05-18 aggregate was created.",
+      "verdict": "pass"
+    },
+    {
+      "id": "reactive-consecutive-overflow",
+      "scenario": "Valid assistant tool-use-equivalent turn with usage.totalTokens=123456, followed by error and aborted assistant turns containing context_too_large, then compaction.",
+      "expected": "Compaction is reactive; walks both consecutive invalid predecessors; lastValidProviderTokens remains 123456.",
+      "actual": "evidence[2026-07-03T08:03:00Z]={classification:reactive,predecessorStopReasons:[aborted,error],predecessorErrorSnippets:[context_too_large again,context_too_large: request exceeded window],lastValidProviderTokens:123456}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "proactive-no-errors",
+      "scenario": "Valid assistant turn with no preceding error/aborted turns, then compaction.",
+      "expected": "classification=proactive.",
+      "actual": "evidence[2026-07-04T08:01:00Z]={classification:proactive,predecessorStopReasons:[],lastValidProviderTokens:222}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "non-overflow-error-not-reactive",
+      "scenario": "Assistant error predecessor with errorMessage 'invalid_prompt: Request blocked', then compaction.",
+      "expected": "classification remains proactive because the immediate invalid predecessor does not match an overflow pattern.",
+      "actual": "evidence[2026-07-05T08:01:00Z]={classification:proactive,predecessorStopReasons:[error],predecessorErrorSnippets:[invalid_prompt: Request blocked]}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "threshold-regime-by-event-date",
+      "scenario": "Mapped 400k model with tokensBefore=300000, compacted on 2026-06-20 and 2026-06-25.",
+      "expected": "Pre-2026-06-23 applies threshold 272000 and classifies expected; post-cutover applies 340000 and classifies premature (300000 is below 90% of 340000).",
+      "actual": "2026-06-20={thresholdRegime:pre-1021,effectiveThresholdPre1021:272000,effectiveThresholdPost1021:340000,applicableEffectiveThreshold:272000,triggerFullnessClassification:expected}; 2026-06-25={thresholdRegime:post-1021,applicableEffectiveThreshold:340000,triggerFullnessClassification:premature}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "zero-tokens-unknown-usage",
+      "scenario": "Mapped-model compaction with tokensBefore=0.",
+      "expected": "triggerFullnessClassification=unknown-usage and no NaN raw percentage.",
+      "actual": "evidence[2026-06-26T08:00:00Z]={tokensBefore:0,triggerFullnessClassification:unknown-usage,rawWindowPercent:null}; weekly triggerFullness.unknownUsage=1.",
+      "verdict": "pass"
+    },
+    {
+      "id": "malformed-json-integrity",
+      "scenario": "Fixture starts with one deliberately malformed JSONL line.",
+      "expected": "Malformed line is rejected and integrity.linesRejected increments without a crash.",
+      "actual": "fixture exitCode=0; integrity={filesScanned:1,filesFailed:0,linesParsed:16,linesRejected:1,eventsInvalidTimestamp:0}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "unknown-model-reporting",
+      "scenario": "Model changed to acme/unknown-99 before a compaction.",
+      "expected": "Unknown exact provider/model key is reported in unknownModels and compaction receives unknown-window classification.",
+      "actual": "unknownModels=[{model:acme/unknown-99,count:1}]; evidence[2026-07-06T08:00:00Z]={contextWindow:null,triggerFullnessClassification:unknown-window}.",
+      "verdict": "pass"
+    }
+  ],
+  "overall": "pass",
+  "commands": [
+    "bun scripts/mine-compaction-history.ts --since 2026-06-01 --json (real store; exit 0; JSON parsed)",
+    "python3 temporary-fixture harness: mktemp -d equivalent TemporaryDirectory; copied scripts/mine-compaction-history.ts; patched only the copy's SESSIONS_ROOT; wrote one fixture JSONL; ran bun <temp>/mine.ts --since 2026-06-01 --json (exit 0; JSON parsed)",
+    "The frozen scripts/mine-compaction-history.ts and artifacts/compaction-mining-v2.json were not edited. No formatters or project-wide gates were run."
+  ]
+}

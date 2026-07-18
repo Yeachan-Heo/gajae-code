@@ -301,6 +301,181 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		expect(persisted.skill).toBe("deep-interview");
 	});
 
+	it("locks a canonical Round-0 contract to the recorder answer hash without retaining raw custom input", async () => {
+		const cwd = await tempDir();
+		const statePath = statePathFor(cwd);
+		const intentContract = {
+			items: [
+				{ id: "surface:review", category: "surface" as const, statement: "Provide a reviewer surface" },
+				{ id: "artifact:report", category: "artifact" as const, statement: "Produce an audit report" },
+			],
+			confirmation_options: ["Confirm"],
+		};
+		const input = {
+			round: 0,
+			questionId: "intent-confirmation",
+			questionText: "Confirm locked intent",
+			component: "review-topology",
+			dimension: "topology",
+			selectedOptions: ["Confirm"],
+			customInput: "SSN 123-45-6789 must never become contract evidence",
+			intent_contract: intentContract,
+		};
+		const created = await appendOrMergeDeepInterviewRound(cwd, statePath, input, { sessionId: TEST_SESSION_ID });
+		expect(created.action).toBe("created");
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8")) as {
+			state: {
+				intent_contract: {
+					items: Array<{ id: string }>;
+					confirmation_answer_hash: string;
+					confirmation_evidence: string;
+				};
+				rounds: DeepInterviewRoundRecord[];
+			};
+		};
+		expect(persisted.state.intent_contract.items.map(item => item.id)).toEqual(["artifact:report", "surface:review"]);
+		expect(persisted.state.intent_contract.confirmation_answer_hash).toBe(persisted.state.rounds[0].answer_hash);
+		expect(persisted.state.intent_contract.confirmation_evidence).toBe(
+			`answer_hash:${persisted.state.rounds[0].answer_hash}`,
+		);
+		expect(JSON.stringify(persisted.state.intent_contract)).not.toContain("123-45-6789");
+		expect(JSON.stringify(persisted.state)).not.toContain("123-45-6789");
+
+		const replay = await appendOrMergeDeepInterviewRound(cwd, statePath, input, { sessionId: TEST_SESSION_ID });
+		expect(replay.action).toBe("noop");
+		await expect(
+			appendOrMergeDeepInterviewRound(cwd, statePath, { ...input, round: 1 }, { sessionId: TEST_SESSION_ID }),
+		).rejects.toThrow("requires Round 0");
+		await expect(
+			appendOrMergeDeepInterviewRound(
+				cwd,
+				statePath,
+				{
+					...input,
+					intent_contract: {
+						items: [{ id: "artifact:other", category: "artifact", statement: "Replace the report" }],
+						confirmation_options: ["Confirm"],
+					},
+				},
+				{ sessionId: TEST_SESSION_ID },
+			),
+		).rejects.toThrow("cannot be replaced");
+		expect(
+			JSON.parse(await fs.readFile(statePath, "utf-8")).state.intent_contract.items.map(
+				(item: { id: string }) => item.id,
+			),
+		).toEqual(["artifact:report", "surface:review"]);
+	});
+
+	it("does not lock a rejected Round-0 proposal before corrected confirmation", async () => {
+		const cwd = await tempDir();
+		const statePath = statePathFor(cwd);
+		const base = {
+			round: 0,
+			questionId: "intent-confirmation",
+			questionText: "Confirm locked intent",
+			component: "review-topology",
+			dimension: "topology",
+			intent_contract: {
+				items: [{ id: "artifact:draft", category: "artifact" as const, statement: "Draft artifact" }],
+				confirmation_options: ["Looks right"],
+			},
+		};
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{ ...base, selectedOptions: ["Add/remove/merge components"] },
+			{ sessionId: TEST_SESSION_ID },
+		);
+		let persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		expect(persisted.state.intent_contract).toBeUndefined();
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{ ...base, selectedOptions: ["Looks right", "Add/remove/merge components"] },
+			{ sessionId: TEST_SESSION_ID },
+		);
+		persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		expect(persisted.state.intent_contract).toBeUndefined();
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				...base,
+				selectedOptions: ["Looks right"],
+				intent_contract: {
+					items: [{ id: "artifact:final", category: "artifact", statement: "Final artifact" }],
+					confirmation_options: ["Looks right"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		expect(persisted.state.intent_contract.items.map((item: { id: string }) => item.id)).toEqual(["artifact:final"]);
+	});
+
+	it("records approved reductions from answer labels with redacted evidence", async () => {
+		const cwd = await tempDir();
+		const statePath = statePathFor(cwd);
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 0,
+				questionId: "intent-confirmation",
+				questionText: "Confirm locked intent",
+				component: "review-topology",
+				dimension: "topology",
+				selectedOptions: ["Confirm"],
+				intent_contract: {
+					items: [
+						{ id: "artifact:report", category: "artifact", statement: "Produce a report" },
+						{ id: "surface:review", category: "surface", statement: "Provide review" },
+					],
+					confirmation_options: ["Confirm"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				round: 2,
+				questionId: "intent-review",
+				questionText: "Approve the reduction?",
+				component: "locked-intent",
+				dimension: "constraints",
+				selectedOptions: ["Approve reduction"],
+				customInput: "private explanation must not persist",
+				intent_review: {
+					observed_items: [{ id: "artifact:report", category: "artifact", statement: "Produce a report" }],
+					supporting_substitutions: [
+						{
+							removed_id: "surface:review",
+							replacement_ids: ["artifact:report"],
+							rationale: "Report replaces review",
+						},
+					],
+					approval_options: ["Approve reduction"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		expect(persisted.state.intent_review).toMatchObject({
+			status: "approved",
+			approval_round: 2,
+			removed_locked_ids: ["surface:review"],
+		});
+		expect(persisted.state.intent_review.answer_hash).toBe(persisted.state.rounds[1].answer_hash);
+		expect(persisted.state.intent_review.user_answer_evidence).toBe(
+			`answer_hash:${persisted.state.rounds[1].answer_hash}`,
+		);
+		expect(JSON.stringify(persisted.state.intent_review)).not.toContain("private explanation");
+		expect(persisted.state.intent_review.supporting_substitutions[0].rationale).toMatch(/^sha256:[a-f0-9]{64}$/);
+	});
+
 	it("enriches the same record to scored without appending a second", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);

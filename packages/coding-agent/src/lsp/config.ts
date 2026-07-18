@@ -8,6 +8,7 @@ import { type ClaudePluginRoot, getPreloadedPluginRoots } from "../discovery/hel
 import { BiomeClient } from "./clients/biome-client";
 import { SwiftLintClient } from "./clients/swiftlint-client";
 import DEFAULTS from "./defaults.json" with { type: "json" };
+import { isProjectControlledPath } from "./path-trust";
 import type { ServerConfig } from "./types";
 
 export interface LspConfig {
@@ -69,6 +70,40 @@ function normalizeExtensionToFileTypes(value: unknown): string[] | null {
 	return extensions.length > 0 ? extensions : null;
 }
 
+function sanitizeServerConfig(config: unknown, allowProcessOverrides: boolean): RawServerConfig | null {
+	if (!isRecord(config)) return null;
+
+	const sanitized: RawServerConfig = {};
+	if (allowProcessOverrides && typeof config.command === "string" && config.command.length > 0) {
+		sanitized.command = config.command;
+	}
+	if (allowProcessOverrides && Array.isArray(config.args)) {
+		sanitized.args = config.args.filter((entry): entry is string => typeof entry === "string");
+	}
+
+	const fileTypes = normalizeStringArray(config.fileTypes);
+	if (fileTypes) sanitized.fileTypes = fileTypes;
+	if (isRecord(config.extensionToLanguage)) sanitized.extensionToLanguage = config.extensionToLanguage;
+
+	const rootMarkers = normalizeStringArray(config.rootMarkers);
+	if (rootMarkers) sanitized.rootMarkers = rootMarkers;
+	if (allowProcessOverrides && isRecord(config.initOptions)) sanitized.initOptions = config.initOptions;
+	if (allowProcessOverrides && isRecord(config.initializationOptions)) {
+		sanitized.initializationOptions = config.initializationOptions;
+	}
+	if (allowProcessOverrides && isRecord(config.settings)) sanitized.settings = config.settings;
+	if (typeof config.disabled === "boolean") sanitized.disabled = config.disabled;
+	if (typeof config.warmupTimeoutMs === "number" && Number.isFinite(config.warmupTimeoutMs)) {
+		sanitized.warmupTimeoutMs = config.warmupTimeoutMs;
+	}
+	if (isRecord(config.capabilities)) sanitized.capabilities = config.capabilities;
+	const supersedes = normalizeStringArray(config.supersedes);
+	if (supersedes) sanitized.supersedes = supersedes;
+	if (typeof config.isLinter === "boolean") sanitized.isLinter = config.isLinter;
+
+	return sanitized;
+}
+
 function normalizeServerConfig(name: string, config: RawServerConfig): ServerConfig | null {
 	const command = typeof config.command === "string" && config.command.length > 0 ? config.command : null;
 	const fileTypes =
@@ -91,13 +126,17 @@ function normalizeServerConfig(name: string, config: RawServerConfig): ServerCon
 	const supersedes = normalizeStringArray(config.supersedes);
 
 	return {
-		...config,
 		command,
-		args,
+		...(args ? { args } : {}),
 		fileTypes,
 		rootMarkers,
 		...(initOptions ? { initOptions } : {}),
+		...(isRecord(config.settings) ? { settings: config.settings } : {}),
+		...(typeof config.disabled === "boolean" ? { disabled: config.disabled } : {}),
+		...(typeof config.warmupTimeoutMs === "number" ? { warmupTimeoutMs: config.warmupTimeoutMs } : {}),
+		...(isRecord(config.capabilities) ? { capabilities: config.capabilities } : {}),
 		...(supersedes ? { supersedes } : {}),
+		...(typeof config.isLinter === "boolean" ? { isLinter: config.isLinter } : {}),
 	};
 }
 
@@ -114,7 +153,8 @@ function readConfigFile(filePath: string): NormalizedConfig | null {
 function coerceServerConfigs(servers: Record<string, RawServerConfig>): Record<string, ServerConfig> {
 	const result: Record<string, ServerConfig> = {};
 	for (const [name, config] of Object.entries(servers)) {
-		const normalized = normalizeServerConfig(name, config);
+		const sanitized = sanitizeServerConfig(config, true);
+		const normalized = sanitized ? normalizeServerConfig(name, sanitized) : null;
 		if (normalized) {
 			result[name] = normalized;
 		}
@@ -125,11 +165,30 @@ function coerceServerConfigs(servers: Record<string, RawServerConfig>): Record<s
 function mergeServers(
 	base: Record<string, ServerConfig>,
 	overrides: Record<string, RawServerConfig>,
+	allowProcessOverrides: boolean,
 ): Record<string, ServerConfig> {
 	const merged: Record<string, ServerConfig> = { ...base };
 	for (const [name, config] of Object.entries(overrides)) {
+		if (
+			!allowProcessOverrides &&
+			isRecord(config) &&
+			("command" in config ||
+				"args" in config ||
+				"resolvedCommand" in config ||
+				"createClient" in config ||
+				"initOptions" in config ||
+				"initializationOptions" in config ||
+				"settings" in config)
+		) {
+			logger.warn("Ignoring project-controlled LSP process-affecting overrides.", { name });
+		}
+		const sanitized = sanitizeServerConfig(config, allowProcessOverrides);
+		if (!sanitized) {
+			logger.warn("Ignoring invalid LSP server config.", { name });
+			continue;
+		}
 		if (merged[name]) {
-			const candidate = { ...merged[name], ...config };
+			const candidate = { ...merged[name], ...sanitized };
 			const normalized = normalizeServerConfig(name, candidate);
 			if (normalized) {
 				merged[name] = normalized;
@@ -137,7 +196,7 @@ function mergeServers(
 				logger.warn("Ignoring invalid LSP overrides (keeping previous config).", { name });
 			}
 		} else {
-			const normalized = normalizeServerConfig(name, config);
+			const normalized = normalizeServerConfig(name, sanitized);
 			if (normalized) {
 				merged[name] = normalized;
 			}
@@ -276,17 +335,49 @@ export function resolveCommand(command: string, cwd: string): string | null {
 	return $which(command);
 }
 
-interface ConfigSource {
-	read(): NormalizedConfig | null;
+/** Resolve an LSP executable without consulting project-controlled bin directories. */
+function resolveTrustedLspCommand(command: string, cwd: string): string | null {
+	if (!path.isAbsolute(command) && (command.includes("/") || command.includes("\\"))) return null;
+	const discovered = path.isAbsolute(command) ? command : $which(command);
+	if (!discovered) return null;
+	if (isProjectControlledPath(discovered, cwd)) return null;
+	const canonical = canonicalExistingPath(discovered);
+	return canonical;
 }
 
-function fileConfigSource(filePath: string): ConfigSource {
+interface ConfigSource {
+	allowProcessOverrides: boolean;
+	read(): LoadedConfigSource | null;
+}
+
+interface LoadedConfigSource {
+	config: NormalizedConfig;
+	projectControlled: boolean;
+}
+
+function canonicalExistingPath(filePath: string): string | null {
+	try {
+		return fs.realpathSync(filePath);
+	} catch {
+		return null;
+	}
+}
+
+function readCanonicalConfigFile(filePath: string, cwd: string): LoadedConfigSource | null {
+	const canonicalPath = canonicalExistingPath(filePath);
+	if (!canonicalPath) return null;
+	const config = readConfigFile(canonicalPath);
+	return config ? { config, projectControlled: isProjectControlledPath(canonicalPath, cwd) } : null;
+}
+
+function fileConfigSource(filePath: string, cwd: string, allowProcessOverrides: boolean): ConfigSource {
 	return {
-		read: () => readConfigFile(filePath),
+		allowProcessOverrides,
+		read: () => readCanonicalConfigFile(filePath, cwd),
 	};
 }
 
-function readMarketplaceLspConfig(root: ClaudePluginRoot): NormalizedConfig | null {
+function readMarketplaceLspConfig(root: ClaudePluginRoot, cwd: string): LoadedConfigSource | null {
 	const catalogPaths = [
 		path.resolve(root.path, "..", "..", "marketplace.json"),
 		path.resolve(root.path, "..", "..", ".claude-plugin", "marketplace.json"),
@@ -294,8 +385,11 @@ function readMarketplaceLspConfig(root: ClaudePluginRoot): NormalizedConfig | nu
 
 	for (const catalogPath of catalogPaths) {
 		try {
-			const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")) as unknown;
+			const canonicalCatalogPath = canonicalExistingPath(catalogPath);
+			if (!canonicalCatalogPath) continue;
+			const catalog = JSON.parse(fs.readFileSync(canonicalCatalogPath, "utf-8")) as unknown;
 			if (!isRecord(catalog) || !Array.isArray(catalog.plugins)) continue;
+			const catalogIsProjectControlled = isProjectControlledPath(canonicalCatalogPath, cwd);
 
 			for (const plugin of catalog.plugins) {
 				if (!isRecord(plugin) || plugin.name !== root.plugin) continue;
@@ -304,10 +398,27 @@ function readMarketplaceLspConfig(root: ClaudePluginRoot): NormalizedConfig | nu
 				if (typeof lspServers === "string") {
 					const configPath = path.resolve(root.path, lspServers);
 					if (!pathIsWithin(root.path, configPath)) return null;
-					return readConfigFile(configPath);
+					const canonicalRootPath = canonicalExistingPath(root.path);
+					const canonicalConfigPath = canonicalExistingPath(configPath);
+					if (
+						!canonicalRootPath ||
+						!canonicalConfigPath ||
+						!pathIsWithin(canonicalRootPath, canonicalConfigPath)
+					) {
+						return null;
+					}
+					const config = readConfigFile(canonicalConfigPath);
+					return config
+						? {
+								config,
+								projectControlled:
+									catalogIsProjectControlled || isProjectControlledPath(canonicalConfigPath, cwd),
+							}
+						: null;
 				}
 				if (isRecord(lspServers)) {
-					return normalizeConfig({ servers: lspServers });
+					const config = normalizeConfig({ servers: lspServers });
+					return config ? { config, projectControlled: catalogIsProjectControlled } : null;
 				}
 				return null;
 			}
@@ -317,10 +428,15 @@ function readMarketplaceLspConfig(root: ClaudePluginRoot): NormalizedConfig | nu
 	return null;
 }
 
-function marketplaceConfigSource(root: ClaudePluginRoot): ConfigSource {
+function marketplaceConfigSource(root: ClaudePluginRoot, cwd: string, allowProcessOverrides: boolean): ConfigSource {
 	return {
-		read: () => readMarketplaceLspConfig(root),
+		allowProcessOverrides,
+		read: () => readMarketplaceLspConfig(root, cwd),
 	};
+}
+
+function pluginCanOverrideProcess(root: ClaudePluginRoot, cwd: string): boolean {
+	return root.scope !== "project" && !isProjectControlledPath(root.path, cwd);
 }
 
 /**
@@ -333,14 +449,14 @@ function getConfigSources(cwd: string): ConfigSource[] {
 
 	// Project root files (highest priority)
 	for (const filename of filenames) {
-		sources.push(fileConfigSource(path.join(cwd, filename)));
+		sources.push(fileConfigSource(path.join(cwd, filename), cwd, false));
 	}
 
 	// Project config directories (.gjc/, .gemini/)
 	const projectDirs = getConfigDirPaths("", { user: false, project: true, cwd });
 	for (const dir of projectDirs) {
 		for (const filename of filenames) {
-			sources.push(fileConfigSource(path.join(dir, filename)));
+			sources.push(fileConfigSource(path.join(dir, filename), cwd, false));
 		}
 	}
 
@@ -348,22 +464,23 @@ function getConfigSources(cwd: string): ConfigSource[] {
 	const userDirs = getConfigDirPaths("", { user: true, project: false });
 	for (const dir of userDirs) {
 		for (const filename of filenames) {
-			sources.push(fileConfigSource(path.join(dir, filename)));
+			sources.push(fileConfigSource(path.join(dir, filename), cwd, true));
 		}
 	}
 
-	// Plugin LSP configs (from marketplace/--plugin-dir roots)
+	// Plugin LSP configs
 	const pluginRoots = getPreloadedPluginRoots();
 	for (const root of pluginRoots) {
+		const allowProcessOverrides = pluginCanOverrideProcess(root, cwd);
 		for (const filename of filenames) {
-			sources.push(fileConfigSource(path.join(root.path, filename)));
+			sources.push(fileConfigSource(path.join(root.path, filename), cwd, allowProcessOverrides));
 		}
-		sources.push(marketplaceConfigSource(root));
+		sources.push(marketplaceConfigSource(root, cwd, allowProcessOverrides));
 	}
 
 	// User home root files (lowest priority fallback)
 	for (const filename of filenames) {
-		sources.push(fileConfigSource(path.join(os.homedir(), filename)));
+		sources.push(fileConfigSource(path.join(os.homedir(), filename), cwd, true));
 	}
 
 	return sources;
@@ -408,12 +525,14 @@ export function loadConfig(cwd: string): LspConfig {
 
 	let idleTimeoutMs: number | undefined;
 	for (const source of configSources) {
-		const parsed = source.read();
-		if (!parsed) continue;
+		const loaded = source.read();
+		if (!loaded) continue;
+		const parsed = loaded.config;
+		const allowProcessOverrides = source.allowProcessOverrides && !loaded.projectControlled;
 		const hasServerOverrides = Object.keys(parsed.servers).length > 0;
 		if (hasServerOverrides) {
 			hasOverrides = true;
-			mergedServers = mergeServers(mergedServers, parsed.servers);
+			mergedServers = mergeServers(mergedServers, parsed.servers, allowProcessOverrides);
 		}
 		if (parsed.idleTimeoutMs !== undefined) {
 			idleTimeoutMs = parsed.idleTimeoutMs;
@@ -430,7 +549,7 @@ export function loadConfig(cwd: string): LspConfig {
 			if (!hasRootMarkers(cwd, config.rootMarkers)) continue;
 
 			// Check if the language server binary is available (local or $PATH)
-			const resolved = resolveCommand(config.command, cwd);
+			const resolved = resolveTrustedLspCommand(config.command, cwd);
 			if (!resolved) continue;
 
 			detected[name] = { ...config, resolvedCommand: resolved };
@@ -445,7 +564,7 @@ export function loadConfig(cwd: string): LspConfig {
 	for (const [name, config] of Object.entries(mergedWithRuntime)) {
 		if (config.disabled) continue;
 		if (!hasRootMarkers(cwd, config.rootMarkers)) continue;
-		const resolved = resolveCommand(config.command, cwd);
+		const resolved = resolveTrustedLspCommand(config.command, cwd);
 		if (!resolved) continue;
 		available[name] = { ...config, resolvedCommand: resolved };
 	}

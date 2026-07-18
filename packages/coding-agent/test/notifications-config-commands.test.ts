@@ -155,6 +155,7 @@ describe("parseTelegramControlCommand", () => {
 
 	test("unknown commands and wrong bot suffix fall through", () => {
 		expect(parseTelegramControlCommand("/unknown")).toEqual({ kind: "none" });
+		expect(parseTelegramControlCommand("/btw why is this happening?")).toEqual({ kind: "none" });
 		expect(parseTelegramControlCommand("/context@OtherBot", "GajaeCodeBot")).toEqual({
 			kind: "ignored",
 			commandName: "context",

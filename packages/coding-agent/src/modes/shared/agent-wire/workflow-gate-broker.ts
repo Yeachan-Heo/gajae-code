@@ -28,7 +28,7 @@ import type {
 	WorkflowGateValidationError,
 	WorkflowStage,
 } from "./workflow-gate-types";
-import { RESERVED_WORKFLOW_STAGES } from "./workflow-gate-types";
+import { RESERVED_WORKFLOW_STAGES, WORKFLOW_GATE_V1_STAGES } from "./workflow-gate-types";
 
 export type PersistedSemanticDisposition = "commit" | "resolve_without_commit";
 export type PersistedResolutionOrigin =
@@ -108,6 +108,10 @@ export interface WorkflowGateEmitter {
 	setAckRecoveryParticipant?(participant: AskSelectedAckRecoveryParticipant | null): void;
 	/** Explicit host hook for same-process accepted-but-unadvanced recovery. */
 	recoverAcceptedGates?(): Promise<string[]>;
+	/** Reads a durable completed resolution before any presentation claim. */
+	lookupCompletedResolution?(response: WorkflowGateResponse): WorkflowGateCompletedResolutionLookup;
+	/** Supplies the active runtime turn captured immediately before a gate is opened. */
+	setRuntimeTurnProvider?(provider: (() => string | undefined) | null): void;
 	/** Permanently revoke all in-process continuation authority and reject their waiters. */
 	fence?(): void;
 	/** Temporarily make this emitter unavailable while a session transition is reversible. */
@@ -139,6 +143,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	readonly #runId: string;
 	readonly #store: GateStore;
 	readonly #emitterHooks: Pick<BrokerHooks, "advance">;
+	#runtimeTurnProvider: (() => string | undefined) | undefined;
 
 	constructor(runId: string, store: GateStore, emitterHooks: Pick<BrokerHooks, "advance"> = {}) {
 		this.#runId = runId;
@@ -158,20 +163,29 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	isUnattended(): boolean {
 		return true;
 	}
+	setRuntimeTurnProvider(provider: (() => string | undefined) | null): void {
+		this.#runtimeTurnProvider = provider ?? undefined;
+	}
 
 	emitGate(input: OpenGateInput): Promise<unknown> {
 		if (this.#fenced || this.#suspended) return Promise.reject(new Error("workflow gate emitter is unavailable"));
 		const waiter = Promise.withResolvers<unknown>();
-		const gate = this.#broker.openGate(input, {
-			activate: opened => this.#waiters.set(opened.gate_id, waiter),
-			isLive: gateId => this.#waiters.has(gateId),
-			release: gateId => {
-				const activeWaiter = this.#waiters.get(gateId);
-				if (!activeWaiter) return;
-				this.#waiters.delete(gateId);
-				activeWaiter.reject(new Error(`workflow gate ${gateId} continuation was fenced`));
+		const gate = this.#broker.openGate(
+			{
+				...input,
+				...(input.runtimeTurnId === undefined ? { runtimeTurnId: this.#runtimeTurnProvider?.() } : {}),
 			},
-		});
+			{
+				activate: opened => this.#waiters.set(opened.gate_id, waiter),
+				isLive: gateId => this.#waiters.has(gateId),
+				release: gateId => {
+					const activeWaiter = this.#waiters.get(gateId);
+					if (!activeWaiter) return;
+					this.#waiters.delete(gateId);
+					activeWaiter.reject(new Error(`workflow gate ${gateId} continuation was fenced`));
+				},
+			},
+		);
 		// A listener may answer synchronously while the broker emits. The durable
 		// record is the source of truth in that race; never strand its promise.
 		const persisted = this.#store.get(gate.gate_id);
@@ -192,6 +206,10 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 			throw error;
 		});
 	}
+	lookupCompletedResolution(response: WorkflowGateResponse): WorkflowGateCompletedResolutionLookup {
+		return this.#broker.lookupCompletedResolution(response);
+	}
+
 	prepareTerminalization(gateId: string, proof: WorkflowGateTerminalProof): boolean {
 		return this.#broker.prepareTerminalization(gateId, proof);
 	}
@@ -223,6 +241,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 		if (this.#fenced) return;
 		this.#fenced = true;
 		this.#suspended = false;
+		this.#runtimeTurnProvider = undefined;
 		if (this.#recoveryTimer) clearTimeout(this.#recoveryTimer);
 		this.#recoveryTimer = undefined;
 		if (this.#recoveryGraceTimer) clearTimeout(this.#recoveryGraceTimer);
@@ -466,8 +485,6 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 		return this.#recoveryPromise;
 	}
 }
-
-const V1_STAGES: readonly WorkflowStage[] = ["deep-interview", "ralplan", "ultragoal"];
 
 export interface PersistedGate {
 	gate: WorkflowGate;
@@ -760,7 +777,7 @@ function assertFileState(value: unknown, filePath: string): asserts value is Fil
 		invalidFileState(filePath);
 	for (const [stage, counter] of Object.entries(value.counters)) {
 		if (
-			!V1_STAGES.includes(stage as WorkflowStage) ||
+			!WORKFLOW_GATE_V1_STAGES.includes(stage as WorkflowStage) ||
 			typeof counter !== "number" ||
 			!Number.isSafeInteger(counter) ||
 			counter < 0
@@ -805,7 +822,7 @@ function assertPersistedGate(
 	if (
 		gate.type !== "workflow_gate" ||
 		!isNonEmptyString(gate.gate_id) ||
-		!V1_STAGES.includes(stage) ||
+		!WORKFLOW_GATE_V1_STAGES.includes(stage) ||
 		!["question", "approval", "execution"].includes(gate.kind as string) ||
 		!isObject(gate.schema) ||
 		!isNonEmptyString(gate.schema_hash) ||
@@ -814,6 +831,7 @@ function assertPersistedGate(
 		gate.required !== true
 	)
 		invalidFileState(filePath);
+	if (gate.runtime_turn_id !== undefined && !isNonEmptyString(gate.runtime_turn_id)) invalidFileState(filePath);
 	const id = new RegExp(`^wg_[A-Za-z0-9]+_${gate.stage}_(\\d{6,})$`).exec(gate.gate_id);
 	if (
 		!id ||
@@ -1149,11 +1167,24 @@ export interface OpenGateInput {
 	context?: WorkflowGateContext;
 	/** Optional diagnostic gate replaced by this newly persisted gate. */
 	supersedesGateId?: string;
+	/** Optional immutable runtime turn captured by the emitter before broker persistence. */
+	runtimeTurnId?: string;
 }
+
+/** Durable resolution state used to safely replay direct control after presentation retirement. */
+export type WorkflowGateCompletedResolutionLookup =
+	| { kind: "none" }
+	| { kind: "completed"; resolution: WorkflowGateResolution }
+	| { kind: "accepted_incomplete" };
 
 export class WorkflowGateBrokerError extends Error {
 	constructor(
-		readonly code: "unknown_gate" | "already_resolved" | "idempotency_conflict" | "invalid_workflow_stage",
+		readonly code:
+			| "unknown_gate"
+			| "already_resolved"
+			| "idempotency_conflict"
+			| "invalid_workflow_stage"
+			| "invalid_runtime_turn",
 		message: string,
 	) {
 		super(message);
@@ -1210,6 +1241,27 @@ export class WorkflowGateBroker {
 		if (record?.status !== "accepted")
 			throw new WorkflowGateBrokerError("unknown_gate", `no accepted gate ${gateId}`);
 		this.store.put({ ...record, ackPolicy });
+	}
+
+	lookupCompletedResolution(response: WorkflowGateResponse): WorkflowGateCompletedResolutionLookup {
+		const record = this.store.get(response.gate_id);
+		if (!record) return { kind: "none" };
+		const responseHash = answerHashOf({ gate_id: response.gate_id, answer: response.answer });
+		if (record.status !== "accepted" && record.status !== "quarantined") return { kind: "none" };
+		if (record.responseHash === undefined) return { kind: "none" };
+		const sameBody = record.responseHash === responseHash;
+		const sameKey = record.idempotencyKey === response.idempotency_key;
+		if (response.idempotency_key !== undefined && sameKey && !sameBody)
+			throw new WorkflowGateBrokerError(
+				"idempotency_conflict",
+				`idempotency_conflict: gate ${response.gate_id} resolved with a different body`,
+			);
+		if (response.idempotency_key !== undefined && sameKey && sameBody) {
+			if (record.terminalized === true && record.advanced === true && record.resolution)
+				return { kind: "completed", resolution: record.resolution };
+			return { kind: "accepted_incomplete" };
+		}
+		throw new WorkflowGateBrokerError("already_resolved", `already_resolved: gate ${response.gate_id}`);
 	}
 
 	async #terminalize(record: PersistedGate): Promise<void> {
@@ -1350,12 +1402,14 @@ export class WorkflowGateBroker {
 
 	/** Open and emit a gate. The pending record is persisted BEFORE emission. */
 	openGate(input: OpenGateInput, continuation?: GateContinuation): WorkflowGate {
-		if (RESERVED_WORKFLOW_STAGES.includes(input.stage) || !V1_STAGES.includes(input.stage)) {
+		if (RESERVED_WORKFLOW_STAGES.includes(input.stage) || !WORKFLOW_GATE_V1_STAGES.includes(input.stage)) {
 			throw new WorkflowGateBrokerError(
 				"invalid_workflow_stage",
 				`stage "${input.stage}" is not a v1 workflow stage`,
 			);
 		}
+		if (input.runtimeTurnId !== undefined && !isNonEmptyString(input.runtimeTurnId))
+			throw new WorkflowGateBrokerError("invalid_runtime_turn", "runtime turn id must be a nonempty string");
 		// Asserts schema shape (throws WorkflowGateSchemaError on unsupported keywords).
 		compileGateSchema(input.schema);
 		const seq = this.store.nextSeq(input.stage).toString().padStart(6, "0");
@@ -1371,6 +1425,7 @@ export class WorkflowGateBroker {
 			context: input.context ?? {},
 			created_at: new Date().toISOString(),
 			required: true,
+			...(input.runtimeTurnId === undefined ? {} : { runtime_turn_id: input.runtimeTurnId }),
 		};
 		if (!continuation) {
 			this.store.put({

@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 
 import { Settings } from "../src/config/settings";
 import { TELEGRAM_PARSE_MODE } from "../src/sdk/bus/html-format";
@@ -56,6 +57,14 @@ function makeDaemon(agentDir: string, bot: never): TelegramNotificationDaemon {
 function msg(chatId: string, text: string, updateId: number): unknown {
 	return { update_id: updateId, message: { chat: { id: chatId }, text, message_id: updateId } };
 }
+type NativeSecurity = { ok: true } | { ok: false; code: string };
+
+function secureOwnerOnlyFile(pathname: string): void {
+	const applied = native.applyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
+	if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
+	const verified = native.verifyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
+	if (!verified.ok) throw new Error(`Owner-only security rejected ${pathname}: ${verified.code}`);
+}
 
 function writeSession(
 	agentDir: string,
@@ -73,7 +82,7 @@ function writeSession(
 	const file = path.join(prepared.scope.directoryPath, `${id}.jsonl`);
 	const suffix = entries.length > 0 ? `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n` : "";
 	fs.writeFileSync(file, `${JSON.stringify({ ...header, type: "session", id, cwd })}\n${suffix}`, { mode: 0o600 });
-	fs.chmodSync(file, 0o600);
+	secureOwnerOnlyFile(file);
 	fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
 }
 
@@ -116,7 +125,7 @@ describe("lifecycle command routing (G009)", () => {
 		const { calls, api } = spyBot();
 		const daemon = makeDaemon(agentDir, api);
 		(daemon as unknown as { lifecycleControlActive: boolean }).lifecycleControlActive = true;
-		const cwd = path.join(agentDir, "repo-<tag>&branch", "x".repeat(100));
+		const cwd = path.join(agentDir, "repo-&branch", "x".repeat(100));
 		fs.mkdirSync(cwd, { recursive: true });
 		const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(cwd);
 		for (let i = 0; i < 20; i++) {

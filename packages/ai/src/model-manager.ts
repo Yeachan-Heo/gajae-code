@@ -41,6 +41,8 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
 	modelsDev?: ModelsDevFallback<TApi, TModelsDevPayload>;
 	/** Clock override for deterministic tests. */
 	now?: () => number;
+	/** Optional guard that must permit cache publication. Default: writes are permitted. */
+	canPublishCache?: () => boolean;
 }
 
 /**
@@ -148,7 +150,9 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			return { models: cachedModels, stale: false };
 		}
 		const repairedModels = mergeDynamicModels(staticModels, cachedModels);
-		writeModelCache(options.providerId, now(), repairedModels, true, staticFingerprint, dbPath);
+		if (options.canPublishCache?.() ?? true) {
+			writeModelCache(options.providerId, now(), repairedModels, true, staticFingerprint, dbPath);
+		}
 		return { models: repairedModels, stale: false };
 	}
 
@@ -169,24 +173,28 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			const snapshotModels = applyFinalCodexGpt56ContextCap(
 				mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), dynamicModels),
 			);
-			writeModelCache(options.providerId, now(), snapshotModels, true, staticFingerprint, dbPath);
+			if (options.canPublishCache?.() ?? true) {
+				writeModelCache(options.providerId, now(), snapshotModels, true, staticFingerprint, dbPath);
+			}
 		} else {
 			// Dynamic fetch failed — update cache with a non-authoritative snapshot so
 			// stale state remains visible while retry backoff still applies.
 			const latestCache = readModelCache<TApi>(options.providerId, ttlMs, now, dbPath);
-			writeModelCache(
-				options.providerId,
-				now(),
-				applyFinalCodexGpt56ContextCap(
-					mergeDynamicModels(
-						mergeModelSources(staticModels, modelsDevModels),
-						normalizeModelList<TApi>(latestCache?.models ?? cache?.models ?? []),
+			if (options.canPublishCache?.() ?? true) {
+				writeModelCache(
+					options.providerId,
+					now(),
+					applyFinalCodexGpt56ContextCap(
+						mergeDynamicModels(
+							mergeModelSources(staticModels, modelsDevModels),
+							normalizeModelList<TApi>(latestCache?.models ?? cache?.models ?? []),
+						),
 					),
-				),
-				false,
-				staticFingerprint,
-				dbPath,
-			);
+					false,
+					staticFingerprint,
+					dbPath,
+				);
+			}
 		}
 	}
 	return {

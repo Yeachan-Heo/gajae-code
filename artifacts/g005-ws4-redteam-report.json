@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "story": "G005",
+  "suites": [
+    {
+      "command": "bun test test/g005-ws4-redteam.test.ts",
+      "status": "failed",
+      "passed": 2,
+      "failed": 3,
+      "evidence": "Ran 5 tests / 8 expectations; three reproducible WS4 contract failures."
+    },
+    {
+      "command": "bun --cwd packages/coding-agent test test/plan-preview-overlay.test.ts test/interactive-mode-plan-review.test.ts",
+      "status": "passed",
+      "passed": 19,
+      "failed": 0,
+      "evidence": "Ran 19 tests / 50 expectations."
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "overlay-5k-unicode-width20",
+      "status": "passed",
+      "evidence": "5,000 CJK/emoji lines page forward; SHA-256 matches node crypto; rendered ANSI-stripped lines fit width 20."
+    },
+    {
+      "id": "serialization-hash-range-order",
+      "status": "passed",
+      "evidence": "Hash8 equals the first eight hex characters of SHA-256; single-line L<n>, range L<start>-L<end>, comment order, and freeform-note ordering match the serialized contract."
+    },
+    {
+      "id": "comments-range-exceeds-plan-length",
+      "status": "failed",
+      "evidence": "L2-L99 against a two-line plan emits five invented blank quote lines after > two."
+    },
+    {
+      "id": "serialization-crlf-cjk",
+      "status": "failed",
+      "evidence": "CRLF CJK source lines retain raw carriage returns in markdown quote payloads, yielding embedded CR bytes."
+    },
+    {
+      "id": "empty-state-actions-width20",
+      "status": "failed",
+      "evidence": "At width 20, the one-line action bar is truncated after the first action; the other three actions are not exposed in rendered output."
+    },
+    {
+      "id": "stale-hash-with-notes-only",
+      "status": "failed-static",
+      "evidence": "interactive-mode.ts only reopens with a warning when review.comments.length is nonzero. A stale snapshot carrying freeform notes but no line comments proceeds without reconfirmation, contrary to stale mismatch at any decision."
+    },
+    {
+      "id": "decision-dispatch-and-transitions",
+      "status": "passed-existing-focused",
+      "evidence": "Existing focused tests pass for ordinary refine prompt dispatch and approval/compaction lifecycle paths; source confirms refine calls session.prompt(revisionPrompt) without synthetic options and approved paths render reviewer comments into the synthetic prompt."
+    }
+  ],
+  "blockers": [
+    {
+      "id": "WS4-RT-001",
+      "severity": "medium",
+      "title": "Out-of-range review ranges fabricate quoted blank lines",
+      "repro": "Run bun --cwd packages/coding-agent test test/g005-ws4-redteam.test.ts. The 'clips an out-of-bounds line range' case fails: serializePlanReviewComments('one\\ntwo', hash, [L2-L99]) emits > two plus five > blank lines.",
+      "source": "packages/coding-agent/src/modes/components/plan-preview-overlay.ts:33",
+      "expected": "Quote only existing referenced plan lines (and define how an entirely invalid range is handled).",
+      "actual": "The loop caps at startLine + 5 but never at lines.length, using an empty fallback for missing lines."
+    },
+    {
+      "id": "WS4-RT-002",
+      "severity": "medium",
+      "title": "CRLF plan comments are not normalized for markdown serialization",
+      "repro": "Run the same red-team suite. With 第一行\\r\\n第二行\\r\\n第三行 and L1-L2, output contains carriage returns after each quoted source line.",
+      "source": "packages/coding-agent/src/modes/components/plan-preview-overlay.ts:28,33",
+      "expected": "Quoted display lines serialize with newline delimiters only while the snapshot hash remains the hash of the original file bytes.",
+      "actual": "content.split('\\n') leaves terminal \\r in each CRLF source line and serialization embeds it."
+    },
+    {
+      "id": "WS4-RT-003",
+      "severity": "medium",
+      "title": "Empty/missing plan state hides three required actions at width 20",
+      "repro": "Run the same red-team suite. PlanPreviewOverlay(null).render(20) truncates the one-line action bar to 'Approve and exec…'.",
+      "source": "packages/coding-agent/src/modes/components/plan-preview-overlay.ts:63-65",
+      "expected": "The explicit empty state exposes all four actions at minimum supported width.",
+      "actual": "All actions are joined into a single line before truncation, so compact/keep/refine are invisible."
+    },
+    {
+      "id": "WS4-RT-004",
+      "severity": "medium",
+      "title": "Stale review with freeform notes but no line comments is not reconfirmed",
+      "repro": "Open a plan review, enter notes without a line comment, modify plan.md before selecting a decision. In handlePlanApproval, staleComments is true but the warning/reopen branch is skipped because review.comments.length is zero.",
+      "source": "packages/coding-agent/src/modes/interactive-mode.ts:2157-2164",
+      "expected": "Any stale snapshot invalidates review guidance and reopens confirmation, including notes-only review.",
+      "actual": "The stale guard only handles nonempty line-comment arrays; notes continue into the decision against changed content."
+    }
+  ]
+}

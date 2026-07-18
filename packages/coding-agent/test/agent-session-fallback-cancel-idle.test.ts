@@ -44,6 +44,37 @@ function failingStream(model: Model): AssistantMessageEventStream {
 	return stream;
 }
 
+function typedOpaqueOverflowStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage & {
+			transportFailure: { kind: "transport"; status: number; openaiErrorCode: string };
+		} = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "",
+			errorStatus: 400,
+			timestamp: Date.now(),
+			transportFailure: { kind: "transport", status: 400, openaiErrorCode: "context_length_exceeded" },
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+
 describe("AgentSession managed fallback cancellation completion", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
@@ -194,5 +225,38 @@ describe("AgentSession managed fallback cancellation completion", () => {
 		expect(session!.isStreaming).toBe(false);
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(events.find(event => event.type === "agent_end")).toMatchObject({ stopReason: "cancelled" });
+	});
+
+	it("abandons the overflow-maintenance handoff before any continuation provider call", async () => {
+		const calls: string[] = [];
+		createSession((model, _context, _options) => {
+			calls.push(selector(model));
+			return typedOpaqueOverflowStream(model);
+		});
+		session!.settings.set("compaction.enabled", true);
+		const compactionStarted = Promise.withResolvers<void>();
+		const events: AgentSessionEvent[] = [];
+		let abort: Promise<void> | undefined;
+		session!.subscribe(event => {
+			events.push(event);
+			if (event.type === "auto_compaction_start" && event.reason === "overflow") {
+				compactionStarted.resolve();
+				abort ??= session!.abort();
+			}
+		});
+
+		const run = session!.prompt("abort overflow maintenance");
+		await compactionStarted.promise;
+		await abort;
+		await run;
+		await session!.waitForIdle();
+
+		expect(calls).toHaveLength(1);
+		expect(session!.isStreaming).toBe(false);
+		expect(session!.isRetrying).toBe(false);
+		expect(events.filter(event => event.type === "agent_end")).toEqual([
+			expect.objectContaining({ stopReason: "cancelled" }),
+		]);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
 	});
 });

@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import { type Component, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { formatCount, getProjectDir } from "@gajae-code/utils";
 import { $ } from "bun";
+import type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
+import { KEYBINDINGS } from "../../config/keybindings";
 import { settings } from "../../config/settings";
 import type { StatusLinePreset, StatusLineSegmentId, StatusLineSeparatorStyle } from "../../config/settings-schema";
 import { theme } from "../../modes/theme/theme";
@@ -10,6 +12,7 @@ import type { AgentSession } from "../../session/agent-session";
 import { readVisibleSkillActiveState, type SkillActiveEntry } from "../../skill-state/active-state";
 import * as git from "../../utils/git";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../utils/session-color";
+import type { ActionRegistry, FocusDomain } from "../action-registry";
 import { EMPTY_JOBS_SNAPSHOT, type JobsSnapshot } from "../jobs-observer";
 import { sanitizeStatusText } from "../shared";
 import { renderSkillHudBar } from "./skill-hud/render";
@@ -49,6 +52,69 @@ export interface StatusLineSettings {
 
 export interface StatusLineComponentOptions {
 	version?: string;
+	actionRegistry?: ActionRegistry<void>;
+	getKeybindings?: () => KeybindingsManager;
+	focusDomain?: FocusDomain;
+}
+
+export interface StatusLineActionHint {
+	id: AppKeybinding;
+	content: string;
+}
+
+const ACTION_HINT_PRIORITY: readonly AppKeybinding[] = [
+	"app.message.sendNow",
+	"app.message.queue",
+	"app.message.followUp",
+	"app.message.dequeue",
+	"app.commandPalette.open",
+	"app.plan.toggle",
+	"app.mode.cycle",
+	"app.thinking.cycle",
+	"app.model.select",
+	"app.model.cycleForward",
+	"app.history.search",
+	"app.session.togglePath",
+	"app.session.toggleSort",
+	"app.session.rename",
+	"app.session.delete",
+	"app.tree.foldOrUp",
+	"app.tree.unfoldOrDown",
+];
+
+/**
+ * Produces whole, bound action hints for the current focus domain. The registry
+ * remains the authority for availability; KEYBINDINGS remains the authority for
+ * whether an action has a binding and the active manager supplies overrides.
+ */
+export function getAvailableActionHints(
+	actionRegistry: ActionRegistry<void> | undefined,
+	getKeybindings: (() => KeybindingsManager) | undefined,
+	width: number,
+	domain: FocusDomain = "composer",
+): StatusLineActionHint[] {
+	if (!actionRegistry || !getKeybindings || width <= 0) return [];
+	const keybindings = getKeybindings();
+	const available = actionRegistry.all().filter(action => actionRegistry.isAvailable(action.id));
+
+	const byId = new Map(available.map(action => [action.id, action]));
+	const candidates = ACTION_HINT_PRIORITY.map(id => byId.get(id))
+		.filter((action): action is NonNullable<typeof action> => action !== undefined)
+		.filter(action => action.domains.includes(domain));
+	const selected: StatusLineActionHint[] = [];
+	let used = 0;
+	for (const action of candidates) {
+		const bindingId = action.bindingId ?? action.id;
+		if (!(bindingId in KEYBINDINGS)) continue;
+		const keys = keybindings.getKeys(bindingId);
+		if (keys.length === 0) continue;
+		const content = theme.fg("dim", keybindings.getDisplayString(bindingId)) + theme.fg("muted", ` ${action.title}`);
+		const nextWidth = visibleWidth(content) + (selected.length === 0 ? 0 : 3);
+		if (used + nextWidth > width) break;
+		selected.push({ id: action.id, content });
+		used += nextWidth;
+	}
+	return selected;
 }
 
 interface CollectedStatusSegments {
@@ -91,6 +157,10 @@ export class StatusLineComponent implements Component {
 	#skillHudLastFetch = 0;
 	#skillHudInFlight = false;
 	#version: string | undefined;
+	#actionRegistry: ActionRegistry<void> | undefined;
+	#getKeybindings: (() => KeybindingsManager) | undefined;
+	#focusDomain: FocusDomain;
+
 	#resolvedSettingsCache:
 		| (Required<Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">> &
 				StatusLineSettings)
@@ -134,10 +204,25 @@ export class StatusLineComponent implements Component {
 			maxRows: settings.get("statusLine.maxRows"),
 		};
 		this.#version = options.version?.trim() || undefined;
+		this.#actionRegistry = options.actionRegistry;
+		this.#getKeybindings = options.getKeybindings;
+		this.#focusDomain = options.focusDomain ?? "composer";
 	}
 
 	updateSettings(settings: StatusLineSettings): void {
 		this.#settings = { ...this.#settings, previewHighlightSegment: undefined, ...settings };
+	}
+
+	setActionRegistry(actionRegistry: ActionRegistry<void>, getKeybindings: () => KeybindingsManager): void {
+		this.#actionRegistry = actionRegistry;
+		this.#getKeybindings = getKeybindings;
+		this.#renderedRowsCache = undefined;
+	}
+
+	setFocusDomain(domain: FocusDomain): void {
+		if (this.#focusDomain === domain) return;
+		this.#focusDomain = domain;
+		this.#renderedRowsCache = undefined;
 	}
 
 	setAutoCompactEnabled(enabled: boolean): void {
@@ -706,12 +791,14 @@ export class StatusLineComponent implements Component {
 		}
 
 		const right: string[] = [];
+		const actionHints = getAvailableActionHints(this.#actionRegistry, this.#getKeybindings, width, this.#focusDomain);
 		for (const segId of effectiveSettings.rightSegments) {
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
 				right.push(highlightSegment(segId, rendered.content));
 			}
 		}
+		right.push(...actionHints.map(hint => hint.content));
 
 		const runningBackgroundJobs =
 			this.session.getAsyncJobSnapshot()?.running.filter(job => job.metadata?.monitor !== true).length ?? 0;

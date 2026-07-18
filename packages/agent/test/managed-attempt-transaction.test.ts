@@ -232,6 +232,54 @@ describe("managed attempt transaction", () => {
 		expect(events.at(-1)).toBe("agent_end");
 	});
 
+	it("classifies an opaque typed OpenAI overflow as discarded maintenance without leaking a lifecycle", async () => {
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: async () => {
+				throw Object.assign(new Error(""), {
+					transportFailure: { kind: "transport", status: 400, openaiErrorCode: "context_length_exceeded" },
+				});
+			},
+		});
+		const events: AgentEvent[] = [];
+		const outcomes: ManagedAttemptOutcome[] = [];
+		let maintenanceRuns = 0;
+		agent.subscribe(event => events.push(event));
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				return {
+					type: "maintenance",
+					continuation: () => {
+						maintenanceRuns += 1;
+					},
+				};
+			},
+		});
+
+		expect(outcomes).toEqual([
+			expect.objectContaining({
+				type: "context_overflow_discarded",
+				message: expect.objectContaining({ errorMessage: "" }),
+			}),
+		]);
+		expect(maintenanceRuns).toBe(1);
+		expect(
+			events.filter(
+				event =>
+					event.type === "message_update" ||
+					((event.type === "message_start" || event.type === "message_end") &&
+						event.message.role === "assistant") ||
+					event.type === "turn_end" ||
+					event.type === "agent_end",
+			),
+		).toEqual([]);
+		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(0);
+	});
+
 	it("discards retryable managed failures before any assistant lifecycle escapes", async () => {
 		const mock = createMockModel();
 		const streamFn = async () => {
@@ -259,7 +307,11 @@ describe("managed attempt transaction", () => {
 			fallbackManaged: true,
 			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
 				outcomes.push(
-					outcome.type === "retryable_discarded" ? (outcome.failure.message.errorMessage ?? "") : outcome.reason,
+					outcome.type === "run_terminal"
+						? outcome.reason
+						: outcome.type === "retryable_discarded"
+							? (outcome.failure.message.errorMessage ?? "")
+							: (outcome.message.errorMessage ?? ""),
 				);
 				return { type: "retry", continuation: () => {} };
 			},
@@ -339,7 +391,11 @@ describe("managed attempt transaction", () => {
 			fallbackManaged: true,
 			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
 				outcomes.push(
-					outcome.type === "retryable_discarded" ? (outcome.failure.message.errorMessage ?? "") : outcome.reason,
+					outcome.type === "run_terminal"
+						? outcome.reason
+						: outcome.type === "retryable_discarded"
+							? (outcome.failure.message.errorMessage ?? "")
+							: (outcome.message.errorMessage ?? ""),
 				);
 				if (outcome.type === "retryable_discarded") facts.push(outcome.failure.transportFailure);
 				return { type: "terminal", terminal: { stopReason: "exhausted" } };

@@ -104,6 +104,7 @@ export interface TruncationTextOptions {
 	totalLines?: number;
 	totalBytes?: number;
 	maxBytes?: number;
+	artifactId?: string;
 }
 
 /**
@@ -289,6 +290,7 @@ export class OutputMetaBuilder {
 			outputLines,
 			outputBytes,
 			maxBytes: options.maxBytes,
+			artifactId: options.artifactId,
 			shownRange: { start: shownStart, end: shownEnd },
 			nextOffset: options.direction === "head" ? shownEnd + 1 : undefined,
 		};

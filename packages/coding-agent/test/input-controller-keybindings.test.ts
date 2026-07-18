@@ -1,7 +1,9 @@
-import { beforeAll, describe, expect, it, vi } from "bun:test";
+import { beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+
 import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
 import { InputController } from "../src/modes/controllers/input-controller";
 import { initTheme } from "../src/modes/theme/theme";
@@ -175,6 +177,7 @@ async function createContext(options?: {
 			getQueuedMessageEntries,
 			removeQueuedMessageForEditing,
 			moveQueuedMessageForEditing,
+			getRoleModelCycleCandidateCount: vi.fn(() => 0),
 		} as unknown as InteractiveModeContext["session"],
 		keybindings: {
 			getKeys(action: string) {
@@ -249,6 +252,8 @@ async function createContext(options?: {
 		handleBashCommand,
 		showWarning: vi.fn(),
 		showStatus,
+		showError: vi.fn(),
+
 		hasActiveBtw: vi.fn(() => false),
 	} as unknown as InteractiveModeContext;
 
@@ -286,6 +291,55 @@ beforeAll(() => {
 });
 
 describe("InputController keybinding setup", () => {
+	it("reports model, streaming, and unfinished action availability", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			isStreaming: boolean;
+			model: { reasoning?: boolean } | undefined;
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		const controller = new InputController(ctx);
+
+		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.model.cycleForward")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.session.togglePath")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.transcript.browse")).toBe(false);
+
+		session.model = { reasoning: true };
+		session.getRoleModelCycleCandidateCount.mockReturnValue(2);
+		session.isStreaming = true;
+		await Promise.resolve();
+		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(true);
+		expect(controller.actionRegistry.isAvailable("app.model.cycleForward")).toBe(true);
+
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(true);
+	});
+
+	it("enables model cycling from configured role candidates without a model scope", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			scopedModels: unknown[];
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		session.scopedModels = [];
+		session.getRoleModelCycleCandidateCount.mockReturnValue(2);
+
+		expect(new InputController(ctx).actionRegistry.isAvailable("app.model.cycleForward")).toBe(true);
+	});
+
+	it("disables model cycling when a model scope has one cycleable candidate", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			scopedModels: unknown[];
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		session.scopedModels = [{}, {}];
+		session.getRoleModelCycleCandidateCount.mockReturnValue(1);
+
+		expect(new InputController(ctx).actionRegistry.isAvailable("app.model.cycleBackward")).toBe(false);
+	});
+
 	it("registers temporary and persisted model selector actions separately", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const controller = new InputController(ctx);
@@ -299,7 +353,9 @@ describe("InputController keybinding setup", () => {
 		expect(editor.onSelectModelTemporary).not.toBe(editor.onSelectModel);
 
 		editor.onSelectModelTemporary?.();
+		await Bun.sleep(0);
 		editor.onSelectModel?.();
+		await Bun.sleep(0);
 
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(1, { temporaryOnly: true });
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
@@ -440,8 +496,9 @@ describe("InputController keybinding setup", () => {
 
 	it("queues explicit message action during compaction", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
-		const session = ctx.session as unknown as { isCompacting: boolean };
+		const session = ctx.session as unknown as { isCompacting: boolean; isStreaming: boolean };
 		session.isCompacting = true;
+		session.isStreaming = true;
 		editor.setText("queue while compacting via shortcut");
 		const controller = new InputController(ctx);
 
