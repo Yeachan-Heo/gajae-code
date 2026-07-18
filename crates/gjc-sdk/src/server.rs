@@ -1576,7 +1576,7 @@ where
 		},
 		ClientMessage::EphemeralTurn(turn) => {
 			if tokens_match(&turn.token, &state.token) {
-				let canonical = ClientMessage::EphemeralTurn(turn.clone());
+				let canonical = ClientMessage::EphemeralTurn(turn);
 				let _ = state.inbound_tx.send(canonical.clone());
 				if let Ok(frame) = serde_json::to_string(&canonical) {
 					let _ = state.frame_tx.send((connection_id.to_owned(), frame));
@@ -1586,7 +1586,7 @@ where
 		},
 		ClientMessage::EphemeralTurnCancel(cancel) => {
 			if tokens_match(&cancel.token, &state.token) {
-				let canonical = ClientMessage::EphemeralTurnCancel(cancel.clone());
+				let canonical = ClientMessage::EphemeralTurnCancel(cancel);
 				let _ = state.inbound_tx.send(canonical.clone());
 				if let Ok(frame) = serde_json::to_string(&canonical) {
 					let _ = state.frame_tx.send((connection_id.to_owned(), frame));

@@ -839,8 +839,7 @@ fn validate_thread_id(value: &str) -> Result<(), &'static str> {
 		|| value
 			.parse::<i64>()
 			.ok()
-			.filter(|id| (1..=MAX_SAFE_INTEGER).contains(id))
-			.is_none()
+			.is_none_or(|id| !(1..=MAX_SAFE_INTEGER).contains(&id))
 	{
 		return Err("threadId must be a positive decimal safe-integer string");
 	}
@@ -958,7 +957,7 @@ struct RawEphemeralTurnResult {
 	text:       Option<String>,
 }
 
-fn validate_ephemeral_turn_result(
+const fn validate_ephemeral_turn_result(
 	status: EphemeralTurnStatus,
 	text: Option<&str>,
 ) -> Result<(), &'static str> {
