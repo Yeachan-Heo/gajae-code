@@ -244,6 +244,7 @@ import {
 import {
 	persistCoordinatorRuntimeStateFromEvent,
 	registerCoordinatorRuntimeStateFinalizer,
+	runtimeStateFileForContext,
 } from "../gjc-runtime/session-state-sidecar";
 import { writeArtifact } from "../gjc-runtime/state-writer";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
@@ -2782,13 +2783,24 @@ export class AgentSession {
 	};
 
 	#persistRuntimeStateInBackground(event: AgentSessionEvent): void {
-		void persistCoordinatorRuntimeStateFromEvent(event, {
+		const context = {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
-		}).catch(() => {
-			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
-		});
+		};
+		let stateFile: string | null = null;
+		void Promise.resolve()
+			.then(async () => {
+				stateFile = runtimeStateFileForContext(context);
+				await persistCoordinatorRuntimeStateFromEvent(event, context);
+			})
+			.catch(error => {
+				logger.warn("Failed to persist coordinator runtime state", {
+					event: event.type,
+					error: String(error),
+					stateFile,
+				});
+			});
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {

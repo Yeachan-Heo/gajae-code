@@ -535,7 +535,7 @@ function assertPreviousRuntimeStateIdentity(previous: Record<string, unknown>, i
 		throw new PreviousRuntimeStateReadError();
 }
 
-function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
+export function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
 	const explicit = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	if (explicit) return explicit;
 	if (!context.sessionId.trim()) return null;

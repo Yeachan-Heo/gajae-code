@@ -347,7 +347,15 @@ describe("AgentSession active goal reminders", () => {
 					throw new Error("Timed out waiting for coordinator runtime-state failure containment");
 				}),
 			]);
-			expect(warnSpy).toHaveBeenCalledWith("Failed to persist coordinator runtime state", { event: "turn_start" });
+			expect(warnSpy).toHaveBeenCalledWith(
+				"Failed to persist coordinator runtime state",
+				expect.objectContaining({
+					error: expect.stringContaining("Existing runtime state marker is invalid or unreadable"),
+					event: "turn_start",
+					stateFile,
+				}),
+			);
+			expect(JSON.stringify(warnSpy.mock.calls)).not.toContain("private_payload");
 		} finally {
 			if (previousStateFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 			else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = previousStateFile;
