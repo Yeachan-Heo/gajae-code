@@ -3,7 +3,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
-import { onAppendOnlyModeChanged, resetSettingsForTest, SETTINGS_SCHEMA, Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	onAppendOnlyModeChanged,
+	resetSettingsForTest,
+	SETTINGS_SCHEMA,
+	Settings,
+} from "@gajae-code/coding-agent/config/settings";
 import { getCustomThemesDir, getProjectAgentDir, logger, Snowflake } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { withFileLock } from "../src/config/file-lock";
@@ -585,10 +590,11 @@ describe("Settings", () => {
 		it("silently ignores a legacy tasks.todoClearDelay key in config.yml", async () => {
 			await writeSettings({ tasks: { todoClearDelay: 60 } });
 
-			// Loading must not throw; the orphan key is preserved but never read.
+			// Loading and subsequent supported writes must preserve the orphan key.
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("defaultThinkingLevel", Effort.High);
+			await settings.flushOrThrow();
 
-			// The orphan key survives in the raw config but has no runtime effect.
 			const raw = await readSettings();
 			expect((raw.tasks as { todoClearDelay?: unknown } | undefined)?.todoClearDelay).toBe(60);
 		});

@@ -8164,11 +8164,11 @@ export class AgentSession {
 
 	// Auto-clear of completed/abandoned tasks was removed: the timer-driven
 	// splice mutated canonical `#todoPhases` between tool calls, so the model
-	// observed phase totals shrinking ("5 → 4") after marking tasks done. The
-	// `tasks.todoClearDelay` setting has been removed from the settings schema;
-	// completed tasks survive until the next explicit `todo_write` call removes
-	// them via `rm`/`drop`. A leftover `tasks.todoClearDelay` key in a user's
-	// config.yml is silently ignored (unknown keys are preserved, never read).
+	// observed phase totals shrinking ("5 → 4") after marking tasks done.
+	// Branch resynchronization still intentionally filters completed/abandoned
+	// tasks when compaction or session-history transitions rebuild this state.
+	// A leftover `tasks.todoClearDelay` key in a user's config.yml is silently
+	// ignored (unknown keys are preserved, never read).
 
 	#abortOptions(options?: {
 		goalReason?: "interrupted" | "internal";
