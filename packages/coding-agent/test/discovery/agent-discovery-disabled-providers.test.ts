@@ -6,7 +6,14 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { disableProvider, enableProvider, initializeWithSettings, isProviderEnabled } from "../../src/capability";
+import {
+	disableProvider,
+	enableProvider,
+	getDisabledProviders,
+	initializeWithSettings,
+	isProviderEnabled,
+	setDisabledProviders,
+} from "../../src/capability";
 import { clearCache as clearFsCache } from "../../src/capability/fs";
 import { resetSettingsForTest, Settings } from "../../src/config/settings";
 import { clearClaudePluginRootsCache } from "../../src/discovery/helpers";
@@ -91,6 +98,9 @@ describe("discoverAgents — claude-plugins disabled provider", () => {
 
 			expect(() => enableProvider("already-disabled")).toThrow("Repair config.yml");
 			expect(isProviderEnabled("already-disabled")).toBe(false);
+
+			expect(() => setDisabledProviders(["replacement"])).toThrow("Repair config.yml");
+			expect(getDisabledProviders()).toEqual(["already-disabled"]);
 		} finally {
 			canWrite.mockRestore();
 			initializeWithSettings(writableSettings);
