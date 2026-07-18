@@ -53,6 +53,9 @@
 - Connected MCP server instructions now remain untrusted user-role data instead of entering the cached system prompt; hostile file paths, working directories, and workspace-tree metadata are structurally encoded, and volatile project context is removed from durable session history between requests.
 - Restored the strict G002 public-surface quarantine by removing the default README advertisement for the private coordinator MCP runtime.
 
+### Fixed
+- Non-TTY launches now fail fast when stdin is empty and automatically use print mode for positional prompts and `@file` inputs, preventing orphaned interactive TUI processes (#2507).
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

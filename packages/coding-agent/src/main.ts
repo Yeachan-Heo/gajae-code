@@ -23,6 +23,7 @@ import chalk from "chalk";
 import type { Args } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
+import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
 import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
@@ -282,7 +283,7 @@ export function resolveAcpStartupOptions(
 }
 
 async function readPipedInput(): Promise<string | undefined> {
-	if (process.stdin.isTTY !== false) return undefined;
+	if (process.stdin.isTTY === true) return undefined;
 	try {
 		const text = await Bun.stdin.text();
 		if (text.trim().length === 0) return undefined;
@@ -1180,14 +1181,25 @@ export async function runRootCommand(
 		fileImages,
 		stdinContent: pipedInput,
 	});
-	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
+	const disposition = resolveLaunchDisposition({
+		stdinIsTTY: process.stdin.isTTY,
+		pipedInput,
+		hasPreparedInput: parsedArgs.messages.length > 0 || parsedArgs.fileArgs.length > 0,
+		print: Boolean(parsedArgs.print),
+		mode: parsedArgs.mode,
+	});
+	if (disposition.nonInteractiveError) {
+		process.stderr.write(`${chalk.red(disposition.nonInteractiveError)}\n`);
+		process.exit(1);
+	}
+	const autoPrint = disposition.autoPrint;
 	const startupUpdateRoute = classifyStartupUpdateRoute(parsedArgs, autoPrint);
 	const startupUpdate = new StartupUpdateOrchestrator(
 		startupUpdateRoute,
 		() => settingsInstance.get("startup.checkUpdate"),
 		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION)),
 	);
-	const isInteractive = startupUpdateRoute === "interactive";
+	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
 
 	// Initialize discovery system with settings for provider persistence
