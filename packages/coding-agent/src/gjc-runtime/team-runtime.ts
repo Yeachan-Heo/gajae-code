@@ -2999,10 +2999,18 @@ async function continueStalledGjcTeamWorkers(
 				candidate.assignee === worker.id &&
 				candidate.owner === worker.id,
 		);
-		const claimRecords = await Promise.all(
-			(await fs.readdir(path.join(dir, "claims"), { withFileTypes: true }))
+		const claimsDir = path.join(dir, "claims");
+		let claimNames: string[];
+		try {
+			claimNames = (await fs.readdir(claimsDir, { withFileTypes: true }))
 				.filter(entry => entry.isFile() && entry.name.endsWith(".json"))
-				.map(entry => readContinuationJson<GjcTeamTaskClaim>(path.join(dir, "claims", entry.name))),
+				.map(entry => entry.name);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			claimNames = [];
+		}
+		const claimRecords = await Promise.all(
+			claimNames.map(name => readContinuationJson<GjcTeamTaskClaim>(path.join(claimsDir, name))),
 		);
 		const workerClaims = claimRecords.filter((claim): claim is GjcTeamTaskClaim => claim?.owner === worker.id);
 		if (claimedTasks.length !== 1 || workerClaims.length !== 1) {

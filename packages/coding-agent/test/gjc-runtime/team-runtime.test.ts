@@ -3302,6 +3302,53 @@ describe("stalled worker continuation protocol", () => {
 		await Bun.write(path.join(fixture.stateDir, "tasks", "task-1.json"), `${JSON.stringify({ ...task, claim })}\n`);
 		await Bun.write(path.join(fixture.stateDir, "claims", "task-1.json"), `${JSON.stringify(claim)}\n`);
 	}
+	it("treats a missing claims directory as zero canonical claims before the first claim", async () => {
+		cleanupRoot = await createGitRepo();
+		const nowMs = Date.now();
+		const dispatches: string[][] = [];
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: () => nowMs,
+			continuationTmuxDispatch: (_command, args) => {
+				dispatches.push([...args]);
+				return { exitCode: 0 };
+			},
+		});
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const env = {
+			GJC_SESSION_ID: TEST_SESSION_ID,
+			PATH: process.env.PATH ?? "",
+			GJC_TEAM_WORKER_COMMAND: "true",
+			GJC_TEAM_TMUX_COMMAND: fakeTmux,
+			GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS: "1",
+			GJC_TEAM_HEARTBEAT_STALE_MS: "1000",
+		};
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Pending before first claim",
+			teamName: "continuation-before-first-claim-team",
+			cwd: cleanupRoot,
+			env,
+		});
+		await Bun.write(
+			path.join(snapshot.state_dir, "workers", "worker-1", "lifecycle.json"),
+			`${JSON.stringify({ worker: "worker-1", lifecycle_state: "working", worker_status_state: "working", updated_at: new Date(nowMs).toISOString() })}\n`,
+		);
+		await writeWorkerStatus(snapshot.state_dir, "worker-1", "working");
+		await Bun.write(
+			path.join(snapshot.state_dir, "workers", "worker-1", "heartbeat.json"),
+			`${JSON.stringify({ pid: 1, last_turn_at: new Date(nowMs - 1_001).toISOString(), turn_count: 1, alive: true })}\n`,
+		);
+		await expect(fs.access(path.join(snapshot.state_dir, "claims"))).rejects.toMatchObject({ code: "ENOENT" });
+
+		await monitorGjcTeam("continuation-before-first-claim-team", cleanupRoot, env);
+
+		expect(dispatches).toHaveLength(0);
+		const task = await readGjcTeamTask("continuation-before-first-claim-team", "task-1", cleanupRoot, env);
+		expect(task.status).toBe("pending");
+		expect(task.claim).toBeUndefined();
+		expect(await readEvents(snapshot.state_dir)).toContain('"reason":"invalid_claim_count"');
+	});
 
 	it("revokes escaped task mutation capabilities after their fenced callback", async () => {
 		const fixture = await prepareContinuation("continuation-capability-team");
