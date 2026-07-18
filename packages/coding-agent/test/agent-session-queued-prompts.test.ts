@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
@@ -62,7 +62,10 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		await removeTempDirWithRetry(tempDir);
 	});
 
-	function buildSession(responses: MockHandler[]): AgentSession {
+	function buildSession(
+		responses: MockHandler[],
+		settings = Settings.isolated({ "compaction.enabled": false }),
+	): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
 		const mock = createMockModel({ responses });
@@ -71,7 +74,6 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: mock.stream,
 		});
-		const settings = Settings.isolated({ "compaction.enabled": false });
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
 	}
@@ -102,6 +104,34 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		}
 	}
 
+	it("rejects persisted queue modes before changing the live agent", () => {
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			steeringMode: "one-at-a-time",
+			followUpMode: "one-at-a-time",
+			interruptMode: "immediate",
+		});
+		session = buildSession([], settings);
+		const canWrite = spyOn(settings, "canWriteDurableConfig").mockReturnValue(false);
+		const set = spyOn(settings, "set");
+
+		try {
+			expect(() => session!.setSteeringMode("all")).toThrow("Repair config.yml");
+			expect(() => session!.setFollowUpMode("all")).toThrow("Repair config.yml");
+			expect(() => session!.setInterruptMode("wait")).toThrow("Repair config.yml");
+
+			expect(session.agent.getSteeringMode()).toBe("one-at-a-time");
+			expect(session.agent.getFollowUpMode()).toBe("one-at-a-time");
+			expect(session.agent.getInterruptMode()).toBe("immediate");
+			expect(settings.getGlobal("steeringMode")).toBe("one-at-a-time");
+			expect(settings.getGlobal("followUpMode")).toBe("one-at-a-time");
+			expect(settings.getGlobal("interruptMode")).toBe("immediate");
+			expect(set).not.toHaveBeenCalled();
+		} finally {
+			canWrite.mockRestore();
+			set.mockRestore();
+		}
+	});
 	it("runs prompts queued while busy after the active turn, in submission order", async () => {
 		const gate = Promise.withResolvers<void>();
 		session = buildSession([

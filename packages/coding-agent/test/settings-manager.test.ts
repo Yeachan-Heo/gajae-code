@@ -668,6 +668,28 @@ describe("Settings", () => {
 			settings.getStorage()?.close();
 		}
 	});
+	it("serializes failed-save recovery behind a later reserved save", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		let queuedNewestSave = false;
+		const warning = vi.spyOn(logger, "warn").mockImplementation(message => {
+			if (message !== "Settings: background save failed" || queuedNewestSave) return;
+			queuedNewestSave = true;
+			fs.writeFileSync(getConfigPath(), YAML.stringify({ theme: { dark: "red-claw" } }, null, 2));
+			settings.set("theme.dark", "red-claw");
+		});
+		try {
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await expect(settings.flushOrThrow()).rejects.toThrow();
+
+			expect(queuedNewestSave).toBe(true);
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			expect((await readSettings()).theme).toEqual({ dark: "red-claw" });
+		} finally {
+			warning.mockRestore();
+			settings.getStorage()?.close();
+		}
+	});
 
 	it("keeps malformed global recovery and notification state in cwd clones", async () => {
 		const malformed = "notifications: [";
@@ -687,7 +709,7 @@ describe("Settings", () => {
 			source.getStorage()?.close();
 		}
 	});
-	it("preserves retained dirty patches in recovered cwd clones", async () => {
+	it("keeps the source as the sole owner of retained patches in recovered cwd clones", async () => {
 		const clonedCwd = path.join(testDir, "cloned-project");
 		fs.mkdirSync(clonedCwd, { recursive: true });
 		const source = await Settings.init({ cwd: projectDir, agentDir });
@@ -701,9 +723,12 @@ describe("Settings", () => {
 			expect(cloned.get("theme.dark")).toBe("blue-crab");
 
 			await Bun.write(getConfigPath(), "");
-			await cloned.flushOrThrow();
-
+			await source.flushOrThrow();
 			expect((await readSettings()).theme).toEqual({ dark: "blue-crab" });
+
+			await Bun.write(getConfigPath(), YAML.stringify({ theme: { dark: "red-claw" } }, null, 2));
+			await cloned.flushOrThrow();
+			expect((await readSettings()).theme).toEqual({ dark: "red-claw" });
 		} finally {
 			source.getStorage()?.close();
 		}

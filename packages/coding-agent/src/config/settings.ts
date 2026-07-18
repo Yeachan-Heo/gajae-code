@@ -42,6 +42,7 @@ import {
 	atomicYamlPathHash,
 	type CasReceipt,
 	deleteByPath,
+	enqueueAtomicYamlOperation,
 	reserveAtomicYamlUpdateSlot,
 	setByPath,
 } from "./atomic-yaml-patch";
@@ -892,13 +893,12 @@ export class Settings implements NotificationSettingsReader {
 		cloned.#rawNotificationConfig = structuredClone(this.#rawNotificationConfig);
 		cloned.#durableRawNotificationConfig = structuredClone(this.#durableRawNotificationConfig);
 		cloned.#durableNotificationFingerprint = this.#durableNotificationFingerprint;
-		cloned.#modified = new Map([...this.#modified].map(([key, patch]) => [key, structuredClone(patch)]));
-		cloned.#nextGeneration = this.#nextGeneration;
-		cloned.#pathRevisions = structuredClone(this.#pathRevisions);
-		cloned.#nextRevision = this.#nextRevision;
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#overrides = structuredClone(this.#overrides);
-		await cloned.#normalizeAfterLoad();
+		if (cloned.#hasRecoveredConfigSyntax) {
+			cloned.#sanitizeModelSelectorRecords();
+			cloned.#rebuildMerged();
+		} else await cloned.#normalizeAfterLoad();
 		cloned.#fireAllHooks();
 		return cloned;
 	}
@@ -1808,10 +1808,12 @@ export class Settings implements NotificationSettingsReader {
 
 	async #refreshDurableSettings(): Promise<void> {
 		if (!this.#persist || !this.#configPath) return;
-		const previousFingerprint = this.#durableNotificationFingerprint;
-		const current = await this.#loadYaml(this.#configPath);
-		if (previousFingerprint !== this.#durableNotificationFingerprint) this.#notificationValidationGeneration++;
-		this.#replaceGlobalWithDurable(current);
+		await enqueueAtomicYamlOperation(this.#configPath, async canonicalPath => {
+			const previousFingerprint = this.#durableNotificationFingerprint;
+			const current = await this.#loadYaml(canonicalPath);
+			if (previousFingerprint !== this.#durableNotificationFingerprint) this.#notificationValidationGeneration++;
+			this.#replaceGlobalWithDurable(current);
+		});
 	}
 	#assertDurableConfigWritable(): void {
 		if (this.canWriteDurableConfig()) return;

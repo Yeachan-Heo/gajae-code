@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
@@ -180,5 +180,235 @@ describe("issue #775: per-model defaultLevel", () => {
 		expect(session.thinkingLevel).toBe(settings.get("defaultThinkingLevel"));
 		expect(session.getThinkingScopeForControl()).toBe("global config");
 		expect(session.sessionManager.buildSessionContext().thinkingLevel).toBe(ThinkingLevel.Inherit);
+	});
+	it("keeps a newer session thinking level when a global control commit finishes", async () => {
+		const settings = Settings.isolated({ defaultThinkingLevel: Effort.Low });
+		await createSession(getSonnet(), settings);
+		const commitStarted = Promise.withResolvers<void>();
+		const releaseCommit = Promise.withResolvers<void>();
+		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
+			commitStarted.resolve();
+			await releaseCommit.promise;
+			return commitAtomicBatch(changes);
+		});
+		const events: string[] = [];
+		const unsubscribe = session.subscribe(event => events.push(event.type));
+
+		try {
+			const persistentControl = session.setThinkingLevelForControl(Effort.Medium, true);
+			await commitStarted.promise;
+			await session.setThinkingLevelForControl(Effort.Low, false);
+			const historyAfterNewerControl = structuredClone(session.sessionManager.getBranch());
+
+			releaseCommit.resolve();
+			await persistentControl;
+
+			expect(settings.getGlobal("defaultThinkingLevel")).toBe(Effort.Medium);
+			expect(session.thinkingLevel).toBe(Effort.Low);
+			expect(session.sessionManager.getBranch()).toEqual(historyAfterNewerControl);
+			expect(events).toEqual([]);
+		} finally {
+			unsubscribe();
+			commit.mockRestore();
+		}
+	});
+
+	it("keeps a newer session thinking visibility when a global control commit finishes", async () => {
+		const settings = Settings.isolated({ hideThinkingBlock: false });
+		await createSession(getSonnet(), settings);
+		session.setThinkingVisibility("hidden");
+		const history = structuredClone(session.sessionManager.getBranch());
+		const commitStarted = Promise.withResolvers<void>();
+		const releaseCommit = Promise.withResolvers<void>();
+		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
+			commitStarted.resolve();
+			await releaseCommit.promise;
+			return commitAtomicBatch(changes);
+		});
+
+		try {
+			const persistentControl = session.setThinkingVisibilityForControl("visible", true);
+			await commitStarted.promise;
+			session.setThinkingVisibility("hidden");
+
+			releaseCommit.resolve();
+			await persistentControl;
+
+			expect(settings.getGlobal("hideThinkingBlock")).toBe(false);
+			expect(session.getThinkingVisibility()).toBe("hidden");
+			expect(session.sessionManager.getBranch()).toEqual(history);
+		} finally {
+			commit.mockRestore();
+		}
+	});
+
+	it("lets the newest overlapping persistent thinking level own live promotion", async () => {
+		const settings = Settings.isolated({ defaultThinkingLevel: Effort.Low });
+		await createSession(getSonnet(), settings);
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const releaseSecond = Promise.withResolvers<void>();
+		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		let callCount = 0;
+		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
+			callCount++;
+			if (callCount === 1) {
+				firstStarted.resolve();
+				await releaseFirst.promise;
+			} else {
+				secondStarted.resolve();
+				await releaseSecond.promise;
+			}
+			return commitAtomicBatch(changes);
+		});
+		const events: string[] = [];
+		const unsubscribe = session.subscribe(event => events.push(event.type));
+
+		try {
+			const older = session.setThinkingLevelForControl(Effort.Medium, true);
+			await firstStarted.promise;
+			const newer = session.setThinkingLevelForControl(Effort.High, true);
+			await secondStarted.promise;
+
+			releaseFirst.resolve();
+			await older;
+			expect(session.thinkingLevel).toBe(Effort.Low);
+
+			releaseSecond.resolve();
+			await newer;
+
+			expect(settings.getGlobal("defaultThinkingLevel")).toBe(Effort.High);
+			expect(session.thinkingLevel).toBe(Effort.High);
+			expect(events).toEqual(["thinking_level_changed"]);
+			expect(session.getThinkingScopeForControl()).toBe("global config");
+		} finally {
+			unsubscribe();
+			commit.mockRestore();
+		}
+	});
+
+	it("lets the newest overlapping persistent visibility own live promotion", async () => {
+		const settings = Settings.isolated({ hideThinkingBlock: false });
+		await createSession(getSonnet(), settings);
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const releaseSecond = Promise.withResolvers<void>();
+		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		let callCount = 0;
+		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
+			callCount++;
+			if (callCount === 1) {
+				firstStarted.resolve();
+				await releaseFirst.promise;
+			} else {
+				secondStarted.resolve();
+				await releaseSecond.promise;
+			}
+			return commitAtomicBatch(changes);
+		});
+
+		try {
+			const older = session.setThinkingVisibilityForControl("hidden", true);
+			await firstStarted.promise;
+			const newer = session.setThinkingVisibilityForControl("visible", true);
+			await secondStarted.promise;
+
+			releaseFirst.resolve();
+			await older;
+			expect(session.getThinkingVisibility()).toBe("visible");
+
+			releaseSecond.resolve();
+			await newer;
+
+			expect(settings.getGlobal("hideThinkingBlock")).toBe(false);
+			expect(session.getThinkingVisibility()).toBe("visible");
+		} finally {
+			commit.mockRestore();
+		}
+	});
+	it("rejects durable thinking controls before mutating session state", async () => {
+		const sonnet = getSonnet();
+		const settings = Settings.isolated({
+			defaultThinkingLevel: Effort.Low,
+			hideThinkingBlock: false,
+		});
+		await createSession(sonnet, settings);
+		const canWrite = spyOn(settings, "canWriteDurableConfig").mockReturnValue(false);
+		const set = spyOn(settings, "set");
+		const history = structuredClone(session.sessionManager.getBranch());
+		const events: string[] = [];
+		const unsubscribe = session.subscribe(event => events.push(event.type));
+
+		try {
+			expect(() => session.setThinkingLevel(Effort.High, true)).toThrow("Repair config.yml");
+			await expect(session.setThinkingLevelForControl(Effort.High, true)).rejects.toThrow("Repair config.yml");
+			expect(() => session.setThinkingVisibility("hidden", true)).toThrow("Repair config.yml");
+			await expect(session.setThinkingVisibilityForControl("hidden", true)).rejects.toThrow("Repair config.yml");
+
+			expect(session.thinkingLevel).toBe(Effort.Low);
+			expect(session.getThinkingVisibility()).toBe("visible");
+			expect(session.sessionManager.getBranch()).toEqual(history);
+			expect(events).toEqual([]);
+			expect(settings.getGlobal("defaultThinkingLevel")).toBe(Effort.Low);
+			expect(settings.getGlobal("hideThinkingBlock")).toBe(false);
+			expect(set).not.toHaveBeenCalled();
+		} finally {
+			unsubscribe();
+			canWrite.mockRestore();
+			set.mockRestore();
+		}
+	});
+	it("leaves reasoning level state untouched when config corruption breaks the durable commit", async () => {
+		const agentDir = path.join(tempDir.path(), "agent");
+		const settings = await Settings.init({ cwd: tempDir.path(), agentDir });
+		await createSession(getSonnet(), settings);
+		const history = structuredClone(session.sessionManager.getBranch());
+		const settingsBefore = settings.getGlobal("defaultThinkingLevel");
+		const events: string[] = [];
+		const unsubscribe = session.subscribe(event => events.push(event.type));
+
+		try {
+			await Bun.write(path.join(agentDir, "config.yml"), "defaultThinkingLevel: [\n");
+
+			await expect(session.setThinkingLevelForControl(Effort.High, true)).rejects.toThrow(
+				"Unable to persist reasoning settings.",
+			);
+
+			expect(session.thinkingLevel).toBe(Effort.Low);
+			expect(session.sessionManager.getBranch()).toEqual(history);
+			expect(events).toEqual([]);
+			expect(settings.getGlobal("defaultThinkingLevel")).toBe(settingsBefore);
+		} finally {
+			unsubscribe();
+		}
+	});
+
+	it("leaves reasoning visibility state untouched when config corruption breaks the durable commit", async () => {
+		const agentDir = path.join(tempDir.path(), "agent");
+		const settings = await Settings.init({ cwd: tempDir.path(), agentDir });
+		await createSession(getSonnet(), settings);
+		const history = structuredClone(session.sessionManager.getBranch());
+		const settingsBefore = settings.getGlobal("hideThinkingBlock");
+		const events: string[] = [];
+		const unsubscribe = session.subscribe(event => events.push(event.type));
+
+		try {
+			await Bun.write(path.join(agentDir, "config.yml"), "hideThinkingBlock: [\n");
+
+			await expect(session.setThinkingVisibilityForControl("hidden", true)).rejects.toThrow(
+				"Unable to persist reasoning settings.",
+			);
+
+			expect(session.getThinkingVisibility()).toBe("visible");
+			expect(session.sessionManager.getBranch()).toEqual(history);
+			expect(events).toEqual([]);
+			expect(settings.getGlobal("hideThinkingBlock")).toBe(settingsBefore);
+		} finally {
+			unsubscribe();
+		}
 	});
 });
