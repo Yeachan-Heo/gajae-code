@@ -81,6 +81,7 @@ const DeepInterviewIntentItem = z
 const DeepInterviewIntentContract = z
 	.object({
 		items: z.array(DeepInterviewIntentItem).min(1).max(64),
+		confirmation_options: z.array(z.string().min(1).max(200)).min(1).max(5),
 	})
 	.strict();
 
@@ -144,15 +145,35 @@ const WorkflowGateMeta = z.object({
 	kind: z.enum(["question", "approval", "execution"]).describe("workflow gate kind"),
 });
 
-const QuestionItem = z.object({
-	id: z.string().describe("question id"),
-	question: z.string().describe("question text"),
-	options: z.array(OptionItem).describe("available options"),
-	multi: z.boolean().describe("allow multiple selections").optional(),
-	recommended: z.number().describe("recommended option index").optional(),
-	deepInterview: DeepInterviewMeta.describe("optional deep-interview round metadata").optional(),
-	workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
-});
+const QuestionItem = z
+	.object({
+		id: z.string().describe("question id"),
+		question: z.string().describe("question text"),
+		options: z.array(OptionItem).describe("available options"),
+		multi: z.boolean().describe("allow multiple selections").optional(),
+		recommended: z.number().describe("recommended option index").optional(),
+		deepInterview: DeepInterviewMeta.describe("optional deep-interview round metadata").optional(),
+		workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
+	})
+	.superRefine((value, context) => {
+		const labels = new Set(value.options.map(option => option.label));
+		for (const label of value.deepInterview?.intent_contract?.confirmation_options ?? []) {
+			if (!labels.has(label))
+				context.addIssue({
+					code: "custom",
+					message: "intent confirmation option must be displayed",
+					path: ["deepInterview", "intent_contract"],
+				});
+		}
+		for (const label of value.deepInterview?.intent_review?.approval_options ?? []) {
+			if (!labels.has(label))
+				context.addIssue({
+					code: "custom",
+					message: "intent approval option must be displayed",
+					path: ["deepInterview", "intent_review"],
+				});
+		}
+	});
 
 export const askSchema = z.object({
 	questions: z.array(QuestionItem).min(1).describe("questions to ask"),

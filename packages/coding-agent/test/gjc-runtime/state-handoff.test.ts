@@ -1,7 +1,12 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	createDeepInterviewIntentManifest,
+	reviewDeepInterviewIntent,
+} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import {
 	activeSnapshotPath,
 	modeStatePath,
@@ -204,6 +209,60 @@ describe("gjc state handoff", () => {
 			expect(callee?.active).toBe(true);
 			expect(callee?.current_phase).toBe("planner");
 			expect(callee?.handoff_from).toBe("deep-interview");
+		});
+	});
+
+	it("fails closed on missing or stale locked intent at shared handoff", async () => {
+		await withTempCwd(async cwd => {
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: WORKFLOW_STATE_VERSION,
+				active: true,
+				current_phase: "handoff",
+				state: { intent_contract_required: true, rounds: [] },
+			});
+			const missing = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(missing.status).toBe(2);
+			expect(missing.stderr).toContain("requires a locked Round 0 intent contract");
+		});
+
+		await withTempCwd(async cwd => {
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const answerHash = "a".repeat(64);
+			const items = [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }];
+			const contract = createDeepInterviewIntentManifest(items, { round: 0, answer_hash: answerHash });
+			const review = reviewDeepInterviewIntent(contract, items, {
+				status: "not_required",
+				supporting_substitutions: [],
+			});
+			const specPath = path.join(cwd, "intent-spec.md");
+			const content = "# Intent\nartifact:report\n";
+			await fs.writeFile(specPath, content, "utf-8");
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: WORKFLOW_STATE_VERSION,
+				active: true,
+				current_phase: "handoff",
+				spec_path: specPath,
+				spec_sha256: createHash("sha256").update(content).digest("hex"),
+				state: {
+					intent_contract_required: true,
+					intent_contract: contract,
+					intent_review: review,
+					rounds: [{ round: 0, answer_hash: answerHash }],
+				},
+			});
+			await fs.writeFile(specPath, `${content}tampered\n`, "utf-8");
+			const stale = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(stale.status).toBe(2);
+			expect(stale.stderr).toContain("spec hash mismatch");
 		});
 	});
 

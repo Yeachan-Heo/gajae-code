@@ -581,7 +581,15 @@ function intentIdsInSpec(content: string): string[] {
 function resolveLockedIntentReview(existing: unknown, content: string): DeepInterviewIntentReview | undefined {
 	const envelope = normalizeDeepInterviewEnvelope(existing);
 	const state = envelope.state;
-	if (!state || state.intent_contract === undefined) return undefined;
+	if (!state) return undefined;
+	if (state.intent_contract === undefined) {
+		if (state.intent_contract_required === true)
+			throw new DeepInterviewCommandError(
+				2,
+				"deep-interview locked intent blocks spec persistence: missing Round 0 intent contract",
+			);
+		return undefined;
+	}
 	const locked = state.intent_contract as DeepInterviewIntentManifest;
 	const observedIds = intentIdsInSpec(content);
 	const rounds = Array.isArray(state.rounds)
@@ -734,6 +742,7 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 		threshold_source: resolved.thresholdSource,
 		state: {
 			initial_idea: resolved.idea,
+			intent_contract_required: true,
 			rounds: [],
 			established_facts: [],
 			current_ambiguity: 1.0,

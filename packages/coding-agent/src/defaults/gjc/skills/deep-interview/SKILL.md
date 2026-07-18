@@ -259,7 +259,7 @@ Is that topology and locked intent right? Should any component or intent be adde
 
 Options should include contextually relevant choices such as **Looks right**, **Add/remove/merge components**, **Defer one or more components**, plus free-text, translated/localized according to `language.instruction` when present. This is the only pre-scoring question and preserves the one-question-per-round rule.
 
-The Round 0 `ask` call MUST include `deepInterview.round = 0`, `deepInterview.component = "review-topology"`, `deepInterview.dimension = "topology"`, and `deepInterview.intent_contract.items` containing the exact displayed locked-intent items. The runtime recorder canonicalizes and locks this contract against the accepted answer hash. Do not manually copy raw free text into intent evidence, and do not continue if this required recorder write fails.
+The Round 0 `ask` call MUST include `deepInterview.round = 0`, `deepInterview.component = "review-topology"`, `deepInterview.dimension = "topology"`, `deepInterview.intent_contract.items` containing the exact displayed locked-intent items, and `deepInterview.intent_contract.confirmation_options` listing only the displayed affirmative labels that lock the proposal (normally **Looks right**). The runtime recorder canonicalizes and locks this contract only when the user selects one of those labels; correction, deferral, free-text, and clarification answers never lock the pre-question proposal. Do not manually copy raw free text into intent evidence, and do not continue if this required recorder write fails.
 
 3. **Lock topology into state** after the answer. Store a normalized component list and confirmation timestamp:
 

@@ -340,6 +340,7 @@ describe("deep-interview structured metadata red-team", () => {
 		const base = { id: "intent-q", question: "Confirm intent", options: [{ label: "Confirm" }] };
 		const validContract = {
 			items: [{ id: "artifact:report", category: "artifact", statement: "Produce an audit report" }],
+			confirmation_options: ["Confirm"],
 		};
 		function parsed(contract: unknown, round = 0) {
 			return askSchema.safeParse({
@@ -415,6 +416,7 @@ describe("deep-interview structured metadata red-team", () => {
 			};
 			const question = (round: number, review: unknown) => ({
 				...base,
+				options: [{ label: "Approve reduction" }, { label: "Revise spec" }],
 				deepInterview: {
 					round,
 					component: "locked-intent",

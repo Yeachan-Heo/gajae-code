@@ -53,7 +53,7 @@ export interface DeepInterviewAnswerInput {
 	ambiguity?: number;
 	selectedOptions?: string[];
 	customInput?: string;
-	intent_contract?: { items: DeepInterviewIntentItem[] };
+	intent_contract?: { items: DeepInterviewIntentItem[]; confirmation_options: string[] };
 	intent_review?: {
 		observed_items: DeepInterviewIntentItem[];
 		supporting_substitutions: DeepInterviewIntentSubstitution[];
@@ -441,21 +441,26 @@ export async function appendOrMergeDeepInterviewRound(
 	if (input.intent_contract) {
 		if (input.round !== 0 || input.component !== "review-topology" || input.dimension !== "topology")
 			throw new Error("intent contract requires Round 0 topology metadata");
-		const contract = createDeepInterviewIntentManifest(input.intent_contract.items, {
-			round: 0,
-			answer_hash: shell.answer_hash,
-		});
-		const existingContract = inner.intent_contract;
-		if (existingContract !== undefined) {
-			assertDeepInterviewIntentManifest(existingContract);
-			if (
-				existingContract.digest !== contract.digest ||
-				existingContract.confirmation_answer_hash !== contract.confirmation_answer_hash
-			)
-				throw new Error("locked intent contract cannot be replaced");
-		} else {
-			inner.intent_contract = contract;
-			intentStateChanged = true;
+		const confirmed = (input.selectedOptions ?? []).some(option =>
+			input.intent_contract?.confirmation_options.includes(option),
+		);
+		if (confirmed) {
+			const contract = createDeepInterviewIntentManifest(input.intent_contract.items, {
+				round: 0,
+				answer_hash: shell.answer_hash,
+			});
+			const existingContract = inner.intent_contract;
+			if (existingContract !== undefined) {
+				assertDeepInterviewIntentManifest(existingContract);
+				if (
+					existingContract.digest !== contract.digest ||
+					existingContract.confirmation_answer_hash !== contract.confirmation_answer_hash
+				)
+					throw new Error("locked intent contract cannot be replaced");
+			} else {
+				inner.intent_contract = contract;
+				intentStateChanged = true;
+			}
 		}
 	}
 	if (input.intent_review) {

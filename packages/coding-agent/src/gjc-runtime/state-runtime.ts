@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
@@ -27,7 +28,13 @@ import {
 } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
-import { mergeDeepInterviewEnvelope, normalizeDeepInterviewEnvelope } from "./deep-interview-state";
+import {
+	assertDeepInterviewIntentManifest,
+	assertDeepInterviewIntentReview,
+	type DeepInterviewIntentManifest,
+	mergeDeepInterviewEnvelope,
+	normalizeDeepInterviewEnvelope,
+} from "./deep-interview-state";
 import { activeSnapshotPath, auditPath, modeStatePath, sessionStateDir } from "./session-layout";
 import {
 	resolveGjcSessionForRead,
@@ -1554,6 +1561,57 @@ async function handleClear(
 	);
 }
 
+const DEEP_INTERVIEW_INTENT_ID_RE = /(?:artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}/g;
+
+async function assertDeepInterviewHandoffReady(state: Record<string, unknown>): Promise<void> {
+	const envelope = normalizeDeepInterviewEnvelope(state);
+	const inner = envelope.state;
+	if (!inner) return;
+	if (inner.intent_contract === undefined) {
+		if (inner.intent_contract_required === true)
+			throw new StateCommandError(2, "deep-interview handoff requires a locked Round 0 intent contract");
+		return;
+	}
+	assertDeepInterviewIntentManifest(inner.intent_contract);
+	const specPath = typeof state.spec_path === "string" ? state.spec_path : undefined;
+	const expectedSha = typeof state.spec_sha256 === "string" ? state.spec_sha256 : undefined;
+	if (!specPath || !expectedSha)
+		throw new StateCommandError(2, "deep-interview handoff requires a persisted intent-validated spec");
+	let content: string;
+	try {
+		content = await fs.readFile(specPath, "utf-8");
+	} catch (error) {
+		throw new StateCommandError(
+			2,
+			`deep-interview handoff cannot read persisted spec: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (createHash("sha256").update(content).digest("hex") !== expectedSha)
+		throw new StateCommandError(2, "deep-interview handoff spec hash mismatch");
+	const observedIds = [...new Set(content.match(DEEP_INTERVIEW_INTENT_ID_RE) ?? [])].sort();
+	const rounds = Array.isArray(inner.rounds)
+		? inner.rounds
+				.filter(
+					(round): round is Record<string, unknown> =>
+						Boolean(round) && typeof round === "object" && !Array.isArray(round),
+				)
+				.map(round => ({ round: round.round, answer_hash: round.answer_hash }))
+		: [];
+	try {
+		assertDeepInterviewIntentReview(
+			inner.intent_review,
+			inner.intent_contract as DeepInterviewIntentManifest,
+			observedIds,
+			rounds,
+		);
+	} catch (error) {
+		throw new StateCommandError(
+			2,
+			`deep-interview handoff intent validation failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
 /**
  * `handoff` exists in two distinct roles:
  *   - As a verb: this CLI action, which atomically transitions caller→callee.
@@ -1742,6 +1800,7 @@ async function handleHandoffUnlocked(
 					unknown
 				>)
 			: migrateWorkflowState(existingCaller, caller).state;
+	if (caller === "deep-interview") await assertDeepInterviewHandoffReady(normalizedCaller);
 	const normalizedCallee =
 		callee === "deep-interview"
 			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCallee, callee).state) as Record<

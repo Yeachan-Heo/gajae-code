@@ -352,6 +352,17 @@ export function mergeDeepInterviewEnvelope(
 
 	const existingState = isPlainObject(normalizedExisting.state) ? normalizedExisting.state : {};
 	const incomingState = isPlainObject(normalizedIncoming.state) ? normalizedIncoming.state : {};
+	if (existingState.intent_contract !== undefined && Object.hasOwn(incomingState, "intent_contract")) {
+		assertDeepInterviewIntentManifest(existingState.intent_contract);
+		if (incomingState.intent_contract === null) throw new Error("locked intent contract cannot be deleted");
+		assertDeepInterviewIntentManifest(incomingState.intent_contract);
+		if (
+			incomingState.intent_contract.digest !== existingState.intent_contract.digest ||
+			incomingState.intent_contract.confirmation_answer_hash !==
+				existingState.intent_contract.confirmation_answer_hash
+		)
+			throw new Error("locked intent contract cannot be replaced");
+	}
 	const mergedState: Record<string, unknown> = { ...existingState };
 	for (const [key, value] of Object.entries(incomingState)) {
 		if (key === "rounds") continue;

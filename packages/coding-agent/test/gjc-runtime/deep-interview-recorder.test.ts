@@ -309,6 +309,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 				{ id: "surface:review", category: "surface" as const, statement: "Provide a reviewer surface" },
 				{ id: "artifact:report", category: "artifact" as const, statement: "Produce an audit report" },
 			],
+			confirmation_options: ["Confirm"],
 		};
 		const input = {
 			round: 0,
@@ -353,6 +354,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 					...input,
 					intent_contract: {
 						items: [{ id: "artifact:other", category: "artifact", statement: "Replace the report" }],
+						confirmation_options: ["Confirm"],
 					},
 				},
 				{ sessionId: TEST_SESSION_ID },
@@ -363,6 +365,45 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 				(item: { id: string }) => item.id,
 			),
 		).toEqual(["artifact:report", "surface:review"]);
+	});
+
+	it("does not lock a rejected Round-0 proposal before corrected confirmation", async () => {
+		const cwd = await tempDir();
+		const statePath = statePathFor(cwd);
+		const base = {
+			round: 0,
+			questionId: "intent-confirmation",
+			questionText: "Confirm locked intent",
+			component: "review-topology",
+			dimension: "topology",
+			intent_contract: {
+				items: [{ id: "artifact:draft", category: "artifact" as const, statement: "Draft artifact" }],
+				confirmation_options: ["Looks right"],
+			},
+		};
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{ ...base, selectedOptions: ["Add/remove/merge components"] },
+			{ sessionId: TEST_SESSION_ID },
+		);
+		let persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		expect(persisted.state.intent_contract).toBeUndefined();
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{
+				...base,
+				selectedOptions: ["Looks right"],
+				intent_contract: {
+					items: [{ id: "artifact:final", category: "artifact", statement: "Final artifact" }],
+					confirmation_options: ["Looks right"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		expect(persisted.state.intent_contract.items.map((item: { id: string }) => item.id)).toEqual(["artifact:final"]);
 	});
 
 	it("records approved reductions from answer labels with redacted evidence", async () => {
@@ -383,6 +424,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 						{ id: "artifact:report", category: "artifact", statement: "Produce a report" },
 						{ id: "surface:review", category: "surface", statement: "Provide review" },
 					],
+					confirmation_options: ["Confirm"],
 				},
 			},
 			{ sessionId: TEST_SESSION_ID },

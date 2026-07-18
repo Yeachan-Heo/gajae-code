@@ -339,4 +339,20 @@ describe("deep-interview-state: intent contract", () => {
 		);
 		expect(review.removed_locked_ids).toEqual([]);
 	});
+	it("rejects locked contract replacement and deletion through shared merges", () => {
+		const locked = createDeepInterviewIntentManifest(lockedItems, { round: 0, answer_hash: "a".repeat(64) });
+		const replacement = createDeepInterviewIntentManifest(
+			[{ id: "artifact:other", category: "artifact", statement: "Produce another artifact" }],
+			{ round: 0, answer_hash: "b".repeat(64) },
+		);
+		expect(() =>
+			mergeDeepInterviewEnvelope(
+				{ state: { intent_contract: locked } },
+				{ state: { intent_contract: replacement } },
+			),
+		).toThrow("cannot be replaced");
+		expect(() =>
+			mergeDeepInterviewEnvelope({ state: { intent_contract: locked } }, { state: { intent_contract: null } }),
+		).toThrow("cannot be deleted");
+	});
 });
