@@ -1199,8 +1199,22 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.requestRender();
 			return false;
 		}
+		if (!settings.canWriteDurableConfig()) {
+			this.showError(
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			);
+			return false;
+		}
+		try {
+			settings.set("pet.mode", mode);
+		} catch (error) {
+			if (!settings.canWriteDurableConfig()) {
+				this.showError(error instanceof Error ? error.message : String(error));
+				return false;
+			}
+			throw error;
+		}
 		apply(mode);
-		settings.set("pet.mode", mode);
 		this.ui.requestRender();
 		return true;
 	}

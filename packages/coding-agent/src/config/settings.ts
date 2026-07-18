@@ -892,6 +892,10 @@ export class Settings implements NotificationSettingsReader {
 		cloned.#rawNotificationConfig = structuredClone(this.#rawNotificationConfig);
 		cloned.#durableRawNotificationConfig = structuredClone(this.#durableRawNotificationConfig);
 		cloned.#durableNotificationFingerprint = this.#durableNotificationFingerprint;
+		cloned.#modified = new Map([...this.#modified].map(([key, patch]) => [key, structuredClone(patch)]));
+		cloned.#nextGeneration = this.#nextGeneration;
+		cloned.#pathRevisions = structuredClone(this.#pathRevisions);
+		cloned.#nextRevision = this.#nextRevision;
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#overrides = structuredClone(this.#overrides);
 		await cloned.#normalizeAfterLoad();
@@ -1672,25 +1676,33 @@ export class Settings implements NotificationSettingsReader {
 					this.#recomputeNotificationValidationFromRaw();
 				},
 			};
-		}).then(() => undefined);
-		this.#savePromise = save;
-		void save.catch(error => {
-			logger.warn("Settings: background save failed", { error: String(error) });
-			for (const patch of captured) {
-				const key = settingsPatchKey(patch);
-				if (this.#modified.get(key)?.generation === patch.generation) this.#modified.set(key, patch);
-			}
-			if (durableBeforeWrite) {
-				this.#global = durableBeforeWrite;
-				this.#captureRawNotificationConfig(durableBeforeWrite);
-				for (const patch of this.#pendingPatchesInGenerationOrder()) {
-					applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
-					this.#applyNotificationMutationToRaw(patch.path, patch.value);
+		})
+			.then(() => undefined)
+			.catch(async error => {
+				logger.warn("Settings: background save failed", { error: String(error) });
+				for (const patch of captured) {
+					const key = settingsPatchKey(patch);
+					if (this.#modified.get(key)?.generation === patch.generation) this.#modified.set(key, patch);
 				}
-				this.#rebuildMerged();
-				this.#recomputeNotificationValidationFromRaw();
-			}
-		});
+				if (durableBeforeWrite) {
+					this.#global = durableBeforeWrite;
+					this.#captureRawNotificationConfig(durableBeforeWrite);
+					for (const patch of this.#pendingPatchesInGenerationOrder()) {
+						applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
+						this.#applyNotificationMutationToRaw(patch.path, patch.value);
+					}
+					this.#rebuildMerged();
+					this.#recomputeNotificationValidationFromRaw();
+				}
+				try {
+					await this.#refreshDurableSettings();
+				} catch (refreshError) {
+					logger.warn("Settings: refresh after background save failure failed", { error: String(refreshError) });
+				}
+				throw error;
+			});
+		this.#savePromise = save;
+		void save.catch(() => {});
 		this.#armSaveTimer(slot);
 	}
 

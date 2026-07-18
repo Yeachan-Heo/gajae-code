@@ -236,4 +236,57 @@ describe("SelectorController effort selector", () => {
 		expect(ctx.ui.requestRender).toHaveBeenCalled();
 		expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(ctx.editor);
 	});
+
+	it("rejects persisted effort changes before mutating live session state during recovery", () => {
+		const editorContainer = {
+			children: [] as unknown[],
+			clear() {
+				this.children = [];
+			},
+			addChild(child: unknown) {
+				this.children.push(child);
+			},
+		};
+		const settings = Settings.isolated({ defaultThinkingLevel: ThinkingLevel.High });
+		const canWrite = vi.spyOn(settings, "canWriteDurableConfig").mockReturnValue(false);
+		const session = {
+			thinkingLevel: ThinkingLevel.Off as ThinkingLevel | undefined,
+			getAvailableThinkingLevels: () => [ThinkingLevel.Low],
+			setThinkingLevel: vi.fn(),
+		};
+		const showError = vi.fn();
+		const ctx = {
+			editorContainer,
+			editor: {},
+			session,
+			settings,
+			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+			statusLine: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+			updateEditorTopBorder: vi.fn(),
+			showStatus: vi.fn(),
+			showError,
+		} as unknown as InteractiveModeContext;
+		try {
+			const controller = new SelectorController(ctx);
+			controller.showEffortSelector();
+			const selector = editorContainer.children[0];
+			if (!(selector instanceof ThinkingSelectorComponent)) {
+				throw new Error("Expected /effort to mount ThinkingSelectorComponent");
+			}
+
+			selector.handleInput("\x1b[B");
+			selector.handleInput("\n");
+			selector.handleInput("\x1b[B");
+			selector.handleInput("\n");
+
+			expect(session.setThinkingLevel).not.toHaveBeenCalled();
+			expect(showError).toHaveBeenCalledWith(
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			);
+			expect(editorContainer.children[0]).toBe(selector);
+		} finally {
+			canWrite.mockRestore();
+		}
+	});
 });

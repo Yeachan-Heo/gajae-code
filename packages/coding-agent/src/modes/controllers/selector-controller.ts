@@ -1227,6 +1227,12 @@ export class SelectorController {
 				this.ctx.session.thinkingLevel,
 				availableLevels,
 				selection => {
+					if (selection.persistDefault && !this.ctx.settings.canWriteDurableConfig()) {
+						this.ctx.showError(
+							"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+						);
+						return;
+					}
 					done();
 
 					const { level, persistDefault } = selection;
@@ -1336,24 +1342,40 @@ export class SelectorController {
 		getAvailableThemes().then(availableThemes => {
 			const initialTheme = getCurrentThemeName() ?? "red-claw";
 			this.showSelector(done => {
+				const restoreAndClose = () => {
+					void restoreThemePreview(initialTheme).then(result => {
+						if (!result.success && result.error) {
+							this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
+						}
+						this.#refreshThemeUi();
+					});
+					done();
+				};
 				const selector = new ThemeSelectorComponent(
 					initialTheme,
 					availableThemes,
 					themeName => {
-						const settingPath = getDetectedThemeSettingsPath();
-						settings.set(settingPath, themeName);
+						if (!settings.canWriteDurableConfig()) {
+							this.ctx.showError(
+								"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+							);
+							restoreAndClose();
+							return;
+						}
+						try {
+							settings.set(getDetectedThemeSettingsPath(), themeName);
+						} catch (error) {
+							if (!settings.canWriteDurableConfig()) {
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+								restoreAndClose();
+								return;
+							}
+							throw error;
+						}
 						this.#refreshThemeUi();
 						done();
 					},
-					() => {
-						void restoreThemePreview(initialTheme).then(result => {
-							if (!result.success && result.error) {
-								this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
-							}
-							this.#refreshThemeUi();
-						});
-						done();
-					},
+					restoreAndClose,
 					themeName => {
 						void previewTheme(themeName).then(result => {
 							if (!result.success && result.error) {
@@ -1377,8 +1399,9 @@ export class SelectorController {
 			const selector = new PetSelectorComponent(
 				initial,
 				mode => {
-					this.ctx.setPetMode(mode);
-					done();
+					if (this.ctx.setPetMode(mode)) {
+						done();
+					}
 				},
 				() => {
 					this.ctx.previewPetMode(initial);

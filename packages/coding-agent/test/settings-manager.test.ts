@@ -612,6 +612,22 @@ describe("Settings", () => {
 			settings.getStorage()?.close();
 		}
 	});
+	it("enters syntax recovery after a debounced save encounters malformed YAML", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await Bun.sleep(300);
+
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+			expect(settings.getSchemaReport()).toMatchObject({ valid: false });
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => settings.set("theme.light", "blue-crab")).toThrow("Repair config.yml");
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
 	it("preserves fail-closed notifications while replaying dirty patches after external syntax corruption", async () => {
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
 		try {
@@ -667,6 +683,27 @@ describe("Settings", () => {
 			expect(() => cloned.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
 			expect(() => cloned.set("notifications.redact", true)).toThrow("Repair config.yml");
 			expect(await Bun.file(getConfigPath()).text()).toBe(malformed);
+		} finally {
+			source.getStorage()?.close();
+		}
+	});
+	it("preserves retained dirty patches in recovered cwd clones", async () => {
+		const clonedCwd = path.join(testDir, "cloned-project");
+		fs.mkdirSync(clonedCwd, { recursive: true });
+		const source = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			source.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await Bun.sleep(300);
+
+			const cloned = await source.cloneForCwd(clonedCwd);
+			expect(cloned.canWriteDurableConfig()).toBe(false);
+			expect(cloned.get("theme.dark")).toBe("blue-crab");
+
+			await Bun.write(getConfigPath(), "");
+			await cloned.flushOrThrow();
+
+			expect((await readSettings()).theme).toEqual({ dark: "blue-crab" });
 		} finally {
 			source.getStorage()?.close();
 		}
