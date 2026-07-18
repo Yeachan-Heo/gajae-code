@@ -399,6 +399,7 @@ interface AskSingleQuestionOptions {
 	scrollTitleRows?: number;
 	otherOptionLabel?: string;
 	clarificationOptionLabel?: string;
+	autoSelectOnTimeout?: boolean;
 	onRemoteState?: (state: {
 		interaction: "selector" | "custom_editor" | "clarification_editor";
 		selectedCount: number;
@@ -440,7 +441,15 @@ async function askSingleQuestion(
 	multi: boolean,
 	options: AskSingleQuestionOptions = {},
 ): Promise<SelectionResult> {
-	const { recommended, timeout, signal, initialSelection, navigation, scrollTitleRows } = options;
+	const {
+		recommended,
+		timeout,
+		signal,
+		initialSelection,
+		navigation,
+		scrollTitleRows,
+		autoSelectOnTimeout = true,
+	} = options;
 	const doneLabel = getDoneOptionLabel();
 	const otherOptionLabel = options.otherOptionLabel ?? OTHER_OPTION;
 	const clarificationOptionLabel = options.clarificationOptionLabel;
@@ -743,7 +752,7 @@ async function askSingleQuestion(
 		}
 	}
 
-	if (timedOut && selectedOptions.length === 0 && customInput === undefined) {
+	if (timedOut && selectedOptions.length === 0 && customInput === undefined && autoSelectOnTimeout) {
 		selectedOptions = getAutoSelectionOnTimeout(optionLabels, recommended);
 	}
 
@@ -1170,6 +1179,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					navigation: options?.navigation,
 					scrollTitleRows: isDeepInterviewQuestion ? DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS : undefined,
 					otherOptionLabel,
+					autoSelectOnTimeout: !q.deepInterview?.intent_contract && !q.deepInterview?.intent_review,
 					clarificationOptionLabel,
 					onRemoteState: state => {
 						activeRemoteRequest = {
@@ -1254,7 +1264,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
-			if (clarificationQuestion === undefined) {
+			if (
+				clarificationQuestion === undefined &&
+				!(timedOut && (q.deepInterview?.intent_contract || q.deepInterview?.intent_review))
+			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
 			const details: AskToolDetails = {
@@ -1332,7 +1345,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				clarificationQuestion,
 			};
 
-			if (clarificationQuestion === undefined) {
+			if (
+				clarificationQuestion === undefined &&
+				!(timedOut && (q.deepInterview?.intent_contract || q.deepInterview?.intent_review))
+			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
 
