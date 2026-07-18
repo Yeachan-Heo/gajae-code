@@ -327,4 +327,203 @@ describe("AuthStorage OAuth refresh race", () => {
 		const retryKey = await authStorage.getApiKey("unit-oauth-rotation", sessionId);
 		expect(retryKey).toBe("access-b");
 	});
+
+	test("adopts a peer-rotated credential without firing a doomed refresh", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const refreshedExpires = Date.now() + 60 * 60_000;
+		let staleRefreshCalls = 0;
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-adopt",
+			name: "Unit OAuth Adopt",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: refreshedExpires };
+			},
+			async refreshToken(credentials) {
+				if (credentials.refresh === "stale-refresh") {
+					staleRefreshCalls += 1;
+					throw new Error('invalid_grant {"error":"invalid_grant"}');
+				}
+				return { ...credentials, expires: refreshedExpires };
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-adopt", [
+			{ type: "oauth", access: "stale-access", refresh: "stale-refresh", expires: Date.now() - 60_000 },
+		]);
+		const credentialId = store.listAuthCredentials("unit-oauth-adopt")[0]!.id;
+
+		// Peer rotated the row after we loaded our snapshot but before we needed a
+		// refresh. The pre-refresh re-read must adopt the persisted rotation and
+		// never burn the (already-invalidated) stale refresh token on the network.
+		store.updateAuthCredential(credentialId, {
+			type: "oauth",
+			access: "fresh-access-from-peer",
+			refresh: "fresh-refresh-from-peer",
+			expires: Date.now() + 60 * 60_000,
+		});
+
+		const apiKey = await authStorage.getApiKey("unit-oauth-adopt", "session-adopt");
+		expect(apiKey).toBe("fresh-access-from-peer");
+		expect(staleRefreshCalls).toBe(0);
+		expect(events).toHaveLength(0);
+	});
+
+	test("recovers when the peer's rotation persists shortly after our refresh failure", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-late-peer",
+			name: "Unit OAuth Late Peer",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			async refreshToken(credentials) {
+				if (credentials.refresh === "stale-refresh") {
+					throw new Error('invalid_grant {"error":"invalid_grant"}');
+				}
+				return { ...credentials, expires: Date.now() + 60 * 60_000 };
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-late-peer", [
+			{ type: "oauth", access: "stale-access", refresh: "stale-refresh", expires: Date.now() - 60_000 },
+		]);
+		const sharedStore = store;
+		const credentialId = sharedStore.listAuthCredentials("unit-oauth-late-peer")[0]!.id;
+
+		// The peer that won the rotation persists its success ~100ms after our
+		// refresh fails: its success write trails the token endpoint round-trip.
+		// The delayed re-check must observe it instead of disabling the row.
+		const peerPersist = setTimeout(() => {
+			sharedStore.updateAuthCredential(credentialId, {
+				type: "oauth",
+				access: "fresh-access-from-peer",
+				refresh: "fresh-refresh-from-peer",
+				expires: Date.now() + 60 * 60_000,
+			});
+		}, 100);
+
+		try {
+			const apiKey = await authStorage.getApiKey("unit-oauth-late-peer", "session-late-peer");
+			expect(apiKey).toBe("fresh-access-from-peer");
+			expect(events).toHaveLength(0);
+
+			const stored = sharedStore.listAuthCredentials("unit-oauth-late-peer");
+			expect(stored).toHaveLength(1);
+			expect(stored[0]?.credential.type).toBe("oauth");
+			if (stored[0]?.credential.type === "oauth") {
+				expect(stored[0].credential.refresh).toBe("fresh-refresh-from-peer");
+			}
+		} finally {
+			clearTimeout(peerPersist);
+		}
+	});
+
+	test("winner's rotation revives a row a racing loser disabled mid-flight", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const refreshStarted = Promise.withResolvers<void>();
+		const allowRefresh = Promise.withResolvers<void>();
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-revive",
+			name: "Unit OAuth Revive",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			async refreshToken(credentials) {
+				refreshStarted.resolve();
+				await allowRefresh.promise;
+				return {
+					...credentials,
+					access: "access-rotated",
+					refresh: "refresh-rotated",
+					expires: Date.now() + 60 * 60_000,
+				};
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-revive", [
+			{ type: "oauth", access: "access-old", refresh: "refresh-old", expires: Date.now() - 60_000 },
+		]);
+		const credentialId = store.listAuthCredentials("unit-oauth-revive")[0]!.id;
+
+		// We are the winner: the provider has already rotated the token (our
+		// refresh call is in flight). A racing loser that still held the previous
+		// token hits invalid_grant and CAS-disables the row before our success
+		// write lands. Without revival the only-valid rotated token would be
+		// trapped in a soft-deleted row and every process would be signed out.
+		const pending = authStorage.getApiKey("unit-oauth-revive", "session-revive");
+		await refreshStarted.promise;
+		store.deleteAuthCredential(credentialId, "oauth refresh failed: invalid_grant (racing loser)");
+		expect(store.listAuthCredentials("unit-oauth-revive")).toHaveLength(0);
+		allowRefresh.resolve();
+
+		const apiKey = await pending;
+		expect(apiKey).toBe("access-rotated");
+
+		const stored = store.listAuthCredentials("unit-oauth-revive");
+		expect(stored).toHaveLength(1);
+		expect(stored[0]?.id).toBe(credentialId);
+		expect(stored[0]?.credential.type).toBe("oauth");
+		if (stored[0]?.credential.type === "oauth") {
+			expect(stored[0].credential.access).toBe("access-rotated");
+			expect(stored[0].credential.refresh).toBe("refresh-rotated");
+		}
+	});
+
+	test("winner's rotation does not revive a row the user deleted mid-flight", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const refreshStarted = Promise.withResolvers<void>();
+		const allowRefresh = Promise.withResolvers<void>();
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-no-revive",
+			name: "Unit OAuth No Revive",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			async refreshToken(credentials) {
+				refreshStarted.resolve();
+				await allowRefresh.promise;
+				return {
+					...credentials,
+					access: "access-rotated",
+					refresh: "refresh-rotated",
+					expires: Date.now() + 60 * 60_000,
+				};
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-no-revive", [
+			{ type: "oauth", access: "access-old", refresh: "refresh-old", expires: Date.now() - 60_000 },
+		]);
+		const credentialId = store.listAuthCredentials("unit-oauth-no-revive")[0]!.id;
+
+		// Only refresh-failure disables are revived; an explicit user deletion
+		// that lands while a refresh is in flight must stay deleted.
+		const pending = authStorage.getApiKey("unit-oauth-no-revive", "session-no-revive");
+		await refreshStarted.promise;
+		store.deleteAuthCredential(credentialId, "deleted by user");
+		allowRefresh.resolve();
+		await pending;
+
+		expect(store.listAuthCredentials("unit-oauth-no-revive")).toHaveLength(0);
+	});
 });
