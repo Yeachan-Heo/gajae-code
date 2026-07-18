@@ -1057,7 +1057,6 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
 				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: plan.tmuxCommand,
-				...(plan.computerBrokerEnvironment ?? {}),
 			},
 			// Linux managed owner close signals the pane PID. Do not place the exit-marker shell
 			// in front of it; `buildInnerCommand` therefore execs the GJC owner directly.
@@ -1444,6 +1443,8 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			);
 		}
 	}
+	if (plan.computerBrokerEnvironment)
+		newSessionOptions.env = { ...(newSessionOptions.env ?? env), ...plan.computerBrokerEnvironment };
 	try {
 		prepareManagedOwnerLifecycle(plan, context);
 	} catch (error) {

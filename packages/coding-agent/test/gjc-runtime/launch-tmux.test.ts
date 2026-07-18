@@ -3115,6 +3115,7 @@ describe("tmux owner isolation launch gate", () => {
 
 	it("starts one macOS arm64 broker, preserves its lease, and injects its environment into the managed owner", () => {
 		const calls: string[][] = [];
+		let newSessionEnvironment: NodeJS.ProcessEnv | undefined;
 		const dispose = vi.fn();
 		const start = vi.fn(() => ({
 			environment: { GJC_COMPUTER_BROKER_SOCKET: "/tmp/broker.sock", GJC_COMPUTER_BROKER_TOKEN: "secret" },
@@ -3133,8 +3134,9 @@ describe("tmux owner isolation launch gate", () => {
 			tmuxAvailable: true,
 			existingBranchSessionName: null,
 			computerBrokerStarter: start,
-			spawnSync: (_command, spawnArgs) => {
+			spawnSync: (_command, spawnArgs, spawnOptions) => {
 				calls.push(spawnArgs);
+				if (spawnArgs[0] === "new-session") newSessionEnvironment = spawnOptions.env;
 				return { exitCode: 0, stdout: NATIVE_SESSION_ID };
 			},
 		});
@@ -3142,9 +3144,12 @@ describe("tmux owner isolation launch gate", () => {
 		expect(start).toHaveBeenCalledTimes(1);
 		expect(dispose).not.toHaveBeenCalled();
 		const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
-		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_SOCKET='/tmp/broker.sock'");
-		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_TOKEN='secret'");
-		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_REQUIRED='1'");
+		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_SOCKET");
+		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_TOKEN");
+		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_REQUIRED");
+		expect(newSessionEnvironment?.GJC_COMPUTER_BROKER_SOCKET).toBe("/tmp/broker.sock");
+		expect(newSessionEnvironment?.GJC_COMPUTER_BROKER_TOKEN).toBe("secret");
+		expect(newSessionEnvironment?.GJC_COMPUTER_BROKER_REQUIRED).toBe("1");
 	});
 
 	it("does not start the broker for existing attaches, unsupported platforms, unsupported architectures, or direct launch", () => {
@@ -3195,6 +3200,7 @@ describe("tmux owner isolation launch gate", () => {
 
 	it("marks managed tmux computer use unavailable when the broker cannot start", () => {
 		const calls: string[][] = [];
+		let newSessionEnvironment: NodeJS.ProcessEnv | undefined;
 		const handled = launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello"], tmux: true }),
 			rawArgs: ["--tmux", "hello"],
@@ -3208,17 +3214,21 @@ describe("tmux owner isolation launch gate", () => {
 			tmuxAvailable: true,
 			existingBranchSessionName: null,
 			computerBrokerStarter: () => null,
-			spawnSync: (_command, spawnArgs) => {
+			spawnSync: (_command, spawnArgs, spawnOptions) => {
 				calls.push(spawnArgs);
+				if (spawnArgs[0] === "new-session") newSessionEnvironment = spawnOptions.env;
 				return { exitCode: 0, stdout: NATIVE_SESSION_ID };
 			},
 		});
 		expect(handled).toBe(true);
 		expect(calls.some(call => call[0] === "new-session")).toBe(true);
 		const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
-		expect(innerCommand).toContain("GJC_COMPUTER_BROKER_REQUIRED='1'");
+		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_REQUIRED");
 		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_SOCKET");
 		expect(innerCommand).not.toContain("GJC_COMPUTER_BROKER_TOKEN");
+		expect(newSessionEnvironment?.GJC_COMPUTER_BROKER_REQUIRED).toBe("1");
+		expect(newSessionEnvironment?.GJC_COMPUTER_BROKER_SOCKET).toBeUndefined();
+		expect(newSessionEnvironment?.GJC_COMPUTER_BROKER_TOKEN).toBeUndefined();
 	});
 
 	it("propagates broker cleanup failures before creating tmux", () => {
