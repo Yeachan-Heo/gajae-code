@@ -612,6 +612,28 @@ describe("Settings", () => {
 			settings.getStorage()?.close();
 		}
 	});
+	it("preserves fail-closed notifications while replaying dirty patches after external syntax corruption", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			settings.set("notifications.redact", true);
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "notifications: [");
+			await settings.flush();
+
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+
+			await Bun.write(getConfigPath(), "");
+			await settings.flushOrThrow();
+
+			expect(await readSettings()).toMatchObject({
+				notifications: { redact: true },
+				theme: { dark: "blue-crab" },
+			});
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
 	it("retains fail-closed recovery state when a durable refresh read fails", async () => {
 		const malformed = "notifications: [";
 		await Bun.write(getConfigPath(), malformed);

@@ -1023,7 +1023,9 @@ export class Settings implements NotificationSettingsReader {
 		this.#global = current;
 		for (const patch of this.#pendingPatchesInGenerationOrder()) {
 			applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
-			this.#applyNotificationMutationToRaw(patch.path, patch.value);
+			if (this.#rawNotificationConfig !== undefined) {
+				this.#applyNotificationMutationToRaw(patch.path, patch.value);
+			}
 		}
 		this.#rebuildMerged();
 		this.#recomputeNotificationValidationFromRaw();

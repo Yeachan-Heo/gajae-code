@@ -1015,7 +1015,14 @@ export class SettingsSelectorComponent extends Container {
 					// The shared pet commit policy rechecks capability immediately
 					// before mutation and persists only on acceptance; the settings
 					// surface must not persist ahead of that result.
-					const accepted = this.callbacks.onPetCommit?.(value) ?? false;
+					let accepted = false;
+					if (
+						!commitInteractiveSettings(this.callbacks, () => {
+							accepted = this.callbacks.onPetCommit?.(value) ?? false;
+						})
+					) {
+						return;
+					}
 					done(accepted ? value : undefined);
 					return;
 				}

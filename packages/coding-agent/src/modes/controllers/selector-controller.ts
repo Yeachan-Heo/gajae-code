@@ -1292,6 +1292,7 @@ export class SelectorController {
 						onPetPreview: mode => {
 							this.ctx.previewPetMode(mode as PetMode);
 						},
+						onPetCommit: mode => this.ctx.commitPetPreviewMode(mode as PetMode),
 						onStatusLinePreview: previewSettings => {
 							// Update status line with preview settings
 							this.ctx.statusLine.updateSettings({
