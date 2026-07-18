@@ -4316,7 +4316,10 @@ describe("stalled worker continuation protocol", () => {
 			if (name === "release claim" || name === "worker GC prune") expect(task.claim).toBeUndefined();
 			if (name === "terminal transition") expect(task.status).toBe("failed");
 			if (name === "phase shutdown") expect((operationResult as { phase: string }).phase).toBe("cancelled");
-			if (name === "worker GC prune") expect(operationResult).toBe(true);
+			if (name === "worker GC prune") {
+				expect(operationResult).toBe(true);
+				expect(await Bun.file(path.join(fixture.stateDir, "workers", "worker-1")).exists()).toBe(false);
+			}
 			expect(["pending", "in_progress", "failed"]).toContain(task.status);
 			if (task.claim) expect(task.claim.owner).toBe("worker-1");
 		}

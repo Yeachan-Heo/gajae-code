@@ -3345,6 +3345,7 @@ export async function monitorGjcTeam(
 		const config = await readConfig(dir);
 		await continueStalledGjcTeamWorkers(dir, config, env);
 		await reconcileGjcTeamStaleClaimsUnlocked(workerOrchestrationRuntime, teamName, dir, config, env, capability);
+		await computeLifecycleNudges(config, dir, cwd, env);
 	});
 	const integrationByWorker = await integrateGjcWorkerCommits(config, dir, previous, cwd, env);
 	await writeJsonFile(monitorSnapshotPath(dir), {
@@ -3352,7 +3353,6 @@ export async function monitorGjcTeam(
 		updated_at: now(),
 	});
 	await replayGjcTeamNotifications(teamName, cwd, env);
-	await computeLifecycleNudges(config, dir, cwd, env);
 	return readGjcTeamSnapshot(teamName, cwd, env);
 }
 export async function listGjcTeams(
@@ -3465,6 +3465,12 @@ async function computeLifecycleNudges(
 	const createdAt = Date.parse(config.created_at);
 	const ageMs = Date.now() - (Number.isFinite(createdAt) ? createdAt : Date.now());
 	for (const worker of config.workers) {
+		try {
+			await fs.access(workerDir(dir, worker.id));
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
 		const ack = await readJsonFile<Record<string, unknown>>(path.join(workerDir(dir, worker.id), "startup-ack.json"));
 		if (!ack && ageMs >= startupGraceMs) {
 			await writeLifecycleNudge(
