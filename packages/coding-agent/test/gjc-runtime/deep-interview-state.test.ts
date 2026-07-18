@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import {
+	assertDeepInterviewIntentReview,
 	createDeepInterviewIntentManifest,
+	deepInterviewObservedIntentDigest,
 	deriveRoundKey,
 	mergeDeepInterviewEnvelope,
 	mergeDeepInterviewRounds,
@@ -236,31 +238,24 @@ describe("deep-interview-state: intent contract", () => {
 	];
 
 	it("creates a deterministic category-prefixed Round 0 manifest", () => {
-		const forward = createDeepInterviewIntentManifest(lockedItems);
-		const reverse = createDeepInterviewIntentManifest([...lockedItems].reverse());
+		const confirmation = { round: 0 as const, answer_hash: "a".repeat(64) };
+		const forward = createDeepInterviewIntentManifest(lockedItems, confirmation);
+		const reverse = createDeepInterviewIntentManifest([...lockedItems].reverse(), confirmation);
 		expect(reverse).toEqual(forward);
 		expect(forward.digest).toMatch(/^[a-f0-9]{64}$/);
 		expect(() =>
-			createDeepInterviewIntentManifest([
-				{ id: "surface:wrong", category: "artifact", statement: "Mismatched prefix" },
-			]),
-		).toThrow("artifact: prefix");
+			createDeepInterviewIntentManifest(
+				[{ id: "surface:wrong", category: "artifact", statement: "Mismatched prefix" }],
+				confirmation,
+			),
+		).toThrow("invalid intent category");
 	});
 
-	it("requires explicit evidence and substitutions for every locked reduction", () => {
-		const locked = createDeepInterviewIntentManifest(lockedItems);
+	it("validates redacted approval evidence, substitutions, and deterministic observed digests", () => {
+		const answerHash = "a".repeat(64);
+		const locked = createDeepInterviewIntentManifest(lockedItems, { round: 0, answer_hash: answerHash });
 		const observed = lockedItems.filter(item => item.id !== "integration:export");
-		expect(() =>
-			reviewDeepInterviewIntent(locked, observed, {
-				status: "approved",
-				supporting_substitutions: [],
-				approval_round: 3,
-				answer_hash: "answer",
-				user_answer_evidence: "Approved replacement",
-			}),
-		).toThrow("every substitution");
-
-		const review = reviewDeepInterviewIntent(locked, observed, {
+		const approved = reviewDeepInterviewIntent(locked, observed, {
 			status: "approved",
 			supporting_substitutions: [
 				{
@@ -270,24 +265,78 @@ describe("deep-interview-state: intent contract", () => {
 				},
 			],
 			approval_round: 3,
-			answer_hash: "answer",
-			user_answer_evidence: "Approved replacement",
+			answer_hash: "b".repeat(64),
+			user_answer_evidence: `answer_hash:${"b".repeat(64)}`,
 		});
-		expect(review.removed_locked_ids).toEqual(["integration:export"]);
-		expect(review.locked_digest).toBe(locked.digest);
-		expect(review.observed_digest).not.toBe(locked.digest);
+		expect(approved.removed_locked_ids).toEqual(["integration:export"]);
+		expect(approved.locked_digest).toBe(locked.digest);
+		expect(approved.observed_digest).toBe(deepInterviewObservedIntentDigest(observed.map(item => item.id)));
+		expect(approved.user_answer_evidence).not.toContain("archive");
+
+		const recorded = [{ round: 3, answer_hash: "b".repeat(64) }];
+
+		for (const input of [
+			{ ...approved, status: "unknown" },
+			{ ...approved, approval_round: Number.NaN },
+			{ ...approved, approval_round: 0 },
+			{ ...approved, approval_round: 1.5 },
+			{ ...approved, answer_hash: "not-a-hash" },
+			{ ...approved, user_answer_evidence: "Approved replacement" },
+			{ ...approved, user_answer_evidence: `answer_hash:${"b".repeat(65)}` },
+			{
+				...approved,
+				supporting_substitutions: [{ ...approved.supporting_substitutions[0], replacement_ids: ["missing:id"] }],
+			},
+			{
+				...approved,
+				supporting_substitutions: [approved.supporting_substitutions[0], approved.supporting_substitutions[0]],
+			},
+		]) {
+			expect(() =>
+				assertDeepInterviewIntentReview(
+					input,
+					locked,
+					observed.map(item => item.id),
+					recorded,
+				),
+			).toThrow();
+		}
+
+		expect(() =>
+			assertDeepInterviewIntentReview(
+				{ ...approved, unexpected: true },
+				locked,
+				observed.map(item => item.id),
+				recorded,
+			),
+		).toThrow("invalid intent review");
+		expect(() =>
+			assertDeepInterviewIntentReview(
+				{ ...approved, approval_round: 4 },
+				locked,
+				observed.map(item => item.id),
+				recorded,
+			),
+		).toThrow("approval evidence is invalid");
 	});
 
 	it("does not require approval when the observed manifest preserves every locked intent", () => {
-		const locked = createDeepInterviewIntentManifest(lockedItems);
-		const review = reviewDeepInterviewIntent(locked, [...lockedItems, {
-			id: "surface:admin",
-			category: "surface",
-			statement: "Add an administrator view",
-		}], {
-			status: "not_required",
-			supporting_substitutions: [],
-		});
+		const locked = createDeepInterviewIntentManifest(lockedItems, { round: 0, answer_hash: "a".repeat(64) });
+		const review = reviewDeepInterviewIntent(
+			locked,
+			[
+				...lockedItems,
+				{
+					id: "surface:admin",
+					category: "surface",
+					statement: "Add an administrator view",
+				},
+			],
+			{
+				status: "not_required",
+				supporting_substitutions: [],
+			},
+		);
 		expect(review.removed_locked_ids).toEqual([]);
 	});
 });

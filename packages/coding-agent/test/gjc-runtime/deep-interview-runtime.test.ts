@@ -3,6 +3,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import {
+	createDeepInterviewIntentManifest,
+	reviewDeepInterviewIntent,
+} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import {
 	activeSnapshotPath,
@@ -94,6 +98,181 @@ describe("native gjc deep-interview runtime", () => {
 		const validState = JSON.parse(await fs.readFile(validStatePath, "utf-8"));
 		expect(validState.transcript).toEqual([{ question: "q", answer: "a" }]);
 		expect(validState.spec_slug).toBe("valid-state");
+	});
+
+	it("enforces locked-intent review before creating a spec while preserving legacy handoff", async () => {
+		const lockedItems = [
+			{ id: "artifact:report", category: "artifact" as const, statement: "Produce an audit report" },
+			{ id: "surface:review", category: "surface" as const, statement: "Provide a reviewer surface" },
+		];
+		const confirmationHash = "a".repeat(64);
+		const approvalHash = "b".repeat(64);
+		const locked = createDeepInterviewIntentManifest(lockedItems, { round: 0, answer_hash: confirmationHash });
+		const fullSpec = "# Full\nartifact:report\nsurface:review";
+		const reducedSpec = "# Reduced\nartifact:report";
+		const approvedReduction = reviewDeepInterviewIntent(locked, [lockedItems[0]], {
+			status: "approved",
+			supporting_substitutions: [
+				{
+					removed_id: "surface:review",
+					replacement_ids: ["artifact:report"],
+					rationale: "Report covers the review",
+				},
+			],
+			approval_round: 2,
+			answer_hash: approvalHash,
+			user_answer_evidence: `answer_hash:${approvalHash}`,
+		});
+		const notRequired = reviewDeepInterviewIntent(locked, lockedItems, {
+			status: "not_required",
+			supporting_substitutions: [],
+		});
+
+		async function writeState(root: string, state: Record<string, unknown>): Promise<void> {
+			const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+			await fs.mkdir(path.dirname(statePath), { recursive: true });
+			await fs.writeFile(statePath, `${JSON.stringify({ state })}\n`, "utf-8");
+		}
+		async function expectBlocked(
+			name: string,
+			state: Record<string, unknown>,
+			spec: string,
+			message: string,
+		): Promise<void> {
+			const root = await tempDir();
+			await writeState(root, state);
+			const result = await runNativeDeepInterviewCommand(
+				["--write", "--stage", "final", "--slug", name, "--spec", spec, "--json"],
+				root,
+			);
+			expect(result.status, name).toBe(2);
+			expect(result.stderr, name).toContain(message);
+			await expect(
+				fs.access(path.join(sessionSpecsDir(root, TEST_SESSION_ID), `deep-interview-${name}.md`)),
+			).rejects.toThrow();
+		}
+
+		const legacyRoot = await tempDir();
+		await writeState(legacyRoot, { rounds: [] });
+		const legacy = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "legacy", "--spec", fullSpec, "--json"],
+			legacyRoot,
+		);
+		expect(legacy.status).toBe(0);
+
+		const fullRoot = await tempDir();
+		await writeState(fullRoot, { intent_contract: locked, intent_review: notRequired, rounds: [] });
+		const full = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "full", "--spec", fullSpec, "--json"],
+			fullRoot,
+		);
+		expect(full.status).toBe(0);
+		expect(
+			await fs.readFile(path.join(sessionSpecsDir(fullRoot, TEST_SESSION_ID), "deep-interview-full.md"), "utf-8"),
+		).toContain("surface:review");
+
+		const automaticRoot = await tempDir();
+		await writeState(automaticRoot, { intent_contract: locked, rounds: [] });
+		const automatic = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "automatic-review", "--spec", fullSpec, "--json"],
+			automaticRoot,
+		);
+		expect(automatic.status).toBe(0);
+		const automaticState = JSON.parse(
+			await fs.readFile(modeStatePath(automaticRoot, TEST_SESSION_ID, "deep-interview"), "utf-8"),
+		);
+		expect(automaticState.state.intent_review).toMatchObject({ status: "not_required", removed_locked_ids: [] });
+		await expectBlocked(
+			"malformed-review",
+			{ intent_contract: locked, intent_review: {}, rounds: [] },
+			fullSpec,
+			"invalid intent review",
+		);
+		await expectBlocked(
+			"pending-review",
+			{
+				intent_contract: locked,
+				intent_review: {
+					...approvedReduction,
+					status: "pending",
+					approval_round: undefined,
+					answer_hash: undefined,
+					user_answer_evidence: undefined,
+				},
+				rounds: [],
+			},
+			reducedSpec,
+			"pending or unapproved",
+		);
+		await expectBlocked(
+			"stale-review",
+			{
+				intent_contract: locked,
+				intent_review: { ...approvedReduction, observed_digest: "0".repeat(64) },
+				rounds: [],
+			},
+			reducedSpec,
+			"stale intent review",
+		);
+		await expectBlocked(
+			"omitted-locked",
+			{ intent_contract: locked, intent_review: notRequired, rounds: [] },
+			reducedSpec,
+			"stale intent review",
+		);
+		await expectBlocked(
+			"missing-substitution",
+			{
+				intent_contract: locked,
+				intent_review: { ...approvedReduction, supporting_substitutions: [] },
+				rounds: [{ round: 2, answer_hash: approvalHash }],
+			},
+			reducedSpec,
+			"every substitution",
+		);
+		await expectBlocked(
+			"absent-replacement",
+			{
+				intent_contract: locked,
+				intent_review: {
+					...approvedReduction,
+					supporting_substitutions: [
+						{ ...approvedReduction.supporting_substitutions[0], replacement_ids: ["surface:review"] },
+					],
+				},
+				rounds: [{ round: 2, answer_hash: approvalHash }],
+			},
+			reducedSpec,
+			"invalid intent substitution",
+		);
+		await expectBlocked(
+			"unrecorded-approval",
+			{
+				intent_contract: locked,
+				intent_review: approvedReduction,
+				rounds: [{ round: 2, answer_hash: confirmationHash }],
+			},
+			reducedSpec,
+			"approval evidence is invalid",
+		);
+
+		const approvedRoot = await tempDir();
+		await writeState(approvedRoot, {
+			intent_contract: locked,
+			intent_review: approvedReduction,
+			rounds: [{ round: 2, answer_hash: approvalHash }],
+		});
+		const approved = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "approved", "--spec", reducedSpec, "--json"],
+			approvedRoot,
+		);
+		expect(approved.status).toBe(0);
+		expect(
+			await fs.readFile(
+				path.join(sessionSpecsDir(approvedRoot, TEST_SESSION_ID), "deep-interview-approved.md"),
+				"utf-8",
+			),
+		).toContain("artifact:report");
 	});
 
 	it("fails closed on corrupt deep-interview state unless --force is supplied", async () => {

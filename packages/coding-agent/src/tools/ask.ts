@@ -66,14 +66,75 @@ const OptionItem = z.object({
 	label: z.string().describe("display label"),
 });
 
+const DeepInterviewIntentItem = z
+	.object({
+		id: z.string().regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/),
+		category: z.enum(["artifact", "surface", "integration", "constraint"]),
+		statement: z.string().min(1).max(1_000),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (!value.id.startsWith(`${value.category}:`))
+			context.addIssue({ code: "custom", message: "intent ID must use its category prefix", path: ["id"] });
+	});
+
+const DeepInterviewIntentContract = z
+	.object({
+		items: z.array(DeepInterviewIntentItem).min(1).max(64),
+	})
+	.strict();
+
+const DeepInterviewIntentReview = z
+	.object({
+		observed_items: z.array(DeepInterviewIntentItem).min(1).max(64),
+		supporting_substitutions: z
+			.array(
+				z
+					.object({
+						removed_id: z
+							.string()
+							.regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/),
+						replacement_ids: z
+							.array(z.string().regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/))
+							.min(1)
+							.max(64),
+						rationale: z.string().min(1).max(500),
+					})
+					.strict(),
+			)
+			.max(64),
+		approval_options: z.array(z.string().min(1).max(200)).min(1).max(5),
+	})
+	.strict();
+
 /** Optional structured deep-interview round metadata; when present the round is recorded automatically. */
-const DeepInterviewMeta = z.object({
-	round_id: z.string().describe("stable optional round identity").optional(),
-	round: z.number().int().nonnegative().describe("round number"),
-	component: z.string().min(1).describe("targeted topology component"),
-	dimension: z.string().min(1).describe("targeted clarity dimension"),
-	ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
-});
+const DeepInterviewMeta = z
+	.object({
+		round_id: z.string().max(128).describe("stable optional round identity").optional(),
+		round: z.number().int().nonnegative().describe("round number"),
+		component: z.string().min(1).max(128).describe("targeted topology component"),
+		dimension: z.string().min(1).max(128).describe("targeted clarity dimension"),
+		ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
+		intent_contract: DeepInterviewIntentContract.describe("Round-0 locked intent contract").optional(),
+		intent_review: DeepInterviewIntentReview.describe("Locked-intent reduction review").optional(),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (value.intent_contract && value.round !== 0)
+			context.addIssue({
+				code: "custom",
+				message: "intent_contract is only valid for Round 0",
+				path: ["intent_contract"],
+			});
+		if (value.intent_review && value.round === 0)
+			context.addIssue({
+				code: "custom",
+				message: "intent_review requires a post-Round-0 answer",
+				path: ["intent_review"],
+			});
+		if (value.intent_contract && value.intent_review)
+			context.addIssue({ code: "custom", message: "intent_contract and intent_review are mutually exclusive" });
+	});
 
 const WorkflowGateMeta = z.object({
 	stage: z.enum(["deep-interview", "ralplan", "ultragoal"]).describe("workflow gate stage"),
@@ -133,7 +194,11 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>): Promise<void> {
+async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>, required: boolean): Promise<void> {
+	if (required) {
+		await persistence;
+		return;
+	}
 	let timeout: ReturnType<typeof setTimeout> | undefined;
 	try {
 		await Promise.race([
@@ -147,6 +212,7 @@ async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>)
 		]);
 	} catch (error) {
 		logger.warn(`ask: deep-interview round recording failed: ${errorMessage(error)}`);
+		if (required) throw error;
 	} finally {
 		if (timeout) clearTimeout(timeout);
 	}
@@ -724,11 +790,14 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					ambiguity: meta.ambiguity,
 					selectedOptions,
 					customInput,
+					intent_contract: meta.intent_contract,
+					intent_review: meta.intent_review,
 				},
 				{ sessionId },
 			).then(async () => {
 				await syncDeepInterviewRecorderHud(cwd, statePath, sessionId);
 			}),
+			meta.intent_contract !== undefined || meta.intent_review !== undefined,
 		);
 	}
 
