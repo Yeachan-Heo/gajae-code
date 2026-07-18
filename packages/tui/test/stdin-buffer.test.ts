@@ -32,6 +32,43 @@ describe("StdinBuffer", () => {
 			processInput("hello \u4e16\u754c");
 			expect(emittedSequences).toEqual(["h", "e", "l", "l", "o", " ", "\u4e16", "\u754c"]);
 		});
+		it("emits supplementary characters as complete code points", () => {
+			processInput("\u{1f389}");
+			expect(emittedSequences).toEqual(["\u{1f389}"]);
+		});
+
+		it("preserves ASCII, supplementary, and BMP character ordering", () => {
+			processInput("a\u{1f389}\u4e16b");
+			expect(emittedSequences).toEqual(["a", "\u{1f389}", "\u4e16", "b"]);
+		});
+
+		it("treats ESC plus a supplementary character as one Meta sequence", () => {
+			processInput("\x1b\u{1f389}");
+			expect(emittedSequences).toEqual(["\x1b\u{1f389}"]);
+		});
+		it("reassembles a Meta supplementary character split across string chunks", () => {
+			processInput("\x1b\ud83c");
+			expect(emittedSequences).toEqual([]);
+
+			processInput("\udf89");
+			expect(emittedSequences).toEqual(["\x1b\u{1f389}"]);
+		});
+
+		it("does not consume input following a malformed Meta high surrogate", () => {
+			processInput("\x1b\ud83c");
+			expect(emittedSequences).toEqual([]);
+
+			processInput("x");
+			expect(emittedSequences).toEqual(["\x1b\ud83c", "x"]);
+		});
+
+		it("reassembles a surrogate pair split across string chunks", () => {
+			processInput("\ud83c");
+			expect(emittedSequences).toEqual([]);
+
+			processInput("\udf89");
+			expect(emittedSequences).toEqual(["\u{1f389}"]);
+		});
 	});
 
 	describe("Partial Escape Sequences", () => {
@@ -138,6 +175,19 @@ describe("StdinBuffer", () => {
 			// Press 'a', release 'a' batched together (common over SSH)
 			processInput("\x1b[97u\x1b[97;1:3u");
 			expect(emittedSequences).toEqual(["\x1b[97u", "\x1b[97;1:3u"]);
+		});
+		it("deduplicates raw supplementary characters after matching Kitty events", () => {
+			processInput("\x1b[127881u\u{1f389}");
+			expect(emittedSequences).toEqual(["\x1b[127881u"]);
+		});
+		it("continues to deduplicate matching BMP characters after Kitty events", () => {
+			processInput("\x1b[97ua");
+			expect(emittedSequences).toEqual(["\x1b[97u"]);
+		});
+
+		it("does not deduplicate a different supplementary character after a Kitty event", () => {
+			processInput("\x1b[127881u\u{1f38a}");
+			expect(emittedSequences).toEqual(["\x1b[127881u", "\u{1f38a}"]);
 		});
 
 		it("should handle multiple batched Kitty events", () => {
@@ -258,6 +308,12 @@ describe("StdinBuffer", () => {
 			const flushed = buffer.flush();
 			expect(flushed).toEqual([]);
 		});
+		it("returns a malformed trailing high surrogate on flush", () => {
+			processInput("\ud83c");
+
+			expect(buffer.flush()).toEqual(["\ud83c"]);
+			expect(buffer.getBuffer()).toBe("");
+		});
 
 		it("should not emit incomplete SGR mouse reports via timeout", async () => {
 			processInput("\x1b[<35");
@@ -278,6 +334,13 @@ describe("StdinBuffer", () => {
 			buffer.clear();
 			expect(buffer.getBuffer()).toBe("");
 			expect(emittedSequences).toEqual([]);
+		});
+		it("drops a malformed trailing high surrogate on clear", () => {
+			processInput("\ud83c");
+			buffer.clear();
+
+			processInput("\udf89");
+			expect(emittedSequences).toEqual(["\udf89"]);
 		});
 	});
 
