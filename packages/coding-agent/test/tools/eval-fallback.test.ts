@@ -31,6 +31,7 @@ const mockResult = {
 describe("EvalTool language dispatch", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+		delete Bun.env.GJC_PY;
 	});
 
 	it('dispatches to the JS backend when cell.language === "js"', async () => {
@@ -90,12 +91,32 @@ describe("EvalTool language dispatch", () => {
 		).rejects.toThrow(/eval\.py = false/);
 	});
 
+	it("rejects py cells when GJC_PY selects JavaScript only", async () => {
+		Bun.env.GJC_PY = "js";
+		const tool = new EvalTool(makeSession());
+		await expect(
+			tool.execute("call-py-env-disabled", {
+				cells: [{ language: "py", code: "print('hi')" }],
+			}),
+		).rejects.toThrow(/eval\.py = false/);
+	});
+
 	it("rejects js cells when eval.js is disabled", async () => {
 		const settings = Settings.isolated();
 		settings.set("eval.js", false);
 		const tool = new EvalTool(makeSession(settings));
 		await expect(
 			tool.execute("call-js-disabled", {
+				cells: [{ language: "js", code: "const x = 1;" }],
+			}),
+		).rejects.toThrow(/eval\.js = false/);
+	});
+
+	it("rejects js cells when GJC_PY selects Python only", async () => {
+		Bun.env.GJC_PY = "py";
+		const tool = new EvalTool(makeSession());
+		await expect(
+			tool.execute("call-js-env-disabled", {
 				cells: [{ language: "js", code: "const x = 1;" }],
 			}),
 		).rejects.toThrow(/eval\.js = false/);
