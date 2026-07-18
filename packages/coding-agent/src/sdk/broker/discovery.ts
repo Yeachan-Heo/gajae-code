@@ -33,7 +33,7 @@ export function isPidAlive(pid: number): boolean {
 	}
 }
 async function syncFile(file: string): Promise<void> {
-	const handle = await fs.open(file, "r");
+	const handle = await fs.open(file, "r+");
 	try {
 		await handle.sync();
 	} finally {

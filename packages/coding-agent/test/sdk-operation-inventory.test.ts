@@ -66,7 +66,7 @@ describe("SDK operation inventory", () => {
 		expect(result.exitCode, output(result)).toBe(0);
 	});
 
-	it("locks private mid-run maintenance test seams out of the public SDK", async () => {
+	it("locks private AgentSession seams out of the public SDK", async () => {
 		const records = (await Bun.file(inventory).json()) as Array<{
 			sourceId: string;
 			decision: string;
@@ -82,6 +82,10 @@ describe("SDK operation inventory", () => {
 			[
 				"agent_session:estimateMidRunContextTokensForTests",
 				"test-only estimator seam, not a user-facing SDK control seam",
+			],
+			[
+				"agent_session:awaitPendingContextTransformations",
+				"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
 			],
 		]);
 		for (const [sourceId, rationale] of expected) {

@@ -25,6 +25,8 @@
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 - Added a searchable command palette with direct action dispatch; slash commands run only from an empty composer, and drafts are never touched.
 - Added deep-interview intent manifests that preserve user-locked artifacts, surfaces, and integrations through Round 0.
+- Added Telegram `/btw <question>` support through the `ephemeral_turn_v1` SDK capability in authorized known private-session topics. It uses current-session context in an isolated side turn without injecting or persisting user or assistant messages in main history, remains available while the main turn is busy, permits two concurrent questions per logical session, and cancels provider work at the 120-second host deadline; `notifications.telegram.btw.enabled` defaults to `true` as the local kill switch.
+- Telegram `/btw` replies now use eligible complete Bot API 10.1 structured Markdown once as `{rich_message:{markdown,skip_entity_detection:true}}`, correlated in the source topic. Tables and math use Telegram Markdown support rather than outgoing native blocks or media; ineligible content and definite rich rejection use correlated HTML, while ambiguous outcomes never retry or fall back and `/rich off` remains HTML-only.
 
 ### Fixed
 
@@ -52,6 +54,7 @@
 - Input-free interactive TTY startup now keeps the TUI reachable when configured model profiles are missing required provider credentials, skips only the blocked profiles, and preserves later `--mpreset` and explicit model/thinking precedence; redirected terminals, input-bearing, resume-continuation, image-only, print/text, and unrelated activation failures remain fail-closed (#2277).
 - Windows Bun runtimes no longer crash while committing the durable workflow-gate store when directory `fsync` reports the unsupported-operation code `EPERM`; unexpected directory-sync failures remain fail-closed.
 - Browser geo settings now propagate coherently across request `Accept-Language`, navigator languages, and `Intl` locale/timezone surfaces; configured managed browsers are isolated by geo/profile posture, concurrent acquisition is serialized, and unset geo preserves Chromium's native locale/timezone instead of injecting a fixed New York profile.
+- Windows startup no longer fails when the platform rejects the workflow-gate store's parent-directory durability sync with `EPERM`; file fsync and atomic replacement remain enforced.
 
 - Cooperative mid-run context maintenance now waits at a cancellation-aware FIFO consumer-drain checkpoint before flushing or rewriting session history. Materialized tool results and steering messages are synchronously canonicalized first; aborted barriers and hook/signal-cancelled compactions settle without rewriting or scheduling a continuation. Promotion, pruning, and compaction each start a clean provider/prompt-cache epoch. Script-aware #2067 unsent-delta accounting remains cache-free and distinct from the lifecycle checkpoint.
 - Classified the cooperative mid-run maintenance driver and token estimator test seams as locked non-public SDK exclusions, restoring deterministic operation-inventory generation and post-merge dev CI coverage.

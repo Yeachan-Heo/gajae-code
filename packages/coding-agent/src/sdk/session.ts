@@ -492,7 +492,16 @@ export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir(
 			sourceLabel: `broker ${brokerConfig.url}`,
 			credentialRankingMode,
 		});
-		await storage.reload();
+		try {
+			await storage.reload();
+		} catch (error) {
+			try {
+				storage.close();
+			} catch {
+				// Preserve the initial reload failure.
+			}
+			throw error;
+		}
 		return storage;
 	}
 	const dbPath = getAgentDbPath(agentDir);
@@ -501,7 +510,16 @@ export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir(
 		sourceLabel: `local ${dbPath}`,
 		credentialRankingMode,
 	});
-	await storage.reload();
+	try {
+		await storage.reload();
+	} catch (error) {
+		try {
+			storage.close();
+		} catch {
+			// Preserve the initial reload failure.
+		}
+		throw error;
+	}
 	return storage;
 }
 
@@ -967,6 +985,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
 	// / session would silently miss credential_disabled events.
+	const ownsAuthStorage = options.modelRegistry === undefined && options.authStorage === undefined;
 	const modelRegistry =
 		options.modelRegistry ??
 		new ModelRegistry(options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir)));
@@ -976,392 +995,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
-	// Subscribe before any getApiKey() call so startup model probes can't fire a
-	// credential_disabled event past us. An embedder's constructor handler makes the
-	// listener set non-empty from construction, which defeats AuthStorage's no-listener
-	// buffer — so we can't rely on it to catch startup events for the extension runner.
-	const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
-	let credentialDisabledTarget: ExtensionRunner | undefined;
-	let unsubscribeCredentialDisabled: (() => void) | undefined = authStorage.onCredentialDisabled(event => {
-		if (credentialDisabledTarget) {
-			// Discard return: any handler error is routed through runner.onError listeners.
-			void credentialDisabledTarget.emitCredentialDisabled(event);
-		} else {
-			startupCredentialDisabledEvents.push(event);
-		}
-	});
-	let runtimeCredentialSelectorInstalled = false;
-	const installRuntimeCredentialSelector = (provider: string): void => {
-		if (!options.credentialSelector || runtimeCredentialSelectorInstalled) return;
-		authStorage.setRuntimeCredentialSelector(provider, options.credentialSelector.selector);
-		runtimeCredentialSelectorInstalled = true;
-	};
-	const earlyCredentialSelectorProvider = options.credentialSelector?.provider ?? options.model?.provider;
-	if (earlyCredentialSelectorProvider) {
-		installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
-	}
-	const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
-	modelRegistry.applyConfiguredModelBindings(settings);
-	logger.time("initializeWithSettings", initializeWithSettings, settings);
-	const canRefreshModelsBeforeCredentialSelector =
-		!options.credentialSelector || runtimeCredentialSelectorInstalled || options.modelRegistry !== undefined;
-	if (!options.modelRegistry && canRefreshModelsBeforeCredentialSelector) {
-		modelRegistry.refreshInBackground();
-	}
-	// Kick off workspace tree discovery early. The native workspace scan returns
-	// both the rendered-tree input and the AGENTS.md directory-context index, so
-	// startup does not perform a second recursive filesystem search. Subagents
-	// inherit the parent's resolved values via options.
-	const STARTUP_SCAN_DEADLINE_MS = 5000;
-	const workspaceTreePromise: Promise<WorkspaceTree> = options.workspaceTree
-		? Promise.resolve(options.workspaceTree)
-		: logger.time("buildWorkspaceTree", () => buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }));
-	workspaceTreePromise.catch(() => {});
-
-	// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
-	// at their respective consumer sites. Their work can overlap with model resolution, secret loading,
-	// session-context build, tool creation, MCP discovery, and extension discovery.
-	const contextFilesPromise = options.contextFiles
-		? Promise.resolve(options.contextFiles)
-		: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir);
-	contextFilesPromise.catch(() => {});
-	const promptTemplatesPromise = options.promptTemplates
-		? Promise.resolve(options.promptTemplates)
-		: logger.time("discoverPromptTemplates", discoverPromptTemplates, cwd, agentDir);
-	promptTemplatesPromise.catch(() => {});
-	const slashCommandsPromise = options.slashCommands ? Promise.resolve(options.slashCommands) : Promise.resolve([]);
-	slashCommandsPromise.catch(() => {});
-
-	// Initialize provider preferences from settings
-	const webSearchProvider = getConfiguredSearchProviderPreference(settings);
-	setPreferredSearchProvider(webSearchProvider);
-	const webSearchFallback = settings.get("web_search.fallback");
-	if (Array.isArray(webSearchFallback)) {
-		setSearchFallbackProviders(
-			webSearchFallback.filter(value => typeof value === "string" && isConfigurableSearchProviderId(value)),
-		);
-	}
-	applyConfiguredSearchTimeout(settings);
-
-	const imageProvider = settings.get("providers.image");
-	if (
-		imageProvider === "auto" ||
-		imageProvider === "openai" ||
-		imageProvider === "gemini" ||
-		imageProvider === "openrouter" ||
-		imageProvider === "antigravity"
-	) {
-		setPreferredImageProvider(imageProvider);
-	}
-
-	const sessionManager =
-		options.sessionManager ??
-		(await logger.time("sessionManager", async () => {
-			const sessionDir = SessionManager.getDefaultSessionDir(cwd, agentDir);
-			return SessionManager.create(cwd, sessionDir);
-		}));
-	const logicalSessionId = sessionManager.getSessionId();
-	const providerSessionId = options.providerSessionId ?? options.forkContextSeed?.cacheIdentity ?? logicalSessionId;
-	const modelApiKeyAvailability = new Map<string, boolean>();
-	const getModelAvailabilityKey = (candidate: Model): string =>
-		`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
-	const hasModelApiKey = async (candidate: Model): Promise<boolean> => {
-		const availabilityKey = getModelAvailabilityKey(candidate);
-		const cached = modelApiKeyAvailability.get(availabilityKey);
-		if (cached !== undefined) {
-			return cached;
-		}
-
-		const credentialSelector =
-			options.credentialSelector && !runtimeCredentialSelectorInstalled
-				? options.credentialSelector.provider === undefined ||
-					options.credentialSelector.provider === candidate.provider
-					? options.credentialSelector.selector
-					: undefined
-				: undefined;
-		if (options.credentialSelector?.provider && options.credentialSelector.provider !== candidate.provider) {
-			modelApiKeyAvailability.set(availabilityKey, false);
-			return false;
-		}
-		const key = await modelRegistry.getApiKey(candidate, providerSessionId, { credentialSelector }).catch(error => {
-			if (credentialSelector) {
-				logger.debug("Credential selector did not match model availability candidate", {
-					provider: candidate.provider,
-					model: candidate.id,
-					error: error instanceof Error ? error.message : String(error),
-				});
-				return undefined;
-			}
-			throw error;
-		});
-		const hasKey = Boolean(key) && (!credentialSelector || key !== kNoAuth);
-		modelApiKeyAvailability.set(availabilityKey, hasKey);
-		return hasKey;
-	};
-
-	// Load and create secret obfuscator early so resumed session state and prompt warnings
-	// reflect actual loaded secrets, not just the setting toggle.
-	let obfuscator: SecretObfuscator | undefined;
-	if (settings.get("secrets.enabled")) {
-		const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir);
-		const envEntries = collectEnvSecrets();
-		const allEntries = [...envEntries, ...fileEntries];
-		if (allEntries.length > 0) {
-			obfuscator = new SecretObfuscator(allEntries);
-		}
-	}
-	const secretsEnabled = obfuscator?.hasSecrets() === true;
-
-	// Check if session has existing data to restore
-	const existingSession = logger.time("loadSessionContext", () =>
-		deobfuscateSessionContext(sessionManager.buildSessionContext(), obfuscator),
-	);
-	const existingBranch = logger.time("getSessionBranch", () => sessionManager.getBranch());
-	const hasExistingSession = existingBranch.length > 0;
-	const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
-	const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
-
-	const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
-	const modelMatchPreferences = {
-		usageOrder: settings.getStorage()?.getModelUsageOrder(),
-	};
-	const allowedModels = await logger.time("resolveAllowedModels", () =>
-		resolveAllowedModels(modelRegistry, settings, modelMatchPreferences),
-	);
-	const defaultRoleSpec = logger.time("resolveDefaultModelRole", () =>
-		resolveModelRoleValue(settings.getModelRole("default"), allowedModels, {
-			settings,
-			matchPreferences: modelMatchPreferences,
-			modelRegistry,
-		}),
-	);
-	let model = options.model;
-	let modelFallbackMessage: string | undefined;
-	const persistedDefaultChain = existingSession.configuredModelChains.default?.entries;
-	const defaultModelEntries =
-		persistedDefaultChain && persistedDefaultChain.length > 0
-			? persistedDefaultChain
-			: existingSession.models.default
-				? [existingSession.models.default]
-				: [];
-	// If session has data, restore its configured default chain rather than the
-	// scalar runtime model, which may be a stale fallback from the prior run.
-	if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
-		await logger.time("restoreSessionModel", async () => {
-			const restoredDefaultResolution = await resolveModelChainWithAuth(
-				defaultModelEntries,
-				modelRegistry,
-				settings,
-				providerSessionId,
-				{ managedFallback: defaultModelEntries.length > 1 },
-			);
-			model = restoredDefaultResolution.model;
-			if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
-		});
-	}
-
-	// If still no model, try settings default.
-	// Skip settings fallback when an explicit model was requested.
-	if (!hasExplicitModel && !model && defaultRoleSpec.model) {
-		const settingsDefaultModel = defaultRoleSpec.model;
-		logger.time("resolveSettingsDefaultModel", () => {
-			// defaultRoleSpec.model already comes from modelRegistry.getAvailable(),
-			// so re-validating auth here just repeats the expensive lookup path.
-			model = settingsDefaultModel;
-		});
-	}
-
-	const taskDepth = options.taskDepth ?? 0;
-
-	let thinkingLevel = options.thinkingLevel;
-	const hasExplicitDefaultThinkingLevel = settings.has("defaultThinkingLevel");
-	let thinkingLevelFromSchemaDefault = false;
-
-	// If session has data and includes a thinking entry, restore an explicit session
-	// override. A persisted inherit marker deliberately re-enters the normal
-	// default-role/global/model resolution path instead of resolving to `undefined`.
-	const restoredThinkingLevel =
-		hasExistingSession && hasThinkingEntry ? parseThinkingLevel(existingSession.thinkingLevel) : undefined;
-	if (thinkingLevel === undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
-		thinkingLevel = restoredThinkingLevel;
-	}
-
-	if (thinkingLevel === undefined && !hasExplicitModel && defaultRoleSpec.explicitThinkingLevel) {
-		thinkingLevel = defaultRoleSpec.thinkingLevel;
-	}
-
-	// An explicit user/project default should win over the model's bundled
-	// defaultLevel. The schema default is only a final fallback so model metadata
-	// can keep driving first-run behavior until the user chooses "Set as default".
-	if (thinkingLevel === undefined && hasExplicitDefaultThinkingLevel) {
-		thinkingLevel = settings.get("defaultThinkingLevel");
-	}
-
-	if (thinkingLevel === undefined && model?.thinking?.defaultLevel !== undefined) {
-		thinkingLevel = model.thinking.defaultLevel;
-	}
-
-	if (thinkingLevel === undefined) {
-		thinkingLevel = settings.get("defaultThinkingLevel");
-		thinkingLevelFromSchemaDefault = true;
-	}
-	if (model) {
-		const resolvedModel = model;
-		thinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
-			resolveThinkingLevelForModel(resolvedModel, thinkingLevel),
-		);
-		// Fire-and-forget TLS+H2 handshake to the model's host so it overlaps
-		// with the rest of session setup (extension/skill load, tool registry,
-		// system prompt build). Without this, the first `fetch(...)` pays the
-		// full handshake serially — 100–300 ms transcontinental for
-		// api.anthropic.com from a residential IP. Every session frontend benefits
-		// (interactive, print, SDK, ACP).
-		preconnectModelHost(model.baseUrl);
-	}
-
-	let skills: Skill[];
-	let skillWarnings: SkillWarning[];
-	if (options.skills !== undefined) {
-		// The four public GJC workflow skills are a product invariant, not
-		// ordinary filesystem-discovered skills. Keep them available even for
-		// explicit SDK skill lists so startup and command routing survive
-		// accidental `.gjc` deletion or overzealous caller filtering.
-		skills = withEmbeddedDefaultGjcSkills(options.skills);
-		skillWarnings = [];
-	} else if (settings.get("skills.enabled")) {
-		const skillsResult = await logger.time("loadSkills", loadSkills, {
-			...settings.getGroup("skills"),
-			cwd,
-			disabledExtensions: settings.get("disabledExtensions"),
-		});
-		skills = withEmbeddedDefaultGjcSkills(skillsResult.skills);
-		skillWarnings = skillsResult.warnings;
-	} else {
-		// GJC's four public workflow skills are bundled into the binary so the
-		// default workflow surface survives accidental .gjc deletion. Arbitrary
-		// filesystem skill discovery remains gated by skills.enabled above.
-		skills = getEmbeddedDefaultGjcSkills();
-		skillWarnings = [];
-	}
-
-	// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
-	const { ttsrManager, rulebookRules, alwaysApplyRules } = await logger.time("discoverTtsrRules", async () => {
-		const ttsrSettings = settings.getGroup("ttsr");
-		const ttsrManager = new TtsrManager(ttsrSettings);
-		const rulesResult =
-			options.rules !== undefined
-				? { items: options.rules, warnings: undefined }
-				: await loadCapability<Rule>(ruleCapability.id, { cwd });
-		const rulebookRules: Rule[] = [];
-		const alwaysApplyRules: Rule[] = [];
-		for (const rule of rulesResult.items) {
-			const isTtsrRule = rule.condition && rule.condition.length > 0 ? ttsrManager.addRule(rule) : false;
-			if (isTtsrRule) {
-				continue;
-			}
-			if (rule.alwaysApply === true) {
-				alwaysApplyRules.push(rule);
-				continue;
-			}
-			if (rule.description) {
-				rulebookRules.push(rule);
-			}
-		}
-		if (ttsrManager.getSettings().enabled !== false) {
-			if ((existingSession.ttsrMessageCount ?? 0) > 0) {
-				ttsrManager.restoreMessageCount(existingSession.ttsrMessageCount ?? 0);
-			}
-			if (existingSession.injectedTtsrRuleRecords && existingSession.injectedTtsrRuleRecords.length > 0) {
-				ttsrManager.restoreInjected(existingSession.injectedTtsrRuleRecords);
-			} else if (existingSession.injectedTtsrRules.length > 0) {
-				ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
-			}
-		}
-		return { ttsrManager, rulebookRules, alwaysApplyRules };
-	});
-
-	// Resolve contextFiles up-front (it's needed before tool creation). The
-	// workspace tree scan is slow on large repos and we MUST NOT block startup on
-	// it. On timeout we forward `undefined` to ToolSession; buildSystemPromptInternal
-	// will re-race the same promise through its own withDeadline path. Background
-	// work continues so caches still warm.
-	const raceWithDeadline = async <T>(name: string, work: Promise<T>): Promise<T | undefined> => {
-		let timedOut = false;
-		const result = await Promise.race([
-			work,
-			Bun.sleep(STARTUP_SCAN_DEADLINE_MS).then(() => {
-				timedOut = true;
-				return undefined;
-			}),
-		]);
-		if (timedOut) {
-			logger.warn("Startup scan exceeded deadline; deferring to system prompt fallback", {
-				name,
-				timeoutMs: STARTUP_SCAN_DEADLINE_MS,
-				cwd,
-			});
-		}
-		return result;
-	};
-	const [contextFiles, resolvedWorkspaceTree] = await Promise.all([
-		contextFilesPromise,
-		raceWithDeadline("buildWorkspaceTree", workspaceTreePromise),
-	]);
-
 	let agent: Agent;
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
 	let cleanupOwnedMcpManager: (() => Promise<void>) | undefined;
-	const enableLsp = options.enableLsp ?? true;
-	const backgroundJobsEnabled = isBackgroundJobSupportEnabled(settings);
-	const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
-	const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
-	const ASYNC_PREVIEW_MAX_CHARS = 4_000;
-	const formatAsyncResultForFollowUp = async (result: string): Promise<string> => {
-		if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) {
-			return result;
-		}
-
-		const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
-		try {
-			const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
-			if (artifactPath && artifactId) {
-				await Bun.write(artifactPath, result);
-				return `${preview}\nFull output: artifact://${artifactId}`;
-			}
-		} catch (error) {
-			logger.warn("Failed to persist async follow-up artifact", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-
-		return preview;
-	};
-	// Only top-level sessions own an AsyncJobManager. Subagents reach the
-	// parent's manager via `AsyncJobManager.instance()` (set below), so creating
-	// a second instance here just to leave it orphaned wastes a constructor and
-	// risks accidental disposal of the parent's manager on subagent teardown.
-	const asyncJobManager =
-		backgroundJobsEnabled && !options.parentTaskPrefix
-			? new AsyncJobManager({
-					maxRunningJobs: asyncMaxJobs,
-					onJobComplete: async (jobId, result, job) => {
-						if (!session || asyncJobManager!.isDeliverySuppressed(jobId)) return;
-						const formattedResult = await formatAsyncResultForFollowUp(result);
-						if (asyncJobManager!.isDeliverySuppressed(jobId)) return;
-
-						const durationMs = job ? jobElapsedMs(job) : undefined;
-						session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
-							jobId,
-							result: formattedResult,
-							job,
-							durationMs,
-						});
-					},
-				})
-			: undefined;
-
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? (isCanonicalSubSession ? "sub" : "main");
@@ -1378,8 +1016,403 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		localProtocolOverrideReleased = true;
 		disposeLocalProtocolOverride?.();
 	};
+	const enableLsp = options.enableLsp ?? true;
+	let authStorageClosed = false;
+	const closeOwnedAuthStorage = (): void => {
+		if (!ownsAuthStorage || authStorageClosed) return;
+		authStorageClosed = true;
+		authStorage.close();
+	};
+	let unsubscribeCredentialDisabled: (() => void) | undefined;
+	const releaseCredentialDisabledSubscription = (): void => {
+		const unsubscribe = unsubscribeCredentialDisabled;
+		unsubscribeCredentialDisabled = undefined;
+		unsubscribe?.();
+	};
 
 	try {
+		// Subscribe before any getApiKey() call so startup model probes can't fire a
+		// credential_disabled event past us. An embedder's constructor handler makes the
+		// listener set non-empty from construction, which defeats AuthStorage's no-listener
+		// buffer — so we can't rely on it to catch startup events for the extension runner.
+		const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
+		let credentialDisabledTarget: ExtensionRunner | undefined;
+		unsubscribeCredentialDisabled = authStorage.onCredentialDisabled(event => {
+			if (credentialDisabledTarget) {
+				// Discard return: any handler error is routed through runner.onError listeners.
+				void credentialDisabledTarget.emitCredentialDisabled(event);
+			} else {
+				startupCredentialDisabledEvents.push(event);
+			}
+		});
+		let runtimeCredentialSelectorInstalled = false;
+		const installRuntimeCredentialSelector = (provider: string): void => {
+			if (!options.credentialSelector || runtimeCredentialSelectorInstalled) return;
+			authStorage.setRuntimeCredentialSelector(provider, options.credentialSelector.selector);
+			runtimeCredentialSelectorInstalled = true;
+		};
+		const earlyCredentialSelectorProvider = options.credentialSelector?.provider ?? options.model?.provider;
+		if (earlyCredentialSelectorProvider) {
+			installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
+		}
+		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
+		modelRegistry.applyConfiguredModelBindings(settings);
+		logger.time("initializeWithSettings", initializeWithSettings, settings);
+		const canRefreshModelsBeforeCredentialSelector =
+			!options.credentialSelector || runtimeCredentialSelectorInstalled || options.modelRegistry !== undefined;
+		if (!options.modelRegistry && canRefreshModelsBeforeCredentialSelector) {
+			modelRegistry.refreshInBackground();
+		}
+		// Kick off workspace tree discovery early. The native workspace scan returns
+		// both the rendered-tree input and the AGENTS.md directory-context index, so
+		// startup does not perform a second recursive filesystem search. Subagents
+		// inherit the parent's resolved values via options.
+		const STARTUP_SCAN_DEADLINE_MS = 5000;
+		const workspaceTreePromise: Promise<WorkspaceTree> = options.workspaceTree
+			? Promise.resolve(options.workspaceTree)
+			: logger.time("buildWorkspaceTree", () => buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }));
+		workspaceTreePromise.catch(() => {});
+
+		// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
+		// at their respective consumer sites. Their work can overlap with model resolution, secret loading,
+		// session-context build, tool creation, MCP discovery, and extension discovery.
+		const contextFilesPromise = options.contextFiles
+			? Promise.resolve(options.contextFiles)
+			: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir);
+		contextFilesPromise.catch(() => {});
+		const promptTemplatesPromise = options.promptTemplates
+			? Promise.resolve(options.promptTemplates)
+			: logger.time("discoverPromptTemplates", discoverPromptTemplates, cwd, agentDir);
+		promptTemplatesPromise.catch(() => {});
+		const slashCommandsPromise = options.slashCommands ? Promise.resolve(options.slashCommands) : Promise.resolve([]);
+		slashCommandsPromise.catch(() => {});
+
+		// Initialize provider preferences from settings
+		const webSearchProvider = getConfiguredSearchProviderPreference(settings);
+		setPreferredSearchProvider(webSearchProvider);
+		const webSearchFallback = settings.get("web_search.fallback");
+		if (Array.isArray(webSearchFallback)) {
+			setSearchFallbackProviders(
+				webSearchFallback.filter(value => typeof value === "string" && isConfigurableSearchProviderId(value)),
+			);
+		}
+		applyConfiguredSearchTimeout(settings);
+
+		const imageProvider = settings.get("providers.image");
+		if (
+			imageProvider === "auto" ||
+			imageProvider === "openai" ||
+			imageProvider === "gemini" ||
+			imageProvider === "openrouter" ||
+			imageProvider === "antigravity"
+		) {
+			setPreferredImageProvider(imageProvider);
+		}
+
+		const sessionManager =
+			options.sessionManager ??
+			(await logger.time("sessionManager", async () => {
+				const sessionDir = SessionManager.getDefaultSessionDir(cwd, agentDir);
+				return SessionManager.create(cwd, sessionDir);
+			}));
+		const logicalSessionId = sessionManager.getSessionId();
+		const providerSessionId = options.providerSessionId ?? options.forkContextSeed?.cacheIdentity ?? logicalSessionId;
+		const modelApiKeyAvailability = new Map<string, boolean>();
+		const getModelAvailabilityKey = (candidate: Model): string =>
+			`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
+		const hasModelApiKey = async (candidate: Model): Promise<boolean> => {
+			const availabilityKey = getModelAvailabilityKey(candidate);
+			const cached = modelApiKeyAvailability.get(availabilityKey);
+			if (cached !== undefined) {
+				return cached;
+			}
+
+			const credentialSelector =
+				options.credentialSelector && !runtimeCredentialSelectorInstalled
+					? options.credentialSelector.provider === undefined ||
+						options.credentialSelector.provider === candidate.provider
+						? options.credentialSelector.selector
+						: undefined
+					: undefined;
+			if (options.credentialSelector?.provider && options.credentialSelector.provider !== candidate.provider) {
+				modelApiKeyAvailability.set(availabilityKey, false);
+				return false;
+			}
+			const key = await modelRegistry
+				.getApiKey(candidate, providerSessionId, { credentialSelector })
+				.catch(error => {
+					if (credentialSelector) {
+						logger.debug("Credential selector did not match model availability candidate", {
+							provider: candidate.provider,
+							model: candidate.id,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						return undefined;
+					}
+					throw error;
+				});
+			const hasKey = Boolean(key) && (!credentialSelector || key !== kNoAuth);
+			modelApiKeyAvailability.set(availabilityKey, hasKey);
+			return hasKey;
+		};
+
+		// Load and create secret obfuscator early so resumed session state and prompt warnings
+		// reflect actual loaded secrets, not just the setting toggle.
+		let obfuscator: SecretObfuscator | undefined;
+		if (settings.get("secrets.enabled")) {
+			const fileEntries = await logger.time("loadSecrets", loadSecrets, cwd, agentDir);
+			const envEntries = collectEnvSecrets();
+			const allEntries = [...envEntries, ...fileEntries];
+			if (allEntries.length > 0) {
+				obfuscator = new SecretObfuscator(allEntries);
+			}
+		}
+		const secretsEnabled = obfuscator?.hasSecrets() === true;
+
+		// Check if session has existing data to restore
+		const existingSession = logger.time("loadSessionContext", () =>
+			deobfuscateSessionContext(sessionManager.buildSessionContext(), obfuscator),
+		);
+		const existingBranch = logger.time("getSessionBranch", () => sessionManager.getBranch());
+		const hasExistingSession = existingBranch.length > 0;
+		const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
+		const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
+
+		const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
+		const modelMatchPreferences = {
+			usageOrder: settings.getStorage()?.getModelUsageOrder(),
+		};
+		const allowedModels = await logger.time("resolveAllowedModels", () =>
+			resolveAllowedModels(modelRegistry, settings, modelMatchPreferences),
+		);
+		const defaultRoleSpec = logger.time("resolveDefaultModelRole", () =>
+			resolveModelRoleValue(settings.getModelRole("default"), allowedModels, {
+				settings,
+				matchPreferences: modelMatchPreferences,
+				modelRegistry,
+			}),
+		);
+		let model = options.model;
+		let modelFallbackMessage: string | undefined;
+		const persistedDefaultChain = existingSession.configuredModelChains.default?.entries;
+		const defaultModelEntries =
+			persistedDefaultChain && persistedDefaultChain.length > 0
+				? persistedDefaultChain
+				: existingSession.models.default
+					? [existingSession.models.default]
+					: [];
+		// If session has data, restore its configured default chain rather than the
+		// scalar runtime model, which may be a stale fallback from the prior run.
+		if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
+			await logger.time("restoreSessionModel", async () => {
+				const restoredDefaultResolution = await resolveModelChainWithAuth(
+					defaultModelEntries,
+					modelRegistry,
+					settings,
+					providerSessionId,
+					{ managedFallback: defaultModelEntries.length > 1 },
+				);
+				model = restoredDefaultResolution.model;
+				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+			});
+		}
+
+		// If still no model, try settings default.
+		// Skip settings fallback when an explicit model was requested.
+		if (!hasExplicitModel && !model && defaultRoleSpec.model) {
+			const settingsDefaultModel = defaultRoleSpec.model;
+			logger.time("resolveSettingsDefaultModel", () => {
+				// defaultRoleSpec.model already comes from modelRegistry.getAvailable(),
+				// so re-validating auth here just repeats the expensive lookup path.
+				model = settingsDefaultModel;
+			});
+		}
+
+		const taskDepth = options.taskDepth ?? 0;
+
+		let thinkingLevel = options.thinkingLevel;
+		const hasExplicitDefaultThinkingLevel = settings.has("defaultThinkingLevel");
+		let thinkingLevelFromSchemaDefault = false;
+
+		// If session has data and includes a thinking entry, restore an explicit session
+		// override. A persisted inherit marker deliberately re-enters the normal
+		// default-role/global/model resolution path instead of resolving to `undefined`.
+		const restoredThinkingLevel =
+			hasExistingSession && hasThinkingEntry ? parseThinkingLevel(existingSession.thinkingLevel) : undefined;
+		if (thinkingLevel === undefined && restoredThinkingLevel !== ThinkingLevel.Inherit) {
+			thinkingLevel = restoredThinkingLevel;
+		}
+
+		if (thinkingLevel === undefined && !hasExplicitModel && defaultRoleSpec.explicitThinkingLevel) {
+			thinkingLevel = defaultRoleSpec.thinkingLevel;
+		}
+
+		// An explicit user/project default should win over the model's bundled
+		// defaultLevel. The schema default is only a final fallback so model metadata
+		// can keep driving first-run behavior until the user chooses "Set as default".
+		if (thinkingLevel === undefined && hasExplicitDefaultThinkingLevel) {
+			thinkingLevel = settings.get("defaultThinkingLevel");
+		}
+
+		if (thinkingLevel === undefined && model?.thinking?.defaultLevel !== undefined) {
+			thinkingLevel = model.thinking.defaultLevel;
+		}
+
+		if (thinkingLevel === undefined) {
+			thinkingLevel = settings.get("defaultThinkingLevel");
+			thinkingLevelFromSchemaDefault = true;
+		}
+		if (model) {
+			const resolvedModel = model;
+			thinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
+				resolveThinkingLevelForModel(resolvedModel, thinkingLevel),
+			);
+			// Fire-and-forget TLS+H2 handshake to the model's host so it overlaps
+			// with the rest of session setup (extension/skill load, tool registry,
+			// system prompt build). Without this, the first `fetch(...)` pays the
+			// full handshake serially — 100–300 ms transcontinental for
+			// api.anthropic.com from a residential IP. Every session frontend benefits
+			// (interactive, print, SDK, ACP).
+			preconnectModelHost(model.baseUrl);
+		}
+
+		let skills: Skill[];
+		let skillWarnings: SkillWarning[];
+		if (options.skills !== undefined) {
+			// The four public GJC workflow skills are a product invariant, not
+			// ordinary filesystem-discovered skills. Keep them available even for
+			// explicit SDK skill lists so startup and command routing survive
+			// accidental `.gjc` deletion or overzealous caller filtering.
+			skills = withEmbeddedDefaultGjcSkills(options.skills);
+			skillWarnings = [];
+		} else if (settings.get("skills.enabled")) {
+			const skillsResult = await logger.time("loadSkills", loadSkills, {
+				...settings.getGroup("skills"),
+				cwd,
+				disabledExtensions: settings.get("disabledExtensions"),
+			});
+			skills = withEmbeddedDefaultGjcSkills(skillsResult.skills);
+			skillWarnings = skillsResult.warnings;
+		} else {
+			// GJC's four public workflow skills are bundled into the binary so the
+			// default workflow surface survives accidental .gjc deletion. Arbitrary
+			// filesystem skill discovery remains gated by skills.enabled above.
+			skills = getEmbeddedDefaultGjcSkills();
+			skillWarnings = [];
+		}
+
+		// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
+		const { ttsrManager, rulebookRules, alwaysApplyRules } = await logger.time("discoverTtsrRules", async () => {
+			const ttsrSettings = settings.getGroup("ttsr");
+			const ttsrManager = new TtsrManager(ttsrSettings);
+			const rulesResult =
+				options.rules !== undefined
+					? { items: options.rules, warnings: undefined }
+					: await loadCapability<Rule>(ruleCapability.id, { cwd });
+			const rulebookRules: Rule[] = [];
+			const alwaysApplyRules: Rule[] = [];
+			for (const rule of rulesResult.items) {
+				const isTtsrRule = rule.condition && rule.condition.length > 0 ? ttsrManager.addRule(rule) : false;
+				if (isTtsrRule) {
+					continue;
+				}
+				if (rule.alwaysApply === true) {
+					alwaysApplyRules.push(rule);
+					continue;
+				}
+				if (rule.description) {
+					rulebookRules.push(rule);
+				}
+			}
+			if (ttsrManager.getSettings().enabled !== false) {
+				if ((existingSession.ttsrMessageCount ?? 0) > 0) {
+					ttsrManager.restoreMessageCount(existingSession.ttsrMessageCount ?? 0);
+				}
+				if (existingSession.injectedTtsrRuleRecords && existingSession.injectedTtsrRuleRecords.length > 0) {
+					ttsrManager.restoreInjected(existingSession.injectedTtsrRuleRecords);
+				} else if (existingSession.injectedTtsrRules.length > 0) {
+					ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
+				}
+			}
+			return { ttsrManager, rulebookRules, alwaysApplyRules };
+		});
+
+		// Resolve contextFiles up-front (it's needed before tool creation). The
+		// workspace tree scan is slow on large repos and we MUST NOT block startup on
+		// it. On timeout we forward `undefined` to ToolSession; buildSystemPromptInternal
+		// will re-race the same promise through its own withDeadline path. Background
+		// work continues so caches still warm.
+		const raceWithDeadline = async <T>(name: string, work: Promise<T>): Promise<T | undefined> => {
+			let timedOut = false;
+			const result = await Promise.race([
+				work,
+				Bun.sleep(STARTUP_SCAN_DEADLINE_MS).then(() => {
+					timedOut = true;
+					return undefined;
+				}),
+			]);
+			if (timedOut) {
+				logger.warn("Startup scan exceeded deadline; deferring to system prompt fallback", {
+					name,
+					timeoutMs: STARTUP_SCAN_DEADLINE_MS,
+					cwd,
+				});
+			}
+			return result;
+		};
+		const [contextFiles, resolvedWorkspaceTree] = await Promise.all([
+			contextFilesPromise,
+			raceWithDeadline("buildWorkspaceTree", workspaceTreePromise),
+		]);
+
+		const backgroundJobsEnabled = isBackgroundJobSupportEnabled(settings);
+		const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
+		const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
+		const ASYNC_PREVIEW_MAX_CHARS = 4_000;
+		const formatAsyncResultForFollowUp = async (result: string): Promise<string> => {
+			if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) {
+				return result;
+			}
+
+			const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
+			try {
+				const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
+				if (artifactPath && artifactId) {
+					await Bun.write(artifactPath, result);
+					return `${preview}\nFull output: artifact://${artifactId}`;
+				}
+			} catch (error) {
+				logger.warn("Failed to persist async follow-up artifact", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+
+			return preview;
+		};
+		// Only top-level sessions own an AsyncJobManager. Subagents reach the
+		// parent's manager via `AsyncJobManager.instance()` (set below), so creating
+		// a second instance here just to leave it orphaned wastes a constructor and
+		// risks accidental disposal of the parent's manager on subagent teardown.
+		const asyncJobManager =
+			backgroundJobsEnabled && !options.parentTaskPrefix
+				? new AsyncJobManager({
+						maxRunningJobs: asyncMaxJobs,
+						onJobComplete: async (jobId, result, job) => {
+							if (!session || asyncJobManager!.isDeliverySuppressed(jobId)) return;
+							const formattedResult = await formatAsyncResultForFollowUp(result);
+							if (asyncJobManager!.isDeliverySuppressed(jobId)) return;
+
+							const durationMs = job ? jobElapsedMs(job) : undefined;
+							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
+								jobId,
+								result: formattedResult,
+								job,
+								durationMs,
+							});
+						},
+					})
+				: undefined;
+
 		let promptMetadataModel: Model | undefined;
 		const getActiveModelString = (): string | undefined => {
 			const activeModel = promptMetadataModel ?? agent?.state.model;
@@ -1741,6 +1774,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						settings,
 						controller: notificationSessionController,
 						spawnedByGjc,
+						runEphemeralTurn: async (promptText, signal) => {
+							if (!session) throw new Error("Ephemeral turns are unavailable.");
+							const { replyText } = await session.runEphemeralTurn({ promptText, signal });
+							return { replyText };
+						},
 					});
 				} catch (error) {
 					lifecycleStartupCapability?.settleFailure(
@@ -1891,8 +1929,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// No runner to forward to; release our subscription. The embedder's own
 			// onCredentialDisabled (if any) keeps firing through its own subscription.
 			startupCredentialDisabledEvents.length = 0;
-			unsubscribeCredentialDisabled?.();
-			unsubscribeCredentialDisabled = undefined;
+			releaseCredentialDisabledSubscription();
 		}
 
 		const getSessionContext = () => ({
@@ -2514,9 +2551,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				try {
 					await originalDispose();
 				} finally {
-					agentRegistry.unregister(resolvedAgentId);
-					unsubscribeCredentialDisabled?.();
-					releaseLocalProtocolOverride();
+					try {
+						agentRegistry.unregister(resolvedAgentId);
+						releaseCredentialDisabledSubscription();
+						releaseLocalProtocolOverride();
+					} finally {
+						closeOwnedAuthStorage();
+					}
 				}
 			};
 		}
@@ -2631,9 +2672,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 	} catch (error) {
 		// Release the subscription if the throw happened after install but before the
-		// dispose-wrap took ownership. Idempotent with dispose() — Set.delete is a no-op
-		// for already-removed listeners.
-		unsubscribeCredentialDisabled?.();
+		// dispose-wrap took ownership.
+		releaseCredentialDisabledSubscription();
 		try {
 			if (hasSession) {
 				await session.dispose();
@@ -2647,6 +2687,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			logger.warn("Failed to clean up createAgentSession resources after startup error");
 		} finally {
 			releaseLocalProtocolOverride();
+			try {
+				closeOwnedAuthStorage();
+			} catch {
+				logger.warn("Failed to close owned auth storage after startup error");
+			}
 		}
 		throw error;
 	}

@@ -1,0 +1,18 @@
+{
+  "source": "https://core.telegram.org/bots/api#june-11-2026",
+  "published": "2026-06-11",
+  "anchors": {
+    "sendRichMessage": "https://core.telegram.org/bots/api#sendrichmessage",
+    "inputRichMessage": "https://core.telegram.org/bots/api#inputrichmessage"
+  },
+  "sendRichMessage": {
+    "supports": ["message_thread_id", "reply_parameters", "rich_message", "reply_markup"]
+  },
+  "inputRichMessage": {
+    "supports": ["markdown", "skip_entity_detection"],
+    "forbids": ["blocks", "media"]
+  },
+  "pinnedOutgoingContract": {
+    "forbidden": ["blocks", "media"]
+  }
+}

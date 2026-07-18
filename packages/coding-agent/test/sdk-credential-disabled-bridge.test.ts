@@ -9,9 +9,10 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { Extension, ExtensionError, ExtensionFactory } from "@gajae-code/coding-agent/extensibility/extensions";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions";
 import { ExtensionRuntime } from "@gajae-code/coding-agent/extensibility/extensions/loader";
-import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { createAgentSession, discoverAuthStorage } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
+import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 
 interface SessionDirs {
 	cwd: string;
@@ -83,8 +84,40 @@ const initializeRunnerForTest = (runner: ExtensionRunner | undefined): void => {
 	);
 };
 
+async function stopDetachedBroker(agentDir: string): Promise<void> {
+	const discovery = await readBrokerDiscovery(agentDir);
+	if (!discovery) return;
+	try {
+		process.kill(discovery.pid, "SIGTERM");
+	} catch {
+		return;
+	}
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		try {
+			process.kill(discovery.pid, 0);
+			await Bun.sleep(25);
+		} catch {
+			return;
+		}
+	}
+	try {
+		process.kill(discovery.pid, "SIGKILL");
+	} catch {}
+}
+
 describe("createAgentSession credential_disabled subscription", () => {
 	const tempDirs: string[] = [];
+	const authStorages = new Set<AuthStorage>();
+
+	const createTestAuthStorage = async (
+		filePath: string,
+		options?: { onCredentialDisabled?: (event: CredentialDisabledEvent) => void },
+	): Promise<AuthStorage> => {
+		const storage = await AuthStorage.create(filePath, options);
+		authStorages.add(storage);
+		return storage;
+	};
 
 	const makeDirs = (label: string): SessionDirs => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-credential-disabled-${label}-${Snowflake.next()}-`));
@@ -143,17 +176,26 @@ describe("createAgentSession credential_disabled subscription", () => {
 		for (let i = 0; i < 5; i++) await Promise.resolve();
 	};
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const storage of authStorages) {
+			try {
+				storage.close();
+			} catch {}
+		}
+		authStorages.clear();
 		for (const dir of tempDirs.splice(0)) {
-			fs.rmSync(dir, { recursive: true, force: true });
+			await stopDetachedBroker(path.join(dir, "agent"));
+			Bun.gc(true);
+			await Bun.sleep(50);
+			await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 		}
 	});
 
 	it("fans events out to both embedder and session-extension subscribers", async () => {
 		const dirs = makeDirs("fanout");
 		const embedderEvents: CredentialDisabledEvent[] = [];
-		const authStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent.db"), {
+		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"), {
 			onCredentialDisabled: event => {
 				embedderEvents.push(event);
 			},
@@ -184,7 +226,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 	it("session.dispose() unsubscribes the session's listener; the embedder's listener keeps firing", async () => {
 		const dirs = makeDirs("dispose");
 		const embedderEvents: CredentialDisabledEvent[] = [];
-		const authStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent.db"), {
+		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"), {
 			onCredentialDisabled: event => {
 				embedderEvents.push(event);
 			},
@@ -224,7 +266,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 		async () => {
 			const sharedDirs = makeDirs("concurrent");
 			const embedderEvents: CredentialDisabledEvent[] = [];
-			const authStorage = await AuthStorage.create(path.join(sharedDirs.agentDir, "agent.db"), {
+			const authStorage = await createTestAuthStorage(path.join(sharedDirs.agentDir, "agent.db"), {
 				onCredentialDisabled: event => {
 					embedderEvents.push(event);
 				},
@@ -301,7 +343,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 		// rather than the real context wired in by mode controllers.
 		const dirs = makeDirs("pre-init");
 		// No constructor handler — verifies the default case still defers properly.
-		const authStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent.db"));
+		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
 		const ext = makeRecordingExtension();
 
 		const { session } = await createAgentSession(baseOptions(dirs, authStorage, [ext.factory]));
@@ -337,7 +379,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 		// and the extension runner (deferred until initialize).
 		const dirs = makeDirs("embedder-and-extension");
 		const embedderEvents: CredentialDisabledEvent[] = [];
-		const authStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent.db"), {
+		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"), {
 			onCredentialDisabled: event => {
 				embedderEvents.push(event);
 			},
@@ -374,10 +416,60 @@ describe("createAgentSession credential_disabled subscription", () => {
 		}
 	});
 
+	it("closes a newly discovered store when its initial reload fails", async () => {
+		const reloadError = new Error("initial reload failed");
+		const storage = {
+			reload: vi.fn(async () => {
+				throw reloadError;
+			}),
+			close: vi.fn(),
+		} as unknown as AuthStorage;
+		vi.spyOn(AuthStorage, "create").mockResolvedValue(storage);
+
+		await expect(discoverAuthStorage(makeDirs("reload-failure").agentDir)).rejects.toBe(reloadError);
+
+		expect(storage.close).toHaveBeenCalledTimes(1);
+	});
+
+	it("cleans an abandoned credential listener without closing caller-owned storage", async () => {
+		const dirs = makeDirs("settings-failure");
+		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
+		const close = vi.spyOn(authStorage, "close");
+		const originalSubscribe = authStorage.onCredentialDisabled.bind(authStorage);
+		let unsubscriptions = 0;
+		vi.spyOn(authStorage, "onCredentialDisabled").mockImplementation(listener => {
+			const unsubscribe = originalSubscribe(listener);
+			return () => {
+				unsubscriptions++;
+				unsubscribe();
+			};
+		});
+		vi.spyOn(Settings, "init").mockRejectedValue(new Error("settings initialization failed"));
+		const { settings: _settings, ...startupOptions } = baseOptions(dirs, authStorage);
+
+		await expect(createAgentSession(startupOptions)).rejects.toThrow(/settings initialization failed/);
+
+		expect(unsubscriptions).toBe(1);
+		expect(close).not.toHaveBeenCalled();
+	});
+
+	it("closes internally owned storage when startup fails before AgentSession construction", async () => {
+		const dirs = makeDirs("owned-settings-failure");
+		const storage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
+		const close = vi.spyOn(storage, "close");
+		vi.spyOn(AuthStorage, "create").mockResolvedValue(storage);
+		vi.spyOn(Settings, "init").mockRejectedValue(new Error("settings initialization failed"));
+
+		await expect(createAgentSession({ cwd: dirs.cwd, agentDir: dirs.agentDir })).rejects.toThrow(
+			/settings initialization failed/,
+		);
+
+		expect(close).toHaveBeenCalledTimes(1);
+	});
 	it("releases the session subscription if createAgentSession throws mid-startup", async () => {
 		const dirs = makeDirs("startup-failure");
 		const embedderEvents: CredentialDisabledEvent[] = [];
-		const authStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent.db"), {
+		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"), {
 			onCredentialDisabled: event => {
 				embedderEvents.push(event);
 			},
@@ -411,7 +503,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 	it("subscribes through the registry's auth storage when only options.modelRegistry is provided", async () => {
 		const dirs = makeDirs("registry-only");
 		const embedderEvents: CredentialDisabledEvent[] = [];
-		const authStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent.db"), {
+		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"), {
 			onCredentialDisabled: event => {
 				embedderEvents.push(event);
 			},
@@ -455,8 +547,8 @@ describe("createAgentSession credential_disabled subscription", () => {
 
 	it("rejects when options.authStorage and options.modelRegistry.authStorage are different instances", async () => {
 		const dirs = makeDirs("mismatch");
-		const registryStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent-registry.db"));
-		const otherStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent-other.db"));
+		const registryStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent-registry.db"));
+		const otherStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent-other.db"));
 		const modelRegistry = new ModelRegistry(registryStorage);
 
 		await expect(
@@ -484,7 +576,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 		// Handler exceptions were therefore silently dropped. The flush is now deferred
 		// by one microtask so a sync onError() registration lands in time.
 		const dirs = makeDirs("error-routing");
-		const authStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent.db"));
+		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
 		try {
 			const throwingExtension: Extension = {

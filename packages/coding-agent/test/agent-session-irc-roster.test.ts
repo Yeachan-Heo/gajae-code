@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentMessage } from "@gajae-code/agent-core";
+import type { SimpleStreamOptions } from "@gajae-code/ai";
 import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
@@ -35,6 +36,8 @@ function createHarness(
 		model?: MockModel;
 		getApiKey?: () => Promise<string>;
 		retryEnabled?: boolean;
+		transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
+		onPayload?: SimpleStreamOptions["onPayload"];
 	} = {},
 ): Harness {
 	const model = options.model ?? createMockModel({ handler: () => ({ content: ["ok"] }) });
@@ -61,6 +64,8 @@ function createHarness(
 			snapshots.push(messages);
 			return convertToLlm(messages);
 		},
+		transformContext: options.transformContext,
+		onPayload: options.onPayload,
 	});
 	testSessions.push(session);
 	return { session, registry, model, snapshots, sessionManager };
@@ -99,8 +104,41 @@ async function prompt(harness: Harness, text = "hello"): Promise<void> {
 async function ephemeral(harness: Harness, text = "side request"): Promise<void> {
 	await harness.session.runEphemeralTurn({ promptText: text });
 }
+async function background(harness: Harness, text = "side request"): Promise<void> {
+	await harness.session.respondAsBackground({ from: "1-Worker", message: text });
+}
 
 describe("AgentSession IRC roster delivery", () => {
+	it("applies ephemeral context transforms and provider hooks without mutating history", async () => {
+		let providerOptions: SimpleStreamOptions | undefined;
+		const model = createMockModel({
+			handler: async (_context, options) => {
+				providerOptions = options;
+				await options?.onPayload?.({ request: "ephemeral" });
+				return { content: ["ok"] };
+			},
+		});
+		const transformContext = vi.fn((messages: AgentMessage[]) => [
+			...messages.filter(message => message.role !== "user" || message.content !== "filtered history"),
+			{ role: "user" as const, content: "injected context", timestamp: Date.now() },
+		]);
+		const onPayload = vi.fn();
+		const harness = createHarness({ model, transformContext, onPayload });
+		const filtered: AgentMessage = { role: "user", content: "filtered history", timestamp: Date.now() };
+		const retained: AgentMessage = { role: "user", content: "retained history", timestamp: Date.now() };
+		harness.session.agent.appendMessage(filtered);
+		harness.session.agent.appendMessage(retained);
+		const historyBefore = structuredClone(harness.session.agent.state.messages);
+
+		await harness.session.runEphemeralTurn({ promptText: "side request" });
+
+		expect(transformContext).toHaveBeenCalledTimes(1);
+		expect(JSON.stringify(harness.snapshots.at(-1))).not.toContain("filtered history");
+		expect(JSON.stringify(harness.snapshots.at(-1))).toContain("injected context");
+		expect(onPayload).toHaveBeenCalledTimes(1);
+		expect(providerOptions?.sessionId).not.toBe(harness.session.sessionId);
+		expect(harness.session.agent.state.messages).toEqual(historyBefore);
+	});
 	it("emits one hidden roster reminder for the first roster change", async () => {
 		const harness = createHarness();
 		addPeer(harness.registry);
@@ -155,23 +193,50 @@ describe("AgentSession IRC roster delivery", () => {
 
 		expect(deliveredRosters(harness)).toHaveLength(1);
 	});
-
-	it("applies the same changed-only roster rule to /btw ephemeral turns", async () => {
-		const harness = createHarness();
+	it("lets direct ephemeral turns claim roster context without conflicting with background replies", async () => {
+		const harness = createHarness({
+			model: createMockModel({ handler: () => ({ content: ["repeat\nrepeat\nrepeat\nrepeat\nrepeat"] }) }),
+		});
 		addPeer(harness.registry);
-		await ephemeral(harness, "<btw>first</btw>");
-		await ephemeral(harness, "<btw>second</btw>");
+		const direct = await harness.session.runEphemeralTurn({ promptText: "direct side turn" });
+		const reply = await harness.session.respondAsBackground({ from: "1-Worker", message: "ping" });
 
+		expect(direct.replyText).toBe("repeat\nrepeat\nrepeat\nrepeat\nrepeat");
+		expect(reply.replyText).toContain("[…5×]");
 		expect(deliveredRosters(harness)).toHaveLength(1);
+		expect(deliveredRosters(harness)[0]).toContain("1-Worker (1-Worker label)");
+		expect(findRosterMessage(harness)).toBeUndefined();
 	});
 
-	it("delivers a concurrent main and ephemeral turn through exactly one carrier", async () => {
-		const release = Promise.withResolvers<void>();
+	it("commits direct ephemeral roster delivery without persisting it", async () => {
+		const harness = createHarness();
+		addPeer(harness.registry);
+		const before = [...harness.session.agent.state.messages];
+		await ephemeral(harness, "<btw>first</btw>");
+		await ephemeral(harness, "<btw>second</btw>");
+		addPeer(harness.registry, "2-Worker");
+		await ephemeral(harness, "<btw>changed</btw>");
+
+		expect(deliveredRosters(harness)).toHaveLength(2);
+		expect(deliveredRosters(harness)[1]).toContain("2-Worker (2-Worker label)");
+		expect(harness.session.agent.state.messages).toEqual(before);
+	});
+
+	it("completes a /btw ephemeral turn before an active main turn releases", async () => {
+		const releaseMain = Promise.withResolvers<void>();
+		const mainStarted = Promise.withResolvers<void>();
 		let calls = 0;
+		let mainStreamSessionId: string | undefined;
 		const model = createMockModel({
-			handler: async () => {
+			handler: async (_context, options) => {
 				calls += 1;
-				if (calls === 1) await release.promise;
+				if (calls === 1) {
+					mainStreamSessionId = options?.sessionId;
+					mainStarted.resolve();
+					await releaseMain.promise;
+				} else if (options?.sessionId === mainStreamSessionId) {
+					await releaseMain.promise;
+				}
 				return { content: ["ok"] };
 			},
 		});
@@ -179,12 +244,18 @@ describe("AgentSession IRC roster delivery", () => {
 		addPeer(harness.registry);
 
 		const main = prompt(harness, "main");
-		await Bun.sleep(0);
-		const side = ephemeral(harness);
-		release.resolve();
-		await Promise.all([main, side]);
+		await mainStarted.promise;
+		const historyDuringMain = [...harness.session.agent.state.messages];
+		const side = await harness.session.runEphemeralTurn({ promptText: "<btw>side request</btw>" });
 
-		expect(deliveredRosters(harness)).toHaveLength(1);
+		expect(side.replyText).toBe("ok");
+		expect(harness.session.isStreaming).toBe(true);
+		expect(harness.session.agent.state.messages).toEqual(historyDuringMain);
+		expect(model.calls).toHaveLength(2);
+		expect(model.calls[1]?.options?.sessionId).not.toBe(model.calls[0]?.options?.sessionId);
+
+		releaseMain.resolve();
+		await main;
 	});
 
 	it("releases a normal-turn roster claim after a resolving error outcome", async () => {
@@ -246,7 +317,7 @@ describe("AgentSession IRC roster delivery", () => {
 		expect(deliveredRosters(harness)).toHaveLength(1);
 	});
 
-	it("omits an ephemeral roster claim invalidated during API-key resolution and redelivers it once", async () => {
+	it("omits a direct ephemeral roster claim invalidated during API-key resolution and redelivers it once", async () => {
 		const apiKey = Promise.withResolvers<string>();
 		const claimAcquired = Promise.withResolvers<void>();
 		const harness = createHarness({
@@ -268,7 +339,7 @@ describe("AgentSession IRC roster delivery", () => {
 		expect(deliveredRosters(harness)).toHaveLength(1);
 	});
 
-	it("releases a failed claimant so a later turn retries the same signature", async () => {
+	it("releases a failed direct ephemeral claimant so a later turn retries the same signature", async () => {
 		let fail = true;
 		const model = createMockModel({
 			handler: () => (fail ? { throw: "temporary failure" } : { content: ["ok"] }),
@@ -279,6 +350,58 @@ describe("AgentSession IRC roster delivery", () => {
 		await expect(ephemeral(harness)).rejects.toThrow("temporary failure");
 		fail = false;
 		await ephemeral(harness);
+
+		const deliveries = deliveredRosters(harness);
+		expect(deliveries).toHaveLength(2);
+		expect(deliveries[0]).toBe(deliveries[1]);
+	});
+	it("releases an aborted direct ephemeral roster claim for retry", async () => {
+		const apiKey = Promise.withResolvers<string>();
+		const claimAcquired = Promise.withResolvers<void>();
+		const harness = createHarness({
+			getApiKey: async () => {
+				claimAcquired.resolve();
+				return apiKey.promise;
+			},
+		});
+		addPeer(harness.registry);
+		const controller = new AbortController();
+
+		const aborted = harness.session.runEphemeralTurn({ promptText: "abort", signal: controller.signal });
+		await claimAcquired.promise;
+		controller.abort();
+		await expect(aborted).rejects.toThrow();
+		apiKey.resolve("test-key");
+		await ephemeral(harness, "retry");
+
+		expect(deliveredRosters(harness)).toHaveLength(1);
+	});
+	it("does not commit a direct roster claim when an abort-ignoring provider completes", async () => {
+		const providerStarted = Promise.withResolvers<void>();
+		const allowProviderCompletion = Promise.withResolvers<void>();
+		let calls = 0;
+		const harness = createHarness({
+			model: createMockModel({
+				handler: async () => {
+					calls += 1;
+					if (calls === 1) {
+						providerStarted.resolve();
+						await allowProviderCompletion.promise;
+					}
+					return { content: ["ok"] };
+				},
+			}),
+		});
+		addPeer(harness.registry);
+		const controller = new AbortController();
+
+		const aborted = harness.session.runEphemeralTurn({ promptText: "abort", signal: controller.signal });
+		await providerStarted.promise;
+		controller.abort();
+		allowProviderCompletion.resolve();
+		await expect(aborted).rejects.toThrow();
+
+		await ephemeral(harness, "retry");
 
 		const deliveries = deliveredRosters(harness);
 		expect(deliveries).toHaveLength(2);
@@ -296,12 +419,12 @@ describe("AgentSession IRC roster delivery", () => {
 		const harness = createHarness({ model });
 		addPeer(harness.registry, "1-Worker");
 
-		const first = ephemeral(harness);
+		const first = background(harness);
 		await Bun.sleep(0);
 		addPeer(harness.registry, "2-Worker");
 		release.resolve();
 		await first;
-		await ephemeral(harness);
+		await background(harness);
 
 		const deliveries = deliveredRosters(harness);
 		expect(deliveries).toHaveLength(2);
@@ -319,12 +442,12 @@ describe("AgentSession IRC roster delivery", () => {
 		const harness = createHarness({ model });
 		addPeer(harness.registry);
 
-		const first = ephemeral(harness);
+		const first = background(harness);
 		await Bun.sleep(0);
 		await harness.session.newSession();
 		release.resolve();
 		await first;
-		await ephemeral(harness);
+		await background(harness);
 
 		expect(deliveredRosters(harness)).toHaveLength(2);
 	});

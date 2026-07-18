@@ -851,8 +851,8 @@ function dedupeIrcReply(text: string): string {
  * `provider` is the target provider string (e.g. `"anthropic"`) and gates the
  * `account_uuid` and `device_id` lookups — only `"anthropic"` requests carry them.
  *
- * `sessionId` is forwarded to the auth-storage session-sticky lookup so that
- * multi-credential setups attribute to the same OAuth account used for the
+ * `credentialSessionId` is forwarded to the auth-storage session-sticky lookup
+ * so multi-credential setups attribute to the same OAuth account used for the
  * actual API request rather than always picking the first credential.
  *
  * `authStorage` is treated as optional so test fixtures that stub `modelRegistry`
@@ -863,6 +863,7 @@ function buildSessionMetadata(
 	sessionId: string,
 	provider: string,
 	authStorage: AuthStorage | undefined,
+	credentialSessionId = sessionId,
 ): Record<string, unknown> {
 	const userId: Record<string, string> = { session_id: sessionId };
 	// Only look up account_uuid when the request is going to Anthropic. Injecting
@@ -870,7 +871,7 @@ function buildSessionMetadata(
 	// Anthropic-format-compatible proxies like cloudflare-ai-gateway or gitlab-duo)
 	// would leak the user's Anthropic identity to unrelated third-party APIs.
 	if (provider === "anthropic") {
-		const accountUuid = authStorage?.getOAuthAccountId("anthropic", sessionId);
+		const accountUuid = authStorage?.getOAuthAccountId("anthropic", credentialSessionId);
 		if (typeof accountUuid === "string" && accountUuid.length > 0) {
 			userId.account_uuid = accountUuid;
 			// Derive device_id from account_uuid so the payload matches the real CC
@@ -1093,6 +1094,7 @@ function extractPermissionLocations(
  *  rely on the existing text-equality match. `sequence` gives each queued chip a
  *  stable edit id while the display arrays preserve delivery order. */
 type QueuedDisplayEntry = { text: string; tag?: string; sequence: number };
+type IrcRosterClaim = { token: symbol; signature: string; epoch: number; message: CustomMessage };
 export type QueuedMessageEditMode = "steer" | "followUp";
 
 export interface QueuedMessageEditEntry {
@@ -1512,7 +1514,7 @@ export class AgentSession {
 	#agentRegistry: AgentRegistry | undefined;
 	#lastDeliveredIrcRosterSignature: string | null = null;
 	#ircRosterEpoch = 0;
-	#ircRosterClaim: { token: symbol; signature: string; epoch: number } | null = null;
+	#ircRosterClaim: IrcRosterClaim | null = null;
 	#providerSessionId: string | undefined;
 	#providerCacheSessionId: string | undefined;
 	#isDisposed = false;
@@ -13174,12 +13176,22 @@ export class AgentSession {
 		// failures and sender aborts therefore leave no accepted IRC batch or UI
 		// observation. The deferred roster claim is committed only after the pair
 		// below is accepted.
-		const { replyText, commitRosterClaim, releaseRosterClaim } = await this.runEphemeralTurn({
-			promptText: incomingPrompt,
-			signal: args.signal,
-			deferRosterCommit: true,
-		});
+		const rosterClaim = this.#claimIrcRosterCandidate();
 		try {
+			const rosterMessage =
+				rosterClaim && this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch)
+					? rosterClaim.message
+					: undefined;
+			const { replyText: generatedReplyText } = await this.runEphemeralTurn({
+				promptText: incomingPrompt,
+				signal: args.signal,
+				prependMessages: rosterMessage ? [rosterMessage] : undefined,
+				prependMessagesValid: rosterClaim
+					? () => this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch)
+					: undefined,
+				ircRosterClaim: rosterClaim,
+			});
+			const replyText = dedupeIrcReply(generatedReplyText);
 			const replyObservationId = crypto.randomUUID();
 			const replyRecord: CustomMessage = {
 				role: "custom",
@@ -13194,7 +13206,7 @@ export class AgentSession {
 			// roster claim, notifying either UI, or resolving the sender delivery.
 			args.signal?.throwIfAborted();
 			this.#queueBackgroundExchangeInjection([incomingRecord, replyRecord], { deferFlush: true });
-			commitRosterClaim?.();
+			if (rosterClaim) this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			this.#flushOrSchedulePendingBackgroundExchanges();
 			announceIncoming();
 			this.#emitIrcObservation(replyRecord);
@@ -13209,7 +13221,7 @@ export class AgentSession {
 
 			return { replyText };
 		} finally {
-			releaseRosterClaim?.();
+			if (rosterClaim) this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 		}
 	}
 
@@ -13349,14 +13361,14 @@ export class AgentSession {
 		};
 	}
 
-	#claimIrcRosterCandidate(): { token: symbol; epoch: number; message: CustomMessage } | null {
+	#claimIrcRosterCandidate(): IrcRosterClaim | null {
 		if (this.#ircRosterClaim) return null;
 		const candidate = this.#buildIrcRosterCandidate();
 		if (!candidate || candidate.signature === this.#lastDeliveredIrcRosterSignature) return null;
 		const token = Symbol("irc-roster");
 		const epoch = this.#ircRosterEpoch;
-		this.#ircRosterClaim = { token, signature: candidate.signature, epoch };
-		return { token, epoch, message: candidate.message };
+		this.#ircRosterClaim = { token, signature: candidate.signature, epoch, message: candidate.message };
+		return { token, signature: candidate.signature, epoch, message: candidate.message };
 	}
 
 	#isCurrentIrcRosterClaim(token: symbol, epoch: number): boolean {
@@ -13398,40 +13410,44 @@ export class AgentSession {
 		promptText: string;
 		onTextDelta?: (delta: string) => void;
 		signal?: AbortSignal;
-		/** Defer the successful roster-claim commit until the caller accepts its exchange. */
-		deferRosterCommit?: boolean;
+		/** Internal caller-supplied, non-persistent context such as the IRC roster. */
+		prependMessages?: AgentMessage[];
+		/** Revalidates optional caller context after asynchronous boundaries. */
+		prependMessagesValid?: () => boolean;
+		/**
+		 * An existing IRC roster claim owned by the caller. `undefined` makes this
+		 * turn claim and commit its own roster candidate; `null` opts out.
+		 */
+		ircRosterClaim?: IrcRosterClaim | null;
 	}): Promise<{
 		replyText: string;
 		assistantMessage: AssistantMessage;
-		commitRosterClaim?: () => void;
-		releaseRosterClaim?: () => void;
 	}> {
-		const rosterClaim = this.#claimIrcRosterCandidate();
-		let rosterClaimDeferred = false;
+		args.signal?.throwIfAborted();
+		const callerOwnsRosterClaim = args.ircRosterClaim !== undefined;
+		const rosterClaim = callerOwnsRosterClaim ? args.ircRosterClaim : this.#claimIrcRosterCandidate();
+		const rosterClaimIsCurrent = () =>
+			!rosterClaim || this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
+		const prependMessagesValid = () => rosterClaimIsCurrent() && args.prependMessagesValid?.() !== false;
+		const rosterMessage = !callerOwnsRosterClaim && rosterClaimIsCurrent() ? rosterClaim?.message : undefined;
 		try {
 			const model = this.model;
 			if (!model) {
 				throw new Error("No active model on session");
 			}
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+			const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, this.sessionId), args.signal);
 			if (!apiKey) {
 				throw new Error(`No API key for ${model.provider}/${model.id}`);
 			}
 
-			const rosterMessage =
-				rosterClaim && this.#isCurrentIrcRosterClaim(rosterClaim.token, rosterClaim.epoch)
-					? rosterClaim.message
-					: undefined;
-			if (rosterClaim && !rosterMessage) {
-				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
-			}
-			let snapshot = this.#buildEphemeralSnapshot(args.promptText, rosterMessage ? [rosterMessage] : undefined);
-			let llmMessages = await this.convertMessagesToLlm(snapshot, args.signal);
-			if (rosterMessage && !this.#isCurrentIrcRosterClaim(rosterClaim!.token, rosterClaim!.epoch)) {
-				this.#releaseIrcRosterClaim(rosterClaim!.token, rosterClaim!.epoch);
-				// Conversion is asynchronous, so rebuild without a claim invalidated while it awaited.
+			const prependMessages = prependMessagesValid()
+				? [...(rosterMessage ? [rosterMessage] : []), ...(args.prependMessages ?? [])]
+				: undefined;
+			let snapshot = this.#buildEphemeralSnapshot(args.promptText, prependMessages);
+			let llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
+			if (prependMessages && !prependMessagesValid()) {
 				snapshot = this.#buildEphemeralSnapshot(args.promptText);
-				llmMessages = await this.convertMessagesToLlm(snapshot, args.signal);
+				llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
 			}
 			const context: Context = {
 				systemPrompt: this.systemPrompt,
@@ -13442,10 +13458,20 @@ export class AgentSession {
 				// removes the surface entirely.
 				tools: [],
 			};
+			// Providers use sessionId as their sticky stream identity. Reusing the
+			// active turn's identity makes this no-history request wait behind its
+			// stream (notably on the WebSocket transport), so it must be unique.
+			const ephemeralSessionId = crypto.randomUUID();
 			const options = this.prepareSimpleStreamOptions(
 				{
 					apiKey,
-					sessionId: this.sessionId,
+					sessionId: ephemeralSessionId,
+					metadata: buildSessionMetadata(
+						ephemeralSessionId,
+						model.provider,
+						this.#modelRegistry.authStorage,
+						this.sessionId,
+					),
 					reasoning: toReasoningEffort(this.thinkingLevel),
 					hideThinkingSummary: this.agent.hideThinkingSummary,
 					serviceTier: this.serviceTier,
@@ -13457,6 +13483,7 @@ export class AgentSession {
 
 			let replyText = "";
 			let assistantMessage: AssistantMessage | undefined;
+			args.signal?.throwIfAborted();
 			const stream = streamSimple(model, context, options);
 			for await (const event of stream) {
 				if (event.type === "text_delta") {
@@ -13476,31 +13503,25 @@ export class AgentSession {
 			if (!assistantMessage) {
 				throw new Error("Ephemeral turn ended without a final message");
 			}
-			if (rosterClaim && args.deferRosterCommit) {
-				rosterClaimDeferred = true;
-				let rosterClaimSettled = false;
-				const settleRosterClaim = (commit: boolean) => {
-					if (rosterClaimSettled) return;
-					rosterClaimSettled = true;
-					if (commit) {
-						this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
-					} else {
-						this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
-					}
-				};
-				return {
-					replyText: dedupeIrcReply(replyText.trim()),
-					assistantMessage,
-					commitRosterClaim: () => settleRosterClaim(true),
-					releaseRosterClaim: () => settleRosterClaim(false),
-				};
-			}
-			if (rosterClaim) {
+			// A provider may ignore the caller signal and yield a normal terminal event.
+			// Do not let that completion commit a direct roster claim or report success.
+			args.signal?.throwIfAborted();
+			if (
+				!callerOwnsRosterClaim &&
+				rosterClaim &&
+				assistantMessage.stopReason !== "error" &&
+				assistantMessage.stopReason !== "aborted"
+			) {
+				args.signal?.throwIfAborted();
 				this.#commitIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
-			return { replyText: dedupeIrcReply(replyText.trim()), assistantMessage };
+			args.signal?.throwIfAborted();
+			return {
+				replyText: replyText.trim(),
+				assistantMessage,
+			};
 		} finally {
-			if (rosterClaim && !rosterClaimDeferred) {
+			if (!callerOwnsRosterClaim && rosterClaim) {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 		}
@@ -13550,7 +13571,7 @@ export class AgentSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		});
-		return messages;
+		return cloneJsonValueForForkSeed(messages);
 	}
 
 	#queueBackgroundExchangeInjection(messages: CustomMessage[], options?: { deferFlush?: boolean }): void {
@@ -14811,6 +14832,27 @@ export class AgentSession {
 	}
 }
 
+async function awaitEphemeralAbort<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+	signal?.throwIfAborted();
+	if (!signal) return await pending;
+
+	const cancellation = Promise.withResolvers<never>();
+	const abort = () => {
+		try {
+			signal.throwIfAborted();
+		} catch (error) {
+			cancellation.reject(error);
+		}
+	};
+	signal.addEventListener("abort", abort, { once: true });
+	try {
+		const result = await Promise.race([pending, cancellation.promise]);
+		signal.throwIfAborted();
+		return result;
+	} finally {
+		signal.removeEventListener("abort", abort);
+	}
+}
 function cloneJsonValueForForkSeed<T>(value: T): T {
 	return structuredClone(value);
 }

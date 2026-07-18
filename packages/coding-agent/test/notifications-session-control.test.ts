@@ -32,6 +32,7 @@ const BASE_CONFIG: NotificationConfig = {
 	richDraft: { enabled: false },
 	streaming: { enabled: false },
 	topics: { nameTemplate: undefined },
+	btw: { enabled: true },
 };
 
 type Call = { kind: "start" | "stop" | "daemon"; cwd: string; sessionId: string };

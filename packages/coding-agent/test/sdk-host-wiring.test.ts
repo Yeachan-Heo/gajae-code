@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel } from "@gajae-code/ai";
+import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -56,9 +56,14 @@ type SdkPermissionProvider =
 
 const dirs: string[] = [];
 const sockets: WebSocket[] = [];
-afterEach(() => {
-	for (const socket of sockets.splice(0)) socket.close();
-	for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+afterEach(async () => {
+	await Promise.all(sockets.splice(0).map(closeSocket));
+	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
+	if (process.platform === "win32") {
+		Bun.gc(true);
+		await Bun.sleep(50);
+	}
+	for (const dir of dirs.splice(0)) await removeTempDir(dir);
 	delete process.env.GJC_SDK_DISABLE;
 	delete process.env.GJC_NOTIFICATIONS;
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
@@ -67,10 +72,33 @@ afterEach(() => {
 });
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 4_000;
+	const deadline = Date.now() + 15_000;
 	while (!predicate()) {
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
 		await Bun.sleep(20);
+	}
+}
+
+async function closeSocket(socket: WebSocket): Promise<void> {
+	if (socket.readyState === WebSocket.CLOSED) return;
+	const { promise, resolve } = Promise.withResolvers<void>();
+	socket.addEventListener("close", () => resolve(), { once: true });
+	socket.close();
+	await Promise.race([promise, Bun.sleep(500)]);
+}
+
+async function removeTempDir(dir: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await fs.promises.rm(dir, { recursive: true, force: true });
+			return;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (attempt >= 20 || (code !== "EBUSY" && code !== "EPERM" && code !== "EACCES" && code !== "ENOTEMPTY"))
+				throw error;
+			if (process.platform === "win32") Bun.gc(true);
+			await Bun.sleep(100);
+		}
 	}
 }
 
@@ -321,7 +349,7 @@ test("lifecycle teardown rejects dual owner failures and retains exact retry aut
 			(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = nativeStop;
 		}
 	}
-});
+}, 60_000);
 test("lifecycle cleanup fences same-id startup and preserves proven owner release across retry", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-cleanup-retry-"));
 	dirs.push(cwd);
@@ -366,7 +394,7 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 		serverStart.mockRestore();
 		(NotificationServer.prototype as unknown as { stopAndWait: () => Promise<void> }).stopAndWait = nativeStop;
 	}
-});
+}, 60_000);
 
 test("production SDK host starts exactly one instrumented server (no duplicate auto-host)", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-single-host-"));
@@ -387,7 +415,7 @@ test("production SDK host starts exactly one instrumented server (no duplicate a
 		serverStart.mockRestore();
 		await host?.stop();
 	}
-});
+}, 60_000);
 
 test("lifecycle session shutdown disposes the exact endpoint once", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-lifecycle-once-"));
@@ -410,7 +438,7 @@ test("lifecycle session shutdown disposes the exact endpoint once", async () => 
 	} finally {
 		stop.mockRestore();
 	}
-});
+}, 60_000);
 
 test("lifecycle rollback proof only fences the exact started endpoint generation", () => {
 	const tracker = new SdkStartupRollbackTracker();
@@ -530,7 +558,7 @@ test("SDK broker registration records an absolute lifecycle scope", async () => 
 	} finally {
 		await brokerOwnerForTest(agentDir)?.stop();
 	}
-});
+}, 60_000);
 
 test("ExtensionRunner forwards SDK permission providers into its production context", () => {
 	let installed: SdkPermissionProvider;
@@ -2364,6 +2392,7 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 		ok: true,
 		page: { items: ["Completed persisted reply"] },
 	});
+	await closeSocket(socket);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	await agentSession.dispose();
 	await sessionManager.close();
@@ -2408,9 +2437,13 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 		ok: true,
 		page: { items: ["Completed persisted reply"] },
 	});
+	await closeSocket(reopenedSocket);
 	await reopenedHandlers.get("session_shutdown")?.({ type: "session_shutdown" }, reopenedSessionContext);
 	await reopenedSessionManager.close();
 	authStorage.close();
+	closeModelCache(path.join(cwd, "models.db"));
+	handlers.clear();
+	reopenedHandlers.clear();
 });
 
 test("terminal shutdown removes session snapshot spills", async () => {

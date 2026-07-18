@@ -13,6 +13,7 @@ export interface EnsureBrokerSettings {
 }
 
 const DISCOVERY_TIMEOUT_MS = 10_000;
+const FIXTURE_DISCOVERY_TIMEOUT_MS = 30_000;
 // Bounded grace windows for reaping a spawned broker on failure, mirroring the
 // owned-process teardown convention (SIGTERM -> grace -> SIGKILL -> hard cap).
 const REAP_GRACEFUL_MS = 2_000;
@@ -215,7 +216,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		spawnError = error;
 	});
 	const owner = registerBrokerOwner(settings.agentDir, child);
-	const deadline = Date.now() + DISCOVERY_TIMEOUT_MS;
+	const discoveryTimeoutMs = initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS;
+	const deadline = Date.now() + discoveryTimeoutMs;
 	let discoveryError: unknown;
 	while (Date.now() < deadline) {
 		if (spawnError || child.exitCode !== null || child.signalCode !== null) break;

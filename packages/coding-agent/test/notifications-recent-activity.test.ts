@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { listRecentSessions } from "@gajae-code/coding-agent/sdk/bus/recent-activity";
+import * as native from "@gajae-code/natives";
 import {
 	prepareManagedSessionScopeForWriteSync,
 	resolveManagedScope,
@@ -28,6 +29,15 @@ async function managedDirectory(root: string, cwd: string): Promise<string> {
 	return prepared.scope.directoryPath;
 }
 
+type NativeSecurity = { ok: true } | { ok: false; code: string };
+
+function secureOwnerOnlyFile(pathname: string): void {
+	const applied = native.applyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
+	if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
+	const verified = native.verifyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
+	if (!verified.ok) throw new Error(`Owner-only security rejected ${pathname}: ${verified.code}`);
+}
+
 function writeSession(
 	directory: string,
 	filename: string,
@@ -42,7 +52,7 @@ function writeSession(
 		`${JSON.stringify({ type: "session", id: filename, cwd, ...header })}\n${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`,
 		{ mode: 0o600 },
 	);
-	fs.chmodSync(file, 0o600);
+	secureOwnerOnlyFile(file);
 	fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
 	return file;
 }

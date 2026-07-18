@@ -1,7 +1,7 @@
 //! Canonical directory identity and fail-closed path security helpers.
 
 use std::{
-	io,
+	io::{self, Read},
 	path::{Component, Path, PathBuf},
 };
 
@@ -10,6 +10,7 @@ use napi::{
 	bindgen_prelude::{BigInt, Either, Uint8Array},
 };
 use napi_derive::napi;
+use sha2::{Digest, Sha256};
 
 /// Result of resolving an existing directory to its stable platform identity.
 #[napi(object)]
@@ -142,92 +143,21 @@ fn parse_sha256(value: Option<&String>) -> Option<[u8; 32]> {
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
-	const INITIAL: [u32; 8] = [
-		0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-		0x5be0cd19,
-	];
-	const K: [u32; 64] = [
-		0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-		0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-		0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-		0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-		0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-		0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-		0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-		0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-		0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-		0xc67178f2,
-	];
-	let bit_length = (bytes.len() as u64).wrapping_mul(8);
-	let mut padded = Vec::with_capacity(bytes.len() + 72);
-	padded.extend_from_slice(bytes);
-	padded.push(0x80);
-	while (padded.len() + 8) % 64 != 0 {
-		padded.push(0);
-	}
-	padded.extend_from_slice(&bit_length.to_be_bytes());
-	let mut state = INITIAL;
-	for block in padded.chunks_exact(64) {
-		let mut words = [0u32; 64];
-		for (index, chunk) in block.chunks_exact(4).take(16).enumerate() {
-			words[index] = u32::from_be_bytes(chunk.try_into().expect("SHA-256 block word"));
+	let mut hasher = Sha256::new();
+	hasher.update(bytes);
+	hasher.finalize().into()
+}
+
+fn digest_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
+	let mut hasher = Sha256::new();
+	let mut chunk = [0u8; 16 * 1024];
+	loop {
+		let read = reader.read(&mut chunk)?;
+		if read == 0 {
+			return Ok(hasher.finalize().into());
 		}
-		for index in 16..64 {
-			let s0 = words[index - 15].rotate_right(7)
-				^ words[index - 15].rotate_right(18)
-				^ (words[index - 15] >> 3);
-			let s1 = words[index - 2].rotate_right(17)
-				^ words[index - 2].rotate_right(19)
-				^ (words[index - 2] >> 10);
-			words[index] = words[index - 16]
-				.wrapping_add(s0)
-				.wrapping_add(words[index - 7])
-				.wrapping_add(s1);
-		}
-		let (
-			mut a_word,
-			mut b_word,
-			mut c_word,
-			mut d_word,
-			mut e_word,
-			mut f_word,
-			mut g_word,
-			mut h_word,
-		) = (state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7]);
-		for index in 0..64 {
-			let s1 = e_word.rotate_right(6) ^ e_word.rotate_right(11) ^ e_word.rotate_right(25);
-			let choice = (e_word & f_word) ^ ((!e_word) & g_word);
-			let temp1 = h_word
-				.wrapping_add(s1)
-				.wrapping_add(choice)
-				.wrapping_add(K[index])
-				.wrapping_add(words[index]);
-			let s0 = a_word.rotate_right(2) ^ a_word.rotate_right(13) ^ a_word.rotate_right(22);
-			let majority = (a_word & b_word) ^ (a_word & c_word) ^ (b_word & c_word);
-			let temp2 = s0.wrapping_add(majority);
-			h_word = g_word;
-			g_word = f_word;
-			f_word = e_word;
-			e_word = d_word.wrapping_add(temp1);
-			d_word = c_word;
-			c_word = b_word;
-			b_word = a_word;
-			a_word = temp1.wrapping_add(temp2);
-		}
-		state[0] = state[0].wrapping_add(a_word);
-		state[1] = state[1].wrapping_add(b_word);
-		state[2] = state[2].wrapping_add(c_word);
-		state[3] = state[3].wrapping_add(d_word);
-		state[4] = state[4].wrapping_add(e_word);
-		state[5] = state[5].wrapping_add(f_word);
-		state[6] = state[6].wrapping_add(g_word);
-		state[7] = state[7].wrapping_add(h_word);
+		hasher.update(&chunk[..read]);
 	}
-	let mut digest = [0u8; 32];
-	for (index, word) in state.iter().enumerate() {
-		digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
-	}
-	digest
 }
 
 fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileIdentity> {
@@ -452,7 +382,6 @@ mod platform {
 		ffi::CString,
 		fmt::Write as _,
 		fs::{self, File},
-		io::Read,
 		os::{
 			fd::{AsRawFd, FromRawFd},
 			unix::{
@@ -466,7 +395,7 @@ mod platform {
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, io_code, security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, digest_reader, io_code, security_io_code, sha256,
 	};
 
 	pub(super) fn canonical_existing_directory_identity(
@@ -826,9 +755,7 @@ mod platform {
 		}
 		// SAFETY: this uniquely transfers the live descriptor to `File` ownership.
 		let mut file = unsafe { File::from_raw_fd(fd) };
-		let mut bytes = Vec::new();
-		file.read_to_end(&mut bytes).map_err(|_| "io_error")?;
-		Ok(sha256(&bytes))
+		digest_reader(&mut file).map_err(|_| "io_error")
 	}
 
 	pub(super) fn exact_unlink(
@@ -1850,11 +1777,11 @@ mod platform {
 		ptr::{null, null_mut},
 	};
 
+	use sha2::{Digest, Sha256};
 	use windows_sys::Win32::{
 		Foundation::{
-			CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
-			ERROR_NOT_SAME_DEVICE, ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError, HANDLE,
-			INVALID_HANDLE_VALUE, LocalFree,
+			CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError,
+			HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -1865,14 +1792,14 @@ mod platform {
 			PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
 		},
 		Storage::FileSystem::{
-			BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-			FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_BEGIN,
-			FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-			FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
-			FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FileBasicInfo, FileDispositionInfo,
-			GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL,
-			ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID, WRITE_DAC,
-			WRITE_OWNER,
+			BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
+			FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+			FILE_BASIC_INFO, FILE_BEGIN, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+			FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
+			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
+			READ_CONTROL, ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID,
+			WRITE_DAC, WRITE_OWNER,
 		},
 		System::Threading::{GetCurrentProcess, OpenProcessToken},
 	};
@@ -1887,7 +1814,7 @@ mod platform {
 	const SECURITY_OWNER_DACL_PROTECTED: u32 =
 		SECURITY_OWNER_DACL | PROTECTED_DACL_SECURITY_INFORMATION;
 
-	const FILE_RENAME_INFO_CLASS: i32 = 3;
+	const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
 
 	#[repr(C)]
 	struct HandleRenameInformation {
@@ -2057,6 +1984,14 @@ mod platform {
 			ea_length: u32,
 		) -> i32;
 
+		fn NtSetInformationFile(
+			file_handle: HANDLE,
+			io_status_block: *mut IoStatusBlock,
+			file_information: *mut c_void,
+			length: u32,
+			file_information_class: i32,
+		) -> i32;
+
 		fn NtQueryDirectoryFile(
 			file_handle: HANDLE,
 			event: HANDLE,
@@ -2169,6 +2104,7 @@ mod platform {
 			0xc000_0035 => "quarantine_collision",
 			0xc000_0022 => "owner_mismatch",
 			0xc000_050b => "reparse_point",
+			0xc000_00d4 => "atomic_unavailable",
 			_ => "io_error",
 		}
 	}
@@ -2241,7 +2177,9 @@ mod platform {
 		}
 		let (root, names) =
 			absolute_components(path).map_err(NativeOwnerOnlySecurityResult::failure)?;
-		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES)
+		// Every directory retained as ObjectAttributes.RootDirectory needs traversal
+		// authority for the next descriptor-relative NtCreateFile call.
+		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
 			.map_err(NativeOwnerOnlySecurityResult::failure)?;
 		let root_attributes = match handle_attributes(root_handle) {
 			Ok(attributes) => attributes,
@@ -2269,9 +2207,14 @@ mod platform {
 				parent,
 				name,
 				if final_component {
-					desired_access
+					// Every final handle is validated with GetFileInformationByHandle before
+					// use, so its caller-requested authority must also include attribute reads.
+					desired_access | FILE_READ_ATTRIBUTES
 				} else {
-					FILE_READ_ATTRIBUTES
+					// This retained directory becomes RootDirectory for the next
+					// descriptor-relative NtCreateFile, which requires traversal
+					// authority as well as attribute inspection.
+					FILE_READ_ATTRIBUTES | FILE_TRAVERSE
 				},
 				if final_component {
 					kind == "directory"
@@ -2320,14 +2263,15 @@ mod platform {
 	}
 
 	fn open_directory_exact(path: &Path) -> Result<HeldExact, String> {
-		match open_exact(path, "directory", FILE_READ_ATTRIBUTES) {
+		match open_exact(path, "directory", FILE_READ_ATTRIBUTES | FILE_TRAVERSE) {
 			Ok(handle) => Ok(handle),
 			Err(_result)
 				if path
 					.components()
 					.all(|component| matches!(component, Component::Prefix(_) | Component::RootDir)) =>
 			{
-				let handle = open_path(path, true, FILE_READ_ATTRIBUTES).map_err(str::to_owned)?;
+				let handle = open_path(path, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+					.map_err(str::to_owned)?;
 				let attributes = match handle_attributes(handle) {
 					Ok(attributes) => attributes,
 					Err(code) => {
@@ -2378,7 +2322,10 @@ mod platform {
 	) -> Result<(), &'static str> {
 		let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or("io_error")?;
 		let file_name_offset = std::mem::offset_of!(HandleRenameInformation, file_name);
-		let allocation_size = file_name_offset.checked_add(name_bytes).ok_or("io_error")?;
+		let allocation_size = file_name_offset
+			.checked_add(name_bytes)
+			.ok_or("io_error")?
+			.max(size_of::<HandleRenameInformation>());
 		let allocation_size_u32 = u32::try_from(allocation_size).map_err(|_| "io_error")?;
 		if file_name_offset % align_of::<u16>() != 0 {
 			return Err("io_error");
@@ -2389,35 +2336,40 @@ mod platform {
 			/ size_of::<usize>();
 		let mut storage = vec![0usize; words];
 		let rename = storage.as_mut_ptr().cast::<HandleRenameInformation>();
-		// SAFETY: `storage` is usize-aligned and spans the checked ABI field offset
-		// plus the complete trailing UTF-16 name. `rename` and `file_name` stay live
-		// and non-overlapping with `name` until the synchronous kernel call returns.
+		// SAFETY: `storage` is usize-aligned and spans the complete fixed ABI
+		// structure plus the checked trailing UTF-16 name. The name pointer is
+		// computed from the field offset rather than from the one-element flexible
+		// array member, so the copy never creates an out-of-bounds array reference.
 		unsafe {
 			(*rename).replace_if_exists = 0;
 			(*rename).root_directory = parent_handle;
 			(*rename).file_name_length = u32::try_from(name_bytes).map_err(|_| "io_error")?;
-			std::ptr::copy_nonoverlapping(name.as_ptr(), (*rename).file_name.as_mut_ptr(), name.len());
+			let file_name = storage
+				.as_mut_ptr()
+				.cast::<u8>()
+				.add(file_name_offset)
+				.cast::<u16>();
+			std::ptr::copy_nonoverlapping(name.as_ptr(), file_name, name.len());
 		}
 		// SAFETY: `handle` and `parent_handle` are retained handles, and `storage`
-		// supplies the aligned FILE_RENAME_INFO layout through the real `file_name`
-		// field offset plus exactly the checked trailing UTF-16 byte length.
-		if unsafe {
-			SetFileInformationByHandle(
+		// supplies the aligned FILE_RENAME_INFORMATION layout through the real
+		// `file_name` field offset plus exactly the checked trailing UTF-16 byte
+		// length. NtSetInformationFile accepts the retained parent handle as relative
+		// rename authority, unlike the Win32 wrapper on all supported filesystems.
+		let mut status: IoStatusBlock = unsafe { std::mem::zeroed() };
+		let rename_status = unsafe {
+			NtSetInformationFile(
 				handle,
-				FILE_RENAME_INFO_CLASS,
+				&raw mut status,
 				storage.as_mut_ptr().cast(),
 				allocation_size_u32,
+				FILE_RENAME_INFORMATION_CLASS,
 			)
-		} != 0
-		{
+		};
+		if rename_status >= 0 {
 			Ok(())
-		// SAFETY: GetLastError has no pointer or lifetime requirements.
 		} else {
-			match unsafe { GetLastError() } {
-				ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS => Err("quarantine_collision"),
-				ERROR_NOT_SAME_DEVICE => Err("atomic_unavailable"),
-				_ => Err(last_error_code()),
-			}
+			Err(ntstatus_code(rename_status))
 		}
 	}
 
@@ -2463,7 +2415,7 @@ mod platform {
 		if unsafe { SetFilePointerEx(handle, 0, null_mut(), FILE_BEGIN) } == 0 {
 			return Err(last_error_code());
 		}
-		let mut bytes = Vec::new();
+		let mut hasher = Sha256::new();
 		let mut chunk = [0u8; 64 * 1024];
 		loop {
 			let mut read = 0u32;
@@ -2473,9 +2425,9 @@ mod platform {
 			{
 				return Err(last_error_code());
 			}
-			bytes.extend_from_slice(&chunk[..read as usize]);
+			hasher.update(&chunk[..read as usize]);
 			if read < chunk.len() as u32 {
-				return Ok(sha256(&bytes));
+				return Ok(hasher.finalize().into());
 			}
 		}
 	}
@@ -2771,6 +2723,10 @@ mod platform {
 	const CONTAINER_INHERIT_ACE: u8 = 0x02;
 	const SE_DACL_PROTECTED: u16 = 0x1000;
 
+	fn owner_only_ace_mask_is_safe(mask: u32) -> bool {
+		matches!(mask, GENERIC_ALL | FILE_ALL_ACCESS)
+	}
+
 	fn owner_only_dacl(sid: &[u8], kind: &str) -> Result<Vec<usize>, ()> {
 		let sid_length = valid_sid(sid).ok_or(())?;
 		let size = size_of::<ACL>()
@@ -2797,7 +2753,7 @@ mod platform {
 					acl,
 					ACL_REVISION,
 					u32::from(ace_flags),
-					GENERIC_ALL,
+					FILE_ALL_ACCESS,
 					sid.as_ptr().cast_mut().cast(),
 				)
 			} == 0
@@ -2960,7 +2916,7 @@ mod platform {
 								ace_size - sid_offset,
 							)
 						};
-						mask == GENERIC_ALL && valid_sid(ace_sid).is_some()
+						owner_only_ace_mask_is_safe(mask) && valid_sid(ace_sid).is_some()
 							// SAFETY: both pointers identify complete validated SIDs that remain live.
 							&& unsafe {
 								EqualSid(ace_sid.as_ptr().cast_mut().cast(), sid.as_ptr().cast_mut().cast())
@@ -2980,6 +2936,22 @@ mod platform {
 			NativeOwnerOnlySecurityResult::success()
 		} else {
 			NativeOwnerOnlySecurityResult::failure("acl_verify_failed")
+		}
+	}
+	#[cfg(test)]
+	mod tests {
+		use super::{FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, owner_only_ace_mask_is_safe};
+
+		#[test]
+		fn owner_only_ace_mask_accepts_legacy_and_current_full_access_masks() {
+			assert!(owner_only_ace_mask_is_safe(GENERIC_ALL));
+			assert!(owner_only_ace_mask_is_safe(FILE_ALL_ACCESS));
+		}
+
+		#[test]
+		fn owner_only_ace_mask_rejects_partial_and_combined_masks() {
+			assert!(!owner_only_ace_mask_is_safe(FILE_ALL_ACCESS & !FILE_READ_DATA));
+			assert!(!owner_only_ace_mask_is_safe(GENERIC_ALL | FILE_READ_DATA));
 		}
 	}
 	fn hex_digest(digest: [u8; 32]) -> String {
@@ -3528,5 +3500,163 @@ mod platform {
 		_: &str,
 	) -> NativeOwnerOnlySecurityResult {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+}
+#[cfg(all(test, windows))]
+mod owner_only_security_tests {
+	use std::{
+		path::PathBuf,
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::{
+		apply_owner_only_path_security, rename_no_replace_path, verify_owner_only_path_security,
+	};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"gjc-owner-security-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+			));
+			std::fs::create_dir(&path).expect("create owner-security temp directory");
+			Self(path)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[test]
+	fn owner_only_security_round_trips_local_directory_and_file() {
+		let dir = TempDir::new();
+		let directory = dir.0.to_string_lossy().into_owned();
+		let applied_directory =
+			apply_owner_only_path_security(directory.clone(), "directory".to_owned());
+		assert!(applied_directory.ok, "{:?}", applied_directory.code);
+		let verified_directory = verify_owner_only_path_security(directory, "directory".to_owned());
+		assert!(verified_directory.ok, "{:?}", verified_directory.code);
+
+		let file = dir.0.join("probe.tmp");
+		std::fs::write(&file, b"owner-only").expect("write owner-security probe");
+		let file = file.to_string_lossy().into_owned();
+		let applied_file = apply_owner_only_path_security(file.clone(), "file".to_owned());
+		assert!(applied_file.ok, "{:?}", applied_file.code);
+		let verified_file = verify_owner_only_path_security(file, "file".to_owned());
+		assert!(verified_file.ok, "{:?}", verified_file.code);
+	}
+	#[test]
+	fn owner_only_security_rejects_missing_wrong_kind_and_reparse_paths() {
+		let dir = TempDir::new();
+
+		let missing = dir.0.join("missing.tmp").to_string_lossy().into_owned();
+		let missing_result = verify_owner_only_path_security(missing, "file".to_owned());
+		assert!(!missing_result.ok);
+		assert_eq!(missing_result.code.as_deref(), Some("not_found"));
+
+		let file = dir.0.join("target.tmp");
+		std::fs::write(&file, b"owner-only").expect("write owner-security target");
+		let wrong_kind = verify_owner_only_path_security(
+			file.to_string_lossy().into_owned(),
+			"directory".to_owned(),
+		);
+		assert!(!wrong_kind.ok);
+
+		let link = dir.0.join("target-link.tmp");
+		std::os::windows::fs::symlink_file(&file, &link)
+			.expect("create owner-security reparse point");
+		let reparse =
+			verify_owner_only_path_security(link.to_string_lossy().into_owned(), "file".to_owned());
+		assert!(!reparse.ok);
+		assert_eq!(reparse.code.as_deref(), Some("reparse_point"));
+	}
+	#[test]
+	fn rename_no_replace_uses_retained_parent_authority() {
+		let dir = TempDir::new();
+		let source = dir.0.join("source.tmp");
+		let destination = dir.0.join("d");
+		std::fs::write(&source, b"source").expect("write rename source");
+
+		let renamed = rename_no_replace_path(
+			source.to_string_lossy().into_owned(),
+			destination.to_string_lossy().into_owned(),
+		);
+		assert!(renamed.ok, "{:?}", renamed.code);
+		assert_eq!(std::fs::read(&destination).expect("read renamed destination"), b"source");
+
+		let collision_source = dir.0.join("collision-source.tmp");
+		std::fs::write(&collision_source, b"collision").expect("write collision source");
+		let collision = rename_no_replace_path(
+			collision_source.to_string_lossy().into_owned(),
+			destination.to_string_lossy().into_owned(),
+		);
+		assert!(!collision.ok);
+		assert_eq!(collision.code.as_deref(), Some("quarantine_collision"));
+		assert_eq!(
+			std::fs::read(&collision_source).expect("read retained collision source"),
+			b"collision"
+		);
+		assert_eq!(std::fs::read(&destination).expect("read retained destination"), b"source");
+	}
+}
+#[cfg(test)]
+mod sha256_tests {
+	use std::io::{self, Read};
+
+	use super::{digest_reader, sha256};
+	fn hex(digest: [u8; 32]) -> String {
+		digest.iter().map(|byte| format!("{byte:02x}")).collect()
+	}
+
+	#[test]
+	fn sha256_matches_known_answers_and_block_boundaries() {
+		assert_eq!(
+			hex(sha256(b"")),
+			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+		);
+		assert_eq!(
+			hex(sha256(b"abc")),
+			"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+		);
+		for length in [55, 56, 63, 64, 65] {
+			let bytes = vec![b'a'; length];
+			let mut reader = bytes.as_slice();
+			assert_eq!(digest_reader(&mut reader).unwrap(), sha256(&bytes));
+		}
+	}
+
+	#[test]
+	fn digest_reader_streams_large_files_in_bounded_reads() {
+		struct ChunkedReader {
+			bytes:    Vec<u8>,
+			offset:   usize,
+			max_read: usize,
+		}
+
+		impl Read for ChunkedReader {
+			fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+				let remaining = &self.bytes[self.offset..];
+				let count = remaining.len().min(buffer.len()).min(self.max_read);
+				buffer[..count].copy_from_slice(&remaining[..count]);
+				self.offset += count;
+				Ok(count)
+			}
+		}
+
+		let bytes = (0..(1024 * 1024 + 17))
+			.map(|index| (index % 251) as u8)
+			.collect();
+		let mut reader = ChunkedReader { bytes, offset: 0, max_read: 1021 };
+		let digest = digest_reader(&mut reader).unwrap();
+		assert_eq!(reader.offset, reader.bytes.len());
+		assert_eq!(digest, sha256(&reader.bytes));
 	}
 }

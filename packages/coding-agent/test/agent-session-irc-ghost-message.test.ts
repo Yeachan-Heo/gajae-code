@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Agent } from "@gajae-code/agent-core";
+import type { Message } from "@gajae-code/ai";
 import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentRegistry, MAIN_AGENT_ID } from "@gajae-code/coding-agent/registry/agent-registry";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionConfig } from "@gajae-code/coding-agent/session/agent-session";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
@@ -25,7 +26,15 @@ afterEach(async () => {
 	for (const session of testSessions.splice(0)) await session.dispose();
 });
 
-function createHarness(options: { model?: MockModel; agentId?: string } = {}): Harness {
+function createHarness(
+	options: {
+		model?: MockModel;
+		agentId?: string;
+		getApiKey?: () => Promise<string | undefined>;
+		transformContext?: AgentSessionConfig["transformContext"];
+		convertToLlm?: AgentSessionConfig["convertToLlm"];
+	} = {},
+): Harness {
 	const model = options.model ?? createMockModel({ handler: () => ({ content: ["pong"] }) });
 	const registry = new AgentRegistry();
 	const sessionManager = SessionManager.inMemory();
@@ -43,13 +52,19 @@ function createHarness(options: { model?: MockModel; agentId?: string } = {}): H
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "test-key", getAvailable: () => [model] } as never,
+		modelRegistry: {
+			getApiKey: options.getApiKey ?? (async () => "test-key"),
+			getAvailable: () => [model],
+		} as never,
 		agentId: options.agentId ?? "1-Worker",
 		agentRegistry: registry,
-		convertToLlm: async messages => {
-			snapshots.push(messages);
-			return convertToLlm(messages);
-		},
+		convertToLlm:
+			options.convertToLlm ??
+			(async messages => {
+				snapshots.push(messages);
+				return convertToLlm(messages);
+			}),
+		transformContext: options.transformContext,
 	});
 	const ircEvents: Harness["ircEvents"] = [];
 	session.subscribe(event => {
@@ -136,8 +151,14 @@ describe("AgentSession respondAsBackground failure visibility", () => {
 	it("does not leave a ghost incoming message when the sender aborts mid-reply", async () => {
 		// Real-world shape: the sending agent's tool call is aborted (user ESC)
 		// while the recipient is still generating the auto-reply.
+		const started = Promise.withResolvers<void>();
 		const harness = createHarness({
-			model: createMockModel({ handler: () => ({ delayMs: 5_000, content: ["late reply"] }) }),
+			model: createMockModel({
+				handler: () => {
+					started.resolve();
+					return { delayMs: 5_000, content: ["late reply"] };
+				},
+			}),
 		});
 		const abort = new AbortController();
 
@@ -146,7 +167,7 @@ describe("AgentSession respondAsBackground failure visibility", () => {
 			message: "ping",
 			signal: abort.signal,
 		});
-		await Bun.sleep(0);
+		await started.promise;
 		abort.abort();
 		await expect(pending).rejects.toThrow();
 
@@ -267,6 +288,104 @@ describe("AgentSession respondAsBackground failure visibility", () => {
 		expect(ircHistory(harness).map(message => message.customType)).toEqual(["irc:incoming", "irc:autoreply"]);
 	});
 
+	it("does not add ephemeral turns to session history", async () => {
+		const harness = createHarness();
+		const before = [...harness.session.agent.state.messages];
+
+		await expect(harness.session.runEphemeralTurn({ promptText: "<btw>side question</btw>" })).resolves.toMatchObject(
+			{
+				replyText: "pong",
+			},
+		);
+
+		expect(harness.session.agent.state.messages).toEqual(before);
+	});
+	it("rejects promptly without dispatching a provider call when credential lookup ignores cancellation", async () => {
+		const credential = Promise.withResolvers<string>();
+		const harness = createHarness({ getApiKey: () => credential.promise });
+		const abort = new AbortController();
+
+		const pending = harness.session.runEphemeralTurn({ promptText: "side question", signal: abort.signal });
+		abort.abort();
+
+		await expect(pending).rejects.toThrow();
+		expect(harness.model.calls).toHaveLength(0);
+	});
+
+	it("rejects promptly without dispatching a provider call when conversion ignores cancellation", async () => {
+		const conversionStarted = Promise.withResolvers<void>();
+		const conversion = Promise.withResolvers<Message[]>();
+		const harness = createHarness({
+			convertToLlm: async _messages => {
+				conversionStarted.resolve();
+				return await conversion.promise;
+			},
+		});
+		const abort = new AbortController();
+
+		const pending = harness.session.runEphemeralTurn({ promptText: "side question", signal: abort.signal });
+		await conversionStarted.promise;
+		abort.abort();
+
+		await expect(pending).rejects.toThrow();
+		expect(harness.model.calls).toHaveLength(0);
+	});
+
+	it("deeply isolates persisted history and caller prepends from mutating context hooks", async () => {
+		const historyMessage = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "live history" }],
+			timestamp: Date.now(),
+		};
+		const callerPrepend = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "caller prepend" }],
+			timestamp: Date.now(),
+		};
+		let transformCalls = 0;
+		const harness = createHarness({
+			transformContext: messages => {
+				transformCalls++;
+				for (const message of messages) {
+					if (message.role !== "user" || typeof message.content === "string") continue;
+					const text = message.content[0];
+					if (text?.type === "text") text.text = "mutated by hook";
+				}
+				return messages;
+			},
+		});
+		harness.session.agent.appendMessage(historyMessage);
+		harness.sessionManager.appendMessage(historyMessage);
+		const beforeLive = JSON.stringify(harness.session.agent.state.messages);
+		const beforePersisted = JSON.stringify(harness.sessionManager.getBranch());
+
+		await harness.session.runEphemeralTurn({
+			promptText: "side question",
+			prependMessages: [callerPrepend],
+		});
+
+		expect(JSON.stringify(harness.session.agent.state.messages)).toBe(beforeLive);
+		expect(JSON.stringify(harness.sessionManager.getBranch())).toBe(beforePersisted);
+		expect(callerPrepend.content[0]?.text).toBe("caller prepend");
+		expect(transformCalls).toBe(1);
+	});
+
+	it("preserves long /btw replies while retaining explicit IRC reply shaping", async () => {
+		const longReply = "x".repeat(5_000);
+		const harness = createHarness({
+			model: createMockModel({ handler: () => ({ content: [longReply] }) }),
+		});
+
+		await expect(harness.session.runEphemeralTurn({ promptText: "<btw>long answer</btw>" })).resolves.toMatchObject({
+			replyText: longReply,
+		});
+		const irc = await harness.session.respondAsBackground({
+			from: "0-Main",
+			message: "IRC background reply",
+		});
+		expect(irc.replyText).not.toBeNull();
+		expect(Buffer.byteLength(irc.replyText!, "utf8")).toBeLessThanOrEqual(4_096);
+	});
 	it("commits a successful IRC roster claim after accepting its exchange", async () => {
 		const harness = createHarness();
 		addPeer(harness.registry);
@@ -312,7 +431,7 @@ describe("AgentSession respondAsBackground failure visibility", () => {
 			"model unavailable",
 		);
 		fail = false;
-		await harness.session.runEphemeralTurn({ promptText: "retry" });
+		await harness.session.respondAsBackground({ from: "0-Main", message: "retry" });
 
 		expect(rosterDeliveryCount(harness)).toBe(2);
 	});

@@ -41,6 +41,7 @@ rayon.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 similar.workspace = true
 smallvec.workspace = true
 syntect.workspace = true

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { SessionIndex, sessionIndexChecksum } from "../src/sdk/broker/session-index";
+import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 
 const event = (sessionId: string) => ({
 	type: "host_registered" as const,
@@ -86,13 +87,13 @@ describe("SDK session index", () => {
 		const oversized = {
 			...event("oversized"),
 			locator: { repo: "r".repeat(4 * 1024 * 1024), stateRoot: "q" },
-			version: invalidSnapshot.version,
+			version: SDK_STATE_VERSION,
 			indexSeq: 2,
 			ts: Date.now(),
 		};
 		await fs.appendFile(
 			path.join(sessionsDir, "index.jsonl"),
-			`${JSON.stringify({ ...oversized, checksum: sessionIndexChecksum(oversized) })}\n`,
+			`${JSON.stringify({ ...oversized, checksum: sessionIndexChecksum(oversized as Parameters<typeof sessionIndexChecksum>[0]) })}\n`,
 		);
 
 		await index.append(event("after"));
@@ -219,4 +220,119 @@ describe("SDK session index", () => {
 			indexSeq: expect.any(Number),
 		});
 	}, 30_000);
+
+	it("compaction drops terminal+dead sessions and keeps live sessions with their original indexSeq", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const deadPid = await (async () => {
+			const proc = Bun.spawn({ cmd: ["true"] });
+			await proc.exited;
+			return proc.pid;
+		})();
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("live"));
+		await index.append({ ...event("dead"), pid: deadPid });
+		await index.append({ ...event("dead"), type: "host_unregistered", pid: deadPid });
+		await index.append(event("live2"));
+		await index.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		expect(snapshot.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["live", "live2"]);
+		expect(snapshot.events[0].indexSeq).toBe(1);
+		expect(snapshot.indexSeq).toBe(4);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["live", "live2"]);
+		expect(replay.indexSeq).toBe(4);
+	});
+	it("collapses superseded heartbeats to the latest per surviving session", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("s"));
+		await index.append({ ...event("s"), type: "host_heartbeat" });
+		await index.append({ ...event("s"), type: "host_heartbeat" });
+		await index.append(event("other"));
+		const before = index.listSessions().sessions.map(session => session.sessionId);
+		await index.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		const heartbeats = snapshot.events.filter((e: { type: string }) => e.type === "host_heartbeat");
+		expect(heartbeats).toHaveLength(1);
+		expect(heartbeats[0].indexSeq).toBe(3);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(before);
+	});
+	it("accepts a gapped-monotonic snapshot on replay and chains subsequent appends", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		const signed = (indexSeq: number, sessionId: string) => {
+			const unsigned = {
+				...event(sessionId),
+				version: SDK_STATE_VERSION,
+				indexSeq,
+				ts: 1,
+			};
+			return { ...unsigned, checksum: sessionIndexChecksum(unsigned as Parameters<typeof sessionIndexChecksum>[0]) };
+		};
+		await fs.writeFile(
+			path.join(sessionsDir, "index.snapshot.json"),
+			JSON.stringify({ version: 2, indexSeq: 5, events: [signed(1, "a"), signed(5, "b")] }),
+		);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().warnings).toEqual([]);
+		expect(replay.indexSeq).toBe(5);
+		const appended = await replay.append(event("c"));
+		expect(appended.indexSeq).toBe(6);
+	});
+	it("rejects a non-monotonic snapshot as invalid", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		const signed = (indexSeq: number, sessionId: string) => {
+			const unsigned = { ...event(sessionId), version: SDK_STATE_VERSION, indexSeq, ts: 1 };
+			return { ...unsigned, checksum: sessionIndexChecksum(unsigned as Parameters<typeof sessionIndexChecksum>[0]) };
+		};
+		await fs.writeFile(
+			path.join(sessionsDir, "index.snapshot.json"),
+			JSON.stringify({ version: 2, indexSeq: 3, events: [signed(3, "a"), signed(2, "b")] }),
+		);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().warnings).toContain("Invalid session index snapshot");
+		expect(replay.indexSeq).toBe(0);
+	});
+	it("guards state version: rejects a newer snapshot and reads an older one", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		const snapshotFile = path.join(sessionsDir, "index.snapshot.json");
+		await fs.writeFile(snapshotFile, JSON.stringify({ version: 3, indexSeq: 0, events: [] }));
+		await expect(new SessionIndex(dir).open()).rejects.toThrow(/Unsupported SDK state version/);
+		const legacy = { ...event("legacy"), version: 1 as const, indexSeq: 1, ts: 1 };
+		const legacyEvent = {
+			...legacy,
+			checksum: sessionIndexChecksum(legacy as unknown as Parameters<typeof sessionIndexChecksum>[0]),
+		};
+		await fs.writeFile(snapshotFile, JSON.stringify({ version: 1, indexSeq: 1, events: [legacyEvent] }));
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().warnings).toEqual([]);
+		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["legacy"]);
+	});
+	it("compacts idempotently: a second snapshot of the same history is byte-identical", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const deadPid = await (async () => {
+			const proc = Bun.spawn({ cmd: ["true"] });
+			await proc.exited;
+			return proc.pid;
+		})();
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("live"));
+		await index.append({ ...event("dead"), pid: deadPid });
+		await index.append({ ...event("dead"), type: "host_unregistered", pid: deadPid });
+		await index.append({ ...event("live"), type: "host_heartbeat" });
+		await index.append(event("live2"));
+		const snapshotFile = path.join(dir, "sdk", "sessions", "index.snapshot.json");
+		await index.snapshot();
+		const first = await fs.readFile(snapshotFile, "utf8");
+		const reopened = await new SessionIndex(dir).open();
+		await reopened.snapshot();
+		const second = await fs.readFile(snapshotFile, "utf8");
+		expect(second).toBe(first);
+	});
 });

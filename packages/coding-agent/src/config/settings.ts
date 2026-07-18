@@ -28,7 +28,11 @@ import { type Settings as SettingsCapabilityItem, settingsCapability } from "../
 import type { ModelRole } from "../config/model-registry";
 import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
-import type { NotificationSettingsReader, NotificationSettingsSnapshot } from "../sdk/bus/config";
+import {
+	type NotificationSettingsReader,
+	type NotificationSettingsSnapshot,
+	parseNotificationSettingsSnapshot,
+} from "../sdk/bus/config";
 import { AgentStorage } from "../session/agent-storage";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import {
@@ -89,6 +93,15 @@ type DurableBatchRevision = {
 	patch: AtomicYamlPatch;
 	previousRevision: number | undefined;
 	revision: number;
+};
+type NotificationValidationState = {
+	malformedConfigRoot: boolean;
+	invalidNotificationConfiguration: boolean;
+	generation: number;
+};
+type NotificationValidationRestoreGuard = {
+	readonly state: NotificationValidationState;
+	restoreGeneration: number | undefined;
 };
 
 export type SettingsAtomicPatch = { path: SettingPath; op: "set"; value: unknown } | { path: SettingPath; op: "unset" };
@@ -328,6 +341,13 @@ export class Settings implements NotificationSettingsReader {
 
 	/** Global settings from config.yml */
 	#global: RawSettings = {};
+	/**
+	 * Raw notification syntax retained across schema reconciliation so notification
+	 * validation matches the lightweight config reader until each leaf is repaired.
+	 */
+	#rawNotificationConfig: RawSettings | undefined = {};
+	/** Raw notification syntax from the last durable config read, before local replay. */
+	#durableRawNotificationConfig: RawSettings | undefined = {};
 	/** Project settings from .Anthropic model/settings.yml etc */
 	#project: RawSettings = {};
 	/** Runtime overrides (not persisted) */
@@ -352,6 +372,11 @@ export class Settings implements NotificationSettingsReader {
 	#schemaMigrationPending = false;
 	/** A newer config schema must never be rewritten by legacy migrations. */
 	#futureSchemaVersion = false;
+	#hasMalformedConfigRoot = false;
+	#hasInvalidNotificationConfiguration = false;
+	#notificationValidationGeneration = 0;
+	/** Notification subtree fingerprint from the last raw durable config read. */
+	#durableNotificationFingerprint: string | undefined;
 
 	/** Whether to persist changes */
 	#persist: boolean;
@@ -432,6 +457,7 @@ export class Settings implements NotificationSettingsReader {
 		normalizeSessionDirectoryMigration(instance.#global);
 
 		instance.#rebuildMerged();
+		instance.#captureRawNotificationConfig(instance.#global);
 		return instance;
 	}
 
@@ -481,112 +507,9 @@ export class Settings implements NotificationSettingsReader {
 	 * are deliberately excluded from this trust boundary.
 	 */
 	getNotificationSettingsSnapshot(): NotificationSettingsSnapshot {
-		const enabled = this.#getGlobalResolved("notifications.enabled");
-		const botToken = this.#getGlobalResolved("notifications.telegram.botToken");
-		const chatId = this.#getGlobalResolved("notifications.telegram.chatId");
-		const activation = this.#getGlobalResolved("notifications.telegram.activation");
-		const activationSnapshot =
-			activation && Object.keys(activation).length > 0 ? structuredClone(activation) : undefined;
-		const richEnabled = this.#getGlobalResolved("notifications.telegram.rich.enabled");
-		const richDraftEnabled = this.#getGlobalResolved("notifications.telegram.richDraft.enabled");
-		const streamingEnabled = this.#getGlobalResolved("notifications.telegram.streaming.enabled");
-		const nameTemplate = this.#getGlobalResolved("notifications.telegram.topics.nameTemplate");
-		const discordBotToken = this.#getGlobalResolved("notifications.discord.botToken");
-		const discordApplicationId = this.#getGlobalResolved("notifications.discord.applicationId");
-		const discordGuildId = this.#getGlobalResolved("notifications.discord.guildId");
-		const discordParentChannelId = this.#getGlobalResolved("notifications.discord.parentChannelId");
-		const slackBotToken = this.#getGlobalResolved("notifications.slack.botToken");
-		const slackAppToken = this.#getGlobalResolved("notifications.slack.appToken");
-		const slackWorkspaceId = this.#getGlobalResolved("notifications.slack.workspaceId");
-		const slackChannelId = this.#getGlobalResolved("notifications.slack.channelId");
-		const slackAuthorizedUserId = this.#getGlobalResolved("notifications.slack.authorizedUserId");
-		const redact = this.#getGlobalResolved("notifications.redact");
-		const verbosity = this.#getGlobalResolved("notifications.verbosity");
-		const sessionScope = this.#getGlobalResolved("notifications.sessionScope");
-		const idleTimeoutMs = this.#getGlobalResolved("notifications.daemon.idleTimeoutMs");
-
-		return {
-			enabled: typeof enabled === "boolean" ? enabled : getDefault("notifications.enabled"),
-			telegram: {
-				botToken:
-					typeof botToken === "string" && botToken.length > 0
-						? botToken
-						: getDefault("notifications.telegram.botToken"),
-				chatId:
-					typeof chatId === "string" && chatId.length > 0 ? chatId : getDefault("notifications.telegram.chatId"),
-				...(activationSnapshot === undefined ? {} : { activation: activationSnapshot }),
-				rich: {
-					enabled:
-						typeof richEnabled === "boolean" ? richEnabled : getDefault("notifications.telegram.rich.enabled"),
-				},
-				richDraft: {
-					enabled:
-						typeof richDraftEnabled === "boolean"
-							? richDraftEnabled
-							: getDefault("notifications.telegram.richDraft.enabled"),
-				},
-				streaming: {
-					enabled:
-						typeof streamingEnabled === "boolean"
-							? streamingEnabled
-							: getDefault("notifications.telegram.streaming.enabled"),
-				},
-				topics: {
-					nameTemplate:
-						typeof nameTemplate === "string" && nameTemplate.length > 0
-							? nameTemplate
-							: getDefault("notifications.telegram.topics.nameTemplate"),
-				},
-			},
-			discord: {
-				botToken:
-					typeof discordBotToken === "string" && discordBotToken.length > 0
-						? discordBotToken
-						: getDefault("notifications.discord.botToken"),
-				applicationId:
-					typeof discordApplicationId === "string" && discordApplicationId.length > 0
-						? discordApplicationId
-						: getDefault("notifications.discord.applicationId"),
-				guildId:
-					typeof discordGuildId === "string" && discordGuildId.length > 0
-						? discordGuildId
-						: getDefault("notifications.discord.guildId"),
-				parentChannelId:
-					typeof discordParentChannelId === "string" && discordParentChannelId.length > 0
-						? discordParentChannelId
-						: getDefault("notifications.discord.parentChannelId"),
-			},
-			slack: {
-				botToken:
-					typeof slackBotToken === "string" && slackBotToken.length > 0
-						? slackBotToken
-						: getDefault("notifications.slack.botToken"),
-				appToken:
-					typeof slackAppToken === "string" && slackAppToken.length > 0
-						? slackAppToken
-						: getDefault("notifications.slack.appToken"),
-				workspaceId:
-					typeof slackWorkspaceId === "string" && slackWorkspaceId.length > 0
-						? slackWorkspaceId
-						: getDefault("notifications.slack.workspaceId"),
-				channelId:
-					typeof slackChannelId === "string" && slackChannelId.length > 0
-						? slackChannelId
-						: getDefault("notifications.slack.channelId"),
-				authorizedUserId:
-					typeof slackAuthorizedUserId === "string" && slackAuthorizedUserId.length > 0
-						? slackAuthorizedUserId
-						: getDefault("notifications.slack.authorizedUserId"),
-			},
-			redact: typeof redact === "boolean" ? redact : getDefault("notifications.redact"),
-			verbosity: verbosity === "verbose" || getDefault("notifications.verbosity") === "verbose" ? "verbose" : "lean",
-			sessionScope:
-				sessionScope === "primary" || getDefault("notifications.sessionScope") === "primary" ? "primary" : "all",
-			idleTimeoutMs:
-				typeof idleTimeoutMs === "number" && Number.isFinite(idleTimeoutMs) && idleTimeoutMs > 0
-					? idleTimeoutMs
-					: getDefault("notifications.daemon.idleTimeoutMs"),
-		};
+		return parseNotificationSettingsSnapshot(
+			this.#hasMalformedConfigRoot || this.#hasInvalidNotificationConfiguration ? null : this.#global,
+		);
 	}
 
 	/** Check whether a setting is present in loaded settings/overrides rather than coming from schema defaults. */
@@ -622,10 +545,12 @@ export class Settings implements NotificationSettingsReader {
 			revision: ++this.#nextRevision,
 		};
 		setByPath(this.#global, path.split("."), structuredClone(clonedValue));
+		this.#applyNotificationMutationToRaw(path, clonedValue);
 		this.#pathRevisions.set(path, patch.revision);
 		this.#modified.set(path, patch);
 
 		this.#rebuildMerged();
+		this.#revalidateNotificationSettingsAfterMutation([path]);
 		this.#queueSave();
 
 		const hook = SETTING_HOOKS[path];
@@ -645,9 +570,11 @@ export class Settings implements NotificationSettingsReader {
 			revision: ++this.#nextRevision,
 		};
 		deleteByPath(this.#global, path.split("."));
+		this.#applyNotificationMutationToRaw(path, undefined);
 		this.#pathRevisions.set(path, patch.revision);
 		this.#modified.set(path, patch);
 		this.#rebuildMerged();
+		this.#revalidateNotificationSettingsAfterMutation([path]);
 		this.#queueSave();
 
 		const hook = SETTING_HOOKS[path];
@@ -660,6 +587,7 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	async commitAtomicBatch(patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> {
 		if (!this.#persist || !this.#configPath) {
+			const notificationValidationGuard = this.#notificationValidationRestoreGuard();
 			const changes = new Map<string, { before: unknown; beforeHash: string; afterHash: string }>();
 			for (const patch of patches) {
 				if (!isAtomicSettingsPath(patch.path)) {
@@ -677,13 +605,23 @@ export class Settings implements NotificationSettingsReader {
 				}
 			}
 			for (const patch of patches) {
-				if (patch.op === "set") setByPath(this.#global, patch.path.split("."), structuredClone(patch.value));
-				else deleteByPath(this.#global, patch.path.split("."));
+				if (patch.op === "set") {
+					setByPath(this.#global, patch.path.split("."), structuredClone(patch.value));
+					this.#applyNotificationMutationToRaw(patch.path, patch.value);
+				} else {
+					deleteByPath(this.#global, patch.path.split("."));
+					this.#applyNotificationMutationToRaw(patch.path, undefined);
+				}
 			}
 			for (const [patchPath, change] of changes) {
 				change.afterHash = atomicYamlPathHash(this.#global, patchPath);
 			}
 			this.#rebuildMerged();
+			this.#revalidateNotificationSettingsAfterMutation(patches.map(patch => patch.path));
+			this.#recordNotificationValidationBatchApply(
+				notificationValidationGuard,
+				patches.map(patch => patch.path),
+			);
 			let discarded = false;
 			let receipt: CasReceipt;
 			receipt = {
@@ -697,11 +635,17 @@ export class Settings implements NotificationSettingsReader {
 						atomicYamlPathHash(this.#global, patchPath) === change.afterHash ? [] : [patchPath],
 					);
 					if (conflicts.length > 0) return { status: "conflict", paths: conflicts } as const;
+					const restoreNotificationValidationState = this.#canRestoreNotificationValidationState(
+						notificationValidationGuard,
+						changes.keys(),
+					);
 					for (const [patchPath, change] of changes) {
 						if (change.beforeHash === atomicYamlPathHash({}, patchPath)) {
 							deleteByPath(this.#global, patchPath.split("."));
+							this.#applyNotificationMutationToRaw(patchPath, undefined);
 						} else {
 							setByPath(this.#global, patchPath.split("."), structuredClone(change.before));
+							this.#applyNotificationMutationToRaw(patchPath, change.before);
 						}
 					}
 					const modelRoles = rawSettingsRecord(this.#global.modelRoles);
@@ -709,6 +653,10 @@ export class Settings implements NotificationSettingsReader {
 						delete this.#global.modelRoles;
 					}
 					this.#rebuildMerged();
+					this.#revalidateNotificationSettingsAfterMutation(changes.keys());
+					if (restoreNotificationValidationState) {
+						this.#restoreNotificationValidationState(notificationValidationGuard.state);
+					}
 					return { status: "restored", receipt } as const;
 				},
 			};
@@ -729,6 +677,7 @@ export class Settings implements NotificationSettingsReader {
 		// A durable batch is a causal barrier: close the earlier ordinary debounce
 		// inside its already-reserved slot before queueing this batch.
 		this.#releasePendingSaveSlot();
+		const notificationValidationGuard = this.#notificationValidationRestoreGuard();
 
 		const revisions = durablePatches.map(patch => ({
 			patch,
@@ -739,9 +688,13 @@ export class Settings implements NotificationSettingsReader {
 
 		try {
 			const receipt = await applyAtomicYamlPatches(this.#configPath, durablePatches, {
-				onRestored: restoredPatches => this.#applyRestoredDurableBatch(revisions, restoredPatches),
+				validateRoot: (root, currentPatches) =>
+					this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
+				onRestored: restoredPatches =>
+					this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
 			});
-			this.#applyDurableBatch(revisions);
+			const appliedNotificationMutation = this.#applyDurableBatch(revisions);
+			this.#recordNotificationValidationBatchApply(notificationValidationGuard, appliedNotificationMutation);
 			return receipt;
 		} catch (error) {
 			for (const entry of revisions) {
@@ -768,6 +721,7 @@ export class Settings implements NotificationSettingsReader {
 
 		this.#releasePendingSaveSlot();
 		let revisions: DurableBatchRevision[] = [];
+		const notificationValidationGuard = this.#notificationValidationRestoreGuard();
 		try {
 			const receipt = await applyAtomicYamlPatchesWithCurrent(
 				this.#configPath,
@@ -794,10 +748,14 @@ export class Settings implements NotificationSettingsReader {
 					return durablePatches;
 				},
 				{
-					onRestored: restoredPatches => this.#applyRestoredDurableBatch(revisions, restoredPatches),
+					validateRoot: (root, currentPatches) =>
+						this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
+					onRestored: restoredPatches =>
+						this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
 				},
 			);
-			this.#applyDurableBatch(revisions);
+			const appliedNotificationMutation = this.#applyDurableBatch(revisions);
+			this.#recordNotificationValidationBatchApply(notificationValidationGuard, appliedNotificationMutation);
 			return receipt;
 		} catch (error) {
 			for (const entry of revisions) {
@@ -885,6 +843,9 @@ export class Settings implements NotificationSettingsReader {
 		cloned.#futureSchemaVersion = this.#futureSchemaVersion;
 
 		cloned.#global = structuredClone(this.#global);
+		cloned.#rawNotificationConfig = structuredClone(this.#rawNotificationConfig);
+		cloned.#durableRawNotificationConfig = structuredClone(this.#durableRawNotificationConfig);
+		cloned.#durableNotificationFingerprint = this.#durableNotificationFingerprint;
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#overrides = structuredClone(this.#overrides);
 		await cloned.#normalizeAfterLoad();
@@ -1015,8 +976,10 @@ export class Settings implements NotificationSettingsReader {
 		this.#global = current;
 		for (const patch of this.#pendingPatchesInGenerationOrder()) {
 			applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
+			this.#applyNotificationMutationToRaw(patch.path, patch.value);
 		}
 		this.#rebuildMerged();
+		this.#recomputeNotificationValidationFromRaw();
 	}
 	/**
 	 * Set an agent model override while keeping any live runtime override aligned.
@@ -1086,33 +1049,54 @@ export class Settings implements NotificationSettingsReader {
 		// #loadYaml then reads; migration's db fallback needs #storage opened.
 		const projectPromise = this.#loadProjectSettings();
 
-		if (this.#persist) {
-			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
-			await this.#migrateFromLegacy();
-			this.#global = await this.#loadYaml(this.#configPath!);
-		}
-		if (this.#schemaMigrationPending)
-			this.#recordLegacyFallbackMigrationPatch("configSchemaVersion", CONFIG_SCHEMA_VERSION);
+		try {
+			if (this.#persist) {
+				this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
+				await this.#migrateFromLegacy();
+				this.#global = await this.#loadYaml(this.#configPath!);
+			}
+			if (this.#schemaMigrationPending)
+				this.#recordLegacyFallbackMigrationPatch("configSchemaVersion", CONFIG_SCHEMA_VERSION);
 
-		this.#project = await projectPromise;
+			this.#project = await projectPromise;
 
-		await this.#normalizeAfterLoad();
-		if (this.#schemaReport.issues.length > 0) {
-			logger.warn("Settings: schema reconciliation found configuration issues", {
-				issues: this.#schemaReport.issues.map(issue => `${issue.kind}:${issue.path}`),
-			});
+			await this.#normalizeAfterLoad();
+			if (this.#schemaReport.issues.length > 0) {
+				logger.warn("Settings: schema reconciliation found configuration issues", {
+					issues: this.#schemaReport.issues.map(issue => `${issue.kind}:${issue.path}`),
+				});
+			}
+			return this;
+		} catch (error) {
+			this.#storage?.close();
+			throw error;
 		}
-		return this;
 	}
 
 	async #loadYaml(filePath: string): Promise<RawSettings> {
+		this.#hasMalformedConfigRoot = false;
+		this.#hasInvalidNotificationConfiguration = false;
+		this.#captureRawNotificationConfig({});
 		try {
 			const content = await Bun.file(filePath).text();
 			const parsed = YAML.parse(content);
+			if (parsed === undefined) return {};
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				this.#hasMalformedConfigRoot = true;
+				this.#captureRawNotificationConfig(undefined);
 				return {};
 			}
 			const parsedRaw = parsed as RawSettings;
+			if (filePath === this.#configPath) this.#captureRawNotificationConfig(parsedRaw);
+			if (filePath === this.#configPath) {
+				try {
+					parseNotificationSettingsSnapshot(parsedRaw);
+				} catch (error) {
+					if (!(error instanceof Error) || error.message !== "gjc_notify_daemon_invalid_configuration")
+						throw error;
+					this.#hasInvalidNotificationConfiguration = true;
+				}
+			}
 			this.#futureSchemaVersion =
 				filePath === this.#configPath &&
 				typeof parsedRaw.configSchemaVersion === "number" &&
@@ -1137,9 +1121,11 @@ export class Settings implements NotificationSettingsReader {
 			this.#schemaReport = reconciled.report;
 			return reconciled.settings;
 		} catch (error) {
-			if (isEnoent(error)) return {};
-			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
-			return {};
+			if (isEnoent(error)) {
+				this.#captureRawNotificationConfig({});
+				return {};
+			}
+			throw error;
 		}
 	}
 
@@ -1579,6 +1565,7 @@ export class Settings implements NotificationSettingsReader {
 							captured = captured.filter(patch => !patch.legacyFallbackMigration);
 						}
 					}
+					this.#fenceNotificationValidationForExternalDurableDelta(current, captured);
 					durableBeforeWrite = structuredClone(current);
 					for (const patch of captured) applySettingsPatch(current, patch);
 					return { shouldWrite: captured.length > 0 };
@@ -1590,10 +1577,13 @@ export class Settings implements NotificationSettingsReader {
 						if (this.#modified.get(key)?.generation === patch.generation) this.#modified.delete(key);
 					}
 					this.#global = current;
+					this.#captureRawNotificationConfig(current);
 					for (const patch of this.#pendingPatchesInGenerationOrder()) {
 						applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
+						this.#applyNotificationMutationToRaw(patch.path, patch.value);
 					}
 					this.#rebuildMerged();
+					this.#recomputeNotificationValidationFromRaw();
 				},
 			};
 		}).then(() => undefined);
@@ -1606,10 +1596,13 @@ export class Settings implements NotificationSettingsReader {
 			}
 			if (durableBeforeWrite) {
 				this.#global = durableBeforeWrite;
+				this.#captureRawNotificationConfig(durableBeforeWrite);
 				for (const patch of this.#pendingPatchesInGenerationOrder()) {
 					applySettingsPatch(this.#global, { ...patch, value: structuredClone(patch.value) });
+					this.#applyNotificationMutationToRaw(patch.path, patch.value);
 				}
 				this.#rebuildMerged();
+				this.#recomputeNotificationValidationFromRaw();
 			}
 		});
 		this.#armSaveTimer(slot);
@@ -1639,8 +1632,8 @@ export class Settings implements NotificationSettingsReader {
 		slot.release();
 	}
 
-	#applyDurableBatch(revisions: readonly DurableBatchRevision[]): void {
-		this.#applyDurablePatches(
+	#applyDurableBatch(revisions: readonly DurableBatchRevision[]): boolean {
+		return this.#applyDurablePatches(
 			revisions,
 			revisions.map(entry => entry.patch),
 			true,
@@ -1650,15 +1643,22 @@ export class Settings implements NotificationSettingsReader {
 	#applyRestoredDurableBatch(
 		revisions: readonly DurableBatchRevision[],
 		restoredPatches: readonly AtomicYamlPatch[],
+		notificationValidationGuard: NotificationValidationRestoreGuard,
 	): void {
-		this.#applyDurablePatches(revisions, restoredPatches, false);
+		const restoreNotificationValidationState = this.#canRestoreNotificationValidationState(
+			notificationValidationGuard,
+			restoredPatches.map(patch => patch.path),
+		);
+		if (this.#applyDurablePatches(revisions, restoredPatches, false) && restoreNotificationValidationState) {
+			this.#restoreNotificationValidationState(notificationValidationGuard.state);
+		}
 	}
 
 	#applyDurablePatches(
 		revisions: readonly DurableBatchRevision[],
 		patches: readonly AtomicYamlPatch[],
 		clearStagedMutations: boolean,
-	): void {
+	): boolean {
 		const revisionsByPath = new Map<string, DurableBatchRevision>();
 		for (const entry of revisions) revisionsByPath.set(entry.patch.path, entry);
 		const finalPatches = new Map<string, AtomicYamlPatch>();
@@ -1667,7 +1667,7 @@ export class Settings implements NotificationSettingsReader {
 			const revision = revisionsByPath.get(patch.path);
 			return revision !== undefined && this.#pathRevisions.get(patch.path) === revision.revision;
 		});
-		if (applicable.length === 0) return;
+		if (applicable.length === 0) return false;
 
 		const previous = new Map<string, unknown>();
 		for (const patch of applicable) {
@@ -1676,8 +1676,10 @@ export class Settings implements NotificationSettingsReader {
 			previous.set(settingPath, getByPath(this.#global, settingPath.split(".")));
 			if (patch.op === "set") {
 				setByPath(this.#global, settingPath.split("."), structuredClone(patch.value));
+				this.#applyNotificationMutationToRaw(settingPath, patch.value);
 			} else {
 				deleteByPath(this.#global, settingPath.split("."));
+				this.#applyNotificationMutationToRaw(settingPath, undefined);
 			}
 			if (clearStagedMutations) {
 				for (const [key, staged] of this.#modified) {
@@ -1687,6 +1689,7 @@ export class Settings implements NotificationSettingsReader {
 				}
 			}
 		}
+		for (const patch of applicable) this.#applyDurableNotificationMutation(patch);
 		const modelRoles = rawSettingsRecord(this.#global.modelRoles);
 		if (
 			applicable.some(patch => patch.path === "modelRoles.default" && patch.op === "unset") &&
@@ -1696,22 +1699,143 @@ export class Settings implements NotificationSettingsReader {
 			delete this.#global.modelRoles;
 		}
 		this.#rebuildMerged();
+		this.#revalidateNotificationSettingsAfterMutation(applicable.map(patch => patch.path));
 		for (const patch of applicable) {
 			const settingPath = patch.path as SettingPath;
 			const hook = SETTING_HOOKS[settingPath];
 			if (hook) hook(this.get(settingPath), previous.get(settingPath)!);
 		}
+		return applicable.some(patch => isNotificationSettingsPath(patch.path));
 	}
 
 	async #refreshDurableSettings(): Promise<void> {
 		if (!this.#persist || !this.#configPath) return;
-		this.#replaceGlobalWithDurable(await this.#loadYaml(this.#configPath));
+		const previousFingerprint = this.#durableNotificationFingerprint;
+		const current = await this.#loadYaml(this.#configPath);
+		if (previousFingerprint !== this.#durableNotificationFingerprint) this.#notificationValidationGeneration++;
+		this.#replaceGlobalWithDurable(current);
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// Utilities
 	// ─────────────────────────────────────────────────────────────────────────
 
+	#notificationValidationRestoreGuard(): NotificationValidationRestoreGuard {
+		return {
+			state: this.#notificationValidationState(),
+			restoreGeneration: undefined,
+		};
+	}
+	#notificationValidationState(): NotificationValidationState {
+		return {
+			malformedConfigRoot: this.#hasMalformedConfigRoot,
+			invalidNotificationConfiguration: this.#hasInvalidNotificationConfiguration,
+			generation: this.#notificationValidationGeneration,
+		};
+	}
+	#recordNotificationValidationBatchApply(
+		guard: NotificationValidationRestoreGuard,
+		pathsOrAppliedNotificationMutation: Iterable<string> | boolean,
+	): void {
+		const appliedNotificationMutation =
+			typeof pathsOrAppliedNotificationMutation === "boolean"
+				? pathsOrAppliedNotificationMutation
+				: [...pathsOrAppliedNotificationMutation].some(isNotificationSettingsPath);
+		if (appliedNotificationMutation && this.#notificationValidationGeneration === guard.state.generation + 1) {
+			guard.restoreGeneration = this.#notificationValidationGeneration;
+		}
+	}
+	#canRestoreNotificationValidationState(guard: NotificationValidationRestoreGuard, paths: Iterable<string>): boolean {
+		return (
+			[...paths].some(isNotificationSettingsPath) &&
+			guard.restoreGeneration !== undefined &&
+			this.#notificationValidationGeneration === guard.restoreGeneration
+		);
+	}
+	#restoreNotificationValidationState(state: NotificationValidationState): void {
+		this.#hasMalformedConfigRoot = state.malformedConfigRoot;
+		this.#hasInvalidNotificationConfiguration = state.invalidNotificationConfiguration;
+	}
+	#rejectAtomicNotificationRepairForMalformedRoot(patches: readonly AtomicYamlPatch[], root: unknown): void {
+		if (
+			root !== undefined &&
+			!rawSettingsRecord(root) &&
+			patches.some(patch => isNotificationSettingsPath(patch.path))
+		) {
+			throw new Error("Cannot atomically repair notification settings while config.yml has a malformed root.");
+		}
+	}
+
+	#captureRawNotificationConfig(raw: RawSettings | undefined): void {
+		this.#rawNotificationConfig = raw === undefined ? undefined : structuredClone(raw);
+		this.#durableRawNotificationConfig = raw === undefined ? undefined : structuredClone(raw);
+		this.#durableNotificationFingerprint =
+			raw === undefined ? "malformed-root" : YAML.stringify(getByPath(raw, ["notifications"]), null, 2);
+	}
+	#applyNotificationMutationToRaw(path: string, value: unknown | undefined): void {
+		if (!isNotificationSettingsPath(path)) return;
+		if (!this.#rawNotificationConfig) this.#rawNotificationConfig = {};
+		if (value === undefined) deleteByPath(this.#rawNotificationConfig, path.split("."));
+		else setByPath(this.#rawNotificationConfig, path.split("."), structuredClone(value));
+	}
+	#applyDurableNotificationMutation(patch: AtomicYamlPatch): void {
+		if (!isNotificationSettingsPath(patch.path)) return;
+		if (!this.#durableRawNotificationConfig) this.#durableRawNotificationConfig = {};
+		if (patch.op === "unset") deleteByPath(this.#durableRawNotificationConfig, patch.path.split("."));
+		else setByPath(this.#durableRawNotificationConfig, patch.path.split("."), structuredClone(patch.value));
+		this.#durableNotificationFingerprint = YAML.stringify(
+			getByPath(this.#durableRawNotificationConfig, ["notifications"]),
+			null,
+			2,
+		);
+	}
+	#fenceNotificationValidationForExternalDurableDelta(current: RawSettings, captured: readonly SettingsPatch[]): void {
+		const expected = structuredClone(this.#durableRawNotificationConfig);
+		for (const patch of captured) {
+			if (!isNotificationSettingsPath(patch.path)) continue;
+			if (!expected) break;
+			if (patch.value === undefined) deleteByPath(expected, patch.path.split("."));
+			else setByPath(expected, patch.path.split("."), structuredClone(patch.value));
+		}
+		const expectedFingerprint =
+			expected === undefined ? "malformed-root" : YAML.stringify(getByPath(expected, ["notifications"]), null, 2);
+		const currentFingerprint = YAML.stringify(getByPath(current, ["notifications"]), null, 2);
+		if (expectedFingerprint !== currentFingerprint) this.#notificationValidationGeneration++;
+	}
+	#recomputeNotificationValidationFromRaw(): void {
+		if (this.#rawNotificationConfig === undefined) {
+			this.#hasMalformedConfigRoot = true;
+			this.#hasInvalidNotificationConfiguration = false;
+			return;
+		}
+		try {
+			parseNotificationSettingsSnapshot(this.#rawNotificationConfig);
+			this.#hasMalformedConfigRoot = false;
+			this.#hasInvalidNotificationConfiguration = false;
+		} catch (error) {
+			if (error instanceof Error && error.message === "gjc_notify_daemon_invalid_configuration") {
+				this.#hasMalformedConfigRoot = false;
+				this.#hasInvalidNotificationConfiguration = true;
+				return;
+			}
+			throw error;
+		}
+	}
+	#revalidateNotificationSettingsAfterMutation(paths: Iterable<string>): void {
+		if (![...paths].some(isNotificationSettingsPath)) return;
+		this.#notificationValidationGeneration++;
+		try {
+			parseNotificationSettingsSnapshot(this.#rawNotificationConfig);
+			this.#hasMalformedConfigRoot = false;
+			this.#hasInvalidNotificationConfiguration = false;
+		} catch (error) {
+			if (error instanceof Error && error.message === "gjc_notify_daemon_invalid_configuration") {
+				this.#hasInvalidNotificationConfiguration = true;
+				return;
+			}
+			throw error;
+		}
+	}
 	#rebuildMerged(): void {
 		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#project);
 		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
@@ -1725,11 +1849,6 @@ export class Settings implements NotificationSettingsReader {
 				hook(value, value);
 			}
 		}
-	}
-
-	#getGlobalResolved<P extends SettingPath>(path: P): SettingValue<P> {
-		const value = getByPath(this.#global, path.split("."));
-		return value === undefined ? getDefault(path) : (value as SettingValue<P>);
 	}
 
 	#stripProjectNotificationSettings(settings: RawSettings): {
@@ -1859,6 +1978,7 @@ export function isSettingsInitialized(): boolean {
  * @internal
  */
 export function resetSettingsForTest(): void {
+	globalInstance?.getStorage()?.close();
 	globalInstance = null;
 	globalInstancePromise = null;
 	globalInitOptions = null;
