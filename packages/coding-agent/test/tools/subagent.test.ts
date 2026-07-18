@@ -488,6 +488,210 @@ describe("SubagentTool", () => {
 		expect(steerText).not.toContain("acted on");
 		await manager.dispose({ timeoutMs: 100 });
 	});
+	it("steer delivers the complete message while bounding only the parent echo", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const message = `${"🙂\t".repeat(6_100)}done`;
+		const delivered: string[] = [];
+
+		manager.registerSubagentRecord({
+			subagentId: "0-Running",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-Running.jsonl",
+			resumable: true,
+		});
+		manager.registerLiveHandle("0-Running", {
+			requestPause() {},
+			async injectMessage(content) {
+				delivered.push(content);
+			},
+		});
+		for (const [subagentId, status] of [
+			["0-Paused", "paused"],
+			["0-Queued", "queued"],
+			["0-Terminal", "completed"],
+		] as const) {
+			manager.registerSubagentRecord({
+				subagentId,
+				ownerId: "0-Main",
+				currentJobId: null,
+				historicalJobIds: [],
+				status,
+				sessionFile: `/tmp/${subagentId}.jsonl`,
+				resumable: true,
+				...(status === "queued" ? { queued: { ownerId: "0-Main", seq: 1, createdAt: Date.now() } } : {}),
+			});
+		}
+		manager.setResumeRunner((subagentId, resumeMessage) => {
+			delivered.push(resumeMessage ?? "");
+			return manager.register("task", subagentId, async () => "resumed", {
+				id: `job-${subagentId}`,
+				ownerId: "0-Main",
+				metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+			});
+		});
+
+		for (const id of ["0-Running", "0-Paused", "0-Queued", "0-Terminal"]) {
+			await tool.execute(`subagent-steer-${id}`, { action: "steer", id, message });
+		}
+
+		for (const received of [...delivered, manager.getSubagentRecord("0-Queued")?.queued?.message ?? ""]) {
+			expect(new TextEncoder().encode(received)).toEqual(new TextEncoder().encode(message));
+		}
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("steer echoes use verbosity limits and mark only steer truncation", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const message = `${"🙂\t".repeat(6_100)}done`;
+		const injected: string[] = [];
+		manager.registerSubagentRecord({
+			subagentId: "0-Bounded",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-Bounded.jsonl",
+			resumable: true,
+		});
+		manager.registerLiveHandle("0-Bounded", {
+			requestPause() {},
+			async injectMessage(content) {
+				injected.push(content);
+			},
+		});
+
+		for (const [verbosity, width] of [
+			["receipt", 280],
+			["preview", 2_000],
+			["full", 12_000],
+		] as const) {
+			const result = await tool.execute(`subagent-steer-${verbosity}`, {
+				action: "steer",
+				ids: ["0-Bounded"],
+				message,
+				verbosity,
+			});
+			const snapshot = result.details?.subagents[0];
+			if (!snapshot?.steerMessage) throw new Error("Expected bounded steer echo");
+			expect(snapshot.steerMessageTruncated).toBe(true);
+			expect(snapshot.truncated).toBeUndefined();
+			expect(Bun.stringWidth(snapshot.steerMessage)).toBeLessThanOrEqual(width);
+			expect(getText(result)).toContain(snapshot.steerMessage);
+			expect(new TextDecoder().decode(new TextEncoder().encode(snapshot.steerMessage))).toBe(snapshot.steerMessage);
+			expect(getText(result)).toContain("Steer message truncated in parent echo.");
+		}
+
+		const shortMessage = "preserve short 🙂";
+		const shortResult = await tool.execute("subagent-steer-short", {
+			action: "steer",
+			id: "0-Bounded",
+			message: shortMessage,
+		});
+		expect(shortResult.details?.subagents[0]?.steerMessage).toBe(shortMessage);
+		expect(shortResult.details?.subagents[0]?.steerMessageTruncated).toBe(false);
+		expect(getText(shortResult)).not.toContain("Steer message truncated in parent echo.");
+		expect(injected).toEqual([message, message, message, shortMessage]);
+		await manager.dispose({ timeoutMs: 100 });
+	});
+	it("steer echo caps adversarial invisible and multiline content without altering delivery", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const delivered: string[] = [];
+		manager.registerSubagentRecord({
+			subagentId: "0-Adversarial",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: "/tmp/0-Adversarial.jsonl",
+			resumable: true,
+		});
+		manager.registerLiveHandle("0-Adversarial", {
+			requestPause() {},
+			async injectMessage(content) {
+				delivered.push(content);
+			},
+		});
+
+		const inputs = [
+			"newline-only\n".repeat(100_000),
+			"\u200B\u0301".repeat(100_000),
+			"\u001B[31mansi\u001B[0m".repeat(100_000),
+			"delete\u007F".repeat(100_000),
+			"\u001B]unterminated-osc".repeat(100_000),
+			"\u001BPunterminated-dcs".repeat(100_000),
+		];
+		for (const [verbosity, width, maxChars, maxLines] of [
+			["receipt", 280, 1_024, 12],
+			["preview", 2_000, 8_000, 48],
+			["full", 12_000, 48_000, 240],
+		] as const) {
+			for (const input of inputs) {
+				const result = await tool.execute(`subagent-steer-adversarial-${verbosity}`, {
+					action: "steer",
+					ids: ["0-Adversarial"],
+					message: input,
+					verbosity,
+				});
+				const echo = result.details?.subagents[0]?.steerMessage ?? "";
+				expect(result.details?.subagents[0]?.steerMessageTruncated).toBe(true);
+				expect(echo.length).toBeLessThanOrEqual(maxChars);
+				expect(echo.split("\n").length).toBeLessThanOrEqual(maxLines);
+				expect(Bun.stringWidth(echo)).toBeLessThanOrEqual(width);
+				expect(echo).not.toContain("\u001B");
+				expect(echo).not.toContain("\u007F");
+				expect(new TextDecoder().decode(new TextEncoder().encode(echo))).toBe(echo);
+			}
+		}
+		const controlOnlyResult = await tool.execute("subagent-steer-control-only", {
+			action: "steer",
+			ids: ["0-Adversarial"],
+			message: "\u007F",
+		});
+		expect(controlOnlyResult.details?.subagents[0]?.steerMessage).toBe("");
+		expect(getText(controlOnlyResult)).toContain("Steer (queued):");
+		expect(getText(controlOnlyResult)).not.toContain("\u007F");
+		const c1Message =
+			"\u009B31mred\u009B0m \u009Dtitle\u009Cvisible \u001B]title\u009Cafter \u001B(Bplain \u001B#8aligned \u001B🙂emoji";
+		const c1Result = await tool.execute("subagent-steer-c1-sequences", {
+			action: "steer",
+			ids: ["0-Adversarial"],
+			message: c1Message,
+		});
+		expect(c1Result.details?.subagents[0]?.steerMessage).toBe("red visible after plain aligned 🙂emoji");
+		const cancellationMessage =
+			"\u001B]hidden\u0018visible \u009Dhidden\u001Ac1 \u001B[31\u001Ared \u009B31\u0018c1red";
+		const cancellationResult = await tool.execute("subagent-steer-cancelled-controls", {
+			action: "steer",
+			ids: ["0-Adversarial"],
+			message: cancellationMessage,
+		});
+		expect(cancellationResult.details?.subagents[0]?.steerMessage).toBe("visible c1 red c1red");
+
+		const exactMessage = `a${"\u0301".repeat(279)}`;
+		const exactResult = await tool.execute("subagent-steer-exact-character-limit", {
+			action: "steer",
+			ids: ["0-Adversarial"],
+			message: exactMessage,
+		});
+		expect(exactResult.details?.subagents[0]?.steerMessage).toBe(exactMessage);
+		expect(exactResult.details?.subagents[0]?.steerMessageTruncated).toBe(false);
+		expect(delivered).toEqual([
+			...inputs,
+			...inputs,
+			...inputs,
+			"\u007F",
+			c1Message,
+			cancellationMessage,
+			exactMessage,
+		]);
+		await manager.dispose({ timeoutMs: 100 });
+	});
 
 	it("steer attributes the caller (nested parent) id, not main or the child id", async () => {
 		const manager = createManager();

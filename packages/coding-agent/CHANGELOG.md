@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Parent-facing subagent steer echoes now honor receipt, preview, and full output bounds while children still receive the complete steer message.
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
 - Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
 - Coordinator MCP operational calls now canonically bootstrap or reuse the agent-global SDK broker when discovery is absent or stale, while coordinator/hermes JSON checks report catalog and broker-discovery readiness separately without mutating broker state (#2552).

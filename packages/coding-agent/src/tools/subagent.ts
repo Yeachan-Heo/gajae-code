@@ -17,6 +17,13 @@ const MAX_LIST_LIMIT = 50;
 const RECEIPT_PREVIEW_WIDTH = 280;
 const PREVIEW_WIDTH = 2_000;
 const FULL_PREVIEW_WIDTH = 12_000;
+const STEER_RECEIPT_MAX_CHARS = RECEIPT_PREVIEW_WIDTH;
+const STEER_PREVIEW_MAX_CHARS = PREVIEW_WIDTH;
+const STEER_FULL_MAX_CHARS = FULL_PREVIEW_WIDTH;
+const STEER_RECEIPT_MAX_LINES = 12;
+const STEER_PREVIEW_MAX_LINES = 48;
+const STEER_FULL_MAX_LINES = 240;
+const STEER_ELLIPSIS = "…";
 const STEER_QUEUED_GUIDANCE =
 	"The steer message is queued for the subagent's next steering boundary and has not necessarily taken effect yet.";
 
@@ -66,6 +73,8 @@ export interface SubagentSnapshot {
 	truncated?: boolean;
 	guidance?: string;
 	steerMessage?: string;
+	/** True when only the parent-facing steer echo was truncated. */
+	steerMessageTruncated?: boolean;
 	steerState?: "queued" | "resume_queued" | "resume_started";
 	steerPauseRequested?: boolean;
 	/** Live streaming progress for the awaited subagent (await panel only; UI detail). */
@@ -252,6 +261,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (message === undefined || message.trim() === "") {
 				throw new ToolError("`steer` requires a non-empty message.");
 			}
+			const steerEcho = previewSteerMessage(message, verbosity);
 			const records: SubagentRecord[] = [];
 			const missing: SubagentSnapshot[] = [];
 			const steerStates = new Map<string, NonNullable<SubagentSnapshot["steerState"]>>();
@@ -291,7 +301,8 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 						const snapshot = this.#recordSnapshot(manager, record, false, verbosity, verifiedOutputIds);
 						return {
 							...snapshot,
-							steerMessage: message,
+							steerMessage: steerEcho.message,
+							steerMessageTruncated: steerEcho.truncated,
 							steerState: steerStates.get(record.subagentId) ?? "queued",
 							steerPauseRequested: params.pause === true,
 							guidance: snapshot.guidance
@@ -598,8 +609,9 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (snapshot.description) lines.push(`Description: ${snapshot.description}`);
 			if (snapshot.outputRef) lines.push(`Output: ${snapshot.outputRef}`);
 			if (snapshot.assignment) lines.push("Assignment:", "```", snapshot.assignment, "```");
-			if (snapshot.steerMessage) {
+			if (snapshot.steerMessage !== undefined) {
 				lines.push(`Steer (${snapshot.steerState ?? "queued"}):`, "```", snapshot.steerMessage, "```");
+				if (snapshot.steerMessageTruncated) lines.push("Steer message truncated in parent echo.");
 				lines.push(STEER_QUEUED_GUIDANCE);
 			}
 			if (snapshot.resultPreview) {
@@ -786,6 +798,153 @@ function sanitizeText(text: string, width: number): string {
 	return truncateToWidth(replaceTabs(text), width, Ellipsis.Unicode);
 }
 
+function previewSteerMessage(
+	message: string,
+	verbosity: SubagentParams["verbosity"] = "receipt",
+): { message: string; truncated: boolean } {
+	const width =
+		verbosity === "full" ? FULL_PREVIEW_WIDTH : verbosity === "preview" ? PREVIEW_WIDTH : RECEIPT_PREVIEW_WIDTH;
+	const maxChars =
+		verbosity === "full"
+			? STEER_FULL_MAX_CHARS
+			: verbosity === "preview"
+				? STEER_PREVIEW_MAX_CHARS
+				: STEER_RECEIPT_MAX_CHARS;
+	const maxLines =
+		verbosity === "full"
+			? STEER_FULL_MAX_LINES
+			: verbosity === "preview"
+				? STEER_PREVIEW_MAX_LINES
+				: STEER_RECEIPT_MAX_LINES;
+	const collected = collectSteerEcho(message, maxChars, maxLines);
+	const tabbed = replaceTabs(collected.text);
+	const contentCapped = truncateSteerContent(tabbed, maxChars);
+	const preview = truncateToWidth(contentCapped.text, width, Ellipsis.Unicode);
+	return {
+		message: preview,
+		truncated: collected.truncated || contentCapped.truncated || preview !== contentCapped.text,
+	};
+}
+
+function collectSteerEcho(message: string, maxChars: number, maxLines: number): { text: string; truncated: boolean } {
+	const sourceBudget = maxChars * 8 + 4_096;
+	const outputBudget = maxChars;
+	const out: string[] = [];
+	let index = 0;
+	let outputLength = 0;
+	let lines = 1;
+	let truncated = false;
+
+	while (index < message.length && index < sourceBudget) {
+		const code = message.charCodeAt(index);
+		if (code === 0x1b) {
+			index = skipEscapeSequence(message, index + 1, sourceBudget);
+			continue;
+		}
+		if (code >= 0x80 && code <= 0x9f) {
+			index = skipC1Sequence(message, index, sourceBudget);
+			continue;
+		}
+		if ((code < 0x20 && code !== 0x0a && code !== 0x09) || code === 0x7f) {
+			index++;
+			continue;
+		}
+		const codePoint = message.codePointAt(index)!;
+		const character = String.fromCodePoint(codePoint);
+		if (character === "\n") {
+			if (lines >= maxLines) {
+				truncated = true;
+				break;
+			}
+			lines++;
+		}
+		if (outputLength + character.length > outputBudget) {
+			truncated = true;
+			break;
+		}
+		out.push(character);
+		outputLength += character.length;
+		index += character.length;
+	}
+	if (index < message.length) truncated = true;
+	const text = out.join("");
+	return {
+		text: truncated ? appendSteerEllipsis(text, maxChars) : text,
+		truncated,
+	};
+}
+
+function appendSteerEllipsis(text: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	const content = text.endsWith("\n") ? text.slice(0, -1) : text;
+	let contentEnd = Math.min(content.length, Math.max(0, maxChars - STEER_ELLIPSIS.length));
+	const finalCodeUnit = content.charCodeAt(contentEnd - 1);
+	if (finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff) contentEnd--;
+	return `${content.slice(0, contentEnd)}${STEER_ELLIPSIS}`;
+}
+
+function skipEscapeSequence(text: string, index: number, sourceBudget: number): number {
+	if (index >= text.length || index >= sourceBudget) return index;
+	const kind = text.charCodeAt(index);
+	if (kind === 0x5b) return skipCsiSequence(text, index + 1, sourceBudget);
+	if (kind >= 0x20 && kind <= 0x2f) return skipEscapeIntermediateSequence(text, index + 1, sourceBudget);
+	if (kind === 0x5d || kind === 0x50 || kind === 0x58 || kind === 0x5e || kind === 0x5f) {
+		return skipControlString(text, index + 1, sourceBudget, kind === 0x5d);
+	}
+	if (kind === 0x18 || kind === 0x1a || (kind >= 0x30 && kind <= 0x7e)) return index + 1;
+	return index;
+}
+
+function skipEscapeIntermediateSequence(text: string, index: number, sourceBudget: number): number {
+	while (index < text.length && index < sourceBudget) {
+		const code = text.charCodeAt(index);
+		if (code >= 0x20 && code <= 0x2f) {
+			index++;
+			continue;
+		}
+		if (code === 0x18 || code === 0x1a || (code >= 0x30 && code <= 0x7e)) index++;
+		break;
+	}
+	return index;
+}
+
+function skipC1Sequence(text: string, index: number, sourceBudget: number): number {
+	const kind = text.charCodeAt(index++);
+	if (kind === 0x9b) return skipCsiSequence(text, index, sourceBudget);
+	if (kind !== 0x90 && kind !== 0x98 && kind !== 0x9d && kind !== 0x9e && kind !== 0x9f) return index;
+	return skipControlString(text, index, sourceBudget, kind === 0x9d);
+}
+
+function skipCsiSequence(text: string, index: number, sourceBudget: number): number {
+	while (index < text.length && index < sourceBudget) {
+		const code = text.charCodeAt(index++);
+		if (code === 0x18 || code === 0x1a) break;
+		if (code >= 0x40 && code <= 0x7e) break;
+	}
+	return index;
+}
+
+function skipControlString(text: string, index: number, sourceBudget: number, allowBell: boolean): number {
+	while (index < text.length && index < sourceBudget) {
+		const code = text.charCodeAt(index++);
+		if (code === 0x18 || code === 0x1a) break;
+		if ((allowBell && code === 0x07) || code === 0x9c) break;
+		if (code === 0x1b && index < text.length && text.charCodeAt(index) === 0x5c) {
+			index++;
+			break;
+		}
+	}
+	return index;
+}
+
+function truncateSteerContent(text: string, maxChars: number): { text: string; truncated: boolean } {
+	if (text.length <= maxChars) return { text, truncated: false };
+	let contentEnd = Math.max(0, maxChars - STEER_ELLIPSIS.length);
+	const finalCodeUnit = text.charCodeAt(contentEnd - 1);
+	if (finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff) contentEnd--;
+	return { text: `${text.slice(0, contentEnd)}${STEER_ELLIPSIS}`, truncated: true };
+}
+
 function previewJobOutput(
 	job: AsyncJob,
 	verbosity: SubagentParams["verbosity"] = "receipt",
@@ -851,6 +1010,7 @@ function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
 		truncated: snapshot.truncated ?? false,
 		guidance: snapshot.guidance ?? null,
 		steerMessage: snapshot.steerMessage ?? null,
+		steerMessageTruncated: snapshot.steerMessageTruncated ?? false,
 		steerState: snapshot.steerState ?? null,
 		steerPauseRequested: snapshot.steerPauseRequested ?? false,
 		liveProgressAvailable: snapshot.liveProgressAvailable ?? null,
