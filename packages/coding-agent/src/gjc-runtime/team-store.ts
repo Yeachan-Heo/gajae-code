@@ -137,6 +137,119 @@ type EventAppender = (event: {
 const now = () => new Date().toISOString();
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 const isEnoent = (error: unknown): error is { code: string } => isRecord(error) && error.code === "ENOENT";
+const canonicalTaskKeys = new Set([
+	"id",
+	"subject",
+	"description",
+	"title",
+	"objective",
+	"status",
+	"assignee",
+	"owner",
+	"result",
+	"completion_evidence",
+	"error",
+	"blocked_by",
+	"depends_on",
+	"lane",
+	"required_role",
+	"allowed_roles",
+	"version",
+	"claim",
+	"created_at",
+	"updated_at",
+	"completed_at",
+]);
+const canonicalClaimKeys = new Set(["owner", "token", "leased_until"]);
+const canonicalEvidenceKeys = new Set(["summary", "items", "files", "notes", "recorded_by", "recorded_at"]);
+const canonicalEvidenceItemKeys = new Set(["kind", "status", "summary", "command", "artifact", "location", "output"]);
+const hasExactKeys = (value: Record<string, unknown>, keys: Set<string>) =>
+	Object.keys(value).every(key => keys.has(key));
+const isNonEmptyString = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+const isSafePersistedId = (value: unknown): value is string =>
+	isNonEmptyString(value) && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(value) && !value.includes("..");
+const isFiniteTimestamp = (value: unknown): value is string =>
+	typeof value === "string" && Number.isFinite(Date.parse(value));
+
+/** The sole strict schema gate for persisted task and claim authority records. */
+export function isCanonicalPersistedGjcTeamTaskClaim(value: unknown): value is GjcTeamTaskClaim {
+	if (!isRecord(value) || Array.isArray(value) || !hasExactKeys(value, canonicalClaimKeys)) return false;
+	return isSafePersistedId(value.owner) && isNonEmptyString(value.token) && isFiniteTimestamp(value.leased_until);
+}
+
+function isCanonicalCompletionEvidence(value: unknown): value is GjcTeamTaskCompletionEvidence {
+	if (!isRecord(value) || Array.isArray(value) || !hasExactKeys(value, canonicalEvidenceKeys)) return false;
+	if (
+		!isNonEmptyString(value.summary) ||
+		!isSafePersistedId(value.recorded_by) ||
+		!isFiniteTimestamp(value.recorded_at)
+	)
+		return false;
+	if (!Array.isArray(value.items) || value.items.length === 0) return false;
+	if (
+		!value.items.every(item => {
+			if (!isRecord(item) || Array.isArray(item) || !hasExactKeys(item, canonicalEvidenceItemKeys)) return false;
+			if (!isNonEmptyString(item.summary) || !["command", "inspection", "artifact"].includes(String(item.kind)))
+				return false;
+			if (
+				(item.kind === "command" && !["passed", "failed", "not_run"].includes(String(item.status))) ||
+				(item.kind !== "command" && !["verified", "rejected"].includes(String(item.status)))
+			)
+				return false;
+			if (item.command !== undefined && !isNonEmptyString(item.command)) return false;
+			if (item.artifact !== undefined && !isNonEmptyString(item.artifact)) return false;
+			if (item.location !== undefined && !isNonEmptyString(item.location)) return false;
+			if (item.output !== undefined && typeof item.output !== "string") return false;
+			return item.kind !== "command" || isNonEmptyString(item.command);
+		})
+	)
+		return false;
+	if (
+		value.files !== undefined &&
+		(!Array.isArray(value.files) || !value.files.every(file => typeof file === "string" && file.trim().length > 0))
+	)
+		return false;
+	return value.notes === undefined || typeof value.notes === "string";
+}
+
+export function isCanonicalPersistedGjcTeamTask(value: unknown, fileId?: string): value is GjcTeamTask {
+	if (!isRecord(value) || Array.isArray(value) || !hasExactKeys(value, canonicalTaskKeys)) return false;
+	if (!isSafePersistedId(value.id) || (fileId !== undefined && value.id !== fileId)) return false;
+	if (!["pending", "blocked", "in_progress", "completed", "failed"].includes(String(value.status))) return false;
+	if (!["subject", "description", "title", "objective"].every(key => typeof value[key] === "string")) return false;
+	if (!Number.isInteger(value.version) || (value.version as number) <= 0) return false;
+	if (!isFiniteTimestamp(value.created_at) || !isFiniteTimestamp(value.updated_at)) return false;
+	if (value.completed_at !== undefined && !isFiniteTimestamp(value.completed_at)) return false;
+	if (value.owner !== undefined && !isSafePersistedId(value.owner)) return false;
+	if (value.assignee !== undefined && !isSafePersistedId(value.assignee)) return false;
+	if (value.result !== undefined && typeof value.result !== "string") return false;
+	if (value.error !== undefined && typeof value.error !== "string") return false;
+	if (value.lane !== undefined && !isNonEmptyString(value.lane)) return false;
+	if (value.required_role !== undefined && !isNonEmptyString(value.required_role)) return false;
+	if (
+		value.allowed_roles !== undefined &&
+		(!Array.isArray(value.allowed_roles) || !value.allowed_roles.every(isNonEmptyString))
+	)
+		return false;
+	if (
+		value.depends_on !== undefined &&
+		(!Array.isArray(value.depends_on) || !value.depends_on.every(isSafePersistedId))
+	)
+		return false;
+	if (
+		value.blocked_by !== undefined &&
+		(!Array.isArray(value.blocked_by) || !value.blocked_by.every(isSafePersistedId))
+	)
+		return false;
+	if (value.completion_evidence !== undefined && !isCanonicalCompletionEvidence(value.completion_evidence))
+		return false;
+	if (value.claim !== undefined) {
+		if (!isCanonicalPersistedGjcTeamTaskClaim(value.claim)) return false;
+		if (value.status !== "in_progress" || value.owner !== value.claim.owner || value.assignee !== value.claim.owner)
+			return false;
+	}
+	return true;
+}
 const safeId = (kind: string, value: string) => {
 	if (
 		!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(value) ||

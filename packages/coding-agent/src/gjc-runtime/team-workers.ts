@@ -20,6 +20,8 @@ import type {
 import type { GjcTeamTask, GjcTeamTaskClaim, GjcTeamTaskMutationCapability } from "./team-store";
 import {
 	getGjcTeamTaskCompletionEvidenceFailure,
+	isCanonicalPersistedGjcTeamTask,
+	isCanonicalPersistedGjcTeamTaskClaim,
 	isGjcTeamTaskCompletionVerified,
 	normalizeGjcTeamTask,
 } from "./team-store";
@@ -421,20 +423,6 @@ function claimFromUnknown(value: unknown): GjcTeamTaskClaim | undefined {
 	return owner && token && leasedUntil ? { owner, token, leased_until: leasedUntil } : undefined;
 }
 
-function isCanonicalContinuationClaim(value: unknown): value is GjcTeamTaskClaim {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-	const claim = value as Record<string, unknown>;
-	return (
-		Object.keys(claim).length === 3 &&
-		typeof claim.owner === "string" &&
-		claim.owner.length > 0 &&
-		typeof claim.token === "string" &&
-		claim.token.length > 0 &&
-		typeof claim.leased_until === "string" &&
-		Number.isFinite(Date.parse(claim.leased_until))
-	);
-}
-
 async function hasCurrentContinuationClaimAuthority(
 	runtime: GjcTeamWorkerOrchestrationRuntime,
 	dir: string,
@@ -450,24 +438,22 @@ async function hasCurrentContinuationClaimAuthority(
 	} catch {
 		return false;
 	}
-	if (!isCanonicalContinuationClaim(canonicalClaim)) return false;
+	if (!isCanonicalPersistedGjcTeamTaskClaim(canonicalClaim)) return false;
 	if (
 		canonicalClaim.owner !== claim.owner ||
 		canonicalClaim.token !== claim.token ||
 		canonicalClaim.leased_until !== claim.leased_until
 	)
 		return false;
-	if (typeof canonicalTask !== "object" || canonicalTask === null || Array.isArray(canonicalTask)) return false;
-	const current = canonicalTask as Record<string, unknown>;
+	if (!isCanonicalPersistedGjcTeamTask(canonicalTask, task.id)) return false;
 	return (
-		current.id === task.id &&
-		current.status === "in_progress" &&
-		current.owner === worker &&
-		current.assignee === worker &&
-		isCanonicalContinuationClaim(current.claim) &&
-		current.claim.owner === canonicalClaim.owner &&
-		current.claim.token === canonicalClaim.token &&
-		current.claim.leased_until === canonicalClaim.leased_until
+		canonicalTask.version === task.version &&
+		canonicalTask.status === "in_progress" &&
+		canonicalTask.owner === worker &&
+		canonicalTask.assignee === worker &&
+		canonicalTask.claim?.owner === canonicalClaim.owner &&
+		canonicalTask.claim?.token === canonicalClaim.token &&
+		canonicalTask.claim?.leased_until === canonicalClaim.leased_until
 	);
 }
 

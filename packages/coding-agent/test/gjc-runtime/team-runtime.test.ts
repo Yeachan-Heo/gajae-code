@@ -3349,20 +3349,55 @@ describe("stalled worker continuation protocol", () => {
 		expect(task.claim).toBeUndefined();
 		expect(await readEvents(snapshot.state_dir)).toContain('"reason":"invalid_claim_count"');
 	});
-	it("fails closed when a listed task or claim authority record is malformed or filename-inconsistent", async () => {
-		for (const scenario of ["malformed_task", "mismatched_task_id", "invalid_claim"] as const) {
+	it("fails closed when continuation inventory contains a non-canonical task or claim authority record", async () => {
+		for (const scenario of [
+			"malformed_task",
+			"mismatched_task_id",
+			"invalid_claim",
+			"extra_claim_key",
+			"extra_task_key",
+			"malformed_optional_array",
+			"malformed_completion_evidence",
+			"empty_owner",
+			"claim_status_owner_assignee_mismatch",
+			"claim_owner_mismatch",
+			"claim_assignee_mismatch",
+			"orphan_claim",
+		] as const) {
 			const fixture = await prepareContinuation(`continuation-inventory-${scenario}-team`);
-			const taskPath = path.join(fixture.stateDir, "tasks", "task-2.json");
+			const taskPath = path.join(fixture.stateDir, "tasks", "task-1.json");
+			const claimPath = path.join(fixture.stateDir, "claims", "task-1.json");
+			const task = await Bun.file(taskPath).json();
 			if (scenario === "malformed_task") {
 				await Bun.write(taskPath, "{truncated");
-			} else {
-				const task = await Bun.file(path.join(fixture.stateDir, "tasks", "task-1.json")).json();
+			} else if (scenario === "mismatched_task_id") {
+				await Bun.write(taskPath, `${JSON.stringify({ ...task, id: "other-task" })}\n`);
+			} else if (scenario === "invalid_claim") {
+				await Bun.write(claimPath, "null\n");
+			} else if (scenario === "extra_claim_key") {
+				await Bun.write(claimPath, `${JSON.stringify({ ...task.claim, unexpected: true })}\n`);
+			} else if (scenario === "extra_task_key") {
+				await Bun.write(taskPath, `${JSON.stringify({ ...task, unexpected: true })}\n`);
+			} else if (scenario === "malformed_optional_array") {
+				await Bun.write(taskPath, `${JSON.stringify({ ...task, allowed_roles: ["executor", 1] })}\n`);
+			} else if (scenario === "malformed_completion_evidence") {
 				await Bun.write(
 					taskPath,
-					`${JSON.stringify({ ...task, id: scenario === "mismatched_task_id" ? "other-task" : "task-2" })}\n`,
+					`${JSON.stringify({ ...task, completion_evidence: { summary: "bad", items: [] } })}\n`,
 				);
-				if (scenario === "invalid_claim")
-					await Bun.write(path.join(fixture.stateDir, "claims", "task-2.json"), "null\n");
+			} else if (scenario === "empty_owner") {
+				await Bun.write(taskPath, `${JSON.stringify({ ...task, owner: "", assignee: "" })}\n`);
+			} else if (scenario === "claim_status_owner_assignee_mismatch") {
+				await Bun.write(taskPath, `${JSON.stringify({ ...task, status: "pending" })}\n`);
+			} else if (scenario === "claim_owner_mismatch") {
+				await Bun.write(taskPath, `${JSON.stringify({ ...task, owner: "other-worker" })}\n`);
+			} else if (scenario === "claim_assignee_mismatch") {
+				await Bun.write(taskPath, `${JSON.stringify({ ...task, assignee: "other-worker" })}\n`);
+			} else {
+				await Bun.write(
+					path.join(fixture.stateDir, "claims", "orphan-task.json"),
+					`${JSON.stringify(task.claim)}\n`,
+				);
 			}
 			if (scenario === "malformed_task") await expect(fixture.monitor()).rejects.toThrow();
 			else await fixture.monitor();
@@ -3379,6 +3414,7 @@ describe("stalled worker continuation protocol", () => {
 			"task_status_changed",
 			"task_owner_changed",
 			"task_assignee_changed",
+			"task_version_changed",
 		] as const) {
 			const fixture = await prepareContinuation(`continuation-pre-dispatch-${scenario}-team`);
 			__setGjcTeamRuntimeTestSeamsForTests({
@@ -3400,6 +3436,7 @@ describe("stalled worker continuation protocol", () => {
 								...(scenario === "task_status_changed" ? { status: "pending" } : {}),
 								...(scenario === "task_owner_changed" ? { owner: "other-worker" } : {}),
 								...(scenario === "task_assignee_changed" ? { assignee: "other-worker" } : {}),
+								...(scenario === "task_version_changed" ? { version: task.version + 1 } : {}),
 							})}\n`,
 						);
 					}
@@ -3417,6 +3454,7 @@ describe("stalled worker continuation protocol", () => {
 			"task_status_changed",
 			"task_owner_changed",
 			"task_assignee_changed",
+			"task_version_changed",
 		] as const) {
 			const fixture = await prepareContinuation(`continuation-hold-authority-${scenario}-team`);
 			await fixture.monitor();
@@ -3436,6 +3474,7 @@ describe("stalled worker continuation protocol", () => {
 						...(scenario === "task_status_changed" ? { status: "pending" } : {}),
 						...(scenario === "task_owner_changed" ? { owner: "other-worker" } : {}),
 						...(scenario === "task_assignee_changed" ? { assignee: "other-worker" } : {}),
+						...(scenario === "task_version_changed" ? { version: task.version + 1 } : {}),
 					})}\n`,
 				);
 			}

@@ -43,6 +43,8 @@ import type {
 } from "./team-store";
 import {
 	GjcTeamTaskStore,
+	isCanonicalPersistedGjcTeamTask,
+	isCanonicalPersistedGjcTeamTaskClaim,
 	isGjcTeamTaskCompletionVerified,
 	readGjcTeamTasksFromDir as readTasks,
 	taskMetadataFromInput,
@@ -719,44 +721,6 @@ type GjcContinuationAuthorityInventory =
 	| { valid: true; tasks: GjcTeamTask[]; claims: Map<string, GjcTeamTaskClaim> }
 	| { valid: false };
 
-function isCanonicalContinuationClaim(value: unknown): value is GjcTeamTaskClaim {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-	const record = value as Record<string, unknown>;
-	return (
-		Object.keys(record).length === 3 &&
-		typeof record.owner === "string" &&
-		record.owner.length > 0 &&
-		typeof record.token === "string" &&
-		record.token.length > 0 &&
-		typeof record.leased_until === "string" &&
-		Number.isFinite(Date.parse(record.leased_until))
-	);
-}
-
-function isCanonicalContinuationTask(value: unknown, fileId: string): value is GjcTeamTask {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-	const task = value as Record<string, unknown>;
-	return (
-		task.id === fileId &&
-		isSafeId(fileId) &&
-		typeof task.subject === "string" &&
-		typeof task.description === "string" &&
-		typeof task.title === "string" &&
-		typeof task.objective === "string" &&
-		["pending", "blocked", "in_progress", "completed", "failed"].includes(String(task.status)) &&
-		typeof task.version === "number" &&
-		Number.isInteger(task.version) &&
-		task.version > 0 &&
-		typeof task.created_at === "string" &&
-		Number.isFinite(Date.parse(task.created_at)) &&
-		typeof task.updated_at === "string" &&
-		Number.isFinite(Date.parse(task.updated_at)) &&
-		(task.owner === undefined || typeof task.owner === "string") &&
-		(task.assignee === undefined || typeof task.assignee === "string") &&
-		(task.claim === undefined || isCanonicalContinuationClaim(task.claim))
-	);
-}
-
 async function readGjcContinuationAuthorityInventory(dir: string): Promise<GjcContinuationAuthorityInventory> {
 	let taskNames: string[];
 	try {
@@ -772,7 +736,7 @@ async function readGjcContinuationAuthorityInventory(dir: string): Promise<GjcCo
 		const id = name.slice(0, -".json".length);
 		try {
 			const task = await Bun.file(path.join(dir, "tasks", name)).json();
-			if (!isCanonicalContinuationTask(task, id) || taskIds.has(task.id)) return { valid: false };
+			if (!isCanonicalPersistedGjcTeamTask(task, id) || taskIds.has(task.id)) return { valid: false };
 			taskIds.add(task.id);
 			tasks.push(task);
 		} catch {
@@ -794,7 +758,7 @@ async function readGjcContinuationAuthorityInventory(dir: string): Promise<GjcCo
 		if (!taskIds.has(id) || claims.has(id)) return { valid: false };
 		try {
 			const claim = await Bun.file(path.join(dir, "claims", name)).json();
-			if (!isCanonicalContinuationClaim(claim)) return { valid: false };
+			if (!isCanonicalPersistedGjcTeamTaskClaim(claim)) return { valid: false };
 			claims.set(id, claim);
 		} catch {
 			return { valid: false };
@@ -3450,7 +3414,12 @@ async function writeLifecycleNudge(
 		suggested_action: suggestedAction,
 		auto_action_taken: false,
 	};
-	await writeJsonFile(nudgePath, record);
+	try {
+		await writeJsonFile(nudgePath, record);
+	} catch (error) {
+		if (isEnoent(error)) return;
+		throw error;
+	}
 	await appendEvent(dir, {
 		type: "worker_lifecycle_nudge",
 		worker,
