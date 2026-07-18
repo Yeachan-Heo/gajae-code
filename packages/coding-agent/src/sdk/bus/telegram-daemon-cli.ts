@@ -94,7 +94,7 @@ export function createLightweightDaemonSettings(input: {
 				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "richDraft", "enabled"]), false),
 			},
 			streaming: {
-				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "streaming", "enabled"]), false),
+				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "streaming", "enabled"]), true),
 			},
 			topics: {
 				nameTemplate: asString(getByPath(rawConfig, ["notifications", "telegram", "topics", "nameTemplate"])),

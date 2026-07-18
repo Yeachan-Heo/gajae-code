@@ -1020,7 +1020,7 @@ const defaultConfig: NotificationConfig = {
 	idleTimeoutMs: 60_000,
 	rich: { enabled: true },
 	richDraft: { enabled: false },
-	streaming: { enabled: false },
+	streaming: { enabled: true },
 	topics: {},
 };
 
@@ -1028,10 +1028,10 @@ export function notificationsEnabled(): boolean {
 	return process.env.GJC_NOTIFICATIONS === "1" || Boolean(process.env.GJC_NOTIFICATIONS_TOKEN);
 }
 
-// Live streaming (opt-in): emit throttled non-finalized `turn_stream` frames as
-// the assistant message streams so remote clients can edit ONE message live. The
+// Live streaming: emit throttled non-finalized `turn_stream` frames as the
+// assistant message streams so remote clients can edit ONE message live. The
 // finalized frame (turn_end) carries the same messageRef and stays authoritative,
-// so a dropped live frame self-heals. The global setting enables it durably;
+// so a dropped live frame self-heals. The global setting is default-on;
 // GJC_NOTIFICATIONS_STREAM=1 enables it per-process and 0/off/false disables it.
 function streamingEnabled(cfg: Pick<NotificationConfig, "streaming">): boolean {
 	const env = process.env.GJC_NOTIFICATIONS_STREAM?.trim();

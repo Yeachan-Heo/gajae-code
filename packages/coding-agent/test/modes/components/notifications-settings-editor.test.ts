@@ -256,6 +256,22 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(component.mode).toBe("chat-entry");
 		expect(render(component)).toContain("private chat ID (optional)");
 	});
+	it("keeps streaming enabled while notification state is still loading", async () => {
+		const operations = new FakeNotificationsOperations();
+		const loadGate = deferred<NotificationsEditorState>();
+		operations.loadState = () => loadGate.promise;
+		const component = new NotificationsSettingsEditorComponent(operations);
+
+		select(component, 10);
+		component.handleInput("\n");
+		select(component, 5);
+
+		expect(render(component)).toContain("Telegram message streaming: on");
+
+		loadGate.resolve(state());
+		await flush();
+		component.dispose();
+	});
 
 	it("wraps CJK status guidance without truncating any localized sentence", async () => {
 		const operations = new FakeNotificationsOperations();

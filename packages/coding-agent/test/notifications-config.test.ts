@@ -233,6 +233,30 @@ describe("notifications config", () => {
 		expect(settings.getNotificationSettingsSnapshot()).toEqual(lightweight.getNotificationSettingsSnapshot());
 		expect(getNotificationConfig(settings)).toEqual(getNotificationConfig(lightweight));
 	});
+	test("absent streaming keys default on across full Settings and the lightweight daemon", () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": "telegram-token",
+			"notifications.telegram.chatId": "telegram-chat",
+		});
+		const lightweight = createLightweightDaemonSettings({
+			agentDir: "/tmp/gjc-notification-snapshot-absent",
+			rawConfig: {
+				notifications: {
+					enabled: true,
+					telegram: {
+						botToken: "telegram-token",
+						chatId: "telegram-chat",
+					},
+				},
+			},
+		});
+
+		expect(settings.getNotificationSettingsSnapshot().telegram.streaming.enabled).toBe(true);
+		expect(lightweight.getNotificationSettingsSnapshot().telegram.streaming.enabled).toBe(true);
+		expect(getNotificationConfig(settings).streaming.enabled).toBe(true);
+		expect(getNotificationConfig(lightweight).streaming.enabled).toBe(true);
+	});
 
 	test("project notification settings are ignored without leaking credentials", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-project-boundary-"));

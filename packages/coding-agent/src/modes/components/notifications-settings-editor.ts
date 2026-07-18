@@ -194,7 +194,7 @@ function emptyState(): NotificationsEditorState {
 			sessionScope: "all",
 			richEnabled: true,
 			richDraftEnabled: false,
-			streamingEnabled: false,
+			streamingEnabled: true,
 		},
 	};
 }

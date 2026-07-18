@@ -1,0 +1,163 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "Final read-only review agent://3-FinalDefaultReview found the default-on Telegram streaming contract consistent across schema/full Settings, lightweight daemon config, producer fallback, chat-daemon validation projections, editor loading/persistence, tests, docs, and changelog; no blockers or findings.",
+    "commands": ["agent://3-FinalDefaultReview"],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "Final executor QA agent://5-FinalExecutorDefaultQA ran the complete bounded suite: 92 pass, 0 fail, 413 expect calls across 7 files. Leader reran the same suite plus package check and schema check successfully.",
+    "e2eCommands": [
+      "bun test packages/coding-agent/test/notifications-config.test.ts packages/coding-agent/test/notifications-daemon-config-reachability.test.ts packages/coding-agent/test/modes/components/notifications-settings-editor.test.ts packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/sdk-chat-daemon-worker.test.ts packages/coding-agent/test/notification-settings-controller.test.ts packages/coding-agent/test/notifications-session-control.test.ts"
+    ],
+    "redTeamCommands": [
+      "bun --cwd=packages/coding-agent run check",
+      "bun run check:schemas",
+      "agent://5-FinalExecutorDefaultQA"
+    ],
+    "artifactRefs": [
+      {
+        "id": "telegram-streaming-default-consistency",
+        "kind": "api-package-test-report",
+        "path": "artifacts/telegram-message-streaming-default-consistency-quality-gate.json",
+        "description": "Final default-consistency package tests, red-team cases, and review evidence"
+      }
+    ],
+    "contractCoverage": [
+      {
+        "id": "absent-default-boundaries",
+        "contractRef": "notifications.telegram.streaming.enabled",
+        "obligation": "Absent streaming keys resolve enabled across full Settings and lightweight daemon settings.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["default-consistency-tests"],
+        "adversarialCaseRefs": ["absent-key"]
+      },
+      {
+        "id": "malformed-and-false-config",
+        "contractRef": "notifications.telegram.streaming.enabled",
+        "obligation": "Malformed values use the default-on fallback while explicit durable false remains false.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["default-consistency-tests"],
+        "adversarialCaseRefs": ["malformed-value", "durable-false"]
+      },
+      {
+        "id": "runtime-producer-fallback",
+        "contractRef": "SDK notification producer fallback",
+        "obligation": "No-settings producer fallback is default-on and uses durable config unless an env override applies.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["streaming-tests"],
+        "adversarialCaseRefs": ["durable-false", "env-opt-out"]
+      },
+      {
+        "id": "chat-daemon-boundary",
+        "contractRef": "Discord/Slack chat-daemon validation projections",
+        "obligation": "Validation fallback projections use the intended default-on streaming shape without leaking Telegram live partials.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["streaming-tests"],
+        "adversarialCaseRefs": ["chat-adapter-live-filter"]
+      },
+      {
+        "id": "editor-loading",
+        "contractRef": "Notifications settings editor",
+        "obligation": "Editor loading state presents streaming as enabled until durable state loads.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["default-consistency-tests"],
+        "adversarialCaseRefs": ["editor-loading"]
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "id": "default-consistency-tests",
+        "contractRef": "Notification default boundary tests",
+        "surface": "package",
+        "invocation": "bun test packages/coding-agent/test/notifications-config.test.ts packages/coding-agent/test/notifications-daemon-config-reachability.test.ts packages/coding-agent/test/modes/components/notifications-settings-editor.test.ts",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-default-consistency"]
+      },
+      {
+        "id": "streaming-tests",
+        "contractRef": "Telegram turn_stream producer and chat-adapter runtime",
+        "surface": "package",
+        "invocation": "bun test packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/sdk-chat-daemon-worker.test.ts packages/coding-agent/test/notification-settings-controller.test.ts packages/coding-agent/test/notifications-session-control.test.ts",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-default-consistency"]
+      },
+      {
+        "id": "package-schema-checks",
+        "contractRef": "Coding-agent package and generated schema",
+        "surface": "package",
+        "invocation": "bun --cwd=packages/coding-agent run check; bun run check:schemas",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-default-consistency"]
+      }
+    ],
+    "adversarialCases": [
+      {
+        "id": "absent-key",
+        "contractRef": "notifications.telegram.streaming.enabled",
+        "scenario": "Full Settings and raw lightweight daemon config omit the streaming key.",
+        "expectedBehavior": "Both snapshots and projected configs resolve streaming.enabled=true.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-default-consistency"]
+      },
+      {
+        "id": "malformed-value",
+        "contractRef": "notifications.telegram.streaming.enabled",
+        "scenario": "Raw lightweight config supplies a non-boolean streaming.enabled value.",
+        "expectedBehavior": "The value falls back to true instead of string-coercing to an opt-out.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-default-consistency"]
+      },
+      {
+        "id": "durable-false",
+        "contractRef": "notifications.telegram.streaming.enabled=false",
+        "scenario": "Stored streaming false with no GJC_NOTIFICATIONS_STREAM override.",
+        "expectedBehavior": "No live frame is emitted and finalized output has no messageRef.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-default-consistency"]
+      },
+      {
+        "id": "env-opt-out",
+        "contractRef": "GJC_NOTIFICATIONS_STREAM",
+        "scenario": "Process env is 0, off, false, or whitespace-padded OFF while durable streaming is enabled.",
+        "expectedBehavior": "Live streaming is disabled and finalized output remains keyless.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-default-consistency"]
+      },
+      {
+        "id": "chat-adapter-live-filter",
+        "contractRef": "Discord/Slack live-frame boundary",
+        "scenario": "Shared SDK emits phase=live turn_stream frames while Discord/Slack runtimes are attached.",
+        "expectedBehavior": "Non-Telegram adapters ignore live partials while finalized behavior remains available.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-default-consistency"]
+      },
+      {
+        "id": "editor-loading",
+        "contractRef": "Notifications settings editor loading state",
+        "scenario": "User enters preferences before asynchronous loadState resolves.",
+        "expectedBehavior": "The editor renders Telegram message streaming as on.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-default-consistency"]
+      }
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "AI SLOP CLEANUP REPORT: PASS. Read-only sweep covered all 10 implementation/test/docs changed files; the evidence-only gate artifact adds no product logic. Fallback defaults are grounded compatibility behavior, no duplication/dead code/needless abstraction/boundary/UI findings were found, and missing-test findings were closed by durable-false and malformed-value regressions. Full verification reran cleanly after the cleanup and review loop.",
+    "fullRerun": true,
+    "rerunCommands": [
+      "bun test packages/coding-agent/test/notifications-config.test.ts packages/coding-agent/test/notifications-daemon-config-reachability.test.ts packages/coding-agent/test/modes/components/notifications-settings-editor.test.ts packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/sdk-chat-daemon-worker.test.ts packages/coding-agent/test/notification-settings-controller.test.ts packages/coding-agent/test/notifications-session-control.test.ts",
+      "bun --cwd=packages/coding-agent run check",
+      "bun run check:schemas"
+    ],
+    "blockers": []
+  }
+}

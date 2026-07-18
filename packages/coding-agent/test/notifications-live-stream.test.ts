@@ -199,6 +199,22 @@ test("GJC_NOTIFICATIONS_STREAM=0 disables live frames, and finalized carries no 
 	const final = frames.find(f => f.type === "turn_stream" && f.phase === "finalized")!;
 	expect(final.messageRef).toBeUndefined();
 });
+test("stored Telegram streaming false disables live frames without an env override", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	const { handlers, ctx, frames } = await bootSession({ "notifications.telegram.streaming.enabled": false });
+
+	await handlers.get("message_update")!(assistant("stored setting disables stream"), ctx);
+	await sleep(200);
+	expect(frames.filter(f => f.type === "turn_stream" && f.phase === "live").length).toBe(0);
+
+	await handlers.get("turn_end")!(
+		{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "stored setting final" } },
+		ctx,
+	);
+	await waitFor(() => frames.some(f => f.type === "turn_stream" && f.phase === "finalized"), 3000, "finalized");
+	const final = frames.find(f => f.type === "turn_stream" && f.phase === "finalized")!;
+	expect(final.messageRef).toBeUndefined();
+});
 
 test("default Telegram streaming setting enables live frames without the env opt-in", async () => {
 	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
