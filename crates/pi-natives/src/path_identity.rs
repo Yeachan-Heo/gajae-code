@@ -382,7 +382,6 @@ mod platform {
 		ffi::CString,
 		fmt::Write as _,
 		fs::{self, File},
-		io::Read,
 		os::{
 			fd::{AsRawFd, FromRawFd},
 			unix::{
@@ -396,7 +395,7 @@ mod platform {
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, io_code, security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, digest_reader, io_code, security_io_code, sha256,
 	};
 
 	pub(super) fn canonical_existing_directory_identity(
