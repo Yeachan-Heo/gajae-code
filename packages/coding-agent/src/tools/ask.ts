@@ -747,6 +747,14 @@ async function askSingleQuestion(
 				selectedOptions = [];
 			}
 		}
+		if (timedOut && !autoSelectOnTimeout) {
+			return {
+				selectedOptions: [],
+				customInput: undefined,
+				timedOut,
+				...(navigation?.allowForward ? { navigation: "forward" as const } : {}),
+			};
+		}
 		if (navigation?.allowForward) {
 			return { selectedOptions, customInput, timedOut, navigation: "forward" };
 		}
