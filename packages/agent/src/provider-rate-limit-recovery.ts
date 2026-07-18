@@ -53,8 +53,9 @@ function keyFor(model: ProviderRateLimitModel): string {
 	return JSON.stringify([model.provider, model.id]);
 }
 
-function delayOrZero(delayMs: number): number {
-	return Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : 0;
+function normalizedDelay(delayMs: number): number {
+	if (delayMs === Number.POSITIVE_INFINITY) return Number.MAX_SAFE_INTEGER;
+	return Number.isFinite(delayMs) && delayMs >= 0 ? Math.min(delayMs, Number.MAX_SAFE_INTEGER) : 0;
 }
 const MAX_TIMEOUT_DELAY_MS = 2_147_483_647;
 
@@ -140,7 +141,7 @@ export class ProviderRateLimitRecoveryGate {
 			byModel.set(key, live);
 		}
 		live.generation += 1;
-		live.deadline = Math.max(live.deadline, this.#clock.now() + delayOrZero(retryAfterMs));
+		live.deadline = Math.max(live.deadline, this.#clock.now() + normalizedDelay(retryAfterMs));
 		if (live.timer !== undefined) this.#clock.clearTimeout(live.timer);
 		const generation = live.generation;
 		live.timer = this.#clock.setTimeout(

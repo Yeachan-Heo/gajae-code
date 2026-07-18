@@ -5,6 +5,7 @@
 ### Fixed
 
 - `transportFailureFacts` now reduces transport headers to a plain record containing only the retained retry signals (`retry-after`, `retry-after-ms`). Providers attach these facts to error `AssistantMessage`s, and the previous shape carried the live fetch/SDK `Headers` instance — which is not structured-cloneable (`structuredClone` throws `DataCloneError`, "The object can not be cloned." under Bun) and not JSON-serializable (persisted as `{}` in session files, silently dropping the retry hint). Under a managed model fallback chain, snapshotting such an error message replaced the real provider failure with the local clone error and exhausted the whole chain. Normalization is idempotent (re-running facts on facts is structurally stable; errors carrying only unretained headers with no status/code now yield no facts instead of an empty facts object), Retry-After classification (`classifyFallbackTrigger`) is unchanged, and arbitrary response headers no longer reach persisted facts.
+- Retry-After parsing now saturates huge finite second and millisecond values before conversion, preventing numeric overflow from turning an upstream cooldown into an immediate recovery retry.
 
 ## [0.11.0] - 2026-07-15
 ### Added

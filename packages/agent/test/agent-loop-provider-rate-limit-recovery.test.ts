@@ -27,14 +27,14 @@ function responseStream(message: AssistantMessage): AssistantMessageEventStream 
 	return stream;
 }
 
-function rateLimitMessage(model: Model): AssistantMessage {
+function rateLimitMessage(model: Model, headers?: Record<string, string>): AssistantMessage {
 	return {
 		...createAssistantMessage([], "error"),
 		provider: model.provider,
 		model: model.id,
 		errorMessage: "rate limited",
 		errorStatus: 429,
-		transportFailure: { kind: "transport", status: 429 },
+		transportFailure: { kind: "transport", status: 429, ...(headers ? { headers } : {}) },
 	};
 }
 
@@ -104,6 +104,32 @@ describe("agent loop provider rate-limit recovery integration", () => {
 		expect(dispatched).toBe(12);
 	});
 
+	it("keeps a huge finite Retry-After header from causing early cross-layer probe admission", async () => {
+		const model = createMockModel().model;
+		const scope = Object.freeze({});
+		await run(model, scope, () => responseStream(rateLimitMessage(model, { "retry-after": "1e308" })));
+
+		const controller = new AbortController();
+		let dispatched = 0;
+		const blocked = run(
+			model,
+			scope,
+			() => {
+				dispatched += 1;
+				return responseStream(createAssistantMessage([{ type: "text", text: "must stay blocked" }]));
+			},
+			[],
+			controller.signal,
+		);
+
+		await Bun.sleep(10);
+		expect(dispatched).toBe(0);
+		controller.abort();
+		const messages = await blocked;
+		const final = messages.at(-1);
+		expect(final?.role).toBe("assistant");
+		if (final?.role === "assistant") expect(final.stopReason).toBe("aborted");
+	});
 	it("does not dispatch a pre-aborted acquisition while a same-key probe is in flight", async () => {
 		const model = createMockModel().model;
 		const scope = Object.freeze({});

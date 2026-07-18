@@ -167,6 +167,26 @@ describe("ProviderRateLimitRecoveryGate", () => {
 		recovery.settle(second, { type: "error", status: 503 });
 		expect((await thirdPending).kind).toBe("probe");
 	});
+	it("saturates positive infinite delays instead of admitting an immediate probe", async () => {
+		const { clock, recovery, scope } = gate();
+		const initial = await recovery.acquire(scope, model);
+		recovery.settle(initial, rateLimit, Number.POSITIVE_INFINITY);
+		const controller = new AbortController();
+		const queued = recovery.acquire(scope, model, controller.signal);
+		let admitted = false;
+		queued.then(
+			() => (admitted = true),
+			() => {},
+		);
+
+		expect(clock.scheduledDelays[0]).toBe(2_147_483_647);
+		clock.advance(2_147_483_647);
+		await Promise.resolve();
+		expect(admitted).toBe(false);
+
+		controller.abort();
+		await expect(queued).rejects.toThrow();
+	});
 	it("rearms oversized retry deadlines in bounded timeout chunks", async () => {
 		const { clock, recovery, scope } = gate();
 		const maxTimeoutDelay = 2_147_483_647;

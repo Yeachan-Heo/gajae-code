@@ -196,19 +196,25 @@ function headersOf(headers: TransportHeaders | undefined): Headers | undefined {
 	if (headers instanceof Headers) return headers;
 	return headers ? new Headers(headers as Record<string, string>) : undefined;
 }
+const MAX_RETRY_AFTER_MS = Number.MAX_SAFE_INTEGER;
+
+function saturatedRetryDelay(value: number, multiplier = 1): number | undefined {
+	if (!Number.isFinite(value) || value < 0) return undefined;
+	if (value >= MAX_RETRY_AFTER_MS / multiplier) return MAX_RETRY_AFTER_MS;
+	return Math.round(value * multiplier);
+}
 
 function parseRetryAfterSeconds(value: string | null, now = Date.now()): number | undefined {
 	if (!value) return undefined;
-	const seconds = Number(value);
-	if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+	const seconds = saturatedRetryDelay(Number(value), 1000);
+	if (seconds !== undefined) return seconds;
 	const date = Date.parse(value);
 	return Number.isFinite(date) ? Math.max(0, date - now) : undefined;
 }
 
 function parseRetryAfterMilliseconds(value: string | null): number | undefined {
 	if (!value) return undefined;
-	const milliseconds = Number(value);
-	return Number.isFinite(milliseconds) && milliseconds >= 0 ? Math.round(milliseconds) : undefined;
+	return saturatedRetryDelay(Number(value));
 }
 
 function isContextOverflowCode(code: string | undefined): boolean {

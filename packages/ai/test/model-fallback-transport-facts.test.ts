@@ -78,6 +78,24 @@ describe("fallback transport facts", () => {
 		expect(classifyFallbackTrigger({ kind: "transport", status: 503 })).toEqual({ class: "server" });
 	});
 
+	it("saturates finite Retry-After values whose millisecond conversion exceeds the safe range", () => {
+		const expected = { class: "rate_limit", retryAfterMs: Number.MAX_SAFE_INTEGER } as const;
+		expect(
+			classifyFallbackTrigger({
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after": "1e308" },
+			}),
+		).toEqual(expected);
+		expect(
+			classifyFallbackTrigger({
+				kind: "transport",
+				status: 429,
+				headers: { "retry-after-ms": "1e308" },
+			}),
+		).toEqual(expected);
+	});
+
 	it("normalizes provider transport metadata without parsing error text", () => {
 		const quotaError = Object.assign(new Error("provider response"), {
 			status: 429,
