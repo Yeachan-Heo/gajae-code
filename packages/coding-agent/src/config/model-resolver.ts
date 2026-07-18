@@ -7,7 +7,7 @@ import { type Api, DEFAULT_MODEL_PER_PROVIDER, type KnownProvider, type Model, m
 
 import { logger } from "@gajae-code/utils";
 import chalk from "chalk";
-import { parseThinkingLevel, resolveThinkingLevelForModel } from "../thinking";
+import { parseThinkingLevel, resolveThinkingLevelForModel, splitSelectorThinkingSuffix } from "../thinking";
 import { isAuthenticatedOrKeyless } from "./model-auth";
 import { compareEquivalentModelVariants } from "./model-equivalence";
 import { MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-registry";
@@ -37,27 +37,8 @@ export interface ScopedModel extends ScopedModelSelection {
 	explicitThinkingLevel: boolean;
 }
 
-/**
- * Parse a model string in "provider/modelId" format.
- * Returns undefined if the format is invalid.
- */
-export interface SelectorThinkingSuffix {
-	selector: string;
-	thinkingLevel?: ThinkingLevel;
-	invalidSuffix?: string;
-}
-
-/** Split the final selector suffix once, preserving colons in model IDs. */
-export function splitSelectorThinkingSuffix(selector: string): SelectorThinkingSuffix {
-	const colonIndex = selector.lastIndexOf(":");
-	if (colonIndex === -1) return { selector };
-
-	const suffix = selector.slice(colonIndex + 1);
-	const thinkingLevel = parseThinkingLevel(suffix);
-	return thinkingLevel
-		? { selector: selector.slice(0, colonIndex), thinkingLevel }
-		: { selector: selector.slice(0, colonIndex), invalidSuffix: suffix };
-}
+export type { SelectorThinkingSuffix } from "../thinking";
+export { splitSelectorThinkingSuffix } from "../thinking";
 
 /**
  * Parse a model string in "provider/modelId" format.

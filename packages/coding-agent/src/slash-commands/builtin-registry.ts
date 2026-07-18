@@ -18,6 +18,7 @@ import {
 	formatModelSelectorValue,
 	parseModelPattern,
 	parseModelString,
+	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { resolveMemoryBackend } from "../memory-backend";
@@ -253,12 +254,9 @@ function parseModelCommandArgs(args: string): ParsedModelCommandArgs {
 
 function splitExplicitThinkingSelector(selector: string): { baseSelector: string; thinkingLevel?: ThinkingLevel } {
 	const trimmed = selector.trim();
-	const colonIndex = trimmed.lastIndexOf(":");
-	if (colonIndex === -1) {
-		return { baseSelector: trimmed };
-	}
-	const thinkingLevel = parseThinkingLevel(trimmed.slice(colonIndex + 1));
-	return thinkingLevel ? { baseSelector: trimmed.slice(0, colonIndex), thinkingLevel } : { baseSelector: trimmed };
+	const { selector: baseSelector, thinkingLevel } = splitSelectorThinkingSuffix(trimmed);
+	// Preserve the whole selector when the trailing suffix is not a valid thinking level.
+	return thinkingLevel ? { baseSelector, thinkingLevel } : { baseSelector: trimmed };
 }
 
 interface ModelCommandSelection {
