@@ -46,16 +46,23 @@ import {
 	isGjcTeamTaskCompletionVerified,
 	readGjcTeamTasksFromDir as readTasks,
 	taskMetadataFromInput,
-	writeGjcTeamTaskToDir as writeTask,
+	withGjcTeamMutationFence,
+	withGjcTeamTaskMutation,
 } from "./team-store";
+
 import {
+	GJC_TEAM_CONTINUATION_PROMPT,
 	type GjcTeamWorkerOrchestrationRuntime,
 	type GjcTeamWorkerRuntime,
+	gjcContinuationReservationDigest,
+	isValidGjcContinuationOutcome,
+	isValidGjcContinuationReservation,
+	readGjcShutdownAuthority,
 	readWorkerLifecycleById as readLifecycleById,
 	readGjcShutdownAck as readShutdownAck,
 	readGjcWorkerHeartbeat as readWorkerHeartbeat,
 	readGjcWorkerStatus as readWorkerStatus,
-	reconcileGjcTeamStaleClaims as reconcileStaleClaimsWorkers,
+	reconcileGjcTeamStaleClaimsUnlocked,
 	shutdownGjcTeamWorkers,
 	updateGjcWorkerHeartbeat as updateWorkerHeartbeat,
 	updateGjcWorkerStatus as updateWorkerStatus,
@@ -523,9 +530,28 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"write-task-approval",
 ] as const;
 
-function now(): string {
-	return new Date().toISOString();
+function currentTimeMs(): number {
+	return gjcTeamRuntimeTestSeams?.nowMs?.() ?? Date.now();
 }
+
+function now(): string {
+	return new Date(currentTimeMs()).toISOString();
+}
+
+export interface GjcTeamRuntimeTestSeams {
+	nowMs?: () => number;
+	continuationTmuxDispatch?: (command: string, args: readonly string[]) => { exitCode?: number };
+
+	continuationBeforeDispatch?: () => Promise<void>;
+}
+
+let gjcTeamRuntimeTestSeams: GjcTeamRuntimeTestSeams | undefined;
+
+/** @internal Test-only seam; production code leaves the real clock and tmux dispatch intact. */
+export function __setGjcTeamRuntimeTestSeamsForTests(seams: GjcTeamRuntimeTestSeams | undefined): void {
+	gjcTeamRuntimeTestSeams = seams;
+}
+
 function isEnoent(error: unknown): error is FsError {
 	return typeof error === "object" && error !== null && "code" in error && (error as FsError).code === "ENOENT";
 }
@@ -681,6 +707,15 @@ async function readJsonFile<T>(filePath: string): Promise<T | null> {
 		throw error;
 	}
 }
+
+async function readContinuationJson<T>(filePath: string): Promise<T | null> {
+	try {
+		return await readJsonFile<T>(filePath);
+	} catch {
+		return null;
+	}
+}
+
 function isPositivePid(value: unknown): value is number {
 	return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
@@ -815,6 +850,18 @@ export async function listTeamWorkerGcRecords(teamRoot: string, probe: GcPidProb
 /** @internal */
 export async function pruneTeamWorkerGcRecord(record: GcRecord, probe: GcPidProbe): Promise<boolean> {
 	if (!record.path || !record.id.includes("/")) return false;
+	const teamDirPath = path.dirname(path.dirname(record.path));
+	return withGjcTeamTaskMutation(taskStore(teamDirPath), capability =>
+		pruneTeamWorkerGcRecordUnlocked(record, probe, capability),
+	);
+}
+
+async function pruneTeamWorkerGcRecordUnlocked(
+	record: GcRecord,
+	probe: GcPidProbe,
+	capability: import("./team-store").GjcTeamTaskMutationCapability,
+): Promise<boolean> {
+	if (!record.path || !record.id.includes("/")) return false;
 	const [teamName, workerId] = record.id.split("/", 2);
 	if (!teamName || !workerId) return false;
 	const teamDirPath = path.dirname(path.dirname(record.path));
@@ -839,7 +886,7 @@ export async function pruneTeamWorkerGcRecord(record: GcRecord, probe: GcPidProb
 	for (const task of await readTasks(teamDirPath)) {
 		if (task.claim?.owner !== workerId && task.assignee !== workerId) continue;
 		if (task.status === "completed" || task.status === "failed") continue;
-		await writeTask(teamDirPath, {
+		await capability.writeRecovered({
 			...task,
 			status: "pending",
 			assignee: undefined,
@@ -1073,8 +1120,13 @@ async function readConfigForWorkerIntegration(dir: string): Promise<GjcTeamConfi
 	return config;
 }
 async function readPhase(dir: string): Promise<GjcTeamPhase> {
-	const phase = await readJsonFile<{ current_phase?: GjcTeamPhase }>(path.join(dir, "phase.json"));
-	return phase?.current_phase ?? "running";
+	try {
+		const phase = await readJsonFile<{ current_phase?: GjcTeamPhase }>(path.join(dir, "phase.json"));
+		return phase?.current_phase ?? "running";
+	} catch (error) {
+		if (error instanceof SyntaxError) return "running";
+		throw error;
+	}
 }
 async function writePhase(dir: string, phase: GjcTeamPhase): Promise<void> {
 	await writeJsonFile(path.join(dir, "phase.json"), {
@@ -1106,6 +1158,7 @@ const workerRuntime: GjcTeamWorkerRuntime = {
 	writeJson: writeJsonFile,
 	appendEvent,
 	now,
+	nowMs: currentTimeMs,
 	stableHash,
 };
 
@@ -1120,7 +1173,7 @@ const writeWorkerLifecycleForConfig = (
 const workerOrchestrationRuntime: GjcTeamWorkerOrchestrationRuntime = {
 	...workerRuntime,
 	readTasks,
-	writeTask,
+	withTaskMutation: (dir, fn) => withGjcTeamTaskMutation(taskStore(dir), fn),
 	appendTelemetry,
 	paneBelongsToTeamTarget,
 	parseDurationEnv,
@@ -1197,8 +1250,10 @@ export async function recoverGjcTeamStaleClaims(
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamLivenessRecoveryResult> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	return reconcileStaleClaimsWorkers(workerOrchestrationRuntime, teamName, dir, config, env);
+	return withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		const config = await readConfig(dir);
+		return reconcileGjcTeamStaleClaimsUnlocked(workerOrchestrationRuntime, teamName, dir, config, env, capability);
+	});
 }
 const GJC_TEAM_INTEGRATION_ATTENTION_STATUSES = new Set<GjcTeamIntegrationStatus>([
 	"integration_failed",
@@ -2540,6 +2595,9 @@ async function integrateGjcWorkerCommits(
 	return integrationByWorker;
 }
 
+const writeInitialGjcTeamTask = (dir: string, task: GjcTeamTask) =>
+	withGjcTeamTaskMutation(taskStore(dir), capability => capability.writeRecovered(task));
+
 export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTeamSnapshot> {
 	return startGjcTeamLaunch(
 		{
@@ -2564,7 +2622,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 			writeJson: writeJsonFile,
 			now,
 			writePhase,
-			writeTask,
+			writeTask: writeInitialGjcTeamTask,
 			appendEvent,
 			appendTelemetry,
 			startTmuxSession,
@@ -2780,6 +2838,418 @@ export async function buildTeamHudSummary(
 	});
 }
 
+const GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS_ENV = "GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS";
+const GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS = 5_000;
+
+async function validateGjcContinuationEligibility(
+	dir: string,
+	config: GjcTeamConfig,
+	worker: GjcTeamWorker,
+	task: GjcTeamTask,
+	heartbeatAt: string,
+	staleMs: number,
+	env: NodeJS.ProcessEnv,
+	reservedHoldUntil?: string,
+): Promise<string | null> {
+	const phase = await readContinuationJson<Record<string, unknown>>(path.join(dir, "phase.json"));
+	if (
+		phase?.current_phase !== "running" ||
+		typeof phase.updated_at !== "string" ||
+		!Number.isFinite(Date.parse(phase.updated_at))
+	)
+		return "invalid_or_absent_running_phase";
+	if (
+		!worker.pane_id ||
+		!/^%\d+$/.test(worker.pane_id) ||
+		worker.pane_id === config.leader.pane_id ||
+		!paneBelongsToTeamTarget(config, worker.pane_id)
+	)
+		return "invalid_pane_authority";
+	const shutdownAuthority = await readGjcShutdownAuthority(
+		workerRuntime,
+		path.join(workerDir(dir, worker.id), "shutdown-request.json"),
+	);
+	if (shutdownAuthority.state === "valid_present") return "shutdown_requested";
+	if (shutdownAuthority.state === "invalid_or_unreadable") return "invalid_shutdown_authority";
+	const heartbeat = await readWorkerHeartbeat(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
+	if (!heartbeat || heartbeat.last_turn_at !== heartbeatAt || currentTimeMs() - Date.parse(heartbeatAt) < staleMs)
+		return "heartbeat_changed";
+	const lifecycle = (await readLifecycleById(workerRuntime, dir, config))[worker.id];
+	const status = await readWorkerStatus(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
+	if (
+		(lifecycle?.lifecycle_state !== "ready" && lifecycle?.lifecycle_state !== "working") ||
+		!["idle", "working", "blocked", "done"].includes(status.state) ||
+		typeof status.updated_at !== "string" ||
+		!Number.isFinite(Date.parse(status.updated_at))
+	)
+		return "invalid_worker_lifecycle_or_status";
+	const current = (await readTasks(dir)).find(candidate => candidate.id === task.id);
+	const storedClaim = await readContinuationJson<GjcTeamTaskClaim>(path.join(dir, "claims", `${task.id}.json`));
+	if (
+		current?.status !== "in_progress" ||
+		current.version !== task.version ||
+		current.assignee !== worker.id ||
+		current.owner !== worker.id ||
+		current.claim?.owner !== task.claim?.owner ||
+		current.claim?.token !== task.claim?.token ||
+		current.claim?.leased_until !== task.claim?.leased_until ||
+		storedClaim?.owner !== task.claim?.owner ||
+		storedClaim?.token !== task.claim?.token ||
+		storedClaim?.leased_until !== task.claim?.leased_until
+	)
+		return "claim_changed";
+	const leaseUntil = Date.parse(task.claim?.leased_until ?? "");
+	const holdUntil = reservedHoldUntil === undefined ? undefined : Date.parse(reservedHoldUntil);
+	if (!Number.isFinite(leaseUntil) || leaseUntil <= currentTimeMs()) return "invalid_or_expired_lease";
+	if (holdUntil !== undefined && (!Number.isFinite(holdUntil) || leaseUntil < holdUntil))
+		return "lease_does_not_cover_hold";
+	if (reservedHoldUntil !== undefined && shouldDispatchWorkerWithSendKeys(config.tmux_command))
+		return "unsupported_send_keys_transport";
+	return null;
+}
+function normalizeGjcContinuationDispatchError(value: unknown, fallback: string, maxLength: number): string {
+	try {
+		const normalized = String(value ?? "")
+			.replace(/(token|secret|password|authorization)\s*[:=]\s*\S+/gi, "$1=[redacted]")
+			.trim()
+			.slice(0, maxLength);
+		return normalized || fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+function readGjcContinuationDispatchErrorField(error: unknown, field: "name" | "code" | "message"): unknown {
+	try {
+		return typeof error === "object" && error !== null ? (error as Record<string, unknown>)[field] : undefined;
+	} catch {
+		return undefined;
+	}
+}
+async function continueStalledGjcTeamWorkers(
+	dir: string,
+	config: GjcTeamConfig,
+	env: NodeJS.ProcessEnv,
+): Promise<void> {
+	if (env[GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS_ENV] !== "1" || config.dry_run) return;
+	const phase = await readContinuationJson<unknown>(path.join(dir, "phase.json"));
+
+	if (
+		typeof phase !== "object" ||
+		phase === null ||
+		Array.isArray(phase) ||
+		(phase as Record<string, unknown>).current_phase !== "running" ||
+		typeof (phase as Record<string, unknown>).updated_at !== "string" ||
+		!Number.isFinite(Date.parse(String((phase as Record<string, unknown>).updated_at)))
+	) {
+		await appendEvent(dir, {
+			type: "continuation_skipped",
+			message: "Continuation requires a valid running team phase record",
+			data: { reason: "invalid_or_absent_running_phase" },
+		});
+		return;
+	}
+	const staleMs = parseDurationEnv(env, "GJC_TEAM_HEARTBEAT_STALE_MS", 120_000);
+	if (staleMs <= 0) return;
+	const tasks = await readTasks(dir);
+	for (const worker of config.workers) {
+		const heartbeat = await readWorkerHeartbeat(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
+		const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? "");
+		if (!heartbeat || !Number.isFinite(heartbeatAt) || currentTimeMs() - heartbeatAt < staleMs) continue;
+		if (!worker.pane_id || !/^%\d+$/.test(worker.pane_id) || worker.pane_id === config.leader.pane_id) continue;
+		if (!paneBelongsToTeamTarget(config, worker.pane_id)) continue;
+		const shutdownAuthority = await readGjcShutdownAuthority(
+			workerRuntime,
+			path.join(workerDir(dir, worker.id), "shutdown-request.json"),
+		);
+		if (shutdownAuthority.state !== "proven_absent") {
+			await appendEvent(dir, {
+				type: "continuation_skipped",
+				worker: worker.id,
+				message: "Continuation requires a readable absent shutdown authority record",
+				data: {
+					reason:
+						shutdownAuthority.state === "valid_present" ? "shutdown_requested" : "invalid_shutdown_authority",
+				},
+			});
+			continue;
+		}
+
+		const lifecycle = (await readLifecycleById(workerRuntime, dir, config))[worker.id];
+		const status = await readWorkerStatus(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
+		if (
+			(lifecycle?.lifecycle_state !== "ready" && lifecycle?.lifecycle_state !== "working") ||
+			!["idle", "working", "blocked", "done"].includes(status.state) ||
+			typeof status.updated_at !== "string" ||
+			!Number.isFinite(Date.parse(status.updated_at))
+		) {
+			await appendEvent(dir, {
+				type: "continuation_skipped",
+				worker: worker.id,
+				message: "Continuation requires valid worker lifecycle and status records",
+				data: { reason: "invalid_worker_lifecycle_or_status" },
+			});
+			continue;
+		}
+
+		const claimedTasks = tasks.filter(
+			candidate =>
+				candidate.status === "in_progress" &&
+				candidate.claim?.owner === worker.id &&
+				candidate.assignee === worker.id &&
+				candidate.owner === worker.id,
+		);
+		const claimRecords = await Promise.all(
+			(await fs.readdir(path.join(dir, "claims"), { withFileTypes: true }))
+				.filter(entry => entry.isFile() && entry.name.endsWith(".json"))
+				.map(entry => readContinuationJson<GjcTeamTaskClaim>(path.join(dir, "claims", entry.name))),
+		);
+		const workerClaims = claimRecords.filter((claim): claim is GjcTeamTaskClaim => claim?.owner === worker.id);
+		if (claimedTasks.length !== 1 || workerClaims.length !== 1) {
+			await appendEvent(dir, {
+				type: "continuation_skipped",
+				worker: worker.id,
+				message: "Continuation requires exactly one canonical current in-progress claim",
+				data: { reason: "invalid_claim_count", task_count: claimedTasks.length, claim_count: workerClaims.length },
+			});
+			continue;
+		}
+		const task = claimedTasks[0];
+		if (!task?.claim) continue;
+		const storedClaim = workerClaims[0];
+		if (
+			storedClaim.token !== task.claim.token ||
+			storedClaim.leased_until !== task.claim.leased_until ||
+			storedClaim.owner !== task.claim.owner
+		)
+			continue;
+		const eligibilityReason = await validateGjcContinuationEligibility(
+			dir,
+			config,
+			worker,
+			task,
+			heartbeat.last_turn_at,
+			staleMs,
+			env,
+		);
+		if (eligibilityReason) {
+			await appendEvent(dir, {
+				type: "continuation_skipped",
+				worker: worker.id,
+				message: "Continuation eligibility changed or contains an invalid mutable record",
+				data: { reason: eligibilityReason },
+			});
+			continue;
+		}
+
+		const incident = stableHash(
+			[
+				config.team_name,
+				worker.id,
+				task.id,
+				task.claim.owner,
+				task.claim.token,
+				task.version,
+				heartbeat.last_turn_at,
+				worker.pane_id,
+				config.tmux_target,
+			].join(":"),
+		);
+		const journalDir = path.join(workerDir(dir, worker.id), "continuations", incident);
+		const firstReservationPath = path.join(journalDir, "attempt-01.reservation.json");
+		const firstOutcomePath = path.join(journalDir, "attempt-01.outcome.json");
+		const firstReservation = await readContinuationJson<Record<string, unknown>>(firstReservationPath);
+
+		const firstOutcome = await readContinuationJson<Record<string, unknown>>(firstOutcomePath);
+
+		let attempt = 1;
+		if (firstReservation) {
+			if (
+				!isValidGjcContinuationReservation(
+					firstReservation,
+					incident,
+					1,
+					config,
+					worker.id,
+					task,
+					task.claim,
+					heartbeat.last_turn_at,
+					worker.pane_id,
+				)
+			)
+				continue;
+			if (
+				!isValidGjcContinuationOutcome(firstOutcome, firstReservation, incident, 1) ||
+				firstOutcome.result !== "sent"
+			)
+				continue;
+			const firstHold = Date.parse(String(firstOutcome.hold_until));
+			const leaseUntil = Date.parse(task.claim.leased_until);
+			if (
+				!Number.isFinite(firstHold) ||
+				!Number.isFinite(leaseUntil) ||
+				leaseUntil < firstHold ||
+				currentTimeMs() < firstHold
+			)
+				continue;
+			if (await readContinuationJson(path.join(journalDir, "attempt-02.reservation.json"))) continue;
+
+			attempt = 2;
+		}
+		const holdMs = attempt === 1 ? 30_000 : 120_000;
+		const reservedAtMs = currentTimeMs();
+		const reservedAt = new Date(reservedAtMs).toISOString();
+		const holdUntil = new Date(reservedAtMs + holdMs).toISOString();
+		const leaseUntil = Date.parse(task.claim.leased_until);
+		if (!Number.isFinite(leaseUntil) || leaseUntil < Date.parse(holdUntil)) continue;
+		const reservation = {
+			schema_version: 1,
+			incident_hash: incident,
+			team_name: config.team_name,
+			worker: worker.id,
+			task_id: task.id,
+			owner: task.claim.owner,
+			claim_token: task.claim.token,
+			task_version: task.version,
+			leased_until: task.claim.leased_until,
+			heartbeat_at: heartbeat.last_turn_at,
+			pane_id: worker.pane_id,
+			tmux_target: config.tmux_target,
+			attempt,
+			reserved_at: reservedAt,
+			hold_until: holdUntil,
+			prompt_version: 1,
+			prompt_sha256: createHash("sha256").update(GJC_TEAM_CONTINUATION_PROMPT).digest("hex"),
+			dispatch_protocol: "tmux_command_sequence_v1",
+		};
+		const reservationPath = path.join(journalDir, `attempt-0${attempt}.reservation.json`);
+		try {
+			await createJsonNoClobber(
+				reservationPath,
+				reservation,
+				stateWriterOptions(reservationPath, "state", "continuation-reservation"),
+			);
+		} catch (error) {
+			if (error instanceof AlreadyExistsError) continue;
+			throw error;
+		}
+		let result: "sent" | "unknown" = "unknown";
+		let outcomeReason = "tmux_missing_exit_code";
+		let tmuxExitCode: number | undefined;
+		let tmuxError: { name: string; code?: string; message: string } | undefined;
+		let dispatchedAt: string | undefined;
+		let dispatchHoldUntil: string | undefined;
+		if (gjcTeamRuntimeTestSeams?.continuationBeforeDispatch)
+			await gjcTeamRuntimeTestSeams.continuationBeforeDispatch();
+		const revalidationReason = await validateGjcContinuationEligibility(
+			dir,
+			config,
+			worker,
+			task,
+			heartbeat.last_turn_at,
+			staleMs,
+			env,
+			new Date(currentTimeMs() + GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS + holdMs).toISOString(),
+		);
+		if (revalidationReason) {
+			const skippedPath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);
+			await createJsonNoClobber(
+				skippedPath,
+				{
+					schema_version: 1,
+					incident_hash: incident,
+					attempt,
+					reservation_sha256: gjcContinuationReservationDigest(reservation),
+					recorded_at: now(),
+					result: "skipped",
+					reason: revalidationReason,
+				},
+				stateWriterOptions(skippedPath, "state", "continuation-outcome"),
+			);
+			return;
+		}
+		try {
+			const args = Object.freeze([
+				"send-keys",
+				"-l",
+				"-t",
+				worker.pane_id,
+				GJC_TEAM_CONTINUATION_PROMPT,
+				";",
+				"send-keys",
+				"-t",
+				worker.pane_id,
+				"Enter",
+			]);
+			const dispatch = gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
+				? gjcTeamRuntimeTestSeams.continuationTmuxDispatch(config.tmux_command, args)
+				: Bun.spawnSync([config.tmux_command, ...args], {
+						stdout: "ignore",
+						stderr: "ignore",
+						timeout: GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS,
+					});
+			const dispatchAtMs = currentTimeMs();
+			tmuxExitCode = dispatch.exitCode;
+			if (dispatch.exitCode === 0) {
+				result = "sent";
+				outcomeReason = "tmux_sent";
+				dispatchedAt = new Date(dispatchAtMs).toISOString();
+				dispatchHoldUntil = new Date(dispatchAtMs + holdMs).toISOString();
+			} else if (typeof dispatch.exitCode === "number") {
+				outcomeReason = "tmux_nonzero_exit";
+			}
+		} catch (error) {
+			outcomeReason = "tmux_dispatch_threw";
+			const name = normalizeGjcContinuationDispatchError(
+				readGjcContinuationDispatchErrorField(error, "name"),
+				"Error",
+				120,
+			);
+			const code = normalizeGjcContinuationDispatchError(
+				readGjcContinuationDispatchErrorField(error, "code"),
+				"",
+				120,
+			);
+			tmuxError = {
+				name,
+				...(code ? { code } : {}),
+				message: normalizeGjcContinuationDispatchError(
+					readGjcContinuationDispatchErrorField(error, "message") ?? error,
+					"tmux_dispatch_error",
+					400,
+				),
+			};
+		}
+		const outcomePath = path.join(journalDir, `attempt-0${attempt}.outcome.json`);
+		try {
+			await createJsonNoClobber(
+				outcomePath,
+				{
+					schema_version: 1,
+					incident_hash: incident,
+					attempt,
+					reservation_sha256: gjcContinuationReservationDigest(reservation),
+					recorded_at: now(),
+					result,
+					reason: outcomeReason,
+					...(tmuxExitCode === undefined ? {} : { tmux_exit_code: tmuxExitCode }),
+					...(dispatchedAt === undefined || dispatchHoldUntil === undefined
+						? {}
+						: { dispatched_at: dispatchedAt, hold_until: dispatchHoldUntil }),
+					...(tmuxError ? { tmux_error: tmuxError } : {}),
+				},
+				stateWriterOptions(outcomePath, "state", "continuation-outcome"),
+			);
+		} catch (error) {
+			if (!(error instanceof AlreadyExistsError)) throw error;
+			const existing = await readContinuationJson<Record<string, unknown>>(outcomePath);
+			if (!isValidGjcContinuationOutcome(existing, reservation, incident, attempt))
+				throw new Error(`invalid_continuation_outcome:${incident}:${attempt}`);
+		}
+		return;
+	}
+}
+
 export async function monitorGjcTeam(
 	teamName: string,
 	cwd = process.cwd(),
@@ -2788,7 +3258,11 @@ export async function monitorGjcTeam(
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
 	const previous = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
-	await reconcileStaleClaimsWorkers(workerOrchestrationRuntime, teamName, dir, config, env);
+	await withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		const config = await readConfig(dir);
+		await continueStalledGjcTeamWorkers(dir, config, env);
+		await reconcileGjcTeamStaleClaimsUnlocked(workerOrchestrationRuntime, teamName, dir, config, env, capability);
+	});
 	const integrationByWorker = await integrateGjcWorkerCommits(config, dir, previous, cwd, env);
 	await writeJsonFile(monitorSnapshotPath(dir), {
 		integration_by_worker: integrationByWorker,
@@ -2821,13 +3295,16 @@ function parsePaneAttemptResult(value: string): GjcTeamPaneAttemptResult {
 	if (value === "sent" || value === "queued" || value === "deferred" || value === "failed") return value;
 	throw new Error(`invalid_pane_attempt_result:${value}`);
 }
-const writeGjcWorkerStartupAck = (
+async function writeGjcWorkerStartupAck(
 	teamName: string,
 	worker: string,
 	cwd: string,
 	env: NodeJS.ProcessEnv,
 	input: Record<string, unknown>,
-): Promise<Record<string, unknown>> => writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, input);
+): Promise<Record<string, unknown>> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	return withGjcTeamMutationFence(dir, () => writeWorkerStartupAck(workerRuntime, teamName, worker, cwd, env, input));
+}
 function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: number): number {
 	const raw = env[name]?.trim();
 	if (!raw) return fallbackMs;
@@ -2937,7 +3414,8 @@ export async function shutdownGjcTeam(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamSnapshot> {
-	return shutdownGjcTeamWorkers(workerOrchestrationRuntime, teamName, cwd, env);
+	const dir = await findTeamDir(teamName, cwd, env);
+	return withGjcTeamMutationFence(dir, () => shutdownGjcTeamWorkers(workerOrchestrationRuntime, teamName, cwd, env));
 }
 
 function taskStore(dir: string): GjcTeamTaskStore {
@@ -2970,12 +3448,14 @@ export async function createGjcTeamTask(
 	taskOptions: GjcTeamTaskMetadataInput = {},
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	if (taskOptions.owner) assertKnownWorker(config, taskOptions.owner);
-	const task = await taskStore(dir).create(subject, description, taskOptions);
-	config.updated_at = now();
-	await writeJsonFile(path.join(dir, "config.json"), config);
-	return task;
+	return withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		const config = await readConfig(dir);
+		if (taskOptions.owner) assertKnownWorker(config, taskOptions.owner);
+		const task = await capability.create(subject, description, taskOptions);
+		config.updated_at = now();
+		await writeJsonFile(path.join(dir, "config.json"), config);
+		return task;
+	});
 }
 export async function updateGjcTeamTask(
 	teamName: string,
@@ -2989,7 +3469,8 @@ export async function updateGjcTeamTask(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask> {
-	return taskStore(await findTeamDir(teamName, cwd, env)).update(taskId, updates);
+	const dir = await findTeamDir(teamName, cwd, env);
+	return taskStore(dir).update(taskId, updates);
 }
 export async function claimGjcTeamTask(
 	teamName: string,
@@ -2999,16 +3480,28 @@ export async function claimGjcTeamTask(
 	taskId?: string,
 ): Promise<GjcTeamApiClaimResult> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	const config = await readConfig(dir);
-	const worker = findKnownWorker(config, workerId);
-	const recovered = await reconcileStaleClaimsWorkers(workerOrchestrationRuntime, teamName, dir, config, env);
-	const reasons = recovered.stale_workers[workerId];
-	if (reasons?.length)
-		return {
-			ok: false,
-			reason: `worker_not_live:${workerId}:${reasons.join(",")}`,
-		};
-	return taskStore(dir).claim(worker, taskId);
+	return withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		const config = await readConfig(dir);
+		const worker = findKnownWorker(config, workerId);
+		const recovered = await reconcileGjcTeamStaleClaimsUnlocked(
+			workerOrchestrationRuntime,
+			teamName,
+			dir,
+			config,
+			env,
+			capability,
+		);
+		const reasons = recovered.stale_workers[workerId];
+		if (reasons?.length) return { ok: false, reason: `worker_not_live:${workerId}:${reasons.join(",")}` };
+		const status = await readWorkerStatus(workerRuntime, teamName, workerId, cwd, env);
+		if (
+			!["idle", "working", "blocked", "done"].includes(status.state) ||
+			typeof status.updated_at !== "string" ||
+			!Number.isFinite(Date.parse(status.updated_at))
+		)
+			return { ok: false, reason: `worker_not_live:${workerId}:invalid_status` };
+		return capability.claim(worker, taskId);
+	});
 }
 export async function transitionGjcTeamTaskStatus(
 	teamName: string,
@@ -3021,8 +3514,10 @@ export async function transitionGjcTeamTaskStatus(
 	completionEvidenceInput?: unknown,
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	if (workerId) assertKnownWorker(await readConfig(dir), workerId);
-	return taskStore(dir).transition(taskId, status, claimToken, workerId, completionEvidenceInput);
+	return withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		if (workerId) assertKnownWorker(await readConfig(dir), workerId);
+		return capability.transition(taskId, status, claimToken, workerId, completionEvidenceInput);
+	});
 }
 export async function transitionGjcTeamTask(
 	teamName: string,
@@ -3052,7 +3547,8 @@ export async function releaseGjcTeamTaskClaim(
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask> {
-	return taskStore(await findTeamDir(teamName, cwd, env)).release(taskId, claimToken, workerId);
+	const dir = await findTeamDir(teamName, cwd, env);
+	return taskStore(dir).release(taskId, claimToken, workerId);
 }
 
 async function listNotificationRecords(dir: string): Promise<GjcTeamNotification[]> {
@@ -3270,7 +3766,7 @@ export const readGjcWorkerStatus = (
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<WorkerStatusFile> => readWorkerStatus(workerRuntime, teamName, worker, cwd, env);
-export const updateGjcWorkerStatus = (
+export async function updateGjcWorkerStatus(
 	teamName: string,
 	worker: string,
 	status: GjcWorkerStatusState,
@@ -3278,21 +3774,30 @@ export const updateGjcWorkerStatus = (
 	env: NodeJS.ProcessEnv = process.env,
 	currentTaskId?: string,
 	reason?: string,
-): Promise<WorkerStatusFile> =>
-	updateWorkerStatus(workerRuntime, teamName, worker, status, cwd, env, currentTaskId, reason);
+): Promise<WorkerStatusFile> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	return withGjcTeamMutationFence(dir, () =>
+		updateWorkerStatus(workerRuntime, teamName, worker, status, cwd, env, currentTaskId, reason),
+	);
+}
 export const readGjcWorkerHeartbeat = (
 	teamName: string,
 	worker: string,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<WorkerHeartbeatFile | null> => readWorkerHeartbeat(workerRuntime, teamName, worker, cwd, env);
-export const updateGjcWorkerHeartbeat = (
+export async function updateGjcWorkerHeartbeat(
 	teamName: string,
 	worker: string,
 	heartbeat: WorkerHeartbeatFile,
 	cwd = process.cwd(),
 	env: NodeJS.ProcessEnv = process.env,
-): Promise<WorkerHeartbeatFile> => updateWorkerHeartbeat(workerRuntime, teamName, worker, heartbeat, cwd, env);
+): Promise<WorkerHeartbeatFile> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	return withGjcTeamMutationFence(dir, () =>
+		updateWorkerHeartbeat(workerRuntime, teamName, worker, heartbeat, cwd, env),
+	);
+}
 export async function writeGjcWorkerInbox(
 	teamName: string,
 	worker: string,
@@ -3410,7 +3915,7 @@ export async function readGjcTaskApproval(
 		path.join(await findTeamDir(teamName, cwd, env), "approvals", `${taskId}.json`),
 	);
 }
-export const writeGjcShutdownRequest = (
+export async function writeGjcShutdownRequest(
 	teamName: string,
 	worker: string,
 	requestedBy: string,
@@ -3419,8 +3924,12 @@ export const writeGjcShutdownRequest = (
 	requestId = `shutdown-${stableHash([teamName, worker, now(), randomUUID()].join(":"))}`,
 	mode: GjcTeamShutdownMode = "graceful",
 	requestedAt = now(),
-): Promise<Record<string, unknown>> =>
-	writeShutdownRequest(workerRuntime, teamName, worker, requestedBy, cwd, env, requestId, mode, requestedAt);
+): Promise<Record<string, unknown>> {
+	const dir = await findTeamDir(teamName, cwd, env);
+	return withGjcTeamMutationFence(dir, () =>
+		writeShutdownRequest(workerRuntime, teamName, worker, requestedBy, cwd, env, requestId, mode, requestedAt),
+	);
+}
 export const readGjcShutdownAck = (
 	teamName: string,
 	worker: string,

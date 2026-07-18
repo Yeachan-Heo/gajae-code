@@ -1,10 +1,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getWorktreesDir } from "@gajae-code/utils/dirs";
 import { sessionReportsDir, teamStateRoot } from "../../src/gjc-runtime/session-layout";
 import {
+	__setGjcTeamRuntimeTestSeamsForTests,
 	buildWorkerCommand,
 	claimGjcTeamTask,
 	classifyGjcTeamCheckpointFiles,
@@ -15,8 +17,11 @@ import {
 	monitorGjcTeam,
 	monitorGjcTeamSnapshot,
 	parseTeamLaunchArgs,
+	pruneTeamWorkerGcRecord,
 	readGjcTeamSnapshot,
 	readGjcTeamTask,
+	recoverGjcTeamStaleClaims,
+	releaseGjcTeamTaskClaim,
 	requestGjcWorkerIntegrationAttempt,
 	resolveGjcTeamWorkerCli,
 	resolveGjcTeamWorkerCliPlan,
@@ -28,6 +33,12 @@ import {
 	transitionGjcTeamTask,
 	translateGjcWorkerLaunchArgsForCli,
 } from "../../src/gjc-runtime/team-runtime";
+import {
+	type GjcTeamTaskMutationCapability,
+	GjcTeamTaskStore,
+	withGjcTeamTaskMutation,
+} from "../../src/gjc-runtime/team-store";
+import { gjcContinuationReservationDigest, isValidGjcContinuationOutcome } from "../../src/gjc-runtime/team-workers";
 
 const TEST_SESSION_ID = "test-session";
 let cleanupRoot: string | undefined;
@@ -227,6 +238,7 @@ function artifactCompletionEvidence(summary = "Completed by artifact review") {
 }
 
 afterEach(async () => {
+	__setGjcTeamRuntimeTestSeamsForTests(undefined);
 	if (cleanupRoot) {
 		for (const session of [
 			"gjc-worktree-team",
@@ -3224,5 +3236,913 @@ describe("resolveGjcWorkerCommand invocation authority", () => {
 
 		expect(command).toBe("'C:\\Program Files\\GJC\\gjc.exe'");
 		expect(command).not.toMatch(/B:\/~BUN|B:\\~BUN|\/\$bunfs|\\\$bunfs/i);
+	});
+});
+
+describe("stalled worker continuation protocol", () => {
+	async function prepareContinuation(teamName: string) {
+		cleanupRoot = await createGitRepo();
+		let nowMs = Date.now();
+		const dispatches: Array<{ command: string; args: string[] }> = [];
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: () => nowMs,
+			continuationTmuxDispatch: (command, args) => {
+				dispatches.push({ command, args: [...args] });
+				return { exitCode: 0 };
+			},
+		});
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
+		const env = {
+			GJC_SESSION_ID: TEST_SESSION_ID,
+			PATH: process.env.PATH ?? "",
+			GJC_TEAM_WORKER_COMMAND: "true",
+			GJC_TEAM_TMUX_COMMAND: fakeTmux,
+			GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS: "1",
+			GJC_TEAM_HEARTBEAT_STALE_MS: "1000",
+		};
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Continue stalled claim",
+			teamName,
+			cwd: cleanupRoot,
+			env,
+		});
+		const claim = await claimGjcTeamTask(teamName, "worker-1", cleanupRoot, env);
+		expect(claim.ok).toBe(true);
+		const stateDir = snapshot.state_dir;
+		await Bun.write(
+			path.join(stateDir, "workers", "worker-1", "lifecycle.json"),
+			`${JSON.stringify({ worker: "worker-1", lifecycle_state: "working", worker_status_state: "working", updated_at: new Date(nowMs).toISOString() })}\n`,
+		);
+		await writeWorkerStatus(stateDir, "worker-1", "working");
+		await Bun.write(
+			path.join(stateDir, "workers", "worker-1", "heartbeat.json"),
+			`${JSON.stringify({ pid: 1, last_turn_at: new Date(nowMs - 1_001).toISOString(), turn_count: 1, alive: true })}\n`,
+		);
+		return {
+			teamName,
+			env,
+			stateDir,
+			dispatches,
+			now: () => nowMs,
+			advance: (ms: number) => {
+				nowMs += ms;
+			},
+			monitor: () => monitorGjcTeam(teamName, cleanupRoot!, env),
+		};
+	}
+	async function setContinuationLease(
+		fixture: Awaited<ReturnType<typeof prepareContinuation>>,
+		leasedUntil: string,
+	): Promise<void> {
+		const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
+		if (!task.claim) throw new Error("expected claimed task");
+		const claim = { ...task.claim, leased_until: leasedUntil };
+		await Bun.write(path.join(fixture.stateDir, "tasks", "task-1.json"), `${JSON.stringify({ ...task, claim })}\n`);
+		await Bun.write(path.join(fixture.stateDir, "claims", "task-1.json"), `${JSON.stringify(claim)}\n`);
+	}
+
+	it("revokes escaped task mutation capabilities after their fenced callback", async () => {
+		const fixture = await prepareContinuation("continuation-capability-team");
+		const store = new GjcTeamTaskStore(fixture.stateDir, async () => undefined);
+		let escaped: GjcTeamTaskMutationCapability | undefined;
+		await withGjcTeamTaskMutation(store, async capability => {
+			escaped = capability;
+		});
+		expect(() => escaped?.create("forged", "forged", {})).toThrow("team_mutation_capability_revoked");
+		await expect(
+			store.withMutationCapability(Symbol("forged-capability") as never, async () => undefined),
+		).rejects.toThrow("team_mutation_capability_required");
+	});
+
+	it("drains unawaited capability mutations before releasing the shared fence", async () => {
+		const fixture = await prepareContinuation("continuation-capability-drain-team");
+		let releaseMutation!: () => void;
+		const mutationBlocked = new Promise<void>(resolve => {
+			releaseMutation = resolve;
+		});
+		let mutationEntered!: () => void;
+		const enteredMutation = new Promise<void>(resolve => {
+			mutationEntered = resolve;
+		});
+		let appendCount = 0;
+		let escaped: GjcTeamTaskMutationCapability | undefined;
+		const store = new GjcTeamTaskStore(fixture.stateDir, async () => {
+			appendCount += 1;
+			if (appendCount === 1) {
+				mutationEntered();
+				await mutationBlocked;
+			}
+		});
+		const fenced = withGjcTeamTaskMutation(store, async capability => {
+			escaped = capability;
+			void capability.create("unawaited", "must drain", {});
+		});
+		await enteredMutation;
+		expect(() => escaped?.create("escaped", "must be rejected during drain", {})).toThrow(
+			"team_mutation_capability_revoked",
+		);
+		let competingFinished = false;
+		const competing = store.create("competing", "must remain fenced", {}).then(() => {
+			competingFinished = true;
+		});
+		await Promise.resolve();
+		expect(competingFinished).toBe(false);
+		releaseMutation();
+		await Promise.all([fenced, competing]);
+		expect(competingFinished).toBe(true);
+	});
+
+	it("writes an immutable skipped outcome when a delayed but unexpired lease cannot cover the dispatch-time hold", async () => {
+		const fixture = await prepareContinuation("continuation-post-reservation-lease-team");
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: fixture.now,
+			continuationBeforeDispatch: async () => {
+				fixture.advance(30 * 60_000 - 15_000);
+			},
+			continuationTmuxDispatch: () => {
+				throw new Error("must not dispatch with an insufficient remaining lease");
+			},
+		});
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(0);
+		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(continuationRoot);
+		if (!incident) throw new Error("expected continuation incident");
+		const outcome = await Bun.file(path.join(continuationRoot, incident, "attempt-01.outcome.json")).json();
+		expect(outcome).toMatchObject({ result: "skipped", reason: "lease_does_not_cover_hold" });
+		expect(outcome.reservation_sha256).toBeDefined();
+	});
+
+	it("requires worst-case dispatch coverage while retaining a dispatch-relative successful hold", async () => {
+		const dispatchTimeoutMs = 5_000;
+		const holdMs = 30_000;
+		const covered = await prepareContinuation("continuation-worst-case-coverage-team");
+		const coveredLease = new Date(covered.now() + dispatchTimeoutMs + holdMs).toISOString();
+		await setContinuationLease(covered, coveredLease);
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: covered.now,
+			continuationTmuxDispatch: (command, args) => {
+				covered.dispatches.push({ command, args: [...args] });
+				covered.advance(dispatchTimeoutMs);
+				return { exitCode: 0 };
+			},
+		});
+		await covered.monitor();
+		const coveredRoot = path.join(covered.stateDir, "workers", "worker-1", "continuations");
+		const [coveredIncident] = await fs.readdir(coveredRoot);
+		if (!coveredIncident) throw new Error("expected continuation incident");
+		const coveredReservation = await Bun.file(
+			path.join(coveredRoot, coveredIncident, "attempt-01.reservation.json"),
+		).json();
+		const coveredOutcome = await Bun.file(path.join(coveredRoot, coveredIncident, "attempt-01.outcome.json")).json();
+		expect(coveredOutcome).toMatchObject({ result: "sent", reason: "tmux_sent" });
+		expect(Date.parse(coveredOutcome.hold_until)).toBeLessThanOrEqual(Date.parse(coveredLease));
+		expect(isValidGjcContinuationOutcome(coveredOutcome, coveredReservation, coveredIncident, 1)).toBe(true);
+
+		const insufficient = await prepareContinuation("continuation-insufficient-worst-case-coverage-team");
+		await setContinuationLease(insufficient, new Date(insufficient.now() + holdMs).toISOString());
+		let dispatchInputs = 0;
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: insufficient.now,
+			continuationTmuxDispatch: () => {
+				dispatchInputs += 1;
+				return { exitCode: 0 };
+			},
+		});
+		await insufficient.monitor();
+		expect(dispatchInputs).toBe(0);
+		const insufficientRoot = path.join(insufficient.stateDir, "workers", "worker-1", "continuations");
+		const [insufficientIncident] = await fs.readdir(insufficientRoot);
+		if (!insufficientIncident) throw new Error("expected continuation incident");
+		const insufficientOutcome = await Bun.file(
+			path.join(insufficientRoot, insufficientIncident, "attempt-01.outcome.json"),
+		).json();
+		expect(insufficientOutcome).toMatchObject({ result: "skipped", reason: "lease_does_not_cover_hold" });
+	});
+	it("uses the successful dispatch deadline rather than the earlier reservation deadline", async () => {
+		const fixture = await prepareContinuation("continuation-dispatch-relative-hold-team");
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: fixture.now,
+			continuationBeforeDispatch: async () => fixture.advance(15_000),
+			continuationTmuxDispatch: (command, args) => {
+				fixture.dispatches.push({ command, args: [...args] });
+				return { exitCode: 0 };
+			},
+		});
+		await fixture.monitor();
+		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(continuationRoot);
+		if (!incident) throw new Error("expected continuation incident");
+		const outcome = await Bun.file(path.join(continuationRoot, incident, "attempt-01.outcome.json")).json();
+		expect(Date.parse(outcome.hold_until) - Date.parse(outcome.dispatched_at)).toBe(30_000);
+		fixture.advance(15_000);
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(1);
+		fixture.advance(15_000);
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(2);
+	});
+
+	it("vetoes continuation but allows normal recovery for valid, null, and invalid shutdown authority", async () => {
+		for (const [name, shutdownRecord] of [
+			["null", "null"],
+			["malformed", "{truncated"],
+			["invalid", "{}"],
+			["array", "[]"],
+			[
+				"valid",
+				JSON.stringify({
+					worker: "worker-1",
+					requested_by: "leader-fixed",
+					request_id: "shutdown-test",
+					mode: "graceful",
+					requested_at: new Date().toISOString(),
+				}),
+			],
+		] as const) {
+			const fixture = await prepareContinuation(`continuation-shutdown-${name}-team`);
+			await Bun.write(path.join(fixture.stateDir, "workers", "worker-1", "shutdown-request.json"), shutdownRecord);
+			await fixture.monitor();
+			expect(fixture.dispatches).toHaveLength(0);
+			const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
+			expect(task.status).toBe("pending");
+			expect(task.claim).toBeUndefined();
+		}
+	});
+
+	it("continues only with a proven absent shutdown authority", async () => {
+		const fixture = await prepareContinuation("continuation-absent-shutdown-team");
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(1);
+	});
+
+	it("journals but sends no continuation input through psmux fallback transport", async () => {
+		const fixture = await prepareContinuation("continuation-psmux-transport-team");
+		const fakePsmux = await createFakeTmuxBin(cleanupRoot!, { commandName: "psmux" });
+		const configPath = path.join(fixture.stateDir, "config.json");
+		const config = await readTeamConfig(fixture.stateDir);
+		await Bun.write(configPath, `${JSON.stringify({ ...config, tmux_command: fakePsmux })}\n`);
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(0);
+		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(continuationRoot);
+		if (!incident) throw new Error("expected continuation incident");
+		const outcome = await Bun.file(path.join(continuationRoot, incident, "attempt-01.outcome.json")).json();
+		expect(outcome).toMatchObject({ result: "skipped", reason: "unsupported_send_keys_transport" });
+	});
+
+	it("is default-off and uses the controlled clock for exact 30s, 120s, and no-third-attempt timing", async () => {
+		const fixture = await prepareContinuation("continuation-team");
+		await Bun.write(
+			path.join(fixture.stateDir, "workers", "worker-1", "heartbeat.json"),
+			`${JSON.stringify({ pid: 1, last_turn_at: new Date(fixture.now()).toISOString(), turn_count: 1, alive: true })}\n`,
+		);
+		await monitorGjcTeam(fixture.teamName, cleanupRoot!, {
+			...fixture.env,
+			GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS: "0",
+		});
+		expect(fixture.dispatches).toHaveLength(0);
+		await Bun.write(
+			path.join(fixture.stateDir, "workers", "worker-1", "heartbeat.json"),
+			`${JSON.stringify({ pid: 1, last_turn_at: new Date(fixture.now() - 1_001).toISOString(), turn_count: 1, alive: true })}\n`,
+		);
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(1);
+		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(continuationRoot);
+		if (!incident) throw new Error("expected continuation incident");
+		const first = await Bun.file(path.join(continuationRoot, incident, "attempt-01.reservation.json")).json();
+		expect(Date.parse(first.hold_until) - Date.parse(first.reserved_at)).toBe(30_000);
+		fixture.advance(29_999);
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(1);
+		fixture.advance(1);
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(2);
+		const second = await Bun.file(path.join(continuationRoot, incident, "attempt-02.reservation.json")).json();
+		expect(Date.parse(second.hold_until) - Date.parse(second.reserved_at)).toBe(120_000);
+		fixture.advance(120_000);
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(2);
+		expect(await Bun.file(path.join(continuationRoot, incident, "attempt-03.reservation.json")).exists()).toBe(false);
+	});
+
+	it("fails closed for absent or invalid phase records without dispatching", async () => {
+		const fixture = await prepareContinuation("continuation-phase-team");
+		await fs.rm(path.join(fixture.stateDir, "phase.json"));
+		await fixture.monitor();
+		await Bun.write(path.join(fixture.stateDir, "phase.json"), `${JSON.stringify({ current_phase: "complete" })}\n`);
+		await fixture.monitor();
+		await Bun.write(path.join(fixture.stateDir, "phase.json"), "{malformed\n");
+		await fixture.monitor();
+
+		await Bun.write(path.join(fixture.stateDir, "phase.json"), `${JSON.stringify({ current_phase: "running" })}\n`);
+		await fixture.monitor();
+		expect(fixture.dispatches).toHaveLength(0);
+		const events = await readEvents(fixture.stateDir);
+		expect(events.match(/invalid_or_absent_running_phase/g) ?? []).toHaveLength(4);
+	});
+
+	it("serializes concurrent monitor calls behind the mutation fence without duplicate continuation dispatch", async () => {
+		const fixture = await prepareContinuation("continuation-fence-team");
+		let release!: () => void;
+		const releaseDispatch = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		let entered!: () => void;
+		const enteredDispatch = new Promise<void>(resolve => {
+			entered = resolve;
+		});
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: fixture.now,
+			continuationBeforeDispatch: async () => {
+				entered();
+				await releaseDispatch;
+			},
+			continuationTmuxDispatch: () => ({ exitCode: 0 }),
+		});
+		const first = fixture.monitor();
+		await enteredDispatch;
+		const second = fixture.monitor();
+		release();
+		await Promise.all([first, second]);
+		const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+		const [incident] = await fs.readdir(continuationRoot);
+		if (!incident) throw new Error("expected continuation incident");
+		expect(await Bun.file(path.join(continuationRoot, incident, "attempt-01.reservation.json")).exists()).toBe(true);
+		expect(await Bun.file(path.join(continuationRoot, incident, "attempt-02.reservation.json")).exists()).toBe(false);
+	});
+
+	it("records nonzero, partial, or thrown tmux dispatches as unknown and never retries them", async () => {
+		for (const [teamName, dispatch, reason] of [
+			["continuation-nonzero-team", () => ({ exitCode: 7 }), "tmux_nonzero_exit"],
+			["continuation-partial-team", () => ({}), "tmux_missing_exit_code"],
+			[
+				"continuation-throw-team",
+				() => {
+					throw new Error("tmux unavailable");
+				},
+				"tmux_dispatch_threw",
+			],
+		] as const) {
+			const fixture = await prepareContinuation(teamName);
+			__setGjcTeamRuntimeTestSeamsForTests({ nowMs: fixture.now, continuationTmuxDispatch: dispatch });
+			await fixture.monitor();
+			fixture.advance(120_001);
+			await fixture.monitor();
+			const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+			const [incident] = await fs.readdir(continuationRoot);
+			if (!incident) throw new Error("expected continuation incident");
+			const outcome = await Bun.file(path.join(continuationRoot, incident, "attempt-01.outcome.json")).json();
+			expect(outcome.reason).toBe(reason);
+			expect(outcome.result).toBe("unknown");
+			expect(await Bun.file(path.join(continuationRoot, incident, "attempt-02.reservation.json")).exists()).toBe(
+				false,
+			);
+		}
+	});
+	it("normalizes hostile thrown values into validator-accepted unknown outcomes without recovery", async () => {
+		for (const [teamName, thrown] of [
+			["continuation-empty-object-throw-team", {}],
+			["continuation-empty-string-throw-team", ""],
+			["continuation-empty-fields-throw-team", { name: "", code: "", message: "" }],
+		] as const) {
+			const fixture = await prepareContinuation(teamName);
+			__setGjcTeamRuntimeTestSeamsForTests({
+				nowMs: fixture.now,
+				continuationTmuxDispatch: () => {
+					throw thrown;
+				},
+			});
+			await fixture.monitor();
+			const continuationRoot = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+			const [incident] = await fs.readdir(continuationRoot);
+			if (!incident) throw new Error("expected continuation incident");
+			const reservation = await Bun.file(
+				path.join(continuationRoot, incident, "attempt-01.reservation.json"),
+			).json();
+			const outcome = await Bun.file(path.join(continuationRoot, incident, "attempt-01.outcome.json")).json();
+			expect(outcome).toMatchObject({ result: "unknown", reason: "tmux_dispatch_threw" });
+			expect(outcome.tmux_error.name.length).toBeGreaterThan(0);
+			expect(outcome.tmux_error.message.length).toBeGreaterThan(0);
+			if (outcome.tmux_error.code !== undefined) expect(outcome.tmux_error.code.length).toBeGreaterThan(0);
+			expect(isValidGjcContinuationOutcome(outcome, reservation, incident, 1)).toBe(true);
+			fixture.advance(120_001);
+			await fixture.monitor();
+			expect(await Bun.file(path.join(continuationRoot, incident, "attempt-02.reservation.json")).exists()).toBe(
+				false,
+			);
+			expect((await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env)).claim).toBeUndefined();
+			expect((await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env)).status).toBe("pending");
+		}
+	});
+	it("rejects non-canonical attempt-two outcomes before they can authorize another continuation", () => {
+		const reservation = { immutable: true };
+		const common = {
+			schema_version: 1,
+			incident_hash: "incident",
+			attempt: 2,
+			reservation_sha256: gjcContinuationReservationDigest(reservation),
+			recorded_at: new Date().toISOString(),
+		};
+		expect(
+			isValidGjcContinuationOutcome(
+				{ ...common, result: "skipped", reason: "forged_reason" },
+				reservation,
+				"incident",
+				2,
+			),
+		).toBe(false);
+		expect(
+			isValidGjcContinuationOutcome(
+				{ ...common, result: "sent", reason: "tmux_sent", tmux_exit_code: 0, forged: true },
+				reservation,
+				"incident",
+				2,
+			),
+		).toBe(false);
+		expect(
+			isValidGjcContinuationOutcome(
+				{ ...common, result: "unknown", reason: "tmux_nonzero_exit", tmux_exit_code: 0 },
+				reservation,
+				"incident",
+				2,
+			),
+		).toBe(false);
+	});
+	it("rejects every extra nested tmux error key", () => {
+		const reservation = { immutable: true };
+		const common = {
+			schema_version: 1,
+			incident_hash: "incident",
+			attempt: 1,
+			reservation_sha256: gjcContinuationReservationDigest(reservation),
+			recorded_at: new Date().toISOString(),
+			result: "unknown",
+			reason: "tmux_dispatch_threw",
+		};
+		for (const extra of ["forged", "stack", "cause", "detail"]) {
+			expect(
+				isValidGjcContinuationOutcome(
+					{ ...common, tmux_error: { name: "Error", message: "failed", [extra]: "forged" } },
+					reservation,
+					"incident",
+					1,
+				),
+			).toBe(false);
+		}
+		expect(
+			isValidGjcContinuationOutcome(
+				{ ...common, tmux_error: { name: "Error", message: "failed", code: "" } },
+				reservation,
+				"incident",
+				1,
+			),
+		).toBe(false);
+	});
+	it("requires exactly one current claim and rejects shutdown, draining, lease, and pane authority gaps", async () => {
+		for (const scenario of [
+			"zero_claims",
+			"multiple_claims",
+			"shutdown",
+			"draining_lifecycle",
+			"draining_status",
+			"expired_lease",
+			"leader_pane",
+			"cross_pane",
+			"missing_pane",
+			"missing_status",
+			"invalid_status",
+			"unknown_status",
+		] as const) {
+			const fixture = await prepareContinuation(`continuation-${scenario}-team`);
+			if (scenario === "zero_claims") {
+				const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
+				await releaseGjcTeamTaskClaim(
+					fixture.teamName,
+					"task-1",
+					task.claim?.token ?? "",
+					"worker-1",
+					cleanupRoot!,
+					fixture.env,
+				);
+			} else if (scenario === "multiple_claims") {
+				const extra = (await executeGjcTeamApiOperation(
+					"create-task",
+					{ team_name: fixture.teamName, subject: "second current claim", description: "second" },
+					cleanupRoot!,
+					fixture.env,
+				)) as { task_id: string };
+				await Bun.write(
+					path.join(fixture.stateDir, "workers", "worker-1", "heartbeat.json"),
+					`${JSON.stringify({ pid: 1, last_turn_at: new Date(fixture.now()).toISOString(), turn_count: 1, alive: true })}\n`,
+				);
+				const second = await claimGjcTeamTask(
+					fixture.teamName,
+					"worker-1",
+					cleanupRoot!,
+					fixture.env,
+					extra.task_id,
+				);
+				expect(second.ok).toBe(true);
+				await Bun.write(
+					path.join(fixture.stateDir, "workers", "worker-1", "heartbeat.json"),
+					`${JSON.stringify({ pid: 1, last_turn_at: new Date(fixture.now() - 1_001).toISOString(), turn_count: 1, alive: true })}\n`,
+				);
+			} else if (scenario === "shutdown") {
+				await Bun.write(path.join(fixture.stateDir, "workers", "worker-1", "shutdown-request.json"), "{}\n");
+			} else if (
+				scenario === "draining_lifecycle" ||
+				scenario === "draining_status" ||
+				scenario === "missing_status" ||
+				scenario === "invalid_status" ||
+				scenario === "unknown_status"
+			) {
+				if (scenario === "draining_lifecycle")
+					await Bun.write(
+						path.join(fixture.stateDir, "workers", "worker-1", "lifecycle.json"),
+						`${JSON.stringify({ worker: "worker-1", lifecycle_state: "draining", worker_status_state: "working", updated_at: new Date(fixture.now()).toISOString() })}\n`,
+					);
+				else if (scenario === "missing_status")
+					await fs.rm(path.join(fixture.stateDir, "workers", "worker-1", "status.json"));
+				else if (scenario === "invalid_status")
+					await Bun.write(
+						path.join(fixture.stateDir, "workers", "worker-1", "status.json"),
+						'{"state":"forged"}\n',
+					);
+				else if (scenario === "unknown_status") await writeWorkerStatus(fixture.stateDir, "worker-1", "unknown");
+				else await writeWorkerStatus(fixture.stateDir, "worker-1", "draining");
+			} else if (scenario === "expired_lease") {
+				fixture.advance(30 * 60_001);
+			} else {
+				const config = await readTeamConfig(fixture.stateDir);
+				const worker = config.workers[0];
+				if (!worker) throw new Error("expected worker");
+				worker.pane_id =
+					scenario === "leader_pane" ? config.leader.pane_id : scenario === "cross_pane" ? "%9" : undefined;
+				await Bun.write(path.join(fixture.stateDir, "config.json"), `${JSON.stringify(config)}\n`);
+			}
+			await fixture.monitor();
+			expect(fixture.dispatches, scenario).toHaveLength(0);
+			if (scenario === "zero_claims" || scenario === "multiple_claims")
+				expect(await readEvents(fixture.stateDir)).toContain("invalid_claim_count");
+		}
+	});
+
+	it("rejects insufficient lease, corrupt reservations, digest-mismatched outcomes, and restarts without an outcome", async () => {
+		const insufficient = await prepareContinuation("continuation-insufficient-lease-team");
+		insufficient.advance(30 * 60_000);
+		await insufficient.monitor();
+		expect(insufficient.dispatches).toHaveLength(0);
+
+		const corrupt = await prepareContinuation("continuation-corrupt-reservation-team");
+		const config = await readTeamConfig(corrupt.stateDir);
+		const task = await readGjcTeamTask(corrupt.teamName, "task-1", cleanupRoot!, corrupt.env);
+		const worker = config.workers[0];
+		if (!worker || !task.claim) throw new Error("expected claimed worker task");
+		const heartbeatAt = new Date(corrupt.now() - 1_001).toISOString();
+		const incident = createHash("sha256")
+			.update(
+				[
+					config.team_name,
+					worker.id,
+					task.id,
+					task.claim.owner,
+					task.claim.token,
+					task.version,
+					heartbeatAt,
+					worker.pane_id,
+					config.tmux_target,
+				].join(":"),
+			)
+			.digest("hex")
+			.slice(0, 24);
+		const journal = path.join(corrupt.stateDir, "workers", "worker-1", "continuations", incident);
+		await fs.mkdir(journal, { recursive: true });
+		await Bun.write(path.join(journal, "attempt-01.reservation.json"), "{}\n");
+		await corrupt.monitor();
+		corrupt.advance(120_001);
+		await corrupt.monitor();
+		expect(corrupt.dispatches).toHaveLength(0);
+		expect(await Bun.file(path.join(journal, "attempt-02.reservation.json")).exists()).toBe(false);
+
+		const digestMismatch = await prepareContinuation("continuation-digest-mismatch-team");
+		let digestDispatches = 0;
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: digestMismatch.now,
+			continuationBeforeDispatch: async () => {
+				const root = path.join(digestMismatch.stateDir, "workers", "worker-1", "continuations");
+				const [incidentName] = await fs.readdir(root);
+				if (!incidentName) throw new Error("expected reservation");
+				await Bun.write(
+					path.join(root, incidentName, "attempt-01.outcome.json"),
+					`${JSON.stringify({ schema_version: 1, incident_hash: incidentName, attempt: 1, reservation_sha256: "wrong", recorded_at: new Date(digestMismatch.now()).toISOString(), result: "sent", reason: "tmux_sent" })}\n`,
+				);
+			},
+			continuationTmuxDispatch: () => {
+				digestDispatches += 1;
+				return { exitCode: 0 };
+			},
+		});
+		await expect(digestMismatch.monitor()).rejects.toThrow("invalid_continuation_outcome");
+		await digestMismatch.monitor();
+		expect(digestDispatches).toBe(1);
+
+		const restart = await prepareContinuation("continuation-missing-outcome-team");
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: restart.now,
+			continuationBeforeDispatch: async () => {
+				throw new Error("simulated crash");
+			},
+		});
+		await expect(restart.monitor()).rejects.toThrow("simulated crash");
+		__setGjcTeamRuntimeTestSeamsForTests({ nowMs: restart.now, continuationTmuxDispatch: () => ({ exitCode: 0 }) });
+		await restart.monitor();
+		const restartRoot = path.join(restart.stateDir, "workers", "worker-1", "continuations");
+		const [restartIncident] = await fs.readdir(restartRoot);
+		if (!restartIncident) throw new Error("expected reservation");
+		expect(await Bun.file(path.join(restartRoot, restartIncident, "attempt-01.outcome.json")).exists()).toBe(false);
+		expect(restart.dispatches).toHaveLength(0);
+	});
+
+	it("releases stale claims for present null or malformed continuation outcomes instead of treating them as missing", async () => {
+		for (const [name, outcome] of [
+			["null", "null"],
+			["malformed", "{truncated"],
+		] as const) {
+			const fixture = await prepareContinuation(`continuation-${name}-outcome-recovery-team`);
+			__setGjcTeamRuntimeTestSeamsForTests({
+				nowMs: fixture.now,
+				continuationBeforeDispatch: async () => {
+					throw new Error("simulated crash");
+				},
+			});
+			await expect(fixture.monitor()).rejects.toThrow("simulated crash");
+			const root = path.join(fixture.stateDir, "workers", "worker-1", "continuations");
+			const [incident] = await fs.readdir(root);
+			if (!incident) throw new Error("expected reservation");
+			await Bun.write(path.join(root, incident, "attempt-01.outcome.json"), outcome);
+			await recoverGjcTeamStaleClaims(fixture.teamName, cleanupRoot!, fixture.env);
+			const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
+			expect(task.status).toBe("pending");
+			expect(task.claim).toBeUndefined();
+		}
+	});
+
+	it("uses the injected clock to expire missing attempt-one and sent attempt-two recovery holds", async () => {
+		const missing = await prepareContinuation("continuation-missing-hold-clock-team");
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: missing.now,
+			continuationBeforeDispatch: async () => {
+				throw new Error("simulated crash");
+			},
+		});
+		await expect(missing.monitor()).rejects.toThrow("simulated crash");
+		await recoverGjcTeamStaleClaims(missing.teamName, cleanupRoot!, missing.env);
+		expect((await readGjcTeamTask(missing.teamName, "task-1", cleanupRoot!, missing.env)).claim).toBeDefined();
+		missing.advance(30_000);
+		await recoverGjcTeamStaleClaims(missing.teamName, cleanupRoot!, missing.env);
+		expect((await readGjcTeamTask(missing.teamName, "task-1", cleanupRoot!, missing.env)).claim).toBeUndefined();
+
+		const sent = await prepareContinuation("continuation-sent-hold-clock-team");
+		await sent.monitor();
+		sent.advance(30_000);
+		await sent.monitor();
+		await recoverGjcTeamStaleClaims(sent.teamName, cleanupRoot!, sent.env);
+		expect((await readGjcTeamTask(sent.teamName, "task-1", cleanupRoot!, sent.env)).claim).toBeDefined();
+		sent.advance(120_000);
+		await recoverGjcTeamStaleClaims(sent.teamName, cleanupRoot!, sent.env);
+		expect((await readGjcTeamTask(sent.teamName, "task-1", cleanupRoot!, sent.env)).claim).toBeUndefined();
+	});
+
+	it("holds every public authority-changing operation behind the monitor dispatch fence", async () => {
+		const hostileInputs = [
+			"task;$(touch pwned)",
+			"provider\n--socket=/tmp/pwned",
+			"mailbox --target %stale",
+			"\n; tmux kill-server",
+		] as const;
+		const expectedArgv = [
+			"send-keys",
+			"-l",
+			"-t",
+			"%2",
+			"Continue only your current claimed GJC team task. Re-read current GJC team state; do not replay prior output; report status.",
+			";",
+			"send-keys",
+			"-t",
+			"%2",
+			"Enter",
+		];
+		const cases = [
+			[
+				"update task",
+				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+					executeGjcTeamApiOperation(
+						"update-task",
+						{ team_name: f.teamName, task_id: "task-1", subject: "updated" },
+						cleanupRoot!,
+						f.env,
+					),
+			],
+			[
+				"competing claim",
+				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+					executeGjcTeamApiOperation(
+						"claim-task",
+						{ team_name: f.teamName, worker: "worker-1", task_id: "task-1" },
+						cleanupRoot!,
+						f.env,
+					),
+			],
+			[
+				"release claim",
+				async (f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+					executeGjcTeamApiOperation(
+						"release-task-claim",
+						{
+							team_name: f.teamName,
+							task_id: "task-1",
+							claim_token: (await readGjcTeamTask(f.teamName, "task-1", cleanupRoot!, f.env)).claim?.token,
+							worker: "worker-1",
+						},
+						cleanupRoot!,
+						f.env,
+					),
+			],
+			[
+				"terminal transition",
+				async (f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+					executeGjcTeamApiOperation(
+						"transition-task-status",
+						{
+							team_name: f.teamName,
+							task_id: "task-1",
+							status: "failed",
+							claim_token: (await readGjcTeamTask(f.teamName, "task-1", cleanupRoot!, f.env)).claim?.token,
+							worker: "worker-1",
+						},
+						cleanupRoot!,
+						f.env,
+					),
+			],
+			[
+				"heartbeat update",
+				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+					executeGjcTeamApiOperation(
+						"update-worker-heartbeat",
+						{
+							team_name: f.teamName,
+							worker: "worker-1",
+							heartbeat: { pid: 1, last_turn_at: new Date(f.now()).toISOString(), turn_count: 2, alive: true },
+						},
+						cleanupRoot!,
+						f.env,
+					),
+			],
+			[
+				"status update",
+				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+					executeGjcTeamApiOperation(
+						"update-worker-status",
+						{ team_name: f.teamName, worker: "worker-1", status: "idle" },
+						cleanupRoot!,
+						f.env,
+					),
+			],
+			[
+				"lifecycle startup update",
+				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+					executeGjcTeamApiOperation(
+						"worker-startup-ack",
+						{ team_name: f.teamName, worker: "worker-1", pane_id: "%dry-run-worker-1", pid: 1 },
+						cleanupRoot!,
+						f.env,
+					),
+			],
+			[
+				"shutdown request",
+				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+					executeGjcTeamApiOperation(
+						"write-shutdown-request",
+						{
+							team_name: f.teamName,
+							worker: "worker-1",
+							requested_by: "worker-1",
+							request_id: "held-request",
+							mode: "graceful",
+						},
+						cleanupRoot!,
+						f.env,
+					),
+			],
+			[
+				"phase shutdown",
+				(f: Awaited<ReturnType<typeof prepareContinuation>>) => shutdownGjcTeam(f.teamName, cleanupRoot!, f.env),
+			],
+			[
+				"direct recovery",
+				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+					recoverGjcTeamStaleClaims(f.teamName, cleanupRoot!, f.env),
+			],
+			[
+				"worker GC prune",
+				async (f: Awaited<ReturnType<typeof prepareContinuation>>) => {
+					const workerPath = path.join(f.stateDir, "workers", "worker-1");
+					return pruneTeamWorkerGcRecord(
+						{
+							store: "team_workers",
+							id: `${f.teamName}/worker-1`,
+							path: workerPath,
+							status: "dead",
+							stale: true,
+							removable: true,
+							action: "would_remove",
+							reason: "dead",
+						},
+						() => ({ status: "dead" }),
+					);
+				},
+			],
+		] as const;
+		for (const [name, operation] of cases) {
+			const fixture = await prepareContinuation(`continuation-held-${name.replaceAll(" ", "-")}-team`);
+			let release!: () => void;
+			const held = new Promise<void>(resolve => {
+				release = resolve;
+			});
+			let entered!: () => void;
+			const enteredDispatch = new Promise<void>(resolve => {
+				entered = resolve;
+			});
+			const argv: string[][] = [];
+			__setGjcTeamRuntimeTestSeamsForTests({
+				nowMs: fixture.now,
+				continuationBeforeDispatch: async () => {
+					entered();
+					await held;
+				},
+				continuationTmuxDispatch: (_command, args) => {
+					argv.push([...args]);
+					return { exitCode: 0 };
+				},
+			});
+			const monitor = fixture.monitor();
+			await enteredDispatch;
+			let finished = false;
+			const result = operation(fixture).then(value => {
+				finished = true;
+				return value;
+			});
+			await Promise.resolve();
+			expect(finished, name).toBe(false);
+			release();
+			const [, operationResult] = await Promise.all([monitor, result]);
+			expect(finished, name).toBe(true);
+			expect(argv, name).toEqual([expectedArgv]);
+			for (const hostile of hostileInputs) expect(argv.flat().join("\u0000"), name).not.toContain(hostile);
+			const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
+			if (name === "update task") expect(task.subject).toBe("updated");
+			if (name === "competing claim") expect((operationResult as { ok: boolean }).ok).toBe(false);
+			if (name === "release claim" || name === "worker GC prune") expect(task.claim).toBeUndefined();
+			if (name === "terminal transition") expect(task.status).toBe("failed");
+			if (name === "phase shutdown") expect((operationResult as { phase: string }).phase).toBe("cancelled");
+			if (name === "worker GC prune") expect(operationResult).toBe(true);
+			expect(["pending", "in_progress", "failed"]).toContain(task.status);
+			if (task.claim) expect(task.claim.owner).toBe("worker-1");
+		}
+	});
+
+	it("keeps stale-claim GC blocked behind a monitor-held mutation fence", async () => {
+		const fixture = await prepareContinuation("continuation-gc-fence-team");
+		let release!: () => void;
+		const blocked = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		let entered!: () => void;
+		const enteredDispatch = new Promise<void>(resolve => {
+			entered = resolve;
+		});
+		__setGjcTeamRuntimeTestSeamsForTests({
+			nowMs: fixture.now,
+			continuationBeforeDispatch: async () => {
+				entered();
+				await blocked;
+			},
+			continuationTmuxDispatch: () => ({ exitCode: 0 }),
+		});
+		const monitor = fixture.monitor();
+		await enteredDispatch;
+		let gcFinished = false;
+		const gc = recoverGjcTeamStaleClaims(fixture.teamName, cleanupRoot!, fixture.env).then(() => {
+			gcFinished = true;
+		});
+		await Promise.resolve();
+		expect(gcFinished).toBe(false);
+		release();
+		await Promise.all([monitor, gc]);
+		expect(gcFinished).toBe(true);
 	});
 });

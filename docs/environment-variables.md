@@ -288,6 +288,8 @@ If the wheel does not scroll inside `gjc --tmux` on WSL, confirm the session is 
 | `GJC_TEAM_WORKER_COMMAND` | Worker GJC command override |
 | `GJC_TEAM_WORKER_CLI` | Team worker CLI selector; accepted values are `auto` or `gjc` |
 | `GJC_TEAM_WORKER_CLI_MAP` | Comma-separated worker CLI selector map; entries must be `auto` or `gjc` |
+| `GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS` | Default-off stalled-worker continuation for the mutating `gjc team monitor` path; only exact value `1` enables it. A nudge is fenced to a running non-dry-run team, stale heartbeat, live recorded non-leader pane in the recorded tmux target, a proven-absent shutdown authority record, `ready`/`working` lifecycle with a valid non-terminal worker status, one current matching in-progress claim, and a lease that covers the hold. Valid-present or invalid/unreadable shutdown authority vetoes continuation but does not suppress normal stale-claim recovery. It uses at most two immutable journaled attempts (30s, then 120s) and fails closed on restart/unknown outcome. It sends a fixed prompt only to that pane on verified native tmux transport; psmux and native Windows send-keys fallback transports record a skipped outcome and send no continuation input. It does not replay providers, inspect/inject dynamic pane content or cross panes, kill/relaunch/split workers, or alter claims. |
+| `GJC_TEAM_HEARTBEAT_STALE_MS` | Stale-heartbeat threshold in milliseconds. Defaults to `120000`; a non-numeric value falls back to that default, and a non-positive value disables stale-heartbeat detection. |
 
 ### Hermes MCP bridge
 

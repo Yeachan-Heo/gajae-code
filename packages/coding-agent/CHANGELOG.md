@@ -8,6 +8,7 @@
 - Coordinator MCP operational calls now canonically bootstrap or reuse the agent-global SDK broker when discovery is absent or stale, while coordinator/hermes JSON checks report catalog and broker-discovery readiness separately without mutating broker state (#2552).
 - Coordinator MCP question polling now requires a session, reconciles pending workflow gates into bounded public questions, diagnostics, and reconciliation state, and submits bound idempotent answers through `workflow.gate_answer` without exposing private gate payloads (#2550).
 - Runtime skill discovery now follows native user config-root precedence: nearest project, canonical `GJC_CONFIG_DIR`/`PI_CONFIG_DIR`/`.gjc` `agent/skills`, configured legacy `<config>/skills`, then historical legacy `~/.gjc/skills`, preserving exact fallback precedence (#2572).
+- Opt-in stalled team-worker continuation now remains default-off (`GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS=1`) and sends at most two fenced, journaled fixed prompts only to a verified stale worker pane with a matching live claim and sufficient lease; unknown restart state fails closed, with no provider replay, pane lifecycle action, or claim mutation (#2580).
 
 ### Fixed
 - SDK host response delivery to a disconnected client no longer escalates a second structured-error send failure into a process-level unhandled rejection; failures stay local to that connection.
