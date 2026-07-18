@@ -3,10 +3,11 @@ import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { postmortem, TempDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../src/cli/args";
-import { Settings } from "../src/config/settings";
+import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
 import {
 	classifyStartupUpdateRoute,
+	getChangelogForDisplay,
 	initializeInteractiveModeWithStartupUpdate,
 	runRootCommand,
 	StartupUpdateOrchestrator,
@@ -78,6 +79,22 @@ describe("startup update contract", () => {
 		expect(setting.ui.description).toContain("never install");
 		expect(setting.ui.description).toContain("Use `gjc update` only");
 		expect(setting.ui.description).toContain("source, linked, and unrecognized installs use their original method");
+	});
+	it("displays the changelog without rewriting malformed global YAML", async () => {
+		using tempDir = TempDir.createSync("@gjc-malformed-changelog-");
+		const agentDir = path.join(tempDir.path(), "agent");
+		const malformed = "notifications: [";
+		await Bun.write(path.join(agentDir, "config.yml"), malformed);
+		resetSettingsForTest();
+		const activeSettings = await Settings.init({ cwd: tempDir.path(), agentDir });
+		try {
+			expect(activeSettings.canWriteDurableConfig()).toBe(false);
+			expect(await getChangelogForDisplay(rootArgs())).toBeDefined();
+			expect(() => activeSettings.set("lastChangelogVersion", "0.0.0")).toThrow("Repair config.yml");
+			expect(await Bun.file(path.join(agentDir, "config.yml")).text()).toBe(malformed);
+		} finally {
+			resetSettingsForTest();
+		}
 	});
 
 	it("classifies every noninteractive launch route and starts no checker for them", () => {

@@ -530,6 +530,12 @@ export class Settings implements NotificationSettingsReader {
 		return () => this.#changeListeners.delete(listener);
 	}
 
+	/** Whether durable settings mutations are permitted for the loaded configuration. */
+	canWriteDurableConfig(): boolean {
+		return !this.#persist || !this.#hasRecoveredConfigSyntax;
+	}
+	}
+
 	/**
 	 * Set a setting value (sync).
 	 * Updates global settings and reserves its background persistence slot before
@@ -854,8 +860,13 @@ export class Settings implements NotificationSettingsReader {
 			inMemory: !this.#persist,
 		});
 		cloned.#storage = this.#storage;
+		cloned.#schemaReport = structuredClone(this.#schemaReport);
+		cloned.#schemaMigrationPending = this.#schemaMigrationPending;
 		cloned.#futureSchemaVersion = this.#futureSchemaVersion;
-
+		cloned.#hasMalformedConfigRoot = this.#hasMalformedConfigRoot;
+		cloned.#hasRecoveredConfigSyntax = this.#hasRecoveredConfigSyntax;
+		cloned.#hasInvalidNotificationConfiguration = this.#hasInvalidNotificationConfiguration;
+		cloned.#notificationValidationGeneration = this.#notificationValidationGeneration;
 		cloned.#global = structuredClone(this.#global);
 		cloned.#rawNotificationConfig = structuredClone(this.#rawNotificationConfig);
 		cloned.#durableRawNotificationConfig = structuredClone(this.#durableRawNotificationConfig);
@@ -1088,21 +1099,29 @@ export class Settings implements NotificationSettingsReader {
 		}
 	}
 
-	async #loadYaml(filePath: string): Promise<RawSettings> {
+	#resetYamlLoadState(): void {
 		this.#hasMalformedConfigRoot = false;
 		this.#hasRecoveredConfigSyntax = false;
 		this.#hasInvalidNotificationConfiguration = false;
+		this.#schemaReport = { issues: [], valid: true };
+		this.#schemaMigrationPending = false;
+		this.#futureSchemaVersion = false;
 		this.#captureRawNotificationConfig({});
+	}
+
+	async #loadYaml(filePath: string): Promise<RawSettings> {
 		let content: string;
 		try {
 			content = await Bun.file(filePath).text();
 		} catch (error) {
 			if (isEnoent(error)) {
-				this.#captureRawNotificationConfig({});
+				this.#resetYamlLoadState();
 				return {};
 			}
 			throw error;
 		}
+		this.#resetYamlLoadState();
+		if (content.trim() === "") return {};
 		let parsed: unknown;
 		try {
 			parsed = YAML.parse(content);
@@ -1760,7 +1779,7 @@ export class Settings implements NotificationSettingsReader {
 		this.#replaceGlobalWithDurable(current);
 	}
 	#assertDurableConfigWritable(): void {
-		if (!this.#persist || !this.#hasRecoveredConfigSyntax) return;
+		if (this.canWriteDurableConfig()) return;
 		throw new Error(
 			"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
 		);

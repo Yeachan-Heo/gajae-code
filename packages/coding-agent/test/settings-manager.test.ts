@@ -568,4 +568,66 @@ describe("Settings", () => {
 		expect(migration?.default).toBe("copy-retain");
 		expect(migration?.enum).toEqual(["copy-retain", "disabled"]);
 	});
+	it("clears recovered diagnostics and notification validation after an empty-file repair", async () => {
+		const malformed = "notifications: [";
+		await Bun.write(getConfigPath(), malformed);
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.getSchemaReport()).toMatchObject({ valid: false });
+			expect(() => settings.set("theme.dark", "red-claw")).toThrow("Repair config.yml");
+			expect(await Bun.file(getConfigPath()).text()).toBe(malformed);
+
+			await Bun.write(getConfigPath(), "");
+			await settings.flush();
+
+			expect(settings.canWriteDurableConfig()).toBe(true);
+			expect(settings.getSchemaReport()).toEqual({ issues: [], valid: true });
+			expect(settings.getNotificationSettingsSnapshot()).toMatchObject({ enabled: false });
+			settings.set("notifications.redact", true);
+			expect(settings.get("notifications.redact")).toBe(true);
+			await settings.flushOrThrow();
+			expect(await readSettings()).toMatchObject({ notifications: { redact: true } });
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+
+	it("retains fail-closed recovery state when a durable refresh read fails", async () => {
+		const malformed = "notifications: [";
+		await Bun.write(getConfigPath(), malformed);
+		const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			fs.rmSync(getConfigPath());
+			fs.mkdirSync(getConfigPath());
+
+			await expect(settings.flush()).rejects.toThrow();
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.getSchemaReport()).toMatchObject({ valid: false });
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => settings.set("notifications.redact", true)).toThrow("Repair config.yml");
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
+
+	it("keeps malformed global recovery and notification state in cwd clones", async () => {
+		const malformed = "notifications: [";
+		const clonedCwd = path.join(testDir, "cloned-project");
+		fs.mkdirSync(clonedCwd, { recursive: true });
+		await Bun.write(getConfigPath(), malformed);
+		const source = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			const cloned = await source.cloneForCwd(clonedCwd);
+			expect(cloned.canWriteDurableConfig()).toBe(false);
+			expect(cloned.getSchemaReport()).toEqual(source.getSchemaReport());
+			expect(() => source.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => cloned.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			expect(() => cloned.set("notifications.redact", true)).toThrow("Repair config.yml");
+			expect(await Bun.file(getConfigPath()).text()).toBe(malformed);
+		} finally {
+			source.getStorage()?.close();
+		}
+	});
 });
