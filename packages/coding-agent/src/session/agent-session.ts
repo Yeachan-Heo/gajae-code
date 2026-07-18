@@ -1574,6 +1574,45 @@ export class AgentSession {
 	#defaultModelSelectionMutationRevision = 0;
 	#thinkingLevelMutationRevision = 0;
 	#thinkingVisibilityMutationRevision = 0;
+	#thinkingLevelLiveMutationRevision = 0;
+	#thinkingVisibilityLiveMutationRevision = 0;
+	#reasoningControlContextGeneration = 0;
+	#pendingThinkingLevelControlSuccess:
+		| {
+				level: ThinkingLevel;
+				mutationRevision: number;
+				sessionId: string;
+				model: Model | undefined;
+				contextGeneration: number;
+		  }
+		| undefined;
+	#pendingThinkingVisibilityControlSuccess:
+		| {
+				visibility: "visible" | "hidden";
+				mutationRevision: number;
+				sessionId: string;
+				model: Model | undefined;
+				contextGeneration: number;
+		  }
+		| undefined;
+	#pendingThinkingLevelControlFailure:
+		| {
+				mutationRevision: number;
+				liveMutationRevision: number;
+				sessionId: string;
+				model: Model | undefined;
+				contextGeneration: number;
+		  }
+		| undefined;
+	#pendingThinkingVisibilityControlFailure:
+		| {
+				mutationRevision: number;
+				liveMutationRevision: number;
+				sessionId: string;
+				model: Model | undefined;
+				contextGeneration: number;
+		  }
+		| undefined;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -2709,10 +2748,16 @@ export class AgentSession {
 		this.#defaultFallbackController = scope.fallbackController;
 		const previousEditMode = this.#resolveActiveEditMode();
 		if (scope.model) {
-			this.agent.setModel(scope.model);
+			this.#setAgentModelWithReasoningContext(scope.model);
 			this.#syncAppendOnlyContext(scope.model);
 		}
 		this.#thinkingLevelMutationRevision++;
+		this.#thinkingLevelLiveMutationRevision++;
+		this.#pendingThinkingLevelControlSuccess = undefined;
+		this.#pendingThinkingLevelControlFailure = undefined;
+		this.#thinkingVisibilityLiveMutationRevision++;
+		this.#pendingThinkingVisibilityControlSuccess = undefined;
+		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = scope.thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(scope.thinkingLevel));
 		void this.#syncEditToolModeAfterModelChange(previousEditMode);
@@ -5156,6 +5201,7 @@ export class AgentSession {
 	 * such event.
 	 */
 	#syncAgentSessionId(sessionId?: string): void {
+		this.#reasoningControlContextGeneration++;
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
 		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
@@ -9385,6 +9431,12 @@ export class AgentSession {
 		this.#clearConstructorToolSelectionAuthority();
 		const inheritedThinkingLevel = resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
 		this.#thinkingLevelMutationRevision++;
+		this.#thinkingLevelLiveMutationRevision++;
+		this.#pendingThinkingLevelControlSuccess = undefined;
+		this.#pendingThinkingLevelControlFailure = undefined;
+		this.#thinkingVisibilityLiveMutationRevision++;
+		this.#pendingThinkingVisibilityControlSuccess = undefined;
+		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = inheritedThinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(inheritedThinkingLevel));
 		this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
@@ -9734,7 +9786,7 @@ export class AgentSession {
 		const ownsScope = scope !== undefined && !suppliedScope;
 		try {
 			if (isTemporaryOperation) {
-				this.agent.setModel(model);
+				this.#setAgentModelWithReasoningContext(model);
 				this.#syncAppendOnlyContext(model);
 			} else {
 				this.#setModelAuthoritatively(model, options?.cause ?? "temporary-operation");
@@ -9820,6 +9872,12 @@ export class AgentSession {
 		this.#setModelWithProviderSessionReset(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
 		this.#thinkingLevelMutationRevision++;
+		this.#thinkingLevelLiveMutationRevision++;
+		this.#pendingThinkingLevelControlSuccess = undefined;
+		this.#pendingThinkingLevelControlFailure = undefined;
+		this.#thinkingVisibilityLiveMutationRevision++;
+		this.#pendingThinkingVisibilityControlSuccess = undefined;
+		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(thinkingLevel));
 		if (thinkingLevelChanged) {
@@ -10138,6 +10196,9 @@ export class AgentSession {
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
 		if (persist) this.#assertDurableSettingsWritable();
 		this.#thinkingLevelMutationRevision++;
+		this.#thinkingLevelLiveMutationRevision++;
+		this.#pendingThinkingLevelControlSuccess = undefined;
+		this.#pendingThinkingLevelControlFailure = undefined;
 		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
 		const isChanging = effectiveLevel !== this.#thinkingLevel;
 
@@ -10176,19 +10237,80 @@ export class AgentSession {
 		);
 		const persistedLevel = level === ThinkingLevel.Inherit ? getDefault("defaultThinkingLevel") : effectiveLevel;
 		const mutationRevision = ++this.#thinkingLevelMutationRevision;
+		const expectedLiveMutationRevision = this.#thinkingLevelLiveMutationRevision;
 		const expectedSessionId = this.sessionManager.getSessionId();
 		const expectedModel = this.model;
+		const expectedContextGeneration = this.#reasoningControlContextGeneration;
 		try {
 			await this.settings.commitAtomicBatch([{ path: "defaultThinkingLevel", op: "set", value: persistedLevel }]);
 		} catch {
+			if (
+				mutationRevision === this.#thinkingLevelMutationRevision &&
+				this.#reasoningControlContextGeneration === expectedContextGeneration &&
+				this.sessionManager.getSessionId() === expectedSessionId &&
+				this.model === expectedModel
+			) {
+				const pending = this.#pendingThinkingLevelControlSuccess;
+				this.#pendingThinkingLevelControlSuccess = undefined;
+				if (
+					pending &&
+					pending.contextGeneration === expectedContextGeneration &&
+					this.sessionManager.getSessionId() === pending.sessionId &&
+					this.model === pending.model
+				) {
+					this.setThinkingLevel(
+						pending.level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : pending.level,
+					);
+					this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+				} else {
+					this.#pendingThinkingLevelControlFailure = {
+						mutationRevision,
+						liveMutationRevision: expectedLiveMutationRevision,
+						sessionId: expectedSessionId,
+						model: expectedModel,
+						contextGeneration: expectedContextGeneration,
+					};
+				}
+			}
 			throw new Error("Unable to persist reasoning settings.");
 		}
 
 		if (
 			mutationRevision !== this.#thinkingLevelMutationRevision ||
+			this.#reasoningControlContextGeneration !== expectedContextGeneration ||
 			this.sessionManager.getSessionId() !== expectedSessionId ||
 			this.model !== expectedModel
 		) {
+			if (
+				this.#thinkingLevelLiveMutationRevision === expectedLiveMutationRevision &&
+				this.#reasoningControlContextGeneration === expectedContextGeneration &&
+				this.sessionManager.getSessionId() === expectedSessionId &&
+				this.model === expectedModel &&
+				(this.#pendingThinkingLevelControlSuccess?.mutationRevision ?? -1) < mutationRevision
+			) {
+				this.#pendingThinkingLevelControlSuccess = {
+					level,
+					mutationRevision,
+					sessionId: expectedSessionId,
+					model: expectedModel,
+					contextGeneration: expectedContextGeneration,
+				};
+				const failure = this.#pendingThinkingLevelControlFailure;
+				if (
+					failure &&
+					failure.mutationRevision === this.#thinkingLevelMutationRevision &&
+					failure.liveMutationRevision === expectedLiveMutationRevision &&
+					failure.sessionId === expectedSessionId &&
+					failure.model === expectedModel &&
+					failure.contextGeneration === expectedContextGeneration
+				) {
+					this.#pendingThinkingLevelControlFailure = undefined;
+					this.setThinkingLevel(
+						level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel,
+					);
+					this.sessionManager.appendThinkingLevelChange(ThinkingLevel.Inherit);
+				}
+			}
 			return;
 		}
 		this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : effectiveLevel);
@@ -10210,6 +10332,9 @@ export class AgentSession {
 	setThinkingVisibility(visibility: "visible" | "hidden", persist: boolean = false): void {
 		if (persist) this.#assertDurableSettingsWritable();
 		this.#thinkingVisibilityMutationRevision++;
+		this.#thinkingVisibilityLiveMutationRevision++;
+		this.#pendingThinkingVisibilityControlSuccess = undefined;
+		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.agent.hideThinkingSummary = visibility === "hidden";
 		if (persist) {
 			this.settings.set("hideThinkingBlock", visibility === "hidden");
@@ -10227,19 +10352,76 @@ export class AgentSession {
 
 		this.#assertDurableSettingsWritable();
 		const mutationRevision = ++this.#thinkingVisibilityMutationRevision;
+		const expectedLiveMutationRevision = this.#thinkingVisibilityLiveMutationRevision;
 		const expectedSessionId = this.sessionManager.getSessionId();
+		const expectedModel = this.model;
+		const expectedContextGeneration = this.#reasoningControlContextGeneration;
 		try {
 			await this.settings.commitAtomicBatch([
 				{ path: "hideThinkingBlock", op: "set", value: visibility === "hidden" },
 			]);
 		} catch {
+			if (
+				mutationRevision === this.#thinkingVisibilityMutationRevision &&
+				this.#reasoningControlContextGeneration === expectedContextGeneration &&
+				this.sessionManager.getSessionId() === expectedSessionId &&
+				this.model === expectedModel
+			) {
+				const pending = this.#pendingThinkingVisibilityControlSuccess;
+				this.#pendingThinkingVisibilityControlSuccess = undefined;
+				if (
+					pending &&
+					pending.contextGeneration === expectedContextGeneration &&
+					this.sessionManager.getSessionId() === pending.sessionId &&
+					this.model === pending.model
+				) {
+					this.setThinkingVisibility(pending.visibility);
+				} else {
+					this.#pendingThinkingVisibilityControlFailure = {
+						mutationRevision,
+						liveMutationRevision: expectedLiveMutationRevision,
+						sessionId: expectedSessionId,
+						model: expectedModel,
+						contextGeneration: expectedContextGeneration,
+					};
+				}
+			}
 			throw new Error("Unable to persist reasoning settings.");
 		}
 
 		if (
 			mutationRevision !== this.#thinkingVisibilityMutationRevision ||
-			this.sessionManager.getSessionId() !== expectedSessionId
+			this.#reasoningControlContextGeneration !== expectedContextGeneration ||
+			this.sessionManager.getSessionId() !== expectedSessionId ||
+			this.model !== expectedModel
 		) {
+			if (
+				this.#thinkingVisibilityLiveMutationRevision === expectedLiveMutationRevision &&
+				this.#reasoningControlContextGeneration === expectedContextGeneration &&
+				this.sessionManager.getSessionId() === expectedSessionId &&
+				this.model === expectedModel &&
+				(this.#pendingThinkingVisibilityControlSuccess?.mutationRevision ?? -1) < mutationRevision
+			) {
+				this.#pendingThinkingVisibilityControlSuccess = {
+					visibility,
+					mutationRevision,
+					sessionId: expectedSessionId,
+					model: expectedModel,
+					contextGeneration: expectedContextGeneration,
+				};
+				const failure = this.#pendingThinkingVisibilityControlFailure;
+				if (
+					failure &&
+					failure.mutationRevision === this.#thinkingVisibilityMutationRevision &&
+					failure.liveMutationRevision === expectedLiveMutationRevision &&
+					failure.sessionId === expectedSessionId &&
+					failure.model === expectedModel &&
+					failure.contextGeneration === expectedContextGeneration
+				) {
+					this.#pendingThinkingVisibilityControlFailure = undefined;
+					this.setThinkingVisibility(visibility);
+				}
+			}
 			return;
 		}
 		this.setThinkingVisibility(visibility);
@@ -11927,13 +12109,18 @@ export class AgentSession {
 		this.#defaultFallbackExhaustedLastTurn = false;
 	}
 
+	#setAgentModelWithReasoningContext(model: Model | undefined): void {
+		this.#reasoningControlContextGeneration++;
+		this.agent.setModel(model);
+	}
+
 	#setModelWithProviderSessionReset(model: Model | undefined): void {
 		this.#defaultModelSelectionMutationRevision++;
 		const currentModel = this.model;
 		if (currentModel) {
 			this.#closeProviderSessionsForModelSwitch(currentModel, model);
 		}
-		this.agent.setModel(model);
+		this.#setAgentModelWithReasoningContext(model);
 	}
 
 	#setModelAuthoritatively(model: Model, cause: ModelChangeCause): void {
@@ -11942,7 +12129,7 @@ export class AgentSession {
 		if (cause !== "temporary-operation") this.#commitAllTemporaryProviderSessionScopes();
 		const currentModel = this.model;
 		if (currentModel) this.#closeProviderSessionsForModelSwitch(currentModel, model);
-		this.agent.setModel(model);
+		this.#setAgentModelWithReasoningContext(model);
 		this.#syncAppendOnlyContext(model);
 	}
 
@@ -14937,6 +15124,13 @@ export class AgentSession {
 						? this.#getInheritedThinkingLevel()
 						: persistedThinkingLevel,
 				);
+				this.#thinkingLevelMutationRevision++;
+				this.#thinkingLevelLiveMutationRevision++;
+				this.#pendingThinkingLevelControlSuccess = undefined;
+				this.#pendingThinkingLevelControlFailure = undefined;
+				this.#thinkingVisibilityLiveMutationRevision++;
+				this.#pendingThinkingVisibilityControlSuccess = undefined;
+				this.#pendingThinkingVisibilityControlFailure = undefined;
 				this.#thinkingLevel = nextThinkingLevel;
 				this.agent.setThinkingLevel(toReasoningEffort(nextThinkingLevel));
 				this.agent.serviceTier = hasServiceTierEntry
@@ -15006,9 +15200,15 @@ export class AgentSession {
 				this.agent.restoreSteering(previousAgentSteeringQueue);
 				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
 				if (previousModel) {
-					this.agent.setModel(previousModel);
+					this.#setAgentModelWithReasoningContext(previousModel);
 				}
 				this.#thinkingLevelMutationRevision++;
+				this.#thinkingLevelLiveMutationRevision++;
+				this.#pendingThinkingLevelControlSuccess = undefined;
+				this.#pendingThinkingLevelControlFailure = undefined;
+				this.#thinkingVisibilityLiveMutationRevision++;
+				this.#pendingThinkingVisibilityControlSuccess = undefined;
+				this.#pendingThinkingVisibilityControlFailure = undefined;
 				this.#thinkingLevel = previousThinkingLevel;
 				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
 				this.agent.serviceTier = previousServiceTier;

@@ -330,6 +330,108 @@ describe("issue #775: per-model defaultLevel", () => {
 			commit.mockRestore();
 		}
 	});
+	it("reconciles an older successful thinking level after the newer durable commit fails", async () => {
+		const settings = Settings.isolated({ defaultThinkingLevel: Effort.Low });
+		await createSession(getSonnet(), settings);
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		let callCount = 0;
+		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
+			if (++callCount === 1) {
+				firstStarted.resolve();
+				await releaseFirst.promise;
+				return commitAtomicBatch(changes);
+			}
+			secondStarted.resolve();
+			throw new Error("newer commit failed");
+		});
+
+		try {
+			const older = session.setThinkingLevelForControl(Effort.Medium, true);
+			await firstStarted.promise;
+			const newer = session.setThinkingLevelForControl(Effort.High, true);
+			await secondStarted.promise;
+			releaseFirst.resolve();
+			await older;
+			await expect(newer).rejects.toThrow("Unable to persist reasoning settings.");
+
+			expect(settings.getGlobal("defaultThinkingLevel")).toBe(Effort.Medium);
+			expect(session.thinkingLevel).toBe(Effort.Medium);
+			expect(session.getThinkingScopeForControl()).toBe("global config");
+		} finally {
+			commit.mockRestore();
+		}
+	});
+	it("reconciles an older successful thinking visibility after the newer durable commit fails", async () => {
+		const settings = Settings.isolated({ hideThinkingBlock: false });
+		await createSession(getSonnet(), settings);
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		let callCount = 0;
+		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
+			if (++callCount === 1) {
+				firstStarted.resolve();
+				await releaseFirst.promise;
+				return commitAtomicBatch(changes);
+			}
+			secondStarted.resolve();
+			throw new Error("newer commit failed");
+		});
+
+		try {
+			const older = session.setThinkingVisibilityForControl("hidden", true);
+			await firstStarted.promise;
+			const newer = session.setThinkingVisibilityForControl("visible", true);
+			await secondStarted.promise;
+			releaseFirst.resolve();
+			await older;
+			await expect(newer).rejects.toThrow("Unable to persist reasoning settings.");
+
+			expect(settings.getGlobal("hideThinkingBlock")).toBe(true);
+			expect(session.getThinkingVisibility()).toBe("hidden");
+		} finally {
+			commit.mockRestore();
+		}
+	});
+	it("does not reconcile over an intervening live thinking level mutation", async () => {
+		const settings = Settings.isolated({ defaultThinkingLevel: Effort.Low });
+		await createSession(getSonnet(), settings);
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const commitAtomicBatch = settings.commitAtomicBatch.bind(settings);
+		let callCount = 0;
+		const commit = spyOn(settings, "commitAtomicBatch").mockImplementation(async changes => {
+			if (++callCount === 1) {
+				firstStarted.resolve();
+				await releaseFirst.promise;
+				return commitAtomicBatch(changes);
+			}
+			secondStarted.resolve();
+			throw new Error("newer commit failed");
+		});
+
+		try {
+			const older = session.setThinkingLevelForControl(Effort.Medium, true);
+			await firstStarted.promise;
+			const newer = session.setThinkingLevelForControl(Effort.High, true);
+			await secondStarted.promise;
+			releaseFirst.resolve();
+			await older;
+			await session.setThinkingLevelForControl(Effort.Low, false);
+			await expect(newer).rejects.toThrow("Unable to persist reasoning settings.");
+
+			expect(settings.getGlobal("defaultThinkingLevel")).toBe(Effort.Medium);
+			expect(session.thinkingLevel).toBe(Effort.Low);
+			expect(session.getThinkingScopeForControl()).toBe("session");
+		} finally {
+			commit.mockRestore();
+		}
+	});
 	it("rejects durable thinking controls before mutating session state", async () => {
 		const sonnet = getSonnet();
 		const settings = Settings.isolated({
