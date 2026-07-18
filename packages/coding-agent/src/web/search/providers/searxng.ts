@@ -38,14 +38,12 @@ import { classifyProviderHttpError, withHardTimeout } from "./utils";
 const DEFAULT_NUM_RESULTS = 10;
 const MAX_NUM_RESULTS = 20;
 
-/** Map our recency filter to SearXNG time_range parameter.
- *  SearXNG only supports day/month/year, so week maps to month. */
-const RECENCY_MAP: Record<"day" | "week" | "month" | "year", string> = {
+/** Map supported recency filters to SearXNG time_range values. */
+const RECENCY_MAP = {
 	day: "day",
-	week: "month",
 	month: "month",
 	year: "year",
-};
+} as const;
 
 /** SearXNG JSON API response types */
 interface SearXNGResult {
@@ -173,7 +171,7 @@ function buildRequest(
 		url.searchParams.set("pageno", "1");
 	}
 
-	if (params.recency) {
+	if (params.recency && params.recency !== "week") {
 		url.searchParams.set("time_range", RECENCY_MAP[params.recency]);
 	}
 
