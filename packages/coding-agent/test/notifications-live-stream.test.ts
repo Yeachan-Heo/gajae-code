@@ -2,7 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Settings } from "../src/config/settings";
+import { getNotificationConfig } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
+import type { NotificationSessionContext } from "../src/sdk/bus/session-control";
+import { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { renderThreadedFrame } from "../src/sdk/bus/threaded-render";
@@ -98,7 +102,14 @@ function setEnv(over: Partial<Record<(typeof envKeys)[number], string>>): void {
 
 async function bootSession(
 	settingsOverrides: Record<string, unknown> = {},
-): Promise<{ handlers: Map<string, Handler>; ctx: unknown; frames: Frame[] }> {
+	options: { withoutSettings?: boolean } = {},
+): Promise<{
+	handlers: Map<string, Handler>;
+	ctx: NotificationSessionContext;
+	frames: Frame[];
+	settings: Settings;
+	controller: NotificationSessionController;
+}> {
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
@@ -109,7 +120,13 @@ async function bootSession(
 	const agentDir = path.join(cwd, ".gjc", "agent");
 	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 	cleanupRoots.push(cleanup);
-	createNotificationsExtension(api, { settings: isolatedNotificationSettings(agentDir, settingsOverrides) });
+	const settings = isolatedNotificationSettings(agentDir, settingsOverrides);
+	const controller = new NotificationSessionController({
+		eligible: true,
+		getConfig: () => getNotificationConfig(settings),
+	});
+	if (options.withoutSettings) createNotificationsExtension(api);
+	else createNotificationsExtension(api, { settings, controller });
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -121,7 +138,7 @@ async function bootSession(
 		},
 		getContextUsage: () => undefined,
 		getModel: () => undefined,
-	} as never;
+	} as NotificationSessionContext;
 
 	registerNotificationRuntime(cleanup, {
 		key: `notification-session:${sid}`,
@@ -144,7 +161,7 @@ async function bootSession(
 		ws.addEventListener("error", () => reject(new Error("ws error")));
 	});
 	await sleep(250);
-	return { handlers, ctx, frames };
+	return { handlers, ctx, frames, settings, controller };
 }
 
 const assistant = (content: string) => ({ type: "message_update", message: { role: "assistant", content } });
@@ -229,6 +246,45 @@ test("default Telegram streaming setting enables live frames without the env opt
 	const live = frames.find(f => f.type === "turn_stream" && f.phase === "live")!;
 	expect(live.text).toContain("settings enabled stream");
 	expect(live.messageRef).toBe("1");
+});
+test("producer default enables streaming when Settings are unavailable", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	const { handlers, ctx, frames } = await bootSession({}, { withoutSettings: true });
+
+	await handlers.get("message_update")!(assistant("fallback stream"), ctx);
+	await waitFor(() => frames.some(f => f.type === "turn_stream" && f.phase === "live"), 3000, "fallback live frame");
+});
+test("reconciliation refreshes streaming for an active in-flight turn", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	const { handlers, ctx, frames, settings, controller } = await bootSession({
+		"notifications.telegram.streaming.enabled": true,
+	});
+	const liveFrames = () => frames.filter(f => f.type === "turn_stream" && f.phase === "live");
+
+	await handlers.get("message_update")!(assistant("before disable"), ctx);
+	await waitFor(() => liveFrames().length === 1, 3000, "initial live frame");
+
+	settings.set("notifications.telegram.streaming.enabled", false);
+	await controller.reconcileCurrentSession(ctx);
+	await handlers.get("message_update")!(assistant("after disable"), ctx);
+	await sleep(200);
+	expect(liveFrames()).toHaveLength(1);
+
+	await handlers.get("turn_end")!(
+		{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "authoritative final" } },
+		ctx,
+	);
+	await waitFor(
+		() => frames.some(f => f.type === "turn_stream" && f.phase === "finalized"),
+		3000,
+		"finalized after disable",
+	);
+
+	settings.set("notifications.telegram.streaming.enabled", true);
+	await controller.reconcileCurrentSession(ctx);
+	await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+	await handlers.get("message_update")!(assistant("after re-enable"), ctx);
+	await waitFor(() => liveFrames().length === 2, 3000, "re-enabled live frame");
 });
 
 for (const value of ["0", "off", "false", " OFF "]) {

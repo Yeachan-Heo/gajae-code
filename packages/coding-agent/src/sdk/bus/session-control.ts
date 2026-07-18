@@ -34,6 +34,11 @@ export interface NotificationSessionRuntime<Context extends NotificationSessionC
 	start(binding: BoundNotificationSession<Context>): Promise<NotificationEndpointStartResult>;
 	stop(binding: BoundNotificationSession<Context>): Promise<boolean>;
 	/**
+	 * Refreshes the active runtime's effective Telegram streaming gate after
+	 * durable configuration changes. The runtime applies process-env precedence.
+	 */
+	refreshStreaming?(binding: BoundNotificationSession<Context>, cfg: NotificationConfig): void;
+	/**
 	 * Proves the complete Telegram owner identity before a generic endpoint can
 	 * emit a frame. `blocked_identity` is fail-closed and starts nothing.
 	 */
@@ -233,6 +238,7 @@ export class NotificationSessionController {
 	): Promise<NotificationSessionReconcileResult> {
 		const cfg = this.#getConfig();
 		const runtime = this.#runtime as NotificationSessionRuntime<Context> | undefined;
+		runtime?.refreshStreaming?.(binding, cfg);
 		const status = this.#status(binding, cfg, runtime);
 		if (!status.effectiveEnabled) {
 			if (runtime && status.running) await runtime.stop(binding);

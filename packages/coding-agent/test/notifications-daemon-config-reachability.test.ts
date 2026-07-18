@@ -81,6 +81,16 @@ describe("notifications daemon config reachability (rich)", () => {
 		const cfg = cfgFromRaw({ notifications: { enabled: true, telegram: { botToken: "token", chatId: "42" } } });
 		expect(cfg.streaming.enabled).toBe(true);
 	});
+	test("missing streaming defaults to enabled through the daemon validation projection", () => {
+		const settings = createLightweightDaemonSettings({
+			agentDir: "/tmp/gjc-streaming-config",
+			rawConfig: { notifications: { enabled: true, telegram: { botToken: "token", chatId: "42" } } },
+		});
+
+		expect(settings.get("notifications.telegram.streaming.enabled")).toBe(true);
+		expect(settings.getNotificationSettingsSnapshot().telegram.streaming.enabled).toBe(true);
+		expect(getNotificationConfig(settings).streaming.enabled).toBe(true);
+	});
 	test("malformed streaming values use the default while explicit false is preserved", () => {
 		const malformed = cfgFromRaw({
 			notifications: { telegram: { streaming: { enabled: "no" } } },

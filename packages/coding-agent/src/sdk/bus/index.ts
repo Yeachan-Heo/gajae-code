@@ -3717,6 +3717,10 @@ export function createNotificationsExtension(
 			return result.status === "started" || result.status === "already" ? "started" : result.status;
 		},
 		stop: async binding => await stopSession(binding.sessionId, "notifications"),
+		refreshStreaming: (binding, cfg) => {
+			const runtime = runtimes.get(binding.sessionId);
+			if (runtime) runtime.stream = streamingEnabled(cfg);
+		},
 		ensureTelegramDaemon: async binding => {
 			const { settings, settingsAvailable } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
