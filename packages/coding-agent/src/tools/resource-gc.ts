@@ -76,11 +76,13 @@ const defaultDeps: ResourceGcDeps = {
 // ── Controller state (process-global; tabs/browsers are module-global too) ──────────────────
 const activeSessions = new Map<string, Settings>();
 let timer: ReturnType<typeof setTimeout> | null = null;
+let pendingSweepDeadline: number | null = null;
 let stopped = false;
 // Bumped on every stop so an in-flight tick from a previous schedule cannot reschedule after a
 // stop+re-register and leak a duplicate timer.
 let timerGeneration = 0;
 let inProgress = false;
+let rescheduleAfterProgress = false;
 let rssWarningActive = false;
 let lastScreenshotScanAt = 0;
 let deps: ResourceGcDeps = defaultDeps;
@@ -114,43 +116,63 @@ function currentSweepIntervalMs(): number {
 }
 
 function ensureTimerStarted(): void {
-	if (timer) return;
 	stopped = false;
 	scheduleNextSweep();
 }
 
 // Recursive setTimeout (not setInterval) so the cadence is recomputed every cycle and later
-// session register/unregister changes to resourceGc.sweepIntervalMs are honored live.
+// session register/unregister changes to resourceGc.sweepIntervalMs are honored live. A newly
+// registered shorter policy may pull the sweep forward, but longer policies never delay it.
 function scheduleNextSweep(): void {
 	if (stopped || activeSessions.size === 0) {
 		timer = null;
+		pendingSweepDeadline = null;
 		return;
 	}
+	if (inProgress) {
+		rescheduleAfterProgress = true;
+		return;
+	}
+
+	const deadline = Date.now() + currentSweepIntervalMs();
+	if (timer && pendingSweepDeadline !== null && pendingSweepDeadline <= deadline) return;
+
+	if (timer) clearTimeout(timer);
 	const generation = timerGeneration;
-	timer = setTimeout(() => {
-		void tickAndReschedule(generation);
-	}, currentSweepIntervalMs());
+	pendingSweepDeadline = deadline;
+	timer = setTimeout(
+		() => {
+			timer = null;
+			pendingSweepDeadline = null;
+			void tickAndReschedule(generation);
+		},
+		Math.max(0, deadline - Date.now()),
+	);
 	timer.unref?.();
 }
 
 async function tickAndReschedule(generation: number): Promise<void> {
-	await runTick();
-	// A stop (and possible re-register) happened during the tick: a newer cycle owns the timer now.
-	if (generation !== timerGeneration) return;
+	const ran = await runTick(true);
+	if (!ran) return;
+	// A stop without a replacement session invalidates this cycle. When a session re-registers
+	// during the sweep, its scheduling attempt is deferred until the sweep finishes.
+	if (generation !== timerGeneration && (stopped || activeSessions.size === 0)) return;
 	scheduleNextSweep();
 }
 
 function stopTimer(): void {
 	stopped = true;
 	timerGeneration++;
-	if (timer) {
-		clearTimeout(timer);
-		timer = null;
-	}
+	if (timer) clearTimeout(timer);
+	timer = null;
+	pendingSweepDeadline = null;
 }
 
-async function runTick(): Promise<void> {
-	if (inProgress) return;
+async function runTick(rescheduleIfSkipped = false): Promise<boolean> {
+	if (inProgress) {
+		if (rescheduleIfSkipped) rescheduleAfterProgress = true;
+		return false;
+	}
 	inProgress = true;
 	try {
 		await sweepOnce(deps);
@@ -158,7 +180,12 @@ async function runTick(): Promise<void> {
 		logger.debug("resource GC sweep failed", { error: (err as Error).message });
 	} finally {
 		inProgress = false;
+		if (rescheduleAfterProgress) {
+			rescheduleAfterProgress = false;
+			scheduleNextSweep();
+		}
 	}
+	return true;
 }
 
 export async function sweepOnce(d: ResourceGcDeps = deps): Promise<void> {
@@ -285,6 +312,7 @@ export function __resetResourceGcForTest(): void {
 	stopTimer();
 	activeSessions.clear();
 	inProgress = false;
+	rescheduleAfterProgress = false;
 	rssWarningActive = false;
 	lastScreenshotScanAt = 0;
 	deps = defaultDeps;

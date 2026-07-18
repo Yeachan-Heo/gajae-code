@@ -47,11 +47,15 @@ function baseDeps(over: Partial<ResourceGcDeps> = {}): ResourceGcDeps {
 		...over,
 	};
 }
+function gcSettings(sweepIntervalMs: number): Settings {
+	return Settings.isolated({ "resourceGc.sweepIntervalMs": sweepIntervalMs, "browser.gc.idleMs": 1_000 });
+}
 
 describe("resource GC controller", () => {
 	afterEach(() => {
 		__resetResourceGcForTest();
 		vi.restoreAllMocks();
+		vi.useRealTimers();
 	});
 
 	it("idle sweep evicts idle tabs oldest-first and spares recent ones", async () => {
@@ -220,6 +224,113 @@ describe("resource GC controller", () => {
 		expect(__getResourceGcStateForTest().sessionCount).toBe(0);
 	});
 
+	it("reschedules a pending long sweep when a session policy becomes shorter", () => {
+		vi.useFakeTimers({ now: 0 });
+		const listTabs = vi.fn(() => []);
+		__setResourceGcDepsForTest({ listTabs });
+		registerResourceGcSession({ sessionId: "s1", settings: gcSettings(1_000) });
+
+		vi.advanceTimersByTime(100);
+		registerResourceGcSession({ sessionId: "s1", settings: gcSettings(200) });
+		expect(vi.getTimerCount()).toBe(1);
+
+		vi.advanceTimersByTime(199);
+		expect(listTabs).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		expect(listTabs).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not postpone a pending short sweep when a session policy becomes longer", () => {
+		vi.useFakeTimers({ now: 0 });
+		const listTabs = vi.fn(() => []);
+		__setResourceGcDepsForTest({ listTabs });
+		registerResourceGcSession({ sessionId: "s1", settings: gcSettings(200) });
+
+		vi.advanceTimersByTime(100);
+		registerResourceGcSession({ sessionId: "s1", settings: gcSettings(1_000) });
+		expect(vi.getTimerCount()).toBe(1);
+
+		vi.advanceTimersByTime(99);
+		expect(listTabs).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		expect(listTabs).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not postpone a pending sweep when the shortest session unregisters", () => {
+		vi.useFakeTimers({ now: 0 });
+		const listTabs = vi.fn(() => []);
+		__setResourceGcDepsForTest({ listTabs });
+		const unregisterShort = registerResourceGcSession({ sessionId: "short", settings: gcSettings(200) });
+		registerResourceGcSession({ sessionId: "long", settings: gcSettings(1_000) });
+
+		vi.advanceTimersByTime(100);
+		unregisterShort();
+		expect(vi.getTimerCount()).toBe(1);
+
+		vi.advanceTimersByTime(99);
+		expect(listTabs).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		expect(listTabs).toHaveBeenCalledTimes(1);
+	});
+
+	it("defers scheduling when a session registers during an in-flight tick", async () => {
+		vi.useFakeTimers({ now: 0 });
+		let releaseSweep: (() => void) | undefined;
+		const releaseTab = vi.fn(
+			() =>
+				new Promise<boolean>(resolve => {
+					releaseSweep = () => resolve(true);
+				}),
+		);
+		__setResourceGcDepsForTest({
+			now: () => NOW,
+			listTabs: () => [snapshot("busy", "initial", NOW - 5_000)],
+			releaseTab,
+		});
+		registerResourceGcSession({ sessionId: "initial", settings: gcSettings(100) });
+
+		vi.advanceTimersByTime(100);
+		expect(__getResourceGcStateForTest().inProgress).toBe(true);
+		registerResourceGcSession({ sessionId: "new", settings: gcSettings(1_000) });
+		expect(vi.getTimerCount()).toBe(0);
+
+		vi.advanceTimersByTime(10_000);
+		expect(releaseTab).toHaveBeenCalledTimes(1);
+		expect(vi.getTimerCount()).toBe(0);
+
+		releaseSweep?.();
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(__getResourceGcStateForTest().inProgress).toBe(false);
+		expect(vi.getTimerCount()).toBe(1);
+	});
+
+	it("fences an in-flight tick across stop and re-registration", async () => {
+		vi.useFakeTimers({ now: 0 });
+		let releaseSweep: (() => void) | undefined;
+		__setResourceGcDepsForTest({
+			now: () => NOW,
+			listTabs: () => [snapshot("busy", "initial", NOW - 5_000)],
+			releaseTab: vi.fn(
+				() =>
+					new Promise<boolean>(resolve => {
+						releaseSweep = () => resolve(true);
+					}),
+			),
+		});
+		const unregister = registerResourceGcSession({ sessionId: "initial", settings: gcSettings(100) });
+
+		vi.advanceTimersByTime(100);
+		expect(__getResourceGcStateForTest().inProgress).toBe(true);
+		unregister();
+		registerResourceGcSession({ sessionId: "replacement", settings: gcSettings(1_000) });
+		expect(vi.getTimerCount()).toBe(0);
+
+		releaseSweep?.();
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(__getResourceGcStateForTest().inProgress).toBe(false);
+		expect(vi.getTimerCount()).toBe(1);
+	});
+
 	it("does not run overlapping ticks", async () => {
 		const settings = Settings.isolated({
 			"browser.gc.enabled": true,
@@ -248,6 +359,106 @@ describe("resource GC controller", () => {
 
 		resolveRelease?.();
 		await first;
+	});
+
+	it("reschedules after a timer fires during an externally started tick", async () => {
+		vi.useFakeTimers({ now: 0 });
+		let releaseSweep: (() => void) | undefined;
+		let releaseCalls = 0;
+		const releaseTab = vi.fn(() => {
+			releaseCalls++;
+			if (releaseCalls > 1) return Promise.resolve(true);
+			return new Promise<boolean>(resolve => {
+				releaseSweep = () => resolve(true);
+			});
+		});
+		__setResourceGcDepsForTest({
+			now: () => NOW,
+			listTabs: () => [snapshot("busy", "initial", NOW - 5_000)],
+			releaseTab,
+		});
+		registerResourceGcSession({ sessionId: "initial", settings: gcSettings(100) });
+
+		const externalTick = __runResourceGcTickForTest();
+		await Promise.resolve();
+		expect(__getResourceGcStateForTest().inProgress).toBe(true);
+
+		vi.advanceTimersByTime(100);
+		expect(vi.getTimerCount()).toBe(0);
+		expect(releaseTab).toHaveBeenCalledTimes(1);
+
+		releaseSweep?.();
+		await externalTick;
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(__getResourceGcStateForTest().inProgress).toBe(false);
+		expect(vi.getTimerCount()).toBe(1);
+
+		vi.advanceTimersByTime(100);
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(releaseTab).toHaveBeenCalledTimes(2);
+	});
+
+	it("rearms after stop and re-registration during an externally started tick", async () => {
+		vi.useFakeTimers({ now: 0 });
+		let releaseSweep: (() => void) | undefined;
+		__setResourceGcDepsForTest({
+			now: () => NOW,
+			listTabs: () => [snapshot("busy", "initial", NOW - 5_000)],
+			releaseTab: vi.fn(
+				() =>
+					new Promise<boolean>(resolve => {
+						releaseSweep = () => resolve(true);
+					}),
+			),
+		});
+		const unregister = registerResourceGcSession({ sessionId: "initial", settings: gcSettings(100) });
+
+		const externalTick = __runResourceGcTickForTest();
+		await Promise.resolve();
+		unregister();
+		registerResourceGcSession({ sessionId: "replacement", settings: gcSettings(1_000) });
+		expect(vi.getTimerCount()).toBe(0);
+
+		releaseSweep?.();
+		await externalTick;
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(__getResourceGcStateForTest()).toMatchObject({ inProgress: false, sessionCount: 1, timerActive: true });
+		expect(vi.getTimerCount()).toBe(1);
+	});
+
+	it("advances a pending deadline after a shorter policy registers during an external tick", async () => {
+		vi.useFakeTimers({ now: 0 });
+		let releaseSweep: (() => void) | undefined;
+		let releaseCalls = 0;
+		const releaseTab = vi.fn(() => {
+			releaseCalls++;
+			if (releaseCalls > 1) return Promise.resolve(true);
+			return new Promise<boolean>(resolve => {
+				releaseSweep = () => resolve(true);
+			});
+		});
+		__setResourceGcDepsForTest({
+			now: () => NOW,
+			listTabs: () => [snapshot("busy", "initial", NOW - 5_000)],
+			releaseTab,
+		});
+		registerResourceGcSession({ sessionId: "initial", settings: gcSettings(1_000) });
+
+		const externalTick = __runResourceGcTickForTest();
+		await Promise.resolve();
+		vi.advanceTimersByTime(100);
+		registerResourceGcSession({ sessionId: "short", settings: gcSettings(200) });
+		expect(vi.getTimerCount()).toBe(1);
+
+		releaseSweep?.();
+		await externalTick;
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+
+		vi.advanceTimersByTime(199);
+		expect(releaseTab).toHaveBeenCalledTimes(1);
+		vi.advanceTimersByTime(1);
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(releaseTab).toHaveBeenCalledTimes(2);
 	});
 
 	it("lazy-arms and throttles stale screenshot cleanup", async () => {
