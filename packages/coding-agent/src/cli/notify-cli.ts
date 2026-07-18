@@ -592,8 +592,9 @@ ${chalk.bold("Examples:")}
 
 ${chalk.bold("Threaded Mode:")}
   GJC uses Telegram private-chat topics for per-session threads. Setup verifies the bot
-  capability via getMe.has_topics_enabled. Enable Threaded Mode in @BotFather > Bot Settings
-  > Threads Settings; bots cannot toggle it through the Bot API. If Telegram refuses topic
+  capability via getMe.has_topics_enabled. Enable Threaded Mode in the BotFather Mini App
+  (@BotFather profile > Open App > your bot > Bot Settings > Threads Settings); the /mybots
+  chat menu does not list it, and bots cannot toggle it through the Bot API. If Telegram refuses topic
   creation at runtime, GJC delivers flat to the paired private chat with outbound notifications
   and inline ask buttons only, then nudges you to enable Threaded Mode for free-text replies
   and session commands.

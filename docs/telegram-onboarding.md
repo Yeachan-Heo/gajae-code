@@ -89,7 +89,24 @@ manual BotFather toggle. A forum-enabled supergroup is no longer required.
 Note: enabling topics in private chats may require an additional Telegram Stars
 purchase fee, per Telegram's Terms of Service for Bot Developers.
 
-If BotFather's **Bot Settings** menu does not show **Threads Settings** or
+The Threaded Mode toggle lives in the BotFather **Mini App**, not in the
+`/mybots` chat-command menu. In current Telegram clients the chat-command path
+(`/mybots` > **Bot Settings**) does not list **Threads Settings** at all, so a
+missing menu there is expected and does not mean the bot lacks the capability.
+To enable Threaded Mode:
+
+1. open the `@BotFather` chat and go to its profile page;
+2. tap **Open App** to launch the BotFather Mini App;
+3. select your bot, then **Settings** > **Bot Settings**;
+4. enable **Threaded Mode** (keep "users can create topics" enabled).
+
+After toggling, verify with Telegram `getMe` for the bot token:
+`has_topics_enabled: true` confirms the capability took effect. If the Mini App
+itself shows no Threads/Threaded Mode setting, that can be a Telegram rollout
+gap — some newly created bots are provisioned without the `has_topics_enabled`
+capability, and the only known workaround is creating a new bot.
+
+If even the BotFather Mini App does not show **Threads Settings** or
 **Threaded Mode**, do not treat that as a setup blocker. Telegram exposes this
 capability unevenly across clients/accounts/bot states, and GJC cannot force the
 menu to appear through the Bot API. The safe fallback is to continue setup with a
@@ -381,9 +398,10 @@ by the current setup flow.
 ### Setup succeeds but no Telegram session messages arrive
 
 Check the `threaded=` status from the last `gjc notify setup` run. If it is
-`threaded=unverified` or `threaded=unknown`, first try the current Telegram
-client's @BotFather flow for this bot. If BotFather's **Bot Settings** menu lacks
-**Threads Settings**/**Threaded Mode**, continue with the saved private-chat
+`threaded=unverified` or `threaded=unknown`, open the BotFather **Mini App**
+(@BotFather profile > **Open App** > your bot > **Settings** > **Bot Settings**)
+and enable **Threaded Mode** there — the `/mybots` chat-command menu does not
+list it. If the Mini App also lacks the setting, continue with the saved private-chat
 pairing; this is supported. GJC cannot enable Threaded Mode through the Bot API,
 and no paid/Stars option is required just to receive flat private-chat
 notifications. When `createForumTopic` is refused for the paired chat, the daemon

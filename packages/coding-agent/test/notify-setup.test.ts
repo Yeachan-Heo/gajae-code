@@ -821,6 +821,8 @@ describe("notify setup threaded mode verification", () => {
 		);
 		expect(stdout).toContain("Threaded Mode is OFF");
 		expect(stdout).toContain("@BotFather");
+		expect(stdout).toContain("BotFather Mini App");
+		expect(stdout).toContain("Open App");
 		expect(stdout).toContain("Bot Settings > Threads Settings");
 		expect(stdout).toContain("inline ask buttons only");
 		expect(stdout).toContain("threaded=verified");

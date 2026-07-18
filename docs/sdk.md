@@ -412,10 +412,12 @@ buttons, and routes replies back to the exact session/action. A forum-enabled
 supergroup is no longer required: when the bot owner enables Threaded Mode in
 @BotFather, the daemon creates one topic per session in the paired private chat.
 GJC cannot enable Threaded Mode through the Bot API; setup only verifies the
-capability and guides the manual BotFather toggle.
+capability and guides the manual BotFather toggle. The toggle lives in the
+BotFather Mini App (bot profile > **Open App** > your bot > **Settings** >
+**Bot Settings** > **Threaded Mode**), not in the `/mybots` chat-command menu.
 
-If BotFather's per-bot **Bot Settings** menu does not show **Threads Settings**
-or **Threaded Mode**, the supported fallback is the normal private-chat pairing.
+If even the BotFather Mini App does not show **Threads Settings** or
+**Threaded Mode**, the supported fallback is the normal private-chat pairing.
 Setup can be saved as `threaded=unverified`/`threaded=unknown`, and the daemon
 still tries topics when Telegram allows them. When `createForumTopic` is refused,
 the daemon does not drop the send: it routes the notification to the normal

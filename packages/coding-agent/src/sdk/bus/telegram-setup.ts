@@ -159,7 +159,7 @@ const THREADED_NONINTERACTIVE_WARNING =
 	"Warning: Telegram Threaded Mode capability is OFF for this bot. Setup will be saved because this run is non-interactive. Flat private-chat fallback supports outbound notifications and inline ask buttons only; free-text replies and session commands require enabling Threaded Mode in @BotFather > Bot Settings > Threads Settings.\n";
 const THREADED_DISABLED_GUIDANCE =
 	"Telegram Threaded Mode is OFF for this bot. GJC needs Telegram private-chat topics so each session can use its own thread.\n" +
-	"GJC cannot enable this through the Bot API. Open @BotFather > Bot Settings > Threads Settings for this bot, enable Threaded Mode / forum topics for private chats, then return here.\n" +
+	"GJC cannot enable this through the Bot API. The toggle is in the BotFather Mini App, not the /mybots chat menu: open @BotFather's profile > Open App, select this bot, then Bot Settings > Threads Settings, enable Threaded Mode / forum topics for private chats, then return here.\n" +
 	"Without Threaded Mode, flat private-chat fallback supports outbound notifications and inline ask buttons only; free-text replies and session commands require topic routing.\n";
 const THREADED_DISABLED_PROMPT =
 	"Press Enter after enabling Threaded Mode, or type skip to finish setup with a warning: ";

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Telegram Threaded Mode guidance now points to the actual toggle location: the BotFather **Mini App** (@BotFather profile > Open App > your bot > Bot Settings > Threads Settings). Current Telegram clients do not list Threads Settings in the `/mybots` chat-command menu at all, so the onboarding docs, SDK docs, interactive setup guidance, and `gjc notify` help previously sent stuck users to a menu that never shows the setting. Docs also document verifying the toggle via `getMe.has_topics_enabled` and the known Telegram rollout gap where newly created bots lack the capability entirely.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed
