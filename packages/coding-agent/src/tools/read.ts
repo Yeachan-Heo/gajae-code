@@ -1587,6 +1587,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (internalRouter.canHandle(readPath)) {
 			const internalTarget = splitInternalUrlSel(readPath);
 			const parsed = parseSel(internalTarget.sel);
+			if (internalTarget.sel !== undefined && parsed.kind === "none") {
+				throw new ToolError(`Invalid internal URL selector "${internalTarget.sel}".`);
+			}
 			return this.#handleInternalUrl(internalTarget.path, parsed, signal);
 		}
 
