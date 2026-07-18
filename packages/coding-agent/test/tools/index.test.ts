@@ -7,8 +7,8 @@ import {
 	parseGjcPy,
 	resolveEvalBackends,
 	resolveEvalBackendsFromEnv,
-	resolvePythonIpcTrace,
 	resolvePythonIntegrationGate,
+	resolvePythonIpcTrace,
 	resolvePythonSkipCheck,
 	type ToolSession,
 } from "@gajae-code/coding-agent/tools";
@@ -538,15 +538,11 @@ describe("resolvePythonIntegrationGate (OR semantics)", () => {
 	});
 
 	it("GJC=0, PI=1 is still true (OR semantics, not GJC-gated)", () => {
-		expect(resolvePythonIntegrationGate({ GJC_PYTHON_INTEGRATION: "0", PI_PYTHON_INTEGRATION: "1" })).toBe(
-			true,
-		);
+		expect(resolvePythonIntegrationGate({ GJC_PYTHON_INTEGRATION: "0", PI_PYTHON_INTEGRATION: "1" })).toBe(true);
 	});
 
 	it("both 0 is false", () => {
-		expect(resolvePythonIntegrationGate({ GJC_PYTHON_INTEGRATION: "0", PI_PYTHON_INTEGRATION: "0" })).toBe(
-			false,
-		);
+		expect(resolvePythonIntegrationGate({ GJC_PYTHON_INTEGRATION: "0", PI_PYTHON_INTEGRATION: "0" })).toBe(false);
 	});
 
 	it("accepts truthy tokens true/yes case-insensitively", () => {
