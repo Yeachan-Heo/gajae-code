@@ -60,6 +60,7 @@ export interface GjcTeamWorkerOrchestrationRuntime extends GjcTeamWorkerRuntime 
 	): Promise<unknown>;
 	paneBelongsToTeamTarget(config: GjcTeamConfig, paneId: string): boolean;
 	parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number;
+	parseHeartbeatStaleMs(env: NodeJS.ProcessEnv): number;
 	killWorkerPanes(config: GjcTeamConfig): void;
 	removeCleanCreatedWorktrees(workers: GjcTeamWorker[]): Promise<void>;
 	readMonitorSnapshot(dir: string): Promise<unknown>;
@@ -476,7 +477,7 @@ async function livenessReasons(
 
 	if (lifecycle.lifecycle_state === "failed") addRecoveryReason(reasons, "worker_lifecycle_failed");
 	if (lifecycle.lifecycle_state === "stopped") addRecoveryReason(reasons, "worker_lifecycle_stopped");
-	const staleMs = runtime.parseDurationEnv(env, "GJC_TEAM_HEARTBEAT_STALE_MS", 120_000);
+	const staleMs = runtime.parseHeartbeatStaleMs(env);
 	const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? worker.last_heartbeat);
 	if (staleMs > 0 && Number.isFinite(heartbeatAt) && runtime.nowMs() - heartbeatAt >= staleMs)
 		addRecoveryReason(reasons, "stale_heartbeat");

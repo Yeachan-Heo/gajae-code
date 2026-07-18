@@ -3406,6 +3406,20 @@ describe("stalled worker continuation protocol", () => {
 		}
 	});
 
+	it("disables continuation, stale recovery, and stale-heartbeat nudges for non-positive thresholds", async () => {
+		for (const threshold of ["0", "-1"]) {
+			const fixture = await prepareContinuation(
+				`continuation-disabled-threshold-${threshold.replace("-", "negative")}-team`,
+			);
+			const env = { ...fixture.env, GJC_TEAM_HEARTBEAT_STALE_MS: threshold };
+			await monitorGjcTeam(fixture.teamName, cleanupRoot!, env);
+			expect(fixture.dispatches, threshold).toHaveLength(0);
+			const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, env);
+			expect(task.claim, threshold).toBeDefined();
+			expect(await readEvents(fixture.stateDir), threshold).not.toContain("stale_heartbeat");
+		}
+	});
+
 	it("revalidates canonical claim and task authority immediately before continuation dispatch", async () => {
 		for (const scenario of [
 			"claim_deleted",
@@ -3415,6 +3429,7 @@ describe("stalled worker continuation protocol", () => {
 			"task_owner_changed",
 			"task_assignee_changed",
 			"task_version_changed",
+			"second_claim_added",
 		] as const) {
 			const fixture = await prepareContinuation(`continuation-pre-dispatch-${scenario}-team`);
 			__setGjcTeamRuntimeTestSeamsForTests({
@@ -3427,6 +3442,18 @@ describe("stalled worker continuation protocol", () => {
 					else if (scenario === "claim_token_changed") {
 						const claim = await Bun.file(claimPath).json();
 						await Bun.write(claimPath, `${JSON.stringify({ ...claim, token: "replaced-token" })}\n`);
+					} else if (scenario === "second_claim_added") {
+						const task = await Bun.file(taskPath).json();
+						const claim = {
+							owner: "worker-1",
+							token: "second-claim-token",
+							leased_until: task.claim.leased_until,
+						};
+						await Bun.write(
+							path.join(fixture.stateDir, "tasks", "task-2.json"),
+							`${JSON.stringify({ ...task, id: "task-2", claim })}\n`,
+						);
+						await Bun.write(path.join(fixture.stateDir, "claims", "task-2.json"), `${JSON.stringify(claim)}\n`);
 					} else {
 						const task = await Bun.file(taskPath).json();
 						await Bun.write(

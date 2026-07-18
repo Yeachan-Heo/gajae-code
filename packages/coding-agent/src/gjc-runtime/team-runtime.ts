@@ -779,6 +779,40 @@ async function readGjcContinuationAuthorityInventory(dir: string): Promise<GjcCo
 	return { valid: true, tasks, claims };
 }
 
+type GjcContinuationWorkerAuthority =
+	| { valid: true; task: GjcTeamTask & { claim: GjcTeamTaskClaim }; claim: GjcTeamTaskClaim }
+	| { valid: false; taskCount: number; claimCount: number };
+
+function selectGjcContinuationWorkerAuthority(
+	inventory: Extract<GjcContinuationAuthorityInventory, { valid: true }>,
+	worker: string,
+): GjcContinuationWorkerAuthority {
+	const tasks = inventory.tasks.filter(
+		task =>
+			task.status === "in_progress" &&
+			task.claim?.owner === worker &&
+			task.assignee === worker &&
+			task.owner === worker,
+	);
+	const claims = [...inventory.claims.entries()]
+		.filter(([, claim]) => claim.owner === worker)
+		.map(([taskId, claim]) => ({ taskId, claim }));
+	if (tasks.length !== 1 || claims.length !== 1)
+		return { valid: false, taskCount: tasks.length, claimCount: claims.length };
+	const task = tasks[0];
+	const stored = claims[0];
+	if (
+		!task?.claim ||
+		!stored ||
+		stored.taskId !== task.id ||
+		stored.claim.owner !== task.claim.owner ||
+		stored.claim.token !== task.claim.token ||
+		stored.claim.leased_until !== task.claim.leased_until
+	)
+		return { valid: false, taskCount: tasks.length, claimCount: claims.length };
+	return { valid: true, task: { ...task, claim: task.claim }, claim: stored.claim };
+}
+
 function isPositivePid(value: unknown): value is number {
 	return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
@@ -1240,6 +1274,7 @@ const workerOrchestrationRuntime: GjcTeamWorkerOrchestrationRuntime = {
 	appendTelemetry,
 	paneBelongsToTeamTarget,
 	parseDurationEnv,
+	parseHeartbeatStaleMs,
 	killWorkerPanes,
 	removeCleanCreatedWorktrees,
 	readMonitorSnapshot: dir => readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir)),
@@ -2948,20 +2983,14 @@ async function validateGjcContinuationEligibility(
 		return "invalid_worker_lifecycle_or_status";
 	const inventory = await readGjcContinuationAuthorityInventory(dir);
 	if (!inventory.valid) return "invalid_authority_inventory";
-	const current = inventory.tasks.find(candidate => candidate.id === task.id);
-	const storedClaim = inventory.claims.get(task.id);
+	const authority = selectGjcContinuationWorkerAuthority(inventory, worker.id);
 	if (
-		current?.status !== "in_progress" ||
-		current.version !== task.version ||
-		current.assignee !== worker.id ||
-		current.owner !== worker.id ||
-		current.claim?.owner !== task.claim?.owner ||
-		current.claim?.token !== task.claim?.token ||
-		current.claim?.leased_until !== task.claim?.leased_until ||
-		!storedClaim ||
-		storedClaim.owner !== task.claim?.owner ||
-		storedClaim.token !== task.claim?.token ||
-		storedClaim.leased_until !== task.claim?.leased_until
+		!authority.valid ||
+		authority.task.id !== task.id ||
+		authority.task.version !== task.version ||
+		authority.task.claim?.owner !== task.claim?.owner ||
+		authority.task.claim?.token !== task.claim?.token ||
+		authority.task.claim?.leased_until !== task.claim?.leased_until
 	)
 		return "claim_changed";
 	const leaseUntil = Date.parse(task.claim?.leased_until ?? "");
@@ -3015,7 +3044,7 @@ async function continueStalledGjcTeamWorkers(
 		});
 		return;
 	}
-	const staleMs = parseDurationEnv(env, "GJC_TEAM_HEARTBEAT_STALE_MS", 120_000);
+	const staleMs = parseHeartbeatStaleMs(env);
 	if (staleMs <= 0) return;
 	const inventory = await readGjcContinuationAuthorityInventory(dir);
 	if (!inventory.valid) {
@@ -3026,7 +3055,6 @@ async function continueStalledGjcTeamWorkers(
 		});
 		return;
 	}
-	const { tasks, claims } = inventory;
 	for (const worker of config.workers) {
 		const heartbeat = await readWorkerHeartbeat(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
 		const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? "");
@@ -3067,36 +3095,17 @@ async function continueStalledGjcTeamWorkers(
 			continue;
 		}
 
-		const claimedTasks = tasks.filter(
-			candidate =>
-				candidate.status === "in_progress" &&
-				candidate.claim?.owner === worker.id &&
-				candidate.assignee === worker.id &&
-				candidate.owner === worker.id,
-		);
-		const workerClaims = [...claims.entries()]
-			.filter(([, claim]) => claim.owner === worker.id)
-			.map(([taskId, claim]) => ({ taskId, claim }));
-		if (claimedTasks.length !== 1 || workerClaims.length !== 1) {
+		const authority = selectGjcContinuationWorkerAuthority(inventory, worker.id);
+		if (!authority.valid) {
 			await appendEvent(dir, {
 				type: "continuation_skipped",
 				worker: worker.id,
 				message: "Continuation requires exactly one canonical current in-progress claim",
-				data: { reason: "invalid_claim_count", task_count: claimedTasks.length, claim_count: workerClaims.length },
+				data: { reason: "invalid_claim_count", task_count: authority.taskCount, claim_count: authority.claimCount },
 			});
 			continue;
 		}
-		const task = claimedTasks[0];
-		if (!task?.claim) continue;
-		const storedClaim = workerClaims[0]?.claim;
-		if (
-			storedClaim === undefined ||
-			workerClaims[0]?.taskId !== task.id ||
-			storedClaim.token !== task.claim.token ||
-			storedClaim.leased_until !== task.claim.leased_until ||
-			storedClaim.owner !== task.claim.owner
-		)
-			continue;
+		const task = authority.task;
 		const eligibilityReason = await validateGjcContinuationEligibility(
 			dir,
 			config,
@@ -3385,6 +3394,13 @@ function parseDurationEnv(env: NodeJS.ProcessEnv, name: string, fallbackMs: numb
 	const parsed = Number(raw);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallbackMs;
 }
+
+function parseHeartbeatStaleMs(env: NodeJS.ProcessEnv): number {
+	const raw = env.GJC_TEAM_HEARTBEAT_STALE_MS?.trim();
+	if (!raw) return 120_000;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) ? parsed : 120_000;
+}
 async function writeLifecycleNudge(
 	dir: string,
 	worker: string,
@@ -3445,7 +3461,7 @@ async function computeLifecycleNudges(
 	env: NodeJS.ProcessEnv,
 ): Promise<void> {
 	const startupGraceMs = parseDurationEnv(env, "GJC_TEAM_STARTUP_GRACE_MS", 30_000);
-	const heartbeatStaleMs = parseDurationEnv(env, "GJC_TEAM_HEARTBEAT_STALE_MS", 120_000);
+	const heartbeatStaleMs = parseHeartbeatStaleMs(env);
 	const createdAt = Date.parse(config.created_at);
 	const ageMs = Date.now() - (Number.isFinite(createdAt) ? createdAt : Date.now());
 	for (const worker of config.workers) {
@@ -3465,7 +3481,7 @@ async function computeLifecycleNudges(
 			GJC_TEAM_STATE_ROOT: config.state_root,
 		});
 		const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? worker.last_heartbeat);
-		if (Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt >= heartbeatStaleMs) {
+		if (heartbeatStaleMs > 0 && Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt >= heartbeatStaleMs) {
 			await writeLifecycleNudge(
 				dir,
 				worker.id,
