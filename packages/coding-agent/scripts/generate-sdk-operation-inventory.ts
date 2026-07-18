@@ -257,6 +257,8 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"slash_command:new": "session.new",
 	"slash_command:compact": "compaction.run",
 	"slash_command:resume": "session.resume",
+	"slash_command:branch": "session.branch",
+	"slash_command:fork": "session.fork",
 	"slash_command:retry": "retry.last",
 	"slash_command:background": "bash.background",
 	"slash_command:rename": "session.rename",

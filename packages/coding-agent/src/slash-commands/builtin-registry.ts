@@ -1179,6 +1179,44 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			runtime.ctx.editor.setText("");
 		},
 	},
+	{
+		name: "branch",
+		description: "Branch from an earlier user message into a new session",
+		// Keep invalid argument forms inside the TUI command path so session
+		// control typos cannot fall through as literal model prompts.
+		allowArgs: true,
+		handleTui: (command, runtime) => {
+			if (command.args.trim().length > 0) {
+				runtime.ctx.showError("Usage: /branch");
+				if (canClearComposer(runtime)) {
+					runtime.ctx.editor.setText("");
+				}
+				return;
+			}
+			runtime.ctx.showUserMessageSelector();
+			if (canClearComposer(runtime)) {
+				runtime.ctx.editor.setText("");
+			}
+		},
+	},
+	{
+		name: "fork",
+		description: "Fork the current session",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			if (command.args.trim().length > 0) {
+				runtime.ctx.showError("Usage: /fork");
+				if (canClearComposer(runtime)) {
+					runtime.ctx.editor.setText("");
+				}
+				return;
+			}
+			if (canClearComposer(runtime)) {
+				runtime.ctx.editor.setText("");
+			}
+			await runtime.ctx.handleForkCommand();
+		},
+	},
 
 	{
 		name: "provider",
