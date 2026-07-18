@@ -988,6 +988,53 @@ describe("notifications config", () => {
 			missingSettings.getStorage()?.close();
 		}
 	});
+	test("recovered YAML syntax is read-only until config.yml is repaired", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-settings-syntax-recovery-"));
+		tempDirs.push(root);
+		const agentDir = path.join(root, "agent");
+		const configPath = path.join(agentDir, "config.yml");
+		const malformed = "notifications: [\n";
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(configPath, malformed);
+
+		const settings = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			expect(settings.getSchemaReport()).toEqual({
+				valid: false,
+				issues: [
+					{
+						path: "config.yml",
+						kind: "invalid",
+						detail: "Configuration YAML syntax is invalid; repair config.yml before changing settings.",
+					},
+				],
+			});
+			expect(() => settings.set("theme.dark", "blue-crab")).toThrow("Repair config.yml");
+			expect(() => settings.unset("theme.dark")).toThrow("Repair config.yml");
+			await expect(
+				settings.commitAtomicBatch([{ path: "theme.dark", op: "set", value: "blue-crab" }]),
+			).rejects.toThrow("Repair config.yml");
+			await expect(
+				settings.commitAtomicBatchWithCurrent(() => [{ path: "theme.dark", op: "set", value: "blue-crab" }]),
+			).rejects.toThrow("Repair config.yml");
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			await settings.flush();
+			expect(fs.readFileSync(configPath, "utf8")).toBe(malformed);
+
+			fs.writeFileSync(configPath, "theme:\n  dark: blue-crab\n");
+			await settings.flush();
+			expect(settings.getSchemaReport()).toEqual({ issues: [], valid: true });
+			settings.set("theme.dark", "red-claw");
+			await settings.flushOrThrow();
+			expect(YAML.parse(fs.readFileSync(configPath, "utf8"))).toMatchObject({ theme: { dark: "red-claw" } });
+		} finally {
+			settings.getStorage()?.close();
+		}
+
+		const isolated = Settings.isolated();
+		isolated.set("theme.dark", "blue-crab");
+		expect(isolated.get("theme.dark")).toBe("blue-crab");
+	});
 
 	test("project notification settings are ignored without leaking credentials", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-project-boundary-"));
