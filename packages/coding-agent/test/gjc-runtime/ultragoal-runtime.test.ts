@@ -45,10 +45,13 @@ beforeEach(() => {
 	savedSessionFile = process.env.GJC_SESSION_FILE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	delete process.env.GJC_SESSION_FILE;
+	savedCiDevChangedPaths = { value: process.env.CI_DEV_CHANGED_PATHS };
+	delete process.env.CI_DEV_CHANGED_PATHS;
 });
 
+/** Keep ordinary fixtures outside the contributor worktree so its live diff cannot change quality-gate requirements. */
 async function tempDir(): Promise<string> {
-	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-ultragoal-runtime-"));
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ultragoal-runtime-"));
 	tempRoots.push(dir);
 	return dir;
 }
