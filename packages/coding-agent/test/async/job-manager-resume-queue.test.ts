@@ -41,7 +41,7 @@ function spawnControllable(manager: AsyncJobManager, subagentId: string, ownerId
 		sessionFile: `/tmp/${subagentId}.jsonl`,
 		resumable: true,
 	});
-	manager.registerLiveHandle(subagentId, {
+	manager.registerLiveHandle(subagentId, jobId, {
 		requestPause() {
 			pauseRequested = true;
 		},

@@ -133,6 +133,16 @@ export interface SubagentLiveHandle {
 	): Promise<void>;
 }
 
+interface AttemptLiveHandle {
+	jobId: string;
+	handle: SubagentLiveHandle;
+}
+
+interface AttemptSubagentProgress {
+	jobId: string;
+	progress: AgentProgress;
+}
+
 /**
  * Canonical, stable-id-keyed record for a subagent. Survives `AsyncJob`
  * eviction so resume stays addressable by subagent id, and is the single source
@@ -374,8 +384,8 @@ export class AsyncJobManager {
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
 	readonly #subagentRecords = new Map<string, SubagentRecord>();
-	readonly #liveHandles = new Map<string, SubagentLiveHandle>();
-	readonly #subagentProgress = new Map<string, AgentProgress>();
+	readonly #liveHandles = new Map<string, AttemptLiveHandle>();
+	readonly #subagentProgress = new Map<string, AttemptSubagentProgress>();
 	readonly #resumeQueue: ResumeQueueEntry[] = [];
 	#resumeSeq = 0;
 	#resumeRunner?: ResumeRunner;
@@ -492,6 +502,9 @@ export class AsyncJobManager {
 				});
 			}
 		};
+		this.#jobs.set(id, job);
+		this.#notifyChange();
+
 		job.promise = (async () => {
 			try {
 				const result = await run({ jobId: id, signal: abortController.signal, reportProgress });
@@ -546,9 +559,6 @@ export class AsyncJobManager {
 				this.#drainResumeQueue();
 			}
 		})();
-
-		this.#jobs.set(id, job);
-		this.#notifyChange();
 		return id;
 	}
 
@@ -575,6 +585,7 @@ export class AsyncJobManager {
 		this.#runLifecycle(id, "cancel");
 		job.status = "cancelled";
 		this.#freezeEndTime(job);
+		this.#markRecordTerminal(id, "cancelled");
 		job.abortController.abort();
 		return true;
 	}
@@ -710,16 +721,26 @@ export class AsyncJobManager {
 		return out;
 	}
 
-	registerLiveHandle(subagentId: string, handle: SubagentLiveHandle): void {
-		this.#liveHandles.set(subagentId, handle);
+	registerLiveHandle(subagentId: string, attemptJobId: string, handle: SubagentLiveHandle): boolean {
+		const record = this.#subagentRecords.get(subagentId);
+		const job = this.#jobs.get(attemptJobId);
+		if (!record || record.currentJobId !== attemptJobId || record.status !== "running" || job?.status !== "running") {
+			return false;
+		}
+		this.#liveHandles.set(subagentId, { jobId: attemptJobId, handle });
+		return true;
 	}
 
 	getLiveHandle(subagentId: string): SubagentLiveHandle | undefined {
-		return this.#liveHandles.get(subagentId);
+		const record = this.#subagentRecords.get(subagentId);
+		const entry = this.#liveHandles.get(subagentId);
+		if (!record || record.status !== "running" || !entry || entry.jobId !== record.currentJobId) return undefined;
+		return entry.handle;
 	}
 
-	removeLiveHandle(subagentId: string): void {
-		this.#liveHandles.delete(subagentId);
+	removeLiveHandle(subagentId: string, attemptJobId: string): void {
+		const entry = this.#liveHandles.get(subagentId);
+		if (entry?.jobId === attemptJobId) this.#liveHandles.delete(subagentId);
 	}
 
 	/**
@@ -731,27 +752,46 @@ export class AsyncJobManager {
 	 * task runs that share the executor path) so the map only holds detached
 	 * subagent progress and never accumulates untracked foreground task state.
 	 */
-	recordSubagentProgress(subagentId: string, progress: AgentProgress): void {
-		if (!this.#subagentRecords.has(subagentId)) return;
-		this.#subagentProgress.set(subagentId, structuredClone(progress));
+	recordSubagentProgress(subagentId: string, attemptJobId: string, progress: AgentProgress): void {
+		const record = this.#subagentRecords.get(subagentId);
+		if (!record || record.currentJobId !== attemptJobId || record.status !== "running") return;
+		this.#subagentProgress.set(subagentId, { jobId: attemptJobId, progress: structuredClone(progress) });
 	}
 
 	getSubagentProgress(subagentId: string): AgentProgress | undefined {
-		return this.#subagentProgress.get(subagentId);
+		const record = this.#subagentRecords.get(subagentId);
+		const entry = this.#subagentProgress.get(subagentId);
+		if (!record || entry?.jobId !== record.currentJobId) return undefined;
+		return entry.progress;
 	}
 
 	/**
-	 * True only when a live, in-session progress producer exists for this id: a
-	 * canonical registered record with a live handle or an in-memory running job.
-	 * False for `SubagentTool` backward-compat job synthesis and resumed-from-disk
-	 * records, which have no live producer to stream from.
+	 * True only when the canonical running record has a live handle for its
+	 * current attempt.
 	 */
 	hasLiveSubagent(subagentId: string, filter?: AsyncJobFilter): boolean {
-		const rec = this.getSubagentRecord(subagentId, filter);
-		if (!rec) return false;
-		if (this.#liveHandles.has(rec.subagentId)) return true;
-		const job = rec.currentJobId ? this.#jobs.get(rec.currentJobId) : undefined;
-		return job?.status === "running";
+		const record = this.getSubagentRecord(subagentId, filter);
+		const entry = record && this.#liveHandles.get(record.subagentId);
+		return record?.status === "running" && entry?.jobId === record.currentJobId;
+	}
+
+	async steerSubagent(
+		subagentId: string,
+		message: string,
+		opts: { filter?: AsyncJobFilter; pause?: boolean; fromAgentId?: string } = {},
+	): Promise<"delivered" | "no-live-handle" | "superseded" | "not-running"> {
+		const record = this.getSubagentRecord(subagentId, opts.filter);
+		if (!record || record.status !== "running") return "not-running";
+		const attemptJobId = record.currentJobId;
+		const entry = this.#liveHandles.get(record.subagentId);
+		if (!attemptJobId || !entry || entry.jobId !== attemptJobId) return "no-live-handle";
+
+		await entry.handle.injectMessage(message, "steer", { fromAgentId: opts.fromAgentId });
+
+		const current = this.getSubagentRecord(subagentId, opts.filter);
+		if (!current || current.status !== "running" || current.currentJobId !== attemptJobId) return "superseded";
+		if (opts.pause === true) this.pauseSubagent(subagentId, opts.filter);
+		return "delivered";
 	}
 
 	/** Install the TaskTool-owned resume runner. Returns the new job id, or undefined on failure. */
@@ -1039,9 +1079,10 @@ export class AsyncJobManager {
 		const rec = this.getSubagentRecord(subagentId, filter);
 		if (!rec) return { ok: false, reason: "not_found" };
 		if (rec.status !== "running") return { ok: false, status: rec.status, reason: "not_running" };
-		const handle = this.#liveHandles.get(rec.subagentId);
-		if (!handle) return { ok: false, status: rec.status, reason: "no_live_handle" };
-		handle.requestPause();
+		const entry = this.#liveHandles.get(rec.subagentId);
+		if (!entry || entry.jobId !== rec.currentJobId)
+			return { ok: false, status: rec.status, reason: "no_live_handle" };
+		entry.handle.requestPause();
 		return { ok: true, status: rec.status };
 	}
 
@@ -1092,8 +1133,9 @@ export class AsyncJobManager {
 			return { ok: false, status: rec.status, reason: "owner_shutdown_in_progress" };
 		}
 		const prevJobId = rec.currentJobId;
-		// Clear any retained progress from the previous run so a resumed subagent
-		// never renders the prior run's tool/output as live before it emits again.
+		// Clear state from the previous run so a resumed subagent never exposes
+		// prior-attempt control or progress before the new attempt registers.
+		this.#liveHandles.delete(rec.subagentId);
 		this.#subagentProgress.delete(rec.subagentId);
 		const runner = this.#resolveResumeRunner(rec.subagentId);
 		const newJobId = runner?.(rec.subagentId, message, this.#resumeDescriptors.get(rec.subagentId));

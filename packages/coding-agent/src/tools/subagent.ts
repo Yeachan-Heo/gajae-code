@@ -262,11 +262,20 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			} else {
 				if (!record.sessionFile) throw new ToolError(`Subagent ${record.subagentId} has no session file.`);
 				if (record.status === "running") {
-					const handle = manager.getLiveHandle(record.subagentId);
-					if (!handle) throw new ToolError(`Subagent ${record.subagentId} has no live handle.`);
-					const fromAgentId = this.session.getAgentId?.() ?? undefined;
-					await handle.injectMessage(message, "steer", { fromAgentId });
-					if (params.pause === true) manager.pauseSubagent(record.subagentId, ownerFilter);
+					const result = await manager.steerSubagent(record.subagentId, message, {
+						filter: ownerFilter,
+						pause: params.pause === true,
+						fromAgentId: this.session.getAgentId?.() ?? undefined,
+					});
+					if (result === "no-live-handle") {
+						throw new ToolError(`Subagent ${record.subagentId} is still initializing and has no live handle.`);
+					}
+					if (result === "superseded") {
+						throw new ToolError(`Subagent ${record.subagentId} was superseded while steering.`);
+					}
+					if (result === "not-running") {
+						throw new ToolError(`Subagent ${record.subagentId} is no longer running.`);
+					}
 					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 					steerStates.set(record.subagentId, "queued");
 				} else {

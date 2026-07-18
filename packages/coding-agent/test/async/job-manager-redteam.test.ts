@@ -156,8 +156,8 @@ describe("AsyncJobManager red-team invariants", () => {
 		);
 		manager.registerSubagentRecord(record("terminal-sub", terminalJobId, "running"));
 		manager.registerResumeDescriptor(descriptor("terminal-sub"));
-		manager.registerLiveHandle("terminal-sub", { requestPause() {}, async injectMessage() {} });
-		manager.recordSubagentProgress("terminal-sub", { currentTool: "terminal" } as never);
+		manager.registerLiveHandle("terminal-sub", terminalJobId, { requestPause() {}, async injectMessage() {} });
+		manager.recordSubagentProgress("terminal-sub", terminalJobId, { currentTool: "terminal" } as never);
 
 		await manager.waitForAll();
 		expect(manager.getJob(terminalJobId)).toBeUndefined();
@@ -174,8 +174,8 @@ describe("AsyncJobManager red-team invariants", () => {
 		);
 		manager.registerSubagentRecord(record("paused-sub", pausedJobId, "running"));
 		manager.registerResumeDescriptor(descriptor("paused-sub"));
-		manager.registerLiveHandle("paused-sub", { requestPause() {}, async injectMessage() {} });
-		manager.recordSubagentProgress("paused-sub", { currentTool: "paused" } as never);
+		manager.registerLiveHandle("paused-sub", pausedJobId, { requestPause() {}, async injectMessage() {} });
+		manager.recordSubagentProgress("paused-sub", pausedJobId, { currentTool: "paused" } as never);
 
 		await manager.waitForAll();
 		expect(manager.getJob(pausedJobId)?.status).toBe("paused");

@@ -165,11 +165,11 @@ describe("AsyncJobManager bounded dispose and delivery", () => {
 		const terminalJobId = manager.register("task", "terminal", async () => "done", { id: "terminal-job" });
 		manager.registerSubagentRecord(subagentRecord("terminal-sub", terminalJobId, "running"));
 		manager.registerResumeDescriptor(resumeDescriptor("terminal-sub"));
-		manager.registerLiveHandle("terminal-sub", {
+		manager.registerLiveHandle("terminal-sub", terminalJobId, {
 			requestPause: () => {},
 			injectMessage: async () => {},
 		});
-		manager.recordSubagentProgress("terminal-sub", { currentTool: "test" } as never);
+		manager.recordSubagentProgress("terminal-sub", terminalJobId, { currentTool: "test" } as never);
 
 		await manager.waitForAll();
 		expect(manager.getSubagentRecord("terminal-sub")?.resumable).toBe(true);
@@ -182,11 +182,11 @@ describe("AsyncJobManager bounded dispose and delivery", () => {
 		});
 		manager.registerSubagentRecord(subagentRecord("paused-sub", pausedJobId, "running"));
 		manager.registerResumeDescriptor(resumeDescriptor("paused-sub"));
-		manager.registerLiveHandle("paused-sub", {
+		manager.registerLiveHandle("paused-sub", pausedJobId, {
 			requestPause: () => {},
 			injectMessage: async () => {},
 		});
-		manager.recordSubagentProgress("paused-sub", { currentTool: "test" } as never);
+		manager.recordSubagentProgress("paused-sub", pausedJobId, { currentTool: "test" } as never);
 
 		await manager.waitForAll();
 		expect(manager.getSubagentRecord("paused-sub")?.status).toBe("paused");

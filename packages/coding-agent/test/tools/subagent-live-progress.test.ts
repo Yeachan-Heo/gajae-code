@@ -50,6 +50,12 @@ function runningRecord(subagentId: string, jobId: string): SubagentRecord {
 		resumable: false,
 	};
 }
+function registerLiveHandle(manager: AsyncJobManager, subagentId: string, jobId: string): void {
+	manager.registerLiveHandle(subagentId, jobId, {
+		requestPause() {},
+		async injectMessage() {},
+	});
+}
 
 describe("subagent await live progress", () => {
 	afterEach(() => {
@@ -76,8 +82,10 @@ describe("subagent await live progress", () => {
 		// Record progress BEFORE await; no further progress event will fire.
 		manager.recordSubagentProgress(
 			"0-Live",
+			jobId,
 			makeProgress({ id: "0-Live", currentTool: "read", recentOutput: ["scanning files"] }),
 		);
+		registerLiveHandle(manager, "0-Live", jobId);
 
 		const result = await tool.execute("await", { action: "await", ids: ["0-Live"], timeout_ms: 5 });
 		const snap = result.details?.subagents.find(s => s.id === "0-Live");
@@ -122,8 +130,10 @@ describe("subagent await live progress", () => {
 		);
 		manager.registerSubagentRecord(runningRecord("0-A", jobA));
 		manager.registerSubagentRecord(runningRecord("0-B", jobB));
-		manager.recordSubagentProgress("0-A", makeProgress({ id: "0-A", currentTool: "read" }));
-		manager.recordSubagentProgress("0-B", makeProgress({ id: "0-B", currentTool: "bash" }));
+		registerLiveHandle(manager, "0-A", jobA);
+		registerLiveHandle(manager, "0-B", jobB);
+		manager.recordSubagentProgress("0-A", jobA, makeProgress({ id: "0-A", currentTool: "read" }));
+		manager.recordSubagentProgress("0-B", jobB, makeProgress({ id: "0-B", currentTool: "bash" }));
 
 		const result = await tool.execute("await", { action: "await", ids: ["0-A", "0-B"], timeout_ms: 5 });
 		const a = result.details?.subagents.find(s => s.id === "0-A");
@@ -184,7 +194,11 @@ describe("subagent await live progress", () => {
 			},
 		);
 		// Retained progress exists for the id, but there is no live producer for it.
-		manager.recordSubagentProgress("0-Stale", makeProgress({ id: "0-Stale", currentTool: "should-not-render" }));
+		manager.recordSubagentProgress(
+			"0-Stale",
+			"job-stale",
+			makeProgress({ id: "0-Stale", currentTool: "should-not-render" }),
+		);
 
 		const result = await tool.execute("await", { action: "await", ids: ["0-Stale"], timeout_ms: 5 });
 		const snap = result.details?.subagents.find(s => s.id === "0-Stale");
@@ -218,6 +232,7 @@ describe("AsyncJobManager subagent progress retention", () => {
 			},
 		);
 		manager.registerSubagentRecord(runningRecord("0-Live", jobId));
+		registerLiveHandle(manager, "0-Live", jobId);
 
 		expect(manager.hasLiveSubagent("0-Live")).toBe(true);
 		expect(manager.hasLiveSubagent("0-Absent")).toBe(false);
@@ -241,7 +256,7 @@ describe("AsyncJobManager subagent progress retention", () => {
 			},
 		);
 		manager.registerSubagentRecord(runningRecord("0-Clean", jobId));
-		manager.recordSubagentProgress("0-Clean", makeProgress({ id: "0-Clean", currentTool: "read" }));
+		manager.recordSubagentProgress("0-Clean", jobId, makeProgress({ id: "0-Clean", currentTool: "read" }));
 		expect(manager.getSubagentProgress("0-Clean")).toBeDefined();
 
 		manager.cancelSubagent("0-Clean", { ownerId: "0-Main" });
@@ -253,7 +268,11 @@ describe("AsyncJobManager subagent progress retention", () => {
 
 	it("ignores progress for ids without a canonical subagent record (foreground task isolation)", () => {
 		const manager = createManager();
-		manager.recordSubagentProgress("0-Foreground", makeProgress({ id: "0-Foreground", currentTool: "read" }));
+		manager.recordSubagentProgress(
+			"0-Foreground",
+			"no-job",
+			makeProgress({ id: "0-Foreground", currentTool: "read" }),
+		);
 		expect(manager.getSubagentProgress("0-Foreground")).toBeUndefined();
 	});
 
@@ -277,11 +296,12 @@ describe("AsyncJobManager subagent progress retention", () => {
 			ownerId: "0-Main",
 			currentJobId: firstJob,
 			historicalJobIds: [],
-			status: "paused",
+			status: "running",
 			sessionFile: "/tmp/0-Resume.jsonl",
 			resumable: true,
 		});
-		manager.recordSubagentProgress("0-Resume", makeProgress({ id: "0-Resume", currentTool: "old-tool" }));
+		manager.recordSubagentProgress("0-Resume", firstJob, makeProgress({ id: "0-Resume", currentTool: "old-tool" }));
+		manager.getSubagentRecord("0-Resume")!.status = "paused";
 		expect(manager.getSubagentProgress("0-Resume")).toBeDefined();
 
 		manager.setResumeRunner(() =>
@@ -308,9 +328,18 @@ describe("AsyncJobManager subagent progress retention", () => {
 
 	it("deep-clones retained progress so later mutation cannot corrupt it", () => {
 		const manager = createManager();
-		manager.registerSubagentRecord(runningRecord("0-Clone", "job-clone"));
+		const cloneJob = manager.register(
+			"task",
+			"clone",
+			async () => {
+				await Bun.sleep(100);
+				return "done";
+			},
+			{ id: "job-clone" },
+		);
+		manager.registerSubagentRecord(runningRecord("0-Clone", cloneJob));
 		const live = makeProgress({ id: "0-Clone", recentOutput: ["one"] });
-		manager.recordSubagentProgress("0-Clone", live);
+		manager.recordSubagentProgress("0-Clone", cloneJob, live);
 		live.recentOutput.push("two");
 		live.currentTool = "mutated";
 
@@ -506,7 +535,8 @@ describe("subagent await emit gating", () => {
 				},
 			);
 			manager.registerSubagentRecord(runningRecord(id, jobId));
-			manager.recordSubagentProgress(id, makeProgress({ id, currentTool: "read", recentOutput: ["scan"] }));
+			registerLiveHandle(manager, id, jobId);
+			manager.recordSubagentProgress(id, jobId, makeProgress({ id, currentTool: "read", recentOutput: ["scan"] }));
 		});
 
 		const ac = new AbortController();
@@ -524,7 +554,11 @@ describe("subagent await emit gating", () => {
 		for (const spy of spies) expect(spy).toHaveBeenCalledTimes(1);
 
 		// A real progress change on 0-A emits exactly once; idle peers stay quiet.
-		manager.recordSubagentProgress("0-A", makeProgress({ id: "0-A", currentTool: "bash", recentOutput: ["scan"] }));
+		manager.recordSubagentProgress(
+			"0-A",
+			"job-0-A",
+			makeProgress({ id: "0-A", currentTool: "bash", recentOutput: ["scan"] }),
+		);
 		vi.advanceTimersByTime(500);
 		expect(spies[0]).toHaveBeenCalledTimes(2);
 		expect(spies[1]).toHaveBeenCalledTimes(1);

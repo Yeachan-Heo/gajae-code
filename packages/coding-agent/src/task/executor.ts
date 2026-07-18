@@ -182,6 +182,8 @@ export interface ExecutorOptions {
 	runMode?: "initial" | "resume" | "message";
 	resumeMessage?: string;
 	subagentId?: string;
+	/** Async job id for this detached subagent attempt. */
+	attemptJobId?: string;
 	/**
 	 * Active model selector of the parent session, used as an auth-aware fallback
 	 * if the resolved subagent model has no working credentials. See #985.
@@ -1529,8 +1531,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 			const liveSubagentId = options.subagentId ?? id;
 			const manager = AsyncJobManager.instance();
-			if (manager) {
-				manager.registerLiveHandle(liveSubagentId, {
+			if (manager && options.attemptJobId) {
+				manager.registerLiveHandle(liveSubagentId, options.attemptJobId, {
 					requestPause: () => {
 						pauseRequested = true;
 					},
@@ -1839,7 +1841,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (exitCode === 0) exitCode = 1;
 			}
 			sessionAbortController.abort();
-			AsyncJobManager.instance()?.removeLiveHandle(options.subagentId ?? id);
+			if (options.attemptJobId)
+				AsyncJobManager.instance()?.removeLiveHandle(options.subagentId ?? id, options.attemptJobId);
 			if (unsubscribe) {
 				try {
 					unsubscribe();

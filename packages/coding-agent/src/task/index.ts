@@ -564,7 +564,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				return manager.register(
 					"task",
 					descriptor.task.id,
-					async ({ signal: runSignal }) => {
+					async ({ jobId: attemptJobId, signal: runSignal }) => {
 						const result = await this.#executeSync(
 							descriptor.toolCallId,
 							{ ...descriptor.params, tasks: [descriptor.task] },
@@ -576,6 +576,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								runMode: message ? "message" : "resume",
 								resumeMessage: message,
 								sessionFiles: new Map([[descriptor.task.id, descriptor.sessionFile]]),
+								attemptJobId,
 								suppressRoiReconciliation: true,
 							},
 						);
@@ -656,7 +657,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const jobId = manager.register(
 					"task",
 					label,
-					async ({ signal: runSignal, reportProgress }) => {
+					async ({ jobId: attemptJobId, signal: runSignal, reportProgress }) => {
 						const startedAt = Date.now();
 						const progress = progressByTaskId.get(taskItem.id);
 						await semaphore.acquire();
@@ -684,6 +685,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								frozenForkSeeds,
 								{
 									sessionFiles: new Map([[uniqueId, subtaskSessionFile]]),
+									attemptJobId,
 									suppressRoiReconciliation: true,
 								},
 							);
@@ -892,6 +894,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			runMode?: "initial" | "resume" | "message";
 			resumeMessage?: string;
 			sessionFiles?: ReadonlyMap<string, string | null>;
+			attemptJobId?: string;
 			/**
 			 * Set for per-child async runs: the spawnPlan is carried for gate
 			 * consistency, but batch-level ROI reconciliation must not be computed
@@ -1321,6 +1324,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						runMode: overrides?.runMode ?? executionOverrides?.runMode,
 						resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
 						subagentId: task.id,
+						attemptJobId: executionOverrides?.attemptJobId,
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
@@ -1339,7 +1343,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							progressMap.set(index, {
 								...structuredClone(progress),
 							});
-							AsyncJobManager.instance()?.recordSubagentProgress(task.id, progress);
+							if (executionOverrides?.attemptJobId) {
+								AsyncJobManager.instance()?.recordSubagentProgress(
+									task.id,
+									executionOverrides.attemptJobId,
+									progress,
+								);
+							}
 							emitProgress();
 						},
 						authStorage: this.session.authStorage,
@@ -1385,6 +1395,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						runMode: overrides?.runMode ?? executionOverrides?.runMode,
 						resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
 						subagentId: task.id,
+						attemptJobId: executionOverrides?.attemptJobId,
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
@@ -1403,7 +1414,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							progressMap.set(index, {
 								...structuredClone(progress),
 							});
-							AsyncJobManager.instance()?.recordSubagentProgress(task.id, progress);
+							if (executionOverrides?.attemptJobId) {
+								AsyncJobManager.instance()?.recordSubagentProgress(
+									task.id,
+									executionOverrides.attemptJobId,
+									progress,
+								);
+							}
 							emitProgress();
 						},
 						authStorage: this.session.authStorage,

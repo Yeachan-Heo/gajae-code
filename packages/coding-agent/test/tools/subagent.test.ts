@@ -25,6 +25,21 @@ function createManager(): AsyncJobManager {
 	AsyncJobManager.setInstance(manager);
 	return manager;
 }
+function registerRunningAttempt(manager: AsyncJobManager, subagentId: string, ownerId: string): string {
+	return manager.register(
+		"task",
+		subagentId,
+		async ({ signal }) => {
+			await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+			throw new Error("cancelled");
+		},
+		{
+			id: `job-${subagentId}`,
+			ownerId,
+			metadata: { subagent: { id: subagentId, agent: "executor", agentSource: "bundled" } },
+		},
+	);
+}
 
 function getText(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content.find(part => part.type === "text")?.text ?? "";
@@ -349,16 +364,17 @@ describe("SubagentTool", () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());
 		let pauseRequested = false;
+		const pauseJobId = registerRunningAttempt(manager, "0-Pause", "0-Main");
 		manager.registerSubagentRecord({
 			subagentId: "0-Pause",
 			ownerId: "0-Main",
-			currentJobId: null,
+			currentJobId: pauseJobId,
 			historicalJobIds: [],
 			status: "running",
 			sessionFile: "/tmp/0-Pause.jsonl",
 			resumable: true,
 		});
-		manager.registerLiveHandle("0-Pause", {
+		manager.registerLiveHandle("0-Pause", pauseJobId, {
 			requestPause() {
 				pauseRequested = true;
 			},
@@ -447,16 +463,17 @@ describe("SubagentTool", () => {
 		let injected: string | undefined;
 		let injectedFrom: string | undefined;
 		let pauseRequested = false;
+		const steerJobId = registerRunningAttempt(manager, "0-Steer", "0-Main");
 		manager.registerSubagentRecord({
 			subagentId: "0-Steer",
 			ownerId: "0-Main",
-			currentJobId: null,
+			currentJobId: steerJobId,
 			historicalJobIds: [],
 			status: "running",
 			sessionFile: "/tmp/0-Steer.jsonl",
 			resumable: true,
 		});
-		manager.registerLiveHandle("0-Steer", {
+		manager.registerLiveHandle("0-Steer", steerJobId, {
 			requestPause() {
 				pauseRequested = true;
 			},
@@ -493,16 +510,17 @@ describe("SubagentTool", () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession("1-Parent"));
 		let injectedFrom: string | undefined;
+		const childJobId = registerRunningAttempt(manager, "2-Child", "1-Parent");
 		manager.registerSubagentRecord({
 			subagentId: "2-Child",
 			ownerId: "1-Parent",
-			currentJobId: null,
+			currentJobId: childJobId,
 			historicalJobIds: [],
 			status: "running",
 			sessionFile: "/tmp/2-Child.jsonl",
 			resumable: true,
 		});
-		manager.registerLiveHandle("2-Child", {
+		manager.registerLiveHandle("2-Child", childJobId, {
 			requestPause() {},
 			async injectMessage(_content, _deliverAs, opts) {
 				injectedFrom = opts?.fromAgentId;
@@ -525,17 +543,23 @@ describe("SubagentTool", () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());
 		const injected: string[] = [];
+		const attemptJobIds = new Map(
+			["0-SteerA", "0-SteerB"].map(subagentId => [
+				subagentId,
+				registerRunningAttempt(manager, subagentId, "0-Main"),
+			]),
+		);
 		for (const subagentId of ["0-SteerA", "0-SteerB"]) {
 			manager.registerSubagentRecord({
 				subagentId,
 				ownerId: "0-Main",
-				currentJobId: null,
+				currentJobId: attemptJobIds.get(subagentId)!,
 				historicalJobIds: [],
 				status: "running",
 				sessionFile: `/tmp/${subagentId}.jsonl`,
 				resumable: true,
 			});
-			manager.registerLiveHandle(subagentId, {
+			manager.registerLiveHandle(subagentId, attemptJobIds.get(subagentId)!, {
 				requestPause() {},
 				async injectMessage(content) {
 					injected.push(`${subagentId}:${content}`);
