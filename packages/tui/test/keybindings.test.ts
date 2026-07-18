@@ -34,6 +34,57 @@ describe("KeybindingsManager", () => {
 		]);
 		expect(keybindings.getKeys("tui.editor.cursorLeft")).toEqual(["left", "ctrl+b"]);
 	});
+
+	describe("user binding ownership", () => {
+		it("clones array bindings passed to the constructor", () => {
+			const bindings = { "tui.select.up": ["down"] as ("down" | "up")[] };
+			const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, bindings);
+
+			bindings["tui.select.up"].push("up");
+
+			expect(keybindings.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(keybindings.getKeys("tui.select.up")).toEqual(["down"]);
+			expect(keybindings.matches("\x1b[B", "tui.select.up")).toBe(true);
+			expect(keybindings.matches("\x1b[A", "tui.select.up")).toBe(false);
+		});
+
+		it("clones array bindings passed to setUserBindings and rebuilds from them", () => {
+			const keybindings = new KeybindingsManager(TUI_KEYBINDINGS);
+			expect(keybindings.getKeys("tui.select.up")).toEqual(["up"]);
+			const bindings = { "tui.select.up": ["down"] as ("down" | "up")[] };
+
+			keybindings.setUserBindings(bindings);
+			bindings["tui.select.up"].push("up");
+
+			expect(keybindings.getKeys("tui.select.up")).toEqual(["down"]);
+			expect(keybindings.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(keybindings.matches("\x1b[B", "tui.select.up")).toBe(true);
+			expect(keybindings.matches("\x1b[A", "tui.select.up")).toBe(false);
+		});
+
+		it("clones array bindings returned from getUserBindings", () => {
+			const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, {
+				"tui.select.up": ["down"],
+				"tui.select.confirm": [],
+				"tui.input.submit": "ctrl+x",
+				"tui.editor.cursorUp": undefined,
+			});
+			const bindings = keybindings.getUserBindings();
+			(bindings["tui.select.up"] as string[]).push("up");
+			(bindings["tui.select.confirm"] as string[]).push("enter");
+
+			expect(keybindings.getUserBindings()).toEqual({
+				"tui.select.up": ["down"],
+				"tui.select.confirm": [],
+				"tui.input.submit": "ctrl+x",
+				"tui.editor.cursorUp": undefined,
+			});
+			expect(keybindings.getKeys("tui.select.up")).toEqual(["down"]);
+			expect(keybindings.getKeys("tui.select.confirm")).toEqual([]);
+			expect(keybindings.matches("\x1b[A", "tui.select.up")).toBe(false);
+			expect(keybindings.matches("\r", "tui.select.confirm")).toBe(false);
+		});
+	});
 });
 
 describe("detectDefaultKeyCollisions", () => {
