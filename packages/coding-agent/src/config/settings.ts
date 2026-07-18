@@ -838,6 +838,15 @@ export class Settings implements NotificationSettingsReader {
 			}
 		}
 		await this.#refreshDurableSettings();
+		if (this.#modified.size > 0 && !this.#pendingSaveSlot) {
+			this.#queueSave();
+			this.#releasePendingSaveSlot();
+			try {
+				await this.#savePromise;
+			} catch {
+				// Keep dirty state for a later explicit flush or mutation.
+			}
+		}
 	}
 
 	/** Like {@link flush}, but reports a durable save failure to the caller. */
@@ -845,8 +854,20 @@ export class Settings implements NotificationSettingsReader {
 		this.#releasePendingSaveSlot();
 		if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 		this.#releasePendingSaveSlot();
-		await this.#savePromise;
+		let saveError: unknown;
+		try {
+			await this.#savePromise;
+		} catch (error) {
+			saveError = error;
+		}
 		await this.#refreshDurableSettings();
+		if (this.#modified.size > 0 && !this.#pendingSaveSlot) {
+			this.#queueSave();
+			this.#releasePendingSaveSlot();
+			await this.#savePromise;
+			return;
+		}
+		if (saveError !== undefined) throw saveError;
 	}
 
 	async cloneForCwd(cwd: string): Promise<Settings> {

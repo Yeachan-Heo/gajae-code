@@ -1272,6 +1272,7 @@ export class SelectorController {
 					},
 					{
 						onChange: (id, value) => this.handleSettingChange(id, value),
+						onError: message => this.ctx.showError(message),
 						onThemePreview: themeName => {
 							return previewTheme(themeName).then(result => {
 								if (!result.success && result.error && !isThemePreviewSuperseded(result)) {

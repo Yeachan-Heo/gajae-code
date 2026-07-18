@@ -593,6 +593,25 @@ describe("Settings", () => {
 		}
 	});
 
+	it("persists a retained dirty patch on the first flush after YAML repair", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		try {
+			settings.set("theme.dark", "blue-crab");
+			await Bun.write(getConfigPath(), "theme: [");
+			await settings.flush();
+
+			expect(settings.canWriteDurableConfig()).toBe(false);
+			expect(settings.get("theme.dark")).toBe("blue-crab");
+
+			await Bun.write(getConfigPath(), "");
+			await settings.flushOrThrow();
+
+			expect(settings.canWriteDurableConfig()).toBe(true);
+			expect((await readSettings()).theme).toEqual({ dark: "blue-crab" });
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
 	it("retains fail-closed recovery state when a durable refresh read fails", async () => {
 		const malformed = "notifications: [";
 		await Bun.write(getConfigPath(), malformed);

@@ -1,4 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -61,6 +64,55 @@ describe("SettingsSelectorComponent memory tab", () => {
 		expect(after).toContain("Memory Backend");
 		expect(after).toContain("Hindsight API URL");
 		expect(after).toContain("Hindsight Auto Recall");
+	});
+	it("reports malformed-YAML repair errors without changing an interactive control", async () => {
+		const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "settings-selector-recovery-"));
+		const agentDir = path.join(testDir, "agent");
+		fs.mkdirSync(agentDir, { recursive: true });
+		resetSettingsForTest();
+		await Bun.write(path.join(agentDir, "config.yml"), "theme: [");
+
+		const errors: string[] = [];
+		const changes: Array<{ path: string; value: unknown }> = [];
+		let cleanupError: unknown;
+		try {
+			await Settings.init({ cwd: testDir, agentDir });
+			const component = new SettingsSelectorComponent(
+				{
+					availableThinkingLevels: [],
+					thinkingLevel: undefined,
+					availableThemes: ["blue-crab"],
+					availableModelProfiles: [],
+					cwd: testDir,
+				},
+				{
+					onChange: (path, value) => changes.push({ path, value }),
+					onError: message => errors.push(message),
+					onCancel: () => {},
+				},
+			);
+
+			component.handleInput("\n");
+			component.handleInput("\n");
+
+			expect(errors).toEqual([
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			]);
+			expect(changes).toEqual([]);
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			component.handleInput("\x1b");
+			expect(component.render(120).join("\n")).toContain("red-claw");
+		} finally {
+			Settings.instance.getStorage()?.close();
+			try {
+				fs.rmSync(testDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+			} catch (error) {
+				if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EBUSY") {
+					cleanupError = error;
+				}
+			}
+		}
+		if (cleanupError) throw cleanupError;
 	});
 
 	it("hides Hindsight rows again when the backend is switched back to off without leaving the tab", () => {
