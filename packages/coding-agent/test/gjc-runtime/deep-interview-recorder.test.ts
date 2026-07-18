@@ -338,6 +338,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			`answer_hash:${persisted.state.rounds[0].answer_hash}`,
 		);
 		expect(JSON.stringify(persisted.state.intent_contract)).not.toContain("123-45-6789");
+		expect(JSON.stringify(persisted.state)).not.toContain("123-45-6789");
 
 		const replay = await appendOrMergeDeepInterviewRound(cwd, statePath, input, { sessionId: TEST_SESSION_ID });
 		expect(replay.action).toBe("noop");
@@ -422,6 +423,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			`answer_hash:${persisted.state.rounds[1].answer_hash}`,
 		);
 		expect(JSON.stringify(persisted.state.intent_review)).not.toContain("private explanation");
+		expect(persisted.state.intent_review.supporting_substitutions[0].rationale).toMatch(/^sha256:[a-f0-9]{64}$/);
 	});
 
 	it("enriches the same record to scored without appending a second", async () => {

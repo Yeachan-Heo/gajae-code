@@ -372,6 +372,7 @@ export type DeepInterviewIntentCategory = (typeof DEEP_INTERVIEW_INTENT_CATEGORI
 
 const INTENT_ID_RE = /^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/;
 const ANSWER_HASH_RE = /^[a-f0-9]{64}$/;
+const INTENT_RATIONALE_REF_RE = /^sha256:[a-f0-9]{64}$/;
 const MAX_INTENT_ITEMS = 64;
 const MAX_INTENT_STATEMENT_LENGTH = 1_000;
 const MAX_INTENT_RATIONALE_LENGTH = 500;
@@ -525,6 +526,11 @@ export function reviewDeepInterviewIntent(
 		)
 			throw new Error("invalid intent substitution");
 	}
+	const redactedSubstitutions = substitutions.map(substitution => ({
+		removed_id: substitution.removed_id,
+		replacement_ids: [...new Set(substitution.replacement_ids)].sort(),
+		rationale: `sha256:${createHash("sha256").update(substitution.rationale.trim()).digest("hex")}`,
+	}));
 	if (input.status !== "not_required" && input.status !== "pending" && input.status !== "approved")
 		throw new Error("invalid intent review status");
 	if (input.status === "not_required") {
@@ -559,6 +565,7 @@ export function reviewDeepInterviewIntent(
 	}
 	return {
 		...input,
+		supporting_substitutions: redactedSubstitutions,
 		version: 1,
 		locked_digest: locked.digest,
 		observed_digest: deepInterviewObservedIntentDigest([...observedIds]),
@@ -617,8 +624,7 @@ export function assertDeepInterviewIntentReview(
 			replacement_ids.length === 0 ||
 			replacement_ids.some(id => typeof id !== "string" || !INTENT_ID_RE.test(id) || !observed.has(id)) ||
 			typeof rationale !== "string" ||
-			!rationale.trim() ||
-			rationale.length > MAX_INTENT_RATIONALE_LENGTH
+			!INTENT_RATIONALE_REF_RE.test(rationale)
 		)
 			throw new Error("invalid intent substitution");
 		substitutionIds.add(removed_id);

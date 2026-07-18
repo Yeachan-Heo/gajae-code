@@ -428,19 +428,18 @@ export async function appendOrMergeDeepInterviewRound(
 ): Promise<{ action: AppendOrMergeAction; record: DeepInterviewRoundRecord; disputedFactIds?: string[] }> {
 	const envelope = await readEnvelope(statePath);
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
-	const shell = buildAnswerShell({ ...input, interviewId });
+	const shell = buildAnswerShell({
+		...input,
+		interviewId,
+		customInput: input.intent_contract || input.intent_review ? undefined : input.customInput,
+	});
 	const rounds = readRounds(envelope);
 	const priorRecord = rounds.find(r => r.round_key === shell.round_key);
 	const result = appendOrMergeRound(rounds, shell);
 	const inner = envelope.state as Record<string, unknown>;
 	let intentStateChanged = false;
 	if (input.intent_contract) {
-		if (
-			input.round !== 0 ||
-			typeof input.component !== "string" ||
-			!input.component.trim() ||
-			input.dimension !== "topology"
-		)
+		if (input.round !== 0 || input.component !== "review-topology" || input.dimension !== "topology")
 			throw new Error("intent contract requires Round 0 topology metadata");
 		const contract = createDeepInterviewIntentManifest(input.intent_contract.items, {
 			round: 0,

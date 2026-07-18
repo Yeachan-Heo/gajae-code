@@ -348,8 +348,8 @@ describe("deep-interview structured metadata red-team", () => {
 						...base,
 						deepInterview: {
 							round,
-							component: "intent",
-							dimension: "goal",
+							component: "review-topology",
+							dimension: "topology",
 							ambiguity: 0.5,
 							intent_contract: contract,
 						},
@@ -361,6 +361,22 @@ describe("deep-interview structured metadata red-team", () => {
 		it("accepts a valid Round-0 contract and rejects invalid contract shapes at the ask boundary", () => {
 			expect(parsed(validContract)).toBe(true);
 			expect(parsed(validContract, 1)).toBe(false);
+			expect(
+				askSchema.safeParse({
+					questions: [
+						{
+							...base,
+							deepInterview: {
+								round: 0,
+								component: "unrelated-component",
+								dimension: "topology",
+								ambiguity: 0.5,
+								intent_contract: validContract,
+							},
+						},
+					],
+				}).success,
+			).toBe(false);
 			expect(
 				parsed({ items: [{ id: "artifact:report", category: "unknown", statement: "Produce an audit report" }] }),
 			).toBe(false);

@@ -120,10 +120,13 @@ const DeepInterviewMeta = z
 	})
 	.strict()
 	.superRefine((value, context) => {
-		if (value.intent_contract && value.round !== 0)
+		if (
+			value.intent_contract &&
+			(value.round !== 0 || value.component !== "review-topology" || value.dimension !== "topology")
+		)
 			context.addIssue({
 				code: "custom",
-				message: "intent_contract is only valid for Round 0",
+				message: "intent_contract requires Round 0 review-topology metadata",
 				path: ["intent_contract"],
 			});
 		if (value.intent_review && value.round === 0)
