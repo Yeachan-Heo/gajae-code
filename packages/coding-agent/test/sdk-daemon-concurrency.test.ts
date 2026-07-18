@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { isProcessIncarnation, processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { ChatEffectJournal, MAX_TERMINAL_CHAT_EFFECTS } from "../src/sdk/bus/chat-effect-journal";
 import {
 	boundedDedupe,
@@ -8,7 +9,6 @@ import {
 	conversationStorePath,
 	MAX_DEDUPE_IDS,
 } from "../src/sdk/bus/conversation-store";
-import { isProcessIncarnation, processIncarnation } from "../src/sdk/broker/process-incarnation";
 import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
 import { MemoryConversationStoreFs } from "./fixtures/chat-daemon-stores";
 
@@ -123,8 +123,14 @@ describe("ConversationStore", () => {
 			pidIncarnation: pid => (pid === 303 ? "darwin:1700000000:123456" : "darwin:1700000000:654321"),
 			lockTimeoutMs: 0,
 		});
-		fs.files.set(`${store.filePath}.lock`, JSON.stringify({ pid: 101, incarnation: "darwin:1700000000:999999", timestamp: 1 }));
-		fs.files.set(`${store.filePath}.lock.reclaim`, JSON.stringify({ pid: 303, incarnation: "darwin:1700000000:123456", timestamp: 1 }));
+		fs.files.set(
+			`${store.filePath}.lock`,
+			JSON.stringify({ pid: 101, incarnation: "darwin:1700000000:999999", timestamp: 1 }),
+		);
+		fs.files.set(
+			`${store.filePath}.lock.reclaim`,
+			JSON.stringify({ pid: 303, incarnation: "darwin:1700000000:123456", timestamp: 1 }),
+		);
 		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
 		expect(fs.files.get(`${store.filePath}.lock.reclaim`)).toBe(
 			JSON.stringify({ pid: 303, incarnation: "darwin:1700000000:123456", timestamp: 1 }),
@@ -132,7 +138,6 @@ describe("ConversationStore", () => {
 	});
 
 	test("default-path lock uses canonical processIncarnation format", async () => {
-		const fs = new MemoryConversationStoreFs();
 		let capturedLock: string | undefined;
 		class CapturingFs extends MemoryConversationStoreFs {
 			override async open(file: string, flags: string) {

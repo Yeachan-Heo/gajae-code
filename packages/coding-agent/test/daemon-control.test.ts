@@ -17,6 +17,11 @@ import {
 } from "../src/daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../src/daemon/runtime";
 import {
+	isProcessIncarnation,
+	parseDarwinProcessIncarnation,
+	processIncarnation,
+} from "../src/sdk/broker/process-incarnation";
+import {
 	acquireChatDaemonOwnership,
 	buildChatDaemonSpawnArgs,
 	ChatDaemonController,
@@ -32,7 +37,6 @@ import {
 	TelegramDaemonController,
 	writeTelegramControlRequest,
 } from "../src/sdk/bus/telegram-daemon-control";
-import { isProcessIncarnation, parseDarwinProcessIncarnation, processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { TopicRegistry } from "../src/sdk/bus/topic-registry";
 
 const BOT_TOKEN = "123456:secret-token";
@@ -1121,11 +1125,8 @@ describe("canonical processIncarnation daemon lock identity", () => {
 		const view = new DataView(bsdInfo.buffer);
 		view.setBigUint64(120, 1_700_000_000n, true);
 		view.setBigUint64(128, 123_456n, true);
-		const result = processIncarnation(4_242, {
-			platform: "darwin",
-			runCommand: () => ({ exitCode: 0, stdout: "" }),
-		});
-		expect(result).toBeUndefined();
+		const result = parseDarwinProcessIncarnation(bsdInfo);
+		expect(result).toBe("darwin:1700000000:123456");
 		expect(isProcessIncarnation("darwin:1700000000:123456")).toBe(true);
 		expect(isProcessIncarnation("darwin:Thu Jul 17 10:00:00 2025")).toBe(false);
 	});
