@@ -442,6 +442,7 @@ describe("native gjc team runtime", () => {
 		const telemetry = await Bun.file(path.join(snapshot.state_dir, "telemetry.jsonl")).text();
 
 		expect(config.worker_command).toBe("bun ./packages/coding-agent/src/cli.ts");
+		expect(config.gjc_session_id).toBe(TEST_SESSION_ID);
 		expect(manifest.worker_command).toBe("bun ./packages/coding-agent/src/cli.ts");
 		expect(telemetry).toContain("bun ./packages/coding-agent/src/cli.ts");
 		expect(resolveGjcWorkerCommand(cleanupRoot, { GJC_TEAM_WORKER_COMMAND: "gjc-dev" })).toBe("gjc-dev");
@@ -537,6 +538,181 @@ describe("native gjc team runtime", () => {
 
 		// Windows env assignment form is emitted too.
 		expect(buildWorkerCommand(base, worker, "win32")).toContain("$env:GJC_SPAWNED_BY_SESSION = 'leader-xyz';");
+	});
+
+	it("exports only the owning GJC session identity with platform-safe quoting", () => {
+		const config = {
+			team_name: "identity-team",
+			display_name: "identity-team",
+			requested_name: "identity-team",
+			task: "Do work",
+			agent_type: "executor",
+			worker_count: 1,
+			max_workers: 1,
+			state_root: "/state",
+			gjc_session_id: "owner-'$(echo hostile)",
+			worker_command: "gjc",
+			worker_cli_plan: ["gjc"],
+			tmux_command: "tmux",
+			tmux_session: "sess",
+			tmux_session_name: "sess",
+			tmux_target: "sess:0",
+			workspace_mode: "direct",
+			dry_run: false,
+			leader: { session_id: "foreign-session", pane_id: "%1", cwd: "/repo" },
+			leader_cwd: "/repo",
+			team_state_root: "/state",
+			workers: [],
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+		} satisfies GjcTeamConfig;
+		const worker = {
+			id: "worker-1",
+			name: "worker-1",
+			index: 1,
+			agent_type: "executor",
+			role: "executor",
+			status: "starting",
+			last_heartbeat: "2026-01-01T00:00:00.000Z",
+			assigned_tasks: [],
+		} satisfies GjcTeamWorker;
+
+		const posix = buildWorkerCommand(config, worker, "linux");
+		expect(posix).toContain("GJC_SESSION_ID='owner-'\\''$(echo hostile)'");
+		expect(posix).toContain("GJC_SPAWNED_BY_SESSION='foreign-session'");
+
+		const windows = buildWorkerCommand(config, worker, "win32");
+		expect(windows).toContain("$env:GJC_SESSION_ID = 'owner-''$(echo hostile)';");
+		expect(windows).toContain("$env:GJC_SPAWNED_BY_SESSION = 'foreign-session';");
+	});
+
+	it("omits owning session identity instead of falling back to foreign provenance", () => {
+		const config = {
+			team_name: "identity-team",
+			display_name: "identity-team",
+			requested_name: "identity-team",
+			task: "Do work",
+			agent_type: "executor",
+			worker_count: 1,
+			max_workers: 1,
+			state_root: "/state",
+			worker_command: "gjc",
+			worker_cli_plan: ["gjc"],
+			tmux_command: "tmux",
+			tmux_session: "sess",
+			tmux_session_name: "sess",
+			tmux_target: "sess:0",
+			workspace_mode: "direct",
+			dry_run: false,
+			leader: { session_id: "foreign-session", pane_id: "%1", cwd: "/repo" },
+			leader_cwd: "/repo",
+			team_state_root: "/state",
+			workers: [],
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+		} satisfies GjcTeamConfig;
+		const worker = {
+			id: "worker-1",
+			name: "worker-1",
+			index: 1,
+			agent_type: "executor",
+			role: "executor",
+			status: "starting",
+			last_heartbeat: "2026-01-01T00:00:00.000Z",
+			assigned_tasks: [],
+		} satisfies GjcTeamWorker;
+
+		const command = buildWorkerCommand(config, worker, "linux");
+		expect(command).toContain("unset GJC_SESSION_ID;");
+		expect(command).not.toContain("GJC_SESSION_ID='");
+		expect(command).toContain("GJC_SPAWNED_BY_SESSION='foreign-session'");
+		expect(buildWorkerCommand(config, worker, "win32")).toContain("$env:GJC_SESSION_ID = $null;");
+	});
+
+	it("clears a foreign ambient session identity before executing a worker", () => {
+		const config = {
+			team_name: "identity-team",
+			display_name: "identity-team",
+			requested_name: "identity-team",
+			task: "Do work",
+			agent_type: "executor",
+			worker_count: 1,
+			max_workers: 1,
+			state_root: "/state",
+			worker_command:
+				"bun -e \"process.stdout.write((process.env.GJC_SESSION_ID ?? '<unset>') + '|' + (process.env.GJC_TEAM_WORKER ?? '<missing>'))\"",
+			worker_cli_plan: ["gjc"],
+			tmux_command: "tmux",
+			tmux_session: "sess",
+			tmux_session_name: "sess",
+			tmux_target: "sess:0",
+			workspace_mode: "direct",
+			dry_run: false,
+			leader: { session_id: "foreign-session", pane_id: "%1", cwd: "/repo" },
+			leader_cwd: "/repo",
+			team_state_root: "/state",
+			workers: [],
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+		} satisfies GjcTeamConfig;
+		const worker = {
+			id: "worker-1",
+			name: "worker-1",
+			index: 1,
+			agent_type: "executor",
+			role: "executor",
+			status: "starting",
+			last_heartbeat: "2026-01-01T00:00:00.000Z",
+			assigned_tasks: [],
+		} satisfies GjcTeamWorker;
+
+		const result = Bun.spawnSync(["sh", "-c", buildWorkerCommand(config, worker, "linux")], {
+			env: { ...process.env, GJC_SESSION_ID: "foreign-ambient-session" },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString().trim()).toBe("<unset>|identity-team/worker-1");
+	});
+
+	it("rejects unsafe owning session identities even with an explicit team state root", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		await expect(
+			startGjcTeam({
+				workerCount: 1,
+				agentType: "executor",
+				task: "Reject unsafe identity",
+				teamName: "unsafe-identity-team",
+				cwd: cleanupRoot,
+				dryRun: true,
+				env: {
+					GJC_SESSION_ID: "../foreign-session",
+					GJC_TEAM_STATE_ROOT: path.join(cleanupRoot, "team-state"),
+					PATH: "",
+				},
+			}),
+		).rejects.toThrow("session id must be a single path component");
+	});
+
+	it("does not persist a foreign session fallback when the owning GJC identity is absent", async () => {
+		cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-team-runtime-"));
+		const snapshot = await startGjcTeam({
+			workerCount: 1,
+			agentType: "executor",
+			task: "Preserve missing identity",
+			teamName: "missing-identity-team",
+			cwd: cleanupRoot,
+			dryRun: true,
+			env: {
+				CODEX_SESSION_ID: "foreign-session",
+				GJC_TEAM_STATE_ROOT: path.join(cleanupRoot, ".gjc", "team-state"),
+				PATH: "",
+			},
+		});
+
+		const config = await Bun.file(path.join(snapshot.state_dir, "config.json")).json();
+		expect(config.gjc_session_id).toBeUndefined();
+		expect(config.leader.session_id).toBe("foreign-session");
 	});
 
 	it("resolves Windows JavaScript entrypoints through an executable runtime", async () => {

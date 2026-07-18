@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SPAWN_PROVENANCE_ENV } from "../sdk/bus/config";
+import { resolveSessionIdFromSources } from "./session-resolution";
 import type {
 	GjcTeamConfig,
 	GjcTeamSnapshot,
@@ -60,14 +61,21 @@ export function buildWorkerCommand(
 		envAssignment("GJC_TEAM_NAME", config.team_name),
 		envAssignment("GJC_TEAM_WORKER_ID", worker.id),
 		envAssignment("GJC_TEAM_STATE_ROOT", config.state_root),
+		...(config.gjc_session_id ? [envAssignment("GJC_SESSION_ID", config.gjc_session_id)] : []),
 		envAssignment("GJC_TEAM_LEADER_CWD", config.leader.cwd),
 		envAssignment("GJC_TEAM_DISPLAY_NAME", config.display_name),
 		envAssignment(SPAWN_PROVENANCE_ENV, config.leader.session_id.trim() || config.team_name),
 		...(worker.worktree_path ? [envAssignment("GJC_TEAM_WORKTREE_PATH", worker.worktree_path)] : []),
 	];
 	const joined = envLines.join(" ");
-	if (platform === "win32") return `& { ${joined} & ${config.worker_command} ${quote(prompt)} }`;
-	return `${joined} ${config.worker_command} ${quote(prompt)}`;
+	const clearInheritedSession = config.gjc_session_id
+		? ""
+		: platform === "win32"
+			? "$env:GJC_SESSION_ID = $null; "
+			: "unset GJC_SESSION_ID; ";
+	if (platform === "win32")
+		return `& { ${clearInheritedSession}${joined} & ${config.worker_command} ${quote(prompt)} }`;
+	return `${clearInheritedSession}${joined} ${config.worker_command} ${quote(prompt)}`;
 }
 
 interface GjcTmuxBinary {
@@ -171,6 +179,7 @@ export async function startGjcTeamLaunch(
 ): Promise<GjcTeamSnapshot> {
 	const cwd = options.cwd ?? process.cwd();
 	const env = options.env ?? process.env;
+	const gjcSessionId = resolveSessionIdFromSources({ envSessionId: env.GJC_SESSION_ID })?.gjcSessionId;
 	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > runtime.maxWorkers)
 		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${runtime.maxWorkers}`);
 	const workerCliPlan = runtime.resolveWorkerCliPlan(options.workerCount, env);
@@ -218,6 +227,7 @@ export async function startGjcTeamLaunch(
 		max_workers: runtime.maxWorkers,
 		state_root: stateRoot,
 		worker_command: runtime.resolveWorkerCommand(cwd, env),
+		...(gjcSessionId ? { gjc_session_id: gjcSessionId } : {}),
 		worker_cli_plan: workerCliPlan,
 		tmux_command: tmuxCommand,
 		tmux_session: tmuxContext.sessionName,

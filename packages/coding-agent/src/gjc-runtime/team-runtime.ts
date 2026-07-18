@@ -158,6 +158,7 @@ export interface GjcTeamConfig {
 	worker_count: number;
 	max_workers: number;
 	state_root: string;
+	gjc_session_id?: string;
 	worker_command: string;
 	worker_cli_plan: GjcTeamWorkerCli[];
 	tmux_command: string;
