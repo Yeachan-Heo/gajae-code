@@ -3239,8 +3239,18 @@ describe("resolveGjcWorkerCommand invocation authority", () => {
 	});
 });
 
+type ContinuationFixture = {
+	teamName: string;
+	env: NodeJS.ProcessEnv;
+	stateDir: string;
+	dispatches: Array<{ command: string; args: string[] }>;
+	now: () => number;
+	advance: (ms: number) => void;
+	monitor: () => Promise<unknown>;
+};
+
 describe("stalled worker continuation protocol", () => {
-	async function prepareContinuation(teamName: string) {
+	async function prepareContinuation(teamName: string): Promise<ContinuationFixture> {
 		cleanupRoot = await createGitRepo();
 		let nowMs = Date.now();
 		const dispatches: Array<{ command: string; args: string[] }> = [];
@@ -3292,10 +3302,7 @@ describe("stalled worker continuation protocol", () => {
 			monitor: () => monitorGjcTeam(teamName, cleanupRoot!, env),
 		};
 	}
-	async function setContinuationLease(
-		fixture: Awaited<ReturnType<typeof prepareContinuation>>,
-		leasedUntil: string,
-	): Promise<void> {
+	async function setContinuationLease(fixture: ContinuationFixture, leasedUntil: string): Promise<void> {
 		const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
 		if (!task.claim) throw new Error("expected claimed task");
 		const claim = { ...task.claim, leased_until: leasedUntil };
@@ -4146,7 +4153,7 @@ describe("stalled worker continuation protocol", () => {
 		const cases = [
 			[
 				"update task",
-				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+				(f: ContinuationFixture) =>
 					executeGjcTeamApiOperation(
 						"update-task",
 						{ team_name: f.teamName, task_id: "task-1", subject: "updated" },
@@ -4156,7 +4163,7 @@ describe("stalled worker continuation protocol", () => {
 			],
 			[
 				"competing claim",
-				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+				(f: ContinuationFixture) =>
 					executeGjcTeamApiOperation(
 						"claim-task",
 						{ team_name: f.teamName, worker: "worker-1", task_id: "task-1" },
@@ -4166,7 +4173,7 @@ describe("stalled worker continuation protocol", () => {
 			],
 			[
 				"release claim",
-				async (f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+				async (f: ContinuationFixture) =>
 					executeGjcTeamApiOperation(
 						"release-task-claim",
 						{
@@ -4181,7 +4188,7 @@ describe("stalled worker continuation protocol", () => {
 			],
 			[
 				"terminal transition",
-				async (f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+				async (f: ContinuationFixture) =>
 					executeGjcTeamApiOperation(
 						"transition-task-status",
 						{
@@ -4197,7 +4204,7 @@ describe("stalled worker continuation protocol", () => {
 			],
 			[
 				"heartbeat update",
-				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+				(f: ContinuationFixture) =>
 					executeGjcTeamApiOperation(
 						"update-worker-heartbeat",
 						{
@@ -4211,7 +4218,7 @@ describe("stalled worker continuation protocol", () => {
 			],
 			[
 				"status update",
-				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+				(f: ContinuationFixture) =>
 					executeGjcTeamApiOperation(
 						"update-worker-status",
 						{ team_name: f.teamName, worker: "worker-1", status: "idle" },
@@ -4221,7 +4228,7 @@ describe("stalled worker continuation protocol", () => {
 			],
 			[
 				"lifecycle startup update",
-				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+				(f: ContinuationFixture) =>
 					executeGjcTeamApiOperation(
 						"worker-startup-ack",
 						{ team_name: f.teamName, worker: "worker-1", pane_id: "%dry-run-worker-1", pid: 1 },
@@ -4231,7 +4238,7 @@ describe("stalled worker continuation protocol", () => {
 			],
 			[
 				"shutdown request",
-				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
+				(f: ContinuationFixture) =>
 					executeGjcTeamApiOperation(
 						"write-shutdown-request",
 						{
@@ -4245,18 +4252,11 @@ describe("stalled worker continuation protocol", () => {
 						f.env,
 					),
 			],
-			[
-				"phase shutdown",
-				(f: Awaited<ReturnType<typeof prepareContinuation>>) => shutdownGjcTeam(f.teamName, cleanupRoot!, f.env),
-			],
-			[
-				"direct recovery",
-				(f: Awaited<ReturnType<typeof prepareContinuation>>) =>
-					recoverGjcTeamStaleClaims(f.teamName, cleanupRoot!, f.env),
-			],
+			["phase shutdown", (f: ContinuationFixture) => shutdownGjcTeam(f.teamName, cleanupRoot!, f.env)],
+			["direct recovery", (f: ContinuationFixture) => recoverGjcTeamStaleClaims(f.teamName, cleanupRoot!, f.env)],
 			[
 				"worker GC prune",
-				async (f: Awaited<ReturnType<typeof prepareContinuation>>) => {
+				async (f: ContinuationFixture) => {
 					const workerPath = path.join(f.stateDir, "workers", "worker-1");
 					return pruneTeamWorkerGcRecord(
 						{

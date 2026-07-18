@@ -39,6 +39,7 @@ import type {
 	GjcTeamTask,
 	GjcTeamTaskClaim,
 	GjcTeamTaskMetadataInput,
+	GjcTeamTaskMutationCapability,
 	GjcTeamTaskStatus,
 } from "./team-store";
 import {
@@ -956,7 +957,7 @@ export async function pruneTeamWorkerGcRecord(record: GcRecord, probe: GcPidProb
 async function pruneTeamWorkerGcRecordUnlocked(
 	record: GcRecord,
 	probe: GcPidProbe,
-	capability: import("./team-store").GjcTeamTaskMutationCapability,
+	capability: GjcTeamTaskMutationCapability,
 ): Promise<boolean> {
 	if (!record.path || !record.id.includes("/")) return false;
 	const [teamName, workerId] = record.id.split("/", 2);
