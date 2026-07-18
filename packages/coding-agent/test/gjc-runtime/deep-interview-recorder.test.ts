@@ -392,6 +392,14 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
+			{ ...base, selectedOptions: ["Looks right", "Add/remove/merge components"] },
+			{ sessionId: TEST_SESSION_ID },
+		);
+		persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		expect(persisted.state.intent_contract).toBeUndefined();
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
 			{
 				...base,
 				selectedOptions: ["Looks right"],

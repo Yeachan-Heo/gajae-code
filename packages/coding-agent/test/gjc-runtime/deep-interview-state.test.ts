@@ -354,5 +354,18 @@ describe("deep-interview-state: intent contract", () => {
 		expect(() =>
 			mergeDeepInterviewEnvelope({ state: { intent_contract: locked } }, { state: { intent_contract: null } }),
 		).toThrow("cannot be deleted");
+		expect(() =>
+			mergeDeepInterviewEnvelope(
+				{ state: { intent_contract: locked } },
+				{ state: { intent_contract: replacement } },
+				{ replace: true },
+			),
+		).toThrow("cannot be replaced");
+		const preserved = mergeDeepInterviewEnvelope(
+			{ state: { intent_contract_required: true, intent_contract: locked, stale: true } },
+			{ state: { rounds: [] } },
+			{ replace: true },
+		);
+		expect(preserved.state).toMatchObject({ intent_contract_required: true, intent_contract: locked, rounds: [] });
 	});
 });

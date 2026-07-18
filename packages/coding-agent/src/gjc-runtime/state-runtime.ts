@@ -1685,18 +1685,19 @@ async function handleHandoffUnlocked(
 		nowIso: handoffAt,
 		mutationId,
 	});
+	const normalizedCaller =
+		caller === "deep-interview"
+			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
+					string,
+					unknown
+				>)
+			: migrateWorkflowState(existingCaller, caller).state;
+	if (caller === "deep-interview") await assertDeepInterviewHandoffReady(normalizedCaller);
 
 	// Runtime callees have no native mode-state to clear later, so do not
 	// persist them as active-state entries; the prompt observer tracks them
 	// in memory the same way direct `/skill:<runtime>` invocation does.
 	if (!calleeIsWorkflow) {
-		const normalizedCaller =
-			caller === "deep-interview"
-				? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
-						string,
-						unknown
-					>)
-				: migrateWorkflowState(existingCaller, caller).state;
 		const mergedCallerState: Record<string, unknown> = {
 			...normalizedCaller,
 			skill: caller,
@@ -1793,14 +1794,6 @@ async function handleHandoffUnlocked(
 	});
 
 	const calleeInitial = initialPhaseForSkill(callee);
-	const normalizedCaller =
-		caller === "deep-interview"
-			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
-					string,
-					unknown
-				>)
-			: migrateWorkflowState(existingCaller, caller).state;
-	if (caller === "deep-interview") await assertDeepInterviewHandoffReady(normalizedCaller);
 	const normalizedCallee =
 		callee === "deep-interview"
 			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCallee, callee).state) as Record<

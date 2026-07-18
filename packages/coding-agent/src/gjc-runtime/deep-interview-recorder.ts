@@ -441,9 +441,9 @@ export async function appendOrMergeDeepInterviewRound(
 	if (input.intent_contract) {
 		if (input.round !== 0 || input.component !== "review-topology" || input.dimension !== "topology")
 			throw new Error("intent contract requires Round 0 topology metadata");
-		const confirmed = (input.selectedOptions ?? []).some(option =>
-			input.intent_contract?.confirmation_options.includes(option),
-		);
+		const confirmed =
+			input.selectedOptions?.length === 1 &&
+			input.intent_contract.confirmation_options.includes(input.selectedOptions[0]);
 		if (confirmed) {
 			const contract = createDeepInterviewIntentManifest(input.intent_contract.items, {
 				round: 0,
@@ -467,9 +467,8 @@ export async function appendOrMergeDeepInterviewRound(
 		if (input.round <= 0) throw new Error("intent review requires a post-Round-0 answer");
 		const locked = inner.intent_contract;
 		assertDeepInterviewIntentManifest(locked);
-		const approved = (input.selectedOptions ?? []).some(option =>
-			input.intent_review?.approval_options.includes(option),
-		);
+		const approved =
+			input.selectedOptions?.length === 1 && input.intent_review.approval_options.includes(input.selectedOptions[0]);
 		inner.intent_review = reviewDeepInterviewIntent(locked, input.intent_review.observed_items, {
 			status: approved ? "approved" : "pending",
 			supporting_substitutions: input.intent_review.supporting_substitutions,

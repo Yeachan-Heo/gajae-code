@@ -337,9 +337,30 @@ export function mergeDeepInterviewEnvelope(
 	const incomingHasEstablishedFacts =
 		Object.hasOwn(incomingNestedState, "established_facts") || Object.hasOwn(incomingEnvelope, "established_facts");
 	const normalizedIncoming = normalizeDeepInterviewEnvelope(incoming);
-	if (options.replace) return normalizedIncoming;
-
 	const normalizedExisting = normalizeDeepInterviewEnvelope(existing);
+	const existingState = isPlainObject(normalizedExisting.state) ? normalizedExisting.state : {};
+	const incomingState = isPlainObject(normalizedIncoming.state) ? { ...normalizedIncoming.state } : {};
+	if (existingState.intent_contract !== undefined) {
+		assertDeepInterviewIntentManifest(existingState.intent_contract);
+		if (Object.hasOwn(incomingState, "intent_contract")) {
+			if (incomingState.intent_contract === null) throw new Error("locked intent contract cannot be deleted");
+			assertDeepInterviewIntentManifest(incomingState.intent_contract);
+			if (
+				incomingState.intent_contract.digest !== existingState.intent_contract.digest ||
+				incomingState.intent_contract.confirmation_answer_hash !==
+					existingState.intent_contract.confirmation_answer_hash
+			)
+				throw new Error("locked intent contract cannot be replaced");
+		} else {
+			incomingState.intent_contract = existingState.intent_contract;
+		}
+	}
+	if (existingState.intent_contract_required === true) incomingState.intent_contract_required = true;
+	if (options.replace) {
+		normalizedIncoming.state = incomingState;
+		return normalizedIncoming;
+	}
+
 	const merged: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(normalizedExisting)) {
 		if (key !== "state") merged[key] = value;
@@ -350,19 +371,6 @@ export function mergeDeepInterviewEnvelope(
 		else merged[key] = value;
 	}
 
-	const existingState = isPlainObject(normalizedExisting.state) ? normalizedExisting.state : {};
-	const incomingState = isPlainObject(normalizedIncoming.state) ? normalizedIncoming.state : {};
-	if (existingState.intent_contract !== undefined && Object.hasOwn(incomingState, "intent_contract")) {
-		assertDeepInterviewIntentManifest(existingState.intent_contract);
-		if (incomingState.intent_contract === null) throw new Error("locked intent contract cannot be deleted");
-		assertDeepInterviewIntentManifest(incomingState.intent_contract);
-		if (
-			incomingState.intent_contract.digest !== existingState.intent_contract.digest ||
-			incomingState.intent_contract.confirmation_answer_hash !==
-				existingState.intent_contract.confirmation_answer_hash
-		)
-			throw new Error("locked intent contract cannot be replaced");
-	}
 	const mergedState: Record<string, unknown> = { ...existingState };
 	for (const [key, value] of Object.entries(incomingState)) {
 		if (key === "rounds") continue;

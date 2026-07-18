@@ -157,6 +157,22 @@ const QuestionItem = z
 	})
 	.superRefine((value, context) => {
 		const labels = new Set(value.options.map(option => option.label));
+		if ((value.deepInterview?.intent_contract || value.deepInterview?.intent_review) && value.multi === true)
+			context.addIssue({ code: "custom", message: "intent gates must be single-select", path: ["multi"] });
+		const confirmationOptions = value.deepInterview?.intent_contract?.confirmation_options ?? [];
+		if (new Set(confirmationOptions).size !== confirmationOptions.length)
+			context.addIssue({
+				code: "custom",
+				message: "intent confirmation options must be unique",
+				path: ["deepInterview", "intent_contract"],
+			});
+		const approvalOptions = value.deepInterview?.intent_review?.approval_options ?? [];
+		if (new Set(approvalOptions).size !== approvalOptions.length)
+			context.addIssue({
+				code: "custom",
+				message: "intent approval options must be unique",
+				path: ["deepInterview", "intent_review"],
+			});
 		for (const label of value.deepInterview?.intent_contract?.confirmation_options ?? []) {
 			if (!labels.has(label))
 				context.addIssue({

@@ -228,6 +228,14 @@ describe("gjc state handoff", () => {
 			);
 			expect(missing.status).toBe(2);
 			expect(missing.stderr).toContain("requires a locked Round 0 intent contract");
+			const runtimeMissing = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "made-up-skill", "--json"],
+				cwd,
+			);
+			expect(runtimeMissing.status).toBe(2);
+			expect(runtimeMissing.stderr).toContain("requires a locked Round 0 intent contract");
+			const unchanged = await readJson(callerPath);
+			expect(unchanged?.active).toBe(true);
 		});
 
 		await withTempCwd(async cwd => {
