@@ -548,6 +548,7 @@ export function reviewDeepInterviewIntent(
 		if (removed.some(id => !substitutionIds.has(id)))
 			throw new Error("approved intent reduction requires every substitution");
 		if (
+			typeof input.approval_round !== "number" ||
 			!Number.isFinite(input.approval_round) ||
 			!Number.isInteger(input.approval_round) ||
 			input.approval_round <= 0 ||
@@ -640,6 +641,7 @@ export function assertDeepInterviewIntentReview(
 	if (removed.some(id => !substitutionIds.has(id)))
 		throw new Error("approved intent reduction requires every substitution");
 	if (
+		typeof value.approval_round !== "number" ||
 		!Number.isFinite(value.approval_round) ||
 		!Number.isInteger(value.approval_round) ||
 		value.approval_round <= 0 ||
