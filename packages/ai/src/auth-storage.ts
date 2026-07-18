@@ -459,6 +459,16 @@ const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 10_000;
  */
 const OAUTH_REFRESH_SKEW_MS = 60_000;
 /**
+ * When an OAuth refresh fails with a definitive auth error, the stored row is
+ * re-read before disabling it: a peer process that just rotated the token may
+ * not have persisted its success yet (its success write trails our failure by
+ * the token endpoint's round-trip). Poll a few times with a short delay so an
+ * in-flight peer rotation gets a chance to land before we conclude the stored
+ * refresh token is genuinely dead.
+ */
+const OAUTH_ROTATION_RECHECK_ATTEMPTS = 3;
+const OAUTH_ROTATION_RECHECK_DELAY_MS = 150;
+/**
  * Cap on the buffered credential_disabled backlog held while no handler is attached.
  * In practice the backlog is 0–N where N ≈ active providers (≤ ~20). The cap exists so
  * pathological detach-without-reattach loops can't grow memory unboundedly.
@@ -3001,12 +3011,36 @@ export class AuthStorage {
 		credentialId: number | undefined,
 		signal?: AbortSignal,
 	): Promise<OAuthCredentials> {
+		// Adopt a peer rotation before burning a refresh: providers with rotating
+		// refresh tokens (e.g. Anthropic) invalidate the previous refresh token on
+		// use, so firing the network refresh with a token another process already
+		// rotated is guaranteed to fail with invalid_grant. Re-read the persisted
+		// row and prefer it over our in-memory snapshot. The broker/override path
+		// below is exempt: the broker server is the single refresh authority and
+		// resolves the credential by id on its side.
 		let refreshPromise: Promise<OAuthCredentials>;
 		// Caller override > store-level hook > local per-provider refresh.
 		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
 		// routes refresh through the broker without explicit wiring.
 		const storeRefresh = this.#store.refreshOAuthCredential?.bind(this.#store);
 		const overrideRefresh = this.#refreshOAuthCredentialOverride ?? storeRefresh;
+		if (!overrideRefresh && credentialId !== undefined) {
+			try {
+				const latest = this.#store.listAuthCredentials(provider).find(row => row.id === credentialId)?.credential;
+				if (latest?.type === "oauth" && latest.refresh !== credential.refresh) {
+					logger.debug("OAuth refresh adopting peer-rotated credential instead of stale snapshot", {
+						provider,
+						credentialId,
+					});
+					if (Date.now() + OAUTH_REFRESH_SKEW_MS < latest.expires) {
+						return latest;
+					}
+					credential = latest;
+				}
+			} catch {
+				// Best-effort re-read; fall through to refreshing with the snapshot.
+			}
+		}
 		if (overrideRefresh && credentialId !== undefined) {
 			refreshPromise = overrideRefresh(provider, credentialId, credential, signal);
 		} else {
@@ -3222,19 +3256,25 @@ export class AuthStorage {
 				// Re-read the row from disk before marking it disabled — if the persisted
 				// refresh token has changed, the peer rotation succeeded and we should pick
 				// up the new credential instead of soft-deleting the row that the peer just
-				// updated.
+				// updated. The peer's success write can trail our failure by its token
+				// endpoint round-trip, so poll briefly instead of reading once.
 				const credentialId = this.#getStoredCredentials(provider)[selection.index]?.id;
 				if (credentialId !== undefined) {
-					const latestRow = this.#store.listAuthCredentials(provider).find(row => row.id === credentialId);
-					const latestCredential = latestRow?.credential;
-					if (latestCredential?.type === "oauth" && latestCredential.refresh !== selection.credential.refresh) {
-						logger.debug("OAuth refresh race detected; another process rotated token first", {
-							provider,
-							index: selection.index,
-							credentialId,
-						});
-						await this.reload();
-						return this.#resolveOAuthSelection(provider, sessionId, options);
+					for (let attempt = 0; attempt < OAUTH_ROTATION_RECHECK_ATTEMPTS; attempt++) {
+						if (attempt > 0) {
+							await new Promise(resolve => setTimeout(resolve, OAUTH_ROTATION_RECHECK_DELAY_MS));
+						}
+						const latestRow = this.#store.listAuthCredentials(provider).find(row => row.id === credentialId);
+						const latestCredential = latestRow?.credential;
+						if (latestCredential?.type === "oauth" && latestCredential.refresh !== selection.credential.refresh) {
+							logger.debug("OAuth refresh race detected; another process rotated token first", {
+								provider,
+								index: selection.index,
+								credentialId,
+							});
+							await this.reload();
+							return this.#resolveOAuthSelection(provider, sessionId, options);
+						}
 					}
 				}
 				// Permanently disable invalid credentials with an explicit cause for inspection/debugging.
@@ -3866,6 +3906,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#listDisabledByProviderStmt: Statement;
 	#insertStmt: Statement;
 	#updateStmt: Statement;
+	#updateReviveStmt: Statement;
 	#deleteStmt: Statement;
 	#deleteIfMatchesStmt: Statement;
 	#deleteByProviderStmt: Statement;
@@ -3895,6 +3936,16 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		);
 		this.#updateStmt = this.#db.prepare(
 			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
+		);
+		// Persisting a successful OAuth refresh is proof-of-life: the rotated
+		// token is the only valid one from now on. If a racing peer lost the
+		// rotation and CAS-disabled this row with a refresh-failure cause in the
+		// window before our success write landed, un-disable it — otherwise the
+		// freshly-rotated (only valid) token stays trapped in a soft-deleted row
+		// and every process is signed out until a manual re-login. Rows disabled
+		// for any other reason (e.g. "deleted by user") are never revived.
+		this.#updateReviveStmt = this.#db.prepare(
+			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, updated_at = ${SQLITE_NOW_EPOCH}, disabled_cause = CASE WHEN disabled_cause LIKE 'oauth refresh failed%' THEN NULL ELSE disabled_cause END WHERE id = ?`,
 		);
 		this.#deleteStmt = this.#db.prepare(
 			`UPDATE auth_credentials SET disabled_cause = ?, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
@@ -4375,7 +4426,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			const provider = providerRow?.provider ?? "";
 			const serialized = serializeCredential(provider, credential);
 			if (!serialized) return;
-			this.#updateStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, id);
+			this.#updateReviveStmt.run(serialized.credentialType, serialized.data, serialized.identityKey, id);
 			if (provider) {
 				this.#purgeSupersededDisabledRows(provider, this.listAuthCredentials(provider));
 			}
@@ -4525,6 +4576,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#listDisabledByProviderStmt.finalize();
 		this.#insertStmt.finalize();
 		this.#updateStmt.finalize();
+		this.#updateReviveStmt.finalize();
 		this.#deleteStmt.finalize();
 		this.#deleteIfMatchesStmt.finalize();
 		this.#deleteByProviderStmt.finalize();
