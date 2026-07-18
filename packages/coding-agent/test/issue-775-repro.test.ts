@@ -364,7 +364,7 @@ describe("issue #775: per-model defaultLevel", () => {
 	});
 	it("leaves reasoning level state untouched when config corruption breaks the durable commit", async () => {
 		const agentDir = path.join(tempDir.path(), "agent");
-		const settings = await Settings.init({ cwd: tempDir.path(), agentDir });
+		const settings = await Settings.loadForScope({ cwd: tempDir.path(), agentDir });
 		await createSession(getSonnet(), settings);
 		const history = structuredClone(session.sessionManager.getBranch());
 		const settingsBefore = settings.getGlobal("defaultThinkingLevel");
@@ -384,12 +384,13 @@ describe("issue #775: per-model defaultLevel", () => {
 			expect(settings.getGlobal("defaultThinkingLevel")).toBe(settingsBefore);
 		} finally {
 			unsubscribe();
+			settings.getStorage()?.close();
 		}
 	});
 
 	it("leaves reasoning visibility state untouched when config corruption breaks the durable commit", async () => {
 		const agentDir = path.join(tempDir.path(), "agent");
-		const settings = await Settings.init({ cwd: tempDir.path(), agentDir });
+		const settings = await Settings.loadForScope({ cwd: tempDir.path(), agentDir });
 		await createSession(getSonnet(), settings);
 		const history = structuredClone(session.sessionManager.getBranch());
 		const settingsBefore = settings.getGlobal("hideThinkingBlock");
@@ -409,6 +410,7 @@ describe("issue #775: per-model defaultLevel", () => {
 			expect(settings.getGlobal("hideThinkingBlock")).toBe(settingsBefore);
 		} finally {
 			unsubscribe();
+			settings.getStorage()?.close();
 		}
 	});
 });
