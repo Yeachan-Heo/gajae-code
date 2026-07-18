@@ -8376,13 +8376,116 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			call => call.method === "sendMessage" || call.method === "sendRichMessage",
 		).length;
 		await daemon.handleSessionMessage(session, {
-			type: "ephemeral_turn_result",
 			...request,
+			type: "ephemeral_turn_result",
 			status: "ok",
 			text: "late answer",
 		});
 		expect(bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage")).toHaveLength(
 			deliveriesAfterLoss,
 		);
+	});
+	test("terminalizes the prior logical session before a threaded identity rekey", async () => {
+		const { bot, daemon, threadId } = await daemonWithTopic();
+		await daemon.handleTelegramUpdate({
+			update_id: 991,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw old identity?", message_id: 1991 },
+		});
+		const session = daemon.sessions.get("S")!;
+		const request = JSON.parse((session.ws as unknown as FakeWs).sent.at(-1)!) as {
+			requestId: string;
+			sessionId: string;
+			updateId: number;
+			messageId: number;
+			threadId: string;
+		};
+
+		await daemon.handleSessionMessage(session, { type: "config_update", sessionId: "replacement-logical" });
+		await Promise.resolve();
+
+		expect(
+			bot.calls.filter(
+				call =>
+					call.method === "sendMessage" &&
+					call.body.text ===
+						"This /btw question stopped because the GJC session closed or changed. Reopen it and try again.",
+			),
+		).toHaveLength(1);
+		const deliveriesAfterRekey = bot.calls.filter(
+			call => call.method === "sendMessage" || call.method === "sendRichMessage",
+		).length;
+		await daemon.handleSessionMessage(session, {
+			...request,
+			type: "ephemeral_turn_result",
+			status: "ok",
+			text: "late old-identity answer",
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage")).toHaveLength(
+			deliveriesAfterRekey,
+		);
+	});
+
+	test("joins an in-flight rejected result delivery before sending one session-loss terminal reply", async () => {
+		const { bot, daemon, threadId } = await daemonWithTopic();
+		await daemon.handleTelegramUpdate({
+			update_id: 992,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw delivery race?", message_id: 1992 },
+		});
+		const session = daemon.sessions.get("S")!;
+		const request = JSON.parse((session.ws as unknown as FakeWs).sent.at(-1)!) as {
+			requestId: string;
+			sessionId: string;
+			updateId: number;
+			messageId: number;
+			threadId: string;
+		};
+		const answerStarted = Promise.withResolvers<void>();
+		const answerResponse = Promise.withResolvers<unknown>();
+		const normalCall = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (
+				method === "sendRichMessage" ||
+				(method === "sendMessage" && (body as { text?: unknown }).text === "delivery result")
+			) {
+				bot.calls.push({ method, body, options });
+				answerStarted.resolve();
+				return await answerResponse.promise;
+			}
+			return await normalCall(method, body, options);
+		};
+
+		const handling = daemon.handleSessionMessage(session, {
+			...request,
+			type: "ephemeral_turn_result",
+			status: "ok",
+			text: "delivery result",
+		});
+		await Promise.race([
+			answerStarted.promise,
+			Bun.sleep(1_000).then(() => {
+				throw new Error(
+					`Expected answer delivery to start; request=${JSON.stringify(request)} calls=${JSON.stringify(bot.calls.slice(-3))}`,
+				);
+			}),
+		]);
+		(session.ws as unknown as FakeWs).dispatchEvent(new Event("close"));
+		answerResponse.resolve({ ok: false, description: "delivery unavailable" });
+		await handling;
+
+		expect(
+			bot.calls.filter(
+				call =>
+					call.method === "sendRichMessage" ||
+					(call.method === "sendMessage" && call.body.text === "delivery result"),
+			),
+		).toHaveLength(1);
+		expect(
+			bot.calls.filter(
+				call =>
+					call.method === "sendMessage" &&
+					call.body.text ===
+						"This /btw question stopped because the GJC session closed or changed. Reopen it and try again.",
+			),
+		).toHaveLength(1);
 	});
 });

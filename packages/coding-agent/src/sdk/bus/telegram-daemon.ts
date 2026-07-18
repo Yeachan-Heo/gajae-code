@@ -1392,6 +1392,13 @@ interface PendingBtwTurn {
 	updateId: number;
 	expiresAt: number;
 }
+interface PendingBtwDelivery {
+	pending: PendingBtwTurn;
+	/** The owning session changed while this terminal Bot API call was in flight. */
+	invalidated: boolean;
+	finished: Promise<void>;
+	finish: () => void;
+}
 
 export class TelegramNotificationDaemon {
 	readonly aliasTable: AliasTable;
@@ -1416,6 +1423,7 @@ export class TelegramNotificationDaemon {
 	private readonly daemonRenameAttempts = new Map<string, number>();
 	private readonly selectedAckPending = new Map<string, SelectedAckQueueItem>();
 	#pendingBtwTurns = new Map<string, PendingBtwTurn>();
+	#btwTerminalDeliveries = new Map<string, PendingBtwDelivery>();
 	#btwTerminalTombstones = new Map<
 		string,
 		{ sessionId: string; updateId: number; messageId: number; threadId: string; expiresAt: number }
@@ -2357,6 +2365,12 @@ export class TelegramNotificationDaemon {
 		}
 	}
 	async #terminalizeBtwTurn(requestId: string, pending: PendingBtwTurn, allowWhileStopping = false): Promise<void> {
+		const delivery = this.#btwTerminalDeliveries.get(requestId);
+		if (delivery?.pending === pending) {
+			delivery.invalidated = true;
+			if (allowWhileStopping) await delivery.finished;
+			return;
+		}
 		if (this.#stoppingBtw && !allowWhileStopping) return;
 		if (!this.#takeBtwTurn(requestId, pending)) return;
 		try {
@@ -2499,6 +2513,7 @@ export class TelegramNotificationDaemon {
 			(msg.type !== "config_update" && !renderThreadedFrame(msg))
 		)
 			return;
+		this.#terminalizeBtwTurnsForSession(session);
 		this.#clearModelChoiceAliasesForSocket(session);
 		this.#clearModelChoiceAliases(msg.sessionId);
 		session.logicalSessionId = msg.sessionId;
@@ -3512,81 +3527,127 @@ export class TelegramNotificationDaemon {
 			)
 				return;
 			if (msg.status === "ok" && typeof msg.text !== "string") return;
-			if (this.#stoppingBtw || !this.#takeBtwTurn(requestId, pending)) return;
-			if (msg.status !== "ok") {
-				const text =
-					msg.status === "busy"
-						? "Two /btw questions are already running. Wait for one to finish."
-						: msg.status === "timeout"
-							? "This /btw question timed out after 120 seconds. Send it again to retry."
-							: msg.status === "cancelled" || msg.status === "session_unavailable"
-								? "This /btw question stopped because the GJC session closed or changed. Reopen it and try again."
-								: "This /btw question failed. Send it again to retry.";
-				try {
-					await this.#sendBtwMessage({
-						threadId: pending.threadId,
-						messageId: pending.messageId,
-						text,
-					});
-				} catch {
-					logger.warn("notifications: /btw status delivery failed");
-				}
-				return;
-			}
-			const markdown = msg.text;
-			const isAuthoritative = (): boolean =>
-				!this.#stoppingBtw &&
-				this.sessions.get(session.sessionId) === session &&
-				session.ws.readyState === WebSocket.OPEN &&
-				pending.endpointDigest === session.endpointDigest &&
-				pending.generation === session.hostGeneration &&
-				pending.logicalSessionId === this.#logicalSessionId(session) &&
-				pending.transportSessionId === session.sessionId &&
-				requestId === msg.requestId &&
-				pending.logicalSessionId === msg.sessionId &&
-				pending.messageId === msg.messageId &&
-				pending.threadId === msg.threadId &&
-				pending.updateId === msg.updateId &&
-				this.topics.sessionForTopic(pending.threadId) === pending.transportSessionId;
-			const signal = AbortSignal.any([this.#btwDeliveryAbort.signal, AbortSignal.timeout(30_000)]);
-			const deliver = async (
-				method: "sendMessage" | "sendRichMessage",
-				body: unknown,
-			): Promise<"accepted" | "rejected" | "uncertain" | "stale"> => {
-				if (!isAuthoritative()) return "stale";
-				try {
-					const response = await this.botApi.call(method, body, { noRetry: true, signal });
-					if (!response || typeof response !== "object") return "uncertain";
-					if ((response as { ok?: unknown }).ok === true) return "accepted";
-					if ((response as { ok?: unknown }).ok === false) return "rejected";
-					return "uncertain";
-				} catch {
-					return "uncertain";
-				}
+			if (this.#stoppingBtw || this.#btwTerminalDeliveries.has(requestId)) return;
+			const finished = Promise.withResolvers<void>();
+			const terminalDelivery: PendingBtwDelivery = {
+				pending,
+				invalidated: false,
+				finished: finished.promise,
+				finish: finished.resolve,
 			};
-			const html = markdownToTelegramHtml(markdown);
-			const fallback = async (): Promise<void> => {
-				for (const [index, text] of splitTelegramHtml(html).entries()) {
-					const outcome = await deliver("sendMessage", {
+			this.#btwTerminalDeliveries.set(requestId, terminalDelivery);
+			let deliveryOutcome: "accepted" | "not_delivered" | "uncertain" = "not_delivered";
+			try {
+				if (msg.status !== "ok") {
+					const text =
+						msg.status === "busy"
+							? "Two /btw questions are already running. Wait for one to finish."
+							: msg.status === "timeout"
+								? "This /btw question timed out after 120 seconds. Send it again to retry."
+								: msg.status === "cancelled" || msg.status === "session_unavailable"
+									? "This /btw question stopped because the GJC session closed or changed. Reopen it and try again."
+									: "This /btw question failed. Send it again to retry.";
+					try {
+						const response = await this.#sendBtwMessage({
+							threadId: pending.threadId,
+							messageId: pending.messageId,
+							text,
+						});
+						deliveryOutcome =
+							response && typeof response === "object" && (response as { ok?: unknown }).ok === true
+								? "accepted"
+								: response && typeof response === "object" && (response as { ok?: unknown }).ok === false
+									? "not_delivered"
+									: "uncertain";
+					} catch {
+						deliveryOutcome = "uncertain";
+						logger.warn("notifications: /btw status delivery failed");
+					}
+					return;
+				}
+				const markdown = msg.text;
+				const isAuthoritative = (): boolean =>
+					!this.#stoppingBtw &&
+					this.sessions.get(session.sessionId) === session &&
+					session.ws.readyState === WebSocket.OPEN &&
+					pending.endpointDigest === session.endpointDigest &&
+					pending.generation === session.hostGeneration &&
+					pending.logicalSessionId === this.#logicalSessionId(session) &&
+					pending.transportSessionId === session.sessionId &&
+					requestId === msg.requestId &&
+					pending.logicalSessionId === msg.sessionId &&
+					pending.messageId === msg.messageId &&
+					pending.threadId === msg.threadId &&
+					pending.updateId === msg.updateId &&
+					this.topics.sessionForTopic(pending.threadId) === pending.transportSessionId;
+				const signal = AbortSignal.any([this.#btwDeliveryAbort.signal, AbortSignal.timeout(30_000)]);
+				const deliver = async (
+					method: "sendMessage" | "sendRichMessage",
+					body: unknown,
+				): Promise<"accepted" | "rejected" | "uncertain" | "stale"> => {
+					if (!isAuthoritative()) return "stale";
+					try {
+						const response = await this.botApi.call(method, body, { noRetry: true, signal });
+						if (!response || typeof response !== "object") return "uncertain";
+						if ((response as { ok?: unknown }).ok === true) return "accepted";
+						if ((response as { ok?: unknown }).ok === false) return "rejected";
+						return "uncertain";
+					} catch {
+						return "uncertain";
+					}
+				};
+				const html = markdownToTelegramHtml(markdown);
+				const fallback = async (): Promise<typeof deliveryOutcome> => {
+					let accepted = false;
+					for (const [index, text] of splitTelegramHtml(html).entries()) {
+						const outcome = await deliver("sendMessage", {
+							chat_id: this.opts.chatId,
+							message_thread_id: Number(pending.threadId),
+							...(index === 0 ? { reply_parameters: { message_id: pending.messageId } } : {}),
+							text,
+							parse_mode: TELEGRAM_PARSE_MODE,
+						});
+						if (outcome === "accepted") {
+							accepted = true;
+							continue;
+						}
+						if (accepted) return "accepted";
+						return outcome === "uncertain" ? "uncertain" : "not_delivered";
+					}
+					return accepted ? "accepted" : "not_delivered";
+				};
+				if (this.opts.rich?.enabled !== false && isBtwRichEligible(markdown)) {
+					const outcome = await deliver("sendRichMessage", {
 						chat_id: this.opts.chatId,
 						message_thread_id: Number(pending.threadId),
-						...(index === 0 ? { reply_parameters: { message_id: pending.messageId } } : {}),
-						text,
-						parse_mode: TELEGRAM_PARSE_MODE,
+						reply_parameters: { message_id: pending.messageId },
+						rich_message: { markdown, skip_entity_detection: true },
 					});
-					if (outcome !== "accepted") return;
+					deliveryOutcome =
+						outcome === "accepted"
+							? "accepted"
+							: outcome === "rejected"
+								? await fallback()
+								: outcome === "uncertain"
+									? "uncertain"
+									: "not_delivered";
+				} else {
+					deliveryOutcome = await fallback();
 				}
-			};
-			if (this.opts.rich?.enabled !== false && isBtwRichEligible(markdown)) {
-				const outcome = await deliver("sendRichMessage", {
-					chat_id: this.opts.chatId,
-					message_thread_id: Number(pending.threadId),
-					reply_parameters: { message_id: pending.messageId },
-					rich_message: { markdown, skip_entity_detection: true },
-				});
-				if (outcome === "rejected") await fallback();
-			} else {
-				await fallback();
+			} finally {
+				if (this.#btwTerminalDeliveries.get(requestId) === terminalDelivery) {
+					this.#btwTerminalDeliveries.delete(requestId);
+				}
+				try {
+					// Unknown transport outcomes stay single-attempt to avoid duplicate Telegram replies.
+					if (terminalDelivery.invalidated && deliveryOutcome === "not_delivered") {
+						await this.#terminalizeBtwTurn(requestId, pending, this.#stoppingBtw);
+					} else {
+						this.#takeBtwTurn(requestId, pending);
+					}
+				} finally {
+					terminalDelivery.finish();
+				}
 			}
 			return;
 		}
