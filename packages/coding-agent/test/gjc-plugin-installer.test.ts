@@ -54,6 +54,29 @@ async function getAvailablePort(): Promise<number> {
 	return promise;
 }
 
+async function startRejectingGitServer(): Promise<{ url: string; stop: () => Promise<void> }> {
+	const server = createServer(socket => socket.destroy());
+	const { promise, resolve, reject } = Promise.withResolvers<number>();
+	server.once("error", reject);
+	server.listen(0, "127.0.0.1", () => {
+		const address = server.address();
+		if (!address || typeof address === "string") reject(new Error("Failed to start rejecting git server"));
+		else resolve(address.port);
+	});
+	const port = await promise;
+	return {
+		url: `git://127.0.0.1:${port}/no-such-repo.git`,
+		stop: async () => {
+			const { promise: closed, resolve: resolveClosed, reject: rejectClosed } = Promise.withResolvers<void>();
+			server.close(error => {
+				if (error) rejectClosed(error);
+				else resolveClosed();
+			});
+			await closed;
+		},
+	};
+}
+
 async function mkGitDaemonRepo(manifest: object): Promise<{ url: string; stop: () => Promise<void> }> {
 	const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-git-src-"));
 	tempDirs.push(base);
@@ -180,10 +203,7 @@ describe("GJC plugin installer", () => {
 		const res = spawnSync("tar", ["-czf", tarball, "-C", sixSurface, "."], {
 			env: { ...process.env, COPYFILE_DISABLE: "1" },
 		});
-		if (res.status !== 0) {
-			// tar unavailable in this environment; skip without failing the suite.
-			return;
-		}
+		expect(res.status).toBe(0);
 		const result = await installGjcPluginBundle(tarball, { scope: "project", cwd });
 		expect(result.status).toBe("installed");
 		expect(await isGjcPluginBundleSource(tarball)).toBe(true);
@@ -223,12 +243,15 @@ describe("GJC plugin installer", () => {
 
 	test("an invalid git source maps stderr to GjcPluginLoadError(install_conflict)", async () => {
 		const cwd = await mkProjectCwd();
-		const closedPort = await getAvailablePort();
-		const badUrl = `git://127.0.0.1:${closedPort}/no-such-repo.git`;
-		await expect(installGjcPluginBundle(badUrl, { scope: "project", cwd })).rejects.toMatchObject({
-			code: "install_conflict",
-			name: "GjcPluginLoadError",
-		});
+		const rejectingServer = await startRejectingGitServer();
+		try {
+			await expect(installGjcPluginBundle(rejectingServer.url, { scope: "project", cwd })).rejects.toMatchObject({
+				code: "install_conflict",
+				name: "GjcPluginLoadError",
+			});
+		} finally {
+			await rejectingServer.stop();
+		}
 		const registry = await readRegistry("project", cwd);
 		expect(registry.plugins).toEqual([]);
 		expect(await exists(path.join(cwd, ".gjc", "gjc-plugins", "no-such-repo"))).toBe(false);
