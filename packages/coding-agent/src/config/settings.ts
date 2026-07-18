@@ -388,7 +388,7 @@ export class Settings implements NotificationSettingsReader {
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
-		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, "config.yml");
+		this.#configPath = options.inMemory ? null : path.resolve(this.#agentDir, "config.yml");
 		this.#persist = !options.inMemory;
 
 		if (options.overrides) {
@@ -706,13 +706,16 @@ export class Settings implements NotificationSettingsReader {
 		}));
 		for (const entry of revisions) this.#pathRevisions.set(entry.patch.path, entry.revision);
 
+		const commit = applyAtomicYamlPatches(this.#configPath, durablePatches, {
+			validateRoot: (root, currentPatches) =>
+				this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
+			onRestored: restoredPatches =>
+				this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
+		});
+		const failureRefresh = this.#reserveAtomicFailureRefresh(commit);
 		try {
-			const receipt = await applyAtomicYamlPatches(this.#configPath, durablePatches, {
-				validateRoot: (root, currentPatches) =>
-					this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
-				onRestored: restoredPatches =>
-					this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
-			});
+			const receipt = await commit;
+			await failureRefresh;
 			const appliedNotificationMutation = this.#applyDurableBatch(revisions);
 			this.#recordNotificationValidationBatchApply(notificationValidationGuard, appliedNotificationMutation);
 			return receipt;
@@ -723,6 +726,7 @@ export class Settings implements NotificationSettingsReader {
 					else this.#pathRevisions.set(entry.patch.path, entry.previousRevision);
 				}
 			}
+			await failureRefresh;
 			if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 			throw error;
 		}
@@ -743,38 +747,41 @@ export class Settings implements NotificationSettingsReader {
 		this.#releasePendingSaveSlot();
 		let revisions: DurableBatchRevision[] = [];
 		const notificationValidationGuard = this.#notificationValidationRestoreGuard();
+		const commit = applyAtomicYamlPatchesWithCurrent(
+			this.#configPath,
+			async current => {
+				const patches = await buildPatches(structuredClone(current));
+				const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
+					if (!isAtomicSettingsPath(patch.path)) {
+						throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
+					}
+					if (patch.op === "unset") return { path: patch.path, op: "unset" };
+					if (patch.value === undefined) {
+						throw new TypeError(
+							`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`,
+						);
+					}
+					return { path: patch.path, op: "set", value: structuredClone(patch.value) };
+				});
+				revisions = durablePatches.map(patch => ({
+					patch,
+					revision: ++this.#nextRevision,
+					previousRevision: this.#pathRevisions.get(patch.path),
+				}));
+				for (const entry of revisions) this.#pathRevisions.set(entry.patch.path, entry.revision);
+				return durablePatches;
+			},
+			{
+				validateRoot: (root, currentPatches) =>
+					this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
+				onRestored: restoredPatches =>
+					this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
+			},
+		);
+		const failureRefresh = this.#reserveAtomicFailureRefresh(commit);
 		try {
-			const receipt = await applyAtomicYamlPatchesWithCurrent(
-				this.#configPath,
-				async current => {
-					const patches = await buildPatches(structuredClone(current));
-					const durablePatches: AtomicYamlPatch[] = patches.map(patch => {
-						if (!isAtomicSettingsPath(patch.path)) {
-							throw new Error(`Unknown setting path for atomic batch: ${patch.path}`);
-						}
-						if (patch.op === "unset") return { path: patch.path, op: "unset" };
-						if (patch.value === undefined) {
-							throw new TypeError(
-								`Settings set patch for ${patch.path} cannot carry undefined; use unset instead.`,
-							);
-						}
-						return { path: patch.path, op: "set", value: structuredClone(patch.value) };
-					});
-					revisions = durablePatches.map(patch => ({
-						patch,
-						revision: ++this.#nextRevision,
-						previousRevision: this.#pathRevisions.get(patch.path),
-					}));
-					for (const entry of revisions) this.#pathRevisions.set(entry.patch.path, entry.revision);
-					return durablePatches;
-				},
-				{
-					validateRoot: (root, currentPatches) =>
-						this.#rejectAtomicNotificationRepairForMalformedRoot(currentPatches, root),
-					onRestored: restoredPatches =>
-						this.#applyRestoredDurableBatch(revisions, restoredPatches, notificationValidationGuard),
-				},
-			);
+			const receipt = await commit;
+			await failureRefresh;
 			const appliedNotificationMutation = this.#applyDurableBatch(revisions);
 			this.#recordNotificationValidationBatchApply(notificationValidationGuard, appliedNotificationMutation);
 			return receipt;
@@ -785,6 +792,7 @@ export class Settings implements NotificationSettingsReader {
 					else this.#pathRevisions.set(entry.patch.path, entry.previousRevision);
 				}
 			}
+			await failureRefresh;
 			if (this.#modified.size > 0 && !this.#pendingSaveSlot) this.#queueSave();
 			throw error;
 		}
@@ -1806,14 +1814,34 @@ export class Settings implements NotificationSettingsReader {
 		return applicable.some(patch => isNotificationSettingsPath(patch.path));
 	}
 
+	#reserveAtomicFailureRefresh(commit: Promise<unknown>): Promise<void> {
+		if (!this.#persist || !this.#configPath) return Promise.resolve();
+		return enqueueAtomicYamlOperation(this.#configPath, async canonicalPath => {
+			try {
+				await commit;
+				return;
+			} catch {
+				// The original commit error remains authoritative. Recovery failures
+				// are diagnostic only and must not replace it.
+			}
+			try {
+				await this.#refreshDurableSettingsUnderQueue(canonicalPath);
+			} catch (refreshError) {
+				logger.warn("Settings: refresh after atomic batch failure failed", { error: String(refreshError) });
+			}
+		});
+	}
+	async #refreshDurableSettingsUnderQueue(canonicalPath: string): Promise<void> {
+		const previousFingerprint = this.#durableNotificationFingerprint;
+		const current = await this.#loadYaml(canonicalPath);
+		if (previousFingerprint !== this.#durableNotificationFingerprint) this.#notificationValidationGeneration++;
+		this.#replaceGlobalWithDurable(current);
+	}
 	async #refreshDurableSettings(): Promise<void> {
 		if (!this.#persist || !this.#configPath) return;
-		await enqueueAtomicYamlOperation(this.#configPath, async canonicalPath => {
-			const previousFingerprint = this.#durableNotificationFingerprint;
-			const current = await this.#loadYaml(canonicalPath);
-			if (previousFingerprint !== this.#durableNotificationFingerprint) this.#notificationValidationGeneration++;
-			this.#replaceGlobalWithDurable(current);
-		});
+		await enqueueAtomicYamlOperation(this.#configPath, canonicalPath =>
+			this.#refreshDurableSettingsUnderQueue(canonicalPath),
+		);
 	}
 	#assertDurableConfigWritable(): void {
 		if (this.canWriteDurableConfig()) return;

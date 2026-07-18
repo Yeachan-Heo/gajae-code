@@ -2061,7 +2061,7 @@ export class InputController {
 			throw error;
 		}
 		this.ctx.hideThinkingBlock = hideThinkingBlock;
-		this.ctx.session.agent.hideThinkingSummary = hideThinkingBlock;
+		this.ctx.session.setThinkingVisibility(hideThinkingBlock ? "hidden" : "visible");
 
 		// Rebuild chat from session messages
 		// Detach the live streaming component before the disposing clear() so the

@@ -515,6 +515,28 @@ describe("notifications config", () => {
 			}
 		}
 	}, 30_000);
+	test("Settings keeps malformed notification leaves fail-closed with a relative agent directory", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-relative-agent-dir-"));
+		tempDirs.push(root);
+		const agentDir = path.join(root, "agent");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			`${JSON.stringify({ notifications: { enabled: "invalid" } })}\n`,
+		);
+
+		const settings = await Settings.loadForScope({
+			cwd: root,
+			agentDir: path.relative(process.cwd(), agentDir),
+		});
+		try {
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			await settings.flush();
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
 	test("Settings revalidates malformed notification config after direct repairs only", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notification-direct-repair-"));
 		tempDirs.push(root);

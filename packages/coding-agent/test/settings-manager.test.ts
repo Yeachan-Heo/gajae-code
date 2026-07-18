@@ -476,6 +476,71 @@ describe("Settings", () => {
 			await settings.flushOrThrow();
 			expect((await readSettings()).notifications).toEqual({ redact: true });
 		});
+		it("fails closed after an atomic read failure", async () => {
+			for (const commit of [
+				(settings: Settings) =>
+					settings.commitAtomicBatch([{ path: "theme.dark", op: "set" as const, value: "red-claw" }]),
+				(settings: Settings) =>
+					settings.commitAtomicBatchWithCurrent(() => [
+						{ path: "theme.dark", op: "set" as const, value: "red-claw" },
+					]),
+			]) {
+				await writeSettings({ theme: { dark: "blue-crab" } });
+				const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+				await Bun.write(getConfigPath(), "notifications: [");
+
+				const failure = await commit(settings).catch(error => error);
+				expect(failure).toBeInstanceOf(Error);
+				expect(settings.canWriteDurableConfig()).toBe(false);
+				expect(settings.getSchemaReport()).toMatchObject({
+					valid: false,
+					issues: [{ path: "config.yml", kind: "invalid" }],
+				});
+				expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+				await expect(
+					settings.commitAtomicBatch([{ path: "theme.dark", op: "set", value: "red-claw" }]),
+				).rejects.toThrow("Repair config.yml");
+				settings.getStorage()?.close();
+			}
+		});
+		it("keeps atomic failure recovery ahead of causally dependent queued work", async () => {
+			for (const commit of [
+				(settings: Settings) =>
+					settings.commitAtomicBatch([{ path: "notifications.enabled", op: "set" as const, value: true }]),
+				(settings: Settings) =>
+					settings.commitAtomicBatchWithCurrent(() => [
+						{ path: "notifications.enabled", op: "set" as const, value: true },
+					]),
+			]) {
+				await writeSettings({ theme: { dark: "blue-crab" } });
+				const settings = await Settings.loadForScope({ cwd: projectDir, agentDir });
+				await Bun.write(getConfigPath(), "malformed-root\n");
+
+				const firstSettled = Promise.withResolvers<void>();
+				const first = commit(settings);
+				void first.finally(() => firstSettled.resolve()).catch(() => undefined);
+				const later = settings.commitAtomicBatchWithCurrent(async () => {
+					await firstSettled.promise;
+					return [];
+				});
+				const bounded = await Promise.race([
+					Promise.allSettled([first, later]),
+					Bun.sleep(2_000).then(() => "timeout" as const),
+				]);
+
+				expect(bounded).not.toBe("timeout");
+				expect(bounded).toMatchObject([
+					{
+						status: "rejected",
+						reason: {
+							message: "Cannot atomically repair notification settings while config.yml has a malformed root.",
+						},
+					},
+					{ status: "fulfilled" },
+				]);
+				settings.getStorage()?.close();
+			}
+		});
 
 		it("exposes an ordinary set and hook before disk completion without reentrant flush deadlock", async () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });

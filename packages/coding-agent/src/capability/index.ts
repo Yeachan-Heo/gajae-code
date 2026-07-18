@@ -259,10 +259,18 @@ export function initializeWithSettings(activeSettings: Settings): void {
 	for (const id of disabled) disabledProviders.add(id);
 }
 
+function assertDisabledProvidersWritable(activeSettings: Settings): void {
+	if (!activeSettings.canWriteDurableConfig()) {
+		throw new Error(
+			"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+		);
+	}
+}
 /**
  * Persist current disabled providers to settings.
  */
 function persistDisabledProviders(activeSettings: Settings, providers: ReadonlySet<string>): void {
+	assertDisabledProvidersWritable(activeSettings);
 	activeSettings.set("disabledProviders", Array.from(providers));
 }
 
