@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { isProcessIncarnation, processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { ChatEffectJournal, MAX_TERMINAL_CHAT_EFFECTS } from "../src/sdk/bus/chat-effect-journal";
 import {
 	boundedDedupe,
@@ -119,15 +120,73 @@ describe("ConversationStore", () => {
 			fs,
 			pid: 202,
 			pidAlive: pid => pid !== 101,
-			pidIncarnation: pid => (pid === 303 ? "live" : "writer"),
+			pidIncarnation: pid => (pid === 303 ? "darwin:1700000000:123456" : "darwin:1700000000:654321"),
 			lockTimeoutMs: 0,
 		});
-		fs.files.set(`${store.filePath}.lock`, JSON.stringify({ pid: 101, incarnation: "dead", timestamp: 1 }));
-		fs.files.set(`${store.filePath}.lock.reclaim`, JSON.stringify({ pid: 303, incarnation: "live", timestamp: 1 }));
+		fs.files.set(
+			`${store.filePath}.lock`,
+			JSON.stringify({ pid: 101, incarnation: "darwin:1700000000:999999", timestamp: 1 }),
+		);
+		fs.files.set(
+			`${store.filePath}.lock.reclaim`,
+			JSON.stringify({ pid: 303, incarnation: "darwin:1700000000:123456", timestamp: 1 }),
+		);
 		await expect(store.write("mapping", undefined, record(1))).rejects.toBeInstanceOf(ConversationLockTimeoutError);
 		expect(fs.files.get(`${store.filePath}.lock.reclaim`)).toBe(
-			JSON.stringify({ pid: 303, incarnation: "live", timestamp: 1 }),
+			JSON.stringify({ pid: 303, incarnation: "darwin:1700000000:123456", timestamp: 1 }),
 		);
+	});
+
+	test("default-path lock uses canonical processIncarnation format", async () => {
+		let capturedLock: string | undefined;
+		class CapturingFs extends MemoryConversationStoreFs {
+			override async open(file: string, flags: string) {
+				const handle = await super.open(file, flags);
+				if (flags === "wx" && file.endsWith(".lock")) {
+					return {
+						...handle,
+						writeFile: async (data: string, encoding: "utf8") => {
+							capturedLock = data.trim();
+							await handle.writeFile(data, encoding);
+						},
+					};
+				}
+				return handle;
+			}
+		}
+		const capturingFs = new CapturingFs();
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs: capturingFs,
+			pid: process.pid,
+			pidAlive: () => true,
+		});
+		await store.write("mapping", undefined, record(1));
+		expect(capturedLock).toBeDefined();
+		const lock = JSON.parse(capturedLock!);
+		expect(lock.pid).toBe(process.pid);
+		// The incarnation must be canonical (not a locale-dependent lstart string).
+		expect(isProcessIncarnation(lock.incarnation)).toBe(true);
+		expect(lock.incarnation).toBe(processIncarnation(process.pid));
+	});
+
+	test("reclaims a non-canonical locale-dependent Darwin lock as not-owned", async () => {
+		const fs = new MemoryConversationStoreFs();
+		const store = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs,
+			pid: 202,
+			pidAlive: () => true,
+			pidIncarnation: () => "darwin:1700000000:123456",
+		});
+		// Simulate a stale lock written by the old locale-dependent defaultPidIncarnation.
+		fs.files.set(
+			`${store.filePath}.lock`,
+			JSON.stringify({ pid: 101, incarnation: "darwin:Thu Jul 17 10:00:00 2025", timestamp: 1 }),
+		);
+		expect(await store.write("mapping", undefined, record(1))).toBe(true);
 	});
 
 	test("serializes separate store instances so independent mapping updates do not overwrite one another", async () => {

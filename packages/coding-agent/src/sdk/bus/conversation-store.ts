@@ -1,8 +1,7 @@
-import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 
 export const CONVERSATION_STORE_VERSION = 1;
 export const MAX_DEDUPE_IDS = 128;
@@ -111,7 +110,7 @@ export class ConversationStore<T extends ConversationRecord> {
 		this.#fs = input.fs ?? nodeFs;
 		this.#clock = input.now ?? Date.now;
 		this.#pid = input.pid ?? process.pid;
-		this.#pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
+		this.#pidIncarnation = input.pidIncarnation ?? processIncarnation;
 		this.#pidAlive = input.pidAlive ?? defaultPidAlive;
 		this.#sleep = input.sleep ?? (async ms => await Bun.sleep(ms));
 		this.#lockTimeoutMs = input.lockTimeoutMs ?? 1_000;
@@ -289,9 +288,9 @@ export class ConversationStore<T extends ConversationRecord> {
 		const currentIncarnation = this.#pidIncarnation(parsed.pid);
 		return (
 			!this.#pidAlive(parsed.pid) ||
-			(currentIncarnation !== undefined &&
-				parsed.incarnation !== "unavailable" &&
-				currentIncarnation !== parsed.incarnation)
+			(parsed.incarnation !== "unavailable" &&
+				(!isProcessIncarnation(parsed.incarnation) ||
+					(currentIncarnation !== undefined && currentIncarnation !== parsed.incarnation)))
 		);
 	}
 	async #isExpiredUnpublishedLock(lockFile: string): Promise<boolean> {
@@ -354,29 +353,6 @@ function defaultPidAlive(pid: number): boolean {
 	} catch {
 		return false;
 	}
-}
-
-function defaultPidIncarnation(pid: number): string | undefined {
-	if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-	if (process.platform === "linux") {
-		try {
-			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-			return `linux:${
-				stat
-					.slice(stat.lastIndexOf(")") + 2)
-					.trim()
-					.split(/\s+/)[19]
-			}`;
-		} catch {
-			return undefined;
-		}
-	}
-	if (process.platform === "darwin") {
-		const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
-		const startedAt = result.status === 0 ? result.stdout.trim() : "";
-		return startedAt ? `darwin:${startedAt}` : undefined;
-	}
-	return undefined;
 }
 
 function isConversationStoreLock(value: unknown): value is ConversationStoreLock {

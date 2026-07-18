@@ -95,7 +95,8 @@ export function parseDarwinProcessIncarnation(info: Uint8Array): string | undefi
 	}
 }
 
-function isProcessIncarnation(value: unknown): value is string {
+/** Whether `value` is a canonical process-incarnation string (`linux:`/`darwin:`/`windows:`). */
+export function isProcessIncarnation(value: unknown): value is string {
 	return (
 		typeof value === "string" &&
 		(/^(?:linux:\d+|darwin:[1-9]\d*:\d+)$/.test(value) ||

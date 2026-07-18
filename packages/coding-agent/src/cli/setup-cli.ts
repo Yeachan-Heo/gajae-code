@@ -564,7 +564,7 @@ async function confirmImport(count: number): Promise<boolean> {
  */
 export interface CredentialsSetupDependencies {
 	openStore?: typeof SqliteAuthCredentialStore.open;
-	createAuthStorage?: (store: Awaited<ReturnType<typeof SqliteAuthCredentialStore.open>>) => AuthStorage;
+	createAuthStorage?: (store: SqliteAuthCredentialStore) => AuthStorage;
 	discover?: Parameters<typeof runExternalCredentialAutoImport>[0]["discover"];
 }
 

@@ -43,7 +43,7 @@ export class BrokerTransport {
 	readonly #broker: Broker;
 	readonly #token: string;
 	readonly #requestedPort: number;
-	#server: ReturnType<typeof Bun.serve> | null = null;
+	#server: Bun.Server<undefined> | null = null;
 	#port = 0;
 	constructor(broker: Broker, token: string, port = 0) {
 		this.#broker = broker;
