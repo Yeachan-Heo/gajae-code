@@ -21,6 +21,8 @@ export interface TopicRecord {
 	identitySent: boolean;
 	/** Creation timestamp (ms epoch). */
 	createdAt: number;
+	/** First positive observation that the owning endpoint is stale, dead, or missing. */
+	orphanedAt?: number;
 	/** Last applied or observed Telegram topic title. */
 	name?: string;
 	/** Naming authority. Missing values are legacy daemon-owned records. */
@@ -43,6 +45,12 @@ export interface TopicRegistryState {
 	topics: Record<string, TopicRecord>;
 }
 
+function isValidTopicId(value: unknown): value is string {
+	return (
+		typeof value === "string" && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) > 0
+	);
+}
+
 export function emptyTopicRegistryState(): TopicRegistryState {
 	return { topics: {} };
 }
@@ -56,6 +64,8 @@ export class TopicRegistry {
 	private readonly topics: Map<string, TopicRecord>;
 	/** Maps topicId -> sessionId for fast inbound routing. */
 	private readonly byTopic = new Map<string, string>();
+	/** Persisted collisions are ambiguous and must never authorize inbound routing. */
+	readonly #ambiguousTopicIds = new Set<string>();
 	/** In-flight create promises, keyed by session, to dedupe concurrent creates. */
 	private readonly inflight = new Map<string, Promise<TopicRecord>>();
 
@@ -67,7 +77,7 @@ export class TopicRegistry {
 	/** Merge serialized state and normalize authority fields from older releases. */
 	load(state: TopicRegistryState): void {
 		for (const [sessionId, raw] of Object.entries(state.topics ?? {})) {
-			if (!raw || typeof raw.topicId !== "string") continue;
+			if (!raw || !isValidTopicId(raw.topicId)) continue;
 			const hasValidUserAuthority =
 				raw.nameOwner === "user" &&
 				typeof raw.name === "string" &&
@@ -87,6 +97,9 @@ export class TopicRegistry {
 				identitySent: raw.identitySent === true,
 				createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
 				...(typeof raw.name === "string" ? { name: raw.name } : {}),
+				...(typeof raw.orphanedAt === "number" && Number.isFinite(raw.orphanedAt) && raw.orphanedAt >= 0
+					? { orphanedAt: raw.orphanedAt }
+					: {}),
 				...(hasValidUserAuthority ? { nameOwner: "user" as const } : {}),
 				...(hasValidUserAuthority && raw.nameReconcilePending === true ? { nameReconcilePending: true } : {}),
 				...(hasValidUserAuthority ? { userNameUpdateId: raw.userNameUpdateId } : {}),
@@ -94,6 +107,12 @@ export class TopicRegistry {
 				...(hasValidReplayCursor ? { replayGeneration: raw.replayGeneration, replaySeq: raw.replaySeq } : {}),
 			};
 			this.topics.set(sessionId, record);
+			if (this.#ambiguousTopicIds.has(record.topicId)) continue;
+			if (this.byTopic.has(record.topicId)) {
+				this.byTopic.delete(record.topicId);
+				this.#ambiguousTopicIds.add(record.topicId);
+				continue;
+			}
 			this.byTopic.set(record.topicId, sessionId);
 		}
 	}
@@ -119,7 +138,7 @@ export class TopicRegistry {
 	 */
 	async getOrCreateTopic(
 		sessionId: string,
-		create: () => Promise<string>,
+		create: () => Promise<unknown>,
 		now: () => number = Date.now,
 		name?: string,
 	): Promise<TopicRecord> {
@@ -133,8 +152,15 @@ export class TopicRegistry {
 		if (pending) return pending;
 		const promise = (async () => {
 			const topicId = await create();
+			if (!isValidTopicId(topicId)) throw new Error("createForumTopic: invalid message_thread_id");
 			const record: TopicRecord = { topicId, name, identitySent: false, createdAt: now() };
 			this.topics.set(sessionId, record);
+			if (this.#ambiguousTopicIds.has(topicId)) return record;
+			if (this.byTopic.has(topicId)) {
+				this.byTopic.delete(topicId);
+				this.#ambiguousTopicIds.add(topicId);
+				return record;
+			}
 			this.byTopic.set(topicId, sessionId);
 			return record;
 		})();
@@ -163,6 +189,21 @@ export class TopicRegistry {
 		const record = this.topics.get(sessionId);
 		if (!record || record.identityKey === identityKey) return false;
 		record.identityKey = identityKey;
+		return true;
+	}
+	/** Start the orphan grace clock on the first positive liveness-loss observation. */
+	markOrphaned(sessionId: string, now: number): boolean {
+		const record = this.topics.get(sessionId);
+		if (!record || record.orphanedAt !== undefined) return false;
+		record.orphanedAt = now;
+		return true;
+	}
+
+	/** Clear a prior orphan observation after the endpoint is positively live again. */
+	clearOrphaned(sessionId: string): boolean {
+		const record = this.topics.get(sessionId);
+		if (!record || record.orphanedAt === undefined) return false;
+		delete record.orphanedAt;
 		return true;
 	}
 
@@ -246,7 +287,7 @@ export class TopicRegistry {
 		const record = this.topics.get(sessionId);
 		if (!record) return false;
 		this.topics.delete(sessionId);
-		this.byTopic.delete(record.topicId);
+		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
 		return true;
 	}
 

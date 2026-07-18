@@ -30,7 +30,7 @@ import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai";
 import { NotificationServer, nativeBuildInfo } from "@gajae-code/natives";
-import { logger, postmortem, VERSION } from "@gajae-code/utils";
+import { logger, postmortem, prompt, VERSION } from "@gajae-code/utils";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type {
@@ -38,6 +38,7 @@ import type {
 	WorkflowGateTerminalController,
 	WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
+import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -923,6 +924,10 @@ interface SessionRuntime {
 	inFlightTools: Map<string, { toolName: string; args: unknown }>;
 	/** Cancels the postmortem cleanup that emits `session_closed` on process teardown. */
 	cancelPostmortemCleanup: () => void;
+	/** Aborts active side turns when their owning logical session becomes unavailable. */
+	abortEphemeralTurns: () => void;
+	/** Stops optional broker presence heartbeats. */
+	stopBrokerHeartbeat: () => void;
 }
 
 const SENSITIVE_MODEL_LABEL =
@@ -1022,6 +1027,7 @@ const defaultConfig: NotificationConfig = {
 	rich: { enabled: true },
 	richDraft: { enabled: false },
 	topics: {},
+	btw: { enabled: true },
 };
 
 export function notificationsEnabled(): boolean {
@@ -2318,6 +2324,343 @@ function sdkControlSurface(
 	return surface;
 }
 
+const EPHEMERAL_TURN_DEADLINE_MS = 120_000;
+const EPHEMERAL_TURN_TTL_MS = 300_000;
+const EPHEMERAL_TURN_MAX_RECORDS = 256;
+const EPHEMERAL_TURN_MAX_ACTIVE_PER_SESSION = 2;
+const EPHEMERAL_TURN_MAX_RESULT_BYTES = 262_144;
+
+interface EphemeralTurnTuple {
+	sessionId: string;
+	requestId: string;
+	updateId: number;
+	messageId: number;
+	threadId: string;
+}
+
+type EphemeralTurnStatus = "ok" | "busy" | "timeout" | "cancelled" | "session_unavailable" | "failed";
+
+interface EphemeralTurnAuthority {
+	sessionId: string;
+	endpointDigest: string;
+	eventGeneration: number;
+}
+
+interface EphemeralTurnEvent {
+	tuple: EphemeralTurnTuple;
+	authority: EphemeralTurnAuthority;
+	status: EphemeralTurnStatus;
+	text?: string;
+	completedAt: number;
+	expiresAt: number;
+}
+
+interface EphemeralTurnTombstone {
+	tuple: EphemeralTurnTuple;
+	authority: EphemeralTurnAuthority;
+	status: EphemeralTurnStatus;
+	completedAt: number;
+	expiresAt: number;
+}
+
+interface ActiveEphemeralTurn {
+	tuple: EphemeralTurnTuple;
+	authority: EphemeralTurnAuthority;
+	connectionId: string;
+	staleConnectionIds: Set<string>;
+	controller: AbortController;
+	subscribers: Set<string>;
+	deadline: NodeJS.Timeout;
+	abortListener: () => void;
+}
+
+function ephemeralTuple(frame: Record<string, unknown>): EphemeralTurnTuple | undefined {
+	const { sessionId, requestId, updateId, messageId, threadId } = frame;
+	return typeof sessionId === "string" &&
+		typeof requestId === "string" &&
+		typeof updateId === "number" &&
+		Number.isSafeInteger(updateId) &&
+		typeof messageId === "number" &&
+		Number.isSafeInteger(messageId) &&
+		messageId > 0 &&
+		typeof threadId === "string"
+		? { sessionId, requestId, updateId, messageId, threadId }
+		: undefined;
+}
+
+function sameEphemeralTuple(left: EphemeralTurnTuple, right: EphemeralTurnTuple): boolean {
+	return (
+		left.sessionId === right.sessionId &&
+		left.requestId === right.requestId &&
+		left.updateId === right.updateId &&
+		left.messageId === right.messageId &&
+		left.threadId === right.threadId
+	);
+}
+
+function ephemeralTupleKey(tuple: EphemeralTurnTuple): string {
+	return JSON.stringify([tuple.sessionId, tuple.requestId, tuple.updateId, tuple.messageId, tuple.threadId]);
+}
+
+/** Host-owned, bounded idempotency and cancellation lifecycle for v3 side turns. */
+export class EphemeralTurnHost {
+	#active = new Map<string, ActiveEphemeralTurn>();
+	#terminalEvents = new Map<string, EphemeralTurnEvent>();
+	#tombstones = new Map<string, EphemeralTurnTombstone>();
+	#expiryTimer: NodeJS.Timeout | undefined;
+	#disposed = false;
+	#now: () => number;
+	#sendTo: (connectionId: string, frame: Record<string, unknown>) => void;
+	#execute: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
+	#authority: EphemeralTurnAuthority | undefined;
+
+	constructor(
+		sendTo: (connectionId: string, frame: Record<string, unknown>) => void,
+		execute: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>,
+		now: () => number = Date.now,
+	) {
+		this.#sendTo = sendTo;
+		this.#execute = execute;
+		this.#now = now;
+	}
+
+	configureAuthority(authority: EphemeralTurnAuthority): void {
+		if (this.#authority && !this.#sameAuthority(this.#authority, authority))
+			for (const active of [...this.#active.values()]) active.controller.abort("session_unavailable");
+		this.#authority = { ...authority };
+	}
+
+	dispose(): void {
+		this.#disposed = true;
+		for (const active of this.#active.values()) active.controller.abort("session_unavailable");
+		if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
+		this.#expiryTimer = undefined;
+		this.#terminalEvents.clear();
+		this.#tombstones.clear();
+	}
+
+	handle(connectionId: string, frame: Record<string, unknown>): boolean {
+		if (frame.type === "ephemeral_turn") return this.#start(connectionId, frame);
+		if (frame.type === "ephemeral_turn_cancel") return this.#cancel(connectionId, frame);
+		return false;
+	}
+
+	sessionUnavailable(sessionId: string): void {
+		for (const active of [...this.#active.values()])
+			if (active.tuple.sessionId === sessionId) active.controller.abort("session_unavailable");
+	}
+
+	/** Testable event-ring eviction boundary; tombstones remain idempotency authority. */
+	evictTerminalEvents(): void {
+		this.#terminalEvents.clear();
+	}
+
+	#start(connectionId: string, frame: Record<string, unknown>): boolean {
+		const tuple = ephemeralTuple(frame);
+		const question = typeof frame.question === "string" ? frame.question.trim() : "";
+		const authority = this.#authority;
+		if (!tuple || !question || !authority || tuple.sessionId !== authority.sessionId) return true;
+		this.#purge();
+		const key = ephemeralTupleKey(tuple);
+		const active = this.#active.get(key);
+		if (active) {
+			if (!this.#sameAuthority(active.authority, authority)) {
+				active.controller.abort("session_unavailable");
+				return true;
+			}
+			if (active.connectionId === connectionId || active.staleConnectionIds.has(connectionId)) return true;
+			active.staleConnectionIds.add(active.connectionId);
+			active.connectionId = connectionId;
+			active.subscribers = new Set([connectionId]);
+			return true;
+		}
+		const event = this.#terminalEvents.get(key);
+		if (event) {
+			if (this.#sameAuthority(event.authority, authority))
+				this.#send(connectionId, event.tuple, event.status, event.text);
+			return true;
+		}
+		const tombstone = this.#tombstones.get(key);
+		if (tombstone) {
+			if (this.#sameAuthority(tombstone.authority, authority)) this.#send(connectionId, tombstone.tuple, "failed");
+			return true;
+		}
+		for (const candidate of this.#tombstones.values()) {
+			if (candidate.tuple.sessionId === tuple.sessionId && candidate.tuple.requestId === tuple.requestId) {
+				logger.warn("notifications: ephemeral request id conflict", {
+					sessionId: tuple.sessionId,
+					requestId: tuple.requestId,
+				});
+				return true;
+			}
+		}
+		for (const candidate of this.#active.values()) {
+			if (candidate.tuple.sessionId === tuple.sessionId && candidate.tuple.requestId === tuple.requestId) {
+				logger.warn("notifications: ephemeral request id conflict", {
+					sessionId: tuple.sessionId,
+					requestId: tuple.requestId,
+				});
+				return true;
+			}
+		}
+		const activeForSession = [...this.#active.values()].filter(
+			candidate => candidate.tuple.sessionId === tuple.sessionId,
+		).length;
+		if (activeForSession >= EPHEMERAL_TURN_MAX_ACTIVE_PER_SESSION) {
+			const completedAt = this.#now();
+			this.#finish(key, {
+				tuple,
+				authority: { ...authority },
+				status: "busy",
+				completedAt,
+				expiresAt: completedAt + EPHEMERAL_TURN_TTL_MS,
+			});
+			this.#send(connectionId, tuple, "busy");
+			return true;
+		}
+		const controller = new AbortController();
+		const abortListener = () => this.#complete(key, this.#abortStatus(controller.signal));
+		const record: ActiveEphemeralTurn = {
+			tuple,
+			authority: { ...authority },
+			connectionId,
+			controller,
+			subscribers: new Set([connectionId]),
+			staleConnectionIds: new Set(),
+			deadline: setTimeout(() => controller.abort("timeout"), EPHEMERAL_TURN_DEADLINE_MS),
+			abortListener,
+		};
+		this.#active.set(key, record);
+		controller.signal.addEventListener("abort", abortListener, { once: true });
+		void this.#execute(question, controller.signal).then(
+			result =>
+				this.#complete(
+					key,
+					controller.signal.aborted ? this.#abortStatus(controller.signal) : "ok",
+					result.replyText,
+				),
+			() => this.#complete(key, controller.signal.aborted ? this.#abortStatus(controller.signal) : "failed"),
+		);
+		return true;
+	}
+
+	#cancel(connectionId: string, frame: Record<string, unknown>): boolean {
+		const tuple = ephemeralTuple(frame);
+		const authority = this.#authority;
+		if (!tuple || frame.reason !== "daemon_shutdown" || !authority || tuple.sessionId !== authority.sessionId)
+			return true;
+		const active = this.#active.get(ephemeralTupleKey(tuple));
+		if (
+			!active ||
+			!sameEphemeralTuple(active.tuple, tuple) ||
+			active.connectionId !== connectionId ||
+			!this.#sameAuthority(active.authority, authority)
+		)
+			return true;
+		active.controller.abort("cancelled");
+		return true;
+	}
+
+	#abortStatus(signal: AbortSignal): EphemeralTurnStatus {
+		return signal.reason === "timeout"
+			? "timeout"
+			: signal.reason === "session_unavailable"
+				? "session_unavailable"
+				: "cancelled";
+	}
+
+	#sameAuthority(left: EphemeralTurnAuthority, right: EphemeralTurnAuthority): boolean {
+		return (
+			left.sessionId === right.sessionId &&
+			left.endpointDigest === right.endpointDigest &&
+			left.eventGeneration === right.eventGeneration
+		);
+	}
+
+	#complete(key: string, status: EphemeralTurnStatus, text?: string): void {
+		const active = this.#active.get(key);
+		if (!active) return;
+		clearTimeout(active.deadline);
+		active.controller.signal.removeEventListener("abort", active.abortListener);
+		this.#active.delete(key);
+		if (this.#disposed) return;
+		const terminalStatus =
+			status === "ok" && Buffer.byteLength(text ?? "", "utf8") > EPHEMERAL_TURN_MAX_RESULT_BYTES ? "failed" : status;
+		const completedAt = this.#now();
+		const terminal: EphemeralTurnEvent = {
+			tuple: active.tuple,
+			authority: active.authority,
+			status: terminalStatus,
+			...(terminalStatus === "ok" ? { text: text ?? "" } : {}),
+			completedAt,
+			expiresAt: completedAt + EPHEMERAL_TURN_TTL_MS,
+		};
+		this.#finish(key, terminal);
+		for (const connectionId of active.subscribers)
+			this.#send(connectionId, terminal.tuple, terminal.status, terminal.text);
+	}
+
+	#finish(key: string, terminal: EphemeralTurnEvent): void {
+		this.#terminalEvents.set(key, terminal);
+		this.#tombstones.set(key, {
+			tuple: terminal.tuple,
+			authority: terminal.authority,
+			status: terminal.status,
+			completedAt: terminal.completedAt,
+			expiresAt: terminal.expiresAt,
+		});
+		this.#purge();
+		while (this.#terminalEvents.size > EPHEMERAL_TURN_MAX_RECORDS)
+			this.#terminalEvents.delete(this.#terminalEvents.keys().next().value!);
+		while (this.#tombstones.size > EPHEMERAL_TURN_MAX_RECORDS) {
+			const oldestKey = this.#tombstones.keys().next().value!;
+			this.#tombstones.delete(oldestKey);
+			this.#terminalEvents.delete(oldestKey);
+		}
+		this.#scheduleExpiry();
+	}
+
+	#send(connectionId: string, tuple: EphemeralTurnTuple, status: EphemeralTurnStatus, text?: string): void {
+		this.#sendTo(connectionId, {
+			type: "ephemeral_turn_result",
+			...tuple,
+			status,
+			...(status === "ok" ? { text: text ?? "" } : {}),
+		});
+	}
+
+	#purge(): void {
+		const now = this.#now();
+		for (const [key, tombstone] of this.#tombstones) {
+			if (tombstone.expiresAt > now) continue;
+			this.#tombstones.delete(key);
+			this.#terminalEvents.delete(key);
+		}
+	}
+
+	#scheduleExpiry(): void {
+		if (this.#disposed) return;
+		if (this.#expiryTimer) clearTimeout(this.#expiryTimer);
+		const nextExpiry = [...this.#tombstones.values()].reduce(
+			(earliest, tombstone) => Math.min(earliest, tombstone.expiresAt),
+			Number.POSITIVE_INFINITY,
+		);
+		if (!Number.isFinite(nextExpiry)) {
+			this.#expiryTimer = undefined;
+			return;
+		}
+		this.#expiryTimer = setTimeout(
+			() => {
+				this.#expiryTimer = undefined;
+				if (this.#disposed) return;
+				this.#purge();
+				this.#scheduleExpiry();
+			},
+			Math.max(0, nextExpiry - this.#now()),
+		);
+		this.#expiryTimer.unref();
+	}
+}
 /** Parse only v3 frames carried through the existing control-command seam. */
 function sdkInboundFrame(commandJson: string | undefined): Record<string, unknown> | undefined {
 	if (!commandJson) return undefined;
@@ -2353,6 +2696,7 @@ export function createNotificationsExtension(
 		controller?: NotificationSessionController;
 
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
+		runEphemeralTurn?: (promptText: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 	} = {},
 ): void {
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
@@ -2371,6 +2715,7 @@ export function createNotificationsExtension(
 	let activeRuntimeId: string | undefined;
 	let identityControlInFlight = false;
 	let deferredIdentityRotation: { event: { previousSessionFile?: string }; ctx: ExtensionContext } | undefined;
+	let extensionShuttingDown = false;
 
 	async function ensureTelegramOwner(
 		settings: Settings,
@@ -2418,7 +2763,10 @@ export function createNotificationsExtension(
 		const activeRuntime = runtimes.get(id);
 		const requestedRuntime = retryRuntime ?? activeRuntime;
 		if (expectedRuntime && requestedRuntime !== expectedRuntime) return false;
-		if (reason === "session" && requestedRuntime) requestedRuntime.stopping = true;
+		if (reason === "session" && requestedRuntime) {
+			requestedRuntime.stopping = true;
+			requestedRuntime.abortEphemeralTurns();
+		}
 		if (reason === "session" && requestedRuntime) {
 			// Fence the exact runtime before awaiting its startup promise: a late start
 			// must observe removal and clean itself up rather than becoming reachable.
@@ -2460,6 +2808,9 @@ export function createNotificationsExtension(
 
 		try {
 			rt.cancelPostmortemCleanup();
+		} catch {}
+		try {
+			rt.stopBrokerHeartbeat();
 		} catch {}
 		try {
 			rt.disposeAnswerSource();
@@ -2625,6 +2976,7 @@ export function createNotificationsExtension(
 		}
 		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? redact, tag);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
+		let stopBrokerHeartbeat = () => {};
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
 			const quiesced = resolution.then(
@@ -2898,6 +3250,10 @@ export function createNotificationsExtension(
 		};
 
 		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>) => {
+			if (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime) {
+				abandonPromptResponse(connectionId, frame);
+				return;
+			}
 			const json = JSON.stringify(frame);
 			if (connectionId.startsWith("seam:")) {
 				try {
@@ -3054,7 +3410,9 @@ export function createNotificationsExtension(
 			workflowGate: undefined,
 			gatePresentations,
 			stopping: false,
+			abortEphemeralTurns: () => {},
 			cancelPostmortemCleanup: () => {},
+			stopBrokerHeartbeat,
 
 			redact,
 			verbosity,
@@ -3068,7 +3426,8 @@ export function createNotificationsExtension(
 			pendingInbound: new Set<number>(),
 			inFlightTools: new Map<string, { toolName: string; args: unknown }>(),
 		};
-		runtimes.set(id, runtime);
+		const initializedRuntime = runtime;
+		runtimes.set(id, initializedRuntime);
 		activeRuntimeId = id;
 		const startSettled = Promise.withResolvers<SessionStartResult>();
 		sessionStartPromises.set(id, startSettled.promise);
@@ -3102,11 +3461,21 @@ export function createNotificationsExtension(
 			} catch {}
 		};
 
+		const ephemeralTurns = new EphemeralTurnHost(sendSdkFrame, async (question, signal) => {
+			if (!options.runEphemeralTurn) throw new Error("Ephemeral turns are unavailable.");
+			return await options.runEphemeralTurn(prompt.render(btwUserPrompt, { question }), signal);
+		});
+		initializedRuntime.abortEphemeralTurns = () => ephemeralTurns.dispose();
 		try {
 			server.onSdkFrame((err, inbound) => {
 				if (err || !inbound) return;
 				try {
-					inboundSdkFrame?.(inbound.connectionId, JSON.parse(inbound.json) as Record<string, unknown>);
+					const frame = JSON.parse(inbound.json) as unknown;
+					if (!frame || typeof frame !== "object") return;
+					// Native Rust authenticates and strips the token before emitting InboundEvent.
+					const typedFrame = frame as Record<string, unknown>;
+					if (ephemeralTurns.handle(inbound.connectionId, typedFrame)) return;
+					inboundSdkFrame?.(inbound.connectionId, typedFrame);
 				} catch {}
 			});
 			// Required: the negotiated-capability callback is how the TS host learns
@@ -3488,6 +3857,14 @@ export function createNotificationsExtension(
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			const endpoint = await server.start();
+			ephemeralTurns.configureAuthority({
+				sessionId: id,
+				endpointDigest: crypto
+					.createHash("sha256")
+					.update(endpoint.url + token)
+					.digest("hex"),
+				eventGeneration: host.generation,
+			});
 			throwIfLifecycleStopped();
 			if (runtimes.get(id) !== runtime) {
 				finishStartup({ status: "failed" });
@@ -3531,17 +3908,28 @@ export function createNotificationsExtension(
 						},
 					});
 					throwIfLifecycleStopped();
-					runtime.brokerRegistrationActive = true;
-					// Host liveness is derived from alive(pid) when the index is read; heartbeats
-					// are deliberately not appended to the durable session index.
+					initializedRuntime.brokerRegistrationActive = true;
+					const timer = setInterval(() => {
+						void index
+							.append({
+								type: "host_heartbeat",
+								sessionId: id,
+								locator,
+								endpointGeneration: host.generation,
+								pid: process.pid,
+							})
+							.catch(error => logger.warn(`sdk broker heartbeat failed: ${String(error)}`));
+					}, 5_000);
+					stopBrokerHeartbeat = () => clearInterval(timer);
 				} catch (brokerError) {
 					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
 				}
 			}
 
-			const startedRuntime = runtime;
-			runtime.enableNotifications = () => {
+			initializedRuntime.stopBrokerHeartbeat = stopBrokerHeartbeat;
+			const startedRuntime = initializedRuntime;
+			initializedRuntime.enableNotifications = () => {
 				const runtime = startedRuntime;
 				if (runtime.notificationsActive) return;
 				runtime.notificationsActive = true;
@@ -3567,16 +3955,19 @@ export function createNotificationsExtension(
 					}
 				});
 			};
-			const activeRuntime = runtime;
+			const activeRuntime = initializedRuntime;
 			// A native terminal close (SIGHUP), SIGTERM, Ctrl+C exit, or fatal error
 			// skips AgentSession.dispose(), so the `session_shutdown` extension event
 			// never fires and the daemon-side topic would be orphaned. postmortem
 			// awaits registered cleanups on those paths, so send the graceful
 			// `session_closed` frame from there too. stopSession() cancels this
 			// registration on every other teardown path, so it never double-fires.
-			runtime.cancelPostmortemCleanup = postmortem.register(`notifications-session-closed:${id}`, async () => {
-				await stopSession(runtime!.id);
-			});
+			initializedRuntime.cancelPostmortemCleanup = postmortem.register(
+				`notifications-session-closed:${id}`,
+				async () => {
+					await stopSession(initializedRuntime.id);
+				},
+			);
 			logger.info(`notifications: serving session ${id} at ${endpoint.url}`);
 			// A workflow-gate emitter can be installed after session startup.
 			// Attach dynamically so the SDK bus presents every durable gate.
@@ -3656,9 +4047,9 @@ export function createNotificationsExtension(
 			};
 			activeRuntime.disposeGateEmitterListener = registerWorkflowGateEmitterListener(id, attachWorkflowGate);
 			if (ctx.workflowGate) attachWorkflowGate(ctx.workflowGate);
-			if (notificationsEnabledForSession) runtime.enableNotifications();
-			finishStartup({ status: "started", runtime });
-			return { status: "started", runtime };
+			if (notificationsEnabledForSession) initializedRuntime.enableNotifications();
+			finishStartup({ status: "started", runtime: initializedRuntime });
+			return { status: "started", runtime: initializedRuntime };
 		} catch (e) {
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
@@ -3788,13 +4179,19 @@ export function createNotificationsExtension(
 		event: { previousSessionFile?: string },
 		ctx: ExtensionContext,
 	): Promise<void> => {
+		if (extensionShuttingDown) return;
 		const newId = sessionId(ctx);
 		const prevId = activeRuntimeId ?? sessionIdFromFile(event.previousSessionFile);
 		if (prevId && prevId !== newId) {
 			controller.rekeySession(prevId, newId);
 			await stopSession(prevId);
 		}
+		if (extensionShuttingDown) return;
 		await startSession(ctx);
+		if (extensionShuttingDown) {
+			await stopSession(newId);
+			return;
+		}
 		await controller.reconcileCurrentSession(ctx);
 	};
 	api.on("session_switch", async (event, ctx) => {
@@ -4163,6 +4560,9 @@ export function createNotificationsExtension(
 	});
 
 	api.on("session_shutdown", async (_event, ctx) => {
+		extensionShuttingDown = true;
+		identityControlInFlight = false;
+		deferredIdentityRotation = undefined;
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (rt) terminalizeInFlightTools(rt, id, "unknown");

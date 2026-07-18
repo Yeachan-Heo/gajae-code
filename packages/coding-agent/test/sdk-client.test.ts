@@ -37,6 +37,20 @@ function start(
 	return { url: `ws://127.0.0.1:${server.port}`, token, stop: () => server.stop(true) };
 }
 
+async function expectResult(promise: Promise<unknown>, expected: object): Promise<void> {
+	expect(await promise).toMatchObject(expected);
+}
+
+async function expectFailure(promise: Promise<unknown>, expected: object): Promise<void> {
+	let failure: unknown;
+	try {
+		await promise;
+	} catch (error) {
+		failure = error;
+	}
+	expect(failure).toMatchObject(expected);
+}
+
 test("SdkClient correlates direct v3 control/query frames and typed errors", async () => {
 	const host = start((frame, socket) => {
 		if (frame.operation === "bad")
@@ -59,11 +73,11 @@ test("SdkClient correlates direct v3 control/query frames and typed errors", asy
 			);
 	});
 	const client = await SdkClient.connect(host.url, host.token);
-	await expect(client.control("turn.prompt", { text: "hello" })).resolves.toMatchObject({
+	await expectResult(client.control("turn.prompt", { text: "hello" }), {
 		ok: true,
 		echoed: { operation: "turn.prompt" },
 	});
-	await expect(client.query("session.metadata", {}, "next")).resolves.toMatchObject({
+	await expectResult(client.query("session.metadata", {}, "next"), {
 		ok: true,
 		echoed: { query: "session.metadata", cursor: "next" },
 	});
@@ -83,8 +97,8 @@ test("SdkClient surfaces malformed transport frames as typed protocol errors", a
 		else socket.send(JSON.stringify({ type: "control_command_result", id: frame.id, message: "not-json" }));
 	});
 	const client = await SdkClient.connect(host.url, host.token);
-	await expect(client.control("malformed")).rejects.toMatchObject({ code: "protocol_error" });
-	await expect(client.control("malformed_seam")).rejects.toMatchObject({ code: "protocol_error" });
+	await expectFailure(client.control("malformed"), { code: "protocol_error" });
+	await expectFailure(client.control("malformed_seam"), { code: "protocol_error" });
 	await client.close();
 });
 
@@ -95,7 +109,7 @@ test("SdkClient reports connection_closed when a sent request loses its response
 		socket.close(1000, "done");
 	});
 	const client = await SdkClient.connect(host.url, host.token, { timeoutMs: 1_000 });
-	await expect(client.control("close")).rejects.toMatchObject({ code: "connection_closed" });
+	await expectFailure(client.control("close"), { code: "connection_closed" });
 	expect(accepted).toMatchObject({ type: "control_request", operation: "close" });
 	await client.close();
 });
@@ -170,7 +184,7 @@ test("SdkClient ignores a stale failed socket while a retried request is in flig
 		reconnectBackoffMs: 1,
 	});
 	const response = client.control("turn.prompt", { text: "still connected" }, { timeoutMs: 1_000 });
-	await expect(response).resolves.toMatchObject({ ok: true });
+	await expectResult(response, { ok: true });
 	expect(connections).toBe(2);
 	await client.close();
 });
@@ -254,8 +268,8 @@ test("SdkClient never replays sent work onto a replacement connection", async ()
 	});
 	servers.push(server);
 	const client = await SdkClient.connect(`ws://127.0.0.1:${server.port}`, token);
-	await expect(client.control("mutate", { value: 1 })).rejects.toMatchObject({ code: "connection_closed" });
-	await expect(client.control("after_close", { value: 2 })).resolves.toMatchObject({ ok: true });
+	await expectFailure(client.control("mutate", { value: 1 }), { code: "connection_closed" });
+	await expectResult(client.control("after_close", { value: 2 }), { ok: true });
 	expect(received.filter(entry => entry.frame.operation === "mutate")).toHaveLength(1);
 	expect(received.filter(entry => entry.frame.operation === "after_close")).toHaveLength(1);
 	expect(received.map(entry => entry.frame.id)).toEqual(

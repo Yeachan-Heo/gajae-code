@@ -214,6 +214,28 @@ function rawSettingsRecord(value: unknown): RawSettings | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	return value as RawSettings;
 }
+function notificationConfigurationError(): Error {
+	return new Error("gjc_notify_daemon_invalid_configuration");
+}
+
+function notificationSettingsRecord(value: unknown): RawSettings {
+	if (value === undefined) return {};
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw notificationConfigurationError();
+	return value as RawSettings;
+}
+
+function resolveBtwEnabled(value: unknown, malformedRoot = false): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw notificationConfigurationError();
+	if (malformedRoot) throw notificationConfigurationError();
+
+	const notifications = notificationSettingsRecord((value as RawSettings).notifications);
+	const telegram = notificationSettingsRecord(notifications.telegram);
+	const btw = notificationSettingsRecord(telegram.btw);
+	const enabled = btw.enabled;
+	if (enabled === undefined) return getDefault("notifications.telegram.btw.enabled");
+	if (typeof enabled !== "boolean") throw notificationConfigurationError();
+	return enabled;
+}
 
 function shallowModelSelectorRecord(value: unknown): Record<string, ModelSelectorValue> {
 	const record = rawSettingsRecord(value);
@@ -380,6 +402,7 @@ export class Settings implements NotificationSettingsReader {
 	/** Legacy fallback migration warnings emitted once per settings instance. */
 	#legacyFallbackMigrationWarnings = 0;
 	#legacyFallbackMigrationGlobalFingerprint: string | undefined;
+	#hasMalformedConfigRoot = false;
 
 	/** Whether to persist changes */
 	#persist: boolean;
@@ -516,6 +539,7 @@ export class Settings implements NotificationSettingsReader {
 		const activationSnapshot =
 			activation && Object.keys(activation).length > 0 ? structuredClone(activation) : undefined;
 		const richEnabled = this.#getGlobalResolved("notifications.telegram.rich.enabled");
+		const btwEnabled = resolveBtwEnabled(this.#global, this.#hasMalformedConfigRoot);
 		const richDraftEnabled = this.#getGlobalResolved("notifications.telegram.richDraft.enabled");
 		const nameTemplate = this.#getGlobalResolved("notifications.telegram.topics.nameTemplate");
 		const discordBotToken = this.#getGlobalResolved("notifications.discord.botToken");
@@ -542,6 +566,9 @@ export class Settings implements NotificationSettingsReader {
 				chatId:
 					typeof chatId === "string" && chatId.length > 0 ? chatId : getDefault("notifications.telegram.chatId"),
 				...(activationSnapshot === undefined ? {} : { activation: activationSnapshot }),
+				btw: {
+					enabled: btwEnabled,
+				},
 				rich: {
 					enabled:
 						typeof richEnabled === "boolean" ? richEnabled : getDefault("notifications.telegram.rich.enabled"),
@@ -1240,33 +1267,40 @@ export class Settings implements NotificationSettingsReader {
 		// #loadYaml then reads; migration's db fallback needs #storage opened.
 		const projectPromise = this.#loadProjectSettings();
 
-		if (this.#persist) {
-			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
-			await this.#migrateFromLegacy();
-			this.#global = await this.#loadYaml(this.#configPath!);
-			const configVersion = readConfigVersion(this.#configPath!);
-			this.#defaultModelRoleOwnership.configVersion = configVersion;
-			this.#defaultModelRoleOwnership.defaultConfigVersion = configVersion;
+		try {
+			if (this.#persist) {
+				this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
+				await this.#migrateFromLegacy();
+				this.#global = await this.#loadYaml(this.#configPath!);
+				const configVersion = readConfigVersion(this.#configPath!);
+				this.#defaultModelRoleOwnership.configVersion = configVersion;
+				this.#defaultModelRoleOwnership.defaultConfigVersion = configVersion;
+			}
+
+			this.#project = await projectPromise;
+
+			await this.#normalizeAfterLoad();
+			return this;
+		} catch (error) {
+			this.#storage?.close();
+			throw error;
 		}
-
-		this.#project = await projectPromise;
-
-		await this.#normalizeAfterLoad();
-		return this;
 	}
 
 	async #loadYaml(filePath: string): Promise<RawSettings> {
+		this.#hasMalformedConfigRoot = false;
 		try {
 			const content = await Bun.file(filePath).text();
 			const parsed = YAML.parse(content);
+			if (parsed === undefined) return {};
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				this.#hasMalformedConfigRoot = true;
 				return {};
 			}
 			return this.#migrateRawSettings(parsed as RawSettings);
 		} catch (error) {
 			if (isEnoent(error)) return {};
-			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
-			return {};
+			throw error;
 		}
 	}
 
@@ -2061,6 +2095,7 @@ export function isSettingsInitialized(): boolean {
  * @internal
  */
 export function resetSettingsForTest(): void {
+	globalInstance?.getStorage()?.close();
 	globalInstance = null;
 	globalInstancePromise = null;
 	globalInitOptions = null;

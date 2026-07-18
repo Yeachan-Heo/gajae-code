@@ -99,7 +99,7 @@ function defaultStateRoot(): string {
 }
 
 function endpointDir(stateRoot: string): string {
-	return path.join(stateRoot, "notifications");
+	return path.join(stateRoot, "sdk");
 }
 
 // --- status -------------------------------------------------------------

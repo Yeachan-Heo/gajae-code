@@ -4,6 +4,7 @@ import * as os from "node:os";
 import path from "node:path";
 import { AcpSdkAdapter } from "../src/sdk/acp";
 import { Broker } from "../src/sdk/broker";
+import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { sendAuthorizedChatOperation } from "../src/sdk/bus/chat-command-policy";
 import { runSdkSessionCli } from "../src/sdk/cli/session-cli";
 import { SdkClient } from "../src/sdk/client";
@@ -117,6 +118,16 @@ function expectedAcpRejection(operation: Operation, secret: boolean): string {
 	if (disposition === "provider_only") return "provider_required";
 	if (disposition === "machine_only") return operation.errorCodes[0] ?? "machine_only";
 	return "operation_prohibited";
+}
+
+async function expectSdkRejection(promise: Promise<unknown>, code: string): Promise<void> {
+	let failure: unknown;
+	try {
+		await promise;
+	} catch (error) {
+		failure = error;
+	}
+	expect(failure).toMatchObject({ code });
 }
 
 function inputFor(operation: Operation, secret = false): Record<string, unknown> {
@@ -234,6 +245,7 @@ async function fixture(): Promise<AdapterFixture> {
 		brokerEndpoint,
 		observed,
 		stop: async () => {
+			await brokerOwnerForTest(agentDir)?.stop();
 			await productionHost.stop();
 			await broker.stop();
 			fs.rmSync(repo, { recursive: true, force: true });
@@ -247,6 +259,16 @@ function expectObservation(host: AdapterFixture, before: number, operation: Oper
 	else if (operation.kind === "global")
 		expect(observed).toContainEqual({ kind: "global", operation: operation.sdkId });
 }
+async function stopFixture(host: AdapterFixture, operation: Operation): Promise<void> {
+	await host.stop();
+	if (operation.sdkId !== "session.new") return;
+	await Bun.sleep(500);
+	const runtimeAgentDir = path.join(host.repo, ".gjc", "agent");
+	const restartedAfterShutdown = fs.existsSync(runtimeAgentDir);
+	await brokerOwnerForTest(runtimeAgentDir)?.stop();
+	fs.rmSync(host.repo, { recursive: true, force: true });
+	expect(restartedAfterShutdown).toBe(false);
+}
 
 async function assertAcpRow(operation: Operation, secret: boolean): Promise<void> {
 	const host = await fixture();
@@ -259,39 +281,29 @@ async function assertAcpRow(operation: Operation, secret: boolean): Promise<void
 		if (operation.kind === "control") {
 			if (expected === "forwarded") {
 				const code = expectedDomainErrors[operation.sdkId];
-				if (code)
-					await expect(adapter.control(operation.sdkId, { ...input, confirm: true })).rejects.toMatchObject({
-						code,
-					});
+				if (code) await expectSdkRejection(adapter.control(operation.sdkId, { ...input, confirm: true }), code);
 				else expectSemanticResult(operation, await adapter.control(operation.sdkId, { ...input, confirm: true }));
 			} else
-				await expect(adapter.control(operation.sdkId, input)).rejects.toMatchObject({
-					code: expectedAcpRejection(operation, secret),
-				});
+				await expectSdkRejection(adapter.control(operation.sdkId, input), expectedAcpRejection(operation, secret));
 		} else if (operation.kind === "global") {
 			if (expected === "forwarded") {
 				const code = expectedGlobalErrors[operation.sdkId];
-				if (code)
-					await expect(adapter.global(operation.sdkId, input, `parity-${operation.id}`)).rejects.toMatchObject({
-						code,
-					});
+				if (code) await expectSdkRejection(adapter.global(operation.sdkId, input, `parity-${operation.id}`), code);
 				else
 					expectSemanticResult(operation, await adapter.global(operation.sdkId, input, `parity-${operation.id}`));
 			} else
-				await expect(adapter.global(operation.sdkId, input)).rejects.toMatchObject({
-					code: expectedAcpRejection(operation, secret),
-				});
+				await expectSdkRejection(adapter.global(operation.sdkId, input), expectedAcpRejection(operation, secret));
 		} else if (operation.kind === "query") {
 			if (expected !== "forwarded")
 				throw new Error(`Query ${operation.sdkId} has no permitted machine-adapter semantic fixture.`);
 			const code = expectedDomainErrors[operation.sdkId];
-			if (code) await expect(adapter.query(operation.sdkId, input)).rejects.toMatchObject({ code });
+			if (code) await expectSdkRejection(adapter.query(operation.sdkId, input), code);
 			else expectSemanticResult(operation, await adapter.query(operation.sdkId, input));
 		} else expect(expected).toBe("internal_only");
 		expectObservation(host, before, operation, expected);
 	} finally {
 		await adapter.close();
-		await host.stop();
+		await stopFixture(host, operation);
 	}
 }
 
@@ -327,7 +339,7 @@ async function assertMcpRow(operation: Operation, secret: boolean): Promise<void
 		} else expect(result).toMatchObject({ ok: false, error: expect.any(Object) });
 		expectObservation(host, before, operation, expected);
 	} finally {
-		await host.stop();
+		await stopFixture(host, operation);
 	}
 }
 
@@ -375,7 +387,7 @@ async function assertDaemonCliRow(operation: Operation, secret: boolean): Promis
 		} else expect(result.output).toMatchObject({ ok: false, error: expect.any(Object) });
 		expectObservation(host, before, operation, expected);
 	} finally {
-		await host.stop();
+		await stopFixture(host, operation);
 	}
 }
 

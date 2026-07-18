@@ -2,6 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
+import { brokerProcessIncarnation } from "../src/sdk/broker/discovery";
+import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createSdkMcpServer } from "../src/sdk/mcp";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
 
@@ -9,7 +11,10 @@ const dirs: string[] = [];
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 afterEach(async () => {
 	for (const server of servers.splice(0)) await server.stop(true);
-	for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+	for (const dir of dirs.splice(0)) {
+		await brokerOwnerForTest(path.join(dir, "agent"))?.stop();
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 function fixture() {
@@ -73,6 +78,8 @@ test("MCP lifecycle responses never expose broker endpoint credentials", async (
 	const agentDir = path.join(repo, "agent");
 	const brokerDir = path.join(agentDir, "sdk");
 	fs.mkdirSync(brokerDir, { recursive: true });
+	const incarnation = brokerProcessIncarnation(process.pid);
+	if (!incarnation) throw new Error(`Current process incarnation is unavailable for pid ${process.pid}.`);
 	fs.writeFileSync(
 		path.join(brokerDir, "broker.json"),
 		JSON.stringify({
@@ -81,6 +88,7 @@ test("MCP lifecycle responses never expose broker endpoint credentials", async (
 			packageGeneration: "test",
 			ownerId: "mcp-owner",
 			pid: process.pid,
+			incarnation,
 			host: "127.0.0.1",
 			port: 1,
 			url: "ws://broker.example.test",

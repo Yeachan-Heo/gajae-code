@@ -7,6 +7,7 @@ import { logger } from "@gajae-code/utils";
 import { NotificationSettingsOverrideError, resetSettingsForTest, Settings } from "../src/config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../src/extensibility/extensions";
 import { createAgentSession } from "../src/sdk";
+import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import {
 	buildRedactedAction,
 	completionNotifyDisabledByEnv,
@@ -27,7 +28,7 @@ import {
 } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { daemonPaths, ensureTelegramDaemonRunning } from "../src/sdk/bus/telegram-daemon";
-import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
+import { createLightweightDaemonSettings, loadLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 import { SessionManager } from "../src/session/session-manager";
 import { cleanupFixtureRoot } from "./helpers/fixture-broker-cleanup";
 import {
@@ -66,6 +67,9 @@ const BASE_CFG: NotificationConfig = {
 		nameTemplate: undefined,
 	},
 	idleTimeoutMs: 60000,
+	btw: {
+		enabled: true,
+	},
 };
 
 const GLOBAL_CFG: NotificationConfig = {
@@ -80,7 +84,12 @@ const PRIMARY_GLOBAL_CFG: NotificationConfig = {
 };
 const tempDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+	for (const dir of tempDirs) await brokerOwnerForTest(dir)?.stop();
+	if (process.platform === "win32") {
+		Bun.gc(true);
+		await Bun.sleep(50);
+	}
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -94,6 +103,7 @@ describe("notifications config", () => {
 			"notifications.enabled": true,
 			"notifications.telegram.botToken": "token-1",
 			"notifications.telegram.chatId": "chat-1",
+			"notifications.telegram.btw.enabled": true,
 			"notifications.discord.botToken": "discord-token",
 			"notifications.discord.applicationId": "discord-app",
 			"notifications.discord.guildId": "discord-guild",
@@ -127,6 +137,9 @@ describe("notifications config", () => {
 			redact: true,
 			verbosity: "lean",
 			sessionScope: "all",
+			btw: {
+				enabled: true,
+			},
 			rich: {
 				enabled: true,
 			},
@@ -171,6 +184,7 @@ describe("notifications config", () => {
 			"notifications.enabled": true,
 			"notifications.telegram.botToken": "telegram-token",
 			"notifications.telegram.chatId": "telegram-chat",
+			"notifications.telegram.btw.enabled": true,
 			"notifications.telegram.rich.enabled": false,
 			"notifications.telegram.richDraft.enabled": true,
 			"notifications.telegram.topics.nameTemplate": "{repo}/{branch}",
@@ -197,6 +211,7 @@ describe("notifications config", () => {
 					telegram: {
 						botToken: "telegram-token",
 						chatId: "telegram-chat",
+						btw: { enabled: true },
 						rich: { enabled: false },
 						richDraft: { enabled: true },
 						topics: { nameTemplate: "{repo}/{branch}" },
@@ -225,6 +240,71 @@ describe("notifications config", () => {
 		expect(settings.getNotificationSettingsSnapshot()).toEqual(lightweight.getNotificationSettingsSnapshot());
 		expect(getNotificationConfig(settings)).toEqual(getNotificationConfig(lightweight));
 	});
+	test("full Settings loaded from config.yml fails closed for malformed notification settings", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-btw-settings-"));
+		tempDirs.push(root);
+
+		for (const [index, [config, rawConfig]] of (
+			[
+				["true\n", true],
+				["notifications: true\n", { notifications: true }],
+				["notifications:\n  telegram: []\n", { notifications: { telegram: [] } }],
+				["notifications:\n  telegram:\n    btw: true\n", { notifications: { telegram: { btw: true } } }],
+				[
+					'notifications:\n  telegram:\n    btw:\n      enabled: "false"\n',
+					{ notifications: { telegram: { btw: { enabled: "false" } } } },
+				],
+			] as const
+		).entries()) {
+			const agentDir = path.join(root, `agent-${index}`);
+			fs.mkdirSync(agentDir, { recursive: true });
+			fs.writeFileSync(path.join(agentDir, "config.yml"), config);
+
+			const settings = await Settings.loadForScope({ cwd: root, agentDir });
+			try {
+				expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+				expect(() =>
+					createLightweightDaemonSettings({ agentDir, rawConfig }).getNotificationSettingsSnapshot(),
+				).toThrow("gjc_notify_daemon_invalid_configuration");
+			} finally {
+				settings.getStorage()?.close();
+			}
+		}
+	});
+	test("full Settings rejects invalid or inaccessible config.yml like lightweight loading", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-btw-settings-load-"));
+		tempDirs.push(root);
+
+		const fixtures =
+			process.platform === "win32"
+				? (["notifications: [\n"] as const)
+				: (["notifications: [\n", "directory"] as const);
+		for (const [index, fixture] of fixtures.entries()) {
+			const agentDir = path.join(root, `agent-${index}`);
+			const configPath = path.join(agentDir, "config.yml");
+			fs.mkdirSync(agentDir, { recursive: true });
+			if (fixture === "directory") {
+				fs.mkdirSync(configPath);
+			} else {
+				fs.writeFileSync(configPath, fixture);
+			}
+
+			await expect(Settings.loadForScope({ cwd: root, agentDir })).rejects.toThrow();
+			await expect(loadLightweightDaemonSettings(agentDir)).rejects.toThrow();
+		}
+
+		const agentDir = path.join(root, "missing-config");
+		fs.mkdirSync(agentDir, { recursive: true });
+		const settings = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			expect(settings.getNotificationSettingsSnapshot().telegram.btw.enabled).toBe(true);
+			expect(
+				(await loadLightweightDaemonSettings(agentDir)).getNotificationSettingsSnapshot().telegram.btw.enabled,
+			).toBe(true);
+		} finally {
+			settings.getStorage()?.close();
+		}
+	});
 
 	test("project notification settings are ignored without leaking credentials", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-project-boundary-"));
@@ -244,7 +324,7 @@ describe("notifications config", () => {
 			JSON.stringify({
 				notifications: {
 					enabled: false,
-					telegram: { botToken: projectToken, chatId: "project-chat" },
+					telegram: { botToken: projectToken, chatId: "project-chat", btw: { enabled: true } },
 					terminalBell: true,
 					bellOnComplete: false,
 				},

@@ -69,6 +69,7 @@
 		"linkedom": "catalog:",
 		"lru-cache": "catalog:",
 		"markit-ai": "catalog:",
+		"marked": "catalog:",
 		"puppeteer-core": "catalog:",
 		"turndown": "catalog:",
 		"turndown-plugin-gfm": "catalog:",

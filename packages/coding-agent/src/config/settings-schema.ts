@@ -285,6 +285,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"notifications.telegram.chatId": { type: "string", default: undefined },
 	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
+	"notifications.telegram.btw.enabled": { type: "boolean", default: true },
 	"notifications.telegram.rich.enabled": {
 		type: "boolean",
 		default: true,
@@ -3587,6 +3588,9 @@ export interface NotificationsSettings {
 	telegram: {
 		botToken: string | undefined;
 		chatId: string | undefined;
+		btw: {
+			enabled: boolean;
+		};
 		rich: {
 			enabled: boolean;
 		};

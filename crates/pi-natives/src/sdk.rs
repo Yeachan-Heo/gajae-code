@@ -116,26 +116,36 @@ impl From<gjc_sdk::protocol::AskSelectedAckOutcome> for AskSelectedAckOutcomeEve
 	}
 }
 
-/// An inbound message forwarded to the TypeScript host: a free-text injection,
-/// in-thread config command, or deterministic control command.
+/// An authenticated inbound message forwarded to the TypeScript host: free-text
+/// injection, ephemeral side-question request/cancel, in-thread config command,
+/// or deterministic control command.
 #[napi(object)]
 pub struct InboundEvent {
-	/// Inbound kind (`user_message`, `config_command`, or `control_command`).
+	/// Inbound kind (`user_message`, `ephemeral_turn`,
+	/// `ephemeral_turn_cancel`, `config_command`, or `control_command`).
 	pub kind:         String,
 	/// The session this inbound belongs to.
 	pub session_id:   String,
-	/// Free-text body (`user_message` only).
+	/// Free-text body (`user_message` or `ephemeral_turn` only).
 	pub text:         Option<String>,
-	/// Telegram update id for dedupe (`user_message` only).
+	/// Telegram update id for dedupe (`user_message`, `ephemeral_turn`, or
+	/// `ephemeral_turn_cancel` only).
 	pub update_id:    Option<i64>,
-	/// Originating thread/topic id (`user_message` only).
+	/// Originating thread/topic id (`user_message`, `ephemeral_turn`, or
+	/// `ephemeral_turn_cancel` only).
 	pub thread_id:    Option<String>,
+	/// Originating Telegram message id (`ephemeral_turn` and
+	/// `ephemeral_turn_cancel` only).
+	pub message_id:   Option<i64>,
 	/// Requested verbosity `"lean"|"verbose"` (`config_command` only).
 	pub verbosity:    Option<String>,
 	/// Requested redaction state (`config_command` only).
 	pub redact:       Option<bool>,
-	/// Client-generated request id (`control_command` only).
+	/// Client-generated request id (`ephemeral_turn`, `ephemeral_turn_cancel`,
+	/// or `control_command` only).
 	pub request_id:   Option<String>,
+	/// Cancellation reason (`ephemeral_turn_cancel` only).
+	pub reason:       Option<String>,
 	/// JSON-encoded command payload (`control_command` only).
 	pub command_json: Option<String>,
 	/// Inline image attachments forwarded with the message (`user_message`
@@ -221,8 +231,9 @@ impl NotificationServer {
 		*self.on_reply.lock() = Some(callback);
 	}
 
-	/// Register the inbound-message callback (free-text injections and in-thread
-	/// config commands). Must be called before [`Self::start`].
+	/// Register the authenticated inbound-message callback (free-text,
+	/// side-question request/cancel, and in-thread config/control commands).
+	/// Must be called before [`Self::start`].
 	#[napi(ts_args_type = "callback: (err: null | Error, msg: InboundEvent) => void")]
 	pub fn on_inbound(&self, callback: ThreadsafeFunction<InboundEvent>) {
 		*self.on_inbound.lock() = Some(callback);
@@ -311,6 +322,8 @@ impl NotificationServer {
 							text:         Some(u.text),
 							update_id:    u.update_id,
 							thread_id:    u.thread_id,
+							message_id:   None,
+							reason:       None,
 							images:       if u.images.is_empty() {
 								None
 							} else {
@@ -326,12 +339,16 @@ impl NotificationServer {
 							request_id:   None,
 							command_json: None,
 						},
+						ClientMessage::EphemeralTurn(turn) => ephemeral_turn_event(turn),
+						ClientMessage::EphemeralTurnCancel(cancel) => ephemeral_turn_cancel_event(cancel),
 						ClientMessage::ConfigCommand(c) => InboundEvent {
 							kind:         "config_command".to_owned(),
 							session_id:   c.session_id,
 							text:         None,
 							update_id:    None,
 							thread_id:    None,
+							message_id:   None,
+							reason:       None,
 							verbosity:    c.verbosity.map(|v| match v {
 								Verbosity::Lean => "lean".to_owned(),
 								Verbosity::Verbose => "verbose".to_owned(),
@@ -347,6 +364,8 @@ impl NotificationServer {
 							text:         None,
 							update_id:    c.update_id,
 							thread_id:    c.thread_id,
+							message_id:   None,
+							reason:       None,
 							verbosity:    None,
 							redact:       None,
 							request_id:   Some(c.request_id),
@@ -524,8 +543,8 @@ impl NotificationServer {
 
 	/// Broadcast an ephemeral threaded-session frame. `frame_json` is a JSON
 	/// `ServerMessage` (e.g. `identity_header`, `context_update`, `turn_stream`,
-	/// `image_attachment`, `session_closed`, `config_update`, `hello`). Not
-	/// buffered for replay.
+	/// `ephemeral_turn_result`, `image_attachment`, `session_closed`,
+	/// `config_update`, `hello`). Not buffered for replay.
 	///
 	/// # Errors
 	/// Fails if not started or `frame_json` is not a valid `ServerMessage`.
@@ -937,6 +956,39 @@ impl NotificationControlServer {
 	}
 }
 
+fn ephemeral_turn_event(turn: gjc_sdk::protocol::EphemeralTurn) -> InboundEvent {
+	InboundEvent {
+		kind:         "ephemeral_turn".to_owned(),
+		session_id:   turn.session_id,
+		text:         Some(turn.question),
+		update_id:    Some(turn.update_id),
+		thread_id:    Some(turn.thread_id),
+		message_id:   Some(turn.message_id),
+		verbosity:    None,
+		redact:       None,
+		request_id:   Some(turn.request_id),
+		reason:       None,
+		command_json: None,
+		images:       None,
+	}
+}
+
+fn ephemeral_turn_cancel_event(cancel: gjc_sdk::protocol::EphemeralTurnCancel) -> InboundEvent {
+	InboundEvent {
+		kind:         "ephemeral_turn_cancel".to_owned(),
+		session_id:   cancel.session_id,
+		text:         None,
+		update_id:    Some(cancel.update_id),
+		thread_id:    Some(cancel.thread_id),
+		message_id:   Some(cancel.message_id),
+		verbosity:    None,
+		redact:       None,
+		request_id:   Some(cancel.request_id),
+		reason:       Some("daemon_shutdown".to_owned()),
+		command_json: None,
+		images:       None,
+	}
+}
 fn presentation_lease(identity: Option<ActionIdentity>) -> Result<PresentationLease> {
 	let identity =
 		identity.ok_or_else(|| Error::from_reason("action registration did not produce a lease"))?;
@@ -970,6 +1022,49 @@ fn ensure_not_current_arbitrated_presentation(
 #[cfg(test)]
 mod tests {
 	use super::{ActionIdentity, PresentationLease, ensure_not_current_arbitrated_presentation};
+
+	#[test]
+	fn ephemeral_turn_mapping_preserves_question_and_tuple_without_token() {
+		let event = super::ephemeral_turn_event(gjc_sdk::protocol::EphemeralTurn {
+			session_id: "session".to_owned(),
+			token:      "secret".to_owned(),
+			request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
+			update_id:  7,
+			message_id: 9,
+			thread_id:  "11".to_owned(),
+			question:   "What changed?".to_owned(),
+		});
+		assert_eq!(event.kind, "ephemeral_turn");
+		assert_eq!(event.session_id, "session");
+		assert_eq!(event.text.as_deref(), Some("What changed?"));
+		assert_eq!(event.request_id.as_deref(), Some("btw:123e4567-e89b-42d3-a456-426614174000"));
+		assert_eq!(event.update_id, Some(7));
+		assert_eq!(event.message_id, Some(9));
+		assert_eq!(event.thread_id.as_deref(), Some("11"));
+		assert_eq!(event.reason, None);
+		assert_eq!(event.command_json, None);
+		assert!(event.images.is_none());
+	}
+	#[test]
+	fn ephemeral_turn_cancel_mapping_preserves_tuple_without_token_or_question() {
+		let event = super::ephemeral_turn_cancel_event(gjc_sdk::protocol::EphemeralTurnCancel {
+			session_id: "session".to_owned(),
+			token:      "secret".to_owned(),
+			request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
+			update_id:  7,
+			message_id: 9,
+			thread_id:  "11".to_owned(),
+			reason:     gjc_sdk::protocol::EphemeralTurnCancelReason::DaemonShutdown,
+		});
+		assert_eq!(event.kind, "ephemeral_turn_cancel");
+		assert_eq!(event.session_id, "session");
+		assert_eq!(event.request_id.as_deref(), Some("btw:123e4567-e89b-42d3-a456-426614174000"));
+		assert_eq!(event.update_id, Some(7));
+		assert_eq!(event.message_id, Some(9));
+		assert_eq!(event.thread_id.as_deref(), Some("11"));
+		assert_eq!(event.reason.as_deref(), Some("daemon_shutdown"));
+		assert_eq!(event.text, None);
+	}
 
 	#[test]
 	fn exact_arbitrated_presentation_blocks_local_and_client_id_only_resolution() {

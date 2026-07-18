@@ -141,7 +141,7 @@ describe("notification-service health", () => {
 	test("healthy daemon with fresh heartbeat and matching identity is ok", async () => {
 		const { fs } = mockFs({
 			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, generation: DAEMON_GENERATION }),
-			[path.join("/tmp/gjc-none", "notifications", "session-a.json")]: JSON.stringify({
+			[path.join("/tmp/gjc-none", "sdk", "session-a.json")]: JSON.stringify({
 				sessionId: "session-a",
 				pid: 1000,
 			}),
@@ -220,7 +220,7 @@ describe("notification-service health", () => {
 				: { "notifications.enabled": false },
 		);
 		const rowStatePath = daemonPaths(rowSettings.getAgentDir()).state;
-		const endpointPath = path.join("/tmp/gjc-none", "notifications", "session-a.json");
+		const endpointPath = path.join("/tmp/gjc-none", "sdk", "session-a.json");
 		const { fs } = mockFs({
 			...(state ? { [rowStatePath]: state } : {}),
 			...(endpoint ? { [endpointPath]: typeof endpoint === "string" ? endpoint : JSON.stringify(endpoint) } : {}),
@@ -287,7 +287,7 @@ describe("notification-service health", () => {
 		for (const generation of malformedGenerationValues) {
 			const { fs } = mockFs({
 				[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, generation }),
-				[path.join("/tmp/gjc-none", "notifications", "session-a.json")]: JSON.stringify({
+				[path.join("/tmp/gjc-none", "sdk", "session-a.json")]: JSON.stringify({
 					sessionId: "session-a",
 					pid: 1000,
 				}),
@@ -425,7 +425,7 @@ describe("notification-service recovery", () => {
 	});
 	const paths = daemonPaths(settings.getAgentDir());
 	const stateRoot = "/tmp/gjc-recovery-state";
-	const epDir = path.join(stateRoot, "notifications");
+	const epDir = path.join(stateRoot, "sdk");
 
 	test("removes only dead/stale endpoints and never a live owner's lock", async () => {
 		const { fs, unlinked } = mockFs({
@@ -487,7 +487,7 @@ describe("notification-service endpoint liveness (owner-proof)", () => {
 		"notifications.telegram.chatId": "12345",
 	});
 	const stateRoot = "/tmp/gjc-liveness-state";
-	const epDir = path.join(stateRoot, "notifications");
+	const epDir = path.join(stateRoot, "sdk");
 
 	test("health treats a PID-less endpoint as unknown, never dead", async () => {
 		const { fs } = mockFs({

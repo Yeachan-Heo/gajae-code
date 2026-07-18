@@ -202,6 +202,13 @@ async function cleanupFixtureRootOnce(
 			throw new AggregateError([error], `Fixture broker lease close failed: ${describeError(error)}`);
 		}
 	}
+	if (process.platform === "win32") {
+		// Bun can retain native directory/database handles until a collection after
+		// their owning test runtimes are disposed. Force that finalizer boundary
+		// before asserting fixture-root removal on Windows.
+		Bun.gc(true);
+		await Bun.sleep(50);
+	}
 	const removeRoot = options.removeRoot ?? (async value => fs.rm(value, { recursive: true, force: true }));
 	const rootExists = options.rootExists ?? exists;
 	if (root.phases.rootRemove === "pending") {

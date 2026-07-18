@@ -27,9 +27,10 @@ describe("escapeHtml (AC2)", () => {
 });
 
 describe("markdownToTelegramHtml (AC5)", () => {
-	test("bold and italic", () => {
+	test("bold, italic, and strikethrough", () => {
 		expect(markdownToTelegramHtml("**hi**")).toBe("<b>hi</b>");
 		expect(markdownToTelegramHtml("*hi*")).toBe("<i>hi</i>");
+		expect(markdownToTelegramHtml("~~hi~~")).toBe("<s>hi</s>");
 	});
 
 	test("inline and fenced code escape their contents and are not re-parsed", () => {
@@ -62,6 +63,21 @@ describe("markdownToTelegramHtml (AC5)", () => {
 	test("GFM tables render as an aligned monospace <pre> block", () => {
 		const md = "| Name | Age |\n| --- | ---: |\n| Alice | 30 |\n| Bob | 1 |";
 		expect(markdownToTelegramHtml(md)).toBe("<pre>Name  | Age\n------|----\nAlice |  30\nBob   |   1</pre>");
+	});
+
+	test("wide GFM tables render as stacked records for narrow Telegram clients", () => {
+		const md =
+			"| 공식 | 표현 |\n| --- | --- |\n| 이차방정식 근의 공식 | \\\\(x=\\\\frac{-b\\\\pm\\\\sqrt{b^2-4ac}}{2a}\\\\) |";
+		expect(markdownToTelegramHtml(md)).toBe(
+			"<b>공식</b>: 이차방정식 근의 공식\n<b>표현</b>: \\\\(x=\\\\frac{-b\\\\pm\\\\sqrt{b^2-4ac}}{2a}\\\\)",
+		);
+	});
+	test("wide header-only GFM tables retain their grid", () => {
+		const header = "This header is intentionally wider than forty-two columns";
+		const html = markdownToTelegramHtml(`| ${header} |\n| --- |`);
+
+		expect(html).toContain(`<pre>${header}\n`);
+		expect(html).toContain(`${"-".repeat(header.length)}</pre>`);
 	});
 
 	test("table cell content is escaped and not re-parsed as markup", () => {

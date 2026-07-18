@@ -1251,6 +1251,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			capabilities::ASK_CONTROLS_V1.into(),
 			capabilities::ASK_SELECTED_ACK_V1.into(),
 			capabilities::TOOL_ACTIVITY_V1.into(),
+			capabilities::EPHEMERAL_TURN_V1.into(),
 		],
 		connection_id:    Some(connection_id.clone()),
 	});
@@ -1564,11 +1565,32 @@ where
 	};
 	let reply = match msg {
 		ClientMessage::Reply(reply) => reply,
-		// Inbound free-text injection / in-thread config command: forward to the
-		// host (token-authorized) and stop. These are not action replies.
+		// Inbound free-text injection / ephemeral side question / in-thread config
+		// command: forward to the host (token-authorized) and stop. These are not
+		// action replies.
 		ClientMessage::UserMessage(u) => {
 			if tokens_match(&u.token, &state.token) {
 				let _ = state.inbound_tx.send(ClientMessage::UserMessage(u));
+			}
+			return true;
+		},
+		ClientMessage::EphemeralTurn(turn) => {
+			if tokens_match(&turn.token, &state.token) {
+				let canonical = ClientMessage::EphemeralTurn(turn.clone());
+				let _ = state.inbound_tx.send(canonical.clone());
+				if let Ok(frame) = serde_json::to_string(&canonical) {
+					let _ = state.frame_tx.send((connection_id.to_owned(), frame));
+				}
+			}
+			return true;
+		},
+		ClientMessage::EphemeralTurnCancel(cancel) => {
+			if tokens_match(&cancel.token, &state.token) {
+				let canonical = ClientMessage::EphemeralTurnCancel(cancel.clone());
+				let _ = state.inbound_tx.send(canonical.clone());
+				if let Ok(frame) = serde_json::to_string(&canonical) {
+					let _ = state.frame_tx.send((connection_id.to_owned(), frame));
+				}
 			}
 			return true;
 		},
@@ -2390,7 +2412,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn push_frame_broadcasts_threaded_frames_and_preserves_ask() {
-		use crate::protocol::{IdentityHeader, TurnPhase, TurnStream};
+		use crate::protocol::{EphemeralTurnResult, IdentityHeader, TurnPhase, TurnStream};
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
 		let mut ws = connect(&handle, "secret").await;
 		next_server_hello(&mut ws).await;
@@ -2425,6 +2447,25 @@ mod tests {
 				assert_eq!(t.text, "done");
 			},
 			other => panic!("expected turn_stream, got {other:?}"),
+		}
+		handle
+			.push_frame(ServerMessage::EphemeralTurnResult(EphemeralTurnResult {
+				session_id: "s".into(),
+				request_id: "btw:123e4567-e89b-42d3-a456-426614174000".into(),
+				update_id:  7,
+				message_id: 8,
+				thread_id:  "42".into(),
+				status:     crate::protocol::EphemeralTurnStatus::Ok,
+				text:       Some("side answer".into()),
+			}))
+			.unwrap();
+		match next_server_msg(&mut ws).await {
+			ServerMessage::EphemeralTurnResult(result) => {
+				assert_eq!(result.request_id, "btw:123e4567-e89b-42d3-a456-426614174000");
+				assert_eq!(result.update_id, 7);
+				assert_eq!(result.message_id, 8);
+			},
+			other => panic!("expected ephemeral_turn_result, got {other:?}"),
 		}
 
 		// Asks share the connection-local reevaluation path alongside streaming frames.
@@ -2525,6 +2566,7 @@ mod tests {
 			capabilities::ASK_CONTROLS_V1,
 			capabilities::ASK_SELECTED_ACK_V1,
 			capabilities::TOOL_ACTIVITY_V1,
+			capabilities::EPHEMERAL_TURN_V1,
 		]);
 
 		match next_server_msg(&mut ws).await {
@@ -3023,6 +3065,178 @@ mod tests {
 		handle.stop();
 	}
 
+	#[tokio::test]
+	async fn authenticated_ephemeral_turn_forwards_to_inbound_and_correlated_frame_receivers() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut inbound = handle.take_inbound_receiver().expect("inbound receiver");
+		let mut frames = handle.take_frame_receiver().expect("frame receiver");
+		let mut ws = connect(&handle, "secret").await;
+		let connection_id = next_server_hello(&mut ws)
+			.await
+			.connection_id
+			.expect("connection id");
+		wait_for_clients(&handle, 1).await;
+		ws.send(Message::Text(
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "secret",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "What changed?",
+			})
+			.to_string()
+			.into(),
+		))
+		.await
+		.unwrap();
+
+		let inbound_turn = tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv())
+			.await
+			.expect("inbound timed out")
+			.expect("inbound channel closed");
+		match inbound_turn {
+			ClientMessage::EphemeralTurn(turn) => {
+				assert_eq!(turn.session_id, "s");
+				assert_eq!(turn.token, "secret");
+				assert_eq!(turn.question, "What changed?");
+				assert_eq!(turn.request_id, "btw:123e4567-e89b-42d3-a456-426614174000");
+				assert_eq!(turn.update_id, 7);
+				assert_eq!(turn.message_id, 9);
+				assert_eq!(turn.thread_id, "11");
+			},
+			other => panic!("expected ephemeral_turn, got {other:?}"),
+		}
+
+		let (source, raw) = tokio::time::timeout(std::time::Duration::from_secs(2), frames.recv())
+			.await
+			.expect("frame timed out")
+			.expect("frame channel closed");
+		assert_eq!(source, connection_id);
+		let frame: serde_json::Value = serde_json::from_str(&raw).expect("valid frame");
+		assert_eq!(frame["sessionId"], "s");
+		assert_eq!(frame["token"], "secret");
+		assert_eq!(frame["question"], "What changed?");
+		assert_eq!(frame["requestId"], "btw:123e4567-e89b-42d3-a456-426614174000");
+		assert_eq!(frame["updateId"], 7);
+		assert_eq!(frame["messageId"], 9);
+		assert_eq!(frame["threadId"], "11");
+
+		for frame in [
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "secret",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "malformed",
+				"unexpected": true,
+			}),
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "wrong",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "wrong token",
+			}),
+		] {
+			ws.send(Message::Text(frame.to_string().into()))
+				.await
+				.unwrap();
+		}
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(300), inbound.recv())
+				.await
+				.is_err(),
+			"malformed and wrong-token frames must not reach inbound receiver"
+		);
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(300), frames.recv())
+				.await
+				.is_err(),
+			"malformed and wrong-token frames must not reach frame receiver"
+		);
+		handle.stop();
+	}
+	#[tokio::test]
+	async fn authenticated_ephemeral_turn_cancel_forwards_full_tuple_as_v3_frame() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut frames = handle.take_frame_receiver().expect("frame rx");
+		let mut ws = connect(&handle, "secret").await;
+		next_server_hello(&mut ws).await;
+		wait_for_clients(&handle, 1).await;
+		ws.send(Message::Text(
+			serde_json::json!({
+				"type": "ephemeral_turn_cancel",
+				"sessionId": "s",
+				"token": "secret",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"reason": "daemon_shutdown",
+			})
+			.to_string()
+			.into(),
+		))
+		.await
+		.unwrap();
+
+		let (_, raw) = tokio::time::timeout(std::time::Duration::from_secs(2), frames.recv())
+			.await
+			.expect("cancel timed out")
+			.expect("frame channel closed");
+		let cancel: serde_json::Value = serde_json::from_str(&raw).expect("valid frame");
+		assert_eq!(cancel["updateId"], 7);
+		assert_eq!(cancel["messageId"], 9);
+		assert_eq!(cancel["threadId"], "11");
+		ws.send(Message::Text(
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "secret",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "strict",
+				"unexpected": true,
+			})
+			.to_string()
+			.into(),
+		))
+		.await
+		.unwrap();
+		ws.send(Message::Text(
+			serde_json::json!({
+				"type": "ephemeral_turn",
+				"sessionId": "s",
+				"token": "wrong",
+				"requestId": "btw:123e4567-e89b-42d3-a456-426614174000",
+				"updateId": 7,
+				"messageId": 9,
+				"threadId": "11",
+				"question": "strict",
+			})
+			.to_string()
+			.into(),
+		))
+		.await
+		.unwrap();
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(300), frames.recv())
+				.await
+				.is_err()
+		);
+		handle.stop();
+	}
 	#[tokio::test]
 	async fn inbound_control_command_forwards_to_host() {
 		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();

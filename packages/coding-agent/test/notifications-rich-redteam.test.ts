@@ -164,7 +164,7 @@ describe("redteam(b): rich body carries hostile raw verbatim with no HTML-path p
 
 	test("RT-B2: buildRichMessage wraps hostile raw verbatim (no escaping, no truncation)", () => {
 		const built = buildRichMessage(hostileRaw);
-		expect(built).toEqual({ rich_message: { markdown: hostileRaw } });
+		expect(built).toEqual({ rich_message: { markdown: hostileRaw, skip_entity_detection: true } });
 		expect(built.rich_message.markdown).toBe(hostileRaw); // byte-for-byte
 		expect(built.rich_message.markdown.length).toBe(hostileRaw.length); // >4096 preserved (overflow deferred to Slice 2)
 		// The HTML renderer WOULD transform the same payload, so verbatim rich != accidental HTML reuse.
@@ -237,10 +237,10 @@ describe("redteam(c): forged non-boolean finalAnswer never sets richMarkdown", (
 });
 
 // ===========================================================================
-// (d) fallback-throws-during-fallback — daemon must not crash
+// (d) ambiguous transport errors — no fallback and daemon remains live
 // ===========================================================================
-describe("redteam(d): a throwing fallback does not crash the daemon", () => {
-	test("RT-D1: deliverRichWithFallback warns once then propagates a throwing fallback (survival is the caller's job)", async () => {
+describe("redteam(d): an ambiguous rich transport error never duplicates through HTML", () => {
+	test("RT-D1: deliverRichWithFallback warns once and never invokes a throwing fallback", async () => {
 		const bot = new RedTeamBot();
 		bot.richBehavior = "throw";
 		const warns: string[] = [];
@@ -250,25 +250,27 @@ describe("redteam(d): a throwing fallback does not crash the daemon", () => {
 				bot as any,
 				{ chat_id: "42", message_thread_id: 555 },
 				makeSend(),
+				AbortSignal.timeout(30_000),
 				async () => {
 					fell++;
 					throw new Error("fallback boom");
 				},
 				{ warn: m => warns.push(m) },
 			),
-		).rejects.toThrow("fallback boom");
-		expect(warns).toHaveLength(1); // exactly one diagnostic, emitted before the fallback ran
-		expect(fell).toBe(1);
+		).resolves.toBeUndefined();
+		expect(warns).toHaveLength(1);
+		expect(warns[0]).toContain("not falling back to HTML");
+		expect(fell).toBe(0);
 		expect(countMethod(bot, "sendRichMessage")).toBe(1);
 	});
 
-	test("RT-D2: flushPool best-effort try swallows rich-throw + HTML-throw; daemon stays live", async () => {
+	test("RT-D2: flushPool preserves one rich attempt after ambiguity and stays live", async () => {
 		const bot = new RedTeamBot();
 		bot.richBehavior = "throw";
 		const daemon = makeRichDaemon(bot, { enabled: true });
 		const session = richSession();
 		await primeTopic(daemon, bot, session);
-		bot.htmlThrows = true; // now BOTH the rich attempt and the HTML fallback throw
+		bot.htmlThrows = true; // would fail if an unsafe HTML compensation were attempted
 		let survived = true;
 		try {
 			await daemon.handleSessionMessage(session, {
@@ -282,8 +284,8 @@ describe("redteam(d): a throwing fallback does not crash the daemon", () => {
 			survived = false;
 		}
 		expect(survived).toBe(true); // daemon did not crash
-		expect(countMethod(bot, "sendRichMessage")).toBe(1); // rich attempted
-		expect(countMethod(bot, "sendMessage")).toBe(1); // HTML fallback attempted (then threw, swallowed)
+		expect(countMethod(bot, "sendRichMessage")).toBe(1);
+		expect(countMethod(bot, "sendMessage")).toBe(0);
 		// Liveness: the daemon still delivers a subsequent frame.
 		bot.htmlThrows = false;
 		bot.calls.length = 0;
@@ -312,13 +314,14 @@ describe("redteam(e): hostile {ok:false} description warns once without crashing
 			bot as any,
 			{ chat_id: "42", message_thread_id: 555 },
 			makeSend(),
+			AbortSignal.timeout(30_000),
 			async () => {
 				fell++;
 			},
 			{ warn: m => warns.push(m) },
 		);
 		expect(warns).toHaveLength(1);
-		expect(warns[0]).toContain("sendRichMessage failed");
+		expect(warns[0]).toContain("sendRichMessage rejected");
 		expect(warns[0]).toContain("falling back to HTML");
 		expect(warns[0]).toContain("injected"); // hostile description embedded verbatim, no crash
 		expect(fell).toBe(1);
@@ -335,6 +338,7 @@ describe("redteam(e): hostile {ok:false} description warns once without crashing
 			bot as any,
 			{ chat_id: "42" },
 			makeSend(),
+			AbortSignal.timeout(30_000),
 			async () => {
 				fell++;
 			},

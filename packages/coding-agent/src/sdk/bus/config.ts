@@ -55,6 +55,9 @@ export interface NotificationSettingsSnapshot {
 		botToken?: string;
 		chatId?: string;
 		activation?: Record<string, unknown>;
+		btw: {
+			enabled: boolean;
+		};
 		rich: {
 			enabled: boolean;
 		};
@@ -121,6 +124,9 @@ export interface NotificationConfig {
 	 */
 	sessionScope: "all" | "primary";
 	idleTimeoutMs: number;
+	btw: {
+		enabled: boolean;
+	};
 	rich: {
 		enabled: boolean;
 	};
@@ -154,6 +160,7 @@ export function getNotificationConfig(settings: NotificationSettingsReader): Not
 		sessionScope: snapshot.sessionScope,
 		idleTimeoutMs: snapshot.idleTimeoutMs,
 		rich: snapshot.telegram.rich,
+		btw: snapshot.telegram.btw,
 		richDraft: snapshot.telegram.richDraft,
 		topics: snapshot.telegram.topics,
 	};

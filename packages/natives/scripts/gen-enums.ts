@@ -122,6 +122,8 @@ function applyPathIdentityTypes(dts: string): string {
 				| "acl_unavailable"
 				| "acl_apply_failed"
 				| "acl_verify_failed"
+				| "identity_unavailable"
+				| "owner_mismatch"
 				| "io_error";
 	  }`;
 	return dts

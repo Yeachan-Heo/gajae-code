@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { applyAtomicYamlPatches, setByPath } from "../../config/atomic-yaml-patch";
 import type { Settings } from "../../config/settings";
@@ -54,67 +55,104 @@ function argValue(argv: string[], name: string): string | undefined {
 	return i >= 0 ? argv[i + 1] : undefined;
 }
 
-function getByPath(obj: unknown, pathSegments: string[]): unknown {
-	let current = obj;
-	for (const segment of pathSegments) {
-		if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
-		current = (current as Record<string, unknown>)[segment];
-	}
-	return current;
+function asObject(value: unknown): Record<string, unknown> {
+	if (value === undefined) return {};
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw configurationError();
+	return value as Record<string, unknown>;
 }
 
 function asString(value: unknown): string | undefined {
-	return typeof value === "string" && value.length > 0 ? value : undefined;
+	if (value === undefined) return undefined;
+	if (typeof value === "string") return value;
+	throw configurationError();
+}
+
+const DAEMON_COMPATIBILITY_DIAGNOSTIC_LIMIT = 1;
+let daemonCompatibilityDiagnosticCount = 0;
+
+function configurationError(): Error {
+	return new Error("gjc_notify_daemon_invalid_configuration");
 }
 
 function asBoolean(value: unknown, fallback: boolean): boolean {
-	return typeof value === "boolean" ? value : fallback;
+	if (value === undefined) return fallback;
+	if (typeof value === "boolean") return value;
+	throw configurationError();
+}
+
+function asChoice<T extends string>(value: unknown, fallback: T, choices: readonly T[]): T {
+	if (value === undefined) return fallback;
+	if (typeof value === "string" && choices.includes(value as T)) return value as T;
+	throw configurationError();
 }
 
 function asIdleTimeoutMs(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 60_000;
+	if (value === undefined) return 60_000;
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+	throw configurationError();
+}
+
+function recordDaemonCompatibilityDiagnostic(message: string): void {
+	if (daemonCompatibilityDiagnosticCount >= DAEMON_COMPATIBILITY_DIAGNOSTIC_LIMIT) return;
+	daemonCompatibilityDiagnosticCount++;
+	logger.warn(message);
 }
 
 export function createLightweightDaemonSettings(input: {
 	agentDir: string;
 	rawConfig?: unknown;
 }): LightweightDaemonSettings {
-	const rawConfig = input.rawConfig && typeof input.rawConfig === "object" ? input.rawConfig : {};
-	const activation = readTelegramActivationMarkers(getByPath(rawConfig, ["notifications", "telegram", "activation"]));
-	const getNotificationSettingsSnapshot = (): NotificationSettingsSnapshot => ({
-		enabled: asBoolean(getByPath(rawConfig, ["notifications", "enabled"]), false),
-		telegram: {
-			botToken: asString(getByPath(rawConfig, ["notifications", "telegram", "botToken"])),
-			chatId: asString(getByPath(rawConfig, ["notifications", "telegram", "chatId"])),
-			...(Object.keys(activation).length === 0 ? {} : { activation }),
-			rich: {
-				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "rich", "enabled"]), true),
+	const rawConfig = asObject(input.rawConfig);
+	const getNotificationSettingsSnapshot = (): NotificationSettingsSnapshot => {
+		const notifications = asObject(rawConfig.notifications);
+		const telegram = asObject(notifications.telegram);
+		const btw = asObject(telegram.btw);
+		const rich = asObject(telegram.rich);
+		const richDraft = asObject(telegram.richDraft);
+		const topics = asObject(telegram.topics);
+		const activation = readTelegramActivationMarkers(asObject(telegram.activation));
+		const discord = asObject(notifications.discord);
+		const slack = asObject(notifications.slack);
+		const daemon = asObject(notifications.daemon);
+		return {
+			enabled: asBoolean(notifications.enabled, false),
+			telegram: {
+				botToken: asString(telegram.botToken),
+				chatId: asString(telegram.chatId),
+				...(Object.keys(activation).length === 0 ? {} : { activation }),
+				btw: {
+					enabled: asBoolean(btw.enabled, true),
+				},
+				rich: {
+					enabled: asBoolean(rich.enabled, true),
+				},
+				richDraft: {
+					enabled: asBoolean(richDraft.enabled, false),
+				},
+				topics: {
+					nameTemplate: asString(topics.nameTemplate),
+				},
 			},
-			richDraft: {
-				enabled: asBoolean(getByPath(rawConfig, ["notifications", "telegram", "richDraft", "enabled"]), false),
+			discord: {
+				botToken: asString(discord.botToken),
+				applicationId: asString(discord.applicationId),
+				guildId: asString(discord.guildId),
+				parentChannelId: asString(discord.parentChannelId),
 			},
-			topics: {
-				nameTemplate: asString(getByPath(rawConfig, ["notifications", "telegram", "topics", "nameTemplate"])),
+			slack: {
+				botToken: asString(slack.botToken),
+				appToken: asString(slack.appToken),
+				workspaceId: asString(slack.workspaceId),
+				channelId: asString(slack.channelId),
+				authorizedUserId: asString(slack.authorizedUserId),
 			},
-		},
-		discord: {
-			botToken: asString(getByPath(rawConfig, ["notifications", "discord", "botToken"])),
-			applicationId: asString(getByPath(rawConfig, ["notifications", "discord", "applicationId"])),
-			guildId: asString(getByPath(rawConfig, ["notifications", "discord", "guildId"])),
-			parentChannelId: asString(getByPath(rawConfig, ["notifications", "discord", "parentChannelId"])),
-		},
-		slack: {
-			botToken: asString(getByPath(rawConfig, ["notifications", "slack", "botToken"])),
-			appToken: asString(getByPath(rawConfig, ["notifications", "slack", "appToken"])),
-			workspaceId: asString(getByPath(rawConfig, ["notifications", "slack", "workspaceId"])),
-			channelId: asString(getByPath(rawConfig, ["notifications", "slack", "channelId"])),
-			authorizedUserId: asString(getByPath(rawConfig, ["notifications", "slack", "authorizedUserId"])),
-		},
-		redact: asBoolean(getByPath(rawConfig, ["notifications", "redact"]), false),
-		verbosity: getByPath(rawConfig, ["notifications", "verbosity"]) === "verbose" ? "verbose" : "lean",
-		sessionScope: getByPath(rawConfig, ["notifications", "sessionScope"]) === "primary" ? "primary" : "all",
-		idleTimeoutMs: asIdleTimeoutMs(getByPath(rawConfig, ["notifications", "daemon", "idleTimeoutMs"])),
-	});
+			redact: asBoolean(notifications.redact, false),
+			verbosity: asChoice<"lean" | "verbose">(notifications.verbosity, "lean", ["lean", "verbose"]),
+			sessionScope: asChoice<"all" | "primary">(notifications.sessionScope, "all", ["all", "primary"]),
+			idleTimeoutMs: asIdleTimeoutMs(daemon.idleTimeoutMs),
+		};
+	};
+	getNotificationSettingsSnapshot();
 
 	return {
 		get(pathName: string): unknown {
@@ -126,6 +164,8 @@ export function createLightweightDaemonSettings(input: {
 					return snapshot.telegram.botToken;
 				case "notifications.telegram.chatId":
 					return snapshot.telegram.chatId;
+				case "notifications.telegram.btw.enabled":
+					return snapshot.telegram.btw.enabled;
 				case "notifications.discord.botToken":
 					return snapshot.discord.botToken;
 				case "notifications.discord.applicationId":
@@ -243,7 +283,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const ownerId = argValue(argv, "--owner-id");
 	if (!ownerId) throw new Error("missing --owner-id");
 	if (!ownerProcessIsAlive(ownerId, deps)) {
-		process.stderr.write(`GJC notify daemon exiting: owner process from --owner-id ${ownerId} is not alive.\n`);
+		recordDaemonCompatibilityDiagnostic("GJC notify daemon exiting because its owner is not alive");
 		return;
 	}
 	const resolvedAgentDir = agentDir ?? process.env.GJC_CODING_AGENT_DIR ?? path.join(process.cwd(), ".gjc", "agent");
@@ -261,6 +301,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		rich: cfg.rich,
 		richDraft: cfg.richDraft,
 		topics: cfg.topics,
+		btw: cfg.btw,
 		pid: deps.processPid ?? process.pid,
 		control: {
 			shouldStop: async owner => {

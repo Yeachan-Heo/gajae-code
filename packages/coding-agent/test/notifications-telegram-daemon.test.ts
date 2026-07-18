@@ -3,7 +3,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { Marked } from "marked";
 import { Settings } from "../src/config/settings";
+import { tokenFingerprint } from "../src/sdk/bus/config";
 import {
 	markdownToTelegramHtml,
 	splitTelegramHtml,
@@ -19,9 +21,11 @@ import {
 	daemonPaths,
 	ensureTelegramDaemonRunning,
 	ensureTelegramDaemonRunningDetailed,
+	readDaemonState,
 	registerNotificationRoot,
 	releaseDaemonOwnership,
 	renewDaemonHeartbeat,
+	spawnTelegramDaemonOwner,
 	TelegramBotTransport,
 	type TelegramDaemonFs,
 	type TelegramDaemonOptions,
@@ -31,7 +35,8 @@ import {
 	TOOL_ACTIVITY_CAPABILITY,
 	unregisterNotificationRoot,
 } from "../src/sdk/bus/telegram-daemon";
-import { runDaemonInternal, runDaemonSmoke } from "../src/sdk/bus/telegram-daemon-cli";
+import { ownerPidFromOwnerId, runDaemonInternal, runDaemonSmoke } from "../src/sdk/bus/telegram-daemon-cli";
+import { NOTIFICATION_PROTOCOL_VERSION } from "../src/sdk/bus/telegram-daemon-contract";
 
 const THREADED_FALLBACK_NOTICE =
 	"Flat Telegram private chat supports outbound notifications and inline ask buttons only. Enable Threaded Mode in @BotFather > Bot Settings > Threads Settings for free-text replies and session commands.";
@@ -103,15 +108,28 @@ class FakeWs extends EventTarget {
 	}
 	static instances: FakeWs[] = [];
 }
+async function enableEphemeralTurns(daemon: TelegramNotificationDaemon, sessionId = "S"): Promise<void> {
+	const session = daemon.sessions.get(sessionId)!;
+	if (!session.replayPending) session.ws.dispatchEvent(new Event("open"));
+	await daemon.handleSessionMessage(session, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
+	await daemon.handleSessionMessage(session, {
+		type: "event_replay_result",
+		id: session.replayId,
+		generation: 1,
+		lastSeq: 0,
+		events: [],
+	});
+}
 
 class FakeBotApi {
-	calls: Array<{ method: string; body: any }> = [];
+	createdTopicThreadIds: number[] = [];
+	calls: Array<{ method: string; body: any; options?: { noRetry?: boolean; signal?: AbortSignal } }> = [];
 	updates: any[] = [];
 	activeGetUpdates = 0;
 	maxConcurrentGetUpdates = 0;
 	botUsername: string | undefined = undefined;
-	async call(method: string, body: unknown): Promise<unknown> {
-		this.calls.push({ method, body });
+	async call(method: string, body: unknown, options?: { noRetry?: boolean; signal?: AbortSignal }): Promise<unknown> {
+		this.calls.push({ method, body, options });
 		if (method === "getUpdates") {
 			this.activeGetUpdates++;
 			this.maxConcurrentGetUpdates = Math.max(this.maxConcurrentGetUpdates, this.activeGetUpdates);
@@ -126,8 +144,13 @@ class FakeBotApi {
 		if (method === "getChat")
 			return { ok: true, result: { id: (body as { chat_id?: unknown }).chat_id, type: "private" } };
 		if (method === "getFile") return { ok: true, result: { file_path: "docs/file_7.bin" } };
-		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: this.calls.length } };
-		if (method === "sendMessage") return { ok: true, result: { message_id: this.calls.length } };
+		if (method === "createForumTopic") {
+			const threadId = this.calls.length;
+			this.createdTopicThreadIds.push(threadId);
+			return { ok: true, result: { message_thread_id: threadId } };
+		}
+		if (method === "sendMessage" || method === "sendRichMessage")
+			return { ok: true, result: { message_id: this.calls.length } };
 		return { ok: true, result: true };
 	}
 }
@@ -498,12 +521,216 @@ describe("telegram daemon", () => {
 					settings: s,
 					tokenFingerprint: "fp",
 					chatId: "42",
-					pidAlive: () => false,
+					pidAlive: pid => pid !== 999,
 					pid: 222,
 				}),
 			),
 		);
 		expect(results.filter(r => r.acquired)).toHaveLength(1);
+	});
+	test("stopped state with a retained lock is taken over even when its PID is live", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 0 }));
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 111,
+				ownerId: "stopped",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 0,
+				heartbeatAt: 0,
+				stoppedAt: 1,
+				roots: [],
+				version: DAEMON_VERSION,
+				generation: DAEMON_GENERATION,
+			}),
+		);
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				now: () => 30_000,
+				pidAlive: pid => pid === 111,
+			}),
+		).resolves.toMatchObject({ acquired: true });
+	});
+	test("release paused after stopped write cannot unlink a successor lock", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 111,
+			ownerId: "old",
+		});
+		const paths = daemonPaths(agentDir);
+		let stoppedWritten!: () => void;
+		let continueRelease!: () => void;
+		const stoppedWrite = new Promise<void>(resolve => {
+			stoppedWritten = resolve;
+		});
+		const releaseGate = new Promise<void>(resolve => {
+			continueRelease = resolve;
+		});
+		const pausedFs: TelegramDaemonFs = {
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+			writeFile: async (file, data, opts) => {
+				await fs.promises.writeFile(file, data, opts);
+				if (file.startsWith(`${paths.state}.`) && file.endsWith(".tmp")) {
+					stoppedWritten();
+					await releaseGate;
+				}
+			},
+			rename: (oldPath, newPath) => fs.promises.rename(oldPath, newPath).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+		};
+		const release = releaseDaemonOwnership({
+			settings: s,
+			ownerId: "old",
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 111,
+			fs: pausedFs,
+		});
+		await stoppedWrite;
+		const successor = acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 222,
+			ownerId: "new",
+		});
+		continueRelease();
+		await release;
+		await expect(successor).resolves.toMatchObject({ acquired: true, ownerId: "new" });
+		expect((await readDaemonState(s))?.ownerId).toBe("new");
+		expect(fs.existsSync(paths.lock)).toBe(true);
+	});
+	test("malformed acquisition PID fails closed without probing liveness", async () => {
+		const agentDir = tempAgentDir();
+		const probes: number[] = [];
+		await expect(
+			acquireDaemonOwnership({
+				settings: setPrivateAgentDir(settings(agentDir), agentDir),
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: Number.NaN,
+				pidAlive: pid => {
+					probes.push(pid);
+					return false;
+				},
+			}),
+		).resolves.toEqual({ acquired: false, attached: true });
+		expect(probes).toEqual([]);
+	});
+	test("malformed persisted PID is not sent to the liveness probe", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: "invalid", startedAt: 0 }));
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: "invalid",
+				ownerId: "old",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 0,
+				heartbeatAt: 0,
+				roots: [],
+				version: DAEMON_VERSION,
+			}),
+		);
+		const probes: number[] = [];
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 222,
+			now: () => 30_000,
+			pidAlive: pid => {
+				probes.push(pid);
+				return false;
+			},
+		});
+		expect(probes).toEqual([]);
+	});
+	test("state publication failure leaves recoverable lock metadata", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		let failStateWrite = true;
+		const crashingFs: TelegramDaemonFs = {
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+			writeFile: async (file, data, opts) => {
+				if (file.startsWith(`${paths.state}.`) && file.endsWith(".tmp") && failStateWrite) {
+					failStateWrite = false;
+					throw new Error("simulated crash between lock and state publication");
+				}
+				await fs.promises.writeFile(file, data, opts);
+			},
+			rename: (oldPath, newPath) => fs.promises.rename(oldPath, newPath).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: async (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+		};
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 111,
+				now: () => 0,
+				fs: crashingFs,
+			}),
+		).rejects.toThrow("simulated crash");
+		expect(fs.existsSync(paths.lock)).toBe(true);
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toEqual({ pid: 111, startedAt: 0 });
+		expect(fs.existsSync(paths.state)).toBe(false);
+
+		expect(
+			await acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				now: () => 30_000,
+				pidAlive: () => false,
+			}),
+		).toMatchObject({ acquired: true });
+	});
+	test("metadata-bearing lock does not steal from a live initializer", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 111, startedAt: 0 }));
+
+		expect(
+			await acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				now: () => 30_000,
+				pidAlive: pid => pid === 111,
+			}),
+		).toEqual({ acquired: false, attached: true });
 	});
 
 	test("fresh heartbeat is not stolen", async () => {
@@ -624,6 +851,10 @@ describe("telegram daemon", () => {
 		fs.writeFileSync(paths.state, JSON.stringify(liveOwnerState(extra)));
 		fs.writeFileSync(paths.lock, "");
 	}
+	test("keeps the wire protocol at 3 while reload ownership uses generation 5", () => {
+		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
+		expect(DAEMON_GENERATION).toBe(5);
+	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
 		const agentDir = tempAgentDir();
@@ -635,6 +866,19 @@ describe("telegram daemon", () => {
 			chatId: "42",
 			pidAlive: () => true,
 			now: () => 101,
+		});
+		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
+	});
+	test("#2028 acquire flags a reload for a live daemon from the immediately preceding generation", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, heartbeatAt: Date.now() });
+		const result = await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "e60b05c186ca",
+			chatId: "42",
+			pidAlive: () => true,
+			now: () => Date.now(),
 		});
 		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
 	});
@@ -805,7 +1049,7 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
 			settings: s,
-			tokenFingerprint: "fp",
+			tokenFingerprint: tokenFingerprint("tok"),
 			chatId: "42",
 			pid: process.pid,
 			randomId: () => "owner",
@@ -833,10 +1077,11 @@ describe("telegram daemon", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
 			settings: s,
-			tokenFingerprint: "e60b05c186ca",
+			tokenFingerprint: tokenFingerprint("123456:secret-token"),
 			chatId: "42",
 			pid: 111,
 			randomId: () => "owner",
+			allowPidRebind: true,
 		});
 		class OneShotDaemon extends TelegramNotificationDaemon {
 			#options: TelegramDaemonOptions;
@@ -850,7 +1095,9 @@ describe("telegram daemon", () => {
 				await renewDaemonHeartbeat({
 					settings: this.#options.settings,
 					ownerId: this.#options.ownerId,
-					pid: this.#options.pid,
+					tokenFingerprint: tokenFingerprint("123456:secret-token"),
+					chatId: "42",
+					pid: this.#options.pid!,
 				});
 			}
 		}
@@ -868,6 +1115,227 @@ describe("telegram daemon", () => {
 		expect(state.ownerId).toBe("owner");
 	});
 
+	test("Windows source-linked spawn uses an opaque owner id and the daemon rebinds its PID", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		let spawnArgs: string[] | undefined;
+		const spawned = await spawnTelegramDaemonOwner(
+			{ settings: s, tokenFingerprint: "fp", chatId: "42" },
+			{
+				execPath: "/usr/local/bin/bun",
+				platform: "win32",
+				pid: 7132,
+				randomId: () => "launch-token",
+				spawn: (_command, args) => {
+					spawnArgs = args;
+					return { unref() {} };
+				},
+			},
+		);
+
+		expect(spawned).toMatchObject({ result: "owner_spawned", ownerId: "daemon-launch-token" });
+		expect(spawnArgs).toEqual(expect.arrayContaining(["--owner-id", "daemon-launch-token"]));
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 8123,
+			}),
+		).toBe(true);
+		expect((await readDaemonState(s))?.pid).toBe(8123);
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 9123,
+			}),
+		).toBe(false);
+		expect((await readDaemonState(s))?.pid).toBe(8123);
+	});
+	test("serializes concurrent launcher PID handoffs so exactly one daemon binds", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 7132,
+			ownerId: "daemon-launch-token",
+			allowPidRebind: true,
+		});
+
+		const [firstBound, secondBound] = await Promise.all([
+			renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 8123,
+			}),
+			renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 9123,
+			}),
+		]);
+
+		expect([firstBound, secondBound].filter(Boolean)).toHaveLength(1);
+		expect((await readDaemonState(s))?.pid).toBe(firstBound ? 8123 : 9123);
+	});
+	test("serializes release with launcher PID handoff", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 7132,
+			ownerId: "daemon-launch-token",
+			allowPidRebind: true,
+		});
+
+		const [bound] = await Promise.all([
+			renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 8123,
+			}),
+			releaseDaemonOwnership({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 7132,
+			}),
+		]);
+		const state = await readDaemonState(s);
+
+		if (bound) {
+			expect(state).toMatchObject({ pid: 8123 });
+			expect(state?.stoppedAt).toBeUndefined();
+			expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
+		} else {
+			expect(state).toMatchObject({ pid: 7132, stoppedAt: expect.any(Number) });
+			expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+		}
+	});
+	test("Unix source and compiled launches use PID-prefixed owner IDs and recover dead launchers", async () => {
+		const sourceAgentDir = tempAgentDir();
+		const source = await spawnTelegramDaemonOwner(
+			{ settings: settings(sourceAgentDir), tokenFingerprint: "fp", chatId: "42" },
+			{
+				execPath: "/usr/local/bin/bun",
+				platform: "linux",
+				pid: 4242,
+				randomId: () => "4242-nonce",
+				spawn: () => ({ unref() {} }),
+			},
+		);
+		const compiledAgentDir = tempAgentDir();
+		const compiled = await spawnTelegramDaemonOwner(
+			{ settings: settings(compiledAgentDir), tokenFingerprint: "fp", chatId: "42" },
+			{
+				execPath: "/opt/gjc/gjc",
+				platform: "win32",
+				pid: 5252,
+				randomId: () => "5252-nonce",
+				spawn: () => ({ unref() {} }),
+			},
+		);
+
+		expect(source).toMatchObject({ result: "owner_spawned", ownerId: "4242-nonce" });
+		expect(compiled).toMatchObject({ result: "owner_spawned", ownerId: "5252-nonce" });
+		expect(ownerPidFromOwnerId(source.ownerId!)).toBe(4242);
+		expect(ownerPidFromOwnerId(compiled.ownerId!)).toBe(5252);
+		expect(
+			await acquireDaemonOwnership({
+				settings: settings(sourceAgentDir),
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 4343,
+				randomId: () => "4343-replacement",
+				pidAlive: pid => pid !== 4242,
+			}),
+		).toMatchObject({ acquired: true, ownerId: "4343-replacement" });
+	});
+
+	test("daemon heartbeat rejects omitted identity or PID at runtime", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 7132,
+			ownerId: "owner",
+		});
+
+		// @ts-expect-error Heartbeats require the Telegram identity and daemon PID.
+		expect(await renewDaemonHeartbeat({ settings: s, ownerId: "owner" })).toBe(false);
+		expect(await readDaemonState(s)).toMatchObject({ pid: 7132, heartbeatAt: expect.any(Number) });
+	});
+
+	test("daemon heartbeat rejects a foreign Telegram identity even with the owner id", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 7132,
+			ownerId: "daemon-launch-token",
+		});
+
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "foreign-fp",
+				chatId: "42",
+				pid: 8123,
+			}),
+		).toBe(false);
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "daemon-launch-token",
+				tokenFingerprint: "fp",
+				chatId: "foreign-chat",
+				pid: 8123,
+			}),
+		).toBe(false);
+		expect((await readDaemonState(s))?.pid).toBe(7132);
+	});
+	test("release rejects a matching owner and Telegram identity with the wrong PID", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 7132,
+			ownerId: "owner",
+		});
+
+		await releaseDaemonOwnership({
+			settings: s,
+			ownerId: "owner",
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: 8123,
+		});
+
+		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
+		expect((await readDaemonState(s))?.stoppedAt).toBeUndefined();
+	});
 	test("runDaemonInternal stops when persisted ownership moves to another owner", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -1974,8 +2442,7 @@ describe("telegram daemon", () => {
 			question: "Name it?",
 			options: ["a", "b"],
 		});
-		const askSend = bot.calls.find(c => c.method === "sendMessage");
-		const threadId = askSend!.body.message_thread_id;
+		const threadId = bot.createdTopicThreadIds.at(-1)!;
 		const update = {
 			update_id: 1,
 			message: { chat: { id: 42 }, message_thread_id: threadId, text: "my typed answer", message_id: 99 },
@@ -2545,6 +3012,355 @@ describe("telegram daemon", () => {
 		expect(sent.some(frame => frame.type === "user_message" && frame.text === "start a new task")).toBe(true);
 		expect(sent.some(frame => frame.type === "reply")).toBe(false);
 	});
+	test("routes /btw as an ephemeral frame and returns its reply to the original topic", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await enableEphemeralTurns(daemon);
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const threadId = bot.createdTopicThreadIds.at(-1)!;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "action_resolved", id: "ask1" });
+
+		await daemon.handleTelegramUpdate({
+			update_id: 8,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw what changed?", message_id: 101 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent).toContainEqual(
+			expect.objectContaining({
+				type: "ephemeral_turn",
+				sessionId: "S",
+				question: "what changed?",
+				token: "ts",
+				updateId: 8,
+				threadId: String(threadId),
+				messageId: 101,
+				requestId: expect.stringMatching(/^btw:/),
+			}),
+		);
+		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
+
+		const requestId = sent.find(frame => frame.type === "ephemeral_turn")!.requestId;
+		const replyCountBefore = bot.calls.filter(call => call.method === "sendMessage").length;
+		const richCountBefore = bot.calls.filter(call => call.method === "sendRichMessage").length;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "ephemeral_turn_result",
+			sessionId: "S",
+			requestId: "btw:stale",
+			threadId: String(threadId),
+			updateId: 8,
+			messageId: 101,
+			status: "ok",
+			text: "Stale answer",
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(replyCountBefore);
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "ephemeral_turn_result",
+			sessionId: "S",
+			requestId,
+			threadId: String(threadId),
+			updateId: 8,
+			messageId: 101,
+			status: "ok",
+			text: "# Reply\n\n| Name | Score |\n| --- | ---: |\n| Ada | 10 |",
+		});
+		const richCountAfterResult = bot.calls.filter(call => call.method === "sendRichMessage").length;
+		expect(richCountAfterResult).toBe(richCountBefore + 1);
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "ephemeral_turn_result",
+			sessionId: "S",
+			requestId,
+			threadId: String(threadId),
+			updateId: 8,
+			messageId: 101,
+			status: "ok",
+			text: "Duplicate answer",
+		});
+		expect(bot.calls.filter(call => call.method === "sendRichMessage")).toHaveLength(richCountAfterResult);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(replyCountBefore);
+		const rich = bot.calls.find(
+			call => call.method === "sendRichMessage" && call.body.reply_parameters?.message_id === 101,
+		)!;
+		expect(rich.body).toEqual({
+			chat_id: "42",
+			message_thread_id: threadId,
+			reply_parameters: { message_id: 101 },
+			rich_message: {
+				markdown: "# Reply\n\n| Name | Score |\n| --- | ---: |\n| Ada | 10 |",
+				skip_entity_detection: true,
+			},
+		});
+		expect(rich.body.rich_message.blocks).toBeUndefined();
+		expect(rich.body.rich_message.media).toBeUndefined();
+		expect(rich.options).toEqual(expect.objectContaining({ noRetry: true, signal: expect.any(AbortSignal) }));
+		bot.calls = [];
+		const call = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "sendRichMessage") {
+				bot.calls.push({ method, body, options });
+				throw new Error("rich transport outcome unknown");
+			}
+			return call(method, body, options);
+		};
+		await daemon.handleTelegramUpdate({
+			update_id: 9,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw uncertain", message_id: 102 },
+		});
+		const uncertainRequest = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).find(
+			frame => frame.type === "ephemeral_turn" && frame.messageId === 102,
+		)!;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "ephemeral_turn_result",
+			sessionId: "S",
+			requestId: uncertainRequest.requestId,
+			threadId: String(threadId),
+			updateId: 9,
+			messageId: 102,
+			status: "ok",
+			text: "# Uncertain\n\n| Name |\n| --- |\n| Ada |",
+		});
+		expect(bot.calls.map(call => call.method)).toEqual(["sendRichMessage"]);
+	});
+	test("/btw addressed to another bot is consumed without injecting a user message", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const threadId = bot.createdTopicThreadIds.at(-1)!;
+		await daemon.handleTelegramUpdate({
+			update_id: 81,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw@OtherBot secret", message_id: 181 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent.some(frame => frame.type === "ephemeral_turn" || frame.type === "user_message")).toBe(false);
+	});
+	test("/btw result retains its transport topic ownership after a logical-session rekey", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await enableEphemeralTurns(daemon);
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const threadId = bot.createdTopicThreadIds.at(-1)!;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "config_update", sessionId: "rekeyed" });
+		await daemon.handleTelegramUpdate({
+			update_id: 82,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw rekey", message_id: 182 },
+		});
+		const request = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).find(
+			frame => frame.type === "ephemeral_turn",
+		)!;
+		expect(request.sessionId).toBe("rekeyed");
+		const rekeyMarkdown = "| Value |\n| --- |\n| still routed |";
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "ephemeral_turn_result",
+			sessionId: "rekeyed",
+			requestId: request.requestId,
+			threadId: String(threadId),
+			updateId: 82,
+			messageId: 182,
+			status: "ok",
+			text: rekeyMarkdown,
+		});
+		const rich = bot.calls.find(
+			call => call.method === "sendRichMessage" && call.body.reply_parameters?.message_id === 182,
+		)!;
+		expect(rich.body).toEqual({
+			chat_id: "42",
+			message_thread_id: threadId,
+			reply_parameters: { message_id: 182 },
+			rich_message: { markdown: rekeyMarkdown, skip_entity_detection: true },
+		});
+		expect(rich.options).toEqual(expect.objectContaining({ noRetry: true, signal: expect.any(AbortSignal) }));
+	});
+	test("routes /btw rich delivery at exact 32,768 boundary and preserves HTML when bypassed or disabled", async () => {
+		const tablePrefix = "| Value |\n| --- |\n| ";
+		const tableSuffix = " |";
+		const lexerSpy = vi.spyOn(Marked.prototype, "lexer");
+		try {
+			for (const { label, rich, length, richCalls, lexerCalls } of [
+				{ label: "default omitted at 32,768", rich: undefined, length: 32_768, richCalls: 1, lexerCalls: 1 },
+				{ label: "explicit on at 32,768", rich: { enabled: true }, length: 32_768, richCalls: 1, lexerCalls: 1 },
+				{ label: "explicit off at 32,768", rich: { enabled: false }, length: 32_768, richCalls: 0, lexerCalls: 0 },
+				{ label: "explicit on at 32,769", rich: { enabled: true }, length: 32_769, richCalls: 0, lexerCalls: 0 },
+			] as const) {
+				FakeWs.instances = [];
+				const bot = new RichFakeBotApi();
+				const agentDir = tempAgentDir();
+				const daemon = new TelegramNotificationDaemon({
+					settings: setPrivateAgentDir(settings(agentDir), agentDir),
+					ownerId: "owner",
+					botToken: "tok",
+					chatId: "42",
+					botApi: bot as any,
+					WebSocketImpl: FakeWs as any,
+					...(rich ? { rich } : {}),
+				});
+				daemon.connectSession("S", "ws://s", "ts");
+				await enableEphemeralTurns(daemon);
+				await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+					type: "action_needed",
+					kind: "ask",
+					id: "ask1",
+					question: "Name it?",
+					options: ["a", "b"],
+				});
+				const threadId = bot.richThreadId;
+				await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "action_resolved", id: "ask1" });
+				bot.calls.length = 0;
+				lexerSpy.mockClear();
+
+				await daemon.handleTelegramUpdate({
+					update_id: 80,
+					message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw boundary", message_id: 180 },
+				});
+				const requestId = JSON.parse(FakeWs.instances[0]!.sent.at(-1)!).requestId;
+				const markdown = `${tablePrefix}${"x".repeat(length - tablePrefix.length - tableSuffix.length)}${tableSuffix}`;
+				await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+					type: "ephemeral_turn_result",
+					sessionId: "S",
+					requestId,
+					threadId: String(threadId),
+					updateId: 80,
+					messageId: 180,
+					status: "ok",
+					text: markdown,
+				});
+
+				expect(countMethod(bot, "sendRichMessage"), label).toBe(richCalls);
+				expect(lexerSpy, label).toHaveBeenCalledTimes(lexerCalls);
+				const html = bot.calls.filter(call => call.method === "sendMessage");
+				if (richCalls === 1) {
+					expect(html, label).toHaveLength(0);
+					const rich = findMethod(bot, "sendRichMessage")!;
+					expect(rich.body).toEqual({
+						chat_id: "42",
+						message_thread_id: threadId,
+						reply_parameters: { message_id: 180 },
+						rich_message: { markdown, skip_entity_detection: true },
+					});
+					expect(rich.body.rich_message.blocks).toBeUndefined();
+					expect(rich.body.rich_message.media).toBeUndefined();
+					expect(rich.options).toEqual(
+						expect.objectContaining({ noRetry: true, signal: expect.any(AbortSignal) }),
+					);
+				} else {
+					expect(html, label).toHaveLength(splitTelegramHtml(markdownToTelegramHtml(markdown)).length);
+					expect(
+						html.map(call => call.body.text),
+						label,
+					).toEqual(splitTelegramHtml(markdownToTelegramHtml(markdown)));
+					expect(html[0]!.body.reply_parameters, label).toEqual({ message_id: 180 });
+					expect(
+						html.slice(1).every(call => call.body.reply_parameters === undefined),
+						label,
+					).toBe(true);
+					expect(
+						html.every(call => call.body.parse_mode === TELEGRAM_PARSE_MODE),
+						label,
+					).toBe(true);
+					expect(
+						html.every(call => call.options?.noRetry === true && call.options.signal instanceof AbortSignal),
+						label,
+					).toBe(true);
+				}
+			}
+		} finally {
+			lexerSpy.mockRestore();
+		}
+	});
+
+	test("shows /btw help for an empty question without injecting a user turn", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const threadId = bot.calls.find(c => c.method === "sendMessage")!.body.message_thread_id;
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "action_resolved", id: "ask1" });
+
+		await daemon.handleTelegramUpdate({
+			update_id: 9,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw", message_id: 102 },
+		});
+
+		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(sent.some(frame => frame.type === "ephemeral_turn" || frame.type === "user_message")).toBe(false);
+		const reply = bot.calls.find(
+			call => call.method === "sendMessage" && call.body.text === "Usage: /btw <question>",
+		)!;
+		expect(reply).toMatchObject({
+			body: {
+				message_thread_id: threadId,
+				reply_parameters: { message_id: 102 },
+				text: "Usage: /btw <question>",
+			},
+			options: { noRetry: true, signal: expect.any(AbortSignal) },
+		});
+	});
 
 	test("telegram control command forwards control_command instead of user_message", async () => {
 		FakeWs.instances = [];
@@ -2896,7 +3712,7 @@ describe("telegram daemon", () => {
 		expect(fs.readdirSync(daemonPaths(agentDir).dir).join("\n")).not.toContain("secret-token");
 	});
 
-	test("heartbeat renew and release helpers honor owner id", async () => {
+	test("release requires the owner identity as well as its opaque owner id", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
@@ -2906,21 +3722,224 @@ describe("telegram daemon", () => {
 			pid: process.pid,
 			randomId: () => "owner",
 		});
-		expect(await renewDaemonHeartbeat({ settings: s, ownerId: "other" })).toBe(false);
-		expect(await renewDaemonHeartbeat({ settings: s, ownerId: "owner" })).toBe(true);
-		await releaseDaemonOwnership({ settings: s, ownerId: "other" });
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "other",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: process.pid,
+			}),
+		).toBe(false);
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "owner",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: process.pid,
+			}),
+		).toBe(true);
+
+		await releaseDaemonOwnership({
+			settings: s,
+			ownerId: "owner",
+			tokenFingerprint: "foreign-fp",
+			chatId: "42",
+			pid: process.pid,
+		});
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
-		await releaseDaemonOwnership({ settings: s, ownerId: "owner" });
+		expect(
+			await acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "foreign-fp",
+				chatId: "42",
+				pid: process.pid,
+				randomId: () => "owner",
+			}),
+		).toMatchObject({ acquired: false, blocked: true });
+
+		await releaseDaemonOwnership({
+			settings: s,
+			ownerId: "owner",
+			tokenFingerprint: "fp",
+			chatId: "99",
+			pid: process.pid,
+		});
+		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
+
+		await releaseDaemonOwnership({
+			settings: s,
+			ownerId: "owner",
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: process.pid,
+		});
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
 	});
 
+	test("stopped ownership records do not block immediate reacquisition", async () => {
+		for (const token of ["fp", "foreign-fp"]) {
+			const agentDir = tempAgentDir();
+			const s = setPrivateAgentDir(settings(agentDir), agentDir);
+			await acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: process.pid,
+				randomId: () => "owner",
+			});
+			await releaseDaemonOwnership({
+				settings: s,
+				ownerId: "owner",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: process.pid,
+			});
+
+			expect(
+				await acquireDaemonOwnership({
+					settings: s,
+					tokenFingerprint: token,
+					chatId: "42",
+					pid: process.pid,
+					pidAlive: () => true,
+					randomId: () => "replacement",
+				}),
+			).toMatchObject({ acquired: true, ownerId: "replacement" });
+		}
+	});
+
+	test("heartbeat rejects malformed PIDs without changing ownership state", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: process.pid,
+			randomId: () => "owner",
+		});
+		const before = await readDaemonState(s);
+
+		for (const pid of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+			expect(
+				await renewDaemonHeartbeat({
+					settings: s,
+					ownerId: "owner",
+					tokenFingerprint: "fp",
+					chatId: "42",
+					pid,
+				}),
+			).toBe(false);
+		}
+		expect(await readDaemonState(s)).toEqual(before);
+	});
+
+	test("heartbeat rejects malformed persisted handoff PIDs without rewriting state", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pid: process.pid,
+			randomId: () => "owner",
+			allowPidRebind: true,
+		});
+		const malformed = {
+			...(await readDaemonState(s))!,
+			pid: -1,
+			launcherPid: -1,
+		};
+		fs.writeFileSync(paths.state, JSON.stringify(malformed));
+
+		expect(
+			await renewDaemonHeartbeat({
+				settings: s,
+				ownerId: "owner",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: process.pid + 1,
+			}),
+		).toBe(false);
+		expect(await readDaemonState(s)).toEqual(malformed);
+	});
+
+	test("ownership heartbeat remains fresh during a pending long poll and is cleaned up on exit", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		let now = 0;
+		await acquireDaemonOwnership({
+			settings: s,
+			tokenFingerprint: tokenFingerprint("tok"),
+			chatId: "42",
+			pid: process.pid,
+			now: () => now,
+			randomId: () => "owner",
+		});
+
+		const timers = new Map<number, { ms: number; callback: () => void }>();
+		let nextTimerId = 1;
+		let pollStarted!: () => void;
+		const pollStartedPromise = new Promise<void>(resolve => {
+			pollStarted = resolve;
+		});
+		let releasePoll!: () => void;
+		const pollGate = new Promise<void>(resolve => {
+			releasePoll = resolve;
+		});
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			now: () => now,
+			idleTimeoutMs: 60_000,
+			createLifecycleControlServer: null,
+			botApi: {
+				async call(method: string): Promise<unknown> {
+					if (method === "getUpdates") {
+						pollStarted();
+						await pollGate;
+					}
+					return { ok: true, result: [] };
+				},
+			},
+			setIntervalImpl: ((callback: () => void, ms: number) => {
+				const id = nextTimerId++;
+				timers.set(id, { ms, callback });
+				return id as unknown as ReturnType<typeof setInterval>;
+			}) as typeof setInterval,
+			clearIntervalImpl: ((id: number) => {
+				timers.delete(id);
+			}) as unknown as typeof clearInterval,
+		});
+
+		const runPromise = daemon.run();
+		await pollStartedPromise;
+		now = 10_000;
+		[...timers.values()].find(timer => timer.ms === 5_000)?.callback();
+		for (let attempts = 0; attempts < 20; attempts++) {
+			if ((await readDaemonState(s))?.heartbeatAt === now) break;
+			await Bun.sleep(5);
+		}
+		expect((await readDaemonState(s))?.heartbeatAt).toBe(now);
+
+		daemon.requestStop();
+		releasePoll();
+		await runPromise;
+		expect(timers.size).toBe(0);
+		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+	});
 	test("scan timer connects new sessions while a getUpdates long-poll is in flight", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
 			settings: s,
-			tokenFingerprint: "fp",
+			tokenFingerprint: tokenFingerprint("tok"),
 			chatId: "42",
 			pid: process.pid,
 			randomId: () => "owner",
@@ -3100,10 +4119,27 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 		expect(FakeWs.instances).toHaveLength(1);
 		expect(daemon.sessions.has("S")).toBe(true);
 
+		FakeWs.instances[0]!.dispatchEvent(new Event("open"));
+		expect(FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).find(frame => frame.type === "hello")).toEqual({
+			type: "hello",
+			protocolVersion: 3,
+			capabilities: ["client_ping_pong", "ask_controls_v1", "ask_selected_ack_v1", "tool_activity_v1"],
+		});
 		// The native server advertises the ping/pong capability so ack-based
 		// liveness can start; then the link goes half-open (no further frames,
 		// socket never closes, no pong will arrive).
 		FakeWs.instances[0]!.emit({ type: "hello", protocolVersion: 2, capabilities: ["client_ping_pong"] });
+		FakeWs.instances[0]!.emit({
+			type: "event_replay_result",
+			id: "telegram-startup-replay:S",
+			generation: 1,
+			lastSeq: 0,
+			events: [],
+		});
+		for (let attempts = 0; attempts < 20 && liveness.length === 0; attempts++) {
+			await Bun.sleep(1);
+		}
+		expect(liveness).toHaveLength(1);
 
 		// Advance past the heartbeat TTL and fire any liveness probe. Post-fix this
 		// detects the missing pong, drops the stale session, and reconnects.
@@ -3127,7 +4163,7 @@ describe("telegram daemon connection-drop resilience (repro-first)", () => {
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		await acquireDaemonOwnership({
 			settings: s,
-			tokenFingerprint: "fp",
+			tokenFingerprint: tokenFingerprint("tok"),
 			chatId: "42",
 			pid: process.pid,
 			randomId: () => "owner",
@@ -3197,6 +4233,7 @@ test("daemon registers in-thread config and lifecycle commands and drops stale r
 		command => command.command === "verbose",
 	);
 	expect(verbose?.description).toBe("Mirror bounded tool-owned summaries + provider-displayable reasoning summaries");
+	expect(cmds).toContain("btw");
 	expect(cmds).toContain("session_create");
 	expect(cmds).toContain("session_recent");
 	expect(cmds).toContain("session_close");
@@ -3981,11 +5018,11 @@ test("stale identity after loadTopics reuses the persisted repo branch owner", a
 test("threaded mode off: frames fall back to the flat paired chat with a one-time notice", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
-	// Threaded Mode is off: createForumTopic yields no message_thread_id, so
-	// ensureTopic fails and the daemon must route flat instead of dropping.
+	// Telegram explicitly confirms that Threaded Mode is unavailable, so flat
+	// delivery is permitted for the paired private chat.
 	bot.call = (async (method: string, body: any) => {
 		bot.calls.push({ method, body });
-		if (method === "createForumTopic") return { ok: true, result: {} };
+		if (method === "createForumTopic") return { ok: false, description: "Bad Request: Threaded Mode is disabled" };
 		if (method === "getChat") return { ok: true, result: { type: "private" } };
 		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
 		return { ok: true, result: true };
@@ -4032,13 +5069,96 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 	expect(ask).toBeTruthy();
 	expect(ask!.body.reply_markup?.inline_keyboard?.length).toBeGreaterThan(0);
 });
+test("topic creation transport failures fail closed without flat delivery", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = async (method, body) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "createForumTopic") throw new Error("connection reset");
+		return { ok: true, result: true };
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await expect(
+		daemon.handleSessionMessage(session as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		}),
+	).rejects.toThrow("connection reset");
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+});
+
+test("malformed topic creation success fails closed without flat delivery", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = async (method, body) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "createForumTopic") return { ok: true, result: {} };
+		return { ok: true, result: true };
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await expect(
+		daemon.handleSessionMessage(session as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		}),
+	).rejects.toThrow("invalid message_thread_id");
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+});
+
+test("topic persistence failures fail closed without flat delivery", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		fs: topicStateFs(async () => {
+			throw new Error("topic persistence failed");
+		}),
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await expect(
+		daemon.handleSessionMessage(session as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		}),
+	).rejects.toThrow("topic persistence failed");
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+});
 
 test("threaded mode off: multiple sessions share a single fallback notice", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
 	bot.call = (async (method: string, body: any) => {
 		bot.calls.push({ method, body });
-		if (method === "createForumTopic") return { ok: true, result: {} };
+		if (method === "createForumTopic") return { ok: false, description: "Bad Request: Threaded Mode is disabled" };
 		if (method === "getChat") return { ok: true, result: { type: "private" } };
 		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
 		return { ok: true, result: true };
@@ -4066,7 +5186,7 @@ test("threaded mode off: image_attachment uploads flat without message_thread_id
 	const bot = new FakeBotApi();
 	bot.call = (async (method: string, body: any) => {
 		bot.calls.push({ method, body });
-		if (method === "createForumTopic") return { ok: true, result: {} };
+		if (method === "createForumTopic") return { ok: false, description: "Bad Request: Threaded Mode is disabled" };
 		if (method === "getChat") return { ok: true, result: { type: "private" } };
 		if (method === "sendPhoto") return { ok: true, result: { message_id: bot.calls.length } };
 		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
@@ -4629,15 +5749,21 @@ test("inbound document is saved to a tmp file and its path injected into the tex
 	expect(match).toBeTruthy();
 	expect(fs.existsSync(match![1]!)).toBe(true);
 	expect(fs.readFileSync(match![1]!)).toEqual(Buffer.from([9, 9, 9]));
-	// Security: the saved file must be private (0600, no group/other access) inside
-	// a private 0700 per-session directory under the system temp root — not a
-	// predictable, world-readable /tmp path.
+	// Security: every platform uses a private, unguessable per-session directory
+	// and an exclusive random file name. POSIX additionally exposes the requested
+	// 0700/0600 ownership bits; Windows does not represent ACLs in stat().mode.
 	const dest = match![1]!;
-	const fileMode = fs.statSync(dest).mode & 0o777;
-	const dirMode = fs.statSync(path.dirname(dest)).mode & 0o777;
-	expect(fileMode).toBe(0o600);
-	expect(fileMode & 0o077).toBe(0);
-	expect(dirMode & 0o077).toBe(0);
+	const attachmentDir = path.dirname(dest);
+	expect(attachmentDir).not.toBe(os.tmpdir());
+	expect(path.basename(attachmentDir)).toMatch(/^gjc-telegram-[A-Za-z0-9_-]+$/);
+	expect(path.basename(dest)).toMatch(/^[0-9a-f]{16}-report\.pdf$/);
+	if (process.platform !== "win32") {
+		const fileMode = fs.statSync(dest).mode & 0o777;
+		const dirMode = fs.statSync(attachmentDir).mode & 0o777;
+		expect(fileMode).toBe(0o600);
+		expect(fileMode & 0o077).toBe(0);
+		expect(dirMode & 0o077).toBe(0);
+	}
 	expect(dest.startsWith(os.tmpdir())).toBe(true);
 });
 
@@ -5219,7 +6345,7 @@ test("requestStop aborts the active long poll and run() exits, releasing ownersh
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	await acquireDaemonOwnership({
 		settings: s,
-		tokenFingerprint: "e60b05c186ca",
+		tokenFingerprint: tokenFingerprint("tok"),
 		chatId: "42",
 		pid: process.pid,
 		randomId: () => "owner",
@@ -5263,13 +6389,106 @@ test("requestStop aborts the active long poll and run() exits, releasing ownersh
 	await runPromise;
 	expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
 });
+test("graceful stop cancels a pending /btw and suppresses delayed successful delivery", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: tokenFingerprint("tok"),
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+	});
+	const pollStarted = Promise.withResolvers<void>();
+	const bot = new FakeBotApi();
+	const call = bot.call.bind(bot);
+	bot.call = async (method, body, opts) => {
+		if (method === "getUpdates") {
+			pollStarted.resolve();
+			const pending = Promise.withResolvers<unknown>();
+			opts?.signal?.addEventListener("abort", () =>
+				pending.reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+			);
+			return pending.promise;
+		}
+		return call(method, body);
+	};
+	class NoScan extends TelegramNotificationDaemon {
+		override async scanRoots(): Promise<void> {}
+	}
+	const daemon = new NoScan({
+		settings: s,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		createLifecycleControlServer: null,
+	});
+	daemon.connectSession("S", "ws://s", "t");
+	await enableEphemeralTurns(daemon);
+	await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "repo",
+		branch: "main",
+	});
+	const threadId = bot.createdTopicThreadIds.at(-1)!;
+	await daemon.handleTelegramUpdate({
+		update_id: 901,
+		message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw stop now", message_id: 1901 },
+	});
+	const request = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).find(
+		frame => frame.type === "ephemeral_turn",
+	)!;
+	const socket = FakeWs.instances[0]!;
+	const send = socket.send.bind(socket);
+	socket.send = data => {
+		send(data);
+		const frame = JSON.parse(data);
+		if (frame.type === "ephemeral_turn_cancel") {
+			queueMicrotask(() =>
+				socket.emit({
+					type: "ephemeral_turn_result",
+					sessionId: frame.sessionId,
+					requestId: frame.requestId,
+					updateId: frame.updateId,
+					messageId: frame.messageId,
+					threadId: frame.threadId,
+					status: "ok",
+					text: "late answer",
+				}),
+			);
+		}
+	};
+	bot.calls = [];
+	const runPromise = daemon.run();
+	await pollStarted.promise;
+	daemon.requestStop("signal");
+	await runPromise;
+	const cancels = socket.sent.map(frame => JSON.parse(frame)).filter(frame => frame.type === "ephemeral_turn_cancel");
+	expect(cancels).toHaveLength(1);
+	const cancel = cancels[0]!;
+	expect(cancel).toEqual({
+		type: "ephemeral_turn_cancel",
+		sessionId: "S",
+		token: "t",
+		requestId: request.requestId,
+		updateId: 901,
+		messageId: 1901,
+		threadId: String(threadId),
+		reason: "daemon_shutdown",
+	});
+	expect(bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage")).toEqual([]);
+});
 
 test("run() loop exits when an owner-scoped control request asks it to stop", async () => {
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	await acquireDaemonOwnership({
 		settings: s,
-		tokenFingerprint: "e60b05c186ca",
+		tokenFingerprint: tokenFingerprint("tok"),
 		chatId: "42",
 		pid: process.pid,
 		randomId: () => "owner",
@@ -5305,7 +6524,7 @@ test("run() persists aliases before releasing ownership on exit", async () => {
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
 	await acquireDaemonOwnership({
 		settings: s,
-		tokenFingerprint: "e60b05c186ca",
+		tokenFingerprint: tokenFingerprint("tok"),
 		chatId: "42",
 		pid: process.pid,
 		randomId: () => "owner",
@@ -5492,6 +6711,15 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 		}),
 	);
 	const bot = new FakeBotApi();
+	const originalBotCall = bot.call.bind(bot);
+	bot.call = async (method: string, body: unknown): Promise<unknown> => {
+		if (method === "deleteForumTopic" && (body as { message_thread_id?: unknown }).message_thread_id === 101) {
+			bot.calls.push({ method, body });
+			return { ok: false, description: "Bad Request: TOPIC_ID_INVALID" };
+		}
+		return await originalBotCall(method, body);
+	};
+	let now = 120_000;
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
@@ -5500,9 +6728,19 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 		botApi: bot,
 		WebSocketImpl: FakeWs as any,
 		pidAlive: () => false,
-		now: () => 120_000,
+		now: () => now,
 	});
 	await daemon.loadTopics();
+	daemon.connectSession("stale", "ws://stale", "t");
+	daemon.connectSession("dead", "ws://dead", "t");
+	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	expect(daemon.sessions.size).toBe(0);
+	let persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics.stale.orphanedAt).toBe(120_000);
+	expect(persisted.topics.dead.orphanedAt).toBe(120_000);
+
+	now += 60_000;
 	await daemon.scanRoots();
 	expect(
 		bot.calls
@@ -5510,7 +6748,8 @@ test("scanRoots reaps stale and dead-PID session topics after the orphan grace w
 			.map(c => c.body.message_thread_id)
 			.sort(),
 	).toEqual([101, 102]);
-	expect(daemon.sessions.size).toBe(0);
+	persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics).toEqual({});
 });
 
 test("scanRoots reaps missing endpoint topics only when all roots are readable and grace has elapsed", async () => {
@@ -5525,17 +6764,26 @@ test("scanRoots reaps missing endpoint topics only when all roots are readable a
 		JSON.stringify({ topics: { missing: { topicId: "201", identitySent: true, createdAt: 0, name: "missing" } } }),
 	);
 	const bot = new FakeBotApi();
+	let now = 120_000;
 	const daemon = new TelegramNotificationDaemon({
 		settings: s,
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
 		botApi: bot,
-		now: () => 120_000,
+		now: () => now,
 	});
 	await daemon.loadTopics();
 	await daemon.scanRoots();
+	expect(bot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+	let persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics.missing.orphanedAt).toBe(120_000);
+
+	now += 60_000;
+	await daemon.scanRoots();
 	expect(bot.calls.filter(c => c.method === "deleteForumTopic").map(c => c.body.message_thread_id)).toEqual([201]);
+	persisted = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+	expect(persisted.topics).toEqual({});
 
 	const blockedAgentDir = tempAgentDir();
 	const blockedSettings = setPrivateAgentDir(settings(blockedAgentDir), blockedAgentDir);
@@ -5671,22 +6919,26 @@ test("a long finalized turn is scheduled through the pool, not burst in one gran
 class RichFakeBotApi extends FakeBotApi {
 	richBehavior: "ok" | "ok_false" | "throw" = "ok";
 	richThreadId = 555;
-	/** When true, createForumTopic yields no thread id, forcing flat delivery. */
+	/** When true, createForumTopic returns a confirmed capability refusal for flat delivery. */
 	threadedOff = false;
-	override async call(method: string, body: unknown): Promise<unknown> {
+	override async call(
+		method: string,
+		body: unknown,
+		options?: { noRetry?: boolean; signal?: AbortSignal },
+	): Promise<unknown> {
 		if (method === "createForumTopic") {
-			this.calls.push({ method, body });
+			this.calls.push({ method, body, options });
 			return this.threadedOff
-				? { ok: true, result: {} }
+				? { ok: false, description: "Bad Request: forum topics are disabled" }
 				: { ok: true, result: { message_thread_id: this.richThreadId } };
 		}
 		if (method === "sendRichMessage") {
-			this.calls.push({ method, body });
+			this.calls.push({ method, body, options });
 			if (this.richBehavior === "throw") throw new Error("rich transport down");
 			if (this.richBehavior === "ok_false") return { ok: false, description: "rich unavailable" };
 			return { ok: true, result: { message_id: 4242 } };
 		}
-		return super.call(method, body);
+		return super.call(method, body, options);
 	}
 }
 
@@ -5890,7 +7142,11 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		expect(findMethod(bot, "sendRichMessage")!.body).toEqual({
 			chat_id: "42",
 			message_thread_id: 555,
-			rich_message: { markdown: raw },
+			rich_message: { markdown: raw, skip_entity_detection: true },
+		});
+		expect(findMethod(bot, "sendRichMessage")!.options).toEqual({
+			noRetry: true,
+			signal: expect.any(AbortSignal),
 		});
 	});
 
@@ -6009,7 +7265,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		expect(findMethod(bot, "sendMessage")!.body.text).toBe(markdownToTelegramHtml(raw));
 	});
 
-	test("(d) deliverRichWithFallback warns exactly once per failure and never on success", async () => {
+	test("(d) deliverRichWithFallback warns exactly once per explicit rejection and never on success", async () => {
 		const send = { method: "sendMessage", lane: "finalized", text: "<b>x</b>", richMarkdown: "raw md" } as any;
 		const base = { chat_id: "42", message_thread_id: 555 };
 
@@ -6020,6 +7276,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 			okBot as any,
 			base,
 			send,
+			AbortSignal.timeout(30_000),
 			async () => {
 				okFallbacks++;
 			},
@@ -6029,23 +7286,6 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 		expect(okFallbacks).toBe(0);
 		expect(okWarns).toHaveLength(0);
 
-		const throwBot = new RichFakeBotApi();
-		throwBot.richBehavior = "throw";
-		const throwWarns: string[] = [];
-		let throwFallbacks = 0;
-		await deliverRichWithFallback(
-			throwBot as any,
-			base,
-			send,
-			async () => {
-				throwFallbacks++;
-			},
-			{ warn: m => throwWarns.push(m) },
-		);
-		expect(throwFallbacks).toBe(1);
-		expect(throwWarns).toHaveLength(1);
-		expect(throwWarns[0]).toContain("sendRichMessage failed");
-
 		const okFalseBot = new RichFakeBotApi();
 		okFalseBot.richBehavior = "ok_false";
 		const okFalseWarns: string[] = [];
@@ -6054,6 +7294,7 @@ describe("telegram daemon rich final-answer promotion (Rev 3 verification)", () 
 			okFalseBot as any,
 			base,
 			send,
+			AbortSignal.timeout(30_000),
 			async () => {
 				okFalseFallbacks++;
 			},
@@ -6217,12 +7458,14 @@ describe("telegram daemon rich overflow boundary (G006)", () => {
 				});
 			}
 		};
-		await deliverRichWithFallback(bot as any, base, send, sendHtmlFallback, { warn: m => warns.push(m) });
+		await deliverRichWithFallback(bot as any, base, send, AbortSignal.timeout(30_000), sendHtmlFallback, {
+			warn: m => warns.push(m),
+		});
 
 		expect(countMethod(bot, "sendRichMessage")).toBe(1);
 		expect(fallbacks).toBe(1); // fallback invoked exactly once for the whole overflow
 		expect(warns).toHaveLength(1); // one diagnostic, NOT one per chunk
-		expect(warns[0]).toContain("sendRichMessage failed");
+		expect(warns[0]).toContain("sendRichMessage rejected");
 		const sends = bot.calls.filter(c => c.method === "sendMessage");
 		expect(sends).toHaveLength(chunks.length);
 		expect(sends.map(c => c.body.text)).toEqual(chunks);
@@ -6278,6 +7521,10 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		});
 		const rich = bot.calls.filter(c => c.method === "sendRichMessage");
 		expect(rich).toHaveLength(1);
+		expect(rich[0]!.options).toEqual({
+			noRetry: true,
+			signal: expect.any(AbortSignal),
+		});
 		expect(countMethod(bot, "sendMessage")).toBe(0);
 		expect(rich[0]!.body.rich_message.markdown).toContain("Q");
 		expect(rich[0]!.body.reply_markup.inline_keyboard).toBeTruthy();
@@ -6308,7 +7555,7 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 		});
 	});
 
-	for (const behavior of ["ok_false", "throw"] as const) {
+	for (const behavior of ["ok_false"] as const) {
 		test(`ask rich ${behavior}: HTML fallback registers last-chunk id and routes replies`, async () => {
 			FakeWs.instances = [];
 			const bot = new RichFakeBotApi();
@@ -6732,5 +7979,336 @@ describe("Telegram tool activity capability and routing", () => {
 		expect(bot.calls.some(call => call.method === "editMessageText")).toBe(false);
 		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
 		expect(liveMessages.has("S:tool:A")).toBe(true);
+	});
+});
+
+describe("telegram daemon /btw reservation and capability boundaries", () => {
+	async function daemonWithTopic(input: { enabled?: boolean; capability?: boolean } = {}) {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			btw: { enabled: input.enabled ?? true },
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		if (input.capability ?? true) await enableEphemeralTurns(daemon);
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "main",
+		});
+		return {
+			bot,
+			daemon,
+			threadId: bot.createdTopicThreadIds.at(-1),
+		};
+	}
+
+	test("reserves every /btw form before outstanding-ask reply routing", async () => {
+		const { bot, daemon, threadId } = await daemonWithTopic();
+		daemon.messageRoutes.set("1799", { sessionId: "S", actionId: "outstanding" });
+		daemon.sessions.get("S")!.pending.set("outstanding", { sessionId: "S", actionId: "outstanding" });
+		for (const [updateId, messageId, text] of [
+			[801, 1801, "/btw"],
+			[802, 1802, "/btw@OtherBot question"],
+			[803, 1803, "/btw-not-a-command"],
+			[805, 1805, "/btw@OwnBot@malformed question"],
+		] as const) {
+			await daemon.handleTelegramUpdate({
+				update_id: updateId,
+				message: {
+					chat: { id: 42 },
+					message_thread_id: threadId,
+					reply_to_message: { message_id: 1799 },
+					text,
+					message_id: messageId,
+				},
+			});
+		}
+		const originalCall = bot.call.bind(bot);
+		bot.call = async (method, body, opts) =>
+			method === "getFile" ? { ok: true, result: {} } : originalCall(method, body, opts);
+		await daemon.handleTelegramUpdate({
+			update_id: 804,
+			message: {
+				chat: { id: 42 },
+				message_thread_id: threadId,
+				reply_to_message: { message_id: 1799 },
+				text: "/btw with attachment",
+				message_id: 1804,
+				photo: [{ file_id: "attachment" }],
+			},
+		});
+		const frames = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame) as { type?: string });
+		expect(
+			frames.some(
+				frame => frame.type === "ephemeral_turn" || frame.type === "user_message" || frame.type === "reply",
+			),
+		).toBe(false);
+		const replies = bot.calls.filter(
+			call => call.method === "sendMessage" && call.body.text === "Usage: /btw <question>",
+		);
+		expect(replies).toHaveLength(4);
+		expect(replies).toEqual(
+			expect.arrayContaining(
+				[1801, 1803, 1804, 1805].map(messageId =>
+					expect.objectContaining({
+						body: expect.objectContaining({
+							message_thread_id: threadId,
+							reply_parameters: { message_id: messageId },
+						}),
+						options: expect.objectContaining({ noRetry: true, signal: expect.any(AbortSignal) }),
+					}),
+				),
+			),
+		);
+	});
+
+	test.each([
+		["disabled", { enabled: false }, 1806],
+		["disconnected", {}, 1807],
+	])("returns /btw attachment usage before %s branches", async (_name, options, messageId) => {
+		const { bot, daemon, threadId } = await daemonWithTopic(options);
+		if (_name === "disconnected")
+			(daemon.sessions.get("S")!.ws as unknown as FakeWs).dispatchEvent(new Event("close"));
+		await daemon.handleTelegramUpdate({
+			update_id: messageId,
+			message: {
+				chat: { id: 42 },
+				message_thread_id: threadId,
+				text: "/btw attachment",
+				message_id: messageId,
+				photo: [{ file_id: "attachment" }],
+			},
+		});
+		expect(bot.calls.at(-1)).toMatchObject({
+			method: "sendMessage",
+			body: {
+				message_thread_id: threadId,
+				reply_parameters: { message_id: messageId },
+				text: "Usage: /btw <question>",
+			},
+			options: { noRetry: true, signal: expect.any(AbortSignal) },
+		});
+		expect(
+			FakeWs.instances
+				.flatMap(socket => socket.sent.map(frame => JSON.parse(frame)))
+				.some(frame => frame.type === "ephemeral_turn"),
+		).toBe(false);
+	});
+
+	test("returns the exact disabled and unsupported replies without emitting an ephemeral frame", async () => {
+		const disabled = await daemonWithTopic({ enabled: false });
+		await disabled.daemon.handleTelegramUpdate({
+			update_id: 804,
+			message: { chat: { id: 42 }, message_thread_id: disabled.threadId, text: "/btw status?", message_id: 1804 },
+		});
+		expect(disabled.bot.calls.at(-1)).toMatchObject({
+			method: "sendMessage",
+			body: {
+				message_thread_id: disabled.threadId,
+				reply_parameters: { message_id: 1804 },
+				text: "Telegram /btw is disabled in local settings.",
+			},
+			options: { noRetry: true, signal: expect.any(AbortSignal) },
+		});
+		expect(
+			FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).some(frame => frame.type === "ephemeral_turn"),
+		).toBe(false);
+
+		const unsupported = await daemonWithTopic({ capability: false });
+		await unsupported.daemon.handleTelegramUpdate({
+			update_id: 805,
+			message: { chat: { id: 42 }, message_thread_id: unsupported.threadId, text: "/btw status?", message_id: 1805 },
+		});
+		expect(unsupported.bot.calls.at(-1)).toMatchObject({
+			method: "sendMessage",
+			body: {
+				message_thread_id: unsupported.threadId,
+				reply_parameters: { message_id: 1805 },
+				text: "Restart this GJC session to enable /btw.",
+			},
+			options: { noRetry: true, signal: expect.any(AbortSignal) },
+		});
+		expect(
+			FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).some(frame => frame.type === "ephemeral_turn"),
+		).toBe(false);
+	});
+	test("reserves /btw updates before visible replies and host execution", async () => {
+		const { agentDir, bot, daemon, threadId } = await unavailableControlHarness();
+		await enableEphemeralTurns(daemon);
+		let persistedBeforeSend = false;
+		const originalCall = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "sendMessage" && (body as { text?: unknown }).text === "Usage: /btw <question>")
+				persistedBeforeSend = fs.existsSync(daemonPaths(agentDir).seenUpdates);
+			return originalCall(method, body, options);
+		};
+		await daemon.handleTelegramUpdate({
+			update_id: 1806,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw", message_id: 2806 },
+		});
+		expect(persistedBeforeSend).toBe(true);
+
+		const socket = FakeWs.instances[0]!;
+		let persistedBeforeExecution = false;
+		const send = socket.send.bind(socket);
+		socket.send = data => {
+			if (JSON.parse(data).type === "ephemeral_turn") {
+				const state = JSON.parse(fs.readFileSync(daemonPaths(agentDir).seenUpdates, "utf8")) as {
+					updateIds: number[];
+				};
+				persistedBeforeExecution = state.updateIds.includes(1807);
+			}
+			send(data);
+		};
+		await daemon.handleTelegramUpdate({
+			update_id: 1807,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw reserve", message_id: 2807 },
+		});
+		expect(persistedBeforeExecution).toBe(true);
+	});
+
+	test("does not send or execute /btw when update reservation cannot persist", async () => {
+		let fail = false;
+		const fsImpl: TelegramDaemonFs = {
+			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
+			readFile: (file, encoding) => fs.promises.readFile(file, encoding),
+			writeFile: (file, data, opts) =>
+				fail && file.includes("telegram-seen-updates")
+					? Promise.reject(new Error("disk failure"))
+					: fs.promises.writeFile(file, data, opts),
+			rename: (oldPath, newPath) => fs.promises.rename(oldPath, newPath).then(() => undefined),
+			unlink: file => fs.promises.unlink(file),
+			open: (file, flags, mode) => fs.promises.open(file, flags, mode),
+			readdir: file => fs.promises.readdir(file),
+			chmod: (file, mode) => fs.promises.chmod(file, mode),
+		};
+		const { bot, daemon, threadId } = await unavailableControlHarness(fsImpl);
+		await enableEphemeralTurns(daemon);
+		fail = true;
+		bot.calls = [];
+		const socket = FakeWs.instances[0]!;
+		const sentBefore = socket.sent.length;
+		await daemon.handleTelegramUpdate({
+			update_id: 1808,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw no replay", message_id: 2808 },
+		});
+		expect(bot.calls).toEqual([]);
+		expect(
+			socket.sent
+				.slice(sentBefore)
+				.map(frame => JSON.parse(frame))
+				.some(frame => frame.type === "ephemeral_turn"),
+		).toBe(false);
+	});
+	test("does not treat ws://x/ + abc and ws://x/a + bc as the same endpoint tuple", async () => {
+		const { bot, daemon, threadId } = await daemonWithTopic();
+		daemon.connectSession("S", "ws://x/", "abc");
+		const initial = daemon.sessions.get("S")!;
+		const initialSocket = initial.ws as unknown as FakeWs;
+		initialSocket.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(initial, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
+		await daemon.handleSessionMessage(initial, {
+			type: "event_replay_result",
+			id: initial.replayId,
+			generation: 4,
+			lastSeq: 0,
+			events: [],
+		});
+		await daemon.handleTelegramUpdate({
+			update_id: 906,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw reconnect?", message_id: 1906 },
+		});
+		const request = JSON.parse(initialSocket.sent.at(-1)!) as {
+			requestId: string;
+			sessionId: string;
+			updateId: number;
+			messageId: number;
+			threadId: string;
+		};
+		const terminal = {
+			type: "ephemeral_turn_result",
+			sessionId: request.sessionId,
+			requestId: request.requestId,
+			updateId: request.updateId,
+			messageId: request.messageId,
+			threadId: request.threadId,
+			status: "ok",
+			text: "reconnected answer",
+		};
+		const dispatches = () =>
+			bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage").length;
+		const before = dispatches();
+
+		initialSocket.dispatchEvent(new Event("close"));
+		expect(
+			initialSocket.sent.map(frame => JSON.parse(frame)).some(frame => frame.type === "ephemeral_turn_cancel"),
+		).toBe(false);
+		expect(daemon.sessions.has("S")).toBe(false);
+		expect(dispatches()).toBe(before);
+
+		daemon.connectSession("S", "ws://changed", "changed-token");
+		const changed = daemon.sessions.get("S")!;
+		changed.ws.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(changed, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
+		await daemon.handleSessionMessage(changed, {
+			type: "event_replay_result",
+			id: changed.replayId,
+			generation: 4,
+			lastSeq: 0,
+			events: [],
+		});
+		await daemon.handleSessionMessage(changed, terminal);
+		expect(dispatches()).toBe(before);
+		changed.ws.dispatchEvent(new Event("close"));
+
+		daemon.connectSession("S", "ws://x/a", "bc");
+		const replacement = daemon.sessions.get("S")!;
+		replacement.ws.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(replacement, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
+		await daemon.handleSessionMessage(replacement, {
+			type: "event_replay_result",
+			id: replacement.replayId,
+			generation: 4,
+			lastSeq: 0,
+			events: [],
+		});
+		await daemon.handleSessionMessage(initial, terminal);
+		await daemon.handleSessionMessage(replacement, terminal);
+		expect(dispatches()).toBe(before);
+
+		replacement.ws.dispatchEvent(new Event("close"));
+		daemon.connectSession("S", "ws://x/", "abc");
+		const exact = daemon.sessions.get("S")!;
+		exact.ws.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(exact, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
+		await daemon.handleSessionMessage(exact, {
+			type: "event_replay_result",
+			id: exact.replayId,
+			generation: 4,
+			lastSeq: 0,
+			events: [],
+		});
+		await daemon.handleSessionMessage(exact, { type: "config_update", sessionId: "other" });
+		await daemon.handleSessionMessage(exact, terminal);
+		expect(dispatches()).toBe(before);
+		await daemon.handleSessionMessage(exact, { type: "config_update", sessionId: "S" });
+		await daemon.handleSessionMessage(exact, {
+			...terminal,
+			updateId: terminal.updateId + 1,
+		});
+		expect(dispatches()).toBe(before);
+		await daemon.handleSessionMessage(exact, terminal);
+		expect(dispatches()).toBe(before + 1);
+		await daemon.handleSessionMessage(exact, terminal);
+		expect(dispatches()).toBe(before + 1);
 	});
 });
