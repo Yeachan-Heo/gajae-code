@@ -32,25 +32,42 @@ import type { OutputMeta } from "../tools/output-meta";
 import { formatOutputNotice } from "../tools/output-meta";
 
 /**
- * Encode untrusted values embedded in prompt markup. Control and bidi characters
- * become visible escape sequences so they cannot alter markup structure or display.
+ * Encode untrusted values embedded in prompt markup. Control and bidi characters become visible
+ * escape sequences so they cannot alter markup structure or display. Isolated UTF-16 surrogates
+ * are also escaped; valid Unicode pairs remain intact.
  */
 export function escapePromptMetadata(value: string, options: { preserveNewlines?: boolean } = {}): string {
-	return value.replace(/[&<>"\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/g, char => {
-		if (options.preserveNewlines && (char === "\n" || char === "\t")) return char;
-		switch (char) {
-			case "&":
-				return "&amp;";
-			case "<":
-				return "&lt;";
-			case ">":
-				return "&gt;";
-			case '"':
-				return "&quot;";
-			default:
-				return `\\u${char.codePointAt(0)!.toString(16).padStart(4, "0")}`;
-		}
-	});
+	return value.replace(
+		/[&<>"\u0000-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]/g,
+		(char, offset) => {
+			const code = char.charCodeAt(0);
+			if (
+				(code >= 0xd800 &&
+					code <= 0xdbff &&
+					value.charCodeAt(offset + 1) >= 0xdc00 &&
+					value.charCodeAt(offset + 1) <= 0xdfff) ||
+				(code >= 0xdc00 &&
+					code <= 0xdfff &&
+					value.charCodeAt(offset - 1) >= 0xd800 &&
+					value.charCodeAt(offset - 1) <= 0xdbff)
+			) {
+				return char;
+			}
+			if (options.preserveNewlines && (char === "\n" || char === "\t")) return char;
+			switch (char) {
+				case "&":
+					return "&amp;";
+				case "<":
+					return "&lt;";
+				case ">":
+					return "&gt;";
+				case '"':
+					return "&quot;";
+				default:
+					return `\\u${code.toString(16).padStart(4, "0")}`;
+			}
+		},
+	);
 }
 export const SKILL_PROMPT_MESSAGE_TYPE = "skill-prompt";
 
@@ -392,7 +409,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					const fileContents = m.files
 						.map(file => {
 							const inner = file.content
-								? `\n${file.content.replace(/<\/system-reminder>/gi, "&lt;/system-reminder>")}\n`
+								? `\n${escapePromptMetadata(file.content, { preserveNewlines: true })}\n`
 								: "\n";
 							return `<file path="${escapePromptMetadata(file.path)}">${inner}</file>`;
 						})
