@@ -932,38 +932,60 @@ describe("notifications config", () => {
 			settings.getStorage()?.close();
 		}
 	});
-	test("full Settings rejects invalid or inaccessible config.yml like lightweight loading", async () => {
+	test("full Settings recovers defaults from invalid YAML while notifications remain fail-closed", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-btw-settings-load-"));
 		tempDirs.push(root);
-
-		const fixtures =
-			process.platform === "win32"
-				? (["notifications: [\n"] as const)
-				: (["notifications: [\n", "directory"] as const);
-		for (const [index, fixture] of fixtures.entries()) {
-			const agentDir = path.join(root, `agent-${index}`);
-			const configPath = path.join(agentDir, "config.yml");
-			fs.mkdirSync(agentDir, { recursive: true });
-			if (fixture === "directory") {
-				fs.mkdirSync(configPath);
-			} else {
-				fs.writeFileSync(configPath, fixture);
-			}
-
-			await expect(Settings.loadForScope({ cwd: root, agentDir })).rejects.toThrow();
-			await expect(loadLightweightDaemonSettings(agentDir)).rejects.toThrow();
+		const agentDir = path.join(root, "invalid-yaml");
+		const configPath = path.join(agentDir, "config.yml");
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(configPath, "notifications: [\n");
+		resetSettingsForTest();
+		const initialized = await Settings.init({ cwd: root, agentDir });
+		try {
+			expect(initialized.get("theme.dark")).toBe("red-claw");
+			expect(() => initialized.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+		} finally {
+			resetSettingsForTest();
 		}
 
-		const agentDir = path.join(root, "missing-config");
-		fs.mkdirSync(agentDir, { recursive: true });
 		const settings = await Settings.loadForScope({ cwd: root, agentDir });
 		try {
-			expect(settings.getNotificationSettingsSnapshot().telegram.btw.enabled).toBe(true);
-			expect(
-				(await loadLightweightDaemonSettings(agentDir)).getNotificationSettingsSnapshot().telegram.btw.enabled,
-			).toBe(true);
+			expect(settings.get("theme.dark")).toBe("red-claw");
+			expect(() => settings.getNotificationSettingsSnapshot()).toThrow("gjc_notify_daemon_invalid_configuration");
+			await expect(loadLightweightDaemonSettings(agentDir)).rejects.toThrow();
 		} finally {
 			settings.getStorage()?.close();
+		}
+
+		fs.writeFileSync(configPath, `${JSON.stringify({ notifications: { enabled: true } })}\n`);
+		const repaired = await Settings.loadForScope({ cwd: root, agentDir });
+		try {
+			expect(repaired.getNotificationSettingsSnapshot()).toMatchObject({ enabled: true });
+			expect(repaired.getNotificationSettingsSnapshot()).toEqual(
+				(await loadLightweightDaemonSettings(agentDir)).getNotificationSettingsSnapshot(),
+			);
+		} finally {
+			repaired.getStorage()?.close();
+		}
+
+		if (process.platform !== "win32") {
+			const inaccessibleAgentDir = path.join(root, "directory");
+			fs.mkdirSync(path.join(inaccessibleAgentDir, "config.yml"), { recursive: true });
+			await expect(Settings.loadForScope({ cwd: root, agentDir: inaccessibleAgentDir })).rejects.toThrow();
+			await expect(loadLightweightDaemonSettings(inaccessibleAgentDir)).rejects.toThrow();
+		}
+
+		const missingAgentDir = path.join(root, "missing-config");
+		fs.mkdirSync(missingAgentDir, { recursive: true });
+		const missingSettings = await Settings.loadForScope({ cwd: root, agentDir: missingAgentDir });
+		try {
+			expect(missingSettings.getNotificationSettingsSnapshot().telegram.btw.enabled).toBe(true);
+			expect(
+				(await loadLightweightDaemonSettings(missingAgentDir)).getNotificationSettingsSnapshot().telegram.btw
+					.enabled,
+			).toBe(true);
+		} finally {
+			missingSettings.getStorage()?.close();
 		}
 	});
 

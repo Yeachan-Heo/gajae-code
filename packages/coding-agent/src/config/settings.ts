@@ -1085,49 +1085,9 @@ export class Settings implements NotificationSettingsReader {
 		this.#hasMalformedConfigRoot = false;
 		this.#hasInvalidNotificationConfiguration = false;
 		this.#captureRawNotificationConfig({});
+		let content: string;
 		try {
-			const content = await Bun.file(filePath).text();
-			const parsed = YAML.parse(content);
-			if (parsed === undefined) return {};
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-				this.#hasMalformedConfigRoot = true;
-				this.#captureRawNotificationConfig(undefined);
-				return {};
-			}
-			const parsedRaw = parsed as RawSettings;
-			if (filePath === this.#configPath) this.#captureRawNotificationConfig(parsedRaw);
-			if (filePath === this.#configPath) {
-				try {
-					parseNotificationSettingsSnapshot(parsedRaw);
-				} catch (error) {
-					if (!(error instanceof Error) || error.message !== "gjc_notify_daemon_invalid_configuration")
-						throw error;
-					this.#hasInvalidNotificationConfiguration = true;
-				}
-			}
-			this.#futureSchemaVersion =
-				filePath === this.#configPath &&
-				typeof parsedRaw.configSchemaVersion === "number" &&
-				parsedRaw.configSchemaVersion > CONFIG_SCHEMA_VERSION;
-
-			const configSchemaVersion = parsedRaw.configSchemaVersion;
-			if (
-				filePath === this.#configPath &&
-				(typeof configSchemaVersion !== "number" || configSchemaVersion < CONFIG_SCHEMA_VERSION)
-			) {
-				this.#schemaMigrationPending = true;
-			}
-			const migrated = this.#migrateRawSettings(parsedRaw);
-			const reconciled = reconcileSettingsSchema(migrated);
-			if (typeof configSchemaVersion === "number" && configSchemaVersion > CONFIG_SCHEMA_VERSION) {
-				reconciled.report.issues.push({
-					path: "configSchemaVersion",
-					kind: "pending-migration",
-					detail: `Configuration requires schema version ${configSchemaVersion}.`,
-				});
-			}
-			this.#schemaReport = reconciled.report;
-			return reconciled.settings;
+			content = await Bun.file(filePath).text();
 		} catch (error) {
 			if (isEnoent(error)) {
 				this.#captureRawNotificationConfig({});
@@ -1135,6 +1095,53 @@ export class Settings implements NotificationSettingsReader {
 			}
 			throw error;
 		}
+		let parsed: unknown;
+		try {
+			parsed = YAML.parse(content);
+		} catch {
+			this.#hasMalformedConfigRoot = true;
+			this.#captureRawNotificationConfig(undefined);
+			return {};
+		}
+		if (parsed === undefined) return {};
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			this.#hasMalformedConfigRoot = true;
+			this.#captureRawNotificationConfig(undefined);
+			return {};
+		}
+		const parsedRaw = parsed as RawSettings;
+		if (filePath === this.#configPath) this.#captureRawNotificationConfig(parsedRaw);
+		if (filePath === this.#configPath) {
+			try {
+				parseNotificationSettingsSnapshot(parsedRaw);
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "gjc_notify_daemon_invalid_configuration") throw error;
+				this.#hasInvalidNotificationConfiguration = true;
+			}
+		}
+		this.#futureSchemaVersion =
+			filePath === this.#configPath &&
+			typeof parsedRaw.configSchemaVersion === "number" &&
+			parsedRaw.configSchemaVersion > CONFIG_SCHEMA_VERSION;
+
+		const configSchemaVersion = parsedRaw.configSchemaVersion;
+		if (
+			filePath === this.#configPath &&
+			(typeof configSchemaVersion !== "number" || configSchemaVersion < CONFIG_SCHEMA_VERSION)
+		) {
+			this.#schemaMigrationPending = true;
+		}
+		const migrated = this.#migrateRawSettings(parsedRaw);
+		const reconciled = reconcileSettingsSchema(migrated);
+		if (typeof configSchemaVersion === "number" && configSchemaVersion > CONFIG_SCHEMA_VERSION) {
+			reconciled.report.issues.push({
+				path: "configSchemaVersion",
+				kind: "pending-migration",
+				detail: `Configuration requires schema version ${configSchemaVersion}.`,
+			});
+		}
+		this.#schemaReport = reconciled.report;
+		return reconciled.settings;
 	}
 
 	async #loadProjectSettings(): Promise<RawSettings> {
