@@ -331,7 +331,7 @@ describe("AgentSession respondAsBackground failure visibility", () => {
 		expect(harness.model.calls).toHaveLength(0);
 	});
 
-	it("deeply isolates persisted history and caller prepends from mutating conversion hooks", async () => {
+	it("deeply isolates persisted history and caller prepends from mutating context hooks", async () => {
 		const historyMessage = {
 			role: "user" as const,
 			content: [{ type: "text" as const, text: "live history" }],
@@ -367,7 +367,7 @@ describe("AgentSession respondAsBackground failure visibility", () => {
 		expect(JSON.stringify(harness.session.agent.state.messages)).toBe(beforeLive);
 		expect(JSON.stringify(harness.sessionManager.getBranch())).toBe(beforePersisted);
 		expect(callerPrepend.content[0]?.text).toBe("caller prepend");
-		expect(transformCalls).toBe(0);
+		expect(transformCalls).toBe(1);
 	});
 
 	it("preserves long /btw replies while retaining explicit IRC reply shaping", async () => {
