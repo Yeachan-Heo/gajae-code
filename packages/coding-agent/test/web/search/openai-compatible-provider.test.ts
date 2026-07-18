@@ -127,6 +127,47 @@ describe("OpenAI-compatible web search provider", () => {
 			status: 424,
 		});
 	});
+	it("wraps invalid JSON success bodies without exposing their contents", async () => {
+		const body = `not-json-${"sensitive ".repeat(1_000)}`;
+		using _hook = hookFetch(async () => new Response(body));
+		try {
+			await new OpenAICompatibleSearchProvider().search(params());
+			throw new Error("Expected malformed response to fail");
+		} catch (error) {
+			expect(error).toBeInstanceOf(SearchProviderError);
+			expect(error).toMatchObject({ provider: "openai-compatible", status: 502 });
+			expect((error as Error).message).toContain("invalid JSON");
+			expect((error as Error).message).not.toContain("sensitive");
+			expect((error as Error).message.length).toBeLessThan(200);
+		}
+	});
+
+	it("rejects object-valued response arrays as malformed provider responses", async () => {
+		const malformedBodies = [
+			{ output: {} },
+			{ choices: {} },
+			{ output: [{ content: {} }] },
+			{ output: [{ content: [{ annotations: {} }] }] },
+			{ choices: [{ message: { annotations: {} } }] },
+		];
+
+		for (const body of malformedBodies) {
+			using _hook = hookFetch(async () => Response.json(body));
+			await expect(new OpenAICompatibleSearchProvider().search(params())).rejects.toMatchObject({
+				provider: "openai-compatible",
+				status: 502,
+			});
+		}
+	});
+
+	it("preserves abort errors from fetch", async () => {
+		const abort = new Error("Aborted");
+		abort.name = "AbortError";
+		using _hook = hookFetch(async () => {
+			throw abort;
+		});
+		await expect(new OpenAICompatibleSearchProvider().search(params())).rejects.toBe(abort);
+	});
 
 	it("does not accept non-url_citation source metadata as a citation (no masking)", async () => {
 		using _hook = hookFetch(async () =>

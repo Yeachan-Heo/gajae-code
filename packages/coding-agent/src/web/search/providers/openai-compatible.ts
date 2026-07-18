@@ -5,16 +5,68 @@ import { SearchProvider } from "./base";
 import { extractTextSources } from "./text-citations";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
+type JsonObject = Record<string, unknown>;
+
+function isJsonObject(value: unknown): value is JsonObject {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function malformedResponse(detail: string): never {
+	throw new SearchProviderError(
+		"openai-compatible",
+		`OpenAI-compatible web search returned malformed response body (${detail})`,
+		502,
+	);
+}
+
+function optionalArray(value: unknown, detail: string): unknown[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) malformedResponse(detail);
+	return value;
+}
+
+function normalizeResponseBody(value: unknown): JsonObject {
+	if (!isJsonObject(value)) malformedResponse("expected a JSON object");
+
+	const output = optionalArray(value.output, "output must be an array");
+	const choices = optionalArray(value.choices, "choices must be an array");
+
+	for (const item of output) {
+		if (!isJsonObject(item)) continue;
+		for (const content of optionalArray(item.content, "output content must be an array")) {
+			if (isJsonObject(content)) optionalArray(content.annotations, "output annotations must be an array");
+		}
+	}
+	for (const choice of choices) {
+		if (!isJsonObject(choice) || !isJsonObject(choice.message)) continue;
+		optionalArray(choice.message.annotations, "choice annotations must be an array");
+	}
+
+	return { ...value, output, choices };
+}
+
+function parseResponseBody(text: string): JsonObject {
+	let value: unknown;
+	try {
+		value = text ? JSON.parse(text) : {};
+	} catch {
+		throw new SearchProviderError("openai-compatible", "OpenAI-compatible web search returned invalid JSON", 502);
+	}
+	return normalizeResponseBody(value);
+}
+
 /**
  * Whether the response carries independent proof that a web search ran. Used to
  * gate inline-citation recovery so a stray prose URL in a non-search answer is
  * never promoted to a citation.
  */
-function webSearchPerformed(json: any): boolean {
-	if (Array.isArray(json?.output) && json.output.some((item: any) => item?.type === "web_search_call")) {
+function webSearchPerformed(json: JsonObject): boolean {
+	if (Array.isArray(json.output) && json.output.some(item => isJsonObject(item) && item.type === "web_search_call")) {
 		return true;
 	}
-	const numRequests = json?.tool_usage?.web_search?.num_requests;
+	const toolUsage = isJsonObject(json.tool_usage) ? json.tool_usage : undefined;
+	const webSearch = toolUsage && isJsonObject(toolUsage.web_search) ? toolUsage.web_search : undefined;
+	const numRequests = webSearch?.num_requests;
 	return typeof numRequests === "number" && numRequests > 0;
 }
 
@@ -23,16 +75,18 @@ function endpoint(baseUrl: string, api: string): string {
 	return api === "openai-completions" ? `${base}/chat/completions` : `${base}/responses`;
 }
 
-function textFromResponse(json: any): string | undefined {
+function textFromResponse(json: JsonObject): string | undefined {
 	if (typeof json.output_text === "string") return json.output_text;
 	const chunks: string[] = [];
-	for (const item of json.output ?? []) {
-		for (const content of item.content ?? []) {
-			if (typeof content.text === "string") chunks.push(content.text);
+	for (const item of json.output as unknown[]) {
+		if (!isJsonObject(item)) continue;
+		for (const content of optionalArray(item.content, "output content must be an array")) {
+			if (isJsonObject(content) && typeof content.text === "string") chunks.push(content.text);
 		}
 	}
-	const chat = json.choices?.[0]?.message?.content;
-	if (typeof chat === "string") chunks.push(chat);
+	const firstChoice = (json.choices as unknown[])[0];
+	const message = isJsonObject(firstChoice) && isJsonObject(firstChoice.message) ? firstChoice.message : undefined;
+	if (typeof message?.content === "string") chunks.push(message.content);
 	return chunks.join("\n") || undefined;
 }
 
@@ -64,15 +118,17 @@ function collectCitationAnnotations(annotations: unknown, out: SearchCitation[])
 	}
 }
 
-function parseCitations(json: any): SearchCitation[] {
+function parseCitations(json: JsonObject): SearchCitation[] {
 	const citations: SearchCitation[] = [];
-	for (const item of json?.output ?? []) {
-		for (const content of item?.content ?? []) {
-			collectCitationAnnotations(content?.annotations, citations);
+	for (const item of json.output as unknown[]) {
+		if (!isJsonObject(item)) continue;
+		for (const content of optionalArray(item.content, "output content must be an array")) {
+			if (isJsonObject(content)) collectCitationAnnotations(content.annotations, citations);
 		}
 	}
-	for (const choice of json?.choices ?? []) {
-		collectCitationAnnotations(choice?.message?.annotations, citations);
+	for (const choice of json.choices as unknown[]) {
+		const message = isJsonObject(choice) && isJsonObject(choice.message) ? choice.message : undefined;
+		if (message) collectCitationAnnotations(message.annotations, citations);
 	}
 	const seen = new Set<string>();
 	return citations.filter(c => {
@@ -156,7 +212,7 @@ export class OpenAICompatibleSearchProvider extends SearchProvider {
 				response.status,
 			);
 		}
-		const json = text ? JSON.parse(text) : {};
+		const json = parseResponseBody(text);
 		const citations = parseCitations(json);
 		const answer = textFromResponse(json);
 		const limit = params.limit ?? params.numSearchResults ?? 10;
@@ -178,7 +234,7 @@ export class OpenAICompatibleSearchProvider extends SearchProvider {
 			sources,
 			citations: citations.length > 0 ? citations : undefined,
 			model,
-			requestId: json.id,
+			requestId: typeof json.id === "string" ? json.id : undefined,
 			authMode: "api-key",
 		};
 	}
