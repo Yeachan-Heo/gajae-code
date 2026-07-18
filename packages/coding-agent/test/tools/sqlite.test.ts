@@ -62,6 +62,12 @@ function createFixtureDatabase(dbPath: string): void {
 				id INTEGER PRIMARY KEY,
 				payload TEXT NOT NULL
 			);
+			CREATE TABLE sqlitefoo (
+				value TEXT NOT NULL
+			);
+			CREATE TABLE sqliteXtable (
+				value TEXT NOT NULL
+			);
 		`);
 
 		db.prepare("INSERT INTO users (name, email, status, created) VALUES (?, ?, ?, ?)").run(
@@ -110,6 +116,8 @@ function createFixtureDatabase(dbPath: string): void {
 
 		db.prepare("INSERT INTO composite (team_id, user_id, value) VALUES (?, ?, ?)").run(1, 2, "pair");
 		db.prepare("INSERT INTO wide_rows (id, payload) VALUES (?, ?)").run(1, "x".repeat(320));
+		db.prepare("INSERT INTO sqlitefoo (value) VALUES (?)").run("foo");
+		db.prepare("INSERT INTO sqliteXtable (value) VALUES (?)").run("bar");
 	} finally {
 		db.close();
 	}
@@ -237,13 +245,15 @@ describe("SQLite tool support", () => {
 		});
 	});
 
-	it("lists tables for a .sqlite database and excludes sqlite internal tables", async () => {
+	it("lists user tables with sqlite prefixes and excludes SQLite internal tables", async () => {
 		const result = await readTool.execute("sqlite-list", { path: sqlitePath });
 		const text = getText(result);
 
 		expect(text).toContain("users (6 rows)");
 		expect(text).toContain("slugs (2 rows)");
 		expect(text).toContain("notes (3 rows)");
+		expect(text).toContain("sqlitefoo (1 rows)");
+		expect(text).toContain("sqliteXtable (1 rows)");
 		expect(text).not.toContain("sqlite_sequence");
 	});
 
@@ -264,6 +274,14 @@ describe("SQLite tool support", () => {
 		expect(text).toContain("CREATE TABLE users");
 		expect(text).toContain("Sample rows:");
 		expect(text).toContain("Alice");
+	});
+	it("reads tables that start with sqlite without an underscore", async () => {
+		const schemaResult = await readTool.execute("sqlite-prefix-schema", { path: `${sqlitePath}:sqlitefoo` });
+		const tableResult = await readTool.execute("sqlite-prefix-table", { path: `${sqlitePath}:sqliteXtable?limit=1` });
+
+		expect(getText(schemaResult)).toContain("CREATE TABLE sqlitefoo");
+		expect(getText(schemaResult)).toContain("foo");
+		expect(getText(tableResult)).toContain("bar");
 	});
 
 	it("returns a row by integer primary key", async () => {

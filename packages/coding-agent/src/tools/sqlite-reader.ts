@@ -13,6 +13,8 @@ const MAX_RENDER_WIDTH = 120;
 const MAX_COLUMN_WIDTH = 40;
 const MIN_COLUMN_WIDTH = 1;
 
+const USER_TABLE_PREDICATE = "name NOT GLOB 'sqlite_*'";
+
 type SqliteBinding = Exclude<SQLQueryBindings, Record<string, unknown>>;
 
 type SqliteRow = Record<string, unknown>;
@@ -182,7 +184,7 @@ function getTableMasterRow(db: Database, table: string): SqliteMasterRow {
 	const row =
 		db
 			.prepare<SqliteMasterRow, [string]>(
-				"SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name = ?",
+				`SELECT name, sql FROM sqlite_master WHERE type = 'table' AND ${USER_TABLE_PREDICATE} AND name = ?`,
 			)
 			.get(table) ?? null;
 	if (!row) {
@@ -502,7 +504,7 @@ export function parseSqliteSelector(subPath: string, queryString: string): Sqlit
 export function listTables(db: Database): { name: string; rowCount: number }[] {
 	const names = db
 		.prepare<Pick<SqliteMasterRow, "name">, []>(
-			"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name COLLATE NOCASE",
+			`SELECT name FROM sqlite_master WHERE type = 'table' AND ${USER_TABLE_PREDICATE} ORDER BY name COLLATE NOCASE`,
 		)
 		.all();
 
