@@ -3349,6 +3349,100 @@ describe("stalled worker continuation protocol", () => {
 		expect(task.claim).toBeUndefined();
 		expect(await readEvents(snapshot.state_dir)).toContain('"reason":"invalid_claim_count"');
 	});
+	it("fails closed when a listed task or claim authority record is malformed or filename-inconsistent", async () => {
+		for (const scenario of ["malformed_task", "mismatched_task_id", "invalid_claim"] as const) {
+			const fixture = await prepareContinuation(`continuation-inventory-${scenario}-team`);
+			const taskPath = path.join(fixture.stateDir, "tasks", "task-2.json");
+			if (scenario === "malformed_task") {
+				await Bun.write(taskPath, "{truncated");
+			} else {
+				const task = await Bun.file(path.join(fixture.stateDir, "tasks", "task-1.json")).json();
+				await Bun.write(
+					taskPath,
+					`${JSON.stringify({ ...task, id: scenario === "mismatched_task_id" ? "other-task" : "task-2" })}\n`,
+				);
+				if (scenario === "invalid_claim")
+					await Bun.write(path.join(fixture.stateDir, "claims", "task-2.json"), "null\n");
+			}
+			if (scenario === "malformed_task") await expect(fixture.monitor()).rejects.toThrow();
+			else await fixture.monitor();
+			expect(fixture.dispatches, scenario).toHaveLength(0);
+			expect(await readEvents(fixture.stateDir), scenario).toContain('"reason":"invalid_authority_inventory"');
+		}
+	});
+
+	it("revalidates canonical claim and task authority immediately before continuation dispatch", async () => {
+		for (const scenario of [
+			"claim_deleted",
+			"claim_corrupt",
+			"claim_token_changed",
+			"task_status_changed",
+			"task_owner_changed",
+			"task_assignee_changed",
+		] as const) {
+			const fixture = await prepareContinuation(`continuation-pre-dispatch-${scenario}-team`);
+			__setGjcTeamRuntimeTestSeamsForTests({
+				nowMs: fixture.now,
+				continuationBeforeDispatch: async () => {
+					const taskPath = path.join(fixture.stateDir, "tasks", "task-1.json");
+					const claimPath = path.join(fixture.stateDir, "claims", "task-1.json");
+					if (scenario === "claim_deleted") await fs.rm(claimPath);
+					else if (scenario === "claim_corrupt") await Bun.write(claimPath, "null\n");
+					else if (scenario === "claim_token_changed") {
+						const claim = await Bun.file(claimPath).json();
+						await Bun.write(claimPath, `${JSON.stringify({ ...claim, token: "replaced-token" })}\n`);
+					} else {
+						const task = await Bun.file(taskPath).json();
+						await Bun.write(
+							taskPath,
+							`${JSON.stringify({
+								...task,
+								...(scenario === "task_status_changed" ? { status: "pending" } : {}),
+								...(scenario === "task_owner_changed" ? { owner: "other-worker" } : {}),
+								...(scenario === "task_assignee_changed" ? { assignee: "other-worker" } : {}),
+							})}\n`,
+						);
+					}
+				},
+			});
+			await fixture.monitor();
+			expect(fixture.dispatches, scenario).toHaveLength(0);
+		}
+	});
+	it("does not honor a continuation recovery hold after canonical authority changes", async () => {
+		for (const scenario of [
+			"claim_deleted",
+			"claim_corrupt",
+			"claim_token_changed",
+			"task_status_changed",
+			"task_owner_changed",
+			"task_assignee_changed",
+		] as const) {
+			const fixture = await prepareContinuation(`continuation-hold-authority-${scenario}-team`);
+			await fixture.monitor();
+			const taskPath = path.join(fixture.stateDir, "tasks", "task-1.json");
+			const claimPath = path.join(fixture.stateDir, "claims", "task-1.json");
+			if (scenario === "claim_deleted") await fs.rm(claimPath);
+			else if (scenario === "claim_corrupt") await Bun.write(claimPath, "null\n");
+			else if (scenario === "claim_token_changed") {
+				const claim = await Bun.file(claimPath).json();
+				await Bun.write(claimPath, `${JSON.stringify({ ...claim, token: "replaced-token" })}\n`);
+			} else {
+				const task = await Bun.file(taskPath).json();
+				await Bun.write(
+					taskPath,
+					`${JSON.stringify({
+						...task,
+						...(scenario === "task_status_changed" ? { status: "pending" } : {}),
+						...(scenario === "task_owner_changed" ? { owner: "other-worker" } : {}),
+						...(scenario === "task_assignee_changed" ? { assignee: "other-worker" } : {}),
+					})}\n`,
+				);
+			}
+			await recoverGjcTeamStaleClaims(fixture.teamName, cleanupRoot!, fixture.env);
+			expect(await Bun.file(claimPath).exists(), scenario).toBe(false);
+		}
+	});
 
 	it("revokes escaped task mutation capabilities after their fenced callback", async () => {
 		const fixture = await prepareContinuation("continuation-capability-team");

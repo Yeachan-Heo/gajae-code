@@ -421,6 +421,56 @@ function claimFromUnknown(value: unknown): GjcTeamTaskClaim | undefined {
 	return owner && token && leasedUntil ? { owner, token, leased_until: leasedUntil } : undefined;
 }
 
+function isCanonicalContinuationClaim(value: unknown): value is GjcTeamTaskClaim {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const claim = value as Record<string, unknown>;
+	return (
+		Object.keys(claim).length === 3 &&
+		typeof claim.owner === "string" &&
+		claim.owner.length > 0 &&
+		typeof claim.token === "string" &&
+		claim.token.length > 0 &&
+		typeof claim.leased_until === "string" &&
+		Number.isFinite(Date.parse(claim.leased_until))
+	);
+}
+
+async function hasCurrentContinuationClaimAuthority(
+	runtime: GjcTeamWorkerOrchestrationRuntime,
+	dir: string,
+	worker: string,
+	task: GjcTeamTask,
+	claim: GjcTeamTaskClaim,
+): Promise<boolean> {
+	let canonicalClaim: unknown;
+	let canonicalTask: unknown;
+	try {
+		canonicalClaim = await runtime.readJson<unknown>(path.join(dir, "claims", `${task.id}.json`));
+		canonicalTask = await runtime.readJson<unknown>(path.join(dir, "tasks", `${task.id}.json`));
+	} catch {
+		return false;
+	}
+	if (!isCanonicalContinuationClaim(canonicalClaim)) return false;
+	if (
+		canonicalClaim.owner !== claim.owner ||
+		canonicalClaim.token !== claim.token ||
+		canonicalClaim.leased_until !== claim.leased_until
+	)
+		return false;
+	if (typeof canonicalTask !== "object" || canonicalTask === null || Array.isArray(canonicalTask)) return false;
+	const current = canonicalTask as Record<string, unknown>;
+	return (
+		current.id === task.id &&
+		current.status === "in_progress" &&
+		current.owner === worker &&
+		current.assignee === worker &&
+		isCanonicalContinuationClaim(current.claim) &&
+		current.claim.owner === canonicalClaim.owner &&
+		current.claim.token === canonicalClaim.token &&
+		current.claim.leased_until === canonicalClaim.leased_until
+	);
+}
+
 function claimIsExpired(value: string | undefined, nowMs: number): boolean {
 	if (!value) return false;
 	const timestamp = Date.parse(value);
@@ -634,6 +684,7 @@ export function isValidGjcContinuationOutcome(
 				"invalid_worker_lifecycle_or_status",
 				"claim_changed",
 				"invalid_or_expired_lease",
+				"invalid_authority_inventory",
 				"lease_does_not_cover_hold",
 				"unsupported_send_keys_transport",
 			].includes(outcome.reason)
@@ -665,6 +716,7 @@ async function hasActiveContinuationHold(
 	task: GjcTeamTask,
 	claim: GjcTeamTaskClaim,
 ): Promise<boolean> {
+	if (!(await hasCurrentContinuationClaimAuthority(runtime, dir, worker, task, claim))) return false;
 	const heartbeat = await readRuntimeJson<WorkerHeartbeatFile>(runtime, heartbeatPath(runtime, dir, worker));
 
 	const teamWorker = config.workers.find(candidate => candidate.id === worker);

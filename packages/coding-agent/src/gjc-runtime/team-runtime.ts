@@ -715,6 +715,105 @@ async function readContinuationJson<T>(filePath: string): Promise<T | null> {
 		return null;
 	}
 }
+type GjcContinuationAuthorityInventory =
+	| { valid: true; tasks: GjcTeamTask[]; claims: Map<string, GjcTeamTaskClaim> }
+	| { valid: false };
+
+function isCanonicalContinuationClaim(value: unknown): value is GjcTeamTaskClaim {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	return (
+		Object.keys(record).length === 3 &&
+		typeof record.owner === "string" &&
+		record.owner.length > 0 &&
+		typeof record.token === "string" &&
+		record.token.length > 0 &&
+		typeof record.leased_until === "string" &&
+		Number.isFinite(Date.parse(record.leased_until))
+	);
+}
+
+function isCanonicalContinuationTask(value: unknown, fileId: string): value is GjcTeamTask {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const task = value as Record<string, unknown>;
+	return (
+		task.id === fileId &&
+		isSafeId(fileId) &&
+		typeof task.subject === "string" &&
+		typeof task.description === "string" &&
+		typeof task.title === "string" &&
+		typeof task.objective === "string" &&
+		["pending", "blocked", "in_progress", "completed", "failed"].includes(String(task.status)) &&
+		typeof task.version === "number" &&
+		Number.isInteger(task.version) &&
+		task.version > 0 &&
+		typeof task.created_at === "string" &&
+		Number.isFinite(Date.parse(task.created_at)) &&
+		typeof task.updated_at === "string" &&
+		Number.isFinite(Date.parse(task.updated_at)) &&
+		(task.owner === undefined || typeof task.owner === "string") &&
+		(task.assignee === undefined || typeof task.assignee === "string") &&
+		(task.claim === undefined || isCanonicalContinuationClaim(task.claim))
+	);
+}
+
+async function readGjcContinuationAuthorityInventory(dir: string): Promise<GjcContinuationAuthorityInventory> {
+	let taskNames: string[];
+	try {
+		taskNames = (await fs.readdir(path.join(dir, "tasks"), { withFileTypes: true }))
+			.filter(entry => entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".evidence.json"))
+			.map(entry => entry.name);
+	} catch {
+		return { valid: false };
+	}
+	const tasks: GjcTeamTask[] = [];
+	const taskIds = new Set<string>();
+	for (const name of taskNames) {
+		const id = name.slice(0, -".json".length);
+		try {
+			const task = await Bun.file(path.join(dir, "tasks", name)).json();
+			if (!isCanonicalContinuationTask(task, id) || taskIds.has(task.id)) return { valid: false };
+			taskIds.add(task.id);
+			tasks.push(task);
+		} catch {
+			return { valid: false };
+		}
+	}
+	let claimNames: string[];
+	try {
+		claimNames = (await fs.readdir(path.join(dir, "claims"), { withFileTypes: true }))
+			.filter(entry => entry.isFile() && entry.name.endsWith(".json"))
+			.map(entry => entry.name);
+	} catch (error) {
+		if (!isEnoent(error)) return { valid: false };
+		claimNames = [];
+	}
+	const claims = new Map<string, GjcTeamTaskClaim>();
+	for (const name of claimNames) {
+		const id = name.slice(0, -".json".length);
+		if (!taskIds.has(id) || claims.has(id)) return { valid: false };
+		try {
+			const claim = await Bun.file(path.join(dir, "claims", name)).json();
+			if (!isCanonicalContinuationClaim(claim)) return { valid: false };
+			claims.set(id, claim);
+		} catch {
+			return { valid: false };
+		}
+	}
+	for (const task of tasks) {
+		const claim = claims.get(task.id);
+		if ((task.claim === undefined) !== (claim === undefined)) return { valid: false };
+		if (
+			task.claim !== undefined &&
+			(!claim ||
+				claim.owner !== task.claim.owner ||
+				claim.token !== task.claim.token ||
+				claim.leased_until !== task.claim.leased_until)
+		)
+			return { valid: false };
+	}
+	return { valid: true, tasks, claims };
+}
 
 function isPositivePid(value: unknown): value is number {
 	return typeof value === "number" && Number.isInteger(value) && value > 0;
@@ -2883,8 +2982,10 @@ async function validateGjcContinuationEligibility(
 		!Number.isFinite(Date.parse(status.updated_at))
 	)
 		return "invalid_worker_lifecycle_or_status";
-	const current = (await readTasks(dir)).find(candidate => candidate.id === task.id);
-	const storedClaim = await readContinuationJson<GjcTeamTaskClaim>(path.join(dir, "claims", `${task.id}.json`));
+	const inventory = await readGjcContinuationAuthorityInventory(dir);
+	if (!inventory.valid) return "invalid_authority_inventory";
+	const current = inventory.tasks.find(candidate => candidate.id === task.id);
+	const storedClaim = inventory.claims.get(task.id);
 	if (
 		current?.status !== "in_progress" ||
 		current.version !== task.version ||
@@ -2893,9 +2994,10 @@ async function validateGjcContinuationEligibility(
 		current.claim?.owner !== task.claim?.owner ||
 		current.claim?.token !== task.claim?.token ||
 		current.claim?.leased_until !== task.claim?.leased_until ||
-		storedClaim?.owner !== task.claim?.owner ||
-		storedClaim?.token !== task.claim?.token ||
-		storedClaim?.leased_until !== task.claim?.leased_until
+		!storedClaim ||
+		storedClaim.owner !== task.claim?.owner ||
+		storedClaim.token !== task.claim?.token ||
+		storedClaim.leased_until !== task.claim?.leased_until
 	)
 		return "claim_changed";
 	const leaseUntil = Date.parse(task.claim?.leased_until ?? "");
@@ -2951,7 +3053,16 @@ async function continueStalledGjcTeamWorkers(
 	}
 	const staleMs = parseDurationEnv(env, "GJC_TEAM_HEARTBEAT_STALE_MS", 120_000);
 	if (staleMs <= 0) return;
-	const tasks = await readTasks(dir);
+	const inventory = await readGjcContinuationAuthorityInventory(dir);
+	if (!inventory.valid) {
+		await appendEvent(dir, {
+			type: "continuation_skipped",
+			message: "Continuation requires a complete canonical task and claim authority inventory",
+			data: { reason: "invalid_authority_inventory" },
+		});
+		return;
+	}
+	const { tasks, claims } = inventory;
 	for (const worker of config.workers) {
 		const heartbeat = await readWorkerHeartbeat(workerRuntime, config.team_name, worker.id, config.leader_cwd, env);
 		const heartbeatAt = Date.parse(heartbeat?.last_turn_at ?? "");
@@ -2999,20 +3110,9 @@ async function continueStalledGjcTeamWorkers(
 				candidate.assignee === worker.id &&
 				candidate.owner === worker.id,
 		);
-		const claimsDir = path.join(dir, "claims");
-		let claimNames: string[];
-		try {
-			claimNames = (await fs.readdir(claimsDir, { withFileTypes: true }))
-				.filter(entry => entry.isFile() && entry.name.endsWith(".json"))
-				.map(entry => entry.name);
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-			claimNames = [];
-		}
-		const claimRecords = await Promise.all(
-			claimNames.map(name => readContinuationJson<GjcTeamTaskClaim>(path.join(claimsDir, name))),
-		);
-		const workerClaims = claimRecords.filter((claim): claim is GjcTeamTaskClaim => claim?.owner === worker.id);
+		const workerClaims = [...claims.entries()]
+			.filter(([, claim]) => claim.owner === worker.id)
+			.map(([taskId, claim]) => ({ taskId, claim }));
 		if (claimedTasks.length !== 1 || workerClaims.length !== 1) {
 			await appendEvent(dir, {
 				type: "continuation_skipped",
@@ -3024,8 +3124,10 @@ async function continueStalledGjcTeamWorkers(
 		}
 		const task = claimedTasks[0];
 		if (!task?.claim) continue;
-		const storedClaim = workerClaims[0];
+		const storedClaim = workerClaims[0]?.claim;
 		if (
+			storedClaim === undefined ||
+			workerClaims[0]?.taskId !== task.id ||
 			storedClaim.token !== task.claim.token ||
 			storedClaim.leased_until !== task.claim.leased_until ||
 			storedClaim.owner !== task.claim.owner
