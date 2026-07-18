@@ -752,6 +752,9 @@ async function askSingleQuestion(
 		}
 	}
 
+	if (timedOut && !autoSelectOnTimeout) {
+		return { selectedOptions: [], customInput: undefined, timedOut };
+	}
 	if (timedOut && selectedOptions.length === 0 && customInput === undefined && autoSelectOnTimeout) {
 		selectedOptions = getAutoSelectionOnTimeout(optionLabels, recommended);
 	}

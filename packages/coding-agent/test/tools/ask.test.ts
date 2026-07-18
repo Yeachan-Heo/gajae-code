@@ -2321,7 +2321,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 				const timeout = dialogOptions?.timeout ?? 1;
 				await Bun.sleep(timeout + 5);
 				dialogOptions?.onTimeout?.();
-				return undefined;
+				return _options[0];
 			},
 		});
 		const contractQuestion = {
