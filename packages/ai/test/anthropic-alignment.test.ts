@@ -129,7 +129,7 @@ describe("Anthropic request fingerprint alignment", () => {
 		});
 	});
 
-	it("places the automatic Anthropic cache breakpoint on the last ordered system prompt", async () => {
+	it("places canonical automatic cache control at the request level", async () => {
 		const payload = (await captureAnthropicPayload(
 			ANTHROPIC_MODEL,
 			{
@@ -137,12 +137,15 @@ describe("Anthropic request fingerprint alignment", () => {
 				messages: [{ role: "user", content: "variable context", timestamp: Date.now() }],
 			},
 			{ isOAuth: false },
-		)) as { system?: Array<{ type: string; text?: string; cache_control?: unknown }> };
+		)) as {
+			cache_control?: { type: string; ttl?: string };
+			system?: Array<{ type: string; text?: string; cache_control?: unknown }>;
+		};
 
+		expect(payload.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
 		expect(payload.system).toEqual([
 			{ type: "text", text: "stable system" },
-			// Canonical Anthropic API + long-cache-capable model defaults to 1h retention.
-			{ type: "text", text: "stable durable context", cache_control: { type: "ephemeral", ttl: "1h" } },
+			{ type: "text", text: "stable durable context" },
 		]);
 	});
 

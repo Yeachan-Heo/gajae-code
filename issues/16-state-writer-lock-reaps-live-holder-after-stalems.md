@@ -33,3 +33,7 @@ Do not reap an *alive* owner by elapsed time alone — add a heartbeat and/or
 owner-token compare (mirroring the file-lock GC owner-token guard from #618)
 before removing a lock dir. Add a regression where the holder sleeps past
 `staleMs` and a second writer must not overlap.
+
+## Resolution
+
+**Resolved.** `packages/coding-agent/src/config/file-lock.ts` now stamps PID start-time identity and refuses to reap a live holder; state-sidecar and lease mutation paths use the same lock. Regression coverage: `packages/coding-agent/test/file-lock-gc-toctou.test.ts` and `packages/coding-agent/test/session-state-sidecar.test.ts`.

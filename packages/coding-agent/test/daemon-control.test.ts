@@ -374,8 +374,10 @@ describe("TelegramDaemonController.reload", () => {
 			ownerId: string;
 			pid: number;
 		};
+		const ownerIdIndex = spawns[0]?.args.indexOf("--owner-id") ?? -1;
+		expect(ownerIdIndex).toBeGreaterThanOrEqual(0);
 		expect(after.ownerId).not.toBe("old");
-		expect(after.ownerId.startsWith("4242-")).toBe(true);
+		expect(after.ownerId).toBe(spawns[0]?.args[ownerIdIndex + 1]);
 		expect(after.pid).toBe(4242);
 		// No leftover control request after a successful reload.
 		expect(await readTelegramControlRequest(s)).toBeUndefined();

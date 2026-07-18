@@ -10,7 +10,7 @@ import {
 	readVisibleSkillActiveState,
 	type SkillActiveEntry,
 } from "../src/skill-state/active-state";
-import { getDeepInterviewMutationDecision } from "../src/skill-state/deep-interview-mutation-guard";
+import { getWorkflowMutationDecision } from "../src/skill-state/workflow-mutation-guard";
 
 async function withTempCwd(fn: (cwd: string) => Promise<void>): Promise<void> {
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-g005-redteam-"));
@@ -187,7 +187,7 @@ describe("G005 red-team skill-state cache freshness", () => {
 			});
 			await writeExternalModeState(cwd, sessionId, "deep-interview", "questions");
 
-			const decision = await getDeepInterviewMutationDecision({
+			const decision = await getWorkflowMutationDecision({
 				cwd,
 				sessionId,
 				tool: tool("write"),

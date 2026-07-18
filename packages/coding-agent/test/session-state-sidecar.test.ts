@@ -1750,9 +1750,10 @@ describe("coordinator runtime state sidecar", () => {
 		const stateFile = path.join(root, "runtime-state.json");
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "orphaned-runtime-lock";
+		await fs.mkdir(`${stateFile}.lock`);
 		await Bun.write(
-			`${stateFile}.lock`,
-			JSON.stringify({ pid: 999_999_999, start_time: "0", token: "orphaned-writer" }),
+			`${stateFile}.lock/info`,
+			JSON.stringify({ pid: 999_999_999, start_time: "0", timestamp: Date.now() }),
 		);
 		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("completed"), {
 			sessionId: "orphaned-runtime-lock",

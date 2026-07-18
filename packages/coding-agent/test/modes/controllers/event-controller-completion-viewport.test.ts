@@ -151,7 +151,7 @@ describe("EventController completion viewport", () => {
 						streamingMessage: startMessage,
 						loadingAnimation: { stop: stopLoading },
 						pendingTools: new Map(),
-						flushPendingModelSwitch: async () => {},
+						planModeController: { flushPendingModelSwitch: async () => {} },
 						updateEditorTopBorder: () => {},
 						updateEditorBorderColor: () => {},
 						session: {

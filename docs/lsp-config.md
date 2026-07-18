@@ -13,7 +13,7 @@ Source of truth in code:
 When no LSP config file is present, GJC auto-detects servers by intersecting two conditions:
 
 1. The project directory contains at least one of the server's `rootMarkers`.
-2. The server binary is available — checked in project-local bin directories first (e.g., `node_modules/.bin/`, `.venv/bin/`), then `$PATH`.
+2. The server binary is a trusted external executable. Project-local binaries, including paths reached through symlinks, are rejected.
 
 No configuration is required for common setups. The built-in server list covers most popular languages; see [`defaults.json`](../packages/coding-agent/src/lsp/defaults.json) for the full set.
 
@@ -24,18 +24,21 @@ GJC merges LSP config from multiple files, lowest to highest priority:
 | Priority | Location |
 |----------|----------|
 | 5 (lowest) | `~/lsp.json`, `~/.lsp.json`, `~/lsp.yaml`, `~/.lsp.yaml` |
+| 4 | Preloaded trusted external plugin LSP config outside the project (internal loader support; no current CLI/startup producer) |
 | 3 | `~/.gjc/agent/lsp.json`, `~/.gjc/agent/lsp.yaml`, `~/.gemini/lsp.*` |
 | 2 | `<project>/.gjc/lsp.json`, `<project>/.gjc/lsp.yaml`, `<project>/.gemini/lsp.*` |
 | 1 (highest) | `<project>/lsp.json`, `<project>/.lsp.json`, `<project>/lsp.yaml` |
 
-Each location accepts both `.json` and `.yaml` / `.yml` variants, as well as hidden-file versions (`.lsp.json`, `.lsp.yaml`). Files are merged in order: higher-priority files override lower-priority fields for the same server. Servers not mentioned in any override file remain at their built-in defaults.
+Each location accepts both `.json` and `.yaml` / `.yml` variants, as well as hidden-file versions (`.lsp.json`, `.lsp.yaml`). Configuration is merged in order, but project-controlled files can only control declarative server matching, activation, and capabilities. They cannot define or override a server's `command`, `args`, executable, client factory, `initOptions` / `initializationOptions`, or `settings`; opaque options that can instruct a trusted server belong to trusted user configuration.
+
+The recommended trusted user configuration is `~/.gjc/agent/lsp.json` (or YAML equivalent). Legacy user-wide `~/.gemini/lsp.*` and home-root `~/lsp.*` / `~/.lsp.*` files are also outside the project and may define launch settings and opaque server options, including custom servers. Project files may refine declarative matching and activation fields of built-in or user-defined servers.
 
 **Recommended locations:**
 
-- User-wide preferences → `~/.gjc/agent/lsp.json`
-- Project-specific overrides → `<project>/.gjc/lsp.json`
+- Trusted user launch settings, `initOptions`, and `settings` → `~/.gjc/agent/lsp.json`
+- Project-specific matching and activation → `<project>/.gjc/lsp.json`
 
-> **Note:** The presence of any LSP config file disables auto-detection. When at least one file is found, GJC skips the binary-scan phase and loads all servers that have matching `rootMarkers`, an available binary, and are not explicitly `disabled`.
+> **Note:** The presence of any LSP config file disables auto-detection. When at least one file is found, GJC skips the binary-scan phase and loads matching, available, non-disabled servers using trusted launch definitions.
 
 ## File shape
 
@@ -68,12 +71,12 @@ Top-level keys:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `command` | `string` | yes | Binary name (resolved via PATH/local bins) or absolute path |
-| `args` | `string[]` | no | Arguments passed to the binary |
+| `command` | `string` | trusted user config only | Server executable name or absolute path; project configuration cannot set or override it |
+| `args` | `string[]` | no | Launch arguments; trusted user config only |
 | `fileTypes` | `string[]` | yes | File extensions this server handles, e.g. `[".ts", ".tsx"]` |
 | `rootMarkers` | `string[]` | yes | Files/dirs that indicate a project root; glob patterns (e.g. `*.cabal`) are supported |
-| `initOptions` | `object` | no | Sent as `initializationOptions` during LSP handshake |
-| `settings` | `object` | no | Workspace settings pushed via `workspace/didChangeConfiguration` |
+| `initOptions` | `object` | trusted user config only | Sent as `initializationOptions` during LSP handshake |
+| `settings` | `object` | trusted user config only | Workspace settings pushed via `workspace/didChangeConfiguration` |
 | `disabled` | `boolean` | no | Set to `true` to disable this server entirely |
 | `warmupTimeoutMs` | `number` | no | Startup timeout in ms for this server (overrides the global default) |
 | `isLinter` | `boolean` | no | Mark server as linter/formatter only; excluded from type-intelligence operations (hover, go-to-definition, etc.) |
@@ -101,15 +104,21 @@ All fields are boolean and optional. They are currently used by `rust-analyzer`.
 
 ## Common recipes
 
-### Override a built-in server's settings
+### Override a built-in server's settings from trusted user configuration
 
-Partial overrides are merged onto the built-in defaults. You only need to specify the fields you want to change.
+Opaque server settings may contain process-affecting instructions, so place these partial overrides in trusted user configuration such as `~/.gjc/agent/lsp.json`:
 
 ```json
 {
   "servers": {
     "typescript-language-server": {
-      "args": ["--stdio", "--log-level", "4"]
+      "settings": {
+        "typescript": {
+          "preferences": {
+            "quoteStyle": "single"
+          }
+        }
+      }
     }
   }
 }
@@ -138,7 +147,7 @@ servers:
 
 ### Register a custom server
 
-New servers require `command`, `fileTypes`, and `rootMarkers`. All other fields are optional.
+Register custom servers in the canonical trusted user configuration, `~/.gjc/agent/lsp.json`. New servers require `command`, `fileTypes`, and `rootMarkers`; `args` is optional. Project configuration cannot register a launch definition or override a server's command, arguments, executable, or client factory.
 
 ```json
 {
@@ -180,6 +189,10 @@ Place the override in `<project>/.gjc/lsp.json`:
 The user-level config in `~/.gjc/agent/lsp.json` is unaffected; pylsp is only suppressed in this project.
 
 When multiple built-in primary servers support the same file, a default server can list lower-precedence servers in `supersedes`. For example, `csharp-ls` supersedes `omnisharp` only when both C# servers are installed and detected; if `csharp-ls` is unavailable, `omnisharp` remains the fallback.
+
+## lspmux
+
+`GJC_DISABLE_LSPMUX=1` is the canonical opt-out. `PI_DISABLE_LSPMUX=1` is a supported compatibility alias. A truthy value for either variable disables lspmux probing and wrapping.
 
 ## Built-in server list
 

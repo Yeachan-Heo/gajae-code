@@ -32,10 +32,14 @@ describe("ExtensionRunner", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 		authStorage.close();
-		tempDir.removeSync();
+		if (process.platform === "win32") {
+			Bun.gc(true);
+			await Bun.sleep(50);
+		}
+		await tempDir.remove();
 	});
 
 	const loadTestExtensions = async (configuredPaths: string[] = []) => {
@@ -890,7 +894,7 @@ describe("ExtensionRunner", () => {
 			expect(sessionManager.getHeader()?.title).toBe("Named by extension");
 		});
 
-		it("routes counted pending-message queues through createContext and zero-falls-back when omitted", async () => {
+		it("routes counted pending-message queues without exposing side-turn execution", async () => {
 			const extCode = `
 				export default function(pi) {
 					pi.on("session_start", () => {});
@@ -942,6 +946,8 @@ describe("ExtensionRunner", () => {
 				sessionManager,
 				modelRegistry,
 			);
+			const earlyContext = wired.createContext();
+			expect("runEphemeralTurn" in earlyContext).toBe(false);
 			wired.initialize(runtimeActions, {
 				...baseContextActions,
 				getPendingMessageCounts: () => ({ steering: 2, followUp: 1, nextTurn: 3 }),

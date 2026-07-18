@@ -1138,15 +1138,12 @@ describe("anthropic stream envelope handling", () => {
 			await stream.result();
 		}
 
-		const cacheControls = payloads.map(payload => {
-			const messages = (payload as { messages: Array<{ content: unknown }> }).messages;
-			const content = messages.at(-1)?.content;
-			if (!Array.isArray(content)) return undefined;
-			return (content.at(-1) as { cache_control?: { ttl?: string; type: string } } | undefined)?.cache_control;
-		});
+		const cacheControls = payloads.map(
+			payload => (payload as { cache_control?: { ttl?: string; type: string } }).cache_control,
+		);
 		expect(cacheControls[0]).toEqual({ type: "ephemeral", ttl: "1h" });
 		expect(cacheControls[1]).toEqual({ type: "ephemeral" });
-		expect(cacheControls[2]).toEqual({ type: "ephemeral" });
+		expect(cacheControls[2]).toBeUndefined();
 	});
 
 	it("defaults to 1h cache TTL when the request omits cacheRetention, with safe fallback", async () => {
@@ -1181,17 +1178,14 @@ describe("anthropic stream envelope handling", () => {
 			else Bun.env.PI_CACHE_RETENTION = prevPi;
 		}
 
-		const cacheControls = payloads.map(payload => {
-			const messages = (payload as { messages: Array<{ content: unknown }> }).messages;
-			const content = messages.at(-1)?.content;
-			if (!Array.isArray(content)) return undefined;
-			return (content.at(-1) as { cache_control?: { ttl?: string; type: string } } | undefined)?.cache_control;
-		});
+		const cacheControls = payloads.map(
+			payload => (payload as { cache_control?: { ttl?: string; type: string } }).cache_control,
+		);
 		// Canonical Anthropic API + long-cache-capable model gets 1h by default.
 		expect(cacheControls[0]).toEqual({ type: "ephemeral", ttl: "1h" });
 		// Models without long-cache support fall back to the default ~5m breakpoint.
 		expect(cacheControls[1]).toEqual({ type: "ephemeral" });
-		// Non-canonical base URLs fall back to the default ~5m breakpoint.
-		expect(cacheControls[2]).toEqual({ type: "ephemeral" });
+		// Unknown compatible endpoints do not receive generated cache controls.
+		expect(cacheControls[2]).toBeUndefined();
 	});
 });

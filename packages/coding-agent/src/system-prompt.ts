@@ -70,6 +70,11 @@ function dedupePromptSource(source: string | null | undefined, otherSources: Arr
 	return otherSources.some(otherSource => promptSourceContainsRule(otherSource, resolvedSource)) ? "" : resolvedSource;
 }
 
+/** Neutralize tag-like sequences in embedded project context so file bodies cannot escape framing. */
+function sanitizeEmbeddedPromptContent(content: string): string {
+	return escapePromptMetadata(content, { preserveNewlines: true });
+}
+
 function firstNonEmpty(...values: (string | undefined | null)[]): string | null {
 	for (const value of values) {
 		const trimmed = value?.trim();
@@ -575,6 +580,17 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const injectedAlwaysApplyRules = dedupeAlwaysApplyRules(alwaysApplyRules, promptSources);
 
 	const environment = await logger.time("getEnvironmentInfo", getEnvironmentInfo);
+	const sanitizedContextFiles = contextFiles.map(file => ({
+		...file,
+		path: escapePromptMetadata(file.path),
+		content: sanitizeEmbeddedPromptContent(file.content),
+	}));
+	const sanitizedAlwaysApplyRules = injectedAlwaysApplyRules.map(rule => ({
+		...rule,
+		name: escapePromptMetadata(rule.name),
+		path: escapePromptMetadata(rule.path),
+		content: sanitizeEmbeddedPromptContent(rule.content),
+	}));
 	const data = {
 		systemPromptCustomization: effectiveSystemPromptCustomization,
 		customPrompt: resolvedCustomPrompt,
@@ -584,11 +600,11 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		repeatToolDescriptions,
 		toolRefs,
 		environment,
-		contextFiles,
-		agentsMdSearch: { files: agentsMdFiles },
+		contextFiles: sanitizedContextFiles,
+		agentsMdSearch: { files: agentsMdFiles.map(file => escapePromptMetadata(file)) },
 		workspaceTree,
 		rules: rules ?? [],
-		alwaysApplyRules: injectedAlwaysApplyRules,
+		alwaysApplyRules: sanitizedAlwaysApplyRules,
 		date,
 		dateTime,
 		cwd: promptCwd,

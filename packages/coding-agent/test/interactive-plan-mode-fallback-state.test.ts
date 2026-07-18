@@ -45,14 +45,14 @@ describe("plan-mode temporary fallback state", () => {
 		session.providerSessionState.set("default", state(originalClose));
 		session.setConfiguredModelChain("default", ["test/default", "test/plan"], "test");
 
-		await mode.handlePlanModeCommand();
+		await mode.planModeController.handleCommand();
 
 		expect(session.model).toBe(planModel);
 		expect(session.providerSessionState.has("default")).toBe(false);
 		expect(originalClose).not.toHaveBeenCalled();
 		expect(session.getConfiguredModelChain("default")).toEqual(["test/default", "test/plan"]);
 		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
-		await mode.handlePlanModeCommand();
+		await mode.planModeController.handleCommand();
 
 		expect(session.model).toBe(defaultModel);
 		expect(session.providerSessionState.get("default")?.close).toBe(originalClose);
@@ -65,7 +65,7 @@ describe("plan-mode temporary fallback state", () => {
 		const originalClose = vi.fn();
 		originalMap.set("default", state(originalClose));
 
-		await mode.handlePlanModeCommand();
+		await mode.planModeController.handleCommand();
 		const planMap = session.providerSessionState;
 		const planClose = vi.fn();
 		planMap.set("plan", state(planClose));
@@ -78,7 +78,7 @@ describe("plan-mode temporary fallback state", () => {
 		promotionMap.set("promotion", state(promotionClose));
 
 		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
-		await mode.handlePlanModeCommand();
+		await mode.planModeController.handleCommand();
 
 		expect(session.model).toBe(defaultModel);
 		expect(session.providerSessionState).toBe(originalMap);
@@ -95,15 +95,15 @@ describe("plan-mode temporary fallback state", () => {
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
 		vi.spyOn(session, "sendPlanModeContext").mockResolvedValue(undefined);
 
-		await mode.handlePlanModeCommand();
+		await mode.planModeController.handleCommand();
 		expect(session.model).toBe(defaultModel);
 		expect(originalClose).not.toHaveBeenCalled();
 		streaming = false;
-		await mode.flushPendingModelSwitch();
+		await mode.planModeController.flushPendingModelSwitch();
 		expect(session.model).toBe(planModel);
 		expect(originalClose).not.toHaveBeenCalled();
 		vi.spyOn(mode, "showHookConfirm").mockResolvedValue(true);
-		await mode.handlePlanModeCommand();
+		await mode.planModeController.handleCommand();
 
 		expect(session.model).toBe(defaultModel);
 		expect(session.providerSessionState.get("default")?.close).toBe(originalClose);
@@ -115,7 +115,7 @@ describe("plan-mode temporary fallback state", () => {
 		session.providerSessionState.set("default", state(originalClose));
 		vi.spyOn(session, "setModelTemporary").mockRejectedValue(new Error("switch failed"));
 
-		await mode.handlePlanModeCommand();
+		await mode.planModeController.handleCommand();
 
 		expect(session.model).toBe(defaultModel);
 		expect(session.providerSessionState.get("default")?.close).toBe(originalClose);

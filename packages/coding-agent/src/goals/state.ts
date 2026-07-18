@@ -2,6 +2,8 @@ import type { UsageStatistics } from "../session/session-manager";
 
 export type GoalStatus = "active" | "paused" | "complete" | "dropped";
 
+export type GoalProvenance = { source: "ultragoal"; runId: string; goalId: string } | { source: "user" };
+
 export interface Goal {
 	id: string;
 	objective: string;
@@ -10,6 +12,7 @@ export interface Goal {
 	timeUsedSeconds: number;
 	createdAt: number;
 	updatedAt: number;
+	provenance?: GoalProvenance;
 }
 
 export interface GoalModeState {
@@ -47,6 +50,20 @@ export function normalizeGoal(candidate: unknown): Goal | null {
 	if (status !== "active" && status !== "paused" && status !== "complete" && status !== "dropped") {
 		return null;
 	}
+	const provenance = value.provenance;
+	if (
+		provenance !== undefined &&
+		(!provenance ||
+			typeof provenance !== "object" ||
+			((provenance as Record<string, unknown>).source === "ultragoal" &&
+				(typeof (provenance as Record<string, unknown>).runId !== "string" ||
+					typeof (provenance as Record<string, unknown>).goalId !== "string")) ||
+			((provenance as Record<string, unknown>).source !== "ultragoal" &&
+				(provenance as Record<string, unknown>).source !== "user"))
+	) {
+		return null;
+	}
+
 	return {
 		id: value.id,
 		objective: value.objective,
@@ -55,6 +72,7 @@ export function normalizeGoal(candidate: unknown): Goal | null {
 		timeUsedSeconds: value.timeUsedSeconds,
 		createdAt: value.createdAt,
 		updatedAt: value.updatedAt,
+		...(provenance ? { provenance: provenance as GoalProvenance } : {}),
 	};
 }
 

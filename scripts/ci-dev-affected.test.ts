@@ -46,12 +46,19 @@ describe("planTasks command shape (issue #622)", () => {
 });
 
 describe("dev-ci canonical-plan workflow contract", () => {
-	test("binds the canonical plan to its checked-out source and validates it before aggregate decisions", async () => {
+	test("binds canonical artifacts to the run so attempt-2 consumers reuse attempt-1 producers safely", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow.match(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/g)).toHaveLength(5);
 		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(5);
-		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}");
-		expect(workflow.match(/\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g)).toHaveLength(8);
+		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}");
+		expect(workflow).toContain("name: dev-affected-native-${{ github.run_id }}");
+		expect(workflow).toContain("name: dev-affected-shard-${{ github.run_id }}-${{ strategy.job-index }}");
+		expect(workflow).toContain("pattern: dev-affected-shard-${{ github.run_id }}-*");
+		expect(workflow).not.toContain("github.run_attempt");
+		expect(workflow.match(/overwrite: true/g)).toHaveLength(3);
+		expect(workflow.match(/dev-affected-plan-\$\{\{ github\.run_id \}\}/g)).toHaveLength(4);
+		expect(workflow.match(/dev-affected-native-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
+		expect(workflow.match(/dev-affected-shard-\$\{\{ github\.run_id \}\}/g)).toHaveLength(2);
 		expect(workflow).toContain("include-hidden-files: true");
 		expect(workflow.match(/include-hidden-files: true/g)).toHaveLength(2);
 		expect(workflow).toContain("CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}");
@@ -82,6 +89,20 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const aggregateWorkflow = workflow.slice(workflow.indexOf("  affected:\n"));
 		expect(aggregateWorkflow).toContain("name: Validate canonical affected plan");
 		expect(aggregateWorkflow).toContain("run: bun scripts/ci-dev-affected.ts --validate-plan");
+		const receiptConsumerCondition = "if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-shards.result == 'success' }}";
+		expect(workflow.match(new RegExp(receiptConsumerCondition.replace(/[.$|?*+(){}[\]\\]/g, "\\$&"), "g"))).toHaveLength(2);
+		for (const name of ["Download shard completion receipts", "Validate canonical shard completion"]) {
+			const step = workflow.slice(workflow.indexOf(`name: ${name}`), workflow.indexOf("\n      - name:", workflow.indexOf(`name: ${name}`) + 1));
+			expect(step).toContain(receiptConsumerCondition);
+		}
+		expect(aggregateWorkflow).toContain("if: ${{ always() }}");
+		const aggregateValidationStart = aggregateWorkflow.indexOf("name: Aggregate affected path validation shards");
+		const aggregateValidationEnd = aggregateWorkflow.indexOf("\n      - name:", aggregateValidationStart + 1);
+		const aggregateValidationStep = aggregateWorkflow.slice(
+			aggregateValidationStart,
+			aggregateValidationEnd === -1 ? undefined : aggregateValidationEnd,
+		);
+		expect(aggregateValidationStep).not.toContain("\n        if:");
 	});
 
 	test("aggregate result truth table rejects every missing, failed, cancelled, and unplanned dependency", () => {
@@ -100,6 +121,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 			{ ...valid[0]!, native: "cancelled" },
 			{ ...valid[0]!, shards: "failure" },
 			{ ...valid[0]!, shards: "cancelled" },
+			{ ...valid[0]!, shards: "skipped" },
 			{ ...valid[0]!, windowsDoctor: "failure" },
 			{ ...valid[0]!, windowsDoctor: "cancelled" },
 			{ ...valid[0]!, windowsDoctor: "skipped" },
@@ -218,13 +240,13 @@ describe("describeTasks matrix emission", () => {
 		}
 	});
 
-	test("full-workspace root-check uses the bounded CI command without native artifacts", () => {
+	test("full-workspace root-check downloads the native artifact used by generated checks", () => {
 		const entries = describeTasks(planTasks(["tsconfig.json"], packages));
 		const nativeBuild = entries.find(entry => entry.key === "native-linux-x64");
 		const rootCheck = entries.find(entry => entry.key === "root-check");
 
 		expect(nativeBuild?.nativeBuild).toBe(true);
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("rust tasks are flagged rust and need no native addon", () => {
@@ -389,7 +411,6 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(output).toContain("plan_digest=");
 		expect(await Bun.file(path.join(repoRoot, ".ci-dev-affected-plan.json")).exists()).toBe(true);
 	});
-
 	test("Cargo selection includes transitive dependents and never emits vendored shards", async () => {
 		const sdk = await runScript(["--matrix-json"], "crates/gjc-sdk/src/lib.rs");
 		expect(sdk.exitCode).toBe(0);
@@ -509,6 +530,53 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		});
 		expect(receiptMissing.exitCode).toBe(1);
 		expect(receiptMissing.stderr).toContain("shard receipt set does not match canonical plan");
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity }));
+		await Bun.write(path.join(receiptDir, "stale-extra.json"), JSON.stringify({ key: "stale", identity: "stale" }));
+		const receiptExtra = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptExtra.exitCode).toBe(1);
+		expect(receiptExtra.stderr).toContain("shard receipt set does not match canonical plan");
+		await fs.rm(path.join(receiptDir, "stale-extra.json"));
+		await Bun.write(path.join(receiptDir, "duplicate.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity }));
+		const receiptDuplicate = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptDuplicate.exitCode).toBe(1);
+		expect(receiptDuplicate.stderr).toContain("shard receipt set does not match canonical plan");
+		await fs.rm(path.join(receiptDir, "duplicate.json"));
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: "wrong" }));
+		const receiptWrongIdentity = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptWrongIdentity.exitCode).toBe(1);
+		expect(receiptWrongIdentity.stderr).toContain("shard receipt set does not match canonical plan");
+		await Bun.write(path.join(receiptDir, "0.json"), "{");
+		const receiptMalformedJson = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptMalformedJson.exitCode).toBe(1);
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity, extra: true }));
+		const receiptMalformedObject = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptMalformedObject.exitCode).toBe(1);
+		expect(receiptMalformedObject.stderr).toContain("malformed shard receipt");
 		const wrongSource = await runScript(["--validate-plan"], "packages/stats/src/index.ts", {
 			CI_DEV_AFFECTED_PLAN: planFile,
 			CI_DEV_PLAN_DIGEST: digest as string,
@@ -625,6 +693,10 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
 		expect(keys).not.toContain("test:packages/coding-agent/test/sdk/index.test.ts");
 		expect(keys).not.toContain("test:packages/coding-agent/test/other/index.test.ts");
+		expect(describeTasks(tasks).find(entry => entry.key === "check:@gajae-code/coding-agent")).toMatchObject({
+			native: true,
+			nativeBuild: false,
+		});
 	});
 
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
@@ -746,14 +818,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("wrapper-version");
 	});
 
-	test("root-level codeish fallback uses the bounded CI command without native artifacts", () => {
+	test("root-level codeish fallback plans the native artifact required by the bounded check", () => {
 		const tasks = targeted(["scripts/unmapped-tool.ts"]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
-		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
+		expect(keys).toContain("native-linux-x64");
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("docs/changelog-only changes plan nothing expensive", () => {
@@ -819,14 +891,14 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
 	});
 
-	test("tooling-script root-check uses the bounded CI command without native artifacts", () => {
+	test("tooling-script root-check marks the bounded check as a native consumer", () => {
 		const tasks = planTasks(["scripts/unmapped-tool.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
 		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("push mode selects the bridge-client SDK package smoke exactly once for package and SDK client changes", () => {

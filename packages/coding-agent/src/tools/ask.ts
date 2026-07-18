@@ -66,29 +66,130 @@ const OptionItem = z.object({
 	label: z.string().describe("display label"),
 });
 
+const DeepInterviewIntentItem = z
+	.object({
+		id: z.string().regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/),
+		category: z.enum(["artifact", "surface", "integration", "constraint"]),
+		statement: z.string().min(1).max(1_000),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (!value.id.startsWith(`${value.category}:`))
+			context.addIssue({ code: "custom", message: "intent ID must use its category prefix", path: ["id"] });
+	});
+
+const DeepInterviewIntentContract = z
+	.object({
+		items: z.array(DeepInterviewIntentItem).min(1).max(64),
+		confirmation_options: z.array(z.string().min(1).max(200)).min(1).max(5),
+	})
+	.strict();
+
+const DeepInterviewIntentReview = z
+	.object({
+		observed_items: z.array(DeepInterviewIntentItem).min(1).max(64),
+		supporting_substitutions: z
+			.array(
+				z
+					.object({
+						removed_id: z
+							.string()
+							.regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/),
+						replacement_ids: z
+							.array(z.string().regex(/^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/))
+							.min(1)
+							.max(64),
+						rationale: z.string().min(1).max(500),
+					})
+					.strict(),
+			)
+			.max(64),
+		approval_options: z.array(z.string().min(1).max(200)).min(1).max(5),
+	})
+	.strict();
+
 /** Optional structured deep-interview round metadata; when present the round is recorded automatically. */
-const DeepInterviewMeta = z.object({
-	round_id: z.string().describe("stable optional round identity").optional(),
-	round: z.number().int().nonnegative().describe("round number"),
-	component: z.string().min(1).describe("targeted topology component"),
-	dimension: z.string().min(1).describe("targeted clarity dimension"),
-	ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
-});
+const DeepInterviewMeta = z
+	.object({
+		round_id: z.string().max(128).describe("stable optional round identity").optional(),
+		round: z.number().int().nonnegative().describe("round number"),
+		component: z.string().min(1).max(128).describe("targeted topology component"),
+		dimension: z.string().min(1).max(128).describe("targeted clarity dimension"),
+		ambiguity: z.number().min(0).max(1).describe("ambiguity at ask time (0..1)"),
+		intent_contract: DeepInterviewIntentContract.describe("Round-0 locked intent contract").optional(),
+		intent_review: DeepInterviewIntentReview.describe("Locked-intent reduction review").optional(),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (
+			value.intent_contract &&
+			(value.round !== 0 || value.component !== "review-topology" || value.dimension !== "topology")
+		)
+			context.addIssue({
+				code: "custom",
+				message: "intent_contract requires Round 0 review-topology metadata",
+				path: ["intent_contract"],
+			});
+		if (value.intent_review && value.round === 0)
+			context.addIssue({
+				code: "custom",
+				message: "intent_review requires a post-Round-0 answer",
+				path: ["intent_review"],
+			});
+		if (value.intent_contract && value.intent_review)
+			context.addIssue({ code: "custom", message: "intent_contract and intent_review are mutually exclusive" });
+	});
 
 const WorkflowGateMeta = z.object({
 	stage: z.enum(["deep-interview", "ralplan", "ultragoal"]).describe("workflow gate stage"),
 	kind: z.enum(["question", "approval", "execution"]).describe("workflow gate kind"),
 });
 
-const QuestionItem = z.object({
-	id: z.string().describe("question id"),
-	question: z.string().describe("question text"),
-	options: z.array(OptionItem).describe("available options"),
-	multi: z.boolean().describe("allow multiple selections").optional(),
-	recommended: z.number().describe("recommended option index").optional(),
-	deepInterview: DeepInterviewMeta.describe("optional deep-interview round metadata").optional(),
-	workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
-});
+const QuestionItem = z
+	.object({
+		id: z.string().describe("question id"),
+		question: z.string().describe("question text"),
+		options: z.array(OptionItem).describe("available options"),
+		multi: z.boolean().describe("allow multiple selections").optional(),
+		recommended: z.number().describe("recommended option index").optional(),
+		deepInterview: DeepInterviewMeta.describe("optional deep-interview round metadata").optional(),
+		workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
+	})
+	.superRefine((value, context) => {
+		const labels = new Set(value.options.map(option => option.label));
+		if ((value.deepInterview?.intent_contract || value.deepInterview?.intent_review) && value.multi === true)
+			context.addIssue({ code: "custom", message: "intent gates must be single-select", path: ["multi"] });
+		const confirmationOptions = value.deepInterview?.intent_contract?.confirmation_options ?? [];
+		if (new Set(confirmationOptions).size !== confirmationOptions.length)
+			context.addIssue({
+				code: "custom",
+				message: "intent confirmation options must be unique",
+				path: ["deepInterview", "intent_contract"],
+			});
+		const approvalOptions = value.deepInterview?.intent_review?.approval_options ?? [];
+		if (new Set(approvalOptions).size !== approvalOptions.length)
+			context.addIssue({
+				code: "custom",
+				message: "intent approval options must be unique",
+				path: ["deepInterview", "intent_review"],
+			});
+		for (const label of value.deepInterview?.intent_contract?.confirmation_options ?? []) {
+			if (!labels.has(label))
+				context.addIssue({
+					code: "custom",
+					message: "intent confirmation option must be displayed",
+					path: ["deepInterview", "intent_contract"],
+				});
+		}
+		for (const label of value.deepInterview?.intent_review?.approval_options ?? []) {
+			if (!labels.has(label))
+				context.addIssue({
+					code: "custom",
+					message: "intent approval option must be displayed",
+					path: ["deepInterview", "intent_review"],
+				});
+		}
+	});
 
 export const askSchema = z.object({
 	questions: z.array(QuestionItem).min(1).describe("questions to ask"),
@@ -133,7 +234,11 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>): Promise<void> {
+async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>, required: boolean): Promise<void> {
+	if (required) {
+		await persistence;
+		return;
+	}
 	let timeout: ReturnType<typeof setTimeout> | undefined;
 	try {
 		await Promise.race([
@@ -147,6 +252,7 @@ async function awaitDeepInterviewRecorderPersistence(persistence: Promise<void>)
 		]);
 	} catch (error) {
 		logger.warn(`ask: deep-interview round recording failed: ${errorMessage(error)}`);
+		if (required) throw error;
 	} finally {
 		if (timeout) clearTimeout(timeout);
 	}
@@ -293,6 +399,7 @@ interface AskSingleQuestionOptions {
 	scrollTitleRows?: number;
 	otherOptionLabel?: string;
 	clarificationOptionLabel?: string;
+	autoSelectOnTimeout?: boolean;
 	onRemoteState?: (state: {
 		interaction: "selector" | "custom_editor" | "clarification_editor";
 		selectedCount: number;
@@ -334,7 +441,15 @@ async function askSingleQuestion(
 	multi: boolean,
 	options: AskSingleQuestionOptions = {},
 ): Promise<SelectionResult> {
-	const { recommended, timeout, signal, initialSelection, navigation, scrollTitleRows } = options;
+	const {
+		recommended,
+		timeout,
+		signal,
+		initialSelection,
+		navigation,
+		scrollTitleRows,
+		autoSelectOnTimeout = true,
+	} = options;
 	const doneLabel = getDoneOptionLabel();
 	const otherOptionLabel = options.otherOptionLabel ?? OTHER_OPTION;
 	const clarificationOptionLabel = options.clarificationOptionLabel;
@@ -632,12 +747,23 @@ async function askSingleQuestion(
 				selectedOptions = [];
 			}
 		}
+		if (timedOut && !autoSelectOnTimeout) {
+			return {
+				selectedOptions: [],
+				customInput: undefined,
+				timedOut,
+				...(navigation?.allowForward ? { navigation: "forward" as const } : {}),
+			};
+		}
 		if (navigation?.allowForward) {
 			return { selectedOptions, customInput, timedOut, navigation: "forward" };
 		}
 	}
 
-	if (timedOut && selectedOptions.length === 0 && customInput === undefined) {
+	if (timedOut && !autoSelectOnTimeout) {
+		return { selectedOptions: [], customInput: undefined, timedOut };
+	}
+	if (timedOut && selectedOptions.length === 0 && customInput === undefined && autoSelectOnTimeout) {
 		selectedOptions = getAutoSelectionOnTimeout(optionLabels, recommended);
 	}
 
@@ -724,11 +850,14 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					ambiguity: meta.ambiguity,
 					selectedOptions,
 					customInput,
+					intent_contract: meta.intent_contract,
+					intent_review: meta.intent_review,
 				},
 				{ sessionId },
 			).then(async () => {
 				await syncDeepInterviewRecorderHud(cwd, statePath, sessionId);
 			}),
+			meta.intent_contract !== undefined || meta.intent_review !== undefined,
 		);
 	}
 
@@ -1061,6 +1190,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					navigation: options?.navigation,
 					scrollTitleRows: isDeepInterviewQuestion ? DEEP_INTERVIEW_SELECTOR_SCROLL_TITLE_ROWS : undefined,
 					otherOptionLabel,
+					autoSelectOnTimeout: !q.deepInterview?.intent_contract && !q.deepInterview?.intent_review,
 					clarificationOptionLabel,
 					onRemoteState: state => {
 						activeRemoteRequest = {
@@ -1145,7 +1275,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
 			}
-			if (clarificationQuestion === undefined) {
+			if (
+				clarificationQuestion === undefined &&
+				!(timedOut && (q.deepInterview?.intent_contract || q.deepInterview?.intent_review))
+			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
 			const details: AskToolDetails = {
@@ -1223,7 +1356,10 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 				clarificationQuestion,
 			};
 
-			if (clarificationQuestion === undefined) {
+			if (
+				clarificationQuestion === undefined &&
+				!(timedOut && (q.deepInterview?.intent_contract || q.deepInterview?.intent_review))
+			) {
 				await this.#recordDeepInterviewRound(q, selectedOptions, customInput);
 			}
 

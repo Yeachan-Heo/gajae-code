@@ -57,7 +57,7 @@
       "lint-staged": "^16.4.0",
       "lru-cache": "11.3.6",
       "lucide-react": "^1.14.0",
-      "marked": "^18.0.3",
+      "marked": "18.0.6",
       "markit-ai": "0.5.3",
       "openai": "^6.36.0",
       "partial-json": "^0.1.7",

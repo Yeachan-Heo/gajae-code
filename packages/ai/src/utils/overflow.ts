@@ -1,4 +1,5 @@
 import type { AssistantMessage } from "../types";
+import type { TransportFailureFacts } from "./fallback-transport";
 
 /**
  * Regex patterns to detect context overflow errors from different providers.
@@ -119,48 +120,88 @@ const EMPTY_RESPONSE_USAGE_THRESHOLD = 5;
  * @param contextWindow - Optional context window size for detecting silent overflow (z.ai)
  * @returns true if the message indicates a context overflow
  */
-export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
-	// Case 1: Check error message patterns
-	if (message.stopReason === "error" && message.errorMessage) {
-		// Check known patterns
-		if (OVERFLOW_PATTERNS.some(p => p.test(message.errorMessage!))) {
-			return true;
-		}
+/**
+ * Authoritatively classify a context overflow from the assistant result and
+ * normalized transport facts. Typed facts take precedence over provider prose:
+ * an explicit non-overflow transport failure cannot be upgraded by hostile or
+ * misleading error text.
+ */
+const OVERFLOW_PROVIDER_CODES = new Set(["context_length_exceeded", "request_too_large"]);
+const NON_OVERFLOW_PROVIDER_CODES = new Set([
+	"invalid_request_error",
+	"authentication_error",
+	"invalid_api_key",
+	"invalid_token",
+	"token_expired",
+	"unauthorized",
+	"forbidden",
+	"insufficient_quota",
+	"quota_exceeded",
+	"quota_exhausted",
+	"usage_limit_reached",
+	"usage_not_included",
+	"out_of_credits",
+	"rate_limit",
+	"rate_limit_error",
+	"rate_limit_exceeded",
+	"too_many_requests",
+]);
 
-		// Cerebras and Mistral return 400/413 with no body for context overflow.
-		// Proxy providers (e.g. api.synthetic.new) wrap upstream 400/413 no-body
-		// responses in a JSON envelope, so the status code phrase may appear
-		// anywhere in the message rather than at its start.
-		// Note: 429 is rate limiting (requests/tokens per time), NOT context overflow
-		if (/\b4(00|13)\s*(status code)?\s*\(no body\)/i.test(message.errorMessage)) {
-			return true;
-		}
+function transportCodes(transportFailure: TransportFailureFacts | undefined): string[] {
+	return [transportFailure?.openaiErrorCode, transportFailure?.anthropicErrorType, transportFailure?.providerCode]
+		.filter((code): code is string => typeof code === "string")
+		.map(code => code.toLowerCase());
+}
+
+function hasTypedNonOverflowCode(transportFailure: TransportFailureFacts | undefined): boolean {
+	return transportCodes(transportFailure).some(code => NON_OVERFLOW_PROVIDER_CODES.has(code));
+}
+
+function isTypedNoBodyOverflow(
+	message: AssistantMessage,
+	transportFailure: TransportFailureFacts | undefined,
+): boolean {
+	if (transportFailure?.status !== 400 && transportFailure?.status !== 413) return false;
+	return !message.errorMessage || /\b4(00|13)\s*(status code)?\s*\(no body\)/i.test(message.errorMessage);
+}
+
+export function classifyContextOverflow(
+	message: AssistantMessage,
+	transportFailure?: TransportFailureFacts,
+	contextWindow?: number,
+): boolean {
+	if (transportFailure?.status === 429) return false;
+	const typedCodes = transportCodes(transportFailure);
+	if (typedCodes.some(code => OVERFLOW_PROVIDER_CODES.has(code))) return true;
+	if (hasTypedNonOverflowCode(transportFailure)) return false;
+	if (isTypedNoBodyOverflow(message, transportFailure)) return true;
+
+	const errorMessage = message.errorMessage;
+	if (message.stopReason === "error" && errorMessage) {
+		if (OVERFLOW_PATTERNS.some(pattern => pattern.test(errorMessage))) return true;
+		if (/\b4(00|13)\s*(status code)?\s*\(no body\)/i.test(errorMessage)) return true;
 	}
 
-	// Case 2: Usage-based overflow (silent or provider-specific)
 	if (contextWindow) {
 		const inputTokens = message.usage.input + message.usage.cacheRead + message.usage.cacheWrite;
-		if (inputTokens > contextWindow) {
-			return true;
-		}
+		if (inputTokens > contextWindow) return true;
 	}
 
-	// Case 3: Empty response with anomalously low usage (proxy-level overflow)
-	// Some proxies (e.g. LiteLLM) return a "successful" response (stopReason "stop")
-	// with empty content and a near-zero token count when the upstream model's
-	// context window is exceeded. This is distinct from silent overflow (Case 2),
-	// where the provider reports the real input token count. Here the proxy
-	// fabricates a bogus usage (input: 1, output: 1) that is far below any
-	// realistic turn, so we detect it heuristically.
-	if (
+	return (
 		message.stopReason === "stop" &&
 		message.content.length === 0 &&
 		message.usage.input + message.usage.output <= EMPTY_RESPONSE_USAGE_THRESHOLD
-	) {
-		return true;
-	}
+	);
+}
 
-	return false;
+/**
+ * Check if an assistant message represents a context overflow error.
+ *
+ * Callers with normalized transport facts should use {@link classifyContextOverflow}
+ * so typed provider codes take precedence over error prose.
+ */
+export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
+	return classifyContextOverflow(message, undefined, contextWindow);
 }
 
 /**

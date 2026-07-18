@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { parseNotifyArgs, promptForToken, runNotifyCliCommand, runNotifyCommand } from "../src/cli/notify-cli";
 import type { CasReceipt } from "../src/config/atomic-yaml-patch";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
@@ -1236,8 +1237,9 @@ describe("notify daemon-internal lightweight startup", () => {
 	test("daemon-internal exits before loading settings when owner pid is stale", async () => {
 		let settingsLoaded = false;
 		let daemonConstructed = false;
-		const { stderr } = await captureOutput(() =>
-			runDaemonInternal(["--owner-id", "12345-dead", "--agent-dir", tempAgentDir()], {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await runDaemonInternal(["--owner-id", `12345-${token}`, "--agent-dir", tempAgentDir()], {
 				pidAlive: () => false,
 				SettingsImpl: {
 					async init() {
@@ -1252,11 +1254,14 @@ describe("notify daemon-internal lightweight startup", () => {
 					requestStop(): void {}
 					async run(): Promise<void> {}
 				} as never,
-			}),
-		);
-		expect(stderr).toContain("owner process");
-		expect(settingsLoaded).toBe(false);
-		expect(daemonConstructed).toBe(false);
+			});
+			expect(warning).toHaveBeenCalledWith("GJC notify daemon exiting because its owner is not alive");
+			expect(warning.mock.calls.flat().join("\n")).not.toContain(token);
+			expect(settingsLoaded).toBe(false);
+			expect(daemonConstructed).toBe(false);
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	test("owner pid parser accepts pid-prefixed owner ids only", () => {

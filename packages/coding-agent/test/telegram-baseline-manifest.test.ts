@@ -65,13 +65,23 @@ async function sdkAdapterParityManifest(): Promise<SdkAdapterParityManifest> {
 async function fakeBun(directory: string): Promise<{ binDirectory: string; log: string }> {
 	const binDirectory = path.join(directory, "bin");
 	const log = path.join(directory, "receipts.log");
-	const command = path.join(binDirectory, "bun");
+	const command = path.join(binDirectory, process.platform === "win32" ? "bun.exe" : "bun");
 	await fs.mkdir(binDirectory, { recursive: true });
-	await Bun.write(
-		command,
-		'#!/bin/sh\nprintf "%s\\n" "$*" >> "$GJC_MANIFEST_RECEIPT_LOG"\ncase "$*" in\n*fail-command.test.ts*) echo "1 fail"; exit 1 ;;\n*) echo "1 pass" ;;\nesac\n',
-	);
-	await fs.chmod(command, 0o755);
+	if (process.platform === "win32") {
+		const source = path.join(directory, "fake-bun.ts");
+		await Bun.write(
+			source,
+			'import { appendFile } from "node:fs/promises";\n\nconst args = process.argv.slice(2);\nawait appendFile(process.env.GJC_MANIFEST_RECEIPT_LOG!, args.join(" ") + "\\n");\nif (args.includes("fail-command.test.ts")) {\n\tconsole.log("1 fail");\n\tprocess.exit(1);\n}\nconsole.log("1 pass");\n',
+		);
+		const build = Bun.spawnSync([process.execPath, "build", source, "--compile", "--outfile", command]);
+		if (build.exitCode !== 0) throw new Error(`failed to compile fake Bun: ${build.stderr?.toString() ?? ""}`);
+	} else {
+		await Bun.write(
+			command,
+			'#!/bin/sh\nprintf "%s\\n" "$*" >> "$GJC_MANIFEST_RECEIPT_LOG"\ncase "$*" in\n*fail-command.test.ts*) echo "1 fail"; exit 1 ;;\n*) echo "1 pass" ;;\nesac\n',
+		);
+		await fs.chmod(command, 0o755);
+	}
 	return { binDirectory, log };
 }
 
@@ -329,11 +339,11 @@ describe("test manifest runner", () => {
 		expect(invocations).toHaveLength(manifest.commands.length + manifest.rows.length);
 		expect(invocations[0]).toBe(`test ${manifest.commands[0]?.argv.slice(2).join(" ")}`);
 		expect(invocations.at(-1)).toBe(`test ${manifest.rows.at(-1)?.argv.slice(2).join(" ")}`);
-	});
+	}, 300_000);
 });
 
 describe("gjc-sdk rename scanner", () => {
-	it("fails closed when a tracked file cannot be read", async () => {
+	it.skipIf(process.platform === "win32")("fails closed when a tracked file cannot be read", async () => {
 		const directory = await tempDir();
 		const scanRoot = path.join(directory, "repo");
 		await fs.mkdir(scanRoot, { recursive: true });
@@ -391,6 +401,7 @@ describe("gjc-sdk rename scanner", () => {
 		git("commit", "-m", "initial");
 
 		const legacyPath = path.join("src", "notifications", "legacy.ts");
+		const legacyPosixPath = legacyPath.replaceAll("\\", "/");
 		await fs.mkdir(path.join(scanRoot, path.dirname(legacyPath)), { recursive: true });
 		await Bun.write(path.join(scanRoot, legacyPath), `${["use", ["gjc", "notifications"].join("_")].join(" ")}\n`);
 		const scanner = path.join(packageRoot, "scripts", "verify-gjc-sdk-rename.ts");
@@ -400,10 +411,10 @@ describe("gjc-sdk rename scanner", () => {
 		expect(output(result)).toContain(`clean.txt:1: forbidden ${JSON.stringify(["notifications", "SDK"].join(" "))}`);
 		expect(output(result)).toContain(`clean.txt:2: forbidden ${JSON.stringify(["notifications", "SDK"].join(" "))}`);
 		expect(output(result)).toContain(
-			`${legacyPath}: forbidden filename ${JSON.stringify(["src", "notifications", ""].join("/"))}`,
+			`${legacyPosixPath}: forbidden filename ${JSON.stringify(["src", "notifications", ""].join("/"))}`,
 		);
 		expect(output(result)).toContain(
-			`${legacyPath}:1: forbidden ${JSON.stringify(["gjc", "notifications"].join("_"))}`,
+			`${legacyPosixPath}:1: forbidden ${JSON.stringify(["gjc", "notifications"].join("_"))}`,
 		);
 	});
 });

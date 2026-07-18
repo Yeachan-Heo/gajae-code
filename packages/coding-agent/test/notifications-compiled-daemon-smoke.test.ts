@@ -7,6 +7,7 @@ import { buildChatDaemonSpawnArgs } from "../src/sdk/bus/chat-daemon-control";
 import { buildTelegramDaemonSpawnArgs, daemonPaths } from "../src/sdk/bus/telegram-daemon";
 
 const repoRoot = path.resolve(import.meta.dir, "../../..");
+const executableSuffix = process.platform === "win32" ? ".exe" : "";
 
 describe("compiled daemon smoke coverage", () => {
 	function tempDir(prefix: string): string {
@@ -100,7 +101,7 @@ describe("compiled daemon smoke coverage", () => {
 			new Response(proc.stderr).text(),
 		]);
 		expect(`${exitCode}\n${stdout}\n${stderr}`).toStartWith("0\n");
-		fs.copyFileSync(path.join(repoRoot, "packages/coding-agent/dist/gjc"), outPath);
+		fs.copyFileSync(path.join(repoRoot, `packages/coding-agent/dist/gjc${executableSuffix}`), outPath);
 		fs.chmodSync(outPath, 0o755);
 	}
 
@@ -175,7 +176,7 @@ describe("compiled daemon smoke coverage", () => {
 	});
 	test("compiled binary preserves the shipped chat worker entrypoint", async () => {
 		const temp = tempDir("gjc-compiled-daemon-binary-");
-		const binaryPath = path.join(temp, "gjc-repro");
+		const binaryPath = path.join(temp, `gjc-repro${executableSuffix}`);
 		try {
 			await buildCompiledDaemonSmokeBinary(binaryPath);
 			const nativeVersion = (

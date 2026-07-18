@@ -139,6 +139,21 @@ function renderTableText(header: string[], aligns: ColumnAlign[], body: string[]
 	const divider = widths.map(w => "-".repeat(w)).join("-|-");
 	return [renderRow(header), divider, ...body.map(renderRow)].join("\n");
 }
+/** Render compact tables as a grid and wide tables as readable Telegram-native records. */
+function renderTelegramTable(header: string[], aligns: ColumnAlign[], body: string[][]): string {
+	const grid = renderTableText(header, aligns, body);
+	if (body.length === 0 || grid.split("\n").every(line => Bun.stringWidth(line) <= 42)) return pre(grid);
+	return body
+		.map(row =>
+			header
+				.map(
+					(label, column) =>
+						`${tag("b", escapeHtml(label || `Column ${column + 1}`))}: ${escapeHtml(row[column] ?? "")}`,
+				)
+				.join("\n"),
+		)
+		.join("\n\n");
+}
 
 /**
  * Replace GFM tables with stashed monospace `<pre>` blocks. Telegram HTML has no
@@ -161,7 +176,7 @@ function convertMarkdownTables(text: string, stash: (html: string) => string): s
 				if (!looksLikeTableRow(row) || isTableSeparator(row)) break;
 				body.push(splitTableRow(row));
 			}
-			out.push(stash(pre(renderTableText(header, aligns, body))));
+			out.push(stash(renderTelegramTable(header, aligns, body)));
 			i = j - 1;
 			continue;
 		}
@@ -172,8 +187,9 @@ function convertMarkdownTables(text: string, stash: (html: string) => string): s
 
 /**
  * Convert a bounded markdown subset into Telegram HTML. Supported: fenced code,
- * inline code, `**bold**`, `*italic*`, `[text](url)` (safe schemes only),
- * `#` headers, `>` blockquotes, and GFM tables (rendered as a monospace block).
+ * inline code, `**bold**`, `*italic*`, `~~strikethrough~~`, `[text](url)`
+ * (safe schemes only), `#` headers, `>` blockquotes, and GFM tables (rendered
+ * as a monospace block).
  * Unsupported or malformed markdown is left as escaped literal text — never
  * emitted as unbalanced tags.
  */
@@ -234,6 +250,7 @@ export function markdownToTelegramHtml(markdown: string): string {
 	// 6. Inline emphasis (bold before italic; unbalanced markers stay literal).
 	text = text.replace(/\*\*([^*\n]+)\*\*/g, (_m, body: string) => tag("b", body));
 	text = text.replace(/\*([^*\n]+)\*/g, (_m, body: string) => tag("i", body));
+	text = text.replace(/~~([^~\n]+)~~/g, (_m, body: string) => tag("s", body));
 
 	// 7. Restore protected placeholders.
 	text = text.replace(

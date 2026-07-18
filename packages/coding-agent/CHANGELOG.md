@@ -4,12 +4,17 @@
 
 ### Fixed
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
-
+- Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
+- Coordinator MCP operational calls now canonically bootstrap or reuse the agent-global SDK broker when discovery is absent or stale, while coordinator/hermes JSON checks report catalog and broker-discovery readiness separately without mutating broker state (#2552).
+- Coordinator MCP question polling now requires a session, reconciles pending workflow gates into bounded public questions, diagnostics, and reconciliation state, and submits bound idempotent answers through `workflow.gate_answer` without exposing private gate payloads (#2550).
+- Runtime skill discovery now follows native user config-root precedence: nearest project, canonical `GJC_CONFIG_DIR`/`PI_CONFIG_DIR`/`.gjc` `agent/skills`, configured legacy `<config>/skills`, then historical legacy `~/.gjc/skills`, preserving exact fallback precedence (#2572).
+- Opt-in stalled team-worker continuation now remains default-off (`GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS=1`) and sends at most two fenced, journaled fixed prompts only to a verified stale worker pane with a matching live claim and sufficient lease; unknown restart state fails closed, with no provider replay, pane lifecycle action, or claim mutation (#2580).
 
 ### Fixed
 - SDK host response delivery to a disconnected client no longer escalates a second structured-error send failure into a process-level unhandled rejection; failures stay local to that connection.
 
 ### Fixed
+- Repository LSP configuration can no longer define process-affecting server behavior: project files may control declarative matching, activation, and capabilities, but cannot set launch fields, initialization options, or opaque server settings. Trusted canonical user configuration outside the project retains those overrides; project-controlled plugin roots and the quarantined `--plugin-dir` surface cannot inject them. Automatic discovery uses trusted external executables and rejects repository-owned lexical paths as well as symlink-resolved project binaries; status uses the session cwd as its lspmux trust root. `GJC_DISABLE_LSPMUX=1` is the canonical opt-out and `PI_DISABLE_LSPMUX=1` is a supported compatibility alias; either truthy value disables lspmux probing and wrapping.
 - Palette slash commands now run only from an empty composer; drafts are never touched.
 - Aborting a session without an enabled active goal no longer suppresses the first reminder when a goal is activated later; active-goal abort suppression is one-shot, goal-owned, and clears across inactive or replacement-goal transitions (#2436).
 - Palette slash submissions no longer clear or rewrite composer text, cursor state, history, or pending images created while an asynchronous input hook is awaiting; canonical keyboard submission cleanup remains unchanged (#2441).
@@ -19,6 +24,9 @@
 ### Added
 - Double-Esc now clears an idle draft after a confirmation hint, saving it to prompt history; from an empty editor it follows the configured tree, branch, or disabled action.
 - Added a searchable command palette with direct action dispatch; slash commands run only from an empty composer, and drafts are never touched.
+- Added deep-interview intent manifests that preserve user-locked artifacts, surfaces, and integrations through Round 0.
+- Added Telegram `/btw <question>` support through the `ephemeral_turn_v1` SDK capability in authorized known private-session topics. It uses current-session context in an isolated side turn without injecting or persisting user or assistant messages in main history, remains available while the main turn is busy, permits two concurrent questions per logical session, and cancels provider work at the 120-second host deadline; `notifications.telegram.btw.enabled` defaults to `true` as the local kill switch.
+- Telegram `/btw` replies now use eligible complete Bot API 10.1 structured Markdown once as `{rich_message:{markdown,skip_entity_detection:true}}`, correlated in the source topic. Tables and math use Telegram Markdown support rather than outgoing native blocks or media; ineligible content and definite rich rejection use correlated HTML, while ambiguous outcomes never retry or fall back and `/rich off` remains HTML-only.
 
 ### Fixed
 
@@ -46,6 +54,7 @@
 - Input-free interactive TTY startup now keeps the TUI reachable when configured model profiles are missing required provider credentials, skips only the blocked profiles, and preserves later `--mpreset` and explicit model/thinking precedence; redirected terminals, input-bearing, resume-continuation, image-only, print/text, and unrelated activation failures remain fail-closed (#2277).
 - Windows Bun runtimes no longer crash while committing the durable workflow-gate store when directory `fsync` reports the unsupported-operation code `EPERM`; unexpected directory-sync failures remain fail-closed.
 - Browser geo settings now propagate coherently across request `Accept-Language`, navigator languages, and `Intl` locale/timezone surfaces; configured managed browsers are isolated by geo/profile posture, concurrent acquisition is serialized, and unset geo preserves Chromium's native locale/timezone instead of injecting a fixed New York profile.
+- Windows startup no longer fails when the platform rejects the workflow-gate store's parent-directory durability sync with `EPERM`; file fsync and atomic replacement remain enforced.
 
 - Cooperative mid-run context maintenance now waits at a cancellation-aware FIFO consumer-drain checkpoint before flushing or rewriting session history. Materialized tool results and steering messages are synchronously canonicalized first; aborted barriers and hook/signal-cancelled compactions settle without rewriting or scheduling a continuation. Promotion, pruning, and compaction each start a clean provider/prompt-cache epoch. Script-aware #2067 unsent-delta accounting remains cache-free and distinct from the lifecycle checkpoint.
 - Classified the cooperative mid-run maintenance driver and token estimator test seams as locked non-public SDK exclusions, restoring deterministic operation-inventory generation and post-merge dev CI coverage.
@@ -147,6 +156,7 @@
 - Cache-miss diagnostics now separate actionable, diagnostic-only, and provider-side-suspected causes instead of asserting a user-side fix for every miss (#2020). A large, costly miss with no cache reads or writes is reported as a neutral `Cache notice` marked "provider-side suspected / not user-actionable" (with what GJC cannot determine) rather than telling the user to keep a stable prefix; a miss with reads but no writes is reported as diagnostic-only without asserting a single cause; and the "cache write without enough matching reads" warning now only fires when reads actually fail to cover the writes. The existing miss cost summary and the #1929/#1936 pricing/provenance safeguards are unchanged.
 
 ### Fixed
+- `/btw` side questions now start independently while the main answer is still streaming, read only committed conversation state, avoid main-session callbacks/history/IRC-roster mutation, disable silent provider retries, and fail the side request visibly if no provider event arrives within 15 seconds.
 
 - Fixed native-Windows coordinator/runtime compatibility by treating psmux's successful empty `list-sessions` response as an absent server while keeping malformed rows fail-closed, reading process incarnations through a validated PowerShell start-time query, sharing the existing BOM-free encoded PowerShell pane command, preserving multiline SDK prompts behind semantic readiness, and retaining runtime command/turn acknowledgement identity across Windows-equivalent workspace paths (#2145).
 - The coordinator MCP owner-server probe now recognizes tmux ≥3.7's missing-server diagnostic (`error connecting to <socket> (No such file or directory)`) as an absent server. tmux 3.7 changed the wording from the older `no server running on <socket>`, which the coordinator probe did not match — so a brand-new coordinator socket (which never has a server yet) was misclassified `unverifiable` instead of `absent`, and **every** `gjc_delegate_*` / session create failed closed with `coordinator_tmux_owner_server_unverifiable` on tmux ≥3.7. The coordinator and `gjc` harness probes now match the same no-server wordings the other owner-isolation probes already did.

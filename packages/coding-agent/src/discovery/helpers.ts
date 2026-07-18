@@ -20,8 +20,6 @@ import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import type { ForkContextPolicy } from "../task/types";
 import { parseThinkingLevel } from "../thinking";
 
-import { buildPluginDirRoot } from "./plugin-dir-roots";
-
 /**
  * Standard paths for each config source.
  */
@@ -900,14 +898,6 @@ export async function listClaudePluginRoots(
 		roots.push(...projectRoots, ...deduped);
 	}
 
-	// Merge --plugin-dir roots (highest precedence) on every fresh load
-	if (injectedPluginDirRoots.length > 0) {
-		const injectedIds = new Set(injectedPluginDirRoots.map(r => r.id));
-		const filtered = roots.filter(r => !injectedIds.has(r.id));
-		roots.length = 0;
-		roots.push(...injectedPluginDirRoots, ...filtered);
-	}
-
 	const result = { roots, warnings };
 	pluginRootsCache.set(cacheKey, result);
 	return result;
@@ -918,7 +908,7 @@ export async function listClaudePluginRoots(
  */
 export function clearClaudePluginRootsCache(): void {
 	pluginRootsCache.clear();
-	preloadedPluginRoots = [...injectedPluginDirRoots];
+	preloadedPluginRoots = [];
 	// Re-warm preloaded roots asynchronously so sync LSP config reads stay valid
 	if (lastPreloadHome) {
 		void preloadPluginRoots(lastPreloadHome, getProjectDir());
@@ -941,7 +931,6 @@ export function clearPluginRootsAndCaches(extraPaths?: readonly string[]): void 
 // getPreloadedPluginRoots(). Safe degradation: empty array if not warmed.
 
 let preloadedPluginRoots: ClaudePluginRoot[] = [];
-let injectedPluginDirRoots: ClaudePluginRoot[] = [];
 let lastPreloadHome: string | undefined;
 
 /**
@@ -961,42 +950,4 @@ export async function preloadPluginRoots(home: string, cwd?: string): Promise<vo
  */
 export function getPreloadedPluginRoots(): readonly ClaudePluginRoot[] {
 	return preloadedPluginRoots;
-}
-
-// ── --plugin-dir injection ──────────────────────────────────────────────────
-
-/**
- * Inject synthetic plugin roots from --plugin-dir paths.
- * These are prepended to the cache with highest precedence (before GJC/Anthropic model entries).
- * Must be called before any listAnthropic modelPluginRoots() access.
- */
-export async function injectPluginDirRoots(home: string, dirs: string[], cwd?: string): Promise<void> {
-	const injected: ClaudePluginRoot[] = [];
-	for (const dir of dirs) {
-		const resolved = path.resolve(dir);
-		// Read plugin name from manifest
-		let pluginName = path.basename(resolved);
-		try {
-			const manifestPath = path.join(resolved, ".claude-plugin", "plugin.json");
-			const content = await Bun.file(manifestPath).text();
-			const manifest = JSON.parse(content);
-			if (typeof manifest.name === "string" && manifest.name) {
-				pluginName = manifest.name;
-			}
-		} catch {
-			// No manifest or invalid — use directory name
-		}
-
-		injected.push(buildPluginDirRoot(resolved, pluginName));
-	}
-
-	// Set injected roots BEFORE populating cache so listAnthropic modelPluginRoots merges them.
-	injectedPluginDirRoots = injected;
-	lastPreloadHome = home; // ensure cache-clear re-warm fires even when injectPluginDirRoots was the startup path
-	// Clear any stale cache entries (populated before injected roots were set).
-	pluginRootsCache.clear();
-	// Rebuild — cache miss triggers fresh load that includes both user+project registries
-	// and prepends injectedPluginDirRoots at highest precedence.
-	const { roots } = await listClaudePluginRoots(home, cwd);
-	preloadedPluginRoots = roots;
 }

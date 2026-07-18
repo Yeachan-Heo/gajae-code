@@ -1,8 +1,10 @@
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $flag, $which, logger } from "@gajae-code/utils";
 import { TOML } from "bun";
 import { spawnOwnedProcess } from "../runtime/process-lifecycle";
+import { isProjectControlledPath } from "./path-trust";
 
 /**
  * lspmux integration for LSP server multiplexing.
@@ -81,6 +83,7 @@ function getConfigPath(): string {
 
 let cachedState: LspmuxState | null = null;
 let cacheTimestamp = 0;
+let cacheCwd: string | null = null;
 
 /**
  * Parse lspmux config.toml file.
@@ -110,7 +113,7 @@ async function checkServerRunning(binaryPath: string): Promise<boolean> {
 		drainStream(proc.stdout);
 		drainStream(proc.stderr);
 
-		let timer: ReturnType<typeof setTimeout> | undefined;
+		let timer: NodeJS.Timeout | undefined;
 		const timeout = new Promise<null>(resolve => {
 			timer = setTimeout(() => resolve(null), LIVENESS_TIMEOUT_MS);
 		});
@@ -147,28 +150,42 @@ function drainStream(stream: ReadableStream<Uint8Array> | null | undefined): voi
 	})();
 }
 
+function resolveTrustedLspmuxBinary(cwd: string): string | null {
+	const discoveredPath = $which("lspmux");
+	if (!discoveredPath) return null;
+	if (isProjectControlledPath(discoveredPath, cwd)) return null;
+
+	try {
+		return fs.realpathSync(discoveredPath);
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Detect lspmux availability and state.
  * Results are cached for STATE_CACHE_TTL_MS.
  *
- * Set PI_DISABLE_LSPMUX=1 to disable.
+ * Set GJC_DISABLE_LSPMUX=1 or PI_DISABLE_LSPMUX=1 to disable.
  */
-export async function detectLspmux(): Promise<LspmuxState> {
+export async function detectLspmux(cwd = process.cwd()): Promise<LspmuxState> {
 	const now = Date.now();
-	if (cachedState && now - cacheTimestamp < STATE_CACHE_TTL_MS) {
-		return cachedState;
-	}
-
-	if ($flag("PI_DISABLE_LSPMUX")) {
+	if ($flag("GJC_DISABLE_LSPMUX") || $flag("PI_DISABLE_LSPMUX")) {
 		cachedState = { available: false, running: false, binaryPath: null, config: null };
 		cacheTimestamp = now;
+		cacheCwd = cwd;
 		return cachedState;
 	}
 
-	const binaryPath = $which("lspmux");
+	if (cachedState && cacheCwd === cwd && now - cacheTimestamp < STATE_CACHE_TTL_MS) {
+		return cachedState;
+	}
+
+	const binaryPath = resolveTrustedLspmuxBinary(cwd);
 	if (!binaryPath) {
 		cachedState = { available: false, running: false, binaryPath: null, config: null };
 		cacheTimestamp = now;
+		cacheCwd = cwd;
 		return cachedState;
 	}
 
@@ -176,12 +193,20 @@ export async function detectLspmux(): Promise<LspmuxState> {
 
 	cachedState = { available: true, running, binaryPath, config };
 	cacheTimestamp = now;
+	cacheCwd = cwd;
 
 	if (running) {
 		logger.debug("lspmux detected and running", { binaryPath });
 	}
 
 	return cachedState;
+}
+
+/** Reset cached lspmux detection state for focused tests. */
+export function resetLspmuxStateForTesting(): void {
+	cachedState = null;
+	cacheTimestamp = 0;
+	cacheCwd = null;
 }
 
 // =============================================================================
@@ -251,7 +276,11 @@ export function wrapWithLspmux(
  * @param args - Original command arguments
  * @returns Command and args to use (possibly wrapped with lspmux)
  */
-export async function getLspmuxCommand(command: string, args?: string[]): Promise<LspmuxWrappedCommand> {
-	const state = await detectLspmux();
+export async function getLspmuxCommand(
+	command: string,
+	args?: string[],
+	cwd = process.cwd(),
+): Promise<LspmuxWrappedCommand> {
+	const state = await detectLspmux(cwd);
 	return wrapWithLspmux(command, args, state);
 }

@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "story": "G004",
+  "e2eStatus": "not-run (no standalone end-to-end TUI invocation was assigned; focused component and session suites were run)",
+  "redTeamStatus": "blocker-found",
+  "counts": {
+    "redTeamTests": 7,
+    "focusedTests": 21,
+    "passing": 28,
+    "failing": 0,
+    "blockers": 1
+  },
+  "suites": [
+    {
+      "command": "bun --cwd packages/coding-agent test test/g004-ws3-redteam.test.ts",
+      "status": "passed",
+      "tests": 7
+    },
+    {
+      "command": "bun --cwd packages/coding-agent test test/tasks-aggregator.test.ts test/tasks-pane.test.ts test/cancel-and-submit.test.ts test/queue-pane.test.ts test/background-fold.test.ts",
+      "status": "passed",
+      "tests": 21
+    }
+  ],
+  "adversarialCases": [
+    {
+      "case": "Subagent merge, paused manager-only mapping, and registry eviction fallback",
+      "status": "passed",
+      "evidence": "g004-ws3-redteam.test.ts: joins one registry-wins row, maps paused to waiting, and reverts dual to manager queued/waiting after registry removal."
+    },
+    {
+      "case": "Failure precedence, acknowledgement, post-ack eviction, re-latch, and monitor badge refresh",
+      "status": "passed",
+      "evidence": "g004-ws3-redteam.test.ts verifies failed > running, a changed monitor-output line count, tombstone removal, and new failed monitor latch."
+    },
+    {
+      "case": "Empty task pane and task action under transcript viewer",
+      "status": "passed-with-observation",
+      "evidence": "Empty pane renders No tasks safely. InputController dispatches alt+t task action even when isTranscriptViewerOpen() is true; modality/exclusivity is delegated to the outer selector controller, not enforced by InputController."
+    },
+    {
+      "case": "cancelAndSubmit duplicate, compaction, rollback timeout/error cause, suppression, hidden next-turn byte preservation, and single commit consumption",
+      "status": "passed",
+      "evidence": "Existing cancel-and-submit.test.ts passed all 14 scenarios, including the required seams and rollback/commit invariants."
+    },
+    {
+      "case": "Queue send-now availability and composer priority",
+      "status": "passed",
+      "evidence": "g004-ws3-redteam.test.ts verifies empty queue is unavailable and composer text wins without dequeuing queue head."
+    },
+    {
+      "case": "Queue head during rollback",
+      "status": "blocker-found",
+      "evidence": "Reproduction test documents the current loss: InputController.sendNow removes queue head before session.cancelAndSubmit. A rolled_back timeout only restores AgentSession's post-removal snapshot, leaving the UI queue empty."
+    }
+  ],
+  "verdicts": {
+    "tasksAggregator": "pass",
+    "tasksPane": "pass with overlay-modality observation",
+    "cancelAndSubmit": "pass",
+    "queuePane": "blocked by send-now rollback data loss",
+    "backgroundFold": "pass"
+  },
+  "blockers": [
+    {
+      "id": "G004-WS3-RT-01",
+      "severity": "high",
+      "title": "Queue head is lost after send-now rollback",
+      "repro": [
+        "Start streaming with an empty composer and one visible queued message.",
+        "Invoke InputController.sendNow().",
+        "Make AgentSession.cancelAndSubmit return { kind: 'rolled_back', outcome: { kind: 'timeout' } }.",
+        "Observe that sendNow called removeQueuedMessageForEditing before cancelAndSubmit, and the queued message is absent after the rollback."
+      ],
+      "expected": "Rollback restores the queue head exactly as it was before send-now.",
+      "actual": "The queue head is removed before AgentSession snapshots queues; rollback restores only that already-mutated state.",
+      "source": "packages/coding-agent/src/modes/controllers/input-controller.ts:871-878"
+    }
+  ]
+}

@@ -265,8 +265,11 @@ function createGoalTuiRuntime(goalModeEnabled: boolean) {
 	const addToHistory = vi.fn();
 	const setText = vi.fn();
 	const ctx = {
-		goalModeEnabled,
-		handleGoalModeCommand,
+		goalModeController: {
+			enabled: goalModeEnabled,
+			paused: false,
+			handleCommand: handleGoalModeCommand,
+		},
 		editor: { addToHistory, setText },
 	} as unknown as InteractiveModeContext;
 

@@ -41,6 +41,7 @@ interface AppKeybindings {
 	"app.session.fork": true;
 	"app.session.resume": true;
 	"app.session.observe": true;
+	"app.session.dashboard": true;
 	"app.jobs.open": true;
 	"app.session.togglePath": true;
 	"app.session.toggleSort": true;
@@ -53,6 +54,13 @@ interface AppKeybindings {
 	"app.history.search": true;
 	"app.stt.toggle": true;
 	"app.irc.sidebar.toggle": true;
+	"app.transcript.browse": true;
+	"app.transcript.prevTurn": true;
+	"app.transcript.nextTurn": true;
+	"app.mode.cycle": true;
+	"app.tasks.toggle": true;
+	"app.queue.togglePane": true;
+	"app.message.sendNow": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
@@ -63,6 +71,10 @@ declare module "@gajae-code/tui" {
 
 export function defaultMessageQueueKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId {
 	return platform === "win32" || platform === "darwin" ? "alt+q" : "alt+enter";
+}
+
+export function defaultClipboardPasteImageKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId {
+	return platform === "win32" ? "alt+v" : "ctrl+v";
 }
 
 /**
@@ -139,7 +151,7 @@ export const KEYBINDINGS = {
 		description: "Select queued message to edit",
 	},
 	"app.clipboard.pasteImage": {
-		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
+		defaultKeys: defaultClipboardPasteImageKeysForPlatform(),
 		description: "Paste image from clipboard",
 	},
 	"app.clipboard.copyLine": {
@@ -169,6 +181,10 @@ export const KEYBINDINGS = {
 	"app.session.observe": {
 		defaultKeys: "ctrl+s",
 		description: "Observe subagent sessions",
+	},
+	"app.session.dashboard": {
+		defaultKeys: [],
+		description: "Show all persisted sessions dashboard",
 	},
 
 	"app.jobs.open": {
@@ -218,6 +234,34 @@ export const KEYBINDINGS = {
 	"app.irc.sidebar.toggle": {
 		defaultKeys: "alt+i",
 		description: "Toggle IRC sidebar",
+	},
+	"app.transcript.browse": {
+		defaultKeys: [],
+		description: "Browse the transcript",
+	},
+	"app.transcript.prevTurn": {
+		defaultKeys: [],
+		description: "Jump to previous user turn",
+	},
+	"app.transcript.nextTurn": {
+		defaultKeys: [],
+		description: "Jump to next user turn",
+	},
+	"app.mode.cycle": {
+		defaultKeys: [],
+		description: "Cycle interaction mode",
+	},
+	"app.tasks.toggle": {
+		defaultKeys: "alt+t",
+		description: "Toggle tasks pane",
+	},
+	"app.queue.togglePane": {
+		defaultKeys: [],
+		description: "Toggle message queue pane",
+	},
+	"app.message.sendNow": {
+		defaultKeys: [],
+		description: "Send message immediately",
 	},
 } as const satisfies KeybindingDefinitions;
 

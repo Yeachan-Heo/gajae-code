@@ -1,0 +1,67 @@
+{
+  "cases": [
+    {
+      "id": "four-named-regression-suite",
+      "claim": "The four named regression test files pass with 79 pass, 0 fail, and 2 skip.",
+      "method": "Ran the exact requested Bun command.",
+      "actual": "77 pass, 2 skip, 2 fail across 81 tests. Both failures are in packages/coding-agent/test/compaction.test.ts: remote compaction setting > forwards an explicit initiator override to local summarization requests (expected completeSimpleSpy 3 calls, received 2), and remote compaction setting > uses local summarization when remote compaction is disabled (expected completeSpy 3 calls, received 2).",
+      "verdict": "fail"
+    },
+    {
+      "id": "midrun-regression-suite-and-trigger-coverage",
+      "claim": "The existing mid-run compaction and maintenance regression suites exist and cover corrected threshold trigger behavior.",
+      "method": "Read both test files; searched their test descriptions/assertions for threshold and mid-run behavior; ran each file independently.",
+      "actual": "Both files exist. agent-session-midrun-compaction.test.ts contains the threshold-trigger scenario \"runs threshold maintenance mid-loop and resumes without a provider overflow\" and asserts a \"threshold\" compaction reason; it passed 18 tests, 0 fail. agent-session-midrun-maintenance.test.ts covers below, exactly-at, and above-threshold outcomes; it passed 13 tests, 0 fail.",
+      "verdict": "pass"
+    },
+    {
+      "id": "mined-postfix-reactive-and-premature-distribution",
+      "claim": "Mined data has zero reactive compactions from 2026-07-15 onward and 16 of 228 premature records that are temporally non-clustered.",
+      "method": "Parsed artifacts/compaction-mining-v2.json with Python; filtered compactionEvidence by classification and UTC timestamp, and computed premature record dates and Monday week starts.",
+      "actual": "228 total records; 0 reactive records with timestamp >= 2026-07-15; 16 premature records. Premature dates span 2026-06-18 through 2026-07-16 and five week starts: 2026-06-15, 2026-06-22, 2026-06-29, 2026-07-06, 2026-07-13.",
+      "verdict": "pass"
+    },
+    {
+      "id": "threshold-math",
+      "claim": "Default thresholds are 323000 for a 380000-token window and 340000 for a 400000-token window using window - max(floor(0.15 * window), 16384).",
+      "method": "Ran deterministic Bun arithmetic assertions.",
+      "actual": "380000: 323000; 400000: 340000.",
+      "verdict": "pass"
+    },
+    {
+      "id": "referenced-artifact-existence",
+      "claim": "All four evidence artifacts referenced by the conclusion document exist.",
+      "method": "Read each referenced artifact from the worktree.",
+      "actual": "Present and readable: artifacts/compaction-mining-v2.json, artifacts/compaction-frequency-analysis-v2.md, artifacts/compaction-root-cause-report.md, artifacts/g002-root-cause-qa-report.json.",
+      "verdict": "pass"
+    }
+  ],
+  "overall": "fail: the conclusion's current-state assertion that the exact four-file Bun command yields 79 pass and 0 fail does not hold in this worktree; it yielded 77 pass, 2 skip, and 2 fail. All other checked claims passed.",
+  "commands": [
+    {
+      "command": "bun test packages/coding-agent/test/compaction.test.ts packages/coding-agent/test/agent-session-context-usage-ssot.test.ts packages/coding-agent/test/context-usage-ssot-redteam.test.ts packages/coding-agent/test/agent-session-midrun-compaction.test.ts",
+      "exitCode": 1,
+      "result": "77 pass, 2 skip, 2 fail"
+    },
+    {
+      "command": "bun test packages/coding-agent/test/agent-session-midrun-compaction.test.ts",
+      "exitCode": 0,
+      "result": "18 pass, 0 fail"
+    },
+    {
+      "command": "bun test packages/coding-agent/test/agent-session-midrun-maintenance.test.ts",
+      "exitCode": 0,
+      "result": "13 pass, 0 fail"
+    },
+    {
+      "command": "python3 -c '<parse compaction-mining-v2.json and filter evidence>'",
+      "exitCode": 0,
+      "result": "228 records; 0 reactive at/after 2026-07-15; 16 premature spanning five Monday weeks"
+    },
+    {
+      "command": "bun -e '<compute threshold formula for 380000 and 400000>'",
+      "exitCode": 0,
+      "result": "380000: 323000; 400000: 340000"
+    }
+  ]
+}

@@ -50,6 +50,71 @@ function rateLimitStream(model: Model): AssistantMessageEventStream {
 	return stream;
 }
 
+function typedRateLimitStream(
+	model: Model,
+	retryAfterMs: number,
+	errorMessage = "rate limit exceeded",
+): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage & {
+			transportFailure: { kind: "transport"; status: number; headers: Record<string, string> };
+		} = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage,
+			errorStatus: 429,
+			timestamp: Date.now(),
+			transportFailure: { kind: "transport", status: 429, headers: { "retry-after-ms": String(retryAfterMs) } },
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+
+function typedOpaqueOverflowStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage & {
+			transportFailure: { kind: "transport"; status: number; openaiErrorCode: string };
+		} = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "",
+			errorStatus: 400,
+			timestamp: Date.now(),
+			transportFailure: { kind: "transport", status: 400, openaiErrorCode: "context_length_exceeded" },
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
 function successfulStream(model: Model, content = "Recovered"): AssistantMessageEventStream {
 	return createMockModel({ responses: [{ content: [content] }] }).stream(model, {
 		systemPrompt: [],
@@ -124,6 +189,144 @@ describe("AgentSession managed fallback upstream request counts", () => {
 		}
 	});
 
+	it("keeps an opaque typed overflow budget-neutral before one rate limit advances N=1", async () => {
+		const calls: StreamCall[] = [];
+		const fallbackSwitches: Array<Extract<AgentSessionEvent, { type: "model_fallback_switched" }>> = [];
+		const events: AgentSessionEvent[] = [];
+		let primaryCalls = 0;
+		const { primary, fallback } = createSession(1, (model, context, options) => {
+			calls.push({
+				selector: selector(model),
+				fallbackManaged: options?.fallbackManaged,
+				fallbackAttempt: options?.fallbackAttempt,
+			});
+			if (selector(model) === selector(primary)) {
+				primaryCalls += 1;
+				return primaryCalls === 1 ? typedOpaqueOverflowStream(model) : typedRateLimitStream(model, 50);
+			}
+			return createMockModel({ responses: [{ content: ["Recovered after rate limit"] }] }).stream(
+				model,
+				context,
+				options,
+			);
+		});
+		const suppressSpy = vi.spyOn(modelRegistry, "suppressSelector");
+		session!.subscribe(event => {
+			events.push(event);
+			if (event.type === "model_fallback_switched") fallbackSwitches.push(event);
+		});
+
+		await session!.prompt("Recover through managed overflow maintenance");
+		await session!.waitForIdle();
+
+		expect(calls.map(call => call.selector)).toEqual([selector(primary), selector(primary), selector(fallback)]);
+		expect(calls.map(call => call.fallbackManaged)).toEqual([true, true, true]);
+		const attemptIds = calls.map(call => (call.fallbackAttempt as { attemptId: string }).attemptId);
+		expect(new Set(attemptIds).size).toBe(3);
+		expect(suppressSpy).toHaveBeenCalledTimes(1);
+		expect(suppressSpy).toHaveBeenCalledWith(selector(primary), expect.any(Number));
+		expect(fallbackSwitches).toEqual([
+			expect.objectContaining({
+				from: selector(primary),
+				to: selector(fallback),
+				reason: "rate_limit",
+				attemptsUsed: 1,
+			}),
+		]);
+		const assistantLifecycle = events.filter(
+			event =>
+				(event.type === "message_start" || event.type === "message_update" || event.type === "message_end") &&
+				"message" in event &&
+				event.message.role === "assistant",
+		);
+		expect(assistantLifecycle.filter(event => event.type === "message_start")).toHaveLength(1);
+		expect(assistantLifecycle.filter(event => event.type === "message_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "agent_end")).toEqual([
+			expect.objectContaining({ stopReason: "completed" }),
+		]);
+		expect(session!.messages.filter(message => message.role === "user")).toHaveLength(1);
+		expect(session!.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("advances typed 429 with hostile overflow prose without running maintenance", async () => {
+		const calls: string[] = [];
+		const events: AgentSessionEvent[] = [];
+		const { primary, fallback } = createSession(1, (model, context, options) => {
+			calls.push(selector(model));
+			return selector(model) === selector(primary)
+				? typedRateLimitStream(model, 50, "context_length_exceeded: context window exceeded")
+				: createMockModel({ responses: [{ content: ["Recovered after typed rate limit"] }] }).stream(
+						model,
+						context,
+						options,
+					);
+		});
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Advance despite hostile overflow prose");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
+		expect(events).toContainEqual(
+			expect.objectContaining({ type: "model_fallback_switched", reason: "rate_limit", attemptsUsed: 1 }),
+		);
+	});
+
+	it("bounds repeated overflow maintenance within one logical run", async () => {
+		const calls: string[] = [];
+		const events: AgentSessionEvent[] = [];
+		const { primary, fallback } = createSession(1, model => {
+			calls.push(selector(model));
+			return typedOpaqueOverflowStream(model);
+		});
+		session!.subscribe(event => events.push(event));
+
+		await session!.prompt("Stop after bounded overflow maintenance");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(primary)]);
+		expect(calls).not.toContain(selector(fallback));
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+		});
+	});
+	it("preserves a prior fallback charge across overflow maintenance", async () => {
+		const calls: string[] = [];
+		const fallbackSwitches: Array<Extract<AgentSessionEvent, { type: "model_fallback_switched" }>> = [];
+		let primaryCalls = 0;
+		const { primary, fallback } = createSession(2, (model, context, options) => {
+			calls.push(selector(model));
+			if (selector(model) === selector(primary)) {
+				primaryCalls += 1;
+				if (primaryCalls === 2) return typedOpaqueOverflowStream(model);
+				return rateLimitStream(model);
+			}
+			return createMockModel({ responses: [{ content: ["Recovered with preserved budget"] }] }).stream(
+				model,
+				context,
+				options,
+			);
+		});
+		session!.subscribe(event => {
+			if (event.type === "model_fallback_switched") fallbackSwitches.push(event);
+		});
+
+		await session!.prompt("Keep the first policy charge across overflow");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(primary), selector(primary), selector(fallback)]);
+		expect(fallbackSwitches).toEqual([
+			expect.objectContaining({
+				reason: "rate_limit",
+				attemptsUsed: 2,
+				from: selector(primary),
+				to: selector(fallback),
+			}),
+		]);
+	});
 	it("N=3 performs exactly three upstream attempts before switching and reports attemptsUsed", async () => {
 		const calls: StreamCall[] = [];
 		const fallbackSwitches: Array<Extract<AgentSessionEvent, { type: "model_fallback_switched" }>> = [];
@@ -165,6 +368,33 @@ describe("AgentSession managed fallback upstream request counts", () => {
 				attemptsUsed: 3,
 			}),
 		]);
+	});
+
+	it("suppresses the rate-limited head and returns to it when the cooldown expires", async () => {
+		const calls: string[] = [];
+		let primaryAttempts = 0;
+		const { primary, fallback } = createSession(1, (model, _context, _options) => {
+			calls.push(selector(model));
+			if (selector(model) === selector(primary) && primaryAttempts++ === 0) {
+				return typedRateLimitStream(model, 1);
+			}
+			return successfulStream(model, "Recovered");
+		});
+		const suppressSpy = vi.spyOn(modelRegistry, "suppressSelector");
+
+		await session!.prompt("Switch after a rate limit");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		expect(suppressSpy).toHaveBeenCalledWith(selector(primary), expect.any(Number));
+		expect(modelRegistry.getSelectorSuppressionStatus(selector(fallback))).toBe("none");
+		await Bun.sleep(5);
+
+		await session!.prompt("Return after cooldown expiry");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(fallback), selector(primary)]);
+		expect(session!.model).toMatchObject({ provider: primary.provider, id: primary.id });
 	});
 
 	it("emits one switch when an exhausted chain restarts with an unavailable head", async () => {

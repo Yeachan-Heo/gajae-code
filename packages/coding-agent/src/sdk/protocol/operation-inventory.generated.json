@@ -1625,17 +1625,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "interactive diagnostics command; session on/off delegate to the notifications extension, not an SDK ingress seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:settings",
@@ -1643,17 +1636,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:theme",
@@ -1661,17 +1647,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:pet",
@@ -1679,17 +1658,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:goal",
@@ -1787,17 +1759,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:dump",
@@ -1854,6 +1819,17 @@
 		]
 	},
 	{
+		"sourceId": "slash_command:transcript",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "exclude",
+		"rationale": "visual/local-only transcript viewer, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "slash_command:context",
 		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
 		"sourceKind": "slash_command",
@@ -1895,17 +1871,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:help",
@@ -1913,17 +1882,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:hotkeys",
@@ -1931,17 +1893,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:tools",
@@ -1967,17 +1922,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:monitors",
@@ -1985,17 +1933,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:tree",
@@ -2003,17 +1944,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:provider",
@@ -2021,17 +1955,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:login",
@@ -2057,17 +1984,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:ssh",
@@ -2075,17 +1995,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:clear",
@@ -2129,17 +2042,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:compact",
@@ -2165,17 +2071,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:resume",
@@ -2196,22 +2095,26 @@
 		]
 	},
 	{
+		"sourceId": "slash_command:sessions",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "exclude",
+		"rationale": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "slash_command:btw",
 		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:retry",
@@ -2255,17 +2158,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:memory",
@@ -2273,17 +2169,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "slash_command:rename",
@@ -2327,17 +2216,10 @@
 		"sourceKind": "slash_command",
 		"decision": "exclude",
 		"rationale": "visual/local-only command, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:constructor",
@@ -2345,17 +2227,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:nextToolChoice",
@@ -2363,17 +2238,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setForcedToolChoice",
@@ -2381,17 +2249,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getActiveSkillState",
@@ -2399,17 +2260,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getActiveSkillPhase",
@@ -2417,17 +2271,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:peekQueueInvoker",
@@ -2435,17 +2282,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:peekStandingResolveHandler",
@@ -2453,17 +2293,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setStandingResolveHandler",
@@ -2471,17 +2304,21 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:setSdkPlanModeHandler",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal host lifecycle plumbing for mode.plan.set",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:beginTemporaryProviderSessionScope",
@@ -2489,17 +2326,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal temporary model/provider restoration scope, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:restoreTemporaryProviderSessionScope",
@@ -2507,17 +2337,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal temporary model/provider restoration scope, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:commitTemporaryProviderSessionScope",
@@ -2525,17 +2348,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal temporary model/provider restoration scope, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:buildForkContextSeed",
@@ -2543,17 +2359,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getHindsightSessionState",
@@ -2561,17 +2370,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setHindsightSessionState",
@@ -2579,17 +2381,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:markPlanCompactAbortPending",
@@ -2597,17 +2392,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:clearPlanCompactAbortPending",
@@ -2615,17 +2403,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:enqueueCustomMessageDisplay",
@@ -2633,17 +2414,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getAgentId",
@@ -2651,17 +2425,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getAsyncJobSnapshot",
@@ -2687,17 +2454,21 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:awaitPendingContextTransformations",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:subscribe",
@@ -2705,17 +2476,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:dispose",
@@ -2723,17 +2487,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:closeWriterStrict",
@@ -2741,17 +2498,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal ACP lifecycle teardown plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:disposeChildSubprocesses",
@@ -2759,17 +2509,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:waitForIdle",
@@ -2777,17 +2520,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:drainAsyncJobDeliveriesForAcp",
@@ -2795,17 +2531,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getAsyncDeliveryStateForAcp",
@@ -2813,17 +2542,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal ACP lifecycle quiescence plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getLastAssistantMessage",
@@ -2867,17 +2589,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:registerForegroundBashBackgroundRequestHandler",
@@ -2885,17 +2600,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:hasForegroundBashBackgroundRequestHandler",
@@ -2903,17 +2611,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setSdkPermissionMode",
@@ -2939,17 +2640,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal reverse-provider plumbing, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:requestForegroundBashBackground",
@@ -2957,17 +2651,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getAllToolNames",
@@ -2993,17 +2680,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:isToolDiscoveryEnabled",
@@ -3011,17 +2691,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getDiscoverableTools",
@@ -3047,17 +2720,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getSelectedDiscoveredToolNames",
@@ -3065,17 +2731,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:activateDiscoveredTools",
@@ -3083,17 +2742,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:refreshSshTool",
@@ -3101,17 +2753,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setActiveToolsByName",
@@ -3137,17 +2782,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:refreshMCPTools",
@@ -3155,17 +2793,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:refreshGjcSubskillTools",
@@ -3173,17 +2804,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:continuePersistedHistory",
@@ -3191,17 +2815,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal startup lifecycle plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:buildDisplaySessionContext",
@@ -3209,17 +2826,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:convertMessagesToLlm",
@@ -3227,17 +2837,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:prepareSimpleStreamOptions",
@@ -3245,17 +2848,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getPlanModeState",
@@ -3263,17 +2859,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getSdkConfigItems",
@@ -3299,17 +2888,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:invokeSkill",
@@ -3407,17 +2989,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setGoalModeState",
@@ -3425,17 +3000,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getWorkflowGateEmitter",
@@ -3443,17 +3011,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getAskAnswerSource",
@@ -3461,17 +3022,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setWorkflowGateEmitter",
@@ -3479,17 +3033,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:markPlanReferenceSent",
@@ -3497,17 +3044,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setPlanReferencePath",
@@ -3515,17 +3055,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setClientBridge",
@@ -3533,17 +3066,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getCheckpointState",
@@ -3551,17 +3077,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setCheckpointState",
@@ -3569,17 +3088,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:sendPlanModeContext",
@@ -3587,17 +3099,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:sendGoalModeContext",
@@ -3605,17 +3110,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:resolveRoleModel",
@@ -3623,17 +3121,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:resolveRoleModelWithThinking",
@@ -3641,17 +3132,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setSlashCommands",
@@ -3659,17 +3143,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setMCPPromptCommands",
@@ -3677,17 +3154,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:prompt",
@@ -3713,17 +3183,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal custom-message plumbing, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:steer",
@@ -3767,17 +3230,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:queueDeferredMessageForTests",
@@ -3785,17 +3241,32 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:getPendingNextTurnMessagesForTests",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "read-only test seam, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:setCancelAndSubmitAbortOutcomeProviderForTests",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "test-only cancellation seam, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:sendCustomMessage",
@@ -3803,17 +3274,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal custom-message plumbing, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:purgeQueuedCustomMessages",
@@ -3821,17 +3285,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:sendUserMessage",
@@ -3857,17 +3314,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getQueuedMessages",
@@ -3947,17 +3397,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getTodoPhases",
@@ -4001,17 +3444,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:activeMidRunBarrierCountForTests",
@@ -4019,17 +3455,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "read-only test seam, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:activeMidRunMaintenanceCountForTests",
@@ -4037,17 +3466,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "read-only test seam, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:runMidRunMaintenanceForTests",
@@ -4055,17 +3477,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "test-only maintenance seam, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:estimateMidRunContextTokensForTests",
@@ -4073,17 +3488,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "test-only estimator seam, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:abort",
@@ -4102,6 +3510,17 @@
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
 		]
+	},
+	{
+		"sourceId": "agent_session:cancelAndSubmit",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "interactive queue transaction plumbing, not an independent SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:newSession",
@@ -4199,17 +3618,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getActiveModelProfile",
@@ -4217,17 +3629,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getConfiguredModelChain",
@@ -4235,17 +3640,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal profile and fallback-chain state, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setConfiguredModelChain",
@@ -4253,17 +3651,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal profile and fallback-chain state, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setDefaultFallbackRuntimeModel",
@@ -4271,17 +3662,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal fallback runtime bookkeeping, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:seedDefaultFallbackResolution",
@@ -4289,17 +3673,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal fallback resolution bookkeeping, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getSessionDefaultModelSelector",
@@ -4307,17 +3684,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:recordResumeDefaultModel",
@@ -4325,17 +3695,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setModelTemporary",
@@ -4343,17 +3706,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setModelTemporaryForControl",
@@ -4361,17 +3717,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal Telegram control wrapper over the reviewed model.set seam, not an independent public SDK operation",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setDefaultModelSelection",
@@ -4410,22 +3759,26 @@
 		]
 	},
 	{
+		"sourceId": "agent_session:getRoleModelCycleCandidateCount",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal role-model display accessor, not a user-facing SDK seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:cycleRoleModels",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getAvailableModels",
@@ -4469,17 +3822,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal Telegram control wrapper over the reviewed thinking.set seam, not an independent public SDK operation",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getThinkingScopeForControl",
@@ -4487,17 +3833,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal Telegram control status accessor, not a user-facing SDK operation seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getThinkingVisibility",
@@ -4505,17 +3844,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal extension and Telegram display accessor, not a user-facing SDK operation seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setThinkingVisibility",
@@ -4523,17 +3855,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal extension display mutation without a public SDK registry operation",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setThinkingVisibilityForControl",
@@ -4541,17 +3866,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal Telegram control wrapper over display state, not an independent public SDK operation",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:cycleThinkingLevel",
@@ -4577,17 +3895,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:isFastForProvider",
@@ -4595,17 +3906,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:isFastForSubagentProvider",
@@ -4613,17 +3917,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:isFastModeActive",
@@ -4631,17 +3928,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setServiceTier",
@@ -4703,17 +3993,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setSteeringMode",
@@ -4793,17 +4076,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:runIdleCompaction",
@@ -4811,17 +4087,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:abortBranchSummary",
@@ -4829,17 +4098,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:abortHandoff",
@@ -4847,17 +4109,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:handoff",
@@ -4883,17 +4138,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setResourceSampler",
@@ -4901,17 +4149,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setRetainedMemorySampler",
@@ -4919,17 +4160,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:setAutoCompactionEnabled",
@@ -5045,17 +4279,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:abortBash",
@@ -5081,17 +4308,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:assertEvalExecutionAllowed",
@@ -5099,17 +4319,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:trackEvalExecution",
@@ -5117,17 +4330,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal execution bookkeeping, not a user-facing SDK control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:recordPythonResult",
@@ -5135,17 +4341,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:abortEval",
@@ -5153,17 +4352,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:respondAsBackground",
@@ -5171,17 +4363,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:emitIrcRelayObservation",
@@ -5189,17 +4374,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:emitSubagentSteerObservation",
@@ -5207,17 +4385,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:emitSubagentSteerRelayObservation",
@@ -5225,17 +4396,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:runEphemeralTurn",
@@ -5243,17 +4407,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:reload",
@@ -5315,17 +4472,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getUserMessagesForBranching",
@@ -5387,17 +4537,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "test-only observability, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:fetchUsageReports",
@@ -5423,17 +4566,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal Telegram control wrapper over the reviewed usage.get seam, not an independent public SDK operation",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:exportToHtml",
@@ -5477,17 +4613,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getLastVisibleHandoffText",
@@ -5495,17 +4624,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:formatSessionAsText",
@@ -5549,17 +4671,10 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:registerBeforeAgentStartContributor",
@@ -5567,16 +4682,9 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
-		"adapterMappings": {
-			"telegram": "generic_safe",
-			"discord": "generic_safe",
-			"slack": "generic_safe",
-			"mcp": "generic_safe",
-			"acp": "generic_safe",
-			"daemonCli": "generic_safe"
-		},
-		"testIds": [
-			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
-		]
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	}
 ]

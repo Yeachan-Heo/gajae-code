@@ -1,0 +1,70 @@
+{
+ "schemaVersion": 1,
+ "kind": "api-package-test-report",
+ "commit": "3e23f132",
+ "status": "passed",
+ "commands": [
+  {
+   "command": "bun test packages/coding-agent/test/interactive-mode-plan-review.test.ts packages/coding-agent/test/plan-preview-overlay.test.ts packages/coding-agent/test/input-controller-escape.test.ts packages/coding-agent/test/input-controller-keybindings.test.ts packages/coding-agent/test/input-controller-skill-queue.test.ts packages/coding-agent/test/interactive-mode-issue-2261-new-session.test.ts packages/coding-agent/test/interactive-mode-lsp-startup.test.ts",
+   "verdict": "passed",
+   "evidence": "150 pass, 0 fail, 562 expect() calls across 7 files."
+  },
+  {
+   "command": "bun test packages/coding-agent/test/modes/controllers/*.test.ts",
+   "verdict": "passed",
+   "evidence": "91 pass, 0 fail, 856 expect() calls across 21 files."
+  },
+  {
+   "command": "bun run check",
+   "verdict": "excluded-environment-baseline",
+   "evidence": "All earlier check stages passed, including Biome (2,918 files), declaration checks, schemas, SDK closure, and Rust check. The only failure was sdk-host-wiring Q17 when Darwin resolves /var as a reparse/symlink path: packages/coding-agent/src/session/session-storage.ts:368 throws 'Unsafe reparse storage path: /var' for packages/coding-agent/test/sdk-host-wiring.test.ts:2189."
+  },
+  {
+   "command": "bun test packages/coding-agent/test/goals/goal-continuation-timeout-loop.test.ts",
+   "verdict": "excluded-pre-change-baseline",
+   "evidence": "At fa024c32: 8 pass, 2 fail (repeated-timeout attention status; end-only unmatched tool event). The identical command at pre-change baseline 5a478428 produced the identical 8 pass, 2 fail, and 120 expect() calls, proving these failures predate the refactor."
+  }
+ ],
+ "cases": [
+  {
+   "id": "mode-gate-single-owner",
+   "verdict": "passed",
+   "evidence": "packages/coding-agent/test/modes/controllers/mode-gate.test.ts passed under the controller suite: goal re-entry succeeds, competing plan entry returns false, active owner remains goal, and only its own exit releases the gate. Plan and goal controllers reject a competing active mode with explicit warnings; SDK plan entry additionally rejects with Error.code='conflict' at packages/coding-agent/src/modes/interactive-mode.ts:399-418."
+  },
+  {
+   "id": "delegate-wall-removed",
+   "verdict": "passed",
+   "evidence": "Source scan of packages/coding-agent/src/modes/interactive-mode.ts found no handlePlanModeCommand, handleGoalModeCommand, planModeEnabled, goalModeEnabled, planModePaused, or goalModePaused forwarding members. Consumers use capabilities: input-controller.ts:100-101 and :624 delegate to planModeController; event-controller.ts:806 and :823 delegate to planModeController."
+  },
+  {
+   "id": "plan-preview-snapshot-invalidation-reopen-and-audit",
+   "verdict": "passed",
+   "evidence": "Focused plan-preview and interactive plan-review tests passed. plan-preview-overlay.test.ts:93-120 verifies editor refresh produces a new snapshot hash and clears stale comments. interactive-mode-plan-review.test.ts:249-324 verifies stale review material is discarded and each decision variant reopens without adding an approval audit; :226-247 verifies serialized review comments and the audit entry."
+  },
+  {
+   "id": "stt-mic-animation-controller-ownership",
+   "verdict": "passed",
+   "evidence": "InteractiveMode source scan found no mic animation implementation. packages/coding-agent/src/modes/controllers/stt-controller.ts:29-30 owns STTController and animation interval; :70-88 starts, updates, and clears the mic animation."
+  },
+  {
+   "id": "test-contract-preservation",
+   "verdict": "passed",
+   "evidence": "git diff --unified=0 5a478428 fa024c32 -- packages/coding-agent/test showed only call-site/property migration from InteractiveMode forwarding members to controller capabilities and fixture-context capability fields. No expect assertion was removed or weakened; git diff --check was clean."
+  },
+  {
+   "id": "target-integrity",
+   "verdict": "passed",
+   "evidence": "git rev-parse HEAD returned fa024c3224ccf15f0f5410f08e6a05b148d58d34 before QA. No production source or .gjc files were edited; this receipt is the sole target-worktree change."
+  }
+ ],
+ "summary": {
+  "passedCommands": 2,
+  "excludedCommands": 2,
+  "failedCommands": 0,
+  "passedCases": 6,
+  "failedCases": 0
+ },
+ "notes": [
+  "Leader update: architect re-review at 3e23f132 APPROVE all-CLEAR after three blocker fixes (goal-continuation timeout-hold guard ported into GoalModeController with goal-loop suite fully green 27/0; plan abort timeout restored to shared 5000ms constant; ModeGate driven from goal_updated with tool-created-goal regression). The earlier classification of the 2 goal-loop failures as baseline was corrected: they were branch regressions, now fixed."
+ ]
+}

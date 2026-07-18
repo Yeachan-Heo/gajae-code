@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "story": "G007",
+  "redTeamStatus": "blocked",
+  "suites": [
+    {
+      "command": "bun --cwd packages/coding-agent test test/g007-ws5-redteam.test.ts test/sessions-dashboard.test.ts",
+      "status": "passed",
+      "tests": 6
+    },
+    {
+      "command": "bun --cwd packages/coding-agent test test/sessions-dashboard.test.ts",
+      "status": "passed",
+      "tests": 2
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "hostile-storage-and-width-40",
+      "verdict": "failed",
+      "evidence": "A MemorySessionStorage fixture with corrupt JSONL, a zero-byte JSONL, and 1,100 valid CJK sessions returns all 1,100 valid sessions without writes. SessionsDashboardComponent.render(40) returns more than 2,000 lines (two per session plus chrome), so a large global inventory is unbounded."
+    },
+    {
+      "id": "presence-sidecars",
+      "verdict": "passed",
+      "evidence": "Matches docs/adr-sessions-dashboard.md: future expiry is active, expired valid expiry is stale, and absent, invalid JSON, wrong-shaped records, a symlink to malformed content, and a directory are unknown without a throw."
+    },
+    {
+      "id": "read-only-open-render-close",
+      "verdict": "passed",
+      "evidence": "Spies on fs.writeFileSync, fs.appendFileSync, fs.promises.writeFile, and fs.promises.appendFile recorded zero calls during controller open/render/close. The foreign transcript mtimeMs was unchanged."
+    },
+    {
+      "id": "overlay-coexistence-and-reopen",
+      "verdict": "failed",
+      "evidence": "A transcript viewer can be open when /sessions opens, but two sequential showSessionsDashboard() calls create two dashboard overlays (three overlays total including the viewer). Escape closes only the latest dashboard and restores editor focus."
+    },
+    {
+      "id": "observe-only-surface",
+      "verdict": "passed",
+      "evidence": "The action metadata has app.session.dashboard but no app.session.dispatch or app.session.reply; the dashboard has only Escape input and renders its Read-only guidance."
+    }
+  ],
+  "blockers": [
+    {
+      "id": "unbounded-global-session-render",
+      "severity": "release-blocker",
+      "repro": "bun --cwd packages/coding-agent test test/g007-ws5-redteam.test.ts",
+      "observed": "1,100 discovered sessions render more than 2,000 dashboard lines at width 40.",
+      "expected": "Global-session inventory rendering must be bounded (pagination, virtualization, or an explicit capped inventory) so hostile session directories cannot create an unbounded overlay.",
+      "source": "packages/coding-agent/src/modes/components/sessions-dashboard.ts"
+    },
+    {
+      "id": "sessions-dashboard-reopen-stacks-overlays",
+      "severity": "release-blocker",
+      "repro": "bun --cwd packages/coding-agent test test/g007-ws5-redteam.test.ts",
+      "observed": "showSessionsDashboard() has no open-state guard; repeated opens stack dashboard overlays over the transcript viewer or prior dashboard.",
+      "expected": "Repeated /sessions or registry action invocation must preserve a single dashboard overlay and focus it rather than stacking overlays.",
+      "source": "packages/coding-agent/src/modes/controllers/selector-controller.ts"
+    }
+  ]
+}

@@ -63,6 +63,22 @@ describe("RateLimitPool", () => {
 		expect(pool.pending).toBe(1);
 		expect(pool.drain(0).map(i => i.payload)).toEqual(["v3"]);
 	});
+	test("reserves generated IDs across coalescing replacements", async () => {
+		const pool = new RateLimitPool<string>({ capacity: 2, refillPerSec: 0, now: () => 0 });
+		const first = pool.submit(item("s1", "live", "v1", "msg-7"));
+		const replacement = pool.submit(item("s1", "live", "v2", "msg-7"));
+		const next = pool.submit(item("s1", "live", "next"));
+
+		expect([first.itemId, replacement.itemId, next.itemId]).toEqual(["rate-limit:0", "rate-limit:1", "rate-limit:2"]);
+		await expect(first.settled).resolves.toBe("removed");
+
+		const granted = pool.drain(0);
+		expect(granted.map(job => job.itemId)).toEqual([replacement.itemId, next.itemId]);
+		for (const job of granted) pool.settle(job.itemId!, "accepted");
+
+		await expect(replacement.settled).resolves.toBe("accepted");
+		await expect(next.settled).resolves.toBe("accepted");
+	});
 
 	test("coalescing is scoped per session and per key", () => {
 		const pool = new RateLimitPool<string>({ capacity: 10, refillPerSec: 1, now: () => 0 });

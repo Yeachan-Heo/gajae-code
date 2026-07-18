@@ -46,3 +46,7 @@ active), while preserving the deliberate same-run terminal/cleared guard that
 #647's tests cover. Add a regression: state `{run_id, active:false,
 current_phase:"planner", version:2}` + same-run planner `--write` → `active:true`
 re-asserted.
+
+## Resolution
+
+**Resolved.** The active-state reassertion regression is covered by the ralplan runtime implementation and its focused regression tests. See `packages/coding-agent/src/gjc-runtime/ralplan-runtime.ts` and `packages/coding-agent/test/gjc-runtime/ralplan-runtime.test.ts`.

@@ -324,6 +324,37 @@ Reply paths:
   - `/lean`
   - `/verbosity <lean|verbose>`
   - `/redact <on|off>`
+  - `/btw <question>` is available only in an authorized, known private-session
+    topic. It uses the current session context in an isolated side turn and never
+    injects or persists either a user or assistant message in the main session
+    history, so it can run while the main session is busy. It accepts no
+    attachments; `/btw` with an attachment returns `Usage: /btw <question>`.
+    Foreign bot-command suffixes are silently ignored.
+
+    Each logical session permits at most two concurrent side questions. The host
+    deadline is 120 seconds and cancels the actual provider work. Operational
+    responses are: `Usage: /btw <question>` for an empty question; `Telegram
+    /btw is disabled in local settings.` when disabled; `Restart this GJC session
+    to enable /btw.` when the connected session does not support side turns; `Two
+    /btw questions are already running. Wait for one to finish.` when busy; `This
+    /btw question timed out after 120 seconds. Send it again to retry.` on
+    timeout; `This /btw question stopped because the GJC session closed or
+    changed. Reopen it and try again.` when stopped; and `This /btw question
+    failed. Send it again to retry.` on failure.
+
+    A transient reconnect to the exact session may deliver a result once.
+    Graceful GJC or daemon shutdown cancels side questions. Crashes or identity
+    changes do not promise delivery, and stale results are fenced.
+    `/btw` rich replies use Telegram Bot API 10.1 Markdown only. An eligible,
+    complete structured Markdown reply is sent once as
+    `{rich_message:{markdown,skip_entity_detection:true}}`, correlated to the
+    source message in the same topic; GJC does not send native `blocks` or
+    `media`. Eligibility is conservative: valid Unicode; at most 32,768 scalars,
+    131,072 UTF-8 bytes, 500 blocks, 16 nesting levels, and 20 table columns.
+    Tables and math use Telegram's 10.1 Markdown support. Ineligible content and
+    a definite rich rejection use the existing correlated HTML delivery.
+    Ambiguous rich outcomes never retry or fall back; `/rich off` keeps HTML-only
+    behavior.
 - send paired-chat lifecycle commands from the Telegram command menu or by typing:
   - `/session_create path <dir>`
   - `/session_create worktree <repo> <branch>`
@@ -335,6 +366,17 @@ Reply paths:
 The removed legacy `/answer <session-tag> <answer>` flow is not the primary UX;
 Telegram topic routing identifies the target session when the configured chat
 supports it.
+### `/btw` operational rollback
+
+`notifications.telegram.btw.enabled` defaults to `true` and is the local kill
+switch. Disabling it consumes `/btw` without forwarding it to the session. To
+roll back, restart the Telegram daemon, and probe health:
+
+```sh
+gjc config set notifications.telegram.btw.enabled false
+gjc daemon restart telegram --json
+gjc notify health --probe
+```
 
 ## 8. Local `/notify` inside a session
 

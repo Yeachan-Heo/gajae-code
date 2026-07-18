@@ -235,7 +235,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 	const agentDir = path.join(repo, ".gjc", "agent");
 	const stateRoot = path.join(repo, ".gjc", "state");
 	const environment = createFixtureBrokerEnvironment(repo, agentDir);
-
+	const fixtureSessionDir = SessionManager.getDefaultSessionDir(repo, agentDir);
 	const started = await startFixtureBrokerWithLeaseForTest({ agentDir, env: environment });
 	const cleanup = createFixtureRootCleanup(repo, agentDir, started.lease);
 	return {
@@ -281,7 +281,6 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 			const resolved = await resolveManagedSessionScope({ cwd: repo, agentDir });
 			expect(resolved.kind).toBe("resolved");
 			if (resolved.kind !== "resolved") throw new Error(resolved.message);
-			const fixtureSessionDir = SessionManager.getDefaultSessionDir(repo, agentDir);
 			expect(fixtureSessionDir).toBe(resolved.scope.directoryPath);
 			const savedSession = SessionManager.create(repo, fixtureSessionDir);
 			await savedSession.ensureOnDisk();

@@ -50,7 +50,7 @@ export interface StateWriterReceiptContext {
 	skill: CanonicalGjcWorkflowSkill;
 	owner: WorkflowStateMutationOwner;
 	command: string;
-	sessionId?: string;
+	sessionId: string;
 	mutationId?: string;
 	nowIso?: string;
 	verb?: string;
@@ -96,6 +96,7 @@ export interface GuardedStateWriterOptions extends StateWriterOptions {
 	policy: StateWritePolicy;
 	expectedRevision?: number;
 	sourceRevision?: number;
+	lockHeld?: boolean;
 }
 
 export type GuardedWriteResult =
@@ -267,7 +268,7 @@ export function stampWorkflowEnvelopeChecksum<T>(value: T, filePath: string, com
 		content_sha256: {
 			algorithm: "sha256",
 			value: workflowEnvelopeContentSha256(envelope),
-			covered_path: filePath,
+			covered_path: path.resolve(filePath),
 			computed_at: computedAt,
 		},
 	};
@@ -559,46 +560,18 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 	options: GuardedStateWriterOptions,
 ): Promise<GuardedWriteResult> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	return lockResolvedWorkflowTarget(
-		filePath,
-		async () => {
-			const current = await readJsonIfPresentTolerant(filePath);
-			const currentRevision = persistedStateRevision(current);
-
-			if (options.policy === "source") {
-				if (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
-					throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
-				}
-				const next = stampWorkflowEnvelopeRevisionAndChecksum(
-					value,
-					filePath,
-					currentRevision + 1,
-					undefined,
-					options,
-				);
-				const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
-				if (!parsed.success) {
-					throw new Error(
-						`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
-							.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
-							.join("; ")}`,
-					);
-				}
-				await atomicWrite(filePath, jsonText(next));
-				await maybeAudit(filePath, options);
-				return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
-			}
-
-			const incomingSourceRevision =
-				options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
-			if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
-				return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
+	const write = async (): Promise<GuardedWriteResult> => {
+		const current = await readJsonIfPresentTolerant(filePath);
+		const currentRevision = persistedStateRevision(current);
+		if (options.policy === "source") {
+			if (options.expectedRevision !== undefined && options.expectedRevision !== currentRevision) {
+				throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
 			}
 			const next = stampWorkflowEnvelopeRevisionAndChecksum(
 				value,
 				filePath,
 				currentRevision + 1,
-				incomingSourceRevision,
+				undefined,
 				options,
 			);
 			const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
@@ -612,9 +585,32 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 			await atomicWrite(filePath, jsonText(next));
 			await maybeAudit(filePath, options);
 			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
-		},
-		options.lock,
-	);
+		}
+		const incomingSourceRevision =
+			options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
+		if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
+			return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
+		}
+		const next = stampWorkflowEnvelopeRevisionAndChecksum(
+			value,
+			filePath,
+			currentRevision + 1,
+			incomingSourceRevision,
+			options,
+		);
+		const parsed = RequiredOnWriteEnvelopeSchema.safeParse(next);
+		if (!parsed.success) {
+			throw new Error(
+				`Refusing to write invalid workflow state envelope to ${filePath}: ${parsed.error.issues
+					.map(issue => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
+					.join("; ")}`,
+			);
+		}
+		await atomicWrite(filePath, jsonText(next));
+		await maybeAudit(filePath, options);
+		return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
+	};
+	return options.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options.lock);
 }
 
 export async function writeJsonAtomic(

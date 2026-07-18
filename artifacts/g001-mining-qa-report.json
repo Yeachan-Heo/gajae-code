@@ -1,0 +1,66 @@
+{
+  "cases": [
+    {
+      "id": "happy-path-json-invariants",
+      "scenario": "Ran the frozen CLI against the real read-only session store: bun scripts/mine-compaction-history.ts --since 2026-06-01 --json. Parsed stdout as JSON and asserted ascending week keys, non-negative p50 quantiles, and compactionsPer100Turns equal to round(compactions / assistantTurns * 100, 2), or null for a zero denominator.",
+      "expected": "Valid JSON; ascending weeks; no negative quantiles; each weekly rate matches its numerator and denominator without NaN.",
+      "actual": "PASS. filesScanned=8293, sessionsWithData=8157, weekCount=7. First week: {\"week\":\"2026-06-01\",\"sessions\":784,\"assistantTurns\":33169,\"compactions\":72,\"genuinelyFull\":3,\"falselyFull\":14,\"midband\":51,\"unknownWindow\":4,\"tokensBeforeP50\":269618,\"fullnessP50\":0.670435,\"compactionsPer100Turns\":0.22}. Last week: {\"week\":\"2026-07-13\",\"sessions\":1073,\"assistantTurns\":37022,\"compactions\":19,\"genuinelyFull\":17,\"falselyFull\":2,\"midband\":0,\"unknownWindow\":0,\"tokensBeforeP50\":361916,\"fullnessP50\":0.9023025,\"compactionsPer100Turns\":0.05}. All invariant assertions passed; no crash or NaN occurred.",
+      "verdict": "passed"
+    },
+    {
+      "id": "malformed-jsonl-line-recovery",
+      "scenario": "Temp-only patched copy (only SESSIONS_ROOT changed) read a session containing a literal malformed JSON line between valid session and assistant/compaction entries.",
+      "expected": "Ignore the malformed line and continue processing subsequent valid JSONL entries.",
+      "actual": "PASS. Combined fixture output retained the valid assistant and both later compactions: {\"filesScanned\":4,\"sessionsWithData\":3,\"weeks\":[{\"week\":\"2026-06-01\",\"sessions\":2,\"assistantTurns\":1,\"compactions\":3,...}]}. The CLI exited successfully.",
+      "verdict": "passed"
+    },
+    {
+      "id": "missing-tokens-before",
+      "scenario": "Temp fixture emitted a known-window gpt-5.6 compaction with tokensBefore omitted.",
+      "expected": "Treat missing tokensBefore as 0 and classify it as falsely-full (<0.60), without NaN.",
+      "actual": "PASS. Weekly output included falselyFull=1, tokensBeforeP50=100, fullnessP50=0.75, and no NaN: {\"genuinelyFull\":1,\"falselyFull\":1,\"midband\":0,\"unknownWindow\":1}.",
+      "verdict": "passed"
+    },
+    {
+      "id": "zero-assistant-turns-compaction",
+      "scenario": "Temp fixture contained a dated session with no assistant messages and one gpt-5.6 compaction at tokensBefore=300000.",
+      "expected": "Count the compaction and classify 300000/400000 as genuinely-full; aggregate rate remains finite from all weekly turns.",
+      "actual": "PASS. The output has compactions=3, assistantTurns=1, genuinelyFull=1, and compactionsPer100Turns=300. No crash, NaN, or dropped zero-turn session occurred.",
+      "verdict": "passed"
+    },
+    {
+      "id": "unknown-model-window",
+      "scenario": "Temp fixture changed the active model to vendor/mystery-1 before a compaction with tokensBefore=100.",
+      "expected": "Exclude the unknown model from full/false classification and increment unknownWindow.",
+      "actual": "PASS. Output: {\"genuinelyFull\":1,\"falselyFull\":1,\"midband\":0,\"unknownWindow\":1}. The mystery-model compaction was counted only in unknownWindow.",
+      "verdict": "passed"
+    },
+    {
+      "id": "zero-total-token-usage-fallback",
+      "scenario": "Temp fixture assistant usage was {totalTokens:0,input:100,cacheRead:50}, exercising the totalTokens=0 fallback path before a compaction.",
+      "expected": "Use the positive component sum (150) instead of treating the usage as zero.",
+      "actual": "PASS for execution/path behavior. The fixture completed through the subsequent compaction without error. The CLI JSON intentionally does not expose lastProviderTokens, so its internal value cannot be asserted solely from CLI output; source behavior used by this invocation is `usage.totalTokens || (usage.input + usage.output + usage.cacheRead + usage.cacheWrite)`, which yields 150 for this fixture. Output snippet: {\"assistantTurns\":1,\"compactions\":3,\"compactionsPer100Turns\":300}.",
+      "verdict": "passed"
+    },
+    {
+      "id": "empty-jsonl-file",
+      "scenario": "Temp fixture root included an empty .jsonl file alongside three data files.",
+      "expected": "Scan the empty file without crash and do not count it as a session with data.",
+      "actual": "PASS. Output reported filesScanned=4 and sessionsWithData=3; the empty file was scanned but excluded from data sessions.",
+      "verdict": "passed"
+    },
+    {
+      "id": "since-filter-excludes-older-compaction",
+      "scenario": "Temp fixture included a 2026-05-20 session and 2026-05-21 compaction, then ran with --since 2026-06-01.",
+      "expected": "Exclude the older compaction and emit only the 2026-06-01 week.",
+      "actual": "PASS. Exact output week list: [{\"week\":\"2026-06-01\",\"sessions\":2,\"assistantTurns\":1,\"compactions\":3,\"genuinelyFull\":1,\"falselyFull\":1,\"midband\":0,\"unknownWindow\":1,\"tokensBeforeP50\":100,\"fullnessP50\":0.75,\"compactionsPer100Turns\":300}]. No May week or fourth compaction appeared.",
+      "verdict": "passed"
+    }
+  ],
+  "overall": "passed",
+  "commands": [
+    "bun scripts/mine-compaction-history.ts --since 2026-06-01 --json",
+    "bun <mktemp>/mine-compaction-history.ts --since 2026-06-01 --json",
+    "python3 JSON assertion harness (valid JSON, ascending weeks, rate formula, non-negative quantiles, and fixture aggregate assertions)"
+  ]
+}

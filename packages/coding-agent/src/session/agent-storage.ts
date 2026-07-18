@@ -37,6 +37,8 @@ const instances = new Map<string, AgentStorage>();
 export class AgentStorage {
 	#db: Database;
 	#authStore: AuthCredentialStore;
+	#dbPath: string;
+	#closed = false;
 
 	#listSettingsStmt: Statement;
 	#upsertModelUsageStmt: Statement;
@@ -44,6 +46,7 @@ export class AgentStorage {
 	#modelUsageCache: string[] | null = null;
 
 	private constructor(dbPath: string) {
+		this.#dbPath = dbPath;
 		this.#ensureDir(dbPath);
 		try {
 			this.#db = new Database(dbPath);
@@ -431,6 +434,21 @@ FROM model_usage_legacy
 		this.#authStore.cleanExpiredCache();
 	}
 
+	/**
+	 * Release prepared statements and the shared SQLite handle.
+	 *
+	 * AgentStorage instances are cached by path, so closing also evicts this
+	 * instance and allows a later open() to create a fresh handle.
+	 */
+	close(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#listSettingsStmt.finalize();
+		this.#upsertModelUsageStmt.finalize();
+		this.#listModelUsageStmt.finalize();
+		this.#authStore.close();
+		if (instances.get(this.#dbPath) === this) instances.delete(this.#dbPath);
+	}
 	/**
 	 * Ensures the parent directory for the database file exists.
 	 * @param dbPath - Path to the database file

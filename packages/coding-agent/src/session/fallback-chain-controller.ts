@@ -69,6 +69,14 @@ export class FallbackChainController {
 		this.#attemptStarted = true;
 	}
 
+	/** Remove the current started request from fallback-policy accounting without erasing prior failures. */
+	discardStartedAttempt(): void {
+		if (!this.#attemptStarted) return;
+		this.attemptsUsed = Math.max(0, this.attemptsUsed - 1);
+		this.#totalAttemptsUsed = Math.max(0, this.#totalAttemptsUsed - 1);
+		this.#attemptStarted = false;
+	}
+
 	/** Start a logically new request with a fresh fallback-chain budget. */
 	resetAttemptBudget(): void {
 		this.attemptsUsed = 0;

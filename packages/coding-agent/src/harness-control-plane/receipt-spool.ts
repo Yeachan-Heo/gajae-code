@@ -21,6 +21,46 @@ export interface ReceiptSpoolAppendResult {
 const receiptSpoolDirStorage = new AsyncLocalStorage<string | undefined>();
 const spoolQueues = new Map<string, Promise<void>>();
 const noop = (): void => undefined;
+
+interface ReceiptSpoolCursorCache {
+	mtimeMs: number;
+	size: number;
+	highest: bigint;
+}
+
+const cursorCache = new Map<string, ReceiptSpoolCursorCache>();
+let fullScanCount = 0;
+
+/** @internal Test-only instrumentation for steady-state spool scan coverage. */
+export function receiptSpoolFullScanCountForTesting(): number {
+	return fullScanCount;
+}
+
+/** @internal Test-only cache reset. */
+export function resetReceiptSpoolCursorCacheForTesting(): void {
+	cursorCache.clear();
+	fullScanCount = 0;
+}
+
+async function spoolStat(spoolFile: string): Promise<{ mtimeMs: number; size: number } | undefined> {
+	try {
+		const stats = await fs.stat(spoolFile);
+		return { mtimeMs: stats.mtimeMs, size: stats.size };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+function sameSpoolRevision(a: ReceiptSpoolCursorCache, b: { mtimeMs: number; size: number }): boolean {
+	return a.mtimeMs === b.mtimeMs && a.size === b.size;
+}
+
+async function cacheHighestCursor(spoolFile: string, highest: bigint): Promise<void> {
+	const revision = await spoolStat(spoolFile);
+	if (revision) cursorCache.set(spoolFile, { ...revision, highest });
+}
+
 export async function withReceiptSpoolDir<T>(spoolDir: string, fn: () => Promise<T>): Promise<T> {
 	const trimmed = spoolDir.trim();
 	if (!trimmed) throw new Error("receipt_spool_dir_empty");
@@ -55,14 +95,16 @@ export function formatReceiptSpoolCursor(cursor: bigint): string {
 
 export async function readHighestReceiptSpoolCursor(spoolDir: string): Promise<bigint> {
 	const spoolFile = receiptSpoolPath(spoolDir);
-	let raw: string;
-	try {
-		raw = await fs.readFile(spoolFile, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0n;
-		throw error;
+	const revision = await spoolStat(spoolFile);
+	if (!revision) {
+		cursorCache.delete(spoolFile);
+		return 0n;
 	}
+	const cached = cursorCache.get(spoolFile);
+	if (cached && sameSpoolRevision(cached, revision)) return cached.highest;
 
+	fullScanCount++;
+	const raw = await fs.readFile(spoolFile, "utf8");
 	let highest = 0n;
 	for (const line of raw.split("\n")) {
 		const trimmed = line.trim();
@@ -72,9 +114,10 @@ export async function readHighestReceiptSpoolCursor(spoolDir: string): Promise<b
 			const cursor = parseCursor(parsed.cursor);
 			if (cursor !== undefined && cursor > highest) highest = cursor;
 		} catch {
-			// A crash may leave a torn tail; consumers skip malformed lines and so do we.
+			// A crash may leave a torn tail; a full scan ignores it and re-establishes the cache.
 		}
 	}
+	cursorCache.set(spoolFile, { ...revision, highest });
 	return highest;
 }
 
@@ -111,6 +154,7 @@ export async function appendReceiptToSpool(
 				} finally {
 					await handle.close();
 				}
+				await cacheHighestCursor(spoolFile, BigInt(cursor));
 				return { cursor, path: spoolFile };
 			},
 			{ staleMs: 30_000, retries: 100, retryDelayMs: 25 },

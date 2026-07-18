@@ -981,6 +981,7 @@ function isSource(file: string): boolean {
 }
 
 const teamRuntimeTmuxPath = "packages/coding-agent/src/gjc-runtime/team-runtime.ts";
+const teamWorkersTmuxPath = "packages/coding-agent/src/gjc-runtime/team-workers.ts";
 
 const coordinatorMcpRoot = "packages/coding-agent/src/coordinator-mcp/server.ts";
 function isPublishedGjcSessionShellHelper(file: string): boolean {
@@ -1427,6 +1428,16 @@ function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
 			/Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*workerCommand\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
 		),
 	];
+	const continuationPromptMatches = [
+		...contents.matchAll(
+			/(?:const\s+GJC_TEAM_CONTINUATION_PROMPT\s*=\s*["']Continue only your current claimed GJC team task\. Re-read current GJC team state; do not replay prior output; report status\.["']\s*;|import\s*\{[\s\S]{0,1000}?\bGJC_TEAM_CONTINUATION_PROMPT\b[\s\S]{0,1000}?\}\s*from\s*["']\.\/team-workers["']\s*;)/g,
+		),
+	];
+	const continuationMatches = [
+		...contents.matchAll(
+			/const\s+args\s*=\s*Object\.freeze\(\s*\[\s*["']send-keys["']\s*,\s*["']-l["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*GJC_TEAM_CONTINUATION_PROMPT\s*,\s*["'];["']\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*worker\.pane_id\s*,\s*["']Enter["']\s*,?\s*\]\s*\)\s*;\s*const\s+dispatch\s*=\s*gjcTeamRuntimeTestSeams\?\.continuationTmuxDispatch\s*\?\s*gjcTeamRuntimeTestSeams\.continuationTmuxDispatch\(config\.tmux_command\s*,\s*args\)\s*:\s*Bun\.spawnSync\(\[config\.tmux_command\s*,\s*\.\.\.args\]\s*,\s*\{\s*stdout\s*:\s*["']ignore["']\s*,\s*stderr\s*:\s*["']ignore["']\s*,\s*timeout\s*:\s*GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS\s*,?\s*\}\s*\)\s*;/g,
+		),
+	];
 	const enterMatches = [
 		...contents.matchAll(
 			/const\s+sendKeys\s*=\s*Bun\.spawnSync\(\s*\[\s*config\.tmux_command\s*,\s*["']send-keys["']\s*,\s*["']-t["']\s*,\s*paneId\s*,\s*["']Enter["']\s*\]\s*,\s*\{[\s\S]{0,200}?stdout\s*:\s*["']ignore["'][\s\S]{0,200}?stderr\s*:\s*["']ignore["'][\s\S]{0,100}?\}\s*\)\s*;/g,
@@ -1449,6 +1460,8 @@ function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
 		guardMatches.length !== 1 ||
 		payloadMatches.length !== 1 ||
 		enterMatches.length !== 1 ||
+		continuationPromptMatches.length !== 1 ||
+		continuationMatches.length !== 1 ||
 		fallbackPredicateMatches.length !== 1 ||
 		useFallbackMatches.length !== 1 ||
 		splitWorkerCommandMatches.length !== 1
@@ -1468,18 +1481,43 @@ function exactTeamRuntimeSendKeysRanges(contents: string): ShellRange[] {
 	const guard = guardMatches[0];
 	const openingBrace = (guard.index ?? 0) + guard[0].lastIndexOf("{");
 	const range = braceBlockRange(contents, openingBrace);
-	if (!range) return [];
+	const continuationFunction =
+		/async\s+function\s+continueStalledGjcTeamWorkers\s*\([^)]*\)\s*:\s*Promise<void>\s*\{/.exec(contents);
+	const monitorFence = /await\s+withGjcTeamTaskMutation\([\s\S]{0,500}?async\s+capability\s*=>\s*\{/.exec(contents);
+	if (!range || !continuationFunction || !monitorFence) return [];
+	const continuationOpeningBrace = (continuationFunction.index ?? 0) + continuationFunction[0].lastIndexOf("{");
+	const continuationRange = braceBlockRange(contents, continuationOpeningBrace);
+	const monitorOpeningBrace = (monitorFence.index ?? 0) + monitorFence[0].lastIndexOf("{");
+	const monitorRange = braceBlockRange(contents, monitorOpeningBrace);
+	if (!continuationRange || !monitorRange) return [];
+	const monitorBody = contents.slice(monitorRange.start, monitorRange.end);
+	const continuationCall = /await\s+continueStalledGjcTeamWorkers\s*\(/.exec(monitorBody);
+	const reconciliationCall = /await\s+reconcileGjcTeamStaleClaimsUnlocked\s*\(/.exec(monitorBody);
+	const continuationStart = continuationMatches[0].index ?? 0;
+	const finalValidationStart = contents.lastIndexOf("const revalidationReason =", continuationStart);
+	const skippedBranch = finalValidationStart === -1 ? "" : contents.slice(finalValidationStart, continuationStart);
 	if (
 		payloadStart < range.start ||
 		payloadStart >= range.end ||
 		enterStart < range.start ||
 		enterStart >= range.end ||
-		contents.indexOf("void sendKeys.exitCode;", enterStart) >= range.end
+		contents.indexOf("void sendKeys.exitCode;", enterStart) >= range.end ||
+		continuationStart < continuationRange.start ||
+		continuationStart >= continuationRange.end ||
+		finalValidationStart < continuationRange.start ||
+		!continuationCall ||
+		!reconciliationCall ||
+		(continuationCall.index ?? 0) >= (reconciliationCall.index ?? 0) ||
+		!/if\s*\(\s*revalidationReason\s*\)[\s\S]*?return\s*;/.test(skippedBranch)
 	)
 		return [];
 	return [
 		{ start: payloadStart, end: payloadStart + payloadMatches[0][0].length },
 		{ start: enterStart, end: enterStart + enterMatches[0][0].length },
+		{
+			start: continuationMatches[0].index ?? 0,
+			end: (continuationMatches[0].index ?? 0) + continuationMatches[0][0].length,
+		},
 	];
 }
 
@@ -1504,6 +1542,7 @@ function isTypeOnlyTmuxPrimitiveOccurrence(contents: string, occurrence: TmuxPri
 }
 
 function tmuxMachineBusViolations(file: string, contents: string): string[] {
+	if (isGeneratedDocumentationIndex(file)) return [];
 	const allowedTeamFallbackRanges = file === teamRuntimeTmuxPath ? exactTeamRuntimeSendKeysRanges(contents) : [];
 	const violations: string[] = [];
 	for (const occurrence of tmuxPrimitiveOccurrences(contents)) {
@@ -1890,6 +1929,15 @@ async function scan(): Promise<string[]> {
 			} else {
 				violations.push(...tmuxMachineBusViolations(file, contents));
 			}
+			if (
+				file === teamWorkersTmuxPath &&
+				!/^export const GJC_TEAM_CONTINUATION_PROMPT =\n\t"Continue only your current claimed GJC team task\. Re-read current GJC team state; do not replay prior output; report status\.";$/m.test(
+					contents,
+				)
+			)
+				violations.push(
+					`${file}: stalled-worker continuation prompt must remain the exact source-controlled literal`,
+				);
 		}
 		if (file === coordinatorMcpRoot) {
 			for (const pattern of coordinatorDirectAuthorityPatterns) {
@@ -3067,6 +3115,9 @@ fi
 		"tmux send-keys content injection is outside sanctioned process lifecycle",
 	);
 	const canonicalTeamRuntimeSendKeysFixture = `
+async function continueStalledGjcTeamWorkers(): Promise<void> {
+	const revalidationReason = null;
+	if (revalidationReason) return;
 function shouldDispatchWorkerWithSendKeys(tmuxCommand: string, platform: NodeJS.Platform = process.platform): boolean {
 	return platform === "win32" || path.basename(tmuxCommand).toLowerCase() === "psmux";
 }
@@ -3083,10 +3134,99 @@ if (useSendKeysFallback) {
 	});
 	void sendKeys.exitCode;
 }
+const GJC_TEAM_CONTINUATION_PROMPT = "Continue only your current claimed GJC team task. Re-read current GJC team state; do not replay prior output; report status.";
+const GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS = 5_000;
+const args = Object.freeze([
+	"send-keys",
+	"-l",
+	"-t",
+	worker.pane_id,
+	GJC_TEAM_CONTINUATION_PROMPT,
+	";",
+	"send-keys",
+	"-t",
+	worker.pane_id,
+	"Enter",
+]);
+
+const dispatch = gjcTeamRuntimeTestSeams?.continuationTmuxDispatch
+	? gjcTeamRuntimeTestSeams.continuationTmuxDispatch(config.tmux_command, args)
+	: Bun.spawnSync([config.tmux_command, ...args], {
+		stdout: "ignore",
+		stderr: "ignore",
+		timeout: GJC_TEAM_CONTINUATION_DISPATCH_TIMEOUT_MS,
+	});
+}
+async function monitorGjcTeam(): Promise<void> {
+	await withGjcTeamTaskMutation(taskStore(dir), async capability => {
+		await continueStalledGjcTeamWorkers();
+		await reconcileGjcTeamStaleClaimsUnlocked(workerOrchestrationRuntime, teamName, dir, config, env, capability);
+	});
+}
 `;
 	await runSelfTestFixture(
 		{ "packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture },
 		0,
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				"async function continueStalledGjcTeamWorkers(): Promise<void>",
+				"async function relocatedContinuation(): Promise<void>",
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				"if (revalidationReason) return;",
+				"if (revalidationReason) {}",
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				"await continueStalledGjcTeamWorkers();",
+				"",
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				"await continueStalledGjcTeamWorkers();\n\t\tawait reconcileGjcTeamStaleClaimsUnlocked(workerOrchestrationRuntime, teamName, dir, config, env, capability);",
+				"await reconcileGjcTeamStaleClaimsUnlocked(workerOrchestrationRuntime, teamName, dir, config, env, capability);\n\t\tawait continueStalledGjcTeamWorkers();",
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				"const dispatch =",
+				'args.push("forged");\nconst dispatch =',
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				"report status.",
+				"report injected status.",
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
 	);
 	await runSelfTestFixture(
 		{
@@ -3111,6 +3251,46 @@ if (useSendKeysFallback) {
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": `${canonicalTeamRuntimeSendKeysFixture}\nBun.spawnSync([config.tmux_command, "send-keys", "-t", paneId, "prompt"]);\n`,
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replaceAll(
+				"worker.pane_id",
+				'"%99"',
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				'GJC_TEAM_CONTINUATION_PROMPT,\n\t";",',
+				"`$" + "{GJC_TEAM_CONTINUATION_PROMPT}" + '`,\n\t";",',
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				'"send-keys",\n\t"-l",\n\t"-t",\n\tworker.pane_id,\n\tGJC_TEAM_CONTINUATION_PROMPT,\n\t";",\n\t"send-keys",\n\t"-t",\n\tworker.pane_id,\n\t"Enter",',
+				'"send-keys", "-t", worker.pane_id, "Enter", ";", "send-keys", "-l", "-t", worker.pane_id, GJC_TEAM_CONTINUATION_PROMPT,',
+			),
+		},
+		1,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/gjc-runtime/team-runtime.ts": canonicalTeamRuntimeSendKeysFixture.replace(
+				"Bun.spawnSync([config.tmux_command, ...args]",
+				'Bun.spawnSync([config.tmux_command, "run-shell", ...args]',
+			),
 		},
 		1,
 		"tmux send-keys content injection is outside sanctioned process lifecycle",
