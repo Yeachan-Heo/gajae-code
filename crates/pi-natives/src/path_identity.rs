@@ -1769,8 +1769,8 @@ mod platform {
 	use sha2::{Digest, Sha256};
 	use windows_sys::Win32::{
 		Foundation::{
-			CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GetLastError, HANDLE,
-			INVALID_HANDLE_VALUE, LocalFree,
+			CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, GENERIC_ALL, GetLastError,
+			HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 		},
 		Security::{
 			ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
@@ -2712,6 +2712,10 @@ mod platform {
 	const CONTAINER_INHERIT_ACE: u8 = 0x02;
 	const SE_DACL_PROTECTED: u16 = 0x1000;
 
+	fn owner_only_ace_mask_is_safe(mask: u32) -> bool {
+		matches!(mask, GENERIC_ALL | FILE_ALL_ACCESS)
+	}
+
 	fn owner_only_dacl(sid: &[u8], kind: &str) -> Result<Vec<usize>, ()> {
 		let sid_length = valid_sid(sid).ok_or(())?;
 		let size = size_of::<ACL>()
@@ -2901,7 +2905,7 @@ mod platform {
 								ace_size - sid_offset,
 							)
 						};
-						mask == FILE_ALL_ACCESS && valid_sid(ace_sid).is_some()
+						owner_only_ace_mask_is_safe(mask) && valid_sid(ace_sid).is_some()
 							// SAFETY: both pointers identify complete validated SIDs that remain live.
 							&& unsafe {
 								EqualSid(ace_sid.as_ptr().cast_mut().cast(), sid.as_ptr().cast_mut().cast())
@@ -2921,6 +2925,22 @@ mod platform {
 			NativeOwnerOnlySecurityResult::success()
 		} else {
 			NativeOwnerOnlySecurityResult::failure("acl_verify_failed")
+		}
+	}
+	#[cfg(test)]
+	mod tests {
+		use super::{FILE_ALL_ACCESS, FILE_READ_DATA, GENERIC_ALL, owner_only_ace_mask_is_safe};
+
+		#[test]
+		fn owner_only_ace_mask_accepts_legacy_and_current_full_access_masks() {
+			assert!(owner_only_ace_mask_is_safe(GENERIC_ALL));
+			assert!(owner_only_ace_mask_is_safe(FILE_ALL_ACCESS));
+		}
+
+		#[test]
+		fn owner_only_ace_mask_rejects_partial_and_combined_masks() {
+			assert!(!owner_only_ace_mask_is_safe(FILE_ALL_ACCESS & !FILE_READ_DATA));
+			assert!(!owner_only_ace_mask_is_safe(GENERIC_ALL | FILE_READ_DATA));
 		}
 	}
 	fn hex_digest(digest: [u8; 32]) -> String {

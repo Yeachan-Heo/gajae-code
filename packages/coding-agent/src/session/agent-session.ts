@@ -13338,10 +13338,10 @@ export class AgentSession {
 
 		const prependMessages = args.prependMessagesValid?.() === false ? undefined : args.prependMessages;
 		let snapshot = this.#buildEphemeralSnapshot(args.promptText, prependMessages);
-		let llmMessages = await awaitEphemeralAbort(Promise.resolve(this.#convertToLlm(snapshot)), args.signal);
+		let llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
 		if (prependMessages && args.prependMessagesValid?.() === false) {
 			snapshot = this.#buildEphemeralSnapshot(args.promptText);
-			llmMessages = await awaitEphemeralAbort(Promise.resolve(this.#convertToLlm(snapshot)), args.signal);
+			llmMessages = await awaitEphemeralAbort(this.convertMessagesToLlm(snapshot, args.signal), args.signal);
 		}
 		const context: Context = {
 			systemPrompt: this.systemPrompt,
@@ -13356,21 +13356,24 @@ export class AgentSession {
 		// active turn's identity makes this no-history request wait behind its
 		// stream (notably on the WebSocket transport), so it must be unique.
 		const ephemeralSessionId = crypto.randomUUID();
-		const options: SimpleStreamOptions = {
-			apiKey,
-			sessionId: ephemeralSessionId,
-			metadata: buildSessionMetadata(
-				ephemeralSessionId,
-				model.provider,
-				this.#modelRegistry.authStorage,
-				this.sessionId,
-			),
-			reasoning: toReasoningEffort(this.thinkingLevel),
-			hideThinkingSummary: this.agent.hideThinkingSummary,
-			serviceTier: this.serviceTier,
-			signal: args.signal,
-			toolChoice: "none",
-		};
+		const options = this.prepareSimpleStreamOptions(
+			{
+				apiKey,
+				sessionId: ephemeralSessionId,
+				metadata: buildSessionMetadata(
+					ephemeralSessionId,
+					model.provider,
+					this.#modelRegistry.authStorage,
+					this.sessionId,
+				),
+				reasoning: toReasoningEffort(this.thinkingLevel),
+				hideThinkingSummary: this.agent.hideThinkingSummary,
+				serviceTier: this.serviceTier,
+				signal: args.signal,
+				toolChoice: "none",
+			},
+			model.provider,
+		);
 
 		let replyText = "";
 		let assistantMessage: AssistantMessage | undefined;

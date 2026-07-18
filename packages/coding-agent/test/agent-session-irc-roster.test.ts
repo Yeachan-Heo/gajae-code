@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, type AgentMessage } from "@gajae-code/agent-core";
+import type { SimpleStreamOptions } from "@gajae-code/ai";
 import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
@@ -35,6 +36,8 @@ function createHarness(
 		model?: MockModel;
 		getApiKey?: () => Promise<string>;
 		retryEnabled?: boolean;
+		transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
+		onPayload?: SimpleStreamOptions["onPayload"];
 	} = {},
 ): Harness {
 	const model = options.model ?? createMockModel({ handler: () => ({ content: ["ok"] }) });
@@ -61,6 +64,8 @@ function createHarness(
 			snapshots.push(messages);
 			return convertToLlm(messages);
 		},
+		transformContext: options.transformContext,
+		onPayload: options.onPayload,
 	});
 	testSessions.push(session);
 	return { session, registry, model, snapshots, sessionManager };
@@ -104,6 +109,36 @@ async function background(harness: Harness, text = "side request"): Promise<void
 }
 
 describe("AgentSession IRC roster delivery", () => {
+	it("applies ephemeral context transforms and provider hooks without mutating history", async () => {
+		let providerOptions: SimpleStreamOptions | undefined;
+		const model = createMockModel({
+			handler: async (_context, options) => {
+				providerOptions = options;
+				await options?.onPayload?.({ request: "ephemeral" });
+				return { content: ["ok"] };
+			},
+		});
+		const transformContext = vi.fn((messages: AgentMessage[]) => [
+			...messages.filter(message => message.role !== "user" || message.content !== "filtered history"),
+			{ role: "user" as const, content: "injected context", timestamp: Date.now() },
+		]);
+		const onPayload = vi.fn();
+		const harness = createHarness({ model, transformContext, onPayload });
+		const filtered: AgentMessage = { role: "user", content: "filtered history", timestamp: Date.now() };
+		const retained: AgentMessage = { role: "user", content: "retained history", timestamp: Date.now() };
+		harness.session.agent.appendMessage(filtered);
+		harness.session.agent.appendMessage(retained);
+		const historyBefore = structuredClone(harness.session.agent.state.messages);
+
+		await harness.session.runEphemeralTurn({ promptText: "side request" });
+
+		expect(transformContext).toHaveBeenCalledTimes(1);
+		expect(JSON.stringify(harness.snapshots.at(-1))).not.toContain("filtered history");
+		expect(JSON.stringify(harness.snapshots.at(-1))).toContain("injected context");
+		expect(onPayload).toHaveBeenCalledTimes(1);
+		expect(providerOptions?.sessionId).not.toBe(harness.session.sessionId);
+		expect(harness.session.agent.state.messages).toEqual(historyBefore);
+	});
 	it("emits one hidden roster reminder for the first roster change", async () => {
 		const harness = createHarness();
 		addPeer(harness.registry);

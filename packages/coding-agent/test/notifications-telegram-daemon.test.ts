@@ -6480,7 +6480,22 @@ test("graceful stop cancels a pending /btw and suppresses delayed successful del
 		threadId: String(threadId),
 		reason: "daemon_shutdown",
 	});
-	expect(bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage")).toEqual([]);
+	expect(
+		bot.calls.filter(
+			call =>
+				call.method === "sendMessage" &&
+				call.body.text ===
+					"This /btw question stopped because the GJC session closed or changed. Reopen it and try again.",
+		),
+	).toEqual([
+		expect.objectContaining({
+			body: expect.objectContaining({
+				message_thread_id: threadId,
+				reply_parameters: { message_id: 1901 },
+				text: "This /btw question stopped because the GJC session closed or changed. Reopen it and try again.",
+			}),
+		}),
+	]);
 });
 
 test("run() loop exits when an owner-scoped control request asks it to stop", async () => {
@@ -8253,7 +8268,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			initialSocket.sent.map(frame => JSON.parse(frame)).some(frame => frame.type === "ephemeral_turn_cancel"),
 		).toBe(false);
 		expect(daemon.sessions.has("S")).toBe(false);
-		expect(dispatches()).toBe(before);
+		expect(dispatches()).toBe(before + 1);
 
 		daemon.connectSession("S", "ws://changed", "changed-token");
 		const changed = daemon.sessions.get("S")!;
@@ -8267,7 +8282,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			events: [],
 		});
 		await daemon.handleSessionMessage(changed, terminal);
-		expect(dispatches()).toBe(before);
+		expect(dispatches()).toBe(before + 1);
 		changed.ws.dispatchEvent(new Event("close"));
 
 		daemon.connectSession("S", "ws://x/a", "bc");
@@ -8283,7 +8298,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		});
 		await daemon.handleSessionMessage(initial, terminal);
 		await daemon.handleSessionMessage(replacement, terminal);
-		expect(dispatches()).toBe(before);
+		expect(dispatches()).toBe(before + 1);
 
 		replacement.ws.dispatchEvent(new Event("close"));
 		daemon.connectSession("S", "ws://x/", "abc");
@@ -8299,16 +8314,75 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		});
 		await daemon.handleSessionMessage(exact, { type: "config_update", sessionId: "other" });
 		await daemon.handleSessionMessage(exact, terminal);
-		expect(dispatches()).toBe(before);
+		expect(dispatches()).toBe(before + 1);
 		await daemon.handleSessionMessage(exact, { type: "config_update", sessionId: "S" });
 		await daemon.handleSessionMessage(exact, {
 			...terminal,
 			updateId: terminal.updateId + 1,
 		});
-		expect(dispatches()).toBe(before);
-		await daemon.handleSessionMessage(exact, terminal);
 		expect(dispatches()).toBe(before + 1);
 		await daemon.handleSessionMessage(exact, terminal);
 		expect(dispatches()).toBe(before + 1);
+		await daemon.handleSessionMessage(exact, terminal);
+		expect(dispatches()).toBe(before + 1);
+	});
+	test.each([
+		"session_closed",
+		"socket_closed",
+		"liveness_timeout",
+		"authority_replaced",
+	] as const)("terminalizes a pending /btw exactly once when %s loses its transport session", async loss => {
+		const { bot, daemon, threadId } = await daemonWithTopic();
+		await daemon.handleTelegramUpdate({
+			update_id: 990,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw lost?", message_id: 1990 },
+		});
+		const session = daemon.sessions.get("S")!;
+		const request = JSON.parse((session.ws as unknown as FakeWs).sent.at(-1)!) as {
+			requestId: string;
+			sessionId: string;
+			updateId: number;
+			messageId: number;
+			threadId: string;
+		};
+		if (loss === "session_closed") {
+			await daemon.handleSessionMessage(session, { type: "session_closed", sessionId: "S" });
+		} else if (loss === "socket_closed") {
+			(session.ws as unknown as FakeWs).dispatchEvent(new Event("close"));
+		} else if (loss === "liveness_timeout") {
+			(daemon as unknown as { dropSession(session: unknown, reason: string): void }).dropSession(
+				session,
+				"liveness_timeout",
+			);
+		} else if (loss === "authority_replaced") {
+			daemon.connectSession("S", "ws://replacement", "replacement-token");
+		}
+		await Promise.resolve();
+		const unavailable = bot.calls.filter(
+			call =>
+				call.method === "sendMessage" &&
+				call.body.text ===
+					"This /btw question stopped because the GJC session closed or changed. Reopen it and try again.",
+		);
+		expect(unavailable).toHaveLength(1);
+		expect(unavailable[0]).toMatchObject({
+			body: {
+				chat_id: "42",
+				message_thread_id: threadId,
+				reply_parameters: { message_id: 1990 },
+			},
+		});
+		const deliveriesAfterLoss = bot.calls.filter(
+			call => call.method === "sendMessage" || call.method === "sendRichMessage",
+		).length;
+		await daemon.handleSessionMessage(session, {
+			type: "ephemeral_turn_result",
+			...request,
+			status: "ok",
+			text: "late answer",
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage")).toHaveLength(
+			deliveriesAfterLoss,
+		);
 	});
 });

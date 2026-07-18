@@ -1510,7 +1510,7 @@ export class TelegramNotificationDaemon {
 			else item.controller?.abort();
 			this.finishSelectedAck(item, { status: "unknown", reason: "shutdown" });
 		}
-		this.#btwDeliveryAbort.abort();
+		this.#stoppingBtw = true;
 		this.#deliveryAbort.abort();
 		this.runtime.requestStop();
 		this.running = false;
@@ -2181,7 +2181,9 @@ export class TelegramNotificationDaemon {
 		const endpointKey = endpointGenerationKey(url, token);
 		this.closedEndpointKeys.delete(sessionId);
 		const existing = this.sessions.get(sessionId);
-		if (existing) this.#clearModelChoiceAliasesForSocket(existing);
+		if (existing) {
+			this.dropSession(existing, "authority_replaced");
+		}
 		this.#clearModelChoiceAliases(sessionId);
 
 		const session: SessionSocket = {
@@ -2300,6 +2302,7 @@ export class TelegramNotificationDaemon {
 			clearIntervalImpl(session.pingTimer);
 			session.pingTimer = undefined;
 		}
+		this.#terminalizeBtwTurnsForSession(session);
 		const isCurrentSession = this.sessions.get(session.sessionId) === session;
 		if (isCurrentSession || reason === "session_closed") {
 			this.deleteMessageRoutes(session.sessionId);
@@ -2327,13 +2330,54 @@ export class TelegramNotificationDaemon {
 		for (const [requestId, tombstone] of this.#btwTerminalTombstones)
 			if (tombstone.expiresAt <= now) this.#btwTerminalTombstones.delete(requestId);
 	}
+	#takeBtwTurn(requestId: string, pending: PendingBtwTurn): boolean {
+		if (this.#pendingBtwTurns.get(requestId) !== pending) return false;
+		this.#pendingBtwTurns.delete(requestId);
+		this.#btwTerminalTombstones.set(requestId, {
+			sessionId: pending.logicalSessionId,
+			updateId: pending.updateId,
+			messageId: pending.messageId,
+			threadId: pending.threadId,
+			expiresAt: (this.opts.now?.() ?? Date.now()) + BTW_PENDING_TTL_MS,
+		});
+		while (this.#pendingBtwTurns.size + this.#btwTerminalTombstones.size > BTW_MAX_PENDING)
+			this.#btwTerminalTombstones.delete(this.#btwTerminalTombstones.keys().next().value!);
+		return true;
+	}
+	#terminalizeBtwTurnsForSession(session: SessionSocket): void {
+		for (const [requestId, pending] of this.#pendingBtwTurns) {
+			if (
+				pending.transportSessionId !== session.sessionId ||
+				pending.logicalSessionId !== this.#logicalSessionId(session) ||
+				pending.endpointDigest !== session.endpointDigest ||
+				pending.generation !== session.hostGeneration
+			)
+				continue;
+			void this.#terminalizeBtwTurn(requestId, pending).catch(() => undefined);
+		}
+	}
+	async #terminalizeBtwTurn(requestId: string, pending: PendingBtwTurn, allowWhileStopping = false): Promise<void> {
+		if (this.#stoppingBtw && !allowWhileStopping) return;
+		if (!this.#takeBtwTurn(requestId, pending)) return;
+		try {
+			await this.#sendBtwMessage({
+				threadId: pending.threadId,
+				messageId: pending.messageId,
+				text: "This /btw question stopped because the GJC session closed or changed. Reopen it and try again.",
+				allowWhileStopping,
+			});
+		} catch {
+			logger.warn("notifications: /btw session-unavailable delivery failed");
+		}
+	}
 	async #sendBtwMessage(input: {
 		threadId: string;
 		messageId: number;
 		text: string;
 		parseMode?: typeof TELEGRAM_PARSE_MODE;
+		allowWhileStopping?: boolean;
 	}): Promise<unknown> {
-		if (this.#stoppingBtw || this.#btwDeliveryAbort.signal.aborted) return undefined;
+		if ((!input.allowWhileStopping && this.#stoppingBtw) || this.#btwDeliveryAbort.signal.aborted) return undefined;
 		return this.botApi.call(
 			"sendMessage",
 			{
@@ -2355,31 +2399,30 @@ export class TelegramNotificationDaemon {
 		for (const [requestId, pending] of this.#pendingBtwTurns) {
 			const session = this.sessions.get(pending.transportSessionId);
 			if (
-				!session ||
-				session.ws.readyState !== WebSocket.OPEN ||
-				session.endpointDigest !== pending.endpointDigest ||
-				session.hostGeneration !== pending.generation ||
-				this.#logicalSessionId(session) !== pending.logicalSessionId
-			)
-				continue;
-			try {
-				session.ws.send(
-					JSON.stringify({
-						type: "ephemeral_turn_cancel",
-						sessionId: pending.logicalSessionId,
-						token: session.token,
-						requestId,
-						updateId: pending.updateId,
-						messageId: pending.messageId,
-						threadId: pending.threadId,
-						reason: "daemon_shutdown",
-					}),
-				);
-			} catch {}
+				session &&
+				session.ws.readyState === WebSocket.OPEN &&
+				session.endpointDigest === pending.endpointDigest &&
+				session.hostGeneration === pending.generation &&
+				this.#logicalSessionId(session) === pending.logicalSessionId
+			) {
+				try {
+					session.ws.send(
+						JSON.stringify({
+							type: "ephemeral_turn_cancel",
+							sessionId: pending.logicalSessionId,
+							token: session.token,
+							requestId,
+							updateId: pending.updateId,
+							messageId: pending.messageId,
+							threadId: pending.threadId,
+							reason: "daemon_shutdown",
+						}),
+					);
+				} catch {}
+			}
+			await this.#terminalizeBtwTurn(requestId, pending, true);
 		}
-		const deadline = this.runtime.now() + 2_000;
-		while (this.#pendingBtwTurns.size > 0 && this.runtime.now() < deadline) await this.runtime.sleep(10);
-		this.#pendingBtwTurns.clear();
+		this.#btwDeliveryAbort.abort();
 		this.#btwTerminalTombstones.clear();
 		this.pool.removeWhere(() => true);
 	}
@@ -3469,17 +3512,7 @@ export class TelegramNotificationDaemon {
 			)
 				return;
 			if (msg.status === "ok" && typeof msg.text !== "string") return;
-			this.#pendingBtwTurns.delete(requestId);
-			this.#btwTerminalTombstones.set(requestId, {
-				sessionId: pending.logicalSessionId,
-				updateId: pending.updateId,
-				messageId: pending.messageId,
-				threadId: pending.threadId,
-				expiresAt: (this.opts.now?.() ?? Date.now()) + BTW_PENDING_TTL_MS,
-			});
-			while (this.#pendingBtwTurns.size + this.#btwTerminalTombstones.size > BTW_MAX_PENDING)
-				this.#btwTerminalTombstones.delete(this.#btwTerminalTombstones.keys().next().value!);
-			if (this.#stoppingBtw) return;
+			if (this.#stoppingBtw || !this.#takeBtwTurn(requestId, pending)) return;
 			if (msg.status !== "ok") {
 				const text =
 					msg.status === "busy"
