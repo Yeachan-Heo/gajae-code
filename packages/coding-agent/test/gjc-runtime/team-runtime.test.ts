@@ -4325,6 +4325,40 @@ describe("stalled worker continuation protocol", () => {
 		}
 	});
 
+	it("does not recreate a GC-pruned missing-pane worker during a later monitor", async () => {
+		const fixture = await prepareContinuation("continuation-gc-first-team");
+		const configPath = path.join(fixture.stateDir, "config.json");
+		const config = await readTeamConfig(fixture.stateDir);
+		await Bun.write(
+			configPath,
+			`${JSON.stringify({ ...config, workers: config.workers.map(worker => ({ ...worker, pane_id: "%999" })) })}\n`,
+		);
+		const workerPath = path.join(fixture.stateDir, "workers", "worker-1");
+		expect(
+			await pruneTeamWorkerGcRecord(
+				{
+					store: "team_workers",
+					id: `${fixture.teamName}/worker-1`,
+					path: workerPath,
+					status: "dead",
+					stale: true,
+					removable: true,
+					action: "would_remove",
+					reason: "dead",
+				},
+				() => ({ status: "dead" }),
+			),
+		).toBe(true);
+		expect(await Bun.file(workerPath).exists()).toBe(false);
+
+		await monitorGjcTeam(fixture.teamName, cleanupRoot!, fixture.env);
+
+		expect(await Bun.file(workerPath).exists()).toBe(false);
+		expect(await readEvents(fixture.stateDir)).not.toContain("worker_lifecycle_nudge");
+		const task = await readGjcTeamTask(fixture.teamName, "task-1", cleanupRoot!, fixture.env);
+		expect(task.status).toBe("pending");
+		expect(task.claim).toBeUndefined();
+	});
 	it("keeps stale-claim GC blocked behind a monitor-held mutation fence", async () => {
 		const fixture = await prepareContinuation("continuation-gc-fence-team");
 		let release!: () => void;

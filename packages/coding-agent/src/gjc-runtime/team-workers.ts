@@ -818,8 +818,14 @@ export async function reconcileGjcTeamStaleClaimsUnlocked(
 		const reasons = await livenessReasons(runtime, dir, config, worker, env);
 		if (reasons.length === 0) continue;
 		staleWorkers[worker.id] = reasons;
-		if (reasons.includes("missing_pane") && !reasons.includes("worker_lifecycle_stopped"))
-			await writeWorkerLifecycleRecord(runtime, dir, worker, "failed", { stop_reason: "pane_missing" });
+		if (reasons.includes("missing_pane") && !reasons.includes("worker_lifecycle_stopped")) {
+			try {
+				await fs.access(runtime.workerDir(dir, worker.id));
+				await writeWorkerLifecycleRecord(runtime, dir, worker, "failed", { stop_reason: "pane_missing" });
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+		}
 	}
 	const recoveredClaims: GjcTeamRecoveredClaim[] = [];
 	for (const task of await runtime.readTasks(dir)) {
