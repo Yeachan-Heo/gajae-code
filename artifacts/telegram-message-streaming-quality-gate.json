@@ -1,0 +1,137 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "Follow-up architect review agent://2-TelegramStreamingFollowupReview approved the updated diff with no blockers. It confirmed Discord/Slack live turn_stream filtering, Telegram setting/env wiring, redaction suppression, and finalized/keyless behavior preservation.",
+    "commands": ["architect review lane: agent://2-TelegramStreamingFollowupReview"],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "Focused tests passed: bun test packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/notifications-config.test.ts packages/coding-agent/test/sdk-chat-daemon-worker.test.ts => 53 pass / 0 fail. Broader affected focused tests passed: bun test packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/notifications-config.test.ts packages/coding-agent/test/notification-settings-controller.test.ts packages/coding-agent/test/notifications-session-control.test.ts => 55 pass / 0 fail. Type/check gate passed: bun --cwd=packages/coding-agent run check. Schema check passed: bun run check:schemas. Follow-up QA lane agent://3-TelegramStreamingFollowupQA reported passed with no blockers.",
+    "e2eCommands": [
+      "bun test packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/notifications-config.test.ts packages/coding-agent/test/sdk-chat-daemon-worker.test.ts",
+      "bun test packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/notifications-config.test.ts packages/coding-agent/test/notification-settings-controller.test.ts packages/coding-agent/test/notifications-session-control.test.ts"
+    ],
+    "redTeamCommands": ["executor QA/red-team lane: agent://3-TelegramStreamingFollowupQA"],
+    "artifactRefs": [
+      {
+        "id": "telegram-streaming-quality-gate",
+        "kind": "api-package-test-report",
+        "path": "artifacts/telegram-message-streaming-quality-gate.json",
+        "description": "Telegram streaming config/runtime test and review evidence"
+      }
+    ],
+    "contractCoverage": [
+      {
+        "id": "stream-setting",
+        "contractRef": "notifications.telegram.streaming.enabled",
+        "obligation": "Global Telegram streaming setting enables live Telegram turn_stream frames without env opt-in.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["live-stream-tests"],
+        "adversarialCaseRefs": ["settings-enable"]
+      },
+      {
+        "id": "env-overrides",
+        "contractRef": "GJC_NOTIFICATIONS_STREAM",
+        "obligation": "Env 1 enables streaming; 0/off/false with whitespace disables it per process.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["live-stream-tests"],
+        "adversarialCaseRefs": ["env-disable-aliases"]
+      },
+      {
+        "id": "redaction",
+        "contractRef": "notifications.redact",
+        "obligation": "Redaction suppresses live and finalized turn_stream content.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["live-stream-tests"],
+        "adversarialCaseRefs": ["redaction-stream-suppression"]
+      },
+      {
+        "id": "chat-adapter-boundary",
+        "contractRef": "Discord/Slack notification adapters",
+        "obligation": "Telegram live partial streaming must not make Discord or Slack post phase=live partials.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["chat-daemon-tests"],
+        "adversarialCaseRefs": ["discord-slack-live-filter"]
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "id": "live-stream-tests",
+        "contractRef": "Telegram SDK turn_stream producer",
+        "surface": "package",
+        "invocation": "bun test packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/notifications-config.test.ts",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-quality-gate"]
+      },
+      {
+        "id": "chat-daemon-tests",
+        "contractRef": "Discord/Slack chat daemon runtime",
+        "surface": "package",
+        "invocation": "bun test packages/coding-agent/test/sdk-chat-daemon-worker.test.ts",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-quality-gate"]
+      },
+      {
+        "id": "type-schema-checks",
+        "contractRef": "Typed config and generated schema",
+        "surface": "package",
+        "invocation": "bun --cwd=packages/coding-agent run check; bun run check:schemas",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-quality-gate"]
+      }
+    ],
+    "adversarialCases": [
+      {
+        "id": "settings-enable",
+        "contractRef": "notifications.telegram.streaming.enabled",
+        "scenario": "Streaming env unset but global Telegram streaming setting true.",
+        "expectedBehavior": "A live turn_stream frame is emitted with messageRef matching the finalized frame.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-quality-gate"]
+      },
+      {
+        "id": "env-disable-aliases",
+        "contractRef": "GJC_NOTIFICATIONS_STREAM",
+        "scenario": "Global setting true but env is 0/off/false or whitespace-padded OFF.",
+        "expectedBehavior": "No live frames are emitted and finalized turn_stream has no messageRef.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-quality-gate"]
+      },
+      {
+        "id": "redaction-stream-suppression",
+        "contractRef": "notifications.redact",
+        "scenario": "Streaming enabled while notification redaction is true.",
+        "expectedBehavior": "No live or finalized turn_stream content frames are emitted.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-quality-gate"]
+      },
+      {
+        "id": "discord-slack-live-filter",
+        "contractRef": "Discord/Slack chat daemon runtime",
+        "scenario": "Shared SDK emits phase=live turn_stream frames while Discord/Slack daemons are attached.",
+        "expectedBehavior": "Discord and Slack ignore live partials; non-live/keyless turn_stream behavior remains available.",
+        "verdict": "passed",
+        "artifactRefs": ["telegram-streaming-quality-gate"]
+      }
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "Initial architect/QA review found cross-adapter leakage and coverage gaps. Fixes added Discord/Slack live-frame filtering, env trim/alias coverage, redaction coverage, and settings/lightweight propagation coverage. Follow-up architect and QA lanes are clean; focused tests and package check reran cleanly.",
+    "fullRerun": true,
+    "rerunCommands": [
+      "bun test packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/notifications-config.test.ts packages/coding-agent/test/sdk-chat-daemon-worker.test.ts",
+      "bun test packages/coding-agent/test/notifications-live-stream.test.ts packages/coding-agent/test/notifications-config.test.ts packages/coding-agent/test/notification-settings-controller.test.ts packages/coding-agent/test/notifications-session-control.test.ts",
+      "bun --cwd=packages/coding-agent run check",
+      "bun run check:schemas"
+    ],
+    "blockers": []
+  }
+}

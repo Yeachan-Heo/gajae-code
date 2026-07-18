@@ -77,6 +77,21 @@ describe("notifications daemon config reachability (rich)", () => {
 		const cfg = cfgFromRaw({ notifications: { telegram: { topics: { nameTemplate: 42 } } } });
 		expect(cfg.topics.nameTemplate).toBeUndefined();
 	});
+	test("missing streaming defaults to enabled", () => {
+		const cfg = cfgFromRaw({ notifications: { enabled: true, telegram: { botToken: "token", chatId: "42" } } });
+		expect(cfg.streaming.enabled).toBe(true);
+	});
+	test("malformed streaming values use the default while explicit false is preserved", () => {
+		const malformed = cfgFromRaw({
+			notifications: { telegram: { streaming: { enabled: "no" } } },
+		});
+		const disabled = cfgFromRaw({
+			notifications: { telegram: { streaming: { enabled: false } } },
+		});
+
+		expect(malformed.streaming.enabled).toBe(true);
+		expect(disabled.streaming.enabled).toBe(false);
+	});
 });
 
 describe("notifications daemon config reachability (providers)", () => {

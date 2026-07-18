@@ -65,6 +65,7 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 				idleTimeoutMs: 60_000,
 				rich: { enabled: true },
 				richDraft: { enabled: false },
+				streaming: { enabled: true },
 				topics: { nameTemplate: undefined },
 			})
 		) {
@@ -97,6 +98,7 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 			idleTimeoutMs: 60_000,
 			rich: { enabled: true },
 			richDraft: { enabled: false },
+			streaming: { enabled: true },
 			topics: { nameTemplate: undefined },
 		})
 	) {

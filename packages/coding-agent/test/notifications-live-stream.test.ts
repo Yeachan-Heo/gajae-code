@@ -96,7 +96,9 @@ function setEnv(over: Partial<Record<(typeof envKeys)[number], string>>): void {
 	for (const [k, v] of Object.entries(over)) process.env[k] = v;
 }
 
-async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unknown; frames: Frame[] }> {
+async function bootSession(
+	settingsOverrides: Record<string, unknown> = {},
+): Promise<{ handlers: Map<string, Handler>; ctx: unknown; frames: Frame[] }> {
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
@@ -107,7 +109,7 @@ async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unk
 	const agentDir = path.join(cwd, ".gjc", "agent");
 	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 	cleanupRoots.push(cleanup);
-	createNotificationsExtension(api, { settings: isolatedNotificationSettings(agentDir) });
+	createNotificationsExtension(api, { settings: isolatedNotificationSettings(agentDir, settingsOverrides) });
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -181,8 +183,8 @@ test("rapid live updates are throttled to a single frame within the interval", a
 	expect(live().length).toBe(1); // later updates fall inside the throttle window
 });
 
-test("no live frames are emitted when streaming is disabled, and finalized carries no messageRef", async () => {
-	setEnv({ GJC_NOTIFICATIONS: "1" }); // GJC_NOTIFICATIONS_STREAM unset -> off
+test("GJC_NOTIFICATIONS_STREAM=0 disables live frames, and finalized carries no messageRef", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM: "0" });
 	const { handlers, ctx, frames } = await bootSession();
 
 	await handlers.get("message_update")!(assistant("should not stream"), ctx);
@@ -196,6 +198,75 @@ test("no live frames are emitted when streaming is disabled, and finalized carri
 	await waitFor(() => frames.some(f => f.type === "turn_stream" && f.phase === "finalized"), 3000, "finalized");
 	const final = frames.find(f => f.type === "turn_stream" && f.phase === "finalized")!;
 	expect(final.messageRef).toBeUndefined();
+});
+test("stored Telegram streaming false disables live frames without an env override", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	const { handlers, ctx, frames } = await bootSession({ "notifications.telegram.streaming.enabled": false });
+
+	await handlers.get("message_update")!(assistant("stored setting disables stream"), ctx);
+	await sleep(200);
+	expect(frames.filter(f => f.type === "turn_stream" && f.phase === "live").length).toBe(0);
+
+	await handlers.get("turn_end")!(
+		{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "stored setting final" } },
+		ctx,
+	);
+	await waitFor(() => frames.some(f => f.type === "turn_stream" && f.phase === "finalized"), 3000, "finalized");
+	const final = frames.find(f => f.type === "turn_stream" && f.phase === "finalized")!;
+	expect(final.messageRef).toBeUndefined();
+});
+
+test("default Telegram streaming setting enables live frames without the env opt-in", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	const { handlers, ctx, frames } = await bootSession();
+
+	await handlers.get("message_update")!(assistant("settings enabled stream"), ctx);
+	await waitFor(
+		() => frames.some(f => f.type === "turn_stream" && f.phase === "live"),
+		3000,
+		"settings-enabled live frame",
+	);
+	const live = frames.find(f => f.type === "turn_stream" && f.phase === "live")!;
+	expect(live.text).toContain("settings enabled stream");
+	expect(live.messageRef).toBe("1");
+});
+
+for (const value of ["0", "off", "false", " OFF "]) {
+	test(`GJC_NOTIFICATIONS_STREAM=${JSON.stringify(value)} disables live frames even when the global setting is enabled`, async () => {
+		setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM: value });
+		const { handlers, ctx, frames } = await bootSession({ "notifications.telegram.streaming.enabled": true });
+
+		await handlers.get("message_update")!(assistant("disabled by env"), ctx);
+		await sleep(200);
+
+		expect(frames.filter(f => f.type === "turn_stream" && f.phase === "live").length).toBe(0);
+
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "final after disabled env" } },
+			ctx,
+		);
+		await waitFor(
+			() => frames.some(f => f.type === "turn_stream" && f.phase === "finalized"),
+			3000,
+			"disabled-env finalized",
+		);
+		const final = frames.find(f => f.type === "turn_stream" && f.phase === "finalized")!;
+		expect(final.messageRef).toBeUndefined();
+	});
+}
+
+test("redaction suppresses live and finalized turn_stream content even when streaming is enabled", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM: "1" });
+	const { handlers, ctx, frames } = await bootSession({ "notifications.redact": true });
+
+	await handlers.get("message_update")!(assistant("secret live content"), ctx);
+	await handlers.get("turn_end")!(
+		{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "secret final content" } },
+		ctx,
+	);
+	await sleep(200);
+
+	expect(frames.filter(f => f.type === "turn_stream").length).toBe(0);
 });
 
 // ---------------------------------------------------------------------------

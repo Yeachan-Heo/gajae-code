@@ -707,6 +707,7 @@ export interface SettingsCallbacks {
 	onPluginsChanged?: () => void;
 	/** Called when settings panel is closed */
 	onCancel: () => void;
+	onUpdate?: () => void;
 }
 
 /**
@@ -1060,6 +1061,7 @@ export class SettingsSelectorComponent extends Container {
 		if (!this.notificationsOperations) return;
 		this.#notificationsEditor = new NotificationsSettingsEditorComponent(this.notificationsOperations, {
 			onCancel: () => this.callbacks.onCancel(),
+			onUpdate: () => this.callbacks.onUpdate?.(),
 		});
 		this.addChild(this.#notificationsEditor);
 	}

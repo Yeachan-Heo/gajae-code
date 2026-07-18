@@ -333,6 +333,7 @@ export function createNotificationsEditorOperations(
 					sessionScope: config.sessionScope,
 					richEnabled: config.rich.enabled,
 					richDraftEnabled: config.richDraft.enabled,
+					streamingEnabled: config.streaming.enabled,
 				},
 			};
 		},
@@ -470,6 +471,7 @@ export function createNotificationsEditorOperations(
 					tokenFingerprint: setup.tokenFingerprint,
 					richEnabled: input.richEnabled,
 					richDraftEnabled: input.richDraftEnabled,
+					streamingEnabled: input.streamingEnabled,
 				};
 				drafts.set(draft, token);
 				const pairingMessage =
@@ -513,6 +515,7 @@ export function createNotificationsEditorOperations(
 					{ path: "notifications.telegram.chatId", op: "set", value: draft.chatId },
 					{ path: "notifications.telegram.rich.enabled", op: "set", value: draft.richEnabled },
 					{ path: "notifications.telegram.richDraft.enabled", op: "set", value: draft.richDraftEnabled },
+					{ path: "notifications.telegram.streaming.enabled", op: "set", value: draft.streamingEnabled },
 				]);
 				drafts.delete(draft);
 				const activationMarker = createTelegramActivationMarker({
@@ -683,6 +686,7 @@ export function createNotificationsEditorOperations(
 					{ path: "notifications.sessionScope", op: "set", value: preferences.sessionScope },
 					{ path: "notifications.telegram.rich.enabled", op: "set", value: preferences.richEnabled },
 					{ path: "notifications.telegram.richDraft.enabled", op: "set", value: preferences.richDraftEnabled },
+					{ path: "notifications.telegram.streaming.enabled", op: "set", value: preferences.streamingEnabled },
 				]);
 				await notifyAfterDurableCommit();
 				return { receipt, message: "Notification preferences saved atomically." };
@@ -1173,6 +1177,7 @@ export class SelectorController {
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
 						},
+						onUpdate: () => this.ctx.ui.requestRender(),
 					},
 					notificationsOperations,
 				);

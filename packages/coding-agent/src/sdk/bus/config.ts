@@ -61,6 +61,9 @@ export interface NotificationSettingsSnapshot {
 		richDraft: {
 			enabled: boolean;
 		};
+		streaming: {
+			enabled: boolean;
+		};
 		topics: {
 			nameTemplate?: string;
 		};
@@ -127,6 +130,9 @@ export interface NotificationConfig {
 	richDraft: {
 		enabled: boolean;
 	};
+	streaming: {
+		enabled: boolean;
+	};
 	topics: {
 		/**
 		 * Optional Telegram forum-topic name template with `{repo}`, `{branch}`,
@@ -155,6 +161,7 @@ export function getNotificationConfig(settings: NotificationSettingsReader): Not
 		idleTimeoutMs: snapshot.idleTimeoutMs,
 		rich: snapshot.telegram.rich,
 		richDraft: snapshot.telegram.richDraft,
+		streaming: snapshot.telegram.streaming,
 		topics: snapshot.telegram.topics,
 	};
 }

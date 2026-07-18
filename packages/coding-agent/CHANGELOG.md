@@ -4,6 +4,7 @@
 
 ### Fixed
 - Skill invocation failures now list available skill names so agents can recover from typos without a blind retry loop.
+- Telegram live-message streaming now keeps its default-on behavior consistent across full Settings, lightweight daemons, fallback producers, and the settings editor when the new key is absent.
 - Workflow state receipts now use canonical session-layout paths, require resolved session identity, and report a `state_path` that matches native write/clear output (#2393).
 - Coordinator MCP operational calls now canonically bootstrap or reuse the agent-global SDK broker when discovery is absent or stale, while coordinator/hermes JSON checks report catalog and broker-discovery readiness separately without mutating broker state (#2552).
 - Coordinator MCP question polling now requires a session, reconciles pending workflow gates into bounded public questions, diagnostics, and reconciliation state, and submits bound idempotent answers through `workflow.gate_answer` without exposing private gate payloads (#2550).

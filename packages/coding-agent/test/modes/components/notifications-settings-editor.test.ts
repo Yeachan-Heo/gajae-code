@@ -77,6 +77,7 @@ function state(): NotificationsEditorState {
 			sessionScope: "all",
 			richEnabled: true,
 			richDraftEnabled: false,
+			streamingEnabled: false,
 		},
 		health: health(),
 	};
@@ -89,6 +90,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 	healthGate: Deferred<NotificationHealthReport> | undefined;
 	recoverFailure = false;
 	testGate: Deferred<{ ok: boolean; adapter: "telegram"; chatId: string | undefined; detail: string }> | undefined;
+	commitPreferencesGate: Deferred<{ message: string }> | undefined;
 	preflightSignal: AbortSignal | undefined;
 	healthSignal: AbortSignal | undefined;
 	removedTelegram = false;
@@ -151,6 +153,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 				tokenFingerprint: "telegram:cafefeed",
 				richEnabled: input.richEnabled,
 				richDraftEnabled: input.richDraftEnabled,
+				streamingEnabled: input.streamingEnabled,
 			},
 		};
 	}
@@ -202,6 +205,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 	}
 
 	async commitPreferences(preferences: NotificationsEditorPreferences) {
+		if (this.commitPreferencesGate) await this.commitPreferencesGate.promise;
 		this.committedPreferences.push({ ...preferences });
 		this.state.preferences = { ...preferences };
 		this.state.status.redact = preferences.redact;
@@ -252,6 +256,22 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(component.mode).toBe("chat-entry");
 		expect(render(component)).toContain("private chat ID (optional)");
 	});
+	it("keeps streaming enabled while notification state is still loading", async () => {
+		const operations = new FakeNotificationsOperations();
+		const loadGate = deferred<NotificationsEditorState>();
+		operations.loadState = () => loadGate.promise;
+		const component = new NotificationsSettingsEditorComponent(operations);
+
+		select(component, 10);
+		component.handleInput("\n");
+		select(component, 5);
+
+		expect(render(component)).toContain("Telegram message streaming: on");
+
+		loadGate.resolve(state());
+		await flush();
+		component.dispose();
+	});
 
 	it("wraps CJK status guidance without truncating any localized sentence", async () => {
 		const operations = new FakeNotificationsOperations();
@@ -293,12 +313,41 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(render(component)).toContain("unsaved draft");
 		component.handleInput("\n"); // redact on in the editor-only preference draft
 		expect(operations.committedPreferences).toEqual([]);
-		select(component, 5);
+		select(component, 6);
 		component.handleInput("\n");
 		await flush();
 		expect(operations.committedPreferences).toEqual([
-			{ redact: true, verbosity: "lean", sessionScope: "all", richEnabled: true, richDraftEnabled: false },
+			{
+				redact: true,
+				verbosity: "lean",
+				sessionScope: "all",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: false,
+			},
 		]);
+	});
+
+	it("requests a render when guarded preference save completes asynchronously", async () => {
+		const operations = new FakeNotificationsOperations();
+		operations.commitPreferencesGate = deferred();
+		let updates = 0;
+		const component = new NotificationsSettingsEditorComponent(operations, { onUpdate: () => (updates += 1) });
+		await flush();
+
+		select(component, 10);
+		component.handleInput("\n");
+		component.handleInput("\n");
+		select(component, 6);
+		component.handleInput("\n");
+
+		expect(render(component)).toContain("PENDING");
+		const beforeComplete = updates;
+		operations.commitPreferencesGate.resolve({ message: "Preferences saved." });
+		await flush();
+
+		expect(updates).toBeGreaterThan(beforeComplete);
+		expect(render(component)).toContain("OK");
 	});
 
 	it("guides pairing discovery without a chat ID and accurately labels supplied-chat validation", async () => {
@@ -465,7 +514,13 @@ describe("NotificationsSettingsEditorComponent", () => {
 			status: "ready",
 			identity: { status: "foreign" },
 			message: "late foreign result",
-			draft: { chatId: "1001", tokenMask: "••••", richEnabled: true, richDraftEnabled: false },
+			draft: {
+				chatId: "1001",
+				tokenMask: "••••",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: false,
+			},
 		});
 		await flush();
 		expect(pairing.mode).toBe("home");

@@ -62,6 +62,9 @@ const BASE_CFG: NotificationConfig = {
 	richDraft: {
 		enabled: false,
 	},
+	streaming: {
+		enabled: true,
+	},
 	topics: {
 		nameTemplate: undefined,
 	},
@@ -133,6 +136,9 @@ describe("notifications config", () => {
 			richDraft: {
 				enabled: false,
 			},
+			streaming: {
+				enabled: true,
+			},
 			topics: {
 				nameTemplate: undefined,
 			},
@@ -173,6 +179,7 @@ describe("notifications config", () => {
 			"notifications.telegram.chatId": "telegram-chat",
 			"notifications.telegram.rich.enabled": false,
 			"notifications.telegram.richDraft.enabled": true,
+			"notifications.telegram.streaming.enabled": true,
 			"notifications.telegram.topics.nameTemplate": "{repo}/{branch}",
 			"notifications.discord.botToken": "discord-token",
 			"notifications.discord.applicationId": "discord-application",
@@ -199,6 +206,7 @@ describe("notifications config", () => {
 						chatId: "telegram-chat",
 						rich: { enabled: false },
 						richDraft: { enabled: true },
+						streaming: { enabled: true },
 						topics: { nameTemplate: "{repo}/{branch}" },
 					},
 					discord: {
@@ -224,6 +232,30 @@ describe("notifications config", () => {
 
 		expect(settings.getNotificationSettingsSnapshot()).toEqual(lightweight.getNotificationSettingsSnapshot());
 		expect(getNotificationConfig(settings)).toEqual(getNotificationConfig(lightweight));
+	});
+	test("absent streaming keys default on across full Settings and the lightweight daemon", () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": "telegram-token",
+			"notifications.telegram.chatId": "telegram-chat",
+		});
+		const lightweight = createLightweightDaemonSettings({
+			agentDir: "/tmp/gjc-notification-snapshot-absent",
+			rawConfig: {
+				notifications: {
+					enabled: true,
+					telegram: {
+						botToken: "telegram-token",
+						chatId: "telegram-chat",
+					},
+				},
+			},
+		});
+
+		expect(settings.getNotificationSettingsSnapshot().telegram.streaming.enabled).toBe(true);
+		expect(lightweight.getNotificationSettingsSnapshot().telegram.streaming.enabled).toBe(true);
+		expect(getNotificationConfig(settings).streaming.enabled).toBe(true);
+		expect(getNotificationConfig(lightweight).streaming.enabled).toBe(true);
 	});
 
 	test("project notification settings are ignored without leaking credentials", async () => {

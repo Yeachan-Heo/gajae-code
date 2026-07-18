@@ -332,6 +332,9 @@ describe("chat daemon worker", () => {
 			threadId: "thread-1",
 			content: "GJC identity header\ntitle: Replay identity\nrepo: replay-repo\nbranch: replay-branch",
 		});
+		client.handler?.({ type: "turn_stream", sessionId: "session", phase: "live", text: "partial outbound" });
+		await Bun.sleep(10);
+		expect(provider.messages.some(message => message.content.includes("partial outbound"))).toBe(false);
 		client.handler?.({ type: "turn_stream", sessionId: "session", text: "outbound" });
 		await turnStreamPosted;
 		expect(provider.messages).toContainEqual({ threadId: "thread-1", content: "GJC turn stream\noutbound" });
@@ -689,6 +692,9 @@ describe("chat daemon worker", () => {
 			createClient: async () => firstClient,
 		});
 		await firstRuntime.start();
+		firstClient.handler?.({ type: "turn_stream", sessionId: "session", phase: "live", text: "partial slack" });
+		await Bun.sleep(10);
+		expect(firstProvider.posts.some(post => post.text.includes("partial slack"))).toBe(false);
 		firstClient.handler?.({
 			type: "action_needed",
 			sessionId: "session",
