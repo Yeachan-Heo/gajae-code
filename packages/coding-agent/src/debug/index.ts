@@ -443,7 +443,7 @@ export class DebugSelectorComponent extends Container {
 		return {
 			model: this.ctx.session.model?.id,
 			thinkingLevel: this.ctx.session.thinkingLevel,
-			planModeEnabled: this.ctx.planModeEnabled,
+			planModeEnabled: this.ctx.planModeController.enabled,
 			toolOutputExpanded: this.ctx.toolOutputExpanded,
 			hideThinkingBlock: this.ctx.hideThinkingBlock,
 		};

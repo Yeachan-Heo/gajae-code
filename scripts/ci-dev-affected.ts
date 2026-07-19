@@ -142,6 +142,14 @@ async function main(): Promise<void> {
 		await validateAggregate();
 		return;
 	}
+	if (process.argv.includes("--write-affected-evidence")) {
+		await writeAffectedEvidence();
+		return;
+	}
+	if (process.argv.includes("--validate-affected-evidence")) {
+		await validateAffectedEvidence();
+		return;
+	}
 	if (process.argv.includes("--native-build")) {
 		await runNativeBuild();
 		return;
@@ -258,6 +266,8 @@ function isNativeBuildKey(key: string): boolean {
 function taskNeedsNative(key: string): boolean {
 	return (
 		key === "root-test" ||
+		key === "root-check" ||
+		key === "check:@gajae-code/coding-agent" ||
 		key === "cli-smoke" ||
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||
@@ -448,6 +458,7 @@ async function resolveBaseRef(): Promise<string> {
 			const value = mergeBase.stdout.toString().trim();
 			if (value !== "") return value;
 		}
+		if (baseSha && !ZERO_SHA.test(baseSha)) return baseSha;
 		return `origin/${baseRef}`;
 	}
 	if (baseSha && !ZERO_SHA.test(baseSha)) {
@@ -1297,6 +1308,8 @@ async function validateAggregate(): Promise<void> {
 		hasNative: Bun.env.CI_DEV_HAS_NATIVE?.trim() || "",
 		hasTasks: Bun.env.CI_DEV_HAS_TASKS?.trim() || "",
 	};
+
+
 	console.log(`affected-plan: ${results.plan}`);
 	console.log(`affected-native: ${results.native}`);
 	console.log(`affected-shards: ${results.shards}`);
@@ -1307,12 +1320,199 @@ async function validateAggregate(): Promise<void> {
 	validateAffectedAggregate(results);
 	const tasks = await loadCanonicalPlan();
 	if (!tasks) throw new Error("affected-plan-invalid: aggregate requires a canonical plan");
+	validatePlanCapabilities(tasks, results, Bun.env.CI_DEV_PLAN_MODE?.trim() || resolvePlanMode());
+	console.log("Affected path validation: all required shards passed");
+}
+
+function validatePlanCapabilities(tasks: readonly Task[], results: Pick<AffectedAggregateResults, "hasNative" | "hasTasks">, mode: string): void {
+	if (mode !== "pr" && mode !== "push") throw new Error("affected-plan-invalid: invalid plan mode");
 	const expectedHasNative = String(tasks.some(task => task.capabilities?.nativeProducer === true));
 	const expectedHasTasks = String(tasks.some(task => task.capabilities?.nativeProducer !== true));
-	if (results.hasNative !== expectedHasNative || results.hasTasks !== expectedHasTasks) {
-		throw new Error("affected-plan-invalid: planner flags do not match canonical plan");
+	if (results.hasNative !== expectedHasNative || results.hasTasks !== expectedHasTasks) throw new Error("affected-plan-invalid: plan capability flags mismatch");
+}
+
+const AFFECTED_EVIDENCE_MANIFEST = ".ci-dev-affected-evidence.json";
+const AFFECTED_EVIDENCE_RECEIPT = ".ci-dev-affected-evidence.receipt.json";
+const AFFECTED_PLAN_NAME = ".ci-dev-affected-plan.json";
+const AFFECTED_SHARD_DIR = ".ci-dev-shard-receipts";
+const SHA256 = /^[a-f0-9]{64}$/;
+const SOURCE_SHA = /^[a-f0-9]{40}$/;
+
+type EvidenceChild = { name: string; sha256: string };
+type EvidenceTask = { key: string; identity: string };
+type ReplayScope = { repository: string; workflow: string; runId: string };
+type AffectedEvidenceManifest = {
+	schemaVersion: 1; subject: "ci-dev-affected-evidence"; sourceSha: string; planDigest: string; planMode: PlanMode;
+	replayScope: ReplayScope; aggregateResults: AffectedAggregateResults; taskIdentities: EvidenceTask[]; childEvidence: EvidenceChild[];
+};
+type DetachedEvidenceReceipt = {
+	schemaVersion: 1; subject: "ci-dev-affected-evidence"; manifestSha256: string; sourceSha: string; planDigest: string; replayScope: ReplayScope;
+};
+
+function sha256(value: string | Uint8Array): string { return new Bun.CryptoHasher("sha256").update(value).digest("hex"); }
+function canonicalEvidence(value: object): string { return `${JSON.stringify(value)}\n`; }
+function evidenceRoot(): string { return path.resolve(requiredEnv("CI_DEV_EVIDENCE_ROOT")); }
+function evidenceError(reason: string): Error { return new Error(`affected-evidence-invalid: ${reason}`); }
+function exactKeys(value: Record<string, unknown>, keys: readonly string[], reason: string): void {
+	if (Object.keys(value).length !== keys.length || Object.keys(value).some(key => !keys.includes(key))) throw evidenceError(reason);
+}
+function requiredEnv(name: string): string { const value = Bun.env[name]?.trim(); if (!value) throw evidenceError(`missing ${name}`); return value; }
+
+function isMissingError(error: unknown): boolean { return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"; }
+async function checkedEvidencePath(root: string, relative: string, finalKind: "file" | "directory"): Promise<string> {
+	const resolvedRoot = path.resolve(root);
+	const target = path.resolve(resolvedRoot, relative);
+	if (!target.startsWith(`${resolvedRoot}${path.sep}`)) throw evidenceError("path escaped staging root");
+	let rootStat: import("node:fs").Stats;
+	try { rootStat = await fs.lstat(resolvedRoot); } catch (error) { if (isMissingError(error)) throw evidenceError("missing staging root"); throw error; }
+	if (rootStat.isSymbolicLink()) throw evidenceError("symlink staging root");
+	if (!rootStat.isDirectory()) throw evidenceError("non-directory staging root");
+	let current = resolvedRoot;
+	for (const piece of path.relative(resolvedRoot, target).split(path.sep)) {
+		current = path.join(current, piece);
+		let stat: import("node:fs").Stats;
+		try { stat = await fs.lstat(current); } catch (error) { if (isMissingError(error)) throw evidenceError("missing evidence object"); throw error; }
+		if (stat.isSymbolicLink()) throw evidenceError("symlink evidence object");
+		const final = current === target;
+		if (final ? (finalKind === "file" ? !stat.isFile() : !stat.isDirectory()) : !stat.isDirectory()) {
+			throw evidenceError(final ? `non-${finalKind} evidence object` : "non-directory evidence parent");
+		}
 	}
-	console.log("Affected path validation: all required shards passed");
+	return target;
+}
+async function readEvidenceBytes(root: string, relative: string): Promise<Uint8Array> { return new Uint8Array(await fs.readFile(await checkedEvidencePath(root, relative, "file"))); }
+function decodeEvidenceJson(raw: Uint8Array): string { try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw); } catch { throw evidenceError("malformed UTF-8 evidence"); } }
+async function readEvidenceFile(root: string, relative: string): Promise<string> { return decodeEvidenceJson(await readEvidenceBytes(root, relative)); }
+async function checkEvidenceDirectory(root: string, relative: string): Promise<string> { return checkedEvidencePath(root, relative, "directory"); }
+
+function expectedEvidenceTasks(tasks: readonly Task[]): EvidenceTask[] {
+	return tasks.filter(task => task.capabilities?.nativeProducer !== true).map(task => ({ key: task.key, identity: canonicalTaskIdentity(task) }));
+}
+function expectedEvidenceNames(tasks: readonly Task[]): string[] {
+	return [AFFECTED_PLAN_NAME, ...expectedEvidenceTasks(tasks).map((_, index) => `${AFFECTED_SHARD_DIR}/${index}.json`)];
+}
+function canonicalReplayScope(): ReplayScope {
+	return { repository: requiredEnv("GITHUB_REPOSITORY"), workflow: requiredEnv("GITHUB_WORKFLOW"), runId: requiredEnv("GITHUB_RUN_ID") };
+}
+function aggregateFromEnv(): AffectedAggregateResults {
+	return { plan: requiredEnv("CI_DEV_PLAN_RESULT"), native: requiredEnv("CI_DEV_NATIVE_RESULT"), shards: requiredEnv("CI_DEV_SHARDS_RESULT"), windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"), windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"), hasNative: requiredEnv("CI_DEV_HAS_NATIVE"), hasTasks: requiredEnv("CI_DEV_HAS_TASKS") };
+}
+function parseAggregate(value: unknown): AffectedAggregateResults {
+	if (!isRecord(value)) throw evidenceError("malformed aggregate results");
+	exactKeys(value, ["plan", "native", "shards", "windowsDoctor", "windowsDoctorRequired", "hasNative", "hasTasks"], "unexpected aggregate results field");
+	if (!Object.values(value).every(isString)) throw evidenceError("malformed aggregate results");
+	return { plan: value.plan as string, native: value.native as string, shards: value.shards as string, windowsDoctor: value.windowsDoctor as string, windowsDoctorRequired: value.windowsDoctorRequired as string, hasNative: value.hasNative as string, hasTasks: value.hasTasks as string };
+}
+function parseReplayScope(value: unknown): ReplayScope {
+	if (!isRecord(value)) throw evidenceError("malformed replay scope");
+	exactKeys(value, ["repository", "workflow", "runId"], "unexpected replay scope field");
+	if (!isString(value.repository) || !isString(value.workflow) || !isString(value.runId) || !value.repository || !value.workflow || !value.runId) throw evidenceError("malformed replay scope");
+	return { repository: value.repository, workflow: value.workflow, runId: value.runId };
+}
+function parseEvidenceTasks(value: unknown): EvidenceTask[] {
+	if (!Array.isArray(value)) throw evidenceError("malformed task identities");
+	return value.map(entry => { if (!isRecord(entry)) throw evidenceError("malformed task identity"); exactKeys(entry, ["key", "identity"], "unexpected task identity field"); if (!isString(entry.key) || !isString(entry.identity) || !entry.key || !entry.identity) throw evidenceError("malformed task identity"); return { key: entry.key, identity: entry.identity }; });
+}
+function parseEvidenceChildren(value: unknown): EvidenceChild[] {
+	if (!Array.isArray(value)) throw evidenceError("malformed child evidence");
+	return value.map(entry => { if (!isRecord(entry)) throw evidenceError("malformed child evidence"); exactKeys(entry, ["name", "sha256"], "unexpected child evidence field"); if (!isString(entry.name) || !isString(entry.sha256) || !SHA256.test(entry.sha256)) throw evidenceError("malformed child evidence"); return { name: entry.name, sha256: entry.sha256 }; });
+}
+function parseCanonicalManifest(raw: string): AffectedEvidenceManifest {
+	let decoded: unknown; try { decoded = JSON.parse(raw); } catch { throw evidenceError("malformed manifest"); }
+	if (!isRecord(decoded)) throw evidenceError("malformed manifest");
+	exactKeys(decoded, ["schemaVersion", "subject", "sourceSha", "planDigest", "planMode", "replayScope", "aggregateResults", "taskIdentities", "childEvidence"], "unexpected manifest field");
+	if (decoded.schemaVersion !== 1 || decoded.subject !== "ci-dev-affected-evidence" || !isString(decoded.sourceSha) || !SOURCE_SHA.test(decoded.sourceSha) || !isString(decoded.planDigest) || !SHA256.test(decoded.planDigest) || (decoded.planMode !== "pr" && decoded.planMode !== "push")) throw evidenceError("malformed manifest");
+	const manifest: AffectedEvidenceManifest = { schemaVersion: 1, subject: "ci-dev-affected-evidence", sourceSha: decoded.sourceSha, planDigest: decoded.planDigest, planMode: decoded.planMode, replayScope: parseReplayScope(decoded.replayScope), aggregateResults: parseAggregate(decoded.aggregateResults), taskIdentities: parseEvidenceTasks(decoded.taskIdentities), childEvidence: parseEvidenceChildren(decoded.childEvidence) };
+	if (raw !== canonicalEvidence(manifest)) throw evidenceError("non-canonical manifest bytes");
+	return manifest;
+}
+function parseCanonicalReceipt(raw: string): DetachedEvidenceReceipt {
+	let decoded: unknown; try { decoded = JSON.parse(raw); } catch { throw evidenceError("malformed receipt"); }
+	if (!isRecord(decoded)) throw evidenceError("malformed receipt");
+	exactKeys(decoded, ["schemaVersion", "subject", "manifestSha256", "sourceSha", "planDigest", "replayScope"], "unexpected receipt field");
+	if (decoded.schemaVersion !== 1 || decoded.subject !== "ci-dev-affected-evidence" || !isString(decoded.manifestSha256) || !SHA256.test(decoded.manifestSha256) || !isString(decoded.sourceSha) || !SOURCE_SHA.test(decoded.sourceSha) || !isString(decoded.planDigest) || !SHA256.test(decoded.planDigest)) throw evidenceError("malformed receipt");
+	const receipt: DetachedEvidenceReceipt = { schemaVersion: 1, subject: "ci-dev-affected-evidence", manifestSha256: decoded.manifestSha256, sourceSha: decoded.sourceSha, planDigest: decoded.planDigest, replayScope: parseReplayScope(decoded.replayScope) };
+	if (raw !== canonicalEvidence(receipt)) throw evidenceError("non-canonical receipt bytes");
+	return receipt;
+}
+
+async function readValidatedEvidencePlan(root: string): Promise<{ tasks: Task[]; raw: Uint8Array; mode: PlanMode }> {
+	const raw = await readEvidenceBytes(root, AFFECTED_PLAN_NAME);
+	let decoded: unknown; try { decoded = JSON.parse(decodeEvidenceJson(raw)); } catch { throw evidenceError("malformed canonical plan"); }
+	if (!isRecord(decoded) || (decoded.mode !== "pr" && decoded.mode !== "push")) throw evidenceError("malformed canonical plan");
+	const planPath = path.join(root, AFFECTED_PLAN_NAME);
+	const original = Bun.env.CI_DEV_AFFECTED_PLAN;
+	Bun.env.CI_DEV_AFFECTED_PLAN = planPath;
+	try { const tasks = await loadCanonicalPlan(); if (!tasks) throw evidenceError("missing canonical plan"); return { tasks, raw, mode: decoded.mode }; }
+	finally { if (original === undefined) delete Bun.env.CI_DEV_AFFECTED_PLAN; else Bun.env.CI_DEV_AFFECTED_PLAN = original; }
+}
+async function collectChildEvidence(root: string, tasks: readonly Task[]): Promise<EvidenceChild[]> {
+	const expected = expectedEvidenceNames(tasks);
+	const shardTasks = expectedEvidenceTasks(tasks);
+	if (shardTasks.length === 0) {
+		try { await fs.lstat(path.join(root, AFFECTED_SHARD_DIR)); throw evidenceError("unexpected shard receipt directory"); } catch (error) { if (error instanceof Error && error.message.startsWith("affected-evidence-invalid")) throw error; if (!isMissingError(error)) throw error; }
+	} else {
+		const directory = await checkEvidenceDirectory(root, AFFECTED_SHARD_DIR);
+		const entries = await fs.readdir(directory);
+		if (entries.length !== shardTasks.length || entries.some(entry => !/^\d+\.json$/.test(entry))) throw evidenceError("shard receipt set does not match canonical plan");
+	}
+	const children: EvidenceChild[] = [];
+	for (const [index, name] of expected.entries()) {
+		const rawBytes = await readEvidenceBytes(root, name);
+		const raw = decodeEvidenceJson(rawBytes);
+		if (index > 0) {
+			let value: unknown; try { value = JSON.parse(raw); } catch { throw evidenceError("malformed shard receipt"); }
+			const expectedTask = shardTasks[index - 1]!;
+			if (!isRecord(value) || Object.keys(value).length !== 2 || value.key !== expectedTask.key || value.identity !== expectedTask.identity) throw evidenceError("shard receipt set does not match canonical plan");
+		}
+		children.push({ name, sha256: sha256(rawBytes) });
+	}
+	return children;
+}
+async function writeAffectedEvidence(): Promise<void> {
+	const root = evidenceRoot();
+	const { tasks, raw: planRaw, mode: planMode } = await readValidatedEvidencePlan(root);
+	const results = aggregateFromEnv(); validateAffectedAggregate(results);
+	const digest = requiredEnv("CI_DEV_PLAN_DIGEST");
+	const mode = requiredEnv("CI_DEV_PLAN_MODE");
+	if (mode !== "pr" && mode !== "push") throw evidenceError("invalid CI_DEV_PLAN_MODE");
+	if (mode !== planMode) throw evidenceError("plan mode mismatch");
+	validatePlanCapabilities(tasks, results, mode);
+	if (sha256(planRaw) !== digest) throw evidenceError("plan digest mismatch");
+	const manifestPath = path.join(root, AFFECTED_EVIDENCE_MANIFEST); const receiptPath = path.join(root, AFFECTED_EVIDENCE_RECEIPT);
+	for (const target of [manifestPath, receiptPath]) { try { await fs.lstat(target); throw evidenceError("evidence target already exists"); } catch (error) { if (error instanceof Error && error.message.startsWith("affected-evidence-invalid")) throw error; if (!isMissingError(error)) throw error; } }
+	const manifest: AffectedEvidenceManifest = { schemaVersion: 1, subject: "ci-dev-affected-evidence", sourceSha: requiredEnv("CI_DEV_SOURCE_SHA"), planDigest: digest, planMode: mode, replayScope: canonicalReplayScope(), aggregateResults: results, taskIdentities: expectedEvidenceTasks(tasks), childEvidence: await collectChildEvidence(root, tasks) };
+	let wroteManifest = false;
+	try {
+		await fs.writeFile(manifestPath, canonicalEvidence(manifest), { flag: "wx" }); wroteManifest = true;
+		const finalized = await readEvidenceBytes(root, AFFECTED_EVIDENCE_MANIFEST);
+		if (Bun.env.CI_DEV_INJECT_EVIDENCE_POST_MANIFEST_FAILURE === "true") throw evidenceError("injected post-manifest failure");
+		const receipt: DetachedEvidenceReceipt = { schemaVersion: 1, subject: "ci-dev-affected-evidence", manifestSha256: sha256(finalized), sourceSha: manifest.sourceSha, planDigest: manifest.planDigest, replayScope: manifest.replayScope };
+		await fs.writeFile(receiptPath, canonicalEvidence(receipt), { flag: "wx" });
+		console.log(`affected evidence produced: ${manifest.childEvidence.length} child evidence file(s)`);
+	} catch (error) { if (wroteManifest) await fs.rm(manifestPath, { force: true }); throw error; }
+}
+async function validateAffectedEvidence(): Promise<void> {
+	const root = evidenceRoot();
+	const receiptRaw = await readEvidenceFile(root, AFFECTED_EVIDENCE_RECEIPT);
+	const manifestBytes = await readEvidenceBytes(root, AFFECTED_EVIDENCE_MANIFEST);
+	const manifestRaw = decodeEvidenceJson(manifestBytes);
+	const receipt = parseCanonicalReceipt(receiptRaw);
+	if (receipt.manifestSha256 !== sha256(manifestBytes)) throw evidenceError("manifest digest mismatch");
+	const manifest = parseCanonicalManifest(manifestRaw);
+	const { tasks, raw: planRaw, mode: planMode } = await readValidatedEvidencePlan(root);
+	const expectedReplay = canonicalReplayScope(); const expectedSource = requiredEnv("CI_DEV_SOURCE_SHA"); const expectedDigest = requiredEnv("CI_DEV_PLAN_DIGEST");
+	if (manifest.sourceSha !== expectedSource || receipt.sourceSha !== expectedSource || manifest.planDigest !== expectedDigest || receipt.planDigest !== expectedDigest || JSON.stringify(manifest.replayScope) !== JSON.stringify(expectedReplay) || JSON.stringify(receipt.replayScope) !== JSON.stringify(expectedReplay)) throw evidenceError("replay binding mismatch");
+	if (manifest.planMode !== requiredEnv("CI_DEV_PLAN_MODE") || manifest.planMode !== planMode || sha256(planRaw) !== expectedDigest) throw evidenceError("plan binding mismatch");
+	validateAffectedAggregate(manifest.aggregateResults);
+	const liveAggregate = aggregateFromEnv();
+	if (JSON.stringify(manifest.aggregateResults) !== JSON.stringify(liveAggregate)) throw evidenceError("aggregate result mismatch");
+	validatePlanCapabilities(tasks, liveAggregate, manifest.planMode);
+	const expectedTasks = expectedEvidenceTasks(tasks);
+	if (JSON.stringify(manifest.taskIdentities) !== JSON.stringify(expectedTasks)) throw evidenceError("task identity mismatch");
+	const children = await collectChildEvidence(root, tasks);
+	if (JSON.stringify(manifest.childEvidence) !== JSON.stringify(children)) throw evidenceError("child evidence mismatch");
+	console.log(`affected evidence validated: ${children.length} child evidence file(s)`);
 }
 
 async function validateShardReceipts(): Promise<void> {

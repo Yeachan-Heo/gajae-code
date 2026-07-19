@@ -97,4 +97,21 @@ describe("Hermes MCP safety policy", () => {
 			"coordinator_artifact_outside_allowed_roots",
 		);
 	});
+
+	it("denies an artifact after its parent directory is swapped for an outside symlink", async () => {
+		const root = await tempRoot();
+		const outside = await tempRoot();
+		const parent = path.join(root, "artifacts");
+		await fs.mkdir(parent);
+		await Bun.write(path.join(outside, "secret.txt"), "secret");
+		await fs.rm(parent, { recursive: true });
+		await fs.symlink(outside, parent);
+		const config = buildCoordinatorMcpConfig({
+			GJC_SESSION_ID: "coordinator-policy-test-session",
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+		});
+		await expect(assertCoordinatorArtifactPath(config, path.join(parent, "secret.txt"))).rejects.toThrow(
+			"coordinator_artifact_outside_allowed_roots",
+		);
+	});
 });

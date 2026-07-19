@@ -9,7 +9,7 @@ import { APP_NAME, setProjectDir } from "@gajae-code/utils";
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { parseArgs } from "../cli/args";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
-import { prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
+import { type PreparedLaunchWorktree, prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
@@ -214,7 +214,7 @@ export default class Index extends Command {
 			return;
 		}
 
-		let launch: ReturnType<typeof prepareLaunchWorktree>;
+		let launch: PreparedLaunchWorktree;
 		try {
 			launch = prepareLaunchWorktree(process.cwd(), args);
 		} catch (error) {

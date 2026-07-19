@@ -31,6 +31,8 @@ export interface CronJobView {
 	prompt: string;
 	recurring: boolean;
 	nextFireAt?: number;
+	/** A cron firing whose spawned job is currently running. */
+	firing?: boolean;
 	createdAt: number;
 }
 
@@ -140,6 +142,7 @@ export class JobsObserver {
 				recurring: snapshot.recurring,
 				nextFireAt: snapshot.nextFireAt,
 				createdAt: snapshot.createdAt,
+				firing: snapshot.firing,
 			}))
 			.sort((a, b) => b.createdAt - a.createdAt);
 		const worstState: JobsWorstState = this.#failedUnacknowledged

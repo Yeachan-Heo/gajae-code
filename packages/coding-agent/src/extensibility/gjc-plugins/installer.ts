@@ -211,23 +211,23 @@ async function resolveTarball(source: string): Promise<ResolvedSource> {
 }
 
 function runGit(args: string[], cwd?: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		// argv array (no shell) — repo/ref are passed as discrete args, not interpolated.
-		const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-		let stdout = "";
-		let stderr = "";
-		child.stdout.on("data", d => {
-			stdout += d;
-		});
-		child.stderr.on("data", d => {
-			stderr += d;
-		});
-		child.on("error", reject);
-		child.on("close", code => {
-			if (code === 0) resolve(stdout.trim());
-			else reject(new GjcPluginLoadError("install_conflict", `git ${args[0]} failed: ${stderr.trim()}`));
-		});
+	const { promise, resolve, reject } = Promise.withResolvers<string>();
+	// argv array (no shell) — repo/ref are passed as discrete args, not interpolated.
+	const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", d => {
+		stdout += d;
 	});
+	child.stderr.on("data", d => {
+		stderr += d;
+	});
+	child.on("error", reject);
+	child.on("close", code => {
+		if (code === 0) resolve(stdout.trim());
+		else reject(new GjcPluginLoadError("install_conflict", `git ${args[0]} failed: ${stderr.trim()}`));
+	});
+	return promise;
 }
 
 async function resolveGit(source: string): Promise<ResolvedSource> {

@@ -52,6 +52,9 @@ export interface SkillManifest {
 	retention: RetentionPolicy[];
 	hudFields: string[];
 	graphLabel: string;
+	stopReleasingPhases: readonly string[];
+	phaseLock: readonly string[];
+	canonicalOverrides: readonly string[];
 }
 
 const STATE_RETENTION: RetentionPolicy = { category: "state", keep: 1 };
@@ -116,6 +119,9 @@ function manifest(input: {
 	retention: RetentionPolicy[];
 	hudFields: string[];
 	graphLabel: string;
+	stopReleasingPhases?: readonly string[];
+	phaseLock?: readonly string[];
+	canonicalOverrides?: readonly string[];
 	initialState?: string;
 }): SkillManifest {
 	const staleInitialState = initialPhaseForSkill(input.skill);
@@ -131,6 +137,16 @@ function manifest(input: {
 		retention: input.retention,
 		hudFields: input.hudFields,
 		graphLabel: input.graphLabel,
+		stopReleasingPhases: input.stopReleasingPhases ?? [
+			"complete",
+			"completed",
+			"failed",
+			"cancelled",
+			"canceled",
+			"inactive",
+		],
+		phaseLock: input.phaseLock ?? [],
+		canonicalOverrides: input.canonicalOverrides ?? [],
 	};
 }
 
@@ -207,6 +223,8 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		retention: [STATE_RETENTION, ARTIFACT_RETENTION, LEDGER_RETENTION, PRUNE_RETENTION, FORCE_RETENTION],
 		hudFields: ["current_phase", "mode", "run_id", "stage", "stage_n", "plan_path"],
 		graphLabel: "Ralplan",
+		phaseLock: ["final", "handoff", "complete", "completed", "failed", "cancelled", "canceled", "inactive"],
+		canonicalOverrides: ["final", "handoff", "complete", "completed", "failed", "cancelled", "canceled", "inactive"],
 	}),
 	ultragoal: manifest({
 		skill: "ultragoal",

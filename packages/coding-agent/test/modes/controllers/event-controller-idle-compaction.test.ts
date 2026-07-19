@@ -53,7 +53,7 @@ describe("EventController idle compaction teardown", () => {
 			streamingComponent: undefined,
 			streamingMessage: undefined,
 			pendingTools: new Map<string, unknown>(),
-			flushPendingModelSwitch: async () => {},
+			planModeController: { flushPendingModelSwitch: async () => {} },
 			ui: { requestRender: vi.fn() },
 			chatContainer: { removeChild: vi.fn() },
 			statusContainer: { clear: vi.fn() },

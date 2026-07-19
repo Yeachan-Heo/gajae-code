@@ -1,9 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import {
+	assertDeepInterviewIntentReview,
+	createDeepInterviewIntentManifest,
+	deepInterviewObservedIntentDigest,
 	deriveRoundKey,
 	mergeDeepInterviewEnvelope,
 	mergeDeepInterviewRounds,
 	normalizeDeepInterviewEnvelope,
+	reviewDeepInterviewIntent,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { deriveDeepInterviewHud } from "@gajae-code/coding-agent/skill-state/workflow-hud";
 
@@ -222,5 +226,146 @@ describe("deep-interview-state: deriveDeepInterviewHud legacy_missing topology",
 		expect(labels).not.toContain("target");
 		expect(labels).not.toContain("weakest");
 		expect(labels).toContain("round");
+	});
+});
+
+describe("deep-interview-state: intent contract", () => {
+	const lockedItems = [
+		{ id: "artifact:report", category: "artifact" as const, statement: "Produce an audit report" },
+		{ id: "surface:review", category: "surface" as const, statement: "Provide the reviewer UI" },
+		{ id: "integration:export", category: "integration" as const, statement: "Export to the archive" },
+		{ id: "constraint:retention", category: "constraint" as const, statement: "Retain records for seven years" },
+	];
+
+	it("creates a deterministic category-prefixed Round 0 manifest", () => {
+		const confirmation = { round: 0 as const, answer_hash: "a".repeat(64) };
+		const forward = createDeepInterviewIntentManifest(lockedItems, confirmation);
+		const reverse = createDeepInterviewIntentManifest([...lockedItems].reverse(), confirmation);
+		expect(reverse).toEqual(forward);
+		expect(forward.digest).toMatch(/^[a-f0-9]{64}$/);
+		expect(() =>
+			createDeepInterviewIntentManifest(
+				[{ id: "surface:wrong", category: "artifact", statement: "Mismatched prefix" }],
+				confirmation,
+			),
+		).toThrow("invalid intent category");
+	});
+
+	it("validates redacted approval evidence, substitutions, and deterministic observed digests", () => {
+		const answerHash = "a".repeat(64);
+		const locked = createDeepInterviewIntentManifest(lockedItems, { round: 0, answer_hash: answerHash });
+		const observed = lockedItems.filter(item => item.id !== "integration:export");
+		const approved = reviewDeepInterviewIntent(locked, observed, {
+			status: "approved",
+			supporting_substitutions: [
+				{
+					removed_id: "integration:export",
+					replacement_ids: ["artifact:report"],
+					rationale: "The report is delivered directly to the archive",
+				},
+			],
+			approval_round: 3,
+			answer_hash: "b".repeat(64),
+			user_answer_evidence: `answer_hash:${"b".repeat(64)}`,
+		});
+		expect(approved.removed_locked_ids).toEqual(["integration:export"]);
+		expect(approved.locked_digest).toBe(locked.digest);
+		expect(approved.observed_digest).toBe(deepInterviewObservedIntentDigest(observed.map(item => item.id)));
+		expect(approved.user_answer_evidence).not.toContain("archive");
+
+		const recorded = [{ round: 3, answer_hash: "b".repeat(64) }];
+
+		for (const input of [
+			{ ...approved, status: "unknown" },
+			{ ...approved, approval_round: Number.NaN },
+			{ ...approved, approval_round: 0 },
+			{ ...approved, approval_round: 1.5 },
+			{ ...approved, answer_hash: "not-a-hash" },
+			{ ...approved, user_answer_evidence: "Approved replacement" },
+			{ ...approved, user_answer_evidence: `answer_hash:${"b".repeat(65)}` },
+			{
+				...approved,
+				supporting_substitutions: [{ ...approved.supporting_substitutions[0], replacement_ids: ["missing:id"] }],
+			},
+			{
+				...approved,
+				supporting_substitutions: [approved.supporting_substitutions[0], approved.supporting_substitutions[0]],
+			},
+		]) {
+			expect(() =>
+				assertDeepInterviewIntentReview(
+					input,
+					locked,
+					observed.map(item => item.id),
+					recorded,
+				),
+			).toThrow();
+		}
+
+		expect(() =>
+			assertDeepInterviewIntentReview(
+				{ ...approved, unexpected: true },
+				locked,
+				observed.map(item => item.id),
+				recorded,
+			),
+		).toThrow("invalid intent review");
+		expect(() =>
+			assertDeepInterviewIntentReview(
+				{ ...approved, approval_round: 4 },
+				locked,
+				observed.map(item => item.id),
+				recorded,
+			),
+		).toThrow("approval evidence is invalid");
+	});
+
+	it("does not require approval when the observed manifest preserves every locked intent", () => {
+		const locked = createDeepInterviewIntentManifest(lockedItems, { round: 0, answer_hash: "a".repeat(64) });
+		const review = reviewDeepInterviewIntent(
+			locked,
+			[
+				...lockedItems,
+				{
+					id: "surface:admin",
+					category: "surface",
+					statement: "Add an administrator view",
+				},
+			],
+			{
+				status: "not_required",
+				supporting_substitutions: [],
+			},
+		);
+		expect(review.removed_locked_ids).toEqual([]);
+	});
+	it("rejects locked contract replacement and deletion through shared merges", () => {
+		const locked = createDeepInterviewIntentManifest(lockedItems, { round: 0, answer_hash: "a".repeat(64) });
+		const replacement = createDeepInterviewIntentManifest(
+			[{ id: "artifact:other", category: "artifact", statement: "Produce another artifact" }],
+			{ round: 0, answer_hash: "b".repeat(64) },
+		);
+		expect(() =>
+			mergeDeepInterviewEnvelope(
+				{ state: { intent_contract: locked } },
+				{ state: { intent_contract: replacement } },
+			),
+		).toThrow("cannot be replaced");
+		expect(() =>
+			mergeDeepInterviewEnvelope({ state: { intent_contract: locked } }, { state: { intent_contract: null } }),
+		).toThrow("cannot be deleted");
+		expect(() =>
+			mergeDeepInterviewEnvelope(
+				{ state: { intent_contract: locked } },
+				{ state: { intent_contract: replacement } },
+				{ replace: true },
+			),
+		).toThrow("cannot be replaced");
+		const preserved = mergeDeepInterviewEnvelope(
+			{ state: { intent_contract_required: true, intent_contract: locked, stale: true } },
+			{ state: { rounds: [] } },
+			{ replace: true },
+		);
+		expect(preserved.state).toMatchObject({ intent_contract_required: true, intent_contract: locked, rounds: [] });
 	});
 });

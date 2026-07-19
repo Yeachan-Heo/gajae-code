@@ -3,13 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
+import { Settings } from "../src/config/settings";
 import {
 	getNotificationConfig,
 	isDiscordConfigured,
 	isGloballyConfigured,
 	isSlackConfigured,
 } from "../src/sdk/bus/config";
-import { createLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
+import { createLightweightDaemonSettings, loadLightweightDaemonSettings } from "../src/sdk/bus/telegram-daemon-cli";
 
 // The daemon is spawned as a lightweight process that reads config.yml into a
 // raw object and exposes it through createLightweightDaemonSettings, NOT the
@@ -45,9 +46,13 @@ describe("notifications daemon config reachability (rich)", () => {
 		expect(cfg.rich).toEqual({ enabled: true });
 	});
 
-	test("non-boolean enabled coerces to default", () => {
-		const cfg = cfgFromRaw({ notifications: { telegram: { rich: { enabled: "yes" } } } });
-		expect(cfg.rich.enabled).toBe(true);
+	test("explicit malformed booleans throw a sanitized configuration error", () => {
+		expect(() => cfgFromRaw({ notifications: { telegram: { rich: { enabled: "yes" } } } })).toThrow(
+			"gjc_notify_daemon_invalid_configuration",
+		);
+		expect(() => cfgFromRaw(YAML.parse('notifications:\n  telegram:\n    btw:\n      enabled: "false"\n'))).toThrow(
+			"gjc_notify_daemon_invalid_configuration",
+		);
 	});
 
 	test("stale richFinal config is ignored", () => {
@@ -73,9 +78,58 @@ describe("notifications daemon config reachability (rich)", () => {
 		expect(cfgFromRaw({ notifications: { enabled: true } }).topics.nameTemplate).toBeUndefined();
 	});
 
-	test("a non-string nameTemplate is coerced away", () => {
-		const cfg = cfgFromRaw({ notifications: { telegram: { topics: { nameTemplate: 42 } } } });
-		expect(cfg.topics.nameTemplate).toBeUndefined();
+	test("rejects an explicitly malformed topics.nameTemplate", () => {
+		expect(() => cfgFromRaw({ notifications: { telegram: { topics: { nameTemplate: 42 } } } })).toThrow(
+			"gjc_notify_daemon_invalid_configuration",
+		);
+	});
+});
+describe("notifications daemon config reachability (btw)", () => {
+	test("defaults enabled in both resolved settings and the lightweight daemon reader", () => {
+		expect(Settings.isolated({}).getNotificationSettingsSnapshot().telegram.btw).toEqual({ enabled: true });
+		expect(cfgFromRaw({}).btw).toEqual({ enabled: true });
+	});
+	test("rejects scalar roots and malformed notification containers instead of applying defaults", () => {
+		for (const rawConfig of [
+			true,
+			{ notifications: true },
+			{ notifications: { telegram: [] } },
+			{ notifications: { telegram: { btw: true } } },
+		]) {
+			expect(() => cfgFromRaw(rawConfig)).toThrow("gjc_notify_daemon_invalid_configuration");
+		}
+	});
+	test("explicit malformed idle timeout throws instead of silently defaulting", () => {
+		expect(() => cfgFromRaw({ notifications: { daemon: { idleTimeoutMs: 0 } } })).toThrow(
+			"gjc_notify_daemon_invalid_configuration",
+		);
+	});
+
+	test("persists, reloads, and re-enables btw without exposing notification secrets", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-btw-set-"));
+		const configPath = path.join(agentDir, "config.yml");
+		fs.writeFileSync(
+			configPath,
+			YAML.stringify({
+				notifications: { telegram: { botToken: "secret-token", chatId: "42" } },
+			}),
+		);
+
+		const settings = createLightweightDaemonSettings({
+			agentDir,
+			rawConfig: YAML.parse(fs.readFileSync(configPath, "utf8")),
+		});
+		await settings.set("notifications.telegram.btw.enabled", false);
+		expect(settings.get("notifications.telegram.btw.enabled")).toBe(false);
+
+		const disabled = await loadLightweightDaemonSettings(agentDir);
+		expect(getNotificationConfig(disabled).btw).toEqual({ enabled: false });
+
+		await disabled.set("notifications.telegram.btw.enabled", true);
+		const reenabled = await loadLightweightDaemonSettings(agentDir);
+		expect(getNotificationConfig(reenabled).btw).toEqual({ enabled: true });
+
+		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 });
 

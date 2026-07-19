@@ -1,0 +1,157 @@
+{
+  "cases": [
+    {
+      "id": "weekly-per-100-and-2026-07-06-split",
+      "claim": "Weekly normalized rates are 0.05–0.06 in July, and week 2026-07-06 contains 49 reactive and 17 proactive compactions.",
+      "method": "Recomputed compactions / assistantTurns * 100 and classifications from compactionEvidence; compared with weeklyAggregates.",
+      "actual": {
+        "2026-07-06": {
+          "assistantTurns": 101685,
+          "compactions": 66,
+          "per100Exact": 0.06490632836701579,
+          "per100Stored": 0.06,
+          "reactive": 49,
+          "proactive": 17
+        },
+        "2026-07-13": {
+          "assistantTurns": 38808,
+          "compactions": 20,
+          "per100Exact": 0.0515357658214801,
+          "per100Stored": 0.05
+        }
+      },
+      "verdict": "passed"
+    },
+    {
+      "id": "daily-reactive-series-2026-07-09-through-17",
+      "claim": "Daily reactive counts are 3, 13, 12, 18, 8, 2, 0, 0, 0 for 2026-07-09 through 2026-07-17.",
+      "method": "Counted compactionEvidence rows classified reactive by UTC timestamp date, independently of dailyAggregates.",
+      "actual": [
+        { "day": "2026-07-09", "reactive": 3 },
+        { "day": "2026-07-10", "reactive": 13 },
+        { "day": "2026-07-11", "reactive": 12 },
+        { "day": "2026-07-12", "reactive": 18 },
+        { "day": "2026-07-13", "reactive": 8 },
+        { "day": "2026-07-14", "reactive": 2 },
+        { "day": "2026-07-15", "reactive": 0 },
+        { "day": "2026-07-16", "reactive": 0 },
+        { "day": "2026-07-17", "reactive": 0 }
+      ],
+      "verdict": "passed"
+    },
+    {
+      "id": "trigger-fullness-class-counts",
+      "claim": "The 228 evidence records classify as expected/between/premature/unknown-usage/unknown-window = 116/73/16/22/1.",
+      "method": "Grouped all compactionEvidence rows by triggerFullnessClassification.",
+      "actual": {
+        "expected": 116,
+        "between": 73,
+        "premature": 16,
+        "unknown-usage": 22,
+        "unknown-window": 1,
+        "total": 228
+      },
+      "verdict": "passed"
+    },
+    {
+      "id": "provider-ceiling-gpt-5-6-reactive-evidence",
+      "claim": "Reactive layofflabs/gpt-5.6* provider usage shows hard context_too_large rejections at about 362k–371k and none exceed about 372k.",
+      "method": "Selected all reactive compactionEvidence records whose model starts layofflabs/gpt-5.6 and extracted lastValidProviderTokens; inspected the over-372k row's predecessor error snippet.",
+      "actual": {
+        "recordCount": 49,
+        "values": [292797, 331349, 341422, 344521, 345227, 347206, 353261, 355742, 359500, 360921, 360927, 361916, 362848, 363137, 364468, 364661, 364662, 365404, 366536, 366568, 366861, 368258, 368378, 368610, 369403, 369781, 369900, 370045, 370079, 370284, 370310, 370331, 370334, 370344, 370883, 371033, 371046, 371136, 371150, 371186, 371299, 371324, 371369, 371372, 371392, 371454, 371471, 371562, 428628],
+        "in362kToUnder372k": 36,
+        "over372k": 1,
+        "over380k": 1,
+        "falsifyingRecord": {
+          "timestamp": "2026-07-10T02:32:19.122Z",
+          "model": "layofflabs/gpt-5.6-sol",
+          "lastValidProviderTokens": 428628,
+          "tokensBefore": 428628,
+          "predecessorErrorSnippet": "Error Code context_too_large: Your input exceeds the context window of this model. Please adjust your input and try again"
+        }
+      },
+      "verdict": "failed"
+    },
+    {
+      "id": "commit-05f0b589-auto-compaction-reserve",
+      "claim": "05f0b589, dated 2026-06-23, removed model maxOutputTokens as the auto-compaction shouldCompact reserve input.",
+      "method": "Inspected git show 05f0b589 for packages/coding-agent/src/session/agent-session.ts and context-usage.ts, plus commit metadata.",
+      "actual": {
+        "commitDate": "2026-06-23 13:47:05 +0900",
+        "before": "shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)",
+        "after": "shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)",
+        "replacementValue": 0,
+        "alsoChanged": "resolveThresholdTokens/effectiveReserveTokens no longer receive model?.maxTokens"
+      },
+      "verdict": "passed"
+    },
+    {
+      "id": "commit-2ff0daa3-mid-run-maintenance",
+      "claim": "2ff0daa3, dated 2026-07-15, added mid-run shouldCompact checks using a 1.2x compactionDeltaInflation estimate.",
+      "method": "Inspected git show 2ff0daa3 and its added #runMidRunMaintenance, #estimateMidRunContextTokens, #compactionDeltaInflation, and #estimateMessageCompactionDeltaTokens code.",
+      "actual": {
+        "commitDate": "2026-07-15 01:53:28 +0900",
+        "midRunHook": "agent.setMaintainContext((context, lifecycle) => this.#trackMidRunMaintenance(this.#runMidRunMaintenance(context, lifecycle)))",
+        "thresholdCheck": "#runMidRunMaintenance calls shouldCompact before and after prune",
+        "inflation": "#compactionDeltaInflation = 1.2; #estimateMessageCompactionDeltaTokens returns ceil(heuristic * #compactionDeltaInflation)"
+      },
+      "verdict": "passed"
+    },
+    {
+      "id": "zero-reactive-on-or-after-2026-07-15",
+      "claim": "Reactive compactions stop at 2026-07-15; the count at timestamps >= 2026-07-15 is zero.",
+      "method": "Filtered compactionEvidence for classification=reactive and ISO timestamp >= 2026-07-15.",
+      "actual": { "reactiveEvidenceCount": 0 },
+      "verdict": "passed"
+    },
+    {
+      "id": "adversarial-2026-06-15-reactive-cluster",
+      "claim": "The July 9–14 cluster is the one genuine reactive anomaly, while June was majority-proactive except the 2026-06-15 week.",
+      "method": "Selected reactive evidence timestamps from 2026-06-15 through before 2026-06-22 and grouped model and tokensBefore; inspected overflow error snippets.",
+      "actual": {
+        "weekSplit": { "reactive": 16, "proactive": 4 },
+        "models": {
+          "layofflabs/gpt-5.5": {
+            "count": 15,
+            "tokensBeforeSorted": [0, 0, 0, 0, 0, 260068, 263931, 263941, 266379, 267424, 268466, 269856, 270624, 270875, 271442],
+            "lastValidProviderTokensRange": [260068, 271442]
+          },
+          "layofflabs-anthropic/claude-opus-4-8": {
+            "count": 1,
+            "tokensBeforeSorted": [95983],
+            "lastValidProviderTokensRange": [95983, 95983]
+          }
+        },
+        "errorEvidence": "All 16 selected rows have context-overflow predecessor snippets; 15 gpt-5.5 rows cluster around the former 272k threshold/provider-use range."
+      },
+      "verdict": "failed"
+    },
+    {
+      "id": "session-volume-claim",
+      "claim": "Week 2026-07-06 had 3,050 sessions versus about 600–800 sessions in June weeks.",
+      "method": "Read distinctSessions from every weeklyAggregates row.",
+      "actual": {
+        "2026-07-06": 3053,
+        "JuneWeeks": {
+          "2026-06-01": 784,
+          "2026-06-08": 808,
+          "2026-06-15": 634,
+          "2026-06-22": 536,
+          "2026-06-29": 1092
+        },
+        "finding": "3,050 is not the JSON value, and June includes values below 600, above 800, and 1,092."
+      },
+      "verdict": "failed"
+    }
+  ],
+  "overall": "failed",
+  "commands": [
+    "python3 JSON recomputation over artifacts/compaction-mining-v2.json for weekly/daily/fullness/provider/June/volume cases",
+    "git show --no-patch --format='%H%n%ci%n%s' 05f0b589",
+    "git show --format=fuller --find-renames 05f0b589 -- packages/coding-agent/src/session/agent-session.ts packages/coding-agent/src/modes/utils/context-usage.ts",
+    "git show --no-patch --format='%H%n%ci%n%s' 2ff0daa3",
+    "git show 2ff0daa3 -L 13120,13220:packages/coding-agent/src/session/agent-session.ts",
+    "git show 2ff0daa3 -L 13220,13290:packages/coding-agent/src/session/agent-session.ts"
+  ]
+}

@@ -25,16 +25,25 @@ import {
 	classifyCgroup,
 	isExactScopedBootstrapSuccessReceipt,
 	isOwnerGenerationBaselineCurrentSync,
+	isSafeServerProof,
 	type OwnerGenerationBaseline,
 	type OwnerIsolationProbe,
 	observeOwnerTerminal,
 	ownerProcessStartTime,
 	planTmuxOwnerIsolation,
 	replaceOwnerGenerationSync,
+	sameServerIdentity,
 	type TmuxServerProof,
 } from "../gjc-runtime/tmux-owner-isolation";
 import { classifyRecovery } from "../harness-control-plane/classifier";
 import { callEndpoint, EndpointUnreachableError } from "../harness-control-plane/control-endpoint";
+import {
+	type CompletedTerminalEvent,
+	isOwnerLivenessBlocker,
+	needsVanishedOwnerBlock,
+	OWNER_STARTUP_BLOCKER,
+	reconcileOwnerLifecycle,
+} from "../harness-control-plane/lifecycle-reconciliation";
 import { type ResolvedOwner, RuntimeOwner, resolveOwner, resolveOwnerLive } from "../harness-control-plane/owner";
 import { preserveDirtyWorktree } from "../harness-control-plane/preserve";
 import { RECEIPT_SPOOL_DIR_ENV } from "../harness-control-plane/receipt-spool";
@@ -252,12 +261,6 @@ function pushUnique(out: string[], value: unknown): void {
 	if (typeof value === "string" && !out.includes(value)) out.push(value);
 }
 
-interface CompletedTerminalEvent {
-	cursor: number;
-	createdAt: string;
-	kind: string;
-}
-
 function completedTerminalEvent(events: EventEnvelope[]): CompletedTerminalEvent | null {
 	for (const event of [...events].reverse()) {
 		const signal = (event.evidence as { signal?: unknown } | undefined)?.signal;
@@ -461,73 +464,21 @@ function updateStateWithRestoredOwner(state: SessionState, leasePath: string, re
 	state.updatedAt = nowIso();
 }
 
-function isOwnerLivenessBlocker(blocker: string): boolean {
-	return blocker === "detached-owner-not-live" || blocker.startsWith("owner-vanished:");
-}
-
-async function reconcileCompletedOwnerExited(
+async function reconcileLifecycle(
 	root: string,
 	state: SessionState,
 	observation: Observation,
 	completedTerminal: CompletedTerminalEvent | null,
+	startupBlocked = false,
 ): Promise<SessionState> {
-	if (!completedTerminal || observation.ownerLive || observation.gitDelta !== "clean") return state;
-	if (state.lifecycle === "completed" || state.lifecycle === "retired") return state;
-	state.lifecycle = "completed";
-	state.blockers = state.blockers.filter(blocker => !isOwnerLivenessBlocker(blocker));
-	state.updatedAt = nowIso();
-	await writeSessionState(root, state);
-	return state;
-}
-
-function needsVanishedOwnerBlock(
-	state: SessionState,
-	observation: Observation,
-	completedTerminal: CompletedTerminalEvent | null,
-): boolean {
-	if (observation.ownerLive || state.lifecycle !== "observing") return false;
-	if (completedTerminal || observation.observedSignals.includes("completed")) return false;
-	return observation.observedSignals.some(
-		signal => signal === "prompt-accepted" || signal === "tool-call" || signal === "streaming",
-	);
-}
-
-async function markVanishedOwnerBlocked(
-	root: string,
-	state: SessionState,
-	observation: Observation,
-	completedTerminal: CompletedTerminalEvent | null,
-): Promise<SessionState> {
-	if (!needsVanishedOwnerBlock(state, observation, completedTerminal)) return state;
-	const blocker = `owner-vanished:${observation.gitDelta}`;
-	state.lifecycle = "blocked";
-	state.blockers = state.blockers.includes(blocker) ? state.blockers : [...state.blockers, blocker];
-	state.updatedAt = nowIso();
-	await writeSessionState(root, state);
-	return state;
-}
-
-const OWNER_STARTUP_BLOCKER = "owner-died-before-first-prompt";
-
-/**
- * Persist an explicit startup blocker when an owner started, reported live, but died before
- * accepting the first prompt. This makes the failure an actionable lifecycle state instead of a
- * silent `owner-not-live` gate, so observe/recover surface it and recover can respawn the owner.
- */
-async function markStartupOwnerBlocked(
-	root: string,
-	state: SessionState,
-	ownerExit: OwnerExitEvidence,
-): Promise<SessionState> {
-	if (!ownerExit.startupBlocker) return state;
-	if (state.lifecycle === "completed" || state.lifecycle === "retired") return state;
-	state.lifecycle = "blocked";
-	state.blockers = state.blockers.includes(OWNER_STARTUP_BLOCKER)
-		? state.blockers
-		: [...state.blockers, OWNER_STARTUP_BLOCKER];
-	state.updatedAt = nowIso();
-	await writeSessionState(root, state);
-	return state;
+	return reconcileOwnerLifecycle({
+		state,
+		observation,
+		completedTerminal,
+		startupBlocked,
+		persist: async nextState => writeSessionState(root, nextState),
+		nowIso,
+	});
 }
 
 function resolveRetryBudget(input: Record<string, unknown>): RetryBudget {
@@ -559,29 +510,6 @@ function isBoundedNoServerDiagnostic(stderr: Uint8Array): boolean {
 		diagnostic.length > 0 &&
 		diagnostic.length <= 512 &&
 		/^(?:no server running on |failed to connect to server|error connecting to )/i.test(diagnostic.trim())
-	);
-}
-
-function sameServerIdentity(left: TmuxServerProof, right: TmuxServerProof): boolean {
-	return (
-		left.pid === right.pid &&
-		left.startTime === right.startTime &&
-		left.cgroup?.classification === right.cgroup?.classification &&
-		left.cgroup?.scope === right.cgroup?.scope &&
-		left.cgroup?.diagnostic === right.cgroup?.diagnostic
-	);
-}
-
-function isSafeServerProof(proof: TmuxServerProof): boolean {
-	return (
-		proof.state === "safe" &&
-		typeof proof.pid === "number" &&
-		Number.isSafeInteger(proof.pid) &&
-		proof.pid > 0 &&
-		typeof proof.startTime === "string" &&
-		proof.startTime.length > 0 &&
-		(proof.cgroup?.classification === "safe" ||
-			(process.platform !== "linux" && proof.cgroup?.classification === "not_applicable"))
 	);
 }
 
@@ -985,7 +913,9 @@ export default class Harness extends Command {
 		proof: TmuxServerProof | null,
 		probeServer: OwnerIsolationProbe["probeServer"],
 	): Promise<void> {
-		if (!nativeSessionId || !proof || !isSafeServerProof(proof)) throw new Error("tmux-owner-cleanup_uncertain");
+		if (!nativeSessionId || !proof || !isSafeServerProof(proof, ownerIsolationPlatform()))
+			throw new Error("tmux-owner-cleanup_uncertain");
+
 		if (!(await this.#nativeSessionBoundToName(tmuxCommand, socketKey, nativeSessionId, sessionName)))
 			throw new Error("tmux-owner-cleanup_uncertain");
 		const current = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
@@ -1141,7 +1071,7 @@ export default class Harness extends Command {
 		const postSpawnServer = await probeServer(socketKey, [tmuxCommand, "-L", socketKey]);
 		cleanupProof = postSpawnServer;
 		if (postSpawnServer.state === "unsafe") return fail("tmux-owner-server_unsafe");
-		if (!isSafeServerProof(postSpawnServer)) return fail("tmux-owner-server_unverifiable");
+		if (!isSafeServerProof(postSpawnServer, ownerIsolationPlatform())) return fail("tmux-owner-server_unverifiable");
 		if (
 			scopedReceipt &&
 			(scopedReceipt.sessionName !== sessionName ||
@@ -1441,14 +1371,10 @@ export default class Harness extends Command {
 		let state = await loadState(root, sessionId);
 		const ownerLive = ownerLiveFor(state);
 		const { observation, completedTerminalEvent } = await buildObservation(root, state, ownerLive);
-		state = await reconcileCompletedOwnerExited(root, state, observation, completedTerminalEvent);
 		const vanishedOwnerBlock = needsVanishedOwnerBlock(state, observation, completedTerminalEvent);
-		state = await markVanishedOwnerBlocked(root, state, observation, completedTerminalEvent);
-		// Build owner-exit evidence whenever the owner is gone so a startup death (owner started,
-		// reported live, then died before the first prompt) is detectable, not just vanish/completion.
 		const ownerExit = !ownerLive ? await buildOwnerExitEvidence(root, state) : null;
 		const startupBlocked = ownerExit?.startupBlocker ?? false;
-		if (ownerExit && startupBlocked) state = await markStartupOwnerBlocked(root, state, ownerExit);
+		state = await reconcileLifecycle(root, state, observation, completedTerminalEvent, startupBlocked);
 		const includeOwnerExit = Boolean(ownerExit && (vanishedOwnerBlock || completedTerminalEvent || startupBlocked));
 		writeJson(
 			buildResponse(state, ownerLive, {
@@ -1482,12 +1408,7 @@ export default class Harness extends Command {
 			if (!observation) {
 				const built = await buildObservation(root, stateView, ownerLive);
 				observation = built.observation;
-				stateView = await markVanishedOwnerBlocked(
-					root,
-					stateView,
-					built.observation,
-					built.completedTerminalEvent,
-				);
+				stateView = await reconcileLifecycle(root, stateView, built.observation, built.completedTerminalEvent);
 			}
 		}
 		if (!observation) throw new Error("classify_requires_observation_or_session");
@@ -1548,7 +1469,14 @@ export default class Harness extends Command {
 		const ownerExit = await buildOwnerExitEvidence(root, state);
 		// An owner that started, reported live, then died before accepting the first prompt is a
 		// startup blocker, not a healthy `owner-not-live` gate — persist it and report it as such.
-		if (ownerExit.startupBlocker) state = await markStartupOwnerBlocked(root, state, ownerExit);
+		const built = await buildObservation(root, state, false);
+		state = await reconcileLifecycle(
+			root,
+			state,
+			built.observation,
+			built.completedTerminalEvent,
+			ownerExit.startupBlocker,
+		);
 		const reason = ownerExit.startupBlocker ? ownerExit.reason : "owner-not-live";
 		writeJson(
 			buildResponse(
@@ -1614,7 +1542,7 @@ export default class Harness extends Command {
 		let state = await loadState(root, sessionId);
 		const beforeExit = await buildOwnerExitEvidence(root, state);
 		const { observation, completedTerminalEvent } = await buildObservation(root, state, false);
-		state = await markVanishedOwnerBlocked(root, state, observation, completedTerminalEvent);
+		state = await reconcileLifecycle(root, state, observation, completedTerminalEvent);
 		const decision = classifyRecovery({
 			observation: { ...observation, lifecycle: state.lifecycle },
 			retryBudget: budget,

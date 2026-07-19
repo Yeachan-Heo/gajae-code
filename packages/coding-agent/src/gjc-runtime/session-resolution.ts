@@ -39,10 +39,19 @@ export interface SessionIdSources {
 export class SessionResolutionError extends Error {
 	constructor(
 		message: string,
-		readonly code: "blank_flag" | "no_session" | "ambiguous" | "missing_for_write",
+		readonly code: "blank_flag" | "unsafe_session" | "no_session" | "ambiguous" | "missing_for_write",
 	) {
 		super(message);
 		this.name = "SessionResolutionError";
+	}
+}
+
+function assertSafeResolvedSessionId(sessionId: string): void {
+	if (sessionId === "." || sessionId === ".." || /[/\\]/.test(sessionId)) {
+		throw new SessionResolutionError(
+			"session id must be a single path component (no separators or traversal)",
+			"unsafe_session",
+		);
 	}
 }
 
@@ -65,13 +74,18 @@ export function resolveSessionIdFromSources(sources: SessionIdSources): Resolved
 				"blank_flag",
 			);
 		}
+		assertSafeResolvedSessionId(trimmed);
 		return { gjcSessionId: trimmed, source: "flag" };
 	}
 	if (typeof payloadSessionId === "string" && payloadSessionId.trim() !== "") {
-		return { gjcSessionId: payloadSessionId.trim(), source: "payload" };
+		const trimmed = payloadSessionId.trim();
+		assertSafeResolvedSessionId(trimmed);
+		return { gjcSessionId: trimmed, source: "payload" };
 	}
 	if (typeof envSessionId === "string" && envSessionId.trim() !== "") {
-		return { gjcSessionId: envSessionId.trim(), source: "env" };
+		const trimmed = envSessionId.trim();
+		assertSafeResolvedSessionId(trimmed);
+		return { gjcSessionId: trimmed, source: "env" };
 	}
 	return undefined;
 }
@@ -155,6 +169,7 @@ async function collectActiveSessionCandidates(cwd: string): Promise<SessionCandi
 		if (!entry.isDirectory()) continue;
 		const gjcSessionId = sessionIdFromDirName(entry.name);
 		if (!gjcSessionId) continue;
+		assertSafeResolvedSessionId(gjcSessionId);
 		const dir = path.join(root, entry.name);
 		const activityMs = await readActivityMs(path.join(dir, GJC_SESSION_ACTIVITY_FILE));
 		// Sessions with no readable activity marker are considered inactive and

@@ -1,0 +1,135 @@
+{
+	"schemaVersion": 3,
+	"issue": 2383,
+	"status": "pass",
+	"evidenceType": "deterministic-sequential-three-request-provider-payload-simulation",
+	"source": {
+		"url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+		"retrievedAt": "2026-07-18",
+		"providerSourceBlobOid": "59955056d1120403917d633051a37698cd157c73",
+		"providerSourceSha256": "22abd82c2a3740c6ad77bc84d28b1c62946b856d761a1dc70eb38ef2c74f8884",
+		"inputFixtureSha256": "b1ca8d3183ca168140774f848ed414252178f7c5788d61243069862ae59c129b"
+	},
+	"derivationCommands": [
+		"git rev-parse HEAD:packages/ai/src/providers/anthropic.ts",
+		"git hash-object packages/ai/src/providers/anthropic.ts",
+		"sha256sum packages/ai/src/providers/anthropic.ts",
+		"WRITE_ARCHITECTURE_2383_EVAL=1 bun test packages/ai/test/anthropic-cache-eval.integration.test.ts",
+		"bun test packages/ai/test/anthropic-cache-eval.integration.test.ts"
+	],
+	"perTurn": {
+		"oldPlacement": [
+			{
+				"anchors": [
+					{
+						"path": "messages[2].content[0]",
+						"sha256": "0866acbb6c3c82b40c6e6df39231ff991b3ac203a91ac0282c3ae007660c8732"
+					},
+					{
+						"path": "messages[3].content[0]",
+						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+					}
+				],
+				"cacheableTokenEstimateAtLeast": 1024
+			},
+			{
+				"anchors": [
+					{
+						"path": "messages[2].content[0]",
+						"sha256": "0866acbb6c3c82b40c6e6df39231ff991b3ac203a91ac0282c3ae007660c8732"
+					},
+					{
+						"path": "messages[3].content[0]",
+						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+					}
+				],
+				"cacheableTokenEstimateAtLeast": 1024
+			},
+			{
+				"anchors": [
+					{
+						"path": "messages[2].content[0]",
+						"sha256": "0866acbb6c3c82b40c6e6df39231ff991b3ac203a91ac0282c3ae007660c8732"
+					},
+					{
+						"path": "messages[3].content[0]",
+						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+					}
+				],
+				"cacheableTokenEstimateAtLeast": 1024
+			}
+		],
+		"newPlacement": [
+			{
+				"anchors": [
+					{
+						"path": "messages[1].content[0]",
+						"sha256": "9047854cc1ed7ce4bf7ed94847681a8189b0cda0bd108a619cb9d3dd3f8fb2d6"
+					},
+					{
+						"path": "messages[3].content[0]",
+						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+					}
+				],
+				"cacheableTokenEstimateAtLeast": 1024
+			},
+			{
+				"anchors": [
+					{
+						"path": "messages[1].content[0]",
+						"sha256": "9047854cc1ed7ce4bf7ed94847681a8189b0cda0bd108a619cb9d3dd3f8fb2d6"
+					},
+					{
+						"path": "messages[3].content[0]",
+						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+					}
+				],
+				"cacheableTokenEstimateAtLeast": 1024
+			},
+			{
+				"anchors": [
+					{
+						"path": "messages[1].content[0]",
+						"sha256": "9047854cc1ed7ce4bf7ed94847681a8189b0cda0bd108a619cb9d3dd3f8fb2d6"
+					},
+					{
+						"path": "messages[3].content[0]",
+						"sha256": "72931bd324dae58558aa54a6f9e13d4c4152d4017049f4cae4dc76e87f291916"
+					}
+				],
+				"cacheableTokenEstimateAtLeast": 1024
+			}
+		]
+	},
+	"simulatedExplicitBreakpointWriteTokensAtLeast": {
+		"oldPlacement": [
+			1024,
+			1024,
+			1024
+		],
+		"newPlacement": [
+			1024,
+			1024,
+			1024
+		]
+	},
+	"simulatedExplicitBreakpointReadTokensAtLeast": {
+		"oldPlacement": [
+			0,
+			0,
+			0
+		],
+		"newPlacement": [
+			0,
+			1024,
+			1024
+		]
+	},
+	"method": "The test sequentially builds three real explicit-mode streamAnthropic onPayload requests over the same agentic turn shape, with a distinct newest tool result on each request and a stable prefix above the documented 1,024-token minimum. It models documented explicit cache writes at each provider-built cache_control breakpoint and reads using inclusive structural prefix lookback over the actual built tools, system, and message sequence. Cache-control metadata is excluded from prefix identity because it designates the breakpoint rather than prompt content. The old comparator places the assistant breakpoint on the volatile tool-result wire message plus the current human message; the provider payload is the new comparator, with the stable previous assistant boundary plus current human message. All token quantities are structural simulated estimates, not billed or provider-reported usage.",
+	"limitations": [
+		"This is deterministic local simulation over provider-built payloads; it does not send Anthropic API requests.",
+		"Structural simulated token estimates use floor(UTF-8 bytes / 4), not provider tokenization or billing telemetry.",
+		"The cited prompt-caching documentation was retrieved on 2026-07-18; cache retention, pricing, and provider usage are not asserted."
+	],
+	"testCommand": "bun test packages/ai/test/anthropic-cache-eval.integration.test.ts"
+}

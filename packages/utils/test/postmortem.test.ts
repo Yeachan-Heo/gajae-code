@@ -13,6 +13,7 @@ interface ScenarioResult {
 interface FixtureResult {
 	count: number;
 	exitBeforeCleanupFinished?: boolean;
+	started?: boolean;
 }
 
 const fixturePath = path.join(import.meta.dir, "postmortem-fixture.ts");
@@ -100,6 +101,44 @@ describe("postmortem cleanup re-entry", () => {
 		expect(result.exitCode).toBe(0);
 		expect(parseResult(result.stdout).count).toBe(1);
 		expect(hasRecursiveCleanupError(combinedOutput(result))).toBe(false);
+	});
+});
+
+describe("postmortem cleanup deadline contract (issue #2556)", () => {
+	it("a second termination signal joins the in-flight cleanup instead of truncating it", async () => {
+		const result = await runScenario("consecutive-signals-share-cleanup");
+
+		// The first signal (SIGHUP) owns the exit; the teardown callback runs
+		// exactly once and completes despite the SIGTERM 20ms later.
+		expect(result.exitCode).toBe(129);
+		expect(parseResult(result.stdout).count).toBe(1);
+		expect(result.stdout).toContain('"reason":"sighup"');
+		expect(hasRecursiveCleanupError(combinedOutput(result))).toBe(false);
+	});
+
+	it("a hung cleanup callback cannot outlive the deadline on a signal exit; owner code preserved", async () => {
+		const result = await runScenario("cleanup-deadline-signal");
+
+		expect(result.exitCode).toBe(143);
+		expect(parseResult(result.stdout).started).toBe(true);
+		expect(result.stderr).toContain("cleanup deadline (300ms) expired for sigterm");
+	});
+
+	it("a hung cleanup callback cannot hang quit(); quit's exit code is preserved", async () => {
+		const result = await runScenario("cleanup-deadline-quit");
+
+		expect(result.exitCode).toBe(7);
+		expect(parseResult(result.stdout).started).toBe(true);
+		expect(result.stderr).toContain("cleanup deadline (300ms) expired for manual");
+	});
+
+	it("a hung cleanup callback cannot hang a fatal exit; fatal diagnostic and status 1 preserved", async () => {
+		const result = await runScenario("cleanup-deadline-fatal");
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("[Uncaught Exception]");
+		expect(result.stderr).toContain("fixture: fatal with hung cleanup");
+		expect(result.stderr).toContain("cleanup deadline (300ms) expired for uncaught_exception");
 	});
 });
 

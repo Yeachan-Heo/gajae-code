@@ -9,6 +9,8 @@ import {
 	RECEIPT_SPOOL_FILENAME,
 	type ReceiptSpoolRecord,
 	readHighestReceiptSpoolCursor,
+	receiptSpoolFullScanCountForTesting,
+	resetReceiptSpoolCursorCacheForTesting,
 	withReceiptSpoolDir,
 } from "../../src/harness-control-plane/receipt-spool";
 import { type CompletionEvidence, validateReceipt } from "../../src/harness-control-plane/receipts";
@@ -276,5 +278,19 @@ if (!result.completed) {
 		expect(records.map(record => record.cursor)).toEqual(["000000000001", "000000000002"]);
 		expect(records[1].envelope.family).toBe("completion");
 		expect((records[1].envelope.evidence as CompletionEvidence).finalLifecycle).toBe("completed");
+	});
+	it("uses the cursor cache until the spool is externally changed", async () => {
+		resetReceiptSpoolCursorCacheForTesting();
+		const spoolFile = path.join(spoolDir, RECEIPT_SPOOL_FILENAME);
+		await writeFile(spoolFile, '{"cursor":"000000000007"}\n', "utf8");
+
+		expect(await readHighestReceiptSpoolCursor(spoolDir)).toBe(7n);
+		expect(receiptSpoolFullScanCountForTesting()).toBe(1);
+		expect(await readHighestReceiptSpoolCursor(spoolDir)).toBe(7n);
+		expect(receiptSpoolFullScanCountForTesting()).toBe(1);
+
+		await writeFile(spoolFile, '{"cursor":"000000000007"}\n{"cursor":"000000000008"}\n', "utf8");
+		expect(await readHighestReceiptSpoolCursor(spoolDir)).toBe(8n);
+		expect(receiptSpoolFullScanCountForTesting()).toBe(2);
 	});
 });

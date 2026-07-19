@@ -128,6 +128,26 @@ describe("config CLI schema coverage", () => {
 		});
 	});
 
+	it("reports invalid settings through config doctor JSON", async () => {
+		await Bun.write(
+			path.join(testAgentDir, "config.yml"),
+			"configSchemaVersion: 1\nnotifications:\n  enabled: invalid\n",
+		);
+		resetSettingsForTest();
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await runConfigCommand({ action: "doctor", flags: { json: true } });
+
+		const report = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as {
+			issues: Array<{ path: string; kind: string; detail: string }>;
+		};
+		expect(report.issues).toContainEqual({
+			path: "notifications.enabled",
+			kind: "invalid",
+			detail: "Expected boolean.",
+		});
+	});
+
 	describe("secret redaction", () => {
 		it("redacts secret-like values in list, get, and set output by default", async () => {
 			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});

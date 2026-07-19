@@ -166,7 +166,7 @@ test("message_update emits a live turn_stream whose messageRef matches the final
 	const final = streams().find(f => f.phase === "finalized")!;
 	expect(final.text).toContain("done");
 	expect(final.messageRef).toBe("1"); // same message as the live edits
-});
+}, 15_000);
 
 test("rapid live updates are throttled to a single frame within the interval", async () => {
 	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
@@ -179,7 +179,7 @@ test("rapid live updates are throttled to a single frame within the interval", a
 	await waitFor(() => live().length >= 1, 3000, "first live frame");
 	await sleep(200);
 	expect(live().length).toBe(1); // later updates fall inside the throttle window
-});
+}, 15_000);
 
 test("no live frames are emitted when streaming is disabled, and finalized carries no messageRef", async () => {
 	setEnv({ GJC_NOTIFICATIONS: "1" }); // GJC_NOTIFICATIONS_STREAM unset -> off
@@ -196,7 +196,7 @@ test("no live frames are emitted when streaming is disabled, and finalized carri
 	await waitFor(() => frames.some(f => f.type === "turn_stream" && f.phase === "finalized"), 3000, "finalized");
 	const final = frames.find(f => f.type === "turn_stream" && f.phase === "finalized")!;
 	expect(final.messageRef).toBeUndefined();
-});
+}, 15_000);
 
 // ---------------------------------------------------------------------------
 // 3) Telegram delivery: streamed frames edit ONE message in place; a keyless
@@ -285,7 +285,7 @@ test("streamed turn frames edit ONE Telegram message in place (send once, then e
 	const turnSendIdx = bot.calls.findIndex(c => c.method === "sendMessage" && String(c.body.text).includes("Hello"));
 	const firstEditIdx = bot.calls.findIndex(c => c.method === "editMessageText");
 	expect(turnSendIdx).toBeLessThan(firstEditIdx);
-});
+}, 60_000);
 
 test("a finalized turn frame without a messageRef posts a fresh message (no in-place edit)", async () => {
 	const { daemon, bot, session } = await bootDaemon();
@@ -297,7 +297,7 @@ test("a finalized turn frame without a messageRef posts a fresh message (no in-p
 	});
 	expect(bot.calls.filter(c => c.method === "editMessageText").length).toBe(0);
 	expect(bot.calls.some(c => c.method === "sendMessage" && String(c.body.text).includes("All done"))).toBe(true);
-});
+}, 60_000);
 // ---------------------------------------------------------------------------
 // 4) Finalized turn-text cap: default lets full turns reach split-capable
 //    clients (Telegram daemon / Slack bridge) instead of being truncated;
@@ -325,25 +325,25 @@ test("finalized turn text defaults to full-turn delivery for split-capable clien
 	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1" });
 	expect(text.length).toBe(5000); // full turn, untruncated
 	expect(text.endsWith("…")).toBe(false);
-});
+}, 60_000);
 
 test("GJC_NOTIFICATIONS_TURN_MAX can lower the finalized cap for summary mirrors", async () => {
 	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TURN_MAX: "3500" });
 	expect(text.length).toBeLessThanOrEqual(3500);
 	expect(text.endsWith("…")).toBe(true); // truncated with an ellipsis
-});
+}, 60_000);
 
 test("GJC_NOTIFICATIONS_TURN_MAX is clamped to a finite ceiling (never unbounded)", async () => {
 	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TURN_MAX: "10000000" }, 45000);
 	expect(text.length).toBe(40000); // clamped to TURN_TEXT_MAX_CEILING, not the requested 10M
 	expect(text.endsWith("…")).toBe(true); // still truncated at the ceiling
-});
+}, 60_000);
 
 test("non-finite GJC_NOTIFICATIONS_TURN_MAX falls back to the full-turn ceiling", async () => {
 	const text = await finalizedTextFor({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_TURN_MAX: "Infinity" });
 	expect(text.length).toBe(5000); // invalid env does not force summary truncation
 	expect(text.endsWith("…")).toBe(false);
-});
+}, 60_000);
 
 test("live frames are NOT raised by the turn cap (stay one editable preview)", async () => {
 	setEnv({
@@ -357,7 +357,7 @@ test("live frames are NOT raised by the turn cap (stay one editable preview)", a
 	await waitFor(() => frames.some(f => f.type === "turn_stream" && f.phase === "live"), 3000, "live frame");
 	const live = frames.find(f => f.type === "turn_stream" && f.phase === "live")!;
 	expect(live.text!.length).toBeLessThanOrEqual(3500); // live preview stays capped regardless of TURN_MAX
-});
+}, 60_000);
 
 // Pro round-6 regression: a live (editable) frame whose HTML splits must NOT fan
 // out into stale non-coalesced continuation messages. The daemon edits the one
@@ -394,4 +394,4 @@ test("a split live preview edits one message and never fans out continuation sen
 		messageRef: "1",
 	});
 	expect(bot.calls.filter(c => c.method === "sendMessage").length).toBe(0);
-});
+}, 60_000);

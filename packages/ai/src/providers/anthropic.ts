@@ -435,27 +435,31 @@ function getCacheControl(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
-): { retention: CacheRetention; cacheControl?: AnthropicCacheControl } {
-	// Default Anthropic prompt caching to long (1h) retention. The provider
-	// default of ~5m is too fragile for long-running Codex/Gajae-Code subagent
-	// workflows, where the prefix is frequently evicted between turns. Explicit
-	// request/model `cacheRetention` and the GJC_CACHE_RETENTION /
-	// PI_CACHE_RETENTION env overrides still win.
+): { mode: AnthropicCacheMode; cacheControl?: AnthropicCacheControl } {
 	const retention = resolveCacheRetention(cacheRetention, "long");
-	if (retention === "none") {
-		return { retention };
-	}
-	// `ttl: "1h"` is only honoured on the canonical Anthropic API for models
-	// that advertise long-cache support. Everywhere else (proxies, gateways,
-	// models without the capability) we fall back to the default ephemeral
-	// breakpoint, which Anthropic services at the standard ~5m TTL.
-	const ttl =
-		retention === "long" && isAnthropicApiBaseUrl(baseUrl) && getAnthropicCompat(model).supportsLongCacheRetention
-			? "1h"
-			: undefined;
+	if (retention === "none") return { mode: "none" };
+
+	const isCanonicalApi = isAnthropicApiBaseUrl(baseUrl);
+	const promptCacheMode = model.compat?.promptCacheMode;
+	const mode: AnthropicCacheMode =
+		promptCacheMode === "none"
+			? "none"
+			: promptCacheMode === "explicit"
+				? "explicit"
+				: isCanonicalApi
+					? "automatic"
+					: "none";
+	if (mode === "none") return { mode };
+
+	const supportsLongCacheRetention = isCanonicalApi
+		? getAnthropicCompat(model).supportsLongCacheRetention
+		: model.compat?.supportsLongCacheRetention === true;
 	return {
-		retention,
-		cacheControl: { type: "ephemeral", ...(ttl && { ttl }) },
+		mode,
+		cacheControl: {
+			type: "ephemeral",
+			...(retention === "long" && supportsLongCacheRetention ? { ttl: "1h" } : {}),
+		},
 	};
 }
 
@@ -1081,6 +1085,7 @@ function getAnthropicCompat(
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
 		supportsToolChoice: model.compat?.supportsToolChoice ?? true,
 		supportsForcedToolChoice: model.compat?.supportsForcedToolChoice ?? true,
+		promptCacheMode: model.compat?.promptCacheMode ?? "none",
 		toolChoiceSupport: model.compat?.toolChoiceSupport,
 	};
 }
@@ -1304,6 +1309,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				if (replacementPayload !== undefined) {
 					nextParams = replacementPayload as typeof nextParams;
 				}
+				validateCacheControls(nextParams as AnthropicCacheParams);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -2043,232 +2049,159 @@ type CacheControlBlock = {
 	cache_control?: AnthropicCacheControl | null;
 };
 
-function applyCacheControlToLastBlock<T extends CacheControlBlock>(
-	blocks: T[],
-	cacheControl: AnthropicCacheControl,
-): void {
-	if (blocks.length === 0) return;
-	const lastIndex = blocks.length - 1;
-	blocks[lastIndex] = { ...blocks[lastIndex], cache_control: cacheControl };
+type AnthropicCacheParams = MessageCreateParamsStreaming & {
+	cache_control?: AnthropicCacheControl;
+};
+
+type AnthropicCacheMode = "automatic" | "explicit" | "none";
+
+function isCacheableContentBlock(block: ContentBlockParam): boolean {
+	if (block.type === "thinking" || block.type === "redacted_thinking") return false;
+	return block.type !== "text" || block.text.trim().length > 0;
 }
 
-function applyCacheControlToLastTextBlock(
-	blocks: Array<ContentBlockParam & CacheControlBlock>,
-	cacheControl: AnthropicCacheControl,
-): void {
-	if (blocks.length === 0) return;
-	for (let i = blocks.length - 1; i >= 0; i--) {
-		if (blocks[i].type === "text") {
-			blocks[i] = { ...blocks[i], cache_control: cacheControl };
-			return;
-		}
-	}
-	applyCacheControlToLastBlock(blocks, cacheControl);
+function cacheControlError(path: string, reason: string): Error {
+	return new Error(`Invalid Anthropic cache_control at ${path}: ${reason}`);
 }
 
-function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?: AnthropicCacheControl): void {
-	if (!cacheControl) return;
-
-	// Skip if cache_control breakpoints were already placed externally on messages.
-	for (const message of params.messages) {
-		if (Array.isArray(message.content)) {
-			if ((message.content as Array<ContentBlockParam & CacheControlBlock>).some(b => b.cache_control != null))
-				return;
-		}
+function validateCacheControl(control: unknown, path: string, seenFiveMinute: { value: boolean }): void {
+	if (!isRecord(control) || control.type !== "ephemeral") {
+		throw cacheControlError(path, 'expected { type: "ephemeral" }');
 	}
-
-	const MAX_CACHE_BREAKPOINTS = 4;
-	let cacheBreakpointsUsed = 0;
-
-	if (params.tools && params.tools.length > 0) {
-		applyCacheControlToLastBlock(params.tools as Array<CacheControlBlock>, cacheControl);
-		cacheBreakpointsUsed++;
+	if (control.ttl !== undefined && control.ttl !== "5m" && control.ttl !== "1h") {
+		throw cacheControlError(path, 'ttl must be "5m" or "1h"');
 	}
-
-	if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) return;
-
-	if (params.system && Array.isArray(params.system) && params.system.length > 0) {
-		applyCacheControlToLastBlock(params.system, cacheControl);
-		cacheBreakpointsUsed++;
-	}
-
-	if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) return;
-
-	const userIndexes = params.messages
-		.map((message, index) => (message.role === "user" ? index : -1))
-		.filter(index => index >= 0);
-
-	if (userIndexes.length >= 2) {
-		const penultimateUserIndex = userIndexes[userIndexes.length - 2];
-		const penultimateUser = params.messages[penultimateUserIndex];
-		if (penultimateUser) {
-			if (typeof penultimateUser.content === "string") {
-				const contentBlock: ContentBlockParam & CacheControlBlock = {
-					type: "text",
-					text: penultimateUser.content,
-					cache_control: cacheControl,
-				};
-				penultimateUser.content = [contentBlock];
-				cacheBreakpointsUsed++;
-			} else if (Array.isArray(penultimateUser.content) && penultimateUser.content.length > 0) {
-				applyCacheControlToLastTextBlock(
-					penultimateUser.content as Array<ContentBlockParam & CacheControlBlock>,
-					cacheControl,
-				);
-				cacheBreakpointsUsed++;
-			}
-		}
-	}
-
-	if (cacheBreakpointsUsed >= MAX_CACHE_BREAKPOINTS) return;
-
-	if (userIndexes.length >= 1) {
-		const lastUserIndex = userIndexes[userIndexes.length - 1];
-		const lastUser = params.messages[lastUserIndex];
-		if (lastUser) {
-			if (typeof lastUser.content === "string") {
-				const contentBlock: ContentBlockParam & CacheControlBlock = {
-					type: "text",
-					text: lastUser.content,
-					cache_control: cacheControl,
-				};
-				lastUser.content = [contentBlock];
-			} else if (Array.isArray(lastUser.content) && lastUser.content.length > 0) {
-				applyCacheControlToLastTextBlock(
-					lastUser.content as Array<ContentBlockParam & CacheControlBlock>,
-					cacheControl,
-				);
-			}
-		}
-	}
-}
-
-function normalizeCacheControlBlockTtl(block: CacheControlBlock, seenFiveMinute: { value: boolean }): void {
-	const cacheControl = block.cache_control;
-	if (!cacheControl) return;
-	if (cacheControl.ttl !== "1h") {
-		seenFiveMinute.value = true;
+	if (control.ttl === "1h") {
+		if (seenFiveMinute.value) throw cacheControlError(path, "1h TTL must precede 5m TTL");
 		return;
 	}
-	if (seenFiveMinute.value) {
-		delete cacheControl.ttl;
-	}
+	seenFiveMinute.value = true;
 }
 
-function normalizeCacheControlTtlOrdering(params: MessageCreateParamsStreaming): void {
+function validateCacheControls(params: AnthropicCacheParams): void {
 	const seenFiveMinute = { value: false };
-	if (params.tools) {
-		for (const tool of params.tools as Array<Anthropic.Messages.Tool & CacheControlBlock>) {
-			normalizeCacheControlBlockTtl(tool, seenFiveMinute);
+	let count = 0;
+	const validate = (control: unknown, path: string): void => {
+		if (control == null) return;
+		count++;
+		validateCacheControl(control, path, seenFiveMinute);
+	};
+	if (!Array.isArray(params.messages)) throw cacheControlError("messages", "must be an array");
+
+	validate(params.cache_control, "cache_control");
+	for (const [index, tool] of (params.tools ?? []).entries()) {
+		validate((tool as CacheControlBlock).cache_control, `tools[${index}].cache_control`);
+	}
+	if (Array.isArray(params.system)) {
+		for (const [index, block] of params.system.entries()) {
+			validate((block as CacheControlBlock).cache_control, `system[${index}].cache_control`);
 		}
 	}
-	if (params.system && Array.isArray(params.system)) {
-		for (const block of params.system as Array<AnthropicSystemBlock & CacheControlBlock>) {
-			normalizeCacheControlBlockTtl(block, seenFiveMinute);
-		}
-	}
-	for (const message of params.messages) {
+	for (const [messageIndex, message] of params.messages.entries()) {
 		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content as Array<ContentBlockParam & CacheControlBlock>) {
-			normalizeCacheControlBlockTtl(block, seenFiveMinute);
+		for (const [blockIndex, block] of message.content.entries()) {
+			const control = (block as CacheControlBlock).cache_control;
+			if (control != null && !isCacheableContentBlock(block)) {
+				throw cacheControlError(
+					`messages[${messageIndex}].content[${blockIndex}].cache_control`,
+					"block is not cacheable",
+				);
+			}
+			validate(control, `messages[${messageIndex}].content[${blockIndex}].cache_control`);
 		}
 	}
+	if (count > 4) throw cacheControlError("cache_control", "at most four total breakpoints are allowed");
 }
 
-function findLastCacheControlIndex<T extends CacheControlBlock>(blocks: T[]): number {
+function applyCacheControlToLastCacheableBlock(
+	blocks: Array<ContentBlockParam & CacheControlBlock>,
+	cacheControl: AnthropicCacheControl,
+): boolean {
 	for (let index = blocks.length - 1; index >= 0; index--) {
-		if (blocks[index]?.cache_control != null) return index;
+		const block = blocks[index];
+		if (!isCacheableContentBlock(block)) continue;
+		blocks[index] = { ...block, cache_control: { ...cacheControl } };
+		return true;
 	}
-	return -1;
+	return false;
 }
 
-function stripCacheControlExceptIndex<T extends CacheControlBlock>(
-	blocks: T[],
-	preserveIndex: number,
-	excessCounter: { value: number },
+function isHumanUserMessage(message: MessageCreateParamsStreaming["messages"][number]): boolean {
+	if (message.role !== "user") return false;
+	if (typeof message.content === "string") return true;
+	return message.content.some(block => block.type !== "tool_result");
+}
+
+function applyExplicitPromptCaching(params: AnthropicCacheParams, cacheControl: AnthropicCacheControl): void {
+	if (countCacheControlBreakpoints(params) >= 4) return;
+
+	const currentUserIndex = params.messages.findLastIndex(isHumanUserMessage);
+	if (currentUserIndex < 0) return;
+	const currentUser = params.messages[currentUserIndex];
+	if (!currentUser) return;
+
+	// A tool result is encoded as role "user" on the wire, but belongs to the
+	// preceding assistant turn. Anchor that assistant turn, not the tool result,
+	// so changing tool output does not invalidate the reusable conversation prefix.
+	for (let index = currentUserIndex - 1; index >= 0; index--) {
+		const message = params.messages[index];
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+		if (
+			applyCacheControlToLastCacheableBlock(
+				message.content as Array<ContentBlockParam & CacheControlBlock>,
+				cacheControl,
+			)
+		) {
+			break;
+		}
+	}
+
+	if (countCacheControlBreakpoints(params) >= 4) return;
+	if (typeof currentUser.content === "string" && currentUser.content.trim()) {
+		currentUser.content = [{ type: "text", text: currentUser.content, cache_control: { ...cacheControl } }];
+	} else if (Array.isArray(currentUser.content)) {
+		applyCacheControlToLastCacheableBlock(
+			currentUser.content as Array<ContentBlockParam & CacheControlBlock>,
+			cacheControl,
+		);
+	}
+}
+
+function applyPromptCaching(
+	params: AnthropicCacheParams,
+	cacheMode: AnthropicCacheMode,
+	cacheControl?: AnthropicCacheControl,
 ): void {
-	for (let index = 0; index < blocks.length && excessCounter.value > 0; index++) {
-		if (index === preserveIndex) continue;
-		if (!blocks[index]?.cache_control) continue;
-		delete blocks[index].cache_control;
-		excessCounter.value--;
+	if (!cacheControl || cacheMode === "none") return;
+	validateCacheControls(params);
+	if (cacheMode === "automatic") {
+		params.cache_control = { ...cacheControl };
+		return;
 	}
+	applyExplicitPromptCaching(params, cacheControl);
+	validateCacheControls(params);
 }
 
-function stripAllCacheControl<T extends CacheControlBlock>(blocks: T[], excessCounter: { value: number }): void {
-	for (const block of blocks) {
-		if (excessCounter.value <= 0) return;
-		if (!block.cache_control) continue;
-		delete block.cache_control;
-		excessCounter.value--;
-	}
+export function normalizeCacheControlTtlOrdering(params: MessageCreateParamsStreaming): void {
+	validateCacheControls(params as AnthropicCacheParams);
 }
 
-function stripMessageCacheControl(
-	messages: MessageCreateParamsStreaming["messages"],
-	excessCounter: { value: number },
-): void {
-	for (const message of messages) {
-		if (excessCounter.value <= 0) return;
-		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content as Array<ContentBlockParam & CacheControlBlock>) {
-			if (excessCounter.value <= 0) return;
-			if (!block.cache_control) continue;
-			delete block.cache_control;
-			excessCounter.value--;
-		}
-	}
-}
-
-function countCacheControlBreakpoints(params: MessageCreateParamsStreaming): number {
-	let total = 0;
-	if (params.tools) {
-		for (const tool of params.tools as Array<Anthropic.Messages.Tool & CacheControlBlock>) {
-			if (tool.cache_control) total++;
-		}
-	}
-	if (params.system && Array.isArray(params.system)) {
-		for (const block of params.system as Array<AnthropicSystemBlock & CacheControlBlock>) {
-			if (block.cache_control) total++;
-		}
+function countCacheControlBreakpoints(params: AnthropicCacheParams): number {
+	let total = params.cache_control ? 1 : 0;
+	for (const tool of params.tools ?? []) if ((tool as CacheControlBlock).cache_control) total++;
+	if (Array.isArray(params.system)) {
+		for (const block of params.system) if ((block as CacheControlBlock).cache_control) total++;
 	}
 	for (const message of params.messages) {
 		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content as Array<ContentBlockParam & CacheControlBlock>) {
-			if (block.cache_control) total++;
-		}
+		for (const block of message.content) if ((block as CacheControlBlock).cache_control) total++;
 	}
 	return total;
 }
 
 function enforceCacheControlLimit(params: MessageCreateParamsStreaming, maxBreakpoints: number): void {
-	const total = countCacheControlBreakpoints(params);
-	if (total <= maxBreakpoints) return;
-	const excessCounter = { value: total - maxBreakpoints };
-	const systemBlocks =
-		params.system && Array.isArray(params.system)
-			? (params.system as Array<AnthropicSystemBlock & CacheControlBlock>)
-			: [];
-	const toolBlocks = (params.tools ?? []) as Array<Anthropic.Messages.Tool & CacheControlBlock>;
-	const lastSystemIndex = findLastCacheControlIndex(systemBlocks);
-	const lastToolIndex = findLastCacheControlIndex(toolBlocks);
-	if (systemBlocks.length > 0) {
-		stripCacheControlExceptIndex(systemBlocks, lastSystemIndex, excessCounter);
-	}
-	if (excessCounter.value <= 0) return;
-	if (toolBlocks.length > 0) {
-		stripCacheControlExceptIndex(toolBlocks, lastToolIndex, excessCounter);
-	}
-	if (excessCounter.value <= 0) return;
-	stripMessageCacheControl(params.messages, excessCounter);
-	if (excessCounter.value <= 0) return;
-	if (systemBlocks.length > 0) {
-		stripAllCacheControl(systemBlocks, excessCounter);
-	}
-	if (excessCounter.value <= 0) return;
-	if (toolBlocks.length > 0) {
-		stripAllCacheControl(toolBlocks, excessCounter);
-	}
+	if (maxBreakpoints !== 4) throw new Error("Anthropic supports exactly four cache breakpoints");
+	validateCacheControls(params as AnthropicCacheParams);
 }
 function buildParams(
 	model: Model<"anthropic-messages">,
@@ -2279,7 +2212,8 @@ function buildParams(
 	disableStrictTools = false,
 	repairLatestAssistantThinking = false,
 ): MessageCreateParamsStreaming {
-	const { cacheControl } = getCacheControl(model, baseUrl, options?.cacheRetention);
+	const { mode: cacheMode, cacheControl } = getCacheControl(model, baseUrl, options?.cacheRetention);
+
 	const params: AnthropicSamplingParams = {
 		model: model.id,
 		messages: convertAnthropicMessages(context.messages, model, isOAuthToken, { repairLatestAssistantThinking }),
@@ -2410,7 +2344,7 @@ function buildParams(
 	}
 	disableThinkingIfToolChoiceForced(params);
 	ensureMaxTokensForThinking(params, model);
-	applyPromptCaching(params, cacheControl);
+	applyPromptCaching(params as AnthropicCacheParams, cacheMode, cacheControl);
 	enforceCacheControlLimit(params, 4);
 	normalizeCacheControlTtlOrdering(params);
 

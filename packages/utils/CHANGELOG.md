@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Consecutive termination signals now join the same in-flight postmortem cleanup instead of logging a spurious recursion error, and every exit-bound cleanup wait (signals, fatals, quiet broken-pipe exit, `quit()`) is bounded by an explicit finite deadline (default 5000 ms, `GJC_CLEANUP_DEADLINE_MS` override). On expiry the owner's exit code is preserved, a single diagnostic is emitted (suppressed during quiet shutdown), and late callback settlement becomes a no-op — a never-settling cleanup callback can no longer hang shutdown permanently (#2556).
+
 ## [0.10.1] - 2026-07-13
 
 ### Fixed

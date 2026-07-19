@@ -1,6 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type SettingPath, Settings } from "@gajae-code/coding-agent/config/settings";
-import { BUILTIN_TOOLS, createTools, HIDDEN_TOOLS, type ToolSession } from "@gajae-code/coding-agent/tools";
+import {
+	BUILTIN_TOOLS,
+	createTools,
+	HIDDEN_TOOLS,
+	parseGjcPy,
+	resolveEvalBackends,
+	resolveEvalBackendsFromEnv,
+	resolvePythonIntegrationGate,
+	resolvePythonIpcTrace,
+	resolvePythonSkipCheck,
+	type ToolSession,
+} from "@gajae-code/coding-agent/tools";
 
 Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 
@@ -321,5 +332,221 @@ describe("createTools", () => {
 		expect(Object.keys(BUILTIN_TOOLS)).not.toEqual(
 			expect.arrayContaining(["get_goal", "create_goal", "update_goal"]),
 		);
+	});
+});
+
+// Env vars exercised below leak across tests via the shared `Bun.env`/`$env`
+// reference, so each block restores the keys it touches in afterEach.
+const PY_ENV_KEYS = [
+	"GJC_PY",
+	"PI_PY",
+	"PI_JS",
+	"GJC_PYTHON_SKIP_CHECK",
+	"PI_PYTHON_SKIP_CHECK",
+	"GJC_PYTHON_IPC_TRACE",
+	"PI_PYTHON_IPC_TRACE",
+	"GJC_PYTHON_INTEGRATION",
+	"PI_PYTHON_INTEGRATION",
+] as const;
+
+function clearPyEnvKeys(): void {
+	for (const key of PY_ENV_KEYS) delete Bun.env[key];
+}
+
+describe("parseGjcPy", () => {
+	it("returns null when GJC_PY is unset", () => {
+		expect(parseGjcPy({})).toBeNull();
+	});
+
+	it("returns null when GJC_PY is empty or whitespace", () => {
+		expect(parseGjcPy({ GJC_PY: "" })).toBeNull();
+		expect(parseGjcPy({ GJC_PY: "   " })).toBeNull();
+	});
+
+	it("returns null for unrecognized tokens (invalid values are ignored)", () => {
+		expect(parseGjcPy({ GJC_PY: "python" })).toBeNull();
+		expect(parseGjcPy({ GJC_PY: "yes" })).toBeNull();
+		expect(parseGjcPy({ GJC_PY: "2" })).toBeNull();
+	});
+
+	it("parses 0/bash as JavaScript only", () => {
+		expect(parseGjcPy({ GJC_PY: "0" })).toEqual({ py: false, js: true });
+		expect(parseGjcPy({ GJC_PY: "bash" })).toEqual({ py: false, js: true });
+	});
+
+	it("parses 1/py as Python only", () => {
+		expect(parseGjcPy({ GJC_PY: "1" })).toEqual({ py: true, js: false });
+		expect(parseGjcPy({ GJC_PY: "py" })).toEqual({ py: true, js: false });
+	});
+
+	it("parses js as JavaScript only", () => {
+		expect(parseGjcPy({ GJC_PY: "js" })).toEqual({ py: false, js: true });
+	});
+
+	it("parses mix/both as both backends", () => {
+		expect(parseGjcPy({ GJC_PY: "mix" })).toEqual({ py: true, js: true });
+		expect(parseGjcPy({ GJC_PY: "both" })).toEqual({ py: true, js: true });
+	});
+
+	it("is case-insensitive", () => {
+		expect(parseGjcPy({ GJC_PY: "PY" })).toEqual({ py: true, js: false });
+		expect(parseGjcPy({ GJC_PY: "Both" })).toEqual({ py: true, js: true });
+		expect(parseGjcPy({ GJC_PY: "  Js  " })).toEqual({ py: false, js: true });
+	});
+});
+
+describe("resolveEvalBackendsFromEnv", () => {
+	it("returns null when no env override is set", () => {
+		expect(resolveEvalBackendsFromEnv({})).toBeNull();
+	});
+
+	it("prefers GJC_PY over legacy PI_PY/PI_JS", () => {
+		// GJC_PY=py (python only) wins even though PI_JS would enable js.
+		expect(resolveEvalBackendsFromEnv({ GJC_PY: "py", PI_JS: "1" })).toEqual({ python: true, js: false });
+	});
+
+	it("falls back to legacy PI_PY/PI_JS when GJC_PY is unset", () => {
+		expect(resolveEvalBackendsFromEnv({ PI_PY: "1", PI_JS: "0" })).toEqual({ python: true, js: false });
+		expect(resolveEvalBackendsFromEnv({ PI_PY: "0", PI_JS: "1" })).toEqual({ python: false, js: true });
+	});
+
+	it("falls back to legacy flags when GJC_PY is an unrecognized token", () => {
+		expect(resolveEvalBackendsFromEnv({ GJC_PY: "bogus", PI_PY: "1" })).toEqual({ python: true, js: true });
+	});
+
+	it("treats an unset legacy flag as true (defer-to-settings semantics)", () => {
+		// Only PI_PY set: python follows it, js defaults true.
+		expect(resolveEvalBackendsFromEnv({ PI_PY: "0" })).toEqual({ python: false, js: true });
+		expect(resolveEvalBackendsFromEnv({ PI_JS: "0" })).toEqual({ python: true, js: false });
+	});
+
+	it("honors truthy legacy values 1/true/yes case-insensitively", () => {
+		expect(resolveEvalBackendsFromEnv({ PI_PY: "true", PI_JS: "YES" })).toEqual({
+			python: true,
+			js: true,
+		});
+	});
+
+	it("treats non-truthy legacy values as false", () => {
+		expect(resolveEvalBackendsFromEnv({ PI_PY: "no", PI_JS: "0" })).toEqual({ python: false, js: false });
+	});
+});
+
+describe("resolveEvalBackends (session integration)", () => {
+	afterEach(() => clearPyEnvKeys());
+
+	it("defers to settings when no env override is set", () => {
+		clearPyEnvKeys();
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({ "eval.py": false, "eval.js": true }),
+		});
+		expect(resolveEvalBackends(session)).toEqual({ python: false, js: true });
+	});
+
+	it("GJC_PY=py overrides settings to python only", () => {
+		clearPyEnvKeys();
+		Bun.env.GJC_PY = "py";
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({ "eval.py": true, "eval.js": true }),
+		});
+		expect(resolveEvalBackends(session)).toEqual({ python: true, js: false });
+	});
+
+	it("GJC_PY=0 disables python and enables js regardless of settings", () => {
+		clearPyEnvKeys();
+		Bun.env.GJC_PY = "0";
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({ "eval.py": true, "eval.js": false }),
+		});
+		expect(resolveEvalBackends(session)).toEqual({ python: false, js: true });
+	});
+
+	it("GJC_PY wins over legacy PI_PY/PI_JS when both are set", () => {
+		clearPyEnvKeys();
+		Bun.env.GJC_PY = "js";
+		Bun.env.PI_PY = "1";
+		Bun.env.PI_JS = "0";
+		const session = createTestSession();
+		// GJC says js only; PI says py only. GJC wins → python false, js true.
+		expect(resolveEvalBackends(session)).toEqual({ python: false, js: true });
+	});
+
+	it("legacy PI_PY/PI_JS still apply when GJC_PY is unset", () => {
+		clearPyEnvKeys();
+		Bun.env.PI_PY = "1";
+		Bun.env.PI_JS = "0";
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({ "eval.py": false, "eval.js": true }),
+		});
+		expect(resolveEvalBackends(session)).toEqual({ python: true, js: false });
+	});
+});
+
+describe("resolvePythonSkipCheck", () => {
+	it("is false when neither GJC nor PI is set", () => {
+		expect(resolvePythonSkipCheck({})).toBe(false);
+	});
+
+	it("honors GJC_PYTHON_SKIP_CHECK truthy values", () => {
+		expect(resolvePythonSkipCheck({ GJC_PYTHON_SKIP_CHECK: "1" })).toBe(true);
+		expect(resolvePythonSkipCheck({ GJC_PYTHON_SKIP_CHECK: "true" })).toBe(true);
+		expect(resolvePythonSkipCheck({ GJC_PYTHON_SKIP_CHECK: "yes" })).toBe(true);
+	});
+
+	it("falls back to PI_PYTHON_SKIP_CHECK", () => {
+		expect(resolvePythonSkipCheck({ PI_PYTHON_SKIP_CHECK: "1" })).toBe(true);
+	});
+
+	it("prefers GJC over PI but either truthy wins (OR)", () => {
+		expect(resolvePythonSkipCheck({ GJC_PYTHON_SKIP_CHECK: "1", PI_PYTHON_SKIP_CHECK: "0" })).toBe(true);
+		expect(resolvePythonSkipCheck({ GJC_PYTHON_SKIP_CHECK: "0", PI_PYTHON_SKIP_CHECK: "1" })).toBe(true);
+	});
+
+	it("is case-insensitive and ignores whitespace", () => {
+		expect(resolvePythonSkipCheck({ GJC_PYTHON_SKIP_CHECK: "  YES  " })).toBe(true);
+	});
+
+	it("treats non-truthy values as false", () => {
+		expect(resolvePythonSkipCheck({ GJC_PYTHON_SKIP_CHECK: "no" })).toBe(false);
+		expect(resolvePythonSkipCheck({ GJC_PYTHON_SKIP_CHECK: "0" })).toBe(false);
+	});
+});
+
+describe("resolvePythonIpcTrace", () => {
+	it("is false when neither is set", () => {
+		expect(resolvePythonIpcTrace({})).toBe(false);
+	});
+
+	it("honors GJC_PYTHON_IPC_TRACE first, then PI_PYTHON_IPC_TRACE", () => {
+		expect(resolvePythonIpcTrace({ GJC_PYTHON_IPC_TRACE: "1" })).toBe(true);
+		expect(resolvePythonIpcTrace({ PI_PYTHON_IPC_TRACE: "true" })).toBe(true);
+		expect(resolvePythonIpcTrace({ GJC_PYTHON_IPC_TRACE: "0", PI_PYTHON_IPC_TRACE: "1" })).toBe(true);
+	});
+});
+
+describe("resolvePythonIntegrationGate (OR semantics)", () => {
+	it("is false when neither is set", () => {
+		expect(resolvePythonIntegrationGate({})).toBe(false);
+	});
+
+	it("is true when GJC_PYTHON_INTEGRATION=1", () => {
+		expect(resolvePythonIntegrationGate({ GJC_PYTHON_INTEGRATION: "1" })).toBe(true);
+	});
+
+	it("is true when PI_PYTHON_INTEGRATION=1", () => {
+		expect(resolvePythonIntegrationGate({ PI_PYTHON_INTEGRATION: "1" })).toBe(true);
+	});
+
+	it("GJC=0, PI=1 is still true (OR semantics, not GJC-gated)", () => {
+		expect(resolvePythonIntegrationGate({ GJC_PYTHON_INTEGRATION: "0", PI_PYTHON_INTEGRATION: "1" })).toBe(true);
+	});
+
+	it("both 0 is false", () => {
+		expect(resolvePythonIntegrationGate({ GJC_PYTHON_INTEGRATION: "0", PI_PYTHON_INTEGRATION: "0" })).toBe(false);
+	});
+
+	it("accepts truthy tokens true/yes case-insensitively", () => {
+		expect(resolvePythonIntegrationGate({ GJC_PYTHON_INTEGRATION: "TRUE" })).toBe(true);
+		expect(resolvePythonIntegrationGate({ PI_PYTHON_INTEGRATION: "yes" })).toBe(true);
 	});
 });

@@ -1,12 +1,9 @@
 /**
- * Phase-boundary receipt rollup builder (receipt-of-receipts).
+ * EXPERIMENTAL: Phase-boundary receipt rollup builder (receipt-of-receipts).
  *
- * At a harness lifecycle boundary, N child task receipts can be superseded by a
- * single `phase-rollup` receipt that preserves per-child pointers (id, status,
- * outputRef, sha256) plus aggregate ROI totals. The rollup is hash-sealed via
- * the standard receipt envelope and validated fail-closed like every other
- * family (see `validatePhaseRollup` in receipts.ts). Pure builder — no runtime
- * injection behavior is changed here.
+ * This builder is not wired into finalize or retire yet; child receipts remain
+ * authoritative until a lifecycle integration preserves their supersession
+ * semantics. It is retained for controlled integration experiments only.
  */
 import type { TaskResultReceipt } from "../task/receipt";
 import {

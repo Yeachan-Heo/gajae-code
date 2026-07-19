@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "commit": "379a429b",
+  "scope": "PR #2482 / #2390 team-runtime module split QA",
+  "environment": {
+    "platform": "darwin",
+    "baseline": "/var reparse/acl_unavailable",
+    "note": "Known Darwin filesystem capability baseline; not investigated because the requested focused suites and package typecheck completed successfully."
+  },
+  "commands": [
+    {
+      "cwd": "packages/coding-agent",
+      "command": "bun test test/gjc-runtime/team-runtime.test.ts test/gjc-runtime/team-convergence.test.ts test/team-worker-integration-scheduler.test.ts test/gjc-runtime/tmux-gc.redteam.test.ts test/gjc-runtime/state-concurrency-fuzz.test.ts",
+      "result": "passed",
+      "evidence": "82 pass, 0 fail, 538 expect() calls across 5 files"
+    },
+    {
+      "cwd": "packages/coding-agent",
+      "command": "bun run check:types",
+      "result": "passed",
+      "evidence": "tsc -p tsconfig.json --noEmit completed cleanly"
+    },
+    {
+      "cwd": ".",
+      "command": "git diff --check 379a429b^ 379a429b && git diff --name-only 379a429b^ 379a429b -- packages/coding-agent/test",
+      "result": "passed",
+      "evidence": "No whitespace errors and no test-file changes in the frozen-head commit"
+    },
+    {
+      "cwd": ".",
+      "command": "git diff --unified=5 dev...379a429b -- packages/coding-agent/test/gjc-runtime/team-runtime.test.ts",
+      "result": "passed",
+      "evidence": "The only dev-relative test updates replace module-global transport setup/reset with explicit per-call transport parameters; notification delivery, fallback, idempotency, and state assertions remain present"
+    }
+  ],
+  "cases": [
+    {
+      "id": "required-focused-suites",
+      "result": "passed",
+      "evidence": "team-runtime, team-convergence, worker integration scheduler, tmux GC red-team, and the discovered claim-race focused suite all passed"
+    },
+    {
+      "id": "claim-lease-semantics",
+      "result": "passed",
+      "evidence": "state-concurrency-fuzz.test.ts asserts exactly one O_EXCL claim winner and all other racers lose; team-runtime.test.ts asserts an expired claim is recovered with a new token and lease, and records claim_expired"
+    },
+    {
+      "id": "cli-launch-path",
+      "result": "passed",
+      "evidence": "commands/team.ts invokes startGjcTeam; team-runtime delegates that public entrypoint to startGjcTeamLaunch with its tmux and worktree runtime dependencies. Focused team runtime/convergence suites passed"
+    },
+    {
+      "id": "explicit-mailbox-transport",
+      "result": "passed",
+      "evidence": "Source audit found no module-global mailbox transport singleton. team-notify.ts accepts GjcTeamMailboxDeliveryTransport as an explicit function parameter; focused tests pass an isolated transport on each send"
+    },
+    {
+      "id": "extracted-module-ownership",
+      "result": "passed",
+      "evidence": "team-store owns GjcTeamTaskStore and file-backed task/claim operations; team-notify owns notification delivery/replay/mailbox operations; team-workers owns lifecycle/heartbeat/recovery/shutdown operations; team-launch owns startGjcTeamLaunch state/worktree/tmux orchestration. These are implementations, not re-export shims"
+    },
+    {
+      "id": "assertion-strength",
+      "result": "passed",
+      "evidence": "Frozen-head diff has no test changes. Dev-relative transport test changes remove global setup/reset only and retain delivery, fallback, duplicate-idempotency, attempt-count, and delivery-state assertions"
+    }
+  ],
+  "blockers": []
+}

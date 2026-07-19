@@ -202,6 +202,25 @@ describe("WorkflowGateBroker", () => {
 		);
 	});
 
+	it("C07 replays only the completed identical resolution and rejects conflicting or double answers", async () => {
+		const { broker, advanced } = makeBroker();
+		const gate = broker.openGate(
+			{ stage: "ultragoal", kind: "execution", schema: { type: "boolean" } },
+			liveContinuation(),
+		);
+		const first = await broker.resolve({ gate_id: gate.gate_id, answer: true, idempotency_key: "c07" });
+		expect(first).toMatchObject({ status: "accepted", gate_id: gate.gate_id });
+		expect(advanced).toEqual([{ gate, answer: true }]);
+		await expect(broker.resolve({ gate_id: gate.gate_id, answer: false, idempotency_key: "c07" })).rejects.toThrow(
+			/idempotency_conflict|conflict/,
+		);
+		await expect(broker.resolve({ gate_id: gate.gate_id, answer: true })).rejects.toThrow(
+			/already_resolved|resolved/,
+		);
+		expect(await broker.resolve({ gate_id: gate.gate_id, answer: true, idempotency_key: "c07" })).toEqual(first);
+		expect(advanced).toHaveLength(1);
+	});
+
 	it("throws on unknown gate ids", async () => {
 		const { broker } = makeBroker();
 		await expect(broker.resolve({ gate_id: "wg_x_ralplan_000099", answer: 1 })).rejects.toThrow(

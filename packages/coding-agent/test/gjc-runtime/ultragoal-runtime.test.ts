@@ -922,6 +922,25 @@ describe("ultragoal CLI replay validation", () => {
 			]),
 		);
 	});
+
+	it("rejects empty or nonce-matching replay invariants and retains equality for negative-only assertions", async () => {
+		const cases: Array<{ invariants: Record<string, unknown>[]; message: string }> = [
+			{ invariants: [{ type: "regex", value: "[\\s\\S]*" }], message: "meaningful positive" },
+			{ invariants: [{ type: "regex", value: "[^]*" }], message: "meaningful positive" },
+			{ invariants: [{ type: "regex", value: "^" }], message: "meaningful positive" },
+			{ invariants: [{ type: "regex", value: "(?:)" }], message: "meaningful positive" },
+			{ invariants: [{ type: "substring", value: " \t" }], message: "non-empty string" },
+			{ invariants: [{ type: "not_substring", value: "missing" }], message: "stdout did not match" },
+		];
+		for (const entry of cases) {
+			const root = await tempDir();
+			const error = await expectRejectedExecutorQa(
+				root,
+				cliExecutorQa([cliReplayArtifact({ recordedStdout: "different\n", invariants: entry.invariants })]),
+			);
+			expect(error).toContain(entry.message);
+		}
+	});
 });
 
 describe("native GJC ultragoal runtime", () => {

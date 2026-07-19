@@ -133,6 +133,7 @@ function invoke(
 	operation: string,
 	input: ControlInput,
 	confirm: boolean | undefined,
+	idempotencyKey: string | undefined,
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
@@ -148,7 +149,12 @@ function invoke(
 		case "ask.answer":
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
-			return surface.answerGate(text(input, "id"), input.response, input.expectedSessionId as string | undefined);
+			return surface.answerGate(
+				text(input, "id"),
+				input.response,
+				input.expectedSessionId as string | undefined,
+				idempotencyKey,
+			);
 		case "workflow.plan_approve":
 			return surface.approvePlan(text(input, "id"), input.choice, input.expectedSessionId as string | undefined);
 		case "skill.invoke":
@@ -276,7 +282,13 @@ async function execute(surface: ControlSurface, row: Operation, request: Control
 		return {
 			id: request.id,
 			ok: true,
-			result: await invoke(surface, row.sdkId, request.input as ControlInput, request.confirm),
+			result: await invoke(
+				surface,
+				row.sdkId,
+				request.input as ControlInput,
+				request.confirm,
+				request.idempotencyKey,
+			),
 		};
 	} catch (error) {
 		return errorResponse(request.id, row, error);

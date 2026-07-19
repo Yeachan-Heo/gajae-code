@@ -38,5 +38,26 @@ declare module "@gajae-code/natives" {
 		registerArbitratedAsk(actionJson: string, repliable: boolean): PresentationLease;
 		/** Retire an exact private lease unless a generic reply has already claimed it. */
 		retireIfUnclaimed(lease: PresentationLease): RetireIfUnclaimedResult;
+		/** Broadcast a TypeScript-constructed turn frame without JSON serde validation. */
+		pushTurnStreamUnchecked(
+			sessionId: string,
+			phase: "live" | "finalized",
+			text: string,
+			finalAnswer?: boolean,
+			messageRef?: string,
+		): void;
+		/** Broadcast raw file bytes; Rust encodes the unchanged base64 wire field. */
+		pushFileAttachmentUnchecked(
+			sessionId: string,
+			name: string,
+			mime: string | undefined,
+			data: Buffer,
+			caption: string | undefined,
+		): void;
+		/** Counters for known-good N-API frame crossings. */
+		knownGoodFrameStats(): {
+			knownGoodTurnStreamFrames: number;
+			turnStreamSerdeValidationParses: number;
+		};
 	}
 }

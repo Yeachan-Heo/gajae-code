@@ -53,7 +53,7 @@ export default class MCP extends Command {
 
 	async run(): Promise<void> {
 		if (this.argv.includes("--help") || this.argv.includes("-h")) {
-			this.printHelp();
+			this.#printHelp();
 			return;
 		}
 
@@ -80,7 +80,7 @@ export default class MCP extends Command {
 		await runMCPCommand(cmd);
 	}
 
-	private printHelp(): void {
+	#printHelp(): void {
 		process.stdout.write(`Store standalone MCP server definitions in GJC config without loading them at runtime
 
 USAGE

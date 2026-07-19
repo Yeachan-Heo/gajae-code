@@ -13,6 +13,8 @@ import { SecretObfuscator } from "@gajae-code/coding-agent/secrets";
 import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getSessionsDir, Snowflake } from "@gajae-code/utils";
+import { discoverAuthStorage } from "../src/sdk/session";
+import { AgentStorage } from "../src/session/agent-storage";
 
 function createTtsrRule(name: string): Rule {
 	return {
@@ -63,6 +65,10 @@ describe("createAgentSession session storage isolation", () => {
 	afterEach(async () => {
 		LocalProtocolHandler.resetOverrideForTests();
 		AgentRegistry.resetGlobalForTests();
+		if (process.platform === "win32") {
+			Bun.gc(true);
+			await Bun.sleep(50);
+		}
 		for (const tempDir of tempDirs.splice(0)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -100,6 +106,48 @@ describe("createAgentSession session storage isolation", () => {
 			await session.dispose();
 		}
 	});
+	it("keeps settings storage usable while default sessions dispose independently", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-shared-storage-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+
+		const settingsStorage = await AgentStorage.open(path.join(agentDir, "agent.db"));
+		const options = {
+			cwd,
+			agentDir,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		};
+		const first = await createAgentSession(options);
+		const second = await createAgentSession(options);
+		try {
+			await first.session.dispose();
+			await first.session.dispose();
+
+			settingsStorage.recordModelUsage("test/shared");
+			expect(settingsStorage.getModelUsageOrder()).toContain("test/shared");
+			await second.session.modelRegistry.authStorage.reload();
+
+			const laterStorage = await discoverAuthStorage(agentDir);
+			try {
+				await laterStorage.reload();
+			} finally {
+				laterStorage.close();
+			}
+		} finally {
+			await first.session.dispose();
+			await second.session.dispose();
+			settingsStorage.close();
+		}
+	}, 20_000);
 
 	it("releases each session's owned local:// override on dispose", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-local-protocol-${Snowflake.next()}-`));

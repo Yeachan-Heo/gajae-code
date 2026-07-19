@@ -132,4 +132,4 @@
 
 When the live peer roster changes, an eligible model turn receives one hidden single-line reminder listing stable agent ids and roster labels. The initial empty roster produces no reminder; a later transition to empty does. Running/idle status changes alone do not count as a roster change.
 
-Normal turns and `/btw` ephemeral turns commit an atomic roster claim on successful completion. Awaited IRC auto-replies defer that commit until their incoming + auto-reply exchange is accepted; failed or aborted reply turns release the claim for a later retry. These reminders are context-only and never appear in the transcript or persisted history.
+Normal turns commit an atomic roster claim on successful completion. Awaited IRC auto-replies defer that commit until their incoming + auto-reply exchange is accepted; failed or aborted reply turns release the claim for a later retry. Isolated `/btw` turns do not acquire or commit roster claims. These reminders are context-only and never appear in the transcript or persisted history.

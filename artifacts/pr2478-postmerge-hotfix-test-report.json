@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "commit": "5a253ec8826ab4b00b62e66fb304405c9ed9d426",
+  "base": "d5660c7e5c7153898923388eb370b7df59052c91",
+  "status": "passed",
+  "summary": {
+    "tests": 175,
+    "assertions": 2232,
+    "failures": 0,
+    "packageCheck": "passed",
+    "build": "passed",
+    "sdkInventoryCheck": "passed",
+    "cleaner": "passed",
+    "architectReview": "CLEAR/APPROVE"
+  },
+  "commands": [
+    "bun test packages/coding-agent/test/command-palette.test.ts packages/coding-agent/test/file-lock-gc-toctou.test.ts packages/coding-agent/test/sdk-operation-inventory.test.ts packages/coding-agent/test/sdk-operation-matrix.test.ts packages/coding-agent/test/slash-command-builtin-registry.test.ts packages/coding-agent/test/agent-session-default-model-selection.test.ts packages/coding-agent/test/config/atomic-yaml-patch.test.ts packages/coding-agent/test/harness-control-plane/receipt-spool.test.ts scripts/ci-dev-affected.test.ts",
+    "bun packages/coding-agent/scripts/generate-sdk-operation-inventory.ts --check",
+    "bun --cwd=packages/coding-agent run check",
+    "bun run build"
+  ],
+  "adversarialCoverage": [
+    "command palette draft preservation and overlapping dispatch",
+    "file-lock missing/changed ownership and dual failure",
+    "SDK scanner missing/unbalanced anchors and explicit exclusion metadata",
+    "goal builtin canonical controller fixture",
+    "affected aggregate failed/cancelled/skipped truth table",
+    "strict missing/extra/duplicate/wrong/malformed shard receipts",
+    "default-model durable and cleanup failure recovery",
+    "atomic YAML concurrency, CAS conflict, and rename failure"
+  ],
+  "blockers": []
+}

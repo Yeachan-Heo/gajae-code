@@ -288,6 +288,8 @@ If the wheel does not scroll inside `gjc --tmux` on WSL, confirm the session is 
 | `GJC_TEAM_WORKER_COMMAND` | Worker GJC command override |
 | `GJC_TEAM_WORKER_CLI` | Team worker CLI selector; accepted values are `auto` or `gjc` |
 | `GJC_TEAM_WORKER_CLI_MAP` | Comma-separated worker CLI selector map; entries must be `auto` or `gjc` |
+| `GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS` | Default-off stalled-worker continuation for the mutating `gjc team monitor` path; only exact value `1` enables it. A nudge is fenced to a running non-dry-run team, stale heartbeat, live recorded non-leader pane in the recorded tmux target, a proven-absent shutdown authority record, `ready`/`working` lifecycle with a valid non-terminal worker status, one current matching in-progress claim, and a lease that covers the hold. Valid-present or invalid/unreadable shutdown authority vetoes continuation but does not suppress normal stale-claim recovery. It uses at most two immutable journaled attempts (30s, then 120s) and fails closed on restart/unknown outcome. It sends a fixed prompt only to that pane on verified native tmux transport; psmux and native Windows send-keys fallback transports record a skipped outcome and send no continuation input. It does not replay providers, inspect/inject dynamic pane content or cross panes, kill/relaunch/split workers, or alter claims. |
+| `GJC_TEAM_HEARTBEAT_STALE_MS` | Stale-heartbeat threshold in milliseconds. Defaults to `120000`; a non-numeric value falls back to that default, and a non-positive value disables stale-heartbeat detection. |
 
 ### Hermes MCP bridge
 
@@ -446,7 +448,8 @@ Extra conditional behavior:
 | `GJC_TASK_MAX_OUTPUT_LINES`   | Max captured output lines per subagent (default `5000`)                                            |
 | `GJC_TIMING`                  | If set (any non-empty value), prints a hierarchical timing-span tree to **stderr** via `logger.printTimings()`. In interactive mode the tree prints once the agent is ready (before the TUI starts); in print mode it prints after the whole prompt batch completes. Print-mode prompts are wrapped in `print:prompt:initial` / `print:prompt:next` spans so each user message shows up as its own row. `GJC_TIMING=x` exits the process with code 0 right after printing in interactive mode (use to measure cold startup only). `GJC_TIMING=full` lists every module-load entry instead of just the top N. |
 | `GJC_PACKAGE_DIR`             | Overrides package asset base dir resolution (docs/examples/changelog path lookup)                  |
-| `GJC_DISABLE_LSPMUX`          | If `1`, disables lspmux detection/integration and forces direct LSP server spawning                |
+| `GJC_DISABLE_LSPMUX`          | Canonical lspmux opt-out. A truthy value disables lspmux probing and wrapping; `PI_DISABLE_LSPMUX` is a supported compatibility alias with the same effect. |
+| `PI_DISABLE_LSPMUX`           | Supported compatibility alias for `GJC_DISABLE_LSPMUX`; a truthy value also disables lspmux probing and wrapping. |
 | `SMITHERY_URL`               | Smithery web URL override (default `https://smithery.ai`)                                          |
 | `SMITHERY_API_URL`           | Smithery API base URL override (default `https://api.smithery.ai`)                                 |
 | `PUPPETEER_EXECUTABLE_PATH`  | Browser tool Chromium executable override                                                          |
@@ -457,6 +460,8 @@ Extra conditional behavior:
 | `GJC_FORCE_IMAGE_PROTOCOL`    | Forces supported image protocol (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) where used            |
 | `GJC_ALLOW_SIXEL_PASSTHROUGH` | Allows SIXEL passthrough when `GJC_FORCE_IMAGE_PROTOCOL=sixel`                                      |
 | `GJC_NO_PTY`                  | If `1`, disables interactive PTY path for bash tool                                                |
+
+LSP project configuration may control declarative matching, activation, and capabilities, but it cannot define a command, arguments, executable, client factory, initialization options, or opaque server settings. Trusted user-wide configuration outside the project—including the recommended `~/.gjc/agent/lsp.*` files and supported legacy user locations—can override LSP launches and server options; automatic discovery uses trusted external executables and rejects project-owned lexical paths as well as symlink-resolved project binaries.
 
 `GJC_NO_PTY` is also set internally when CLI `--no-pty` is used.
 

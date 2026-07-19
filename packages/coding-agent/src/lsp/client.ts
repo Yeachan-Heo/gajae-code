@@ -509,7 +509,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 
 		// Wrap with lspmux if available and supported
 		const { command, args, env } = isLspmuxSupported(baseCommand)
-			? await getLspmuxCommand(baseCommand, baseArgs)
+			? await getLspmuxCommand(baseCommand, baseArgs, cwd)
 			: { command: baseCommand, args: baseArgs };
 
 		const owner = spawnOwnedProcess([command, ...args], {

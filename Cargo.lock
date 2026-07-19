@@ -2476,6 +2476,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "similar 3.1.1",
  "smallvec",
  "syntect",

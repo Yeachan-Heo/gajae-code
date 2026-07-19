@@ -58,11 +58,12 @@ jobs:
       - name: Upload canonical affected plan
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .ci-dev-affected-plan.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
   windows-dev-doctor:
     name: Windows dev:doctor
@@ -152,7 +153,7 @@ jobs:
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .
       - run: bun scripts/ci-dev-affected.ts --validate-plan
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
@@ -181,12 +182,13 @@ jobs:
       - name: Upload native addon(s)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-native-${{ github.run_id }}
           path: |
             packages/natives/native/pi_natives.linux-x64-baseline.node
             packages/natives/native/pi_natives.linux-x64-modern.node
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
   # One shard per planned task on the broad runner. Native build tasks are
   # excluded (they run in affected-native); shards that load the native addon at
@@ -221,6 +223,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       - name: Verify checked-out source head
         shell: bash
         run: |
@@ -235,7 +238,7 @@ jobs:
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .
       - run: bun scripts/ci-dev-affected.ts --validate-plan
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
@@ -269,7 +272,7 @@ jobs:
         if: ${{ matrix.native }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-native-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-native-${{ github.run_id }}
           path: packages/natives/native
       - name: Run affected task shard
         env:
@@ -285,28 +288,32 @@ jobs:
       - name: Upload shard completion receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: dev-affected-shard-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          name: dev-affected-shard-${{ github.run_id }}-${{ strategy.job-index }}
           path: .ci-dev-shard-receipts/${{ strategy.job-index }}.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
 
-  # Branch protection must keep requiring this stable aggregate status. It validates
-  # the canonical plan and receipts, then passes iff the planner, native build,
-  # every affected shard, and Windows doctor satisfy their planned contracts. The
-  # job name must stay exactly "Affected path validation".
-  affected:
-    name: Affected path validation
+  # This producer is deliberately not the protected status: the downstream job
+  # validates the finalized bundle downloaded by its immutable artifact ID.
+  affected-evidence-producer:
+    name: Affected path validation / evidence producer
     if: ${{ always() }}
     needs: [affected-plan, affected-native, affected-shards, windows-dev-doctor]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    outputs:
+      artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}
     env:
       CI_DEV_AFFECTED_PLAN: .ci-dev-affected-plan.json
       CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
       CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
+      CI_DEV_PLAN_MODE: ${{ needs.affected-plan.outputs.plan_mode }}
       CI_DEV_SHARD_RECEIPTS: .ci-dev-shard-receipts
+      CI_DEV_EVIDENCE_ROOT: .
       CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -323,21 +330,16 @@ jobs:
       - name: Download canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dev-affected-plan-${{ github.run_id }}
           path: .
-      - name: Validate canonical affected plan
-        run: bun scripts/ci-dev-affected.ts --validate-plan
       - name: Download shard completion receipts
-        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-shards.result == 'success' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
-          pattern: dev-affected-shard-${{ github.run_id }}-${{ github.run_attempt }}-*
+          pattern: dev-affected-shard-${{ github.run_id }}-*
           path: .ci-dev-shard-receipts
           merge-multiple: true
-      - name: Validate canonical shard completion
-        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' }}
-        run: bun scripts/ci-dev-affected.ts --validate-shard-receipts
-      - name: Aggregate affected path validation shards
+      - name: Produce affected evidence
         env:
           CI_DEV_PLAN_RESULT: ${{ needs.affected-plan.result }}
           CI_DEV_NATIVE_RESULT: ${{ needs.affected-native.result }}
@@ -346,7 +348,78 @@ jobs:
           CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
           CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
           CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
-        run: bun scripts/ci-dev-affected.ts --validate-aggregate
+        run: bun scripts/ci-dev-affected.ts --write-affected-evidence
+      - name: Upload affected evidence
+        id: upload-evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-affected-evidence-${{ github.run_id }}
+          path: |
+            .ci-dev-affected-evidence.json
+            .ci-dev-affected-evidence.receipt.json
+            .ci-dev-affected-plan.json
+            .ci-dev-shard-receipts
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  affected:
+    name: Affected path validation
+    if: ${{ always() }}
+    needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, windows-dev-doctor]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    env:
+      CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}
+      CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}
+      CI_DEV_PLAN_MODE: ${{ needs.affected-plan.outputs.plan_mode }}
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CI_DEV_PLAN_RESULT: ${{ needs.affected-plan.result }}
+      CI_DEV_NATIVE_RESULT: ${{ needs.affected-native.result }}
+      CI_DEV_SHARDS_RESULT: ${{ needs.affected-shards.result }}
+      CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}
+      CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
+      CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
+      CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+    steps:
+      - name: Fail closed on producer and live dependency results
+        env:
+          CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence
+        shell: bash
+        run: |
+          test '${{ needs.affected-evidence-producer.result }}' = success
+          test '${{ needs.affected-plan.result }}' = success
+          test '${{ needs.affected-evidence-producer.outputs.artifact_id }}' != ''
+          test '${{ needs.affected-evidence-producer.outputs.artifact_digest }}' != ''
+          test "$CI_DEV_EVIDENCE_ROOT" != "$GITHUB_WORKSPACE"
+          case "$CI_DEV_EVIDENCE_ROOT" in "$GITHUB_WORKSPACE"/*) exit 1;; esac
+          rm -rf "$CI_DEV_EVIDENCE_ROOT"
+          mkdir -p "$CI_DEV_EVIDENCE_ROOT"
+      - name: Download finalized affected evidence
+      # download-artifact selects the immutable upload by artifact ID; the pinned
+      # action exposes no downloaded digest output to compare, so artifact_digest
+      # remains a required producer audit binding rather than a path selector.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          artifact-ids: ${{ needs.affected-evidence-producer.outputs.artifact_id }}
+          path: ${{ runner.temp }}/ci-dev-affected-evidence
+          merge-multiple: true
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - name: Validate finalized affected evidence
+        env:
+          CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence
+        run: bun scripts/ci-dev-affected.ts --validate-affected-evidence
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}

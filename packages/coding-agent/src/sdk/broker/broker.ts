@@ -14,6 +14,7 @@ import {
 	brokerProcessIncarnation,
 	isPidAlive,
 	newBrokerToken,
+	type RedactedBrokerDiscovery,
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 	writeBrokerDiscovery,
@@ -373,7 +374,7 @@ export class Broker {
 	#chains = new Map<string, Promise<void>>();
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
-	#heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+	#heartbeatTimer: NodeJS.Timeout | null = null;
 	#heartbeatWrite: Promise<void> = Promise.resolve();
 	constructor(settings: BrokerSettings) {
 		this.settings = {
@@ -560,7 +561,7 @@ export class Broker {
 	get ownsDiscovery(): boolean {
 		return this.discovery?.ownerId === this.#owner;
 	}
-	status(): ReturnType<typeof redactBrokerDiscovery> | null {
+	status(): RedactedBrokerDiscovery | null {
 		return this.discovery ? redactBrokerDiscovery(this.discovery) : null;
 	}
 	async heartbeat(): Promise<void> {

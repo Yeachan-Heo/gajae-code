@@ -46,42 +46,248 @@ describe("planTasks command shape (issue #622)", () => {
 });
 
 describe("dev-ci canonical-plan workflow contract", () => {
-	test("binds the canonical plan to its checked-out source and validates it before aggregate decisions", async () => {
+	test("pins independent no-shard and multi-shard detached-document byte oracles", () => {
+		const noShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"pr\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"skipped\",\"shards\":\"skipped\",\"windowsDoctor\":\"skipped\",\"windowsDoctorRequired\":\"false\",\"hasNative\":\"false\",\"hasTasks\":\"false\"},\"taskIdentities\":[],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}\n";
+		const multiShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"push\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"success\",\"shards\":\"success\",\"windowsDoctor\":\"success\",\"windowsDoctorRequired\":\"true\",\"hasNative\":\"true\",\"hasTasks\":\"true\"},\"taskIdentities\":[{\"key\":\"one\",\"identity\":\"id-one\"},{\"key\":\"two\",\"identity\":\"id-two\"}],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},{\"name\":\".ci-dev-shard-receipts/0.json\",\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},{\"name\":\".ci-dev-shard-receipts/1.json\",\"sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}]}\n";
+		const noShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"588c6fef9fe2fd488a5f511c7e02e620c6c55a165d10997fa2d9aad24f5db746\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
+		const multiShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"276923dd0acb537de815b14eab377a2740224a4063679738cfd3bbae87324ba6\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
+		const hash = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+		expect(hash(noShardManifest)).toBe("588c6fef9fe2fd488a5f511c7e02e620c6c55a165d10997fa2d9aad24f5db746");
+		expect(hash(multiShardManifest)).toBe("276923dd0acb537de815b14eab377a2740224a4063679738cfd3bbae87324ba6");
+		expect(hash(noShardReceipt)).toBe("39f209e20824bec9839b6e9ffa8ce6a5f894b4190e80061c1635c46a645faa56");
+		expect(hash(multiShardReceipt)).toBe("0d939ebfb8e87300b3c8433e2a7e4499072f89f28fee1b3b164156b554d08eda");
+	});
+	test("uses a detached finalized evidence producer and artifact-ID consumer", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
-		expect(workflow.match(/ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}/g)).toHaveLength(5);
-		expect(workflow.match(/Verify checked-out source head/g)).toHaveLength(5);
-		expect(workflow).toContain("name: dev-affected-plan-${{ github.run_id }}-${{ github.run_attempt }}");
-		expect(workflow.match(/\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/g)).toHaveLength(8);
-		expect(workflow).toContain("include-hidden-files: true");
-		expect(workflow.match(/include-hidden-files: true/g)).toHaveLength(2);
-		expect(workflow).toContain("CI_DEV_PLAN_DIGEST: ${{ needs.affected-plan.outputs.plan_digest }}");
-		expect(workflow).toContain("CI_DEV_PLAN_SOURCE_SHA: ${{ needs.affected-plan.outputs.plan_source_sha }}");
-		expect(workflow).toContain("CI_DEV_MATRIX_NEXTEST: ${{ matrix.nextest }}");
-		expect(workflow).toContain("timeout-minutes: ${{ matrix.key == 'root-check' && 30 || 90 }}");
-		expect(workflow.match(/run: bun scripts\/ci-dev-affected\.ts --validate-plan/g)).toHaveLength(3);
-		expect(workflow).toContain("if: ${{ matrix.nextest }}");
-		expect(workflow).toContain("affected-native.result != 'failure'");
-		expect(workflow).toContain("name: Affected path validation");
-		expect(workflow).toContain("CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}");
-		expect(workflow).toContain("CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}");
-		expect(workflow).toContain("--validate-aggregate");
-		expect(workflow).toContain("CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}");
-		expect(workflow).toContain("CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}");
-		expect(workflow).toContain("max-parallel: 8");
-		expect(workflow).toContain("CI_DEV_MATRIX_IDENTITY: ${{ matrix.identity }}");
-		expect(workflow).toContain("Upload shard completion receipt");
-		expect(workflow).toContain("Validate canonical shard completion");
-		expect(workflow).toContain("--validate-shard-receipts");
-		expect(workflow).toContain("pi_natives.linux-x64-baseline.node");
-		expect(workflow).toContain("pi_natives.linux-x64-modern.node");
-		expect(workflow).not.toContain("native-cache");
+		expect(workflow).toContain("affected-evidence-producer:");
+		expect(workflow).toContain("name: Affected path validation / evidence producer");
+		expect(workflow).toContain("  affected:\n    name: Affected path validation\n    if: ${{ always() }}");
+		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, windows-dev-doctor]");
+		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
+		expect(workflow).toContain("artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}");
+		expect(workflow).toContain("artifact-ids: ${{ needs.affected-evidence-producer.outputs.artifact_id }}");
+		const finalizedDownloadStart = workflow.indexOf("      - name: Download finalized affected evidence");
+		const finalizedDownloadEnd = workflow.indexOf("\n      - ", finalizedDownloadStart + 1);
+		expect(workflow.slice(finalizedDownloadStart, finalizedDownloadEnd)).toContain("merge-multiple: true");
+		const uploadStart = workflow.indexOf("      - name: Upload affected evidence");
+		const uploadEnd = workflow.indexOf("\n\n  affected:", uploadStart);
+		expect(workflow.slice(uploadStart, uploadEnd)).toContain("overwrite: true");
+		expect(workflow).toContain("CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence");
+		expect(workflow).toContain("rm -rf \"$CI_DEV_EVIDENCE_ROOT\"");
+		expect(workflow).toContain("--write-affected-evidence");
+		expect(workflow).toContain("--validate-affected-evidence");
+		expect(workflow).toContain(".ci-dev-affected-evidence.json");
+		expect(workflow).toContain(".ci-dev-affected-evidence.receipt.json");
+		expect(workflow).not.toContain("evidencePath");
 		expect(workflow).not.toContain("pull_request_target");
-		expect(workflow).not.toContain("uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830");
-		expect(workflow.match(/uses: actions\/cache\/restore@0057852bfaa89a56745cba8c7296529d2fc39830/g)).toHaveLength(4);
-		expect(workflow.match(/save-if: \$\{\{ github\.event_name == 'push' && github\.ref == 'refs\/heads\/dev' \}\}/g)).toHaveLength(3);
-		const aggregateWorkflow = workflow.slice(workflow.indexOf("  affected:\n"));
-		expect(aggregateWorkflow).toContain("name: Validate canonical affected plan");
-		expect(aggregateWorkflow).toContain("run: bun scripts/ci-dev-affected.ts --validate-plan");
+		expect(workflow).not.toContain("github.run_attempt");
+		expect(workflow).toContain("artifact_digest");
+		expect(workflow).toContain("remains a required producer audit binding");
+		expect(workflow).not.toContain("continue-on-error");
+		const protectedJob = workflow.slice(workflow.indexOf("  affected:\n"), workflow.indexOf("\n  gjc-state-gates-matrix:"));
+		expect(protectedJob).toContain("if: ${{ always() }}");
+		expect(protectedJob).toContain("name: Validate finalized affected evidence");
+		expect(protectedJob).not.toContain("continue-on-error");
+		const validationStart = protectedJob.indexOf("name: Validate finalized affected evidence");
+		expect(protectedJob.slice(validationStart)).not.toContain("\n        if:");
+		const protectedJobEnv = protectedJob.slice(0, protectedJob.indexOf("    steps:"));
+		expect(protectedJobEnv).not.toContain("runner.temp");
+		const preparationStart = protectedJob.indexOf("name: Fail closed on producer and live dependency results");
+		const preparationEnd = protectedJob.indexOf("\n      - name:", preparationStart + 1);
+		expect(protectedJob.slice(preparationStart, preparationEnd)).toContain("CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence");
+		expect(protectedJob.slice(validationStart)).toContain("CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence");
+	});
+
+	describe("detached evidence subprocess contract", () => {
+		const scriptPath = path.join(import.meta.dir, "ci-dev-affected.ts");
+		const repoRoot = path.join(import.meta.dir, "..");
+		const sourceSha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
+		const baseAggregate = { plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false" };
+		type EvidenceFixture = { root: string; env: Record<string, string>; plan: string; digest: string };
+
+		async function fixture(tasks: unknown[] = []): Promise<EvidenceFixture> {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-evidence-"));
+			const plan = JSON.stringify({ schemaVersion: 1, sourceSha, mode: "pr", paths: [], tasks });
+			const digest = new Bun.CryptoHasher("sha256").update(plan).digest("hex");
+			await fs.writeFile(path.join(root, ".ci-dev-affected-plan.json"), plan);
+			const env: Record<string, string> = {
+				CI_DEV_EVIDENCE_ROOT: root, CI_DEV_AFFECTED_PLAN: path.join(root, ".ci-dev-affected-plan.json"), CI_DEV_PLAN_SOURCE_SHA: sourceSha,
+				CI_DEV_SOURCE_SHA: sourceSha, CI_DEV_PLAN_DIGEST: digest, CI_DEV_PLAN_MODE: "pr", GITHUB_REPOSITORY: "owner/repo", GITHUB_WORKFLOW: "Dev CI", GITHUB_RUN_ID: "42",
+				CI_DEV_PLAN_RESULT: baseAggregate.plan, CI_DEV_NATIVE_RESULT: baseAggregate.native, CI_DEV_SHARDS_RESULT: baseAggregate.shards, CI_DEV_WINDOWS_DOCTOR_RESULT: baseAggregate.windowsDoctor,
+				CI_DEV_WINDOWS_DOCTOR_REQUIRED: baseAggregate.windowsDoctorRequired, CI_DEV_HAS_NATIVE: baseAggregate.hasNative, CI_DEV_HAS_TASKS: baseAggregate.hasTasks,
+			};
+			return { root, env, plan, digest };
+		}
+		async function invoke(env: Record<string, string>, command: string) {
+			const proc = Bun.spawn(["bun", scriptPath, command], {
+				cwd: repoRoot,
+				env: {
+					...process.env,
+					CI_DEV_MATRIX_KEY: undefined,
+					CI_DEV_MATRIX_RUST: undefined,
+					CI_DEV_MATRIX_NEXTEST: undefined,
+					CI_DEV_MATRIX_NATIVE: undefined,
+					CI_DEV_MATRIX_IDENTITY: undefined,
+					CI_DEV_SHARD_INDEX: undefined,
+					AFFECTED_TASK_KEY: undefined,
+					...env,
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return { exitCode: await proc.exited, stdout: await new Response(proc.stdout).text(), stderr: await new Response(proc.stderr).text() };
+		}
+		async function withFixture(body: (value: EvidenceFixture) => Promise<void>, tasks: unknown[] = []) {
+			const value = await fixture(tasks); try { await body(value); } finally { await fs.rm(value.root, { recursive: true, force: true }); }
+		}
+
+		test("produces deterministic no-shard evidence and validates it", async () => {
+			await withFixture(async ({ root, env, digest }) => {
+				const first = await invoke(env, "--write-affected-evidence");
+				expect(first.exitCode).toBe(0); expect(first.stdout).toContain("affected evidence produced: 1 child evidence file(s)");
+				const manifest = await fs.readFile(path.join(root, ".ci-dev-affected-evidence.json"), "utf8");
+				const receipt = await fs.readFile(path.join(root, ".ci-dev-affected-evidence.receipt.json"), "utf8");
+				const expectedManifest = `${JSON.stringify({ schemaVersion: 1, subject: "ci-dev-affected-evidence", sourceSha, planDigest: digest, planMode: "pr", replayScope: { repository: "owner/repo", workflow: "Dev CI", runId: "42" }, aggregateResults: baseAggregate, taskIdentities: [], childEvidence: [{ name: ".ci-dev-affected-plan.json", sha256: digest }] })}\n`;
+				expect(manifest).toBe(expectedManifest);
+				const expectedReceipt = `${JSON.stringify({ schemaVersion: 1, subject: "ci-dev-affected-evidence", manifestSha256: new Bun.CryptoHasher("sha256").update(expectedManifest).digest("hex"), sourceSha, planDigest: digest, replayScope: { repository: "owner/repo", workflow: "Dev CI", runId: "42" } })}\n`;
+				expect(receipt).toBe(expectedReceipt);
+				const validated = await invoke(env, "--validate-affected-evidence");
+				expect(validated.exitCode).toBe(0); expect(validated.stdout).toContain("affected evidence validated: 1 child evidence file(s)");
+				await fs.rm(path.join(root, ".ci-dev-affected-evidence.json")); await fs.rm(path.join(root, ".ci-dev-affected-evidence.receipt.json"));
+				expect((await invoke(env, "--write-affected-evidence")).exitCode).toBe(0);
+				expect(await fs.readFile(path.join(root, ".ci-dev-affected-evidence.json"), "utf8")).toBe(manifest);
+				expect(await fs.readFile(path.join(root, ".ci-dev-affected-evidence.receipt.json"), "utf8")).toBe(receipt);
+			});
+		});
+
+		test("produces and consumes a complete multi-shard bundle", async () => {
+			const task = { key: "fixture-task", identity: "fixture:task", description: "fixture", command: ["true"], cwd: ".", capabilities: { rust: false, nextest: false, nativeConsumer: false, nativeProducer: false }, phase: "legacy" };
+			await withFixture(async ({ root, env, digest }) => {
+				const multiAggregate = { ...baseAggregate, hasTasks: "true", shards: "success" };
+				const multiEnv = { ...env, CI_DEV_HAS_TASKS: multiAggregate.hasTasks, CI_DEV_SHARDS_RESULT: multiAggregate.shards };
+				await fs.mkdir(path.join(root, ".ci-dev-shard-receipts"));
+				const shardRaw = JSON.stringify({ key: task.key, identity: task.identity });
+				await fs.writeFile(path.join(root, ".ci-dev-shard-receipts", "0.json"), shardRaw);
+				expect((await invoke(multiEnv, "--write-affected-evidence")).stdout).toContain("affected evidence produced: 2 child evidence file(s)");
+				const manifest = await fs.readFile(path.join(root, ".ci-dev-affected-evidence.json"), "utf8");
+				const receipt = await fs.readFile(path.join(root, ".ci-dev-affected-evidence.receipt.json"), "utf8");
+				const expectedManifest = `${JSON.stringify({ schemaVersion: 1, subject: "ci-dev-affected-evidence", sourceSha, planDigest: digest, planMode: "pr", replayScope: { repository: "owner/repo", workflow: "Dev CI", runId: "42" }, aggregateResults: multiAggregate, taskIdentities: [{ key: task.key, identity: task.identity }], childEvidence: [{ name: ".ci-dev-affected-plan.json", sha256: digest }, { name: ".ci-dev-shard-receipts/0.json", sha256: new Bun.CryptoHasher("sha256").update(shardRaw).digest("hex") }] })}\n`;
+				expect(manifest).toBe(expectedManifest);
+				const expectedReceipt = `${JSON.stringify({ schemaVersion: 1, subject: "ci-dev-affected-evidence", manifestSha256: new Bun.CryptoHasher("sha256").update(expectedManifest).digest("hex"), sourceSha, planDigest: digest, replayScope: { repository: "owner/repo", workflow: "Dev CI", runId: "42" } })}\n`;
+				expect(receipt).toBe(expectedReceipt);
+				const consumed = await invoke(multiEnv, "--validate-affected-evidence");
+				expect(consumed.exitCode).toBe(0); expect(consumed.stdout).toContain("affected evidence validated: 2 child evidence file(s)");
+				await fs.writeFile(path.join(root, ".ci-dev-shard-receipts", "1.json"), "{}");
+				expect((await invoke(multiEnv, "--validate-affected-evidence")).exitCode).toBe(1);
+			}, [task]);
+		});
+
+		test("fails closed for canonical, replay, child, layout, and pair failures", async () => {
+			await withFixture(async ({ root, env }) => {
+				expect((await invoke(env, "--write-affected-evidence")).exitCode).toBe(0);
+				const manifest = path.join(root, ".ci-dev-affected-evidence.json"); const receipt = path.join(root, ".ci-dev-affected-evidence.receipt.json");
+				for (const mutate of [
+					async () => fs.writeFile(manifest, `${await fs.readFile(manifest, "utf8")}\n`),
+					async () => fs.writeFile(receipt, "{}\n"),
+					async () => fs.mkdir(path.join(root, ".ci-dev-shard-receipts")),
+					async () => fs.writeFile(manifest, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(await fs.readFile(manifest))])),
+					async () => fs.writeFile(receipt, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(await fs.readFile(receipt))])),
+				]) {
+					const originalManifest = await fs.readFile(manifest, "utf8"); const originalReceipt = await fs.readFile(receipt, "utf8"); await mutate();
+					expect((await invoke(env, "--validate-affected-evidence")).exitCode).toBe(1);
+					await fs.rm(path.join(root, ".ci-dev-shard-receipts"), { recursive: true, force: true }); await fs.writeFile(manifest, originalManifest); await fs.writeFile(receipt, originalReceipt);
+				}
+				await fs.writeFile(path.join(root, ".ci-dev-affected-plan.json"), "{}");
+				expect((await invoke(env, "--validate-affected-evidence")).exitCode).toBe(1);
+			}, []);
+		});
+
+		test("rejects pre-existing targets and removes its owned manifest after injected receipt failure", async () => {
+			await withFixture(async ({ root, env }) => {
+				await fs.writeFile(path.join(root, ".ci-dev-affected-evidence.json"), "occupied");
+				expect((await invoke(env, "--write-affected-evidence")).exitCode).toBe(1);
+				await fs.rm(path.join(root, ".ci-dev-affected-evidence.json"));
+				expect((await invoke({ ...env, CI_DEV_INJECT_EVIDENCE_POST_MANIFEST_FAILURE: "true" }, "--write-affected-evidence")).exitCode).toBe(1);
+				expect(await Bun.file(path.join(root, ".ci-dev-affected-evidence.json")).exists()).toBe(false);
+				expect(await Bun.file(path.join(root, ".ci-dev-affected-evidence.receipt.json")).exists()).toBe(false);
+			});
+		});
+
+		test("rejects replay, source, aggregate, task, child, and filesystem substitutions", async () => {
+			await withFixture(async ({ root, env }) => {
+				expect((await invoke(env, "--write-affected-evidence")).exitCode).toBe(0);
+				const manifestPath = path.join(root, ".ci-dev-affected-evidence.json"); const receiptPath = path.join(root, ".ci-dev-affected-evidence.receipt.json");
+				const originalManifest = await fs.readFile(manifestPath, "utf8"); const originalReceipt = await fs.readFile(receiptPath, "utf8");
+				async function resign(mutator: (manifest: Record<string, unknown>) => void) {
+					const manifest = JSON.parse(originalManifest) as Record<string, unknown>; mutator(manifest);
+					const raw = `${JSON.stringify(manifest)}\n`; const digest = new Bun.CryptoHasher("sha256").update(raw).digest("hex");
+					const receipt = JSON.parse(originalReceipt) as Record<string, unknown>; receipt.manifestSha256 = digest;
+					await fs.writeFile(manifestPath, raw); await fs.writeFile(receiptPath, `${JSON.stringify(receipt)}\n`);
+					expect((await invoke(env, "--validate-affected-evidence")).exitCode).toBe(1);
+					await fs.writeFile(manifestPath, originalManifest); await fs.writeFile(receiptPath, originalReceipt);
+				}
+				await resign(manifest => { (manifest.replayScope as Record<string, string>).runId = "stale"; });
+				await resign(manifest => { manifest.sourceSha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"; });
+				await resign(manifest => { (manifest.aggregateResults as Record<string, string>).plan = "failure"; });
+				await resign(manifest => { manifest.taskIdentities = [{ key: "extra", identity: "extra" }]; });
+				await resign(manifest => { (manifest.childEvidence as Array<Record<string, string>>)[0]!.sha256 = "a".repeat(64); });
+				await fs.rm(manifestPath); await fs.symlink(receiptPath, manifestPath);
+				expect((await invoke(env, "--validate-affected-evidence")).exitCode).toBe(1);
+				await fs.rm(manifestPath); await fs.mkdir(manifestPath);
+				expect((await invoke(env, "--validate-affected-evidence")).exitCode).toBe(1);
+			});
+		});
+
+		test("requires an explicit existing evidence root and rejects plan mode and capability drift", async () => {
+			const absent = path.join(os.tmpdir(), `ci-dev-evidence-absent-${Date.now()}`);
+			expect((await invoke({ CI_DEV_EVIDENCE_ROOT: absent }, "--validate-affected-evidence")).exitCode).toBe(1);
+			await withFixture(async ({ root, env }) => {
+				expect((await invoke({ ...env, CI_DEV_PLAN_MODE: "push" }, "--write-affected-evidence")).exitCode).toBe(1);
+			}, []);
+			const nativeTask = { key: "native-only", identity: "native-only", description: "native", command: ["true"], cwd: ".", capabilities: { rust: false, nextest: false, nativeConsumer: false, nativeProducer: true }, phase: "native-producer" };
+			await withFixture(async ({ root, env }) => {
+				expect((await invoke(env, "--write-affected-evidence")).exitCode).toBe(1);
+				expect((await invoke({ ...env, CI_DEV_HAS_NATIVE: "true", CI_DEV_NATIVE_RESULT: "success" }, "--write-affected-evidence")).exitCode).toBe(0);
+			}, [nativeTask]);
+			const regularTask = { key: "regular", identity: "regular", description: "regular", command: ["true"], cwd: ".", capabilities: { rust: false, nextest: false, nativeConsumer: false, nativeProducer: false }, phase: "legacy" };
+			await withFixture(async ({ root, env }) => {
+				expect((await invoke({ ...env, CI_DEV_HAS_TASKS: "false", CI_DEV_SHARDS_RESULT: "skipped" }, "--write-affected-evidence")).exitCode).toBe(1);
+			}, [regularTask]);
+		});
+
+		test("rejects unknown nested schemas, pair swaps, and receipt-side disagreement", async () => {
+			await withFixture(async ({ root, env }) => {
+				expect((await invoke(env, "--write-affected-evidence")).exitCode).toBe(0);
+				const manifestPath = path.join(root, ".ci-dev-affected-evidence.json"); const receiptPath = path.join(root, ".ci-dev-affected-evidence.receipt.json");
+				const manifest = await fs.readFile(manifestPath, "utf8"); const receipt = await fs.readFile(receiptPath, "utf8");
+				for (const mutate of [
+					async () => fs.writeFile(manifestPath, `${JSON.stringify({ ...JSON.parse(manifest), unknown: true })}\n`),
+					async () => {
+						const decoded = JSON.parse(manifest) as Record<string, unknown>;
+						decoded.replayScope = { ...(decoded.replayScope as Record<string, unknown>), unknown: true };
+						await fs.writeFile(manifestPath, `${JSON.stringify(decoded)}\n`);
+					},
+					async () => {
+						const decoded = JSON.parse(manifest) as Record<string, unknown>;
+						decoded.aggregateResults = { ...(decoded.aggregateResults as Record<string, unknown>), unknown: true };
+						await fs.writeFile(manifestPath, `${JSON.stringify(decoded)}\n`);
+					},
+					async () => fs.writeFile(receiptPath, `${JSON.stringify({ ...JSON.parse(receipt), sourceSha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd" })}\n`),
+					async () => { await fs.writeFile(manifestPath, receipt); await fs.writeFile(receiptPath, manifest); },
+				]) {
+					await mutate(); expect((await invoke(env, "--validate-affected-evidence")).exitCode).toBe(1);
+					await fs.writeFile(manifestPath, manifest); await fs.writeFile(receiptPath, receipt);
+				}
+			});
+		});
+
+		test("rejects malformed UTF-8 evidence bytes", async () => {
+			await withFixture(async ({ root, env }) => {
+				expect((await invoke(env, "--write-affected-evidence")).exitCode).toBe(0);
+				await fs.writeFile(path.join(root, ".ci-dev-affected-evidence.json"), Uint8Array.from([0xff]));
+				expect((await invoke(env, "--validate-affected-evidence")).exitCode).toBe(1);
+			});
+		});
 	});
 
 	test("aggregate result truth table rejects every missing, failed, cancelled, and unplanned dependency", () => {
@@ -100,6 +306,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 			{ ...valid[0]!, native: "cancelled" },
 			{ ...valid[0]!, shards: "failure" },
 			{ ...valid[0]!, shards: "cancelled" },
+			{ ...valid[0]!, shards: "skipped" },
 			{ ...valid[0]!, windowsDoctor: "failure" },
 			{ ...valid[0]!, windowsDoctor: "cancelled" },
 			{ ...valid[0]!, windowsDoctor: "skipped" },
@@ -218,13 +425,13 @@ describe("describeTasks matrix emission", () => {
 		}
 	});
 
-	test("full-workspace root-check uses the bounded CI command without native artifacts", () => {
+	test("full-workspace root-check downloads the native artifact used by generated checks", () => {
 		const entries = describeTasks(planTasks(["tsconfig.json"], packages));
 		const nativeBuild = entries.find(entry => entry.key === "native-linux-x64");
 		const rootCheck = entries.find(entry => entry.key === "root-check");
 
 		expect(nativeBuild?.nativeBuild).toBe(true);
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("rust tasks are flagged rust and need no native addon", () => {
@@ -389,7 +596,6 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(output).toContain("plan_digest=");
 		expect(await Bun.file(path.join(repoRoot, ".ci-dev-affected-plan.json")).exists()).toBe(true);
 	});
-
 	test("Cargo selection includes transitive dependents and never emits vendored shards", async () => {
 		const sdk = await runScript(["--matrix-json"], "crates/gjc-sdk/src/lib.rs");
 		expect(sdk.exitCode).toBe(0);
@@ -509,6 +715,53 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		});
 		expect(receiptMissing.exitCode).toBe(1);
 		expect(receiptMissing.stderr).toContain("shard receipt set does not match canonical plan");
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity }));
+		await Bun.write(path.join(receiptDir, "stale-extra.json"), JSON.stringify({ key: "stale", identity: "stale" }));
+		const receiptExtra = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptExtra.exitCode).toBe(1);
+		expect(receiptExtra.stderr).toContain("shard receipt set does not match canonical plan");
+		await fs.rm(path.join(receiptDir, "stale-extra.json"));
+		await Bun.write(path.join(receiptDir, "duplicate.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity }));
+		const receiptDuplicate = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptDuplicate.exitCode).toBe(1);
+		expect(receiptDuplicate.stderr).toContain("shard receipt set does not match canonical plan");
+		await fs.rm(path.join(receiptDir, "duplicate.json"));
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: "wrong" }));
+		const receiptWrongIdentity = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptWrongIdentity.exitCode).toBe(1);
+		expect(receiptWrongIdentity.stderr).toContain("shard receipt set does not match canonical plan");
+		await Bun.write(path.join(receiptDir, "0.json"), "{");
+		const receiptMalformedJson = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptMalformedJson.exitCode).toBe(1);
+		await Bun.write(path.join(receiptDir, "0.json"), JSON.stringify({ key: expectedShards[0]!.key, identity: expectedShards[0]!.identity, extra: true }));
+		const receiptMalformedObject = await runScript(["--validate-shard-receipts"], "packages/stats/src/index.ts", {
+			CI_DEV_AFFECTED_PLAN: planFile,
+			CI_DEV_PLAN_DIGEST: digest as string,
+			CI_DEV_PLAN_SOURCE_SHA: head,
+			CI_DEV_SHARD_RECEIPTS: receiptDir,
+		});
+		expect(receiptMalformedObject.exitCode).toBe(1);
+		expect(receiptMalformedObject.stderr).toContain("malformed shard receipt");
 		const wrongSource = await runScript(["--validate-plan"], "packages/stats/src/index.ts", {
 			CI_DEV_AFFECTED_PLAN: planFile,
 			CI_DEV_PLAN_DIGEST: digest as string,
@@ -625,6 +878,10 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
 		expect(keys).not.toContain("test:packages/coding-agent/test/sdk/index.test.ts");
 		expect(keys).not.toContain("test:packages/coding-agent/test/other/index.test.ts");
+		expect(describeTasks(tasks).find(entry => entry.key === "check:@gajae-code/coding-agent")).toMatchObject({
+			native: true,
+			nativeBuild: false,
+		});
 	});
 
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
@@ -746,14 +1003,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain("wrapper-version");
 	});
 
-	test("root-level codeish fallback uses the bounded CI command without native artifacts", () => {
+	test("root-level codeish fallback plans the native artifact required by the bounded check", () => {
 		const tasks = targeted(["scripts/unmapped-tool.ts"]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
-		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
+		expect(keys).toContain("native-linux-x64");
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("docs/changelog-only changes plan nothing expensive", () => {
@@ -819,14 +1076,14 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
 	});
 
-	test("tooling-script root-check uses the bounded CI command without native artifacts", () => {
+	test("tooling-script root-check marks the bounded check as a native consumer", () => {
 		const tasks = planTasks(["scripts/unmapped-tool.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("root-check");
 		expect(keys.filter(key => key === "native-linux-x64" || key === "native-build")).toEqual([]);
 
 		const rootCheck = describeTasks(tasks).find(entry => entry.key === "root-check");
-		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: false, nativeBuild: false });
+		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
 	test("push mode selects the bridge-client SDK package smoke exactly once for package and SDK client changes", () => {

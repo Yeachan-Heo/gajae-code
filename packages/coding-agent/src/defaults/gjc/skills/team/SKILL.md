@@ -203,6 +203,22 @@ sleep 30 && gjc team monitor <team-name>
 ```
 The mutating monitor path also performs bounded liveness recovery: expired task claims, stale heartbeat claims, and missing recorded worker panes are requeued instead of leaving work permanently `in_progress`.
 
+### Opt-in stalled-worker continuation
+
+`GJC_TEAM_AUTO_CONTINUE_STALLED_WORKERS=1` enables a separate, default-off monitor-only nudge for a stalled live worker. It is considered only when the team is running (not dry-run), the worker heartbeat is stale (using `GJC_TEAM_HEARTBEAT_STALE_MS`, default `120000` ms), and all of these checks pass:
+
+- The recorded pane id is a non-leader `%<number>` pane that tmux currently reports in the recorded `tmux_target` as that same pane id; no other pane is targeted.
+- Shutdown authority is proven absent; valid-present and invalid/unreadable records veto continuation without suppressing normal stale-claim recovery.
+- Lifecycle is `ready` or `working`, and worker status is a structurally valid non-terminal state (not `draining`, `failed`, or `unknown`).
+- One current non-terminal task is `in_progress`, assigned to and claimed by that worker; the stored claim record exactly matches its owner, token, and lease.
+- The lease remains valid through the entire next hold interval.
+
+The policy has at most two attempts per immutable incident: attempt 1 reserves a 30-second hold, then attempt 2 reserves a 120-second hold only after attempt 1 was recorded as sent and its hold elapsed. A retry still requires the heartbeat to be stale and every fence above to pass. Reservations and outcomes are create-without-clobber journal records keyed to the incident identity; a pre-existing reservation, an unknown/missing/non-sent outcome after restart, or a second-attempt record fails closed rather than sending again.
+
+Each eligible attempt sends only the fixed continuation prompt to that verified recorded worker pane, followed by Enter. It does not replay provider output or a prior prompt, inspect or inject dynamic pane content, cross pane boundaries, kill or relaunch workers, create/split panes, or extend/rewrite claims. This bounded nudge is not automatic recovery for a dead, shutdown, reassigned, terminal, or lease-expired worker. When it cannot act, use `gjc team status <team-name>` / `gjc team monitor <team-name>` and the documented state evidence; manual pane intervention remains the last-resort fallback.
+
+Continuation input is unsupported on psmux and native Windows send-keys fallback transports: the fixed prompt is not dispatched there because equivalent literal-input semantics are not proven. Startup's existing empty-pane worker command fallback is separate and unchanged.
+
 ## Operational Commands
 
 ```bash

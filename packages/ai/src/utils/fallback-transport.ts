@@ -156,7 +156,8 @@ export function transportFailureFacts(
 		finiteStatus(propertyOf(response, "status")) ??
 		finiteStatus(propertyOf(capturedResponse, "status"));
 	const anthropicErrorType = stringValue(propertyOf(nestedError, "type")) ?? stringValue(propertyOf(value, "type"));
-	const openaiErrorCode = stringValue(propertyOf(nestedError, "code"));
+	const openaiErrorCode =
+		stringValue(propertyOf(value, "openaiErrorCode")) ?? stringValue(propertyOf(nestedError, "code"));
 	const providerCode =
 		stringValue(propertyOf(value, "providerCode")) ??
 		openaiErrorCode ??
@@ -183,7 +184,8 @@ export function transportFailureFacts(
 		headers === undefined &&
 		!isQuotaCode(normalizedCode) &&
 		!isAuthCode(normalizedCode) &&
-		!isRateLimitCode(normalizedCode)
+		!isRateLimitCode(normalizedCode) &&
+		!isContextOverflowCode(normalizedCode)
 	) {
 		return undefined;
 	}
@@ -209,6 +211,9 @@ function parseRetryAfterMilliseconds(value: string | null): number | undefined {
 	return Number.isFinite(milliseconds) && milliseconds >= 0 ? Math.round(milliseconds) : undefined;
 }
 
+function isContextOverflowCode(code: string | undefined): boolean {
+	return code === "context_length_exceeded";
+}
 function isQuotaCode(code: string | undefined): boolean {
 	return (
 		code === "insufficient_quota" ||

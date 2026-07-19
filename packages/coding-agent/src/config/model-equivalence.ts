@@ -104,6 +104,72 @@ export function formatCanonicalVariantSelector(model: Model<Api>): string {
 	return `${model.provider}/${model.id}`;
 }
 
+/**
+ * Compare equivalent provider variants using the caller's ranking policy.
+ *
+ * The ordered criteria intentionally mirror the historical canonical resolver:
+ * vision support, configured provider rank, canonical exactness, canonical
+ * source, input plus cache-read cost, and original catalog order. Callers that
+ * do not have a canonical index can omit those axes while retaining a stable,
+ * total comparison.
+ */
+export function compareEquivalentModelVariants(
+	left: Model<Api>,
+	right: Model<Api>,
+	options: {
+		providerRank?: ReadonlyMap<string, number>;
+		canonicalId?: string;
+		leftSourceRank?: number;
+		rightSourceRank?: number;
+		modelOrder?: ReadonlyMap<string, number>;
+		includeCost?: boolean;
+		finalize?: boolean;
+	} = {},
+): number {
+	const leftVisionRank = Number(!left.input.includes("image"));
+	const rightVisionRank = Number(!right.input.includes("image"));
+	if (leftVisionRank !== rightVisionRank) return leftVisionRank - rightVisionRank;
+
+	if (options.providerRank) {
+		const leftProviderRank = options.providerRank.get(left.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
+		const rightProviderRank = options.providerRank.get(right.provider.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
+		if (leftProviderRank !== rightProviderRank) return leftProviderRank - rightProviderRank;
+	}
+
+	if (options.canonicalId) {
+		const leftExactRank = Number(left.id !== options.canonicalId);
+		const rightExactRank = Number(right.id !== options.canonicalId);
+		if (leftExactRank !== rightExactRank) return leftExactRank - rightExactRank;
+	}
+
+	if (options.leftSourceRank !== undefined || options.rightSourceRank !== undefined) {
+		const leftSourceRank = options.leftSourceRank ?? Number.MAX_SAFE_INTEGER;
+		const rightSourceRank = options.rightSourceRank ?? Number.MAX_SAFE_INTEGER;
+		if (leftSourceRank !== rightSourceRank) return leftSourceRank - rightSourceRank;
+	}
+
+	if (options.includeCost) {
+		const leftCost = left.cost.input + left.cost.cacheRead;
+		const rightCost = right.cost.input + right.cost.cacheRead;
+		if (leftCost !== rightCost) return leftCost - rightCost;
+	}
+
+	if (options.modelOrder) {
+		const leftOrder = options.modelOrder.get(formatCanonicalVariantSelector(left)) ?? Number.MAX_SAFE_INTEGER;
+		const rightOrder = options.modelOrder.get(formatCanonicalVariantSelector(right)) ?? Number.MAX_SAFE_INTEGER;
+		if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+	}
+
+	return options.finalize === false
+		? 0
+		: formatCanonicalVariantSelector(left).localeCompare(formatCanonicalVariantSelector(right));
+}
+
+/** @deprecated Use compareEquivalentModelVariants for total variant ranking. */
+export function compareModelVariantRank(left: Model<Api>, right: Model<Api>): number {
+	return compareEquivalentModelVariants(left, right);
+}
+
 function buildOverrideMap(overrides: Record<string, string> | undefined): Map<string, string> {
 	const result = new Map<string, string>();
 	if (!overrides) {

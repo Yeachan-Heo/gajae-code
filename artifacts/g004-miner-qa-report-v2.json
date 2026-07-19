@@ -1,0 +1,87 @@
+{
+  "cases": [
+    {
+      "id": "fixture-command-json",
+      "scenario": "Patched only a temporary miner copy to read a mktemp session root and ran --since 2026-06-01 --json.",
+      "expected": "Exit 0 with parseable JSON and no NaN.",
+      "actual": "exitCode=0; JSON parsed; integrity={'filesScanned': 1, 'filesFailed': 0, 'linesParsed': 18, 'linesRejected': 1, 'eventsInvalidTimestamp': 0}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "event-week-and-per-event-since",
+      "scenario": "Session filename implies 2026-05-20; assistant is 2026-06-02 and compaction is 2026-06-03.",
+      "expected": "Both events survive --since and bucket to week 2026-06-01.",
+      "actual": "week={'week': '2026-06-01', 'distinctSessions': 1, 'assistantTurns': 1, 'compactions': 1, 'compactionsPer100Turns': 100, 'reactive': 0, 'proactive': 1, 'triggerFullness': {'expected': 1, 'premature': 0, 'between': 0, 'unknownUsage': 0, 'unknownWindow': 0}, 'tokensBeforeMedian': 300000, 'rawWindowPercentMedian': 75}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "reactive-exceeds-available-context-size",
+      "scenario": "Error predecessor says 'exceeds the available context size'.",
+      "expected": "Reactive with 400000 window and no unknown model.",
+      "actual": "classification=reactive; contextWindow=400000; unknownModels={'acme/unknown-99': 1}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "non-overflow-error-code-invalid-prompt",
+      "scenario": "Error predecessor says 'Error Code invalid_prompt: Request blocked.'.",
+      "expected": "Proactive; invalid_prompt alone is not an overflow signal.",
+      "actual": "classification=proactive; snippets=['Error Code invalid_prompt: Request blocked.'].",
+      "verdict": "pass"
+    },
+    {
+      "id": "reactive-input-exceeds-context-window",
+      "scenario": "Aborted predecessor says '400 Your input exceeds the context window of this model'.",
+      "expected": "Reactive.",
+      "actual": "classification=reactive; snippets=['400 Your input exceeds the context window of this model'].",
+      "verdict": "pass"
+    },
+    {
+      "id": "complete-model-window-map",
+      "scenario": "Compactions use layofflabs/MiniMax-M3 and localproxy/qwen3.6-35b-a3b-uncensored.",
+      "expected": "Windows resolve to 400000 and 262144, neither appears in unknownModels.",
+      "actual": "MiniMax=400000; localproxy=262144; unknownModels={'acme/unknown-99': 1}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "threshold-regimes-across-2026-06-23",
+      "scenario": "400k model compacts at 300000 tokens on 2026-06-20 and 2026-06-25.",
+      "expected": "Pre-cutover threshold is 272000 expected; post-cutover threshold is 340000 premature.",
+      "actual": "pre={threshold:272000,classification:expected}; post={threshold:340000,classification:premature}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "zero-tokens-unknown-usage",
+      "scenario": "Mapped 400k model compacts with tokensBefore=0.",
+      "expected": "unknown-usage and rawWindowPercent null.",
+      "actual": "trigger=unknown-usage; rawWindowPercent=None.",
+      "verdict": "pass"
+    },
+    {
+      "id": "malformed-json-integrity",
+      "scenario": "Fixture begins with malformed JSONL.",
+      "expected": "linesRejected=1 and process does not crash.",
+      "actual": "integrity={'filesScanned': 1, 'filesFailed': 0, 'linesParsed': 18, 'linesRejected': 1, 'eventsInvalidTimestamp': 0}.",
+      "verdict": "pass"
+    },
+    {
+      "id": "truly-unknown-model",
+      "scenario": "Compaction follows model_change acme/unknown-99.",
+      "expected": "unknownModels records it and evidence is unknown-window.",
+      "actual": "unknownModels={'acme/unknown-99': 1}; trigger=unknown-window.",
+      "verdict": "pass"
+    },
+    {
+      "id": "real-store-happy-path-weekly-invariant",
+      "scenario": "Run the frozen miner against the real store with --since 2026-06-01 --json.",
+      "expected": "Exit 0, valid JSON, and weekly reactive + proactive equals compactions for every week.",
+      "actual": "exitCode=0; integrity={'filesScanned': 8298, 'filesFailed': 0, 'linesParsed': 894792, 'linesRejected': 0, 'eventsInvalidTimestamp': 0}; weeklyAggregates=7; compactionEvidence=222; weeklyInvariant=True.",
+      "verdict": "pass"
+    }
+  ],
+  "overall": "pass",
+  "commands": [
+    "python3 QA harness: mktemp -d; copied scripts/mine-compaction-history.ts; patched SESSIONS_ROOT only in the temporary copy; wrote a temporary fixture JSONL; ran bun <temporary>/mine.ts --since 2026-06-01 --json; asserted all fixture cases.",
+    "bun scripts/mine-compaction-history.ts --since 2026-06-01 --json (real store; parsed JSON; asserted reactive + proactive == compactions for every weekly aggregate).",
+    "Frozen scripts/mine-compaction-history.ts and artifacts/compaction-mining-v2.json were not edited. No formatters or project gates were run."
+  ]
+}

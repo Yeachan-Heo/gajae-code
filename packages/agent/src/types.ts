@@ -13,6 +13,7 @@ import type {
 	Tool,
 	ToolChoice,
 	ToolResultMessage,
+	TransportFailureFacts,
 	TSchema,
 } from "@gajae-code/ai";
 import type { AppendOnlyContextManager } from "./append-only-context";
@@ -58,6 +59,7 @@ export type ManagedAttemptContinuation = (ownership: ManagedAttemptContinuationO
 /** Decision returned by managed fallback policy for one provisional attempt. */
 export type ManagedAttemptDecision =
 	| { type: "retry"; continuation: ManagedAttemptContinuation }
+	| { type: "maintenance"; continuation: ManagedAttemptContinuation }
 	| { type: "terminal"; terminal: RunTerminalRequest };
 
 /** Structured result for one managed upstream invocation. */
@@ -67,9 +69,10 @@ export type ManagedAttemptOutcome =
 			failure: {
 				message: AssistantMessage;
 				/** Exact provider transport facts, including retry headers, for fallback policy. */
-				transportFailure?: import("@gajae-code/ai").TransportFailureFacts;
+				transportFailure?: TransportFailureFacts;
 			};
 	  }
+	| { type: "context_overflow_discarded"; message: AssistantMessage }
 	| { type: "run_terminal"; reason: "cancelled" | "error" | "exhausted" };
 
 export type ManagedAttemptOutcomeHandler = (

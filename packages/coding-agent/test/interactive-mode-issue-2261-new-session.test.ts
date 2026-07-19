@@ -7,9 +7,11 @@ import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import type { ExtensionCommandContextActions } from "../src/extensibility/extensions";
+import { planSnapshotHash } from "../src/modes/components/plan-preview-overlay";
 import { BtwController } from "../src/modes/controllers/btw-controller";
 import { CommandController } from "../src/modes/controllers/command-controller";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
+import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AgentSession } from "../src/session/agent-session";
@@ -60,11 +62,21 @@ describe("Issue #2261 InteractiveMode session-switch preparation", () => {
 			getSessionId: () => session.sessionManager.getSessionId(),
 		});
 		await Bun.write(resolvedPath, "# Plan\n\nKeep this review open.");
-		mode.planModeEnabled = true;
-		mode.planModePlanFilePath = planFilePath;
-		vi.spyOn(mode, "showHookSelector").mockResolvedValue("Refine plan");
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
+		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
+			action: "Refine plan",
+			comments: [],
+			notes: "",
+			snapshotHash: planSnapshotHash("# Plan\n\nKeep this review open."),
+		});
 		vi.spyOn(session, "abort").mockResolvedValue(undefined);
-		await mode.handlePlanApproval({ planFilePath, planExists: true, title: "PLAN", finalPlanFilePath: planFilePath });
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath: planFilePath,
+		});
 	}
 
 	for (const [command, method] of [

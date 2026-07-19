@@ -18,6 +18,7 @@ import {
 	formatModelSelectorValue,
 	parseModelPattern,
 	parseModelString,
+	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { resolveMemoryBackend } from "../memory-backend";
@@ -253,12 +254,9 @@ function parseModelCommandArgs(args: string): ParsedModelCommandArgs {
 
 function splitExplicitThinkingSelector(selector: string): { baseSelector: string; thinkingLevel?: ThinkingLevel } {
 	const trimmed = selector.trim();
-	const colonIndex = trimmed.lastIndexOf(":");
-	if (colonIndex === -1) {
-		return { baseSelector: trimmed };
-	}
-	const thinkingLevel = parseThinkingLevel(trimmed.slice(colonIndex + 1));
-	return thinkingLevel ? { baseSelector: trimmed.slice(0, colonIndex), thinkingLevel } : { baseSelector: trimmed };
+	const { selector: baseSelector, thinkingLevel } = splitSelectorThinkingSuffix(trimmed);
+	// Preserve the whole selector when the trailing suffix is not a valid thinking level.
+	return thinkingLevel ? { baseSelector, thinkingLevel } : { baseSelector: trimmed };
 }
 
 interface ModelCommandSelection {
@@ -635,7 +633,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			// — including the first-time `/goal set <objective>` case where goal
 			// mode was not yet active. A previous `wasGoalModeEnabled` guard dropped
 			// that first-time case from history (up/down-arrow recall).
-			await runtime.ctx.handleGoalModeCommand(command.args || undefined);
+			await runtime.ctx.goalModeController.handleCommand(command.args || undefined);
 			if (command.args) {
 				runtime.ctx.editor.addToHistory(command.text);
 			}
@@ -1059,6 +1057,20 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "transcript",
+		description: "Browse the current session transcript",
+		acpDescription: "Browse the current session transcript",
+		handle: async (_command, runtime) => {
+			await runtime.output("Transcript browsing is available in the interactive TUI.");
+			return commandConsumed();
+		},
+		handleTui: (_command, runtime) => {
+			if (runtime.ctx.isTranscriptViewerOpen()) return;
+			runtime.ctx.showTranscriptViewer();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "context",
 		description: "Show active context token usage breakdown",
 		acpDescription: "Show active context token usage breakdown",
@@ -1453,6 +1465,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		description: "Resume a previous session",
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showSessionSelector();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "sessions",
+		priority: 91,
+		description: "Show all persisted sessions (read-only)",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.showSessionsDashboard();
 			runtime.ctx.editor.setText("");
 		},
 	},

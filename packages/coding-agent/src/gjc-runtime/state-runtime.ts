@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
@@ -27,7 +28,13 @@ import {
 } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
-import { mergeDeepInterviewEnvelope, normalizeDeepInterviewEnvelope } from "./deep-interview-state";
+import {
+	assertDeepInterviewIntentManifest,
+	assertDeepInterviewIntentReview,
+	type DeepInterviewIntentManifest,
+	mergeDeepInterviewEnvelope,
+	normalizeDeepInterviewEnvelope,
+} from "./deep-interview-state";
 import { activeSnapshotPath, auditPath, modeStatePath, sessionStateDir } from "./session-layout";
 import {
 	resolveGjcSessionForRead,
@@ -61,8 +68,10 @@ import {
 	softDelete,
 	updateWorkflowTransactionJournal,
 	type WorkflowEnvelopeIntegrityMismatch,
+	withWorkflowStateLock,
 	writeGuardedWorkflowEnvelopeAtomic,
 } from "./state-writer";
+import { assertSafePathComponent, CommandError, flagValue, hasFlag, isPlainObject } from "./workflow-cli-common";
 import { getSkillManifest, isKnownWorkflowState, isValidTransition, typedArgsFor } from "./workflow-manifest";
 
 /**
@@ -80,28 +89,13 @@ export interface StateCommandResult {
 }
 
 const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
-const TERMINAL_CLEAR_PHASES = new Set(["complete", "completed", "cancelled", "canceled", "failed"]);
-const PATH_COMPONENT_RE = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 const KNOWN_MODES: readonly string[] = CANONICAL_GJC_WORKFLOW_SKILLS;
 
-class StateCommandError extends Error {
-	constructor(
-		public readonly exitStatus: number,
-		message: string,
-	) {
-		super(message);
+class StateCommandError extends CommandError {
+	constructor(exitStatus: number, message: string) {
+		super(exitStatus, message);
 		this.name = "StateCommandError";
 	}
-}
-
-function flagValue(args: readonly string[], flag: string): string | undefined {
-	const index = args.indexOf(flag);
-	if (index < 0) return undefined;
-	return args[index + 1];
-}
-
-function hasFlag(args: readonly string[], flag: string): boolean {
-	return args.includes(flag);
 }
 
 const GRAPH_FORMATS = new Set(["ascii", "mermaid", "dot"]);
@@ -237,11 +231,6 @@ function parsePositionalArgs(args: readonly string[]): ParsedInvocation {
 	return { action: "read" };
 }
 
-function assertSafePathComponent(value: string, label: string): void {
-	if (!PATH_COMPONENT_RE.test(value) || value.includes("..")) {
-		throw new StateCommandError(2, `invalid path component for --${label}: ${value}`);
-	}
-}
 function isKnownMode(mode: string): mode is CanonicalGjcWorkflowSkill {
 	return KNOWN_MODES.includes(mode);
 }
@@ -391,7 +380,9 @@ async function describeStaleClearState(
 	existing: Record<string, unknown>,
 ): Promise<string | undefined> {
 	const phase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : undefined;
-	if (phase && TERMINAL_CLEAR_PHASES.has(phase)) return `mode-state is already terminal (${phase})`;
+	if (phase && getSkillManifest(mode).stopReleasingPhases.includes(phase) && phase !== "inactive") {
+		return `mode-state is already terminal (${phase})`;
+	}
 	const activePhase = await readActivePhaseForSkill(cwd, sessionId, mode);
 	if (activePhase && phase && activePhase !== phase) {
 		return `active-state phase ${activePhase} differs from mode-state phase ${phase}`;
@@ -504,22 +495,11 @@ function phaseFromActiveValue(value: unknown): string | undefined {
 	return phase || undefined;
 }
 
-const RALPLAN_CANONICAL_PHASE_OVERRIDES = new Set([
-	"final",
-	"handoff",
-	"complete",
-	"completed",
-	"failed",
-	"cancelled",
-	"canceled",
-	"inactive",
-]);
-
 function modeStatePhase(value: unknown): string | undefined {
 	if (!isPlainObject(value) || typeof value.current_phase !== "string") return undefined;
 	const phase = value.current_phase.trim();
 	if (!phase) return undefined;
-	if (value.active === false && !RALPLAN_CANONICAL_PHASE_OVERRIDES.has(phase)) return undefined;
+	if (value.active === false && !getSkillManifest("ralplan").canonicalOverrides.includes(phase)) return undefined;
 	return phase;
 }
 
@@ -821,6 +801,7 @@ async function writeJsonAtomic(
 		fromPhase?: string;
 		toPhase?: string;
 		owner?: WorkflowStateMutationOwner;
+		lockHeld?: boolean;
 	},
 ): Promise<{ warning?: string; stamped: Record<string, unknown>; revision: number }> {
 	const warning = options?.skill
@@ -850,6 +831,7 @@ async function writeJsonAtomic(
 			toPhase: options?.toPhase,
 			forced: options?.force ?? false,
 		},
+		lockHeld: options?.lockHeld ?? false,
 	});
 	// `writeResult.stamped` and `.revision` are computed inside the writer lock, so they are
 	// the envelope/revision this write actually owns. Never post-lock re-read here: a concurrent
@@ -936,10 +918,6 @@ async function readAuditWindow(
 		if (selected.length < limit) selected.push(entry);
 	}
 	return { entries: selected.reverse(), limit, ...(since ? { since } : {}), truncated: matched > limit };
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 /**
@@ -1127,11 +1105,21 @@ export async function reconcileWorkflowSkillState(options: {
 	payload: Record<string, unknown>;
 	sourceRevision?: number;
 }): Promise<{ stateFile: string }> {
-	const { cwd, mode, threadId, turnId, active, payload } = options;
-	const { gjcSessionId: sessionId } = resolveGjcSessionForWrite(cwd, {
+	const { gjcSessionId: sessionId } = resolveGjcSessionForWrite(options.cwd, {
 		payloadSessionId: options.sessionId,
 		envSessionId: process.env.GJC_SESSION_ID,
 	});
+	return withWorkflowStateLock(
+		path.relative(options.cwd, modeStateFile(options.cwd, options.mode, sessionId)),
+		async () => reconcileWorkflowSkillStateUnlocked(options, sessionId),
+	);
+}
+
+async function reconcileWorkflowSkillStateUnlocked(
+	options: Parameters<typeof reconcileWorkflowSkillState>[0],
+	sessionId: string,
+): Promise<{ stateFile: string }> {
+	const { cwd, mode, threadId, turnId, active, payload } = options;
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const existingRead = await readExistingStateForMutation(filePath);
 	const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
@@ -1181,9 +1169,10 @@ export async function reconcileWorkflowSkillState(options: {
 	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
 
 	if (existingRead.kind === "corrupt") await fs.rm(filePath, { force: true });
-	await writeGuardedWorkflowEnvelopeAtomic(filePath, merged, {
+	const writeResult = await writeGuardedWorkflowEnvelopeAtomic(filePath, merged, {
 		cwd,
 		policy: "source",
+		lockHeld: true,
 		receipt: {
 			cwd,
 			skill: mode,
@@ -1209,8 +1198,7 @@ export async function reconcileWorkflowSkillState(options: {
 			toPhase: trimmedPhase,
 		},
 	});
-	const persisted = (await readJsonFile(filePath)) ?? {};
-	const sourceRevision = options.sourceRevision ?? existingStateRevision(persisted);
+	const sourceRevision = options.sourceRevision ?? writeResult.revision;
 
 	// Reconciliation drives the active-state/HUD update directly (not via the
 	// best-effort syncWorkflowSkillState wrapper) so a failed HUD/active-state write
@@ -1332,132 +1320,149 @@ async function handleWrite(
 
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const forced = hasFlag(args, "--force");
-	const existingRead = await readExistingStateForMutation(filePath);
-	if (existingRead.kind === "corrupt" && !forced) {
-		throw new StateCommandError(
-			2,
-			`existing state for ${mode} is corrupt or tampered (${existingRead.error}); use --force to overwrite`,
-		);
-	}
-	const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
-	const nowIsoStr = nowIso();
-	const mutationId = `${mode}:${nowIsoStr}`;
-	const receipt = buildWorkflowStateReceipt({
-		cwd,
-		skill: mode,
-		owner: "gjc-state-cli",
-		command: `gjc state ${mode} write`,
-		sessionId,
-		nowIso: nowIsoStr,
-		mutationId,
-	});
-	const innerState = (payload.state as Record<string, unknown> | undefined) ?? {};
-	const incomingPhase =
-		typeof payload.current_phase === "string" && payload.current_phase.trim()
-			? payload.current_phase.trim()
-			: typeof payload.phase === "string" && payload.phase.trim()
-				? payload.phase.trim()
-				: typeof innerState.current_phase === "string" && (innerState.current_phase as string).trim()
-					? (innerState.current_phase as string).trim()
-					: undefined;
-	let merged: Record<string, unknown>;
-	if (mode === "deep-interview") {
-		// Deep-interview keeps interview data nested under `state` and merges rounds
-		// losslessly by durable key; never flatten or delete `state` (that drops recorder history).
-		// The deterministic ambiguity floor is applied after the merge so a reported
-		// score written through the CLI can never undercut persisted contradiction evidence.
-		merged = applyAmbiguityFloorToEnvelope(
-			mergeDeepInterviewEnvelope(existingPayload, payload, { replace: hasFlag(args, "--replace") }),
-		).envelope;
-	} else if (hasFlag(args, "--replace")) {
-		merged = { ...payload };
-	} else {
-		merged = mergeWithNullDelete(existingPayload, payload);
-		// Flatten payload.state.* into the top-level envelope so downstream consumers
-		// see a single canonical structure with the receipt at top level.
-		if (payload.state && typeof payload.state === "object" && !Array.isArray(payload.state)) {
-			merged = mergeWithNullDelete(merged, payload.state as Record<string, unknown>);
-			delete merged.state;
-		}
-	}
-	const preDefaultValidation = validateWorkflowStateEnvelope(mode, merged);
-	if (!preDefaultValidation.valid) {
-		throw new StateCommandError(2, preDefaultValidation.error ?? `invalid ${mode} state envelope`);
-	}
-	merged.skill = mode;
-	if (incomingPhase) {
-		merged.current_phase = incomingPhase;
-	} else if (typeof merged.current_phase !== "string" || !merged.current_phase.trim()) {
-		const retainedPhase =
-			typeof existingPayload.current_phase === "string" ? existingPayload.current_phase.trim() : "";
-		merged.current_phase = retainedPhase || initialPhaseForSkill(mode);
-	} else {
-		merged.current_phase = merged.current_phase.trim();
-	}
-	merged.version = WORKFLOW_STATE_VERSION;
-	if (typeof merged.active !== "boolean") merged.active = true;
-	merged.updated_at = nowIsoStr;
-	merged.receipt = receipt;
-	if (sessionId && typeof merged.session_id !== "string") merged.session_id = sessionId;
+	return await withWorkflowStateLock(
+		filePath,
+		async () => {
+			const existingRead = await readExistingStateForMutation(filePath);
+			if (existingRead.kind === "corrupt" && !forced) {
+				throw new StateCommandError(
+					2,
+					`existing state for ${mode} is corrupt or tampered (${existingRead.error}); use --force to overwrite`,
+				);
+			}
+			const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
+			const nowIsoStr = nowIso();
+			const mutationId = `${mode}:${nowIsoStr}`;
+			const receipt = buildWorkflowStateReceipt({
+				cwd,
+				skill: mode,
+				owner: "gjc-state-cli",
+				command: `gjc state ${mode} write`,
+				sessionId,
+				nowIso: nowIsoStr,
+				mutationId,
+			});
+			const innerState = (payload.state as Record<string, unknown> | undefined) ?? {};
+			const incomingPhase =
+				typeof payload.current_phase === "string" && payload.current_phase.trim()
+					? payload.current_phase.trim()
+					: typeof payload.phase === "string" && payload.phase.trim()
+						? payload.phase.trim()
+						: typeof innerState.current_phase === "string" && (innerState.current_phase as string).trim()
+							? (innerState.current_phase as string).trim()
+							: undefined;
+			let merged: Record<string, unknown>;
+			if (mode === "deep-interview") {
+				// Deep-interview keeps interview data nested under `state` and merges rounds
+				// losslessly by durable key; never flatten or delete `state` (that drops recorder history).
+				// The deterministic ambiguity floor is applied after the merge so a reported
+				// score written through the CLI can never undercut persisted contradiction evidence.
+				merged = applyAmbiguityFloorToEnvelope(
+					mergeDeepInterviewEnvelope(existingPayload, payload, { replace: hasFlag(args, "--replace") }),
+				).envelope;
+			} else if (hasFlag(args, "--replace")) {
+				merged = { ...payload };
+			} else {
+				merged = mergeWithNullDelete(existingPayload, payload);
+				// Flatten payload.state.* into the top-level envelope so downstream consumers
+				// see a single canonical structure with the receipt at top level.
+				if (payload.state && typeof payload.state === "object" && !Array.isArray(payload.state)) {
+					merged = mergeWithNullDelete(merged, payload.state as Record<string, unknown>);
+					delete merged.state;
+				}
+			}
+			const preDefaultValidation = validateWorkflowStateEnvelope(mode, merged);
+			if (!preDefaultValidation.valid) {
+				throw new StateCommandError(2, preDefaultValidation.error ?? `invalid ${mode} state envelope`);
+			}
+			merged.skill = mode;
+			if (incomingPhase) {
+				merged.current_phase = incomingPhase;
+			} else if (typeof merged.current_phase !== "string" || !merged.current_phase.trim()) {
+				const retainedPhase =
+					typeof existingPayload.current_phase === "string" ? existingPayload.current_phase.trim() : "";
+				merged.current_phase = retainedPhase || initialPhaseForSkill(mode);
+			} else {
+				merged.current_phase = merged.current_phase.trim();
+			}
+			merged.version = WORKFLOW_STATE_VERSION;
+			if (typeof merged.active !== "boolean") merged.active = true;
+			merged.updated_at = nowIsoStr;
+			merged.receipt = receipt;
+			if (sessionId && typeof merged.session_id !== "string") merged.session_id = sessionId;
 
-	const fromPhase =
-		typeof existingPayload.current_phase === "string" ? existingPayload.current_phase.trim() : undefined;
-	const toPhase = merged.current_phase as string;
-	const manifestStates = new Set(getSkillManifest(mode).states.map(state => state.id));
-	if (!manifestStates.has(toPhase) && !forced) {
-		throw new StateCommandError(2, `unknown ${mode} phase "${toPhase}"; use --force to bypass`);
-	}
-	if (fromPhase && toPhase && isKnownWorkflowState(mode, fromPhase) && isKnownWorkflowState(mode, toPhase)) {
-		if (!isValidTransition(mode, fromPhase, toPhase) && !forced) {
-			throw new StateCommandError(
-				2,
-				`invalid ${mode} phase transition from ${fromPhase} to ${toPhase}; use --force to bypass`,
-			);
-		}
-	}
+			const fromPhase =
+				typeof existingPayload.current_phase === "string" ? existingPayload.current_phase.trim() : undefined;
+			const toPhase = merged.current_phase as string;
+			const manifestStates = new Set(getSkillManifest(mode).states.map(state => state.id));
+			if (!manifestStates.has(toPhase) && !forced) {
+				throw new StateCommandError(2, `unknown ${mode} phase "${toPhase}"; use --force to bypass`);
+			}
+			if (fromPhase && toPhase && isKnownWorkflowState(mode, fromPhase) && isKnownWorkflowState(mode, toPhase)) {
+				if (!isValidTransition(mode, fromPhase, toPhase) && !forced) {
+					throw new StateCommandError(
+						2,
+						`invalid ${mode} phase transition from ${fromPhase} to ${toPhase}; use --force to bypass`,
+					);
+				}
+			}
 
-	const validation = validateWorkflowStateEnvelope(mode, merged);
-	if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
+			const validation = validateWorkflowStateEnvelope(mode, merged);
+			if (!validation.valid) throw new StateCommandError(2, validation.error ?? `invalid ${mode} state envelope`);
 
-	const {
-		warning: outOfBandWarning,
-		stamped,
-		revision: stampedRevision,
-	} = await writeJsonAtomic(cwd, filePath, merged, "write", {
-		sessionId,
-		skill: mode,
-		mutationId,
-		force: forced,
-		fromPhase,
-		toPhase,
-	});
-	const stampedReceipt = isPlainObject(stamped.receipt) ? stamped.receipt : {};
+			const {
+				warning: outOfBandWarning,
+				stamped,
+				revision: stampedRevision,
+			} = await writeJsonAtomic(cwd, filePath, merged, "write", {
+				sessionId,
+				skill: mode,
+				mutationId,
+				force: forced,
+				fromPhase,
+				toPhase,
+				lockHeld: true,
+			});
+			const stampedReceipt = isPlainObject(stamped.receipt) ? stamped.receipt : {};
 
-	const phase = typeof merged.current_phase === "string" ? merged.current_phase : undefined;
-	const active = merged.active !== false;
-	// Reflect the lock-owned mode-state revision onto the in-memory payload so the active-state/HUD
-	// sync derives a `sourceRevision` from the revision this write actually owns (computed inside the
-	// writer lock), not the stale pre-write value or a post-lock re-read a concurrent writer could
-	// have advanced; otherwise the active-state writer stale-skips the update and the mirror keeps the
-	// prior phase (e.g. staying "interviewing" after a "handoff" write).
-	merged.state_revision = stampedRevision;
-	await syncWorkflowSkillState({ cwd, mode, sessionId, threadId, turnId, active, phase, payload: merged, receipt });
-	await touchStateActivityMarker(cwd, sessionId, filePath);
+			const phase = typeof merged.current_phase === "string" ? merged.current_phase : undefined;
+			const active = merged.active !== false;
+			// Reflect the lock-owned mode-state revision onto the in-memory payload so the active-state/HUD
+			// sync derives a `sourceRevision` from the revision this write actually owns (computed inside the
+			// writer lock), not the stale pre-write value or a post-lock re-read a concurrent writer could
+			// have advanced; otherwise the active-state writer stale-skips the update and the mirror keeps the
+			// prior phase (e.g. staying "interviewing" after a "handoff" write).
+			merged.state_revision = stampedRevision;
+			await syncWorkflowSkillState({
+				cwd,
+				mode,
+				sessionId,
+				threadId,
+				turnId,
+				active,
+				phase,
+				payload: merged,
+				receipt,
+			});
+			await touchStateActivityMarker(cwd, sessionId, filePath);
 
-	return {
-		status: 0,
-		stdout: renderCliWriteReceipt({
-			ok: true,
-			skill: mode,
-			state_path: filePath,
-			current_phase: phase,
-			active,
-			mutation_id: typeof stampedReceipt.mutation_id === "string" ? stampedReceipt.mutation_id : mutationId,
-			status: typeof stampedReceipt.status === "string" ? stampedReceipt.status : undefined,
-			content_sha256: stampedReceipt.content_sha256,
-		}),
-		...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
-	};
+			return {
+				status: 0,
+				stdout: renderCliWriteReceipt({
+					ok: true,
+					skill: mode,
+					state_path: receipt.state_path,
+					current_phase: phase,
+					active,
+					mutation_id: typeof stampedReceipt.mutation_id === "string" ? stampedReceipt.mutation_id : mutationId,
+					status: typeof stampedReceipt.status === "string" ? stampedReceipt.status : undefined,
+					content_sha256: stampedReceipt.content_sha256,
+				}),
+				...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
+			};
+		},
+		{ cwd },
+	);
 }
 
 async function handleClear(
@@ -1476,74 +1481,135 @@ async function handleClear(
 
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const forced = hasFlag(args, "--force");
-	const existingRead = await readExistingStateForMutation(filePath);
-	if (existingRead.kind === "corrupt" && !forced) {
+	return await withWorkflowStateLock(
+		filePath,
+		async () => {
+			const existingRead = await readExistingStateForMutation(filePath);
+			if (existingRead.kind === "corrupt" && !forced) {
+				throw new StateCommandError(
+					2,
+					`existing state for ${mode} is corrupt or tampered (${existingRead.error}); use --force to overwrite`,
+				);
+			}
+			const existing = existingRead.kind === "valid" ? existingRead.value : {};
+			const staleReason = await describeStaleClearState(cwd, sessionId, mode, existing);
+			if (staleReason && !forced) {
+				throw new StateCommandError(
+					2,
+					`existing state for ${mode} is stale (${staleReason}); use --force to clear`,
+				);
+			}
+			const clearedAt = nowIso();
+			const cleared: Record<string, unknown> = {
+				skill: mode,
+				...existing,
+				active: false,
+				current_phase: "complete",
+				updated_at: clearedAt,
+				version: WORKFLOW_STATE_VERSION,
+			};
+			cleared.skill = mode;
+			const mutationId = `${mode}:clear:${clearedAt}`;
+			const receipt = buildWorkflowStateReceipt({
+				cwd,
+				skill: mode,
+				owner: "gjc-state-cli",
+				command: `gjc state ${mode} clear`,
+				sessionId,
+				nowIso: clearedAt,
+				mutationId,
+			});
+			cleared.receipt = receipt;
+			const { warning: outOfBandWarning, stamped } = await writeJsonAtomic(cwd, filePath, cleared, "clear", {
+				sessionId,
+				skill: mode,
+				mutationId,
+				force: forced,
+				fromPhase: typeof existing.current_phase === "string" ? existing.current_phase : undefined,
+				toPhase: "complete",
+				lockHeld: true,
+			});
+			const stampedReceipt = isPlainObject(stamped.receipt) ? stamped.receipt : {};
+
+			await syncWorkflowSkillState({
+				cwd,
+				mode,
+				sessionId,
+				threadId,
+				turnId,
+				active: false,
+				phase: "complete",
+				payload: cleared,
+			});
+			await touchStateActivityMarker(cwd, sessionId, filePath);
+			return {
+				status: 0,
+				stdout: renderCliWriteReceipt({
+					ok: true,
+					skill: mode,
+					state_path: receipt.state_path,
+					active: false,
+					current_phase: typeof cleared.current_phase === "string" ? cleared.current_phase : undefined,
+					mutation_id: typeof stampedReceipt.mutation_id === "string" ? stampedReceipt.mutation_id : mutationId,
+					status: typeof stampedReceipt.status === "string" ? stampedReceipt.status : undefined,
+					content_sha256: stampedReceipt.content_sha256,
+				}),
+				...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
+			};
+		},
+		{ cwd },
+	);
+}
+
+const DEEP_INTERVIEW_INTENT_ID_RE = /(?:artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}/g;
+
+async function assertDeepInterviewHandoffReady(state: Record<string, unknown>): Promise<void> {
+	const envelope = normalizeDeepInterviewEnvelope(state);
+	const inner = envelope.state;
+	if (!inner) return;
+	if (inner.intent_contract === undefined) {
+		if (inner.intent_contract_required === true)
+			throw new StateCommandError(2, "deep-interview handoff requires a locked Round 0 intent contract");
+		return;
+	}
+	assertDeepInterviewIntentManifest(inner.intent_contract);
+	const specPath = typeof state.spec_path === "string" ? state.spec_path : undefined;
+	const expectedSha = typeof state.spec_sha256 === "string" ? state.spec_sha256 : undefined;
+	if (!specPath || !expectedSha)
+		throw new StateCommandError(2, "deep-interview handoff requires a persisted intent-validated spec");
+	let content: string;
+	try {
+		content = await fs.readFile(specPath, "utf-8");
+	} catch (error) {
 		throw new StateCommandError(
 			2,
-			`existing state for ${mode} is corrupt or tampered (${existingRead.error}); use --force to overwrite`,
+			`deep-interview handoff cannot read persisted spec: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
-	const existing = existingRead.kind === "valid" ? existingRead.value : {};
-	const staleReason = await describeStaleClearState(cwd, sessionId, mode, existing);
-	if (staleReason && !forced) {
-		throw new StateCommandError(2, `existing state for ${mode} is stale (${staleReason}); use --force to clear`);
+	if (createHash("sha256").update(content).digest("hex") !== expectedSha)
+		throw new StateCommandError(2, "deep-interview handoff spec hash mismatch");
+	const observedIds = [...new Set(content.match(DEEP_INTERVIEW_INTENT_ID_RE) ?? [])].sort();
+	const rounds = Array.isArray(inner.rounds)
+		? inner.rounds
+				.filter(
+					(round): round is Record<string, unknown> =>
+						Boolean(round) && typeof round === "object" && !Array.isArray(round),
+				)
+				.map(round => ({ round: round.round, answer_hash: round.answer_hash }))
+		: [];
+	try {
+		assertDeepInterviewIntentReview(
+			inner.intent_review,
+			inner.intent_contract as DeepInterviewIntentManifest,
+			observedIds,
+			rounds,
+		);
+	} catch (error) {
+		throw new StateCommandError(
+			2,
+			`deep-interview handoff intent validation failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
-	const clearedAt = nowIso();
-	const cleared: Record<string, unknown> = {
-		skill: mode,
-		...existing,
-		active: false,
-		current_phase: "complete",
-		updated_at: clearedAt,
-		version: WORKFLOW_STATE_VERSION,
-	};
-	cleared.skill = mode;
-	const mutationId = `${mode}:clear:${clearedAt}`;
-	const receipt = buildWorkflowStateReceipt({
-		cwd,
-		skill: mode,
-		owner: "gjc-state-cli",
-		command: `gjc state ${mode} clear`,
-		sessionId,
-		nowIso: clearedAt,
-		mutationId,
-	});
-	cleared.receipt = receipt;
-	const { warning: outOfBandWarning, stamped } = await writeJsonAtomic(cwd, filePath, cleared, "clear", {
-		sessionId,
-		skill: mode,
-		mutationId,
-		force: forced,
-		fromPhase: typeof existing.current_phase === "string" ? existing.current_phase : undefined,
-		toPhase: "complete",
-	});
-	const stampedReceipt = isPlainObject(stamped.receipt) ? stamped.receipt : {};
-
-	await syncWorkflowSkillState({
-		cwd,
-		mode,
-		sessionId,
-		threadId,
-		turnId,
-		active: false,
-		phase: "complete",
-		payload: cleared,
-	});
-	await touchStateActivityMarker(cwd, sessionId, filePath);
-	return {
-		status: 0,
-		stdout: renderCliWriteReceipt({
-			ok: true,
-			skill: mode,
-			state_path: filePath,
-			active: false,
-			current_phase: typeof cleared.current_phase === "string" ? cleared.current_phase : undefined,
-			mutation_id: typeof stampedReceipt.mutation_id === "string" ? stampedReceipt.mutation_id : mutationId,
-			status: typeof stampedReceipt.status === "string" ? stampedReceipt.status : undefined,
-			content_sha256: stampedReceipt.content_sha256,
-		}),
-		...(outOfBandWarning ? { stderr: `${outOfBandWarning}\n` } : {}),
-	};
 }
 
 /**
@@ -1565,7 +1631,7 @@ async function handleClear(
  * the phase remains in `skill-active-state.json` until a chain call (or
  * explicit `clear`) demotes it.
  */
-async function handleHandoff(
+async function handleHandoffUnlocked(
 	args: readonly string[],
 	cwd: string,
 	positionalSkill: string | undefined,
@@ -1619,18 +1685,19 @@ async function handleHandoff(
 		nowIso: handoffAt,
 		mutationId,
 	});
+	const normalizedCaller =
+		caller === "deep-interview"
+			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
+					string,
+					unknown
+				>)
+			: migrateWorkflowState(existingCaller, caller).state;
+	if (caller === "deep-interview") await assertDeepInterviewHandoffReady(normalizedCaller);
 
 	// Runtime callees have no native mode-state to clear later, so do not
 	// persist them as active-state entries; the prompt observer tracks them
 	// in memory the same way direct `/skill:<runtime>` invocation does.
 	if (!calleeIsWorkflow) {
-		const normalizedCaller =
-			caller === "deep-interview"
-				? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
-						string,
-						unknown
-					>)
-				: migrateWorkflowState(existingCaller, caller).state;
 		const mergedCallerState: Record<string, unknown> = {
 			...normalizedCaller,
 			skill: caller,
@@ -1727,13 +1794,6 @@ async function handleHandoff(
 	});
 
 	const calleeInitial = initialPhaseForSkill(callee);
-	const normalizedCaller =
-		caller === "deep-interview"
-			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
-					string,
-					unknown
-				>)
-			: migrateWorkflowState(existingCaller, caller).state;
 	const normalizedCallee =
 		callee === "deep-interview"
 			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCallee, callee).state) as Record<
@@ -1882,6 +1942,17 @@ async function handleHandoff(
 			},
 		}),
 	};
+}
+
+async function handleHandoff(
+	args: readonly string[],
+	cwd: string,
+	positionalSkill: string | undefined,
+): Promise<StateCommandResult> {
+	const selectors = await resolveSelectors(args, cwd, positionalSkill, "handoff");
+	return withWorkflowStateLock(path.relative(cwd, activeStateFile(cwd, selectors.gjcSessionId)), async () =>
+		handleHandoffUnlocked(args, cwd, positionalSkill),
+	);
 }
 
 async function handleContract(
@@ -2253,7 +2324,7 @@ export async function runNativeStateCommand(args: string[], cwd = process.cwd())
 				return { status: 2, stderr: `Unknown gjc state command: ${parsed.action}\n` };
 		}
 	} catch (error) {
-		if (error instanceof StateCommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
+		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
 		if (error instanceof SessionResolutionError) return { status: 2, stderr: `${error.message}\n` };
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}

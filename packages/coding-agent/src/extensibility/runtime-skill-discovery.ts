@@ -4,7 +4,8 @@ import * as path from "node:path";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
-import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
+import { compareSkillOrder, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import type { Skill } from "./skills";
 
 export type RuntimeSkillDiscoverySource = "project" | "user";
@@ -32,6 +33,7 @@ function getRuntimeHome(): string {
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
+const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 
 function normalizeLimit(limit: number | undefined): number {
 	if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT;
@@ -54,6 +56,18 @@ async function getProjectSkillDirs(cwd: string, home: string): Promise<{ dirs: s
 		current = parent;
 	}
 	return { dirs, repoRoot };
+}
+
+function getUserSkillDirs(home: string): string[] {
+	const canonicalUserDir = SOURCE_PATHS.native.userAgent;
+	const configuredLegacyDir = SOURCE_PATHS.native.userBase;
+	return [
+		...new Set([
+			path.join(home, canonicalUserDir, "skills"),
+			path.join(home, configuredLegacyDir, "skills"),
+			path.join(home, ".gjc", "skills"),
+		]),
+	];
 }
 
 function getUseWhen(skill: CapabilitySkill): string[] | undefined {
@@ -110,6 +124,7 @@ function isAllowedByPolicy(
 	source: RuntimeSkillDiscoverySource,
 	policy: SkillsSettings | undefined,
 ): boolean {
+	if (BUILT_IN_SKILL_NAMES.has(skill.name)) return false;
 	if (!sourceEnabled(source, policy)) return false;
 	if (isDisabledSkill(skill.name, policy?.disabledExtensions)) return false;
 	if (matchesIgnorePatterns(skill.name, policy?.ignoredSkills)) return false;
@@ -158,12 +173,14 @@ export async function discoverRuntimeSkills(
 		}
 	}
 	if ((source === "all" || source === "user") && sourceEnabled("user", policy)) {
-		scanJobs.push(
-			scanSkillsFromDir(
-				{ cwd: options.cwd, home, repoRoot: home },
-				{ dir: path.join(home, ".gjc", "skills"), providerId: "runtime", level: "user", requireDescription: true },
-			).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
-		);
+		for (const dir of getUserSkillDirs(home)) {
+			scanJobs.push(
+				scanSkillsFromDir(
+					{ cwd: options.cwd, home, repoRoot: home },
+					{ dir, providerId: "runtime", level: "user", requireDescription: true },
+				).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
+			);
+		}
 	}
 
 	const seenNames = new Set<string>();
@@ -175,6 +192,7 @@ export async function discoverRuntimeSkills(
 		if (seenPaths.has(realPath) || seenNames.has(entry.skill.name)) continue;
 		seenPaths.add(realPath);
 		seenNames.add(entry.skill.name);
+
 		const candidate: RuntimeSkillDiscoveryCandidate = {
 			name: entry.skill.name,
 			description:
@@ -213,12 +231,14 @@ export async function findRuntimeSkillByName(
 		);
 	}
 	if (sourceEnabled("user", policy)) {
-		scanJobs.push(
-			scanSkillsFromDir(
-				{ cwd, home, repoRoot: home },
-				{ dir: path.join(home, ".gjc", "skills"), providerId: "runtime", level: "user", requireDescription: true },
-			).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
-		);
+		for (const dir of getUserSkillDirs(home)) {
+			scanJobs.push(
+				scanSkillsFromDir(
+					{ cwd, home, repoRoot: home },
+					{ dir, providerId: "runtime", level: "user", requireDescription: true },
+				).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
+			);
+		}
 	}
 	for (const entry of (await Promise.all(scanJobs)).flat()) {
 		if (entry.skill.name === normalized && isAllowedByPolicy(entry.skill, entry.source, policy)) {

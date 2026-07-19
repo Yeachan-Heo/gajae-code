@@ -28,7 +28,7 @@ import {
 	ensureWorkflowSkillActivationState,
 	readVisibleSkillActiveState,
 } from "../src/hooks/skill-state";
-import { getDeepInterviewMutationDecision } from "../src/skill-state/deep-interview-mutation-guard";
+import { getWorkflowMutationDecision } from "../src/skill-state/workflow-mutation-guard";
 import { WORKFLOW_STATE_VERSION } from "../src/skill-state/workflow-state-contract";
 
 describe("GJC native skill-state hooks", () => {
@@ -886,7 +886,7 @@ describe("GJC native skill-state hooks", () => {
 		const state = await readVisibleSkillActiveState(root, "session-rich");
 		expect(state).toMatchObject({ active: true, skill: "deep-interview" });
 
-		const blockedProduct = await getDeepInterviewMutationDecision({
+		const blockedProduct = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "write" } as never,
@@ -896,7 +896,7 @@ describe("GJC native skill-state hooks", () => {
 		expect(blockedProduct.reason).toBe("phase-boundary");
 		expect(blockedProduct.message).toContain("handoff/spec before code edits");
 
-		const allowedReadOnlyBash = await getDeepInterviewMutationDecision({
+		const allowedReadOnlyBash = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "bash" } as never,
@@ -904,7 +904,7 @@ describe("GJC native skill-state hooks", () => {
 		});
 		expect(allowedReadOnlyBash.blocked).toBe(false);
 
-		const blockedSpec = await getDeepInterviewMutationDecision({
+		const blockedSpec = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "write" } as never,
@@ -916,7 +916,7 @@ describe("GJC native skill-state hooks", () => {
 
 		// Per #951 the mutation guard never blocks `bash`, even for `.gjc/**` targets;
 		// `.gjc/**` is gated only through the dedicated write/edit/ast_edit tools.
-		const allowedGjcBash = await getDeepInterviewMutationDecision({
+		const allowedGjcBash = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "bash" } as never,
@@ -924,7 +924,7 @@ describe("GJC native skill-state hooks", () => {
 		});
 		expect(allowedGjcBash.blocked).toBe(false);
 
-		const blocked = await getDeepInterviewMutationDecision({
+		const blocked = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-rich",
 			tool: { name: "write" } as never,
@@ -936,7 +936,7 @@ describe("GJC native skill-state hooks", () => {
 
 	it("blocks direct workflow state JSON writes and points to gjc state", async () => {
 		const root = await cwd();
-		const blocked = await getDeepInterviewMutationDecision({
+		const blocked = await getWorkflowMutationDecision({
 			cwd: root,
 			tool: { name: "write" } as never,
 			args: { path: ".gjc/state/ralplan-state.json", content: "{}" },
@@ -945,14 +945,14 @@ describe("GJC native skill-state hooks", () => {
 		expect(blocked.reason).toBe("workflow-state-target");
 		expect(blocked.message).toContain("gjc state ralplan");
 
-		const allowedSpec = await getDeepInterviewMutationDecision({
+		const allowedSpec = await getWorkflowMutationDecision({
 			cwd: root,
 			tool: { name: "write" } as never,
 			args: { path: ".gjc/specs/deep-interview-sample.md", content: "spec" },
 		});
 		expect(allowedSpec.blocked).toBe(true);
 
-		const allowedPlan = await getDeepInterviewMutationDecision({
+		const allowedPlan = await getWorkflowMutationDecision({
 			cwd: root,
 			tool: { name: "write" } as never,
 			args: { path: ".gjc/plans/sample.md", content: "plan" },
@@ -1792,7 +1792,7 @@ disabledExtensions:
 
 	it("ensureWorkflowSkillActivationState seeds state and engages the mutation guard", async () => {
 		const root = await cwd();
-		const before = await getDeepInterviewMutationDecision({
+		const before = await getWorkflowMutationDecision({
 			cwd: root,
 			tool: { name: "write" } as never,
 			args: { path: "src/app.ts", content: "x" },
@@ -1809,7 +1809,7 @@ disabledExtensions:
 		const state = await readVisibleSkillActiveState(root, "session-seed");
 		expect(state).toMatchObject({ active: true, skill: "deep-interview" });
 
-		const after = await getDeepInterviewMutationDecision({
+		const after = await getWorkflowMutationDecision({
 			cwd: root,
 			sessionId: "session-seed",
 			tool: { name: "write" } as never,

@@ -118,6 +118,7 @@ function canClaim(effect: ChatEffect, now: number): boolean {
 export class ChatEffectJournal {
 	readonly #store: ConversationStore<ChatEffect>;
 	readonly #mappings: ConversationStore<EffectReferenceMapping>;
+	readonly #maxTerminalEffects: number;
 
 	readonly #now: () => number;
 
@@ -131,10 +132,17 @@ export class ChatEffectJournal {
 		pidIncarnation?: (pid: number) => string | undefined;
 		sleep?: (ms: number) => Promise<void>;
 		lockTimeoutMs?: number;
+		maxTerminalEffects?: number;
 	}) {
 		this.#store = new ConversationStore<ChatEffect>({ ...input, kind: input.transport, fileName: "effects.json" });
 		this.#mappings = new ConversationStore<EffectReferenceMapping>({ ...input, kind: input.transport });
 
+		if (
+			input.maxTerminalEffects !== undefined &&
+			(!Number.isSafeInteger(input.maxTerminalEffects) || input.maxTerminalEffects < 1)
+		)
+			throw new Error("Chat effect terminal retention must be a positive safe integer");
+		this.#maxTerminalEffects = input.maxTerminalEffects ?? MAX_TERMINAL_CHAT_EFFECTS;
 		this.#now = input.now ?? Date.now;
 	}
 
@@ -343,12 +351,12 @@ export class ChatEffectJournal {
 		const terminal = (await this.list())
 			.filter(effect => effect.state === "terminal")
 			.sort((left, right) => left.updatedAt - right.updatedAt);
-		if (terminal.length <= MAX_TERMINAL_CHAT_EFFECTS) return;
+		if (terminal.length <= this.#maxTerminalEffects) return;
 
 		const referenced = new Set<string>();
 		for (const mapping of Object.values((await this.#mappings.load()).conversations))
 			collectEffectReferences(mapping, referenced);
-		for (const effect of terminal.slice(0, terminal.length - MAX_TERMINAL_CHAT_EFFECTS)) {
+		for (const effect of terminal.slice(0, terminal.length - this.#maxTerminalEffects)) {
 			if (!referenced.has(effect.id)) await this.#store.delete(effect.id, effect.generation);
 		}
 	}

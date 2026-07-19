@@ -70,15 +70,15 @@ Breadcrumb content is two lines: original cwd, then session file path. `continue
 Session files are JSONL: one JSON object per line.
 
 - Line 1 is always the session header (`type: "session"`).
-- Remaining lines are `SessionEntry` values.
-- Entries are append-only at runtime; branch navigation moves a pointer (`leafId`) rather than mutating existing entries.
+- Remaining lines are `SessionEntry` values or v4 append-only patch records. `header_patch` records update header metadata and `entry_patch` records replace a message payload when replay metadata is sanitized.
+- Entries and patch records are append-only at runtime; branch navigation moves a pointer (`leafId`) rather than mutating existing entries.
 
 ### Header (`SessionHeader`)
 
 ```json
 {
   "type": "session",
-  "version": 3,
+  "version": 4,
   "id": "1f9d2a6b9c0d1234",
   "timestamp": "2026-02-16T10:20:30.000Z",
   "cwd": "/work/pi",
@@ -336,7 +336,7 @@ Extension-provided message that does participate in LLM context. `content` can b
 
 ## Versioning and Migration
 
-Current session version: `3`.
+Current session version: `4`.
 
 ### v1 -> v2
 
@@ -354,11 +354,18 @@ Applied when header `version < 3`:
 - For `message` entries: rewrites legacy `message.role === "hookMessage"` to `"custom"`.
 - Sets header `version = 3`.
 
+### v3 -> v4
+
+Applied when header `version < 4`:
+
+- Sets header `version = 4`.
+- Enables v4 append-only `header_patch` and `entry_patch` records. Patch records are applied only when the header version is exactly `4`; they are ignored for v1-v3 transcripts.
+
 ### Migration Trigger and Persistence
 
-- Migrations run during session load (`setSessionFile`).
-- If any migration ran, the entire file is rewritten to disk immediately.
-- Migration mutates in-memory entries first, then persists rewritten JSONL.
+- v1-v3 transcripts remain readable without mutation during read-only inspection and strict resume selection.
+- Mutable session loads migrate v1-v3 entries in memory and immediately rewrite the complete JSONL file at version 4.
+- v4 sessions load without a migration rewrite.
 
 ## Load and Compatibility Behavior
 

@@ -10,6 +10,7 @@ import {
 	isUltragoalAskBlocked,
 	isUltragoalBypassPrompt,
 	isUltragoalPauseBlocked,
+	readUltragoalVerificationState,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-guard";
 import {
 	countUltragoalNudges,
@@ -59,6 +60,36 @@ afterEach(async () => {
 });
 
 describe("ultragoal nudge guard", () => {
+	it("links a reworded goal to its ultragoal run through provenance", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+
+		const diagnostic = await readUltragoalVerificationState({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			currentGoal: {
+				objective: "Reworded after plan creation",
+				provenance: { source: "ultragoal", runId: TEST_SESSION_ID, goalId: "G001" },
+			},
+		});
+
+		expect(diagnostic.state).toBe("active_missing_final_receipt");
+	});
+
+	it("preserves legacy objective matching when goal provenance is absent", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+
+		const diagnostic = await readUltragoalVerificationState({
+			cwd,
+			sessionId: TEST_SESSION_ID,
+			currentGoal: { objective: "Unrelated reworded objective" },
+		});
+
+		expect(diagnostic.state).toBe("unrelated_goal");
+	});
 	// AC5: the escalating refusal text must never trip the bypass detector.
 	it("AC5: formatted nudge text never trips isUltragoalBypassPrompt for any surface", () => {
 		const surfaces: UltragoalNudgeSurface[] = ["pause", "drop", "ask", "premature_complete"];

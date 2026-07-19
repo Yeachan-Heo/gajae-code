@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
+import { createServer } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -35,6 +36,94 @@ async function exists(p: string): Promise<boolean> {
 	}
 }
 
+async function getAvailablePort(): Promise<number> {
+	const server = createServer();
+	const { promise, resolve, reject } = Promise.withResolvers<number>();
+	server.once("error", reject);
+	server.listen(0, "127.0.0.1", () => {
+		const address = server.address();
+		if (!address || typeof address === "string") {
+			reject(new Error("Failed to allocate a local TCP port"));
+			return;
+		}
+		server.close(error => {
+			if (error) reject(error);
+			else resolve(address.port);
+		});
+	});
+	return promise;
+}
+
+async function startRejectingGitServer(): Promise<{ url: string; stop: () => Promise<void> }> {
+	const server = createServer(socket => socket.destroy());
+	const { promise, resolve, reject } = Promise.withResolvers<number>();
+	server.once("error", reject);
+	server.listen(0, "127.0.0.1", () => {
+		const address = server.address();
+		if (!address || typeof address === "string") reject(new Error("Failed to start rejecting git server"));
+		else resolve(address.port);
+	});
+	const port = await promise;
+	return {
+		url: `git://127.0.0.1:${port}/no-such-repo.git`,
+		stop: async () => {
+			const { promise: closed, resolve: resolveClosed, reject: rejectClosed } = Promise.withResolvers<void>();
+			server.close(error => {
+				if (error) rejectClosed(error);
+				else resolveClosed();
+			});
+			await closed;
+		},
+	};
+}
+
+async function mkGitDaemonRepo(manifest: object): Promise<{ url: string; stop: () => Promise<void> }> {
+	const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-git-src-"));
+	tempDirs.push(base);
+	const repoDir = path.join(base, "plugin-repo");
+	await fs.mkdir(repoDir, { recursive: true });
+	await fs.writeFile(path.join(repoDir, "gajae-plugin.json"), JSON.stringify(manifest));
+	await fs.writeFile(path.join(repoDir, "README.md"), "# git-sourced plugin\n");
+	const gitEnv = {
+		...process.env,
+		GIT_AUTHOR_NAME: "t",
+		GIT_AUTHOR_EMAIL: "t@t",
+		GIT_COMMITTER_NAME: "t",
+		GIT_COMMITTER_EMAIL: "t@t",
+	};
+	expect(spawnSync("git", ["init", "-q", "-b", "main"], { cwd: repoDir, env: gitEnv }).status).toBe(0);
+	expect(spawnSync("git", ["add", "-A"], { cwd: repoDir, env: gitEnv }).status).toBe(0);
+	expect(spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: repoDir, env: gitEnv }).status).toBe(0);
+
+	const port = await getAvailablePort();
+	const url = `git://127.0.0.1:${port}/plugin-repo`;
+	const daemon = spawn(
+		"git",
+		["daemon", `--base-path=${base}`, "--export-all", "--listen=127.0.0.1", `--port=${port}`, "--reuseaddr"],
+		{ stdio: "ignore" },
+	);
+	const startedAt = Date.now();
+	while (true) {
+		if (daemon.exitCode !== null) throw new Error(`git daemon exited before readiness with code ${daemon.exitCode}`);
+		if (spawnSync("git", ["ls-remote", url, "HEAD"], { stdio: "ignore", timeout: 1_000 }).status === 0) break;
+		if (Date.now() - startedAt > 5_000) {
+			daemon.kill("SIGTERM");
+			throw new Error("git daemon did not become ready within 5 seconds");
+		}
+		await Bun.sleep(100);
+	}
+
+	return {
+		url,
+		stop: async () => {
+			if (daemon.exitCode !== null) return;
+			const { promise, resolve } = Promise.withResolvers<void>();
+			daemon.once("close", () => resolve());
+			daemon.kill("SIGTERM");
+			await promise;
+		},
+	};
+}
 describe("GJC plugin installer", () => {
 	test("installs a local-path bundle into the project scope", async () => {
 		const cwd = await mkProjectCwd();
@@ -114,14 +203,57 @@ describe("GJC plugin installer", () => {
 		const res = spawnSync("tar", ["-czf", tarball, "-C", sixSurface, "."], {
 			env: { ...process.env, COPYFILE_DISABLE: "1" },
 		});
-		if (res.status !== 0) {
-			// tar unavailable in this environment; skip without failing the suite.
-			return;
-		}
+		expect(res.status).toBe(0);
 		const result = await installGjcPluginBundle(tarball, { scope: "project", cwd });
 		expect(result.status).toBe("installed");
 		expect(await isGjcPluginBundleSource(tarball)).toBe(true);
 		const registry = await readRegistry("project", cwd);
 		expect(registry.plugins[0]?.source.kind).toBe("tarball");
+	});
+	test("installs a git source bundle via a local git daemon", async () => {
+		const served = await mkGitDaemonRepo({
+			kind: "gajae-code-plugin",
+			name: "git-source-bundle",
+			version: "1.0.0",
+			subskills: [],
+			tools: [],
+			hooks: [],
+			mcps: [],
+			system_appendix: [{ name: "git-policy", content: "policy body" }],
+			"agent-appendix": [],
+		});
+		const cwd = await mkProjectCwd();
+		try {
+			const result = await installGjcPluginBundle(served.url, { scope: "project", cwd });
+			expect(result.status).toBe("installed");
+			expect(result.entry.source.kind).toBe("git");
+			expect(result.entry.source.uri).toBe(served.url);
+
+			const installedDir = path.join(cwd, ".gjc", "gjc-plugins", "git-source-bundle");
+			expect(await exists(path.join(installedDir, "gajae-plugin.json"))).toBe(true);
+
+			const registry = await readRegistry("project", cwd);
+			expect(registry.plugins.map(p => p.name)).toEqual(["git-source-bundle"]);
+			expect(registry.plugins[0]?.source.kind).toBe("git");
+			expect(typeof registry.plugins[0]?.source.sha).toBe("string");
+		} finally {
+			await served.stop();
+		}
+	});
+
+	test("an invalid git source maps stderr to GjcPluginLoadError(install_conflict)", async () => {
+		const cwd = await mkProjectCwd();
+		const rejectingServer = await startRejectingGitServer();
+		try {
+			await expect(installGjcPluginBundle(rejectingServer.url, { scope: "project", cwd })).rejects.toMatchObject({
+				code: "install_conflict",
+				name: "GjcPluginLoadError",
+			});
+		} finally {
+			await rejectingServer.stop();
+		}
+		const registry = await readRegistry("project", cwd);
+		expect(registry.plugins).toEqual([]);
+		expect(await exists(path.join(cwd, ".gjc", "gjc-plugins", "no-such-repo"))).toBe(false);
 	});
 });

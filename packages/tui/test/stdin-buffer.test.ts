@@ -76,14 +76,49 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual(["\x1b[<35;20;5m"]);
 		});
 
-		it("should flush incomplete sequence after timeout", async () => {
+		it("should discard incomplete SGR mouse reports after timeout", async () => {
 			processInput("\x1b[<35");
 			expect(emittedSequences).toEqual([]);
 
 			// Wait for timeout
 			await Bun.sleep(15);
 
-			expect(emittedSequences).toEqual(["\x1b[<35"]);
+			expect(emittedSequences).toEqual([]);
+		});
+
+		it("quarantines delayed SGR suffix chunks and preserves trailing text", async () => {
+			processInput("\x1b[<0;4");
+			await Bun.sleep(15);
+			processInput(";5Mtail");
+			expect(emittedSequences).toEqual(["t", "a", "i", "l"]);
+		});
+
+		it("resynchronizes after a bounded SGR quarantine", async () => {
+			processInput("\x1b[<0;");
+			await Bun.sleep(15);
+			processInput(`${"1".repeat(256)}tail`);
+			expect(emittedSequences).toEqual(["t", "a", "i", "l"]);
+		});
+
+		it("resynchronizes immediately when the timed-out SGR suffix is already invalid", async () => {
+			processInput("\x1b[<0;x");
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["x"]);
+		});
+
+		it("preserves ordinary input and bracketed paste after a malformed delayed SGR report", async () => {
+			processInput("\x1b[<0;4");
+			await Bun.sleep(15);
+			processInput("xtext");
+			expect(emittedSequences).toEqual(["x", "t", "e", "x", "t"]);
+
+			const pasted: string[] = [];
+			buffer.on("paste", text => pasted.push(text));
+			emittedSequences = [];
+			processInput("\x1b[<0;4");
+			await Bun.sleep(15);
+			processInput("\x1b[200~pasted\x1b[201~");
+			expect(pasted).toEqual(["pasted"]);
 		});
 	});
 
@@ -148,6 +183,11 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual(["\x1b[<35;15;10m"]);
 		});
 
+		it("keeps trailing text after a malformed SGR report", () => {
+			processInput("\x1b[<-1;4;5Mtail");
+			expect(emittedSequences).toEqual(["t", "a", "i", "l"]);
+		});
+
 		it("should handle multiple mouse events", () => {
 			processInput("\x1b[<35;1;1m\x1b[<35;2;2m\x1b[<35;3;3m");
 			expect(emittedSequences).toEqual(["\x1b[<35;1;1m", "\x1b[<35;2;2m", "\x1b[<35;3;3m"]);
@@ -207,10 +247,10 @@ describe("StdinBuffer", () => {
 	});
 
 	describe("Flush", () => {
-		it("should flush incomplete sequences", () => {
+		it("should discard incomplete SGR mouse reports on flush", () => {
 			processInput("\x1b[<35");
 			const flushed = buffer.flush();
-			expect(flushed).toEqual(["\x1b[<35"]);
+			expect(flushed).toEqual([]);
 			expect(buffer.getBuffer()).toBe("");
 		});
 
@@ -219,14 +259,14 @@ describe("StdinBuffer", () => {
 			expect(flushed).toEqual([]);
 		});
 
-		it("should emit flushed data via timeout", async () => {
+		it("should not emit incomplete SGR mouse reports via timeout", async () => {
 			processInput("\x1b[<35");
 			expect(emittedSequences).toEqual([]);
 
 			// Wait for timeout to flush
 			await Bun.sleep(15);
 
-			expect(emittedSequences).toEqual(["\x1b[<35"]);
+			expect(emittedSequences).toEqual([]);
 		});
 	});
 

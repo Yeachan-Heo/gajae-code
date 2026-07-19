@@ -299,14 +299,14 @@ export function ensureReusableNodeModules(sourceRoot: string, worktreePath: stri
 	return "symlink";
 }
 
-export function prepareLaunchWorktree(
-	cwd: string,
-	args: string[],
-): {
+/** Result of {@link prepareLaunchWorktree}: the effective working directory, remaining args, and resolved worktree plan. */
+export interface PreparedLaunchWorktree {
 	cwd: string;
 	args: string[];
 	worktree: GjcLaunchWorktreeResult | { enabled: false };
-} {
+}
+
+export function prepareLaunchWorktree(cwd: string, args: string[]): PreparedLaunchWorktree {
 	const parsed = parseLaunchWorktreeMode(args);
 	const planned = planLaunchWorktree(cwd, parsed.mode);
 	const ensured = ensureLaunchWorktree(planned);
