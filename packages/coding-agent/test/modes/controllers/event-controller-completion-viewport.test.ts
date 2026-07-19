@@ -379,7 +379,11 @@ describe("EventController completion viewport", () => {
 							const firstRetryLoader = ctx.retryLoader;
 							expect(firstRetryLoader).toBeDefined();
 							if (!firstRetryLoader) throw new Error("retry start did not install a loader");
-							expect(statusContainer.children).toEqual([residualStatus, reserve, firstRetryLoader]);
+							expect(statusContainer.children).toEqual([
+								residualStatus,
+								...(reserve ? [reserve] : []),
+								firstRetryLoader,
+							]);
 
 							await controller.handleEvent({
 								type: "auto_retry_start",
@@ -393,7 +397,11 @@ describe("EventController completion viewport", () => {
 							expect(secondRetryLoader).toBeDefined();
 							if (!secondRetryLoader) throw new Error("repeated retry start did not replace the loader");
 							expect(secondRetryLoader).not.toBe(firstRetryLoader);
-							expect(statusContainer.children).toEqual([residualStatus, reserve, secondRetryLoader]);
+							expect(statusContainer.children).toEqual([
+								residualStatus,
+								...(reserve ? [reserve] : []),
+								secondRetryLoader,
+							]);
 
 							await controller.handleEvent({ type: "auto_retry_end", success: true, attempt: 2 });
 							await term.waitForRender();
