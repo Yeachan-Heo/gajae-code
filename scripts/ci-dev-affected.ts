@@ -300,10 +300,34 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 
 // `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
 // by tests and for debugging). Under GitHub Actions it also appends the dev-ci
-// planner outputs: `matrix` (the shard include list, excluding native-build
-// tasks), `has_tasks`, `has_native`, and the resolved `changed_paths` so every
-// downstream job reuses the planner's exact diff via CI_DEV_CHANGED_PATHS
-// instead of re-resolving the base ref on each runner.
+// planner outputs: `matrix`, `has_tasks`, `has_native`, and the canonical Darwin
+// smoke flag. Downstream jobs reuse the planner's exact diff via
+// CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
+// Paths that affect the compiled tab-worker smoke graph. Keep this authoritative
+// predicate in the planner: dev-ci consumes its emitted flag rather than copying
+// path checks into individual jobs.
+export function isDarwinArm64TabWorkerSmokePath(changedPath: string): boolean {
+	// The compiled worker recursively loads browser, eval, scraper, and utility
+	// helpers. Directory ownership is deliberately conservative so a newly-added
+	// helper in those graph roots cannot silently bypass the Darwin smoke.
+	return changedPath.startsWith("packages/coding-agent/src/tools/browser/") ||
+		changedPath.startsWith("packages/coding-agent/src/eval/js/") ||
+		changedPath.startsWith("packages/coding-agent/src/web/scrapers/") ||
+		changedPath.startsWith("packages/coding-agent/src/utils/") ||
+		changedPath.startsWith("packages/utils/src/") ||
+		changedPath === "packages/coding-agent/src/tools/tool-errors.ts" ||
+		changedPath === "packages/coding-agent/src/tools/path-utils.ts" ||
+		changedPath === "packages/coding-agent/src/cli.ts" ||
+		changedPath === "packages/coding-agent/scripts/build-binary.ts" ||
+		changedPath === "packages/coding-agent/scripts/compile-args.ts" ||
+		changedPath.startsWith("packages/natives/") ||
+		changedPath === "scripts/ci-build-native.ts";
+}
+
+export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolean {
+	return paths.some(isDarwinArm64TabWorkerSmokePath);
+}
+
 async function emitMatrix(): Promise<void> {
 	const sourceSha = await resolveSourceSha();
 	await requireCommitObject(sourceSha, "source head");
@@ -323,10 +347,12 @@ async function emitMatrix(): Promise<void> {
 		.filter(entry => !entry.nativeBuild)
 		.map(entry => ({ key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest }));
 	const hasNative = entries.some(entry => entry.nativeBuild);
+	const hasDarwinArm64TabWorkerSmoke = needsDarwinArm64TabWorkerSmoke(paths);
 	const lines = [
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
 		`has_native=${hasNative}`,
+		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,
@@ -575,6 +601,9 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 			}
 		}
 	}
+	if (needsDarwinArm64TabWorkerSmoke(paths)) {
+		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
+	}
 
 	if (toolingScriptChanged && !fullWorkspace && !ciOnly && !workflowHarnessOnly) {
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "ci:check:full"]);
@@ -716,6 +745,9 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		}
 	}
 
+	if (needsDarwinArm64TabWorkerSmoke(relevant)) {
+		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
+	}
 	if (needCiSelftest) {
 		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts"]);
 		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
@@ -1286,6 +1318,8 @@ export interface AffectedAggregateResults {
 	windowsDoctorRequired: string;
 	hasNative: string;
 	hasTasks: string;
+	darwinArm64TabWorkerSmoke: string;
+	darwinArm64TabWorkerSmokeRequired: string;
 }
 
 export function validateAffectedAggregate(results: AffectedAggregateResults): void {
@@ -1296,6 +1330,8 @@ export function validateAffectedAggregate(results: AffectedAggregateResults): vo
 	if (results.shards !== (results.hasTasks === "true" ? "success" : "skipped")) throw new Error(results.hasTasks === "true" ? "required affected shards did not succeed" : "unplanned affected shards were not skipped");
 	if (results.windowsDoctorRequired !== "true" && results.windowsDoctorRequired !== "false") throw new Error(`planner emitted invalid windows_doctor_required=${results.windowsDoctorRequired}`);
 	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
+	if (results.darwinArm64TabWorkerSmokeRequired !== "true" && results.darwinArm64TabWorkerSmokeRequired !== "false") throw new Error(`planner emitted invalid darwin_arm64_tab_worker_smoke_required=${results.darwinArm64TabWorkerSmokeRequired}`);
+	if (results.darwinArm64TabWorkerSmoke !== (results.darwinArm64TabWorkerSmokeRequired === "true" ? "success" : "skipped")) throw new Error(results.darwinArm64TabWorkerSmokeRequired === "true" ? "required Darwin arm64 tab-worker smoke did not succeed" : "unplanned Darwin arm64 tab-worker smoke was not skipped");
 }
 
 async function validateAggregate(): Promise<void> {
@@ -1307,6 +1343,8 @@ async function validateAggregate(): Promise<void> {
 		windowsDoctorRequired: Bun.env.CI_DEV_WINDOWS_DOCTOR_REQUIRED?.trim() || "",
 		hasNative: Bun.env.CI_DEV_HAS_NATIVE?.trim() || "",
 		hasTasks: Bun.env.CI_DEV_HAS_TASKS?.trim() || "",
+		darwinArm64TabWorkerSmoke: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT?.trim() || "",
+		darwinArm64TabWorkerSmokeRequired: Bun.env.CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED?.trim() || "",
 	};
 
 
@@ -1317,6 +1355,8 @@ async function validateAggregate(): Promise<void> {
 	console.log(`planned shard work: ${results.hasTasks}`);
 	console.log(`windows-dev-doctor: ${results.windowsDoctor}`);
 	console.log(`planned Windows dev:doctor: ${results.windowsDoctorRequired}`);
+	console.log(`darwin-arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmoke}`);
+	console.log(`planned Darwin arm64 tab-worker smoke: ${results.darwinArm64TabWorkerSmokeRequired}`);
 	validateAffectedAggregate(results);
 	const tasks = await loadCanonicalPlan();
 	if (!tasks) throw new Error("affected-plan-invalid: aggregate requires a canonical plan");
@@ -1395,13 +1435,47 @@ function canonicalReplayScope(): ReplayScope {
 	return { repository: requiredEnv("GITHUB_REPOSITORY"), workflow: requiredEnv("GITHUB_WORKFLOW"), runId: requiredEnv("GITHUB_RUN_ID") };
 }
 function aggregateFromEnv(): AffectedAggregateResults {
-	return { plan: requiredEnv("CI_DEV_PLAN_RESULT"), native: requiredEnv("CI_DEV_NATIVE_RESULT"), shards: requiredEnv("CI_DEV_SHARDS_RESULT"), windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"), windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"), hasNative: requiredEnv("CI_DEV_HAS_NATIVE"), hasTasks: requiredEnv("CI_DEV_HAS_TASKS") };
+	return {
+		plan: requiredEnv("CI_DEV_PLAN_RESULT"),
+		native: requiredEnv("CI_DEV_NATIVE_RESULT"),
+		shards: requiredEnv("CI_DEV_SHARDS_RESULT"),
+		windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"),
+		windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"),
+		hasNative: requiredEnv("CI_DEV_HAS_NATIVE"),
+		hasTasks: requiredEnv("CI_DEV_HAS_TASKS"),
+		darwinArm64TabWorkerSmoke: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT"),
+		darwinArm64TabWorkerSmokeRequired: requiredEnv("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED"),
+	};
 }
 function parseAggregate(value: unknown): AffectedAggregateResults {
 	if (!isRecord(value)) throw evidenceError("malformed aggregate results");
-	exactKeys(value, ["plan", "native", "shards", "windowsDoctor", "windowsDoctorRequired", "hasNative", "hasTasks"], "unexpected aggregate results field");
+	exactKeys(
+		value,
+		[
+			"plan",
+			"native",
+			"shards",
+			"windowsDoctor",
+			"windowsDoctorRequired",
+			"hasNative",
+			"hasTasks",
+			"darwinArm64TabWorkerSmoke",
+			"darwinArm64TabWorkerSmokeRequired",
+		],
+		"unexpected aggregate results field",
+	);
 	if (!Object.values(value).every(isString)) throw evidenceError("malformed aggregate results");
-	return { plan: value.plan as string, native: value.native as string, shards: value.shards as string, windowsDoctor: value.windowsDoctor as string, windowsDoctorRequired: value.windowsDoctorRequired as string, hasNative: value.hasNative as string, hasTasks: value.hasTasks as string };
+	return {
+		plan: value.plan as string,
+		native: value.native as string,
+		shards: value.shards as string,
+		windowsDoctor: value.windowsDoctor as string,
+		windowsDoctorRequired: value.windowsDoctorRequired as string,
+		hasNative: value.hasNative as string,
+		hasTasks: value.hasTasks as string,
+		darwinArm64TabWorkerSmoke: value.darwinArm64TabWorkerSmoke as string,
+		darwinArm64TabWorkerSmokeRequired: value.darwinArm64TabWorkerSmokeRequired as string,
+	};
 }
 function parseReplayScope(value: unknown): ReplayScope {
 	if (!isRecord(value)) throw evidenceError("malformed replay scope");

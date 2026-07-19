@@ -25,6 +25,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       has_tasks: ${{ steps.plan.outputs.has_tasks }}
       has_native: ${{ steps.plan.outputs.has_native }}
+      has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}
       changed_paths: ${{ steps.plan.outputs.changed_paths }}
       plan_mode: ${{ steps.plan.outputs.plan_mode }}
       plan_digest: ${{ steps.plan.outputs.plan_digest }}
@@ -190,6 +191,78 @@ jobs:
           retention-days: 1
           overwrite: true
 
+  # Darwin arm64 builds the checked-out PR head end-to-end for every compiled
+  # tab-worker smoke-graph path. The planner emits this canonical relevance flag.
+  affected-darwin-arm64-tab-worker-smoke:
+    name: Affected path validation / darwin-arm64 tab-worker smoke
+    needs: [affected-plan]
+    if: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' }}
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+          node -e 'if (process.platform !== "darwin" || process.arch !== "arm64") { throw new Error(`Expected darwin/arm64, got ${process.platform}/${process.arch}`) }'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: dev-affected-darwin-arm64-tab-worker
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - name: Build native addon (darwin-arm64)
+        env:
+          TARGET_PLATFORM: darwin
+          TARGET_ARCH: arm64
+        run: bun run ci:build:native
+      - name: Build darwin-arm64 coding-agent binary
+        run: bun --cwd=packages/coding-agent run build
+      - name: Smoke compiled tab worker with fresh owner directories
+        shell: bash
+        run: |
+          runtime_dir="$(mktemp -d)"
+          mkdir -p "$runtime_dir/home" "$runtime_dir/xdg"
+          HOME="$runtime_dir/home" XDG_CONFIG_HOME="$runtime_dir/xdg/config" XDG_DATA_HOME="$runtime_dir/xdg/data" XDG_CACHE_HOME="$runtime_dir/xdg/cache" packages/coding-agent/dist/gjc --smoke-test
+          printf 'CI_DEV_DARWIN_SMOKE_HOME=%s\n' "$runtime_dir/home" >> "$GITHUB_ENV"
+          printf 'CI_DEV_DARWIN_SMOKE_XDG_CONFIG_HOME=%s\n' "$runtime_dir/xdg/config" >> "$GITHUB_ENV"
+          printf 'CI_DEV_DARWIN_SMOKE_XDG_DATA_HOME=%s\n' "$runtime_dir/xdg/data" >> "$GITHUB_ENV"
+          printf 'CI_DEV_DARWIN_SMOKE_XDG_CACHE_HOME=%s\n' "$runtime_dir/xdg/cache" >> "$GITHUB_ENV"
+      - name: Write immutable Darwin smoke receipt
+        env:
+          CI_DEV_DARWIN_BINARY: packages/coding-agent/dist/gjc
+          CI_DEV_DARWIN_NATIVE_ADDON: packages/natives/native/pi_natives.darwin-arm64.node
+        run: bun scripts/ci-validate-darwin-receipt.ts --write
+      - name: Upload Darwin smoke receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-affected-darwin-receipt-${{ github.run_id }}
+          path: .ci-dev-darwin-arm64-receipt.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
   # One shard per planned task on the broad runner. Native build tasks are
   # excluded (they run in affected-native); shards that load the native addon at
   # runtime download the prebuilt artifact instead of rebuilding it.
@@ -301,7 +374,7 @@ jobs:
   affected-evidence-producer:
     name: Affected path validation / evidence producer
     if: ${{ always() }}
-    needs: [affected-plan, affected-native, affected-shards, windows-dev-doctor]
+    needs: [affected-plan, affected-native, affected-shards, windows-dev-doctor, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     outputs:
@@ -339,6 +412,18 @@ jobs:
           pattern: dev-affected-shard-${{ github.run_id }}-*
           path: .ci-dev-shard-receipts
           merge-multiple: true
+      - name: Validate canonical shard completion
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-shards.result == 'success' }}
+        run: bun scripts/ci-dev-affected.ts --validate-shard-receipts
+      - name: Download Darwin smoke receipt
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && needs.affected-darwin-arm64-tab-worker-smoke.result == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dev-affected-darwin-receipt-${{ github.run_id }}
+          path: .
+      - name: Validate Darwin smoke receipt
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && needs.affected-darwin-arm64-tab-worker-smoke.result == 'success' }}
+        run: bun scripts/ci-validate-darwin-receipt.ts
       - name: Produce affected evidence
         env:
           CI_DEV_PLAN_RESULT: ${{ needs.affected-plan.result }}
@@ -348,6 +433,8 @@ jobs:
           CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
           CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
           CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+          CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-darwin-arm64-tab-worker-smoke.result }}
+          CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke }}
         run: bun scripts/ci-dev-affected.ts --write-affected-evidence
       - name: Upload affected evidence
         id: upload-evidence
@@ -359,6 +446,7 @@ jobs:
             .ci-dev-affected-evidence.receipt.json
             .ci-dev-affected-plan.json
             .ci-dev-shard-receipts
+            .ci-dev-darwin-arm64-receipt.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
@@ -382,6 +470,8 @@ jobs:
       CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
       CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
       CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+      CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && 'success' || 'skipped' }}
+      CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke }}
     steps:
       - name: Fail closed on producer and live dependency results
         env:
@@ -416,6 +506,11 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.3"
+      - name: Validate finalized Darwin smoke receipt
+        if: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' }}
+        env:
+          CI_DEV_DARWIN_RECEIPT: ${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-darwin-arm64-receipt.json
+        run: bun scripts/ci-validate-darwin-receipt.ts
       - name: Validate finalized affected evidence
         env:
           CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence

@@ -15,10 +15,10 @@ import { pluralize } from "@gajae-code/utils";
 import { settings } from "../config/settings";
 import type { Theme } from "../modes/theme/theme";
 import { Hasher } from "../tui/utils";
-import { formatDimensionNote, type ResizedImage } from "../utils/image-resize";
 
 export { Ellipsis } from "@gajae-code/natives";
 export { replaceTabs, truncateToWidth, wrapTextWithAnsi } from "@gajae-code/tui";
+export { formatScreenshot } from "./browser/screenshot-format";
 
 // =============================================================================
 // Standardized Display Constants
@@ -589,32 +589,6 @@ export function formatToolWorkingDirectory(workdir: string | undefined, projectD
 		relativePath.length > 0 && !relativePath.startsWith("..") && !relativePath.startsWith(`..${path.sep}`);
 	const displayWorkdir = isWithinProject ? relativePath : shortenPath(resolvedWorkdir);
 	return replaceTabs(displayWorkdir);
-}
-
-export function formatScreenshot(opts: {
-	saveFullRes: boolean;
-	savedMimeType: string;
-	savedByteLength: number;
-	dest: string;
-	resized: ResizedImage;
-}): string[] {
-	const lines = ["Screenshot captured"];
-	if (opts.saveFullRes) {
-		lines.push(
-			`Saved: ${opts.savedMimeType} (${(opts.savedByteLength / 1024).toFixed(2)} KB) to ${shortenPath(opts.dest)}`,
-		);
-		lines.push(
-			`Model: ${opts.resized.mimeType} (${(opts.resized.buffer.length / 1024).toFixed(2)} KB, ${opts.resized.width}x${opts.resized.height})`,
-		);
-	} else {
-		lines.push(`Format: ${opts.resized.mimeType} (${(opts.resized.buffer.length / 1024).toFixed(2)} KB)`);
-		lines.push(`Dimensions: ${opts.resized.width}x${opts.resized.height}`);
-	}
-	const dimensionNote = formatDimensionNote(opts.resized);
-	if (dimensionNote) {
-		lines.push(dimensionNote);
-	}
-	return lines;
 }
 
 export function wrapBrackets(text: string, theme: Theme): string {

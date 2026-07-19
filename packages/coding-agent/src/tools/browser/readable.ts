@@ -1,6 +1,6 @@
 import { Readability } from "@mozilla/readability";
 import { parseHtmlLazy } from "../../utils/linkedom";
-import { htmlToBasicMarkdown } from "../../web/scrapers/types";
+import { htmlToBasicMarkdown } from "../../web/scrapers/html-to-markdown";
 
 export type ReadableFormat = "text" | "markdown";
 

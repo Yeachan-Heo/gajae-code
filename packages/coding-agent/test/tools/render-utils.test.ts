@@ -11,6 +11,7 @@ import {
 	getPreviewLines,
 	shortenPath,
 } from "@gajae-code/coding-agent/tools/render-utils";
+import { formatScreenshot as formatBrowserScreenshot } from "../../src/tools/browser/screenshot-format";
 
 describe("parse error formatting", () => {
 	it("deduplicates parse errors while preserving order", () => {
@@ -43,6 +44,9 @@ describe("parse error formatting", () => {
 });
 
 describe("formatScreenshot", () => {
+	it("re-exports the browser formatter implementation", () => {
+		expect(formatScreenshot).toBe(formatBrowserScreenshot);
+	});
 	function fakeResized(
 		overrides?: Partial<{
 			width: number;

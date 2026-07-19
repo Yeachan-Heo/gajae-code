@@ -2,7 +2,7 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, loadBuildInventory, normalizeChangedPaths, packageScriptCommand, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, normalizeChangedPaths, packageScriptCommand, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 
 // Matrix planning validates live workspace and Cargo manifests in subprocesses.
 // Hosted runners can need more than Bun's 5s default during their first cold scan.
@@ -97,12 +97,40 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(protectedJob.slice(preparationStart, preparationEnd)).toContain("CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence");
 		expect(protectedJob.slice(validationStart)).toContain("CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence");
 	});
+	test("gates exact-head Darwin tab-worker evidence through detached affected evidence", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		expect(workflow).toContain("has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}");
+		expect(workflow).toContain("affected-darwin-arm64-tab-worker-smoke:");
+		expect(workflow).toContain("runs-on: macos-14");
+		expect(workflow).toContain("TARGET_PLATFORM: darwin");
+		expect(workflow).toContain("TARGET_ARCH: arm64");
+		expect(workflow).toContain("process.platform");
+		expect(workflow).toContain("process.arch");
+		expect(workflow).toContain("Write immutable Darwin smoke receipt");
+		expect(workflow).toContain("dev-affected-darwin-receipt-${{ github.run_id }}");
+		expect(workflow).toContain("Download Darwin smoke receipt");
+		expect(workflow).toContain("Validate Darwin smoke receipt");
+		expect(workflow).toContain(".ci-dev-darwin-arm64-receipt.json");
+		expect(workflow).toContain("Validate finalized Darwin smoke receipt");
+		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT");
+		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED");
+	});
 
 	describe("detached evidence subprocess contract", () => {
 		const scriptPath = path.join(import.meta.dir, "ci-dev-affected.ts");
 		const repoRoot = path.join(import.meta.dir, "..");
 		const sourceSha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
-		const baseAggregate = { plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false" };
+		const baseAggregate = {
+			plan: "success",
+			native: "skipped",
+			shards: "skipped",
+			windowsDoctor: "skipped",
+			windowsDoctorRequired: "false",
+			hasNative: "false",
+			hasTasks: "false",
+			darwinArm64TabWorkerSmoke: "skipped",
+			darwinArm64TabWorkerSmokeRequired: "false",
+		};
 		type EvidenceFixture = { root: string; env: Record<string, string>; plan: string; digest: string };
 
 		async function fixture(tasks: unknown[] = []): Promise<EvidenceFixture> {
@@ -115,6 +143,8 @@ describe("dev-ci canonical-plan workflow contract", () => {
 				CI_DEV_SOURCE_SHA: sourceSha, CI_DEV_PLAN_DIGEST: digest, CI_DEV_PLAN_MODE: "pr", GITHUB_REPOSITORY: "owner/repo", GITHUB_WORKFLOW: "Dev CI", GITHUB_RUN_ID: "42",
 				CI_DEV_PLAN_RESULT: baseAggregate.plan, CI_DEV_NATIVE_RESULT: baseAggregate.native, CI_DEV_SHARDS_RESULT: baseAggregate.shards, CI_DEV_WINDOWS_DOCTOR_RESULT: baseAggregate.windowsDoctor,
 				CI_DEV_WINDOWS_DOCTOR_REQUIRED: baseAggregate.windowsDoctorRequired, CI_DEV_HAS_NATIVE: baseAggregate.hasNative, CI_DEV_HAS_TASKS: baseAggregate.hasTasks,
+				CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: baseAggregate.darwinArm64TabWorkerSmoke,
+				CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: baseAggregate.darwinArm64TabWorkerSmokeRequired,
 			};
 			return { root, env, plan, digest };
 		}
@@ -292,10 +322,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 
 	test("aggregate result truth table rejects every missing, failed, cancelled, and unplanned dependency", () => {
 		const valid: AffectedAggregateResults[] = [
-			{ plan: "success", native: "success", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "true", hasTasks: "true" },
-			{ plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false" },
-			{ plan: "success", native: "success", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "true", hasTasks: "false" },
-			{ plan: "success", native: "skipped", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "false", hasTasks: "true" },
+			{ plan: "success", native: "success", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "true", hasTasks: "true", darwinArm64TabWorkerSmoke: "success", darwinArm64TabWorkerSmokeRequired: "true" },
+			{ plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
+			{ plan: "success", native: "success", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "true", hasTasks: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
+			{ plan: "success", native: "skipped", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "false", hasTasks: "true", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
 		];
 		for (const results of valid) expect(() => validateAffectedAggregate(results)).not.toThrow();
 
@@ -310,6 +340,12 @@ describe("dev-ci canonical-plan workflow contract", () => {
 			{ ...valid[0]!, windowsDoctor: "failure" },
 			{ ...valid[0]!, windowsDoctor: "cancelled" },
 			{ ...valid[0]!, windowsDoctor: "skipped" },
+			{ ...valid[0]!, darwinArm64TabWorkerSmoke: "failure" },
+			{ ...valid[0]!, darwinArm64TabWorkerSmoke: "cancelled" },
+			{ ...valid[0]!, darwinArm64TabWorkerSmoke: "skipped" },
+			{ ...valid[1]!, darwinArm64TabWorkerSmoke: "success" },
+			{ ...valid[1]!, darwinArm64TabWorkerSmokeRequired: "" },
+			{ ...valid[1]!, darwinArm64TabWorkerSmokeRequired: "maybe" },
 			{ ...valid[1]!, windowsDoctor: "success" },
 			{ ...valid[1]!, windowsDoctorRequired: "" },
 			{ ...valid[1]!, windowsDoctorRequired: "maybe" },
@@ -648,6 +684,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(pr.exitCode).toBe(0);
 		expect((JSON.parse(pr.stdout.trim()) as Array<{ key: string }>).map(entry => entry.key)).toEqual([
 			"check:@gajae-code/natives",
+			"install-methods",
 			"native-linux-x64",
 			"ts-build:ts:Y29kaW5nLWFnZW50:cGFja2FnZXMvY29kaW5nLWFnZW50",
 			"ts-build:ts:c3RhdHM:cGFja2FnZXMvc3RhdHM",
@@ -665,6 +702,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
 			"check:@gajae-code/typescript-edit-benchmark", "test:@gajae-code/typescript-edit-benchmark",
 			"check:@gajae-code/utils", "test:@gajae-code/utils",
+			"install-methods",
 			"native-linux-x64",
 			"ts-build:ts:Y29kaW5nLWFnZW50:cGFja2FnZXMvY29kaW5nLWFnZW50",
 			"ts-build:ts:c3RhdHM:cGFja2FnZXMvc3RhdHM",
@@ -882,6 +920,42 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			native: true,
 			nativeBuild: false,
 		});
+	});
+
+test("tab-worker graph changes always include install-methods and are Darwin relevant", () => {
+		for (const changedPath of [
+			"packages/coding-agent/src/tools/browser/tab-worker-entry.ts",
+			"packages/coding-agent/src/tools/browser/new-worker-helper.ts",
+			"packages/coding-agent/src/tools/browser/launch.ts",
+			"packages/coding-agent/src/tools/browser/readable.ts",
+			"packages/coding-agent/src/tools/browser/screenshot-format.ts",
+			"packages/coding-agent/src/eval/js/shared/runtime.ts",
+			"packages/coding-agent/src/eval/js/new-eval-helper.ts",
+			"packages/coding-agent/src/web/scrapers/html-to-markdown.ts",
+			"packages/coding-agent/src/web/scrapers/new-scraper-helper.ts",
+			"packages/coding-agent/src/utils/linkedom.ts",
+			"packages/coding-agent/src/utils/new-browser-safe-helper.ts",
+			"packages/utils/src/new-worker-safe-helper.ts",
+			"packages/coding-agent/src/tools/tool-errors.ts",
+			"packages/coding-agent/src/tools/path-utils.ts",
+			"packages/coding-agent/src/cli.ts",
+			"packages/coding-agent/scripts/compile-args.ts",
+			"packages/coding-agent/scripts/build-binary.ts",
+			"packages/natives/native/index.js",
+			"scripts/ci-build-native.ts",
+		]) {
+			expect(isDarwinArm64TabWorkerSmokePath(changedPath)).toBe(true);
+			expect(needsDarwinArm64TabWorkerSmoke([changedPath])).toBe(true);
+			expect(targeted([changedPath]).map(task => task.key)).toContain("install-methods");
+			expect(planTasks([changedPath], targetingPackages).map(task => task.key)).toContain("install-methods");
+		}
+	});
+
+	test("irrelevant changes skip the Darwin smoke and install-methods", () => {
+		const paths = ["packages/coding-agent/src/edit/foo.ts"];
+		expect(needsDarwinArm64TabWorkerSmoke(paths)).toBe(false);
+		expect(targeted(paths).map(task => task.key)).not.toContain("install-methods");
+		expect(planTasks(paths, targetingPackages).map(task => task.key)).not.toContain("install-methods");
 	});
 
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
