@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@gajae-code/tui";
-import { $env, sanitizeText } from "@gajae-code/utils";
+import { $env, formatBytes, sanitizeText } from "@gajae-code/utils";
 import { type AppKeybinding, KEYBINDINGS } from "../../config/keybindings";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
@@ -24,7 +24,7 @@ import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
-import { formatPastedImageReference, resolvePastedImagePath } from "../../utils/pasted-image-path";
+import { formatPastedImageReference, resolvePastedImagePaths } from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { ActionRegistry, APP_ACTION_METADATA } from "../action-registry";
 import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } from "../components/command-palette";
@@ -43,6 +43,8 @@ const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
 const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
 const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
+export const MAX_PASTED_IMAGE_COUNT = 16;
+export const MAX_PASTED_IMAGE_AGGREGATE_BYTES = 64 * 1024 * 1024;
 
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
@@ -1523,8 +1525,8 @@ export class InputController {
 	}
 
 	handleTextPaste(text: string): boolean | Promise<boolean> {
-		const imagePath = resolvePastedImagePath(text, { cwd: this.ctx.sessionManager.getCwd() });
-		return imagePath ? this.#attachPastedImagePath(imagePath) : false;
+		const imagePaths = resolvePastedImagePaths(text, { cwd: this.ctx.sessionManager.getCwd() });
+		return imagePaths && imagePaths.length > 0 ? this.#attachPastedImagePaths(imagePaths) : false;
 	}
 
 	/**
@@ -1532,28 +1534,59 @@ export class InputController {
 	 * bracketed paste — the raw path text must never be lost when attachment
 	 * is impossible (unsupported content, oversized image, load error).
 	 */
-	async #attachPastedImagePath(imagePath: string): Promise<boolean> {
-		try {
-			const image = await loadImageInput({
-				path: imagePath,
-				cwd: this.ctx.sessionManager.getCwd(),
-				autoResize: this.ctx.settings.get("images.autoResize"),
-			});
-			if (!image) {
-				this.ctx.showStatus("Unsupported pasted image file");
-				return false;
-			}
+	async #attachPastedImagePaths(imagePaths: readonly string[]): Promise<boolean> {
+		if (imagePaths.length > MAX_PASTED_IMAGE_COUNT) {
+			this.ctx.showStatus(`Cannot attach ${imagePaths.length} pasted images; maximum is ${MAX_PASTED_IMAGE_COUNT}.`);
+			return false;
+		}
 
-			this.ctx.pendingImages = [
-				...this.ctx.pendingImages,
-				{
+		try {
+			const loadedImages: InteractiveModeContext["pendingImages"] = [];
+			const resolvedPaths: string[] = [];
+			let aggregateBytes = 0;
+			for (const imagePath of imagePaths) {
+				const image = await loadImageInput({
+					path: imagePath,
+					cwd: this.ctx.sessionManager.getCwd(),
+					autoResize: this.ctx.settings.get("images.autoResize"),
+				});
+				if (!image) {
+					const status =
+						imagePaths.length === 1
+							? "Unsupported pasted image file"
+							: `Unsupported pasted image file: ${path.basename(imagePath)}`;
+					this.ctx.showStatus(status);
+					return false;
+				}
+
+				aggregateBytes += image.bytes;
+				if (aggregateBytes > MAX_PASTED_IMAGE_AGGREGATE_BYTES) {
+					this.ctx.showStatus(
+						`Pasted images total ${formatBytes(aggregateBytes)}, exceeding the ${formatBytes(MAX_PASTED_IMAGE_AGGREGATE_BYTES)} aggregate limit.`,
+					);
+					return false;
+				}
+				loadedImages.push({
 					type: "image",
 					data: image.data,
 					mimeType: image.mimeType,
-				},
-			];
-			this.ctx.editor.insertText(`${formatPastedImageReference(this.#nextImagePlaceholder(), image.resolvedPath)} `);
-			this.ctx.showStatus(`Attached image: ${path.basename(image.resolvedPath)}`, { dim: true });
+				});
+				resolvedPaths.push(image.resolvedPath);
+			}
+
+			const pendingImages = this.ctx.pendingImages;
+			const firstImageNumber = pendingImages.length + 1;
+			const references = resolvedPaths.map((resolvedPath, index) =>
+				formatPastedImageReference(`[image ${firstImageNumber + index}]`, resolvedPath),
+			);
+			this.ctx.editor.insertText(`${references.join(" ")} `);
+			this.ctx.pendingImages = [...pendingImages, ...loadedImages];
+			const singularResolvedPath = resolvedPaths.length === 1 ? resolvedPaths[0] : undefined;
+			if (singularResolvedPath) {
+				this.ctx.showStatus(`Attached image: ${path.basename(singularResolvedPath)}`, { dim: true });
+			} else {
+				this.ctx.showStatus(`Attached ${resolvedPaths.length} images`, { dim: true });
+			}
 			this.ctx.ui.requestRender();
 			return true;
 		} catch (error) {
@@ -1561,7 +1594,9 @@ export class InputController {
 				this.ctx.showStatus(error.message);
 				return false;
 			}
-			this.ctx.showStatus("Failed to attach pasted image");
+			this.ctx.showStatus(
+				imagePaths.length === 1 ? "Failed to attach pasted image" : "Failed to attach pasted images",
+			);
 			return false;
 		}
 	}

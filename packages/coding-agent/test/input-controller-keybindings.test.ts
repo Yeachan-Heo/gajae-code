@@ -5,10 +5,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
-import { InputController } from "../src/modes/controllers/input-controller";
+import {
+	InputController,
+	MAX_PASTED_IMAGE_AGGREGATE_BYTES,
+	MAX_PASTED_IMAGE_COUNT,
+} from "../src/modes/controllers/input-controller";
 import { initTheme } from "../src/modes/theme/theme";
 import type { CompactionQueuedMessage, ComposerSubmissionOptions, InteractiveModeContext } from "../src/modes/types";
 import type { QueuedMessageEditEntry } from "../src/session/agent-session";
+import { MAX_IMAGE_INPUT_BYTES } from "../src/utils/image-loading";
+import { formatPastedImageReference } from "../src/utils/pasted-image-path";
 
 type FakeEditor = {
 	onEscape?: () => void;
@@ -923,7 +929,7 @@ describe("InputController keybinding setup", () => {
 	});
 });
 
-describe("InputController pasted clipboard image paths", () => {
+describe("InputController pasted image paths", () => {
 	const RED_1X1_PNG_BASE64 =
 		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
@@ -944,6 +950,117 @@ describe("InputController pasted clipboard image paths", () => {
 			expect(spies.showStatus).toHaveBeenCalledWith(`Attached image: ${imagePath.split("/").at(-1)}`, { dim: true });
 		} finally {
 			await fs.rm(imagePath, { force: true });
+		}
+	});
+
+	it("atomically attaches multiple saved image paths in source order with one editor update", async () => {
+		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pasted-images-"));
+		const firstPath = path.join(tempDirectory, "first.png");
+		const secondPath = path.join(tempDirectory, "second.gif");
+		await Bun.write(firstPath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(secondPath, Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			ctx.pendingImages = [{ type: "image", data: "existing", mimeType: "image/png" }];
+			const insertText = vi.spyOn(editor, "insertText");
+			const requestRender = vi.spyOn(ctx.ui, "requestRender");
+			const controller = new InputController(ctx);
+
+			controller.setupKeyHandlers();
+			const handled = await editor.onPasteText?.(`${firstPath} ${secondPath}`);
+
+			expect(handled).toBe(true);
+			expect(editor.getText()).toBe(
+				`${formatPastedImageReference("[image 2]", firstPath)} ${formatPastedImageReference("[image 3]", secondPath)} `,
+			);
+			expect(ctx.pendingImages.map(image => image.mimeType)).toEqual(["image/png", "image/png", "image/gif"]);
+			expect(insertText).toHaveBeenCalledTimes(1);
+			expect(requestRender).toHaveBeenCalledTimes(1);
+			expect(spies.showStatus).toHaveBeenCalledWith("Attached 2 images", { dim: true });
+		} finally {
+			await fs.rm(tempDirectory, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects pasted image lists above the count limit without loading or attaching any image", async () => {
+		const imagePath = path.join(os.tmpdir(), `saved-count-limit-${process.pid.toString(36)}.png`);
+		await Bun.write(imagePath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			const requestRender = vi.spyOn(ctx.ui, "requestRender");
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+			const pastedText = Array.from({ length: MAX_PASTED_IMAGE_COUNT + 1 }, () => imagePath).join(" ");
+
+			const handled = await editor.onPasteText?.(pastedText);
+
+			expect(handled).toBe(false);
+			expect(editor.getText()).toBe("");
+			expect(ctx.pendingImages).toEqual([]);
+			expect(requestRender).not.toHaveBeenCalled();
+			expect(spies.showStatus).toHaveBeenCalledWith(
+				`Cannot attach ${MAX_PASTED_IMAGE_COUNT + 1} pasted images; maximum is ${MAX_PASTED_IMAGE_COUNT}.`,
+			);
+		} finally {
+			await fs.rm(imagePath, { force: true });
+		}
+	});
+
+	it("rejects pasted images above the aggregate loaded-byte limit without attaching any image", async () => {
+		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pasted-images-aggregate-"));
+		const imageBytes = MAX_PASTED_IMAGE_AGGREGATE_BYTES / 4 + 1;
+		const imagePaths = Array.from({ length: 4 }, (_, index) => path.join(tempDirectory, `image-${index}.png`));
+		for (const imagePath of imagePaths) {
+			await Bun.write(imagePath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+			await fs.truncate(imagePath, imageBytes);
+		}
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			const requestRender = vi.spyOn(ctx.ui, "requestRender");
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+
+			const handled = await editor.onPasteText?.(imagePaths.join(" "));
+
+			expect(handled).toBe(false);
+			expect(editor.getText()).toBe("");
+			expect(ctx.pendingImages).toEqual([]);
+			expect(requestRender).not.toHaveBeenCalled();
+			expect(spies.showStatus.mock.calls.at(-1)?.[0]).toContain("aggregate limit");
+		} finally {
+			await fs.rm(tempDirectory, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps an existing draft and attachments unchanged when any pasted image load fails", async () => {
+		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pasted-images-atomic-"));
+		const validPath = path.join(tempDirectory, "valid.png");
+		const oversizedPath = path.join(tempDirectory, "oversized.png");
+		await Bun.write(validPath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(oversizedPath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await fs.truncate(oversizedPath, MAX_IMAGE_INPUT_BYTES + 1);
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			const existingImage: InteractiveModeContext["pendingImages"][number] = {
+				type: "image",
+				data: "existing",
+				mimeType: "image/png",
+			};
+			ctx.pendingImages = [existingImage];
+			editor.setText("existing draft ");
+			const requestRender = vi.spyOn(ctx.ui, "requestRender");
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+
+			const handled = await editor.onPasteText?.(`${validPath} ${oversizedPath}`);
+
+			expect(handled).toBe(false);
+			expect(editor.getText()).toBe("existing draft ");
+			expect(ctx.pendingImages).toEqual([existingImage]);
+			expect(requestRender).not.toHaveBeenCalled();
+			expect(spies.showStatus.mock.calls.at(-1)?.[0]).toContain("Image file too large");
+		} finally {
+			await fs.rm(tempDirectory, { recursive: true, force: true });
 		}
 	});
 

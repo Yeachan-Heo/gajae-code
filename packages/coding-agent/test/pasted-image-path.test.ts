@@ -2,10 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as url from "node:url";
 import {
 	decodePastedPathCandidate,
+	decodePastedPathCandidates,
 	formatPastedImageReference,
 	resolvePastedImagePath,
+	resolvePastedImagePaths,
 } from "../src/utils/pasted-image-path";
 
 const NNBSP = "\u202f"; // narrow no-break space used by macOS screenshot names
@@ -134,6 +137,152 @@ describe("resolvePastedImagePath", () => {
 	it("rejects empty and whitespace-only pastes", () => {
 		expect(resolvePastedImagePath("")).toBeUndefined();
 		expect(resolvePastedImagePath("   ")).toBeUndefined();
+	});
+});
+
+describe("resolvePastedImagePaths", () => {
+	let testDir: string;
+
+	beforeEach(() => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pasted-images-"));
+	});
+
+	afterEach(() => {
+		fs.rmSync(testDir, { recursive: true, force: true });
+	});
+
+	const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+	function writeImage(name: string): string {
+		const filePath = path.join(testDir, name);
+		fs.writeFileSync(filePath, PNG_SIGNATURE);
+		return filePath;
+	}
+
+	it("accepts at least two saved image paths and preserves source order", () => {
+		const first = writeImage("first.png");
+		const second = writeImage("second.jpg");
+		expect(resolvePastedImagePaths(`${second} ${first} ${second}`)).toEqual([second, first, second]);
+	});
+
+	it("supports POSIX escapes plus single-quoted and double-quoted paths", () => {
+		const escaped = writeImage("escaped path.png");
+		const singleQuoted = writeImage("single quoted.jpg");
+		const doubleQuoted = writeImage("double quoted.webp");
+		const paste = `${escaped.replaceAll(" ", "\\ ")} '${singleQuoted}' "${doubleQuoted}"`;
+		expect(resolvePastedImagePaths(paste)).toEqual([escaped, singleQuoted, doubleQuoted]);
+	});
+
+	it("resolves a macOS multi-screenshot paste with escaped spaces and U+202F", () => {
+		const first = writeImage(`Screenshot 2026-07-19 at 3.21.27${NNBSP}PM.png`);
+		const second = writeImage(`Screenshot 2026-07-19 at 3.21.29${NNBSP}PM.png`);
+		const paste = `${first.replaceAll(" ", "\\ ")} ${second.replaceAll(" ", "\\ ")}`;
+		expect(resolvePastedImagePaths(paste)).toEqual([first, second]);
+	});
+
+	it("resolves complete lists of local file URLs", () => {
+		const first = writeImage("first uri.png");
+		const second = writeImage("second uri.jpg");
+		const paste = `${url.pathToFileURL(first).href}\n${url.pathToFileURL(second).href}`;
+		expect(resolvePastedImagePaths(paste)).toEqual([first, second]);
+	});
+
+	it("splits on ASCII whitespace while retaining U+202F inside screenshot names", () => {
+		const first = writeImage(`Screenshot${NNBSP}AM.png`);
+		const second = writeImage(`Screenshot${NNBSP}PM.png`);
+		expect(resolvePastedImagePaths(`\t${first}\r\n\f\v${second} `)).toEqual([first, second]);
+	});
+
+	it("resolves relative and home-relative paths for saved-image lists", () => {
+		const relative = writeImage("relative.png");
+		const homeRelative = writeImage("home.jpg");
+		expect(resolvePastedImagePaths("./relative.png ~/home.jpg", { cwd: testDir, homedir: testDir })).toEqual([
+			relative,
+			homeRelative,
+		]);
+	});
+
+	it("retains the single-candidate clipboard-temp policy", () => {
+		const saved = writeImage("saved.png");
+		const clipboard = writeImage("clipboard-2026-07-19-095500-A1.png");
+		expect(resolvePastedImagePaths(saved)).toBeUndefined();
+		expect(resolvePastedImagePaths(clipboard)).toEqual([clipboard]);
+	});
+
+	it("rejects the complete list when any candidate is missing or unsupported", () => {
+		const valid = writeImage("valid.png");
+		const missing = path.join(testDir, "missing.png");
+		const textFile = path.join(testDir, "not-an-image.jpg");
+		fs.writeFileSync(textFile, "not an image");
+		expect(resolvePastedImagePaths(`${valid} ${missing}`)).toBeUndefined();
+		expect(resolvePastedImagePaths(`${valid} ${textFile}`)).toBeUndefined();
+	});
+
+	it("rejects directories, non-image extensions, and prose anywhere in the list", () => {
+		const valid = writeImage("valid.png");
+		const directory = path.join(testDir, "directory.png");
+		const textFile = path.join(testDir, "notes.txt");
+		fs.mkdirSync(directory);
+		fs.writeFileSync(textFile, PNG_SIGNATURE);
+		expect(resolvePastedImagePaths(`${valid} ${directory}`)).toBeUndefined();
+		expect(resolvePastedImagePaths(`${valid} ${textFile}`)).toBeUndefined();
+		expect(resolvePastedImagePaths(`${valid} explanatory text`)).toBeUndefined();
+	});
+
+	it("rejects malformed quoting and dangling POSIX escapes", () => {
+		const first = writeImage("first.png");
+		const second = writeImage("second.png");
+		expect(resolvePastedImagePaths(`'${first} ${second}`)).toBeUndefined();
+		expect(resolvePastedImagePaths(`"${first} ${second}`)).toBeUndefined();
+		expect(resolvePastedImagePaths(`${first} ${second}\\`)).toBeUndefined();
+		expect(resolvePastedImagePaths(`${first} '' ${second}`)).toBeUndefined();
+	});
+});
+
+describe("decodePastedPathCandidates", () => {
+	it("decodes shell-like quoting, escaping, and concatenated quoted segments", () => {
+		expect(
+			decodePastedPathCandidates(`alpha\\ beta.png 'gamma delta'.jpg "epsilon zeta".webp`, {
+				platform: "linux",
+			}),
+		).toEqual(["alpha beta.png", "gamma delta.jpg", "epsilon zeta.webp"]);
+	});
+
+	it("uses only ASCII whitespace as separators", () => {
+		expect(decodePastedPathCandidates(`first${NNBSP}image.png\tsecond.jpg\nthird.webp`)).toEqual([
+			`first${NNBSP}image.png`,
+			"second.jpg",
+			"third.webp",
+		]);
+	});
+
+	it("preserves Windows path-separator backslashes", () => {
+		expect(
+			decodePastedPathCandidates(String.raw`C:\Users\me\one.png "D:\Saved Images\two.jpg"`, {
+				platform: "win32",
+			}),
+		).toEqual([String.raw`C:\Users\me\one.png`, String.raw`D:\Saved Images\two.jpg`]);
+	});
+
+	it("decodes file URLs independently and rejects an invalid member", () => {
+		expect(
+			decodePastedPathCandidates("file:///tmp/first%20image.png file:///tmp/second.jpg", {
+				platform: "linux",
+			}),
+		).toEqual(["/tmp/first image.png", "/tmp/second.jpg"]);
+		expect(
+			decodePastedPathCandidates("file:///tmp/first.png file://server/share/second.jpg", {
+				platform: "linux",
+			}),
+		).toBeUndefined();
+	});
+
+	it("rejects empty input, empty candidates, and unfinished tokenizer states", () => {
+		expect(decodePastedPathCandidates(" \t\r\n")).toBeUndefined();
+		expect(decodePastedPathCandidates("first.png '' second.png")).toBeUndefined();
+		expect(decodePastedPathCandidates("first.png 'second.png")).toBeUndefined();
+		expect(decodePastedPathCandidates('first.png "second.png')).toBeUndefined();
+		expect(decodePastedPathCandidates("first.png second.png\\", { platform: "linux" })).toBeUndefined();
 	});
 });
 
