@@ -9,6 +9,7 @@ import {
 	assertSafeCodexEndpoint,
 	buildCodexWakePrompt,
 	type CodexAppServerTransport,
+	type CodexTransportFactory,
 	createDefaultCodexTransportFactory,
 	publishCodexWake,
 	readCodexTokenFile,
@@ -102,10 +103,16 @@ async function createWebSocketFixture(
 	const pongs: Buffer[] = [];
 	const server = net.createServer(socket => {
 		let handshaken = false;
+		let initialized = false;
 		let buffer = Buffer.alloc(0);
 		socket.on("data", chunk => {
 			buffer = Buffer.concat([buffer, chunk]);
 			if (!handshaken) {
+				// Real app-server transports are WebSocket only; raw JSONL clients never upgrade.
+				if (!buffer.subarray(0, 4).toString("latin1").startsWith("GET")) {
+					socket.destroy();
+					return;
+				}
 				const end = buffer.indexOf("\r\n\r\n");
 				if (end < 0) return;
 				const request = buffer.subarray(0, end).toString("latin1");
@@ -126,7 +133,43 @@ async function createWebSocketFixture(
 			for (const message of parsed.messages) {
 				const request = JSON.parse(message) as { id?: number; method: string; params: Record<string, unknown> };
 				messages.push({ method: request.method, params: request.params });
-				if (request.id === undefined) continue;
+				if (request.id === undefined) {
+					if (request.method === "initialized") initialized = true;
+					continue;
+				}
+				// Per the generated protocol, every connection must initialize before other requests.
+				if (request.method !== "initialize" && !initialized) {
+					socket.write(
+						serverFrame(
+							JSON.stringify({
+								jsonrpc: "2.0",
+								id: request.id,
+								error: { code: -32600, message: "not initialized" },
+							}),
+						),
+					);
+					continue;
+				}
+				// Generated TurnStartParams accepts threadId/clientUserMessageId/input; legacy prompt is invalid.
+				if (
+					request.method === "turn/start" &&
+					("prompt" in request.params ||
+						!Array.isArray(request.params.input) ||
+						!(request.params.input as Array<Record<string, unknown>>).every(
+							item => item.type === "text" && typeof item.text === "string" && Array.isArray(item.text_elements),
+						))
+				) {
+					socket.write(
+						serverFrame(
+							JSON.stringify({
+								jsonrpc: "2.0",
+								id: request.id,
+								error: { code: -32602, message: "invalid turn/start params" },
+							}),
+						),
+					);
+					continue;
+				}
 				const result =
 					request.method === "initialize"
 						? { userAgent: "fixture" }
@@ -308,6 +351,82 @@ describe("Codex wake publisher", () => {
 				"initialized",
 				"thread/resume",
 			]);
+		} finally {
+			await closeServer(fixture.server);
+		}
+	});
+
+	it("rejects a legacy raw-JSONL prompt-based transport against the schema-backed fixture", async () => {
+		// Emulates the f792165d-era transport: raw newline JSON-RPC without a WebSocket
+		// upgrade, no initialize/initialized handshake, and turn/start with `prompt`.
+		const root = await tempRoot();
+		const socketPath = path.join(root, "codex-legacy.sock");
+		const fixture = await createWebSocketFixture(socketPath, "idle");
+		try {
+			const legacyFactory: CodexTransportFactory = async endpoint => {
+				if (endpoint.kind !== "unix") throw new Error("invalid_codex_endpoint");
+				const socket = net.createConnection(endpoint.path);
+				const connected = Promise.withResolvers<void>();
+				socket.once("connect", () => connected.resolve());
+				socket.once("error", error => connected.reject(error));
+				await connected.promise;
+				return {
+					request: async (method, params) =>
+						await new Promise((_, reject) => {
+							socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`);
+							socket.once("close", () => reject(new Error("codex_app_server_unavailable")));
+							setTimeout(() => reject(new Error("codex_app_server_timeout")), 500);
+						}),
+					close: async () => {
+						socket.destroy();
+					},
+				};
+			};
+			await expect(
+				publishCodexWake({
+					handoff: { ...handoff(), endpoint: { kind: "unix", path: socketPath } },
+					event: event(),
+					transportFactory: legacyFactory,
+				}),
+			).rejects.toThrow(/codex_app_server_(unavailable|timeout)/);
+			expect(fixture.messages).toHaveLength(0);
+		} finally {
+			await closeServer(fixture.server);
+		}
+	});
+
+	it("fails requests sent before initialize and turn/start bodies using legacy prompt params", async () => {
+		const root = await tempRoot();
+		const socketPath = path.join(root, "codex-strict.sock");
+		const fixture = await createWebSocketFixture(socketPath, "idle");
+		try {
+			const transport = await createDefaultCodexTransportFactory()({ kind: "unix", path: socketPath }, null);
+			try {
+				// Request before initialize -> fixture rejects per protocol.
+				await expect(transport.request("thread/resume", { threadId: "thread-1" })).rejects.toThrow(
+					"codex_app_server_request_failed",
+				);
+				await transport.request("initialize", {
+					clientInfo: { name: "strict-test", title: null, version: "0" },
+					capabilities: null,
+				});
+				await transport.notify?.("initialized", {});
+				// Legacy prompt-shaped turn/start -> invalid params per generated TurnStartParams.
+				await expect(
+					transport.request("turn/start", { threadId: "thread-1", prompt: "legacy prompt body" }),
+				).rejects.toThrow("codex_app_server_request_failed");
+				// Schema-shaped input succeeds.
+				await transport.request("thread/resume", { threadId: "thread-1" });
+				await expect(
+					transport.request("turn/start", {
+						threadId: "thread-1",
+						clientUserMessageId: "gjc-wake-session-1:7",
+						input: [{ type: "text", text: "ok", text_elements: [] }],
+					}),
+				).resolves.toBeDefined();
+			} finally {
+				await transport.close();
+			}
 		} finally {
 			await closeServer(fixture.server);
 		}
