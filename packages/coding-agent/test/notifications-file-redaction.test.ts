@@ -45,7 +45,10 @@ async function withNotifications<T>(fn: () => Promise<T>): Promise<T> {
 	}
 }
 
-async function createHarness(redact: boolean) {
+async function createHarness(
+	redact: boolean,
+	options: { readNotificationFile?: (path: string) => Promise<Buffer> } = {},
+) {
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => {
@@ -59,7 +62,7 @@ async function createHarness(redact: boolean) {
 	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 	cleanupRoots.push(cleanup);
 	const settings = isolatedNotificationSettings(agentDir, { "notifications.redact": redact });
-	createNotificationsExtension(api, { settings });
+	createNotificationsExtension(api, { settings, ...options });
 	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	let sid = `file-redaction-${suffix}`;
 	const ctx = {
@@ -135,6 +138,32 @@ test("runtime redaction blocks telegram_send file attachments before reading or 
 		expectRedactionBlocked(result);
 		expect(frames.some(f => f.type === "file_attachment")).toBe(false);
 
+		await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+	});
+}, 20000);
+
+test("drops an asynchronous file read completed after redaction changes", async () => {
+	await withNotifications(async () => {
+		const readEntered = Promise.withResolvers<void>();
+		const releaseRead = Promise.withResolvers<Buffer>();
+		const harness = await createHarness(false, {
+			readNotificationFile: async () => {
+				readEntered.resolve();
+				return await releaseRead.promise;
+			},
+		});
+		const { frames, ws, token } = await startAndConnect(harness);
+		const sink = getTelegramFileSink(harness.sid);
+		expect(sink).toBeDefined();
+		const pending = sink!({ path: path.join(harness.cwd, "secret.txt"), caption: "secret" });
+		await readEntered.promise;
+
+		ws.send(JSON.stringify({ type: "config_command", sessionId: harness.sid, token, redact: true }));
+		await waitFor(() => frames.some(f => f.type === "config_update" && f.redact === true), 3000, "redact update");
+		releaseRead.resolve(Buffer.from("secret bytes"));
+
+		expectRedactionBlocked(await pending);
+		expect(frames.some(f => f.type === "file_attachment")).toBe(false);
 		await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
 	});
 }, 20000);

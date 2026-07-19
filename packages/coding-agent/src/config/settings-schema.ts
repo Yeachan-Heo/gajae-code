@@ -286,6 +286,7 @@ export const SETTINGS_SCHEMA = {
 	"notifications.telegram.chatId": { type: "string", default: undefined },
 	"notifications.telegram.activation": { type: "record", default: {} as Record<string, unknown> },
 	"notifications.telegram.btw.enabled": { type: "boolean", default: true },
+	"notifications.telegram.streaming.enabled": { type: "boolean", default: true },
 	"notifications.telegram.rich.enabled": {
 		type: "boolean",
 		default: true,
@@ -3779,6 +3780,9 @@ export interface NotificationsSettings {
 			enabled: boolean;
 		};
 		toolActivity: {
+			enabled: boolean;
+		};
+		streaming: {
 			enabled: boolean;
 		};
 		topics: {

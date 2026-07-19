@@ -71,6 +71,16 @@
 							},
 							"additionalProperties": false
 						},
+						"streaming": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"default": true
+								}
+							},
+							"additionalProperties": false
+						},
 						"rich": {
 							"type": "object",
 							"properties": {

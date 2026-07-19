@@ -67,6 +67,9 @@ export interface NotificationSettingsSnapshot {
 		toolActivity: {
 			enabled: boolean;
 		};
+		streaming: {
+			enabled: boolean;
+		};
 		topics: {
 			nameTemplate?: string;
 		};
@@ -145,6 +148,7 @@ export function parseNotificationSettingsSnapshot(rawConfig?: unknown): Notifica
 	const rich = notificationSettingsObject(telegram.rich);
 	const richDraft = notificationSettingsObject(telegram.richDraft);
 	const toolActivity = notificationSettingsObject(telegram.toolActivity);
+	const streaming = notificationSettingsObject(telegram.streaming);
 	const topics = notificationSettingsObject(telegram.topics);
 	const activation = readTelegramActivationMarkers(notificationSettingsObject(telegram.activation));
 	const discord = notificationSettingsObject(notifications.discord);
@@ -167,6 +171,9 @@ export function parseNotificationSettingsSnapshot(rawConfig?: unknown): Notifica
 			},
 			toolActivity: {
 				enabled: notificationSettingsBoolean(toolActivity.enabled, true),
+			},
+			streaming: {
+				enabled: notificationSettingsBoolean(streaming.enabled, true),
 			},
 			topics: {
 				nameTemplate: notificationSettingsString(topics.nameTemplate),
@@ -234,6 +241,9 @@ export interface NotificationConfig {
 	toolActivity: {
 		enabled: boolean;
 	};
+	streaming: {
+		enabled: boolean;
+	};
 	topics: {
 		/**
 		 * Optional Telegram forum-topic name template with `{repo}`, `{branch}`,
@@ -264,6 +274,7 @@ export function getNotificationConfig(settings: NotificationSettingsReader): Not
 		btw: snapshot.telegram.btw,
 		richDraft: snapshot.telegram.richDraft,
 		toolActivity: snapshot.telegram.toolActivity,
+		streaming: snapshot.telegram.streaming,
 		topics: snapshot.telegram.topics,
 	};
 }
@@ -322,6 +333,21 @@ export function notificationConfigFromFile(
 
 export function hasNonBlankValue(value: string | undefined): boolean {
 	return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Resolve live assistant streaming independently of generic notification
+ * lifecycle enablement. Explicit environment values override the durable
+ * Telegram preference; otherwise streaming is available only to an active
+ * configured Telegram identity.
+ */
+export function isNotificationStreamingEnabled(input: { cfg: NotificationConfig; env: NodeJS.ProcessEnv }): boolean {
+	const override = input.env.GJC_NOTIFICATIONS_STREAM?.trim().toLowerCase();
+	if (override === "1") return true;
+	if (override === "0" || override === "off" || override === "false") return false;
+	return (
+		input.cfg.streaming.enabled && isTelegramConfigured(input.cfg) && !getCurrentTelegramActivationMarker(input.cfg)
+	);
 }
 
 /** Is Telegram configured with usable non-blank boundary credentials? */

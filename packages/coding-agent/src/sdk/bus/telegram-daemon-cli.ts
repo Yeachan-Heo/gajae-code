@@ -81,6 +81,8 @@ export function createLightweightDaemonSettings(input: {
 					return snapshot.telegram.chatId;
 				case "notifications.telegram.btw.enabled":
 					return snapshot.telegram.btw.enabled;
+				case "notifications.telegram.streaming.enabled":
+					return snapshot.telegram.streaming.enabled;
 				case "notifications.discord.botToken":
 					return snapshot.discord.botToken;
 				case "notifications.discord.applicationId":

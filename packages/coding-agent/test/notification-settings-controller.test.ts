@@ -49,6 +49,7 @@ function snapshot(overrides: Partial<NotificationSettingsSnapshot> = {}): Notifi
 			btw: { enabled: true },
 			richDraft: { enabled: false },
 			toolActivity: { enabled: true },
+			streaming: { enabled: true },
 			topics: {},
 		},
 		discord: {},
@@ -144,6 +145,7 @@ function editorState(): NotificationsEditorState {
 			richEnabled: true,
 			richDraftEnabled: false,
 			toolActivityEnabled: true,
+			streamingEnabled: true,
 		},
 	};
 }
@@ -336,6 +338,7 @@ describe("notification settings controller adapter", () => {
 
 		const loaded = await operations.loadState();
 		expect(loaded.session).toEqual(sessionStatus());
+		expect(loaded.preferences.streamingEnabled).toBe(true);
 		const signal = new AbortController().signal;
 		await operations.refreshHealth({ probe: true, signal });
 		await operations.sendTest();
@@ -354,19 +357,25 @@ describe("notification settings controller adapter", () => {
 
 		const firstSecret = secret();
 		const firstPreflight = await operations.preflightProposedIdentity(
-			{ token: firstSecret as never, chatId: "input-chat", richEnabled: true, richDraftEnabled: false },
+			{
+				token: firstSecret as never,
+				chatId: "input-chat",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: true,
+			},
 			new AbortController().signal,
 		);
 		expect(firstSecret.consume).toHaveBeenCalledTimes(1);
 		expect(firstPreflight).toMatchObject({
 			status: "ready",
-			draft: { chatId: "validated-chat", tokenMask: expect.not.stringContaining(TOKEN) },
+			draft: { chatId: "validated-chat", tokenMask: expect.not.stringContaining(TOKEN), streamingEnabled: true },
 		});
 		expect(setupCalls[0]).toMatchObject({ chatId: "input-chat", interactive: false });
 		expect(identityCalls[0]).toMatchObject({ chatId: "validated-chat", chatDisplay: "validated-chat" });
 
 		const discoveredPreflight = await operations.preflightProposedIdentity(
-			{ token: secret() as never, richEnabled: true, richDraftEnabled: false },
+			{ token: secret() as never, richEnabled: true, richDraftEnabled: false, streamingEnabled: true },
 			new AbortController().signal,
 		);
 		expect(setupCalls[1]).toMatchObject({ chatId: undefined, interactive: false });
@@ -385,11 +394,18 @@ describe("notification settings controller adapter", () => {
 			{ path: "notifications.telegram.chatId", op: "set", value: "validated-chat" },
 			{ path: "notifications.telegram.rich.enabled", op: "set", value: true },
 			{ path: "notifications.telegram.richDraft.enabled", op: "set", value: false },
+			{ path: "notifications.telegram.streaming.enabled", op: "set", value: true },
 		]);
 		expect(events.slice(0, 3)).toEqual(["commit", "reconcile", "notify"]);
 
 		const secondPreflight = await operations.preflightProposedIdentity(
-			{ token: secret() as never, chatId: "input-chat", richEnabled: true, richDraftEnabled: false },
+			{
+				token: secret() as never,
+				chatId: "input-chat",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: true,
+			},
 			new AbortController().signal,
 		);
 		if (!secondPreflight.draft) throw new Error("Expected prepared Telegram draft.");
@@ -463,6 +479,7 @@ describe("notification settings controller adapter", () => {
 			richEnabled: false,
 			richDraftEnabled: true,
 			toolActivityEnabled: false,
+			streamingEnabled: false,
 		});
 		expect(batches.at(-1)).toEqual([
 			{ path: "notifications.redact", op: "set", value: true },
@@ -470,12 +487,19 @@ describe("notification settings controller adapter", () => {
 			{ path: "notifications.sessionScope", op: "set", value: "primary" },
 			{ path: "notifications.telegram.rich.enabled", op: "set", value: false },
 			{ path: "notifications.telegram.richDraft.enabled", op: "set", value: true },
+			{ path: "notifications.telegram.streaming.enabled", op: "set", value: false },
 			{ path: "notifications.telegram.toolActivity.enabled", op: "set", value: false },
 		]);
 		expect(events).toEqual(["stop", "commit", "reload", "notify"]);
 
 		const discarded = await operations.preflightProposedIdentity(
-			{ token: secret() as never, chatId: "input-chat", richEnabled: true, richDraftEnabled: false },
+			{
+				token: secret() as never,
+				chatId: "input-chat",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: true,
+			},
 			new AbortController().signal,
 		);
 		if (!discarded.draft) throw new Error("Expected prepared Telegram draft.");
@@ -520,6 +544,7 @@ describe("notification settings controller adapter", () => {
 				richEnabled: false,
 				richDraftEnabled: true,
 				toolActivityEnabled: false,
+				streamingEnabled: true,
 			}),
 		).rejects.toThrow("commit failed");
 		expect(events).toEqual(["stop", "commit", "restart"]);
@@ -558,6 +583,7 @@ describe("notification settings controller adapter", () => {
 				richEnabled: false,
 				richDraftEnabled: true,
 				toolActivityEnabled: false,
+				streamingEnabled: true,
 			}),
 		).rejects.toThrow(
 			"Notification preference commit failed (commit failed) and daemon restart failed (owner did not restart).",
@@ -608,7 +634,13 @@ describe("notification settings controller adapter", () => {
 			},
 		);
 		const result = await operations.preflightProposedIdentity(
-			{ token: secret() as never, chatId: "chat", richEnabled: true, richDraftEnabled: false },
+			{
+				token: secret() as never,
+				chatId: "chat",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: true,
+			},
 			new AbortController().signal,
 		);
 		if (!result.draft) throw new Error("Expected prepared Telegram draft.");

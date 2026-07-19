@@ -22,6 +22,7 @@ import {
 	isDiscordConfigured,
 	isGloballyConfigured,
 	isNotificationHostEligible,
+	isNotificationStreamingEnabled,
 	isSessionNotificationsEnabled,
 	isSlackConfigured,
 	isTelegramConfigured,
@@ -77,6 +78,9 @@ const BASE_CFG: NotificationConfig = {
 	toolActivity: {
 		enabled: true,
 	},
+	streaming: {
+		enabled: true,
+	},
 	topics: {
 		nameTemplate: undefined,
 	},
@@ -106,6 +110,7 @@ const MALFORMED_NOTIFICATION_LEAVES: ReadonlyArray<readonly [SettingPath, unknow
 	["notifications.telegram.rich.enabled", "invalid"],
 	["notifications.telegram.richDraft.enabled", "invalid"],
 	["notifications.telegram.toolActivity.enabled", "invalid"],
+	["notifications.telegram.streaming.enabled", "invalid"],
 	["notifications.telegram.topics.nameTemplate", 42],
 	["notifications.discord.botToken", 42],
 	["notifications.discord.applicationId", 42],
@@ -168,6 +173,7 @@ describe("notifications config", () => {
 			"notifications.telegram.botToken": "token-1",
 			"notifications.telegram.chatId": "chat-1",
 			"notifications.telegram.btw.enabled": true,
+			"notifications.telegram.streaming.enabled": false,
 			"notifications.discord.botToken": "discord-token",
 			"notifications.discord.applicationId": "discord-app",
 			"notifications.discord.guildId": "discord-guild",
@@ -212,6 +218,9 @@ describe("notifications config", () => {
 			},
 			toolActivity: {
 				enabled: true,
+			},
+			streaming: {
+				enabled: false,
 			},
 			topics: {
 				nameTemplate: undefined,
@@ -265,6 +274,7 @@ describe("notifications config", () => {
 			"notifications.telegram.rich.enabled": false,
 			"notifications.telegram.richDraft.enabled": true,
 			"notifications.telegram.toolActivity.enabled": false,
+			"notifications.telegram.streaming.enabled": false,
 			"notifications.telegram.topics.nameTemplate": "{repo}/{branch}",
 			"notifications.discord.botToken": "discord-token",
 			"notifications.discord.applicationId": "discord-application",
@@ -302,6 +312,7 @@ describe("notifications config", () => {
 						rich: { enabled: false },
 						richDraft: { enabled: true },
 						toolActivity: { enabled: false },
+						streaming: { enabled: false },
 						topics: { nameTemplate: "{repo}/{branch}" },
 					},
 					discord: {
@@ -348,6 +359,59 @@ describe("notifications config", () => {
 			emptyLightweight.getNotificationSettingsSnapshot(),
 		);
 	});
+	test("streaming defaults and malformed values have full and lightweight parity", () => {
+		const settings = Settings.isolated();
+		const lightweight = createLightweightDaemonSettings({
+			agentDir: "/tmp/gjc-notification-streaming-default",
+			rawConfig: {},
+		});
+		expect(settings.getNotificationSettingsSnapshot().telegram.streaming.enabled).toBe(true);
+		expect(lightweight.getNotificationSettingsSnapshot().telegram.streaming.enabled).toBe(true);
+
+		for (const rawConfig of [
+			{ notifications: { telegram: { streaming: true } } },
+			{ notifications: { telegram: { streaming: { enabled: "invalid" } } } },
+		]) {
+			expect(() =>
+				createLightweightDaemonSettings({ agentDir: "/tmp/gjc-notification-streaming-invalid", rawConfig }),
+			).toThrow("gjc_notify_daemon_invalid_configuration");
+		}
+	});
+
+	test("streaming env overrides and durable Telegram activation have explicit precedence", () => {
+		const activeTelegram = GLOBAL_CFG;
+		const inactiveTelegram: NotificationConfig = {
+			...GLOBAL_CFG,
+			streaming: { enabled: false },
+		};
+		const genericOnly: NotificationConfig = { ...BASE_CFG, enabled: true };
+		const inactiveTelegramIdentity = telegramActivationIdentity(GLOBAL_CFG.botToken!, GLOBAL_CFG.chatId!);
+		const blockedTelegram: NotificationConfig = {
+			...GLOBAL_CFG,
+			activation: {
+				[inactiveTelegramIdentity]: {
+					identity: inactiveTelegramIdentity,
+					state: "inactive",
+					reason: "saved_inactive",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				},
+			},
+		};
+
+		expect(isNotificationStreamingEnabled({ cfg: activeTelegram, env: {} })).toBe(true);
+		expect(isNotificationStreamingEnabled({ cfg: inactiveTelegram, env: {} })).toBe(false);
+		expect(isNotificationStreamingEnabled({ cfg: blockedTelegram, env: {} })).toBe(false);
+		expect(isNotificationStreamingEnabled({ cfg: genericOnly, env: {} })).toBe(false);
+		expect(isNotificationStreamingEnabled({ cfg: genericOnly, env: { GJC_NOTIFICATIONS_STREAM: "1" } })).toBe(true);
+		for (const value of ["0", "off", "false"]) {
+			expect(isNotificationStreamingEnabled({ cfg: activeTelegram, env: { GJC_NOTIFICATIONS_STREAM: value } })).toBe(
+				false,
+			);
+		}
+		expect(
+			isNotificationStreamingEnabled({ cfg: activeTelegram, env: { GJC_NOTIFICATIONS_STREAM: "unknown" } }),
+		).toBe(true);
+	});
 	test("full Settings and lightweight daemon reject the same malformed notification leaves", () => {
 		for (const [pathName, value] of MALFORMED_NOTIFICATION_LEAVES) {
 			const rawConfig = notificationRawConfigAtPath(pathName, value);
@@ -377,6 +441,7 @@ describe("notifications config", () => {
 			{ notifications: { telegram: { rich: true } } },
 			{ notifications: { telegram: { richDraft: true } } },
 			{ notifications: { telegram: { toolActivity: true } } },
+			{ notifications: { telegram: { streaming: true } } },
 			{ notifications: { telegram: { topics: true } } },
 			{ notifications: { discord: [] } },
 			{ notifications: { slack: [] } },

@@ -31,6 +31,7 @@ export interface NotificationsEditorPreferences {
 	richEnabled: boolean;
 	richDraftEnabled: boolean;
 	toolActivityEnabled: boolean;
+	streamingEnabled: boolean;
 }
 
 /** Secret-safe snapshot used to render the Notifications tab. */
@@ -51,6 +52,7 @@ export interface NotificationsEditorSetupInput {
 	chatId?: string;
 	richEnabled: boolean;
 	richDraftEnabled: boolean;
+	streamingEnabled: boolean;
 }
 
 /**
@@ -63,6 +65,7 @@ export interface PreparedTelegramConfiguration {
 	tokenFingerprint?: string;
 	richEnabled: boolean;
 	richDraftEnabled: boolean;
+	streamingEnabled: boolean;
 }
 
 export interface NotificationsPreflightResult {
@@ -193,6 +196,7 @@ function emptyState(): NotificationsEditorState {
 			richEnabled: true,
 			richDraftEnabled: false,
 			toolActivityEnabled: true,
+			streamingEnabled: true,
 		},
 	};
 }
@@ -552,6 +556,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 						chatId,
 						richEnabled: preferences.richEnabled,
 						richDraftEnabled: preferences.richDraftEnabled,
+						streamingEnabled: preferences.streamingEnabled,
 					},
 					signal,
 				),
@@ -934,6 +939,9 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			case "tool-activity":
 				draft.toolActivityEnabled = !draft.toolActivityEnabled;
 				return;
+			case "test":
+				draft.streamingEnabled = !draft.streamingEnabled;
+				return;
 			default:
 				return;
 		}
@@ -1079,6 +1087,11 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				label: `Telegram tool activity: ${draft.toolActivityEnabled ? "on" : "off"}`,
 				description: "Toggle tool start and completion notifications.",
 			},
+			{
+				id: "test",
+				label: `Telegram streaming: ${draft.streamingEnabled ? "on" : "off"}`,
+				description: "Toggle the unsaved Telegram streaming preference.",
+			},
 			{ id: "save", label: "Save preferences", description: "Atomically persist this preference draft." },
 			{ id: "cancel", label: "Cancel and discard draft", description: "Leave saved preferences unchanged." },
 		];
@@ -1173,7 +1186,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 		);
 		lines.push(
 			this.#truncate(
-				`  Private chat: ${draft?.chatId ?? "(expired)"}  rich: ${draft?.richEnabled ? "on" : "off"}  drafts: ${draft?.richDraftEnabled ? "on" : "off"}`,
+				`  Private chat: ${draft?.chatId ?? "(expired)"}  rich: ${draft?.richEnabled ? "on" : "off"}  drafts: ${draft?.richDraftEnabled ? "on" : "off"}  streaming: ${draft?.streamingEnabled ? "on" : "off"}`,
 				width,
 			),
 		);

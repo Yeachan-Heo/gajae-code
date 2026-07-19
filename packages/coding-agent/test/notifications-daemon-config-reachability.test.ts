@@ -84,6 +84,25 @@ describe("notifications daemon config reachability (rich)", () => {
 		);
 	});
 });
+
+describe("notifications daemon config reachability (streaming)", () => {
+	test("defaults enabled in resolved settings and reaches the lightweight daemon reader", () => {
+		expect(Settings.isolated({}).getNotificationSettingsSnapshot().telegram.streaming).toEqual({ enabled: true });
+		expect(cfgFromRaw({}).streaming).toEqual({ enabled: true });
+		expect(cfgFromRaw({ notifications: { telegram: { streaming: { enabled: false } } } }).streaming).toEqual({
+			enabled: false,
+		});
+	});
+
+	test("rejects malformed streaming containers and enabled values", () => {
+		for (const rawConfig of [
+			{ notifications: { telegram: { streaming: true } } },
+			{ notifications: { telegram: { streaming: { enabled: "false" } } } },
+		]) {
+			expect(() => cfgFromRaw(rawConfig)).toThrow("gjc_notify_daemon_invalid_configuration");
+		}
+	});
+});
 describe("notifications daemon config reachability (btw)", () => {
 	test("defaults enabled in both resolved settings and the lightweight daemon reader", () => {
 		expect(Settings.isolated({}).getNotificationSettingsSnapshot().telegram.btw).toEqual({ enabled: true });

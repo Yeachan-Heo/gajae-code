@@ -365,6 +365,7 @@ export class ChatDaemonRuntime {
 	private async handleFrame(attached: AttachedSession, frame: Record<string, unknown>): Promise<void> {
 		if (this.#sessions.get(attached.sessionId) !== attached) return;
 		const normalizedFrame = notificationFrame(frame);
+		if (normalizedFrame.type === "turn_stream" && normalizedFrame.phase === "live") return;
 		const frameSessionId = sessionIdFrom(normalizedFrame) ?? sessionIdFrom(frame);
 		if (frameSessionId !== undefined && frameSessionId !== attached.sessionId) return;
 		const sessionId = attached.sessionId;

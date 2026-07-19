@@ -616,6 +616,7 @@ function fixedEditorState(
 		richEnabled: true,
 		richDraftEnabled: false,
 		toolActivityEnabled: true,
+		streamingEnabled: true,
 	};
 
 	switch (stateId) {
@@ -787,6 +788,7 @@ class DeterministicNotificationsEditorOperations implements NotificationsEditorO
 				tokenFingerprint: "telegram:2050feed",
 				richEnabled: input.richEnabled,
 				richDraftEnabled: input.richDraftEnabled,
+				streamingEnabled: input.streamingEnabled,
 			},
 		};
 	}

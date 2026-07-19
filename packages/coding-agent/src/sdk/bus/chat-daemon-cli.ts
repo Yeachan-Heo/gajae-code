@@ -68,6 +68,7 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 				toolActivity: { enabled: true },
 				topics: { nameTemplate: undefined },
 				btw: { enabled: true },
+				streaming: { enabled: true },
 			})
 		) {
 			throw new Error("Discord notifications are enabled but configuration is incomplete");
@@ -102,6 +103,7 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 			toolActivity: { enabled: true },
 			topics: { nameTemplate: undefined },
 			btw: { enabled: true },
+			streaming: { enabled: true },
 		})
 	) {
 		throw new Error("Slack notifications are enabled but configuration is incomplete");

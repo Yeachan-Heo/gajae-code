@@ -78,6 +78,7 @@ function state(): NotificationsEditorState {
 			richEnabled: true,
 			richDraftEnabled: false,
 			toolActivityEnabled: true,
+			streamingEnabled: true,
 		},
 		health: health(),
 	};
@@ -152,6 +153,7 @@ class FakeNotificationsOperations implements NotificationsEditorOperations {
 				tokenFingerprint: "telegram:cafefeed",
 				richEnabled: input.richEnabled,
 				richDraftEnabled: input.richDraftEnabled,
+				streamingEnabled: input.streamingEnabled,
 			},
 		};
 	}
@@ -240,6 +242,13 @@ function enterTelegramTokenWithoutChat(component: NotificationsSettingsEditorCom
 }
 
 describe("NotificationsSettingsEditorComponent", () => {
+	it("defaults the unsaved streaming preference on before asynchronous state loads", () => {
+		const component = new NotificationsSettingsEditorComponent(new FakeNotificationsOperations());
+		select(component, 10);
+		component.handleInput("\n");
+		select(component, 5);
+		expect(render(component)).toContain("Telegram streaming: on");
+	});
 	it("requires an explicit provider choice before the optional private-chat ID step", async () => {
 		const component = new NotificationsSettingsEditorComponent(new FakeNotificationsOperations());
 		await flush();
@@ -283,6 +292,7 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(review).toContain("Review Telegram notification setup");
 		expect(review).toContain("••••••••");
 		expect(review).toContain("telegram:cafefeed");
+		expect(review).toContain("streaming: on");
 		expect(review).not.toContain(rawToken);
 
 		component.handleInput("\x1b");
@@ -295,6 +305,10 @@ describe("NotificationsSettingsEditorComponent", () => {
 		component.handleInput("\n"); // redact on in the editor-only preference draft
 		expect(operations.committedPreferences).toEqual([]);
 		select(component, 6);
+		expect(render(component)).toContain("Telegram streaming: on");
+		component.handleInput("\n"); // streaming off in the editor-only preference draft
+		expect(render(component)).toContain("Telegram streaming: off");
+		select(component, 1);
 		component.handleInput("\n");
 		await flush();
 		expect(operations.committedPreferences).toEqual([
@@ -305,6 +319,7 @@ describe("NotificationsSettingsEditorComponent", () => {
 				richEnabled: true,
 				richDraftEnabled: false,
 				toolActivityEnabled: true,
+				streamingEnabled: false,
 			},
 		]);
 	});
@@ -473,7 +488,13 @@ describe("NotificationsSettingsEditorComponent", () => {
 			status: "ready",
 			identity: { status: "foreign" },
 			message: "late foreign result",
-			draft: { chatId: "1001", tokenMask: "••••", richEnabled: true, richDraftEnabled: false },
+			draft: {
+				chatId: "1001",
+				tokenMask: "••••",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: true,
+			},
 		});
 		await flush();
 		expect(pairing.mode).toBe("home");

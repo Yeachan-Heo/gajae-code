@@ -10,6 +10,8 @@ import { sessionStateDir } from "../src/gjc-runtime/session-layout";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
+	MemoryGateStore,
+	NotificationGatePolicyChangedError,
 	type OpenGateInput,
 	type WorkflowGateEmitter,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
@@ -578,5 +580,80 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		expect(restarted.listWorkflowGateQueryRecords!()).toMatchObject([
 			{ id: expect.stringMatching(/^diagnostic:/), tag: "quarantined" },
 		]);
+	});
+	it("does not advance a notification gate when policy changes during selected acknowledgement", async () => {
+		let advances = 0;
+		const emitter = new BrokerWorkflowGateEmitter("policy-change", new MemoryGateStore(), {
+			advance: () => {
+				advances++;
+			},
+		});
+		let gateId = "";
+		emitter.onGateEmitted!(gate => {
+			gateId = gate.gate_id;
+		});
+		const continuation = emitter.emitGate({
+			stage: "ralplan",
+			kind: "approval",
+			schema: { type: "string", enum: ["approve"] },
+		});
+		void continuation.catch(() => {});
+		await Promise.resolve();
+		let resolvedClaims = 0;
+
+		await expect(
+			emitter.resolveGateFromNotification!(
+				{ gate_id: gateId, answer: "approve", idempotency_key: "policy-change" },
+				{
+					interactionActionId: "action-1",
+					replyReceiptId: "receipt-1",
+					answerJson: JSON.stringify("approve"),
+					requestSelectedAck: async () => {
+						throw new NotificationGatePolicyChangedError();
+					},
+					resolveClaim: () => {
+						resolvedClaims++;
+					},
+					closeClaimInvalid: () => {},
+				},
+			),
+		).rejects.toBeInstanceOf(NotificationGatePolicyChangedError);
+		expect(resolvedClaims).toBe(0);
+		expect(advances).toBe(0);
+		await Bun.sleep(100);
+		expect(advances).toBe(0);
+		expect(emitter.listGateDiagnostics!()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ tag: "quarantined" })]),
+		);
+
+		const throwingEmitter = new BrokerWorkflowGateEmitter("policy-close-failure", new MemoryGateStore());
+		let throwingGateId = "";
+		throwingEmitter.onGateEmitted!(gate => {
+			throwingGateId = gate.gate_id;
+		});
+		void throwingEmitter
+			.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } })
+			.catch(() => {});
+		await Promise.resolve();
+		await expect(
+			throwingEmitter.resolveGateFromNotification!(
+				{ gate_id: throwingGateId, answer: "approve", idempotency_key: "policy-close-failure" },
+				{
+					interactionActionId: "action-2",
+					replyReceiptId: "receipt-2",
+					answerJson: JSON.stringify("approve"),
+					requestSelectedAck: async () => {
+						throw new NotificationGatePolicyChangedError();
+					},
+					resolveClaim: () => {},
+					closeClaimInvalid: () => {
+						throw new Error("native close failed");
+					},
+				},
+			),
+		).rejects.toThrow("native close failed");
+		expect(throwingEmitter.listGateDiagnostics!()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ tag: "quarantined" })]),
+		);
 	});
 });
