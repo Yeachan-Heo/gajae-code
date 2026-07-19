@@ -96,7 +96,7 @@ function parseMaskedFrames(buffer: Buffer): { messages: string[]; pongs: Buffer[
 async function createWebSocketFixture(
 	socketPath: string,
 	status: "idle" | "active",
-	behavior: { ping?: boolean; noiseBeforeResponse?: boolean } = {},
+	behavior: { ping?: boolean; noiseBeforeResponse?: boolean; fragmentResponses?: boolean } = {},
 ) {
 	const messages: Array<{ method: string; params: Record<string, unknown> }> = [];
 	const headers: string[] = [];
@@ -187,7 +187,28 @@ async function createWebSocketFixture(
 					socket.write(serverFrame(JSON.stringify({ jsonrpc: "2.0", id: 999999, result: { wrong: true } })));
 					socket.write(serverFrame(JSON.stringify({ jsonrpc: "2.0", method: "noise/notification", params: {} })));
 				}
-				socket.write(serverFrame(JSON.stringify({ jsonrpc: "2.0", id: request.id, result })));
+				if (behavior.fragmentResponses) {
+					// Legal wire behavior: a complete notification frame first, then the
+					// response as an RFC 6455 fragmented message (FIN=0 text frame plus a
+					// FIN=1 continuation frame), delivered in TCP chunks split mid-frame.
+					socket.write(
+						serverFrame(JSON.stringify({ jsonrpc: "2.0", method: "thread/statusChanged", params: {} })),
+					);
+					const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
+					const half = Math.floor(body.length / 2);
+					const firstFragment = Buffer.concat([Buffer.from([0x01, half]), body.subarray(0, half)]);
+					const continuation = Buffer.concat([Buffer.from([0x80, body.length - half]), body.subarray(half)]);
+					socket.write(firstFragment.subarray(0, 1));
+					setTimeout(() => {
+						socket.write(firstFragment.subarray(1));
+						setTimeout(() => {
+							socket.write(continuation.subarray(0, 1));
+							setTimeout(() => socket.write(continuation.subarray(1)), 3);
+						}, 3);
+					}, 3);
+				} else {
+					socket.write(serverFrame(JSON.stringify({ jsonrpc: "2.0", id: request.id, result })));
+				}
 			}
 		});
 	});
@@ -472,6 +493,63 @@ describe("Codex wake publisher", () => {
 			).rejects.toThrow("codex_app_server_unavailable");
 		} finally {
 			await closeServer(server);
+		}
+	});
+
+	it("omits the Authorization header when no token_file is configured and never puts tokens in frames", async () => {
+		const root = await tempRoot();
+		const socketPath = path.join(root, "codex-no-token.sock");
+		const fixture = await createWebSocketFixture(socketPath, "idle");
+		try {
+			const result = await publishCodexWake({
+				handoff: { ...handoff(null), endpoint: { kind: "unix", path: socketPath } },
+				event: event(),
+				transportFactory: createDefaultCodexTransportFactory(),
+			});
+			expect(result).toEqual({ published: true, reason: null });
+			expect(fixture.headers[0]).not.toContain("Authorization");
+		} finally {
+			await closeServer(fixture.server);
+		}
+
+		const tokenFile = path.join(root, "token.txt");
+		await fs.writeFile(tokenFile, "frame-secret-b1c2\n");
+		const withTokenPath = path.join(root, "codex-with-token.sock");
+		const withToken = await createWebSocketFixture(withTokenPath, "idle");
+		try {
+			await publishCodexWake({
+				handoff: { ...handoff(tokenFile), endpoint: { kind: "unix", path: withTokenPath } },
+				event: event(),
+				transportFactory: createDefaultCodexTransportFactory(),
+			});
+			expect(withToken.headers[0]).toContain("Authorization: Bearer frame-secret-b1c2");
+			// Token appears ONLY in the handshake header; never in any JSON-RPC frame.
+			for (const message of withToken.messages) expect(JSON.stringify(message)).not.toContain("frame-secret-b1c2");
+		} finally {
+			await closeServer(withToken.server);
+		}
+	});
+
+	it("assembles fragmented responses with interleaved notifications without timing out", async () => {
+		const root = await tempRoot();
+		const socketPath = path.join(root, "codex-fragmented.sock");
+		const fixture = await createWebSocketFixture(socketPath, "idle", { fragmentResponses: true });
+		try {
+			const wake = event();
+			const result = await publishCodexWake({
+				handoff: { ...handoff(), endpoint: { kind: "unix", path: socketPath } },
+				event: wake,
+				transportFactory: createDefaultCodexTransportFactory({ requestTimeoutMs: 3_000 }),
+			});
+			expect(result).toEqual({ published: true, reason: null });
+			expect(fixture.messages.map(message => message.method)).toEqual([
+				"initialize",
+				"initialized",
+				"thread/resume",
+				"turn/start",
+			]);
+		} finally {
+			await closeServer(fixture.server);
 		}
 	});
 

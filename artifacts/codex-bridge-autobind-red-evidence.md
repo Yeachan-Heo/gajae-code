@@ -717,3 +717,30 @@ New test (coordinator-codex-bridge-redteam.test.ts):
 
 Mutation proof: reintroducing `summary: ${event.summary}` into
 buildCodexWakePrompt makes the new test FAIL (1 fail); reverted -> passes.
+
+## Auth placement + fragmentation review closure
+
+Token placement audit: request() contains NO params-token merge (removed in the
+ebb80f5d-era hardening); the token from token_file is used exclusively as
+`Authorization: Bearer <token>` in the HTTP Upgrade handshake. New capture test:
+- `omits the Authorization header when no token_file is configured and never puts
+  tokens in frames` — header absent without token_file; present with it; token
+  string never appears in ANY JSON-RPC frame payload.
+
+Fragmentation RED->GREEN (manual framing retained; no maintained ws client in the
+dependency tree supports unix sockets without adding a dependency):
+- RED: fixture emitting a legal RFC 6455 fragmented response (FIN=0 text +
+  FIN=1 continuation, TCP chunks split mid-frame, complete notification first)
+  made thread/resume time out (codex_app_server_timeout) against the pre-fix
+  client, which only handled FIN=1 text frames.
+- GREEN: client now assembles continuation frames (opcode 0x0) per RFC 6455;
+  test `assembles fragmented responses with interleaved notifications without
+  timing out` passes.
+
+Real installed app-server smoke (self-launched unix:// listener) now records:
+    initialize response keys: codexHome,platformFamily,platformOs,userAgent
+    thread/start status: {"type":"idle"}
+    turn/start accepted, turn keys: completedAt,durationMs,error,id,items,itemsView
+    thread/resume response: thread.status: {"type":"active","activeFlags":[]}  (live turn running)
+The active status on resume while the started turn runs proves the idle gate
+reads genuine server state; turn was interrupted for cleanup.
