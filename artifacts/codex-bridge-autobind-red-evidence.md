@@ -698,3 +698,22 @@ GREEN — current HEAD `createDefaultCodexTransportFactory()` against the same l
     turn/start OK: turn id 019f78fa-74d0-7441-80b0-fea378cbd901   (schema-shaped input + clientUserMessageId; immediately interrupted)
     GREEN: full documented lifecycle succeeded on the same real boundary
     green-exit=0
+
+## Prompt-injection hardening: hostile summary never reaches turn/start
+
+Contract check: `buildCodexWakePrompt` already carries ONLY the resume instruction,
+work_unit/wake_key identifiers, and optional turn/question ids — the summary line was
+removed in the transport rewrite (3bc15185). This section locks that with an
+end-to-end hostile test plus a mutation proof.
+
+New test (coordinator-codex-bridge-redteam.test.ts):
+`never forwards hostile event summaries into the app-server turn/start input`
+- Hostile summary containing instruction-injection ("IGNORE ALL PREVIOUS
+  INSTRUCTIONS", `rm -rf`), question text, delegated-output and final_response
+  sentinels, and a 50KB log dump is appended as a real coordinator event.
+- Asserts turn/start input[0].text contains NONE of the hostile fragments,
+  only identifiers + fixed instruction, < 500 chars; and that the summary
+  persists solely as bounded (<=240 chars) durable metadata for diagnostics.
+
+Mutation proof: reintroducing `summary: ${event.summary}` into
+buildCodexWakePrompt makes the new test FAIL (1 fail); reverted -> passes.
