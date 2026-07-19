@@ -54,6 +54,22 @@ export interface CodexWakeEventV1 {
 	updated_at: string;
 	last_error: string | null;
 }
+export const CODEX_WAKE_LIFECYCLE_SCHEMA_VERSION = 1;
+
+export type CodexWakeLifecycle = "requested" | "delivered" | "acknowledged" | "failed";
+
+export function codexWakeLifecycle(status: CodexWakeEventV1["status"]): CodexWakeLifecycle {
+	switch (status) {
+		case "pending":
+			return "requested";
+		case "published":
+			return "delivered";
+		case "acked":
+			return "acknowledged";
+		case "failed":
+			return "failed";
+	}
+}
 
 const SAFE_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/;
 
