@@ -28,27 +28,36 @@ describe("Loader component", () => {
 		loader.stop();
 		tui.stop();
 	});
-	it("preserves its dynamic render footprint without visible status text", () => {
+	it("preserves a frozen ANSI and Unicode footprint through resize reflow", () => {
 		const term = new VirtualTerminal(40, 4);
 		const tui = new TUI(term);
 		const loader = new Loader(
 			tui,
-			text => text,
-			text => text,
-			"A long status message that wraps",
+			text => `\x1b[36m${text}\x1b[0m`,
+			text => `\x1b[35m${text}\x1b[0m`,
+			"한글🙂 e\u0301 café — wrapping status",
 			["|"],
 		);
 
 		const footprint = loader.createFootprint();
-		const expectedFootprints = new Map<number, string[]>();
-		for (const width of [4, 40]) {
-			const expected = loader.render(width).map(() => "");
-			expectedFootprints.set(width, expected);
-			expect(footprint.render(width)).toEqual(expected);
+		const expectedLineCounts = new Map([
+			[1, 30],
+			[2, 30],
+			[3, 30],
+			[4, 17],
+			[7, 10],
+			[16, 5],
+			[40, 2],
+		]);
+		for (const [width, count] of expectedLineCounts) {
+			term.resize(width, 4);
+			expect(footprint.render(term.columns)).toEqual(Array.from({ length: count }, () => ""));
 		}
+
 		loader.setMessage("A different status that would wrap differently");
-		for (const [width, expected] of expectedFootprints) {
-			expect(footprint.render(width)).toEqual(expected);
+		for (const [width, count] of expectedLineCounts) {
+			term.resize(width, 4);
+			expect(footprint.render(term.columns)).toEqual(Array.from({ length: count }, () => ""));
 		}
 
 		loader.stop();

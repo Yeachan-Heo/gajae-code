@@ -118,6 +118,8 @@ export class EventController {
 	#toolIntentCache = new Map<string, { args: unknown; intent: string | undefined }>();
 	#thinkingContentIndices = new Set<number>();
 	#handlers: AgentSessionEventHandlers;
+	#completionFootprint: Component | undefined = undefined;
+	#suspendedLoadingAnimation: Loader | undefined = undefined;
 
 	constructor(private ctx: InteractiveModeContext) {
 		this.#handlers = {
@@ -241,20 +243,29 @@ export class EventController {
 		if (this.ctx.isTranscriptViewerOpen?.()) this.ctx.refreshTranscriptViewer?.();
 	}
 
+	#clearCompletionFootprint(): void {
+		if (!this.#completionFootprint) return;
+		this.ctx.statusContainer.removeChild(this.#completionFootprint);
+		this.#completionFootprint = undefined;
+	}
+
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
+		this.#clearCompletionFootprint();
+		this.#suspendedLoadingAnimation = undefined;
 		if (this.ctx.retryEscapeHandler) {
 			this.ctx.editor.onEscape = this.ctx.retryEscapeHandler;
 			this.ctx.retryEscapeHandler = undefined;
 		}
 		if (this.ctx.retryLoader) {
-			this.ctx.retryLoader.stop();
+			const retryLoader = this.ctx.retryLoader;
+			retryLoader.stop();
 			this.#clearRetryCountdown();
 			this.ctx.retryLoader = undefined;
-			this.ctx.statusContainer.clear();
+			this.ctx.statusContainer.removeChild(retryLoader);
 		}
 		this.ctx.retryEscapePrimed = false;
 		this.#cancelIdleCompaction();
@@ -810,16 +821,19 @@ export class EventController {
 	}
 
 	async #handleAgentEnd(_event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		if (this.ctx.loadingAnimation) {
-			const loader = this.ctx.loadingAnimation;
+		const loader = this.ctx.loadingAnimation ?? this.#suspendedLoadingAnimation;
+		this.ctx.loadingAnimation = undefined;
+		this.#suspendedLoadingAnimation = undefined;
+		if (loader) {
 			loader.stop();
-			this.ctx.loadingAnimation = undefined;
 			// Process terminals do not expose native scrollback position. Preserve
 			// the loader's actual footprint so completion cannot contract and repaint
 			// a viewport the user is browsing.
-			this.ctx.statusContainer.clear();
+			this.#clearCompletionFootprint();
+			this.ctx.statusContainer.removeChild(loader);
 			if (this.ctx.ui.terminal.isProcessTerminal) {
-				this.ctx.statusContainer.addChild(loader.createFootprint());
+				this.#completionFootprint = loader.createFootprint();
+				this.ctx.statusContainer.addChild(this.#completionFootprint);
 			}
 		}
 		if (this.ctx.streamingComponent) {
@@ -946,9 +960,19 @@ export class EventController {
 				this.ctx.session.abortRetry();
 			}
 		};
-		this.ctx.statusContainer.clear();
-		// Stop any prior retry loader/timer before installing a new one.
-		this.ctx.retryLoader?.stop();
+		// Hide the working loader during backoff while retaining its completion footprint.
+		const loadingAnimation = this.ctx.loadingAnimation;
+		if (loadingAnimation) {
+			loadingAnimation.stop();
+			this.ctx.statusContainer.detachChild(loadingAnimation);
+			this.#suspendedLoadingAnimation = loadingAnimation;
+			this.ctx.loadingAnimation = undefined;
+		}
+		const previousRetryLoader = this.ctx.retryLoader;
+		if (previousRetryLoader) {
+			previousRetryLoader.stop();
+			this.ctx.statusContainer.removeChild(previousRetryLoader);
+		}
 		this.#clearRetryCountdown();
 		const reason = friendlyRetryReason(event.errorMessage);
 		const attemptLabel = event.unbounded ? `attempt ${event.attempt}` : `${event.attempt}/${event.maxAttempts}`;
@@ -980,10 +1004,11 @@ export class EventController {
 			this.ctx.retryEscapeHandler = undefined;
 		}
 		if (this.ctx.retryLoader) {
-			this.ctx.retryLoader.stop();
+			const retryLoader = this.ctx.retryLoader;
+			retryLoader.stop();
 			this.#clearRetryCountdown();
 			this.ctx.retryLoader = undefined;
-			this.ctx.statusContainer.clear();
+			this.ctx.statusContainer.removeChild(retryLoader);
 		}
 		this.ctx.retryEscapePrimed = false;
 		if (!event.success) {
