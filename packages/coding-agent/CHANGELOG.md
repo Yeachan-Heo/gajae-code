@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- The interactive status area now reserves its high-water row count on native process terminals, so completion, auto-retry backoff/recovery, and auto-compaction transitions never contract the bottom status slot and repaint scrollback the user is browsing. Session lifecycle events are ordered on a dedicated completion/start lane (live events are never queued behind a handler awaiting user interaction), stale completions from superseded runs are ignored via turn-generation identity, and auto-compaction no longer blanket-clears independently owned status components.
+
 ## [0.11.2] - 2026-07-19
 
 ### Changed

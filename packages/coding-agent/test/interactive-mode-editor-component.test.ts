@@ -663,4 +663,16 @@ describe("InteractiveMode.setEditorComponent", () => {
 			setTerminalImageProtocol(originalProtocol);
 		}
 	});
+	it("preserves independently owned status components when starting the real working loader", () => {
+		const independentStatus = new Text("independent status", 0, 0);
+		mode.statusContainer.addChild(independentStatus);
+
+		mode.ensureLoadingAnimation();
+
+		const loadingAnimation = mode.loadingAnimation;
+		expect(loadingAnimation).toBeDefined();
+		if (!loadingAnimation) throw new Error("Expected the working loader");
+		expect(mode.statusContainer.children).toEqual([independentStatus, loadingAnimation]);
+		loadingAnimation.stop();
+	});
 });

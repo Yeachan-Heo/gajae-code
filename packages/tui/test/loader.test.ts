@@ -28,7 +28,6 @@ describe("Loader component", () => {
 		loader.stop();
 		tui.stop();
 	});
-
 	it("unrefs its animation interval so it does not keep the event loop alive", () => {
 		const term = new VirtualTerminal(20, 4);
 		const tui = new TUI(term);

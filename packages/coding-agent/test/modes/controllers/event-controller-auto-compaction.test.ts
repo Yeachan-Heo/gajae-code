@@ -13,7 +13,7 @@ type AutoCompactionFixture = {
 	showWarning: Mock<(message: string) => void>;
 	flushCompactionQueue: Mock<(options: { willRetry: boolean }) => Promise<void>>;
 	loaderStop: Mock<() => void>;
-	statusContainerClear: Mock<() => void>;
+	statusContainerRemoveChild: Mock<(component: unknown) => void>;
 	rebuildChatFromMessages: Mock<(policy: "replace-identity" | "reconcile-same-transcript") => void>;
 };
 
@@ -22,8 +22,8 @@ function createFixture(): AutoCompactionFixture {
 	const loaderStop = vi.fn(() => {
 		order.push("loader.stop");
 	});
-	const statusContainerClear = vi.fn(() => {
-		order.push("statusContainer.clear");
+	const statusContainerRemoveChild = vi.fn(() => {
+		order.push("statusContainer.removeChild");
 	});
 	const showStatus = vi.fn(() => {
 		order.push("showStatus");
@@ -45,7 +45,7 @@ function createFixture(): AutoCompactionFixture {
 		autoCompactionEscapeHandler: () => order.push("originalEscape"),
 		autoCompactionLoader: { stop: loaderStop },
 		editor: { onEscape: () => order.push("temporaryEscape") },
-		statusContainer: { clear: statusContainerClear },
+		statusContainer: { removeChild: statusContainerRemoveChild, children: [] },
 		statusLine: {
 			invalidate: vi.fn(() => {
 				order.push("statusLine.invalidate");
@@ -81,7 +81,7 @@ function createFixture(): AutoCompactionFixture {
 		showWarning,
 		flushCompactionQueue,
 		loaderStop,
-		statusContainerClear,
+		statusContainerRemoveChild,
 		rebuildChatFromMessages,
 	};
 }
@@ -111,7 +111,7 @@ describe("EventController auto-compaction overflow status", () => {
 		});
 
 		expect(fixture.loaderStop).toHaveBeenCalledTimes(1);
-		expect(fixture.statusContainerClear).toHaveBeenCalledTimes(1);
+		expect(fixture.statusContainerRemoveChild).toHaveBeenCalledTimes(1);
 		expect(fixture.ctx.autoCompactionLoader).toBeUndefined();
 		expect(fixture.showStatus).toHaveBeenCalledWith("Context overflow maintenance completed");
 		expect(fixture.showWarning).not.toHaveBeenCalled();
@@ -134,7 +134,7 @@ describe("EventController auto-compaction overflow status", () => {
 		expect(fixture.ctx.autoCompactionLoader).toBeUndefined();
 		expect(fixture.showStatus).toHaveBeenCalledWith("Context overflow maintenance skipped");
 		expect(fixture.showWarning).not.toHaveBeenCalled();
-		expect(fixture.order.indexOf("statusContainer.clear")).toBeLessThan(fixture.order.indexOf("showStatus"));
+		expect(fixture.order.indexOf("statusContainer.removeChild")).toBeLessThan(fixture.order.indexOf("showStatus"));
 		expect(fixture.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: true });
 	});
 

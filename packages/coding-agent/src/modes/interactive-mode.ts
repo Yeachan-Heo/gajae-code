@@ -1497,7 +1497,6 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	ensureLoadingAnimation(): void {
 		if (!this.loadingAnimation) {
-			this.statusContainer.clear();
 			this.loadingAnimation = new Loader(
 				this.ui,
 				spinner => {
