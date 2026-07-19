@@ -1340,6 +1340,23 @@ async function appendCodexWakeDiagnostic(
 	}
 }
 
+async function appendCodexWakePublishDiagnostic(
+	namespaceDir: string,
+	event: CodexWakeEventV1,
+	error: unknown,
+): Promise<void> {
+	const line = `${new Date().toISOString()} wake=${event.key} error=${codexWakeErrorCode(error)}\n`;
+	try {
+		await fs.appendFile(path.join(namespaceDir, "codex-wake-errors.log"), line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP), {
+			mode: 0o600,
+		});
+	} catch {
+		try {
+			process.stderr.write("codex-wake-diagnostic-unwritable\n");
+		} catch {}
+	}
+}
+
 async function autoBindDelegateCodexHandoff(
 	namespaceDir: string,
 	cwd: string,
@@ -1496,11 +1513,16 @@ async function publishRecordedCodexWake(
 		});
 		return published.published ? "published" : "thread_active_pending";
 	} catch (error) {
-		await updateCodexWakeEvent(namespaceDir, event.key, {
-			status: "failed",
-			attempts_delta: 1,
-			last_error: codexWakeErrorCode(error),
-		});
+		await appendCodexWakePublishDiagnostic(namespaceDir, event, error);
+		try {
+			await updateCodexWakeEvent(namespaceDir, event.key, {
+				status: "failed",
+				attempts_delta: 1,
+				last_error: codexWakeErrorCode(error),
+			});
+		} catch (updateError) {
+			await appendCodexWakePublishDiagnostic(namespaceDir, event, updateError);
+		}
 		return "failed";
 	}
 }
