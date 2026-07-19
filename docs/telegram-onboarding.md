@@ -315,8 +315,8 @@ The managed daemon can render:
 - inbound delivery acknowledgements.
 
 Tool activity updates such as `⚙ read — ok` are enabled by default. Send
-`/tools off` in the paired private chat to suppress them globally, or `/tools on`
-to restore them. The toggle is durable, works without a connected session, and
+`/toolactivity off` in the paired private chat to suppress them globally, or
+`/toolactivity on` to restore them. The toggle is durable, works without a connected session, and
 is also available under `/settings` → **Notifications** → **Preferences**.
 
 Reply paths:

@@ -43,7 +43,7 @@ import {
 	theme,
 } from "../../modes/theme/theme";
 import type { InteractiveModeContext, OAuthSelectorOptions } from "../../modes/types";
-import { getNotificationConfig, maskToken } from "../../sdk/bus/config";
+import { getNotificationConfig, isTelegramConfigured, maskToken } from "../../sdk/bus/config";
 import {
 	clearTelegramActivationMarker,
 	createTelegramActivationMarker,
@@ -228,6 +228,7 @@ export interface NotificationsEditorOperationDependencies {
 	saveTelegramInactive: typeof saveTelegramInactive;
 	removeTelegramConfiguration: typeof removeTelegramConfiguration;
 	unregisterNotificationRoot: typeof unregisterNotificationRoot;
+	reloadTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
 }
 
 const notificationEditorOperationDependencies: NotificationsEditorOperationDependencies = {
@@ -245,6 +246,8 @@ const notificationEditorOperationDependencies: NotificationsEditorOperationDepen
 	saveTelegramInactive,
 	removeTelegramConfiguration,
 	unregisterNotificationRoot,
+	reloadTelegramDaemon: async settings =>
+		await new TelegramDaemonController(settings).reload({ spawnIfStopped: false }),
 };
 
 function unavailableNotificationSessionStatus(): NotificationSessionStatus {
@@ -690,6 +693,12 @@ export function createNotificationsEditorOperations(
 						value: preferences.toolActivityEnabled,
 					},
 				]);
+				const config = services.getNotificationConfig(ctx.settings);
+				if (isTelegramConfigured(config)) {
+					const reload = await services.reloadTelegramDaemon(ctx.settings);
+					if (!reload.ok)
+						throw new Error(`Notification preferences were saved, but daemon reload failed: ${reload.message}`);
+				}
 				await notifyAfterDurableCommit();
 				return { receipt, message: "Notification preferences saved atomically." };
 			} catch (error) {

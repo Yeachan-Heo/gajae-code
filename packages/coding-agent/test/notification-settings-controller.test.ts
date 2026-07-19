@@ -15,7 +15,7 @@ import {
 	type NotificationsEditorOperationDependencies,
 } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import type { NotificationSettingsSnapshot } from "@gajae-code/coding-agent/sdk/bus/config";
+import { getNotificationConfig, type NotificationSettingsSnapshot } from "@gajae-code/coding-agent/sdk/bus/config";
 import {
 	createTelegramActivationMarker,
 	telegramActivationIdentity,
@@ -245,6 +245,11 @@ describe("notification settings controller adapter", () => {
 			commitAtomicBatch: async (patches: unknown[]) => {
 				events.push("commit");
 				batches.push(structuredClone(patches));
+				for (const patch of patches as Array<{ path?: string; value?: unknown }>) {
+					if (patch.path === "notifications.telegram.toolActivity.enabled" && typeof patch.value === "boolean") {
+						currentSnapshot.telegram.toolActivity.enabled = patch.value;
+					}
+				}
 				return receipt();
 			},
 		} as unknown as Settings;
@@ -281,6 +286,12 @@ describe("notification settings controller adapter", () => {
 				return recovery();
 			},
 			unregisterNotificationRoot: async () => ({ root: "/workspace/current/.gjc/state", remainingRoots: 1 }),
+			reloadTelegramDaemon: async input => {
+				expect(input).toBe(settings);
+				expect(getNotificationConfig(input).toolActivity.enabled).toBe(false);
+				events.push("reload");
+				return { ok: true, message: "reloaded" };
+			},
 
 			ensureTelegramDaemonRunningDetailed: async input => {
 				expect(input).toMatchObject({ cwd: "/workspace/current", sessionId: "session-current" });
@@ -432,6 +443,7 @@ describe("notification settings controller adapter", () => {
 		expect(controller.reconcileCurrentSession).toHaveBeenCalledWith(
 			expect.objectContaining({ sessionManager: ctx.sessionManager }),
 		);
+		events.length = 0;
 		await operations.commitPreferences({
 			redact: true,
 			verbosity: "verbose",
@@ -448,6 +460,7 @@ describe("notification settings controller adapter", () => {
 			{ path: "notifications.telegram.richDraft.enabled", op: "set", value: true },
 			{ path: "notifications.telegram.toolActivity.enabled", op: "set", value: false },
 		]);
+		expect(events).toEqual(["commit", "reload", "notify"]);
 
 		const discarded = await operations.preflightProposedIdentity(
 			{ token: secret() as never, chatId: "input-chat", richEnabled: true, richDraftEnabled: false },

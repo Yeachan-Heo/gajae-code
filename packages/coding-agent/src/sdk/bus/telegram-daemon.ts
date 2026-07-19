@@ -1018,7 +1018,12 @@ async function reloadStaleGenerationOwner(settings: Settings, deps: TelegramDaem
 		sleep: deps.sleep,
 		waitStepMs: deps.waitStepMs,
 	});
-	await controller.reload();
+	const result = await controller.reload();
+	if (!result.ok) throw new Error(`Telegram daemon generation reload failed: ${result.message}`);
+	const state = await readDaemonState(settings, deps.fs);
+	if (state?.generation !== DAEMON_GENERATION) {
+		throw new Error("Telegram daemon generation reload did not install the current generation.");
+	}
 }
 
 export interface BotApi {
@@ -4103,9 +4108,15 @@ export class TelegramNotificationDaemon {
 			if (msg.type === "tool_activity" && this.opts.toolActivity?.enabled === false) {
 				const toolCallId = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
 				const phase = typeof msg.phase === "string" ? msg.phase : undefined;
-				const hasVisibleStart =
-					toolCallId !== undefined && this.liveMessages.has(`${session.sessionId}:tool:${toolCallId}`);
-				if (phase === "started" || !hasVisibleStart) return;
+				if (phase === "started" || toolCallId === undefined) return;
+				const liveKey = `${session.sessionId}:tool:${toolCallId}`;
+				if (!this.liveMessages.has(liveKey)) {
+					// A start may already be granted to the serialized dispatcher but not
+					// yet recorded as visible. Wait for that exact dispatch boundary before
+					// deciding whether its terminal frame must close a visible message.
+					await this.flushChain;
+				}
+				if (!this.liveMessages.has(liveKey)) return;
 			}
 			const send = renderThreadedFrame(msg);
 			if (!send) return;
@@ -4498,10 +4509,21 @@ export class TelegramNotificationDaemon {
 			const m = (update as { update_id?: number; message?: Record<string, unknown> }).message;
 			const chat = m?.chat as { id?: unknown } | undefined;
 			const cmdText = typeof m?.text === "string" ? m.text : undefined;
-			const command = cmdText?.trim().split(/\s+/)[0]?.toLowerCase().split("@")[0];
+			const commandToken = cmdText?.trim().split(/\s+/)[0]?.toLowerCase();
+			const [command, commandSuffix] = commandToken?.split("@", 2) ?? [];
 			const isRichCommand = command === "/rich";
-			const isToolsCommand = command === "/tools";
-			if (m !== undefined && String(chat?.id) === String(this.opts.chatId) && (isRichCommand || isToolsCommand)) {
+			const isToolActivityCommand = command === "/toolactivity";
+			if (
+				isToolActivityCommand &&
+				commandSuffix &&
+				(!this.botUsername || commandSuffix !== this.botUsername.toLowerCase())
+			)
+				return;
+			if (
+				m !== undefined &&
+				String(chat?.id) === String(this.opts.chatId) &&
+				(isRichCommand || isToolActivityCommand)
+			) {
 				// These commands mutate global config, so honor them ONLY in the
 				// configured private chat. Fail closed for legacy or hand-edited group IDs.
 				if (!(await this.pairedChatIsPrivate())) return;
@@ -4526,8 +4548,8 @@ export class TelegramNotificationDaemon {
 				};
 				const desired = isRichCommand
 					? parseRichToggleCommand(cmdText ?? "")
-					: parseToolActivityToggleCommand(cmdText ?? "");
-				const usage = isRichCommand ? "Usage: /rich on|off" : "Usage: /tools on|off";
+					: parseToolActivityToggleCommand(cmdText ?? "", this.botUsername);
+				const usage = isRichCommand ? "Usage: /rich on|off" : "Usage: /toolactivity on|off";
 				if (desired === undefined) {
 					await reply(usage);
 					return;
@@ -4552,13 +4574,18 @@ export class TelegramNotificationDaemon {
 				} else {
 					this.opts.toolActivity = { enabled: desired };
 					if (!desired) {
-						this.pool.removeWhere(item => item.coalesceKey?.startsWith("tool:") === true);
+						this.pool.removeWhere(item => item.lane === "live" && item.coalesceKey?.startsWith("tool:") === true);
 						for (const [sessionId, frames] of this.pendingThreadedFrames) {
 							const retained = frames.filter(frame => frame.msg.type !== "tool_activity");
 							if (retained.length === 0) this.pendingThreadedFrames.delete(sessionId);
 							else this.pendingThreadedFrames.set(sessionId, retained);
 						}
 					}
+					// The policy flips before joining the serialized dispatch chain:
+					// future starts are rejected immediately, queued starts are removed,
+					// and any already-granted Bot API effect settles before the off
+					// acknowledgement. Visible starts may still receive their terminal edit.
+					await this.flushChain;
 				}
 				await reply(`${label}: ${desired ? "on" : "off"}`);
 				return;
@@ -4878,7 +4905,10 @@ export class TelegramNotificationDaemon {
 					{ command: "lean", description: "Mirror assistant text + tool names only (default)" },
 					{ command: "redact", description: "Toggle redaction of streamed content: /redact <on|off>" },
 					{ command: "rich", description: "Toggle rich Telegram delivery: /rich <on|off>" },
-					{ command: "tools", description: "Toggle tool activity updates: /tools <on|off>" },
+					{
+						command: "toolactivity",
+						description: "Toggle tool activity updates: /toolactivity <on|off>",
+					},
 					{ command: "reasoning", description: "Show or change reasoning effort in this session" },
 					{ command: "usage", description: "Show provider/local usage for this session" },
 					{ command: "model", description: "Select a model for this session" },
