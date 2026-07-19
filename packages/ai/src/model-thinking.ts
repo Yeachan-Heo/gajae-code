@@ -50,6 +50,7 @@ const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, E
 const GPT_5_2_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
+const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const CLOUDFLARE_AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic";
@@ -516,6 +517,9 @@ function applyOpenAICatalogPolicy(model: ApiModel<Api>, parsedModel: OpenAIModel
 }
 
 function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel: ParsedModel): Effort | undefined {
+	if (model.provider === "kimi-code" && model.id === "k3") {
+		return Effort.High;
+	}
 	if (
 		parsedModel.family === "openai" &&
 		model.provider === "openai-codex" &&
@@ -591,6 +595,9 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 }
 
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
+	if (model.provider === "kimi-code" && model.id === "k3") {
+		return KIMI_K3_EFFORTS;
+	}
 	switch (parsedModel.family) {
 		case "openai":
 			return inferOpenAISupportedEfforts(parsedModel);

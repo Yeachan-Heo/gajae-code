@@ -538,6 +538,24 @@ describe("model thinking runtime helpers", () => {
 		);
 	});
 
+	it("uses Kimi K3's discrete low, high, and max efforts", () => {
+		const model = createModel({
+			id: "k3",
+			api: "openai-completions",
+			provider: "kimi-code",
+		});
+
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+			defaultLevel: Effort.High,
+		});
+		expect(requireSupportedEffort(model, Effort.Max)).toBe(Effort.Max);
+		expect(() => requireSupportedEffort(model, Effort.Medium)).toThrow(/Supported efforts: low, high, max/);
+	});
+
 	it("derives binary-thinking fallback from resolved compat when catalog compat is partial", () => {
 		const model = enrichModelThinking({
 			id: "qwen/qwen3-32b",

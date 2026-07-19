@@ -122,33 +122,33 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "kimi-coding-plan-eco",
 		requiredProviders: ["kimi-code"],
 		mapping: {
-			default: "kimi-code/kimi-k2.7-code:low",
-			executor: "kimi-code/kimi-k2.7-code:minimal",
-			planner: "kimi-code/kimi-k2.7-code:low",
-			critic: "kimi-code/kimi-k2.7-code:medium",
-			architect: "kimi-code/kimi-k2.7-code:high",
+			default: "kimi-code/k3:low",
+			executor: "kimi-code/k3:low",
+			planner: "kimi-code/k3:low",
+			critic: "kimi-code/k3:high",
+			architect: "kimi-code/k3:high",
 		},
 	},
 	{
 		name: "kimi-coding-plan-medium",
 		requiredProviders: ["kimi-code"],
 		mapping: {
-			default: "kimi-code/kimi-k2.7-code:medium",
-			executor: "kimi-code/kimi-k2.7-code:low",
-			planner: "kimi-code/kimi-k2.7-code:medium",
-			critic: "kimi-code/kimi-k2.7-code:high",
-			architect: "kimi-code/kimi-k2.7-code:xhigh",
+			default: "kimi-code/k3:high",
+			executor: "kimi-code/k3:low",
+			planner: "kimi-code/k3:high",
+			critic: "kimi-code/k3:high",
+			architect: "kimi-code/k3:max",
 		},
 	},
 	{
 		name: "kimi-coding-plan-pro",
 		requiredProviders: ["kimi-code"],
 		mapping: {
-			default: "kimi-code/kimi-k2.7-code:xhigh",
-			executor: "kimi-code/kimi-k2.7-code:medium",
-			planner: "kimi-code/kimi-k2.7-code:high",
-			critic: "kimi-code/kimi-k2.7-code:xhigh",
-			architect: "kimi-code/kimi-k2.7-code:xhigh",
+			default: "kimi-code/k3:max",
+			executor: "kimi-code/k3:high",
+			planner: "kimi-code/k3:high",
+			critic: "kimi-code/k3:max",
+			architect: "kimi-code/k3:max",
 		},
 	},
 	{
@@ -456,7 +456,7 @@ describe("built-in model profile catalog", () => {
 			}
 		}
 		expect(missing).toEqual([]);
-		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.["kimi-k2.7-code"]).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>)["kimi-code"]?.k3).toBeDefined();
 		expect((modelsJson as Record<string, Record<string, unknown>>)["minimax-code"]?.["minimax-m3"]).toBeDefined();
 	});
 

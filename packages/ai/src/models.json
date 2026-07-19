@@ -21259,6 +21259,42 @@
 		}
 	},
 	"kimi-code": {
+		"k3": {
+			"id": "k3",
+			"name": "K3",
+			"api": "openai-completions",
+			"provider": "kimi-code",
+			"baseUrl": "https://api.kimi.com/coding/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 32000,
+			"compat": {
+				"thinkingFormat": "zai",
+				"reasoningContentField": "reasoning_content",
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"defaultLevel": "high",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
+			}
+		},
 		"kimi-for-coding": {
 			"id": "kimi-for-coding",
 			"name": "Kimi For Coding",
