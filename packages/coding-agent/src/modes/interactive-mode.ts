@@ -741,7 +741,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Start the UI
 		this.ui.start();
 		pushTerminalTitle();
-		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
+		setSessionTerminalTitle(
+			this.sessionManager.getSessionName(),
+			this.sessionManager.getCwd(),
+			this.sessionManager.getSessionId?.(),
+		);
 		this.updateEditorChrome();
 		this.#syncEditorMaxHeight();
 		this.isInitialized = true;

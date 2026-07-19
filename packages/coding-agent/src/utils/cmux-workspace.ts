@@ -1,4 +1,9 @@
-import { logger } from "@gajae-code/utils";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
+import { getAgentDir, logger } from "@gajae-code/utils";
+import { withFileLock } from "../config/file-lock";
 
 const CMUX_COMMAND = "cmux";
 const CMUX_WORKSPACE_ID_ENV = "CMUX_WORKSPACE_ID";
@@ -7,6 +12,7 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 const CMUX_WORKSPACE_TITLE_PREFIX = "GJC: ";
 const CMUX_WORKSPACE_RENAME_TIMEOUT_MS = 1500;
 const CMUX_WORKSPACE_LIST_TIMEOUT_MS = 1500;
+const CMUX_WORKSPACE_STATE_SCHEMA_VERSION = 1;
 
 export interface CmuxWorkspaceRenameCommand {
 	command: string;
@@ -21,6 +27,12 @@ export interface CmuxWorkspaceOwnership {
 	title: string;
 }
 
+export interface CmuxWorkspaceManagedOwnership {
+	schemaVersion: 1;
+	sessionId: string;
+	title: string;
+}
+
 export interface CmuxWorkspaceRenameProcess {
 	exited: Promise<number>;
 	kill(): void;
@@ -30,6 +42,7 @@ export interface CmuxWorkspaceRenameProcess {
 export interface CmuxWorkspaceTitleSyncOptions {
 	env?: NodeJS.ProcessEnv;
 	isTty?: boolean;
+	stateDir?: string;
 	which?: (command: string) => string | null;
 	spawn?: (
 		command: string[],
@@ -114,18 +127,25 @@ export function parseCmuxWorkspaceOwnership(jsonText: string, workspaceId: strin
 	return null;
 }
 
-/** Only rename when GJC owns the name:
+/** Only rename when the current session has durable ownership evidence:
  * - unknown ownership (read failed) → skip (fail safe, never clobber)
  * - already the desired title → skip (no-op)
- * - workspace still on its default title → rename
- * - any custom title (user- or peer-set) → skip
- * This makes GJC name a fresh workspace once and then leave it alone, so it
- * never overwrites a user-pinned name and multiple sessions sharing one
- * CMUX_WORKSPACE_ID do not thrash the workspace title. */
-export function shouldRenameCmuxWorkspace(ownership: CmuxWorkspaceOwnership | null, desiredTitle: string): boolean {
+ * - workspace still on its default title → rename and claim it
+ * - custom title matching this session's last successful rename → rename
+ * - any other custom title → skip
+ * The durable record distinguishes the owning session from peer GJC processes
+ * and user-pinned titles; a display prefix alone is never ownership proof. */
+export function shouldRenameCmuxWorkspace(
+	ownership: CmuxWorkspaceOwnership | null,
+	desiredTitle: string,
+	managedOwnership: CmuxWorkspaceManagedOwnership | null,
+	sessionId: string,
+): boolean {
 	if (!ownership) return false;
-	if ((sanitizeCmuxWorkspaceTitle(ownership.title) ?? "") === desiredTitle) return false;
-	return !ownership.hasCustomTitle;
+	const currentTitle = sanitizeCmuxWorkspaceTitle(ownership.title) ?? "";
+	if (currentTitle === desiredTitle) return false;
+	if (!ownership.hasCustomTitle) return true;
+	return managedOwnership?.sessionId === sessionId && managedOwnership.title === currentTitle;
 }
 
 async function defaultReadOwnership(
@@ -155,16 +175,53 @@ async function defaultReadOwnership(
 		return null;
 	}
 }
+function workspaceStateFile(workspaceId: string, stateDir: string): string {
+	const key = crypto.createHash("sha256").update(workspaceId.trim().toLowerCase()).digest("hex");
+	return path.join(stateDir, `${key}.json`);
+}
+
+async function readManagedOwnership(stateFile: string): Promise<CmuxWorkspaceManagedOwnership | null> {
+	try {
+		const parsed = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+		const sessionId = typeof parsed.session_id === "string" ? parsed.session_id.trim() : "";
+		const title = sanitizeCmuxWorkspaceTitle(typeof parsed.title === "string" ? parsed.title : undefined);
+		if (parsed.schema_version !== CMUX_WORKSPACE_STATE_SCHEMA_VERSION || !sessionId || !title) return null;
+		return { schemaVersion: 1, sessionId, title };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+			logger.debug("cmux workspace managed ownership read failed", { error: String(error) });
+		return null;
+	}
+}
+
+async function writeManagedOwnership(stateFile: string, ownership: CmuxWorkspaceManagedOwnership): Promise<void> {
+	const temporary = `${stateFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	await Bun.write(
+		temporary,
+		`${JSON.stringify({
+			schema_version: ownership.schemaVersion,
+			session_id: ownership.sessionId,
+			title: ownership.title,
+		})}\n`,
+	);
+	await fs.chmod(temporary, 0o600);
+	try {
+		await fs.rename(temporary, stateFile);
+	} catch (error) {
+		await fs.rm(temporary, { force: true });
+		throw error;
+	}
+}
 
 /**
  * Best-effort sync of the containing cmux workspace title to the current GJC
- * session name. Ownership-guarded: GJC reads the current workspace title and
- * only renames a workspace that still has its default title, so it never
- * overwrites a name the user pinned or a name a peer session (sharing the same
- * CMUX_WORKSPACE_ID) set. Opt out with GJC_NO_CMUX_RENAME.
+ * session name. A cross-process lock and durable session/title record serialize
+ * peer GJC writers and preserve unrelated custom titles. Opt out with
+ * GJC_NO_CMUX_RENAME.
  */
 export async function syncCmuxWorkspaceTitle(
 	sessionName: string | undefined,
+	sessionId: string | undefined,
 	options: CmuxWorkspaceTitleSyncOptions = {},
 ): Promise<void> {
 	const env = options.env ?? process.env;
@@ -174,7 +231,8 @@ export async function syncCmuxWorkspaceTitle(
 	if (!isTty) return;
 
 	const workspaceId = env[CMUX_WORKSPACE_ID_ENV]?.trim();
-	if (!workspaceId) return;
+	const normalizedSessionId = sessionId?.trim();
+	if (!workspaceId || !normalizedSessionId) return;
 
 	const desired = formatCmuxWorkspaceTitle(sessionName);
 	if (!desired) return;
@@ -189,45 +247,51 @@ export async function syncCmuxWorkspaceTitle(
 	}
 	if (!resolvedCommand) return;
 
-	let ownership: CmuxWorkspaceOwnership | null;
-	try {
-		const readOwnership = options.readOwnership ?? defaultReadOwnership;
-		ownership = await readOwnership(resolvedCommand, workspaceId, env);
-	} catch (error) {
-		logger.debug("cmux workspace ownership read failed", { error: String(error) });
-		return;
-	}
-
-	if (!shouldRenameCmuxWorkspace(ownership, desired)) return;
-
-	const plan = buildCmuxWorkspaceRenameCommand(sessionName, env);
-	if (!plan) return;
-
+	const stateDir = options.stateDir ?? path.join(getAgentDir(), "state", "cmux-workspaces");
+	const stateFile = workspaceStateFile(workspaceId, stateDir);
+	const readOwnership = options.readOwnership ?? defaultReadOwnership;
 	const spawn = options.spawn ?? defaultSpawn;
+
 	try {
-		const proc = spawn([resolvedCommand, ...plan.args], {
-			env,
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "ignore",
-		});
-		proc.unref();
-		const timer = setTimeout(() => {
-			try {
-				proc.kill();
-			} catch {}
-		}, CMUX_WORKSPACE_RENAME_TIMEOUT_MS);
-		timer.unref?.();
-		void proc.exited
-			.then(exitCode => {
-				clearTimeout(timer);
-				if (exitCode !== 0) logger.debug("cmux workspace rename exited non-zero", { exitCode });
-			})
-			.catch(error => {
-				clearTimeout(timer);
-				logger.debug("cmux workspace rename failed", { error: String(error) });
+		await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
+		await withFileLock(stateFile, async () => {
+			const ownership = await readOwnership(resolvedCommand, workspaceId, env);
+			const managedOwnership = await readManagedOwnership(stateFile);
+			if (!shouldRenameCmuxWorkspace(ownership, desired, managedOwnership, normalizedSessionId)) return;
+
+			const plan = buildCmuxWorkspaceRenameCommand(sessionName, env);
+			if (!plan) return;
+
+			const proc = spawn([resolvedCommand, ...plan.args], {
+				env,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
 			});
+			proc.unref();
+			const timer = setTimeout(() => {
+				try {
+					proc.kill();
+				} catch {}
+			}, CMUX_WORKSPACE_RENAME_TIMEOUT_MS);
+			timer.unref?.();
+
+			try {
+				const exitCode = await proc.exited;
+				if (exitCode !== 0) {
+					logger.debug("cmux workspace rename exited non-zero", { exitCode });
+					return;
+				}
+				await writeManagedOwnership(stateFile, {
+					schemaVersion: 1,
+					sessionId: normalizedSessionId,
+					title: desired,
+				});
+			} finally {
+				clearTimeout(timer);
+			}
+		});
 	} catch (error) {
-		logger.debug("cmux workspace rename failed to start", { error: String(error) });
+		logger.debug("cmux workspace title sync failed", { error: String(error) });
 	}
 }

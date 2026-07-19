@@ -9,6 +9,8 @@
 - Workflow-state handoff no longer self-locks the active-state cache, so a same-turn skill handoff (e.g. ultragoal → ralplan) completes instead of stalling behind a lock the handoff itself still holds (#2638).
 - SDK host shutdown now retries a failed broker unregister instead of short-circuiting with a stale broker-index entry, while retained startup-cleanup owner-release failures remain isolated from the red extension-error path (#2625).
 - Non-TTY launches now fail fast when stdin is empty and automatically use print mode for positional prompts and `@file` inputs, preventing orphaned interactive TUI processes (#2507).
+### Fixed
+- cmux workspace titles now follow later renames by the GJC session that originally claimed the workspace, using durable session/title ownership records and cross-process serialization so peer sessions and user-pinned titles remain preserved.
 
 ## [0.11.2] - 2026-07-19
 

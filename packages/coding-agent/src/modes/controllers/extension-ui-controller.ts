@@ -470,7 +470,11 @@ export class ExtensionUiController {
 				}
 				this.ctx.statusContainer.clear();
 				this.ctx.resetIrcSidebarSession();
-				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+				setSessionTerminalTitle(
+					this.ctx.sessionManager.getSessionName(),
+					this.ctx.sessionManager.getCwd(),
+					this.ctx.sessionManager.getSessionId?.(),
+				);
 
 				if (options?.setup) {
 					await options.setup(this.ctx.sessionManager);
@@ -540,7 +544,11 @@ export class ExtensionUiController {
 				const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
 				if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
 
-				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+				setSessionTerminalTitle(
+					this.ctx.sessionManager.getSessionName(),
+					this.ctx.sessionManager.getCwd(),
+					this.ctx.sessionManager.getSessionId?.(),
+				);
 				this.ctx.rebuildInitialMessages(
 					switchingToDifferentSession ? "replace-identity" : "reconcile-same-transcript",
 				);
@@ -1361,7 +1369,11 @@ export class ExtensionUiController {
 
 	async #updateSessionName(name: string): Promise<void> {
 		await this.ctx.sessionManager.setSessionName(name, "user");
-		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+		setSessionTerminalTitle(
+			this.ctx.sessionManager.getSessionName(),
+			this.ctx.sessionManager.getCwd(),
+			this.ctx.sessionManager.getSessionId?.(),
+		);
 	}
 
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {

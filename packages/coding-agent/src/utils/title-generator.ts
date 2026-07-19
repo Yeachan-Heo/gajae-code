@@ -217,9 +217,9 @@ export function setTerminalTitle(title: string): void {
 	process.stdout.write(`\x1b]0;${sanitizeTerminalTitlePart(title) ?? DEFAULT_TERMINAL_TITLE}\x07`);
 }
 
-export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
+export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string, sessionId?: string): void {
 	setTerminalTitle(formatSessionTerminalTitle(sessionName, cwd));
-	void syncCmuxWorkspaceTitle(sessionName);
+	void syncCmuxWorkspaceTitle(sessionName, sessionId);
 }
 
 /**

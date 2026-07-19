@@ -2050,9 +2050,14 @@ export class SelectorController {
 		const sessionManager = this.ctx.sessionManager as {
 			getSessionName?: () => string | undefined;
 			getCwd: () => string;
+			getSessionId?: () => string;
 			titleSource?: "auto" | "user" | undefined;
 		};
-		setSessionTerminalTitle(sessionManager.getSessionName?.(), sessionManager.getCwd());
+		setSessionTerminalTitle(
+			sessionManager.getSessionName?.(),
+			sessionManager.getCwd(),
+			sessionManager.getSessionId?.(),
+		);
 	}
 
 	async #deleteSession(sessionPath: string): Promise<void> {

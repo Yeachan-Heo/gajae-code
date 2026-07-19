@@ -487,7 +487,11 @@ export class PlanModeController {
 			!this.ctx.sessionManager.getSessionName() &&
 			(await this.ctx.sessionManager.setSessionName(name, "auto"))
 		) {
-			setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+			setSessionTerminalTitle(
+				this.ctx.sessionManager.getSessionName(),
+				this.ctx.sessionManager.getCwd(),
+				this.ctx.sessionManager.getSessionId?.(),
+			);
 			this.ctx.updateEditorChrome();
 		}
 		try {

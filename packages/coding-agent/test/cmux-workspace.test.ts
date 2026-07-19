@@ -1,6 +1,10 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	buildCmuxWorkspaceRenameCommand,
+	type CmuxWorkspaceManagedOwnership,
 	type CmuxWorkspaceOwnership,
 	formatCmuxWorkspaceTitle,
 	parseCmuxWorkspaceOwnership,
@@ -22,6 +26,16 @@ const LIST_JSON = JSON.stringify({
 });
 
 describe("cmux workspace title sync", () => {
+	let stateDir: string;
+
+	beforeEach(async () => {
+		stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cmux-workspace-test-"));
+	});
+
+	afterEach(async () => {
+		await fs.rm(stateDir, { recursive: true, force: true });
+	});
+
 	it("builds an explicit workspace rename command with the GJC prefix", () => {
 		expect(buildCmuxWorkspaceRenameCommand("Investigate Resolver", cmuxEnv())).toEqual({
 			command: "cmux",
@@ -67,50 +81,74 @@ describe("cmux workspace title sync", () => {
 	});
 
 	describe("shouldRenameCmuxWorkspace", () => {
-		const owned = (over: Partial<CmuxWorkspaceOwnership>): CmuxWorkspaceOwnership => ({
+		const current = (over: Partial<CmuxWorkspaceOwnership>): CmuxWorkspaceOwnership => ({
 			hasCustomTitle: true,
 			title: "current",
 			...over,
 		});
+		const managed = (over: Partial<CmuxWorkspaceManagedOwnership> = {}): CmuxWorkspaceManagedOwnership => ({
+			schemaVersion: 1,
+			sessionId: "session-a",
+			title: "GJC: Session A",
+			...over,
+		});
 
-		it("skips when ownership is unknown (read failed)", () => {
-			expect(shouldRenameCmuxWorkspace(null, "GJC: Desired")).toBe(false);
+		it("fails closed when cmux ownership cannot be read", () => {
+			expect(shouldRenameCmuxWorkspace(null, "GJC: Desired", managed(), "session-a")).toBe(false);
 		});
 
 		it("skips when the title already matches", () => {
-			expect(shouldRenameCmuxWorkspace(owned({ title: "GJC: Desired" }), "GJC: Desired")).toBe(false);
+			expect(
+				shouldRenameCmuxWorkspace(current({ title: "GJC: Desired" }), "GJC: Desired", managed(), "session-a"),
+			).toBe(false);
 		});
 
-		it("renames when the workspace still has the default title", () => {
-			expect(shouldRenameCmuxWorkspace(owned({ hasCustomTitle: false }), "GJC: Desired")).toBe(true);
+		it("allows a default workspace to be claimed", () => {
+			expect(
+				shouldRenameCmuxWorkspace(
+					current({ hasCustomTitle: false, title: "~/dev/x" }),
+					"GJC: Desired",
+					null,
+					"session-a",
+				),
+			).toBe(true);
 		});
 
-		it("skips a user- or peer-owned custom title", () => {
-			expect(shouldRenameCmuxWorkspace(owned({ title: "My Pinned Name" }), "GJC: Desired")).toBe(false);
-			expect(shouldRenameCmuxWorkspace(owned({ title: "GJC: Session A" }), "GJC: Session B")).toBe(false);
+		it("requires matching durable session and title evidence for a custom title", () => {
+			const ownership = current({ title: "GJC: Session A" });
+			expect(shouldRenameCmuxWorkspace(ownership, "GJC: Desired", null, "session-a")).toBe(false);
+			expect(shouldRenameCmuxWorkspace(ownership, "GJC: Desired", managed(), "session-b")).toBe(false);
+			expect(
+				shouldRenameCmuxWorkspace(ownership, "GJC: Desired", managed({ title: "GJC: Stale title" }), "session-a"),
+			).toBe(false);
+			expect(shouldRenameCmuxWorkspace(ownership, "GJC: Desired", managed(), "session-a")).toBe(true);
 		});
 	});
 
-	it("does not spawn outside a tty", async () => {
+	it("does not spawn outside a tty or without a session identity", async () => {
 		let spawned = false;
-		await syncCmuxWorkspaceTitle("Investigate Resolver", {
+		const options = {
 			env: cmuxEnv(),
 			isTty: false,
+			stateDir,
 			which: () => "/usr/local/bin/cmux",
 			readOwnership: async () => ({ hasCustomTitle: false, title: "default" }),
 			spawn: () => {
 				spawned = true;
 				return { exited: Promise.resolve(0), kill: () => {}, unref: () => {} };
 			},
-		});
+		};
+		await syncCmuxWorkspaceTitle("Investigate Resolver", "session-a", options);
+		await syncCmuxWorkspaceTitle("Investigate Resolver", undefined, { ...options, isTty: true });
 		expect(spawned).toBe(false);
 	});
 
 	it("does not spawn when GJC_NO_CMUX_RENAME is set", async () => {
 		let spawned = false;
-		await syncCmuxWorkspaceTitle("Investigate Resolver", {
+		await syncCmuxWorkspaceTitle("Investigate Resolver", "session-a", {
 			env: cmuxEnv("ws-optout", { GJC_NO_CMUX_RENAME: "1" }),
 			isTty: true,
+			stateDir,
 			which: () => "/usr/local/bin/cmux",
 			readOwnership: async () => ({ hasCustomTitle: false, title: "default" }),
 			spawn: () => {
@@ -121,36 +159,42 @@ describe("cmux workspace title sync", () => {
 		expect(spawned).toBe(false);
 	});
 
-	it("renames a default-titled workspace inside a tty cmux workspace", async () => {
-		const unref = vi.fn(() => {});
-		const kill = vi.fn(() => {});
+	it("claims a default workspace and lets only that session update it", async () => {
 		const calls: string[][] = [];
-
-		await syncCmuxWorkspaceTitle("Investigate Resolver", {
-			env: cmuxEnv("ws-default"),
+		let title = "~/dev/x";
+		let hasCustomTitle = false;
+		const options = {
+			env: cmuxEnv("ws-owned"),
 			isTty: true,
-			which: command => (command === "cmux" ? "/usr/local/bin/cmux" : null),
-			readOwnership: async () => ({ hasCustomTitle: false, title: "~/dev/x" }),
-			spawn: command => {
+			stateDir,
+			which: () => "/usr/local/bin/cmux",
+			readOwnership: async () => ({ hasCustomTitle, title }),
+			spawn: (command: string[]) => {
 				calls.push(command);
-				return { exited: Promise.resolve(0), kill, unref };
+				title = command.at(-1) ?? "";
+				hasCustomTitle = true;
+				return { exited: Promise.resolve(0), kill: () => {}, unref: () => {} };
 			},
-		});
+		};
+
+		await syncCmuxWorkspaceTitle("Session A task", "session-a", options);
+		await syncCmuxWorkspaceTitle("Renamed A task", "session-a", options);
+		await syncCmuxWorkspaceTitle("Session B task", "session-b", options);
 
 		expect(calls).toEqual([
-			["/usr/local/bin/cmux", "workspace", "rename", "ws-default", "--title", "GJC: Investigate Resolver"],
+			["/usr/local/bin/cmux", "workspace", "rename", "ws-owned", "--title", "GJC: Session A task"],
+			["/usr/local/bin/cmux", "workspace", "rename", "ws-owned", "--title", "GJC: Renamed A task"],
 		]);
-		expect(unref).toHaveBeenCalledTimes(1);
-		expect(kill).not.toHaveBeenCalled();
 	});
 
-	it("does not clobber a user-pinned workspace title", async () => {
+	it("preserves user-pinned titles even when they begin with the public GJC prefix", async () => {
 		let spawned = false;
-		await syncCmuxWorkspaceTitle("Investigate Resolver", {
+		await syncCmuxWorkspaceTitle("Investigate Resolver", "session-a", {
 			env: cmuxEnv("ws-userpinned"),
 			isTty: true,
+			stateDir,
 			which: () => "/usr/local/bin/cmux",
-			readOwnership: async () => ({ hasCustomTitle: true, title: "My Pinned Name" }),
+			readOwnership: async () => ({ hasCustomTitle: true, title: "GJC: My Pinned Name" }),
 			spawn: () => {
 				spawned = true;
 				return { exited: Promise.resolve(0), kill: () => {}, unref: () => {} };
@@ -159,45 +203,55 @@ describe("cmux workspace title sync", () => {
 		expect(spawned).toBe(false);
 	});
 
-	it("skips renaming when ownership cannot be read", async () => {
-		let spawned = false;
-		await syncCmuxWorkspaceTitle("Investigate Resolver", {
-			env: cmuxEnv("ws-unreadable"),
-			isTty: true,
-			which: () => "/usr/local/bin/cmux",
-			readOwnership: async () => null,
-			spawn: () => {
-				spawned = true;
-				return { exited: Promise.resolve(0), kill: () => {}, unref: () => {} };
-			},
-		});
-		expect(spawned).toBe(false);
-	});
-
-	it("does not thrash a workspace shared by multiple sessions", async () => {
-		// Two sessions share one CMUX_WORKSPACE_ID. Session A names the still-default
-		// workspace; session B then sees a custom title and must not overwrite it.
+	it("does not claim ownership when the rename command fails", async () => {
+		let title = "~/dev/x";
+		let hasCustomTitle = false;
+		let exitCode = 1;
 		const calls: string[][] = [];
-		const spawn = (command: string[]) => {
-			calls.push(command);
-			return { exited: Promise.resolve(0), kill: () => {}, unref: () => {} };
+		const options = {
+			env: cmuxEnv("ws-failed"),
+			isTty: true,
+			stateDir,
+			which: () => "/usr/local/bin/cmux",
+			readOwnership: async () => ({ hasCustomTitle, title }),
+			spawn: (command: string[]) => {
+				calls.push(command);
+				return { exited: Promise.resolve(exitCode), kill: () => {}, unref: () => {} };
+			},
 		};
-		await syncCmuxWorkspaceTitle("Session A task", {
-			env: cmuxEnv("ws-shared"),
+
+		await syncCmuxWorkspaceTitle("First attempt", "session-a", options);
+		title = "GJC: First attempt";
+		hasCustomTitle = true;
+		exitCode = 0;
+		await syncCmuxWorkspaceTitle("Second attempt", "session-a", options);
+
+		expect(calls).toHaveLength(1);
+	});
+
+	it("serializes peer sessions so only the first claimant renames a default workspace", async () => {
+		const calls: string[][] = [];
+		let title = "~/dev/x";
+		let hasCustomTitle = false;
+		const options = {
+			env: cmuxEnv("ws-concurrent"),
 			isTty: true,
+			stateDir,
 			which: () => "/usr/local/bin/cmux",
-			readOwnership: async () => ({ hasCustomTitle: false, title: "~/dev/x" }),
-			spawn,
-		});
-		await syncCmuxWorkspaceTitle("Session B task", {
-			env: cmuxEnv("ws-shared"),
-			isTty: true,
-			which: () => "/usr/local/bin/cmux",
-			readOwnership: async () => ({ hasCustomTitle: true, title: "GJC: Session A task" }),
-			spawn,
-		});
-		expect(calls).toEqual([
-			["/usr/local/bin/cmux", "workspace", "rename", "ws-shared", "--title", "GJC: Session A task"],
+			readOwnership: async () => ({ hasCustomTitle, title }),
+			spawn: (command: string[]) => {
+				calls.push(command);
+				title = command.at(-1) ?? "";
+				hasCustomTitle = true;
+				return { exited: Promise.resolve(0), kill: () => {}, unref: () => {} };
+			},
+		};
+
+		await Promise.all([
+			syncCmuxWorkspaceTitle("Session A", "session-a", options),
+			syncCmuxWorkspaceTitle("Session B", "session-b", options),
 		]);
+
+		expect(calls).toHaveLength(1);
 	});
 });
