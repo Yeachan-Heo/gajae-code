@@ -28,6 +28,7 @@ import {
 	bindDelegateCodexHandoff,
 	type CodexHandoffRegistrationV1,
 	type CodexWakeEventV1,
+	codexWakeLifecycle,
 	isCodexWakeEventKind,
 	listCodexHandoffs,
 	listCodexWakeEvents,
@@ -637,7 +638,7 @@ function toolSchema(name: CoordinatorToolName): {
 			inputSchema: { type: "object", properties: { session_id: sessionId }, required: ["session_id"] },
 		};
 	}
-	if (name === "gjc_coordinator_ack_codex_wake") {
+	if (name === "gjc_coordinator_ack_codex_handoff") {
 		return {
 			name,
 			description: "Acknowledge a durable Codex app-server resume wake event.",
@@ -1014,6 +1015,8 @@ function boundedCodexHandoffResponse(response: Record<string, unknown>): Record<
 	}
 	const handoff = boundedCodexHandoff(response.handoff);
 	if (handoff) output.handoff = handoff;
+	if (response.heartbeat?.supported === false && response.heartbeat.reason === "automation_update_unavailable")
+		output.heartbeat = { supported: false, reason: "automation_update_unavailable" };
 	return output;
 }
 
@@ -4232,7 +4235,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									| { kind: "tcp"; host: string; port: number },
 								token_file: args.token_file as string | null | undefined,
 							});
-							return { ok: true, handoff };
+							return {
+								ok: true,
+								handoff,
+								heartbeat: { supported: false, reason: "automation_update_unavailable" },
+							};
 						} catch (error) {
 							const code = error instanceof Error ? error.message : "invalid_codex_endpoint";
 							if (
@@ -4249,16 +4256,30 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_read_codex_handoff") {
 				const sessionId = safeExternalId("session", args.session_id);
-				const wakeEvents = (await listCodexWakeEvents(namespaceDir, sessionId)).slice(-100);
-				const pendingWakeEvents = (await listPendingCodexWakeEvents(namespaceDir, sessionId)).slice(-100);
+				const wakeEvents = (await listCodexWakeEvents(namespaceDir, sessionId))
+					.slice(-100)
+					.map(event => ({ ...event, lifecycle: codexWakeLifecycle(event.status) }));
+				const pendingWakeEvents = (await listPendingCodexWakeEvents(namespaceDir, sessionId))
+					.slice(-100)
+					.map(event => ({ ...event, lifecycle: codexWakeLifecycle(event.status) }));
 				return {
 					ok: true,
 					handoff: await readCodexHandoff(namespaceDir, sessionId),
+					heartbeat: { supported: false, reason: "automation_update_unavailable" },
+					lifecycle_schema: {
+						version: 1,
+						mapping: {
+							pending: "requested",
+							published: "delivered",
+							acked: "acknowledged",
+							failed: "failed",
+						},
+					},
 					wake_events: wakeEvents,
 					pending_wake_events: pendingWakeEvents,
 				};
 			}
-			if (name === "gjc_coordinator_ack_codex_wake") {
+			if (name === "gjc_coordinator_ack_codex_handoff") {
 				requireCoordinatorMutation(config, "sessions", args);
 				const idempotencyKey = requiredIdempotencyKey(args);
 				const sessionId = safeExternalId("session", args.session_id);
@@ -4277,7 +4298,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								error: { code: "not_found", message: `Codex wake event not found: ${wakeKey}` },
 							};
 						try {
-							return { ok: true, wake_event: await ackCodexWakeEvent(namespaceDir, wakeKey) };
+							const acknowledgedWakeEvent = await ackCodexWakeEvent(namespaceDir, wakeKey);
+							return {
+								ok: true,
+								wake_event: {
+									...acknowledgedWakeEvent,
+									lifecycle: codexWakeLifecycle(acknowledgedWakeEvent.status),
+								},
+							};
 						} catch (error) {
 							if (error instanceof Error && error.message === "resource_gone")
 								return {

@@ -637,3 +637,45 @@ documented lifecycle executed over our WebSocket transport/raw frames:
   never a crash.
 - initialized notification is now sent with NO params member, matching the generated
   ClientNotification type { "method": "initialized" } exactly.
+## Contract alignment RED — lifecycle mapping and heartbeat observability
+
+Command:
+
+```text
+bun test packages/coding-agent/test/coordinator-codex-bridge.test.ts
+```
+
+Verbatim RED output excerpts before implementation:
+
+```text
+error: expect(received).toMatchObject(expected)
+
+-   },
+-   "heartbeat": {
+-     "reason": "automation_update_unavailable",
+-     "supported": false,
+-   },
+
+- Expected  - 4
++ Received  + 4
+
+(fail) Coordinator Codex resume bridge > registers and reads handoffs without accepting raw token material or non-loopback endpoints
+
+error: expect(received).toMatchObject(expected)
+
+-       "lifecycle": "requested",
++       "status": "pending",
+
+- Expected  - 1
++ Received  + 42
+
+(fail) Coordinator Codex resume bridge > leaves active Codex threads pending and acknowledges the durable wake
+
+10 pass
+2 fail
+```
+
+## Contract-alignment smoke (2026-07-19T06:04:12Z)
+tools/list: 22 tools; ack tool is gjc_coordinator_ack_codex_handoff (renamed from ack_codex_wake)
+register response: heartbeat={supported:false, reason:automation_update_unavailable}
+read response: heartbeat gate + lifecycle_schema v1 mapping (pending->requested, published->delivered, acked->acknowledged, failed->failed); per-event lifecycle labels decorate wake_events

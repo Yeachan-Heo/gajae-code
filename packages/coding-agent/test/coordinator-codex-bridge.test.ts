@@ -97,12 +97,23 @@ describe("Coordinator Codex resume bridge", () => {
 				endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
 				token_file: path.join(root, "codex-token"),
 			},
+			heartbeat: { supported: false, reason: "automation_update_unavailable" },
 		});
 		await expect(
 			server.callTool("gjc_coordinator_read_codex_handoff", { session_id: "session-1" }),
 		).resolves.toMatchObject({
 			ok: true,
 			handoff: { thread_id: "thread-1", token_file: path.join(root, "codex-token") },
+			heartbeat: { supported: false, reason: "automation_update_unavailable" },
+			lifecycle_schema: {
+				version: 1,
+				mapping: {
+					pending: "requested",
+					published: "delivered",
+					acked: "acknowledged",
+					failed: "failed",
+				},
+			},
 			wake_events: [],
 			pending_wake_events: [],
 		});
@@ -261,17 +272,19 @@ describe("Coordinator Codex resume bridge", () => {
 		await expect(
 			server.callTool("gjc_coordinator_read_codex_handoff", { session_id: "session-1" }),
 		).resolves.toMatchObject({
-			pending_wake_events: [{ key: `session-1:${event.seq}`, status: "pending", attempts: 1 }],
+			pending_wake_events: [
+				{ key: `session-1:${event.seq}`, status: "pending", lifecycle: "requested", attempts: 1 },
+			],
 		});
 		expect(requests.map(request => request.method)).toEqual(["initialize", "thread/resume"]);
 		await expect(
-			server.callTool("gjc_coordinator_ack_codex_wake", {
+			server.callTool("gjc_coordinator_ack_codex_handoff", {
 				session_id: "session-1",
 				wake_key: `session-1:${event.seq}`,
 				idempotency_key: "ack-codex-wake",
 				allow_mutation: true,
 			}),
-		).resolves.toMatchObject({ ok: true, wake_event: { status: "acked" } });
+		).resolves.toMatchObject({ ok: true, wake_event: { status: "acked", lifecycle: "acknowledged" } });
 		await expect(
 			server.callTool("gjc_coordinator_read_codex_handoff", { session_id: "session-1" }),
 		).resolves.toMatchObject({
@@ -399,7 +412,7 @@ describe("Coordinator Codex resume bridge", () => {
 			attempts: 2,
 		});
 
-		await server.callTool("gjc_coordinator_ack_codex_wake", {
+		await server.callTool("gjc_coordinator_ack_codex_handoff", {
 			session_id: "session-1",
 			wake_key: `session-1:${published.seq}`,
 			idempotency_key: "ack-published-wake",

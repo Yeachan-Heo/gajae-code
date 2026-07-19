@@ -21,7 +21,7 @@ export const COORDINATOR_MCP_TOOL_NAMES = [
 	"gjc_coordinator_report_status",
 	"gjc_coordinator_register_codex_handoff",
 	"gjc_coordinator_read_codex_handoff",
-	"gjc_coordinator_ack_codex_wake",
+	"gjc_coordinator_ack_codex_handoff",
 	"gjc_delegate_plan",
 	"gjc_delegate_execute",
 	"gjc_delegate_team",
