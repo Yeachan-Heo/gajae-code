@@ -918,7 +918,7 @@ process.stdout.write(${JSON.stringify(output)});
 					`${mode}:${focusedPath}`,
 				).toBe(true);
 				if (focusedPath.startsWith("packages/coding-agent/"))
-					expect(entries.find((entry) => entry.key === "check:coding-agent")?.command).toEqual(["bun", "run", "check"]);
+					expect(entries.find((entry) => entry.key === "check:coding-agent")?.command).toEqual(["bun", "run", "check:types"]);
 				expect(entries.some((entry) => entry.key === "lint:coding-agent")).toBe(false);
 				const output = await Bun.file(outputFile).text();
 				expect(output).toContain("worktree_safety_required=true");

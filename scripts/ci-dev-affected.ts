@@ -95,7 +95,7 @@ export function planFocusedWorktreeTasks(paths: readonly string[]): Task[] {
 			tasks,
 			"check:coding-agent",
 			"Check @gajae-code/coding-agent",
-			["bun", "run", "check"],
+			["bun", "run", "check:types"],
 			resolvePackageCwd("packages/coding-agent"),
 		);
 	}

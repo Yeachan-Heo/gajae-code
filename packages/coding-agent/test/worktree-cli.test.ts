@@ -63,6 +63,7 @@ function renderedPath(value: string): string {
 	return value.replaceAll("\\", "\\\\");
 }
 const CHUNK_BYTES_FOR_TEST = 8192;
+const posixTest = test.skipIf(process.platform === "win32");
 
 describe("bounded worktree scanner", () => {
 	test("publishes fixed limits and preserves missing roots", async () => {
@@ -75,7 +76,7 @@ describe("bounded worktree scanner", () => {
 		expect(await scanWorktrees({ root: join(tmpdir(), "gjc-no-such-root"), platform: "posix" })).toEqual([]);
 	});
 
-	test("recognizes a valid pointer and reads bounded metadata in order", async () => {
+	posixTest("recognizes a valid pointer and reads bounded metadata in order", async () => {
 		await withRoot(async root => {
 			const candidate = join(root, "candidate");
 			const target = join(candidate, "meta", "worktrees", "one");
@@ -187,7 +188,7 @@ describe("bounded worktree scanner", () => {
 		});
 	});
 
-	test("classifies an empty gitfile as malformed", async () => {
+	posixTest("classifies an empty gitfile as malformed", async () => {
 		await withRoot(async root => {
 			const candidate = join(root, "empty-gitfile");
 			await mkdir(candidate);
@@ -202,14 +203,14 @@ describe("bounded worktree scanner", () => {
 			]);
 		});
 	});
-	test("rejects malformed metadata without exposing raw content", async () => {
+	posixTest("rejects malformed metadata without exposing raw content", async () => {
 		await withRoot(async root => {
 			const candidate = join(root, "bad");
 			await mkdir(candidate);
 			await writeFile(join(candidate, ".git"), Buffer.from([0xff, 0xfe]));
 			const result = await scanWorktrees({ root, platform: "posix" });
 			expect(result[0]?.message).toBe(".git file is not valid UTF-8; preserved");
-			expect(JSON.stringify(result)).not.toContain("ff");
+			expect(JSON.stringify(result)).not.toContain("\uFFFD");
 		});
 	});
 	test("preserves exact worker streams for empty list and root failure", async () => {
@@ -268,7 +269,7 @@ describe("bounded worktree scanner", () => {
 		});
 	});
 
-	test("rejects pointers outside the managed root and non-reciprocal metadata", async () => {
+	posixTest("rejects pointers outside the managed root and non-reciprocal metadata", async () => {
 		await withRoot(async root => {
 			const candidate = join(root, "candidate");
 			const target = join(tmpdir(), "gjc-worktree-outside-target");
@@ -364,7 +365,7 @@ describe("bounded worktree scanner", () => {
 		});
 	});
 
-	test("requires exact reciprocal metadata inside the managed root", async () => {
+	posixTest("requires exact reciprocal metadata inside the managed root", async () => {
 		await withRoot(async root => {
 			const candidate = join(root, "candidate");
 			const target = join(candidate, "meta", "worktrees", "one");
@@ -489,7 +490,7 @@ describe("bounded worktree scanner", () => {
 			}
 		});
 	});
-	test("never opens final-component links and revalidates pointer ancestors", async () => {
+	posixTest("never opens final-component links and revalidates pointer ancestors", async () => {
 		await withRoot(async root => {
 			const candidate = join(root, "linked-git");
 			const external = join(root, "external-metadata");
@@ -596,7 +597,7 @@ describe("bounded worktree scanner", () => {
 		});
 	});
 
-	test("proves exact 15-of-16 metadata reservation operations", async () => {
+	posixTest("proves exact 15-of-16 metadata reservation operations", async () => {
 		await withRoot(async root => {
 			for (let index = 0; index < 16; index++) {
 				const candidate = join(root, `protocol-${String(index).padStart(2, "0")}`);
@@ -690,7 +691,7 @@ describe("bounded worktree scanner", () => {
 		});
 	});
 
-	test("does not refund a reservation after an open failure", async () => {
+	posixTest("does not refund a reservation after an open failure", async () => {
 		await withRoot(async root => {
 			for (let index = 0; index < 16; index++) {
 				const candidate = join(root, `nonrefundable-${String(index).padStart(2, "0")}`);
@@ -787,7 +788,7 @@ describe("bounded worktree scanner", () => {
 		},
 	);
 
-	test("maps open, stat, read, identity, and close failures by phase", async () => {
+	posixTest("maps open, stat, read, identity, and close failures by phase", async () => {
 		const scenarios: Array<{
 			name: string;
 			openCode?: string;
@@ -864,90 +865,93 @@ describe("bounded worktree scanner", () => {
 			});
 		}
 	});
-	test("covers every hostile HEAD, commondir, and reciprocal gitdir family failure in precedence order", async () => {
-		const families = [
-			{
-				name: "HEAD",
-				file: "HEAD",
-				failures: [
-					["unreadable", "unreadable-head", "unreadable"],
-					["oversize", "oversize-head", Buffer.alloc(MAX_METADATA_BYTES + 1, 0x61)],
-					["invalid-utf8", "invalid-utf8-head", Buffer.from([0xff])],
-					["NUL", "nul-head", Buffer.from("ref: refs/heads/topic\0")],
-					["malformed", "malformed-head", "not-a-head"],
-				],
-				later: ["unreadable-gitdir", "oversize-gitdir", "invalid-utf8-gitdir", "nul-gitdir", "invalid-pointer"],
-			},
-			{
-				name: "commondir",
-				file: "commondir",
-				failures: [
-					["unreadable", "unreadable-commondir", "unreadable"],
-					["oversize", "oversize-commondir", Buffer.alloc(MAX_METADATA_BYTES + 1, 0x61)],
-					["invalid-utf8", "invalid-utf8-commondir", Buffer.from([0xff])],
-					["NUL", "nul-commondir", Buffer.from("../..\0")],
-					["malformed", "common-dir", ""],
-				],
-				later: [
-					"unreadable-head",
-					"oversize-head",
-					"invalid-utf8-head",
-					"nul-head",
-					"malformed-head",
-					"unreadable-gitdir",
-				],
-			},
-			{
-				name: "gitdir",
-				file: "gitdir",
-				failures: [
-					["unreadable", "unreadable-gitdir", "unreadable"],
-					["oversize", "oversize-gitdir", Buffer.alloc(MAX_METADATA_BYTES + 1, 0x61)],
-					["invalid-utf8", "invalid-utf8-gitdir", Buffer.from([0xff])],
-					["NUL", "nul-gitdir", Buffer.from(`${join("/tmp", "candidate", ".git")}\0`)],
-					["malformed", "invalid-pointer", ""],
-				],
-				later: [],
-			},
-		] as const;
-		for (const family of families) {
-			for (const [label, expected, content] of family.failures) {
-				await withRoot(async root => {
-					const candidate = join(root, `${family.name}-${label}`);
-					const target = join(candidate, "meta", "worktrees", "one");
-					await mkdir(target, { recursive: true });
-					await writeFile(join(candidate, ".git"), `gitdir: ${target}\n`);
-					await writeFile(join(target, "commondir"), "../..\n");
-					await writeFile(join(target, "HEAD"), "ref: refs/heads/topic\n");
-					await writeFile(join(target, "gitdir"), `${join(candidate, ".git")}\n`);
-					await writeFile(join(target, family.file), content);
-					if (family.name === "commondir") {
-						await writeFile(join(target, "HEAD"), "not-a-head");
-						await writeFile(join(target, "gitdir"), "");
-					} else if (family.name === "HEAD") {
-						await writeFile(join(target, "gitdir"), "");
-					}
-					const actualOpen = fsPromises.open;
-					const openSpy = spyOn(fsPromises, "open").mockImplementation(async (filePath, flags) => {
-						if (label === "unreadable" && String(filePath) === join(target, family.file))
-							throw Object.assign(new Error("synthetic unreadable metadata"), { code: "EACCES" });
-						return actualOpen(filePath, flags);
+	posixTest(
+		"covers every hostile HEAD, commondir, and reciprocal gitdir family failure in precedence order",
+		async () => {
+			const families = [
+				{
+					name: "HEAD",
+					file: "HEAD",
+					failures: [
+						["unreadable", "unreadable-head", "unreadable"],
+						["oversize", "oversize-head", Buffer.alloc(MAX_METADATA_BYTES + 1, 0x61)],
+						["invalid-utf8", "invalid-utf8-head", Buffer.from([0xff])],
+						["NUL", "nul-head", Buffer.from("ref: refs/heads/topic\0")],
+						["malformed", "malformed-head", "not-a-head"],
+					],
+					later: ["unreadable-gitdir", "oversize-gitdir", "invalid-utf8-gitdir", "nul-gitdir", "invalid-pointer"],
+				},
+				{
+					name: "commondir",
+					file: "commondir",
+					failures: [
+						["unreadable", "unreadable-commondir", "unreadable"],
+						["oversize", "oversize-commondir", Buffer.alloc(MAX_METADATA_BYTES + 1, 0x61)],
+						["invalid-utf8", "invalid-utf8-commondir", Buffer.from([0xff])],
+						["NUL", "nul-commondir", Buffer.from("../..\0")],
+						["malformed", "common-dir", ""],
+					],
+					later: [
+						"unreadable-head",
+						"oversize-head",
+						"invalid-utf8-head",
+						"nul-head",
+						"malformed-head",
+						"unreadable-gitdir",
+					],
+				},
+				{
+					name: "gitdir",
+					file: "gitdir",
+					failures: [
+						["unreadable", "unreadable-gitdir", "unreadable"],
+						["oversize", "oversize-gitdir", Buffer.alloc(MAX_METADATA_BYTES + 1, 0x61)],
+						["invalid-utf8", "invalid-utf8-gitdir", Buffer.from([0xff])],
+						["NUL", "nul-gitdir", Buffer.from(`${join("/tmp", "candidate", ".git")}\0`)],
+						["malformed", "invalid-pointer", ""],
+					],
+					later: [],
+				},
+			] as const;
+			for (const family of families) {
+				for (const [label, expected, content] of family.failures) {
+					await withRoot(async root => {
+						const candidate = join(root, `${family.name}-${label}`);
+						const target = join(candidate, "meta", "worktrees", "one");
+						await mkdir(target, { recursive: true });
+						await writeFile(join(candidate, ".git"), `gitdir: ${target}\n`);
+						await writeFile(join(target, "commondir"), "../..\n");
+						await writeFile(join(target, "HEAD"), "ref: refs/heads/topic\n");
+						await writeFile(join(target, "gitdir"), `${join(candidate, ".git")}\n`);
+						await writeFile(join(target, family.file), content);
+						if (family.name === "commondir") {
+							await writeFile(join(target, "HEAD"), "not-a-head");
+							await writeFile(join(target, "gitdir"), "");
+						} else if (family.name === "HEAD") {
+							await writeFile(join(target, "gitdir"), "");
+						}
+						const actualOpen = fsPromises.open;
+						const openSpy = spyOn(fsPromises, "open").mockImplementation(async (filePath, flags) => {
+							if (label === "unreadable" && String(filePath) === join(target, family.file))
+								throw Object.assign(new Error("synthetic unreadable metadata"), { code: "EACCES" });
+							return actualOpen(filePath, flags);
+						});
+						try {
+							const result = await scanWorktrees({ root, platform: "posix" });
+							const candidateResult = result.find(entry => entry.path === renderedPath(candidate));
+							expect(candidateResult?.reasonCode, `${family.name}/${label}`).toBe(expected);
+							expect(result.some(entry => family.later.some(reason => reason === entry.reasonCode))).toBe(false);
+							expect(result.some(entry => entry.reasonCode === "normal-pr")).toBe(false);
+						} finally {
+							openSpy.mockRestore();
+						}
 					});
-					try {
-						const result = await scanWorktrees({ root, platform: "posix" });
-						const candidateResult = result.find(entry => entry.path === renderedPath(candidate));
-						expect(candidateResult?.reasonCode, `${family.name}/${label}`).toBe(expected);
-						expect(result.some(entry => family.later.some(reason => reason === entry.reasonCode))).toBe(false);
-						expect(result.some(entry => entry.reasonCode === "normal-pr")).toBe(false);
-					} finally {
-						openSpy.mockRestore();
-					}
-				});
+				}
 			}
-		}
-	});
+		},
+	);
 
-	test("distinguishes 65536-byte metadata from a 65537-byte overflow read", async () => {
+	posixTest("distinguishes 65536-byte metadata from a 65537-byte overflow read", async () => {
 		await withRoot(async root => {
 			const exact = join(root, "exact");
 			const oversized = join(root, "oversized");
@@ -1036,7 +1040,7 @@ describe("bounded worktree scanner", () => {
 				const result = await scanWorktrees({ root, platform: "posix" });
 				expect(result).toEqual([
 					{
-						path: renderedPath(join(root, "%FF")),
+						path: `${renderedPath(root)}/%FF`,
 						kind: "unsupported",
 						reasonCode: "invalid-name",
 						message: "invalid UTF-8 directory name; preserved",
@@ -1061,7 +1065,7 @@ describe("bounded worktree scanner", () => {
 		},
 	);
 
-	test("accepts relative CRLF pointers and detached HEAD metadata", async () => {
+	posixTest("accepts relative CRLF pointers and detached HEAD metadata", async () => {
 		await withRoot(async root => {
 			const candidate = join(root, "relative");
 			const target = join(candidate, "meta", "worktrees", "one");
@@ -1081,7 +1085,7 @@ describe("bounded worktree scanner", () => {
 		});
 	});
 
-	test("uses frozen diagnostics for NUL, network pointers, and bare repositories", async () => {
+	posixTest("uses frozen diagnostics for NUL, network pointers, and bare repositories", async () => {
 		await withRoot(async root => {
 			const nul = join(root, "nul");
 			const network = join(root, "network");
@@ -1110,7 +1114,7 @@ describe("bounded worktree scanner", () => {
 		});
 	});
 
-	test("shares one exact 15-of-16 reservation protocol across metadata categories", async () => {
+	posixTest("shares one exact 15-of-16 reservation protocol across metadata categories", async () => {
 		await withRoot(async root => {
 			const metadataPaths: string[] = [];
 			for (let index = 0; index < 4; index++) {
@@ -1151,7 +1155,7 @@ describe("bounded worktree scanner", () => {
 		});
 	});
 
-	test("renders exact list and clear report-only output contracts", async () => {
+	posixTest("renders exact list and clear report-only output contracts", async () => {
 		await withRoot(async root => {
 			const candidate = join(root, "bare");
 			await mkdir(join(candidate, ".git"), { recursive: true });
