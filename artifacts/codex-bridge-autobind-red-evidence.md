@@ -744,3 +744,29 @@ Real installed app-server smoke (self-launched unix:// listener) now records:
     thread/resume response: thread.status: {"type":"active","activeFlags":[]}  (live turn running)
 The active status on resume while the started turn runs proves the idle gate
 reads genuine server state; turn was interrupted for cleanup.
+
+## Reviewer-reproduced RED->GREEN on the installed desktop control socket
+
+Reviewer ran the current publisher against the real installed app-server boundary
+(desktop control socket) and confirmed GREEN:
+
+    WebSocket Upgrade -> initialize -> initialized -> thread/resume completed in 1.4s, exit 0
+    {initialized:true, threadId:'019f780a-46e1-7921-a845-2f1cd9e6e64e', status:{type:'idle'}}
+
+(Same boundary that produced the recorded RED for the f792165d transport:
+codex_app_server_timeout after ~10s, exit 17.)
+
+Leader re-verification note: initialize+initialized over the same socket completes
+in ~4ms with the genuine Codex Desktop userAgent; a later thread/resume of that
+specific rollout returned a JSON-RPC error (rollout ownership/lifecycle varies by
+desktop session over time), surfaced correctly as codex_app_server_request_failed
+— never a timeout or crash. No turn/start was ever issued against the reviewer's
+live thread: waking the reviewing task recursively is out of bounds. turn/start
+coverage uses (a) the disposable self-launched server smoke (thread/start ->
+turn/start -> turn/interrupt, recorded above) and (b) the generated-schema-
+enforcing WebSocket fixture that rejects prompt-shaped bodies with -32602.
+
+Authorization placement (re-confirmed): token from token_file is sent exclusively
+as `Authorization: Bearer <token>` in the HTTP Upgrade; capture test proves the
+header exists only when token_file is configured and the token never appears in
+any JSON-RPC frame. No params-token merge exists in request().
