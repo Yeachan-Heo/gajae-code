@@ -679,3 +679,22 @@ error: expect(received).toMatchObject(expected)
 tools/list: 22 tools; ack tool is gjc_coordinator_ack_codex_handoff (renamed from ack_codex_wake)
 register response: heartbeat={supported:false, reason:automation_update_unavailable}
 read response: heartbeat gate + lifecycle_schema v1 mapping (pending->requested, published->delivered, acked->acknowledged, failed->failed); per-event lifecycle labels decorate wake_events
+
+## Reproduced RED -> GREEN on the identical real installed boundary
+
+Server: `codex app-server --listen unix:///Users/probe/git/probepark/gajae-code/.gjc/tmp/codex-app-server-red-20260719.sock`
+(codex-cli 0.144.5, freshly launched; same socket used for both runs).
+
+RED — f792165d transport extracted verbatim via `git show f792165d:...codex-wake-publisher.ts`
+(raw newline JSON-RPC, no WebSocket upgrade, no initialize, invented thread/status):
+
+    RED (f792165d transport, live installed app-server): codex_app_server_timeout after 10s
+    exit=17
+
+GREEN — current HEAD `createDefaultCodexTransportFactory()` against the same live server/socket:
+
+    initialize OK: {"userAgent":"gjc-red-green/0.144.5 (Mac OS 26.5.2; arm64) dumb (gjc-red-green; 0)"}
+    thread/start OK: id 019f78fa-6f90-78d0-8e7b-04600db6bb11 status {"type":"idle"}
+    turn/start OK: turn id 019f78fa-74d0-7441-80b0-fea378cbd901   (schema-shaped input + clientUserMessageId; immediately interrupted)
+    GREEN: full documented lifecycle succeeded on the same real boundary
+    green-exit=0
