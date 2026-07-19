@@ -4310,6 +4310,7 @@ test("daemon registers in-thread config and lifecycle commands and drops stale r
 	expect(cmds).toContain("verbose");
 	expect(cmds).toContain("lean");
 	expect(cmds).toContain("redact");
+	expect(cmds).toContain("tools");
 	const verbose = (call!.body.commands as Array<{ command: string; description: string }>).find(
 		command => command.command === "verbose",
 	);
@@ -8467,6 +8468,64 @@ describe("Telegram tool activity capability and routing", () => {
 		const threadedFrames = (TelegramNotificationDaemon as any).THREADED_FRAMES as Set<string>;
 		expect(threadedFrames.has("tool_activity")).toBe(true);
 		expect(threadedFrames.has("reasoning_summary")).toBe(true);
+	});
+	test("/tools persists the global toggle and immediately controls tool frames", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: s,
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: false },
+		});
+		const session = richSession();
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "hidden",
+			toolName: "read",
+			phase: "started",
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "hidden",
+			toolName: "read",
+			phase: "completed",
+		});
+		expect(bot.calls).toHaveLength(0);
+
+		await daemon.handleTelegramUpdate({
+			update_id: 960,
+			message: { chat: { id: 42, type: "private" }, text: "/tools on", message_id: 1 },
+		});
+		expect(s.get("notifications.telegram.toolActivity.enabled")).toBe(true);
+		expect(bot.calls.some(call => call.method === "sendMessage" && call.body.text === "Tool activity: on")).toBe(
+			true,
+		);
+
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "visible",
+			toolName: "read",
+			phase: "started",
+		});
+		expect(
+			bot.calls.some(call => call.method === "sendMessage" && String(call.body.text).includes("read — started")),
+		).toBe(true);
 	});
 	test("parallel tool bubbles retain in-flight entries and evict completed entries", async () => {
 		const agentDir = tempAgentDir();

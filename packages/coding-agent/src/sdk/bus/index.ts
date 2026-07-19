@@ -1049,6 +1049,7 @@ const defaultConfig: NotificationConfig = {
 	idleTimeoutMs: 60_000,
 	rich: { enabled: true },
 	richDraft: { enabled: false },
+	toolActivity: { enabled: true },
 	topics: {},
 	btw: { enabled: true },
 };

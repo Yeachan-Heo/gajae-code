@@ -48,6 +48,7 @@ function snapshot(overrides: Partial<NotificationSettingsSnapshot> = {}): Notifi
 			rich: { enabled: true },
 			btw: { enabled: true },
 			richDraft: { enabled: false },
+			toolActivity: { enabled: true },
 			topics: {},
 		},
 		discord: {},
@@ -142,6 +143,7 @@ function editorState(): NotificationsEditorState {
 			sessionScope: "all",
 			richEnabled: true,
 			richDraftEnabled: false,
+			toolActivityEnabled: true,
 		},
 	};
 }
@@ -436,6 +438,7 @@ describe("notification settings controller adapter", () => {
 			sessionScope: "primary",
 			richEnabled: false,
 			richDraftEnabled: true,
+			toolActivityEnabled: false,
 		});
 		expect(batches.at(-1)).toEqual([
 			{ path: "notifications.redact", op: "set", value: true },
@@ -443,6 +446,7 @@ describe("notification settings controller adapter", () => {
 			{ path: "notifications.sessionScope", op: "set", value: "primary" },
 			{ path: "notifications.telegram.rich.enabled", op: "set", value: false },
 			{ path: "notifications.telegram.richDraft.enabled", op: "set", value: true },
+			{ path: "notifications.telegram.toolActivity.enabled", op: "set", value: false },
 		]);
 
 		const discarded = await operations.preflightProposedIdentity(

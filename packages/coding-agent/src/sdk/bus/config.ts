@@ -64,6 +64,9 @@ export interface NotificationSettingsSnapshot {
 		richDraft: {
 			enabled: boolean;
 		};
+		toolActivity: {
+			enabled: boolean;
+		};
 		topics: {
 			nameTemplate?: string;
 		};
@@ -141,6 +144,7 @@ export function parseNotificationSettingsSnapshot(rawConfig?: unknown): Notifica
 	const btw = notificationSettingsObject(telegram.btw);
 	const rich = notificationSettingsObject(telegram.rich);
 	const richDraft = notificationSettingsObject(telegram.richDraft);
+	const toolActivity = notificationSettingsObject(telegram.toolActivity);
 	const topics = notificationSettingsObject(telegram.topics);
 	const activation = readTelegramActivationMarkers(notificationSettingsObject(telegram.activation));
 	const discord = notificationSettingsObject(notifications.discord);
@@ -160,6 +164,9 @@ export function parseNotificationSettingsSnapshot(rawConfig?: unknown): Notifica
 			},
 			richDraft: {
 				enabled: notificationSettingsBoolean(richDraft.enabled, false),
+			},
+			toolActivity: {
+				enabled: notificationSettingsBoolean(toolActivity.enabled, true),
 			},
 			topics: {
 				nameTemplate: notificationSettingsString(topics.nameTemplate),
@@ -224,6 +231,9 @@ export interface NotificationConfig {
 	richDraft: {
 		enabled: boolean;
 	};
+	toolActivity: {
+		enabled: boolean;
+	};
 	topics: {
 		/**
 		 * Optional Telegram forum-topic name template with `{repo}`, `{branch}`,
@@ -253,6 +263,7 @@ export function getNotificationConfig(settings: NotificationSettingsReader): Not
 		rich: snapshot.telegram.rich,
 		btw: snapshot.telegram.btw,
 		richDraft: snapshot.telegram.richDraft,
+		toolActivity: snapshot.telegram.toolActivity,
 		topics: snapshot.telegram.topics,
 	};
 }

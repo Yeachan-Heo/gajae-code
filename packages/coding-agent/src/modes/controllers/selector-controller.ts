@@ -333,6 +333,7 @@ export function createNotificationsEditorOperations(
 					sessionScope: config.sessionScope,
 					richEnabled: config.rich.enabled,
 					richDraftEnabled: config.richDraft.enabled,
+					toolActivityEnabled: config.toolActivity.enabled,
 				},
 			};
 		},
@@ -683,6 +684,11 @@ export function createNotificationsEditorOperations(
 					{ path: "notifications.sessionScope", op: "set", value: preferences.sessionScope },
 					{ path: "notifications.telegram.rich.enabled", op: "set", value: preferences.richEnabled },
 					{ path: "notifications.telegram.richDraft.enabled", op: "set", value: preferences.richDraftEnabled },
+					{
+						path: "notifications.telegram.toolActivity.enabled",
+						op: "set",
+						value: preferences.toolActivityEnabled,
+					},
 				]);
 				await notifyAfterDurableCommit();
 				return { receipt, message: "Notification preferences saved atomically." };

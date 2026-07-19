@@ -615,6 +615,7 @@ function fixedEditorState(
 		sessionScope: "all",
 		richEnabled: true,
 		richDraftEnabled: false,
+		toolActivityEnabled: true,
 	};
 
 	switch (stateId) {

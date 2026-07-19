@@ -5,6 +5,7 @@ import {
 	parseInThreadConfigCommand,
 	parseRichToggleCommand,
 	parseTelegramControlCommand,
+	parseToolActivityToggleCommand,
 } from "../src/sdk/bus/config-commands";
 
 describe("parseInThreadConfigCommand", () => {
@@ -71,6 +72,25 @@ describe("parseRichToggleCommand", () => {
 		expect(parseRichToggleCommand("/verbose")).toBeUndefined();
 		expect(parseRichToggleCommand("rich on")).toBeUndefined();
 		expect(parseRichToggleCommand("")).toBeUndefined();
+	});
+});
+
+describe("parseToolActivityToggleCommand", () => {
+	test("parses on/off aliases and bot suffixes", () => {
+		expect(parseToolActivityToggleCommand("/tools on")).toBe(true);
+		expect(parseToolActivityToggleCommand("/tools true")).toBe(true);
+		expect(parseToolActivityToggleCommand("/tools 1")).toBe(true);
+		expect(parseToolActivityToggleCommand("/tools off")).toBe(false);
+		expect(parseToolActivityToggleCommand("/tools false")).toBe(false);
+		expect(parseToolActivityToggleCommand("/tools 0")).toBe(false);
+		expect(parseToolActivityToggleCommand("/TOOLS@GajaeCodeBot OFF")).toBe(false);
+	});
+
+	test("rejects missing, invalid, and unrelated commands", () => {
+		expect(parseToolActivityToggleCommand("/tools")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/tools maybe")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/tool off")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("tools off")).toBeUndefined();
 	});
 });
 

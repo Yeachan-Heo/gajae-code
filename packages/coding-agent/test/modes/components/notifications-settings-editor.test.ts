@@ -77,6 +77,7 @@ function state(): NotificationsEditorState {
 			sessionScope: "all",
 			richEnabled: true,
 			richDraftEnabled: false,
+			toolActivityEnabled: true,
 		},
 		health: health(),
 	};
@@ -293,11 +294,18 @@ describe("NotificationsSettingsEditorComponent", () => {
 		expect(render(component)).toContain("unsaved draft");
 		component.handleInput("\n"); // redact on in the editor-only preference draft
 		expect(operations.committedPreferences).toEqual([]);
-		select(component, 5);
+		select(component, 6);
 		component.handleInput("\n");
 		await flush();
 		expect(operations.committedPreferences).toEqual([
-			{ redact: true, verbosity: "lean", sessionScope: "all", richEnabled: true, richDraftEnabled: false },
+			{
+				redact: true,
+				verbosity: "lean",
+				sessionScope: "all",
+				richEnabled: true,
+				richDraftEnabled: false,
+				toolActivityEnabled: true,
+			},
 		]);
 	});
 
