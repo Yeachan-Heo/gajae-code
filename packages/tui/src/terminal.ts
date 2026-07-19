@@ -10,6 +10,47 @@ const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 
 /**
+ * Capability-probe reply shapes that GJC itself solicits from the terminal
+ * (OSC 11 background color, the DA1 sentinel, the Mode 2031 appearance DSR, and
+ * the Kitty keyboard-flags report). Each entry pairs the query GJC issues with
+ * the exact anchored reply shape it produces.
+ *
+ * These are terminal->host replies and are NEVER legitimate user input on the
+ * TUI's own stdin (child-tool stdout goes to the tool's own PTY, not here), so
+ * a reply that arrives outside its pending-query window - a late or duplicate
+ * reply, or a probe that straddled a foreground-tool suspend/resume - can be
+ * dropped without ever swallowing a real keystroke. Bracketed-paste content is
+ * routed through StdinBuffer's separate 'paste' event and never reaches the
+ * 'data' handler, so pasted reply-shaped bytes are structurally unaffected.
+ *
+ * This registry is the single source of truth shared by the defensive strip in
+ * #setupStdinBuffer and the probe-coverage regression test: adding a new probe
+ * query without a matching reply entry fails that test.
+ */
+export const PROBE_REPLY_PATTERNS: ReadonlyArray<{ name: string; issuedProbe: string; pattern: RegExp }> = [
+	{
+		name: "osc11-background",
+		issuedProbe: "\x1b]11;?\x07",
+		pattern: /^\x1b\]11;rgba?:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}(?:\x07|\x1b\\)$/,
+	},
+	{ name: "da1-primary", issuedProbe: "\x1b[c", pattern: /^\x1b\[\?[\d;]*c$/ },
+	{ name: "mode2031-dsr", issuedProbe: "\x1b[?2031h", pattern: /^\x1b\[\?997;[12]n$/ },
+	{ name: "kitty-flags", issuedProbe: "\x1b[?u", pattern: /^\x1b\[\?\d+u$/ },
+];
+
+/**
+ * True when `sequence` is a capability-probe reply GJC solicited (see
+ * PROBE_REPLY_PATTERNS). Used as a defensive backstop before forwarding stdin
+ * sequences to the input handler.
+ */
+export function isUnsolicitedProbeReply(sequence: string): boolean {
+	for (const entry of PROBE_REPLY_PATTERNS) {
+		if (entry.pattern.test(sequence)) return true;
+	}
+	return false;
+}
+
+/**
  * Whether GJC may reprogram the keyboard with enhanced input protocols
  * (the Kitty keyboard protocol and the xterm modifyOtherKeys fallback).
  *
@@ -514,6 +555,18 @@ export class ProcessTerminal implements Terminal {
 					this.#mode2031DebounceTimer = undefined;
 					this.#queryBackgroundColor();
 				}, 100);
+				return;
+			}
+			// Defensive backstop against the otty input-freeze: a capability-probe
+			// reply that reaches this point arrived outside its pending-query window
+			// (late/duplicate reply, or a probe that straddled a foreground-tool
+			// suspend/resume), so the pending-window handlers above did not consume
+			// it. Some shapes (Mode 2031 DSR) are also caught by dedicated handlers
+			// earlier; this backstop guarantees none can leak into the editor
+			// regardless of handler ordering or reply timing. These shapes are never
+			// user input and paste content never reaches this handler, so dropping
+			// is always safe.
+			if (isUnsolicitedProbeReply(sequence)) {
 				return;
 			}
 			if (this.#inputHandler) {
