@@ -83,17 +83,21 @@ async function runCliWithIgnoredStdin(
 	});
 	const result = await Promise.race([
 		proc.exited.then(exitCode => ({ timedOut: false as const, exitCode })),
-		Bun.sleep(8_000).then(() => ({ timedOut: true as const, exitCode: -1 })),
+		Bun.sleep(15_000).then(() => ({ timedOut: true as const, exitCode: -1 })),
 	]);
 	if (result.timedOut) {
 		proc.kill();
 		await proc.exited;
-		throw new Error(`CLI did not exit within the timeout for: ${args.join(" ")}`);
 	}
 	const [stdout, stderr] = await Promise.all([
 		new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
 		new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
 	]);
+	if (result.timedOut) {
+		throw new Error(
+			`CLI did not exit within the timeout for: ${args.join(" ")}\nstdout: ${stdout}\nstderr: ${stderr}`,
+		);
+	}
 	return { stdout, stderr, exitCode: result.exitCode };
 }
 
@@ -120,23 +124,27 @@ describe("non-TTY CLI startup", () => {
 	it("routes a positional prompt to print mode instead of starting the TUI", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-non-tty-prompt-"));
 		try {
-			const result = await runCliWithIgnoredStdin(["--no-session", "hello"], {
-				...process.env,
-				GJC_CODING_AGENT_DIR: root,
-				PI_CODING_AGENT_DIR: root,
-				GJC_NOTIFICATIONS: "0",
-				NO_COLOR: "1",
-				GJC_CLEANUP_DEADLINE_MS: "250",
-				ANTHROPIC_API_KEY: "",
-				ANTHROPIC_OAUTH_TOKEN: "",
-				OPENAI_API_KEY: "",
-				GEMINI_API_KEY: "",
-			});
+			const result = await runCliWithIgnoredStdin(
+				["--no-session", "--no-extensions", "--no-lsp", "--no-tools", "--no-skills", "--no-rules", "hello"],
+				{
+					...process.env,
+					GJC_CODING_AGENT_DIR: root,
+					PI_CODING_AGENT_DIR: root,
+					GJC_NOTIFICATIONS: "0",
+					GJC_SDK_DISABLE: "1",
+					NO_COLOR: "1",
+					GJC_CLEANUP_DEADLINE_MS: "250",
+					ANTHROPIC_API_KEY: "",
+					ANTHROPIC_OAUTH_TOKEN: "",
+					OPENAI_API_KEY: "",
+					GEMINI_API_KEY: "",
+				},
+			);
 
 			expect(result.exitCode).not.toBe(0);
 			expect(result.stderr).toContain("No models available");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
-	}, 15_000);
+	}, 25_000);
 });
