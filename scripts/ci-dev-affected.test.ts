@@ -132,7 +132,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 			"run: bun test packages/coding-agent/test/worktree-cli.test.ts",
 			"run: bun test scripts/check-worktree-report-capabilities.test.ts",
 			"run: bun scripts/check-worktree-report-capabilities.ts",
-			"run: bun run check",
+			"run: bun run check:types",
 		])
 			expect(safetyJob, step).toContain(step);
 		for (const forbidden of ["dtolnay/rust-toolchain", "cargo ", "packages/natives", "--native-build"])

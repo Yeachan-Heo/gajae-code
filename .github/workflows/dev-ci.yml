@@ -103,7 +103,7 @@ jobs:
       - run: bun test scripts/check-worktree-report-capabilities.test.ts
       - run: bun scripts/check-worktree-report-capabilities.ts
       - working-directory: packages/coding-agent
-        run: bun run check
+        run: bun run check:types
   windows-dev-doctor:
     name: Windows dev:doctor
     needs: [affected-plan]
