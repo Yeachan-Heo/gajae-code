@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import packageJson from "../package.json";
 import { parseArgs } from "../src/cli/args";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
@@ -47,6 +48,37 @@ describe("GJC public CLI command surface", () => {
 			"completion",
 			"launch",
 		]);
+	});
+
+	it("tombstones the removed worktree package subpaths", () => {
+		for (const subpath of [
+			"./cli/worktree-cli",
+			"./cli/worktree-cli.js",
+			"./commands/worktree",
+			"./commands/worktree.js",
+		] as const)
+			expect(packageJson.exports[subpath]).toBeNull();
+	});
+
+	it.each([
+		"@gajae-code/coding-agent/cli/worktree-cli",
+		"@gajae-code/coding-agent/commands/worktree",
+	])("rejects resolution of the removed %s subpath", async subpath => {
+		const child = Bun.spawn([process.execPath, "-e", `await import(${JSON.stringify(subpath)})`], {
+			cwd: import.meta.dir,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		const output = `${stdout}${stderr}`;
+
+		expect(exitCode).not.toBe(0);
+		expect(output).toMatch(/error/i);
+		expect(output).toContain(subpath);
 	});
 
 	it("exposes the update command help without launching the TUI", () => {

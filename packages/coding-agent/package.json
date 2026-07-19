@@ -170,6 +170,8 @@
 			"types": "./src/capability/*.ts",
 			"import": "./src/capability/*.ts"
 		},
+		"./cli/worktree-cli": null,
+		"./cli/worktree-cli.js": null,
 		"./cli/*": {
 			"types": "./src/cli/*.ts",
 			"import": "./src/cli/*.ts"
@@ -186,6 +188,8 @@
 		"./commands/ultraqa": null,
 		"./commands/ultrawork": null,
 		"./commands/performance-goal": null,
+		"./commands/worktree": null,
+		"./commands/worktree.js": null,
 		"./commands/*": {
 			"types": "./src/commands/*.ts",
 			"import": "./src/commands/*.ts"
