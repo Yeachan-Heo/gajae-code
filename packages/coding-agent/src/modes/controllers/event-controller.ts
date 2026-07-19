@@ -811,9 +811,16 @@ export class EventController {
 
 	async #handleAgentEnd(_event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
 		if (this.ctx.loadingAnimation) {
-			this.ctx.loadingAnimation.stop();
+			const loader = this.ctx.loadingAnimation;
+			loader.stop();
 			this.ctx.loadingAnimation = undefined;
+			// Process terminals do not expose native scrollback position. Preserve
+			// the loader's actual footprint so completion cannot contract and repaint
+			// a viewport the user is browsing.
 			this.ctx.statusContainer.clear();
+			if (this.ctx.ui.terminal.isProcessTerminal) {
+				this.ctx.statusContainer.addChild(loader.createFootprint());
+			}
 		}
 		if (this.ctx.streamingComponent) {
 			this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);

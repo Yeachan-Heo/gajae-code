@@ -121,6 +121,7 @@ describe("EventController completion viewport", () => {
 					});
 					const pendingMessagesContainer = new Container();
 					const statusContainer = new Container();
+					statusContainer.addChild(new Text("", 0, 0));
 					statusContainer.addChild(new Text("working", 0, 0));
 					const todoContainer = new Container();
 					const btwContainer = new Container();
@@ -136,6 +137,9 @@ describe("EventController completion viewport", () => {
 					ui.addChild(editor);
 					ui.setBottomPinnedComponent(statusLine);
 					const stopLoading = vi.fn();
+					const createFootprint = vi.fn(() => ({
+						render: () => ["", ""],
+					}));
 					const ctx = {
 						isInitialized: true,
 						ui,
@@ -149,7 +153,7 @@ describe("EventController completion viewport", () => {
 						getUserMessageText: (userMessage: { content: string }) => userMessage.content,
 						streamingComponent,
 						streamingMessage: startMessage,
-						loadingAnimation: { stop: stopLoading },
+						loadingAnimation: { stop: stopLoading, createFootprint },
 						pendingTools: new Map(),
 						planModeController: { flushPendingModelSwitch: async () => {} },
 						updateEditorTopBorder: () => {},
@@ -187,16 +191,21 @@ describe("EventController completion viewport", () => {
 						await controller.handleEvent({ type: "message_end", message });
 						expect(getSessionMessageViewportAnchorId(message)).toBe(anchorId);
 						await term.waitForRender();
+						term.clearWriteLog();
 						await controller.handleEvent({ type: "agent_end", messages: [message] });
 						await term.waitForRender();
 						expect(stopLoading, `${testCase.label} clear=${clearOnShrink}`).toHaveBeenCalledTimes(1);
+						expect(createFootprint, `${testCase.label} clear=${clearOnShrink}`).toHaveBeenCalledTimes(1);
 						expect(ctx.loadingAnimation, `${testCase.label} clear=${clearOnShrink}`).toBeUndefined();
-						expect(statusContainer.children, `${testCase.label} clear=${clearOnShrink}`).toHaveLength(0);
+						expect(statusContainer.children, `${testCase.label} clear=${clearOnShrink}`).toHaveLength(1);
 						const after = term.getViewport().map(line => line.trimEnd());
 						for (const entry of beforeHistory) expect(after[entry.index]).toBe(entry.line);
 						const writes = term.getWriteLog().join("");
 						expect(writes).not.toContain("\x1b[2J\x1b[H");
 						expect(writes).not.toContain("\x1b[3J");
+						for (const entry of beforeHistory) {
+							expect(writes, `${testCase.label} clear=${clearOnShrink}`).not.toContain(entry.line);
+						}
 						const visibleHistoryNumbers = beforeHistory.flatMap(entry => {
 							const match = /history-(\d+)/.exec(entry.line);
 							return match ? [Number(match[1])] : [];

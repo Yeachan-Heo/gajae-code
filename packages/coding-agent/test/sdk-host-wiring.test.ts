@@ -2028,7 +2028,14 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 			sessionManager: {
 				getSessionId: () => activeSessionId,
 				getSessionName: () => "SDK rotate",
-				getUsageStatistics: () => ({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 }),
+				getUsageStatistics: () => ({
+					input: 1,
+					output: 2,
+					cacheRead: 0,
+					cacheWrite: 0,
+					premiumRequests: 0,
+					cost: 0,
+				}),
 			},
 		};
 		// Fail A's owner release exactly once so the rotate-time stopSession(prevId)

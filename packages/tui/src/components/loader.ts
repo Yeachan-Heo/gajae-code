@@ -1,5 +1,5 @@
 import { type AnimationRegistration, registerAnimationCallback } from "../animation-scheduler";
-import type { TUI } from "../tui";
+import type { Component, TUI } from "../tui";
 import { sliceByColumn, visibleWidth } from "../utils";
 import { Text } from "./text";
 
@@ -43,6 +43,18 @@ export class Loader extends Text {
 			this.#frames = spinnerFrames;
 		}
 		this.start();
+	}
+
+	/**
+	 * Retains this loader's current render footprint without retaining its visible
+	 * status text. Use after stopping a loader when removing rows would repaint an
+	 * inline terminal viewport.
+	 */
+	createFootprint(): Component {
+		return {
+			render: width => this.render(width).map(() => ""),
+			invalidate: () => {},
+		};
 	}
 
 	render(width: number): string[] {

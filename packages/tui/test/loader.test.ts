@@ -28,6 +28,25 @@ describe("Loader component", () => {
 		loader.stop();
 		tui.stop();
 	});
+	it("preserves its dynamic render footprint without visible status text", () => {
+		const term = new VirtualTerminal(40, 4);
+		const tui = new TUI(term);
+		const loader = new Loader(
+			tui,
+			text => text,
+			text => text,
+			"A long status message that wraps",
+			["|"],
+		);
+
+		const footprint = loader.createFootprint();
+		for (const width of [4, 40]) {
+			expect(footprint.render(width)).toEqual(loader.render(width).map(() => ""));
+		}
+
+		loader.stop();
+		tui.stop();
+	});
 
 	it("unrefs its animation interval so it does not keep the event loop alive", () => {
 		const term = new VirtualTerminal(20, 4);
