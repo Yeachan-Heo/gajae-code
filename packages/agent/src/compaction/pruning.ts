@@ -9,8 +9,9 @@
  */
 
 import type { ToolCall, ToolResultMessage } from "@gajae-code/ai";
+import { sanitizeText } from "@gajae-code/utils";
 import type { AgentMessage } from "../types";
-import { estimateEntryTokens } from "./compaction";
+import { estimateEntryTokens, estimateTextTokensHeuristic } from "./compaction";
 import type { SessionEntry, SessionMessageEntry } from "./entries";
 
 export interface PruneConfig {
@@ -78,16 +79,6 @@ function lastNonEmptyLine(text: string): string | undefined {
 	return text.trim().split(/\r?\n/).filter(Boolean).at(-1)?.trim();
 }
 
-function errorResultDigest(message: ToolResultMessage): string | undefined {
-	if (message.isError !== true) return undefined;
-	const text = firstTextContent(message);
-	if (text.trim().length === 0) return "error=tool result failed without text";
-	const error = firstErrorLine(text);
-	if (error) return `error=${error}`;
-	const summary = firstNonEmptyLine(text) ?? lastNonEmptyLine(text);
-	return summary ? `summary=${summary}` : undefined;
-}
-
 function truncateField(value: string, maxLength: number): string {
 	if (value.length <= maxLength) return value;
 	if (maxLength <= 1) return "…";
@@ -96,7 +87,7 @@ function truncateField(value: string, maxLength: number): string {
 
 function resultDigest(message: ToolResultMessage): string | undefined {
 	const toolName = message.toolName.toLowerCase();
-	const text = firstTextContent(message);
+	const text = sanitizeText(firstTextContent(message));
 	if (toolName === "bash") {
 		const details = message as { details?: { exitCode?: unknown } };
 		const exitCode =
@@ -121,7 +112,12 @@ function resultDigest(message: ToolResultMessage): string | undefined {
 				.join("; ") || "search digest unavailable"
 		);
 	}
-	return errorResultDigest(message);
+	if (message.isError !== true) return undefined;
+	if (text.trim().length === 0) return "error=tool result failed without text";
+	const error = firstErrorLine(text);
+	if (error) return `error=${error}`;
+	const summary = firstNonEmptyLine(text) ?? lastNonEmptyLine(text);
+	return summary ? `summary=${summary}` : undefined;
 }
 
 function createPrunedNotice(tokens: number, message?: ToolResultMessage): string {
@@ -146,8 +142,7 @@ function getToolResultMessage(entry: SessionEntry): ToolResultMessage | undefine
 }
 
 function estimatePrunedSavings(tokens: number, notice: string): number {
-	const noticeTokens = Math.ceil(notice.length / 4);
-	return Math.max(0, tokens - noticeTokens);
+	return tokens - estimateTextTokensHeuristic(notice);
 }
 
 export interface AssistantArgumentPruneResult {
@@ -694,11 +689,17 @@ function collectToolOutputPruneCandidates(
 		}
 
 		const notice = createPrunedNotice(tokens, message);
+		const savings = estimatePrunedSavings(tokens, notice);
+		const errorNoticeGrows = message.isError === true && notice.length > firstTextContent(message).length;
+		if (savings <= 0 || errorNoticeGrows) {
+			accumulatedTokens += tokens;
+			continue;
+		}
 		candidates.push({
 			entry: entry as SessionMessageEntry,
 			tokens,
 			notice,
-			savings: estimatePrunedSavings(tokens, notice),
+			savings,
 		});
 		accumulatedTokens += tokens;
 	}

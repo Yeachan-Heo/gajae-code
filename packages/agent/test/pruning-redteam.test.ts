@@ -226,6 +226,157 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		expect(textOf(failure)).toContain("[Output truncated - ");
 		expect(typeof (failure.message as ToolResultMessage).prunedAt).toBe("number");
 	});
+	test("mixed batches mutate and count only candidates with exact positive savings", () => {
+		const shortError = toolEntry("short-error", "edit", "Patch failed.");
+		(shortError.message as ToolResultMessage).isError = true;
+		const profitable = toolEntry("profitable", "edit", textForTokens("large-success", 80));
+		const shortErrorText = textOf(shortError);
+		const profitableBefore = tokens(profitable);
+
+		const result = pruneToolOutputs([shortError, profitable], config({ minimumSavings: 0 }));
+		const profitableAfter = tokens(profitable);
+
+		expect(result.prunedEntries.map(entry => entry.id)).toEqual(["profitable"]);
+		expect(result.prunedCount).toBe(1);
+		expect(result.tokensSaved).toBe(profitableBefore - profitableAfter);
+		expect(textOf(shortError)).toBe(shortErrorText);
+		expect((shortError.message as ToolResultMessage).prunedAt).toBeUndefined();
+	});
+	test("deterministic mixed-script matrix preserves positive-delta and exact-accounting invariants", () => {
+		const scripts = ["ascii error", "오류 실패", "error 💥"] as const;
+		const entries = Array.from({ length: 24 }, (_, index) => {
+			const repetitions = index % 4 === 0 ? 2 : 20 + index;
+			const text = Array.from({ length: repetitions }, () => scripts[index % scripts.length]).join("\n");
+			const entry = toolEntry(`matrix-${index}`, index % 3 === 0 ? "bash" : "edit", text);
+			(entry.message as ToolResultMessage).isError = index % 2 === 0;
+			return entry;
+		});
+		const before = new Map(entries.map(entry => [entry.id, { text: textOf(entry), tokens: tokens(entry) }] as const));
+
+		const result = pruneToolOutputs(entries, config({ minimumSavings: 0 }));
+		let exactSavings = 0;
+		const changedIds = new Set(result.prunedEntries.map(entry => entry.id));
+		for (const entry of entries) {
+			const snapshot = before.get(entry.id);
+			expect(snapshot).toBeDefined();
+			if (!snapshot) continue;
+			if (!changedIds.has(entry.id)) {
+				expect(textOf(entry)).toBe(snapshot.text);
+				expect((entry.message as ToolResultMessage).prunedAt).toBeUndefined();
+				continue;
+			}
+			const delta = snapshot.tokens - tokens(entry);
+			expect(delta).toBeGreaterThan(0);
+			if ((entry.message as ToolResultMessage).isError === true) {
+				expect(textOf(entry).length).toBeLessThanOrEqual(snapshot.text.length);
+			}
+			exactSavings += delta;
+		}
+		expect(result.prunedCount).toBe(changedIds.size);
+		expect(result.tokensSaved).toBe(exactSavings);
+	});
+
+	test("script-dense and character-expanding error notices remain unchanged", () => {
+		for (const [id, text] of [
+			["cjk", `오류 ${"실패".repeat(40)}`],
+			["emoji", `error ${"💥".repeat(40)}`],
+		] as const) {
+			const failure = toolEntry(id, "edit", text);
+			(failure.message as ToolResultMessage).isError = true;
+			const beforeTokens = tokens(failure);
+
+			const result = pruneToolOutputs([failure], config({ minimumSavings: 0 }));
+
+			expect(result).toEqual({ prunedCount: 0, tokensSaved: 0, prunedEntries: [] });
+			expect(textOf(failure)).toBe(text);
+			expect(tokens(failure)).toBe(beforeTokens);
+			expect((failure.message as ToolResultMessage).prunedAt).toBeUndefined();
+		}
+	});
+
+	test("sanitizes retained error evidence and preserves generic success notice", () => {
+		const failure = toolEntry(
+			"hostile-error",
+			"edit",
+			`\u001b[31mPatch failed.\u001b[0m\u0000\n${textForTokens("context", 80)}`,
+		);
+		(failure.message as ToolResultMessage).isError = true;
+		const success = toolEntry("generic-success", "edit", textForTokens("success", 80));
+		const successTokens = tokens(success);
+
+		const result = pruneToolOutputs([failure, success], config({ minimumSavings: 0 }));
+
+		expect(result.prunedEntries.map(entry => entry.id)).toEqual(["generic-success", "hostile-error"]);
+		expect(textOf(failure)).toContain("error=Patch failed.");
+		expect(textOf(failure)).not.toContain("\u001b");
+		expect(textOf(failure)).not.toContain("\u0000");
+		expect(textOf(success)).toBe(`[Output truncated - ${successTokens} tokens]`);
+	});
+	test("preserves special bash and search digest shapes after sanitization", () => {
+		const bash = toolEntry(
+			"bash-error",
+			"bash",
+			`\u001b[31mcommand failed\u001b[0m\n${textForTokens("bash-context", 80)}\nfinal failure`,
+		);
+		(bash.message as ToolResultMessage).isError = true;
+		(bash.message as ToolResultMessage & { details: { exitCode: number } }).details = { exitCode: 17 };
+		const search = toolEntry(
+			"search-error",
+			"search",
+			`12 matches in 3 files\nerror: engine failed\n${textForTokens("search-context", 80)}`,
+		);
+		(search.message as ToolResultMessage).isError = true;
+
+		const result = pruneToolOutputs([bash, search], config({ minimumSavings: 0 }));
+
+		expect(result.prunedEntries.map(entry => entry.id)).toEqual(["search-error", "bash-error"]);
+		expect(textOf(bash)).toContain("exit=17");
+		expect(textOf(bash)).toContain("tail=final failure");
+		expect(textOf(bash)).toContain("error=command failed");
+		expect(textOf(bash)).not.toContain("\u001b");
+		expect(textOf(search)).toContain("matches=12");
+		expect(textOf(search)).toContain("files=3");
+		expect(textOf(search)).toContain("error=error: engine failed");
+	});
+
+	test("multi-block results keep first-text evidence and exact whole-entry savings", () => {
+		const failure = toolEntry("multi-block", "edit", "placeholder");
+		failure.message = {
+			...(failure.message as ToolResultMessage),
+			isError: true,
+			content: [
+				{ type: "image", data: "a".repeat(400), mimeType: "image/png" },
+				{ type: "text", text: `Patch failed.\n${textForTokens("first-text", 40)}` },
+				{ type: "text", text: textForTokens("later-text", 80) },
+			],
+		};
+		const beforeTokens = tokens(failure);
+		const firstTextLength = (
+			(failure.message as ToolResultMessage).content as Array<{ type: string; text?: string }>
+		).find(block => block.type === "text")?.text?.length;
+
+		const result = pruneToolOutputs([failure], config({ minimumSavings: 0 }));
+
+		expect(result.prunedEntries).toEqual([failure]);
+		expect(textOf(failure)).toContain("error=Patch failed.");
+		expect(textOf(failure).length).toBeLessThanOrEqual(firstTextLength ?? 0);
+		expect(result.tokensSaved).toBe(beforeTokens - tokens(failure));
+
+		const emptyFirst = toolEntry("empty-first", "edit", "placeholder");
+		emptyFirst.message = {
+			...(emptyFirst.message as ToolResultMessage),
+			isError: true,
+			content: [
+				{ type: "text", text: "" },
+				{ type: "text", text: textForTokens("later-error", 80) },
+			],
+		};
+		const emptyFirstContent = (emptyFirst.message as ToolResultMessage).content;
+		const excluded = pruneToolOutputs([emptyFirst], config({ minimumSavings: 0 }));
+		expect(excluded).toEqual({ prunedCount: 0, tokensSaved: 0, prunedEntries: [] });
+		expect((emptyFirst.message as ToolResultMessage).content).toEqual(emptyFirstContent);
+		expect((emptyFirst.message as ToolResultMessage).prunedAt).toBeUndefined();
+	});
 
 	test("adversarial inputs: empty entries, non-messages, empty content, zero thresholds, and duplicate outputs", () => {
 		expect(pruneToolOutputs([], config())).toEqual({ prunedCount: 0, tokensSaved: 0, prunedEntries: [] });
@@ -243,9 +394,10 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		];
 		const result = pruneToolOutputs(entries, config({ protectTokens: 0, minimumSavings: 0 }));
 
-		expect(result.prunedEntries.map(entry => entry.id)).toEqual(["dup-b", "dup-a", "empty"]);
-		expect(result.prunedCount).toBe(3);
-		expect(textOf(empty)).toStartWith("[Output truncated - 0 tokens");
+		expect(result.prunedEntries.map(entry => entry.id)).toEqual(["dup-b", "dup-a"]);
+		expect(result.prunedCount).toBe(2);
+		expect(textOf(empty)).toBe("");
+		expect((empty.message as ToolResultMessage).prunedAt).toBeUndefined();
 		expect(textOf(duplicateA)).toStartWith("[Output truncated - ");
 		expect(textOf(duplicateB)).toStartWith("[Output truncated - ");
 	});
