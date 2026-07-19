@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+
 import { type SettingPath, Settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	BUILTIN_TOOLS,
@@ -13,7 +14,37 @@ import {
 	type ToolSession,
 } from "@gajae-code/coding-agent/tools";
 
-Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+const PY_ENV_KEYS = [
+	"GJC_PY",
+	"PI_PY",
+	"PI_JS",
+	"GJC_PYTHON_SKIP_CHECK",
+	"PI_PYTHON_SKIP_CHECK",
+	"GJC_PYTHON_IPC_TRACE",
+	"PI_PYTHON_IPC_TRACE",
+	"GJC_PYTHON_INTEGRATION",
+	"PI_PYTHON_INTEGRATION",
+] as const;
+
+function snapshotPyEnv(): Map<string, string | undefined> {
+	return new Map(PY_ENV_KEYS.map(key => [key, Bun.env[key]]));
+}
+
+function restorePyEnv(snapshot: Map<string, string | undefined>): void {
+	for (const key of PY_ENV_KEYS) {
+		const value = snapshot.get(key);
+		if (value === undefined) delete Bun.env[key];
+		else Bun.env[key] = value;
+	}
+}
+
+let testPyEnv = new Map<string, string | undefined>();
+beforeEach(() => {
+	testPyEnv = snapshotPyEnv();
+	clearPyEnvKeys();
+	Bun.env.PI_PYTHON_SKIP_CHECK = "1";
+});
+afterEach(() => restorePyEnv(testPyEnv));
 
 function createTestSession(overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
@@ -337,18 +368,6 @@ describe("createTools", () => {
 
 // Env vars exercised below leak across tests via the shared `Bun.env`/`$env`
 // reference, so each block restores the keys it touches in afterEach.
-const PY_ENV_KEYS = [
-	"GJC_PY",
-	"PI_PY",
-	"PI_JS",
-	"GJC_PYTHON_SKIP_CHECK",
-	"PI_PYTHON_SKIP_CHECK",
-	"GJC_PYTHON_IPC_TRACE",
-	"PI_PYTHON_IPC_TRACE",
-	"GJC_PYTHON_INTEGRATION",
-	"PI_PYTHON_INTEGRATION",
-] as const;
-
 function clearPyEnvKeys(): void {
 	for (const key of PY_ENV_KEYS) delete Bun.env[key];
 }
@@ -433,8 +452,27 @@ describe("resolveEvalBackendsFromEnv", () => {
 });
 
 describe("resolveEvalBackends (session integration)", () => {
-	afterEach(() => clearPyEnvKeys());
+	let previousEnv = new Map<string, string | undefined>();
 
+	beforeEach(() => {
+		previousEnv = snapshotPyEnv();
+		clearPyEnvKeys();
+	});
+
+	afterEach(() => restorePyEnv(previousEnv));
+
+	it("restores pre-existing Python environment values after cleanup", () => {
+		const suiteEnv = snapshotPyEnv();
+		try {
+			for (const key of PY_ENV_KEYS) Bun.env[key] = `hostile-${key}`;
+			const testEnv = snapshotPyEnv();
+			clearPyEnvKeys();
+			restorePyEnv(testEnv);
+			for (const key of PY_ENV_KEYS) expect(Bun.env[key]).toBe(`hostile-${key}`);
+		} finally {
+			restorePyEnv(suiteEnv);
+		}
+	});
 	it("defers to settings when no env override is set", () => {
 		clearPyEnvKeys();
 		const session = createTestSession({

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+
 import { disposeAllKernelSessions, executePython } from "@gajae-code/coding-agent/eval/py/executor";
 import type {
 	KernelExecuteOptions,
@@ -9,6 +10,18 @@ import { checkPythonKernelAvailability, PythonKernel } from "@gajae-code/coding-
 import { TempDir } from "@gajae-code/utils";
 
 const originalStart = PythonKernel.start;
+
+function snapshotEnv(keys: readonly string[]): Map<string, string | undefined> {
+	return new Map(keys.map(key => [key, Bun.env[key]]));
+}
+
+function restoreEnv(keys: readonly string[], snapshot: Map<string, string | undefined>): void {
+	for (const key of keys) {
+		const value = snapshot.get(key);
+		if (value === undefined) delete Bun.env[key];
+		else Bun.env[key] = value;
+	}
+}
 
 const OK_RESULT: KernelExecuteResult = {
 	status: "ok",
@@ -62,9 +75,20 @@ async function waitForExit(pid: number, timeoutMs = 3000): Promise<boolean> {
 }
 
 describe("python eval lifecycle", () => {
+	const envKeys = ["PI_PYTHON_SKIP_CHECK"] as const;
+	let previousEnv = new Map<string, string | undefined>();
+
+	beforeEach(() => {
+		previousEnv = snapshotEnv(envKeys);
+	});
+
 	afterEach(async () => {
 		PythonKernel.start = originalStart;
-		await disposeAllKernelSessions();
+		try {
+			await disposeAllKernelSessions();
+		} finally {
+			restoreEnv(envKeys, previousEnv);
+		}
 	});
 
 	it("coalesces concurrent first acquires for the same session into one kernel", async () => {
@@ -208,17 +232,18 @@ describe("python kernel env-var dual-read (GJC_* preferred, PI_* fallback)", () 
 	// (NODE_ENV/BUN_ENV === "test"), which would mask the skip-check branch.
 	// These tests neutralize the test-runtime guard inside a scoped window and
 	// restore it in finally so the real GJC/PI skip-check branch is exercised.
-	const SKIP_ENV_KEYS = [
+	const envKeys = [
 		"GJC_PYTHON_SKIP_CHECK",
 		"PI_PYTHON_SKIP_CHECK",
 		"GJC_PYTHON_IPC_TRACE",
 		"PI_PYTHON_IPC_TRACE",
+		"NODE_ENV",
+		"BUN_ENV",
 	] as const;
-	const originalNodeEnv = Bun.env.NODE_ENV;
-	const originalBunEnv = Bun.env.BUN_ENV;
+	let previousEnv = new Map<string, string | undefined>();
 
 	function clearSkipEnv(): void {
-		for (const key of SKIP_ENV_KEYS) delete Bun.env[key];
+		for (const key of envKeys) delete Bun.env[key];
 	}
 
 	function neutralizeTestRuntime(): void {
@@ -228,16 +253,26 @@ describe("python kernel env-var dual-read (GJC_* preferred, PI_* fallback)", () 
 		delete Bun.env.BUN_ENV;
 	}
 
-	function restoreTestRuntime(): void {
-		Bun.env.NODE_ENV = originalNodeEnv;
-		Bun.env.BUN_ENV = originalBunEnv;
-	}
-
-	afterEach(() => {
-		clearSkipEnv();
-		restoreTestRuntime();
+	beforeEach(() => {
+		previousEnv = snapshotEnv(envKeys);
 	});
 
+	afterEach(() => {
+		restoreEnv(envKeys, previousEnv);
+	});
+
+	it("restores pre-existing environment values after cleanup", () => {
+		const suiteEnv = snapshotEnv(envKeys);
+		try {
+			for (const key of envKeys) Bun.env[key] = `hostile-${key}`;
+			const testEnv = snapshotEnv(envKeys);
+			clearSkipEnv();
+			restoreEnv(envKeys, testEnv);
+			for (const key of envKeys) expect(Bun.env[key]).toBe(`hostile-${key}`);
+		} finally {
+			restoreEnv(envKeys, suiteEnv);
+		}
+	});
 	it("honors GJC_PYTHON_SKIP_CHECK=1 and returns ok without spawning Python", async () => {
 		clearSkipEnv();
 		neutralizeTestRuntime();

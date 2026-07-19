@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import * as evalIndex from "@gajae-code/coding-agent/eval";
 import * as pyKernel from "@gajae-code/coding-agent/eval/py/kernel";
@@ -28,12 +29,48 @@ const mockResult = {
 	displayOutputs: [],
 };
 
+const ENV_KEYS = ["GJC_PY", "PI_PY", "PI_JS"] as const;
+
+function snapshotEnv(): Map<string, string | undefined> {
+	return new Map(ENV_KEYS.map(key => [key, Bun.env[key]]));
+}
+
+function restoreEnv(snapshot: Map<string, string | undefined>): void {
+	for (const key of ENV_KEYS) {
+		const value = snapshot.get(key);
+		if (value === undefined) delete Bun.env[key];
+		else Bun.env[key] = value;
+	}
+}
+
+function clearEnv(): void {
+	for (const key of ENV_KEYS) delete Bun.env[key];
+}
+
 describe("EvalTool language dispatch", () => {
-	afterEach(() => {
-		vi.restoreAllMocks();
-		delete Bun.env.GJC_PY;
+	let previousEnv = new Map<string, string | undefined>();
+
+	beforeEach(() => {
+		previousEnv = snapshotEnv();
+		clearEnv();
 	});
 
+	afterEach(() => {
+		restoreEnv(previousEnv);
+		vi.restoreAllMocks();
+	});
+	it("restores a pre-existing GJC_PY value after cleanup", () => {
+		const suiteEnv = snapshotEnv();
+		try {
+			Bun.env.GJC_PY = "hostile-value";
+			const testEnv = snapshotEnv();
+			delete Bun.env.GJC_PY;
+			restoreEnv(testEnv);
+			expect(String(Bun.env.GJC_PY)).toBe("hostile-value");
+		} finally {
+			restoreEnv(suiteEnv);
+		}
+	});
 	it('dispatches to the JS backend when cell.language === "js"', async () => {
 		const jsExecuteSpy = vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(mockResult);
 		const pythonExecuteSpy = vi.spyOn(evalIndex.pythonBackend, "execute");

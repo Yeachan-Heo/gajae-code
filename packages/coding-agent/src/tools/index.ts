@@ -4,6 +4,7 @@ import { $env, logger } from "@gajae-code/utils";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
+import { isTruthyPythonFlag } from "../eval/py/env";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
@@ -500,17 +501,6 @@ export interface EvalBackendsAllowance {
 }
 
 /**
- * Truthy set for boolean-style Python env flags. Case-insensitive: `1`,
- * `true`, `yes` (and `on`/`y`) are treated as true; everything else is false.
- */
-const PYTHON_TRUTHY = new Set(["1", "true", "yes", "on", "y"]);
-
-/** True when `value` is a non-empty string matching a truthy boolean token. */
-function isTruthyFlag(value: string | undefined): boolean {
-	return value !== undefined && PYTHON_TRUTHY.has(value.trim().toLowerCase());
-}
-
-/**
  * Parse the `GJC_PY` multi-value token into per-backend booleans.
  *
  * Tokens (case-insensitive):
@@ -556,8 +546,8 @@ function parseLegacyEvalEnvFlags(env: Record<string, string | undefined>): EvalB
 	const jsEnv = env.PI_JS;
 	if (pyEnv === undefined && jsEnv === undefined) return null;
 	return {
-		python: pyEnv === undefined ? true : isTruthyFlag(pyEnv),
-		js: jsEnv === undefined ? true : isTruthyFlag(jsEnv),
+		python: pyEnv === undefined ? true : isTruthyPythonFlag(pyEnv),
+		js: jsEnv === undefined ? true : isTruthyPythonFlag(jsEnv),
 	};
 }
 
@@ -589,33 +579,11 @@ export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance
 	return resolveEvalBackendsFromEnv($env) ?? readEvalBackendsAllowance(session);
 }
 
-/**
- * Resolve the Python skip-check flag. `GJC_PYTHON_SKIP_CHECK` is preferred;
- * falls back to legacy `PI_PYTHON_SKIP_CHECK`. Truthy values: `1`, `true`,
- * `yes` (case-insensitive).
- */
-export function resolvePythonSkipCheck(env: Record<string, string | undefined>): boolean {
-	return isTruthyFlag(env.GJC_PYTHON_SKIP_CHECK) || isTruthyFlag(env.PI_PYTHON_SKIP_CHECK);
-}
-
-/**
- * Resolve the Python IPC trace flag. `GJC_PYTHON_IPC_TRACE` is preferred;
- * falls back to legacy `PI_PYTHON_IPC_TRACE`. Truthy values: `1`, `true`,
- * `yes` (case-insensitive).
- */
-export function resolvePythonIpcTrace(env: Record<string, string | undefined>): boolean {
-	return isTruthyFlag(env.GJC_PYTHON_IPC_TRACE) || isTruthyFlag(env.PI_PYTHON_IPC_TRACE);
-}
-
-/**
- * Resolve the gated Python integration-test gate. Uses OR semantics:
- * `GJC_PYTHON_INTEGRATION === "1"` OR `PI_PYTHON_INTEGRATION === "1"` enables
- * it. A truthy value on either name opts the tests in, so `GJC=0, PI=1` is
- * still true. Truthy values: `1`, `true`, `yes` (case-insensitive).
- */
-export function resolvePythonIntegrationGate(env: Record<string, string | undefined>): boolean {
-	return isTruthyFlag(env.GJC_PYTHON_INTEGRATION) || isTruthyFlag(env.PI_PYTHON_INTEGRATION);
-}
+export {
+	resolvePythonIntegrationGate,
+	resolvePythonIpcTrace,
+	resolvePythonSkipCheck,
+} from "../eval/py/env";
 
 /**
  * Create tools from BUILTIN_TOOLS registry.
