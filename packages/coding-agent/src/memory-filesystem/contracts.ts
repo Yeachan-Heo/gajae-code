@@ -22,6 +22,7 @@ export type FilesystemMemoryOutcomeCode =
 	| "too_large"
 	| "permission_denied"
 	| "identity_unavailable"
+	| "not_initialized"
 	| "identity_drift"
 	| "policy_denied"
 	| "unknown_version";

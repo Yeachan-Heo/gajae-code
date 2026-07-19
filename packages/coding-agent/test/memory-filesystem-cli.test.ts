@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { commands } from "../src/cli";
+import { doctorFilesystemMemory } from "../src/memory-filesystem/doctor";
 import {
 	enrollFilesystemMemoryProjectIdentity,
 	getFilesystemMemoryRegistryPath,
@@ -154,6 +155,23 @@ describe("filesystem memory CLI lifecycle and protocol", () => {
 		expect(await fs.readdir(outside)).toEqual([]);
 	});
 
+	it("keeps global-only initialization healthy without project enrollment", async () => {
+		const { root, agentDir } = await fixture();
+		expect((await initializeFilesystemMemory(["global"], root, agentDir)).code).toBe("ok");
+		const roots = await getFilesystemMemoryRoots(root, agentDir);
+		expect(roots.code).toBe("ok");
+		if (roots.code !== "ok") throw new Error("expected global-only roots");
+		expect(roots.value.availability).toEqual([
+			{ scope: "global", available: true, reason: null },
+			{ scope: "project", available: false, reason: "not_initialized" },
+			{ scope: "project-local", available: false, reason: "not_initialized" },
+			{ scope: "session", available: false, reason: "not_initialized" },
+		]);
+		expect(await doctorFilesystemMemory(roots.value.roots, roots.value.availability)).toEqual({
+			healthy: true,
+			findings: [],
+		});
+	});
 	it("detects checkpoint digest conflicts and resumes equal-time checkpoints by descending session ID", async () => {
 		const { root, agentDir } = await fixture();
 		const { cwd, projectId } = await enrolledProject(root, agentDir);
@@ -165,8 +183,38 @@ describe("filesystem memory CLI lifecycle and protocol", () => {
 					agentDir,
 				)
 			).code,
-		).toBe("identity_unavailable");
+		).toBe("not_initialized");
 		expect((await initializeFilesystemMemory(["session"], cwd, agentDir)).code).toBe("ok");
+		const partialRoots = await getFilesystemMemoryRoots(cwd, agentDir);
+		expect(partialRoots.code).toBe("ok");
+		if (partialRoots.code !== "ok") throw new Error("expected partial roots");
+		expect(partialRoots.value.availability).toContainEqual({
+			scope: "global",
+			available: false,
+			reason: "not_initialized",
+		});
+		expect(await doctorFilesystemMemory(partialRoots.value.roots, partialRoots.value.availability)).toEqual({
+			healthy: true,
+			findings: [],
+		});
+		const registry = await fs.readFile(getFilesystemMemoryRegistryPath(agentDir));
+		await fs.rm(getFilesystemMemoryRegistryPath(agentDir));
+		const lostIdentityRoots = await getFilesystemMemoryRoots(cwd, agentDir);
+		expect(lostIdentityRoots).toEqual({
+			code: "identity_drift",
+			message: "Filesystem memory identity registry is missing for existing project data.",
+		});
+		await fs.writeFile(getFilesystemMemoryRegistryPath(agentDir), registry);
+		const parsedRegistry = JSON.parse(registry.toString()) as { version: 1; repositories: Record<string, unknown> };
+		await fs.writeFile(
+			getFilesystemMemoryRegistryPath(agentDir),
+			JSON.stringify({ ...parsedRegistry, repositories: {} }),
+		);
+		expect(await getFilesystemMemoryRoots(cwd, agentDir)).toEqual({
+			code: "identity_drift",
+			message: "Filesystem memory project data is orphaned from the identity registry.",
+		});
+		await fs.writeFile(getFilesystemMemoryRegistryPath(agentDir), registry);
 		const first = await checkpointFilesystemMemory(
 			{ taskId: "task", sessionId: "session-a", content: "first" },
 			cwd,

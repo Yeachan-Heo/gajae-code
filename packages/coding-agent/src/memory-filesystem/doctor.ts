@@ -32,7 +32,8 @@ export async function doctorFilesystemMemory(
 ): Promise<FilesystemMemoryDoctorReport> {
 	const findings: FilesystemMemoryDoctorFinding[] = [];
 	for (const entry of availability) {
-		if (!entry.available && entry.reason) findings.push({ scope: entry.scope, path: ".", code: entry.reason });
+		if (!entry.available && entry.reason && entry.reason !== "not_initialized")
+			findings.push({ scope: entry.scope, path: ".", code: entry.reason });
 	}
 	let visitedDirectories = 0;
 	let inspectedEntries = 0;

@@ -149,4 +149,18 @@ describe("filesystem MAP retrieval", () => {
 		});
 		expect(report.findings).toContainEqual({ scope: "project", path: "memory.yaml", code: "missing_map" });
 	});
+	it("treats intentionally uninitialized scopes as absent rather than unhealthy", async () => {
+		const root = await fixtureRoot();
+		await fs.writeFile(path.join(root, "memory.yaml"), '{"version":1,"routes":{}}\n');
+		const report = await doctorFilesystemMemory({ "project-local": root }, [
+			{ scope: "global", available: false, reason: "not_initialized" },
+			{ scope: "project", available: false, reason: "not_initialized" },
+			{ scope: "project-local", available: true, reason: null },
+			{ scope: "session", available: false, reason: "identity_unavailable" },
+		]);
+		expect(report).toEqual({
+			healthy: false,
+			findings: [{ scope: "session", path: ".", code: "identity_unavailable" }],
+		});
+	});
 });

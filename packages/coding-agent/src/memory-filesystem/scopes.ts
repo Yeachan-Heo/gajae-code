@@ -36,7 +36,8 @@ export function validateFilesystemMemoryRepositoryPolicy(
 export function resolveFilesystemMemoryScopeAvailability(
 	userPolicy: FilesystemMemoryUserPolicyV1,
 	repositoryPolicy: FilesystemMemoryRepositoryPolicyV1 | null,
-	availableScopes: ReadonlySet<FilesystemMemoryScope>,
+	initializedScopes: ReadonlySet<FilesystemMemoryScope>,
+	identityScopes: ReadonlySet<FilesystemMemoryScope> = new Set(ALL_SCOPES),
 ): readonly FilesystemMemoryScopeAvailability[] {
 	const userError = validateFilesystemMemoryUserPolicy(userPolicy);
 	const repositoryError = repositoryPolicy ? validateFilesystemMemoryRepositoryPolicy(repositoryPolicy) : null;
@@ -45,7 +46,8 @@ export function resolveFilesystemMemoryScopeAvailability(
 		if (!userPolicy.allowedScopes.includes(scope)) return { scope, available: false, reason: "policy_denied" };
 		if (repositoryPolicy?.allowedScopes && !repositoryPolicy.allowedScopes.includes(scope))
 			return { scope, available: false, reason: "policy_denied" };
-		if (!availableScopes.has(scope)) return { scope, available: false, reason: "identity_unavailable" };
+		if (!initializedScopes.has(scope)) return { scope, available: false, reason: "not_initialized" };
+		if (!identityScopes.has(scope)) return { scope, available: false, reason: "identity_unavailable" };
 		return { scope, available: true, reason: null };
 	});
 }

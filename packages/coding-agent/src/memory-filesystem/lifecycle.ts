@@ -136,11 +136,40 @@ function isIdentityRegistry(value: unknown): value is FilesystemMemoryIdentityRe
 async function readIdentityRegistry(
 	file: string,
 ): Promise<FilesystemMemoryOutcome<FilesystemMemoryIdentityRegistryV1>> {
+	try {
+		await fs.lstat(file);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+			return fail("permission_denied", "Filesystem memory identity registry cannot be inspected.");
+		try {
+			const projects = await fs.readdir(path.join(path.dirname(file), "projects"));
+			if (projects.length)
+				return fail("identity_drift", "Filesystem memory identity registry is missing for existing project data.");
+		} catch (projectsError) {
+			if ((projectsError as NodeJS.ErrnoException).code !== "ENOENT")
+				return fail("permission_denied", "Filesystem memory project data cannot be inspected.");
+		}
+	}
 	const result = await readJson<unknown>(file, { version: 1, repositories: {} });
 	if (result.code !== "ok") return result;
-	return isIdentityRegistry(result.value)
-		? { code: "ok", value: result.value }
-		: fail("invalid_path", "Filesystem memory identity registry is malformed.");
+	if (!isIdentityRegistry(result.value))
+		return fail("invalid_path", "Filesystem memory identity registry is malformed.");
+	try {
+		const projects = await fs.readdir(path.join(path.dirname(file), "projects"), { withFileTypes: true });
+		if (projects.length > FILESYSTEM_MEMORY_MAX_INSPECTED_ENTRIES)
+			return fail("identity_drift", "Filesystem memory project data exceeds the identity registry bound.");
+		const registered = new Set(Object.values(result.value.repositories).map(identity => identity.projectId));
+		for (const project of projects) {
+			if (project.isSymbolicLink() || !project.isDirectory() || !PROJECT_ID.test(project.name))
+				return fail("identity_drift", "Filesystem memory project data is inconsistent with the identity registry.");
+			if (!registered.has(project.name))
+				return fail("identity_drift", "Filesystem memory project data is orphaned from the identity registry.");
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+			return fail("permission_denied", "Filesystem memory project data cannot be inspected.");
+	}
+	return { code: "ok", value: result.value };
 }
 
 async function acquireLock(directory: string): Promise<FilesystemMemoryOutcome<fs.FileHandle>> {
@@ -296,7 +325,12 @@ export async function getFilesystemMemoryRoots(
 		if (marker.code !== "ok") return marker;
 		if (marker.value?.scopes.includes(scope)) initialized.add(scope);
 	}
-	const availability = resolveFilesystemMemoryScopeAvailability(userPolicy, repositoryPolicyResult.value, initialized);
+	const availability = resolveFilesystemMemoryScopeAvailability(
+		userPolicy,
+		repositoryPolicyResult.value,
+		initialized,
+		new Set(Object.keys(raw.value.roots) as FilesystemMemoryScope[]),
+	);
 	const roots: Partial<Record<FilesystemMemoryScope, string>> = {};
 	for (const entry of availability) {
 		const root = raw.value.roots[entry.scope];
