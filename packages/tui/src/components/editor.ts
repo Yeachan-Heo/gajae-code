@@ -3,6 +3,7 @@ import {
 	type AutocompleteProvider,
 	type CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
+	isInsideInlineCodeSpan,
 } from "../autocomplete";
 import { BracketedPasteHandler } from "../bracketed-paste";
 import { getKeybindings, type KeybindingsManager } from "../keybindings";
@@ -459,6 +460,7 @@ export class Editor implements Component, Focusable {
 	#autocompleteState: "regular" | "force" | null = null;
 	#autocompletePrefix: string = "";
 	#autocompleteRequestId: number = 0;
+	#autocompleteOrigin?: { docVersion: number; cursorLine: number; cursorCol: number };
 	#autocompleteMaxVisible: number = 5;
 	onAutocompleteUpdate?: () => void;
 
@@ -1201,6 +1203,11 @@ export class Editor implements Component, Focusable {
 
 				// If Tab was pressed, always apply the selection
 				if (kb.matches(data, "tui.input.tab")) {
+					if (!this.#isAutocompleteSelectionCurrent()) {
+						this.#cancelAutocomplete();
+						this.#handleTabCompletion();
+						return;
+					}
 					const selected = this.#autocompleteList.getSelectedItem();
 					if (selected && this.#autocompleteProvider) {
 						const shouldChainSlashCommandAutocomplete = this.#isSlashCommandNameAutocompleteSelection();
@@ -1234,36 +1241,38 @@ export class Editor implements Component, Focusable {
 				}
 
 				// If Enter was pressed on a slash command, apply completion and submit
-				if ((kb.matches(data, "tui.input.submit") || data === "\n") && this.#autocompletePrefix.startsWith("/")) {
-					// Check for stale autocomplete state due to debounce
-					const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
-					const currentTextBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-					if (!currentTextBeforeCursor.endsWith(this.#autocompletePrefix)) {
-						// Autocomplete is stale - cancel and fall through to normal submission
+				if (
+					(kb.matches(data, "tui.input.submit") || data === "\n") &&
+					this.#autocompleteState === "regular" &&
+					this.#autocompletePrefix.startsWith("/")
+				) {
+					const selected = this.#autocompleteList.getSelectedItem();
+					if (!this.#isAutocompleteSelectionCurrent()) {
 						this.#cancelAutocomplete();
-					} else {
-						const selected = this.#autocompleteList.getSelectedItem();
-						if (selected && this.#autocompleteProvider) {
-							const result = this.#autocompleteProvider.applyCompletion(
-								this.#state.lines,
-								this.#state.cursorLine,
-								this.#state.cursorCol,
-								selected,
-								this.#autocompletePrefix,
-							);
+					} else if (selected && this.#autocompleteProvider) {
+						const result = this.#autocompleteProvider.applyCompletion(
+							this.#state.lines,
+							this.#state.cursorLine,
+							this.#state.cursorCol,
+							selected,
+							this.#autocompletePrefix,
+						);
 
-							this.#state.lines = result.lines;
-							this.#bumpDocumentVersion();
-							this.#state.cursorLine = result.cursorLine;
-							this.#setCursorCol(result.cursorCol);
-							result.onApplied?.();
-						}
+						this.#state.lines = result.lines;
+						this.#bumpDocumentVersion();
+						this.#state.cursorLine = result.cursorLine;
+						this.#setCursorCol(result.cursorCol);
+						result.onApplied?.();
 						this.#cancelAutocomplete();
 					}
 					// Don't return - fall through to submission logic
 				}
 				// If Enter was pressed on a file path, apply completion
 				else if (kb.matches(data, "tui.input.submit") || data === "\n") {
+					if (!this.#isAutocompleteSelectionCurrent()) {
+						this.#cancelAutocomplete();
+						return;
+					}
 					const selected = this.#autocompleteList.getSelectedItem();
 					if (selected && this.#autocompleteProvider) {
 						const result = this.#autocompleteProvider.applyCompletion(
@@ -1863,9 +1872,17 @@ export class Editor implements Component, Focusable {
 
 		// Check if we should trigger or update autocomplete
 		if (!this.#autocompleteState) {
-			// Auto-trigger for slash command tokens.
-			if (char === "/" && (this.#isAtStartOfSubmittedMessage() || this.#isInSlashTokenContext())) {
-				this.#tryTriggerAutocomplete();
+			// Auto-trigger slash commands, or path-only completion inside inline code.
+			if (char === "/") {
+				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+				if (this.#isInSubmittedSlashCommandContext()) {
+					this.#tryTriggerAutocomplete();
+				} else if (isInsideInlineCodeSpan(textBeforeCursor)) {
+					this.#forceFileAutocomplete();
+				} else if (this.#isInSlashTokenContext()) {
+					this.#tryTriggerAutocomplete();
+				}
 			}
 			// Auto-trigger for "@" file reference (fuzzy search)
 			else if (char === "@") {
@@ -2771,14 +2788,6 @@ export class Editor implements Component, Focusable {
 		return true;
 	}
 
-	// Slash commands execute only when the submitted prompt starts with the command.
-	#isAtStartOfSubmittedMessage(): boolean {
-		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
-		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
-
-		return this.#hasOnlyWhitespaceBeforeCursorLine() && (beforeCursor.trim() === "" || beforeCursor.trim() === "/");
-	}
-
 	#isInSubmittedSlashCommandContext(): boolean {
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
@@ -2793,6 +2802,30 @@ export class Editor implements Component, Focusable {
 
 	#isInSlashTokenContext(): boolean {
 		return this.#getSlashTokenBeforeCursor() !== null;
+	}
+	#isAutocompleteSelectionCurrent(): boolean {
+		if (!this.#isAutocompleteOriginCurrent()) return false;
+		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+		if (!textBeforeCursor.endsWith(this.#autocompletePrefix)) return false;
+		if (this.#autocompleteState !== "regular" || !this.#autocompletePrefix.startsWith("/")) return true;
+		return extractSlashCommandTokenPrefix(textBeforeCursor) === this.#autocompletePrefix;
+	}
+	#captureAutocompleteOrigin(): { docVersion: number; cursorLine: number; cursorCol: number } {
+		return {
+			docVersion: this.#docVersion,
+			cursorLine: this.#state.cursorLine,
+			cursorCol: this.#state.cursorCol,
+		};
+	}
+
+	#isAutocompleteOriginCurrent(origin = this.#autocompleteOrigin): boolean {
+		return (
+			origin !== undefined &&
+			origin.docVersion === this.#docVersion &&
+			origin.cursorLine === this.#state.cursorLine &&
+			origin.cursorCol === this.#state.cursorCol
+		);
 	}
 
 	#isSlashCommandNameAutocompleteSelection(): boolean {
@@ -2835,6 +2868,7 @@ export class Editor implements Component, Focusable {
 			}
 		}
 
+		const origin = this.#captureAutocompleteOrigin();
 		const requestId = ++this.#autocompleteRequestId;
 
 		const suggestions = await this.#autocompleteProvider.getSuggestions(
@@ -2842,12 +2876,13 @@ export class Editor implements Component, Focusable {
 			this.#state.cursorLine,
 			this.#state.cursorCol,
 		);
-		if (requestId !== this.#autocompleteRequestId) return;
+		if (requestId !== this.#autocompleteRequestId || !this.#isAutocompleteOriginCurrent(origin)) return;
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
 			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
 			this.#autocompleteState = "regular";
+			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {
 			this.#cancelAutocomplete();
@@ -2907,13 +2942,14 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			return;
 		}
 
+		const origin = this.#captureAutocompleteOrigin();
 		const requestId = ++this.#autocompleteRequestId;
 		const suggestions = await provider.getForceFileSuggestions(
 			this.#state.lines,
 			this.#state.cursorLine,
 			this.#state.cursorCol,
 		);
-		if (requestId !== this.#autocompleteRequestId) return;
+		if (requestId !== this.#autocompleteRequestId || !this.#isAutocompleteOriginCurrent(origin)) return;
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			// If there's exactly one suggestion and this was an explicit Tab press, apply it immediately
@@ -2941,6 +2977,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			this.#autocompletePrefix = suggestions.prefix;
 			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
 			this.#autocompleteState = "force";
+			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {
 			this.#cancelAutocomplete();
@@ -2955,6 +2992,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 		this.#autocompleteRequestId += 1;
 		this.#autocompleteState = null;
 		this.#autocompleteList = undefined;
+		this.#autocompleteOrigin = undefined;
 		this.#autocompletePrefix = "";
 		if (notifyCancel && wasAutocompleting) {
 			this.onAutocompleteCancel?.();
@@ -2974,6 +3012,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			return;
 		}
 
+		const origin = this.#captureAutocompleteOrigin();
 		const requestId = ++this.#autocompleteRequestId;
 
 		const suggestions = await this.#autocompleteProvider.getSuggestions(
@@ -2981,12 +3020,13 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			this.#state.cursorLine,
 			this.#state.cursorCol,
 		);
-		if (requestId !== this.#autocompleteRequestId) return;
+		if (requestId !== this.#autocompleteRequestId || !this.#isAutocompleteOriginCurrent(origin)) return;
 
 		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
 			this.#autocompletePrefix = suggestions.prefix;
 			// Always create new SelectList to ensure update
 			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#autocompleteOrigin = origin;
 			this.onAutocompleteUpdate?.();
 		} else {
 			this.#cancelAutocomplete();

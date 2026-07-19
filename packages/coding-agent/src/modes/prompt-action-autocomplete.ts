@@ -248,6 +248,13 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 
 		return this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol);
 	}
+	getForceFileSuggestions(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
+		return this.#baseProvider.getForceFileSuggestions(lines, cursorLine, cursorCol);
+	}
 
 	applyCompletion(
 		lines: string[],

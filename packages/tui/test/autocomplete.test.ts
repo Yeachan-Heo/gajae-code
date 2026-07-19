@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CombinedAutocompleteProvider } from "@gajae-code/tui/autocomplete";
+import { CombinedAutocompleteProvider, extractSlashCommandTokenPrefix } from "@gajae-code/tui/autocomplete";
 
 describe("CombinedAutocompleteProvider", () => {
 	describe("extractPathPrefix", () => {
@@ -166,6 +166,62 @@ describe("CombinedAutocompleteProvider", () => {
 			const values = result?.items.map(item => item.value) ?? [];
 			expect(values).toContain("./src/");
 		});
+	});
+});
+
+describe("inline backtick slash classification", () => {
+	it.each([
+		["open span", "please use `/mo", null],
+		["closed span", "please use `/mo` then /he", "/he"],
+		["multiple spans", "`/mo` and `/he", null],
+		["odd escaped delimiter", "please use \\`/mo", "/mo"],
+		["even escaped delimiter", "please use \\\\`/mo", null],
+		["double-backtick run", "please use ``/mo", "/mo"],
+		["triple-backtick run", "please use ```/mo", "/mo"],
+	])("handles %s", (_name, text, expected) => {
+		expect(extractSlashCommandTokenPrefix(text)).toBe(expected);
+	});
+
+	it("resets literal state at line boundaries", () => {
+		expect(extractSlashCommandTokenPrefix("/mo")).toBe("/mo");
+	});
+
+	it("preserves path suggestions inside an open inline-code span", async () => {
+		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-backtick-test-"));
+		try {
+			fs.mkdirSync(path.join(baseDir, "src", "foo"), { recursive: true });
+			fs.writeFileSync(path.join(baseDir, "src", "foo", "bar.ts"), "export {};\n");
+			const provider = new CombinedAutocompleteProvider(
+				[{ name: "model", description: "Switch AI model", value: "model" }],
+				baseDir,
+			);
+			const line = "please read `src/foo/";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe("src/foo/");
+			expect(result?.items.map(item => item.value)).toContain("src/foo/bar.ts");
+			expect(result?.items.map(item => item.value)).not.toContain("model");
+		} finally {
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+	it("preserves submitted command argument completion inside backticks", async () => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{
+					name: "read",
+					getArgumentCompletions: argumentPrefix => [
+						{ value: argumentPrefix, label: "existing argument completion" },
+					],
+				},
+			],
+			"/tmp",
+		);
+		const line = "/read `src/foo/";
+		const result = await provider.getSuggestions([line], 0, line.length);
+
+		expect(result?.prefix).toBe("`src/foo/");
+		expect(result?.items).toEqual([{ value: "`src/foo/", label: "existing argument completion" }]);
 	});
 });
 

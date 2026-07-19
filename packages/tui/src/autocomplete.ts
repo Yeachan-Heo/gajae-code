@@ -190,10 +190,38 @@ function normalizeSlashCommandText(value: string): string {
 		.replace(/\s+/g, " ");
 }
 const NON_COMMAND_SLASH_PREFIX_PRECEDERS = new Set(["/", "\\", ":", ".", "~"]);
+function findOpenInlineCodeSpanStart(text: string): number | null {
+	let openDelimiter: number | null = null;
+
+	for (let i = 0; i < text.length; ) {
+		if (text[i] !== "`") {
+			i += 1;
+			continue;
+		}
+
+		let runEnd = i + 1;
+		while (text[runEnd] === "`") runEnd += 1;
+		if (runEnd - i !== 1) {
+			i = runEnd;
+			continue;
+		}
+
+		let backslashCount = 0;
+		for (let j = i - 1; j >= 0 && text[j] === "\\"; j -= 1) backslashCount += 1;
+		if (backslashCount % 2 === 0) openDelimiter = openDelimiter === null ? i : null;
+		i = runEnd;
+	}
+
+	return openDelimiter;
+}
+export function isInsideInlineCodeSpan(text: string): boolean {
+	return findOpenInlineCodeSpanStart(text) !== null;
+}
 
 export function extractSlashCommandTokenPrefix(text: string): string | null {
 	const slashIndex = text.lastIndexOf("/");
 	if (slashIndex === -1) return null;
+	if (isInsideInlineCodeSpan(text.slice(0, slashIndex + 1))) return null;
 
 	const token = text.slice(slashIndex);
 	if (/[\s]/.test(token)) return null;
@@ -556,7 +584,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		}
 
 		const lastDelimiterIndex = findLastDelimiter(text);
-		const pathPrefix = lastDelimiterIndex === -1 ? text : text.slice(lastDelimiterIndex + 1);
+		const inlineCodeStart = findOpenInlineCodeSpanStart(text);
+		const prefixStart = Math.max(lastDelimiterIndex, inlineCodeStart ?? -1);
+		const pathPrefix = prefixStart === -1 ? text : text.slice(prefixStart + 1);
 
 		// For forced extraction (Tab key), always return something
 		if (forceExtract) {
