@@ -117,6 +117,7 @@ Read tools:
 - `gjc_coordinator_read_turn`
 - `gjc_coordinator_await_turn`
 - `gjc_coordinator_watch_events`
+- `gjc_coordinator_read_codex_handoff` — reads the Codex app-server resume bridge registration and durable wake state; endpoints are unix sockets or loopback TCP only, and token-file references only.
 
 
 Mutating tools:
@@ -127,6 +128,8 @@ Mutating tools:
 - `gjc_coordinator_send_prompt`
 - `gjc_coordinator_submit_question_answer`
 - `gjc_coordinator_report_status`
+- `gjc_coordinator_register_codex_handoff` — registers the Codex app-server resume bridge with a unix/loopback endpoint and token-file reference only.
+- `gjc_coordinator_ack_codex_wake` — acknowledges a Codex resume wake; wake prompts never include GJC final responses.
 - `gjc_delegate_plan`
 - `gjc_delegate_execute`
 - `gjc_delegate_team`

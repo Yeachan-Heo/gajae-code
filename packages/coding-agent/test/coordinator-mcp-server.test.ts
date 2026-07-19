@@ -2469,4 +2469,161 @@ describe("Coordinator MCP prepared session activation", () => {
 		expect(JSON.stringify(replay)).toBe(JSON.stringify(first));
 		expect(frames).toHaveLength(1);
 	});
+it("emits one bounded question.opened event and records its Codex wake", async () => {
+	const root = await tempRoot();
+	const controls: SdkControl[] = [];
+	let runtimeTurnId = "unbound";
+	const server = await createSdkControlServer(root, controls, [], query =>
+		query === "Q12"
+			? {
+					ok: true,
+					page: { items: [sharedAskGate("gate-opened", runtimeTurnId)], complete: true, revision: "opened-r1" },
+				}
+			: { ok: true, page: { items: [], complete: true, revision: "context" } },
+	);
+	await registerSdkSession(server, root);
+	const sent = await server.callTool("gjc_coordinator_send_prompt", {
+		session_id: "visible-session",
+		prompt: "gate prompt text must not enter the event",
+		idempotency_key: "opened-prompt",
+		allow_mutation: true,
+	});
+	const runtimeAcknowledgement = sent.result as { turn_id?: unknown };
+	if (typeof runtimeAcknowledgement.turn_id !== "string") throw new Error("missing runtime turn id");
+	runtimeTurnId = runtimeAcknowledgement.turn_id;
+	await expect(
+		server.callTool("gjc_coordinator_register_codex_handoff", {
+			session_id: "visible-session",
+			thread_id: "thread-opened",
+			endpoint: { kind: "unix", path: "/tmp/question-opened.sock" },
+			idempotency_key: "opened-handoff",
+			allow_mutation: true,
+		}),
+	).resolves.toMatchObject({ ok: true });
+
+	const first = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+	const question = (first.questions as Array<Record<string, unknown>>)[0]!;
+	const journal = path.join(root, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl");
+	const opened = (await fs.readFile(journal, "utf8"))
+		.trim()
+		.split("\n")
+		.map(line => JSON.parse(line) as Record<string, unknown>)
+		.filter(event => event.kind === "question.opened" && event.question_id === "gate-opened");
+	expect(opened).toHaveLength(1);
+	expect(opened[0]).toMatchObject({
+		session_id: "visible-session",
+		turn_id: question.turn_id,
+		question_id: "gate-opened",
+	});
+	expect(String(opened[0]?.summary)).not.toContain("gate prompt text must not enter the event");
+	await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+	const openedAfterReplay = (await fs.readFile(journal, "utf8"))
+		.trim()
+		.split("\n")
+		.map(line => JSON.parse(line) as Record<string, unknown>)
+		.filter(event => event.kind === "question.opened" && event.question_id === "gate-opened");
+	expect(openedAfterReplay).toHaveLength(1);
+	expect(
+		JSON.parse(
+			await fs.readFile(
+				path.join(
+					root,
+					".gjc",
+					"coordinator-state",
+					"local",
+					"repo",
+					"codex-wake-events",
+					`visible-session__${opened[0]?.seq}.json`,
+				),
+				"utf8",
+			),
+		),
+	).toMatchObject({ event_kind: "question.opened", question_id: "gate-opened" });
+});
+
+it("keeps parallel pending questions isolated when one answer is submitted", async () => {
+	const rootA = await tempRoot();
+	const rootB = await tempRoot();
+	const controlsA: SdkControl[] = [];
+	const controlsB: SdkControl[] = [];
+	let runtimeTurnA = "unbound";
+	let runtimeTurnB = "unbound";
+	const serverA = await createSdkControlServer(
+		rootA,
+		controlsA,
+		[],
+		query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: { items: [sharedAskGate("gate-isolated-a", runtimeTurnA)], complete: true, revision: "a-r1" },
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		undefined,
+		undefined,
+		undefined,
+		{ controlResult: control => (control.operation === "workflow.gate_answer" ? { status: "accepted" } : undefined) },
+	);
+	const serverB = await createSdkControlServer(rootB, controlsB, [], query =>
+		query === "Q12"
+			? {
+					ok: true,
+					page: { items: [sharedAskGate("gate-isolated-b", runtimeTurnB)], complete: true, revision: "b-r1" },
+				}
+			: { ok: true, page: { items: [], complete: true, revision: "context" } },
+	);
+	await Promise.all([registerSdkSession(serverA, rootA), registerSdkSession(serverB, rootB)]);
+	const [sentA, sentB] = await Promise.all([
+		serverA.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "open A",
+			idempotency_key: "isolation-prompt-a",
+			allow_mutation: true,
+		}),
+		serverB.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "open B",
+			idempotency_key: "isolation-prompt-b",
+			allow_mutation: true,
+		}),
+	]);
+	const acknowledgementA = sentA.result as { turn_id?: unknown };
+	const acknowledgementB = sentB.result as { turn_id?: unknown };
+	if (typeof acknowledgementA.turn_id !== "string" || typeof acknowledgementB.turn_id !== "string")
+		throw new Error("missing runtime turn id");
+	runtimeTurnA = acknowledgementA.turn_id;
+	runtimeTurnB = acknowledgementB.turn_id;
+	const [listedA, listedB] = await Promise.all([
+		serverA.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		serverB.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+	]);
+	const questionA = (listedA.questions as Array<Record<string, unknown>>)[0]!;
+	const questionBBefore = (listedB.questions as Array<Record<string, unknown>>)[0]!;
+	await expect(
+		serverA.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sentA.turn_id,
+			question_id: "gate-isolated-a",
+			answer_binding: questionA.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "isolation-answer-a",
+			allow_mutation: true,
+		}),
+	).resolves.toMatchObject({ ok: true, status: "accepted" });
+	const listedBAfter = await serverB.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+	const questionBAfter = (listedBAfter.questions as Array<Record<string, unknown>>)[0]!;
+	expect(questionBAfter).toMatchObject({
+		question_id: "gate-isolated-b",
+		status: "pending",
+		updated_at: questionBBefore.updated_at,
+		answer_binding: questionBBefore.answer_binding,
+	});
+	const journalB = await fs.readFile(
+		path.join(rootB, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl"),
+		"utf8",
+	);
+	expect(journalB).not.toContain("question.answered");
+	await expect(
+		fs.access(path.join(rootB, ".gjc", "coordinator-state", "local", "repo", "codex-wake-events")),
+	).rejects.toThrow();
 });

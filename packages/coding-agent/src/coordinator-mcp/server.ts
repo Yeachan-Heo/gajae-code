@@ -23,6 +23,23 @@ import {
 	requestPreparedSessionActivation,
 	SessionActivationError,
 } from "../sdk/session-activation";
+	ackCodexWakeEvent,
+	type CodexHandoffRegistrationV1,
+	type CodexWakeEventV1,
+	isCodexWakeEventKind,
+	listCodexHandoffs,
+	listCodexWakeEvents,
+	listPendingCodexWakeEvents,
+	readCodexHandoff,
+	recordCodexWakeEvent,
+	registerCodexHandoff,
+	updateCodexWakeEvent,
+} from "./codex-handoff";
+import {
+	type CodexTransportFactory,
+	createDefaultCodexTransportFactory,
+	publishCodexWake,
+} from "./codex-wake-publisher";
 import {
 	type CoordinatorModelProfileLoader,
 	loadCoordinatorModelProfiles,
@@ -68,7 +85,6 @@ import {
 	withNamespaceRegistry,
 	withSessionTransaction,
 } from "./question-state";
-
 import { createSessionReaper, type ReapableSession, type SessionReaper } from "./session-reaper";
 
 export type { CoordinatorToolName };
@@ -161,6 +177,7 @@ interface CoordinatorServices {
 	getAgentDir?: () => string;
 	resolveModelProfiles?: CoordinatorModelProfileLoader;
 	canonicalizePath?: (value: string) => Promise<string>;
+	codexTransportFactory?: CodexTransportFactory;
 }
 
 interface CoordinatorMcpServerOptions {
@@ -587,6 +604,53 @@ function toolSchema(name: CoordinatorToolName): {
 			},
 		};
 	}
+	if (name === "gjc_coordinator_register_codex_handoff") {
+		return {
+			name,
+			description: "Register a Codex app-server resume handoff using only unix or loopback TCP endpoints.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					session_id: sessionId,
+					thread_id: { type: "string" },
+					endpoint: {
+						type: "object",
+						description: "Codex app-server unix socket path or loopback TCP endpoint only.",
+					},
+					token_file: {
+						type: "string",
+						description: "Token FILE PATH reference only; raw tokens are rejected and never persisted.",
+					},
+					allow_mutation: allowMutation,
+					idempotency_key: idempotencyKey,
+				},
+				required: ["session_id", "thread_id", "endpoint", "idempotency_key", "allow_mutation"],
+			},
+		};
+	}
+	if (name === "gjc_coordinator_read_codex_handoff") {
+		return {
+			name,
+			description: "Read a Codex app-server resume handoff and durable wake events.",
+			inputSchema: { type: "object", properties: { session_id: sessionId }, required: ["session_id"] },
+		};
+	}
+	if (name === "gjc_coordinator_ack_codex_wake") {
+		return {
+			name,
+			description: "Acknowledge a durable Codex app-server resume wake event.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					session_id: sessionId,
+					wake_key: { type: "string" },
+					allow_mutation: allowMutation,
+					idempotency_key: idempotencyKey,
+				},
+				required: ["session_id", "wake_key", "idempotency_key", "allow_mutation"],
+			},
+		};
+	}
 	const delegateWorkflow = workflowForDelegateTool(name);
 	if (delegateWorkflow) {
 		return {
@@ -883,6 +947,73 @@ function boundedPublicResponse(response: Record<string, unknown>): Record<string
 	const value = boundedPublicValue(response, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP });
 	return asRecord(value) ?? { ok: false, error: { code: "unavailable", message: "Invalid coordinator response." } };
 }
+const CODEX_HANDOFF_RESPONSE_STRING_CAP = 4096;
+
+function boundedCodexHandoffString(value: unknown): string | null {
+	return typeof value === "string" ? value.slice(0, CODEX_HANDOFF_RESPONSE_STRING_CAP) : null;
+}
+
+function boundedCodexHandoff(response: unknown): Record<string, unknown> | null {
+	const handoff = asRecord(response);
+	if (!handoff) return null;
+	const workUnit = boundedCodexHandoffString(handoff.work_unit);
+	const threadId = boundedCodexHandoffString(handoff.thread_id);
+	const tokenFile = handoff.token_file === null ? null : boundedCodexHandoffString(handoff.token_file);
+	const registeredAt = boundedCodexHandoffString(handoff.registered_at);
+	const updatedAt = boundedCodexHandoffString(handoff.updated_at);
+	const endpoint = asRecord(handoff.endpoint);
+	if (
+		handoff.schema_version !== 1 ||
+		workUnit === null ||
+		threadId === null ||
+		(tokenFile === null && handoff.token_file !== null) ||
+		registeredAt === null ||
+		updatedAt === null ||
+		!endpoint
+	)
+		return null;
+	let boundedEndpoint: Record<string, unknown> | null = null;
+	if (endpoint.kind === "unix") {
+		const socketPath = boundedCodexHandoffString(endpoint.path);
+		if (socketPath !== null) boundedEndpoint = { kind: "unix", path: socketPath };
+	} else if (endpoint.kind === "tcp") {
+		const host = boundedCodexHandoffString(endpoint.host);
+		if (host !== null && typeof endpoint.port === "number")
+			boundedEndpoint = { kind: "tcp", host, port: endpoint.port };
+	}
+	if (!boundedEndpoint) return null;
+	return {
+		schema_version: 1,
+		work_unit: workUnit,
+		thread_id: threadId,
+		endpoint: boundedEndpoint,
+		token_file: tokenFile,
+		registered_at: registeredAt,
+		updated_at: updatedAt,
+	};
+}
+
+function boundedCodexHandoffResponse(response: Record<string, unknown>): Record<string, unknown> {
+	const output: Record<string, unknown> = {};
+	if (typeof response.ok === "boolean") output.ok = response.ok;
+	const error = asRecord(response.error);
+	if (error) {
+		const boundedError: Record<string, unknown> = {};
+		const code = boundedCodexHandoffString(error.code);
+		const message = boundedCodexHandoffString(error.message);
+		if (code !== null) boundedError.code = code;
+		if (message !== null) boundedError.message = message;
+		if (Object.keys(boundedError).length > 0) output.error = boundedError;
+	}
+	const handoff = boundedCodexHandoff(response.handoff);
+	if (handoff) output.handoff = handoff;
+	return output;
+}
+
+function boundedToolResponse(tool: string, response: Record<string, unknown>): Record<string, unknown> {
+	if (tool === "gjc_coordinator_register_codex_handoff") return boundedCodexHandoffResponse(response);
+	return boundedPublicResponse(response);
+}
 
 /**
  * `activation_outcome_unknown` states only that the activation's outcome could
@@ -1172,6 +1303,130 @@ async function readLatestEventSeq(namespaceDir: string): Promise<number> {
 }
 
 const eventAppendQueues = new Map<string, Promise<unknown>>();
+const codexWakeTransportFactories = new Map<string, CodexTransportFactory>();
+const codexWakePublishTails = new Map<string, Promise<void>>();
+
+const CODEX_WAKE_ERROR_CAP = 240;
+const CODEX_WAKE_DIAGNOSTIC_CAP = 512;
+
+function codexWakeErrorCode(error: unknown): string {
+	if (error instanceof Error && /^[a-z0-9_]+$/.test(error.message))
+		return error.message.slice(0, CODEX_WAKE_ERROR_CAP);
+	return "codex_wake_publish_failed";
+}
+
+async function appendCodexWakeDiagnostic(
+	namespaceDir: string,
+	event: Pick<CoordinatorEvent, "id">,
+	error: unknown,
+): Promise<void> {
+	const line = `${new Date().toISOString()} event=${event.id} error=${codexWakeErrorCode(error)}\n`;
+	try {
+		await fs.appendFile(path.join(namespaceDir, "codex-wake-errors.log"), line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP), {
+			mode: 0o600,
+		});
+	} catch {
+		try {
+			process.stderr.write("codex-wake-diagnostic-unwritable\n");
+		} catch {}
+	}
+}
+
+async function maybeRecordCodexWake(
+	namespaceDir: string,
+	event: CoordinatorEvent,
+): Promise<{ handoff: CodexHandoffRegistrationV1; event: CodexWakeEventV1 | null } | null> {
+	if (!event.session_id || !isCodexWakeEventKind(event.kind)) return null;
+	const handoff = await readCodexHandoff(namespaceDir, event.session_id);
+	if (!handoff) return null;
+	const recorded = await recordCodexWakeEvent(namespaceDir, {
+		work_unit: event.session_id,
+		event_seq: event.seq,
+		event_kind: event.kind,
+		turn_id: event.turn_id ?? null,
+		question_id: event.question_id ?? null,
+		summary: event.summary,
+	});
+	return {
+		handoff,
+		event: recorded.event.status === "pending" || recorded.event.status === "failed" ? recorded.event : null,
+	};
+}
+
+async function publishRecordedCodexWake(
+	namespaceDir: string,
+	handoff: CodexHandoffRegistrationV1,
+	event: CodexWakeEventV1,
+): Promise<string | null> {
+	if (event.status !== "pending" && event.status !== "failed") return null;
+	const transportFactory = codexWakeTransportFactories.get(namespaceDir);
+	if (!transportFactory) return null;
+	try {
+		const published = await publishCodexWake({ handoff, event, transportFactory });
+		await updateCodexWakeEvent(namespaceDir, event.key, {
+			...(published.published ? { status: "published" as const } : {}),
+			attempts_delta: 1,
+			last_error: null,
+		});
+		return published.reason;
+	} catch (error) {
+		await updateCodexWakeEvent(namespaceDir, event.key, {
+			status: "failed",
+			attempts_delta: 1,
+			last_error: codexWakeErrorCode(error),
+		});
+		return null;
+	}
+}
+
+async function publishPendingCodexWakes(namespaceDir: string, threadId: string): Promise<void> {
+	const handoffs = (await listCodexHandoffs(namespaceDir)).filter(handoff => handoff.thread_id === threadId);
+	if (handoffs.length === 0) return;
+	const byWorkUnit = new Map(handoffs.map(handoff => [handoff.work_unit, handoff]));
+	const pending: CodexWakeEventV1[] = [];
+	for (const handoff of handoffs) pending.push(...(await listPendingCodexWakeEvents(namespaceDir, handoff.work_unit)));
+	pending.sort((left, right) => left.event_seq - right.event_seq);
+	for (const event of pending) {
+		const handoff = byWorkUnit.get(event.work_unit);
+		if (!handoff) continue;
+		if ((await publishRecordedCodexWake(namespaceDir, handoff, event)) === "thread_active_pending") return;
+	}
+}
+
+function codexWakeTailKey(namespaceDir: string, threadId: string): string {
+	return `${namespaceDir}\0${threadId}`;
+}
+
+function enqueueCodexWakePublish(
+	namespaceDir: string,
+	handoff: CodexHandoffRegistrationV1,
+	_triggeringEvent: CodexWakeEventV1 | null,
+): void {
+	const tailKey = codexWakeTailKey(namespaceDir, handoff.thread_id);
+	const previous = codexWakePublishTails.get(tailKey) ?? Promise.resolve();
+	const next = previous
+		.then(() => publishPendingCodexWakes(namespaceDir, handoff.thread_id))
+		.catch(async error => {
+			await appendCodexWakeDiagnostic(
+				namespaceDir,
+				{ id: `wake-queue:${handoff.thread_id}` } as CoordinatorEvent,
+				error,
+			);
+		});
+	codexWakePublishTails.set(tailKey, next);
+	void next.finally(() => {
+		if (codexWakePublishTails.get(tailKey) === next) codexWakePublishTails.delete(tailKey);
+	});
+}
+
+/** Test-only helper that waits for queued Codex wake publishes in a namespace. */
+export async function awaitCodexWakePublishesForTest(namespaceDir: string): Promise<void> {
+	await Promise.all(
+		[...codexWakePublishTails.entries()]
+			.filter(([key]) => key.startsWith(`${namespaceDir}\0`))
+			.map(([, tail]) => tail),
+	);
+}
 
 async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEventInput): Promise<CoordinatorEvent> {
 	const previous = eventAppendQueues.get(namespaceDir) ?? Promise.resolve();
@@ -1207,11 +1462,23 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 		await ensureDir(eventsDir(namespaceDir));
 		await fs.appendFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
 		await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
+		const codexWake = await maybeRecordCodexWake(namespaceDir, event).catch(async error => {
+			await appendCodexWakeDiagnostic(namespaceDir, event, error);
+			return null;
+		});
+		if (codexWake) enqueueCodexWakePublish(namespaceDir, codexWake.handoff, codexWake.event);
 		return event;
 	} finally {
 		release();
 		if (eventAppendQueues.get(namespaceDir) === queued) eventAppendQueues.delete(namespaceDir);
 	}
+}
+/** Test-only event injection for coordinator wake-pipeline coverage. */
+export async function appendCoordinatorEventForTest(
+	namespaceDir: string,
+	input: CoordinatorEventInput,
+): Promise<CoordinatorEvent> {
+	return appendCoordinatorEvent(namespaceDir, input);
 }
 
 function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
@@ -1982,6 +2249,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		config.namespace.repo ?? "unscoped-repo",
 	);
 	const questionPaths = coordinatorStatePaths(config.stateRoot, config.namespace.identity);
+	codexWakeTransportFactories.set(
+		namespaceDir,
+		services.codexTransportFactory ?? createDefaultCodexTransportFactory(),
+	);
+	void (async () => {
+		try {
+			for (const handoff of await listCodexHandoffs(namespaceDir))
+				enqueueCodexWakePublish(namespaceDir, handoff, null);
+		} catch (error) {
+			await appendCodexWakeDiagnostic(namespaceDir, { id: "startup-drain" }, error);
+		}
+	})();
 	let questionStateReady: Promise<void> | null = null;
 
 	function ensureQuestionStateReady(): Promise<void> {
@@ -2185,6 +2464,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 			}
 			const projectedTurnQuestions = new Map<string, string[]>();
+			const openedQuestions: Array<{ turnId: string; questionId: string }> = [];
 			await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
 				const seen = new Set<string>();
 				const byRuntimeTurn = new Map<string, Array<(typeof transaction.canonical.turns)[string]>>();
@@ -2347,6 +2627,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						};
 						turn.question_ids = [...new Set([...turn.question_ids, questionId])];
 						projectedTurnQuestions.set(turn.turn_id, turn.question_ids);
+						openedQuestions.push({ turnId: turn.turn_id, questionId });
 					}
 				}
 				if (complete)
@@ -2373,6 +2654,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				legacyTurn.question_ids = questionIds;
 				await writeTurnRecord(namespaceDir, legacyTurn);
 			}
+			for (const question of openedQuestions)
+				await appendCoordinatorEvent(namespaceDir, {
+					kind: "question.opened",
+					sessionId,
+					turnId: question.turnId,
+					questionId: question.questionId,
+					summary: "A coordinator question is awaiting an answer.",
+				});
 			return {
 				ok: true,
 				schema_version: 1,
@@ -2670,7 +2959,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						},
 					};
 				if (existing.state === "in_progress") {
-					const response = boundedPublicResponse(await operation().catch(error => sdkError(error)));
+					const response = boundedToolResponse(tool, await operation().catch(error => sdkError(error)));
 					// The receipt keeps its original key and request digests, so a
 					// reused key still conflicts and a later settled answer still seals.
 					if (isNonterminal(response)) return response;
@@ -2699,7 +2988,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				created_at: new Date().toISOString(),
 			};
 			await writeCoordinatorIdempotencyFile(file, started);
-			const response = boundedPublicResponse(await operation().catch(error => sdkError(error)));
+			const response = boundedToolResponse(tool, await operation().catch(error => sdkError(error)));
 			if (isNonterminal(response)) return response;
 			await writeCoordinatorIdempotencyFile(file, {
 				...started,
@@ -3767,6 +4056,93 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					},
 					true,
 					isUnobservedCompensation,
+				);
+			}
+			if (name === "gjc_coordinator_register_codex_handoff") {
+				requireCoordinatorMutation(config, "sessions", args);
+				const idempotencyKey = requiredIdempotencyKey(args);
+				const sessionId = safeExternalId("session", args.session_id);
+				if (!(await readJsonFile(sessionFile(sessionId))))
+					return {
+						ok: false,
+						error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
+					};
+				if (Object.hasOwn(args, "token")) return { ok: false, error: { code: "token_material_not_allowed" } };
+				return await withToolIdempotency(
+					name,
+					idempotencyKey,
+					{
+						session_id: sessionId,
+						thread_id: args.thread_id,
+						endpoint: args.endpoint,
+						token_file: args.token_file ?? null,
+						allow_mutation: true,
+					},
+					async () => {
+						try {
+							const handoff = await registerCodexHandoff(namespaceDir, {
+								work_unit: sessionId,
+								thread_id: typeof args.thread_id === "string" ? args.thread_id : "",
+								endpoint: args.endpoint as
+									| { kind: "unix"; path: string }
+									| { kind: "tcp"; host: string; port: number },
+								token_file: args.token_file as string | null | undefined,
+							});
+							return { ok: true, handoff };
+						} catch (error) {
+							const code = error instanceof Error ? error.message : "invalid_codex_endpoint";
+							if (
+								code === "invalid_codex_endpoint" ||
+								code === "codex_endpoint_not_loopback" ||
+								code === "token_material_not_allowed" ||
+								code === "invalid_thread_id"
+							)
+								return { ok: false, error: { code } };
+							throw error;
+						}
+					},
+				);
+			}
+			if (name === "gjc_coordinator_read_codex_handoff") {
+				const sessionId = safeExternalId("session", args.session_id);
+				const wakeEvents = (await listCodexWakeEvents(namespaceDir, sessionId)).slice(-100);
+				const pendingWakeEvents = (await listPendingCodexWakeEvents(namespaceDir, sessionId)).slice(-100);
+				return {
+					ok: true,
+					handoff: await readCodexHandoff(namespaceDir, sessionId),
+					wake_events: wakeEvents,
+					pending_wake_events: pendingWakeEvents,
+				};
+			}
+			if (name === "gjc_coordinator_ack_codex_wake") {
+				requireCoordinatorMutation(config, "sessions", args);
+				const idempotencyKey = requiredIdempotencyKey(args);
+				const sessionId = safeExternalId("session", args.session_id);
+				const wakeKey = typeof args.wake_key === "string" ? args.wake_key : "";
+				return await withToolIdempotency(
+					name,
+					idempotencyKey,
+					{ session_id: sessionId, wake_key: wakeKey, allow_mutation: true },
+					async () => {
+						const wakeEvent = (await listCodexWakeEvents(namespaceDir, sessionId)).find(
+							event => event.key === wakeKey,
+						);
+						if (!wakeEvent)
+							return {
+								ok: false,
+								error: { code: "not_found", message: `Codex wake event not found: ${wakeKey}` },
+							};
+						try {
+							return { ok: true, wake_event: await ackCodexWakeEvent(namespaceDir, wakeKey) };
+						} catch (error) {
+							if (error instanceof Error && error.message === "resource_gone")
+								return {
+									ok: false,
+									error: { code: "not_found", message: `Codex wake event not found: ${wakeKey}` },
+								};
+							throw error;
+						}
+					},
 				);
 			}
 			if (name === "gjc_coordinator_read_status") {

@@ -1,0 +1,18 @@
+# Codex bridge coordinator real-surface smoke (2026-07-19T03:40:46Z)
+
+## mcp-serve coordinator --check
+server: gjc-coordinator-mcp
+tools: 22
+
+## stdio JSON-RPC: parallel registrations sharing one Codex thread + fresh-process durable read
+id=2 ok=True work_unit=par-1 thread=thread-shared (register)
+id=3 ok=True work_unit=par-2 thread=thread-shared (register)
+--- restart (fresh process) ---
+id=2 ok=True work_unit=par-1 thread=thread-shared wake_events=0 (durable read)
+id=3 ok=True work_unit=par-2 thread=thread-shared wake_events=0 (durable read)
+token scan of state root: NO-TOKEN-IN-STATE
+
+## negative cases (earlier same-session run)
+non-loopback tcp 8.8.8.8 -> {ok:false, code:codex_endpoint_not_loopback}
+ack missing wake -> {ok:false, code:not_found}
+raw token argument -> {ok:false, code:token_material_not_allowed} (covered in bridge tests)

@@ -99,6 +99,7 @@ Read-only tools:
 - `gjc_coordinator_read_artifact`
 - `gjc_coordinator_read_coordination_status`
 - `gjc_coordinator_watch_events`
+- `gjc_coordinator_read_codex_handoff` — reads the Codex app-server resume bridge registration and durable wake state; endpoints are unix sockets or loopback TCP only, and token-file references only.
 
 Mutating tools:
 
@@ -109,6 +110,8 @@ Mutating tools:
 - `gjc_coordinator_submit_question_answer`
 - `gjc_coordinator_report_status`
 - `gjc_coordinator_stop_session`
+- `gjc_coordinator_register_codex_handoff` — registers the Codex app-server resume bridge with a unix/loopback endpoint and token-file reference only.
+- `gjc_coordinator_ack_codex_wake` — acknowledges a Codex resume wake; wake prompts never include GJC final responses.
 
 `gjc_coordinator_stop_session` closes a coordinator delegate-created (ephemeral) session through canonical SDK broker lifecycle control, then removes its coordinator metadata only after the broker reports success. It refuses sessions with an active turn. User-registered sessions require both `force: true` and the `GJC_COORDINATOR_MCP_FORCE_STOP` capability; the same SDK lifecycle path reaps abandoned ephemeral delegate sessions after the configured idle TTL.
 
