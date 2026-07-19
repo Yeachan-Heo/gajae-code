@@ -170,8 +170,14 @@
 			"types": "./src/capability/*.ts",
 			"import": "./src/capability/*.ts"
 		},
-		"./cli/worktree-cli": null,
-		"./cli/worktree-cli.js": null,
+		"./cli/worktree-cli": {
+			"types": "./src/cli/worktree-cli.ts",
+			"import": "./src/cli/worktree-cli.ts"
+		},
+		"./cli/worktree-cli.js": {
+			"types": "./src/cli/worktree-cli.ts",
+			"import": "./src/cli/worktree-cli.ts"
+		},
 		"./cli/*": {
 			"types": "./src/cli/*.ts",
 			"import": "./src/cli/*.ts"
@@ -188,8 +194,14 @@
 		"./commands/ultraqa": null,
 		"./commands/ultrawork": null,
 		"./commands/performance-goal": null,
-		"./commands/worktree": null,
-		"./commands/worktree.js": null,
+		"./commands/worktree": {
+			"types": "./src/commands/worktree.ts",
+			"import": "./src/commands/worktree.ts"
+		},
+		"./commands/worktree.js": {
+			"types": "./src/commands/worktree.ts",
+			"import": "./src/commands/worktree.ts"
+		},
 		"./commands/*": {
 			"types": "./src/commands/*.ts",
 			"import": "./src/commands/*.ts"

@@ -50,36 +50,57 @@ describe("GJC public CLI command surface", () => {
 		]);
 	});
 
-	it("tombstones the removed worktree package subpaths", () => {
-		for (const subpath of [
-			"./cli/worktree-cli",
-			"./cli/worktree-cli.js",
-			"./commands/worktree",
-			"./commands/worktree.js",
+	it("maps the removed worktree package subpaths to throwing tombstone modules", () => {
+		for (const [subpath, target] of [
+			["./cli/worktree-cli", "./src/cli/worktree-cli.ts"],
+			["./cli/worktree-cli.js", "./src/cli/worktree-cli.ts"],
+			["./commands/worktree", "./src/commands/worktree.ts"],
+			["./commands/worktree.js", "./src/commands/worktree.ts"],
 		] as const)
-			expect(packageJson.exports[subpath]).toBeNull();
+			expect(packageJson.exports[subpath]).toEqual({ types: target, import: target });
 	});
 
-	it.each([
-		"@gajae-code/coding-agent/cli/worktree-cli",
-		"@gajae-code/coding-agent/commands/worktree",
-	])("rejects resolution of the removed %s subpath", async subpath => {
-		const child = Bun.spawn([process.execPath, "-e", `await import(${JSON.stringify(subpath)})`], {
-			cwd: import.meta.dir,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(child.stdout).text(),
-			new Response(child.stderr).text(),
-			child.exited,
-		]);
-		const output = `${stdout}${stderr}`;
-
-		expect(exitCode).not.toBe(0);
-		expect(output).toMatch(/error/i);
-		expect(output).toContain(subpath);
-	});
+	it("serves migration guidance for removed worktree subpaths from the packed package", async () => {
+		const stageDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-worktree-tombstone-"));
+		try {
+			const packageDir = path.join(repoRoot, "packages", "coding-agent");
+			const pack = Bun.spawnSync(["bun", "pm", "pack", "--destination", stageDir], {
+				cwd: packageDir,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(pack.exitCode, pack.stderr.toString()).toBe(0);
+			const tarball = (await fs.readdir(stageDir)).find(name => name.endsWith(".tgz"));
+			if (!tarball) throw new Error("bun pm pack produced no tarball");
+			const extract = Bun.spawnSync(["tar", "xzf", tarball], { cwd: stageDir, stdout: "pipe", stderr: "pipe" });
+			expect(extract.exitCode, extract.stderr.toString()).toBe(0);
+			const consumerDir = path.join(stageDir, "consumer");
+			await fs.mkdir(path.join(consumerDir, "node_modules", "@gajae-code"), { recursive: true });
+			await fs.symlink(
+				path.join(stageDir, "package"),
+				path.join(consumerDir, "node_modules", "@gajae-code", "coding-agent"),
+			);
+			for (const subpath of [
+				"@gajae-code/coding-agent/cli/worktree-cli",
+				"@gajae-code/coding-agent/cli/worktree-cli.js",
+				"@gajae-code/coding-agent/commands/worktree",
+				"@gajae-code/coding-agent/commands/worktree.js",
+			]) {
+				const child = Bun.spawnSync([process.execPath, "-e", `await import(${JSON.stringify(subpath)})`], {
+					cwd: consumerDir,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const output = `${child.stdout.toString()}${child.stderr.toString()}`;
+				expect(child.exitCode, output).not.toBe(0);
+				expect(output).toContain("was deliberately removed");
+				expect(output).toContain("Inspect leftover managed worktrees under ~/.gjc/wt manually");
+				expect(output).toContain("`git worktree remove` or `git worktree prune` instead");
+			}
+		} finally {
+			await fs.rm(stageDir, { recursive: true, force: true });
+		}
+	}, 60_000);
 
 	it("exposes the update command help without launching the TUI", () => {
 		const result = Bun.spawnSync(["bun", cliEntry, "update", "--help"], {
