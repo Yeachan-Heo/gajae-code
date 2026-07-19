@@ -41,6 +41,7 @@ export class CustomProviderWizardComponent extends Container {
 		credential: "",
 		models: "",
 	};
+	#submitInFlight = false;
 	#onSubmit: (input: CustomProviderWizardSubmit) => void;
 	#onCancel: () => void;
 	#onRender: () => void;
@@ -294,13 +295,37 @@ export class CustomProviderWizardComponent extends Container {
 			this.#step = "credential";
 		} else if (this.#step === "confirm" || this.#step === "force-confirm") {
 			if (this.#selectedIndex === 0) {
-				this.#onSubmit(this.#buildInput(this.#step === "force-confirm"));
+				this.#submit();
 				return;
 			}
 			this.#step = "models";
 		}
 		this.#renderStep();
 		this.#onRender();
+	}
+
+	#submit(): void {
+		if (this.#submitInFlight) return;
+		this.#submitInFlight = true;
+		let submission: unknown;
+		try {
+			submission = this.#onSubmit(this.#buildInput(this.#step === "force-confirm"));
+		} catch (error) {
+			this.#submitInFlight = false;
+			throw error;
+		}
+		if (!(submission instanceof Promise)) {
+			this.#submitInFlight = false;
+			return;
+		}
+		void submission.then(
+			() => {
+				this.#submitInFlight = false;
+			},
+			() => {
+				this.#submitInFlight = false;
+			},
+		);
 	}
 
 	#buildInput(force: boolean): CustomProviderWizardSubmit {

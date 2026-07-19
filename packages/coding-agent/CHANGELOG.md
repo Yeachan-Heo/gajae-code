@@ -7,6 +7,7 @@
 ### Fixed
 - Malformed selectors on internal read URLs now fail explicitly instead of silently falling back to an unbounded resource read.
 - Newly registered earlier resource-GC policies advance the pending sweep without postponing an already earlier sweep.
+- Provider onboarding wizard completion is now deterministic under CI load: duplicate in-flight confirmation is suppressed, success tests await the real refresh/notification/status boundary instead of fixed sleeps, and the newly configured model is verified through the subsequent model selector.
 
 ## [0.11.3] - 2026-07-19
 ### Added

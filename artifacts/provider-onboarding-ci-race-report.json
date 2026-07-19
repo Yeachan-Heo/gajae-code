@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "story": "Deterministic provider onboarding wizard completion under CI load",
+  "classification": {
+    "verdict": "latent fixed-sleep race exposed by scheduler pressure",
+    "baseline": "Focused pre-change rerun passed 600/600, while CI shard run 29695908337 observed refreshModes=[] after a fixed 50 ms sleep; tombstone commit ac23d6baa did not modify onboarding code.",
+    "productionFinding": "The controller already ordered provider write, offline refresh, config notification, formatted status, completion, and render, but the wizard discarded the returned asynchronous operation and allowed duplicate confirmation while it was pending."
+  },
+  "changes": [
+    "CustomProviderWizardComponent tracks the real Promise returned by submission and suppresses duplicate Enter until settlement while preserving synchronous callbacks and retries.",
+    "SelectorController returns its existing submit Promise to the wizard.",
+    "Success tests await an exact formatted status after refresh and notification instead of Bun.sleep(50)/Bun.sleep(1000).",
+    "Red-team coverage proves rejected notification cannot emit success and the subsequent real ModelSelectorComponent exposes the configured model."
+  ],
+  "verification": [
+    {"command":"bun test test/provider-onboarding-wizard-redteam.test.ts --rerun-each 100","cwd":"packages/coding-agent","result":"700 pass, 0 fail"},
+    {"command":"bun test test/provider-onboarding-wizard.test.ts --rerun-each 100","cwd":"packages/coding-agent","result":"700 pass, 0 fail"},
+    {"command":"bun test test/provider-onboarding-wizard-redteam.test.ts test/provider-onboarding-wizard.test.ts test/provider-onboarding.test.ts","cwd":"packages/coding-agent","result":"30 pass, 0 fail"},
+    {"command":"bun run check","cwd":"packages/coding-agent","result":"Biome clean; TypeScript check passed"},
+    {"command":"bun test --shard=7/8","cwd":"packages/coding-agent","result":"1332 pass, 32 skip; 2 unrelated local failures in gjc-plugin-mcp-connect.test.ts caused by MCP startup timeout"}
+  ],
+  "reviews": {
+    "architect": {"status":"CLEAR","recommendation":"APPROVE","receipt":"agent://5-ProviderWizardArchitectFinal","cleanerBlockingCount":0},
+    "executorQa": {"status":"passed","e2eStatus":"passed","redTeamStatus":"passed","receipt":"agent://6-ProviderWizardQAFinal","blockers":[]}
+  },
+  "limitations": [
+    "The local shard-7 environment could not start the unrelated bundled MCP fixture and timed out in two existing plugin tests; focused onboarding coverage and all package checks passed. PR Dev CI is the authoritative shard environment."
+  ]
+}

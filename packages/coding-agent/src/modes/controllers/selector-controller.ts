@@ -1060,7 +1060,7 @@ export class SelectorController {
 			};
 			wizard = new CustomProviderWizardComponent(
 				input => {
-					void submit(input);
+					return submit(input);
 				},
 				() => {
 					done();
