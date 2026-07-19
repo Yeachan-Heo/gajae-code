@@ -1,0 +1,23 @@
+{
+ "schemaVersion": 1,
+ "kind": "cli-replay",
+ "replaySafe": true,
+ "command": [
+  "bun",
+  "--version"
+ ],
+ "cwd": ".",
+ "env": {
+  "LC_ALL": "C"
+ },
+ "timeoutMs": 30000,
+ "expectedExitCode": 0,
+ "recordedStdout": "1.3.14\n",
+ "recordedStderr": "",
+ "invariants": [
+  {
+   "type": "substring",
+   "value": "1.3"
+  }
+ ]
+}

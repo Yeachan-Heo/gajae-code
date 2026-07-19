@@ -109,6 +109,10 @@ Call the \`${meta.tool}\` coordinator MCP tool to delegate this work to gajae-co
 GJC starts a session and runs \`/skill:${meta.skill}\` to completion, returning a
 durable \`turn_id\`, status, and artifact references. Poll with
 \`gjc_coordinator_await_turn\` or \`gjc_coordinator_watch_events\`.
+Codex resume bridge correlation: after registering an app-server handoff with
+\`gjc_coordinator_register_codex_handoff\`, pass the same \`session_id\` as
+\`codex_host_session_id\` on delegate calls so the new GJC session auto-binds to
+the Codex thread for wake-on-completion and questions.
 `;
 }
 
@@ -139,6 +143,11 @@ project directory and does **not** set \`GJC_COORDINATOR_MCP_MUTATIONS\`.
 Delegation is read-only until the user explicitly enables a mutation class and
 passes \`allow_mutation: true\` per call. \`GJC_COORDINATOR_MCP_REPO\` is a
 namespace label only, never a filesystem path.
+## Codex resume bridge correlation
+
+After registering an app-server handoff with \`gjc_coordinator_register_codex_handoff\`,
+pass the same \`session_id\` as \`codex_host_session_id\` on delegate calls so new GJC
+sessions auto-bind to the Codex thread for wake-on-completion and questions.
 
 ## Polling
 

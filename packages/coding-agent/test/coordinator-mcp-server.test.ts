@@ -1644,6 +1644,129 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		}
 		expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceBefore);
 	});
+	it("binds a delegate session to an explicitly correlated Codex handoff", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await registerCodexHandoff(namespace, {
+			work_unit: "codex-host-1",
+			thread_id: "thread-explicit-one",
+			endpoint: { kind: "unix", path: "/tmp/codex-explicit-one.sock" },
+		});
+
+		const result = await server.callTool("gjc_delegate_execute", {
+			cwd: root,
+			task: "bind explicit Codex handoff",
+			idempotency_key: "explicit-codex-handoff",
+			allow_mutation: true,
+			codex_host_session_id: "codex-host-1",
+		});
+		const sessionId = String(result.session_id);
+
+		expect(result).toMatchObject({
+			ok: true,
+			codex_handoff: { auto_bound: true, thread_id: "thread-explicit-one" },
+		});
+		expect(await readCodexHandoff(namespace, sessionId)).toMatchObject({
+			origin: { codex_host_session_id: "codex-host-1" },
+		});
+	});
+	it("explicit correlation overrides ambient host context", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "ambient-codex-host",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		await Promise.all([
+			registerCodexHandoff(namespace, {
+				work_unit: "ambient-codex-host",
+				thread_id: "thread-ambient",
+				endpoint: { kind: "unix", path: "/tmp/codex-ambient.sock" },
+			}),
+			registerCodexHandoff(namespace, {
+				work_unit: "codex-host-2",
+				thread_id: "thread-explicit-two",
+				endpoint: { kind: "unix", path: "/tmp/codex-explicit-two.sock" },
+			}),
+		]);
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "prefer explicit Codex handoff",
+				idempotency_key: "explicit-over-ambient",
+				allow_mutation: true,
+				codex_host_session_id: "codex-host-2",
+			}),
+		).resolves.toMatchObject({
+			ok: true,
+			codex_handoff: { auto_bound: true, thread_id: "thread-explicit-two" },
+		});
+	});
+	it("missing explicit correlation skips binding with a durable diagnostic", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "skip missing explicit Codex handoff",
+				idempotency_key: "missing-explicit-codex-handoff",
+				allow_mutation: true,
+				codex_host_session_id: "missing-codex-host",
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+			"codex_handoff_explicit_source_missing",
+		);
+	});
+	it("rejects malformed explicit correlation ids without failing delegation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "reject malformed explicit Codex handoff",
+				idempotency_key: "malformed-explicit-codex-handoff",
+				allow_mutation: true,
+				codex_host_session_id: "../evil",
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+			"codex_handoff_explicit_source_missing",
+		);
+	});
+	it("treats a corrupt explicit handoff registration as missing without failing delegation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await fs.mkdir(path.join(namespace, "codex-handoffs"), { recursive: true });
+		await fs.writeFile(path.join(namespace, "codex-handoffs", "corrupt-codex-host.json"), "{ not json", "utf8");
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "skip corrupt explicit Codex handoff",
+				idempotency_key: "corrupt-explicit-codex-handoff",
+				allow_mutation: true,
+				codex_host_session_id: "corrupt-codex-host",
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+			"codex_handoff_explicit_source_missing",
+		);
+	});
 	it("fails closed when eligible host contexts resolve to different Codex threads", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

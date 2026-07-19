@@ -674,6 +674,11 @@ function toolSchema(name: CoordinatorToolName): {
 						description:
 							"Optional existing GJC coordinator bridge session id to reuse; omitted starts a fresh session.",
 					},
+					codex_host_session_id: {
+						type: "string",
+						description:
+							"Optional Codex resume-bridge correlation: the session_id previously passed to gjc_coordinator_register_codex_handoff. When set, the new delegate session auto-binds to that registration's Codex thread; ambient host-context inference is skipped.",
+					},
 					queue: {
 						type: "boolean",
 						description: "When reusing a session with an active turn, queue instead of failing.",
@@ -1341,10 +1346,60 @@ async function autoBindDelegateCodexHandoff(
 	workUnit: string,
 	delegationId: string,
 	workflow: string,
+	explicitHostWorkUnit: string | null,
 ): Promise<{ auto_bound: boolean; thread_id?: string }> {
+	const diagnosticEvent = { id: `delegate-handoff-${delegationId}` };
+	if (explicitHostWorkUnit !== null) {
+		if (!SAFE_EXTERNAL_ID_PATTERN.test(explicitHostWorkUnit)) {
+			await appendCodexWakeDiagnostic(
+				namespaceDir,
+				diagnosticEvent,
+				new Error("codex_handoff_explicit_source_missing"),
+			);
+			return { auto_bound: false };
+		}
+		let source: CodexHandoffRegistrationV1 | null;
+		try {
+			source = await readCodexHandoff(namespaceDir, explicitHostWorkUnit);
+		} catch {
+			await appendCodexWakeDiagnostic(
+				namespaceDir,
+				diagnosticEvent,
+				new Error("codex_handoff_explicit_source_missing"),
+			);
+			return { auto_bound: false };
+		}
+		if (!source) {
+			await appendCodexWakeDiagnostic(
+				namespaceDir,
+				diagnosticEvent,
+				new Error("codex_handoff_explicit_source_missing"),
+			);
+			return { auto_bound: false };
+		}
+		try {
+			const binding = await bindDelegateCodexHandoff(namespaceDir, {
+				work_unit: workUnit,
+				source,
+				origin: {
+					gjc_session_id: workUnit,
+					gjc_turn_id: delegationId,
+					codex_thread_id: source.thread_id,
+					codex_turn_id: null,
+					codex_host_session_id: explicitHostWorkUnit,
+					delegation_id: delegationId,
+					workflow,
+					bound_at: new Date().toISOString(),
+				},
+			});
+			return { auto_bound: true, thread_id: binding.handoff.thread_id };
+		} catch (error) {
+			await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, error);
+			return { auto_bound: false };
+		}
+	}
 	try {
 		const hostContexts = await listMcpDelegateHostContexts(cwd);
-		const diagnosticEvent = { id: `delegate-handoff-${delegationId}` };
 		if (hostContexts.failures > 0)
 			await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, new Error("codex_handoff_context_unreadable"));
 		if (hostContexts.contexts.length === 0) return { auto_bound: false };
@@ -1396,7 +1451,7 @@ async function autoBindDelegateCodexHandoff(
 		});
 		return { auto_bound: true, thread_id: binding.handoff.thread_id };
 	} catch (error) {
-		await appendCodexWakeDiagnostic(namespaceDir, { id: `delegate-handoff-${delegationId}` }, error);
+		await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, error);
 		return { auto_bound: false };
 	}
 }
@@ -4372,6 +4427,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					model: typeof args.model === "string" ? args.model : null,
 				});
 				const reusedSessionId = args.session_id == null ? undefined : safeExternalId("session", args.session_id);
+				const explicitHostWorkUnit =
+					args.codex_host_session_id === undefined
+						? null
+						: typeof args.codex_host_session_id === "string" &&
+								SAFE_EXTERNAL_ID_PATTERN.test(args.codex_host_session_id)
+							? args.codex_host_session_id
+							: "";
 				const canonicalArgs = {
 					cwd: canonicalCwd,
 					task,
@@ -4385,6 +4447,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						? { timeout_ms: args.timeout_ms, poll_interval_ms: args.poll_interval_ms }
 						: {}),
 					prompt_alias_ignored: hasTask && hasPrompt,
+					...(explicitHostWorkUnit !== null ? { codex_host_session_id: explicitHostWorkUnit } : {}),
 					allow_mutation: true,
 				};
 				return await withToolIdempotency(
@@ -4550,6 +4613,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								sessionId,
 								turn.turn_id,
 								delegateWorkflow,
+								explicitHostWorkUnit,
 							);
 							await appendCoordinatorEvent(namespaceDir, {
 								kind: "delegation.started",
