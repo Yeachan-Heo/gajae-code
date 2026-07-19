@@ -37,6 +37,34 @@ describe("checkBashAllowedPrefixes", () => {
 			),
 		).toEqual({ allowed: true });
 	});
+	it("allows canonical GJC state reads, writes, and contracts", () => {
+		const commands = [
+			"gjc state deep-interview",
+			"gjc state read --mode ralplan --json",
+			'gjc state ultragoal write --input \'{"current_phase":"handoff"}\' --json',
+			"gjc state team contract",
+		];
+
+		for (const command of commands) {
+			expect(checkBashAllowedPrefixes(command, ROLE_AGENT_PREFIXES)).toEqual({ allowed: true });
+		}
+	});
+
+	it("blocks bare or unknown GJC state targets", () => {
+		const commands = ["gjc state", "gjc state unknown write --json", "gjc state write --mode unknown --input '{}'"];
+
+		for (const command of commands) {
+			const result = checkBashAllowedPrefixes(command, ROLE_AGENT_PREFIXES);
+			expect(result.allowed).toBe(false);
+			expect(result.reason).toContain("canonical workflow skill");
+		}
+	});
+	it("blocks equals-form state modes that the runtime does not recognize", () => {
+		const result = checkBashAllowedPrefixes("gjc state write --mode=ralplan --input '{}'", ROLE_AGENT_PREFIXES);
+
+		expect(result.allowed).toBe(false);
+		expect(result.reason).toContain("canonical workflow skill");
+	});
 
 	it("blocks destructive state clears", () => {
 		const result = checkBashAllowedPrefixes("gjc state ralplan clear --json", ROLE_AGENT_PREFIXES);

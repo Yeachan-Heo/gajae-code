@@ -1,3 +1,5 @@
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
+
 export interface BashAllowedPrefixesCheck {
 	allowed: boolean;
 	reason?: string;
@@ -14,6 +16,7 @@ const UNSAFE_UNQUOTED_EXPANSION_CHARS = new Set(["$", "*", "?", "[", "]", "{", "
 const STATE_FLAGS_WITH_VALUES = new Set(["--input", "--mode", "--session-id", "--thread-id", "--turn-id", "--to"]);
 const STATE_ACTIONS = new Set(["read", "write", "clear", "contract", "handoff"]);
 const ALLOWED_STATE_ACTIONS = new Set(["read", "write", "contract"]);
+const CANONICAL_STATE_TARGETS = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 const READ_ONLY_COMMANDS = new Set(["grep", "rg", "tree", "ls", "pwd", "wc", "du", "file", "stat"]);
 
 function parseShellWords(command: string): { words: string[]; reason?: string } {
@@ -101,16 +104,24 @@ function wordsStartWith(words: readonly string[], prefix: readonly string[]): bo
 	return prefix.every((word, index) => words[index] === word);
 }
 
-function parseStateAction(words: readonly string[]): string | undefined {
+interface ParsedStateAction {
+	action: string;
+	targets: string[];
+}
+
+function parseStateAction(words: readonly string[]): ParsedStateAction | undefined {
 	const args = words.slice(2);
 	const positional: string[] = [];
+	const targets: string[] = [];
 	let skipNext = false;
-	for (const arg of args) {
+	for (const [index, arg] of args.entries()) {
 		if (skipNext) {
 			skipNext = false;
 			continue;
 		}
 		if (STATE_FLAGS_WITH_VALUES.has(arg)) {
+			const value = args[index + 1];
+			if (arg === "--mode" && value) targets.push(value);
 			skipNext = true;
 			continue;
 		}
@@ -118,11 +129,16 @@ function parseStateAction(words: readonly string[]): string | undefined {
 	}
 
 	const [first, second, third] = positional;
-	if (!first) return "read";
-	if (STATE_ACTIONS.has(first)) return second ? undefined : first;
-	if (!second) return "read";
+	if (!first) return { action: "read", targets };
+	if (STATE_ACTIONS.has(first)) {
+		if (third) return undefined;
+		if (second) targets.push(second);
+		return { action: first, targets };
+	}
+	targets.push(first);
+	if (!second) return { action: "read", targets };
 	if (!STATE_ACTIONS.has(second)) return undefined;
-	return third ? undefined : second;
+	return third ? undefined : { action: second, targets };
 }
 
 function optionWords(words: readonly string[]): string[] {
@@ -189,15 +205,24 @@ function validateMatchedGjcCommand(words: readonly string[]): BashAllowedPrefixe
 	}
 
 	if (words[1] === "state") {
-		const action = parseStateAction(words);
-		if (!action) {
+		const parsed = parseStateAction(words);
+		if (!parsed) {
 			return {
 				allowed: false,
 				reason: "restricted role-agent bash only allows documented `gjc state` action shapes",
 			};
 		}
-		if (!ALLOWED_STATE_ACTIONS.has(action)) {
-			return { allowed: false, reason: `restricted role-agent bash does not allow \`gjc state ${action}\`` };
+		if (parsed.targets.length === 0 || parsed.targets.some(target => !CANONICAL_STATE_TARGETS.has(target))) {
+			return {
+				allowed: false,
+				reason: "restricted role-agent bash requires a canonical workflow skill for `gjc state` commands",
+			};
+		}
+		if (!ALLOWED_STATE_ACTIONS.has(parsed.action)) {
+			return {
+				allowed: false,
+				reason: `restricted role-agent bash does not allow \`gjc state ${parsed.action}\``,
+			};
 		}
 		return { allowed: true };
 	}
