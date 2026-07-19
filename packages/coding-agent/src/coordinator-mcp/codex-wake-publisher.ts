@@ -6,7 +6,7 @@ import type { CodexHandoffEndpoint, CodexHandoffRegistrationV1, CodexWakeEventV1
 
 export interface CodexAppServerTransport {
 	request(method: string, params: Record<string, unknown>): Promise<unknown>;
-	notify?(method: string, params: Record<string, unknown>): Promise<void>;
+	notify?(method: string, params?: Record<string, unknown>): Promise<void>;
 	close(): Promise<void>;
 }
 
@@ -82,7 +82,7 @@ export async function publishCodexWake(input: {
 			clientInfo: { name: "gjc-coordinator", title: null, version: packageJson.version || "0" },
 			capabilities: null,
 		});
-		await transport.notify?.("initialized", {});
+		await transport.notify?.("initialized");
 		const resumed = await transport.request("thread/resume", { threadId: input.handoff.thread_id });
 		if (!idleStatus(resumed)) return { published: false, reason: "thread_active_pending" };
 		await transport.request("turn/start", {
@@ -318,7 +318,7 @@ export function createDefaultCodexTransportFactory(options: CodexTransportFactor
 			},
 			notify: async (method, params) => {
 				try {
-					send({ jsonrpc: "2.0", method, params });
+					send(params === undefined ? { jsonrpc: "2.0", method } : { jsonrpc: "2.0", method, params });
 				} catch (error) {
 					throw new Error(error instanceof Error ? error.message : "codex_app_server_unavailable");
 				}
