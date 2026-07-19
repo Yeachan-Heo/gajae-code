@@ -4,6 +4,7 @@
 
 ### Fixed
 - The Python eval runtime now honors the documented `GJC_*` environment variables instead of silently reading only legacy `PI_*` names. `GJC_PY` (tokens `0`/`bash`, `1`/`py`, `js`, `mix`/`both`) overrides the eval backend allowance with precedence over legacy `PI_PY`/`PI_JS`; `GJC_PYTHON_SKIP_CHECK`, `GJC_PYTHON_IPC_TRACE`, and `GJC_PYTHON_INTEGRATION` are read first with `PI_*` fallback (OR semantics, so either truthy name wins). Operators following `docs/environment-variables.md` and `docs/python-repl.md` who set `GJC_PY=py` previously saw no effect — a silent docs/runtime contract break. Legacy `PI_*` names remain supported for backward compatibility.
+- cmux workspace titles already managed by GJC (identified by the `GJC: ` prefix) now update when the GJC session name changes, while unrelated user-pinned titles remain preserved.
 
 ### Fixed
 - Team worker launches now receive the validated owning `GJC_SESSION_ID` for sanctioned session-scoped writes while preserving absent identity, fail-closed resolution, and separate spawn provenance (#2597).

@@ -118,14 +118,15 @@ export function parseCmuxWorkspaceOwnership(jsonText: string, workspaceId: strin
  * - unknown ownership (read failed) → skip (fail safe, never clobber)
  * - already the desired title → skip (no-op)
  * - workspace still on its default title → rename
- * - any custom title (user- or peer-set) → skip
- * This makes GJC name a fresh workspace once and then leave it alone, so it
- * never overwrites a user-pinned name and multiple sessions sharing one
- * CMUX_WORKSPACE_ID do not thrash the workspace title. */
+ * - existing `GJC: ` title → rename, because GJC set it
+ * - any other custom title → skip
+ * The prefix distinguishes GJC-managed titles from user-pinned titles, allowing
+ * session renames to stay synchronized without clobbering unrelated names. */
 export function shouldRenameCmuxWorkspace(ownership: CmuxWorkspaceOwnership | null, desiredTitle: string): boolean {
 	if (!ownership) return false;
-	if ((sanitizeCmuxWorkspaceTitle(ownership.title) ?? "") === desiredTitle) return false;
-	return !ownership.hasCustomTitle;
+	const currentTitle = sanitizeCmuxWorkspaceTitle(ownership.title) ?? "";
+	if (currentTitle === desiredTitle) return false;
+	return !ownership.hasCustomTitle || currentTitle.startsWith(CMUX_WORKSPACE_TITLE_PREFIX);
 }
 
 async function defaultReadOwnership(
@@ -158,10 +159,9 @@ async function defaultReadOwnership(
 
 /**
  * Best-effort sync of the containing cmux workspace title to the current GJC
- * session name. Ownership-guarded: GJC reads the current workspace title and
- * only renames a workspace that still has its default title, so it never
- * overwrites a name the user pinned or a name a peer session (sharing the same
- * CMUX_WORKSPACE_ID) set. Opt out with GJC_NO_CMUX_RENAME.
+ * session name. Ownership-guarded: GJC updates default or `GJC: `-prefixed
+ * workspace titles while preserving other custom titles. Opt out with
+ * GJC_NO_CMUX_RENAME.
  */
 export async function syncCmuxWorkspaceTitle(
 	sessionName: string | undefined,

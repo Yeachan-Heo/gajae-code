@@ -85,9 +85,9 @@ describe("cmux workspace title sync", () => {
 			expect(shouldRenameCmuxWorkspace(owned({ hasCustomTitle: false }), "GJC: Desired")).toBe(true);
 		});
 
-		it("skips a user- or peer-owned custom title", () => {
+		it("preserves user-pinned titles and updates GJC-managed titles", () => {
 			expect(shouldRenameCmuxWorkspace(owned({ title: "My Pinned Name" }), "GJC: Desired")).toBe(false);
-			expect(shouldRenameCmuxWorkspace(owned({ title: "GJC: Session A" }), "GJC: Session B")).toBe(false);
+			expect(shouldRenameCmuxWorkspace(owned({ title: "GJC: Session A" }), "GJC: Session B")).toBe(true);
 		});
 	});
 
@@ -174,9 +174,7 @@ describe("cmux workspace title sync", () => {
 		expect(spawned).toBe(false);
 	});
 
-	it("does not thrash a workspace shared by multiple sessions", async () => {
-		// Two sessions share one CMUX_WORKSPACE_ID. Session A names the still-default
-		// workspace; session B then sees a custom title and must not overwrite it.
+	it("updates a GJC-managed title when the session name changes", async () => {
 		const calls: string[][] = [];
 		const spawn = (command: string[]) => {
 			calls.push(command);
@@ -198,6 +196,7 @@ describe("cmux workspace title sync", () => {
 		});
 		expect(calls).toEqual([
 			["/usr/local/bin/cmux", "workspace", "rename", "ws-shared", "--title", "GJC: Session A task"],
+			["/usr/local/bin/cmux", "workspace", "rename", "ws-shared", "--title", "GJC: Session B task"],
 		]);
 	});
 });
