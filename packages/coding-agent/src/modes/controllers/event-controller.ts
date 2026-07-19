@@ -118,6 +118,9 @@ export class EventController {
 	#toolIntentCache = new Map<string, { args: unknown; intent: string | undefined }>();
 	#thinkingContentIndices = new Set<number>();
 	#handlers: AgentSessionEventHandlers;
+	#completionFootprints: Component[] = [];
+	#eventQueue: Promise<void> = Promise.resolve();
+	#completionHandled = false;
 
 	constructor(private ctx: InteractiveModeContext) {
 		this.#handlers = {
@@ -228,7 +231,18 @@ export class EventController {
 		});
 	}
 
-	async handleEvent(event: AgentSessionEvent): Promise<void> {
+	/**
+	 * Serializes session events so a completion cannot interleave with a
+	 * successor turn's start. Handlers must never await handleEvent themselves:
+	 * a nested call would queue behind the current event and deadlock.
+	 */
+	handleEvent(event: AgentSessionEvent): Promise<void> {
+		const completion = this.#eventQueue.then(() => this.#handleEvent(event));
+		this.#eventQueue = completion.catch(() => {});
+		return completion;
+	}
+
+	async #handleEvent(event: AgentSessionEvent): Promise<void> {
 		if (!this.ctx.isInitialized) {
 			await this.ctx.init();
 		}
@@ -241,20 +255,42 @@ export class EventController {
 		if (this.ctx.isTranscriptViewerOpen?.()) this.ctx.refreshTranscriptViewer?.();
 	}
 
+	#clearCompletionFootprints(): void {
+		for (const footprint of this.#completionFootprints) {
+			this.ctx.statusContainer.removeChild(footprint);
+		}
+		this.#completionFootprints = [];
+	}
+	/**
+	 * Retains the exact render footprint of a loader that is being removed
+	 * while visible. Footprints accumulate within a turn so the status area
+	 * never contracts (a contraction repaints the inline viewport the user may
+	 * be browsing); the next agent_start clears them.
+	 */
+	#retainCompletionFootprint(loader: Loader): void {
+		if (!this.ctx.ui.terminal.isProcessTerminal) return;
+		const footprint = loader.createFootprint();
+		this.#completionFootprints.push(footprint);
+		this.ctx.statusContainer.addChild(footprint);
+	}
+
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		this.#completionHandled = false;
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
+		this.#clearCompletionFootprints();
 		if (this.ctx.retryEscapeHandler) {
 			this.ctx.editor.onEscape = this.ctx.retryEscapeHandler;
 			this.ctx.retryEscapeHandler = undefined;
 		}
 		if (this.ctx.retryLoader) {
-			this.ctx.retryLoader.stop();
+			const retryLoader = this.ctx.retryLoader;
+			retryLoader.stop();
 			this.#clearRetryCountdown();
 			this.ctx.retryLoader = undefined;
-			this.ctx.statusContainer.clear();
+			this.ctx.statusContainer.removeChild(retryLoader);
 		}
 		this.ctx.retryEscapePrimed = false;
 		this.#cancelIdleCompaction();
@@ -810,11 +846,28 @@ export class EventController {
 	}
 
 	async #handleAgentEnd(_event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		if (this.ctx.loadingAnimation) {
-			this.ctx.loadingAnimation.stop();
-			this.ctx.loadingAnimation = undefined;
-			this.ctx.statusContainer.clear();
+		if (this.#completionHandled) return;
+		this.#completionHandled = true;
+
+		if (this.ctx.retryEscapeHandler) {
+			this.ctx.editor.onEscape = this.ctx.retryEscapeHandler;
+			this.ctx.retryEscapeHandler = undefined;
 		}
+		this.#clearRetryCountdown();
+		const retryLoader = this.ctx.retryLoader;
+		this.ctx.retryLoader = undefined;
+		const workingLoader = this.ctx.loadingAnimation;
+		this.ctx.loadingAnimation = undefined;
+		// Process terminals do not expose native scrollback position. Preserve
+		// each visible status's actual footprint so completion cannot contract
+		// and repaint a viewport the user is browsing.
+		for (const loader of [retryLoader, workingLoader]) {
+			if (!loader) continue;
+			loader.stop();
+			this.ctx.statusContainer.removeChild(loader);
+			this.#retainCompletionFootprint(loader);
+		}
+		this.ctx.retryEscapePrimed = false;
 		if (this.ctx.streamingComponent) {
 			this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);
 			this.ctx.streamingComponent = undefined;
@@ -939,9 +992,20 @@ export class EventController {
 				this.ctx.session.abortRetry();
 			}
 		};
-		this.ctx.statusContainer.clear();
-		// Stop any prior retry loader/timer before installing a new one.
-		this.ctx.retryLoader?.stop();
+		// Hide the working loader during backoff. The retry loader added in this
+		// same frame replaces its rows; auto_retry_end retains the retry
+		// loader's footprint, so the status area never contracts on completion.
+		const loadingAnimation = this.ctx.loadingAnimation;
+		if (loadingAnimation) {
+			loadingAnimation.stop();
+			this.ctx.statusContainer.removeChild(loadingAnimation);
+			this.ctx.loadingAnimation = undefined;
+		}
+		const previousRetryLoader = this.ctx.retryLoader;
+		if (previousRetryLoader) {
+			previousRetryLoader.stop();
+			this.ctx.statusContainer.removeChild(previousRetryLoader);
+		}
 		this.#clearRetryCountdown();
 		const reason = friendlyRetryReason(event.errorMessage);
 		const attemptLabel = event.unbounded ? `attempt ${event.attempt}` : `${event.attempt}/${event.maxAttempts}`;
@@ -973,10 +1037,12 @@ export class EventController {
 			this.ctx.retryEscapeHandler = undefined;
 		}
 		if (this.ctx.retryLoader) {
-			this.ctx.retryLoader.stop();
+			const retryLoader = this.ctx.retryLoader;
+			retryLoader.stop();
 			this.#clearRetryCountdown();
 			this.ctx.retryLoader = undefined;
-			this.ctx.statusContainer.clear();
+			this.ctx.statusContainer.removeChild(retryLoader);
+			this.#retainCompletionFootprint(retryLoader);
 		}
 		this.ctx.retryEscapePrimed = false;
 		if (!event.success) {

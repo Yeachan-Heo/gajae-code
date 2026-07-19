@@ -28,6 +28,41 @@ describe("Loader component", () => {
 		loader.stop();
 		tui.stop();
 	});
+	it("preserves a frozen ANSI and Unicode footprint through resize reflow", () => {
+		const term = new VirtualTerminal(40, 4);
+		const tui = new TUI(term);
+		const loader = new Loader(
+			tui,
+			text => `\x1b[36m${text}\x1b[0m`,
+			text => `\x1b[35m${text}\x1b[0m`,
+			"한글🙂 e\u0301 café — wrapping status",
+			["|"],
+		);
+
+		const footprint = loader.createFootprint();
+		const expectedLineCounts = new Map([
+			[1, 30],
+			[2, 30],
+			[3, 30],
+			[4, 17],
+			[7, 10],
+			[16, 5],
+			[40, 2],
+		]);
+		for (const [width, count] of expectedLineCounts) {
+			term.resize(width, 4);
+			expect(footprint.render(term.columns)).toEqual(Array.from({ length: count }, () => ""));
+		}
+
+		loader.setMessage("A different status that would wrap differently");
+		for (const [width, count] of expectedLineCounts) {
+			term.resize(width, 4);
+			expect(footprint.render(term.columns)).toEqual(Array.from({ length: count }, () => ""));
+		}
+
+		loader.stop();
+		tui.stop();
+	});
 
 	it("unrefs its animation interval so it does not keep the event loop alive", () => {
 		const term = new VirtualTerminal(20, 4);

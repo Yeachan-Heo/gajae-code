@@ -5,6 +5,9 @@
 
 - Suppressed slash-command and skill autocomplete inside line-local single-backtick code spans while preserving path completion and ordinary slash matching outside literals (#2619).
 
+### Fixed
+
+- Added `Loader.createFootprint()` so callers can retain a stopped loader's exact, width-dependent blank render footprint instead of coupling transient layout stability to a fixed row count.
 ## [0.11.0] - 2026-07-15
 ### Fixed
 
