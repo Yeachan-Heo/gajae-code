@@ -86,3 +86,80 @@ Additional tuning knobs (concurrency, lease durations, token budgets) are availa
 - `packages/coding-agent/src/memories/storage.ts` — SQLite-backed job queue and thread registry
 - `packages/coding-agent/src/prompts/memories/` — memory prompt templates
 - `packages/coding-agent/src/internal-urls/memory-protocol.ts` — legacy non-public `memory://` compatibility handler
+
+## Filesystem + MAP memory (opt-in CLI)
+
+`gjc memory` is an independent filesystem/MAP capability. It is **off until you run `gjc memory init`**; it is not a `memory.backend` value and does not start, select, replace, or otherwise alter the legacy autonomous local-memory or Hindsight backends. It never automatically captures transcripts or tool output, injects prompts, synthesizes model memory, syncs to a service, builds embeddings, or exposes a generic model-facing memory tool. It only reads or writes when its explicit CLI commands are invoked.
+
+### Commands
+
+All ten commands accept `--format text` (default), `--format json`, or `--format jsonl`:
+
+```sh
+# Create only the requested roots; omitting --scope creates all four.
+gjc memory init --scope global,project
+
+# Inspect resolved roots and availability.
+gjc memory scopes --format json
+
+# Resolve a route in a MAP document.
+gjc memory resolve project:///memory.yaml engineering.runbook
+
+# Read one logical Markdown document.
+gjc memory get project:///MEMORY.md --format json
+
+# Bounded deterministic retrieval across available roots.
+gjc memory search "release checklist" --limit 10
+# `recall` currently has the same retrieval semantics as `search`.
+gjc memory recall "release checklist" --format json
+
+# Persist one checkpoint object, then recover the newest matching task checkpoint.
+gjc memory checkpoint --input '{"taskId":"release","sessionId":"s20260719","content":"Tests passed."}'
+gjc memory resume release --format json
+
+# Read-only validation and the protocol capability receipt.
+gjc memory doctor
+gjc memory capabilities --format json
+```
+
+`init` accepts a comma-separated `--scope` list of `global`, `project`, `project-local`, and `session`. `get` requires a URI; `resolve` requires `MAP_URI ROUTE`; `search` and `recall` require a query; `resume` requires `TASK_ID`. `checkpoint` takes an object supplied with `--input` or stdin: `{ "taskId": string, "sessionId": string, "content": string }`. Its optional `--expected-digest` (or JSONL record field) is a compare-and-swap digest for replacement.
+
+For single-command JSON, stdout is one `{code:"ok",value:...}` success object or `{code,message}` error object. JSONL checkpoint input processes each nonblank line independently and emits one JSON record per input record; invalid records do not prevent later valid records, but make the command fail overall. Text is a human-readable JSON rendering for structured values. Diagnostics do not belong on stdout. Exit status is 0 for success, 3 for not found, 4 for policy/permission denial, and 2 for other command errors.
+
+### Scopes, identities, and logical URIs
+
+Logical URIs are canonical, percent-encoded `scope:///path` references, never host paths. A path must contain safe non-empty components; `.`/`..`, separators, controls, and noncanonical escaping are rejected. Examples:
+
+- `global:///MEMORY.md` — user-owned memory under the user agent data directory.
+- `project:///MEMORY.md` — repository-shared memory at the **current worktree's** `.gjc/memory`, so linked worktrees do not silently use another branch's files.
+- `project-local:///notes/private.md` — private data associated with an enrolled repository identity, stable across its worktrees.
+- `session:///s20260719/release.checkpoint.json` — private checkpoint data for that same stable project identity.
+
+Project-local and session scopes require a Git worktree and private enrollment. Enrollment stores a random project UUID in a private registry keyed by the canonical Git common directory; the UUID, not a repository remote, is the authority. A remote is only optional sanitized display metadata. Private roots are created owner-only where the platform supports POSIX modes; repository-shared content intentionally remains repository-owned.
+
+### Version-1 files
+
+Initialization creates, without overwriting existing files, an `initialization.v1.json` marker with `{version:1, initializedAt, scopes}`, a `MEMORY.md`, and a `memory.yaml` MAP in each selected root. Despite its filename, the generated MAP is JSON and is also accepted in a deliberately restricted YAML form:
+
+```yaml
+version: 1
+routes:
+  engineering.runbook:
+    - project:///MEMORY.md
+```
+
+A MAP is exactly version `1` plus `routes`, whose normalized lowercase dotted route IDs map to one or more canonical logical URIs. `resolve` returns route targets in stable lexical order. `search` and `recall` accept `--map <MAP_URI> --route <ROUTE_ID>` to prioritize an explicit route before deterministic fallback ranking. Markdown frontmatter may set `status: active|archived|superseded|unverified`; retrieval excludes every non-active status by default. The version-1 private user-policy shape is `policy.v1.json` with `{version:1, allowedScopes:[...]}`. The companion repository narrowing-policy shape is `{version:1, allowedScopes?: [...]}`; its validation rule permits narrowing only, never granting a user-disabled scope. The private identity registry is `identity-registry.v1.json` with `{version:1, repositories:{...}}`. Unknown MAP versions are rejected rather than migrated automatically; `doctor` reports policy-denied scopes, identity/policy failures surfaced during scope resolution, secret-like repository-shared Markdown, and readable document/MAP safety problems, and never repairs or migrates files.
+
+Checkpoints are private `session:///SESSION/TASK.checkpoint.json` documents with `{version:1, taskId, createdAt, content, expectedDigest}`. Task and session IDs are lowercase bounded identifiers. A replacement requires the current serialized-file digest, preventing blind concurrent overwrite. `resume` scans a bounded set of session directories, ignores malformed checkpoints, selects the latest `createdAt` (then session ID), and always marks recovered state `verificationRequired: true`.
+
+### Retrieval and safety boundaries
+
+`get`, `search`, and `recall` read Markdown only. Discovery is deterministic: scopes are visited in fixed order, entries and final URI candidates are sorted, traversal is bounded to depth 16, 256 directories, 4,096 entries, 1 MiB per document, and 32 selected results. Results rank canonical URI match, explicit MAP membership when a map route is supplied to retrieval, metadata match, heading match, lexical match, then URI. A retrieval response reports excluded files and `truncated` when a bound applies.
+
+Each result includes a logical citation: URI, scope, matching heading and line range, SHA-256 digest, authority (`user`, `repository`, or `private`), freshness, volatility, and `verificationRequired`. Volatile frontmatter causes `verificationRequired: true`; citations intentionally do not disclose home-directory paths. Repository-scoped Markdown that appears to contain a credential-like secret is excluded.
+
+Files are lexically contained under their selected roots. Reads reject symlinks, use no-follow descriptors where supported, require regular files, and revalidate descriptor and ancestor topology before and after reading. The implementation fails closed when it detects a topology or content change; this is detection, not a claim of absolute immunity from hostile concurrent filesystem mutation. Private writes use bounded lock attempts and same-directory temporary-file, sync, rename replacement. `doctor` is read-only.
+
+### Migration and non-goals
+
+Filesystem/MAP memory does not migrate legacy autonomous-memory state, create a fourth backend, modify `memory.backend`, or activate itself from configuration. It has no retrieval ledger and no `markdown` or `paths` output format. Existing legacy `memory://` compatibility behavior and the autonomous local-memory/Hindsight lifecycle remain separate from this explicit CLI protocol.

@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "testedCodeCommit": "d4e8dd132ed312a51788196e34d834163afaabda",
+  "changedCodeBlobs": {
+    "packages/coding-agent/src/sdk/bus/telegram-daemon.ts": "6c5c84aab4713a7ff8a508a065b89ccb5f832705",
+    "packages/coding-agent/test/notifications-rich-e2e.test.ts": "b63cead8d11911feaebc1a9b5dc50433ed2ca308"
+  },
+  "baselineHead": "98e3b56aae9b8188ecac04063755044aaf2a0cd3",
+  "ciFailure": {
+    "run": 29691855561,
+    "job": 88206360025,
+    "shard": "8/8",
+    "test": "rich e2e: /btw Bot API outcomes fall back only after definite ok:false"
+  },
+  "classification": "deterministic test-harness lifecycle ownership gap; the missing ephemeral_turn preceded Bot API outcome injection",
+  "commands": [
+    {
+      "command": "bun --cwd=packages/coding-agent run check",
+      "status": "passed",
+      "observed": "Biome clean; TypeScript noEmit passed"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent test test/notifications-rich-e2e.test.ts test/notifications-telegram-btw-e2e.test.ts test/notifications-telegram-daemon.test.ts test/notifications-ephemeral-host.test.ts",
+      "status": "passed",
+      "observed": "280 passed, 0 failed, 1360 assertions"
+    },
+    {
+      "command": "GJC_RICH_LIFECYCLE_SEED=29691855561 GJC_RICH_LIFECYCLE_ITERATIONS=25 bun --cwd=packages/coding-agent test test/notifications-rich-e2e.test.ts --test-name-pattern='rich e2e: /btw deterministic lifecycle rotations'",
+      "status": "passed",
+      "observed": "25 iterations / 125 isolated owners; 1 test passed, 1054 assertions"
+    },
+    {
+      "command": "bun run ci:test:smoke",
+      "status": "passed",
+      "observed": "CLI version/help/stats help and smoke-test passed"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent test --shard=8/8",
+      "status": "passed",
+      "observed": "2339 passed, 32 skipped, 0 failed, 10394 assertions"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent test --shard=1/8",
+      "status": "blocked_unrelated",
+      "observed": "1187 passed, 35 skipped, 2 unrelated failures in gjc-plugin-mcp-session.test.ts; focused reproduction confirms those failures independently of this diff"
+    },
+    {
+      "command": "CI_DEV_PLAN_MODE=pr ... bun scripts/ci-dev-affected.ts --matrix-json; bun scripts/ci-dev-affected.ts --validate-plan",
+      "status": "passed",
+      "observed": "Canonical PR affected plan generated and digest/source-SHA validation passed"
+    }
+  ],
+  "cleanup": {
+    "verdict": "PASS",
+    "receipt": "agent://22-BtwZeroBlockerCleaner",
+    "blockingFindings": []
+  },
+  "invariants": [
+    "The original five-outcome test retains its exact title and 60000 ms timeout.",
+    "Heavy deterministic stress is isolated in a separate 900000 ms test.",
+    "Only definite ok:false produces one HTML fallback; ambiguous outcomes remain single-attempt with zero fallback.",
+    "Teardown awaits native stop, exact daemon session removal, timer clearing, exact connection close, endpoint removal, and exact-tuple terminal delivery settlement.",
+    "The terminal-delivery observer is module-internal and absent from published TelegramDaemonOptions and exports."
+  ]
+}

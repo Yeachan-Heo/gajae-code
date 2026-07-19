@@ -8,7 +8,7 @@ import { openLifecycleSessionManager, runSessionHost } from "../src/commands/sdk
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
-import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { brokerOwnerForTest, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
 	deriveLifecycleDeadlines,
@@ -260,23 +260,6 @@ test("legacy metadata cleanup rejects mixed lifecycle and arbitrary receipt keys
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
-
-async function stopDiscoveredBroker(agentDir: string): Promise<void> {
-	const discovery = await readSdkBrokerDiscovery(agentDir);
-	if (!discovery) return;
-	const stillOwned = (): boolean => processIncarnation(discovery.pid) === discovery.incarnation;
-	const waitForExit = async (timeoutMs: number): Promise<boolean> => {
-		const deadline = Date.now() + timeoutMs;
-		while (stillOwned() && Date.now() < deadline) await Bun.sleep(10);
-		return !stillOwned();
-	};
-	if (!stillOwned()) return;
-	process.kill(discovery.pid, "SIGTERM");
-	if (await waitForExit(2_000)) return;
-	if (!stillOwned()) return;
-	process.kill(discovery.pid, "SIGKILL");
-	if (!(await waitForExit(2_000))) throw new Error(`Test broker ${discovery.pid} did not exit after SIGKILL.`);
-}
 
 async function liveLifecycleSession(root: string, agentDir: string, sessionId: string, staleMarkerFirst = false) {
 	const stateRoot = path.join(root, ".gjc", "state");
@@ -2913,6 +2896,8 @@ test("shipped sdk session-host-internal stays alive only after a semantic ready 
 	const agentDir = path.join(root, "agent");
 	const sessionId = "shipped-subprocess";
 	brokerDirs.push(agentDir);
+	const brokerFixture = await startFixtureBrokerWithLeaseForTest({ agentDir });
+	expect(brokerOwnerForTest(agentDir)).toBeDefined();
 	try {
 		const { child, endpoint } = await liveLifecycleSession(root, agentDir, sessionId);
 		const client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 2_000, reconnectAttempts: 0 });
@@ -2939,7 +2924,8 @@ test("shipped sdk session-host-internal stays alive only after a semantic ready 
 		);
 		expect(broker.url).toStartWith("ws://127.0.0.1:");
 	} finally {
-		await stopDiscoveredBroker(agentDir);
+		await brokerFixture.lease.close();
+		expect(brokerOwnerForTest(agentDir)).toBeUndefined();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);

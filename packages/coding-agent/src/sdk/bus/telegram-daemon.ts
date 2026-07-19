@@ -1293,6 +1293,20 @@ export interface DaemonControlHooks {
 	clear?(ownerId: string): Promise<void>;
 }
 
+type BtwTerminalDeliveryOutcome = "accepted" | "not_delivered" | "uncertain" | "partial_accepted" | "stale";
+
+interface BtwTerminalDeliveryReceipt {
+	requestId: string;
+	logicalSessionId: string;
+	transportSessionId: string;
+	threadId: string;
+	updateId: number;
+	messageId: number;
+	outcome: BtwTerminalDeliveryOutcome;
+}
+
+const BTW_TERMINAL_DELIVERY_TEST_OBSERVER = Symbol.for("gjc.test.btw-terminal-delivery-observer");
+
 export interface TelegramDaemonOptions {
 	settings: Settings;
 	ownerId: string;
@@ -3958,6 +3972,7 @@ export class TelegramNotificationDaemon {
 			};
 			this.#btwTerminalDeliveries.set(requestId, terminalDelivery);
 			let deliveryOutcome: "accepted" | "not_delivered" | "uncertain" | "partial_accepted" = "not_delivered";
+			let observerOutcome: BtwTerminalDeliveryOutcome = deliveryOutcome;
 			try {
 				if (msg.status !== "ok") {
 					const text =
@@ -4023,7 +4038,7 @@ export class TelegramNotificationDaemon {
 					}
 				};
 				const html = markdownToTelegramHtml(markdown);
-				const fallback = async (): Promise<typeof deliveryOutcome> => {
+				const fallback = async (): Promise<BtwTerminalDeliveryOutcome> => {
 					let acceptedChunks = 0;
 					for (const [index, text] of splitTelegramHtml(html).entries()) {
 						const outcome = await this.#queueBtwFallbackChunk({
@@ -4045,6 +4060,7 @@ export class TelegramNotificationDaemon {
 							continue;
 						}
 						if (outcome === "partial_accepted" || acceptedChunks > 0) return "partial_accepted";
+						if (outcome === "stale") return "stale";
 						return outcome === "uncertain" ? "uncertain" : "not_delivered";
 					}
 					return "accepted";
@@ -4056,16 +4072,21 @@ export class TelegramNotificationDaemon {
 						reply_parameters: { message_id: pending.messageId },
 						rich_message: { markdown, skip_entity_detection: true },
 					});
-					deliveryOutcome =
-						outcome === "accepted"
-							? "accepted"
-							: outcome === "rejected"
-								? await fallback()
-								: outcome === "uncertain"
-									? "uncertain"
-									: "not_delivered";
+					if (outcome === "accepted") {
+						deliveryOutcome = "accepted";
+						observerOutcome = "accepted";
+					} else if (outcome === "rejected") {
+						const fallbackOutcome = await fallback();
+						observerOutcome = fallbackOutcome;
+						deliveryOutcome = fallbackOutcome === "stale" ? "not_delivered" : fallbackOutcome;
+					} else {
+						deliveryOutcome = outcome === "uncertain" ? "uncertain" : "not_delivered";
+						observerOutcome = outcome === "stale" ? "stale" : deliveryOutcome;
+					}
 				} else {
-					deliveryOutcome = await fallback();
+					const fallbackOutcome = await fallback();
+					observerOutcome = fallbackOutcome;
+					deliveryOutcome = fallbackOutcome === "stale" ? "not_delivered" : fallbackOutcome;
 				}
 			} finally {
 				if (this.#btwTerminalDeliveries.get(requestId) === terminalDelivery) {
@@ -4084,6 +4105,25 @@ export class TelegramNotificationDaemon {
 					}
 				} finally {
 					terminalDelivery.finish();
+					observerOutcome = observerOutcome === "stale" ? "stale" : deliveryOutcome;
+					if (this.#pendingBtwTurns.get(requestId) !== pending) {
+						try {
+							const observer = (
+								this as unknown as Record<symbol, ((receipt: BtwTerminalDeliveryReceipt) => void) | undefined>
+							)[BTW_TERMINAL_DELIVERY_TEST_OBSERVER];
+							observer?.({
+								requestId,
+								logicalSessionId: pending.logicalSessionId,
+								transportSessionId: pending.transportSessionId,
+								threadId: pending.threadId,
+								updateId: pending.updateId,
+								messageId: pending.messageId,
+								outcome: observerOutcome,
+							});
+						} catch {
+							logger.warn("notifications: /btw terminal delivery observer failed");
+						}
+					}
 				}
 			}
 			return;

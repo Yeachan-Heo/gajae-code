@@ -1,7 +1,12 @@
 import { mkdirSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import type { FixtureBrokerLease } from "../../src/sdk/broker/ensure";
+import {
+	type FixtureBrokerCommand,
+	type FixtureBrokerLease,
+	type StartedFixtureBrokerCommand,
+	startFixtureBrokerCommandWithLeaseForTest as startFixtureBrokerCommand,
+} from "../../src/sdk/broker/ensure";
 
 export type FixtureRuntimeOwner = "runtime" | "runtime-and-broker";
 type State = "pending" | "verified";
@@ -110,6 +115,11 @@ export function createFixtureBrokerEnvironment(root: string, agentDir: string): 
 		if (process.env[key] !== undefined) environment[key] = process.env[key];
 	}
 	return environment;
+}
+
+/** Test-only retained-child launch boundary for SDK broker topology fixtures. */
+export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBrokerCommand): StartedFixtureBrokerCommand {
+	return startFixtureBrokerCommand(command);
 }
 const describeError = (error: unknown): string =>
 	error instanceof Error

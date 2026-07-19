@@ -7,6 +7,7 @@ import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
 import { Broker } from "../sdk/broker/broker";
+import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
@@ -439,9 +440,9 @@ export default class Sdk extends Command {
 		});
 		await broker.start();
 		if (!broker.ownsDiscovery) return;
-		const stop = () => void broker.stop().finally(() => process.exit(0));
+		const stop = () => void broker.stop();
 		process.once("SIGTERM", stop);
 		process.once("SIGINT", stop);
-		await new Promise<void>(() => {});
+		await completeBrokerProcess(broker);
 	}
 }

@@ -12,7 +12,7 @@ import { ExtensionRuntime } from "@gajae-code/coding-agent/extensibility/extensi
 import { createAgentSession, discoverAuthStorage } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
-import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 
 interface SessionDirs {
 	cwd: string;
@@ -85,25 +85,7 @@ const initializeRunnerForTest = (runner: ExtensionRunner | undefined): void => {
 };
 
 async function stopDetachedBroker(agentDir: string): Promise<void> {
-	const discovery = await readBrokerDiscovery(agentDir);
-	if (!discovery) return;
-	try {
-		process.kill(discovery.pid, "SIGTERM");
-	} catch {
-		return;
-	}
-	const deadline = Date.now() + 5_000;
-	while (Date.now() < deadline) {
-		try {
-			process.kill(discovery.pid, 0);
-			await Bun.sleep(25);
-		} catch {
-			return;
-		}
-	}
-	try {
-		process.kill(discovery.pid, "SIGKILL");
-	} catch {}
+	await brokerOwnerForTest(agentDir)?.stop();
 }
 
 describe("createAgentSession credential_disabled subscription", () => {

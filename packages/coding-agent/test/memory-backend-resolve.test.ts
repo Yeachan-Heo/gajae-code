@@ -11,10 +11,16 @@ describe("resolveMemoryBackend", () => {
 		resetSettingsForTest();
 	});
 
-	it("returns the hindsight backend when memory.backend is hindsight, regardless of legacy memories.enabled", () => {
-		const a = Settings.isolated({ "memory.backend": "hindsight", "memories.enabled": false });
-		const b = Settings.isolated({ "memory.backend": "hindsight", "memories.enabled": true });
-		expect(resolveMemoryBackend(a).id).toBe("hindsight");
-		expect(resolveMemoryBackend(b).id).toBe("hindsight");
+	it("preserves the existing off, local, and hindsight runtime selections without a filesystem backend", () => {
+		const off = Settings.isolated({ "memory.backend": "off" });
+		const local = Settings.isolated({ "memory.backend": "local" });
+		const hindsightDisabled = Settings.isolated({ "memory.backend": "hindsight", "memories.enabled": false });
+		const hindsightEnabled = Settings.isolated({ "memory.backend": "hindsight", "memories.enabled": true });
+
+		expect(resolveMemoryBackend(off).id).toBe("off");
+		expect(resolveMemoryBackend(local).id).toBe("local");
+		expect(resolveMemoryBackend(hindsightDisabled).id).toBe("hindsight");
+		expect(resolveMemoryBackend(hindsightEnabled).id).toBe("hindsight");
+		expect(["off", "local", "hindsight"]).not.toContain("filesystem");
 	});
 });

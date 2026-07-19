@@ -108,6 +108,10 @@ The agent supports three mutually-exclusive memory backends, selected via the `m
 
 Switching backends mid-session is honoured on the next system-prompt rebuild and the next `/memory` slash command. Existing users with `memories.enabled = true|false` are migrated to `memory.backend = "local"|"off"` exactly once on first launch.
 
+### Filesystem + MAP memory CLI
+
+The independent `gjc memory` CLI is an explicit, default-off filesystem/MAP protocol; initialize it with `gjc memory init`. It is not a fourth `memory.backend`, does not change `off`, `local`, or `hindsight`, and never automatically captures transcripts, injects memory into prompts, or exposes generic model-facing memory tools. It provides `init`, `scopes`, `resolve`, `get`, `search`, `recall`, `checkpoint`, `resume`, `doctor`, and `capabilities` with text, JSON, and JSONL output. See [Filesystem + MAP memory](../../docs/memory.md#filesystem--map-memory-opt-in-cli) for scope ownership, URI, MAP, safety, and checkpoint contracts.
+
 ## Red-claw TUI theme
 
 The interactive TUI defaults to the bundled `red-claw` crustacean theme for dark terminals and the bundled `blue-crab` theme for light-appearance terminals, with matching welcome/icon assets. Three additional bundled migration themes — `claude-code`, `codex`, and `opencode` — mirror the look of those tools for easy eye-migration and are selectable from Settings or `/theme`. Explicit user theme settings still win; set `theme.dark: red-claw` and `theme.light: blue-crab` in `~/.gjc/agent/config.yml` to pin them.

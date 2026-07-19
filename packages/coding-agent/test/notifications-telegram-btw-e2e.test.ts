@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { NotificationServer } from "../../natives/native/index.js";
 import { Settings } from "../src/config/settings";
-import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { createNotificationsExtension } from "../src/sdk/bus";
 import {
 	type BotApi,
@@ -26,25 +26,7 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 }
 
 async function stopDetachedBroker(agentDir: string): Promise<void> {
-	const discovery = await readBrokerDiscovery(agentDir);
-	if (!discovery) return;
-	try {
-		process.kill(discovery.pid, "SIGTERM");
-	} catch {
-		return;
-	}
-	const deadline = Date.now() + 5_000;
-	while (Date.now() < deadline) {
-		try {
-			process.kill(discovery.pid, 0);
-			await sleep(25);
-		} catch {
-			return;
-		}
-	}
-	try {
-		process.kill(discovery.pid, "SIGKILL");
-	} catch {}
+	await brokerOwnerForTest(agentDir)?.stop();
 }
 
 class Bot implements BotApi {

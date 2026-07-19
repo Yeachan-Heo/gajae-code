@@ -10,7 +10,82 @@ use napi::{
 	bindgen_prelude::{BigInt, Either, Uint8Array},
 };
 use napi_derive::napi;
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+
+/// Classification of a read-only retained-publication observation.
+#[napi(object)]
+pub struct NativeBrokerPublicationObservation {
+	pub kind: String,
+}
+
+/// Result of a retained positional heartbeat write or sync.
+#[napi(object)]
+pub struct NativeBrokerPublicationOperation {
+	pub kind: String,
+}
+
+/// Retained no-follow authority for the SDK publication namespace.
+#[napi]
+pub struct NativeRetainedBrokerPublication {
+	inner: Mutex<Option<publication::RetainedPublication>>,
+}
+
+#[napi]
+impl NativeRetainedBrokerPublication {
+	#[napi]
+	pub fn observe(&self) -> NativeBrokerPublicationObservation {
+		let guard = self.inner.lock();
+		NativeBrokerPublicationObservation {
+			kind: guard
+				.as_ref()
+				.map_or_else(|| "ambiguous".to_owned(), publication::RetainedPublication::observe),
+		}
+	}
+
+	#[napi]
+	pub fn heartbeat(&self, heartbeat_at: String) -> NativeBrokerPublicationOperation {
+		let mut guard = self.inner.lock();
+		NativeBrokerPublicationOperation {
+			kind: guard.as_mut().map_or_else(
+				|| "closed".to_owned(),
+				|publication| publication.heartbeat(&heartbeat_at),
+			),
+		}
+	}
+
+	#[napi]
+	pub fn sync(&self) -> NativeBrokerPublicationOperation {
+		let guard = self.inner.lock();
+		NativeBrokerPublicationOperation {
+			kind: guard
+				.as_ref()
+				.map_or_else(|| "closed".to_owned(), publication::RetainedPublication::sync),
+		}
+	}
+
+	/// Close discovery, owner record, lock directory, and SDK root in that
+	/// order.
+	#[napi]
+	pub fn close(&self) -> NativeBrokerPublicationOperation {
+		let mut guard = self.inner.lock();
+		guard.take();
+		NativeBrokerPublicationOperation { kind: "closed".to_owned() }
+	}
+}
+
+/// Retain the existing no-follow SDK publication objects after one-time
+/// publication.
+#[napi]
+pub fn retain_broker_publication(
+	agent_dir: String,
+) -> napi::Result<NativeRetainedBrokerPublication> {
+	let publication =
+		publication::RetainedPublication::open(Path::new(&agent_dir)).ok_or_else(|| {
+			napi::Error::from_reason("Retained broker publication authority is unavailable.")
+		})?;
+	Ok(NativeRetainedBrokerPublication { inner: Mutex::new(Some(publication)) })
+}
 
 /// Result of resolving an existing directory to its stable platform identity.
 #[napi(object)]
@@ -376,6 +451,208 @@ fn path_from_bytes(bytes: &[u8]) -> Option<PathBuf> {
 	String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
 }
 
+#[cfg(unix)]
+mod publication {
+	use std::{
+		fs::File,
+		io::Read,
+		os::unix::fs::{FileExt, MetadataExt},
+		path::{Path, PathBuf},
+	};
+
+	#[cfg(target_vendor = "apple")]
+	const fn mode_kind(kind: libc::mode_t) -> u32 {
+		kind as u32
+	}
+
+	#[cfg(not(target_vendor = "apple"))]
+	const fn mode_kind(kind: libc::mode_t) -> u32 {
+		kind
+	}
+
+	struct Identity {
+		dev: u64,
+		ino: u64,
+	}
+
+	impl Identity {
+		fn of(file: &File) -> Option<Self> {
+			let metadata = file.metadata().ok()?;
+			Some(Self { dev: metadata.dev(), ino: metadata.ino() })
+		}
+
+		fn matches(&self, file: &File, expected_kind: u32) -> bool {
+			file.metadata().is_ok_and(|metadata| {
+				metadata.dev() == self.dev
+					&& metadata.ino() == self.ino
+					&& metadata.mode() & mode_kind(libc::S_IFMT) == expected_kind
+			})
+		}
+	}
+
+	fn open_result(path: &Path, directory: bool, write: bool) -> std::io::Result<File> {
+		use std::os::fd::FromRawFd;
+		let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+		let name = std::ffi::CString::new(bytes)
+			.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+		let flags = (if write { libc::O_RDWR } else { libc::O_RDONLY })
+			| libc::O_CLOEXEC
+			| libc::O_NOFOLLOW
+			| if directory { libc::O_DIRECTORY } else { 0 };
+		// SAFETY: `name` is a live NUL-terminated path and `flags` contains only
+		// valid open(2) flags. A non-negative descriptor is uniquely transferred
+		// into `File` exactly once below.
+		let fd = unsafe { libc::open(name.as_ptr(), flags) };
+		if fd < 0 {
+			return Err(std::io::Error::last_os_error());
+		}
+		// SAFETY: successful open(2) returned an owned descriptor that has not
+		// been wrapped or closed elsewhere.
+		Ok(unsafe { File::from_raw_fd(fd) })
+	}
+
+	fn open(path: &Path, directory: bool, write: bool) -> Option<File> {
+		open_result(path, directory, write).ok()
+	}
+
+	pub(super) struct RetainedPublication {
+		// Declaration order is drop order: release publication authority first.
+		discovery:          File,
+		_owner:             File,
+		_lock:              File,
+		_root:              File,
+		root_identity:      Identity,
+		lock_identity:      Identity,
+		owner_identity:     Identity,
+		discovery_identity: Identity,
+		heartbeat_offset:   u64,
+		agent_dir:          PathBuf,
+	}
+
+	impl RetainedPublication {
+		pub(super) fn open(agent_dir: &Path) -> Option<Self> {
+			let root = open(&agent_dir.join("sdk"), true, false)?;
+			let lock = open(&agent_dir.join("sdk/broker.lock"), true, false)?;
+			let owner = open(&agent_dir.join("sdk/broker.lock/owner.json"), false, false)?;
+			let discovery = open(&agent_dir.join("sdk/broker.json"), false, true)?;
+			let mut readable = discovery.try_clone().ok()?;
+			let mut bytes = Vec::new();
+			readable.read_to_end(&mut bytes).ok()?;
+			let needle = b"\"heartbeatAt\":";
+			let start = bytes
+				.windows(needle.len())
+				.position(|window| window == needle)?
+				+ needle.len();
+			if bytes
+				.get(start..start + 13)?
+				.iter()
+				.any(|byte| !byte.is_ascii_digit())
+				|| bytes.get(start + 13).is_some_and(u8::is_ascii_digit)
+			{
+				return None;
+			}
+			Some(Self {
+				root_identity: Identity::of(&root)?,
+				lock_identity: Identity::of(&lock)?,
+				owner_identity: Identity::of(&owner)?,
+				discovery_identity: Identity::of(&discovery)?,
+				agent_dir: agent_dir.to_path_buf(),
+				_root: root,
+				_lock: lock,
+				_owner: owner,
+				discovery,
+				heartbeat_offset: start as u64,
+			})
+		}
+
+		pub(super) fn observe(&self) -> String {
+			fn named(path: &Path, identity: &Identity, directory: bool) -> &'static str {
+				match open_result(path, directory, false) {
+					Ok(file)
+						if identity.matches(
+							&file,
+							if directory {
+								mode_kind(libc::S_IFDIR)
+							} else {
+								mode_kind(libc::S_IFREG)
+							},
+						) =>
+					{
+						"owned"
+					},
+					Ok(_) => "replaced",
+					Err(error) => match error.raw_os_error() {
+						Some(libc::ENOENT) => "absent",
+						Some(libc::ELOOP | libc::ENOTDIR) => "replaced",
+						_ => "ambiguous",
+					},
+				}
+			}
+			let checks = [
+				named(&self.agent_dir.join("sdk"), &self.root_identity, true),
+				named(&self.agent_dir.join("sdk/broker.lock"), &self.lock_identity, true),
+				named(&self.agent_dir.join("sdk/broker.lock/owner.json"), &self.owner_identity, false),
+				named(&self.agent_dir.join("sdk/broker.json"), &self.discovery_identity, false),
+			];
+			if checks.iter().all(|kind| *kind == "owned") {
+				"owned".to_owned()
+			} else if checks.contains(&"replaced") {
+				"replaced".to_owned()
+			} else if checks.contains(&"absent") {
+				"absent".to_owned()
+			} else {
+				"ambiguous".to_owned()
+			}
+		}
+
+		pub(super) fn heartbeat(&self, heartbeat_at: &str) -> String {
+			if heartbeat_at.len() != 13 || !heartbeat_at.bytes().all(|byte| byte.is_ascii_digit()) {
+				return "ambiguous".to_owned();
+			}
+			match self
+				.discovery
+				.write_at(heartbeat_at.as_bytes(), self.heartbeat_offset)
+			{
+				Ok(13) => "written".to_owned(),
+				_ => "ambiguous".to_owned(),
+			}
+		}
+
+		pub(super) fn sync(&self) -> String {
+			if self.discovery.sync_all().is_ok() {
+				"synced".to_owned()
+			} else {
+				"ambiguous".to_owned()
+			}
+		}
+	}
+}
+
+#[cfg(not(unix))]
+mod publication {
+	use std::path::Path;
+
+	/// Windows retained HANDLE/FileIdInfo authority is intentionally unavailable
+	/// until its reparse-safe implementation lands; acquisition fails closed.
+	pub(super) struct RetainedPublication;
+	impl RetainedPublication {
+		pub(super) fn open(_: &Path) -> Option<Self> {
+			None
+		}
+
+		pub(super) fn observe(&self) -> String {
+			"ambiguous".to_owned()
+		}
+
+		pub(super) fn heartbeat(&mut self, _: &str) -> String {
+			"ambiguous".to_owned()
+		}
+
+		pub(super) fn sync(&self) -> String {
+			"ambiguous".to_owned()
+		}
+	}
+}
 #[cfg(unix)]
 mod platform {
 	use std::{
@@ -3607,6 +3884,86 @@ mod owner_only_security_tests {
 		assert_eq!(std::fs::read(&destination).expect("read retained destination"), b"source");
 	}
 }
+#[cfg(all(test, unix))]
+mod retained_broker_publication_tests {
+	use std::{
+		path::PathBuf,
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::{NativeRetainedBrokerPublication, publication::RetainedPublication};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"gjc-retained-broker-publication-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+			));
+			std::fs::create_dir(&path).expect("create retained publication temp directory");
+			Self(path)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn publish(root: &PathBuf) {
+		let sdk = root.join("sdk");
+		let lock = sdk.join("broker.lock");
+		std::fs::create_dir_all(&lock).expect("create broker lock");
+		std::fs::write(lock.join("owner.json"), b"owner").expect("write owner record");
+		std::fs::write(sdk.join("broker.json"), b"{\"heartbeatAt\":1234567890123}\n")
+			.expect("write discovery record");
+	}
+
+	#[test]
+	fn retained_publication_observes_writes_syncs_and_closes_without_reopening_paths() {
+		let dir = TempDir::new();
+		publish(&dir.0);
+		let publication = RetainedPublication::open(&dir.0).expect("retain published objects");
+
+		assert_eq!(publication.observe(), "owned");
+		assert_eq!(publication.heartbeat("1234567890999"), "written");
+		assert_eq!(publication.sync(), "synced");
+		assert_eq!(
+			std::fs::read_to_string(dir.0.join("sdk/broker.json")).expect("read retained discovery"),
+			"{\"heartbeatAt\":1234567890999}\n"
+		);
+
+		std::fs::remove_file(dir.0.join("sdk/broker.json")).expect("remove published discovery");
+		assert_eq!(publication.observe(), "absent");
+		assert_eq!(publication.heartbeat("1234567890888"), "written");
+		assert!(!dir.0.join("sdk/broker.json").exists());
+
+		let retained =
+			NativeRetainedBrokerPublication { inner: parking_lot::Mutex::new(Some(publication)) };
+		assert_eq!(retained.close().kind, "closed");
+		assert_eq!(retained.heartbeat("1234567890777".to_owned()).kind, "closed");
+		assert_eq!(retained.observe().kind, "ambiguous");
+	}
+
+	#[test]
+	fn retained_publication_reports_replacement_and_rejects_invalid_heartbeat_width() {
+		let dir = TempDir::new();
+		publish(&dir.0);
+		let publication = RetainedPublication::open(&dir.0).expect("retain published objects");
+		std::fs::rename(dir.0.join("sdk/broker.lock"), dir.0.join("sdk/replaced-lock"))
+			.expect("replace lock namespace");
+		std::fs::create_dir(dir.0.join("sdk/broker.lock")).expect("create replacement lock");
+
+		assert_eq!(publication.observe(), "replaced");
+		assert_eq!(publication.heartbeat("not-a-timestamp"), "ambiguous");
+	}
+}
+
 #[cfg(test)]
 mod sha256_tests {
 	use std::io::{self, Read};

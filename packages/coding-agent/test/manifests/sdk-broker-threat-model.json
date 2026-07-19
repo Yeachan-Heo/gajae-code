@@ -40,6 +40,21 @@
       "id": "broker-non-loopback-negative-test",
       "description": "No non-loopback broker URL is advertised, and a wrong-token WebSocket upgrade is rejected.",
       "kind": "negative-test"
+    },
+    {
+      "id": "broker-discovery-derived-signal-authority-forbidden",
+      "description": "Discovery records, including PID and incarnation fields, are observation-only and must never authorize TERM or KILL cleanup; retained exact-child fixture leases are the sole test signal authority.",
+      "kind": "negative-test"
+    },
+    {
+      "id": "broker-pid-zero-observation-allowed",
+      "description": "The hostile harness labels PID-zero liveness checks as observation-only and rejects their use as signal authority.",
+      "kind": "assertion"
+    },
+    {
+      "id": "broker-fixture-control-nonproduction-reachability",
+      "description": "GSF1 and SSH1 frames, fd 3 control channels, and fixture timing controls are reachable only from explicitly test-labeled fixture launch paths, never production broker or session-host selection.",
+      "kind": "negative-test"
     }
   ]
 }

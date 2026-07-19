@@ -71,6 +71,185 @@ function settings(agentDir: string): Settings {
 	);
 }
 
+type RichOutcome = "ok" | "ok_false" | "throw" | "abort" | "timeout" | "malformed";
+
+type BtwTerminalDeliveryReceipt = {
+	requestId: string;
+	logicalSessionId: string;
+	transportSessionId: string;
+	threadId: string;
+	updateId: number;
+	messageId: number;
+	outcome: "accepted" | "not_delivered" | "uncertain" | "partial_accepted" | "stale";
+};
+
+const BTW_TERMINAL_DELIVERY_TEST_OBSERVER = Symbol.for("gjc.test.btw-terminal-delivery-observer");
+
+type DeliveryTuple = {
+	sessionId: string;
+	transportSessionId: string;
+	requestId: string;
+	threadId: string;
+	updateId: number;
+	messageId: number;
+};
+
+const SUCCESS_PREFIX = [
+	"server_started",
+	"session_connected",
+	"replay_applied",
+	"capability_ready",
+	"identity_ready",
+	"update_dispatched",
+	"ephemeral_received",
+	"result_pushed",
+	"rich_settled",
+] as const;
+const SUCCESS_SUFFIX = [
+	"delivery_barrier_settled",
+	"daemon_stop_requested",
+	"native_stop_settled",
+	"session_removed",
+	"timer_cleared",
+	"connection_closed",
+	"endpoint_absent",
+] as const;
+type LifecyclePhase =
+	| (typeof SUCCESS_PREFIX)[number]
+	| "fallback_settled"
+	| "no_fallback_settled"
+	| (typeof SUCCESS_SUFFIX)[number];
+
+class LifecycleLedger {
+	readonly phases: LifecyclePhase[] = [];
+	private partial = false;
+	constructor(
+		readonly tag: string,
+		private readonly outcome: RichOutcome,
+	) {}
+
+	private get expected(): readonly LifecyclePhase[] {
+		return [
+			...SUCCESS_PREFIX,
+			this.outcome === "ok_false" ? "fallback_settled" : "no_fallback_settled",
+			...SUCCESS_SUFFIX,
+		];
+	}
+
+	mark(phase: LifecyclePhase): void {
+		if (this.partial) {
+			if (this.phases.includes(phase)) throw new Error(`${this.tag} duplicate partial phase ${phase}`);
+			this.phases.push(phase);
+			return;
+		}
+		const expected = this.expected[this.phases.length];
+		if (phase !== expected)
+			throw new Error(
+				`${this.tag} expected phase ${String(expected)}, received ${phase}; ledger=${JSON.stringify(this.phases)}`,
+			);
+		this.phases.push(phase);
+	}
+
+	markPartial(): void {
+		this.partial = true;
+	}
+
+	validate(): void {
+		if (this.partial) return;
+		expect(this.phases).toEqual([...this.expected]);
+	}
+
+	failure(error: unknown): Error {
+		return new Error(
+			`${this.tag} failed: ${error instanceof Error ? error.message : String(error)}; ledger=${JSON.stringify(this.phases)}`,
+			{
+				cause: error,
+			},
+		);
+	}
+}
+
+class DeliveryBarrier {
+	private readonly settled = Promise.withResolvers<void>();
+	private readonly lateDelivery = Promise.withResolvers<void>();
+	private tuple: DeliveryTuple | undefined;
+	private closed = false;
+	private lateError: Error | undefined;
+	private receiptReceived = false;
+
+	constructor(
+		private readonly ledger: LifecycleLedger,
+		private readonly outcome: RichOutcome,
+	) {
+		void this.lateDelivery.promise.catch(() => {});
+	}
+
+	bind(tuple: DeliveryTuple): void {
+		if (this.tuple) throw new Error(`${this.ledger.tag} duplicate delivery bind`);
+		this.tuple = tuple;
+	}
+	get hasBoundDelivery(): boolean {
+		return this.tuple !== undefined;
+	}
+
+	receipt(receipt: BtwTerminalDeliveryReceipt): void {
+		const tuple = this.tuple;
+		if (!tuple) return;
+		const matches =
+			receipt.requestId === tuple.requestId &&
+			receipt.logicalSessionId === tuple.sessionId &&
+			receipt.transportSessionId === tuple.transportSessionId &&
+			receipt.threadId === tuple.threadId &&
+			receipt.updateId === tuple.updateId &&
+			receipt.messageId === tuple.messageId;
+		if (!matches) return;
+		if (this.closed || this.receiptReceived) {
+			this.failLateDelivery(`${this.ledger.tag} duplicate terminal delivery receipt`);
+			return;
+		}
+		this.receiptReceived = true;
+		const expectedOutcome = this.outcome === "ok" || this.outcome === "ok_false" ? "accepted" : "uncertain";
+		if (receipt.outcome !== expectedOutcome) {
+			this.settled.reject(
+				new Error(`${this.ledger.tag} expected terminal outcome ${expectedOutcome}, received ${receipt.outcome}`),
+			);
+			return;
+		}
+		this.ledger.mark("rich_settled");
+		this.ledger.mark(this.outcome === "ok_false" ? "fallback_settled" : "no_fallback_settled");
+		this.settled.resolve();
+	}
+
+	private failLateDelivery(message: string): void {
+		this.lateError = new Error(message);
+		this.lateDelivery.reject(this.lateError);
+	}
+
+	async settle(): Promise<void> {
+		if (this.closed) {
+			this.assertNoLateDelivery();
+			return;
+		}
+		if (!this.tuple) throw new Error(`${this.ledger.tag} cannot settle an unbound delivery barrier`);
+		await Promise.race([this.settled.promise, this.lateDelivery.promise]);
+		this.closed = true;
+		this.ledger.mark("delivery_barrier_settled");
+	}
+
+	markNoDeliveryAbort(): void {
+		if (this.tuple) throw new Error(`${this.ledger.tag} bound delivery cannot use no-delivery abort`);
+	}
+
+	assertNoLateDelivery(): void {
+		if (this.lateError) throw this.lateError;
+	}
+}
+
+interface LifecycleRun {
+	ledger: LifecycleLedger;
+	barrier: DeliveryBarrier;
+}
+
 /**
  * Capturing Telegram Bot API: records every method+body and fakes ONLY the HTTP
  * responses (getChat -> private, createForumTopic -> a fixed thread id, and an
@@ -79,7 +258,7 @@ function settings(agentDir: string): Settings {
  */
 class CapturingBotApi implements BotApi {
 	readonly calls: Array<{ method: string; body: any; options?: { noRetry?: boolean; signal?: AbortSignal } }> = [];
-	richOutcome: "ok" | "ok_false" | "throw" | "abort" | "timeout" | "malformed" | "pending_until_abort" = "ok";
+	richOutcome: RichOutcome | "pending_until_abort" = "ok";
 	htmlOutcomes: Array<"ok" | "ok_false" | "throw" | "malformed"> = [];
 	readonly richStarted = Promise.withResolvers<void>();
 	constructor(private readonly threadId: number) {}
@@ -146,14 +325,18 @@ interface Harness {
 		messageId: number;
 	}>;
 	inboundKinds: string[];
-	stop: () => Promise<void>;
+	stop: (abortDelivery?: boolean) => Promise<void>;
 }
 
 /**
  * Boot the real napi server, register its endpoint as a notification root, then
  * connect the real daemon to it over a REAL WebSocket via `scanRoots()`.
  */
-async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemeralTurns = true): Promise<Harness> {
+async function connectRealPipeline(
+	rich?: { enabled: boolean },
+	respondToEphemeralTurns = true,
+	lifecycle?: LifecycleRun,
+): Promise<Harness> {
 	const agentDir = tempAgentDir();
 	try {
 		const s = settings(agentDir);
@@ -166,10 +349,16 @@ async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemer
 		// which is exactly where registerNotificationRoot points the daemon to scan.
 		const stateRoot = path.join(cwd, ".gjc", "state");
 		const srv = new NotificationServer(sessionId, "tok", stateRoot, true);
+		let replayConnectionId: string | undefined;
+		const closedConnectionIds = new Set<string>();
+		srv.onConnectionClose((error, connectionId) => {
+			if (!error) closedConnectionIds.add(connectionId);
+		});
 		srv.onSdkFrame((error, inbound) => {
 			if (error || !inbound) return;
 			const frame = JSON.parse(inbound.json);
 			if (frame.type === "event_replay") {
+				replayConnectionId = inbound.connectionId;
 				srv.sendTo(
 					inbound.connectionId,
 					JSON.stringify({
@@ -193,7 +382,6 @@ async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemer
 						],
 					}),
 				);
-				return;
 			}
 		});
 		const ephemeralTurns: Array<{
@@ -222,6 +410,7 @@ async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemer
 				updateId: inbound.updateId,
 				messageId: inbound.messageId,
 			});
+			lifecycle?.ledger.mark("ephemeral_received");
 			if (!respondToEphemeralTurns) return;
 			srv.pushFrame(
 				JSON.stringify({
@@ -236,8 +425,6 @@ async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemer
 				}),
 			);
 		});
-		const ep = await srv.start();
-		expect(ep.url).toContain("ws://127.0.0.1:");
 
 		const bot = new CapturingBotApi(THREAD_ID);
 		const daemon = new TelegramNotificationDaemon({
@@ -250,20 +437,55 @@ async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemer
 			pidAlive: () => true,
 			...(rich ? { rich } : {}),
 		});
+		if (lifecycle) {
+			(daemon as unknown as Record<symbol, ((receipt: BtwTerminalDeliveryReceipt) => void) | undefined>)[
+				BTW_TERMINAL_DELIVERY_TEST_OBSERVER
+			] = receipt => lifecycle.barrier.receipt(receipt);
+		}
 
-		const stop = async () => {
+		const stop = async (abortDelivery = false) => {
+			const session = daemon.sessions.get(sessionId);
+			let primaryError: unknown;
 			try {
+				if (abortDelivery) lifecycle?.ledger.markPartial();
 				daemon.requestStop();
-				srv.stop();
-				// Let the server-initiated close reach the daemon's socket so dropSession
-				// clears the per-session liveness interval before the test ends.
-				await sleep(80);
-			} finally {
-				await fs.promises.rm(agentDir, { recursive: true, force: true });
+				lifecycle?.ledger.mark("daemon_stop_requested");
+				if (lifecycle) {
+					if (lifecycle.barrier.hasBoundDelivery) await lifecycle.barrier.settle();
+					else if (abortDelivery) lifecycle.barrier.markNoDeliveryAbort();
+				}
+				await srv.stopAndWait();
+				lifecycle?.ledger.mark("native_stop_settled");
+				if (session) {
+					await waitFor(() => daemon.sessions.get(sessionId) !== session, 8000, "exact daemon session removal");
+					lifecycle?.ledger.mark("session_removed");
+					expect(session.pingTimer).toBeUndefined();
+					lifecycle?.ledger.mark("timer_cleared");
+				}
+				if (replayConnectionId !== undefined) {
+					await waitFor(() => closedConnectionIds.has(replayConnectionId!), 8000, "native connection close");
+					lifecycle?.ledger.mark("connection_closed");
+				}
+				expect(fs.existsSync(path.join(stateRoot, "sdk", `${sessionId}.json`))).toBe(false);
+				lifecycle?.ledger.mark("endpoint_absent");
+				lifecycle?.barrier.assertNoLateDelivery();
+			} catch (error) {
+				primaryError = error;
 			}
+			try {
+				await fs.promises.rm(agentDir, { recursive: true, force: true });
+			} catch (cleanupError) {
+				if (primaryError)
+					throw new AggregateError([primaryError, cleanupError], "pipeline cleanup and root removal failed");
+				throw cleanupError;
+			}
+			if (primaryError) throw primaryError;
 		};
 
 		try {
+			const ep = await srv.start();
+			expect(ep.url).toContain("ws://127.0.0.1:");
+			lifecycle?.ledger.mark("server_started");
 			// REAL WS path: scanRoots -> readEndpoint -> connectSession -> new WebSocket(...)
 			// to the napi server. NOT a direct handleSessionMessage call.
 			await daemon.scanRoots();
@@ -272,23 +494,34 @@ async function connectRealPipeline(rich?: { enabled: boolean }, respondToEphemer
 				8000,
 				"daemon WS connect to napi server",
 			);
+			lifecycle?.ledger.mark("session_connected");
 			await waitFor(() => daemon.sessions.get(sessionId)?.hostGeneration === 4, 8000, "generation-4 replay");
+			lifecycle?.ledger.mark("replay_applied");
 			srv.pushFrame(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["ephemeral_turn_v1"] }));
 			await waitFor(() => daemon.sessions.get(sessionId)?.ephemeralCapable === true, 8000, "ephemeral capability");
+			lifecycle?.ledger.mark("capability_ready");
 		} catch (err) {
-			await stop();
+			try {
+				await stop(true);
+			} catch (cleanupError) {
+				throw new AggregateError([err, cleanupError], "pipeline startup and cleanup failed");
+			}
 			throw err;
 		}
 
 		return { sessionId, srv, bot, daemon, ephemeralTurns, inboundKinds, stop };
-	} catch (err) {
-		await fs.promises.rm(agentDir, { recursive: true, force: true });
-		throw err;
+	} catch (error) {
+		try {
+			await fs.promises.rm(agentDir, { recursive: true, force: true });
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "pipeline startup and root removal failed");
+		}
+		throw error;
 	}
 }
 
 /** Drive the identity_header over the wire and wait until its topic + HTML header are sent. */
-async function driveIdentity(h: Harness, title: string): Promise<void> {
+async function driveIdentity(h: Harness, title: string, ledger?: LifecycleLedger): Promise<void> {
 	h.srv.pushFrame(
 		JSON.stringify({ type: "identity_header", sessionId: h.sessionId, repo: "r", branch: "b", machine: "m", title }),
 	);
@@ -300,6 +533,7 @@ async function driveIdentity(h: Harness, title: string): Promise<void> {
 		8000,
 		"forum topic created + identity header delivered",
 	);
+	ledger?.mark("identity_ready");
 }
 
 test("rich e2e: NotificationServer + real WS + daemon scanRoots -> finalAnswer promotes to sendRichMessage", async () => {
@@ -390,67 +624,108 @@ test("rich e2e: /btw ignores mismatched and duplicate results before delivering 
 		await h.stop();
 	}
 }, 30000);
+const OUTCOME_ROTATIONS = [
+	["ok_false", "throw", "abort", "timeout", "malformed"],
+	["throw", "abort", "timeout", "malformed", "ok_false"],
+	["abort", "timeout", "malformed", "ok_false", "throw"],
+	["timeout", "malformed", "ok_false", "throw", "abort"],
+	["malformed", "ok_false", "throw", "abort", "timeout"],
+] as const satisfies ReadonlyArray<ReadonlyArray<RichOutcome>>;
 
-test("rich e2e: /btw Bot API outcomes fall back only after definite ok:false", async () => {
-	for (const outcome of ["ok_false", "throw", "abort", "timeout", "malformed"] as const) {
-		const h = await connectRealPipeline(undefined, false);
-		try {
-			await driveIdentity(h, `Rich BTW ${outcome}`);
-			h.bot.calls.length = 0;
-			h.bot.richOutcome = outcome;
-			await h.daemon.handleTelegramUpdate({
-				update_id: 78,
-				message: { chat: { id: 42 }, message_thread_id: THREAD_ID, text: "/btw outcome?", message_id: 702 },
-			});
-			await waitFor(() => h.ephemeralTurns.length === 1, 8000, `${outcome} ephemeral turn`);
-			const inbound = h.ephemeralTurns[0]!;
-			h.srv.pushFrame(
-				JSON.stringify({
-					type: "ephemeral_turn_result",
-					sessionId: inbound.sessionId,
-					requestId: inbound.requestId,
-					threadId: inbound.threadId,
-					updateId: inbound.updateId,
-					messageId: inbound.messageId,
-					status: "ok",
-					text: RICH_TEXT,
-				}),
-			);
-			await waitFor(() => count(h.bot, "sendRichMessage") === 1, 8000, `${outcome} rich call`);
-			await sleep(100);
-			const rich = find(h.bot, "sendRichMessage")!;
-			expect(rich.body).toEqual({
+async function assertBtwOutcome(outcome: RichOutcome, tag: string): Promise<void> {
+	const ledger = new LifecycleLedger(tag, outcome);
+	const barrier = new DeliveryBarrier(ledger, outcome);
+	let h: Harness | undefined;
+	let deliveryComplete = false;
+	let failure: Error | undefined;
+	try {
+		h = await connectRealPipeline(undefined, false, { ledger, barrier });
+		await driveIdentity(h, `Rich BTW ${tag}`, ledger);
+		h.bot.calls.length = 0;
+		h.bot.richOutcome = outcome;
+		ledger.mark("update_dispatched");
+		await h.daemon.handleTelegramUpdate({
+			update_id: 78,
+			message: { chat: { id: 42 }, message_thread_id: THREAD_ID, text: "/btw outcome?", message_id: 702 },
+		});
+		await waitFor(() => h!.ephemeralTurns.length === 1, 8000, `${tag} ephemeral turn`);
+		const inbound = h.ephemeralTurns[0]!;
+		barrier.bind({ ...inbound, transportSessionId: h.sessionId });
+		ledger.mark("result_pushed");
+		h.srv.pushFrame(
+			JSON.stringify({
+				type: "ephemeral_turn_result",
+				sessionId: inbound.sessionId,
+				requestId: inbound.requestId,
+				threadId: inbound.threadId,
+				updateId: inbound.updateId,
+				messageId: inbound.messageId,
+				status: "ok",
+				text: RICH_TEXT,
+			}),
+		);
+		await barrier.settle();
+		deliveryComplete = true;
+
+		const rich = find(h.bot, "sendRichMessage")!;
+		expect(rich.body).toEqual({
+			chat_id: "42",
+			message_thread_id: THREAD_ID,
+			reply_parameters: { message_id: 702 },
+			rich_message: { markdown: RICH_TEXT, skip_entity_detection: true },
+		});
+		expect(rich.options).toEqual(expect.objectContaining({ noRetry: true, signal: expect.any(AbortSignal) }));
+		const html = h.bot.calls.filter(call => call.method === "sendMessage");
+		if (outcome === "ok_false") {
+			expect(html).toHaveLength(1);
+			expect(html[0]!.body).toEqual({
 				chat_id: "42",
 				message_thread_id: THREAD_ID,
 				reply_parameters: { message_id: 702 },
-				rich_message: { markdown: RICH_TEXT, skip_entity_detection: true },
+				text: markdownToTelegramHtml(RICH_TEXT),
+				parse_mode: TELEGRAM_PARSE_MODE,
 			});
-			expect(rich.options).toEqual(expect.objectContaining({ noRetry: true, signal: expect.any(AbortSignal) }));
-
-			const html = h.bot.calls.filter(call => call.method === "sendMessage");
-			if (outcome === "ok_false") {
-				expect(html).toHaveLength(1);
-				expect(html[0]!.body).toEqual({
-					chat_id: "42",
-					message_thread_id: THREAD_ID,
-					reply_parameters: { message_id: 702 },
-					text: markdownToTelegramHtml(RICH_TEXT),
-					parse_mode: TELEGRAM_PARSE_MODE,
-				});
-				expect(html[0]!.options).toEqual(
-					expect.objectContaining({ noRetry: true, signal: expect.any(AbortSignal) }),
-				);
-			} else {
-				expect(html).toHaveLength(0);
-			}
-			expect(
-				h.bot.calls.filter(call => call.method === "sendRichMessage" || call.method === "sendMessage"),
-			).toHaveLength(outcome === "ok_false" ? 2 : 1);
-		} finally {
-			await h.stop();
+			expect(html[0]!.options).toEqual(expect.objectContaining({ noRetry: true, signal: expect.any(AbortSignal) }));
+		} else {
+			expect(html).toHaveLength(0);
+		}
+		expect(
+			h.bot.calls.filter(call => call.method === "sendRichMessage" || call.method === "sendMessage"),
+		).toHaveLength(outcome === "ok_false" ? 2 : 1);
+	} catch (error) {
+		failure = ledger.failure(error);
+	}
+	if (h) {
+		try {
+			await h.stop(!deliveryComplete);
+		} catch (cleanupError) {
+			const cleanupFailure = ledger.failure(cleanupError);
+			failure = failure
+				? new AggregateError([failure, cleanupFailure], `${tag} execution and cleanup failed`)
+				: cleanupFailure;
 		}
 	}
+	if (!failure) ledger.validate();
+	if (failure) throw failure;
+}
+
+test("rich e2e: /btw Bot API outcomes fall back only after definite ok:false", async () => {
+	for (const outcome of OUTCOME_ROTATIONS[0]) await assertBtwOutcome(outcome, `default/0/${outcome}`);
 }, 60000);
+
+test("rich e2e: /btw deterministic lifecycle rotations", async () => {
+	const seed = process.env.GJC_RICH_LIFECYCLE_SEED ?? "29691855561";
+	expect(seed, "invalid lifecycle seed").toBe("29691855561");
+	const iterations = Number(process.env.GJC_RICH_LIFECYCLE_ITERATIONS ?? "5");
+	expect(Number.isInteger(iterations), "invalid lifecycle iteration count").toBe(true);
+	expect(iterations, "invalid lifecycle iteration count").toBeGreaterThan(0);
+	expect(iterations, "invalid lifecycle iteration count").toBeLessThanOrEqual(25);
+	for (let iteration = 0; iteration < iterations; iteration++) {
+		for (const outcome of OUTCOME_ROTATIONS[iteration % OUTCOME_ROTATIONS.length]!) {
+			await assertBtwOutcome(outcome, `seed=${seed}/iteration=${iteration}/outcome=${outcome}`);
+		}
+	}
+}, 900_000);
 test("rich e2e: /btw HTML chunks stop after rejection or ambiguity and reply only on the first call", async () => {
 	const chunks = splitTelegramHtml(markdownToTelegramHtml(LONG_HTML_MARKDOWN));
 	expect(chunks.length).toBeGreaterThan(2);
