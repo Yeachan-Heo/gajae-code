@@ -12,6 +12,7 @@ import {
 	type CoordinatorToolName,
 } from "../coordinator/contract";
 import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
+import { listMcpDelegateHostContexts } from "../hooks/mcp-delegate-host-context";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
@@ -24,6 +25,7 @@ import {
 	SessionActivationError,
 } from "../sdk/session-activation";
 	ackCodexWakeEvent,
+	bindDelegateCodexHandoff,
 	type CodexHandoffRegistrationV1,
 	type CodexWakeEventV1,
 	isCodexWakeEventKind,
@@ -1308,6 +1310,7 @@ const codexWakePublishTails = new Map<string, Promise<void>>();
 
 const CODEX_WAKE_ERROR_CAP = 240;
 const CODEX_WAKE_DIAGNOSTIC_CAP = 512;
+const CODEX_HANDOFF_FRESHNESS_MS = 24 * 60 * 60 * 1000;
 
 function codexWakeErrorCode(error: unknown): string {
 	if (error instanceof Error && /^[a-z0-9_]+$/.test(error.message))
@@ -1332,6 +1335,72 @@ async function appendCodexWakeDiagnostic(
 	}
 }
 
+async function autoBindDelegateCodexHandoff(
+	namespaceDir: string,
+	cwd: string,
+	workUnit: string,
+	delegationId: string,
+	workflow: string,
+): Promise<{ auto_bound: boolean; thread_id?: string }> {
+	try {
+		const hostContexts = await listMcpDelegateHostContexts(cwd);
+		const diagnosticEvent = { id: `delegate-handoff-${delegationId}` };
+		if (hostContexts.failures > 0)
+			await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, new Error("codex_handoff_context_unreadable"));
+		if (hostContexts.contexts.length === 0) return { auto_bound: false };
+		const handoffs = await listCodexHandoffs(namespaceDir);
+		const freshHostHandoffs = handoffs
+			.filter(handoff => {
+				if (handoff.origin !== undefined) return false;
+				const updatedAt = Date.parse(handoff.updated_at);
+				return Number.isFinite(updatedAt) && updatedAt >= Date.now() - CODEX_HANDOFF_FRESHNESS_MS;
+			})
+			.sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at));
+		const freshThreads = new Set(freshHostHandoffs.map(handoff => handoff.thread_id));
+		const fallbackSource = freshThreads.size === 1 ? freshHostHandoffs[0] : undefined;
+		const resolved = hostContexts.contexts.flatMap(context => {
+			const source = handoffs.find(handoff => handoff.work_unit === context.session_id) ?? fallbackSource;
+			return source ? [{ context, source }] : [];
+		});
+		if (resolved.length === 0) {
+			const hasHostHandoffs = handoffs.some(handoff => handoff.origin === undefined);
+			await appendCodexWakeDiagnostic(
+				namespaceDir,
+				diagnosticEvent,
+				new Error(
+					hasHostHandoffs && freshHostHandoffs.length === 0
+						? "codex_handoff_source_stale"
+						: "codex_handoff_source_ambiguous",
+				),
+			);
+			return { auto_bound: false };
+		}
+		if (new Set(resolved.map(({ source }) => source.thread_id)).size !== 1) {
+			await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, new Error("codex_handoff_context_ambiguous"));
+			return { auto_bound: false };
+		}
+		const { context, source } = resolved[0]!;
+		const binding = await bindDelegateCodexHandoff(namespaceDir, {
+			work_unit: workUnit,
+			source,
+			origin: {
+				gjc_session_id: workUnit,
+				gjc_turn_id: delegationId,
+				codex_thread_id: source.thread_id,
+				codex_turn_id: context.turn_id,
+				codex_host_session_id: context.session_id,
+				delegation_id: delegationId,
+				workflow,
+				bound_at: new Date().toISOString(),
+			},
+		});
+		return { auto_bound: true, thread_id: binding.handoff.thread_id };
+	} catch (error) {
+		await appendCodexWakeDiagnostic(namespaceDir, { id: `delegate-handoff-${delegationId}` }, error);
+		return { auto_bound: false };
+	}
+}
+
 async function maybeRecordCodexWake(
 	namespaceDir: string,
 	event: CoordinatorEvent,
@@ -1353,14 +1422,16 @@ async function maybeRecordCodexWake(
 	};
 }
 
+type CodexWakePublishOutcome = "published" | "thread_active_pending" | "failed" | "skipped";
+
 async function publishRecordedCodexWake(
 	namespaceDir: string,
 	handoff: CodexHandoffRegistrationV1,
 	event: CodexWakeEventV1,
-): Promise<string | null> {
-	if (event.status !== "pending" && event.status !== "failed") return null;
+): Promise<CodexWakePublishOutcome> {
+	if (event.status !== "pending" && event.status !== "failed") return "skipped";
 	const transportFactory = codexWakeTransportFactories.get(namespaceDir);
-	if (!transportFactory) return null;
+	if (!transportFactory) return "skipped";
 	try {
 		const published = await publishCodexWake({ handoff, event, transportFactory });
 		await updateCodexWakeEvent(namespaceDir, event.key, {
@@ -1368,14 +1439,14 @@ async function publishRecordedCodexWake(
 			attempts_delta: 1,
 			last_error: null,
 		});
-		return published.reason;
+		return published.published ? "published" : "thread_active_pending";
 	} catch (error) {
 		await updateCodexWakeEvent(namespaceDir, event.key, {
 			status: "failed",
 			attempts_delta: 1,
 			last_error: codexWakeErrorCode(error),
 		});
-		return null;
+		return "failed";
 	}
 }
 
@@ -1389,7 +1460,8 @@ async function publishPendingCodexWakes(namespaceDir: string, threadId: string):
 	for (const event of pending) {
 		const handoff = byWorkUnit.get(event.work_unit);
 		if (!handoff) continue;
-		if ((await publishRecordedCodexWake(namespaceDir, handoff, event)) === "thread_active_pending") return;
+		const outcome = await publishRecordedCodexWake(namespaceDir, handoff, event);
+		if (outcome === "thread_active_pending" || outcome === "failed") return;
 	}
 }
 
@@ -1397,11 +1469,7 @@ function codexWakeTailKey(namespaceDir: string, threadId: string): string {
 	return `${namespaceDir}\0${threadId}`;
 }
 
-function enqueueCodexWakePublish(
-	namespaceDir: string,
-	handoff: CodexHandoffRegistrationV1,
-	_triggeringEvent: CodexWakeEventV1 | null,
-): void {
+function enqueueCodexWakePublish(namespaceDir: string, handoff: CodexHandoffRegistrationV1): void {
 	const tailKey = codexWakeTailKey(namespaceDir, handoff.thread_id);
 	const previous = codexWakePublishTails.get(tailKey) ?? Promise.resolve();
 	const next = previous
@@ -1466,7 +1534,7 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 			await appendCodexWakeDiagnostic(namespaceDir, event, error);
 			return null;
 		});
-		if (codexWake) enqueueCodexWakePublish(namespaceDir, codexWake.handoff, codexWake.event);
+		if (codexWake) enqueueCodexWakePublish(namespaceDir, codexWake.handoff);
 		return event;
 	} finally {
 		release();
@@ -2255,8 +2323,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	);
 	void (async () => {
 		try {
-			for (const handoff of await listCodexHandoffs(namespaceDir))
-				enqueueCodexWakePublish(namespaceDir, handoff, null);
+			for (const handoff of await listCodexHandoffs(namespaceDir)) enqueueCodexWakePublish(namespaceDir, handoff);
 		} catch (error) {
 			await appendCodexWakeDiagnostic(namespaceDir, { id: "startup-drain" }, error);
 		}
@@ -4477,6 +4544,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								acknowledgement,
 								promptKey,
 							);
+							const codexHandoff = await autoBindDelegateCodexHandoff(
+								namespaceDir,
+								canonicalCwd,
+								sessionId,
+								turn.turn_id,
+								delegateWorkflow,
+							);
 							await appendCoordinatorEvent(namespaceDir, {
 								kind: "delegation.started",
 								sessionId,
@@ -4504,6 +4578,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
 								result: publicSdkAcknowledgement(acknowledgement),
+								codex_handoff: codexHandoff,
 								...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
 							};
 							if (creationKey) {

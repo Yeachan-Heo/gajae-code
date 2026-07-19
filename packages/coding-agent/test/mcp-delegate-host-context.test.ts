@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { activeSnapshotPath } from "../src/gjc-runtime/session-layout";
 import {
 	detectMcpDelegateFlowActivation,
+	listMcpDelegateHostContexts,
 	mcpDelegateHostContextPath,
 	persistMcpDelegateHostContext,
 	readMcpDelegateHostContext,
@@ -163,6 +164,127 @@ describe("MCP delegate-flow host context", () => {
 		await fs.mkdir(contextPath, { recursive: true });
 
 		await expect(readMcpDelegateHostContext(root, sessionId)).rejects.toThrow("state_unreadable");
+	});
+	it("finds the newest context when more than 64 session directories exist", async () => {
+		const root = await tempRoot();
+		const oldRecordedAt = "2026-07-18T00:00:00.000Z";
+		for (let index = 0; index < 65; index++) {
+			const sessionId = `session-${String(index).padStart(3, "0")}`;
+			const contextPath = mcpDelegateHostContextPath(root, sessionId);
+			await fs.mkdir(path.dirname(contextPath), { recursive: true });
+			await fs.writeFile(
+				contextPath,
+				JSON.stringify({
+					schema_version: 1,
+					activation: "$gjc-mcp-delegate-flow",
+					session_id: sessionId,
+					thread_id: null,
+					turn_id: null,
+					cwd: root,
+					source: "user_prompt_submit",
+					recorded_at: oldRecordedAt,
+					prompt_excerpt: "resume",
+				}),
+				"utf8",
+			);
+			await fs.utimes(contextPath, new Date(oldRecordedAt), new Date(oldRecordedAt));
+		}
+		for (let index = 65; index < 69; index++) {
+			await fs.mkdir(path.join(root, ".gjc", `_session-session-${String(index).padStart(3, "0")}`), {
+				recursive: true,
+			});
+		}
+		const newest = await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "session-069",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		if (!newest) throw new Error("newest context was not persisted");
+
+		const listed = await listMcpDelegateHostContexts(root);
+
+		expect(listed.contexts[0]).toMatchObject({ session_id: "session-069" });
+		expect(listed.contexts).toHaveLength(64);
+	});
+	it("skips invalid session ids and oversized excerpts during enumeration", async () => {
+		const root = await tempRoot();
+		for (const [directory, context] of [
+			[
+				"_session-traversal",
+				{
+					schema_version: 1,
+					activation: "$gjc-mcp-delegate-flow",
+					session_id: "../evil",
+					thread_id: null,
+					turn_id: null,
+					cwd: root,
+					source: "user_prompt_submit",
+					recorded_at: "2026-07-19T00:00:00.000Z",
+					prompt_excerpt: "resume",
+				},
+			],
+			[
+				"_session-oversized",
+				{
+					schema_version: 1,
+					activation: "$gjc-mcp-delegate-flow",
+					session_id: "oversized",
+					thread_id: null,
+					turn_id: null,
+					cwd: root,
+					source: "user_prompt_submit",
+					recorded_at: "2026-07-19T00:00:00.000Z",
+					prompt_excerpt: "x".repeat(1024 * 1024),
+				},
+			],
+		] as const) {
+			const contextPath = path.join(root, ".gjc", directory, "state", "mcp-delegate-host-context.json");
+			await fs.mkdir(path.dirname(contextPath), { recursive: true });
+			await fs.writeFile(contextPath, JSON.stringify(context), "utf8");
+		}
+		const valid = await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "valid",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+
+		const listed = await listMcpDelegateHostContexts(root);
+
+		expect(listed.contexts).toEqual([valid?.context]);
+		expect(listed.failures).toBe(2);
+	});
+	it("continues dispatching when host-context persistence fails", async () => {
+		const root = await tempRoot();
+		const sessionId = "persist-failure";
+		await fs.mkdir(mcpDelegateHostContextPath(root, sessionId), { recursive: true });
+
+		const failedPersistResult = await dispatchGjcNativeSkillHook({
+			hookEventName: "UserPromptSubmit",
+			userPrompt: "$gjc-mcp-delegate-flow",
+			cwd: root,
+			sessionId,
+		});
+		expect(failedPersistResult).toMatchObject({ hookEventName: "UserPromptSubmit" });
+		expect(
+			String(
+				(failedPersistResult.outputJson?.hookSpecificOutput as { additionalContext?: unknown } | undefined)
+					?.additionalContext ?? "",
+			),
+		).not.toContain("GJC MCP delegate-flow host context persisted at");
+		await expect(
+			dispatchGjcNativeSkillHook(
+				{
+					hookEventName: "UserPromptSubmit",
+					userPrompt: "ultragoal continue this objective",
+					cwd: root,
+					sessionId: "skill-after-persist-failure",
+				},
+				{ effectiveSkillConfig: testEffectiveSkillConfig },
+			),
+		).resolves.toMatchObject({ hookEventName: "UserPromptSubmit" });
+		expect(await readVisibleSkillActiveState(root, "skill-after-persist-failure")).toMatchObject({
+			skill: "ultragoal",
+		});
 	});
 
 	it("leaves ultragoal workflow activation unchanged", async () => {

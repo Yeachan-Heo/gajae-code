@@ -3,7 +3,13 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createCoordinatorMcpServer } from "../src/coordinator-mcp/server";
+import { readCodexHandoff, registerCodexHandoff } from "../src/coordinator-mcp/codex-handoff";
+import {
+	appendCoordinatorEventForTest,
+	awaitCodexWakePublishesForTest,
+	createCoordinatorMcpServer,
+} from "../src/coordinator-mcp/server";
+import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
 	buildAskGateAnswerSchema,
@@ -72,6 +78,7 @@ type SdkControlServerOptions = {
 	/** Every raw session frame the server sent, in order (activation frames included). */
 	sessionFrames?: Array<Record<string, unknown>>;
 	sessionFrameResult?: (frame: Record<string, unknown>) => unknown;
+	codexTransportFactory?: Parameters<typeof createCoordinatorMcpServer>[0]["services"]["codexTransportFactory"];
 };
 function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	return controls.filter(
@@ -220,6 +227,7 @@ async function createSdkControlServer(
 			getAgentDir: () => agentDir,
 			resolveModelProfiles: () => new Map([["codex-eco", { name: "codex-eco" }]]),
 			canonicalizePath: serverOptions.canonicalizePath,
+			codexTransportFactory: serverOptions.codexTransportFactory,
 			connectSdk: async () =>
 				({
 					control: async (
@@ -1582,6 +1590,493 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			]),
 		);
 	});
+	it("auto-binds concurrent delegated sessions to the newest host Codex handoff", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const host = await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "visible-session",
+			turnId: "host-turn",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		if (!host) throw new Error("host context was not persisted");
+		const source = await registerCodexHandoff(namespace, {
+			work_unit: "visible-session",
+			thread_id: "thread-codex-1",
+			endpoint: { kind: "unix", path: "/tmp/codex-bridge.sock" },
+			token_file: "/tmp/codex-bridge.token",
+		});
+		const sourceFile = path.join(namespace, "codex-handoffs", "visible-session.json");
+		const sourceBefore = await fs.readFile(sourceFile, "utf8");
+		const results = await Promise.all(
+			["auto-bind-one", "auto-bind-two"].map(idempotency_key =>
+				server.callTool("gjc_delegate_execute", {
+					cwd: root,
+					task: idempotency_key,
+					idempotency_key,
+					allow_mutation: true,
+				}),
+			),
+		);
+		const sessionIds = results.map(result => String(result.session_id));
+
+		expect(results).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ ok: true, codex_handoff: { auto_bound: true, thread_id: "thread-codex-1" } }),
+			]),
+		);
+		expect(new Set(sessionIds).size).toBe(2);
+		for (const [index, sessionId] of sessionIds.entries()) {
+			expect(await readCodexHandoff(namespace, sessionId)).toMatchObject({
+				thread_id: source.thread_id,
+				endpoint: source.endpoint,
+				token_file: source.token_file,
+				origin: {
+					gjc_session_id: sessionId,
+					codex_host_session_id: "visible-session",
+					codex_turn_id: "host-turn",
+					delegation_id: results[index]?.turn_id,
+					workflow: "execute",
+				},
+			});
+		}
+		expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceBefore);
+	});
+	it("fails closed when eligible host contexts resolve to different Codex threads", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		for (const [sessionId, threadId] of [
+			["host-one", "thread-one"],
+			["host-two", "thread-two"],
+		] as const) {
+			await persistMcpDelegateHostContext({ cwd: root, sessionId, prompt: "$gjc-mcp-delegate-flow" });
+			await registerCodexHandoff(namespace, {
+				work_unit: sessionId,
+				thread_id: threadId,
+				endpoint: { kind: "unix", path: `/tmp/${sessionId}.sock` },
+			});
+		}
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "reject conflicting host contexts",
+				idempotency_key: "conflicting-host-contexts",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+			"codex_handoff_context_ambiguous",
+		);
+	});
+	it("binds when eligible host contexts resolve to the same Codex thread", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		for (const sessionId of ["same-thread-one", "same-thread-two"]) {
+			await persistMcpDelegateHostContext({ cwd: root, sessionId, prompt: "$gjc-mcp-delegate-flow" });
+			await registerCodexHandoff(namespace, {
+				work_unit: sessionId,
+				thread_id: "thread-shared-context",
+				endpoint: { kind: "unix", path: `/tmp/${sessionId}.sock` },
+			});
+		}
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "bind matching host contexts",
+				idempotency_key: "matching-host-contexts",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({
+			ok: true,
+			codex_handoff: { auto_bound: true, thread_id: "thread-shared-context" },
+		});
+	});
+	it("binds despite rejected traversal and oversized host contexts", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		for (const [directory, sessionId, promptExcerpt] of [
+			["_session-traversal", "../evil", "resume"],
+			["_session-oversized", "oversized", "x".repeat(1024 * 1024)],
+		] as const) {
+			const contextPath = path.join(root, ".gjc", directory, "state", "mcp-delegate-host-context.json");
+			await fs.mkdir(path.dirname(contextPath), { recursive: true });
+			await fs.writeFile(
+				contextPath,
+				JSON.stringify({
+					schema_version: 1,
+					activation: "$gjc-mcp-delegate-flow",
+					session_id: sessionId,
+					thread_id: null,
+					turn_id: null,
+					cwd: root,
+					source: "user_prompt_submit",
+					recorded_at: "2026-07-19T00:00:00.000Z",
+					prompt_excerpt: promptExcerpt,
+				}),
+				"utf8",
+			);
+		}
+		await persistMcpDelegateHostContext({ cwd: root, sessionId: "valid-host", prompt: "$gjc-mcp-delegate-flow" });
+		await registerCodexHandoff(namespace, {
+			work_unit: "valid-host",
+			thread_id: "thread-valid-host",
+			endpoint: { kind: "unix", path: "/tmp/valid-host.sock" },
+		});
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "ignore invalid host evidence",
+				idempotency_key: "ignore-invalid-host-evidence",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: true, thread_id: "thread-valid-host" } });
+		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+			"codex_handoff_context_unreadable",
+		);
+	});
+	it("records and serializes wakes for auto-bound delegate sessions sharing one Codex thread", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			codexTransportFactory: async () => ({
+				request: async (method, params) => {
+					requests.push({ method, params });
+					return method === "thread/resume" ? { thread: { status: { type: "idle" } } } : {};
+				},
+				close: async () => {},
+			}),
+		});
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "visible-session",
+			turnId: "host-turn",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		await registerCodexHandoff(namespace, {
+			work_unit: "visible-session",
+			thread_id: "thread-wake-shared",
+			endpoint: { kind: "unix", path: "/tmp/codex-wake-shared.sock" },
+		});
+		const results = await Promise.all(
+			["wake-bind-one", "wake-bind-two"].map(idempotency_key =>
+				server.callTool("gjc_delegate_execute", {
+					cwd: root,
+					task: idempotency_key,
+					idempotency_key,
+					allow_mutation: true,
+				}),
+			),
+		);
+		const sessionIds = results.map(result => String(result.session_id));
+		expect(new Set(sessionIds).size).toBe(2);
+		const events = await Promise.all(
+			sessionIds.map(sessionId =>
+				appendCoordinatorEventForTest(namespace, {
+					kind: "turn.completed",
+					sessionId,
+					summary: `delegate ${sessionId} done`,
+				}),
+			),
+		);
+		await awaitCodexWakePublishesForTest(namespace);
+		const starts = requests.filter(request => request.method === "turn/start");
+		const startIds = starts.map(request => String(request.params.clientUserMessageId));
+		expect(new Set(startIds).size).toBe(startIds.length);
+		for (const [index, sessionId] of sessionIds.entries())
+			expect(startIds).toContain(`gjc-wake-${sessionId}:${events[index]?.seq}`);
+		for (let index = 0; index < requests.length; index++)
+			if (requests[index]?.method === "turn/start") expect(requests[index - 1]?.method).toBe("thread/resume");
+	});
+	it("skips ambiguous Codex auto-binding without failing delegation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "host-without-handoff",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		await Promise.all([
+			registerCodexHandoff(namespace, {
+				work_unit: "source-one",
+				thread_id: "thread-one",
+				endpoint: { kind: "unix", path: "/tmp/codex-one.sock" },
+			}),
+			registerCodexHandoff(namespace, {
+				work_unit: "source-two",
+				thread_id: "thread-two",
+				endpoint: { kind: "unix", path: "/tmp/codex-two.sock" },
+			}),
+		]);
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "ambiguous handoff",
+				idempotency_key: "ambiguous-handoff",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+			"codex_handoff_source_ambiguous",
+		);
+	});
+	it("uses an unbound host handoff instead of a delegate-bound fallback source", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "host-context",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		await registerCodexHandoff(namespace, {
+			work_unit: "delegate-source",
+			thread_id: "thread-shared",
+			endpoint: { kind: "unix", path: "/tmp/delegate-source.sock" },
+			origin: {
+				gjc_session_id: "delegate-source",
+				gjc_turn_id: null,
+				codex_host_session_id: "host-context",
+				codex_thread_id: "thread-shared",
+				codex_turn_id: null,
+				delegation_id: "prior-delegation",
+				workflow: "execute",
+				bound_at: new Date().toISOString(),
+			},
+		});
+		await registerCodexHandoff(namespace, {
+			work_unit: "host-source",
+			thread_id: "thread-shared",
+			endpoint: { kind: "unix", path: "/tmp/host-source.sock" },
+		});
+
+		const result = await server.callTool("gjc_delegate_execute", {
+			cwd: root,
+			task: "select host fallback",
+			idempotency_key: "select-host-fallback",
+			allow_mutation: true,
+		});
+		const sessionId = String(result.session_id);
+
+		expect(result).toMatchObject({ ok: true, codex_handoff: { auto_bound: true, thread_id: "thread-shared" } });
+		expect(await readCodexHandoff(namespace, sessionId)).toMatchObject({
+			endpoint: { kind: "unix", path: "/tmp/host-source.sock" },
+		});
+	});
+	it("skips stale Codex auto-binding sources with a durable diagnostic", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "host-context",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		await registerCodexHandoff(namespace, {
+			work_unit: "stale-host",
+			thread_id: "thread-stale",
+			endpoint: { kind: "unix", path: "/tmp/stale-host.sock" },
+		});
+		const sourceFile = path.join(namespace, "codex-handoffs", "stale-host.json");
+		const stale = JSON.parse(await fs.readFile(sourceFile, "utf8")) as Record<string, unknown>;
+		stale.updated_at = "2026-07-01T00:00:00.000Z";
+		await fs.writeFile(sourceFile, JSON.stringify(stale), "utf8");
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "reject stale source",
+				idempotency_key: "reject-stale-source",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+			"codex_handoff_source_stale",
+		);
+	});
+	it("prefers a fresh fallback source over stale records on the same or other threads", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "host-context-mixed",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		await registerCodexHandoff(namespace, {
+			work_unit: "a-stale-same-thread",
+			thread_id: "thread-fresh",
+			endpoint: { kind: "unix", path: "/tmp/stale-same.sock" },
+		});
+		await registerCodexHandoff(namespace, {
+			work_unit: "b-stale-other-thread",
+			thread_id: "thread-old",
+			endpoint: { kind: "unix", path: "/tmp/stale-other.sock" },
+		});
+		for (const workUnit of ["a-stale-same-thread", "b-stale-other-thread"]) {
+			const file = path.join(namespace, "codex-handoffs", `${workUnit}.json`);
+			const record = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+			record.updated_at = "2026-07-01T00:00:00.000Z";
+			await fs.writeFile(file, JSON.stringify(record), "utf8");
+		}
+		await registerCodexHandoff(namespace, {
+			work_unit: "z-fresh-host",
+			thread_id: "thread-fresh",
+			endpoint: { kind: "unix", path: "/tmp/fresh-host.sock" },
+		});
+
+		const delegated = await server.callTool("gjc_delegate_execute", {
+			cwd: root,
+			task: "bind to the fresh source",
+			idempotency_key: "mixed-stale-fresh",
+			allow_mutation: true,
+		});
+		expect(delegated).toMatchObject({ ok: true, codex_handoff: { auto_bound: true, thread_id: "thread-fresh" } });
+		expect(await readCodexHandoff(namespace, String(delegated.session_id))).toMatchObject({
+			thread_id: "thread-fresh",
+			endpoint: { kind: "unix", path: "/tmp/fresh-host.sock" },
+		});
+	});
+	it("reports stale rather than ambiguous when every fallback thread is stale", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "host-context-all-stale",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		for (const [workUnit, thread] of [
+			["stale-one", "thread-one"],
+			["stale-two", "thread-two"],
+		] as const) {
+			await registerCodexHandoff(namespace, {
+				work_unit: workUnit,
+				thread_id: thread,
+				endpoint: { kind: "unix", path: `/tmp/${workUnit}.sock` },
+			});
+			const file = path.join(namespace, "codex-handoffs", `${workUnit}.json`);
+			const record = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+			record.updated_at = "2026-07-01T00:00:00.000Z";
+			await fs.writeFile(file, JSON.stringify(record), "utf8");
+		}
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "all sources stale",
+				idempotency_key: "all-stale-threads",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		const log = await fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8");
+		expect(log).toContain("codex_handoff_source_stale");
+		expect(log).not.toContain("codex_handoff_source_ambiguous");
+	});
+	it("keeps a direct host session handoff authoritative over other fallback threads", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "direct-host",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		await registerCodexHandoff(namespace, {
+			work_unit: "direct-host",
+			thread_id: "thread-direct",
+			endpoint: { kind: "unix", path: "/tmp/direct-host.sock" },
+		});
+		await registerCodexHandoff(namespace, {
+			work_unit: "other-host",
+			thread_id: "thread-other",
+			endpoint: { kind: "unix", path: "/tmp/other-host.sock" },
+		});
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "direct source wins",
+				idempotency_key: "direct-source-wins",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: true, thread_id: "thread-direct" } });
+	});
+	it("records unreadable host context evidence before binding from an older valid context", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await persistMcpDelegateHostContext({
+			cwd: root,
+			sessionId: "valid-host",
+			prompt: "$gjc-mcp-delegate-flow",
+		});
+		await fs.mkdir(path.join(root, ".gjc", "_session-corrupt-host", "state"), { recursive: true });
+		await fs.writeFile(
+			path.join(root, ".gjc", "_session-corrupt-host", "state", "mcp-delegate-host-context.json"),
+			"{",
+			"utf8",
+		);
+		await registerCodexHandoff(namespace, {
+			work_unit: "valid-host",
+			thread_id: "thread-valid",
+			endpoint: { kind: "unix", path: "/tmp/valid-host.sock" },
+		});
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "record corrupt context",
+				idempotency_key: "record-corrupt-context",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: true, thread_id: "thread-valid" } });
+		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+			"codex_handoff_context_unreadable",
+		);
+	});
+	it("records unreadable host context evidence when no valid context remains", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const contextPath = path.join(root, ".gjc", "_session-corrupt-host", "state", "mcp-delegate-host-context.json");
+		await fs.mkdir(path.dirname(contextPath), { recursive: true });
+		await fs.writeFile(contextPath, "{", "utf8");
+
+		await expect(
+			server.callTool("gjc_delegate_execute", {
+				cwd: root,
+				task: "reject unreadable-only context",
+				idempotency_key: "reject-unreadable-only-context",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+			"codex_handoff_context_unreadable",
+		);
+	});
 	it("serializes concurrent delegations that reuse one live session", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -2599,6 +3094,7 @@ it("keeps parallel pending questions isolated when one answer is submitted", asy
 	]);
 	const questionA = (listedA.questions as Array<Record<string, unknown>>)[0]!;
 	const questionBBefore = (listedB.questions as Array<Record<string, unknown>>)[0]!;
+	expect(questionA.answer_binding).not.toBe(questionBBefore.answer_binding);
 	await expect(
 		serverA.callTool("gjc_coordinator_submit_question_answer", {
 			session_id: "visible-session",

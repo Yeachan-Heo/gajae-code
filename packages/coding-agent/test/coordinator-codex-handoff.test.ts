@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	ackCodexWakeEvent,
+	bindDelegateCodexHandoff,
 	listCodexWakeEvents,
 	readCodexHandoff,
 	recordCodexWakeEvent,
@@ -173,5 +174,116 @@ console.log(JSON.stringify(await recordCodexWakeEvent(${JSON.stringify(root)}, {
 			await fs.readFile(path.join(root, "codex-wake-events", "session-atomic__7.json"), "utf8"),
 		) as Record<string, unknown>;
 		expect(persisted).toMatchObject(winner.event);
+	});
+	it("never exposes a partial delegate binding to concurrent binders", async () => {
+		const root = await tempRoot();
+		const source = await registerCodexHandoff(root, {
+			work_unit: "host",
+			thread_id: "thread-source",
+			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+		});
+		for (let index = 0; index < 20; index++) {
+			const origin = {
+				gjc_session_id: `concurrent-${index}`,
+				gjc_turn_id: null,
+				codex_thread_id: "thread-source",
+				codex_turn_id: null,
+				codex_host_session_id: "host",
+				delegation_id: `delegate-${index}`,
+				workflow: "execute",
+				bound_at: "2026-07-19T00:00:00.000Z",
+			};
+			const results = await Promise.all([
+				bindDelegateCodexHandoff(root, { work_unit: `concurrent-${index}`, source, origin }),
+				bindDelegateCodexHandoff(root, { work_unit: `concurrent-${index}`, source, origin }),
+			]);
+			expect(results[0]?.handoff).toEqual(results[1]?.handoff);
+			expect(results.map(result => result.created)).toEqual(expect.arrayContaining([true, false]));
+		}
+	});
+	it("round-trips delegate origins and never overwrites an existing delegate binding", async () => {
+		const root = await tempRoot();
+		const source = await registerCodexHandoff(root, {
+			work_unit: "host-session",
+			thread_id: "thread-source",
+			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+			token_file: "/tmp/codex-token",
+		});
+		const origin = {
+			gjc_session_id: "delegate-session",
+			gjc_turn_id: "delegate-turn",
+			codex_thread_id: "thread-source",
+			codex_turn_id: "codex-turn-1",
+			codex_host_session_id: "host-session",
+			delegation_id: "delegate-turn",
+			workflow: "execute",
+			bound_at: "2026-07-19T00:00:00.000Z",
+		};
+		const first = await bindDelegateCodexHandoff(root, {
+			work_unit: "delegate-session",
+			source,
+			origin,
+		});
+		const file = path.join(root, "codex-handoffs", "delegate-session.json");
+		const beforeSecondBind = await fs.readFile(file, "utf8");
+		const second = await bindDelegateCodexHandoff(root, {
+			work_unit: "delegate-session",
+			source,
+			origin: { ...origin, delegation_id: "other-turn" },
+		});
+
+		expect(first).toMatchObject({ created: true, handoff: { origin } });
+		expect(second).toMatchObject({ created: false, handoff: { origin } });
+		expect(await fs.readFile(file, "utf8")).toBe(beforeSecondBind);
+		await expect(
+			registerCodexHandoff(root, {
+				work_unit: "invalid-origin",
+				thread_id: "thread-invalid",
+				endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+				origin: { ...origin, delegation_id: 1 },
+			}),
+		).rejects.toThrow("state_corrupt");
+		for (const hostileOrigin of [
+			{ ...origin, delegation_id: "a/../b" },
+			{ ...origin, workflow: "bogus" },
+			{ ...origin, bound_at: "not-a-date" },
+			{ ...origin, codex_thread_id: "other-thread" },
+		]) {
+			await expect(
+				bindDelegateCodexHandoff(root, {
+					work_unit: `invalid-${hostileOrigin.delegation_id.replaceAll(/[^a-z0-9]/gi, "") || "origin"}`,
+					source,
+					origin: hostileOrigin,
+				}),
+			).rejects.toThrow("state_corrupt");
+		}
+
+		await fs.writeFile(
+			path.join(root, "codex-handoffs", "legacy.json"),
+			JSON.stringify({
+				schema_version: 1,
+				work_unit: "legacy",
+				thread_id: "thread-legacy",
+				endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+				token_file: null,
+				registered_at: "2026-07-19T00:00:00.000Z",
+				updated_at: "2026-07-19T00:00:00.000Z",
+			}),
+		);
+		expect((await readCodexHandoff(root, "legacy"))?.origin).toBeUndefined();
+		await fs.writeFile(
+			path.join(root, "codex-handoffs", "corrupt-origin.json"),
+			JSON.stringify({
+				schema_version: 1,
+				work_unit: "corrupt-origin",
+				thread_id: "thread-corrupt",
+				endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+				token_file: null,
+				registered_at: "2026-07-19T00:00:00.000Z",
+				updated_at: "2026-07-19T00:00:00.000Z",
+				origin: { ...origin, delegation_id: 1 },
+			}),
+		);
+		await expect(readCodexHandoff(root, "corrupt-origin")).rejects.toThrow("state_corrupt");
 	});
 });

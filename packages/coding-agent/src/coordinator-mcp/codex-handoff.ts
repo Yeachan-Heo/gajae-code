@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
@@ -15,6 +16,16 @@ export const CODEX_WAKE_EVENT_KINDS = [
 export type CodexWakeEventKind = (typeof CODEX_WAKE_EVENT_KINDS)[number];
 
 export type CodexHandoffEndpoint = { kind: "unix"; path: string } | { kind: "tcp"; host: string; port: number };
+export interface CodexHandoffOriginV1 {
+	gjc_session_id: string | null;
+	gjc_turn_id: string | null;
+	codex_thread_id: string;
+	codex_turn_id: string | null;
+	codex_host_session_id: string | null;
+	delegation_id: string;
+	workflow: string;
+	bound_at: string;
+}
 
 export interface CodexHandoffRegistrationV1 {
 	schema_version: 1;
@@ -24,6 +35,7 @@ export interface CodexHandoffRegistrationV1 {
 	token_file: string | null;
 	registered_at: string;
 	updated_at: string;
+	origin?: CodexHandoffOriginV1;
 }
 
 export interface CodexWakeEventV1 {
@@ -105,19 +117,25 @@ async function writeAtomic(file: string, value: unknown): Promise<void> {
 
 async function writeExclusive(file: string, value: unknown): Promise<boolean> {
 	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-	let handle: fs.FileHandle;
-	try {
-		handle = await fs.open(file, "wx", 0o600);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-		throw error;
-	}
+	const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+	const handle = await fs.open(temp, "wx", 0o600);
 	try {
 		await handle.writeFile(JSON.stringify(value));
 		await handle.sync();
 	} finally {
 		await handle.close();
 	}
+	try {
+		await fs.link(temp, file);
+	} catch (error) {
+		await fs.unlink(temp).catch(() => {});
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			await fsyncDirectory(path.dirname(file));
+			return false;
+		}
+		throw error;
+	}
+	await fs.unlink(temp);
 	await fsyncDirectory(path.dirname(file));
 	return true;
 }
@@ -142,6 +160,31 @@ function boundSummary(value: string): string {
 		.trim();
 	return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
 }
+function isBoundString(value: unknown, maximum = 256): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= maximum && !value.includes("\0");
+}
+
+function assertCodexHandoffOrigin(value: unknown): asserts value is CodexHandoffOriginV1 {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("state_corrupt");
+	const origin = value as Record<string, unknown>;
+	if (
+		!(
+			origin.gjc_session_id === null ||
+			(typeof origin.gjc_session_id === "string" && SAFE_ID.test(origin.gjc_session_id))
+		) ||
+		!(origin.gjc_turn_id === null || (typeof origin.gjc_turn_id === "string" && SAFE_ID.test(origin.gjc_turn_id))) ||
+		!(typeof origin.codex_thread_id === "string" && SAFE_ID.test(origin.codex_thread_id)) ||
+		!(origin.codex_turn_id === null || isBoundString(origin.codex_turn_id)) ||
+		!(
+			origin.codex_host_session_id === null ||
+			(typeof origin.codex_host_session_id === "string" && SAFE_ID.test(origin.codex_host_session_id))
+		) ||
+		!(typeof origin.delegation_id === "string" && SAFE_ID.test(origin.delegation_id)) ||
+		!["plan", "execute", "team"].includes(origin.workflow as string) ||
+		!(typeof origin.bound_at === "string" && Number.isFinite(Date.parse(origin.bound_at)))
+	)
+		throw new Error("state_corrupt");
+}
 
 function assertCodexHandoff(value: unknown, workUnit: string): asserts value is CodexHandoffRegistrationV1 {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("state_corrupt");
@@ -157,6 +200,7 @@ function assertCodexHandoff(value: unknown, workUnit: string): asserts value is 
 		typeof registration.updated_at !== "string"
 	)
 		throw new Error("state_corrupt");
+	if (Object.hasOwn(registration, "origin")) assertCodexHandoffOrigin(registration.origin);
 	try {
 		assertSafeCodexEndpoint(registration.endpoint);
 	} catch {
@@ -205,6 +249,7 @@ export async function registerCodexHandoff(
 		thread_id: string;
 		endpoint: CodexHandoffEndpoint;
 		token_file?: string | null;
+		origin?: unknown;
 	},
 ): Promise<CodexHandoffRegistrationV1> {
 	if (Object.hasOwn(input, "token")) throw new Error("token_material_not_allowed");
@@ -213,6 +258,7 @@ export async function registerCodexHandoff(
 	const tokenFile = input.token_file ?? null;
 	if (tokenFile !== null && (typeof tokenFile !== "string" || !isTokenFileReference(tokenFile)))
 		throw new Error("token_material_not_allowed");
+	if (input.origin !== undefined) assertCodexHandoffOrigin(input.origin);
 	const endpoint = assertSafeCodexEndpoint(input.endpoint);
 	const file = handoffPath(namespaceDir, workUnit);
 	const existing = await readCodexHandoff(namespaceDir, workUnit);
@@ -225,6 +271,7 @@ export async function registerCodexHandoff(
 		token_file: tokenFile,
 		registered_at: existing?.registered_at ?? now,
 		updated_at: now,
+		...(input.origin === undefined ? {} : { origin: input.origin }),
 	};
 	await writeAtomic(file, registration);
 	return registration;
@@ -238,6 +285,39 @@ export async function readCodexHandoff(
 	if (registration === null) return null;
 	assertCodexHandoff(registration, workUnit);
 	return registration;
+}
+
+export async function bindDelegateCodexHandoff(
+	namespaceDir: string,
+	input: {
+		work_unit: string;
+		source: CodexHandoffRegistrationV1;
+		origin: unknown;
+	},
+): Promise<{ created: boolean; handoff: CodexHandoffRegistrationV1 }> {
+	const workUnit = assertWorkUnit(input.work_unit);
+	assertCodexHandoff(input.source, input.source.work_unit);
+	assertCodexHandoffOrigin(input.origin);
+	if ((input.origin as CodexHandoffOriginV1).codex_thread_id !== input.source.thread_id)
+		throw new Error("state_corrupt");
+	const file = handoffPath(namespaceDir, workUnit);
+	const existing = await readCodexHandoff(namespaceDir, workUnit);
+	if (existing) return { created: false, handoff: existing };
+	const now = new Date().toISOString();
+	const handoff: CodexHandoffRegistrationV1 = {
+		schema_version: 1,
+		work_unit: workUnit,
+		thread_id: input.source.thread_id,
+		endpoint: input.source.endpoint,
+		token_file: input.source.token_file,
+		registered_at: now,
+		updated_at: now,
+		origin: input.origin,
+	};
+	if (await writeExclusive(file, handoff)) return { created: true, handoff };
+	const concurrent = await readCodexHandoff(namespaceDir, workUnit);
+	if (!concurrent) throw new Error("state_corrupt");
+	return { created: false, handoff: concurrent };
 }
 
 export async function listCodexHandoffs(namespaceDir: string): Promise<CodexHandoffRegistrationV1[]> {

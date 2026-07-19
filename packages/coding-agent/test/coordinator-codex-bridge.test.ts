@@ -51,7 +51,9 @@ function createServer(
 				return {
 					request: async (method, params) => {
 						requests.push({ method, params });
-						return method === "thread/status" ? { status: control.status } : {};
+						return method === "thread/resume"
+							? { thread: { status: { type: control.status === "idle" ? "idle" : "active" } } }
+							: {};
 					},
 					close: async () => {},
 				};
@@ -214,11 +216,15 @@ describe("Coordinator Codex resume bridge", () => {
 				},
 			],
 		});
-		expect(requests.map(request => request.method)).toEqual(["thread/resume", "thread/status", "turn/start"]);
+		expect(requests.map(request => request.method)).toEqual(["initialize", "thread/resume", "turn/start"]);
 		const start = requests.find(request => request.method === "turn/start");
 		expect(start?.params).toMatchObject({ clientUserMessageId: `gjc-wake-session-1:${event.seq}` });
-		expect(String(start?.params.prompt)).not.toContain(finalResponseSentinel);
-		expect(String(start?.params.prompt)).not.toContain("FINAL-RESPONSE-SENTINEL-9c41");
+		expect(String((start?.params.input as Array<{ text: string }> | undefined)?.[0]?.text)).not.toContain(
+			finalResponseSentinel,
+		);
+		expect(String((start?.params.input as Array<{ text: string }> | undefined)?.[0]?.text)).not.toContain(
+			"FINAL-RESPONSE-SENTINEL-9c41",
+		);
 
 		const restarted = createServer(root, "idle", requests);
 		const duplicate = await recordCodexWakeEvent(namespaceDir(root), {
@@ -257,7 +263,7 @@ describe("Coordinator Codex resume bridge", () => {
 		).resolves.toMatchObject({
 			pending_wake_events: [{ key: `session-1:${event.seq}`, status: "pending", attempts: 1 }],
 		});
-		expect(requests.map(request => request.method)).toEqual(["thread/resume", "thread/status"]);
+		expect(requests.map(request => request.method)).toEqual(["initialize", "thread/resume"]);
 		await expect(
 			server.callTool("gjc_coordinator_ack_codex_wake", {
 				session_id: "session-1",
@@ -429,7 +435,7 @@ describe("Coordinator Codex resume bridge", () => {
 						}
 						if (endpoint.kind === "unix" && endpoint.path.endsWith("two.sock") && method === "turn/start")
 							secondStarted.resolve();
-						return method === "thread/status" ? { status: "idle" } : {};
+						return method === "thread/resume" ? { thread: { status: { type: "idle" } } } : {};
 					},
 					close: async () => {},
 				}),
@@ -507,10 +513,10 @@ describe("Coordinator Codex resume bridge", () => {
 				codexTransportFactory: async () => ({
 					request: async (method, params) => {
 						requests.push({ method, params });
-						if (method === "thread/status") {
+						if (method === "thread/resume") {
 							const status = threadBusy ? "running" : "idle";
 							statusResponses.set(requests.length - 1, status);
-							return { status };
+							return { thread: { status: { type: status === "idle" ? "idle" : "active" } } };
 						}
 						if (method === "turn/start" && ++startCount === 1) threadBusy = true;
 						return {};
@@ -548,7 +554,7 @@ describe("Coordinator Codex resume bridge", () => {
 
 		for (let index = 0; index < requests.length; index++)
 			if (requests[index]?.method === "turn/start") {
-				expect(requests[index - 1]?.method).toBe("thread/status");
+				expect(requests[index - 1]?.method).toBe("thread/resume");
 				expect(statusResponses.get(index - 1)).toBe("idle");
 			}
 		const startsByWake = new Map<string, number>();
@@ -586,7 +592,8 @@ describe("Coordinator Codex resume bridge", () => {
 				codexTransportFactory: async () => ({
 					request: async (method, params) => {
 						requests.push({ method, params });
-						if (method === "thread/status") return { status: threadBusy ? "running" : "idle" };
+						if (method === "thread/resume")
+							return { thread: { status: { type: threadBusy ? "active" : "idle" } } };
 						return {};
 					},
 					close: async () => {},
