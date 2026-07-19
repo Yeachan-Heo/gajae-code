@@ -99,6 +99,7 @@ export type ManagedDeleteCandidateResult =
 type NativeIdentity =
 	| { ok: true; platform: "posix" | "win32"; canonicalPath: string }
 	| { ok: false; code: NativeIdentityFailureCode };
+type CanonicalNativeIdentity = Extract<NativeIdentity, { ok: true }>;
 
 type NativeIdentityFailureCode =
 	| "not_found"
@@ -149,6 +150,18 @@ function identityFor(cwd: string): NativeIdentity {
 	return canonicalExistingDirectoryIdentity(cwd) as NativeIdentity;
 }
 
+function canonicalExistingPathForIo(base: string, identity: CanonicalNativeIdentity): string {
+	if (identity.platform !== "win32") return identity.canonicalPath;
+	try {
+		// Native identity uses a stable Volume GUID path on Windows. Bun 1.3.14
+		// cannot reliably create/read files through that path, so retain the
+		// symlink-resolved DOS path for JavaScript filesystem I/O.
+		return fs.realpathSync.native(base);
+	} catch {
+		return path.resolve(base);
+	}
+}
+
 /**
  * Resolve benign symlinks in the deepest existing ancestor of a trusted storage
  * root (e.g. macOS `/var -> /private/var`, or a symlinked `$HOME`) while keeping
@@ -164,7 +177,8 @@ export function canonicalizeTrustedPath(target: string): string {
 	for (;;) {
 		const identity = canonicalExistingDirectoryIdentity(base) as NativeIdentity;
 		if (identity.ok) {
-			return suffix.length === 0 ? identity.canonicalPath : path.join(identity.canonicalPath, ...suffix);
+			const canonicalBase = canonicalExistingPathForIo(base, identity);
+			return suffix.length === 0 ? canonicalBase : path.join(canonicalBase, ...suffix);
 		}
 		if (identity.code !== "not_found" && identity.code !== "not_directory") return path.resolve(target);
 		const parent = path.dirname(base);
