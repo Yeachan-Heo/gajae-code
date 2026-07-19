@@ -525,11 +525,21 @@ mod platform {
 	}
 
 	#[cfg(target_os = "linux")]
+	/// Errno values proving no POSIX ACL entry exists on the file: `ENODATA`
+	/// means the attribute is absent, and `EOPNOTSUPP` means the filesystem
+	/// cannot store POSIX ACLs at all (e.g. `NFSv4` or `noacl` mounts), so no
+	/// extended entry can widen access beyond the owner-only mode bits that
+	/// `apply_owner_only_path_security` enforces.
+	const fn posix_acl_absent(errno: Option<i32>) -> bool {
+		matches!(errno, Some(libc::ENODATA | libc::EOPNOTSUPP))
+	}
+
+	#[cfg(target_os = "linux")]
 	fn clear_extended_acl(file: &File) -> Result<(), NativeOwnerOnlySecurityResult> {
 		let name = b"system.posix_acl_access\0";
 		// SAFETY: the file descriptor and NUL-terminated attribute name remain valid.
 		let result = unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr().cast()) };
-		if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA) {
+		if result == 0 || posix_acl_absent(std::io::Error::last_os_error().raw_os_error()) {
 			Ok(())
 		} else {
 			Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"))
@@ -545,10 +555,29 @@ mod platform {
 		};
 		if result >= 0 {
 			Ok(true)
-		} else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA) {
+		} else if posix_acl_absent(std::io::Error::last_os_error().raw_os_error()) {
 			Ok(false)
 		} else {
 			Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"))
+		}
+	}
+
+	#[cfg(all(test, target_os = "linux"))]
+	mod posix_acl_errno_tests {
+		use super::posix_acl_absent;
+
+		#[test]
+		fn absent_for_missing_attribute_and_unsupported_filesystem() {
+			assert!(posix_acl_absent(Some(libc::ENODATA)));
+			assert!(posix_acl_absent(Some(libc::EOPNOTSUPP)));
+		}
+
+		#[test]
+		fn unavailable_for_real_failures() {
+			assert!(!posix_acl_absent(Some(libc::EACCES)));
+			assert!(!posix_acl_absent(Some(libc::EIO)));
+			assert!(!posix_acl_absent(Some(libc::EPERM)));
+			assert!(!posix_acl_absent(None));
 		}
 	}
 
@@ -579,10 +608,16 @@ mod platform {
 		// SAFETY: the file descriptor and owned ACL allocation remain live for this
 		// call.
 		let result = unsafe { acl_set_fd(file.as_raw_fd(), acl) };
+		// Capture errno before `acl_free`, which may clobber it.
+		let errno = std::io::Error::last_os_error().raw_os_error();
 		// SAFETY: this owns the ACL allocation from the preceding ACL API and frees it
 		// once.
 		unsafe { acl_free(acl) };
 		if result == 0 {
+			Ok(())
+		} else if errno == Some(libc::ENOTSUP) {
+			// The filesystem cannot store extended ACLs at all (e.g. some NFS or
+			// SMB mounts), so no entry can widen access beyond the mode bits.
 			Ok(())
 		} else {
 			Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"))
@@ -595,8 +630,13 @@ mod platform {
 		let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
 		if acl.is_null() {
 			// On macOS `acl_get_fd` returns NULL with errno ENOENT when the file has no
-			// extended ACL; that is the common case, not a failure.
-			if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+			// extended ACL; that is the common case, not a failure. ENOTSUP means the
+			// filesystem cannot store extended ACLs at all, which equally proves none
+			// exists.
+			if matches!(
+				std::io::Error::last_os_error().raw_os_error(),
+				Some(libc::ENOENT) | Some(libc::ENOTSUP)
+			) {
 				return Ok(false);
 			}
 			return Err(NativeOwnerOnlySecurityResult::failure("acl_unavailable"));
@@ -3500,6 +3540,76 @@ mod platform {
 		_: &str,
 	) -> NativeOwnerOnlySecurityResult {
 		NativeOwnerOnlySecurityResult::failure("acl_unavailable")
+	}
+}
+#[cfg(all(test, unix))]
+mod owner_only_security_posix_tests {
+	use std::{
+		path::PathBuf,
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::{apply_owner_only_path_security, verify_owner_only_path_security};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new_in(base: PathBuf) -> Self {
+			let path = base.join(format!(
+				"gjc-owner-security-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+			));
+			std::fs::create_dir(&path).expect("create owner-security temp directory");
+			Self(path)
+		}
+
+		fn new() -> Self {
+			Self::new_in(std::env::temp_dir())
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn assert_round_trip(dir: &TempDir) {
+		let directory = dir.0.to_string_lossy().into_owned();
+		let applied_directory =
+			apply_owner_only_path_security(directory.clone(), "directory".to_owned());
+		assert!(applied_directory.ok, "{:?}", applied_directory.code);
+		let verified_directory = verify_owner_only_path_security(directory, "directory".to_owned());
+		assert!(verified_directory.ok, "{:?}", verified_directory.code);
+
+		let file = dir.0.join("probe.tmp");
+		std::fs::write(&file, b"owner-only").expect("write owner-security probe");
+		let file = file.to_string_lossy().into_owned();
+		let applied_file = apply_owner_only_path_security(file.clone(), "file".to_owned());
+		assert!(applied_file.ok, "{:?}", applied_file.code);
+		let verified_file = verify_owner_only_path_security(file, "file".to_owned());
+		assert!(verified_file.ok, "{:?}", verified_file.code);
+	}
+
+	#[test]
+	fn owner_only_security_round_trips_local_directory_and_file() {
+		assert_round_trip(&TempDir::new());
+	}
+
+	/// Regression coverage for filesystems without POSIX ACL support (e.g.
+	/// `NFSv4` home directories), where the xattr probes fail with `EOPNOTSUPP`
+	/// and the pre-fix code refused the session store with `acl_unavailable`.
+	/// Opt-in because it needs a real ACL-less mount: point
+	/// `GJC_TEST_NOACL_DIR` at a writable directory on such a filesystem.
+	#[test]
+	fn owner_only_security_round_trips_on_acl_less_filesystem() {
+		let Some(base) = std::env::var_os("GJC_TEST_NOACL_DIR") else {
+			return;
+		};
+		assert_round_trip(&TempDir::new_in(PathBuf::from(base)));
 	}
 }
 #[cfg(all(test, windows))]

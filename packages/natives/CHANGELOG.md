@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Owner-only path security no longer fails closed with `acl_unavailable` on POSIX filesystems that cannot store extended ACLs (Linux `EOPNOTSUPP`, macOS `ENOTSUP`, e.g. NFSv4 home directories). On such mounts no extended ACL can widen access beyond the enforced `0700`/`0600` mode bits, so the apply/verify probes now treat the condition as "no ACL present" instead of rejecting the managed session store at startup.
+
 ## [0.11.2] - 2026-07-19
 
 ### Fixed
