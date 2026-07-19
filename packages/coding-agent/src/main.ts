@@ -293,6 +293,30 @@ async function readPipedInput(): Promise<string | undefined> {
 	}
 }
 
+async function readPipedInputIfReady(): Promise<string | undefined> {
+	if (process.stdin.isTTY === true) return undefined;
+
+	const ready = Promise.withResolvers<void>();
+	const onReadable = () => ready.resolve();
+	const onEnd = () => ready.resolve();
+	const onError = () => ready.resolve();
+	process.stdin.once("readable", onReadable);
+	process.stdin.once("end", onEnd);
+	process.stdin.once("error", onError);
+	await Promise.race([ready.promise, new Promise<void>(resolve => setImmediate(resolve))]);
+	process.stdin.removeListener("readable", onReadable);
+	process.stdin.removeListener("end", onEnd);
+	process.stdin.removeListener("error", onError);
+
+	const chunks: Buffer[] = [];
+	for (let chunk = process.stdin.read(); chunk !== null; chunk = process.stdin.read()) {
+		chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+	}
+	if (chunks.length === 0) return undefined;
+	const text = Buffer.concat(chunks).toString("utf8");
+	return text.trim() ? text : undefined;
+}
+
 export interface InteractiveModeNotify {
 	kind: "warn" | "error" | "info";
 	message: string;
@@ -1166,8 +1190,16 @@ export async function runRootCommand(
 	if (parsedArgs.noTitle || parsedArgs.mode === "acp") {
 		Bun.env.PI_NO_TITLE = "1";
 	}
+	const hasPreparedInput = parsedArgs.messages.length > 0 || parsedArgs.fileArgs.length > 0;
 	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
-		const pipedInput = parsedArgs.mode === "acp" ? undefined : await (deps.readPipedInput ?? readPipedInput)();
+		const pipedInput =
+			parsedArgs.mode === "acp"
+				? undefined
+				: deps.readPipedInput
+					? await deps.readPipedInput()
+					: hasPreparedInput
+						? await readPipedInputIfReady()
+						: await readPipedInput();
 		if (parsedArgs.fileArgs.length === 0) {
 			return { pipedInput, fileText: undefined, fileImages: undefined };
 		}
@@ -1185,7 +1217,7 @@ export async function runRootCommand(
 	const disposition = resolveLaunchDisposition({
 		stdinIsTTY: deps.stdinIsTTY ?? process.stdin.isTTY,
 		pipedInput,
-		hasPreparedInput: parsedArgs.messages.length > 0 || parsedArgs.fileArgs.length > 0,
+		hasPreparedInput,
 		print: Boolean(parsedArgs.print),
 		mode: parsedArgs.mode,
 	});
@@ -1332,6 +1364,7 @@ export async function runRootCommand(
 	sessionOptions.modelRegistry = modelRegistry;
 	sessionOptions.hasUI = isInteractive;
 	sessionOptions.notificationHostModeSupported = isInteractive;
+	sessionOptions.sdkHostModeSupported = isInteractive;
 	sessionOptions.settings = settingsInstance;
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
 
@@ -1364,6 +1397,30 @@ export async function runRootCommand(
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, sessionOptions.model);
 	}
 
+	if (
+		!deps.suppressProcessExit &&
+		deps.createAgentSession === undefined &&
+		parsedArgs.noSession === true &&
+		!parsedArgs.continue &&
+		parsedArgs.resume === undefined &&
+		parsedArgs.fork === undefined &&
+		!isInteractive &&
+		mode !== "acp" &&
+		!hasRootStartupProfile &&
+		!sessionOptions.model &&
+		!sessionOptions.modelPattern &&
+		modelRegistry.getAvailable().length === 0
+	) {
+		process.stderr.write(`${chalk.red(`No models available. ${formatModelOnboardingGuidance()}`)}\n`);
+		process.stderr.write(
+			`${chalk.yellow(`\nAdvanced manual config remains available at ${ModelsConfigFile.path()}`)}\n`,
+		);
+		process.exitCode = 1;
+		authStorage.close();
+		stopThemeWatcher();
+		await postmortem.cleanup();
+		return;
+	}
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
 		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
@@ -1378,10 +1435,16 @@ export async function runRootCommand(
 	};
 
 	if (mode === "acp") {
-		await (deps.runAcpMode ?? (await import("./modes/acp")).runAcpMode)({
-			agentDir: settingsInstance.getAgentDir(),
-			...(acpStartupOptions ? { startupOptions: acpStartupOptions } : {}),
-		});
+		try {
+			await (deps.runAcpMode ?? (await import("./modes/acp")).runAcpMode)({
+				agentDir: settingsInstance.getAgentDir(),
+				...(acpStartupOptions ? { startupOptions: acpStartupOptions } : {}),
+			});
+		} finally {
+			authStorage.close();
+			stopThemeWatcher();
+			if (!deps.suppressProcessExit) await postmortem.cleanup();
+		}
 	} else {
 		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager, eventBus } = await createSession(
 			sessionOptions,
@@ -1516,20 +1579,21 @@ export async function runRootCommand(
 			}
 		} else {
 			const runPrint = deps.runPrintMode ?? (await import("./modes/print-mode")).runPrintMode;
-			await runPrint(session, {
-				mode,
-				messages: parsedArgs.messages,
-				initialMessage,
-				initialImages,
-				suppressProcessExit: deps.suppressProcessExit,
-			});
-			if ($env.PI_TIMING) {
-				logger.printTimings();
-			}
-			stopThemeWatcher();
-			if (!deps.suppressProcessExit) {
-				const exitCode = typeof process.exitCode === "number" ? process.exitCode : 0;
-				await postmortem.quit(exitCode);
+			try {
+				await runPrint(session, {
+					mode,
+					messages: parsedArgs.messages,
+					initialMessage,
+					initialImages,
+					suppressProcessExit: deps.suppressProcessExit,
+				});
+				if ($env.PI_TIMING) {
+					logger.printTimings();
+				}
+			} finally {
+				stopThemeWatcher();
+				authStorage.close();
+				if (!deps.suppressProcessExit) await postmortem.cleanup();
 			}
 		}
 	}

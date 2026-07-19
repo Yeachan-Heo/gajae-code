@@ -2741,6 +2741,8 @@ export function createNotificationsExtension(
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
 		controller?: NotificationSessionController;
+		/** Whether this host mode can own the root SDK endpoint. Default: true. */
+		sdkHostModeSupported?: boolean;
 
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 		runEphemeralTurn?: (promptText: string, signal: AbortSignal) => Promise<{ replyText: string }>;
@@ -2956,7 +2958,8 @@ export function createNotificationsExtension(
 		const lifecycleRequestId = safeLifecycleRequestId(process.env.GJC_LIFECYCLE_REQUEST_ID);
 		const { settings, cfg, settingsAvailable } = resolveSettings(options.settings);
 		const notificationsEnabledForSession = controller.query(ctx).effectiveEnabled;
-		const sdkEnabledForSession = shouldHostSdk(settings, isNotificationEligibleContext(ctx));
+		const sdkEnabledForSession =
+			(options.sdkHostModeSupported ?? true) && shouldHostSdk(settings, isNotificationEligibleContext(ctx));
 		const lifecycleRequired = lifecycleStartupCapability !== undefined;
 		const failLifecycleStartup = (
 			reason: "disabled" | "ineligible" | "failed",

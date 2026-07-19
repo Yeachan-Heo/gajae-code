@@ -390,6 +390,8 @@ export interface CreateAgentSessionOptions {
 	hasUI?: boolean;
 	/** Whether this host mode can own a notification session endpoint. Default: true. */
 	notificationHostModeSupported?: boolean;
+	/** Whether this host mode can own the root SDK endpoint. Default: true. */
+	sdkHostModeSupported?: boolean;
 
 	/**
 	 * Opt-in OpenTelemetry instrumentation forwarded to the underlying Agent.
@@ -1763,7 +1765,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				currentAgentType: options.currentAgentType,
 				spawnedByGjc,
 			}) ||
-			shouldHostSdk(notificationCfg, isTopLevelSdkSession)
+			(shouldHostSdk(notificationCfg, isTopLevelSdkSession) && (options.sdkHostModeSupported ?? true))
 		) {
 			inlineExtensions.push(async api => {
 				try {
@@ -1774,6 +1776,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						settings,
 						controller: notificationSessionController,
 						spawnedByGjc,
+						sdkHostModeSupported: options.sdkHostModeSupported,
 						runEphemeralTurn: async (promptText, signal) => {
 							if (!session) throw new Error("Ephemeral turns are unavailable.");
 							const { replyText } = await session.runEphemeralTurn({ promptText, signal });

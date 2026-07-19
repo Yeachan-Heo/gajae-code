@@ -223,12 +223,26 @@ describe("startup update contract", () => {
 			args: Partial<Args>;
 			pipedInput?: string;
 			expectedRunner: "acp" | "print";
+			expectedInitialMessage?: string;
 		}> = [
 			{ name: "print", args: { print: true }, expectedRunner: "print" },
 			{ name: "text", args: { mode: "text" }, expectedRunner: "print" },
 			{ name: "json", args: { mode: "json" }, expectedRunner: "print" },
 			{ name: "acp", args: { mode: "acp" }, expectedRunner: "acp" },
-			{ name: "auto-print", args: {}, pipedInput: "piped prompt", expectedRunner: "print" },
+			{
+				name: "auto-print",
+				args: {},
+				pipedInput: "piped prompt",
+				expectedRunner: "print",
+				expectedInitialMessage: "piped prompt",
+			},
+			{
+				name: "positional-auto-print",
+				args: { messages: ["hello"] },
+				pipedInput: "pipe context",
+				expectedRunner: "print",
+				expectedInitialMessage: "pipe context\nhello",
+			},
 		];
 
 		for (const testCase of cases) {
@@ -238,13 +252,18 @@ describe("startup update contract", () => {
 			let checks = 0;
 			const runners: string[] = [];
 			let pipedInputReads = 0;
+			let sessionOptions: CreateAgentSessionOptions | undefined;
+			let initialMessage: string | undefined;
 			try {
 				const parsed =
 					testCase.expectedRunner === "acp"
 						? ({ messages: [], fileArgs: [], unknownFlags: new Map(), ...testCase.args } satisfies Args)
 						: rootArgs(testCase.args);
 				await runRootCommand(parsed, [], {
-					createAgentSession: async () => fakeSessionResult(),
+					createAgentSession: async options => {
+						sessionOptions = options;
+						return fakeSessionResult();
+					},
 					discoverAuthStorage: async () => authStorage,
 					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": true }),
 					suppressProcessExit: true,
@@ -263,13 +282,20 @@ describe("startup update contract", () => {
 					runAcpMode: async () => {
 						runners.push("acp");
 					},
-					runPrintMode: async () => {
+					runPrintMode: async (_session, options) => {
 						runners.push("print");
+						initialMessage = options.initialMessage;
 					},
 				});
 				expect(checks, testCase.name).toBe(0);
 				expect(runners, testCase.name).toEqual([testCase.expectedRunner]);
 				expect(pipedInputReads, testCase.name).toBe(testCase.expectedRunner === "acp" ? 0 : 1);
+				expect(initialMessage, testCase.name).toBe(testCase.expectedInitialMessage);
+				if (testCase.expectedRunner === "print") {
+					expect(sessionOptions?.sdkHostModeSupported, testCase.name).toBe(false);
+				} else {
+					expect(sessionOptions, testCase.name).toBeUndefined();
+				}
 			} finally {
 				authStorage.close();
 				if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
@@ -357,13 +383,13 @@ describe("startup update contract", () => {
 		}
 	});
 
-	it("preserves print-mode status and does not dispose the session twice", async () => {
+	it("preserves print-mode status, cleans up owners, and does not dispose the session twice", async () => {
 		using tempDir = TempDir.createSync("@gjc-print-exit-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		const originalNoTitle = Bun.env.PI_NO_TITLE;
 		const originalExitCode = process.exitCode;
 		let disposeCalls = 0;
-		const quitSpy = vi.spyOn(postmortem, "quit").mockResolvedValue(undefined);
+		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
 		const sessionResult = fakeSessionResult();
 		sessionResult.session.dispose = async () => {
 			disposeCalls += 1;
@@ -385,10 +411,39 @@ describe("startup update contract", () => {
 			});
 
 			expect(disposeCalls).toBe(1);
-			expect(quitSpy).toHaveBeenCalledWith(78);
+			expect(cleanupSpy).toHaveBeenCalledTimes(1);
+			expect(process.exitCode).toBe(78);
 		} finally {
 			vi.restoreAllMocks();
 			process.exitCode = originalExitCode ?? 0;
+			authStorage.close();
+			if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
+			else Bun.env.PI_NO_TITLE = originalNoTitle;
+		}
+	});
+	it("cleans up noninteractive owners when print mode rejects", async () => {
+		using tempDir = TempDir.createSync("@gjc-print-failure-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const originalNoTitle = Bun.env.PI_NO_TITLE;
+		const printFailure = new Error("print failed");
+		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
+		try {
+			await expect(
+				runRootCommand(rootArgs({ mode: "text" }), [], {
+					createAgentSession: async () => fakeSessionResult(),
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					runPrintMode: async () => {
+						throw printFailure;
+					},
+				}),
+			).rejects.toBe(printFailure);
+			expect(cleanupSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.restoreAllMocks();
 			authStorage.close();
 			if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
 			else Bun.env.PI_NO_TITLE = originalNoTitle;

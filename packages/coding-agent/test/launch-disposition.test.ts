@@ -86,18 +86,12 @@ async function runCliWithIgnoredStdin(
 		Bun.sleep(15_000).then(() => ({ timedOut: true as const, exitCode: -1 })),
 	]);
 	if (result.timedOut) {
-		proc.kill();
-		await proc.exited;
+		throw new Error(`CLI did not exit naturally within 15 seconds for: ${args.join(" ")} (pid ${proc.pid})`);
 	}
 	const [stdout, stderr] = await Promise.all([
 		new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
 		new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
 	]);
-	if (result.timedOut) {
-		throw new Error(
-			`CLI did not exit within the timeout for: ${args.join(" ")}\nstdout: ${stdout}\nstderr: ${stderr}`,
-		);
-	}
 	return { stdout, stderr, exitCode: result.exitCode };
 }
 
@@ -121,25 +115,34 @@ describe("non-TTY CLI startup", () => {
 		}
 	}, 15_000);
 
-	it("routes a positional prompt to print mode instead of starting the TUI", async () => {
+	it("routes a positional prompt without waiting for ignored stdin", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-non-tty-prompt-"));
+		const env = { ...process.env };
+		delete env.GJC_SDK_DISABLE;
+		delete env.GJC_SESSION_ID;
+		delete env.GJC_SESSION_FILE;
+		delete env.GJC_SESSION_CWD;
+		delete env.GJCCODE;
+		delete env.CLAUDECODE;
+		delete env.ANTHROPIC_AUTH_TOKEN;
+		delete env.ANTHROPIC_BASE_URL;
+		delete env.OPENAI_BASE_URL;
 		try {
-			const result = await runCliWithIgnoredStdin(
-				["--no-session", "--no-extensions", "--no-lsp", "--no-tools", "--no-skills", "--no-rules", "hello"],
-				{
-					...process.env,
-					GJC_CODING_AGENT_DIR: root,
-					PI_CODING_AGENT_DIR: root,
-					GJC_NOTIFICATIONS: "0",
-					GJC_SDK_DISABLE: "1",
-					NO_COLOR: "1",
-					GJC_CLEANUP_DEADLINE_MS: "250",
-					ANTHROPIC_API_KEY: "",
-					ANTHROPIC_OAUTH_TOKEN: "",
-					OPENAI_API_KEY: "",
-					GEMINI_API_KEY: "",
-				},
-			);
+			const result = await runCliWithIgnoredStdin(["--no-session", "hello"], {
+				...env,
+				HOME: root,
+				XDG_CONFIG_HOME: root,
+				XDG_DATA_HOME: root,
+				GJC_CODING_AGENT_DIR: root,
+				PI_CODING_AGENT_DIR: root,
+				GJC_NOTIFICATIONS: "0",
+				ANTHROPIC_API_KEY: "",
+				ANTHROPIC_OAUTH_TOKEN: "",
+				OPENAI_API_KEY: "",
+				GEMINI_API_KEY: "",
+				GITHUB_TOKEN: "",
+				NO_COLOR: "1",
+			});
 
 			expect(result.exitCode).not.toBe(0);
 			expect(result.stderr).toContain("No models available");
