@@ -51,8 +51,9 @@ export class Loader extends Text {
 	 * inline terminal viewport.
 	 */
 	createFootprint(): Component {
+		const snapshot = new Text(this.getText(), 1, 0);
 		return {
-			render: width => this.render(width).map(() => ""),
+			render: width => ["", ...snapshot.render(width)].map(() => ""),
 			invalidate: () => {},
 		};
 	}

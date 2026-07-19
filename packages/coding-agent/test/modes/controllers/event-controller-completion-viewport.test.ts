@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { AssistantMessageComponent } from "@gajae-code/coding-agent/modes/components/assistant-message";
@@ -12,7 +12,7 @@ import {
 	associateSessionMessageViewportAnchorId,
 	getSessionMessageViewportAnchorId,
 } from "@gajae-code/coding-agent/session/session-manager";
-import { Container, shouldUseViewportRepaintForHost, Text, TUI } from "@gajae-code/tui";
+import { Container, Loader, shouldUseViewportRepaintForHost, Text, TUI } from "@gajae-code/tui";
 import { VirtualTerminal } from "../../../../tui/test/virtual-terminal";
 
 function assistantMessage(text: string): AssistantMessage {
@@ -79,6 +79,7 @@ describe("EventController completion viewport", () => {
 			env: Partial<Record<(typeof envKeys)[number], string>>;
 			resizeHeight?: number;
 			nativeWindows?: boolean;
+			isProcessTerminal?: boolean;
 		}> = [
 			{ label: "plain-ssh", env: { SSH_CONNECTION: "client server", TERM: "xterm-256color" } },
 			{ label: "tmux-default", env: { TMUX: "/tmp/tmux,1,0", TERM: "tmux-256color" } },
@@ -92,6 +93,7 @@ describe("EventController completion viewport", () => {
 				env: { WT_SESSION: "forwarded", TERM_PROGRAM: "Windows_Terminal", TERM: "xterm-256color" },
 			},
 			{ label: "native-windows-selector", env: { TERM: "xterm-256color" }, nativeWindows: true },
+			{ label: "virtual-terminal", env: { TERM: "xterm-256color" }, isProcessTerminal: false },
 		];
 
 		for (const testCase of cases) {
@@ -105,7 +107,7 @@ describe("EventController completion viewport", () => {
 						expect(shouldUseViewportRepaintForHost({}, "win32", { includeNativeWindows: true })).toBe(true);
 					}
 
-					const term = new VirtualTerminal(40, 18, { isProcessTerminal: true });
+					const term = new VirtualTerminal(40, 18, { isProcessTerminal: testCase.isProcessTerminal ?? true });
 					const ui = new TUI(term);
 					ui.setClearOnShrink(clearOnShrink);
 					const chatContainer = new Container();
@@ -121,8 +123,14 @@ describe("EventController completion viewport", () => {
 					});
 					const pendingMessagesContainer = new Container();
 					const statusContainer = new Container();
-					statusContainer.addChild(new Text("", 0, 0));
-					statusContainer.addChild(new Text("working", 0, 0));
+					const loadingAnimation = new Loader(
+						ui,
+						value => value,
+						value => value,
+						"working",
+						["|"],
+					);
+					statusContainer.addChild(loadingAnimation);
 					const todoContainer = new Container();
 					const btwContainer = new Container();
 					const statusLine = new Text("status", 0, 0);
@@ -136,11 +144,23 @@ describe("EventController completion viewport", () => {
 					ui.addChild(statusLine);
 					ui.addChild(editor);
 					ui.setBottomPinnedComponent(statusLine);
-					const stopLoading = vi.fn();
-					const createFootprint = vi.fn(() => ({
-						render: () => ["", ""],
-					}));
-					const ctx = {
+					const initialFootprint = loadingAnimation.render(term.columns).map(() => "");
+					let replacementLoader: Loader | undefined;
+					let ctx: InteractiveModeContext;
+					const ensureLoadingAnimation = (): void => {
+						if (ctx.loadingAnimation) return;
+						statusContainer.clear();
+						replacementLoader = new Loader(
+							ui,
+							value => value,
+							value => value,
+							"working",
+							["|"],
+						);
+						ctx.loadingAnimation = replacementLoader;
+						statusContainer.addChild(replacementLoader);
+					};
+					ctx = {
 						isInitialized: true,
 						ui,
 						chatContainer,
@@ -153,7 +173,8 @@ describe("EventController completion viewport", () => {
 						getUserMessageText: (userMessage: { content: string }) => userMessage.content,
 						streamingComponent,
 						streamingMessage: startMessage,
-						loadingAnimation: { stop: stopLoading, createFootprint },
+						loadingAnimation,
+						ensureLoadingAnimation,
 						pendingTools: new Map(),
 						planModeController: { flushPendingModelSwitch: async () => {} },
 						updateEditorTopBorder: () => {},
@@ -194,26 +215,44 @@ describe("EventController completion viewport", () => {
 						term.clearWriteLog();
 						await controller.handleEvent({ type: "agent_end", messages: [message] });
 						await term.waitForRender();
-						expect(stopLoading, `${testCase.label} clear=${clearOnShrink}`).toHaveBeenCalledTimes(1);
-						expect(createFootprint, `${testCase.label} clear=${clearOnShrink}`).toHaveBeenCalledTimes(1);
 						expect(ctx.loadingAnimation, `${testCase.label} clear=${clearOnShrink}`).toBeUndefined();
-						expect(statusContainer.children, `${testCase.label} clear=${clearOnShrink}`).toHaveLength(1);
-						const after = term.getViewport().map(line => line.trimEnd());
-						for (const entry of beforeHistory) expect(after[entry.index]).toBe(entry.line);
-						const writes = term.getWriteLog().join("");
-						expect(writes).not.toContain("\x1b[2J\x1b[H");
-						expect(writes).not.toContain("\x1b[3J");
-						for (const entry of beforeHistory) {
-							expect(writes, `${testCase.label} clear=${clearOnShrink}`).not.toContain(entry.line);
+						if (term.isProcessTerminal) {
+							expect(statusContainer.children, `${testCase.label} clear=${clearOnShrink}`).toHaveLength(1);
+							expect(statusContainer.render(term.columns), `${testCase.label} clear=${clearOnShrink}`).toEqual(
+								initialFootprint,
+							);
+							const after = term.getViewport().map(line => line.trimEnd());
+							for (const entry of beforeHistory) expect(after[entry.index]).toBe(entry.line);
+							const writes = term.getWriteLog().join("");
+							expect(writes).not.toContain("\x1b[2J\x1b[H");
+							expect(writes).not.toContain("\x1b[3J");
+							for (const entry of beforeHistory) {
+								expect(writes, `${testCase.label} clear=${clearOnShrink}`).not.toContain(entry.line);
+							}
+							const visibleHistoryNumbers = beforeHistory.flatMap(entry => {
+								const match = /history-(\d+)/.exec(entry.line);
+								return match ? [Number(match[1])] : [];
+							});
+							const firstVisibleHistory = Math.min(...visibleHistoryNumbers);
+							for (let index = 0; index < firstVisibleHistory; index++) {
+								expect(writes).not.toMatch(new RegExp(`history-${index}(?!\\d)`));
+							}
+						} else {
+							expect(statusContainer.children, `${testCase.label} clear=${clearOnShrink}`).toHaveLength(0);
+							expect(statusContainer.render(term.columns), `${testCase.label} clear=${clearOnShrink}`).toEqual(
+								[],
+							);
 						}
-						const visibleHistoryNumbers = beforeHistory.flatMap(entry => {
-							const match = /history-(\d+)/.exec(entry.line);
-							return match ? [Number(match[1])] : [];
-						});
-						const firstVisibleHistory = Math.min(...visibleHistoryNumbers);
-						for (let index = 0; index < firstVisibleHistory; index++) {
-							expect(writes).not.toMatch(new RegExp(`history-${index}(?!\\d)`));
-						}
+						term.clearWriteLog();
+						await controller.handleEvent({ type: "agent_start" });
+						await term.waitForRender();
+						expect(replacementLoader, `${testCase.label} clear=${clearOnShrink}`).toBeDefined();
+						if (!replacementLoader) throw new Error("agent start did not replace the completion footprint");
+						expect(ctx.loadingAnimation, `${testCase.label} clear=${clearOnShrink}`).toBe(replacementLoader);
+						expect(statusContainer.children, `${testCase.label} clear=${clearOnShrink}`).toEqual([
+							replacementLoader,
+						]);
+						replacementLoader.stop();
 						term.clearWriteLog();
 						ui.requestRender();
 						await term.waitForRender();

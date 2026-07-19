@@ -40,8 +40,15 @@ describe("Loader component", () => {
 		);
 
 		const footprint = loader.createFootprint();
+		const expectedFootprints = new Map<number, string[]>();
 		for (const width of [4, 40]) {
-			expect(footprint.render(width)).toEqual(loader.render(width).map(() => ""));
+			const expected = loader.render(width).map(() => "");
+			expectedFootprints.set(width, expected);
+			expect(footprint.render(width)).toEqual(expected);
+		}
+		loader.setMessage("A different status that would wrap differently");
+		for (const [width, expected] of expectedFootprints) {
+			expect(footprint.render(width)).toEqual(expected);
 		}
 
 		loader.stop();
