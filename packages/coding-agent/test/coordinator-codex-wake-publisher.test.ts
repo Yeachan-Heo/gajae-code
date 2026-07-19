@@ -410,7 +410,7 @@ describe("Codex wake publisher", () => {
 					clientInfo: { name: "strict-test", title: null, version: "0" },
 					capabilities: null,
 				});
-				await transport.notify?.("initialized", {});
+				await transport.notify?.("initialized");
 				// Legacy prompt-shaped turn/start -> invalid params per generated TurnStartParams.
 				await expect(
 					transport.request("turn/start", { threadId: "thread-1", prompt: "legacy prompt body" }),

@@ -615,3 +615,25 @@ RED (legacy transport vs schema-backed fixture) — new tests:
 GREEN (real installed app-server, read-only):
 real initialize OK: {"userAgent":"Codex Desktop/0.144.5 (Mac OS 26.5.2; arm64) unknown (gjc-coordinator; 0)","codexHome"
 bogus thread/resume -> codex_app_server_request_failed (JSON-RPC error over WebSocket; no turn started)
+
+## Live launched app-server end-to-end smoke (codex app-server --listen unix://)
+
+Self-launched installed server (codex-cli 0.144.5) on a private unix socket; full
+documented lifecycle executed over our WebSocket transport/raw frames:
+
+1 initialize ok: {"userAgent":"gjc-smoke/0.144.5 (Mac OS 26.5.2; arm64) dumb (gjc-smoke; 0)"}
+2 thread/start: 019f78f2-a529-78a1-9088-d3a9c95721de status: {"type":"idle"}
+3 turn/start accepted, turn id: 019f78f2-aa16-71e3-a431-069121c71472
+4 turn/interrupt acknowledged (cleanup)
+
+- turn/start used the exact generated TurnStartParams shape:
+  {threadId, clientUserMessageId, input:[{type:'text', text, text_elements:[]}]} — ACCEPTED
+  by the real server and returned a genuine turn id (immediately interrupted).
+- idle gate source: thread status from the thread/start (and thread/resume) response,
+  status.type === 'idle'; no thread/status method used anywhere.
+- Cross-scope note: thread/resume against a rollout owned by a different server
+  instance returns JSON-RPC -32600 "no rollout found ..." — surfaced by our transport
+  as codex_app_server_request_failed and recorded as a failed wake (durable retry),
+  never a crash.
+- initialized notification is now sent with NO params member, matching the generated
+  ClientNotification type { "method": "initialized" } exactly.
