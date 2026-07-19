@@ -581,3 +581,37 @@ Final focused GREEN:
  0 fail
  570 expect() calls
 Ran 122 tests across 7 files. [8.74s]
+
+## Schema-backed transport compatibility proof (second criterion blocker)
+
+Schemas regenerated from the installed CLI: `codex app-server generate-ts --out ...`
+(codex-cli 0.144.5); byte-identical to the earlier dump used for the transport
+rewrite. Verified from generated bindings:
+- `--listen unix://PATH` / `ws://IP:PORT` transports are WebSocket (codex app-server --help).
+- `InitializeParams { clientInfo, capabilities }` + `initialized` notification required
+  per connection before any other request.
+- `TurnStartParams = { threadId, clientUserMessageId?, input: Array<UserInput>, ... }`;
+  `UserInput` text = `{ type:'text', text, text_elements }` — legacy `prompt` invalid.
+  `clientUserMessageId` IS present in the generated schema, so it is retained.
+- No `thread/status` method exists. Idle/active is read from the documented
+  `thread/resume` response `result.thread.status` (`ThreadStatus =
+  notLoaded | idle | systemError | active{activeFlags}`); busy threads take the
+  pending-fallback path and drain later (`ThreadStatusChangedNotification` exists
+  for push updates but polling resume-status is sufficient and documented).
+
+Fixture hardening (schema-enforcing, would fail the f792165d transport):
+- non-WebSocket (raw JSONL) clients are destroyed before any JSON-RPC exchange;
+- requests before initialize/initialized get JSON-RPC error -32600;
+- `turn/start` with `prompt` or non-conforming `input` gets -32602.
+
+RED (legacy transport vs schema-backed fixture) — new tests:
+- `rejects a legacy raw-JSONL prompt-based transport against the schema-backed fixture`
+  (raw JSONL client: connection destroyed, zero messages accepted, publisher fails
+  with codex_app_server_unavailable/timeout — exactly how f792165d would fail).
+- `fails requests sent before initialize and turn/start bodies using legacy prompt params`
+  (pre-initialize request rejected; prompt-shaped turn/start rejected; schema-shaped
+  input accepted).
+
+GREEN (real installed app-server, read-only):
+real initialize OK: {"userAgent":"Codex Desktop/0.144.5 (Mac OS 26.5.2; arm64) unknown (gjc-coordinator; 0)","codexHome"
+bogus thread/resume -> codex_app_server_request_failed (JSON-RPC error over WebSocket; no turn started)
