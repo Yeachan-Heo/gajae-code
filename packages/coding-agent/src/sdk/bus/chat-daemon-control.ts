@@ -12,8 +12,8 @@ import type {
 	DaemonStatus,
 } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
-import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
 import { readLinuxProcStartTimeSync } from "../../gjc-runtime/linux-proc";
+import { getNotificationConfig, isDiscordConfigured, isSlackConfigured } from "./config";
 
 export type ChatDaemonKind = "discord" | "slack";
 export type ChatDaemonAction = "stop" | "reload";

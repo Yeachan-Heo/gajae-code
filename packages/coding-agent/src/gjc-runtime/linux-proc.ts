@@ -16,19 +16,26 @@ import * as nodeFsSync from "node:fs";
 import * as nodeFs from "node:fs/promises";
 
 /**
- * Parse field 22 (process start time, in clock ticks since boot) from a
- * `/proc/<pid>/stat` string. Returns the raw numeric token, or `null` when the
- * input is missing, lacks a closing paren, or field 22 is absent/non-numeric.
+ * Parse field 22 (process start time, in clock ticks since boot) from one
+ * `/proc/<pid>/stat` record. Returns the raw numeric token, or `null` when the
+ * record shape is malformed or field 22 is absent/non-numeric.
  */
 export function parseLinuxProcStartTime(stat: string | null | undefined): string | null {
-	if (!stat) return null;
-	const close = stat.lastIndexOf(")");
-	if (close < 0) return null;
-	const startTime = stat
-		.slice(close + 2)
-		.trim()
-		.split(/\s+/)[19];
-	return startTime && /^\d+$/.test(startTime) ? startTime : null;
+	if (!stat || stat.includes("\0") || stat.includes("\r")) return null;
+	const record = stat.endsWith("\n") ? stat.slice(0, -1) : stat;
+	if (!record || record.includes("\n")) return null;
+
+	const open = record.indexOf(" (");
+	const close = record.lastIndexOf(")");
+	if (open < 1 || close <= open + 1 || !/^[1-9]\d*$/.test(record.slice(0, open))) return null;
+
+	const suffix = record.slice(close + 1);
+	if (!/^[ \t]+/.test(suffix)) return null;
+	const fields = suffix.trim().split(/[ \t]+/);
+	if (fields.length < 20 || !/^[RSDTtXZPI]$/.test(fields[0])) return null;
+
+	const startTime = fields[19];
+	return /^\d+$/.test(startTime) ? startTime : null;
 }
 
 /**

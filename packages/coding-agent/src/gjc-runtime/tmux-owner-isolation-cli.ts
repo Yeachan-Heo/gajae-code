@@ -1,5 +1,6 @@
 /** Internal JSON-line facade for the tmux owner-isolation contract. */
 import * as fs from "node:fs/promises";
+import { readLinuxProcStartTime } from "./linux-proc";
 import {
 	type BootstrapRequest,
 	bootstrapTmuxOwnerIsolation,
@@ -16,7 +17,6 @@ import {
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
-import { readLinuxProcStartTime } from "./linux-proc";
 
 /** Matches the sole argv shape allowed to enter the owner-isolation JSON-line protocol. */
 export function isTmuxOwnerIsolationCliArgv(argv: readonly string[]): boolean {

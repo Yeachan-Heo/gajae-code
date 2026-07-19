@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
+import { readLinuxProcStartTimeSync } from "./linux-proc";
 import { sessionRuntimeDir } from "./session-layout";
 import {
 	isValidOwnerIntent,
@@ -14,7 +15,6 @@ import {
 	observeOwnerTerminal,
 	type TerminalSignal,
 } from "./tmux-owner-isolation";
-import { readLinuxProcStartTimeSync } from "./linux-proc";
 
 /** Managed tmux owner provenance propagated only to the launched child process. */
 export const GJC_TMUX_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";

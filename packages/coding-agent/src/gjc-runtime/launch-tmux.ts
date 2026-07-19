@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils/dirs";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
+import { readLinuxProcStartTimeSync } from "./linux-proc";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
@@ -43,7 +44,6 @@ import {
 	replaceOwnerGenerationSync,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
-import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
 	findGjcTmuxSessionByName,
 	findGjcTmuxSessionByScope,

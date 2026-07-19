@@ -3,6 +3,7 @@ import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
@@ -49,7 +50,6 @@ import {
 	type TmuxOwnerIsolationExecutionResult,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
-import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import { buildWindowsPowerShellInnerCommand } from "./windows-powershell-command";
 
 export interface GjcTmuxSessionStatus {

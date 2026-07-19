@@ -11,6 +11,7 @@ import {
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
+import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
 import {
@@ -27,7 +28,6 @@ import {
 	requireCoordinatorMutation,
 } from "./policy";
 import { createSessionReaper, type ReapableSession, type SessionReaper } from "./session-reaper";
-import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
 
 export type { CoordinatorToolName };
 export { COORDINATOR_MCP_PROTOCOL_VERSION, COORDINATOR_MCP_SERVER_NAME, COORDINATOR_MCP_TOOL_NAMES };

@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { NotificationControlServer as NativeNotificationControlServer } from "@gajae-code/natives";
+import { readLinuxProcStartTime } from "../../gjc-runtime/linux-proc";
 import { tmuxRuntimeSessionPath } from "../../gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -35,7 +36,6 @@ import {
 	replaceOwnerGeneration,
 	type TmuxServerProof,
 } from "../../gjc-runtime/tmux-owner-isolation";
-import { readLinuxProcStartTime } from "../../gjc-runtime/linux-proc";
 import {
 	findGjcTmuxSessionByName,
 	forceCloseGjcTmuxSession,

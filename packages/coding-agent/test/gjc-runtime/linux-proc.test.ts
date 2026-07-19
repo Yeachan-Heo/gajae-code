@@ -52,6 +52,18 @@ describe("parseLinuxProcStartTime", () => {
 		expect(parseLinuxProcStartTime(procStat("owner", ""))).toBeNull();
 	});
 
+	it("rejects malformed record boundaries and fields", () => {
+		expect(parseLinuxProcStartTime(`x${procStat("owner", "1234")}`)).toBeNull();
+		expect(parseLinuxProcStartTime(procStat("owner", "1234").replace(") ", ")"))).toBeNull();
+		expect(parseLinuxProcStartTime(procStat("owner", "1234").replace(") S", ") Q"))).toBeNull();
+		expect(parseLinuxProcStartTime(`${procStat("owner", "1234")}\nsecond record`)).toBeNull();
+		expect(parseLinuxProcStartTime(`${procStat("owner", "1234")}\0`)).toBeNull();
+	});
+
+	it("accepts a single terminal newline and fields after field 22", () => {
+		expect(parseLinuxProcStartTime(`${procStat("owner", "1234", " 99 100")}\n`)).toBe("1234");
+	});
+
 	it("parses a large numeric start time", () => {
 		expect(parseLinuxProcStartTime(procStat("tmux", "18446744073709551615"))).toBe("18446744073709551615");
 	});
