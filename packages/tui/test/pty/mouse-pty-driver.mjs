@@ -8,19 +8,24 @@ const bunBinary = process.env.BUN_BINARY;
 const testDir = path.dirname(url.fileURLToPath(import.meta.url));
 const fixture = path.join(testDir, "mouse-pty-fixture.ts");
 const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== undefined));
+const MULTIPLEXER_ENV_KEYS = ["TMUX", "TMUX_PANE", "STY", "ZELLIJ", "GJC_TMUX_LAUNCHED"];
+
 
 if (!bunBinary) throw new Error("BUN_BINARY must identify the Bun executable that runs the PTY fixture.");
 if (!scenario) throw new Error("A PTY scenario is required.");
 
 
 function launchFixture(env = {}) {
+	const scenarioEnv = { ...baseEnv, TERM: "xterm-256color" };
+	for (const key of MULTIPLEXER_ENV_KEYS) delete scenarioEnv[key];
+
 	let captured = "";
 	const terminal = pty.spawn("/bin/sh", ["-c", 'exec "$1" "$2"', "pty-fixture", bunBinary, fixture], {
 		name: "xterm-256color",
 		cols: 80,
 		rows: 24,
 		cwd: process.cwd(),
-		env: { ...baseEnv, TERM: "xterm-256color", ...env },
+		env: { ...scenarioEnv, ...env },
 	});
 	terminal.onData(data => {
 		captured += data;
