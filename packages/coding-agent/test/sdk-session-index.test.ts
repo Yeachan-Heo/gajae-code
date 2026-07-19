@@ -558,13 +558,32 @@ describe("SDK session index", () => {
 			`${JSON.stringify({ ...inverted, checksum: sessionIndexChecksum(inverted as Parameters<typeof sessionIndexChecksum>[0]) })}\n`,
 		);
 		const corrupt = await new SessionIndex(dir).open();
+		const repairEntered = Promise.withResolvers<void>();
+		const resumeRepair = Promise.withResolvers<void>();
+		const quarantineRepairPrefix = path.join(dir, "sdk", "sessions", "quarantine", "repair-");
+		const originalMkdir = fs.mkdir.bind(fs);
+		const mkdir = vi.spyOn(fs, "mkdir").mockImplementation(async (target, options) => {
+			if (typeof target === "string" && target.startsWith(quarantineRepairPrefix)) {
+				repairEntered.resolve();
+				await resumeRepair.promise;
+			}
+			await originalMkdir(target, options);
+		});
 		const repairing = corrupt.repair();
-		const writer = new SessionIndex(dir);
-		const appended = await writer.append(event("racing-writer"));
-		expect((await repairing).validPrefixSeq).toBe(2);
-		expect(appended.indexSeq).toBe(3);
-		const replay = await new SessionIndex(dir).open();
-		expect(replay.indexSeq).toBe(3);
-		expect((await replay.diagnose()).status).toBe("healthy");
+		try {
+			await repairEntered.promise;
+			const writer = new SessionIndex(dir);
+			const appending = writer.append(event("racing-writer"));
+			resumeRepair.resolve();
+			const [repair, appended] = await Promise.all([repairing, appending]);
+			expect(repair.validPrefixSeq).toBe(2);
+			expect(appended.indexSeq).toBe(3);
+			const replay = await new SessionIndex(dir).open();
+			expect(replay.indexSeq).toBe(3);
+			expect((await replay.diagnose()).status).toBe("healthy");
+		} finally {
+			resumeRepair.resolve();
+			mkdir.mockRestore();
+		}
 	});
 });
