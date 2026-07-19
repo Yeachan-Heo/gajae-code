@@ -6,7 +6,7 @@
  */
 import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@gajae-code/utils/cli";
-import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
+import { APP_NAME, formatBunRuntimeError, getWorktreesDir, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 
@@ -59,6 +59,14 @@ export const commands: CommandEntry[] = [
 	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
 	{ name: "completion", load: () => import("./commands/completion").then(m => m.default) },
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default) },
+	{
+		name: "worktree",
+		aliases: ["wt"],
+		load: async () => {
+			const { createWorktreeCommand } = await import("./commands/worktree");
+			return createWorktreeCommand(getWorktreesDir);
+		},
+	},
 ];
 
 async function showHelp(config: CliConfig): Promise<void> {

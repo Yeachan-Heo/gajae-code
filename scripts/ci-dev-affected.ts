@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun";
+import type { Stats } from "node:fs";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 
@@ -22,7 +23,112 @@ const CODING_AGENT_SHARD_ONE_COVERAGE_PATHS = [
 	"packages/coding-agent/test/coordinator-mcp/send-prompt-concurrency.test.ts",
 ] as const;
 
+const WORKTREE_FOCUSED_PATHS: ReadonlySet<string> = new Set([
+	"packages/coding-agent/src/cli.ts",
+	"packages/coding-agent/src/commands/worktree.ts",
+	"packages/coding-agent/src/cli/worktree-cli.ts",
+	"packages/coding-agent/src/cli/worktree-scanner.ts",
+	"packages/coding-agent/test/worktree-cli.test.ts",
+	"packages/coding-agent/CHANGELOG.md",
+	"scripts/check-worktree-report-capabilities.ts",
+	"scripts/check-worktree-report-capabilities.test.ts",
+	"scripts/ci-dev-affected.ts",
+	"scripts/ci-dev-affected.test.ts",
+	".github/workflows/dev-ci.yml",
+]);
+const WORKTREE_FIXTURE_PREFIX = "scripts/fixtures/worktree-report-capabilities/";
 
+export function hasWorktreeSafetyChange(paths: readonly string[]): boolean {
+	return isFocusedWorktreeOnly(paths);
+}
+
+export function isFocusedWorktreeOnly(paths: readonly string[]): boolean {
+	return (
+		paths.length > 0 &&
+		paths.every((candidate) => WORKTREE_FOCUSED_PATHS.has(candidate) || candidate.startsWith(WORKTREE_FIXTURE_PREFIX))
+	);
+}
+
+function addFocusedTask(
+	tasks: Map<string, Task>,
+	key: string,
+	description: string,
+	command: readonly string[],
+	cwd?: string,
+): void {
+	if (tasks.has(key)) return;
+	tasks.set(key, {
+		key,
+		description,
+		command,
+		cwd,
+		capabilities: {
+			rust: false,
+			nextest: false,
+			nativeConsumer: false,
+			nativeProducer: false,
+		},
+		phase: "legacy",
+	});
+}
+
+export function planFocusedWorktreeTasks(paths: readonly string[]): Task[] {
+	const tasks = new Map<string, Task>();
+	const codingAgent = paths.some((candidate) => candidate.startsWith("packages/coding-agent/"));
+	const verifier = paths.some(
+		(candidate) =>
+			candidate === "scripts/check-worktree-report-capabilities.ts" ||
+			candidate === "scripts/check-worktree-report-capabilities.test.ts" ||
+			candidate.startsWith(WORKTREE_FIXTURE_PREFIX),
+	);
+	const selector = paths.some(
+		(candidate) => candidate === "scripts/ci-dev-affected.ts" || candidate === "scripts/ci-dev-affected.test.ts",
+	);
+	const workflow = paths.includes(".github/workflows/dev-ci.yml");
+	if (codingAgent) {
+		addFocusedTask(tasks, "test:worktree-cli", "Test packages/coding-agent/test/worktree-cli.test.ts", [
+			"bun",
+			"test",
+			"packages/coding-agent/test/worktree-cli.test.ts",
+		]);
+		addFocusedTask(
+			tasks,
+			"check:coding-agent",
+			"Check @gajae-code/coding-agent",
+			["bun", "run", "check"],
+			resolvePackageCwd("packages/coding-agent"),
+		);
+	}
+	if (verifier) {
+		addFocusedTask(tasks, "test:worktree-capabilities", "Test scripts/check-worktree-report-capabilities.test.ts", [
+			"bun",
+			"test",
+			"scripts/check-worktree-report-capabilities.test.ts",
+		]);
+		addFocusedTask(tasks, "verify:worktree-capabilities", "Verify worktree report capabilities", [
+			"bun",
+			"scripts/check-worktree-report-capabilities.ts",
+		]);
+	}
+	if (selector || workflow) {
+		addFocusedTask(tasks, "ci-selftest", "Affected CI selector unit tests", [
+			"bun",
+			"test",
+			"scripts/ci-dev-affected.test.ts",
+		]);
+		addFocusedTask(tasks, "ci-dry-run", "Affected CI selector dry-run", [
+			"bun",
+			"scripts/ci-dev-affected.ts",
+			"--dry-run",
+		]);
+	}
+	if (workflow)
+		addFocusedTask(tasks, "workflow-yaml-parse", "Workflow YAML parse check", [
+			"bun",
+			"scripts/check-workflow-yaml.ts",
+		]);
+	return Array.from(tasks.values());
+}
 // Keys for tasks that compile the @gajae-code/natives addon. They run once in
 // the dedicated dev-ci native-build job (not as matrix shards) and publish the
 // built `.node` files as an artifact the runtime-dependent shards download.
@@ -122,10 +228,6 @@ export interface TaskMatrixEntry {
 async function main(): Promise<void> {
 	const dryRun = process.argv.includes("--dry-run");
 
-	if (process.argv.includes("--emit-flags")) {
-		await emitAffectedFlags();
-		return;
-	}
 	if (process.argv.includes("--matrix-json")) {
 		await emitMatrix();
 		return;
@@ -154,7 +256,7 @@ async function main(): Promise<void> {
 		await runNativeBuild();
 		return;
 	}
-	const taskArg = process.argv.find(arg => arg.startsWith("--task="));
+	const taskArg = process.argv.find((arg) => arg.startsWith("--task="));
 	if (taskArg) {
 		await runSingleTask(taskArg.slice("--task=".length));
 		return;
@@ -178,7 +280,6 @@ async function main(): Promise<void> {
 	}
 }
 
-
 // CI runs in one of two planning modes:
 //   - "pr": pull_request runs get a fast, narrowly targeted plan (run only the
 //     tests/checks directly relevant to the changed paths).
@@ -199,14 +300,16 @@ export function resolvePlanMode(): PlanMode {
 // Resolve the plan for the current changed paths and CI mode. PR mode builds the
 // targeted plan from a filesystem index of test files (for source→test mapping);
 // push mode reuses the broad affected planner unchanged.
-async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
+async function resolvePlannedTasks(paths: string[]): Promise<Task[]> {
+	const normalizedPaths = normalizeChangedPaths(paths);
 	const fromArtifact = await loadCanonicalPlan();
 	if (fromArtifact) return fromArtifact;
-	const normalizedPaths = normalizeChangedPaths(paths);
+	if (isFocusedWorktreeOnly(normalizedPaths)) return planFocusedWorktreeTasks(normalizedPaths);
 	const packages = await getWorkspacePackages();
-	const legacy = resolvePlanMode() === "pr"
-		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles())
-		: planTasks(normalizedPaths, packages);
+	const legacy =
+		resolvePlanMode() === "pr"
+			? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles())
+			: planTasks(normalizedPaths, packages);
 	if (normalizedPaths.length > 0 && normalizedPaths.every(isDocOrChangelogPath)) return legacy;
 	return appendBuildTasks(legacy, normalizedPaths, packages, await loadBuildInventory());
 }
@@ -228,32 +331,6 @@ async function gatherTestFiles(): Promise<string[]> {
 	}
 	return Array.from(found).sort();
 }
-// `--emit-flags` resolves changed paths exactly as a normal run does, then
-// reports whether the resulting plan needs the Rust toolchain (rust-check /
-// rust-test) and/or a native build, so dev-ci can gate its Rust setup. It
-// fails open (rust=true native=true) on any error or unresolved base so CI
-// never skips Rust setup it actually needs.
-async function emitAffectedFlags(): Promise<void> {
-	let rust = true;
-	let native = true;
-	try {
-		const paths = await getChangedPaths();
-		const packages = await getWorkspacePackages();
-		const planned = planTasks(paths, packages);
-		const keys = new Set(planned.map(task => task.key));
-		rust = keys.has("rust-check") || keys.has("rust-test");
-		native = keys.has("native-build") || keys.has("native-linux-x64");
-		console.log(`ci-dev-affected: rust=${rust} native=${native} (changed paths: ${paths.length})`);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		console.log(`ci-dev-affected: flag computation failed (${message}); failing open to rust=true native=true`);
-		rust = true;
-		native = true;
-	}
-	if (process.env.GITHUB_OUTPUT) {
-		await fs.appendFile(process.env.GITHUB_OUTPUT, `rust=${rust}\nnative=${native}\n`);
-	}
-}
 
 function isNativeBuildKey(key: string): boolean {
 	return NATIVE_BUILD_KEYS.has(key);
@@ -273,24 +350,39 @@ function taskNeedsNative(key: string): boolean {
 		key === "deep-interview-definitions" ||
 		key === "deep-interview-runtime" ||
 		key === "bridge-client-sdk-package-smoke" ||
-		key.startsWith("test:")
+		(key.startsWith("test:") && !["test:worktree-cli", "test:worktree-capabilities"].includes(key))
 	);
 }
 
 // Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
 function taskNeedsRust(key: string): boolean {
-	return key === "rust-check" || key === "rust-test" || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
+	return (
+		key === "rust-check" ||
+		key === "rust-test" ||
+		key === "ci-selftest" ||
+		key === "ci-dry-run" ||
+		key === "affected-selftest" ||
+		key === "affected-dry-run"
+	);
+}
+export function normalizeTaskCwdSeparators(value: string): string {
+	return value.replaceAll("\\", "/");
+}
+
+function canonicalTaskCwd(cwd: string | undefined): string {
+	const relative = cwd ? path.relative(repoRoot, cwd) || "." : ".";
+	return normalizeTaskCwdSeparators(relative);
 }
 
 // Build the machine-readable descriptor list for the current changed-path plan.
 // `cwd` is emitted repo-relative so the JSON stays portable across runners.
 export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
-	return tasks.map(task => ({
+	return tasks.map((task) => ({
 		key: task.key,
 		identity: canonicalTaskIdentity(task),
 		description: task.description,
 		command: task.command,
-		cwd: task.cwd ? path.relative(repoRoot, task.cwd) || "." : undefined,
+		cwd: task.cwd ? canonicalTaskCwd(task.cwd) : undefined,
 		native: task.capabilities?.nativeConsumer ?? taskNeedsNative(task.key),
 		rust: task.capabilities?.rust ?? taskNeedsRust(task.key),
 		nextest: task.capabilities?.nextest ?? task.key === "rust-test",
@@ -312,7 +404,15 @@ async function emitMatrix(): Promise<void> {
 	const mode = resolvePlanMode();
 	const tasks = await resolvePlannedTasks(paths);
 	const entries = describeTasks(tasks);
-	const canonical = JSON.stringify({ schemaVersion: 1, sourceSha, mode, paths, tasks: serializeTasks(tasks) });
+	const worktreeSafetyRequired = hasWorktreeSafetyChange(paths);
+	const canonical = JSON.stringify({
+		schemaVersion: 1,
+		sourceSha,
+		mode,
+		paths,
+		worktreeSafetyRequired,
+		tasks: serializeTasks(tasks),
+	});
 	const digest = new Bun.CryptoHasher("sha256").update(canonical).digest("hex");
 	await Bun.write(path.join(repoRoot, ".ci-dev-affected-plan.json"), canonical);
 	console.log(JSON.stringify(entries));
@@ -320,13 +420,21 @@ async function emitMatrix(): Promise<void> {
 	const githubOutput = process.env.GITHUB_OUTPUT;
 	if (!githubOutput) return;
 	const shards = entries
-		.filter(entry => !entry.nativeBuild)
-		.map(entry => ({ key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest }));
-	const hasNative = entries.some(entry => entry.nativeBuild);
+		.filter((entry) => !entry.nativeBuild)
+		.map((entry) => ({
+			key: entry.key,
+			identity: entry.identity,
+			description: entry.description,
+			native: entry.native,
+			rust: entry.rust,
+			nextest: entry.nextest,
+		}));
+	const hasNative = entries.some((entry) => entry.nativeBuild);
 	const lines = [
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
 		`has_native=${hasNative}`,
+		`worktree_safety_required=${worktreeSafetyRequired}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,
@@ -342,8 +450,8 @@ async function emitMatrix(): Promise<void> {
 // once. The dedicated dev-ci native-build job uses it so the expensive native
 // compile happens a single time per run instead of on each runtime shard.
 async function runNativeBuild(): Promise<void> {
-	const paths = await getChangedPaths();
-	const tasks = (await resolvePlannedTasks(paths)).filter(task => isNativeBuildKey(task.key));
+	const tasks = (await loadCanonicalPlan())?.filter((task) => isNativeBuildKey(task.key));
+	if (!tasks) throw new Error("affected-plan-invalid: native build requires a canonical plan");
 	if (tasks.length === 0) {
 		console.log("ci-dev-affected: no native build tasks in plan; nothing to build.");
 		return;
@@ -363,11 +471,11 @@ async function runNativeBuild(): Promise<void> {
 // error so plan drift between the planner and a shard fails loudly instead of
 // silently skipping validation.
 async function runSingleTask(key: string): Promise<void> {
-	const paths = await getChangedPaths();
-	const tasks = await resolvePlannedTasks(paths);
-	const task = tasks.find(candidate => candidate.key === key);
+	const tasks = await loadCanonicalPlan();
+	if (!tasks) throw new Error("affected-plan-invalid: task execution requires a canonical plan");
+	const task = tasks.find((candidate) => candidate.key === key);
 	if (!task) {
-		const known = tasks.map(candidate => candidate.key).join(", ") || "(none)";
+		const known = tasks.map((candidate) => candidate.key).join(", ") || "(none)";
 		console.error(`ci-dev-affected: task '${key}' is not in the current plan. Planned tasks: ${known}`);
 		process.exit(1);
 		return;
@@ -392,7 +500,7 @@ function printPlan(paths: readonly string[], plannedTasks: readonly Task[]): voi
 	}
 	console.log("Planned tasks:");
 	for (const task of plannedTasks) {
-		const where = task.cwd ? ` (cwd: ${path.relative(repoRoot, task.cwd) || "."})` : "";
+		const where = task.cwd ? ` (cwd: ${canonicalTaskCwd(task.cwd)})` : "";
 		console.log(` - ${task.description}: ${task.command.join(" ")}${where}`);
 	}
 }
@@ -402,7 +510,7 @@ async function getChangedPaths(): Promise<string[]> {
 	if (explicitPaths) {
 		return explicitPaths
 			.split(/[\n,]/)
-			.map(entry => entry.trim())
+			.map((entry) => entry.trim())
 			.filter(Boolean)
 			.sort();
 	}
@@ -498,7 +606,7 @@ async function getWorkspaceDirs(): Promise<string[]> {
 		if (pattern.endsWith("/*")) {
 			const parent = pattern.slice(0, -2);
 			const entries = await Array.fromAsync(new Bun.Glob(`${parent}/*/package.json`).scan({ cwd: repoRoot }));
-			dirs.push(...entries.map(entry => path.dirname(entry)));
+			dirs.push(...entries.map((entry) => path.dirname(entry)));
 		} else if (await Bun.file(path.join(repoRoot, pattern, "package.json")).exists()) {
 			dirs.push(pattern);
 		}
@@ -542,14 +650,23 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	const wrapperChanged = paths.some(isUnscopedWrapperPath);
 	const toolingScriptChanged = paths.some(isToolingScriptPath);
 	const deepInterviewOnly = isDeepInterviewOnly(paths);
-	const needsNativeRuntime = !deepInterviewOnly && (paths.some(isCodingAgentRuntimePath) || wrapperChanged || fullWorkspace);
+	const needsNativeRuntime =
+		!deepInterviewOnly && (paths.some(isCodingAgentRuntimePath) || wrapperChanged || fullWorkspace);
 	const workflowHarnessOnly = paths.length > 0 && paths.every(isWorkflowHarnessPath);
-	const ciOnly = paths.length > 0 && paths.every(changedPath => changedPath.startsWith(".github/"));
+	const ciOnly = paths.length > 0 && paths.every((changedPath) => changedPath.startsWith(".github/"));
 
 	if (deepInterviewOnly) {
 		addNativeBuild(tasks);
-		add(tasks, "deep-interview-definitions", "Deep interview default definition tests", ["bun", "test", "packages/coding-agent/test/default-gjc-definitions.test.ts"]);
-		add(tasks, "deep-interview-runtime", "Deep interview runtime tests", ["bun", "test", "packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts"]);
+		add(tasks, "deep-interview-definitions", "Deep interview default definition tests", [
+			"bun",
+			"test",
+			"packages/coding-agent/test/default-gjc-definitions.test.ts",
+		]);
+		add(tasks, "deep-interview-runtime", "Deep interview runtime tests", [
+			"bun",
+			"test",
+			"packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts",
+		]);
 		return Array.from(tasks.values());
 	}
 
@@ -563,12 +680,18 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 		addWorkspaceTestTasks(tasks, packages);
 	} else if (!ciOnly && !workflowHarnessOnly) {
 		const affectedPackages = expandWithDependents(touchedPackages, packages);
-		if (affectedPackages.some(workspacePackage => workspacePackage.manifest.scripts?.test)) {
+		if (affectedPackages.some((workspacePackage) => workspacePackage.manifest.scripts?.test)) {
 			addNativeBuild(tasks);
 		}
 		for (const workspacePackage of affectedPackages) {
 			if (workspacePackage.manifest.scripts?.check) {
-				add(tasks, `check:${workspacePackage.name}`, `Check ${workspacePackage.name}`, packageScriptCommand("check"), resolvePackageCwd(workspacePackage.dir));
+				add(
+					tasks,
+					`check:${workspacePackage.name}`,
+					`Check ${workspacePackage.name}`,
+					packageScriptCommand("check"),
+					resolvePackageCwd(workspacePackage.dir),
+				);
 			}
 			if (workspacePackage.manifest.scripts?.test) {
 				addPackageTestTasks(tasks, workspacePackage);
@@ -580,13 +703,20 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "ci:check:full"]);
 	}
 	if (wrapperChanged) {
-		add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
+		add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", [
+			"bun",
+			"packages/gajae-code/bin/gjc.js",
+			"--version",
+		]);
 	}
 	if (publishChanged) {
 		addReleasePublishTasks(tasks);
 	}
 	if (paths.some(isBridgeClientSdkPackageSmokePath)) {
-		add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
+		add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", [
+			"bun",
+			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
+		]);
 	}
 
 	if (rustChanged) {
@@ -600,8 +730,16 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 		add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 	}
 	if (paths.some(isWorkflowOrScriptPath)) {
-		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
-		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts"]);
+		add(tasks, "affected-dry-run", "Affected CI selector self-check", [
+			"bun",
+			"scripts/ci-dev-affected.ts",
+			"--dry-run",
+		]);
+		add(tasks, "affected-selftest", "Affected CI selector unit tests", [
+			"bun",
+			"test",
+			"scripts/ci-dev-affected.test.ts",
+		]);
 		if (paths.some(isWorkflowPath)) {
 			add(tasks, "workflow-yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
 		}
@@ -622,9 +760,13 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 // Native builds are added once (native-linux-x64) only when a planned task needs
 // the addon at runtime; the dedicated job restores it from cache when no native
 // source changed, so PRs never rebuild native per shard.
-export function planTargetedTasks(paths: readonly string[], packages: readonly WorkspacePackage[], testFiles: readonly string[]): Task[] {
+export function planTargetedTasks(
+	paths: readonly string[],
+	packages: readonly WorkspacePackage[],
+	testFiles: readonly string[],
+): Task[] {
 	const tasks = new Map<string, Task>();
-	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath));
+	const relevant = paths.filter((changedPath) => !isDocOrChangelogPath(changedPath));
 	if (relevant.length === 0) {
 		return [];
 	}
@@ -662,11 +804,18 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		if (isReleasePublishPath(changedPath)) {
 			addReleasePublishTasks(tasks);
 			if (isUnscopedWrapperPath(changedPath)) {
-				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
+				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", [
+					"bun",
+					"packages/gajae-code/bin/gjc.js",
+					"--version",
+				]);
 			}
 		}
 		if (isBridgeClientSdkPackageSmokePath(changedPath)) {
-			add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
+			add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", [
+				"bun",
+				"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
+			]);
 			const bridgeClientOwner = owningPackage(changedPath, packages);
 			if (bridgeClientOwner?.manifest.scripts?.check) {
 				add(
@@ -678,7 +827,6 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 				);
 			}
 		}
-
 
 		const mappedTests = mappedTestsFor(changedPath, packages, testFiles);
 		for (const testFile of mappedTests) {
@@ -698,13 +846,23 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		const owner = owningPackage(changedPath, packages);
 		if (owner) {
 			if (owner.manifest.scripts?.check) {
-				add(tasks, `check:${owner.name}`, `Check ${owner.name}`, packageScriptCommand("check"), resolvePackageCwd(owner.dir));
+				add(
+					tasks,
+					`check:${owner.name}`,
+					`Check ${owner.name}`,
+					packageScriptCommand("check"),
+					resolvePackageCwd(owner.dir),
+				);
 			}
 			if (isCodingAgentRuntimePath(changedPath)) {
 				add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
 			}
 			if (isUnscopedWrapperPath(changedPath)) {
-				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
+				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", [
+					"bun",
+					"packages/gajae-code/bin/gjc.js",
+					"--version",
+				]);
 			}
 			continue;
 		}
@@ -746,7 +904,13 @@ function addWorkspaceTestTasks(tasks: Map<string, Task>, packages: readonly Work
 
 function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: WorkspacePackage): void {
 	if (workspacePackage.name !== "@gajae-code/coding-agent") {
-		add(tasks, `test:${workspacePackage.name}`, `Test ${workspacePackage.name}`, packageScriptCommand("test"), resolvePackageCwd(workspacePackage.dir));
+		add(
+			tasks,
+			`test:${workspacePackage.name}`,
+			`Test ${workspacePackage.name}`,
+			packageScriptCommand("test"),
+			resolvePackageCwd(workspacePackage.dir),
+		);
 		return;
 	}
 
@@ -770,7 +934,11 @@ function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number): void 
 // which live within the changed file's owning package (or its directory for
 // root-level files). Returns [] when there is no unique direct mapping, so basename
 // collisions fall back to package-level checks instead of selecting arbitrary tests.
-function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage[], testFiles: readonly string[]): string[] {
+function mappedTestsFor(
+	changedPath: string,
+	packages: readonly WorkspacePackage[],
+	testFiles: readonly string[],
+): string[] {
 	if (isTestFilePath(changedPath)) {
 		return testFiles.includes(changedPath) ? [changedPath] : [];
 	}
@@ -782,7 +950,7 @@ function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage
 	const owner = owningPackage(changedPath, packages);
 	const scopePrefix = owner ? `${owner.dir}/` : `${path.posix.dirname(changedPath)}/`;
 	const matches = testFiles.filter(
-		testFile => wanted.has(path.posix.basename(testFile)) && testFile.startsWith(scopePrefix),
+		(testFile) => wanted.has(path.posix.basename(testFile)) && testFile.startsWith(scopePrefix),
 	);
 	return matches.length === 1 ? matches : [];
 }
@@ -795,13 +963,15 @@ function behavioralTestsFor(changedPath: string): readonly string[] {
 }
 
 function isCodingAgentShardOneCoveragePath(changedPath: string): boolean {
-	return CODING_AGENT_SHARD_ONE_COVERAGE_PATHS.some(coveragePath =>
+	return CODING_AGENT_SHARD_ONE_COVERAGE_PATHS.some((coveragePath) =>
 		coveragePath.endsWith("/") ? changedPath.startsWith(coveragePath) : changedPath === coveragePath,
 	);
 }
 
 function owningPackage(changedPath: string, packages: readonly WorkspacePackage[]): WorkspacePackage | undefined {
-	return packages.find(workspacePackage => changedPath === workspacePackage.dir || changedPath.startsWith(`${workspacePackage.dir}/`));
+	return packages.find(
+		(workspacePackage) => changedPath === workspacePackage.dir || changedPath.startsWith(`${workspacePackage.dir}/`),
+	);
 }
 
 // Ensure a single native build task is present whenever any planned task loads
@@ -823,20 +993,32 @@ function isTestFilePath(changedPath: string): boolean {
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
-	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/check-workflow-yaml.ts";
+	return (
+		changedPath === "scripts/ci-dev-affected.ts" ||
+		changedPath === "scripts/ci-dev-affected.test.ts" ||
+		changedPath === "scripts/check-workflow-yaml.ts"
+	);
 }
-
 
 function isCodeIshPath(changedPath: string): boolean {
 	return /\.(tsx?|jsx?|mts|cts|mjs|cjs|json|jsonc|toml|ya?ml|sh)$/.test(changedPath) || changedPath === "bun.lock";
 }
 
-
 function addNativeBuild(tasks: Map<string, Task>): void {
-	add(tasks, "native-linux-x64", "Build linux x64 native addons", ["bash", "-lc", 'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts']);
+	add(tasks, "native-linux-x64", "Build linux x64 native addons", [
+		"bash",
+		"-lc",
+		'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts',
+	]);
 }
 
-function add(tasks: Map<string, Task>, key: string, description: string, command: readonly string[], cwd?: string): void {
+function add(
+	tasks: Map<string, Task>,
+	key: string,
+	description: string,
+	command: readonly string[],
+	cwd?: string,
+): void {
 	if (!tasks.has(key)) {
 		tasks.set(key, { key, description, command, cwd });
 	}
@@ -853,7 +1035,6 @@ export function packageScriptCommand(script: string): readonly string[] {
 	return ["bun", "run", script];
 }
 
-
 // Resolve a workspace-relative package directory to an absolute path used as
 // the spawned task's process cwd.
 export function resolvePackageCwd(dir: string): string {
@@ -861,13 +1042,20 @@ export function resolvePackageCwd(dir: string): string {
 }
 
 function findTouchedPackages(paths: readonly string[], packages: readonly WorkspacePackage[]): WorkspacePackage[] {
-	return packages.filter(workspacePackage => paths.some(changedPath => changedPath === workspacePackage.dir || changedPath.startsWith(`${workspacePackage.dir}/`)));
+	return packages.filter((workspacePackage) =>
+		paths.some(
+			(changedPath) => changedPath === workspacePackage.dir || changedPath.startsWith(`${workspacePackage.dir}/`),
+		),
+	);
 }
 
-export function expandWithDependents(touched: readonly WorkspacePackage[], packages: readonly WorkspacePackage[]): WorkspacePackage[] {
-	const workspaceByName = new Map(packages.map(workspacePackage => [workspacePackage.name, workspacePackage]));
-	const selected = new Map(touched.map(workspacePackage => [workspacePackage.name, workspacePackage]));
-	const queue = [...touched.map(workspacePackage => workspacePackage.name)];
+export function expandWithDependents(
+	touched: readonly WorkspacePackage[],
+	packages: readonly WorkspacePackage[],
+): WorkspacePackage[] {
+	const workspaceByName = new Map(packages.map((workspacePackage) => [workspacePackage.name, workspacePackage]));
+	const selected = new Map(touched.map((workspacePackage) => [workspacePackage.name, workspacePackage]));
+	const queue = [...touched.map((workspacePackage) => workspacePackage.name)];
 	while (queue.length > 0) {
 		const currentName = queue.shift();
 		if (!currentName) continue;
@@ -882,7 +1070,11 @@ export function expandWithDependents(touched: readonly WorkspacePackage[], packa
 	return Array.from(selected.values()).sort((left, right) => left.dir.localeCompare(right.dir));
 }
 
-function dependsOnWorkspace(manifest: PackageManifest, dependencyName: string, workspaceByName: ReadonlyMap<string, WorkspacePackage>): boolean {
+function dependsOnWorkspace(
+	manifest: PackageManifest,
+	dependencyName: string,
+	workspaceByName: ReadonlyMap<string, WorkspacePackage>,
+): boolean {
 	for (const scope of PACKAGE_SCOPES) {
 		const dependencies = manifest[scope];
 		if (!dependencies) continue;
@@ -908,11 +1100,12 @@ function isFullWorkspacePath(changedPath: string): boolean {
 function isRootPackageReleaseHarnessOnly(paths: readonly string[]): boolean {
 	return (
 		paths.includes("package.json") &&
-		paths.every(changedPath =>
-			changedPath === "package.json" ||
-			isReleasePublishPath(changedPath) ||
-			isReleaseHarnessScriptPath(changedPath) ||
-			isUnscopedWrapperPath(changedPath),
+		paths.every(
+			(changedPath) =>
+				changedPath === "package.json" ||
+				isReleasePublishPath(changedPath) ||
+				isReleaseHarnessScriptPath(changedPath) ||
+				isUnscopedWrapperPath(changedPath),
 		)
 	);
 }
@@ -929,32 +1122,51 @@ function isReleaseHarnessScriptPath(changedPath: string): boolean {
 
 function addReleasePublishTasks(tasks: Map<string, Task>): void {
 	add(tasks, "release-publish-contract", "Release publish contract tests", ["bun", "run", "test:release"]);
-	add(tasks, "release-publish-dry-run", "Release publish dry-run", ["bun", "scripts/ci-release-publish.ts", "--dry-run"]);
+	add(tasks, "release-publish-dry-run", "Release publish dry-run", [
+		"bun",
+		"scripts/ci-release-publish.ts",
+		"--dry-run",
+	]);
 	addTestFileTask(tasks, "scripts/release-evidence.test.ts");
 }
-
 
 function isRustPath(changedPath: string): boolean {
 	const fileName = path.basename(changedPath);
 	return (
 		changedPath.startsWith("crates/") ||
 		changedPath.startsWith(".cargo/") ||
-		["Cargo.toml", "Cargo.lock", "rust-toolchain", "rust-toolchain.toml", "rustfmt.toml", ".rustfmt.toml", "clippy.toml", ".clippy.toml"].includes(fileName)
+		[
+			"Cargo.toml",
+			"Cargo.lock",
+			"rust-toolchain",
+			"rust-toolchain.toml",
+			"rustfmt.toml",
+			".rustfmt.toml",
+			"clippy.toml",
+			".clippy.toml",
+		].includes(fileName)
 	);
 }
 
 function isInstallPath(changedPath: string): boolean {
-	return changedPath.startsWith("scripts/install") || changedPath === "Dockerfile" || changedPath === "Dockerfile.dockerignore";
+	return (
+		changedPath.startsWith("scripts/install") ||
+		changedPath === "Dockerfile" ||
+		changedPath === "Dockerfile.dockerignore"
+	);
 }
 
 function isCodingAgentRuntimePath(changedPath: string): boolean {
-	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
+	return (
+		changedPath.startsWith("packages/coding-agent/") ||
+		changedPath.startsWith("packages/agent/") ||
+		changedPath.startsWith("packages/ai/")
+	);
 }
 
 function isBridgeClientSdkPackageSmokePath(changedPath: string): boolean {
 	return (
-		changedPath.startsWith("packages/bridge-client/") ||
-		changedPath.startsWith("packages/coding-agent/src/sdk/client/")
+		changedPath.startsWith("packages/bridge-client/") || changedPath.startsWith("packages/coding-agent/src/sdk/client/")
 	);
 }
 
@@ -965,7 +1177,7 @@ function isDeepInterviewOnly(paths: readonly string[]): boolean {
 		"packages/coding-agent/test/default-gjc-definitions.test.ts",
 		"packages/coding-agent/test/gjc-runtime/deep-interview-runtime.test.ts",
 	]);
-	return paths.length > 0 && paths.every(changedPath => allowed.has(changedPath));
+	return paths.length > 0 && paths.every((changedPath) => allowed.has(changedPath));
 }
 
 function isWorkflowOrScriptPath(changedPath: string): boolean {
@@ -975,7 +1187,6 @@ function isWorkflowOrScriptPath(changedPath: string): boolean {
 function isWorkflowPath(changedPath: string): boolean {
 	return changedPath.startsWith(".github/workflows/");
 }
-
 
 const BUILD_INVENTORY_PATH = path.join(repoRoot, "scripts/ci-dev-affected-build-inventory.json");
 const NATIVE_PRODUCER: Task = {
@@ -989,9 +1200,19 @@ const NATIVE_PRODUCER: Task = {
 };
 
 export function normalizeChangedPaths(paths: readonly string[]): string[] {
-	const normalized = paths.map(entry => entry.replaceAll("\\", "/").trim()).map(entry => entry.replace(/^\.\//, ""));
+	const normalized = paths
+		.map((entry) => entry.replaceAll("\\", "/").trim())
+		.map((entry) => entry.replace(/^\.\//, ""));
 	for (const entry of normalized) {
-		if (!entry || entry.startsWith("/") || /^[A-Za-z]:\//.test(entry) || entry === ".." || entry.startsWith("../") || entry.includes("/../") || entry.split("/").some(part => part === "." || part === "")) {
+		if (
+			!entry ||
+			entry.startsWith("/") ||
+			/^[A-Za-z]:\//.test(entry) ||
+			entry === ".." ||
+			entry.startsWith("../") ||
+			entry.includes("/../") ||
+			entry.split("/").some((part) => part === "." || part === "")
+		) {
 			throw new Error(`affected-path-invalid: unsafe changed path '${entry}'`);
 		}
 	}
@@ -1003,9 +1224,17 @@ export async function loadBuildInventory(inventoryPath = BUILD_INVENTORY_PATH): 
 	try {
 		parsed = JSON.parse(await Bun.file(inventoryPath).text());
 	} catch (error) {
-		throw new Error(`inventory-invalid: cannot read build inventory (${error instanceof Error ? error.message : String(error)})`);
+		throw new Error(
+			`inventory-invalid: cannot read build inventory (${error instanceof Error ? error.message : String(error)})`,
+		);
 	}
-	if (!isRecord(parsed) || parsed.schemaVersion !== 1 || !Array.isArray(parsed.typescript) || !Array.isArray(parsed.cargo) || !isRecord(parsed.emergency)) {
+	if (
+		!isRecord(parsed) ||
+		parsed.schemaVersion !== 1 ||
+		!Array.isArray(parsed.typescript) ||
+		!Array.isArray(parsed.cargo) ||
+		!isRecord(parsed.emergency)
+	) {
 		throw new Error("inventory-invalid: malformed build inventory");
 	}
 	assertExactKeys(parsed, ["schemaVersion", "typescript", "cargo", "emergency"], "build inventory");
@@ -1022,125 +1251,291 @@ export async function loadBuildInventory(inventoryPath = BUILD_INVENTORY_PATH): 
 }
 
 function parseTsInventoryUnit(value: unknown): TsInventoryUnit {
-	if (!isRecord(value) || !isString(value.id) || !isString(value.name) || !isString(value.dir) || typeof value.nativeConsumer !== "boolean" || typeof value.nativeProducer !== "boolean") throw new Error("inventory-invalid: malformed TypeScript unit");
+	if (
+		!isRecord(value) ||
+		!isString(value.id) ||
+		!isString(value.name) ||
+		!isString(value.dir) ||
+		typeof value.nativeConsumer !== "boolean" ||
+		typeof value.nativeProducer !== "boolean"
+	)
+		throw new Error("inventory-invalid: malformed TypeScript unit");
 	assertExactKeys(value, ["id", "name", "dir", "nativeConsumer", "nativeProducer"], "TypeScript unit");
-	return { id: value.id, name: value.name, dir: normalizeInventoryPath(value.dir), nativeConsumer: value.nativeConsumer, nativeProducer: value.nativeProducer };
+	return {
+		id: value.id,
+		name: value.name,
+		dir: normalizeInventoryPath(value.dir),
+		nativeConsumer: value.nativeConsumer,
+		nativeProducer: value.nativeProducer,
+	};
 }
 function parseCargoInventoryUnit(value: unknown): CargoInventoryUnit {
-	if (!isRecord(value) || !isString(value.id) || !isString(value.name) || !isString(value.manifestPath) || value.supported !== true || typeof value.nativeAddonSource !== "boolean") throw new Error("inventory-invalid: malformed Cargo unit");
+	if (
+		!isRecord(value) ||
+		!isString(value.id) ||
+		!isString(value.name) ||
+		!isString(value.manifestPath) ||
+		value.supported !== true ||
+		typeof value.nativeAddonSource !== "boolean"
+	)
+		throw new Error("inventory-invalid: malformed Cargo unit");
 	assertExactKeys(value, ["id", "name", "manifestPath", "supported", "nativeAddonSource"], "Cargo unit");
-	return { id: value.id, name: value.name, manifestPath: normalizeInventoryPath(value.manifestPath), supported: true, nativeAddonSource: value.nativeAddonSource };
+	return {
+		id: value.id,
+		name: value.name,
+		manifestPath: normalizeInventoryPath(value.manifestPath),
+		supported: true,
+		nativeAddonSource: value.nativeAddonSource,
+	};
 }
 function parseEmergency(value: Record<string, unknown>): BuildInventory["emergency"] {
-	if (Object.keys(value).some(key => key !== "cargoWorkspaceBuild")) throw new Error("inventory-invalid: unexpected emergency field");
+	if (Object.keys(value).some((key) => key !== "cargoWorkspaceBuild"))
+		throw new Error("inventory-invalid: unexpected emergency field");
 	const emergency = value.cargoWorkspaceBuild;
 	if (emergency === undefined) return {};
-	if (!isRecord(emergency) || emergency.id !== "cargo-workspace-emergency" || emergency.key !== "cargo-build:emergency:workspace" || emergency.identity !== "emergency:cargo-workspace:root" || !Array.isArray(emergency.command) || emergency.command.join("\0") !== "cargo\0build\0--workspace" || emergency.cwd !== "." || !isRecord(emergency.capabilities) || emergency.allowedReasons === undefined || !Array.isArray(emergency.allowedReasons) || emergency.allowedReasons.join("\0") !== "cargo-name-ambiguity") throw new Error("inventory-invalid: malformed cargo workspace emergency");
-	assertExactKeys(emergency, ["id", "key", "identity", "command", "cwd", "capabilities", "allowedReasons"], "cargo workspace emergency");
+	if (
+		!isRecord(emergency) ||
+		emergency.id !== "cargo-workspace-emergency" ||
+		emergency.key !== "cargo-build:emergency:workspace" ||
+		emergency.identity !== "emergency:cargo-workspace:root" ||
+		!Array.isArray(emergency.command) ||
+		emergency.command.join("\0") !== "cargo\0build\0--workspace" ||
+		emergency.cwd !== "." ||
+		!isRecord(emergency.capabilities) ||
+		emergency.allowedReasons === undefined ||
+		!Array.isArray(emergency.allowedReasons) ||
+		emergency.allowedReasons.join("\0") !== "cargo-name-ambiguity"
+	)
+		throw new Error("inventory-invalid: malformed cargo workspace emergency");
+	assertExactKeys(
+		emergency,
+		["id", "key", "identity", "command", "cwd", "capabilities", "allowedReasons"],
+		"cargo workspace emergency",
+	);
 	const capabilities = emergency.capabilities;
-	if (capabilities.rust !== true || capabilities.nextest !== false || capabilities.nativeConsumer !== false || capabilities.nativeProducer !== false) throw new Error("inventory-invalid: malformed cargo workspace emergency capabilities");
-	assertExactKeys(capabilities, ["rust", "nextest", "nativeConsumer", "nativeProducer"], "cargo workspace emergency capabilities");
-	return { cargoWorkspaceBuild: { id: "cargo-workspace-emergency", key: "cargo-build:emergency:workspace", identity: "emergency:cargo-workspace:root", command: ["cargo", "build", "--workspace"], cwd: ".", capabilities: { rust: true, nextest: false, nativeConsumer: false, nativeProducer: false }, allowedReasons: ["cargo-name-ambiguity"] } };
+	if (
+		capabilities.rust !== true ||
+		capabilities.nextest !== false ||
+		capabilities.nativeConsumer !== false ||
+		capabilities.nativeProducer !== false
+	)
+		throw new Error("inventory-invalid: malformed cargo workspace emergency capabilities");
+	assertExactKeys(
+		capabilities,
+		["rust", "nextest", "nativeConsumer", "nativeProducer"],
+		"cargo workspace emergency capabilities",
+	);
+	return {
+		cargoWorkspaceBuild: {
+			id: "cargo-workspace-emergency",
+			key: "cargo-build:emergency:workspace",
+			identity: "emergency:cargo-workspace:root",
+			command: ["cargo", "build", "--workspace"],
+			cwd: ".",
+			capabilities: { rust: true, nextest: false, nativeConsumer: false, nativeProducer: false },
+			allowedReasons: ["cargo-name-ambiguity"],
+		},
+	};
 }
 function normalizeInventoryPath(value: string): string {
 	const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "");
-	if (!normalized || normalized.startsWith("/") || normalized.includes("../") || normalized.split("/").some(part => !part || part === ".")) throw new Error("inventory-invalid: unsafe inventory path");
+	if (
+		!normalized ||
+		normalized.startsWith("/") ||
+		normalized.includes("../") ||
+		normalized.split("/").some((part) => !part || part === ".")
+	)
+		throw new Error("inventory-invalid: unsafe inventory path");
 	return normalized;
 }
 function assertInventory(inventory: BuildInventory): void {
-	const unique = (values: readonly string[], label: string) => { if (new Set(values).size !== values.length) throw new Error(`inventory-invalid: duplicate ${label}`); };
-	unique(inventory.typescript.map(unit => unit.id), "TypeScript id");
-	unique(inventory.typescript.map(unit => unit.name), "TypeScript name");
-	unique(inventory.typescript.map(unit => unit.dir), "TypeScript directory");
-	unique(inventory.cargo.map(unit => unit.id), "Cargo id");
-	unique(inventory.cargo.map(unit => unit.manifestPath), "Cargo manifest path");
-	const nativeSources = inventory.cargo.filter(unit => unit.nativeAddonSource);
-	if (nativeSources.length !== 1 || nativeSources[0]?.id !== "pi-natives") throw new Error("inventory-invalid: pi-natives must be the sole native addon source");
+	const unique = (values: readonly string[], label: string) => {
+		if (new Set(values).size !== values.length) throw new Error(`inventory-invalid: duplicate ${label}`);
+	};
+	unique(
+		inventory.typescript.map((unit) => unit.id),
+		"TypeScript id",
+	);
+	unique(
+		inventory.typescript.map((unit) => unit.name),
+		"TypeScript name",
+	);
+	unique(
+		inventory.typescript.map((unit) => unit.dir),
+		"TypeScript directory",
+	);
+	unique(
+		inventory.cargo.map((unit) => unit.id),
+		"Cargo id",
+	);
+	unique(
+		inventory.cargo.map((unit) => unit.manifestPath),
+		"Cargo manifest path",
+	);
+	const nativeSources = inventory.cargo.filter((unit) => unit.nativeAddonSource);
+	if (nativeSources.length !== 1 || nativeSources[0]?.id !== "pi-natives")
+		throw new Error("inventory-invalid: pi-natives must be the sole native addon source");
 	const counts = new Map<string, number>();
 	for (const unit of inventory.cargo) counts.set(unit.name, (counts.get(unit.name) ?? 0) + 1);
-	if (Array.from(counts.values()).some(count => count > 1) && !inventory.emergency.cargoWorkspaceBuild) throw new Error("inventory-invalid: duplicate Cargo names require workspace emergency");
+	if (Array.from(counts.values()).some((count) => count > 1) && !inventory.emergency.cargoWorkspaceBuild)
+		throw new Error("inventory-invalid: duplicate Cargo names require workspace emergency");
 }
 
 async function assertTypeScriptInventoryLive(inventory: BuildInventory): Promise<void> {
 	const workspaces = await getWorkspacePackages();
-	const buildable = workspaces.filter(workspacePackage => workspacePackage.name !== "@gajae-code/natives" && workspacePackage.manifest.scripts?.build);
-	const classified = inventory.typescript.filter(unit => !unit.nativeProducer);
-	const buildableNames = new Set(buildable.map(workspacePackage => workspacePackage.name));
-	const classifiedNames = new Set(classified.map(unit => unit.name));
-	if (buildableNames.size !== classifiedNames.size || Array.from(buildableNames).some(name => !classifiedNames.has(name))) {
+	const buildable = workspaces.filter(
+		(workspacePackage) => workspacePackage.name !== "@gajae-code/natives" && workspacePackage.manifest.scripts?.build,
+	);
+	const classified = inventory.typescript.filter((unit) => !unit.nativeProducer);
+	const buildableNames = new Set(buildable.map((workspacePackage) => workspacePackage.name));
+	const classifiedNames = new Set(classified.map((unit) => unit.name));
+	if (
+		buildableNames.size !== classifiedNames.size ||
+		Array.from(buildableNames).some((name) => !classifiedNames.has(name))
+	) {
 		throw new Error("inventory-drift: TypeScript build-capable workspaces are not fully classified");
 	}
 	for (const unit of inventory.typescript) {
 		const manifest = await readPackageManifest(path.join(repoRoot, unit.dir, "package.json"));
-		if (!manifest || manifest.name !== unit.name || (!unit.nativeProducer && !manifest.scripts?.build)) throw new Error(`inventory-drift: TypeScript build unit ${unit.id} does not match its package manifest`);
+		if (!manifest || manifest.name !== unit.name || (!unit.nativeProducer && !manifest.scripts?.build))
+			throw new Error(`inventory-drift: TypeScript build unit ${unit.id} does not match its package manifest`);
 	}
 }
 
-async function appendBuildTasks(legacy: readonly Task[], paths: readonly string[], packages: readonly WorkspacePackage[], inventory: BuildInventory): Promise<Task[]> {
-	const withoutNative = legacy.filter(task => !isNativeBuildKey(task.key));
-	const buildPaths = paths.filter(changedPath => !isDocOrChangelogPath(changedPath));
+async function appendBuildTasks(
+	legacy: readonly Task[],
+	paths: readonly string[],
+	packages: readonly WorkspacePackage[],
+	inventory: BuildInventory,
+): Promise<Task[]> {
+	const withoutNative = legacy.filter((task) => !isNativeBuildKey(task.key));
+	const buildPaths = paths.filter((changedPath) => !isDocOrChangelogPath(changedPath));
 	const selectedTs = selectTsBuildUnits(buildPaths, packages, inventory);
 	const cargo = await selectCargoBuildTasks(buildPaths, inventory, packages);
-	const legacyNeedsProducer = legacy.some(task => isNativeBuildKey(task.key)) || legacy.some(task => taskNeedsNative(task.key));
+	const legacyNeedsProducer =
+		legacy.some((task) => isNativeBuildKey(task.key)) || legacy.some((task) => taskNeedsNative(task.key));
 	const cargoNeedsProducer = inventory.cargo
-		.filter(unit => unit.nativeAddonSource)
-		.some(unit => cargo.some(task => task.key === inventory.emergency.cargoWorkspaceBuild?.key || task.identity === stableIdentity("cargo", unit.id, unit.manifestPath)));
-	const needsProducer = legacyNeedsProducer || selectedTs.some(unit => unit.nativeConsumer || unit.nativeProducer) || cargoNeedsProducer;
-	const tsTasks = selectedTs.map(unit => ({ key: `ts-build:${stableIdentity("ts", unit.id, unit.dir)}`, identity: stableIdentity("ts", unit.id, unit.dir), description: `Build ${unit.name}`, command: ["bun", "run", "build"] as const, cwd: resolvePackageCwd(unit.dir), capabilities: { rust: false, nextest: false, nativeConsumer: unit.nativeConsumer, nativeProducer: unit.nativeProducer }, phase: "ts-build" as const }));
+		.filter((unit) => unit.nativeAddonSource)
+		.some((unit) =>
+			cargo.some(
+				(task) =>
+					task.key === inventory.emergency.cargoWorkspaceBuild?.key ||
+					task.identity === stableIdentity("cargo", unit.id, unit.manifestPath),
+			),
+		);
+	const needsProducer =
+		legacyNeedsProducer || selectedTs.some((unit) => unit.nativeConsumer || unit.nativeProducer) || cargoNeedsProducer;
+	const tsTasks = selectedTs.map((unit) => ({
+		key: `ts-build:${stableIdentity("ts", unit.id, unit.dir)}`,
+		identity: stableIdentity("ts", unit.id, unit.dir),
+		description: `Build ${unit.name}`,
+		command: ["bun", "run", "build"] as const,
+		cwd: resolvePackageCwd(unit.dir),
+		capabilities: {
+			rust: false,
+			nextest: false,
+			nativeConsumer: unit.nativeConsumer,
+			nativeProducer: unit.nativeProducer,
+		},
+		phase: "ts-build" as const,
+	}));
 	return [...withoutNative, ...(needsProducer ? [NATIVE_PRODUCER] : []), ...tsTasks, ...cargo];
 }
-function selectTsBuildUnits(paths: readonly string[], packages: readonly WorkspacePackage[], inventory: BuildInventory): TsInventoryUnit[] {
+function selectTsBuildUnits(
+	paths: readonly string[],
+	packages: readonly WorkspacePackage[],
+	inventory: BuildInventory,
+): TsInventoryUnit[] {
 	const selected = allBuildFallback(paths, packages)
 		? packages
 		: expandWithDependents(findTouchedPackages(paths, packages), packages);
-	const names = new Set(selected.map(unit => unit.name));
-	return inventory.typescript.filter(unit => names.has(unit.name)).sort(compareTsUnits);
+	const names = new Set(selected.map((unit) => unit.name));
+	return inventory.typescript.filter((unit) => names.has(unit.name)).sort(compareTsUnits);
 }
 function allBuildFallback(paths: readonly string[], packages: readonly WorkspacePackage[]): boolean {
-	return paths.some(changedPath =>
-		isFullWorkspacePath(changedPath) ||
-		changedPath === "bun.lock" ||
-		changedPath.startsWith("tsconfig") ||
-		isWorkflowHarnessPath(changedPath) ||
-		changedPath === "scripts/ci-dev-affected-build-inventory.json" ||
-		(!isDocOrChangelogPath(changedPath) && !owningPackage(changedPath, packages)),
+	return paths.some(
+		(changedPath) =>
+			isFullWorkspacePath(changedPath) ||
+			changedPath === "bun.lock" ||
+			changedPath.startsWith("tsconfig") ||
+			isWorkflowHarnessPath(changedPath) ||
+			changedPath === "scripts/ci-dev-affected-build-inventory.json" ||
+			(!isDocOrChangelogPath(changedPath) && !owningPackage(changedPath, packages)),
 	);
 }
-function compareTsUnits(left: TsInventoryUnit, right: TsInventoryUnit): number { return left.dir.localeCompare(right.dir) || left.name.localeCompare(right.name) || left.id.localeCompare(right.id); }
-function stableIdentity(domain: string, id: string, location: string): string { return `${domain}:${toBase64Url(id)}:${toBase64Url(location)}`; }
-function toBase64Url(value: string): string { return Buffer.from(value).toString("base64url"); }
+function compareTsUnits(left: TsInventoryUnit, right: TsInventoryUnit): number {
+	return left.dir.localeCompare(right.dir) || left.name.localeCompare(right.name) || left.id.localeCompare(right.id);
+}
+function stableIdentity(domain: string, id: string, location: string): string {
+	return `${domain}:${toBase64Url(id)}:${toBase64Url(location)}`;
+}
+function toBase64Url(value: string): string {
+	return Buffer.from(value).toString("base64url");
+}
 
-async function selectCargoBuildTasks(paths: readonly string[], inventory: BuildInventory, packages: readonly WorkspacePackage[]): Promise<Task[]> {
-	const supported = inventory.cargo.filter(unit => unit.supported);
-	const fallbackAll = paths.some(changedPath =>
-		changedPath === "Cargo.toml" ||
-		changedPath === "Cargo.lock" ||
-		changedPath === "rust-toolchain.toml" ||
-		changedPath.startsWith(".cargo/") ||
-		isFullWorkspacePath(changedPath) ||
-		isWorkflowHarnessPath(changedPath) ||
-		changedPath === "scripts/ci-dev-affected-build-inventory.json" ||
-		(!isDocOrChangelogPath(changedPath) && !changedPath.startsWith("crates/") && !owningPackage(changedPath, packages)),
+async function selectCargoBuildTasks(
+	paths: readonly string[],
+	inventory: BuildInventory,
+	packages: readonly WorkspacePackage[],
+): Promise<Task[]> {
+	const supported = inventory.cargo.filter((unit) => unit.supported);
+	const fallbackAll = paths.some(
+		(changedPath) =>
+			changedPath === "Cargo.toml" ||
+			changedPath === "Cargo.lock" ||
+			changedPath === "rust-toolchain.toml" ||
+			changedPath.startsWith(".cargo/") ||
+			isFullWorkspacePath(changedPath) ||
+			isWorkflowHarnessPath(changedPath) ||
+			changedPath === "scripts/ci-dev-affected-build-inventory.json" ||
+			(!isDocOrChangelogPath(changedPath) &&
+				!changedPath.startsWith("crates/") &&
+				!owningPackage(changedPath, packages)),
 	);
 	if (!fallbackAll && !paths.some(isRustPath)) return [];
 	const cargoChanged = paths.filter(isRustPath);
-	const fallback = fallbackAll || cargoChanged.some(changed => !supported.some(unit => changed === unit.manifestPath || changed.startsWith(`${path.posix.dirname(unit.manifestPath)}/`)));
-	let selected = fallback ? supported : supported.filter(unit => cargoChanged.some(changed => changed === unit.manifestPath || changed.startsWith(`${path.posix.dirname(unit.manifestPath)}/`)));
+	const fallback =
+		fallbackAll ||
+		cargoChanged.some(
+			(changed) =>
+				!supported.some(
+					(unit) => changed === unit.manifestPath || changed.startsWith(`${path.posix.dirname(unit.manifestPath)}/`),
+				),
+		);
+	let selected = fallback
+		? supported
+		: supported.filter((unit) =>
+				cargoChanged.some(
+					(changed) => changed === unit.manifestPath || changed.startsWith(`${path.posix.dirname(unit.manifestPath)}/`),
+				),
+			);
 	if (!fallback) selected = await expandCargoDependents(selected, supported, true);
 	if (requiresCargoWorkspaceEmergency(selected, supported)) {
 		const emergency = inventory.emergency.cargoWorkspaceBuild;
 		if (!emergency) throw new Error("inventory-invalid: duplicate selected Cargo name has no emergency");
-		return [{
-			key: emergency.key,
-			identity: emergency.identity,
-			description: "Build Cargo workspace",
-			command: emergency.command,
-			cwd: repoRoot,
-			capabilities: emergency.capabilities,
-			phase: "cargo-build",
-		}];
+		return [
+			{
+				key: emergency.key,
+				identity: emergency.identity,
+				description: "Build Cargo workspace",
+				command: emergency.command,
+				cwd: repoRoot,
+				capabilities: emergency.capabilities,
+				phase: "cargo-build",
+			},
+		];
 	}
-	return selected.sort((left, right) => left.manifestPath.localeCompare(right.manifestPath) || left.id.localeCompare(right.id)).map(unit => ({ key: `cargo-build:${stableIdentity("cargo", unit.id, unit.manifestPath)}`, identity: stableIdentity("cargo", unit.id, unit.manifestPath), description: `Build Cargo crate ${unit.name}`, command: ["cargo", "build", "--package", unit.name] as const, cwd: repoRoot, capabilities: { rust: true, nextest: false, nativeConsumer: false, nativeProducer: false }, phase: "cargo-build" as const }));
+	return selected
+		.sort((left, right) => left.manifestPath.localeCompare(right.manifestPath) || left.id.localeCompare(right.id))
+		.map((unit) => ({
+			key: `cargo-build:${stableIdentity("cargo", unit.id, unit.manifestPath)}`,
+			identity: stableIdentity("cargo", unit.id, unit.manifestPath),
+			description: `Build Cargo crate ${unit.name}`,
+			command: ["cargo", "build", "--package", unit.name] as const,
+			cwd: repoRoot,
+			capabilities: { rust: true, nextest: false, nativeConsumer: false, nativeProducer: false },
+			phase: "cargo-build" as const,
+		}));
 }
 
 export function requiresCargoWorkspaceEmergency(
@@ -1149,28 +1544,45 @@ export function requiresCargoWorkspaceEmergency(
 ): boolean {
 	const counts = new Map<string, number>();
 	for (const unit of supported) counts.set(unit.name, (counts.get(unit.name) ?? 0) + 1);
-	return selected.some(unit => (counts.get(unit.name) ?? 0) > 1);
+	return selected.some((unit) => (counts.get(unit.name) ?? 0) > 1);
 }
 
-async function expandCargoDependents(
+export async function expandCargoDependents(
 	initial: readonly CargoInventoryUnit[],
 	supported: readonly CargoInventoryUnit[],
 	fallbackOnMetadataFailure: boolean,
 ): Promise<CargoInventoryUnit[]> {
 	const metadata = await $`cargo metadata --format-version=1 --no-deps`.cwd(repoRoot).quiet().nothrow();
 	if (metadata.exitCode !== 0) {
-		if (fallbackOnMetadataFailure) return [...supported];
-		throw new Error(`inventory-drift: cargo metadata failed: ${metadata.stderr.toString().trim()}`);
+		if (fallbackOnMetadataFailure) {
+			reportCargoMetadataFallback(
+				"command failure",
+				`exit code ${metadata.exitCode}; ${boundDiagnostic(metadata.stderr.toString())}`,
+			);
+			return [...supported];
+		}
+		throw new Error(`inventory-drift: cargo metadata failed: ${boundDiagnostic(metadata.stderr.toString())}`);
 	}
 	let decoded: unknown;
 	try {
 		decoded = JSON.parse(metadata.stdout.toString());
 	} catch {
-		if (fallbackOnMetadataFailure) return [...supported];
+		if (fallbackOnMetadataFailure) {
+			reportCargoMetadataFallback("malformed JSON");
+			return [...supported];
+		}
 		throw new Error("inventory-drift: cargo metadata was not JSON");
 	}
-	if (!isRecord(decoded) || !Array.isArray(decoded.packages) || !Array.isArray(decoded.workspace_members) || !decoded.workspace_members.every(isString)) {
-		if (fallbackOnMetadataFailure) return [...supported];
+	if (
+		!isRecord(decoded) ||
+		!Array.isArray(decoded.packages) ||
+		!Array.isArray(decoded.workspace_members) ||
+		!decoded.workspace_members.every(isString)
+	) {
+		if (fallbackOnMetadataFailure) {
+			reportCargoMetadataFallback("malformed workspace schema");
+			return [...supported];
+		}
 		throw new Error("inventory-drift: cargo metadata workspace inventory missing");
 	}
 	const byManifest = new Map<string, CargoInventoryUnit>();
@@ -1180,13 +1592,18 @@ async function expandCargoDependents(
 		if (!isRecord(entry) || !isString(entry.id) || !isString(entry.name) || !isString(entry.manifest_path)) continue;
 		const unit = byManifest.get(path.resolve(entry.manifest_path));
 		if (unit) {
-			if (unit.name !== entry.name || byPackageId.has(entry.id)) throw new Error("inventory-drift: Cargo registry mapping mismatch");
+			if (unit.name !== entry.name || byPackageId.has(entry.id))
+				throw new Error("inventory-drift: Cargo registry mapping mismatch");
 			byPackageId.set(entry.id, unit);
 		}
 	}
-	if (byPackageId.size !== supported.length) throw new Error("inventory-drift: supported Cargo inventory does not match metadata");
+	if (byPackageId.size !== supported.length)
+		throw new Error("inventory-drift: supported Cargo inventory does not match metadata");
 	const workspaceMemberIds = new Set(decoded.workspace_members as string[]);
-	if (workspaceMemberIds.size !== supported.length || Array.from(workspaceMemberIds).some(id => !byPackageId.has(id))) {
+	if (
+		workspaceMemberIds.size !== supported.length ||
+		Array.from(workspaceMemberIds).some((id) => !byPackageId.has(id))
+	) {
 		throw new Error("inventory-drift: Cargo workspace contains unclassified members");
 	}
 	const reverse = new Map<string, string[]>();
@@ -1198,16 +1615,35 @@ async function expandCargoDependents(
 			if (dependencyUnit) reverse.set(dependencyUnit.id, [...(reverse.get(dependencyUnit.id) ?? []), entry.id]);
 		}
 	}
-	const selected = new Map(initial.map(unit => [unit.id, unit]));
+	const selected = new Map(initial.map((unit) => [unit.id, unit]));
 	const queue = [...selected.keys()];
 	while (queue.length > 0) {
-		const current = queue.shift(); if (!current) continue;
-		for (const packageId of reverse.get(current) ?? []) { const unit = byPackageId.get(packageId); if (unit && !selected.has(unit.id)) { selected.set(unit.id, unit); queue.push(unit.id); } }
+		const current = queue.shift();
+		if (!current) continue;
+		for (const packageId of reverse.get(current) ?? []) {
+			const unit = byPackageId.get(packageId);
+			if (unit && !selected.has(unit.id)) {
+				selected.set(unit.id, unit);
+				queue.push(unit.id);
+			}
+		}
 	}
 	return Array.from(selected.values());
 }
+function boundDiagnostic(value: string): string {
+	const normalized = value.replace(/\s+/g, " ").trim().replace(/(?:\/|[A-Za-z]:[\\/])\S+/g, "<path>");
+	return normalized.length > 160 ? `${normalized.slice(0, 160)}…` : normalized || "no error detail";
+}
+
+function reportCargoMetadataFallback(reason: string, detail?: string): void {
+	console.error(`ci-dev-affected: cargo metadata ${reason}; selecting all supported Cargo units${detail ? ` (${detail})` : ""}`);
+}
 function isWorkflowHarnessPath(changedPath: string): boolean {
-	return isWorkflowPath(changedPath) || changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/check-workflow-yaml.ts";
+	return (
+		isWorkflowPath(changedPath) ||
+		changedPath === "scripts/ci-dev-affected.ts" ||
+		changedPath === "scripts/check-workflow-yaml.ts"
+	);
 }
 
 function isToolingScriptPath(changedPath: string): boolean {
@@ -1233,8 +1669,14 @@ function isString(value: unknown): value is string {
 	return typeof value === "string";
 }
 
-function assertExactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
-	if (Object.keys(value).length !== keys.length || Object.keys(value).some(key => !keys.includes(key))) throw new Error(`inventory-invalid: unexpected ${label} field`);
+function assertExactKeys(
+	value: Record<string, unknown>,
+	keys: readonly string[],
+	label: string,
+	errorNamespace = "inventory-invalid",
+): void {
+	if (Object.keys(value).length !== keys.length || Object.keys(value).some((key) => !keys.includes(key)))
+		throw new Error(`${errorNamespace}: unexpected ${label} field`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1254,8 +1696,8 @@ export async function runCommand(command: readonly string[], cwd: string): Promi
 }
 
 function serializeTasks(tasks: readonly Task[]): Task[] {
-	return tasks.map(task => {
-		const cwd = task.cwd ? path.relative(repoRoot, task.cwd) || "." : ".";
+	return tasks.map((task) => {
+		const cwd = canonicalTaskCwd(task.cwd);
 		return {
 			key: task.key,
 			identity: canonicalTaskIdentity(task),
@@ -1274,7 +1716,7 @@ function serializeTasks(tasks: readonly Task[]): Task[] {
 }
 
 function canonicalTaskIdentity(task: Task): string {
-	const cwd = task.cwd ? path.relative(repoRoot, task.cwd) || "." : ".";
+	const cwd = canonicalTaskCwd(task.cwd);
 	return task.identity ?? `legacy:${toBase64Url(task.key)}:${toBase64Url(cwd)}`;
 }
 
@@ -1284,18 +1726,52 @@ export interface AffectedAggregateResults {
 	shards: string;
 	windowsDoctor: string;
 	windowsDoctorRequired: string;
+	worktreeSafety: string;
+	worktreeSafetyRequired: string;
 	hasNative: string;
 	hasTasks: string;
 }
 
 export function validateAffectedAggregate(results: AffectedAggregateResults): void {
 	if (results.plan !== "success") throw new Error("planner did not succeed");
-	if (results.hasNative !== "true" && results.hasNative !== "false") throw new Error(`planner emitted invalid has_native=${results.hasNative}`);
-	if (results.hasTasks !== "true" && results.hasTasks !== "false") throw new Error(`planner emitted invalid has_tasks=${results.hasTasks}`);
-	if (results.native !== (results.hasNative === "true" ? "success" : "skipped")) throw new Error(results.hasNative === "true" ? "required native build did not succeed" : "unplanned native build was not skipped");
-	if (results.shards !== (results.hasTasks === "true" ? "success" : "skipped")) throw new Error(results.hasTasks === "true" ? "required affected shards did not succeed" : "unplanned affected shards were not skipped");
-	if (results.windowsDoctorRequired !== "true" && results.windowsDoctorRequired !== "false") throw new Error(`planner emitted invalid windows_doctor_required=${results.windowsDoctorRequired}`);
-	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped")) throw new Error(results.windowsDoctorRequired === "true" ? "required Windows dev:doctor did not succeed" : "unplanned Windows dev:doctor was not skipped");
+	if (results.hasNative !== "true" && results.hasNative !== "false")
+		throw new Error(`planner emitted invalid has_native=${results.hasNative}`);
+	if (results.hasTasks !== "true" && results.hasTasks !== "false")
+		throw new Error(`planner emitted invalid has_tasks=${results.hasTasks}`);
+	if (results.native !== (results.hasNative === "true" ? "success" : "skipped"))
+		throw new Error(
+			results.hasNative === "true" ? "required native build did not succeed" : "unplanned native build was not skipped",
+		);
+	if (results.shards !== (results.hasTasks === "true" ? "success" : "skipped"))
+		throw new Error(
+			results.hasTasks === "true"
+				? "required affected shards did not succeed"
+				: "unplanned affected shards were not skipped",
+		);
+	if (results.windowsDoctorRequired !== "true" && results.windowsDoctorRequired !== "false")
+		throw new Error(`planner emitted invalid windows_doctor_required=${results.windowsDoctorRequired}`);
+	if (results.windowsDoctor !== (results.windowsDoctorRequired === "true" ? "success" : "skipped"))
+		throw new Error(
+			results.windowsDoctorRequired === "true"
+				? "required Windows dev:doctor did not succeed"
+				: "unplanned Windows dev:doctor was not skipped",
+		);
+	if (results.worktreeSafetyRequired !== "true" && results.worktreeSafetyRequired !== "false")
+		throw new Error(`planner emitted invalid worktree_safety_required=${results.worktreeSafetyRequired}`);
+	if (results.worktreeSafety !== (results.worktreeSafetyRequired === "true" ? "success" : "skipped"))
+		throw new Error(
+			results.worktreeSafetyRequired === "true"
+				? "required worktree safety did not succeed"
+				: "unplanned worktree safety was not skipped",
+		);
+}
+export function validateCanonicalWorktreeSafetyRequirement(
+	results: Pick<AffectedAggregateResults, "worktreeSafetyRequired">,
+	canonicalWorktreeSafetyRequired: boolean,
+): void {
+	if (results.worktreeSafetyRequired !== String(canonicalWorktreeSafetyRequired)) {
+		throw new Error("affected-plan-invalid: worktree safety flag does not match canonical plan");
+	}
 }
 
 async function validateAggregate(): Promise<void> {
@@ -1305,6 +1781,8 @@ async function validateAggregate(): Promise<void> {
 		shards: Bun.env.CI_DEV_SHARDS_RESULT?.trim() || "",
 		windowsDoctor: Bun.env.CI_DEV_WINDOWS_DOCTOR_RESULT?.trim() || "",
 		windowsDoctorRequired: Bun.env.CI_DEV_WINDOWS_DOCTOR_REQUIRED?.trim() || "",
+		worktreeSafety: Bun.env.CI_DEV_WORKTREE_SAFETY_RESULT?.trim() || "",
+		worktreeSafetyRequired: Bun.env.CI_DEV_WORKTREE_SAFETY_REQUIRED?.trim() || "",
 		hasNative: Bun.env.CI_DEV_HAS_NATIVE?.trim() || "",
 		hasTasks: Bun.env.CI_DEV_HAS_TASKS?.trim() || "",
 	};
@@ -1318,9 +1796,10 @@ async function validateAggregate(): Promise<void> {
 	console.log(`windows-dev-doctor: ${results.windowsDoctor}`);
 	console.log(`planned Windows dev:doctor: ${results.windowsDoctorRequired}`);
 	validateAffectedAggregate(results);
-	const tasks = await loadCanonicalPlan();
-	if (!tasks) throw new Error("affected-plan-invalid: aggregate requires a canonical plan");
-	validatePlanCapabilities(tasks, results, Bun.env.CI_DEV_PLAN_MODE?.trim() || resolvePlanMode());
+	const canonical = await loadCanonicalPlanDocument();
+	if (!canonical) throw new Error("affected-plan-invalid: aggregate requires a canonical plan");
+	validatePlanCapabilities(canonical.tasks, results, Bun.env.CI_DEV_PLAN_MODE?.trim() || resolvePlanMode());
+	validateCanonicalWorktreeSafetyRequirement(results, canonical.worktreeSafetyRequired);
 	console.log("Affected path validation: all required shards passed");
 }
 
@@ -1363,14 +1842,14 @@ async function checkedEvidencePath(root: string, relative: string, finalKind: "f
 	const resolvedRoot = path.resolve(root);
 	const target = path.resolve(resolvedRoot, relative);
 	if (!target.startsWith(`${resolvedRoot}${path.sep}`)) throw evidenceError("path escaped staging root");
-	let rootStat: import("node:fs").Stats;
+	let rootStat: Stats;
 	try { rootStat = await fs.lstat(resolvedRoot); } catch (error) { if (isMissingError(error)) throw evidenceError("missing staging root"); throw error; }
 	if (rootStat.isSymbolicLink()) throw evidenceError("symlink staging root");
 	if (!rootStat.isDirectory()) throw evidenceError("non-directory staging root");
 	let current = resolvedRoot;
 	for (const piece of path.relative(resolvedRoot, target).split(path.sep)) {
 		current = path.join(current, piece);
-		let stat: import("node:fs").Stats;
+		let stat: Stats;
 		try { stat = await fs.lstat(current); } catch (error) { if (isMissingError(error)) throw evidenceError("missing evidence object"); throw error; }
 		if (stat.isSymbolicLink()) throw evidenceError("symlink evidence object");
 		const final = current === target;
@@ -1395,13 +1874,47 @@ function canonicalReplayScope(): ReplayScope {
 	return { repository: requiredEnv("GITHUB_REPOSITORY"), workflow: requiredEnv("GITHUB_WORKFLOW"), runId: requiredEnv("GITHUB_RUN_ID") };
 }
 function aggregateFromEnv(): AffectedAggregateResults {
-	return { plan: requiredEnv("CI_DEV_PLAN_RESULT"), native: requiredEnv("CI_DEV_NATIVE_RESULT"), shards: requiredEnv("CI_DEV_SHARDS_RESULT"), windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"), windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"), hasNative: requiredEnv("CI_DEV_HAS_NATIVE"), hasTasks: requiredEnv("CI_DEV_HAS_TASKS") };
+	return {
+		plan: requiredEnv("CI_DEV_PLAN_RESULT"),
+		native: requiredEnv("CI_DEV_NATIVE_RESULT"),
+		shards: requiredEnv("CI_DEV_SHARDS_RESULT"),
+		windowsDoctor: requiredEnv("CI_DEV_WINDOWS_DOCTOR_RESULT"),
+		windowsDoctorRequired: requiredEnv("CI_DEV_WINDOWS_DOCTOR_REQUIRED"),
+		worktreeSafety: requiredEnv("CI_DEV_WORKTREE_SAFETY_RESULT"),
+		worktreeSafetyRequired: requiredEnv("CI_DEV_WORKTREE_SAFETY_REQUIRED"),
+		hasNative: requiredEnv("CI_DEV_HAS_NATIVE"),
+		hasTasks: requiredEnv("CI_DEV_HAS_TASKS"),
+	};
 }
 function parseAggregate(value: unknown): AffectedAggregateResults {
 	if (!isRecord(value)) throw evidenceError("malformed aggregate results");
-	exactKeys(value, ["plan", "native", "shards", "windowsDoctor", "windowsDoctorRequired", "hasNative", "hasTasks"], "unexpected aggregate results field");
+	exactKeys(
+		value,
+		[
+			"plan",
+			"native",
+			"shards",
+			"windowsDoctor",
+			"windowsDoctorRequired",
+			"worktreeSafety",
+			"worktreeSafetyRequired",
+			"hasNative",
+			"hasTasks",
+		],
+		"unexpected aggregate results field",
+	);
 	if (!Object.values(value).every(isString)) throw evidenceError("malformed aggregate results");
-	return { plan: value.plan as string, native: value.native as string, shards: value.shards as string, windowsDoctor: value.windowsDoctor as string, windowsDoctorRequired: value.windowsDoctorRequired as string, hasNative: value.hasNative as string, hasTasks: value.hasTasks as string };
+	return {
+		plan: value.plan as string,
+		native: value.native as string,
+		shards: value.shards as string,
+		windowsDoctor: value.windowsDoctor as string,
+		windowsDoctorRequired: value.windowsDoctorRequired as string,
+		worktreeSafety: value.worktreeSafety as string,
+		worktreeSafetyRequired: value.worktreeSafetyRequired as string,
+		hasNative: value.hasNative as string,
+		hasTasks: value.hasTasks as string,
+	};
 }
 function parseReplayScope(value: unknown): ReplayScope {
 	if (!isRecord(value)) throw evidenceError("malformed replay scope");
@@ -1436,15 +1949,34 @@ function parseCanonicalReceipt(raw: string): DetachedEvidenceReceipt {
 	return receipt;
 }
 
-async function readValidatedEvidencePlan(root: string): Promise<{ tasks: Task[]; raw: Uint8Array; mode: PlanMode }> {
+async function readValidatedEvidencePlan(
+	root: string,
+): Promise<{ tasks: Task[]; raw: Uint8Array; mode: PlanMode; worktreeSafetyRequired: boolean }> {
 	const raw = await readEvidenceBytes(root, AFFECTED_PLAN_NAME);
-	let decoded: unknown; try { decoded = JSON.parse(decodeEvidenceJson(raw)); } catch { throw evidenceError("malformed canonical plan"); }
-	if (!isRecord(decoded) || (decoded.mode !== "pr" && decoded.mode !== "push")) throw evidenceError("malformed canonical plan");
+	let decoded: unknown;
+	try {
+		decoded = JSON.parse(decodeEvidenceJson(raw));
+	} catch {
+		throw evidenceError("malformed canonical plan");
+	}
+	if (!isRecord(decoded) || (decoded.mode !== "pr" && decoded.mode !== "push"))
+		throw evidenceError("malformed canonical plan");
 	const planPath = path.join(root, AFFECTED_PLAN_NAME);
 	const original = Bun.env.CI_DEV_AFFECTED_PLAN;
 	Bun.env.CI_DEV_AFFECTED_PLAN = planPath;
-	try { const tasks = await loadCanonicalPlan(); if (!tasks) throw evidenceError("missing canonical plan"); return { tasks, raw, mode: decoded.mode }; }
-	finally { if (original === undefined) delete Bun.env.CI_DEV_AFFECTED_PLAN; else Bun.env.CI_DEV_AFFECTED_PLAN = original; }
+	try {
+		const canonical = await loadCanonicalPlanDocument();
+		if (!canonical) throw evidenceError("missing canonical plan");
+		return {
+			tasks: canonical.tasks,
+			raw,
+			mode: decoded.mode,
+			worktreeSafetyRequired: canonical.worktreeSafetyRequired,
+		};
+	} finally {
+		if (original === undefined) delete Bun.env.CI_DEV_AFFECTED_PLAN;
+		else Bun.env.CI_DEV_AFFECTED_PLAN = original;
+	}
 }
 async function collectChildEvidence(root: string, tasks: readonly Task[]): Promise<EvidenceChild[]> {
 	const expected = expectedEvidenceNames(tasks);
@@ -1471,13 +2003,14 @@ async function collectChildEvidence(root: string, tasks: readonly Task[]): Promi
 }
 async function writeAffectedEvidence(): Promise<void> {
 	const root = evidenceRoot();
-	const { tasks, raw: planRaw, mode: planMode } = await readValidatedEvidencePlan(root);
+	const { tasks, raw: planRaw, mode: planMode, worktreeSafetyRequired } = await readValidatedEvidencePlan(root);
 	const results = aggregateFromEnv(); validateAffectedAggregate(results);
 	const digest = requiredEnv("CI_DEV_PLAN_DIGEST");
 	const mode = requiredEnv("CI_DEV_PLAN_MODE");
 	if (mode !== "pr" && mode !== "push") throw evidenceError("invalid CI_DEV_PLAN_MODE");
 	if (mode !== planMode) throw evidenceError("plan mode mismatch");
 	validatePlanCapabilities(tasks, results, mode);
+	validateCanonicalWorktreeSafetyRequirement(results, worktreeSafetyRequired);
 	if (sha256(planRaw) !== digest) throw evidenceError("plan digest mismatch");
 	const manifestPath = path.join(root, AFFECTED_EVIDENCE_MANIFEST); const receiptPath = path.join(root, AFFECTED_EVIDENCE_RECEIPT);
 	for (const target of [manifestPath, receiptPath]) { try { await fs.lstat(target); throw evidenceError("evidence target already exists"); } catch (error) { if (error instanceof Error && error.message.startsWith("affected-evidence-invalid")) throw error; if (!isMissingError(error)) throw error; } }
@@ -1500,7 +2033,7 @@ async function validateAffectedEvidence(): Promise<void> {
 	const receipt = parseCanonicalReceipt(receiptRaw);
 	if (receipt.manifestSha256 !== sha256(manifestBytes)) throw evidenceError("manifest digest mismatch");
 	const manifest = parseCanonicalManifest(manifestRaw);
-	const { tasks, raw: planRaw, mode: planMode } = await readValidatedEvidencePlan(root);
+	const { tasks, raw: planRaw, mode: planMode, worktreeSafetyRequired } = await readValidatedEvidencePlan(root);
 	const expectedReplay = canonicalReplayScope(); const expectedSource = requiredEnv("CI_DEV_SOURCE_SHA"); const expectedDigest = requiredEnv("CI_DEV_PLAN_DIGEST");
 	if (manifest.sourceSha !== expectedSource || receipt.sourceSha !== expectedSource || manifest.planDigest !== expectedDigest || receipt.planDigest !== expectedDigest || JSON.stringify(manifest.replayScope) !== JSON.stringify(expectedReplay) || JSON.stringify(receipt.replayScope) !== JSON.stringify(expectedReplay)) throw evidenceError("replay binding mismatch");
 	if (manifest.planMode !== requiredEnv("CI_DEV_PLAN_MODE") || manifest.planMode !== planMode || sha256(planRaw) !== expectedDigest) throw evidenceError("plan binding mismatch");
@@ -1508,6 +2041,7 @@ async function validateAffectedEvidence(): Promise<void> {
 	const liveAggregate = aggregateFromEnv();
 	if (JSON.stringify(manifest.aggregateResults) !== JSON.stringify(liveAggregate)) throw evidenceError("aggregate result mismatch");
 	validatePlanCapabilities(tasks, liveAggregate, manifest.planMode);
+	validateCanonicalWorktreeSafetyRequirement(liveAggregate, worktreeSafetyRequired);
 	const expectedTasks = expectedEvidenceTasks(tasks);
 	if (JSON.stringify(manifest.taskIdentities) !== JSON.stringify(expectedTasks)) throw evidenceError("task identity mismatch");
 	const children = await collectChildEvidence(root, tasks);
@@ -1519,21 +2053,33 @@ async function validateShardReceipts(): Promise<void> {
 	const tasks = await loadCanonicalPlan();
 	if (!tasks) throw new Error("affected-plan-invalid: shard receipt validation requires a canonical plan");
 	const expected = tasks
-		.filter(task => task.capabilities?.nativeProducer !== true)
-		.map(task => ({ key: task.key, identity: canonicalTaskIdentity(task) }))
+		.filter((task) => task.capabilities?.nativeProducer !== true)
+		.map((task) => ({ key: task.key, identity: canonicalTaskIdentity(task) }))
 		.sort((left, right) => left.key.localeCompare(right.key));
 	const receiptDir = path.resolve(repoRoot, Bun.env.CI_DEV_SHARD_RECEIPTS?.trim() || ".ci-dev-shard-receipts");
 	const actual: Array<{ key: string; identity: string }> = [];
 	for await (const entry of new Bun.Glob("*.json").scan({ cwd: receiptDir })) {
 		const value = await Bun.file(path.join(receiptDir, entry)).json();
-		if (!isRecord(value) || !isString(value.key) || !isString(value.identity) || Object.keys(value).length !== 2) throw new Error("affected-plan-invalid: malformed shard receipt");
+		if (!isRecord(value) || !isString(value.key) || !isString(value.identity) || Object.keys(value).length !== 2)
+			throw new Error("affected-plan-invalid: malformed shard receipt");
 		actual.push({ key: value.key, identity: value.identity });
 	}
 	actual.sort((left, right) => left.key.localeCompare(right.key));
-	if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error("affected-plan-invalid: shard receipt set does not match canonical plan");
+	if (JSON.stringify(actual) !== JSON.stringify(expected))
+		throw new Error("affected-plan-invalid: shard receipt set does not match canonical plan");
+}
+
+interface LoadedCanonicalPlan {
+	tasks: Task[];
+	worktreeSafetyRequired: boolean;
 }
 
 async function loadCanonicalPlan(): Promise<Task[] | null> {
+	const canonical = await loadCanonicalPlanDocument();
+	return canonical?.tasks ?? null;
+}
+
+async function loadCanonicalPlanDocument(): Promise<LoadedCanonicalPlan | null> {
 	const planFile = Bun.env.CI_DEV_AFFECTED_PLAN?.trim();
 	if (!planFile) return null;
 	let rawPlan: string;
@@ -1544,48 +2090,107 @@ async function loadCanonicalPlan(): Promise<Task[] | null> {
 	} catch {
 		throw new Error("affected-plan-invalid: cannot read canonical plan");
 	}
-	if (!isRecord(decoded) || decoded.schemaVersion !== 1 || !isString(decoded.sourceSha) || (decoded.mode !== "pr" && decoded.mode !== "push") || !Array.isArray(decoded.paths) || !decoded.paths.every(isString) || !Array.isArray(decoded.tasks)) throw new Error("affected-plan-invalid: malformed canonical plan");
-	if (Object.keys(decoded).length !== 5 || Object.keys(decoded).some(key => !["schemaVersion", "sourceSha", "mode", "paths", "tasks"].includes(key))) throw new Error("affected-plan-invalid: unexpected top-level field");
+	if (
+		!isRecord(decoded) ||
+		decoded.schemaVersion !== 1 ||
+		!isString(decoded.sourceSha) ||
+		(decoded.mode !== "pr" && decoded.mode !== "push") ||
+		!Array.isArray(decoded.paths) ||
+		!decoded.paths.every(isString) ||
+		typeof decoded.worktreeSafetyRequired !== "boolean" ||
+		!Array.isArray(decoded.tasks)
+	)
+		throw new Error("affected-plan-invalid: malformed canonical plan");
+	if (
+		Object.keys(decoded).length !== 6 ||
+		Object.keys(decoded).some(
+			(key) => !["schemaVersion", "sourceSha", "mode", "paths", "worktreeSafetyRequired", "tasks"].includes(key),
+		)
+	)
+		throw new Error("affected-plan-invalid: unexpected top-level field");
 	const decodedPaths = decoded.paths as string[];
 	const paths = normalizeChangedPaths(decodedPaths);
-	if (paths.length !== decodedPaths.length || paths.some((entry, index) => entry !== decodedPaths[index])) throw new Error("affected-plan-invalid: paths are not canonical");
+	if (paths.length !== decodedPaths.length || paths.some((entry, index) => entry !== decodedPaths[index]))
+		throw new Error("affected-plan-invalid: paths are not canonical");
+	if (decoded.worktreeSafetyRequired !== hasWorktreeSafetyChange(paths))
+		throw new Error("affected-plan-invalid: worktree safety requirement mismatch");
 	const expectedSha = Bun.env.CI_DEV_PLAN_SOURCE_SHA?.trim();
 	const expectedDigest = Bun.env.CI_DEV_PLAN_DIGEST?.trim();
 	if (!expectedSha || !expectedDigest) throw new Error("affected-plan-invalid: missing expected digest or source SHA");
 	if (decoded.sourceSha !== expectedSha) throw new Error("affected-plan-invalid: source SHA mismatch");
 	const checkedOut = await $`git rev-parse HEAD`.cwd(repoRoot).quiet().nothrow();
-	if (checkedOut.exitCode !== 0 || checkedOut.stdout.toString().trim() !== expectedSha) throw new Error("affected-plan-invalid: checked-out SHA mismatch");
+	if (checkedOut.exitCode !== 0 || checkedOut.stdout.toString().trim() !== expectedSha)
+		throw new Error("affected-plan-invalid: checked-out SHA mismatch");
 	const actual = new Bun.CryptoHasher("sha256").update(rawPlan).digest("hex");
 	if (actual !== expectedDigest) throw new Error("affected-plan-invalid: digest mismatch");
 	const tasks = decoded.tasks.map(deserializeTask);
+	if (decoded.worktreeSafetyRequired) {
+		const expectedFocusedTasks = serializeTasks(planFocusedWorktreeTasks(paths));
+		if (JSON.stringify(decoded.tasks) !== JSON.stringify(expectedFocusedTasks))
+			throw new Error("affected-plan-invalid: focused task set mismatch");
+	}
 	if (
-		new Set(tasks.map(task => task.key)).size !== tasks.length ||
-		new Set(tasks.map(task => task.identity)).size !== tasks.length
-	) throw new Error("affected-plan-invalid: duplicate task key or identity");
+		new Set(tasks.map((task) => task.key)).size !== tasks.length ||
+		new Set(tasks.map((task) => task.identity)).size !== tasks.length
+	)
+		throw new Error("affected-plan-invalid: duplicate task key or identity");
 	const matrixKey = Bun.env.CI_DEV_MATRIX_KEY?.trim();
 	if (matrixKey) {
-		const task = tasks.find(candidate => candidate.key === matrixKey);
+		const task = tasks.find((candidate) => candidate.key === matrixKey);
 		if (!task || !task.capabilities) throw new Error("affected-plan-invalid: matrix task mismatch");
-		if (task.capabilities.rust !== (Bun.env.CI_DEV_MATRIX_RUST === "true") || task.capabilities.nextest !== (Bun.env.CI_DEV_MATRIX_NEXTEST === "true") || task.capabilities.nativeConsumer !== (Bun.env.CI_DEV_MATRIX_NATIVE === "true")) throw new Error("affected-plan-invalid: matrix capabilities mismatch");
+		const matrixIdentity = Bun.env.CI_DEV_MATRIX_IDENTITY?.trim();
+		if (!matrixIdentity || task.identity !== matrixIdentity)
+			throw new Error("affected-plan-invalid: matrix identity mismatch");
+		if (
+			task.capabilities.rust !== (Bun.env.CI_DEV_MATRIX_RUST === "true") ||
+			task.capabilities.nextest !== (Bun.env.CI_DEV_MATRIX_NEXTEST === "true") ||
+			task.capabilities.nativeConsumer !== (Bun.env.CI_DEV_MATRIX_NATIVE === "true")
+		)
+			throw new Error("affected-plan-invalid: matrix capabilities mismatch");
 	}
-	return tasks;
+	return { tasks, worktreeSafetyRequired: decoded.worktreeSafetyRequired };
 }
 function deserializeTask(value: unknown): Task {
-	if (!isRecord(value) || !isString(value.key) || !isString(value.description) || !Array.isArray(value.command) || !value.command.every(isString) || (value.cwd !== undefined && !isString(value.cwd))) throw new Error("affected-plan-invalid: malformed task");
+	if (!isRecord(value)) throw new Error("affected-plan-invalid: malformed task");
 	assertTaskKeys(value);
-	if (!isString(value.identity) || value.identity.length === 0) throw new Error("affected-plan-invalid: missing task identity");
+	if (
+		!isString(value.key) ||
+		value.key.length === 0 ||
+		!isString(value.identity) ||
+		value.identity.length === 0 ||
+		!isString(value.description) ||
+		value.description.length === 0 ||
+		!Array.isArray(value.command) ||
+		value.command.length === 0 ||
+		!value.command.every((entry) => isString(entry) && entry.length > 0) ||
+		!isString(value.cwd)
+	)
+		throw new Error("affected-plan-invalid: malformed task");
 	const capabilities = value.capabilities;
-	if (!isRecord(capabilities) || typeof capabilities.rust !== "boolean" || typeof capabilities.nextest !== "boolean" || typeof capabilities.nativeConsumer !== "boolean" || typeof capabilities.nativeProducer !== "boolean") throw new Error("affected-plan-invalid: missing task capabilities");
-	assertExactKeys(capabilities, ["rust", "nextest", "nativeConsumer", "nativeProducer"], "task capabilities");
-	if (value.cwd !== undefined && value.cwd !== ".") normalizeInventoryPath(value.cwd);
+	if (
+		!isRecord(capabilities) ||
+		typeof capabilities.rust !== "boolean" ||
+		typeof capabilities.nextest !== "boolean" ||
+		typeof capabilities.nativeConsumer !== "boolean" ||
+		typeof capabilities.nativeProducer !== "boolean"
+	)
+		throw new Error("affected-plan-invalid: missing task capabilities");
+	assertExactKeys(
+		capabilities,
+		["rust", "nextest", "nativeConsumer", "nativeProducer"],
+		"task capabilities",
+		"affected-plan-invalid",
+	);
+	const cwd = validateCanonicalTaskCwd(value.cwd);
 	const phase = value.phase;
-	if (phase !== "legacy" && phase !== "native-producer" && phase !== "ts-build" && phase !== "cargo-build") throw new Error("affected-plan-invalid: missing task phase");
+	if (phase !== "legacy" && phase !== "native-producer" && phase !== "ts-build" && phase !== "cargo-build")
+		throw new Error("affected-plan-invalid: missing task phase");
 	return {
 		key: value.key,
 		identity: value.identity,
 		description: value.description,
 		command: value.command,
-		cwd: isString(value.cwd) ? path.resolve(repoRoot, value.cwd) : undefined,
+		cwd: path.resolve(repoRoot, cwd),
 		capabilities: {
 			rust: capabilities.rust as boolean,
 			nextest: capabilities.nextest as boolean,
@@ -1596,8 +2201,26 @@ function deserializeTask(value: unknown): Task {
 	};
 }
 function assertTaskKeys(value: Record<string, unknown>): void {
-	const allowed = ["key", "identity", "description", "command", "cwd", "capabilities", "phase"];
-	if (Object.keys(value).some(key => !allowed.includes(key))) throw new Error("affected-plan-invalid: malformed task");
+	const expected = ["key", "identity", "description", "command", "cwd", "capabilities", "phase"];
+	const keys = Object.keys(value);
+	if (keys.length !== expected.length || keys.some((key) => !expected.includes(key)))
+		throw new Error("affected-plan-invalid: malformed task");
+}
+
+function validateCanonicalTaskCwd(value: string): string {
+	if (value.length === 0 || value.includes("\\") || path.posix.isAbsolute(value) || /^[A-Za-z]:/.test(value))
+		throw new Error("affected-plan-invalid: unsafe task cwd");
+	if (value === ".") return value;
+	const segments = value.split("/");
+	if (segments.some((segment) => segment.length === 0 || segment === "." || segment === ".."))
+		throw new Error("affected-plan-invalid: unsafe task cwd");
+	const normalized = path.posix.normalize(value);
+	if (normalized !== value) throw new Error("affected-plan-invalid: non-canonical task cwd");
+	const resolved = path.resolve(repoRoot, ...segments);
+	const relative = path.relative(repoRoot, resolved);
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+		throw new Error("affected-plan-invalid: unsafe task cwd");
+	return value;
 }
 
 if (import.meta.main) {
