@@ -255,10 +255,13 @@ export function createDefaultCodexTransportFactory(options: CodexTransportFactor
 			if (response.error !== undefined) current.reject(new Error("codex_app_server_request_failed"));
 			else current.resolve(response.result);
 		};
+		let fragmentOpcode: number | null = null;
+		let fragmentPayload = Buffer.alloc(0);
 		const consumeFrames = (chunk: Buffer) => {
 			buffer = Buffer.concat([buffer, chunk]);
 			for (;;) {
 				if (buffer.length < 2) return;
+				const fin = (buffer[0]! & 0x80) !== 0;
 				const opcode = buffer[0]! & 0x0f;
 				const lengthCode = buffer[1]! & 0x7f;
 				let headerLength = 2;
@@ -288,8 +291,24 @@ export function createDefaultCodexTransportFactory(options: CodexTransportFactor
 					for (let index = 0; index < payload.length; index++) payload[index] ^= mask[index % 4]!;
 				}
 				buffer = buffer.subarray(headerLength + maskLength + length);
-				if (opcode === 0x1) handleText(payload);
-				else if (opcode === 0x9) writeFrame(0x0a, payload);
+				if (opcode === 0x1 || opcode === 0x0) {
+					// RFC 6455 fragmentation: FIN=0 text starts a message; opcode 0x0
+					// continuation frames extend it; FIN=1 completes it.
+					if (opcode === 0x1 && !fin) {
+						fragmentOpcode = 0x1;
+						fragmentPayload = Buffer.from(payload);
+					} else if (opcode === 0x0 && fragmentOpcode !== null) {
+						fragmentPayload = Buffer.concat([fragmentPayload, payload]);
+						if (fin) {
+							const assembled = fragmentPayload;
+							fragmentOpcode = null;
+							fragmentPayload = Buffer.alloc(0);
+							handleText(assembled);
+						}
+					} else if (opcode === 0x1 && fin) {
+						handleText(payload);
+					}
+				} else if (opcode === 0x9) writeFrame(0x0a, payload);
 			}
 		};
 		let closing = false;
