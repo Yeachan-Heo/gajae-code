@@ -74,6 +74,9 @@ const BASE_CFG: NotificationConfig = {
 	richDraft: {
 		enabled: false,
 	},
+	toolActivity: {
+		enabled: true,
+	},
 	topics: {
 		nameTemplate: undefined,
 	},
@@ -102,6 +105,7 @@ const MALFORMED_NOTIFICATION_LEAVES: ReadonlyArray<readonly [SettingPath, unknow
 	["notifications.telegram.btw.enabled", "invalid"],
 	["notifications.telegram.rich.enabled", "invalid"],
 	["notifications.telegram.richDraft.enabled", "invalid"],
+	["notifications.telegram.toolActivity.enabled", "invalid"],
 	["notifications.telegram.topics.nameTemplate", 42],
 	["notifications.discord.botToken", 42],
 	["notifications.discord.applicationId", 42],
@@ -206,6 +210,9 @@ describe("notifications config", () => {
 			richDraft: {
 				enabled: false,
 			},
+			toolActivity: {
+				enabled: true,
+			},
 			topics: {
 				nameTemplate: undefined,
 			},
@@ -257,6 +264,7 @@ describe("notifications config", () => {
 			"notifications.telegram.btw.enabled": true,
 			"notifications.telegram.rich.enabled": false,
 			"notifications.telegram.richDraft.enabled": true,
+			"notifications.telegram.toolActivity.enabled": false,
 			"notifications.telegram.topics.nameTemplate": "{repo}/{branch}",
 			"notifications.discord.botToken": "discord-token",
 			"notifications.discord.applicationId": "discord-application",
@@ -293,6 +301,7 @@ describe("notifications config", () => {
 						btw: { enabled: true },
 						rich: { enabled: false },
 						richDraft: { enabled: true },
+						toolActivity: { enabled: false },
 						topics: { nameTemplate: "{repo}/{branch}" },
 					},
 					discord: {
@@ -367,6 +376,7 @@ describe("notifications config", () => {
 			{ notifications: { telegram: { activation: true } } },
 			{ notifications: { telegram: { rich: true } } },
 			{ notifications: { telegram: { richDraft: true } } },
+			{ notifications: { telegram: { toolActivity: true } } },
 			{ notifications: { telegram: { topics: true } } },
 			{ notifications: { discord: [] } },
 			{ notifications: { slack: [] } },

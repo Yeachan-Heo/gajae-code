@@ -306,6 +306,16 @@ export const SETTINGS_SCHEMA = {
 			editing: "notification-atomic",
 		},
 	},
+	"notifications.telegram.toolActivity.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Tool Activity",
+			description: "Send Telegram updates for tool starts and completions.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.telegram.topics.nameTemplate": { type: "string", default: undefined },
 	"notifications.discord.botToken": { type: "string", default: undefined },
 	"notifications.discord.applicationId": { type: "string", default: undefined },
@@ -3766,6 +3776,9 @@ export interface NotificationsSettings {
 			enabled: boolean;
 		};
 		richDraft: {
+			enabled: boolean;
+		};
+		toolActivity: {
 			enabled: boolean;
 		};
 		topics: {

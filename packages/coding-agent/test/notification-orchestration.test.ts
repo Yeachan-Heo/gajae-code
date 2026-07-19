@@ -44,6 +44,7 @@ function snapshot(overrides: Partial<NotificationSettingsSnapshot> = {}): Notifi
 			chatId: "stored-chat",
 			rich: { enabled: true },
 			richDraft: { enabled: false },
+			toolActivity: { enabled: true },
 			topics: {},
 			activation: {},
 		} as NotificationSettingsSnapshot["telegram"] & { activation: TelegramActivationMarkers },

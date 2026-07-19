@@ -93,6 +93,17 @@
 							},
 							"additionalProperties": false
 						},
+						"toolActivity": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Send Telegram updates for tool starts and completions.",
+									"default": true
+								}
+							},
+							"additionalProperties": false
+						},
 						"topics": {
 							"type": "object",
 							"properties": {

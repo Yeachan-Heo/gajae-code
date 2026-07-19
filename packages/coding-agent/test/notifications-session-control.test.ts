@@ -30,6 +30,7 @@ const BASE_CONFIG: NotificationConfig = {
 	idleTimeoutMs: 60_000,
 	rich: { enabled: true },
 	richDraft: { enabled: false },
+	toolActivity: { enabled: true },
 	topics: { nameTemplate: undefined },
 	btw: { enabled: true },
 };

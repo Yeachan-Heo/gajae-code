@@ -30,6 +30,7 @@ export interface NotificationsEditorPreferences {
 	sessionScope: "all" | "primary";
 	richEnabled: boolean;
 	richDraftEnabled: boolean;
+	toolActivityEnabled: boolean;
 }
 
 /** Secret-safe snapshot used to render the Notifications tab. */
@@ -155,7 +156,8 @@ type HomeActionId =
 	| "recover"
 	| "reconnect"
 	| "remove"
-	| "preferences";
+	| "preferences"
+	| "tool-activity";
 
 interface Action {
 	id: HomeActionId | "telegram" | "external" | "save" | "save-inactive" | "cancel" | "confirm";
@@ -190,6 +192,7 @@ function emptyState(): NotificationsEditorState {
 			sessionScope: "all",
 			richEnabled: true,
 			richDraftEnabled: false,
+			toolActivityEnabled: true,
 		},
 	};
 }
@@ -928,6 +931,9 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 			case "refresh":
 				draft.richDraftEnabled = !draft.richDraftEnabled;
 				return;
+			case "tool-activity":
+				draft.toolActivityEnabled = !draft.toolActivityEnabled;
+				return;
 			default:
 				return;
 		}
@@ -1067,6 +1073,11 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				id: "refresh",
 				label: `Telegram rich drafts: ${draft.richDraftEnabled ? "on" : "off"}`,
 				description: "Toggle the unsaved rich-draft preference.",
+			},
+			{
+				id: "tool-activity",
+				label: `Telegram tool activity: ${draft.toolActivityEnabled ? "on" : "off"}`,
+				description: "Toggle tool start and completion notifications.",
 			},
 			{ id: "save", label: "Save preferences", description: "Atomically persist this preference draft." },
 			{ id: "cancel", label: "Cancel and discard draft", description: "Leave saved preferences unchanged." },

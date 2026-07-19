@@ -10,7 +10,12 @@ import type { Settings } from "../../config/settings";
 import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { getNotificationConfig, isTelegramConfigured, tokenFingerprint } from "./config";
-import { parseInThreadConfigCommand, parseRichToggleCommand, parseTelegramControlCommand } from "./config-commands";
+import {
+	parseInThreadConfigCommand,
+	parseRichToggleCommand,
+	parseTelegramControlCommand,
+	parseToolActivityToggleCommand,
+} from "./config-commands";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import { sanitizeDiagnostic } from "./notification-service";
 import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
@@ -156,13 +161,14 @@ export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
 const nodeFs: TelegramDaemonFs = fs.promises as unknown as TelegramDaemonFs;
 
 /**
- * Durably persist a `/rich` toggle. A real {@link Settings} exposes
- * `flushOrThrow()`, which rejects on a failed config.yml write (its `set()` is a
- * fire-and-forget whose background save swallows errors). The lightweight daemon
- * settings has no `flushOrThrow` — its `set()` already wrote durably and throws
- * on failure — so its plain `flush()` no-op drain is sufficient.
+ * Durably persist a daemon-local Telegram delivery toggle. A real
+ * {@link Settings} exposes `flushOrThrow()`, which rejects on a failed config.yml
+ * write (its `set()` is a fire-and-forget whose background save swallows errors).
+ * The lightweight daemon settings has no `flushOrThrow` — its `set()` already
+ * wrote durably and throws on failure — so its plain `flush()` no-op drain is
+ * sufficient.
  */
-async function flushRichToggleSettings(settings: Settings): Promise<void> {
+async function flushTelegramToggleSettings(settings: Settings): Promise<void> {
 	if (typeof settings.flushOrThrow === "function") {
 		await settings.flushOrThrow();
 		return;
@@ -1336,6 +1342,8 @@ export interface TelegramDaemonOptions {
 	rich?: { enabled: boolean };
 	/** Opt-in rich-draft streaming of live turn previews (off by default; see rich-draft.ts). */
 	richDraft?: { enabled: boolean };
+	/** Tool start/completion messages (enabled by default). */
+	toolActivity?: { enabled: boolean };
 	/**
 	 * Per-session Telegram forum-topic naming. `nameTemplate` supports the
 	 * `{repo}`, `{branch}`, and `{title}` placeholders; unset preserves the
@@ -2997,7 +3005,10 @@ export class TelegramNotificationDaemon {
 		const frames = this.pendingThreadedFrames.get(sessionId);
 		if (!frames || frames.length === 0) return;
 		this.pendingThreadedFrames.delete(sessionId);
-		for (const frame of frames) await this.submitThreadedFrame(sessionId, frame.send, topicLease);
+		for (const frame of frames) {
+			if (frame.msg.type === "tool_activity" && this.opts.toolActivity?.enabled === false) continue;
+			await this.submitThreadedFrame(sessionId, frame.send, topicLease);
+		}
 	}
 
 	/**
@@ -4089,6 +4100,13 @@ export class TelegramNotificationDaemon {
 			return;
 		}
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
+			if (msg.type === "tool_activity" && this.opts.toolActivity?.enabled === false) {
+				const toolCallId = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
+				const phase = typeof msg.phase === "string" ? msg.phase : undefined;
+				const hasVisibleStart =
+					toolCallId !== undefined && this.liveMessages.has(`${session.sessionId}:tool:${toolCallId}`);
+				if (phase === "started" || !hasVisibleStart) return;
+			}
 			const send = renderThreadedFrame(msg);
 			if (!send) return;
 			const existingTopic = await this.existingTopicForPrivateChat(session.sessionId);
@@ -4473,28 +4491,21 @@ export class TelegramNotificationDaemon {
 				}
 			}
 		}
-		// Rich-message toggle (/rich on|off): daemon-local delivery policy, NOT a
-		// session config forward. Handled at paired-chat pre-routing, before threaded
-		// injection and independent of any session WebSocket, so it works even when
-		// no session is connected and never becomes an ask answer.
+		// Telegram delivery toggles are daemon-local policy, NOT session config
+		// forwards. Handle them before threaded injection and independently of any
+		// session WebSocket, so they work even when no session is connected.
 		{
 			const m = (update as { update_id?: number; message?: Record<string, unknown> }).message;
 			const chat = m?.chat as { id?: unknown } | undefined;
 			const cmdText = typeof m?.text === "string" ? m.text : undefined;
-			const rawFirst = cmdText?.trim().split(/\s+/)[0]?.toLowerCase();
-			// Fail-closed: intercept ANY "/rich" or "/rich@<anything>" form (Telegram
-			// appends @botname in groups; the bot username may be unknown if getMe
-			// failed) so a rich command is never leaked into threaded injection / an
-			// ask answer. Argument validity is decided by parseRichToggleCommand below.
-			const isRichCommand = rawFirst?.split("@")[0] === "/rich";
-			if (m !== undefined && String(chat?.id) === String(this.opts.chatId) && isRichCommand) {
-				// Fail-closed: /rich mutates global config, so honor it ONLY in a PRIVATE
-				// paired chat — the same contract as session delivery and lifecycle
-				// commands. A group/supergroup chatId (legacy or hand-edited) must never
-				// let an arbitrary chat member toggle the owner's notification config.
+			const command = cmdText?.trim().split(/\s+/)[0]?.toLowerCase().split("@")[0];
+			const isRichCommand = command === "/rich";
+			const isToolsCommand = command === "/tools";
+			if (m !== undefined && String(chat?.id) === String(this.opts.chatId) && (isRichCommand || isToolsCommand)) {
+				// These commands mutate global config, so honor them ONLY in the
+				// configured private chat. Fail closed for legacy or hand-edited group IDs.
 				if (!(await this.pairedChatIsPrivate())) return;
 				const updateId = (update as { update_id?: number }).update_id;
-				// Dedupe redelivered updates so a toggle+confirmation runs at most once.
 				if (typeof updateId === "number") {
 					if (this.dispatchState.seenUpdateIds.has(updateId)) return;
 					await this.rememberSeenUpdateId(updateId);
@@ -4513,31 +4524,43 @@ export class TelegramNotificationDaemon {
 						// Best-effort confirmation; never block on the notice.
 					}
 				};
-				const desired = parseRichToggleCommand(cmdText ?? "");
+				const desired = isRichCommand
+					? parseRichToggleCommand(cmdText ?? "")
+					: parseToolActivityToggleCommand(cmdText ?? "");
+				const usage = isRichCommand ? "Usage: /rich on|off" : "Usage: /tools on|off";
 				if (desired === undefined) {
-					await reply("Usage: /rich on|off");
+					await reply(usage);
 					return;
 				}
+				const settingPath = isRichCommand
+					? "notifications.telegram.rich.enabled"
+					: "notifications.telegram.toolActivity.enabled";
+				const label = isRichCommand ? "Rich messages" : "Tool activity";
 				try {
-					await this.opts.settings.set("notifications.telegram.rich.enabled", desired);
-					// Confirm success only after a DURABLE write. The real Settings.set is
-					// a synchronous fire-and-forget whose queued save (Settings.#saveNow)
-					// swallows write errors, and Settings.flush() inherits that — neither
-					// rejects on a failed config.yml write. flushOrThrow() rethrows the
-					// durable-write failure so it lands in the catch below (in-memory
-					// isolated Settings short-circuit and never throw). The lightweight
-					// daemon settings has no flushOrThrow: its set() already wrote durably
-					// (and throws on failure), so its flush() is only a no-op drain.
-					await flushRichToggleSettings(this.opts.settings);
+					await this.opts.settings.set(settingPath, desired);
+					// Confirm only after the global config write is durable.
+					await flushTelegramToggleSettings(this.opts.settings);
 				} catch (err) {
 					logger.warn(
-						`notifications: /rich settings write failed (${err instanceof Error ? err.message : String(err)}); runtime unchanged`,
+						`notifications: ${command} settings write failed (${err instanceof Error ? err.message : String(err)}); runtime unchanged`,
 					);
-					await reply("Rich messages: unchanged (settings write failed)");
+					await reply(`${label}: unchanged (settings write failed)`);
 					return;
 				}
-				this.opts.rich = { enabled: desired };
-				await reply(desired ? "Rich messages: on" : "Rich messages: off");
+				if (isRichCommand) {
+					this.opts.rich = { enabled: desired };
+				} else {
+					this.opts.toolActivity = { enabled: desired };
+					if (!desired) {
+						this.pool.removeWhere(item => item.coalesceKey?.startsWith("tool:") === true);
+						for (const [sessionId, frames] of this.pendingThreadedFrames) {
+							const retained = frames.filter(frame => frame.msg.type !== "tool_activity");
+							if (retained.length === 0) this.pendingThreadedFrames.delete(sessionId);
+							else this.pendingThreadedFrames.set(sessionId, retained);
+						}
+					}
+				}
+				await reply(`${label}: ${desired ? "on" : "off"}`);
 				return;
 			}
 		}
@@ -4855,6 +4878,7 @@ export class TelegramNotificationDaemon {
 					{ command: "lean", description: "Mirror assistant text + tool names only (default)" },
 					{ command: "redact", description: "Toggle redaction of streamed content: /redact <on|off>" },
 					{ command: "rich", description: "Toggle rich Telegram delivery: /rich <on|off>" },
+					{ command: "tools", description: "Toggle tool activity updates: /tools <on|off>" },
 					{ command: "reasoning", description: "Show or change reasoning effort in this session" },
 					{ command: "usage", description: "Show provider/local usage for this session" },
 					{ command: "model", description: "Select a model for this session" },

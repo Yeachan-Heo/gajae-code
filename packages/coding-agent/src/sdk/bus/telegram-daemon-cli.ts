@@ -215,6 +215,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		idleTimeoutMs: cfg.idleTimeoutMs,
 		rich: cfg.rich,
 		richDraft: cfg.richDraft,
+		toolActivity: cfg.toolActivity,
 		topics: cfg.topics,
 		btw: cfg.btw,
 		pid: deps.processPid ?? process.pid,
