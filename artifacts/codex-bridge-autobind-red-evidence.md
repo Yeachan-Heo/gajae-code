@@ -770,3 +770,28 @@ Authorization placement (re-confirmed): token from token_file is sent exclusivel
 as `Authorization: Bearer <token>` in the HTTP Upgrade; capture test proves the
 header exists only when token_file is configured and the token never appears in
 any JSON-RPC frame. No params-token merge exists in request().
+
+## Origin-correlation mapping verification (reported swap already fixed; now mutation-locked)
+
+The reported swap (context.session_id/turn_id written into gjc_session_id/gjc_turn_id
+with codex_turn_id null) existed in the FIRST auto-bind iteration and was corrected in
+the a04bc387-era finalizer. Current shipped mapping (both ambient and explicit paths):
+
+    gjc_session_id        = newly created coordinator sessionId (workUnit)
+    gjc_turn_id           = newly accepted GJC turn.turn_id (delegationId passes turn.turn_id)
+    codex_thread_id       = source.thread_id (bindDelegateCodexHandoff enforces
+                            origin.codex_thread_id === source.thread_id -> state_corrupt)
+    codex_turn_id         = context.turn_id            (Codex host turn correlation)
+    codex_host_session_id = context.session_id / explicit correlation id (dedicated field;
+                            never masquerades as the GJC session)
+    delegation_id         = GJC turn id (stable per delegation)
+
+New assertions in `auto-binds concurrent delegated sessions to the newest host Codex
+handoff`: two delegates have DISTINCT gjc_session_id and DISTINCT gjc_turn_id while
+sharing codex_thread_id and preserving identical codex_host_session_id/codex_turn_id;
+GJC ids never equal Codex host ids.
+
+Mutation RED proof: reintroducing the reported swapped mapping
+(gjc_session_id=context.session_id, gjc_turn_id=context.turn_id, codex_turn_id=null,
+codex_host_session_id=null) fails the test (1 fail, 3 expect calls reached); reverted
+-> 14 expect calls pass.

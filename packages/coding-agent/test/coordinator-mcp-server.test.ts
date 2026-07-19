@@ -1628,19 +1628,38 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			]),
 		);
 		expect(new Set(sessionIds).size).toBe(2);
+		const origins: Array<Record<string, unknown>> = [];
 		for (const [index, sessionId] of sessionIds.entries()) {
-			expect(await readCodexHandoff(namespace, sessionId)).toMatchObject({
+			const bound = await readCodexHandoff(namespace, sessionId);
+			expect(bound).toMatchObject({
 				thread_id: source.thread_id,
 				endpoint: source.endpoint,
 				token_file: source.token_file,
 				origin: {
+					// GJC identity: the NEW delegate coordinator session and its accepted GJC turn.
 					gjc_session_id: sessionId,
+					gjc_turn_id: results[index]?.turn_id,
+					// Codex correlation: host thread (must equal source), host session, host turn.
+					codex_thread_id: source.thread_id,
 					codex_host_session_id: "visible-session",
 					codex_turn_id: "host-turn",
 					delegation_id: results[index]?.turn_id,
 					workflow: "execute",
 				},
 			});
+			origins.push(bound?.origin as Record<string, unknown>);
+		}
+		// Two delegates: DISTINCT GJC session + turn identities...
+		expect(origins[0]?.gjc_session_id).not.toBe(origins[1]?.gjc_session_id);
+		expect(origins[0]?.gjc_turn_id).not.toBe(origins[1]?.gjc_turn_id);
+		// ...sharing one Codex thread and the SAME Codex host session/turn correlation.
+		expect(origins[0]?.codex_thread_id).toBe(origins[1]?.codex_thread_id);
+		expect(origins[0]?.codex_host_session_id).toBe(origins[1]?.codex_host_session_id);
+		expect(origins[0]?.codex_turn_id).toBe(origins[1]?.codex_turn_id);
+		// GJC ids never masquerade as Codex host ids and vice versa.
+		for (const origin of origins) {
+			expect(origin.gjc_session_id).not.toBe(origin.codex_host_session_id);
+			expect(origin.gjc_turn_id).not.toBe(origin.codex_turn_id);
 		}
 		expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceBefore);
 	});
