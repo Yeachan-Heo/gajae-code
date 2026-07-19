@@ -46,7 +46,6 @@ import {
 import "../tools/review";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { generateCommitMessage } from "../utils/commit-message-generator";
-import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import { runSubprocess } from "./executor";
 import { adviseForkContextMode } from "./fork-context-advisory";
@@ -61,11 +60,9 @@ import { reconcileSpawnRoi } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
 import { DEFAULT_SPAWN_THRESHOLD, evaluateSpawnGate } from "./spawn-gate";
 import {
-	applyNestedPatches,
 	captureBaseline,
 	captureDeltaPatch,
 	cleanupIsolation,
-	cleanupTaskBranches,
 	commitToBranch,
 	ensureIsolation,
 	getRepoRoot,
@@ -1348,6 +1345,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 				const taskStart = Date.now();
 				let isolationHandle: IsolationHandle | undefined;
+				let cleanupIsolationOnExit = true;
+				let recoveryArtifactName: string | undefined;
+				const preserveIsolationForRecovery = (): void => {
+					cleanupIsolationOnExit = false;
+					recoveryArtifactName = isolationHandle?.baseDir ? path.basename(isolationHandle.baseDir) : undefined;
+				};
 				try {
 					if (!repoRoot || !baseline) {
 						throw new Error("Isolated task execution not initialized.");
@@ -1433,18 +1436,33 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								commitMsg,
 							);
 							const producedChanges = Boolean(commitResult?.branchName || commitResult?.nestedPatches.length);
+							const artifactId = validateAllocatedTaskId(task.id);
+							const nestedPatches = await Promise.all(
+								(commitResult?.nestedPatches ?? []).map(async (nested, nestedIndex) => {
+									const repositoryToken =
+										nested.relativePath.replace(/[^a-zA-Z0-9.-]+/g, "-").replace(/^-+|-+$/g, "") || "nested";
+									const artifactPath = path.join(
+										effectiveArtifactsDir,
+										`${artifactId}.nested-${nestedIndex + 1}-${repositoryToken}.patch`,
+									);
+									await Bun.write(artifactPath, nested.patch);
+									return { ...nested, artifactPath };
+								}),
+							);
 							return {
 								...resultWithForkContext,
 								branchName: commitResult?.branchName,
-								nestedPatches: commitResult?.nestedPatches,
+								nestedPatches,
 								producedChanges,
 							};
 						} catch (mergeErr) {
-							// Agent succeeded but branch commit failed — clean up stale branch
-							const branchName = `gjc/task/${task.id}`;
-							await git.branch.tryDelete(repoRoot, branchName);
+							preserveIsolationForRecovery();
 							const msg = mergeErr instanceof Error ? mergeErr.message : String(mergeErr);
-							return { ...resultWithForkContext, error: `Merge failed: ${msg}` };
+							return {
+								...resultWithForkContext,
+								recoveryArtifactName,
+								error: `Merge failed: ${msg}`,
+							};
 						}
 					}
 					if (resultWithForkContext.exitCode === 0) {
@@ -1453,20 +1471,42 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							const artifactId = validateAllocatedTaskId(task.id);
 							const patchPath = path.join(effectiveArtifactsDir, `${artifactId}.patch`);
 							await Bun.write(patchPath, delta.rootPatch);
-							const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
+							const nestedPatches = await Promise.all(
+								delta.nestedPatches.map(async (nested, nestedIndex) => {
+									const repositoryToken =
+										nested.relativePath.replace(/[^a-zA-Z0-9.-]+/g, "-").replace(/^-+|-+$/g, "") || "nested";
+									const artifactPath = path.join(
+										effectiveArtifactsDir,
+										`${artifactId}.nested-${nestedIndex + 1}-${repositoryToken}.patch`,
+									);
+									await Bun.write(artifactPath, nested.patch);
+									return { ...nested, artifactPath };
+								}),
+							);
+							const producedChanges = Boolean(delta.rootPatch.trim() || nestedPatches.length);
 							return {
 								...resultWithForkContext,
 								patchPath,
-								nestedPatches: delta.nestedPatches,
+								nestedPatches,
 								producedChanges,
 							};
 						} catch (patchErr) {
+							preserveIsolationForRecovery();
 							const msg = patchErr instanceof Error ? patchErr.message : String(patchErr);
-							return { ...resultWithForkContext, error: `Patch capture failed: ${msg}` };
+							return {
+								...resultWithForkContext,
+								recoveryArtifactName,
+								error: `Patch capture failed: ${msg}`,
+							};
 						}
+					}
+					if (resultWithForkContext.exitCode !== 0 || resultWithForkContext.aborted) {
+						preserveIsolationForRecovery();
+						return { ...resultWithForkContext, recoveryArtifactName };
 					}
 					return resultWithForkContext;
 				} catch (err) {
+					preserveIsolationForRecovery();
 					const message = err instanceof Error ? err.message : String(err);
 					const assignment = task.assignment.trim();
 					return {
@@ -1486,9 +1526,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						modelOverride,
 						forkContext,
 						error: message,
+						recoveryArtifactName,
 					};
 				} finally {
-					if (isolationHandle) {
+					if (isolationHandle && cleanupIsolationOnExit) {
 						await cleanupIsolation(isolationHandle);
 					}
 				}
@@ -1562,7 +1603,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			let mergeSummary = "";
 			let changesApplied: boolean | null = null;
 			let hadAnyChanges = false;
-			let mergedBranchesForNestedPatches: Set<string> | null = null;
 			if (isIsolated && repoRoot) {
 				try {
 					if (mergeMode === "branch") {
@@ -1577,7 +1617,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							mergeSummary = "\n\nNo changes to apply.";
 						} else {
 							const mergeResult = await mergeTaskBranches(repoRoot, branchEntries);
-							mergedBranchesForNestedPatches = new Set(mergeResult.merged);
 							changesApplied = mergeResult.failed.length === 0;
 							hadAnyChanges = changesApplied && mergeResult.merged.length > 0;
 
@@ -1593,54 +1632,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								mergeSummary = `\n\n<system-notification>Branch merge failed. ${mergedPart}${failedPart}${conflictPart}\nUnmerged branches remain for manual resolution.</system-notification>`;
 							}
 						}
-
-						// Clean up merged branches (keep failed ones for manual resolution)
-						const allBranches = branchEntries.map(b => b.branchName);
-						if (changesApplied) {
-							await cleanupTaskBranches(repoRoot, allBranches);
-						}
 					} else {
-						// Patch mode: combine and apply patches
+						// Patch mode preserves artifacts for explicit managed integration.
 						const patchesInOrder = results.map(result => result.patchPath).filter(Boolean) as string[];
-						const missingPatch = results.some(result => !result.patchPath);
-						if (missingPatch) {
-							changesApplied = false;
-							hadAnyChanges = false;
-						} else {
-							const patchStats = await Promise.all(
-								patchesInOrder.map(async patchPath => ({
-									patchPath,
-									size: (await fs.stat(patchPath)).size,
-								})),
-							);
-							const nonEmptyPatches = patchStats.filter(patch => patch.size > 0).map(patch => patch.patchPath);
-							if (nonEmptyPatches.length === 0) {
-								changesApplied = true;
-								hadAnyChanges = false;
-							} else {
-								const patchTexts = await Promise.all(
-									nonEmptyPatches.map(async patchPath => Bun.file(patchPath).text()),
-								);
-								const combinedPatch = patchTexts
-									.map(text => (text.endsWith("\n") ? text : `${text}\n`))
-									.join("");
-								if (!combinedPatch.trim()) {
-									changesApplied = true;
-									hadAnyChanges = false;
-								} else {
-									changesApplied = await git.patch.canApplyText(repoRoot, combinedPatch);
-									if (changesApplied) {
-										try {
-											await git.patch.applyText(repoRoot, combinedPatch);
-											hadAnyChanges = true;
-										} catch {
-											changesApplied = false;
-											hadAnyChanges = false;
-										}
-									}
-								}
-							}
-						}
+						const patchStats = await Promise.all(
+							patchesInOrder.map(async patchPath => ({
+								patchPath,
+								size: (await fs.stat(patchPath)).size,
+							})),
+						);
+						hadAnyChanges =
+							patchStats.some(patch => patch.size > 0) ||
+							results.some(result => (result.nestedPatches?.length ?? 0) > 0);
+						changesApplied = !hadAnyChanges;
 
 						if (changesApplied) {
 							mergeSummary = hadAnyChanges ? "\n\nApplied patches: yes" : "\n\nNo changes to apply.";
@@ -1662,44 +1666,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				}
 			}
 
-			// Apply nested repo patches (separate from parent git)
-			if (isIsolated && repoRoot && (mergeMode === "branch" || changesApplied !== false)) {
-				const allNestedPatches = results
-					.filter(r => {
-						if (!r.nestedPatches || r.nestedPatches.length === 0 || r.exitCode !== 0 || r.aborted) {
-							return false;
-						}
-						if (mergeMode !== "branch") {
-							return true;
-						}
-						if (!r.branchName || !mergedBranchesForNestedPatches) {
-							return false;
-						}
-						return mergedBranchesForNestedPatches.has(r.branchName);
-					})
-					.flatMap(r => r.nestedPatches!);
-				if (allNestedPatches.length > 0) {
-					try {
-						const commitMsg =
-							commitStyle === "ai" && this.session.modelRegistry
-								? async (diff: string) => {
-										return generateCommitMessage(
-											diff,
-											this.session.modelRegistry!,
-											this.session.settings,
-											this.session.getSessionId?.() ?? undefined,
-										);
-									}
-								: undefined;
-						await applyNestedPatches(repoRoot, allNestedPatches, commitMsg);
-					} catch {
-						// Nested patch failures are non-fatal to the parent merge
-						mergeSummary +=
-							"\n\n<system-notification>Some nested repository patches failed to apply.</system-notification>";
-					}
-				}
-			}
-
+			const nestedPatchCount = results.reduce((count, result) => count + (result.nestedPatches?.length ?? 0), 0);
+			if (nestedPatchCount > 0)
+				mergeSummary += `\n\n<system-notification>${nestedPatchCount} nested repository patch artifact${nestedPatchCount === 1 ? "" : "s"} preserved for explicit managed integration.</system-notification>`;
 			// Build final output - match plugin format
 			const cancelledCount = results.filter(r => r.aborted).length;
 			const successCount = results.filter(r => r.exitCode === 0 && !r.error && !r.aborted).length;
@@ -1738,9 +1707,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				mergeSummary,
 			});
 
-			// Cleanup temp directory if used
+			// Cleanup only when no patch artifact still requires explicit integration.
+			const hasPendingPatchArtifacts = results.some(
+				result =>
+					(mergeMode === "patch" && result.producedChanges === true) || (result.nestedPatches?.length ?? 0) > 0,
+			);
 			const shouldCleanupTempArtifacts =
-				tempArtifactsDir && (!isIsolated || changesApplied === true || changesApplied === null);
+				tempArtifactsDir &&
+				!hasPendingPatchArtifacts &&
+				(!isIsolated || changesApplied === true || changesApplied === null);
 			if (shouldCleanupTempArtifacts) {
 				await fs.rm(tempArtifactsDir, { recursive: true, force: true });
 			}

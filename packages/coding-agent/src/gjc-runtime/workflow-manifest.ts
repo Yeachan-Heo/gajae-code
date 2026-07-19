@@ -458,6 +458,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 					"read-events",
 					"await-event",
 					"write-shutdown-request",
+					"write-shutdown-ack",
 					"read-shutdown-ack",
 					"read-monitor-snapshot",
 					"write-monitor-snapshot",

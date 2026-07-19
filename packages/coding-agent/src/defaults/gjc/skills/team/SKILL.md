@@ -81,6 +81,9 @@ GJC_TEAM_WORKER_COMMAND="bun packages/coding-agent/src/cli.ts" gjc team executor
 ```
 
 ## Preconditions
+### Managed lifecycle lanes
+
+When `<git-common-dir>/gjc/lifecycle/v1/policy.json` exists, Team is a worker layer inside one active managed **feature** lane. Launch only from that feature lane's recorded worktree path; never launch from `main` or a user checkout. Managed startup refuses any existing deterministic worker path or named worker branch and records exact common-dir, path, branch/detached mode, base HEAD, team, and worker ownership. It holds a renewable lane lease for the full run. Managed runtime never auto-checkpoints dirty worktrees, cherry-picks, or cross-rebases; under the lane lock it merges only the captured worker SHA into a clean, registered leader worktree. Unmanaged teams never integrate into the leader checkout automatically. Graceful managed shutdown requires each worker to write a matching `accepted` ACK, flush and commit its final work, then write a terminal `stopped` ACK containing runtime-captured clean final-HEAD evidence immediately before exiting. The leader does not kill managed panes during graceful shutdown. Missing terminal ACK or exit proof is nonterminal: preserve worktrees and lease. Cleanup is evidence-gated: only team-created, clean, registered worktrees exactly at their recorded integrated head and reachable from the leader HEAD are removed non-forcibly.
 
 Before running `$team`, confirm:
 
@@ -250,6 +253,7 @@ Semantics:
 - `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/lifecycle.json`
 - `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/heartbeat.json`
 - `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/shutdown-request.json`
+- `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/shutdown-ack.json`
 - `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/nudges/<fingerprint>.json`
 - `.gjc/_session-{sessionid}/reports/team-commit-hygiene/<team>.ledger.json`
 
@@ -263,6 +267,8 @@ gjc team api claim-task --input '{"team_name":"my-team","worker_id":"worker-1"}'
 gjc team api transition-task-status --input '{"team_name":"my-team","task_id":"task-1","to":"completed","worker_id":"worker-1","claim_token":"<claim-token>","completion_evidence":{"summary":"Completed requested work and verified it locally.","items":[{"kind":"command","status":"passed","summary":"Focused test passed","command":"bun test packages/coding-agent/test/gjc-runtime/team-runtime.test.ts"}],"files":["packages/coding-agent/test/gjc-runtime/team-runtime.test.ts"],"notes":"Include at least one passed command or verified inspection/artifact item."}}' --json
 gjc team api update-worker-status --input '{"team_name":"my-team","worker_id":"worker-1","status":"working","current_task_id":"task-1"}' --json
 gjc team api recover-stale-claims --input '{"team_name":"my-team"}' --json
+gjc team api write-shutdown-ack --input '{"team_name":"my-team","worker_id":"worker-1","request_id":"<shutdown-request-id>","status":"accepted"}' --json
+gjc team api write-shutdown-ack --input '{"team_name":"my-team","worker_id":"worker-1","request_id":"<shutdown-request-id>","status":"stopped"}' --json
 gjc team api read-traces --input '{"team_name":"my-team"}' --json
 gjc team api create-task --input '{"team_name":"my-team","subject":"Verify delivery","description":"Run verification","owner":"worker-1","lane":"verification","required_role":"executor","depends_on":["task-1"]}' --json
 ```
@@ -300,10 +306,11 @@ Forbidden assumptions: do not copy OMX paths, Codex notify payload formats, OMX 
 Worker protocol:
 
 - Send startup ACK with `worker-startup-ack` before task work.
+- On a graceful shutdown request, first acknowledge it with status `accepted`. After flushing and committing final work, write status `stopped` with the same request id immediately before exiting. The runtime captures final HEAD and cleanliness in the terminal ACK. Do not create ACK or stopped evidence on behalf of another worker.
 - Report worker activity with `update-worker-status`; this is the worker-reported status plane, not the runtime lifecycle state.
 - Claim pending work with `claim-task`.
 - Transition the task to `completed`, `failed`, or `blocked` with `transition-task-status`, including claim token and evidence for completion.
-- Commit or leave worktree changes in the worker worktree; the leader `monitor`/`resume` path will auto-checkpoint dirty worktrees and integrate committed history where possible.
+- Commit worktree changes explicitly. Managed leader `monitor`/`resume` integrates committed worker history under the lane lock; unmanaged teams report `integration_required` without mutating the leader checkout.
 - Record implementation/verification evidence in normal task output and state files; leader integration/conflict notifications are delivered through `.gjc/_session-{sessionid}/state/team/<team>/mailbox/leader-fixed.json`.
 
 ## Environment Knobs

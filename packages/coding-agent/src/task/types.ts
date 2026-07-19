@@ -326,6 +326,7 @@ export interface SingleResult {
 	outputPath?: string;
 	/** Patch path for isolated worktree output */
 	patchPath?: string;
+	recoveryArtifactName?: string;
 	/** Branch name for isolated branch-mode output */
 	branchName?: string;
 	/** Nested repo patches to apply after parent merge */

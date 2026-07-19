@@ -138,10 +138,6 @@ function hasBranchInUse(entries: GitWorktreeEntry[], branchName: string, worktre
 	return entries.some(entry => entry.branchRef === expectedRef && path.resolve(entry.path) !== resolvedPath);
 }
 
-function pruneStaleWorktreePath(repoRoot: string): void {
-	runGit(repoRoot, ["worktree", "prune"]);
-}
-
 function readWorktreeEntryFromPath(repoRoot: string, worktreePath: string): GitWorktreeEntry | null {
 	if (!fs.existsSync(worktreePath)) return null;
 	const repoCommonDir = tryRunGit(repoRoot, ["rev-parse", "--git-common-dir"]);
@@ -226,12 +222,10 @@ export function ensureLaunchWorktree(
 	plan: GjcLaunchWorktreePlan | { enabled: false },
 ): GjcLaunchWorktreeResult | { enabled: false } {
 	if (!plan.enabled) return { enabled: false };
-	let allWorktrees = listWorktrees(plan.repoRoot);
+	const allWorktrees = listWorktrees(plan.repoRoot);
 	const staleAtPath = findWorktreeByPath(allWorktrees, plan.worktreePath);
-	if (staleAtPath && !fs.existsSync(staleAtPath.path)) {
-		pruneStaleWorktreePath(plan.repoRoot);
-		allWorktrees = listWorktrees(plan.repoRoot);
-	}
+	if (staleAtPath && !fs.existsSync(staleAtPath.path))
+		throw new Error(`worktree_stale_registration:${plan.worktreePath}`);
 
 	const existingAtPath =
 		findWorktreeByPath(allWorktrees, plan.worktreePath) ??
@@ -239,27 +233,13 @@ export function ensureLaunchWorktree(
 	const expectedBranchRef = plan.branchName ? `refs/heads/${plan.branchName}` : null;
 
 	if (existingAtPath) {
-		let dirty = isWorktreeDirty(plan.worktreePath);
-		if (plan.detached) {
-			if (!existingAtPath.detached) {
-				throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
-			}
-			if (existingAtPath.head !== plan.baseRef) {
-				if (dirty) throw new Error(`worktree_dirty:${plan.worktreePath}`);
-				runGit(plan.worktreePath, ["checkout", "--detach", plan.baseRef]);
-				dirty = false;
-			}
-		} else if (existingAtPath.branchRef !== expectedBranchRef) {
+		if (isWorktreeDirty(plan.worktreePath)) throw new Error(`worktree_dirty:${plan.worktreePath}`);
+		if (
+			(plan.detached && !existingAtPath.detached) ||
+			(!plan.detached && existingAtPath.branchRef !== expectedBranchRef)
+		)
 			throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
-		}
-		return {
-			...plan,
-			worktreePath: path.resolve(plan.worktreePath),
-			created: false,
-			reused: true,
-			createdBranch: false,
-			...(dirty ? { dirty: true } : {}),
-		};
+		throw new Error(`worktree_ownership_required:${plan.worktreePath}`);
 	}
 
 	if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
@@ -267,11 +247,11 @@ export function ensureLaunchWorktree(
 		throw new Error(`branch_in_use:${plan.branchName}`);
 	}
 
-	fs.mkdirSync(path.dirname(plan.worktreePath), { recursive: true });
 	const branchAlreadyExisted = plan.branchName ? branchExists(plan.repoRoot, plan.branchName) : false;
+	if (branchAlreadyExisted) throw new Error(`branch_unmanaged:${plan.branchName}`);
+	fs.mkdirSync(path.dirname(plan.worktreePath), { recursive: true });
 	const args = ["worktree", "add"];
 	if (plan.detached) args.push("--detach", plan.worktreePath, plan.baseRef);
-	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
 	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
 
 	const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });

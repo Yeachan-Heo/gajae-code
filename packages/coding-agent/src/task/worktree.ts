@@ -1,9 +1,17 @@
+import { randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
 import { getWorktreeDir, hashPath, logger, Snowflake } from "@gajae-code/utils";
+import {
+	acquireLifecycleLock,
+	findLaneRecordByWorktreePath,
+	type LifecycleLock,
+	readLaneRecord,
+	writeLaneRecord,
+} from "../gjc-runtime/git-lifecycle";
 import * as git from "../utils/git";
 
 const { IsoBackendKind } = natives;
@@ -158,6 +166,7 @@ async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline): Promise
 export interface NestedRepoPatch {
 	relativePath: string;
 	patch: string;
+	artifactPath?: string;
 }
 
 export interface DeltaPatchResult {
@@ -181,47 +190,6 @@ export async function captureDeltaPatch(isolationDir: string, baseline: Worktree
 	}
 
 	return { rootPatch, nestedPatches };
-}
-
-/**
- * Apply nested repo patches directly to their working directories after parent merge.
- * @param commitMessage Optional async function to generate a commit message from the combined diff.
- *                      If omitted or returns null, falls back to a generic message.
- */
-export async function applyNestedPatches(
-	repoRoot: string,
-	patches: NestedRepoPatch[],
-	commitMessage?: (diff: string) => Promise<string | null>,
-): Promise<void> {
-	// Group patches by target repo to apply all at once and commit
-	const byRepo = new Map<string, NestedRepoPatch[]>();
-	for (const p of patches) {
-		if (!p.patch.trim()) continue;
-		const group = byRepo.get(p.relativePath) ?? [];
-		group.push(p);
-		byRepo.set(p.relativePath, group);
-	}
-
-	for (const [relativePath, repoPatches] of byRepo) {
-		const nestedDir = path.join(repoRoot, relativePath);
-		try {
-			await fs.access(path.join(nestedDir, ".git"));
-		} catch {
-			continue;
-		}
-
-		const combinedDiff = repoPatches.map(p => p.patch).join("\n");
-		for (const { patch } of repoPatches) {
-			await git.patch.applyText(nestedDir, patch);
-		}
-
-		// Commit so nested repo history reflects the task changes
-		if ((await git.status(nestedDir)).trim().length > 0) {
-			const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
-			await git.stage.files(nestedDir);
-			await git.commit(nestedDir, msg);
-		}
-	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -287,6 +255,8 @@ export function parseIsolationMode(mode: TaskIsolationMode): IsoBackendKind | un
 export interface IsolationHandle {
 	/** Merged view materialised by the backend; pass this to the task. */
 	mergedDir: string;
+	baseDir?: string;
+	ownershipToken?: string;
 	/** Backend the PAL actually used. */
 	backend: IsoBackendKind;
 	/** True when the resolver downgraded from `preferred` to `backend`. */
@@ -312,38 +282,53 @@ export async function ensureIsolation(
 	preferred?: IsoBackendKind,
 ): Promise<IsolationHandle> {
 	const repoRoot = await getRepoRoot(baseCwd);
-	const baseDir = getWorktreeDir(`${id}-${hashPath(repoRoot)}`);
+	const ownershipToken = randomUUID();
+	const baseDir = getWorktreeDir(`${id}-${hashPath(repoRoot)}-${ownershipToken}`);
 	const mergedDir = path.join(baseDir, "merged");
+	const ownerPath = path.join(baseDir, ".gjc-isolation-owner");
+	await fs.mkdir(path.dirname(baseDir), { recursive: true });
+	await fs.mkdir(baseDir);
+	await fs.writeFile(ownerPath, ownershipToken, { encoding: "utf8", flag: "wx" });
 
 	const resolution = natives.isoResolve(preferred ?? null);
 	const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];
 	let fallbackReason = resolution.reason ?? null;
 
 	for (const candidate of candidates) {
-		await fs.rm(baseDir, { recursive: true, force: true });
+		await fs.rm(mergedDir, { recursive: true, force: true });
 		try {
 			await natives.isoStart(candidate, repoRoot, mergedDir);
 			return {
 				mergedDir,
+				baseDir,
+				ownershipToken,
 				backend: candidate,
 				fellBack: candidate !== resolution.kind || resolution.fellBack,
 				fallbackReason,
 			};
 		} catch (err) {
-			await fs.rm(baseDir, { recursive: true, force: true });
+			await fs.rm(mergedDir, { recursive: true, force: true });
 			const message = errorMessage(err);
 			if (!natives.isoIsUnavailableError(message)) {
+				if ((await fs.readFile(ownerPath, "utf8")) === ownershipToken)
+					await fs.rm(baseDir, { recursive: true, force: true });
 				throw err;
 			}
 			fallbackReason ??= message;
 		}
 	}
 
+	if ((await fs.readFile(ownerPath, "utf8")) === ownershipToken)
+		await fs.rm(baseDir, { recursive: true, force: true });
 	throw new Error(fallbackReason ?? "No isolation backend is available.");
 }
 
 /** Tear down a handle returned by {@link ensureIsolation}. */
 export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
+	const baseDir = handle.baseDir ?? path.dirname(handle.mergedDir);
+	const ownerPath = path.join(baseDir, ".gjc-isolation-owner");
+	if (!handle.ownershipToken || (await fs.readFile(ownerPath, "utf8")) !== handle.ownershipToken)
+		throw new Error("Isolation cleanup ownership proof is missing or mismatched.");
 	try {
 		try {
 			await natives.isoStop(handle.backend, handle.mergedDir);
@@ -355,9 +340,8 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
 			});
 		}
 	} finally {
-		// baseDir is the parent of the merged directory
-		const baseDir = path.dirname(handle.mergedDir);
-		await fs.rm(baseDir, { recursive: true, force: true });
+		if ((await fs.readFile(ownerPath, "utf8")) === handle.ownershipToken)
+			await fs.rm(baseDir, { recursive: true, force: true });
 	}
 }
 
@@ -429,6 +413,51 @@ export interface MergeBranchResult {
 	conflict?: string;
 }
 
+const MANAGED_TASK_INTEGRATION_STATES = new Set(["active", "pushed", "pr_open", "verifying", "eligible"]);
+
+function gitText(cwd: string, args: string[]): string | undefined {
+	const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	return result.exitCode === 0 ? result.stdout.toString().trim() : undefined;
+}
+
+async function acquireManagedTaskDestination(
+	repoRoot: string,
+): Promise<{ lock: LifecycleLock; commonDir: string; laneId: string } | undefined> {
+	const commonValue = gitText(repoRoot, ["rev-parse", "--git-common-dir"]);
+	if (!commonValue) return undefined;
+	const commonDir = path.resolve(repoRoot, commonValue);
+	try {
+		await fs.access(path.join(commonDir, "gjc", "lifecycle", "v1", "policy.json"));
+	} catch {
+		return undefined;
+	}
+	const lane = await findLaneRecordByWorktreePath(commonDir, repoRoot);
+	if (!lane || !MANAGED_TASK_INTEGRATION_STATES.has(lane.state)) return undefined;
+	const lock = await acquireLifecycleLock(commonDir, lane.laneId);
+	try {
+		const current = await readLaneRecord(commonDir, lane.laneId);
+		const branch = await git.branch.current(repoRoot);
+		const head = await git.head.sha(repoRoot);
+		if (
+			!current ||
+			!MANAGED_TASK_INTEGRATION_STATES.has(current.state) ||
+			current.leaseOwner ||
+			path.resolve(current.worktreePath) !== path.resolve(repoRoot) ||
+			current.branch !== branch ||
+			(current.gitCommonDir && path.resolve(current.gitCommonDir) !== commonDir) ||
+			!head ||
+			(current as typeof current & { headSha?: string }).headSha !== head
+		) {
+			await lock.release();
+			return undefined;
+		}
+		return { lock, commonDir, laneId: lane.laneId };
+	} catch (error) {
+		await lock.release();
+		throw error;
+	}
+}
+
 /**
  * Cherry-pick task branch commits sequentially onto HEAD.
  * Each branch has a single commit that gets replayed cleanly.
@@ -440,15 +469,52 @@ export async function mergeTaskBranches(
 ): Promise<MergeBranchResult> {
 	const merged: string[] = [];
 	const failed: string[] = [];
+	if (branches.length === 0) return { merged, failed };
+	const initialStatus = await git.status(repoRoot);
+	if (initialStatus.trim()) {
+		return {
+			merged,
+			failed: branches.map(branch => branch.branchName),
+			conflict: "Destination working tree is dirty; refusing to cherry-pick task branches.",
+		};
+	}
 
-	// Stash dirty working tree so cherry-pick can operate on a clean HEAD.
-	// Without this, cherry-pick refuses to run when uncommitted changes exist.
-	const didStash = await git.stash.push(repoRoot, "gjc-task-merge");
-
-	let conflictResult: MergeBranchResult | undefined;
+	const destination = await acquireManagedTaskDestination(repoRoot);
+	if (!destination) {
+		return {
+			merged,
+			failed: branches.map(branch => branch.branchName),
+			conflict: "Managed feature lane ownership is required; refusing to mutate the destination checkout.",
+		};
+	}
 
 	try {
+		let expectedHead = await git.head.sha(repoRoot);
+		if (!expectedHead) {
+			return {
+				merged,
+				failed: branches.map(branch => branch.branchName),
+				conflict: "Managed destination HEAD is unavailable; refusing to cherry-pick task branches.",
+			};
+		}
+		const status = await git.status(repoRoot);
+		if (status.trim()) {
+			return {
+				merged,
+				failed: branches.map(branch => branch.branchName),
+				conflict: "Destination working tree is dirty; refusing to cherry-pick task branches.",
+			};
+		}
+
 		for (const { branchName } of branches) {
+			if ((await git.head.sha(repoRoot)) !== expectedHead || (await git.status(repoRoot)).trim()) {
+				failed.push(branchName);
+				return {
+					merged,
+					failed: [...failed, ...branches.slice(merged.length + failed.length).map(branch => branch.branchName)],
+					conflict: "Managed destination changed during integration; refusing to continue.",
+				};
+			}
 			try {
 				await git.cherryPick(repoRoot, branchName);
 			} catch (err) {
@@ -464,43 +530,28 @@ export async function mergeTaskBranches(
 							? err.message
 							: String(err);
 				failed.push(branchName);
-				conflictResult = {
+				return {
 					merged,
-					failed: [...failed, ...branches.slice(merged.length + failed.length).map(b => b.branchName)],
+					failed: [...failed, ...branches.slice(merged.length + failed.length).map(branch => branch.branchName)],
 					conflict: `${branchName}: ${stderr}`,
 				};
-				break;
 			}
 
+			const nextHead = await git.head.sha(repoRoot);
+			if (!nextHead) throw new Error("Managed destination HEAD disappeared after task integration.");
+			expectedHead = nextHead;
 			merged.push(branchName);
 		}
+
+		const current = await readLaneRecord(destination.commonDir, destination.laneId);
+		if (!current) throw new Error("Managed destination lane disappeared after task integration.");
+		await writeLaneRecord(destination.commonDir, {
+			...current,
+			headSha: expectedHead,
+			updatedAt: new Date().toISOString(),
+		} as typeof current & { headSha: string });
+		return { merged, failed };
 	} finally {
-		if (didStash) {
-			try {
-				await git.stash.pop(repoRoot, { index: true });
-			} catch {
-				// Stash-pop conflicts mean the replayed changes clash with the user's
-				// uncommitted edits. Treat this as a merge failure so the caller preserves
-				// recovery branches instead of reporting success and deleting them.
-				logger.warn("Failed to restore stashed changes after task merge; stash entry preserved");
-				if (!conflictResult) {
-					conflictResult = {
-						merged,
-						failed: merged,
-						conflict:
-							"stash pop: cherry-picked changes conflict with uncommitted edits. Run `git stash pop` and resolve manually.",
-					};
-				}
-			}
-		}
-	}
-
-	return conflictResult ?? { merged, failed };
-}
-
-/** Clean up temporary task branches. */
-export async function cleanupTaskBranches(repoRoot: string, branches: string[]): Promise<void> {
-	for (const branch of branches) {
-		await git.branch.tryDelete(repoRoot, branch);
+		await destination.lock.release();
 	}
 }

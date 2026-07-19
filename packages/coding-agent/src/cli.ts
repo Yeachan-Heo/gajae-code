@@ -38,6 +38,7 @@ export const commands: CommandEntry[] = [
 	{ name: "team", load: () => import("./commands/team").then(m => m.default) },
 	{ name: "ultragoal", load: () => import("./commands/ultragoal").then(m => m.default) },
 	{ name: "gc", load: () => import("./commands/gc").then(m => m.default) },
+	{ name: "lane", load: () => import("./commands/lane").then(m => m.default) },
 	{ name: "ralplan", load: () => import("./commands/ralplan").then(m => m.default) },
 	{ name: "config", load: () => import("./commands/config").then(m => m.default) },
 	{ name: "stats", load: () => import("./commands/stats").then(m => m.default) },

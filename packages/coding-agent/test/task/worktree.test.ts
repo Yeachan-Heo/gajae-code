@@ -3,9 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
+import { readLaneRecord, writeLaneRecord } from "../../src/gjc-runtime/git-lifecycle";
 import {
 	captureBaseline,
 	captureDeltaPatch,
+	cleanupIsolation,
 	ensureIsolation,
 	getGitNoIndexNullPath,
 	mergeTaskBranches,
@@ -46,6 +48,31 @@ async function createGitRepo(): Promise<{ baseBranch: string; repo: string }> {
 		baseBranch: await runGit(repo, ["branch", "--show-current"]),
 		repo,
 	};
+}
+
+async function registerManagedDestination(repo: string, baseBranch: string): Promise<string> {
+	const commonValue = await runGit(repo, ["rev-parse", "--git-common-dir"]);
+	const commonDir = path.resolve(repo, commonValue);
+	const now = new Date().toISOString();
+	await fs.mkdir(path.join(commonDir, "gjc", "lifecycle", "v1"), { recursive: true });
+	await fs.writeFile(path.join(commonDir, "gjc", "lifecycle", "v1", "policy.json"), "{}\n");
+	await writeLaneRecord(commonDir, {
+		version: 1,
+		laneId: "task-lane",
+		state: "active",
+		repositoryId: "test-repository",
+		realm: process.platform === "win32" ? "windows" : "wsl",
+		branch: baseBranch,
+		worktreeToken: path.basename(repo),
+		worktreePath: repo,
+		agent: "gjc",
+		sessionId: "test-session",
+		gitCommonDir: commonDir,
+		headSha: await runGit(repo, ["rev-parse", "HEAD"]),
+		createdAt: now,
+		updatedAt: now,
+	});
+	return commonDir;
 }
 
 afterEach(async () => {
@@ -102,7 +129,75 @@ describe("worktree isolation helpers", () => {
 		expect(handle.fallbackReason).toBe(unavailable.message);
 	});
 
-	it("does not pop an unrelated pre-existing stash when the working tree is clean", async () => {
+	it("allocates unique owned isolation directories and cleans only the matching handle", async () => {
+		const { repo } = await createGitRepo();
+		vi.spyOn(natives, "isoResolve").mockReturnValue({
+			kind: natives.IsoBackendKind.Rcopy,
+			candidates: [natives.IsoBackendKind.Rcopy],
+			fellBack: false,
+			reason: undefined,
+		});
+		vi.spyOn(natives, "isoStart").mockImplementation(async (_backend, _source, mergedDir) => {
+			await fs.mkdir(mergedDir, { recursive: true });
+		});
+		vi.spyOn(natives, "isoStop").mockResolvedValue(undefined);
+
+		const first = await ensureIsolation(repo, "same-task");
+		const second = await ensureIsolation(repo, "same-task");
+		expect(first.baseDir).not.toBe(second.baseDir);
+
+		await cleanupIsolation(first);
+		expect(await fs.stat(second.mergedDir)).toBeDefined();
+		await cleanupIsolation(second);
+	});
+
+	async function createTaskBranch(repo: string, baseBranch: string, branchName: string): Promise<void> {
+		await runGit(repo, ["checkout", "-b", branchName]);
+		await fs.writeFile(path.join(repo, "merged.txt"), "task branch change\n");
+		await runGit(repo, ["add", "merged.txt"]);
+		await runGit(repo, ["commit", "-m", "task change"]);
+		await runGit(repo, ["checkout", baseBranch]);
+	}
+
+	async function captureDestination(
+		repo: string,
+		files: string[],
+	): Promise<{
+		cachedDiff: string;
+		files: Uint8Array[];
+		head: string;
+		index: string;
+		refs: string;
+		stash: string;
+		status: string;
+		unstagedDiff: string;
+	}> {
+		return {
+			cachedDiff: await runGit(repo, ["diff", "--cached", "--binary"]),
+			files: await Promise.all(files.map(file => fs.readFile(path.join(repo, file)))),
+			head: await runGit(repo, ["rev-parse", "HEAD"]),
+			index: await runGit(repo, ["ls-files", "--stage"]),
+			refs: await runGit(repo, ["show-ref", "--head"]),
+			stash: await runGit(repo, ["stash", "list"]),
+			status: await runGit(repo, ["status", "--porcelain=v1"]),
+			unstagedDiff: await runGit(repo, ["diff", "--binary"]),
+		};
+	}
+
+	async function expectDirtyDestinationRejected(repo: string, taskBranch: string, files: string[]): Promise<void> {
+		const before = await captureDestination(repo, files);
+
+		const result = await mergeTaskBranches(repo, [{ branchName: taskBranch, taskId: "task-1" }]);
+
+		expect(result).toEqual({
+			merged: [],
+			failed: [taskBranch],
+			conflict: "Destination working tree is dirty; refusing to cherry-pick task branches.",
+		});
+		expect(await captureDestination(repo, files)).toEqual(before);
+	}
+
+	it("keeps an unrelated pre-existing stash when the destination is clean", async () => {
 		const { repo } = await createGitRepo();
 		await fs.writeFile(path.join(repo, "preexisting.txt"), "user stash\n");
 		await runGit(repo, ["stash", "push", "--include-untracked", "-m", "preexisting-user-stash"]);
@@ -115,25 +210,114 @@ describe("worktree isolation helpers", () => {
 		expect(await runGit(repo, ["status", "--porcelain=v1"])).toBe("");
 	});
 
-	it("restores staged changes with index preservation after merging task branches", async () => {
+	it("fails closed without changing a staged destination", async () => {
 		const { baseBranch, repo } = await createGitRepo();
 		const taskBranch = "task/merge-staged";
-		await runGit(repo, ["checkout", "-b", taskBranch]);
-		await fs.writeFile(path.join(repo, "merged.txt"), "task branch change\n");
-		await runGit(repo, ["add", "merged.txt"]);
-		await runGit(repo, ["commit", "-m", "task-change"]);
-		await runGit(repo, ["checkout", baseBranch]);
+		await createTaskBranch(repo, baseBranch, taskBranch);
+		await fs.writeFile(path.join(repo, "stash-seed.txt"), "user stash\n");
+		await runGit(repo, ["stash", "push", "--include-untracked", "-m", "preexisting-user-stash"]);
 		await fs.writeFile(path.join(repo, "staged.txt"), "local staged change\n");
 		await runGit(repo, ["add", "staged.txt"]);
-		expect(await runGit(repo, ["status", "--porcelain=v1"])).toBe("M  staged.txt");
 
+		await expectDirtyDestinationRejected(repo, taskBranch, ["staged.txt"]);
+	});
+
+	it("fails closed without changing an unstaged destination", async () => {
+		const { baseBranch, repo } = await createGitRepo();
+		const taskBranch = "task/merge-unstaged";
+		await createTaskBranch(repo, baseBranch, taskBranch);
+		await fs.writeFile(path.join(repo, "stash-seed.txt"), "user stash\n");
+		await runGit(repo, ["stash", "push", "--include-untracked", "-m", "preexisting-user-stash"]);
+		await fs.writeFile(path.join(repo, "staged.txt"), "local unstaged change\n");
+
+		await expectDirtyDestinationRejected(repo, taskBranch, ["staged.txt"]);
+	});
+
+	it("fails closed without changing an untracked destination", async () => {
+		const { baseBranch, repo } = await createGitRepo();
+		const taskBranch = "task/merge-untracked";
+		await createTaskBranch(repo, baseBranch, taskBranch);
+		await fs.writeFile(path.join(repo, "stash-seed.txt"), "user stash\n");
+		await runGit(repo, ["stash", "push", "--include-untracked", "-m", "preexisting-user-stash"]);
+		await fs.writeFile(path.join(repo, "untracked.txt"), "local untracked change\n");
+
+		await expectDirtyDestinationRejected(repo, taskBranch, ["untracked.txt"]);
+	});
+
+	it("cherry-picks a task branch onto a clean destination", async () => {
+		const { baseBranch, repo } = await createGitRepo();
+		const taskBranch = "task/merge-clean";
+		await createTaskBranch(repo, baseBranch, taskBranch);
+
+		await registerManagedDestination(repo, baseBranch);
 		const result = await mergeTaskBranches(repo, [{ branchName: taskBranch, taskId: "task-1" }]);
 
 		expect(result).toEqual({ failed: [], merged: [taskBranch] });
-		expect(await fs.readFile(path.join(repo, "merged.txt"), "utf8")).toBe("task branch change\n");
-		expect(await runGit(repo, ["status", "--porcelain=v1"])).toBe("M  staged.txt");
-		expect(await runGit(repo, ["diff", "--cached", "--", "staged.txt"])).toContain("+local staged change");
-		expect(await runGit(repo, ["stash", "list"])).toBe("");
+		expect((await fs.readFile(path.join(repo, "merged.txt"), "utf8")).replace(/\r\n/g, "\n")).toBe(
+			"task branch change\n",
+		);
+		expect(await runGit(repo, ["status", "--porcelain=v1"])).toBe("");
+		const commonDir = path.resolve(repo, await runGit(repo, ["rev-parse", "--git-common-dir"]));
+		expect((await readLaneRecord(commonDir, "task-lane"))?.headSha).toBe(await runGit(repo, ["rev-parse", "HEAD"]));
+	});
+
+	it("refuses to mutate a clean destination without managed lane ownership", async () => {
+		const { baseBranch, repo } = await createGitRepo();
+		const taskBranch = "task/merge-unmanaged";
+		await createTaskBranch(repo, baseBranch, taskBranch);
+		const before = await captureDestination(repo, ["merged.txt"]);
+
+		const result = await mergeTaskBranches(repo, [{ branchName: taskBranch, taskId: "task-1" }]);
+
+		expect(result).toEqual({
+			merged: [],
+			failed: [taskBranch],
+			conflict: "Managed feature lane ownership is required; refusing to mutate the destination checkout.",
+		});
+		expect(await captureDestination(repo, ["merged.txt"])).toEqual(before);
+	});
+
+	it("refuses task integration while the managed lane has an active lease", async () => {
+		const { baseBranch, repo } = await createGitRepo();
+		const taskBranch = "task/merge-leased";
+		await createTaskBranch(repo, baseBranch, taskBranch);
+		const commonDir = await registerManagedDestination(repo, baseBranch);
+		const lane = await readLaneRecord(commonDir, "task-lane");
+		if (!lane) throw new Error("missing managed lane");
+		await writeLaneRecord(commonDir, {
+			...lane,
+			leaseOwner: "team:other",
+			leaseUpdatedAt: new Date().toISOString(),
+			leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+		});
+		const before = await captureDestination(repo, ["merged.txt"]);
+
+		const result = await mergeTaskBranches(repo, [{ branchName: taskBranch, taskId: "task-1" }]);
+
+		expect(result).toEqual({
+			merged: [],
+			failed: [taskBranch],
+			conflict: "Managed feature lane ownership is required; refusing to mutate the destination checkout.",
+		});
+		expect(await captureDestination(repo, ["merged.txt"])).toEqual(before);
+	});
+
+	it("aborts a clean-destination cherry-pick conflict and preserves the task branch", async () => {
+		const { baseBranch, repo } = await createGitRepo();
+		const taskBranch = "task/merge-conflict";
+		await createTaskBranch(repo, baseBranch, taskBranch);
+		await fs.writeFile(path.join(repo, "merged.txt"), "destination change\n");
+		await runGit(repo, ["add", "merged.txt"]);
+		await runGit(repo, ["commit", "-m", "destination change"]);
+
+		await registerManagedDestination(repo, baseBranch);
+		const result = await mergeTaskBranches(repo, [{ branchName: taskBranch, taskId: "task-1" }]);
+
+		expect(result.merged).toEqual([]);
+		expect(result.failed).toEqual([taskBranch]);
+		expect(result.conflict).toContain(taskBranch);
+		expect(await runGit(repo, ["status", "--porcelain=v1"])).toBe("");
+		expect(await runGit(repo, ["rev-parse", taskBranch])).not.toBe("");
 	});
 
 	it("subtracts baseline dirty state even when the task commits it", async () => {

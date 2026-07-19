@@ -7,6 +7,15 @@ import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import type { GcPidProbe, GcRecord } from "./gc-runtime";
+import {
+	acquireLifecycleLock,
+	appendLifecycleEvent,
+	findLaneRecordByWorktreePath,
+	type LaneRecord,
+	readLaneRecord,
+	WorkType,
+	writeLaneRecord,
+} from "./git-lifecycle";
 import { applyGjcTmuxProfile } from "./launch-tmux";
 import { modeStatePath, sessionIdFromDirName, sessionReportsDir, teamStateRoot } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
@@ -68,12 +77,15 @@ export interface GjcTeamWorker {
 	status: "starting" | "idle" | "busy" | "stopped";
 	last_heartbeat: string;
 	assigned_tasks: string[];
+	auth_token?: string;
 	worktree_repo_root?: string;
 	worktree_path?: string;
 	worktree_branch?: string | null;
 	worktree_detached?: boolean;
 	worktree_created?: boolean;
 	worktree_base_ref?: string;
+	worktree_git_common_dir?: string;
+	worktree_base_head?: string;
 	team_state_root?: string;
 }
 
@@ -155,12 +167,16 @@ export interface GjcTeamConfig {
 	team_state_root: string;
 	workers: GjcTeamWorker[];
 	created_at: string;
+	lifecycle_mode?: "managed";
+	lifecycle_lane_id?: string;
+	lifecycle_git_common_dir?: string;
 	updated_at: string;
 }
 
 export type GjcTeamIntegrationStatus =
 	| "idle"
 	| "integrated"
+	| "integration_required"
 	| "integration_failed"
 	| "merge_conflict"
 	| "cherry_pick_conflict"
@@ -196,6 +212,9 @@ export interface GjcTeamWorkerLifecycle {
 	shutdown_acknowledged_at?: string;
 	shutdown_ack_status?: string;
 	shutdown_mode?: GjcTeamShutdownMode;
+	shutdown_final_head?: string;
+	shutdown_clean?: boolean;
+	shutdown_terminal_at?: string;
 }
 
 export type GjcTeamNotificationDeliveryState =
@@ -574,6 +593,7 @@ export const GJC_TEAM_API_OPERATIONS = [
 	"read-traces",
 	"await-event",
 	"write-shutdown-request",
+	"write-shutdown-ack",
 	"read-shutdown-ack",
 	"read-monitor-snapshot",
 	"write-monitor-snapshot",
@@ -1199,6 +1219,9 @@ async function readWorkerLifecycleRecord(dir: string, worker: GjcTeamWorker): Pr
 	if (typeof shutdownAck?.acknowledged_at === "string")
 		lifecycle.shutdown_acknowledged_at = shutdownAck.acknowledged_at;
 	if (typeof shutdownAck?.status === "string") lifecycle.shutdown_ack_status = shutdownAck.status;
+	if (typeof shutdownAck?.final_head === "string") lifecycle.shutdown_final_head = shutdownAck.final_head;
+	if (typeof shutdownAck?.clean === "boolean") lifecycle.shutdown_clean = shutdownAck.clean;
+	if (typeof shutdownAck?.terminal_at === "string") lifecycle.shutdown_terminal_at = shutdownAck.terminal_at;
 	return lifecycle;
 }
 
@@ -1742,6 +1765,7 @@ function buildWorkers(count: number, agentType: string, stateRoot?: string): Gjc
 			status: "starting",
 			last_heartbeat: now(),
 			assigned_tasks: [],
+			auth_token: randomUUID(),
 			team_state_root: stateRoot,
 		};
 	});
@@ -1785,6 +1809,174 @@ function tryRunGit(cwd: string, args: string[]): string | null {
 }
 function isGitRepository(cwd: string): boolean {
 	return tryRunGit(cwd, ["rev-parse", "--show-toplevel"]) != null;
+}
+function gitCommonDir(cwd: string): string | null {
+	const commonDir = tryRunGit(cwd, ["rev-parse", "--git-common-dir"]);
+	return commonDir ? path.resolve(cwd, commonDir) : null;
+}
+
+const MANAGED_DEVELOPMENT_STATES = new Set(["active", "pushed", "pr_open", "verifying", "eligible"]);
+const MANAGED_FEATURE_LANE_TYPES = new Set(Object.values(WorkType));
+function isManagedFeatureLaneBranch(branch: string): boolean {
+	const [type, name] = branch.split("/", 2);
+	return Boolean(name && type && MANAGED_FEATURE_LANE_TYPES.has(type as (typeof WorkType)[keyof typeof WorkType]));
+}
+
+async function resolveManagedTeamLane(cwd: string): Promise<{ lane: LaneRecord; gitCommonDir: string } | undefined> {
+	const commonDir = gitCommonDir(cwd);
+	if (!commonDir || !(await pathExists(path.join(commonDir, "gjc", "lifecycle", "v1", "policy.json"))))
+		return undefined;
+	const lane = await findLaneRecordByWorktreePath(commonDir, cwd);
+	if (
+		!lane ||
+		path.resolve(lane.worktreePath) !== path.resolve(cwd) ||
+		lane.branch !== tryRunGit(cwd, ["branch", "--show-current"]) ||
+		(lane.gitCommonDir && path.resolve(lane.gitCommonDir) !== commonDir) ||
+		!isManagedFeatureLaneBranch(lane.branch) ||
+		!MANAGED_DEVELOPMENT_STATES.has(lane.state)
+	)
+		throw new Error("managed_team_requires_active_feature_lane");
+	return { lane, gitCommonDir: commonDir };
+}
+const MANAGED_TEAM_LEASE_MS = 120_000;
+async function acquireManagedTeamLease(
+	commonDir: string,
+	laneId: string,
+	owner: string,
+	leaderCwd: string,
+	expectedHead: string | null,
+): Promise<void> {
+	const lock = await acquireLifecycleLock(commonDir, laneId);
+	try {
+		const lane = await readLaneRecord(commonDir, laneId);
+		if (!lane) throw new Error("managed_team_lane_missing");
+		if (
+			!MANAGED_DEVELOPMENT_STATES.has(lane.state) ||
+			!isManagedFeatureLaneBranch(lane.branch) ||
+			path.resolve(lane.worktreePath) !== path.resolve(leaderCwd) ||
+			lane.branch !== tryRunGit(leaderCwd, ["branch", "--show-current"]) ||
+			(lane.gitCommonDir && path.resolve(lane.gitCommonDir) !== commonDir) ||
+			commonDir !== gitCommonDir(leaderCwd) ||
+			worktreeIsDirty(leaderCwd) ||
+			!expectedHead ||
+			(lane as LaneRecord & { headSha?: string }).headSha !== expectedHead ||
+			resolveHead(leaderCwd) !== expectedHead
+		)
+			throw new Error("managed_team_lane_changed_before_lease");
+		if (lane.leaseOwner && lane.leaseOwner !== owner)
+			throw new Error(`managed_team_lease_conflict:${lane.leaseOwner}`);
+		const updatedAt = now();
+		await writeLaneRecord(commonDir, {
+			...lane,
+			leaseOwner: owner,
+			leaseUpdatedAt: updatedAt,
+			leaseExpiresAt: new Date(Date.now() + MANAGED_TEAM_LEASE_MS).toISOString(),
+			updatedAt,
+		});
+		await appendLifecycleEvent(commonDir, {
+			version: 1,
+			laneId,
+			at: updatedAt,
+			type: "team_lease_acquired",
+			state: lane.state,
+			details: { owner },
+		});
+	} finally {
+		await lock.release();
+	}
+}
+async function releaseManagedTeamLease(gitCommonDir: string, laneId: string, owner: string): Promise<void> {
+	const lock = await acquireLifecycleLock(gitCommonDir, laneId);
+	try {
+		const lane = await readLaneRecord(gitCommonDir, laneId);
+		if (!lane || lane.leaseOwner !== owner) return;
+		const updatedAt = now();
+		await writeLaneRecord(gitCommonDir, {
+			...lane,
+			leaseOwner: undefined,
+			leaseExpiresAt: undefined,
+			leaseUpdatedAt: undefined,
+			updatedAt,
+		});
+		await appendLifecycleEvent(gitCommonDir, {
+			version: 1,
+			laneId,
+			at: updatedAt,
+			type: "team_lease_released",
+			state: lane.state,
+			details: { owner },
+		});
+	} finally {
+		await lock.release();
+	}
+}
+async function renewManagedTeamLeaseUnderLock(config: GjcTeamConfig): Promise<LaneRecord> {
+	if (!config.lifecycle_git_common_dir || !config.lifecycle_lane_id)
+		throw new Error("managed_team_lifecycle_metadata_missing");
+	const lane = await readLaneRecord(config.lifecycle_git_common_dir, config.lifecycle_lane_id);
+	const owner = `team:${config.team_name}`;
+	const leaderHead = resolveHead(config.leader_cwd);
+	const recordedHead = (lane as (LaneRecord & { headSha?: string }) | undefined)?.headSha;
+	if (
+		!lane ||
+		lane.leaseOwner !== owner ||
+		!lane.leaseExpiresAt ||
+		!MANAGED_DEVELOPMENT_STATES.has(lane.state) ||
+		path.resolve(lane.worktreePath) !== path.resolve(config.leader_cwd) ||
+		lane.branch !== tryRunGit(config.leader_cwd, ["branch", "--show-current"]) ||
+		(lane.gitCommonDir && path.resolve(lane.gitCommonDir) !== path.resolve(config.lifecycle_git_common_dir)) ||
+		gitCommonDir(config.leader_cwd) !== path.resolve(config.lifecycle_git_common_dir) ||
+		worktreeIsDirty(config.leader_cwd) ||
+		!recordedHead ||
+		leaderHead !== recordedHead
+	)
+		throw new Error("managed_team_lease_not_renewable");
+	const updatedAt = now();
+	const updated = {
+		...lane,
+		leaseUpdatedAt: updatedAt,
+		leaseExpiresAt: new Date(Date.now() + MANAGED_TEAM_LEASE_MS).toISOString(),
+		updatedAt,
+	};
+	await writeLaneRecord(config.lifecycle_git_common_dir, updated);
+	return updated;
+}
+
+async function recordManagedTeamHeadUnderLock(
+	config: GjcTeamConfig,
+	expectedPreviousHead: string,
+	newHead: string,
+): Promise<void> {
+	if (!config.lifecycle_git_common_dir || !config.lifecycle_lane_id)
+		throw new Error("managed_team_lifecycle_metadata_missing");
+	const lane = await readLaneRecord(config.lifecycle_git_common_dir, config.lifecycle_lane_id);
+	const owner = `team:${config.team_name}`;
+	if (
+		!lane ||
+		lane.leaseOwner !== owner ||
+		(lane as LaneRecord & { headSha?: string }).headSha !== expectedPreviousHead ||
+		resolveHead(config.leader_cwd) !== newHead ||
+		worktreeIsDirty(config.leader_cwd)
+	)
+		throw new Error("managed_team_head_record_failed");
+	const updatedAt = now();
+	const updated: LaneRecord & { headSha: string } = {
+		...lane,
+		headSha: newHead,
+		updatedAt,
+	};
+	await writeLaneRecord(config.lifecycle_git_common_dir, updated);
+}
+function assertManagedLeaderReady(config: GjcTeamConfig, lane: LaneRecord, expectedHead: string | null): void {
+	const leader = config.leader_cwd;
+	if (
+		path.resolve(lane.worktreePath) !== path.resolve(leader) ||
+		lane.branch !== tryRunGit(leader, ["branch", "--show-current"]) ||
+		(lane.gitCommonDir && path.resolve(lane.gitCommonDir) !== gitCommonDir(leader)) ||
+		worktreeIsDirty(leader) ||
+		(expectedHead !== null && resolveHead(leader) !== expectedHead)
+	)
+		throw new Error("managed_team_leader_not_ready");
 }
 
 function parseWorktreeMode(args: string[]): { mode: GjcTeamWorktreeMode; remainingArgs: string[] } {
@@ -1888,20 +2080,16 @@ async function ensureWorkerWorktree(
 	const branchName = mode.detached
 		? null
 		: `${mode.name}/${sanitizePathToken(teamName)}/${sanitizePathToken(worker.id)}`;
-	if (existing) {
-		if (worktreeIsDirty(worktreePath)) throw new Error(`worktree_dirty:${worktreePath}`);
-		if (mode.detached && worktreeHead(worktreePath) !== baseRef) throw new Error(`worktree_stale:${worktreePath}`);
-	} else {
-		if (await pathExists(worktreePath)) throw new Error(`worktree_path_conflict:${worktreePath}`);
-		await fs.mkdir(path.dirname(worktreePath), { recursive: true });
-		const args = mode.detached
-			? ["worktree", "add", "--detach", worktreePath, baseRef]
-			: branchExists(repoRoot, branchName ?? "")
-				? ["worktree", "add", worktreePath, branchName ?? ""]
-				: ["worktree", "add", "-b", branchName ?? "", worktreePath, baseRef];
-		runGit(repoRoot, args);
-		created = true;
-	}
+	if (existing) throw new Error(`worktree_path_conflict:${worktreePath}`);
+	if (await pathExists(worktreePath)) throw new Error(`worktree_path_conflict:${worktreePath}`);
+	if (!mode.detached && branchExists(repoRoot, branchName ?? ""))
+		throw new Error(`worktree_branch_conflict:${branchName}`);
+	await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+	const args = mode.detached
+		? ["worktree", "add", "--detach", worktreePath, baseRef]
+		: ["worktree", "add", "-b", branchName ?? "", worktreePath, baseRef];
+	runGit(repoRoot, args);
+	created = true;
 	return {
 		...worker,
 		worktree_repo_root: repoRoot,
@@ -1910,6 +2098,8 @@ async function ensureWorkerWorktree(
 		worktree_detached: mode.detached,
 		worktree_created: created,
 		worktree_base_ref: baseRef,
+		worktree_git_common_dir: gitCommonDir(repoRoot) ?? undefined,
+		worktree_base_head: baseRef,
 	};
 }
 
@@ -2100,6 +2290,7 @@ export function buildWorkerCommand(
 		envAssignment("GJC_TEAM_INTERNAL_WORKER", `${config.team_name}/${worker.id}`),
 		envAssignment("GJC_TEAM_NAME", config.team_name),
 		envAssignment("GJC_TEAM_WORKER_ID", worker.id),
+		...(worker.auth_token ? [envAssignment("GJC_TEAM_WORKER_AUTH_TOKEN", worker.auth_token)] : []),
 		envAssignment("GJC_TEAM_STATE_ROOT", config.state_root),
 		envAssignment("GJC_TEAM_LEADER_CWD", config.leader.cwd),
 		envAssignment("GJC_TEAM_DISPLAY_NAME", config.display_name),
@@ -2363,6 +2554,17 @@ function paneBelongsToTeamTarget(config: GjcTeamConfig, paneId: string): boolean
 	const [target = "", detectedPaneId = ""] = result.stdout.toString().trim().split(/\s+/);
 	return target === config.tmux_target && detectedPaneId === paneId;
 }
+function paneIsPositivelyAbsent(config: GjcTeamConfig, paneId: string): boolean {
+	const result = Bun.spawnSync([config.tmux_command, "list-panes", "-a", "-F", "#{pane_id}"], {
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	if (result.exitCode !== 0) return false;
+	return !result.stdout
+		.toString()
+		.split(/\r?\n/)
+		.some(candidate => candidate.trim() === paneId);
+}
 function killWorkerPanes(config: GjcTeamConfig): void {
 	for (const worker of config.workers)
 		if (worker.pane_id?.startsWith("%") && paneBelongsToTeamTarget(config, worker.pane_id))
@@ -2372,22 +2574,87 @@ function killWorkerPanes(config: GjcTeamConfig): void {
 			});
 }
 async function rollbackCreatedWorktrees(workers: GjcTeamWorker[]): Promise<void> {
-	for (const worker of workers.filter(worker => worker.worktree_created).reverse())
-		if (worker.worktree_repo_root && worker.worktree_path)
-			Bun.spawnSync(["git", "worktree", "remove", "--force", worker.worktree_path], {
-				cwd: worker.worktree_repo_root,
-				stdout: "ignore",
-				stderr: "ignore",
-			});
+	for (const worker of workers.filter(worker => worker.worktree_created).reverse()) {
+		if (!worker.worktree_repo_root || !worker.worktree_path || !(await pathExists(worker.worktree_path))) continue;
+		const registered = findWorktreePath(worker.worktree_repo_root, worker.worktree_path);
+		const owned =
+			registered === path.resolve(worker.worktree_path) &&
+			worker.worktree_git_common_dir === gitCommonDir(worker.worktree_repo_root) &&
+			!worktreeIsDirty(worker.worktree_path) &&
+			worktreeHead(worker.worktree_path) === worker.worktree_base_head;
+		if (owned) runGitResult(worker.worktree_repo_root, ["worktree", "remove", worker.worktree_path]);
+	}
 }
 async function removeCleanCreatedWorktrees(workers: GjcTeamWorker[]): Promise<void> {
-	for (const worker of workers.filter(worker => worker.worktree_created).reverse())
-		if (worker.worktree_repo_root && worker.worktree_path && !worktreeIsDirty(worker.worktree_path))
-			Bun.spawnSync(["git", "worktree", "remove", worker.worktree_path], {
-				cwd: worker.worktree_repo_root,
-				stdout: "ignore",
-				stderr: "ignore",
+	for (const worker of workers.filter(worker => worker.worktree_created).reverse()) {
+		if (!worker.worktree_repo_root || !worker.worktree_path || !(await pathExists(worker.worktree_path))) continue;
+		const registered = findWorktreePath(worker.worktree_repo_root, worker.worktree_path);
+		const commonDir = gitCommonDir(worker.worktree_path);
+		const currentBranch = tryRunGit(worker.worktree_path, ["symbolic-ref", "-q", "--short", "HEAD"]);
+		const owned =
+			registered === path.resolve(worker.worktree_path) &&
+			Boolean(
+				worker.worktree_git_common_dir &&
+					commonDir === path.resolve(worker.worktree_git_common_dir) &&
+					commonDir === gitCommonDir(worker.worktree_repo_root),
+			) &&
+			(worker.worktree_detached ? currentBranch === null : currentBranch === worker.worktree_branch) &&
+			!worktreeIsDirty(worker.worktree_path) &&
+			worktreeHead(worker.worktree_path) === worker.worktree_base_head;
+		if (owned) runGitResult(worker.worktree_repo_root, ["worktree", "remove", worker.worktree_path]);
+	}
+}
+async function removeManagedCleanCreatedWorktrees(
+	dir: string,
+	config: GjcTeamConfig,
+	monitor: GjcTeamMonitorSnapshot | null,
+	pendingIntegration: boolean,
+): Promise<void> {
+	for (const worker of config.workers.filter(worker => worker.worktree_created).reverse()) {
+		const integration = monitor?.integration_by_worker?.[worker.id];
+		const head =
+			worker.worktree_path && (await pathExists(worker.worktree_path)) ? resolveHead(worker.worktree_path) : null;
+		const registered =
+			worker.worktree_repo_root && worker.worktree_path
+				? findWorktreePath(worker.worktree_repo_root, worker.worktree_path)
+				: null;
+		const currentCommonDir = worker.worktree_path ? gitCommonDir(worker.worktree_path) : null;
+		const currentBranch = worker.worktree_path
+			? tryRunGit(worker.worktree_path, ["symbolic-ref", "-q", "--short", "HEAD"])
+			: null;
+		const eligible = Boolean(
+			!pendingIntegration &&
+				worker.worktree_repo_root &&
+				worker.worktree_path &&
+				head &&
+				registered === path.resolve(worker.worktree_path) &&
+				worker.worktree_git_common_dir &&
+				currentCommonDir === path.resolve(worker.worktree_git_common_dir) &&
+				currentCommonDir === gitCommonDir(worker.worktree_repo_root) &&
+				(worker.worktree_detached ? currentBranch === null : currentBranch === worker.worktree_branch) &&
+				integration?.last_integrated_head === head &&
+				!worktreeIsDirty(worker.worktree_path) &&
+				isAncestor(config.leader_cwd, head, "HEAD"),
+		);
+		if (eligible) {
+			const removal = runGitResult(worker.worktree_repo_root ?? config.leader_cwd, [
+				"worktree",
+				"remove",
+				worker.worktree_path ?? "",
+			]);
+			await appendIntegrationEvent(dir, removal.ok ? "worker_cleanup_applied" : "worker_cleanup_blocked", worker, {
+				worktree_path: worker.worktree_path,
+				summary: removal.ok
+					? `removed integrated worker worktree ${worker.id}`
+					: `cleanup blocked for ${worker.id}: ${removal.stderr || removal.stdout}`,
 			});
+			continue;
+		}
+		await appendIntegrationEvent(dir, "worker_cleanup_blocked", worker, {
+			worktree_path: worker.worktree_path,
+			summary: `cleanup blocked for ${worker.id}; integration, reachability, or cleanliness evidence is missing`,
+		});
+	}
 }
 
 function monitorSnapshotPath(dir: string): string {
@@ -2631,10 +2898,47 @@ async function integrateGjcWorkerCommits(
 		...(previous?.integration_by_worker ?? {}),
 	};
 	const hygieneEntries: GjcTeamCommitHygieneEntry[] = [];
+	const dirtyWorkers = new Set<string>();
 	const leaderCwd = config.leader_cwd || cwd;
 	const cycleLeaderHead = resolveHead(leaderCwd);
+	if (config.lifecycle_mode !== "managed") {
+		for (const worker of config.workers) {
+			if (!worker.worktree_path || !(await pathExists(worker.worktree_path))) continue;
+			const workerHead = resolveHead(worker.worktree_path);
+			integrationByWorker[worker.id] = {
+				...(integrationByWorker[worker.id] ?? {}),
+				last_seen_head: workerHead ?? undefined,
+				last_leader_head: cycleLeaderHead ?? undefined,
+				...integrationNowState(
+					workerHead && cycleLeaderHead && isAncestor(leaderCwd, workerHead, "HEAD")
+						? "idle"
+						: "integration_required",
+				),
+			};
+			if (workerHead && cycleLeaderHead && !isAncestor(leaderCwd, workerHead, "HEAD"))
+				await appendIntegrationEvent(dir, "worker_integration_required", worker, {
+					commit_hash: workerHead,
+					worktree_path: worker.worktree_path,
+					summary: `worker ${worker.id} requires explicit integration into an owned feature lane`,
+				});
+		}
+		return integrationByWorker;
+	}
 	for (const worker of config.workers) {
 		if (!worker.worktree_path || !worker.worktree_repo_root || !(await pathExists(worker.worktree_path))) continue;
+		if (config.lifecycle_mode === "managed" && worktreeIsDirty(worker.worktree_path)) {
+			dirtyWorkers.add(worker.id);
+			integrationByWorker[worker.id] = {
+				...(integrationByWorker[worker.id] ?? {}),
+				last_seen_head: resolveHead(worker.worktree_path) ?? undefined,
+				...integrationNowState("integration_failed"),
+			};
+			await appendIntegrationEvent(dir, "worker_dirty_blocked", worker, {
+				worktree_path: worker.worktree_path,
+				summary: `blocked dirty worker ${worker.id}; commit explicitly before integration`,
+			});
+			continue;
+		}
 		const { committed, commit } = autoCommitDirtyWorker(worker);
 		if (!committed) continue;
 		await appendIntegrationEvent(dir, "worker_auto_commit", worker, {
@@ -2657,6 +2961,7 @@ async function integrateGjcWorkerCommits(
 
 	for (const worker of config.workers) {
 		if (!worker.worktree_path || !worker.worktree_repo_root || !(await pathExists(worker.worktree_path))) continue;
+		if (dirtyWorkers.has(worker.id)) continue;
 		const leaderHead = resolveHead(leaderCwd);
 		const workerHead = resolveHead(worker.worktree_path);
 		const state: GjcTeamWorkerIntegrationState = {
@@ -2676,12 +2981,20 @@ async function integrateGjcWorkerCommits(
 			};
 			continue;
 		}
-		if (isAncestor(worker.worktree_path, leaderHead, workerHead)) {
-			const mergeRef = workerMergeRef(worker, workerHead);
+		if (config.lifecycle_mode === "managed" || isAncestor(worker.worktree_path, leaderHead, workerHead)) {
+			const mergeRef = config.lifecycle_mode === "managed" ? workerHead : workerMergeRef(worker, workerHead);
+			if (config.lifecycle_mode === "managed") {
+				if (!config.lifecycle_git_common_dir || !config.lifecycle_lane_id)
+					throw new Error("managed_team_lifecycle_metadata_missing");
+				const lane = await renewManagedTeamLeaseUnderLock(config);
+				assertManagedLeaderReady(config, lane, leaderHead);
+			}
 			const merge = runGitResult(leaderCwd, ["merge", "--no-ff", "-m", `gjc(team): merge ${worker.id}`, mergeRef]);
 			if (merge.ok) {
 				const newLeaderHead = resolveHead(leaderCwd);
 				if (newLeaderHead && newLeaderHead !== leaderHead && isAncestor(leaderCwd, workerHead, "HEAD")) {
+					if (config.lifecycle_mode === "managed")
+						await recordManagedTeamHeadUnderLock(config, leaderHead, newLeaderHead);
 					integrationByWorker[worker.id] = {
 						...state,
 						last_integrated_head: workerHead,
@@ -2893,7 +3206,7 @@ async function integrateGjcWorkerCommits(
 	}
 
 	const newLeaderHead = resolveHead(leaderCwd);
-	if (cycleLeaderHead && newLeaderHead && cycleLeaderHead !== newLeaderHead) {
+	if (config.lifecycle_mode !== "managed" && cycleLeaderHead && newLeaderHead && cycleLeaderHead !== newLeaderHead) {
 		for (const worker of config.workers) {
 			if (!worker.worktree_path || !(await pathExists(worker.worktree_path))) continue;
 			const status = await readGjcWorkerStatus(config.team_name, worker.id, cwd, env);
@@ -3039,6 +3352,7 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	if (!Number.isInteger(options.workerCount) || options.workerCount < 1 || options.workerCount > GJC_TEAM_MAX_WORKERS)
 		throw new Error(`invalid_team_worker_count:${options.workerCount}:expected_1_${GJC_TEAM_MAX_WORKERS}`);
 	const workerCliPlan = resolveGjcTeamWorkerCliPlan(options.workerCount, env);
+	const managedLane = await resolveManagedTeamLane(cwd);
 	const stateRoot = resolveGjcTeamStateRoot(cwd, env);
 	const teamName = sanitizeName(options.teamName ?? makeTeamName(options.task, env));
 	const displayName = sanitizeName(options.teamName ?? options.task).slice(0, 30) || teamName;
@@ -3054,6 +3368,16 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 	const initialWorkers = buildWorkers(options.workerCount, options.agentType, stateRoot);
 	const initialTasks = buildInitialTasks(options.task, initialWorkers);
 	const workers: GjcTeamWorker[] = [];
+	const managedLeaseOwner = managedLane ? `team:${teamName}` : undefined;
+	const managedLeaseHead = managedLane ? resolveHead(cwd) : null;
+	if (managedLane && managedLeaseOwner)
+		await acquireManagedTeamLease(
+			managedLane.gitCommonDir,
+			managedLane.lane.laneId,
+			managedLeaseOwner,
+			cwd,
+			managedLeaseHead,
+		);
 	try {
 		for (const worker of initialWorkers)
 			workers.push(
@@ -3063,6 +3387,8 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 			);
 	} catch (error) {
 		await rollbackCreatedWorktrees(workers);
+		if (managedLane && managedLeaseOwner)
+			await releaseManagedTeamLease(managedLane.gitCommonDir, managedLane.lane.laneId, managedLeaseOwner);
 		throw error;
 	}
 	const config: GjcTeamConfig = {
@@ -3088,6 +3414,13 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		workers,
 		created_at: createdAt,
 		updated_at: createdAt,
+		...(managedLane
+			? {
+					lifecycle_mode: "managed" as const,
+					lifecycle_lane_id: managedLane.lane.laneId,
+					lifecycle_git_common_dir: managedLane.gitCommonDir,
+				}
+			: {}),
 	};
 	await initializeStateDirs(dir, config.workers);
 	await writeJsonFile(path.join(dir, "config.json"), config);
@@ -3145,6 +3478,8 @@ export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTea
 		});
 		killWorkerPanes(config);
 		await rollbackCreatedWorktrees(config.workers);
+		if (managedLane && managedLeaseOwner)
+			await releaseManagedTeamLease(managedLane.gitCommonDir, managedLane.lane.laneId, managedLeaseOwner);
 		throw error;
 	}
 	const runningConfig = {
@@ -3323,9 +3658,23 @@ export async function monitorGjcTeam(
 	const dir = await findTeamDir(teamName, cwd, env);
 	const config = await readConfig(dir);
 	const previous = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
-	await reconcileGjcTeamStaleClaims(teamName, dir, config, env);
-	const integrationByWorker = await integrateGjcWorkerCommits(config, dir, previous, cwd, env);
-	await writeJsonFile(monitorSnapshotPath(dir), { integration_by_worker: integrationByWorker, updated_at: now() });
+	const runMonitor = async (): Promise<void> => {
+		await reconcileGjcTeamStaleClaims(teamName, dir, config, env);
+		const integrationByWorker = await integrateGjcWorkerCommits(config, dir, previous, cwd, env);
+		await writeJsonFile(monitorSnapshotPath(dir), { integration_by_worker: integrationByWorker, updated_at: now() });
+	};
+	if (config.lifecycle_mode === "managed") {
+		if (!config.lifecycle_git_common_dir || !config.lifecycle_lane_id)
+			throw new Error("managed_team_lifecycle_metadata_missing");
+		const lock = await acquireLifecycleLock(config.lifecycle_git_common_dir, config.lifecycle_lane_id);
+		try {
+			const lane = await renewManagedTeamLeaseUnderLock(config);
+			assertManagedLeaderReady(config, lane, resolveHead(config.leader_cwd));
+			await runMonitor();
+		} finally {
+			await lock.release();
+		}
+	} else await runMonitor();
 	await replayGjcTeamNotifications(teamName, cwd, env);
 	await computeLifecycleNudges(config, dir, cwd, env);
 	return readGjcTeamSnapshot(teamName, cwd, env);
@@ -3513,25 +3862,74 @@ export async function shutdownGjcTeam(
 			),
 		),
 	);
+	if (config.lifecycle_mode === "managed") {
+		const deadline = Date.now() + parseDurationEnv(env, "GJC_TEAM_SHUTDOWN_ACK_TIMEOUT_MS", 30_000);
+		let terminal = false;
+		while (!terminal && Date.now() <= deadline) {
+			terminal = (
+				await Promise.all(
+					config.workers.map(async worker => {
+						const ack = await readGjcShutdownAck(teamName, worker.id, cwd, env);
+						const currentHead =
+							worker.worktree_path && (await pathExists(worker.worktree_path))
+								? resolveHead(worker.worktree_path)
+								: null;
+						return (
+							ack?.request_id === shutdownRequestId &&
+							ack.status === "stopped" &&
+							ack.clean === true &&
+							typeof ack.final_head === "string" &&
+							ack.final_head === currentHead &&
+							Boolean(worker.worktree_path) &&
+							!worktreeIsDirty(worker.worktree_path ?? "") &&
+							typeof worker.pane_id === "string" &&
+							paneIsPositivelyAbsent(config, worker.pane_id)
+						);
+					}),
+				)
+			).every(Boolean);
+			if (!terminal) await Bun.sleep(100);
+		}
+		if (!terminal) {
+			await appendEvent(dir, {
+				type: "team_shutdown_blocked",
+				message: "Managed shutdown blocked: worker-authored terminal ACK or pane exit proof is missing",
+				data: { shutdown_request_id: shutdownRequestId },
+			});
+			throw new Error("managed_shutdown_blocked_missing_terminal_ack_or_exit");
+		}
+	}
 	const monitor = await readJsonFile<GjcTeamMonitorSnapshot>(monitorSnapshotPath(dir));
 	const completionVerified = tasks.length === 0 || tasks.every(isGjcTeamTaskCompletionVerified);
 	const pendingIntegration = completionVerified ? await hasPendingGjcTeamIntegration(dir, config, monitor) : false;
-	killWorkerPanes(config);
-	await removeCleanCreatedWorktrees(config.workers);
+	if (config.lifecycle_mode !== "managed") killWorkerPanes(config);
+	if (config.lifecycle_mode === "managed") {
+		if (!config.lifecycle_git_common_dir || !config.lifecycle_lane_id)
+			throw new Error("managed_team_lifecycle_metadata_missing");
+		const lock = await acquireLifecycleLock(config.lifecycle_git_common_dir, config.lifecycle_lane_id);
+		try {
+			const lane = await renewManagedTeamLeaseUnderLock(config);
+			assertManagedLeaderReady(config, lane, resolveHead(config.leader_cwd));
+			await removeManagedCleanCreatedWorktrees(dir, config, monitor, pendingIntegration);
+		} finally {
+			await lock.release();
+		}
+	} else await removeCleanCreatedWorktrees(config.workers);
 	const stopped = {
 		...config,
 		workers: config.workers.map(worker => ({ ...worker, status: "stopped" as const, last_heartbeat: now() })),
 		updated_at: now(),
 	};
 	await writeJsonFile(path.join(dir, "config.json"), stopped);
-	await writeWorkerLifecycleForConfig(dir, stopped, "stopped", worker => ({
-		pane_id: worker.pane_id,
-		stopped_at: stopped.updated_at,
-		stop_reason: "graceful_shutdown",
-		shutdown_request_id: shutdownRequestId,
-		shutdown_requested_at: shutdownRequestedAt,
-		shutdown_mode: "graceful",
-	}));
+	if (config.lifecycle_mode !== "managed")
+		await writeWorkerLifecycleForConfig(dir, stopped, "stopped", worker => ({
+			pane_id: worker.pane_id,
+			stopped_at: stopped.updated_at,
+			stop_reason: "graceful_shutdown",
+			shutdown_request_id: shutdownRequestId,
+			shutdown_requested_at: shutdownRequestedAt,
+			shutdown_mode: "graceful",
+		}));
 	const workerLifecycleById = await readWorkerLifecycleById(dir, stopped);
 	const gracefulShutdownComplete = stopped.workers.every(worker => {
 		const lifecycle = workerLifecycleById[worker.id];
@@ -3550,6 +3948,18 @@ export async function shutdownGjcTeam(
 				? "failed"
 				: "cancelled";
 	await writePhase(dir, shutdownPhase);
+	if (
+		config.lifecycle_mode === "managed" &&
+		shutdownPhase === "complete" &&
+		!pendingIntegration &&
+		config.lifecycle_git_common_dir &&
+		config.lifecycle_lane_id
+	)
+		await releaseManagedTeamLease(
+			config.lifecycle_git_common_dir,
+			config.lifecycle_lane_id,
+			`team:${config.team_name}`,
+		);
 	const shutdownData: Record<string, unknown> = {
 		phase: shutdownPhase,
 		shutdown_request_id: shutdownRequestId,
@@ -4426,6 +4836,74 @@ export async function writeGjcShutdownRequest(
 	});
 	return value;
 }
+export async function writeGjcShutdownAck(
+	teamName: string,
+	worker: string,
+	requestId: string,
+	status: string,
+	cwd = process.cwd(),
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<Record<string, unknown>> {
+	if (!requestId.trim()) throw new Error("invalid_shutdown_ack_request_id");
+	if (status !== "accepted" && status !== "stopped") throw new Error(`invalid_shutdown_ack_status:${status}`);
+	const dir = await findTeamDir(teamName, cwd, env);
+	const config = await readConfig(dir);
+	const teamWorker = findKnownWorker(config, worker);
+	const authenticatedTeam = env.GJC_TEAM_NAME?.trim();
+	const authenticatedWorker = env.GJC_TEAM_WORKER_ID?.trim() || env.GJC_TEAM_INTERNAL_WORKER?.split("/").pop()?.trim();
+	const authenticatedToken = env.GJC_TEAM_WORKER_AUTH_TOKEN?.trim();
+	if (
+		authenticatedTeam !== teamName ||
+		authenticatedWorker !== worker ||
+		!teamWorker.auth_token ||
+		authenticatedToken !== teamWorker.auth_token
+	)
+		throw new Error("shutdown_ack_worker_identity_mismatch");
+	const request = await readJsonFile<Record<string, unknown>>(
+		path.join(workerDir(dir, worker), "shutdown-request.json"),
+	);
+	if (request?.request_id !== requestId) throw new Error("shutdown_ack_request_id_mismatch");
+	const prior = await readJsonFile<Record<string, unknown>>(path.join(workerDir(dir, worker), "shutdown-ack.json"));
+	if (status === "stopped" && (prior?.request_id !== requestId || prior.status !== "accepted"))
+		throw new Error("shutdown_terminal_ack_requires_acceptance");
+	const worktreePath = teamWorker.worktree_path;
+	const finalHead = worktreePath && (await pathExists(worktreePath)) ? resolveHead(worktreePath) : null;
+	const clean = worktreePath ? !worktreeIsDirty(worktreePath) : true;
+	if (status === "stopped" && config.lifecycle_mode === "managed" && (!finalHead || !clean))
+		throw new Error("managed_shutdown_terminal_ack_requires_clean_final_head");
+	const acknowledgedAt = now();
+	const ack = {
+		worker,
+		request_id: requestId,
+		status,
+		acknowledged_at: acknowledgedAt,
+		...(status === "stopped" ? { final_head: finalHead, clean, terminal_at: acknowledgedAt } : {}),
+	};
+	await writeJsonFile(path.join(workerDir(dir, worker), "shutdown-ack.json"), ack);
+	await writeWorkerLifecycleRecord(dir, teamWorker, status === "stopped" ? "stopped" : "draining", {
+		shutdown_request_id: requestId,
+		shutdown_acknowledged_at: acknowledgedAt,
+		shutdown_ack_status: status,
+		...(status === "stopped"
+			? {
+					stopped_at: acknowledgedAt,
+					stop_reason: "worker_terminal_ack",
+					shutdown_final_head: finalHead ?? undefined,
+					shutdown_clean: clean,
+					shutdown_terminal_at: acknowledgedAt,
+				}
+			: {}),
+	});
+	await appendEvent(dir, {
+		type: status === "stopped" ? "worker_shutdown_terminal" : "worker_shutdown_ack",
+		worker,
+		message:
+			status === "stopped"
+				? `Worker ${worker} reported terminal shutdown`
+				: `Worker ${worker} acknowledged shutdown`,
+	});
+	return ack;
+}
 export async function readGjcShutdownAck(
 	teamName: string,
 	worker: string,
@@ -4696,6 +5174,15 @@ export async function executeGjcTeamApiOperation(
 				parseGjcTeamShutdownMode(input.mode),
 			);
 		}
+		case "write-shutdown-ack":
+			return writeGjcShutdownAck(
+				teamName,
+				worker,
+				String(input.request_id ?? input.requestId ?? ""),
+				String(input.status ?? ""),
+				cwd,
+				env,
+			);
 		case "read-shutdown-ack":
 			return readGjcShutdownAck(teamName, worker, cwd, env);
 		default:

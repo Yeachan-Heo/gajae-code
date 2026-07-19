@@ -95,7 +95,7 @@ describe("default launch worktrees", () => {
 		});
 	});
 
-	it("creates and reuses a detached launch worktree beside the source repo", async () => {
+	it("creates a detached launch worktree and refuses unleased reuse", async () => {
 		const repo = await createRepo("gjc-launch-worktree-");
 		await fs.mkdir(path.join(repo, "node_modules"));
 
@@ -110,9 +110,9 @@ describe("default launch worktrees", () => {
 		expect(await Bun.file(path.join(expectedPath, ".git")).exists()).toBe(true);
 		expect((await fs.lstat(path.join(expectedPath, "node_modules"))).isSymbolicLink()).toBe(true);
 
-		const second = prepareLaunchWorktree(repo, ["--worktree", "--slow", "opus"]);
-		expect(await fs.realpath(second.cwd)).toBe(await fs.realpath(expectedPath));
-		expect(second.worktree.enabled && second.worktree.reused).toBe(true);
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "--slow", "opus"])).toThrow(
+			`worktree_ownership_required:${expectedPath}`,
+		);
 	});
 
 	it("creates launch worktrees beside the canonical source repo when launched from an existing worktree", async () => {
@@ -145,7 +145,7 @@ describe("default launch worktrees", () => {
 		);
 	});
 
-	it("updates a clean reused detached launch worktree when source HEAD advances", async () => {
+	it("refuses to advance an existing clean detached launch worktree without ownership", async () => {
 		const repo = await createRepo("gjc-launch-advance-worktree-");
 		const first = prepareLaunchWorktree(repo, ["--worktree"]);
 		expect(first.worktree.enabled && first.worktree.created).toBe(true);
@@ -155,9 +155,8 @@ describe("default launch worktrees", () => {
 		run("git", ["commit", "-m", "next"], repo);
 		const nextHead = run("git", ["rev-parse", "HEAD"], repo);
 
-		const second = prepareLaunchWorktree(repo, ["--worktree"]);
-		expect(second.worktree.enabled && second.worktree.reused).toBe(true);
-		expect(run("git", ["rev-parse", "HEAD"], second.cwd)).toBe(nextHead);
+		expect(() => prepareLaunchWorktree(repo, ["--worktree"])).toThrow(`worktree_ownership_required:${first.cwd}`);
+		expect(run("git", ["rev-parse", "HEAD"], first.cwd)).not.toBe(nextHead);
 	});
 
 	it("rejects dirty detached launch worktrees when source HEAD advances", async () => {
@@ -204,6 +203,30 @@ describe("default launch worktrees", () => {
 		expect(ensured.enabled && (await fs.realpath(ensured.worktreePath))).toBe(await fs.realpath(expectedPath));
 		expect(ensured.enabled && ensured.branchName).toBe("feature/demo");
 		expect(run("git", ["branch", "--show-current"], expectedPath)).toBe("feature/demo");
+	});
+	it("rejects reuse of a dirty named launch worktree", async () => {
+		const repo = await createRepo("gjc-launch-dirty-named-worktree-");
+		const first = prepareLaunchWorktree(repo, ["--worktree", "feature/dirty"]);
+		expect(first.worktree.enabled && first.worktree.created).toBe(true);
+		await Bun.write(path.join(first.cwd, "dirty.txt"), "dirty\n");
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/dirty"])).toThrow(/worktree_dirty:/);
+		expect(await Bun.file(path.join(first.cwd, "dirty.txt")).text()).toBe("dirty\n");
+		expect(run("git", ["status", "--porcelain"], first.cwd)).toBe("?? dirty.txt");
+	});
+
+	it("rejects an unmanaged existing branch without changing the user checkout", async () => {
+		const repo = await createRepo("gjc-launch-unmanaged-branch-");
+		const branchName = "feature/unmanaged";
+		run("git", ["branch", branchName], repo);
+		const statusBefore = run("git", ["status", "--porcelain"], repo);
+		const readmeBefore = await Bun.file(path.join(repo, "README.md")).text();
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: branchName });
+
+		expect(() => ensureLaunchWorktree(planned)).toThrow(`branch_unmanaged:${branchName}`);
+		expect(run("git", ["status", "--porcelain"], repo)).toBe(statusBefore);
+		expect(await Bun.file(path.join(repo, "README.md")).text()).toBe(readmeBefore);
+		expect(await Bun.file(planned.enabled ? path.join(planned.worktreePath, ".git") : "").exists()).toBe(false);
 	});
 
 	it("keeps launch worktree slugs collision-resistant for similar branch names", async () => {

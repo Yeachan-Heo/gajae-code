@@ -33,6 +33,8 @@ export interface TaskResultReceipt {
 	cost?: number;
 	usageCostBreakdownComplete?: true;
 	branchName?: string;
+	patchArtifacts?: Array<{ repositoryPath: string; name: string }>;
+	recoveryArtifactName?: string;
 	retryFailure?: { attempt: number; errorSummary: string };
 	errorSummary?: string;
 	abortSummary?: string;
@@ -225,6 +227,15 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 				]),
 			)
 		: undefined;
+	const patchArtifacts = [
+		...(raw.patchPath ? [{ repositoryPath: ".", name: raw.patchPath.split(/[\\/]/).pop() ?? "root.patch" }] : []),
+		...(raw.nestedPatches ?? [])
+			.filter(patch => Boolean(patch.artifactPath))
+			.map(patch => ({
+				repositoryPath: patch.relativePath,
+				name: patch.artifactPath?.split(/[\\/]/).pop() ?? "nested.patch",
+			})),
+	];
 	return {
 		index: raw.index,
 		id: raw.id,
@@ -249,6 +260,8 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		usageCostBreakdownComplete:
 			raw.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(raw.usage) ? true : undefined,
 		branchName: raw.branchName,
+		recoveryArtifactName: raw.recoveryArtifactName,
+		patchArtifacts: patchArtifacts.length > 0 ? patchArtifacts : undefined,
 		retryFailure: raw.retryFailure
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
 			: undefined,
