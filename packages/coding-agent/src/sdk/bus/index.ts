@@ -2826,7 +2826,12 @@ export function createNotificationsExtension(
 				.catch(() => {})
 				.then(() => {
 					if (runtimes.get(id) === requestedRuntime || cleanupRetries.get(id) === requestedRuntime)
-						void stopSession(id, reason, requestedRuntime);
+						void stopSession(id, reason, requestedRuntime).catch(error =>
+							// A retained owner-release failure keeps the exact runtime in
+							// cleanupRetries for a later retry; log it rather than letting a
+							// fire-and-forget rejection become a fatal unhandled rejection.
+							logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`),
+						);
 				});
 		const rt = requestedRuntime;
 
@@ -4112,7 +4117,17 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
-			if (!(await stopSession(id, "session", runtime))) await cleanupAbandonedStartup();
+			let stopped = false;
+			try {
+				stopped = await stopSession(id, "session", runtime);
+			} catch (error) {
+				// A secondary owner-release failure during abandoned-startup cleanup is
+				// retained for an explicit later retry via cleanupRetries; log it rather
+				// than letting it escape startSession and surface a red extension error
+				// through session_start / session_switch / session_branch.
+				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			}
+			if (!stopped) await cleanupAbandonedStartup();
 			return { ...result, runtime };
 		}
 	}
@@ -4242,7 +4257,15 @@ export function createNotificationsExtension(
 		const prevId = activeRuntimeId ?? sessionIdFromFile(event.previousSessionFile);
 		if (prevId && prevId !== newId) {
 			controller.rekeySession(prevId, newId);
-			await stopSession(prevId);
+			try {
+				await stopSession(prevId);
+			} catch (error) {
+				// A retained owner-release failure keeps the exact runtime in
+				// cleanupRetries for an explicit later retry; log it rather than
+				// surfacing a red extension error
+				// while rotating session authority (/new, fork, resume, branch).
+				logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+			}
 		}
 		if (extensionShuttingDown) return;
 		await startSession(ctx);
@@ -4627,6 +4650,15 @@ export function createNotificationsExtension(
 		const controllerStop =
 			typeof ctx.sessionManager.getCwd === "function" ? controller.stopCurrentSession(ctx) : Promise.resolve(false);
 		void controllerStop.catch(error => logger.warn(`notifications: controller shutdown failed: ${String(error)}`));
-		await stopSession(id);
+		try {
+			await stopSession(id);
+		} catch (error) {
+			// A retained owner-release failure keeps the exact runtime in
+			// cleanupRetries for an explicit later retry; log it rather than
+			// surfacing a red extension error at
+			// shutdown. On terminal quit there is no later retry cycle, so log at
+			// error severity (matching the postmortem cleanup precedent).
+			logger.error(`notifications: SDK notification runtime cleanup failed: ${String(error)}`);
+		}
 	});
 }
