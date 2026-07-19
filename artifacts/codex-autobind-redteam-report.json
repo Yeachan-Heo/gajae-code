@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "kind": "black-box-api-receipt",
+  "suite": "codex-autobind-redteam",
+  "cases": [
+    {
+      "id": "origin-wrong-type-and-oversize",
+      "scenario": "Hand-crafted persisted origins with a numeric delegation_id and a 257-byte delegation_id were read through readCodexHandoff.",
+      "expected": "Both reads fail closed with state_corrupt.",
+      "verdict": "pass"
+    },
+    {
+      "id": "origin-path-like-delegation-id",
+      "scenario": "A hand-crafted persisted origin used delegation_id '../../wake-prompt' and was read through readCodexHandoff and listCodexHandoffs.",
+      "expected": "Both APIs fail closed with state_corrupt; hostile origin data cannot reach wake-related state.",
+      "verdict": "fail: readCodexHandoff accepted the record, so listCodexHandoffs would also accept it."
+    },
+    {
+      "id": "concurrent-bind-same-work-unit",
+      "scenario": "32 concurrent bindDelegateCodexHandoff calls targeted one new work unit with alternating sources and origins.",
+      "expected": "Exactly one creation wins; all callers get a consistent binding and no caller observes torn JSON.",
+      "verdict": "fail: a loser observed state_corrupt while the winner's exclusive file was open but not fully written."
+    },
+    {
+      "id": "freshness-exact-24h-boundary",
+      "scenario": "A fallback registration updated exactly 24 hours before a fixed Date.now() was exercised through gjc_delegate_execute.",
+      "expected": "The inclusive boundary is deterministic and auto-binds the single unambiguous source.",
+      "verdict": "pass"
+    },
+    {
+      "id": "freshness-invalid-updated-at",
+      "scenario": "A fallback registration with updated_at 'invalid-date' was exercised through gjc_delegate_execute.",
+      "expected": "No crash; delegation remains successful, auto_bound is false, and a durable stale-source diagnostic is emitted.",
+      "verdict": "pass"
+    },
+    {
+      "id": "host-context-injection",
+      "scenario": "A persisted host context used session_id '../../outside' and a 1 MiB prompt_excerpt containing token-like text, then listMcpDelegateHostContexts was called.",
+      "expected": "The malformed/injected context is skipped or counted as a failure, with no acceptance outside the .gjc session-state contract.",
+      "verdict": "fail: enumeration accepted the context (contexts length 1, failures 0). No filesystem traversal was observed in this invocation."
+    },
+    {
+      "id": "diagnostic-hygiene",
+      "scenario": "A corrupt persisted host context containing a 2 KiB token-like prompt string was exercised through gjc_delegate_execute and the durable diagnostic log was inspected.",
+      "expected": "Delegation succeeds with auto_bound false; diagnostic output is bounded and excludes token/prompt material.",
+      "verdict": "pass"
+    },
+    {
+      "id": "hermes-question-flow-regression",
+      "scenario": "Focused coordinator suite covering coordinator MCP server question behavior was run after the auto-bind change.",
+      "expected": "Question flow remains on the existing Hermes list_questions/submit_question_answer surface.",
+      "verdict": "pass"
+    },
+    {
+      "id": "focused-union",
+      "scenario": "bun test packages/coding-agent/test/coordinator-mcp-server.test.ts packages/coding-agent/test/coordinator-codex-handoff.test.ts packages/coding-agent/test/coordinator-codex-bridge.test.ts packages/coding-agent/test/coordinator-codex-wake-publisher.test.ts packages/coding-agent/test/coordinator-codex-bridge-redteam.test.ts packages/coding-agent/test/mcp-delegate-host-context.test.ts",
+      "expected": "All focused tests pass.",
+      "verdict": "pass: 104 pass, 0 fail, 477 expectations."
+    }
+  ],
+  "findings": [
+    {
+      "severity": "high",
+      "id": "bind-exclusive-read-race",
+      "detail": "bindDelegateCodexHandoff uses exclusive file creation followed by writes. A concurrent loser can detect EEXIST and immediately parse the still-empty/incomplete file, receiving state_corrupt rather than the winning binding. This violates the no-torn-observation and delegation-success contract under overwrite races."
+    },
+    {
+      "severity": "medium",
+      "id": "origin-delegation-id-not-path-safe",
+      "detail": "Origin validation only bounds delegation_id as a non-NUL string. It accepts path separators and traversal-like strings, contrary to the fail-closed hostile-origin requirement."
+    },
+    {
+      "severity": "medium",
+      "id": "host-context-enumerator-accepts-unbounded-untrusted-fields",
+      "detail": "listMcpDelegateHostContexts validates only primitive types for persisted context fields. It accepts a traversal-shaped session_id and a 1 MiB prompt_excerpt instead of rejecting/skipping the record."
+    }
+  ]
+}

@@ -108,7 +108,7 @@ function createServer(
 				request: async (method, params) => {
 					requests.push({ method, params });
 					if (throwOnResume && method === "thread/resume") throw new Error("resume network detail");
-					return method === "thread/status" ? status : {};
+					return method === "thread/resume" ? { thread: { status } } : {};
 				},
 				close: async () => {},
 			}),
@@ -189,7 +189,8 @@ describe("Codex resume bridge red-team", () => {
 			transportFactory: async (_endpoint, token) => {
 				receivedToken = token;
 				return {
-					request: async method => (method === "thread/status" ? { status: "running" } : {}),
+					request: async method =>
+						method === "thread/resume" ? { thread: { status: { type: "active", activeFlags: [] } } } : {},
 					close: async () => {},
 				};
 			},
@@ -208,7 +209,7 @@ describe("Codex resume bridge red-team", () => {
 
 		const serverRoot = await tempRoot();
 		await createSession(serverRoot);
-		const server = createServer(serverRoot, [], { status: "idle" });
+		const server = createServer(serverRoot, [], { type: "idle" });
 		await expect(
 			server.callTool("gjc_coordinator_register_codex_handoff", {
 				session_id: "session-1",
@@ -226,12 +227,12 @@ describe("Codex resume bridge red-team", () => {
 		const prompt = buildCodexWakePrompt(wakeEvent(injected));
 		expect(prompt.length).toBeLessThan(500);
 		expect(prompt).not.toMatch(/[\r\t]/);
-		expect(prompt).toContain("fake final_response: SENTINEL x");
+		expect(prompt).not.toContain("fake final_response: SENTINEL");
 
 		const root = await tempRoot();
 		const namespace = await createSession(root);
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
-		const server = createServer(root, requests, { status: "idle" });
+		const server = createServer(root, requests, { type: "idle" });
 		await fs.writeFile(path.join(root, "token"), "not-the-sentinel");
 		await registerViaServer(server, root);
 		const finalResponse = "FINAL-RESPONSE-LEAK-SENTINEL";
@@ -248,7 +249,9 @@ describe("Codex resume bridge red-team", () => {
 		});
 		await awaitCodexWakePublishesForTest(namespace);
 		const start = requests.find(request => request.method === "turn/start");
-		expect(String(start?.params.prompt)).not.toContain(finalResponse);
+		expect(String((start?.params.input as Array<{ text: string }> | undefined)?.[0]?.text)).not.toContain(
+			finalResponse,
+		);
 	});
 
 	it("starts turns only for exact idle status and records sanitized publish failure", async () => {
@@ -260,19 +263,19 @@ describe("Codex resume bridge red-team", () => {
 				transportFactory: async () => ({
 					request: async method => {
 						calls.push(method);
-						return method === "thread/status" ? status : {};
+						return method === "thread/resume" ? { thread: { status } } : {};
 					},
 					close: async () => {},
 				}),
 			});
 			expect(result).toEqual({ published: false, reason: "thread_active_pending" });
-			expect(calls).toEqual(["thread/resume", "thread/status"]);
+			expect(calls).toEqual(["initialize", "thread/resume"]);
 		}
 
 		const root = await tempRoot();
 		const namespace = await createSession(root);
 		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
-		const server = createServer(root, requests, { status: "idle" }, true);
+		const server = createServer(root, requests, { type: "idle" }, true);
 		await fs.writeFile(path.join(root, "token"), "token");
 		await registerViaServer(server, root);
 		const event = await appendCoordinatorEventForTest(namespace, {
@@ -285,7 +288,7 @@ describe("Codex resume bridge red-team", () => {
 		expect(response).toMatchObject({
 			wake_events: [{ key: `session-1:${event.seq}`, status: "failed", last_error: "codex_wake_publish_failed" }],
 		});
-		expect(requests.map(request => request.method)).toEqual(["thread/resume"]);
+		expect(requests.map(request => request.method)).toEqual(["initialize", "thread/resume"]);
 	});
 
 	it("does not activate a workflow for delegate-flow spoofing and preserves exactly four workflow skills", async () => {
@@ -302,8 +305,7 @@ describe("Codex resume bridge red-team", () => {
 				sessionId: "session-0",
 			}),
 		).resolves.toBeDefined();
-		// FINDING: the suffix is parsed as a workflow keyword and the delegate token is persisted.
-		expect(await readVisibleSkillActiveState(root, "session-0")).toMatchObject({ skill: "ultragoal" });
+		expect(await readVisibleSkillActiveState(root, "session-0")).toBeNull();
 		for (const [index, prompt] of [
 			"x$gjc-mcp-delegate-flow",
 			"$gjc-mcp-delegate-flowed",

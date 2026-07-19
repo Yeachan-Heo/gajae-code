@@ -5,6 +5,8 @@ import { sessionStateDir } from "../gjc-runtime/session-layout";
 export const GJC_MCP_DELEGATE_FLOW_ACTIVATION = "$gjc-mcp-delegate-flow";
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]{1,256}$/;
+const MAX_HOST_CONTEXT_BYTES = 8192;
+const MAX_HOST_CONTEXTS = 64;
 const ACTIVATION_PATTERN = /(?:^|[^A-Za-z0-9_-])\$gjc-mcp-delegate-flow(?=$|[^A-Za-z0-9_-])/;
 
 export interface McpDelegateHostContextV1 {
@@ -33,13 +35,15 @@ function isMcpDelegateHostContextV1(value: unknown): value is McpDelegateHostCon
 	return (
 		context.schema_version === 1 &&
 		context.activation === GJC_MCP_DELEGATE_FLOW_ACTIVATION &&
-		(typeof context.session_id === "string" || context.session_id === null) &&
+		typeof context.session_id === "string" &&
+		SESSION_ID_PATTERN.test(context.session_id) &&
 		(typeof context.thread_id === "string" || context.thread_id === null) &&
 		(typeof context.turn_id === "string" || context.turn_id === null) &&
 		typeof context.cwd === "string" &&
 		context.source === "user_prompt_submit" &&
 		typeof context.recorded_at === "string" &&
-		typeof context.prompt_excerpt === "string"
+		typeof context.prompt_excerpt === "string" &&
+		context.prompt_excerpt.length <= 400
 	);
 }
 
@@ -98,4 +102,42 @@ export async function readMcpDelegateHostContext(
 	} catch {
 		throw new Error("state_corrupt");
 	}
+}
+
+export async function listMcpDelegateHostContexts(
+	cwd: string,
+): Promise<{ contexts: McpDelegateHostContextV1[]; failures: number }> {
+	let entries: fs.Dirent[];
+	try {
+		entries = await fs.readdir(path.join(cwd, ".gjc"), { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { contexts: [], failures: 0 };
+		return { contexts: [], failures: 1 };
+	}
+	let failures = 0;
+	const candidates: Array<{ path: string; mtimeMs: number }> = [];
+	for (const entry of entries) {
+		if (!entry.isDirectory() || !entry.name.startsWith("_session-")) continue;
+		const contextPath = path.join(cwd, ".gjc", entry.name, "state", "mcp-delegate-host-context.json");
+		try {
+			const stat = await fs.stat(contextPath);
+			if (stat.isFile() && stat.size <= MAX_HOST_CONTEXT_BYTES)
+				candidates.push({ path: contextPath, mtimeMs: stat.mtimeMs });
+			else failures++;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") failures++;
+		}
+	}
+	candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+	const contexts: McpDelegateHostContextV1[] = [];
+	for (const candidate of candidates.slice(0, MAX_HOST_CONTEXTS)) {
+		try {
+			const context = JSON.parse(await fs.readFile(candidate.path, "utf8"));
+			if (!isMcpDelegateHostContextV1(context)) throw new Error("state_corrupt");
+			contexts.push(context);
+		} catch {
+			failures++;
+		}
+	}
+	return { contexts: contexts.sort((left, right) => right.recorded_at.localeCompare(left.recorded_at)), failures };
 }

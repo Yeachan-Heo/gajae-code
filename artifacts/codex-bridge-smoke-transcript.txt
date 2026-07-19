@@ -16,3 +16,14 @@ token scan of state root: NO-TOKEN-IN-STATE
 non-loopback tcp 8.8.8.8 -> {ok:false, code:codex_endpoint_not_loopback}
 ack missing wake -> {ok:false, code:not_found}
 raw token argument -> {ok:false, code:token_material_not_allowed} (covered in bridge tests)
+
+## N:1 parallel handoff smoke (2026-07-19T04:02:15Z) — corrective auto-bind change
+Three registrations (host-1, delegate-a, delegate-b) share thread-n1 over stdio JSON-RPC;
+fresh-process reads return both delegate handoffs bound to thread-n1; no token material in state.
+id=2 ok=True work_unit=host-1 thread=thread-n1 (register)
+id=3 ok=True work_unit=delegate-a thread=thread-n1 (register)
+id=4 ok=True work_unit=delegate-b thread=thread-n1 (register)
+restart: id=2 delegate-a thread-n1; id=3 delegate-b thread-n1
+
+Bound-ask isolation with distinct answer bindings proven in:
+  test 'keeps parallel pending questions isolated when one answer is submitted' (answer_binding A != B)
