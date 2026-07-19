@@ -237,6 +237,7 @@ describe("startup update contract", () => {
 			const originalNoTitle = Bun.env.PI_NO_TITLE;
 			let checks = 0;
 			const runners: string[] = [];
+			let pipedInputReads = 0;
 			try {
 				const parsed =
 					testCase.expectedRunner === "acp"
@@ -254,7 +255,10 @@ describe("startup update contract", () => {
 						},
 					},
 					initTheme: async () => {},
-					readPipedInput: async () => testCase.pipedInput,
+					readPipedInput: async () => {
+						pipedInputReads += 1;
+						return testCase.pipedInput;
+					},
 					runStartupCredentialAutoImportIfNeeded: async () => undefined,
 					runAcpMode: async () => {
 						runners.push("acp");
@@ -265,6 +269,7 @@ describe("startup update contract", () => {
 				});
 				expect(checks, testCase.name).toBe(0);
 				expect(runners, testCase.name).toEqual([testCase.expectedRunner]);
+				expect(pipedInputReads, testCase.name).toBe(testCase.expectedRunner === "acp" ? 0 : 1);
 			} finally {
 				authStorage.close();
 				if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
@@ -408,6 +413,7 @@ describe("startup update contract", () => {
 					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
 					initTheme: async () => {},
 					readPipedInput: async () => undefined,
+					stdinIsTTY: true,
 					runStartupCredentialAutoImportIfNeeded: async () => undefined,
 					getChangelogForDisplay: async () => {
 						throw startupFailure;
@@ -491,6 +497,7 @@ describe("startup update contract", () => {
 					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
 					initTheme: async () => {},
 					readPipedInput: async () => undefined,
+					stdinIsTTY: true,
 					runStartupCredentialAutoImportIfNeeded: async () => undefined,
 					getChangelogForDisplay: async () => undefined,
 				}),
@@ -529,6 +536,7 @@ describe("startup update contract", () => {
 				},
 				initTheme: async () => {},
 				readPipedInput: async () => undefined,
+				stdinIsTTY: true,
 				runStartupCredentialAutoImportIfNeeded: async () => undefined,
 				getChangelogForDisplay: async () => {
 					events.push("changelog-start");
@@ -599,6 +607,7 @@ describe("startup update contract", () => {
 						},
 						initTheme: async () => {},
 						readPipedInput: async () => undefined,
+						stdinIsTTY: true,
 						runStartupCredentialAutoImportIfNeeded: async () => undefined,
 						getChangelogForDisplay: async () => undefined,
 						createInteractiveMode: () =>
@@ -642,6 +651,7 @@ describe("startup update contract", () => {
 					settings,
 					initTheme: async () => {},
 					readPipedInput: async () => undefined,
+					stdinIsTTY: true,
 					runStartupCredentialAutoImportIfNeeded: async () => undefined,
 					getChangelogForDisplay: async () => undefined,
 					createInteractiveMode: () =>

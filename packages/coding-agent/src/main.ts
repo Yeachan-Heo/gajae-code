@@ -1015,6 +1015,7 @@ export interface RunRootCommandDependencies {
 	startupUpdate?: { check: () => Promise<string | undefined> };
 	initTheme?: typeof initTheme;
 	readPipedInput?: typeof readPipedInput;
+	stdinIsTTY?: boolean;
 	runStartupCredentialAutoImportIfNeeded?: typeof runStartupCredentialAutoImportIfNeeded;
 	getChangelogForDisplay?: typeof getChangelogForDisplay;
 	createInteractiveMode?: CreateInteractiveMode;
@@ -1166,7 +1167,7 @@ export async function runRootCommand(
 		Bun.env.PI_NO_TITLE = "1";
 	}
 	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
-		const pipedInput = await (deps.readPipedInput ?? readPipedInput)();
+		const pipedInput = parsedArgs.mode === "acp" ? undefined : await (deps.readPipedInput ?? readPipedInput)();
 		if (parsedArgs.fileArgs.length === 0) {
 			return { pipedInput, fileText: undefined, fileImages: undefined };
 		}
@@ -1182,7 +1183,7 @@ export async function runRootCommand(
 		stdinContent: pipedInput,
 	});
 	const disposition = resolveLaunchDisposition({
-		stdinIsTTY: process.stdin.isTTY,
+		stdinIsTTY: deps.stdinIsTTY ?? process.stdin.isTTY,
 		pipedInput,
 		hasPreparedInput: parsedArgs.messages.length > 0 || parsedArgs.fileArgs.length > 0,
 		print: Boolean(parsedArgs.print),

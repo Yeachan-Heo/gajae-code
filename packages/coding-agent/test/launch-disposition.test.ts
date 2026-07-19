@@ -106,6 +106,7 @@ describe("non-TTY CLI startup", () => {
 				GJC_CODING_AGENT_DIR: root,
 				PI_CODING_AGENT_DIR: root,
 				GJC_NOTIFICATIONS: "0",
+				GJC_CLEANUP_DEADLINE_MS: "250",
 				NO_COLOR: "1",
 			});
 
@@ -125,6 +126,7 @@ describe("non-TTY CLI startup", () => {
 				PI_CODING_AGENT_DIR: root,
 				GJC_NOTIFICATIONS: "0",
 				NO_COLOR: "1",
+				GJC_CLEANUP_DEADLINE_MS: "250",
 				ANTHROPIC_API_KEY: "",
 				ANTHROPIC_OAUTH_TOKEN: "",
 				OPENAI_API_KEY: "",
