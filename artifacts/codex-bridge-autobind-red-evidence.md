@@ -259,3 +259,325 @@ returns codex_app_server_request_failed (JSON-RPC error: no rollout found) — n
 Origin mapping (final): gjc_session_id=delegate work unit, gjc_turn_id=delegation turn,
 codex_thread_id=source thread, codex_turn_id=host context turn, codex_host_session_id=host context session.
 Token: sent only as Authorization Bearer header in the WebSocket upgrade; never in RPC params.
+## Explicit Codex correlation RED — T1–T4
+
+Command:
+
+```text
+bun test packages/coding-agent/test/coordinator-mcp-server.test.ts --test-name-pattern 'binds a delegate session to an explicitly correlated Codex handoff|explicit correlation overrides ambient host context|missing explicit correlation skips binding with a durable diagnostic|rejects malformed explicit correlation ids without failing delegation'
+```
+
+Verbatim RED output:
+
+```text
+bun test v1.3.14 (d1632b29)
+
+packages/coding-agent/test/coordinator-mcp-server.test.ts:
+1629 | 			allow_mutation: true,
+1630 | 			codex_host_session_id: "codex-host-1",
+1631 | 		});
+1632 | 		const sessionId = String(result.session_id);
+1633 | 
+1634 | 		expect(result).toMatchObject({
+                        ^
+error: expect(received).toMatchObject(expected)
+
+  {
++   "active_turn_id": "turn-ee294e49-ef70-4555-a685-4f15b1cd18cf",
+    "codex_handoff": {
+-     "auto_bound": true,
+-     "thread_id": "thread-explicit-one",
++     "auto_bound": false,
++   },
++   "delivered": true,
++   "delivery": {
++     "attempts": [
++       {
++         "channel": "runtime_ack",
++         "created_at": "2026-07-19T05:33:35.743Z",
++         "delivered": true,
++         "reason": null,
++       },
++     ],
++     "delivered": true,
++     "prompt_acknowledged": true,
++     "queued": false,
++     "runtime_command_id": "sdk-command-6",
++     "runtime_turn_id": "sdk-turn-6",
++     "state": "acknowledged",
++     "target": null,
+    },
+    "ok": true,
++   "queued": false,
++   "result": {
++     "accepted": true,
++     "command_id": "sdk-command-6",
++     "turn_id": "sdk-turn-6",
++   },
++   "session": {
++     "created_at": "2026-07-19T05:33:35.735Z",
++     "cwd": "/private/var/folders/yx/36gb7cy13hqbgxkbll48m0cr0000gn/T/gjc-coordinator-server-rF3G1z",
++     "ephemeral": true,
++     "session_id": "created-session-1",
++   },
++   "session_id": "created-session-1",
++   "session_state": {
++     "current_turn_id": "turn-ee294e49-ef70-4555-a685-4f15b1cd18cf",
++     "last_turn_id": null,
++     "ready_for_input": false,
++     "session_id": "created-session-1",
++     "state": "running",
++     "updated_at": "2026-07-19T05:33:35.747Z",
++   },
++   "status": "active",
++   "tool_name": "gjc_delegate_execute",
++   "turn": {
++     "completed_at": null,
++     "created_at": "2026-07-19T05:33:35.743Z",
++     "delivery": {
++       "attempts": [
++         {
++           "channel": "runtime_ack",
++           "created_at": "2026-07-19T05:33:35.743Z",
++           "delivered": true,
++           "reason": null,
++         },
++       ],
++       "delivered": true,
++       "prompt_acknowledged": true,
++       "queued": false,
++       "runtime_command_id": "sdk-command-6",
++       "runtime_turn_id": "sdk-turn-6",
++       "state": "acknowledged",
++       "target": null,
++     },
++     "error": null,
++     "evidence": [],
++     "final_response": {
++       "artifact_path": null,
++       "format": "markdown",
++       "source": null,
++       "text": null,
++       "truncated": false,
++     },
++     "liveness": {
++       "checked_at": null,
++       "live": null,
++       "reason": null,
++     },
++     "namespace": {
++       "identity": "ns1_8ef82ae97c638dba80f302e594a19da9",
++       "profile": "local",
++       "repo": "repo",
++     },
++     "prompt": {
++       "created_at": "2026-07-19T05:33:35.743Z",
++       "source": "mcp",
++       "text": 
++ "/skill:ultragoal
++ 
++ Delegated by coordinator MCP tool: gjc_delegate_execute
++ Workflow: execute
++ CWD: /private/var/folders/yx/36gb7cy13hqbgxkbll48m0cr0000gn/T/gjc-coordinator-server-rF3G1z
++ Mutation intent: mutation requested; coordinator startup policy remains authoritative.
++ Optional model hint: none
++ 
++ Task:
++ bind explicit Codex handoff
++ 
++ Return durable status and artifact references through GJC runtime/coordinator state. Do not expose host-facing tmux controls."
++ ,
++     },
++     "question_ids": [],
++     "schema_version": 1,
++     "session_id": "created-session-1",
++     "started_at": "2026-07-19T05:33:35.743Z",
++     "status": "active",
++     "turn_id": "turn-ee294e49-ef70-4555-a685-4f15b1cd18cf",
++     "updated_at": "2026-07-19T05:33:35.743Z",
++   },
++   "turn_id": "turn-ee294e49-ef70-4555-a685-4f15b1cd18cf",
++   "workflow": "execute",
+  }
+
+- Expected  - 2
++ Received  + 110
+
+      at <anonymous> (/Users/probe/git/probepark/gajae-code/packages/coding-agent/test/coordinator-mcp-server.test.ts:1634:18)
+(fail) Coordinator MCP canonical SDK controls > binds a delegate session to an explicitly correlated Codex handoff [38.20ms]
+1668 | 				task: "prefer explicit Codex handoff",
+1669 | 				idempotency_key: "explicit-over-ambient",
+1670 | 				allow_mutation: true,
+1671 | 				codex_host_session_id: "codex-host-2",
+1672 | 			}),
+1673 | 		).resolves.toMatchObject({
+                    ^
+error: expect(received).toMatchObject(expected)
+
+  {
++   "active_turn_id": "turn-e6549946-ea0e-49df-aa95-def7a6c78273",
+    "codex_handoff": {
+      "auto_bound": true,
+-     "thread_id": "thread-explicit-two",
++     "thread_id": "thread-ambient",
++   },
++   "delivered": true,
++   "delivery": {
++     "attempts": [
++       {
++         "channel": "runtime_ack",
++         "created_at": "2026-07-19T05:33:35.766Z",
++         "delivered": true,
++         "reason": null,
++       },
++     ],
++     "delivered": true,
++     "prompt_acknowledged": true,
++     "queued": false,
++     "runtime_command_id": "sdk-command-6",
++     "runtime_turn_id": "sdk-turn-6",
++     "state": "acknowledged",
++     "target": null,
+    },
+    "ok": true,
++   "queued": false,
++   "result": {
++     "accepted": true,
++     "command_id": "sdk-command-6",
++     "turn_id": "sdk-turn-6",
++   },
++   "session": {
++     "created_at": "2026-07-19T05:33:35.761Z",
++     "cwd": "/private/var/folders/yx/36gb7cy13hqbgxkbll48m0cr0000gn/T/gjc-coordinator-server-4mIJ9N",
++     "ephemeral": true,
++     "session_id": "created-session-1",
++   },
++   "session_id": "created-session-1",
++   "session_state": {
++     "current_turn_id": "turn-e6549946-ea0e-49df-aa95-def7a6c78273",
++     "last_turn_id": null,
++     "ready_for_input": false,
++     "session_id": "created-session-1",
++     "state": "running",
++     "updated_at": "2026-07-19T05:33:35.770Z",
++   },
++   "status": "active",
++   "tool_name": "gjc_delegate_execute",
++   "turn": {
++     "completed_at": null,
++     "created_at": "2026-07-19T05:33:35.766Z",
++     "delivery": {
++       "attempts": [
++         {
++           "channel": "runtime_ack",
++           "created_at": "2026-07-19T05:33:35.766Z",
++           "delivered": true,
++           "reason": null,
++         },
++       ],
++       "delivered": true,
++       "prompt_acknowledged": true,
++       "queued": false,
++       "runtime_command_id": "sdk-command-6",
++       "runtime_turn_id": "sdk-turn-6",
++       "state": "acknowledged",
++       "target": null,
++     },
++     "error": null,
++     "evidence": [],
++     "final_response": {
++       "artifact_path": null,
++       "format": "markdown",
++       "source": null,
++       "text": null,
++       "truncated": false,
++     },
++     "liveness": {
++       "checked_at": null,
++       "live": null,
++       "reason": null,
++     },
++     "namespace": {
++       "identity": "ns1_8ef82ae97c638dba80f302e594a19da9",
++       "profile": "local",
++       "repo": "repo",
++     },
++     "prompt": {
++       "created_at": "2026-07-19T05:33:35.766Z",
++       "source": "mcp",
++       "text": 
++ "/skill:ultragoal
++ 
++ Delegated by coordinator MCP tool: gjc_delegate_execute
++ Workflow: execute
++ CWD: /private/var/folders/yx/36gb7cy13hqbgxkbll48m0cr0000gn/T/gjc-coordinator-server-4mIJ9N
++ Mutation intent: mutation requested; coordinator startup policy remains authoritative.
++ Optional model hint: none
++ 
++ Task:
++ prefer explicit Codex handoff
++ 
++ Return durable status and artifact references through GJC runtime/coordinator state. Do not expose host-facing tmux controls."
++ ,
++     },
++     "question_ids": [],
++     "schema_version": 1,
++     "session_id": "created-session-1",
++     "started_at": "2026-07-19T05:33:35.766Z",
++     "status": "active",
++     "turn_id": "turn-e6549946-ea0e-49df-aa95-def7a6c78273",
++     "updated_at": "2026-07-19T05:33:35.766Z",
++   },
++   "turn_id": "turn-e6549946-ea0e-49df-aa95-def7a6c78273",
++   "workflow": "execute",
+  }
+
+- Expected  - 1
++ Received  + 110
+
+      at <anonymous> (/Users/probe/git/probepark/gajae-code/packages/coding-agent/test/coordinator-mcp-server.test.ts:1673:14)
+(fail) Coordinator MCP canonical SDK controls > explicit correlation overrides ambient host context [24.80ms]
+1688 | 				idempotency_key: "missing-explicit-codex-handoff",
+1689 | 				allow_mutation: true,
+1690 | 				codex_host_session_id: "missing-codex-host",
+1691 | 			}),
+1692 | 		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+1693 | 		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+                                                                                                   ^
+error: 
+
+Expected promise that resolves
+Received promise that rejected: Promise { <rejected> }
+
+      at <anonymous> (/Users/probe/git/probepark/gajae-code/packages/coding-agent/test/coordinator-mcp-server.test.ts:1693:93)
+(fail) Coordinator MCP canonical SDK controls > missing explicit correlation skips binding with a durable diagnostic [19.99ms]
+1707 | 				idempotency_key: "malformed-explicit-codex-handoff",
+1708 | 				allow_mutation: true,
+1709 | 				codex_host_session_id: "../evil",
+1710 | 			}),
+1711 | 		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+1712 | 		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
+                                                                                                   ^
+error: 
+
+Expected promise that resolves
+Received promise that rejected: Promise { <rejected> }
+
+      at <anonymous> (/Users/probe/git/probepark/gajae-code/packages/coding-agent/test/coordinator-mcp-server.test.ts:1712:93)
+(fail) Coordinator MCP canonical SDK controls > rejects malformed explicit correlation ids without failing delegation [18.23ms]
+
+ 0 pass
+ 67 filtered out
+ 4 fail
+ 6 expect() calls
+Ran 4 tests across 1 file. [436.00ms]
+``` 
+
+## Explicit correlation GREEN + corrupt-source coverage
+Added test: 'treats a corrupt explicit handoff registration as missing without failing delegation'
+(invalid JSON at codex-handoffs/corrupt-codex-host.json -> ok:true, auto_bound:false, codex_handoff_explicit_source_missing).
+Final focused GREEN:
+ 122 pass
+ 0 fail
+ 570 expect() calls
+Ran 122 tests across 7 files. [8.74s]
