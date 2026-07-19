@@ -161,7 +161,7 @@ export class DebugSelectorComponent extends Container {
 			"Generating report...",
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(loader);
+		this.ctx.statusArea.addLoader(loader);
 		this.ctx.ui.requestRender();
 
 		try {
@@ -174,8 +174,7 @@ export class DebugSelectorComponent extends Container {
 				workProfile,
 			});
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(loader);
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -184,8 +183,7 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(loader);
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -226,7 +224,7 @@ export class DebugSelectorComponent extends Container {
 			"Creating report bundle...",
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(loader);
+		this.ctx.statusArea.addLoader(loader);
 		this.ctx.ui.requestRender();
 
 		try {
@@ -235,8 +233,7 @@ export class DebugSelectorComponent extends Container {
 				settings: this.#getResolvedSettings(),
 			});
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(loader);
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -245,8 +242,7 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(loader);
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -261,7 +257,7 @@ export class DebugSelectorComponent extends Container {
 			"Generating heap snapshot...",
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(loader);
+		this.ctx.statusArea.addLoader(loader);
 		this.ctx.ui.requestRender();
 
 		try {
@@ -274,8 +270,7 @@ export class DebugSelectorComponent extends Container {
 				heapSnapshot,
 			});
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(loader);
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -284,8 +279,7 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(loader);
 			this.ctx.showError(`Failed to create report: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
@@ -412,14 +406,13 @@ export class DebugSelectorComponent extends Container {
 			"Clearing artifact cache...",
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(loader);
+		this.ctx.statusArea.addLoader(loader);
 		this.ctx.ui.requestRender();
 
 		try {
 			const result = await clearArtifactCache(sessionsDir, 30);
 
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(loader);
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(
@@ -430,8 +423,7 @@ export class DebugSelectorComponent extends Container {
 				),
 			);
 		} catch (err) {
-			loader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(loader);
 			this.ctx.showError(`Failed to clear cache: ${err instanceof Error ? err.message : String(err)}`);
 		}
 

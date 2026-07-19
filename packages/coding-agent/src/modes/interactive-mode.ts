@@ -86,6 +86,7 @@ import { OAuthManualInputManager } from "./oauth-manual-input";
 import { SessionObserverRegistry } from "./session-observer-registry";
 import { interruptHint } from "./shared";
 import { shouldShowExtensionCommand } from "./slash-command-visibility";
+import { StatusArea } from "./status-area";
 import { TasksAggregator } from "./tasks-aggregator";
 import { type ShimmerPalette, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
@@ -277,6 +278,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	chatContainer: Container;
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
+	// Initialized before ui/statusContainer are assigned in the constructor:
+	// StatusArea must only read its context lazily inside its methods.
+	readonly statusArea: StatusArea = new StatusArea(this);
 	todoContainer: Container;
 	btwContainer: Container;
 	editor: CustomEditor;
@@ -963,9 +967,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingWorkingMessage = undefined;
 		this.#goalModeController.onPendingSubmissionFinished(submission.customType);
 		if (this.loadingAnimation) {
-			this.loadingAnimation.stop();
+			this.statusArea.removeLoader(this.loadingAnimation);
 			this.loadingAnimation = undefined;
-			this.statusContainer.clear();
 		}
 		if (!submission.customType) {
 			this.pendingImages = submission.images ? [...submission.images] : [];
@@ -999,9 +1002,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			pendingSubmissionDispose?.();
 			this.#pendingWorkingMessage = undefined;
 			if (this.loadingAnimation) {
-				this.loadingAnimation.stop();
+				this.statusArea.removeLoader(this.loadingAnimation);
 				this.loadingAnimation = undefined;
-				this.statusContainer.clear();
 			}
 		}
 	}
@@ -1447,9 +1449,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionDispose = undefined;
 		this.#pendingWorkingMessage = undefined;
 		if (this.loadingAnimation) {
-			this.loadingAnimation.stop();
+			this.statusArea.removeLoader(this.loadingAnimation);
 			this.loadingAnimation = undefined;
-			this.statusContainer.clear();
 		}
 		this.#uiHelpers.showError(message);
 	}
@@ -1498,7 +1499,6 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	ensureLoadingAnimation(): void {
 		if (!this.loadingAnimation) {
-			this.statusContainer.clear();
 			this.loadingAnimation = new Loader(
 				this.ui,
 				spinner => {
@@ -1510,7 +1510,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				getSymbolTheme().spinnerFrames,
 				{ timeDependentColor: true },
 			);
-			this.statusContainer.addChild(this.loadingAnimation);
+			this.statusArea.addLoader(this.loadingAnimation);
 		}
 
 		this.applyPendingWorkingMessage();

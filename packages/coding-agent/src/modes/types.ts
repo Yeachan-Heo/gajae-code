@@ -32,6 +32,7 @@ import type { ToolExecutionHandle } from "./components/tool-execution";
 import type { StatusLineComponent } from "./components/tool-status-header";
 import type { IrcObservationLedger } from "./irc-observation-ledger";
 import type { OAuthManualInputManager } from "./oauth-manual-input";
+import type { StatusArea } from "./status-area";
 import type { Theme } from "./theme/theme";
 import type { ParsedIrcMessage } from "./utils/irc-message";
 
@@ -90,6 +91,8 @@ export interface InteractiveModeContext {
 	chatContainer: Container;
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
+	/** Single owner of transient status-slot teardown; see StatusArea docs. */
+	statusArea: StatusArea;
 	todoContainer: Container;
 	btwContainer: Container;
 	editor: CustomEditor;

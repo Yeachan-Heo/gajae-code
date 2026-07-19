@@ -1942,7 +1942,7 @@ export class SelectorController {
 							"Summarizing branch... (esc to cancel)",
 							getSymbolTheme().spinnerFrames,
 						);
-						this.ctx.statusContainer.addChild(summaryLoader);
+						this.ctx.statusArea.addLoader(summaryLoader);
 						this.ctx.ui.requestRender();
 					}
 
@@ -1973,10 +1973,7 @@ export class SelectorController {
 					} catch (error) {
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					} finally {
-						if (summaryLoader) {
-							summaryLoader.stop();
-							this.ctx.statusContainer.clear();
-						}
+						this.ctx.statusArea.removeLoader(summaryLoader);
 						this.ctx.editor.onEscape = originalOnEscape;
 					}
 				},

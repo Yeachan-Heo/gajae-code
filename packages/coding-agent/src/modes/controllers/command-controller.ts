@@ -1205,11 +1205,8 @@ export class CommandController {
 		customInstructionsOrOptions?: string | CompactOptions,
 		isAuto = false,
 	): Promise<CompactionOutcome> {
-		if (this.ctx.loadingAnimation) {
-			this.ctx.loadingAnimation.stop();
-			this.ctx.loadingAnimation = undefined;
-		}
-		this.ctx.statusContainer.clear();
+		this.ctx.statusArea.removeLoader(this.ctx.loadingAnimation);
+		this.ctx.loadingAnimation = undefined;
 
 		const originalOnEscape = this.ctx.editor.onEscape;
 		this.ctx.editor.onEscape = () => {
@@ -1225,7 +1222,7 @@ export class CommandController {
 			label,
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(compactingLoader);
+		this.ctx.statusArea.addLoader(compactingLoader);
 		this.ctx.ui.requestRender();
 
 		let outcome: CompactionOutcome = "ok";
@@ -1251,8 +1248,7 @@ export class CommandController {
 				this.ctx.showError(`Compaction failed: ${message}`);
 			}
 		} finally {
-			compactingLoader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(compactingLoader);
 			this.ctx.editor.onEscape = originalOnEscape;
 		}
 		await this.ctx.flushCompactionQueue({ willRetry: false });
@@ -1268,11 +1264,8 @@ export class CommandController {
 			return;
 		}
 
-		if (this.ctx.loadingAnimation) {
-			this.ctx.loadingAnimation.stop();
-			this.ctx.loadingAnimation = undefined;
-		}
-		this.ctx.statusContainer.clear();
+		this.ctx.statusArea.removeLoader(this.ctx.loadingAnimation);
+		this.ctx.loadingAnimation = undefined;
 
 		const originalOnEscape = this.ctx.editor.onEscape;
 		this.ctx.editor.onEscape = () => {
@@ -1286,7 +1279,7 @@ export class CommandController {
 			"Generating handoff… (esc to cancel)",
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(handoffLoader);
+		this.ctx.statusArea.addLoader(handoffLoader);
 		this.ctx.ui.requestRender();
 
 		try {
@@ -1322,8 +1315,7 @@ export class CommandController {
 				this.ctx.showError(`Handoff failed: ${message}`);
 			}
 		} finally {
-			handoffLoader.stop();
-			this.ctx.statusContainer.clear();
+			this.ctx.statusArea.removeLoader(handoffLoader);
 			this.ctx.editor.onEscape = originalOnEscape;
 		}
 	}

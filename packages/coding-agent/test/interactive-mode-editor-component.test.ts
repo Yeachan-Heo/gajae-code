@@ -663,4 +663,49 @@ describe("InteractiveMode.setEditorComponent", () => {
 			setTerminalImageProtocol(originalProtocol);
 		}
 	});
+	it("preserves independently owned status components when starting the real working loader", () => {
+		const independentStatus = new Text("independent status", 0, 0);
+		mode.statusContainer.addChild(independentStatus);
+
+		mode.ensureLoadingAnimation();
+
+		const loadingAnimation = mode.loadingAnimation;
+		expect(loadingAnimation).toBeDefined();
+		if (!loadingAnimation) throw new Error("Expected the working loader");
+		expect(mode.statusContainer.children).toContain(independentStatus);
+		expect(mode.statusContainer.children).toContain(loadingAnimation);
+		loadingAnimation.stop();
+	});
+	it("error teardown removes only the working loader and keeps independent status", () => {
+		vi.spyOn(mode, "renderSessionContext").mockImplementation(() => undefined);
+		const independentStatus = new Text("independent status", 0, 0);
+		mode.statusContainer.addChild(independentStatus);
+
+		mode.ensureLoadingAnimation();
+		const workingLoader = mode.loadingAnimation;
+		expect(workingLoader).toBeDefined();
+
+		mode.showError("boom");
+
+		expect(mode.loadingAnimation).toBeUndefined();
+		expect(mode.statusContainer.children).not.toContain(workingLoader);
+		expect(mode.statusContainer.children).toContain(independentStatus);
+	});
+	it("cancel teardown removes only the working loader and keeps independent status", () => {
+		vi.spyOn(mode, "renderSessionContext").mockImplementation(() => undefined);
+		const independentStatus = new Text("independent status", 0, 0);
+		mode.statusContainer.addChild(independentStatus);
+
+		mode.startPendingSubmission({ text: "hello" });
+		mode.ensureLoadingAnimation();
+		const workingLoader = mode.loadingAnimation;
+		expect(workingLoader).toBeDefined();
+
+		expect(mode.cancelPendingSubmission()).toBe(true);
+
+		expect(mode.loadingAnimation).toBeUndefined();
+		expect(mode.statusContainer.children).not.toContain(workingLoader);
+		expect(mode.statusContainer.children).toContain(independentStatus);
+		expect(mode.editor.getText()).toBe("hello");
+	});
 });

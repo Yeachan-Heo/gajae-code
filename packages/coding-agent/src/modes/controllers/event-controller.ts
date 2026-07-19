@@ -14,6 +14,7 @@ import {
 import { TodoReminderComponent } from "../../modes/components/todo-reminder";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
+import { StatusArea } from "../../modes/status-area";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
 import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
@@ -118,8 +119,13 @@ export class EventController {
 	#toolIntentCache = new Map<string, { args: unknown; intent: string | undefined }>();
 	#thinkingContentIndices = new Set<number>();
 	#handlers: AgentSessionEventHandlers;
+	#statusArea: StatusArea;
+	#lifecycleQueue: Promise<void> = Promise.resolve();
+	#turnGeneration = 0;
+	#completedGeneration = -1;
 
 	constructor(private ctx: InteractiveModeContext) {
+		this.#statusArea = ctx.statusArea ?? new StatusArea(ctx);
 		this.#handlers = {
 			agent_start: e => this.#handleAgentStart(e),
 			agent_end: e => this.#handleAgentEnd(e),
@@ -228,7 +234,24 @@ export class EventController {
 		});
 	}
 
-	async handleEvent(event: AgentSessionEvent): Promise<void> {
+	/**
+	 * Orders lifecycle events so a completion cannot interleave with a
+	 * successor turn's start. Only agent_start/agent_end are serialized:
+	 * queuing the whole stream would let a handler that awaits user
+	 * interaction (e.g. plan approval inside tool_execution_end) starve live
+	 * events. Handlers must never await handleEvent for a lifecycle event: a
+	 * nested call would queue behind the current one and deadlock.
+	 */
+	handleEvent(event: AgentSessionEvent): Promise<void> {
+		if (event.type === "agent_start" || event.type === "agent_end") {
+			const completion = this.#lifecycleQueue.then(() => this.#handleEvent(event));
+			this.#lifecycleQueue = completion.catch(() => {});
+			return completion;
+		}
+		return this.#handleEvent(event);
+	}
+
+	async #handleEvent(event: AgentSessionEvent): Promise<void> {
 		if (!this.ctx.isInitialized) {
 			await this.ctx.init();
 		}
@@ -242,6 +265,7 @@ export class EventController {
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		this.#turnGeneration++;
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
@@ -251,15 +275,15 @@ export class EventController {
 			this.ctx.retryEscapeHandler = undefined;
 		}
 		if (this.ctx.retryLoader) {
-			this.ctx.retryLoader.stop();
 			this.#clearRetryCountdown();
+			this.#statusArea.removeLoader(this.ctx.retryLoader);
 			this.ctx.retryLoader = undefined;
-			this.ctx.statusContainer.clear();
 		}
 		this.ctx.retryEscapePrimed = false;
 		this.#cancelIdleCompaction();
 		this.ctx.updateEditorBorderColor();
 		this.ctx.ensureLoadingAnimation();
+		this.#statusArea.capture();
 		this.ctx.ui.requestRender();
 	}
 
@@ -810,11 +834,29 @@ export class EventController {
 	}
 
 	async #handleAgentEnd(_event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
-		if (this.ctx.loadingAnimation) {
-			this.ctx.loadingAnimation.stop();
-			this.ctx.loadingAnimation = undefined;
-			this.ctx.statusContainer.clear();
+		if (this.#completedGeneration === this.#turnGeneration) return;
+		// A stale completion from a superseded run must not complete the active
+		// turn: the agent flips isStreaming to false before emitting a
+		// legitimate agent_end, so a streaming session here means an active run
+		// owns the next completion (or a queued follow-up chained runs without
+		// an idle gap — no completion should be shown either way).
+		if (this.ctx.session.isStreaming) return;
+		this.#completedGeneration = this.#turnGeneration;
+
+		if (this.ctx.retryEscapeHandler) {
+			this.ctx.editor.onEscape = this.ctx.retryEscapeHandler;
+			this.ctx.retryEscapeHandler = undefined;
 		}
+		this.#clearRetryCountdown();
+		// Process terminals do not expose native scrollback position. The
+		// reserve records the visible rows before each removal so completion
+		// cannot contract the status area and repaint a viewport the user is
+		// browsing.
+		this.#statusArea.removeLoader(this.ctx.retryLoader);
+		this.ctx.retryLoader = undefined;
+		this.#statusArea.removeLoader(this.ctx.loadingAnimation);
+		this.ctx.loadingAnimation = undefined;
+		this.ctx.retryEscapePrimed = false;
 		if (this.ctx.streamingComponent) {
 			this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);
 			this.ctx.streamingComponent = undefined;
@@ -847,7 +889,10 @@ export class EventController {
 		this.ctx.editor.onEscape = () => {
 			this.ctx.session.abortCompaction();
 		};
-		this.ctx.statusContainer.clear();
+		if (this.ctx.autoCompactionLoader) {
+			this.#statusArea.removeLoader(this.ctx.autoCompactionLoader);
+			this.ctx.autoCompactionLoader = undefined;
+		}
 		const reasonText =
 			event.reason === "overflow" ? "Context overflow detected, " : event.reason === "idle" ? "Idle " : "";
 		const actionLabel = event.action === "handoff" ? "Auto-handoff" : "Auto context-full maintenance";
@@ -858,7 +903,7 @@ export class EventController {
 			`${reasonText}${actionLabel}… (esc to cancel)`,
 			getSymbolTheme().spinnerFrames,
 		);
-		this.ctx.statusContainer.addChild(this.ctx.autoCompactionLoader);
+		this.#statusArea.addLoader(this.ctx.autoCompactionLoader);
 		this.ctx.ui.requestRender();
 	}
 
@@ -869,9 +914,8 @@ export class EventController {
 			this.ctx.autoCompactionEscapeHandler = undefined;
 		}
 		if (this.ctx.autoCompactionLoader) {
-			this.ctx.autoCompactionLoader.stop();
+			this.#statusArea.removeLoader(this.ctx.autoCompactionLoader);
 			this.ctx.autoCompactionLoader = undefined;
-			this.ctx.statusContainer.clear();
 		}
 		this.ctx.updateEditorBorderColor();
 		const isHandoffAction = event.action === "handoff";
@@ -939,9 +983,13 @@ export class EventController {
 				this.ctx.session.abortRetry();
 			}
 		};
-		this.ctx.statusContainer.clear();
-		// Stop any prior retry loader/timer before installing a new one.
-		this.ctx.retryLoader?.stop();
+		// Hide the working loader during backoff. The reserve records the rows
+		// before removal, so the swap never contracts even when the
+		// replacement retry status is shorter (e.g. narrow terminals).
+		this.#statusArea.removeLoader(this.ctx.loadingAnimation);
+		this.ctx.loadingAnimation = undefined;
+		this.#statusArea.removeLoader(this.ctx.retryLoader);
+		this.ctx.retryLoader = undefined;
 		this.#clearRetryCountdown();
 		const reason = friendlyRetryReason(event.errorMessage);
 		const attemptLabel = event.unbounded ? `attempt ${event.attempt}` : `${event.attempt}/${event.maxAttempts}`;
@@ -963,7 +1011,7 @@ export class EventController {
 		this.ctx.retryCountdownTimer = setInterval(() => {
 			retryLoader.setMessage(buildMessage());
 		}, 1000);
-		this.ctx.statusContainer.addChild(retryLoader);
+		this.#statusArea.addLoader(retryLoader);
 		this.ctx.ui.requestRender();
 	}
 
@@ -973,10 +1021,9 @@ export class EventController {
 			this.ctx.retryEscapeHandler = undefined;
 		}
 		if (this.ctx.retryLoader) {
-			this.ctx.retryLoader.stop();
 			this.#clearRetryCountdown();
+			this.#statusArea.removeLoader(this.ctx.retryLoader);
 			this.ctx.retryLoader = undefined;
-			this.ctx.statusContainer.clear();
 		}
 		this.ctx.retryEscapePrimed = false;
 		if (!event.success) {

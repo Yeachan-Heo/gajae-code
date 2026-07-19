@@ -7,6 +7,7 @@
 - Newly registered earlier resource-GC policies advance the pending sweep without postponing an already earlier sweep.
 - Provider onboarding wizard completion is now deterministic under CI load: duplicate in-flight confirmation is suppressed, success tests await the real refresh/notification/status boundary instead of fixed sleeps, and the newly configured model is verified through the subsequent model selector.
 - OpenAI-compatible web search now turns malformed successful response bodies into bounded provider errors while preserving normal provider fallback (#2593).
+- Transient status-slot install and teardown now flow through a single `StatusArea` owner that reserves the slot's high-water row count on native process terminals: completion, cancel, error, auto-retry backoff/recovery, auto/manual compaction, handoff, branch-summary, and debug-report transitions never contract the bottom status area and repaint scrollback the user is browsing, and independently owned status components survive every one of those teardowns. `statusContainer.clear()` is now reserved for whole-session resets. Session lifecycle events are ordered on a dedicated completion/start lane (live events are never queued behind a handler awaiting user interaction), and stale completions from superseded runs are ignored via turn-generation identity.
 
 ## [0.11.3] - 2026-07-19
 ### Added

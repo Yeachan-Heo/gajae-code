@@ -9,6 +9,7 @@ import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { Loader } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
 
 describe("issue #927 optimistic pending spinner", () => {
@@ -69,6 +70,7 @@ describe("issue #927 optimistic pending spinner", () => {
 		expect(mode.loadingAnimation).toBeUndefined();
 		expect(mode.optimisticUserMessageSignature).toBeUndefined();
 		expect(mode.locallySubmittedUserSignatures.has("/extension-no-turn\u00000")).toBe(false);
-		expect(mode.statusContainer.children.length).toBe(0);
+		// The status row reserve may legitimately remain; no loader may.
+		expect(mode.statusContainer.children.filter(child => child instanceof Loader)).toHaveLength(0);
 	});
 });
