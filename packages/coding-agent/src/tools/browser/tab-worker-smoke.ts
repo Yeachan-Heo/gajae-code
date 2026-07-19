@@ -35,7 +35,7 @@ export async function smokeTestTabWorkerWithWorkerForTest(worker: SmokeWorkerHan
 	let phase: SmokePhase = "await-bootstrap";
 	const { promise, resolve, reject } = Promise.withResolvers<void>();
 	let settled = false;
-	let timeout: ReturnType<typeof setTimeout> | undefined;
+	let timeout: NodeJS.Timeout | undefined;
 
 	const cleanup = (): void => {
 		if (timeout) clearTimeout(timeout);

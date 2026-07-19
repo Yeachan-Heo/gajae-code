@@ -9,6 +9,7 @@ import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@g
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
+import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -277,7 +278,6 @@ async function runSmokeTest(): Promise<void> {
 	if (typeof h02ScoreSequenceFuzzy !== "function" || typeof h01FindBestFuzzyMatch !== "function") {
 		throw new Error("smoke-test: native fuzzy exports missing from embedded addon");
 	}
-	const { smokeTestTabWorker } = await import("./tools/browser/tab-worker-smoke");
 	await smokeTestTabWorker();
 	process.stdout.write("smoke-test: ok\n");
 }

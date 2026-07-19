@@ -108,6 +108,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("process.arch");
 		expect(workflow).toContain("Write immutable Darwin smoke receipt");
 		expect(workflow).toContain("dev-affected-darwin-receipt-${{ github.run_id }}");
+		const darwinReceiptUploadStart = workflow.indexOf("      - name: Upload Darwin smoke receipt");
+		const darwinReceiptUploadEnd = workflow.indexOf("\n\n  # One shard", darwinReceiptUploadStart);
+		expect(workflow.slice(darwinReceiptUploadStart, darwinReceiptUploadEnd)).toContain("overwrite: true");
 		expect(workflow).toContain("Download Darwin smoke receipt");
 		expect(workflow).toContain("Validate Darwin smoke receipt");
 		expect(workflow).toContain(".ci-dev-darwin-arm64-receipt.json");
@@ -943,6 +946,8 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/scripts/build-binary.ts",
 			"packages/natives/native/index.js",
 			"scripts/ci-build-native.ts",
+			"packages/coding-agent/src/tools/puppeteer/00_stealth_tampering.txt",
+			"packages/coding-agent/src/tools/puppeteer/15_stealth_webrtc.txt",
 		]) {
 			expect(isDarwinArm64TabWorkerSmokePath(changedPath)).toBe(true);
 			expect(needsDarwinArm64TabWorkerSmoke([changedPath])).toBe(true);

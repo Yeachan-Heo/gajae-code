@@ -262,6 +262,7 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
 
   # One shard per planned task on the broad runner. Native build tasks are
   # excluded (they run in affected-native); shards that load the native addon at

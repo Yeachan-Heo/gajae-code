@@ -311,6 +311,7 @@ export function isDarwinArm64TabWorkerSmokePath(changedPath: string): boolean {
 	// helpers. Directory ownership is deliberately conservative so a newly-added
 	// helper in those graph roots cannot silently bypass the Darwin smoke.
 	return changedPath.startsWith("packages/coding-agent/src/tools/browser/") ||
+		changedPath.startsWith("packages/coding-agent/src/tools/puppeteer/") ||
 		changedPath.startsWith("packages/coding-agent/src/eval/js/") ||
 		changedPath.startsWith("packages/coding-agent/src/web/scrapers/") ||
 		changedPath.startsWith("packages/coding-agent/src/utils/") ||

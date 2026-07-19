@@ -158,7 +158,7 @@ async function awaitWithinBudget(op: Promise<unknown>, remainingMs: number, labe
 		logger.debug("close teardown budget already spent; detaching step", { label });
 		return false;
 	}
-	let timer: ReturnType<typeof setTimeout> | undefined;
+	let timer: NodeJS.Timeout | undefined;
 	const timedOut = new Promise<boolean>(resolve => {
 		timer = setTimeout(() => resolve(false), remainingMs);
 	});
