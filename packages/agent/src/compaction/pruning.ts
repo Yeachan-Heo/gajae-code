@@ -48,6 +48,7 @@ export interface PruneResult {
 }
 
 const DIGEST_NOTICE_TOKEN_CAP_MULTIPLIER = 1.25;
+const ERROR_DIGEST_NOTICE_MIN_CHARS = 240;
 
 function createGenericPrunedNotice(tokens: number): string {
 	return `[Output truncated - ${tokens} tokens]`;
@@ -64,6 +65,27 @@ function firstErrorLine(text: string): string | undefined {
 		.split(/\r?\n/)
 		.find(line => /error|failed|exception|panic/i.test(line))
 		?.trim();
+}
+
+function firstNonEmptyLine(text: string): string | undefined {
+	return text
+		.split(/\r?\n/)
+		.find(line => line.trim().length > 0)
+		?.trim();
+}
+
+function lastNonEmptyLine(text: string): string | undefined {
+	return text.trim().split(/\r?\n/).filter(Boolean).at(-1)?.trim();
+}
+
+function errorResultDigest(message: ToolResultMessage): string | undefined {
+	if (message.isError !== true) return undefined;
+	const text = firstTextContent(message);
+	if (text.trim().length === 0) return "error=tool result failed without text";
+	const error = firstErrorLine(text);
+	if (error) return `error=${error}`;
+	const summary = firstNonEmptyLine(text) ?? lastNonEmptyLine(text);
+	return summary ? `summary=${summary}` : undefined;
 }
 
 function truncateField(value: string, maxLength: number): string {
@@ -99,7 +121,7 @@ function resultDigest(message: ToolResultMessage): string | undefined {
 				.join("; ") || "search digest unavailable"
 		);
 	}
-	return undefined;
+	return errorResultDigest(message);
 }
 
 function createPrunedNotice(tokens: number, message?: ToolResultMessage): string {
@@ -110,7 +132,9 @@ function createPrunedNotice(tokens: number, message?: ToolResultMessage): string
 	const maxTokens = Math.max(genericTokens, Math.floor(genericTokens * DIGEST_NOTICE_TOKEN_CAP_MULTIPLIER));
 	const prefix = `[Output truncated - ${tokens} tokens; `;
 	const suffix = "]";
-	const maxChars = Math.max(0, maxTokens * 4 - prefix.length - suffix.length);
+	const digestChars = maxTokens * 4 - prefix.length - suffix.length;
+	const maxChars =
+		message?.isError === true ? Math.max(ERROR_DIGEST_NOTICE_MIN_CHARS, digestChars) : Math.max(0, digestChars);
 	return `${prefix}${truncateField(digest, maxChars)}${suffix}`;
 }
 

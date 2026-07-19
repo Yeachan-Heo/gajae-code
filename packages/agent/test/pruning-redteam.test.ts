@@ -206,6 +206,26 @@ describe("pruneToolOutputs red-team boundaries", () => {
 		}
 		expect(result.prunedEntries.every(entry => textOf(entry).startsWith("[Output truncated - "))).toBe(true);
 	});
+	test("pruned error results preserve actionable evidence for non-digested tools", () => {
+		const failure = toolEntry(
+			"edit-failure",
+			"edit",
+			[
+				"Patch application failed.",
+				"Edit rejected: 2 anchors do not match the current file.",
+				textForTokens("omitted-context", 80),
+			].join("\n"),
+		);
+		(failure.message as ToolResultMessage).isError = true;
+		const newest = toolEntry("newest", "bash", "newest");
+
+		const result = pruneToolOutputs([failure, newest], config({ protectTokens: tokens(newest), minimumSavings: 0 }));
+
+		expect(result.prunedEntries).toEqual([failure]);
+		expect(textOf(failure)).toContain("error=Patch application failed.");
+		expect(textOf(failure)).toContain("[Output truncated - ");
+		expect(typeof (failure.message as ToolResultMessage).prunedAt).toBe("number");
+	});
 
 	test("adversarial inputs: empty entries, non-messages, empty content, zero thresholds, and duplicate outputs", () => {
 		expect(pruneToolOutputs([], config())).toEqual({ prunedCount: 0, tokensSaved: 0, prunedEntries: [] });
