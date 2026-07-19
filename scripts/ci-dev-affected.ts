@@ -400,6 +400,22 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 	return paths.some(isDarwinArm64TabWorkerSmokePath);
 }
 
+// Paths whose Windows drive-letter vs Volume-GUID canonicalization and Bun
+// `node:fs` resident-cache write semantics the fix governs. On Ubuntu the
+// windows-canonical-path regression suite is skipped by `describe.skipIf`, so a
+// Linux shard cannot verify the ENOENT fix; dev-ci consumes this emitted flag to
+// run and require the windows-latest job whenever any of these change.
+export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
+	return changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
+		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
+		changedPath === "packages/coding-agent/src/session/session-manager.ts" ||
+		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts";
+}
+
+export function needsWindowsSessionPathRegression(paths: readonly string[]): boolean {
+	return paths.some(isWindowsSessionPathRegressionPath);
+}
+
 // Main CI full mode: emit a lean matrix from the deterministic full plan. It
 // deliberately skips the dev source-sha/checkout asserts, the canonical plan
 // artifact, plan digest, and the Darwin smoke flag — Main CI re-derives the same
@@ -446,11 +462,13 @@ async function emitMatrix(): Promise<void> {
 		.map(entry => ({ key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest }));
 	const hasNative = entries.some(entry => entry.nativeBuild);
 	const hasDarwinArm64TabWorkerSmoke = needsDarwinArm64TabWorkerSmoke(paths);
+	const hasWindowsSessionPath = needsWindowsSessionPathRegression(paths);
 	const lines = [
 		`matrix=${JSON.stringify({ include: shards })}`,
 		`has_tasks=${shards.length > 0}`,
 		`has_native=${hasNative}`,
 		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
+		`has_windows_session_path=${hasWindowsSessionPath}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,

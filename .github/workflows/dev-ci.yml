@@ -26,6 +26,7 @@ jobs:
       has_tasks: ${{ steps.plan.outputs.has_tasks }}
       has_native: ${{ steps.plan.outputs.has_native }}
       has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}
+      has_windows_session_path: ${{ steps.plan.outputs.has_windows_session_path }}
       changed_paths: ${{ steps.plan.outputs.changed_paths }}
       plan_mode: ${{ steps.plan.outputs.plan_mode }}
       plan_digest: ${{ steps.plan.outputs.plan_digest }}
@@ -67,9 +68,9 @@ jobs:
           overwrite: true
 
   windows-dev-doctor:
-    name: Windows dev:doctor
+    name: Windows dev:doctor + session-path regression
     needs: [affected-plan]
-    if: ${{ needs.affected-plan.outputs.relevant == 'true' && contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' && (contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 60
     env:
@@ -118,6 +119,11 @@ jobs:
           bun test scripts/dev-link.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun run dev:doctor
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Windows session-path canonicalization regression
+        shell: pwsh
+        run: |
+          bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # Native addon build runs once per run and publishes the built `.node` files as
@@ -433,7 +439,7 @@ jobs:
           CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}
           CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
           CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
-          CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+          CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' }}
           CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-darwin-arm64-tab-worker-smoke.result }}
           CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke }}
         run: bun scripts/ci-dev-affected.ts --write-affected-evidence
@@ -470,7 +476,7 @@ jobs:
       CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}
       CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
       CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
-      CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+      CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' }}
       CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && 'success' || 'skipped' }}
       CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke }}
     steps:

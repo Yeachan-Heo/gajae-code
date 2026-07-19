@@ -2,7 +2,7 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 
 // Matrix planning validates live workspace and Cargo manifests in subprocesses.
 // Hosted runners can need more than Bun's 5s default during their first cold scan.
@@ -117,6 +117,21 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("Validate finalized Darwin smoke receipt");
 		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT");
 		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED");
+	});
+
+	test("routes the Windows session-path regression suite onto windows-latest and requires it", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		expect(workflow).toContain("has_windows_session_path: ${{ steps.plan.outputs.has_windows_session_path }}");
+		const windowsJob = workflow.slice(workflow.indexOf("  windows-dev-doctor:"), workflow.indexOf("\n  affected-native:"));
+		expect(windowsJob).toContain("runs-on: windows-latest");
+		expect(windowsJob).toContain("needs.affected-plan.outputs.has_windows_session_path == 'true'");
+		expect(windowsJob).toContain("Windows session-path canonicalization regression");
+		expect(windowsJob).toContain("bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
+		// The required predicate must textually match the job gate so the aggregate
+		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
+		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
+		expect(requiredLines.length).toBe(2);
+		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
 	});
 
 	describe("detached evidence subprocess contract", () => {
@@ -961,6 +976,20 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(needsDarwinArm64TabWorkerSmoke(paths)).toBe(false);
 		expect(targeted(paths).map(task => task.key)).not.toContain("install-methods");
 		expect(planTasks(paths, targetingPackages).map(task => task.key)).not.toContain("install-methods");
+	});
+
+	test("routes the Windows session-path regression for session I/O sources and its regression test", () => {
+		for (const changedPath of [
+			"packages/coding-agent/src/session/internal/managed-session-scope.ts",
+			"packages/coding-agent/src/session/blob-store.ts",
+			"packages/coding-agent/src/session/session-manager.ts",
+			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
+		]) {
+			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
+			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
+		}
+		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-store.ts")).toBe(false);
+		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
 	});
 
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
