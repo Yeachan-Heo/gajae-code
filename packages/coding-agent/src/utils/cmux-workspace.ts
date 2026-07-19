@@ -1,4 +1,9 @@
-import { logger } from "@gajae-code/utils";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
+import { getAgentDir, logger } from "@gajae-code/utils";
+import { withFileLock } from "../config/file-lock";
 
 const CMUX_COMMAND = "cmux";
 const CMUX_WORKSPACE_ID_ENV = "CMUX_WORKSPACE_ID";
@@ -7,6 +12,10 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 const CMUX_WORKSPACE_TITLE_PREFIX = "GJC: ";
 const CMUX_WORKSPACE_RENAME_TIMEOUT_MS = 1500;
 const CMUX_WORKSPACE_LIST_TIMEOUT_MS = 1500;
+const CMUX_WORKSPACE_LOCK_DIR_MODE = 0o700;
+const CMUX_WORKSPACE_LOCK_FILE_MODE_MASK = 0o077;
+const processClaims = new Map<string, string>();
+const MAX_PROCESS_CLAIMS = 32;
 
 export interface CmuxWorkspaceRenameCommand {
 	command: string;
@@ -23,13 +32,15 @@ export interface CmuxWorkspaceOwnership {
 
 export interface CmuxWorkspaceRenameProcess {
 	exited: Promise<number>;
-	kill(): void;
+	kill(signal?: number | NodeJS.Signals): void;
 	unref(): void;
 }
 
 export interface CmuxWorkspaceTitleSyncOptions {
 	env?: NodeJS.ProcessEnv;
 	isTty?: boolean;
+	lockDir?: string;
+	claims?: Map<string, string>;
 	which?: (command: string) => string | null;
 	spawn?: (
 		command: string[],
@@ -48,6 +59,25 @@ function defaultSpawn(
 	options: { env: NodeJS.ProcessEnv; stdin: "ignore"; stdout: "ignore"; stderr: "ignore" },
 ): CmuxWorkspaceRenameProcess {
 	return Bun.spawn(command, options);
+}
+async function withProcessDeadline<T>(
+	proc: Pick<CmuxWorkspaceRenameProcess, "kill">,
+	operation: Promise<T>,
+	timeoutMs: number,
+): Promise<{ timedOut: false; value: T } | { timedOut: true }> {
+	const timeout = Promise.withResolvers<{ timedOut: true }>();
+	const timer = setTimeout(() => {
+		try {
+			proc.kill("SIGKILL");
+		} catch {}
+		timeout.resolve({ timedOut: true });
+	}, timeoutMs);
+	timer.unref?.();
+	try {
+		return await Promise.race([operation.then(value => ({ timedOut: false as const, value })), timeout.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function isEnvSet(value: string | undefined): boolean {
@@ -114,17 +144,19 @@ export function parseCmuxWorkspaceOwnership(jsonText: string, workspaceId: strin
 	return null;
 }
 
-/** Only rename when GJC owns the name:
- * - unknown ownership (read failed) → skip (fail safe, never clobber)
- * - already the desired title → skip (no-op)
- * - workspace still on its default title → rename
- * - any custom title (user- or peer-set) → skip
- * This makes GJC name a fresh workspace once and then leave it alone, so it
- * never overwrites a user-pinned name and multiple sessions sharing one
- * CMUX_WORKSPACE_ID do not thrash the workspace title. */
-export function shouldRenameCmuxWorkspace(ownership: CmuxWorkspaceOwnership | null, desiredTitle: string): boolean {
+/** Decide whether this process may rename the workspace.
+ * A default-titled workspace may be claimed. Once claimed, updates require the
+ * current title to exactly match the last title this process verified after a
+ * successful rename. A prefix is never ownership evidence. */
+export function shouldRenameCmuxWorkspace(
+	ownership: CmuxWorkspaceOwnership | null,
+	desiredTitle: string,
+	lastVerifiedTitle?: string,
+): boolean {
 	if (!ownership) return false;
-	if ((sanitizeCmuxWorkspaceTitle(ownership.title) ?? "") === desiredTitle) return false;
+	const currentTitle = ownership.title;
+	if (currentTitle === desiredTitle) return false;
+	if (lastVerifiedTitle !== undefined) return ownership.hasCustomTitle && currentTitle === lastVerifiedTitle;
 	return !ownership.hasCustomTitle;
 }
 
@@ -140,28 +172,118 @@ async function defaultReadOwnership(
 			stdout: "pipe",
 			stderr: "ignore",
 		});
-		const timer = setTimeout(() => {
-			try {
-				proc.kill();
-			} catch {}
-		}, CMUX_WORKSPACE_LIST_TIMEOUT_MS);
-		timer.unref?.();
-		const text = await new Response(proc.stdout).text();
-		await proc.exited;
-		clearTimeout(timer);
-		return parseCmuxWorkspaceOwnership(text, workspaceId);
+		const completed = await withProcessDeadline(
+			proc,
+			(async () => {
+				const text = await new Response(proc.stdout).text();
+				const exitCode = await proc.exited;
+				return { exitCode, text };
+			})(),
+			CMUX_WORKSPACE_LIST_TIMEOUT_MS,
+		);
+		if (completed.timedOut) {
+			logger.debug("cmux workspace list timed out");
+			return null;
+		}
+		if (completed.value.exitCode !== 0) {
+			logger.debug("cmux workspace list exited non-zero", { exitCode: completed.value.exitCode });
+			return null;
+		}
+		return parseCmuxWorkspaceOwnership(completed.value.text, workspaceId);
 	} catch (error) {
 		logger.debug("cmux workspace list failed", { error: String(error) });
 		return null;
 	}
 }
+function claimKey(workspaceId: string, env: NodeJS.ProcessEnv): string {
+	const socket = env.CMUX_SOCKET_PATH?.trim() || env.CMUX_SOCKET?.trim() || "default";
+	return `${socket}\u0000${workspaceId.trim().toLowerCase()}`;
+}
+
+function workspaceLockFile(lockDir: string, key: string): string {
+	return path.join(lockDir, `${crypto.createHash("sha256").update(key).digest("hex")}.guard`);
+}
+function rememberClaim(claims: Map<string, string>, key: string, title: string): void {
+	claims.delete(key);
+	claims.set(key, title);
+	while (claims.size > MAX_PROCESS_CLAIMS) {
+		const oldest = claims.keys().next().value;
+		if (oldest === undefined) return;
+		claims.delete(oldest);
+	}
+}
+
+async function assertOwnedCanonicalDirectory(directory: string, privateMode: boolean): Promise<string> {
+	const resolved = path.resolve(directory);
+	const [stat, canonical] = await Promise.all([fs.lstat(resolved), fs.realpath(resolved)]);
+	if (!stat.isDirectory() || stat.isSymbolicLink() || canonical !== resolved)
+		throw new Error("cmux workspace lock path is not a canonical directory");
+	if (typeof process.getuid === "function" && stat.uid !== process.getuid())
+		throw new Error("cmux workspace lock path is not owned by the current user");
+	if (privateMode && (stat.mode & CMUX_WORKSPACE_LOCK_FILE_MODE_MASK) !== 0)
+		await fs.chmod(resolved, CMUX_WORKSPACE_LOCK_DIR_MODE);
+	return resolved;
+}
+
+async function ensureOwnedChildDirectory(parent: string, name: string, privateMode: boolean): Promise<string> {
+	const canonicalParent = await assertOwnedCanonicalDirectory(parent, false);
+	const child = path.join(canonicalParent, name);
+	try {
+		await fs.mkdir(child, { mode: privateMode ? CMUX_WORKSPACE_LOCK_DIR_MODE : 0o700 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+	}
+	return assertOwnedCanonicalDirectory(child, privateMode);
+}
+
+async function ensurePrivateLockDir(configuredLockDir?: string): Promise<string> {
+	if (configuredLockDir) {
+		const resolved = path.resolve(configuredLockDir);
+		return ensureOwnedChildDirectory(path.dirname(resolved), path.basename(resolved), true);
+	}
+	const agentDir = await assertOwnedCanonicalDirectory(await fs.realpath(getAgentDir()), false);
+	const stateDir = await ensureOwnedChildDirectory(agentDir, "state", false);
+	return ensureOwnedChildDirectory(stateDir, "cmux-workspace-locks", true);
+}
+
+async function renameAndVerify(
+	resolvedCommand: string,
+	workspaceId: string,
+	sessionName: string | undefined,
+	desired: string,
+	env: NodeJS.ProcessEnv,
+	readOwnership: NonNullable<CmuxWorkspaceTitleSyncOptions["readOwnership"]>,
+	spawn: NonNullable<CmuxWorkspaceTitleSyncOptions["spawn"]>,
+): Promise<boolean> {
+	const plan = buildCmuxWorkspaceRenameCommand(sessionName, env);
+	if (!plan) return false;
+
+	const proc = spawn([resolvedCommand, ...plan.args], {
+		env,
+		stdin: "ignore",
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	proc.unref();
+	const completed = await withProcessDeadline(proc, proc.exited, CMUX_WORKSPACE_RENAME_TIMEOUT_MS);
+	if (completed.timedOut) {
+		logger.debug("cmux workspace rename timed out");
+		return false;
+	}
+	if (completed.value !== 0) {
+		logger.debug("cmux workspace rename exited non-zero", { exitCode: completed.value });
+		return false;
+	}
+	const verified = await readOwnership(resolvedCommand, workspaceId, env);
+	return verified?.hasCustomTitle === true && verified.title === desired;
+}
 
 /**
  * Best-effort sync of the containing cmux workspace title to the current GJC
- * session name. Ownership-guarded: GJC reads the current workspace title and
- * only renames a workspace that still has its default title, so it never
- * overwrites a name the user pinned or a name a peer session (sharing the same
- * CMUX_WORKSPACE_ID) set. Opt out with GJC_NO_CMUX_RENAME.
+ * process. Claims are process-lifetime only: a successful rename is read back,
+ * and subsequent updates require the exact last verified title. A guarded
+ * cross-process claim prevents peer GJC processes from simultaneously claiming
+ * a fresh workspace. User or peer changes revoke this process's claim.
  */
 export async function syncCmuxWorkspaceTitle(
 	sessionName: string | undefined,
@@ -189,45 +311,28 @@ export async function syncCmuxWorkspaceTitle(
 	}
 	if (!resolvedCommand) return;
 
-	let ownership: CmuxWorkspaceOwnership | null;
-	try {
-		const readOwnership = options.readOwnership ?? defaultReadOwnership;
-		ownership = await readOwnership(resolvedCommand, workspaceId, env);
-	} catch (error) {
-		logger.debug("cmux workspace ownership read failed", { error: String(error) });
-		return;
-	}
-
-	if (!shouldRenameCmuxWorkspace(ownership, desired)) return;
-
-	const plan = buildCmuxWorkspaceRenameCommand(sessionName, env);
-	if (!plan) return;
-
+	const key = claimKey(workspaceId, env);
+	const claims = options.claims ?? processClaims;
+	const readOwnership = options.readOwnership ?? defaultReadOwnership;
 	const spawn = options.spawn ?? defaultSpawn;
+	const configuredLockDir = options.lockDir;
+
 	try {
-		const proc = spawn([resolvedCommand, ...plan.args], {
-			env,
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "ignore",
+		const lockDir = await ensurePrivateLockDir(configuredLockDir);
+		await withFileLock(workspaceLockFile(lockDir, key), async () => {
+			const ownership = await readOwnership(resolvedCommand, workspaceId, env);
+			const lastVerifiedTitle = claims.get(key);
+			if (lastVerifiedTitle !== undefined && ownership?.title !== lastVerifiedTitle) {
+				claims.delete(key);
+				return;
+			}
+			if (!shouldRenameCmuxWorkspace(ownership, desired, lastVerifiedTitle)) return;
+
+			if (await renameAndVerify(resolvedCommand, workspaceId, sessionName, desired, env, readOwnership, spawn))
+				rememberClaim(claims, key, desired);
+			else claims.delete(key);
 		});
-		proc.unref();
-		const timer = setTimeout(() => {
-			try {
-				proc.kill();
-			} catch {}
-		}, CMUX_WORKSPACE_RENAME_TIMEOUT_MS);
-		timer.unref?.();
-		void proc.exited
-			.then(exitCode => {
-				clearTimeout(timer);
-				if (exitCode !== 0) logger.debug("cmux workspace rename exited non-zero", { exitCode });
-			})
-			.catch(error => {
-				clearTimeout(timer);
-				logger.debug("cmux workspace rename failed", { error: String(error) });
-			});
 	} catch (error) {
-		logger.debug("cmux workspace rename failed to start", { error: String(error) });
+		logger.debug("cmux workspace title sync failed", { error: String(error) });
 	}
 }
