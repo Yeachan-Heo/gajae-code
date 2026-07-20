@@ -85,7 +85,7 @@ describe("BracketedPasteHandler", () => {
 		expect(handler.process("\x1b[201~", now + 10)).toEqual({
 			handled: true,
 			leading: "",
-			pasteContent: "line1\n" + Array.from({ length: 30 }, (_, i) => `chunk-${i}\n`).join(""),
+			pasteContent: `line1\n${Array.from({ length: 30 }, (_, i) => `chunk-${i}\n`).join("")}`,
 			remaining: "",
 		});
 	});
@@ -113,5 +113,4 @@ describe("BracketedPasteHandler", () => {
 			remaining: "more",
 		});
 	});
-
 });
