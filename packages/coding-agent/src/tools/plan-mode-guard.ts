@@ -11,6 +11,7 @@ function resolveRawPath(session: ToolSession, targetPath: string): string {
 	if (normalized.startsWith(LOCAL_SCHEME_PREFIX)) {
 		return resolveLocalUrlToPath(normalized, {
 			getArtifactsDir: session.getArtifactsDir,
+			isManagedDestination: session.isManagedSessionDestination,
 			getSessionId: session.getSessionId,
 		});
 	}

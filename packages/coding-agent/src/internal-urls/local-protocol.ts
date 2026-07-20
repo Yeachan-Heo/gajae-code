@@ -28,6 +28,7 @@ export interface ManagedLegacyLocalMigrationSource {
 
 export interface LocalProtocolOptions {
 	getArtifactsDir?: () => string | null;
+	isManagedDestination?: () => boolean;
 	getManagedLegacyLocalMigrationSource?: () => ManagedLegacyLocalMigrationSource | null;
 	getSessionId?: () => string | null;
 }
@@ -422,7 +423,33 @@ const initializedLocalRoots = new Set<string>();
  * Completes the mandatory legacy migration gate for a local root.
  * Call and await this before using the synchronous path resolver for reads or writes.
  */
+function explicitLocalRoot(options: LocalProtocolOptions): string | null {
+	if (options.isManagedDestination?.()) return null;
+	const artifactsDir = options.getArtifactsDir?.();
+	return artifactsDir ? path.resolve(artifactsDir, "local") : null;
+}
+
+async function initializeExplicitLocalRoot(localRoot: string): Promise<string> {
+	await fs.mkdir(path.dirname(localRoot), { recursive: true });
+	await assertDirectoryNotSymlink(path.dirname(localRoot));
+	await fs.mkdir(localRoot, { recursive: true });
+	await assertDirectoryNotSymlink(localRoot);
+	return await fs.realpath(localRoot);
+}
+
+function initializeExplicitLocalRootSync(localRoot: string): string {
+	fsSync.mkdirSync(path.dirname(localRoot), { recursive: true });
+	const parentStat = fsSync.lstatSync(path.dirname(localRoot));
+	if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) throw new Error("Unsafe local:// root");
+	fsSync.mkdirSync(localRoot, { recursive: true });
+	const rootStat = fsSync.lstatSync(localRoot);
+	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Unsafe local:// root");
+	return fsSync.realpathSync(localRoot);
+}
+
 export async function initializeLocalRoot(options: LocalProtocolOptions): Promise<string> {
+	const explicitRoot = explicitLocalRoot(options);
+	if (explicitRoot) return await initializeExplicitLocalRoot(explicitRoot);
 	const localRoot = path.resolve(resolveLocalRoot(options));
 	const scratchParent = path.dirname(localRoot);
 
@@ -451,6 +478,11 @@ export async function initializeLocalRoot(options: LocalProtocolOptions): Promis
 }
 
 function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, localRoot: string): void {
+	const explicitRoot = explicitLocalRoot(options);
+	if (explicitRoot) {
+		initializeExplicitLocalRootSync(explicitRoot);
+		return;
+	}
 	if (initializedLocalRoots.has(localRoot)) return;
 	const scratchParent = path.dirname(localRoot);
 	fsSync.mkdirSync(scratchParent, { recursive: true, mode: 0o700 });
@@ -489,7 +521,7 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 }
 
 export function resolveLocalRoot(options: LocalProtocolOptions): string {
-	return path.join(os.tmpdir(), "gjc-local", safeSessionId(options));
+	return explicitLocalRoot(options) ?? path.join(os.tmpdir(), "gjc-local", safeSessionId(options));
 }
 
 export function resolveLocalUrlToPath(input: string | InternalUrl, options: LocalProtocolOptions): string {
@@ -574,6 +606,7 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		if (!sessionManager) return undefined;
 		return {
 			getArtifactsDir: () => sessionManager.getArtifactsDir(),
+			isManagedDestination: () => sessionManager.isManagedDestination(),
 			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
 			getSessionId: () => sessionManager.getSessionId(),
 		};

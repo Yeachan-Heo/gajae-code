@@ -636,6 +636,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			internalRouter: InternalUrlRouter.instance(),
 			localOptions: {
 				getArtifactsDir: this.session.getArtifactsDir,
+				isManagedDestination: this.session.isManagedSessionDestination,
 				getSessionId: this.session.getSessionId,
 			},
 		};

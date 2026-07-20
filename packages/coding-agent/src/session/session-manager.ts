@@ -5478,6 +5478,10 @@ export class SessionManager {
 		return sessionFile ? sessionFile.slice(0, -6) : null;
 	}
 
+	isManagedDestination(): boolean {
+		return this.destination.kind === "managed";
+	}
+
 	/** Supplies opaque retained authority for mandatory managed legacy local migration. */
 	getManagedLegacyLocalMigrationSource(): ManagedLegacyLocalMigrationSource | null {
 		if (this.destination.kind !== "managed" || !this.#sessionFile || this.#adoptedArtifactManager) return null;

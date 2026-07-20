@@ -588,10 +588,12 @@ describe("AgentSession handoff", () => {
 		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
 
 		const result = await session.handoff(undefined, { autoTriggered: true });
-		expect(result?.savedPath).toBeDefined();
-		if (!result?.savedPath) throw new Error("Expected handoff document path");
-		expect(result.savedPath.endsWith(".md")).toBe(true);
-		const savedText = await Bun.file(result.savedPath).text();
+		expect(result?.savedPath).toMatch(/^artifact:\/\/\d+$/);
+		if (!result?.savedPath) throw new Error("Expected handoff artifact URI");
+		const artifactPath = await session.sessionManager.getArtifactPath(result.savedPath.slice("artifact://".length));
+		expect(artifactPath).toBeDefined();
+		if (!artifactPath) throw new Error("Expected handoff artifact path");
+		const savedText = await Bun.file(artifactPath).text();
 		expect(savedText).toContain(handoffText);
 	});
 

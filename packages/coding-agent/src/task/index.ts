@@ -638,6 +638,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (!batchArtifactsDir) {
 			const asyncLocalOptions: LocalProtocolOptions = {
 				getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
+				isManagedDestination: this.session.isManagedSessionDestination,
 				getSessionId: this.session.getSessionId ?? (() => null),
 			};
 			await initializeLocalRoot(asyncLocalOptions);
@@ -1156,6 +1157,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// Share the parent session's local:// root with subagents so they read/write the same scratch space
 		const localProtocolOptions: LocalProtocolOptions = {
 			getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
+			isManagedDestination: this.session.isManagedSessionDestination,
 			getSessionId: this.session.getSessionId ?? (() => null),
 		};
 

@@ -80,12 +80,13 @@ describe("AgentSession pre-admission artifact spill", () => {
 		});
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
-		const allocateArtifactPath = sessionManager.allocateArtifactPath.bind(sessionManager);
-		(
-			sessionManager as unknown as { allocateArtifactPath: typeof sessionManager.allocateArtifactPath }
-		).allocateArtifactPath = async toolType => {
+		const saveArtifact = sessionManager.saveArtifact.bind(sessionManager);
+		(sessionManager as unknown as { saveArtifact: typeof sessionManager.saveArtifact }).saveArtifact = async (
+			content,
+			toolType,
+		) => {
 			await writeGate;
-			return await allocateArtifactPath(toolType);
+			return await saveArtifact(content, toolType);
 		};
 		session = new AgentSession({
 			agent,

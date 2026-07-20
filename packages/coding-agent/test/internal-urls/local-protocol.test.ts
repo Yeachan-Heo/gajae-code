@@ -34,9 +34,24 @@ async function withLocalRoot<T>(sessionId: string, fn: (root: string) => Promise
 }
 
 function localOptions(sessionId: string, artifactsDir: string) {
-	return { getArtifactsDir: () => artifactsDir, getSessionId: () => sessionId };
+	return { getArtifactsDir: () => artifactsDir, isManagedDestination: () => true, getSessionId: () => sessionId };
 }
 
+it("keeps explicit local roots under artifacts while managed roots stay external", async () => {
+	await withTempDir(async artifactsDir => {
+		const sessionId = `routing-${path.basename(artifactsDir)}`;
+		expect(resolveLocalRoot({ getArtifactsDir: () => artifactsDir, getSessionId: () => sessionId })).toBe(
+			path.join(artifactsDir, "local"),
+		);
+		expect(
+			resolveLocalRoot({
+				getArtifactsDir: () => artifactsDir,
+				isManagedDestination: () => true,
+				getSessionId: () => sessionId,
+			}),
+		).toBe(path.join(os.tmpdir(), "gjc-local", sessionId));
+	});
+});
 it("migrates opaque managed legacy topology, retires exactly once, and verifies the marker", async () => {
 	const sessionId = `managed-${crypto.randomUUID()}`;
 	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;
