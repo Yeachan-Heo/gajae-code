@@ -66,12 +66,41 @@ const kJsonWireSchema = Symbol("pi.schema.json.wire");
  * The empty-schema normalization (`{}` → `true`, see `normalizeEmptySchemas`)
  * runs separately from `toolWireSchema` so both Zod and TypeBox tools get it.
  */
-function postProcess(schema: Record<string, unknown>): Record<string, unknown> {
+function postProcess(schema: Record<string,unknown>): Record<string,unknown> {
 	delete schema.$schema;
 	walk(schema);
 	normalizeEmptySchemas(schema);
+	collapseAnyOfNullable(schema);
 	return schema;
 }
+
+/**
+ * Collapse `anyOf: [{type:"T"}, {type:"null"}]` → `type: ["T","null"]`.
+ * DeepSeek V4 (OpenRouter) rejects `anyOf` in tool-parameter schemas without a
+ * peer `type` field. This transform keeps the same semantics in a compliant form.
+ */
+function collapseAnyOfNullable(node: unknown): void {
+	if (Array.isArray(node)) {
+		for (const child of node) collapseAnyOfNullable(child);
+		return;
+	}
+	if (!node || typeof node !== "object") return;
+	const obj = node as Record<string,unknown>;
+	for (const k in obj) collapseAnyOfNullable(obj[k]);
+	if (!Array.isArray(obj.anyOf) || obj.anyOf.length !== 2) return;
+	if ("type" in obj) return;
+	const [a, b] = obj.anyOf;
+	if (
+		a != null && typeof a === "object" && "type" in a &&
+		b != null && typeof b === "object" && "type" in b &&
+		typeof (a as Record<string,unknown>).type === "string" &&
+		(b as Record<string,unknown>).type === "null"
+	) {
+		obj.type = [(a as Record<string,unknown>).type as string, "null"];
+		delete obj.anyOf;
+	}
+}
+
 
 const SAFE_INTEGER_MAX = Number.MAX_SAFE_INTEGER;
 const SAFE_INTEGER_MIN = Number.MIN_SAFE_INTEGER;

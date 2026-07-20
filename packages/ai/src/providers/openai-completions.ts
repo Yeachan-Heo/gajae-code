@@ -1898,6 +1898,53 @@ export function convertMessages(
 	return params;
 }
 
+/**
+ * DeepSeek V4 (via OpenRouter) requires `type` alongside `anyOf` in tool-parameter
+ * schemas, rejects `type: "object"` without `properties`, and rejects `type: "array"`
+ * without `items`. Walk every node and add the missing companion fields in place.
+ */
+function collapseAnyOfNullableDeep(schema: Record<string, unknown>): Record<string, unknown> {
+	const resolveNonnullType = (branch: unknown): string | undefined => {
+		if (!branch || typeof branch !== "object") return undefined;
+		const b = branch as Record<string, unknown>;
+		if ("type" in b && b.type !== "null" && typeof b.type === "string") return b.type as string;
+		if (Array.isArray(b.anyOf)) {
+			for (const sub of b.anyOf) {
+				const t = resolveNonnullType(sub);
+				if (t) return t;
+			}
+		}
+		return undefined;
+	};
+	const walk = (node: unknown): void => {
+		if (Array.isArray(node)) { for (const child of node) walk(child); return; }
+		if (!node || typeof node !== "object") return;
+		const obj = node as Record<string, unknown>;
+		for (const k in obj) walk(obj[k]);
+		if (obj.type === "object" && !("properties" in obj) && "propertyNames" in obj) {
+			obj.properties = {};
+		}
+		if (!Array.isArray(obj.anyOf) || "type" in obj) return;
+		const nonnull = resolveNonnullType(obj.anyOf[0]);
+		if (nonnull) {
+			if (nonnull === "object" && !("properties" in obj)) {
+				obj.properties = {};
+			}
+			obj.type = nonnull;
+			if (nonnull === "array") {
+				for (const branch of obj.anyOf as Record<string, unknown>[]) {
+					if (branch && typeof branch === "object" && "items" in branch) {
+						obj.items = (branch as Record<string, unknown>).items;
+						break;
+					}
+				}
+			}
+		}
+	};
+	walk(schema);
+	return schema;
+}
+
 function convertTools(
 	tools: Tool[],
 	compat: ResolvedOpenAICompat,
@@ -1907,10 +1954,11 @@ function convertTools(
 		const strict = !NO_STRICT && compat.supportsStrictMode !== false && tool.strict !== false;
 		const baseParameters = flattenToolRootCombinators(toolWireSchema(tool));
 		const adapted = adaptSchemaForStrict(baseParameters, strict);
+		const schema = collapseAnyOfNullableDeep(adapted.schema);
 		return {
 			tool,
 			baseParameters,
-			parameters: adapted.schema,
+			parameters: schema,
 			strict: adapted.strict,
 		};
 	});
