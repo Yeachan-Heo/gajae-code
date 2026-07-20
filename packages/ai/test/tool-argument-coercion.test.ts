@@ -992,4 +992,46 @@ describe("Tool argument coercion", () => {
 		).toThrow("raw arguments rejected before coercion");
 		expect(observed).toBe("null");
 	});
+
+	describe("union cross-branch repair", () => {
+		// Root unions flatten every branch's issues into one pool. A field the
+		// matching branch types (keypress `keys: string[]`) must never be
+		// destroyed by another branch's unrecognized-key deletion (batch has no
+		// `keys`). Live regression: the computer tool rejected every top-level
+		// keypress with "root: Invalid input" because the batch branch deleted
+		// `keys` before array coercion could run.
+		const single = z.discriminatedUnion("action", [
+			z.object({ action: z.literal("screenshot") }).strict(),
+			z.object({ action: z.literal("keypress"), keys: z.array(z.string()).min(1) }).strict(),
+		]);
+		const batch = z.object({ action: z.literal("batch"), actions: z.array(single).min(1) }).strict();
+		const computerLike = z.union([single, batch]);
+		const tool: Tool = { name: "computer-like", description: "", parameters: computerLike };
+		const call = (arguments_: unknown): ToolCall => ({
+			type: "toolCall",
+			id: "call-union",
+			name: "computer-like",
+			arguments: arguments_ as ToolCall["arguments"],
+		});
+
+		it("accepts a proper top-level string array", () => {
+			expect(validateToolArguments(tool, call({ action: "keypress", keys: ["Escape"] }))).toEqual({
+				action: "keypress",
+				keys: ["Escape"],
+			});
+		});
+
+		it("coerces a JSON-stringified array without another branch deleting the field", () => {
+			expect(validateToolArguments(tool, call({ action: "keypress", keys: '["Escape"]' }))).toEqual({
+				action: "keypress",
+				keys: ["Escape"],
+			});
+		});
+
+		it("still deletes keys that no branch recognizes as typed fields", () => {
+			expect(validateToolArguments(tool, call({ action: "screenshot", hallucinated: null }))).toEqual({
+				action: "screenshot",
+			});
+		});
+	});
 });

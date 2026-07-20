@@ -825,8 +825,24 @@ function coerceArgsFromIssues(args: unknown, issues: FlatIssue[]): { value: unkn
 	let owned = false;
 	let nextArgs: unknown = args;
 
+	// Union branches are flattened into one issue pool, so a pointer can be
+	// "unrecognized" for one branch while another branch types it (e.g. a
+	// root union of a keypress variant with `keys: string[]` and a batch
+	// variant without `keys`: a JSON-stringified `keys` array yields a type
+	// issue from the keypress branch AND an unrecognized issue from the batch
+	// branch). Deleting such a pointer destroys the field the matching branch
+	// needs before type coercion can repair it, so pointers that any branch
+	// recognizes as a typed field are exempt from unrecognized-key deletion.
+	const typedPointers = new Set<string>();
+	for (const issue of issues) {
+		if (issue.keyword === "type" && issue.expectedTypes.length > 0) {
+			typedPointers.add(issue.instancePath);
+		}
+	}
+
 	for (const issue of issues) {
 		if (issue.keyword === "unrecognized") {
+			if (typedPointers.has(issue.instancePath)) continue;
 			const previous = nextArgs;
 			nextArgs = deleteValueAtPointer(nextArgs, issue.instancePath);
 			if (nextArgs !== previous) changed = true;
