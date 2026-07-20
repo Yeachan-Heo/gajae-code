@@ -1246,7 +1246,7 @@ function buildParams(
 	}
 
 	if (context.tools?.length) {
-		const builtTools = convertTools(context.tools, compat, toolStrictModeOverride);
+		const builtTools = convertTools(context.tools, compat, model, toolStrictModeOverride);
 		params.tools = builtTools.tools;
 		toolStrictMode = builtTools.toolStrictMode;
 	} else if (context.tools === undefined && hasToolHistory(context.messages)) {
@@ -1897,14 +1897,15 @@ export function convertMessages(
 
 	return params;
 }
-
 function convertTools(
 	tools: Tool[],
 	compat: ResolvedOpenAICompat,
+	model: Model<"openai-completions">,
 	toolStrictModeOverride?: ToolStrictModeOverride,
 ): BuiltOpenAICompletionTools {
+	const isDeepseek = /deepseek/i.test(model.id);
 	const adaptedTools = tools.map(tool => {
-		const strict = !NO_STRICT && compat.supportsStrictMode !== false && tool.strict !== false;
+		const strict = !NO_STRICT && compat.supportsStrictMode !== false && tool.strict !== false && !isDeepseek;
 		const baseParameters = flattenToolRootCombinators(toolWireSchema(tool));
 		const adapted = adaptSchemaForStrict(baseParameters, strict);
 		return {
