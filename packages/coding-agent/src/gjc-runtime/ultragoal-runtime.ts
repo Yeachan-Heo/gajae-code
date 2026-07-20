@@ -33,6 +33,20 @@ import {
 	writeGuardedJsonAtomic,
 } from "./state-writer";
 
+export {
+	captureUltragoalRecoverySnapshot,
+	parseStrictTerminalTranscript,
+	persistUltragoalRecoveryDecision,
+	planUltragoalOwnerLossRecovery,
+	type UltragoalOwnerLossReceipt,
+	type UltragoalRecoveryBinding,
+	type UltragoalRecoveryDecision,
+	type UltragoalRecoverySnapshot,
+	validateOwnerLossBinding,
+	validateRawUltragoalEvidence,
+	validateRecoveryAdmission,
+	validateRecoveryPath,
+} from "./ultragoal-owner-loss-recovery";
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
 export type UltragoalGoalStatus =
 	| "pending"

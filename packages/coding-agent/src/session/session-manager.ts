@@ -521,7 +521,7 @@ export interface StrictSessionOpenSuccess {
 
 export interface StrictSessionOpenFailure {
 	kind: "error";
-	reason: ResumeTailError["reason"] | "identity-mismatch";
+	reason: ResumeTailError["reason"] | "identity-mismatch" | "migration-required";
 }
 
 /** Exact transcript bytes and authority captured from one descriptor-bound read. */
@@ -540,6 +540,27 @@ export type StrictSessionForkResult = { kind: "forked"; manager: SessionManager 
 
 /** Result of opening an inspected session without create-or-rewrite fallback. */
 export type StrictSessionOpenResult = StrictSessionOpenSuccess | StrictSessionOpenFailure;
+
+/**
+ * Capability returned only by a strict recovery hydration open. It represents
+ * immutable transcript authority and is consumed by the promotion seam.
+ */
+export interface RecoveryHydrationContext {
+	readonly identity: ResumeSessionIdentity;
+}
+
+export interface RecoveryHydrationOpenSuccess {
+	readonly kind: "hydrated";
+	readonly manager: SessionManager;
+	readonly context: RecoveryHydrationContext;
+}
+
+export type RecoveryHydrationOpenResult = RecoveryHydrationOpenSuccess | StrictSessionOpenFailure;
+
+export interface RecoveryHydrationPromotionFence {
+	/** The caller has durably published ownership and acquired its writer lease. */
+	readonly ownershipReady: true;
+}
 
 export interface SessionInfo {
 	path: string;
@@ -3653,6 +3674,7 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#ensuredOnDisk: boolean = false;
+	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#fileEntries: FileEntry[] = [];
 	#byId: Map<string, SessionEntry> = new Map();
 	#labelsById: Map<string, string> = new Map();
@@ -6671,6 +6693,62 @@ export class SessionManager {
 		return canContinuePersistedHistory(inspected.context.messages)
 			? { kind: "resumable", identity: inspected.identity }
 			: { kind: "terminal", identity: inspected.identity };
+	}
+
+	/**
+	 * Hydrate an existing predecessor transcript for recovery without taking any
+	 * write-capable action. The caller must retain the returned context and use
+	 * the explicit promotion seam only after its ownership-ready fence and writer
+	 * lease are durable.
+	 */
+	static async openExistingForRecoveryHydrationStrict(
+		identity: ResumeSessionIdentity,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<RecoveryHydrationOpenResult> {
+		const inspected = inspectResumeSessionFile(identity.canonicalPath, storage);
+		if ("kind" in inspected) return inspected;
+		if (!sameResumeIdentity(identity, inspected.identity)) return { kind: "error", reason: "identity-mismatch" };
+		if (inspected.migrationApplied) return { kind: "error", reason: "migration-required" };
+
+		const header = inspected.entries[0] as SessionHeader;
+		const manager = new SessionManager(
+			header.cwd || getProjectDir(),
+			sessionDir ?? path.resolve(identity.canonicalPath, ".."),
+			true,
+			storage,
+		);
+		await manager.#hydrateExistingSession(identity.canonicalPath, inspected.entries, false);
+		const revalidated = inspectResumeSessionFile(identity.canonicalPath, storage);
+		if ("kind" in revalidated || !sameResumeIdentity(identity, revalidated.identity)) {
+			await manager.close();
+			return "kind" in revalidated ? revalidated : { kind: "error", reason: "identity-mismatch" };
+		}
+		const context: RecoveryHydrationContext = Object.freeze({
+			identity: Object.freeze({ ...identity }),
+		});
+		manager.#recoveryHydrationContext = context;
+		return { kind: "hydrated", manager, context };
+	}
+
+	/**
+	 * Allows the normal post-open metadata sanitation only after the caller has
+	 * fsynced its external ownership-ready fence and acquired the writer lease.
+	 */
+	async promoteRecoveryHydrationAfterOwnershipReadyFence(
+		context: RecoveryHydrationContext,
+		fence: RecoveryHydrationPromotionFence,
+	): Promise<void> {
+		if (fence.ownershipReady !== true || this.#recoveryHydrationContext !== context) {
+			throw new Error("Recovery hydration promotion requires the original ownership-ready context.");
+		}
+		const inspected = inspectResumeSessionFile(context.identity.canonicalPath, this.storage);
+		if ("kind" in inspected || !sameResumeIdentity(context.identity, inspected.identity)) {
+			throw new Error("Recovery transcript authority changed before promotion.");
+		}
+		await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
+		writeTerminalBreadcrumb(this.cwd, context.identity.canonicalPath);
+		this.#recoveryHydrationContext = undefined;
 	}
 
 	/**

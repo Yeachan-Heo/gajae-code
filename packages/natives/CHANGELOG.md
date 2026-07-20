@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Linux-only descriptor-relative recovery filesystem authority with no-follow trusted-root stat, bounded read, exclusive create, no-replace install, fsync, and stable identity operations. Unsupported platforms and unsafe traversal, symlink, special-file, hard-link, oversized-content, or identity-swap evidence fail closed (#2681).
+
 ## [0.11.2] - 2026-07-19
 
 ### Fixed

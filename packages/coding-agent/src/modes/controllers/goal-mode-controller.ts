@@ -227,19 +227,37 @@ export class GoalModeController {
 		this.scheduleContinuation();
 	}
 
-	async restoreFromSession(sessionContext: SessionContext): Promise<boolean> {
+	/**
+	 * Restore durable goal state. Recovery hydration deliberately performs only
+	 * in-memory restoration: it neither consumes a pending request nor repairs
+	 * invalid persisted state by writing a fallback mode entry.
+	 */
+	async restoreFromSession(
+		sessionContext: SessionContext,
+		options?: { recoveryHydration?: boolean },
+	): Promise<boolean> {
+		const recoveryHydration = options?.recoveryHydration === true;
 		const goalEnabled = this.ctx.session.settings.get("goal.enabled");
 		if (!goalEnabled && (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused")) {
+			if (recoveryHydration) return false;
 			this.ctx.sessionManager.appendModeChange("none");
 			return true;
 		}
 		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
 			const goal = normalizeGoal(sessionContext.modeData?.goal) ?? undefined;
 			if (!goal) {
+				if (recoveryHydration) throw new Error("Recovery hydration rejected an invalid persisted goal state.");
 				this.ctx.sessionManager.appendModeChange("none");
 				return true;
 			}
 			this.ctx.session.setGoalModeState({ enabled: sessionContext.mode === "goal", mode: "active", goal });
+			if (recoveryHydration) {
+				this.#enabled = sessionContext.mode === "goal";
+				this.#paused = sessionContext.mode === "goal_paused";
+				if (this.#enabled || this.#paused) this.ctx.modeGate.enter("goal");
+				this.#updateStatus();
+				return true;
+			}
 			const restored = await this.ctx.session.goalRuntime.onThreadResumed();
 			this.#enabled = restored?.enabled === true;
 			this.#paused = restored?.enabled !== true && restored?.goal.status === "paused";
@@ -251,6 +269,7 @@ export class GoalModeController {
 			this.#updateStatus();
 			return true;
 		}
+		if (recoveryHydration) return false;
 		const pendingGoal = goalEnabled
 			? await consumePendingGoalModeRequest(this.ctx.sessionManager.getCwd(), this.ctx.sessionManager.getSessionId())
 			: null;

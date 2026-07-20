@@ -20,6 +20,7 @@ import {
 	VERSION,
 } from "@gajae-code/utils";
 import chalk from "chalk";
+import { runCli } from "./cli";
 import type { Args } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
@@ -36,6 +37,8 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from "./gjc-runtime/managed-owner-admission";
+import { isManagedOwnerSupervisorArgv, runManagedOwnerSupervisor } from "./gjc-runtime/managed-owner-supervisor";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
@@ -1604,6 +1607,15 @@ export async function main(args: string[]): Promise<void> {
 		await runTmuxOwnerIsolationCliFromStdin();
 		return;
 	}
-	const { runCli } = await import("./cli");
+	if (isManagedOwnerSupervisorArgv(args)) {
+		await runManagedOwnerSupervisor();
+		return;
+	}
+	const admission = await admitManagedOwnerBeforeCli();
+	if (admission.kind === "blocked") return;
+	if (admission.kind === "recovery") {
+		await completeManagedOwnerRecovery(admission.context);
+		return;
+	}
 	await runCli(args.length === 0 ? ["launch"] : args);
 }

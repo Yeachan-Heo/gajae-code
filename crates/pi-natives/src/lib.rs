@@ -49,6 +49,7 @@ pub mod path_identity;
 pub mod prof;
 pub mod ps;
 pub mod pty;
+pub mod recovery_fs;
 pub mod shell;
 pub mod summary;
 pub mod task;

@@ -25,6 +25,7 @@ export const NotificationControlServer = nativeBindings.NotificationControlServe
 export const NotificationServer = nativeBindings.NotificationServer;
 export const Process = nativeBindings.Process;
 export const PtySession = nativeBindings.PtySession;
+export const RecoveryFsRoot = nativeBindings.RecoveryFsRoot;
 export const Shell = nativeBindings.Shell;
 
 // functions
@@ -69,6 +70,7 @@ export const matchesKey = nativeBindings.matchesKey;
 export const matchesKittySequence = nativeBindings.matchesKittySequence;
 export const matchesLegacySequence = nativeBindings.matchesLegacySequence;
 export const nativeBuildInfo = nativeBindings.nativeBuildInfo;
+export const openRecoveryFsRoot = nativeBindings.openRecoveryFsRoot;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
 export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;

@@ -1242,7 +1242,8 @@ describe("lifecycle control runtime", () => {
 		expect(calls).toContain("@gjc-owner-generation");
 		expect(calls).toContain("@gjc-owner-server-key");
 		expect(calls).not.toContain("GJC_OWNER_");
-		expect(calls).toContain(`gjc --resume 'abc123'`);
+		expect(calls).toContain("GJC_MANAGED_OWNER_COMMAND_JSON=");
+		expect(calls).toContain("abc123");
 		expect(calls).not.toContain("gjc-lifecycle-owner-isolation");
 		expect(calls).toContain("@gjc-project");
 		expect(fs.existsSync(serverState)).toBe(true);
@@ -1387,6 +1388,8 @@ describe("lifecycle control runtime", () => {
 			expect(calls).toContain(`GJC_TMUX_OWNER_GENERATION='${generation}'`);
 			expect(calls).toContain(`GJC_TMUX_OWNER_STATE_DIR='${path.dirname(result.sessionStateFile!)}'`);
 			expect(calls).toContain("GJC_TMUX_OWNER_SERVER_KEY='default'");
+			expect(calls).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
+			expect(calls).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
 			expect(calls).toContain("@gjc-owner-generation");
 			expect(calls).toContain("@gjc-owner-server-key");
 			expect(calls).not.toContain("GJC_OWNER_");

@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Fixed
+- Added fail-closed managed tmux owner SIGABRT recovery: exact-child supervisor receipts and pre-CLI admission now bind replacement ownership, strict durable Ultragoal/transcript evidence reconciles terminal child yields over stale nonterminal runtime state, recovery hydration remains write-free until an ownership fence, and hostile identity, corruption, concurrency, and path boundaries preserve dirty product files (#2681).
 - Restored the canonical public CLI command-surface contract for the independently documented `gjc memory` filesystem/MAP command after its feature merge omitted the expected command-list update.
 - Filesystem/MAP `memory doctor` now treats intentionally uninitialized scopes as absent instead of making partial-scope opt-in permanently unhealthy; explicit policy denials and real document/MAP safety findings remain reported.
 - Added evidence-preserving recovery for legacy multi-writer SDK session-index corruption: `gjc gc` now diagnoses corrupt prefixes, `--repair-session-index` quarantines the original snapshot/log under the session-index lock before atomically restoring only the checksum-valid monotonic prefix, and append failures point operators to the explicit repair path (#2654).

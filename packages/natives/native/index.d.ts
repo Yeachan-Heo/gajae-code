@@ -350,6 +350,33 @@ export declare class PtySession {
   kill(): void
 }
 
+/** Retained trusted-root authority for Linux recovery artifacts. */
+export declare class RecoveryFsRoot {
+  /** Return the stable identity of the retained root descriptor. */
+  identity(): RecoveryFsResult
+  /** Stat one existing regular, single-linked file without following links. */
+  stat(relativePath: string): RecoveryFsResult
+  /** Read one existing regular, single-linked file without following links. */
+  read(relativePath: string, maxBytes: number): RecoveryFsResult
+  /**
+   * Create one previously absent regular, owner-only file and synchronously
+   * persist its contents. Existing entries are never replaced.
+   */
+  create(relativePath: string, data: Uint8Array): RecoveryFsResult
+  /**
+   * Atomically install an already-created regular file at an absent name.
+   * Both names remain relative to this retained root and are never resolved
+   * through a pathname after their parent descriptors are acquired.
+   */
+  install(sourceRelativePath: string, destinationRelativePath: string): RecoveryFsResult
+  /**
+   * Synchronize the retained root directory, making a preceding create or
+   * install durable when the filesystem supports directory fsync.
+   */
+  fsync(): RecoveryFsResult
+  close(): RecoveryFsResult
+}
+
 /** Persistent brush-core shell session. */
 export declare class Shell {
   /**
@@ -1640,6 +1667,12 @@ export interface NotificationEndpoint {
   sessionId: string
 }
 
+/**
+ * Acquire an immutable trusted-root descriptor. Linux is required; every
+ * other platform returns a durable unsupported-platform result.
+ */
+export declare function openRecoveryFsRoot(path: string): RecoveryFsRoot
+
 /** Parsed Kitty keyboard protocol sequence result for a Kitty input sequence. */
 export interface ParsedKittyResult {
   /** Primary codepoint associated with the key. */
@@ -1755,6 +1788,20 @@ export declare function ptyTimeoutCount(): bigint
  * Returns an error if clipboard access fails or image encoding fails.
  */
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
+
+export interface RecoveryFsIdentity {
+  dev: string
+  ino: string
+  size: string
+  mtimeNs: string
+}
+
+export interface RecoveryFsResult {
+  ok: boolean
+  code?: string
+  identity?: RecoveryFsIdentity
+  data?: Uint8Array
+}
 
 export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeExactUnlinkResult
 
