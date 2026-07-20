@@ -54,7 +54,10 @@ async function phase<T>(promise: Promise<T>, label: string, timeoutMs: number): 
 type FixtureCommand = { file: string; args: string[] };
 type FixtureCommandFactory = (root: string) => Promise<FixtureCommand>;
 
-async function assertAuthenticatedFixtureTopology(commandForRoot: FixtureCommandFactory): Promise<void> {
+async function assertAuthenticatedFixtureTopology(
+	commandForRoot: FixtureCommandFactory,
+	options: { coalesceExitWithAccept?: boolean } = {},
+): Promise<void> {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-self-reap-"));
 	const token = randomBytes(32);
 	const requestId = randomUUID();
@@ -62,9 +65,21 @@ async function assertAuthenticatedFixtureTopology(commandForRoot: FixtureCommand
 	const server = await listen();
 	const address = server.address();
 	if (!address || typeof address === "string") throw new Error("Expected IPv4 listener address.");
+	const expectBye = (candidate: net.Socket): Promise<void> =>
+		new Promise<void>((resolve, reject) => {
+			candidate.once("data", data => {
+				try {
+					expect(data.toString("ascii")).toBe("BYE1");
+					resolve();
+				} catch (error) {
+					reject(error);
+				}
+			});
+		});
 	let socket: net.Socket | undefined;
 	let childExited = false;
 	let childExit: Promise<void> | undefined;
+	let coalescedAcknowledged: Promise<void> | undefined;
 	const connected = new Promise<void>((resolve, reject) => {
 		server.once("connection", candidate => {
 			socket = candidate;
@@ -82,7 +97,14 @@ async function assertAuthenticatedFixtureTopology(commandForRoot: FixtureCommand
 					expect(hello.length).toBe(36);
 					expect(timingSafeEqual(hello.subarray(4), expected)).toBe(true);
 					const accept = proof(token, "SSH1-accept", requestId);
-					candidate.write(Buffer.concat([Buffer.from("ACK1"), accept]));
+					if (options.coalesceExitWithAccept) {
+						const exit = proof(token, "SSH1-exit", requestId);
+						coalescedAcknowledged = expectBye(candidate);
+						candidate.write(Buffer.concat([Buffer.from("ACK1"), accept, Buffer.from("EXT1"), exit]));
+						exit.fill(0);
+					} else {
+						candidate.write(Buffer.concat([Buffer.from("ACK1"), accept]));
+					}
 					accept.fill(0);
 					resolve();
 				} catch (error) {
@@ -112,23 +134,17 @@ async function assertAuthenticatedFixtureTopology(commandForRoot: FixtureCommand
 		// The broker naturally returns after dispatch; this observation is through
 		// its exact retained lease, not a child PID recovered from the protocol.
 		expect(await started.lease.waitForExit!(2_000)).toBe(true);
-		expect(childExited).toBe(false);
-		expect(socket?.destroyed).toBe(false);
-
-		const exit = proof(token, "SSH1-exit", requestId);
-		const acknowledged = new Promise<void>((resolve, reject) => {
-			socket!.once("data", data => {
-				try {
-					expect(data.toString("ascii")).toBe("BYE1");
-					resolve();
-				} catch (error) {
-					reject(error);
-				}
-			});
-		});
-		socket!.write(Buffer.concat([Buffer.from("EXT1"), exit]));
-		exit.fill(0);
-		await phase(acknowledged, "authenticated child self-exit acknowledgement", 10_000);
+		if (options.coalesceExitWithAccept) {
+			await phase(coalescedAcknowledged!, "coalesced authenticated child self-exit acknowledgement", 10_000);
+		} else {
+			expect(childExited).toBe(false);
+			expect(socket?.destroyed).toBe(false);
+			const exit = proof(token, "SSH1-exit", requestId);
+			const acknowledged = expectBye(socket!);
+			socket!.write(Buffer.concat([Buffer.from("EXT1"), exit]));
+			exit.fill(0);
+			await phase(acknowledged, "authenticated child self-exit acknowledgement", 10_000);
+		}
 		await phase(childExit!, "authenticated child socket close", 5_000);
 		expect(childExited).toBe(true);
 	} finally {
@@ -223,6 +239,16 @@ test.serial(
 	"source fixture broker exits naturally while its authenticated child remains alive until self-exit",
 	async () => {
 		await assertAuthenticatedFixtureTopology(async () => ({ file: process.execPath, args: [fixture] }));
+	},
+	10_000,
+);
+
+test.serial(
+	"source fixture preserves an authenticated exit frame coalesced with handshake acceptance",
+	async () => {
+		await assertAuthenticatedFixtureTopology(async () => ({ file: process.execPath, args: [fixture] }), {
+			coalesceExitWithAccept: true,
+		});
 	},
 	10_000,
 );

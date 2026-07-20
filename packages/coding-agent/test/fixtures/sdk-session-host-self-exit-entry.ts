@@ -68,10 +68,14 @@ export async function runSessionHostSelfExitFixture(): Promise<void> {
 		const expected = proof(token, "SSH1-accept", bootstrap.requestId);
 		const accepted =
 			received.subarray(0, 4).toString("ascii") === "ACK1" && timingSafeEqual(received.subarray(4, 36), expected);
+		const trailing = Buffer.from(received.subarray(36));
 		expected.fill(0);
 		received.fill(0);
 		received = Buffer.alloc(0);
-		if (!accepted) process.exit(1);
+		if (!accepted) {
+			trailing.fill(0);
+			process.exit(1);
+		}
 		socket.off("data", onHandshakeData);
 		clearTimeout(timer);
 		timer = setTimeout(() => process.exit(1), CONTROL_TTL_MS);
@@ -100,6 +104,7 @@ export async function runSessionHostSelfExitFixture(): Promise<void> {
 			socket.end("BYE1");
 		};
 		socket.on("data", onExitData);
+		if (trailing.length > 0) onExitData(trailing);
 	};
 	socket.on("data", onHandshakeData);
 	socket.once("end", () => {
