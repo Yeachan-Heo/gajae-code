@@ -150,13 +150,24 @@ export function ensureManagedDirectory(pathname: string): void {
 	secure(pathname, "directory");
 }
 
+/** Captures a bounded prefix from one no-follow descriptor and rechecks the pathname before use. */
+export function captureManagedFilePrefixNoFollow(pathname: string, maxBytes: number): ManagedFileSnapshot {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("invalid_capture_limit");
+	return captureManagedFileNoFollowLimit(pathname, maxBytes);
+}
+
 /** Captures header/hash/copy input from one no-follow descriptor and rechecks the pathname before use. */
 export function captureManagedFileNoFollow(pathname: string): ManagedFileSnapshot {
+	return captureManagedFileNoFollowLimit(pathname);
+}
+
+function captureManagedFileNoFollowLimit(pathname: string, maxBytes?: number): ManagedFileSnapshot {
 	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
 		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
-		const bytes = Buffer.alloc(Number(before.size));
+		const captureSize = maxBytes === undefined ? Number(before.size) : Math.min(Number(before.size), maxBytes);
+		const bytes = Buffer.alloc(captureSize);
 		let offset = 0;
 		while (offset < bytes.byteLength) {
 			const count = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);

@@ -14,6 +14,7 @@ import {
 import {
 	acquireManagedLock,
 	captureManagedFileNoFollow,
+	captureManagedFilePrefixNoFollow,
 	copyManagedFileNoReplace,
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
@@ -390,6 +391,49 @@ function fsyncManagedParent(pathname: string): void {
 	}
 }
 
+type CandidatePreflight =
+	| { kind: "capture"; identity: { dev: bigint; ino: bigint; size: number; mtimeNs: bigint } }
+	| {
+			kind: "foreign";
+	  }
+	| {
+			kind: "invalid";
+			code: string;
+	  };
+
+function preflightCandidate(filePath: string, scope: ManagedScope): CandidatePreflight {
+	try {
+		const snapshot = captureManagedFilePrefixNoFollow(filePath, HEADER_MAX_BYTES);
+		const lineEnd = snapshot.bytes.indexOf(0x0a);
+		if (lineEnd < 0) return { kind: "invalid", code: "invalid_header" };
+		const value: unknown = JSON.parse(snapshot.bytes.subarray(0, lineEnd).toString("utf8"));
+		if (!value || typeof value !== "object" || Array.isArray(value))
+			return { kind: "invalid", code: "invalid_header" };
+		const header = value as Record<string, unknown>;
+		if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string")
+			return { kind: "invalid", code: "invalid_header" };
+		const candidateIdentity = identityFor(header.cwd);
+		if (
+			candidateIdentity.ok &&
+			(candidateIdentity.platform !== scope.platform || candidateIdentity.canonicalPath !== scope.canonicalCwd)
+		)
+			return { kind: "foreign" };
+		return { kind: "capture", identity: snapshot.identity };
+	} catch {
+		return { kind: "invalid", code: "unreadable_candidate" };
+	}
+}
+
+function matchesPreflightIdentity(candidate: ManagedCandidate, preflight: CandidatePreflight): boolean {
+	return (
+		preflight.kind === "capture" &&
+		candidate.identity.dev === preflight.identity.dev &&
+		candidate.identity.ino === preflight.identity.ino &&
+		candidate.identity.size === preflight.identity.size &&
+		candidate.identity.mtimeNs === preflight.identity.mtimeNs
+	);
+}
+
 function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): ManagedCandidate | { code: string } {
 	try {
 		const snapshot = captureManagedFileNoFollow(filePath);
@@ -451,10 +495,13 @@ function discoveredLegacyDirectoryNames(scope: ManagedScope): readonly string[] 
 	return [...known, ...discovered];
 }
 
+type CandidateInspection = ManagedCandidate | { code: string } | { foreign: true };
+
 function listDirectoryCandidates(
 	directory: string,
 	provenance: "v2" | "legacy",
-): readonly (ManagedCandidate | { code: string })[] {
+	scope: ManagedScope,
+): readonly CandidateInspection[] {
 	let directoryStat: fs.Stats;
 	try {
 		directoryStat = fs.lstatSync(directory);
@@ -466,7 +513,15 @@ function listDirectoryCandidates(
 	return fs
 		.readdirSync(directory, { withFileTypes: true })
 		.filter(entry => entry.name.endsWith(".jsonl"))
-		.map(entry => inspectCandidate(path.join(directory, entry.name), provenance));
+		.map(entry => {
+			const filePath = path.join(directory, entry.name);
+			const preflight = preflightCandidate(filePath, scope);
+			if (preflight.kind === "invalid") return { code: preflight.code };
+			if (preflight.kind === "foreign") return { foreign: true };
+			const candidate = inspectCandidate(filePath, provenance);
+			if ("code" in candidate) return candidate;
+			return matchesPreflightIdentity(candidate, preflight) ? candidate : { code: "source_changed" };
+		});
 }
 
 export async function ensureManagedScope(scope: ManagedScope): Promise<ManagedScopeResolution> {
@@ -545,9 +600,13 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 		];
 		const seen = new Set<string>();
 		for (const directory of directories) {
-			for (const candidate of listDirectoryCandidates(directory.path, directory.provenance)) {
+			for (const candidate of listDirectoryCandidates(directory.path, directory.provenance, scope)) {
 				if ("code" in candidate) {
 					invalid.push({ code: candidate.code });
+					continue;
+				}
+				if ("foreign" in candidate) {
+					foreignCount++;
 					continue;
 				}
 				const candidateIdentity = identityFor(candidate.cwd);
