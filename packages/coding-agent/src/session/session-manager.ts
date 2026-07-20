@@ -3560,6 +3560,60 @@ function getTaskToolUsage(details: unknown): Usage | undefined {
 	return usage as Usage;
 }
 
+interface ValidatedUsageTotals {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	premiumRequests: number;
+	cost: number;
+}
+
+/** Max malformed-usage entry ids sampled for a single resume-time report. */
+const MALFORMED_USAGE_SAMPLE_LIMIT = 8;
+
+function isFiniteNonNegativeNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * Validate an untrusted persisted `usage` record before it is aggregated into
+ * session usage statistics. `parseSessionEntries` accepts any parseable JSON, so a
+ * torn/corrupt record can carry a `usage` that is still valid JSON yet malformed:
+ * absent (`{}` yields NaN), numeric strings (`"10"` coerces sums into strings), or
+ * negative buckets that silently reduce totals. Returns the validated finite
+ * non-negative totals, or null when any bucket or `cost.total` is malformed — the
+ * caller then skips and reports that record rather than poisoning every
+ * getUsageStatistics() consumer. Absent `premiumRequests`/`cost` default to 0
+ * (backward-compatible with older transcripts); a present-but-invalid field is
+ * rejected.
+ */
+function validatePersistedUsageTotals(usage: unknown): ValidatedUsageTotals | null {
+	if (typeof usage !== "object" || usage === null) return null;
+	const record = usage as Record<string, unknown>;
+	const input = record.input;
+	const output = record.output;
+	const cacheRead = record.cacheRead;
+	const cacheWrite = record.cacheWrite;
+	if (
+		!isFiniteNonNegativeNumber(input) ||
+		!isFiniteNonNegativeNumber(output) ||
+		!isFiniteNonNegativeNumber(cacheRead) ||
+		!isFiniteNonNegativeNumber(cacheWrite)
+	)
+		return null;
+	const premiumRequests = record.premiumRequests ?? 0;
+	if (!isFiniteNonNegativeNumber(premiumRequests)) return null;
+	const rawCost = record.cost;
+	let cost: unknown = 0;
+	if (rawCost !== undefined && rawCost !== null) {
+		if (typeof rawCost !== "object") return null;
+		cost = (rawCost as Record<string, unknown>).total ?? 0;
+	}
+	if (!isFiniteNonNegativeNumber(cost)) return null;
+	return { input, output, cacheRead, cacheWrite, premiumRequests, cost };
+}
+
 function extractTextFromContent(content: Message["content"]): string {
 	if (typeof content === "string") return content;
 	return content
@@ -4982,6 +5036,8 @@ export class SessionManager {
 		this.#labelsById.clear();
 		this.#leafId = null;
 		this.#usageStatistics = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 };
+		let malformedUsageRecords = 0;
+		const malformedUsageSample: string[] = [];
 		for (const entry of this.#fileEntries) {
 			if (entry.type === "session") continue;
 			this.#byId.set(entry.id, entry);
@@ -4994,27 +5050,49 @@ export class SessionManager {
 				}
 			}
 			if (entry.type === "message" && entry.message.role === "assistant") {
-				const usage = entry.message.usage;
-				this.#usageStatistics.input += usage.input;
-				this.#usageStatistics.output += usage.output;
-				this.#usageStatistics.cacheRead += usage.cacheRead;
-				this.#usageStatistics.cacheWrite += usage.cacheWrite;
-				this.#usageStatistics.premiumRequests += usage.premiumRequests ?? 0;
-				this.#usageStatistics.cost += usage.cost.total;
+				// parseSessionEntries accepts any parseable JSON, so a torn/corrupt persisted
+				// assistant record can carry a malformed `usage` (absent, {}, numeric strings,
+				// or negative buckets) that is still valid JSON. Validate every bucket and
+				// cost.total as finite non-negative numbers before aggregating: a malformed
+				// record is skipped (and reported after the loop) instead of poisoning usage
+				// totals with NaN, string coercion, or negatives for every
+				// getUsageStatistics() consumer.
+				const totals = validatePersistedUsageTotals(entry.message.usage);
+				if (totals) this.#addValidatedUsage(totals);
+				else {
+					malformedUsageRecords++;
+					if (malformedUsageSample.length < MALFORMED_USAGE_SAMPLE_LIMIT) malformedUsageSample.push(entry.id);
+				}
 			}
 
 			if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "task") {
-				const usage = getTaskToolUsage(entry.message.details);
-				if (usage) {
-					this.#usageStatistics.input += usage.input;
-					this.#usageStatistics.output += usage.output;
-					this.#usageStatistics.cacheRead += usage.cacheRead;
-					this.#usageStatistics.cacheWrite += usage.cacheWrite;
-					this.#usageStatistics.premiumRequests += usage.premiumRequests ?? 0;
-					this.#usageStatistics.cost += usage.cost.total;
+				const rawTaskUsage = getTaskToolUsage(entry.message.details);
+				if (rawTaskUsage !== undefined) {
+					const totals = validatePersistedUsageTotals(rawTaskUsage);
+					if (totals) this.#addValidatedUsage(totals);
+					else {
+						malformedUsageRecords++;
+						if (malformedUsageSample.length < MALFORMED_USAGE_SAMPLE_LIMIT) malformedUsageSample.push(entry.id);
+					}
 				}
 			}
 		}
+		if (malformedUsageRecords > 0) {
+			logger.warn("Skipped malformed persisted usage records during resume aggregation", {
+				sessionFile: this.#sessionFile,
+				count: malformedUsageRecords,
+				sampleEntryIds: malformedUsageSample,
+			});
+		}
+	}
+
+	#addValidatedUsage(totals: ValidatedUsageTotals): void {
+		this.#usageStatistics.input += totals.input;
+		this.#usageStatistics.output += totals.output;
+		this.#usageStatistics.cacheRead += totals.cacheRead;
+		this.#usageStatistics.cacheWrite += totals.cacheWrite;
+		this.#usageStatistics.premiumRequests += totals.premiumRequests;
+		this.#usageStatistics.cost += totals.cost;
 	}
 
 	#recordPersistError(err: unknown): Error {
