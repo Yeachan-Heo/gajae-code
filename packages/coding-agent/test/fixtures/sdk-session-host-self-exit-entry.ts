@@ -52,7 +52,7 @@ export async function runSessionHostSelfExitFixture(): Promise<void> {
 	const bootstrap = parse(readFrame());
 	closeFd3();
 	const token = Buffer.from(bootstrap.token, "base64");
-	const timer = setTimeout(() => process.exit(1), CONTROL_TTL_MS);
+	let timer = setTimeout(() => process.exit(1), CONTROL_TTL_MS);
 	const socket = net.connect({ host: "127.0.0.1", port: bootstrap.port });
 	socket.once("error", () => process.exit(1));
 	socket.once("connect", () => {
@@ -61,6 +61,7 @@ export async function runSessionHostSelfExitFixture(): Promise<void> {
 		hello.fill(0);
 	});
 	let received = Buffer.alloc(0);
+	let exitAuthorized = false;
 	const onHandshakeData = (data: Buffer): void => {
 		received = Buffer.concat([received, data]);
 		if (received.length < 36) return;
@@ -72,6 +73,8 @@ export async function runSessionHostSelfExitFixture(): Promise<void> {
 		received = Buffer.alloc(0);
 		if (!accepted) process.exit(1);
 		socket.off("data", onHandshakeData);
+		clearTimeout(timer);
+		timer = setTimeout(() => process.exit(1), CONTROL_TTL_MS);
 		// The parent sends one authenticated self-exit capability after broker exit.
 		let exitReceived = Buffer.alloc(0);
 		const onExitData = (command: Buffer): void => {
@@ -88,14 +91,20 @@ export async function runSessionHostSelfExitFixture(): Promise<void> {
 			exitReceived.fill(0);
 			exitReceived = Buffer.alloc(0);
 			token.fill(0);
-			clearTimeout(timer);
 			if (!valid) process.exit(1);
-			socket.end("BYE1", () => process.exit(0));
+			exitAuthorized = true;
+			socket.once("close", () => {
+				clearTimeout(timer);
+				process.exit(0);
+			});
+			socket.end("BYE1");
 		};
 		socket.on("data", onExitData);
 	};
 	socket.on("data", onHandshakeData);
-	socket.once("end", () => process.exit(1));
+	socket.once("end", () => {
+		if (!exitAuthorized) process.exit(1);
+	});
 }
 if (path.basename(process.argv[1] ?? "") === "sdk-session-host-self-exit-entry.ts")
 	void runSessionHostSelfExitFixture().catch(() => process.exit(1));
