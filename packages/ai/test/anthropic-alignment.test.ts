@@ -19,6 +19,8 @@ import {
 } from "@gajae-code/ai/providers/anthropic";
 import { getEnvApiKey } from "@gajae-code/ai/stream";
 import type { Context, Model, TJsonSchema, Tool } from "@gajae-code/ai/types";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
 import * as z from "zod/v4";
 import { withEnv } from "./helpers";
 
@@ -80,6 +82,45 @@ function captureAnthropicPayload(
 		onPayload: payload => resolve(payload),
 	});
 	return promise;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function objectsIn(value: unknown): Record<string, unknown>[] {
+	if (Array.isArray(value)) return value.flatMap(objectsIn);
+	if (!isObject(value)) return [];
+	return [value, ...Object.values(value).flatMap(objectsIn)];
+}
+
+async function askTool() {
+	const tool = (
+		await createTools(
+			{
+				cwd: "/tmp/test",
+				hasUI: true,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+			} satisfies ToolSession,
+			["ask"],
+		)
+	).find(candidate => candidate.name === "ask");
+	if (!tool) throw new Error("Expected AskTool to be registered");
+	return tool;
+}
+
+function assertLooseAskSchema(parameters: unknown): void {
+	const question = objectsIn(parameters).find(candidate => {
+		const properties = candidate.properties;
+		return (
+			isObject(properties) &&
+			["id", "question", "options", "deepInterview", "workflowGate"].every(name => Object.hasOwn(properties, name))
+		);
+	});
+	if (!question) throw new Error("Anthropic payload omitted AskTool question schema");
+	expect(question.required).toEqual(["id", "question", "options"]);
 }
 
 describe("Anthropic request fingerprint alignment", () => {
@@ -300,6 +341,25 @@ describe("Anthropic request fingerprint alignment", () => {
 		)) as { metadata?: { user_id?: string } };
 
 		expect(payload.metadata?.user_id).toBe(userId);
+	});
+
+	it("keeps the non-strict AskTool question metadata optional on the final Anthropic payload", async () => {
+		const tool = await askTool();
+		if (tool.strict !== false) throw new Error("Expected AskTool to opt out of strict schemas");
+		const payload = (await captureAnthropicPayload(
+			ANTHROPIC_MODEL,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Confirm", timestamp: 0 }],
+				tools: [tool],
+			},
+			{ isOAuth: false },
+		)) as { tools?: Array<{ name?: string; strict?: boolean; input_schema?: unknown }> };
+		const ask = payload.tools?.find(tool => tool.name === "ask");
+		if (!ask) throw new Error("Anthropic payload omitted AskTool");
+
+		expect(ask.strict).toBeUndefined();
+		assertLooseAskSchema(ask.input_schema);
 	});
 
 	it("replaces JSON metadata.user_id missing session_id for OAuth requests", async () => {

@@ -228,6 +228,9 @@ function validateMatchedGjcCommand(words: readonly string[]): BashAllowedPrefixe
 	if (words[0] !== "gjc") return { allowed: true };
 
 	if (words[1] === "ralplan") {
+		if (words.slice(2).some(word => isLongOption(word, "--mcp-config"))) {
+			return { allowed: false, reason: "restricted role-agent bash does not allow launch-only MCP configuration" };
+		}
 		if (!words.includes("--write")) {
 			return { allowed: false, reason: "restricted role-agent bash only allows `gjc ralplan --write ...`" };
 		}

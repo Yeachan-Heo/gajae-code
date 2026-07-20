@@ -75,6 +75,57 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(payload.task).toBeUndefined();
 	});
 
+	it("reports session paths and diagnostics without creating state", async () => {
+		const root = await tempDir();
+		const result = await runNativeRalplanCommand(["preflight", "--json"], root);
+
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}") as Record<string, unknown>;
+		expect(payload).toMatchObject({
+			ok: true,
+			session_id: TEST_SESSION_ID,
+			state_path: ralplanStatePath(root),
+			plans_path: path.join(sessionPlansDir(root, TEST_SESSION_ID), "ralplan"),
+			state_readability: "absent",
+			lock: { status: "absent" },
+		});
+		await expect(fs.access(path.join(root, ".gjc"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("reports readable active run state and lock owner without mutation", async () => {
+		const root = await tempDir();
+		const statePath = ralplanStatePath(root);
+		await fs.mkdir(`${statePath}.lock`, { recursive: true });
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(statePath, JSON.stringify({ run_id: "current-run" }), "utf-8");
+		await fs.writeFile(path.join(`${statePath}.lock`, "info"), JSON.stringify({ pid: 1, timestamp: 1 }), "utf-8");
+		const beforeState = await fs.readFile(statePath, "utf-8");
+		const beforeLock = await fs.readFile(path.join(`${statePath}.lock`, "info"), "utf-8");
+
+		const result = await runNativeRalplanCommand(["preflight", "--json"], root);
+
+		expect(result.status).toBe(0);
+		const payload = JSON.parse(result.stdout ?? "{}") as Record<string, unknown>;
+		expect(payload.run_id).toBe("current-run");
+		expect(payload.run_path).toBe(ralplanRunDir(root, "current-run"));
+		expect(payload.lock).toMatchObject({ status: "present", owner: { pid: 1, timestamp: 1 } });
+		expect(await fs.readFile(statePath, "utf-8")).toBe(beforeState);
+		expect(await fs.readFile(path.join(`${statePath}.lock`, "info"), "utf-8")).toBe(beforeLock);
+	});
+
+	it("reports corrupt state as a read-only preflight failure", async () => {
+		const root = await tempDir();
+		const statePath = ralplanStatePath(root);
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(statePath, "{broken json", "utf-8");
+
+		const result = await runNativeRalplanCommand(["preflight", "--json"], root);
+
+		expect(result.status).toBe(2);
+		expect(JSON.parse(result.stdout ?? "{}")).toMatchObject({ ok: false, state_readability: "corrupt" });
+		expect(await fs.readFile(statePath, "utf-8")).toBe("{broken json");
+	});
+
 	it("rejects corrupt ralplan state before consensus handoff seeding", async () => {
 		const root = await tempDir();
 		const statePath = ralplanStatePath(root);
@@ -725,6 +776,167 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		expect(indexLines.length).toBe(1);
 		expect(JSON.parse(indexLines[0]).stage).toBe("planner");
 	});
+
+	it("recovers a lost stdout retry only after verifying the indexed artifact", async () => {
+		const root = await tempDir();
+		const args = [
+			"--write",
+			"--stage",
+			"planner",
+			"--stage_n",
+			"1",
+			"--artifact",
+			"# Plan",
+			"--run-id",
+			"lost-stdout",
+		];
+		await runNativeRalplanCommand(args, root);
+		const retry = await runNativeRalplanCommand([...args, "--json"], root);
+		expect(retry.status).toBe(0);
+		expect((JSON.parse(retry.stdout ?? "{}") as { deduplicated?: boolean }).deduplicated).toBe(true);
+	});
+
+	it("rejects an identical retry when the indexed artifact was tampered with", async () => {
+		const root = await tempDir();
+		const args = [
+			"--write",
+			"--stage",
+			"planner",
+			"--stage_n",
+			"1",
+			"--artifact",
+			"# Plan",
+			"--run-id",
+			"tampered-retry",
+		];
+		await runNativeRalplanCommand(args, root);
+		await fs.writeFile(ralplanPlanPath(root, "tampered-retry", "stage-01-planner.md"), "tampered\n", "utf-8");
+
+		const retry = await runNativeRalplanCommand(args, root);
+		expect(retry.status).toBe(2);
+		expect(retry.stderr).toContain("stage artifact digest does not match index");
+	});
+
+	it("rejects duplicate, substituted, and malformed matching ledger rows without rewriting", async () => {
+		const root = await tempDir();
+		const args = [
+			"--write",
+			"--stage",
+			"planner",
+			"--stage_n",
+			"1",
+			"--artifact",
+			"# Plan",
+			"--run-id",
+			"invalid-ledger",
+		];
+		await runNativeRalplanCommand(args, root);
+		const indexPath = ralplanPlanPath(root, "invalid-ledger", "index.jsonl");
+		const original = await fs.readFile(indexPath, "utf-8");
+		const row = JSON.parse(original) as Record<string, unknown>;
+		await fs.writeFile(indexPath, `${original}${JSON.stringify(row)}\n`, "utf-8");
+
+		const duplicate = await runNativeRalplanCommand(args, root);
+		expect(duplicate.status).toBe(2);
+		expect(duplicate.stderr).toContain("found 2 index rows");
+
+		await fs.writeFile(indexPath, `${JSON.stringify({ ...row, path: "../stage-01-planner.md" })}\n`, "utf-8");
+		const substituted = await runNativeRalplanCommand(args, root);
+		expect(substituted.status).toBe(2);
+		expect(substituted.stderr).toContain("matching index path is not canonical");
+
+		await fs.writeFile(indexPath, `${JSON.stringify({ ...row, sha256: "invalid" })}\n`, "utf-8");
+		const malformedDigest = await runNativeRalplanCommand(args, root);
+		expect(malformedDigest.status).toBe(2);
+		expect(malformedDigest.stderr).toContain("matching index digest is malformed");
+	});
+
+	it("requires an untampered canonical pending approval artifact for final retry", async () => {
+		const root = await tempDir();
+		const args = [
+			"--write",
+			"--stage",
+			"final",
+			"--stage_n",
+			"1",
+			"--artifact",
+			"# Final",
+			"--run-id",
+			"final-retry",
+		];
+		await runNativeRalplanCommand(args, root);
+		await fs.writeFile(ralplanPlanPath(root, "final-retry", "pending-approval.md"), "different\n", "utf-8");
+
+		const retry = await runNativeRalplanCommand(args, root);
+		expect(retry.status).toBe(2);
+		expect(retry.stderr).toContain("pending-approval.md digest does not match final stage 1");
+	});
+
+	it("rejects oversized recovery ledger and artifact files before reading them", async () => {
+		const root = await tempDir();
+		const indexArgs = [
+			"--write",
+			"--stage",
+			"planner",
+			"--stage_n",
+			"1",
+			"--artifact",
+			"# Plan",
+			"--run-id",
+			"oversized-index",
+		];
+		await runNativeRalplanCommand(indexArgs, root);
+		await fs.appendFile(ralplanPlanPath(root, "oversized-index", "index.jsonl"), " ".repeat(1024 * 1024), "utf-8");
+		const indexRetry = await runNativeRalplanCommand(indexArgs, root);
+		expect(indexRetry.status).toBe(2);
+		expect(indexRetry.stderr).toContain("index.jsonl exceeds the 1048576-byte limit");
+
+		const artifactArgs = [
+			"--write",
+			"--stage",
+			"planner",
+			"--stage_n",
+			"1",
+			"--artifact",
+			"# Plan",
+			"--run-id",
+			"oversized-artifact",
+		];
+		await runNativeRalplanCommand(artifactArgs, root);
+		await fs.appendFile(
+			ralplanPlanPath(root, "oversized-artifact", "stage-01-planner.md"),
+			" ".repeat(2 * 1024 * 1024),
+			"utf-8",
+		);
+		const artifactRetry = await runNativeRalplanCommand(artifactArgs, root);
+		expect(artifactRetry.status).toBe(2);
+		expect(artifactRetry.stderr).toContain("stage artifact exceeds the 2097152-byte limit");
+	});
+
+	it("rejects a symbolic-link stage artifact during receipt recovery", async () => {
+		const root = await tempDir();
+		const args = [
+			"--write",
+			"--stage",
+			"planner",
+			"--stage_n",
+			"1",
+			"--artifact",
+			"# Plan",
+			"--run-id",
+			"linked-retry",
+		];
+		await runNativeRalplanCommand(args, root);
+		const artifactPath = ralplanPlanPath(root, "linked-retry", "stage-01-planner.md");
+		const replacementPath = path.join(root, "replacement.md");
+		await fs.writeFile(replacementPath, "# Plan\n", "utf-8");
+		await fs.rm(artifactPath);
+		await fs.symlink(replacementPath, artifactPath);
+
+		const retry = await runNativeRalplanCommand(args, root);
+		expect(retry.status).toBe(2);
+		expect(retry.stderr).toContain("stage artifact is not a regular file");
+	});
 });
 
 describe("native gjc ralplan runtime — persisted Planner state", () => {
@@ -849,40 +1061,66 @@ describe("native gjc ralplan runtime — persisted Planner state", () => {
 		expect(await fs.readFile(statePath(root), "utf-8")).toBe("{broken json");
 	});
 
-	it("records fallback metadata together with a fresh planner id", async () => {
-		const root = await tempDir();
-		const result = await runNativeRalplanCommand(
-			[
-				"--write",
-				"--stage",
-				"revision",
-				"--stage_n",
-				"3",
-				"--artifact",
-				"# Rev",
-				"--run-id",
-				"pp-fb",
-				"--planner-id",
-				"1-PlannerFresh",
-				"--fallback-reason",
-				"context_unavailable",
-				"--fallback-attempted-id",
-				"0-PlannerOld",
-				"--fallback-stage-n",
-				"3",
-				"--fallback-receipt-path",
-				".gjc/plans/ralplan/pp-fb/stage-03-revision.md",
-				"--json",
-			],
-			root,
-		);
-		expect(result.status).toBe(0);
-		const state = await readState(root);
-		expect(state.planner_fallback_reason).toBe("context_unavailable");
-		expect(state.planner_fallback_attempted_id).toBe("0-PlannerOld");
-		expect(state.planner_fallback_stage_n).toBe(3);
-		expect(state.planner_fallback_receipt_path).toBe(".gjc/plans/ralplan/pp-fb/stage-03-revision.md");
-		expect(state.planner_subagent_id).toBe("1-PlannerFresh");
+	it("serializes every documented fresh-Planner fallback reason without changing the recorded pass", async () => {
+		const fallbackReasons = [
+			"context_unavailable",
+			"not_found",
+			"no_runner",
+			"resume_failed",
+			"process_restart",
+			"missing_record",
+		] as const;
+
+		for (const fallbackReason of fallbackReasons) {
+			const root = await tempDir();
+			const result = await runNativeRalplanCommand(
+				[
+					"--write",
+					"--stage",
+					"revision",
+					"--stage_n",
+					"3",
+					"--artifact",
+					"# Rev",
+					"--run-id",
+					`pp-fb-${fallbackReason}`,
+					"--planner-id",
+					"1-PlannerFresh",
+					"--fallback-reason",
+					fallbackReason,
+					"--fallback-attempted-id",
+					"0-PlannerOld",
+					"--fallback-stage-n",
+					"3",
+					"--fallback-receipt-path",
+					`.gjc/plans/ralplan/pp-fb-${fallbackReason}/stage-03-revision.md`,
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(0);
+			const payload = JSON.parse(result.stdout ?? "{}") as {
+				stage_n?: number;
+				planner_state?: Record<string, unknown>;
+			};
+			expect(payload.stage_n).toBe(3);
+			expect(payload.planner_state).toEqual({
+				planner_subagent_id: "1-PlannerFresh",
+				planner_fallback_reason: fallbackReason,
+				planner_fallback_attempted_id: "0-PlannerOld",
+				planner_fallback_stage_n: 3,
+				planner_fallback_receipt_path: `.gjc/plans/ralplan/pp-fb-${fallbackReason}/stage-03-revision.md`,
+			});
+			const state = await readState(root);
+			expect(state.current_phase).toBe("revision");
+			expect(state.planner_fallback_reason).toBe(fallbackReason);
+			expect(state.planner_fallback_attempted_id).toBe("0-PlannerOld");
+			expect(state.planner_fallback_stage_n).toBe(3);
+			expect(state.planner_fallback_receipt_path).toBe(
+				`.gjc/plans/ralplan/pp-fb-${fallbackReason}/stage-03-revision.md`,
+			);
+			expect(state.planner_subagent_id).toBe("1-PlannerFresh");
+		}
 	});
 
 	it("rejects invalid --planner-resumable with exit 2", async () => {

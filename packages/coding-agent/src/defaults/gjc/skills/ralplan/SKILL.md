@@ -51,6 +51,10 @@ RECEIPT-ONLY guideline: role agents (`planner`, `architect`, and `critic`) persi
 
 This skill runs GJC planning in consensus mode for the provided arguments.
 
+Before spawning Planner, Architect, or Critic for every pass — and immediately after a process restart — run `gjc ralplan preflight --json` with a 5-second command timeout. Treat a non-zero result, unreadable state, or invalid lock diagnostic as a structured blocker before research. The preflight is read-only: use its resolved session/run/canonical paths and lock diagnostics for routing; never repair or edit `.gjc/` directly.
+
+Persistence-only retry rules are in the bundled persistence fragment: a writer retry keeps the same already-produced artifact bytes, `stage_n`, Planner context, and consensus iteration. Do not recreate research, spawn a fallback Planner, or charge one of the five re-review iterations because a persistence receipt was lost.
+
 The consensus workflow:
 1. **Planner** creates the initial plan and a compact **RALPLAN-DR summary** before review. Launch the Planner ONCE per run as a detached, resumable subagent (await it before the Architect) and record its returned subagent id as the run's persisted Planner id; persist the stage with `gjc ralplan --write --stage planner --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT --planner-id <id> --planner-resumable <true|false>` (see **Persisted Planner** below):
    - After persistence, return only the receipt/path plus compact planning status; do not paste the full plan markdown back to the caller unless explicitly requested.

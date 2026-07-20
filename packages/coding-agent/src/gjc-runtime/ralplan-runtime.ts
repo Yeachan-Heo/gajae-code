@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { syncSkillActiveState } from "../skill-state/active-state";
@@ -13,7 +14,7 @@ import {
 } from "./ledger-event-renderer";
 import { GJC_RALPLAN_ARTIFACT_ENV, isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
 import { modeStatePath, sessionPlansDir } from "./session-layout";
-import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
+import { resolveGjcSessionForRead, resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { migrateWorkflowState } from "./state-migrations";
 import { runNativeStateCommand } from "./state-runtime";
 import {
@@ -59,6 +60,36 @@ const KNOWN_ARCHITECT_KINDS = new Set(["openai-code"]);
 const KNOWN_CRITIC_KINDS = new Set(["openai-code"]);
 
 const SUBAGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+const RALPLAN_INDEX_MAX_BYTES = 1024 * 1024;
+const RALPLAN_ARTIFACT_MAX_BYTES = 2 * 1024 * 1024;
+const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
+
+async function readBoundedFile(filePath: string, maxBytes: number, label: string): Promise<Buffer> {
+	let stat: Stats;
+	try {
+		stat = await fs.lstat(filePath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") throw error;
+		throw new RalplanCommandError(2, `cannot recover ralplan artifact: ${label} is missing at ${filePath}.`);
+	}
+	if (!stat.isFile() || stat.isSymbolicLink()) {
+		throw new RalplanCommandError(
+			2,
+			`cannot recover ralplan artifact: ${label} is not a regular file at ${filePath}.`,
+		);
+	}
+	if (stat.size > maxBytes) {
+		throw new RalplanCommandError(
+			2,
+			`cannot recover ralplan artifact: ${label} exceeds the ${maxBytes}-byte limit at ${filePath}.`,
+		);
+	}
+	return await fs.readFile(filePath);
+}
+
+async function readBoundedText(filePath: string, maxBytes: number, label: string): Promise<string> {
+	return (await readBoundedFile(filePath, maxBytes, label)).toString("utf8");
+}
 
 const KNOWN_FALLBACK_REASONS = new Set([
 	"context_unavailable",
@@ -99,6 +130,10 @@ export function isRalplanArtifactWriteInvocation(args: readonly string[]): boole
 
 function isRalplanDoctorInvocation(args: readonly string[]): boolean {
 	return args[0] === "doctor";
+}
+
+function isRalplanPreflightInvocation(args: readonly string[]): boolean {
+	return args[0] === "preflight";
 }
 
 function assertKnownStage(stage: string): asserts stage is RalplanStage {
@@ -531,13 +566,7 @@ interface ExistingStageArtifact {
 	createdAt: string;
 }
 
-/**
- * Find the most recent `index.jsonl` row for a `(stage, stage_n)` pair so a
- * repeated `--write` can dedupe instead of silently clobbering the artifact and
- * appending a duplicate ledger row. Best-effort: a missing or unreadable index
- * yields `undefined`, treated as "no prior artifact". The ledger is the source of
- * truth for dedup because it is exactly what a duplicate write would corrupt.
- */
+/** Validate an identical-stage retry against the immutable artifact ledger and files. */
 async function findExistingStageArtifact(
 	cwd: string,
 	sessionId: string,
@@ -545,14 +574,18 @@ async function findExistingStageArtifact(
 	stage: RalplanStage,
 	stageN: number,
 ): Promise<ExistingStageArtifact | undefined> {
-	const indexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, "index.jsonl");
+	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
+	const indexPath = path.join(runDir, "index.jsonl");
 	let text: string;
 	try {
-		text = await fs.readFile(indexPath, "utf8");
-	} catch {
-		return undefined;
+		text = await readBoundedText(indexPath, RALPLAN_INDEX_MAX_BYTES, "index.jsonl");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
 	}
-	let match: ExistingStageArtifact | undefined;
+
+	const canonicalPath = path.join(runDir, `stage-${pad2(stageN)}-${stage}.md`);
+	const matches: ExistingStageArtifact[] = [];
 	for (const line of text.split(/\r?\n/)) {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
@@ -560,17 +593,67 @@ async function findExistingStageArtifact(
 		try {
 			row = JSON.parse(trimmed);
 		} catch {
-			continue;
+			throw new RalplanCommandError(2, `cannot recover ralplan artifact: index.jsonl is malformed at ${indexPath}.`);
 		}
-		if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+		if (!row || typeof row !== "object" || Array.isArray(row)) {
+			throw new RalplanCommandError(
+				2,
+				`cannot recover ralplan artifact: index.jsonl has a malformed row at ${indexPath}.`,
+			);
+		}
 		const record = row as Record<string, unknown>;
 		if (record.stage !== stage || record.stage_n !== stageN) continue;
-		if (typeof record.path !== "string" || typeof record.sha256 !== "string") continue;
-		match = {
-			path: record.path,
+		if (typeof record.path !== "string" || typeof record.sha256 !== "string") {
+			throw new RalplanCommandError(
+				2,
+				`cannot recover ralplan artifact: matching index row is malformed at ${indexPath}.`,
+			);
+		}
+		if (path.normalize(record.path) !== canonicalPath || record.path !== canonicalPath) {
+			throw new RalplanCommandError(
+				2,
+				`cannot recover ralplan artifact: matching index path is not canonical for ${stage} stage ${stageN}.`,
+			);
+		}
+		if (!SHA256_HEX_RE.test(record.sha256)) {
+			throw new RalplanCommandError(
+				2,
+				`cannot recover ralplan artifact: matching index digest is malformed for ${stage} stage ${stageN}.`,
+			);
+		}
+		matches.push({
+			path: canonicalPath,
 			sha256: record.sha256,
 			createdAt: typeof record.created_at === "string" ? record.created_at : "",
-		};
+		});
+	}
+	if (matches.length === 0) return undefined;
+	if (matches.length !== 1) {
+		throw new RalplanCommandError(
+			2,
+			`cannot recover ralplan artifact: found ${matches.length} index rows for ${stage} stage ${stageN}.`,
+		);
+	}
+
+	const match = matches[0];
+	const artifact = await readBoundedFile(canonicalPath, RALPLAN_ARTIFACT_MAX_BYTES, "stage artifact");
+	const artifactDigest = createHash("sha256").update(artifact).digest("hex");
+	if (artifactDigest !== match.sha256) {
+		throw new RalplanCommandError(
+			2,
+			`cannot recover ralplan artifact: stage artifact digest does not match index for ${stage} stage ${stageN}.`,
+		);
+	}
+	if (stage === "final") {
+		const pendingPath = path.join(runDir, "pending-approval.md");
+		const pending = await readBoundedFile(pendingPath, RALPLAN_ARTIFACT_MAX_BYTES, "pending-approval.md");
+		const pendingDigest = createHash("sha256").update(pending).digest("hex");
+		if (pendingDigest !== match.sha256) {
+			throw new RalplanCommandError(
+				2,
+				`cannot recover ralplan artifact: pending-approval.md digest does not match final stage ${stageN}.`,
+			);
+		}
 	}
 	return match;
 }
@@ -888,6 +971,85 @@ async function handleConsensusHandoff(args: readonly string[], cwd: string): Pro
 	return { status: 0, stdout };
 }
 
+interface RalplanPreflightArgs {
+	sessionId: string;
+	sessionSource: string;
+}
+
+async function resolvePreflightArgs(args: readonly string[], cwd: string): Promise<RalplanPreflightArgs> {
+	for (let index = 1; index < args.length; index += 1) {
+		const arg = args[index];
+		if (arg === "--json") continue;
+		if (arg === "--session-id") {
+			if (args[index + 1] === undefined) throw new RalplanCommandError(2, "--session-id requires a value");
+			index += 1;
+			continue;
+		}
+		throw new RalplanCommandError(2, `unknown flag for gjc ralplan preflight: ${arg}`);
+	}
+	if (!hasFlag(args, "--json")) throw new RalplanCommandError(2, "gjc ralplan preflight requires --json");
+	const session = await resolveGjcSessionForRead(cwd, {
+		flagValue: flagValue(args, "--session-id"),
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	return { sessionId: session.gjcSessionId, sessionSource: session.source };
+}
+
+async function readPreflightState(
+	statePath: string,
+): Promise<{ readability: "absent" | "readable" | "corrupt"; runId?: string }> {
+	try {
+		const raw = await fs.readFile(statePath, "utf8");
+		const state = JSON.parse(raw) as unknown;
+		if (!state || typeof state !== "object" || Array.isArray(state)) return { readability: "corrupt" };
+		const record = state as Record<string, unknown>;
+		const runId = typeof record.run_id === "string" ? record.run_id.trim() : "";
+		if (runId) assertSafePathComponent(runId, "run-id");
+		return { readability: "readable", ...(runId ? { runId } : {}) };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { readability: "absent" };
+		return { readability: "corrupt" };
+	}
+}
+
+async function readPreflightLock(lockPath: string): Promise<Record<string, unknown>> {
+	try {
+		const stat = await fs.lstat(lockPath);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) return { status: "invalid" };
+		try {
+			const owner = JSON.parse(await fs.readFile(path.join(lockPath, "info"), "utf8")) as unknown;
+			return owner && typeof owner === "object" && !Array.isArray(owner)
+				? { status: "present", owner }
+				: { status: "invalid" };
+		} catch {
+			return { status: "invalid" };
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" };
+		return { status: "unreadable" };
+	}
+}
+
+async function handlePreflight(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
+	const resolved = await resolvePreflightArgs(args, cwd);
+	const statePath = ralplanStatePath(cwd, resolved.sessionId);
+	const state = await readPreflightState(statePath);
+	const plansPath = path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan");
+	const runPath = state.runId ? path.join(plansPath, state.runId) : undefined;
+	const payload = {
+		ok: state.readability !== "corrupt",
+		session_id: resolved.sessionId,
+		session_source: resolved.sessionSource,
+		run_id: state.runId,
+		state_path: statePath,
+		plans_path: plansPath,
+		run_path: runPath,
+		state_readability: state.readability,
+		lock: await readPreflightLock(`${statePath}.lock`),
+	};
+	return { status: state.readability === "corrupt" ? 2 : 0, stdout: `${JSON.stringify(payload, null, 2)}\n` };
+}
+
 async function handleDoctor(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
 	return await runNativeStateCommand(["doctor", "--skill", "ralplan", ...args.slice(1)], cwd);
 }
@@ -897,6 +1059,7 @@ async function handleDoctor(args: readonly string[], cwd: string): Promise<Ralpl
 export async function runNativeRalplanCommand(args: string[], cwd = process.cwd()): Promise<RalplanCommandResult> {
 	try {
 		if (isRalplanDoctorInvocation(args)) return await handleDoctor(args, cwd);
+		if (isRalplanPreflightInvocation(args)) return await handlePreflight(args, cwd);
 		if (isRalplanArtifactWriteInvocation(args)) return await handleArtifactWrite(args, cwd);
 		return await handleConsensusHandoff(args, cwd);
 	} catch (error) {

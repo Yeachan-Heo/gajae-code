@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { finalizeSubprocessOutput } from "../../src/task/executor";
+import { buildTaskReceipt } from "../../src/task/receipt";
 import { subprocessToolRegistry } from "../../src/task/subprocess-tool-registry";
 import { parseReportFindingDetails, toReviewFinding } from "../../src/tools/review";
 
@@ -130,5 +131,94 @@ describe("toReviewFinding", () => {
 			findings: Array<{ priority: number }>;
 		};
 		expect(parsed.findings[0].priority).toBe(2);
+	});
+
+	it("keeps reported findings in the receipt when a closed schema forbids their projection", () => {
+		const completion = {
+			receipt: "agent://0-Reviewer",
+			verdict: "incorrect",
+		};
+		const reportFinding = { ...base, priority: "P2" as const };
+		const result = finalizeSubprocessOutput({
+			rawOutput: "",
+			exitCode: 0,
+			stderr: "",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [{ status: "success", data: completion }],
+			reportFindings: [toReviewFinding(reportFinding)],
+			outputSchema: {
+				type: "object",
+				properties: {
+					receipt: { type: "string" },
+					verdict: { type: "string" },
+				},
+				required: ["receipt", "verdict"],
+				additionalProperties: false,
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toBe("");
+		expect(JSON.parse(result.rawOutput)).toEqual(completion);
+		const receipt = buildTaskReceipt({
+			index: 0,
+			id: "0-Reviewer",
+			agent: "reviewer",
+			agentSource: "bundled",
+			task: "Review the patch",
+			exitCode: result.exitCode,
+			output: result.rawOutput,
+			stderr: result.stderr,
+			truncated: false,
+			durationMs: 1,
+			tokens: 1,
+			extractedToolData: {
+				yield: [{ data: completion }],
+				report_finding: [reportFinding],
+			},
+		});
+		expect(receipt.review).toMatchObject({
+			findingCount: 1,
+			findings: [{ severity: "P2", summary: "[P0] Example finding" }],
+		});
+	});
+
+	it("adds reported findings when no closed output schema constrains the completion", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "",
+			exitCode: 0,
+			stderr: "",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [{ status: "success", data: { verdict: "incorrect" } }],
+			reportFindings: [toReviewFinding({ ...base, priority: "P2" })],
+			outputSchema: undefined,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(JSON.parse(result.rawOutput)).toMatchObject({ findings: [{ priority: 2 }] });
+	});
+
+	it("reports the original schema violation when neither projection is valid", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "",
+			exitCode: 0,
+			stderr: "",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [{ status: "success", data: { verdict: "incorrect" } }],
+			reportFindings: [toReviewFinding({ ...base, priority: "P2" })],
+			outputSchema: {
+				type: "object",
+				properties: { receipt: { type: "string" }, verdict: { type: "string" } },
+				required: ["receipt", "verdict"],
+				additionalProperties: false,
+			},
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("missing required fields: receipt");
+		expect(JSON.parse(result.rawOutput)).toMatchObject({ error: "schema_violation", missingRequired: ["receipt"] });
 	});
 });

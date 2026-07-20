@@ -15,6 +15,7 @@ import {
 	type OpenGateInput,
 	type WorkflowGateEmitter,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import { initTheme } from "../src/modes/theme/theme";
 import { SessionManager } from "../src/session/session-manager";
 import { registerWorkflowGateEmitterListener } from "../src/tools/ask-answer-registry";
@@ -197,6 +198,86 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			expect(await emitter!.resolveGate!(response)).toMatchObject({ status: "accepted" });
 			expect(await emitter!.resolveGate!(response)).toMatchObject({ status: "accepted" });
 			expect(JSON.stringify((await result).details)).toContain("JWT");
+			dispose();
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("emits and resolves real question and approval gates without deep-interview metadata", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-ask-overrides-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			const emitter = session.getWorkflowGateEmitter();
+			if (!emitter?.onGateEmitted || !emitter.resolveGate) throw new Error("Expected SDK workflow gate emitter");
+			attachTerminalController(emitter);
+			await Bun.sleep(0);
+			const gates: WorkflowGate[] = [];
+			const dispose = emitter.onGateEmitted(gate => gates.push(gate));
+			const ask = session.getToolByName("ask");
+			if (!ask) throw new Error("Expected AskTool");
+			const result = ask.execute(
+				"production-gate-overrides",
+				{
+					questions: [
+						{ id: "scope", question: "Choose scope", options: [{ label: "Minimal" }] },
+						{
+							id: "approval",
+							question: "Approve plan",
+							options: [{ label: "Approve" }],
+							workflowGate: { stage: "ralplan", kind: "approval" },
+						},
+					],
+				},
+				undefined,
+				undefined,
+				{ hasUI: false, abort: () => {} } as unknown as AgentToolContext,
+			);
+			for (let i = 0; i < 20 && gates.length < 1; i += 1) await Bun.sleep(1);
+			expect(gates).toHaveLength(1);
+			expect(gates[0]).toMatchObject({ stage: "deep-interview", kind: "question" });
+			expect(gates[0]?.context?.stage_state).toMatchObject({
+				question_id: "scope",
+				multi: false,
+				allow_empty: false,
+				options: ["Minimal"],
+				navigation_label: "Next",
+			});
+			expect(gates[0]?.context?.stage_state).not.toHaveProperty("deep_interview_metadata");
+			await emitter.resolveGate({
+				gate_id: gates[0]!.gate_id,
+				answer: { selected: ["Minimal"], other: false },
+				idempotency_key: "scope-answer",
+			});
+			for (let i = 0; i < 20 && gates.length < 2; i += 1) await Bun.sleep(1);
+			expect(gates).toHaveLength(2);
+			expect(gates[1]).toMatchObject({ stage: "ralplan", kind: "approval" });
+			expect(gates[1]?.context?.stage_state).toMatchObject({
+				question_id: "approval",
+				multi: false,
+				allow_empty: false,
+				options: ["Approve"],
+				navigation_label: "Done",
+			});
+			expect(gates[1]?.context?.stage_state).not.toHaveProperty("deep_interview_metadata");
+			await emitter.resolveGate({
+				gate_id: gates[1]!.gate_id,
+				answer: { selected: ["Approve"], other: false },
+				idempotency_key: "approval-answer",
+			});
+			expect(JSON.stringify((await result).details)).toContain("Approve");
 			dispose();
 		} finally {
 			await session.dispose();

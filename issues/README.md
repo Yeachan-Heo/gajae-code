@@ -31,6 +31,10 @@ Deferred (designed; tracked as follow-ups, NOT claimed fixed):
 
 Plan + consensus artifacts: `.gjc/plans/ralplan/2026-06-13-1236-71f5/` (`pending-approval.md`).
 
+## Cross-cutting field reports
+
+- [2026-07-20 — RECOVA Ralplan 제어면 결함](field-reports/2026-07-20-recova-ralplan-control-plane-failures.md): `ask` provider-visible schema 불일치, 프로젝트 wrapper의 workflow 관리 명령 파손, Ralplan persistence timeout·fallback·receipt 복구 문제를 실제 작업 타임라인과 함께 기록한다.
+
 
 | # | Severity | Scope (primary file) | Summary |
 |---|----------|----------------------|---------|

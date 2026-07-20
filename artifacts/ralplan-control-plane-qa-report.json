@@ -1,0 +1,79 @@
+{
+  "kind": "cli-api-package-test-report",
+  "generatedAt": "2026-07-20",
+  "scope": "Fresh adversarial QA after rebuilding the darwin-arm64 native addon for 0.11.4; read-only CLI replays used isolated temporary workspaces.",
+  "revision": "c7cf7da4",
+  "invocations": [
+    {
+      "command": "bun test packages/coding-agent/test/tools/ask.test.ts packages/coding-agent/test/tools/issue-2643-openai-completions-wire.test.ts packages/coding-agent/test/sdk-workflow-gate-emitter.test.ts packages/coding-agent/test/tools/review.test.ts packages/coding-agent/test/gjc-runtime/ralplan-runtime.test.ts packages/coding-agent/test/cli-command-surface.test.ts packages/ai/test/openai-responses-tool-choice.test.ts packages/ai/test/openai-codex-responses-tool-choice.test.ts",
+      "result": "passed",
+      "evidence": "182 pass, 0 fail, 799 expectations, 7.54s. The rebuilt native addon loaded successfully across all eight focused files."
+    },
+    {
+      "command": "bun test packages/coding-agent/test/sdk-workflow-gate-emitter.test.ts",
+      "result": "passed",
+      "evidence": "15 pass, 0 fail, 92 expectations, 4.06s."
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent run build",
+      "result": "passed",
+      "evidence": "Bundled, compiled packages/coding-agent/dist/gjc, embedded the rebuilt native addon, and reset the temporary embedded-client source."
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent run check",
+      "result": "passed",
+      "evidence": "Biome checked 2,262 files without fixes; TypeScript check completed successfully."
+    },
+    {
+      "command": "bun --cwd=packages/ai run check",
+      "result": "passed",
+      "evidence": "Biome checked 401 files without fixes; TypeScript check completed successfully."
+    },
+    {
+      "command": "isolated argv matrix: bun packages/coding-agent/src/cli.ts [leading separated/equal/empty/missing/duplicate --mcp-config; post-subcommand unknown flags; ralplan preflight --json]",
+      "result": "passed",
+      "evidence": "All six leading malformed management forms exited 2 in 67-99ms with actionable launch-only guidance; both post-subcommand forms exited 2 in 106-134ms with native unknown-flag diagnostics; preflight exited 0 in 105ms with JSON showing ok=true, state_readability=absent, and lock.status=absent. No startup markers appeared."
+    },
+    {
+      "command": "isolated argv matrix: packages/coding-agent/dist/gjc [same argv matrix]",
+      "result": "passed",
+      "evidence": "All six leading malformed management forms exited 2 in 345-368ms with actionable launch-only guidance; both post-subcommand forms exited 2 in 375-438ms with native unknown-flag diagnostics; preflight exited 0 in 419ms with JSON showing ok=true, state_readability=absent, and lock.status=absent. No startup markers appeared."
+    }
+  ],
+  "contractCoverage": [
+    "Provider AskTool optionality and OpenAI completions/responses/Codex final-wire assertions passed in the focused eight-file suite.",
+    "Workflow question and approval gate emission passed: 15 workflow-emitter tests and 92 assertions.",
+    "Canonical receipt recovery passed through the focused ralplan runtime suite, including path/digest validation, duplicate ledger rows, final alias checks, bounded files, symlinks, and no-mutation recovery behavior.",
+    "Closed-schema findings projection passed through the focused review suite.",
+    "Source CLI rejects leading separated, equals, empty, missing-value, mixed duplicate, and duplicate-separated --mcp-config before ralplan/state with exit 2 and actionable guidance.",
+    "Compiled 0.11.4 binary reproduces the complete leading --mcp-config rejection matrix with exit 2 and actionable guidance.",
+    "Post-subcommand --mcp-config uses ralplan/state unknown-flag handling with exit 2 on source and compiled surfaces.",
+    "Canonical ralplan preflight --json succeeds with exit 0 and valid read-only JSON on source and compiled surfaces.",
+    "Coding-agent and AI package checks pass after native-addon rebuild."
+  ],
+  "surfaceEvidence": [
+    "The prior pi_natives version-sentinel initialization failure is absent: focused imports, source CLI, and compiled binary all ran successfully.",
+    "Every malformed leading management invocation returned the exact actionable message that --mcp-config is only valid for launch and should be removed for management commands.",
+    "Post-subcommand diagnostics were specific: ralplan reported an unknown ralplan flag, and state reported an unknown state flag.",
+    "All 18 measured CLI invocations completed below five seconds; the slowest was compiled ralplan post-subcommand unknown flag at 438ms.",
+    "No source or compiled replay output contained startup markers (Starting, Loading, Welcome, TUI, or runtime startup).",
+    "Preflight JSON on both surfaces reported an absent state and absent lock in a fresh temporary workspace, preserving read-only behavior."
+  ],
+  "adversarialCases": [
+    "Leading --mcp-config /tmp/tools.json before ralplan.",
+    "Leading --mcp-config=/tmp/tools.json before state.",
+    "Leading empty --mcp-config= before ralplan.",
+    "Leading --mcp-config with ralplan as the apparent missing value.",
+    "Mixed equals and separated duplicate leading --mcp-config forms.",
+    "Duplicate separated leading --mcp-config forms.",
+    "Post-subcommand --mcp-config=/tmp/tools.json for ralplan and state.",
+    "Canonical ralplan preflight --json in a fresh workspace.",
+    "Receipt retry/recovery tampering, duplicate/substituted/malformed ledger rows, final alias tampering, oversized files, and symlink artifacts through focused runtime tests.",
+    "Actionable output, expected exit codes, five-second upper bound, and absence of runtime startup markers for source and compiled CLI replays."
+  ],
+  "findings": [],
+  "verdict": "CLEAR",
+  "e2eStatus": "passed",
+  "redTeamStatus": "passed",
+  "blockers": []
+}

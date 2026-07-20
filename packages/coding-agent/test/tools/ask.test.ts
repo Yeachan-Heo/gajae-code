@@ -2598,17 +2598,51 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(result.details?.selectedOptions).toEqual(["yes"]);
 	});
 
-	it("keeps deepInterview optional and rejects malformed metadata", () => {
+	it("preserves omitted optional fields and mutually exclusive deep-interview metadata branches", () => {
+		const question = { id: "q", question: "Pick?", options: [{ label: "A" }] };
+		const metadata = { round: 2, component: "Scope", dimension: "Constraints", ambiguity: 0.42 };
+		const contract = {
+			round: 0,
+			component: "review-topology",
+			dimension: "topology",
+			ambiguity: 1,
+			intent_contract: {
+				items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+				confirmation_options: ["A"],
+			},
+		};
+		const review = {
+			round: 1,
+			component: "locked-intent",
+			dimension: "constraints",
+			ambiguity: 0.42,
+			intent_review: {
+				observed_items: [{ id: "artifact:report", category: "artifact" as const, statement: "Produce report" }],
+				supporting_substitutions: [],
+				approval_options: ["A"],
+			},
+		};
+
+		for (const input of [
+			{ questions: [question] },
+			{ questions: [{ ...question, workflowGate: { stage: "ralplan", kind: "question" } }] },
+			{ questions: [{ ...question, workflowGate: { stage: "ralplan", kind: "approval" } }] },
+			{ questions: [{ ...question, deepInterview: metadata }] },
+			{ questions: [{ ...question, deepInterview: contract }] },
+			{ questions: [{ ...question, deepInterview: review }] },
+		]) {
+			expect(askSchema.safeParse(input).success).toBe(true);
+		}
 		expect(
-			askSchema.safeParse({ questions: [{ id: "q", question: "Pick?", options: [{ label: "A" }] }] }).success,
-		).toBe(true);
+			askSchema.safeParse({
+				questions: [{ ...question, deepInterview: { ...contract, intent_review: review.intent_review } }],
+			}).success,
+		).toBe(false);
 		expect(
 			askSchema.safeParse({
 				questions: [
 					{
-						id: "q",
-						question: "Pick?",
-						options: [{ label: "A" }],
+						...question,
 						deepInterview: { round: "two", component: "Scope", dimension: "Constraints", ambiguity: 1.2 },
 					},
 				],

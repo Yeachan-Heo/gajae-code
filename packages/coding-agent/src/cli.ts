@@ -165,6 +165,29 @@ function hasRootVersionFlag(argv: string[]): boolean {
 	return hasRootFastFlag(argv, versionFlags);
 }
 
+/** Reject launch-only MCP configuration before management command dispatch. */
+export function managementCommandMcpConfigError(argv: readonly string[]): string | undefined {
+	let index = 0;
+	let sawMcpConfig = false;
+	while (argv[index] === "--mcp-config" || argv[index]?.startsWith("--mcp-config=")) {
+		const arg = argv[index]!;
+		sawMcpConfig = true;
+		if (
+			arg === "--mcp-config" &&
+			argv[index + 1] !== undefined &&
+			argv[index + 1] !== "ralplan" &&
+			argv[index + 1] !== "state"
+		) {
+			index += 2;
+		} else {
+			index++;
+		}
+	}
+	return sawMcpConfig && (argv[index] === "ralplan" || argv[index] === "state")
+		? `${APP_NAME}: --mcp-config is only valid for launch; remove it for management commands and use it only with launch`
+		: undefined;
+}
+
 export class RootHelpCommand extends Command {
 	static description = "Red-claw AI coding assistant";
 	static hidden = true;
@@ -364,6 +387,12 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (hasRootVersionFlag(argv)) {
 		process.stdout.write(`${APP_NAME}/${VERSION}\n`);
+		return;
+	}
+	const mcpConfigError = managementCommandMcpConfigError(argv);
+	if (mcpConfigError) {
+		process.stderr.write(`${mcpConfigError}\n`);
+		process.exitCode = 2;
 		return;
 	}
 	await installRuntimeGlobals();

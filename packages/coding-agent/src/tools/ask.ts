@@ -978,7 +978,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	readonly description: string;
 	readonly parameters = askSchema;
 	readonly rawArgumentValidation = recoverRoundZeroIntentContract;
-	readonly strict = true;
+	readonly strict = false;
 	readonly loadMode = "discoverable";
 
 	constructor(private readonly session: ToolSession) {

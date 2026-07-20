@@ -314,6 +314,31 @@ describe("checkBashAllowedPrefixes", () => {
 		expect(result.reason).toContain("shell control operator");
 	});
 
+	it("blocks global CLI flag insertion before restricted workflow commands", () => {
+		const commands = [
+			"gjc --mcp-config tools.json state ralplan read --json",
+			"gjc --mcp-config=tools.json ralplan --write --stage critic --artifact verdict",
+		];
+
+		for (const command of commands) {
+			const result = checkBashAllowedPrefixes(command, ROLE_AGENT_PREFIXES);
+			expect(result.allowed).toBe(false);
+			expect(result.reason).toContain("restricted role-agent bash only allows commands starting with");
+		}
+	});
+
+	it("blocks restricted workflow command prefix bypass shapes", () => {
+		const commands = [
+			"gjc -- state ralplan read --json",
+			"gjc ./state ralplan read --json",
+			"gjc ralplan --write --stage critic --artifact verdict --mcp-config tools.json",
+		];
+
+		for (const command of commands) {
+			expect(checkBashAllowedPrefixes(command, ROLE_AGENT_PREFIXES).allowed).toBe(false);
+		}
+	});
+
 	it("blocks ordinary shell commands for restricted role agents", () => {
 		const result = checkBashAllowedPrefixes("echo verdict", ROLE_AGENT_PREFIXES);
 

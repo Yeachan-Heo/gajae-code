@@ -32,6 +32,11 @@ function hasProperties(value: JsonObject, names: readonly string[]): boolean {
 	return isObject(properties) && names.every(name => Object.hasOwn(properties, name));
 }
 
+function requiredPropertyNames(schema: JsonObject): string[] {
+	const required = schema.required;
+	return Array.isArray(required) && required.every(name => typeof name === "string") ? required : [];
+}
+
 function assertMetadataBranches(schema: unknown): void {
 	const metadataBranches = objectsIn(schema).filter(branch =>
 		hasProperties(branch, ["round", "component", "dimension", "ambiguity"]),
@@ -98,5 +103,7 @@ describe("issue #2643 — OpenAI completions AskTool wire contract", () => {
 		const question = schemas.find(schema => hasProperties(schema, ["id", "question", "options", "deepInterview"]));
 		expect(question).toBeDefined();
 		expect(hasProperties(question as JsonObject, ["workflowGate"])).toBe(true);
+		expect(ask.function.strict).toBeUndefined();
+		expect(requiredPropertyNames(question as JsonObject)).toEqual(["id", "question", "options"]);
 	});
 });

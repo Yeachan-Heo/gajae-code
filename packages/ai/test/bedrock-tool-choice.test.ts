@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it } from "bun:test";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
 import { convertToolConfig, stripBedrockForcedToolChoiceForRetry } from "../src/providers/amazon-bedrock";
 import type { Model, Tool } from "../src/types";
 import {
@@ -7,6 +9,45 @@ import {
 	markToolChoiceIncapability,
 	resolveToolChoice,
 } from "../src/utils/tool-choice-capability";
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function objectsIn(value: unknown): Record<string, unknown>[] {
+	if (Array.isArray(value)) return value.flatMap(objectsIn);
+	if (!isObject(value)) return [];
+	return [value, ...Object.values(value).flatMap(objectsIn)];
+}
+
+async function askTool() {
+	const tool = (
+		await createTools(
+			{
+				cwd: "/tmp/test",
+				hasUI: true,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+			} satisfies ToolSession,
+			["ask"],
+		)
+	).find(candidate => candidate.name === "ask");
+	if (!tool) throw new Error("Expected AskTool to be registered");
+	return tool;
+}
+
+function assertLooseAskSchema(parameters: unknown): void {
+	const question = objectsIn(parameters).find(candidate => {
+		const properties = candidate.properties;
+		return (
+			isObject(properties) &&
+			["id", "question", "options", "deepInterview", "workflowGate"].every(name => Object.hasOwn(properties, name))
+		);
+	});
+	if (!question) throw new Error("Bedrock payload omitted AskTool question schema");
+	expect(question.required).toEqual(["id", "question", "options"]);
+}
 
 const tool: Tool = {
 	name: "read",
@@ -33,6 +74,16 @@ describe("Bedrock tool choice", () => {
 	it("maps required and any to Bedrock any", () => {
 		expect(convertToolConfig([tool], "required")?.toolChoice).toEqual({ any: {} });
 		expect(convertToolConfig([tool], "any")?.toolChoice).toEqual({ any: {} });
+	});
+
+	it("keeps the non-strict AskTool question metadata optional in the final Bedrock declaration", async () => {
+		const tool = await askTool();
+		if (tool.strict !== false) throw new Error("Expected AskTool to opt out of strict schemas");
+		const config = convertToolConfig([tool], "auto");
+		const ask = config?.tools.find(tool => tool.toolSpec.name === "ask");
+		if (!ask) throw new Error("Bedrock conversion omitted AskTool");
+
+		assertLooseAskSchema(ask.toolSpec.inputSchema.json);
 	});
 
 	it("keeps tools but omits toolChoice when resolvedChoice is undefined", () => {

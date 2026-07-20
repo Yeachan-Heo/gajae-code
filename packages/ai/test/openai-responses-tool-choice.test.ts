@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
 import { streamOpenAIResponses } from "../src/providers/openai-responses";
 import type { Model } from "../src/types";
 import {
@@ -13,6 +15,64 @@ import {
 	expectSingleCleanFallbackEvents,
 	testContext,
 } from "./openai-tool-choice-test-helpers";
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function objectsIn(value: unknown): Record<string, unknown>[] {
+	if (Array.isArray(value)) return value.flatMap(objectsIn);
+	if (!isObject(value)) return [];
+	return [value, ...Object.values(value).flatMap(objectsIn)];
+}
+
+async function askTool() {
+	const tool = (
+		await createTools(
+			{
+				cwd: "/tmp/test",
+				hasUI: true,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+			} satisfies ToolSession,
+			["ask"],
+		)
+	).find(candidate => candidate.name === "ask");
+	if (!tool) throw new Error("Expected AskTool to be registered");
+	return tool;
+}
+
+function assertLooseAskSchema(parameters: unknown): void {
+	const question = objectsIn(parameters).find(candidate => {
+		const properties = candidate.properties;
+		return (
+			isObject(properties) &&
+			["id", "question", "options", "deepInterview", "workflowGate"].every(name => Object.hasOwn(properties, name))
+		);
+	});
+	if (!question) throw new Error("OpenAI Responses payload omitted AskTool question schema");
+	expect(question.required).toEqual(["id", "question", "options"]);
+}
+
+async function captureAskPayload(): Promise<Record<string, unknown>> {
+	const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+	const controller = new AbortController();
+	controller.abort();
+	streamOpenAIResponses(
+		model({ provider: "openai", baseUrl: "" }),
+		{
+			messages: [{ role: "user", content: "Confirm", timestamp: 0 }],
+			tools: [await askTool()],
+		},
+		{
+			apiKey: "test-key",
+			signal: controller.signal,
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		},
+	);
+	return promise;
+}
 
 const originalFetch = global.fetch;
 
@@ -76,6 +136,17 @@ describe("OpenAI responses tool choice capability", () => {
 			toolChoice: { type: "function", function: { name: "search" } },
 		}).result();
 		expect(payload?.tool_choice).toEqual({ type: "function", name: "search" });
+	});
+
+	it("keeps the non-strict ask question metadata optional on the final wire payload", async () => {
+		const payload = await captureAskPayload();
+		const ask = (payload.tools as unknown[]).find(
+			candidate => isObject(candidate) && candidate.type === "function" && candidate.name === "ask",
+		);
+		if (!isObject(ask)) throw new Error("OpenAI Responses payload omitted AskTool");
+
+		expect(ask.strict).toBeUndefined();
+		assertLooseAskSchema(ask.parameters);
 	});
 
 	it("omits forced tool_choice but keeps tools when forced choices are unsupported", async () => {

@@ -377,31 +377,40 @@ function extractCompletionData(parsed: unknown): unknown {
 	return parsed;
 }
 
-function normalizeCompleteData(data: unknown, reportFindings?: ReviewFinding[]): unknown {
-	let normalized = parseStringifiedJson(data ?? null);
-	if (
-		Array.isArray(reportFindings) &&
-		reportFindings.length > 0 &&
-		normalized &&
-		typeof normalized === "object" &&
-		!Array.isArray(normalized)
-	) {
-		const record = normalized as Record<string, unknown>;
-		if (!("findings" in record)) {
-			normalized = { ...record, findings: reportFindings };
-		}
-	}
-	return normalized;
+function normalizeCompleteData(data: unknown): unknown {
+	return parseStringifiedJson(data ?? null);
 }
 
-function resolveFallbackCompletion(rawOutput: string, outputSchema: unknown): { data: unknown } | null {
+function projectReportFindings(
+	data: unknown,
+	reportFindings: ReviewFinding[] | undefined,
+	validator: OutputValidator | undefined,
+): { data: unknown; schemaFailure?: { message: string; missingRequired: string[] } } {
+	if (
+		!Array.isArray(reportFindings) ||
+		reportFindings.length === 0 ||
+		!data ||
+		typeof data !== "object" ||
+		Array.isArray(data) ||
+		"findings" in data
+	) {
+		return { data };
+	}
+
+	const enriched = { ...(data as Record<string, unknown>), findings: reportFindings };
+	if (!validator) return { data: enriched };
+	const enrichedVerdict = validator.validate(enriched);
+	if (enrichedVerdict.ok) return { data: enriched };
+
+	const originalVerdict = validator.validate(data);
+	return originalVerdict.ok ? { data } : { data, schemaFailure: originalVerdict };
+}
+
+function resolveFallbackCompletion(rawOutput: string): { data: unknown } | null {
 	const parsed = tryParseJsonOutput(rawOutput);
 	if (parsed === undefined) return null;
 	const candidate = parseStringifiedJson(extractCompletionData(parsed));
 	if (candidate === undefined) return null;
-	const { validator, error } = buildOutputValidator(outputSchema);
-	if (error) return null;
-	if (validator && !validator.validate(candidate).ok) return null;
 	return { data: candidate };
 }
 
@@ -498,35 +507,43 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 			if (submitData === null || submitData === undefined) {
 				rawOutput = rawOutput ? `${SUBAGENT_WARNING_NULL_YIELD}\n\n${rawOutput}` : SUBAGENT_WARNING_NULL_YIELD;
 			} else {
-				const completeData = normalizeCompleteData(submitData, reportFindings);
+				const completeData = normalizeCompleteData(submitData);
 				const { validator, error: schemaError } = buildOutputValidator(outputSchema);
 				if (schemaError) {
 					rawOutput = `{"error":"schema_violation","message":"invalid output schema: ${schemaError.replace(/"/g, '\\"')}"}`;
 					stderr = `schema_violation: invalid output schema: ${schemaError}`;
 					exitCode = 1;
 				} else {
-					const placeholderPath = findPlaceholderYieldPath(completeData);
-					if (placeholderPath) {
-						const outcome = buildPlaceholderYieldOutcome(placeholderPath, completeData);
+					const projection = projectReportFindings(completeData, reportFindings, validator);
+					if (projection.schemaFailure) {
+						const outcome = buildSchemaViolationOutcome(projection.schemaFailure, projection.data);
 						rawOutput = outcome.rawOutput;
 						stderr = outcome.stderr;
 						exitCode = outcome.exitCode;
 					} else {
-						const verdict = validator ? validator.validate(completeData) : { ok: true as const };
-						if (!verdict.ok) {
-							const outcome = buildSchemaViolationOutcome(verdict, completeData);
+						const placeholderPath = findPlaceholderYieldPath(projection.data);
+						if (placeholderPath) {
+							const outcome = buildPlaceholderYieldOutcome(placeholderPath, projection.data);
 							rawOutput = outcome.rawOutput;
 							stderr = outcome.stderr;
 							exitCode = outcome.exitCode;
 						} else {
-							try {
-								rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
-							} catch (err) {
-								const errorMessage = err instanceof Error ? err.message : String(err);
-								rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
+							const verdict = validator ? validator.validate(projection.data) : { ok: true as const };
+							if (!verdict.ok) {
+								const outcome = buildSchemaViolationOutcome(verdict, projection.data);
+								rawOutput = outcome.rawOutput;
+								stderr = outcome.stderr;
+								exitCode = outcome.exitCode;
+							} else {
+								try {
+									rawOutput = JSON.stringify(projection.data, null, 2) ?? "null";
+								} catch (err) {
+									const errorMessage = err instanceof Error ? err.message : String(err);
+									rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
+								}
+								exitCode = 0;
+								stderr = "";
 							}
-							exitCode = 0;
-							stderr = "";
 						}
 					}
 				}
@@ -536,32 +553,40 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 		const allowFallback = exitCode === 0 && !doneAborted && !signalAborted;
 		const { normalized: normalizedSchema, error: schemaError } = normalizeSchema(outputSchema);
 		const hasOutputSchema = normalizedSchema !== undefined && !schemaError;
-		const fallback = allowFallback ? resolveFallbackCompletion(rawOutput, outputSchema) : null;
+		const fallback = allowFallback && !schemaError ? resolveFallbackCompletion(rawOutput) : null;
 		if (fallback) {
-			const completeData = normalizeCompleteData(fallback.data, reportFindings);
+			const completeData = normalizeCompleteData(fallback.data);
 			const { validator } = buildOutputValidator(outputSchema);
-			const placeholderPath = findPlaceholderYieldPath(completeData);
-			if (placeholderPath) {
-				const outcome = buildPlaceholderYieldOutcome(placeholderPath, completeData);
+			const projection = projectReportFindings(completeData, reportFindings, validator);
+			if (projection.schemaFailure) {
+				const outcome = buildSchemaViolationOutcome(projection.schemaFailure, projection.data);
 				rawOutput = outcome.rawOutput;
 				stderr = outcome.stderr;
 				exitCode = outcome.exitCode;
 			} else {
-				const verdict = validator ? validator.validate(completeData) : { ok: true as const };
-				if (!verdict.ok) {
-					const outcome = buildSchemaViolationOutcome(verdict, completeData);
+				const placeholderPath = findPlaceholderYieldPath(projection.data);
+				if (placeholderPath) {
+					const outcome = buildPlaceholderYieldOutcome(placeholderPath, projection.data);
 					rawOutput = outcome.rawOutput;
 					stderr = outcome.stderr;
 					exitCode = outcome.exitCode;
 				} else {
-					try {
-						rawOutput = JSON.stringify(completeData, null, 2) ?? "null";
-					} catch (err) {
-						const errorMessage = err instanceof Error ? err.message : String(err);
-						rawOutput = `{"error":"Failed to serialize fallback completion: ${errorMessage}"}`;
+					const verdict = validator ? validator.validate(projection.data) : { ok: true as const };
+					if (!verdict.ok) {
+						const outcome = buildSchemaViolationOutcome(verdict, projection.data);
+						rawOutput = outcome.rawOutput;
+						stderr = outcome.stderr;
+						exitCode = outcome.exitCode;
+					} else {
+						try {
+							rawOutput = JSON.stringify(projection.data, null, 2) ?? "null";
+						} catch (err) {
+							const errorMessage = err instanceof Error ? err.message : String(err);
+							rawOutput = `{"error":"Failed to serialize fallback completion: ${errorMessage}"}`;
+						}
+						exitCode = 0;
+						stderr = "";
 					}
-					exitCode = 0;
-					stderr = "";
 				}
 			}
 		} else if (!hasOutputSchema && allowFallback && rawOutput.trim().length > 0) {

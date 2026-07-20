@@ -489,6 +489,59 @@ Project executor override body.
 		);
 	});
 
+	it("locks ralplan preflight, persistence retry, and Planner fallback orchestration to bundled prompt contracts", () => {
+		const ralplan = getDefaultGjcDefinitions().find(
+			definition => definition.kind === "skill" && definition.name === "ralplan",
+		);
+		const skill = ralplan?.content ?? "";
+		const persistencePrompts = ["planner", "architect", "critic"].map(
+			name => getBundledAgent(name)?.systemPrompt ?? "",
+		);
+
+		// The native CLI serializes receipts; the skill owns preflight, subagent routing, and retries.
+		expect(skill).toContain("run `gjc ralplan preflight --json` with a 5-second command timeout");
+		expect(skill).toContain("The preflight is read-only");
+		expect(skill).toContain("Persistence-only retry rules are in the bundled persistence fragment");
+		expect(skill).toContain("The Planner is a **same-session persisted subagent**");
+		expect(skill).toContain("Do NOT modify the subagent control surface");
+		expect(skill).toContain("same-parent, active-session continuity only");
+		expect(skill).toContain("not just `.gjc` run-state");
+
+		for (const prompt of persistencePrompts) {
+			expect(prompt).toContain("Run each writer command with a 30-second Bash-tool timeout.");
+			expect(prompt).toContain(
+				"Preserve the exact `GJC_RALPLAN_ARTIFACT` bytes, command arguments, `stage_n`, and digest",
+			);
+			expect(prompt).toContain("Only when the first attempt times out or its transport/receipt outcome is unknown");
+			expect(prompt).toContain("exactly one retry");
+			expect(prompt).toContain("byte-identical command with the same artifact bytes and another 30-second timeout");
+			expect(prompt).toContain("Do not blindly retry an explicit writer error");
+			expect(prompt).toContain("Do not regenerate research or artifact content");
+			expect(prompt).toContain("resume/spawn another role");
+			expect(prompt).toContain("switch Planner context");
+			expect(prompt).toContain("increment `stage_n`");
+			expect(prompt).toContain("charge a consensus iteration");
+			expect(prompt).toContain("structured persistence blocker after the retry is exhausted");
+		}
+
+		for (const outcome of ["running", "queued"]) {
+			const row = skill.match(new RegExp(String.raw`\| \`${outcome}\` \| ([^\n]+) \|`))?.[1] ?? "";
+			expect(row).toContain("same id");
+			expect(row).toContain("do NOT fresh-spawn");
+		}
+		for (const fallbackReason of [
+			"context_unavailable",
+			"not_found",
+			"no_runner",
+			"resume_failed",
+			"process_restart",
+			"missing_record",
+		]) {
+			expect(skill).toContain(fallbackReason);
+		}
+		expect(skill).toContain("Fallback flags are recorded only when a fresh-spawn fallback actually occurs");
+	});
+
 	it("installs bundled workflow skill definitions without overwriting local edits unless forced", async () => {
 		const targetRoot = await makeTempRoot();
 		const initial = await installDefaultGjcDefinitions({ targetRoot });

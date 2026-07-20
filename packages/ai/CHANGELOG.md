@@ -8,6 +8,9 @@
 
 - Added the native Kimi Code `k3` catalog entry with its 1M-token context window, multimodal input, and reasoning support.
 
+### Fixed
+
+- Preserved per-tool strictness opt-outs in final OpenAI Completions, Responses, and Codex Responses declarations so `ask` keeps optional workflow and Deep Interview fields omittable on the provider-visible wire contract.
 ## [0.11.2] - 2026-07-19
 
 ### Fixed

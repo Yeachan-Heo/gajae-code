@@ -87,6 +87,11 @@ export default function lifecycleNotifier(pi: ExtensionAPI) {
 
 This is the supported repo-native lifecycle notification path. It is not Claude Code hook compatibility, and it remains disabled unless the user configures an extension/hook handler and private delivery target.
 
+## Workflow management commands
+
+`gjc ralplan` and `gjc state` are management commands, not agent-launch commands. Launch-only configuration flags must not be prepended to them; misplaced launch configuration exits with status 2 before runtime or model initialization. Wrappers should dispatch management commands unchanged instead of prepending launch flags to every `gjc` invocation.
+
+Ralplan role passes should run `gjc ralplan preflight --json` with a five-second bound before research and after a process restart. Persistence writes use the already-produced artifact, a 30-second attempt, and at most one byte-identical retry when the transport outcome is unknown. Identical retries recover only canonical, uniquely indexed, size-bounded artifacts whose persisted bytes match the recorded SHA-256; persistence-only retries do not advance `stage_n` or consume a consensus iteration.
 ## Memory backends
 
 The agent supports three mutually-exclusive memory backends, selected via the `memory.backend` setting (Settings → Memory tab, or `~/.gjc/agent/config.yml`):

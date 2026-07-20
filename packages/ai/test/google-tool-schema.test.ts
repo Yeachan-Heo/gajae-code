@@ -2,6 +2,47 @@ import { describe, expect, it } from "bun:test";
 import { convertTools } from "@gajae-code/ai/providers/google-shared";
 import type { Model, TJsonSchema, Tool } from "@gajae-code/ai/types";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle } from "@gajae-code/ai/utils/schema";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function objectsIn(value: unknown): Record<string, unknown>[] {
+	if (Array.isArray(value)) return value.flatMap(objectsIn);
+	if (!isObject(value)) return [];
+	return [value, ...Object.values(value).flatMap(objectsIn)];
+}
+
+async function askTool() {
+	const tool = (
+		await createTools(
+			{
+				cwd: "/tmp/test",
+				hasUI: true,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: Settings.isolated(),
+			} satisfies ToolSession,
+			["ask"],
+		)
+	).find(candidate => candidate.name === "ask");
+	if (!tool) throw new Error("Expected AskTool to be registered");
+	return tool;
+}
+
+function assertLooseAskSchema(parameters: unknown): void {
+	const question = objectsIn(parameters).find(candidate => {
+		const properties = candidate.properties;
+		return (
+			isObject(properties) &&
+			["id", "question", "options", "deepInterview", "workflowGate"].every(name => Object.hasOwn(properties, name))
+		);
+	});
+	if (!question) throw new Error("Google payload omitted AskTool question schema");
+	expect(question.required).toEqual(["id", "question", "options"]);
+}
 
 function createModel(id: string): Model<"google-gemini-cli"> {
 	return {
@@ -68,6 +109,24 @@ describe("Cloud Code Assist Claude tool schema conversion", () => {
 				},
 			},
 		});
+	});
+
+	it("keeps the non-strict AskTool question metadata optional in Gemini declarations", async () => {
+		const tool = await askTool();
+		if (tool.strict !== false) throw new Error("Expected AskTool to opt out of strict schemas");
+		const gemini = convertTools([tool], createModel("gemini-2.5-pro"))?.[0]?.functionDeclarations[0];
+		if (!gemini) throw new Error("Google conversion omitted AskTool");
+
+		assertLooseAskSchema(gemini.parametersJsonSchema);
+	});
+
+	it("fails closed to the documented empty schema when CCA cannot represent AskTool unions", async () => {
+		const tool = await askTool();
+		const claude = convertTools([tool], createModel("claude-sonnet-4-5"))?.[0]?.functionDeclarations[0];
+		if (!claude) throw new Error("Cloud Code Assist conversion omitted AskTool");
+
+		expect(claude.parameters).toEqual({ type: "object", properties: {} });
+		expect(claude.parametersJsonSchema).toBeUndefined();
 	});
 
 	it("uses sanitized parameters for claude models with deterministic output", () => {

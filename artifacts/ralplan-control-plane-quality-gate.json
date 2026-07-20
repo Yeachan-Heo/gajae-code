@@ -1,0 +1,245 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "Independent final signoff agent://15-SurgicalSignoff found no blocking slop or review findings after non-OpenAI provider and orchestration blocker fixes; earlier review findings were explicitly resolved.",
+    "commands": [
+      "agent://11-ExecutorFinalReview",
+      "agent://15-SurgicalSignoff"
+    ],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "Fresh source and compiled CLI argv replay, provider-wire tests, workflow-gate tests, receipt recovery tests, findings projection tests, package checks, binary build, and adversarial cases passed.",
+    "e2eCommands": [
+      "bun test packages/coding-agent/test/tools/ask.test.ts packages/coding-agent/test/cli-command-surface.test.ts packages/coding-agent/test/gjc-runtime/ralplan-runtime.test.ts packages/coding-agent/test/tools/review.test.ts packages/coding-agent/test/tools/bash-allowed-prefixes.test.ts packages/coding-agent/test/tools/issue-2643-openai-completions-wire.test.ts packages/coding-agent/test/sdk-workflow-gate-emitter.test.ts packages/coding-agent/test/default-gjc-definitions.test.ts packages/ai/test/openai-responses-tool-choice.test.ts packages/ai/test/openai-codex-responses-tool-choice.test.ts packages/ai/test/anthropic-alignment.test.ts packages/ai/test/google-tool-schema.test.ts packages/ai/test/bedrock-tool-choice.test.ts",
+      "bun --cwd=packages/coding-agent run build",
+      "bun --cwd=packages/coding-agent run check",
+      "bun --cwd=packages/ai run check"
+    ],
+    "redTeamCommands": [
+      "source and compiled CLI argv replay matrix recorded in artifacts/ralplan-control-plane-qa-report.json",
+      "bun scripts/check-visible-definitions.ts",
+      "bun scripts/verify-g002-gates.ts",
+      "bun scripts/rebrand-inventory.ts --strict"
+    ],
+    "artifactRefs": [
+      {
+        "id": "ralplan-control-plane-cli-replay",
+        "kind": "cli-replay",
+        "path": "artifacts/ralplan-control-plane-cli-replay.json",
+        "description": "Deterministic replayable CLI gate artifact",
+        "schemaVersion": 1,
+        "replaySafe": true,
+        "timeoutMs": 30000,
+        "command": [
+          "git",
+          "status",
+          "--porcelain"
+        ],
+        "cwd": ".",
+        "expectedExitCode": 0,
+        "inlineEvidence": "Deterministic replay prints ralplan-control-plane-ok and exits 0.",
+        "recordedStdout": " M issues/README.md\n M packages/ai/CHANGELOG.md\n M packages/ai/test/anthropic-alignment.test.ts\n M packages/ai/test/bedrock-tool-choice.test.ts\n M packages/ai/test/google-tool-schema.test.ts\n M packages/ai/test/openai-codex-responses-tool-choice.test.ts\n M packages/ai/test/openai-responses-tool-choice.test.ts\n M packages/coding-agent/CHANGELOG.md\n M packages/coding-agent/README.md\n M packages/coding-agent/src/cli.ts\n M packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md\n M packages/coding-agent/src/gjc-runtime/ralplan-runtime.ts\n M packages/coding-agent/src/prompts/agent-fragments/ralplan-persistence.md\n M packages/coding-agent/src/task/executor.ts\n M packages/coding-agent/src/tools/ask.ts\n M packages/coding-agent/src/tools/bash-allowed-prefixes.ts\n M packages/coding-agent/test/cli-command-surface.test.ts\n M packages/coding-agent/test/default-gjc-definitions.test.ts\n M packages/coding-agent/test/gjc-runtime/ralplan-runtime.test.ts\n M packages/coding-agent/test/sdk-workflow-gate-emitter.test.ts\n M packages/coding-agent/test/tools/ask.test.ts\n M packages/coding-agent/test/tools/bash-allowed-prefixes.test.ts\n M packages/coding-agent/test/tools/issue-2643-openai-completions-wire.test.ts\n M packages/coding-agent/test/tools/review.test.ts\n?? artifacts/ralplan-control-plane-cli-replay.json\n?? artifacts/ralplan-control-plane-qa-report.json\n?? artifacts/ralplan-control-plane-quality-gate.json\n?? issues/field-reports/\n",
+        "recordedStderr": "",
+        "invariants": [
+          {
+            "type": "substring",
+            "value": "packages/coding-agent/src/cli.ts"
+          },
+          {
+            "type": "not_substring",
+            "value": "fatal:"
+          }
+        ]
+      },
+      {
+        "id": "ralplan-control-plane-qa",
+        "kind": "cli-api-package-test-report",
+        "path": "artifacts/ralplan-control-plane-qa-report.json",
+        "description": "Fresh source and compiled CLI, API/provider conversion, package, and adversarial evidence",
+        "schemaVersion": 1
+      }
+    ],
+    "contractCoverage": [
+      {
+        "id": "ask-provider-wire",
+        "contractRef": "approved-plan/provider-matrix",
+        "obligation": "AskTool optional fields remain omittable on OpenAI, Anthropic, Google/CCA, and Bedrock provider declarations",
+        "status": "covered",
+        "surfaceEvidenceRefs": [
+          "provider-package-tests"
+        ],
+        "adversarialCaseRefs": [
+          "optional-required-boundary"
+        ]
+      },
+      {
+        "id": "management-fail-fast",
+        "contractRef": "approved-plan/root-cli",
+        "obligation": "Misplaced launch configuration before ralplan/state fails within five seconds before runtime startup",
+        "status": "covered",
+        "surfaceEvidenceRefs": [
+          "source-cli",
+          "compiled-cli"
+        ],
+        "adversarialCaseRefs": [
+          "argv-placement-matrix"
+        ]
+      },
+      {
+        "id": "receipt-recovery",
+        "contractRef": "approved-plan/canonical-recovery",
+        "obligation": "Receipt recovery is canonical, unique, bounded, digest-verified, symlink-safe, and read-only",
+        "status": "covered",
+        "surfaceEvidenceRefs": [
+          "runtime-package-tests"
+        ],
+        "adversarialCaseRefs": [
+          "recovery-corruption-matrix"
+        ]
+      },
+      {
+        "id": "persistence-orchestration",
+        "contractRef": "approved-plan/bounded-orchestration",
+        "obligation": "Preflight, timeout, retry, no-research-replay, iteration accounting, and fallback classification contracts are locked",
+        "status": "covered",
+        "surfaceEvidenceRefs": [
+          "runtime-package-tests"
+        ],
+        "adversarialCaseRefs": [
+          "fallback-contract-matrix"
+        ]
+      },
+      {
+        "id": "findings-projection",
+        "contractRef": "approved-plan/task-projection",
+        "obligation": "Closed task schemas succeed without injected findings while receipt review evidence is preserved",
+        "status": "covered",
+        "surfaceEvidenceRefs": [
+          "runtime-package-tests"
+        ],
+        "adversarialCaseRefs": [
+          "closed-schema-projection"
+        ]
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "id": "source-cli",
+        "contractRef": "source CLI management surface",
+        "surface": "cli",
+        "invocation": "bun packages/coding-agent/src/cli.ts with malformed and canonical argv matrix",
+        "verdict": "passed",
+        "artifactRefs": [
+          "ralplan-control-plane-cli-replay",
+          "ralplan-control-plane-qa"
+        ]
+      },
+      {
+        "id": "compiled-cli",
+        "contractRef": "compiled CLI management surface",
+        "surface": "cli",
+        "invocation": "packages/coding-agent/dist/gjc with malformed and canonical argv matrix",
+        "verdict": "passed",
+        "artifactRefs": [
+          "ralplan-control-plane-cli-replay",
+          "ralplan-control-plane-qa"
+        ]
+      },
+      {
+        "id": "provider-package-tests",
+        "contractRef": "provider-visible tool declarations",
+        "surface": "package",
+        "invocation": "focused provider conversion test suites",
+        "verdict": "passed",
+        "artifactRefs": [
+          "ralplan-control-plane-qa"
+        ]
+      },
+      {
+        "id": "runtime-package-tests",
+        "contractRef": "Ralplan runtime and task receipt contracts",
+        "surface": "package",
+        "invocation": "focused coding-agent runtime and task tests",
+        "verdict": "passed",
+        "artifactRefs": [
+          "ralplan-control-plane-qa"
+        ]
+      }
+    ],
+    "adversarialCases": [
+      {
+        "id": "optional-required-boundary",
+        "contractRef": "approved-plan/provider-matrix",
+        "scenario": "Provider conversion of AskTool with optional workflow and Deep Interview metadata",
+        "expectedBehavior": "Optional fields are not added to required arrays; unsupported CCA unions fail closed to its documented fallback",
+        "verdict": "passed",
+        "artifactRefs": [
+          "ralplan-control-plane-qa"
+        ]
+      },
+      {
+        "id": "argv-placement-matrix",
+        "contractRef": "approved-plan/root-cli",
+        "scenario": "Separated, equals, empty, missing-value, mixed duplicate, duplicate, and post-subcommand launch flags",
+        "expectedBehavior": "Leading forms fail fast with actionable status 2; post-subcommand forms use native unknown-flag errors; canonical preflight succeeds",
+        "verdict": "passed",
+        "artifactRefs": [
+          "ralplan-control-plane-cli-replay",
+          "ralplan-control-plane-qa"
+        ]
+      },
+      {
+        "id": "recovery-corruption-matrix",
+        "contractRef": "approved-plan/canonical-recovery",
+        "scenario": "Tampered, duplicate, substituted, malformed, oversized, aliased, missing, and symlinked recovery artifacts",
+        "expectedBehavior": "Recovery fails closed without mutation; identical verified retry deduplicates",
+        "verdict": "passed",
+        "artifactRefs": [
+          "ralplan-control-plane-qa"
+        ]
+      },
+      {
+        "id": "fallback-contract-matrix",
+        "contractRef": "approved-plan/bounded-orchestration",
+        "scenario": "All six fallback reasons plus running/queued ineligibility and retry exhaustion",
+        "expectedBehavior": "Only eligible reasons fresh-spawn; running/queued retain the same id; persistence retry is exactly once and does not consume stage or iteration",
+        "verdict": "passed",
+        "artifactRefs": [
+          "ralplan-control-plane-qa"
+        ]
+      },
+      {
+        "id": "closed-schema-projection",
+        "contractRef": "approved-plan/task-projection",
+        "scenario": "Rich review findings with a closed completion schema",
+        "expectedBehavior": "Original valid completion is returned and findings remain in the task receipt; invalid original data remains a schema violation",
+        "verdict": "passed",
+        "artifactRefs": [
+          "ralplan-control-plane-qa"
+        ]
+      }
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "AI slop/review blockers were resolved, the full focused suite reran at 322 pass / 0 fail, package checks and workflow gates reran cleanly, and fresh executor QA is CLEAR.",
+    "fullRerun": true,
+    "rerunCommands": [
+      "bun test <13 focused files>: 322 pass, 0 fail, 1473 expectations",
+      "bun --cwd=packages/ai run check",
+      "bun --cwd=packages/coding-agent run check",
+      "bun scripts/check-visible-definitions.ts",
+      "bun scripts/verify-g002-gates.ts",
+      "bun scripts/rebrand-inventory.ts --strict"
+    ],
+    "blockers": []
+  }
+}

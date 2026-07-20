@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json";
+import { managementCommandMcpConfigError } from "../src/cli";
 import { parseArgs } from "../src/cli/args";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
@@ -233,6 +234,39 @@ describe("GJC public CLI command surface", () => {
 			await fs.rm(home, { recursive: true, force: true });
 		}
 	}, 15_000);
+});
+
+describe("root launch-only MCP configuration", () => {
+	it("rejects leading MCP configuration before management commands before runtime startup", () => {
+		const cases = [
+			["--mcp-config", "tools.json", "ralplan"],
+			["--mcp-config=tools.json", "state"],
+			["--mcp-config=", "ralplan"],
+			["--mcp-config", "state"],
+			["--mcp-config", "first.json", "--mcp-config=second.json", "state"],
+		] as const;
+
+		for (const argv of cases) {
+			const result = Bun.spawnSync(["bun", cliEntry, ...argv], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+
+			expect(result.exitCode, `${argv.join(" ")}\n${output}`).toBe(2);
+			expect(output).toContain("remove it for management commands");
+			expect(output).toContain("only with launch");
+			expect(output).not.toContain("Failed to load pi_natives");
+		}
+	});
+
+	it("leaves ordinary launch arguments and post-subcommand unknown flags outside the root guard", () => {
+		expect(managementCommandMcpConfigError(["--mcp-config", "tools.json", "summarize"])).toBeUndefined();
+		expect(managementCommandMcpConfigError(["ralplan", "--mcp-config", "tools.json"])).toBeUndefined();
+		expect(managementCommandMcpConfigError(["--mcp-config-path=tools.json", "ralplan"])).toBeUndefined();
+		expect(managementCommandMcpConfigError(["--mcp-configuration=tools.json", "state"])).toBeUndefined();
+	});
 });
 
 describe("startup login parsing", () => {
