@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs";
 import net from "node:net";
+import path from "node:path";
 
 const MAX_FRAME_BYTES = 4096;
 const CONTROL_TTL_MS = 10_000;
@@ -47,7 +48,7 @@ function parse(frame: Buffer): Bootstrap {
 		frame.fill(0);
 	}
 }
-async function main(): Promise<void> {
+export async function runSessionHostSelfExitFixture(): Promise<void> {
 	const bootstrap = parse(readFrame());
 	closeFd3();
 	const token = Buffer.from(bootstrap.token, "base64");
@@ -72,21 +73,29 @@ async function main(): Promise<void> {
 		if (!accepted) process.exit(1);
 		socket.off("data", onHandshakeData);
 		// The parent sends one authenticated self-exit capability after broker exit.
-		socket.once("data", (command: Buffer) => {
+		let exitReceived = Buffer.alloc(0);
+		const onExitData = (command: Buffer): void => {
+			exitReceived = Buffer.concat([exitReceived, command]);
+			command.fill(0);
+			if (exitReceived.length < 36) return;
+			socket.off("data", onExitData);
 			const exit = proof(token, "SSH1-exit", bootstrap.requestId);
 			const valid =
-				command.length === 36 &&
-				command.subarray(0, 4).toString("ascii") === "EXT1" &&
-				timingSafeEqual(command.subarray(4), exit);
+				exitReceived.length === 36 &&
+				exitReceived.subarray(0, 4).toString("ascii") === "EXT1" &&
+				timingSafeEqual(exitReceived.subarray(4), exit);
 			exit.fill(0);
-			command.fill(0);
+			exitReceived.fill(0);
+			exitReceived = Buffer.alloc(0);
 			token.fill(0);
 			clearTimeout(timer);
 			if (!valid) process.exit(1);
 			socket.end("BYE1", () => process.exit(0));
-		});
+		};
+		socket.on("data", onExitData);
 	};
 	socket.on("data", onHandshakeData);
 	socket.once("end", () => process.exit(1));
 }
-void main().catch(() => process.exit(1));
+if (path.basename(process.argv[1] ?? "") === "sdk-session-host-self-exit-entry.ts")
+	void runSessionHostSelfExitFixture().catch(() => process.exit(1));

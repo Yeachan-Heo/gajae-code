@@ -4,6 +4,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { Writable } from "node:stream";
+import { runSessionHostSelfExitFixture } from "./sdk-session-host-self-exit-entry";
 
 const MAX_FRAME_BYTES = 4096;
 const SESSION_FIXTURE_BASENAME = `sdk-session-host-self-exit-fixture${process.platform === "win32" ? ".exe" : ""}`;
@@ -97,7 +98,11 @@ async function main(): Promise<void> {
 		closeFd3();
 	}
 }
-void main().catch(() => {
-	closeFd3();
-	process.exitCode = 1;
-});
+if (path.basename(process.execPath) === SESSION_FIXTURE_BASENAME) {
+	void runSessionHostSelfExitFixture().catch(() => process.exit(1));
+} else {
+	void main().catch(() => {
+		closeFd3();
+		process.exitCode = 1;
+	});
+}
