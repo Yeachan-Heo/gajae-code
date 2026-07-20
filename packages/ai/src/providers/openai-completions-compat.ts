@@ -244,7 +244,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		requiresAssistantContentForToolCalls: isKimiModel || isDirectDeepseekReasoning,
 		openRouterRouting: undefined,
 		vercelGatewayRouting: undefined,
-		supportsStrictMode: detectStrictModeSupport(provider, baseUrl),
+		supportsStrictMode: detectStrictModeSupport(provider, baseUrl) && !(isDeepseekFamily && isOpenRouter),
 		extraBody: isDirectDeepseekReasoning ? { thinking: { type: "enabled" } } : undefined,
 		toolStrictMode: isCerebras ? "all_strict" : "mixed",
 	};
