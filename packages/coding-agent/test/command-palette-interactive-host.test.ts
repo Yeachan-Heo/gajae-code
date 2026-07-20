@@ -3,7 +3,11 @@ import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import type { LoadedCustomCommand } from "@gajae-code/coding-agent/extensibility/custom-commands";
-import { ExtensionRunner, loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions";
+import {
+	ExtensionRunner,
+	loadExtensions,
+	type RegisteredCommand,
+} from "@gajae-code/coding-agent/extensibility/extensions";
 import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
 import { CommandPaletteComponent } from "@gajae-code/coding-agent/modes/components/command-palette";
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
@@ -125,7 +129,7 @@ async function createHost(): Promise<InteractivePaletteHost> {
 			name: "extension:demo",
 			description: "Extension command",
 			handler: extension,
-		} satisfies NonNullable<ReturnType<ExtensionRunner["getCommand"]>>;
+		} satisfies RegisteredCommand;
 		const loadedExtensions = await loadExtensions([], tempDir.path());
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		const extensionRunner = new ExtensionRunner(
