@@ -88,7 +88,8 @@ impl std::error::Error for InputError {}
 /// Returns `None` for unrecognized names.
 #[must_use]
 pub fn key_code_for(name: &str) -> Option<u16> {
-	let code = match name.to_ascii_lowercase().as_str() {
+	let lowered = name.to_ascii_lowercase();
+	let code = match lowered.as_str() {
 		"return" | "enter" => 36,
 		"tab" => 48,
 		"space" => 49,
@@ -98,9 +99,130 @@ pub fn key_code_for(name: &str) -> Option<u16> {
 		"right" | "arrowright" => 124,
 		"down" | "arrowdown" => 125,
 		"up" | "arrowup" => 126,
+		// Modifiers (left-side codes; combos are expressed as "cmd+q").
+		"cmd" | "command" | "meta" | "super" => 55,
+		"shift" => 56,
+		"capslock" => 57,
+		"option" | "alt" => 58,
+		"ctrl" | "control" => 59,
+		"fn" | "function" => 63,
+		// Navigation cluster.
+		"home" => 115,
+		"end" => 119,
+		"pageup" => 116,
+		"pagedown" => 121,
+		"forwarddelete" => 117,
+		"help" | "insert" => 114,
+		// Function keys.
+		"f1" => 122,
+		"f2" => 120,
+		"f3" => 99,
+		"f4" => 118,
+		"f5" => 96,
+		"f6" => 97,
+		"f7" => 98,
+		"f8" => 100,
+		"f9" => 101,
+		"f10" => 109,
+		"f11" => 103,
+		"f12" => 111,
+		"f13" => 105,
+		"f14" => 107,
+		"f15" => 113,
+		"f16" => 106,
+		"f17" => 64,
+		"f18" => 79,
+		"f19" => 80,
+		"f20" => 90,
+		_ => return single_char_key_code(&lowered),
+	};
+	Some(code)
+}
+
+/// ANSI-layout virtual key code for a single printable character.
+#[must_use]
+fn single_char_key_code(name: &str) -> Option<u16> {
+	let mut chars = name.chars();
+	let ch = chars.next()?;
+	if chars.next().is_some() {
+		return None;
+	}
+	let code = match ch {
+		'a' => 0,
+		's' => 1,
+		'd' => 2,
+		'f' => 3,
+		'h' => 4,
+		'g' => 5,
+		'z' => 6,
+		'x' => 7,
+		'c' => 8,
+		'v' => 9,
+		'b' => 11,
+		'q' => 12,
+		'w' => 13,
+		'e' => 14,
+		'r' => 15,
+		'y' => 16,
+		't' => 17,
+		'1' => 18,
+		'2' => 19,
+		'3' => 20,
+		'4' => 21,
+		'6' => 22,
+		'5' => 23,
+		'=' => 24,
+		'9' => 25,
+		'7' => 26,
+		'-' => 27,
+		'8' => 28,
+		'0' => 29,
+		']' => 30,
+		'o' => 31,
+		'u' => 32,
+		'[' => 33,
+		'i' => 34,
+		'p' => 35,
+		'l' => 37,
+		'j' => 38,
+		'\'' => 39,
+		'k' => 40,
+		';' => 41,
+		'\\' => 42,
+		',' => 43,
+		'/' => 44,
+		'n' => 45,
+		'm' => 46,
+		'.' => 47,
+		'`' => 50,
 		_ => return None,
 	};
 	Some(code)
+}
+
+/// Resolve one `keys` entry into the chord of key codes it presses together.
+///
+/// A bare name (`"escape"`) is a single-code chord; a `+`-joined name
+/// (`"cmd+shift+q"`) holds every part in order and releases in reverse, which
+/// is how shortcuts like Cmd-Q are expressed.
+///
+/// # Errors
+/// Returns [`InputError::UnknownKey`] carrying the original entry when any
+/// part is unrecognized or the entry is empty.
+pub fn key_chord_for(name: &str) -> Result<Vec<u16>, InputError> {
+	// A literal "+" key (or a chord ending in one, e.g. "shift+=") would split
+	// into an empty part, so resolve exact single-character names first.
+	if let Some(code) = key_code_for(name) {
+		return Ok(vec![code]);
+	}
+	let parts: Vec<&str> = name.split('+').map(str::trim).collect();
+	if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
+		return Err(InputError::UnknownKey(name.to_string()));
+	}
+	parts
+		.iter()
+		.map(|part| key_code_for(part).ok_or_else(|| InputError::UnknownKey(name.to_string())))
+		.collect()
 }
 
 /// Orchestrates input actions over an [`EventSink`], tracking held buttons so
@@ -255,16 +377,27 @@ impl<S: EventSink> InputController<S> {
 		self.sink.type_unicode(text);
 	}
 
-	/// Press and release each named key in order.
+	/// Press and release each named entry in order. A `+`-joined entry
+	/// (`"cmd+q"`) is a chord: every part is held down in order and released
+	/// in reverse, so modifier shortcuts work; a bare entry keeps the original
+	/// press/release behavior.
 	///
 	/// # Errors
-	/// Returns [`InputError::UnknownKey`] when a name is unrecognized; keys
-	/// before the failure have already been sent.
+	/// Returns [`InputError::UnknownKey`] when an entry is unrecognized; every
+	/// entry is resolved before anything is sent, so a failing entry emits no
+	/// events at all.
 	pub fn keypress(&mut self, keys: &[String]) -> Result<(), InputError> {
-		for name in keys {
-			let code = key_code_for(name).ok_or_else(|| InputError::UnknownKey(name.clone()))?;
-			self.sink.key(code, true);
-			self.sink.key(code, false);
+		let chords: Vec<Vec<u16>> = keys
+			.iter()
+			.map(|name| key_chord_for(name))
+			.collect::<Result<_, _>>()?;
+		for chord in chords {
+			for code in &chord {
+				self.sink.key(*code, true);
+			}
+			for code in chord.iter().rev() {
+				self.sink.key(*code, false);
+			}
 		}
 		Ok(())
 	}
@@ -494,7 +627,9 @@ mod mac {
 
 #[cfg(test)]
 mod tests {
-	use super::{EventSink, InputController, InputError, MouseButton, SinkOp, key_code_for};
+	use super::{
+		EventSink, InputController, InputError, MouseButton, SinkOp, key_chord_for, key_code_for,
+	};
 	use crate::computer::coords::{LogicalPoint, NormalizedDisplay};
 
 	#[derive(Default)]
@@ -650,6 +785,57 @@ mod tests {
 		assert_eq!(key_code_for("ESC"), Some(53));
 		assert_eq!(key_code_for("up"), Some(126));
 		assert_eq!(key_code_for("nope"), None);
+	}
+
+	#[test]
+	fn key_code_table_covers_modifiers_function_and_character_keys() {
+		assert_eq!(key_code_for("cmd"), Some(55));
+		assert_eq!(key_code_for("Command"), Some(55));
+		assert_eq!(key_code_for("meta"), Some(55));
+		assert_eq!(key_code_for("shift"), Some(56));
+		assert_eq!(key_code_for("option"), Some(58));
+		assert_eq!(key_code_for("alt"), Some(58));
+		assert_eq!(key_code_for("ctrl"), Some(59));
+		assert_eq!(key_code_for("F15"), Some(113));
+		assert_eq!(key_code_for("f1"), Some(122));
+		assert_eq!(key_code_for("home"), Some(115));
+		assert_eq!(key_code_for("pagedown"), Some(121));
+		assert_eq!(key_code_for("q"), Some(12));
+		assert_eq!(key_code_for("A"), Some(0));
+		assert_eq!(key_code_for("0"), Some(29));
+		assert_eq!(key_code_for("/"), Some(44));
+		assert_eq!(key_code_for("qq"), None);
+	}
+
+	#[test]
+	fn keypress_chords_hold_modifiers_and_release_in_reverse() {
+		let mut c = InputController::new(RecordingSink::default());
+		c.keypress(&["cmd+q".to_string()]).unwrap();
+		assert_eq!(c.ops_ref(), &[
+			SinkOp::Key { code: 55, down: true },
+			SinkOp::Key { code: 12, down: true },
+			SinkOp::Key { code: 12, down: false },
+			SinkOp::Key { code: 55, down: false },
+		]);
+	}
+
+	#[test]
+	fn keypress_chord_with_unknown_part_emits_nothing() {
+		let mut c = InputController::new(RecordingSink::default());
+		let err = c
+			.keypress(&["escape".to_string(), "cmd+nope".to_string()])
+			.unwrap_err();
+		assert!(matches!(err, InputError::UnknownKey(name) if name == "cmd+nope"));
+		assert!(c.ops_ref().is_empty());
+	}
+
+	#[test]
+	fn key_chord_rejects_dangling_plus_and_resolves_bare_names() {
+		assert_eq!(key_chord_for("escape").unwrap(), vec![53]);
+		assert_eq!(key_chord_for("cmd+shift+q").unwrap(), vec![55, 56, 12]);
+		assert!(matches!(key_chord_for("cmd+"), Err(InputError::UnknownKey(_))));
+		assert!(matches!(key_chord_for("+q"), Err(InputError::UnknownKey(_))));
+		assert!(matches!(key_chord_for(""), Err(InputError::UnknownKey(_))));
 	}
 
 	// Test-only helpers on the controller.

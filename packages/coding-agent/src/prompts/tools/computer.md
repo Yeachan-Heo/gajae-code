@@ -27,7 +27,14 @@ The model action object uses exactly these snake_case actions and fields:
 - `drag` — `x`, `y`, `to_x`, `to_y`, optional `button`.
 - `scroll` — `x`, `y`, `scroll_x`, `scroll_y`.
 - `type` — `text`.
-- `keypress` — `keys` string array.
+- `keypress` — `keys` string array. Each entry is pressed and released in
+  order. Key names are case-insensitive: named keys (`Return`/`Enter`, `Tab`,
+  `Space`, `Delete`/`Backspace`, `Escape`, arrows, `Home`, `End`, `PageUp`,
+  `PageDown`, `F1`–`F20`), modifiers (`Cmd`/`Command`/`Meta`, `Shift`,
+  `Option`/`Alt`, `Ctrl`/`Control`, `Fn`), and single characters (`a`–`z`,
+  `0`–`9`, common punctuation). Join names with `+` for a held shortcut chord,
+  e.g. `["cmd+q"]` or `["cmd+shift+s"]` — modifiers stay held until the chord
+  completes and release in reverse order.
 - `wait` — `ms`.
 - `batch` — `actions`: a non-empty array of the single actions above. Steps run in order and the result includes per-step status and the last screenshot captured inside the batch.
 
