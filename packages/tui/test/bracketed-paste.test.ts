@@ -70,4 +70,48 @@ describe("BracketedPasteHandler", () => {
 			remaining: "\x1b[200~two\x1b[201~",
 		});
 	});
+
+	it("keeps buffering a slow multi-chunk paste when idle gaps stay under the timeout", () => {
+		const handler = new BracketedPasteHandler();
+		let now = 1_000_000;
+		expect(handler.process("\x1b[200~line1\n", now)).toEqual({ handled: true, leading: "", remaining: "" });
+
+		// Stream for >1s total with small idle gaps (old wall-clock timer would truncate).
+		for (let i = 0; i < 30; i++) {
+			now += 100;
+			expect(handler.process(`chunk-${i}\n`, now)).toEqual({ handled: true, leading: "", remaining: "" });
+		}
+
+		expect(handler.process("\x1b[201~", now + 10)).toEqual({
+			handled: true,
+			leading: "",
+			pasteContent: "line1\n" + Array.from({ length: 30 }, (_, i) => `chunk-${i}\n`).join(""),
+			remaining: "",
+		});
+	});
+
+	it("refreshes the idle timer so a 1.1s gap after recent chunks does not flush early", () => {
+		const handler = new BracketedPasteHandler();
+		const t0 = 2_000_000;
+		expect(handler.process("\x1b[200~a", t0)).toEqual({ handled: true, leading: "", remaining: "" });
+		expect(handler.process("b", t0 + 1_100)).toEqual({ handled: true, leading: "", remaining: "" });
+		expect(handler.process("\x1b[201~", t0 + 1_200)).toEqual({
+			handled: true,
+			leading: "",
+			pasteContent: "ab",
+			remaining: "",
+		});
+	});
+
+	it("still flushes when no chunk arrives for the full idle timeout", () => {
+		const handler = new BracketedPasteHandler();
+		expect(handler.process("\x1b[200~partial", 0)).toEqual({ handled: true, leading: "", remaining: "" });
+		expect(handler.process("more", BRACKETED_PASTE_FRAME_TIMEOUT_MS + 1)).toEqual({
+			handled: true,
+			leading: "",
+			pasteContent: "partial",
+			remaining: "more",
+		});
+	});
+
 });

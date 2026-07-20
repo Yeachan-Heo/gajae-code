@@ -1,8 +1,11 @@
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
-export const BRACKETED_PASTE_FRAME_TIMEOUT_MS = 1_000;
-export const BRACKETED_PASTE_FRAME_MAX_BYTES = 1024 * 1024;
+// Idle timeout between chunks (not total paste duration). Long pastes on
+// Windows Terminal / ConPTY can take many seconds to stream; resetting the
+// timer on each chunk avoids truncating mid-paste.
+export const BRACKETED_PASTE_FRAME_TIMEOUT_MS = 5_000;
+export const BRACKETED_PASTE_FRAME_MAX_BYTES = 8 * 1024 * 1024;
 
 export type PasteResult =
 	| { handled: false }
@@ -63,7 +66,10 @@ export class BracketedPasteHandler {
 				? this.#flushActive(data)
 				: { handled: true, leading: `${this.#flushBuffered()}${data}`, remaining: "" };
 		}
-		if (this.hasPendingFrame && data === "\x1b") {
+		// Lone ESC while waiting for more paste data can mean the user cancelled,
+		// but only treat it as cancel when we are not mid-frame of a multi-chunk
+		// paste that already has content (Windows can deliver odd splits).
+		if (this.hasPendingFrame && data === "\x1b" && !(this.#active && this.#buffer.length > 0)) {
 			return this.#active
 				? this.#flushActive(data)
 				: { handled: true, leading: `${this.#flushBuffered()}${data}`, remaining: "" };
@@ -99,9 +105,12 @@ export class BracketedPasteHandler {
 			this.#leading += combined.slice(0, startIndex);
 			this.#buffer = combined.slice(startIndex + PASTE_START.length);
 			this.#active = true;
-			this.#pendingSince ??= now;
+			this.#pendingSince = now;
 		} else {
 			this.#buffer += data;
+			// Refresh idle clock on each chunk so total paste duration is unbounded
+			// as long as the terminal keeps streaming content.
+			this.#pendingSince = now;
 		}
 
 		const endIndex = this.#buffer.indexOf(PASTE_END);
