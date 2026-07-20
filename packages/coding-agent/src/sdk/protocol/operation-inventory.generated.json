@@ -2810,6 +2810,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:promoteRecoveryHydrationAfterOwnershipReadyFence",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal owner-recovery authority transition after a durable writer fence, never a user-facing SDK operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:continuePersistedHistory",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
