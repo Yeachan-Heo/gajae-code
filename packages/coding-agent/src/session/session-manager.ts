@@ -4959,13 +4959,20 @@ export class SessionManager {
 				}
 			}
 			if (entry.type === "message" && entry.message.role === "assistant") {
+				// A malformed or torn-write persisted assistant entry can be missing `usage`
+				// entirely (concurrent multi-writer / NFS corruption produces parseable-but-
+				// malformed lines). parseSessionEntries already tolerates unparseable lines via
+				// parseJsonlLenient; the load-path aggregation must not fatally deref usage and
+				// take down the whole resume for one bad entry.
 				const usage = entry.message.usage;
-				this.#usageStatistics.input += usage.input;
-				this.#usageStatistics.output += usage.output;
-				this.#usageStatistics.cacheRead += usage.cacheRead;
-				this.#usageStatistics.cacheWrite += usage.cacheWrite;
-				this.#usageStatistics.premiumRequests += usage.premiumRequests ?? 0;
-				this.#usageStatistics.cost += usage.cost.total;
+				if (usage) {
+					this.#usageStatistics.input += usage.input;
+					this.#usageStatistics.output += usage.output;
+					this.#usageStatistics.cacheRead += usage.cacheRead;
+					this.#usageStatistics.cacheWrite += usage.cacheWrite;
+					this.#usageStatistics.premiumRequests += usage.premiumRequests ?? 0;
+					this.#usageStatistics.cost += usage.cost?.total ?? 0;
+				}
 			}
 
 			if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "task") {
