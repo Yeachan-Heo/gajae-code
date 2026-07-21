@@ -1346,9 +1346,20 @@ export class TUI extends Container {
 	 * the transcript top during streaming redraws, so viewport-repaint sessions
 	 * keep force off and let `#doRender` repaint only the live viewport. Set
 	 * `PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER=1` to restore the legacy tmux redraw.
+	 *
+	 * Spurious resize events (SIGWINCH with unchanged dimensions — iTerm2 tab
+	 * switches and window focus changes, the self-sent SIGWINCH after resume)
+	 * must not force either: on hosts still using the `fullRender` path (legacy
+	 * multiplexer opt-in, non-process terminals) the forced redraw clears
+	 * scrollback (`2J`/`H`/`3J`) and replays the whole transcript, which can
+	 * park the native viewport at the transcript top. Only force when the grid
+	 * size actually changed since the last committed frame; a plain diff render
+	 * is a no-op otherwise.
 	 */
 	requestResizeRender(): void {
-		this.requestRender(!useViewportRepaintPath(this.terminal), "resize");
+		const dimensionsChanged =
+			this.#previousWidth !== this.terminal.columns || this.#previousHeight !== this.terminal.rows;
+		this.requestRender(dimensionsChanged && !useViewportRepaintPath(this.terminal), "resize");
 	}
 
 	requestRender(force = false, source = "unknown"): void {

@@ -5,6 +5,10 @@
 
 - Internal transcript PageUp/PageDown now continues through tool-output and other non-semantic rows instead of intermittently becoming a no-op after a semantic viewport anchor was established.
 
+### Fixed
+
+- Spurious resize events with unchanged terminal dimensions (iTerm2 tab switches and window focus changes deliver SIGWINCH without a size change) no longer trigger a forced full redraw. On hosts still using the full clear+replay path (legacy multiplexer opt-in, non-process terminals) that redraw cleared scrollback (`2J`/`H`/`3J`) and replayed the entire transcript, which could park the native viewport at the top of the thread when returning to the tab. `requestResizeRender()` now forces only when the grid size actually changed since the last committed frame; same-size events fall through to a no-op diff render.
+
 ## [0.11.4] - 2026-07-20
 ### Fixed
 
