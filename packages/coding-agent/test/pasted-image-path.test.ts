@@ -26,7 +26,7 @@ describe("resolvePastedImagePath", () => {
 		expect(resolvePastedImagePath(missing)).toBe(missing);
 	});
 
-	it("rejects non-image extensions, prose, multiline text, and empty input", () => {
+	it("accepts terminal line endings but rejects non-path multiline text", () => {
 		const clipboard = path.join(os.tmpdir(), "clipboard-2026-07-19-123456-Ab3.png");
 		expect(resolvePastedImagePath(clipboard.replace(/\.png$/, ".txt"))).toBeUndefined();
 		expect(resolvePastedImagePath(`look at ${clipboard}`)).toBeUndefined();
@@ -34,7 +34,8 @@ describe("resolvePastedImagePath", () => {
 		expect(resolvePastedImagePath("   ")).toBeUndefined();
 		expect(resolvePastedImagePath(`${clipboard} please`)).toBeUndefined();
 		expect(resolvePastedImagePath(`\n${clipboard}`)).toBeUndefined();
-		expect(resolvePastedImagePath(`${clipboard}\n`)).toBeUndefined();
+		expect(resolvePastedImagePath(`${clipboard}\n`)).toBe(clipboard);
+		expect(resolvePastedImagePath(`${clipboard}\r\n`)).toBe(clipboard);
 		expect(resolvePastedImagePath(`"${clipboard}"`)).toBe(clipboard);
 		expect(resolvePastedImagePath(`./${path.basename(clipboard)}`, { cwd: os.tmpdir() })).toBe(clipboard);
 	});

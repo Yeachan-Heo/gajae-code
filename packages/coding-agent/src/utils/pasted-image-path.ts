@@ -257,8 +257,9 @@ function isRecognizedClipboardTempPath(filePath: string, platform: NodeJS.Platfo
 /** Resolve one recognized clipboard-temp image path lexically, before any filesystem access. */
 export function resolvePastedImagePath(text: string, options: ResolvePastedImagePathOptions = {}): string | undefined {
 	const platform = options.platform ?? process.platform;
-	if (/[\r\n]/.test(text)) return undefined;
-	const candidates = decodePastedPathCandidates(text, options, 1);
+	const terminalNewlinesTrimmed = text.replace(/(?:\r\n|\r|\n)+$/, "");
+	if (/\r|\n/.test(terminalNewlinesTrimmed)) return undefined;
+	const candidates = decodePastedPathCandidates(terminalNewlinesTrimmed, options, 1);
 	if (candidates?.length !== 1) return undefined;
 	const candidate = candidates[0];
 	if (!IMAGE_FILE_EXTENSION_PATTERN.test(candidate)) return undefined;
