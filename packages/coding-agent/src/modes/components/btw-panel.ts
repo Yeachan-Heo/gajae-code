@@ -1,5 +1,10 @@
 import { type Component, Container, Markdown, Spacer, Text, type TUI } from "@gajae-code/tui";
-import { BTW_MAX_ANSWER_UTF8_BYTES, BTW_MAX_CONTEXT_TURNS, truncateUtf8 } from "../../session/btw-contract";
+import {
+	BTW_MAX_ANSWER_UTF8_BYTES,
+	BTW_MAX_CONTEXT_TURNS,
+	sanitizeBtwError,
+	truncateUtf8,
+} from "../../session/btw-contract";
 import { replaceTabs } from "../../tools/render-utils";
 import { getMarkdownTheme, theme } from "../theme/theme";
 import { DynamicBorder } from "./dynamic-border";
@@ -37,8 +42,10 @@ export class BtwPanelComponent extends Container {
 
 	beginTurn(question: string): void {
 		if (this.#closed) return;
-		this.#completedTurns.push(this.#currentTurn());
-		if (this.#completedTurns.length > BTW_MAX_CONTEXT_TURNS) this.#completedTurns.shift();
+		if (this.#state === "complete") {
+			this.#completedTurns.push(this.#currentTurn());
+			if (this.#completedTurns.length > BTW_MAX_CONTEXT_TURNS) this.#completedTurns.shift();
+		}
 		this.#question = question;
 		this.#answer = "";
 		this.#errorMessage = undefined;
@@ -75,7 +82,8 @@ export class BtwPanelComponent extends Container {
 	markError(message: string): void {
 		if (this.#closed) return;
 		this.#state = "error";
-		this.#errorMessage = message;
+		this.#answer = "";
+		this.#errorMessage = sanitizeBtwError(message);
 		this.#rebuild();
 	}
 

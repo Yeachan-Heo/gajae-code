@@ -218,8 +218,10 @@ describe("AgentSession /btw isolation", () => {
 
 		const turn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "virtual btw prompt",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: {
+				question: "virtual btw prompt",
+				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
 		});
 		(harness.committed.content[0] as { type: "text"; text: string }).text = "mutated after invocation";
 		await turn;
@@ -269,8 +271,10 @@ describe("AgentSession /btw isolation", () => {
 
 		const turn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "snapshot prompt",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: {
+				question: "snapshot prompt",
+				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
 		});
 		harness.session.agent.setSystemPrompt(["mutated system"]);
 		key.resolve("test-key");
@@ -286,7 +290,7 @@ describe("AgentSession /btw isolation", () => {
 		const scope = harness.session.createBtwConversationScope("btw test instruction");
 		harness.session.agent.setModel(replacement);
 
-		await harness.session.runEphemeralTurn({ purpose: "btw", question: "frozen", scope });
+		await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "frozen", scope } });
 
 		expect(original.calls).toHaveLength(1);
 		expect(replacement.calls).toHaveLength(0);
@@ -300,8 +304,10 @@ describe("AgentSession /btw isolation", () => {
 
 		await harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "affinity check",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: {
+				question: "affinity check",
+				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
 		});
 
 		expect(harness.getApiKey.mock.calls[0]?.[1]).toBe("main-cache-affinity");
@@ -331,8 +337,10 @@ describe("AgentSession /btw isolation", () => {
 		try {
 			const sideTurn = harness.session.runEphemeralTurn({
 				purpose: "btw",
-				question: "side request",
-				scope: harness.session.createBtwConversationScope("btw test instruction"),
+				turn: {
+					question: "side request",
+					scope: harness.session.createBtwConversationScope("btw test instruction"),
+				},
 				onTextDelta: delta => sideFirstEvent.resolve(delta),
 			});
 
@@ -369,8 +377,7 @@ describe("AgentSession /btw isolation", () => {
 		await expect(
 			harness.session.runEphemeralTurn({
 				purpose: "btw",
-				question: "fail once",
-				scope: harness.session.createBtwConversationScope("btw test instruction"),
+				turn: { question: "fail once", scope: harness.session.createBtwConversationScope("btw test instruction") },
 			}),
 		).rejects.toThrow("503 service unavailable");
 		expect(model.calls).toHaveLength(1);
@@ -397,8 +404,7 @@ describe("AgentSession /btw isolation", () => {
 		);
 		const sideTurn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "deadline",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: { question: "deadline", scope: harness.session.createBtwConversationScope("btw test instruction") },
 		});
 		const sideCall = await controlled.sideStarted;
 		await drainSyntheticStart();
@@ -434,8 +440,7 @@ describe("AgentSession /btw isolation", () => {
 		const providerProgress = Promise.withResolvers<string>();
 		const sideTurn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "established",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: { question: "established", scope: harness.session.createBtwConversationScope("btw test instruction") },
 			onTextDelta: providerProgress.resolve,
 		});
 		const sideCall = await controlled.sideStarted;
@@ -462,8 +467,7 @@ describe("AgentSession /btw isolation", () => {
 		const staleController = new AbortController();
 		const staleTurn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "stale",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: { question: "stale", scope: harness.session.createBtwConversationScope("btw test instruction") },
 			signal: staleController.signal,
 		});
 		await drainToProvider(model);
@@ -471,8 +475,7 @@ describe("AgentSession /btw isolation", () => {
 		staleController.abort(new Error("replaced"));
 		const replacementTurn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "replacement",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: { question: "replacement", scope: harness.session.createBtwConversationScope("btw test instruction") },
 		});
 		await expect(staleTurn).rejects.toThrow();
 		await expect(replacementTurn).resolves.toMatchObject({ replyText: "replacement" });
@@ -494,8 +497,7 @@ describe("AgentSession /btw isolation", () => {
 		await expect(
 			harness.session.runEphemeralTurn({
 				purpose: "btw",
-				question: "cancelled",
-				scope: harness.session.createBtwConversationScope("btw test instruction"),
+				turn: { question: "cancelled", scope: harness.session.createBtwConversationScope("btw test instruction") },
 				signal: controller.signal,
 			}),
 		).rejects.toThrow("replaced before setup");
@@ -509,8 +511,10 @@ describe("AgentSession /btw isolation", () => {
 		const controller = new AbortController();
 		const turn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "cancel during credentials",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: {
+				question: "cancel during credentials",
+				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
 			signal: controller.signal,
 		});
 		controller.abort(new Error("replaced during credentials"));
@@ -525,8 +529,7 @@ describe("AgentSession /btw isolation", () => {
 		const controller = new AbortController();
 		const turn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "cancelled",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: { question: "cancelled", scope: harness.session.createBtwConversationScope("btw test instruction") },
 			signal: controller.signal,
 		});
 		await Promise.resolve();

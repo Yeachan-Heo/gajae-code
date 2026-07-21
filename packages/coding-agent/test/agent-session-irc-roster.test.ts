@@ -105,8 +105,7 @@ async function ephemeral(harness: Harness, purpose: EphemeralTurnPurpose, text =
 	if (purpose === "btw") {
 		await harness.session.runEphemeralTurn({
 			purpose,
-			question: text,
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: { question: text, scope: harness.session.createBtwConversationScope("btw test instruction") },
 		});
 		return;
 	}
@@ -255,8 +254,7 @@ describe("AgentSession IRC roster delivery", () => {
 		const historyDuringMain = [...harness.session.agent.state.messages];
 		const side = await harness.session.runEphemeralTurn({
 			purpose: "btw",
-			question: "side request",
-			scope: harness.session.createBtwConversationScope("btw test instruction"),
+			turn: { question: "side request", scope: harness.session.createBtwConversationScope("btw test instruction") },
 		});
 
 		expect(side.replyText).toBe("ok");

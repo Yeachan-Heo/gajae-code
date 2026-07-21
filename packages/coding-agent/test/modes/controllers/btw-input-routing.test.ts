@@ -153,6 +153,23 @@ describe("InputController /btw multi-turn routing", () => {
 		expect(editor.getText()).toBe("REAL_EDITOR_BUSY_SENTINEL");
 	});
 
+	it("routes the initial /btw command before extension input observers", async () => {
+		const harness = createHarness({ btwOpen: false });
+		const emitInput = vi.fn(async () => undefined);
+		const mutable = harness.ctx as unknown as {
+			pendingImages: unknown[];
+			session: { extensionRunner: { hasHandlers: () => boolean; emitInput: typeof emitInput } };
+		};
+		mutable.pendingImages = [{ type: "image", data: "INITIAL_PRIVATE_IMAGE", mimeType: "image/png" }];
+		mutable.session.extensionRunner = { hasHandlers: () => true, emitInput };
+
+		await submit(harness, "/btw INITIAL_PRIVATE_COMMAND_SENTINEL");
+
+		expect(harness.ctx.handleBtwCommand).toHaveBeenCalledWith("INITIAL_PRIVATE_COMMAND_SENTINEL");
+		expect(emitInput).not.toHaveBeenCalled();
+		expect(mutable.pendingImages).toEqual([]);
+	});
+
 	it("keeps slash-origin input on normal dispatch, including a prompt-returning command", async () => {
 		const harness = createHarness({ btwOpen: true });
 		await submit(harness, "/btw a known slash");

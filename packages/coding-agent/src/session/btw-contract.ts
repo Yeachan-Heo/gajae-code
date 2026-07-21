@@ -2,6 +2,7 @@ export const BTW_MAX_CONTEXT_TURNS = 12;
 export const BTW_MAX_CONTEXT_UTF8_BYTES = 64 * 1024;
 export const BTW_MAX_QUESTION_UTF8_BYTES = 16 * 1024;
 export const BTW_MAX_ANSWER_UTF8_BYTES = 32 * 1024;
+export const BTW_MAX_ERROR_UTF8_BYTES = 4 * 1024;
 export const BTW_STREAM_IDLE_TIMEOUT_MS = 30_000;
 export const BTW_STREAM_TOTAL_TIMEOUT_MS = 120_000;
 
@@ -27,6 +28,14 @@ export function truncateUtf8(text: string, maxBytes: number): string {
 	return result;
 }
 
+export function sanitizeBtwError(text: string): string {
+	const sanitized = text
+		.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, " ")
+		.replace(/[\u202A-\u202E\u2066-\u2069]/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	return truncateUtf8(sanitized || "Side-chat request failed.", BTW_MAX_ERROR_UTF8_BYTES);
+}
 export function exchangeUtf8Bytes(exchange: BtwTextExchange): number {
 	return utf8ByteLength(exchange.question) + utf8ByteLength(exchange.answer);
 }

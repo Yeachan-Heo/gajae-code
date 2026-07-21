@@ -1,9 +1,10 @@
 import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
-import type { BtwConversationScope } from "../../session/agent-session";
+import type { BtwConversationScope, BtwTurnCapture } from "../../session/agent-session";
 import {
 	BTW_MAX_QUESTION_UTF8_BYTES,
 	type BtwTextExchange,
 	boundBtwExchanges,
+	sanitizeBtwError,
 	utf8ByteLength,
 } from "../../session/btw-contract";
 import { BtwPanelComponent } from "../components/btw-panel";
@@ -11,11 +12,15 @@ import type { InteractiveModeContext } from "../types";
 
 type BtwFollowUpResult = "accepted" | "busy" | "closed" | "rejected";
 
+interface ActiveBtwTurn extends BtwTurnCapture {
+	abortController: AbortController | undefined;
+	active: boolean;
+}
+
 interface BtwRequest {
 	component: BtwPanelComponent;
-	abortController: AbortController | undefined;
-	scope: BtwConversationScope | undefined;
-	question: string;
+	conversationScope: BtwConversationScope | undefined;
+	activeTurn: ActiveBtwTurn | undefined;
 	inFlight: boolean;
 	contextExchanges: BtwTextExchange[];
 }
@@ -73,9 +78,8 @@ export class BtwController {
 		const trimmedQuestion = question.trim();
 		if (!trimmedQuestion) return "closed";
 		if (!this.#acceptQuestion(trimmedQuestion)) return "rejected";
-		if (!request.scope) return "closed";
-		request.question = trimmedQuestion;
-		request.abortController = new AbortController();
+		if (!request.conversationScope) return "closed";
+		request.activeTurn = this.#createTurn(trimmedQuestion, request.conversationScope);
 		request.inFlight = true;
 		request.component.beginTurn(trimmedQuestion);
 		void this.#runRequest(request);
@@ -94,12 +98,15 @@ export class BtwController {
 		return false;
 	}
 
+	#createTurn(question: string, scope: BtwConversationScope): ActiveBtwTurn {
+		return { question, scope, abortController: new AbortController(), active: true };
+	}
+
 	#openRequest(question: string, scope: BtwConversationScope): BtwRequest {
 		const request: BtwRequest = {
 			component: new BtwPanelComponent({ question, tui: this.ctx.ui }),
-			abortController: new AbortController(),
-			scope,
-			question,
+			conversationScope: scope,
+			activeTurn: this.#createTurn(question, scope),
 			inFlight: true,
 			contextExchanges: [],
 		};
@@ -111,58 +118,67 @@ export class BtwController {
 	}
 
 	async #runRequest(request: BtwRequest): Promise<void> {
-		const abortController = request.abortController;
-		const scope = request.scope;
-		if (!abortController || !scope) return;
-		const question = request.question;
+		const turn = request.activeTurn;
+		const abortController = turn?.abortController;
+		if (!turn?.scope || !abortController) return;
 		try {
 			const { replyText } = await this.ctx.session.runEphemeralTurn({
 				purpose: "btw",
-				question,
-				scope,
+				turn,
 				contextExchanges: request.contextExchanges.map(exchange => ({ ...exchange })),
 				onTextDelta: delta => {
-					if (this.#isActiveRequest(request)) request.component.appendText(delta);
+					if (turn.active && this.#isActiveRequest(request)) request.component.appendText(delta);
 				},
 				signal: abortController.signal,
 			});
-			if (!this.#isActiveRequest(request)) return;
+			if (!turn.active || !this.#isActiveRequest(request)) return;
 			request.inFlight = false;
-			request.contextExchanges = boundBtwExchanges([...request.contextExchanges, { question, answer: replyText }]);
+			request.contextExchanges = boundBtwExchanges([
+				...request.contextExchanges,
+				{ question: turn.question, answer: replyText },
+			]);
 			if (replyText) request.component.setAnswer(replyText);
 			request.component.markComplete();
-		} catch (error) {
-			if (!this.#isActiveRequest(request)) return;
+		} catch {
+			if (!turn.active || !this.#isActiveRequest(request)) return;
 			request.inFlight = false;
 			if (abortController.signal.aborted) {
 				request.component.markAborted();
 				return;
 			}
-			const message = error instanceof Error ? error.message : String(error);
-			request.contextExchanges = boundBtwExchanges([
-				...request.contextExchanges,
-				{ question, answer: `Error: ${message}` },
-			]);
-			request.component.markError(message);
+			request.component.markError(sanitizeBtwError("Side-chat request failed."));
+		} finally {
+			if (request.activeTurn === turn) request.activeTurn = undefined;
+			this.#scrubTurn(turn);
 		}
+	}
+
+	#scrubTurn(turn: ActiveBtwTurn): void {
+		turn.active = false;
+		turn.question = "";
+		turn.abortController = undefined;
+		turn.scope = undefined;
 	}
 
 	#closeActiveRequest(): void {
 		const request = this.#activeRequest;
 		if (!request) return;
 		this.#activeRequest = undefined;
-		const abortController = request.abortController;
-		request.abortController = undefined;
-		request.question = "";
+		const turn = request.activeTurn;
+		const abortController = turn?.abortController;
+		if (turn) this.#scrubTurn(turn);
+		request.activeTurn = undefined;
 		request.contextExchanges.splice(0);
 		request.inFlight = false;
-		if (request.scope) {
-			request.scope.messages.splice(0);
-			request.scope.systemPrompt.splice(0);
-			request.scope = undefined;
+		if (request.conversationScope) {
+			request.conversationScope.messages.splice(0);
+			request.conversationScope.systemPrompt.splice(0);
+			request.conversationScope = undefined;
 		}
 		abortController?.abort();
 		request.component.close();
+		this.ctx.editor?.setText("");
+		this.ctx.pendingImages = [];
 		this.ctx.btwContainer.clear();
 		this.ctx.ui.requestRender();
 	}

@@ -122,8 +122,7 @@ describe("AgentSession ephemeral context", () => {
 
 		await session.runEphemeralTurn({
 			purpose: "btw",
-			question: "current prompt",
-			scope: session.createBtwConversationScope("btw test instruction"),
+			turn: { question: "current prompt", scope: session.createBtwConversationScope("btw test instruction") },
 			contextExchanges,
 		});
 
@@ -136,6 +135,12 @@ describe("AgentSession ephemeral context", () => {
 			"user:current prompt",
 		]);
 		expect(JSON.stringify(providerContexts[0]?.messages)).not.toContain("thinking");
+		expect(
+			providerContexts[0]?.messages.every(message => {
+				const keys = Object.keys(message).sort();
+				return keys.length === 2 && keys[0] === "content" && keys[1] === "role";
+			}),
+		).toBe(true);
 		expect(contextExchanges).toEqual(contextBefore);
 		expect(session.messages).toEqual(sessionBefore);
 		expect(model.calls[0]?.context.tools).toEqual([]);
@@ -150,8 +155,10 @@ describe("AgentSession ephemeral context", () => {
 
 		await session.runEphemeralTurn({
 			purpose: "btw",
-			question: "private current prompt",
-			scope: session.createBtwConversationScope("btw test instruction"),
+			turn: {
+				question: "private current prompt",
+				scope: session.createBtwConversationScope("btw test instruction"),
+			},
 			contextExchanges: [{ question: "private prior question", answer: "private prior answer" }],
 		});
 

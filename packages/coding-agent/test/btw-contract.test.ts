@@ -3,8 +3,10 @@ import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
 	BTW_MAX_CONTEXT_TURNS,
 	BTW_MAX_CONTEXT_UTF8_BYTES,
+	BTW_MAX_ERROR_UTF8_BYTES,
 	boundBtwExchanges,
 	exchangeUtf8Bytes,
+	sanitizeBtwError,
 	truncateUtf8,
 	utf8ByteLength,
 } from "@gajae-code/coding-agent/session/btw-contract";
@@ -30,5 +32,12 @@ describe("/btw bounded text contract", () => {
 		expect(bounded.reduce((total, exchange) => total + exchangeUtf8Bytes(exchange), 0)).toBeLessThanOrEqual(
 			BTW_MAX_CONTEXT_UTF8_BYTES,
 		);
+	});
+	it("sanitizes controls and bounds provider errors by UTF-8 bytes", () => {
+		const bounded = sanitizeBtwError(`provider\u0000\u202E${"한".repeat(BTW_MAX_ERROR_UTF8_BYTES)}`);
+		expect(bounded).not.toContain("\u0000");
+		expect(bounded).not.toContain("\u202E");
+		expect(bounded.endsWith("�")).toBe(false);
+		expect(utf8ByteLength(bounded)).toBeLessThanOrEqual(BTW_MAX_ERROR_UTF8_BYTES);
 	});
 });

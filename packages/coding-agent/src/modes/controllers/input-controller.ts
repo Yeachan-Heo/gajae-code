@@ -764,6 +764,18 @@ export class InputController {
 			}
 		}
 
+		if (/^\/btw(?:\s|$)/.test(text)) {
+			const slashResult = await executeBuiltinSlashCommand(text, {
+				ctx: this.ctx,
+				handleBackgroundCommand: () => this.handleBackgroundCommand(),
+				composer,
+			});
+			if (slashResult === true) {
+				this.ctx.pendingImages = [];
+				return;
+			}
+		}
+
 		// Empty submit while streaming with queued messages: flush queues immediately
 		if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
 			// Abort current stream and let queued messages be processed

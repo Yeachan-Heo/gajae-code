@@ -1,7 +1,11 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { BtwPanelComponent } from "@gajae-code/coding-agent/modes/components/btw-panel";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { BTW_MAX_CONTEXT_TURNS } from "@gajae-code/coding-agent/session/btw-contract";
+import {
+	BTW_MAX_CONTEXT_TURNS,
+	BTW_MAX_ERROR_UTF8_BYTES,
+	utf8ByteLength,
+} from "@gajae-code/coding-agent/session/btw-contract";
 import type { Component, TUI } from "@gajae-code/tui";
 
 beforeAll(async () => {
@@ -75,5 +79,20 @@ describe("BtwPanelComponent retained rendering", () => {
 		const rendered = renderTree(panel);
 		expect(rendered).not.toContain("q0");
 		expect(rendered).toContain(`q${BTW_MAX_CONTEXT_TURNS + 2}`);
+	});
+	it("bounds provider errors and discards failed turns before the next question", () => {
+		const panel = new BtwPanelComponent({ question: "FAILED_PRIVATE_QUESTION", tui: makeTui() });
+		panel.appendText("PARTIAL_PRIVATE_ANSWER");
+		panel.markError(`RAW_PROVIDER_SENTINEL\u0000${"é".repeat(BTW_MAX_ERROR_UTF8_BYTES)}`);
+
+		const failed = renderTree(panel);
+		expect(failed).not.toContain("PARTIAL_PRIVATE_ANSWER");
+		const visibleError = failed.match(/RAW_PROVIDER_SENTINEL[^\n]*/)?.[0] ?? "";
+		expect(utf8ByteLength(visibleError)).toBeLessThanOrEqual(BTW_MAX_ERROR_UTF8_BYTES);
+
+		panel.beginTurn("recovery");
+		const recovered = renderTree(panel);
+		expect(recovered).not.toContain("FAILED_PRIVATE_QUESTION");
+		expect(recovered).not.toContain("RAW_PROVIDER_SENTINEL");
 	});
 });

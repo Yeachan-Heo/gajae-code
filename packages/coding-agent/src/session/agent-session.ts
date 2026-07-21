@@ -846,10 +846,15 @@ interface EphemeralTurnBaseArgs {
 	signal?: AbortSignal;
 }
 
+export interface BtwRoleTextMessage {
+	role: "user" | "assistant";
+	text: string;
+}
+
 export interface BtwConversationScope {
 	model: Model;
 	systemPrompt: string[];
-	messages: Message[];
+	messages: BtwRoleTextMessage[];
 	thinkingLevel: ThinkingLevel;
 	hideThinkingSummary: boolean;
 	serviceTier: ServiceTier | undefined;
@@ -858,11 +863,15 @@ export interface BtwConversationScope {
 	sideSessionId: string;
 }
 
+export interface BtwTurnCapture {
+	question: string;
+	scope: BtwConversationScope | undefined;
+}
+
 export type EphemeralTurnArgs =
 	| (Omit<EphemeralTurnBaseArgs, "promptText"> & {
 			purpose: "btw";
-			question: string;
-			scope: BtwConversationScope;
+			turn: BtwTurnCapture;
 			contextExchanges?: readonly BtwTextExchange[];
 	  })
 	| (EphemeralTurnBaseArgs & {
@@ -14036,8 +14045,8 @@ export class AgentSession {
 		};
 	}
 
-	#projectBtwVisibleText(messages: readonly AgentMessage[]): Message[] {
-		const projected: Message[] = [];
+	#projectBtwVisibleText(messages: readonly AgentMessage[]): BtwRoleTextMessage[] {
+		const projected: BtwRoleTextMessage[] = [];
 		for (const message of messages) {
 			if (message.role !== "user" && message.role !== "assistant") continue;
 			const text = (
@@ -14049,16 +14058,7 @@ export class AgentSession {
 							.join("")
 			).trim();
 			if (!text) continue;
-			if (message.role === "user") {
-				projected.push({
-					role: "user",
-					content: [{ type: "text", text }],
-					attribution: "user",
-					timestamp: 0,
-				});
-				continue;
-			}
-			projected.push(this.#buildBtwAssistantMessage(text));
+			projected.push({ role: message.role, text });
 		}
 		return projected;
 	}
@@ -14163,31 +14163,34 @@ export class AgentSession {
 	}
 
 	async #runBtwTurn(args: Extract<EphemeralTurnArgs, { purpose: "btw" }>): Promise<EphemeralTurnResult> {
-		const { scope } = args;
-		if (utf8ByteLength(args.question) > BTW_MAX_QUESTION_UTF8_BYTES) {
+		const model = args.turn.scope?.model;
+		const credentialSessionId = args.turn.scope?.credentialSessionId;
+		if (!model || !credentialSessionId) throw new Error("The /btw conversation scope was scrubbed.");
+		if (utf8ByteLength(args.turn.question) > BTW_MAX_QUESTION_UTF8_BYTES) {
 			throw new RangeError(`/btw questions are limited to ${BTW_MAX_QUESTION_UTF8_BYTES} UTF-8 bytes.`);
 		}
-		const apiKey = await awaitEphemeralAbort(
-			this.#modelRegistry.getApiKey(scope.model, scope.credentialSessionId),
-			args.signal,
-		);
-		if (!apiKey) throw new Error(`No API key for ${scope.model.provider}/${scope.model.id}`);
-		const messages = [...scope.messages];
+		const apiKey = await awaitEphemeralAbort(this.#modelRegistry.getApiKey(model, credentialSessionId), args.signal);
+		if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		const scope = args.turn.scope;
+		if (!scope) throw new Error("The /btw conversation scope was scrubbed.");
+		const messages = scope.messages.map(message => ({
+			role: message.role,
+			content: [{ type: "text" as const, text: message.text }],
+		})) as Message[];
 		for (const exchange of boundBtwExchanges(args.contextExchanges ?? [])) {
 			messages.push({
 				role: "user",
 				content: [{ type: "text", text: exchange.question }],
-				attribution: "user",
-				timestamp: 0,
-			});
-			messages.push(this.#buildBtwAssistantMessage(exchange.answer));
+			} as Message);
+			messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: exchange.answer }],
+			} as Message);
 		}
 		messages.push({
 			role: "user",
-			content: [{ type: "text", text: args.question }],
-			attribution: "user",
-			timestamp: 0,
-		});
+			content: [{ type: "text", text: args.turn.question }],
+		} as Message);
 		const context: Context = { systemPrompt: scope.systemPrompt, messages, tools: [] };
 		const timeoutAbort = new AbortController();
 		const requestSignal = args.signal ? AbortSignal.any([args.signal, timeoutAbort.signal]) : timeoutAbort.signal;

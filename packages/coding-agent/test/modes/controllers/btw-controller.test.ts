@@ -30,8 +30,7 @@ function createAssistantMessage(text: string): AssistantMessage {
 
 interface RunEphemeralTurnArgs {
 	purpose: "btw";
-	question: string;
-	scope: unknown;
+	turn: { question: string; scope: { messages: unknown[]; systemPrompt: string[] } | undefined };
 	contextExchanges?: readonly BtwTextExchange[];
 	onTextDelta?: (delta: string) => void;
 	signal?: AbortSignal;
@@ -59,6 +58,8 @@ function makeCtx(session: InteractiveModeContext["session"], btwContainer = new 
 		ui: { requestRender: vi.fn() } as unknown as TUI,
 		btwContainer,
 		session,
+		editor: { setText: vi.fn() },
+		pendingImages: [],
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 	} as unknown as InteractiveModeContext;
@@ -70,10 +71,13 @@ beforeAll(async () => {
 
 describe("BtwController", () => {
 	it("dispatches the question with a frozen scope and fresh signal", async () => {
-		const runEphemeralTurn = vi.fn(async (_args: RunEphemeralTurnArgs) => ({
-			replyText: "Answer",
-			assistantMessage: createAssistantMessage("Answer"),
-		}));
+		let dispatchedQuestion: string | undefined;
+		let dispatchedScope: unknown;
+		const runEphemeralTurn = vi.fn(async (args: RunEphemeralTurnArgs) => {
+			dispatchedQuestion = args.turn.question;
+			dispatchedScope = args.turn.scope;
+			return { replyText: "Answer", assistantMessage: createAssistantMessage("Answer") };
+		});
 		const ctx = makeCtx(makeFakeSession(runEphemeralTurn));
 		const controller = new BtwController(ctx);
 
@@ -85,8 +89,8 @@ describe("BtwController", () => {
 		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
 		const callArg = runEphemeralTurn.mock.calls[0]?.[0];
 		expect(callArg).toBeDefined();
-		expect(callArg?.question).toBe("What changed?");
-		expect(callArg?.scope).toBeDefined();
+		expect(dispatchedQuestion).toBe("What changed?");
+		expect(dispatchedScope).toBeDefined();
 		expect(callArg?.purpose).toBe("btw");
 		expect(callArg?.signal).toBeInstanceOf(AbortSignal);
 		expect(typeof callArg?.onTextDelta).toBe("function");
@@ -94,10 +98,11 @@ describe("BtwController", () => {
 	});
 
 	it("keeps structural and bidi user text out of the static side-chat instruction", async () => {
-		const runEphemeralTurn = vi.fn(async (_args: RunEphemeralTurnArgs) => ({
-			replyText: "Answer",
-			assistantMessage: createAssistantMessage("Answer"),
-		}));
+		let dispatchedQuestion: string | undefined;
+		const runEphemeralTurn = vi.fn(async (args: RunEphemeralTurnArgs) => {
+			dispatchedQuestion = args.turn.question;
+			return { replyText: "Answer", assistantMessage: createAssistantMessage("Answer") };
+		});
 		const session = makeFakeSession(runEphemeralTurn);
 		const instructionFactory = session.createBtwConversationScope as Mock<(instruction: string) => unknown>;
 		const controller = new BtwController(makeCtx(session));
@@ -106,7 +111,7 @@ describe("BtwController", () => {
 		await controller.start(sentinel);
 		await Promise.resolve();
 
-		expect(runEphemeralTurn.mock.calls[0]?.[0].question).toBe(sentinel);
+		expect(dispatchedQuestion).toBe(sentinel);
 		expect(instructionFactory.mock.calls[0]?.[0]).not.toContain("PRIVATE_OVERRIDE");
 	});
 
@@ -142,7 +147,8 @@ describe("BtwController", () => {
 		await Promise.resolve();
 
 		const rendered = Bun.stripANSI(btwContainer.render(80).join("\n"));
-		expect(rendered).toContain("side establishment failed");
+		expect(rendered).toContain("Side-chat request failed.");
+		expect(rendered).not.toContain("side establishment failed");
 		expect(session.abort).not.toHaveBeenCalled();
 		expect(session.waitForIdle).not.toHaveBeenCalled();
 	});
@@ -153,12 +159,15 @@ describe("BtwController", () => {
 		const btwContainer = new Container();
 		const ctx = makeCtx(makeFakeSession(runEphemeralTurn), btwContainer);
 		const controller = new BtwController(ctx);
+		ctx.pendingImages = [{ type: "image", data: "PRIVATE_IMAGE", mimeType: "image/png" }];
 
 		await controller.start("Question?");
 		expect(btwContainer.children).toHaveLength(1);
 		expect(controller.handleEscape()).toBe(true);
 		expect(btwContainer.children).toHaveLength(0);
 		expect(controller.hasActiveRequest()).toBe(false);
+		expect(ctx.editor.setText).toHaveBeenCalledWith("");
+		expect(ctx.pendingImages).toEqual([]);
 		pending.resolve({ replyText: "dismissed", assistantMessage: createAssistantMessage("dismissed") });
 		await Promise.resolve();
 	});
@@ -191,13 +200,17 @@ describe("BtwController", () => {
 	});
 	it("replays completed /btw turns as text-only visible exchanges", async () => {
 		const firstAssistant = createAssistantMessage("First answer");
-		const runEphemeralTurn = vi
-			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
-			.mockResolvedValueOnce({ replyText: "First answer", assistantMessage: firstAssistant })
-			.mockResolvedValueOnce({
-				replyText: "Second answer",
-				assistantMessage: createAssistantMessage("Second answer"),
+		const dispatched: Array<{ question: string; contextExchanges: readonly BtwTextExchange[] }> = [];
+		const replies = [firstAssistant, createAssistantMessage("Second answer")];
+		const runEphemeralTurn = vi.fn(async (args: RunEphemeralTurnArgs) => {
+			dispatched.push({
+				question: args.turn.question,
+				contextExchanges: args.contextExchanges?.map(exchange => ({ ...exchange })) ?? [],
 			});
+			const assistantMessage = replies.shift()!;
+			const replyText = assistantMessage.content[0]?.type === "text" ? assistantMessage.content[0].text : "";
+			return { replyText, assistantMessage };
+		});
 		const ctx = makeCtx(makeFakeSession(runEphemeralTurn));
 		const controller = new BtwController(ctx);
 
@@ -211,9 +224,10 @@ describe("BtwController", () => {
 		await Promise.resolve();
 		await Promise.resolve();
 
-		const secondCall = runEphemeralTurn.mock.calls[1]?.[0];
-		expect(secondCall?.question).toBe("Second question?");
-		expect(secondCall?.contextExchanges).toEqual([{ question: "First question?", answer: "First answer" }]);
+		expect(dispatched[1]).toEqual({
+			question: "Second question?",
+			contextExchanges: [{ question: "First question?", answer: "First answer" }],
+		});
 		expect(controller.isTurnInFlight()).toBe(false);
 	});
 
@@ -263,7 +277,7 @@ describe("BtwController", () => {
 		expect(controller.hasOpenPanel()).toBe(false);
 	});
 
-	it("records failed /btw turns so later follow-ups can see the failed question", async () => {
+	it("drops failed /btw turns and provider errors before later follow-ups", async () => {
 		const runEphemeralTurn = vi
 			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
 			.mockRejectedValueOnce(new Error("provider unavailable"))
@@ -284,9 +298,7 @@ describe("BtwController", () => {
 		await Promise.resolve();
 
 		const retryCall = runEphemeralTurn.mock.calls[1]?.[0];
-		expect(retryCall?.contextExchanges).toEqual([
-			{ question: "Failed question?", answer: "Error: provider unavailable" },
-		]);
+		expect(retryCall?.contextExchanges).toEqual([]);
 	});
 
 	it("aborts and scrubs /btw state synchronously on Escape", async () => {
@@ -302,6 +314,8 @@ describe("BtwController", () => {
 		await controller.start("private question");
 		expect(controller.handleEscape()).toBe(true);
 		expect(capturedArgs?.signal?.aborted).toBe(true);
+		expect(capturedArgs?.turn.question).toBe("");
+		expect(capturedArgs?.turn.scope).toBeUndefined();
 		expect(controller.hasOpenPanel()).toBe(false);
 		expect(await controller.submitFollowUp("must not survive")).toBe("closed");
 		capturedArgs?.onTextDelta?.("LATE_PRIVATE_DELTA");
