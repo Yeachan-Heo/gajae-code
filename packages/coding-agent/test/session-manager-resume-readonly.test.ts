@@ -7,6 +7,7 @@ import {
 	createReadonlySessionManager,
 	parseSessionEntries,
 	type ResumeSessionIdentity,
+	resolveResumableSession,
 	SessionManager,
 	type StrictSessionOpenResult,
 	sessionArtifactCapability,
@@ -19,14 +20,16 @@ import {
 	type SessionStorageWriter,
 } from "@gajae-code/coding-agent/session/session-storage";
 import * as native from "@gajae-code/natives";
-import { getSessionsDir } from "@gajae-code/utils";
+import { getSessionsDir, getTerminalSessionsDir } from "@gajae-code/utils";
 import { resolveManagedScope } from "../src/session/internal/managed-session-scope";
+import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const dir of tempDirs.splice(0)) await fs.promises.rm(dir, { recursive: true, force: true });
+	vi.restoreAllMocks();
 });
 
 function makeTempDir(): string {
@@ -753,19 +756,258 @@ describe("CLI session picker deletion scope", () => {
 });
 
 describe("active managed picker root", () => {
-	it("lists from a custom agent root instead of the process-global root", async () => {
+	it("shares a custom managed root between default picker inventory and strict-open preparation", async () => {
 		const root = makeTempDir();
 		const agentDir = path.join(root, "custom-agent");
 		const cwd = path.join(root, "workspace");
 		fs.mkdirSync(cwd, { recursive: true });
-		const sessionDir = SessionManager.getDefaultSessionDir(cwd, agentDir);
-		const manager = SessionManager.create(cwd, sessionDir);
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
 		manager.appendMessage({ role: "user", content: "custom root", timestamp: 1 });
 		await manager.ensureOnDisk();
 		await manager.flush();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected managed session file");
 
-		const listed = await SessionManager.listForResumePickerReadOnly(cwd, sessionDir);
-
+		const listed = await SessionManager.listManagedForResumePickerReadOnly(cwd, agentDir);
 		expect(listed.map(session => session.id)).toContain(manager.getSessionId());
+		const resolvedById = await resolveResumableSession(manager.getSessionId(), cwd, undefined, undefined, agentDir);
+		expect(resolvedById).toMatchObject({ scope: "local", session: { path: sessionFile } });
+		const inspection = await SessionManager.inspectSessionTailReadOnly(sessionFile);
+		if (inspection.kind === "error") throw new Error("Expected resumable inspection");
+		const opened = await SessionManager.openExistingStrict(inspection.identity, destination);
+		expect(opened.kind).toBe("opened");
+		if (opened.kind === "error") throw new Error("Expected strict open");
+		await opened.manager.close();
+	});
+	it("does not let an outside terminal breadcrumb override an explicit resume directory", async () => {
+		const root = makeTempDir();
+		const cwd = path.join(root, "workspace");
+		const explicitDirectory = path.join(root, "explicit");
+		const outsideDirectory = path.join(root, "outside");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(explicitDirectory);
+		const outside = SessionManager.create(cwd, SessionManager.explicitDestination(outsideDirectory));
+		outside.appendMessage({ role: "user", content: "outside", timestamp: 1 });
+		await outside.ensureOnDisk();
+		await outside.flush();
+		const outsideFile = outside.getSessionFile();
+		if (!outsideFile) throw new Error("Expected outside session file");
+		await outside.close();
+		const originalTmux = process.env.TMUX;
+		const originalPane = process.env.TMUX_PANE;
+		const pane = `%explicit-resume-${Date.now()}-${Math.random()}`;
+		const breadcrumbFile = path.join(getTerminalSessionsDir(), `tmux-${pane}`);
+		process.env.TMUX = "/tmp/test-tmux,1,0";
+		process.env.TMUX_PANE = pane;
+		try {
+			fs.mkdirSync(getTerminalSessionsDir(), { recursive: true });
+			fs.symlinkSync(
+				outsideDirectory,
+				path.join(explicitDirectory, "escape"),
+				process.platform === "win32" ? "junction" : "dir",
+			);
+			fs.writeFileSync(
+				breadcrumbFile,
+				`${cwd}\n${path.join(explicitDirectory, "escape", path.basename(outsideFile))}\n`,
+			);
+			const resumed = await SessionManager.continueRecent(
+				cwd,
+				SessionManager.explicitDestination(explicitDirectory),
+			);
+			try {
+				expect(resumed.getSessionFile()).not.toBe(outsideFile);
+				expect(resumed.getSessionDir()).toBe(explicitDirectory);
+			} finally {
+				await resumed.close();
+			}
+		} finally {
+			fs.rmSync(breadcrumbFile, { force: true });
+			if (originalTmux === undefined) delete process.env.TMUX;
+			else process.env.TMUX = originalTmux;
+			if (originalPane === undefined) delete process.env.TMUX_PANE;
+			else process.env.TMUX_PANE = originalPane;
+		}
+	});
+	it("uses manager-bound picker inventory for explicit-only and managed legacy candidates", async () => {
+		const root = makeTempDir();
+		const agentDir = path.join(root, "custom-agent");
+		const cwd = path.join(root, "workspace");
+		const sessionsRoot = path.join(agentDir, "sessions");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "current", timestamp: 1 });
+		await manager.ensureOnDisk();
+		await manager.flush();
+		const currentPath = manager.getSessionFile();
+		if (!currentPath) throw new Error("Expected managed current transcript");
+		await manager.close();
+
+		const legacyDirectory = path.join(
+			sessionsRoot,
+			`--${path
+				.resolve(cwd)
+				.replace(/^[/\\]/, "")
+				.replace(/[/\\:]/g, "-")}--`,
+		);
+		const legacyPath = path.join(legacyDirectory, "legacy.jsonl");
+		fs.mkdirSync(legacyDirectory, { recursive: true });
+		fs.writeFileSync(legacyPath, sessionText("legacy").replace('"cwd":"/cwd"', `"cwd":${JSON.stringify(cwd)}`));
+
+		const explicitManager = SessionManager.create(cwd, SessionManager.explicitDestination(destination.directory));
+		const explicit = await explicitManager.listForResumePickerReadOnly();
+		expect(explicit.map(session => session.path)).toEqual([currentPath]);
+
+		const managed = await manager.listForResumePickerReadOnly();
+		expect(managed.map(session => session.path)).toEqual(expect.arrayContaining([currentPath, legacyPath]));
+	});
+	it("rejects a replacement after managed preparation before strict adoption", async () => {
+		const root = makeTempDir();
+		const cwd = path.join(root, "workspace");
+		const agentDir = path.join(root, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+		manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+		await manager.ensureOnDisk();
+		await manager.flush();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+		const inspection = await SessionManager.inspectSessionTailReadOnly(sessionFile);
+		if (inspection.kind === "error") throw new Error("Expected session inspection");
+		const preparedPath = await manager.prepareManagedCandidateForStrictAdoption(
+			sessionFile,
+			"copy-retain",
+			inspection.identity,
+		);
+		const replacement = path.join(root, "replacement.jsonl");
+		fs.writeFileSync(replacement, fs.readFileSync(preparedPath));
+		fs.renameSync(replacement, preparedPath);
+		await expect(manager.setSessionFile(preparedPath)).rejects.toThrow("changed before strict adoption");
+		await manager.close();
+	});
+	it("rejects source identity drift at the final prepared migration receipt publication guard", async () => {
+		const root = makeTempDir();
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "workspace");
+		const sessionsRoot = path.join(agentDir, "sessions");
+		const legacyDirectory = path.join(
+			sessionsRoot,
+			`--${path
+				.resolve(cwd)
+				.replace(/^[/\\]/, "")
+				.replace(/[/\\:]/g, "-")}--`,
+		);
+		const legacyPath = path.join(legacyDirectory, "legacy.jsonl");
+		const replacementPath = path.join(root, "same-bytes-replacement.jsonl");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		fs.mkdirSync(legacyDirectory, { recursive: true });
+		fs.writeFileSync(legacyPath, sessionText("legacy").replace('"cwd":"/cwd"', `"cwd":${JSON.stringify(cwd)}`));
+		const inspection = await SessionManager.inspectSessionTailReadOnly(legacyPath);
+		if (inspection.kind === "error") throw new Error("Expected legacy inspection");
+		fs.writeFileSync(replacementPath, fs.readFileSync(legacyPath));
+		const protocolRoot = path.join(destination.directory, ".gjc-managed-session-internal");
+		const before = {
+			receipts: fs.readdirSync(path.join(protocolRoot, "receipts")),
+			tombstones: fs.readdirSync(path.join(protocolRoot, "tombstones")),
+		};
+		const assertBound = ManagedSessionDescendantStore.prototype.assertBound;
+		let publicationGuards = 0;
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "assertBound").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+		) {
+			assertBound.call(this);
+			const stack = new Error().stack ?? "";
+			if (
+				stack.includes("publishManagedFileNoReplace") &&
+				stack.includes("assertPublicationConsent") &&
+				++publicationGuards === 2
+			)
+				fs.renameSync(replacementPath, legacyPath);
+		});
+
+		expectStrictFailure(
+			await SessionManager.openExistingStrict(inspection.identity, destination),
+			"identity-mismatch",
+		);
+		expect(publicationGuards).toBe(2);
+		expect(fs.readdirSync(path.join(protocolRoot, "receipts"))).toEqual(before.receipts);
+		expect(fs.readdirSync(path.join(protocolRoot, "tombstones"))).toEqual(before.tombstones);
+		expect(fs.existsSync(path.join(destination.directory, path.basename(legacyPath)))).toBe(false);
+		expect(fs.existsSync(path.join(destination.directory, path.basename(legacyPath).slice(0, -6)))).toBe(false);
+	});
+
+	it("keeps an explicit resume destination explicit without managed preparation or migration", async () => {
+		const root = makeTempDir();
+		const explicitDirectory = path.join(root, "explicit");
+		const selectedPath = path.join(explicitDirectory, "selected.jsonl");
+		fs.mkdirSync(explicitDirectory);
+		fs.writeFileSync(selectedPath, sessionText("explicit"));
+		const inspection = await SessionManager.inspectSessionTailReadOnly(selectedPath);
+		if (inspection.kind === "error") throw new Error("Expected explicit inspection");
+		const prepare = vi.spyOn(SessionManager, "prepareManagedCandidateForWrite");
+
+		const opened = await SessionManager.openExistingStrict(
+			inspection.identity,
+			SessionManager.explicitDestination(explicitDirectory),
+		);
+
+		expect(opened.kind).toBe("opened");
+		if (opened.kind === "opened") await opened.manager.close();
+		expect(prepare).not.toHaveBeenCalled();
+		expect(fs.existsSync(path.join(explicitDirectory, ".gjc-managed-session-scope.v2.json"))).toBe(false);
+		expect(fs.existsSync(path.join(explicitDirectory, ".gjc-managed-session-internal"))).toBe(false);
+	});
+
+	it("fails closed at the final migration seam when captured managed authority is replaced", async () => {
+		const root = makeTempDir();
+		const agentDir = path.join(root, "custom-agent");
+		const cwd = path.join(root, "workspace");
+		const sessionsRoot = path.join(agentDir, "sessions");
+		const legacyDirectory = path.join(
+			sessionsRoot,
+			`--${path
+				.resolve(cwd)
+				.replace(/^[/\\]/, "")
+				.replace(/[/\\:]/g, "-")}--`,
+		);
+		const legacyPath = path.join(legacyDirectory, "legacy.jsonl");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		fs.mkdirSync(legacyDirectory, { recursive: true });
+		fs.writeFileSync(legacyPath, sessionText("legacy").replace('"cwd":"/cwd"', `"cwd":${JSON.stringify(cwd)}`));
+		const candidateBefore = fs.readFileSync(legacyPath);
+		const protocolRoot = path.join(destination.directory, ".gjc-managed-session-internal");
+		const bindingPath = path.join(destination.directory, ".gjc-managed-session-scope.v2.json");
+		const bindingBefore = fs.readFileSync(bindingPath);
+		const receiptsBefore = fs.readdirSync(path.join(protocolRoot, "receipts"));
+		const tombstonesBefore = fs.readdirSync(path.join(protocolRoot, "tombstones"));
+		const displacedAgentDir = path.join(root, "displaced-agent");
+		const assertBound = ManagedSessionDescendantStore.prototype.assertBound;
+		let assertions = 0;
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "assertBound").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+		) {
+			assertBound.call(this);
+			assertions++;
+			if (assertions === 5) {
+				fs.renameSync(agentDir, displacedAgentDir);
+				fs.cpSync(displacedAgentDir, agentDir, { recursive: true });
+			}
+		});
+
+		await expect(
+			SessionManager.prepareManagedCandidateForWrite(legacyPath, "copy-retain", destination),
+		).rejects.toThrow("Managed descendant root binding changed");
+
+		expect(assertions).toBe(5);
+		expect(fs.readFileSync(legacyPath)).toEqual(candidateBefore);
+		expect(fs.readFileSync(bindingPath)).toEqual(bindingBefore);
+		expect(fs.readdirSync(path.join(protocolRoot, "receipts"))).toEqual(receiptsBefore);
+		expect(fs.readdirSync(path.join(protocolRoot, "tombstones"))).toEqual(tombstonesBefore);
+		expect(fs.existsSync(path.join(destination.directory, path.basename(legacyPath)))).toBe(false);
+		expect(fs.existsSync(path.join(destination.directory, path.basename(legacyPath).slice(0, -6)))).toBe(false);
+		expect(fs.existsSync(path.join(legacyDirectory, ".gjc-managed-session-scope.v2.json"))).toBe(false);
 	});
 });

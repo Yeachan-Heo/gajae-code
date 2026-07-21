@@ -12,6 +12,7 @@ import { createInterface } from "node:readline/promises";
 import type { ImageContent } from "@gajae-code/ai";
 import {
 	$env,
+	getAgentDir,
 	getProjectDir,
 	logger,
 	normalizePathForComparison,
@@ -534,7 +535,16 @@ interface InteractiveModeFactoryOptions {
 type CreateInteractiveMode = (options: InteractiveModeFactoryOptions) => InteractiveMode;
 
 type ResumePickerTerminalCheck = () => boolean;
-type ListForResumePickerReadOnly = (cwd: string, sessionDir?: string) => Promise<SessionInfo[]>;
+type ListForResumePickerReadOnly = (cwd: string, sessionDir?: string, storage?: undefined) => Promise<SessionInfo[]>;
+
+type ListManagedForResumePickerReadOnly = (
+	cwd: string,
+	managedAgentDir?: string,
+	storage?: undefined,
+) => Promise<SessionInfo[]>;
+
+type ResolveManagedAgentDirForScope = (cwd: string) => string;
+
 type SelectResumeSession = (sessions: SessionInfo[]) => Promise<SessionSelectionResult>;
 type OpenExistingSessionStrict = (
 	identity: ResumeSessionIdentity,
@@ -546,6 +556,11 @@ type OpenExistingSessionStrict = (
 export const BARE_RESUME_CONFLICT_ERROR =
 	"--resume without a session cannot be combined with --continue, --fork, or --no-session.";
 export const BARE_RESUME_INTERACTIVE_ERROR = "--resume requires an interactive terminal; use --resume <id>.";
+
+/** Resolves only the managed agent root needed for pre-consent picker inventory. */
+export function resolveManagedAgentDirForScope(_cwd: string): string {
+	return getAgentDir();
+}
 export const BARE_RESUME_OPEN_ERROR = "Could not open the selected session. Use --resume <id>.";
 
 function isBareResume(parsed: Args): boolean {
@@ -741,7 +756,13 @@ export async function createSessionManager(
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
 			return await SessionManager.forkFrom(forkSource, cwd, sessionDestination(), undefined, migrationPolicy);
 		}
-		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir);
+		const match = await resolveResumableSession(
+			forkSource,
+			cwd,
+			parsed.sessionDir,
+			undefined,
+			parsed.sessionDir ? undefined : activeSettings.getAgentDir(),
+		);
 		if (!match) {
 			throw new Error(`Session "${forkSource}" not found.`);
 		}
@@ -754,14 +775,18 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			return await SessionManager.open(
-				sessionArg,
-				SessionManager.explicitDestination(path.dirname(sessionArg)),
-				undefined,
-				migrationPolicy,
-			);
+			const destination = parsed.sessionDir
+				? SessionManager.explicitDestination(parsed.sessionDir)
+				: SessionManager.explicitDestination(path.dirname(sessionArg));
+			return await SessionManager.open(sessionArg, destination, undefined, migrationPolicy);
 		}
-		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
+		const match = await resolveResumableSession(
+			sessionArg,
+			cwd,
+			parsed.sessionDir,
+			undefined,
+			parsed.sessionDir ? undefined : activeSettings.getAgentDir(),
+		);
 		if (!match) {
 			throw new Error(`Session "${sessionArg}" not found.`);
 		}
@@ -1058,6 +1083,8 @@ export interface RunRootCommandDependencies {
 	runPrintMode?: RunPrintMode;
 	isResumePickerTerminal?: ResumePickerTerminalCheck;
 	listForResumePickerReadOnly?: ListForResumePickerReadOnly;
+	listManagedForResumePickerReadOnly?: ListManagedForResumePickerReadOnly;
+	resolveManagedAgentDirForScope?: ResolveManagedAgentDirForScope;
 	selectResumeSession?: SelectResumeSession;
 	openExistingSessionStrict?: OpenExistingSessionStrict;
 	initializeSettings?: typeof Settings.init;
@@ -1094,10 +1121,18 @@ export async function runRootCommand(
 		await logger.time("maybeAutoChdir", maybeAutoChdir, parsedArgs);
 		autoChdirApplied = true;
 		const resumeCwd = getProjectDir();
-		const sessions = await (deps.listForResumePickerReadOnly ?? SessionManager.listForResumePickerReadOnly)(
-			resumeCwd,
-			parsedArgs.sessionDir,
-		);
+		const managedAgentDir = parsedArgs.sessionDir
+			? undefined
+			: (deps.resolveManagedAgentDirForScope ?? resolveManagedAgentDirForScope)(resumeCwd);
+		const sessions = parsedArgs.sessionDir
+			? await (deps.listForResumePickerReadOnly ?? SessionManager.listForResumePickerReadOnly)(
+					resumeCwd,
+					parsedArgs.sessionDir,
+				)
+			: await (deps.listManagedForResumePickerReadOnly ?? SessionManager.listManagedForResumePickerReadOnly)(
+					resumeCwd,
+					managedAgentDir,
+				);
 		if (sessions.length === 0) {
 			process.stdout.write(`${chalk.dim("No sessions found")}\n`);
 			return;
@@ -1108,19 +1143,16 @@ export async function runRootCommand(
 		if (selection.kind === "cancelled") {
 			return;
 		}
+		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd });
 		const resumeMigrationPolicy =
-			(await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd })).get(
-				"session.directoryMigration",
-			) === "disabled"
-				? "disabled"
-				: "copy-retain";
+			scopedSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 		let opened: StrictSessionOpenResult;
 		try {
 			opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
 				selection.identity,
 				parsedArgs.sessionDir
 					? SessionManager.explicitDestination(parsedArgs.sessionDir)
-					: SessionManager.managedDestination(resumeCwd, settings.getAgentDir()),
+					: SessionManager.managedDestination(resumeCwd, scopedSettings.getAgentDir()),
 				undefined,
 				resumeMigrationPolicy,
 			);

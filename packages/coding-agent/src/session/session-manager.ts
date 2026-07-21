@@ -18,7 +18,6 @@ import * as native from "@gajae-code/natives";
 import { getTerminalId } from "@gajae-code/tui";
 import {
 	getBlobsDir,
-	getAgentDir as getDefaultAgentDir,
 	getProjectDir,
 	getSessionsDir,
 	getTerminalSessionsDir,
@@ -58,6 +57,7 @@ import {
 	canonicalizeTrustedPath,
 	deleteManagedSessionCandidate,
 	listManagedCandidates,
+	type ManagedCandidateWriteAuthority,
 	type ManagedMigrationPolicy,
 	type ManagedScope,
 	managedDirectoryAuthorityForScope,
@@ -68,6 +68,7 @@ import {
 	resolveManagedScopeForWrite,
 } from "./internal/managed-session-scope";
 import {
+	assertManagedDirectoryRoot,
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
@@ -3891,9 +3892,11 @@ export async function resolveResumableSession(
 	cwd: string,
 	sessionDir?: string,
 	storage: SessionStorage = new FileSessionStorage(),
+	managedAgentDir?: string,
 ): Promise<ResolvedSessionMatch | undefined> {
-	const localSessionDir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-	const localSessions = await SessionManager.list(cwd, localSessionDir, storage);
+	const localSessions = sessionDir
+		? await SessionManager.list(cwd, sessionDir, storage)
+		: await SessionManager.listManagedForResumePickerReadOnly(cwd, managedAgentDir, storage);
 	const localMatch = localSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
 	if (localMatch) {
 		return { session: localMatch, scope: "local" };
@@ -3903,7 +3906,7 @@ export async function resolveResumableSession(
 		return undefined;
 	}
 
-	const globalSessions = await SessionManager.listAll(storage);
+	const globalSessions = await SessionManager.listAll(storage, managedAgentDir);
 	const globalMatch = globalSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
 	if (!globalMatch) {
 		return undefined;
@@ -3935,6 +3938,7 @@ export class SessionManager {
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#fileEntries: FileEntry[] = [];
+	#pendingStrictAdoption: { canonicalPath: string; identity: ResumeSessionIdentity } | undefined;
 	#byId: Map<string, SessionEntry> = new Map();
 	#labelsById: Map<string, string> = new Map();
 	#leafId: string | null = null;
@@ -4208,12 +4212,25 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching) */
 	async setSessionFile(sessionFile: string): Promise<void> {
+		const resolvedSessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		const strictAdoption = this.#pendingStrictAdoption;
+		this.#pendingStrictAdoption = undefined;
+		if (strictAdoption && resolvedSessionFile === strictAdoption.canonicalPath) {
+			const inspected = inspectResumeSessionFile(resolvedSessionFile, this.storage);
+			if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
+				throw new Error("Prepared managed session changed before strict adoption.");
+		}
 		await this.#closePersistWriter();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
-		this.#sessionFile = this.storage instanceof FileSessionStorage ? path.resolve(sessionFile) : sessionFile;
+		this.#sessionFile = resolvedSessionFile;
 		writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		this.#fileEntries = await loadEntriesFromFile(this.#sessionFile, this.storage);
+		if (strictAdoption) {
+			const inspected = inspectResumeSessionFile(this.#sessionFile, this.storage);
+			if ("kind" in inspected || !sameResumeIdentity(strictAdoption.identity, inspected.identity))
+				throw new Error("Prepared managed session changed during strict adoption.");
+		}
 		if (this.#fileEntries.length > 0) {
 			const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
 			this.#sessionId = header?.id ?? createSessionId();
@@ -4561,12 +4578,7 @@ export class SessionManager {
 			if (this.destination.kind === "managed") {
 				return managedDestination(resolvedCwd, this.storage, this.destination.securityContext.agentDir);
 			}
-			if (!(this.storage instanceof FileSessionStorage)) return this.destination;
-			const managedSessionsRoot = resolveManagedSessionRoot(this.sessionDir, this.cwd);
-			const directory = managedSessionsRoot
-				? computeDefaultSessionDir(resolvedCwd, this.storage, managedSessionsRoot)
-				: computeDefaultSessionDir(resolvedCwd, this.storage);
-			return explicitDestination(directory);
+			return this.destination;
 		})();
 		const newSessionDir = nextDestination.directory;
 		let hadSessionFile = false;
@@ -5545,6 +5557,17 @@ export class SessionManager {
 
 	getSessionDir(): string {
 		return this.sessionDir;
+	}
+
+	/** Lists picker candidates within this manager's captured destination authority. */
+	async listForResumePickerReadOnly(): Promise<SessionInfo[]> {
+		return this.destination.kind === "managed"
+			? await SessionManager.listManagedForResumePickerReadOnly(
+					this.cwd,
+					this.destination.securityContext.agentDir,
+					this.storage,
+				)
+			: await SessionManager.listForResumePickerReadOnly(this.cwd, this.destination.directory, this.storage);
 	}
 
 	getSessionId(): string {
@@ -7155,20 +7178,59 @@ export class SessionManager {
 		return manager;
 	}
 
+	/** Prepare a selected candidate using this manager's captured managed destination authority. */
+	async prepareManagedCandidateForWrite(
+		filePath: string,
+		migrationPolicy: SessionDirectoryMigrationPolicy,
+		expectedIdentity?: ResumeSessionIdentity,
+	): Promise<string> {
+		return SessionManager.prepareManagedCandidateForWrite(
+			filePath,
+			migrationPolicy,
+			this.destination,
+			expectedIdentity,
+		);
+	}
+
+	/** Prepare a managed candidate and retain its exact post-preparation identity for the next adoption. */
+	async prepareManagedCandidateForStrictAdoption(
+		filePath: string,
+		migrationPolicy: SessionDirectoryMigrationPolicy,
+		expectedIdentity: ResumeSessionIdentity,
+	): Promise<string> {
+		const preparedPath = await this.prepareManagedCandidateForWrite(filePath, migrationPolicy, expectedIdentity);
+		const inspected = inspectResumeSessionFile(preparedPath, this.storage);
+		if ("kind" in inspected) throw new Error(`Could not inspect prepared managed session: ${inspected.reason}`);
+		this.#pendingStrictAdoption = { canonicalPath: inspected.identity.canonicalPath, identity: inspected.identity };
+		return preparedPath;
+	}
+
 	/** Resolve a default-managed candidate through binding validation and copy-retain migration before mutation. */
 	static async prepareManagedCandidateForWrite(
 		filePath: string,
 		migrationPolicy: SessionDirectoryMigrationPolicy,
+		destination: SessionDestination,
+		expectedIdentity?: ResumeSessionIdentity,
 	): Promise<string> {
+		if (!trustedSessionDestinations.has(destination) || destination.kind !== "managed")
+			throw new Error("Managed candidate preparation requires a trusted managed destination authority");
 		const storage = new FileSessionStorage();
+		const managedDestinationStore = managedStoreFromContext(destination.securityContext, destination.directory);
+		const assertManagedDestinationBound = (): void => {
+			assertManagedDirectoryRoot(destination.securityContext.rootAuthority);
+			managedDestinationStore.assertBound();
+		};
+		assertManagedDestinationBound();
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
 			if (inspected.reason === "missing") return filePath;
 			throw new Error(`Could not inspect managed session: ${inspected.reason}`);
 		}
+		if (expectedIdentity && !sameResumeIdentity(expectedIdentity, inspected.identity))
+			throw new Error("Managed session changed before migration authority was adopted.");
 		const header = inspected.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header?.cwd) return filePath;
-		const sessionsRoot = getSessionsDir();
+		const sessionsRoot = destination.securityContext.sessionsRoot;
 		const resolvedPath = path.resolve(filePath);
 		const relativeToManagedRoot = path.relative(sessionsRoot, resolvedPath);
 		const isManagedPath =
@@ -7176,14 +7238,17 @@ export class SessionManager {
 			(!relativeToManagedRoot.startsWith("..") && !path.isAbsolute(relativeToManagedRoot));
 
 		if (!isManagedPath) return filePath;
+		assertManagedDestinationBound();
 		const resolved = resolveManagedScope({
 			cwd: header.cwd,
-			agentDir: path.resolve(sessionsRoot, ".."),
+			agentDir: destination.securityContext.agentDir,
 			sessionsRoot,
 		});
 		if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);
 
+		assertManagedDestinationBound();
 		const listing = listManagedCandidates(resolved.scope);
+		assertManagedDestinationBound();
 		if (listing.kind !== "complete") throw new Error(`Managed session scan failed: ${listing.message}`);
 
 		const candidate = listing.owned.find(item => path.resolve(item.path) === resolvedPath);
@@ -7200,7 +7265,24 @@ export class SessionManager {
 			candidate.identity.sha256 !== inspected.identity.sha256
 		)
 			throw new Error("Managed session changed before migration authority was adopted.");
-		const opened = await openManagedCandidateForWrite(resolved.scope, candidate, migrationPolicy);
+		assertManagedDestinationBound();
+		const authority: ManagedCandidateWriteAuthority = {
+			rootAuthority: destination.securityContext.rootAuthority,
+			...(path.resolve(destination.directory) === path.resolve(resolved.scope.directoryPath)
+				? {
+						retainedAuthority: destination.securityContext.retainedAuthority,
+						retainedDirectory: destination.directory,
+					}
+				: {}),
+		};
+		const opened = await openManagedCandidateForWrite(
+			resolved.scope,
+			candidate,
+			expectedIdentity ?? inspected.identity,
+			migrationPolicy,
+			authority,
+		);
+		assertManagedDestinationBound();
 		if (opened.kind === "error") {
 			if (opened.code === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
 			throw new Error(`Could not open managed session: ${opened.message}`);
@@ -7222,7 +7304,7 @@ export class SessionManager {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const managedSourcePath =
 			destination.kind === "managed" && storage instanceof FileSessionStorage
-				? await SessionManager.prepareManagedCandidateForWrite(sourcePath, migrationPolicy)
+				? await SessionManager.prepareManagedCandidateForWrite(sourcePath, migrationPolicy, destination)
 				: sourcePath;
 		const dir = destination.directory;
 		const manager = new SessionManager(cwd, dir, true, storage, destination);
@@ -7286,10 +7368,9 @@ export class SessionManager {
 			return manager;
 		}
 
-		const managedPath = await SessionManager.prepareManagedCandidateForWrite(filePath, migrationPolicy);
-		const inspected = inspectResumeSessionFile(managedPath, storage);
+		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
-			if (inspected.reason === "missing" && path.resolve(managedPath) === path.resolve(filePath)) {
+			if (inspected.reason === "missing") {
 				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
 				await manager.#initSessionFile(filePath);
 				return manager;
@@ -7357,46 +7438,47 @@ export class SessionManager {
 		return manager;
 	}
 	/**
-	 * List sessions for the resume picker without recovery or other maintenance writes.
+	 * List default-managed sessions for the resume picker without recovery or other
+	 * maintenance writes. This is the only picker inventory that includes legacy
+	 * sibling directories.
+	 */
+	static async listManagedForResumePickerReadOnly(
+		cwd: string,
+		managedAgentDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<SessionInfo[]> {
+		if (!(storage instanceof FileSessionStorage)) return [];
+		const sessionsRoot = getSessionsDir(managedAgentDir);
+		const resolved = resolveManagedScope({
+			cwd,
+			agentDir: managedAgentDir ?? path.resolve(sessionsRoot, ".."),
+			sessionsRoot,
+		});
+		if (resolved.kind === "error") return [];
+		const listing = listManagedCandidates(resolved.scope);
+		if (listing.kind === "error") return [];
+		return await collectSessionsFromFiles(
+			listing.owned.map(candidate => candidate.path),
+			storage,
+		);
+	}
+
+	/**
+	 * List sessions from an explicitly supplied picker directory without recovery
+	 * or other maintenance writes. Unlike managed inventory, this never scans
+	 * legacy sibling directories.
 	 */
 	static async listForResumePickerReadOnly(
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionInfo[]> {
-		if (!sessionDir && !(storage instanceof FileSessionStorage)) return [];
-		if (sessionDir && !resolveManagedSessionRoot(sessionDir, cwd)) {
-			try {
-				return await collectSessionsFromFiles(storage.listFilesSync(sessionDir, "*.jsonl"), storage);
-			} catch {
-				return [];
-			}
-		}
-		const sessionsRoot = sessionDir
-			? (resolveManagedSessionRoot(sessionDir, cwd) ?? getSessionsDir())
-			: getSessionsDir();
-		const resolved = resolveManagedScope({ cwd, agentDir: path.resolve(sessionsRoot, ".."), sessionsRoot });
-		if (resolved.kind === "error") return [];
-		if (storage instanceof FileSessionStorage) {
-			const listing = listManagedCandidates(resolved.scope);
-			if (listing.kind === "error") return [];
-			return await collectSessionsFromFiles(
-				listing.owned.map(candidate => candidate.path),
-				storage,
-			);
-		}
-		const legacyDirectory = `--${resolved.scope.canonicalCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-		const files = new Set<string>();
+		if (!sessionDir) return await SessionManager.listManagedForResumePickerReadOnly(cwd, undefined, storage);
 		try {
-			for (const directory of [resolved.scope.directoryPath, path.join(sessionsRoot, legacyDirectory)]) {
-				for (const file of storage.listFilesSync(directory, "*.jsonl")) files.add(file);
-			}
+			return await collectSessionsFromFiles(storage.listFilesSync(sessionDir, "*.jsonl"), storage);
 		} catch {
 			return [];
 		}
-		return (await collectSessionsFromFiles([...files], storage)).filter(
-			session => resolveEquivalentPath(session.cwd) === resolved.scope.canonicalCwd,
-		);
 	}
 
 	/** Tombstone and exact-delete a default-managed candidate. */
@@ -7698,22 +7780,29 @@ export class SessionManager {
 		let sessionPath = identity.canonicalPath;
 		if (destination.kind === "managed" && storage instanceof FileSessionStorage) {
 			try {
-				sessionPath = await SessionManager.prepareManagedCandidateForWrite(sessionPath, migrationPolicy);
+				sessionPath = await SessionManager.prepareManagedCandidateForWrite(
+					sessionPath,
+					migrationPolicy,
+					destination,
+					identity,
+				);
 			} catch (error) {
 				if (error instanceof SessionMigrationPolicyError)
 					return { kind: "error", reason: "legacy_migration_disabled" };
+				if (
+					error instanceof Error &&
+					(error.message.includes("source_changed") || error.message.includes("changed before migration"))
+				)
+					return { kind: "error", reason: "identity-mismatch" };
 				throw error;
 			}
 		}
 		const inspected = inspectResumeSessionFile(sessionPath, storage);
 		if ("kind" in inspected) return inspected;
-		if (
-			(sessionPath === identity.canonicalPath && !sameResumeIdentity(identity, inspected.identity)) ||
-			(sessionPath !== identity.canonicalPath &&
-				(identity.sessionId !== inspected.identity.sessionId || identity.sha256 !== inspected.identity.sha256))
-		) {
+		if (sessionPath === identity.canonicalPath && !sameResumeIdentity(identity, inspected.identity)) {
 			return { kind: "error", reason: "identity-mismatch" };
 		}
+
 		const entries = inspected.entries;
 		const header = entries[0] as SessionHeader;
 		const dir = destination.directory;
@@ -7771,9 +7860,20 @@ export class SessionManager {
 		const managedCandidates =
 			destination.kind === "explicit"
 				? []
-				: await SessionManager.listForResumePickerReadOnly(cwd, destination.directory, storage);
+				: await SessionManager.listManagedForResumePickerReadOnly(
+						cwd,
+						destination.securityContext.agentDir,
+						storage,
+					);
+
 		const terminalSession = await readTerminalBreadcrumb(cwd);
-		if (terminalSession) {
+		const terminalSessionIsInExplicitRoot = (() => {
+			if (destination.kind === "managed" || !terminalSession) return destination.kind === "managed";
+			const canonicalRoot = canonicalizeTrustedPath(destination.directory);
+			const canonicalSessionPath = canonicalizeTrustedPath(terminalSession);
+			return pathIsWithin(canonicalRoot, canonicalSessionPath);
+		})();
+		if (terminalSession && terminalSessionIsInExplicitRoot) {
 			const opened = await openSelectedStrictly(terminalSession);
 			if (opened) return opened;
 		}
@@ -7811,7 +7911,7 @@ export class SessionManager {
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionInfo[]> {
-		if (!sessionDir) return await SessionManager.listForResumePickerReadOnly(cwd, undefined, storage);
+		if (!sessionDir) return await SessionManager.listManagedForResumePickerReadOnly(cwd, undefined, storage);
 		try {
 			await recoverOrphanedBackups(sessionDir, storage);
 			return await collectSessionsFromFiles(storage.listFilesSync(sessionDir, "*.jsonl"), storage);
@@ -7823,9 +7923,12 @@ export class SessionManager {
 	/**
 	 * List all sessions across all project directories.
 	 */
-	static async listAll(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
+	static async listAll(
+		storage: SessionStorage = new FileSessionStorage(),
+		managedAgentDir?: string,
+	): Promise<SessionInfo[]> {
 		if (!(storage instanceof FileSessionStorage)) return [];
-		const sessionsRoot = path.join(getDefaultAgentDir(), "sessions");
+		const sessionsRoot = getSessionsDir(managedAgentDir);
 		try {
 			const directories = await fs.promises.readdir(sessionsRoot, { withFileTypes: true });
 			const seedFiles = directories
@@ -7862,6 +7965,19 @@ export class SessionManager {
 		}
 	}
 	/**
+	 * Strict inventory bound to this manager's captured session authority. Managed
+	 * managers include authorized legacy and current candidates; explicit managers
+	 * authorize only their exact directory.
+	 */
+	inventorySessionsStrict(): StrictInventoryResult {
+		return SessionManager.inventorySessionsStrict(this.cwd, {
+			sessionDir: this.destination.kind === "explicit" ? this.destination.directory : undefined,
+			storage: this.storage,
+			destination: this.destination,
+		});
+	}
+
+	/**
 	 * Strict raw scoped inventory for ACP authorization. Enumerates the scoped
 	 * session directory without suppressing any root/scan/lstat/read/parse/stat/
 	 * header/cwd/containment/identity failure. A failure result carries every
@@ -7870,10 +7986,55 @@ export class SessionManager {
 	 */
 	static inventorySessionsStrict(
 		cwd: string,
-		options?: { sessionDir?: string; storage?: SessionStorage },
+		options?: { sessionDir?: string; storage?: SessionStorage; destination?: SessionDestination },
 	): StrictInventoryResult {
 		const storage = options?.storage ?? new FileSessionStorage();
-		const dir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
+		const destination = options?.destination;
+		const dir =
+			options?.sessionDir ?? destination?.directory ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
+		if (destination?.kind === "managed") {
+			if (!trustedSessionDestinations.has(destination) || !(storage instanceof FileSessionStorage)) {
+				return {
+					kind: "failure",
+					failures: [{ kind: "scan", message: "Managed strict inventory authority is unavailable", path: dir }],
+				};
+			}
+			try {
+				const store = managedStoreFromContext(destination.securityContext, destination.directory);
+				assertManagedDirectoryRoot(destination.securityContext.rootAuthority);
+				store.assertBound();
+				const resolved = resolveManagedScope({
+					cwd,
+					agentDir: destination.securityContext.agentDir,
+					sessionsRoot: destination.securityContext.sessionsRoot,
+				});
+				if (resolved.kind === "error")
+					return { kind: "failure", failures: [{ kind: "root", message: resolved.message, path: dir }] };
+				const listing = listManagedCandidates(resolved.scope);
+				if (listing.kind === "error")
+					return { kind: "failure", failures: [{ kind: "scan", message: listing.message, path: dir }] };
+				const failures: StrictInventoryFailure[] = [];
+				const candidates: StrictInventoryCandidate[] = [];
+				for (const managedCandidate of listing.owned) {
+					const candidate = inventoryReadCandidate(
+						storage,
+						managedCandidate.path,
+						cwd,
+						path.dirname(managedCandidate.path),
+					);
+					if ("failures" in candidate) failures.push(...candidate.failures);
+					else candidates.push(candidate.candidate);
+				}
+				assertManagedDirectoryRoot(destination.securityContext.rootAuthority);
+				store.assertBound();
+				return failures.length > 0 ? { kind: "failure", failures } : { kind: "complete", candidates };
+			} catch {
+				return {
+					kind: "failure",
+					failures: [{ kind: "root", message: "Managed strict inventory authority changed", path: dir }],
+				};
+			}
+		}
 		if (!storage.listFilesStrictSync) {
 			return {
 				kind: "failure",

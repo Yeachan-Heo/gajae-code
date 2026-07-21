@@ -2057,10 +2057,7 @@ export class SelectorController {
 	}
 
 	async showSessionSelector(): Promise<void> {
-		const sessions = await SessionManager.listForResumePickerReadOnly(
-			this.ctx.sessionManager.getCwd(),
-			this.ctx.sessionManager.getSessionDir(),
-		);
+		const sessions = await this.ctx.sessionManager.listForResumePickerReadOnly();
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
 				sessions,
@@ -2156,8 +2153,16 @@ export class SelectorController {
 		this.#clearTransientSessionUi();
 		const migrationPolicy =
 			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
-		const writableSessionPath = await SessionManager.prepareManagedCandidateForWrite(sessionPath, migrationPolicy);
-
+		let writableSessionPath = sessionPath;
+		if (this.ctx.sessionManager.isManagedDestination()) {
+			const inspection = await SessionManager.inspectSessionTailReadOnly(sessionPath);
+			if (inspection.kind === "error") throw new Error(`Could not inspect selected session: ${inspection.reason}`);
+			writableSessionPath = await this.ctx.sessionManager.prepareManagedCandidateForStrictAdoption(
+				sessionPath,
+				migrationPolicy,
+				inspection.identity,
+			);
+		}
 		// Switch session via AgentSession (emits hook and tool session events)
 		if (!(await this.ctx.session.switchSession(writableSessionPath))) return;
 		const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();

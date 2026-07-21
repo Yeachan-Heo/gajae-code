@@ -17,11 +17,13 @@ import {
 } from "../session-storage";
 import {
 	acquireManagedLock,
+	assertManagedDirectoryRoot,
 	captureManagedFileNoFollow,
 	captureManagedFilePrefixNoFollow,
 	copyManagedFileNoReplace,
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
+	type ManagedDirectoryRoot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	type ManagedStorageLock,
@@ -50,9 +52,37 @@ export interface ManagedScope {
 	platform: "posix" | "win32";
 }
 
+/**
+ * Opaque managed writer authority captured by a trusted destination. The open
+ * transaction must use this authority rather than reacquiring its root from a
+ * pathname after resume inspection.
+ */
+export interface ManagedCandidateWriteAuthority {
+	readonly rootAuthority: ManagedDirectoryRoot;
+	readonly retainedAuthority?: native.RecoveryFsRoot;
+	readonly retainedDirectory?: string;
+}
+
 const managedRoots = new WeakMap<ManagedScope, ReturnType<typeof managedDirectoryRoot>>();
 const managedDirectoryIdentities = new WeakMap<ManagedScope, { dev: bigint; ino: bigint }>();
 const managedDirectoryAuthorities = new WeakMap<ManagedScope, native.RecoveryFsRoot | undefined>();
+const boundManagedWriteAuthorities = new WeakMap<ManagedScope, ManagedCandidateWriteAuthority>();
+
+function bindManagedWriteAuthority(scope: ManagedScope, authority: ManagedCandidateWriteAuthority): void {
+	assertManagedDirectoryRoot(authority.rootAuthority);
+	if (
+		authority.retainedAuthority &&
+		authority.retainedDirectory !== undefined &&
+		path.resolve(authority.retainedDirectory) === path.resolve(scope.directoryPath)
+	) {
+		new ManagedSessionDescendantStore(authority.rootAuthority, scope.directoryPath, {
+			authority: authority.retainedAuthority,
+			authorityBaseDir: scope.directoryPath,
+		}).assertBound();
+	}
+	managedRoots.set(scope, authority.rootAuthority);
+	boundManagedWriteAuthorities.set(scope, authority);
+}
 
 export function managedDirectoryAuthorityForScope(scope: ManagedScope): native.RecoveryFsRoot | undefined {
 	if (!managedDirectoryAuthorities.has(scope)) throw new Error("Managed session directory authority was not prepared");
@@ -82,6 +112,11 @@ function configuredRootPath(scope: ManagedScope): string {
 }
 
 function scopeRoot(scope: ManagedScope) {
+	const bound = boundManagedWriteAuthorities.get(scope);
+	if (bound) {
+		bindManagedWriteAuthority(scope, bound);
+		return bound.rootAuthority;
+	}
 	const retained = managedRoots.get(scope);
 	if (retained) return retained;
 	const root = managedDirectoryRoot(configuredRootPath(scope));
@@ -721,18 +756,25 @@ function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
 export function prepareManagedSessionScopeForWriteSync(
 	scope: ManagedScope,
 	policy: ManagedSessionSecurityPolicy = "default",
+	authority?: ManagedCandidateWriteAuthority,
 ): ManagedScopeResolution {
 	try {
-		const root = scopeRoot(scope);
+		const root = authority?.rootAuthority ?? scopeRoot(scope);
+		if (authority) bindManagedWriteAuthority(scope, authority);
 		ensureManagedDirectory(scope.sessionsRoot, root, policy);
 		ensureManagedDirectory(scope.directoryPath, root, policy);
 		const preparedDirectory = fs.lstatSync(scope.directoryPath, { bigint: true });
 		if (!preparedDirectory.isDirectory() || preparedDirectory.isSymbolicLink())
 			throw new Error("Managed session directory changed");
-		const retainedAuthority = retainManagedDirectoryAuthority(root, scope.directoryPath, {
-			dev: preparedDirectory.dev,
-			ino: preparedDirectory.ino,
-		});
+		const retainedAuthority =
+			authority?.retainedAuthority &&
+			authority.retainedDirectory !== undefined &&
+			path.resolve(authority.retainedDirectory) === path.resolve(scope.directoryPath)
+				? authority.retainedAuthority
+				: retainManagedDirectoryAuthority(root, scope.directoryPath, {
+						dev: preparedDirectory.dev,
+						ino: preparedDirectory.ino,
+					});
 		const buildStore = () =>
 			new ManagedSessionDescendantStore(
 				root,
@@ -920,6 +962,29 @@ function sameCandidate(left: ManagedCandidate, right: ManagedCandidate): boolean
 		left.identity.mtimeNs === right.identity.mtimeNs &&
 		left.identity.sha256 === right.identity.sha256
 	);
+}
+
+function matchesExpectedResumeIdentity(candidate: ManagedCandidate, expected: ResumeSessionIdentity): boolean {
+	return (
+		path.resolve(candidate.identity.canonicalPath) === path.resolve(expected.canonicalPath) &&
+		candidate.identity.sessionId === expected.sessionId &&
+		candidate.identity.dev === expected.dev &&
+		candidate.identity.ino === expected.ino &&
+		candidate.identity.size === expected.size &&
+		candidate.identity.mtimeMs === expected.mtimeMs &&
+		candidate.identity.mtimeNs === expected.mtimeNs &&
+		candidate.identity.sha256 === expected.sha256
+	);
+}
+
+function revalidatePickerConsent(
+	scope: ManagedScope,
+	candidate: ManagedCandidate,
+	expectedIdentity: ResumeSessionIdentity,
+): ManagedCandidate {
+	const current = validateCandidateForScope(scope, candidate);
+	if (!current || !matchesExpectedResumeIdentity(current, expectedIdentity)) throw new Error("source_changed");
+	return current;
 }
 
 function receiptPathFor(
@@ -1903,6 +1968,8 @@ async function copyArtifacts(
 	destinationTranscript: string,
 	manifest: readonly ArtifactManifestEntry[],
 	lock: ManagedStorageLock,
+	expectedCandidate: ManagedCandidate,
+	expectedIdentity: ResumeSessionIdentity,
 	sourceRootOverride?: string,
 ): Promise<void> {
 	const root = scopeRoot(scope);
@@ -1911,12 +1978,18 @@ async function copyArtifacts(
 	if (!manifestMatches(sourceTranscript, manifest, sourceRoot)) throw new Error("source_changed");
 	const destinationRoot = destinationTranscript.slice(0, -6);
 	for (const entry of manifest) {
+		revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
 		lock.assertOwned();
 		const source = path.join(sourceRoot, entry.path);
 		const destination = path.join(destinationRoot, entry.path);
 		if (entry.kind === "directory") {
-			if (entry.path === "") ensureManagedDirectory(destinationRoot, root);
-			else ensureManagedDirectory(destination, root);
+			if (entry.path === "") {
+				revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
+				ensureManagedDirectory(destinationRoot, root);
+			} else {
+				revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
+				ensureManagedDirectory(destination, root);
+			}
 			continue;
 		}
 		const snapshot = captureManagedFileNoFollow(source);
@@ -1926,6 +1999,7 @@ async function copyArtifacts(
 		)
 			throw new Error("source_changed");
 		try {
+			revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
 			await copyManagedFileNoReplace(source, destination, snapshot, root);
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
@@ -2023,6 +2097,7 @@ function receiptPair(scope: ManagedScope, candidate: ManagedCandidate): ManagedC
 }
 
 function validateCandidateForScope(scope: ManagedScope, candidate: ManagedCandidate): ManagedCandidate | undefined {
+	scopeRoot(scope);
 	const inspected = inspectCandidate(candidate.path, candidate.provenance);
 	if ("code" in inspected || !sameCandidate(inspected, candidate)) return undefined;
 	const identity = identityFor(inspected.cwd);
@@ -2153,7 +2228,12 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 export async function prepareManagedSessionScopeForWrite(
 	scope: ManagedScope,
 	policy: ManagedSessionSecurityPolicy = "default",
+	authority?: ManagedCandidateWriteAuthority,
+	expectedCandidate?: ManagedCandidate,
+	expectedIdentity?: ResumeSessionIdentity,
 ): Promise<ManagedScopeResolution> {
+	if (expectedCandidate && expectedIdentity) revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
+	if (authority) bindManagedWriteAuthority(scope, authority);
 	const prepared = await ensureManagedScope(scope, policy);
 	if (prepared.kind === "error") return prepared;
 	try {
@@ -2182,28 +2262,44 @@ export async function prepareManagedSessionScopeForWrite(
 export async function openManagedCandidateForWrite(
 	scope: ManagedScope,
 	candidate: ManagedCandidate,
-	migrationPolicy: ManagedMigrationPolicy = "copy-retain",
+	expectedIdentityOrMigrationPolicy: ResumeSessionIdentity | ManagedMigrationPolicy = "copy-retain",
+	migrationPolicy: ManagedMigrationPolicy = typeof expectedIdentityOrMigrationPolicy === "string"
+		? expectedIdentityOrMigrationPolicy
+		: "copy-retain",
+	authority?: ManagedCandidateWriteAuthority,
 ): Promise<ManagedOpenCandidateResult> {
+	const expectedIdentity =
+		typeof expectedIdentityOrMigrationPolicy === "string" ? candidate.identity : expectedIdentityOrMigrationPolicy;
 	if (migrationPolicy === "disabled" && candidate.provenance === "legacy")
 		return {
 			kind: "error",
 			code: "legacy_migration_disabled",
 			message: "Legacy session migration is disabled for this workspace.",
 		};
-	const prepared = await prepareManagedSessionScopeForWrite(scope);
-	if (prepared.kind === "error")
+	let prepared: ManagedScopeResolution;
+	let current: ManagedCandidate;
+	try {
+		prepared = await prepareManagedSessionScopeForWrite(
+			scope,
+			scope.platform === "win32" ? "windows-existing-verify-first" : "default",
+			authority,
+			candidate,
+			expectedIdentity,
+		);
+		if (prepared.kind === "error")
+			return {
+				kind: "error",
+				code: prepared.code === "binding_conflict" ? "binding_conflict" : "binding_invalid",
+				message: prepared.message,
+			};
+		current = revalidatePickerConsent(scope, candidate, expectedIdentity);
+	} catch (error) {
 		return {
 			kind: "error",
-			code: prepared.code === "binding_conflict" ? "binding_conflict" : "binding_invalid",
-			message: prepared.message,
+			code: expectedFailure(error),
+			message: error instanceof Error ? error.message : "Managed migration failed.",
 		};
-	const current = validateCandidateForScope(scope, candidate);
-	if (!current)
-		return {
-			kind: "error",
-			code: "source_changed",
-			message: "The managed candidate changed before it could be opened.",
-		};
+	}
 	if (isRetired(scope, current))
 		return { kind: "error", code: "migration_retired", message: "The managed session has been retired." };
 	if (current.provenance === "v2") return { kind: "opened", path: current.path, candidate: current, migrated: false };
@@ -2213,10 +2309,10 @@ export async function openManagedCandidateForWrite(
 	let lock: ManagedStorageLock | undefined;
 	let detachedArtifacts: DetachedArtifactRoot | undefined;
 	try {
+		revalidatePickerConsent(scope, current, expectedIdentity);
 		lock = await acquireManagedLock(path.join(internal, MANAGED_LOCKS_DIRECTORY), operation, scopeRoot(scope));
-		const afterLock = validateCandidateForScope(scope, current);
-		if (!afterLock)
-			return { kind: "error", code: "source_changed", message: "The legacy candidate changed during migration." };
+		const heldLock = lock;
+		const afterLock = revalidatePickerConsent(scope, current, expectedIdentity);
 		const listing = listManagedCandidates(scope);
 		if (listing.kind === "error") return { kind: "error", code: "binding_invalid", message: listing.message };
 		const destination = path.join(scope.directoryPath, path.basename(afterLock.path));
@@ -2228,11 +2324,18 @@ export async function openManagedCandidateForWrite(
 				code: "destination_conflict",
 				message: "A distinct v2 transcript already owns this session id.",
 			};
+		scopeRoot(scope);
+		revalidatePickerConsent(scope, afterLock, expectedIdentity);
 		restorePreparedArtifactRoot(scope, afterLock);
+		scopeRoot(scope);
 		const sourceSnapshot = captureManagedFileNoFollow(afterLock.path);
 		let manifest: readonly ArtifactManifestEntry[] = [];
 		const artifactPlan = planArtifactRootForMigration(afterLock.path, operation);
 		const intendedDestination = { path: destination, sessionId: afterLock.sessionId, cwd: afterLock.cwd };
+		const assertPublicationConsent = (): void => {
+			heldLock.assertOwned();
+			revalidatePickerConsent(scope, afterLock, expectedIdentity);
+		};
 		if (existing && existing.identity.sha256 !== afterLock.identity.sha256) {
 			return {
 				kind: "error",
@@ -2249,6 +2352,7 @@ export async function openManagedCandidateForWrite(
 		}
 		const preparedReceipt = receiptPathFor(scope, afterLock, "prepared");
 		try {
+			revalidatePickerConsent(scope, afterLock, expectedIdentity);
 			lock.assertOwned();
 			await publishManagedFileNoReplace(
 				preparedReceipt,
@@ -2268,7 +2372,8 @@ export async function openManagedCandidateForWrite(
 							}
 						: undefined,
 				),
-				lock.assertOwned,
+				assertPublicationConsent,
+				scopeRoot(scope),
 			);
 		} catch (error) {
 			if ((error as Error).message !== "destination_conflict") throw error;
@@ -2277,11 +2382,23 @@ export async function openManagedCandidateForWrite(
 		if (!preparedReceiptMatches(preparedReceipt, scope, afterLock, intendedDestination, artifactPlan))
 			throw new Error("durability_failed");
 		if (artifactPlan && fs.existsSync(artifactPlan.detachedPath)) throw new Error("destination_conflict");
+		revalidatePickerConsent(scope, afterLock, expectedIdentity);
+		scopeRoot(scope);
 		detachedArtifacts = artifactPlan ? detachArtifactRootForMigration(artifactPlan) : undefined;
 		manifest = detachedArtifacts ? artifactManifestFromSnapshot(detachedArtifacts.tree) : [];
-		await copyArtifacts(scope, afterLock.path, destination, manifest, lock, detachedArtifacts?.detachedPath);
+		await copyArtifacts(
+			scope,
+			afterLock.path,
+			destination,
+			manifest,
+			lock,
+			afterLock,
+			expectedIdentity,
+			detachedArtifacts?.detachedPath,
+		);
 		if (!existing) {
 			try {
+				revalidatePickerConsent(scope, afterLock, expectedIdentity);
 				lock.assertOwned();
 				await copyManagedFileNoReplace(afterLock.path, destination, sourceSnapshot, scopeRoot(scope));
 			} catch (error) {
@@ -2289,6 +2406,7 @@ export async function openManagedCandidateForWrite(
 			}
 		}
 		// Artifact files, directories, and the transcript must be durable before a receipt can grant shadow authority.
+		scopeRoot(scope);
 		if (manifest.length > 0) fsyncManagedArtifactTree(destination.slice(0, -6));
 		lock.assertOwned();
 		const migrated = inspectCandidate(destination, "v2");
@@ -2301,6 +2419,8 @@ export async function openManagedCandidateForWrite(
 		)
 			throw new Error("durability_failed");
 		if (detachedArtifacts) {
+			revalidatePickerConsent(scope, afterLock, expectedIdentity);
+			scopeRoot(scope);
 			restoreDetachedArtifactRoot(detachedArtifacts);
 			detachedArtifacts = undefined;
 		}
@@ -2314,11 +2434,13 @@ export async function openManagedCandidateForWrite(
 		for (const state of ["published", "committed"] as const) {
 			const receipt = receiptPathFor(scope, afterLock, state);
 			try {
+				revalidatePickerConsent(scope, afterLock, expectedIdentity);
 				lock.assertOwned();
 				await publishManagedFileNoReplace(
 					receipt,
 					migrationReceipt(scope, lock, state, afterLock, migrated, manifest),
-					lock.assertOwned,
+					assertPublicationConsent,
+					scopeRoot(scope),
 				);
 			} catch (error) {
 				if ((error as Error).message !== "destination_conflict") throw error;
@@ -2332,6 +2454,8 @@ export async function openManagedCandidateForWrite(
 				code: "durability_failed",
 				message: "The migration receipt does not bind the copied v2 transcript and artifacts.",
 			};
+		revalidatePickerConsent(scope, afterLock, expectedIdentity);
+		scopeRoot(scope);
 		await removeStagedReceipts(scope, afterLock);
 		return {
 			kind: "opened",
