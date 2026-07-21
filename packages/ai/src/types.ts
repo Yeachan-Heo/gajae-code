@@ -97,6 +97,7 @@ export interface ThinkingConfig {
 
 export type KnownProvider =
 	| "alibaba-coding-plan"
+	| "alibaba-token-plan"
 	| "amazon-bedrock"
 	| "anthropic"
 	| "google"

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added first-class `alibaba-token-plan` provider for Alibaba Cloud Model Studio's "Token Plan" OpenAI-compatible gateway (`https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`), mirroring `alibaba-coding-plan`. Resolves credentials from `ALIBABA_TOKEN_PLAN_API_KEY`, seeds six chat models (`qwen3.7-max`, `qwen3.8-max-preview`, `qwen3.7-plus`, `qwen3.6-flash`, `glm-5.2`, `deepseek-v4-pro`), and disables the OpenAI `developer` role so GLM/Qwen models complete through the gateway
+
 ## [0.1.1] - 2026-05-28
 ### Breaking Changes
 

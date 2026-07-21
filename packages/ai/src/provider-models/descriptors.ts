@@ -10,6 +10,7 @@ import { googleModelManagerOptions } from "./google";
 import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
 	alibabaCodingPlanModelManagerOptions,
+	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
@@ -132,6 +133,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"qwen3.5-plus",
 		config => alibabaCodingPlanModelManagerOptions(config),
 		catalog("Alibaba Coding Plan", ["ALIBABA_CODING_PLAN_API_KEY"]),
+	),
+	catalogDescriptor(
+		"alibaba-token-plan",
+		"qwen3.7-max",
+		config => alibabaTokenPlanModelManagerOptions(config),
+		catalog("Alibaba Token Plan", ["ALIBABA_TOKEN_PLAN_API_KEY"]),
 	),
 	descriptor("openai", "gpt-5.4", config => openaiModelManagerOptions(config)),
 	descriptor("groq", "openai/gpt-oss-120b", config => groqModelManagerOptions(config)),

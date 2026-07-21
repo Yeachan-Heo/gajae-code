@@ -21,6 +21,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "alibaba-token-plan",
+		name: "Alibaba Token Plan",
+		available: true,
+	},
+	{
 		id: "openai-codex",
 		name: "ChatGPT Plus/Pro (Codex Subscription)",
 		available: true,

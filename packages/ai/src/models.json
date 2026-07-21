@@ -1,4 +1,168 @@
 {
+	"alibaba-token-plan": {
+		"qwen3.7-max": {
+			"id": "qwen3.7-max",
+			"name": "Qwen3.7 Max",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 65536,
+			"compat": {
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"qwen3.8-max-preview": {
+			"id": "qwen3.8-max-preview",
+			"name": "Qwen3.8 Max Preview",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 131072,
+			"maxTokens": 16384,
+			"compat": {
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"qwen3.7-plus": {
+			"id": "qwen3.7-plus",
+			"name": "Qwen3.7 Plus",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 65536,
+			"compat": {
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"qwen3.6-flash": {
+			"id": "qwen3.6-flash",
+			"name": "Qwen3.6 Flash",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 65536,
+			"compat": {
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"glm-5.2": {
+			"id": "glm-5.2",
+			"name": "GLM-5.2",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 131072,
+			"compat": {
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"deepseek-v4-pro": {
+			"id": "deepseek-v4-pro",
+			"name": "DeepSeek V4 Pro",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 384000,
+			"compat": {
+				"supportsDeveloperRole": false
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		}
+	},
 	"alibaba-coding-plan": {
 		"glm-4.7": {
 			"id": "glm-4.7",

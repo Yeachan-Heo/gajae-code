@@ -1361,6 +1361,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "alibaba-token-plan": {
+				const { loginAlibabaTokenPlan } = await import("./utils/oauth/alibaba-token-plan");
+				const apiKey = await loginAlibabaTokenPlan(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "github-copilot": {
 				const { loginGitHubCopilot } = await import("./utils/oauth/github-copilot");
 				credentials = await loginGitHubCopilot({
