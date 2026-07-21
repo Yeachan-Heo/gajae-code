@@ -366,7 +366,14 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	}
 
 	async reloadForGenerationUpgrade(opts: DaemonOperationOptions = {}): Promise<TelegramGenerationReloadResult> {
-		const operation = await this.stopOrReload("reload", opts);
+		// A generation upgrade MUST replace an incompatible older-generation owner to
+		// avoid a permanent single-poller deadlock. Unlike a manual `gjc daemon
+		// reload`, this automatic path force-escalates to SIGKILL when the old owner
+		// ignores the cooperative SIGTERM within the graceful timeout, so SDK startup
+		// self-recovers instead of failing closed and asking the operator to rerun
+		// with --force. The SIGKILL remains fenced to the still-live, still-matching
+		// captured owner (same ownerId + pid), so a fresh replacement is never killed.
+		const operation = await this.stopOrReload("reload", { ...opts, force: true });
 		if (!operation.ok) return { outcome: "failed", operation };
 		const after = await this.status();
 		return after.health === "running" ? { outcome: "ready", operation } : { outcome: "failed", operation };

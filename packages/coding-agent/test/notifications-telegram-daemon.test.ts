@@ -2016,9 +2016,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps the wire protocol at 3 while legacy tombstone reclamation uses generation 11", () => {
+	test("keeps the wire protocol at 3 while force-escalated generation-upgrade reload uses generation 12", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(11);
+		expect(DAEMON_GENERATION).toBe(12);
 	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {

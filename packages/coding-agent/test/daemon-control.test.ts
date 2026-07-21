@@ -547,6 +547,40 @@ describe("TelegramDaemonController.reload", () => {
 		expect(signals.some(([, sig]) => sig === "SIGTERM")).toBe(true);
 		expect(signals.some(([, sig]) => sig === "SIGKILL")).toBe(true);
 	});
+	test("reloadForGenerationUpgrade force-escalates to SIGKILL for an unresponsive old owner (no explicit --force)", async () => {
+		const agentDir = tempAgentDir();
+		const s = settings(agentDir);
+		const state = freshState();
+		writeState(agentDir, state);
+		writeOwnershipLock(agentDir, state);
+
+		const alive = new Set<number>([999, 4242]);
+		const signals: Array<[number, string]> = [];
+		const child = readyTelegramSpawnFixture({
+			settings: s,
+			firstChildPid: 4244,
+			onSpawn: pid => alive.add(pid),
+		});
+		const ctrl = new TelegramDaemonController(s, {
+			ownerPid: 4242,
+			pidAlive: pid => alive.has(pid),
+			pidIncarnation: () => "linux:100",
+			processReference: testProcessReference((pid, sig) => {
+				signals.push([pid, sig]);
+				if (sig === "SIGKILL") alive.delete(999);
+			}),
+			spawn: child.spawn,
+			sleep: child.sleep,
+			waitStepMs: 1,
+		});
+
+		// No `force` option: the automatic generation-upgrade path must self-escalate.
+		const result = await ctrl.reloadForGenerationUpgrade({ gracefulTimeoutMs: 5, killTimeoutMs: 50 });
+		expect(result.outcome).toBe("ready");
+		expect(result.operation.ok).toBe(true);
+		expect(signals.some(([, sig]) => sig === "SIGTERM")).toBe(true);
+		expect(signals.some(([, sig]) => sig === "SIGKILL")).toBe(true);
+	});
 
 	test("does not escalate or kill when ownership changes mid-wait", async () => {
 		const agentDir = tempAgentDir();
