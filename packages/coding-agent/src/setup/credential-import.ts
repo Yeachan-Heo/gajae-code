@@ -413,11 +413,16 @@ export function formatDiscoverySummary(result: CredentialDiscoveryResult): strin
 	return lines;
 }
 
+function isExpiredImportableOAuthCredential(credential: ImportableCredential): boolean {
+	return credential.kind === "oauth" && credential.expiresAt !== undefined && credential.expiresAt <= Date.now();
+}
+
 export function isAutoImportOAuthCredential(credential: ImportableCredential): boolean {
 	return (
 		AUTO_IMPORT_OAUTH_PROVIDER_ORIGINS[credential.provider]?.has(credential.origin) === true &&
 		credential.kind === "oauth" &&
-		credential.credential.type === "oauth"
+		credential.credential.type === "oauth" &&
+		!isExpiredImportableOAuthCredential(credential)
 	);
 }
 

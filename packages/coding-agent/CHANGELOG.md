@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 ### Fixed
+- `gjc setup credentials` no longer auto-imports expired external OAuth credentials as successful Claude/Codex setup candidates; stale discovery entries remain visible as `[expired]`, but the setup/import path now leaves them out of the success path so provider availability and preset activation do not contradict the import result.
 
 - Resumed managed sessions now complete the verified legacy `local://` artifact migration before synchronous path resolution, preserving legacy scratch files instead of failing startup with a migration-order error.
 

@@ -456,10 +456,24 @@ describe("auto-import OAuth filter and orchestrator", () => {
 				kind: "oauth",
 				credential: { type: "api_key", key: "k" },
 			}),
+			oauthCredential({
+				expiresAt: Date.now() - 1,
+				credential: { type: "oauth", access: "a", refresh: "r", expires: Date.now() - 1 },
+			}),
 		];
 		for (const credential of accepted) expect(isAutoImportOAuthCredential(credential)).toBe(true);
 		for (const credential of rejected) expect(isAutoImportOAuthCredential(credential)).toBe(false);
 		expect(filterAutoImportOAuthCredentials([...accepted, ...rejected])).toEqual(accepted);
+	});
+
+	test("expired OAuth credentials are excluded from auto-import candidates", () => {
+		const fresh = oauthCredential({ expiresAt: Date.now() + 60_000 });
+		const expired = oauthCredential({
+			expiresAt: Date.now() - 60_000,
+			credential: { type: "oauth", access: "a", refresh: "r", expires: Date.now() - 60_000 },
+		});
+
+		expect(filterAutoImportOAuthCredentials([fresh, expired])).toEqual([fresh]);
 	});
 
 	test("provider-origin pairings reject impossible source/provider combinations", () => {
