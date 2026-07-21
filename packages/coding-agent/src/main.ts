@@ -13,6 +13,7 @@ import type { ImageContent } from "@gajae-code/ai";
 import {
 	$env,
 	getAgentDir,
+	$pickenv,
 	getProjectDir,
 	logger,
 	normalizePathForComparison,
@@ -1284,15 +1285,17 @@ export async function runRootCommand(
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
-	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
-	const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;
-	const slowModel = parsedArgs.slow ?? $env.PI_SLOW_MODEL;
-	const planModel = parsedArgs.plan ?? $env.PI_PLAN_MODEL;
+	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted).
+	// Documented and help-advertised as GJC_*, with the legacy PI_* name kept as a
+	// fallback to match the repo-wide GJC_-first/PI_-fallback convention.
+	const smolModel = parsedArgs.smol ?? $pickenv("GJC_SMOL_MODEL", "PI_SMOL_MODEL");
+	const slowModel = parsedArgs.slow ?? $pickenv("GJC_SLOW_MODEL", "PI_SLOW_MODEL");
+	const planModel = parsedArgs.plan ?? $pickenv("GJC_PLAN_MODEL", "PI_PLAN_MODEL");
 	if (smolModel || slowModel || planModel) {
 		settingsInstance.overrideModelRoles({
-			smol: smolModel,
-			slow: slowModel,
-			plan: planModel,
+			...(smolModel ? { smol: smolModel } : {}),
+			...(slowModel ? { slow: slowModel } : {}),
+			...(planModel ? { plan: planModel } : {}),
 		});
 	}
 
