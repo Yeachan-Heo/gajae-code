@@ -50,7 +50,7 @@ export default class Setup extends Command {
 		"gjc-command": Flags.string({ description: "Command used to start `gjc mcp-serve coordinator`" }),
 		target: Flags.string({ description: "Hermes config file target for config-only install" }),
 		"profile-dir": Flags.string({ description: "Hermes profile directory for full setup install" }),
-		preset: Flags.string({ description: "Provider preset: minimax, minimax-cn, or glm" }),
+		preset: Flags.string({ description: "Provider preset: minimax, minimax-cn, glm, or qwen-token-plan" }),
 		compat: Flags.string({ description: "Provider compatibility: openai or anthropic" }),
 		provider: Flags.string({ description: "Provider id to add to models.yml" }),
 		"base-url": Flags.string({ description: "Provider API base URL" }),
