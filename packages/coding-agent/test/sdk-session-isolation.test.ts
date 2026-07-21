@@ -181,7 +181,7 @@ describe("createAgentSession session storage isolation", () => {
 				})
 			).session;
 			expect(resolveLocalUrlToPath("local://note.md", LocalProtocolHandler.resolveOptions()!)).toBe(
-				path.join(os.tmpdir(), "gjc-local", "first-local-session", "note.md"),
+				path.join(firstArtifactsDir, "local", "note.md"),
 			);
 
 			secondSession = (
@@ -194,13 +194,13 @@ describe("createAgentSession session storage isolation", () => {
 				})
 			).session;
 			expect(resolveLocalUrlToPath("local://note.md", LocalProtocolHandler.resolveOptions()!)).toBe(
-				path.join(os.tmpdir(), "gjc-local", "second-local-session", "note.md"),
+				path.join(secondArtifactsDir, "local", "note.md"),
 			);
 
 			await secondSession.dispose();
 			secondSession = undefined;
 			expect(resolveLocalUrlToPath("local://note.md", LocalProtocolHandler.resolveOptions()!)).toBe(
-				path.join(os.tmpdir(), "gjc-local", "first-local-session", "note.md"),
+				path.join(firstArtifactsDir, "local", "note.md"),
 			);
 			await firstSession.dispose();
 			firstSession = undefined;
