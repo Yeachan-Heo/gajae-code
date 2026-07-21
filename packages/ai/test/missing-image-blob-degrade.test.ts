@@ -93,7 +93,7 @@ const DEGRADE: Record<string, string> = {
 	"length % 4 === 1 (five chars)": "abcde",
 	"misplaced padding": "ab=c",
 	"overlong padding": "YQ===",
-	"prose": "not base64 at all!!",
+	prose: "not base64 at all!!",
 	"oversized invalid": `${"prose ".repeat(2000)}!!`,
 };
 
@@ -127,7 +127,10 @@ describe("Anthropic image data must be standard base64 (invalid payloads degrade
 	}
 
 	it("drops an empty image payload without emitting an image block", () => {
-		const content = convertToolResultContent([{ type: "text", text: "only text" }, { type: "image", data: "", mimeType: "image/png" }]);
+		const content = convertToolResultContent([
+			{ type: "text", text: "only text" },
+			{ type: "image", data: "", mimeType: "image/png" },
+		]);
 		expect(imageBlockOf(content)).toBeUndefined();
 		expect(JSON.stringify(content)).toContain("only text");
 	});
