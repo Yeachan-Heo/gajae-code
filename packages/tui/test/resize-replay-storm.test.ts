@@ -447,5 +447,30 @@ describe("multiplexer resize replay storm regression", () => {
 
 			tui.stop();
 		});
+
+		it("ignores same-dimension resize events instead of clearing scrollback and replaying (iTerm2 tab switch)", async () => {
+			const term = new VirtualTerminal(COLS, 30);
+			const tui = new TUI(term);
+			tui.start();
+			await term.waitForRender();
+
+			await buildTranscript(tui, term, 60);
+			term.clearWriteLog();
+
+			// iTerm2 delivers SIGWINCH-driven resize events on tab activation and
+			// window focus changes without changing the grid size. Forcing the
+			// 2J/H/3J clear+replay on those events rebuilds scrollback and can park
+			// the native viewport at the transcript top ("thread jumps to the top
+			// after switching tabs"). A same-size event must be a plain diff render.
+			term.resize(COLS, 30);
+			await term.waitForRender();
+
+			const out = term.getWriteLog().join("");
+			expect(out).not.toContain("\x1b[3J");
+			expect(out).not.toContain("\x1b[2J");
+			expect(distinctReplayedLineMarkers(out)).toBe(0);
+
+			tui.stop();
+		});
 	});
 });
