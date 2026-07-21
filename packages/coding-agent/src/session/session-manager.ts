@@ -5552,11 +5552,12 @@ export class SessionManager {
 	getManagedLegacyLocalMigrationSource(): ManagedLegacyLocalMigrationSource | null {
 		if (this.destination.kind !== "managed" || !this.#sessionFile || this.#adoptedArtifactManager) return null;
 		const store = this.#managedTranscriptStore();
+		const legacyLocalRoot = path.posix.join(path.basename(this.#sessionFile.slice(0, -6)), "local");
 		return {
 			capture: async () => {
 				let snapshot: native.NativeDirectoryTreeSnapshot;
 				try {
-					snapshot = store.captureTree("local");
+					snapshot = store.captureTree(legacyLocalRoot);
 				} catch (error) {
 					if (error instanceof Error && error.message === "not_found") return null;
 					throw error;
@@ -5566,7 +5567,7 @@ export class SessionManager {
 				if (totalBytes > 64 * 1024 * 1024) throw new Error("Legacy local:// migration exceeds the safe size limit");
 				const entries = snapshot.entries.map(entry => {
 					if (entry.kind === "directory") return { relativePath: entry.relativePath, kind: "directory" as const };
-					const captured = store.readExpected(path.posix.join("local", entry.relativePath));
+					const captured = store.readExpected(path.posix.join(legacyLocalRoot, entry.relativePath));
 					if (
 						!captured ||
 						captured.identity.dev.toString() !== entry.dev ||
@@ -5582,12 +5583,12 @@ export class SessionManager {
 						sha256: entry.sha256,
 					};
 				});
-				const verified = store.captureTree("local");
+				const verified = store.captureTree(legacyLocalRoot);
 				if (JSON.stringify(verified) !== JSON.stringify(snapshot))
 					throw new Error("Legacy local:// migration source changed during capture");
 				return { snapshot, entries };
 			},
-			retire: snapshot => store.removeTreeExpected("local", snapshot),
+			retire: snapshot => store.removeTreeExpected(legacyLocalRoot, snapshot),
 		};
 	}
 
