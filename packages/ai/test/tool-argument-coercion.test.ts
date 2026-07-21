@@ -992,4 +992,21 @@ describe("Tool argument coercion", () => {
 		).toThrow("raw arguments rejected before coercion");
 		expect(observed).toBe("null");
 	});
+	it("surfaces a raw argument adapter's bounded rejection reason", () => {
+		const tool: Tool = {
+			name: "raw-adapter-reason",
+			description: "",
+			parameters: z.object({}),
+			rawArgumentValidation: () => ({ outcome: "reject", reason: "use the canonical argument shape" }),
+		};
+
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-raw-adapter-reason",
+				name: "raw-adapter-reason",
+				arguments: {},
+			}),
+		).toThrow('Validation failed for tool "raw-adapter-reason": use the canonical argument shape');
+	});
 });

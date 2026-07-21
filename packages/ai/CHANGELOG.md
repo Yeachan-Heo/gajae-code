@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- Raw argument validation hooks can now return a rejection reason, allowing tools to replace the generic pre-coercion failure with actionable schema guidance while preserving the existing generic message by default.
 
 ## [0.11.4] - 2026-07-20
 

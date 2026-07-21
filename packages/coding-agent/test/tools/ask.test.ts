@@ -3037,6 +3037,14 @@ describe("AskTool Round-0 intent recovery", () => {
 		expect(question).not.toHaveProperty("recommended");
 		expect(question).not.toHaveProperty("workflowGate");
 	});
+	it("explains that review-only metadata is invalid at Round 0", () => {
+		const reviewOnlyRoundZero = roundZeroPair();
+		Reflect.deleteProperty(reviewOnlyRoundZero.questions[0].deepInterview, "intent_contract");
+
+		expect(() => validateAsk(reviewOnlyRoundZero)).toThrow(
+			"Round 0 topology questions require deepInterview.intent_contract; intent_review is only valid after Round 0",
+		);
+	});
 
 	it("terminally rejects every recovery-shaped near-miss before coercion", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
@@ -3072,8 +3080,6 @@ describe("AskTool Round-0 intent recovery", () => {
 		duplicateOptions.questions[0].options = [{ label: "Looks right" }, { label: "Looks right" }];
 		const ownUndefinedGate = roundZeroPair();
 		ownUndefinedGate.questions[0].workflowGate = undefined;
-		const reviewOnlyRoundZero = roundZeroPair();
-		Reflect.deleteProperty(reviewOnlyRoundZero.questions[0].deepInterview, "intent_contract");
 		const multipleQuestions = roundZeroPair();
 		multipleQuestions.questions.push(structuredClone(multipleQuestions.questions[0]));
 		const invalidLabels = roundZeroPair();
@@ -3126,7 +3132,6 @@ describe("AskTool Round-0 intent recovery", () => {
 			extraDeep,
 			duplicateOptions,
 			ownUndefinedGate,
-			reviewOnlyRoundZero,
 			multipleQuestions,
 			invalidLabels,
 			encodedRoot,

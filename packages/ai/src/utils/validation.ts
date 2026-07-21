@@ -969,7 +969,8 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 	const originalArgs = toolCall.arguments;
 	const rawValidation = tool.rawArgumentValidation?.(originalArgs);
 	if (rawValidation?.outcome === "reject") {
-		throw new Error(`Validation failed for tool "${toolCall.name}": raw arguments rejected before coercion`);
+		const reason = rawValidation.reason ?? "raw arguments rejected before coercion";
+		throw new Error(`Validation failed for tool "${toolCall.name}": ${reason}`);
 	}
 	const rawArgs = rawValidation?.outcome === "accept" ? rawValidation.arguments : originalArgs;
 	const ctx = getValidationContext(tool);

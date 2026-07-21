@@ -712,7 +712,7 @@ export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: inf
 export type RawArgumentValidationResult =
 	| { outcome: "passthrough" }
 	| { outcome: "accept"; arguments: ToolCall["arguments"] }
-	| { outcome: "reject" };
+	| { outcome: "reject"; reason?: string };
 
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;

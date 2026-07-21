@@ -389,6 +389,12 @@ function recoverRoundZeroIntentContract(arguments_: Record<string, unknown>): Ra
 	const deepInterview = question.deepInterview;
 	const hasIntentContract = Object.hasOwn(deepInterview, "intent_contract");
 	const hasIntentReview = Object.hasOwn(deepInterview, "intent_review");
+	if (hasIntentReview && !hasIntentContract && deepInterview.round === 0)
+		return {
+			outcome: "reject",
+			reason:
+				"Round 0 topology questions require deepInterview.intent_contract; intent_review is only valid after Round 0",
+		};
 	if (hasIntentContract !== hasIntentReview && askSchema.safeParse(normalizedArguments).success)
 		return { outcome: "passthrough" };
 
