@@ -208,4 +208,32 @@ Body content`;
 		});
 		expect(result.body).toBe("Body content");
 	});
+
+	test("does not treat a dashed banner as frontmatter and preserve the body", () => {
+		const content = "----\nhello\n----\nworld";
+		const result = parse(content);
+		expect(result.frontmatter).toEqual({});
+		expect(result.body).toBe(content);
+	});
+
+	test("does not treat a '--- text' heading line as a frontmatter opener", () => {
+		const content = "--- not frontmatter\nkeep me\n--- also text\nand me";
+		const result = parse(content);
+		expect(result.frontmatter).toEqual({});
+		expect(result.body).toBe(content);
+	});
+
+	test("keeps a markdown '---' horizontal rule inside the body", () => {
+		const content = "---\ntitle: post\n---\nfirst\n\n---\n\nsecond";
+		const result = parse(content);
+		expect(result.frontmatter).toEqual({ title: "post" });
+		expect(result.body).toBe("first\n\n---\n\nsecond");
+	});
+
+	test("closes frontmatter at a delimiter with no trailing newline", () => {
+		const content = "---\nname: x\n---";
+		const result = parse(content);
+		expect(result.frontmatter).toEqual({ name: "x" });
+		expect(result.body).toBe("");
+	});
 });
