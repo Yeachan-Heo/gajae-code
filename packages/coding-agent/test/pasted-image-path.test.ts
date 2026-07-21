@@ -32,6 +32,9 @@ describe("resolvePastedImagePath", () => {
 		expect(resolvePastedImagePath(`look at ${clipboard}`)).toBeUndefined();
 		expect(resolvePastedImagePath(`${clipboard}\nmore`)).toBeUndefined();
 		expect(resolvePastedImagePath("   ")).toBeUndefined();
+		expect(resolvePastedImagePath(`${clipboard} please`)).toBeUndefined();
+		expect(resolvePastedImagePath(`"${clipboard}"`)).toBe(clipboard);
+		expect(resolvePastedImagePath(`./${path.basename(clipboard)}`, { cwd: os.tmpdir() })).toBe(clipboard);
 	});
 
 	it("rejects remote Windows paths before attachment policy", () => {
