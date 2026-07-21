@@ -236,4 +236,43 @@ Body content`;
 		expect(result.frontmatter).toEqual({ name: "x" });
 		expect(result.body).toBe("");
 	});
+
+	test("parses a BOM-prefixed frontmatter document", () => {
+		const result = parse("\uFEFF---\nname: x\n---\nbody");
+		expect(result.frontmatter).toEqual({ name: "x" });
+		expect(result.body).toBe("body");
+	});
+
+	test("strips a leading BOM from a document without frontmatter", () => {
+		const result = parse("\uFEFFhello\nworld");
+		expect(result.frontmatter).toEqual({});
+		expect(result.body).toBe("hello\nworld");
+	});
+
+	test("parses frontmatter with CRLF line endings", () => {
+		const result = parse("---\r\nname: x\r\n---\r\nbody");
+		expect(result.frontmatter).toEqual({ name: "x" });
+		expect(result.body).toBe("body");
+	});
+
+	test("accepts an opener with trailing whitespace but rejects a leading-indented one", () => {
+		expect(parse("--- \t\nname: x\n---\nbody").frontmatter).toEqual({ name: "x" });
+		const indented = "  ---\nname: x\n---\nbody";
+		expect(parse(indented).frontmatter).toEqual({});
+		expect(parse(indented).body).toBe(indented);
+	});
+
+	test("passes through a document whose opener has no closing delimiter", () => {
+		const content = "---\nname: x\nbody with no closer";
+		const result = parse(content);
+		expect(result.frontmatter).toEqual({});
+		expect(result.body).toBe(content);
+	});
+
+	test("preserves a raw leading BOM when normalization is disabled", () => {
+		const content = "\uFEFF---\nname: x\n---\nbody";
+		const result = parseFrontmatter(content, { source: "tests:frontmatter", level: "off", normalize: false });
+		expect(result.frontmatter).toEqual({});
+		expect(result.body).toBe(content);
+	});
 });

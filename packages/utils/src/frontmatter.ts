@@ -124,7 +124,10 @@ export function parseFrontmatter(
 	const loc = location ?? source;
 	const frontmatter: Record<string, unknown> = { ...fallback };
 
-	const normalized = normalize ? stripHtmlComments(content.replace(/\r\n?/g, "\n")) : content;
+	// Normalize away a leading UTF-8 BOM and CRLF line endings before matching so
+	// a BOM-prefixed but otherwise valid document is still recognized as
+	// frontmatter (BOM-prefixed Markdown is common on Windows-authored files).
+	const normalized = normalize ? stripHtmlComments(content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n")) : content;
 	// A frontmatter block opens with a line that is exactly `---` (trailing
 	// spaces/tabs allowed). A bare `----` banner or a `--- text` heading is not
 	// an opener, so a document without frontmatter keeps its body intact rather
