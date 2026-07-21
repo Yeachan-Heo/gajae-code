@@ -604,14 +604,22 @@ export const stripClaudeToolPrefix = (name: string, prefixOverride: string = cla
 	return name.slice(prefixOverride.length);
 };
 
-// Anthropic base64 image payloads use the standard alphabet only. A resident
-// image whose blob went missing carries a human-readable placeholder in `data`
-// (e.g. "[Session resident imageData blob missing: …]"); sending that as an
-// image yields a 400 `invalid base64 data` that rejects the whole request and
-// bricks the session. Guard the wire format so such payloads degrade to text.
-const ANTHROPIC_BASE64_IMAGE_DATA = /^[A-Za-z0-9+/]+={0,2}$/;
+// Anthropic requires image `data` to be standard (RFC 4648) base64: the standard
+// alphabet only, correct quartet grouping, and padding (when present) confined to
+// a trailing `=`/`==`. A resident image whose blob went missing bakes a
+// human-readable placeholder into `data` (e.g. "[Session resident imageData blob
+// missing: …]"), and other callers can pass whitespace, data URLs, or URL-safe
+// variants — all of which the API rejects with a 400 `invalid base64 data` that
+// fails the *entire* request and bricks the session. Validate the wire format
+// strictly and degrade anything that is not standard base64 to text.
+//
+// Accepts canonical padded forms and their unpadded equivalents; rejects
+// length % 4 === 1, misplaced/overlong padding, whitespace, data URLs, URL-safe
+// (`-`/`_`) alphabets, prose, and empty input. The pattern has no nested
+// quantifier, so even oversized inputs are rejected in linear time.
+const ANTHROPIC_BASE64_IMAGE_DATA = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}(?:==)?|[A-Za-z0-9+/]{3}=?)?$/;
 function isAnthropicBase64ImageData(data: string): boolean {
-	return data.length > 0 && ANTHROPIC_BASE64_IMAGE_DATA.test(data);
+	return data.length > 0 && data.length % 4 !== 1 && ANTHROPIC_BASE64_IMAGE_DATA.test(data);
 }
 
 /**
