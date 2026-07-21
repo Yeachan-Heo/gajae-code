@@ -445,7 +445,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:ownerPidFromOwnerId": "46691373b2bee01f28f3817a6aa6a7efffe880c2cea337c89155582c98d952bf",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:runDaemonInternal": "4d61235b0c32bf9afc63e1af29eaeca05368607c4997257c15febe071b30b582",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts:runDaemonSmoke": "6f085a667aa5c83de46d2d8945fb845c355fcbb43c46872342a44489203a5830",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:DAEMON_GENERATION": "682746dd8aa81832ef91c270e40029f4dde96d4cee849e87dc1afc472b124f20",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:DAEMON_GENERATION": "86184ff33055d5e7d9e81775c667638adfd703937aeacde5f6ccf0d3432c09e7",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts:NOTIFICATION_PROTOCOL_VERSION": "b99289f651fedcf020d28dbaf6f07dd37e7e4a5f6dc1f5118b872112325f1e81",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:TelegramDaemonController": "6a57f02977d821e281495414da5811b6dc7321cd3529542c8c75a67d0801186e",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts:clearOwnRequest": "5f02e8a6d69b7400db8aa5f6e33a4efcc29d9b36aa0d71aaeab151b9dbe710c3",
@@ -471,7 +471,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:confirmTelegramDaemonSpawn": "0a1326ba8971e774f8f1a42ac1e10ba682f02460646d73dd340da5739ca777a2",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:defaultPidIncarnation": "377afc123d25710c634df1fcc7f39a0c24d2034e0c31e8ed407435cc4c55a313",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunning": "0dbc6e3450ee72827d720cf492b69c4659e2f366d4d2ff4c008cc19f793a5a19",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunningDetailed": "294073d5188e33bb4830e223c09d5da0fca6d7bd35b5fabef94a1577de38f48a",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:ensureTelegramDaemonRunningDetailed": "2110f8dd201799eeaf7e2b7965b1964e8f5743e4392a07602d322d90f27871a5",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:hasSafeDaemonStateShape": "9cbc3723dec8704b55e2350c9679f7de9219affc99b2820de0a03fb72ee4172b",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isCurrentCompatibleOwner": "a1952b6356fd090a4f2031b3ffdfc090448bf3f2ced243a473c81f33f222da50",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:isFreshLiveOwner": "e6ae047ab6c06d2fbfd1f534f13db6d81ab390ff91feb02f75296be28e94163a",
@@ -501,7 +501,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:writeJsonAtomic": "a768c87646d56cf28b0adbd596884c964aed54ea40775517fa385c111af05a5b"
   },
   "nativeAuthoritySha256": {
-    "crates/pi-natives/src/path_identity.rs": "dd3bec63d7c862664f7adfba0d661b4408d2f0f14acd3d93f64ab8697c30fab9",
+    "crates/pi-natives/src/path_identity.rs": "04e0c4c1e7024752f6cc9d2d74dd8514c9b5fdc18ab7897332750f3f90b3cb54",
     "crates/pi-natives/src/ps.rs": "3c8a28d1daf84e91c3db0d29fa05a6231b871903800428ca1acbb2ddecea5f6b",
     "crates/pi-shell/src/process.rs": "3f74458492c16fff24ecc234c74efd29d2a7f5f5c5a7c879c68b00a2e4f08274",
     "packages/natives/native/index.d.ts": "86ac7c64960e28daad9b9ff1d1512d3916a7855c0aa5c814745dbfe0135be4fe",

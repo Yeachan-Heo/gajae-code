@@ -2036,7 +2036,9 @@ async function reclaimDeadDaemonOwner(input: {
 	if (!state || pidAlive(state.pid)) return false;
 	const lock = await readOwnershipLock(fsImpl, paths.lock);
 	if (lock.kind === "missing") return false;
-	if (!(await ownershipLockIsReclaimable({ fs: fsImpl, path: paths.lock, lock, now: now(), pidAlive, pidIncarnation })))
+	if (
+		!(await ownershipLockIsReclaimable({ fs: fsImpl, path: paths.lock, lock, now: now(), pidAlive, pidIncarnation }))
+	)
 		return false;
 	const transition = await acquireDaemonTransitionLock({
 		fs: fsImpl,
