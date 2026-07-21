@@ -308,6 +308,25 @@ providers:
 
 Use provider-level `headers` for proxy-required headers. Keep the provider `api` set to `openai-completions` when the proxy exposes Chat Completions-compatible `/v1/chat/completions` semantics. `auth: apiKey` sends the resolved token as bearer auth; use `auth: none` only for trusted local/no-auth endpoints.
 
+`input` is the model modality list GJC uses to decide whether image content is forwarded. When a custom model omits `input`, GJC defaults to `[text]` (unless a bundled model with the same id contributes a reference). Vision-capable upstream models therefore need an explicit `input: [text, image]`; otherwise `read`/tool images are stripped before the request and replaced with `[image omitted: model does not support vision]`, even if the remote model can see images.
+
+```yaml
+providers:
+  ali:
+    baseUrl: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+    apiKeyEnv: ALI_API_KEY
+    api: openai-completions
+    auth: apiKey
+    models:
+      # id-only → text-only; images will be omitted
+      - id: some-text-model
+      # vision-capable hosted model must declare image input
+      - id: qwen3.8-max-preview
+        name: Qwen3.8 Max Preview
+        reasoning: true
+        input: [text, image]
+```
+
 `requestTransform` and `wireModelId` remain supported for request-body shaping, but they are not needed for ordinary OpenAI-compatible proxies whose local model id is already the upstream wire id. Unknown config keys fail validation before a provider request is sent.
 
 When request shaping is needed:
