@@ -197,6 +197,18 @@ gjc ultragoal complete-goals
 
 Add `gjc team ...` only when coordinated tmux workers materially help.
 
+### Live Codex usage
+
+For stored OpenAI Codex credentials, `gjc usage` provides a script-friendly live quota probe:
+
+```sh
+gjc usage --live --json
+```
+
+The command is intentionally narrow: it checks only stored `openai-codex` credentials, requires the explicit `--live` flag, and probes accounts sequentially with a bounded per-account timeout (`--timeout <ms>`, 1000-30000, default 10000). Malformed invocations fail before credential discovery.
+
+JSON output is a closed v1 document containing only account identity, status, and normalized quota limits. It does not expose credential row ids, raw provider payloads, metadata, scopes, raw error strings, access tokens, refresh tokens, or API keys.
+
 ## Core capabilities
 
 - **Interview before guessing**: `deep-interview` turns vague requests into concrete requirements.

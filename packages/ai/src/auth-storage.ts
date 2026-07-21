@@ -121,6 +121,8 @@ export interface CheckCredentialsOptions {
 	signal?: AbortSignal;
 	/** Per-credential probe timeout (ms). Defaults to the configured usage request timeout. */
 	timeoutMs?: number;
+	/** Restrict checks to these providers before any resolver, refresh, or network probe runs. */
+	providers?: readonly Provider[];
 	/** Provider → base URL override, same shape as {@link AuthStorage.fetchUsageReports}. */
 	baseUrlResolver?: (provider: Provider) => string | undefined;
 }
@@ -2525,7 +2527,9 @@ export class AuthStorage {
 	 */
 	async checkCredentials(options?: CheckCredentialsOptions): Promise<CredentialHealthResult[]> {
 		options?.signal?.throwIfAborted();
-		const stored = this.#store.listAuthCredentials();
+		const stored = this.#store
+			.listAuthCredentials()
+			.filter(row => !options?.providers || options.providers.includes(row.provider as Provider));
 		const resolver = this.#usageProviderResolver;
 		const timeoutMs = options?.timeoutMs ?? this.#usageRequestTimeoutMs;
 		const ctx: UsageFetchContext = { fetch: this.#usageFetch, logger: this.#usageLogger };

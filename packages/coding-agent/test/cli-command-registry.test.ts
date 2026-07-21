@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { commands } from "../src/cli";
+import { commands, routeRootArgv } from "../src/cli";
 
 describe("CLI command registry", () => {
 	it("registers the `plugin` command so `gjc plugin …` resolves instead of routing to launch", () => {
@@ -48,5 +48,22 @@ describe("CLI command registry", () => {
 		const cmd = (await entry?.load()) as { description?: string } | undefined;
 		expect(cmd).toBeDefined();
 		expect(cmd?.description ?? "").toMatch(/usage statistics/i);
+	});
+
+	it("registers the `usage` command so live usage probes do not route to launch", () => {
+		const entry = commands.find(c => c.name === "usage");
+		expect(entry).toBeDefined();
+		expect(routeRootArgv(["usage", "--live", "--json"])).toEqual(["usage", "--live", "--json"]);
+		expect(routeRootArgv(["usage please summarize this code"])).toEqual([
+			"launch",
+			"usage please summarize this code",
+		]);
+	});
+
+	it("lazily resolves the registered `usage` entry to the Usage command class", async () => {
+		const entry = commands.find(c => c.name === "usage");
+		const cmd = (await entry?.load()) as { description?: string } | undefined;
+		expect(cmd).toBeDefined();
+		expect(cmd?.description ?? "").toMatch(/Codex usage/i);
 	});
 });

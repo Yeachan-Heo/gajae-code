@@ -23,6 +23,7 @@ import {
 	AuthStorage,
 	type StoredAuthCredential,
 } from "../src/auth-storage";
+import type { UsageProvider } from "../src/usage";
 import * as claudeUsage from "../src/usage/claude";
 
 function oauthRow(id: number, email: string, opts?: { expired?: boolean }): StoredAuthCredential {
@@ -35,6 +36,15 @@ function oauthRow(id: number, email: string, opts?: { expired?: boolean }): Stor
 		email,
 	};
 	return { id, provider: "anthropic", credential, disabledCause: null };
+}
+function providerOauthRow(
+	id: number,
+	provider: string,
+	email: string,
+	opts?: { expired?: boolean },
+): StoredAuthCredential {
+	const row = oauthRow(id, email, opts);
+	return { ...row, provider };
 }
 
 function makeStore(
@@ -249,6 +259,46 @@ describe("AuthStorage.checkCredentials", () => {
 			// failed (the second one) or returned no data (the third one).
 			expect(results[1].email).toBe("beta@example.com");
 			expect(results[2].email).toBe("gamma@example.com");
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("filters providers before resolver lookup, refresh, or probe side effects", async () => {
+		const refreshSpy = vi.fn<NonNullable<AuthCredentialStore["refreshOAuthCredential"]>>();
+		const store = makeStore(
+			[
+				providerOauthRow(1, "anthropic", "excluded@example.com", { expired: true }),
+				providerOauthRow(2, "openai-codex", "codex@example.com"),
+			],
+			refreshSpy,
+		);
+		const fetchUsage = vi.fn<UsageProvider["fetchUsage"]>().mockResolvedValue({
+			provider: "openai-codex",
+			fetchedAt: Date.now(),
+			limits: [],
+			metadata: { email: "codex@example.com", accountId: "account-2" },
+		});
+		const provider: UsageProvider = { id: "openai-codex", fetchUsage };
+		const resolver = vi.fn((candidate: string) => (candidate === "openai-codex" ? provider : undefined));
+
+		const storage = new AuthStorage(store, { usageProviderResolver: resolver });
+		await storage.reload();
+
+		try {
+			const results = await storage.checkCredentials({ providers: ["openai-codex"] });
+
+			expect(results).toHaveLength(1);
+			expect(results[0]).toMatchObject({
+				id: 2,
+				provider: "openai-codex",
+				email: "codex@example.com",
+				ok: true,
+			});
+			expect(resolver).toHaveBeenCalledTimes(1);
+			expect(resolver).toHaveBeenCalledWith("openai-codex");
+			expect(fetchUsage).toHaveBeenCalledTimes(1);
+			expect(refreshSpy).not.toHaveBeenCalled();
 		} finally {
 			storage.close();
 		}

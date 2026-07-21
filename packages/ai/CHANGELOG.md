@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- Added provider pre-filtering to `AuthStorage.checkCredentials()` so diagnostic probes can restrict stored credentials before refresh or network side effects.
 
 ## [0.11.4] - 2026-07-20
 

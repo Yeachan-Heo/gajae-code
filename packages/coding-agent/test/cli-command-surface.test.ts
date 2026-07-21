@@ -32,6 +32,7 @@ describe("GJC public CLI command surface", () => {
 			"ralplan",
 			"config",
 			"stats",
+			"usage",
 			"notify",
 			"sdk",
 			"daemon",
@@ -116,6 +117,59 @@ describe("GJC public CLI command surface", () => {
 		expect(stdout).toContain("Check for and install updates");
 		expect(combined).not.toContain("What's New");
 		expect(combined).not.toContain("chatContainer");
+	}, 30_000);
+	it("exposes the usage command help without probing credentials", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-usage-help-home-"));
+		try {
+			const result = Bun.spawnSync(["bun", cliEntry, "usage", "--help"], {
+				cwd: repoRoot,
+				env: { ...process.env, HOME: home, GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent") },
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const stdout = result.stdout.toString();
+			const stderr = result.stderr.toString();
+
+			expect(result.exitCode, stderr).toBe(0);
+			expect(stdout).toContain("gjc usage --live");
+			expect(stdout).toContain("--timeout");
+			expect(stderr).toBe("");
+		} finally {
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("rejects invalid usage invocations with empty stdout", async () => {
+		for (const argv of [
+			["usage"],
+			["usage", "--json"],
+			["usage", "extra", "--live"],
+			["usage", "--live", "--provider", "anthropic"],
+			["usage", "--live", "--provider=anthropic"],
+			["usage", "--live", "--unknown"],
+			["usage", "--live", "--timeout", "999"],
+			["usage", "--live", "--timeout=1000"],
+			["usage", "--live", "--help"],
+		] as const) {
+			const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-usage-invalid-home-"));
+			try {
+				const result = Bun.spawnSync(["bun", cliEntry, ...argv], {
+					cwd: repoRoot,
+					env: { ...process.env, HOME: home, GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent") },
+					stderr: "pipe",
+					stdout: "pipe",
+				});
+				const stdout = result.stdout.toString();
+				const stderr = result.stderr.toString();
+
+				expect(result.exitCode, argv.join(" ")).not.toBe(0);
+				expect(stdout, argv.join(" ")).toBe("");
+				expect(stderr, argv.join(" ")).toContain("Error:");
+				expect(stderr, argv.join(" ")).not.toContain("USAGE");
+			} finally {
+				await fs.rm(home, { recursive: true, force: true });
+			}
+		}
 	}, 30_000);
 	it("documents the session-index repair flag in gc help", () => {
 		const result = Bun.spawnSync(["bun", cliEntry, "gc", "--help"], {
