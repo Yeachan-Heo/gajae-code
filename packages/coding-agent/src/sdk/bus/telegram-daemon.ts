@@ -60,6 +60,7 @@ import {
 	formatLifecycleOutcome,
 	isLifecycleCommandLikeText,
 	isLifecycleCommandText,
+	type LifecycleCommandVerb,
 	lifecycleUsage,
 	parseLifecycleCommand,
 	validateLifecycleTarget,
@@ -3238,7 +3239,7 @@ export class TelegramNotificationDaemon {
 
 		const frame = this.buildLifecycleFrame(parsed, updateId ?? Date.now());
 		const response = await this.submitLifecycleFrame(frame);
-		await reply(this.formatLifecycleResponse(response));
+		await reply(this.formatLifecycleResponse(response, verb));
 		return true;
 	}
 
@@ -3254,8 +3255,8 @@ export class TelegramNotificationDaemon {
 	}
 
 	/** Map a lifecycle response/error to a user-facing message (G010 surfacing). */
-	private formatLifecycleResponse(r: SessionLifecycleResponse): string {
-		return formatLifecycleOutcome(r);
+	private formatLifecycleResponse(r: SessionLifecycleResponse, verb: LifecycleCommandVerb): string {
+		return formatLifecycleOutcome(r, verb);
 	}
 
 	constructor(private readonly opts: TelegramDaemonOptions) {
