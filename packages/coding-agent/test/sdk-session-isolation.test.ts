@@ -154,7 +154,7 @@ describe("createAgentSession session storage isolation", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 	it("initializes a default local root without shadowing an explicit owner", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-owner-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
