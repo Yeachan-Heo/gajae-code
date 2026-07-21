@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Coordinator MCP `await_turn`/`read_turn` now observe completion for broker-managed `--worktree` sessions. An SDK broker hosts many sessions in one process, so the runtime state sidecar cannot receive a per-session `GJC_COORDINATOR_SESSION_STATE_FILE` env and instead writes its authoritative `agent_end` record to the worktree-local `<cwd>/.gjc/_session-<id>/runtime/runtime-state.json`; the coordinator polled only its own `session-states/<id>.json`, which stayed at the `source: "coordinator"` `running` write from prompt delivery. The durable turn therefore never reached a terminal status, so `await_turn` always timed out and callers fell back to doing the work themselves even though the agent had already answered. When the coordinator's own state is non-terminal, `read_turn` now reads the runtime-authored terminal record directly (path-canonicalized and confined to the session workdir) and surfaces its `state`/`final_response`/`error`, guarding against adopting a stale earlier-turn completion by requiring the runtime completion timestamp to be at or after the turn's start.
+
 ## [0.11.6] - 2026-07-21
 ## [0.11.5] - 2026-07-20
 ### Changed
