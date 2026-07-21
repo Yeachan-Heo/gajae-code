@@ -33,6 +33,8 @@ describe("resolvePastedImagePath", () => {
 		expect(resolvePastedImagePath(`${clipboard}\nmore`)).toBeUndefined();
 		expect(resolvePastedImagePath("   ")).toBeUndefined();
 		expect(resolvePastedImagePath(`${clipboard} please`)).toBeUndefined();
+		expect(resolvePastedImagePath(`\n${clipboard}`)).toBeUndefined();
+		expect(resolvePastedImagePath(`${clipboard}\n`)).toBeUndefined();
 		expect(resolvePastedImagePath(`"${clipboard}"`)).toBe(clipboard);
 		expect(resolvePastedImagePath(`./${path.basename(clipboard)}`, { cwd: os.tmpdir() })).toBe(clipboard);
 	});
