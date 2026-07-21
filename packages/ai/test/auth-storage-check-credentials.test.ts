@@ -264,6 +264,41 @@ describe("AuthStorage.checkCredentials", () => {
 		}
 	});
 
+	it("bounds an uncooperative usage probe and continues to the next credential", async () => {
+		const store = makeStore([
+			providerOauthRow(1, "openai-codex", "timed-out@example.com"),
+			providerOauthRow(2, "openai-codex", "healthy@example.com"),
+		]);
+		const neverSettles = Promise.withResolvers<null>();
+		const fetchUsage = vi
+			.fn<UsageProvider["fetchUsage"]>()
+			.mockImplementationOnce(() => neverSettles.promise)
+			.mockResolvedValueOnce({
+				provider: "openai-codex",
+				fetchedAt: Date.now(),
+				limits: [],
+				metadata: { email: "healthy@example.com", accountId: "account-2" },
+			});
+		const provider: UsageProvider = { id: "openai-codex", fetchUsage };
+		const storage = new AuthStorage(store, { usageProviderResolver: () => provider });
+		await storage.reload();
+
+		try {
+			const startedAt = performance.now();
+			const results = await storage.checkCredentials({ timeoutMs: 10 });
+			const elapsedMs = performance.now() - startedAt;
+
+			expect(results).toMatchObject([
+				{ id: 1, provider: "openai-codex", ok: false, reason: "usage fetch aborted" },
+				{ id: 2, provider: "openai-codex", email: "healthy@example.com", ok: true },
+			]);
+			expect(fetchUsage).toHaveBeenCalledTimes(2);
+			expect(elapsedMs).toBeLessThan(1_000);
+		} finally {
+			storage.close();
+		}
+	});
+
 	it("filters providers before resolver lookup, refresh, or probe side effects", async () => {
 		const refreshSpy = vi.fn<NonNullable<AuthCredentialStore["refreshOAuthCredential"]>>();
 		const store = makeStore(

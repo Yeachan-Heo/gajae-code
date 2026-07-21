@@ -2608,7 +2608,7 @@ export class AuthStorage {
 			}
 
 			try {
-				const report = await providerImpl.fetchUsage(params, ctx);
+				const report = await raceUsageWithSignal(providerImpl.fetchUsage(params, ctx), probeSignal);
 				if (report === null) {
 					base.reason = "usage probe returned no data for this credential";
 				} else {
