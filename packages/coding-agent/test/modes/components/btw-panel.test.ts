@@ -29,7 +29,7 @@ function renderTree(component: Component, width = 80): string {
 describe("BtwPanelComponent retained rendering", () => {
 	it("keeps completed turns ordered and updates only the streaming region across deltas", () => {
 		const tui = makeTui();
-		const panel = new BtwPanelComponent({ question: "First question?", retained: true, tui });
+		const panel = new BtwPanelComponent({ question: "First question?", tui });
 		const initialChildren = [...panel.children];
 		panel.appendText("First ");
 		panel.appendText("answer");
@@ -37,7 +37,7 @@ describe("BtwPanelComponent retained rendering", () => {
 		expect(panel.children).toEqual(initialChildren);
 		panel.markComplete();
 
-		panel.beginRetainedTurn("Second question?");
+		panel.beginTurn("Second question?");
 		const afterSecondTurn = [...panel.children];
 		panel.appendText("Second answer");
 		expect(panel.children).toEqual(afterSecondTurn);
@@ -47,15 +47,15 @@ describe("BtwPanelComponent retained rendering", () => {
 		expect(joined).toContain("First answer");
 		expect(joined).toContain("Second question?");
 		expect(joined).toContain("Second answer");
-		expect(joined).toContain("Esc cancel /btw-r");
+		expect(joined).toContain("Esc cancel /btw");
 	});
 
 	it("shows follow-up dismiss guidance after completion and clears state on close", () => {
 		const tui = makeTui();
-		const panel = new BtwPanelComponent({ question: "Only?", retained: true, tui });
+		const panel = new BtwPanelComponent({ question: "Only?", tui });
 		panel.setAnswer("Done");
 		panel.markComplete();
-		expect(renderTree(panel)).toContain("Type a follow-up · Esc dismiss");
+		expect(renderTree(panel)).toContain("Type a follow-up · Esc return to main chat");
 
 		panel.close();
 		panel.appendText("should be ignored");

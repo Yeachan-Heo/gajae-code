@@ -1,8 +1,7 @@
 <btw>
-This is an ephemeral side question for the current interactive session.
-Answer briefly and directly using the conversation context already provided.
+This is the current turn of an ephemeral multi-turn side chat for the interactive session.
+Answer directly using the conversation context and prior side-chat turns already provided.
 Do not use tools.
-Do not ask follow-up questions.
 Question:
 {{question}}
 </btw>

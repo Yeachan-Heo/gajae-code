@@ -7,10 +7,10 @@ beforeAll(async () => {
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
 });
 
-function createHarness(options: { retainedOpen?: boolean; accepted?: boolean; streaming?: boolean } = {}) {
+function createHarness(options: { btwOpen?: boolean; accepted?: boolean; streaming?: boolean } = {}) {
 	let editorText = "";
-	const hasActiveBtwR = vi.fn(() => options.retainedOpen ?? false);
-	const handleBtwRFollowUp = vi.fn<(question: string) => Promise<"accepted" | "busy" | "closed">>(async () =>
+	const hasActiveBtw = vi.fn(() => options.btwOpen ?? false);
+	const handleBtwFollowUp = vi.fn<(question: string) => Promise<"accepted" | "busy" | "closed">>(async () =>
 		(options.accepted ?? true) ? "accepted" : "busy",
 	);
 	const onInputCallback = vi.fn();
@@ -64,13 +64,12 @@ function createHarness(options: { retainedOpen?: boolean; accepted?: boolean; st
 		handlePythonCommand: vi.fn(),
 		handleBackgroundCommand: vi.fn(),
 		handleBtwCommand: vi.fn(async () => {}),
-		hasActiveBtw: vi.fn(() => false),
+		hasActiveBtw,
 		handleBtwEscape: vi.fn(() => false),
-		hasActiveBtwR,
-		handleBtwRFollowUp,
+		handleBtwFollowUp,
 	} as unknown as InteractiveModeContext;
 	new InputController(ctx).setupEditorSubmitHandler();
-	return { ctx, editor, hasActiveBtwR, handleBtwRFollowUp, onInputCallback, abort, prompt };
+	return { ctx, editor, hasActiveBtw, handleBtwFollowUp, onInputCallback, abort, prompt };
 }
 
 async function submit(
@@ -81,15 +80,15 @@ async function submit(
 	await harness.editor.onSubmit?.(text);
 }
 
-describe("InputController retained /btw-r routing", () => {
-	it("captures empty, continuation literals, plain text, bash, and Python only while retained is open", async () => {
-		const open = createHarness({ retainedOpen: true, streaming: true });
+describe("InputController /btw multi-turn routing", () => {
+	it("captures empty, continuation literals, plain text, bash, and Python only while /btw is open", async () => {
+		const open = createHarness({ btwOpen: true, streaming: true });
 		await submit(open, "");
 		expect(open.abort).not.toHaveBeenCalled();
-		expect(open.handleBtwRFollowUp).not.toHaveBeenCalled();
+		expect(open.handleBtwFollowUp).not.toHaveBeenCalled();
 
 		for (const text of [".", "c", "plain follow-up", "!pwd", "$1 + 1"]) await submit(open, text);
-		expect(open.handleBtwRFollowUp.mock.calls.map(call => call[0])).toEqual([
+		expect(open.handleBtwFollowUp.mock.calls.map(call => call[0])).toEqual([
 			".",
 			"c",
 			"plain follow-up",
@@ -100,7 +99,7 @@ describe("InputController retained /btw-r routing", () => {
 		expect(open.editor.addToHistory).not.toHaveBeenCalled();
 		expect(open.editor.getText()).toBe("");
 
-		const closed = createHarness({ retainedOpen: false, streaming: true });
+		const closed = createHarness({ btwOpen: false, streaming: true });
 		await submit(closed, "");
 		expect(closed.abort).toHaveBeenCalledTimes(1);
 		await submit(closed, ".");
@@ -110,55 +109,55 @@ describe("InputController retained /btw-r routing", () => {
 		expect(closed.ctx.handleBashCommand).toHaveBeenCalledWith("pwd", false);
 		expect(closed.ctx.handlePythonCommand).toHaveBeenCalledWith("1 + 1", false);
 		expect(closed.onInputCallback).toHaveBeenCalledWith({ text: "", cancelled: false, started: true });
-		expect(closed.handleBtwRFollowUp).not.toHaveBeenCalled();
+		expect(closed.handleBtwFollowUp).not.toHaveBeenCalled();
 	});
 
-	it("preserves the draft when a retained follow-up is busy", async () => {
-		const harness = createHarness({ retainedOpen: true, accepted: false });
+	it("preserves the draft when a /btw follow-up is busy", async () => {
+		const harness = createHarness({ btwOpen: true, accepted: false });
 		await submit(harness, "wait for the current answer");
-		expect(harness.handleBtwRFollowUp).toHaveBeenCalledWith("wait for the current answer");
+		expect(harness.handleBtwFollowUp).toHaveBeenCalledWith("wait for the current answer");
 		expect(harness.editor.getText()).toBe("wait for the current answer");
 		expect(harness.onInputCallback).not.toHaveBeenCalled();
 	});
 
 	it("keeps slash-origin input on normal dispatch, including a prompt-returning command", async () => {
-		const harness = createHarness({ retainedOpen: true });
+		const harness = createHarness({ btwOpen: true });
 		await submit(harness, "/btw a known slash");
 		expect(harness.ctx.handleBtwCommand).toHaveBeenCalledWith("a known slash");
-		expect(harness.handleBtwRFollowUp).not.toHaveBeenCalled();
+		expect(harness.handleBtwFollowUp).not.toHaveBeenCalled();
 
 		await submit(harness, "/provicer");
 		expect(harness.ctx.showError).toHaveBeenCalled();
-		expect(harness.handleBtwRFollowUp).not.toHaveBeenCalled();
+		expect(harness.handleBtwFollowUp).not.toHaveBeenCalled();
 
 		await submit(harness, "/notify on");
 		expect(harness.onInputCallback).toHaveBeenLastCalledWith({ text: "/notify on", cancelled: false, started: true });
-		expect(harness.handleBtwRFollowUp).not.toHaveBeenCalled();
+		expect(harness.handleBtwFollowUp).not.toHaveBeenCalled();
 	});
 
-	it("returns to the main input path after Esc closes the retained thread", async () => {
-		const harness = createHarness({ retainedOpen: false });
+	it("returns to the main input path after Esc closes /btw", async () => {
+		const harness = createHarness({ btwOpen: false });
 		await submit(harness, "main prompt after Esc");
 		expect(harness.onInputCallback).toHaveBeenCalledWith({
 			text: "main prompt after Esc",
 			cancelled: false,
 			started: true,
 		});
-		expect(harness.handleBtwRFollowUp).not.toHaveBeenCalled();
+		expect(harness.handleBtwFollowUp).not.toHaveBeenCalled();
 	});
-	it("routes explicit follow-up keybinding into the retained thread instead of the main session", async () => {
-		const harness = createHarness({ retainedOpen: true, streaming: true });
+	it("routes the explicit follow-up keybinding into /btw instead of the main session", async () => {
+		const harness = createHarness({ btwOpen: true, streaming: true });
 		harness.editor.setText("follow-up via keybinding");
 		const controller = new InputController(harness.ctx);
 		await controller.handleFollowUp();
-		expect(harness.handleBtwRFollowUp).toHaveBeenCalledWith("follow-up via keybinding");
+		expect(harness.handleBtwFollowUp).toHaveBeenCalledWith("follow-up via keybinding");
 		expect(harness.editor.getText()).toBe("");
 		expect(harness.prompt).not.toHaveBeenCalled();
 		expect(harness.editor.addToHistory).not.toHaveBeenCalled();
 	});
 
-	it("captures non-slash text with an embedded skill command in the retained thread", async () => {
-		const harness = createHarness({ retainedOpen: true });
+	it("captures non-slash text with an embedded skill command in /btw", async () => {
+		const harness = createHarness({ btwOpen: true });
 		const skill = {
 			name: "demo",
 			description: "demo skill",
@@ -185,12 +184,12 @@ describe("InputController retained /btw-r routing", () => {
 
 		await submit(harness, "what does /skill:demo do?");
 
-		expect(harness.handleBtwRFollowUp).toHaveBeenCalledWith("what does /skill:demo do?");
+		expect(harness.handleBtwFollowUp).toHaveBeenCalledWith("what does /skill:demo do?");
 		expect(promptCustomMessage).not.toHaveBeenCalled();
 		expect(harness.onInputCallback).not.toHaveBeenCalled();
 	});
-	it("keeps slash-origin follow-up keybinding off the retained path so /skill:* can dispatch normally", async () => {
-		const harness = createHarness({ retainedOpen: true, streaming: true });
+	it("keeps slash-origin follow-up keybinding off /btw so /skill:* can dispatch normally", async () => {
+		const harness = createHarness({ btwOpen: true, streaming: true });
 		const skill = {
 			name: "demo",
 			description: "demo skill",
@@ -223,8 +222,8 @@ describe("InputController retained /btw-r routing", () => {
 		const controller = new InputController(harness.ctx);
 		await controller.handleFollowUp();
 
-		// Slash-origin must never enter retained capture.
-		expect(harness.handleBtwRFollowUp).not.toHaveBeenCalled();
+		// Slash-origin must never enter /btw capture.
+		expect(harness.handleBtwFollowUp).not.toHaveBeenCalled();
 		expect(promptCustomMessage).toHaveBeenCalled();
 		expect(promptCustomMessage.mock.calls[0]?.[1]).toMatchObject({
 			streamingBehavior: "followUp",

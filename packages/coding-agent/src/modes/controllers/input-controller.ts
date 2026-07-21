@@ -752,10 +752,10 @@ export class InputController {
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
 		text = text.trim();
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
-		if (this.ctx.hasActiveBtwR()) {
+		if (this.ctx.hasActiveBtw()) {
 			if (!text) return;
 			if (text === "." || text === "c") {
-				if ((await this.ctx.handleBtwRFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
+				if ((await this.ctx.handleBtwFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
 					this.ctx.editor.setText("");
 				}
 				return;
@@ -819,8 +819,8 @@ export class InputController {
 			text = slashResult;
 		}
 
-		if (this.ctx.hasActiveBtwR() && !wasSlashOrigin) {
-			if ((await this.ctx.handleBtwRFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
+		if (this.ctx.hasActiveBtw() && !wasSlashOrigin) {
+			if ((await this.ctx.handleBtwFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
 				this.ctx.editor.setText("");
 			}
 			return;
@@ -1374,10 +1374,10 @@ export class InputController {
 	async handleFollowUp(): Promise<void> {
 		const text = this.ctx.editor.getText().trim();
 		if (!text) return;
-		// Mirror Enter: plain retained capture only. Slash-origin stays on normal
-		// dispatch so /skill:* and other slash commands keep working.
-		if (this.ctx.hasActiveBtwR() && !text.startsWith("/")) {
-			if ((await this.ctx.handleBtwRFollowUp(text)) === "accepted") {
+		// While /btw is open, plain text stays in the side chat. Slash-origin
+		// input keeps normal dispatch so commands remain available.
+		if (this.ctx.hasActiveBtw() && !text.startsWith("/")) {
+			if ((await this.ctx.handleBtwFollowUp(text)) === "accepted") {
 				this.ctx.editor.setText("");
 			}
 			return;

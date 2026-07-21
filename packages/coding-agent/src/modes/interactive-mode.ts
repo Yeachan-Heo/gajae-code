@@ -2023,20 +2023,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	handleBtwCommand(question: string): Promise<void> {
 		return this.#btwController.start(question);
 	}
-	handleBtwRCommand(question: string): Promise<void> {
-		return this.#btwController.startRetained(question);
-	}
 
 	hasActiveBtw(): boolean {
 		return this.#btwController.hasOpenPanel();
 	}
 
-	hasActiveBtwR(): boolean {
-		return this.#btwController.hasOpenRetainedThread();
-	}
-
-	handleBtwRFollowUp(question: string): Promise<"accepted" | "busy" | "closed"> {
-		return this.#btwController.submitRetainedFollowUp(question);
+	handleBtwFollowUp(question: string): Promise<"accepted" | "busy" | "closed"> {
+		return this.#btwController.submitFollowUp(question);
 	}
 
 	handleBtwEscape(): boolean {

@@ -7,11 +7,10 @@ type BtwPanelState = "running" | "complete" | "aborted" | "error";
 
 interface BtwPanelComponentOptions {
 	question: string;
-	retained?: boolean;
 	tui: TUI;
 }
 
-interface RetainedTurn {
+interface BtwTurn {
 	question: string;
 	answer: string;
 	state: BtwPanelState;
@@ -21,24 +20,22 @@ interface RetainedTurn {
 export class BtwPanelComponent extends Container {
 	#question: string;
 	#tui: TUI;
-	#retained: boolean;
 	#state: BtwPanelState = "running";
 	#answer = "";
 	#errorMessage: string | undefined;
-	#completedTurns: RetainedTurn[] = [];
+	#completedTurns: BtwTurn[] = [];
 	#streamingContent = new Container();
 	#closed = false;
 
 	constructor(options: BtwPanelComponentOptions) {
 		super();
 		this.#question = options.question;
-		this.#retained = options.retained ?? false;
 		this.#tui = options.tui;
 		this.#rebuild();
 	}
 
-	beginRetainedTurn(question: string): void {
-		if (!this.#retained || this.#closed) return;
+	beginTurn(question: string): void {
+		if (this.#closed) return;
 		this.#completedTurns.push(this.#currentTurn());
 		this.#question = question;
 		this.#answer = "";
@@ -50,21 +47,13 @@ export class BtwPanelComponent extends Container {
 	appendText(delta: string): void {
 		if (!delta || this.#closed) return;
 		this.#answer += delta;
-		if (this.#retained) {
-			this.#updateStreamingContent();
-			return;
-		}
-		this.#rebuild();
+		this.#updateStreamingContent();
 	}
 
 	setAnswer(text: string): void {
 		if (this.#closed) return;
 		this.#answer = text;
-		if (this.#retained) {
-			this.#updateStreamingContent();
-			return;
-		}
-		this.#rebuild();
+		this.#updateStreamingContent();
 	}
 
 	markComplete(): void {
@@ -90,30 +79,26 @@ export class BtwPanelComponent extends Container {
 
 	close(): void {
 		this.#closed = true;
+		this.#question = "";
 		this.#completedTurns = [];
 		this.#answer = "";
 		this.#errorMessage = undefined;
 		this.#streamingContent.clear();
+		this.clear();
 	}
 
 	#rebuild(): void {
 		this.clear();
 		this.addChild(new DynamicBorder(str => theme.fg("dim", str)));
 		this.addChild(new Spacer(1));
-		if (this.#retained) {
-			for (const turn of this.#completedTurns) {
-				this.addChild(this.#turnComponent(turn));
-				this.addChild(new Spacer(1));
-			}
-			this.addChild(new Text(theme.fg("accent", replaceTabs(this.#question)), 1, 0));
+		for (const turn of this.#completedTurns) {
+			this.addChild(this.#turnComponent(turn));
 			this.addChild(new Spacer(1));
-			this.#updateStreamingContent(false);
-			this.addChild(this.#streamingContent);
-		} else {
-			this.addChild(new Text(theme.fg("accent", replaceTabs(this.#question)), 1, 0));
-			this.addChild(new Spacer(1));
-			this.addChild(this.#contentComponent(this.#state, this.#answer, this.#errorMessage));
 		}
+		this.addChild(new Text(theme.fg("accent", replaceTabs(this.#question)), 1, 0));
+		this.addChild(new Spacer(1));
+		this.#updateStreamingContent(false);
+		this.addChild(this.#streamingContent);
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(this.#footerLine(), 1, 0));
 		this.addChild(new Spacer(1));
@@ -127,7 +112,7 @@ export class BtwPanelComponent extends Container {
 		if (requestRender) this.#tui.requestRender();
 	}
 
-	#currentTurn(): RetainedTurn {
+	#currentTurn(): BtwTurn {
 		return {
 			question: this.#question,
 			answer: this.#answer,
@@ -136,7 +121,7 @@ export class BtwPanelComponent extends Container {
 		};
 	}
 
-	#turnComponent(turn: RetainedTurn): Component {
+	#turnComponent(turn: BtwTurn): Component {
 		const container = new Container();
 		container.addChild(new Text(theme.fg("accent", replaceTabs(turn.question)), 1, 0));
 		container.addChild(new Spacer(1));
@@ -145,27 +130,18 @@ export class BtwPanelComponent extends Container {
 	}
 
 	#footerLine(): string {
-		if (this.#retained) {
-			switch (this.#state) {
-				case "running":
-					return theme.fg("muted", "Esc cancel /btw-r");
-				case "complete":
-					return theme.fg("muted", "Type a follow-up · Esc dismiss");
-				case "aborted":
-					return theme.fg("warning", `${theme.status.warning} Cancelled · Type a follow-up · Esc dismiss`);
-				case "error":
-					return theme.fg("error", `${theme.status.error} Error · Type a follow-up · Esc dismiss`);
-			}
-		}
 		switch (this.#state) {
 			case "running":
-				return theme.fg("muted", "Esc cancel /btw");
+				return theme.fg("muted", "Esc cancel /btw and return to main chat");
 			case "complete":
-				return theme.fg("muted", "Esc dismiss");
+				return theme.fg("muted", "Type a follow-up · Esc return to main chat");
 			case "aborted":
-				return theme.fg("warning", `${theme.status.warning} Cancelled · Esc dismiss`);
+				return theme.fg(
+					"warning",
+					`${theme.status.warning} Cancelled · Type a follow-up · Esc return to main chat`,
+				);
 			case "error":
-				return theme.fg("error", `${theme.status.error} Error · Esc dismiss`);
+				return theme.fg("error", `${theme.status.error} Error · Type a follow-up · Esc return to main chat`);
 		}
 	}
 

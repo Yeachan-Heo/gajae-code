@@ -1515,24 +1515,13 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "btw",
-		description: "Ask an ephemeral side question using the current session context",
+		description: "Start an ephemeral multi-turn side chat using the current session context",
 		inlineHint: "<question>",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
 			const question = command.text.slice(`/${command.name}`.length).trim();
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleBtwCommand(question);
-		},
-	},
-	{
-		name: "btw-r",
-		description: "Start an ephemeral retained side chat using the current session context",
-		inlineHint: "<question>",
-		allowArgs: true,
-		handleTui: async (command, runtime) => {
-			const question = command.text.slice(`/${command.name}`.length).trim();
-			runtime.ctx.editor.setText("");
-			await runtime.ctx.handleBtwRCommand(question);
 		},
 	},
 	{

@@ -91,64 +91,6 @@ describe("BtwController", () => {
 		expect(controller.hasActiveRequest()).toBe(true);
 	});
 
-	it("replaces a previous request by aborting it before issuing the next runEphemeralTurn", async () => {
-		const signals: AbortSignal[] = [];
-		const first = Promise.withResolvers<RunEphemeralTurnResult>();
-		const runEphemeralTurn = vi
-			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
-			.mockImplementationOnce(async args => {
-				signals.push(args.signal as AbortSignal);
-				return first.promise;
-			})
-			.mockImplementationOnce(async args => {
-				signals.push(args.signal as AbortSignal);
-				return { replyText: "second", assistantMessage: createAssistantMessage("second") };
-			});
-		const btwContainer = new Container();
-		const ctx = makeCtx(makeFakeSession(runEphemeralTurn), btwContainer);
-		const controller = new BtwController(ctx);
-
-		await controller.start("First?");
-		await controller.start("Second?");
-		// Allow the second call to settle.
-		await Promise.resolve();
-		await Promise.resolve();
-
-		expect(runEphemeralTurn).toHaveBeenCalledTimes(2);
-		expect(signals[0]?.aborted).toBe(true);
-		expect(signals[1]?.aborted).toBe(false);
-		expect(btwContainer.children).toHaveLength(1);
-		// Allow the orphaned first request to finish to keep the test clean.
-		first.resolve({ replyText: "first", assistantMessage: createAssistantMessage("first") });
-	});
-
-	it("suppresses deltas and completion from a replaced request", async () => {
-		const first = Promise.withResolvers<RunEphemeralTurnResult>();
-		const second = Promise.withResolvers<RunEphemeralTurnResult>();
-		let firstArgs: RunEphemeralTurnArgs | undefined;
-		const runEphemeralTurn = vi
-			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
-			.mockImplementationOnce(args => {
-				firstArgs = args;
-				return first.promise;
-			})
-			.mockImplementationOnce(() => second.promise);
-		const btwContainer = new Container();
-		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn), btwContainer));
-
-		await controller.start("Old?");
-		await controller.start("Current?");
-		firstArgs?.onTextDelta?.("late old text");
-		first.resolve({ replyText: "late old answer", assistantMessage: createAssistantMessage("late old answer") });
-		await Promise.resolve();
-		await Promise.resolve();
-
-		const rendered = Bun.stripANSI(btwContainer.render(80).join("\n"));
-		expect(rendered).toContain("Current?");
-		expect(rendered).not.toContain("late old");
-		second.resolve({ replyText: "current", assistantMessage: createAssistantMessage("current") });
-	});
-
 	it("renders a side-request error without invoking main-session lifecycle methods", async () => {
 		const runEphemeralTurn = vi.fn(async () => {
 			throw new Error("side establishment failed");
@@ -209,7 +151,7 @@ describe("BtwController", () => {
 		expect(runEphemeralTurn).not.toHaveBeenCalled();
 		expect(ctx.showError).toHaveBeenCalled();
 	});
-	it("replays completed retained turns as text-only visible exchanges", async () => {
+	it("replays completed /btw turns as text-only visible exchanges", async () => {
 		const firstAssistant = createAssistantMessage("First answer");
 		const runEphemeralTurn = vi
 			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
@@ -221,70 +163,69 @@ describe("BtwController", () => {
 		const ctx = makeCtx(makeFakeSession(runEphemeralTurn));
 		const controller = new BtwController(ctx);
 
-		await controller.startRetained("  First question?  ");
+		await controller.start("  First question?  ");
 		await Promise.resolve();
 		await Promise.resolve();
 
-		expect(controller.hasOpenRetainedThread()).toBe(true);
-		expect(controller.isRetainedTurnInFlight()).toBe(false);
-		expect(await controller.submitRetainedFollowUp("Second question?")).toBe("accepted");
+		expect(controller.hasOpenPanel()).toBe(true);
+		expect(controller.isTurnInFlight()).toBe(false);
+		expect(await controller.submitFollowUp("Second question?")).toBe("accepted");
 		await Promise.resolve();
 		await Promise.resolve();
 
 		const secondCall = runEphemeralTurn.mock.calls[1]?.[0];
-		expect(secondCall?.promptText).toContain("<btw-r>");
+		expect(secondCall?.promptText).toContain("<btw>");
 		expect(secondCall?.contextExchanges).toEqual([{ question: "First question?", answer: "First answer" }]);
-		expect(controller.isRetainedTurnInFlight()).toBe(false);
+		expect(controller.isTurnInFlight()).toBe(false);
 	});
 
-	it("rejects retained follow-ups while a request is in flight", async () => {
+	it("rejects /btw follow-ups while a request is in flight", async () => {
 		const runEphemeralTurn = vi.fn(async () => new Promise<RunEphemeralTurnResult>(() => {}));
 		const ctx = makeCtx(makeFakeSession(runEphemeralTurn));
 		const controller = new BtwController(ctx);
 
-		await controller.startRetained("First?");
-		expect(await controller.submitRetainedFollowUp("Second?")).toBe("busy");
+		await controller.start("First?");
+		expect(await controller.submitFollowUp("Second?")).toBe("busy");
 		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
 		expect(ctx.showStatus).toHaveBeenCalledWith(expect.stringContaining("still answering"));
 	});
-	it("blocks one-shot replacement and retained re-entry while a retained thread is open", async () => {
+	it("blocks a second /btw command while the side chat is open", async () => {
 		const runEphemeralTurn = vi.fn(async () => new Promise<RunEphemeralTurnResult>(() => {}));
 		const ctx = makeCtx(makeFakeSession(runEphemeralTurn));
 		const controller = new BtwController(ctx);
 
-		await controller.startRetained("First?");
-		await controller.start("One-shot?");
-		await controller.startRetained("Replacement?");
+		await controller.start("First?");
+		await controller.start("Replacement?");
 
 		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
-		expect(controller.hasOpenRetainedThread()).toBe(true);
-		expect(ctx.showStatus).toHaveBeenCalledTimes(2);
+		expect(controller.hasOpenPanel()).toBe(true);
+		expect(ctx.showStatus).toHaveBeenCalledTimes(1);
 	});
 
-	it("keeps retained complete and error panels open until Escape", async () => {
+	it("keeps complete and error turns open until Escape", async () => {
 		const runEphemeralTurn = vi
 			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
 			.mockResolvedValueOnce({ replyText: "Answer", assistantMessage: createAssistantMessage("Answer") })
 			.mockRejectedValueOnce(new Error("boom"));
 		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn)));
 
-		await controller.startRetained("First?");
+		await controller.start("First?");
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(controller.hasActiveRequest()).toBe(true);
-		expect(controller.isRetainedTurnInFlight()).toBe(false);
+		expect(controller.isTurnInFlight()).toBe(false);
 
-		expect(await controller.submitRetainedFollowUp("Second?")).toBe("accepted");
+		expect(await controller.submitFollowUp("Second?")).toBe("accepted");
 		await Promise.resolve();
 		await Promise.resolve();
-		expect(controller.hasOpenRetainedThread()).toBe(true);
-		expect(controller.isRetainedTurnInFlight()).toBe(false);
+		expect(controller.hasOpenPanel()).toBe(true);
+		expect(controller.isTurnInFlight()).toBe(false);
 
 		expect(controller.handleEscape()).toBe(true);
-		expect(controller.hasOpenRetainedThread()).toBe(false);
+		expect(controller.hasOpenPanel()).toBe(false);
 	});
 
-	it("records failed retained turns into context so later follow-ups can see the failed question", async () => {
+	it("records failed /btw turns so later follow-ups can see the failed question", async () => {
 		const runEphemeralTurn = vi
 			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
 			.mockRejectedValueOnce(new Error("provider unavailable"))
@@ -294,13 +235,13 @@ describe("BtwController", () => {
 			});
 		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn)));
 
-		await controller.startRetained("Failed question?");
+		await controller.start("Failed question?");
 		await Promise.resolve();
 		await Promise.resolve();
-		expect(controller.hasOpenRetainedThread()).toBe(true);
-		expect(controller.isRetainedTurnInFlight()).toBe(false);
+		expect(controller.hasOpenPanel()).toBe(true);
+		expect(controller.isTurnInFlight()).toBe(false);
 
-		expect(await controller.submitRetainedFollowUp("try again")).toBe("accepted");
+		expect(await controller.submitFollowUp("try again")).toBe("accepted");
 		await Promise.resolve();
 		await Promise.resolve();
 
@@ -310,7 +251,7 @@ describe("BtwController", () => {
 		]);
 	});
 
-	it("aborts and scrubs retained state synchronously on Escape", async () => {
+	it("aborts and scrubs /btw state synchronously on Escape", async () => {
 		const pending = Promise.withResolvers<RunEphemeralTurnResult>();
 		let capturedArgs: RunEphemeralTurnArgs | undefined;
 		const runEphemeralTurn = vi.fn((args: RunEphemeralTurnArgs) => {
@@ -319,11 +260,11 @@ describe("BtwController", () => {
 		});
 		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn)));
 
-		await controller.startRetained("private question");
+		await controller.start("private question");
 		expect(controller.handleEscape()).toBe(true);
 		expect(capturedArgs?.signal?.aborted).toBe(true);
-		expect(controller.hasOpenRetainedThread()).toBe(false);
-		expect(await controller.submitRetainedFollowUp("must not survive")).toBe("closed");
+		expect(controller.hasOpenPanel()).toBe(false);
+		expect(await controller.submitFollowUp("must not survive")).toBe("closed");
 
 		pending.resolve({
 			replyText: "late private answer",
@@ -331,30 +272,5 @@ describe("BtwController", () => {
 		});
 		await Promise.resolve();
 		expect(controller.hasActiveRequest()).toBe(false);
-	});
-	it("lets /btw-r replace an open one-shot /btw panel", async () => {
-		const signals: AbortSignal[] = [];
-		const runEphemeralTurn = vi
-			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
-			.mockImplementationOnce(async args => {
-				signals.push(args.signal as AbortSignal);
-				return new Promise(() => {});
-			})
-			.mockImplementationOnce(async args => {
-				signals.push(args.signal as AbortSignal);
-				return { replyText: "retained", assistantMessage: createAssistantMessage("retained") };
-			});
-		const btwContainer = new Container();
-		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn), btwContainer));
-
-		await controller.start("One-shot?");
-		await controller.startRetained("Retained?");
-		await Promise.resolve();
-		await Promise.resolve();
-
-		expect(runEphemeralTurn).toHaveBeenCalledTimes(2);
-		expect(signals[0]?.aborted).toBe(true);
-		expect(controller.hasOpenRetainedThread()).toBe(true);
-		expect(btwContainer.children).toHaveLength(1);
 	});
 });

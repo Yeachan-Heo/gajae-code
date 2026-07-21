@@ -14194,9 +14194,9 @@ export class AgentSession {
 			messages.push({
 				role: "assistant",
 				content: [{ type: "text", text: exchange.answer }],
-				api: "btw-r",
-				provider: "btw-r",
-				model: "btw-r",
+				api: "btw",
+				provider: "btw",
+				model: "btw",
 				usage: {
 					input: 0,
 					output: 0,

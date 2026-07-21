@@ -1,17 +1,15 @@
 import { prompt } from "@gajae-code/utils";
-import btwRUserPrompt from "../../prompts/system/btw-r-user.md" with { type: "text" };
 import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
 import type { EphemeralTextExchange } from "../../session/agent-session";
 import { BtwPanelComponent } from "../components/btw-panel";
 import type { InteractiveModeContext } from "../types";
 
-type RetainedFollowUpResult = "accepted" | "busy" | "closed";
+type BtwFollowUpResult = "accepted" | "busy" | "closed";
 
 interface BtwRequest {
 	component: BtwPanelComponent;
 	abortController: AbortController | undefined;
 	question: string;
-	mode: "one-shot" | "retained";
 	inFlight: boolean;
 	contextExchanges: EphemeralTextExchange[];
 }
@@ -29,12 +27,8 @@ export class BtwController {
 		return this.hasActiveRequest();
 	}
 
-	hasOpenRetainedThread(): boolean {
-		return this.#activeRequest?.mode === "retained";
-	}
-
-	isRetainedTurnInFlight(): boolean {
-		return this.#activeRequest?.mode === "retained" && this.#activeRequest.inFlight;
+	isTurnInFlight(): boolean {
+		return this.#activeRequest?.inFlight ?? false;
 	}
 
 	handleEscape(): boolean {
@@ -48,8 +42,8 @@ export class BtwController {
 	}
 
 	async start(question: string): Promise<void> {
-		if (this.hasOpenRetainedThread()) {
-			this.ctx.showStatus("A /btw-r thread is open. Type a follow-up or press Esc to dismiss it.");
+		if (this.hasOpenPanel()) {
+			this.ctx.showStatus("A /btw chat is already open. Type a follow-up or press Esc to return to the main chat.");
 			return;
 		}
 
@@ -58,65 +52,43 @@ export class BtwController {
 			this.ctx.showStatus("Usage: /btw <question>");
 			return;
 		}
-		if (!this.#hasModel("/btw")) return;
+		if (!this.#hasModel()) return;
 
-		this.#closeActiveRequest();
-		const request = this.#openRequest(trimmedQuestion, "one-shot");
-		void this.#runOneShotRequest(request);
+		const request = this.#openRequest(trimmedQuestion);
+		void this.#runRequest(request);
 	}
 
-	async startRetained(question: string): Promise<void> {
-		if (this.hasOpenRetainedThread()) {
-			this.ctx.showStatus("A /btw-r thread is already open. Type a follow-up or press Esc to dismiss it.");
-			return;
-		}
-
-		const trimmedQuestion = question.trim();
-		if (!trimmedQuestion) {
-			this.ctx.showStatus("Usage: /btw-r <question>");
-			return;
-		}
-		if (!this.#hasModel("/btw-r")) return;
-
-		this.#closeActiveRequest();
-		const request = this.#openRequest(trimmedQuestion, "retained");
-		void this.#runRetainedRequest(request);
-	}
-
-	async submitRetainedFollowUp(question: string): Promise<RetainedFollowUpResult> {
+	async submitFollowUp(question: string): Promise<BtwFollowUpResult> {
 		const request = this.#activeRequest;
-		if (request?.mode !== "retained") {
-			return "closed";
-		}
+		if (!request) return "closed";
 		if (request.inFlight) {
-			this.ctx.showStatus("The /btw-r thread is still answering. Wait for it to finish.");
+			this.ctx.showStatus("The /btw chat is still answering. Wait for it to finish.");
 			return "busy";
 		}
 
 		const trimmedQuestion = question.trim();
 		if (!trimmedQuestion) return "closed";
-		if (!this.#hasModel("/btw-r")) return "closed";
+		if (!this.#hasModel()) return "closed";
 
 		request.question = trimmedQuestion;
 		request.abortController = new AbortController();
 		request.inFlight = true;
-		request.component.beginRetainedTurn(trimmedQuestion);
-		void this.#runRetainedRequest(request);
+		request.component.beginTurn(trimmedQuestion);
+		void this.#runRequest(request);
 		return "accepted";
 	}
 
-	#hasModel(command: "/btw" | "/btw-r"): boolean {
+	#hasModel(): boolean {
 		if (this.ctx.session.model) return true;
-		this.ctx.showError(`No active model available for ${command}.`);
+		this.ctx.showError("No active model available for /btw.");
 		return false;
 	}
 
-	#openRequest(question: string, mode: BtwRequest["mode"]): BtwRequest {
+	#openRequest(question: string): BtwRequest {
 		const request: BtwRequest = {
-			component: new BtwPanelComponent({ question, retained: mode === "retained", tui: this.ctx.ui }),
+			component: new BtwPanelComponent({ question, tui: this.ctx.ui }),
 			abortController: new AbortController(),
 			question,
-			mode,
 			inFlight: true,
 			contextExchanges: [],
 		};
@@ -127,40 +99,12 @@ export class BtwController {
 		return request;
 	}
 
-	async #runOneShotRequest(request: BtwRequest): Promise<void> {
-		const abortController = request.abortController;
-		if (!abortController) return;
-		try {
-			const promptText = prompt.render(btwUserPrompt, { question: request.question });
-			const { replyText } = await this.ctx.session.runEphemeralTurn({
-				purpose: "btw",
-				promptText,
-				onTextDelta: delta => {
-					if (this.#isActiveRequest(request)) request.component.appendText(delta);
-				},
-				signal: abortController.signal,
-			});
-			if (!this.#isActiveRequest(request)) return;
-			request.inFlight = false;
-			if (replyText) request.component.setAnswer(replyText);
-			request.component.markComplete();
-		} catch (error) {
-			if (!this.#isActiveRequest(request)) return;
-			request.inFlight = false;
-			if (abortController.signal.aborted) {
-				request.component.markAborted();
-				return;
-			}
-			request.component.markError(error instanceof Error ? error.message : String(error));
-		}
-	}
-
-	async #runRetainedRequest(request: BtwRequest): Promise<void> {
+	async #runRequest(request: BtwRequest): Promise<void> {
 		const abortController = request.abortController;
 		if (!abortController) return;
 		const question = request.question;
 		try {
-			const promptText = prompt.render(btwRUserPrompt, { question });
+			const promptText = prompt.render(btwUserPrompt, { question });
 			const { replyText } = await this.ctx.session.runEphemeralTurn({
 				purpose: "btw",
 				promptText,

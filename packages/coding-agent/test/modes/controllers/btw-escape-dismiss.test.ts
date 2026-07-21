@@ -112,21 +112,21 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 			replyText: "Answer",
 			assistantMessage: {},
 		}));
-		await completed.btw.startRetained("Why?");
+		await completed.btw.start("Why?");
 		await drain();
-		expect(completed.btw.hasOpenRetainedThread()).toBe(true);
+		expect(completed.btw.hasOpenPanel()).toBe(true);
 		completed.editor.handleInput(ESC);
-		expect(completed.btw.hasOpenRetainedThread()).toBe(false);
+		expect(completed.btw.hasOpenPanel()).toBe(false);
 		expect(completed.btwContainer.children).toHaveLength(0);
 
 		const errored = makeHarness(async () => {
 			throw new Error("boom");
 		});
-		await errored.btw.startRetained("Why?");
+		await errored.btw.start("Why?");
 		await drain();
-		expect(errored.btw.hasOpenRetainedThread()).toBe(true);
+		expect(errored.btw.hasOpenPanel()).toBe(true);
 		errored.editor.handleInput(ESC);
-		expect(errored.btw.hasOpenRetainedThread()).toBe(false);
+		expect(errored.btw.hasOpenPanel()).toBe(false);
 		expect(errored.btwContainer.children).toHaveLength(0);
 	});
 	it("dismisses under the kitty keyboard protocol encoding of Esc", async () => {
