@@ -32,6 +32,9 @@
 ### Fixed
 
 - Fixed frequent `Request blocked (code=invalid_prompt)` failures on gpt-5.6 (Sol/Terra/Luna) subagent, default-agent, and compaction turns (ref openai/codex#32028, oh-my-pi#5184). Leaked Harmony control-token markers (e.g. `<|channel|>analysis`) were only neutralized on the replayed-history payload path, so markers in assistant reasoning summaries, live-converted message/tool-output text, and user-authored content reached the OpenAI Responses and OpenAI-codex-responses transports verbatim and wedged the session (the poisoned item was re-sent every turn). Both transports now neutralize reserved control tokens across the entire outgoing `input` array at the request boundary via an idempotent zero-width-space insertion that keeps the text human-readable.
+### Fixed
+
+- Fixed Fable 5 adaptive thinking being billed but never displayed: model discovery now classifies `claude-fable-*` as `anthropic-adaptive` (was cached as `budget`, sending `enabled`+`budget_tokens` that Fable answers with signature-only thinking), and `supportsAdaptiveThinkingDisplay` opts Fable into `display: "summarized"` on both Anthropic Messages and Bedrock Converse transports (#2791).
 
 ## [0.10.0] - 2026-07-12
 ### Fixed
