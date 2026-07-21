@@ -127,6 +127,67 @@ describe("resident byte-sensitive IMAGE/PROVIDER materialization is fail-closed"
 	});
 });
 
+function messageEntry(content: unknown[]): Record<string, unknown> {
+	return {
+		type: "message",
+		id: "missing-image-entry",
+		parentId: null,
+		timestamp: new Date(0).toISOString(),
+		message: { role: "user", content, timestamp: 0 },
+	};
+}
+
+function materializedContent(entry: Record<string, unknown>, store: EphemeralBlobStore): unknown[] {
+	const [out] = materializeResidentEntriesForPersistenceForTests([entry], store);
+	return ((out as { message: { content: unknown[] } }).message.content ?? []) as unknown[];
+}
+
+// A missing resident IMAGE blob must never leave an image block whose base64/URL
+// payload is the "blob missing" placeholder: providers reject it (e.g. Anthropic
+// 400 `invalid base64 data`), bricking the whole session. The block is degraded
+// to a text block so one lost image cannot poison the request.
+describe("missing resident IMAGE blocks degrade to a valid text block", () => {
+	test("base64 image block with a missing imageData blob becomes a text block", () => {
+		const store = makeStore();
+		const entry = messageEntry([
+			{ type: "text", text: "screenshot:" },
+			{
+				type: "image",
+				source: { type: "base64", media_type: "image/webp", data: residentBlobSentinelForTests("imageData", MISSING_REF) },
+			},
+		]);
+		const [text, image] = materializedContent(entry, store) as Array<Record<string, unknown>>;
+		expect(text).toEqual({ type: "text", text: "screenshot:" });
+		expect(image.type).toBe("text");
+		expect(image.source).toBeUndefined();
+		expect(String(image.text)).toContain("Session resident imageData blob missing");
+		expect(JSON.stringify(image)).not.toContain(MISSING_REF);
+	});
+
+	test("image_url block with a missing imageUrl blob becomes a text block", () => {
+		const store = makeStore();
+		const entry = messageEntry([
+			{ type: "image_url", image_url: { url: residentBlobSentinelForTests("imageUrl", MISSING_REF) } },
+		]);
+		const [block] = materializedContent(entry, store) as Array<Record<string, unknown>>;
+		expect(block.type).toBe("text");
+		expect(block.image_url).toBeUndefined();
+		expect(String(block.text)).toContain("Session resident imageUrl blob missing");
+	});
+
+	test("a present image blob is preserved as an image block (no false degrade)", () => {
+		const store = makeStore();
+		const raw = Buffer.from("rawimagebytes");
+		const ref = store.putSync(raw).ref;
+		const entry = messageEntry([
+			{ type: "image", source: { type: "base64", media_type: "image/webp", data: residentBlobSentinelForTests("imageData", ref) } },
+		]);
+		const [block] = materializedContent(entry, store) as Array<Record<string, unknown>>;
+		expect(block.type).toBe("image");
+		expect((block.source as Record<string, unknown>).data).toBe(raw.toString("base64"));
+	});
+});
+
 describe("EphemeralBlobStore bounded cache + reset", () => {
 	test("getSync round-trips and dispose() clears disk + buffer cache (blob missing afterwards)", () => {
 		const store = makeStore();

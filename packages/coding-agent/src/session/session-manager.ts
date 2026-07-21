@@ -2493,6 +2493,43 @@ function residentBlobMissingPlaceholder(error: ResidentBlobMissingError): string
 	return `[Session resident ${error.kind} blob missing: sha256:${error.hash}; original content unavailable]`;
 }
 
+const RESIDENT_BLOB_MISSING_PLACEHOLDER_PREFIX = "[Session resident ";
+const RESIDENT_BLOB_MISSING_PLACEHOLDER_SUFFIX = "original content unavailable]";
+
+function isResidentBlobMissingPlaceholder(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.startsWith(RESIDENT_BLOB_MISSING_PLACEHOLDER_PREFIX) &&
+		value.includes(" blob missing: sha256:") &&
+		value.endsWith(RESIDENT_BLOB_MISSING_PLACEHOLDER_SUFFIX)
+	);
+}
+
+/**
+ * A missing resident *image* blob would otherwise leave an image content block
+ * whose base64/URL payload is the human-readable "blob missing" placeholder —
+ * which providers reject outright (e.g. Anthropic 400 `invalid base64 data`),
+ * bricking every subsequent request in the session. Degrade such a block to a
+ * text block so one lost image can never poison the whole request.
+ */
+function degradeMissingResidentImageBlock(block: Record<string, unknown>): Record<string, unknown> | undefined {
+	if (block.type === "image" && block.source && typeof block.source === "object") {
+		const source = block.source as Record<string, unknown>;
+		if (isResidentBlobMissingPlaceholder(source.data)) return { type: "text", text: source.data };
+	}
+	if (block.type === "image_url") {
+		const image = block.image_url;
+		const url =
+			typeof image === "string"
+				? image
+				: image && typeof image === "object"
+					? (image as Record<string, unknown>).url
+					: undefined;
+		if (isResidentBlobMissingPlaceholder(url)) return { type: "text", text: url };
+	}
+	return undefined;
+}
+
 function externalizeResidentValueSync(obj: unknown, stores: ResidentBlobStores, key?: string): unknown {
 	if (obj === null || obj === undefined) return obj;
 	if (typeof obj === "string") {
@@ -2591,7 +2628,12 @@ function materializeResidentValueSync(
 			if (newValue !== value) changed = true;
 			return [childKey, newValue] as const;
 		});
-		return changed ? Object.fromEntries(entries) : obj;
+		const next = changed ? Object.fromEntries(entries) : obj;
+		if (missingPolicy === "placeholder" && next && typeof next === "object") {
+			const degraded = degradeMissingResidentImageBlock(next as Record<string, unknown>);
+			if (degraded) return degraded;
+		}
+		return next;
 	}
 	return obj;
 }
