@@ -25,6 +25,30 @@ async function dispatchLocalCallback(callbackUrl: string): Promise<void> {
 	throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+/**
+ * Reserve an OS-assigned loopback port for the OAuth callback server.
+ *
+ * The reservation is closed before MCPOAuthFlow re-binds the port, which
+ * leaves a narrow close-then-rebind TOCTOU window. This is an accepted
+ * test-only tradeoff: an intervening claimant causes an honest bind
+ * failure/timeout, never a false pass, and eliminating it entirely would
+ * require the production callback API to accept a pre-bound listener.
+ * Do not replace this with hardcoded ports or retries.
+ */
+function allocateCallbackPort(): number {
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch() {
+			return new Response("reserved callback port");
+		},
+	});
+	const port = server.port;
+	server.stop(true);
+	if (port === undefined) throw new Error("Expected callback port");
+	return port;
+}
+
 function mockProviderTokenEndpoint(onBody: (body: string) => void) {
 	return hookFetch((input, init) => {
 		const url = String(input);
@@ -96,12 +120,14 @@ describe("mcp oauth flow", () => {
 			tokenRequestBody = body;
 		});
 
+		const callbackPort = allocateCallbackPort();
+
 		const flow = new MCPOAuthFlow(
 			{
 				authorizationUrl: "https://provider.example/authorize",
 				tokenUrl: "https://provider.example/token",
 				clientId: "client-id",
-				callbackPort: 14567,
+				callbackPort,
 				callbackPath: "slack/oauth_redirect",
 			},
 			{
@@ -137,6 +163,8 @@ describe("mcp oauth flow", () => {
 			tokenRequestBody = body;
 		});
 
+		const callbackPort = allocateCallbackPort();
+
 		const flow = new MCPOAuthFlow(
 			{
 				authorizationUrl: "https://provider.example/authorize",
@@ -144,7 +172,7 @@ describe("mcp oauth flow", () => {
 				clientId: "client-id",
 				clientSecret: "client-secret",
 				redirectUri: "https://public.example/slack/oauth_redirect",
-				callbackPort: 14568,
+				callbackPort,
 				callbackPath: "slack/oauth_redirect",
 			},
 			{
@@ -154,7 +182,7 @@ describe("mcp oauth flow", () => {
 					const state = authUrl.searchParams.get("state") ?? "";
 					queueMicrotask(() => {
 						void dispatchLocalCallback(
-							`http://127.0.0.1:14568/slack/oauth_redirect?code=test-code&state=${state}`,
+							`http://127.0.0.1:${callbackPort}/slack/oauth_redirect?code=test-code&state=${state}`,
 						);
 					});
 				},
@@ -182,13 +210,15 @@ describe("mcp oauth flow", () => {
 			tokenRequestBody = body;
 		});
 
+		const callbackPort = allocateCallbackPort();
+
 		const flow = new MCPOAuthFlow(
 			{
 				authorizationUrl: "https://provider.example/authorize",
 				tokenUrl: "https://provider.example/token",
 				clientId: "client-id",
 				redirectUri: "https://public.example",
-				callbackPort: 14571,
+				callbackPort,
 			},
 			{
 				onAuth: info => {
@@ -196,7 +226,7 @@ describe("mcp oauth flow", () => {
 					observedRedirectUri = authUrl.searchParams.get("redirect_uri") ?? "";
 					const state = authUrl.searchParams.get("state") ?? "";
 					queueMicrotask(() => {
-						void dispatchLocalCallback(`http://127.0.0.1:14571/?code=test-code&state=${state}`);
+						void dispatchLocalCallback(`http://127.0.0.1:${callbackPort}/?code=test-code&state=${state}`);
 					});
 				},
 				signal: AbortSignal.timeout(1_000),
@@ -222,12 +252,14 @@ describe("mcp oauth flow", () => {
 			tokenRequestBody = body;
 		});
 
+		const callbackPort = allocateCallbackPort();
+
 		const flow = new MCPOAuthFlow(
 			{
 				authorizationUrl: "https://provider.example/authorize",
 				tokenUrl: "https://provider.example/token",
 				redirectUri: "https://localhost:3443/slack/oauth_redirect",
-				callbackPort: 14570,
+				callbackPort,
 			},
 			{
 				onAuth: info => {
@@ -236,7 +268,7 @@ describe("mcp oauth flow", () => {
 					const state = authUrl.searchParams.get("state") ?? "";
 					queueMicrotask(() => {
 						void dispatchLocalCallback(
-							`http://127.0.0.1:14570/slack/oauth_redirect?code=test-code&state=${state}`,
+							`http://127.0.0.1:${callbackPort}/slack/oauth_redirect?code=test-code&state=${state}`,
 						);
 					});
 				},
@@ -316,6 +348,7 @@ describe("mcp oauth flow", () => {
 	});
 
 	it("fails instead of falling back to a random port when redirectUri is exact", async () => {
+		const callbackPort = allocateCallbackPort();
 		let servedOptions: { hostname?: string; port?: number | string } | undefined;
 		const serveSpy = vi.spyOn(Bun, "serve").mockImplementation(options => {
 			servedOptions = { hostname: options.hostname, port: options.port };
@@ -327,7 +360,7 @@ describe("mcp oauth flow", () => {
 				authorizationUrl: "https://provider.example/authorize",
 				tokenUrl: "https://provider.example/token",
 				redirectUri: "https://public.example/slack/oauth_redirect",
-				callbackPort: 14569,
+				callbackPort,
 				callbackPath: "/slack/oauth_redirect",
 			},
 			{ signal: AbortSignal.timeout(1_000) },
@@ -335,7 +368,7 @@ describe("mcp oauth flow", () => {
 
 		await expect(flow.login()).rejects.toThrow("cannot fall back to a random port when oauth.redirectUri is set");
 		expect(serveSpy).toHaveBeenCalledTimes(1);
-		expect(servedOptions).toMatchObject({ hostname: "127.0.0.1", port: 14569 });
+		expect(servedOptions).toMatchObject({ hostname: "127.0.0.1", port: callbackPort });
 	});
 
 	it("exposes the dynamically registered client_id and client_secret after generateAuthUrl", async () => {

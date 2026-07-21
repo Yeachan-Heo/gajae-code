@@ -20,7 +20,6 @@ import {
 	VERSION,
 } from "@gajae-code/utils";
 import chalk from "chalk";
-import { runCli } from "./cli";
 import type { Args } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
@@ -1629,5 +1628,6 @@ export async function main(args: string[]): Promise<void> {
 		await completeManagedOwnerRecovery(admission.context);
 		return;
 	}
+	const { runCli } = await import("./cli");
 	await runCli(args.length === 0 ? ["launch"] : args);
 }

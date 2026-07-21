@@ -113,18 +113,29 @@ export interface DaemonProcessReference {
 }
 
 function defaultProcessReference(pid: number, platform = os.platform()): DaemonProcessReference | undefined {
-	// Process.fromPid on Darwin still resolves identity and then signals a numeric
-	// PID. A process can exit and its PID be reused in that interval, so daemon
-	// control must not use it as privileged signaling authority.
-	if (platform === "darwin") return undefined;
 	try {
 		const processRef = Process.fromPid(pid);
 		if (!processRef || !isProcessIncarnation(processRef.incarnation)) return undefined;
+		const incarnation = processRef.incarnation;
 		return {
-			incarnation: processRef.incarnation,
+			incarnation,
 			signalRoot: signal => {
 				const nativeSignal = os.constants.signals[signal];
 				if (nativeSignal === undefined) throw new Error(`Unsupported signal: ${signal}`);
+				// macOS exposes no pidfd and the native signal_root is a no-op there, so
+				// the daemon control plane previously had NO way to signal a live owner —
+				// every stop/reload of a live/hung daemon refused ("ownership changed;
+				// refusing to signal"), and only an external `kill -9` could recover it.
+				// Signal by numeric PID via kill(2), but re-read the immutable start-time
+				// incarnation immediately beforehand so a PID that exited and was reused
+				// since capture is never signaled; the residual window is the few
+				// instructions between this recheck and kill(2).
+				if (platform === "darwin") {
+					const current = Process.fromPid(pid) as { incarnation?: unknown } | null;
+					if (!current || current.incarnation !== incarnation) throw new Error("Pinned process is already gone");
+					process.kill(pid, signal);
+					return;
+				}
 				const rootProcess = processRef as typeof processRef & { signalRoot(signal: number): boolean };
 				if (!rootProcess.signalRoot(nativeSignal)) throw new Error("Pinned process is already gone");
 			},
@@ -366,7 +377,14 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	}
 
 	async reloadForGenerationUpgrade(opts: DaemonOperationOptions = {}): Promise<TelegramGenerationReloadResult> {
-		const operation = await this.stopOrReload("reload", opts);
+		// A generation upgrade MUST replace an incompatible older-generation owner to
+		// avoid a permanent single-poller deadlock. Unlike a manual `gjc daemon
+		// reload`, this automatic path force-escalates to SIGKILL when the old owner
+		// ignores the cooperative SIGTERM within the graceful timeout, so SDK startup
+		// self-recovers instead of failing closed and asking the operator to rerun
+		// with --force. The SIGKILL remains fenced to the still-live, still-matching
+		// captured owner (same ownerId + pid), so a fresh replacement is never killed.
+		const operation = await this.stopOrReload("reload", { ...opts, force: true });
 		if (!operation.ok) return { outcome: "failed", operation };
 		const after = await this.status();
 		return after.health === "running" ? { outcome: "ready", operation } : { outcome: "failed", operation };

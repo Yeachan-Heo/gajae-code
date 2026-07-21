@@ -1137,8 +1137,13 @@
 				},
 				"handoffSaveToDisk": {
 					"type": "boolean",
-					"description": "Save generated handoff documents to markdown files for the auto-handoff flow",
+					"description": "Save auto-triggered handoff documents as session artifacts (resolvable artifact:// URIs); manual /handoff does not save",
 					"default": false
+				},
+				"handoffPromptExtension": {
+					"type": "string",
+					"description": "Extra guidance appended to the default handoff-generation prompt for both manual /handoff and auto-handoff. It supplements, and never replaces, the built-in safety- and continuity-critical instructions.",
+					"default": ""
 				},
 				"remoteEnabled": {
 					"type": "boolean",

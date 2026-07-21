@@ -1436,6 +1436,42 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "handoff",
+		priority: 71,
+		description: "Generate a handoff and continue in a new session",
+		acpDescription: "Generate a handoff document and start a new session",
+		inlineHint: "[focus instructions]",
+		acpInputHint: "[focus instructions]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			let result: Awaited<ReturnType<typeof runtime.session.handoff>>;
+			try {
+				result = await runtime.session.handoff(command.args || undefined);
+			} catch (err) {
+				// Handoff precondition failures (nothing to hand off, streaming),
+				// cancellation, and provider errors propagate as plain Errors; the
+				// switch is non-destructive so the current session is unchanged.
+				return usage(`Handoff failed: ${errorMessage(err)}; current session is unchanged.`, runtime);
+			}
+			if (!result) {
+				return usage(
+					"Handoff not created (cancelled or nothing to hand off); current session is unchanged.",
+					runtime,
+				);
+			}
+			await runtime.output(
+				result.savedPath
+					? `Handoff created; new session started. Handoff document saved to: ${result.savedPath}`
+					: "Handoff created; new session started with handoff context.",
+			);
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleHandoffCommand(command.args || undefined);
+		},
+	},
+	{
 		name: "contribute-pr",
 		aliases: ["contribution-prep"],
 		description: "Dump redacted session context and spawn a fresh contribute-pr worker",

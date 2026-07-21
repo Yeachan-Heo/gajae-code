@@ -1420,6 +1420,11 @@ export class AgentSession {
 	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
 	readonly yieldQueue: YieldQueue;
+	// True from the start of a handoff transition through commit/rollback. While
+	// set, the yield queue treats the session as busy so background async-job
+	// completions cannot start a new idle turn against the session being handed
+	// off (or, on rollback, the restored predecessor mid-transition).
+	#handoffTransitionActive = false;
 
 	#powerAssertion: MacOSPowerAssertion | undefined;
 
@@ -1839,6 +1844,46 @@ export class AgentSession {
 		});
 	}
 
+	/**
+	 * Reject a turn start while a handoff transition owns the session. Handoff never
+	 * routes its own generation/injection through these turn-start chokepoints, and
+	 * auto-maintenance runs before the fence, so this fences only external entrants
+	 * (steer/follow-up/sendUserMessage/custom/hidden-next-turn/continuation) that
+	 * bypass prompt admission.
+	 */
+	#assertNoHandoffTransition(): void {
+		if (this.#handoffTransitionActive) {
+			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+				code: "busy",
+			});
+		}
+	}
+
+	/**
+	 * Single, synchronously-acquired mutex for session-identity transitions
+	 * (handoff, compact, new/switch/branch/clear, fork, tree navigation). Acquired
+	 * BEFORE any await at each transition's entry and released in its finally, so
+	 * exclusion is symmetric regardless of which transition starts first — an
+	 * operation that began earlier and yielded still owns the lease when a peer
+	 * tries to start. Auto-handoff acquires it via handoff() (the maintenance
+	 * orchestrator does not hold it), so there is no self-deadlock.
+	 */
+	#sessionTransitionKind: string | undefined;
+
+	#beginSessionTransition(kind: string): void {
+		if (this.#sessionTransitionKind !== undefined) {
+			throw Object.assign(
+				new Error(`Cannot start ${kind} while a ${this.#sessionTransitionKind} transition is in progress.`),
+				{ code: "busy" },
+			);
+		}
+		this.#sessionTransitionKind = kind;
+	}
+
+	#endSessionTransition(): void {
+		this.#sessionTransitionKind = undefined;
+	}
+
 	#activateNextSessionAdmission(): void {
 		if (this.#activeSessionAdmission || this.#sessionAdmissionClosed) return;
 		const next = this.#sessionAdmissionQueue.shift();
@@ -1854,6 +1899,16 @@ export class AgentSession {
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
+		// Reject new external turns for the whole handoff transition. The handoff
+		// itself never acquires prompt admission (it generates via generateHandoff and
+		// injects via appendCustomMessageEntry), so this fences external entrants —
+		// prompt/sendUserMessage/steer/follow-up/triggerTurn all funnel here — without
+		// blocking the handoff's own work or the exempt auto-maintenance owner.
+		if (kind === "prompt" && this.#handoffTransitionActive) {
+			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+				code: "busy",
+			});
+		}
 
 		const entry: SessionAdmissionEntry = {
 			kind,
@@ -1870,6 +1925,17 @@ export class AgentSession {
 			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
 			this.#activateNextSessionAdmission();
 			throw this.#sessionAdmissionBusyError();
+		}
+		// Re-check the handoff fence after activation: a prompt queued before the
+		// transition began must not start once the fence is up.
+		if (kind === "prompt" && this.#handoffTransitionActive) {
+			entry.released = true;
+			entry.settled.resolve();
+			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
+			this.#activateNextSessionAdmission();
+			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+				code: "busy",
+			});
 		}
 
 		const release = () => {
@@ -2136,7 +2202,7 @@ export class AgentSession {
 		this.#setGuardedAgentTools(this.agent.state.tools);
 		this.#bindWorkflowGateEmitter();
 		this.yieldQueue = new YieldQueue({
-			isStreaming: () => this.isStreaming,
+			isStreaming: () => this.isStreaming || this.#handoffTransitionActive,
 			injectStreaming: message => this.agent.followUp(message),
 			injectIdle: async messages => {
 				const first = messages[0];
@@ -3772,7 +3838,7 @@ export class AgentSession {
 		skipCompactionCheck?: boolean;
 		suppressPredecessorAgentEnd?: boolean;
 		shouldContinue?: () => boolean;
-		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained") => void;
+		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => void;
 		allowDuringCancelAndSubmit?: boolean;
 		onError?: (error: unknown) => void;
 	}): Promise<void> {
@@ -3780,7 +3846,7 @@ export class AgentSession {
 			? this.#reserveDeferredAgentEndForContinuation()
 			: undefined;
 		let terminalized = false;
-		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained") => {
+		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => {
 			if (terminalized) return;
 			terminalized = true;
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
@@ -3834,6 +3900,13 @@ export class AgentSession {
 					}
 					if (options?.shouldContinue && !options.shouldContinue()) {
 						skip("queue_drained");
+						return;
+					}
+					// A continuation scheduled before a handoff engaged must not start a
+					// turn against the session being handed off (or the restored
+					// predecessor). rearmIdle / normal delivery resumes after the fence.
+					if (this.#handoffTransitionActive) {
+						skip("handoff_in_progress");
 						return;
 					}
 					const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
@@ -6239,6 +6312,7 @@ export class AgentSession {
 
 	/** Main startup calls this exactly once, after a strict open returned `kind: "opened"`. */
 	async continuePersistedHistory(): Promise<void> {
+		this.#assertNoHandoffTransition();
 		this.#assertRecoveryHydrationPromoted();
 		this.#removeEphemeralCustomMessages();
 
@@ -6275,6 +6349,10 @@ export class AgentSession {
 					hindsightRecall = undefined;
 				}
 			}
+			// Re-check after the awaited preparation: a handoff can engage during the
+			// volatile-context/hindsight awaits above and this would otherwise start a
+			// turn against the session being handed off.
+			this.#assertNoHandoffTransition();
 			await this.agent.continue({
 				...this.#managedFallbackPromptOptions(),
 				onRunAccepted: () => {
@@ -6561,27 +6639,61 @@ export class AgentSession {
 		return getAskAnswerSourceFromRegistry(this.sessionId);
 	}
 
-	#bindWorkflowGateEmitter(previousSessionId?: string, previousEmitter = this.#workflowGateEmitter): void {
+	#constructWorkflowGateEmitter(): WorkflowGateEmitter {
 		const sessionId = this.sessionManager.getSessionId();
 		assertNonEmptyGjcSessionId(sessionId, "AgentSession workflow-gate session");
 		const gateStore = this.sessionManager.isPersisted()
 			? new FileGateStore(path.join(sessionStateDir(this.sessionManager.getCwd(), sessionId), "workflow-gates.json"))
 			: new MemoryGateStore();
-		const successorEmitter = new BrokerWorkflowGateEmitter(sessionId, gateStore);
-		previousEmitter?.fence?.();
-		if (previousEmitter && !previousEmitter.fence) {
-			for (const gate of previousEmitter.listPendingGates?.() ?? []) previousEmitter.quarantineGate?.(gate.gate_id);
+		return new BrokerWorkflowGateEmitter(sessionId, gateStore);
+	}
+
+	/**
+	 * Publish an already-constructed successor emitter. This is no-throw from the
+	 * caller's perspective: predecessor fencing/quarantine is best-effort (a failure
+	 * must never leave the session with no emitter after a committed switch), and
+	 * listener notification is isolated in the registry.
+	 */
+	#publishWorkflowGateEmitter(
+		successorEmitter: WorkflowGateEmitter,
+		previousSessionId?: string,
+		previousEmitter = this.#workflowGateEmitter,
+	): void {
+		try {
+			previousEmitter?.fence?.();
+			if (previousEmitter && !previousEmitter.fence) {
+				for (const gate of previousEmitter.listPendingGates?.() ?? [])
+					previousEmitter.quarantineGate?.(gate.gate_id);
+			}
+		} catch (error) {
+			logger.warn("Workflow-gate predecessor fence failed during publish", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 		if (previousSessionId) notifyWorkflowGateEmitterChanged(previousSessionId, undefined);
 		this.setWorkflowGateEmitter(successorEmitter);
 	}
 
+	#bindWorkflowGateEmitter(previousSessionId?: string, previousEmitter = this.#workflowGateEmitter): void {
+		this.#publishWorkflowGateEmitter(this.#constructWorkflowGateEmitter(), previousSessionId, previousEmitter);
+	}
+
 	#suspendWorkflowGateEmitter(sessionId: string): WorkflowGateEmitter | undefined {
 		const emitter = this.#workflowGateEmitter;
 		if (!emitter) return undefined;
-		emitter.suspend?.();
+		// Clear the field first, then run the (throwable) suspend + listener
+		// notification inside a guard. This guarantees the caller always receives the
+		// emitter token so a rollback can restore it, even if a registry listener
+		// throws during notification.
 		this.#workflowGateEmitter = undefined;
-		notifyWorkflowGateEmitterChanged(sessionId, undefined);
+		try {
+			emitter.suspend?.();
+			notifyWorkflowGateEmitterChanged(sessionId, undefined);
+		} catch (error) {
+			logger.warn("Workflow-gate emitter suspension notification failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		return emitter;
 	}
 
@@ -7290,7 +7402,12 @@ export class AgentSession {
 			resetRetryReplaySafety?: boolean;
 		},
 	): Promise<void> {
+		this.#assertNoHandoffTransition();
 		await this.#agentEndPublicationPromise;
+		// Re-check after the publication await: a handoff can engage during that
+		// window, and #beginInFlight below would otherwise start a turn against the
+		// session being handed off.
+		this.#assertNoHandoffTransition();
 		this.#beginInFlight();
 		const predecessorAgentEndHold =
 			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
@@ -7776,6 +7893,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { claimsGenuineUserIntent?: boolean },
 	): Promise<void> {
+		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText));
@@ -7810,6 +7928,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { forceOneAtATime?: boolean; claimsGenuineUserIntent?: boolean },
 	): Promise<void> {
+		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#followUpMessages.push(this.#createQueuedDisplayEntry(displayText));
@@ -7881,6 +8000,10 @@ export class AgentSession {
 	}
 
 	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
+		// A hidden next-turn message queued during a handoff transition would be
+		// dropped when the successor clears predecessor queues; reject it as busy so
+		// the caller can retry against the settled session.
+		this.#assertNoHandoffTransition();
 		this.#pendingNextTurnMessages.push(message);
 		if (!triggerTurn) return;
 		const generation = this.#promptGeneration;
@@ -8000,6 +8123,10 @@ export class AgentSession {
 			this.#deepInterviewGenuineUserMessageEpochs.set(appMessage, epoch);
 		}
 		if (this.isStreaming) {
+			// A handoff transition owns the session; a background/custom trigger (cron,
+			// monitor, skill) must not steer/follow-up/queue against the outgoing turn
+			// while an (auto-)handoff is unwinding it.
+			this.#assertNoHandoffTransition();
 			if (options?.deliverAs === "nextTurn") {
 				this.#queueHiddenNextTurnMessage(appMessage, options?.triggerTurn ?? false);
 				return;
@@ -8725,12 +8852,15 @@ export class AgentSession {
 	 */
 	newSession(options?: NewSessionOptions): Promise<boolean> {
 		if (this.#newSessionTransition) return this.#newSessionTransition;
-
+		// Acquire the shared transition lease only when starting a fresh transition
+		// (the dedup above returns the in-flight promise without re-acquiring).
+		this.#beginSessionTransition("new-session");
 		const transition = this.#runNewSessionTransition(options);
 		this.#newSessionTransition = transition;
 		void transition
 			.finally(() => {
 				if (this.#newSessionTransition === transition) this.#newSessionTransition = undefined;
+				this.#endSessionTransition();
 			})
 			.catch(() => {});
 		return transition;
@@ -8925,34 +9055,39 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
-		const sessionId = this.sessionId;
-		this.#disconnectFromAgent();
-		await this.abort();
-		this.#cancelOwnAsyncJobs();
-		this.#suppressOwnAsyncJobDeliveries();
-		this.yieldQueue.clear();
-		this.#pendingBackgroundExchanges = [];
-		this.#closeAllProviderSessions("context clear");
-		this.agent.reset();
-		await this.sessionManager.flush();
-		this.sessionManager.appendContextClearEntry({ sessionId });
-		this.setTodoPhases([]);
-		this.#syncAgentSessionId(sessionId);
-		this.#steeringMessages = [];
-		this.#followUpMessages = [];
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#beginSessionTransition("clear-context");
+		try {
+			const sessionId = this.sessionId;
+			this.#disconnectFromAgent();
+			await this.abort();
+			this.#cancelOwnAsyncJobs();
+			this.#suppressOwnAsyncJobDeliveries();
+			this.yieldQueue.clear();
+			this.#pendingBackgroundExchanges = [];
+			this.#closeAllProviderSessions("context clear");
+			this.agent.reset();
+			await this.sessionManager.flush();
+			this.sessionManager.appendContextClearEntry({ sessionId });
+			this.setTodoPhases([]);
+			this.#syncAgentSessionId(sessionId);
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
 
-		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
-		if (this.model) {
-			this.sessionManager.appendModelChange(`${this.model.provider}/${this.model.id}`);
+			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+			if (this.model) {
+				this.sessionManager.appendModelChange(`${this.model.provider}/${this.model.id}`);
+			}
+			this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
+			this.#todoReminderCount = 0;
+			this.#planReferenceSent = false;
+			this.#planReferencePath = "local://PLAN.md";
+			this.#reconnectToAgent();
+			return true;
+		} finally {
+			this.#endSessionTransition();
 		}
-		this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
-		this.#todoReminderCount = 0;
-		this.#planReferenceSent = false;
-		this.#planReferencePath = "local://PLAN.md";
-		this.#reconnectToAgent();
-		return true;
 	}
 
 	/**
@@ -8969,47 +9104,54 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
 	async fork(): Promise<boolean> {
-		const previousSessionFile = this.sessionFile;
-		const previousWorkflowGateSessionId = this.sessionId;
+		// Fork replaces session identity/file and publishes session_switch; serialize
+		// it with handoff and the other transitions via the shared lease.
+		this.#beginSessionTransition("fork");
+		try {
+			const previousSessionFile = this.sessionFile;
+			const previousWorkflowGateSessionId = this.sessionId;
 
-		// Emit session_before_switch event with reason "fork" (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_switch",
-				reason: "fork",
-			})) as SessionBeforeSwitchResult | undefined;
+			// Emit session_before_switch event with reason "fork" (can be cancelled)
+			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_switch",
+					reason: "fork",
+				})) as SessionBeforeSwitchResult | undefined;
 
-			if (result?.cancel) {
+				if (result?.cancel) {
+					return false;
+				}
+			}
+
+			// Flush current session to ensure all entries are written
+			await this.sessionManager.flush();
+
+			// Fork the session (creates new session file with same entries)
+			const forkResult = await this.sessionManager.fork();
+			if (!forkResult) {
 				return false;
 			}
+
+			// Update agent session ID
+			this.#syncAgentSessionId();
+			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
+			this.#rekeyHindsightMemoryForCurrentSessionId();
+
+			this.#resetIrcRosterDeliveryState();
+
+			// Emit session_switch event with reason "fork" to hooks
+			if (this.#extensionRunner) {
+				await this.#extensionRunner.emit({
+					type: "session_switch",
+					reason: "fork",
+					previousSessionFile,
+				});
+			}
+
+			return true;
+		} finally {
+			this.#endSessionTransition();
 		}
-
-		// Flush current session to ensure all entries are written
-		await this.sessionManager.flush();
-
-		// Fork the session (creates new session file with same entries)
-		const forkResult = await this.sessionManager.fork();
-		if (!forkResult) {
-			return false;
-		}
-
-		// Update agent session ID
-		this.#syncAgentSessionId();
-		this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
-		this.#rekeyHindsightMemoryForCurrentSessionId();
-
-		this.#resetIrcRosterDeliveryState();
-
-		// Emit session_switch event with reason "fork" to hooks
-		if (this.#extensionRunner) {
-			await this.#extensionRunner.emit({
-				type: "session_switch",
-				reason: "fork",
-				previousSessionFile,
-			});
-		}
-
-		return true;
 	}
 
 	// =========================================================================
@@ -10009,148 +10151,156 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
-		if (this.#compactionAbortController) {
-			throw new Error("Compaction already in progress");
-		}
-		this.#disconnectFromAgent();
-		await this.abort();
-		const compactionAbortController = new AbortController();
-		this.#compactionAbortController = compactionAbortController;
-
+		// Serialize with every other session-identity transition via the shared lease
+		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
+		// navigateTree). Released in the outer finally below.
+		this.#beginSessionTransition("compact");
 		try {
-			if (!this.model) {
-				throw new Error("No model selected");
+			if (this.#compactionAbortController) {
+				throw new Error("Compaction already in progress");
 			}
+			this.#disconnectFromAgent();
+			await this.abort();
+			const compactionAbortController = new AbortController();
+			this.#compactionAbortController = compactionAbortController;
 
-			const compactionSettings = this.settings.getGroup("compaction");
-			const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
-
-			const preparation = prepareCompaction(pathEntries, compactionSettings, {
-				contextWindow: this.model.contextWindow,
-				tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
-			});
-			if (!preparation) {
-				// Check why we can't compact
-				const lastEntry = pathEntries[pathEntries.length - 1];
-				if (lastEntry?.type === "compaction") {
-					throw new Error("Already compacted");
+			try {
+				if (!this.model) {
+					throw new Error("No model selected");
 				}
-				throw new Error("Nothing to compact (session too small)");
-			}
 
-			let hookCompaction: CompactionResult | undefined;
-			let fromExtension = false;
-			let preserveData: Record<string, unknown> | undefined;
+				const compactionSettings = this.settings.getGroup("compaction");
+				const pathEntries = this.#withoutEphemeralCustomMessageEntries(this.sessionManager.getBranch());
 
-			if (this.#extensionRunner?.hasHandlers("session_before_compact")) {
-				const result = (await this.#extensionRunner.emit({
-					type: "session_before_compact",
-					preparation,
-					branchEntries: pathEntries,
-					customInstructions,
-					signal: compactionAbortController.signal,
-				})) as SessionBeforeCompactResult | undefined;
+				const preparation = prepareCompaction(pathEntries, compactionSettings, {
+					contextWindow: this.model.contextWindow,
+					tokenCorrectionRatio: this.#computeCompactionTokenCorrectionRatio(),
+				});
+				if (!preparation) {
+					// Check why we can't compact
+					const lastEntry = pathEntries[pathEntries.length - 1];
+					if (lastEntry?.type === "compaction") {
+						throw new Error("Already compacted");
+					}
+					throw new Error("Nothing to compact (session too small)");
+				}
 
-				if (result?.cancel) {
+				let hookCompaction: CompactionResult | undefined;
+				let fromExtension = false;
+				let preserveData: Record<string, unknown> | undefined;
+
+				if (this.#extensionRunner?.hasHandlers("session_before_compact")) {
+					const result = (await this.#extensionRunner.emit({
+						type: "session_before_compact",
+						preparation,
+						branchEntries: pathEntries,
+						customInstructions,
+						signal: compactionAbortController.signal,
+					})) as SessionBeforeCompactResult | undefined;
+
+					if (result?.cancel) {
+						throw new CompactionCancelledError();
+					}
+
+					if (result?.compaction) {
+						hookCompaction = result.compaction;
+						fromExtension = true;
+					}
+				}
+
+				const compactionPrep = await this.#prepareCompactionFromHooks(preparation, hookCompaction);
+
+				let summary: string;
+				let shortSummary: string | undefined;
+				let firstKeptEntryId: string;
+				let tokensBefore: number;
+				let details: unknown;
+
+				if (compactionPrep.kind === "fromHook") {
+					summary = compactionPrep.summary;
+					shortSummary = compactionPrep.shortSummary;
+					firstKeptEntryId = compactionPrep.firstKeptEntryId;
+					tokensBefore = compactionPrep.tokensBefore;
+					details = compactionPrep.details;
+					preserveData = compactionPrep.preserveData;
+				} else {
+					// Generate compaction result. Only convert known abort-shaped
+					// rejections (AbortError raised while the abort signal is set,
+					// or an already-typed sentinel) into `CompactionCancelledError`
+					// so downstream callers can discriminate cancel from generic
+					// failure via `instanceof` without inspecting message strings.
+					// Real compaction bugs (network, server, parsing, etc.) keep
+					// their original shape — they must not be silently relabeled
+					// as cancellations even if the signal happens to be aborted
+					// for an unrelated reason. Assignments live inside the try
+					// block because every catch path throws — the post-try reads
+					// of the result-derived locals are reachable only on success.
+					try {
+						const result = await this.#compactWithFallbackModel(
+							preparation,
+							customInstructions,
+							compactionAbortController.signal,
+							{
+								promptOverride: compactionPrep.hookPrompt,
+								extraContext: compactionPrep.hookContext,
+								remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
+								convertToLlm,
+							},
+						);
+						summary = result.summary;
+						shortSummary = result.shortSummary;
+						firstKeptEntryId = result.firstKeptEntryId;
+						tokensBefore = result.tokensBefore;
+						details = result.details;
+						preserveData = { ...(compactionPrep.preserveData ?? {}), ...(result.preserveData ?? {}) };
+					} catch (err) {
+						if (err instanceof CompactionCancelledError) {
+							throw err;
+						}
+						if (compactionAbortController.signal.aborted && err instanceof Error && err.name === "AbortError") {
+							throw new CompactionCancelledError();
+						}
+						throw err;
+					}
+				}
+
+				if (compactionAbortController.signal.aborted) {
 					throw new CompactionCancelledError();
 				}
 
-				if (result?.compaction) {
-					hookCompaction = result.compaction;
-					fromExtension = true;
+				const compactionEntryId = this.sessionManager.appendCompaction(
+					summary,
+					shortSummary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					fromExtension,
+					preserveData,
+				);
+				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+
+				const compactionResult: CompactionResult = {
+					summary,
+					shortSummary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					preserveData,
+				};
+				options?.onComplete?.(compactionResult);
+				return compactionResult;
+			} catch (error) {
+				const err = error instanceof Error ? error : new Error(String(error));
+				options?.onError?.(err);
+				throw error;
+			} finally {
+				if (this.#compactionAbortController === compactionAbortController) {
+					this.#compactionAbortController = undefined;
 				}
+				this.#reconnectToAgent();
 			}
-
-			const compactionPrep = await this.#prepareCompactionFromHooks(preparation, hookCompaction);
-
-			let summary: string;
-			let shortSummary: string | undefined;
-			let firstKeptEntryId: string;
-			let tokensBefore: number;
-			let details: unknown;
-
-			if (compactionPrep.kind === "fromHook") {
-				summary = compactionPrep.summary;
-				shortSummary = compactionPrep.shortSummary;
-				firstKeptEntryId = compactionPrep.firstKeptEntryId;
-				tokensBefore = compactionPrep.tokensBefore;
-				details = compactionPrep.details;
-				preserveData = compactionPrep.preserveData;
-			} else {
-				// Generate compaction result. Only convert known abort-shaped
-				// rejections (AbortError raised while the abort signal is set,
-				// or an already-typed sentinel) into `CompactionCancelledError`
-				// so downstream callers can discriminate cancel from generic
-				// failure via `instanceof` without inspecting message strings.
-				// Real compaction bugs (network, server, parsing, etc.) keep
-				// their original shape — they must not be silently relabeled
-				// as cancellations even if the signal happens to be aborted
-				// for an unrelated reason. Assignments live inside the try
-				// block because every catch path throws — the post-try reads
-				// of the result-derived locals are reachable only on success.
-				try {
-					const result = await this.#compactWithFallbackModel(
-						preparation,
-						customInstructions,
-						compactionAbortController.signal,
-						{
-							promptOverride: compactionPrep.hookPrompt,
-							extraContext: compactionPrep.hookContext,
-							remoteInstructions: this.#baseSystemPrompt.join("\n\n"),
-							convertToLlm,
-						},
-					);
-					summary = result.summary;
-					shortSummary = result.shortSummary;
-					firstKeptEntryId = result.firstKeptEntryId;
-					tokensBefore = result.tokensBefore;
-					details = result.details;
-					preserveData = { ...(compactionPrep.preserveData ?? {}), ...(result.preserveData ?? {}) };
-				} catch (err) {
-					if (err instanceof CompactionCancelledError) {
-						throw err;
-					}
-					if (compactionAbortController.signal.aborted && err instanceof Error && err.name === "AbortError") {
-						throw new CompactionCancelledError();
-					}
-					throw err;
-				}
-			}
-
-			if (compactionAbortController.signal.aborted) {
-				throw new CompactionCancelledError();
-			}
-
-			const compactionEntryId = this.sessionManager.appendCompaction(
-				summary,
-				shortSummary,
-				firstKeptEntryId,
-				tokensBefore,
-				details,
-				fromExtension,
-				preserveData,
-			);
-			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
-
-			const compactionResult: CompactionResult = {
-				summary,
-				shortSummary,
-				firstKeptEntryId,
-				tokensBefore,
-				details,
-				preserveData,
-			};
-			options?.onComplete?.(compactionResult);
-			return compactionResult;
-		} catch (error) {
-			const err = error instanceof Error ? error : new Error(String(error));
-			options?.onError?.(err);
-			throw error;
 		} finally {
-			if (this.#compactionAbortController === compactionAbortController) {
-				this.#compactionAbortController = undefined;
-			}
-			this.#reconnectToAgent();
+			this.#endSessionTransition();
 		}
 	}
 
@@ -10214,6 +10364,8 @@ export class AgentSession {
 	/** Trigger idle compaction through the auto-compaction flow (with UI events). */
 	async runIdleCompaction(): Promise<void> {
 		if (this.isStreaming || this.isCompacting) return;
+		// Do not start idle compaction while a handoff transition owns the session.
+		if (this.isGeneratingHandoff || this.#handoffTransitionActive) return;
 		await this.#runAutoCompaction("idle", false, true);
 	}
 
@@ -10252,8 +10404,37 @@ export class AgentSession {
 		if (messageCount < 2) {
 			throw new Error("Nothing to hand off (no messages yet)");
 		}
+		// Single-flight: a concurrent handoff would overwrite the abort controller
+		// and the transition fence, letting one invocation's finally clear the
+		// other's ownership and allowing overlapping newSession/restore transactions.
+		if (this.isGeneratingHandoff || this.#handoffTransitionActive) {
+			throw Object.assign(new Error("A handoff is already in progress."), { code: "busy" });
+		}
+		// A manual/external handoff must not race an active turn: replacing the
+		// session and resetting the agent mid-stream can strand old-turn events
+		// onto the successor session. Auto-triggered handoffs run during
+		// post-turn maintenance (never mid-stream) and are exempt.
+		if (this.isStreaming && !options?.autoTriggered) {
+			throw Object.assign(
+				new Error("Cannot hand off while a response is streaming; wait for it to finish or abort it first."),
+				{ code: "busy" },
+			);
+		}
+		// Acquire the shared session-transition lease so handoff is mutually exclusive
+		// with compact/new/switch/branch/clear/fork/navigateTree in BOTH directions —
+		// a transition that started first and yielded still owns the lease here, and a
+		// peer that starts after us is rejected at its own entry. Auto-triggered
+		// handoff still runs while auto-compaction owns its abort controller, but the
+		// maintenance orchestrator does not hold this lease, so acquiring it here does
+		// not self-deadlock. Released in the outer finally below.
+		this.#beginSessionTransition("handoff");
 
 		this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
+		// Fence background async-job delivery for the whole transition (generation
+		// through commit/rollback): a completion that lands mid-handoff must not
+		// start an idle turn against the session being replaced or the restored
+		// predecessor. Cleared in the finally below.
+		this.#handoffTransitionActive = true;
 
 		this.#handoffAbortController = new AbortController();
 		const handoffAbortController = this.#handoffAbortController;
@@ -10294,6 +10475,7 @@ export class AgentSession {
 					systemPrompt: this.#baseSystemPrompt,
 					tools: this.agent.state.tools,
 					customInstructions,
+					promptExtension: this.settings.get("compaction.handoffPromptExtension") || undefined,
 					convertToLlm,
 					initiatorOverride: "agent",
 					metadata: this.agent.metadataForProvider(model.provider),
@@ -10309,68 +10491,207 @@ export class AgentSession {
 				return undefined;
 			}
 
-			// Start a new session
+			// Revalidate immediately before mutating: generation can take seconds,
+			// during which a turn (e.g. a background completion that started before
+			// the delivery fence) may have begun. A manual/external handoff must not
+			// mutate under an active turn; auto-triggered handoff runs at post-turn
+			// maintenance and stays exempt. Nothing has been mutated yet, so throwing
+			// here is fully non-destructive.
+			if (this.isStreaming && !options?.autoTriggered) {
+				throw Object.assign(
+					new Error("Cannot hand off while a response is streaming; wait for it to finish or abort it first."),
+					// The document was already generated; retain it so public callers can
+					// copy/retry even though this late race declines to mutate.
+					{ code: "busy", handoffDocument: handoffText },
+				);
+			}
+
+			// Start a new session transactionally. Capture restore state before the
+			// switch so a persistence, injection, display, or extension failure
+			// after the switch is non-destructive: the current session stays active
+			// and the generated handoff document is preserved for copy/retry.
 			const previousSessionFile = this.sessionFile;
 			await this.sessionManager.flush();
-			this.#cancelOwnAsyncJobs();
-			await this.sessionManager.newSession(previousSessionFile ? { parentSession: previousSessionFile } : undefined);
-			this.agent.reset();
-			this.#syncAgentSessionId();
-			this.#rekeyHindsightMemoryForCurrentSessionId();
-			this.#resetHindsightConversationTrackingIfHindsight();
-			this.#steeringMessages = [];
-			this.#followUpMessages = [];
-			this.#pendingNextTurnMessages = [];
-			this.#scheduledHiddenNextTurnGeneration = undefined;
-			this.#todoReminderCount = 0;
-			if (model) {
-				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`);
-			}
-			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
-			this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
-
-			// Inject the handoff document as a custom message
-			const handoffContent = createHandoffContext(handoffText);
-			this.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
-			await this.sessionManager.ensureOnDisk();
+			const rollbackSessionState = this.sessionManager.captureState();
+			const rollbackAgentMessages = [...this.agent.state.messages];
+			const rollbackSteeringMessages = [...this.#steeringMessages];
+			const rollbackFollowUpMessages = [...this.#followUpMessages];
+			const rollbackPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
+			const rollbackScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
+			const rollbackTodoReminderCount = this.#todoReminderCount;
+			// Snapshot the agent's executable queues so a rollback restores queued
+			// user work that agent.reset() would otherwise clear.
+			const rollbackAgentSteeringQueue = this.agent.snapshotSteering();
+			const rollbackAgentFollowUpQueue = this.agent.snapshotFollowUp();
+			let successorSessionFile: string | undefined;
 			let savedPath: string | undefined;
-			if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
-				try {
-					const artifactId = await this.sessionManager.saveArtifact(`${handoffText}\n`, "handoff");
-					savedPath = `artifact://${artifactId}`;
-				} catch (error) {
-					logger.warn("Failed to save handoff document", {
-						error: error instanceof Error ? error.message : String(error),
+			let committed = false;
+			// Suspend (do not destroy) the workflow-gate emitter so it can be fenced on
+			// commit or resumed on rollback. Suspension runs inside the transaction so a
+			// listener fault during suspension is rolled back like any other prepare step.
+			let suspendedWorkflowGateEmitter: WorkflowGateEmitter | undefined;
+			try {
+				suspendedWorkflowGateEmitter = this.#suspendWorkflowGateEmitter(rollbackSessionState.sessionId);
+				// --- Prepare (reversible): build and persist the successor session
+				// without touching predecessor authority. No irreversible predecessor
+				// teardown or identity publication happens until the commit boundary.
+				await this.sessionManager.newSession(
+					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
+				);
+				successorSessionFile = this.sessionFile;
+				this.agent.reset();
+				this.#syncAgentSessionId();
+				this.#rekeyHindsightMemoryForCurrentSessionId();
+				this.#steeringMessages = [];
+				this.#followUpMessages = [];
+				this.#pendingNextTurnMessages = [];
+				this.#scheduledHiddenNextTurnGeneration = undefined;
+				this.#todoReminderCount = 0;
+				if (model) {
+					this.sessionManager.appendModelChange(`${model.provider}/${model.id}`);
+				}
+				this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+				this.sessionManager.appendServiceTierChange(this.serviceTier ?? null);
+
+				// Inject the handoff document as a custom message
+				const handoffContent = createHandoffContext(handoffText);
+				this.sessionManager.appendCustomMessageEntry("handoff", handoffContent, true, undefined, "agent");
+				await this.sessionManager.ensureOnDisk();
+				if (options?.autoTriggered && this.settings.get("compaction.handoffSaveToDisk")) {
+					try {
+						const artifactId = await this.sessionManager.saveArtifact(`${handoffText}\n`, "handoff");
+						savedPath = `artifact://${artifactId}`;
+					} catch (error) {
+						logger.warn("Failed to save handoff document", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+
+				// Rebuild agent messages from session
+				const sessionContext = this.buildDisplaySessionContext();
+				this.agent.replaceMessages(sessionContext.messages);
+				this.#syncTodoPhasesFromBranch();
+
+				// Construct the successor workflow-gate emitter in the reversible window:
+				// FileGateStore load / broker init can throw, and a failure here must roll
+				// back rather than corrupt an already-committed switch. Publication is
+				// deferred to the (no-throw) commit step below.
+				const successorGateEmitter = this.#constructWorkflowGateEmitter();
+
+				// --- Commit boundary: the successor is durably persisted and every
+				// reversible, fallible step above has succeeded. Cross the irreversible
+				// commit BEFORE any identity rotation. Fencing the predecessor gate
+				// emitter and rotating provider sessions cannot be undone, so once we
+				// begin them a failure must RETAIN the committed successor rather than
+				// attempt a (now-impossible) rollback that would resume a fenced emitter.
+				committed = true;
+				this.#resetInjectedContextSignatures();
+				this.#publishWorkflowGateEmitter(
+					successorGateEmitter,
+					rollbackSessionState.sessionId,
+					suspendedWorkflowGateEmitter,
+				);
+				this.#closeAllProviderSessions("session handoff");
+				this.#rebindProviderSessionState(new Map());
+				this.#resetHindsightConversationTrackingIfHindsight();
+				this.#resetIrcRosterDeliveryState();
+				this.#planReferenceSent = false;
+				this.#planReferencePath = "local://PLAN.md";
+				this.#cancelOwnAsyncJobs();
+				// The predecessor's fenced async-job results (queued while the
+				// transition held the delivery fence) belong to the handed-off session,
+				// not the successor. Suppress and drop ONLY the async-result kind so they
+				// never flush into the new session; MCP resource notifications are
+				// server-scoped and are preserved for the successor.
+				this.#suppressOwnAsyncJobDeliveries();
+				this.yieldQueue.clearKind("async-result");
+
+				// The successor identity/emitter/provider state is now fully live and
+				// predecessor deliveries are suppressed, so release the turn-admission
+				// fence BEFORE publishing session_switch. Successor turns (e.g. a
+				// session_switch hook queuing steering) are legitimate and must not be
+				// rejected; the finally below is only a backstop for early-exit paths.
+				this.#handoffTransitionActive = false;
+				// session_switch is a post-commit identity signal. Extension handler
+				// errors are isolated by ExtensionRunner and must not roll back the
+				// already-committed switch.
+				if (this.#extensionRunner) {
+					await this.#extensionRunner.emit({
+						type: "session_switch",
+						reason: "new",
+						previousSessionFile,
 					});
 				}
-			}
 
-			// Rebuild agent messages from session
-			const sessionContext = this.buildDisplaySessionContext();
-			this.agent.replaceMessages(sessionContext.messages);
-			// Handoff rebuilds live context and can evict a previously injected
-			// goal/plan-mode-context copy; clear the static-once signatures.
-			this.#resetInjectedContextSignatures();
-			this.#syncTodoPhasesFromBranch();
-
-			this.#resetIrcRosterDeliveryState();
-			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
-					reason: "new",
-					previousSessionFile,
+				return { document: handoffText, savedPath };
+			} catch (switchError) {
+				if (committed) {
+					// The switch already committed; a post-commit step failed. Do not
+					// tear down the new session — surface success (the handoff exists).
+					logger.warn("Handoff post-commit step failed after the session switch committed", {
+						error: switchError instanceof Error ? switchError.message : String(switchError),
+					});
+					return { document: handoffText, savedPath };
+				}
+				// Reversible window: roll back to the pre-handoff session so the
+				// failure is non-destructive. Predecessor gate emitter, provider
+				// sessions, async jobs, IRC/plan bookkeeping, and injection signatures
+				// were never mutated before commit, so they survive intact.
+				this.sessionManager.restoreState(rollbackSessionState);
+				this.#syncAgentSessionId(rollbackSessionState.sessionId);
+				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
+				this.#rekeyHindsightMemoryForCurrentSessionId();
+				this.agent.replaceMessages(rollbackAgentMessages);
+				this.agent.clearAllQueues();
+				this.agent.restoreSteering(rollbackAgentSteeringQueue);
+				this.agent.restoreFollowUp(rollbackAgentFollowUpQueue);
+				this.#steeringMessages = rollbackSteeringMessages;
+				this.#followUpMessages = rollbackFollowUpMessages;
+				this.#pendingNextTurnMessages = rollbackPendingNextTurnMessages;
+				this.#scheduledHiddenNextTurnGeneration = rollbackScheduledHiddenNextTurnGeneration;
+				this.#todoReminderCount = rollbackTodoReminderCount;
+				this.#syncTodoPhasesFromBranch();
+				// Remove the orphaned successor transcript/artifacts written before the
+				// failure so a rolled-back handoff leaves nothing behind.
+				if (successorSessionFile && successorSessionFile !== previousSessionFile) {
+					try {
+						await this.sessionManager.discardUncommittedSession(successorSessionFile);
+					} catch (cleanupError) {
+						logger.warn("Failed to remove orphaned handoff session after rollback", {
+							path: successorSessionFile,
+							error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+						});
+					}
+				}
+				// Map to cancellation only for a genuine handoff-signal abort; a
+				// downstream error keeps its cause and the generated document.
+				if (handoffSignal.aborted) {
+					throw new Error("Handoff cancelled");
+				}
+				// Preserve the generated handoff document for copy/retry.
+				throw Object.assign(switchError instanceof Error ? switchError : new Error(String(switchError)), {
+					handoffDocument: handoffText,
 				});
 			}
-
-			return { document: handoffText, savedPath };
 		} catch (error) {
-			if (handoffSignal.aborted || (error instanceof Error && error.name === "AbortError")) {
+			// Genuine handoff-signal cancellation maps to a cancellation error.
+			// Errors surfaced by the inner transaction (which already rolled back
+			// and, for non-aborts, attached the generated document) pass through.
+			if (handoffSignal.aborted) {
 				throw new Error("Handoff cancelled");
 			}
 			throw error;
 		} finally {
 			sourceSignal?.removeEventListener("abort", onSourceAbort);
 			this.#handoffAbortController = undefined;
+			this.#handoffTransitionActive = false;
+			// Releasing the fence: re-arm any idle delivery queued while the transition
+			// held it (e.g. a predecessor async result retained through a rollback, or a
+			// preserved MCP notification) so it is not stranded until an unrelated
+			// enqueue or the next agent yield.
+			this.yieldQueue.rearmIdle();
+			this.#endSessionTransition();
 		}
 	}
 
@@ -13046,6 +13367,9 @@ export class AgentSession {
 	 */
 	async retry(): Promise<boolean> {
 		if (this.isStreaming || this.isCompacting || this.isRetrying) return false;
+		// A handoff transition owns the session; retrying would mutate the tail and
+		// schedule a continuation against the session being handed off.
+		if (this.isGeneratingHandoff || this.#handoffTransitionActive) return false;
 
 		const messages = this.agent.state.messages;
 		const lastMsg = messages[messages.length - 1];
@@ -13961,201 +14285,212 @@ export class AgentSession {
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
 	async switchSession(sessionPath: string): Promise<boolean> {
-		const previousSessionFile = this.sessionManager.getSessionFile();
-		const switchingToDifferentSession = previousSessionFile
-			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
-			: true;
-		// Emit session_before_switch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_switch",
-				reason: "resume",
-				targetSessionFile: sessionPath,
-			})) as SessionBeforeSwitchResult | undefined;
-
-			if (result?.cancel) {
-				return false;
-			}
-		}
-
-		this.#disconnectFromAgent();
-		await this.abort();
-
-		// Flush pending writes before switching so restore snapshots reflect committed state.
-		await this.sessionManager.flush();
-		const previousSessionState = this.sessionManager.captureState();
-		const previousSessionContext = this.buildDisplaySessionContext();
-		// switchSession replaces these arrays wholesale during load/rollback, so retaining
-		// the existing message objects is sufficient and avoids structured-clone failures for
-		// extension/custom metadata that is valid to persist but not cloneable.
-		const previousAgentMessages = [...this.agent.state.messages];
-		const previousSteeringMessages = [...this.#steeringMessages];
-		const previousFollowUpMessages = [...this.#followUpMessages];
-		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
-		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
-		const previousModel = this.model;
-		const previousThinkingLevel = this.#thinkingLevel;
-		const previousServiceTier = this.agent.serviceTier;
-		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
-		const previousTools = [...this.agent.state.tools];
-		const previousBaseSystemPrompt = this.#baseSystemPrompt;
-		const previousSystemPrompt = this.agent.state.systemPrompt;
-		const previousAgentSteeringQueue = this.agent.snapshotSteering();
-		const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
-
-		this.#steeringMessages = [];
-		this.#followUpMessages = [];
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-		const suspendedWorkflowGateEmitter = switchingToDifferentSession
-			? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
-			: undefined;
-		let unavailableDefaultChainMessage: string | undefined;
-
+		this.#beginSessionTransition("switch-session");
 		try {
-			await this.sessionManager.setSessionFile(sessionPath);
-			this.#syncAgentSessionId();
-			this.#rekeyHindsightMemoryForCurrentSessionId();
-
-			const sessionContext = this.buildDisplaySessionContext();
-			const didReloadConversationChange =
-				!switchingToDifferentSession &&
-				this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
-			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
-
-			// The target session is loaded and MCP selections are restored: discard
-			// pre-switch delivery queues before completing the restored agent state.
-			this.agent.clearAllQueues();
-
-			this.agent.replaceMessages(sessionContext.messages);
-			this.#resetInjectedContextSignatures();
-			this.#syncTodoPhasesFromBranch();
-			if (switchingToDifferentSession || didReloadConversationChange) {
-				this.#closeAllProviderSessions(switchingToDifferentSession ? "session switch" : "session reload");
-				this.#rebindProviderSessionState(new Map());
-			}
-
-			const configuredDefaultChain = sessionContext.configuredModelChains.default?.entries;
-			const defaultEntries =
-				configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []);
-			this.#defaultFallbackController = undefined;
-			if (defaultEntries.length > 0) {
-				const resolution = await resolveModelChainWithAuth(
-					defaultEntries,
-					this.#modelRegistry,
-					this.settings,
-					this.sessionId,
-					{ managedFallback: true },
-				);
-				const controller = this.#defaultFallbackChain();
-				this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
-				if (!resolution.model) {
-					unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
-					throw new Error(unavailableDefaultChainMessage);
-				}
-				if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
-					this.#setModelAuthoritatively(resolution.model, "restore");
-				}
-				if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
-					this.setThinkingLevel(resolution.thinkingLevel);
-				}
-			}
-
-			const hasThinkingEntry = this.sessionManager.getBranch().some(entry => entry.type === "thinking_level_change");
-			const hasServiceTierEntry = this.sessionManager
-				.getBranch()
-				.some(entry => entry.type === "service_tier_change");
-			const defaultThinkingLevel = this.settings.get("defaultThinkingLevel");
-			const configuredServiceTier = this.settings.get("serviceTier");
-			const persistedThinkingLevel = hasThinkingEntry
-				? (sessionContext.thinkingLevel as ThinkingLevel | undefined)
-				: defaultThinkingLevel;
-			const nextThinkingLevel = resolveThinkingLevelForModel(
-				this.model,
-				persistedThinkingLevel === ThinkingLevel.Inherit
-					? this.#getInheritedThinkingLevel()
-					: persistedThinkingLevel,
-			);
-			this.#thinkingLevel = nextThinkingLevel;
-			this.agent.setThinkingLevel(toReasoningEffort(nextThinkingLevel));
-			this.agent.serviceTier = hasServiceTierEntry
-				? sessionContext.serviceTier
-				: configuredServiceTier === "none"
-					? undefined
-					: configuredServiceTier;
-			// Establish the successor's durable session identity only after every
-			// restored state facet is live. Identity-bound extension hooks run below.
-			await this.sessionManager.ensureOnDisk();
-
-			if (switchingToDifferentSession) {
-				this.#resetHindsightConversationTrackingIfHindsight();
-				this.#resetIrcRosterDeliveryState();
-			}
-
-			this.#reconnectToAgent();
-			// Fence predecessor continuations before session_switch starts SDK runtime
-			// teardown. The previous runtime waits for those continuations to settle;
-			// waiting to transfer authority until after hooks creates a circular wait.
-			if (suspendedWorkflowGateEmitter)
-				this.#bindWorkflowGateEmitter(previousSessionState.sessionId, suspendedWorkflowGateEmitter);
-			// session_switch is the post-commit identity signal. SDK authority and
-			// other identity-bound integrations must not observe the successor until
-			// messages, model state, MCP selections, and the agent subscription are live.
-			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
+			const previousSessionFile = this.sessionManager.getSessionFile();
+			const switchingToDifferentSession = previousSessionFile
+				? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
+				: true;
+			// Emit session_before_switch event (can be cancelled)
+			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_switch",
 					reason: "resume",
-					previousSessionFile,
-				});
-			}
-			return true;
-		} catch (error) {
-			this.sessionManager.restoreState(previousSessionState);
-			this.#defaultFallbackController = undefined;
-			this.#syncAgentSessionId(previousSessionState.sessionId);
-			this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
-			this.#rekeyHindsightMemoryForCurrentSessionId();
-			let restoreMcpError: unknown;
-			try {
-				await this.#restoreMCPSelectionsForSessionContext(previousSessionContext);
-			} catch (mcpError) {
-				restoreMcpError = mcpError;
-				logger.warn("Failed to restore MCP selections after switch error", {
-					previousSessionFile,
 					targetSessionFile: sessionPath,
-					error: String(mcpError),
-				});
-				this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
-				this.#setGuardedAgentTools(previousTools);
+				})) as SessionBeforeSwitchResult | undefined;
+
+				if (result?.cancel) {
+					return false;
+				}
+			}
+
+			this.#disconnectFromAgent();
+			await this.abort();
+
+			// Flush pending writes before switching so restore snapshots reflect committed state.
+			await this.sessionManager.flush();
+			const previousSessionState = this.sessionManager.captureState();
+			const previousSessionContext = this.buildDisplaySessionContext();
+			// switchSession replaces these arrays wholesale during load/rollback, so retaining
+			// the existing message objects is sufficient and avoids structured-clone failures for
+			// extension/custom metadata that is valid to persist but not cloneable.
+			const previousAgentMessages = [...this.agent.state.messages];
+			const previousSteeringMessages = [...this.#steeringMessages];
+			const previousFollowUpMessages = [...this.#followUpMessages];
+			const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
+			const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
+			const previousModel = this.model;
+			const previousThinkingLevel = this.#thinkingLevel;
+			const previousServiceTier = this.agent.serviceTier;
+			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
+			const previousTools = [...this.agent.state.tools];
+			const previousBaseSystemPrompt = this.#baseSystemPrompt;
+			const previousSystemPrompt = this.agent.state.systemPrompt;
+			const previousAgentSteeringQueue = this.agent.snapshotSteering();
+			const previousAgentFollowUpQueue = this.agent.snapshotFollowUp();
+
+			this.#steeringMessages = [];
+			this.#followUpMessages = [];
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+			const suspendedWorkflowGateEmitter = switchingToDifferentSession
+				? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
+				: undefined;
+			let unavailableDefaultChainMessage: string | undefined;
+
+			try {
+				await this.sessionManager.setSessionFile(sessionPath);
+				this.#syncAgentSessionId();
+				this.#rekeyHindsightMemoryForCurrentSessionId();
+
+				const sessionContext = this.buildDisplaySessionContext();
+				const didReloadConversationChange =
+					!switchingToDifferentSession &&
+					this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
+				await this.#restoreMCPSelectionsForSessionContext(sessionContext);
+
+				// The target session is loaded and MCP selections are restored: discard
+				// pre-switch delivery queues before completing the restored agent state.
+				this.agent.clearAllQueues();
+
+				this.agent.replaceMessages(sessionContext.messages);
+				this.#resetInjectedContextSignatures();
+				this.#syncTodoPhasesFromBranch();
+				if (switchingToDifferentSession || didReloadConversationChange) {
+					this.#closeAllProviderSessions(switchingToDifferentSession ? "session switch" : "session reload");
+					this.#rebindProviderSessionState(new Map());
+				}
+
+				const configuredDefaultChain = sessionContext.configuredModelChains.default?.entries;
+				const defaultEntries =
+					configuredDefaultChain ?? (sessionContext.models.default ? [sessionContext.models.default] : []);
+				this.#defaultFallbackController = undefined;
+				if (defaultEntries.length > 0) {
+					const resolution = await resolveModelChainWithAuth(
+						defaultEntries,
+						this.#modelRegistry,
+						this.settings,
+						this.sessionId,
+						{ managedFallback: true },
+					);
+					const controller = this.#defaultFallbackChain();
+					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
+					if (!resolution.model) {
+						unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
+						throw new Error(unavailableDefaultChainMessage);
+					}
+					if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
+						this.#setModelAuthoritatively(resolution.model, "restore");
+					}
+					if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
+						this.setThinkingLevel(resolution.thinkingLevel);
+					}
+				}
+
+				const hasThinkingEntry = this.sessionManager
+					.getBranch()
+					.some(entry => entry.type === "thinking_level_change");
+				const hasServiceTierEntry = this.sessionManager
+					.getBranch()
+					.some(entry => entry.type === "service_tier_change");
+				const defaultThinkingLevel = this.settings.get("defaultThinkingLevel");
+				const configuredServiceTier = this.settings.get("serviceTier");
+				const persistedThinkingLevel = hasThinkingEntry
+					? (sessionContext.thinkingLevel as ThinkingLevel | undefined)
+					: defaultThinkingLevel;
+				const nextThinkingLevel = resolveThinkingLevelForModel(
+					this.model,
+					persistedThinkingLevel === ThinkingLevel.Inherit
+						? this.#getInheritedThinkingLevel()
+						: persistedThinkingLevel,
+				);
+				this.#thinkingLevel = nextThinkingLevel;
+				this.agent.setThinkingLevel(toReasoningEffort(nextThinkingLevel));
+				this.agent.serviceTier = hasServiceTierEntry
+					? sessionContext.serviceTier
+					: configuredServiceTier === "none"
+						? undefined
+						: configuredServiceTier;
+				// Establish the successor's durable session identity only after every
+				// restored state facet is live. Identity-bound extension hooks run below.
+				await this.sessionManager.ensureOnDisk();
+
+				if (switchingToDifferentSession) {
+					this.#resetHindsightConversationTrackingIfHindsight();
+					this.#resetIrcRosterDeliveryState();
+				}
+
+				this.#reconnectToAgent();
+				// Fence predecessor continuations before session_switch starts SDK runtime
+				// teardown. The previous runtime waits for those continuations to settle;
+				// waiting to transfer authority until after hooks creates a circular wait.
+				if (suspendedWorkflowGateEmitter)
+					this.#bindWorkflowGateEmitter(previousSessionState.sessionId, suspendedWorkflowGateEmitter);
+				// session_switch is the post-commit identity signal. SDK authority and
+				// other identity-bound integrations must not observe the successor until
+				// messages, model state, MCP selections, and the agent subscription are live.
+				if (this.#extensionRunner) {
+					await this.#extensionRunner.emit({
+						type: "session_switch",
+						reason: "resume",
+						previousSessionFile,
+					});
+				}
+				return true;
+			} catch (error) {
+				this.sessionManager.restoreState(previousSessionState);
+				this.#defaultFallbackController = undefined;
+				this.#syncAgentSessionId(previousSessionState.sessionId);
+				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
+				this.#rekeyHindsightMemoryForCurrentSessionId();
+				let restoreMcpError: unknown;
+				try {
+					await this.#restoreMCPSelectionsForSessionContext(previousSessionContext);
+				} catch (mcpError) {
+					restoreMcpError = mcpError;
+					logger.warn("Failed to restore MCP selections after switch error", {
+						previousSessionFile,
+						targetSessionFile: sessionPath,
+						error: String(mcpError),
+					});
+					this.#selectedMCPToolNames = new Set(previousSelectedMCPToolNames);
+					this.#setGuardedAgentTools(previousTools);
+					this.#baseSystemPrompt = previousBaseSystemPrompt;
+					this.agent.setSystemPrompt(previousSystemPrompt);
+				}
 				this.#baseSystemPrompt = previousBaseSystemPrompt;
 				this.agent.setSystemPrompt(previousSystemPrompt);
+				this.agent.replaceMessages(previousAgentMessages);
+				this.#steeringMessages = previousSteeringMessages;
+				this.#followUpMessages = previousFollowUpMessages;
+				this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
+				this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+				this.agent.clearAllQueues();
+				this.agent.restoreSteering(previousAgentSteeringQueue);
+				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
+				if (previousModel) {
+					this.agent.setModel(previousModel);
+				}
+				this.#thinkingLevel = previousThinkingLevel;
+				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
+				this.agent.serviceTier = previousServiceTier;
+				this.#syncTodoPhasesFromBranch();
+				this.#reconnectToAgent();
+				if (restoreMcpError) {
+					throw restoreMcpError;
+				}
+				if (unavailableDefaultChainMessage) {
+					this.emitNotice(
+						"error",
+						`Could not restore session model: ${unavailableDefaultChainMessage}`,
+						"fallback",
+					);
+					return false;
+				}
+				throw error;
 			}
-			this.#baseSystemPrompt = previousBaseSystemPrompt;
-			this.agent.setSystemPrompt(previousSystemPrompt);
-			this.agent.replaceMessages(previousAgentMessages);
-			this.#steeringMessages = previousSteeringMessages;
-			this.#followUpMessages = previousFollowUpMessages;
-			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
-			this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
-			this.agent.clearAllQueues();
-			this.agent.restoreSteering(previousAgentSteeringQueue);
-			this.agent.restoreFollowUp(previousAgentFollowUpQueue);
-			if (previousModel) {
-				this.agent.setModel(previousModel);
-			}
-			this.#thinkingLevel = previousThinkingLevel;
-			this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
-			this.agent.serviceTier = previousServiceTier;
-			this.#syncTodoPhasesFromBranch();
-			this.#reconnectToAgent();
-			if (restoreMcpError) {
-				throw restoreMcpError;
-			}
-			if (unavailableDefaultChainMessage) {
-				this.emitNotice("error", `Could not restore session model: ${unavailableDefaultChainMessage}`, "fallback");
-				return false;
-			}
-			throw error;
+		} finally {
+			this.#endSessionTransition();
 		}
 	}
 
@@ -14172,74 +14507,79 @@ export class AgentSession {
 		selectedText: string;
 		cancelled: boolean;
 	}> {
-		const previousSessionFile = this.sessionFile;
-		const previousWorkflowGateSessionId = this.sessionId;
-		const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
+		this.#beginSessionTransition("branch");
+		try {
+			const previousSessionFile = this.sessionFile;
+			const previousWorkflowGateSessionId = this.sessionId;
+			const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
 
-		if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
-			throw new Error("Invalid entry ID for branching");
-		}
-
-		const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
-
-		let skipConversationRestore = false;
-
-		// Emit session_before_branch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_branch",
-				entryId,
-			})) as SessionBeforeBranchResult | undefined;
-
-			if (result?.cancel) {
-				return { selectedText, cancelled: true };
+			if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
+				throw new Error("Invalid entry ID for branching");
 			}
-			skipConversationRestore = result?.skipConversationRestore ?? false;
+
+			const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
+
+			let skipConversationRestore = false;
+
+			// Emit session_before_branch event (can be cancelled)
+			if (this.#extensionRunner?.hasHandlers("session_before_branch")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_branch",
+					entryId,
+				})) as SessionBeforeBranchResult | undefined;
+
+				if (result?.cancel) {
+					return { selectedText, cancelled: true };
+				}
+				skipConversationRestore = result?.skipConversationRestore ?? false;
+			}
+
+			// Clear pending messages (bound to old session state)
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+
+			// Flush pending writes before branching
+			await this.sessionManager.flush();
+			this.#cancelOwnAsyncJobs();
+
+			if (!selectedEntry.parentId) {
+				await this.sessionManager.newSession({ parentSession: previousSessionFile });
+			} else {
+				this.sessionManager.createBranchedSession(selectedEntry.parentId);
+			}
+			this.#syncTodoPhasesFromBranch();
+			this.#syncAgentSessionId();
+			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
+			this.#rekeyHindsightMemoryForCurrentSessionId();
+			this.#resetHindsightConversationTrackingIfHindsight();
+			this.#closeAllProviderSessions("session branch");
+			this.#rebindProviderSessionState(new Map());
+
+			// Reload messages from entries (works for both file and in-memory mode)
+			const sessionContext = this.buildDisplaySessionContext();
+
+			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
+
+			if (!skipConversationRestore) {
+				this.agent.replaceMessages(sessionContext.messages);
+				this.#resetInjectedContextSignatures();
+				this.#closeCodexProviderSessionsForHistoryRewrite();
+			}
+
+			this.#resetIrcRosterDeliveryState();
+			// session_branch is the post-commit identity signal. Publish it only after
+			// the successor's messages and MCP selections are restored.
+			if (this.#extensionRunner) {
+				await this.#extensionRunner.emit({
+					type: "session_branch",
+					previousSessionFile,
+				});
+			}
+
+			return { selectedText, cancelled: false };
+		} finally {
+			this.#endSessionTransition();
 		}
-
-		// Clear pending messages (bound to old session state)
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-
-		// Flush pending writes before branching
-		await this.sessionManager.flush();
-		this.#cancelOwnAsyncJobs();
-
-		if (!selectedEntry.parentId) {
-			await this.sessionManager.newSession({ parentSession: previousSessionFile });
-		} else {
-			this.sessionManager.createBranchedSession(selectedEntry.parentId);
-		}
-		this.#syncTodoPhasesFromBranch();
-		this.#syncAgentSessionId();
-		this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
-		this.#rekeyHindsightMemoryForCurrentSessionId();
-		this.#resetHindsightConversationTrackingIfHindsight();
-		this.#closeAllProviderSessions("session branch");
-		this.#rebindProviderSessionState(new Map());
-
-		// Reload messages from entries (works for both file and in-memory mode)
-		const sessionContext = this.buildDisplaySessionContext();
-
-		await this.#restoreMCPSelectionsForSessionContext(sessionContext);
-
-		if (!skipConversationRestore) {
-			this.agent.replaceMessages(sessionContext.messages);
-			this.#resetInjectedContextSignatures();
-			this.#closeCodexProviderSessionsForHistoryRewrite();
-		}
-
-		this.#resetIrcRosterDeliveryState();
-		// session_branch is the post-commit identity signal. Publish it only after
-		// the successor's messages and MCP selections are restored.
-		if (this.#extensionRunner) {
-			await this.#extensionRunner.emit({
-				type: "session_branch",
-				previousSessionFile,
-			});
-		}
-
-		return { selectedText, cancelled: false };
 	}
 
 	// =========================================================================
@@ -14266,165 +14606,178 @@ export class AgentSession {
 		/** Raw session context built during navigation — pass to renderInitialMessages to skip a second O(N) walk. */
 		sessionContext?: SessionContext;
 	}> {
-		const oldLeafId = this.sessionManager.getLeafId();
+		// Serialize with every other session-identity transition via the shared
+		// lease (handoff/compact/new/switch/branch/clear/fork). navigateTree rewrites
+		// live history in place, so a concurrent transition would race the same state.
+		this.#beginSessionTransition("navigate-tree");
+		try {
+			const oldLeafId = this.sessionManager.getLeafId();
 
-		// No-op if already at target
-		if (targetId === oldLeafId) {
-			return { cancelled: false };
-		}
-
-		// Model required for summarization
-		if (options.summarize && !this.model) {
-			throw new Error("No model available for summarization");
-		}
-
-		const targetEntry = this.sessionManager.getEntryForFidelity(targetId);
-		if (!targetEntry) {
-			throw new Error(`Entry ${targetId} not found`);
-		}
-
-		// Collect entries to summarize (from old leaf to common ancestor).
-		const { entries: collectedEntriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
-			this.sessionManager,
-			oldLeafId,
-			targetId,
-		);
-		const entriesToSummarize = this.#withoutEphemeralCustomMessageEntries(collectedEntriesToSummarize);
-
-		// Prepare event data
-		const preparation: TreePreparation = {
-			targetId,
-			oldLeafId,
-			commonAncestorId,
-			entriesToSummarize,
-			userWantsSummary: options.summarize ?? false,
-		};
-
-		// Set up abort controller for summarization
-		this.#branchSummaryAbortController = new AbortController();
-		let hookSummary: { summary: string; details?: unknown } | undefined;
-		let fromExtension = false;
-
-		// Emit session_before_tree event
-		if (this.#extensionRunner?.hasHandlers("session_before_tree")) {
-			const result = (await this.#extensionRunner.emit({
-				type: "session_before_tree",
-				preparation,
-				signal: this.#branchSummaryAbortController.signal,
-			})) as SessionBeforeTreeResult | undefined;
-
-			if (result?.cancel) {
-				return { cancelled: true };
+			// No-op if already at target
+			if (targetId === oldLeafId) {
+				return { cancelled: false };
 			}
 
-			if (result?.summary && options.summarize) {
-				hookSummary = result.summary;
-				fromExtension = true;
+			// Model required for summarization
+			if (options.summarize && !this.model) {
+				throw new Error("No model available for summarization");
 			}
-		}
 
-		// Run default summarizer if needed
-		let summaryText: string | undefined;
-		let summaryDetails: unknown;
-		if (options.summarize && entriesToSummarize.length > 0 && !hookSummary) {
-			const model = this.model!;
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
-			if (!apiKey) {
-				throw new Error(`No API key for ${model.provider}`);
+			const targetEntry = this.sessionManager.getEntryForFidelity(targetId);
+			if (!targetEntry) {
+				throw new Error(`Entry ${targetId} not found`);
 			}
-			const branchSummarySettings = this.settings.getGroup("branchSummary");
-			const result = await generateBranchSummary(entriesToSummarize, {
-				...this.#maintenanceProviderTransport(),
-				model,
-				apiKey,
-				signal: this.#branchSummaryAbortController.signal,
-				customInstructions: options.customInstructions,
-				reserveTokens: branchSummarySettings.reserveTokens,
-				metadata: this.agent.metadataForProvider(model.provider),
-				convertToLlm,
-				telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
-			});
-			this.#branchSummaryAbortController = undefined;
-			if (result.aborted) {
-				return { cancelled: true, aborted: true };
-			}
-			if (result.error) {
-				throw new Error(result.error);
-			}
-			summaryText = result.summary;
-			summaryDetails = {
-				readFiles: result.readFiles || [],
-				modifiedFiles: result.modifiedFiles || [],
-			};
-		} else if (hookSummary) {
-			summaryText = hookSummary.summary;
-			summaryDetails = hookSummary.details;
-		}
 
-		// Determine the new leaf position based on target type
-		let newLeafId: string | null;
-		let editorText: string | undefined;
-
-		if (targetEntry.type === "message" && targetEntry.message.role === "user") {
-			// User message: leaf = parent (null if root), text goes to editor
-			newLeafId = targetEntry.parentId;
-			editorText = this.#extractUserMessageText(targetEntry.message.content);
-		} else if (targetEntry.type === "custom_message") {
-			// Custom message: leaf = parent (null if root), text goes to editor
-			newLeafId = targetEntry.parentId;
-			editorText =
-				typeof targetEntry.content === "string"
-					? targetEntry.content
-					: targetEntry.content
-							.filter((c): c is { type: "text"; text: string } => c.type === "text")
-							.map(c => c.text)
-							.join("");
-		} else {
-			// Non-user message: leaf = selected node
-			newLeafId = targetId;
-		}
-
-		// Switch leaf (with or without summary)
-		// Summary is attached at the navigation target position (newLeafId), not the old branch
-		let summaryEntry: BranchSummaryEntry | undefined;
-		if (summaryText) {
-			// Create summary at target position (can be null for root)
-			const summaryId = this.sessionManager.branchWithSummary(newLeafId, summaryText, summaryDetails, fromExtension);
-			summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
-		} else if (newLeafId === null) {
-			// No summary, navigating to root - reset leaf
-			this.sessionManager.resetLeaf();
-		} else {
-			// No summary, navigating to non-root
-			this.sessionManager.branch(newLeafId);
-		}
-
-		// Update agent state through the canonical filtered display context so legacy
-		// request-scoped entries cannot re-enter live history after tree navigation.
-		const displayContext = this.buildDisplaySessionContext();
-		await this.#restoreMCPSelectionsForSessionContext(displayContext);
-		this.agent.replaceMessages(displayContext.messages);
-		this.#resetInjectedContextSignatures();
-		this.#syncTodoPhasesFromBranch();
-		this.#closeCodexProviderSessionsForHistoryRewrite();
-
-		this.#branchSummaryAbortController = undefined;
-
-		// Emit session_tree event; only handlers can mutate session entries, so skip
-		// the emit and the context rebuild when no handlers are registered (mirrors
-		// the session_before_tree guard above).
-		if (this.#extensionRunner?.hasHandlers("session_tree")) {
-			await this.#extensionRunner.emit({
-				type: "session_tree",
-				newLeafId: this.sessionManager.getLeafId(),
+			// Collect entries to summarize (from old leaf to common ancestor).
+			const { entries: collectedEntriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
+				this.sessionManager,
 				oldLeafId,
-				summaryEntry,
-				fromExtension: summaryText ? fromExtension : undefined,
-			});
-			const refreshedContext = this.buildDisplaySessionContext();
-			return { editorText, cancelled: false, summaryEntry, sessionContext: refreshedContext };
+				targetId,
+			);
+			const entriesToSummarize = this.#withoutEphemeralCustomMessageEntries(collectedEntriesToSummarize);
+
+			// Prepare event data
+			const preparation: TreePreparation = {
+				targetId,
+				oldLeafId,
+				commonAncestorId,
+				entriesToSummarize,
+				userWantsSummary: options.summarize ?? false,
+			};
+
+			// Set up abort controller for summarization
+			this.#branchSummaryAbortController = new AbortController();
+			let hookSummary: { summary: string; details?: unknown } | undefined;
+			let fromExtension = false;
+
+			// Emit session_before_tree event
+			if (this.#extensionRunner?.hasHandlers("session_before_tree")) {
+				const result = (await this.#extensionRunner.emit({
+					type: "session_before_tree",
+					preparation,
+					signal: this.#branchSummaryAbortController.signal,
+				})) as SessionBeforeTreeResult | undefined;
+
+				if (result?.cancel) {
+					return { cancelled: true };
+				}
+
+				if (result?.summary && options.summarize) {
+					hookSummary = result.summary;
+					fromExtension = true;
+				}
+			}
+
+			// Run default summarizer if needed
+			let summaryText: string | undefined;
+			let summaryDetails: unknown;
+			if (options.summarize && entriesToSummarize.length > 0 && !hookSummary) {
+				const model = this.model!;
+				const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
+				if (!apiKey) {
+					throw new Error(`No API key for ${model.provider}`);
+				}
+				const branchSummarySettings = this.settings.getGroup("branchSummary");
+				const result = await generateBranchSummary(entriesToSummarize, {
+					...this.#maintenanceProviderTransport(),
+					model,
+					apiKey,
+					signal: this.#branchSummaryAbortController.signal,
+					customInstructions: options.customInstructions,
+					reserveTokens: branchSummarySettings.reserveTokens,
+					metadata: this.agent.metadataForProvider(model.provider),
+					convertToLlm,
+					telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),
+				});
+				this.#branchSummaryAbortController = undefined;
+				if (result.aborted) {
+					return { cancelled: true, aborted: true };
+				}
+				if (result.error) {
+					throw new Error(result.error);
+				}
+				summaryText = result.summary;
+				summaryDetails = {
+					readFiles: result.readFiles || [],
+					modifiedFiles: result.modifiedFiles || [],
+				};
+			} else if (hookSummary) {
+				summaryText = hookSummary.summary;
+				summaryDetails = hookSummary.details;
+			}
+
+			// Determine the new leaf position based on target type
+			let newLeafId: string | null;
+			let editorText: string | undefined;
+
+			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
+				// User message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = this.#extractUserMessageText(targetEntry.message.content);
+			} else if (targetEntry.type === "custom_message") {
+				// Custom message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText =
+					typeof targetEntry.content === "string"
+						? targetEntry.content
+						: targetEntry.content
+								.filter((c): c is { type: "text"; text: string } => c.type === "text")
+								.map(c => c.text)
+								.join("");
+			} else {
+				// Non-user message: leaf = selected node
+				newLeafId = targetId;
+			}
+
+			// Switch leaf (with or without summary)
+			// Summary is attached at the navigation target position (newLeafId), not the old branch
+			let summaryEntry: BranchSummaryEntry | undefined;
+			if (summaryText) {
+				// Create summary at target position (can be null for root)
+				const summaryId = this.sessionManager.branchWithSummary(
+					newLeafId,
+					summaryText,
+					summaryDetails,
+					fromExtension,
+				);
+				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
+			} else if (newLeafId === null) {
+				// No summary, navigating to root - reset leaf
+				this.sessionManager.resetLeaf();
+			} else {
+				// No summary, navigating to non-root
+				this.sessionManager.branch(newLeafId);
+			}
+
+			// Update agent state through the canonical filtered display context so legacy
+			// request-scoped entries cannot re-enter live history after tree navigation.
+			const displayContext = this.buildDisplaySessionContext();
+			await this.#restoreMCPSelectionsForSessionContext(displayContext);
+			this.agent.replaceMessages(displayContext.messages);
+			this.#resetInjectedContextSignatures();
+			this.#syncTodoPhasesFromBranch();
+			this.#closeCodexProviderSessionsForHistoryRewrite();
+
+			this.#branchSummaryAbortController = undefined;
+
+			// Emit session_tree event; only handlers can mutate session entries, so skip
+			// the emit and the context rebuild when no handlers are registered (mirrors
+			// the session_before_tree guard above).
+			if (this.#extensionRunner?.hasHandlers("session_tree")) {
+				await this.#extensionRunner.emit({
+					type: "session_tree",
+					newLeafId: this.sessionManager.getLeafId(),
+					oldLeafId,
+					summaryEntry,
+					fromExtension: summaryText ? fromExtension : undefined,
+				});
+				const refreshedContext = this.buildDisplaySessionContext();
+				return { editorText, cancelled: false, summaryEntry, sessionContext: refreshedContext };
+			}
+			return { editorText, cancelled: false, summaryEntry, sessionContext: displayContext };
+		} finally {
+			this.#endSessionTransition();
 		}
-		return { editorText, cancelled: false, summaryEntry, sessionContext: displayContext };
 	}
 
 	/**

@@ -25,10 +25,13 @@ export type ChatDaemonAction = "stop" | "reload";
  * Operational generations of the Discord/Slack daemon lifecycle contracts.
  * These are intentionally separate from per-session endpoint generations.
  * Generation 6 carries the retained managed filesystem authority boundary.
+ * Generation 7 restores macOS daemon signaling (kill(2) with a start-time
+ * incarnation recheck) so a live/hung owner can be replaced without an external
+ * `kill -9`.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 6,
-	slack: 6,
+	discord: 7,
+	slack: 7,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -166,18 +169,27 @@ export interface ChatDaemonProcessReference {
 }
 
 function defaultProcessReference(pid: number, platform = os.platform()): ChatDaemonProcessReference | undefined {
-	// Process.fromPid on Darwin still resolves identity and then signals a numeric
-	// PID. A process can exit and its PID be reused in that interval, so daemon
-	// control must not use it as privileged signaling authority.
-	if (platform === "darwin") return undefined;
 	try {
 		const processRef = Process.fromPid(pid);
 		if (!processRef || !hasProcessIncarnationAuthority(processRef.incarnation)) return undefined;
+		const incarnation = processRef.incarnation;
 		return {
-			incarnation: processRef.incarnation,
+			incarnation,
 			signalRoot: signal => {
 				const nativeSignal = os.constants.signals[signal];
 				if (nativeSignal === undefined) throw new Error(`Unsupported signal: ${signal}`);
+				// macOS exposes no pidfd and the native signal_root is a no-op there, so
+				// the daemon control plane previously had NO way to signal a live owner —
+				// every stop/reload of a live/hung daemon refused, and only an external
+				// `kill -9` could recover it. Signal by numeric PID via kill(2), but
+				// re-read the immutable start-time incarnation immediately beforehand so a
+				// PID that exited and was reused since capture is never signaled.
+				if (platform === "darwin") {
+					const current = Process.fromPid(pid) as { incarnation?: unknown } | null;
+					if (!current || current.incarnation !== incarnation) throw new Error("Pinned process is already gone");
+					process.kill(pid, signal);
+					return;
+				}
 				const rootProcess = processRef as typeof processRef & { signalRoot(signal: number): boolean };
 				if (!rootProcess.signalRoot(nativeSignal)) throw new Error("Pinned process is already gone");
 			},

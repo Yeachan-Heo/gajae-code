@@ -1926,8 +1926,10 @@ function sdkControlSurface(
 		}
 		return "unknown";
 	};
-	const sendSteer = (text: string) => {
-		api.sendUserMessage(text, { deliverAs: "steer" });
+	const sendSteer = async (text: string) => {
+		// Await admission so a rejection (e.g. handoff in progress) surfaces as a
+		// control error instead of a false `accepted: true`.
+		await api.sendUserMessage(text, { deliverAs: "steer" });
 		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {

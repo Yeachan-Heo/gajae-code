@@ -2066,6 +2066,24 @@
 		]
 	},
 	{
+		"sourceId": "slash_command:handoff",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "include",
+		"sdkId": "session.handoff",
+		"adapterMappings": {
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
 		"sourceId": "slash_command:contribute-pr",
 		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
 		"sourceKind": "slash_command",

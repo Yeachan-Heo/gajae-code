@@ -325,3 +325,49 @@ describe("builtin /exit shutdown command", () => {
 		expect(BUILTIN_SLASH_COMMAND_DEFS.some(command => command.name === "quit")).toBe(false);
 	});
 });
+
+function createHandoffTuiRuntime() {
+	const handleHandoffCommand = vi.fn(async (_focus?: string) => {});
+	const setText = vi.fn();
+	const ctx = {
+		handleHandoffCommand,
+		editor: { setText },
+	} as unknown as InteractiveModeContext;
+
+	return {
+		runtime: { ctx, handleBackgroundCommand: () => undefined },
+		handleHandoffCommand,
+		setText,
+	};
+}
+
+describe("builtin /handoff slash command", () => {
+	it("is discoverable with focus-instruction completion metadata", () => {
+		const handoffCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "handoff");
+
+		expect(handoffCommand).toBeDefined();
+		expect(handoffCommand?.description).toBe("Generate a handoff and continue in a new session");
+		expect(handoffCommand?.inlineHint).toBe("[focus instructions]");
+		expect(handoffCommand?.priority).toBe(71);
+	});
+
+	it("dispatches zero-argument /handoff to the handoff controller path", async () => {
+		const { runtime, handleHandoffCommand, setText } = createHandoffTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/handoff", runtime);
+
+		expect(result).toBe(true);
+		expect(handleHandoffCommand).toHaveBeenCalledWith(undefined);
+		expect(setText).toHaveBeenCalledWith("");
+	});
+
+	it("passes focus instructions through to the handoff controller", async () => {
+		const { runtime, handleHandoffCommand, setText } = createHandoffTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/handoff preserve failing test name", runtime);
+
+		expect(result).toBe(true);
+		expect(handleHandoffCommand).toHaveBeenCalledWith("preserve failing test name");
+		expect(setText).toHaveBeenCalledWith("");
+	});
+});

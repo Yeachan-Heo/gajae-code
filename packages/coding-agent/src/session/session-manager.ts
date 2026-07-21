@@ -853,6 +853,32 @@ function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | un
 	return path.resolve(sessionDir) === path.resolve(resolved.scope.directoryPath) ? sessionsRoot : undefined;
 }
 
+/**
+ * Resolve `target` through the real path of its nearest existing ancestor,
+ * re-appending any not-yet-created trailing segments. Symlink/reparse components
+ * in the existing prefix are canonicalized (so aliases cannot escape a containment
+ * check or alias another file), while a missing leaf (e.g. an uncommitted session
+ * transcript) is still resolved deterministically. Non-ENOENT errors (ELOOP,
+ * EACCES, ...) surface rather than silently falling back to the lexical path.
+ */
+function canonicalizeThroughExistingAncestor(target: string): string {
+	const resolved = path.resolve(target);
+	const tail: string[] = [];
+	let current = resolved;
+	while (true) {
+		try {
+			const real = fs.realpathSync(current);
+			return tail.length === 0 ? real : path.join(real, ...tail.reverse());
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+			const parent = path.dirname(current);
+			if (parent === current) return resolved;
+			tail.push(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
 function isSupportedSessionVersion(version: unknown): boolean {
 	return (
 		version === undefined ||
@@ -4233,6 +4259,46 @@ export class SessionManager {
 			} else {
 				await this.storage.deleteSessionWithArtifacts(sessionPath);
 			}
+		} catch (err) {
+			if (isEnoent(err)) return;
+			throw err;
+		}
+	}
+
+	/**
+	 * Exact-delete a session transcript and its artifacts by path WITHOUT requiring
+	 * managed logical authorization. This is only for discarding an UNCOMMITTED
+	 * successor that a transaction (e.g. handoff) created via `newSession()` but
+	 * never durably authorized — such a session has no managed candidate listing
+	 * yet, so `dropSession` would refuse it and leak its resident-cache/artifact
+	 * root. Bounded to this manager's configured session root and refuses to touch
+	 * the active session; tolerates missing files.
+	 */
+	async discardUncommittedSession(sessionPath: string): Promise<void> {
+		// Close the writer FIRST so the canonical checks and the delete run with no
+		// intervening await, eliminating the check/use window in which a parent
+		// directory could be swapped for a symlink between authorization and deletion.
+		await this.#closePersistWriter();
+		// Canonicalize the candidate (and the active file / configured dir) through
+		// their nearest existing ancestor so symlink/reparse components cannot alias
+		// the active session or escape the configured session directory, even when
+		// the successor transcript itself does not yet exist.
+		const canonicalCandidate = canonicalizeThroughExistingAncestor(path.resolve(sessionPath));
+		if (this.#sessionFile) {
+			const canonicalActive = canonicalizeThroughExistingAncestor(path.resolve(this.#sessionFile));
+			if (canonicalActive === canonicalCandidate) {
+				throw new Error("Refusing to discard the active session as uncommitted.");
+			}
+		}
+		// Least-authority containment: only within this manager's configured session
+		// directory (canonical), where newSession() allocates the successor. The
+		// broader managed root (parent of sessionDir) is deliberately NOT accepted.
+		const canonicalSessionDir = canonicalizeThroughExistingAncestor(path.resolve(this.sessionDir));
+		if (!pathIsWithin(canonicalSessionDir, canonicalCandidate)) {
+			throw new Error("Uncommitted session discard is limited to this manager's configured session directory.");
+		}
+		try {
+			await this.storage.deleteSessionWithArtifacts(canonicalCandidate);
 		} catch (err) {
 			if (isEnoent(err)) return;
 			throw err;

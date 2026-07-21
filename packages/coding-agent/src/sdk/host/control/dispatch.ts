@@ -254,10 +254,17 @@ function invoke(
 }
 
 function errorResponse(id: string, row: Operation, error: unknown): ControlResponse {
-	const candidate = error as { code?: unknown; message?: unknown; recovery?: unknown };
+	const candidate = error as { code?: unknown; message?: unknown; recovery?: unknown; handoffDocument?: unknown };
 	const code = typeof candidate?.code === "string" ? candidate.code : undefined;
 	const message = typeof candidate?.message === "string" ? candidate.message : "Control operation failed.";
-	if (error instanceof BusyError) return failure(id, "busy", message);
+	// A failed session.handoff is non-destructive and retains the generated
+	// document; surface it on the control protocol so external SDK/ACP/daemon
+	// clients can copy/retry it, mirroring the in-process seams and TUI.
+	const details: ControlValue | undefined =
+		row.sdkId === "session.handoff" && typeof candidate?.handoffDocument === "string"
+			? ({ handoffDocument: candidate.handoffDocument } as ControlValue)
+			: undefined;
+	if (error instanceof BusyError) return failure(id, "busy", message, undefined, details);
 	if (code === "default_model_selection_recovery" && row.errorCodes.includes(code)) {
 		const recovery = parseDefaultModelSelectionRecovery(candidate.recovery) ?? {
 			message: DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
@@ -265,11 +272,13 @@ function errorResponse(id: string, row: Operation, error: unknown): ControlRespo
 		};
 		return failure(id, code, DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE, undefined, recovery);
 	}
-	if (code && (row.errorCodes.includes(code) || SHARED_ERROR_CODES.has(code))) return failure(id, code, message);
+	if (code && (row.errorCodes.includes(code) || SHARED_ERROR_CODES.has(code)))
+		return failure(id, code, message, undefined, details);
 	if (code === "resource_gone" || /not found|gone/i.test(message)) return failure(id, "resource_gone", message);
 	if (code === "unknown_gate") return failure(id, "resource_gone", message);
-	if (code === "invalid_input" || /invalid input/i.test(message)) return failure(id, "invalid_input", message);
-	return failure(id, "internal", "Control operation failed.");
+	if (code === "invalid_input" || /invalid input/i.test(message))
+		return failure(id, "invalid_input", message, undefined, details);
+	return failure(id, "internal", "Control operation failed.", undefined, details);
 }
 
 async function execute(surface: ControlSurface, row: Operation, request: ControlRequest): Promise<ControlResponse> {

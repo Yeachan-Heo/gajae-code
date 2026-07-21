@@ -214,13 +214,25 @@ export class ExtensionUiController {
 				try {
 					return {
 						handoff: await session.handoff(
-							typeof input.instructions === "string" ? input.instructions : undefined,
+							typeof input.target === "string"
+								? input.target
+								: typeof input.instructions === "string"
+									? input.instructions
+									: undefined,
 						),
 					};
 				} catch (error) {
+					const typed = error as { code?: unknown; handoffDocument?: unknown };
+					const handoffDocument =
+						typeof typed?.handoffDocument === "string" ? { handoffDocument: typed.handoffDocument } : undefined;
+					// Preserve a safe typed code (e.g. transient `busy`) so clients keep
+					// correct retry/backoff semantics; only synthesize invalid_request for
+					// otherwise-untyped failures.
+					const code = typed?.code === "busy" ? "busy" : "invalid_request";
 					throw Object.assign(
 						new Error(error instanceof Error ? error.message : "Handoff is unavailable for the current state."),
-						{ code: "invalid_request" },
+						{ code },
+						handoffDocument,
 					);
 				}
 			case "session.export_html":

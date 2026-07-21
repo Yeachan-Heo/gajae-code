@@ -17,66 +17,56 @@ const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts"
 
 const cleanupRoots: string[] = [];
 let activeProc: AcpProc | undefined;
+let activeStderrTail = () => "";
 
 /**
  * Tear the child down hard. SIGTERM first so the process gets a chance to
- * unwind, but force-kill quickly if it hasn't reaped — `gjc acp` blocks on
- * stdin reads and won't notice SIGTERM until we close the pipes. We bound
- * the entire shutdown to ~2s so a stuck child never trips Bun's 5s hook
- * timeout (which is what produced the "afterEach hook timed out" flakes).
+ * unwind, then force-kill if it has not reaped. The final exit wait is bounded
+ * so a stuck child cannot trip Bun's 5s hook timeout, but teardown fails rather
+ * than removing the root beneath an unverified live child.
  */
-async function teardown(proc: AcpProc): Promise<void> {
+async function teardown(proc: AcpProc, stderrTail: () => string): Promise<void> {
 	// Close stdin so any blocking read in the child wakes up.
 	try {
 		proc.stdin.end();
-	} catch {
-		// already closed
-	}
-	// Best-effort detach from stdout/stderr so the child's pipe writes don't
-	// block on a full buffer once we stop draining.
-	for (const stream of [proc.stdout, proc.stderr] as Array<ReadableStream<Uint8Array> | undefined>) {
-		if (!stream) continue;
-		try {
-			await stream.cancel();
-		} catch {
-			// reader may already be detached
-		}
+	} catch (error) {
+		if (proc.exitCode === null) throw error;
 	}
 
 	try {
 		proc.kill("SIGTERM");
-	} catch {
-		// already exited
+	} catch (error) {
+		if (proc.exitCode === null) throw error;
 	}
 
-	// Race the natural exit against a short grace, then escalate to SIGKILL
-	// and race again against a hard cap. `await proc.exited` after SIGKILL
-	// always returns promptly on Darwin/Linux.
-	const graceMs = 200;
-	const hardCapMs = 1500;
-	const exited = proc.exited;
-	const raced = await Promise.race([
-		exited.then(() => "exited" as const),
-		Bun.sleep(graceMs).then(() => "grace" as const),
-	]);
-	if (raced === "exited") return;
+	// Give SIGTERM a brief grace window before escalation.
+	const graceful = await Promise.race([proc.exited.then(() => true), Bun.sleep(200).then(() => false)]);
+	if (graceful) return;
+
 	try {
 		proc.kill("SIGKILL");
-	} catch {
-		// already exited between the SIGTERM and SIGKILL
+	} catch (error) {
+		if (proc.exitCode === null) throw error;
 	}
-	await Promise.race([exited, Bun.sleep(hardCapMs)]);
+
+	// SIGKILL is uninterruptible. A child that survives this bounded wait must
+	// be surfaced rather than orphaned under recursive root cleanup. The wait is
+	// sized so the whole teardown (200ms grace + this) stays under Bun's 5s
+	// afterEach hook timeout and our diagnostic error is the one that surfaces.
+	const exited = await Promise.race([proc.exited.then(() => true), Bun.sleep(4_000).then(() => false)]);
+	if (!exited) {
+		throw new Error(
+			`ACP subprocess did not exit after SIGKILL; refusing to remove owned root.\n[child stderr tail]\n${stderrTail()}`,
+		);
+	}
 }
 
 afterEach(async () => {
 	if (activeProc) {
 		const proc = activeProc;
+		await teardown(proc, activeStderrTail);
 		activeProc = undefined;
-		try {
-			await teardown(proc);
-		} catch {
-			// teardown is already best-effort; never let cleanup fail a test
-		}
+		activeStderrTail = () => "";
 	}
 	for (const root of cleanupRoots.splice(0)) {
 		await fs.promises.rm(root, { recursive: true, force: true });
@@ -132,9 +122,10 @@ describe("ACP stdout hygiene", () => {
 		activeProc = proc;
 
 		// Buffer stderr in the background so we can assert no JSON-RPC frame
-		// leaks onto it. The pump exits the moment stderr closes, which
-		// happens during teardown — we never wait on it from the test body.
+		// leaks onto it. The pump exits when the child closes stderr during
+		// teardown; we only await it after the child exit is confirmed.
 		const stderrChunks: Uint8Array[] = [];
+		activeStderrTail = () => Buffer.concat(stderrChunks).toString("utf8");
 		const stderrPump = (async () => {
 			const reader = proc.stderr.getReader();
 			try {
@@ -143,14 +134,8 @@ describe("ACP stdout hygiene", () => {
 					if (done) break;
 					if (value) stderrChunks.push(value);
 				}
-			} catch {
-				// reader cancelled by teardown — expected
 			} finally {
-				try {
-					reader.releaseLock();
-				} catch {
-					// already released
-				}
+				reader.releaseLock();
 			}
 		})();
 
@@ -185,12 +170,12 @@ describe("ACP stdout hygiene", () => {
 		);
 
 		// First frame is good. Tear the child down now so the test body's
-		// wall time is bounded by "boot + first frame", not by waiting for
-		// stderr or a delayed shutdown. teardown() closes stdin/stdout/stderr
-		// and escalates SIGTERM→SIGKILL, which both stops the child and
-		// resolves stderrPump.
-		await teardown(proc);
+		// wall time is bounded by "boot + first frame", not by a delayed shutdown.
+		// teardown() closes stdin and escalates SIGTERM→SIGKILL, then verifies exit
+		// before stderrPump is awaited.
+		await teardown(proc, activeStderrTail);
 		activeProc = undefined;
+		activeStderrTail = () => "";
 		await stderrPump;
 
 		const stderrText = Buffer.concat(stderrChunks).toString("utf8");

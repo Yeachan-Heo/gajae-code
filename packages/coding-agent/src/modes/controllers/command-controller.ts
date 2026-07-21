@@ -1260,6 +1260,10 @@ export class CommandController {
 	}
 
 	async handleHandoffCommand(customInstructions?: string): Promise<void> {
+		if (this.ctx.session.isStreaming) {
+			this.ctx.showWarning("Wait for the current response to finish or abort it before handing off.");
+			return;
+		}
 		const entries = this.ctx.sessionManager.getEntries();
 		const messageCount = entries.filter(e => e.type === "message").length;
 
@@ -1320,6 +1324,17 @@ export class CommandController {
 				this.ctx.showError("Handoff cancelled");
 			} else {
 				this.ctx.showError(`Handoff failed: ${message}`);
+			}
+			// The failure is non-destructive: the current session is unchanged. If the
+			// document was already generated, preserve it on the clipboard for retry.
+			const retainedDocument =
+				error &&
+				typeof error === "object" &&
+				typeof (error as { handoffDocument?: unknown }).handoffDocument === "string"
+					? (error as { handoffDocument: string }).handoffDocument
+					: undefined;
+			if (retainedDocument) {
+				this.#doCopy(retainedDocument, "Handoff document preserved on clipboard; current session is unchanged.");
 			}
 		} finally {
 			handoffLoader.stop();

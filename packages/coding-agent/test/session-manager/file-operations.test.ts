@@ -80,9 +80,9 @@ describe("findMostRecentSession", () => {
 		const file2 = path.join(tempDir, "newer.jsonl");
 
 		fs.writeFileSync(file1, '{"type":"session","id":"old","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
-		// Small delay to ensure different mtime
-		await new Promise(r => setTimeout(r, 10));
 		fs.writeFileSync(file2, '{"type":"session","id":"new","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
+		fs.utimesSync(file1, new Date(10_000), new Date(10_000));
+		fs.utimesSync(file2, new Date(20_000), new Date(20_000));
 
 		expect(await findMostRecentSession(tempDir)).toBe(file2);
 	});
@@ -92,8 +92,9 @@ describe("findMostRecentSession", () => {
 		const valid = path.join(tempDir, "valid.jsonl");
 
 		fs.writeFileSync(invalid, '{"type":"not-session"}\n');
-		await new Promise(r => setTimeout(r, 10));
 		fs.writeFileSync(valid, '{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
+		fs.utimesSync(invalid, new Date(10_000), new Date(10_000));
+		fs.utimesSync(valid, new Date(20_000), new Date(20_000));
 
 		expect(await findMostRecentSession(tempDir)).toBe(valid);
 	});
@@ -114,9 +115,9 @@ describe("findMostRecentSession", () => {
 			future,
 			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION + 1, id: "future-v6", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
 		);
-		fs.utimesSync(valid, new Date(1_000), new Date(1_000));
-		fs.utimesSync(malformed, new Date(2_000), new Date(2_000));
-		fs.utimesSync(future, new Date(3_000), new Date(3_000));
+		fs.utimesSync(valid, new Date(10_000), new Date(10_000));
+		fs.utimesSync(malformed, new Date(20_000), new Date(20_000));
+		fs.utimesSync(future, new Date(30_000), new Date(30_000));
 
 		expect((await getRecentSessions(tempDir)).map(session => session.path)).toEqual([valid]);
 		expect((await SessionManager.list(tempDir, tempDir)).map(session => session.path)).toEqual([valid]);
@@ -724,4 +725,75 @@ describe("non-file session storage directory boundaries", () => {
 		const opened = await SessionManager.open(sessionFile, "/backend/sessions", storage);
 		expect(opened.getSessionFile()).toBe(sessionFile);
 	});
+});
+
+describe("discardUncommittedSession", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = path.join(os.tmpdir(), `discard-uncommitted-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("exact-deletes an in-dir uncommitted successor, refusing the active session and out-of-dir paths", async () => {
+		const session = SessionManager.create(tempDir, tempDir);
+		const activeFile = session.getSessionFile();
+		if (!activeFile) throw new Error("Expected an active session file");
+
+		// A sibling uncommitted successor transcript within the configured session dir.
+		const successor = path.join(path.dirname(activeFile), `successor-${Snowflake.next()}.jsonl`);
+		fs.writeFileSync(
+			successor,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "succ", timestamp: new Date().toISOString(), cwd: tempDir })}\n`,
+		);
+		expect(fs.existsSync(successor)).toBe(true);
+
+		// Exact-deletes the uncommitted successor by path (no managed authorization).
+		await session.discardUncommittedSession(successor);
+		expect(fs.existsSync(successor)).toBe(false);
+
+		// Refuses the active session.
+		await expect(session.discardUncommittedSession(activeFile)).rejects.toThrow(/active session/i);
+
+		// Refuses paths outside the configured session directory.
+		const outside = path.join(os.tmpdir(), `outside-${Snowflake.next()}.jsonl`);
+		await expect(session.discardUncommittedSession(outside)).rejects.toThrow(/configured session directory/i);
+
+		// Tolerates an already-gone in-dir successor.
+		await session.discardUncommittedSession(successor);
+
+		await session.close();
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"refuses equivalent symlink aliases of the active session and paths escaping the dir",
+		async () => {
+			const realDir = fs.realpathSync(tempDir);
+			const session = SessionManager.create(realDir, realDir);
+			const activeFile = session.getSessionFile();
+			if (!activeFile) throw new Error("Expected an active session file");
+
+			// An equivalent path to the ACTIVE session through a symlinked parent must
+			// be refused by canonical identity, not just lexical string comparison.
+			const aliasDir = path.join(path.dirname(realDir), `alias-${Snowflake.next()}`);
+			fs.symlinkSync(realDir, aliasDir);
+			const aliasedActive = path.join(aliasDir, path.relative(realDir, path.resolve(activeFile)));
+			await expect(session.discardUncommittedSession(aliasedActive)).rejects.toThrow(/active session/i);
+
+			// A candidate that escapes the configured dir via an in-dir symlink is
+			// refused by canonical containment (missing leaf still resolved).
+			const outsideDir = path.join(path.dirname(realDir), `outside-${Snowflake.next()}`);
+			fs.mkdirSync(outsideDir, { recursive: true });
+			const escapeLink = path.join(path.dirname(activeFile), `escape-${Snowflake.next()}`);
+			fs.symlinkSync(outsideDir, escapeLink);
+			const escaping = path.join(escapeLink, "would-be-successor.jsonl");
+			await expect(session.discardUncommittedSession(escaping)).rejects.toThrow(/configured session directory/i);
+
+			await session.close();
+		},
+	);
 });

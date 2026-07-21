@@ -101,7 +101,7 @@ describe("AgentSession handoff", () => {
 		expect(session.sessionFile).toBe(beforeSessionFile);
 		expect(session.sessionId).toBe(beforeSessionId);
 		expect(
-			sessionManager.getEntries().filter(entry => entry.type === "custom" && entry.customType === "handoff"),
+			sessionManager.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
 		).toHaveLength(0);
 	});
 
@@ -581,7 +581,7 @@ describe("AgentSession handoff", () => {
 		expect(handoffCall[3].systemPrompt).toEqual(["Test"]);
 	});
 
-	it("saves auto-handoff document to disk when enabled", async () => {
+	it("saves auto-handoff document as an artifact when enabled", async () => {
 		session.settings.set("compaction.handoffSaveToDisk", true);
 
 		const handoffText = "## Goal\nContinue from here";
@@ -644,5 +644,374 @@ describe("AgentSession handoff", () => {
 		await expect(handoffPromise).rejects.toThrow("Handoff cancelled");
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
 		expect(generateHandoffSpy.mock.calls[0]?.[4]?.aborted).toBe(true);
+	});
+
+	it("refuses a manual handoff while a response is streaming and does not mutate the session", async () => {
+		const generateHandoffSpy = vi.spyOn(compactionModule, "generateHandoff");
+		const beforeId = session.sessionId;
+		const beforeFile = session.sessionFile;
+		session.agent.state.isStreaming = true;
+		try {
+			await expect(session.handoff()).rejects.toThrow(/stream/i);
+		} finally {
+			session.agent.state.isStreaming = false;
+		}
+		expect(generateHandoffSpy).not.toHaveBeenCalled();
+		expect(session.sessionId).toBe(beforeId);
+		expect(session.sessionFile).toBe(beforeFile);
+	});
+
+	it("still allows an auto-triggered handoff even if the streaming flag is set", async () => {
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nauto");
+		session.agent.state.isStreaming = true;
+		try {
+			const result = await session.handoff(undefined, { autoTriggered: true });
+			expect(result?.document).toBe("## Goal\nauto");
+		} finally {
+			session.agent.state.isStreaming = false;
+		}
+	});
+
+	it("is non-destructive when the post-generation switch fails: session stays active and document is retained", async () => {
+		const handoffText = "## Goal\nContinue from here";
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
+		const beforeId = session.sessionId;
+		const beforeFile = session.sessionFile;
+		const beforeMessageCount = session.agent.state.messages.length;
+
+		// Force a failure in the injection step, after the session switch has begun.
+		const appendSpy = vi.spyOn(sessionManager, "appendCustomMessageEntry").mockImplementationOnce(() => {
+			throw new Error("inject boom");
+		});
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as Error).message).toContain("inject boom");
+		// Generated document is preserved for copy/retry.
+		expect((caught as { handoffDocument?: string }).handoffDocument).toBe(handoffText);
+		// The active session is fully restored (non-destructive failure).
+		expect(session.sessionId).toBe(beforeId);
+		expect(session.sessionFile).toBe(beforeFile);
+		expect(session.agent.state.messages.length).toBe(beforeMessageCount);
+		// No handoff custom entry leaked into the restored session.
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(0);
+
+		appendSpy.mockRestore();
+
+		// A subsequent handoff succeeds normally after the recovered failure.
+		const result = await session.handoff();
+		expect(result?.document).toBe(handoffText);
+		expect(session.sessionId).not.toBe(beforeId);
+	});
+
+	it.each([
+		[
+			"newSession throws before mutating (partial-switch guard)",
+			() => vi.spyOn(sessionManager, "newSession").mockRejectedValueOnce(new Error("newSession boom")),
+			"newSession boom",
+		],
+		[
+			"ensureOnDisk throws after the switch (persistence failure)",
+			() => vi.spyOn(sessionManager, "ensureOnDisk").mockRejectedValueOnce(new Error("ensure boom")),
+			"ensure boom",
+		],
+		[
+			"display rebuild throws after persistence (post-ensureOnDisk, orphan cleanup)",
+			() =>
+				vi.spyOn(session, "buildDisplaySessionContext").mockImplementationOnce(() => {
+					throw new Error("display boom");
+				}),
+			"display boom",
+		],
+	])("is non-destructive when %s", async (_label, installFault, expectedMessage) => {
+		const handoffText = "## Goal\nContinue from here";
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
+		const beforeId = session.sessionId;
+		const beforeFile = session.sessionFile;
+		const beforeMessageCount = session.agent.state.messages.length;
+
+		const faultSpy = installFault();
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as Error).message).toContain(expectedMessage);
+		expect((caught as { handoffDocument?: string }).handoffDocument).toBe(handoffText);
+		// Active session fully restored.
+		expect(session.sessionId).toBe(beforeId);
+		expect(session.sessionFile).toBe(beforeFile);
+		expect(session.agent.state.messages.length).toBe(beforeMessageCount);
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(0);
+
+		faultSpy.mockRestore();
+
+		// Recovery: a subsequent handoff succeeds.
+		const result = await session.handoff();
+		expect(result?.document).toBe(handoffText);
+		expect(session.sessionId).not.toBe(beforeId);
+	});
+	it("retains the committed successor when a post-commit step fails (no rollback)", async () => {
+		const handoffText = "## Goal\nContinue from here";
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue(handoffText);
+		const beforeId = session.sessionId;
+		// clearKind("async-result") runs at the commit boundary, after `committed`
+		// is set. A failure there must NOT roll back the already-committed switch.
+		vi.spyOn(session.yieldQueue, "clearKind").mockImplementationOnce(() => {
+			throw new Error("post-commit boom");
+		});
+
+		const result = await session.handoff();
+
+		// Post-commit failure is retained, not rolled back: the handoff succeeded.
+		expect(result?.document).toBe(handoffText);
+		expect(session.sessionId).not.toBe(beforeId);
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(1);
+	});
+
+	it("fences background async idle delivery during a handoff transition", async () => {
+		const unregister = session.yieldQueue.register("handoff-fence-test", {
+			build: survivors => ({
+				role: "user" as const,
+				content: [{ type: "text" as const, text: `entries:${survivors.length}` }],
+				timestamp: Date.now(),
+			}),
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt");
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+
+		const handoffPromise = session.handoff();
+		await Bun.sleep(5); // let handoff engage the delivery fence and enter generation
+
+		// A background completion lands mid-handoff. The session is not streaming, so
+		// without the fence this would schedule an idle flush that calls agent.prompt.
+		session.yieldQueue.enqueue("handoff-fence-test", { done: true });
+		await Bun.sleep(30);
+		expect(promptSpy).not.toHaveBeenCalled();
+
+		gate.resolve();
+		await handoffPromise;
+		// The fenced predecessor delivery was dropped at commit, never delivered.
+		expect(promptSpy).not.toHaveBeenCalled();
+		unregister();
+	});
+	it("rejects a concurrent handoff while one is in progress (single-flight)", async () => {
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+		const first = session.handoff();
+		await Bun.sleep(5); // let the first handoff engage the transition
+
+		await expect(session.handoff()).rejects.toThrow(/already in progress/i);
+
+		gate.resolve();
+		await first;
+	});
+
+	it("rejects an external prompt turn while a handoff is in progress", async () => {
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+		const handoffPromise = session.handoff();
+		await Bun.sleep(5);
+
+		// The admission barrier fences external turns for the whole transition.
+		await expect(session.prompt("hello during handoff")).rejects.toThrow(/handoff is in progress/i);
+
+		gate.resolve();
+		await handoffPromise;
+	});
+
+	it("rejects steer/follow-up turn starters while a handoff is in progress", async () => {
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+		const handoffPromise = session.handoff();
+		await Bun.sleep(5);
+
+		// The bypass turn-start paths (steer/follow-up/sendUserMessage) are fenced too.
+		await expect(session.steer("steer during handoff")).rejects.toThrow(/handoff is in progress/i);
+		await expect(session.followUp("follow-up during handoff")).rejects.toThrow(/handoff is in progress/i);
+		await expect(session.sendUserMessage("msg", { deliverAs: "followUp" })).rejects.toThrow(
+			/handoff is in progress/i,
+		);
+
+		gate.resolve();
+		await handoffPromise;
+	});
+
+	it("retains the generated document when a turn starts during generation (late busy)", async () => {
+		const handoffText = "## Goal\nGenerated before the late race";
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			// A turn begins after generation started but before the switch.
+			session.agent.state.isStreaming = true;
+			return handoffText;
+		});
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		} finally {
+			session.agent.state.isStreaming = false;
+		}
+
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as { code?: string }).code).toBe("busy");
+		// The generated document is retained on the late-busy rejection for copy/retry.
+		expect((caught as { handoffDocument?: string }).handoffDocument).toBe(handoffText);
+		// Non-destructive: the current session is unchanged.
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(0);
+	});
+
+	it("releases the turn fence on the committed successor (no over-fencing after handoff)", async () => {
+		vi.spyOn(compactionModule, "generateHandoff").mockResolvedValue("## Goal\nContinue");
+		const result = await session.handoff();
+		expect(result?.document).toBeDefined();
+
+		// The transition fence is released at commit (before session_switch), so a
+		// turn starter on the committed successor is NOT rejected as "handoff in
+		// progress". (#queueFollowUp resolves after enqueue; the continuation runs
+		// detached.)
+		let rejection: unknown;
+		try {
+			await session.followUp("after handoff");
+		} catch (error) {
+			rejection = error;
+		}
+		expect(String((rejection as Error | undefined)?.message ?? "")).not.toMatch(/handoff is in progress/i);
+	});
+
+	it("owns the shared transition lease and rejects every other identity transition (handoff → others)", async () => {
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await gate.promise;
+			return "## Goal\nContinue";
+		});
+		const handoffPromise = session.handoff();
+		await Bun.sleep(5); // let handoff acquire the shared session-transition lease
+
+		// Every session-identity transition acquires the same lease at its entry, so
+		// each is rejected as "busy" while the handoff owns it. This proves the lease
+		// is shared (not a handoff-only guard) and covers the newly-wrapped fork /
+		// clearContext / navigateTree paths alongside compact / new / switch / branch.
+		const attempts: Array<[string, () => Promise<unknown>]> = [
+			["compact", () => session.compact()],
+			["newSession", () => session.newSession()],
+			["switchSession", () => session.switchSession(path.join(tempDir.path(), "other.session"))],
+			["branch", () => session.branch("missing-entry")],
+			["clearContext", () => session.clearContext()],
+			["fork", () => session.fork()],
+			["navigateTree", () => session.navigateTree("missing-target")],
+		];
+		for (const [name, run] of attempts) {
+			let caught: unknown;
+			try {
+				await run();
+			} catch (error) {
+				caught = error;
+			}
+			expect(caught, `${name} should reject while a handoff owns the lease`).toBeInstanceOf(Error);
+			expect((caught as { code?: string }).code).toBe("busy");
+			expect(String((caught as Error).message)).toMatch(/while a handoff transition is in progress/i);
+		}
+
+		// No competing transition mutated the session: still no successor/handoff entry.
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "handoff"),
+		).toHaveLength(0);
+
+		gate.resolve();
+		await handoffPromise;
+	});
+
+	it("rejects a handoff before mutation while a non-handoff transition owns the lease (compact → handoff)", async () => {
+		session.settings.set("compaction.keepRecentTokens", 1);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "large response" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			usage: {
+				input: 4000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 4100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage({ role: "user", content: "u".repeat(8000), timestamp: Date.now() });
+		sessionManager.appendMessage(assistant);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		const branch = sessionManager.getBranch();
+		const firstKeptEntryId = branch[branch.length - 1]!.id;
+		const gate = Promise.withResolvers<void>();
+		// Deferred compaction call: compact() has already acquired the shared lease and
+		// awaits here, so the lease is held deterministically without any timing race.
+		vi.spyOn(compactionModule, "compact").mockImplementation(async () => {
+			await gate.promise;
+			return {
+				summary: "compacted",
+				shortSummary: "short",
+				firstKeptEntryId,
+				tokensBefore: 4100,
+				details: {},
+			};
+		});
+
+		const compactPromise = session.compact();
+		await Bun.sleep(5); // compact acquires the lease, then suspends on the deferred call
+
+		let caught: unknown;
+		try {
+			await session.handoff();
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		expect((caught as { code?: string }).code).toBe("busy");
+		expect(String((caught as Error).message)).toMatch(/while a compact transition is in progress/i);
+		// Reverse-direction symmetry: handoff is rejected at its own lease acquisition,
+		// before any session mutation — no compaction entry was appended yet.
+		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+
+		gate.resolve();
+		await compactPromise.catch(() => {});
 	});
 });

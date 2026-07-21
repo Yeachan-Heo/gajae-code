@@ -865,6 +865,39 @@ function isExplicitlyStoppedDaemonState(state: unknown): state is DaemonState {
 			state.acquisitionId.length > 0,
 	);
 }
+/**
+ * v0.11.4 and earlier generations wrote stopped tombstones before acquisition
+ * and incarnation fields existed. A live, reused PID must not turn that durable
+ * stop marker into a foreign live owner during an upgrade.
+ */
+function isLegacyStoppedDaemonState(state: unknown): boolean {
+	const candidate = state as Partial<DaemonState> | undefined;
+	return Boolean(
+		candidate &&
+			Number.isSafeInteger(candidate.pid) &&
+			(candidate.pid ?? 0) > 0 &&
+			typeof candidate.ownerId === "string" &&
+			candidate.ownerId.length > 0 &&
+			typeof candidate.tokenFingerprint === "string" &&
+			typeof candidate.chatId === "string" &&
+			Number.isSafeInteger(candidate.startedAt) &&
+			Number.isSafeInteger(candidate.heartbeatAt) &&
+			Number.isSafeInteger(candidate.stoppedAt) &&
+			(candidate.launcherPid === undefined ||
+				(Number.isSafeInteger(candidate.launcherPid) && (candidate.launcherPid ?? 0) > 0)) &&
+			Array.isArray(candidate.roots) &&
+			candidate.roots.every(root => typeof root === "string") &&
+			candidate.version === DAEMON_VERSION &&
+			isRecognizedLegacyGeneration(candidate.generation) &&
+			candidate.incarnation === undefined &&
+			candidate.acquisitionId === undefined &&
+			candidate.ownershipPhase === undefined,
+	);
+}
+
+function isStoppedDaemonState(state: unknown): boolean {
+	return isExplicitlyStoppedDaemonState(state) || isLegacyStoppedDaemonState(state);
+}
 
 function ownerIdentityMatches(
 	state: Pick<DaemonState, "tokenFingerprint" | "chatId">,
@@ -1016,7 +1049,7 @@ function classifyForeignLiveOwner(input: {
 	// Validate before probing so malformed PIDs never reach the liveness source.
 	if (!state || !validDaemonPid(state.pid) || !input.pidAlive(state.pid)) return undefined;
 	// A stopped tombstone with a canonical acquisition is not a live owner.
-	if (isExplicitlyStoppedDaemonState(state) || isLegacyParentDaemonState(state)) return undefined;
+	if (isStoppedDaemonState(state) || isLegacyParentDaemonState(state)) return undefined;
 	const currentIncarnation = input.pidIncarnation?.(state.pid) ?? defaultPidIncarnation(state.pid);
 	if (
 		!hasSafeDaemonStateShape(state) ||
@@ -1156,7 +1189,7 @@ export async function acquireDaemonOwnership(input: {
 		if (state && !hasSafeDaemonStateShape(state)) {
 			const malformed = state as Partial<DaemonState>;
 			if (
-				!isExplicitlyStoppedDaemonState(malformed) &&
+				!isStoppedDaemonState(malformed) &&
 				validDaemonPid(malformed.pid) &&
 				typeof malformed.incarnation === "string" &&
 				pidAlive(malformed.pid)
@@ -2011,6 +2044,60 @@ export async function spawnTelegramDaemonOwner(
 }
 
 /**
+ * Owner-bound reclamation of a confirmed-dead daemon owner's lock, mirroring the
+ * daemon step of `gjc notify recovery`. Removes only the lock of a recorded owner
+ * that is still the same, still-dead process — never a live or superseded owner,
+ * because it re-checks ownership and liveness while holding the same steal-mutex
+ * the daemon's own takeover path uses. Lets a fresh SDK session self-heal a stale
+ * owner (e.g. after a crash, or a `stop --force` that left the record behind)
+ * instead of requiring manual reconciliation. Returns true when a stale lock was
+ * cleared and a spawn retry is worthwhile.
+ */
+async function reclaimDeadDaemonOwner(input: {
+	settings: Settings;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+	pidAlive?: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
+}): Promise<boolean> {
+	const fsImpl = input.fs ?? nodeFs;
+	const now = input.now ?? Date.now;
+	const pidAlive = input.pidAlive ?? defaultPidAlive;
+	const pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	const state = await readDaemonState(input.settings, fsImpl);
+	if (!state || pidAlive(state.pid)) return false;
+	const lock = await readOwnershipLock(fsImpl, paths.lock);
+	if (lock.kind === "missing") return false;
+	if (
+		!(await ownershipLockIsReclaimable({ fs: fsImpl, path: paths.lock, lock, now: now(), pidAlive, pidIncarnation }))
+	)
+		return false;
+	const transition = await acquireDaemonTransitionLock({
+		fs: fsImpl,
+		path: paths.steal,
+		pid: process.pid,
+		pidAlive: defaultPidAlive,
+		pidIncarnation: defaultPidIncarnation,
+	});
+	if (!transition) return false;
+	try {
+		const current = await readDaemonState(input.settings, fsImpl);
+		if (!current || current.ownerId !== state.ownerId || current.pid !== state.pid) return false;
+		if (pidAlive(current.pid)) return false;
+		if (!(await daemonTransitionLockIsHeld({ fs: fsImpl, path: paths.steal, lock: transition }))) return false;
+		try {
+			await fsImpl.unlink(paths.lock);
+			return true;
+		} catch {
+			return false;
+		}
+	} finally {
+		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
+	}
+}
+
+/**
  * Ensure a configured daemon owns this session root, preserving ownership safety
  * while exposing whether a #2028 generation handoff was required.
  */
@@ -2062,6 +2149,29 @@ export async function ensureTelegramDaemonRunningDetailed(
 					),
 			);
 		}
+	}
+	if (
+		spawned.result === "blocked" &&
+		!spawned.warnings[0]?.includes("provisional") &&
+		(await reclaimDeadDaemonOwner({
+			settings: input.settings,
+			fs: deps.fs,
+			now: deps.now,
+			pidAlive: deps.pidAlive,
+			pidIncarnation: deps.pidIncarnation,
+		}))
+	) {
+		// A crashed owner (or a `stop --force` that found no live process) can leave a
+		// stale lock behind that blocks re-acquisition. Automate the recovery step so a
+		// fresh session self-heals instead of requiring a manual `gjc notify recovery`.
+		spawned = await withTelegramSetupLease(
+			cfg.botToken,
+			async () =>
+				await spawnTelegramDaemonOwner(
+					{ settings: input.settings, roots: [root], tokenFingerprint: fp, chatId: cfg.chatId },
+					deps,
+				),
+		);
 	}
 	if (spawned.result === "blocked") {
 		logger.warn(`notifications: failed to ensure Telegram daemon: ${spawned.warnings.join("; ")}`);

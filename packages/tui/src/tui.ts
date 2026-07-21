@@ -895,7 +895,14 @@ export class TUI extends Container {
 					selected = { row, anchor };
 			}
 			if (selected === undefined) {
-				if (this.#manualViewportAnchor !== null) return false;
+				// A page can consist entirely of non-semantic rows such as tool output,
+				// transient panels, or pinned chrome. Fall back to numeric viewport
+				// ownership so PageUp/PageDown can continue through those rows instead
+				// of becoming an intermittent no-op. A later page with an eligible row
+				// will establish a fresh semantic anchor.
+				this.#manualViewportAnchor = null;
+				this.#manualViewportFallbackAnchors = [];
+				this.#reconcileMissingViewportAnchor = false;
 			} else {
 				this.#manualViewportAnchor = {
 					id: selected.anchor.id,
