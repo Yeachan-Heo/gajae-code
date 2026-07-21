@@ -1108,19 +1108,16 @@ export async function runRootCommand(
 		if (selection.kind === "cancelled") {
 			return;
 		}
+		const resumeSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd });
 		const resumeMigrationPolicy =
-			(await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd })).get(
-				"session.directoryMigration",
-			) === "disabled"
-				? "disabled"
-				: "copy-retain";
+			resumeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
 		let opened: StrictSessionOpenResult;
 		try {
 			opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
 				selection.identity,
 				parsedArgs.sessionDir
 					? SessionManager.explicitDestination(parsedArgs.sessionDir)
-					: SessionManager.managedDestination(resumeCwd, settings.getAgentDir()),
+					: SessionManager.managedDestination(resumeCwd, resumeSettings.getAgentDir()),
 				undefined,
 				resumeMigrationPolicy,
 			);
