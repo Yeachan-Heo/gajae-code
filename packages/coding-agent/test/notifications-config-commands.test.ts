@@ -160,6 +160,25 @@ describe("parseTelegramControlCommand", () => {
 			command: { name: "model", action: "set", selector: "OpenAI/GPT-5" },
 		});
 	});
+	test("/status accepts only its zero-argument local form", () => {
+		expect(parseTelegramControlCommand("  /STATUS  ", "GajaeCodeBot")).toEqual({
+			kind: "command",
+			command: { name: "status" },
+		});
+		expect(parseTelegramControlCommand("/status@GajaeCodeBot", "GajaeCodeBot")).toEqual({
+			kind: "command",
+			command: { name: "status" },
+		});
+		expect(parseTelegramControlCommand("/status now", "GajaeCodeBot")).toEqual({
+			kind: "invalid",
+			commandName: "status",
+			usage: "Usage: /status",
+		});
+		expect(parseTelegramControlCommand("/status@OtherBot", "GajaeCodeBot")).toEqual({
+			kind: "ignored",
+			commandName: "status",
+		});
+	});
 
 	test("recognized invalid forms fail closed", () => {
 		expect(parseTelegramControlCommand("/usage now")).toMatchObject({ kind: "invalid", commandName: "usage" });

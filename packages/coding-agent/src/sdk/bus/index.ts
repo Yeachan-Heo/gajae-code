@@ -41,6 +41,12 @@ import {
 	type WorkflowGateTerminalProof,
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
+import {
+	collapsePlanningPipeline,
+	readVisibleSkillActiveState,
+	type SkillActiveEntry,
+	type WorkflowHudChip,
+} from "../../skill-state/active-state";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -65,7 +71,6 @@ import {
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 } from "../startup-capability";
-
 import { registerTelegramFileSink } from "./attachment-registry";
 import { ensureDiscordDaemon, ensureSlackDaemon } from "./chat-daemon-control";
 import {
@@ -1225,9 +1230,20 @@ interface NotificationControlCommandPayload {
 	instructions?: unknown;
 }
 
+export interface NotificationSessionStatus {
+	repo: string;
+	branch: string;
+	machine: string;
+	sessionId: string;
+	model?: string;
+	context?: string;
+	workflowLines: string[];
+}
+
 export interface NotificationControlCommandResult {
 	status: "ok" | "error" | "unavailable";
 	message: string;
+	sessionStatus?: NotificationSessionStatus;
 	modelChoices?: Array<{ selector: string; label: string }>;
 }
 
@@ -1255,6 +1271,76 @@ function formatContextUsageLine(ctx: ExtensionContext): string {
 	const window = formatCompactTokenCount(usage.contextWindow);
 	const pct = usage.percent == null ? "unknown" : `${usage.percent.toFixed(1)}%`;
 	return `Context: ${tokens}/${window} ${pct}`;
+}
+
+const STATUS_ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+
+function sanitizeStatusPart(value: string | undefined): string {
+	const sanitized = (value ?? "")
+		.replace(STATUS_ANSI_PATTERN, "")
+		.replace(/[\r\n\t]+/g, " ")
+		.trim();
+	return sanitized.length <= 240 ? sanitized : `${sanitized.slice(0, 239)}…`;
+}
+
+function compareStatusEntries(a: SkillActiveEntry, b: SkillActiveEntry): number {
+	return a.skill.localeCompare(b.skill) || (a.phase ?? "").localeCompare(b.phase ?? "");
+}
+
+function compareStatusChips(a: WorkflowHudChip, b: WorkflowHudChip): number {
+	return (a.priority ?? 50) - (b.priority ?? 50) || a.label.localeCompare(b.label);
+}
+
+/** Render canonical HUD state as a compact vertical summary for one-shot remote status. */
+export function renderSessionWorkflowStatusLines(entries: readonly SkillActiveEntry[]): string[] {
+	const visible = collapsePlanningPipeline(entries.filter(entry => entry.active !== false));
+	const entry = visible.filter(candidate => sanitizeStatusPart(candidate.skill)).sort(compareStatusEntries)[0];
+	if (!entry) return [];
+	const chips = new Map(
+		[...(entry.hud?.chips ?? [])]
+			.sort(compareStatusChips)
+			.map(chip => [sanitizeStatusPart(chip.label), sanitizeStatusPart(chip.value)]),
+	);
+	if (entry.skill === "ralplan") {
+		const stage = chips.get("stage") || sanitizeStatusPart(entry.phase);
+		const pending = chips.get("pending") === "approval";
+		const verdict = chips.get("verdict");
+		return [
+			"Ralplan",
+			stage ? `• stage: ${stage}` : "",
+			pending ? "• status: awaiting approval" : "• status: active",
+			verdict ? `• verdict: ${verdict.toLowerCase()}` : "",
+		].filter(Boolean);
+	}
+	if (entry.skill === "ultragoal") {
+		const current = chips.get("current")?.replace(/^([^:]+):/, "$1 — ");
+		return [
+			"Ultragoal",
+			`• status: ${chips.get("status") || sanitizeStatusPart(entry.phase) || "active"}`,
+			chips.get("goals") ? `• goals: ${chips.get("goals")} complete` : "",
+			current ? `• current: ${current}` : "",
+			chips.get("blocked") ? `• blocked: ${chips.get("blocked")}` : "",
+		].filter(Boolean);
+	}
+	return [sanitizeStatusPart(entry.skill), `• status: ${sanitizeStatusPart(entry.phase) || "active"}`];
+}
+
+async function readNotificationSessionStatus(ctx: ExtensionContext): Promise<NotificationSessionStatus> {
+	const sessionId = ctx.sessionManager.getSessionId();
+	const identityFields = buildIdentity(ctx.cwd);
+	const modelName = ctx.model ? truncate(`${ctx.model.name ?? ctx.model.id} (${ctx.model.provider})`, 200) : undefined;
+	const contextText = formatContextUsageLine(ctx).replace(/^Context:\s*/, "");
+	const state = await readVisibleSkillActiveState(ctx.cwd, sessionId, { tier: "hud" }).catch(() => undefined);
+	const workflowLines = renderSessionWorkflowStatusLines(state?.active_skills ?? []);
+	return {
+		repo: identityFields.repo,
+		branch: identityFields.branch,
+		machine: truncate(identityFields.machine, 100),
+		sessionId,
+		...(modelName ? { model: modelName } : {}),
+		...(contextText ? { context: contextText } : {}),
+		workflowLines,
+	};
 }
 
 function formatLocalUsage(ctx: ExtensionContext): string {
@@ -1408,9 +1494,10 @@ export async function executeNotificationControlCommand(
 	ctx: ExtensionContext,
 	api: ExtensionAPI,
 	expectedSessionId?: string,
+	liveSessionId?: string,
 ): Promise<NotificationControlCommandResult> {
 	try {
-		return await executeNotificationControlCommandUnchecked(command, ctx, api, expectedSessionId);
+		return await executeNotificationControlCommandUnchecked(command, ctx, api, expectedSessionId, liveSessionId);
 	} catch {
 		logger.warn("notifications: control command failed");
 		return { status: "error", message: CONTROL_COMMAND_FAILURE_MESSAGE };
@@ -1422,9 +1509,35 @@ async function executeNotificationControlCommandUnchecked(
 	ctx: ExtensionContext,
 	api: ExtensionAPI,
 	expectedSessionId?: string,
+	liveSessionId?: string,
 ): Promise<NotificationControlCommandResult> {
 	if (!command || typeof command.name !== "string") return { status: "error", message: "Invalid control command." };
 	switch (command.name) {
+		case "status": {
+			const managerSessionId = ctx.sessionManager.getSessionId();
+			if (
+				typeof expectedSessionId !== "string" ||
+				expectedSessionId.trim() === "" ||
+				managerSessionId !== expectedSessionId ||
+				liveSessionId !== expectedSessionId
+			)
+				return { status: "unavailable", message: "Status unavailable for this session." };
+			const sessionStatus = await readNotificationSessionStatus(ctx);
+			return {
+				status: "ok",
+				message: [
+					"GJC session",
+					`repo: ${sessionStatus.repo}`,
+					`branch: ${sessionStatus.branch}`,
+					`machine: ${sessionStatus.machine}`,
+					`session: ${sessionStatus.sessionId}`,
+					...(sessionStatus.model ? [`model: ${sessionStatus.model}`] : []),
+					...(sessionStatus.context ? [`context: ${sessionStatus.context}`] : []),
+					...sessionStatus.workflowLines,
+				].join("\n"),
+				sessionStatus,
+			};
+		}
 		case "reasoning": {
 			const global = command.global === true;
 			if (command.action === "status") return { status: "ok", message: formatReasoningSettings(api) };
@@ -4025,13 +4138,17 @@ export function createNotificationsExtension(
 					if (!runtime || !inbound.requestId) return;
 					const activeRuntime = runtime;
 					if (inbound.sessionId !== activeRuntime.id) {
+						const command = parseControlCommandPayload(inbound.commandJson);
 						pushSessionFrame(activeRuntime, {
 							type: "control_command_result",
 							sessionId: activeRuntime.id,
 							requestId: inbound.requestId,
 							updateId: inbound.updateId,
 							status: "error",
-							message: STALE_MODEL_BUTTON_MESSAGE,
+							message:
+								command?.name === "status"
+									? "Status unavailable for this session."
+									: STALE_MODEL_BUTTON_MESSAGE,
 						});
 						return;
 					}
@@ -4040,6 +4157,7 @@ export function createNotificationsExtension(
 						ctx,
 						api,
 						inbound.sessionId,
+						activeRuntime.id,
 					).then(result => {
 						if (runtime !== activeRuntime) return;
 						pushSessionFrame(activeRuntime, {
@@ -4049,6 +4167,7 @@ export function createNotificationsExtension(
 							updateId: inbound.updateId,
 							status: result.status,
 							message: result.message,
+							sessionStatus: result.sessionStatus,
 							modelChoices: result.modelChoices,
 						});
 					});

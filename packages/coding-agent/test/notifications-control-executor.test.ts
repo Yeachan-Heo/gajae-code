@@ -25,7 +25,11 @@ function fakeCtx(overrides: Record<string, unknown> = {}) {
 					premiumRequests: 2,
 					cost: 0.012345,
 				}),
+				getSessionId: () => "session",
+				getHeader: () => null,
 			},
+			getTranscript: () => [],
+			cwd: "/tmp/status-test",
 			modelRegistry: {
 				getAvailable: () => [],
 			},
@@ -146,6 +150,60 @@ describe("executeNotificationControlCommand", () => {
 		expect(usage.status).toBe("ok");
 		expect(usage.message).toContain("Input tokens: 10");
 		expect("sendUserMessage" in api).toBe(false);
+	});
+	test("status validates expected, manager, and live identities before touching cwd or control APIs", async () => {
+		const { ctx } = fakeCtx({
+			cwd: (() => {
+				throw new Error("status must not read cwd for stale identity");
+			}) as unknown as string,
+			sessionManager: { getSessionId: () => "manager" },
+		});
+		const { api, cycleCalls, thinkingLevelCalls, visibilityCalls, temporaryModelCalls } = fakeApi();
+
+		expect(
+			await executeNotificationControlCommand({ name: "status" }, ctx as any, api as any, "expected", "live"),
+		).toEqual({
+			status: "unavailable",
+			message: "Status unavailable for this session.",
+		});
+		expect(cycleCalls).toBe(0);
+		expect(thinkingLevelCalls).toEqual([]);
+		expect(visibilityCalls).toEqual([]);
+		expect(temporaryModelCalls).toEqual([]);
+	});
+
+	test("status performs an explicit same-session read without steering a busy turn", async () => {
+		const { ctx } = fakeCtx({
+			cwd: "/home/alice/secret-client/repo",
+			sessionManager: { getSessionId: () => "same-session", getHeader: () => null },
+			getTranscript: () => [],
+		});
+		const { api, cycleCalls, thinkingLevelCalls, visibilityCalls, temporaryModelCalls } = fakeApi();
+
+		const result = await executeNotificationControlCommand(
+			{ name: "status" },
+			ctx as any,
+			api as any,
+			"same-session",
+			"same-session",
+		);
+		expect(result.status).toBe("ok");
+		expect(result.message).toContain("GJC session");
+		expect(result.message).toContain("repo: repo");
+		expect(result.message).not.toContain("<code>");
+		expect(result.message).not.toContain("/home/alice");
+		expect(JSON.stringify(result.sessionStatus)).not.toContain("/home/alice");
+		expect(result.sessionStatus).toMatchObject({
+			repo: "repo",
+			branch: "(detached)",
+			sessionId: "same-session",
+			context: "25k/272k 9.2%",
+			workflowLines: [],
+		});
+		expect(cycleCalls).toBe(0);
+		expect(thinkingLevelCalls).toEqual([]);
+		expect(visibilityCalls).toEqual([]);
+		expect(temporaryModelCalls).toEqual([]);
 	});
 
 	test("reports reasoning display and persists only global mutations", async () => {

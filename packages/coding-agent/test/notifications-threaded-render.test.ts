@@ -146,6 +146,31 @@ describe("renderThreadedFrame", () => {
 		expect(send?.text).toContain("✅ Context: &lt;25&gt;/100 (25.0%)");
 	});
 
+	test("control_command_result renders structured session status inside the daemon", () => {
+		const send = renderThreadedFrame({
+			type: "control_command_result",
+			sessionId: "s",
+			status: "ok",
+			message: "plain fallback",
+			sessionStatus: {
+				repo: "repo <unsafe>",
+				branch: "dev",
+				path: "C:\\work\\repo",
+				machine: "host",
+				sessionId: "s",
+				model: "model <unsafe>",
+				context: "25k/100k 25%",
+				workflowLines: ["Ralplan", "• status: awaiting <approval>"],
+			},
+		});
+		expect(send?.text).toStartWith("<b>GJC session</b>");
+		expect(send?.text).toContain("• repo: <code>repo &lt;unsafe&gt;</code>");
+		expect(send?.text).not.toContain("C:\\work\\repo");
+		expect(send?.text).toContain("• session: <code>s</code>");
+		expect(send?.text).toContain("• model: model &lt;unsafe&gt;");
+		expect(send?.text).toContain("• status: awaiting &lt;approval&gt;");
+	});
+
 	test("tool_activity edits a started bubble with its terminal result", () => {
 		const started = renderThreadedFrame({
 			type: "tool_activity",

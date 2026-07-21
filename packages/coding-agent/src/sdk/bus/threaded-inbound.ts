@@ -75,7 +75,9 @@ function asString(value: unknown): string | undefined {
 	return undefined;
 }
 
-function extractAttachment(message: NonNullable<InboundUpdate["message"]>): InboundAttachment | undefined {
+export function extractInboundAttachment(
+	message: NonNullable<InboundUpdate["message"]>,
+): InboundAttachment | undefined {
 	if (Array.isArray(message.photo) && message.photo.length > 0) {
 		const photo = message.photo[message.photo.length - 1];
 		if (photo && typeof photo === "object" && "file_id" in photo && typeof photo.file_id === "string") {
@@ -130,7 +132,7 @@ export function decideThreadedInbound(update: InboundUpdate, ctx: ThreadedInboun
 			: typeof message.caption === "string"
 				? message.caption.trim()
 				: "";
-	const attachment = extractAttachment(message);
+	const attachment = extractInboundAttachment(message);
 	if (!text && attachment === undefined) return { kind: "ignore", reason: "empty_text" };
 
 	if (typeof message.message_id !== "number" || !Number.isSafeInteger(message.message_id) || message.message_id <= 0) {

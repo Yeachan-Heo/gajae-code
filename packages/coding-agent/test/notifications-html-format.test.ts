@@ -17,7 +17,7 @@ import {
 } from "../src/sdk/bus/html-format";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { buildActionMessage } from "../src/sdk/bus/telegram-reference";
-import { formatIdentityHeader, renderThreadedFrame } from "../src/sdk/bus/threaded-render";
+import { formatIdentityHeader, formatSessionStatusHeader, renderThreadedFrame } from "../src/sdk/bus/threaded-render";
 
 describe("escapeHtml (AC2)", () => {
 	test("escapes & < > and escapes & first", () => {
@@ -258,6 +258,21 @@ describe("threaded-render HTML treatment (AC3/AC5)", () => {
 	test("identity header bolds title and wraps fields in code", () => {
 		expect(formatIdentityHeader({ title: "Sess", repo: "r", branch: "b", machine: "m", sessionId: "s" })).toBe(
 			`${bold("Sess")}\n• repo: ${code("r")}\n• branch: ${code("b")}\n• machine: ${code("m")}\n• session: ${code("s")}`,
+		);
+	});
+
+	test("status header extends the visual grammar without changing the pinned identity contract", () => {
+		expect(
+			formatSessionStatusHeader({
+				repo: "r",
+				branch: "b",
+				machine: "m",
+				sessionId: "s",
+				model: "model <x>",
+				context: "25k/100k 25%",
+			}),
+		).toBe(
+			`${bold("GJC session")}\n• repo: ${code("r")}\n• branch: ${code("b")}\n• machine: ${code("m")}\n• session: ${code("s")}\n• model: model &lt;x&gt;\n• context: 25k/100k 25%`,
 		);
 	});
 

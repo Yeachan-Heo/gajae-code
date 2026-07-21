@@ -1197,6 +1197,28 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 		ok: false,
 		error: { code: "unknown_operation" },
 	});
+	socket.send(
+		JSON.stringify({
+			type: "control_command",
+			sessionId,
+			token: endpoint.token,
+			requestId: "status",
+			command: { name: "status" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_command_result" && frame.requestId === "status"),
+		"same-session status response",
+	);
+	const statusFrame = frames.find(frame => frame.type === "control_command_result" && frame.requestId === "status");
+	expect(statusFrame).toMatchObject({
+		type: "control_command_result",
+		sessionId,
+		requestId: "status",
+		status: "ok",
+	});
+	expect(statusFrame?.sessionStatus).toMatchObject({ sessionId });
+	expect(JSON.stringify(statusFrame?.sessionStatus)).not.toContain(cwd);
 });
 
 test("SDK host preserves ordered prompt image blocks in the host payload", async () => {

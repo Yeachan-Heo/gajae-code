@@ -95,7 +95,7 @@ import {
 	readEndpoint,
 	routeInboundUpdate,
 } from "./telegram-reference";
-import { decideThreadedInbound, type InboundAttachment } from "./threaded-inbound";
+import { decideThreadedInbound, extractInboundAttachment, type InboundAttachment } from "./threaded-inbound";
 import { renderThreadedFrame, type ThreadedSend } from "./threaded-render";
 import { type TopicEndpointBinding, TopicRegistry, type TopicRegistryState } from "./topic-registry";
 
@@ -7814,20 +7814,63 @@ export class TelegramNotificationDaemon {
 		// update_id dedupe are all enforced by decideThreadedInbound.
 		const raw = update as {
 			callback_query?: unknown;
-			message?: { text?: unknown; reply_to_message?: { message_id?: unknown } };
+			message?: {
+				message_id?: unknown;
+				text?: unknown;
+				caption?: unknown;
+				photo?: unknown;
+				document?: unknown;
+				video?: unknown;
+				audio?: unknown;
+				voice?: unknown;
+				animation?: unknown;
+				chat?: { id?: unknown };
+				reply_to_message?: { message_id?: unknown };
+				message_thread_id?: unknown;
+			};
 		};
 		// A reply to a known ask message routes to that ask (below). Any OTHER
 		// message in a topic (plain text, or a reply to a non-ask message) is a
 		// free-text injection. Previously replies bypassed injection entirely.
 		const replyTo = raw.message?.reply_to_message?.message_id;
+		const commandText =
+			typeof raw.message?.text === "string"
+				? raw.message.text
+				: typeof raw.message?.caption === "string"
+					? raw.message.caption
+					: undefined;
 		const reservedBtw =
 			typeof raw.message?.text === "string" ? parseBtwCommand(raw.message.text, this.botUsername) : undefined;
+		const directControl = commandText
+			? parseTelegramControlCommand(commandText, this.botUsername)
+			: ({ kind: "none" } as const);
+		const mediaStatus =
+			((directControl.kind === "invalid" && directControl.commandName === "status") ||
+				(directControl.kind === "command" && directControl.command.name === "status")) &&
+			Boolean(raw.message && extractInboundAttachment(raw.message));
+		if (mediaStatus && !raw.callback_query) {
+			const inbound = decideThreadedInbound(update as never, {
+				pairedChatId: this.opts.chatId,
+				topicToSession: t => this.topics.sessionForTopic(t),
+				isDuplicate: id => this.dispatchState.seenUpdateIds.has(id),
+			});
+			if (inbound.kind !== "inject" || !inbound.attachment || !(await this.pairedChatIsPrivate())) return;
+			if (await this.reserveSeenUpdateId(inbound.updateId)) {
+				try {
+					await this.botApi.call("sendMessage", {
+						chat_id: this.opts.chatId,
+						message_thread_id: Number(inbound.threadId),
+						text: "Usage: /status",
+						parse_mode: TELEGRAM_PARSE_MODE,
+					});
+				} catch {
+					logger.warn("notifications: status media usage delivery failed");
+				}
+			}
+			return;
+		}
 		const isAskReply =
 			replyTo !== undefined && (this.messageRoutes.has(String(replyTo)) || this.messageRoutes.has(Number(replyTo)));
-		const directControl =
-			typeof raw.message?.text === "string"
-				? parseTelegramControlCommand(raw.message.text, this.botUsername)
-				: ({ kind: "none" } as const);
 		const interceptAskControl = isAskReply && directControl.kind !== "none";
 		if (!raw.callback_query && (!isAskReply || interceptAskControl || reservedBtw !== undefined)) {
 			const inbound = decideThreadedInbound(update as never, {
@@ -8225,6 +8268,7 @@ export class TelegramNotificationDaemon {
 					{ command: "usage", description: "Show provider/local usage for this session" },
 					{ command: "model", description: "Select a model for this session" },
 					{ command: "context", description: "Show current context usage for this session" },
+					{ command: "status", description: "Show current session and workflow status" },
 					{ command: "compact", description: "Compact this session: /compact [instructions]" },
 					{ command: "btw", description: "Ask an ephemeral side question in this session" },
 					{ command: "session_create", description: "Create a GJC session: path, worktree, or dir [--mpreset]" },

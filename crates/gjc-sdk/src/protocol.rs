@@ -1083,6 +1083,22 @@ pub enum ControlCommandStatus {
 	Unavailable,
 }
 
+/// Structured one-shot session status rendered by the notification daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatus {
+	pub repo:           String,
+	pub branch:         String,
+	pub machine:        String,
+	pub session_id:     String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub model:          Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub context:        Option<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub workflow_lines: Vec<String>,
+}
+
 /// A Telegram-safe model choice surfaced by a successful `model` list control
 /// result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1099,19 +1115,22 @@ pub struct ModelChoice {
 #[serde(rename_all = "camelCase")]
 pub struct ControlCommandResult {
 	/// The session this result belongs to.
-	pub session_id:    String,
+	pub session_id:     String,
 	/// Client request id being answered.
-	pub request_id:    String,
+	pub request_id:     String,
 	/// Telegram update id this result corresponds to, when known.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub update_id:     Option<i64>,
+	pub update_id:      Option<i64>,
 	/// Terminal command status.
-	pub status:        ControlCommandStatus,
+	pub status:         ControlCommandStatus,
 	/// Short deterministic Telegram-visible text.
-	pub message:       String,
+	pub message:        String,
+	/// Optional structured session status rendered by the notification daemon.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub session_status: Option<SessionStatus>,
 	/// Optional model choices for a successful bare `model` list request.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub model_choices: Option<Vec<ModelChoice>>,
+	pub model_choices:  Option<Vec<ModelChoice>>,
 }
 
 /// Agent loop activity state, driving the client's live typing indicator.
@@ -1920,12 +1939,21 @@ mod tests {
 	#[test]
 	fn control_command_result_model_choices_roundtrip() {
 		let msg = ServerMessage::ControlCommandResult(ControlCommandResult {
-			session_id:    "s1".into(),
-			request_id:    "r1".into(),
-			update_id:     Some(42),
-			status:        ControlCommandStatus::Ok,
-			message:       "Select a model".into(),
-			model_choices: Some(vec![ModelChoice {
+			session_id:     "s1".into(),
+			request_id:     "r1".into(),
+			update_id:      Some(42),
+			status:         ControlCommandStatus::Ok,
+			message:        "Select a model".into(),
+			session_status: Some(SessionStatus {
+				repo:           "repo".into(),
+				branch:         "dev".into(),
+				machine:        "host".into(),
+				session_id:     "s1".into(),
+				model:          Some("model".into()),
+				context:        Some("25k/100k 25%".into()),
+				workflow_lines: vec!["Ralplan".into(), "• status: active".into()],
+			}),
+			model_choices:  Some(vec![ModelChoice {
 				selector: "provider/model".into(),
 				label:    "Model".into(),
 			}]),
@@ -1936,6 +1964,7 @@ mod tests {
 		assert_eq!(v["requestId"], "r1");
 		assert_eq!(v["updateId"], 42);
 		assert_eq!(v["status"], "ok");
+		assert_eq!(v["sessionStatus"]["sessionId"], "s1");
 		assert_eq!(v["modelChoices"][0]["selector"], "provider/model");
 		assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
 	}
@@ -1945,7 +1974,10 @@ mod tests {
 		let raw = r#"{"type":"control_command_result","sessionId":"s1","requestId":"r1","status":"ok","message":"done"}"#;
 		let msg: ServerMessage = serde_json::from_str(raw).unwrap();
 		match msg {
-			ServerMessage::ControlCommandResult(result) => assert_eq!(result.model_choices, None),
+			ServerMessage::ControlCommandResult(result) => {
+				assert_eq!(result.model_choices, None);
+				assert_eq!(result.session_status, None);
+			},
 			other => panic!("expected control_command_result, got {other:?}"),
 		}
 	}

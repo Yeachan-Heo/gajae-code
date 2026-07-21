@@ -20,14 +20,15 @@ export interface ConfigCommandChange {
 	redact?: boolean;
 }
 
-export type TelegramControlCommandName = "reasoning" | "usage" | "context" | "compact" | "model";
+export type TelegramControlCommandName = "reasoning" | "usage" | "context" | "compact" | "model" | "status";
 
 export type TelegramControlCommand =
 	| { name: "reasoning"; action: "cycle" | "status" | "set" | "show" | "hide"; level?: string; global?: boolean }
 	| { name: "usage" }
 	| { name: "context" }
 	| { name: "compact"; instructions?: string }
-	| { name: "model"; action: "list" | "set"; selector?: string };
+	| { name: "model"; action: "list" | "set"; selector?: string }
+	| { name: "status" };
 
 export type TelegramControlCommandParseResult =
 	| { kind: "none" }
@@ -41,6 +42,7 @@ const TELEGRAM_CONTROL_COMMANDS = new Set<TelegramControlCommandName>([
 	"context",
 	"compact",
 	"model",
+	"status",
 ]);
 const TELEGRAM_REASONING_LEVELS = new Set(["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
@@ -61,6 +63,8 @@ export function telegramControlCommandUsage(commandName: TelegramControlCommandN
 			return "Usage: /compact [instructions]";
 		case "model":
 			return "Usage: /model [provider/model]";
+		case "status":
+			return "Usage: /status";
 	}
 }
 
@@ -81,6 +85,10 @@ export function parseTelegramControlCommand(text: string, botUsername?: string):
 		case "context":
 			return rest.length === 0
 				? { kind: "command", command: { name: commandName } }
+				: { kind: "invalid", commandName, usage };
+		case "status":
+			return rest.length === 0
+				? { kind: "command", command: { name: "status" } }
 				: { kind: "invalid", commandName, usage };
 		case "compact": {
 			const instructions = trimmed.slice(rawRoot.length + 1).trim();

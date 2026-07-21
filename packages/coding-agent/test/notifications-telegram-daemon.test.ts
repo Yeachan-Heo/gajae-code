@@ -6737,7 +6737,7 @@ describe("telegram daemon", () => {
 		});
 	});
 
-	test("telegram control command forwards control_command instead of user_message", async () => {
+	test("telegram session controls stay on the addressed session thread instead of becoming user messages", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -6764,6 +6764,10 @@ describe("telegram daemon", () => {
 			update_id: 8,
 			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/context", message_id: 101 },
 		});
+		await daemon.handleTelegramUpdate({
+			update_id: 9,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/status", message_id: 102 },
+		});
 
 		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
 		expect(sent).toContainEqual({
@@ -6774,6 +6778,15 @@ describe("telegram daemon", () => {
 			updateId: 8,
 			threadId: String(threadId),
 			command: { name: "context" },
+		});
+		expect(sent).toContainEqual({
+			type: "control_command",
+			sessionId: "S",
+			token: "ts",
+			requestId: "tg:9",
+			updateId: 9,
+			threadId: String(threadId),
+			command: { name: "status" },
 		});
 		expect(sent.some(frame => frame.type === "user_message")).toBe(false);
 	});
@@ -6986,6 +6999,84 @@ describe("telegram daemon", () => {
 			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/reasoning impossible", message_id: 102 },
 		});
 		expect(usageMessages()).toHaveLength(1);
+	});
+	test("reserves known-ask media /status captions before reply or attachment routing", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			rich: { enabled: false },
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask1",
+			question: "Name it?",
+			options: ["a", "b"],
+		});
+		const ask = bot.calls.find(call => call.method === "sendMessage")!;
+		const threadId = ask.body.message_thread_id;
+		const askMessageId = bot.calls.indexOf(ask) + 1;
+		bot.calls = [];
+
+		for (const [offset, attachment] of [
+			{ photo: [{ file_id: "must-not-download" }] },
+			{ document: { file_id: "must-not-download" } },
+			{ video: { file_id: "must-not-download" } },
+			{ audio: { file_id: "must-not-download" } },
+			{ voice: { file_id: "must-not-download" } },
+			{ animation: { file_id: "must-not-download" } },
+		].entries()) {
+			await daemon.handleTelegramUpdate({
+				update_id: 906 + offset,
+				message: {
+					chat: { id: 42 },
+					message_thread_id: threadId,
+					caption: "/status extra",
+					...attachment,
+					message_id: 907 + offset,
+					reply_to_message: { message_id: askMessageId },
+				},
+			});
+		}
+
+		const frames = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
+		expect(
+			frames.some(
+				frame => frame.type === "reply" || frame.type === "user_message" || frame.type === "control_command",
+			),
+		).toBe(false);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(6);
+		expect(bot.calls[0]!.body.text).toBe("Usage: /status");
+		expect(daemon.sessions.get("S")!.pending.has("ask1")).toBe(true);
+		await daemon.handleTelegramUpdate({
+			update_id: 999,
+			message: {
+				chat: { id: 99 },
+				message_thread_id: threadId,
+				caption: "/status extra",
+				animation: { file_id: "foreign" },
+				message_id: 1000,
+			},
+		});
+		await daemon.handleTelegramUpdate({
+			update_id: 1001,
+			message: {
+				chat: { id: 42 },
+				message_thread_id: 999_999,
+				caption: "/status extra",
+				animation: { file_id: "unknown-topic" },
+				message_id: 1002,
+			},
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(6);
 	});
 
 	test("wrong-suffix telegram control command is consumed, not injected or ask-answered", async () => {

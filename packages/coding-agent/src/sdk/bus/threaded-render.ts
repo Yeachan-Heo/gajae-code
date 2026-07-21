@@ -94,6 +94,7 @@ interface ThreadedFrame {
 	// control_command_result
 	status?: unknown;
 	message?: unknown;
+	sessionStatus?: unknown;
 }
 
 function str(v: unknown): string | undefined {
@@ -104,22 +105,48 @@ function isDotOnlyText(value: string): boolean {
 	return /^[.\s]+$/.test(value);
 }
 
-/** Format the one-time identity header as pinned bullets. */
-export function formatIdentityHeader(frame: {
+interface SessionIdentityFields {
 	repo?: unknown;
 	branch?: unknown;
 	machine?: unknown;
 	sessionId?: unknown;
-	title?: unknown;
-}): string {
-	const title = str(frame.title) ?? "GJC session";
-	const bullets = [
+}
+
+function formatSessionIdentityBullets(frame: SessionIdentityFields): string[] {
+	return [
 		`• repo: ${code(str(frame.repo) ?? "?")}`,
 		`• branch: ${code(str(frame.branch) ?? "?")}`,
 		`• machine: ${code(str(frame.machine) ?? "?")}`,
 		`• session: ${code(str(frame.sessionId) ?? "?")}`,
-	];
+	].filter((line): line is string => Boolean(line));
+}
+
+/** Format the one-time identity header as pinned bullets. */
+export function formatIdentityHeader(
+	frame: SessionIdentityFields & {
+		title?: unknown;
+	},
+): string {
+	const title = str(frame.title) ?? "GJC session";
+	const bullets = formatSessionIdentityBullets(frame);
 	return `${bold(title)}\n${bullets.join("\n")}`;
+}
+
+/** Format a one-shot session status using the identity card's visual grammar. */
+export function formatSessionStatusHeader(
+	frame: SessionIdentityFields & {
+		model?: unknown;
+		context?: unknown;
+	},
+): string {
+	const model = str(frame.model);
+	const context = str(frame.context);
+	const bullets = [
+		...formatSessionIdentityBullets(frame),
+		model ? `• model: ${escapeHtml(model)}` : undefined,
+		context ? `• context: ${escapeHtml(context)}` : undefined,
+	].filter((line): line is string => Boolean(line));
+	return `${bold("GJC session")}\n${bullets.join("\n")}`;
 }
 
 /** Format a streamed context update into a compact block (omitting empty fields). */
@@ -282,6 +309,22 @@ export function renderThreadedFrame(frame: ThreadedFrame): ThreadedSend | undefi
 			if (!message) return undefined;
 			const status = str(frame.status);
 			const prefix = status === "ok" ? "✅" : status === "unavailable" ? "⚠️" : "❌";
+			const sessionStatus =
+				frame.sessionStatus && typeof frame.sessionStatus === "object"
+					? (frame.sessionStatus as Record<string, unknown>)
+					: undefined;
+			if (sessionStatus) {
+				const workflowLines = Array.isArray(sessionStatus.workflowLines)
+					? sessionStatus.workflowLines.map(str).filter((line): line is string => Boolean(line))
+					: [];
+				const identity = formatSessionStatusHeader(sessionStatus);
+				const workflow = workflowLines.length > 0 ? `\n\n${workflowLines.map(escapeHtml).join("\n")}` : "";
+				return {
+					method: "sendMessage",
+					lane: "idle",
+					text: finalizeTelegramHtml(`${identity}${workflow}`),
+				};
+			}
 			return {
 				method: "sendMessage",
 				lane: "idle",
