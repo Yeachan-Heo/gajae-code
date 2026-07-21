@@ -7747,7 +7747,7 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<RecoveryHydrationOpenResult> {
-		const destination =
+		let destination =
 			destinationInput === undefined
 				? explicitDestination(path.dirname(identity.canonicalPath))
 				: destinationFor(getProjectDir(), destinationInput, storage);
@@ -7757,6 +7757,17 @@ export class SessionManager {
 		if (inspected.migrationApplied) return { kind: "error", reason: "migration-required" };
 
 		const header = inspected.entries[0] as SessionHeader;
+		if (
+			destination.kind === "managed" &&
+			storage instanceof FileSessionStorage &&
+			header.cwd &&
+			path.resolve(path.dirname(identity.canonicalPath)) !== path.resolve(destination.directory)
+		) {
+			// Retarget a cross-scope resume (e.g. teammate/worktree session opened from
+			// another directory) to the session file's own managed scope so persistence
+			// stays inside the session directory instead of aborting.
+			destination = managedDestination(header.cwd, storage, destination.securityContext.agentDir);
+		}
 		const manager = new SessionManager(
 			header.cwd || getProjectDir(),
 			destination.directory,
@@ -7808,7 +7819,7 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 	): Promise<StrictSessionOpenResult> {
-		const destination =
+		let destination =
 			destinationInput === undefined
 				? explicitDestination(path.dirname(identity.canonicalPath))
 				: destinationFor(getProjectDir(), destinationInput, storage);
@@ -7840,6 +7851,19 @@ export class SessionManager {
 
 		const entries = inspected.entries;
 		const header = entries[0] as SessionHeader;
+		if (
+			destination.kind === "managed" &&
+			storage instanceof FileSessionStorage &&
+			header.cwd &&
+			path.resolve(path.dirname(sessionPath)) !== path.resolve(destination.directory)
+		) {
+			// The resumed session file lives under its origin managed scope, which can
+			// differ from the scope derived from the current working directory (e.g. a
+			// teammate/worktree session resumed by a controller in a different directory).
+			// Retarget the destination to the file's own scope so managed-transcript
+			// persistence stays inside the session directory instead of aborting.
+			destination = managedDestination(header.cwd, storage, destination.securityContext.agentDir);
+		}
 		const dir = destination.directory;
 		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage, destination);
 		await manager.#hydrateExistingSession(sessionPath, entries, inspected.migrationApplied);
