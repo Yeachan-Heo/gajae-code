@@ -1096,6 +1096,17 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(tasks[2]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
+	test("cache-eval evidence artifact adds its focused AI test without bypassing root fallback coverage", () => {
+		const tasks = targeted(["artifacts/architecture-2383-eval.json"]);
+		expect(tasks.map(task => task.key)).toEqual([
+			"test:packages/ai/test/anthropic-cache-eval.integration.test.ts",
+			"root-check",
+			"native-linux-x64",
+		]);
+		expect(tasks[0]?.command).toEqual(["bun", "test", "packages/ai/test/anthropic-cache-eval.integration.test.ts"]);
+		expect(tasks[1]?.command).toEqual(["bun", "run", "ci:check:full"]);
+		expect(tasks[2]?.command).toEqual(["bash", "-lc", 'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts']);
+	});
 
 	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run only", () => {
 		const tasks = targeted([".github/workflows/dev-ci.yml"]);
