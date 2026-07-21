@@ -155,6 +155,35 @@ describe("model thinking metadata", () => {
 		expect(() => mapEffortToAnthropicAdaptiveEffort(sonnet46, Effort.Max)).toThrow(/not supported/);
 		expect(mapEffortToAnthropicAdaptiveEffort(sonnet5, Effort.High)).toBe("high");
 	});
+
+	it("classifies Fable 5 as adaptive thinking with xhigh support (discovery metadata regression)", () => {
+		const fable = createModel({
+			id: "claude-fable-5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+		});
+		const fableBedrock = createModel({
+			id: "us.anthropic.claude-fable-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+		});
+
+		// Discovery previously parsed Fable as an unknown family and cached
+		// mode:"budget", which made requests send `enabled`+budget_tokens —
+		// Fable then returned signature-only thinking (billed, nothing shown).
+		expect(fable.thinking?.mode).toBe("anthropic-adaptive");
+		expect(fable.thinking?.minLevel).toBe(Effort.Minimal);
+		expect(fable.thinking?.maxLevel).toBe(Effort.XHigh);
+		expect(mapEffortToAnthropicAdaptiveEffort(fable, Effort.XHigh)).toBe("xhigh");
+		expect(() => mapEffortToAnthropicAdaptiveEffort(fable, Effort.Max)).toThrow(/not supported/);
+
+		// Bedrock Converse lacks the Messages-only xhigh preset (same split
+		// as Opus 4.7+), so Bedrock Fable stays clamped to high.
+		expect(fableBedrock.thinking?.mode).toBe("anthropic-adaptive");
+		expect(fableBedrock.thinking?.maxLevel).toBe(Effort.High);
+		expect(mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.High)).toBe("high");
+		expect(() => mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.XHigh)).toThrow(/not supported/);
+	});
 });
 
 describe("generated model policies", () => {

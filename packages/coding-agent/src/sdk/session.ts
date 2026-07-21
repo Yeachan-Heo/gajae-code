@@ -1590,13 +1590,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// which collapses to the parent's dir for subagents (they adopt the
 		// parent's ArtifactManager) so one lookup hits everything.
 		const getArtifactsDir = () => sessionManager.getArtifactsDir();
+		const localProtocolOptions = options.localProtocolOptions ?? {
+			getArtifactsDir,
+			isManagedDestination: () => sessionManager.isManagedDestination(),
+			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
+			getSessionId: () => sessionManager.getSessionId(),
+		};
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
 			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
 			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
 		}
+		await initializeLocalRoot(localProtocolOptions);
 		if (options.localProtocolOptions) {
-			await initializeLocalRoot(options.localProtocolOptions);
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
