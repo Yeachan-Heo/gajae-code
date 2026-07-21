@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added `/btw-r`, a retained multi-turn side chat whose visible text-only context stays outside the main transcript and session observability/debug hooks, with synchronous scrubbing on close or abort.
+
 ### Fixed
 
 - Documented that custom OpenAI-compatible models omit vision by default: when `input` is unset, GJC treats the model as text-only and strips images with `[image omitted: model does not support vision]`. Vision backends must set `input: [text, image]` in `models.yml`.

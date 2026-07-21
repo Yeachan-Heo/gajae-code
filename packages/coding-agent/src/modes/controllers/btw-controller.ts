@@ -1,8 +1,7 @@
-import type { AgentMessage } from "@gajae-code/agent-core";
-import type { AssistantMessage } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import btwRUserPrompt from "../../prompts/system/btw-r-user.md" with { type: "text" };
 import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
+import type { EphemeralTextExchange } from "../../session/agent-session";
 import { BtwPanelComponent } from "../components/btw-panel";
 import type { InteractiveModeContext } from "../types";
 
@@ -10,11 +9,11 @@ type RetainedFollowUpResult = "accepted" | "busy" | "closed";
 
 interface BtwRequest {
 	component: BtwPanelComponent;
-	abortController: AbortController;
+	abortController: AbortController | undefined;
 	question: string;
 	mode: "one-shot" | "retained";
 	inFlight: boolean;
-	contextMessages: AgentMessage[];
+	contextExchanges: EphemeralTextExchange[];
 }
 
 export class BtwController {
@@ -40,12 +39,12 @@ export class BtwController {
 
 	handleEscape(): boolean {
 		if (!this.#activeRequest) return false;
-		this.#closeActiveRequest({ abort: this.#activeRequest.inFlight });
+		this.#closeActiveRequest();
 		return true;
 	}
 
 	dispose(): void {
-		this.#closeActiveRequest({ abort: true });
+		this.#closeActiveRequest();
 	}
 
 	async start(question: string): Promise<void> {
@@ -61,7 +60,7 @@ export class BtwController {
 		}
 		if (!this.#hasModel("/btw")) return;
 
-		this.#closeActiveRequest({ abort: true });
+		this.#closeActiveRequest();
 		const request = this.#openRequest(trimmedQuestion, "one-shot");
 		void this.#runOneShotRequest(request);
 	}
@@ -79,7 +78,7 @@ export class BtwController {
 		}
 		if (!this.#hasModel("/btw-r")) return;
 
-		this.#closeActiveRequest({ abort: true });
+		this.#closeActiveRequest();
 		const request = this.#openRequest(trimmedQuestion, "retained");
 		void this.#runRetainedRequest(request);
 	}
@@ -119,7 +118,7 @@ export class BtwController {
 			question,
 			mode,
 			inFlight: true,
-			contextMessages: [],
+			contextExchanges: [],
 		};
 		this.ctx.btwContainer.clear();
 		this.ctx.btwContainer.addChild(request.component);
@@ -129,6 +128,8 @@ export class BtwController {
 	}
 
 	async #runOneShotRequest(request: BtwRequest): Promise<void> {
+		const abortController = request.abortController;
+		if (!abortController) return;
 		try {
 			const promptText = prompt.render(btwUserPrompt, { question: request.question });
 			const { replyText } = await this.ctx.session.runEphemeralTurn({
@@ -137,7 +138,7 @@ export class BtwController {
 				onTextDelta: delta => {
 					if (this.#isActiveRequest(request)) request.component.appendText(delta);
 				},
-				signal: request.abortController.signal,
+				signal: abortController.signal,
 			});
 			if (!this.#isActiveRequest(request)) return;
 			request.inFlight = false;
@@ -146,7 +147,7 @@ export class BtwController {
 		} catch (error) {
 			if (!this.#isActiveRequest(request)) return;
 			request.inFlight = false;
-			if (request.abortController.signal.aborted) {
+			if (abortController.signal.aborted) {
 				request.component.markAborted();
 				return;
 			}
@@ -155,74 +156,48 @@ export class BtwController {
 	}
 
 	async #runRetainedRequest(request: BtwRequest): Promise<void> {
+		const abortController = request.abortController;
+		if (!abortController) return;
+		const question = request.question;
 		try {
-			const promptText = prompt.render(btwRUserPrompt, { question: request.question });
-			const { replyText, assistantMessage } = await this.ctx.session.runEphemeralTurn({
+			const promptText = prompt.render(btwRUserPrompt, { question });
+			const { replyText } = await this.ctx.session.runEphemeralTurn({
+				purpose: "btw",
 				promptText,
-				contextMessages: [...request.contextMessages],
+				contextExchanges: request.contextExchanges.map(exchange => ({ ...exchange })),
 				onTextDelta: delta => {
 					if (this.#isActiveRequest(request)) request.component.appendText(delta);
 				},
-				signal: request.abortController.signal,
+				signal: abortController.signal,
 			});
 			if (!this.#isActiveRequest(request)) return;
 			request.inFlight = false;
-			this.#appendRetainedExchange(request, assistantMessage);
+			request.contextExchanges.push({ question, answer: replyText });
 			if (replyText) request.component.setAnswer(replyText);
 			request.component.markComplete();
 		} catch (error) {
 			if (!this.#isActiveRequest(request)) return;
 			request.inFlight = false;
-			if (request.abortController.signal.aborted) {
+			if (abortController.signal.aborted) {
 				request.component.markAborted();
 				return;
 			}
 			const message = error instanceof Error ? error.message : String(error);
-			// Keep the failed user turn visible to later follow-ups so "try again"
-			// still sees the question that remains on the retained panel.
-			this.#appendRetainedExchange(request, this.#errorAssistantMessage(message));
+			request.contextExchanges.push({ question, answer: `Error: ${message}` });
 			request.component.markError(message);
 		}
 	}
 
-	#appendRetainedExchange(request: BtwRequest, assistantMessage: AgentMessage): void {
-		request.contextMessages.push(
-			{
-				role: "user",
-				content: [{ type: "text", text: request.question }],
-				attribution: "user",
-				timestamp: Date.now(),
-			},
-			assistantMessage,
-		);
-	}
-
-	#errorAssistantMessage(message: string): AssistantMessage {
-		return {
-			role: "assistant",
-			content: [{ type: "text", text: `Error: ${message}` }],
-			api: "btw-r",
-			provider: "btw-r",
-			model: "btw-r",
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "error",
-			timestamp: Date.now(),
-			errorMessage: message,
-		};
-	}
-
-	#closeActiveRequest(options: { abort: boolean }): void {
+	#closeActiveRequest(): void {
 		const request = this.#activeRequest;
 		if (!request) return;
 		this.#activeRequest = undefined;
-		if (options.abort) request.abortController.abort();
+		const abortController = request.abortController;
+		request.abortController = undefined;
+		request.question = "";
+		request.contextExchanges.splice(0);
+		request.inFlight = false;
+		abortController?.abort();
 		request.component.close();
 		this.ctx.btwContainer.clear();
 		this.ctx.ui.requestRender();

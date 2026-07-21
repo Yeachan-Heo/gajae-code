@@ -837,8 +837,13 @@ interface EphemeralTurnBaseArgs {
 	signal?: AbortSignal;
 }
 
+export interface EphemeralTextExchange {
+	question: string;
+	answer: string;
+}
+
 export type EphemeralTurnArgs =
-	| (EphemeralTurnBaseArgs & { purpose: "btw" })
+	| (EphemeralTurnBaseArgs & { purpose: "btw"; contextExchanges?: readonly EphemeralTextExchange[] })
 	| (EphemeralTurnBaseArgs & {
 			purpose?: "background";
 			/** Internal caller-supplied, non-persistent context such as the IRC roster. */
@@ -14002,12 +14007,14 @@ export class AgentSession {
 	async runEphemeralTurn(args: EphemeralTurnArgs): Promise<EphemeralTurnResult> {
 		args.signal?.throwIfAborted();
 		const isBtw = args.purpose === "btw";
+		const contextExchanges = isBtw ? args.contextExchanges : undefined;
 		// `/btw` captures every provider-facing parent facet synchronously so an
 		// in-flight foreground mutation cannot create a mixed-generation request.
 		const btwSnapshot = isBtw
 			? this.#buildBtwEphemeralSnapshot(
 					cloneJsonValueForForkSeed(this.buildDisplaySessionContext().messages),
 					args.promptText,
+					contextExchanges,
 				)
 			: undefined;
 		const model = this.model;
@@ -14078,7 +14085,8 @@ export class AgentSession {
 						reasoning: toReasoningEffort(thinkingLevel),
 						hideThinkingSummary,
 						serviceTier,
-						onPayload: this.#onPayload,
+						// `/btw` content must not enter session payload, response, SSE,
+						// debug-buffer, export, or telemetry hooks.
 						signal: requestSignal,
 						toolChoice: "none",
 						requestMaxRetries: 0,
@@ -14170,8 +14178,37 @@ export class AgentSession {
 		}
 	}
 
-	/** Build a `/btw` snapshot from an already-cloned committed context. */
-	#buildBtwEphemeralSnapshot(messages: AgentMessage[], promptText: string): AgentMessage[] {
+	/** Build a `/btw` snapshot from committed context plus text-only visible side-chat turns. */
+	#buildBtwEphemeralSnapshot(
+		messages: AgentMessage[],
+		promptText: string,
+		contextExchanges?: readonly EphemeralTextExchange[],
+	): AgentMessage[] {
+		for (const exchange of contextExchanges ?? []) {
+			messages.push({
+				role: "user",
+				content: [{ type: "text", text: exchange.question }],
+				attribution: "user",
+				timestamp: Date.now(),
+			});
+			messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: exchange.answer }],
+				api: "btw-r",
+				provider: "btw-r",
+				model: "btw-r",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+		}
 		messages.push(this.#buildEphemeralPromptMessage(promptText));
 		return messages;
 	}

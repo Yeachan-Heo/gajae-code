@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, Usage } from "@gajae-code/ai";
 import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { RawSseDebugBuffer } from "@gajae-code/coding-agent/debug/raw-sse-buffer";
 import { AgentRegistry } from "@gajae-code/coding-agent/registry/agent-registry";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
@@ -52,15 +53,24 @@ function text(message: AgentMessage): string {
 		.join("");
 }
 
-function createHarness(options: { onConvert?: (messages: AgentMessage[]) => Promise<void> } = {}): {
+function createHarness(
+	options: {
+		onConvert?: (messages: AgentMessage[]) => Promise<void>;
+		onPayload?: () => void;
+		onResponse?: () => void;
+		onSseEvent?: () => void;
+	} = {},
+): {
 	session: AgentSession;
 	model: MockModel;
 	snapshots: AgentMessage[][];
 	registry: AgentRegistry;
+	rawSseDebugBuffer: RawSseDebugBuffer;
 } {
 	const model = createMockModel({ handler: () => ({ content: ["ephemeral reply"] }) });
 	const snapshots: AgentMessage[][] = [];
 	const registry = new AgentRegistry();
+	const rawSseDebugBuffer = new RawSseDebugBuffer();
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		initialState: {
@@ -84,80 +94,60 @@ function createHarness(options: { onConvert?: (messages: AgentMessage[]) => Prom
 			await options.onConvert?.(messages);
 			return convertToLlm(messages);
 		},
+		onPayload: options.onPayload as never,
+		onResponse: options.onResponse as never,
+		onSseEvent: options.onSseEvent as never,
+		rawSseDebugBuffer,
 	});
 	sessions.push(session);
-	return { session, model, snapshots, registry };
-}
-
-function addPeer(registry: AgentRegistry): void {
-	registry.register({
-		id: "1-Worker",
-		displayName: "Worker",
-		rosterLabel: "Worker",
-		kind: "sub",
-		session: null,
-		status: "running",
-	});
+	return { session, model, snapshots, registry, rawSseDebugBuffer };
 }
 
 describe("AgentSession ephemeral context", () => {
-	it("replays main messages, caller context, and the virtual prompt in order without mutation or tools", async () => {
+	it("replays only text-visible retained exchanges without mutating session history", async () => {
 		const { session, model, snapshots } = createHarness();
-		const context = [
-			user("first question"),
-			assistant("first answer"),
-			user("second question"),
-			assistant("second answer", "private reasoning"),
+		const contextExchanges = [
+			{ question: "first question", answer: "first answer" },
+			{ question: "second question", answer: "second answer" },
 		];
-		const contextBefore = structuredClone(context);
+		const contextBefore = structuredClone(contextExchanges);
 		const sessionBefore = structuredClone(session.messages);
 
-		await session.runEphemeralTurn({ promptText: "current prompt", contextMessages: context });
+		await session.runEphemeralTurn({ purpose: "btw", promptText: "current prompt", contextExchanges });
 
 		expect(snapshots).toHaveLength(1);
 		expect(snapshots[0]?.map(message => `${message.role}:${text(message)}`)).toEqual([
-			"user:main user",
-			"assistant:main assistant",
 			"user:first question",
 			"assistant:first answer",
 			"user:second question",
 			"assistant:second answer",
 			"user:current prompt",
 		]);
-		expect(snapshots[0]?.[5]).toBe(context[3]);
-		expect((snapshots[0]?.[5] as AssistantMessage).content).toContainEqual({
-			type: "thinking",
-			thinking: "private reasoning",
-		});
-		expect(context).toEqual(contextBefore);
+		expect(JSON.stringify(snapshots[0])).not.toContain("thinking");
+		expect(contextExchanges).toEqual(contextBefore);
 		expect(session.messages).toEqual(sessionBefore);
 		expect(model.calls[0]?.context.tools).toEqual([]);
 		expect(model.calls[0]?.options?.toolChoice).toBe("none");
 	});
 
-	it("preserves caller context when an IRC roster claim is invalidated during conversion", async () => {
-		let session!: AgentSession;
-		let conversions = 0;
-		const harness = createHarness({
-			onConvert: async () => {
-				conversions += 1;
-				if (conversions === 1) await session.newSession();
-			},
+	it("does not route /btw bytes through payload, response, SSE, or raw debug hooks", async () => {
+		const onPayload = vi.fn();
+		const onResponse = vi.fn();
+		const onSseEvent = vi.fn();
+		const { session, model, rawSseDebugBuffer } = createHarness({ onPayload, onResponse, onSseEvent });
+
+		await session.runEphemeralTurn({
+			purpose: "btw",
+			promptText: "private current prompt",
+			contextExchanges: [{ question: "private prior question", answer: "private prior answer" }],
 		});
-		session = harness.session;
-		addPeer(harness.registry);
-		const context = [user("retained question"), assistant("retained answer", "reasoning")];
 
-		await session.runEphemeralTurn({ promptText: "current prompt", contextMessages: context });
-
-		expect(harness.snapshots).toHaveLength(2);
-		expect(JSON.stringify(harness.snapshots[0])).toContain("irc-peer-roster");
-		expect(JSON.stringify(harness.snapshots[1])).not.toContain("irc-peer-roster");
-		expect(harness.snapshots[1]?.map(message => `${message.role}:${text(message)}`)).toEqual([
-			"user:retained question",
-			"assistant:retained answer",
-			"user:current prompt",
-		]);
-		expect(harness.snapshots[1]?.[1]).toBe(context[1]);
+		expect(onPayload).not.toHaveBeenCalled();
+		expect(onResponse).not.toHaveBeenCalled();
+		expect(onSseEvent).not.toHaveBeenCalled();
+		expect(rawSseDebugBuffer.snapshot().records).toEqual([]);
+		expect(model.calls[0]?.options?.onPayload).toBeUndefined();
+		expect(model.calls[0]?.options?.onResponse).toBeUndefined();
+		expect(model.calls[0]?.options?.onSseEvent).toBeUndefined();
 	});
 });

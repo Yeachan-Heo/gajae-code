@@ -1,9 +1,9 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
-import type { AgentMessage } from "@gajae-code/agent-core";
 import type { AssistantMessage, Usage } from "@gajae-code/ai";
 import { BtwController } from "@gajae-code/coding-agent/modes/controllers/btw-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import type { EphemeralTextExchange } from "@gajae-code/coding-agent/session/agent-session";
 import { Container, type TUI } from "@gajae-code/tui";
 
 const usage: Usage = {
@@ -31,7 +31,7 @@ function createAssistantMessage(text: string): AssistantMessage {
 interface RunEphemeralTurnArgs {
 	purpose: "btw";
 	promptText: string;
-	contextMessages?: readonly AgentMessage[];
+	contextExchanges?: readonly EphemeralTextExchange[];
 	onTextDelta?: (delta: string) => void;
 	signal?: AbortSignal;
 }
@@ -209,7 +209,7 @@ describe("BtwController", () => {
 		expect(runEphemeralTurn).not.toHaveBeenCalled();
 		expect(ctx.showError).toHaveBeenCalled();
 	});
-	it("replays completed retained turns as raw user and returned assistant messages", async () => {
+	it("replays completed retained turns as text-only visible exchanges", async () => {
 		const firstAssistant = createAssistantMessage("First answer");
 		const runEphemeralTurn = vi
 			.fn<(args: RunEphemeralTurnArgs) => Promise<RunEphemeralTurnResult>>()
@@ -233,14 +233,7 @@ describe("BtwController", () => {
 
 		const secondCall = runEphemeralTurn.mock.calls[1]?.[0];
 		expect(secondCall?.promptText).toContain("<btw-r>");
-		expect(secondCall?.contextMessages).toHaveLength(2);
-		const firstContextMessage = secondCall?.contextMessages?.[0];
-		expect(firstContextMessage).toMatchObject({
-			role: "user",
-			content: [{ type: "text", text: "First question?" }],
-			attribution: "user",
-		});
-		expect(secondCall?.contextMessages?.[1]).toBe(firstAssistant);
+		expect(secondCall?.contextExchanges).toEqual([{ question: "First question?", answer: "First answer" }]);
 		expect(controller.isRetainedTurnInFlight()).toBe(false);
 	});
 
@@ -312,18 +305,32 @@ describe("BtwController", () => {
 		await Promise.resolve();
 
 		const retryCall = runEphemeralTurn.mock.calls[1]?.[0];
-		expect(retryCall?.contextMessages).toHaveLength(2);
-		expect(retryCall?.contextMessages?.[0]).toMatchObject({
-			role: "user",
-			content: [{ type: "text", text: "Failed question?" }],
-			attribution: "user",
+		expect(retryCall?.contextExchanges).toEqual([
+			{ question: "Failed question?", answer: "Error: provider unavailable" },
+		]);
+	});
+
+	it("aborts and scrubs retained state synchronously on Escape", async () => {
+		const pending = Promise.withResolvers<RunEphemeralTurnResult>();
+		let capturedArgs: RunEphemeralTurnArgs | undefined;
+		const runEphemeralTurn = vi.fn((args: RunEphemeralTurnArgs) => {
+			capturedArgs = args;
+			return pending.promise;
 		});
-		expect(retryCall?.contextMessages?.[1]).toMatchObject({
-			role: "assistant",
-			stopReason: "error",
-			errorMessage: "provider unavailable",
-			content: [{ type: "text", text: "Error: provider unavailable" }],
+		const controller = new BtwController(makeCtx(makeFakeSession(runEphemeralTurn)));
+
+		await controller.startRetained("private question");
+		expect(controller.handleEscape()).toBe(true);
+		expect(capturedArgs?.signal?.aborted).toBe(true);
+		expect(controller.hasOpenRetainedThread()).toBe(false);
+		expect(await controller.submitRetainedFollowUp("must not survive")).toBe("closed");
+
+		pending.resolve({
+			replyText: "late private answer",
+			assistantMessage: createAssistantMessage("late private answer"),
 		});
+		await Promise.resolve();
+		expect(controller.hasActiveRequest()).toBe(false);
 	});
 	it("lets /btw-r replace an open one-shot /btw panel", async () => {
 		const signals: AbortSignal[] = [];
