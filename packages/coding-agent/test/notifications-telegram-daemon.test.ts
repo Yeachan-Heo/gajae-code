@@ -2906,6 +2906,49 @@ describe("telegram daemon", () => {
 		});
 	});
 
+	test("auto-reconciles a stale dead-owner lock and spawns a fresh owner without manual recovery", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		// A prior owner (pid 111) crashed but left its state + lock behind. On Linux its
+		// PID is briefly reused, so the first ownership probe sees it alive and refuses
+		// with an ownership block; it then dies. This is exactly the case that used to
+		// hard-block SDK startup until a manual `gjc notify recovery`.
+		writeLiveOwner(agentDir, {
+			pid: 111,
+			ownerId: "crashed",
+			acquisitionId: "crashed",
+			tokenFingerprint: "stale-token",
+			generation: DAEMON_GENERATION,
+		});
+		let now = 1_000;
+		let staleProbes = 0;
+		const child = readyTelegramSpawnFixture({ settings: s, firstChildPid: 4243, now: () => now });
+
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: agentDir, sessionId: "reconciled" },
+				{
+					pid: 4242,
+					now: () => now,
+					pidAlive: pid => (pid === 111 ? staleProbes++ === 0 : pid === 4243),
+					pidIncarnation: () => "linux:100",
+					spawn: child.spawn,
+					readinessTimeoutMs: 1,
+					waitStepMs: 1,
+					sleep: async () => {
+						now++;
+						await child.sleep();
+					},
+				},
+			),
+		).resolves.toBe("spawned");
+		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({
+			pid: 4243,
+			ownershipPhase: "ready",
+		});
+		expect(JSON.parse(fs.readFileSync(paths.lock, "utf8"))).toMatchObject({ pid: 4243 });
+	});
 	test("#2028 retires an unbound launcher reservation after bounded bind contention so ensure can recover", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
