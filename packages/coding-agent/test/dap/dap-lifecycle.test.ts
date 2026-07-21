@@ -155,9 +155,11 @@ describe("DAP lifecycle behavior", () => {
 		const cwd = await tempDir("gjc-dap-unix-socket-timeout-");
 		try {
 			const script = path.join(cwd, "adapter.ts");
+			const socketPathMarker = path.join(cwd, "socket-path");
+
 			await Bun.write(
 				script,
-				`const listen = process.argv.find(arg => arg.startsWith("--listen=unix:"));\nif (!listen) throw new Error("missing listen arg");\nawait Bun.write(listen.slice("--listen=unix:".length), "not a socket");\nsetInterval(() => {}, 1000);\n`,
+				`const listen = process.argv.find(arg => arg.startsWith("--listen=unix:"));\nif (!listen) throw new Error("missing listen arg");\nconst socketPath = listen.slice("--listen=unix:".length);\nawait Bun.write(${JSON.stringify(socketPathMarker)}, socketPath);\nawait Bun.write(socketPath, "not a socket");\nsetInterval(() => {}, 1000);\n`,
 			);
 
 			await expect(
@@ -167,10 +169,8 @@ describe("DAP lifecycle behavior", () => {
 				}),
 			).rejects.toThrow();
 
-			const leakedSockets = (await fs.readdir("/tmp")).filter(
-				name => name.startsWith("dap-fake-socket-") && name.endsWith(".sock"),
-			);
-			expect(leakedSockets).toEqual([]);
+			const socketPath = await Bun.file(socketPathMarker).text();
+			expect(await Bun.file(socketPath).exists()).toBe(false);
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}

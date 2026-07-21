@@ -60,7 +60,7 @@ jobs:
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-04-29
@@ -158,12 +158,12 @@ jobs:
           printf 'guard evidence: base %s@%s; head %s@%s\n' "${BASE_REPOSITORY}" "${GITHUB_BASE_SHA}" "${HEAD_REPOSITORY}" "${HEAD_REF}"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       # The guard's AST canonicalization is parser-version sensitive: install the
       # pinned @babel/parser from the lockfile so the current-tree digest check is
       # deterministic and matches the committed attestations (no auto-install drift).
@@ -189,7 +189,7 @@ jobs:
           if ($head -ne $env:CI_DEV_SOURCE_SHA) { throw "Checked-out SHA $head does not match $env:CI_DEV_SOURCE_SHA" }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-04-29
@@ -208,7 +208,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - run: bun install --frozen-lockfile
       - name: Build native addon (win32-x64 baseline)
         env:
@@ -241,7 +241,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-04-29
@@ -259,7 +259,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - run: bun install --frozen-lockfile
       - name: Build native addon (win32-x64 baseline)
         env:
@@ -310,7 +310,7 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -330,7 +330,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - name: Install system deps
         run: bash scripts/ci-install-system-deps.sh
       - run: bun install --frozen-lockfile
@@ -376,7 +376,7 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-04-29
@@ -390,7 +390,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - run: bun install --frozen-lockfile
       - name: Build native addon (darwin-arm64)
         env:
@@ -468,7 +468,7 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -486,7 +486,7 @@ jobs:
       - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e  # v2
         if: ${{ matrix.nextest }}
         with:
-          tool: nextest
+          tool: nextest@0.9.137
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         if: ${{ matrix.rust }}
         with:
@@ -498,7 +498,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - name: Install system deps
         run: bash scripts/ci-install-system-deps.sh
       - run: bun install --frozen-lockfile
@@ -560,7 +560,7 @@ jobs:
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Download canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -674,7 +674,7 @@ jobs:
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Validate finalized Darwin smoke receipt
         if: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' }}
         env:
@@ -709,14 +709,14 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Restore bun dependency cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
           restore-keys: |
-            bun-${{ runner.os }}-
+            bun-1.3.14-${{ runner.os }}-
       - run: bun install --frozen-lockfile
       - name: Run GJC state gate shard
         run: bun scripts/ci-gjc-state-gates.ts --group=${{ matrix.group }}

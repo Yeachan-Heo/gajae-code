@@ -80,9 +80,9 @@ describe("findMostRecentSession", () => {
 		const file2 = path.join(tempDir, "newer.jsonl");
 
 		fs.writeFileSync(file1, '{"type":"session","id":"old","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
-		// Small delay to ensure different mtime
-		await new Promise(r => setTimeout(r, 10));
 		fs.writeFileSync(file2, '{"type":"session","id":"new","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
+		fs.utimesSync(file1, new Date(10_000), new Date(10_000));
+		fs.utimesSync(file2, new Date(20_000), new Date(20_000));
 
 		expect(await findMostRecentSession(tempDir)).toBe(file2);
 	});
@@ -92,8 +92,9 @@ describe("findMostRecentSession", () => {
 		const valid = path.join(tempDir, "valid.jsonl");
 
 		fs.writeFileSync(invalid, '{"type":"not-session"}\n');
-		await new Promise(r => setTimeout(r, 10));
 		fs.writeFileSync(valid, '{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
+		fs.utimesSync(invalid, new Date(10_000), new Date(10_000));
+		fs.utimesSync(valid, new Date(20_000), new Date(20_000));
 
 		expect(await findMostRecentSession(tempDir)).toBe(valid);
 	});
@@ -114,9 +115,9 @@ describe("findMostRecentSession", () => {
 			future,
 			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION + 1, id: "future-v6", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
 		);
-		fs.utimesSync(valid, new Date(1_000), new Date(1_000));
-		fs.utimesSync(malformed, new Date(2_000), new Date(2_000));
-		fs.utimesSync(future, new Date(3_000), new Date(3_000));
+		fs.utimesSync(valid, new Date(10_000), new Date(10_000));
+		fs.utimesSync(malformed, new Date(20_000), new Date(20_000));
+		fs.utimesSync(future, new Date(30_000), new Date(30_000));
 
 		expect((await getRecentSessions(tempDir)).map(session => session.path)).toEqual([valid]);
 		expect((await SessionManager.list(tempDir, tempDir)).map(session => session.path)).toEqual([valid]);

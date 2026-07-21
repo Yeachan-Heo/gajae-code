@@ -1,0 +1,42 @@
+# CI reliability policy for cargo-nextest.
+#
+# - retries = 1 with flaky-result = "fail": a test that only passes on retry
+#   still FAILS the run; the retry exists to surface flakiness as telemetry,
+#   never to mask it.
+# - process-lifecycle group: process/PTY-reaping tests are load-sensitive and
+#   must not run concurrently within a partition. The in-source mutexes
+#   (PROCESS_TEST_LOCK / PTY_TEST_LOCK) do not serialize nextest's
+#   process-per-test execution, so serialization must happen here.
+#
+# MAINTENANCE CONTRACT: the overrides below name tests exactly. If one of the
+# listed tests is renamed or moved, its override silently stops matching (no
+# nextest warning) and the test loses serialization + its extended timeout.
+# After renaming any listed test, re-run:
+#   cargo nextest show-config test-groups --profile ci
+# and confirm all eight tests still resolve into process-lifecycle.
+nextest-version = { required = "0.9.137" }
+
+[test-groups.process-lifecycle]
+max-threads = 1
+
+[profile.ci]
+fail-fast = false
+retries = 1
+flaky-result = "fail"
+status-level = "retry"
+final-status-level = "flaky"
+slow-timeout = { period = "60s", terminate-after = 2 }
+leak-timeout = "500ms"
+
+[profile.ci.junit]
+path = "junit.xml"
+
+[[profile.ci.overrides]]
+filter = 'package(pi-shell) & (test(=shell::tests::timeout_builtin_reaps_reparented_same_group_grandchild_and_preserves_sibling) | test(=shell::tests::cancelled_command_reaps_reparented_same_group_grandchild) | test(=process::tests::descendants_includes_freshly_spawned_child))'
+test-group = "process-lifecycle"
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-natives) & (test(=pty::tests::bounded_reader_channel_reports_success_for_high_output) | test(=pty::tests::dropped_session_core_kills_and_reaps_mid_run_child) | test(=pty::tests::dropped_js_pty_session_kills_and_reaps_mid_run_child) | test(=pty::tests::kill_path_reaps_sigterm_trapping_child) | test(=pty::tests::background_grandchild_holding_slave_is_reaped_and_unrelated_sibling_survives))'
+test-group = "process-lifecycle"
+slow-timeout = { period = "120s", terminate-after = 2 }
