@@ -264,6 +264,10 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 }
 
+export function selectShutdownDraft(editorText: string, hasActiveBtw: boolean): string {
+	return hasActiveBtw ? "" : editorText;
+}
+
 export class InteractiveMode implements InteractiveModeContext {
 	session: AgentSession;
 	sessionManager: SessionManager;
@@ -1322,19 +1326,20 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#isShuttingDown) return;
 		this.#isShuttingDown = true;
 
-		// Snapshot the editor before any teardown empties it. Persisting the draft
-		// here covers Ctrl+D shutdown with non-empty text; for /exit the editor is
-		// already cleared so saveDraft("") just removes any stale sidecar.
-		const draftText = this.editor.getText();
+		// `/btw` owns the shared composer while its panel is open. Never persist a
+		// side-chat draft or pending side-chat images into the main-session draft.
+		const hadActiveBtw = this.#btwController.hasOpenPanel();
+		const draftText = selectShutdownDraft(this.editor.getText(), hadActiveBtw);
+		if (hadActiveBtw) this.pendingImages = [];
+		this.#btwController.dispose();
 
-		// Flush pending session writes before shutdown
+		// Flush pending session writes before shutdown.
 		await this.sessionManager.flush();
 		try {
 			await this.sessionManager.saveDraft(draftText);
 		} catch (err) {
 			logger.warn("Failed to save session draft", { error: String(err) });
 		}
-		this.#btwController.dispose();
 
 		// Emit shutdown event to hooks
 		this.session.setSdkPlanModeHandler(null);
@@ -2028,7 +2033,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#btwController.hasOpenPanel();
 	}
 
-	handleBtwFollowUp(question: string): Promise<"accepted" | "busy" | "closed"> {
+	handleBtwFollowUp(question: string): Promise<"accepted" | "busy" | "closed" | "rejected"> {
 		return this.#btwController.submitFollowUp(question);
 	}
 

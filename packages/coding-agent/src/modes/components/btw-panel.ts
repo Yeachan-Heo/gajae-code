@@ -1,4 +1,5 @@
 import { type Component, Container, Markdown, Spacer, Text, type TUI } from "@gajae-code/tui";
+import { BTW_MAX_ANSWER_UTF8_BYTES, BTW_MAX_CONTEXT_TURNS, truncateUtf8 } from "../../session/btw-contract";
 import { replaceTabs } from "../../tools/render-utils";
 import { getMarkdownTheme, theme } from "../theme/theme";
 import { DynamicBorder } from "./dynamic-border";
@@ -37,6 +38,7 @@ export class BtwPanelComponent extends Container {
 	beginTurn(question: string): void {
 		if (this.#closed) return;
 		this.#completedTurns.push(this.#currentTurn());
+		if (this.#completedTurns.length > BTW_MAX_CONTEXT_TURNS) this.#completedTurns.shift();
 		this.#question = question;
 		this.#answer = "";
 		this.#errorMessage = undefined;
@@ -46,13 +48,13 @@ export class BtwPanelComponent extends Container {
 
 	appendText(delta: string): void {
 		if (!delta || this.#closed) return;
-		this.#answer += delta;
+		this.#answer = truncateUtf8(this.#answer + delta, BTW_MAX_ANSWER_UTF8_BYTES);
 		this.#updateStreamingContent();
 	}
 
 	setAnswer(text: string): void {
 		if (this.#closed) return;
-		this.#answer = text;
+		this.#answer = truncateUtf8(text, BTW_MAX_ANSWER_UTF8_BYTES);
 		this.#updateStreamingContent();
 	}
 
@@ -154,6 +156,7 @@ export class BtwPanelComponent extends Container {
 			const waiting = state === "running" ? `${theme.status.pending} Waiting for response…` : "No text returned.";
 			return new Text(theme.fg("dim", waiting), 1, 0);
 		}
+		if (state === "running") return new Text(text, 1, 0);
 		return new Markdown(text, 1, 0, getMarkdownTheme());
 	}
 }

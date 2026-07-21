@@ -754,9 +754,11 @@ export class InputController {
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 		if (this.ctx.hasActiveBtw()) {
 			if (!text) return;
-			if (text === "." || text === "c") {
-				if ((await this.ctx.handleBtwFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
+			if (!text.startsWith("/")) {
+				const result = await this.ctx.handleBtwFollowUp(text);
+				if (result === "accepted" && this.#canModifyComposer(composer)) {
 					this.ctx.editor.setText("");
+					this.ctx.pendingImages = [];
 				}
 				return;
 			}
@@ -803,7 +805,6 @@ export class InputController {
 		}
 
 		if (!text) return;
-		const wasSlashOrigin = text.startsWith("/");
 
 		// Handle built-in slash commands
 		const slashResult = await executeBuiltinSlashCommand(text, {
@@ -817,13 +818,6 @@ export class InputController {
 		if (typeof slashResult === "string") {
 			// Command handled but returned remaining text to use as prompt
 			text = slashResult;
-		}
-
-		if (this.ctx.hasActiveBtw() && !wasSlashOrigin) {
-			if ((await this.ctx.handleBtwFollowUp(text)) === "accepted" && this.#canModifyComposer(composer)) {
-				this.ctx.editor.setText("");
-			}
-			return;
 		}
 
 		// Handle skill commands (/skill:name [args]). While streaming, Enter

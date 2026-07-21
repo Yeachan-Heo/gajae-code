@@ -147,6 +147,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:prepareContributionPrep": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setResourceSampler": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setRetainedMemorySampler": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:createBtwConversationScope":
+		"internal privacy-scoped side-chat snapshot factory, not a user-facing SDK control seam",
 	"agent_session:recordBashResult": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:executePython": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:assertEvalExecutionAllowed": "internal accessor/plumbing, not a user-facing control seam",

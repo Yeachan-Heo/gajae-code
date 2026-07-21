@@ -26,6 +26,7 @@ function makeHarness(runEphemeralTurn: () => Promise<unknown>): Harness {
 	const session = {
 		model: { provider: "anthropic", id: "test" },
 		runEphemeralTurn,
+		createBtwConversationScope: vi.fn(() => ({ messages: [], systemPrompt: [] })),
 		isStreaming: false,
 		isBashRunning: false,
 		isEvalRunning: false,

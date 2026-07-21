@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentMessage } from "@gajae-code/agent-core";
-import type { AssistantMessage, Usage } from "@gajae-code/ai";
+import type { AssistantMessage, Context, Usage } from "@gajae-code/ai";
 import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { RawSseDebugBuffer } from "@gajae-code/coding-agent/debug/raw-sse-buffer";
@@ -66,8 +66,15 @@ function createHarness(
 	snapshots: AgentMessage[][];
 	registry: AgentRegistry;
 	rawSseDebugBuffer: RawSseDebugBuffer;
+	providerContexts: Context[];
 } {
-	const model = createMockModel({ handler: () => ({ content: ["ephemeral reply"] }) });
+	const providerContexts: Context[] = [];
+	const model = createMockModel({
+		handler: context => {
+			providerContexts.push(structuredClone(context));
+			return { content: ["ephemeral reply"] };
+		},
+	});
 	const snapshots: AgentMessage[][] = [];
 	const registry = new AgentRegistry();
 	const rawSseDebugBuffer = new RawSseDebugBuffer();
@@ -100,12 +107,12 @@ function createHarness(
 		rawSseDebugBuffer,
 	});
 	sessions.push(session);
-	return { session, model, snapshots, registry, rawSseDebugBuffer };
+	return { session, model, snapshots, registry, rawSseDebugBuffer, providerContexts };
 }
 
 describe("AgentSession ephemeral context", () => {
 	it("replays only text-visible retained exchanges without mutating session history", async () => {
-		const { session, model, snapshots } = createHarness();
+		const { session, model, snapshots, providerContexts } = createHarness();
 		const contextExchanges = [
 			{ question: "first question", answer: "first answer" },
 			{ question: "second question", answer: "second answer" },
@@ -113,17 +120,22 @@ describe("AgentSession ephemeral context", () => {
 		const contextBefore = structuredClone(contextExchanges);
 		const sessionBefore = structuredClone(session.messages);
 
-		await session.runEphemeralTurn({ purpose: "btw", promptText: "current prompt", contextExchanges });
+		await session.runEphemeralTurn({
+			purpose: "btw",
+			question: "current prompt",
+			scope: session.createBtwConversationScope("btw test instruction"),
+			contextExchanges,
+		});
 
-		expect(snapshots).toHaveLength(1);
-		expect(snapshots[0]?.map(message => `${message.role}:${text(message)}`)).toEqual([
+		expect(snapshots).toEqual([]);
+		expect(providerContexts[0]?.messages.map(message => `${message.role}:${text(message as AgentMessage)}`)).toEqual([
 			"user:first question",
 			"assistant:first answer",
 			"user:second question",
 			"assistant:second answer",
 			"user:current prompt",
 		]);
-		expect(JSON.stringify(snapshots[0])).not.toContain("thinking");
+		expect(JSON.stringify(providerContexts[0]?.messages)).not.toContain("thinking");
 		expect(contextExchanges).toEqual(contextBefore);
 		expect(session.messages).toEqual(sessionBefore);
 		expect(model.calls[0]?.context.tools).toEqual([]);
@@ -138,7 +150,8 @@ describe("AgentSession ephemeral context", () => {
 
 		await session.runEphemeralTurn({
 			purpose: "btw",
-			promptText: "private current prompt",
+			question: "private current prompt",
+			scope: session.createBtwConversationScope("btw test instruction"),
 			contextExchanges: [{ question: "private prior question", answer: "private prior answer" }],
 		});
 

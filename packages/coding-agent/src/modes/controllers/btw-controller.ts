@@ -1,17 +1,23 @@
-import { prompt } from "@gajae-code/utils";
 import btwUserPrompt from "../../prompts/system/btw-user.md" with { type: "text" };
-import type { EphemeralTextExchange } from "../../session/agent-session";
+import type { BtwConversationScope } from "../../session/agent-session";
+import {
+	BTW_MAX_QUESTION_UTF8_BYTES,
+	type BtwTextExchange,
+	boundBtwExchanges,
+	utf8ByteLength,
+} from "../../session/btw-contract";
 import { BtwPanelComponent } from "../components/btw-panel";
 import type { InteractiveModeContext } from "../types";
 
-type BtwFollowUpResult = "accepted" | "busy" | "closed";
+type BtwFollowUpResult = "accepted" | "busy" | "closed" | "rejected";
 
 interface BtwRequest {
 	component: BtwPanelComponent;
 	abortController: AbortController | undefined;
+	scope: BtwConversationScope | undefined;
 	question: string;
 	inFlight: boolean;
-	contextExchanges: EphemeralTextExchange[];
+	contextExchanges: BtwTextExchange[];
 }
 
 export class BtwController {
@@ -46,15 +52,14 @@ export class BtwController {
 			this.ctx.showStatus("A /btw chat is already open. Type a follow-up or press Esc to return to the main chat.");
 			return;
 		}
-
 		const trimmedQuestion = question.trim();
 		if (!trimmedQuestion) {
 			this.ctx.showStatus("Usage: /btw <question>");
 			return;
 		}
-		if (!this.#hasModel()) return;
-
-		const request = this.#openRequest(trimmedQuestion);
+		if (!this.#acceptQuestion(trimmedQuestion) || !this.#hasModel()) return;
+		const scope = this.ctx.session.createBtwConversationScope(btwUserPrompt);
+		const request = this.#openRequest(trimmedQuestion, scope);
 		void this.#runRequest(request);
 	}
 
@@ -65,11 +70,10 @@ export class BtwController {
 			this.ctx.showStatus("The /btw chat is still answering. Wait for it to finish.");
 			return "busy";
 		}
-
 		const trimmedQuestion = question.trim();
 		if (!trimmedQuestion) return "closed";
-		if (!this.#hasModel()) return "closed";
-
+		if (!this.#acceptQuestion(trimmedQuestion)) return "rejected";
+		if (!request.scope) return "closed";
 		request.question = trimmedQuestion;
 		request.abortController = new AbortController();
 		request.inFlight = true;
@@ -78,16 +82,23 @@ export class BtwController {
 		return "accepted";
 	}
 
+	#acceptQuestion(question: string): boolean {
+		if (utf8ByteLength(question) <= BTW_MAX_QUESTION_UTF8_BYTES) return true;
+		this.ctx.showError(`/btw questions are limited to ${BTW_MAX_QUESTION_UTF8_BYTES} UTF-8 bytes.`);
+		return false;
+	}
+
 	#hasModel(): boolean {
 		if (this.ctx.session.model) return true;
 		this.ctx.showError("No active model available for /btw.");
 		return false;
 	}
 
-	#openRequest(question: string): BtwRequest {
+	#openRequest(question: string, scope: BtwConversationScope): BtwRequest {
 		const request: BtwRequest = {
 			component: new BtwPanelComponent({ question, tui: this.ctx.ui }),
 			abortController: new AbortController(),
+			scope,
 			question,
 			inFlight: true,
 			contextExchanges: [],
@@ -101,13 +112,14 @@ export class BtwController {
 
 	async #runRequest(request: BtwRequest): Promise<void> {
 		const abortController = request.abortController;
-		if (!abortController) return;
+		const scope = request.scope;
+		if (!abortController || !scope) return;
 		const question = request.question;
 		try {
-			const promptText = prompt.render(btwUserPrompt, { question });
 			const { replyText } = await this.ctx.session.runEphemeralTurn({
 				purpose: "btw",
-				promptText,
+				question,
+				scope,
 				contextExchanges: request.contextExchanges.map(exchange => ({ ...exchange })),
 				onTextDelta: delta => {
 					if (this.#isActiveRequest(request)) request.component.appendText(delta);
@@ -116,7 +128,7 @@ export class BtwController {
 			});
 			if (!this.#isActiveRequest(request)) return;
 			request.inFlight = false;
-			request.contextExchanges.push({ question, answer: replyText });
+			request.contextExchanges = boundBtwExchanges([...request.contextExchanges, { question, answer: replyText }]);
 			if (replyText) request.component.setAnswer(replyText);
 			request.component.markComplete();
 		} catch (error) {
@@ -127,7 +139,10 @@ export class BtwController {
 				return;
 			}
 			const message = error instanceof Error ? error.message : String(error);
-			request.contextExchanges.push({ question, answer: `Error: ${message}` });
+			request.contextExchanges = boundBtwExchanges([
+				...request.contextExchanges,
+				{ question, answer: `Error: ${message}` },
+			]);
 			request.component.markError(message);
 		}
 	}
@@ -141,6 +156,11 @@ export class BtwController {
 		request.question = "";
 		request.contextExchanges.splice(0);
 		request.inFlight = false;
+		if (request.scope) {
+			request.scope.messages.splice(0);
+			request.scope.systemPrompt.splice(0);
+			request.scope = undefined;
+		}
 		abortController?.abort();
 		request.component.close();
 		this.ctx.btwContainer.clear();

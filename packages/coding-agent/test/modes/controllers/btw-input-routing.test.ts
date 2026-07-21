@@ -1,10 +1,13 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { CustomEditor } from "@gajae-code/coding-agent/modes/components/custom-editor";
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
+import { getEditorTheme, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 
 beforeAll(async () => {
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
+	await initTheme();
 });
 
 function createHarness(options: { btwOpen?: boolean; accepted?: boolean; streaming?: boolean } = {}) {
@@ -112,12 +115,42 @@ describe("InputController /btw multi-turn routing", () => {
 		expect(closed.handleBtwFollowUp).not.toHaveBeenCalled();
 	});
 
+	it("captures private side text and images before extension input observers", async () => {
+		const harness = createHarness({ btwOpen: true });
+		const emitInput = vi.fn(async () => undefined);
+		const mutable = harness.ctx as unknown as {
+			pendingImages: unknown[];
+			session: { extensionRunner: { hasHandlers: () => boolean; emitInput: typeof emitInput } };
+		};
+		mutable.pendingImages = [{ type: "image", data: "PRIVATE_IMAGE_SENTINEL", mimeType: "image/png" }];
+		mutable.session.extensionRunner = { hasHandlers: () => true, emitInput };
+
+		await submit(harness, "PRIVATE_SIDE_TEXT_SENTINEL");
+
+		expect(harness.handleBtwFollowUp).toHaveBeenCalledWith("PRIVATE_SIDE_TEXT_SENTINEL");
+		expect(emitInput).not.toHaveBeenCalled();
+		expect(mutable.pendingImages).toEqual([]);
+	});
+
 	it("preserves the draft when a /btw follow-up is busy", async () => {
 		const harness = createHarness({ btwOpen: true, accepted: false });
 		await submit(harness, "wait for the current answer");
 		expect(harness.handleBtwFollowUp).toHaveBeenCalledWith("wait for the current answer");
 		expect(harness.editor.getText()).toBe("wait for the current answer");
 		expect(harness.onInputCallback).not.toHaveBeenCalled();
+	});
+
+	it("preserves a busy follow-up in the real editor composer", async () => {
+		const harness = createHarness({ btwOpen: true, accepted: false });
+		const editor = new CustomEditor(getEditorTheme());
+		(harness.ctx as unknown as { editor: CustomEditor }).editor = editor;
+		new InputController(harness.ctx).setupEditorSubmitHandler();
+		editor.setText("REAL_EDITOR_BUSY_SENTINEL");
+
+		await editor.onSubmit?.("REAL_EDITOR_BUSY_SENTINEL");
+
+		expect(harness.handleBtwFollowUp).toHaveBeenCalledWith("REAL_EDITOR_BUSY_SENTINEL");
+		expect(editor.getText()).toBe("REAL_EDITOR_BUSY_SENTINEL");
 	});
 
 	it("keeps slash-origin input on normal dispatch, including a prompt-returning command", async () => {

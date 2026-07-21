@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it, vi } from "bun:test";
 import { BtwPanelComponent } from "@gajae-code/coding-agent/modes/components/btw-panel";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { BTW_MAX_CONTEXT_TURNS } from "@gajae-code/coding-agent/session/btw-contract";
 import type { Component, TUI } from "@gajae-code/tui";
 
 beforeAll(async () => {
@@ -60,5 +61,19 @@ describe("BtwPanelComponent retained rendering", () => {
 		panel.close();
 		panel.appendText("should be ignored");
 		expect(renderTree(panel)).not.toContain("should be ignored");
+	});
+
+	it("keeps only the newest bounded turn window", () => {
+		const panel = new BtwPanelComponent({ question: "q0", tui: makeTui() });
+		panel.setAnswer("a0");
+		panel.markComplete();
+		for (let index = 1; index <= BTW_MAX_CONTEXT_TURNS + 2; index += 1) {
+			panel.beginTurn(`q${index}`);
+			panel.setAnswer(`a${index}`);
+			panel.markComplete();
+		}
+		const rendered = renderTree(panel);
+		expect(rendered).not.toContain("q0");
+		expect(rendered).toContain(`q${BTW_MAX_CONTEXT_TURNS + 2}`);
 	});
 });
