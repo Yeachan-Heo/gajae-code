@@ -591,8 +591,15 @@ function ownershipLockMatchesState(lock: OwnershipLockRead, state: DaemonState |
 	);
 }
 
-function ownershipLockMatchesStoppedState(lock: OwnershipLockRead, state: DaemonState | undefined): boolean {
-	return Boolean(state && isExplicitlyStoppedDaemonState(state) && ownershipLockMatchesState(lock, state));
+function ownershipLockMatchesStoppedState(lock: OwnershipLockRead, state: unknown): boolean {
+	if (isExplicitlyStoppedDaemonState(state)) return ownershipLockMatchesState(lock, state);
+	if (!isLegacyStoppedDaemonState(state) || lock.kind !== "legacy") return false;
+	const legacyState = state as Pick<DaemonState, "pid" | "startedAt"> & { stoppedAt: number };
+	return (
+		lock.metadata.pid === legacyState.pid &&
+		lock.metadata.startedAt <= legacyState.startedAt &&
+		legacyState.startedAt <= legacyState.stoppedAt
+	);
 }
 
 async function transitionLockIsHeldByCaller(input: {

@@ -616,6 +616,65 @@ export async function ensureManagedScope(scope: ManagedScope): Promise<ManagedSc
 	}
 }
 
+/**
+ * Re-apply owner-only security to every descendant of a managed scope directory.
+ *
+ * A managed scope can accumulate group/other-readable descendants when a
+ * different code path writes into it without the secured managed-storage
+ * helpers — notably the resident-cache `EphemeralBlobStore` created on the
+ * explicit session path. The managed-tree snapshot fails closed on the first
+ * such descendant (`mode_mismatch`), which would otherwise abort launch with an
+ * uncaught exception. Re-securing the tree in place lets a drifted scope
+ * recover on the next launch instead of trapping the user behind a fatal error.
+ */
+function reapplyOwnerOnlyManagedTree(directory: string): void {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(directory, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		const child = path.join(directory, entry.name);
+		let stat: fs.Stats;
+		try {
+			stat = fs.lstatSync(child);
+		} catch {
+			continue;
+		}
+		if (stat.isSymbolicLink()) continue;
+		if (stat.isDirectory()) {
+			reapplyOwnerOnlyManagedTree(child);
+			try {
+				native.applyOwnerOnlyPathSecurity(child, "directory");
+			} catch {
+				// Best-effort: the managed-tree snapshot re-verifies and reports genuine failures.
+			}
+		} else if (stat.isFile()) {
+			try {
+				native.applyOwnerOnlyPathSecurity(child, "file");
+			} catch {
+				// Best-effort, as above.
+			}
+		}
+	}
+	try {
+		native.applyOwnerOnlyPathSecurity(directory, "directory");
+	} catch {
+		// Best-effort, as above.
+	}
+}
+
+/**
+ * True when a managed setup error reflects a fixable owner-only *mode* drift
+ * (group/other permission bits) rather than an ownership or identity change.
+ * Only mode drift can be self-healed by re-applying owner-only permissions.
+ */
+function isRecoverableOwnerOnlyModeDrift(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : "";
+	return message === "mode_mismatch" || message.endsWith(": mode_mismatch");
+}
+
 /** Synchronously create and validate the v2 binding before a default session writer exists. */
 export function prepareManagedSessionScopeForWriteSync(scope: ManagedScope): ManagedScopeResolution {
 	try {
@@ -629,11 +688,23 @@ export function prepareManagedSessionScopeForWriteSync(scope: ManagedScope): Man
 			dev: preparedDirectory.dev,
 			ino: preparedDirectory.ino,
 		});
-		const store = new ManagedSessionDescendantStore(
-			root,
-			scope.directoryPath,
-			retainedAuthority ? { authority: retainedAuthority, authorityBaseDir: scope.directoryPath } : undefined,
-		);
+		const buildStore = () =>
+			new ManagedSessionDescendantStore(
+				root,
+				scope.directoryPath,
+				retainedAuthority ? { authority: retainedAuthority, authorityBaseDir: scope.directoryPath } : undefined,
+			);
+		let store: ManagedSessionDescendantStore;
+		try {
+			store = buildStore();
+		} catch (error) {
+			if (!isRecoverableOwnerOnlyModeDrift(error)) throw error;
+			// A prior writer left group/other-readable descendants under the scope
+			// (e.g. resident-cache blobs written on the explicit session path).
+			// Re-secure the tree in place and retry once before failing closed.
+			reapplyOwnerOnlyManagedTree(scope.directoryPath);
+			store = buildStore();
+		}
 		const binding = new TextEncoder().encode(`${JSON.stringify(bindingFor(scope))}\n`);
 		try {
 			store.publishNoReplaceSync(MANAGED_SESSION_BINDING_FILE, binding);

@@ -21,7 +21,8 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * confirmed-dead owner's lock in generation 10, legacy stopped-tombstone
  * reclamation in generation 11, force-escalated SIGKILL of an unresponsive
  * older-generation owner during automatic generation-upgrade reload in
- * generation 12, and restored macOS daemon signaling (kill(2) with a start-time
- * incarnation recheck, replacing the darwin no-op) in generation 13.
+ * generation 12, restored macOS daemon signaling (kill(2) with a start-time
+ * incarnation recheck, replacing the darwin no-op) in generation 13, and
+ * retained legacy stopped-lock reclamation in generation 14.
  */
-export const DAEMON_GENERATION = 13;
+export const DAEMON_GENERATION = 14;

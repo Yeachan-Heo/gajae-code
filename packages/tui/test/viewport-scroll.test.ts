@@ -343,7 +343,7 @@ describe("TUI manual viewport paging", () => {
 });
 
 describe("registered viewport anchor", () => {
-	it("blocks excluded PageDown targets and preserves transcript rows through contraction", async () => {
+	it("pages through excluded rows and reacquires transcript anchoring", async () => {
 		const envKeys = [
 			"SSH_CONNECTION",
 			"TERM",
@@ -393,7 +393,30 @@ describe("registered viewport anchor", () => {
 				"transient-1",
 			]);
 			term.clearWriteLog();
-			expect(tui.scrollViewportPages(1)).toBe(false);
+			expect(tui.scrollViewportPages(1)).toBe(true);
+			await term.flush();
+			expect(visible(term)).toEqual([
+				"transient-1",
+				"transient-2",
+				"transient-3",
+				"transient-4",
+				"transient-5",
+				"synthetic-0",
+			]);
+
+			transient.setLine(3, "transient-3 live");
+			tui.requestRender();
+			await settle(term);
+			expect(visible(term)).toEqual([
+				"transient-1",
+				"transient-2",
+				"transient-3 live",
+				"transient-4",
+				"transient-5",
+				"synthetic-0",
+			]);
+
+			expect(tui.scrollViewportPages(-1)).toBe(true);
 			await term.flush();
 			expect(visible(term)).toEqual([
 				"transcript-8",

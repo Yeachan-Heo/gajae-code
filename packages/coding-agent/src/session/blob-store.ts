@@ -5,6 +5,18 @@ import { isEnoent, logger } from "@gajae-code/utils";
 
 const BLOB_PREFIX = "blob:sha256:";
 
+/**
+ * Owner-only permissions for on-disk blob directories and files.
+ *
+ * Blob stores can live inside a managed session scope (e.g. the resident-cache
+ * `EphemeralBlobStore` created on the explicit session path). The managed-tree
+ * snapshot fails closed unless every descendant is owner-only, so blobs and
+ * their directories MUST be created 0700/0600 rather than inheriting a
+ * group/other-readable mode from the process umask.
+ */
+const BLOB_DIR_MODE = 0o700;
+const BLOB_FILE_MODE = 0o600;
+
 export interface BlobPutResult {
 	hash: string;
 	path: string;
@@ -113,6 +125,7 @@ export class BlobStore {
 		};
 
 		await Bun.write(blobPath, data);
+		await fsp.chmod(blobPath, BLOB_FILE_MODE);
 		return result;
 	}
 
@@ -131,8 +144,8 @@ export class BlobStore {
 				return `${BLOB_PREFIX}${hash}`;
 			},
 		};
-		fs.mkdirSync(this.dir, { recursive: true });
-		fs.writeFileSync(blobPath, data);
+		fs.mkdirSync(this.dir, { recursive: true, mode: BLOB_DIR_MODE });
+		fs.writeFileSync(blobPath, data, { mode: BLOB_FILE_MODE });
 		return result;
 	}
 
@@ -147,7 +160,7 @@ export class BlobStore {
 		const hash = sha256Hex(data);
 		const blobPath = path.join(this.dir, hash);
 		const result = makeBlobPutResult(hash, blobPath, data.byteLength);
-		fs.mkdirSync(this.dir, { recursive: true });
+		fs.mkdirSync(this.dir, { recursive: true, mode: BLOB_DIR_MODE });
 
 		if (fs.existsSync(blobPath)) {
 			verifyBlobFileSync(hash, blobPath);
@@ -156,7 +169,7 @@ export class BlobStore {
 
 		const tempPath = uniqueTempBlobPath(this.dir, hash);
 		try {
-			const fd = fs.openSync(tempPath, "wx");
+			const fd = fs.openSync(tempPath, "wx", BLOB_FILE_MODE);
 			try {
 				fs.writeFileSync(fd, data);
 				fs.fsyncSync(fd);
@@ -274,7 +287,7 @@ export class EphemeralBlobStore extends BlobStore {
 	constructor(dir: string) {
 		super(dir);
 		fs.rmSync(dir, { recursive: true, force: true });
-		fs.mkdirSync(dir, { recursive: true });
+		fs.mkdirSync(dir, { recursive: true, mode: BLOB_DIR_MODE });
 	}
 
 	#cachePut(hash: string, data: Buffer): void {
@@ -333,7 +346,7 @@ export class EphemeralBlobStore extends BlobStore {
 		this.#bufferCache.clear();
 		this.#bufferCacheBytes = 0;
 		fs.rmSync(this.dir, { recursive: true, force: true });
-		fs.mkdirSync(this.dir, { recursive: true });
+		fs.mkdirSync(this.dir, { recursive: true, mode: BLOB_DIR_MODE });
 	}
 
 	dispose(): void {

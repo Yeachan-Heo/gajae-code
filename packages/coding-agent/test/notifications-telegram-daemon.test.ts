@@ -924,6 +924,44 @@ describe("telegram daemon", () => {
 		).resolves.toMatchObject({ acquired: true, ownerId: "replacement" });
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).not.toHaveProperty("stoppedAt");
 	});
+	test.each([
+		["matching", { pid: 111, startedAt: 0 }, { acquired: true, ownerId: "replacement" }],
+		["newer-start-time", { pid: 111, startedAt: 3 }, { acquired: false, blocked: true }],
+		["different-pid", { pid: 112, startedAt: 0 }, { acquired: false, blocked: true }],
+	] as const)("handles a %s retained legacy lock without reclaiming a newer reservation", async (_case, lock, expected) => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				pid: 111,
+				ownerId: "legacy-stopped",
+				tokenFingerprint: "fp",
+				chatId: "42",
+				startedAt: 1,
+				heartbeatAt: 1,
+				stoppedAt: 2,
+				roots: [],
+				version: DAEMON_VERSION,
+			}),
+		);
+		fs.writeFileSync(paths.lock, JSON.stringify(lock));
+
+		await expect(
+			acquireDaemonOwnership({
+				settings: s,
+				tokenFingerprint: "fp",
+				chatId: "42",
+				pid: 222,
+				ownerId: "replacement",
+				pidAlive: pid => pid === lock.pid || pid === process.pid,
+				pidIncarnation: pid =>
+					pid === 222 ? "linux:101" : pid === process.pid ? `linux:${process.pid}` : undefined,
+			}),
+		).resolves.toMatchObject(expected);
+	});
 	test("keeps a live malformed legacy tombstone blocked when launcherPid is invalid", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -2016,9 +2054,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps the wire protocol at 3 while restored macOS daemon signaling uses generation 13", () => {
+	test("keeps the wire protocol at 3 while retained legacy stopped-lock reclamation uses generation 14", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(13);
+		expect(DAEMON_GENERATION).toBe(14);
 	});
 
 	test("#2028 acquire flags a reload for a live pre-upgrade owner missing the generation field", async () => {
