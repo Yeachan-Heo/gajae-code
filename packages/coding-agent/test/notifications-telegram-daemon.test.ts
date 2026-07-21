@@ -328,12 +328,24 @@ async function unavailableControlHarness(fsImpl?: TelegramDaemonFs) {
 	return { agentDir, bot, daemon, threadId };
 }
 
-type TopicAuthorityState = {
-	topics: Record<
-		string,
-		{ name?: string; nameOwner?: string; nameReconcilePending?: boolean; userNameUpdateId?: number }
-	>;
-};
+
+	type TopicAuthorityState = {
+		topics: Record<
+			string,
+			{
+				topicId?: string;
+				name?: string;
+				nameOwner?: string;
+				nameReconcilePending?: boolean;
+				userNameUpdateId?: number;
+				authorityState?: "active" | "delete_pending";
+				endpointDigest?: string;
+				endpointGeneration?: number;
+				replayGeneration?: number;
+				replaySeq?: number;
+			}>;
+		closedEndpoints?: Record<string, unknown>;
+	};
 
 async function readTopicAuthorityState(agentDir: string): Promise<TopicAuthorityState> {
 	return JSON.parse(
@@ -385,7 +397,15 @@ async function identityTopicHarness({
 		botApi: bot,
 		fs: fsImpl,
 	});
-	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	const session = {
+		sessionId: "S",
+		token: "tok",
+		endpointKey: "ws://s",
+		endpointDigest: "endpoint-digest",
+		hostGeneration: 1,
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
 	await daemon.handleSessionMessage(session as never, {
 		type: "identity_header",
 		sessionId: "S",
@@ -4139,7 +4159,7 @@ describe("telegram daemon", () => {
 			type: "event_replay",
 			id: "telegram-startup-replay:S",
 			sinceGeneration: 1,
-			sinceSeq: 4,
+			sinceSeq: 0,
 		});
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
 			type: "event_replay_result",
@@ -4329,7 +4349,7 @@ describe("telegram daemon", () => {
 		).toBe(true);
 	});
 
-	test("model aliases cannot cross a same-socket logical-session rekey", async () => {
+	test("untrusted config updates cannot rekey a transport session", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
 		const bot = new FakeBotApi();
@@ -4352,9 +4372,6 @@ describe("telegram daemon", () => {
 			message: "Select a model.",
 			modelChoices: [{ selector: "provider/old", label: "Old" }],
 		});
-		const staleAlias = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup)!.body
-			.reply_markup.inline_keyboard[0][0].callback_data;
-
 		await daemon.handleSessionMessage(session, {
 			type: "config_update",
 			sessionId: "new-logical",
@@ -4367,40 +4384,42 @@ describe("telegram daemon", () => {
 		});
 		expect(JSON.parse(FakeWs.instances[0]!.sent[0]!)).toMatchObject({
 			type: "control_command",
-			sessionId: "new-logical",
+			sessionId: "transport",
 			command: { name: "usage" },
 		});
-		FakeWs.instances[0]!.sent = [];
-		await daemon.handleTelegramUpdate({
-			update_id: 20,
-			callback_query: { id: "old-menu", data: staleAlias, message: { chat: { id: 42 } } },
-		});
-		expect(FakeWs.instances[0]!.sent).toHaveLength(0);
-		expect(
-			bot.calls.some(
-				call => call.method === "answerCallbackQuery" && call.body.text === "Button is stale. Run /model again.",
-			),
-		).toBe(true);
+	});
 
-		await daemon.handleSessionMessage(session, {
-			type: "control_command_result",
-			sessionId: "new-logical",
-			requestId: "tg:model:new",
-			status: "ok",
-			message: "Select a model.",
-			modelChoices: [{ selector: "provider/new", label: "New" }],
+	test.each([
+		["malformed", { generation: 0, lastSeq: 0, events: [] }],
+		[
+			"conflicting identity",
+			{
+				generation: 1,
+				lastSeq: 0,
+				events: [
+					{ payload: { type: "identity_header", sessionId: "canonical" } },
+					{ payload: { type: "identity_header", sessionId: "conflict" } },
+				],
+			},
+		],
+	] as const)("%s replay rejects queued config rekeys before draining", async (_name, replay) => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const daemon = new TelegramNotificationDaemon({
+			settings: setPrivateAgentDir(settings(agentDir), agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: new FakeBotApi(),
+			WebSocketImpl: FakeWs as any,
 		});
-		const freshAlias = bot.calls.filter(call => call.method === "sendMessage" && call.body.reply_markup).at(-1)!.body
-			.reply_markup.inline_keyboard[0][0].callback_data;
-		await daemon.handleTelegramUpdate({
-			update_id: 21,
-			callback_query: { id: "new-menu", data: freshAlias, message: { chat: { id: 42 } } },
-		});
-		expect(JSON.parse(FakeWs.instances[0]!.sent[0]!)).toMatchObject({
-			type: "control_command",
-			sessionId: "new-logical",
-			command: { name: "model", action: "set", selector: "provider/new" },
-		});
+		daemon.connectSession("transport", "ws://transport", "tt");
+		const session = daemon.sessions.get("transport")!;
+		(session.ws as unknown as FakeWs).dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(session, { type: "config_update", sessionId: "untrusted" });
+		await daemon.handleSessionMessage(session, { type: "event_replay_result", id: session.replayId, ...replay });
+		expect(daemon.sessions.has("transport")).toBe(false);
+		expect((daemon as any).topics.get("untrusted")).toBeUndefined();
 	});
 
 	test("model aliases expire after ten minutes using the injected daemon clock", async () => {
@@ -4497,6 +4516,80 @@ describe("telegram daemon", () => {
 			command: { name: "model", action: "set", selector: "provider/fresh" },
 		});
 	});
+
+test("a superseded model-menu creation sends neither a menu nor a threaded delivery", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const createStarted = Promise.withResolvers<void>();
+	const releaseCreate = Promise.withResolvers<unknown>();
+	const originalCall = bot.call.bind(bot);
+	bot.call = async (method, body, options) => {
+		if (method === "createForumTopic") {
+			bot.calls.push({ method, body, options });
+			createStarted.resolve();
+			return releaseCreate.promise;
+		}
+		return originalCall(method, body, options);
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: setPrivateAgentDir(settings(agentDir), agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		rich: { enabled: false },
+		WebSocketImpl: FakeWs as any,
+	});
+	daemon.connectSession("S", "ws://predecessor", "old");
+	const predecessor = daemon.sessions.get("S")!;
+	const rendering = daemon.handleSessionMessage(predecessor, {
+		type: "control_command_result",
+		sessionId: "S",
+		requestId: "tg:model:race",
+		status: "ok",
+		message: "Select a model.",
+		modelChoices: [{ selector: "provider/race", label: "Race" }],
+	});
+	await createStarted.promise;
+	daemon.connectSession("S", "ws://successor", "new");
+	releaseCreate.resolve({ ok: true, result: { message_thread_id: 79 } });
+	await expect(rendering).rejects.toThrow("topic authority was revoked during creation");
+
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+	expect(bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id)).toEqual([79]);
+	expect((daemon as any).topics.get("S")).toBeUndefined();
+});
+
+test("a trusted recovered model menu creates a bound topic and delivers its choices", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = recoveryDaemon(agentDir, bot);
+	await replayResumedIdentity(daemon, "TRANSPORT", "LOGICAL", { url: "ws://recovered", token: "trusted", generation: 4 });
+	const session = daemon.sessions.get("TRANSPORT")!;
+	(daemon as any).topics.delete("LOGICAL");
+	bot.calls.length = 0;
+	await daemon.handleSessionMessage(session, {
+		type: "control_command_result",
+		sessionId: "LOGICAL",
+		requestId: "tg:model:recovered",
+		status: "ok",
+		message: "Select a model.",
+		modelChoices: [{ selector: "provider/recovered", label: "Recovered" }],
+	});
+	const menu = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup);
+	expect(menu).toBeTruthy();
+	const persisted = await readTopicAuthorityState(agentDir);
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+	expect(persisted.topics.LOGICAL).toMatchObject({
+		chatId: "42",
+		endpointKey: session.endpointKey,
+		endpointDigest: endpointAuthorityDigest("ws://recovered", "trusted"),
+		endpointGeneration: 4,
+	});
+	expect(menu!.body.message_thread_id).toBe(Number(persisted.topics.LOGICAL.topicId));
+});
 
 	test("failed model keyboard delivery falls back to the generic control result", async () => {
 		FakeWs.instances = [];
@@ -5494,17 +5587,12 @@ describe("telegram daemon", () => {
 		});
 		releaseSelected.resolve({ ok: true, result: { message_id: 88 } });
 		await request;
+		// The dropped socket's immutable lease is revoked immediately, so completion
+		// cannot emit a stale WebSocket acknowledgement after its replacement wins.
 		const results = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).filter(
 			frame => frame.type === "ask_selected_ack_result" && frame.requestId === "ack-drop",
 		);
-		expect(results).toEqual([
-			{
-				type: "ask_selected_ack_result",
-				requestId: "ack-drop",
-				commitKey: "commit-drop",
-				outcome: { status: "unknown", reason: "transport_ambiguous" },
-			},
-		]);
+		expect(results).toEqual([]);
 	});
 
 	test("cancels a drained acknowledgement before the Telegram application attempt", async () => {
@@ -5784,7 +5872,7 @@ describe("telegram daemon", () => {
 		const sent = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame));
 		expect(sent.some(frame => frame.type === "ephemeral_turn" || frame.type === "user_message")).toBe(false);
 	});
-	test("/btw result retains its transport topic ownership after a logical-session rekey", async () => {
+	test("routes /btw results through logical topic ownership after a session rekey", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
 		const bot = new FakeBotApi();
@@ -5807,6 +5895,21 @@ describe("telegram daemon", () => {
 		});
 		const threadId = bot.createdTopicThreadIds.at(-1)!;
 		await daemon.handleSessionMessage(daemon.sessions.get("S")!, { type: "config_update", sessionId: "rekeyed" });
+		const recovered = daemon.sessions.get("S")! as any;
+		recovered.logicalSessionId = "rekeyed";
+		recovered.logicalSessionIdTrusted = true;
+		recovered.hostGeneration = 1;
+		const binding = {
+			chatId: "42",
+			endpointKey: recovered.endpointKey,
+			endpointDigest: recovered.endpointDigest,
+			endpointGeneration: 1,
+		};
+		recovered.recoveryLease = { state: "authorized", logicalSessionId: "rekeyed", binding, token: 1 };
+		const internal = daemon as any;
+		internal.logicalSessionOwners.set("rekeyed", recovered);
+		internal.topics.delete("S");
+		await internal.topics.getOrCreateTopic("rekeyed", async () => String(threadId), Date.now, undefined, binding);
 		await daemon.handleTelegramUpdate({
 			update_id: 82,
 			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw rekey", message_id: 182 },
@@ -7658,6 +7761,458 @@ test("stale identity after loadTopics reuses the persisted repo branch owner", a
 	expect(Number(threadedSends[0])).toBeGreaterThan(0);
 });
 
+async function replayResumedIdentity(
+	daemon: TelegramNotificationDaemon,
+	transportSessionId: string,
+	logicalSessionId: string,
+	{ url = "ws://canonical", token = "canonical-token", generation = 1 } = {},
+): Promise<void> {
+	daemon.connectSession(transportSessionId, url, token);
+	const session = daemon.sessions.get(transportSessionId)!;
+	session.ws.dispatchEvent(new Event("open"));
+	await daemon.handleSessionMessage(session, {
+		type: "event_replay_result",
+		id: session.replayId,
+		generation,
+		lastSeq: 1,
+		events: [
+			{
+				payload: {
+					type: "identity_header",
+					sessionId: logicalSessionId,
+					repo: "gajae-code",
+					branch: "dev",
+					title: "Recovered session",
+				},
+			},
+		],
+	});
+}
+
+function recoveryDaemon(
+	agentDir: string,
+	bot: FakeBotApi,
+	chatId = "42",
+	fsImpl?: TelegramDaemonFs,
+): TelegramNotificationDaemon {
+	const daemonSettings =
+		chatId === "42"
+			? settings(agentDir)
+			: setPrivateAgentDir(
+					Settings.isolated({
+						"notifications.enabled": true,
+						"notifications.telegram.botToken": "123456:secret-token",
+						"notifications.telegram.chatId": chatId,
+						"notifications.daemon.idleTimeoutMs": 20,
+					}) as Settings,
+					agentDir,
+				);
+	return new TelegramNotificationDaemon({
+		settings: daemonSettings,
+		ownerId: "owner",
+		botToken: "tok",
+		chatId,
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		fs: fsImpl,
+	});
+}
+
+
+	test("authenticated resume resets a persisted generation-one replay cursor for a fresh endpoint incarnation", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const first = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(first, "CANONICAL", "CANONICAL", {
+			url: "ws://old-runtime",
+			token: "old-token",
+			generation: 1,
+		});
+		const originalTopicId = bot.createdTopicThreadIds[0]!;
+		const firstState = await readTopicAuthorityState(agentDir);
+		expect(firstState.topics.CANONICAL).toMatchObject({ replayGeneration: 1, replaySeq: 1 });
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+
+		bot.calls = [];
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		restarted.connectSession("CANONICAL", "ws://fresh-runtime", "fresh-token");
+		const fresh = restarted.sessions.get("CANONICAL")!;
+		fresh.ws.dispatchEvent(new Event("open"));
+		expect((fresh.ws as unknown as FakeWs).sent.map(frame => JSON.parse(frame))).toContainEqual({
+			type: "event_replay",
+			id: fresh.replayId,
+			sinceGeneration: 1,
+			sinceSeq: 0,
+		});
+		await restarted.handleSessionMessage(fresh, {
+			type: "event_replay_result",
+			id: fresh.replayId,
+			generation: 1,
+			lastSeq: 2,
+			events: [
+				{
+					payload: {
+						type: "identity_header",
+						sessionId: "CANONICAL",
+						repo: "gajae-code",
+						branch: "dev",
+						title: "Recovered session",
+					},
+				},
+			],
+		});
+		await restarted.handleSessionMessage(fresh, {
+			type: "turn_stream",
+			sessionId: "CANONICAL",
+			text: "Recovered output",
+		});
+
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+		const sends = bot.calls.filter(call => call.method === "sendMessage");
+		expect(sends).toHaveLength(1);
+		expect(sends[0]!.body.message_thread_id).toBe(originalTopicId);
+		const persisted = await readTopicAuthorityState(agentDir);
+		expect(persisted.topics.CANONICAL).toMatchObject({
+			endpointKey: expect.any(String),
+			endpointGeneration: 1,
+			endpointIncarnation: 1,
+			replayGeneration: 1,
+			replaySeq: 2,
+		});
+	});
+
+	test("persisted A and B topics keep A fail-closed through A-to-B recovery until A resumes", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const initial = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(initial, "A", "A", { url: "ws://a", token: "a" });
+		await replayResumedIdentity(initial, "B", "B", { url: "ws://b", token: "b" });
+		const [aTopic, bTopic] = bot.createdTopicThreadIds;
+		expect(aTopic).not.toBe(bTopic);
+
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		await replayResumedIdentity(restarted, "A", "B", { url: "ws://a-rekey", token: "rekey" });
+		const rekeyed = restarted.sessions.get("A")!;
+		const rekeyedWs = rekeyed.ws as unknown as FakeWs;
+		rekeyedWs.sent.length = 0;
+
+		bot.calls = [];
+		await restarted.handleTelegramUpdate({
+			update_id: 280_101,
+			message: { chat: { id: 42 }, message_thread_id: aTopic, message_id: 1, text: "must not hijack A" },
+		});
+		expect(rekeyedWs.sent).toEqual([]);
+		expect(bot.calls.filter(call => call.method === "setMessageReaction")).toHaveLength(0);
+
+		await replayResumedIdentity(restarted, "A-RETURN", "A", { url: "ws://a-return", token: "return" });
+		const returned = restarted.sessions.get("A-RETURN")!;
+		const returnedWs = returned.ws as unknown as FakeWs;
+		returnedWs.sent.length = 0;
+		await restarted.handleTelegramUpdate({
+			update_id: 280_102,
+			message: { chat: { id: 42 }, message_thread_id: aTopic, message_id: 2, text: "A routes after resume" },
+		});
+		expect(returnedWs.sent.map(frame => JSON.parse(frame))).toContainEqual(
+			expect.objectContaining({ type: "user_message", text: "A routes after resume" }),
+		);
+		const persisted = await readTopicAuthorityState(agentDir);
+		expect(persisted.topics).toMatchObject({ A: { topicId: String(aTopic) }, B: { topicId: String(bTopic) } });
+	});
+
+	test("authenticated fresh endpoint recovery rejects a concurrent active incumbent", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(daemon, "OLD", "CANONICAL", { url: "ws://old-runtime", token: "old-token" });
+		const originalTopicId = bot.createdTopicThreadIds[0]!;
+
+		bot.calls = [];
+		await replayResumedIdentity(daemon, "CONTENDER", "CANONICAL", {
+			url: "ws://fresh-runtime",
+			token: "fresh-token",
+			generation: 1,
+		});
+		await daemon.handleSessionMessage(daemon.sessions.get("CONTENDER")!, {
+			type: "turn_stream",
+			sessionId: "CANONICAL",
+			text: "must not deliver",
+		});
+
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+		expect(await readTopicAuthorityState(agentDir)).toMatchObject({ topics: { CANONICAL: { topicId: String(originalTopicId) } } });
+	});
+
+test("serializes concurrent endpoint recovery claims before durable publication", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const initial = recoveryDaemon(agentDir, bot);
+	await replayResumedIdentity(initial, "INITIAL", "CANONICAL", { url: "ws://old", token: "old" });
+
+	let releaseWrite!: () => void;
+	const writeReleased = new Promise<void>(resolve => (releaseWrite = resolve));
+	let writeReached!: () => void;
+	const writeBlocked = new Promise<void>(resolve => (writeReached = resolve));
+	let paused = true;
+	const restarted = recoveryDaemon(
+		agentDir,
+		bot,
+		"42",
+		topicStateFs(async () => {
+			if (!paused) return;
+			writeReached();
+			await writeReleased;
+		}),
+	);
+	await restarted.loadTopics();
+	const winner = replayResumedIdentity(restarted, "WINNER", "CANONICAL", {
+		url: "ws://winner",
+		token: "winner-token",
+	});
+	await writeBlocked;
+	const loser = replayResumedIdentity(restarted, "LOSER", "CANONICAL", {
+		url: "ws://loser",
+		token: "loser-token",
+	});
+	paused = false;
+	releaseWrite();
+	await Promise.all([winner, loser]);
+
+	bot.calls = [];
+	await restarted.handleSessionMessage(restarted.sessions.get("WINNER")!, {
+		type: "turn_stream",
+		sessionId: "CANONICAL",
+		text: "winner only",
+	});
+	await restarted.handleSessionMessage(restarted.sessions.get("LOSER")!, {
+		type: "turn_stream",
+		sessionId: "CANONICAL",
+		text: "loser must not route",
+	});
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
+	expect((await readTopicAuthorityState(agentDir)).topics.CANONICAL).toMatchObject({
+		endpointDigest: endpointAuthorityDigest("ws://winner", "winner-token"),
+	});
+
+	const afterRestart = recoveryDaemon(agentDir, bot);
+	await afterRestart.loadTopics();
+	await replayResumedIdentity(afterRestart, "RESTART", "CANONICAL", { url: "ws://winner", token: "winner-token" });
+	bot.calls = [];
+	await afterRestart.handleSessionMessage(afterRestart.sessions.get("RESTART")!, {
+		type: "turn_stream",
+		sessionId: "CANONICAL",
+		text: "durably winner only",
+	});
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
+});
+
+test("retries a failed recovery claim without publishing its endpoint", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const initial = recoveryDaemon(agentDir, bot);
+	await replayResumedIdentity(initial, "INITIAL", "CANONICAL", { url: "ws://old", token: "old" });
+	let failWrite = true;
+	const daemon = recoveryDaemon(
+		agentDir,
+		bot,
+		"42",
+		topicStateFs(async () => {
+			if (failWrite) throw new Error("simulated recovery persistence failure");
+		}),
+	);
+	await daemon.loadTopics();
+	await replayResumedIdentity(daemon, "FAILED", "CANONICAL", { url: "ws://failed", token: "failed-token" });
+	bot.calls = [];
+	await daemon.handleSessionMessage(daemon.sessions.get("FAILED")!, {
+		type: "turn_stream",
+		sessionId: "CANONICAL",
+		text: "must not route",
+	});
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+
+	failWrite = false;
+	await replayResumedIdentity(daemon, "RETRY", "CANONICAL", { url: "ws://retry", token: "retry-token" });
+	bot.calls = [];
+	await daemon.handleSessionMessage(daemon.sessions.get("RETRY")!, {
+		type: "turn_stream",
+		sessionId: "CANONICAL",
+		text: "retry routes",
+	});
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
+	expect((await readTopicAuthorityState(agentDir)).topics.CANONICAL).toMatchObject({
+		endpointDigest: endpointAuthorityDigest("ws://retry", "retry-token"),
+	});
+	const afterRestart = recoveryDaemon(agentDir, bot);
+	await afterRestart.loadTopics();
+	await replayResumedIdentity(afterRestart, "RESTART", "CANONICAL", { url: "ws://retry", token: "retry-token" });
+	bot.calls = [];
+	await afterRestart.handleSessionMessage(afterRestart.sessions.get("RESTART")!, {
+		type: "turn_stream",
+		sessionId: "CANONICAL",
+		text: "only durable retry routes",
+	});
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
+});
+
+
+test("a held successful recovery claim keeps live frames behind the replay barrier until durable authorization", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const initial = recoveryDaemon(agentDir, bot);
+	await replayResumedIdentity(initial, "INITIAL", "CANONICAL", { url: "ws://old", token: "old" });
+	let releaseWrite!: () => void;
+	const writeReleased = new Promise<void>(resolve => (releaseWrite = resolve));
+	let writeStarted!: () => void;
+	const writeBlocked = new Promise<void>(resolve => (writeStarted = resolve));
+	const daemon = recoveryDaemon(agentDir, bot, "42", topicStateFs(async () => {
+		writeStarted();
+		await writeReleased;
+	}));
+	await daemon.loadTopics();
+	daemon.connectSession("HELD", "ws://new", "new");
+	const held = daemon.sessions.get("HELD")!;
+	held.ws.dispatchEvent(new Event("open"));
+	const recovery = daemon.handleSessionMessage(held, {
+		type: "event_replay_result", id: held.replayId, generation: 2, lastSeq: 7,
+		events: [{ payload: { type: "identity_header", sessionId: "CANONICAL", repo: "gajae-code", branch: "dev" } }],
+	});
+	await writeBlocked;
+	await daemon.handleSessionMessage(held, { type: "turn_stream", sessionId: "CANONICAL", text: "live after claim" });
+	expect(bot.calls.filter(call => call.method === "sendMessage" && call.body.text === "live after claim")).toHaveLength(0);
+	releaseWrite();
+	await recovery;
+	expect(bot.calls.filter(call => call.method === "sendMessage" && call.body.text === "live after claim")).toHaveLength(1);
+	expect((await readTopicAuthorityState(agentDir)).topics.CANONICAL).toMatchObject({
+		endpointDigest: endpointAuthorityDigest("ws://new", "new"),
+	});
+});
+
+test("a failed recovery write rolls back its binding before a concurrent rename persists", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const initial = recoveryDaemon(agentDir, bot);
+	await replayResumedIdentity(initial, "INITIAL", "CANONICAL", { url: "ws://old", token: "old" });
+	const originalTopicId = bot.createdTopicThreadIds[0]!;
+	let failRecoveryWrite = true;
+	let releaseRecoveryWrite!: () => void;
+	const recoveryWriteReleased = new Promise<void>(resolve => (releaseRecoveryWrite = resolve));
+	let recoveryWriteReached!: () => void;
+	const recoveryWriteBlocked = new Promise<void>(resolve => (recoveryWriteReached = resolve));
+	const restarted = recoveryDaemon(
+		agentDir,
+		bot,
+		"42",
+		topicStateFs(async () => {
+			if (!failRecoveryWrite) return;
+			recoveryWriteReached();
+			await recoveryWriteReleased;
+			throw new Error("simulated recovery persistence failure");
+		}),
+	);
+	await restarted.loadTopics();
+	const failedRecovery = replayResumedIdentity(restarted, "FAILED", "CANONICAL", {
+		url: "ws://failed",
+		token: "failed-token",
+	});
+	await recoveryWriteBlocked;
+	const rename = restarted.handleTelegramUpdate(forumTopicEditedUpdate(903, originalTopicId, "Concurrent user name"));
+	failRecoveryWrite = false;
+	releaseRecoveryWrite();
+	await Promise.all([failedRecovery, rename]);
+
+	const persisted = await readTopicAuthorityState(agentDir);
+	expect(persisted.topics.CANONICAL).toMatchObject({
+		endpointDigest: endpointAuthorityDigest("ws://old", "old"),
+		name: "Concurrent user name",
+		nameOwner: "user",
+	});
+	bot.calls = [];
+	await restarted.handleSessionMessage(restarted.sessions.get("FAILED")!, {
+		type: "turn_stream",
+		sessionId: "CANONICAL",
+		text: "failed authority must not route",
+	});
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+});
+
+
+test("resume recovery rejects unsafe durable topic bindings without creating or reusing a topic", async () => {
+	const cases: Array<{
+		name: string;
+		mutate: (state: any) => void;
+		chatId?: string;
+		url?: string;
+		generation?: number;
+	}> = [
+		{ name: "cross chat", mutate: () => {}, chatId: "43" },
+		{ name: "delete pending", mutate: state => (state.topics.CANONICAL.authorityState = "delete_pending") },
+		{ name: "incomplete binding", mutate: state => delete state.topics.CANONICAL.endpointDigest },
+		{ name: "persisted malformed binding marker", mutate: state => (state.topics.CANONICAL.bindingMalformed = true) },
+		{
+			name: "ambiguous topic",
+			mutate: state => (state.topics.OTHER = { ...state.topics.CANONICAL, identitySent: false }),
+		},
+	];
+
+	for (const testCase of cases) {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const first = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(first, "INITIATOR", "CANONICAL");
+		const state = await readTopicAuthorityState(agentDir);
+		testCase.mutate(state);
+		await fs.promises.writeFile(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), JSON.stringify(state));
+
+		bot.calls = [];
+		const resumed = recoveryDaemon(agentDir, bot, testCase.chatId);
+		await resumed.loadTopics();
+		await replayResumedIdentity(resumed, "INITIATOR", "CANONICAL", {
+			url: testCase.url,
+			generation: testCase.generation,
+		});
+
+		expect(bot.calls.filter(call => call.method === "createForumTopic"), testCase.name).toHaveLength(0);
+		expect(
+			bot.calls.filter(call => call.method === "sendMessage" && call.body.message_thread_id !== undefined),
+			testCase.name,
+		).toHaveLength(0);
+	}
+});
+
+test("resume recovery preserves a user-owned durable topic name", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const first = recoveryDaemon(agentDir, bot);
+	await replayResumedIdentity(first, "INITIATOR", "CANONICAL");
+	const state = await readTopicAuthorityState(agentDir);
+	Object.assign(state.topics.CANONICAL, { name: "My topic", nameOwner: "user", userNameUpdateId: 9 });
+	await fs.promises.writeFile(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), JSON.stringify(state));
+
+	bot.calls = [];
+	const resumed = recoveryDaemon(agentDir, bot);
+	await resumed.loadTopics();
+	await replayResumedIdentity(resumed, "INITIATOR", "CANONICAL");
+
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+	expect(bot.calls.filter(call => call.method === "editForumTopic")).toHaveLength(0);
+	expect((await readTopicAuthorityState(agentDir)).topics.CANONICAL).toMatchObject({
+		name: "My topic",
+		nameOwner: "user",
+		userNameUpdateId: 9,
+	});
+});
+
 test("threaded mode off: frames fall back to the flat paired chat with a one-time notice", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
@@ -7773,6 +8328,7 @@ test("malformed topic creation success fails closed without flat delivery", asyn
 test("topic persistence failures fail closed without flat delivery", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
+	let failFirstTopicWrite = true;
 	const daemon = new TelegramNotificationDaemon({
 		settings: settings(agentDir),
 		ownerId: "owner",
@@ -7780,6 +8336,8 @@ test("topic persistence failures fail closed without flat delivery", async () =>
 		chatId: "42",
 		botApi: bot,
 		fs: topicStateFs(async () => {
+			if (!failFirstTopicWrite) return;
+			failFirstTopicWrite = false;
 			throw new Error("topic persistence failed");
 		}),
 	});
@@ -7794,6 +8352,8 @@ test("topic persistence failures fail closed without flat delivery", async () =>
 		}),
 	).rejects.toThrow("topic persistence failed");
 	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+	expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
+	expect((daemon as any).topics.get("S")?.authorityState).not.toBe("active");
 });
 
 test("threaded mode off: multiple sessions share a single fallback notice", async () => {
@@ -8494,6 +9054,122 @@ test("session_closed clears reply message routes for the closed session", async 
 
 	expect([...daemon.messageRoutes.values()].some(route => route.sessionId === "S")).toBe(false);
 	expect(daemon.messageRoutes.get("t-ask")).toEqual({ sessionId: "T", actionId: "ask" });
+});
+
+	test("session_closed revokes persisted ask aliases and pending replies before settling its topic", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const deleteStarted = Promise.withResolvers<void>();
+		const releaseDelete = Promise.withResolvers<void>();
+		const call = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "deleteForumTopic") {
+				bot.calls.push({ method, body, options });
+				deleteStarted.resolve();
+				await releaseDelete.promise;
+				return { ok: true, result: true };
+			}
+			return call(method, body, options);
+		};
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			rich: { enabled: false },
+		});
+		daemon.connectSession("LOGICAL", "ws://logical", "token");
+		const session = daemon.sessions.get("LOGICAL")!;
+		await daemon.handleSessionMessage(session, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Continue?",
+			options: ["yes"],
+		});
+		const sent = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup)!;
+		const alias = sent.body.reply_markup.inline_keyboard[0][0].callback_data;
+		const close = daemon.handleSessionMessage(session, { type: "session_closed", sessionId: "LOGICAL" });
+		await deleteStarted.promise;
+		const aliases = JSON.parse(fs.readFileSync(daemonPaths(agentDir).aliases, "utf8"));
+		expect(Object.values(aliases.routes).some((route: any) => route.sessionId === "LOGICAL")).toBe(false);
+		expect(session.pending.has("ask")).toBe(false);
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadAliases();
+		await restarted.handleTelegramUpdate({
+			update_id: 900_001,
+			callback_query: { id: "closed-ask", data: alias, message: { chat: { id: 42 } } },
+		});
+		expect((restarted as any).aliasTable.get(alias)).toBeUndefined();
+		releaseDelete.resolve();
+		await close;
+	});
+test("closing endpoint stays fenced after delete settlement until final persistence and teardown", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const finalWriteStarted = Promise.withResolvers<void>();
+	const releaseFinalWrite = Promise.withResolvers<void>();
+	let holdFinalWrite = false;
+	const fsImpl = topicStateFs(async () => {
+		if (!holdFinalWrite) return;
+		finalWriteStarted.resolve();
+		await releaseFinalWrite.promise;
+	});
+	const bot = new FakeBotApi();
+	const call = bot.call.bind(bot);
+	bot.call = async (method, body, options) => {
+		if (method === "deleteForumTopic") holdFinalWrite = true;
+		return call(method, body, options);
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		fs: fsImpl,
+		rich: { enabled: false },
+	});
+	daemon.connectSession("S", "ws://closing", "token");
+	const session = daemon.sessions.get("S")!;
+	await daemon.handleSessionMessage(session, {
+		type: "action_needed",
+		kind: "ask",
+		id: "ask",
+		question: "Continue?",
+		options: ["yes"],
+	});
+	const ask = bot.calls.find(call => call.method === "sendMessage" && call.body.reply_markup)!;
+	const threadId = ask.body.message_thread_id;
+	const alias = ask.body.reply_markup.inline_keyboard[0][0].callback_data;
+	bot.calls = [];
+	const close = daemon.handleSessionMessage(session, { type: "session_closed", sessionId: "S" });
+	await finalWriteStarted.promise;
+	const socket = session.ws as unknown as FakeWs;
+	socket.sent.length = 0;
+	await daemon.handleSessionMessage(session, {
+		type: "turn_stream",
+		sessionId: "S",
+		phase: "finalized",
+		text: "must not recreate after settlement",
+	});
+	await daemon.handleTelegramUpdate({
+		update_id: 900_002,
+		message: { chat: { id: 42 }, message_thread_id: threadId, text: "old reply", message_id: 10 },
+	});
+	await daemon.handleTelegramUpdate({
+		update_id: 900_003,
+		callback_query: { id: "old-callback", data: alias, message: { chat: { id: 42 } } },
+	});
+	expect(socket.sent).toEqual([]);
+	expect(bot.calls.some(call => call.method === "createForumTopic")).toBe(false);
+	expect(bot.calls.some(call => call.method === "sendMessage" && call.body.message_thread_id === threadId)).toBe(false);
+	releaseFinalWrite.resolve();
+	await close;
 });
 
 test("session_closed tombstones its endpoint generation so scans do not recreate an empty topic", async () => {
@@ -9971,6 +10647,37 @@ test("scanRoots reaps missing endpoint topics only when all roots are readable a
 	await blockedDaemon.loadTopics();
 	await blockedDaemon.scanRoots();
 	expect(blockedBot.calls.some(c => c.method === "deleteForumTopic")).toBe(false);
+});
+
+test("scanRoots preserves a logical owner on another transport through the orphan grace window and restart", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const initial = recoveryDaemon(agentDir, bot);
+	await replayResumedIdentity(initial, "B", "B", { url: "ws://b", token: "b" });
+	const topicId = bot.createdTopicThreadIds[0]!;
+	let now = 1_000;
+	const rekeyed = new TelegramNotificationDaemon({
+		settings: settings(agentDir), ownerId: "owner", botToken: "tok", chatId: "42", botApi: bot,
+		WebSocketImpl: FakeWs as any, now: () => now,
+	});
+	await rekeyed.loadTopics();
+	await replayResumedIdentity(rekeyed, "A", "B", { url: "ws://a", token: "a" });
+	bot.calls = [];
+	await rekeyed.scanRoots();
+	now += 60_000;
+	await rekeyed.scanRoots();
+	expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(0);
+	expect((await readTopicAuthorityState(agentDir)).topics.B).toMatchObject({ topicId: String(topicId) });
+
+	const afterRestart = recoveryDaemon(agentDir, bot);
+	await afterRestart.loadTopics();
+	await replayResumedIdentity(afterRestart, "B-RETURN", "B", { url: "ws://b-return", token: "return" });
+	bot.calls = [];
+	await afterRestart.handleSessionMessage(afterRestart.sessions.get("B-RETURN")!, {
+		type: "turn_stream", sessionId: "B", text: "B survives scan and restart",
+	});
+	expect(bot.calls.filter(call => call.method === "sendMessage" && call.body.message_thread_id === topicId)).toHaveLength(1);
 });
 
 test("runDaemonInternal wires SIGTERM to the daemon stop method", async () => {
@@ -12081,7 +12788,7 @@ describe("Telegram tool activity capability and routing", () => {
 
 describe("telegram daemon /btw reservation and capability boundaries", () => {
 	async function daemonWithTopic(
-		input: { enabled?: boolean; capability?: boolean; rich?: boolean; now?: () => number } = {},
+		input: { enabled?: boolean; capability?: boolean; rich?: boolean; now?: () => number; fetchImpl?: typeof fetch } = {},
 	) {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
@@ -12095,6 +12802,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			rich: { enabled: input.rich ?? true },
 			now: input.now,
 			WebSocketImpl: FakeWs as any,
+			fetchImpl: input.fetchImpl,
 			btw: { enabled: input.enabled ?? true },
 		});
 		daemon.connectSession("S", "ws://s", "ts");
@@ -12106,6 +12814,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			branch: "main",
 		});
 		return {
+			agentDir,
 			bot,
 			daemon,
 			threadId: bot.createdTopicThreadIds.at(-1),
@@ -12482,7 +13191,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			replacement.sent
 				.map(frame => JSON.parse(frame) as Record<string, unknown>)
 				.find(frame => frame.type === "ephemeral_turn"),
-		).toMatchObject({ ...request, type: "ephemeral_turn", question: "queued" });
+		).toBeUndefined();
 	});
 
 	test("reports true /btw capacity once and reuses completed tombstone capacity", async () => {
@@ -12657,109 +13366,30 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 				.some(frame => frame.type === "ephemeral_turn"),
 		).toBe(false);
 	});
-	test("does not treat ws://x/ + abc and ws://x/a + bc as the same endpoint tuple", async () => {
-		const { bot, daemon, threadId } = await daemonWithTopic();
+	test("keeps endpoint tuples distinct and rejects a different one from reusing a durable same-ID topic", async () => {
+		const { daemon, threadId } = await daemonWithTopic();
+		expect(endpointAuthorityDigest("ws://x/", "abc")).not.toBe(endpointAuthorityDigest("ws://x/a", "bc"));
 		daemon.connectSession("S", "ws://x/", "abc");
-		const initial = daemon.sessions.get("S")!;
-		const initialSocket = initial.ws as unknown as FakeWs;
-		initialSocket.dispatchEvent(new Event("open"));
-		await daemon.handleSessionMessage(initial, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
-		await daemon.handleSessionMessage(initial, {
+		const session = daemon.sessions.get("S")!;
+		const socket = session.ws as unknown as FakeWs;
+		socket.dispatchEvent(new Event("open"));
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
+		await daemon.handleSessionMessage(session, {
 			type: "event_replay_result",
-			id: initial.replayId,
+			id: session.replayId,
 			generation: 4,
 			lastSeq: 0,
 			events: [],
 		});
+
 		await daemon.handleTelegramUpdate({
 			update_id: 906,
 			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw reconnect?", message_id: 1906 },
 		});
-		const request = JSON.parse(initialSocket.sent.at(-1)!) as {
-			requestId: string;
-			sessionId: string;
-			updateId: number;
-			messageId: number;
-			threadId: string;
-		};
-		const terminal = {
-			type: "ephemeral_turn_result",
-			sessionId: request.sessionId,
-			requestId: request.requestId,
-			updateId: request.updateId,
-			messageId: request.messageId,
-			threadId: request.threadId,
-			status: "ok",
-			text: "reconnected answer",
-		};
-		const dispatches = () =>
-			bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage").length;
-		const before = dispatches();
 
-		initialSocket.dispatchEvent(new Event("close"));
-		expect(
-			initialSocket.sent.map(frame => JSON.parse(frame)).some(frame => frame.type === "ephemeral_turn_cancel"),
-		).toBe(false);
-		expect(daemon.sessions.has("S")).toBe(false);
-		expect(dispatches()).toBe(before);
-
-		daemon.connectSession("S", "ws://changed", "changed-token");
-		const changed = daemon.sessions.get("S")!;
-		changed.ws.dispatchEvent(new Event("open"));
-		await daemon.handleSessionMessage(changed, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
-		await daemon.handleSessionMessage(changed, {
-			type: "event_replay_result",
-			id: changed.replayId,
-			generation: 4,
-			lastSeq: 0,
-			events: [],
-		});
-		await daemon.handleSessionMessage(changed, terminal);
-		expect(dispatches()).toBe(before + 1);
-		changed.ws.dispatchEvent(new Event("close"));
-
-		daemon.connectSession("S", "ws://x/a", "bc");
-		const replacement = daemon.sessions.get("S")!;
-		replacement.ws.dispatchEvent(new Event("open"));
-		await daemon.handleSessionMessage(replacement, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
-		await daemon.handleSessionMessage(replacement, {
-			type: "event_replay_result",
-			id: replacement.replayId,
-			generation: 4,
-			lastSeq: 0,
-			events: [],
-		});
-		await daemon.handleSessionMessage(initial, terminal);
-		await daemon.handleSessionMessage(replacement, terminal);
-		expect(dispatches()).toBe(before + 1);
-
-		replacement.ws.dispatchEvent(new Event("close"));
-		daemon.connectSession("S", "ws://x/", "abc");
-		const exact = daemon.sessions.get("S")!;
-		exact.ws.dispatchEvent(new Event("open"));
-		await daemon.handleSessionMessage(exact, { type: "hello", capabilities: ["ephemeral_turn_v1"] });
-		await daemon.handleSessionMessage(exact, {
-			type: "event_replay_result",
-			id: exact.replayId,
-			generation: 4,
-			lastSeq: 0,
-			events: [],
-		});
-		await daemon.handleSessionMessage(exact, { type: "config_update", sessionId: "other" });
-		await daemon.handleSessionMessage(exact, terminal);
-		expect(dispatches()).toBe(before + 1);
-		await daemon.handleSessionMessage(exact, { type: "config_update", sessionId: "S" });
-		await daemon.handleSessionMessage(exact, {
-			...terminal,
-			updateId: terminal.updateId + 1,
-		});
-		expect(dispatches()).toBe(before + 1);
-		await daemon.handleSessionMessage(exact, terminal);
-		expect(dispatches()).toBe(before + 1);
-		await daemon.handleSessionMessage(exact, terminal);
-		expect(dispatches()).toBe(before + 1);
+		expect(socket.sent.map(frame => JSON.parse(frame)).some(frame => frame.type === "ephemeral_turn")).toBe(false);
 	});
-	test("delivers a /btw result once after a transient socket close and same-authority replacement", async () => {
+	test("does not resume a /btw request onto a same-authority replacement socket", async () => {
 		const { bot, daemon, threadId } = await daemonWithTopic();
 		await daemon.handleTelegramUpdate({
 			update_id: 989,
@@ -12789,11 +13419,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		const replayedRequest = (replacement.ws as unknown as FakeWs).sent
 			.map(frame => JSON.parse(frame) as Record<string, unknown>)
 			.find(frame => frame.type === "ephemeral_turn");
-		expect(replayedRequest).toMatchObject({
-			...request,
-			type: "ephemeral_turn",
-			question: "reconnect",
-		});
+		expect(replayedRequest).toBeUndefined();
 		await daemon.handleSessionMessage(replacement, {
 			...request,
 			type: "ephemeral_turn_result",
@@ -12813,7 +13439,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 					(call.method === "sendMessage" && call.body.text === "reconnected answer") ||
 					(call.method === "sendRichMessage" && call.body.rich_message.markdown === "reconnected answer"),
 			),
-		).toHaveLength(1);
+		).toHaveLength(0);
 	});
 	test.each([
 		"session_closed",
@@ -13041,6 +13667,605 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		if (retained) expect(persisted.topics.S).toMatchObject({ topicId: "77", authorityState: "delete_pending" });
 		else expect(persisted.topics.S).toBeUndefined();
 	});
+
+test("an accepted stale create persists its fence across restart before remote compensation", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const createStarted = Promise.withResolvers<void>();
+	const releaseCreate = Promise.withResolvers<unknown>();
+	const deleteStarted = Promise.withResolvers<void>();
+	const releaseDelete = Promise.withResolvers<unknown>();
+	const originalCall = bot.call.bind(bot);
+	bot.call = async (method, body, options) => {
+		if (method === "createForumTopic") {
+			bot.calls.push({ method, body, options });
+			createStarted.resolve();
+			return releaseCreate.promise;
+		}
+		if (method === "deleteForumTopic") {
+			bot.calls.push({ method, body, options });
+			deleteStarted.resolve();
+			return releaseDelete.promise;
+		}
+		return originalCall(method, body, options);
+	};
+	const daemon = recoveryDaemon(agentDir, bot);
+	const predecessorReplay = replayResumedIdentity(daemon, "CANONICAL", "CANONICAL", { url: "ws://predecessor", token: "old" });
+	await createStarted.promise;
+	daemon.connectSession("CANONICAL", "ws://successor", "new");
+	releaseCreate.resolve({ ok: true, result: { message_thread_id: 78 } });
+	await deleteStarted.promise;
+
+	const fencedBeforeCompensation = await readTopicAuthorityState(agentDir);
+	expect(fencedBeforeCompensation.topics.CANONICAL).toMatchObject({ topicId: "78", authorityState: "delete_pending" });
+	expect((fencedBeforeCompensation as { fences?: Record<string, number> }).fences?.CANONICAL).toBeGreaterThan(0);
+	const restarted = recoveryDaemon(agentDir, bot);
+	await restarted.loadTopics();
+	bot.calls = [];
+	await replayResumedIdentity(restarted, "RESTART", "CANONICAL", { url: "ws://successor", token: "new" });
+	await restarted.handleSessionMessage(restarted.sessions.get("RESTART")!, {
+		type: "turn_stream",
+		sessionId: "CANONICAL",
+		text: "fenced topic must not revive",
+	});
+	expect(bot.calls.filter(call => call.method === "createForumTopic" || call.method === "sendMessage")).toHaveLength(0);
+	expect((await readTopicAuthorityState(agentDir)).topics.CANONICAL).toMatchObject({ authorityState: "delete_pending" });
+
+	releaseDelete.resolve({ ok: true, result: true });
+	await predecessorReplay;
+});
+
+
+	test("fresh-endpoint rotation compensates a held predecessor create and only successor delivery routes", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const createStarted = Promise.withResolvers<void>();
+		const releaseCreate = Promise.withResolvers<unknown>();
+		const originalCall = bot.call.bind(bot);
+		let heldCreate = true;
+		bot.call = async (method, body, options) => {
+			if (method === "createForumTopic" && heldCreate) {
+				bot.calls.push({ method, body, options });
+				createStarted.resolve();
+				return releaseCreate.promise;
+			}
+			return originalCall(method, body, options);
+		};
+		const daemon = recoveryDaemon(agentDir, bot);
+		const predecessorReplay = replayResumedIdentity(daemon, "CANONICAL", "CANONICAL", { url: "ws://predecessor", token: "old" });
+		await createStarted.promise;
+		void predecessorReplay.catch(() => undefined);
+
+		// Connecting a fresh endpoint revokes the predecessor's immutable creation
+		// lease before Telegram accepts its held create.
+		daemon.connectSession("CANONICAL", "ws://successor", "new");
+		const successor = daemon.sessions.get("CANONICAL")!;
+		successor.ws.dispatchEvent(new Event("open"));
+		releaseCreate.resolve({ ok: true, result: { message_thread_id: 77 } });
+		await predecessorReplay;
+		await new Promise(resolve => setTimeout(resolve, 0));
+
+		expect(bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id)).toEqual([77]);
+		expect(bot.calls.filter(call => call.method === "sendMessage" && call.body.message_thread_id === 77)).toEqual([]);
+		expect((daemon as any).topics.get("CANONICAL")).toBeUndefined();
+
+		heldCreate = false;
+		await daemon.handleSessionMessage(successor, {
+			type: "event_replay_result",
+			id: successor.replayId,
+			generation: 1,
+			lastSeq: 1,
+			events: [{ payload: { type: "identity_header", sessionId: "CANONICAL", repo: "gajae-code", branch: "dev" } }],
+		});
+		await daemon.handleSessionMessage(successor, { type: "turn_stream", sessionId: "CANONICAL", text: "successor output" });
+		const routed = bot.calls.filter(call => call.method === "sendMessage" && call.body.message_thread_id !== undefined);
+		expect(routed).toHaveLength(2);
+		expect(routed.every(call => call.body.message_thread_id !== 77)).toBe(true);
+	});
+test.each([
+	["accepted remote delete", async () => ({ ok: true, result: true }), false],
+	["already absent remote topic", async () => ({ ok: false, description: "message thread not found" }), false],
+	["ambiguous remote delete", async () => ({ ok: false, description: "transport unavailable" }), true],
+] as const)("startup scan reconciles a crash-persisted delete fence after %s", async (_outcome, deleteResult, retained) => {
+	const agentDir = tempAgentDir();
+	const topicsPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+	fs.mkdirSync(path.dirname(topicsPath), { recursive: true });
+	fs.writeFileSync(
+		topicsPath,
+		JSON.stringify({
+			topics: {
+				S: {
+					topicId: "77",
+					identitySent: true,
+					createdAt: 1,
+					authorityState: "delete_pending",
+					authorityEpoch: 2,
+				},
+			},
+			fences: { S: 2 },
+		}),
+	);
+	const bot = new FakeBotApi();
+	const call = bot.call.bind(bot);
+	bot.call = async (method, body, options) => {
+		if (method !== "deleteForumTopic") return call(method, body, options);
+		bot.calls.push({ method, body, options });
+		return deleteResult();
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "restarted-owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+
+	await daemon.loadTopics();
+	await daemon.scanRoots();
+
+	expect(bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id)).toEqual([77]);
+	const persisted = JSON.parse(fs.readFileSync(topicsPath, "utf8"));
+	if (retained) expect(persisted.topics.S).toMatchObject({ topicId: "77", authorityState: "delete_pending" });
+	else expect(persisted.topics.S).toBeUndefined();
+});
+
+	test("failed close publication restores only close authority while retaining a concurrent user rename across restart", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const renameWriteStarted = Promise.withResolvers<void>();
+		const releaseRenameWrite = Promise.withResolvers<void>();
+		let holdRenameWrite = false;
+		let failCloseWrite = false;
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			fs: topicStateFs(async () => {
+				if (holdRenameWrite) {
+					holdRenameWrite = false;
+					renameWriteStarted.resolve();
+					await releaseRenameWrite.promise;
+					return;
+				}
+				if (!failCloseWrite) return;
+				failCloseWrite = false;
+				throw new Error("first close publication fails");
+			}),
+		});
+		daemon.connectSession("S", "ws://s", "ts");
+		const closingSession = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(closingSession, { type: "identity_header", sessionId: "S", repo: "repo", branch: "main" });
+		await (daemon as any).topicsPersistQueue;
+		const threadId = bot.createdTopicThreadIds[0]!;
+		holdRenameWrite = true;
+		expect((daemon as any).topics.markUserName("S", "Still mine", 2990)).toBe("updated");
+		const rename = (daemon as any).persistTopics();
+		await Promise.race([
+			renameWriteStarted.promise,
+			Bun.sleep(1_000).then(() => Promise.reject(new Error("rename publication did not begin"))),
+		]);
+		failCloseWrite = true;
+		const closing = daemon.handleSessionMessage(closingSession, { type: "session_closed", sessionId: "S" });
+		const closeFailure = closing.then(
+			() => undefined,
+			error => error,
+		);
+		releaseRenameWrite.resolve();
+		await rename;
+		expect(await closeFailure).toMatchObject({ message: "first close publication fails" });
+		const persisted = await readTopicAuthorityState(agentDir);
+		expect(persisted.topics.S).toMatchObject({ topicId: String(threadId), name: "Still mine", nameOwner: "user" });
+		expect(persisted.topics.S.authorityState).not.toBe("delete_pending");
+		expect(persisted.closedEndpoints?.S).toBeUndefined();
+		const restartedBot = new FakeBotApi();
+		const restarted = recoveryDaemon(agentDir, restartedBot);
+		await restarted.loadTopics();
+		restarted.connectSession("S", "ws://s", "ts");
+		const restartedSession = restarted.sessions.get("S")!;
+		await restarted.handleSessionMessage(restartedSession, { type: "turn_stream", sessionId: "S", text: "still routes" });
+		expect(restartedBot.calls.filter(call => call.method === "sendMessage" && call.body.text === "still routes")).toHaveLength(1);
+	});
+	test("a superseded close retries a failed tombstone clear before returning", async () => {
+	FakeWs.instances = [];
+	const writeStarted = Promise.withResolvers<void>();
+	const releaseWrite = Promise.withResolvers<void>();
+	let holdCloseWrite = false;
+	let failClearWrite = false;
+	let closeWrites = 0;
+	const agentDir = tempAgentDir();
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: new FakeBotApi(),
+		WebSocketImpl: FakeWs as any,
+		fs: topicStateFs(async () => {
+			if (holdCloseWrite) {
+				holdCloseWrite = false;
+				writeStarted.resolve();
+				await releaseWrite.promise;
+			}
+			closeWrites++;
+			if (failClearWrite && closeWrites === 2) {
+				failClearWrite = false;
+				throw new Error("fail once while clearing close tombstone");
+			}
+		}),
+	});
+	daemon.connectSession("S", "ws://old", "old-token");
+	const oldSession = daemon.sessions.get("S")! as any;
+	oldSession.hostGeneration = 1;
+	oldSession.logicalSessionId = "S";
+	oldSession.logicalSessionIdTrusted = true;
+	oldSession.recoveryLease = {
+		state: "authorized",
+		logicalSessionId: "S",
+		binding: {
+			chatId: "42",
+			endpointKey: oldSession.endpointKey,
+			endpointDigest: oldSession.endpointDigest,
+			endpointGeneration: 1,
+		},
+		token: 1,
+	};
+	const internals = daemon as any;
+	internals.logicalSessionOwners.set("S", oldSession);
+
+	holdCloseWrite = true;
+	const closing = daemon.handleSessionMessage(oldSession, { type: "session_closed", sessionId: "S" });
+	await writeStarted.promise;
+	internals.logicalSessionOwners.set("S", { ...oldSession });
+	failClearWrite = true;
+	releaseWrite.resolve();
+	await closing;
+
+	const persisted = JSON.parse(
+		fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"),
+	);
+	expect(persisted.closedEndpoints?.S).toBeUndefined();
+	expect(internals.closedEndpointKeys.has("S")).toBe(false);
+});
+	test("supersession rejects queued HTML continuations from the predecessor lease", async () => {
+		FakeWs.instances = [];
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			rich: { enabled: true },
+		});
+		daemon.connectSession("S", "ws://predecessor", "old-token");
+		const predecessor = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(predecessor, { type: "identity_header", sessionId: "S", repo: "repo", branch: "main" });
+		bot.calls.length = 0;
+
+		const markdown = "x".repeat(9_000);
+		const chunks = splitTelegramHtml(markdownToTelegramHtml(markdown));
+		expect(chunks.length).toBeGreaterThan(1);
+		await daemon.handleSessionMessage(predecessor, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			finalAnswer: true,
+			text: markdown,
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage").map(call => call.body.text)).toEqual([chunks[0]]);
+
+		daemon.connectSession("S", "ws://successor", "new-token");
+		const successor = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(successor, { type: "identity_header", sessionId: "S", repo: "repo", branch: "main" });
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(successor, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "successor tail",
+		});
+
+		const sent = bot.calls.filter(call => call.method === "sendMessage").map(call => call.body.text);
+		expect(sent).toEqual([markdownToTelegramHtml("successor tail")]);
+		expect(sent.some(text => chunks.slice(1).includes(text))).toBe(false);
+	});
+
+	test("supersession rejects queued flat-fallback continuations from the predecessor lease", async () => {
+		FakeWs.instances = [];
+		const bot = new FakeBotApi();
+		const originalCall = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "createForumTopic") {
+				bot.calls.push({ method, body, options });
+				return { ok: false, description: "forum topics are disabled" };
+			}
+			return originalCall(method, body, options);
+		};
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			WebSocketImpl: FakeWs as any,
+			rich: { enabled: false },
+		});
+		daemon.connectSession("S", "ws://predecessor", "old-token");
+		const predecessor = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(predecessor, { type: "identity_header", sessionId: "S", repo: "repo", branch: "main" });
+		bot.calls.length = 0;
+
+		const markdown = "y".repeat(9_000);
+		const chunks = splitTelegramHtml(markdownToTelegramHtml(markdown));
+		await daemon.handleSessionMessage(predecessor, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: markdown,
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage").map(call => call.body.text)).toEqual([chunks[0]]);
+
+		daemon.connectSession("S", "ws://successor", "new-token");
+		const successor = daemon.sessions.get("S")!;
+		await daemon.handleSessionMessage(successor, { type: "identity_header", sessionId: "S", repo: "repo", branch: "main" });
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(successor, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "successor flat tail",
+		});
+
+		const sent = bot.calls.filter(call => call.method === "sendMessage").map(call => call.body.text);
+		expect(sent).toEqual([markdownToTelegramHtml("successor flat tail")]);
+		expect(sent.some(text => chunks.slice(1).includes(text))).toBe(false);
+	});
+
+	test("successor commit during inbound attachment preparation sends nothing through the predecessor", async () => {
+		FakeWs.instances = [];
+		const downloadStarted = Promise.withResolvers<void>();
+		const releaseDownload = Promise.withResolvers<void>();
+		const bot = new FakeBotApi();
+		const fetchImpl = (async () => {
+			downloadStarted.resolve();
+			await releaseDownload.promise;
+			return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
+		}) as unknown as typeof fetch;
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			fetchImpl,
+			WebSocketImpl: FakeWs as any,
+		});
+		daemon.connectSession("S", "ws://predecessor", "old-token");
+		const predecessor = daemon.sessions.get("S")!;
+		const predecessorSocket = predecessor.ws as unknown as FakeWs;
+		await daemon.handleSessionMessage(predecessor, { type: "identity_header", sessionId: "S", repo: "repo", branch: "main" });
+		const threadId = bot.calls.find(call => call.method === "sendMessage")!.body.message_thread_id;
+		predecessorSocket.sent.length = 0;
+		bot.calls.length = 0;
+
+		const inbound = daemon.handleTelegramUpdate({
+			update_id: 2991,
+			message: { chat: { id: 42 }, message_thread_id: threadId, message_id: 1991, photo: [{ file_id: "held-photo" }] },
+		});
+		await downloadStarted.promise;
+		daemon.connectSession("S", "ws://successor", "new-token");
+		releaseDownload.resolve();
+		await inbound;
+
+		expect(predecessorSocket.sent).toHaveLength(0);
+		expect(bot.calls.some(call => call.method === "setMessageReaction" || call.method === "sendMessage")).toBe(false);
+		expect((daemon as any).inboundReactions.has(2991)).toBe(false);
+	});
+
+test("held non-OK /btw result probe cannot deliver after a distinct recovered transport supersedes its lease", async () => {
+	FakeWs.instances = [];
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const daemon = recoveryDaemon(agentDir, bot);
+	await replayResumedIdentity(daemon, "T1", "LOGICAL", { url: "ws://same", token: "token" });
+	await enableEphemeralTurns(daemon, "T1");
+	const threadId = bot.createdTopicThreadIds[0]!;
+	await daemon.handleTelegramUpdate({
+		update_id: 2992,
+		message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw held failure", message_id: 1992 },
+	});
+	const predecessor = daemon.sessions.get("T1")!;
+	const request = JSON.parse((predecessor.ws as unknown as FakeWs).sent.at(-1)!) as Record<string, unknown>;
+	const probeStarted = Promise.withResolvers<void>();
+	const releaseProbe = Promise.withResolvers<void>();
+	const internals = daemon as unknown as {
+		sessionRouter: { dispatch(session: unknown, msg: Record<string, unknown>): Promise<boolean> };
+	};
+	const dispatch = internals.sessionRouter.dispatch.bind(internals.sessionRouter);
+	internals.sessionRouter.dispatch = async (session, msg) => {
+		if (msg.type === "ephemeral_turn_result") {
+			probeStarted.resolve();
+			await releaseProbe.promise;
+		}
+		return dispatch(session, msg);
+	};
+	bot.calls.length = 0;
+	const handling = daemon.handleSessionMessage(predecessor, { ...request, type: "ephemeral_turn_result", status: "failed" });
+	await probeStarted.promise;
+	await replayResumedIdentity(daemon, "T2", "LOGICAL", { url: "ws://same", token: "token" });
+	expect(daemon.sessions.get("T1")).toBe(predecessor);
+	releaseProbe.resolve();
+	await handling;
+
+	expect(bot.calls.some(call => call.method === "sendMessage" && call.body.text === "This /btw question failed. Send it again to retry.")).toBe(false);
+	await daemon.handleSessionMessage(daemon.sessions.get("T2")!, { ...request, type: "ephemeral_turn_result", status: "failed" });
+	expect(bot.calls.some(call => call.method === "sendMessage" && call.body.text === "This /btw question failed. Send it again to retry.")).toBe(false);
+});
+
+test.each([
+	[2995, 1995, "/btw", "guidance"],
+	[2996, 1996, "/context", "control"],
+] as const)("held %s reservation releases a delete-pending topic without durable consumption", async (updateId, messageId, text) => {
+	const { agentDir, bot, daemon, threadId } = await daemonWithTopic();
+	const reservationStarted = Promise.withResolvers<void>();
+	const releaseReservation = Promise.withResolvers<void>();
+	const internals = daemon as unknown as {
+		reserveSeenUpdateId(updateId: number): Promise<boolean>;
+		topics: { beginDelete(sessionId: string): unknown };
+	};
+	const reserve = internals.reserveSeenUpdateId.bind(daemon);
+	internals.reserveSeenUpdateId = async id => {
+		reservationStarted.resolve();
+		await releaseReservation.promise;
+		return reserve(id);
+	};
+	const socket = daemon.sessions.get("S")!.ws as unknown as FakeWs;
+	const sentBefore = socket.sent.length;
+	bot.calls.length = 0;
+	const handling = daemon.handleTelegramUpdate({
+		update_id: updateId,
+		message: { chat: { id: 42 }, message_thread_id: threadId, text, message_id: messageId },
+	});
+	await reservationStarted.promise;
+	internals.topics.beginDelete("S");
+	releaseReservation.resolve();
+	await handling;
+
+	expect(socket.sent.slice(sentBefore)).toHaveLength(0);
+	expect(bot.calls).toEqual([]);
+	expect((daemon as any).dispatchState.seenUpdateIds.has(updateId)).toBe(false);
+	const persisted = JSON.parse(fs.readFileSync(daemonPaths(agentDir).seenUpdates, "utf8")) as { updateIds: number[] };
+	expect(persisted.updateIds).not.toContain(updateId);
+});
+
+	test("held /btw update reservation releases a delete-pending topic without guidance, execution, or durable consumption", async () => {
+		const { agentDir, bot, daemon, threadId } = await daemonWithTopic();
+		const reservationStarted = Promise.withResolvers<void>();
+		const releaseReservation = Promise.withResolvers<void>();
+		const internals = daemon as unknown as {
+			reserveSeenUpdateId(updateId: number): Promise<boolean>;
+			topics: { beginDelete(sessionId: string): unknown };
+		};
+		const reserve = internals.reserveSeenUpdateId.bind(daemon);
+		internals.reserveSeenUpdateId = async updateId => {
+			reservationStarted.resolve();
+			await releaseReservation.promise;
+			return reserve(updateId);
+		};
+		const socket = daemon.sessions.get("S")!.ws as unknown as FakeWs;
+		const sentBefore = socket.sent.length;
+		bot.calls.length = 0;
+		const updateId = 2993;
+		const handling = daemon.handleTelegramUpdate({
+			update_id: updateId,
+			message: { chat: { id: 42 }, message_thread_id: threadId, text: "/btw held reservation", message_id: 1993 },
+		});
+		await reservationStarted.promise;
+		internals.topics.beginDelete("S");
+		releaseReservation.resolve();
+		await handling;
+
+		expect(socket.sent.slice(sentBefore).map(frame => JSON.parse(frame)).some(frame => frame.type === "ephemeral_turn")).toBe(false);
+		expect(bot.calls).toEqual([]);
+		expect((daemon as any).dispatchState.seenUpdateIds.has(updateId)).toBe(false);
+		const persisted = JSON.parse(fs.readFileSync(daemonPaths(agentDir).seenUpdates, "utf8")) as { updateIds: number[] };
+		expect(persisted.updateIds).not.toContain(updateId);
+	});
+
+	test("held inbound attachment work stops at a delete-pending topic without effects or update consumption", async () => {
+		FakeWs.instances = [];
+		const downloadStarted = Promise.withResolvers<void>();
+		const releaseDownload = Promise.withResolvers<void>();
+		const fetchImpl = (async () => {
+			downloadStarted.resolve();
+			await releaseDownload.promise;
+			return { ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer };
+		}) as unknown as typeof fetch;
+		const { agentDir, bot, daemon, threadId } = await daemonWithTopic({ fetchImpl });
+		const socket = daemon.sessions.get("S")!.ws as unknown as FakeWs;
+		const sentBefore = socket.sent.length;
+		bot.calls.length = 0;
+		const updateId = 2994;
+		const handling = daemon.handleTelegramUpdate({
+			update_id: updateId,
+			message: { chat: { id: 42 }, message_thread_id: threadId, message_id: 1994, photo: [{ file_id: "held-photo" }] },
+		});
+		await downloadStarted.promise;
+		(daemon as any).topics.beginDelete("S");
+		releaseDownload.resolve();
+		await handling;
+
+		expect(socket.sent.slice(sentBefore)).toHaveLength(0);
+		expect(bot.calls.some(call => call.method === "sendMessage" || call.method === "setMessageReaction")).toBe(false);
+		expect((daemon as any).dispatchState.seenUpdateIds.has(updateId)).toBe(false);
+		expect(fs.existsSync(daemonPaths(agentDir).seenUpdates)).toBe(false);
+	});
+
+	test("restart before A-to-B replay keeps persisted initiator topic input fail-closed", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const initial = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(initial, "A", "A", { url: "ws://a", token: "a" });
+		await replayResumedIdentity(initial, "B", "B", { url: "ws://b", token: "b" });
+		const aTopic = bot.createdTopicThreadIds[0]!;
+
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		restarted.connectSession("A", "ws://a-rekey", "rekey");
+		const pending = restarted.sessions.get("A")!;
+		const socket = pending.ws as unknown as FakeWs;
+		socket.sent.length = 0;
+		bot.calls.length = 0;
+		await restarted.handleTelegramUpdate({
+			update_id: 280_201,
+			message: { chat: { id: 42 }, message_thread_id: aTopic, message_id: 1, text: "cannot claim before replay" },
+		});
+		expect(socket.sent).toEqual([]);
+		expect(bot.calls.filter(call => call.method === "setMessageReaction")).toHaveLength(0);
+
+		await replayResumedIdentity(restarted, "A", "B", { url: "ws://a-rekey", token: "rekey" });
+		const rekeyed = restarted.sessions.get("A")!.ws as unknown as FakeWs;
+		rekeyed.sent.length = 0;
+		await restarted.handleTelegramUpdate({
+			update_id: 280_202,
+			message: { chat: { id: 42 }, message_thread_id: aTopic, message_id: 2, text: "still cannot hijack" },
+		});
+		expect(rekeyed.sent).toEqual([]);
+	});
+
+	test("daemon quarantines a persisted unbound legacy topic for inbound and outbound threaded traffic", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const topicsPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		fs.mkdirSync(path.dirname(topicsPath), { recursive: true });
+		fs.writeFileSync(topicsPath, JSON.stringify({
+			topics: { LEGACY: { topicId: "777", identitySent: true, createdAt: 1 } },
+		}));
+		const bot = new FakeBotApi();
+		const daemon = recoveryDaemon(agentDir, bot);
+		await daemon.loadTopics();
+		daemon.connectSession("LEGACY", "ws://legacy", "token");
+		const session = daemon.sessions.get("LEGACY")!;
+		const socket = session.ws as unknown as FakeWs;
+		socket.sent.length = 0;
+		await daemon.handleTelegramUpdate({
+			update_id: 280_203,
+			message: { chat: { id: 42 }, message_thread_id: 777, message_id: 3, text: "legacy inbound" },
+		});
+		await daemon.handleSessionMessage(session, { type: "turn_stream", sessionId: "LEGACY", text: "legacy outbound" });
+		expect(socket.sent).toEqual([]);
+		expect(bot.calls.filter(call => call.method === "sendMessage" && call.body.message_thread_id !== undefined)).toHaveLength(0);
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+	});
+
 	test("shutdown retains ownership and returns when control persistence never settles", async () => {
 		const agentDir = tempAgentDir();
 		const s = settings(agentDir);
@@ -13067,5 +14292,263 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			Promise.race([daemon.run(), Bun.sleep(2_000).then(() => Promise.reject(new Error("shutdown timed out")))]),
 		).resolves.toBeUndefined();
 		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(true);
+	});
+	test("identity-less A-to-B replay recovers the unique durable logical topic", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const first = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(first, "A", "A", { url: "ws://rekey", token: "token" });
+		const aTopic = bot.createdTopicThreadIds[0]!;
+		await replayResumedIdentity(first, "A", "B", { url: "ws://rekey", token: "token" });
+		const bTopic = bot.createdTopicThreadIds[1]!;
+		expect(bTopic).not.toBe(aTopic);
+
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		expect(await readTopicAuthorityState(agentDir)).toMatchObject({
+			topics: { B: { endpointDigest: endpointAuthorityDigest("ws://rekey", "token") } },
+	});
+		restarted.connectSession("A", "ws://rekey", "token");
+		const resumed = restarted.sessions.get("A")!;
+		resumed.ws.dispatchEvent(new Event("open"));
+		await restarted.handleSessionMessage(resumed, {
+			type: "event_replay_result",
+			id: resumed.replayId,
+			generation: 1,
+			lastSeq: 2,
+			events: [],
+		});
+		expect(resumed.replayPending).toBe(false);
+		expect(resumed.logicalSessionId).toBe("B");
+		bot.calls.length = 0;
+		await restarted.handleSessionMessage(resumed, { type: "turn_stream", sessionId: "B", text: "identity-less resume" });
+		const delivery = bot.calls.find(call => call.method === "sendMessage" && call.body.text === "identity-less resume");
+		expect(delivery?.body.message_thread_id).toBe(bTopic);
+		expect(delivery?.body.message_thread_id).not.toBe(aTopic);
+	});
+
+	test("quarantined legacy authority fails closed for asks and selected acknowledgements", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const topicsPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		fs.mkdirSync(path.dirname(topicsPath), { recursive: true });
+		fs.writeFileSync(topicsPath, JSON.stringify({
+			topics: { LEGACY: { topicId: "777", identitySent: true, createdAt: 1 } },
+		}));
+		const bot = new FakeBotApi();
+		const daemon = recoveryDaemon(agentDir, bot);
+		await daemon.loadTopics();
+		daemon.connectSession("LEGACY", "ws://legacy", "token");
+		const session = daemon.sessions.get("LEGACY")!;
+		const socket = session.ws as unknown as FakeWs;
+		socket.sent.length = 0;
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(session, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Must not fall back",
+			options: ["No"],
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "ask_selected_ack_request",
+			mode: "live",
+			requestId: "ack",
+			commitKey: "commit",
+			actionId: "ask",
+			deadlineAt: Date.now() + 10_000,
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage" || call.method === "sendRichMessage")).toEqual([]);
+		expect(socket.sent.map(frame => JSON.parse(frame))).toContainEqual({
+			type: "ask_selected_ack_result",
+			requestId: "ack",
+			commitKey: "commit",
+			outcome: { status: "failed", reason: "route_missing" },
+		});
+	});
+	test("rejected recovery leaves the durable cursor unchanged and drops queued effects", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const initial = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(initial, "S", "S", { generation: 1 });
+		const before = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+		expect(before.topics.S).toMatchObject({ replayGeneration: 1, replaySeq: 1 });
+
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		restarted.connectSession("S", "ws://replacement", "replacement-token");
+		const session = restarted.sessions.get("S")!;
+		session.ws.dispatchEvent(new Event("open"));
+		bot.calls.length = 0;
+		await restarted.handleSessionMessage(session, { type: "turn_stream", sessionId: "S", text: "queued must not render" });
+		await restarted.handleSessionMessage(session, {
+			type: "event_replay_result",
+			id: session.replayId,
+			generation: 2,
+			lastSeq: 9,
+			events: [
+				{ payload: { type: "identity_header", sessionId: "S" } },
+				{ payload: { type: "identity_header", sessionId: "OTHER" } },
+			],
+		});
+		expect(restarted.sessions.has("S")).toBe(false);
+		expect(bot.calls.some(call => call.method === "sendMessage" && call.body.text === "queued must not render")).toBe(false);
+		const after = JSON.parse(fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"));
+		expect(after.topics.S).toMatchObject({ replayGeneration: 1, replaySeq: 1 });
+	});
+	test("scanRoots preserves a pre-aged orphaned topic while its logical owner is live on another transport", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const cwd = path.join(agentDir, "repo");
+		await registerNotificationRoot({ settings: s, cwd, sessionId: "B" });
+		const endpointDir = path.join(cwd, ".gjc", "state", "sdk");
+		fs.mkdirSync(endpointDir, { recursive: true });
+		fs.writeFileSync(path.join(endpointDir, "B.json"), JSON.stringify({ url: "ws://dead-b", token: "dead", stale: true }));
+		const bot = new FakeBotApi();
+		const initial = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(initial, "B", "B", { url: "ws://b", token: "b" });
+		const topicId = bot.createdTopicThreadIds[0]!;
+		const topicsPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		const persisted = JSON.parse(fs.readFileSync(topicsPath, "utf8"));
+		persisted.topics.B.orphanedAt = 0;
+		fs.writeFileSync(topicsPath, JSON.stringify(persisted));
+		let now = 120_000;
+		const daemon = new TelegramNotificationDaemon({
+			settings: s, ownerId: "owner", botToken: "tok", chatId: "42", botApi: bot,
+			WebSocketImpl: FakeWs as any, now: () => now, pidAlive: () => false,
+		});
+		await daemon.loadTopics();
+		await replayResumedIdentity(daemon, "A", "B", { url: "ws://a", token: "a" });
+		bot.calls.length = 0;
+		await daemon.scanRoots();
+		now += 60_000;
+		await daemon.scanRoots();
+		expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toEqual([]);
+		expect((await readTopicAuthorityState(agentDir)).topics.B).toMatchObject({ topicId: String(topicId) });
+	});
+
+	test("a B-to-A rekey does not strand an independently recovered B owner", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(daemon, "B", "B", { url: "ws://b", token: "b" });
+		const bTopic = bot.createdTopicThreadIds[0]!;
+		await replayResumedIdentity(daemon, "B", "A", { url: "ws://a", token: "a" });
+		await replayResumedIdentity(daemon, "B-RETURN", "B", { url: "ws://b", token: "b" });
+		const recovered = daemon.sessions.get("B-RETURN")!;
+		expect(recovered.logicalSessionId).toBe("B");
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(recovered, { type: "turn_stream", sessionId: "B", text: "independent B recovery" });
+		expect(bot.calls.filter(call => call.method === "sendMessage" && call.body.message_thread_id === bTopic)).toHaveLength(1);
+	});
+
+	test("held initial daemon topic publication admits neither inbound nor outbound routing", async () => {
+		FakeWs.instances = [];
+		const writeStarted = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		let holdWrite = true;
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = recoveryDaemon(agentDir, bot, "42", topicStateFs(async () => {
+			if (!holdWrite) return;
+			holdWrite = false;
+			writeStarted.resolve();
+			await releaseWrite.promise;
+		}));
+		daemon.connectSession("S", "ws://s", "token");
+		const session = daemon.sessions.get("S")!;
+		const identity = daemon.handleSessionMessage(session, { type: "identity_header", sessionId: "S", repo: "repo", branch: "main" });
+		await writeStarted.promise;
+		const socket = session.ws as unknown as FakeWs;
+		socket.sent.length = 0;
+		bot.calls.length = 0;
+		await daemon.handleTelegramUpdate({ update_id: 280_301, message: { chat: { id: 42 }, message_thread_id: 1, message_id: 1, text: "must not route" } });
+		await daemon.handleSessionMessage(session, { type: "turn_stream", sessionId: "S", text: "must wait for commit" });
+		expect(socket.sent).toEqual([]);
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toEqual([]);
+		releaseWrite.resolve();
+		await identity;
+	});
+
+	test("an actual successor replay during held close retains the successor topic lease", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(daemon, "A", "B", { url: "ws://old", token: "old" });
+		await enableEphemeralTurns(daemon, "A");
+		const threadId = bot.createdTopicThreadIds[0]!;
+		await daemon.handleTelegramUpdate({
+			update_id: 280_302,
+			message: { chat: { id: 42 }, message_thread_id: threadId, message_id: 302, text: "/btw hold close" },
+		});
+		const terminalStarted = Promise.withResolvers<void>();
+		const releaseTerminal = Promise.withResolvers<void>();
+		const call = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "sendMessage" && (body as { text?: string }).text?.includes("question stopped")) {
+				bot.calls.push({ method, body, options });
+				terminalStarted.resolve();
+				return releaseTerminal.promise;
+			}
+			return call(method, body, options);
+		};
+		bot.calls.length = 0;
+		const predecessor = daemon.sessions.get("A")!;
+		const closing = daemon.handleSessionMessage(predecessor, { type: "session_closed", sessionId: "B" });
+		await terminalStarted.promise;
+		await replayResumedIdentity(daemon, "C", "B", { url: "ws://old", token: "old" });
+		releaseTerminal.resolve();
+		await closing;
+		expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toEqual([]);
+		const successor = daemon.sessions.get("C")!;
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(successor, { type: "turn_stream", sessionId: "B", text: "successor remains routable" });
+		expect(bot.calls.filter(call => call.method === "sendMessage" && call.body.message_thread_id === threadId)).toHaveLength(1);
+	});
+
+	test("revoked create retains a delete fence after two failed publications and ambiguous deletion across restart", async () => {
+		FakeWs.instances = [];
+		const createStarted = Promise.withResolvers<void>();
+		const releaseCreate = Promise.withResolvers<unknown>();
+		let topicWrites = 0;
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const call = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "createForumTopic") {
+				bot.calls.push({ method, body, options });
+				createStarted.resolve();
+				return releaseCreate.promise;
+			}
+			if (method === "deleteForumTopic") {
+				bot.calls.push({ method, body, options });
+				return { ok: false, description: "transport unavailable" };
+			}
+			return call(method, body, options);
+		};
+		const daemon = recoveryDaemon(agentDir, bot, "42", topicStateFs(async () => {
+			topicWrites++;
+			if (topicWrites <= 2) throw new Error("durable fence unavailable");
+		}));
+		daemon.connectSession("S", "ws://old", "old");
+		const predecessor = daemon.sessions.get("S")!;
+		const creating = (daemon as any).ensureTopic("S", "topic", predecessor);
+		await createStarted.promise;
+		daemon.connectSession("S", "ws://successor", "new");
+		releaseCreate.resolve({ ok: true, result: { message_thread_id: 909 } });
+		await expect(creating).rejects.toThrow("durable fence unavailable");
+		expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
+		const fenced = await readTopicAuthorityState(agentDir);
+		expect(fenced.topics.S).toMatchObject({ topicId: "909", authorityState: "delete_pending" });
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		bot.calls.length = 0;
+		await restarted.scanRoots();
+		expect(bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id)).toEqual([909]);
 	});
 });

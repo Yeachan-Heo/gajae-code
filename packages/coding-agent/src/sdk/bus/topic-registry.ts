@@ -41,6 +41,18 @@ export interface TopicRecord {
 	authorityEpoch?: number;
 	/** An uncertain delete fences future creation and inbound routing. */
 	authorityState?: "active" | "delete_pending";
+	/** Telegram chat and endpoint authority last proven to use this topic. */
+	chatId?: string;
+	/** Canonical endpoint tuple (URL + token) that currently holds the lease. */
+	endpointKey?: string;
+	/** Authenticated endpoint authority digest, excluding transport presentation. */
+	endpointDigest?: string;
+	/** SDK event generation associated with the current endpoint lease. */
+	endpointGeneration?: number;
+	/** Monotonic authenticated endpoint handoffs; legacy bindings begin at zero. */
+	endpointIncarnation?: number;
+	/** True when persisted binding fields were present but malformed; recovery must fail closed. */
+	bindingMalformed?: true;
 }
 
 /** Serialisable shape persisted to disk. */
@@ -49,6 +61,66 @@ export interface TopicRegistryState {
 	topics: Record<string, TopicRecord>;
 	/** Durable deletion epochs retained after a definite delete. */
 	fences?: Record<string, number>;
+	/** Closed transport endpoint leases; unchanged endpoint discovery remains fenced across restart. */
+	closedEndpoints?: Record<string, TopicEndpointBinding>;
+}
+
+/** Authenticated runtime binding for a durable topic lease. */
+export interface TopicEndpointBinding {
+	chatId: string;
+	endpointKey: string;
+	endpointDigest: string;
+	endpointGeneration?: number;
+}
+
+/** Conditional rollback token for a delete fence publication. */
+export interface TopicDeleteAuthoritySnapshot {
+	sessionId: string;
+	topicId?: string;
+	authorityEpoch?: number;
+	authorityState?: TopicRecord["authorityState"];
+	fenceEpoch?: number;
+}
+
+
+function isValidBindingString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+function isValidBindingGeneration(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+function hasAnyBinding(record: TopicRecord): boolean {
+	return (
+		record.chatId !== undefined ||
+		record.endpointKey !== undefined ||
+		record.endpointDigest !== undefined ||
+		record.endpointGeneration !== undefined ||
+		record.endpointIncarnation !== undefined
+	);
+}
+
+function hasCompleteBinding(record: TopicRecord): boolean {
+	return (
+		isValidBindingString(record.chatId) &&
+		isValidBindingString(record.endpointKey) &&
+		isValidBindingString(record.endpointDigest) &&
+		(record.endpointGeneration === undefined || isValidBindingGeneration(record.endpointGeneration)) &&
+		(record.endpointIncarnation === undefined || isValidBindingGeneration(record.endpointIncarnation))
+	);
+}
+
+function hasMalformedBinding(record: TopicRecord): boolean {
+	return hasAnyBinding(record) && !hasCompleteBinding(record);
+}
+
+function hasValidBinding(binding: TopicEndpointBinding): boolean {
+	return (
+		isValidBindingString(binding.chatId) &&
+		isValidBindingString(binding.endpointKey) &&
+		isValidBindingString(binding.endpointDigest) &&
+		(binding.endpointGeneration === undefined || isValidBindingGeneration(binding.endpointGeneration))
+	);
 }
 
 function isValidTopicId(value: unknown): value is string {
@@ -74,11 +146,22 @@ export class TopicRegistry {
 	readonly #ambiguousTopicIds = new Set<string>();
 	/** In-flight create promises, keyed by session, to dedupe concurrent creates. */
 	private readonly inflight = new Map<string, Promise<TopicRecord>>();
+	/** Newly-created records being durably published; never routable until committed. */
+	private readonly staged = new Map<string, TopicRecord>();
 	/** Monotonic authority epochs, including deletion fences for absent records. */
 	private readonly epochs = new Map<string, number>();
 
 	constructor(state: TopicRegistryState = emptyTopicRegistryState()) {
 		this.topics = new Map();
+		this.load(state);
+	}
+
+	/** Replace all runtime state after a successfully persisted staged publication. */
+	replace(state: TopicRegistryState): void {
+		this.topics.clear();
+		this.byTopic.clear();
+		this.#ambiguousTopicIds.clear();
+		this.epochs.clear();
 		this.load(state);
 	}
 
@@ -94,9 +177,10 @@ export class TopicRegistry {
 				raw.nameOwner === "user" &&
 				typeof raw.name === "string" &&
 				raw.name.trim().length > 0 &&
-				typeof raw.userNameUpdateId === "number" &&
-				Number.isSafeInteger(raw.userNameUpdateId) &&
-				raw.userNameUpdateId >= 0;
+				(raw.userNameUpdateId === undefined ||
+					(typeof raw.userNameUpdateId === "number" &&
+						Number.isSafeInteger(raw.userNameUpdateId) &&
+						raw.userNameUpdateId >= 0));
 			const hasValidReplayCursor =
 				typeof raw.replayGeneration === "number" &&
 				Number.isSafeInteger(raw.replayGeneration) &&
@@ -104,6 +188,18 @@ export class TopicRegistry {
 				typeof raw.replaySeq === "number" &&
 				Number.isSafeInteger(raw.replaySeq) &&
 				raw.replaySeq >= 0;
+			const bindingMalformed = raw.bindingMalformed === true || !hasCompleteBinding(raw);
+			const candidateAuthorityEpoch = raw.authorityEpoch;
+			const rawAuthorityEpoch: number =
+				typeof candidateAuthorityEpoch === "number" &&
+				Number.isSafeInteger(candidateAuthorityEpoch) &&
+				candidateAuthorityEpoch >= 0
+					? candidateAuthorityEpoch
+					: 0;
+			// A fence is the durable authority source. A mixed snapshot can contain an
+			// older active record alongside a newer fence; never rebuild its inbound route.
+			const fenceEpoch = this.epochs.get(sessionId) ?? 0;
+			const fenceSupersedesRecord = fenceEpoch > rawAuthorityEpoch;
 			const record: TopicRecord = {
 				topicId: raw.topicId,
 				identitySent: raw.identitySent === true,
@@ -114,15 +210,27 @@ export class TopicRegistry {
 					: {}),
 				...(hasValidUserAuthority ? { nameOwner: "user" as const } : {}),
 				...(hasValidUserAuthority && raw.nameReconcilePending === true ? { nameReconcilePending: true } : {}),
-				...(hasValidUserAuthority ? { userNameUpdateId: raw.userNameUpdateId } : {}),
+				...(hasValidUserAuthority && typeof raw.userNameUpdateId === "number"
+					? { userNameUpdateId: raw.userNameUpdateId }
+					: {}),
 				...(typeof raw.identityKey === "string" ? { identityKey: raw.identityKey } : {}),
 				...(hasValidReplayCursor ? { replayGeneration: raw.replayGeneration, replaySeq: raw.replaySeq } : {}),
-				...(Number.isSafeInteger(raw.authorityEpoch) && raw.authorityEpoch! >= 0
-					? { authorityEpoch: raw.authorityEpoch }
+				authorityEpoch: Math.max(rawAuthorityEpoch, fenceEpoch),
+				...(raw.authorityState === "delete_pending" || fenceSupersedesRecord
+					? { authorityState: "delete_pending" as const }
 					: {}),
-				...(raw.authorityState === "delete_pending" ? { authorityState: "delete_pending" as const } : {}),
+				...(isValidBindingString(raw.chatId) ? { chatId: raw.chatId } : {}),
+				...(isValidBindingString(raw.endpointKey) ? { endpointKey: raw.endpointKey } : {}),
+				...(isValidBindingString(raw.endpointDigest) ? { endpointDigest: raw.endpointDigest } : {}),
+				...(isValidBindingGeneration(raw.endpointGeneration)
+					? { endpointGeneration: raw.endpointGeneration }
+					: {}),
+				...(isValidBindingGeneration(raw.endpointIncarnation)
+					? { endpointIncarnation: raw.endpointIncarnation }
+					: {}),
+				...(bindingMalformed ? { bindingMalformed: true as const } : {}),
 			};
-			this.epochs.set(sessionId, Math.max(this.epochs.get(sessionId) ?? 0, record.authorityEpoch ?? 0));
+			this.epochs.set(sessionId, Math.max(fenceEpoch, record.authorityEpoch ?? 0));
 
 			this.topics.set(sessionId, record);
 		}
@@ -135,7 +243,7 @@ export class TopicRegistry {
 		const activeByTopic = new Map<string, string>();
 
 		for (const [sessionId, record] of this.topics) {
-			if (record.authorityState === "delete_pending") {
+			if (record.authorityState === "delete_pending" || record.bindingMalformed) {
 				this.#ambiguousTopicIds.add(record.topicId);
 				continue;
 			}
@@ -161,23 +269,141 @@ export class TopicRegistry {
 		return [...this.topics.keys()];
 	}
 
-	/** The existing topic record for a session, if any. */
-	get(sessionId: string): TopicRecord | undefined {
-		return this.topics.get(sessionId);
+	/** Persisted remote deletes that must be reconciled before recovery can proceed. */
+	deletePendingSessionIds(): string[] {
+		return [...this.topics].flatMap(([sessionId, record]) =>
+			record.authorityState === "delete_pending" ? [sessionId] : [],
+		);
+	}
+
+/** The existing topic record for a session, if any. */
+get(sessionId: string): TopicRecord | undefined {
+	return this.topics.get(sessionId);
+}
+
+/** Whether this session has an active, unambiguous topic authority. */
+isActiveUnambiguous(sessionId: string): boolean {
+	const record = this.topics.get(sessionId);
+	return record?.authorityState !== "delete_pending" && this.byTopic.get(record?.topicId ?? "") === sessionId;
+}
+
+	/**
+	 * Resolve a uniquely bound logical owner for an identity-less replay. The
+	 * endpoint tuple is durable authority; transport ids alone never are.
+	 */
+	uniqueSessionForEndpoint(binding: TopicEndpointBinding, excludedSessionId?: string): string | undefined {
+		if (!hasValidBinding(binding)) return undefined;
+		const matches = [...this.topics].flatMap(([sessionId, record]) =>
+			sessionId !== excludedSessionId &&
+			this.isActiveUnambiguous(sessionId) &&
+			!record.bindingMalformed &&
+			record.chatId === binding.chatId &&
+			record.endpointKey === binding.endpointKey &&
+			record.endpointDigest === binding.endpointDigest
+				? [sessionId]
+				: [],
+		);
+		return matches.length === 1 ? matches[0] : undefined;
 	}
 
 	/**
-	 * Return the existing active topic for `sessionId`, or create one via
-	 * `create` (called only on first use).
+	 * Rebind an existing topic to an authenticated successor endpoint. The exact
+	 * logical session id is proved by replay before this method is called. A
+	 * rotated credential may replace only an inactive incumbent; concurrent
+	 * incumbents, cross-chat records, malformed evidence, collisions, and delete
+	 * fences remain fail-closed.
 	 */
-	async getOrCreateTopic(
+	bindEndpoint(
 		sessionId: string,
-		create: () => Promise<unknown>,
-		now: () => number = Date.now,
-		name?: string,
-	): Promise<TopicRecord> {
+		binding: TopicEndpointBinding,
+		activeEndpointKeys: ReadonlySet<string> = new Set(),
+		allowEndpointRotation = false,
+	): "bound" | "unchanged" | "rejected" {
+		const record = this.topics.get(sessionId);
+		if (
+			!record ||
+			record.authorityState === "delete_pending" ||
+			record.bindingMalformed ||
+			!hasValidBinding(binding) ||
+			!this.isActiveUnambiguous(sessionId)
+		)
+			return "rejected";
+		if (hasAnyBinding(record) && !hasCompleteBinding(record)) return "rejected";
+		// A topic id without chat affinity may belong to any prior paired chat.
+		// Do not bind it to the current chat merely because a resumed endpoint
+		// authenticated its logical session id.
+		if (record.chatId === undefined || record.chatId !== binding.chatId) return "rejected";
+
+		const sameEndpoint =
+			record.endpointKey === binding.endpointKey && record.endpointDigest === binding.endpointDigest;
+		if (
+			sameEndpoint &&
+			record.endpointGeneration !== undefined &&
+			binding.endpointGeneration !== undefined &&
+			binding.endpointGeneration < record.endpointGeneration
+		)
+			return "rejected";
+		if (
+			!sameEndpoint &&
+			hasAnyBinding(record) &&
+			(!allowEndpointRotation || (record.endpointKey !== undefined && activeEndpointKeys.has(record.endpointKey)))
+		)
+			return "rejected";
+
+		const changed =
+			record.chatId !== binding.chatId ||
+			record.endpointKey !== binding.endpointKey ||
+			record.endpointDigest !== binding.endpointDigest ||
+			record.endpointGeneration !== binding.endpointGeneration;
+		if (!changed) return "unchanged";
+		record.chatId = binding.chatId;
+		record.endpointKey = binding.endpointKey;
+		record.endpointDigest = binding.endpointDigest;
+		record.endpointGeneration = binding.endpointGeneration;
+		if (!sameEndpoint) record.endpointIncarnation = (record.endpointIncarnation ?? 0) + 1;
+		return "bound";
+	}
+
+	/** Undo a failed durable endpoint migration without disturbing concurrent metadata writers. */
+	restoreEndpointBinding(
+		sessionId: string,
+		expected: TopicEndpointBinding,
+		previous: Pick<TopicRecord, "chatId" | "endpointKey" | "endpointDigest" | "endpointGeneration" | "endpointIncarnation">,
+	): boolean {
+		const record = this.topics.get(sessionId);
+		if (
+			!record ||
+			record.chatId !== expected.chatId ||
+			record.endpointKey !== expected.endpointKey ||
+			record.endpointDigest !== expected.endpointDigest ||
+			record.endpointGeneration !== expected.endpointGeneration
+		)
+			return false;
+		record.chatId = previous.chatId;
+		record.endpointKey = previous.endpointKey;
+		record.endpointDigest = previous.endpointDigest;
+		if (previous.endpointGeneration === undefined) delete record.endpointGeneration;
+		else record.endpointGeneration = previous.endpointGeneration;
+		if (previous.endpointIncarnation === undefined) delete record.endpointIncarnation;
+		else record.endpointIncarnation = previous.endpointIncarnation;
+		return true;
+	}
+
+/**
+ * Return the existing active topic for `sessionId`, or create one via
+ * `create` (called only on first use).
+ */
+async getOrCreateTopic(
+	sessionId: string,
+	create: () => Promise<unknown>,
+	now: () => number = Date.now,
+	name?: string,
+	binding?: TopicEndpointBinding,
+	commit?: () => Promise<void>,
+): Promise<TopicRecord> {
 		const existing = this.topics.get(sessionId);
 		if (existing?.authorityState === "delete_pending") throw new Error("topic authority is deletion-fenced");
+		if (existing?.bindingMalformed) throw new Error("topic authority binding is quarantined");
 		if (existing) return existing;
 		const pending = this.inflight.get(sessionId);
 		if (pending) return pending;
@@ -192,10 +418,36 @@ export class TopicRegistry {
 				identitySent: false,
 				createdAt: now(),
 				authorityEpoch: revoked ? (this.epochs.get(sessionId) ?? 0) : epoch,
+				...(binding
+					? {
+							chatId: binding.chatId,
+							endpointKey: binding.endpointKey,
+							endpointDigest: binding.endpointDigest,
+							endpointIncarnation: 0,
+							...(binding.endpointGeneration === undefined ? {} : { endpointGeneration: binding.endpointGeneration }),
+						}
+					: {}),
 				...(revoked ? { authorityState: "delete_pending" as const } : {}),
 			};
+			if (revoked) {
+				this.topics.set(sessionId, record);
+				throw new Error("topic authority was revoked during creation");
+			}
+			this.staged.set(sessionId, record);
+			try {
+				await commit?.();
+			} catch (error) {
+				this.staged.delete(sessionId);
+				throw error;
+			}
+			this.staged.delete(sessionId);
+			if ((this.epochs.get(sessionId) ?? 0) !== epoch) {
+				record.authorityEpoch = this.epochs.get(sessionId) ?? 0;
+				record.authorityState = "delete_pending";
+				this.topics.set(sessionId, record);
+				throw new Error("topic authority was revoked during creation");
+			}
 			this.topics.set(sessionId, record);
-			if (revoked) throw new Error("topic authority was revoked during creation");
 			if (this.#ambiguousTopicIds.has(topicId)) return record;
 			if (this.byTopic.has(topicId)) {
 				this.byTopic.delete(topicId);
@@ -323,6 +575,42 @@ export class TopicRegistry {
 		record.nameReconcilePending = false;
 	}
 
+	/** Capture only authority fields that a failed delete publication may restore. */
+	captureDeleteAuthority(sessionId: string): TopicDeleteAuthoritySnapshot {
+		const record = this.topics.get(sessionId);
+		return {
+			sessionId,
+			topicId: record?.topicId,
+			authorityEpoch: record?.authorityEpoch,
+			authorityState: record?.authorityState,
+			fenceEpoch: this.epochs.get(sessionId),
+		};
+	}
+
+	/** Restore a failed delete fence only while its exact authority mutation remains current. */
+	restoreDeleteAuthority(snapshot: TopicDeleteAuthoritySnapshot): boolean {
+		const record = this.topics.get(snapshot.sessionId);
+		const deleteEpoch = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0) + 1;
+		if (this.epochs.get(snapshot.sessionId) !== deleteEpoch) return false;
+		if (snapshot.topicId === undefined) {
+			if (record) return false;
+		} else if (
+			!record ||
+			record.topicId !== snapshot.topicId ||
+			record.authorityState !== "delete_pending" ||
+			record.authorityEpoch !== deleteEpoch
+		) {
+			return false;
+		} else {
+			record.authorityEpoch = snapshot.authorityEpoch;
+			record.authorityState = snapshot.authorityState;
+			if (this.byTopic.get(record.topicId) === undefined) this.byTopic.set(record.topicId, snapshot.sessionId);
+		}
+		if (snapshot.fenceEpoch === undefined) this.epochs.delete(snapshot.sessionId);
+		else this.epochs.set(snapshot.sessionId, snapshot.fenceEpoch);
+		return true;
+	}
+
 	/** Fence new work before the remote delete starts, including an absent in-flight create. */
 	beginDelete(sessionId: string): TopicRecord | undefined {
 		const record = this.topics.get(sessionId);
@@ -332,6 +620,38 @@ export class TopicRegistry {
 		record.authorityEpoch = epoch;
 		record.authorityState = "delete_pending";
 		if (this.byTopic.get(record.topicId) === sessionId) this.byTopic.delete(record.topicId);
+		return record;
+	}
+
+	/** Retain an accepted create as deletion-fenced before remote compensation can begin. */
+	fenceAcceptedCreate(
+		sessionId: string,
+		topicId: string,
+		now: () => number = Date.now,
+		name?: string,
+		binding?: TopicEndpointBinding,
+	): TopicRecord {
+		const epoch = Math.max(this.epochs.get(sessionId) ?? 0, this.topics.get(sessionId)?.authorityEpoch ?? 0);
+		const record: TopicRecord = {
+			topicId,
+			name,
+			identitySent: false,
+			createdAt: now(),
+			authorityEpoch: epoch,
+			authorityState: "delete_pending",
+			...(binding
+				? {
+						chatId: binding.chatId,
+						endpointKey: binding.endpointKey,
+						endpointDigest: binding.endpointDigest,
+						endpointIncarnation: 0,
+						...(binding.endpointGeneration === undefined ? {} : { endpointGeneration: binding.endpointGeneration }),
+					}
+				: {}),
+		};
+		this.topics.set(sessionId, record);
+		if (this.byTopic.get(topicId) === sessionId) this.byTopic.delete(topicId);
+		this.#ambiguousTopicIds.add(topicId);
 		return record;
 	}
 
@@ -357,8 +677,8 @@ export class TopicRegistry {
 		return this.topics.delete(sessionId);
 	}
 
-	/** Serialise for atomic persistence beside the daemon state. */
+	/** Serialise active records plus unpublished staged creates for atomic commit. */
 	serialize(): TopicRegistryState {
-		return { topics: Object.fromEntries(this.topics), fences: Object.fromEntries(this.epochs) };
+		return { topics: Object.fromEntries([...this.topics, ...this.staged]), fences: Object.fromEntries(this.epochs) };
 	}
 }

@@ -87,7 +87,6 @@ describe("TopicRegistry", () => {
 		["empty name", { name: "", userNameUpdateId: 3 }],
 		["whitespace name", { name: " \t\n ", userNameUpdateId: 3 }],
 		["negative update id", { name: "Blocked name", userNameUpdateId: -1 }],
-		["missing update id", { name: "Missing source id" }],
 	])("malformed persisted user authority (%s) falls back to daemon naming", (_name, fields) => {
 		const reg = new TopicRegistry({
 			topics: {
@@ -105,6 +104,22 @@ describe("TopicRegistry", () => {
 		expect(reg.get("bad")?.nameOwner).toBeUndefined();
 		expect(reg.get("bad")?.nameReconcilePending).toBeUndefined();
 		expect(reg.get("bad")?.userNameUpdateId).toBeUndefined();
+	});
+
+	test("legacy user authority without an update id remains user-owned", () => {
+		const reg = new TopicRegistry({
+			topics: {
+				legacy: {
+					topicId: "1",
+					identitySent: false,
+					createdAt: 1,
+					nameOwner: "user",
+					name: "Missing source id",
+				},
+			},
+		});
+		expect(reg.needsRename("legacy", "Generated name")).toBe(false);
+		expect(reg.userOwnedName("legacy")).toBe("Missing source id");
 	});
 
 	test("retains valid user authority and normalizes legacy name state", () => {
@@ -137,6 +152,66 @@ describe("TopicRegistry", () => {
 		expect(reg.userNameToReconcile("user")).toBe("Preserved name");
 	});
 
+	test("rejects a persisted binding with present malformed evidence", () => {
+		const reg = new TopicRegistry({
+			topics: {
+				s1: {
+					topicId: "42",
+					identitySent: false,
+					createdAt: 1,
+					chatId: "42",
+					endpointKey: "key",
+					endpointDigest: "digest",
+					endpointGeneration: -1,
+				},
+			},
+		});
+		expect(reg.bindEndpoint("s1", { chatId: "42", endpointKey: "key", endpointDigest: "digest", endpointGeneration: 1 })).toBe(
+			"rejected",
+		);
+		expect(reg.get("s1")?.bindingMalformed).toBe(true);
+	});
+
+	test("quarantines an unbound legacy topic without validated chat affinity", async () => {
+		const reg = new TopicRegistry({ topics: { s1: { topicId: "42", identitySent: false, createdAt: 1 } } });
+		expect(reg.get("s1")?.bindingMalformed).toBe(true);
+		expect(reg.sessionForTopic("42")).toBeUndefined();
+		expect(reg.bindEndpoint("s1", { chatId: "42", endpointKey: "key", endpointDigest: "digest", endpointGeneration: 1 })).toBe(
+			"rejected",
+		);
+		await expect(reg.getOrCreateTopic("s1", async () => "43")).rejects.toThrow("topic authority binding is quarantined");
+	});
+	test("rejects a lower replay generation for the same endpoint without mutating durable authority", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "42", Date.now, undefined, {
+			chatId: "42",
+			endpointKey: "endpoint",
+			endpointDigest: "digest",
+			endpointGeneration: 9,
+		});
+		expect(
+			reg.bindEndpoint("s1", {
+				chatId: "42",
+				endpointKey: "endpoint",
+				endpointDigest: "digest",
+				endpointGeneration: 9,
+			}),
+		).toBe("unchanged");
+		expect(
+			reg.bindEndpoint("s1", {
+				chatId: "42",
+				endpointKey: "endpoint",
+				endpointDigest: "digest",
+				endpointGeneration: 8,
+			}),
+		).toBe("rejected");
+		expect(reg.serialize().topics.s1).toMatchObject({
+			endpointGeneration: 9,
+			endpointKey: "endpoint",
+			endpointDigest: "digest",
+		});
+	});
+
 	test("resolves session for a topic id (inbound routing)", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "99");
@@ -144,7 +219,7 @@ describe("TopicRegistry", () => {
 		expect(reg.sessionForTopic("nope")).toBeUndefined();
 	});
 
-	test("round-trips through serialize and reload, preserving reuse + identity", async () => {
+	test("quarantines an unbound persisted topic across restart", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic(
 			"s1",
@@ -153,15 +228,10 @@ describe("TopicRegistry", () => {
 		);
 		reg.markIdentitySent("s1");
 		const reloaded = new TopicRegistry(reg.serialize());
-		let created = false;
-		const rec = await reloaded.getOrCreateTopic("s1", async () => {
-			created = true;
-			return "2";
-		});
-		expect(created).toBe(false);
-		expect(rec.topicId).toBe("1");
-		expect(reloaded.needsIdentity("s1")).toBe(false);
-		expect(reloaded.sessionForTopic("1")).toBe("s1");
+
+		expect(reloaded.get("s1")?.bindingMalformed).toBe(true);
+		expect(reloaded.sessionForTopic("1")).toBeUndefined();
+		await expect(reloaded.getOrCreateTopic("s1", async () => "2")).rejects.toThrow("topic authority binding is quarantined");
 	});
 	test("persists a monotonic SDK replay cursor across daemon restarts", async () => {
 		const reg = new TopicRegistry();
@@ -255,6 +325,17 @@ describe("TopicRegistry", () => {
 		expect(reg.sessionForTopic("42")).toBeUndefined();
 		expect(reg.serialize().topics.s1).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
 	});
+	test("never activates a staged topic whose authority is revoked during durable commit", async () => {
+		const reg = new TopicRegistry();
+		await expect(
+			reg.getOrCreateTopic("s1", async () => "42", Date.now, undefined, undefined, async () => {
+				reg.beginDelete("s1");
+			}),
+		).rejects.toThrow("topic authority was revoked during creation");
+		expect(reg.sessionForTopic("42")).toBeUndefined();
+		expect(reg.get("s1")).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
+		expect(reg.serialize().topics.s1).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
+	});
 	test("retains a delete-pending record and epoch without restoring its inbound route", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "42");
@@ -267,6 +348,17 @@ describe("TopicRegistry", () => {
 		await expect(reloaded.getOrCreateTopic("s1", async () => "43")).rejects.toThrow(
 			"topic authority is deletion-fenced",
 		);
+	});
+	test("fails closed after restart when a durable fence supersedes an active record epoch", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "42");
+		const snapshot = reg.serialize();
+		snapshot.fences = { s1: (snapshot.topics.s1.authorityEpoch ?? 0) + 1 };
+
+		const reloaded = new TopicRegistry(snapshot);
+
+		expect(reloaded.get("s1")).toMatchObject({ topicId: "42", authorityState: "delete_pending" });
+		expect(reloaded.sessionForTopic("42")).toBeUndefined();
 	});
 	test("rebuilds inbound routes from merged records on repeated load", async () => {
 		const reg = new TopicRegistry();
