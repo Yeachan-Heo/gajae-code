@@ -5,8 +5,6 @@
 
 - Documented that custom OpenAI-compatible models omit vision by default: when `input` is unset, GJC treats the model as text-only and strips images with `[image omitted: model does not support vision]`. Vision backends must set `input: [text, image]` in `models.yml`.
 - Resumed managed sessions now complete the verified legacy `local://` artifact migration before synchronous path resolution, preserving legacy scratch files instead of failing startup with a migration-order error.
-
-### Fixed
 - Corrected Telegram's uncertain lifecycle guidance so create, close, and resume commands describe their own possible outcome; close and resume no longer display the create-only duplicate-start warning.
 
 ## [0.11.6] - 2026-07-21
