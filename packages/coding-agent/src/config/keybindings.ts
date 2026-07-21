@@ -172,7 +172,7 @@ export const KEYBINDINGS = {
 	},
 	"app.session.fork": {
 		defaultKeys: [],
-		description: "Fork session",
+		description: "Branch from message",
 	},
 	"app.session.resume": {
 		defaultKeys: [],
