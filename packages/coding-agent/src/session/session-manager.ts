@@ -4609,12 +4609,14 @@ export class SessionManager {
 		const previousDestination = this.destination;
 		const previousArtifactDir = previousSessionFile?.slice(0, -6);
 
-		const nextDestination = (() => {
-			if (this.destination.kind === "managed") {
-				return managedDestination(resolvedCwd, this.storage, this.destination.securityContext.agentDir);
-			}
-			return this.destination;
-		})();
+		const nextDestination =
+			this.storage instanceof FileSessionStorage
+				? managedDestination(
+						resolvedCwd,
+						this.storage,
+						this.destination.kind === "managed" ? this.destination.securityContext.agentDir : undefined,
+					)
+				: this.destination;
 		const newSessionDir = nextDestination.directory;
 		let hadSessionFile = false;
 		const managedMove = this.destination.kind === "managed" && nextDestination.kind === "managed";

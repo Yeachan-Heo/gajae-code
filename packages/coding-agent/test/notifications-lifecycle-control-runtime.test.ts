@@ -22,7 +22,7 @@ import {
 import type { LedgerEntry, OrchestratorDeps } from "@gajae-code/coding-agent/sdk/bus/lifecycle-orchestrator";
 import { startDaemonLifecycleControl } from "@gajae-code/coding-agent/sdk/bus/telegram-daemon";
 import * as native from "@gajae-code/natives";
-import { logger } from "@gajae-code/utils";
+import { getConfigRootDir, logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { tokenFingerprint } from "../src/sdk/bus/config";
 import { acquireDaemonOwnership, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
@@ -38,6 +38,14 @@ function secureOwnerOnlyFile(pathname: string): void {
 	if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
 	const verified = native.verifyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
 	if (!verified.ok) throw new Error(`Owner-only security rejected ${pathname}: ${verified.code}`);
+}
+
+function managedFixtureRoot(prefix: string): string {
+	const fixturesRoot = path.join(getConfigRootDir(), "test-fixtures");
+	fs.mkdirSync(fixturesRoot, { recursive: true, mode: 0o700 });
+	const applied = native.applyOwnerOnlyPathSecurity(fixturesRoot, "directory") as NativeSecurity;
+	if (!applied.ok) throw new Error(`Owner-only security rejected ${fixturesRoot}: ${applied.code}`);
+	return fs.mkdtempSync(path.join(fixturesRoot, prefix));
 }
 
 function writeManagedSession(sessionsRoot: string, cwd: string, sessionId: string): void {
@@ -1134,7 +1142,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	posixTmuxIt("daemonResumeSession fails closed against saved history (notFound / ambiguous)", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-"));
+		const root = managedFixtureRoot("gjc-resume-");
 		const proj = path.join(root, "proj");
 		fs.mkdirSync(proj, { recursive: true });
 		await writeManagedSession(root, proj, "abc111");
@@ -1164,7 +1172,7 @@ describe("lifecycle control runtime", () => {
 	});
 
 	posixTmuxIt("daemonResumeSession cold-restarts saved sessions from their recorded cwd", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-cwd-"));
+		const root = managedFixtureRoot("gjc-resume-cwd-");
 		const proj = path.join(root, "saved-project");
 		const callsFile = path.join(root, "tmux-calls.log");
 		const serverState = path.join(root, "tmux-server-started");
@@ -1529,7 +1537,7 @@ describe("lifecycle control runtime", () => {
 	posixTmuxIt(
 		"refuses unsafe or unverifiable servers before daemon create or cold-resume can mutate tmux",
 		async () => {
-			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-pre-mutation-refusal-"));
+			const root = managedFixtureRoot("gjc-pre-mutation-refusal-");
 			const project = path.join(root, "project");
 			const callsFile = path.join(root, "tmux-calls.log");
 			const tmux = path.join(root, "fake-tmux.sh");
@@ -1643,7 +1651,7 @@ describe("lifecycle control runtime", () => {
 	posixTmuxIt(
 		"writes no cold-resume ownership tags when a replacement server reuses the native session before metadata",
 		async () => {
-			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cold-resume-metadata-"));
+			const root = managedFixtureRoot("gjc-cold-resume-metadata-");
 			const project = path.join(root, "project");
 			const callsFile = path.join(root, "tmux-calls.log");
 			const tmux = path.join(root, "fake-tmux.sh");
@@ -1702,7 +1710,7 @@ describe("lifecycle control runtime", () => {
 	);
 
 	posixTmuxIt("refuses psmux before create or cold-resume can mutate lifecycle state", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lifecycle-psmux-"));
+		const root = managedFixtureRoot("gjc-lifecycle-psmux-");
 		const project = path.join(root, "project");
 		const psmux = path.join(root, "psmux");
 		const plain = path.join(root, "plain");

@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { exportSessionToHtml } from "@gajae-code/coding-agent/export/html";
 import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
 import * as native from "@gajae-code/natives";
+import { getConfigRootDir } from "@gajae-code/utils";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -14,7 +14,9 @@ afterEach(async () => {
 });
 
 function tempRoot(prefix = "gjc-resident-life-"): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	const parent = getConfigRootDir();
+	fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+	const dir = fs.mkdtempSync(path.join(parent, prefix));
 	tempDirs.push(dir);
 	return dir;
 }
