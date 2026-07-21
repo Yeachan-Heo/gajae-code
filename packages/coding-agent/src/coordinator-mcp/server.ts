@@ -12,6 +12,7 @@ import {
 	type CoordinatorToolName,
 } from "../coordinator/contract";
 import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
+import { sessionRuntimeDir } from "../gjc-runtime/session-layout";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
@@ -1584,6 +1585,83 @@ async function markTurnTerminalFromSessionState(
 	return resolved;
 }
 
+/**
+ * Adopt the runtime's authoritative terminal state for a broker-hosted session.
+ *
+ * SDK broker sessions run many sessions inside one broker process, so the runtime
+ * sidecar cannot receive a per-session `GJC_COORDINATOR_SESSION_STATE_FILE` env and
+ * instead writes its `agent_end` record to the worktree-local
+ * `<cwd>/.gjc/_session-<id>/runtime/runtime-state.json`. The coordinator polls its
+ * own `session-states/<id>.json`, which only ever holds the `source: "coordinator"`
+ * `running` write from prompt delivery — so `await_turn`/`read_turn` would never
+ * observe completion and hang until timeout. Read the runtime-authored record
+ * directly and surface it as a coordinator session-state so the normal
+ * terminal-transition path fires with the real `final_response`.
+ */
+async function readAgentAuthoredTerminalSessionState(
+	session: Record<string, unknown>,
+	sessionId: string,
+	turnId: string,
+	notBefore: string | null,
+	canonicalize: (value: string) => Promise<string>,
+): Promise<RuntimeSessionStatePayload | null> {
+	const cwd = optionalString(session.cwd) ?? optionalString(session.broker_workspace);
+	if (!cwd) return null;
+	const candidate = path.join(sessionRuntimeDir(cwd, sessionId), "runtime-state.json");
+	let canonicalRoot: string;
+	let canonicalFile: string;
+	try {
+		canonicalRoot = await canonicalize(cwd);
+		canonicalFile = await canonicalize(candidate);
+	} catch {
+		return null;
+	}
+	if (canonicalFile !== canonicalRoot && !canonicalFile.startsWith(canonicalRoot + path.sep)) return null;
+	const record = asRecord(await readJsonFile(canonicalFile));
+	if (!record) return null;
+	if (optionalString(record.session_id) !== sessionId) return null;
+	if (record.source !== "agent_session_event") return null;
+	const state = optionalString(record.state);
+	if (state !== "completed" && state !== "errored") return null;
+	const endedAt = optionalString(record.ended_at) ?? optionalString(record.updated_at);
+	if (!endedAt) return null;
+	// The runtime-authored record carries no coordinator turn id, so guard against
+	// adopting a stale completion from an earlier turn on a reused session: require
+	// its completion timestamp to be at or after this turn's start (ISO-8601 UTC
+	// strings compare lexicographically).
+	if (notBefore && endedAt < notBefore) return null;
+	const finalResponse = asRecord(record.final_response);
+	const errorRecord = asRecord(record.error);
+	return {
+		schema_version: 1,
+		session_id: sessionId,
+		state,
+		ready_for_input: state === "completed",
+		current_turn_id: turnId,
+		last_turn_id: optionalString(record.last_turn_id),
+		updated_at: endedAt,
+		source: "agent_session_event",
+		live: typeof record.live === "boolean" ? record.live : false,
+		reason: optionalString(record.reason),
+		final_response: finalResponse
+			? {
+					text: optionalString(finalResponse.text),
+					format: "markdown",
+					source: optionalString(finalResponse.source) ?? "agent_session_event",
+					artifact_path: optionalString(finalResponse.artifact_path),
+					truncated: finalResponse.truncated === true,
+				}
+			: undefined,
+		error:
+			state === "errored"
+				? {
+						code: optionalString(errorRecord?.code) ?? "runtime_errored",
+						message: optionalString(errorRecord?.message) ?? "runtime_errored",
+						recoverable: errorRecord?.recoverable !== false,
+					}
+				: null,
+	};
+}
 function runtimeStateAcknowledgesTurn(turn: TurnRecord, sessionState: CoordinatorSessionState | null): boolean {
 	return (
 		sessionState?.source === "agent_session_event" &&
@@ -3060,6 +3138,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			resolvedTurn = { ...resolvedTurn, status: "waiting_for_answer", updated_at: timestamp };
 			await writeTurnRecord(namespaceDir, resolvedTurn);
 			await writeActiveTurn(namespaceDir, resolvedTurn);
+		}
+		if (
+			session &&
+			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
+			!(sessionState?.state === "completed" || sessionState?.state === "errored")
+		) {
+			const agentTerminal = await readAgentAuthoredTerminalSessionState(
+				session,
+				resolvedTurn.session_id,
+				resolvedTurn.turn_id,
+				resolvedTurn.started_at ?? resolvedTurn.created_at,
+				services.canonicalizePath ?? (value => fs.realpath(value)),
+			);
+			if (agentTerminal) sessionState = agentTerminal;
 		}
 		if (
 			sessionState &&

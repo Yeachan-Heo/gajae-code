@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../src/coordinator-mcp/server";
+import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
 	buildAskGateAnswerSchema,
@@ -2191,4 +2192,137 @@ it("repairs one terminal session without deleting another session's projections"
 		`${String(second.turn_id)}.json`,
 	);
 	await expect(fs.readFile(secondTurnPath, "utf8")).resolves.toContain("other-session");
+});
+
+async function seedBrokerSessionWithActiveTurn(root: string, controls: SdkControl[]) {
+	const server = await createSdkControlServer(root, controls);
+	await registerSdkSession(server, root);
+	// Merge the worktree cwd into the registered session record without clobbering the
+	// incarnation binding that send_prompt requires.
+	const sessionFilePath = path.join(
+		root,
+		".gjc",
+		"coordinator-state",
+		"local",
+		"repo",
+		"sessions",
+		"visible-session.json",
+	);
+	const sessionRecord = JSON.parse(await fs.readFile(sessionFilePath, "utf8")) as Record<string, unknown>;
+	await Bun.write(
+		sessionFilePath,
+		JSON.stringify({
+			...sessionRecord,
+			cwd: sessionRecord.cwd ?? root,
+			broker_workspace: sessionRecord.broker_workspace ?? root,
+		}),
+	);
+	const sent = await server.callTool("gjc_coordinator_send_prompt", {
+		session_id: "visible-session",
+		prompt: "read one file and summarize",
+		idempotency_key: "broker-complete-prompt",
+		allow_mutation: true,
+	});
+	expect(sent).toMatchObject({ ok: true });
+	const turnId = sent.turn_id;
+	if (typeof turnId !== "string") throw new Error("missing durable coordinator turn id");
+	return { server, turnId };
+}
+
+async function writeRuntimeAuthoredState(root: string, overrides: Record<string, unknown>) {
+	await Bun.write(
+		path.join(sessionRuntimeDir(root, "visible-session"), "runtime-state.json"),
+		JSON.stringify({
+			schema_version: 1,
+			session_id: "visible-session",
+			state: "completed",
+			ready_for_input: true,
+			current_turn_id: null,
+			last_turn_id: null,
+			updated_at: "2099-01-01T00:00:00.000Z",
+			ended_at: "2099-01-01T00:00:00.000Z",
+			source: "agent_session_event",
+			event: "agent_end",
+			live: false,
+			reason: null,
+			final_response: {
+				text: "utils/walletSync.ts summary",
+				format: "markdown",
+				source: "agent_end",
+				artifact_path: null,
+				truncated: false,
+			},
+			...overrides,
+		}),
+	);
+}
+
+describe("Coordinator MCP broker turn completion reconciliation", () => {
+	it("adopts the runtime-authored terminal state when the coordinator state is stuck at running", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const { server, turnId } = await seedBrokerSessionWithActiveTurn(root, controls);
+
+		// SDK broker sessions can't receive a per-session state-file env, so the runtime
+		// writes agent_end worktree-local while the coordinator's file stays at running.
+		await writeRuntimeAuthoredState(root, {});
+
+		const read = await server.callTool("gjc_coordinator_read_turn", {
+			turn_id: turnId,
+			session_id: "visible-session",
+		});
+		expect(read).toMatchObject({
+			ok: true,
+			turn: {
+				status: "completed",
+				final_response: { text: "utils/walletSync.ts summary" },
+			},
+		});
+	});
+
+	it("surfaces a runtime-authored errored terminal state as a failed turn", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const { server, turnId } = await seedBrokerSessionWithActiveTurn(root, controls);
+
+		await writeRuntimeAuthoredState(root, {
+			state: "errored",
+			ready_for_input: false,
+			final_response: {
+				text: null,
+				format: "markdown",
+				source: "launch_error",
+				artifact_path: null,
+				truncated: false,
+			},
+			error: { code: "fatal", message: "not a git repository", recoverable: true },
+		});
+
+		const read = await server.callTool("gjc_coordinator_read_turn", {
+			turn_id: turnId,
+			session_id: "visible-session",
+		});
+		expect(read).toMatchObject({
+			ok: true,
+			turn: { status: "failed", error: { code: "fatal" } },
+		});
+	});
+
+	it("ignores a stale runtime completion from an earlier turn on a reused session", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const { server, turnId } = await seedBrokerSessionWithActiveTurn(root, controls);
+
+		// A completion that ended before this turn started must not be adopted.
+		await writeRuntimeAuthoredState(root, {
+			updated_at: "2000-01-01T00:00:00.000Z",
+			ended_at: "2000-01-01T00:00:00.000Z",
+		});
+
+		const read = await server.callTool("gjc_coordinator_read_turn", {
+			turn_id: turnId,
+			session_id: "visible-session",
+		});
+		expect(read).toMatchObject({ ok: true, turn: { status: "active" } });
+	});
 });
