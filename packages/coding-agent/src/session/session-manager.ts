@@ -5552,7 +5552,8 @@ export class SessionManager {
 	getManagedLegacyLocalMigrationSource(): ManagedLegacyLocalMigrationSource | null {
 		if (this.destination.kind !== "managed" || !this.#sessionFile || this.#adoptedArtifactManager) return null;
 		const store = this.#managedTranscriptStore();
-		const legacyLocalRoot = path.posix.join(path.basename(this.#sessionFile.slice(0, -6)), "local");
+		const legacyArtifactsRoot = path.basename(this.#sessionFile.slice(0, -6));
+		const legacyLocalRoot = path.posix.join(legacyArtifactsRoot, "local");
 		return {
 			capture: async () => {
 				let snapshot: native.NativeDirectoryTreeSnapshot;
@@ -5560,6 +5561,13 @@ export class SessionManager {
 					snapshot = store.captureTree(legacyLocalRoot);
 				} catch (error) {
 					if (error instanceof Error && error.message === "not_found") return null;
+					if (error instanceof Error && error.message === "reparse_point") {
+						try {
+							store.captureTree(legacyArtifactsRoot);
+						} catch (artifactsError) {
+							if (artifactsError instanceof Error && artifactsError.message === "not_found") return null;
+						}
+					}
 					throw error;
 				}
 				let totalBytes = 0;
