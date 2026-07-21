@@ -9,7 +9,9 @@ const DAY = 24 * HOUR;
  */
 export function formatDuration(ms: number): string {
 	if (ms < SEC) return `${ms}ms`;
-	if (ms < MIN) return `${(ms / SEC).toFixed(1)}s`;
+	// Truncate below 60.0s instead of rounding up into the next unit (the minute
+	// branch below), mirroring roundBelow/formatByteUnit: e.g. 59_999ms -> "59.9s".
+	if (ms < MIN) return `${(roundBelow(ms / 100, 600) / 10).toFixed(1)}s`;
 	if (ms < HOUR) {
 		const mins = Math.floor(ms / MIN);
 		const secs = Math.floor((ms % MIN) / SEC);
@@ -59,13 +61,21 @@ export function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes}B`;
 	if (bytes < 1024 * 1024) return `${formatByteUnit(bytes, 1024)}KB`;
 	if (bytes < 1024 * 1024 * 1024) return `${formatByteUnit(bytes, 1024 * 1024)}MB`;
-	return `${formatByteUnit(bytes, 1024 * 1024 * 1024)}GB`;
+	// The GB branch is terminal (no larger unit), so it must not clamp below the
+	// next-unit boundary the way KB/MB do; clamping here reports every value >=
+	// 1 TiB as "1023.9GB" (e.g. 2 TiB -> "1023.9GB" instead of "2048.0GB").
+	return `${formatByteUnit(bytes, 1024 * 1024 * 1024, false)}GB`;
 }
 
-/** Format bytes to 1 decimal without rounding up into the next byte unit. */
-function formatByteUnit(bytes: number, unit: number): string {
-	const tenths = Math.min(Math.round((bytes / unit) * 10), 1024 * 10 - 1);
-	return (tenths / 10).toFixed(1);
+/**
+ * Format bytes to 1 decimal. Intermediate units (KB/MB) clamp just below the
+ * next-unit boundary so a value like 1023.95 KB never rounds up to "1024.0KB";
+ * the terminal GB unit passes `clampToNextUnit: false` because it has no next
+ * unit to protect against.
+ */
+function formatByteUnit(bytes: number, unit: number, clampToNextUnit = true): string {
+	const tenths = Math.round((bytes / unit) * 10);
+	return ((clampToNextUnit ? Math.min(tenths, 1024 * 10 - 1) : tenths) / 10).toFixed(1);
 }
 
 /**
