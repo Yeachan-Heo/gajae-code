@@ -604,6 +604,16 @@ export const stripClaudeToolPrefix = (name: string, prefixOverride: string = cla
 	return name.slice(prefixOverride.length);
 };
 
+// Anthropic base64 image payloads use the standard alphabet only. A resident
+// image whose blob went missing carries a human-readable placeholder in `data`
+// (e.g. "[Session resident imageData blob missing: …]"); sending that as an
+// image yields a 400 `invalid base64 data` that rejects the whole request and
+// bricks the session. Guard the wire format so such payloads degrade to text.
+const ANTHROPIC_BASE64_IMAGE_DATA = /^[A-Za-z0-9+/]+={0,2}$/;
+function isAnthropicBase64ImageData(data: string): boolean {
+	return data.length > 0 && ANTHROPIC_BASE64_IMAGE_DATA.test(data);
+}
+
 /**
  * Convert content blocks to Anthropic API format
  */
@@ -627,7 +637,18 @@ function convertContentBlocks(
 		.filter((block): block is TextContent => block.type === "text")
 		.map(block => block.text.toWellFormed())
 		.filter(text => text.trim().length > 0);
-	const imageBlocks = content.filter((block): block is ImageContent => block.type === "image");
+	const imageBlocks: ImageContent[] = [];
+	for (const block of content) {
+		if (block.type !== "image") continue;
+		if (isAnthropicBase64ImageData(block.data)) {
+			imageBlocks.push(block);
+			continue;
+		}
+		// Non-base64 image payload (e.g. a missing-blob placeholder): degrade to
+		// text so one lost image cannot invalidate the entire request.
+		const text = block.data.toWellFormed().trim();
+		if (text.length > 0) textBlocks.push(text);
+	}
 	const omittedImages = !supportsImages && imageBlocks.length > 0;
 	if (imageBlocks.length === 0 || !supportsImages) {
 		if (omittedImages) {
