@@ -270,6 +270,9 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("unless the user explicitly requests a change, command, or execution");
 		expect(rendered).toContain("Clear, low-risk implementation requests use direct tools");
 		expect(rendered).toContain("Vague requirements use `/skill:deep-interview`");
+		expect(rendered).toContain("gjc deep-interview sanity-check");
+		expect(rendered).toContain("repair through typed deep-interview operations");
+		expect(rendered).toContain("never reconstruct or replace the full envelope in normal flow");
 	});
 
 	test("keeps system and project as separate ordered blocks; volatile facts excluded from stable prefix", async () => {
