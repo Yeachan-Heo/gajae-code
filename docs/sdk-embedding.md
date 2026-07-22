@@ -1,4 +1,4 @@
-# SDK
+# Gajae-Code Embedding SDK
 
 For the external control and notification wire protocol, see [the Gajae-Code SDK](./sdk.md).
 
