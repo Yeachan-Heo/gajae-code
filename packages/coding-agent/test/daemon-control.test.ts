@@ -1385,6 +1385,11 @@ describe("ChatDaemonController ownership safety", () => {
 				...input,
 			} as any);
 
+		let preconditionProvenanceProbes = 0;
+		const unexpectedPreconditionProvenanceProbe = () => {
+			preconditionProvenanceProbes += 1;
+			return "linux:12345";
+		};
 		for (const input of [
 			{ ownerId: "wrong-owner" },
 			{ pid: undefined },
@@ -1392,6 +1397,14 @@ describe("ChatDaemonController ownership safety", () => {
 			{ incarnation: undefined },
 			{ incarnation: "wrong" },
 			{ incarnation: "stale" },
+		]) {
+			restore();
+			await release({ ...input, pidIncarnation: unexpectedPreconditionProvenanceProbe });
+			unchanged();
+		}
+		expect(preconditionProvenanceProbes).toBe(0);
+
+		for (const input of [
 			{ pidIncarnation: () => "linux:12346" },
 			{ pidIncarnation: () => undefined },
 			{ pidAlive: () => false, pidIncarnation: () => "linux:12345" },

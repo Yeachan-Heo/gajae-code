@@ -1078,18 +1078,17 @@ export async function releaseChatDaemonOwnership(input: {
 	const pidIncarnation = input.pidIncarnation ?? defaultPidIncarnation;
 	await withStateWriteLock(paths.state, async () => {
 		const state = await readJson<unknown>(paths.state);
-		const currentIncarnation = pidIncarnation(input.pid);
 		if (
 			!hasSafeChatDaemonStateShape(state) ||
 			!hasProcessIncarnationAuthority(input.incarnation) ||
 			state.ownerId !== input.ownerId ||
 			state.pid !== input.pid ||
 			state.incarnation !== input.incarnation ||
-			!pidAlive(input.pid) ||
-			!hasProcessIncarnationAuthority(currentIncarnation) ||
-			currentIncarnation !== input.incarnation
+			!pidAlive(input.pid)
 		)
 			return;
+		const currentIncarnation = pidIncarnation(input.pid);
+		if (!hasProcessIncarnationAuthority(currentIncarnation) || currentIncarnation !== input.incarnation) return;
 		await writeJson(paths.state, { ...state, stoppedAt: Date.now(), transportHealthy: false });
 		const lock = await captureChatDaemonOwnerLockLease(paths.lock);
 		let owner: unknown;
