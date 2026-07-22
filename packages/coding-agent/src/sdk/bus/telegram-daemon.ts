@@ -3695,8 +3695,12 @@ export class TelegramNotificationDaemon {
 							}
 							return;
 						}
-						const deleted = await this.deleteTopic(logicalSessionId, socketLease, true);
-						if (!deleted && socketLease && !this.#deleteLeaseAllows(socketLease)) {
+						const deleteOutcome = await this.deleteTopic(logicalSessionId, socketLease, true);
+						if (
+							deleteOutcome === "pre_dispatch_cancelled" &&
+							socketLease &&
+							!this.#deleteLeaseAllows(socketLease)
+						) {
 							await this.#persistTopicMutation(
 								() => {
 									if (!this.topics.restoreDeleteAuthority(closeTopicAuthority))
@@ -5113,6 +5117,8 @@ export class TelegramNotificationDaemon {
 		)
 			return undefined;
 		if (capturedCreationLease && !this.#leaseTokenAllows(capturedCreationLease)) return undefined;
+		const creationBinding = session ? this.#endpointBinding(session) : undefined;
+		const creationLeaseEpoch = this.topics.authorityEpoch(sessionId);
 		let acceptedTopicId: string | undefined;
 		let acceptedTopicCompensated = false;
 		let acceptedTopicDeleteAttempted = false;
@@ -5129,14 +5135,17 @@ export class TelegramNotificationDaemon {
 						throw new Error("createForumTopic: invalid message_thread_id");
 					acceptedTopicId = String(tid);
 					if (capturedCreationLease && !(await this.#awaitCreationLeaseAuthority(capturedCreationLease))) {
-						this.topics.beginDelete(sessionId);
-						this.topics.fenceAcceptedCreate(
-							sessionId,
-							acceptedTopicId,
-							this.opts.now,
-							name,
-							session ? this.#endpointBinding(session) : undefined,
-						);
+						if (
+							!this.topics.fenceAcceptedCreateForLease(
+								sessionId,
+								acceptedTopicId,
+								creationLeaseEpoch,
+								this.opts.now,
+								name,
+								creationBinding,
+							)
+						)
+							throw new Error("topic authority was revoked during creation");
 						try {
 							await this.persistTopics();
 						} finally {
@@ -5161,7 +5170,7 @@ export class TelegramNotificationDaemon {
 				},
 				this.opts.now,
 				name,
-				session ? this.#endpointBinding(session) : undefined,
+				creationBinding,
 				() => this.persistTopics(),
 				session,
 			);
@@ -5181,7 +5190,17 @@ export class TelegramNotificationDaemon {
 					await this.persistTopics();
 			}
 			if (capturedCreationLease && !(await this.#awaitCreationLeaseAuthority(capturedCreationLease))) {
-				await this.deleteTopic(sessionId);
+				if (
+					this.topics.fenceAcceptedCreateForLease(
+						sessionId,
+						rec.topicId,
+						creationLeaseEpoch,
+						this.opts.now,
+						name,
+						creationBinding,
+					)
+				)
+					await this.deleteTopic(sessionId, undefined, true);
 				return undefined;
 			}
 			return rec.topicId;
@@ -5195,35 +5214,38 @@ export class TelegramNotificationDaemon {
 			) {
 				// A failed initial commit must never make compensation conditional on
 				// successfully publishing its fence.
-				this.topics.beginDelete(sessionId);
-				this.topics.fenceAcceptedCreate(
-					sessionId,
-					acceptedTopicId,
-					this.opts.now,
-					name,
-					session ? this.#endpointBinding(session) : undefined,
-				);
-				try {
-					await this.#persistTopicsWithRetry();
-				} catch {
-					this.#superviseCompensationFence(sessionId);
-				}
+				if (
+					this.topics.fenceAcceptedCreateForLease(
+						sessionId,
+						acceptedTopicId,
+						creationLeaseEpoch,
+						this.opts.now,
+						name,
+						creationBinding,
+					)
+				) {
+					try {
+						await this.#persistTopicsWithRetry();
+					} catch {
+						this.#superviseCompensationFence(sessionId);
+					}
 
-				try {
-					const deletion = await this.botApi.call("deleteForumTopic", {
-						chat_id: this.opts.chatId,
-						message_thread_id: Number(acceptedTopicId),
-					});
-					if (topicDeleteSettled(deletion)) {
-						this.topics.settleDelete(sessionId, acceptedTopicId);
-						await this.persistTopics();
-					} else {
+					try {
+						const deletion = await this.botApi.call("deleteForumTopic", {
+							chat_id: this.opts.chatId,
+							message_thread_id: Number(acceptedTopicId),
+						});
+						if (topicDeleteSettled(deletion)) {
+							this.topics.settleDelete(sessionId, acceptedTopicId);
+							await this.persistTopics();
+						} else {
+							this.#superviseCompensationFence(sessionId);
+							await this.#persistTopicsWithRetry().catch(() => undefined);
+						}
+					} catch {
 						this.#superviseCompensationFence(sessionId);
 						await this.#persistTopicsWithRetry().catch(() => undefined);
 					}
-				} catch {
-					this.#superviseCompensationFence(sessionId);
-					await this.#persistTopicsWithRetry().catch(() => undefined);
 				}
 			}
 			if (acceptedTopicId && !acceptedTopicCompensated && acceptedTopicDeleteAttempted) {
@@ -5264,11 +5286,12 @@ export class TelegramNotificationDaemon {
 		sessionId: string,
 		socketLease?: { session: SessionSocket; token: number; logicalSessionId: string },
 		deleteFenceAlreadyPublished = false,
-	): Promise<boolean> {
+	): Promise<"pre_dispatch_cancelled" | "post_dispatch_pending" | "settled"> {
+		const deleteSnapshot = this.topics.captureDeleteAuthority(sessionId);
 		let record = deleteFenceAlreadyPublished ? this.topics.get(sessionId) : this.topics.beginDelete(sessionId);
-		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return false;
+		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
 		await this.persistTopics();
-		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return false;
+		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
 		await this.#revokeAskAuthority(sessionId);
 		this.deleteMessageRoutes(sessionId);
 		this.#clearModelChoiceAliases(sessionId);
@@ -5276,7 +5299,7 @@ export class TelegramNotificationDaemon {
 			await this.topics.awaitInflight(sessionId);
 			record = this.topics.get(sessionId);
 			await this.persistTopics();
-			if (!record) return true;
+			if (!record) return "settled";
 		}
 		const removed = this.pool.removeWhere(item => item.sessionId === sessionId);
 		for (const item of removed) {
@@ -5286,12 +5309,12 @@ export class TelegramNotificationDaemon {
 		}
 		try {
 			await this.flushPool();
-			if (socketLease && !this.#deleteLeaseAllows(socketLease)) return false;
+			if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
 			const res = (await this.botApi.call("deleteForumTopic", {
 				chat_id: this.opts.chatId,
 				message_thread_id: Number(record.topicId),
 			})) as { ok?: boolean };
-			if (!topicDeleteSettled(res)) return true;
+			if (!topicDeleteSettled(res)) return "post_dispatch_pending";
 			this.topics.settleDelete(sessionId, record.topicId);
 			for (const k of [...this.liveMessages.keys()])
 				if (k.startsWith(`${sessionId}:`)) {
@@ -5302,11 +5325,18 @@ export class TelegramNotificationDaemon {
 				if (ownerSessionId === sessionId) this.topicOwnerByIdentity.delete(identityKey);
 			});
 			this.pendingThreadedFrames.delete(sessionId);
-			await this.persistTopics();
-			return true;
+			try {
+				await this.persistTopics();
+				return "settled";
+			} catch {
+				this.topics.restoreDeleteFence(deleteSnapshot);
+				await this.#persistTopicsWithRetry().catch(() => undefined);
+				return "post_dispatch_pending";
+			}
 		} catch {
-			// Retain the persisted delete fence on transport ambiguity.
-			return false;
+			// Once Telegram dispatch starts, retain the persisted deletion fence: the
+			// remote result is ambiguous and may not restore stale routing authority.
+			return "post_dispatch_pending";
 		}
 	}
 
@@ -6312,8 +6342,17 @@ export class TelegramNotificationDaemon {
 			// that races that claim must await its own public creation before classifying
 			// endpoint authority; otherwise the registry correctly sees an in-flight
 			// claim as ambiguous and rejects a valid bootstrap.
-			if (!this.topics.get(session.sessionId) && this.#ownsLiveOpenEndpoint(session, endpointBinding))
-				await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, {}), session);
+			if (!this.topics.get(session.sessionId) && this.#ownsLiveOpenEndpoint(session, endpointBinding)) {
+				try {
+					await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, {}), session);
+				} catch (error) {
+					logger.warn(
+						`notifications: Telegram replay topic creation failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+					);
+					this.dropSession(session, "replay_topic_creation_failed");
+					return;
+				}
+			}
 			// Identity-less replay may resume only the exact transport owner. A
 			// rekeyed A→B transport remains denied unless replay proves B.
 			const endpointAuthority = this.#endpointAuthority(endpointBinding, session);
@@ -6365,7 +6404,15 @@ export class TelegramNotificationDaemon {
 			for (const frame of replayState) {
 				const fingerprint = JSON.stringify(frame);
 				replayCounts.set(fingerprint, (replayCounts.get(fingerprint) ?? 0) + 1);
-				await this.handleSessionMessage(session, frame);
+				try {
+					await this.handleSessionMessage(session, frame);
+				} catch (error) {
+					logger.warn(
+						`notifications: Telegram replay admission failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+					);
+					this.dropSession(session, "replay_admission_failed");
+					return;
+				}
 			}
 			const queued = session.replayQueue.splice(0);
 			for (const frame of queued) {

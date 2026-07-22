@@ -14708,6 +14708,51 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		});
 	});
 
+	test.each([
+		"createForumTopic",
+		"initial topic-state persistence",
+	])("valid replay recovers and delivers once after one-shot %s failure", async failure => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const call = bot.call.bind(bot);
+		let failCreate = failure === "createForumTopic";
+		bot.call = async (method, body, options) => {
+			if (method === "createForumTopic" && failCreate) {
+				failCreate = false;
+				bot.calls.push({ method, body, options });
+				return { ok: false, description: "one-shot create failure" };
+			}
+			return call(method, body, options);
+		};
+		let failInitialTopicWrite = failure === "initial topic-state persistence";
+		const daemon = recoveryDaemon(
+			agentDir,
+			bot,
+			"42",
+			topicStateFs(async () => {
+				if (!failInitialTopicWrite) return;
+				failInitialTopicWrite = false;
+				throw new Error("one-shot initial topic-state persistence failure");
+			}),
+		);
+		await replayResumedIdentity(daemon, "FAILED", "S", { url: "ws://failed", token: "failed-token" });
+		expect(daemon.sessions.has("FAILED")).toBe(false);
+		await replayResumedIdentity(daemon, "RECOVERED", "S", {
+			url: "ws://recovered",
+			token: "recovered-token",
+			generation: 2,
+		});
+		await daemon.handleSessionMessage(daemon.sessions.get("RECOVERED")!, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: `recovered after ${failure}`,
+		});
+		expect(
+			bot.calls.filter(call => call.method === "sendMessage" && call.body.text === `recovered after ${failure}`),
+		).toHaveLength(1);
+	});
 	test("identity-less replay denies ambiguous endpoint authority", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
@@ -15494,6 +15539,87 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		await identity;
 	});
 
+	test("stale accepted create cannot fence or delete a successor topic lease", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const createStarted = Promise.withResolvers<void>();
+		const releaseCreate = Promise.withResolvers<unknown>();
+		const originalCall = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "createForumTopic") {
+				bot.calls.push({ method, body, options });
+				createStarted.resolve();
+				return releaseCreate.promise;
+			}
+			return originalCall(method, body, options);
+		};
+		const daemon = recoveryDaemon(agentDir, bot);
+		daemon.connectSession("S", "ws://old", "old");
+		const predecessor = daemon.sessions.get("S")!;
+		const creating = (daemon as any).ensureTopic("S", "old topic", predecessor);
+		await createStarted.promise;
+
+		daemon.connectSession("S", "ws://successor", "new");
+		const successor = daemon.sessions.get("S")!;
+		(daemon as any).topics.replace({
+			topics: {
+				S: {
+					topicId: "888",
+					identitySent: false,
+					createdAt: 1,
+					authorityEpoch: 2,
+					creationLeaseEpoch: 2,
+					chatId: "42",
+					endpointKey: successor.endpointKey,
+					endpointDigest: successor.endpointDigest,
+					endpointGeneration: 1,
+				},
+			},
+			fences: { S: 2 },
+		});
+		releaseCreate.resolve({ ok: true, result: { message_thread_id: 777 } });
+		await expect(creating).resolves.toBeUndefined();
+		expect((daemon as any).topics.get("S")).toMatchObject({ topicId: "888" });
+		expect((daemon as any).topics.get("S")?.authorityState).not.toBe("delete_pending");
+		expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toEqual([]);
+	});
+	test("post-dispatch delete rejection retains the exact tombstone despite a successor and restart", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const deleteStarted = Promise.withResolvers<void>();
+		const releaseDelete = Promise.withResolvers<unknown>();
+		const originalCall = bot.call.bind(bot);
+		let holdDelete = true;
+		bot.call = async (method, body, options) => {
+			if (method === "deleteForumTopic" && holdDelete) {
+				bot.calls.push({ method, body, options });
+				deleteStarted.resolve();
+				return releaseDelete.promise;
+			}
+			return originalCall(method, body, options);
+		};
+		const daemon = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(daemon, "PREDECESSOR", "S", { url: "ws://old", token: "old" });
+		const predecessor = daemon.sessions.get("PREDECESSOR")!;
+		const topicId = bot.createdTopicThreadIds.at(-1)!;
+		const closing = daemon.handleSessionMessage(predecessor, { type: "session_closed", sessionId: "S" });
+		await deleteStarted.promise;
+		daemon.connectSession("SUCCESSOR", "ws://successor", "new");
+		releaseDelete.resolve({ ok: false, description: "transport unavailable" });
+		await closing;
+
+		const fenced = await readTopicAuthorityState(agentDir);
+		expect(fenced.topics.S).toMatchObject({ topicId: String(topicId), authorityState: "delete_pending" });
+		expect(fenced.topics.S.authorityState).not.toBe("active");
+
+		holdDelete = false;
+		const restarted = recoveryDaemon(agentDir, bot);
+		await restarted.loadTopics();
+		await restarted.scanRoots();
+		expect((await readTopicAuthorityState(agentDir)).topics.S).toBeUndefined();
+	});
 	test("revoked create retains a delete fence after two failed publications and ambiguous deletion across restart", async () => {
 		FakeWs.instances = [];
 		const createStarted = Promise.withResolvers<void>();

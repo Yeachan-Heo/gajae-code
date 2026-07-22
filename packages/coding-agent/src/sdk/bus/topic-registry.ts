@@ -39,6 +39,8 @@ export interface TopicRecord {
 	replaySeq?: number;
 	/** Serialized authority epoch; a late create may commit only in its starting epoch. */
 	authorityEpoch?: number;
+	/** Immutable authority epoch held when this remote topic create began. */
+	creationLeaseEpoch?: number;
 	/** An uncertain delete fences future creation and inbound routing. */
 	authorityState?: "active" | "delete_pending";
 	/** Telegram chat and endpoint authority last proven to use this topic. */
@@ -86,6 +88,8 @@ export interface TopicDeleteAuthoritySnapshot {
 	authorityEpoch?: number;
 	authorityState?: TopicRecord["authorityState"];
 	fenceEpoch?: number;
+	/** Exact fenced record, retained to restore an in-memory tombstone after a failed clear publication. */
+	record?: TopicRecord;
 }
 
 function isValidBindingString(value: unknown): value is string {
@@ -220,6 +224,11 @@ export class TopicRegistry {
 					? { userNameUpdateId: raw.userNameUpdateId }
 					: {}),
 				...(typeof raw.identityKey === "string" ? { identityKey: raw.identityKey } : {}),
+				...(typeof raw.creationLeaseEpoch === "number" &&
+				Number.isSafeInteger(raw.creationLeaseEpoch) &&
+				raw.creationLeaseEpoch >= 0
+					? { creationLeaseEpoch: raw.creationLeaseEpoch }
+					: {}),
 				...(hasValidReplayCursor ? { replayGeneration: raw.replayGeneration, replaySeq: raw.replaySeq } : {}),
 				authorityEpoch: Math.max(rawAuthorityEpoch, fenceEpoch),
 				...(raw.authorityState === "delete_pending" || fenceSupersedesRecord
@@ -286,6 +295,11 @@ export class TopicRegistry {
 	/** The existing topic record for a session, if any. */
 	get(sessionId: string): TopicRecord | undefined {
 		return this.topics.get(sessionId);
+	}
+
+	/** Current immutable authority epoch for a creation lease. */
+	authorityEpoch(sessionId: string): number {
+		return Math.max(this.epochs.get(sessionId) ?? 0, this.topics.get(sessionId)?.authorityEpoch ?? 0);
 	}
 
 	/** Whether this session has an active, unambiguous topic authority. */
@@ -464,6 +478,7 @@ export class TopicRegistry {
 				identitySent: false,
 				createdAt: now(),
 				authorityEpoch: revoked ? (this.epochs.get(sessionId) ?? 0) : epoch,
+				creationLeaseEpoch: epoch,
 				...(binding
 					? {
 							chatId: binding.chatId,
@@ -634,6 +649,7 @@ export class TopicRegistry {
 			authorityEpoch: record?.authorityEpoch,
 			authorityState: record?.authorityState,
 			fenceEpoch: this.epochs.get(sessionId),
+			...(record ? { record: { ...record } } : {}),
 		};
 	}
 
@@ -667,7 +683,14 @@ export class TopicRegistry {
 		const deleteEpoch = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0) + 1;
 		if (snapshot.topicId === undefined) {
 			if (record) return false;
-		} else if (!record || record.topicId !== snapshot.topicId) {
+		} else if (!record) {
+			if (!snapshot.record) return false;
+			this.topics.set(snapshot.sessionId, {
+				...snapshot.record,
+				authorityEpoch: deleteEpoch,
+				authorityState: "delete_pending",
+			});
+		} else if (record.topicId !== snapshot.topicId) {
 			return false;
 		} else {
 			record.authorityEpoch = deleteEpoch;
@@ -722,6 +745,33 @@ export class TopicRegistry {
 		if (this.byTopic.get(topicId) === sessionId) this.byTopic.delete(topicId);
 		this.#ambiguousTopicIds.add(topicId);
 		return record;
+	}
+
+	/** Fence an accepted create only when its exact creator lease still owns the record. */
+	fenceAcceptedCreateForLease(
+		sessionId: string,
+		topicId: string,
+		creationLeaseEpoch: number,
+		now: () => number = Date.now,
+		name?: string,
+		binding?: TopicEndpointBinding,
+	): TopicRecord | undefined {
+		const record = this.topics.get(sessionId);
+		const matchesBinding =
+			record?.chatId === binding?.chatId &&
+			record?.endpointKey === binding?.endpointKey &&
+			record?.endpointDigest === binding?.endpointDigest &&
+			record?.endpointGeneration === binding?.endpointGeneration;
+		if (
+			record
+				? record.topicId !== topicId || record.creationLeaseEpoch !== creationLeaseEpoch || !matchesBinding
+				: (this.epochs.get(sessionId) ?? 0) !== creationLeaseEpoch
+		)
+			return undefined;
+		this.beginDelete(sessionId);
+		const fenced = this.fenceAcceptedCreate(sessionId, topicId, now, name, binding);
+		fenced.creationLeaseEpoch = creationLeaseEpoch;
+		return fenced;
 	}
 
 	/** Wait for a revoked create to settle before admitting a later lifecycle epoch. */
