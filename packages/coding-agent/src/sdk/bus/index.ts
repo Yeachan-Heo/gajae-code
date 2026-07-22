@@ -4481,6 +4481,12 @@ export function createNotificationsExtension(
 	): Promise<void> =>
 		startup
 			.then(async result => {
+				if (result.status === "failed" && !extensionShuttingDown && !result.suppressExtensionError) {
+					logger.error(
+						`notifications: deferred SDK startup failed for session ${id}: ${result.failure?.message ?? "Unknown startup failure."}`,
+					);
+					return;
+				}
 				if (
 					result.status !== "started" ||
 					extensionShuttingDown ||
@@ -4572,7 +4578,7 @@ export function createNotificationsExtension(
 			deferredIdentityRotation = { event, ctx, awaitStartup: true };
 			return;
 		}
-		await rotateSessionAuthority(event, ctx, true);
+		await rotateSessionAuthority(event, ctx, lifecycleStartupCapability !== undefined);
 	});
 	api.on("session_branch", async (event, ctx) => {
 		if (identityControlInFlight) {

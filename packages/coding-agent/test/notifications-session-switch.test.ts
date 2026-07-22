@@ -4,12 +4,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
+import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 import type { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { SessionSdkHost } from "../src/sdk/host";
+import { attachLifecycleStartupCapability, SdkStartupCapability } from "../src/sdk/startup-capability";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -74,7 +76,10 @@ function createHarness(
 	prefix: string,
 	initialName: string | undefined = "Original",
 	onBranchStartupSettled?: (receipt: { sessionId: string; status: string }) => void,
+	lifecycleStartupCapability?: SdkStartupCapability,
 ) {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	tempDirs.push(cwd);
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
 	const api = {
@@ -85,10 +90,11 @@ function createHarness(
 			commands.set(name, command),
 		sendUserMessage: () => {},
 	} as never;
-	createNotificationsExtension(api, { onBranchStartupSettled });
-
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-	tempDirs.push(cwd);
+	if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
+	createNotificationsExtension(api, {
+		onBranchStartupSettled,
+		settings: lifecycleStartupCapability ? ({ get: () => undefined, getAgentDir: () => cwd } as never) : undefined,
+	});
 
 	const suffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	let sid = `${prefix}${suffix}`;
@@ -426,9 +432,9 @@ test("session_switch rotates SDK authority while preserving topic identity", asy
 		await handlers.get("session_switch")!({ type: "session_switch", reason: "new", previousSessionFile }, ctx);
 
 		const newEndpoint = path.join(notifDir, `${sid}.json`);
-		expect(fs.existsSync(newEndpoint)).toBe(true);
-		expect(getTelegramFileSink(sid)).toBeDefined();
-		expect(fs.existsSync(originalEndpoint)).toBe(false);
+		await waitFor(() => fs.existsSync(newEndpoint), 4000, "rotated endpoint");
+		await waitFor(() => getTelegramFileSink(sid) !== undefined, 4000, "rotated file sink");
+		await waitFor(() => !fs.existsSync(originalEndpoint), 4000, "previous endpoint removal");
 		const newFrames = await connectFrames(newEndpoint);
 
 		await handlers.get("agent_start")!({ type: "agent_start" }, ctx);
@@ -442,6 +448,159 @@ test("session_switch rotates SDK authority while preserving topic identity", asy
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
 	}
+});
+
+test("ordinary session_switch releases predecessor authority without awaiting successor readiness", async () => {
+	await withNotifications(async () => {
+		const harness = createHarness("gjc-notif-switch-async-");
+		await startAndConnect(harness);
+		const previousId = harness.sid;
+		const previousEndpoint = harness.endpoint(previousId);
+		const entered = deferred();
+		const release = deferred();
+		const hostStart = SessionSdkHost.prototype.start;
+		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+			this: SessionSdkHost,
+		) {
+			entered.resolve();
+			await release.promise;
+			return await hostStart.call(this);
+		});
+		try {
+			harness.sid = `successor-${previousId}`;
+			let switchSettled = false;
+			const transition = Promise.resolve(
+				harness.handlers.get("session_switch")!(
+					{ type: "session_switch", previousSessionFile: harness.previousSessionFile(previousId) },
+					harness.ctx,
+				),
+			).then(() => {
+				switchSettled = true;
+			});
+
+			await entered.promise;
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(switchSettled).toBe(true);
+			expect(fs.existsSync(previousEndpoint)).toBe(false);
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
+
+			release.resolve();
+			await transition;
+			await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "asynchronous successor endpoint");
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+		} finally {
+			release.resolve();
+			startSpy.mockRestore();
+		}
+	});
+});
+
+test("ordinary session_switch reports failed deferred successor startup without restoring predecessor authority", async () => {
+	await withNotifications(async () => {
+		const startupSettled = deferred<{ sessionId: string; status: string }>();
+		const harness = createHarness("gjc-notif-switch-failed-async-", "Original", receipt =>
+			startupSettled.resolve(receipt),
+		);
+		await startAndConnect(harness);
+		const previousId = harness.sid;
+		const previousEndpoint = harness.endpoint(previousId);
+		const entered = deferred();
+		const release = deferred();
+		let predecessorReleasedBeforeStart = false;
+		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async () => {
+			predecessorReleasedBeforeStart = !fs.existsSync(previousEndpoint);
+			entered.resolve();
+			await release.promise;
+			throw new Error("ordinary successor startup failed");
+		});
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			harness.sid = `successor-${previousId}`;
+			let switchSettled = false;
+			const transition = Promise.resolve(
+				harness.handlers.get("session_switch")!(
+					{ type: "session_switch", previousSessionFile: harness.previousSessionFile(previousId) },
+					harness.ctx,
+				),
+			).then(() => {
+				switchSettled = true;
+			});
+
+			await entered.promise;
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(switchSettled).toBe(true);
+			expect(predecessorReleasedBeforeStart).toBe(true);
+			expect(fs.existsSync(previousEndpoint)).toBe(false);
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
+
+			release.resolve();
+			await transition;
+			expect(await startupSettled.promise).toEqual({ sessionId: harness.sid, status: "failed" });
+			expect(errorSpy).toHaveBeenCalledWith(
+				`notifications: deferred SDK startup failed for session ${harness.sid}: ordinary successor startup failed`,
+			);
+			expect(fs.existsSync(previousEndpoint)).toBe(false);
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
+
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+			expect(fs.existsSync(previousEndpoint)).toBe(false);
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
+			expect(getTelegramFileSink(harness.sid)).toBeUndefined();
+		} finally {
+			release.resolve();
+			errorSpy.mockRestore();
+			startSpy.mockRestore();
+		}
+	});
+});
+
+test("lifecycle session_switch retains successor readiness acknowledgement", async () => {
+	await withNotifications(async () => {
+		const capability = new SdkStartupCapability();
+		const harness = createHarness("gjc-notif-switch-lifecycle-", "Original", undefined, capability);
+		await startAndConnect(harness);
+		const previousId = harness.sid;
+		const previousEndpoint = harness.endpoint(previousId);
+		const entered = deferred();
+		const release = deferred();
+		const hostStart = SessionSdkHost.prototype.start;
+		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+			this: SessionSdkHost,
+		) {
+			entered.resolve();
+			await release.promise;
+			return await hostStart.call(this);
+		});
+		try {
+			harness.sid = `successor-${previousId}`;
+			let switchSettled = false;
+			const transition = Promise.resolve(
+				harness.handlers.get("session_switch")!(
+					{ type: "session_switch", previousSessionFile: harness.previousSessionFile(previousId) },
+					harness.ctx,
+				),
+			).then(() => {
+				switchSettled = true;
+			});
+
+			await entered.promise;
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(switchSettled).toBe(false);
+			expect(fs.existsSync(previousEndpoint)).toBe(false);
+			expect(fs.existsSync(harness.endpoint())).toBe(false);
+
+			release.resolve();
+			await transition;
+			expect(fs.existsSync(harness.endpoint())).toBe(true);
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+		} finally {
+			release.resolve();
+			startSpy.mockRestore();
+		}
+	});
 });
 
 test("session_switch rotates authority without a previous session file", async () => {
