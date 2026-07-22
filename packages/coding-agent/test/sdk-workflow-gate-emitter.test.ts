@@ -7,6 +7,7 @@ import { getBundledModel } from "@gajae-code/ai";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { Settings } from "../src/config/settings";
+import { createDeepInterviewIntentManifest } from "../src/gjc-runtime/deep-interview-state";
 import { modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
 import {
 	BrokerWorkflowGateEmitter,
@@ -295,6 +296,15 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			slashCommands: [],
 		});
 		try {
+			const { promise: skillActivation, resolve: markSkillActivated } = Promise.withResolvers<void>();
+			const unsubscribe = session.subscribe(event => {
+				if (
+					event.type === "message_start" &&
+					event.message.role === "custom" &&
+					event.message.customType === SKILL_PROMPT_MESSAGE_TYPE
+				)
+					markSkillActivated();
+			});
 			session.agent.emitExternalEvent({
 				type: "message_start",
 				message: {
@@ -307,7 +317,8 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 					timestamp: Date.now(),
 				},
 			});
-			for (let attempt = 0; attempt < 20 && !session.getActiveSkillState(); attempt += 1) await Bun.sleep(1);
+			await skillActivation;
+			unsubscribe();
 			expect(session.getActiveToolNames()).toContain("ask");
 			expect(session.getActiveSkillState()).toMatchObject({ skill: "deep-interview" });
 
@@ -375,6 +386,13 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			const statePath = modeStatePath(tempDir, resumedSession.sessionId, "deep-interview");
 			const modeState = JSON.parse(await Bun.file(statePath).text());
 			modeState.state = { ...(modeState.state ?? {}), intent_contract: {} };
+			await Bun.write(statePath, JSON.stringify(modeState));
+			expect(() => validateToolArguments(askTool, reviewCall)).toThrow('Validation failed for tool "ask"');
+
+			modeState.state.intent_contract = createDeepInterviewIntentManifest(
+				[{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+				{ round: 0, answer_hash: "a".repeat(64) },
+			);
 			await Bun.write(statePath, JSON.stringify(modeState));
 			expect(validateToolArguments(askTool, reviewCall)).toMatchObject({
 				questions: [{ deepInterview: { intent_review: { approval_options: ["Confirm"] } } }],

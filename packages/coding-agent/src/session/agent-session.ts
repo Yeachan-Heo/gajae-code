@@ -245,6 +245,7 @@ import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import { buildSkillPromptMessage, type Skill, type SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
+import { assertDeepInterviewIntentManifest } from "../gjc-runtime/deep-interview-state";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
 import {
 	assertNonEmptyGjcSessionId,
@@ -2509,7 +2510,10 @@ export class AgentSession {
 			);
 			const raw = fs.readFileSync(filePath, "utf-8");
 			const parsed = JSON.parse(raw) as { state?: { intent_contract?: unknown } };
-			return parsed.state?.intent_contract === undefined ? "topology" : "post-topology";
+			const intentContract = parsed.state?.intent_contract;
+			if (intentContract === undefined) return "topology";
+			assertDeepInterviewIntentManifest(intentContract);
+			return "post-topology";
 		} catch {
 			return "topology";
 		}

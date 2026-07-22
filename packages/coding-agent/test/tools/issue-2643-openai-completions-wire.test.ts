@@ -53,6 +53,41 @@ function assertMetadataBranches(schema: unknown): void {
 	expect(metadataBranches.some(branch => hasProperties(branch, ["intent_contract", "intent_review"]))).toBe(false);
 }
 
+function countSchemaKeyword(schema: unknown, keyword: string): number {
+	return objectsIn(schema).filter(branch => Object.hasOwn(branch, keyword)).length;
+}
+
+function askParametersFromPayload(payload: JsonObject): JsonObject {
+	const tools = payload.tools;
+	if (!Array.isArray(tools)) throw new Error("OpenAI payload omitted tools");
+	const ask = tools.find(
+		candidate => isObject(candidate) && isObject(candidate.function) && candidate.function.name === "ask",
+	);
+	if (!isObject(ask) || !isObject(ask.function) || !isObject(ask.function.parameters))
+		throw new Error("OpenAI payload omitted AskTool parameters");
+	return ask.function.parameters;
+}
+
+function roundZeroIntentArguments(intentContract?: JsonObject, intentReview?: JsonObject): JsonObject {
+	return {
+		questions: [
+			{
+				id: "round-0-intent",
+				question: "Confirm the locked intent",
+				options: [{ label: "Confirm" }, { label: "Approve reduction" }],
+				deepInterview: {
+					round: 0,
+					component: "review-topology",
+					dimension: "topology",
+					ambiguity: 1,
+					...(intentContract === undefined ? {} : { intent_contract: intentContract }),
+					...(intentReview === undefined ? {} : { intent_review: intentReview }),
+				},
+			},
+		],
+	};
+}
+
 function abortedSignal(): AbortSignal {
 	const controller = new AbortController();
 	controller.abort();
@@ -85,20 +120,59 @@ describe("issue #2643 — OpenAI completions AskTool wire contract", () => {
 		const tool = await askTool();
 		const wireSchema = toolWireSchema(tool);
 		assertMetadataBranches(wireSchema);
+		expect(countSchemaKeyword(wireSchema, "minItems")).toBe(6);
+		expect(countSchemaKeyword(wireSchema, "exclusiveMinimum")).toBe(2);
 		const payload = await capturePayload();
-		const tools = payload.tools;
-		expect(Array.isArray(tools)).toBe(true);
-		const ask = (tools as unknown[]).find(
-			candidate => isObject(candidate) && isObject(candidate.function) && candidate.function.name === "ask",
-		);
-		if (!isObject(ask) || !isObject(ask.function)) throw new Error("OpenAI payload omitted AskTool");
-
-		const parameters = ask.function.parameters;
+		const parameters = askParametersFromPayload(payload);
 		assertMetadataBranches(parameters);
+		expect(countSchemaKeyword(parameters, "minItems")).toBe(0);
+		expect(countSchemaKeyword(parameters, "exclusiveMinimum")).toBe(0);
 		const schemas = objectsIn(parameters);
 		const question = schemas.find(schema => hasProperties(schema, ["id", "question", "options", "deepInterview"]));
 		expect(question).toBeDefined();
-		expect(hasProperties(question as JsonObject, ["workflowGate"])).toBe(true);
+		if (!question) throw new Error("OpenAI payload omitted AskTool question schema");
+		expect(hasProperties(question, ["workflowGate"])).toBe(true);
+	});
+
+	it("locally corrects the bounded Round-0 pair and returns exact rejection codes for stripped constraints", async () => {
+		const tool = await askTool();
+		const validateRaw = tool.rawArgumentValidation;
+		if (!validateRaw) throw new Error("AskTool omitted raw argument validation");
+		const contract = {
+			items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+			confirmation_options: ["Confirm"],
+		};
+		const review = {
+			observed_items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+			supporting_substitutions: [],
+			approval_options: ["Approve reduction"],
+		};
+
+		expect(validateRaw(roundZeroIntentArguments({ items: [], confirmation_options: [] }))).toEqual({
+			outcome: "reject",
+			code: "ask-intent-contract-requires-non-empty-authority",
+		});
+		expect(
+			validateRaw(
+				roundZeroIntentArguments(undefined, {
+					observed_items: [],
+					supporting_substitutions: [],
+					approval_options: [],
+				}),
+			),
+		).toEqual({
+			outcome: "reject",
+			code: "ask-intent-review-requires-positive-round",
+		});
+
+		const corrected = validateRaw(roundZeroIntentArguments(contract, review));
+		expect(corrected.outcome).toBe("accept");
+		if (corrected.outcome !== "accept") throw new Error("AskTool did not correct the canonical Round-0 pair");
+		const questions = corrected.arguments.questions;
+		if (!Array.isArray(questions) || !isObject(questions[0]) || !isObject(questions[0].deepInterview))
+			throw new Error("AskTool returned malformed corrected arguments");
+		expect(questions[0].deepInterview.intent_contract).toEqual(contract);
+		expect(questions[0].deepInterview).not.toHaveProperty("intent_review");
 	});
 
 	it("exposes only the metadata branch valid for the persisted deep-interview stage", async () => {
