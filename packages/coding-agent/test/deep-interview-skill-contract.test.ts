@@ -6,8 +6,10 @@ import { fileURLToPath } from "node:url";
 const skillPath = join(dirname(fileURLToPath(import.meta.url)), "../src/defaults/gjc/skills/deep-interview/SKILL.md");
 const statePath = join(dirname(fileURLToPath(import.meta.url)), "../src/gjc-runtime/deep-interview-state.ts");
 
+const repairCliPath = join(dirname(fileURLToPath(import.meta.url)), "../../../docs/deep-interview-repair-cli.md");
 const skill = readFileSync(skillPath, "utf8");
 const stateSource = readFileSync(statePath, "utf8");
+const repairCli = readFileSync(repairCliPath, "utf8");
 
 function extractSection(content: string, sectionName: string): string {
 	const sectionMatch = content.match(new RegExp(`<${sectionName}>\\n([\\s\\S]*?)\\n</${sectionName}>`));
@@ -232,5 +234,63 @@ describe("deep-interview ouroboros ooo-interview parity port", () => {
 		expect(skill).toMatch(/50,000/);
 		expect(skill).toMatch(/10,000/);
 		expect(skill).toMatch(/character-count/i);
+	});
+});
+describe("deep-interview CLI-owned draft contract", () => {
+	it("uses drafts for all normal-flow payloads and preserves recorder-first answers", () => {
+		const steps = extractSection(skill, "Steps");
+		for (const kind of ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"]) {
+			expect(steps).toContain(`--for ${kind}`);
+			expect(steps).toContain(`${kind} --draft-id <draft_id>`);
+		}
+		expect(steps).not.toContain("draft create --kind");
+		for (const forbidden of ["--input-json", "--question-json", "--answer-json", "--result-json"]) {
+			expect(steps).not.toContain(forbidden);
+		}
+		expect(steps).toContain("Recorder-first remains mandatory");
+		expect(steps).toContain("draft check --draft-id <draft_id>");
+		expect(steps).toContain("--expected-draft-revision <draft_revision>");
+		expect(steps).toContain("--value");
+		expect(steps).toContain("--null");
+		expect(steps).toContain("--op append");
+		expect(steps).toContain("draft_revision");
+	});
+
+	it("documents CAS-protected private draft consumption", () => {
+		const toolUsage = extractSection(skill, "Tool_Usage");
+		const normalFlowDocs = repairCli.slice(0, repairCli.indexOf("## Legacy compatibility:"));
+		const typedConsumeExamples = [
+			...(skill.match(
+				/^gjc deep-interview (?:initialize-context|confirm-topology|record-answer|apply-round-result) --draft-id [^\n]+$/gm,
+			) ?? []),
+			...(repairCli.match(
+				/^gjc deep-interview (?:initialize-context|confirm-topology|record-answer|apply-round-result) --draft-id [^\n]+$/gm,
+			) ?? []),
+		];
+
+		expect(toolUsage).toContain("draft create|edit|show|check|rebase|discard");
+		expect(toolUsage).toContain("there is no public `draft consume` command");
+		expect(skill).not.toMatch(/\bgjc deep-interview draft consume\b/);
+		expect(normalFlowDocs).not.toMatch(
+			/\bgjc deep-interview draft consume\b|--input-json|--question-json|--answer-json|--result-json/,
+		);
+		expect(typedConsumeExamples).toHaveLength(8);
+		expect(normalFlowDocs).toContain("--draft-id ID --expected-draft-revision <latest_draft_revision> --json");
+		for (const example of typedConsumeExamples) {
+			expect(example).toContain("--expected-draft-revision <latest_draft_revision>");
+			expect(example).toContain("--json");
+		}
+
+		for (const command of ["create", "edit", "show", "check", "rebase", "discard"]) {
+			expect(normalFlowDocs).toMatch(new RegExp(`draft ${command}[^\\n]*--json`));
+		}
+		expect(normalFlowDocs).toContain(
+			"draft rebase  --draft-id ID --expected-draft-revision N --to-state-revision N --json",
+		);
+		expect(normalFlowDocs).toContain("draft discard --draft-id ID --expected-draft-revision N --json");
+		expect(normalFlowDocs).toContain("without consuming or mutating it; it reports when the draft base is stale");
+		expect(normalFlowDocs).toContain("caller-observed current state revision as `--to-state-revision`");
+		expect(toolUsage).toContain("Inline JSON request flags are compatibility-only");
+		expect(toolUsage).toContain("Never construct a full payload");
 	});
 });

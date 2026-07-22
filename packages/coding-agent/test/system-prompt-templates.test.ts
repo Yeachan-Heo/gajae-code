@@ -271,8 +271,11 @@ describe("system Handlebars prompt templates", () => {
 		expect(rendered).toContain("Clear, low-risk implementation requests use direct tools");
 		expect(rendered).toContain("Vague requirements use `/skill:deep-interview`");
 		expect(rendered).toContain("gjc deep-interview sanity-check");
-		expect(rendered).toContain("repair through typed deep-interview operations");
-		expect(rendered).toContain("never reconstruct or replace the full envelope in normal flow");
+		expect(rendered).toContain("CLI-generated/edited drafts");
+		expect(rendered).toContain("draft create|edit|show|check|rebase|discard");
+		expect(rendered).toContain("consumed with `--draft-id`");
+		expect(rendered).toContain("Inline JSON request flags are compatibility-only");
+		expect(rendered).toContain("never reconstruct a payload or full envelope");
 	});
 
 	test("keeps system and project as separate ordered blocks; volatile facts excluded from stable prefix", async () => {
