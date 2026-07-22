@@ -1170,6 +1170,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			imageProvider === "gemini" ||
 			imageProvider === "openrouter" ||
 			imageProvider === "antigravity" ||
+			imageProvider === "alibaba" ||
 			imageProvider === "custom"
 		) {
 			setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);

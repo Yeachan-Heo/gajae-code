@@ -3309,7 +3309,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"providers.image": {
 		type: "enum",
-		values: ["auto", "openai", "gemini", "openrouter", "antigravity", "custom"] as const,
+		values: ["auto", "openai", "gemini", "openrouter", "antigravity", "alibaba", "custom"] as const,
 		default: "auto",
 		ui: {
 			tab: "providers",
@@ -3319,12 +3319,17 @@ export const SETTINGS_SCHEMA = {
 				{
 					value: "auto",
 					label: "Auto",
-					description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini",
+					description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini > Alibaba",
 				},
 				{ value: "openai", label: "OpenAI", description: "Uses gpt-image-2 via OpenAI Responses/Codex" },
 				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
 				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
 				{ value: "antigravity", label: "Antigravity", description: "Requires login with google-antigravity" },
+				{
+					value: "alibaba",
+					label: "Alibaba Bailian",
+					description: "Requires ALIBABA_TOKEN_PLAN_API_KEY (wan2.7-image via Token Plan)",
+				},
 				{
 					value: "custom",
 					label: "Custom",
