@@ -14,6 +14,7 @@ import {
 	installDefaultGjcDefinitions,
 } from "@gajae-code/coding-agent/defaults/gjc-defaults";
 import { loadSkills, resetActiveSkillsForTests, setActiveSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import { WORKFLOW_MANIFEST } from "@gajae-code/coding-agent/gjc-runtime/workflow-manifest";
 import { parseInternalUrl } from "@gajae-code/coding-agent/internal-urls/parse";
 import { SkillProtocolHandler } from "@gajae-code/coding-agent/internal-urls/skill-protocol";
 import { getBundledAgent } from "@gajae-code/coding-agent/task/agents";
@@ -96,6 +97,96 @@ describe("default GJC definitions", () => {
 		expect(team?.content).toContain("`planner` for broad context mapping/sequencing");
 		expect(team?.content).toContain("`architect` for architecture or external-doc-risk assessment");
 		expect(team?.content).not.toMatch(/auto-delegate `researcher`|`researcher` as an evidence lane/i);
+	});
+	it("keeps deep-interview normal flow typed and its generated manifest aligned", async () => {
+		const deepInterview = getDefaultGjcDefinitions().find(
+			definition => definition.kind === "skill" && definition.name === "deep-interview",
+		);
+		if (!deepInterview) throw new Error("missing deep-interview skill");
+
+		const phaseFiveIndex = deepInterview.content.indexOf("## Phase 5: Execution Bridge");
+		const normalFlow = deepInterview.content.slice(0, phaseFiveIndex);
+		expect(normalFlow).toContain("initialize-context");
+		expect(normalFlow).toContain("confirm-topology");
+		expect(normalFlow).toContain("record-answer");
+		expect(normalFlow).toContain("apply-round-result");
+		expect(normalFlow).toContain("sanity-check");
+		expect(normalFlow).not.toMatch(/gjc state(?: deep-interview)? write --input/);
+
+		const generated = JSON.parse(
+			await fs.readFile(
+				path.join(repoRoot, "packages/coding-agent/src/gjc-runtime/workflow-manifest.generated.json"),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(generated["deep-interview"]).toEqual(WORKFLOW_MANIFEST["deep-interview"]);
+	});
+	it("keeps the public typed deep-interview repair CLI contract documented", async () => {
+		const documentation = await fs.readFile(path.join(repoRoot, "docs/deep-interview-repair-cli.md"), "utf8");
+
+		for (const verb of WORKFLOW_MANIFEST["deep-interview"].verbs.filter(
+			verb => verb.surface === "command-positional",
+		)) {
+			expect(documentation).toContain(`gjc deep-interview ${verb.name}`);
+		}
+		expect(documentation).toContain('"global_scores"');
+		expect(documentation).toContain("greenfield");
+		expect(documentation).toContain("brownfield");
+		expect(documentation).toContain("TextView");
+		expect(documentation).toContain("DI_POST_COMMIT_AUDIT_FAILED");
+		expect(documentation).toContain("Do **not** use `grep`, `sed`, direct `.gjc/` edits");
+	});
+	it("declares the complete typed deep-interview verb argument matrix", () => {
+		const typedArgs = WORKFLOW_MANIFEST["deep-interview"].typedArgs;
+		const argsFor = (verb: string) =>
+			typedArgs
+				.filter(arg => arg.appliesToVerbs?.includes(verb))
+				.map(arg => ({ name: arg.name, type: arg.type, required: arg.required ?? false }))
+				.sort((left, right) => left.name.localeCompare(right.name));
+
+		expect(argsFor("initialize-context")).toEqual([
+			{ name: "expected-revision", type: "number", required: true },
+			{ name: "input-json", type: "object", required: true },
+			{ name: "json", type: "boolean", required: true },
+			{ name: "schema-version", type: "number", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("confirm-topology")).toEqual(argsFor("initialize-context"));
+		expect(argsFor("record-answer")).toEqual([
+			{ name: "answer-json", type: "object", required: true },
+			{ name: "component-id", type: "string", required: false },
+			{ name: "dimension", type: "string", required: false },
+			{ name: "expected-revision", type: "number", required: true },
+			{ name: "json", type: "boolean", required: true },
+			{ name: "question-id", type: "string", required: true },
+			{ name: "question-json", type: "string", required: true },
+			{ name: "round", type: "number", required: true },
+			{ name: "round-id", type: "string", required: false },
+			{ name: "schema-version", type: "number", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("apply-round-result")).toEqual([
+			{ name: "expected-revision", type: "number", required: true },
+			{ name: "json", type: "boolean", required: true },
+			{ name: "question-id", type: "string", required: true },
+			{ name: "result-json", type: "object", required: true },
+			{ name: "round", type: "number", required: true },
+			{ name: "round-id", type: "string", required: false },
+			{ name: "schema-version", type: "number", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("inspect")).toEqual([
+			{ name: "cursor", type: "string", required: false },
+			{ name: "json", type: "boolean", required: true },
+			{ name: "limit", type: "number", required: false },
+			{ name: "round-key", type: "string", required: false },
+			{ name: "selector", type: "enum", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
+		expect(argsFor("sanity-check")).toEqual([
+			{ name: "json", type: "boolean", required: true },
+			{ name: "session-id", type: "string", required: true },
+		]);
 	});
 
 	it("exposes deep-interview fragments only through the parent-scoped fragment accessor", () => {
@@ -403,13 +494,17 @@ Project executor override body.
 		expect(routing).toContain("Informational questions are answer-only/read-only");
 		expect(routing).toContain("Vague requirements use `/skill:deep-interview`");
 		expect(routing).toContain("requirements-only workflow that must not mutate product code");
+		expect(routing).toContain("Deep-interview state is runtime-owned");
+		expect(routing).toContain("gjc deep-interview sanity-check");
+		expect(routing).toContain("repair through typed deep-interview operations");
+		expect(routing).toContain("never reconstruct or replace the full envelope in normal flow");
 		expect(routing).toContain("`/skill:ralplan --deliberate`");
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
 		expect(routing).toContain("read the full skill text and follow it exactly");
 		expect(routing).toContain("Before explicit execution approval, planning and interview workflows NEVER edit product source");
-		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(9);
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(10);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 
@@ -454,14 +549,13 @@ Project executor override body.
 		expect(content).toContain("/skill:team");
 		expect(content).toContain("`gjc ralplan` is a native CLI");
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden unless an explicit force override is active");
-		expect(content).toContain("do not edit `.gjc/_session-{sessionid}/state` directly without force override");
+		expect(content).toContain("Normal interview persistence uses only typed `gjc deep-interview` commands");
 		expect(content).toContain("gjc state clear --force --mode deep-interview");
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
 		expect(content).toContain(
 			"default to English unless `{{ARGUMENTS}}` makes another user/session language obvious",
 		);
-		expect(content).toContain('"language": "<existing language object from active state, if present>"');
 		expect(content).toContain("progress reports, and spec prose");
 		expect(content).toContain("translated/localized according to `language.instruction`");
 		expect(content).toContain("must not print `Question:`/`Options:` blocks as assistant prose");
@@ -477,7 +571,6 @@ Project executor override body.
 			"Skill(",
 			"gajae-code:",
 			"/gajae-code",
-			"gjc deep-interview",
 		]) {
 			expect(content).not.toContain(forbidden);
 		}
