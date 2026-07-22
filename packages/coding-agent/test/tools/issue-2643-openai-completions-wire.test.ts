@@ -33,26 +33,6 @@ function hasProperties(value: JsonObject, names: readonly string[]): boolean {
 	return isObject(properties) && names.every(name => Object.hasOwn(properties, name));
 }
 
-function assertMetadataBranches(schema: unknown): void {
-	const metadataBranches = objectsIn(schema).filter(branch =>
-		hasProperties(branch, ["round", "component", "dimension", "ambiguity"]),
-	);
-	const ordinary = metadataBranches.find(
-		branch => !hasProperties(branch, ["intent_contract"]) && !hasProperties(branch, ["intent_review"]),
-	);
-	const contract = metadataBranches.find(
-		branch => hasProperties(branch, ["intent_contract"]) && !hasProperties(branch, ["intent_review"]),
-	);
-	const review = metadataBranches.find(
-		branch => hasProperties(branch, ["intent_review"]) && !hasProperties(branch, ["intent_contract"]),
-	);
-
-	expect(ordinary).toBeDefined();
-	expect(contract).toBeDefined();
-	expect(review).toBeDefined();
-	expect(metadataBranches.some(branch => hasProperties(branch, ["intent_contract", "intent_review"]))).toBe(false);
-}
-
 function countSchemaKeyword(schema: unknown, keyword: string): number {
 	return objectsIn(schema).filter(branch => Object.hasOwn(branch, keyword)).length;
 }
@@ -116,21 +96,22 @@ async function capturePayload(stage?: "topology" | "post-topology"): Promise<Jso
 }
 
 describe("issue #2643 — OpenAI completions AskTool wire contract", () => {
-	it("emits actual mutually exclusive ordinary, contract, and review metadata branches", async () => {
+	it("omits deep-interview authority from the inactive provider schema", async () => {
 		const tool = await askTool();
 		const wireSchema = toolWireSchema(tool);
-		assertMetadataBranches(wireSchema);
-		expect(countSchemaKeyword(wireSchema, "minItems")).toBe(6);
-		expect(countSchemaKeyword(wireSchema, "exclusiveMinimum")).toBe(2);
+		expect(objectsIn(wireSchema).some(branch => Object.hasOwn(branch, "deepInterview"))).toBe(false);
+		expect(countSchemaKeyword(wireSchema, "minItems")).toBe(1);
+		expect(countSchemaKeyword(wireSchema, "exclusiveMinimum")).toBe(0);
 		const payload = await capturePayload();
 		const parameters = askParametersFromPayload(payload);
-		assertMetadataBranches(parameters);
+		expect(objectsIn(parameters).some(branch => Object.hasOwn(branch, "deepInterview"))).toBe(false);
 		expect(countSchemaKeyword(parameters, "minItems")).toBe(0);
 		expect(countSchemaKeyword(parameters, "exclusiveMinimum")).toBe(0);
 		const schemas = objectsIn(parameters);
-		const question = schemas.find(schema => hasProperties(schema, ["id", "question", "options", "deepInterview"]));
+		const question = schemas.find(schema => hasProperties(schema, ["id", "question", "options"]));
 		expect(question).toBeDefined();
 		if (!question) throw new Error("OpenAI payload omitted AskTool question schema");
+		expect(hasProperties(question, ["deepInterview"])).toBe(false);
 		expect(hasProperties(question, ["workflowGate"])).toBe(true);
 	});
 

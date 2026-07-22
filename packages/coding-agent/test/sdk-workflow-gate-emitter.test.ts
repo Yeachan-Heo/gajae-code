@@ -8,7 +8,7 @@ import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { Settings } from "../src/config/settings";
 import { createDeepInterviewIntentManifest } from "../src/gjc-runtime/deep-interview-state";
-import { modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
+import { activeEntryPath, modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
@@ -22,6 +22,7 @@ import { initTheme } from "../src/modes/theme/theme";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
+import { getSkillActiveStatePaths, syncSkillActiveState } from "../src/skill-state/active-state";
 import { registerWorkflowGateEmitterListener } from "../src/tools/ask-answer-registry";
 
 function attachTerminalController(emitter: WorkflowGateEmitter): void {
@@ -354,6 +355,33 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			expect(resumedSession.getActiveToolNames()).toContain("ask");
 			const askTool = resumedSession.agent.state.tools.find(tool => tool.name === "ask");
 			if (!askTool) throw new Error("Expected restored AskTool");
+			const topologyCall = {
+				type: "toolCall" as const,
+				id: "resumed-round-zero-contract",
+				name: "ask",
+				arguments: {
+					questions: [
+						{
+							id: "topology",
+							question: "Confirm?",
+							options: [{ label: "Confirm" }],
+							deepInterview: {
+								round: 0,
+								component: "review-topology",
+								dimension: "topology",
+								ambiguity: 0.2,
+								intent_contract: {
+									items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+									confirmation_options: ["Confirm"],
+								},
+							},
+						},
+					],
+				},
+			};
+			expect(validateToolArguments(askTool, topologyCall)).toMatchObject({
+				questions: [{ deepInterview: { intent_contract: { confirmation_options: ["Confirm"] } } }],
+			});
 			const reviewCall = {
 				type: "toolCall" as const,
 				id: "resumed-round-zero-review",
@@ -387,7 +415,8 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			const modeState = JSON.parse(await Bun.file(statePath).text());
 			modeState.state = { ...(modeState.state ?? {}), intent_contract: {} };
 			await Bun.write(statePath, JSON.stringify(modeState));
-			expect(() => validateToolArguments(askTool, reviewCall)).toThrow('Validation failed for tool "ask"');
+			expect(validateToolArguments(askTool, topologyCall).questions[0]).not.toHaveProperty("deepInterview");
+			expect(validateToolArguments(askTool, reviewCall).questions[0]).not.toHaveProperty("deepInterview");
 
 			modeState.state.intent_contract = createDeepInterviewIntentManifest(
 				[{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
@@ -402,6 +431,115 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			resumedAuthStorage.close();
 		}
 	}, 15_000);
+	it("does not restore deep-interview authority from a stale top-level snapshot", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-stale-workflow-snapshot-"));
+		tempDirs.push(tempDir);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		await sessionManager.ensureOnDisk();
+		const sessionId = sessionManager.getSessionId();
+		await syncSkillActiveState({
+			cwd: tempDir,
+			skill: "ralplan",
+			active: true,
+			phase: "planner",
+			sessionId,
+		});
+		const { sessionPath } = getSkillActiveStatePaths(tempDir, sessionId);
+		const snapshot = JSON.parse(await Bun.file(sessionPath).text());
+		snapshot.skill = "deep-interview";
+		snapshot.phase = "interviewing";
+		await Bun.write(sessionPath, JSON.stringify(snapshot));
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			const askTool = session.getToolByName("ask");
+			expect(askTool).toBeDefined();
+			expect(session.getDeepInterviewAskStage()).toBeUndefined();
+			const parsed = validateToolArguments(askTool!, {
+				type: "toolCall",
+				id: "inactive-deep-interview-contract",
+				name: "ask",
+				arguments: {
+					questions: [
+						{
+							id: "hidden-contract",
+							question: "Approve?",
+							options: [{ label: "Approve" }],
+							deepInterview: {
+								round: 0,
+								component: "review-topology",
+								dimension: "topology",
+								ambiguity: 0,
+								intent_contract: {
+									items: [{ id: "artifact:hidden", category: "artifact", statement: "Hidden" }],
+									confirmation_options: ["Approve"],
+								},
+							},
+						},
+					],
+				},
+			});
+			expect(parsed).not.toHaveProperty("questions.0.deepInterview");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("does not restore deep-interview authority from a sessionless durable entry", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-sessionless-workflow-entry-"));
+		tempDirs.push(tempDir);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		await sessionManager.ensureOnDisk();
+		const sessionId = sessionManager.getSessionId();
+		await syncSkillActiveState({
+			cwd: tempDir,
+			skill: "deep-interview",
+			active: true,
+			phase: "interviewing",
+			sessionId,
+		});
+
+		const { sessionPath } = getSkillActiveStatePaths(tempDir, sessionId);
+		const snapshot = JSON.parse(await Bun.file(sessionPath).text());
+		delete snapshot.session_id;
+		delete snapshot.active_skills[0].session_id;
+		await Bun.write(sessionPath, JSON.stringify(snapshot));
+		const entryPath = activeEntryPath(tempDir, sessionId, "deep-interview");
+		const entry = JSON.parse(await Bun.file(entryPath).text());
+		delete entry.session_id;
+		await Bun.write(entryPath, JSON.stringify(entry));
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			expect(session.getDeepInterviewAskStage()).toBeUndefined();
+			expect(session.getActiveToolNames()).not.toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
 	it("keeps workflow-gate restoration settled after factory return and dispose", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-restoration-settlement-"));
 		tempDirs.push(tempDir);

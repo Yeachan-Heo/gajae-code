@@ -281,6 +281,15 @@ const QuestionItem = createQuestionItemSchema(DeepInterviewMeta);
 const TopologyQuestionItem = createQuestionItemSchema(DeepInterviewTopologyMeta);
 const PostTopologyQuestionItem = createQuestionItemSchema(z.union([DeepInterviewRoundMeta, DeepInterviewReviewMeta]));
 
+const OrdinaryQuestionItem = z.object({
+	id: z.string().describe("question id"),
+	question: z.string().describe("question text"),
+	options: z.array(OptionItem).describe("available options"),
+	multi: z.boolean().describe("allow multiple selections").optional(),
+	recommended: z.number().describe("recommended option index").optional(),
+	workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
+});
+
 export const askSchema = z.object({
 	questions: z.array(QuestionItem).min(1).describe("questions to ask"),
 });
@@ -291,6 +300,10 @@ const topologyAskSchema = z.object({
 
 const postTopologyAskSchema = z.object({
 	questions: z.array(PostTopologyQuestionItem).min(1).describe("questions to ask"),
+});
+
+const ordinaryAskSchema = z.object({
+	questions: z.array(OrdinaryQuestionItem).min(1).describe("questions to ask"),
 });
 
 export type AskToolInput = z.infer<typeof askSchema>;
@@ -1116,7 +1129,11 @@ function formatQuestionResult(result: QuestionResult): string {
 // =============================================================================
 
 type AskParams = AskToolInput;
-type AskParametersSchema = typeof askSchema | typeof topologyAskSchema | typeof postTopologyAskSchema;
+type AskParametersSchema =
+	| typeof ordinaryAskSchema
+	| typeof askSchema
+	| typeof topologyAskSchema
+	| typeof postTopologyAskSchema;
 
 /**
  * Ask tool for interactive user prompting during execution.
@@ -1133,7 +1150,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const stage = this.session.getDeepInterviewAskStage?.();
 		if (stage === "topology") return topologyAskSchema;
 		if (stage === "post-topology") return postTopologyAskSchema;
-		return askSchema;
+		return ordinaryAskSchema;
 	}
 	readonly rawArgumentValidation = recoverRoundZeroIntentContract;
 	readonly strict = true;
@@ -1170,6 +1187,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		if (customInput !== undefined && (meta || isDeepInterviewAskQuestion(q.question)))
 			assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 		if (!meta) return;
+		if (this.session.getDeepInterviewAskStage?.() === undefined) return;
 		if (q.workflowGate && (q.workflowGate.stage !== "deep-interview" || q.workflowGate.kind !== "question")) return;
 		const cwd = this.session.cwd;
 		const sessionId = this.session.getSessionId?.() ?? undefined;

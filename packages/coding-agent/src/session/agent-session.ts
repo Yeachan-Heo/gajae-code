@@ -2515,7 +2515,7 @@ export class AgentSession {
 			assertDeepInterviewIntentManifest(intentContract);
 			return "post-topology";
 		} catch {
-			return "topology";
+			return undefined;
 		}
 	}
 
@@ -6813,8 +6813,9 @@ export class AgentSession {
 		if (!activeSkill) {
 			try {
 				const activeState = await readVisibleSkillActiveState(this.sessionManager.getCwd(), sessionId);
-				activeSkill =
-					activeState?.skill ?? activeState?.active_skills?.find(entry => entry.active !== false)?.skill;
+				activeSkill = activeState?.active_skills?.find(
+					entry => entry.active !== false && entry.session_id === sessionId,
+				)?.skill;
 			} catch (error) {
 				logger.warn("Failed to read durable workflow skill state while restoring ask tool", {
 					error: error instanceof Error ? error.message : String(error),
