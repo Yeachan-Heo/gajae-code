@@ -30,10 +30,13 @@ export type ChatDaemonAction = "stop" | "reload";
  * `kill -9`. Generation 8 adopts Windows expected-identity ACL verification and
  * repair for shared native authority. Generation 9 refreshes the shared native
  * authority declaration contract with bounded frame-delivery acknowledgement.
+ * Generation 11 accepts typed retained exact-unlink cleanup authority — a
+ * concrete detached quarantine plus a proven-absent canonical lock pathname —
+ * when deleting an observed owner-lock lease.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 10,
-	slack: 10,
+	discord: 11,
+	slack: 11,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

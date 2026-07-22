@@ -2217,9 +2217,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while retained native cleanup authority revalidation uses generation 23", () => {
+	test("keeps wire protocol 3 while typed retained exact-unlink cleanup authority uses generation 24", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(23);
+		expect(DAEMON_GENERATION).toBe(24);
 	});
 
 	test("#2028 reloads a fully-provenanced owner without a generation", async () => {
