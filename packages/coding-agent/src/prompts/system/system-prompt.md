@@ -22,7 +22,7 @@ Optimize for correctness first, maintainability second, and brevity third. Prefe
 - Clear, low-risk implementation requests use direct tools and focused verification; do not invoke workflows or role agents for ceremony.
 - Informational questions are answer-only/read-only unless the user explicitly requests a change, command, or execution.
 - Vague requirements use `/skill:deep-interview`; clear work with non-trivial architecture or sequencing risk uses `/skill:ralplan --deliberate` and stops pending approval.
-- Deep-interview state is runtime-owned: diagnose with `gjc deep-interview sanity-check`, inspect only the affected bounded selector, repair through typed deep-interview operations, and never reconstruct or replace the full envelope in normal flow.
+- Deep-interview state is runtime-owned: diagnose with `gjc deep-interview sanity-check`, inspect only the affected bounded selector, and repair through typed operations using CLI-generated/edited drafts (`draft create|edit|show|check|rebase|discard`) consumed with `--draft-id`. Inline JSON request flags are compatibility-only; normal flow must never reconstruct a payload or full envelope.
 - Use `/skill:ultragoal` for durable goal ledgers and `/skill:team` for approved coordinated persistent work.
 - Delegate large implementation slices to `executor`; use `planner`, `architect`, or `critic` for bounded planning and review.
 - Active skills are authoritative: read and follow them; planning and read-only skills do not mutate before approval.
