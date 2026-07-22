@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { computeAmbiguityFloor, scoreToUnits } from "./deep-interview-ambiguity";
+import type { DeepInterviewDraftKind } from "./deep-interview-payload";
 import { runDeepInterviewPostCommitEffects } from "./deep-interview-recorder";
 import {
 	answerHash,
@@ -151,6 +152,15 @@ function strictJson(value: string): unknown {
 	return JSON.parse(value) as unknown;
 }
 
+function structuredObject(value: unknown, code: string, max: number): Record<string, unknown> {
+	if (typeof value === "string") return objectJson(value, code, max);
+	if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype)
+		throw new RepairError(code);
+	const encoded = JSON.stringify(value);
+	if (typeof encoded !== "string" || Buffer.byteLength(encoded) > max) throw new RepairError(code);
+	return value as Record<string, unknown>;
+}
+
 function objectJson(value: string | undefined, code: string, max: number): Record<string, unknown> {
 	if (value === undefined || Buffer.byteLength(value) > MAX_BYTES || Buffer.byteLength(value) > max)
 		throw new RepairError(code);
@@ -243,8 +253,11 @@ function scores(
 function optionalText(value: unknown, max: number): string | undefined {
 	return value === undefined ? undefined : text(value, max);
 }
-function answerJson(value: string | undefined): { selected_options: string[]; custom_input: string | null } {
-	const answer = objectJson(value, "DI_INVALID_ANSWER_JSON", 8 * 1024);
+export function decodeDeepInterviewAnswerJson(value: unknown): {
+	selected_options: string[];
+	custom_input: string | null;
+} {
+	const answer = structuredObject(value, "DI_INVALID_ANSWER_JSON", 8 * 1024);
 	exactKeys(answer, ["selected_options", "custom_input"], "DI_INVALID_ANSWER_JSON");
 	if (!Array.isArray(answer.selected_options) || answer.selected_options.length > 64)
 		throw new RepairError("DI_INVALID_ANSWER_JSON");
@@ -260,8 +273,11 @@ function answerJson(value: string | undefined): { selected_options: string[]; cu
 		throw new RepairError("DI_INVALID_ANSWER_JSON");
 	return { selected_options, custom_input: answer.custom_input };
 }
-function resultJson(value: string | undefined, state: Record<string, unknown>): DeepInterviewRoundResultV1 {
-	const result = objectJson(value, "DI_INVALID_RESULT_JSON", 48 * 1024);
+export function decodeDeepInterviewRoundResultJson(
+	value: unknown,
+	state: Record<string, unknown>,
+): DeepInterviewRoundResultV1 {
+	const result = structuredObject(value, "DI_INVALID_RESULT_JSON", 48 * 1024);
 	const dimensions =
 		state.type === "brownfield"
 			? DIMENSIONS
@@ -485,8 +501,8 @@ function inputText(value: unknown, max: number): string {
 	if (typeof value !== "string" || Buffer.byteLength(value) > max) throw new RepairError("DI_INVALID_INPUT_JSON");
 	return value;
 }
-function setupJson(value: string | undefined): Record<string, unknown> {
-	const input = objectJson(value, "DI_INVALID_INPUT_JSON", 24 * 1024);
+export function decodeDeepInterviewSetupJson(value: unknown): Record<string, unknown> {
+	const input = structuredObject(value, "DI_INVALID_INPUT_JSON", 24 * 1024);
 	exactKeys(
 		input,
 		[
@@ -543,8 +559,8 @@ function setupJson(value: string | undefined): Record<string, unknown> {
 		throw new RepairError("DI_INVALID_INPUT_JSON");
 	return input;
 }
-function topologyJson(value: string | undefined): Record<string, unknown> {
-	const input = objectJson(value, "DI_INVALID_INPUT_JSON", 24 * 1024);
+export function decodeDeepInterviewTopologyJson(value: unknown): Record<string, unknown> {
+	const input = structuredObject(value, "DI_INVALID_INPUT_JSON", 24 * 1024);
 	exactKeys(input, ["components", "deferred_components"], "DI_INVALID_INPUT_JSON");
 	if (
 		!Array.isArray(input.components) ||
@@ -686,11 +702,57 @@ function transformResult(
 	};
 }
 
+async function consumeDraftMutation(
+	args: readonly string[],
+	cwd: string,
+): Promise<DeepInterviewRepairResult | undefined> {
+	const draft = args.indexOf("--draft-id");
+	if (draft === -1) return undefined;
+	const verb = args[0];
+	if (!verb || !["initialize-context", "confirm-topology", "record-answer", "apply-round-result"].includes(verb))
+		throw new RepairError("DI_UNKNOWN_COMMAND");
+	const flags = new Map<string, string>();
+	let hasJson = false;
+	for (let index = 1; index < args.length; ) {
+		const flag = args[index++];
+		if (flag === "--json") {
+			if (hasJson) throw new RepairError("DI_INPUT_MODE_CONFLICT");
+			hasJson = true;
+			if (args[index] === "true") index++;
+			continue;
+		}
+		const value = args[index++];
+		if (
+			!flag?.startsWith("--") ||
+			!["--draft-id", "--expected-draft-revision"].includes(flag) ||
+			value === undefined ||
+			value.startsWith("--") ||
+			flags.has(flag)
+		)
+			throw new RepairError("DI_INPUT_MODE_CONFLICT");
+		flags.set(flag, value);
+	}
+	if (!hasJson) throw new RepairError("DI_JSON_REQUIRED");
+	const id = flags.get("--draft-id");
+	const revision = flags.get("--expected-draft-revision");
+	if (!id || !revision) throw new RepairError("DI_INVALID_ARGUMENT");
+	const { runDeepInterviewDraftInternalConsumeCommand } = await import("./deep-interview-draft");
+	const result = await runDeepInterviewDraftInternalConsumeCommand(
+		id,
+		Number(revision),
+		verb as DeepInterviewDraftKind,
+		cwd,
+	);
+	return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
 export async function runDeepInterviewRepairCommand(
 	args: readonly string[],
 	cwd: string,
 ): Promise<DeepInterviewRepairResult> {
 	try {
+		const consumed = await consumeDraftMutation(args, cwd);
+		if (consumed) return consumed;
 		const parsed = parse(args);
 		if (parsed.verb === "sanity-check") return await sanity(parsed, cwd);
 		if (parsed.verb === "inspect") return await inspect(parsed, cwd);
@@ -727,9 +789,12 @@ async function mutate(parsed: ParsedRepairCommand, cwd: string): Promise<Record<
 		],
 	};
 	const { session, revision } = validateMutation(parsed, configs[parsed.verb as keyof typeof configs]);
-	const setupInput = parsed.verb === "initialize-context" ? setupJson(parsed.flags.get("--input-json")) : undefined;
+	const setupInput =
+		parsed.verb === "initialize-context" ? decodeDeepInterviewSetupJson(parsed.flags.get("--input-json")) : undefined;
 	const topologyInput =
-		parsed.verb === "confirm-topology" ? topologyJson(parsed.flags.get("--input-json")) : undefined;
+		parsed.verb === "confirm-topology"
+			? decodeDeepInterviewTopologyJson(parsed.flags.get("--input-json"))
+			: undefined;
 	const path = statePath(cwd, session);
 	const now = new Date().toISOString();
 	let nativeProjection: object | undefined;
@@ -833,7 +898,7 @@ async function mutate(parsed: ParsedRepairCommand, cwd: string): Promise<Record<
 				)
 					throw new RepairError("DI_INVALID_DIMENSION");
 				const question = stringJson(parsed.flags.get("--question-json"));
-				const answer = answerJson(parsed.flags.get("--answer-json"));
+				const answer = decodeDeepInterviewAnswerJson(parsed.flags.get("--answer-json"));
 				const rounds = Array.isArray(state.rounds) ? [...state.rounds] : [];
 				const candidate = {
 					round,
@@ -873,7 +938,7 @@ async function mutate(parsed: ParsedRepairCommand, cwd: string): Promise<Record<
 				});
 				return { kind: "write" as const, value: { ...current, schema_version: 1, state: { ...state, rounds } } };
 			}
-			const result = resultJson(parsed.flags.get("--result-json"), state);
+			const result = decodeDeepInterviewRoundResultJson(parsed.flags.get("--result-json"), state);
 			try {
 				const outcome = applyDeepInterviewRoundResultV1(current, key, result, now);
 				nativeProjection = outcome.projection;

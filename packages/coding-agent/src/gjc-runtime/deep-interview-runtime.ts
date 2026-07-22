@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { YAML } from "bun";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import { scoreToUnits } from "./deep-interview-ambiguity";
+import { runDeepInterviewDraftCommand } from "./deep-interview-draft";
 import { runDeepInterviewPostCommitEffects } from "./deep-interview-recorder";
 import { isDeepInterviewRepairVerb, runDeepInterviewRepairCommand } from "./deep-interview-repair";
 import {
@@ -1004,6 +1005,24 @@ function isDeepInterviewRepairInvocation(args: readonly string[]): boolean {
 	const separator = args.indexOf("--");
 	return (separator === -1 || separator > 0) && isDeepInterviewRepairVerb(args[0] ?? "");
 }
+function isDeepInterviewDraftInvocation(args: readonly string[]): boolean {
+	const separator = args.indexOf("--");
+	return (separator === -1 || separator > 0) && args[0] === "draft";
+}
+function draftCommandArgs(args: readonly string[]): string[] {
+	const normalized: string[] = [];
+	for (let index = 1; index < args.length; index++) {
+		const argument = args[index];
+		if (argument === "--for") {
+			normalized.push("--kind", args[++index] ?? "");
+			continue;
+		}
+		normalized.push(argument);
+		if ((argument === "--null" || argument === "--json") && !args[index + 1]?.startsWith("--")) continue;
+		if (argument === "--null" || argument === "--json") normalized.push("true");
+	}
+	return normalized;
+}
 
 export async function runNativeDeepInterviewCommand(
 	args: string[],
@@ -1012,6 +1031,7 @@ export async function runNativeDeepInterviewCommand(
 	try {
 		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd);
 		if (isDeepInterviewRepairInvocation(args)) return await runDeepInterviewRepairCommand(args, cwd);
+		if (isDeepInterviewDraftInvocation(args)) return await runDeepInterviewDraftCommand(draftCommandArgs(args), cwd);
 		const resolved = await resolveDeepInterviewArgs(args, cwd);
 		if (!resolved.idea) {
 			const existing = await readExistingStateForMutation(deepInterviewStatePath(cwd, resolved.sessionId));
