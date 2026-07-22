@@ -3108,8 +3108,16 @@ test("production post-registration startup failure proves cleanup and exact repl
 		expect(sessions).toMatchObject({ ok: true, result: { sessions: [] } });
 		const sdkDir = path.join(root, ".gjc", "state", "sdk");
 		const entries = await fs.readdir(sdkDir);
-		expect(entries.some(entry => entry.includes(".lifecycle.failure."))).toBe(false);
-		expect(entries.some(entry => entry.endsWith(".lifecycle.json"))).toBe(false);
+		// Retained `.gjc-delete-*` quarantines are typed cleanup evidence; only
+		// canonical lifecycle metadata must be gone. Every remaining entry that
+		// still matches a lifecycle pattern must be an authorized quarantine name.
+		const canonical = entries.filter(entry => !entry.startsWith(".gjc-delete-"));
+		expect(canonical.some(entry => entry.includes(".lifecycle.failure."))).toBe(false);
+		expect(canonical.some(entry => entry.endsWith(".lifecycle.json"))).toBe(false);
+		const retained = entries.filter(
+			entry => entry.includes(".lifecycle.failure.") || entry.endsWith(".lifecycle.json"),
+		);
+		expect(retained.every(entry => entry.startsWith(".gjc-delete-"))).toBe(true);
 	} finally {
 		if (previousFailure === undefined) delete process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION;
 		else process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION = previousFailure;

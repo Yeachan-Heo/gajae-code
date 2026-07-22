@@ -1452,6 +1452,99 @@ describe("SDK broker identity and discovery", () => {
 		}
 	});
 
+	it("advances typed retained cleanup authority to completion and exactly replays it", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const sessionId = "retained-authority";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+		const broker = new Broker({ agentDir: dir });
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await fs.mkdir(path.dirname(markerPath), { recursive: true });
+		await fs.writeFile(
+			markerPath,
+			JSON.stringify({ pid: 2_147_483_647, effectMarker: "metadata", incarnation: "test" }),
+		);
+		await broker.start();
+		try {
+			const response = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"retained-authority-key",
+			);
+			expect(response).toMatchObject({ ok: true, result: { sessionId } });
+			// Canonical objects are durably absent.
+			expect(await fs.stat(sessionPath).catch(() => undefined)).toBeUndefined();
+			expect(await fs.stat(markerPath).catch(() => undefined)).toBeUndefined();
+			// Typed retained evidence remains only at authorized quarantine names.
+			const sessionEntries = await fs.readdir(path.dirname(sessionPath));
+			const retainedTranscript = sessionEntries.filter(entry => entry.endsWith("-transcript"));
+			expect(retainedTranscript.length).toBeGreaterThan(0);
+			expect(retainedTranscript.every(entry => entry.startsWith(".gjc-delete-"))).toBe(true);
+			const sdkEntries = await fs.readdir(path.dirname(markerPath));
+			const retainedMetadata = sdkEntries.filter(entry => entry.endsWith(".lifecycle.json"));
+			expect(retainedMetadata.length).toBeGreaterThan(0);
+			expect(retainedMetadata.every(entry => entry.startsWith(".gjc-delete-"))).toBe(true);
+			// The typed retained authority is durable in the broker ledger.
+			const ledgerRows = (await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+			expect(
+				ledgerRows.some(
+					row => row.state === "effect_started" && JSON.stringify(row.response).includes('"cleanup_pending"'),
+				),
+			).toBe(true);
+			// The terminal response replays exactly.
+			expect(
+				await broker.handleRequest("session.delete", { sessionId, sessionPath, cwd }, "retained-authority-key"),
+			).toEqual(response);
+		} finally {
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses retained cleanup evidence outside the authorized quarantine plan", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "workspace");
+		const sessionId = "forged-retained-authority";
+		const sessionPath = await managedSessionPath(dir, cwd, sessionId);
+		const broker = new Broker({ agentDir: dir });
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, `${JSON.stringify({ type: "session", id: sessionId, cwd })}\n`);
+		await broker.start();
+		const originalUnlink = native.exactUnlink;
+		const forged = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (pathname === sessionPath) {
+				return {
+					ok: false,
+					code: "cleanup_pending",
+					detachedPath: path.join(path.dirname(sessionPath), ".gjc-delete-forged-transcript"),
+				};
+			}
+			return originalUnlink(pathname, identity);
+		});
+		try {
+			const response = await broker.handleRequest(
+				"session.delete",
+				{ sessionId, sessionPath, cwd },
+				"forged-retained-authority-key",
+			);
+			expect(response).toMatchObject({
+				ok: false,
+				error: { code: "cleanup_pending", cleanup: { phase: "transcript" } },
+			});
+			expect(await fs.readFile(sessionPath, "utf8")).toContain(sessionId);
+		} finally {
+			forged.mockRestore();
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("returns endpoint_stale without dispatching close after endpoint generation rotation", async () => {
 		const dir = await temp();
 		const stateRoot = path.join(dir, ".gjc", "state");

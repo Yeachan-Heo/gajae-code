@@ -1241,6 +1241,10 @@ function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerRespon
 			if (!current) continue;
 			if (!sameLifecycleCleanupIdentity(current.identity, file.identity))
 				return fail("terminal_uncertain", "Lifecycle metadata candidate lacks exact replay authority.");
+			// A completed file's recorded retained quarantine is receipt-bound durable
+			// evidence; anything else that remains is an active survivor.
+			if (file.completed && file.detachedPath && path.resolve(candidate) === path.resolve(file.detachedPath))
+				continue;
 			activeCandidates++;
 		}
 		if (file.completed && activeCandidates > 0)
@@ -1289,7 +1293,21 @@ function lifecycleMetadataReplayAbsent(cleanup: CleanupEvidence): boolean {
 	const id = cleanup.sessionId!;
 	const required = new Set<string>([lifecycleMarkerPath(root, id), lifecycleReadyPath(root, id)]);
 	for (const file of files) for (const candidate of lifecycleCleanupCandidates(file)) required.add(candidate);
-	return [...required].every(absentLifecyclePath);
+	for (const candidate of required) {
+		if (absentLifecyclePath(candidate)) continue;
+		// A completed file's recorded retained quarantine is durable evidence, not a
+		// survivor — accept it only at its receipt-bound path and identity.
+		const owner = files.find(
+			file =>
+				file.completed === true &&
+				file.detachedPath !== undefined &&
+				path.resolve(file.detachedPath) === path.resolve(candidate),
+		);
+		if (!owner) return false;
+		const current = captureLifecycleFile(candidate, true, true);
+		if (!current || !sameLifecycleCleanupIdentity(current.identity, owner.identity)) return false;
+	}
+	return true;
 }
 
 /**
@@ -1552,16 +1570,28 @@ async function reconcileLifecycleCleanup(
 		const candidates = lifecycleCleanupCandidates(file);
 		if (file.completed) {
 			for (const candidate of candidates) {
+				let stat: ReturnType<typeof fsSync.lstatSync>;
 				try {
-					fsSync.lstatSync(candidate);
-					return fail(
-						"terminal_uncertain",
-						"Lifecycle cleanup receipt marks a target complete while an authorized candidate remains.",
-					);
+					stat = fsSync.lstatSync(candidate);
 				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-						return fail("terminal_uncertain", "Lifecycle cleanup completion could not be safely inspected.");
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+					return fail("terminal_uncertain", "Lifecycle cleanup completion could not be safely inspected.");
 				}
+				// A completed file's recorded retained quarantine is durable evidence,
+				// not a survivor — accept it only at its receipt-bound path and identity.
+				if (
+					file.detachedPath &&
+					path.resolve(candidate) === path.resolve(file.detachedPath) &&
+					stat.isFile() &&
+					!stat.isSymbolicLink()
+				) {
+					const current = captureLifecycleFile(candidate, true, true);
+					if (current && sameLifecycleCleanupIdentity(current.identity, file.identity)) continue;
+				}
+				return fail(
+					"terminal_uncertain",
+					"Lifecycle cleanup receipt marks a target complete while an authorized candidate remains.",
+				);
 			}
 			continue;
 		}
@@ -1631,6 +1661,22 @@ async function reconcileLifecycleCleanup(
 			quarantineName: path.basename(currentFile.plannedPath),
 		});
 		if (!result.ok) {
+			if (result.code === "cleanup_pending" && result.detachedPath === currentFile.plannedPath) {
+				// Typed retained authority: the native verified the exact identity-bound
+				// detach and retained the quarantine as durable evidence. Record the
+				// evidence and advance — never claim a terminal byte deletion.
+				const lifecycleFiles = activeCleanup.lifecycleFiles!.map((candidate, candidateIndex) =>
+					candidateIndex === index
+						? { ...candidate, detachedPath: result.detachedPath, completed: true as const }
+						: candidate,
+				);
+				activeCleanup = { ...activeCleanup, lifecycleFiles };
+				await broker.ledger.transition(identity, "effect_started", {
+					response: fail("cleanup_pending", "Lifecycle cleanup completion was durably reconciled.", activeCleanup),
+				});
+				lifecycleCleanupHooksForTest.get(broker)?.();
+				continue;
+			}
 			const lifecycleFiles = activeCleanup.lifecycleFiles!.map((candidate, candidateIndex) =>
 				candidateIndex === index && result.detachedPath
 					? { ...candidate, detachedPath: result.detachedPath }
@@ -3043,11 +3089,26 @@ async function executeLifecycleResponse(
 				`Unable to delete saved session artifacts: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
-		if (deleted.kind === "artifacts_removed") {
+		const retainedArtifactsCleanup =
+			deleted.kind === "cleanup_pending" &&
+			deleted.phase === "artifacts" &&
+			deleted.detachedArtifactsPath !== undefined &&
+			cleanupTarget.plannedArtifactsPath !== undefined &&
+			(deleted.detachedArtifactsPath === cleanupTarget.plannedArtifactsPath ||
+				deleted.detachedArtifactsPath === `${cleanupTarget.plannedArtifactsPath}.removing`);
+		if (deleted.kind === "artifacts_removed" || retainedArtifactsCleanup) {
 			const transcriptPhaseCleanup = {
 				...preauthorizedCleanup,
 				phase: "transcript" as const,
 				artifactsRemoved: true,
+				...(deleted.kind === "cleanup_pending" && deleted.phase === "artifacts"
+					? {
+							detachedArtifactsPath: deleted.detachedArtifactsPath,
+							...(deleted.artifactsIdentity
+								? { artifactsIdentity: serializeCleanupIdentity(deleted.artifactsIdentity) }
+								: {}),
+						}
+					: {}),
 				...(preauthorizedCleanup.artifactTree
 					? { artifactTree: { ...preauthorizedCleanup.artifactTree, completed: true as const } }
 					: {}),
@@ -3068,7 +3129,14 @@ async function executeLifecycleResponse(
 				artifactsRemoved: true,
 			});
 		}
-		if (deleted.kind === "cleanup_pending")
+		if (
+			deleted.kind === "cleanup_pending" &&
+			!(
+				deleted.phase === "transcript" &&
+				deleted.detachedTranscriptPath !== undefined &&
+				deleted.detachedTranscriptPath === cleanupTarget.plannedTranscriptPath
+			)
+		)
 			return fail(
 				"cleanup_pending",
 				`Saved session cleanup is pending in ${deleted.phase}: ${deleted.error.message}`,

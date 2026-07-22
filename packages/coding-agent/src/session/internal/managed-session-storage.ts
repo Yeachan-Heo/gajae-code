@@ -861,7 +861,17 @@ export class ManagedSessionDescendantStore {
 				sha256: expected.identity.sha256,
 				quarantineName: `.gjc-remove-${process.pid}-${randomUUID()}`,
 			});
-			if (!removed.ok) throw new Error(removed.code ?? "managed_remove_failed");
+			if (
+				!removed.ok &&
+				!(
+					removed.code === "cleanup_pending" &&
+					(removed.detachedPath ??
+						removed.retainedSuccessorPath ??
+						removed.retainedPlaceholderPath ??
+						removed.retainedUnknownPath) !== undefined
+				)
+			)
+				throw new Error(removed.code ?? "managed_remove_failed");
 			this.#assertBound();
 			return;
 		}
@@ -874,7 +884,8 @@ export class ManagedSessionDescendantStore {
 			expected.identity.ctimeNs.toString(),
 			expected.identity.sha256,
 		);
-		if (!removed.ok) throw new Error(removed.code ?? "managed_remove_failed");
+		if (!removed.ok && !(removed.code === "cleanup_pending" && removed.recoveryPath !== undefined))
+			throw new Error(removed.code ?? "managed_remove_failed");
 		this.#assertBound();
 	}
 	/** Read and remove one managed descendant through retained authority. */
@@ -898,7 +909,8 @@ export class ManagedSessionDescendantStore {
 				existing.identity.ctimeNs,
 				existing.identity.sha256 ?? createHash("sha256").update(existing.data).digest("hex"),
 			);
-			if (!removed.ok) throw new Error(removed.code ?? "managed_consume_failed");
+			if (!removed.ok && !(removed.code === "cleanup_pending" && removed.recoveryPath !== undefined))
+				throw new Error(removed.code ?? "managed_consume_failed");
 			this.#assertBound();
 			return existing.data;
 		}

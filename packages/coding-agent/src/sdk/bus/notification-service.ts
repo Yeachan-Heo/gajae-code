@@ -900,7 +900,16 @@ async function detachTransitionMarker(
 ): Promise<boolean> {
 	if (!snapshot.identity || !fs.exactUnlink) return false;
 	try {
-		return (await fs.exactUnlink(path, snapshot.identity)).ok;
+		const removed = await fs.exactUnlink(path, snapshot.identity);
+		if (removed.ok) return true;
+		// Accept only typed retained authority: a concrete detached quarantine plus
+		// a proven-absent canonical marker pathname. Anything else stays fail-closed.
+		return (
+			removed.code === "cleanup_pending" &&
+			typeof removed.detachedPath === "string" &&
+			removed.detachedPath.length > 0 &&
+			(await fs.readFile(path, "utf8").catch(() => undefined)) === undefined
+		);
 	} catch {
 		return false;
 	}
@@ -1080,11 +1089,27 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		try {
 			const result = await fs.exactUnlink(file, record.identity);
 			if (!result.ok) {
-				recoveryFailures += 1;
 				if (result.detachedPath) detached.push(result.detachedPath);
 				if (result.retainedSuccessorPath) retainedSuccessors.push(result.retainedSuccessorPath);
 				if (result.retainedPlaceholderPath) retainedPlaceholders.push(result.retainedPlaceholderPath);
 				if (result.retainedUnknownPath) retainedUnknown.push(result.retainedUnknownPath);
+				// Typed retained authority with a concrete quarantine and a proven-absent
+				// canonical endpoint counts as removed; the detached path above is the
+				// durable evidence. Anything else is a genuine recovery failure.
+				const retainedRemoved =
+					result.code === "cleanup_pending" &&
+					typeof result.detachedPath === "string" &&
+					result.detachedPath.length > 0 &&
+					(await fs.readFile(file, "utf8").catch(() => undefined)) === undefined;
+				if (retainedRemoved) {
+					removed.push({
+						sessionId: view.sessionId,
+						pid: view.pid,
+						reason: view.stale ? "stale-flag" : "dead-pid",
+					});
+					continue;
+				}
+				recoveryFailures += 1;
 				if (
 					!result.detachedPath &&
 					!result.retainedSuccessorPath &&

@@ -660,6 +660,26 @@ function ownershipLockMatchesMetadata(lock: OwnershipLockRead, metadata: Ownersh
 	return lock.kind === "valid" && JSON.stringify(lock.metadata) === JSON.stringify(metadata);
 }
 
+/**
+ * Accept an exact unlink only when it either completed or returned typed
+ * retained authority — a concrete detached quarantine plus a proven-absent
+ * canonical pathname. Anything else stays fail-closed.
+ */
+async function exactUnlinkAcceptedWithRetainedEvidence(
+	fsImpl: TelegramDaemonFs,
+	file: string,
+	identity: NotificationEndpointFileIdentity,
+): Promise<boolean> {
+	const removed = await fsImpl.exactUnlink!(file, identity);
+	if (removed.ok) return true;
+	return (
+		removed.code === "cleanup_pending" &&
+		typeof removed.detachedPath === "string" &&
+		removed.detachedPath.length > 0 &&
+		(await fsImpl.readEndpointFile!(file).catch(() => undefined)) === undefined
+	);
+}
+
 async function unlinkOwnershipLockExactly(
 	fsImpl: TelegramDaemonFs,
 	file: string,
@@ -668,7 +688,7 @@ async function unlinkOwnershipLockExactly(
 	if (expected.kind === "missing" || !fsImpl.readEndpointFile || !fsImpl.exactUnlink) return false;
 	const endpoint = await fsImpl.readEndpointFile(file).catch(() => undefined);
 	if (!endpoint || !ownershipLockMatches(expected, await readOwnershipLock(fsImpl, file))) return false;
-	return (await fsImpl.exactUnlink(file, endpoint.identity)).ok;
+	return await exactUnlinkAcceptedWithRetainedEvidence(fsImpl, file, endpoint.identity);
 }
 
 /**
@@ -2521,7 +2541,7 @@ export async function reclaimDeadDaemonOwner(input: {
 		if (!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition })))
 			return { recovered: false, reason: "transition-contended" };
 		for (const endpoint of endpoints)
-			if (!(await fsImpl.exactUnlink(endpoint.file, endpoint.identity)).ok)
+			if (!(await exactUnlinkAcceptedWithRetainedEvidence(fsImpl, endpoint.file, endpoint.identity)))
 				return { recovered: false, reason: "endpoint-changed" };
 		if (currentLock.kind === "missing") return { recovered: true, reason: "cleared" };
 		const exactLock = await fsImpl.readEndpointFile!(paths.lock).catch(() => undefined);
@@ -2532,7 +2552,7 @@ export async function reclaimDeadDaemonOwner(input: {
 			!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
 		)
 			return { recovered: false, reason: "lock-changed" };
-		return (await fsImpl.exactUnlink(paths.lock, exactLock.identity)).ok
+		return (await exactUnlinkAcceptedWithRetainedEvidence(fsImpl, paths.lock, exactLock.identity))
 			? { recovered: true, reason: "cleared" }
 			: { recovered: false, reason: "lock-changed" };
 	} finally {

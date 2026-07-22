@@ -939,10 +939,19 @@ async function ownsChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockL
 /** Deletes only the exact lease observed by this contender; a successor is retained. */
 function unlinkExactChatDaemonOwnerLock(lock: string, lease: ChatDaemonOwnerLockLease): boolean {
 	try {
-		return native.exactUnlink(lock, {
+		const removed = native.exactUnlink(lock, {
 			...lease,
 			quarantineName: `.gjc-delete-chat-daemon-lock-${crypto.randomUUID()}`,
-		}).ok;
+		});
+		if (removed.ok) return true;
+		// Accept only typed retained authority: a concrete detached quarantine plus
+		// a proven-absent canonical lock pathname. Anything else stays fail-closed.
+		return (
+			removed.code === "cleanup_pending" &&
+			typeof removed.detachedPath === "string" &&
+			removed.detachedPath.length > 0 &&
+			!fs.existsSync(lock)
+		);
 	} catch {
 		return false;
 	}
