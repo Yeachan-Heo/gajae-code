@@ -2,7 +2,7 @@ import { Command, Flags } from "@gajae-code/utils/cli";
 import { runNativeDeepInterviewCommand } from "../gjc-runtime/deep-interview-runtime";
 
 export default class DeepInterview extends Command {
-	static description = "Run native GJC deep-interview workflow";
+	static description = "Run native GJC deep-interview workflow, including typed diagnosis and repair operations";
 	static strict = false;
 	static flags = {
 		quick: Flags.boolean({ description: "Seed a quick deep-interview run" }),
@@ -29,6 +29,8 @@ export default class DeepInterview extends Command {
 		'$ gjc deep-interview --trace --standard "<idea>"',
 		"$ gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md",
 		"$ gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md --deliberate",
+		"$ gjc deep-interview inspect --session-id <id> --selector summary --json",
+		'$ gjc deep-interview record-answer --session-id <id> --schema-version 1 --expected-revision 1 --round 1 --question-id q1 --question-json \'"question"\' --answer-json \'{"selected_options":[],"custom_input":null}\' --json',
 	];
 
 	async run(): Promise<void> {
