@@ -14129,6 +14129,8 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		const bot = new FakeBotApi();
 		const createStarted = Promise.withResolvers<void>();
 		const releaseCreate = Promise.withResolvers<unknown>();
+		const deleteStarted = Promise.withResolvers<void>();
+		const releaseDelete = Promise.withResolvers<unknown>();
 		const originalCall = bot.call.bind(bot);
 		let heldCreate = true;
 		bot.call = async (method, body, options) => {
@@ -14136,6 +14138,11 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 				bot.calls.push({ method, body, options });
 				createStarted.resolve();
 				return releaseCreate.promise;
+			}
+			if (method === "deleteForumTopic") {
+				bot.calls.push({ method, body, options });
+				deleteStarted.resolve();
+				return releaseDelete.promise;
 			}
 			return originalCall(method, body, options);
 		};
@@ -14153,14 +14160,20 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		const successor = daemon.sessions.get("CANONICAL")!;
 		successor.ws.dispatchEvent(new Event("open"));
 		releaseCreate.resolve({ ok: true, result: { message_thread_id: 77 } });
+		await deleteStarted.promise;
+		releaseDelete.resolve({ ok: true, result: true });
 		await predecessorReplay;
-		await new Promise(resolve => setTimeout(resolve, 0));
+		await Promise.race([
+			(async () => {
+				while ((daemon as any).topics.get("CANONICAL")) await Bun.sleep(1);
+			})(),
+			Bun.sleep(1_000).then(() => Promise.reject(new Error("predecessor topic compensation did not settle"))),
+		]);
 
 		expect(
 			bot.calls.filter(call => call.method === "deleteForumTopic").map(call => call.body.message_thread_id),
 		).toEqual([77]);
 		expect(bot.calls.filter(call => call.method === "sendMessage" && call.body.message_thread_id === 77)).toEqual([]);
-		expect((daemon as any).topics.get("CANONICAL")).toBeUndefined();
 
 		heldCreate = false;
 		await daemon.handleSessionMessage(successor, {
