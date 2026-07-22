@@ -847,6 +847,10 @@ export class EventController {
 		this.ctx.editor.onEscape = () => {
 			this.ctx.session.abortCompaction();
 		};
+		if (this.ctx.loadingAnimation) {
+			this.ctx.loadingAnimation.stop();
+			this.ctx.loadingAnimation = undefined;
+		}
 		this.ctx.statusContainer.clear();
 		const reasonText =
 			event.reason === "overflow" ? "Context overflow detected, " : event.reason === "idle" ? "Idle " : "";
@@ -939,6 +943,10 @@ export class EventController {
 				this.ctx.session.abortRetry();
 			}
 		};
+		if (this.ctx.loadingAnimation) {
+			this.ctx.loadingAnimation.stop();
+			this.ctx.loadingAnimation = undefined;
+		}
 		this.ctx.statusContainer.clear();
 		// Stop any prior retry loader/timer before installing a new one.
 		this.ctx.retryLoader?.stop();
