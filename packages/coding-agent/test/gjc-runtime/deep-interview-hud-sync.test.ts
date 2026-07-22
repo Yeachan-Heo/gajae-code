@@ -5,10 +5,13 @@ import * as path from "node:path";
 import {
 	appendOrMergeDeepInterviewRound,
 	enrichDeepInterviewRoundScoring,
+	runDeepInterviewPostCommitEffects,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import { runDeepInterviewRepairCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-repair";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { activeSnapshotPath, modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { reconcileWorkflowSkillState, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { syncSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
@@ -18,6 +21,26 @@ async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-di-hud-sync-"));
 	tempRoots.push(dir);
 	return dir;
+}
+async function seedRecorderState(cwd: string): Promise<void> {
+	const result = await runNativeDeepInterviewCommand(["--json", "seed recorder state"], cwd);
+	expect(result.status).toBe(0);
+	const initialized = await runDeepInterviewRepairCommand(
+		[
+			"initialize-context",
+			"--session-id",
+			TEST_SESSION_ID,
+			"--schema-version",
+			"1",
+			"--expected-revision",
+			"0",
+			"--input-json",
+			'{"type":"greenfield","threshold":0.05}',
+			"--json",
+		],
+		cwd,
+	);
+	expect(initialized.status).toBe(0);
 }
 
 beforeAll(() => {
@@ -46,6 +69,7 @@ describe("deep-interview recorder -> HUD sync", () => {
 	it("refreshes active-state HUD round count after recording an answered round", async () => {
 		const cwd = await tempDir();
 		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -68,6 +92,7 @@ describe("deep-interview recorder -> HUD sync", () => {
 	it("refreshes HUD ambiguity after scoring enrichment", async () => {
 		const cwd = await tempDir();
 		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -80,14 +105,84 @@ describe("deep-interview recorder -> HUD sync", () => {
 			{
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.5 },
+				scores: { goal: 0.5, constraints: 0.5, criteria: 0.5 },
 				ambiguity: 0.45,
 			},
 			{ sessionId: TEST_SESSION_ID },
 		);
 		const chips = await deepInterviewChips(cwd);
 		expect(chips.round).toBe("1");
-		expect(chips.ambiguity).toContain("45%");
+		expect(chips.ambiguity).toContain("50%");
+	});
+	it("suppresses a reversed post-commit HUD completion from an older mode revision", async () => {
+		const cwd = await tempDir();
+		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+		const envelope = (roundCount: number) => ({
+			current_phase: "interviewing",
+			state: {
+				rounds: Array.from({ length: roundCount }, (_, index) => ({
+					round_key: `k${index + 1}`,
+					round: index + 1,
+					lifecycle: "answered",
+				})),
+				established_facts: [],
+				threshold: 0.05,
+			},
+		});
+		await runDeepInterviewPostCommitEffects({
+			cwd,
+			statePath,
+			sessionId: TEST_SESSION_ID,
+			envelope: envelope(2),
+			revision: 2,
+			writer: "test",
+		});
+		await runDeepInterviewPostCommitEffects({
+			cwd,
+			statePath,
+			sessionId: TEST_SESSION_ID,
+			envelope: envelope(1),
+			revision: 1,
+			writer: "test",
+		});
+		expect((await deepInterviewChips(cwd)).round).toBe("2");
+	});
+	it("rejects a stale recorder HUD sync after its in-process ordering slot is reinitialized", async () => {
+		const cwd = await tempDir();
+		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+		await syncSkillActiveState({
+			cwd,
+			skill: "deep-interview",
+			active: true,
+			phase: "interviewing",
+			sessionId: TEST_SESSION_ID,
+			hud: { version: 1, chips: [{ label: "round", value: "2" }] },
+			committedModeRevision: 2,
+		});
+
+		await runDeepInterviewPostCommitEffects({
+			cwd,
+			statePath,
+			sessionId: TEST_SESSION_ID,
+			envelope: {
+				current_phase: "interviewing",
+				state: { rounds: [{ round_key: "k1", round: 1, lifecycle: "answered" }], established_facts: [] },
+			},
+			revision: 1,
+			writer: "reinitialized-recorder",
+		});
+
+		const activePath = path.join(
+			cwd,
+			".gjc",
+			`_session-${TEST_SESSION_ID}`,
+			"state",
+			"active",
+			"deep-interview.json",
+		);
+		const active = JSON.parse(await fs.readFile(activePath, "utf-8"));
+		expect(active.committed_mode_state_revision).toBe(2);
+		expect((await deepInterviewChips(cwd)).round).toBe("2");
 	});
 });
 
@@ -95,6 +190,7 @@ describe("deep-interview gjc state write preserves recorder rounds", () => {
 	it("does not drop recorder-written rounds on a partial scoring write", async () => {
 		const cwd = await tempDir();
 		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
