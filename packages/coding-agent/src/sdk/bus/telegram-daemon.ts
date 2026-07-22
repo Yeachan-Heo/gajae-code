@@ -3982,6 +3982,10 @@ export class TelegramNotificationDaemon {
 			// as soon as they connect. A later authenticated logical rekey is the only
 			// path that may recover a different logical session's durable topic.
 			void (async () => {
+				// Give the replay handler the current turn to authenticate a logical owner before
+				// committing this transport-local eager create.
+				await Promise.resolve();
+
 				if (this.#logicalSessionId(session) !== sessionId) return;
 				const topicId = await this.ensureTopic(sessionId, this.topicNameFor(sessionId, {}), session);
 				const topicLease = this.topicAuthorityLeaseFromRegistry(sessionId);
@@ -4881,21 +4885,24 @@ export class TelegramNotificationDaemon {
 			this.legacyTopicOwners.set(previousSessionId, session);
 			this.preservedInitiatorTopics.add(previousSessionId);
 		}
-		if (candidateSessionId === session.sessionId && !this.topics.get(candidateSessionId))
-			void (async () => {
+		if (!this.topics.get(candidateSessionId)) {
+			try {
 				const topicId = await this.ensureTopic(
 					candidateSessionId,
 					this.topicNameFor(candidateSessionId, {}),
 					session,
 				);
+				if (!topicId && (await this.pairedChatIsPrivate())) return false;
 				const topicLease = this.topicAuthorityLeaseFromRegistry(candidateSessionId);
 				if (topicId && topicLease?.topicId === topicId)
 					await this.flushPendingThreadedFrames(candidateSessionId, topicLease);
-			})().catch(err =>
+			} catch (error) {
 				logger.warn(
-					`notifications: Telegram recovered topic creation failed: ${sanitizeDiagnostic(String(err), this.opts.botToken)}`,
-				),
-			);
+					`notifications: Telegram recovered topic creation failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+				);
+				return false;
+			}
+		}
 		return true;
 	}
 
@@ -6427,6 +6434,7 @@ export class TelegramNotificationDaemon {
 	}
 
 	async handleSessionMessage(session: SessionSocket, msg: any): Promise<void> {
+		if (!session) return;
 		if (msg?.type === "hello") {
 			const capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : [];
 			if (capabilities.includes("ephemeral_turn_v1")) {
@@ -6492,6 +6500,7 @@ export class TelegramNotificationDaemon {
 			// endpoint authority; otherwise the registry correctly sees an in-flight
 			// claim as ambiguous and rejects a valid bootstrap.
 			if (
+				!replayIdentitySessionId &&
 				!this.topics.get(session.sessionId) &&
 				this.#ownsLiveOpenEndpoint(session, endpointBinding) &&
 				this.topics.endpointAuthority(endpointBinding, session).state === "none"
