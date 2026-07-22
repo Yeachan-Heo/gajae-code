@@ -3060,7 +3060,10 @@ export class AgentSession {
 		if (event.type === "agent_start" && !this.#activeCoordinatorRuntimeTurnId)
 			this.#activeCoordinatorRuntimeTurnId = this.#followUpMessages[0]?.runtimeTurnId ?? null;
 		const terminalRuntimeTurnId =
-			event.type === "turn_end" && event.message.role === "assistant" && event.message.stopReason !== "toolUse"
+			event.type === "turn_end" &&
+			event.message.role === "assistant" &&
+			event.message.stopReason !== "toolUse" &&
+			!this.agent.hasQueuedSteering()
 				? this.#activeCoordinatorRuntimeTurnId
 				: null;
 		if (event.type === "turn_start") {
@@ -7956,15 +7959,18 @@ export class AgentSession {
 	async #queueSteer(
 		text: string,
 		images?: ImageContent[],
-		options?: { claimsGenuineUserIntent?: boolean },
+		options?: { claimsGenuineUserIntent?: boolean; runtimeTurnId?: string },
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText));
+		const entry = this.#createQueuedDisplayEntry(displayText);
+		if (options?.runtimeTurnId) entry.runtimeTurnId = options.runtimeTurnId;
+		this.#steeringMessages.push(entry);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		if (options?.runtimeTurnId) this.#coordinatorRuntimeTurnByQueuedMessage.set(message, options.runtimeTurnId);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -8348,7 +8354,10 @@ export class AgentSession {
 			return;
 		}
 		if (options?.deliverAs === "steer") {
-			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
+			await this.#queueSteer(text, images, {
+				claimsGenuineUserIntent: true,
+				runtimeTurnId: options.runtimeTurnId,
+			});
 			options.onPreflightAccepted?.();
 			return;
 		}
@@ -8359,7 +8368,10 @@ export class AgentSession {
 		// in-flight compaction internally, and #queueSteer would otherwise park
 		// the message in the steering queue with no turn to consume it.
 		if (this.isStreaming) {
-			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
+			await this.#queueSteer(text, images, {
+				claimsGenuineUserIntent: true,
+				runtimeTurnId: options?.runtimeTurnId,
+			});
 			options?.onPreflightAccepted?.();
 			return;
 		}
@@ -8383,8 +8395,6 @@ export class AgentSession {
 	clearQueue(): { steering: string[]; followUp: string[] } {
 		const steering = this.#steeringMessages.map(e => e.text);
 		const followUp = this.#followUpMessages.map(e => e.text);
-		for (const entry of [...this.#steeringMessages, ...this.#followUpMessages])
-			this.#cancelQueuedCoordinatorRuntimeTurn(entry.runtimeTurnId);
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
 		this.agent.clearAllQueues();
@@ -8457,18 +8467,7 @@ export class AgentSession {
 		);
 	}
 
-	#cancelQueuedCoordinatorRuntimeTurn(runtimeTurnId: string | undefined): void {
-		if (!runtimeTurnId) return;
-		this.#persistRuntimeStateInBackground(
-			{
-				type: "agent_end",
-				messages: [{ role: "assistant", content: [], stopReason: "error" } as unknown as AssistantMessage],
-			},
-			runtimeTurnId,
-		);
-	}
-
-	removeQueuedMessageForEditing(id: string, options?: { preserveRuntimeTurnId?: boolean }): string | undefined {
+	removeQueuedMessageForEditing(id: string): string | undefined {
 		const [mode, sequenceText] = id.split(":");
 		if ((mode !== "steer" && mode !== "followUp") || sequenceText === undefined) return undefined;
 		const sequence = Number(sequenceText);
@@ -8490,7 +8489,6 @@ export class AgentSession {
 		} else {
 			this.agent.removeFollowUpAt(index);
 		}
-		if (!options?.preserveRuntimeTurnId) this.#cancelQueuedCoordinatorRuntimeTurn(entry?.runtimeTurnId);
 		return entry?.text;
 	}
 

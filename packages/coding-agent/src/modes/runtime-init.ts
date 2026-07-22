@@ -365,10 +365,12 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					}
 					case "queue.message.update": {
 						const id = String(input.id);
-						const runtimeTurnId = session.getQueuedRuntimeTurnIdForEditing(id);
-						const old = session.removeQueuedMessageForEditing(id, { preserveRuntimeTurnId: true });
 						const patch = input.patch as { text?: unknown };
-						if (old === undefined || typeof patch?.text !== "string")
+						if (typeof patch?.text !== "string")
+							throw Object.assign(new Error("Queued message update is invalid."), { code: "invalid_message" });
+						const runtimeTurnId = session.getQueuedRuntimeTurnIdForEditing(id);
+						const old = session.removeQueuedMessageForEditing(id);
+						if (old === undefined)
 							throw Object.assign(new Error("Queued message update is invalid."), { code: "invalid_message" });
 						await session.sendUserMessage(patch.text, {
 							deliverAs: id.startsWith("steer:") ? "steer" : "followUp",

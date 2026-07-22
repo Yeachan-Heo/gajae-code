@@ -179,7 +179,10 @@ function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: Nod
 	for (const key of Object.keys(environment)) {
 		if (
 			key.startsWith("GJC_COORDINATOR_SESSION_") ||
-			key.startsWith("GJC_TMUX_") ||
+			key.startsWith("GJC_TMUX_OWNER_") ||
+			key.startsWith("GJC_MANAGED_OWNER_") ||
+			key === "GJC_TMUX_ACTIVE_SESSION" ||
+			key === "GJC_TMUX_LAUNCHED" ||
 			key === "TMUX" ||
 			key === "TMUX_PANE"
 		)

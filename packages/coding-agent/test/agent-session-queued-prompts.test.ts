@@ -197,6 +197,28 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		expect(userTexts(session)).toEqual(["p1", "steer me", "queue me"]);
 	});
 
+	it("retains a coordinator receipt id on a same-turn steer", async () => {
+		const gate = Promise.withResolvers<void>();
+		session = buildSession([
+			async () => {
+				await gate.promise;
+				return { content: ["turn 1"] };
+			},
+			{ content: ["after steer"] },
+		]);
+		const first = session.prompt("p1");
+		await waitUntil(() => session!.isStreaming);
+
+		await session.sendUserMessage("coordinated steer", { runtimeTurnId: "runtime-steer-1" });
+		const [entry] = session.getQueuedMessageEntries();
+		expect(entry?.id).toStartWith("steer:");
+		expect(session.getQueuedRuntimeTurnIdForEditing(entry?.id ?? "")).toBe("runtime-steer-1");
+
+		gate.resolve();
+		await first;
+		await session.waitForIdle();
+	});
+
 	it("removes an arbitrary queued prompt selected for editing", async () => {
 		const gate = Promise.withResolvers<void>();
 		session = buildSession([
