@@ -139,10 +139,10 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		fs.writeFileSync(path.join(foreignArtifactsDir, "foreign.txt"), "foreign artifact");
 		await deletion.sm.setSessionFile(sessionFile);
 		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
-		await expect(deletion.sm.dropSession(deletion.sessionFile)).rejects.toThrow("cleanup remains pending");
+		await deletion.sm.dropSession(deletion.sessionFile);
 		expect(fs.existsSync(deletion.artifactsDir)).toBe(false);
 		expect(fs.existsSync(deletion.cacheDir)).toBe(false);
-		expect(fs.existsSync(deletion.sessionFile)).toBe(true);
+		expect(fs.existsSync(deletion.sessionFile)).toBe(false);
 		expect(fs.existsSync(foreignSessionFile)).toBe(true);
 		expect(fs.existsSync(foreignArtifactsDir)).toBe(true);
 		expect(fs.existsSync(path.join(foreignArtifactsDir, "foreign.txt"))).toBe(true);

@@ -38,15 +38,14 @@ function result(value: unknown): {
 	};
 }
 
-function expectTranscriptCleanupPending(response: ReturnType<typeof result>, sessionId: string): void {
-	expect(response).toMatchObject({
-		ok: false,
-		error: {
-			code: "cleanup_pending",
-			message: expect.stringContaining("pending in transcript"),
-		},
-	});
-	expect(sessionId).toEqual(expect.any(String));
+async function expectRetainedAuthorityDeleteSucceeded(
+	response: ReturnType<typeof result>,
+	sessionId: string,
+	sessionPath: string,
+): Promise<void> {
+	expect(response).toMatchObject({ type: "broker_response", ok: true, result: { sessionId } });
+	await expect(fs.access(sessionPath)).rejects.toMatchObject({ code: "ENOENT" });
+	await expect(fs.access(sessionPath.slice(0, -6))).rejects.toMatchObject({ code: "ENOENT" });
 }
 
 async function mcpGlobal(
@@ -436,7 +435,7 @@ test("shared-agent distinct saved-source IDs remain isolated across inverted MCP
 				`delete-${suffix}-${sessionId}`,
 				life.environment,
 			);
-			expectTranscriptCleanupPending(deletion, sessionId);
+			await expectRetainedAuthorityDeleteSucceeded(deletion, sessionId, sessionPath);
 		}
 	};
 	await run("mcp", "daemon", "d1");
@@ -616,7 +615,7 @@ test("shared-agent equal saved IDs select one owner without cross-workspace effe
 			`delete-collision-${suffix}`,
 			life.environment,
 		);
-		expectTranscriptCleanupPending(deletion, A.source.id);
+		await expectRetainedAuthorityDeleteSucceeded(deletion, A.source.id, winner.source.path);
 		expect((await managedCandidatePaths(loser)).includes(loser.source.path)).toBe(true);
 	};
 	await run("mcp", "daemon", "d1");

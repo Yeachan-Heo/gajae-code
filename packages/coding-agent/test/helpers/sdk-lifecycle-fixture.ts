@@ -405,8 +405,9 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 				"delete-key",
 			);
 			expect(deleted).toMatchObject({
-				ok: false,
-				error: { code: "cleanup_pending", message: expect.stringContaining("pending in transcript") },
+				type: "broker_response",
+				ok: true,
+				result: { sessionId: forkId },
 			});
 			expect(
 				await fs.access(forkPath).then(
@@ -415,12 +416,22 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 				),
 			).toBe(false);
 			expect(
-				await global(
-					"session.delete",
-					{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
-					"delete-key",
+				await fs.access(forkPath.slice(0, -6)).then(
+					() => true,
+					() => false,
 				),
-			).toEqual(deleted);
+			).toBe(false);
+			const replayed = await global(
+				"session.delete",
+				{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
+				"delete-key",
+			);
+			expect(replayed).toMatchObject({ type: "broker_response", ok: true, result: { sessionId: forkId } });
+			const deletedFrameId = (deleted as { id?: unknown }).id;
+			const replayedFrameId = (replayed as { id?: unknown }).id;
+			expect(typeof deletedFrameId).toBe("string");
+			expect(typeof replayedFrameId).toBe("string");
+			expect(replayedFrameId).not.toBe(deletedFrameId);
 			expect(
 				await global(
 					"session.delete",
