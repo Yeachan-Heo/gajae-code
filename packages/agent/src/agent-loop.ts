@@ -644,14 +644,24 @@ function managedAssistantEventSnapshot(event: AssistantMessageEvent, message: As
 		return contentIndex as number;
 	};
 	if (type === "start") return { type, partial: message };
-	if (type === "text_start" || type === "thinking_start" || type === "toolcall_start")
+	if (
+		type === "text_start" ||
+		type === "thinking_start" ||
+		type === "reasoning_summary_start" ||
+		type === "toolcall_start"
+	)
 		return { type, contentIndex: indexed(), partial: message };
-	if (type === "text_delta" || type === "thinking_delta" || type === "toolcall_delta") {
+	if (
+		type === "text_delta" ||
+		type === "thinking_delta" ||
+		type === "reasoning_summary_delta" ||
+		type === "toolcall_delta"
+	) {
 		const delta = managedProperty(snapshot, "delta");
 		if (typeof delta !== "string") throw new ManagedAttemptSnapshotError();
 		return { type, contentIndex: indexed(), delta, partial: message };
 	}
-	if (type === "text_end" || type === "thinking_end") {
+	if (type === "text_end" || type === "thinking_end" || type === "reasoning_summary_end") {
 		const content = managedProperty(snapshot, "content");
 		if (typeof content !== "string") throw new ManagedAttemptSnapshotError();
 		return { type, contentIndex: indexed(), content, partial: message };
