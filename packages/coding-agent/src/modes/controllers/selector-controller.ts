@@ -1085,12 +1085,12 @@ export class SelectorController {
 
 	async #handleImageGenerationConfig(): Promise<void> {
 		const provider = await this.ctx.showHookInput(
-			"Image Generation provider (auto, openai, gemini, openrouter, antigravity, custom)",
+			"Image Generation provider (auto, openai, gemini, openrouter, antigravity, alibaba, custom)",
 			"auto",
 		);
 		if (provider === undefined) return;
 		const normalized = provider.trim().toLowerCase();
-		const validProviders = ["auto", "openai", "gemini", "openrouter", "antigravity", "custom"];
+		const validProviders = ["auto", "openai", "gemini", "openrouter", "antigravity", "alibaba", "custom"];
 		if (!validProviders.includes(normalized)) {
 			this.ctx.showStatus(`Invalid image provider: ${normalized}. Valid: ${validProviders.join(", ")}`);
 			return;
@@ -1122,7 +1122,14 @@ export class SelectorController {
 		if (scope === undefined) return;
 		const persistDefault = scope.trim().toLowerCase() === "default";
 
-		const imageProvider = normalized as "auto" | "openai" | "gemini" | "openrouter" | "antigravity" | "custom";
+		const imageProvider = normalized as
+			| "auto"
+			| "openai"
+			| "gemini"
+			| "openrouter"
+			| "antigravity"
+			| "alibaba"
+			| "custom";
 		setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
 		setConfiguredImageModel({
 			provider: imageProvider,
@@ -1621,6 +1628,7 @@ export class SelectorController {
 					imgProvider === "gemini" ||
 					imgProvider === "openrouter" ||
 					imgProvider === "antigravity" ||
+					imgProvider === "alibaba" ||
 					imgProvider === "custom"
 				) {
 					setPreferredImageProvider(imgProvider === "custom" ? "auto" : imgProvider);
