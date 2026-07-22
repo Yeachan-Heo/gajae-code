@@ -182,16 +182,17 @@ Run this phase only when the active deep-interview state or invocation indicates
    - Preferred: pass the spec markdown **inline** to the native deep-interview write command (`--write … --spec "<markdown>"`) — no scratch file is needed. The CLI is the only sanctioned writer for `.gjc/_session-{sessionid}/specs`.
    - Only if a spec is too large to pass inline, stage it with the `write` tool to a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree, then pass that path to `--spec`. The planning phase-boundary block tolerates these neutral temp writes; never stage interview artifacts inside the repo or under `.gjc/`, and do not improvise repo-relative scratch files.
 
-4. **Initialize through the typed native command**. First use the `summary` inspection result's `state_revision`; then submit only the bounded setup facts, never a workflow envelope or derived scoring values:
-
+4. **Initialize through a CLI-owned draft.** Create an `initialize-context` draft, edit only its bounded fields, check it, then consume it through the typed command. Never serialize a setup request, envelope, or derived values inline:
 ```sh
-gjc deep-interview initialize-context \
-  --session-id <id> --schema-version 1 --expected-revision <state_revision> \
-  --input-json '<SetupRequest: interview type, prompt-safe initial idea, threshold/source, language, bounded trace/context>' \
-  --json
+gjc deep-interview draft create --for initialize-context --session-id <id> --json
+# Capture draft_id and draft_revision from the response.
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /type --value greenfield --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /initial_idea --value "<prompt-safe idea>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /threshold_source --value "<source>" --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview initialize-context --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
-
-`SetupRequest` is schema-bound. The native runtime creates and stamps the complete state, including topology defaults, counters, receipt, and revision. Retain the returned revision for the next typed mutation.
+`draft create` records the state base revision; every edit returns the next `draft_revision`. The native runtime validates, consumes, stamps, and owns the complete state. Retain the returned state revision for inspection only; mutations consume their own checked draft.
 
 5. **Announce the interview** to the user:
 
@@ -238,20 +239,17 @@ Options should include contextually relevant choices such as **Looks right**, **
 
 The Round 0 `ask` call MUST include `deepInterview.round = 0`, `deepInterview.component = "review-topology"`, `deepInterview.dimension = "topology"`, `deepInterview.intent_contract.items` containing the exact displayed locked-intent items, and `deepInterview.intent_contract.confirmation_options` listing only the displayed affirmative labels that lock the proposal (normally **Looks right**). The runtime recorder canonicalizes and locks this contract only when the user selects one of those labels; correction, deferral, free-text, and clarification answers never lock the pre-question proposal. Do not manually copy raw free text into intent evidence, and do not continue if this required recorder write fails.
 
-3. **Lock topology through the typed command** after the answer. Inspect `summary` for the current revision, then submit only normalized component/deferral evidence:
-
+3. **Lock topology through a CLI-owned draft** after the answer. Create a `confirm-topology` draft, use append scaffolds for component entries, set scalar leaves, check it, then consume it:
 ```sh
-gjc deep-interview confirm-topology \
-  --session-id <id> --schema-version 1 --expected-revision <state_revision> \
-  --input-json '<TopologyRequest: confirmed components and user-confirmed deferrals>' \
-  --json
+gjc deep-interview draft create --for confirm-topology --session-id <id> --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op append --path /components --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /components/0/id --value <component_id> --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /components/0/name --value "<component name>" --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview confirm-topology --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
-
-In the same Round 0 answer, the runtime recorder persists `state.intent_contract` version 1 from `deepInterview.intent_contract.items`. It contains the four exact categories `artifact`, `surface`, `integration`, and `constraint`; every item has a unique category-prefixed ID (for example `surface:review`) and a bounded non-empty statement. The recorder canonically sorts items, persists the full SHA-256 manifest digest, and binds confirmation to a redacted answer-hash reference. The confirmation answer locks this manifest before Round 1; later prose, inferred implementation detail, raw answer content, or a regenerated digest cannot replace it.
-
-Before spec persistence, include every preserved locked ID literally in the final spec. Additions and clarifications need no extra question; the runtime derives and persists a `not_required` review when every locked ID remains. For any proposed missing locked ID, ask one intent-review question through `ask` and include `deepInterview.intent_review` with the proposed `observed_items`, every `supporting_substitution`, and the exact `approval_options` labels that count as approval. The runtime recorder writes `pending` when the user does not approve and writes `approved` only when an approval option is selected, binding the review to the recorder-generated answer hash without storing raw answer text. Approved reductions require every removed ID to map to an observed replacement ID. Spec persistence and handoff fail closed for missing, pending, malformed, stale, or unrecorded reduction review evidence. Intent review approves only that output reduction and never authorizes execution or ralplan handoff.
-
-The runtime validates pending/legacy state, preserves declared ordering, detects conflicting confirmations, derives component state, and returns the new revision. Do not replace `topology` through `gjc state write`.
+The recorder still persists `state.intent_contract` from the Round 0 `ask` answer. The runtime validates pending/legacy state, preserves declared ordering, detects conflicting confirmations, derives component state, and returns the new revision. Do not replace `topology` through `gjc state write`.
+It contains the four exact categories `artifact`, `surface`, `integration`, and `constraint`; every item has a unique category-prefixed ID (for example `surface:review`). The recorder canonically sorts items, persists the full SHA-256 manifest digest, and binds confirmation to a redacted answer-hash reference. Before spec persistence, include every preserved locked ID literally in the final spec. For a proposed missing locked ID, ask one intent-review question through `ask`; the runtime records `pending` unless the user selects an exact approval option, and spec persistence/handoff fail closed for missing, stale, or unrecorded reduction-review evidence. Intent review authorizes only that output reduction, never execution or handoff.
 
 4. **Legacy state migration:** When a resumed legacy interview lacks confirmed topology and no final `spec_path` exists, run Round 0 and use `confirm-topology` before the next ambiguity scoring pass. If a final spec already exists, do not rewrite history; note in any handoff that topology was not captured for that legacy interview.
 
@@ -317,7 +315,17 @@ Options should include contextually relevant choices plus free-text, translated/
 
 After applying `language.instruction` to the visible question, options, and generated rationale, apply the self-proofread once to new prose only (DIPP-5); preserve only the Round/Component/Targeting/Ambiguity line structure, fixed labels, numeric ambiguity value, component/target identifiers, and `deepInterview.*` metadata keys. Do not exempt generated natural-language rationale such as Why now.
 
-When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line. If the runtime did not record the answer shell, recover it only with `record-answer`: inspect `pending` or `round` to obtain the current revision and identity, then call `gjc deep-interview record-answer --session-id <id> --schema-version 1 --expected-revision <state_revision> --round <n> --question-id <id> --question-json '"<question>"' --answer-json '<AnswerRequest>' [--round-id <id>] [--component-id <id>] [--dimension <dimension>] --json`. Do not recreate transcript, rounds, or generic state JSON.
+When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line. Recorder-first remains mandatory. If the runtime did not record the answer shell, inspect `pending` or `round` to obtain its identity, then create a `record-answer` draft with that identity, edit scalar leaves, scaffold option arrays, and consume it:
+```sh
+gjc deep-interview draft create --for record-answer --session-id <id> --round <n> --question-id <id> [--round-id <id>] [--component-id <id>] [--dimension <dimension>] --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /question --value "<question>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op append --path /answer/selected_options --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /answer/selected_options/0 --value "<selected option>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /answer/custom_input --null --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview record-answer --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
+```
+Do not recreate transcript, rounds, or generic state JSON.
 
 If the `ask` tool returns `clarificationQuestion`, treat it as a non-answer about the displayed choices. Answer the clarification briefly from the current interview context, then call `ask` again with the exact original question, options, and `deepInterview.*` metadata. A clarification bypasses Step 2b′ auto-answer, Step 2b″ free-text refine, Step 2c ambiguity scoring, Step 2d apply-and-report, and Step 2e soft-limit checks; it must not be recorded as a round answer. This does not violate the one-question-per-round rule because the round remains unresolved until the user submits a real listed option or `Other` answer.
 
@@ -422,16 +430,16 @@ Respond as JSON. Include an additional "ontology" key containing the entities ar
 **Ontology input:** provide entities, relationships, and concise reasoning in `RoundResult`. The runtime determines first-round/no-entity handling, exact-name stability, deterministic renamed matching, counts, ratio, and snapshot persistence. Report the returned ontology result; do not send caller-computed counts, ratios, or snapshots.
 
 ### Step 2d: Apply Round Result and Report Progress
-
-After `ask` has recorded (or `record-answer` has recovered) the answer shell, inspect `pending` or `round` for its identity and current revision. Submit the bounded scorer evidence once:
-
+After `ask` has recorded (or `record-answer` has recovered) the answer shell, inspect `pending` or `round` for its identity. Create an `apply-round-result` draft, edit only bounded scorer evidence, check it, and consume it once:
 ```sh
-gjc deep-interview apply-round-result \
-  --session-id <id> --schema-version 1 --expected-revision <state_revision> \
-  --round <n> --question-id <id> --result-json '<RoundResult>' [--round-id <id>] --json
+gjc deep-interview draft create --for apply-round-result --session-id <id> --round-key <round_key> --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /global_scores/goal --value 0.8 --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op append --path /component_updates --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /component_updates/0/component_id --value <component_id> --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview apply-round-result --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
-
-`RoundResult` contains candidate scores, component updates, triggers, fact operations, ontology input, targeting, and bookkeeping only. The runtime performs one authoritative transaction, returns native-derived scoring and the new revision, and rejects stale, conflicting, malformed, or unrecoverable state. Never enrich a round through `gjc state write`.
+`RoundResult` remains candidate scores, component updates, triggers, fact operations, ontology input, targeting, and bookkeeping only. The runtime performs one authoritative transaction, returns native-derived scoring and the new revision, and rejects stale, conflicting, malformed, or unrecoverable state. Never enrich a round through `gjc state write`.
 
 After the typed transaction succeeds, consume `<native>.native_projection` as the version 1 native projection. Render only the paths listed below; do not report candidate values, inspect-state values, locally calculated values, names, weights, gaps, thresholds, ratios, causes, or milestone transitions that the projection does not expose.
 
@@ -706,7 +714,7 @@ Skipping any stage is possible but reduces quality assurance:
 - Use `read/search/find exploration or a bounded read-only planner/architect subagent` for brownfield codebase exploration (run BEFORE asking user about codebase)
 - Use opus model (temperature 0.1) for ambiguity scoring — consistency is critical
 - Round 0 topology confirmation happens before ambiguity scoring; Phase 2 scoring must honor locked topology and rotate targeting across active components when more than one is present
-- Normal interview persistence uses only typed `gjc deep-interview` commands: `initialize-context`, `confirm-topology`, `record-answer`, `apply-round-result`, `inspect`, and `sanity-check`. Submit bounded schema requests and returned revisions; do not construct a whole generic `gjc state write --input` envelope. Generic `gjc state` remains compatibility/recovery-only for the explicit clear and final handoff paths; never edit `.gjc/_session-{sessionid}/state` directly without force override.
+- Normal interview persistence uses CLI-owned drafts: `gjc deep-interview draft create|edit|show|check|rebase|discard`, followed by the matching typed command with `--draft-id --expected-draft-revision <latest_draft_revision> --json`. All public draft commands require `--json`; there is no public `draft consume` command. Use `--value`, `--null`, and append scaffolds for bounded payload fields; retain each returned `draft_revision`. `check` reports a stale state base but does not mutate; explicitly `rebase` only with the caller-observed `--to-state-revision` and then check again. Inline JSON request flags are compatibility-only. Never construct a full payload or generic `gjc state write --input` envelope. Generic `gjc state` remains compatibility/recovery-only for the explicit clear and final handoff paths; never edit `.gjc/_session-{sessionid}/state` directly without force override.
 - Use the GJC workflow CLI to save the final spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
 - Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
 - The lateral-review panel spawns read-only persona subagents (Task tool) in parallel with independent context; it is an assist layer, never an executor and never the completion authority
