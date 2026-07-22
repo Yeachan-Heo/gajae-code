@@ -41,10 +41,12 @@ const OPENAI_IMAGE_OUTPUT_FORMAT = "webp";
 const OPENAI_IMAGE_MIME_TYPE = "image/webp";
 
 const ANTIGRAVITY_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const ALIBABA_TOKEN_PLAN_HOST = "https://token-plan.ap-southeast-1.maas.aliyuncs.com";
+const ALIBABA_IMAGE_GENERATION_URL = `${ALIBABA_TOKEN_PLAN_HOST}/api/v1/services/aigc/multimodal-generation/generation`;
 const IMAGE_SYSTEM_INSTRUCTION =
 	"You are an AI image generator. Generate images based on user descriptions. Focus on creating high-quality, visually appealing images that match the user's request.";
 
-type ImageProvider = "antigravity" | "gemini" | "openai" | "openai-codex" | "openrouter";
+type ImageProvider = "alibaba" | "antigravity" | "gemini" | "openai" | "openai-codex" | "openrouter";
 interface ImageApiKey {
 	provider: ImageProvider;
 	apiKey: string;
@@ -294,6 +296,81 @@ interface AntigravityResponseChunk {
 		}>;
 		usageMetadata?: GeminiUsageMetadata;
 	};
+}
+
+interface AlibabaImageContentPart {
+	type?: string;
+	text?: string;
+	image?: string;
+}
+
+interface AlibabaImageResponse {
+	code?: string;
+	message?: string;
+	output?: {
+		choices?: Array<{ message?: { content?: AlibabaImageContentPart[] } }>;
+	};
+}
+
+/** Map the tool's image_size values onto wan2.7's 1K/2K size classes. */
+export function resolveAlibabaImageSize(imageSize: string | undefined): string | undefined {
+	switch (imageSize) {
+		case "1024x1024":
+			return "1K";
+		case "1536x1024":
+		case "1024x1536":
+			return "2K";
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Build the Bailian multimodal-generation request body for wan2.7 image
+ * generation/editing. Input images ride along as data URLs; generation-only
+ * calls send just the prompt text. The sync endpoint returns OSS URLs inline.
+ */
+export function buildAlibabaImageRequest(
+	model: string,
+	promptText: string,
+	inputImages: InlineImageData[],
+	imageSize: string | undefined,
+): {
+	model: string;
+	input: { messages: Array<{ role: "user"; content: Array<{ text: string } | { image: string }> }> };
+	parameters: { n: number; watermark: boolean; size?: string };
+} {
+	const content: Array<{ text: string } | { image: string }> = [];
+	for (const image of inputImages) {
+		content.push({ image: toDataUrl(image) });
+	}
+	content.push({ text: promptText });
+	const size = resolveAlibabaImageSize(imageSize);
+	return {
+		model,
+		input: { messages: [{ role: "user", content }] },
+		parameters: { n: 1, watermark: false, ...(size ? { size } : {}) },
+	};
+}
+
+/** Collect OSS image URLs and any text parts from a Bailian image response. */
+export function collectAlibabaImageResult(response: AlibabaImageResponse): {
+	imageUrls: string[];
+	responseText?: string;
+} {
+	const imageUrls: string[] = [];
+	const textParts: string[] = [];
+	for (const choice of response.output?.choices ?? []) {
+		for (const part of choice.message?.content ?? []) {
+			if (part.image) {
+				imageUrls.push(part.image);
+			} else if (part.text) {
+				textParts.push(part.text);
+			}
+		}
+	}
+	const responseText = textParts.join("\n").trim();
+	return { imageUrls, responseText: responseText.length > 0 ? responseText : undefined };
 }
 
 interface ImageGenToolDetails {
@@ -585,6 +662,7 @@ export function setPreferredImageProvider(provider: ImageProvider | "auto"): voi
 /** Provider → default image model mapping for auto-binding */
 export const IMAGE_PROVIDER_DEFAULTS: Record<string, string> = {
 	openai: "gpt-image-2",
+	alibaba: "wan2.7-image",
 	"openai-codex": "gpt-image-2",
 	antigravity: "gemini-3-pro-image",
 	gemini: "gemini-3-pro-image-preview",
@@ -704,6 +782,18 @@ async function findOpenAIHostedImageCredentials(
 	};
 }
 
+async function findAlibabaImageCredentials(
+	modelRegistry: ModelRegistry | undefined,
+	sessionId?: string,
+): Promise<ImageApiKey | null> {
+	const envKey = getEnvApiKey("alibaba-token-plan");
+	if (envKey) return { provider: "alibaba", apiKey: envKey };
+	if (!modelRegistry) return null;
+	const apiKey = await modelRegistry.getApiKeyForProvider("alibaba-token-plan", sessionId);
+	if (!isAuthenticated(apiKey)) return null;
+	return { provider: "alibaba", apiKey };
+}
+
 async function findImageApiKey(
 	modelRegistry?: ModelRegistry,
 	activeModel?: Model,
@@ -744,6 +834,9 @@ async function findImageApiKey(
 			const openRouterKey = getEnvApiKey("openrouter");
 			return openRouterKey ? { provider: "openrouter", apiKey: openRouterKey } : null;
 		}
+		if (config.provider === "alibaba") {
+			return await findAlibabaImageCredentials(modelRegistry, sessionId);
+		}
 	}
 
 	// If a specific provider is preferred (legacy path), try it first.
@@ -762,9 +855,11 @@ async function findImageApiKey(
 	} else if (preferredImageProvider === "openrouter") {
 		const openRouterKey = getEnvApiKey("openrouter");
 		return openRouterKey ? { provider: "openrouter", apiKey: openRouterKey } : null;
+	} else if (preferredImageProvider === "alibaba") {
+		return await findAlibabaImageCredentials(modelRegistry, sessionId);
 	}
 
-	// Auto-detect: GPT hosted image generation, then Antigravity, OpenRouter, Gemini.
+	// Auto-detect: GPT hosted image generation, then Antigravity, OpenRouter, Gemini, Alibaba.
 	const openAI = await findOpenAIHostedImageCredentials(modelRegistry, activeModel, sessionId);
 	if (openAI) return openAI;
 
@@ -781,6 +876,9 @@ async function findImageApiKey(
 
 	const googleKey = $env.GOOGLE_API_KEY;
 	if (googleKey) return { provider: "gemini", apiKey: googleKey };
+
+	const alibaba = await findAlibabaImageCredentials(modelRegistry, sessionId);
+	if (alibaba) return alibaba;
 
 	return null;
 }
@@ -1218,7 +1316,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			const apiKey = await findImageApiKey(ctx.modelRegistry, ctx.model, sessionId);
 			if (!apiKey) {
 				throw new Error(
-					"No image API credentials found. Use a GPT Responses/Codex model with OpenAI credentials, login with google-antigravity, or set OPENROUTER_API_KEY, GEMINI_API_KEY, or GOOGLE_API_KEY.",
+					"No image API credentials found. Use a GPT Responses/Codex model with OpenAI credentials, login with google-antigravity, or set OPENROUTER_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or ALIBABA_TOKEN_PLAN_API_KEY.",
 				);
 			}
 
@@ -1230,9 +1328,11 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 						? (apiKey.model?.id ?? resolveImageModel(provider, null))
 						: provider === "antigravity"
 							? resolveImageModel("antigravity", null)
-							: provider === "openrouter"
-								? resolveImageModel("openrouter", null)
-								: resolveImageModel("gemini", null);
+							: provider === "alibaba"
+								? resolveImageModel("alibaba", null)
+								: provider === "openrouter"
+									? resolveImageModel("openrouter", null)
+									: resolveImageModel("gemini", null);
 			const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 			const cwd = ctx.sessionManager.getCwd();
 
@@ -1442,6 +1542,78 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					details: {
 						provider,
 						model: resolvedModel,
+						imageCount: inlineImages.length,
+						imagePaths,
+						images: inlineImages,
+						responseText,
+					},
+				};
+			}
+
+			if (provider === "alibaba") {
+				const requestBody = buildAlibabaImageRequest(
+					model,
+					assemblePrompt(params),
+					resolvedImages,
+					params.image_size,
+				);
+
+				const response = await fetch(ALIBABA_IMAGE_GENERATION_URL, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${apiKey.apiKey}`,
+					},
+					body: JSON.stringify(requestBody),
+					signal: requestSignal,
+				});
+
+				const rawText = await response.text();
+				if (!response.ok) {
+					let message = rawText;
+					try {
+						const parsed = JSON.parse(rawText) as { message?: string; error?: { message?: string } };
+						message = parsed.error?.message ?? parsed.message ?? message;
+					} catch {
+						// Keep raw text.
+					}
+					throw new Error(`Alibaba image request failed (${response.status}): ${message}`);
+				}
+
+				const data = JSON.parse(rawText) as AlibabaImageResponse;
+				if (data.code) {
+					throw new Error(`Alibaba image request failed: ${data.code}: ${data.message ?? ""}`.trim());
+				}
+
+				const { imageUrls, responseText } = collectAlibabaImageResult(data);
+				// Result URLs are short-lived OSS-signed URLs (24h); download immediately.
+				const inlineImages: InlineImageData[] = [];
+				for (const imageUrl of imageUrls) {
+					inlineImages.push(await loadImageFromUrl(imageUrl, requestSignal));
+				}
+
+				if (inlineImages.length === 0) {
+					const messageText = responseText ? `\n\n${responseText}` : "";
+					return {
+						content: [{ type: "text", text: `No image data returned.${messageText}` }],
+						details: {
+							provider,
+							model,
+							imageCount: 0,
+							imagePaths: [],
+							images: [],
+							responseText,
+						},
+					};
+				}
+
+				const imagePaths = await saveImagesToTemp(inlineImages);
+
+				return {
+					content: [{ type: "text", text: buildResponseSummary(provider, model, imagePaths, responseText) }],
+					details: {
+						provider,
+						model,
 						imageCount: inlineImages.length,
 						imagePaths,
 						images: inlineImages,
