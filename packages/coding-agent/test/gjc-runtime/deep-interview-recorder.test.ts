@@ -18,6 +18,8 @@ import {
 	readDeepInterviewStateCompact,
 	validateDeepInterviewScoredTransition,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import { runDeepInterviewRepairCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-repair";
+import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 
 const TEST_SESSION_ID = "test-session";
@@ -28,6 +30,26 @@ async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-deep-interview-recorder-"));
 	tempRoots.push(dir);
 	return dir;
+}
+async function seedRecorderState(cwd: string): Promise<void> {
+	const result = await runNativeDeepInterviewCommand(["--json", "seed recorder state"], cwd);
+	expect(result.status).toBe(0);
+	const initialized = await runDeepInterviewRepairCommand(
+		[
+			"initialize-context",
+			"--session-id",
+			TEST_SESSION_ID,
+			"--schema-version",
+			"1",
+			"--expected-revision",
+			"0",
+			"--input-json",
+			'{"type":"greenfield","threshold":0.05}',
+			"--json",
+		],
+		cwd,
+	);
+	expect(initialized.status).toBe(0);
 }
 
 beforeAll(() => {
@@ -163,7 +185,7 @@ describe("deep-interview recorder: transition validator", () => {
 			...shell({ round: 2, questionId: "q2" }),
 			lifecycle: "scored",
 			scores: { goal: 0.3 },
-			ambiguity: 0.62,
+			ambiguity: 0.7,
 			triggers: [trigger()],
 		};
 		expect(validateDeepInterviewScoredTransition(prior, next).ok).toBe(true);
@@ -174,7 +196,7 @@ describe("deep-interview recorder: transition validator", () => {
 			...shell({ round: 2, questionId: "q2" }),
 			lifecycle: "scored",
 			scores: { goal: 0.8 },
-			ambiguity: 0.62,
+			ambiguity: 0.7,
 			triggers: [trigger()],
 		};
 		const result = validateDeepInterviewScoredTransition(prior, next);
@@ -233,10 +255,6 @@ describe("deep-interview recorder: contradiction fixture (round N vs N-2)", () =
 			triggers: [
 				trigger({
 					contradictedFactId: "f1",
-					priorDimensionScore: 0.8,
-					newDimensionScore: 0.4,
-					priorAmbiguity: 0.3,
-					newAmbiguity: 0.55,
 					evidence: "Round 3 says the core entity is Project, contradicting f1",
 				}),
 			],
@@ -283,6 +301,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("persists exactly one durable record per key and no-ops identical replay", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		const input = {
 			round: 1,
 			questionId: "q1",
@@ -325,6 +344,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("locks a canonical Round-0 contract to the recorder answer hash without retaining raw custom input", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		const intentContract = {
 			items: [
 				{ id: "surface:review", category: "surface" as const, statement: "Provide a reviewer surface" },
@@ -391,6 +411,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("does not lock a rejected Round-0 proposal before corrected confirmation", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		const base = {
 			round: 0,
 			questionId: "intent-confirmation",
@@ -438,6 +459,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("records approved reductions from answer labels with redacted evidence", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -500,6 +522,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("enriches the same record to scored without appending a second", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -516,7 +539,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.5 },
+				scores: { goal: 0.5, constraints: 0.5, criteria: 0.5 },
 				ambiguity: 0.5,
 			},
 			{ sessionId: TEST_SESSION_ID },
@@ -530,6 +553,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("accepts a 100,000-code-point emoji scoring payload and rejects 100,001 without mutation", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -540,9 +564,9 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			const input = {
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.5 },
+				scores: { goal: 0.5, constraints: 0.5, criteria: 0.5 },
 				ambiguity: 0.5,
-				triggers: [trigger({ name: "" })],
+				triggers: [trigger({ name: "", status: "unresolved", rationale: "payload boundary fixture" })],
 			};
 			input.triggers[0]!.name = "😀".repeat(length - [...JSON.stringify(input)].length);
 			expect([...JSON.stringify(input)]).toHaveLength(length);
@@ -561,6 +585,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("refuses to persist an invalid scored transition and does not falsely converge", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		// Round 1 establishes a clear baseline (goal 0.5, ambiguity 0.5).
 		await appendOrMergeDeepInterviewRound(
 			cwd,
@@ -579,7 +604,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.5 },
+				scores: { goal: 0.5, constraints: 0.5, criteria: 0.5 },
 				ambiguity: 0.5,
 			},
 			{ sessionId: TEST_SESSION_ID },
@@ -598,17 +623,22 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{ sessionId: TEST_SESSION_ID },
 		);
 		await expect(
-			enrichDeepInterviewRoundScoring(cwd, statePath, {
-				round: 2,
-				questionId: "q2",
-				scores: { goal: 0.8 },
-				ambiguity: 0.4,
-				triggers: [trigger()],
-			}),
-		).rejects.toThrow(/invalid and was refused/);
+			enrichDeepInterviewRoundScoring(
+				cwd,
+				statePath,
+				{
+					round: 2,
+					questionId: "q2",
+					scores: { goal: 0.8, constraints: 0.8, criteria: 0.8 },
+					ambiguity: 0.4,
+					triggers: [trigger()],
+				},
+				{ sessionId: TEST_SESSION_ID },
+			),
+		).rejects.toThrow("DI_STATE_SCHEMA_INVALID");
 
 		// Durable state is untouched: round 2 stays an unscored shell and the latest
-		// persisted ambiguity is the prior round's, not the refused 0.4.
+		// persisted ambiguity is the prior round's, not the refused native value.
 		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
 		expect(persisted.state.rounds).toHaveLength(2);
 		const round2 = persisted.state.rounds.find((r: DeepInterviewRoundRecord) => r.round === 2);
@@ -619,6 +649,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 	it("persists a valid scored transition that lowers the dimension and raises ambiguity", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -636,7 +667,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.5 },
+				scores: { goal: 0.5, constraints: 0.5, criteria: 0.5 },
 				ambiguity: 0.5,
 			},
 			{ sessionId: TEST_SESSION_ID },
@@ -658,7 +689,7 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 			{
 				round: 2,
 				questionId: "q2",
-				scores: { goal: 0.3 },
+				scores: { goal: 0.3, constraints: 0.3, criteria: 0.3 },
 				ambiguity: 0.62,
 				triggers: [trigger()],
 			},
@@ -667,7 +698,8 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		const persisted = JSON.parse(await fs.readFile(statePath, "utf-8"));
 		const round2 = persisted.state.rounds.find((r: DeepInterviewRoundRecord) => r.round === 2);
 		expect(round2.lifecycle).toBe("scored");
-		expect(persisted.state.current_ambiguity).toBe(0.62);
+		expect(persisted.state.current_ambiguity).toBe(0.7);
+		expect(round2.reported_ambiguity).toBe(0.7);
 	});
 
 	it("reads a compact slice and migrates legacy on-disk state safely", async () => {
