@@ -15302,6 +15302,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		});
 		const internals = daemon as unknown as {
 			flushPool(): Promise<void>;
+			readonly pendingThreadedFrames: ReadonlyMap<string, unknown>;
 		};
 		expect(
 			bot.calls.some(call => call.method === "sendMessage" && call.body.text === "drains after eager create"),
