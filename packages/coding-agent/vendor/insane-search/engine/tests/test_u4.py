@@ -56,17 +56,20 @@ def t_inject_cookies_then_present():
 def t_parse_envelope_json():
     env = '{"html":"<h1>hi</h1>","finalUrl":"https://x/p","status":200,' \
           '"cookies":[{"name":"a","value":"b"}],"userAgent":"UA"}'
-    html, final, status, cookies, ua, automation = _parse_envelope(env, "https://x/q")
+    html, final, status, cookies, ua, automation, inner_text = _parse_envelope(env, "https://x/q")
     assert html == "<h1>hi</h1>" and final == "https://x/p" and status == 200
     assert cookies and cookies[0]["name"] == "a" and ua == "UA"
-    print("  ✓ envelope JSON parsed")
+    assert inner_text == "", f"innerText should default to '' (got {inner_text!r})"
+    print("  ✓ envelope JSON parsed (innerText backward-compat default '')")
 
 
 def t_parse_envelope_raw_html_fallback():
-    html, final, status, cookies, ua, automation = _parse_envelope("<html>raw</html>", "https://x/q")
+    html, final, status, cookies, ua, automation, inner_text = _parse_envelope(
+        "<html>raw</html>", "https://x/q")
     assert html == "<html>raw</html>" and final == "https://x/q" and status == 200
     assert cookies == [] and ua is None
-    print("  ✓ raw-HTML fallback (non-JSON stdout)")
+    assert inner_text == ""
+    print("  ✓ raw-HTML fallback (non-JSON stdout, innerText default '')")
 
 
 def t_warmup_once_guard_online():

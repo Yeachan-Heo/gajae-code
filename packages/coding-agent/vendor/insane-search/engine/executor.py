@@ -202,9 +202,10 @@ def run_playwright_fallback(
         att.verdict = Verdict.UNKNOWN.value
         return att, ""
 
-    # stdout is a JSON envelope {html, finalUrl, status, cookies, userAgent}.
-    # Fall back to treating raw stdout as HTML for forward/backward compat.
-    html, final_url, status, cookies, user_agent, automation = _parse_envelope(stdout, url)
+    # stdout is a JSON envelope {html, finalUrl, status, cookies, userAgent,
+    # innerText}. Fall back to treating raw stdout as HTML for forward/backward
+    # compat (older templates that did not emit a JSON envelope).
+    html, final_url, status, cookies, user_agent, automation, inner_text = _parse_envelope(stdout, url)
 
     resp = _FakeResp(html, status=status, final_url=final_url)
     vr = validate(resp, success_selectors=success_selectors)
@@ -220,12 +221,22 @@ def run_playwright_fallback(
     if vr.verdict in (Verdict.STRONG_OK, Verdict.WEAK_OK) and cookies:
         _bridge_cookies_to_pool(url, cookies, user_agent)
 
+    # Stash the rendered innerText for the render-merge step: many SPAs expose
+    # visible text only via innerText; the rescue gate in fetch_chain compares
+    # it against the body's visible text and keeps the longer one.
+    if inner_text:
+        try:
+            att._inner_text = inner_text
+        except Exception:
+            pass
+
     return att, html
 
 
 def _parse_envelope(stdout: str, url: str):
-    """Return (html, final_url, status, cookies, user_agent) from a JSON
-    envelope, or treat stdout as raw HTML if it isn't JSON."""
+    """Return (html, final_url, status, cookies, user_agent, automation,
+    inner_text) from a JSON envelope, or treat stdout as raw HTML if it isn't
+    JSON. inner_text is "" for envelopes emitted by older templates."""
     import json
     s = stdout.lstrip()
     if s[:1] == "{":
@@ -237,10 +248,11 @@ def _parse_envelope(stdout: str, url: str):
             cookies = env.get("cookies") or []
             user_agent = env.get("userAgent") or None
             automation = env.get("automation") or None
-            return html, final_url, status, cookies, user_agent, automation
+            inner_text = env.get("innerText") or ""
+            return html, final_url, status, cookies, user_agent, automation, inner_text
         except Exception:
             pass
-    return stdout, url, 200, [], None, None
+    return stdout, url, 200, [], None, None, ""
 
 
 def _bridge_cookies_to_pool(url: str, cookies: list, user_agent: Optional[str]) -> None:

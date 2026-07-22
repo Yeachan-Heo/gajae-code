@@ -17,9 +17,19 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import urlsplit
+
+
+# Transient statuses worth an in-place retry on the SAME identity — rotating
+# to a different TLS family does not help rate-limit / gateway recovery, but
+# the same warm session a moment later often succeeds.
+_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+_RETRY_BASE_DELAY = 1.5       # seconds; backoff = base * (factor ** attempt)
+_RETRY_FACTOR = 2.0
+_RETRY_SLEEP_CAP = 10.0       # ceiling on TOTAL retry sleep per request
 
 
 def _host_of(url: str) -> str:
@@ -116,11 +126,18 @@ class SessionPool:
     def request(self, url: str, *, impersonate: str, referer: str = "",
                 timeout: int = 25, extra_headers: Optional[dict] = None,
                 allow_private: Optional[bool] = None,
-                max_redirects: Optional[int] = None) -> tuple[Any, Optional[str]]:
+                max_redirects: Optional[int] = None,
+                max_retries: int = 0) -> tuple[Any, Optional[str]]:
         """GET via the pooled session (cookie + connection reuse), with an SSRF
         guard: the initial URL and EVERY redirect hop are validated against the
         private/loopback/link-local/metadata block-list before being fetched.
-        Falls back to a one-shot get if no session could be created."""
+        Falls back to a one-shot get if no session could be created.
+
+        ``max_retries`` > 0 retries transient statuses (429/502/503/504) on the
+        SAME identity with exponential backoff before the caller sees the
+        response. A numeric ``Retry-After`` header overrides the backoff delay;
+        total retry sleep is capped (see ``_retry_transient``). Default 0 —
+        callers opt in per request so a failing grid never multiplies sleeps."""
         from . import safety
         if allow_private is None:
             allow_private = safety.allow_private_default()
@@ -150,24 +167,34 @@ class SessionPool:
             def _do_get(u):
                 return cffi_requests.get(u, impersonate=impersonate, headers=headers,
                                          timeout=timeout, allow_redirects=False)
-            return self._fetch_following(_do_get, url, allow_private, max_redirects, None)
+            return self._fetch_following(_do_get, url, allow_private, max_redirects, None,
+                                         max_retries=max_retries)
 
         if ent.injected_ua:
             headers.setdefault("User-Agent", ent.injected_ua)
         def _do_get(u):
             return ent.session.get(u, headers=headers, timeout=timeout, allow_redirects=False)
-        return self._fetch_following(_do_get, url, allow_private, max_redirects, ent)
+        return self._fetch_following(_do_get, url, allow_private, max_redirects, ent,
+                                     max_retries=max_retries)
 
     @staticmethod
     def _fetch_following(do_get, url: str, allow_private: bool, max_redirects: int,
-                         ent) -> tuple[Any, Optional[str]]:
+                         ent, *, max_retries: int = 0) -> tuple[Any, Optional[str]]:
         """Manually follow redirects so each hop is SSRF-validated (curl_cffi's
-        own allow_redirects=True would skip the per-hop check)."""
+        own allow_redirects=True would skip the per-hop check).
+
+        Only the FIRST attempt on the original URL gets the transient-status
+        retry loop; redirect hops are distinct URLs and are not retried."""
         from . import safety
         cur = url
+        first = True
         for _ in range(max_redirects + 1):
             try:
-                resp = do_get(cur)
+                if first and max_retries > 0:
+                    resp = _retry_transient(do_get, cur, max_retries)
+                else:
+                    resp = do_get(cur)
+                first = False
             except Exception as e:
                 return None, f"{type(e).__name__}:{str(e)[:200]}"
             if ent is not None:
@@ -209,3 +236,52 @@ POOL = SessionPool()
 
 def pool_enabled() -> bool:
     return os.environ.get("INSANE_NO_SESSION_POOL", "") not in ("1", "true", "yes")
+
+
+def _retry_after_seconds(resp) -> Optional[float]:
+    """Numeric Retry-After header value, or None (absent / HTTP-date form)."""
+    headers = getattr(resp, "headers", None) or {}
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except ValueError:
+        return None
+
+
+def _retry_transient(do_get, url: str, max_attempts: int,
+                     retry_statuses: frozenset = _RETRY_STATUSES,
+                     base: float = _RETRY_BASE_DELAY,
+                     factor: float = _RETRY_FACTOR,
+                     sleep_cap: float = _RETRY_SLEEP_CAP) -> Any:
+    """Call ``do_get(url)`` up to ``max_attempts + 1`` times. On a transient
+    status (429/502/503/504) sleep, then retry the SAME identity — the warm
+    session and cookies are exactly what a rate-limiter wants to see again.
+
+    A numeric ``Retry-After`` header overrides the exponential backoff for
+    that attempt. Total sleep across all retries is capped at ``sleep_cap``
+    seconds so a huge or hostile Retry-After cannot stall the caller. Returns
+    the last response; the caller classifies the verdict."""
+    resp = do_get(url)
+    slept = 0.0
+    for attempt in range(max_attempts):
+        if resp is None:
+            break
+        status = getattr(resp, "status_code", 0) or 0
+        if status not in retry_statuses:
+            break
+        if slept >= sleep_cap:
+            break
+        delay = base * (factor ** attempt)
+        ra = _retry_after_seconds(resp)
+        if ra is not None:
+            delay = ra
+        delay = min(delay, sleep_cap - slept)
+        time.sleep(delay)
+        slept += delay
+        resp = do_get(url)
+    return resp

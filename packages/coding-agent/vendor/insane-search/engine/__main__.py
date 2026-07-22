@@ -37,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Per-attempt timeout seconds (default 25).")
     p.add_argument("--max-attempts", type=int, default=None,
                    help="TOTAL curl-attempt budget. Default: None = exhaustive (honours R6).")
+    p.add_argument("--no-retry", action="store_true",
+                   help="Disable transient-status (429/502/503/504) probe retry.")
+    p.add_argument("--no-extract", action="store_true",
+                   help="Disable content-rescue extraction (PDF/JSON-LD/render-merge); "
+                        "always return the raw response text.")
     p.add_argument("--no-playwright", action="store_true",
                    help="Skip Playwright fallback (curl-only).")
     p.add_argument("--no-phase0", action="store_true",
@@ -61,6 +66,8 @@ def main(argv: list[str] | None = None) -> int:
             max_attempts=args.max_attempts,
             enable_playwright=not args.no_playwright,
             enable_phase0=not args.no_phase0,
+            enable_extraction=not args.no_extract,
+            enable_retry=not args.no_retry,
         )
     except Exception as e:
         print(f"engine fatal: {type(e).__name__}: {e}", file=sys.stderr)
