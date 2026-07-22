@@ -150,6 +150,8 @@ When the SDK starts its default internal broker or session host from the publish
 
 This boundary prevents a child from newly loading caller-cwd or user-global Bun preload/dotenv policy. It cannot determine how a value already present in the parent environment was originally loaded, so ordinary provider/GJC environment values remain inherited. Default internal children, including compiled self-spawns, remove inherited `BUN_OPTIONS` so parent eval/test/inspect/debug/runtime options cannot be replayed into a detached child. Compiled binaries otherwise retain their existing self-spawn command contract, corroborated by a dedicated embedded marker and exact anchored Bun virtual-filesystem identity. The explicit `GJC_SDK_SESSION_COMMAND` session-host override remains a trusted legacy operator boundary and is not parsed as a shell-safe general command API. There is no broker-command override.
 
+Detached brokers remove only parent session/owner and live tmux socket markers (`GJC_COORDINATOR_SESSION_*`, `GJC_TMUX_OWNER_*`, `GJC_MANAGED_OWNER_*`, `GJC_TMUX_ACTIVE_SESSION`, `GJC_TMUX_LAUNCHED`, `TMUX`, and `TMUX_PANE`). Global GJC tmux configuration such as `GJC_TMUX_COMMAND` and `GJC_TMUX_PROFILE` is retained.
+
 Broker and per-session discovery tokens remain in their authoritative private discovery files because clients need them. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
 
 ## Protocol
