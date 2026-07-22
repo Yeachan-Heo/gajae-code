@@ -3006,6 +3006,55 @@ describe("AskTool deep-interview recorder persistence", () => {
 			).success,
 		).toBe(false);
 	});
+	it("narrows provider-facing deep-interview metadata to the persisted workflow stage", () => {
+		const contractQuestion = {
+			questions: [
+				{
+					id: "topology",
+					question: "Confirm?",
+					options: [{ label: "Confirm" }],
+					deepInterview: {
+						round: 0,
+						component: "review-topology",
+						dimension: "topology",
+						ambiguity: 1,
+						intent_contract: {
+							items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+							confirmation_options: ["Confirm"],
+						},
+					},
+				},
+			],
+		};
+		const reviewQuestion = {
+			questions: [
+				{
+					id: "review",
+					question: "Approve?",
+					options: [{ label: "Approve" }],
+					deepInterview: {
+						round: 1,
+						component: "locked-intent",
+						dimension: "constraints",
+						ambiguity: 0.2,
+						intent_review: {
+							observed_items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+							supporting_substitutions: [],
+							approval_options: ["Approve"],
+						},
+					},
+				},
+			],
+		};
+
+		const topologyTool = new AskTool(createSession({ getDeepInterviewAskStage: () => "topology" }));
+		expect(topologyTool.parameters.safeParse(contractQuestion).success).toBe(true);
+		expect(topologyTool.parameters.safeParse(reviewQuestion).success).toBe(false);
+
+		const postTopologyTool = new AskTool(createSession({ getDeepInterviewAskStage: () => "post-topology" }));
+		expect(postTopologyTool.parameters.safeParse(contractQuestion).success).toBe(false);
+		expect(postTopologyTool.parameters.safeParse(reviewQuestion).success).toBe(true);
+	});
 });
 
 describe("AskTool Round-0 intent recovery", () => {

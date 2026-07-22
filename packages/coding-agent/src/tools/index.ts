@@ -234,6 +234,8 @@ export interface ToolSession {
 	 *  its terminal-phase chain guard. Returns the raw phase string or undefined
 	 *  when no active skill (or accessor) is available. */
 	getActiveSkillPhase?: () => string | undefined;
+	/** Restrict provider-facing deep-interview ask metadata to the active workflow stage. */
+	getDeepInterviewAskStage?: () => "topology" | "post-topology" | undefined;
 	/** Pre-loaded prompt templates */
 	promptTemplates?: PromptTemplate[];
 	/** Whether LSP integrations are enabled */

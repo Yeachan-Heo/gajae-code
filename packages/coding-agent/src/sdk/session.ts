@@ -1523,6 +1523,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
 			getActiveSkillState: () => session?.getActiveSkillState(),
 			getActiveSkillPhase: () => session?.getActiveSkillPhase(),
+			getDeepInterviewAskStage: () => session?.getDeepInterviewAskStage(),
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			get model() {
 				return agent?.state.model ?? model;

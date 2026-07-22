@@ -2488,6 +2488,25 @@ export class AgentSession {
 			return undefined;
 		}
 	}
+	/** Provider-facing ask metadata must expose only the active deep-interview phase. */
+	getDeepInterviewAskStage(): "topology" | "post-topology" | undefined {
+		const active = this.#activeSkillState;
+		if (active?.skill !== "deep-interview") return undefined;
+		const sessionId = active.sessionId ?? this.sessionManager.getSessionId();
+		try {
+			assertNonEmptyGjcSessionId(sessionId, "AgentSession.getDeepInterviewAskStage");
+			const stateDir = sessionStateDir(this.sessionManager.getCwd(), sessionId);
+			const filePath = path.join(
+				stateDir,
+				path.basename(sessionModeStatePath(this.sessionManager.getCwd(), sessionId, active.skill)),
+			);
+			const raw = fs.readFileSync(filePath, "utf-8");
+			const parsed = JSON.parse(raw) as { state?: { intent_contract?: unknown } };
+			return parsed.state?.intent_contract === undefined ? "topology" : "post-topology";
+		} catch {
+			return "topology";
+		}
+	}
 
 	/** Peek the in-flight directive's invocation handler for use by the resolve tool. */
 	peekQueueInvoker(): ((input: unknown) => Promise<unknown> | unknown) | undefined {
