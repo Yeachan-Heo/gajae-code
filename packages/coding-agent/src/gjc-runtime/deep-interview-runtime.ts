@@ -7,11 +7,14 @@ import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import {
+	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentReview,
 	type DeepInterviewIntentCategory,
 	type DeepInterviewIntentItem,
 	type DeepInterviewIntentManifest,
 	type DeepInterviewIntentReview,
+	MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
+	MAX_INITIAL_CONTEXT_LENGTH,
 	normalizeDeepInterviewEnvelope,
 	reviewDeepInterviewIntent,
 } from "./deep-interview-state";
@@ -559,6 +562,7 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 		ideaParts.push(arg);
 	}
 	const idea = ideaParts.join(" ").trim();
+	assertDeepInterviewInputWithinLimit(idea, MAX_INITIAL_CONTEXT_LENGTH, "initial_idea");
 	const effectiveResolution: DeepInterviewResolution = resolution ?? "standard";
 	const trace = hasFlag(args, "--trace") && idea ? await buildDeepInterviewTraceSummary(cwd, idea) : undefined;
 	return {
@@ -632,6 +636,11 @@ export async function persistDeepInterviewSpec(
 	cwd: string,
 	resolved: ResolvedDeepInterviewSpecWriteArgs,
 ): Promise<PersistedDeepInterviewSpec> {
+	assertDeepInterviewInputWithinLimit(
+		resolved.spec,
+		MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
+		"structured deep-interview response",
+	);
 	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt" && !resolved.force) {
@@ -731,6 +740,7 @@ export async function persistDeepInterviewSpec(
 
 async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepInterviewArgs): Promise<string> {
 	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
+	assertDeepInterviewInputWithinLimit(resolved.idea, MAX_INITIAL_CONTEXT_LENGTH, "initial_idea");
 	const now = new Date().toISOString();
 	const payload: Record<string, unknown> = {
 		active: true,

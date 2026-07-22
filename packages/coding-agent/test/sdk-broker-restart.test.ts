@@ -14,6 +14,36 @@ describe("SDK broker restart", () => {
 		expect(second.token).not.toBe(first.token);
 		await b.stop();
 	});
+	it("reclaims repeated identical stale locks into distinct tombstones", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-restart-repeat-"));
+		const lock = path.join(dir, "sdk", "broker.lock");
+		const owner = JSON.stringify({ version: 1, ownerId: "stale-owner", pid: 999_999_999, acquiredAt: 0 });
+		await fs.mkdir(lock, { recursive: true });
+		await fs.writeFile(path.join(lock, "owner.json"), owner);
+
+		const first = new Broker({ agentDir: dir });
+		try {
+			await first.start();
+		} finally {
+			await first.stop();
+		}
+
+		await fs.mkdir(lock, { recursive: true });
+		await fs.writeFile(path.join(lock, "owner.json"), owner);
+		const second = new Broker({ agentDir: dir });
+		try {
+			const discovery = await second.start();
+			expect(discovery.ownerId).toBeDefined();
+			expect(second.ownsDiscovery).toBe(true);
+			const tombstones = (await fs.readdir(path.dirname(lock))).filter(name =>
+				name.startsWith(".broker.lock.stale-"),
+			);
+			expect(tombstones).toHaveLength(2);
+			expect(new Set(tombstones).size).toBe(2);
+		} finally {
+			await second.stop();
+		}
+	});
 
 	it("allows one owner during simultaneous primary lock takeover", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-restart-race-"));

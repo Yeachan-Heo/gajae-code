@@ -16,6 +16,8 @@ export function compileSecretRegex(pattern: string, flags?: string): RegExp {
 		const combined = new Set([...resolvedFlags, ...literalMatch[2]]);
 		resolvedFlags = [...combined].join("");
 	}
+	if (resolvedFlags.includes("y"))
+		throw new SyntaxError('The sticky "y" flag is incompatible with globally scanned secret regexes');
 
 	return new RegExp(resolvedPattern, enforceGlobalFlag(resolvedFlags));
 }

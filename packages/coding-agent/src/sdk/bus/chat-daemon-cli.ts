@@ -26,11 +26,13 @@ export interface ChatDaemonRuntimeHandle {
 export interface RunChatDaemonInternalDeps {
 	processPid?: number;
 	pidAlive?: (pid: number) => boolean;
+	pidIncarnation?: (pid: number) => string | undefined;
 	createRuntime?: (input: {
 		kind: ChatDaemonKind;
 		agentDir: string;
 		config: ChatDaemonConfig;
 	}) => Promise<ChatDaemonRuntimeHandle> | ChatDaemonRuntimeHandle;
+	renewHeartbeat?: (input: Parameters<typeof renewChatDaemonHeartbeat>[0]) => Promise<boolean>;
 	setInterval?: typeof setInterval;
 	clearInterval?: typeof clearInterval;
 }
@@ -65,8 +67,10 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 				idleTimeoutMs: 60_000,
 				rich: { enabled: true },
 				richDraft: { enabled: false },
+				toolActivity: { enabled: true },
 				topics: { nameTemplate: undefined },
 				btw: { enabled: true },
+				streaming: { enabled: true },
 			})
 		) {
 			throw new Error("Discord notifications are enabled but configuration is incomplete");
@@ -98,8 +102,10 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 			idleTimeoutMs: 60_000,
 			rich: { enabled: true },
 			richDraft: { enabled: false },
+			toolActivity: { enabled: true },
 			topics: { nameTemplate: undefined },
 			btw: { enabled: true },
+			streaming: { enabled: true },
 		})
 	) {
 		throw new Error("Slack notifications are enabled but configuration is incomplete");
@@ -160,10 +166,19 @@ export async function runChatDaemonInternal(
 	if (!ownerId) throw new Error("missing --owner-id");
 	const pid = ownerPid(ownerId);
 	if (pid !== undefined && !(deps.pidAlive ?? defaultPidAlive)(pid)) return;
+	const daemonPid = deps.processPid ?? process.pid;
 	const config = await loadConfig(agentDir, kind);
 	if (!config) return;
 	if (
-		!(await acquireChatDaemonOwnership({ agentDir, kind, ownerId, pid: deps.processPid, identity: config.identity }))
+		!(await acquireChatDaemonOwnership({
+			agentDir,
+			kind,
+			ownerId,
+			pid: daemonPid,
+			identity: config.identity,
+			pidAlive: deps.pidAlive,
+			pidIncarnation: deps.pidIncarnation,
+		}))
 	)
 		return;
 
@@ -171,30 +186,60 @@ export async function runChatDaemonInternal(
 	let runtime: ChatDaemonRuntimeHandle | undefined;
 	let interval: ReturnType<typeof setInterval> | undefined;
 	let stopping = false;
+	let terminalError: unknown;
+	let runtimeStop: Promise<void> | undefined;
+	const stopRuntime = (): Promise<void> => {
+		runtimeStop ??= runtime?.stop() ?? Promise.resolve();
+		return runtimeStop;
+	};
 	const stop = (): void => {
 		stopping = true;
+		void stopRuntime().catch(error => {
+			terminalError ??= error;
+		});
 	};
 	try {
 		incarnation = (await readChatDaemonState(agentDir, kind))?.incarnation;
 		if (!incarnation) throw new Error("chat daemon ownership state is missing an incarnation");
 		runtime = await (deps.createRuntime?.({ kind, agentDir, config }) ?? defaultRuntime({ kind, agentDir, config }));
-		const renewHeartbeat = async (): Promise<void> => {
-			await renewChatDaemonHeartbeat({
+		const activeRuntime = runtime;
+		const renewHeartbeat = async (): Promise<boolean> =>
+			await (deps.renewHeartbeat ?? renewChatDaemonHeartbeat)({
 				agentDir,
 				kind,
 				ownerId,
-				pid: deps.processPid,
+				pid: daemonPid,
 				incarnation,
-				transportHealthy: runtime?.transportHealthy?.() ?? true,
+				transportHealthy: activeRuntime.transportHealthy?.() ?? true,
+				pidAlive: deps.pidAlive,
+				pidIncarnation: deps.pidIncarnation,
 			});
+		const terminateForLostOwnership = async (): Promise<void> => {
+			stopping = true;
+			await stopRuntime();
 		};
 		process.once("SIGTERM", stop);
 		process.once("SIGINT", stop);
-		interval = (deps.setInterval ?? setInterval)(() => {
-			void renewHeartbeat();
-		}, 5_000);
+		if (!(await renewHeartbeat())) {
+			await terminateForLostOwnership();
+			return;
+		}
 		await runtime.start();
-		await renewHeartbeat();
+		interval = (deps.setInterval ?? setInterval)(() => {
+			void (async () => {
+				try {
+					if (!(await renewHeartbeat())) await terminateForLostOwnership();
+				} catch (error) {
+					terminalError ??= error;
+					stopping = true;
+					try {
+						await stopRuntime();
+					} catch (stopError) {
+						terminalError ??= stopError;
+					}
+				}
+			})();
+		}, 5_000);
 		while (!stopping) {
 			const request = await readChatDaemonControlRequest(agentDir, kind);
 			if (request?.ownerId === ownerId && request.incarnation === incarnation) {
@@ -208,9 +253,26 @@ export async function runChatDaemonInternal(
 		process.off("SIGTERM", stop);
 		process.off("SIGINT", stop);
 		try {
-			await runtime?.stop();
+			await stopRuntime();
+		} catch (error) {
+			terminalError ??= error;
 		} finally {
-			await releaseChatDaemonOwnership({ agentDir, kind, ownerId, pid: deps.processPid, incarnation });
+			if (incarnation !== undefined) {
+				try {
+					await releaseChatDaemonOwnership({
+						agentDir,
+						kind,
+						ownerId,
+						pid: daemonPid,
+						incarnation,
+						pidAlive: deps.pidAlive,
+						pidIncarnation: deps.pidIncarnation,
+					});
+				} catch (error) {
+					terminalError ??= error;
+				}
+			}
 		}
 	}
+	if (terminalError !== undefined) throw terminalError;
 }

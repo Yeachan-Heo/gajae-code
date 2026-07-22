@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { disableProvider, enableProvider } from "../../src/capability";
 import { clearCache as clearFsCache } from "../../src/capability/fs";
+import { resetSettingsForTest, Settings } from "../../src/config/settings";
 import { clearClaudePluginRootsCache } from "../../src/discovery/helpers";
 import { discoverAgents } from "../../src/task/discovery";
 
@@ -21,8 +22,10 @@ const PLUGIN_AGENT_MD = [
 
 describe("discoverAgents — claude-plugins disabled provider", () => {
 	let tempHome: string;
+	let settings: Settings;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		resetSettingsForTest();
 		tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-disco-home-"));
 
 		// Build a fake GJC plugin install with an agents/ subdirectory.
@@ -52,29 +55,28 @@ describe("discoverAgents — claude-plugins disabled provider", () => {
 			}),
 		);
 
-		// Start each test with a clean provider + cache state.
-		enableProvider("claude-plugins");
+		settings = await Settings.init({ inMemory: true, cwd: tempHome });
+		enableProvider("claude-plugins", settings);
 		clearFsCache();
 		clearClaudePluginRootsCache();
 	});
 
 	afterEach(() => {
 		fs.rmSync(tempHome, { recursive: true, force: true });
-		// Restore global state so other tests in the suite are not affected.
-		enableProvider("claude-plugins");
+		resetSettingsForTest();
 		clearFsCache();
 		clearClaudePluginRootsCache();
 	});
 
 	test("includes plugin agents when claude-plugins is enabled", async () => {
-		const { agents } = await discoverAgents(tempHome, tempHome);
+		const { agents } = await discoverAgents(tempHome, tempHome, settings);
 		expect(agents.map(a => a.name)).toContain("simplifier");
 	});
 
 	test("excludes plugin agents when claude-plugins is disabled", async () => {
-		disableProvider("claude-plugins");
+		disableProvider("claude-plugins", settings);
 		clearClaudePluginRootsCache();
-		const { agents } = await discoverAgents(tempHome, tempHome);
+		const { agents } = await discoverAgents(tempHome, tempHome, settings);
 		expect(agents.map(a => a.name)).not.toContain("simplifier");
 	});
 });

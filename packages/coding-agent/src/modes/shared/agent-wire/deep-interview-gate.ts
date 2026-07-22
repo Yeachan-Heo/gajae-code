@@ -10,6 +10,11 @@
  * This is the pure mapping primitive used by SDK-native workflow gate emitters.
  */
 
+import { isDeepInterviewAskQuestion } from "../../../deep-interview/render-middleware";
+import {
+	assertDeepInterviewInputWithinLimit,
+	MAX_USER_RESPONSE_LENGTH,
+} from "../../../gjc-runtime/deep-interview-state";
 import type { OpenGateInput } from "./workflow-gate-broker";
 import {
 	type AskGateDeepInterviewState,
@@ -134,7 +139,17 @@ export function buildAskGateStageState(question: AskGateQuestion, labels: string
 /** Build the `workflow_gate` open-input for one ask question. */
 export function questionToGate(question: AskGateQuestion): OpenGateInput {
 	const labels = question.options.map(o => o.label);
-	const schema = buildAskGateAnswerSchema(question, labels);
+	const schema = buildAskGateAnswerSchema(
+		{
+			multi: question.multi,
+			allowEmpty: question.allowEmpty,
+			customMaxLength:
+				question.deepInterview || isDeepInterviewAskQuestion(question.question)
+					? MAX_USER_RESPONSE_LENGTH
+					: undefined,
+		},
+		labels,
+	);
 	return {
 		stage: question.workflowGate?.stage ?? "deep-interview",
 		kind: question.workflowGate?.kind ?? "question",
@@ -229,6 +244,12 @@ export function gateAnswerToResult(question: AskGateQuestion, answer: unknown): 
 	if (other && (answer.custom === undefined || answer.custom.trim() === "")) {
 		throw new DeepInterviewGateError("missing_custom", "custom text is required when `other` is true");
 	}
+	if (
+		other &&
+		(question.deepInterview || isDeepInterviewAskQuestion(question.question)) &&
+		answer.custom !== undefined
+	)
+		assertDeepInterviewInputWithinLimit(answer.custom, MAX_USER_RESPONSE_LENGTH, "user_response");
 	return {
 		id: question.id,
 		question: question.question,
@@ -261,6 +282,15 @@ export function classifyAskGateDisposition(
 		multi: (state as Record<string, unknown>).multi === true,
 		allowEmpty: (state as Record<string, unknown>).allow_empty === true,
 	};
+	if (
+		(state as Record<string, unknown>).deep_interview_metadata === true &&
+		typeof (answer as Record<string, unknown>)?.custom === "string"
+	)
+		assertDeepInterviewInputWithinLimit(
+			(answer as Record<string, unknown>).custom as string,
+			MAX_USER_RESPONSE_LENGTH,
+			"user_response",
+		);
 	if (typeof answer === "object" && answer !== null && (answer as Record<string, unknown>).action === "clarify") {
 		gateAnswerToResult(question, answer);
 		return "resolve_without_commit";

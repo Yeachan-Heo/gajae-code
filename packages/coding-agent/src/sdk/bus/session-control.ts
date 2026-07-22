@@ -1,5 +1,6 @@
 import {
 	getCurrentTelegramActivationMarker,
+	isNotificationStreamingEnabled,
 	isSessionNotificationsEnabled,
 	isTelegramConfigured,
 	type NotificationConfig,
@@ -22,7 +23,7 @@ export interface BoundNotificationSession<Context extends NotificationSessionCon
 }
 
 export type NotificationEndpointStartResult = "started" | "already" | "disabled" | "failed";
-export type TelegramDaemonPreflightResult = "ready" | "blocked_identity";
+export type TelegramDaemonPreflightResult = "ready" | "blocked_identity" | "failed";
 
 /**
  * The endpoint implementation is deliberately injected. The controller owns
@@ -38,6 +39,10 @@ export interface NotificationSessionRuntime<Context extends NotificationSessionC
 	 * emit a frame. `blocked_identity` is fail-closed and starts nothing.
 	 */
 	ensureTelegramDaemon?(binding: BoundNotificationSession<Context>): Promise<TelegramDaemonPreflightResult>;
+	/** Refresh mutable delivery policy from the same configuration snapshot used for reconciliation. */
+	refreshPolicy?(binding: BoundNotificationSession<Context>, policy: NotificationRuntimePolicy): void;
+	/** Enables delivery only after the controller has committed a stable policy. */
+	activate?(binding: BoundNotificationSession<Context>): void;
 }
 
 export interface NotificationSessionStatus {
@@ -51,6 +56,13 @@ export interface NotificationSessionStatus {
 export interface NotificationSessionReconcileResult {
 	outcome: NotificationEndpointStartResult | "stopped";
 	status: NotificationSessionStatus;
+}
+
+export interface NotificationRuntimePolicy {
+	redact: boolean;
+	verbosity: NotificationConfig["verbosity"];
+	stream: boolean;
+	mode: "provisional" | "committed";
 }
 
 export interface NotificationSessionControllerOptions {
@@ -69,6 +81,8 @@ export interface NotificationSessionControllerOptions {
  * operation with `isSessionNotificationsEnabled`. Gate C verifies complete
  * Telegram ownership before a generic endpoint is allowed to start.
  */
+const MAX_RECONCILE_ATTEMPTS = 3;
+
 export class NotificationSessionController {
 	readonly #eligible: boolean;
 	readonly #getConfig: () => NotificationConfig;
@@ -129,17 +143,12 @@ export class NotificationSessionController {
 		if (this.#blockedRuntimeSessions.delete(previousSessionId)) this.#blockedRuntimeSessions.add(nextSessionId);
 		if (this.#shuttingDownSessions.delete(previousSessionId)) this.#shuttingDownSessions.add(nextSessionId);
 
-		const previousOperation = this.#sessionOperations.get(previousSessionId);
-		if (!previousOperation) return;
-		const nextOperation = this.#sessionOperations.get(nextSessionId);
-		const completion = nextOperation ? previousOperation.then(() => nextOperation) : previousOperation;
+		// Operations are bound to the identity captured when they were queued. Moving
+		// a predecessor operation to the successor makes successor startup wait for
+		// predecessor teardown, while that teardown can itself await successor
+		// authority: a session-switch deadlock. Leave new-session operations owned by
+		// their new key and let the predecessor operation settle independently.
 		this.#sessionOperations.delete(previousSessionId);
-		this.#sessionOperations.set(nextSessionId, completion);
-		void completion.then(() => {
-			if (this.#sessionOperations.get(nextSessionId) === completion) {
-				this.#sessionOperations.delete(nextSessionId);
-			}
-		});
 	}
 
 	query<Context extends NotificationSessionContext>(context: Context): NotificationSessionStatus {
@@ -176,9 +185,15 @@ export class NotificationSessionController {
 		try {
 			return await this.#enqueue(binding, async () => {
 				const runtime = this.#runtime as NotificationSessionRuntime<Context> | undefined;
-				const stopped = runtime?.isRunning(binding) ? await runtime.stop(binding) : false;
+				this.#refreshPolicy(runtime, binding, { redact: true, verbosity: "lean", stream: false }, "provisional");
+				if (runtime?.isRunning(binding)) {
+					const stopped = await runtime.stop(binding);
+					if (!stopped || runtime.isRunning(binding)) {
+						throw new Error("Notification runtime remained active while entering blocked identity state");
+					}
+				}
 				this.#blockedRuntimeSessions.add(binding.sessionId);
-				return stopped;
+				return true;
 			});
 		} finally {
 			binding.unbind();
@@ -231,47 +246,138 @@ export class NotificationSessionController {
 	async #reconcile<Context extends NotificationSessionContext>(
 		binding: BoundNotificationSession<Context>,
 	): Promise<NotificationSessionReconcileResult> {
-		const cfg = this.#getConfig();
 		const runtime = this.#runtime as NotificationSessionRuntime<Context> | undefined;
-		const status = this.#status(binding, cfg, runtime);
-		if (!status.effectiveEnabled) {
-			if (runtime && status.running) await runtime.stop(binding);
-			return { outcome: status.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
-		}
-
-		if (!runtime) return { outcome: "disabled", status };
-		if (getCurrentTelegramActivationMarker(cfg)) {
-			if (runtime.isRunning(binding)) await runtime.stop(binding);
-			this.#blockedRuntimeSessions.add(binding.sessionId);
-			return { outcome: "disabled", status: this.#status(binding, cfg, runtime) };
-		}
-		if (isTelegramConfigured(cfg)) {
+		for (let attempt = 0; attempt < MAX_RECONCILE_ATTEMPTS; attempt++) {
+			this.#refreshPolicy(runtime, binding, { redact: true, verbosity: "lean", stream: false }, "provisional");
+			let cfg: NotificationConfig;
 			try {
-				const ensured = await runtime.ensureTelegramDaemon?.(binding);
-				if (ensured !== "ready") {
-					if (runtime.isRunning(binding)) await runtime.stop(binding);
-					this.#blockedRuntimeSessions.add(binding.sessionId);
-					return { outcome: "disabled", status: this.#status(binding, cfg, runtime) };
-				}
+				cfg = this.#getConfig();
 			} catch {
+				if (runtime?.isRunning(binding)) await runtime.stop(binding);
+				return { outcome: "failed", status: this.#failClosedStatus(binding, runtime) };
+			}
+			const status = this.#status(binding, cfg, runtime);
+			if (!status.effectiveEnabled) {
+				if (runtime && status.running) await runtime.stop(binding);
+				if (!this.#isCurrentConfig(cfg)) continue;
+				return { outcome: status.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
+			}
+
+			if (!runtime) return { outcome: "disabled", status };
+			if (getCurrentTelegramActivationMarker(cfg)) {
 				if (runtime.isRunning(binding)) await runtime.stop(binding);
 				this.#blockedRuntimeSessions.add(binding.sessionId);
-				return { outcome: "failed", status: this.#status(binding, cfg, runtime) };
+				if (!this.#isCurrentConfig(cfg)) continue;
+				return { outcome: "disabled", status: this.#status(binding, cfg, runtime) };
 			}
+			if (isTelegramConfigured(cfg)) {
+				try {
+					const ensured = await runtime.ensureTelegramDaemon?.(binding);
+					if (!this.#isCurrentConfig(cfg)) continue;
+					if (ensured !== "ready") {
+						if (runtime.isRunning(binding)) await runtime.stop(binding);
+						this.#blockedRuntimeSessions.add(binding.sessionId);
+						return {
+							outcome: ensured === "failed" ? "failed" : "disabled",
+							status: this.#status(binding, cfg, runtime),
+						};
+					}
+				} catch {
+					if (!this.#isCurrentConfig(cfg)) continue;
+					if (runtime.isRunning(binding)) await runtime.stop(binding);
+					this.#blockedRuntimeSessions.add(binding.sessionId);
+					return { outcome: "failed", status: this.#status(binding, cfg, runtime) };
+				}
+			}
+
+			const current = this.#status(binding, cfg, runtime);
+			if (!current.effectiveEnabled || !this.#isCurrentConfig(cfg)) continue;
+			this.#refreshPolicy(
+				runtime,
+				binding,
+				{
+					redact: cfg.redact,
+					verbosity: cfg.verbosity,
+					stream: isNotificationStreamingEnabled({ cfg, env: this.#env }),
+				},
+				"committed",
+			);
+			const outcome = current.running ? "already" : await runtime.start(binding);
+			// start() may have created a cold runtime after the first committed refresh.
+			// Reapply the stable policy before activate() exposes any notification output.
+			this.#refreshPolicy(
+				runtime,
+				binding,
+				{
+					redact: cfg.redact,
+					verbosity: cfg.verbosity,
+					stream: isNotificationStreamingEnabled({ cfg, env: this.#env }),
+				},
+				"committed",
+			);
+			if (!this.#isCurrentConfig(cfg)) {
+				this.#refreshPolicy(runtime, binding, { redact: true, verbosity: "lean", stream: false }, "provisional");
+				const stopped = runtime.isRunning(binding) ? await runtime.stop(binding) : true;
+				if (!stopped || runtime.isRunning(binding)) {
+					return { outcome: "failed", status: this.#status(binding, this.#getConfig(), runtime) };
+				}
+				continue;
+			}
+			runtime.activate?.(binding);
+			const afterStart = this.#status(binding, cfg, runtime);
+			if (!afterStart.effectiveEnabled) {
+				if (afterStart.running) await runtime.stop(binding);
+				return {
+					outcome: afterStart.running ? "stopped" : "disabled",
+					status: this.#status(binding, cfg, runtime),
+				};
+			}
+			return { outcome, status: afterStart };
 		}
 
-		const current = this.#status(binding, cfg, runtime);
-		if (!current.effectiveEnabled) {
-			if (current.running) await runtime.stop(binding);
-			return { outcome: current.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
+		this.#refreshPolicy(runtime, binding, { redact: true, verbosity: "lean", stream: false }, "provisional");
+		let cfg: NotificationConfig;
+		try {
+			cfg = this.#getConfig();
+		} catch {
+			if (runtime?.isRunning(binding)) await runtime.stop(binding);
+			return { outcome: "failed", status: this.#failClosedStatus(binding, runtime) };
 		}
-		const outcome = current.running ? "already" : await runtime.start(binding);
-		const afterStart = this.#status(binding, cfg, runtime);
-		if (!afterStart.effectiveEnabled) {
-			if (afterStart.running) await runtime.stop(binding);
-			return { outcome: afterStart.running ? "stopped" : "disabled", status: this.#status(binding, cfg, runtime) };
+		const status = this.#status(binding, cfg, runtime);
+		if (!runtime || !status.running) return { outcome: "disabled", status };
+		const stopped = await runtime.stop(binding);
+		const finalStatus = this.#status(binding, cfg, runtime);
+		return { outcome: stopped && !finalStatus.running ? "stopped" : "failed", status: finalStatus };
+	}
+
+	#failClosedStatus<Context extends NotificationSessionContext>(
+		binding: BoundNotificationSession<Context>,
+		runtime: NotificationSessionRuntime<Context> | undefined,
+	): NotificationSessionStatus {
+		return {
+			eligible: this.#eligible,
+			locallyEnabled: false,
+			effectiveEnabled: false,
+			running: runtime?.isRunning(binding) ?? false,
+			environment: "off",
+		};
+	}
+
+	#refreshPolicy<Context extends NotificationSessionContext>(
+		runtime: NotificationSessionRuntime<Context> | undefined,
+		binding: BoundNotificationSession<Context>,
+		policy: Omit<NotificationRuntimePolicy, "mode">,
+		mode: NotificationRuntimePolicy["mode"],
+	): void {
+		runtime?.refreshPolicy?.(binding, { ...policy, mode });
+	}
+
+	#isCurrentConfig(cfg: NotificationConfig): boolean {
+		try {
+			return Bun.deepEquals(this.#getConfig(), cfg, true);
+		} catch {
+			return false;
 		}
-		return { outcome, status: this.#status(binding, cfg, runtime) };
 	}
 
 	#enqueue<Context extends NotificationSessionContext, Result>(

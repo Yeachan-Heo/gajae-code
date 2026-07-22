@@ -146,6 +146,22 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 	}
 }
 
+async function validateRecoveryFsBindings(): Promise<void> {
+	const bindings = await Bun.file(path.join(nativeDir, "index.d.ts")).text();
+	for (const symbol of [
+		"RecoveryFsRoot",
+		"RecoveryFsIdentity",
+		"RecoveryFsResult",
+		"openRecoveryFsRoot",
+		"repairOwnerOnlyPathSecurityExpected",
+		"verifyOwnerOnlyPathSecurityExpected",
+	]) {
+		if (!bindings.includes(symbol)) {
+			throw new Error(`napi build did not generate the required recovery filesystem binding: ${symbol}`);
+		}
+	}
+}
+
 type NativeBuildProfile = "local" | "ci" | "dist";
 
 export function resolveNativeBuildProfile(options: {
@@ -231,6 +247,7 @@ try {
 	}
 
 	await installGeneratedBindings(buildOutputDir);
+	await validateRecoveryFsBindings();
 
 	await Bun.write(
 		`${canonicalAddonPath}.build.json`,

@@ -8,6 +8,12 @@ import type {
 	UltragoalReceiptKind,
 } from "./ultragoal-runtime";
 
+export const CRITIC_VERDICT_EVENT = "critic_verdict";
+export const CRITIC_GATE_HARD_STOP_EVENT = "critic_gate_hard_stop";
+export const CRITIC_GATE_OVERRIDE_EVENT = "critic_gate_override";
+export const TERMINAL_CRITIC_CEILING = 5;
+export type CriticVerdict = "OKAY" | "ITERATE" | "REJECT";
+
 export type UltragoalReceiptFreshnessDiagnostic = {
 	state:
 		| "inactive"
@@ -44,6 +50,103 @@ function hashStructuredValue(value: unknown): string {
 
 export function requiredUltragoalGoals(plan: UltragoalPlan): UltragoalGoal[] {
 	return plan.goals.filter(goal => goal.status !== "superseded");
+}
+
+/** Hash the current required-goal set for terminal critic verdict freshness. */
+export function computeCriticVerdictPlanGeneration(plan: UltragoalPlan): string {
+	return hashStructuredValue(
+		requiredUltragoalGoals(plan).map(goal => ({
+			id: goal.id,
+			status: goal.status,
+			updatedAt: goal.updatedAt,
+		})),
+	);
+}
+
+export function isCleanPauseCriticVerdictShape(
+	candidate: UltragoalLedgerEvent,
+	planGeneration: string,
+	classificationEventId: string,
+): boolean {
+	return (
+		candidate.event === CRITIC_VERDICT_EVENT &&
+		candidate.terminus === "pause" &&
+		candidate.verdict === "OKAY" &&
+		typeof candidate.evidence === "string" &&
+		candidate.evidence.trim().length > 0 &&
+		Array.isArray(candidate.blockers) &&
+		candidate.blockers.length === 0 &&
+		candidate.planGeneration === planGeneration &&
+		candidate.classificationEventId === classificationEventId
+	);
+}
+
+export function isCleanPauseCriticVerdict(
+	event: UltragoalLedgerEvent,
+	opts: { planGeneration: string; classificationEventId: string },
+): boolean {
+	return isCleanPauseCriticVerdictShape(event, opts.planGeneration, opts.classificationEventId);
+}
+
+export function findCleanPauseCriticVerdict(
+	plan: UltragoalPlan,
+	ledger: readonly UltragoalLedgerEvent[],
+	classificationEventId: string,
+): UltragoalLedgerEvent | null {
+	const classificationIndex = ledger.findIndex(event => event.eventId === classificationEventId);
+	if (classificationIndex < 0) return null;
+	const planGeneration = computeCriticVerdictPlanGeneration(plan);
+	for (let index = ledger.length - 1; index > classificationIndex; index--) {
+		const event = ledger[index];
+		if (
+			event.event !== CRITIC_VERDICT_EVENT ||
+			event.terminus !== "pause" ||
+			event.planGeneration !== planGeneration ||
+			event.classificationEventId !== classificationEventId
+		)
+			continue;
+		return isCleanPauseCriticVerdict(event, { planGeneration, classificationEventId }) ? event : null;
+	}
+	return null;
+}
+
+/** Pure: count all ledger `critic_verdict` rows for an exact plan generation. */
+export function countTerminalCriticVerdicts(ledger: readonly UltragoalLedgerEvent[], planGeneration: string): number {
+	return ledger.filter(event => event.event === CRITIC_VERDICT_EVENT && event.planGeneration === planGeneration)
+		.length;
+}
+/** Pure: count every non-OKAY terminal critic verdict recorded for this run. */
+export function countNonOkayTerminalCriticVerdicts(
+	ledger: readonly UltragoalLedgerEvent[],
+	_legacyPlanGeneration?: string,
+): number {
+	return ledger.filter(event => event.event === CRITIC_VERDICT_EVENT && event.verdict !== "OKAY").length;
+}
+
+export function terminalCriticHardStopReached(
+	ledger: readonly UltragoalLedgerEvent[],
+	_legacyPlanGeneration?: string,
+): boolean {
+	return ledger.some(event => event.event === CRITIC_GATE_HARD_STOP_EVENT);
+}
+
+export function terminalCriticGateOverridden(ledger: readonly UltragoalLedgerEvent[]): boolean {
+	let overrideAfterLatestHardStop = false;
+	for (let index = ledger.length - 1; index >= 0; index--) {
+		const event = ledger[index];
+		if (event.event === CRITIC_GATE_OVERRIDE_EVENT) overrideAfterLatestHardStop = true;
+		if (event.event === CRITIC_GATE_HARD_STOP_EVENT) return overrideAfterLatestHardStop;
+	}
+	return false;
+}
+
+export function terminalCriticCeilingReached(
+	ledger: readonly UltragoalLedgerEvent[],
+	_legacyPlanGeneration?: string,
+): boolean {
+	return (
+		countNonOkayTerminalCriticVerdicts(ledger) >= TERMINAL_CRITIC_CEILING || terminalCriticHardStopReached(ledger)
+	);
 }
 
 export function receiptRelevantGoals(

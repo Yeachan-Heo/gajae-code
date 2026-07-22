@@ -291,14 +291,18 @@ async function updateChangelogsForRelease(version: string): Promise<void> {
 			continue;
 		}
 
-		// Only create version entry if [Unreleased] has content
-		if (hasUnreleasedContent(content)) {
+		// Remove stale empty version entries before inserting the new release entry.
+		// A release with no unreleased notes still needs a semver heading: the
+		// embedded changelog must identify the version shipped by the package.
+		const unreleasedHasContent = hasUnreleasedContent(content);
+		content = removeEmptyVersionEntries(content);
+
+		if (unreleasedHasContent) {
 			content = content.replace("## [Unreleased]", `## [${version}] - ${date}`);
 			content = content.replace(/^(# Changelog\n\n)/, `$1## [Unreleased]\n\n`);
+		} else {
+			content = content.replace("## [Unreleased]", `## [Unreleased]\n\n## [${version}] - ${date}`);
 		}
-
-		// Clean up any existing empty version entries
-		content = removeEmptyVersionEntries(content);
 
 		await Bun.write(changelog, content);
 		console.log(`  Updated ${changelog}`);
@@ -587,21 +591,33 @@ async function cmdRelease(version: string): Promise<void> {
 	console.log();
 
 	// 4c. Rebuild the native addon so the on-disk `.node` exports the freshly
-	// bumped version sentinel. Otherwise the local `bun run check` below loads a
+	// bumped version sentinel. Otherwise the local checks below load a
 	// stale addon (built against the previous sentinel) and fails. CI rebuilds
 	// per platform; this keeps the maintainer's release run a single shot.
 	console.log("Rebuilding native addon for the new sentinel…");
 	await $`bun --cwd=packages/natives run build`;
 	console.log();
 
+	// 4d. Regenerate the telegram-daemon-generation-guard manifest so the
+	// committed manifest keeps tracking `packages/natives/native/index.d.ts`,
+	// whose `__piNativesV…` version sentinel the bump just rewrote. It only
+	// re-records digests of the already-bumped, reviewed tree; the protected
+	// daemon declaration digests are unchanged by a version bump.
+	console.log("Regenerating telegram-daemon-generation-guard manifest…");
+	await $`bun scripts/telegram-daemon-generation-guard.ts --write-manifest`;
+
 	// 5. Update changelogs
 	console.log("Updating CHANGELOGs...");
 	await updateChangelogsForRelease(version);
 	console.log();
 
-	// 6. Run checks
-	console.log("Running checks...");
-	await $`bun run check`;
+	// 6. Run checks. Mirror the required CI `check` job exactly (`ci:check:full`,
+	// native-free lint + typecheck). The heavier `bun run check` also runs
+	// `check:sdk-closure` (load-sensitive SDK integration tests) and `check:rs`
+	// (clippy under the local toolchain) — neither is part of CI's release gate;
+	// the test suite is validated by CI's sharded jobs on the main-branch push.
+	console.log("Running checks (ci:check:full, matching CI)…");
+	await $`bun run ci:check:full`;
 	console.log();
 
 	// 7. Commit and tag

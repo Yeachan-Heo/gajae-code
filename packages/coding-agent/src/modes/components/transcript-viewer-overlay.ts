@@ -11,6 +11,12 @@ import { sanitizeText } from "@gajae-code/utils";
 import { getMarkdownTheme, theme } from "../theme/theme";
 import type { TranscriptItemRegistry, TranscriptSourcePayload } from "../transcript-item-registry";
 import { DynamicBorder } from "./dynamic-border";
+import {
+	buildToolTranscriptEntry,
+	createToolTranscriptRenderDescriptor,
+	renderToolDisplayLines,
+	type ToolTranscriptRenderDescriptor,
+} from "./tool-transcript-format";
 
 const INDENT = "    ";
 const PAGE_SIZE = 15;
@@ -25,6 +31,8 @@ export type TranscriptViewerEntry = {
 	foldable?: boolean;
 	rawViewable?: boolean;
 	getDisplayText?: (expanded: boolean) => string;
+	renderDescriptor?: ToolTranscriptRenderDescriptor;
+	richRenderEligible?: boolean;
 };
 
 export type TranscriptViewerOverlayOptions = {
@@ -332,6 +340,19 @@ export class TranscriptViewerOverlay extends Container {
 			lines.push(
 				`${selected ? theme.fg("accent", "▶") : " "} ${theme.fg("muted", `[${sanitizeText(entry.label ?? entry.kind)}]`)}`,
 			);
+			if (
+				!raw &&
+				expanded &&
+				selected &&
+				entry.kind === "tool" &&
+				entry.richRenderEligible === true &&
+				entry.renderDescriptor
+			) {
+				for (const line of renderToolDisplayLines(entry.renderDescriptor, contentWidth, theme))
+					lines.push(`${INDENT}${line}`);
+				this.#renderedEntries.push({ lineStart: start, lineCount: lines.length - start });
+				continue;
+			}
 			const text = sanitizeText(
 				(raw
 					? entry.payload.text
@@ -363,6 +384,29 @@ export class TranscriptViewerOverlay extends Container {
 	}
 }
 
+type ToolTranscriptMetadata = {
+	name: string;
+	arguments: Record<string, unknown>;
+	intent?: unknown;
+	resultText: string;
+	isError: boolean;
+	hasResult: boolean;
+};
+
+function hasToolTranscriptMetadata(
+	metadata: Readonly<Record<string, unknown>>,
+): metadata is Readonly<ToolTranscriptMetadata> {
+	return (
+		typeof metadata.name === "string" &&
+		metadata.arguments !== null &&
+		typeof metadata.arguments === "object" &&
+		!Array.isArray(metadata.arguments) &&
+		typeof metadata.resultText === "string" &&
+		typeof metadata.isError === "boolean" &&
+		typeof metadata.hasResult === "boolean"
+	);
+}
+
 /** Main-session adapter over the registry's canonical payload resolver. */
 export function transcriptViewerEntries(registry: TranscriptItemRegistry): TranscriptViewerEntry[] {
 	return registry.items().flatMap(item => {
@@ -375,10 +419,28 @@ export function transcriptViewerEntries(registry: TranscriptItemRegistry): Trans
 				: item.kind === "assistant-thinking"
 					? "Thinking"
 					: item.kind === "tool"
-						? "Tool"
+						? String(payload.metadata.name ?? "Tool")
 						: item.kind === "user"
 							? "User"
 							: item.kind;
+		const toolMetadata = hasToolTranscriptMetadata(payload.metadata) ? payload.metadata : undefined;
+		if (item.kind === "tool" && toolMetadata)
+			return [
+				buildToolTranscriptEntry({
+					canonicalPayload: payload,
+					renderDescriptor: createToolTranscriptRenderDescriptor({
+						name: toolMetadata.name,
+						args: toolMetadata.arguments,
+						intent: toolMetadata.intent,
+						resultContent: toolMetadata.resultText,
+						detailsData: payload.metadata.detailsData,
+						isError: toolMetadata.isError,
+						hasResult: toolMetadata.hasResult,
+					}),
+					capabilities: capabilities ?? { copyable: true, foldable: true, rawViewable: true },
+					identity: { id: item.id, label },
+				}),
+			];
 		return [{ id: item.id, kind: item.kind, label, payload, ...capabilities }];
 	});
 }

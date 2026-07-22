@@ -1,0 +1,10 @@
+{
+  "$schema": "sdk-frame-vectors/v1",
+  "kind": "record",
+  "name": "action needed resolved lifecycle",
+  "frames": [
+    { "type": "action_needed", "id": "action-1", "kind": "ask", "sessionId": "session-1", "question": "Proceed?", "options": ["yes", "no"] },
+    { "type": "action_resolved", "id": "action-1", "sessionId": "session-1", "resolvedBy": "user" }
+  ],
+  "expectations": { "lifecycle": ["action_needed", "action_resolved"], "correlatesBy": "id" }
+}

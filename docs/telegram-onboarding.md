@@ -186,6 +186,7 @@ layer:
 - `notifications.telegram.botToken = <token>`
 - `notifications.telegram.chatId = <paired chat id>`
 - `notifications.redact = true` only when `--redact` was passed
+- `notifications.telegram.streaming.enabled = true` by default; set it to `false` to disable durable live Telegram assistant-output updates globally. `GJC_NOTIFICATIONS_STREAM=1` forces process-local streaming, while `0`, `off`, or `false` forces it off.
 
 A complete global configuration is `notifications.enabled` plus at least one
 complete adapter. Telegram needs its bot token and private-chat id; Discord and
@@ -313,6 +314,11 @@ The managed daemon can render:
 - ask prompts with inline buttons;
 - activity/typing indicators;
 - inbound delivery acknowledgements.
+
+Tool activity updates such as `⚙ read — ok` are enabled by default. Send
+`/toolactivity off` in the paired private chat to suppress them globally, or
+`/toolactivity on` to restore them. The toggle is durable, works without a connected session, and
+is also available under `/settings` → **Notifications** → **Preferences**.
 
 Reply paths:
 

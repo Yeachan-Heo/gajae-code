@@ -19,7 +19,6 @@ import type {
 	RunResultOk,
 	SessionSnapshot,
 	Transferable,
-	Transport,
 	WorkerInbound,
 	WorkerInitPayload,
 	WorkerOutbound,
@@ -38,8 +37,8 @@ interface WorkerHandle {
 	send(msg: WorkerInbound, transferList?: Transferable[]): void;
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
 	onError(handler: (error: Error) => void): () => void;
+	onClose(handler: () => void): () => void;
 	terminate(): Promise<void>;
-	readonly mode: "worker" | "inline";
 }
 
 export type DialogPolicy = "accept" | "dismiss";
@@ -118,6 +117,13 @@ let workerInitializerForTest:
 	| ((worker: WorkerHandle, payload: WorkerInitPayload, timeoutMs: number) => Promise<ReadyInfo>)
 	| undefined;
 const GRACE_MS = 750;
+const TAB_WORKER_MODE = "native-free";
+
+function startupError(stage: string): ToolError {
+	return new ToolError(
+		`Tab worker startup failed (stage=${stage}, mode=${TAB_WORKER_MODE}, platform=${process.platform}).`,
+	);
+}
 
 interface DeadTabDescriptor {
 	tab: TabSession;
@@ -152,7 +158,7 @@ async function awaitWithinBudget(op: Promise<unknown>, remainingMs: number, labe
 		logger.debug("close teardown budget already spent; detaching step", { label });
 		return false;
 	}
-	let timer: ReturnType<typeof setTimeout> | undefined;
+	let timer: NodeJS.Timeout | undefined;
 	const timedOut = new Promise<boolean>(resolve => {
 		timer = setTimeout(() => resolve(false), remainingMs);
 	});
@@ -358,64 +364,69 @@ export async function acquireTab(
 		if (replacementHold) await releaseBrowser(browser, { kill: false });
 		throw error;
 	}
-	let worker = await spawnAcquireWorker();
-	let info: ReadyInfo;
+	let worker: WorkerHandle;
 	try {
-		info = await initializeAcquireWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
-	} catch (error) {
-		// `BuildMessage`-class failures arrive asynchronously via the worker's `error` event,
-		// after `spawnTabWorker`'s synchronous try/catch has already returned. Fall back to
-		// the inline worker here so module-resolution failures don't poison every tab open.
-		await worker.terminate().catch(() => undefined);
-		if (worker.mode === "inline") {
-			if (replacementHold) await releaseBrowser(browser, { kill: false });
-			else if (browser.refCount === 0) await releaseBrowser(browser, { kill: false });
-			throw error;
-		}
-		logger.warn("Tab worker init failed; retrying with inline tab worker (no sync-loop guard)", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-		worker = await (workerFactoryForTest?.() ?? spawnInlineWorker());
-		try {
-			info = await initializeAcquireWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
-		} catch (inlineError) {
-			await worker.terminate().catch(() => undefined);
-			if (replacementHold) await releaseBrowser(browser, { kill: false });
-			else if (browser.refCount === 0) await releaseBrowser(browser, { kill: false });
-			const finalError = new ToolError(
-				`Failed to start browser tab worker (inline fallback also failed): ${inlineError instanceof Error ? inlineError.message : String(inlineError)}`,
-			);
-			(finalError as { cause?: unknown }).cause = error;
-			throw finalError;
-		}
-	}
-
-	afterWorkerInitializationForTest?.(name);
-	if (opts.requireVacantName && tabs.has(name)) {
-		await worker.terminate().catch(() => undefined);
+		worker = await spawnAcquireWorker();
+	} catch {
 		if (replacementHold) await releaseBrowser(browser, { kill: false });
-		throw new ToolError(`Tab ${JSON.stringify(name)} was replaced during recovery.`);
+		else if (browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+		throw startupError("spawn");
 	}
-	holdBrowser(browser);
-	if (replacementHold) await releaseBrowser(browser, { kill: false });
-	const tab: TabSession = {
-		name,
-		browser,
-		targetId: info.targetId,
-		worker,
-		state: "alive",
-		info,
-		pending: new Map(),
-		dialogPolicy: opts.dialogs,
-		kindTag: browser.kind.kind,
-		ownerId: opts.ownerId,
-		lastUsedAt: Date.now(),
-		recoveryOpts: freezeRecoveryOptions(opts),
+	let registeredTab: TabSession | undefined;
+	let startupFailure: Error | undefined;
+	let browserHeld = false;
+	const observeFailure = (error: Error): void => {
+		if (registeredTab) markTabDead(registeredTab, error);
+		else startupFailure ??= error;
 	};
-	worker.onMessage(msg => handleTabMessage(tab, msg));
-	worker.onError(error => markTabDead(tab, error));
-	tabs.set(name, tab);
-	return { tab, created: true };
+	const unlistenLifetimeMessages = worker.onMessage(msg => {
+		if (msg.type === "closed") observeFailure(startupError("protocol-closed"));
+	});
+	const unlistenLifetimeErrors = worker.onError(() => observeFailure(startupError("error")));
+	const unlistenLifetimeClose = worker.onClose(() => observeFailure(startupError("physical-close")));
+	try {
+		const info = await initializeAcquireWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
+		afterWorkerInitializationForTest?.(name);
+		if (startupFailure) throw startupFailure;
+		if (opts.requireVacantName && tabs.has(name))
+			throw new ToolError(`Tab ${JSON.stringify(name)} was replaced during recovery.`);
+
+		holdBrowser(browser);
+		browserHeld = true;
+		if (replacementHold) {
+			await releaseBrowser(browser, { kill: false });
+			replacementHold = false;
+		}
+		if (startupFailure) throw startupFailure;
+
+		const tab: TabSession = {
+			name,
+			browser,
+			targetId: info.targetId,
+			worker,
+			state: "alive",
+			info,
+			pending: new Map(),
+			dialogPolicy: opts.dialogs,
+			kindTag: browser.kind.kind,
+			ownerId: opts.ownerId,
+			lastUsedAt: Date.now(),
+			recoveryOpts: freezeRecoveryOptions(opts),
+		};
+		registeredTab = tab;
+		worker.onMessage(msg => handleTabMessage(tab, msg));
+		tabs.set(name, tab);
+		return { tab, created: true };
+	} catch (error) {
+		unlistenLifetimeMessages();
+		unlistenLifetimeErrors();
+		unlistenLifetimeClose();
+		await worker.terminate().catch(() => undefined);
+		if (browserHeld) await releaseBrowser(browser, { kill: false });
+		if (replacementHold) await releaseBrowser(browser, { kill: false });
+		else if (!browserHeld && browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+		throw error;
+	}
 }
 
 export async function runInTab(name: string, opts: RunInTabOptions): Promise<RunResultOk> {
@@ -871,22 +882,14 @@ async function raceWithTimeout<T>(
 }
 
 async function spawnTabWorker(): Promise<WorkerHandle> {
-	try {
-		const worker = isCompiledBinary()
-			? new Worker("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts", { type: "module" })
-			: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, { type: "module" });
-		return wrapBunWorker(worker);
-	} catch (err) {
-		logger.warn("Bun Worker spawn failed; using inline tab worker (no sync-loop guard)", {
-			error: err instanceof Error ? err.message : String(err),
-		});
-		return spawnInlineWorker();
-	}
+	const worker = isCompiledBinary()
+		? new Worker("./packages/coding-agent/src/tools/browser/tab-worker-entry.ts", { type: "module" })
+		: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, { type: "module" });
+	return wrapBunWorker(worker);
 }
 
 function wrapBunWorker(worker: Worker): WorkerHandle {
 	return {
-		mode: "worker",
 		send(msg, transferList) {
 			worker.postMessage(msg, { transfer: transferList ?? [] });
 		},
@@ -896,9 +899,8 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 			return () => worker.removeEventListener("message", wrap);
 		},
 		onError(handler) {
-			const onError = (event: ErrorEvent): void => handler(errorFromWorkerEvent(event));
-			const onMessageError = (event: MessageEvent): void =>
-				handler(new ToolError(`Tab worker message error: ${String(event.data)}`));
+			const onError = (): void => handler(startupError("error"));
+			const onMessageError = (): void => handler(startupError("messageerror"));
 			worker.addEventListener("error", onError);
 			worker.addEventListener("messageerror", onMessageError);
 			return () => {
@@ -906,46 +908,14 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 				worker.removeEventListener("messageerror", onMessageError);
 			};
 		},
+		onClose(handler) {
+			const onClose = (): void => handler();
+			worker.addEventListener("close", onClose);
+			return () => worker.removeEventListener("close", onClose);
+		},
 		async terminate() {
 			worker.terminate();
 		},
-	};
-}
-
-/**
- * Inline fallback for environments where Bun cannot compile or spawn the worker
- * entry. This preserves normal browser behavior but cannot interrupt synchronous
- * infinite loops because user code runs on the main thread.
- */
-async function spawnInlineWorker(): Promise<WorkerHandle> {
-	const hostListeners = new Set<(message: WorkerOutbound) => void>();
-	const workerListeners = new Set<(message: WorkerInbound) => void>();
-	const workerTransport: Transport = {
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of hostListeners) listener(msg as WorkerOutbound);
-			}),
-		onMessage: handler => {
-			const typed = handler as (message: WorkerInbound) => void;
-			workerListeners.add(typed);
-			return () => workerListeners.delete(typed);
-		},
-		close: () => {},
-	};
-	const { WorkerCore } = await import("./tab-worker");
-	new WorkerCore(workerTransport);
-	return {
-		mode: "inline",
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of workerListeners) listener(msg);
-			}),
-		onMessage: handler => {
-			hostListeners.add(handler);
-			return () => hostListeners.delete(handler);
-		},
-		onError: () => () => {},
-		async terminate() {},
 	};
 }
 
@@ -954,21 +924,60 @@ async function initializeTabWorker(
 	payload: WorkerInitPayload,
 	timeoutMs: number,
 ): Promise<ReadyInfo> {
-	const { promise, resolve, reject } = Promise.withResolvers<ReadyInfo>();
+	type StartupPhase = "await-bootstrap" | "bootstrap-confirmed" | "await-init";
+	let phase: StartupPhase = "await-bootstrap";
+	const { promise: bootstrap, resolve: bootstrapReady, reject: rejectBootstrap } = Promise.withResolvers<void>();
+	const { promise: initialized, resolve: ready, reject: rejectInitialized } = Promise.withResolvers<ReadyInfo>();
+	void initialized.catch(() => undefined);
+	const fail = (stage: string): void => {
+		const error = startupError(stage);
+		rejectBootstrap(error);
+		rejectInitialized(error);
+	};
 	const unlisten = worker.onMessage(msg => {
-		if (msg.type === "ready") resolve(msg.info);
-		else if (msg.type === "init-failed") reject(errorFromPayload(msg.error));
-		else if (msg.type === "log") logWorkerMessage(msg);
+		if (msg.type === "log") {
+			logWorkerMessage(msg);
+			return;
+		}
+		if (phase === "await-bootstrap") {
+			if (msg.type === "bootstrap-ready" && msg.version === 1 && msg.mode === TAB_WORKER_MODE) {
+				phase = "bootstrap-confirmed";
+				bootstrapReady();
+			} else if (msg.type === "bootstrap-failed") {
+				fail("bootstrap");
+			} else if (msg.type === "closed") {
+				fail("protocol-closed");
+			} else {
+				fail("protocol-phase");
+			}
+			return;
+		}
+		if (phase !== "await-init") {
+			fail("protocol-phase");
+			return;
+		}
+		if (msg.type === "ready") {
+			ready(msg.info);
+		} else if (msg.type === "init-failed") {
+			fail("init");
+		} else if (msg.type === "closed") {
+			fail("protocol-closed");
+		} else {
+			fail("protocol-phase");
+		}
 	});
-	const unlistenError = worker.onError(error => {
-		reject(new ToolError(`Tab worker failed during startup: ${error.message}`));
-	});
+	const unlistenError = worker.onError(() => fail("error"));
+	const unlistenClose = worker.onClose(() => fail("physical-close"));
 	try {
+		worker.send({ type: "bootstrap", version: 1, mode: TAB_WORKER_MODE });
+		await raceWithTimeout(bootstrap, timeoutMs, startupError("bootstrap-timeout").message);
+		phase = "await-init";
 		worker.send({ type: "init", payload });
-		return await raceWithTimeout(promise, timeoutMs, "Timed out initializing browser tab worker");
+		return await raceWithTimeout(initialized, timeoutMs, startupError("init-timeout").message);
 	} finally {
 		unlisten();
 		unlistenError();
+		unlistenClose();
 	}
 }
 
@@ -978,10 +987,4 @@ export function initializeTabWorkerForTest(
 	timeoutMs: number,
 ): Promise<ReadyInfo> {
 	return initializeTabWorker(worker, payload, timeoutMs);
-}
-
-function errorFromWorkerEvent(event: ErrorEvent): Error {
-	if (event.error instanceof Error) return event.error;
-	if (event.message) return new Error(event.message);
-	return new Error("Unknown tab worker error");
 }

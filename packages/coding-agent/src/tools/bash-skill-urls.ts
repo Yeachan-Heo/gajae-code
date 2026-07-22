@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Skill } from "../extensibility/skills";
-import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
+import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { validateRelativePath } from "../internal-urls/skill-protocol";
 import type { InternalResource } from "../internal-urls/types";
 import { normalizeLocalScheme } from "./path-utils";
@@ -162,12 +162,23 @@ async function resolveInternalUrlToPath(
 		return resolveSkillUrlToPath(url, skills);
 	}
 
+	// Managed artifact and agent resources carry session authority. Expanding
+	// either into a subprocess command would let that subprocess reopen, replace,
+	// or unlink the managed object by pathname. Keep those resources behind the
+	// internal reader boundary.
+	if (scheme === "artifact" || scheme === "agent") {
+		throw new ToolError(
+			`${scheme}:// URLs cannot be expanded in bash commands; read them through the internal reader instead.`,
+		);
+	}
+
 	if (scheme === "local") {
 		if (!localOptions) {
 			throw new ToolError(
 				"Cannot resolve local:// URL in bash command: local protocol options are unavailable for this session.",
 			);
 		}
+		await initializeLocalRoot(localOptions);
 		const resolvedLocalPath = resolveLocalUrlToPath(url, localOptions);
 		if (ensureLocalParentDirs) {
 			await fs.mkdir(path.dirname(resolvedLocalPath), { recursive: true });
@@ -215,8 +226,8 @@ export function expandSkillUrls(command: string, skills: readonly Skill[]): stri
 }
 
 /**
- * Expand supported internal URLs in a bash command string to shell-escaped absolute paths.
- * Supported schemes: skill://, agent://, artifact://, memory://, rule://, local://
+ * Expand filesystem-safe internal URLs in a bash command string. `agent://` and
+ * `artifact://` remain internal-reader-only and are rejected before resolution.
  */
 export async function expandInternalUrls(command: string, options: InternalUrlExpansionOptions): Promise<string> {
 	if (!command.includes("://") && !command.includes("local:/")) return command;

@@ -4,6 +4,8 @@
  * Automatically detects OAuth requirements from MCP server responses
  * and extracts authentication endpoints.
  */
+import type { AddressResolver, PublicUrlAccepted } from "../web/insane/url-guard";
+import { validatePublicHttpUrl } from "../web/insane/url-guard";
 
 export interface OAuthEndpoints {
 	authorizationUrl: string;
@@ -18,6 +20,16 @@ export interface AuthDetectionResult {
 	oauth?: OAuthEndpoints;
 	authServerUrl?: string;
 	message?: string;
+}
+
+interface OAuthDiscoveryOptions {
+	fetch?: (input: string | URL | Request, init?: BunFetchRequestInit) => Promise<Response>;
+	resolver?: AddressResolver;
+	maxRequests?: number;
+	maxNodes?: number;
+	maxRedirects?: number;
+	timeoutMs?: number;
+	signal?: AbortSignal;
 }
 
 function parseMcpAuthServerUrl(errorMessage: string): string | undefined {
@@ -194,17 +206,11 @@ export function analyzeAuthError(error: Error): AuthDetectionResult {
 		return { requiresAuth: false };
 	}
 
-	const authServerUrl = extractMcpAuthServerUrl(error);
-
-	// Try to extract OAuth endpoints
-	const oauth = extractOAuthEndpoints(error);
-
-	if (oauth) {
+	// Error text is useful for classification, but is not trusted discovery authority.
+	if (extractOAuthEndpoints(error) || extractMcpAuthServerUrl(error)) {
 		return {
 			requiresAuth: true,
 			authType: "oauth",
-			oauth,
-			authServerUrl,
 			message: "Server requires OAuth authentication. Launching authorization flow...",
 		};
 	}
@@ -220,7 +226,6 @@ export function analyzeAuthError(error: Error): AuthDetectionResult {
 		return {
 			requiresAuth: true,
 			authType: "apikey",
-			authServerUrl,
 			message: "Server requires API key authentication.",
 		};
 	}
@@ -229,7 +234,6 @@ export function analyzeAuthError(error: Error): AuthDetectionResult {
 	return {
 		requiresAuth: true,
 		authType: "unknown",
-		authServerUrl,
 		message: "Server requires authentication but type could not be determined.",
 	};
 }
@@ -241,6 +245,7 @@ export function analyzeAuthError(error: Error): AuthDetectionResult {
 export async function discoverOAuthEndpoints(
 	serverUrl: string,
 	authServerUrl?: string,
+	options: OAuthDiscoveryOptions = {},
 ): Promise<OAuthEndpoints | null> {
 	const wellKnownPaths = [
 		"/.well-known/oauth-authorization-server",
@@ -250,8 +255,82 @@ export async function discoverOAuthEndpoints(
 		"/.mcp/auth",
 		"/authorize", // Some MCP servers expose OAuth config here
 	];
-	const urlsToQuery = [authServerUrl, serverUrl].filter((value): value is string => Boolean(value));
-	const visitedAuthServers = new Set<string>();
+	const fetcher = options.fetch ?? globalThis.fetch;
+	const maxRequests = options.maxRequests ?? 32;
+	const maxNodes = options.maxNodes ?? 8;
+	const maxRedirects = options.maxRedirects ?? 3;
+	const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 10_000);
+	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+	const { promise: aborted, resolve: resolveAbort } = Promise.withResolvers<null>();
+	if (signal.aborted) resolveAbort(null);
+	else signal.addEventListener("abort", () => resolveAbort(null), { once: true });
+	const queue: string[] = [];
+	const queued = new Set<string>();
+	const visited = new Set<string>();
+	let requests = 0;
+
+	const canonicalUrl = (raw: string): string | null => {
+		try {
+			const url = new URL(raw);
+			url.hash = "";
+			return url.toString();
+		} catch {
+			return null;
+		}
+	};
+
+	const validateUrl = async (raw: string): Promise<PublicUrlAccepted | null> => {
+		const canonical = canonicalUrl(raw);
+		if (!canonical || signal.aborted) return null;
+		const result = await Promise.race([validatePublicHttpUrl(canonical, { resolver: options.resolver }), aborted]);
+		if (!result) return null;
+		return result.ok && !signal.aborted ? result : null;
+	};
+
+	const enqueue = async (raw: string): Promise<void> => {
+		const canonical = canonicalUrl(raw);
+		if (!canonical) return;
+		const authority = new URL(canonical).origin;
+		if (queued.has(authority) || visited.has(authority) || queued.size + visited.size >= maxNodes) return;
+		const accepted = await validateUrl(canonical);
+		if (!accepted) return;
+		queued.add(accepted.url.origin);
+		queue.push(accepted.url.origin);
+	};
+
+	const fetchMetadata = async (raw: string): Promise<Record<string, unknown> | null> => {
+		let current = raw;
+		for (let redirects = 0; redirects <= maxRedirects; redirects++) {
+			if (signal.aborted || requests >= maxRequests) return null;
+			const accepted = await validateUrl(current);
+			if (!accepted) return null;
+			const target = new URL(accepted.url);
+			const address = accepted.addresses[0];
+			target.hostname = address.includes(":") ? `[${address}]` : address;
+			requests++;
+			const response = await fetcher(target, {
+				method: "GET",
+				headers: { Accept: "application/json", Host: accepted.url.host },
+				redirect: "manual",
+				signal,
+				tls: accepted.url.protocol === "https:" ? { serverName: accepted.url.hostname } : undefined,
+			});
+			if ([301, 302, 303, 307, 308].includes(response.status)) {
+				const location = response.headers.get("Location");
+				if (!location || redirects === maxRedirects) return null;
+				current = new URL(location, accepted.url).toString();
+				continue;
+			}
+			if (!response.ok) return null;
+			return (await Promise.race([response.json(), aborted])) as Record<string, unknown> | null;
+		}
+		return null;
+	};
+
+	const server = await validateUrl(serverUrl);
+	if (!server) return null;
+	await enqueue(server.url.toString());
+	if (authServerUrl) await enqueue(authServerUrl);
 
 	const findEndpoints = (metadata: Record<string, unknown>): OAuthEndpoints | null => {
 		if (metadata.authorization_endpoint && metadata.token_endpoint) {
@@ -310,32 +389,43 @@ export async function discoverOAuthEndpoints(
 		return null;
 	};
 
-	for (const baseUrl of urlsToQuery) {
-		visitedAuthServers.add(baseUrl);
+	while (queue.length > 0 && !signal.aborted && requests < maxRequests) {
+		const baseUrl = queue.shift()!;
+		queued.delete(baseUrl);
+		if (visited.has(baseUrl)) continue;
+		visited.add(baseUrl);
 		for (const path of wellKnownPaths) {
 			try {
 				const url = new URL(path, baseUrl);
-				const response = await fetch(url.toString(), {
-					method: "GET",
-					headers: { Accept: "application/json" },
-				});
+				const metadata = await fetchMetadata(url.toString());
 
-				if (response.ok) {
-					const metadata = (await response.json()) as Record<string, unknown>;
+				if (metadata) {
 					const endpoints = findEndpoints(metadata);
-					if (endpoints) return endpoints;
+					if (endpoints) {
+						const issuer = typeof metadata.issuer === "string" ? canonicalUrl(metadata.issuer) : null;
+						const issuerBound = issuer === canonicalUrl(baseUrl);
+						const authorization = await validateUrl(endpoints.authorizationUrl);
+						const token = await validateUrl(endpoints.tokenUrl);
+						const legacySameOrigin =
+							!issuer && authorization?.url.origin === baseUrl && token?.url.origin === baseUrl;
+						if ((issuerBound || legacySameOrigin) && authorization && token) {
+							return {
+								...endpoints,
+								authorizationUrl: authorization.url.toString(),
+								tokenUrl: token.url.toString(),
+							};
+						}
+					}
 
 					if (path === "/.well-known/oauth-protected-resource") {
+						const resource = typeof metadata.resource === "string" ? canonicalUrl(metadata.resource) : null;
+						if (resource !== canonicalUrl(server.url.toString())) continue;
 						const authServers = Array.isArray(metadata.authorization_servers)
 							? metadata.authorization_servers.filter((entry): entry is string => typeof entry === "string")
 							: [];
 
 						for (const discoveredAuthServer of authServers) {
-							if (visitedAuthServers.has(discoveredAuthServer)) {
-								continue;
-							}
-							const discovered = await discoverOAuthEndpoints(serverUrl, discoveredAuthServer);
-							if (discovered) return discovered;
+							await enqueue(discoveredAuthServer);
 						}
 					}
 				}

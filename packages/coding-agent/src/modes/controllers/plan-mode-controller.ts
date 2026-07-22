@@ -334,6 +334,7 @@ export class PlanModeController {
 		return planFilePath.startsWith("local:")
 			? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), {
 					getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
+					isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
 					getSessionId: () => this.ctx.sessionManager.getSessionId(),
 				})
 			: path.resolve(this.ctx.sessionManager.getCwd(), planFilePath);
@@ -448,6 +449,7 @@ export class PlanModeController {
 					await Bun.write(
 						resolveLocalUrlToPath(options.finalPlanFilePath, {
 							getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
+							isManagedDestination: () => this.ctx.sessionManager.isManagedDestination(),
 							getSessionId: () => this.ctx.sessionManager.getSessionId(),
 						}),
 						planContent,

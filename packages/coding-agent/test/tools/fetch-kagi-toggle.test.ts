@@ -493,7 +493,7 @@ describe("read tool URL handling", () => {
 		void hook;
 	});
 
-	it("uses section-scoped llms.txt fallback without requesting the site-wide file", async () => {
+	it("does not use subprocess output to trigger an llms.txt refetch", async () => {
 		const session = createSession();
 		const tool = new ReadTool(session);
 		const pageUrl = "https://example.com/docs/reference/widget";
@@ -564,18 +564,17 @@ describe("read tool URL handling", () => {
 		const requestedUrls = loadPageSpy.mock.calls.map(([requestedUrl]) => requestedUrl);
 		const textBlock = result.content.find(content => content.type === "text");
 
-		expect(result.details?.method).toBe("llms.txt");
-		expect(result.details?.notes).toContain("Used llms.txt fallback: https://example.com/docs/llms.txt");
+		expect(result.details?.method).toBe("raw-html");
 		expect(textBlock?.type).toBe("text");
-		expect(textBlock?.text).toContain("Section-scoped fallback");
-		expect(requestedUrls).toContain("https://example.com/docs/llms.txt");
+		expect(textBlock?.text).toContain("Widget");
+		expect(requestedUrls).not.toContain("https://example.com/docs/llms.txt");
 		expect(requestedUrls).not.toContain("https://example.com/.well-known/llms.txt");
 		expect(requestedUrls).not.toContain("https://example.com/llms.txt");
 		expect(requestedUrls).not.toContain("https://example.com/llms.md");
 		void missingSystemPython;
 		void hook;
 	});
-	it("prefers Parallel extract before other HTML renderers when configured", async () => {
+	it("does not hand fetched HTML URLs to Parallel when configured", async () => {
 		process.env.PARALLEL_API_KEY = "test-parallel-key";
 		const session = createSession();
 		const tool = new ReadTool(session);
@@ -644,11 +643,11 @@ describe("read tool URL handling", () => {
 		const result = await tool.execute("fetch-parallel-html", { path: pageUrl });
 		const textBlock = result.content.find(content => content.type === "text");
 
-		expect(result.details?.method).toBe("parallel");
+		expect(result.details?.method).toBe("raw-html");
 		expect(textBlock?.type).toBe("text");
-		expect(textBlock?.text).toContain("Parallel-rendered content");
+		expect(textBlock?.text).toContain("Parallel Page");
 		expect(ensureToolSpy).not.toHaveBeenCalled();
-		expect(htmlToMarkdownSpy).not.toHaveBeenCalled();
+		expect(htmlToMarkdownSpy).toHaveBeenCalledTimes(1);
 		void parallelExtractHook;
 	});
 

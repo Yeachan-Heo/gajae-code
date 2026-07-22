@@ -71,6 +71,7 @@ async function createFakeTmuxBin(
 	options: {
 		failDisplay?: boolean;
 		failSplit?: boolean;
+		failLeaderPaneSplit?: boolean;
 		gjcProfile?: boolean;
 		untaggableProfile?: boolean;
 		commandName?: string;
@@ -129,6 +130,17 @@ case "$1" in
     ;;
   split-window)
     ${options.failSplit ? "echo split failed >&2; exit 1" : ""}
+    target=""
+    for ((i=1; i<=$#; i++)); do
+      if [ "\${!i}" = "-t" ]; then
+        next=$((i + 1))
+        target="\${!next}"
+      fi
+    done
+    if [ "${options.failLeaderPaneSplit ? "1" : "0"}" = "1" ] && [ "$target" = "%1" ]; then
+      echo "can't find pane: %1" >&2
+      exit 1
+    fi
     count_file=${JSON.stringify(path.join(root, "tmux-split-count"))}
     count=0
     if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
@@ -849,7 +861,7 @@ describe("native gjc team runtime", () => {
 		}
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
 		expect(tmuxLog).toContain("display-message -p #S:#I #{pane_id}");
-		expect(tmuxLog).toContain("split-window -h -t %1 -d -P -F #{pane_id}");
+		expect(tmuxLog).toContain("split-window -h -t test-session:0 -d -P -F #{pane_id}");
 		expect(tmuxLog).toContain("worker-startup-ack");
 		expect(tmuxLog).toContain("protocol_version");
 		expect(tmuxLog).toContain("claim-task/transition-task-status");
@@ -943,12 +955,37 @@ describe("native gjc team runtime", () => {
 		expect(snapshot.workers).toHaveLength(2);
 		expect(snapshot.workers.map(worker => worker.id)).toEqual(["worker-1", "worker-2"]);
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
-		expect(tmuxLog).toContain("split-window -h -t %1");
+		expect(tmuxLog).toContain("split-window -h -t test-session:0");
 		expect(tmuxLog).toContain("split-window -v -t %2");
 		expect(tmuxLog).toContain("GJC_TEAM_WORKER='multi-team/worker-1'");
 		expect(tmuxLog).toContain("GJC_TEAM_WORKER='multi-team/worker-2'");
 		expect(tmuxLog).not.toContain("send-keys -l");
 		expect(tmuxLog).not.toContain("new-session");
+	});
+
+	it("starts workers from the stable team window when the captured leader pane is stale", async () => {
+		cleanupRoot = await createGitRepo();
+		const fakeTmux = await createFakeTmuxBin(cleanupRoot, { failLeaderPaneSplit: true });
+
+		const snapshot = await startGjcTeam({
+			workerCount: 2,
+			agentType: "executor",
+			task: "Start workers after leader pane replacement",
+			teamName: "stale-leader-pane-team",
+			cwd: cleanupRoot,
+			env: {
+				GJC_SESSION_ID: TEST_SESSION_ID,
+				PATH: process.env.PATH ?? "",
+				GJC_TEAM_WORKER_COMMAND: "true",
+				GJC_TEAM_TMUX_COMMAND: fakeTmux,
+			},
+		});
+
+		expect(snapshot.phase).toBe("running");
+		expect(snapshot.workers.map(worker => worker.pane_id)).toEqual(["%2", "%3"]);
+		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
+		expect(tmuxLog).toContain("split-window -h -t test-session:0");
+		expect(tmuxLog).toContain("split-window -v -t %2");
 	});
 
 	it("keeps psmux worker startup on empty-pane send-keys fallback", async () => {
@@ -973,7 +1010,7 @@ describe("native gjc team runtime", () => {
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
 		const splitLines = tmuxLog.split(/\r?\n/).filter(line => line.startsWith("split-window"));
 		expect(splitLines).toHaveLength(1);
-		expect(splitLines[0]).toContain("split-window -h -t %1 -d -P -F #{pane_id} -c ");
+		expect(splitLines[0]).toContain("split-window -h -t test-session:0 -d -P -F #{pane_id} -c ");
 		expect(splitLines[0]).not.toContain("worker-startup-ack");
 		expect(tmuxLog).toContain("send-keys -l -t %2");
 		expect(tmuxLog).toContain("worker-startup-ack");
@@ -1007,7 +1044,7 @@ describe("native gjc team runtime", () => {
 		expect(workerPath).not.toContain(`${path.sep}state${path.sep}team${path.sep}`);
 
 		const tmuxLog = await Bun.file(path.join(cleanupRoot, "tmux.log")).text();
-		expect(tmuxLog).toContain("split-window -h -t %1 -d -P -F #{pane_id} -c ");
+		expect(tmuxLog).toContain("split-window -h -t test-session:0 -d -P -F #{pane_id} -c ");
 		expect(tmuxLog).toContain("send-keys -l -t %2");
 	});
 	it("distributes explicit markdown lane sections into worker-owned initial tasks", async () => {

@@ -11,11 +11,13 @@
  * touches a live owner's lock/state and never kills a process.
  */
 import * as crypto from "node:crypto";
+import type { WriteFileOptions } from "node:fs";
 import * as fsSync from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import type { Settings } from "../../config/settings";
+import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
 import {
 	getNotificationConfig,
 	isDiscordConfigured,
@@ -67,6 +69,66 @@ export interface NotificationExactUnlinkResult {
 	ok: boolean;
 	code?: string;
 	detachedPath?: string;
+	/** A live publisher successor retained after an exact-unlink race. */
+	retainedSuccessorPath?: string;
+	/** An internal exchange placeholder whose verified cleanup failed. */
+	retainedPlaceholderPath?: string;
+	/** A cleanup entry whose identity could not be verified after a race. */
+	retainedUnknownPath?: string;
+}
+
+/** Read one regular file together with the identity required for exact removal. */
+export async function readNotificationEndpointFile(file: string): Promise<NotificationEndpointFile> {
+	const before = await fsPromises.lstat(file, { bigint: true });
+	if (!before.isFile() || before.isSymbolicLink()) throw new Error("Endpoint is not a regular file");
+	const noFollow = fsSync.constants.O_NOFOLLOW;
+	const handle = await fsPromises.open(file, fsSync.constants.O_RDONLY | (noFollow ?? 0));
+	try {
+		const opened = await handle.stat({ bigint: true });
+		if (!opened.isFile() || !sameEndpointFileMetadata(before, opened))
+			throw new Error("Endpoint changed before it was opened");
+		const bytes = await handle.readFile();
+		const after = await handle.stat({ bigint: true });
+		const pathname = await fsPromises.lstat(file, { bigint: true });
+		if (
+			!after.isFile() ||
+			!pathname.isFile() ||
+			pathname.isSymbolicLink() ||
+			!sameEndpointFileMetadata(opened, after) ||
+			!sameEndpointFileMetadata(opened, pathname)
+		)
+			throw new Error("Endpoint changed while it was read");
+		return {
+			bytes,
+			identity: {
+				dev: opened.dev,
+				ino: opened.ino,
+				size: opened.size,
+				mtimeNs: opened.mtimeNs,
+				sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+			},
+		};
+	} finally {
+		await handle.close();
+	}
+}
+/** Bump when the native exact-deletion identity contract changes. */
+export const NATIVE_PATH_IDENTITY_CONTRACT_VERSION = 1;
+
+export function exactUnlinkNotificationFile(
+	file: string,
+	identity: NotificationEndpointFileIdentity,
+	quarantineName: string,
+): NotificationExactUnlinkResult {
+	const result = native.exactUnlink(file, { ...identity, quarantineName });
+	return {
+		ok: result.ok,
+		code: result.code,
+		detachedPath: result.detachedPath,
+		retainedSuccessorPath: result.retainedSuccessorPath,
+		retainedPlaceholderPath: result.retainedPlaceholderPath,
+		retainedUnknownPath: result.retainedUnknownPath,
+	};
 }
 
 /** Minimal filesystem surface the service needs; injectable for tests. */
@@ -76,69 +138,19 @@ export interface NotificationServiceFs {
 	readEndpointFile(file: string): Promise<NotificationEndpointFile>;
 	exactUnlink(file: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
 	unlink(file: string): Promise<void>;
-	/**
-	 * Atomically create `file` with O_EXCL semantics: resolves `true` when this
-	 * call created it, `false` when it already existed. Used to hold the daemon
-	 * steal-mutex ({@link DaemonPaths.steal}) during owner-bound lock removal so
-	 * recovery and a concurrent daemon takeover are mutually exclusive.
-	 */
-	createExclusive(file: string): Promise<boolean>;
+	writeFile?(file: string, data: string, opts?: WriteFileOptions): Promise<void>;
+	stat?(file: string): Promise<{ mtimeMs: number }>;
 }
 
 const nodeServiceFs: NotificationServiceFs = {
 	readdir: dir => fsPromises.readdir(dir),
 	readFile: (file, encoding) => fsPromises.readFile(file, encoding),
-	readEndpointFile: async file => {
-		const before = await fsPromises.lstat(file, { bigint: true });
-		if (!before.isFile() || before.isSymbolicLink()) throw new Error("Endpoint is not a regular file");
-		const noFollow = fsSync.constants.O_NOFOLLOW;
-		const handle = await fsPromises.open(file, fsSync.constants.O_RDONLY | (noFollow ?? 0));
-		try {
-			const opened = await handle.stat({ bigint: true });
-			if (!opened.isFile() || !sameEndpointFileMetadata(before, opened))
-				throw new Error("Endpoint changed before it was opened");
-			const bytes = await handle.readFile();
-			const after = await handle.stat({ bigint: true });
-			const pathname = await fsPromises.lstat(file, { bigint: true });
-			if (
-				!after.isFile() ||
-				!pathname.isFile() ||
-				pathname.isSymbolicLink() ||
-				!sameEndpointFileMetadata(opened, after) ||
-				!sameEndpointFileMetadata(opened, pathname)
-			)
-				throw new Error("Endpoint changed while it was read");
-			return {
-				bytes,
-				identity: {
-					dev: opened.dev,
-					ino: opened.ino,
-					size: opened.size,
-					mtimeNs: opened.mtimeNs,
-					sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-				},
-			};
-		} finally {
-			await handle.close();
-		}
-	},
-	exactUnlink: async (file, identity) => {
-		const result = native.exactUnlink(file, {
-			...identity,
-			quarantineName: `.gjc-delete-notification-endpoint-${crypto.randomUUID()}.json`,
-		});
-		return { ok: result.ok, code: result.code, detachedPath: result.detachedPath };
-	},
+	readEndpointFile: readNotificationEndpointFile,
+	exactUnlink: async (file, identity) =>
+		exactUnlinkNotificationFile(file, identity, `.gjc-delete-notification-endpoint-${crypto.randomUUID()}.json`),
 	unlink: file => fsPromises.unlink(file),
-	createExclusive: async file => {
-		try {
-			const handle = await fsPromises.open(file, "wx", 0o600);
-			await handle.close();
-			return true;
-		} catch {
-			return false;
-		}
-	},
+	writeFile: (file, data, opts) => fsPromises.writeFile(file, data, opts),
+	stat: file => fsPromises.stat(file),
 };
 
 /** Injectable dependencies shared across service operations. */
@@ -239,18 +251,28 @@ export function formatNotificationStatusReport(report: NotificationStatusReport)
 
 // --- endpoint / daemon file readers -------------------------------------
 
-interface EndpointView {
+export interface NotificationEndpointView {
 	sessionId: string;
 	pid: number | undefined;
 	stale: boolean;
 }
 
-type EndpointFileRead =
-	| { kind: "endpoint"; view: EndpointView; identity: NotificationEndpointFileIdentity }
+export type NotificationEndpointLiveness = "live" | "dead" | "unknown";
+
+/**
+ * Classification used by recovery and startup takeover. A file is an endpoint
+ * only when it has endpoint authority fields; lifecycle/audit records are never
+ * candidates for endpoint cleanup.
+ */
+export type NotificationEndpointClassification =
+	| {
+			kind: "endpoint";
+			view: NotificationEndpointView;
+			liveness: NotificationEndpointLiveness;
+			identity: NotificationEndpointFileIdentity;
+	  }
 	| { kind: "non-endpoint" }
 	| { kind: "unreadable" };
-
-type EndpointLiveness = "live" | "dead" | "unknown";
 
 /**
  * Classify an endpoint using owner-proof semantics. An endpoint is only `dead`
@@ -259,7 +281,10 @@ type EndpointLiveness = "live" | "dead" | "unknown";
  * must never be treated as dead — removing it could delete a live session's
  * discovery file that simply omitted a pid.
  */
-function endpointLiveness(view: EndpointView, pidAlive: (pid: number) => boolean): EndpointLiveness {
+export function notificationEndpointLiveness(
+	view: NotificationEndpointView,
+	pidAlive: (pid: number) => boolean,
+): NotificationEndpointLiveness {
 	if (view.stale) return "dead";
 	if (view.pid === undefined) return "unknown";
 	return pidAlive(view.pid) ? "live" : "dead";
@@ -302,11 +327,19 @@ function isCanonicalLifecycleArtifactName(name: string): boolean {
 	);
 }
 
-function unreadableEndpointResult(file: string): EndpointFileRead {
+function unreadableEndpointResult(file: string): NotificationEndpointClassification {
 	return isCanonicalLifecycleArtifactName(path.basename(file)) ? { kind: "non-endpoint" } : { kind: "unreadable" };
 }
 
-async function readEndpointView(fs: NotificationServiceFs, file: string): Promise<EndpointFileRead> {
+/**
+ * Read and classify one endpoint candidate. The returned identity belongs to
+ * exactly the bytes inspected and is required for any later deletion.
+ */
+export async function classifyNotificationEndpoint(
+	fs: Pick<NotificationServiceFs, "readEndpointFile">,
+	file: string,
+	pidAlive: (pid: number) => boolean,
+): Promise<NotificationEndpointClassification> {
 	let endpoint: NotificationEndpointFile;
 	let raw: string;
 	try {
@@ -322,16 +355,19 @@ async function readEndpointView(fs: NotificationServiceFs, file: string): Promis
 		return unreadableEndpointResult(file);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "non-endpoint" };
+	if (path.basename(file) === "broker.json") return { kind: "non-endpoint" };
 	const rec = parsed as Record<string, unknown>;
 	if (isLifecycleArtifact(rec) || typeof rec.url !== "string" || typeof rec.token !== "string")
 		return { kind: "non-endpoint" };
+	const view: NotificationEndpointView = {
+		sessionId: typeof rec.sessionId === "string" ? rec.sessionId : path.basename(file, ".json"),
+		pid: safePositiveInteger(rec.pid),
+		stale: rec.stale === true,
+	};
 	return {
 		kind: "endpoint",
-		view: {
-			sessionId: typeof rec.sessionId === "string" ? rec.sessionId : path.basename(file, ".json"),
-			pid: safePositiveInteger(rec.pid),
-			stale: rec.stale === true,
-		},
+		view,
+		liveness: notificationEndpointLiveness(view, pidAlive),
 		identity: endpoint.identity,
 	};
 }
@@ -592,14 +628,13 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 	let unknownEndpoints = 0;
 	let unreadable = 0;
 	for (const name of files) {
-		const record = await readEndpointView(fs, path.join(dir, name));
+		const record = await classifyNotificationEndpoint(fs, path.join(dir, name), pidAlive);
 		if (record.kind === "non-endpoint") continue;
 		if (record.kind === "unreadable") {
 			unreadable += 1;
 			continue;
 		}
-		const view = record.view;
-		switch (endpointLiveness(view, pidAlive)) {
+		switch (record.liveness) {
 			case "live":
 				live += 1;
 				break;
@@ -766,6 +801,12 @@ export interface NotificationRecoveryReport {
 	endpointsKept: number;
 	endpointsUnreadable: number;
 	endpointsDetached?: string[];
+	/** Successor paths retained after an exact-unlink race, distinct from stale quarantines. */
+	endpointsRetainedSuccessors?: string[];
+	/** Internal exchange placeholders retained after verified cleanup failure. */
+	endpointsRetainedPlaceholders?: string[];
+	/** Cleanup entries retained with unverified or mismatching identity. */
+	endpointsRetainedUnknown?: string[];
 	daemon: {
 		action: DaemonRecoveryAction;
 		detail: string;
@@ -778,6 +819,179 @@ export interface RecoveryOptions {
 	settings: Settings;
 	stateRoot?: string;
 	deps?: NotificationServiceDeps;
+}
+
+export interface DaemonTransitionLock {
+	pid: number;
+	incarnation: string;
+	createdAt: number;
+	/** Unique fencing generation for this particular transition acquisition. */
+	token: string;
+}
+
+function isDaemonTransitionLock(value: unknown): value is DaemonTransitionLock {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as Record<string, unknown>;
+	return (
+		Number.isSafeInteger(candidate.pid) &&
+		(candidate.pid as number) > 0 &&
+		typeof candidate.incarnation === "string" &&
+		typeof candidate.createdAt === "number" &&
+		typeof candidate.token === "string" &&
+		candidate.token.length > 0
+	);
+}
+
+interface TransitionMarkerSnapshot {
+	raw: string;
+	identity?: NotificationEndpointFileIdentity;
+}
+
+type TransitionMarkerFs = {
+	readFile(file: string, encoding: "utf8"): Promise<string>;
+	writeFile?(file: string, data: string, opts?: WriteFileOptions): Promise<void>;
+	readEndpointFile?(file: string): Promise<NotificationEndpointFile>;
+	exactUnlink?(file: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
+};
+
+async function readTransitionMarker(
+	fs: TransitionMarkerFs,
+	path: string,
+): Promise<TransitionMarkerSnapshot | undefined> {
+	if (fs.readEndpointFile) {
+		const exact = await fs.readEndpointFile(path).catch(() => undefined);
+		if (!exact) return undefined;
+		return { raw: exact.bytes.toString("utf8"), identity: exact.identity };
+	}
+	const raw = await fs.readFile(path, "utf8").catch(() => undefined);
+	if (raw === undefined) return undefined;
+	return { raw };
+}
+
+function transitionMarkerMatchesLock(snapshot: TransitionMarkerSnapshot, lock: DaemonTransitionLock): boolean {
+	try {
+		const current = JSON.parse(snapshot.raw);
+		return (
+			isDaemonTransitionLock(current) &&
+			current.pid === lock.pid &&
+			current.incarnation === lock.incarnation &&
+			current.token === lock.token
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** True only while the exact transition acquisition still occupies the marker path. */
+export async function daemonTransitionLockIsHeld(input: {
+	fs: Pick<TransitionMarkerFs, "readFile" | "readEndpointFile">;
+	path: string;
+	lock: DaemonTransitionLock;
+}): Promise<boolean> {
+	const snapshot = await readTransitionMarker(input.fs, input.path);
+	return Boolean(snapshot && transitionMarkerMatchesLock(snapshot, input.lock));
+}
+
+/** Atomically detaches only the captured transition marker, never a pathname successor. */
+async function detachTransitionMarker(
+	fs: TransitionMarkerFs,
+	path: string,
+	snapshot: TransitionMarkerSnapshot,
+): Promise<boolean> {
+	if (!snapshot.identity || !fs.exactUnlink) return false;
+	try {
+		return (await fs.exactUnlink(path, snapshot.identity)).ok;
+	} catch {
+		return false;
+	}
+}
+
+/** Removes only the caller's exact marker through the identity-bound detach primitive. */
+export async function releaseDaemonTransitionLock(input: {
+	fs: TransitionMarkerFs;
+	path: string;
+	lock: DaemonTransitionLock;
+}): Promise<boolean> {
+	const snapshot = await readTransitionMarker(input.fs, input.path);
+	if (!snapshot || !transitionMarkerMatchesLock(snapshot, input.lock)) return false;
+	return await detachTransitionMarker(input.fs, input.path, snapshot);
+}
+
+/**
+ * Acquire the daemon lifecycle transition lock using durable owner metadata.
+ * The full marker is published in the single O_EXCL write which reserves it;
+ * canonical markers are detached only through their captured filesystem identity.
+ *
+ * Malformed and empty markers deliberately remain blocked regardless of age. They
+ * have no owner provenance, so reclaiming them could detach a generation-6 empty
+ * reservation while its paused legacy writer can still resume. Operators must
+ * manually clean up such legacy debris after confirming no legacy process remains.
+ */
+export async function acquireDaemonTransitionLock(input: {
+	fs: TransitionMarkerFs;
+	path: string;
+	pid: number;
+	pidAlive: (pid: number) => boolean;
+	pidIncarnation: (pid: number) => string | undefined;
+	now?: () => number;
+	sleep?: (ms: number) => Promise<void>;
+	retries?: number;
+	retryDelayMs?: number;
+	randomToken?: () => string;
+}): Promise<DaemonTransitionLock | undefined> {
+	const sleep = input.sleep ?? (async (ms: number) => await Bun.sleep(ms));
+	const now = input.now ?? Date.now;
+	const retries = Math.max(input.retries ?? 5, 0);
+	const retryDelayMs = Math.max(input.retryDelayMs ?? 20, 0);
+	const incarnation = input.pidIncarnation(input.pid);
+	if (!isProcessIncarnation(incarnation)) return undefined;
+	const token = input.randomToken?.() ?? crypto.randomUUID();
+	if (!token || !input.fs.writeFile || !input.fs.readEndpointFile || !input.fs.exactUnlink) return undefined;
+	const owner: DaemonTransitionLock = { pid: input.pid, incarnation, createdAt: now(), token };
+	for (let attempt = 0; attempt <= retries; attempt++) {
+		try {
+			await input.fs.writeFile(input.path, `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: "wx" });
+			return owner;
+		} catch (error) {
+			if (["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			} else throw error;
+		}
+		const snapshot = await readTransitionMarker(input.fs, input.path);
+		let current: unknown;
+		try {
+			current = snapshot === undefined ? undefined : JSON.parse(snapshot.raw);
+		} catch {
+			current = undefined;
+		}
+		// Only canonical owner records prove which process may be reclaimed. An
+		// unreadable or empty legacy reservation is intentionally not age-reclaimed:
+		// it may belong to a paused generation-6 two-step publisher.
+		const ownerAlive = isDaemonTransitionLock(current) && input.pidAlive(current.pid);
+		const ownerIncarnation = isDaemonTransitionLock(current) ? input.pidIncarnation(current.pid) : undefined;
+		const reclaimable =
+			isDaemonTransitionLock(current) &&
+			(!ownerAlive ||
+				(isProcessIncarnation(current.incarnation) &&
+					isProcessIncarnation(ownerIncarnation) &&
+					ownerIncarnation !== current.incarnation));
+		if (snapshot && reclaimable) await detachTransitionMarker(input.fs, input.path, snapshot);
+		if (attempt < retries) await sleep(retryDelayMs);
+	}
+	return undefined;
+}
+
+function defaultTransitionPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function defaultTransitionPidIncarnation(pid: number): string | undefined {
+	return processIncarnation(pid);
 }
 
 /**
@@ -795,13 +1009,21 @@ async function removeDeadOwnerLock(
 	pidAlive: (pid: number) => boolean,
 	expected: NormalizedDaemonState,
 ): Promise<"cleared" | "contended" | "superseded" | "now-alive" | "unlink-failed"> {
-	if (!(await fs.createExclusive(paths.steal))) return "contended";
+	const transition = await acquireDaemonTransitionLock({
+		fs,
+		path: paths.steal,
+		pid: process.pid,
+		pidAlive: defaultTransitionPidAlive,
+		pidIncarnation: defaultTransitionPidIncarnation,
+	});
+	if (!transition) return "contended";
 	try {
 		const current = await readDaemonStateFile(fs, paths.state);
 		if (!current || current.ownerId !== expected.ownerId || current.pid !== expected.pid) {
 			return "superseded";
 		}
 		if (pidAlive(current.pid)) return "now-alive";
+		if (!(await daemonTransitionLockIsHeld({ fs, path: paths.steal, lock: transition }))) return "contended";
 		try {
 			await fs.unlink(paths.lock);
 			return "cleared";
@@ -809,7 +1031,7 @@ async function removeDeadOwnerLock(
 			return "unlink-failed";
 		}
 	} finally {
-		await fs.unlink(paths.steal).catch(() => undefined);
+		await releaseDaemonTransitionLock({ fs, path: paths.steal, lock: transition });
 	}
 }
 
@@ -833,11 +1055,15 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	const files = await listEndpointFiles(fs, dir);
 	const removed: RecoveredEndpoint[] = [];
 	const detached: string[] = [];
+	const retainedSuccessors: string[] = [];
+	const retainedPlaceholders: string[] = [];
+	const retainedUnknown: string[] = [];
+	let recoveryFailures = 0;
 	let kept = 0;
 	let unreadable = 0;
 	for (const name of files) {
 		const file = path.join(dir, name);
-		const record = await readEndpointView(fs, file);
+		const record = await classifyNotificationEndpoint(fs, file, pidAlive);
 		if (record.kind === "non-endpoint") continue;
 		if (record.kind === "unreadable") {
 			// Leave unparseable files untouched: they may be mid-write by a live server.
@@ -845,7 +1071,7 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 			continue;
 		}
 		const view = record.view;
-		if (endpointLiveness(view, pidAlive) !== "dead") {
+		if (record.liveness !== "dead") {
 			// Keep live AND unknown (PID-less) endpoints: only positive proof of
 			// death (a stale tombstone or a dead pid) authorizes removal.
 			kept += 1;
@@ -854,8 +1080,18 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		try {
 			const result = await fs.exactUnlink(file, record.identity);
 			if (!result.ok) {
+				recoveryFailures += 1;
 				if (result.detachedPath) detached.push(result.detachedPath);
-				else kept += 1;
+				if (result.retainedSuccessorPath) retainedSuccessors.push(result.retainedSuccessorPath);
+				if (result.retainedPlaceholderPath) retainedPlaceholders.push(result.retainedPlaceholderPath);
+				if (result.retainedUnknownPath) retainedUnknown.push(result.retainedUnknownPath);
+				if (
+					!result.detachedPath &&
+					!result.retainedSuccessorPath &&
+					!result.retainedPlaceholderPath &&
+					!result.retainedUnknownPath
+				)
+					kept += 1;
 				continue;
 			}
 			removed.push({
@@ -928,11 +1164,14 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	}
 
 	return {
-		endpointsScanned: removed.length + kept + unreadable + detached.length,
+		endpointsScanned: removed.length + kept + unreadable + recoveryFailures,
 		endpointsRemoved: removed,
 		endpointsKept: kept,
 		endpointsUnreadable: unreadable,
 		endpointsDetached: detached,
+		endpointsRetainedSuccessors: retainedSuccessors,
+		endpointsRetainedPlaceholders: retainedPlaceholders,
+		endpointsRetainedUnknown: retainedUnknown,
 		daemon,
 	};
 }
@@ -941,12 +1180,18 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 export function formatNotificationRecoveryReport(report: NotificationRecoveryReport): string {
 	const lines = ["Notification recovery"];
 	lines.push(
-		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}, detached ${report.endpointsDetached?.length ?? 0}`,
+		`  endpoints: scanned ${report.endpointsScanned}, removed ${report.endpointsRemoved.length}, kept ${report.endpointsKept}, unreadable ${report.endpointsUnreadable}, detached ${report.endpointsDetached?.length ?? 0}, retained successors ${report.endpointsRetainedSuccessors?.length ?? 0}, retained placeholders ${report.endpointsRetainedPlaceholders?.length ?? 0}, retained unknown ${report.endpointsRetainedUnknown?.length ?? 0}`,
 	);
 	for (const ep of report.endpointsRemoved) {
 		lines.push(`    - removed ${ep.sessionId} (pid ${ep.pid ?? "?"}, ${ep.reason})`);
 	}
 	for (const detached of report.endpointsDetached ?? []) lines.push(`    - retained detached endpoint ${detached}`);
+	for (const successor of report.endpointsRetainedSuccessors ?? [])
+		lines.push(`    - retained successor endpoint ${successor}`);
+	for (const placeholder of report.endpointsRetainedPlaceholders ?? [])
+		lines.push(`    - retained exchange placeholder cleanup path ${placeholder}`);
+	for (const unknown of report.endpointsRetainedUnknown ?? [])
+		lines.push(`    - retained unverified cleanup path ${unknown}`);
 	lines.push(`  daemon: ${report.daemon.action} — ${report.daemon.detail}`);
 	return lines.join("\n");
 }

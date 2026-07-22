@@ -5,7 +5,7 @@ export { isRecord };
 import { ToolAbortError } from "../../tools/tool-errors";
 import { convertBufferWithMarkit } from "../../utils/markit";
 import type { AddressResolver } from "../insane/url-guard";
-import { validatePublicHttpUrl } from "../insane/url-guard";
+import { guardedPublicFetch } from "../insane/url-guard";
 import { MAX_BYTES } from "./types";
 
 export function asRecord(value: unknown): Record<string, unknown> | null {
@@ -70,16 +70,6 @@ async function readResponseWithLimit(response: Response, maxBytes: number, signa
 	return new Uint8Array(Buffer.concat(chunks, totalBytes));
 }
 
-async function guardPublicBinaryUrl(
-	rawUrl: string,
-	resolver: AddressResolver | undefined,
-	context: string,
-): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
-	const guard = await validatePublicHttpUrl(rawUrl, { resolver });
-	if (guard.ok) return { ok: true, url: guard.url.toString() };
-	return { ok: false, error: `${context}: target URL is not public HTTP(S): ${guard.reason}` };
-}
-
 /**
  * Fetch binary content from a URL
  */
@@ -93,32 +83,28 @@ export async function fetchBinary(
 	const { publicUrlGuard = true, resolver, maxRedirects = 10 } = options;
 	try {
 		let currentUrl = url;
-		if (publicUrlGuard) {
-			const guarded = await guardPublicBinaryUrl(url, resolver, "Blocked binary fetch");
-			if (!guarded.ok) return { ok: false, error: guarded.error };
-			currentUrl = guarded.url;
-		}
 
 		for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount++) {
-			const response = await fetch(currentUrl, {
+			const requestInit: BunFetchRequestInit = {
 				signal: requestSignal,
 				headers: {
 					"User-Agent": "Mozilla/5.0 (compatible; TextBot/1.0)",
 				},
 				redirect: "manual",
-			});
+			};
+			const dial = publicUrlGuard
+				? await guardedPublicFetch(currentUrl, requestInit, { resolver })
+				: { ok: true as const, response: await fetch(currentUrl, requestInit), logicalUrl: new URL(currentUrl) };
+			if (!dial.ok) {
+				return { ok: false, error: `Blocked binary fetch: target URL is not public HTTP(S): ${dial.reason}` };
+			}
+			const { response } = dial;
+			const logicalUrl = dial.logicalUrl.toString();
 
 			if (REDIRECT_STATUSES.has(response.status)) {
 				const location = response.headers.get("location");
 				if (!location) return { ok: false, error: "Redirect response missing Location header" };
-				const redirectUrl = new URL(location, currentUrl).toString();
-				if (publicUrlGuard) {
-					const guarded = await guardPublicBinaryUrl(redirectUrl, resolver, "Blocked binary redirect");
-					if (!guarded.ok) return { ok: false, error: guarded.error };
-					currentUrl = guarded.url;
-				} else {
-					currentUrl = redirectUrl;
-				}
+				currentUrl = new URL(location, logicalUrl).toString();
 				continue;
 			}
 

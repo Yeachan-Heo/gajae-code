@@ -25,7 +25,7 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `action` | string enum | Yes | One of `diagnostics`, `definition`, `references`, `hover`, `symbols`, `rename`, `rename_file`, `code_actions`, `type_definition`, `implementation`, `status`, `reload`, `capabilities`, `request`. |
-| `file` | string | No | File path; for `diagnostics` also a glob; for workspace forms use `"*"`; for `rename_file` this is the source path. |
+| `file` | string | No | File path; for `diagnostics` also a glob; for supported workspace forms use `"*"`; for `rename_file` this is the source path. |
 | `line` | number | No | 1-indexed line number for position-based actions. Defaults to `1` on the single-file action path. |
 | `symbol` | string | No | Substring used to resolve the column on `line`. Supports `name#N` occurrence selectors; `N` is 1-indexed and defaults to `1`. |
 | `query` | string | No | Workspace symbol query, code-action selector/filter, or LSP method name for `action=request`. |
@@ -51,14 +51,14 @@
 6. `getOrCreateClient()` in `client.ts` creates one process per trusted `command:cwd` launch definition, optionally wraps supported commands with `lspmux`, spawns the server, starts the background message reader, sends `initialize`, stores server capabilities, then sends `initialized`.
 7. The message reader in `client.ts` parses LSP frames, resolves pending requests, caches `publishDiagnostics`, tracks `$/progress` tokens for project-load completion, answers `workspace/configuration`, and applies `workspace/applyEdit` requests through `applyWorkspaceEdit()`.
 8. File-scoped actions call `ensureFileOpen()` before requests. Column resolution uses `resolveSymbolColumn()` from `utils.ts`: read the target file, pick first non-whitespace when `symbol` is omitted, otherwise find the exact or case-insensitive match on the target line and honor `#N` occurrence selectors.
-9. Actions dispatch in `LspTool.execute()` through dedicated branches: workspace-only branches (`status`, some `diagnostics`, workspace `symbols`, workspace `reload`, `capabilities`, `request`) run before the single-file switch; all other single-file actions share one client lookup and `switch(action)`.
+9. Actions dispatch in `LspTool.execute()` through dedicated branches: workspace-only branches (`status`, the rejected workspace-diagnostics form, workspace `symbols`, workspace `reload`, `capabilities`, `request`) run before the single-file switch; all other single-file actions share one client lookup and `switch(action)`.
 10. Requests go through `sendRequest()` in `client.ts`, which allocates an incrementing JSON-RPC id, installs abort and timeout handling, sends `$/cancelRequest` on abort, and rejects on timeout or process exit.
 11. Actions that return edits either preview with `formatWorkspaceEdit()` or apply with `applyWorkspaceEdit()` from `edits.ts`; `rename_file` also performs the filesystem rename and then sends `workspace/didRenameFiles`.
 12. Non-abort failures inside the single-file action block are converted to `LSP error: ...`; many precondition failures return explicit text without throwing.
 
 ## Modes / Variants
 ### Routing and workspace scope
-- `file: "*"` is only special for `diagnostics`, `symbols`, and `reload`.
+- `file: "*"` is special for `diagnostics`, `symbols`, and `reload`; diagnostics rejects it without launching a subprocess, while symbols and reload retain workspace behavior.
 - `status` ignores `file`.
 - `capabilities` with omitted `file` or `"*"` inspects all non-custom LSP servers; with a concrete file it scopes to matching non-custom servers.
 - `request` with omitted `file` or `"*"` chooses the first available non-custom LSP server; with a concrete file it chooses that file's primary non-linter server.
@@ -67,11 +67,11 @@
 
 ### `diagnostics`
 **Inputs**
-- Required: `file`, unless using workspace mode with `file: "*"`.
+- Required: a concrete file or glob.
 - Optional: `timeout`.
 
 **Execution**
-- `file: "*"`: `runWorkspaceDiagnostics()` detects project type from root markers and runs one subprocess command: Rust `cargo check --message-format=short`, TypeScript `npx tsc --noEmit`, Go `go build ./...`, Python `pyright`.
+- `file: "*"`: returns `success: false` with guidance to use a concrete file/glob for LSP diagnostics and an execution-authorized tool for build or typecheck commands. It does not launch a subprocess.
 - Concrete file or glob: `resolveDiagnosticTargets()` treats non-globs as one target, otherwise expands a `Bun.Glob` up to `MAX_GLOB_DIAGNOSTIC_TARGETS`.
 - Per file, every matching server runs: custom clients call `lint(file)`; real LSP servers optionally wait for project load, capture `diagnosticsVersion`, `refreshFile()`, then `waitForDiagnostics()` for fresh `publishDiagnostics`.
 - Results are deduplicated by range+message and severity-sorted.
@@ -80,7 +80,7 @@
 - Single target with no issues: `OK`.
 - Single target with issues: `<summary>:\n<grouped diagnostics>`.
 - Batch/glob target: one section per file, plus an initial truncation warning when the glob exceeds the file cap.
-- Workspace mode: `Workspace diagnostics (<detected description>):\n<command output>`.
+- `file: "*"`: `Workspace build diagnostics are unavailable via lsp...` with `details.success: false`.
 
 ### `definition`
 **Inputs**
@@ -252,7 +252,6 @@ Same as `definition`, but sends `textDocument/implementation` and reports `imple
   - None directly; communication is local stdio JSON-RPC to subprocesses.
 - Subprocesses / native bindings
   - Spawns language servers with `ptree.spawn()`.
-  - Workspace diagnostics spawns `cargo`, `npx`, `go`, or `pyright`.
   - `BiomeClient` and `SwiftLintClient` spawn CLI tools.
   - Optional lspmux detection uses the trusted external `lspmux` executable; supported servers may be wrapped through `lspmux client`.
 - Session state (transcript, memory, jobs, checkpoints, registries)
@@ -280,7 +279,6 @@ Same as `definition`, but sends `textDocument/implementation` and reports `imple
 - References retry count: `2` retries, `250ms` backoff — `REFERENCES_RETRY_COUNT`, `REFERENCES_RETRY_DELAY_MS`.
 - Directory rename cap: `1_000` file pairs — `MAX_RENAME_PAIRS`.
 - `detectLspmux()` state cache TTL: `5 * 60 * 1000ms`; liveness check timeout: `1_000ms` — `STATE_CACHE_TTL_MS`, `LIVENESS_TIMEOUT_MS` in `packages/coding-agent/src/lsp/lspmux.ts`.
-- Workspace diagnostics output cap: first `50` lines from the subprocess.
 
 ## Errors
 - Missing or invalid inputs are usually returned as text with `details.success: false`, not thrown:

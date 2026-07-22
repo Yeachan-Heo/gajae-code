@@ -49,6 +49,34 @@ describe("lsp regressions", () => {
 		expect(clampTimeout("lsp", 1000)).toBe(60);
 	});
 
+	it("refuses workspace build diagnostics without spawning project commands", async () => {
+		const spawnSpy = vi.spyOn(Bun, "spawn").mockImplementation(() => {
+			throw new Error("workspace diagnostics must not spawn subprocesses");
+		});
+		const projectMarkers = ["Cargo.toml", "tsconfig.json", "go.mod", "pyproject.toml"];
+
+		for (const marker of projectMarkers) {
+			const tempDir = TempDir.createSync("@gjc-lsp-workspace-diags-");
+			try {
+				await Bun.write(path.join(tempDir.path(), marker), "");
+				const tool = new LspTool({ cwd: tempDir.path() } as ToolSession);
+				const result = await tool.execute("workspace-diags", { action: "diagnostics", file: "*" });
+
+				expect(result.details?.success).toBe(false);
+				expect(result.content).toEqual([
+					{
+						type: "text",
+						text: "Workspace build diagnostics are unavailable via lsp. Use a concrete file path or glob for language-server diagnostics, and use an execution-authorized tool to run build or typecheck commands.",
+					},
+				]);
+			} finally {
+				tempDir.removeSync();
+			}
+		}
+
+		expect(spawnSpy).not.toHaveBeenCalled();
+	});
+
 	it("limits glob collection to avoid large diagnostic stalls", async () => {
 		const tempDir = TempDir.createSync("@gjc-lsp-glob-");
 		try {

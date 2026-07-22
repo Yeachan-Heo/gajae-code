@@ -275,8 +275,20 @@ describe("model selector profile red-team", () => {
 	test("Browse all models switches to flat model rows", async () => {
 		const selector = createSelector(() => {});
 		await renderSelector(selector);
-		selector.handleInput("\x1b[B");
-		selector.handleInput("\x1b[B");
+
+		const visitedRowIdentities = new Set<string>();
+		while (true) {
+			const rowIdentity = selector.__testSelectedPresetRowIdentity();
+			if (!rowIdentity) throw new Error("Expected a selected preset landing row");
+			if (rowIdentity === "browse") break;
+			if (visitedRowIdentities.has(rowIdentity)) {
+				throw new Error(`Preset landing navigation repeated ${rowIdentity} before browse`);
+			}
+			visitedRowIdentities.add(rowIdentity);
+			selector.handleInput("\x1b[B");
+		}
+
+		expect(selector.__testSelectedPresetRowIdentity()).toBe("browse");
 		selector.handleInput("\n");
 		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
 

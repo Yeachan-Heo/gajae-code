@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import { visibleWidth } from "@gajae-code/tui";
 import { formatKeyHints, KEYBINDINGS, KeybindingsManager } from "../src/config/keybindings";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
+import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
 import { ActionRegistry } from "../src/modes/action-registry";
 import { getAvailableActionHints, StatusLineComponent } from "../src/modes/components/tool-status-header";
 import { initTheme } from "../src/modes/theme/theme";
@@ -110,6 +111,28 @@ describe("status line action hints", () => {
 		expect(streamingStatus).toContain("Queue message");
 		expect(streamingStatus).not.toContain("Open command palette");
 		expect(visibleWidth(streamingStatus)).toBeLessThanOrEqual(120);
+	});
+
+	it("hides contextual hints without suppressing configured status segments", () => {
+		expect(SETTINGS_SCHEMA["statusLine.showActionHints"].default).toBe(true);
+		const registry = new ActionRegistry<void>({ context: undefined, showError: () => {} });
+		registerAction(registry, "app.model.select", () => true);
+		const component = new StatusLineComponent(createSession(), {
+			actionRegistry: registry,
+			getKeybindings: () => KeybindingsManager.inMemory(),
+		});
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: ["model"],
+			separator: "pipe",
+			showActionHints: false,
+			showSkillHud: false,
+		});
+
+		const rendered = component.render(120).join("\n");
+		expect(rendered).toContain("no-model");
+		expect(rendered).not.toContain("Select model");
 	});
 
 	it("uses the supplied focus domain when production availability spans composer and selector actions", () => {

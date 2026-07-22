@@ -11,6 +11,7 @@ import * as z from "zod/v4";
 import { getFileReadCache } from "../edit/file-read-cache";
 import { isNotebookPath, readEditableNotebookText } from "../edit/notebook";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
+import { getActiveSkills } from "../extensibility/skills";
 import { formatHashLine, formatHashLines, formatLineHash, HL_BODY_SEP } from "../hashline/hash";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
@@ -72,6 +73,7 @@ import {
 } from "./path-utils";
 import { formatBytes, replaceTabs, shortenPath, wrapBrackets } from "./render-utils";
 import {
+	enforceSqliteQueryOnly,
 	executeReadQuery,
 	getRowByKey,
 	getRowByRowId,
@@ -1271,6 +1273,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		let db: Database | null = null;
 		try {
 			db = new Database(resolvedSqlitePath.absolutePath, { readonly: true, strict: true });
+			enforceSqliteQueryOnly(db);
 			db.run("PRAGMA busy_timeout = 3000");
 			throwIfAborted(signal);
 
@@ -1585,8 +1588,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// off the URL and surfaced via parseSel rather than confusing handlers.
 		const internalRouter = InternalUrlRouter.instance();
 		if (internalRouter.canHandle(readPath)) {
-			const internalTarget = splitInternalUrlSel(readPath);
+			const internalTarget = splitInternalUrlSel(readPath, {
+				activeSkillNames: getActiveSkills().map(skill => skill.name),
+			});
 			const parsed = parseSel(internalTarget.sel);
+			if (internalTarget.sel !== undefined && parsed.kind === "none") {
+				throw new ToolError(`Invalid internal URL selector "${internalTarget.sel}".`);
+			}
 			return this.#handleInternalUrl(internalTarget.path, parsed, signal);
 		}
 

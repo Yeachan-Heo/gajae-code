@@ -35,6 +35,7 @@ import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
 import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
+import { getConfiguredImageModel } from "../../tools/image-gen";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 
@@ -118,6 +119,9 @@ export type ModelSelectorSelection =
 	| {
 			kind: "deleteProfile";
 			profileName: string;
+	  }
+	| {
+			kind: "imageGeneration";
 	  };
 
 interface PendingThinkingChoice {
@@ -183,13 +187,18 @@ interface PresetBrowseRow {
 	kind: "browse";
 }
 
+interface PresetImageGenerationRow {
+	kind: "imageGeneration";
+}
+
 type PresetLandingRow =
 	| PresetGroupRow
 	| PresetProfileRow
 	| PresetCreateRow
 	| PresetCreateUnavailableRow
 	| PresetAlreadySavedRow
-	| PresetBrowseRow;
+	| PresetBrowseRow
+	| PresetImageGenerationRow;
 
 // Stable logical identity for a preset landing row, independent of its current
 // list position. Used to relocate the cursor after the expanded group changes so
@@ -208,6 +217,8 @@ function presetRowIdentity(row: PresetLandingRow): string {
 			return "createUnavailable";
 		case "alreadySaved":
 			return `alreadySaved:${row.profile.name}`;
+		case "imageGeneration":
+			return "imageGeneration";
 	}
 }
 
@@ -962,6 +973,7 @@ export class ModelSelectorComponent extends Container {
 		} else {
 			rows.push({ kind: "createUnavailable", label: "Select a model before creating a custom preset" });
 		}
+		rows.push({ kind: "imageGeneration" });
 		rows.push({ kind: "browse" });
 		return rows;
 	}
@@ -1047,7 +1059,8 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "browse" ||
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
-			selected.kind === "alreadySaved"
+			selected.kind === "alreadySaved" ||
+			selected.kind === "imageGeneration"
 		)
 			return;
 		if (this.#expandedPresetProviderId === selected.groupId) return;
@@ -1063,7 +1076,8 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "browse" ||
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
-			selected.kind === "alreadySaved"
+			selected.kind === "alreadySaved" ||
+			selected.kind === "imageGeneration"
 		)
 			return;
 		if (this.#expandedPresetProviderId !== selected.groupId) return;
@@ -1159,6 +1173,16 @@ export class ModelSelectorComponent extends Container {
 			}
 			if (row.kind === "browse") {
 				const label = "Browse all models";
+				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
+				continue;
+			}
+			if (row.kind === "imageGeneration") {
+				const config = getConfiguredImageModel();
+				const current =
+					config && config.provider !== "auto"
+						? `${config.provider}${config.model ? ` (${config.model})` : ""}`
+						: "Auto";
+				const label = `Image Generation: ${current}`;
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}
@@ -1644,6 +1668,10 @@ export class ModelSelectorComponent extends Container {
 		}
 		if (row.kind === "browse") {
 			this.#switchToModelMode();
+			return;
+		}
+		if (row.kind === "imageGeneration") {
+			this.#onSelectCallback({ kind: "imageGeneration" });
 			return;
 		}
 		if (row.kind === "group") {

@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@gajae-code/coding-agent",
-	"version": "0.11.2",
+	"version": "0.11.6",
 	"description": "Gajae Code CLI with read, bash, edit, write tools and session management",
 	"homepage": "https://gajae-code.com",
 	"author": "Yeachan-Heo and Gajae Code Contributors",
@@ -47,7 +47,7 @@
 		"install:defaults": "bun src/cli.ts setup defaults",
 		"verify:insane-vendor": "bun scripts/verify-insane-vendor.ts",
 		"verify:sdk-canonicalization": "bun scripts/verify-gjc-sdk-canonicalization.ts",
-		"check:sdk-closure": "bun scripts/generate-sdk-operation-inventory.ts --check && bun scripts/generate-sdk-adapter-parity-manifest.ts --check && bun scripts/run-test-manifest.ts test/manifests/sdk-adapter-parity-v1.json && bun scripts/generate-telegram-baseline-manifest.ts --check && bun scripts/run-test-manifest.ts test/manifests/telegram-baseline-v1.json && bun test test/sdk-downgrade-rollback.test.ts test/sdk-downgrade-unknown-version.test.ts && bun scripts/verify-gjc-sdk-canonicalization.ts --self-test && bun scripts/verify-gjc-sdk-canonicalization.ts && bun scripts/verify-gjc-sdk-rename.ts"
+		"check:sdk-closure": "bun ../../scripts/telegram-daemon-generation-guard.ts --validate-current-tree && bun test ../../scripts/telegram-daemon-generation-guard.test.ts && bun scripts/generate-sdk-operation-inventory.ts --check && bun scripts/generate-sdk-adapter-parity-manifest.ts --check && bun scripts/run-test-manifest.ts test/manifests/sdk-adapter-parity-v1.json && bun scripts/generate-telegram-baseline-manifest.ts --check && bun scripts/run-test-manifest.ts test/manifests/telegram-baseline-v1.json && bun test test/sdk-downgrade-rollback.test.ts test/sdk-downgrade-unknown-version.test.ts && bun scripts/verify-gjc-sdk-canonicalization.ts --self-test && bun scripts/verify-gjc-sdk-canonicalization.ts && bun scripts/verify-gjc-sdk-rename.ts"
 	},
 	"dependencies": {
 		"@agentclientprotocol/sdk": "catalog:",
@@ -170,6 +170,14 @@
 			"types": "./src/capability/*.ts",
 			"import": "./src/capability/*.ts"
 		},
+		"./cli/worktree-cli": {
+			"types": "./src/cli/worktree-cli.ts",
+			"import": "./src/cli/worktree-cli.ts"
+		},
+		"./cli/worktree-cli.js": {
+			"types": "./src/cli/worktree-cli.ts",
+			"import": "./src/cli/worktree-cli.ts"
+		},
 		"./cli/*": {
 			"types": "./src/cli/*.ts",
 			"import": "./src/cli/*.ts"
@@ -186,6 +194,14 @@
 		"./commands/ultraqa": null,
 		"./commands/ultrawork": null,
 		"./commands/performance-goal": null,
+		"./commands/worktree": {
+			"types": "./src/commands/worktree.ts",
+			"import": "./src/commands/worktree.ts"
+		},
+		"./commands/worktree.js": {
+			"types": "./src/commands/worktree.ts",
+			"import": "./src/commands/worktree.ts"
+		},
 		"./commands/*": {
 			"types": "./src/commands/*.ts",
 			"import": "./src/commands/*.ts"

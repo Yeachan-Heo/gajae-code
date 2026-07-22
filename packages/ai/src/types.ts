@@ -114,7 +114,7 @@ export interface ThinkingConfig {
 }
 
 export type KnownProvider =
-	| "alibaba-coding-plan"
+	| "alibaba-token-plan"
 	| "amazon-bedrock"
 	| "azure-openai"
 	| "anthropic"
@@ -709,10 +709,17 @@ export type TSchema = ZodType | TJsonSchema;
 /** Resolve parameter types for tool execution / handlers. */
 export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: infer T } ? T : unknown;
 
+export type RawArgumentValidationResult =
+	| { outcome: "passthrough" }
+	| { outcome: "accept"; arguments: ToolCall["arguments"] }
+	| { outcome: "reject" };
+
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
 	description: string;
 	parameters: TParameters;
+	/** Optional pre-coercion adapter for narrowly scoped raw argument recovery or rejection. */
+	rawArgumentValidation?: (arguments_: ToolCall["arguments"]) => RawArgumentValidationResult;
 	/** If true, tool is strictly typed and validated against the parameters schema before execution */
 	strict?: boolean;
 	/**

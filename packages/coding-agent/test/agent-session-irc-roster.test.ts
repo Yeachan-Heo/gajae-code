@@ -102,6 +102,13 @@ async function prompt(harness: Harness, text = "hello"): Promise<void> {
 }
 
 async function ephemeral(harness: Harness, purpose: EphemeralTurnPurpose, text = "side request"): Promise<void> {
+	if (purpose === "btw") {
+		await harness.session.runEphemeralTurn({
+			purpose,
+			turn: { question: text, scope: harness.session.createBtwConversationScope("btw test instruction") },
+		});
+		return;
+	}
 	await harness.session.runEphemeralTurn({ purpose, promptText: text });
 }
 async function background(harness: Harness, text = "side request"): Promise<void> {
@@ -245,7 +252,10 @@ describe("AgentSession IRC roster delivery", () => {
 		const main = prompt(harness, "main");
 		await mainStarted.promise;
 		const historyDuringMain = [...harness.session.agent.state.messages];
-		const side = await harness.session.runEphemeralTurn({ purpose: "btw", promptText: "<btw>side request</btw>" });
+		const side = await harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "side request", scope: harness.session.createBtwConversationScope("btw test instruction") },
+		});
 
 		expect(side.replyText).toBe("ok");
 		expect(harness.session.isStreaming).toBe(true);

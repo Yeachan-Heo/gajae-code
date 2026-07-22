@@ -28,12 +28,36 @@ export type PublicUrlResult = PublicUrlAccepted | PublicUrlRejected;
 /** Resolver seam so tests can inject DNS results without real lookups. */
 export type AddressResolver = (hostname: string) => Promise<string[]>;
 
+type ProxyEnvironment = Record<string, string | undefined>;
+
+export type GuardedPublicFetchResult =
+	| { ok: true; response: Response; logicalUrl: URL; wireUrl: URL }
+	| { ok: false; reason: string; logicalUrl: string };
+
 const defaultResolver: AddressResolver = async hostname => {
 	const records = await dns.lookup(hostname, { all: true, verbatim: true });
 	return records.map(record => record.address);
 };
 
 const BLOCKED_HOSTNAMES = new Set(["localhost", "localhost.localdomain", "0.0.0.0", ""]);
+const PROXY_ENV_KEYS = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] as const;
+
+export function hasConfiguredProxy(env: ProxyEnvironment): boolean {
+	return PROXY_ENV_KEYS.some(key => Boolean(env[key]));
+}
+
+async function resolveWithSignal(resolver: AddressResolver, hostname: string, signal?: AbortSignal): Promise<string[]> {
+	if (!signal) return resolver(hostname);
+	if (signal.aborted) throw signal.reason;
+	const { promise, reject } = Promise.withResolvers<never>();
+	const onAbort = () => reject(signal.reason);
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		return await Promise.race([resolver(hostname), promise]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
 
 function isBlockedHostname(hostname: string): boolean {
 	const normalized = hostname.toLowerCase().replace(/\.$/, "");
@@ -67,37 +91,81 @@ function isPrivateIPv4(address: string): boolean {
 	);
 }
 
-function normalizeIPv4MappedIPv6(address: string): string {
-	return address.toLowerCase().startsWith("::ffff:") ? address.slice(7) : address;
+function parseIPv6Bytes(address: string): Uint8Array | undefined {
+	let normalized = address.toLowerCase();
+	const ipv4Tail = normalized.slice(normalized.lastIndexOf(":") + 1);
+	if (ipv4Tail.includes(".")) {
+		const parts = ipv4Tail.split(".").map(part => Number.parseInt(part, 10));
+		if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return;
+		normalized = `${normalized.slice(0, normalized.lastIndexOf(":") + 1)}${((parts[0] << 8) | parts[1]).toString(16)}:${((parts[2] << 8) | parts[3]).toString(16)}`;
+	}
+
+	const halves = normalized.split("::");
+	if (halves.length > 2) return;
+	const left = halves[0] ? halves[0].split(":") : [];
+	const right = halves[1] ? halves[1].split(":") : [];
+	const omitted = 8 - left.length - right.length;
+	if ((halves.length === 1 && omitted !== 0) || (halves.length === 2 && omitted < 1)) return;
+	const words = [...left, ...Array.from({ length: omitted }, () => "0"), ...right];
+	if (words.length !== 8 || words.some(word => !/^[0-9a-f]{1,4}$/.test(word))) return;
+
+	const bytes = new Uint8Array(16);
+	for (let index = 0; index < words.length; index++) {
+		const word = Number.parseInt(words[index], 16);
+		bytes[index * 2] = word >> 8;
+		bytes[index * 2 + 1] = word & 0xff;
+	}
+	return bytes;
 }
 
+interface IPv6Cidr {
+	network: Uint8Array;
+	prefixLength: number;
+}
+
+function ipv6Cidr(network: string, prefixLength: number): IPv6Cidr {
+	const bytes = parseIPv6Bytes(network);
+	if (!bytes) throw new Error(`Invalid static IPv6 CIDR: ${network}/${prefixLength}`);
+	return { network: bytes, prefixLength };
+}
+
+function matchesIPv6Cidr(address: Uint8Array, cidr: IPv6Cidr): boolean {
+	const wholeBytes = Math.floor(cidr.prefixLength / 8);
+	for (let index = 0; index < wholeBytes; index++) {
+		if (address[index] !== cidr.network[index]) return false;
+	}
+	const remainingBits = cidr.prefixLength % 8;
+	if (remainingBits === 0) return true;
+	const mask = (0xff << (8 - remainingBits)) & 0xff;
+	return (address[wholeBytes] & mask) === (cidr.network[wholeBytes] & mask);
+}
+
+const IPV6_GLOBAL_UNICAST = ipv6Cidr("2000::", 3);
+const BLOCKED_GLOBAL_IPV6_RANGES = [
+	ipv6Cidr("2001::", 23), // IETF protocol assignments
+	ipv6Cidr("2001:db8::", 32), // documentation
+	ipv6Cidr("2002::", 16), // 6to4
+	ipv6Cidr("2620:4f:8000::", 48), // AS112 service
+	ipv6Cidr("3ffe::", 16), // returned 6bone range
+	ipv6Cidr("3fff::", 20), // documentation
+] as const;
+
 function isPrivateIPv6(address: string): boolean {
-	const normalized = address.toLowerCase();
-	const mapped = normalizeIPv4MappedIPv6(normalized);
-	if (mapped !== normalized && net.isIP(mapped) === 4) return isPrivateIPv4(mapped);
+	const bytes = parseIPv6Bytes(address);
+	if (!bytes) return true;
+	const isIPv4Mapped = bytes.subarray(0, 10).every(byte => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff;
+	if (isIPv4Mapped) return isPrivateIPv4(`${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`);
 	return (
-		normalized === "::" || // unspecified
-		normalized === "::1" || // loopback
-		normalized.startsWith("fc") || // ULA fc00::/7
-		normalized.startsWith("fd") || // ULA
-		normalized.startsWith("fe8") || // link-local fe80::/10
-		normalized.startsWith("fe9") ||
-		normalized.startsWith("fea") ||
-		normalized.startsWith("feb") ||
-		normalized.startsWith("ff") || // multicast ff00::/8
-		normalized.startsWith("2001:db8") || // documentation
-		normalized.startsWith("::ffff:") // any remaining IPv4-mapped form we could not classify
+		!matchesIPv6Cidr(bytes, IPV6_GLOBAL_UNICAST) ||
+		BLOCKED_GLOBAL_IPV6_RANGES.some(cidr => matchesIPv6Cidr(bytes, cidr))
 	);
 }
 
 /** True for any address that is not a routable public unicast address. */
 export function isPrivateOrSpecialAddress(address: string): boolean {
-	const normalized = normalizeIPv4MappedIPv6(address);
-	const family = net.isIP(normalized);
-	if (family === 4) return isPrivateIPv4(normalized);
-	if (family === 6) return isPrivateIPv6(normalized);
-	// Re-check the raw value in case it was an IPv4-mapped IPv6 literal.
-	if (net.isIP(address) === 6) return isPrivateIPv6(address);
+	const family = net.isIP(address);
+	if (family === 4) return isPrivateIPv4(address);
+	if (family === 6) return isPrivateIPv6(address);
 	return true; // not a recognizable IP -> treat as unsafe
 }
 
@@ -108,7 +176,7 @@ export function isPrivateOrSpecialAddress(address: string): boolean {
  */
 export async function validatePublicHttpUrl(
 	rawUrl: string,
-	options: { resolver?: AddressResolver } = {},
+	options: { resolver?: AddressResolver; signal?: AbortSignal } = {},
 ): Promise<PublicUrlResult> {
 	const resolver = options.resolver ?? defaultResolver;
 
@@ -128,18 +196,20 @@ export async function validatePublicHttpUrl(
 		return { ok: false, reason: "localhost or internal host" };
 	}
 
-	const literalFamily = net.isIP(url.hostname);
+	const hostname = url.hostname.replace(/^\[|\]$/g, "");
+	const literalFamily = net.isIP(hostname);
 	if (literalFamily !== 0) {
-		if (isPrivateOrSpecialAddress(url.hostname)) {
+		if (isPrivateOrSpecialAddress(hostname)) {
 			return { ok: false, reason: "private, loopback, link-local, or reserved IP literal" };
 		}
-		return { ok: true, url, addresses: [url.hostname] };
+		return { ok: true, url, addresses: [hostname] };
 	}
 
 	let addresses: string[];
 	try {
-		addresses = await resolver(url.hostname);
+		addresses = await resolveWithSignal(resolver, hostname, options.signal);
 	} catch {
+		if (options.signal?.aborted) return { ok: false, reason: "host resolution aborted" };
 		return { ok: false, reason: "host could not be resolved" };
 	}
 	if (addresses.length === 0) {
@@ -149,6 +219,47 @@ export async function validatePublicHttpUrl(
 		return { ok: false, reason: "host resolves to a private or reserved address" };
 	}
 	return { ok: true, url, addresses };
+}
+
+export async function guardedPublicFetch(
+	rawUrl: string,
+	init: BunFetchRequestInit = {},
+	options: { resolver?: AddressResolver } = {},
+): Promise<GuardedPublicFetchResult> {
+	if (Object.hasOwn(init, "proxy") || Object.hasOwn(init, "unix") || hasConfiguredProxy(process.env)) {
+		return { ok: false, reason: "proxy or Unix-socket routing is not allowed", logicalUrl: rawUrl };
+	}
+
+	const signal = init.signal ?? undefined;
+	const guard = await validatePublicHttpUrl(rawUrl, { resolver: options.resolver, signal });
+	if (signal?.aborted) throw signal.reason;
+	if (!guard.ok) return { ok: false, reason: guard.reason, logicalUrl: rawUrl };
+
+	const logicalUrl = guard.url;
+	const headers = new Headers(init.headers);
+	headers.delete("host");
+	headers.set("Host", logicalUrl.host);
+	const hostname = logicalUrl.hostname.replace(/^\[|\]$/g, "");
+	const tls =
+		logicalUrl.protocol === "https:"
+			? { rejectUnauthorized: true, ...(net.isIP(hostname) === 0 ? { serverName: hostname } : {}) }
+			: undefined;
+	let lastError: unknown;
+	for (const address of guard.addresses) {
+		if (hasConfiguredProxy(process.env)) {
+			return { ok: false, reason: "proxy routing appeared during resolution", logicalUrl: rawUrl };
+		}
+		const wireUrl = new URL(logicalUrl);
+		wireUrl.hostname = net.isIP(address) === 6 ? `[${address}]` : address;
+		try {
+			const response = await fetch(wireUrl, { ...init, headers, redirect: "manual", keepalive: false, tls });
+			return { ok: true, response, logicalUrl, wireUrl };
+		} catch (error) {
+			if (signal?.aborted) throw signal.reason;
+			lastError = error;
+		}
+	}
+	throw lastError;
 }
 
 export async function validatePublicHttpUrlForInsane(

@@ -5,13 +5,21 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
-import { publishManagedFileNoReplace } from "../src/session/internal/managed-session-storage";
+import {
+	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
+	publishManagedFileNoReplace,
+	retainManagedDirectoryAuthority,
+	validateNativeSecurityResult,
+} from "../src/session/internal/managed-session-storage";
 import { SessionManager } from "../src/session/session-manager";
 import {
+	createManagedSessionSecurityContext,
 	FileSessionStorage,
 	MemorySessionStorage,
 	SessionDeleteVerificationError,
 	type SessionStorage,
+	type SessionStorageWriterOpenOptions,
 	SessionStorageWriterRetryableCloseError,
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
@@ -182,6 +190,127 @@ describe("FileSessionStorageWriter certainty-aware close", () => {
 	});
 });
 
+describe.skipIf(process.platform !== "linux")("managed native security result validation", () => {
+	const validApply = {
+		ok: true,
+		platform: "linux",
+		kind: "file",
+		protocol: "apply",
+		aclEvidence: { access: { clear: "already_absent", query: "absent" } },
+	} as const;
+
+	it("accepts only protocol-complete Linux success evidence", () => {
+		expect(validateNativeSecurityResult(validApply, "apply", "file")).toEqual(validApply);
+		expect(() =>
+			validateNativeSecurityResult(
+				{ ...validApply, aclEvidence: { access: { clear: "not_run", query: "absent" } } },
+				"apply",
+				"file",
+			),
+		).toThrow("omitted ACL mutation evidence");
+		expect(() => validateNativeSecurityResult({ ...validApply, unexpected: true }, "apply", "file")).toThrow(
+			"Unexpected Linux security success fields",
+		);
+	});
+});
+
+describe.skipIf(process.platform !== "linux")("managed descendant retained binding", () => {
+	it("rejects publication after the retained subtree pathname is replaced", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-managed-store-binding-"));
+		try {
+			const artifacts = path.join(root, "artifacts");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifacts);
+			const detached = path.join(root, "detached");
+			await fsp.rename(artifacts, detached);
+			await fsp.mkdir(artifacts, { mode: 0o700 });
+			await expect(store.publishNoReplace("result.md", Buffer.from("untrusted", "utf8"))).rejects.toThrow(
+				"root binding changed",
+			);
+			expect(await fsp.readdir(artifacts)).toEqual([]);
+		} finally {
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when a retained managed transcript leaf is replaced during a sync rewrite", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-transcript-leaf-"));
+		try {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("authorized\n"));
+			const transcript = path.join(sessionDir, "session.jsonl");
+			const detached = path.join(sessionDir, "detached.jsonl");
+			const realReplace = native.RecoveryFsRoot.prototype.replaceManaged;
+
+			const replace = vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockImplementation(function (
+				this: native.RecoveryFsRoot,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			) {
+				fs.renameSync(transcript, detached);
+				fs.writeFileSync(transcript, "attacker\n", { mode: 0o600 });
+				return realReplace.call(
+					this,
+					relativePath,
+					bytes,
+					expectedDev,
+					expectedIno,
+					expectedSize,
+					expectedMtimeNs,
+					expectedCtimeNs,
+					expectedSha256,
+				);
+			});
+			try {
+				expect(() => store.replaceSync("session.jsonl", Buffer.from("replacement\n"))).toThrow();
+				expect(fs.readFileSync(transcript, "utf8")).toBe("attacker\n");
+				expect(fs.readFileSync(detached, "utf8")).toBe("authorized\n");
+			} finally {
+				replace.mockRestore();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not publish an initial transcript into a substituted session directory", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-transcript-root-"));
+		try {
+			const sessionDir = path.join(root, "session");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), sessionDir);
+			const retained = path.join(root, "retained-session");
+			const realCreate = native.RecoveryFsRoot.prototype.createManaged;
+
+			const create = vi.spyOn(native.RecoveryFsRoot.prototype, "createManaged").mockImplementation(function (
+				this: native.RecoveryFsRoot,
+				relativePath,
+				bytes,
+			) {
+				fs.renameSync(sessionDir, retained);
+				fs.mkdirSync(sessionDir, { mode: 0o700 });
+				return realCreate.call(this, relativePath, bytes);
+			});
+			try {
+				expect(() => store.publishNoReplaceSync("session.jsonl", Buffer.from("authorized\n"))).toThrow(
+					"root binding changed",
+				);
+				expect(fs.readdirSync(sessionDir)).toEqual([]);
+				expect(fs.readFileSync(path.join(retained, "session.jsonl"), "utf8")).toBe("authorized\n");
+			} finally {
+				create.mockRestore();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("FileSessionStorageWriter path security", () => {
 	let tempDir: string;
 	let storage: FileSessionStorage;
@@ -190,6 +319,20 @@ describe("FileSessionStorageWriter path security", () => {
 		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-writer-security-"));
 		storage = new FileSessionStorage();
 	});
+
+	const managedOptions = (extra: Omit<SessionStorageWriterOpenOptions, "securityContext">) => {
+		const rootAuthority = managedDirectoryRoot(path.dirname(tempDir));
+		return {
+			...extra,
+			securityContext: createManagedSessionSecurityContext({
+				agentDir: path.dirname(tempDir),
+				sessionsRoot: tempDir,
+				sessionDir: tempDir,
+				rootAuthority,
+				retainedAuthority: retainManagedDirectoryAuthority(rootAuthority, tempDir),
+			}),
+		};
+	};
 
 	afterEach(async () => {
 		await fsp.rm(tempDir, { recursive: true, force: true });
@@ -209,6 +352,74 @@ describe("FileSessionStorageWriter path security", () => {
 			expect(fs.statSync(first).mode & 0o777).toBe(0o600);
 			expect(fs.statSync(second).mode & 0o777).toBe(0o600);
 		}
+	});
+
+	it("does not truncate through an fd after same-fd security rejects a replacement", () => {
+		const sessionPath = path.join(tempDir, "replacement.jsonl");
+		const protectedPath = `${sessionPath}.secure-b`;
+		fs.writeFileSync(sessionPath, "protected\n");
+		const apply = vi.spyOn(native, "applyOwnerOnlyFdSecurity").mockImplementation(pathname => {
+			fs.renameSync(pathname, protectedPath);
+			fs.writeFileSync(pathname, "attacker replacement\n");
+			return { ok: false, code: "identity_unavailable" };
+		});
+
+		expect(() => storage.openWriter(sessionPath, managedOptions({ flags: "w" }))).toThrow("identity_unavailable");
+
+		expect(fs.readFileSync(protectedPath, "utf8")).toBe("protected\n");
+		expect(fs.readFileSync(sessionPath, "utf8")).toBe("attacker replacement\n");
+		apply.mockRestore();
+	});
+
+	it("fails fsync when the live transcript name is replaced after writing", async () => {
+		const sessionPath = path.join(tempDir, "fsync-replacement.jsonl");
+		const detachedPath = `${sessionPath}.detached`;
+		const writer = storage.openWriter(sessionPath, managedOptions({ flags: "w" }));
+		await writer.writeLine("authorized\n");
+		await fsp.rename(sessionPath, detachedPath);
+		await fsp.writeFile(sessionPath, "replacement\n", { mode: 0o600 });
+
+		await expect(writer.fsync()).rejects.toThrow();
+		expect(await fsp.readFile(sessionPath, "utf8")).toBe("replacement\n");
+		await writer.close().catch(() => {});
+	});
+
+	it("uses caller-fd security rather than pathname security for open writers", async () => {
+		const sessionPath = path.join(tempDir, "fd-security.jsonl");
+		const apply = vi.spyOn(native, "applyOwnerOnlyFdSecurity");
+		const verify = vi.spyOn(native, "verifyOwnerOnlyFdSecurity");
+		const pathApply = vi.spyOn(native, "applyOwnerOnlyPathSecurity");
+		const pathVerify = vi.spyOn(native, "verifyOwnerOnlyPathSecurity");
+
+		const writer = storage.openWriter(sessionPath, managedOptions({ flags: "w" }));
+		writer.writeLineSync("payload\n");
+		await writer.close();
+
+		expect(apply).toHaveBeenCalledWith(sessionPath, "file", expect.any(Number));
+		expect(verify).toHaveBeenCalledWith(sessionPath, "file", expect.any(Number));
+		expect(pathApply).not.toHaveBeenCalled();
+		expect(pathVerify).not.toHaveBeenCalled();
+	});
+
+	it("rejects terminal pathname or descriptor verification before dispatching close", () => {
+		const close = vi.fn();
+		const verify = vi
+			.spyOn(native, "verifyOwnerOnlyFdSecurity")
+			.mockReturnValue({ ok: false, code: "identity_unavailable" });
+
+		const writer = storage.openWriter(
+			path.join(tempDir, "verify-reject.jsonl"),
+			managedOptions({ closeAdapter: { close } }),
+		);
+		writer.writeLineSync("payload\n");
+
+		expect(() => writer.closeSync()).toThrow("identity_unavailable");
+		expect(writer.getCloseState()).toBe("close_failed_retryable");
+		expect(close).not.toHaveBeenCalled();
+
+		verify.mockRestore();
+		writer.closeSync();
+		expect(writer.getCloseState()).toBe("closed");
 	});
 
 	it("rejects a symlinked or junctioned storage parent before opening the writer", async () => {

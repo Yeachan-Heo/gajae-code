@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
@@ -12,12 +13,14 @@ import {
 	type BrokerDiscovery,
 	brokerDiscoveryPath,
 	brokerProcessIncarnation,
+	heartbeatBrokerDiscoveryRetained,
 	isPidAlive,
 	newBrokerToken,
+	publishBrokerDiscovery,
 	type RedactedBrokerDiscovery,
+	type RetainedBrokerDiscovery,
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
-	writeBrokerDiscovery,
 } from "./discovery";
 import { deriveIdempotencyIdentity } from "./identity";
 import { executeLifecycle, isCanonicalSessionId } from "./lifecycle";
@@ -360,7 +363,19 @@ type BrokerLockSnapshot = {
 	ownerId?: string;
 	pid: number;
 	identity: string;
+	lockIdentity: string;
 };
+
+const BROKER_PUBLICATION_CADENCE_MS = 5_000;
+const BROKER_PUBLICATION_GRACE_MS = 15_000;
+const BROKER_SETTLEMENT_MS = 2_000;
+type BrokerPublicationState =
+	| "healthy-owned"
+	| "suspect-unpublished"
+	| "observation-ambiguous"
+	| "heartbeat-ambiguous"
+	| "stopping";
+type BrokerStopMode = "owned-root" | "lost-root";
 
 const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 
@@ -372,10 +387,17 @@ export class Broker {
 	#lock: string;
 	#owner = randomBytes(12).toString("hex");
 	#chains = new Map<string, Promise<void>>();
+	#admitted = new Set<Promise<void>>();
+	#publication: RetainedBrokerDiscovery | null = null;
+	#publicationState: BrokerPublicationState = "healthy-owned";
+	#lossAt: bigint | null = null;
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
-	#heartbeatWrite: Promise<void> = Promise.resolve();
+	#completionTask: Promise<void> | null = null;
+	#completion!: Promise<void>;
+	#resolveCompletion!: () => void;
+	#rejectCompletion!: (error: unknown) => void;
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
@@ -387,11 +409,15 @@ export class Broker {
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
+		const completion = Promise.withResolvers<void>();
+		this.#completion = completion.promise;
+		this.#resolveCompletion = completion.resolve;
+		this.#rejectCompletion = completion.reject;
 	}
 	#lockRecordPath(): string {
 		return path.join(this.#lock, BROKER_LOCK_RECORD);
 	}
-	#lockSnapshot(raw: string): BrokerLockSnapshot {
+	async #lockSnapshot(raw: string, lockIdentity: string): Promise<BrokerLockSnapshot> {
 		try {
 			const lock = JSON.parse(raw) as { ownerId?: unknown; pid?: unknown };
 			if (
@@ -401,32 +427,37 @@ export class Broker {
 				Number.isInteger(lock.pid) &&
 				lock.pid > 0
 			)
-				return { ownerId: lock.ownerId, pid: lock.pid, identity: `owner:${lock.ownerId}` };
+				return { ownerId: lock.ownerId, pid: lock.pid, identity: `owner:${lock.ownerId}`, lockIdentity };
 		} catch {}
-		return { pid: 0, identity: `contents:${createHash("sha256").update(raw).digest("hex")}` };
+		return { pid: 0, identity: `contents:${createHash("sha256").update(raw).digest("hex")}`, lockIdentity };
 	}
 	async #readLock(): Promise<BrokerLockSnapshot | null> {
+		let lock: BigIntStats;
 		try {
-			return this.#lockSnapshot(await fs.readFile(this.#lockRecordPath(), "utf8"));
-		} catch (e) {
-			const code = (e as NodeJS.ErrnoException).code;
-			if (code === "ENOTDIR") {
-				try {
-					return this.#lockSnapshot(await fs.readFile(this.#lock, "utf8"));
-				} catch (legacyError) {
-					if ((legacyError as NodeJS.ErrnoException).code === "ENOENT") return null;
-					throw legacyError;
-				}
-			}
-			if (code !== "ENOENT") throw e;
-		}
-		try {
-			const lock = await fs.stat(this.#lock);
-			return lock.isDirectory() ? { pid: 0, identity: `directory:${lock.dev}:${lock.ino}` } : null;
+			lock = await fs.lstat(this.#lock, { bigint: true });
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
 			throw e;
 		}
+		const lockIdentity = `${lock.dev}:${lock.ino}`;
+		let raw: string;
+		try {
+			raw = lock.isDirectory()
+				? await fs.readFile(path.join(this.#lock, BROKER_LOCK_RECORD), "utf8")
+				: await fs.readFile(this.#lock, "utf8");
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+			raw = "";
+		}
+		try {
+			const current = await fs.lstat(this.#lock, { bigint: true });
+			if (`${current.dev}:${current.ino}` !== lockIdentity || current.isDirectory() !== lock.isDirectory())
+				return null;
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+			throw e;
+		}
+		return this.#lockSnapshot(raw, lockIdentity);
 	}
 	async #createLock(): Promise<void> {
 		await fs.mkdir(this.#lock, { mode: 0o700 });
@@ -454,13 +485,18 @@ export class Broker {
 	}
 	async #reclaimStaleLock(snapshot: BrokerLockSnapshot): Promise<void> {
 		const current = await this.#readLock();
-		if (!current || current.identity !== snapshot.identity || (current.pid > 0 && isPidAlive(current.pid))) return;
+		if (
+			!current ||
+			current.identity !== snapshot.identity ||
+			current.lockIdentity !== snapshot.lockIdentity ||
+			(current.pid > 0 && isPidAlive(current.pid))
+		)
+			return;
 
-		// Keep the tombstone: its immutable-owner-derived pathname prevents a contender
-		// holding an old snapshot from renaming a newly-created directory lock.
+		// Snapshot validation and the deterministic instance suffix protect successor locks.
 		const tombstone = path.join(
 			path.dirname(this.#lock),
-			`.broker.lock.stale-${createHash("sha256").update(snapshot.identity).digest("hex")}`,
+			`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}`,
 		);
 		try {
 			await fs.rename(this.#lock, tombstone);
@@ -490,7 +526,17 @@ export class Broker {
 	}
 
 	async start(): Promise<BrokerDiscovery> {
+		if (this.#completionTask) {
+			await this.#completionTask;
+			const completion = Promise.withResolvers<void>();
+			this.#completion = completion.promise;
+			this.#resolveCompletion = completion.resolve;
+			this.#rejectCompletion = completion.reject;
+			this.#completionTask = null;
+		}
 		this.#stopping = false;
+		this.#publicationState = "healthy-owned";
+		this.#lossAt = null;
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
 		for (;;) {
@@ -544,15 +590,19 @@ export class Broker {
 				startedAt: now,
 				heartbeatAt: now,
 			};
-			await writeBrokerDiscovery(this.settings.agentDir, this.discovery);
-			this.#heartbeatTimer = setInterval(
-				() => void this.heartbeat(),
-				Math.max(1, Math.floor(this.settings.heartbeatTtlMs / 3)),
+			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
+			this.#publicationState = "healthy-owned";
+			const cadenceMs = Math.max(
+				10,
+				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
 			);
+			this.#heartbeatTimer = setInterval(() => void this.#watchPublication(), cadenceMs);
 			return this.discovery;
 		} catch (error) {
 			await this.#transport?.stop();
 			this.#transport = null;
+			this.#publication?.close();
+			this.#publication = null;
 			this.discovery = null;
 			await this.#releaseOwnedLock();
 			throw error;
@@ -561,38 +611,96 @@ export class Broker {
 	get ownsDiscovery(): boolean {
 		return this.discovery?.ownerId === this.#owner;
 	}
+	get completion(): Promise<void> {
+		return this.#completion;
+	}
 	status(): RedactedBrokerDiscovery | null {
 		return this.discovery ? redactBrokerDiscovery(this.discovery) : null;
 	}
+	#fence(kind: "suspect-unpublished" | "observation-ambiguous" | "heartbeat-ambiguous"): void {
+		if (this.#publicationState === "stopping") return;
+		this.#publicationState = kind;
+		if (kind === "suspect-unpublished") this.#lossAt ??= process.hrtime.bigint();
+		else this.#lossAt = null;
+	}
+	async #watchPublication(writeHeartbeat = true): Promise<void> {
+		if (!this.#publication || this.#publicationState === "stopping") return;
+		let observation: ReturnType<RetainedBrokerDiscovery["observe"]>;
+		try {
+			observation = this.#publication.observe();
+		} catch {
+			this.#fence("observation-ambiguous");
+			return;
+		}
+		if (observation === "owned") {
+			if (this.#publicationState === "heartbeat-ambiguous") {
+				if (writeHeartbeat) await this.#writeHeartbeat();
+				return;
+			}
+			this.#publicationState = "healthy-owned";
+			this.#lossAt = null;
+			if (writeHeartbeat) await this.#writeHeartbeat();
+			return;
+		}
+		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
+		if (
+			this.#lossAt !== null &&
+			process.hrtime.bigint() - this.#lossAt >= BigInt(BROKER_PUBLICATION_GRACE_MS) * 1_000_000n
+		)
+			void this.#complete("lost-root");
+	}
+	async #writeHeartbeat(): Promise<void> {
+		if (!this.discovery || !this.#publication || this.#publicationState === "stopping") return;
+		const heartbeatAt = Date.now();
+		try {
+			if (!(await heartbeatBrokerDiscoveryRetained(this.#publication, heartbeatAt))) {
+				this.#fence("heartbeat-ambiguous");
+				return;
+			}
+		} catch {
+			this.#fence("heartbeat-ambiguous");
+			return;
+		}
+		this.#publicationState = "healthy-owned";
+		this.#lossAt = null;
+		this.discovery = { ...this.discovery, heartbeatAt };
+	}
 	async heartbeat(): Promise<void> {
-		if (!this.discovery || this.discovery.ownerId !== this.#owner) return;
-		this.discovery = { ...this.discovery, heartbeatAt: Date.now() };
-		const discovery = this.discovery;
-		this.#heartbeatWrite = this.#heartbeatWrite.then(() => writeBrokerDiscovery(this.settings.agentDir, discovery));
-		await this.#heartbeatWrite;
+		if (this.#publicationState !== "healthy-owned") return;
+		await this.#writeHeartbeat();
+	}
+	async #complete(mode: BrokerStopMode): Promise<void> {
+		if (this.#completionTask) return this.#completionTask;
+		this.#stopping = true;
+		this.#publicationState = "stopping";
+		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
+		this.#heartbeatTimer = null;
+		this.#completionTask = (async () => {
+			await this.#transport?.stop();
+			this.#transport = null;
+			if (mode === "lost-root")
+				await Promise.race([Promise.allSettled(this.#admitted), Bun.sleep(BROKER_SETTLEMENT_MS)]);
+			else await Promise.allSettled(this.#admitted);
+			this.#publication?.close();
+			this.#publication = null;
+			if (mode === "owned-root" && this.discovery?.ownerId === this.#owner) {
+				try {
+					const disk = JSON.parse(await fs.readFile(brokerDiscoveryPath(this.settings.agentDir), "utf8")) as {
+						ownerId?: string;
+					};
+					if (disk.ownerId === this.#owner) await fs.unlink(brokerDiscoveryPath(this.settings.agentDir));
+				} catch (e) {
+					if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+				}
+				await this.#releaseOwnedLock();
+			}
+			this.discovery = null;
+		})();
+		void this.#completionTask.then(this.#resolveCompletion, this.#rejectCompletion);
+		return this.#completionTask;
 	}
 	async stop(): Promise<void> {
-		this.#stopping = true;
-		if (this.#heartbeatTimer) {
-			clearInterval(this.#heartbeatTimer);
-			this.#heartbeatTimer = null;
-		}
-		await this.#heartbeatWrite;
-		await Promise.allSettled(this.#chains.values());
-		await this.#transport?.stop();
-		this.#transport = null;
-		if (this.discovery?.ownerId === this.#owner) {
-			try {
-				const disk = JSON.parse(await fs.readFile(brokerDiscoveryPath(this.settings.agentDir), "utf8")) as {
-					ownerId?: string;
-				};
-				if (disk.ownerId === this.#owner) await fs.unlink(brokerDiscoveryPath(this.settings.agentDir));
-			} catch (e) {
-				if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-			}
-			await this.#releaseOwnedLock();
-		}
-		this.discovery = null;
+		await this.#complete("owned-root");
 	}
 	async #endpoint(input: Record<string, unknown>): Promise<BrokerResponse> {
 		const sessionId = input.sessionId;
@@ -634,7 +742,18 @@ export class Broker {
 			throw e;
 		}
 	}
-	async handleRequest(
+	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+		if (this.#stopping || (this.#publication !== null && this.#publicationState !== "healthy-owned"))
+			return Promise.resolve(error("unavailable", "broker publication is unavailable"));
+		let release!: () => void;
+		const admission = new Promise<void>(resolve => (release = resolve));
+		this.#admitted.add(admission);
+		return this.#handleRequest(operation, input, idempotencyKey).finally(() => {
+			release();
+			this.#admitted.delete(admission);
+		});
+	}
+	async #handleRequest(
 		operation: string,
 		input: Record<string, unknown>,
 		idempotencyKey?: string,

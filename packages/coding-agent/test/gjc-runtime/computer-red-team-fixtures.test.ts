@@ -204,6 +204,11 @@ function qualityGate(qa: Record<string, unknown>): string {
 			evidence: "targeted fixture rerun passed",
 			blockers: [],
 		},
+		criticReview: {
+			verdict: "OKAY",
+			evidence: "critic approved final aggregate terminus",
+			blockers: [],
+		},
 	});
 }
 

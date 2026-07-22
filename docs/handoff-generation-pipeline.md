@@ -167,7 +167,7 @@ After session reset, handoff is persisted as `custom_message` with `customType: 
 
 `buildSessionContext()` converts this entry into a runtime custom/user-context message via `createCustomMessage(...)`, so it is included in future prompts from the new session.
 
-Auto-triggered handoffs can additionally write a timestamped `handoff-*.md` artifact under the session artifacts directory when `compaction.handoffSaveToDisk` is enabled. Manual `/handoff` does not write that artifact.
+Auto-triggered handoffs can additionally save the handoff document as a session artifact when `compaction.handoffSaveToDisk` is enabled; `handoff()` returns its resolvable `artifact://<id>` URI as `savedPath`. Manual `/handoff` does not save an artifact.
 
 ## Controller/UI behavior
 
@@ -226,6 +226,35 @@ Two guards prevent low-signal handoffs:
 
 This avoids creating a new session with empty/near-empty handoff context.
 
+## Concurrency: the shared session-transition lease
+
+`handoff()` does not run concurrently with any other session-identity transition.
+A single synchronously-acquired lease (`#beginSessionTransition` / `#endSessionTransition`)
+serializes every operation that replaces or rewrites session identity/history:
+
+- `handoff()`
+- `compact()`
+- `newSession()` / `switchSession()` / `branch()` / `clearContext()`
+- `fork()`
+- `navigateTree()`
+
+Each of these acquires the lease at its entry (before its first `await`) and releases
+it in its `finally`. Because acquisition is synchronous and up front, exclusion is
+**symmetric**: whichever transition starts first owns the lease, and any peer that
+starts while it is held is rejected with an `Error` carrying `code: "busy"` and a
+message of the form `Cannot start <kind> while a <holder> transition is in progress.`
+The rejection happens at the peer's own lease-acquisition point, i.e. **before any
+session mutation**, so a losing transition never partially mutates the session.
+
+Auto-triggered handoff acquires the lease through `handoff()` itself; the maintenance
+orchestrator does not hold the lease, so an auto-handoff running inside post-turn
+maintenance does not self-deadlock even while auto-compaction owns its own abort
+controller.
+
+This lease is distinct from the turn-start guard (`#assertNoHandoffTransition`), which
+fences external turn starters (prompt / steer / follow-up / continuation) for the whole
+handoff transition and rejects them with `Cannot start a turn while a handoff is in progress.`
+
 ## State transition summary
 
 High-level state flow:
@@ -251,4 +280,4 @@ High-level state flow:
 - No structural validation checks that generated markdown follows the requested section format.
 - Missing generated text is reported as cancellation in controller UX.
 - Manual handoff has no streaming visibility; a cancellable loader is shown until the UI updates after generation completes.
-- Auto-triggered handoffs can write a timestamped `handoff-*.md` artifact when `compaction.handoffSaveToDisk` is enabled; write failure is logged and does not fail the handoff.
+- Auto-triggered handoffs can save the handoff document as a session artifact (`artifact://<id>`) when `compaction.handoffSaveToDisk` is enabled; save failure is logged and does not fail the handoff.

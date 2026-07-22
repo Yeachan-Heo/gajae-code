@@ -14,6 +14,7 @@ import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
 	type BrokerDiscovery,
 	brokerDiscoveryPath,
+	publishBrokerDiscovery,
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 	writeBrokerDiscovery,
@@ -27,6 +28,7 @@ import {
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
+import { completeBrokerProcess } from "../src/sdk/broker/internal";
 import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
@@ -208,6 +210,32 @@ it("initializes the managed target scope before lifecycle fork arguments expose 
 	}
 });
 
+it("exposes the same prepared managed fork scope on repeated lifecycle argument creation", async () => {
+	const agentDir = await temp();
+	const cwd = path.join(agentDir, "repeated-fork-target");
+	await fs.mkdir(cwd);
+	const request: SessionLifecycleLaunchRequest = {
+		operation: "session.fork",
+		sessionId: "fork-destination",
+		cwd,
+		stateRoot: path.join(cwd, ".gjc", "state"),
+		...deriveLifecycleDeadlines(Date.now(), 10_000),
+		sourceCwd: cwd,
+		sourceSessionId: "source-session",
+		sourceSessionPath: path.join(cwd, "source.jsonl"),
+		sourceSessionIdentity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5", sha256: "a".repeat(64) },
+	};
+	try {
+		const first = await lifecycleArgs(request, cwd, agentDir);
+		const second = await lifecycleArgs(request, cwd, agentDir);
+		expect(first.sessionDir).toBe(second.sessionDir);
+		expect(first.sessionDir).toEqual(expect.any(String));
+		expect(syncFs.existsSync(path.join(first.sessionDir!, ".gjc-managed-session-scope.v2.json"))).toBe(true);
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 it("SDK lifecycle launch requests require a worktree identity", () => {
 	expect(() =>
 		readSessionLifecycleLaunchRequest(
@@ -254,6 +282,26 @@ async function waitForDiscovery(agentDir: string, children?: Bun.Subprocess[]) {
 	}
 	throw new Error("Timed out waiting for broker discovery.");
 }
+describe("broker process completion", () => {
+	it("exits zero only after successful broker completion", async () => {
+		const exit = vi.fn((code: number): never => {
+			throw new Error(`exit:${code}`);
+		});
+		await expect(completeBrokerProcess({ completion: Promise.resolve() } as Broker, exit)).rejects.toThrow("exit:0");
+		expect(exit).toHaveBeenCalledWith(0);
+	});
+
+	it("propagates broker completion failure without invoking success exit", async () => {
+		const failure = new Error("broker teardown failed");
+		const exit = vi.fn((_code: number): never => {
+			throw new Error("unexpected exit");
+		});
+		await expect(completeBrokerProcess({ completion: Promise.reject(failure) } as Broker, exit)).rejects.toBe(
+			failure,
+		);
+		expect(exit).not.toHaveBeenCalled();
+	});
+});
 describe("SDK broker identity and discovery", () => {
 	it("persists identity and writes a redacted private discovery record", async () => {
 		const dir = await temp();
@@ -420,11 +468,122 @@ describe("SDK broker identity and discovery", () => {
 		expect(await readBrokerDiscovery(dir)).toBeNull();
 		await fs.rm(dir, { recursive: true, force: true });
 	});
+	it("rolls back its publication when retained authority acquisition fails", async () => {
+		const dir = await temp();
+		const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+			throw new Error("retain failed");
+		});
+		try {
+			await expect(
+				publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "test",
+					ownerId: "failed-owner",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "failed-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}),
+			).rejects.toThrow("retain failed");
+			expect(await fs.stat(brokerDiscoveryPath(dir)).catch(() => null)).toBeNull();
+		} finally {
+			retain.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("fences failed heartbeats until a later retained heartbeat succeeds", async () => {
+		const dir = await temp();
+		let watchdog: (() => void) | undefined;
+		let heartbeatAttempts = 0;
+		const realSetInterval = globalThis.setInterval;
+		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+			watchdog = callback;
+			return realSetInterval(() => {}, 2 ** 31 - 1);
+		}) as typeof setInterval);
+		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
+			observe: () => ({ kind: "owned" }),
+			heartbeat: () => ({ kind: ++heartbeatAttempts === 1 ? "failed" : "written" }),
+			sync: () => ({ kind: "synced" }),
+			close: () => ({ kind: "closed" }),
+		} as never);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await broker.start();
+			await broker.heartbeat();
+			expect(await broker.handleRequest("session.list", {})).toEqual({
+				ok: false,
+				error: { code: "unavailable", message: "broker publication is unavailable" },
+			});
+			watchdog!();
+			await sleep(0);
+			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
+		} finally {
+			interval.mockRestore();
+			retain.mockRestore();
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("fences ambiguous publication observations without self-exit and recovers only after an owned heartbeat succeeds", async () => {
+		const dir = await temp();
+		let watchdog: (() => void) | undefined;
+		let observation: "owned" | "ambiguous" = "owned";
+		let heartbeatAttempts = 0;
+		const realSetInterval = globalThis.setInterval;
+		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+			watchdog = callback;
+			return realSetInterval(() => {}, 2 ** 31 - 1);
+		}) as typeof setInterval);
+		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
+			observe: () => ({ kind: observation }),
+			heartbeat: () => ({ kind: ++heartbeatAttempts === 1 ? "failed" : "written" }),
+			sync: () => ({ kind: "synced" }),
+			close: () => ({ kind: "closed" }),
+		} as never);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await broker.start();
+			expect(watchdog).toBeDefined();
+
+			observation = "ambiguous";
+			watchdog!();
+			await sleep(0);
+			expect(await broker.handleRequest("session.list", {})).toEqual({
+				ok: false,
+				error: { code: "unavailable", message: "broker publication is unavailable" },
+			});
+			expect(await Promise.race([broker.completion.then(() => true), sleep(25).then(() => false)])).toBe(false);
+
+			observation = "owned";
+			watchdog!();
+			await sleep(0);
+			expect(heartbeatAttempts).toBe(1);
+			expect(await broker.handleRequest("session.list", {})).toEqual({
+				ok: false,
+				error: { code: "unavailable", message: "broker publication is unavailable" },
+			});
+			expect(await Promise.race([broker.completion.then(() => true), sleep(25).then(() => false)])).toBe(false);
+
+			watchdog!();
+			await sleep(0);
+			expect(heartbeatAttempts).toBe(2);
+			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
+		} finally {
+			interval.mockRestore();
+			retain.mockRestore();
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("refreshes discovery heartbeat, removes it on stop, and can restart", async () => {
 		const dir = await temp();
 		const broker = new Broker({ agentDir: dir, heartbeatTtlMs: 45 });
 		const first = await broker.start();
-		const deadline = Date.now() + 5_000;
+		const deadline = Date.now() + 6_500;
 		let refreshed = await readBrokerDiscovery(dir);
 		while ((!refreshed || refreshed.heartbeatAt <= first.heartbeatAt) && Date.now() < deadline) {
 			await sleep(10);
@@ -438,6 +597,82 @@ describe("SDK broker identity and discovery", () => {
 		const owner = (await import("../src/sdk/broker/ensure")).brokerOwnerForTest(dir);
 		await owner?.stop();
 	}, 15_000);
+	it("preserves legacy Windows publication and heartbeat when retained self-reap is unsupported", async () => {
+		const dir = await temp();
+		const now = Date.now();
+		const publication = await publishBrokerDiscovery(
+			dir,
+			{
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "windows-compat",
+				ownerId: "windows-owner",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "windows-token",
+				startedAt: now,
+				heartbeatAt: now,
+			},
+			"win32",
+		);
+		try {
+			expect(publication.observe()).toBe("owned");
+			expect(await publication.heartbeat(now + 1)).toBe(true);
+			expect((await readBrokerDiscovery(dir))?.heartbeatAt).toBe(now + 1);
+		} finally {
+			publication.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("reinitializes completion and teardown state when the same broker instance restarts", async () => {
+		const dir = await temp();
+		const broker = new Broker({ agentDir: dir, heartbeatTtlMs: 90 });
+		const first = await broker.start();
+		await broker.stop();
+		const second = await broker.start();
+		try {
+			expect(second.token).not.toBe(first.token);
+			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
+		} finally {
+			await broker.stop();
+		}
+		await expect(fs.stat(brokerDiscoveryPath(dir))).rejects.toMatchObject({ code: "ENOENT" });
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+	it("fences admission on definitive root loss and reopens only when the retained objects return", async () => {
+		const dir = await temp();
+		let watchdog: (() => void) | undefined;
+		const realSetInterval = globalThis.setInterval;
+		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+			watchdog = callback;
+			return realSetInterval(() => {}, 2 ** 31 - 1);
+		}) as typeof setInterval);
+		const broker = new Broker({ agentDir: dir });
+		try {
+			await broker.start();
+			expect(watchdog).toBeDefined();
+			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
+
+			const retainedRoot = path.join(dir, "retained-sdk");
+			await fs.rename(path.join(dir, "sdk"), retainedRoot);
+			watchdog!();
+			// Admission checks the synchronous fence before any request normalization or IO.
+			expect(await broker.handleRequest("session.list", {})).toEqual({
+				ok: false,
+				error: { code: "unavailable", message: "broker publication is unavailable" },
+			});
+
+			await fs.rename(retainedRoot, path.join(dir, "sdk"));
+			watchdog!();
+			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
+		} finally {
+			interval.mockRestore();
+			await broker.stop();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("terminates and reaps the spawned broker when discovery times out", async () => {
 		const dir = await temp();
 		// Force ensureBroker's discovery reads to never resolve a live record so the
@@ -663,7 +898,7 @@ describe("SDK broker identity and discovery", () => {
 			const owner = children.find(child => child.exitCode === null);
 			expect(owner).toBeDefined();
 			expect(discovery.pid).toBe(owner!.pid!);
-			process.kill(discovery.pid, "SIGTERM");
+			owner!.kill("SIGTERM");
 			await Promise.all(children.map(child => child.exited));
 		} finally {
 			for (const child of children) if (child.exitCode === null) child.kill("SIGTERM");

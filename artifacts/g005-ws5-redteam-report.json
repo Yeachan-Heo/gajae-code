@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "kind": "package-test-report",
+  "story": "G001-ws5",
+  "suites": [
+    { "path": "test/g005-ws5-redteam.test.ts", "status": "passed", "tests": 6 },
+    { "path": "test/transcript-adapter-parity.test.ts", "status": "passed" },
+    { "path": "test/tool-transcript-format.test.ts", "status": "passed" },
+    { "path": "test/g002-ws1-redteam.test.ts", "status": "passed" },
+    { "path": "test/g001-toolrender-redteam.test.ts", "status": "passed" },
+    { "path": "test/transcript-viewer-overlay.test.ts", "status": "passed" },
+    { "path": "test/transcript-item-registry.test.ts", "status": "passed" },
+    { "path": "test/transcript-viewer-perf.test.ts", "status": "passed" }
+  ],
+  "adversarialCases": [
+    { "id": "descriptor-freeze-and-prototype-pollution", "status": "passed", "verdict": "Nested objects and arrays are frozen; mutation throws; __proto__ and constructor remain inert own display values without polluting Object.prototype." },
+    { "id": "recursive-display-sanitization", "status": "passed", "verdict": "Hostile controls in nested argument keys/values, arrays, intent, details, name, and result are absent from display descriptors while canonical payload identity and bytes are retained." },
+    { "id": "raw-osc52-copy", "status": "passed", "verdict": "Both main and observer adapter entries copy canonical raw OSC52 bytes through the y-copy seam and never expose those bytes via display text." },
+    { "id": "surface-cap-matrix", "status": "passed", "verdict": "At 99, 100, 101, and 5000 source result lines, main collapsed views contain only call/status data and expanded views source-cap at 100 with a sentinel. Observer entries are forced full and their 100-line viewer cap truncates the already source-capped projection, producing the second sentinel." },
+    { "id": "non-tool-isolation", "status": "passed", "verdict": "read-group and assistant-text payload projections remain byte-identical." },
+    { "id": "stable-tool-identity", "status": "passed", "verdict": "tool:${id} identity remains stable across rebuilt entries and retains expanded fold state." }
+  ],
+  "counts": {
+    "suites": 8,
+    "tests": 52,
+    "expects": 265,
+    "passed": 52,
+    "failed": 0
+  },
+  "verdicts": [
+    { "scope": "G001-ws5", "status": "pass", "summary": "No adversarial blocker reproduced in the frozen WS5 change set." }
+  ],
+  "blockers": []
+}

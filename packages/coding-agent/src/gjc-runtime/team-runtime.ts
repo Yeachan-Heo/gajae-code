@@ -1885,7 +1885,7 @@ async function startTmuxSession(
 		for (const worker of config.workers) {
 			const splitDirection: string = worker.index === 1 ? "-h" : "-v";
 			const splitTarget: string =
-				worker.index === 1 ? config.leader.pane_id : (rightStackRootPaneId ?? config.leader.pane_id);
+				worker.index === 1 ? config.tmux_target : (rightStackRootPaneId ?? config.tmux_target);
 			const workerCommand = buildWorkerCommand(config, worker);
 			const workerCwd = worker.worktree_path ?? config.leader.cwd;
 			const useSendKeysFallback = shouldDispatchWorkerWithSendKeys(config.tmux_command);

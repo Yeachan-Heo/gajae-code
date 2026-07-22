@@ -156,6 +156,18 @@ export function createAliasTable(): AliasTable {
 		},
 	};
 }
+/** Copy labels for display and annotate one valid recommended option only. */
+function withRecommendedOptionLabel(options: readonly string[], recommendedIndex: unknown): string[] {
+	if (
+		typeof recommendedIndex !== "number" ||
+		!Number.isFinite(recommendedIndex) ||
+		!Number.isInteger(recommendedIndex) ||
+		recommendedIndex < 0 ||
+		recommendedIndex >= options.length
+	)
+		return [...options];
+	return options.map((label, index) => (index === recommendedIndex ? `${label} (Recommended)` : label));
+}
 
 /** Render an `action_needed` payload into a Telegram message. */
 export function buildActionMessage(action: {
@@ -163,6 +175,7 @@ export function buildActionMessage(action: {
 	id: string;
 	question?: string;
 	options?: string[];
+	recommendedIndex?: unknown;
 	controls?: readonly TelegramActionControl[];
 	summary?: string;
 }): RenderedMessage {
@@ -172,9 +185,10 @@ export function buildActionMessage(action: {
 	}
 	const text = `❓ ${bold(action.question ?? "Question")}`;
 	const options = action.options ?? [];
+	const displayOptions = withRecommendedOptionLabel(options, action.recommendedIndex);
 	const controls = (action.controls ?? []).filter(control => control.enabled);
 	if (options.length === 0 && controls.length === 0) return { text: `${text}\n\n(reply with text)` };
-	const body = options.length ? `${text}\n\n${numberedOptionList(options)}` : text;
+	const body = options.length ? `${text}\n\n${numberedOptionList(displayOptions)}` : text;
 	const inline_keyboard = [
 		...(options.length ? buildCompactChoiceGrid(options, i => encodeCallbackData(action.id, i)) : []),
 		...controls.map(control => [
@@ -189,6 +203,7 @@ export function buildActionMarkdown(action: {
 	kind: "ask" | "idle";
 	question?: string;
 	options?: string[];
+	recommendedIndex?: unknown;
 	summary?: string;
 }): string {
 	if (action.kind === "idle") {
@@ -196,8 +211,9 @@ export function buildActionMarkdown(action: {
 	}
 	const heading = `❓ **${action.question ?? "Question"}**`;
 	const options = action.options ?? [];
+	const displayOptions = withRecommendedOptionLabel(options, action.recommendedIndex);
 	if (options.length === 0) return `${heading}\n\n(reply with text)`;
-	const list = options.map((label, i) => `${i + 1}. ${label.replace(/^\s*\d+[.)]\s+/, "")}`).join("\n");
+	const list = displayOptions.map((label, i) => `${i + 1}. ${label.replace(/^\s*\d+[.)]\s+/, "")}`).join("\n");
 	return `${heading}\n\n${list}`;
 }
 
@@ -362,6 +378,7 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 			id?: string;
 			question?: string;
 			options?: string[];
+			recommendedIndex?: unknown;
 			controls?: TelegramActionControl[];
 			summary?: string;
 			reason?: string;
@@ -374,6 +391,7 @@ export async function runTelegramReferenceClient(opts: TelegramReferenceOptions)
 				id: msg.id,
 				question: msg.question,
 				options: msg.options,
+				recommendedIndex: msg.recommendedIndex,
 				controls: msg.controls,
 				summary: msg.summary,
 			});

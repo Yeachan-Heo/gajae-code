@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { $ } from "bun";
 
@@ -45,17 +44,8 @@ async function buildArchiveBase64(dir: string): Promise<string> {
 		entries[relativePath] = await fs.readFile(filePath);
 	}
 
-	const tempArchivePath = path.join(
-		os.tmpdir(),
-		`gjc-stats-client-${Bun.hash(Date.now().toString() + Math.random().toString(16)).toString(16)}.tar.gz`,
-	);
-	try {
-		await Bun.Archive.write(tempArchivePath, entries, { compress: "gzip" });
-		const archiveBytes = await Bun.file(tempArchivePath).bytes();
-		return Buffer.from(archiveBytes).toString("base64");
-	} finally {
-		await fs.rm(tempArchivePath, { force: true });
-	}
+	const archiveBytes = await new Bun.Archive(entries, { compress: "gzip" }).bytes();
+	return Buffer.from(archiveBytes).toString("base64");
 }
 
 async function main(): Promise<void> {

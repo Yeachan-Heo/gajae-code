@@ -13,6 +13,10 @@
  * - Dry-run by default: nothing is deleted unless `--prune`/`--force`.
  */
 
+import { getAgentDir } from "@gajae-code/utils";
+import { SessionIndex } from "../sdk/broker/session-index";
+import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
+
 import { buildGcReportText } from "./gc-render";
 
 export type GcStore = "harness_leases" | "team_workers" | "file_locks" | "tmux_sessions" | "registry_entries";
@@ -115,11 +119,21 @@ export interface GcCounts {
 	>;
 }
 
+export interface GcSessionIndexHealth {
+	status: "healthy" | "corrupt" | "repaired" | "unsupported" | "repair_failed";
+	valid_prefix_seq: number;
+	snapshot_seq?: number;
+	reason?: string;
+	quarantine_path?: string;
+}
+
 export interface GcReport {
 	dry_run: boolean;
+	operation?: "dry_run" | "prune" | "repair_session_index";
 	stores: Record<GcStore, GcRecord[]>;
 	counts: GcCounts;
 	errors: GcError[];
+	session_index?: GcSessionIndexHealth;
 }
 
 export interface GcRunResult {
@@ -225,6 +239,7 @@ function computeCounts(stores: Record<GcStore, GcRecord[]>, errors: GcError[]): 
 interface ParsedGcArgs {
 	json: boolean;
 	prune: boolean;
+	repairSessionIndex: boolean;
 	help: boolean;
 }
 
@@ -233,6 +248,8 @@ class GcUsageError extends Error {}
 function parseGcArgs(argv: string[]): ParsedGcArgs {
 	let json = false;
 	let prune = false;
+	let repairSessionIndex = false;
+
 	let dryRun = false;
 	let help = false;
 	for (const arg of argv) {
@@ -245,6 +262,10 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 			case "--force":
 				prune = true;
 				break;
+			case "--repair-session-index":
+				repairSessionIndex = true;
+				break;
+
 			case "--dry-run":
 				dryRun = true;
 				break;
@@ -256,9 +277,11 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 				throw new GcUsageError(`unknown_flag:${arg}`);
 		}
 	}
+	if (repairSessionIndex && prune) throw new GcUsageError("repair_session_index_cannot_combine_with_prune");
+	if (repairSessionIndex && dryRun) throw new GcUsageError("repair_session_index_cannot_combine_with_dry_run");
 	// Explicit --dry-run always wins over --prune/--force.
 	if (dryRun) prune = false;
-	return { json, prune, help };
+	return { json, prune, repairSessionIndex, help };
 }
 
 /**
@@ -336,6 +359,40 @@ export function computeExitCode(report: GcReport): number {
 	return 0;
 }
 
+function resolveGcAgentDir(env: NodeJS.ProcessEnv): string {
+	return env.GJC_CODING_AGENT_DIR?.trim() || env.PI_CODING_AGENT_DIR?.trim() || getAgentDir();
+}
+
+async function collectSessionIndexHealth(repair: boolean, agentDir: string): Promise<GcSessionIndexHealth> {
+	const index = new SessionIndex(agentDir);
+	try {
+		if (repair) {
+			const result = await index.repair();
+			return {
+				status: result.status === "unsupported" ? "unsupported" : result.repaired ? "repaired" : "healthy",
+				valid_prefix_seq: result.validPrefixSeq,
+				snapshot_seq: result.snapshotSeq,
+				...(result.reason ? { reason: result.reason } : {}),
+				...(result.quarantinePath ? { quarantine_path: result.quarantinePath } : {}),
+			};
+		}
+		const diagnosis = await index.diagnose();
+		return {
+			status: diagnosis.status,
+			valid_prefix_seq: diagnosis.validPrefixSeq,
+			snapshot_seq: diagnosis.snapshotSeq,
+			...(diagnosis.reason ? { reason: diagnosis.reason } : {}),
+		};
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return {
+			status: error instanceof UnsupportedStateVersionError ? "unsupported" : "repair_failed",
+			valid_prefix_seq: 0,
+			reason,
+		};
+	}
+}
+
 export async function runGjcGcCommand(
 	argv: string[],
 	cwd: string = process.cwd(),
@@ -357,7 +414,13 @@ export async function runGjcGcCommand(
 	const resolvedAdapters = adapters ?? (await defaultGcAdapters());
 	const ctx: GcContext = { probe: gcPidProbe, force: parsed.prune, env, cwd };
 	const report = await collectGcReport(resolvedAdapters, ctx, parsed.prune);
-	const status = computeExitCode(report);
+	report.operation = parsed.repairSessionIndex ? "repair_session_index" : parsed.prune ? "prune" : "dry_run";
+	report.session_index = await collectSessionIndexHealth(parsed.repairSessionIndex, resolveGcAgentDir(env));
+	const sessionIndexFailed =
+		report.session_index?.status === "corrupt" ||
+		report.session_index?.status === "unsupported" ||
+		report.session_index?.status === "repair_failed";
+	const status = sessionIndexFailed ? 1 : computeExitCode(report);
 	const stdout = parsed.json ? `${JSON.stringify(report, null, 2)}\n` : buildGcReportText(report);
 	return { stdout, stderr: "", status };
 }
@@ -367,12 +430,14 @@ export function gcHelpText(): string {
 		"gjc gc - garbage-collect stale GJC session/PID records",
 		"",
 		"USAGE",
-		"  $ gjc gc [--prune|--force] [--json]",
+		"  $ gjc gc [--prune|--force] [--repair-session-index] [--json]",
+
 		"",
 		"FLAGS",
 		"  --prune, --force  Actually remove stale records (default: dry-run report only)",
 		"  --dry-run         Force report-only mode (overrides --prune/--force)",
 		"  -j, --json        Emit machine-readable JSON",
+		"  --repair-session-index  Explicitly quarantine a corrupt session-index suffix and retain its valid prefix",
 		"",
 		"Liveness-only: a record is removed only when its owning process is dead",
 		"(ESRCH). Live / permission-denied / unknown processes are always kept.",

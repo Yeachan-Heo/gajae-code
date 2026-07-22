@@ -970,4 +970,26 @@ describe("Tool argument coercion", () => {
 		const result = validateToolArguments(tool, toolCall) as Record<string, unknown>;
 		expect(result.op).toBe("fix");
 	});
+	it("runs an opt-in raw argument adapter before null normalization and terminal rejection", () => {
+		let observed: unknown;
+		const tool: Tool = {
+			name: "raw-adapter",
+			description: "",
+			parameters: z.object({ value: z.string().optional() }),
+			rawArgumentValidation: arguments_ => {
+				observed = arguments_.value;
+				return arguments_.value === "null" ? { outcome: "reject" } : { outcome: "passthrough" };
+			},
+		};
+
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "call-raw-adapter",
+				name: "raw-adapter",
+				arguments: { value: "null" },
+			}),
+		).toThrow("raw arguments rejected before coercion");
+		expect(observed).toBe("null");
+	});
 });

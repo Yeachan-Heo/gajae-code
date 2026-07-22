@@ -1,0 +1,10 @@
+{
+  "$schema": "sdk-frame-vectors/v1",
+  "kind": "record",
+  "name": "request response correlation pair",
+  "frames": [
+    { "type": "control_request", "id": "request-1", "operation": "status", "input": {} },
+    { "type": "control_response", "id": "request-1", "ok": true, "result": { "state": "ready" } }
+  ],
+  "expectations": { "correlatesBy": "id" }
+}

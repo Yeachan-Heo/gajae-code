@@ -1,3 +1,5 @@
+import { deepInterviewCharacterCount } from "../../../gjc-runtime/deep-interview-state";
+
 /** Transport-neutral workflow gate contract used by SDK workflow coordination. */
 
 /** Lifecycle stages that emit machine-addressable SDK workflow gates. */
@@ -14,12 +16,28 @@ export type WorkflowGateKind = "question" | "approval" | "execution";
 /** "Other (type your own)" sentinel, mirroring the interactive ask tool. */
 export const GATE_OTHER_OPTION = "Other (type your own)";
 
+/**
+ * Structured adapter context queued at interview start. Non-behavioral:
+ * `confused_terms` and `references` MUST NOT alter the first question, are never
+ * inferred from vocabulary density, and referenced `url`/`excerpt` are inert
+ * strings that are never auto-fetched.
+ */
+export interface AskGateReference {
+	reference_id: string;
+	label: string;
+	origin: string;
+	url?: string;
+	excerpt?: string;
+}
+
 export interface AskGateDeepInterviewState {
 	round_id?: string;
 	round: number;
 	component: string;
 	dimension: string;
 	ambiguity: number;
+	confused_terms?: string[];
+	references?: AskGateReference[];
 }
 
 export interface AskGateStageStateInput {
@@ -34,10 +52,90 @@ export interface AskGateStageStateInput {
 export interface AskGateSchemaInput {
 	multi?: boolean;
 	allowEmpty?: boolean;
+	customMaxLength?: number;
 }
 
 function isBoundedAskGateString(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0 && new TextEncoder().encode(value).byteLength <= 256;
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		deepInterviewCharacterCount(value) <= MAX_ASK_GATE_ADAPTER_STRING_LENGTH
+	);
+}
+
+/** Max characters for adapter metadata identifiers and confused terms. */
+const MAX_ASK_GATE_ADAPTER_STRING_LENGTH = 256;
+const MAX_ASK_GATE_DEEP_INTERVIEW_STRING_LENGTH = 128;
+/** Max characters for a longer inert reference string (url/excerpt); never fetched. */
+const MAX_ASK_GATE_LONG_STRING_LENGTH = 2048;
+const MAX_ASK_GATE_CONFUSED_TERMS = 32;
+const MAX_ASK_GATE_REFERENCES = 32;
+
+function isBoundedAskGateAdapterString(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		deepInterviewCharacterCount(value) <= MAX_ASK_GATE_ADAPTER_STRING_LENGTH
+	);
+}
+
+function isBoundedAskGateDeepInterviewString(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		deepInterviewCharacterCount(value) <= MAX_ASK_GATE_DEEP_INTERVIEW_STRING_LENGTH
+	);
+}
+
+function isBoundedAskGateLongString(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		deepInterviewCharacterCount(value) <= MAX_ASK_GATE_LONG_STRING_LENGTH
+	);
+}
+
+function isDenseArray(value: unknown[]): boolean {
+	for (let index = 0; index < value.length; index++) if (!Object.hasOwn(value, index)) return false;
+	return true;
+}
+
+function isValidAskGateConfusedTerms(value: unknown): value is string[] {
+	return (
+		Array.isArray(value) &&
+		isDenseArray(value) &&
+		value.length <= MAX_ASK_GATE_CONFUSED_TERMS &&
+		value.every(isBoundedAskGateAdapterString)
+	);
+}
+
+function isValidAskGateReference(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return false;
+	const ref = value as Record<string, unknown>;
+	const allowed = new Set(["reference_id", "label", "origin", "url", "excerpt"]);
+	if (Object.keys(ref).some(key => !allowed.has(key))) return false;
+	if (!Object.hasOwn(ref, "reference_id") || !Object.hasOwn(ref, "label") || !Object.hasOwn(ref, "origin"))
+		return false;
+	if (
+		!isBoundedAskGateAdapterString(ref.reference_id) ||
+		!isBoundedAskGateAdapterString(ref.label) ||
+		!isBoundedAskGateAdapterString(ref.origin)
+	)
+		return false;
+	if (ref.url !== undefined && !isBoundedAskGateLongString(ref.url)) return false;
+	if (ref.excerpt !== undefined && !isBoundedAskGateLongString(ref.excerpt)) return false;
+	return true;
+}
+
+function isValidAskGateReferences(value: unknown): boolean {
+	return (
+		Array.isArray(value) &&
+		isDenseArray(value) &&
+		value.length <= MAX_ASK_GATE_REFERENCES &&
+		value.every(isValidAskGateReference)
+	);
 }
 
 /** Rejects stage state that is not exactly compatible with the generic ask-gate producer. */
@@ -62,6 +160,8 @@ export function validateAskGateStageState(value: unknown): asserts value is Reco
 		"challenge_mode",
 		"ambiguity",
 		"topology_gate",
+		"confused_terms",
+		"references",
 	]);
 	if (Object.keys(state).some(key => !allowed.has(key))) throw new Error("ask gate stage_state has an unknown field");
 	if (
@@ -76,7 +176,10 @@ export function validateAskGateStageState(value: unknown): asserts value is Reco
 		throw new Error("ask gate stage_state has invalid required fields");
 	if (state.navigation_label !== undefined && state.navigation_label !== "Next" && state.navigation_label !== "Done")
 		throw new Error("ask gate stage_state has an invalid navigation label");
-	for (const key of ["round_id", "component", "dimension", "mode", "challenge_mode"])
+	for (const key of ["round_id", "component", "dimension"])
+		if (state[key] !== undefined && !isBoundedAskGateDeepInterviewString(state[key]))
+			throw new Error(`ask gate stage_state has an invalid ${key}`);
+	for (const key of ["mode", "challenge_mode"])
 		if (state[key] !== undefined && !isBoundedAskGateString(state[key]))
 			throw new Error(`ask gate stage_state has an invalid ${key}`);
 	if (state.deep_interview_metadata !== undefined && typeof state.deep_interview_metadata !== "boolean")
@@ -93,6 +196,10 @@ export function validateAskGateStageState(value: unknown): asserts value is Reco
 		throw new Error("ask gate stage_state has an invalid ambiguity");
 	if (state.topology_gate !== undefined && typeof state.topology_gate !== "boolean")
 		throw new Error("ask gate stage_state has an invalid topology flag");
+	if (state.confused_terms !== undefined && !isValidAskGateConfusedTerms(state.confused_terms))
+		throw new Error("ask gate stage_state has invalid confused_terms");
+	if (state.references !== undefined && !isValidAskGateReferences(state.references))
+		throw new Error("ask gate stage_state has invalid references");
 }
 
 /** Builds the canonical generic ask answer schema. */
@@ -114,6 +221,7 @@ export function buildAskGateAnswerSchema(question: AskGateSchemaInput, labels: s
 			custom: {
 				type: "string",
 				minLength: 1,
+				...(question.customMaxLength === undefined ? {} : { maxLength: question.customMaxLength }),
 				pattern: "\\S",
 				description: "free-text answer; required when `other` is true",
 			},
@@ -142,7 +250,12 @@ export function buildAskGateAnswerSchema(question: AskGateSchemaInput, labels: s
 				properties: {
 					selected: selectedWithOther,
 					other: { const: true },
-					custom: { type: "string", minLength: 1, pattern: "\\S" },
+					custom: {
+						type: "string",
+						minLength: 1,
+						...(question.customMaxLength === undefined ? {} : { maxLength: question.customMaxLength }),
+						pattern: "\\S",
+					},
 					action: { const: "answer" },
 				},
 				required: ["selected", "other", "custom"],
@@ -176,6 +289,10 @@ export function buildAskGateStageState(input: AskGateStageStateInput, labels: st
 					dimension: input.deepInterview.dimension,
 					ambiguity: input.deepInterview.ambiguity,
 					...(input.deepInterview.round_id === undefined ? {} : { round_id: input.deepInterview.round_id }),
+					...(input.deepInterview.confused_terms === undefined
+						? {}
+						: { confused_terms: input.deepInterview.confused_terms }),
+					...(input.deepInterview.references === undefined ? {} : { references: input.deepInterview.references }),
 				}
 			: (input.fallbackState ?? {})),
 	};

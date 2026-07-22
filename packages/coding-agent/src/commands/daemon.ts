@@ -1,7 +1,7 @@
 /**
  * Manage GJC background daemons (status/list/stop/reload).
  */
-import { Args, Command, Flags } from "@gajae-code/utils/cli";
+import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
 import {
 	type DaemonCommandAction,
 	type DaemonCommandArgs,
@@ -14,6 +14,18 @@ import { initTheme } from "../modes/theme/theme";
 import { runSdkSessionCli } from "../sdk/cli";
 
 const ACTIONS = [...DAEMON_ACTION_TOKENS, "discord-internal", "slack-internal", "session"] as const;
+
+function parsePositiveTimeout(raw: string | undefined, flagName: string): number | undefined {
+	if (raw === undefined) return undefined;
+	if (!/^[0-9]+$/.test(raw)) {
+		throw new CliParseError(`Expected ${flagName} to be a positive safe integer, got "${raw}"`);
+	}
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value) || value <= 0) {
+		throw new CliParseError(`Expected ${flagName} to be a positive safe integer, got "${raw}"`);
+	}
+	return value;
+}
 
 export default class Daemon extends Command {
 	static description =
@@ -41,8 +53,8 @@ export default class Daemon extends Command {
 		all: Flags.boolean({ description: "Target all registered daemon kinds" }),
 		json: Flags.boolean({ description: "Emit JSON output" }),
 		force: Flags.boolean({ description: "Allow hard-kill escalation when graceful stop times out" }),
-		"graceful-timeout-ms": Flags.integer({ description: "Cooperative stop timeout before escalation" }),
-		"kill-timeout-ms": Flags.integer({ description: "Wait for old pid death after SIGKILL" }),
+		"graceful-timeout-ms": Flags.string({ description: "Cooperative stop timeout before escalation" }),
+		"kill-timeout-ms": Flags.string({ description: "Wait for old pid death after SIGKILL" }),
 		"spawn-if-stopped": Flags.boolean({ description: "On reload, spawn even when no daemon is running" }),
 		smoke: Flags.boolean({ description: "Internal: run worker smoke without configuration or network" }),
 		"owner-id": Flags.string({ description: "Internal: daemon owner id" }),
@@ -64,6 +76,11 @@ export default class Daemon extends Command {
 		const rawAction = args.action ?? "status";
 		const positional = Array.isArray(args.kind) ? args.kind : args.kind ? [args.kind] : [];
 		const flagRec = flags as Record<string, unknown>;
+		const gracefulTimeoutMs = parsePositiveTimeout(
+			flagRec["graceful-timeout-ms"] as string | undefined,
+			"--graceful-timeout-ms",
+		);
+		const killTimeoutMs = parsePositiveTimeout(flagRec["kill-timeout-ms"] as string | undefined, "--kill-timeout-ms");
 		if (rawAction === "session") {
 			await runSdkSessionCli({
 				action: positional[0],
@@ -91,8 +108,8 @@ export default class Daemon extends Command {
 			json: Boolean(flags.json),
 			force: Boolean(flags.force),
 			verbose: Boolean(flags.verbose),
-			gracefulTimeoutMs: flagRec["graceful-timeout-ms"] as number | undefined,
-			killTimeoutMs: flagRec["kill-timeout-ms"] as number | undefined,
+			gracefulTimeoutMs,
+			killTimeoutMs,
 			spawnIfStopped: flagRec["spawn-if-stopped"] as boolean | undefined,
 			smoke: Boolean(flags.smoke),
 			ownerId: flagRec["owner-id"] as string | undefined,

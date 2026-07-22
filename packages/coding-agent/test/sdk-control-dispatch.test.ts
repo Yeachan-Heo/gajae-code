@@ -166,6 +166,39 @@ test("forwards an optional thinking level with model.set without changing legacy
 	]);
 });
 
+test("session.handoff surfaces the retained handoff document in the error details", async () => {
+	const row = OPERATIONS.find(operation => operation.sdkId === "session.handoff")!;
+	const surface = {
+		handoffSession: () => {
+			throw Object.assign(new Error("Handoff is unavailable for the current state."), {
+				code: "invalid_request",
+				handoffDocument: "## Goal\nRetained across the SDK wire",
+			});
+		},
+	} as unknown as ControlSurface;
+
+	const response = await dispatchControl(surface, row, {
+		...request(row),
+		input: { target: "focus" },
+	});
+
+	expect(response.ok).toBe(false);
+	expect(response.error?.code).toBe("invalid_request");
+	expect(response.error?.details).toEqual({ handoffDocument: "## Goal\nRetained across the SDK wire" });
+});
+
+test("non-handoff control failures do not attach handoff details", async () => {
+	const row = OPERATIONS.find(operation => operation.sdkId === "session.rename")!;
+	const surface = {
+		renameSession: () => {
+			throw Object.assign(new Error("bad"), { code: "invalid_request", handoffDocument: "leak" });
+		},
+	} as unknown as ControlSurface;
+	const response = await dispatchControl(surface, row, { ...request(row), input: { name: "x" } });
+	expect(response.ok).toBe(false);
+	expect(response.error?.details).toBeUndefined();
+});
+
 test("rejects unknown operations, malformed input, and missing destructive confirmation", async () => {
 	const surface = {} as ControlSurface;
 	const unknown = await dispatchControl(surface, undefined, { id: "x", operation: "no.such.operation", input: {} });

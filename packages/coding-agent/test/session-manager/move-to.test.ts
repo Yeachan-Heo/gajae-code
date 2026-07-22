@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -10,7 +10,6 @@ import {
 	syncSessionMoveDirectory,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { stripOuterDoubleQuotes } from "@gajae-code/coding-agent/tools/path-utils";
-import * as native from "@gajae-code/natives";
 import { getConfigRootDir, getSessionsDir, setAgentDir } from "@gajae-code/utils";
 import { resolveManagedScope } from "../../src/session/internal/managed-session-scope";
 import { makeAssistantMessage } from "./helpers";
@@ -193,42 +192,24 @@ describe("SessionManager.moveTo", () => {
 		expect(session.getSessionFile()).not.toBe(sessionFile);
 	});
 
-	it("rejects an EXDEV session move without mutating either authoritative source", async () => {
+	it("uses retained copy publication when a managed move cannot rename across devices", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "source", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
 		const sourceFile = session.getSessionFile()!;
-		const sourceContent = fs.readFileSync(sourceFile, "utf8");
-		const { path: artifactPath } = await session.allocateArtifactPath("bash");
-		if (!artifactPath) throw new Error("Expected artifact path");
-		await fsp.writeFile(artifactPath, "authoritative artifact");
+		const artifactId = await session.saveArtifact("authoritative artifact", "bash");
+		if (!artifactId) throw new Error("Expected artifact id");
+		const artifactPath = path.join(sourceFile.slice(0, -6), `${artifactId}.bash.log`);
 
 		const destinationFile = path.join(SessionManager.getDefaultSessionDir(cwdB), path.basename(sourceFile));
-		const realRename = native.renameNoReplacePath;
-		const rename = vi
-			.spyOn(native, "renameNoReplacePath")
-			.mockImplementation((source, destination) =>
-				String(source) === sourceFile ? { ok: false, code: "atomic_unavailable" } : realRename(source, destination),
-			);
-		const originalLink = fs.promises.link;
-		const forceCrossDevice = async () => {
-			const error = new Error("cross-device move") as NodeJS.ErrnoException;
-			error.code = "EXDEV";
-			throw error;
-		};
-		fs.promises.link = forceCrossDevice;
-		try {
-			await expect(session.moveTo(cwdB)).rejects.toThrow("native atomic detach/copy/verify support is required");
-		} finally {
-			rename.mockRestore();
-			fs.promises.link = originalLink;
-		}
+		await session.moveTo(cwdB);
 
-		expect(fs.readFileSync(sourceFile, "utf8")).toBe(sourceContent);
-		expect(fs.existsSync(destinationFile)).toBe(false);
-		expect(fs.existsSync(path.dirname(artifactPath))).toBe(true);
-		expect(await fsp.readFile(artifactPath, "utf8")).toBe("authoritative artifact");
+		expect(fs.existsSync(sourceFile)).toBe(false);
+		expect(fs.existsSync(destinationFile)).toBe(true);
+		expect(await fsp.readFile(path.join(destinationFile.slice(0, -6), path.basename(artifactPath)), "utf8")).toBe(
+			"authoritative artifact",
+		);
 	});
 
 	it("uses atomic rename without requiring hard-link support on the same device", async () => {
@@ -260,12 +241,12 @@ describe("SessionManager.moveTo", () => {
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
 		const sourceFile = session.getSessionFile()!;
-		const { path: artifactPath } = await session.allocateArtifactPath("bash");
-		if (!artifactPath) throw new Error("Expected artifact path");
+		const artifactId = await session.saveArtifact("top-level artifact", "bash");
+		if (!artifactId) throw new Error("Expected artifact id");
+		const artifactPath = path.join(sourceFile.slice(0, -6), `${artifactId}.bash.log`);
 		const sourceArtifacts = path.dirname(artifactPath);
-		await fsp.mkdir(path.join(sourceArtifacts, "nested", "empty"), { recursive: true });
-		await fsp.writeFile(artifactPath, "top-level artifact");
-		await fsp.writeFile(path.join(sourceArtifacts, "nested", "payload.txt"), "nested artifact");
+		await fsp.mkdir(path.join(sourceArtifacts, "nested", "empty"), { recursive: true, mode: 0o700 });
+		await fsp.writeFile(path.join(sourceArtifacts, "nested", "payload.txt"), "nested artifact", { mode: 0o600 });
 
 		await session.moveTo(cwdB);
 
@@ -284,9 +265,10 @@ describe("SessionManager.moveTo", () => {
 
 	it("moves an artifact directory without pre-creating the copy destination", async () => {
 		const session = SessionManager.create(cwdA);
-		const { path: artifactPath } = await session.allocateArtifactPath("bash");
-		if (!artifactPath) throw new Error("Expected artifact path");
-		await fsp.writeFile(artifactPath, "artifact");
+		const sourceFile = session.getSessionFile()!;
+		const artifactId = await session.saveArtifact("artifact", "bash");
+		if (!artifactId) throw new Error("Expected artifact id");
+		const artifactPath = path.join(sourceFile.slice(0, -6), `${artifactId}.bash.log`);
 
 		await session.moveTo(cwdB);
 
@@ -407,15 +389,15 @@ describe("SessionManager.moveTo", () => {
 
 	it("moves artifact dir independently when session file does not exist", async () => {
 		const session = SessionManager.create(cwdA);
-		// Allocate an artifact — creates dir via ArtifactManager
-		const { path: artifactPath } = await session.allocateArtifactPath("bash");
-		if (!artifactPath) throw new Error("Expected artifact path");
+		const oldFile = session.getSessionFile()!;
+		const artifactId = await session.saveArtifact("artifact", "bash");
+		if (!artifactId) throw new Error("Expected artifact id");
+		const artifactPath = path.join(oldFile.slice(0, -6), `${artifactId}.bash.log`);
 
 		const oldArtifactDir = path.dirname(artifactPath);
 		expect(fs.existsSync(oldArtifactDir)).toBe(true);
 
 		// No messages — session file doesn't exist
-		const oldFile = session.getSessionFile()!;
 		expect(fs.existsSync(oldFile)).toBe(false);
 
 		await session.moveTo(cwdB);

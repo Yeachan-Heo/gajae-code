@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import { SessionSelectorComponent } from "@gajae-code/coding-agent/modes/components/session-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
@@ -35,11 +35,15 @@ function createContext(currentSessionFile: string): {
 	calls: string[];
 	setCurrentSessionFile: (path: string) => void;
 	setCurrentSessionId: (id: string) => void;
+	setManagedDestination: (managed: boolean) => void;
 	showHookConfirm: (title: string, message: string) => Promise<boolean>;
 	newSession: () => Promise<boolean>;
+	prepareManagedCandidateForStrictAdoption: Mock<(targetPath: string) => Promise<string>>;
+	listForResumePickerReadOnly: Mock<() => Promise<SessionInfo[]>>;
 	switchSession: Mock<(targetPath: string) => Promise<boolean>>;
 } {
 	const calls: string[] = [];
+	let managedDestination = false;
 	let sessionFile = currentSessionFile;
 	let sessionId = currentSessionFile;
 	const editorContainer = {
@@ -65,6 +69,8 @@ function createContext(currentSessionFile: string): {
 		sessionId = targetPath;
 		return true;
 	});
+	const prepareManagedCandidateForStrictAdoption = vi.fn(async (targetPath: string) => targetPath);
+	const listForResumePickerReadOnly = vi.fn(async () => [] as SessionInfo[]);
 	const ctx = {
 		editorContainer,
 		editor: {},
@@ -90,6 +96,9 @@ function createContext(currentSessionFile: string): {
 			getSessionDir: () => "/tmp/project/sessions",
 			getSessionFile: () => sessionFile,
 			getSessionId: () => sessionId,
+			isManagedDestination: () => managedDestination,
+			prepareManagedCandidateForStrictAdoption,
+			listForResumePickerReadOnly,
 		},
 		chatContainer: {
 			clear: vi.fn(() => {
@@ -160,8 +169,13 @@ function createContext(currentSessionFile: string): {
 		setCurrentSessionId(id: string) {
 			sessionId = id;
 		},
+		setManagedDestination(managed: boolean) {
+			managedDestination = managed;
+		},
 		showHookConfirm,
 		newSession,
+		prepareManagedCandidateForStrictAdoption,
+		listForResumePickerReadOnly,
 		switchSession,
 	};
 }
@@ -175,10 +189,6 @@ beforeAll(() => {
 });
 
 describe("SelectorController session deletion", () => {
-	beforeEach(() => {
-		vi.spyOn(SessionManager, "listForResumePickerReadOnly").mockResolvedValue([]);
-	});
-
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -222,32 +232,89 @@ describe("SelectorController session deletion", () => {
 		expect(calls).not.toContain("rebuildInitialMessages:reconcile-same-transcript");
 	});
 
-	it("prepares a legacy managed candidate before switching", async () => {
+	it("prepares a legacy managed candidate against its inspected identity before switching", async () => {
 		const legacyPath = "/tmp/project/legacy/session.jsonl";
 		const migratedPath = "/tmp/project/v2/session.jsonl";
-		const { ctx, switchSession } = createContext("/tmp/project/sessions/a.jsonl");
-		vi.spyOn(SessionManager, "prepareManagedCandidateForWrite").mockResolvedValue(migratedPath);
+		const identity = {
+			canonicalPath: legacyPath,
+			sessionId: "legacy",
+			dev: 1n,
+			ino: 1n,
+			size: 1,
+			mtimeMs: 1,
+			mtimeNs: 1n,
+			sha256: "legacy",
+		};
+		const { ctx, switchSession, prepareManagedCandidateForStrictAdoption, setManagedDestination } = createContext(
+			"/tmp/project/sessions/a.jsonl",
+		);
+		setManagedDestination(true);
+		vi.spyOn(SessionManager, "inspectSessionTailReadOnly").mockResolvedValue({ kind: "resumable", identity });
+		prepareManagedCandidateForStrictAdoption.mockResolvedValue(migratedPath);
 		const controller = new SelectorController(ctx);
 
 		await controller.handleResumeSession(legacyPath);
 
-		expect(SessionManager.prepareManagedCandidateForWrite).toHaveBeenCalledWith(legacyPath, "copy-retain");
+		expect(prepareManagedCandidateForStrictAdoption).toHaveBeenCalledWith(legacyPath, "copy-retain", identity);
 		expect(switchSession).toHaveBeenCalledWith(migratedPath);
 	});
 
-	it("lists sessions from the active explicit session directory", async () => {
-		const { ctx } = createContext("/tmp/project/sessions/a.jsonl");
+	it("keeps explicit selections out of the managed migration fence", async () => {
+		const explicitPath = "/tmp/project/explicit/session.jsonl";
+		const { ctx, switchSession, prepareManagedCandidateForStrictAdoption } = createContext(
+			"/tmp/project/sessions/a.jsonl",
+		);
+		const inspection = vi.spyOn(SessionManager, "inspectSessionTailReadOnly");
+		const controller = new SelectorController(ctx);
+
+		await controller.handleResumeSession(explicitPath);
+
+		expect(inspection).not.toHaveBeenCalled();
+		expect(prepareManagedCandidateForStrictAdoption).not.toHaveBeenCalled();
+		expect(switchSession).toHaveBeenCalledWith(explicitPath);
+	});
+
+	it("does not switch after a managed replacement race rejects the inspected identity", async () => {
+		const selectedPath = "/tmp/project/legacy/session.jsonl";
+		const identity = {
+			canonicalPath: selectedPath,
+			sessionId: "selected",
+			dev: 1n,
+			ino: 1n,
+			size: 1,
+			mtimeMs: 1,
+			mtimeNs: 1n,
+			sha256: "before-replacement",
+		};
+		const { ctx, switchSession, prepareManagedCandidateForStrictAdoption, setManagedDestination } = createContext(
+			"/tmp/project/sessions/a.jsonl",
+		);
+		setManagedDestination(true);
+		vi.spyOn(SessionManager, "inspectSessionTailReadOnly").mockResolvedValue({ kind: "resumable", identity });
+		prepareManagedCandidateForStrictAdoption.mockRejectedValue(
+			new Error("Managed session changed before migration authority was adopted."),
+		);
+		const controller = new SelectorController(ctx);
+
+		await expect(controller.handleResumeSession(selectedPath)).rejects.toThrow("changed before migration");
+
+		expect(prepareManagedCandidateForStrictAdoption).toHaveBeenCalledWith(selectedPath, "copy-retain", identity);
+		expect(switchSession).not.toHaveBeenCalled();
+	});
+
+	it("lists sessions through the active manager's captured destination authority", async () => {
+		const { ctx, listForResumePickerReadOnly } = createContext("/tmp/project/sessions/a.jsonl");
 		const controller = new SelectorController(ctx);
 
 		await controller.showSessionSelector();
 
-		expect(SessionManager.listForResumePickerReadOnly).toHaveBeenCalledWith("/tmp/project", "/tmp/project/sessions");
+		expect(listForResumePickerReadOnly).toHaveBeenCalledWith();
 	});
 
 	it("detaches the active session before selector deletion removes it", async () => {
 		const activeSession = makeSessionInfo("/tmp/project/sessions/active.jsonl");
-		const { ctx, calls } = createContext(activeSession.path);
-		vi.spyOn(SessionManager, "listForResumePickerReadOnly").mockResolvedValue([activeSession]);
+		const { ctx, calls, listForResumePickerReadOnly } = createContext(activeSession.path);
+		listForResumePickerReadOnly.mockResolvedValue([activeSession]);
 		const dropSession = vi.fn(async (sessionPath: string) => {
 			calls.push(`deleteManaged:${sessionPath}`);
 		});
@@ -295,8 +362,8 @@ describe("SelectorController session deletion", () => {
 
 	it("shows inline selector errors when session deletion fails after detach", async () => {
 		const activeSession = makeSessionInfo("/tmp/project/sessions/active.jsonl");
-		const { ctx, newSession } = createContext(activeSession.path);
-		vi.spyOn(SessionManager, "listForResumePickerReadOnly").mockResolvedValue([activeSession]);
+		const { ctx, newSession, listForResumePickerReadOnly } = createContext(activeSession.path);
+		listForResumePickerReadOnly.mockResolvedValue([activeSession]);
 		const deleteSessionWithArtifacts = vi
 			.spyOn(FileSessionStorage.prototype, "deleteSessionWithArtifacts")
 			.mockRejectedValue(new Error("disk failed"));

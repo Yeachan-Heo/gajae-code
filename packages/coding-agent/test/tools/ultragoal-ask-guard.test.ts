@@ -281,7 +281,13 @@ describe("ultragoal ask guard", () => {
 		plan.goals[0].updatedAt = now;
 		plan.goals[0].completedAt = now;
 		const eventId = "event-final";
-		const qualityGateJson = {};
+		const qualityGateJson = {
+			criticReview: {
+				verdict: "OKAY",
+				evidence: "critic approved the final aggregate completion",
+				blockers: [],
+			},
+		};
 		const generation = computeUltragoalPlanGeneration({
 			plan,
 			ledger: [],

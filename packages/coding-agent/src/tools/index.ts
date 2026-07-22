@@ -137,6 +137,8 @@ export interface AskAnswerRequest {
 	options: string[];
 	interaction: "selector" | "custom_editor" | "clarification_editor";
 	controls: readonly AskRemoteControl[];
+	/** Optional zero-based recommendation into the authoritative raw options. */
+	recommendedIndex?: number;
 }
 
 export type AskRemoteInteraction =
@@ -216,6 +218,8 @@ export interface ToolSession {
 	cwd: string;
 	/** Whether UI is available */
 	hasUI: boolean;
+	/** Whether this session will bind a workflow-gate emitter after tool construction. */
+	workflowGateEligible?: boolean;
 	/** Skip Python kernel availability check and warmup */
 	skipPythonPreflight?: boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */
@@ -262,6 +266,8 @@ export interface ToolSession {
 	requestForegroundBashBackground?: () => boolean;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Whether local:// must use external managed scratch instead of artifacts/local. */
+	isManagedSessionDestination?: () => boolean;
 	/** Get Hindsight runtime state for this agent session. */
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "0-Main", "0-AuthLoader"). */

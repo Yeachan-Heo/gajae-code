@@ -187,13 +187,25 @@ describe("LSP lifecycle behavior", () => {
 				runner,
 				`import { detectLspmux } from ${JSON.stringify(path.resolve(import.meta.dir, "../../src/lsp/lspmux.ts"))};\nimport { liveOwnedProcessCount, disposeAllOwnedProcesses } from ${JSON.stringify(path.resolve(import.meta.dir, "../../src/runtime/process-lifecycle.ts"))};\nconst before = liveOwnedProcessCount();\nconst state = await detectLspmux();\nconst after = liveOwnedProcessCount();\nawait disposeAllOwnedProcesses();\nconsole.log(JSON.stringify({ state, before, after }));\n`,
 			);
+			// Hermetic probe: bun test shares one process across test files, so
+			// ambient state left by another file must not reach this probe.
+			// (1) A disable flag in Bun.env (GJC_DISABLE_LSPMUX / PI_DISABLE_LSPMUX)
+			//     would short-circuit detectLspmux() to available:false.
+			// (2) A drifted process.cwd() (an earlier test that chdir'd into a temp
+			//     dir without restoring) would make the trust root a temp ancestor of
+			//     binDir, so the external lspmux is misjudged project-controlled and
+			//     available flips false. Pin cwd to this in-repo test dir so the trust
+			//     root resolves to the repo and binDir (under os.tmpdir()) stays external.
+			const probeEnv: Record<string, string | undefined> = {
+				...Bun.env,
+				PATH: ORIGINAL_PATH ? `${binDir}${path.delimiter}${ORIGINAL_PATH}` : binDir,
+				XDG_CONFIG_HOME: configHome,
+			};
+			delete probeEnv.GJC_DISABLE_LSPMUX;
+			delete probeEnv.PI_DISABLE_LSPMUX;
 			const proc = Bun.spawn([BUN, runner], {
-				cwd: path.resolve("."),
-				env: {
-					...Bun.env,
-					PATH: ORIGINAL_PATH ? `${binDir}${path.delimiter}${ORIGINAL_PATH}` : binDir,
-					XDG_CONFIG_HOME: configHome,
-				},
+				cwd: import.meta.dir,
+				env: probeEnv,
 				stdout: "pipe",
 				stderr: "pipe",
 			});

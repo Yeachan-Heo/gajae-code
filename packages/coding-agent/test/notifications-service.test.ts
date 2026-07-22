@@ -2,8 +2,9 @@ import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
-import { tokenFingerprint } from "../src/sdk/bus/config";
+import { getNotificationConfig, tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
+import { ensureConfiguredProviderDaemons } from "../src/sdk/bus/index";
 import type {
 	NotificationEndpointFileIdentity,
 	NotificationExactUnlinkResult,
@@ -106,12 +107,16 @@ function mockFs(
 			store.delete(file);
 			unlinked.push(file);
 		},
-		async createExclusive(file) {
-			if (store.has(file)) return false;
-			store.set(file, "");
-			created.push(file);
-			opts.onAcquireExclusive?.(file, store);
-			return true;
+		async writeFile(file, data, writeOpts) {
+			const exclusive =
+				typeof writeOpts === "object" && writeOpts !== null && "flag" in writeOpts && writeOpts.flag === "wx";
+			if (exclusive && store.has(file)) throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+			store.set(file, data.toString());
+			revisions.set(file, (revisions.get(file) ?? 0) + 1);
+			if (exclusive) {
+				created.push(file);
+				opts.onAcquireExclusive?.(file, store);
+			}
 		},
 	};
 	return { fs, unlinked, created, store };
@@ -147,6 +152,52 @@ describe("notification-service status", () => {
 		expect(report.telegram.configured).toBe(true);
 		expect(text).toContain("redact: true");
 		expect(text).toContain(`telegram.fingerprint: ${tokenFingerprint(TOKEN)}`);
+	});
+});
+
+describe("configured chat daemon readiness", () => {
+	test("awaits every configured provider before startup can publish identity", async () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.applicationId": "app",
+			"notifications.discord.guildId": "guild",
+			"notifications.discord.parentChannelId": "channel",
+			"notifications.slack.botToken": "slack-bot-token",
+			"notifications.slack.appToken": "slack-app-token",
+			"notifications.slack.workspaceId": "workspace",
+			"notifications.slack.channelId": "channel",
+		});
+		const calls: string[] = [];
+
+		await ensureConfiguredProviderDaemons(settings, getNotificationConfig(settings), async provider => {
+			calls.push(provider);
+		});
+
+		expect(calls).toEqual(["discord", "slack"]);
+	});
+
+	test("propagates configured provider readiness failures instead of reporting startup success", async () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.applicationId": "app",
+			"notifications.discord.guildId": "guild",
+			"notifications.discord.parentChannelId": "channel",
+			"notifications.slack.botToken": "slack-bot-token",
+			"notifications.slack.appToken": "slack-app-token",
+			"notifications.slack.workspaceId": "workspace",
+			"notifications.slack.channelId": "channel",
+		});
+		const calls: string[] = [];
+
+		await expect(
+			ensureConfiguredProviderDaemons(settings, getNotificationConfig(settings), async provider => {
+				calls.push(provider);
+				if (provider === "discord") throw new Error("Discord gateway authentication failed");
+			}),
+		).rejects.toThrow("Discord gateway authentication failed");
+		expect(calls).toEqual(["discord"]);
 	});
 });
 
@@ -739,6 +790,97 @@ describe("notification-service recovery", () => {
 		expect(formatNotificationRecoveryReport(report)).toContain(`retained detached endpoint ${detached}`);
 		expect(unlinked).toEqual([]);
 		expect(store.has(detached)).toBe(true);
+	});
+	test("reports detached stale endpoints and retained successors as separate recovery paths", async () => {
+		const endpoint = path.join(epDir, "raced.json");
+		const detached = path.join(epDir, ".gjc-delete-notification-endpoint-raced.json");
+		const successor = path.join(epDir, ".gjc-exact-unlink-placeholder-raced.json");
+		const { fs, unlinked } = mockFs(
+			{
+				[endpoint]: JSON.stringify({ sessionId: "raced", url: "ws://x", token: "t", pid: 999 }),
+				[detached]: JSON.stringify({ stale: true }),
+				[successor]: JSON.stringify({ live: true }),
+			},
+			{
+				exactUnlinkResult: file =>
+					file === endpoint
+						? {
+								ok: false,
+								code: "identity_mismatch",
+								detachedPath: detached,
+								retainedSuccessorPath: successor,
+							}
+						: undefined,
+			},
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: () => false },
+		});
+
+		expect(report.endpointsDetached).toEqual([detached]);
+		expect(report.endpointsRetainedSuccessors).toEqual([successor]);
+		expect(report.endpointsRetainedPlaceholders).toEqual([]);
+		expect(report.endpointsKept).toBe(0);
+		expect(formatNotificationRecoveryReport(report)).toContain(`retained detached endpoint ${detached}`);
+		expect(formatNotificationRecoveryReport(report)).toContain(`retained successor endpoint ${successor}`);
+		expect(unlinked).toEqual([]);
+	});
+	test("reports a retained internal exchange placeholder separately from stale objects and live successors", async () => {
+		const endpoint = path.join(epDir, "placeholder.json");
+		const placeholder = path.join(epDir, ".gjc-exact-unlink-placeholder-verified");
+		const { fs, unlinked } = mockFs(
+			{
+				[endpoint]: JSON.stringify({ sessionId: "placeholder", url: "ws://x", token: "t", pid: 999 }),
+				[placeholder]: JSON.stringify({ internal: true }),
+			},
+			{
+				exactUnlinkResult: file =>
+					file === endpoint ? { ok: false, code: "io_error", retainedPlaceholderPath: placeholder } : undefined,
+			},
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: () => false },
+		});
+
+		expect(report.endpointsScanned).toBe(1);
+		expect(report.endpointsDetached).toEqual([]);
+		expect(report.endpointsRetainedSuccessors).toEqual([]);
+		expect(report.endpointsRetainedPlaceholders).toEqual([placeholder]);
+		expect(report.endpointsKept).toBe(0);
+		expect(formatNotificationRecoveryReport(report)).toContain(
+			`retained exchange placeholder cleanup path ${placeholder}`,
+		);
+		expect(unlinked).toEqual([]);
+	});
+	test("reports an unverified retained cleanup entry separately from stale objects and verified placeholders", async () => {
+		const endpoint = path.join(epDir, "unknown.json");
+		const unknown = path.join(epDir, ".gjc-exact-unlink-placeholder-mismatch");
+		const { fs, unlinked } = mockFs(
+			{
+				[endpoint]: JSON.stringify({ sessionId: "unknown", url: "ws://x", token: "t", pid: 999 }),
+				[unknown]: JSON.stringify({ unverified: true }),
+			},
+			{
+				exactUnlinkResult: file =>
+					file === endpoint ? { ok: false, code: "identity_mismatch", retainedUnknownPath: unknown } : undefined,
+			},
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, pidAlive: () => false },
+		});
+
+		expect(report.endpointsDetached).toEqual([]);
+		expect(report.endpointsRetainedSuccessors).toEqual([]);
+		expect(report.endpointsRetainedPlaceholders).toEqual([]);
+		expect(report.endpointsRetainedUnknown).toEqual([unknown]);
+		expect(formatNotificationRecoveryReport(report)).toContain(`retained unverified cleanup path ${unknown}`);
+		expect(unlinked).toEqual([]);
 	});
 
 	test("leaves a lock untouched when required daemon ownership metadata is invalid", async () => {

@@ -49,7 +49,7 @@ export const APP_ACTION_METADATA: readonly ActionMetadata[] = [
 	action("app.clipboard.copyPrompt", "Copy prompt", "Clipboard", ["composer"]),
 	action("app.session.new", "New session", "Session", ["composer"]),
 	action("app.session.tree", "Session tree", "Session", ["composer"]),
-	action("app.session.fork", "Fork session", "Session", ["composer"]),
+	action("app.session.fork", "Branch from message", "Session", ["composer"]),
 	action("app.session.resume", "Resume session", "Session", ["composer"]),
 	action("app.session.observe", "Observe sessions", "Session", ["composer"]),
 	action("app.session.dashboard", "Show sessions dashboard", "Session", ["composer"]),

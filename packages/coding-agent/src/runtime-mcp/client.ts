@@ -15,15 +15,12 @@ import type {
 	MCPInitializeParams,
 	MCPInitializeResult,
 	MCPPrompt,
-	MCPPromptsListResult,
 	MCPRequestOptions,
 	MCPResource,
 	MCPResourceReadParams,
 	MCPResourceReadResult,
 	MCPResourceSubscribeParams,
-	MCPResourcesListResult,
 	MCPResourceTemplate,
-	MCPResourceTemplatesListResult,
 	MCPServerCapabilities,
 	MCPServerConfig,
 	MCPServerConnection,
@@ -42,6 +39,9 @@ const PROTOCOL_VERSION = "2025-03-26";
 
 /** Default connection timeout in ms */
 const CONNECTION_TIMEOUT_MS = 30_000;
+
+const MAX_PAGINATION_PAGES = 100,
+	MAX_PAGINATION_ITEMS = 10_000;
 
 /** Client info sent during initialization */
 const CLIENT_INFO = {
@@ -107,6 +107,40 @@ function decodeToolsListResult(value: unknown): MCPToolsListResult {
 	});
 
 	return value.nextCursor === undefined ? { tools } : { tools, nextCursor: value.nextCursor };
+}
+
+async function collectPaginated<T>(
+	connection: MCPServerConnection,
+	options: MCPRequestOptions | undefined,
+	method: string,
+	itemKey: string,
+	items: T[],
+	decode?: (value: unknown) => unknown,
+): Promise<void> {
+	const seenCursors = new Set<string>();
+	const failure = (detail: string) => new MCPExpectedFailure(new Error(`MCP ${method} pagination ${detail}`));
+	let cursor: string | undefined;
+	for (let page = 1; page <= MAX_PAGINATION_PAGES; page++) {
+		const value = await connection.transport.request<unknown>(method, cursor ? { cursor } : {}, options);
+		const result = decode ? decode(value) : value;
+		if (
+			!isRecord(result) ||
+			!Array.isArray(result[itemKey]) ||
+			(result.nextCursor !== undefined && typeof result.nextCursor !== "string")
+		)
+			throw new MCPExpectedFailure();
+		const nextCursor = result.nextCursor as string | undefined;
+		if (nextCursor && seenCursors.has(nextCursor)) throw failure("repeated a cursor");
+		const pageItems = result[itemKey] as T[];
+		const itemCount = items.length + pageItems.length;
+		if (itemCount > MAX_PAGINATION_ITEMS || (itemCount === MAX_PAGINATION_ITEMS && nextCursor))
+			throw failure("did not complete within the 10000-item budget");
+		items.push(...pageItems);
+		if (!nextCursor) return;
+		if (page === MAX_PAGINATION_PAGES) throw failure("did not complete within the 100-page budget");
+		seenCursors.add(nextCursor);
+		cursor = nextCursor;
+	}
 }
 
 /**
@@ -292,18 +326,7 @@ export async function listTools(
 	}
 
 	const allTools: MCPToolDefinition[] = [];
-	let cursor: string | undefined;
-
-	do {
-		const params: Record<string, unknown> = {};
-		if (cursor) {
-			params.cursor = cursor;
-		}
-
-		const result = decodeToolsListResult(await connection.transport.request<unknown>("tools/list", params, options));
-		allTools.push(...result.tools);
-		cursor = result.nextCursor;
-	} while (cursor);
+	await collectPaginated(connection, options, "tools/list", "tools", allTools, decodeToolsListResult);
 
 	// Cache tools
 	connection.tools = allTools;
@@ -362,18 +385,7 @@ export async function listResources(
 	}
 
 	const allResources: MCPResource[] = [];
-	let cursor: string | undefined;
-
-	do {
-		const params: Record<string, unknown> = {};
-		if (cursor) {
-			params.cursor = cursor;
-		}
-
-		const result = await connection.transport.request<MCPResourcesListResult>("resources/list", params, options);
-		allResources.push(...result.resources);
-		cursor = result.nextCursor;
-	} while (cursor);
+	await collectPaginated(connection, options, "resources/list", "resources", allResources);
 
 	connection.resources = allResources;
 	return allResources;
@@ -395,22 +407,7 @@ export async function listResourceTemplates(
 	}
 
 	const allTemplates: MCPResourceTemplate[] = [];
-	let cursor: string | undefined;
-
-	do {
-		const params: Record<string, unknown> = {};
-		if (cursor) {
-			params.cursor = cursor;
-		}
-
-		const result = await connection.transport.request<MCPResourceTemplatesListResult>(
-			"resources/templates/list",
-			params,
-			options,
-		);
-		allTemplates.push(...result.resourceTemplates);
-		cursor = result.nextCursor;
-	} while (cursor);
+	await collectPaginated(connection, options, "resources/templates/list", "resourceTemplates", allTemplates);
 
 	connection.resourceTemplates = allTemplates;
 	return allTemplates;
@@ -514,18 +511,7 @@ export async function listPrompts(
 	}
 
 	const allPrompts: MCPPrompt[] = [];
-	let cursor: string | undefined;
-
-	do {
-		const params: Record<string, unknown> = {};
-		if (cursor) {
-			params.cursor = cursor;
-		}
-
-		const result = await connection.transport.request<MCPPromptsListResult>("prompts/list", params, options);
-		allPrompts.push(...result.prompts);
-		cursor = result.nextCursor;
-	} while (cursor);
+	await collectPaginated(connection, options, "prompts/list", "prompts", allPrompts);
 
 	connection.prompts = allPrompts;
 	return allPrompts;

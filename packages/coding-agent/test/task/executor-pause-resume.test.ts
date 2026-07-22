@@ -2,14 +2,15 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AgentEvent } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { AsyncJobManager } from "../../src/async/job-manager";
-import { kNoAuth } from "../../src/config/model-registry";
+import { kNoAuth, type ModelRegistry } from "../../src/config/model-registry";
 
 import { Settings } from "../../src/config/settings";
 import type { LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "../../src/session/agent-session";
-import { runSubprocess } from "../../src/task/executor";
+import { SessionManager } from "../../src/session/session-manager";
+import { ManagedTaskPersistence, runSubprocess } from "../../src/task/executor";
 import type { AgentDefinition } from "../../src/task/types";
 import { EventBus } from "../../src/utils/event-bus";
 
@@ -131,7 +132,7 @@ describe("runSubprocess pause/resume integration", () => {
 				refresh: async () => {},
 				getAvailable: () => [],
 				getApiKey: async () => kNoAuth,
-			} as unknown as import("../../src/config/model-registry").ModelRegistry,
+			} as unknown as ModelRegistry,
 			enableLsp: false,
 		});
 
@@ -141,5 +142,44 @@ describe("runSubprocess pause/resume integration", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.error).toBeUndefined();
 		expect(manager.getLiveHandle(subagentId)).toBeUndefined();
+	});
+
+	it("makes managed publication failure terminal even after a pause", async () => {
+		const subagentId = "paused-publication-failure";
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(manager);
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			const session = createPauseSession(options ?? {}, subagentId);
+			return createSessionResult(session);
+		});
+		const persistence = Object.create(ManagedTaskPersistence.prototype) as ManagedTaskPersistence;
+		vi.spyOn(persistence, "openSession").mockResolvedValue(SessionManager.inMemory("/tmp"));
+		vi.spyOn(persistence, "publishOutput").mockRejectedValue(new Error("selector commit failed"));
+		const result = await runSubprocess({
+			cwd: "/tmp",
+			agent: {
+				name: "executor",
+				description: "test executor",
+				systemPrompt: "test",
+				source: "bundled",
+			},
+			task: "pause before failed publication",
+			index: 0,
+			id: subagentId,
+			subagentId,
+			settings: Settings.isolated(),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [],
+				getApiKey: async () => kNoAuth,
+			} as unknown as ModelRegistry,
+			enableLsp: false,
+			artifactsDir: "/tmp/managed-artifacts",
+			managedPersistence: persistence,
+		});
+		expect(result.paused).toBe(false);
+		expect(result.exitCode).toBe(1);
+		expect(result.error).toContain("Managed output publication failed: selector commit failed");
+		expect(result.retryFailure?.errorMessage).toContain("selector commit failed");
 	});
 });

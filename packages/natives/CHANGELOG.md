@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-07-20
+### Added
+- `Process.signalRoot` exposes stable root-only process signaling, and identity-bound exact unlink reports stale quarantines, live successors, and retained internal exchange-placeholder cleanup paths as distinct recovery evidence.
+- Added Linux-only descriptor-relative recovery filesystem authority with no-follow trusted-root stat, bounded read, exclusive create, no-replace install, fsync, and stable identity operations. Unsupported platforms and unsafe traversal, symlink, special-file, hard-link, oversized-content, or identity-swap evidence fail closed (#2681).
+- Linux owner-only path security now treats only definitive `ENOTSUP`/`EOPNOTSUPP` results from the exact POSIX ACL operation as proof that ACL storage is unsupported, while preserving descriptor-relative no-follow traversal, ownership, exact mode, type, identity, replacement, and fail-closed error checks for files and directories (#2687).
+
 ## [0.11.2] - 2026-07-19
 
 ### Fixed

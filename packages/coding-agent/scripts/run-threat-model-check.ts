@@ -14,6 +14,61 @@ function assert(condition: unknown, message: string): asserts condition {
 	if (!condition) throw new Error(message);
 }
 
+async function sourceFiles(root: string): Promise<string[]> {
+	const files: string[] = [];
+	for (const entry of await fs.readdir(root, { withFileTypes: true })) {
+		const file = path.join(root, entry.name);
+		if (entry.isDirectory()) files.push(...(await sourceFiles(file)));
+		else if (/\.(?:ts|tsx|js|mjs|cjs)$/.test(entry.name)) files.push(file);
+	}
+	return files;
+}
+
+function hasDiscoverySignalAuthority(source: string): boolean {
+	return /(?:process\.)?kill\s*\(\s*(?:discovery|brokerDiscovery|record)\.pid\s*,\s*["']SIG(?:TERM|KILL)["']/m.test(
+		source,
+	);
+}
+
+async function assertNoDiscoverySignalAuthority(): Promise<void> {
+	const roots = [path.resolve(import.meta.dir, "../src/sdk"), path.resolve(import.meta.dir, "../test")];
+	const offenders: string[] = [];
+	for (const root of roots) {
+		for (const file of await sourceFiles(root)) {
+			if (hasDiscoverySignalAuthority(await fs.readFile(file, "utf8")))
+				offenders.push(path.relative(process.cwd(), file));
+		}
+	}
+	assert(offenders.length === 0, `Discovery-derived TERM/KILL authority remains in: ${offenders.join(", ")}`);
+	assert(
+		hasDiscoverySignalAuthority('process.kill(discovery.pid, "SIGTERM")'),
+		"Synthetic forbidden discovery signal was not detected",
+	);
+	assert(
+		!hasDiscoverySignalAuthority("process.kill(discovery.pid, 0)"),
+		"PID-zero observation was escalated to signal authority",
+	);
+}
+
+async function assertFixtureControlsStayTestOnly(): Promise<void> {
+	const productionRoot = path.resolve(import.meta.dir, "../src");
+	const offenders: string[] = [];
+	for (const file of await sourceFiles(productionRoot)) {
+		const source = await fs.readFile(file, "utf8");
+		if (/\b(?:GSF1|SSH1)\b/.test(source)) offenders.push(path.relative(process.cwd(), file));
+	}
+	assert(
+		offenders.length === 0,
+		`Fixture control frames are reachable from production source: ${offenders.join(", ")}`,
+	);
+	const ensureSource = await fs.readFile(path.resolve(import.meta.dir, "../src/sdk/broker/ensure.ts"), "utf8");
+	assert(
+		ensureSource.includes("startFixtureBrokerCommandWithLeaseForTest"),
+		"Dedicated fixture launch boundary is missing its explicit ForTest label",
+	);
+	assert(!/GJC_.*(?:GSF1|SSH1|SELF_REAP)/.test(ensureSource), "Production environment can select fixture controls");
+}
+
 async function rejectedWebSocket(url: string): Promise<void> {
 	const ws = new WebSocket(url);
 	await new Promise<void>((resolve, reject) => {
@@ -132,6 +187,11 @@ async function main(): Promise<void> {
 				assert(!discovery.url.includes("0.0.0.0"), "non-loopback broker URL exists");
 				await rejectedWebSocket(`${discovery.url}/?token=wrong-token`);
 			},
+			"broker-discovery-derived-signal-authority-forbidden": assertNoDiscoverySignalAuthority,
+			"broker-pid-zero-observation-allowed": async () => {
+				assert(!hasDiscoverySignalAuthority("process.kill(discovery.pid, 0)"), "PID-zero observation was rejected");
+			},
+			"broker-fixture-control-nonproduction-reachability": assertFixtureControlsStayTestOnly,
 		};
 		for (const check of manifest.checks) {
 			try {

@@ -6,6 +6,19 @@ on:
   pull_request:
     branches: [dev]
   workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Base branch ref whose tip must equal base_sha.
+        required: true
+        type: string
+      base_sha:
+        description: Exact 40-hex base commit SHA to compare against base_ref.
+        required: true
+        type: string
+      base_repository:
+        description: Base owner/repository containing base_ref (must be this repository).
+        required: true
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -25,13 +38,16 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       has_tasks: ${{ steps.plan.outputs.has_tasks }}
       has_native: ${{ steps.plan.outputs.has_native }}
+      has_python: ${{ steps.plan.outputs.has_python }}
+      has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}
+      has_windows_session_path: ${{ steps.plan.outputs.has_windows_session_path }}
       changed_paths: ${{ steps.plan.outputs.changed_paths }}
       plan_mode: ${{ steps.plan.outputs.plan_mode }}
       plan_digest: ${{ steps.plan.outputs.plan_digest }}
       plan_source_sha: ${{ steps.plan.outputs.plan_source_sha }}
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
       CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -45,7 +61,7 @@ jobs:
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-04-29
@@ -65,10 +81,100 @@ jobs:
           retention-days: 1
           overwrite: true
 
-  windows-dev-doctor:
-    name: Windows dev:doctor
+
+  telegram-daemon-generation:
+    name: Telegram daemon generation guard
     needs: [affected-plan]
-    if: ${{ needs.affected-plan.outputs.relevant == 'true' && contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
+      GITHUB_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.event_name == 'workflow_dispatch' && inputs.base_ref || github.ref_name }}
+      HEAD_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+      BASE_REPOSITORY: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.repo.full_name || github.event_name == 'workflow_dispatch' && inputs.base_repository || github.repository }}
+      HEAD_REPOSITORY: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+      GUARD_EVENT_NAME: ${{ github.event_name }}
+      GUARD_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Validate exact guard inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha='^[0-9a-fA-F]{40}$'
+          repo='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+          [[ "${GITHUB_BASE_SHA}" =~ ${sha} ]] || { echo "Guard base SHA must be an exact 40-hex commit"; exit 1; }
+          [[ "${GITHUB_HEAD_SHA}" =~ ${sha} ]] || { echo "Guard head SHA must be an exact 40-hex commit"; exit 1; }
+          [[ "${BASE_REPOSITORY}" =~ ${repo} ]] || { echo "Guard base repository is invalid"; exit 1; }
+          [[ "${HEAD_REPOSITORY}" =~ ${repo} ]] || { echo "Guard head repository is invalid"; exit 1; }
+          [[ "${GUARD_REPOSITORY}" =~ ${repo} ]] || { echo "Guard repository is invalid"; exit 1; }
+          git check-ref-format --branch "${BASE_REF}" >/dev/null || { echo "Guard base ref is not a valid branch ref"; exit 1; }
+          git check-ref-format --branch "${HEAD_REF}" >/dev/null || { echo "Guard head ref is not a valid branch ref"; exit 1; }
+          case "${GUARD_EVENT_NAME}" in
+            pull_request) [[ "${BASE_REPOSITORY}" == "${GUARD_REPOSITORY}" ]] || { echo "PR base repository must be this repository"; exit 1; } ;;
+            push|workflow_dispatch) [[ "${BASE_REPOSITORY}" == "${GUARD_REPOSITORY}" && "${HEAD_REPOSITORY}" == "${GUARD_REPOSITORY}" ]] || { echo "Push and dispatch repositories must be this repository"; exit 1; } ;;
+            *) echo "Unsupported guard event"; exit 1 ;;
+          esac
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: ${{ env.HEAD_REPOSITORY }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          [[ "${head}" == "${GITHUB_HEAD_SHA}" ]] || { echo "Checked-out SHA ${head} does not match ${GITHUB_HEAD_SHA}"; exit 1; }
+      - name: Fetch and prove authoritative guard revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add guard-head "https://github.com/${HEAD_REPOSITORY}.git"
+          git remote add guard-base "https://github.com/${BASE_REPOSITORY}.git"
+          git fetch --no-tags guard-head "refs/heads/${HEAD_REF}:refs/remotes/guard-head/${HEAD_REF}"
+          base_ref_sha=''
+          case "${GUARD_EVENT_NAME}" in
+            pull_request)
+              # The immutable event base object remains authoritative while a queued
+              # pull request's live base branch advances.
+              git fetch --no-tags guard-base "${GITHUB_BASE_SHA}"
+              ;;
+            workflow_dispatch)
+              git fetch --no-tags guard-base "refs/heads/${BASE_REF}:refs/remotes/guard-base/${BASE_REF}"
+              base_ref_sha="$(git rev-parse --verify "refs/remotes/guard-base/${BASE_REF}^{commit}")"
+              [[ "${base_ref_sha}" == "${GITHUB_BASE_SHA}" ]] || { echo "Dispatch base ref ${BASE_REF} resolves to ${base_ref_sha}, not ${GITHUB_BASE_SHA}"; exit 1; }
+              ;;
+            push)
+              git fetch --no-tags guard-base "${GITHUB_BASE_SHA}"
+              ;;
+          esac
+          {
+            echo "GUARD_CHECKED_OUT_HEAD=$(git rev-parse --verify HEAD^{commit})"
+            echo "GUARD_HEAD_REF_SHA=$(git rev-parse --verify "refs/remotes/guard-head/${HEAD_REF}^{commit}")"
+            echo "GUARD_BASE_OBJECT_SHA=$(git rev-parse --verify "${GITHUB_BASE_SHA}^{commit}")"
+            echo "GUARD_BASE_REF_SHA=${base_ref_sha}"
+          } >> "${GITHUB_ENV}"
+          printf 'guard evidence: base %s@%s; head %s@%s\n' "${BASE_REPOSITORY}" "${GITHUB_BASE_SHA}" "${HEAD_REPOSITORY}" "${HEAD_REF}"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3.14"
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      # The guard's AST canonicalization is parser-version sensitive: install the
+      # pinned @babel/parser from the lockfile so the current-tree digest check is
+      # deterministic and matches the committed attestations (no auto-install drift).
+      - run: bun install --frozen-lockfile
+      - run: bun scripts/telegram-daemon-generation-guard.ts --check-authority
+      - run: bun scripts/telegram-daemon-generation-guard.ts
+  windows-dev-doctor:
+    name: Windows dev:doctor + session-path regression
+    needs: [affected-plan]
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' && (contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 60
     env:
@@ -84,7 +190,7 @@ jobs:
           if ($head -ne $env:CI_DEV_SOURCE_SHA) { throw "Checked-out SHA $head does not match $env:CI_DEV_SOURCE_SHA" }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           toolchain: nightly-2026-04-29
@@ -103,7 +209,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - run: bun install --frozen-lockfile
       - name: Build native addon (win32-x64 baseline)
         env:
@@ -118,10 +224,66 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun run dev:doctor
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Windows session-path canonicalization regression
+        shell: pwsh
+        run: |
+          bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-  # Native addon build runs once per run and publishes the built `.node` files as
-  # an artifact the runtime-dependent shards download. It is skipped when the
-  # plan needs no native build at all.
+  windows-telegram-daemon-safety:
+    name: Windows Telegram daemon safety
+    needs: [affected-plan]
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' && (contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon-control.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/broker/process-incarnation.ts') || contains(needs.affected-plan.outputs.changed_paths, 'daemon-control.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'notifications-telegram-daemon.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/path_identity.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/ps.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-shell/src/process.rs') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native/index.d.ts')) }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3.14"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - name: Prepend rustup toolchain bin to PATH
+        shell: bash
+        run: |
+          toolchain_bin="$(dirname "$(rustup which cargo)")"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: windows-telegram-daemon-safety-win32-x64
+          cache-on-failure: true
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - name: Build native addon (win32-x64 baseline)
+        env:
+          TARGET_PLATFORM: win32
+          TARGET_ARCH: x64
+          TARGET_VARIANTS: baseline
+        run: bun run ci:build:native
+      - name: Run Windows daemon provenance safety contract
+        shell: pwsh
+        run: |
+          bun test packages/coding-agent/test/daemon-control.test.ts --test-name-pattern 'incarnation|captured-owner|owner-lock|poll overlap|configured chat providers'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test packages/coding-agent/test/notifications-telegram-daemon.test.ts --test-name-pattern 'Windows production preflight|concurrent ensureTelegramDaemonRunning|stale dead-pid lock|lock written before|parent-format|transition lock|provisional|readiness|reload failure|pre-upgrade owner|current-generation live owner|rollback preserves legacy unmanaged root|runDaemonInternal rewrites persisted owner pid|heartbeat fails closed'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test packages/natives/test/native.test.ts --test-name-pattern 'signals only the pinned root process'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # Native addon build runs at most once per run and publishes the built `.node`
+  # files as an artifact the runtime-dependent shards download. A content-hash
+  # cache of the native sources lets PRs that don't touch crates/natives restore
+  # the prebuilt addon and skip the Rust/native source build entirely; only a
+  # cache miss (native source actually changed) recompiles. Skipped when the plan
+  # needs no native build at all.
   affected-native:
     name: Affected path validation / native-build
     needs: [affected-plan]
@@ -149,7 +311,7 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -169,7 +331,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - name: Install system deps
         run: bash scripts/ci-install-system-deps.sh
       - run: bun install --frozen-lockfile
@@ -186,6 +348,118 @@ jobs:
           path: |
             packages/natives/native/pi_natives.linux-x64-baseline.node
             packages/natives/native/pi_natives.linux-x64-modern.node
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  affected-python-matrix:
+    name: Affected path validation / Python ${{ matrix.python-version }}
+    needs: [affected-plan, affected-native]
+    if: ${{ always() && needs.affected-plan.outputs.has_python == 'true' && needs.affected-native.result != 'failure' && needs.affected-native.result != 'cancelled' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    env:
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      GJC_REAL_SESSION_TESTS: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Download native addon(s)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dev-affected-native-${{ github.run_id }}
+          path: packages/natives/native
+      - run: bun install --frozen-lockfile
+      - run: bun run check:py-sdk
+      - run: bun run test:py-sdk
+      - run: bun run ci:test:py-sdk-build
+        if: ${{ matrix.python-version == '3.12' }}
+
+  # Darwin arm64 builds the checked-out PR head end-to-end for every compiled
+  # tab-worker smoke-graph path. The planner emits this canonical relevance flag.
+  affected-darwin-arm64-tab-worker-smoke:
+    name: Affected path validation / darwin-arm64 tab-worker smoke
+    needs: [affected-plan]
+    if: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' }}
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CI_DEV_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify checked-out source head
+        shell: bash
+        run: |
+          head="$(git rev-parse HEAD)"
+          test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+          node -e 'if (process.platform !== "darwin" || process.arch !== "arm64") { throw new Error(`Expected darwin/arm64, got ${process.platform}/${process.arch}`) }'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3.14"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+        with:
+          toolchain: nightly-2026-04-29
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: dev-affected-darwin-arm64-tab-worker
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
+          cache-workspace-crates: true
+      - name: Cache bun dependencies
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - name: Build native addon (darwin-arm64)
+        env:
+          TARGET_PLATFORM: darwin
+          TARGET_ARCH: arm64
+        run: bun run ci:build:native
+      - name: Build darwin-arm64 coding-agent binary
+        run: bun --cwd=packages/coding-agent run build
+      - name: Smoke compiled tab worker with fresh owner directories
+        shell: bash
+        run: |
+          runtime_dir="$(mktemp -d)"
+          mkdir -p "$runtime_dir/home" "$runtime_dir/xdg"
+          HOME="$runtime_dir/home" XDG_CONFIG_HOME="$runtime_dir/xdg/config" XDG_DATA_HOME="$runtime_dir/xdg/data" XDG_CACHE_HOME="$runtime_dir/xdg/cache" packages/coding-agent/dist/gjc --smoke-test
+          printf 'CI_DEV_DARWIN_SMOKE_HOME=%s\n' "$runtime_dir/home" >> "$GITHUB_ENV"
+          printf 'CI_DEV_DARWIN_SMOKE_XDG_CONFIG_HOME=%s\n' "$runtime_dir/xdg/config" >> "$GITHUB_ENV"
+          printf 'CI_DEV_DARWIN_SMOKE_XDG_DATA_HOME=%s\n' "$runtime_dir/xdg/data" >> "$GITHUB_ENV"
+          printf 'CI_DEV_DARWIN_SMOKE_XDG_CACHE_HOME=%s\n' "$runtime_dir/xdg/cache" >> "$GITHUB_ENV"
+      - name: Write immutable Darwin smoke receipt
+        env:
+          CI_DEV_DARWIN_BINARY: packages/coding-agent/dist/gjc
+          CI_DEV_DARWIN_NATIVE_ADDON: packages/natives/native/pi_natives.darwin-arm64.node
+        run: bun scripts/ci-validate-darwin-receipt.ts --write
+      - name: Upload Darwin smoke receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: dev-affected-darwin-receipt-${{ github.run_id }}
+          path: .ci-dev-darwin-arm64-receipt.json
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -234,17 +508,13 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Download and validate canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: dev-affected-plan-${{ github.run_id }}
           path: .
       - run: bun scripts/ci-dev-affected.ts --validate-plan
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
-        if: ${{ startsWith(matrix.key, 'python-') }}
-        with:
-          python-version: "3.11"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         if: ${{ matrix.rust }}
         with:
@@ -252,7 +522,7 @@ jobs:
       - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e  # v2
         if: ${{ matrix.nextest }}
         with:
-          tool: nextest
+          tool: nextest@0.9.137
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         if: ${{ matrix.rust }}
         with:
@@ -264,7 +534,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - name: Install system deps
         run: bash scripts/ci-install-system-deps.sh
       - run: bun install --frozen-lockfile
@@ -278,7 +548,7 @@ jobs:
         env:
           AFFECTED_TASK_KEY: ${{ matrix.key }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
         run: bun scripts/ci-dev-affected.ts --task="$AFFECTED_TASK_KEY"
       - name: Write shard completion receipt
         run: |
@@ -301,7 +571,7 @@ jobs:
   affected-evidence-producer:
     name: Affected path validation / evidence producer
     if: ${{ always() }}
-    needs: [affected-plan, affected-native, affected-shards, windows-dev-doctor]
+    needs: [affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     outputs:
@@ -326,7 +596,7 @@ jobs:
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Download canonical affected plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
@@ -339,6 +609,18 @@ jobs:
           pattern: dev-affected-shard-${{ github.run_id }}-*
           path: .ci-dev-shard-receipts
           merge-multiple: true
+      - name: Validate canonical shard completion
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_tasks == 'true' && needs.affected-shards.result == 'success' }}
+        run: bun scripts/ci-dev-affected.ts --validate-shard-receipts
+      - name: Download Darwin smoke receipt
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && needs.affected-darwin-arm64-tab-worker-smoke.result == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: dev-affected-darwin-receipt-${{ github.run_id }}
+          path: .
+      - name: Validate Darwin smoke receipt
+        if: ${{ needs.affected-plan.result == 'success' && needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && needs.affected-darwin-arm64-tab-worker-smoke.result == 'success' }}
+        run: bun scripts/ci-validate-darwin-receipt.ts
       - name: Produce affected evidence
         env:
           CI_DEV_PLAN_RESULT: ${{ needs.affected-plan.result }}
@@ -346,8 +628,16 @@ jobs:
           CI_DEV_SHARDS_RESULT: ${{ needs.affected-shards.result }}
           CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}
           CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
+          CI_DEV_HAS_PYTHON: ${{ needs.affected-plan.outputs.has_python }}
+          CI_DEV_PYTHON_RESULT: ${{ needs.affected-python-matrix.result == 'skipped' && 'skipped' || needs.affected-python-matrix.result }}
           CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
-          CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+          CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' }}
+          CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}
+          CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.relevant }}
+          CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}
+          CI_DEV_TELEGRAM_WINDOWS_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon-control.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/broker/process-incarnation.ts') || contains(needs.affected-plan.outputs.changed_paths, 'daemon-control.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'notifications-telegram-daemon.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/path_identity.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/ps.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-shell/src/process.rs') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native/index.d.ts') }}
+          CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-darwin-arm64-tab-worker-smoke.result }}
+          CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke }}
         run: bun scripts/ci-dev-affected.ts --write-affected-evidence
       - name: Upload affected evidence
         id: upload-evidence
@@ -359,6 +649,7 @@ jobs:
             .ci-dev-affected-evidence.receipt.json
             .ci-dev-affected-plan.json
             .ci-dev-shard-receipts
+            .ci-dev-darwin-arm64-receipt.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
@@ -367,7 +658,7 @@ jobs:
   affected:
     name: Affected path validation
     if: ${{ always() }}
-    needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, windows-dev-doctor]
+    needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     env:
@@ -380,8 +671,16 @@ jobs:
       CI_DEV_SHARDS_RESULT: ${{ needs.affected-shards.result }}
       CI_DEV_HAS_NATIVE: ${{ needs.affected-plan.outputs.has_native }}
       CI_DEV_HAS_TASKS: ${{ needs.affected-plan.outputs.has_tasks }}
+      CI_DEV_HAS_PYTHON: ${{ needs.affected-plan.outputs.has_python }}
+      CI_DEV_PYTHON_RESULT: ${{ needs.affected-python-matrix.result == 'skipped' && 'skipped' || needs.affected-python-matrix.result }}
       CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
-      CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') }}
+      CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' }}
+      CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && 'success' || 'skipped' }}
+      CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke }}
+      CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}
+      CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.relevant }}
+      CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}
+      CI_DEV_TELEGRAM_WINDOWS_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon-control.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/broker/process-incarnation.ts') || contains(needs.affected-plan.outputs.changed_paths, 'daemon-control.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'notifications-telegram-daemon.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/path_identity.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/ps.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-shell/src/process.rs') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native/index.d.ts') }}
     steps:
       - name: Fail closed on producer and live dependency results
         env:
@@ -415,11 +714,20 @@ jobs:
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
+      - name: Validate finalized Darwin smoke receipt
+        if: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' }}
+        env:
+          CI_DEV_DARWIN_RECEIPT: ${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-darwin-arm64-receipt.json
+        run: bun scripts/ci-validate-darwin-receipt.ts
       - name: Validate finalized affected evidence
         env:
           CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence
         run: bun scripts/ci-dev-affected.ts --validate-affected-evidence
+      - name: Validate live affected aggregate
+        env:
+          CI_DEV_AFFECTED_PLAN: ${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-affected-plan.json
+        run: bun scripts/ci-dev-affected.ts --validate-aggregate
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}
@@ -431,7 +739,7 @@ jobs:
         group: [static, runtime, integrity, read]
     env:
       GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-      GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GITHUB_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.before }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -441,14 +749,14 @@ jobs:
           node-version: "24"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: "1.3"
+          bun-version: "1.3.14"
       - name: Restore bun dependency cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
           restore-keys: |
-            bun-${{ runner.os }}-
+            bun-1.3.14-${{ runner.os }}-
       - run: bun install --frozen-lockfile
       - name: Run GJC state gate shard
         run: bun scripts/ci-gjc-state-gates.ts --group=${{ matrix.group }}

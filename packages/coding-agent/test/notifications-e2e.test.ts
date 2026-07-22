@@ -334,3 +334,81 @@ test("arbitrated native ask lets a generic claim win exactly once over a direct 
 		srv.stop();
 	}
 }, 30_000);
+test("arbitrated native asks canonicalize recommendation hints for late clients and resolve raw selections once", async () => {
+	const sessionId = `arbitrated-recommendation-${process.pid}-${Date.now()}`;
+	const token = "tok";
+	const srv = new NotificationServer(sessionId, token, `/tmp/${sessionId}`, true);
+	const forwarded: Array<{ id: string; answerJson: string; receiptId: string }> = [];
+	srv.onReply((_error, reply) => {
+		if (!reply) return;
+		forwarded.push({ id: reply.id, answerJson: reply.answerJson, receiptId: reply.replyReceiptId });
+		srv.resolveClaim(reply.replyReceiptId, reply.answerJson, reply.idempotencyKey ?? undefined);
+	});
+	const endpoint = await srv.start();
+	try {
+		// Register before a client connects: the late client must receive the canonical
+		// pending action, not the producer's unvalidated JSON.
+		srv.registerArbitratedAsk(
+			JSON.stringify({
+				id: "recommended-ask",
+				kind: "ask",
+				sessionId,
+				question: "Which option is recommended?",
+				options: ["first", "second"],
+				recommendedIndex: 1,
+			}),
+			true,
+		);
+		const ws = new WebSocket(`${endpoint.url}/?token=${token}`);
+		const actions: Array<Record<string, unknown>> = [];
+		let terminals = 0;
+		ws.addEventListener("message", event => {
+			const frame = JSON.parse(String(event.data)) as Record<string, unknown>;
+			if (frame.type === "action_needed") actions.push(frame);
+			if (frame.type === "action_resolved") terminals++;
+		});
+		await new Promise<void>((resolve, reject) => {
+			ws.addEventListener("open", () => resolve(), { once: true });
+			ws.addEventListener("error", () => reject(new Error("ws error")), { once: true });
+		});
+		await waitFor(() => actions.some(action => action.id === "recommended-ask"), 4_000, "late recommendation replay");
+		expect(actions.find(action => action.id === "recommended-ask")).toMatchObject({
+			options: ["first", "second"],
+			recommendedIndex: 1,
+		});
+		ws.send(JSON.stringify({ type: "reply", id: "recommended-ask", answer: 1, token }));
+		await waitFor(() => forwarded.length === 1, 4_000, "recommended raw-index reply");
+		expect(forwarded[0]).toMatchObject({ id: "recommended-ask", answerJson: "1" });
+		await waitFor(() => terminals === 1, 4_000, "recommended action terminal");
+		srv.registerArbitratedAsk(
+			JSON.stringify({
+				id: "malformed-recommendation-ask",
+				kind: "ask",
+				sessionId,
+				question: "Can malformed advice still be answered?",
+				options: ["first", "second"],
+				recommendedIndex: 1.5,
+			}),
+			true,
+		);
+		await waitFor(
+			() => actions.some(action => action.id === "malformed-recommendation-ask"),
+			4_000,
+			"malformed recommendation action",
+		);
+		const malformed = actions.find(action => action.id === "malformed-recommendation-ask");
+		expect(malformed).toMatchObject({ options: ["first", "second"] });
+		expect(malformed).not.toHaveProperty("recommendedIndex");
+		ws.send(JSON.stringify({ type: "reply", id: "malformed-recommendation-ask", answer: 1, token }));
+		await waitFor(() => forwarded.length === 2, 4_000, "malformed recommendation raw-index reply");
+		expect(forwarded[1]).toMatchObject({ id: "malformed-recommendation-ask", answerJson: "1" });
+		await waitFor(() => terminals === 2, 4_000, "malformed recommendation terminal");
+		ws.send(JSON.stringify({ type: "reply", id: "malformed-recommendation-ask", answer: 1, token }));
+		await sleep(100);
+		expect(forwarded).toHaveLength(2);
+		expect(terminals).toBe(2);
+		ws.close();
+	} finally {
+		srv.stop();
+	}
+}, 30_000);

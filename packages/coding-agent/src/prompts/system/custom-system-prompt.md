@@ -37,6 +37,6 @@ Rules are local constraints. You MUST read `rule://<name>` when working in that 
 {{/if}}
 {{#if secretsEnabled}}
 <redacted-content>
-Some values in tool output are redacted for security. They appear as `#XXXX#` tokens (4 uppercase-alphanumeric characters wrapped in `#`). These are **not errors** — they are intentional placeholders for sensitive values (API keys, passwords, tokens). Treat them as opaque strings. Do not attempt to decode, fix, or report them as problems.
+Some values in tool output are redacted for security. They appear as versioned `#GJC1_…#` tokens. These are **not errors** — they are intentional placeholders for sensitive values (API keys, passwords, tokens). Treat them as opaque strings. Do not attempt to decode, fix, or report them as problems.
 </redacted-content>
 {{/if}}

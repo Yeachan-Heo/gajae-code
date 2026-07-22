@@ -158,13 +158,13 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
 #### `db.sqlite?q=SELECT ...`
 - `kind: "raw"`
 - Cannot be combined with table selectors or any other query param.
-- Empty `q` throws.
-- `executeReadQuery()` runs `db.prepare(sql).all()` and rejects bound parameters; it does not verify that the SQL starts with `SELECT`.
+- Accepts exactly one explicit top-level `SELECT`. Comments, NUL, non-`SELECT` forms, and statement tails are rejected; semicolons inside quoted values and one final terminator are allowed.
+- `executeReadQuery()` revalidates the same contract, rejects bound parameters, and streams at most 1,000 rows.
 
 - Rendering caps in `packages/coding-agent/src/tools/sqlite-reader.ts`:
   - ASCII table width `120` (`MAX_RENDER_WIDTH`)
   - per-column width `40` (`MAX_COLUMN_WIDTH`)
-- `#readSqlite()` opens Bun SQLite in `{ readonly: true, strict: true }` and sets `PRAGMA busy_timeout = 3000`.
+- `#readSqlite()` opens Bun SQLite in `{ readonly: true, strict: true }`, enables and verifies `PRAGMA query_only = ON`, then sets `PRAGMA busy_timeout = 3000`. Readonly and query-only modes are defense in depth behind query validation.
 
 ### Documents
 - `CONVERTIBLE_EXTENSIONS` in `packages/coding-agent/src/tools/read.ts` covers `.pdf`, `.doc`, `.docx`, `.ppt`, `.pptx`, `.xls`, `.xlsx`, `.rtf`, `.epub`.
@@ -305,5 +305,5 @@ Notes: ...
 - A bare `/` resolves to the session cwd, not the filesystem root.
 - URL cache keys are session-scoped and normalized by requested URL + raw/rendered mode; both requested URL and final redirected URL are cached.
 - URL line-range reads request `ensureArtifact: true, preferCached: true` so a later paginated read can reopen the same rendered body from artifact storage.
-- Raw SQLite `q=` execution is not keyword-restricted beyond “no bound parameters”; the read tool relies on the surrounding contract to keep it read-only.
+- Raw SQLite `q=` uses the same single explicit `SELECT` validator at selector parsing and execution; readonly and verified query-only connection modes remain defense in depth.
 - The file-read cache is not a read acceleration cache. It exists to recover hashline edits when the file changed after the read.

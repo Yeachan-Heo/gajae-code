@@ -4,7 +4,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import { parseNotifyArgs, promptForToken, runNotifyCliCommand, runNotifyCommand } from "../src/cli/notify-cli";
+import {
+	type NotifyCommandArgs,
+	type NotifyCommandDeps,
+	parseNotifyArgs,
+	promptForToken,
+	runNotifyCliCommand,
+	runNotifyCommand as runNotifyCommandImpl,
+} from "../src/cli/notify-cli";
 import type { CasReceipt } from "../src/config/atomic-yaml-patch";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 import { getNotificationConfig, maskToken, tokenFingerprint } from "../src/sdk/bus/config";
@@ -73,6 +80,15 @@ async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string
 const token = "1234:super-secret-token";
 const NO_DAEMON_PREFLIGHT = {} as const satisfies TelegramSetupPreflight;
 let isolatedSettingsCounter = 0;
+
+function runNotifyCommand(cmd: NotifyCommandArgs, deps: NotifyCommandDeps = {}): Promise<void> {
+	return runNotifyCommandImpl(cmd, deps);
+}
+
+/** Explicit daemon boundary for setup tests that do not exercise activation. */
+function runTelegramSetupWithAttachedDaemon(cmd: NotifyCommandArgs, deps: NotifyCommandDeps): Promise<void> {
+	return runNotifyCommand(cmd, { ...deps, ensureTelegramDaemon: async () => "attached" });
+}
 
 function setupSettings(globalSettings: Record<string, unknown> = {}): Settings {
 	const settings = Settings.isolated(globalSettings as never);
@@ -188,7 +204,7 @@ describe("notify setup cli", () => {
 		});
 
 		const { stdout } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -223,7 +239,7 @@ describe("notify setup cli", () => {
 
 			await expect(
 				captureOutput(() =>
-					runNotifyCommand(
+					runTelegramSetupWithAttachedDaemon(
 						{ action: "setup", rawArgs: [] },
 						{
 							fetchImpl,
@@ -253,7 +269,7 @@ describe("notify setup cli", () => {
 		});
 
 		await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -278,7 +294,7 @@ describe("notify setup cli", () => {
 		});
 
 		await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -321,7 +337,7 @@ describe("notify setup cli", () => {
 
 		await expect(
 			captureOutput(() =>
-				runNotifyCommand(
+				runTelegramSetupWithAttachedDaemon(
 					{ action: "setup", rawArgs: [] },
 					{
 						fetchImpl,
@@ -354,7 +370,7 @@ describe("notify setup cli", () => {
 
 		await expect(
 			captureOutput(() =>
-				runNotifyCommand(
+				runTelegramSetupWithAttachedDaemon(
 					{ action: "setup", rawArgs: [] },
 					{
 						fetchImpl,
@@ -437,13 +453,171 @@ describe("notify setup cli", () => {
 			"notifications.telegram.chatId": "12345",
 			"notifications.redact": true,
 		});
-
 		const { stdout } = await captureOutput(() => runNotifyCommand({ action: "status", rawArgs: [] }, { settings }));
 		expect(stdout).toContain("enabled: true");
 		expect(stdout).toContain(maskToken(token));
 		expect(stdout).toContain("chatId: 12345");
 		expect(stdout).toContain("redact: true");
 		expect(stdout).not.toContain(token);
+	});
+
+	describe("Telegram setup activation boundary", () => {
+		const setupCommand: NotifyCommandArgs = { action: "setup", rawArgs: [] };
+
+		test("ready activation uses the injected daemon boundary exactly once", async () => {
+			const settings = setupSettings();
+			const { fetchImpl } = makeFetch({
+				getMe: [{ ok: true, result: userOn }],
+				getChat: [{ ok: true, result: { id: 999, type: "private" } }],
+			});
+			const ensureTelegramDaemon = vi.fn(async () => "attached" as const);
+
+			await captureOutput(() =>
+				runNotifyCommand(setupCommand, {
+					settings,
+					fetchImpl,
+					setupToken: token,
+					setupChatId: "999",
+					setupInteractive: false,
+					setupPreflight: NO_DAEMON_PREFLIGHT,
+					ensureTelegramDaemon,
+				}),
+			);
+
+			expect(ensureTelegramDaemon).toHaveBeenCalledTimes(1);
+			expect(getNotificationConfig(settings)).toMatchObject({ enabled: true, botToken: token, chatId: "999" });
+		});
+
+		test("blocked identity restores the previous configuration through the injected daemon boundary", async () => {
+			const settings = setupSettings({
+				"notifications.enabled": true,
+				"notifications.telegram.botToken": "previous-token",
+				"notifications.telegram.chatId": "previous-chat",
+			});
+			let commits = 0;
+			Object.defineProperty(settings, "commitAtomicBatch", {
+				value: async (patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> => {
+					for (const patch of patches) {
+						if (patch.op === "set") settings.set(patch.path, patch.value as never);
+						else settings.unset(patch.path);
+					}
+					const commit = ++commits;
+					return {
+						revisions: [],
+						restore: async () => {
+							if (commit === 1) {
+								settings.set("notifications.enabled", true);
+								settings.set("notifications.telegram.botToken", "previous-token");
+								settings.set("notifications.telegram.chatId", "previous-chat");
+							} else settings.unset("notifications.telegram.activation");
+							return {
+								status: "restored",
+								receipt: { revisions: [], restore: async () => ({ status: "discarded" }), discard() {} },
+							};
+						},
+						discard() {},
+					};
+				},
+			});
+			const { fetchImpl } = makeFetch({
+				getMe: [{ ok: true, result: userOn }],
+				getChat: [{ ok: true, result: { id: 999, type: "private" } }],
+			});
+			const ensureTelegramDaemon = vi.fn(async () =>
+				ensureTelegramDaemon.mock.calls.length === 1 ? "blocked_identity" : "attached",
+			);
+
+			await expect(
+				captureOutput(() =>
+					runNotifyCommand(setupCommand, {
+						settings,
+						fetchImpl,
+						setupToken: token,
+						setupChatId: "999",
+						setupInteractive: false,
+						setupPreflight: NO_DAEMON_PREFLIGHT,
+						ensureTelegramDaemon,
+					}),
+				),
+			).rejects.toThrow("previous settings were restored");
+			expect(ensureTelegramDaemon).toHaveBeenCalledTimes(2);
+			expect(getNotificationConfig(settings)).toMatchObject({
+				enabled: true,
+				botToken: "previous-token",
+				chatId: "previous-chat",
+			});
+		});
+
+		test("daemon activation failure rejects rather than reporting setup success", async () => {
+			const settings = setupSettings();
+			const { fetchImpl } = makeFetch({
+				getMe: [{ ok: true, result: userOn }],
+				getChat: [{ ok: true, result: { id: 999, type: "private" } }],
+			});
+			const ensureTelegramDaemon = vi.fn(async () => {
+				throw new Error("daemon readiness failed");
+			});
+
+			await expect(
+				captureOutput(() =>
+					runNotifyCommand(setupCommand, {
+						settings,
+						fetchImpl,
+						setupToken: token,
+						setupChatId: "999",
+						setupInteractive: false,
+						setupPreflight: NO_DAEMON_PREFLIGHT,
+						ensureTelegramDaemon,
+					}),
+				),
+			).rejects.toThrow("daemon readiness failed");
+			expect(ensureTelegramDaemon).toHaveBeenCalledTimes(1);
+		});
+
+		test("blocked identity concurrent restore conflict refuses success", async () => {
+			const settings = setupSettings();
+			let commits = 0;
+			Object.defineProperty(settings, "commitAtomicBatch", {
+				value: async (patches: readonly SettingsAtomicPatch[]): Promise<CasReceipt> => {
+					for (const patch of patches) {
+						if (patch.op === "set") settings.set(patch.path, patch.value as never);
+						else settings.unset(patch.path);
+					}
+					const commit = ++commits;
+					return {
+						revisions: [],
+						restore: async () =>
+							commit === 1
+								? { status: "conflict", paths: ["notifications.telegram"] }
+								: {
+										status: "restored",
+										receipt: { revisions: [], restore: async () => ({ status: "discarded" }), discard() {} },
+									},
+						discard() {},
+					};
+				},
+			});
+			const { fetchImpl } = makeFetch({
+				getMe: [{ ok: true, result: userOn }],
+				getChat: [{ ok: true, result: { id: 999, type: "private" } }],
+			});
+			const ensureTelegramDaemon = vi.fn(async () => "blocked_identity" as const);
+
+			await expect(
+				captureOutput(() =>
+					runNotifyCommand(setupCommand, {
+						settings,
+						fetchImpl,
+						setupToken: token,
+						setupChatId: "999",
+						setupInteractive: false,
+						setupPreflight: NO_DAEMON_PREFLIGHT,
+						ensureTelegramDaemon,
+					}),
+				),
+			).rejects.toThrow("settings changed concurrently");
+			expect(ensureTelegramDaemon).toHaveBeenCalledTimes(1);
+		});
 	});
 });
 
@@ -497,7 +671,7 @@ test("non-interactive setup with --token and --chat-id verifies private chat wit
 	const cmd = parseNotifyArgs(["notify", "setup", "--token", "123:abc", "--chat-id", "999", "--redact"]);
 	expect(cmd).toBeTruthy();
 	await captureOutput(() =>
-		runNotifyCommand(cmd!, {
+		runTelegramSetupWithAttachedDaemon(cmd!, {
 			settings,
 			fetchImpl,
 			apiBase: "https://api.telegram.org",
@@ -525,7 +699,7 @@ test("non-interactive setup rejects non-private chat ids without writing config"
 
 		await expect(
 			captureOutput(() =>
-				runNotifyCommand(cmd!, {
+				runTelegramSetupWithAttachedDaemon(cmd!, {
 					settings,
 					fetchImpl,
 					setupInteractive: false,
@@ -562,7 +736,7 @@ test("injected setup preflight overrides ambient foreign daemon state", async ()
 		let ambientPidAliveCalls = 0;
 
 		await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					settings,
@@ -588,7 +762,7 @@ test("injected setup preflight overrides ambient foreign daemon state", async ()
 		const blocked = makeFetch({ getMe: [{ ok: true, result: { id: 1 } }] });
 		await expect(
 			captureOutput(() =>
-				runNotifyCommand(
+				runTelegramSetupWithAttachedDaemon(
 					{ action: "setup", rawArgs: [] },
 					{
 						settings: foreignSettings,
@@ -604,6 +778,87 @@ test("injected setup preflight overrides ambient foreign daemon state", async ()
 		).rejects.toThrow("Telegram setup cancelled: a live daemon has a foreign identity.");
 		expect(getNotificationConfig(foreignSettings).enabled).toBe(false);
 		expect(blocked.calls.filter(call => call.method === "getUpdates")).toHaveLength(0);
+	} finally {
+		fs.rmSync(agentDir, { force: true, recursive: true });
+	}
+});
+
+test("ambient setup preflight accepts only matching canonical daemon provenance", async () => {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notify-setup-incarnation-"));
+	const statePath = path.join(agentDir, "notifications", "telegram-daemon.state.json");
+	const daemonSecret = "foreign-daemon-secret";
+	const cases: Array<{
+		persistedIncarnation: string;
+		currentIncarnation: string | undefined;
+		blocks: boolean;
+	}> = [
+		{ persistedIncarnation: "linux:4242", currentIncarnation: "linux:4242", blocks: true },
+		{ persistedIncarnation: "linux:4242", currentIncarnation: "linux:9999", blocks: false },
+		{ persistedIncarnation: "linux:4242", currentIncarnation: undefined, blocks: false },
+		{ persistedIncarnation: "stable", currentIncarnation: "linux:4242", blocks: false },
+	];
+	try {
+		fs.mkdirSync(path.dirname(statePath), { recursive: true });
+		for (const fixture of cases) {
+			fs.writeFileSync(
+				statePath,
+				JSON.stringify({
+					pid: 4242,
+					incarnation: fixture.persistedIncarnation,
+					tokenFingerprint: daemonSecret,
+					chatId: "999",
+				}),
+			);
+			const settings = setupSettings();
+			Object.defineProperty(settings, "getAgentDir", { configurable: true, value: () => agentDir });
+			const daemonCalls = makeFetch({
+				getMe: [{ ok: true, result: { id: 1 } }],
+				getUpdates: [
+					{ ok: true, result: [] },
+					{ ok: true, result: [{ update_id: 1, message: { chat: { id: 123, type: "private" } } }] },
+				],
+			});
+			const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+				const response = await daemonCalls.fetchImpl(url, init);
+				if (daemonCalls.calls.filter(call => call.method === "getUpdates").length === 2)
+					fs.rmSync(statePath, { force: true });
+				return response;
+			}) as typeof fetch;
+			const run = () =>
+				captureOutput(() =>
+					runNotifyCommand(
+						{ action: "setup", rawArgs: [] },
+						{
+							settings,
+							fetchImpl,
+							setupToken: token,
+							setupInteractive: false,
+							setupPidAlive: () => true,
+							setupPidIncarnation: () => fixture.currentIncarnation,
+							ensureTelegramDaemon: async () => "attached",
+							pollTimeoutMs: 50,
+							pollIntervalMs: 0,
+						},
+					),
+				);
+			if (fixture.blocks) {
+				const error = await run().catch(error => error);
+				expect(error).toBeInstanceOf(Error);
+				expect((error as Error).message).toContain(
+					"Telegram setup cancelled: a live daemon has a foreign identity.",
+				);
+				expect((error as Error).message).not.toContain(daemonSecret);
+				expect((error as Error).message).not.toContain(token);
+				expect(daemonCalls.calls.filter(call => call.method === "getUpdates")).toHaveLength(0);
+			} else {
+				const output = await run();
+				expect(output.stdout).not.toContain(daemonSecret);
+				expect(output.stderr).not.toContain(daemonSecret);
+				expect(output.stdout).not.toContain(token);
+				expect(output.stderr).not.toContain(token);
+				expect(daemonCalls.calls.filter(call => call.method === "getUpdates")).toHaveLength(2);
+			}
+		}
 	} finally {
 		fs.rmSync(agentDir, { force: true, recursive: true });
 	}
@@ -638,7 +893,7 @@ describe("notify setup threaded mode verification", () => {
 			getUpdates: privateUpdates(),
 		});
 		const { stdout } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -664,7 +919,12 @@ describe("notify setup threaded mode verification", () => {
 		const { fetchImpl, calls } = makeFetch({ getMe: [{ ok: true, result: userOn }] });
 		const cmd = parseNotifyArgs(["notify", "setup", "--token", "123:abc", "--chat-id", "999", "--redact"]);
 		const { stdout } = await captureOutput(() =>
-			runNotifyCommand(cmd!, { fetchImpl, settings, setupInteractive: false, setupPreflight: NO_DAEMON_PREFLIGHT }),
+			runTelegramSetupWithAttachedDaemon(cmd!, {
+				fetchImpl,
+				settings,
+				setupInteractive: false,
+				setupPreflight: NO_DAEMON_PREFLIGHT,
+			}),
 		);
 		expect(stdout).toContain("threaded=verified");
 		expect(calls.filter(c => c.method === "getUpdates")).toHaveLength(0);
@@ -680,7 +940,7 @@ describe("notify setup threaded mode verification", () => {
 			getUpdates: privateUpdates(),
 		});
 		const { stdout } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -703,7 +963,7 @@ describe("notify setup threaded mode verification", () => {
 		const settings = setupSettings();
 		const { fetchImpl, calls } = makeFetch({ getMe: [{ ok: true, result: userMissing }] });
 		const { stdout } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -728,7 +988,7 @@ describe("notify setup threaded mode verification", () => {
 			getUpdates: privateUpdates(),
 		});
 		const { stdout, stderr } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -752,7 +1012,7 @@ describe("notify setup threaded mode verification", () => {
 		const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result: { username: "bot", has_topics_enabled: true } }] });
 		const { stdout, stderr } = await captureOutput(async () => {
 			await expect(
-				runNotifyCommand(
+				runTelegramSetupWithAttachedDaemon(
 					{ action: "setup", rawArgs: [] },
 					{
 						fetchImpl,
@@ -777,7 +1037,7 @@ describe("notify setup threaded mode verification", () => {
 			const { fetchImpl } = makeFetch({ getMe: [{ ok: true, result }] });
 			await expect(
 				captureOutput(() =>
-					runNotifyCommand(
+					runTelegramSetupWithAttachedDaemon(
 						{ action: "setup", rawArgs: [] },
 						{
 							fetchImpl,
@@ -806,7 +1066,7 @@ describe("notify setup threaded mode verification", () => {
 		});
 		const { prompt } = makePrompt([""]);
 		const { stdout } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -836,7 +1096,7 @@ describe("notify setup threaded mode verification", () => {
 		});
 		const { prompt } = makePrompt(["skip"]);
 		const { stdout } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -864,7 +1124,7 @@ describe("notify setup threaded mode verification", () => {
 		const settings = setupSettings();
 		const { fetchImpl, calls } = makeFetch({ getMe: [{ ok: true, result: userOff }] });
 		const { stdout } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -893,7 +1153,7 @@ describe("notify setup threaded mode verification", () => {
 		});
 		const { prompt, asked } = makePrompt(["wat", "skip"]);
 		const { stdout } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -925,7 +1185,7 @@ describe("notify setup threaded mode verification", () => {
 		});
 		const { prompt, asked } = makePrompt(["wat", "still bad", ""]);
 		const { stdout, stderr } = await captureOutput(() =>
-			runNotifyCommand(
+			runTelegramSetupWithAttachedDaemon(
 				{ action: "setup", rawArgs: [] },
 				{
 					fetchImpl,
@@ -958,7 +1218,7 @@ describe("notify setup threaded mode verification", () => {
 		});
 		await expect(
 			captureOutput(() =>
-				runNotifyCommand(
+				runTelegramSetupWithAttachedDaemon(
 					{ action: "setup", rawArgs: [] },
 					{
 						fetchImpl,
@@ -1128,6 +1388,70 @@ test("Discord setup prompts missing values and commits them atomically", async (
 		guildId: "guild",
 		parentChannelId: "channel",
 	});
+});
+
+test("CLI setup reports configured Discord daemon readiness before success", async () => {
+	const settings = setupSettings();
+	let ensured = false;
+	let exitCode: number | undefined;
+	const { stdout, stderr } = await captureOutput(() =>
+		runNotifyCliCommand(
+			{
+				action: "setup",
+				provider: "discord",
+				rawArgs: [],
+				discordBotToken: "discord-secret",
+				discordApplicationId: "app",
+				discordGuildId: "guild",
+				discordParentChannelId: "channel",
+			},
+			{
+				settings,
+				ensureProviderDaemon: async provider => {
+					expect(provider).toBe("discord");
+					ensured = true;
+					return "attached";
+				},
+				setExitCode: code => {
+					exitCode = code;
+				},
+			},
+		),
+	);
+	expect(ensured).toBe(true);
+	expect(exitCode).toBeUndefined();
+	expect(stderr).toBe("");
+	expect(stdout).toContain("Discord notifications enabled.");
+});
+
+test("CLI setup preserves configured Slack daemon readiness diagnostics and withholds success", async () => {
+	const settings = setupSettings();
+	let exitCode: number | undefined;
+	const { stdout, stderr } = await captureOutput(() =>
+		runNotifyCliCommand(
+			{
+				action: "setup",
+				provider: "slack",
+				rawArgs: [],
+				slackBotToken: "slack-bot-secret",
+				slackAppToken: "slack-app-secret",
+				slackWorkspaceId: "workspace",
+				slackChannelId: "channel",
+			},
+			{
+				settings,
+				ensureProviderDaemon: async () => {
+					throw new Error("Slack socket connection rejected by workspace");
+				},
+				setExitCode: code => {
+					exitCode = code;
+				},
+			},
+		),
+	);
+	expect(exitCode).toBe(1);
+	expect(stdout).not.toContain("Slack notifications enabled.");
+	expect(stderr).toContain("Slack daemon did not become ready: Slack socket connection rejected by workspace");
 });
 
 test("interactive Discord setup validates prompted required values before persistence", async () => {

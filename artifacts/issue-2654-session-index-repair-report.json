@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "kind": "algorithm-cli-test-report",
+  "issue": 2654,
+  "base": "origin/dev@9d4a6a66c84bafa32b0dfe034873b4b4e5de4338",
+  "historicalReproduction": {
+    "method": "Four independent writers each allocated indexSeq from its own stale in-memory view while append order alone was serialized, matching the pre-0.11.2 allocation defect.",
+    "writers": 4,
+    "rows": 400,
+    "maxSeq": 100,
+    "strictInversions": 115,
+    "duplicateRows": 300,
+    "first20": [1, 1, 1, 1, 2, 3, 2, 4, 2, 3, 5, 2, 6, 4, 7, 8, 9, 10, 11, 12],
+    "verdict": "reproduced"
+  },
+  "currentFailClosedReproduction": {
+    "fixture": "Checksum-valid prefix followed by malformed, checksum-invalid, unterminated, duplicated, gapped, sequence-inverted, or future-version physical history.",
+    "observedBeforeRepair": "SessionIndex retained the last version/checksum/sequence-verified prefix, reported corruption or unsupported state, and refused append with an actionable repair command for repairable corruption; ordinary gjc gc diagnosis exited nonzero without mutation.",
+    "verdict": "reproduced"
+  },
+  "repairBehavior": {
+    "command": "gjc gc --repair-session-index --json",
+    "observed": "Under the cross-process index lock, original snapshot/log bytes were durably copied into a unique quarantine bundle before live-file replacement. Only version-supported, checksum-valid contiguous history was retained without renumbering; crash-window overlap may start after an earlier rotation but must remain contiguous through snapshotSeq before any tail is accepted. Temp-file fsync, atomic rename, and directory fsync published the repaired snapshot/log. A subsequent append used validPrefixSeq + 1 and a repeated repair was a healthy no-op. Unsupported future state remains byte-preserved and non-repairable.",
+    "diagnoseExit": 1,
+    "repairExit": 0,
+    "postRepairExit": 0,
+    "verdict": "passed"
+  },
+  "verification": [
+    {
+      "command": "bun test test/sdk-session-index.test.ts test/gc-runtime.test.ts test/gc-e2e.test.ts test/perf-redteam.test.ts test/cli-command-surface.test.ts test/sdk-downgrade-unknown-version.test.ts",
+      "result": "70 pass, 0 fail, 244 assertions"
+    },
+    {
+      "command": "bun test test/sdk-broker.test.ts",
+      "result": "40 pass, 0 fail, 129 assertions"
+    },
+    {
+      "command": "bun run check",
+      "result": "Biome check passed across 2236 files; TypeScript check passed"
+    },
+    {
+      "command": "bun run check:runtime",
+      "result": "Generated hotkey docs check and SDK canonicalization verification passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "independentReview": {
+    "architectReview": {
+      "architectureStatus": "CLEAR",
+      "productStatus": "CLEAR",
+      "codeStatus": "CLEAR",
+      "recommendation": "APPROVE",
+      "blockers": []
+    },
+    "executorQa": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "blockers": []
+  },
+  "invariants": [
+    "No valid retained event is renumbered.",
+    "No row after the first corrupt physical-history row is accepted.",
+    "Physical rows covered by a snapshot are version-supported, checksum-valid, and contiguous through the snapshot boundary, including overlap logs that begin after an earlier rotation.",
+    "Invalid snapshots are quarantined and repaired rather than silently ignored.",
+    "Unsupported future snapshot formats, snapshot events, and log events remain fail-closed, byte-preserved, and unmodified.",
+    "Repair and append serialize through the existing cross-process session-index file lock.",
+    "The quarantine base and bundle are durably reachable before repaired live files are replaced.",
+    "Snapshot/log replacement uses fsynced temporary files, atomic rename, and directory fsync.",
+    "Independent multi-process writers produce strict sequences without duplicates or inversions.",
+    "Repair cannot be combined with prune or dry-run, and live-host restart/re-registration guidance is explicit."
+  ]
+}

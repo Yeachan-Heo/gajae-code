@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- SSE readers now accept optional per-event and cumulative UTF-8 byte budgets without changing existing defaults.
 
 ## [0.11.2] - 2026-07-19
 

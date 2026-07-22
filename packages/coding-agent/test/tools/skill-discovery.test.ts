@@ -218,6 +218,7 @@ describe("SkillDiscoveryTool", () => {
 
 		const discovery = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {});
 		expect(discovery.details?.candidates).toEqual([]);
+		expect(discovery.details?.notice).toContain("`skills.enabled` is false");
 
 		const sent: Array<{ content: string; details?: unknown }> = [];
 		const tool = new SkillTool(
@@ -231,6 +232,42 @@ describe("SkillDiscoveryTool", () => {
 		);
 		await expect(tool.execute("call", { name: "project-helper" })).rejects.toThrow(/unknown skill/);
 		expect(sent).toHaveLength(0);
+	});
+
+	it("explains empty results caused by disabled discovery scopes, and stays silent for genuine emptiness", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-"));
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
+
+		// Requested scope is fully disabled: empty result carries a scope notice.
+		const userOff = runtimeSkillSettings({ "skills.enablePiUser": false });
+		const userScope = await new SkillDiscoveryTool(createSession(cwd, { settings: userOff })).execute("call", {
+			source: "user",
+		});
+		expect(userScope.details?.candidates).toEqual([]);
+		expect(userScope.details?.notice).toContain("`skills.enablePiUser` is false");
+
+		// A disabled scope is mentioned even under source "all" when nothing was found.
+		const projectOff = runtimeSkillSettings({ "skills.enablePiProject": false });
+		const allScope = await new SkillDiscoveryTool(createSession(cwd, { settings: projectOff })).execute("call", {
+			query: "no-such-skill-anywhere",
+		});
+		expect(allScope.details?.candidates).toEqual([]);
+		expect(allScope.details?.notice).toContain("`skills.enablePiProject` is false");
+
+		// Fully enabled policy with a non-matching query: genuinely empty, no notice.
+		const enabled = runtimeSkillSettings();
+		const genuine = await new SkillDiscoveryTool(createSession(cwd, { settings: enabled })).execute("call", {
+			query: "no-such-skill-anywhere",
+		});
+		expect(genuine.details?.candidates).toEqual([]);
+		expect(genuine.details?.notice).toBeUndefined();
+
+		// Found results never carry a notice.
+		const found = await new SkillDiscoveryTool(createSession(cwd, { settings: enabled })).execute("call", {
+			query: "project helper",
+		});
+		expect(found.details?.count).toBe(1);
+		expect(found.details?.notice).toBeUndefined();
 	});
 
 	it("discovers canonical and legacy user roots in native precedence order", async () => {

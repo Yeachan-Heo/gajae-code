@@ -2066,6 +2066,24 @@
 		]
 	},
 	{
+		"sourceId": "slash_command:handoff",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "include",
+		"sdkId": "session.handoff",
+		"adapterMappings": {
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
 		"sourceId": "slash_command:contribute-pr",
 		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
 		"sourceKind": "slash_command",
@@ -2804,6 +2822,17 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:promoteRecoveryHydrationAfterOwnershipReadyFence",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal owner-recovery authority transition after a durable writer fence, never a user-facing SDK operation",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
@@ -4396,6 +4425,17 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:createBtwConversationScope",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal privacy-scoped side-chat snapshot factory, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"

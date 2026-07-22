@@ -81,6 +81,8 @@ export function createLightweightDaemonSettings(input: {
 					return snapshot.telegram.chatId;
 				case "notifications.telegram.btw.enabled":
 					return snapshot.telegram.btw.enabled;
+				case "notifications.telegram.streaming.enabled":
+					return snapshot.telegram.streaming.enabled;
 				case "notifications.discord.botToken":
 					return snapshot.discord.botToken;
 				case "notifications.discord.applicationId":
@@ -179,6 +181,22 @@ function ownerProcessIsAlive(ownerId: string, deps: RunDaemonInternalDeps): bool
 	return (deps.pidAlive ?? defaultPidAlive)(ownerPid);
 }
 
+/** Creates owner-fenced daemon control hooks for the CLI lifecycle boundary. */
+export function createDaemonControlHooks(settings: Settings) {
+	return {
+		shouldStop: async (owner: string) => {
+			const req = await readTelegramControlRequest(settings);
+			return Boolean(req && (!req.ownerId || req.ownerId === owner));
+		},
+		clear: async (owner: string) => {
+			const req = await readTelegramControlRequest(settings);
+			// Only clear a request that targets this daemon owner, so an exiting
+			// daemon never erases a newer request meant for a different owner.
+			if (req && (!req.ownerId || req.ownerId === owner)) await clearTelegramControlRequest(settings, req.requestId);
+		},
+	};
+}
+
 export async function runDaemonSmoke(opts: { agentDir?: string } = {}): Promise<void> {
 	const agentDir = opts.agentDir ?? fs.mkdtempSync(path.join(process.cwd(), ".telegram-daemon-smoke-"));
 	const settings = createLightweightDaemonSettings({ agentDir, rawConfig: {} });
@@ -215,23 +233,11 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		idleTimeoutMs: cfg.idleTimeoutMs,
 		rich: cfg.rich,
 		richDraft: cfg.richDraft,
+		toolActivity: cfg.toolActivity,
 		topics: cfg.topics,
 		btw: cfg.btw,
 		pid: deps.processPid ?? process.pid,
-		control: {
-			shouldStop: async owner => {
-				const req = await readTelegramControlRequest(settings as Settings);
-				return Boolean(req && (!req.ownerId || req.ownerId === owner));
-			},
-			clear: async owner => {
-				const req = await readTelegramControlRequest(settings as Settings);
-				// Only clear a request that targets this daemon owner, so an exiting
-				// daemon never erases a newer request meant for a different owner.
-				if (req && (!req.ownerId || req.ownerId === owner)) {
-					await clearTelegramControlRequest(settings as Settings, req.requestId);
-				}
-			},
-		},
+		control: createDaemonControlHooks(settings as Settings),
 	});
 	// Signals are a process concern: install them at the daemon-internal boundary,
 	// not inside the embeddable daemon class. SIGTERM is the reload wakeup path.

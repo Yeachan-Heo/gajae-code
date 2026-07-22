@@ -168,3 +168,25 @@ export function parseRichToggleCommand(text: string): boolean | undefined {
 	if (arg === "off" || arg === "false" || arg === "0") return false;
 	return undefined;
 }
+
+/**
+ * Parse a `/toolactivity on|off` toggle for Telegram tool-activity delivery.
+ *
+ * This is daemon-local delivery policy rather than a host-session config
+ * command, so it works without a connected session and persists globally.
+ * Addressed commands are accepted only for the exact current bot username.
+ */
+export function parseToolActivityToggleCommand(text: string, botUsername?: string): boolean | undefined {
+	const trimmed = text.trim();
+	if (!trimmed.startsWith("/")) return undefined;
+	const [rawCommand, ...rest] = trimmed.slice(1).split(/\s+/);
+	if (!rawCommand || rest.length !== 1) return undefined;
+	if (rawCommand.endsWith("@") || rawCommand.indexOf("@") !== rawCommand.lastIndexOf("@")) return undefined;
+	const { name, suffix } = splitTelegramBotSuffix(rawCommand);
+	if (name !== "toolactivity") return undefined;
+	if (suffix && (!botUsername || suffix !== botUsername.toLowerCase())) return undefined;
+	const arg = rest[0]!.toLowerCase();
+	if (arg === "on" || arg === "true" || arg === "1") return true;
+	if (arg === "off" || arg === "false" || arg === "0") return false;
+	return undefined;
+}

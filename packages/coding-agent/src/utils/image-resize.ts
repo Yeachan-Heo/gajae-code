@@ -21,14 +21,14 @@ export interface ResizedImage {
 
 // 500KB target — aggressive compression; Anthropic's 5MB per-image cap is rarely the
 // binding constraint once images are downsized to 1568px (Anthropic's internal threshold).
-const DEFAULT_MAX_BYTES = 500 * 1024;
+export const DEFAULT_IMAGE_RESIZE_MAX_BYTES = 500 * 1024;
 
 const DEFAULT_OPTIONS: Required<Omit<ImageResizeOptions, "excludeWebP">> = {
 	// Anthropic's "internal recommended size" — Anthropic model internally caps images at
 	// 1568px on the longest edge before vision processing.
 	maxWidth: 1568,
 	maxHeight: 1568,
-	maxBytes: DEFAULT_MAX_BYTES,
+	maxBytes: DEFAULT_IMAGE_RESIZE_MAX_BYTES,
 	jpegQuality: 80,
 };
 
@@ -72,14 +72,17 @@ Buffer.prototype.toBase64 = function (this: Buffer) {
  * Backed by `Bun.Image`: a chainable native pipeline that runs decode/transform/encode
  * off the JS thread when the terminal (`.bytes()`) is awaited.
  */
-export async function resizeImage(img: ImageContent, options?: ImageResizeOptions): Promise<ResizedImage> {
+export async function resizeImageBuffer(
+	inputBuffer: Buffer,
+	inputMimeType: string,
+	options?: ImageResizeOptions,
+): Promise<ResizedImage> {
 	const excludeWebP = options?.excludeWebP ?? isWebPExcluded();
 	const opts = { ...DEFAULT_OPTIONS, ...options, excludeWebP };
-	const inputBuffer = Buffer.from(img.data, "base64");
 
 	try {
 		const { width: originalWidth, height: originalHeight, format } = await new Bun.Image(inputBuffer).metadata();
-		const sourceMime = img.mimeType ?? `image/${format}`;
+		const sourceMime = inputMimeType ?? `image/${format}`;
 
 		// Fast path: already within dimensions AND well under budget.
 		// Threshold is 1/4 of budget — if already that compact, don't re-encode.
@@ -102,7 +105,7 @@ export async function resizeImage(img: ImageContent, options?: ImageResizeOption
 				height: originalHeight,
 				wasResized: false,
 				get data() {
-					return img.data;
+					return inputBuffer.toBase64();
 				},
 			};
 		}
@@ -272,22 +275,26 @@ export async function resizeImage(img: ImageContent, options?: ImageResizeOption
 		// When the caller demanded WebP exclusion AND the original is WebP,
 		// returning the original buffer would silently violate that contract,
 		// so surface an explicit error instead.
-		if (excludeWebP && (img.mimeType === "image/webp" || !img.mimeType)) {
+		if (excludeWebP && (inputMimeType === "image/webp" || !inputMimeType)) {
 			throw new Error("resizeImage: failed to decode image and cannot honor excludeWebP for a WebP source");
 		}
 		return {
 			buffer: inputBuffer,
-			mimeType: img.mimeType,
+			mimeType: inputMimeType,
 			originalWidth: 0,
 			originalHeight: 0,
 			width: 0,
 			height: 0,
 			wasResized: false,
 			get data() {
-				return img.data;
+				return inputBuffer.toBase64();
 			},
 		};
 	}
+}
+
+export function resizeImage(img: ImageContent, options?: ImageResizeOptions): Promise<ResizedImage> {
+	return resizeImageBuffer(Buffer.from(img.data, "base64"), img.mimeType, options);
 }
 
 /**

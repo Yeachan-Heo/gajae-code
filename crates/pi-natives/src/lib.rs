@@ -49,6 +49,7 @@ pub mod path_identity;
 pub mod prof;
 pub mod ps;
 pub mod pty;
+pub mod recovery_fs;
 pub mod shell;
 pub mod summary;
 pub mod task;
@@ -74,5 +75,5 @@ use napi_derive::napi;
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_11_2")]
+#[napi(js_name = "__piNativesV0_11_6")]
 pub const fn pi_natives_version_sentinel() {}

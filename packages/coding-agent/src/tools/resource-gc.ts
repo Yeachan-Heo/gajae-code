@@ -75,12 +75,31 @@ const defaultDeps: ResourceGcDeps = {
 
 // ── Controller state (process-global; tabs/browsers are module-global too) ──────────────────
 const activeSessions = new Map<string, Settings>();
-let timer: ReturnType<typeof setTimeout> | null = null;
+
+interface ScheduleOwner {
+	generation: number;
+	token: number;
+}
+
+interface DeferredSchedule {
+	generation: number;
+	deadline: number;
+}
+
+interface WorkOwner {
+	generation: number;
+	source: "timer" | "external";
+}
+
+let pendingTimer: NodeJS.Timeout | null = null;
+let pendingDeadline: number | null = null;
+let pendingOwner: ScheduleOwner | null = null;
+let deferredSchedule: DeferredSchedule | null = null;
+let inProgressOwner: WorkOwner | null = null;
 let stopped = false;
-// Bumped on every stop so an in-flight tick from a previous schedule cannot reschedule after a
-// stop+re-register and leak a duplicate timer.
 let timerGeneration = 0;
-let inProgress = false;
+let nextTimerToken = 0;
+let schedulerNow = (): number => performance.now();
 let rssWarningActive = false;
 let lastScreenshotScanAt = 0;
 let deps: ResourceGcDeps = defaultDeps;
@@ -96,8 +115,20 @@ export interface ResourceGcRegistration {
  * session unregisters.
  */
 export function registerResourceGcSession(reg: ResourceGcRegistration): () => void {
+	const isNewSession = !activeSessions.has(reg.sessionId);
 	activeSessions.set(reg.sessionId, reg.settings);
-	ensureTimerStarted();
+	stopped = false;
+	if (isNewSession) {
+		const deadline = schedulerNow() + resolveSweepIntervalMs(reg.settings);
+		if (
+			inProgressOwner?.generation === timerGeneration &&
+			(pendingDeadline === null || pendingDeadline <= deadline)
+		) {
+			deferSchedule(timerGeneration, deadline);
+		} else {
+			requestSchedule(deadline);
+		}
+	}
 	let unregistered = false;
 	return () => {
 		if (unregistered) return;
@@ -113,51 +144,78 @@ function currentSweepIntervalMs(): number {
 	return Number.isFinite(min) ? min : DEFAULT_SWEEP_INTERVAL_MS;
 }
 
-function ensureTimerStarted(): void {
-	if (timer) return;
-	stopped = false;
-	scheduleNextSweep();
+function clearPendingSchedule(): void {
+	if (pendingTimer) clearTimeout(pendingTimer);
+	pendingTimer = null;
+	pendingDeadline = null;
+	pendingOwner = null;
 }
 
-// Recursive setTimeout (not setInterval) so the cadence is recomputed every cycle and later
-// session register/unregister changes to resourceGc.sweepIntervalMs are honored live.
-function scheduleNextSweep(): void {
-	if (stopped || activeSessions.size === 0) {
-		timer = null;
+function requestSchedule(deadline: number): void {
+	if (stopped || activeSessions.size === 0) return;
+	if (pendingDeadline !== null && pendingDeadline <= deadline) return;
+	clearPendingSchedule();
+	const owner = { generation: timerGeneration, token: ++nextTimerToken };
+	pendingDeadline = deadline;
+	pendingOwner = owner;
+	pendingTimer = setTimeout(
+		() => {
+			void handleTimerCallback(owner, deadline);
+		},
+		Math.max(0, deadline - schedulerNow()),
+	);
+	pendingTimer.unref?.();
+}
+
+function deferSchedule(generation: number, deadline: number): void {
+	if (generation !== timerGeneration) return;
+	if (deferredSchedule?.generation === generation) {
+		deferredSchedule.deadline = Math.min(deferredSchedule.deadline, deadline);
 		return;
 	}
-	const generation = timerGeneration;
-	timer = setTimeout(() => {
-		void tickAndReschedule(generation);
-	}, currentSweepIntervalMs());
-	timer.unref?.();
+	deferredSchedule = { generation, deadline };
 }
 
-async function tickAndReschedule(generation: number): Promise<void> {
-	await runTick();
-	// A stop (and possible re-register) happened during the tick: a newer cycle owns the timer now.
-	if (generation !== timerGeneration) return;
-	scheduleNextSweep();
+async function handleTimerCallback(owner: ScheduleOwner, deadline: number): Promise<void> {
+	if (pendingOwner?.generation !== owner.generation || pendingOwner.token !== owner.token) return;
+	pendingTimer = null;
+	pendingDeadline = null;
+	pendingOwner = null;
+	if (inProgressOwner) {
+		deferSchedule(owner.generation, deadline);
+		return;
+	}
+	await runTick(owner.generation, "timer");
+}
+
+function reconcileCurrentSchedule(): void {
+	if (stopped || activeSessions.size === 0 || inProgressOwner) return;
+	const normalDeadline = schedulerNow() + currentSweepIntervalMs();
+	const deferredDeadline = deferredSchedule?.generation === timerGeneration ? deferredSchedule.deadline : null;
+	if (deferredDeadline !== null) deferredSchedule = null;
+	requestSchedule(deferredDeadline === null ? normalDeadline : Math.min(deferredDeadline, normalDeadline));
 }
 
 function stopTimer(): void {
 	stopped = true;
 	timerGeneration++;
-	if (timer) {
-		clearTimeout(timer);
-		timer = null;
-	}
+	clearPendingSchedule();
+	deferredSchedule = null;
 }
 
-async function runTick(): Promise<void> {
-	if (inProgress) return;
-	inProgress = true;
+async function runTick(generation = timerGeneration, source: WorkOwner["source"] = "external"): Promise<void> {
+	if (inProgressOwner || activeSessions.size === 0) return;
+	const owner: WorkOwner = { generation, source };
+	inProgressOwner = owner;
 	try {
 		await sweepOnce(deps);
 	} catch (err) {
 		logger.debug("resource GC sweep failed", { error: (err as Error).message });
 	} finally {
-		inProgress = false;
+		if (inProgressOwner === owner) inProgressOwner = null;
+		// A stale completion only releases its own work lock. Once that lock is released, current
+		// generation demand (which may have deferred behind it) can be reconciled independently.
+		reconcileCurrentSchedule();
 	}
 }
 
@@ -268,8 +326,19 @@ export function __setResourceGcDepsForTest(overrides: Partial<ResourceGcDeps>): 
 	deps = { ...defaultDeps, ...overrides };
 }
 
+export function __setResourceGcSchedulerNowForTest(now: () => number): void {
+	schedulerNow = now;
+}
+
 export async function __runResourceGcTickForTest(): Promise<void> {
 	await runTick();
+}
+
+export async function __runResourceGcTimerCallbackForTest(
+	owner: { generation: number; token: number },
+	deadline: number,
+): Promise<void> {
+	await handleTimerCallback(owner, deadline);
 }
 
 export function __getResourceGcStateForTest(): {
@@ -277,15 +346,35 @@ export function __getResourceGcStateForTest(): {
 	sessionCount: number;
 	rssWarningActive: boolean;
 	inProgress: boolean;
+	generation: number;
+	pendingDeadline: number | null;
+	pendingOwner: { generation: number; token: number } | null;
+	deferredDeadline: number | null;
+	deferredGeneration: number | null;
+	activeGeneration: number | null;
 } {
-	return { timerActive: timer !== null, sessionCount: activeSessions.size, rssWarningActive, inProgress };
+	return {
+		timerActive: pendingTimer !== null,
+		sessionCount: activeSessions.size,
+		rssWarningActive,
+		inProgress: inProgressOwner !== null,
+		generation: timerGeneration,
+		pendingDeadline,
+		pendingOwner: pendingOwner ? { ...pendingOwner } : null,
+		deferredDeadline: deferredSchedule?.deadline ?? null,
+		deferredGeneration: deferredSchedule?.generation ?? null,
+		activeGeneration: inProgressOwner?.generation ?? null,
+	};
 }
 
 export function __resetResourceGcForTest(): void {
 	stopTimer();
 	activeSessions.clear();
-	inProgress = false;
+	inProgressOwner = null;
+	deferredSchedule = null;
 	rssWarningActive = false;
 	lastScreenshotScanAt = 0;
+	nextTimerToken = 0;
+	schedulerNow = (): number => performance.now();
 	deps = defaultDeps;
 }

@@ -3,8 +3,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { type FixtureBrokerLease, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 
 const roots = new Set<string>();
+const brokerLeases = new Map<string, FixtureBrokerLease>();
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 
 async function tempRoot(): Promise<string> {
@@ -13,32 +15,13 @@ async function tempRoot(): Promise<string> {
 	return root;
 }
 
-async function stopBroker(agentDir: string): Promise<void> {
-	const discovery = await readBrokerDiscovery(agentDir);
-	if (!discovery) return;
-	try {
-		process.kill(discovery.pid, "SIGTERM");
-	} catch {}
-	const deadline = Date.now() + 5_000;
-	while (Date.now() < deadline) {
-		try {
-			process.kill(discovery.pid, 0);
-			await Bun.sleep(25);
-		} catch {
-			return;
-		}
-	}
-	try {
-		process.kill(discovery.pid, "SIGKILL");
-	} catch {}
-}
-
 afterEach(async () => {
 	for (const root of roots) {
-		await stopBroker(path.join(root, "agent"));
+		await brokerLeases.get(root)?.close();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 	roots.clear();
+	brokerLeases.clear();
 });
 
 it("starts a fresh detached source broker without loading hostile cwd bunfig or dotenv", async () => {
@@ -61,6 +44,21 @@ it("starts a fresh detached source broker without loading hostile cwd bunfig or 
 	);
 	if (process.platform !== "win32") await fs.chmod(fakeBun, 0o755);
 	await fs.mkdir(agentDir, { recursive: true });
+	brokerLeases.set(
+		root,
+		(
+			await startFixtureBrokerWithLeaseForTest({
+				agentDir,
+				env: {
+					...process.env,
+					BUN_OPTIONS: "--no-env-file --config=/dev/null",
+					PI_COMPILED: "1",
+					GJC_COMPILED: "1",
+					PATH: `${hostileBin}${path.delimiter}${process.env.PATH ?? ""}`,
+				},
+			})
+		).lease,
+	);
 	await Bun.write(path.join(hostileCwd, "bunfig.toml"), `preload = [${JSON.stringify(preload)}]\n`);
 	await Bun.write(path.join(hostileCwd, ".env"), "GJC_2178_DOTENV=dotenv-loaded\n");
 	await Bun.write(
@@ -107,6 +105,7 @@ it("starts a fresh detached source broker without loading hostile cwd bunfig or 
 	expect(response.ok).toBe(true);
 	expect(response.result?.sessions).toEqual([]);
 	expect(await readBrokerDiscovery(agentDir)).not.toBeNull();
+	expect(brokerLeases.get(root)).toBeDefined();
 	expect(await Bun.file(preloadSentinel).exists()).toBe(false);
 	expect(await Bun.file(dotenvSentinel).exists()).toBe(false);
 	expect(await Bun.file(pathSentinel).exists()).toBe(false);

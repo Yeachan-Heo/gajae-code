@@ -170,6 +170,7 @@ For common MiniMax and GLM/zAI setup, prefer the provider presets so the OpenAI-
 gjc setup provider --preset minimax
 gjc setup provider --preset minimax-cn
 gjc setup provider --preset glm
+gjc setup provider --preset alibaba-token-plan
 ```
 
 The same presets are available inside the TUI:
@@ -178,9 +179,10 @@ The same presets are available inside the TUI:
 /provider add --preset minimax
 /provider add --preset glm
 /provider add zai
+/provider add --preset alibaba-token-plan
 ```
 
-Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, or `ZAI_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider.
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, or `ALIBABA_TOKEN_PLAN_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: alibaba, token-plan) writes an OpenAI-compatible custom provider named alibaba-token-plan with per-model API routing (qwen3.8-max-preview uses openai-responses; glm-5.2 and deepseek-v4-pro use openai-completions).
 
 ## Model profiles (`--mpreset`)
 
@@ -307,6 +309,25 @@ providers:
 ```
 
 Use provider-level `headers` for proxy-required headers. Keep the provider `api` set to `openai-completions` when the proxy exposes Chat Completions-compatible `/v1/chat/completions` semantics. `auth: apiKey` sends the resolved token as bearer auth; use `auth: none` only for trusted local/no-auth endpoints.
+
+`input` is the model modality list GJC uses to decide whether image content is forwarded. When a custom model omits `input`, GJC defaults to `[text]` (unless a bundled model with the same id contributes a reference). Vision-capable upstream models therefore need an explicit `input: [text, image]`; otherwise `read`/tool images are stripped before the request and replaced with `[image omitted: model does not support vision]`, even if the remote model can see images.
+
+```yaml
+providers:
+  ali:
+    baseUrl: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+    apiKeyEnv: ALI_API_KEY
+    api: openai-completions
+    auth: apiKey
+    models:
+      # id-only → text-only; images will be omitted
+      - id: some-text-model
+      # vision-capable hosted model must declare image input
+      - id: qwen3.8-max-preview
+        name: Qwen3.8 Max Preview
+        reasoning: true
+        input: [text, image]
+```
 
 `requestTransform` and `wireModelId` remain supported for request-body shaping, but they are not needed for ordinary OpenAI-compatible proxies whose local model id is already the upstream wire id. Unknown config keys fail validation before a provider request is sent.
 

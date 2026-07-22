@@ -95,6 +95,12 @@ export interface MCPToolSelectionEntry extends SessionEntryBase {
 	selectedToolNames: string[];
 }
 
+export interface DiscoveredBuiltinToolSelectionEntry extends SessionEntryBase {
+	type: "discovered_builtin_tool_selection";
+	/** Discoverable built-in tool names selected for visibility in discovery mode. */
+	selectedToolNames: string[];
+}
+
 export interface SessionInitEntry extends SessionEntryBase {
 	type: "session_init";
 	/** Full system prompt sent to the model */
@@ -140,6 +146,7 @@ export type SessionEntry =
 	| LabelEntry
 	| TtsrInjectionEntry
 	| MCPToolSelectionEntry
+	| DiscoveredBuiltinToolSelectionEntry
 	| SessionInitEntry
 	| ModeChangeEntry
 	| ConfiguredModelChainEntry

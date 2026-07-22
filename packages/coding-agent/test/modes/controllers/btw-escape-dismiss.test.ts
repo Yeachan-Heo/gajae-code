@@ -26,6 +26,7 @@ function makeHarness(runEphemeralTurn: () => Promise<unknown>): Harness {
 	const session = {
 		model: { provider: "anthropic", id: "test" },
 		runEphemeralTurn,
+		createBtwConversationScope: vi.fn(() => ({ messages: [], systemPrompt: [] })),
 		isStreaming: false,
 		isBashRunning: false,
 		isEvalRunning: false,
@@ -107,6 +108,28 @@ describe("btw panel Esc dismissal (issue #455)", () => {
 		expect(btwContainer.children).toHaveLength(0);
 	});
 
+	it("dismisses retained completed and errored panels on Esc", async () => {
+		const completed = makeHarness(async () => ({
+			replyText: "Answer",
+			assistantMessage: {},
+		}));
+		await completed.btw.start("Why?");
+		await drain();
+		expect(completed.btw.hasOpenPanel()).toBe(true);
+		completed.editor.handleInput(ESC);
+		expect(completed.btw.hasOpenPanel()).toBe(false);
+		expect(completed.btwContainer.children).toHaveLength(0);
+
+		const errored = makeHarness(async () => {
+			throw new Error("boom");
+		});
+		await errored.btw.start("Why?");
+		await drain();
+		expect(errored.btw.hasOpenPanel()).toBe(true);
+		errored.editor.handleInput(ESC);
+		expect(errored.btw.hasOpenPanel()).toBe(false);
+		expect(errored.btwContainer.children).toHaveLength(0);
+	});
 	it("dismisses under the kitty keyboard protocol encoding of Esc", async () => {
 		setKittyProtocolActive(true);
 		try {

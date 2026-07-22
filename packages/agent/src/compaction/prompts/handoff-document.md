@@ -42,6 +42,13 @@ Use exactly this structure:
 1. [What should happen next]
 </output>
 
+{{#if promptExtension}}
+<instruction>
+Additional handoff guidance (supplements — does not replace — the required structure and critical rules above):
+{{promptExtension}}
+</instruction>
+{{/if}}
+
 {{#if additionalFocus}}
 <instruction>
 Additional focus: {{additionalFocus}}

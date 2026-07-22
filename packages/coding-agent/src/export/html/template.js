@@ -436,6 +436,39 @@
         return div.innerHTML;
       }
 
+      function escapeHtmlAttribute(value) {
+        return String(value)
+          .replace(/&/g, '&amp;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+      }
+
+      const SUPPORTED_DATA_IMAGE_MIME_TYPES = new Set([
+        'image/png',
+        'image/jpeg',
+        'image/gif',
+        'image/webp',
+      ]);
+      const STRICT_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+      function isStrictBase64(value) {
+        if (value.length === 0 || !STRICT_BASE64_PATTERN.test(value)) return false;
+        try {
+          return btoa(atob(value)) === value;
+        } catch {
+          return false;
+        }
+      }
+
+      function renderDataImage(image, className) {
+        if (!image || typeof image.mimeType !== 'string' || typeof image.data !== 'string') return '';
+        if (!SUPPORTED_DATA_IMAGE_MIME_TYPES.has(image.mimeType)) return '';
+        if (!isStrictBase64(image.data)) return '';
+        return `<img src="data:${escapeHtmlAttribute(image.mimeType)};base64,${escapeHtmlAttribute(image.data)}" class="${escapeHtmlAttribute(className)}" />`;
+      }
+
       /**
        * Truncate string to maxLen chars, append "..." if truncated.
        */
@@ -480,7 +513,7 @@
               if (toolCall) {
                 return labelHtml + `<span class="tree-role-tool">${escapeHtml(formatToolCall(toolCall.name, toolCall.arguments))}</span>`;
               }
-              return labelHtml + `<span class="tree-role-tool">[${msg.toolName || 'tool'}]</span>`;
+              return labelHtml + `<span class="tree-role-tool">[${escapeHtml(msg.toolName || 'tool')}]</span>`;
             }
             if (msg.role === 'bashExecution') {
               const cmd = truncate(normalize(msg.command || ''));
@@ -490,7 +523,7 @@
               const code = truncate(normalize(msg.code || ''));
               return labelHtml + `<span class="tree-role-tool">[js]:</span> ${escapeHtml(code)}`;
             }
-            return labelHtml + `<span class="tree-muted">[${msg.role}]</span>`;
+            return labelHtml + `<span class="tree-muted">[${escapeHtml(msg.role)}]</span>`;
           }
           case 'compaction':
             return labelHtml + `<span class="tree-compaction">[compaction: ${Math.round(entry.tokensBefore/1000)}k tokens]</span>`;
@@ -505,11 +538,11 @@
           case 'model_change':
             return labelHtml + `<span class="tree-muted">[model: ${escapeHtml(entry.model)}]</span>`;
           case 'thinking_level_change':
-            return labelHtml + `<span class="tree-muted">[thinking: ${entry.thinkingLevel}]</span>`;
+            return labelHtml + `<span class="tree-muted">[thinking: ${escapeHtml(entry.thinkingLevel)}]</span>`;
           case 'mode_change':
             return labelHtml + `<span class="tree-muted">[mode: ${escapeHtml(entry.mode)}]</span>`;
           default:
-            return labelHtml + `<span class="tree-muted">[${entry.type}]</span>`;
+            return labelHtml + `<span class="tree-muted">[${escapeHtml(entry.type)}]</span>`;
         }
       }
 
@@ -1579,7 +1612,7 @@
             const images = result.content.filter(c => c.type === 'image');
             if (images.length === 0) return '';
             return '<div class="tool-images">' +
-              images.map(img => '<img src="data:' + img.mimeType + ';base64,' + img.data + '" class="tool-image" />').join('') +
+              images.map(img => renderDataImage(img, 'tool-image')).join('') +
               '</div>';
           },
         };
@@ -1672,7 +1705,7 @@
        * Render the copy-link button HTML for a message.
        */
       function renderCopyLinkButton(entryId) {
-        return `<button class="copy-link-btn" data-entry-id="${entryId}" title="Copy link to this message">
+        return `<button class="copy-link-btn" data-entry-id="${escapeHtmlAttribute(entryId)}" title="Copy link to this message">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
             <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
@@ -1682,8 +1715,8 @@
 
       function renderEntry(entry) {
         const ts = formatTimestamp(entry.timestamp);
-        const tsHtml = ts ? `<div class="message-timestamp">${ts}</div>` : '';
-        const entryId = `entry-${entry.id}`;
+        const tsHtml = ts ? `<div class="message-timestamp">${escapeHtml(ts)}</div>` : '';
+        const entryId = escapeHtmlAttribute(`entry-${entry.id}`);
         const copyBtnHtml = renderCopyLinkButton(entry.id);
 
         if (entry.type === 'message') {
@@ -1698,7 +1731,7 @@
               if (images.length > 0) {
                 html += '<div class="message-images">';
                 for (const img of images) {
-                  html += `<img src="data:${img.mimeType};base64,${img.data}" class="message-image" />`;
+                  html += renderDataImage(img, 'message-image');
                 }
                 html += '</div>';
               }
@@ -1763,7 +1796,7 @@
             if (msg.cancelled) {
               html += '<div style="color: var(--warning)">(cancelled)</div>';
             } else if (msg.exitCode !== 0 && msg.exitCode !== null) {
-              html += `<div style="color: var(--error)">(exit ${msg.exitCode})</div>`;
+              html += `<div style="color: var(--error)">(exit ${escapeHtml(msg.exitCode)})</div>`;
             }
             html += '</div>';
             return html;
@@ -1777,7 +1810,7 @@
             if (msg.cancelled) {
               html += '<div style="color: var(--warning)">(cancelled)</div>';
             } else if (msg.exitCode !== 0 && msg.exitCode !== null) {
-              html += `<div style="color: var(--error)">(exit ${msg.exitCode})</div>`;
+              html += `<div style="color: var(--error)">(exit ${escapeHtml(msg.exitCode)})</div>`;
             }
             html += '</div>';
             return html;
@@ -1798,10 +1831,11 @@
 
 
         if (entry.type === 'compaction') {
+          const tokensBefore = escapeHtml(entry.tokensBefore.toLocaleString());
           return `<div class="compaction" id="${entryId}" onclick="this.classList.toggle('expanded')">
             <div class="compaction-label">[compaction]</div>
-            <div class="compaction-collapsed">Compacted from ${entry.tokensBefore.toLocaleString()} tokens</div>
-            <div class="compaction-content"><strong>Compacted from ${entry.tokensBefore.toLocaleString()} tokens</strong>\n\n${escapeHtml(entry.summary)}</div>
+            <div class="compaction-collapsed">Compacted from ${tokensBefore} tokens</div>
+            <div class="compaction-content"><strong>Compacted from ${tokensBefore} tokens</strong>\n\n${escapeHtml(entry.summary)}</div>
           </div>`;
         }
 
@@ -1895,8 +1929,8 @@
             <div class="help-bar">Ctrl+T toggle thinking · Ctrl+O toggle tools</div>
             <div class="header-info">
               <div class="info-item"><span class="info-label">Product:</span><span class="info-value">GJC / gajae-code</span></div>
-              <div class="info-item"><span class="info-label">Date:</span><span class="info-value">${header?.timestamp ? new Date(header.timestamp).toLocaleString() : 'unknown'}</span></div>
-              <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${globalStats.models.join(', ') || 'unknown'}</span></div>
+              <div class="info-item"><span class="info-label">Date:</span><span class="info-value">${escapeHtml(header?.timestamp ? new Date(header.timestamp).toLocaleString() : 'unknown')}</span></div>
+              <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${escapeHtml(globalStats.models.join(', ') || 'unknown')}</span></div>
               <div class="info-item"><span class="info-label">Messages:</span><span class="info-value">${msgParts.join(', ') || '0'}</span></div>
               <div class="info-item"><span class="info-label">Tool Calls:</span><span class="info-value">${globalStats.toolCalls}</span></div>
               <div class="info-item"><span class="info-label">Tokens:</span><span class="info-value">${tokenParts.join(' ') || '0'}</span></div>
@@ -2039,7 +2073,7 @@
       }
 
       function renderAttribute(name, value) {
-        return value ? ` ${name}="${escapeHtml(value)}"` : '';
+        return value ? ` ${name}="${escapeHtmlAttribute(value)}"` : '';
       }
 
       function renderUnsafeLinkText(tokens, href) {
@@ -2095,7 +2129,7 @@
             if (sanitizedHref === null) {
               return renderUnsafeLinkText.call(this, token.tokens || [], href);
             }
-            return `<a href="${escapeHtml(sanitizedHref)}"${renderAttribute('title', token.title)}>${this.parser.parseInline(token.tokens || [])}</a>`;
+            return `<a href="${escapeHtmlAttribute(sanitizedHref)}"${renderAttribute('title', token.title)}>${this.parser.parseInline(token.tokens || [])}</a>`;
           },
           image(token) {
             const href = token.href || '';
@@ -2103,7 +2137,7 @@
             if (sanitizedHref === null) {
               return renderUnsafeImageText(token.text || '', href);
             }
-            return `<img src="${escapeHtml(sanitizedHref)}" alt="${escapeHtml(token.text || '')}"${renderAttribute('title', token.title)}>`;
+            return `<img src="${escapeHtmlAttribute(sanitizedHref)}" alt="${escapeHtmlAttribute(token.text || '')}"${renderAttribute('title', token.title)}>`;
           }
         }
       });

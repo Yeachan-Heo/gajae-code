@@ -8,9 +8,6 @@
  * Shutdown writes `{"type":"exit"}` and escalates to SIGTERM/SIGKILL on
  * timeout.
  */
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { $env, isBunTestRuntime, logger, Snowflake } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
 import { $ } from "bun";
@@ -18,7 +15,7 @@ import { Settings } from "../../config/settings";
 import { type KernelDisplayOutput, renderKernelDisplay } from "./display";
 import { resolvePythonIpcTrace, resolvePythonSkipCheck } from "./env";
 import { PYTHON_PRELUDE } from "./prelude";
-import RUNNER_SCRIPT from "./runner.py" with { type: "text" };
+import { ensureRunnerScript } from "./runner-artifact";
 import { ensurePythonRuntime, filterEnv, type PythonRuntimeOptions } from "./runtime";
 
 export type { KernelDisplayOutput, PythonStatusEvent } from "./display";
@@ -26,23 +23,6 @@ export { renderKernelDisplay } from "./display";
 
 // Dual-read: `GJC_PYTHON_IPC_TRACE` is preferred, then legacy `PI_PYTHON_IPC_TRACE`.
 const TRACE_IPC = resolvePythonIpcTrace($env);
-
-// Cache the runner script on disk so the subprocess loads it normally. Cached
-// per script hash so installs don't race across versions.
-const RUNNER_CACHE_DIR = path.join(os.tmpdir(), "gjc-python-runner");
-let RUNNER_SCRIPT_PATH: string | null = null;
-
-async function ensureRunnerScript(): Promise<string> {
-	if (RUNNER_SCRIPT_PATH) return RUNNER_SCRIPT_PATH;
-	await fs.promises.mkdir(RUNNER_CACHE_DIR, { recursive: true });
-	const hash = Bun.hash(RUNNER_SCRIPT).toString(36);
-	const target = path.join(RUNNER_CACHE_DIR, `runner-${hash}.py`);
-	if (!fs.existsSync(target)) {
-		await Bun.write(target, RUNNER_SCRIPT);
-	}
-	RUNNER_SCRIPT_PATH = target;
-	return target;
-}
 
 const SHUTDOWN_GRACE_MS = 1_000;
 const STARTUP_TIMEOUT_MS = 10_000;

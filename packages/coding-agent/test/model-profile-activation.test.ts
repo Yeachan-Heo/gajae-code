@@ -104,6 +104,21 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 			model("minimax-code-cn", "minimax-m3"),
 			model("kimi-code", "kimi-k2.5"),
 			model("zai", "glm-5.1"),
+			model("alibaba-token-plan", "qwen3.8-max-preview", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Minimal,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
+			model("alibaba-token-plan", "glm-5.2", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Minimal,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
+			model("alibaba-token-plan", "deepseek-v4-pro", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Minimal,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
 		],
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
@@ -574,6 +589,26 @@ describe("model profile activation", () => {
 				planner: "anthropic/claude-opus-4-8:medium",
 				critic: "anthropic/claude-opus-4-8:high",
 				architect: "openai-codex/gpt-5.6-sol:xhigh",
+			},
+		],
+		[
+			"alibaba-token-plan-balanced",
+			{
+				default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+				executor: "alibaba-token-plan/deepseek-v4-pro:xhigh",
+				planner: "alibaba-token-plan/glm-5.2:high",
+				critic: "alibaba-token-plan/glm-5.2:high",
+				architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+			},
+		],
+		[
+			"alibaba-token-plan-qwenmaxxing",
+			{
+				default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+				executor: "alibaba-token-plan/qwen3.8-max-preview:low",
+				planner: "alibaba-token-plan/qwen3.8-max-preview:medium",
+				critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+				architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 			},
 		],
 	] satisfies Array<

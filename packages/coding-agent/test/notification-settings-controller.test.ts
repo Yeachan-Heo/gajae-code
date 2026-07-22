@@ -15,7 +15,7 @@ import {
 	type NotificationsEditorOperationDependencies,
 } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import type { NotificationSettingsSnapshot } from "@gajae-code/coding-agent/sdk/bus/config";
+import { getNotificationConfig, type NotificationSettingsSnapshot } from "@gajae-code/coding-agent/sdk/bus/config";
 import {
 	createTelegramActivationMarker,
 	telegramActivationIdentity,
@@ -48,6 +48,8 @@ function snapshot(overrides: Partial<NotificationSettingsSnapshot> = {}): Notifi
 			rich: { enabled: true },
 			btw: { enabled: true },
 			richDraft: { enabled: false },
+			toolActivity: { enabled: true },
+			streaming: { enabled: true },
 			topics: {},
 		},
 		discord: {},
@@ -142,6 +144,8 @@ function editorState(): NotificationsEditorState {
 			sessionScope: "all",
 			richEnabled: true,
 			richDraftEnabled: false,
+			toolActivityEnabled: true,
+			streamingEnabled: true,
 		},
 	};
 }
@@ -243,6 +247,11 @@ describe("notification settings controller adapter", () => {
 			commitAtomicBatch: async (patches: unknown[]) => {
 				events.push("commit");
 				batches.push(structuredClone(patches));
+				for (const patch of patches as Array<{ path?: string; value?: unknown }>) {
+					if (patch.path === "notifications.telegram.toolActivity.enabled" && typeof patch.value === "boolean") {
+						currentSnapshot.telegram.toolActivity.enabled = patch.value;
+					}
+				}
 				return receipt();
 			},
 		} as unknown as Settings;
@@ -279,6 +288,24 @@ describe("notification settings controller adapter", () => {
 				return recovery();
 			},
 			unregisterNotificationRoot: async () => ({ root: "/workspace/current/.gjc/state", remainingRoots: 1 }),
+			stopTelegramDaemon: async input => {
+				expect(input).toBe(settings);
+				expect(getNotificationConfig(input).toolActivity.enabled).toBe(true);
+				events.push("stop");
+				return { ok: true, message: "stopped", before: { health: "running" } };
+			},
+			restartTelegramDaemon: async input => {
+				expect(input).toBe(settings);
+				expect(getNotificationConfig(input).toolActivity.enabled).toBe(false);
+				events.push("reload");
+				return { ok: true, message: "reloaded" };
+			},
+			reloadTelegramDaemon: async input => {
+				expect(input).toBe(settings);
+				expect(getNotificationConfig(input).toolActivity.enabled).toBe(false);
+				events.push("reload");
+				return { ok: true, message: "reloaded" };
+			},
 
 			ensureTelegramDaemonRunningDetailed: async input => {
 				expect(input).toMatchObject({ cwd: "/workspace/current", sessionId: "session-current" });
@@ -311,6 +338,7 @@ describe("notification settings controller adapter", () => {
 
 		const loaded = await operations.loadState();
 		expect(loaded.session).toEqual(sessionStatus());
+		expect(loaded.preferences.streamingEnabled).toBe(true);
 		const signal = new AbortController().signal;
 		await operations.refreshHealth({ probe: true, signal });
 		await operations.sendTest();
@@ -329,19 +357,25 @@ describe("notification settings controller adapter", () => {
 
 		const firstSecret = secret();
 		const firstPreflight = await operations.preflightProposedIdentity(
-			{ token: firstSecret as never, chatId: "input-chat", richEnabled: true, richDraftEnabled: false },
+			{
+				token: firstSecret as never,
+				chatId: "input-chat",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: true,
+			},
 			new AbortController().signal,
 		);
 		expect(firstSecret.consume).toHaveBeenCalledTimes(1);
 		expect(firstPreflight).toMatchObject({
 			status: "ready",
-			draft: { chatId: "validated-chat", tokenMask: expect.not.stringContaining(TOKEN) },
+			draft: { chatId: "validated-chat", tokenMask: expect.not.stringContaining(TOKEN), streamingEnabled: true },
 		});
 		expect(setupCalls[0]).toMatchObject({ chatId: "input-chat", interactive: false });
 		expect(identityCalls[0]).toMatchObject({ chatId: "validated-chat", chatDisplay: "validated-chat" });
 
 		const discoveredPreflight = await operations.preflightProposedIdentity(
-			{ token: secret() as never, richEnabled: true, richDraftEnabled: false },
+			{ token: secret() as never, richEnabled: true, richDraftEnabled: false, streamingEnabled: true },
 			new AbortController().signal,
 		);
 		expect(setupCalls[1]).toMatchObject({ chatId: undefined, interactive: false });
@@ -360,11 +394,18 @@ describe("notification settings controller adapter", () => {
 			{ path: "notifications.telegram.chatId", op: "set", value: "validated-chat" },
 			{ path: "notifications.telegram.rich.enabled", op: "set", value: true },
 			{ path: "notifications.telegram.richDraft.enabled", op: "set", value: false },
+			{ path: "notifications.telegram.streaming.enabled", op: "set", value: true },
 		]);
 		expect(events.slice(0, 3)).toEqual(["commit", "reconcile", "notify"]);
 
 		const secondPreflight = await operations.preflightProposedIdentity(
-			{ token: secret() as never, chatId: "input-chat", richEnabled: true, richDraftEnabled: false },
+			{
+				token: secret() as never,
+				chatId: "input-chat",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: true,
+			},
 			new AbortController().signal,
 		);
 		if (!secondPreflight.draft) throw new Error("Expected prepared Telegram draft.");
@@ -430,12 +471,15 @@ describe("notification settings controller adapter", () => {
 		expect(controller.reconcileCurrentSession).toHaveBeenCalledWith(
 			expect.objectContaining({ sessionManager: ctx.sessionManager }),
 		);
+		events.length = 0;
 		await operations.commitPreferences({
 			redact: true,
 			verbosity: "verbose",
 			sessionScope: "primary",
 			richEnabled: false,
 			richDraftEnabled: true,
+			toolActivityEnabled: false,
+			streamingEnabled: false,
 		});
 		expect(batches.at(-1)).toEqual([
 			{ path: "notifications.redact", op: "set", value: true },
@@ -443,15 +487,107 @@ describe("notification settings controller adapter", () => {
 			{ path: "notifications.sessionScope", op: "set", value: "primary" },
 			{ path: "notifications.telegram.rich.enabled", op: "set", value: false },
 			{ path: "notifications.telegram.richDraft.enabled", op: "set", value: true },
+			{ path: "notifications.telegram.streaming.enabled", op: "set", value: false },
+			{ path: "notifications.telegram.toolActivity.enabled", op: "set", value: false },
 		]);
+		expect(events).toEqual(["stop", "commit", "reload", "notify"]);
 
 		const discarded = await operations.preflightProposedIdentity(
-			{ token: secret() as never, chatId: "input-chat", richEnabled: true, richDraftEnabled: false },
+			{
+				token: secret() as never,
+				chatId: "input-chat",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: true,
+			},
 			new AbortController().signal,
 		);
 		if (!discarded.draft) throw new Error("Expected prepared Telegram draft.");
 		operations.discardConfigureDraft(discarded.draft);
 		await expect(operations.commitConfigure(discarded.draft)).rejects.toThrow("draft expired");
+	});
+
+	it("restarts the fenced daemon when a tool activity disable commit fails", async () => {
+		const events: string[] = [];
+		const settings = {
+			getAgentDir: () => "/tmp/gjc-settings-controller",
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => {
+				events.push("commit");
+				throw new Error("commit failed");
+			},
+		} as unknown as Settings;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: {},
+				sessionManager: { getCwd: () => "/workspace/current", getSessionId: () => "session-current" },
+			} as unknown as NotificationsEditorAdapterContext,
+			{
+				stopTelegramDaemon: async () => {
+					events.push("stop");
+					return { ok: true, message: "stopped", before: { health: "running" } };
+				},
+				restartTelegramDaemon: async input => {
+					events.push("restart");
+					expect(getNotificationConfig(input).toolActivity.enabled).toBe(true);
+					return { ok: true, message: "restarted" };
+				},
+			},
+		);
+
+		await expect(
+			operations.commitPreferences({
+				redact: true,
+				verbosity: "verbose",
+				sessionScope: "primary",
+				richEnabled: false,
+				richDraftEnabled: true,
+				toolActivityEnabled: false,
+				streamingEnabled: true,
+			}),
+		).rejects.toThrow("commit failed");
+		expect(events).toEqual(["stop", "commit", "restart"]);
+		expect(getNotificationConfig(settings).toolActivity.enabled).toBe(true);
+	});
+
+	it("reports both commit and daemon restart failure after fencing", async () => {
+		const settings = {
+			getAgentDir: () => "/tmp/gjc-settings-controller",
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => {
+				throw new Error("commit failed");
+			},
+		} as unknown as Settings;
+		const operations = createNotificationsEditorOperations(
+			{
+				settings,
+				session: {},
+				sessionManager: { getCwd: () => "/workspace/current", getSessionId: () => "session-current" },
+			} as unknown as NotificationsEditorAdapterContext,
+			{
+				stopTelegramDaemon: async () => ({
+					ok: true,
+					message: "stopped",
+					before: { health: "running" },
+				}),
+				restartTelegramDaemon: async () => ({ ok: false, message: "owner did not restart" }),
+			},
+		);
+
+		await expect(
+			operations.commitPreferences({
+				redact: true,
+				verbosity: "verbose",
+				sessionScope: "primary",
+				richEnabled: false,
+				richDraftEnabled: true,
+				toolActivityEnabled: false,
+				streamingEnabled: true,
+			}),
+		).rejects.toThrow(
+			"Notification preference commit failed (commit failed) and daemon restart failed (owner did not restart).",
+		);
 	});
 
 	it("enters controller-owned blocked runtime before reporting a blocked committed identity", async () => {
@@ -498,7 +634,13 @@ describe("notification settings controller adapter", () => {
 			},
 		);
 		const result = await operations.preflightProposedIdentity(
-			{ token: secret() as never, chatId: "chat", richEnabled: true, richDraftEnabled: false },
+			{
+				token: secret() as never,
+				chatId: "chat",
+				richEnabled: true,
+				richDraftEnabled: false,
+				streamingEnabled: true,
+			},
 			new AbortController().signal,
 		);
 		if (!result.draft) throw new Error("Expected prepared Telegram draft.");

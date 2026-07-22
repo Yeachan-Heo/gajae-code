@@ -289,6 +289,17 @@ describe("CustomEditor pasteImage default sourced from KEYBINDINGS", () => {
 });
 
 describe("CustomEditor bracketed paste interception", () => {
+	it("does not retain a standalone Escape as a possible paste prefix", () => {
+		const editor = createEditor();
+		const onEscape = vi.fn();
+		editor.onEscape = onEscape;
+		editor.onPasteText = vi.fn(() => false);
+
+		editor.handleInput("\x1b");
+
+		expect(onEscape).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+	});
 	it("lets coding-agent consume pasted content before the base editor stores it", async () => {
 		const editor = createEditor();
 		const onPasteText = vi.fn(() => true);
@@ -297,7 +308,10 @@ describe("CustomEditor bracketed paste interception", () => {
 		editor.handleInput("\x1b[200~/tmp/clipboard-2026-06-04-120441-CAC144E7.png\x1b[201~");
 		await Bun.sleep(0);
 
-		expect(onPasteText).toHaveBeenCalledWith("/tmp/clipboard-2026-06-04-120441-CAC144E7.png");
+		expect(onPasteText).toHaveBeenCalledWith(
+			"/tmp/clipboard-2026-06-04-120441-CAC144E7.png",
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
+		);
 		expect(editor.getText()).toBe("");
 	});
 
@@ -309,8 +323,25 @@ describe("CustomEditor bracketed paste interception", () => {
 		editor.handleInput("\x1b[200~hello\x1b[201~");
 		await Bun.sleep(0);
 
-		expect(onPasteText).toHaveBeenCalledWith("hello");
+		expect(onPasteText).toHaveBeenCalledWith("hello", expect.objectContaining({ signal: expect.any(AbortSignal) }));
 		expect(editor.getText()).toBe("hello");
+	});
+
+	it("processes leading command text before a split bracketed paste marker", async () => {
+		const editor = createEditor();
+		const observedDrafts: string[] = [];
+		editor.onPasteText = vi.fn(() => {
+			observedDrafts.push(editor.getText());
+			return false;
+		});
+
+		editor.handleInput("!command \x1b[20");
+		expect(editor.getText()).toBe("");
+		editor.handleInput("0~/tmp/one.png /tmp/two.png\x1b[201~ tail");
+		await Bun.sleep(0);
+
+		expect(observedDrafts).toEqual(["!command "]);
+		expect(editor.getText()).toBe("!command /tmp/one.png /tmp/two.png tail");
 	});
 
 	it("follows live before dispatching an async consumed paste and replays later input afterward", async () => {
@@ -361,12 +392,21 @@ describe("CustomEditor bracketed paste interception", () => {
 		expect(trace).toEqual(["follow", "paste", "follow"]);
 	});
 
-	it("drops queued input and ignores late async paste decisions after timeout", async () => {
+	it("aborts timed-out paste handling, restores exact input, and ignores late completion", async () => {
 		vi.useFakeTimers();
 		const editor = createEditor();
 		const pasteDecision = Promise.withResolvers<boolean>();
 		const onPastePendingInputCleared = vi.fn();
-		editor.onPasteText = vi.fn(() => pasteDecision.promise);
+		let pasteSignal: AbortSignal | undefined;
+		let committed = false;
+		editor.onPasteText = vi.fn(async (_text, context) => {
+			pasteSignal = context.signal;
+			await pasteDecision.promise;
+			return context.commit(() => {
+				committed = true;
+				return true;
+			});
+		});
 		editor.onPastePendingInputCleared = onPastePendingInputCleared;
 
 		editor.handleInput("before ");
@@ -374,51 +414,95 @@ describe("CustomEditor bracketed paste interception", () => {
 		editor.handleInput("after");
 
 		expect(editor.getText()).toBe("before ");
-
 		vi.advanceTimersByTime(5_000);
+
+		expect(pasteSignal?.aborted).toBe(true);
 		expect(onPastePendingInputCleared).toHaveBeenCalledWith("timeout", 1);
+		expect(editor.getText()).toBe("before middle after");
 
-		pasteDecision.resolve(false);
+		pasteDecision.resolve(true);
 		await Promise.resolve();
-
-		expect(editor.getText()).toBe("before ");
+		expect(committed).toBe(false);
+		expect(editor.getText()).toBe("before middle after");
 	});
 
-	it("bounds the async paste input queue and clears pending state", async () => {
+	it("aborts at the input queue bound and restores every bounded input event", async () => {
 		const editor = createEditor();
 		const pasteDecision = Promise.withResolvers<boolean>();
 		const onPastePendingInputCleared = vi.fn();
-		editor.onPasteText = vi.fn(() => pasteDecision.promise);
+		let pasteSignal: AbortSignal | undefined;
+		editor.onPasteText = vi.fn((_text, context) => {
+			pasteSignal = context.signal;
+			return pasteDecision.promise;
+		});
 		editor.onPastePendingInputCleared = onPastePendingInputCleared;
 
 		editor.handleInput("before ");
 		editor.handleInput("\x1b[200~middle \x1b[201~");
-		for (let index = 0; index < 65; index += 1) {
-			editor.handleInput(`queued-${index} `);
-		}
+		const queued = Array.from({ length: 65 }, (_, index) => `queued-${index} `);
+		for (const input of queued) editor.handleInput(input);
 
+		expect(pasteSignal?.aborted).toBe(true);
 		expect(onPastePendingInputCleared).toHaveBeenCalledWith("queue-limit", 65);
-		expect(editor.getText()).toBe("before ");
+		expect(editor.getText()).toBe(`before middle ${queued.join("")}`);
 
-		pasteDecision.resolve(false);
+		pasteDecision.resolve(true);
 		await Bun.sleep(0);
-
-		expect(editor.getText()).toBe("before ");
+		expect(editor.getText()).toBe(`before middle ${queued.join("")}`);
 	});
 
-	it("clears pending async paste state when disposed", async () => {
+	it("aborts before retaining a queued input event above the aggregate byte bound", async () => {
 		const editor = createEditor();
 		const pasteDecision = Promise.withResolvers<boolean>();
-		editor.onPasteText = vi.fn(() => pasteDecision.promise);
+		const onPastePendingInputCleared = vi.fn();
+		let pasteSignal: AbortSignal | undefined;
+		editor.onPasteText = vi.fn((_text, context) => {
+			pasteSignal = context.signal;
+			return pasteDecision.promise;
+		});
+		editor.onPastePendingInputCleared = onPastePendingInputCleared;
+		const oversizedInput = "x".repeat(256 * 1024 + 1);
+
+		editor.handleInput("\x1b[200~middle \x1b[201~");
+		editor.handleInput(oversizedInput);
+
+		expect(pasteSignal?.aborted).toBe(true);
+		expect(onPastePendingInputCleared).toHaveBeenCalledWith("queue-limit", 1);
+		expect(editor.getText()).toBe(`middle ${oversizedInput}`);
+	});
+
+	it("rejects oversized trailing input coalesced with the completed paste frame", () => {
+		const editor = createEditor();
+		const onPasteText = vi.fn(() => true);
+		const onPastePendingInputCleared = vi.fn();
+		editor.onPasteText = onPasteText;
+		editor.onPastePendingInputCleared = onPastePendingInputCleared;
+		const oversizedRemaining = "x".repeat(256 * 1024 + 1);
+
+		editor.handleInput(`\x1b[200~middle \x1b[201~${oversizedRemaining}`);
+
+		expect(onPasteText).not.toHaveBeenCalled();
+		expect(onPastePendingInputCleared).toHaveBeenCalledWith("queue-limit", 1);
+		expect(editor.getText()).toBe(`middle ${oversizedRemaining}`);
+	});
+
+	it("aborts pending async paste state when disposed and ignores late completion", async () => {
+		const editor = createEditor();
+		const pasteDecision = Promise.withResolvers<boolean>();
+		let pasteSignal: AbortSignal | undefined;
+		editor.onPasteText = vi.fn((_text, context) => {
+			pasteSignal = context.signal;
+			return pasteDecision.promise;
+		});
 
 		editor.handleInput("before ");
 		editor.handleInput("\x1b[200~middle \x1b[201~");
 		editor.handleInput("after");
 		editor.dispose();
 
+		expect(pasteSignal?.aborted).toBe(true);
 		pasteDecision.resolve(false);
 		await Bun.sleep(0);
-
 		expect(editor.getText()).toBe("before ");
 	});
 });

@@ -65,6 +65,8 @@ packages/ai/test/.temp-images/
 compaction-results/
 changes/
 __pycache__/
+*.egg-info/
+.pytest_cache/
 
 # Scratch files
 syntax.jsonl
@@ -81,3 +83,6 @@ CPU*.md
 packages/coding-agent/binaries/
 
 .release-040-artifacts/
+
+# Python SDK build output
+python/gjc-sdk/build/

@@ -9,7 +9,7 @@ import type { OAuthProvider } from "../utils/oauth/types";
 import { googleModelManagerOptions } from "./google";
 import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
-	alibabaCodingPlanModelManagerOptions,
+	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
@@ -130,10 +130,10 @@ function catalogDescriptor(
 export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 	descriptor("anthropic", "claude-sonnet-5", config => anthropicModelManagerOptions(config)),
 	catalogDescriptor(
-		"alibaba-coding-plan",
-		"qwen3.5-plus",
-		config => alibabaCodingPlanModelManagerOptions(config),
-		catalog("Alibaba Coding Plan", ["ALIBABA_CODING_PLAN_API_KEY"]),
+		"alibaba-token-plan",
+		"deepseek-v4-pro",
+		config => alibabaTokenPlanModelManagerOptions(config),
+		catalog("Alibaba Token Plan", ["ALIBABA_TOKEN_PLAN_API_KEY"], { oauthProvider: "alibaba-token-plan" }),
 	),
 	descriptor("openai", "gpt-5.4", config => openaiModelManagerOptions(config)),
 	descriptor("groq", "openai/gpt-oss-120b", config => groqModelManagerOptions(config)),
@@ -334,7 +334,6 @@ export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = {
 	...Object.fromEntries(PROVIDER_DESCRIPTORS.map(d => [d.providerId, d.defaultModel])),
 	// Providers not in PROVIDER_DESCRIPTORS (special auth or no standard discovery)
 	"azure-openai": "gpt-4.1",
-	"alibaba-coding-plan": "qwen3.5-plus",
 	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
 	"google-antigravity": "gemini-3-pro-high",
 	"google-gemini-cli": "gemini-2.5-pro",

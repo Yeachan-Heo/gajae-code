@@ -14,6 +14,7 @@ import { createMockModel, type MockModel, registerMockApi } from "@gajae-code/ai
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { BTW_STREAM_IDLE_TIMEOUT_MS } from "@gajae-code/coding-agent/session/btw-contract";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 
@@ -187,26 +188,57 @@ describe("AgentSession /btw isolation", () => {
 		const onPayload = vi.fn();
 		const onResponse = vi.fn();
 		const onSseEvent = vi.fn();
+		let providerContext: Context | undefined;
 		const model = createMockModel({
-			handler: () => ({ content: ["answer"], responseHeaders: { "x-request-id": "side" } }),
+			handler: context => {
+				providerContext = structuredClone(context);
+				return { content: ["answer"], responseHeaders: { "x-request-id": "side" } };
+			},
 		});
 		const harness = createHarness({ model, onPayload, onResponse, onSseEvent });
 		const mainMessagesBefore = structuredClone(harness.session.agent.state.messages);
 		const providerStateBefore = harness.session.providerSessionState;
+		harness.sessionManager.appendMessage({
+			role: "custom",
+			customType: "private-custom",
+			content: "PRIVATE_CUSTOM_SENTINEL",
+			display: true,
+			timestamp: 1,
+		});
+		harness.sessionManager.appendMessage({
+			...(harness.live as AssistantMessage),
+			content: [
+				{ type: "thinking", thinking: "PRIVATE_THINKING_SENTINEL" },
+				{ type: "text", text: "visible assistant text" },
+				{ type: "toolCall", id: "private-tool", name: "read", arguments: { secret: "PRIVATE_TOOL_SENTINEL" } },
+			],
+			providerPayload: { private: "PRIVATE_PROVIDER_SENTINEL" } as never,
+		});
 		const committedEntriesBefore = structuredClone(harness.sessionManager.getEntries());
 
-		const turn = harness.session.runEphemeralTurn({ purpose: "btw", promptText: "virtual btw prompt" });
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: {
+				question: "virtual btw prompt",
+				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
+		});
 		(harness.committed.content[0] as { type: "text"; text: string }).text = "mutated after invocation";
 		await turn;
 
 		expect(model.calls).toHaveLength(1);
 		const call = model.calls[0];
-		const payload = JSON.stringify(call?.context.messages);
+		const payload = JSON.stringify(providerContext?.messages);
 		expect(payload).toContain("committed current user");
 		expect(payload).toContain("virtual btw prompt");
 		expect(payload).not.toContain("mutated after invocation");
 		(harness.committed.content[0] as { type: "text"; text: string }).text = "committed current user";
 		expect(payload).not.toContain("uncommitted live assistant");
+		expect(payload).toContain("visible assistant text");
+		expect(payload).not.toContain("PRIVATE_CUSTOM_SENTINEL");
+		expect(payload).not.toContain("PRIVATE_THINKING_SENTINEL");
+		expect(payload).not.toContain("PRIVATE_TOOL_SENTINEL");
+		expect(payload).not.toContain("PRIVATE_PROVIDER_SENTINEL");
 		expect(call?.context.tools).toEqual([]);
 		expect(call?.options?.toolChoice).toBe("none");
 		expect(call?.options?.requestMaxRetries).toBe(0);
@@ -217,8 +249,8 @@ describe("AgentSession /btw isolation", () => {
 		);
 		expect(call?.options?.sessionId).toContain(":btw:");
 		expect(call?.options?.sessionId).not.toBe(harness.session.sessionId);
-		expect(call?.options?.metadata?.user_id).toContain(call?.options?.sessionId);
-		expect(call?.options?.onPayload).toBe(onPayload);
+		expect(call?.options?.metadata).toBeUndefined();
+		expect(call?.options?.onPayload).toBeUndefined();
 		expect(call?.options?.onResponse).toBeUndefined();
 		expect(call?.options?.onSseEvent).toBeUndefined();
 		expect(onPayload).not.toHaveBeenCalled();
@@ -237,12 +269,31 @@ describe("AgentSession /btw isolation", () => {
 		const key = Promise.withResolvers<string>();
 		const harness = createHarness({ getApiKey: () => key.promise });
 
-		const turn = harness.session.runEphemeralTurn({ purpose: "btw", promptText: "snapshot prompt" });
+		const turn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: {
+				question: "snapshot prompt",
+				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
+		});
 		harness.session.agent.setSystemPrompt(["mutated system"]);
 		key.resolve("test-key");
 		await turn;
 
-		expect(harness.model.calls[0]?.context.systemPrompt).toEqual(["system"]);
+		expect(harness.model.calls[0]?.context.systemPrompt).toEqual(["system", "btw test instruction"]);
+	});
+
+	it("keeps the model and provider generation frozen for the open side-chat scope", async () => {
+		const original = createMockModel({ id: "scope-model", handler: () => ({ content: ["scope answer"] }) });
+		const replacement = createMockModel({ id: "replacement-model", handler: () => ({ content: ["wrong answer"] }) });
+		const harness = createHarness({ model: original });
+		const scope = harness.session.createBtwConversationScope("btw test instruction");
+		harness.session.agent.setModel(replacement);
+
+		await harness.session.runEphemeralTurn({ purpose: "btw", turn: { question: "frozen", scope } });
+
+		expect(original.calls).toHaveLength(1);
+		expect(replacement.calls).toHaveLength(0);
 	});
 
 	it("uses the main provider cache identity for credentials and account metadata", async () => {
@@ -251,10 +302,16 @@ describe("AgentSession /btw isolation", () => {
 			providerCacheSessionId: "main-cache-affinity",
 		});
 
-		await harness.session.runEphemeralTurn({ purpose: "btw", promptText: "affinity check" });
+		await harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: {
+				question: "affinity check",
+				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
+		});
 
 		expect(harness.getApiKey.mock.calls[0]?.[1]).toBe("main-cache-affinity");
-		expect(harness.model.calls[0]?.options?.metadata?.user_id).toContain("main-cache-affinity");
+		expect(harness.model.calls[0]?.options?.metadata).toBeUndefined();
 		expect(harness.model.calls[0]?.options?.sessionId).toStartWith("main-cache-affinity:btw:");
 	});
 
@@ -280,7 +337,10 @@ describe("AgentSession /btw isolation", () => {
 		try {
 			const sideTurn = harness.session.runEphemeralTurn({
 				purpose: "btw",
-				promptText: "side request",
+				turn: {
+					question: "side request",
+					scope: harness.session.createBtwConversationScope("btw test instruction"),
+				},
 				onTextDelta: delta => sideFirstEvent.resolve(delta),
 			});
 
@@ -314,16 +374,19 @@ describe("AgentSession /btw isolation", () => {
 		});
 		const harness = createHarness({ model });
 
-		await expect(harness.session.runEphemeralTurn({ purpose: "btw", promptText: "fail once" })).rejects.toThrow(
-			"503 service unavailable",
-		);
+		await expect(
+			harness.session.runEphemeralTurn({
+				purpose: "btw",
+				turn: { question: "fail once", scope: harness.session.createBtwConversationScope("btw test instruction") },
+			}),
+		).rejects.toThrow("503 service unavailable");
 		expect(model.calls).toHaveLength(1);
 		expect(model.calls[0]?.options?.requestMaxRetries).toBe(0);
 		expect(model.calls[0]?.options?.streamMaxRetries).toBe(0);
 		expect(model.calls[0]?.options?.streamFirstEventTimeoutMs).toBe(0);
 	});
 
-	it("keeps the side deadline armed across synthetic start and aborts only the side at 15 seconds", async () => {
+	it("keeps the side idle deadline armed across synthetic start and aborts only the side", async () => {
 		const controlled = createControlledStreamModel();
 		const harness = createHarness({ model: controlled.model });
 		const mainAbort = vi.spyOn(harness.session.agent, "abort");
@@ -339,19 +402,22 @@ describe("AgentSession /btw isolation", () => {
 				mainSettled = true;
 			},
 		);
-		const sideTurn = harness.session.runEphemeralTurn({ purpose: "btw", promptText: "deadline" });
+		const sideTurn = harness.session.runEphemeralTurn({
+			purpose: "btw",
+			turn: { question: "deadline", scope: harness.session.createBtwConversationScope("btw test instruction") },
+		});
 		const sideCall = await controlled.sideStarted;
 		await drainSyntheticStart();
 
 		try {
-			vi.advanceTimersByTime(14_999);
+			vi.advanceTimersByTime(BTW_STREAM_IDLE_TIMEOUT_MS - 1);
 			expect(sideCall.options?.signal?.aborted).toBe(false);
 			expect(mainCall.options?.signal?.aborted).toBe(false);
 			expect(mainSettled).toBe(false);
 
 			vi.advanceTimersByTime(1);
 			expect(sideCall.options?.signal?.aborted).toBe(true);
-			await expect(sideTurn).rejects.toThrow("within 15 seconds");
+			await expect(sideTurn).rejects.toThrow("idle for 30 seconds");
 
 			expect(sideCall.options?.signal?.aborted).toBe(true);
 			expect(mainCall.options?.signal?.aborted).toBe(false);
@@ -374,7 +440,7 @@ describe("AgentSession /btw isolation", () => {
 		const providerProgress = Promise.withResolvers<string>();
 		const sideTurn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			promptText: "established",
+			turn: { question: "established", scope: harness.session.createBtwConversationScope("btw test instruction") },
 			onTextDelta: providerProgress.resolve,
 		});
 		const sideCall = await controlled.sideStarted;
@@ -401,7 +467,7 @@ describe("AgentSession /btw isolation", () => {
 		const staleController = new AbortController();
 		const staleTurn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			promptText: "stale",
+			turn: { question: "stale", scope: harness.session.createBtwConversationScope("btw test instruction") },
 			signal: staleController.signal,
 		});
 		await drainToProvider(model);
@@ -409,7 +475,7 @@ describe("AgentSession /btw isolation", () => {
 		staleController.abort(new Error("replaced"));
 		const replacementTurn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			promptText: "replacement",
+			turn: { question: "replacement", scope: harness.session.createBtwConversationScope("btw test instruction") },
 		});
 		await expect(staleTurn).rejects.toThrow();
 		await expect(replacementTurn).resolves.toMatchObject({ replyText: "replacement" });
@@ -429,7 +495,11 @@ describe("AgentSession /btw isolation", () => {
 		controller.abort(new Error("replaced before setup"));
 
 		await expect(
-			harness.session.runEphemeralTurn({ purpose: "btw", promptText: "cancelled", signal: controller.signal }),
+			harness.session.runEphemeralTurn({
+				purpose: "btw",
+				turn: { question: "cancelled", scope: harness.session.createBtwConversationScope("btw test instruction") },
+				signal: controller.signal,
+			}),
 		).rejects.toThrow("replaced before setup");
 		expect(harness.getApiKey).not.toHaveBeenCalled();
 		expect(harness.model.calls).toHaveLength(0);
@@ -441,7 +511,10 @@ describe("AgentSession /btw isolation", () => {
 		const controller = new AbortController();
 		const turn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			promptText: "cancel during credentials",
+			turn: {
+				question: "cancel during credentials",
+				scope: harness.session.createBtwConversationScope("btw test instruction"),
+			},
 			signal: controller.signal,
 		});
 		controller.abort(new Error("replaced during credentials"));
@@ -456,7 +529,7 @@ describe("AgentSession /btw isolation", () => {
 		const controller = new AbortController();
 		const turn = harness.session.runEphemeralTurn({
 			purpose: "btw",
-			promptText: "cancelled",
+			turn: { question: "cancelled", scope: harness.session.createBtwConversationScope("btw test instruction") },
 			signal: controller.signal,
 		});
 		await Promise.resolve();

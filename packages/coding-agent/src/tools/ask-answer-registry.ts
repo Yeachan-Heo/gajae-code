@@ -7,6 +7,7 @@
  * source; registering returns a disposer.
  */
 
+import { logger } from "@gajae-code/utils";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import type { AskAnswerSource } from "./index";
 
@@ -31,7 +32,20 @@ export function getAskAnswerSource(sessionId: string): AskAnswerSource | undefin
 export function notifyWorkflowGateEmitterChanged(sessionId: string, emitter: WorkflowGateEmitter | undefined): void {
 	if (emitter) workflowGateEmitters.set(sessionId, emitter);
 	else workflowGateEmitters.delete(sessionId);
-	for (const listener of workflowGateListeners.get(sessionId) ?? []) listener(emitter);
+	for (const listener of workflowGateListeners.get(sessionId) ?? []) {
+		// Isolate each listener: a throwing observer must never escape into an
+		// emitter suspend/bind/restore step, which runs inside session-transition
+		// transactions (e.g. handoff) whose rollback/commit correctness depends on
+		// this notification being no-throw.
+		try {
+			listener(emitter);
+		} catch (error) {
+			logger.warn("Workflow-gate emitter listener threw during notification", {
+				sessionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
 }
 
 /** Observe workflow-gate emitter installation even when it occurs after session_start. */

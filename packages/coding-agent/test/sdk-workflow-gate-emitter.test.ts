@@ -10,10 +10,15 @@ import { sessionStateDir } from "../src/gjc-runtime/session-layout";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
+	MemoryGateStore,
+	NotificationGatePolicyChangedError,
 	type OpenGateInput,
 	type WorkflowGateEmitter,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
+import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import { initTheme } from "../src/modes/theme/theme";
+import { AuthStorage } from "../src/session/auth-storage";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
 import { registerWorkflowGateEmitterListener } from "../src/tools/ask-answer-registry";
 
@@ -126,7 +131,8 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			expect(session.getWorkflowGateEmitter()).toBe(emitter);
 			const askTool = session.getToolByName("ask");
 			expect(askTool).toBeDefined();
-			expect(session.getActiveToolNames()).toContain("ask");
+			// Registered-not-attached contract: ask is registered for gate use but not resident by default.
+			expect(session.getActiveToolNames()).not.toContain("ask");
 
 			const ctx = {
 				hasUI: false,
@@ -151,6 +157,263 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			await session.dispose();
 		}
 	}, 15_000);
+	it("attaches ask when a newly registered emitter reports a pending gate", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-pending-gate-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			const pendingGate: WorkflowGate = {
+				type: "workflow_gate",
+				gate_id: "pending-gate",
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string" },
+				schema_hash: "test",
+				context: {},
+				created_at: new Date().toISOString(),
+				required: true,
+			};
+			const emitter: WorkflowGateEmitter = {
+				isUnattended: () => true,
+				emitGate: () => Promise.resolve(undefined),
+				listPendingGates: () => [pendingGate],
+			};
+
+			session.setWorkflowGateEmitter(emitter);
+
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("conservatively attaches ask when pending-gate introspection throws", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-throwing-pending-gates-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			const emitter: WorkflowGateEmitter = {
+				isUnattended: () => true,
+				emitGate: () => Promise.resolve(undefined),
+				listPendingGates: () => {
+					throw new Error("pending gate lookup failed");
+				},
+			};
+
+			expect(() => session.setWorkflowGateEmitter(emitter)).not.toThrow();
+			expect(session.getToolByName("ask")).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("attaches ask when a canonical workflow skill prompt starts", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-skill-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			expect(session.getActiveToolNames()).not.toContain("ask");
+			session.agent.emitExternalEvent({
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
+					content: "# Ultragoal",
+					display: true,
+					details: { name: "ultragoal" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+			});
+			for (let attempt = 0; attempt < 20 && !session.getActiveToolNames().includes("ask"); attempt += 1)
+				await Bun.sleep(1);
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
+	it("restores ask for durable workflow state without carrying it into a fresh session", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-resume-"));
+		tempDirs.push(tempDir);
+		const settings = Settings.isolated({ "mcp.discoveryMode": "mcp-only" });
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		await sessionManager.ensureOnDisk();
+		const originalSessionFile = sessionManager.getSessionFile();
+		if (!originalSessionFile) throw new Error("Expected persisted workflow session");
+		// Switch-back re-resolves the recorded session model with auth; a runtime
+		// key keeps that deterministic on hosts without OpenAI credentials.
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings,
+			authStorage,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			session.agent.emitExternalEvent({
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
+					content: "# Ultragoal",
+					display: true,
+					details: { name: "ultragoal" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+			});
+			for (let attempt = 0; attempt < 20 && !session.getActiveSkillState(); attempt += 1) await Bun.sleep(1);
+			expect(session.getActiveToolNames()).toContain("ask");
+			expect(session.getActiveSkillState()).toMatchObject({ skill: "ultragoal" });
+
+			await expect(session.newSession()).resolves.toBe(true);
+			expect(session.getActiveToolNames()).not.toContain("ask");
+			await expect(session.switchSession(originalSessionFile)).resolves.toBe(true);
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
+
+		const resumedManager = await SessionManager.open(originalSessionFile, tempDir);
+		const resumedAuthStorage = await AuthStorage.create(path.join(tempDir, "testauth-resume.db"));
+		resumedAuthStorage.setRuntimeApiKey("openai", "test-key");
+		const { session: resumedSession } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: resumedManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			authStorage: resumedAuthStorage,
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			// Deterministic readiness contract: createAgentSession awaits
+			// workflowGateToolRestoration, so ask must be resident immediately.
+			expect(resumedSession.getActiveToolNames()).toContain("ask");
+		} finally {
+			await resumedSession.dispose();
+			resumedAuthStorage.close();
+		}
+	}, 15_000);
+	it("keeps workflow-gate restoration settled after factory return and dispose", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-restoration-settlement-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			// createAgentSession returned, so the readiness promise must already
+			// be settled (resolved) — awaiting it again must not hang or reject.
+			await expect(session.workflowGateToolRestoration).resolves.toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+		// Restoration observed after dispose remains settled (no hang, no
+		// late rejection surfacing from the already-completed microtask).
+		await expect(session.workflowGateToolRestoration).resolves.toBeUndefined();
+	});
+	it("attaches ask for a canonical workflow skill even when state sync fails", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-skill-statefail-"));
+		tempDirs.push(tempDir);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			// Poison the durable skill-state location AFTER session boot: `.gjc`
+			// replaced by a FILE makes the observational state-sync writes throw
+			// while attach must still succeed.
+			fs.rmSync(path.join(tempDir, ".gjc"), { recursive: true, force: true });
+			fs.writeFileSync(path.join(tempDir, ".gjc"), "not-a-directory");
+			expect(session.getActiveToolNames()).not.toContain("ask");
+			session.agent.emitExternalEvent({
+				type: "message_start",
+				message: {
+					role: "custom",
+					customType: SKILL_PROMPT_MESSAGE_TYPE,
+					content: "# Ultragoal",
+					display: true,
+					details: { name: "ultragoal" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+			});
+			for (let attempt = 0; attempt < 20 && !session.getActiveToolNames().includes("ask"); attempt += 1)
+				await Bun.sleep(1);
+			expect(session.getActiveToolNames()).toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	});
 	it("provides a durable SDK-native emitter without extension injection", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-production-"));
 		tempDirs.push(tempDir);
@@ -258,11 +521,12 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		const targetSessionFile = targetSessionManager.getSessionFile();
 		await targetSessionManager.close();
 		if (!targetSessionFile) throw new Error("Expected persisted successor session");
+		const settings = await Settings.loadForScope({ cwd: tempDir, agentDir: tempDir });
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager,
-			settings: Settings.isolated(),
+			settings,
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -578,5 +842,80 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		expect(restarted.listWorkflowGateQueryRecords!()).toMatchObject([
 			{ id: expect.stringMatching(/^diagnostic:/), tag: "quarantined" },
 		]);
+	});
+	it("does not advance a notification gate when policy changes during selected acknowledgement", async () => {
+		let advances = 0;
+		const emitter = new BrokerWorkflowGateEmitter("policy-change", new MemoryGateStore(), {
+			advance: () => {
+				advances++;
+			},
+		});
+		let gateId = "";
+		emitter.onGateEmitted!(gate => {
+			gateId = gate.gate_id;
+		});
+		const continuation = emitter.emitGate({
+			stage: "ralplan",
+			kind: "approval",
+			schema: { type: "string", enum: ["approve"] },
+		});
+		void continuation.catch(() => {});
+		await Promise.resolve();
+		let resolvedClaims = 0;
+
+		await expect(
+			emitter.resolveGateFromNotification!(
+				{ gate_id: gateId, answer: "approve", idempotency_key: "policy-change" },
+				{
+					interactionActionId: "action-1",
+					replyReceiptId: "receipt-1",
+					answerJson: JSON.stringify("approve"),
+					requestSelectedAck: async () => {
+						throw new NotificationGatePolicyChangedError();
+					},
+					resolveClaim: () => {
+						resolvedClaims++;
+					},
+					closeClaimInvalid: () => {},
+				},
+			),
+		).rejects.toBeInstanceOf(NotificationGatePolicyChangedError);
+		expect(resolvedClaims).toBe(0);
+		expect(advances).toBe(0);
+		await Bun.sleep(100);
+		expect(advances).toBe(0);
+		expect(emitter.listGateDiagnostics!()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ tag: "quarantined" })]),
+		);
+
+		const throwingEmitter = new BrokerWorkflowGateEmitter("policy-close-failure", new MemoryGateStore());
+		let throwingGateId = "";
+		throwingEmitter.onGateEmitted!(gate => {
+			throwingGateId = gate.gate_id;
+		});
+		void throwingEmitter
+			.emitGate({ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } })
+			.catch(() => {});
+		await Promise.resolve();
+		await expect(
+			throwingEmitter.resolveGateFromNotification!(
+				{ gate_id: throwingGateId, answer: "approve", idempotency_key: "policy-close-failure" },
+				{
+					interactionActionId: "action-2",
+					replyReceiptId: "receipt-2",
+					answerJson: JSON.stringify("approve"),
+					requestSelectedAck: async () => {
+						throw new NotificationGatePolicyChangedError();
+					},
+					resolveClaim: () => {},
+					closeClaimInvalid: () => {
+						throw new Error("native close failed");
+					},
+				},
+			),
+		).rejects.toThrow("native close failed");
+		expect(throwingEmitter.listGateDiagnostics!()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ tag: "quarantined" })]),
+		);
 	});
 });

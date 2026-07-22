@@ -123,6 +123,47 @@ describe("gjc state handoff", () => {
 		});
 	});
 
+	it("bounds referenced legacy specs before a deep-interview handoff mutates workflow state", async () => {
+		const writeLegacyCaller = async (cwd: string, spec: string) => {
+			const specPath = path.join(cwd, "legacy-spec.md");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			await fs.writeFile(specPath, spec, "utf-8");
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: WORKFLOW_STATE_VERSION,
+				active: true,
+				current_phase: "handoff",
+				spec_path: specPath,
+				state: { rounds: [] },
+			});
+			return callerPath;
+		};
+
+		await withTempCwd(async cwd => {
+			await writeLegacyCaller(cwd, "😀".repeat(100_000));
+			const exact = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(exact.status).toBe(0);
+		});
+
+		await withTempCwd(async cwd => {
+			const callerPath = await writeLegacyCaller(cwd, "😀".repeat(100_001));
+			const before = await fs.readFile(callerPath, "utf-8");
+			const rejected = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(rejected.status).toBe(1);
+			expect(rejected.stderr).toContain("persisted deep-interview spec exceeds max length 100000");
+			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ralplan"))).rejects.toThrow();
+			await expect(fs.access(activeSnapshotPath(cwd, TEST_SESSION_ID))).rejects.toThrow();
+			await expect(fs.access(path.join(sessionStateDir(cwd, TEST_SESSION_ID), "transactions"))).rejects.toThrow();
+		});
+	});
+
 	it("serializes a handoff with a concurrent state write to the callee mode-state", async () => {
 		await withTempCwd(async cwd => {
 			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");

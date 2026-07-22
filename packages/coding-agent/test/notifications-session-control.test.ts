@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { type NotificationConfig, telegramActivationIdentity } from "../src/sdk/bus/config";
 import {
 	type BoundNotificationSession,
+	type NotificationRuntimePolicy,
 	type NotificationSessionContext,
 	NotificationSessionController,
 	type NotificationSessionRuntime,
@@ -30,6 +31,8 @@ const BASE_CONFIG: NotificationConfig = {
 	idleTimeoutMs: 60_000,
 	rich: { enabled: true },
 	richDraft: { enabled: false },
+	toolActivity: { enabled: true },
+	streaming: { enabled: true },
 	topics: { nameTemplate: undefined },
 	btw: { enabled: true },
 };
@@ -155,6 +158,267 @@ const slackConfig = (): NotificationConfig => ({
 	},
 });
 
+test("commits the stable policy before activating a cold runtime", async () => {
+	const policies: Array<{ redact: boolean; stream: boolean; mode: string }> = [];
+	let running = false;
+	let activated = 0;
+	const runtime: NotificationSessionRuntime = {
+		isRunning: () => running,
+		start: async () => {
+			running = true;
+			return "started";
+		},
+		stop: async () => {
+			running = false;
+			return true;
+		},
+		ensureTelegramDaemon: async () => "ready",
+		refreshPolicy: (_binding, policy) =>
+			policies.push({ redact: policy.redact, stream: policy.stream, mode: policy.mode }),
+		activate: () => activated++,
+	};
+	const controller = new NotificationSessionController({ eligible: true, getConfig: telegramConfig, env: {} });
+	controller.attachRuntime(runtime);
+
+	expect((await controller.reconcileCurrentSession(createContext().context)).outcome).toBe("started");
+	expect(policies).toEqual([
+		{ redact: true, stream: false, mode: "provisional" },
+		{ redact: false, stream: true, mode: "committed" },
+		{ redact: false, stream: true, mode: "committed" },
+	]);
+	expect(activated).toBe(1);
+});
+
+test("maps a thrown Telegram daemon preflight to a failed restrictive outcome", async () => {
+	const policies: Array<{ redact: boolean; mode: string }> = [];
+	const runtime: NotificationSessionRuntime = {
+		isRunning: () => false,
+		start: async () => "started",
+		stop: async () => false,
+		ensureTelegramDaemon: async () => {
+			throw new Error("daemon unavailable");
+		},
+		refreshPolicy: (_binding, policy) => policies.push({ redact: policy.redact, mode: policy.mode }),
+	};
+	const controller = new NotificationSessionController({ eligible: true, getConfig: telegramConfig, env: {} });
+	controller.attachRuntime(runtime);
+
+	const result = await controller.reconcileCurrentSession(createContext().context);
+
+	expect(result.outcome).toBe("failed");
+	expect(result.status.running).toBe(false);
+	expect(policies).toEqual([{ redact: true, mode: "provisional" }]);
+});
+test("holds streaming disabled until deferred Telegram ownership confirms the unchanged config", async () => {
+	let config = telegramConfig();
+	const ensureEntered = Promise.withResolvers<void>();
+	const releaseEnsure = Promise.withResolvers<void>();
+	const policies: { redact: boolean; stream: boolean }[] = [];
+	const calls: Call[] = [];
+	const runtime: NotificationSessionRuntime = {
+		isRunning: () => false,
+		start: async binding => {
+			calls.push({ kind: "start", cwd: binding.cwd, sessionId: binding.sessionId });
+			return "started";
+		},
+		stop: async () => false,
+		ensureTelegramDaemon: async binding => {
+			calls.push({ kind: "daemon", cwd: binding.cwd, sessionId: binding.sessionId });
+			ensureEntered.resolve();
+			await releaseEnsure.promise;
+			return "ready";
+		},
+		refreshPolicy: (_binding, policy) => policies.push({ redact: policy.redact, stream: policy.stream }),
+	};
+	const controller = new NotificationSessionController({ eligible: true, getConfig: () => config, env: {} });
+	controller.attachRuntime(runtime);
+	const reconciliation = controller.reconcileCurrentSession(createContext().context);
+
+	await ensureEntered.promise;
+	expect(policies).toEqual([{ redact: true, stream: false }]);
+	config = { ...telegramConfig(), enabled: false, redact: true };
+	releaseEnsure.resolve();
+
+	const result = await reconciliation;
+	expect(result.outcome).toBe("disabled");
+	expect(calls.map(call => call.kind)).toEqual(["daemon"]);
+	expect(policies.at(-1)).toEqual({ redact: true, stream: false });
+});
+
+test("stops a deferred start and fails closed when the latest config becomes identity-blocked", async () => {
+	let config = telegramConfig();
+	const startEntered = Promise.withResolvers<void>();
+	const releaseStart = Promise.withResolvers<void>();
+	const policies: { redact: boolean; stream: boolean }[] = [];
+	const calls: Call[] = [];
+	let running = false;
+	const runtime: NotificationSessionRuntime = {
+		isRunning: () => running,
+		start: async binding => {
+			calls.push({ kind: "start", cwd: binding.cwd, sessionId: binding.sessionId });
+			startEntered.resolve();
+			await releaseStart.promise;
+			running = true;
+			return "started";
+		},
+		stop: async binding => {
+			calls.push({ kind: "stop", cwd: binding.cwd, sessionId: binding.sessionId });
+			running = false;
+			return true;
+		},
+		ensureTelegramDaemon: async binding => {
+			calls.push({ kind: "daemon", cwd: binding.cwd, sessionId: binding.sessionId });
+			return "ready";
+		},
+		refreshPolicy: (_binding, policy) => policies.push({ redact: policy.redact, stream: policy.stream }),
+	};
+	const controller = new NotificationSessionController({ eligible: true, getConfig: () => config, env: {} });
+	controller.attachRuntime(runtime);
+	const reconciliation = controller.reconcileCurrentSession(createContext().context);
+
+	await startEntered.promise;
+	const identity = telegramActivationIdentity(config.botToken!, config.chatId!);
+	config = {
+		...config,
+		activation: {
+			[identity]: { identity, state: "inactive", reason: "saved_inactive", updatedAt: "2026-01-01T00:00:00.000Z" },
+		},
+	};
+	releaseStart.resolve();
+
+	const result = await reconciliation;
+	expect(result.outcome).toBe("disabled");
+	expect(result.status.running).toBe(false);
+	expect(calls.map(call => call.kind)).toEqual(["daemon", "start", "stop"]);
+	expect(policies.at(-1)).toEqual({ redact: true, stream: false });
+});
+
+test("fails closed when stale-start cleanup reports false and leaves the runtime running", async () => {
+	let config = telegramConfig();
+	const startEntered = Promise.withResolvers<void>();
+	const releaseStart = Promise.withResolvers<void>();
+	const policies: Array<{ redact: boolean; mode: string }> = [];
+	let running = false;
+	let starts = 0;
+	const runtime: NotificationSessionRuntime = {
+		isRunning: () => running,
+		start: async () => {
+			starts++;
+			startEntered.resolve();
+			await releaseStart.promise;
+			running = true;
+			return "started";
+		},
+		stop: async () => false,
+		ensureTelegramDaemon: async () => "ready",
+		refreshPolicy: (_binding, policy) => policies.push({ redact: policy.redact, mode: policy.mode }),
+	};
+	const controller = new NotificationSessionController({ eligible: true, getConfig: () => config, env: {} });
+	controller.attachRuntime(runtime);
+	const reconciliation = controller.reconcileCurrentSession(createContext().context);
+
+	await startEntered.promise;
+	config = { ...config, streaming: { enabled: false } };
+	releaseStart.resolve();
+
+	const result = await reconciliation;
+	expect(result.outcome).toBe("failed");
+	expect(result.status.running).toBe(true);
+	expect(starts).toBe(1);
+	expect(policies.at(-1)).toEqual({ redact: true, mode: "provisional" });
+});
+
+test("installs restrictive policy before a malformed reload and fails closed", async () => {
+	let malformed = false;
+	let running = false;
+	const policies: NotificationRuntimePolicy[] = [];
+	const controller = new NotificationSessionController({
+		eligible: true,
+		getConfig: () => {
+			if (malformed) throw new Error("malformed notifications config");
+			return telegramConfig();
+		},
+		env: {},
+	});
+	controller.attachRuntime({
+		isRunning: () => running,
+		start: async () => {
+			running = true;
+			return "started";
+		},
+		stop: async () => {
+			running = false;
+			return true;
+		},
+		ensureTelegramDaemon: async () => "ready",
+		refreshPolicy: (_binding, policy) => policies.push(policy),
+	});
+	const context = createContext().context;
+	await controller.reconcileCurrentSession(context);
+	malformed = true;
+
+	const result = await controller.reconcileCurrentSession(context);
+
+	expect(result.outcome).toBe("failed");
+	expect(result.status).toMatchObject({ effectiveEnabled: false, running: false, environment: "off" });
+	expect(policies.at(-1)).toMatchObject({ redact: true, verbosity: "lean", stream: false, mode: "provisional" });
+});
+test("bounds repeated config churn and leaves the runtime at the restrictive policy", async () => {
+	let reads = 0;
+	const calls: Call[] = [];
+	const policies: { redact: boolean; verbosity: string; stream: boolean }[] = [];
+	const controller = new NotificationSessionController({
+		eligible: true,
+		getConfig: () => ({ ...telegramConfig(), redact: reads++ % 2 === 0 }),
+		env: {},
+	});
+	controller.attachRuntime({
+		isRunning: () => false,
+		start: async () => "started",
+		stop: async () => false,
+		ensureTelegramDaemon: async binding => {
+			calls.push({ kind: "daemon", cwd: binding.cwd, sessionId: binding.sessionId });
+			return "ready";
+		},
+		refreshPolicy: (_binding, policy) => policies.push(policy),
+	});
+
+	const result = await controller.reconcileCurrentSession(createContext().context);
+
+	expect(result.outcome).toBe("disabled");
+	expect(calls.map(call => call.kind)).toEqual(["daemon", "daemon", "daemon"]);
+	expect(policies).toHaveLength(4);
+	expect(policies.every(policy => policy.redact && policy.verbosity === "lean" && !policy.stream)).toBe(true);
+});
+
+test("reports failure when bounded churn cannot stop a running runtime", async () => {
+	let reads = 0;
+	let running = true;
+	const calls: Call[] = [];
+	const controller = new NotificationSessionController({
+		eligible: true,
+		getConfig: () => ({ ...telegramConfig(), redact: reads++ % 2 === 0 }),
+		env: {},
+	});
+	controller.attachRuntime({
+		isRunning: () => running,
+		start: async () => "already",
+		stop: async binding => {
+			calls.push({ kind: "stop", cwd: binding.cwd, sessionId: binding.sessionId });
+			running = true;
+			return false;
+		},
+		ensureTelegramDaemon: async () => "ready",
+		refreshPolicy: () => {},
+	});
+
+	const result = await controller.reconcileCurrentSession(createContext().context);
+
+	expect(result.outcome).toBe("failed");
+	expect(result.status.running).toBe(true);
+	expect(calls.map(call => call.kind)).toEqual(["stop"]);
+});
+
 describe("NotificationSessionController", () => {
 	test("locally off remains stopped through setup until session-local on without restart", async () => {
 		let config = BASE_CONFIG;
@@ -223,6 +487,27 @@ describe("NotificationSessionController", () => {
 		expect(calls.map(call => call.kind)).toEqual(["start", "stop"]);
 		expect(client.frames).toEqual(["identity_header:session-one"]);
 		expect(client.frames.slice(framesAtBlockResolution)).toHaveLength(0);
+	});
+
+	test("fails blocked-identity entry when a running endpoint cannot stop", async () => {
+		let running = true;
+		const policies: NotificationRuntimePolicy[] = [];
+		const controller = new NotificationSessionController({ eligible: true, getConfig: telegramConfig, env: {} });
+		controller.attachRuntime({
+			isRunning: () => running,
+			start: async () => "already",
+			stop: async () => {
+				running = true;
+				return false;
+			},
+			refreshPolicy: (_binding, policy) => policies.push(policy),
+		});
+
+		await expect(controller.enterBlockedRuntime(createContext().context)).rejects.toThrow(
+			"Notification runtime remained active while entering blocked identity state",
+		);
+		expect(policies.at(-1)).toMatchObject({ redact: true, verbosity: "lean", stream: false, mode: "provisional" });
+		expect(running).toBe(true);
 	});
 
 	test("serializes a deferred endpoint start before blocking and emits no foreign-client frames after block resolution", async () => {

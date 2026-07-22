@@ -63,6 +63,15 @@ describe("validatePublicHttpUrlForInsane", () => {
 			"http://172.16.0.1/",
 			"http://[::1]/",
 			"http://[::ffff:10.0.0.1]/",
+			"http://[fec0::1]/",
+			"http://[fedf::1]/",
+			"http://[100::1]/",
+			"http://[2001:2::1]/",
+			"http://[2001:db8::1]/",
+			"http://[2002::1]/",
+			"http://[3ffe::1]/",
+			"http://[3fff::1]/",
+			"http://[64:ff9b:1::7f00:1]/",
 		];
 		for (const url of literals) {
 			const result = await validatePublicHttpUrlForInsane(url, { resolver: throwingResolver() });
@@ -70,11 +79,35 @@ describe("validatePublicHttpUrlForInsane", () => {
 		}
 	});
 
+	it("accepts a public global-unicast IPv6 literal without resolving", async () => {
+		const result = await validatePublicHttpUrlForInsane("https://[2606:4700:4700::1111]/", {
+			resolver: throwingResolver(),
+		});
+		expect(result.ok).toBe(true);
+		if (result.ok) expect(result.addresses).toEqual(["2606:4700:4700::1111"]);
+	});
+
 	it("rejects a DNS name that resolves to a private IP", async () => {
 		const result = await validatePublicHttpUrlForInsane("https://sneaky.example/", {
 			resolver: staticResolver({ "sneaky.example": ["10.1.2.3"] }),
 		});
 		expect(result.ok).toBe(false);
+	});
+
+	it("rejects DNS names that resolve to non-global IPv6 addresses", async () => {
+		for (const address of ["fec0::1", "fedf::1", "100::1", "2001:2::1", "64:ff9b:1::7f00:1"]) {
+			const result = await validatePublicHttpUrlForInsane("https://sneaky.example/", {
+				resolver: staticResolver({ "sneaky.example": [address] }),
+			});
+			expect(result.ok).toBe(false);
+		}
+	});
+
+	it("accepts a DNS name that resolves to public global-unicast IPv6", async () => {
+		const result = await validatePublicHttpUrlForInsane("https://public-v6.example/", {
+			resolver: staticResolver({ "public-v6.example": ["2606:4700:4700::1111"] }),
+		});
+		expect(result.ok).toBe(true);
 	});
 
 	it("rejects when any resolved address is private (mixed records)", async () => {
@@ -101,7 +134,22 @@ describe("isPrivateOrSpecialAddress", () => {
 		expect(isPrivateOrSpecialAddress("169.254.0.1")).toBe(true);
 		expect(isPrivateOrSpecialAddress("::1")).toBe(true);
 		expect(isPrivateOrSpecialAddress("::ffff:10.0.0.1")).toBe(true);
+		expect(isPrivateOrSpecialAddress("::ffff:8.8.8.8")).toBe(false);
 		expect(isPrivateOrSpecialAddress("fe80::1")).toBe(true);
+		for (const address of [
+			"fec0::1",
+			"fedf::1",
+			"100::1",
+			"2001:2::1",
+			"2001:db8::1",
+			"2002::1",
+			"3ffe::1",
+			"3fff::1",
+			"64:ff9b:1::7f00:1",
+		]) {
+			expect(isPrivateOrSpecialAddress(address)).toBe(true);
+		}
+		expect(isPrivateOrSpecialAddress("2606:4700:4700::1111")).toBe(false);
 		expect(isPrivateOrSpecialAddress("not-an-ip")).toBe(true);
 	});
 });

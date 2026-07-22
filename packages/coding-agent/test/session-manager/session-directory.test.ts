@@ -100,6 +100,19 @@ describe("managed session write protocol", () => {
 			expect(coalesced.owned[0]?.migrationState).toBe("migrated_v2");
 		}
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const committedReceipt = path.join(
+			receipts,
+			(await fs.readdir(receipts)).find(name => name.endsWith(".json")) ?? "",
+		);
+		const receipt = JSON.parse(await fs.readFile(committedReceipt, "utf8")) as Record<string, unknown>;
+		expect(receipt).toMatchObject({
+			state: "committed",
+			policy: "copy-retain",
+			source: { path: source, sessionId: "session-a" },
+			destination: { path: first.path, sessionId: "session-a" },
+			artifactManifest: [],
+		});
+
 		for (const receipt of await fs.readdir(receipts)) await fs.unlink(path.join(receipts, receipt));
 		const interruptedReplay = await openManagedCandidateForWrite(scope, legacyCandidate);
 		expect(interruptedReplay).toMatchObject({ kind: "opened", path: first.path, migrated: true });
@@ -142,6 +155,20 @@ describe("managed session write protocol", () => {
 		expect((await fs.stat(path.join(destinationArtifacts, "nested", "empty"))).isDirectory()).toBe(true);
 		expect(await fs.readFile(path.join(sourceArtifacts, "payload.txt"), "utf8")).toBe("root");
 		expect((await fs.stat(path.join(sourceArtifacts, "nested", "empty"))).isDirectory()).toBe(true);
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const committedReceipt = path.join(
+			receipts,
+			(await fs.readdir(receipts)).find(name => name.endsWith(".json")) ?? "",
+		);
+		const receipt = JSON.parse(await fs.readFile(committedReceipt, "utf8")) as { artifactManifest?: unknown[] };
+		expect(receipt.artifactManifest).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ kind: "directory", path: "nested" }),
+				expect.objectContaining({ kind: "directory", path: "nested/empty" }),
+				expect.objectContaining({ kind: "file", path: "payload.txt" }),
+				expect.objectContaining({ kind: "file", path: "nested/payload.txt" }),
+			]),
+		);
 	});
 	it("retains a detached legacy artifact root when exact restoration collides", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
@@ -686,6 +713,74 @@ describe("managed session write protocol", () => {
 			kind: "opened",
 			migrated: true,
 		});
+	});
+	it("bounds foreign transcript capture while fully recapturing owned candidates", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const foreignCwd = path.join(path.dirname(cwd), "foreign-workspace");
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await Promise.all([fs.mkdir(foreignCwd), fs.mkdir(legacy, { recursive: true })]);
+		const headerCaptureBytes = 64 * 1024;
+		const foreignContent = transcript("large-foreign", foreignCwd, "f".repeat(4 * 1024 * 1024));
+		const ownedContent = transcript("large-owned", cwd, "o".repeat(2 * 1024 * 1024));
+		const foreignPath = path.join(legacy, "large-foreign.jsonl");
+		const ownedPath = path.join(legacy, "large-owned.jsonl");
+		await Promise.all([fs.writeFile(foreignPath, foreignContent), fs.writeFile(ownedPath, ownedContent)]);
+		const foreignSize = Buffer.byteLength(foreignContent);
+		const ownedSize = Buffer.byteLength(ownedContent);
+		const capturedBySize = new Map<number, number>([
+			[foreignSize, 0],
+			[ownedSize, 0],
+		]);
+		const readSync = syncFs.readSync;
+		function trackedReadSync(
+			descriptor: number,
+			buffer: NodeJS.ArrayBufferView,
+			offset: number,
+			length: number,
+			position: syncFs.ReadPosition | null,
+		): number;
+		function trackedReadSync(
+			descriptor: number,
+			buffer: NodeJS.ArrayBufferView,
+			options?: syncFs.ReadOptions,
+		): number;
+		function trackedReadSync(
+			descriptor: number,
+			buffer: NodeJS.ArrayBufferView,
+			offsetOrOptions?: number | syncFs.ReadOptions,
+			length?: number,
+			position?: syncFs.ReadPosition | null,
+		): number {
+			const count =
+				typeof offsetOrOptions === "number"
+					? readSync(
+							descriptor,
+							buffer,
+							offsetOrOptions,
+							length ?? buffer.byteLength - offsetOrOptions,
+							position ?? null,
+						)
+					: readSync(descriptor, buffer, offsetOrOptions);
+			const size = syncFs.fstatSync(descriptor).size;
+			if (capturedBySize.has(size)) capturedBySize.set(size, (capturedBySize.get(size) ?? 0) + count);
+			return count;
+		}
+		const captureReads = vi.spyOn(syncFs, "readSync").mockImplementation(trackedReadSync);
+		const listed = (() => {
+			try {
+				return listManagedCandidates(scope);
+			} finally {
+				captureReads.mockRestore();
+			}
+		})();
+
+		expect(listed).toMatchObject({
+			kind: "complete",
+			foreignCount: 1,
+			owned: [expect.objectContaining({ sessionId: "large-owned" })],
+		});
+		expect(capturedBySize.get(foreignSize)).toBe(headerCaptureBytes);
+		expect(capturedBySize.get(ownedSize)).toBe(headerCaptureBytes + ownedSize);
 	});
 	it("filters colliding legacy absolute directory entries by their transcript workspace identity", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-collision-"));

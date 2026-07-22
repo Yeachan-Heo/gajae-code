@@ -115,3 +115,28 @@ describe("TranscriptItemRegistry", () => {
 		expect(registry.resolveSourcePayload(canonical!)?.text).toBe("final");
 	});
 });
+
+test("retains enriched tool result metadata without changing the payload shape", () => {
+	const registry = new TranscriptItemRegistry();
+	const id = registry.register({
+		id: "tool:metadata",
+		kind: "tool",
+		source: "tool-1",
+		getPayload: () => ({
+			text: "path: src/file.ts\n✓ done",
+			metadata: {
+				name: "read",
+				arguments: { path: "src/file.ts" },
+				intent: "Inspect file",
+				isError: false,
+				resultText: "",
+				hasResult: true,
+			},
+			source: "tool-1",
+		}),
+	});
+	expect(registry.resolveSourcePayload(id)).toMatchObject({
+		text: "path: src/file.ts\n✓ done",
+		metadata: { resultText: "", hasResult: true },
+	});
+});

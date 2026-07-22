@@ -336,6 +336,67 @@ describe("deep-interview structured metadata red-team", () => {
 		expect(askSchema.safeParse({ questions: [base] }).success).toBe(true);
 	});
 
+	it("accepts emoji adapter metadata using the schema's code-point limits", () => {
+		const term = "😀".repeat(256);
+		const longText = "😀".repeat(2048);
+		const parsed = askSchema.safeParse({
+			questions: [
+				{
+					id: "q-emoji-boundary",
+					question: "Q?",
+					options: [{ label: "A" }],
+					deepInterview: {
+						round_id: "😀".repeat(128),
+						round: 1,
+						component: "😀".repeat(128),
+						dimension: "😀".repeat(128),
+						ambiguity: 0.5,
+						confused_terms: [term],
+						references: [{ reference_id: term, label: term, origin: term, url: longText, excerpt: longText }],
+					},
+				},
+			],
+		});
+
+		expect(parsed.success).toBe(true);
+	});
+
+	it("rejects emoji deep-interview core metadata beyond 128 code points", () => {
+		const base = { id: "q-core-overflow", question: "Q?", options: [{ label: "A" }] };
+		for (const field of ["round_id", "component", "dimension"] as const) {
+			const deepInterview = {
+				round_id: "r1",
+				round: 1,
+				component: "c",
+				dimension: "goal",
+				ambiguity: 0.5,
+				[field]: "😀".repeat(129),
+			};
+			expect(askSchema.safeParse({ questions: [{ ...base, deepInterview }] }).success).toBe(false);
+		}
+	});
+
+	it("rejects emoji reference URL and excerpt values one code point beyond their limits", () => {
+		const base = { id: "q-reference-overflow", question: "Q?", options: [{ label: "A" }] };
+		for (const field of ["url", "excerpt"] as const) {
+			const parsed = askSchema.safeParse({
+				questions: [
+					{
+						...base,
+						deepInterview: {
+							round: 1,
+							component: "intake",
+							dimension: "goal",
+							ambiguity: 0.5,
+							references: [{ reference_id: "r1", label: "label", origin: "user", [field]: "😀".repeat(2049) }],
+						},
+					},
+				],
+			});
+			expect(parsed.success).toBe(false);
+		}
+	});
+
 	describe("Round-0 locked intent contracts", () => {
 		const base = { id: "intent-q", question: "Confirm intent", options: [{ label: "Confirm" }] };
 		const validContract = {

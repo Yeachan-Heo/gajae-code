@@ -1331,6 +1331,23 @@ impl Process {
 		self.inner.args()
 	}
 
+	/// Send `signal` only to this pinned root process.
+	///
+	/// Linux delivers through the owned pidfd and Windows through the owned
+	/// process handle, so PID reuse cannot redirect the signal. Darwin has no
+	/// equivalent stable kernel authority and deliberately fails closed.
+	pub fn signal_root(&self, signal: i32) -> bool {
+		#[cfg(target_os = "macos")]
+		{
+			let _ = signal;
+			false
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			self.inner.kill(signal)
+		}
+	}
+
 	/// Send `signal` to this process and its descendants, children first.
 	///
 	/// On Linux and macOS the signal is forwarded as-is. On Windows there is no

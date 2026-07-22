@@ -17,6 +17,11 @@ describe("application keybinding domains", () => {
 		expect(APP_ACTION_METADATA.filter(action => !(action.id in KEYBINDINGS))).toEqual([]);
 	});
 
+	it("labels the legacy fork action by its message-branch behavior", () => {
+		expect(metadataById.get("app.session.fork")?.title).toBe("Branch from message");
+		expect(KEYBINDINGS["app.session.fork"].description).toBe("Branch from message");
+	});
+
 	it("rejects default chord collisions within a focus domain", () => {
 		const owners = new Map<string, AppKeybinding[]>();
 		for (const action of APP_ACTION_METADATA) {

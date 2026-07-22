@@ -699,6 +699,130 @@ describe("RuntimeOwner (in-process integration)", () => {
 		expect((await resolveOwner(root, SID)).live).toBe(false);
 		owner = null;
 	});
+
+	it("fences the lease heartbeat before releasing so release cannot contend with a renewal", async () => {
+		// Regression for the lease_lock_timeout flake: an aggressive heartbeat
+		// (renewing every 2ms) must be stopped/joined/fenced before releaseLease
+		// acquires the lease mutation lock, or the two contend and the release
+		// starves. We prove the fence by observing the persisted lease: once release
+		// begins, no renewal advances heartbeatAt across a window spanning many
+		// heartbeat intervals.
+		const transport = new FakeTransport();
+		let heartbeatAtRelease: string | undefined;
+		let heartbeatAfterWindow: string | undefined;
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			heartbeatMs: 2,
+			ttlMs: 10_000,
+			leaseRelease: async (releaseRoot, releaseSession, releaseOwnerId) => {
+				heartbeatAtRelease = (await readLease(releaseRoot, releaseSession))?.heartbeatAt;
+				// Detection window: a live 2ms heartbeat would renew ~20 times here.
+				await new Promise(resolve => setTimeout(resolve, 40));
+				heartbeatAfterWindow = (await readLease(releaseRoot, releaseSession))?.heartbeatAt;
+				return releaseLease(releaseRoot, releaseSession, releaseOwnerId);
+			},
+		});
+		await owner.start();
+		await owner.stop();
+		owner = null;
+
+		expect(heartbeatAtRelease).toBeDefined();
+		// Deterministic: the fenced heartbeat performed zero renewals during release.
+		expect(heartbeatAfterWindow).toBe(heartbeatAtRelease);
+		expect((await resolveOwner(root, SID)).live).toBe(false);
+	});
+
+	it("drains an older in-flight heartbeat even after a newer renewal has already settled", async () => {
+		// Deterministic kill-test for the single-slot regression. An OLDER renewal
+		// (#1) is held in flight while NEWER renewals settle, so the "latest promise"
+		// slot points at a settled renewal, not #1. A complete Set drain must still
+		// await #1 before releaseLease; a single-slot join (awaiting only the latest,
+		// already-settled renewal) would release while #1 is still in flight, which
+		// this test detects. The heartbeat seam never re-enters the real lock path
+		// (it only reads the lease), so ticks cannot slow or perturb the ordering.
+		const transport = new FakeTransport();
+		const olderEntered = Promise.withResolvers<void>();
+		const newerSettled = Promise.withResolvers<void>();
+		const olderGate = Promise.withResolvers<void>();
+		let olderActive = false;
+		let releaseEnteredWhileOlderActive = false;
+		let newerSignalled = false;
+		let calls = 0;
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			heartbeatMs: 1,
+			ttlMs: 10_000,
+			leaseHeartbeat: async (hbRoot, hbSession) => {
+				const n = ++calls;
+				// Non-mutating read: never contends the lease mutation lock, so the
+				// only in-flight renewal that stays pending is the intentionally gated
+				// older one.
+				const lease = (await readLease(hbRoot, hbSession))!;
+				if (n === 1) {
+					olderActive = true;
+					olderEntered.resolve();
+					await olderGate.promise;
+					olderActive = false;
+					return lease;
+				}
+				// Newer renewals settle immediately, becoming the latest tracked slot.
+				if (!newerSignalled) {
+					newerSignalled = true;
+					newerSettled.resolve();
+				}
+				return lease;
+			},
+			leaseRelease: async (relRoot, relSession, relOwner) => {
+				if (olderActive) releaseEnteredWhileOlderActive = true;
+				return releaseLease(relRoot, relSession, relOwner);
+			},
+		});
+		await owner.start();
+		await olderEntered.promise; // older (#1) renewal is in flight and gated
+		await newerSettled.promise; // a newer renewal has fully settled (latest slot cleared)
+
+		const stopPromise = owner.stop();
+		// A complete drain must still await the gated older renewal; a single-slot
+		// join (awaiting only the settled latest) would release now. Detection window
+		// gives a reverted implementation time to wrongly release.
+		await new Promise(resolve => setTimeout(resolve, 25));
+		expect(releaseEnteredWhileOlderActive).toBe(false);
+
+		olderGate.resolve(); // only now may the drain complete and release proceed
+		await stopPromise;
+		owner = null;
+
+		expect(releaseEnteredWhileOlderActive).toBe(false);
+		expect((await resolveOwner(root, SID)).live).toBe(false);
+	});
+
+	it("a fenced owner never releases a successor's lease", async () => {
+		const transport = new FakeTransport();
+		owner = new RuntimeOwner({ root, sessionId: SID, transport, heartbeatMs: 2, ttlMs: 10_000 });
+		const first = await owner.start();
+
+		// A successor legitimately takes over the lease before the original tears down.
+		await releaseLease(root, SID, first.ownerId);
+		const { lease: successor } = await acquireLease(root, SID, {
+			ownerId: "successor-owner",
+			pid: process.pid,
+			endpoint: { kind: "unix-socket", path: `${controlSocketPath(root, SID)}.successor` },
+			eventsPath: sessionPaths(root, SID).events,
+			ttlMs: 30_000,
+		});
+
+		// Original owner shuts down; fencing must not renew nor release the successor.
+		await owner.stop();
+		owner = null;
+
+		const after = await readLease(root, SID);
+		expect(after?.ownerId).toBe("successor-owner");
+		expect(after?.leaseEpoch).toBe(successor.leaseEpoch);
+	});
 	it("releases the owner lease after successful transport cleanup and allows replacement takeover", async () => {
 		const transport = new FakeTransport();
 		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });

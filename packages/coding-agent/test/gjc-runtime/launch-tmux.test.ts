@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -22,6 +23,7 @@ import { persistCoordinatorRuntimeStateFromPostmortem } from "@gajae-code/coding
 import {
 	captureOwnerGenerationBaselineSync,
 	isExactScopedBootstrapSuccessReceipt,
+	lifecyclePaths,
 	replaceOwnerGenerationSync,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
@@ -3057,11 +3059,74 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).toContain(`GJC_TMUX_OWNER_STATE_DIR='${root}'`);
 			expect(innerCommand).toContain("GJC_TMUX_OWNER_SERVER_KEY='tmux'");
 			expect(innerCommand).toStartWith("exec env GJC_TMUX_LAUNCHED=1");
+			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
+			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
+			expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");
 			expect(innerCommand).not.toContain("tmux-exit.json");
 			expect(
 				calls.some(call => call.includes("@gjc-owner-generation") && call.at(-1) === generation.generation),
 			).toBe(true);
 			expect(calls.some(call => call.includes("@gjc-owner-server-key") && call.at(-1) === "tmux")).toBe(true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("propagates only an exact durable SIGABRT predecessor token into a replacement launch", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-replacement-"));
+		try {
+			const sessionId = "replacement-session";
+			const generation = "replacement-generation";
+			const runId = "replacement-run";
+			const incarnation = "replacement-incarnation";
+			const predecessorToken = "exact-predecessor";
+			const ownerRoot = lifecyclePaths(root, sessionId, generation).root;
+			fs.mkdirSync(ownerRoot, { recursive: true });
+			fs.writeFileSync(
+				lifecyclePaths(root, sessionId, generation).generationFile,
+				`${JSON.stringify({ schema_version: 1, generation, session_id: sessionId, published_at: "2026-07-19T00:00:00.000Z" })}\n`,
+			);
+			const command = ["gjc", "--resume"];
+			const commandSha256 = createHash("sha256").update(JSON.stringify(command)).digest("hex");
+			fs.writeFileSync(
+				path.join(ownerRoot, `child-${predecessorToken}.binding.json`),
+				`${JSON.stringify({ schema_version: 2, generation, session_id: sessionId, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command, command_sha256: commandSha256, supervisor_pid: 1, supervisor_start_time: "1", created_at: "2026-07-19T00:00:00.000Z" })}\n`,
+			);
+			fs.writeFileSync(
+				path.join(ownerRoot, `sigabrt-${predecessorToken}.receipt.json`),
+				`${JSON.stringify({ schema_version: 2, generation, session_id: sessionId, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command_sha256: commandSha256, supervisor_pid: 1, supervisor_start_time: "1", child_pid: 2, child_start_time: "2", signal: "SIGABRT", signal_number: 6, exit_code: null, received_at: "2026-07-19T00:00:00.000Z" })}\n`,
+			);
+			const calls: string[][] = [];
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello"], tmux: true }),
+				rawArgs: ["--tmux", "hello"],
+				cwd: root,
+				env: {
+					GJC_COORDINATOR_SESSION_ID: sessionId,
+					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
+					GJC_TMUX_OWNER_STATE_DIR: root,
+					GJC_TMUX_OWNER_GENERATION: generation,
+					GJC_MANAGED_OWNER_RUN_ID: runId,
+					GJC_MANAGED_OWNER_INCARNATION: incarnation,
+					GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: predecessorToken,
+				},
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "linux",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				},
+			});
+			expect(handled).toBe(true);
+			const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
+			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_TOKEN='${predecessorToken}'`);
+			expect(innerCommand).toMatch(/GJC_TMUX_OWNER_GENERATION='[0-9a-f-]{36}'/i);
+			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
+			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

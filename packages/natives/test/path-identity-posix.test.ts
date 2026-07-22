@@ -20,6 +20,39 @@ function sha256(contents: string): string {
 	return createHash("sha256").update(contents).digest("hex");
 }
 
+function expectOwnerOnlySuccess(
+	result: ReturnType<typeof applyOwnerOnlyPathSecurity>,
+	kind: "directory" | "file",
+	phase: "apply" | "verify" = "apply",
+): void {
+	expect(result).toMatchObject({ ok: true });
+	if (process.platform !== "linux") return;
+	expect(result).toMatchObject({
+		ok: true,
+		platform: "linux",
+		protocol: phase,
+		kind,
+		aclEvidence: {
+			access: {
+				clear: expect.stringMatching(phase === "apply" ? /^(cleared|already_absent|unsupported)$/ : /^not_run$/),
+				query: expect.stringMatching(/^(absent|unsupported)$/),
+			},
+		},
+	});
+	if (kind === "directory") {
+		expect(result).toMatchObject({
+			aclEvidence: {
+				default: {
+					clear: expect.stringMatching(phase === "apply" ? /^(cleared|already_absent|unsupported)$/ : /^not_run$/),
+					query: expect.stringMatching(/^(absent|unsupported)$/),
+				},
+			},
+		});
+	} else {
+		expect(result.aclEvidence).not.toHaveProperty("default");
+	}
+}
+
 function treeQuarantineName(entry: { relativePath: string; dev: string; ino: string }): string {
 	const material = Buffer.concat([
 		Buffer.from(entry.relativePath),
@@ -54,7 +87,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		await fs.writeFile(file, "{}", { mode: 0o644 });
 		await fs.chmod(file, 0o640);
 
-		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "mode_mismatch" });
 	});
 
 	it("applies and verifies exact owner-only modes without changing regular-file bytes", async () => {
@@ -66,10 +99,10 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		await fs.mkdir(directory, { mode: 0o755 });
 		await fs.writeFile(file, contents, { mode: 0o644 });
 
-		expect(applyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
-		expect(applyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
-		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
-		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
+		expectOwnerOnlySuccess(applyOwnerOnlyPathSecurity(directory, "directory"), "directory");
+		expectOwnerOnlySuccess(applyOwnerOnlyPathSecurity(file, "file"), "file");
+		expectOwnerOnlySuccess(verifyOwnerOnlyPathSecurity(directory, "directory"), "directory", "verify");
+		expectOwnerOnlySuccess(verifyOwnerOnlyPathSecurity(file, "file"), "file", "verify");
 		expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
 		expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
@@ -81,10 +114,22 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		const file = path.join(root, "state.json");
 		await fs.writeFile(file, "{}", { mode: 0o644 });
 
-		expect(applyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
-		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
+		expectOwnerOnlySuccess(applyOwnerOnlyPathSecurity(file, "file"), "file");
+		expectOwnerOnlySuccess(verifyOwnerOnlyPathSecurity(file, "file"), "file", "verify");
 	});
 
+	it("reports a wrong expected kind without mutating the opened directory", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const directory = path.join(root, "managed");
+		await fs.mkdir(directory, { mode: 0o755 });
+
+		expect(applyOwnerOnlyPathSecurity(directory, "file")).toEqual({
+			ok: false,
+			code: "not_directory",
+		});
+		expect((await fs.stat(directory)).mode & 0o777).toBe(0o755);
+	});
 	it("rejects an unauthorized exact-unlink identity without deleting a replacement", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
 		temporaryDirectories.push(root);

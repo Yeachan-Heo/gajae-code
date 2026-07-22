@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "kind": "package-test-report",
+  "story": "G001-toolrender",
+  "suites": [
+    {
+      "command": "bun --cwd packages/coding-agent test test/g001-toolrender-redteam.test.ts test/tool-transcript-format.test.ts test/g002-ws1-redteam.test.ts test/transcript-viewer-overlay.test.ts test/transcript-item-registry.test.ts test/transcript-viewer-perf.test.ts",
+      "pass": 44,
+      "fail": 0
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "result-state-whitespace-and-multiline",
+      "scenario": "Pending, empty success, success, error with text, error without text, whitespace-only results, leading/trailing newlines, and multiline output.",
+      "expected": "Whitespace-only results resolve as ✓ done or ✗ Error; non-empty results are trimmed at boundaries while interior lines remain.",
+      "verdict": "passed"
+    },
+    {
+      "id": "format-args-malformed-and-bounded",
+      "scenario": "Missing read/write/edit paths, non-string bash command, tabbed bash command, non-array search paths, private generic keys, JSON generic values, and 600-character generic values.",
+      "expected": "Malformed special fields produce empty or partial summaries; tabs become four spaces; private keys are omitted; generic output is JSON-formatted and exactly capped at 500 characters.",
+      "verdict": "passed"
+    },
+    {
+      "id": "tool-display-source-line-boundary",
+      "scenario": "Exactly 100, 101, and 100000 result lines with a three-line intent call block; one-line result control.",
+      "expected": "Collapsed output is call-only; expanded output preserves all call lines and emits at most call lines + 100 result lines + one sentinel, with an exact extra-line count.",
+      "verdict": "passed"
+    },
+    {
+      "id": "adapter-incomplete-metadata-and-kind-isolation",
+      "scenario": "Tool payload with missing metadata.name and metadata.arguments, plus user and thinking entries.",
+      "expected": "Tool label falls back to Tool, display formatting defaults arguments to {}, and non-tool entries do not receive getDisplayText.",
+      "verdict": "passed"
+    },
+    {
+      "id": "observer-canonical-parity-and-pending",
+      "scenario": "Observer fixtures for success, empty success, error with text, error without text, and absent result.",
+      "expected": "Present-result rendered canonical strings retain the established golden call/result text; only absent result uses ⏳ pending.",
+      "verdict": "passed"
+    },
+    {
+      "id": "unicode-and-ansi-result-chrome",
+      "scenario": "CJK, emoji, OSC clipboard chrome, SGR chrome, and more than 100 source lines in a tool result.",
+      "expected": "Rendering does not throw, preserves Unicode content, strips overlay-dangerous ANSI chrome, and caps by source line rather than grapheme count.",
+      "verdict": "passed"
+    }
+  ],
+  "blockers": []
+}

@@ -54,6 +54,11 @@ function isReleaseAllowed(state: UltragoalGuardState): boolean {
 
 function passingQualityGate(): string {
 	return JSON.stringify({
+		criticReview: {
+			verdict: "OKAY",
+			evidence: "critic approved the final aggregate completion",
+			blockers: [],
+		},
 		architectReview: {
 			architectureStatus: "CLEAR",
 			productStatus: "CLEAR",
@@ -193,6 +198,10 @@ function reviewedBatchReplacementFixture(options: { multiple?: boolean; staleRep
 			excludeEventId: eventId,
 			targetGoalUpdatedAt: goal.updatedAt,
 		});
+		const qualityGateJson =
+			receiptKind === "final-aggregate"
+				? { criticReview: { verdict: "OKAY", evidence: "critic approved final aggregation", blockers: [] } }
+				: {};
 		const receipt: UltragoalCompletionVerification = {
 			schemaVersion: 1,
 			receiptId: `receipt-${goalId}`,
@@ -202,7 +211,7 @@ function reviewedBatchReplacementFixture(options: { multiple?: boolean; staleRep
 			goalStatusBeforeCheckpoint: "active",
 			gjcGoalMode: plan.gjcGoalMode,
 			gjcObjective: plan.gjcObjective,
-			qualityGateHash: hashStructuredValue({}),
+			qualityGateHash: hashStructuredValue(qualityGateJson),
 			planGeneration: generation.planGeneration,
 			basis: generation.basis,
 			checkpointLedgerEventId: eventId,
@@ -216,7 +225,7 @@ function reviewedBatchReplacementFixture(options: { multiple?: boolean; staleRep
 			event: "goal_checkpointed",
 			goalId,
 			status: "complete",
-			qualityGateJson: {},
+			qualityGateJson,
 			completionVerification: receipt,
 		});
 	};

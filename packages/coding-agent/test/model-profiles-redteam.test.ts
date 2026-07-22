@@ -159,7 +159,7 @@ describe("model profile red-team schema and catalog cases", () => {
 		const merged = mergeModelProfiles(undefined);
 
 		expect(merged.size).toBe(BUILTIN_MODEL_PROFILES.length);
-		expect(merged.size).toBe(28);
+
 		expect([...merged.values()]).toEqual([...BUILTIN_MODEL_PROFILES]);
 	});
 

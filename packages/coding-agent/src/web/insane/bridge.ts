@@ -31,6 +31,7 @@ const KILL_GRACE_MS = 2_000;
 
 /** Stable note prefixes — tests assert on these without depending on full stderr. */
 export const INSANE_NOTES = {
+	securityDisabled: `insane fallback disabled: remote renderer cannot preserve validated network routing`,
 	guardBlocked: (reason: string) => `insane fallback blocked: target URL is not public HTTP(S): ${reason}`,
 	vendorMissing: `insane fallback unavailable: vendor engine missing at packages/coding-agent/vendor/insane-search`,
 	noPython: `insane fallback unavailable: python3 not found; install python3 and curl_cffi, then retry with web.insaneFallback=true`,
@@ -325,8 +326,11 @@ function mapEngineOutput(raw: EngineRawOutput, timeoutMs: number): InsaneBridgeR
  * (which MUST run before this is called). Never throws; always returns a result.
  */
 export async function tryInsaneFetch(url: string, options: TryInsaneFetchOptions = {}): Promise<InsaneBridgeResult> {
+	if (!options.runner) {
+		return { ok: false, reason: "disabled-security", notes: [INSANE_NOTES.securityDisabled] };
+	}
 	const prober = options.prober ?? probeInsaneDependencies;
-	const runner = options.runner ?? (inv => runEngineSubprocess(inv));
+	const runner = options.runner;
 	const limit = options.concurrencyLimit ?? DEFAULT_CONCURRENCY;
 
 	const deps = await prober();

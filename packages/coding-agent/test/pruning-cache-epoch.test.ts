@@ -88,8 +88,9 @@ describe("pruning cache-epoch invariant", () => {
 			sessionManager,
 			modelRegistry,
 		);
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const bundledModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundledModel) throw new Error("Expected built-in anthropic model to exist");
+		const model = { ...bundledModel, contextWindow: 200_000 };
 		const agent = new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } });
 		session = new AgentSession({
 			agent,

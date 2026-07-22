@@ -152,38 +152,30 @@ describe("expandSkillUrls", () => {
 });
 
 describe("expandInternalUrls", () => {
-	it("expands skill/agent/artifact/memory/rule URLs in one command", async () => {
+	it("expands context-free internal URLs in one command", async () => {
 		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
 		const router = createInternalRouter({
-			"artifact://12": { sourcePath: "/tmp/artifacts/12.bash.log" },
-			"agent://reviewer_0": { sourcePath: "/tmp/session/reviewer_0.md" },
 			"memory://root/memory_summary.md": { sourcePath: "/tmp/memories/memory_summary.md" },
 			"rule://rs-no-unwrap": { sourcePath: "/tmp/rules/rs-no-unwrap.md" },
 		});
-		const command =
-			"cat agent://reviewer_0 artifact://12 memory://root/memory_summary.md rule://rs-no-unwrap skill://valid-skill/scripts/init.py";
+		const command = "cat memory://root/memory_summary.md rule://rs-no-unwrap skill://valid-skill/scripts/init.py";
 		const expectedSkillPath = path.join(skills[0].baseDir, "scripts/init.py");
 
 		await expect(expandInternalUrls(command, { skills, internalRouter: router })).resolves.toBe(
-			`cat ${shellEscape("/tmp/session/reviewer_0.md")} ${shellEscape("/tmp/artifacts/12.bash.log")} ${shellEscape("/tmp/memories/memory_summary.md")} ${shellEscape("/tmp/rules/rs-no-unwrap.md")} ${shellEscape(expectedSkillPath)}`,
+			`cat ${shellEscape("/tmp/memories/memory_summary.md")} ${shellEscape("/tmp/rules/rs-no-unwrap.md")} ${shellEscape(expectedSkillPath)}`,
 		);
 	});
 
-	it("expands quoted non-skill URLs and shell-escapes quotes in paths", async () => {
+	it("rejects managed artifact and agent authority in subprocess commands", async () => {
 		const router = createInternalRouter({
 			"artifact://7": { sourcePath: "/tmp/artifacts/with'quote.log" },
-		});
-		await expect(expandInternalUrls('cat "artifact://7"', { skills: [], internalRouter: router })).resolves.toBe(
-			`cat ${shellEscape("/tmp/artifacts/with'quote.log")}`,
-		);
-	});
-
-	it("expands agent:// URLs when router is available", async () => {
-		const router = createInternalRouter({
 			"agent://abc": { sourcePath: "/tmp/session/abc.md" },
 		});
-		await expect(expandInternalUrls("echo agent://abc", { skills: [], internalRouter: router })).resolves.toBe(
-			`echo ${shellEscape("/tmp/session/abc.md")}`,
+		await expect(expandInternalUrls('cat "artifact://7"', { skills: [], internalRouter: router })).rejects.toThrow(
+			"artifact:// URLs cannot be expanded",
+		);
+		await expect(expandInternalUrls("echo agent://abc", { skills: [], internalRouter: router })).rejects.toThrow(
+			"agent:// URLs cannot be expanded",
 		);
 	});
 
@@ -245,9 +237,9 @@ describe("expandInternalUrls", () => {
 		);
 	});
 
-	it("throws when non-skill URL is used without an internal router", async () => {
+	it("rejects managed artifact URLs before router resolution", async () => {
 		await expect(expandInternalUrls("cat artifact://1", { skills: [] })).rejects.toThrow(
-			"Cannot resolve artifact:// URL in bash command",
+			"artifact:// URLs cannot be expanded",
 		);
 	});
 

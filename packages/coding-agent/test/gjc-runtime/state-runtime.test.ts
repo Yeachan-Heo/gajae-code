@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import {
 	activeSnapshotPath,
 	modeStatePath,
@@ -51,6 +52,34 @@ describe("native gjc state runtime", () => {
 		const result = await runNativeStateCommand(["read", "--json"], root);
 		expect(result.status).toBe(0);
 		expect(envelopeState(result.stdout)).toEqual({});
+	});
+	it("treats an empty first positional as absent instead of clearing state", async () => {
+		const root = await tempDir();
+		const seed = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "seed" })],
+			root,
+		);
+		expect(seed.status).toBe(0);
+
+		const result = await runNativeStateCommand(["", "clear", "--mode", "ralplan", "--json"], root);
+		expect(result.status).toBe(0);
+		expect(envelopeState(result.stdout).marker).toBe("seed");
+
+		const retained = await runNativeStateCommand(["read", "--mode", "ralplan", "--json"], root);
+		expect(envelopeState(retained.stdout).marker).toBe("seed");
+	});
+
+	it("treats an empty second positional as absent for an explicit skill read", async () => {
+		const root = await tempDir();
+		const seed = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "seed" })],
+			root,
+		);
+		expect(seed.status).toBe(0);
+
+		const result = await runNativeStateCommand(["ralplan", "", "--json"], root);
+		expect(result.status).toBe(0);
+		expect(envelopeState(result.stdout).marker).toBe("seed");
 	});
 
 	it("reads corrupt mode-state fail-open as empty state", async () => {
@@ -104,6 +133,64 @@ describe("native gjc state runtime", () => {
 		// verify CLI flag won by reading the underlying file path
 		const ralplanFile = modeStatePath(root, TEST_SESSION_ID, "ralplan");
 		expect(JSON.parse(await fs.readFile(ralplanFile, "utf-8")).active).toBe(true);
+	});
+	it("preserves first-occurrence selector precedence for repeated mode flags", async () => {
+		const root = await tempDir();
+		const seed = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "seed" })],
+			root,
+		);
+		expect(seed.status).toBe(0);
+
+		const repeated = await runNativeStateCommand(
+			["write", "--mode", "", "--mode", "team", "--input", JSON.stringify({ marker: "runtime-first" })],
+			root,
+		);
+		expect(repeated.status).toBe(0);
+
+		const ralplan = await runNativeStateCommand(["read", "--mode", "ralplan", "--json"], root);
+		const team = await runNativeStateCommand(["read", "--mode", "team", "--json"], root);
+		expect(envelopeState(ralplan.stdout).marker).toBe("runtime-first");
+		expect(envelopeState(team.stdout)).toEqual({});
+	});
+
+	it("preserves first-occurrence selector precedence for repeated input flags", async () => {
+		const root = await tempDir();
+		const seed = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "seed" })],
+			root,
+		);
+		expect(seed.status).toBe(0);
+
+		const repeated = await runNativeStateCommand(
+			["write", "--input", "{}", "--input", JSON.stringify({ mode: "ralplan", current_phase: "handoff" }), "--json"],
+			root,
+		);
+		expect(repeated.status).toBe(0);
+
+		const result = await runNativeStateCommand(["read", "--mode", "ralplan", "--json"], root);
+		expect(envelopeState(result.stdout)).toMatchObject({ marker: "seed" });
+		expect(envelopeState(result.stdout).current_phase).not.toBe("handoff");
+	});
+
+	it("continues to accept known manifest flags", async () => {
+		const root = await tempDir();
+		const result = await runNativeStateCommand(
+			[
+				"write",
+				"--mode",
+				"ralplan",
+				"--input",
+				JSON.stringify({ marker: "manifest-compatible" }),
+				"--args",
+				"legacy-value",
+			],
+			root,
+		);
+
+		expect(result.status).toBe(0);
+		const state = await runNativeStateCommand(["read", "--mode", "ralplan", "--json"], root);
+		expect(envelopeState(state.stdout).marker).toBe("manifest-compatible");
 	});
 
 	it("merges write payloads while preserving long-lived keys", async () => {
@@ -356,6 +443,126 @@ describe("native gjc state runtime", () => {
 		const result = await runNativeStateCommand(["write", "--input", "{not json", "--mode", "deep-interview"], root);
 		expect(result.status).toBe(2);
 		expect(result.stderr).toContain("--input is not valid JSON");
+	});
+
+	it("rejects oversized deep-interview initial context without creating or changing state", async () => {
+		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const oversizedCreate = await runNativeStateCommand(
+			[
+				"write",
+				"--input",
+				JSON.stringify({ state: { initial_idea: "한".repeat(50_001) } }),
+				"--mode",
+				"deep-interview",
+			],
+			root,
+		);
+		expect(oversizedCreate.status).toBe(2);
+		expect(oversizedCreate.stderr).toContain("initial_idea exceeds max length 50000");
+		await expect(fs.stat(statePath)).rejects.toThrow();
+
+		const valid = await runNativeStateCommand(
+			["write", "--input", JSON.stringify({ state: { initial_idea: "valid" } }), "--mode", "deep-interview"],
+			root,
+		);
+		expect(valid.status).toBe(0);
+		const before = await fs.readFile(statePath, "utf-8");
+		const conflictingCopies = await runNativeStateCommand(
+			[
+				"write",
+				"--input",
+				JSON.stringify({ initial_idea: "😀".repeat(50_001), state: { initial_idea: "valid" } }),
+				"--mode",
+				"deep-interview",
+			],
+			root,
+		);
+		expect(conflictingCopies.status).toBe(2);
+		expect(conflictingCopies.stderr).toContain("initial_idea exceeds max length 50000");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(before);
+		const oversizedUpdate = await runNativeStateCommand(
+			[
+				"write",
+				"--input",
+				JSON.stringify({ state: { initial_context: "한".repeat(50_001) } }),
+				"--mode",
+				"deep-interview",
+			],
+			root,
+		);
+		expect(oversizedUpdate.status).toBe(2);
+		expect(await fs.readFile(statePath, "utf-8")).toBe(before);
+	});
+
+	it("counts emoji as code points and rejects oversized scoring payloads before state mutation", async () => {
+		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const exactInitialContext = "😀".repeat(50_000);
+		expect(
+			(
+				await runNativeStateCommand(
+					[
+						"write",
+						"--input",
+						JSON.stringify({ state: { initial_idea: exactInitialContext } }),
+						"--mode",
+						"deep-interview",
+					],
+					root,
+				)
+			).status,
+		).toBe(0);
+		const before = await fs.readFile(statePath, "utf-8");
+
+		const structuredBase = { state: { ontology_snapshots: [""] } };
+		const exactStructured = {
+			state: {
+				ontology_snapshots: ["😀".repeat(100_000 - deepInterviewCharacterCount(JSON.stringify(structuredBase)))],
+			},
+		};
+		expect(deepInterviewCharacterCount(JSON.stringify(exactStructured))).toBe(100_000);
+		expect(
+			(
+				await runNativeStateCommand(
+					["write", "--input", JSON.stringify(exactStructured), "--mode", "deep-interview"],
+					root,
+				)
+			).status,
+		).toBe(0);
+		const afterExact = await fs.readFile(statePath, "utf-8");
+
+		const oversizedStructured = {
+			state: {
+				ontology_snapshots: ["😀".repeat(100_001 - deepInterviewCharacterCount(JSON.stringify(structuredBase)))],
+			},
+		};
+		expect(deepInterviewCharacterCount(JSON.stringify(oversizedStructured))).toBe(100_001);
+		const rejected = await runNativeStateCommand(
+			["write", "--input", JSON.stringify(oversizedStructured), "--mode", "deep-interview"],
+			root,
+		);
+		expect(rejected.status).toBe(2);
+		expect(rejected.stderr).toContain("structured deep-interview response exceeds max length 100000");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(afterExact);
+
+		const scoringBase = { state: { rounds: [{ scores: { scope: "" } }] } };
+		const oversizedScoring = {
+			state: {
+				rounds: [
+					{ scores: { scope: "😀".repeat(100_001 - deepInterviewCharacterCount(JSON.stringify(scoringBase))) } },
+				],
+			},
+		};
+		expect(deepInterviewCharacterCount(JSON.stringify(oversizedScoring))).toBe(100_001);
+		const rejectedScoring = await runNativeStateCommand(
+			["write", "--input", JSON.stringify(oversizedScoring), "--mode", "deep-interview"],
+			root,
+		);
+		expect(rejectedScoring.status).toBe(2);
+		expect(rejectedScoring.stderr).toContain("structured deep-interview response exceeds max length 100000");
+		expect(await fs.readFile(statePath, "utf-8")).toBe(afterExact);
+		expect(afterExact).not.toBe(before);
 	});
 
 	it("preserves both writers' disjoint keys under interleaved write calls", async () => {

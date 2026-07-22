@@ -71,8 +71,10 @@ describe("stable release policy", () => {
 
 	test("lint/typecheck and tests never run on release tags", async () => {
 		const ci = await workflow();
-		for (const job of ["check", "test"]) {
-			expect(jobSection(ci, job)).toContain("if: ${{ !startsWith(github.ref, 'refs/tags/v') }}");
+		// The monolithic `test` job is now a sharded graph; every job in that graph,
+		// plus the bounded `check` job, must stay excluded on release tags.
+		for (const job of ["check", "main_plan", "main_native", "main_shards", "test"]) {
+			expect(jobSection(ci, job)).toContain("!startsWith(github.ref, 'refs/tags/v')");
 		}
 	});
 

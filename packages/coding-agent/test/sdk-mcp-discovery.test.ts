@@ -174,6 +174,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			expect(MCPManager.instance()).toBeUndefined();
 			expect(session.getAllToolNames()).toContain("mcp__exact_lookup");
 			expect(session.getActiveToolNames()).toContain("mcp__exact_lookup");
+
 			expect(getServerInstructions).not.toHaveBeenCalled();
 			expect(session.systemPrompt.join("\n")).not.toContain(instructionMarker);
 		} finally {
@@ -756,7 +757,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			slashCommands: [],
 			enableMCP: false,
 			enableLsp: false,
-			toolNames: ["read", "search_tool_bm25"],
+
 			customTools: [
 				createMcpCustomTool("mcp__github_create_issue", "github", "create_issue"),
 				createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),

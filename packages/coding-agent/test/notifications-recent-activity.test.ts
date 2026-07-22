@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -108,6 +108,76 @@ describe("recent-activity picker", () => {
 		expect(result.entries.map(entry => entry.sessionId)).toEqual(["saved-elsewhere"]);
 	});
 
+	it("silently ignores sessions whose workspace directories were removed", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const removedCwd = path.join(root, "removed-workspace");
+		const directory = await managedDirectory(root, cwd);
+		await managedDirectory(root, removedCwd);
+		writeSession(directory, "stale-candidate", removedCwd, {}, 2_000);
+		fs.rmSync(removedCwd, { recursive: true });
+
+		const result = await listRecentSessions({ cwd, sessionsRoot: root, allWorkspaces: true });
+
+		expect(result).toMatchObject({ kind: "complete", entries: [], warnings: [] });
+	});
+
+	it("preserves warnings for non-stale cwd identity failures", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const brokenCwd = path.join(root, "identity-error");
+		const directory = await managedDirectory(root, cwd);
+		writeSession(directory, "broken-candidate", brokenCwd, {}, 2_000);
+		const canonicalIdentity = native.canonicalExistingDirectoryIdentity;
+		const identity = vi
+			.spyOn(native, "canonicalExistingDirectoryIdentity")
+			.mockImplementation(pathname =>
+				pathname === brokenCwd ? { ok: false, code: "io_error" } : canonicalIdentity(pathname),
+			);
+		try {
+			const result = await listRecentSessions({ cwd, sessionsRoot: root });
+
+			expect(result).toMatchObject({
+				kind: "complete",
+				entries: [],
+				warnings: ["Ignored invalid managed session candidate: cwd_io_error"],
+			});
+		} finally {
+			identity.mockRestore();
+		}
+	});
+
+	it("silently ignores workspace bindings replaced by files", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const removedCwd = path.join(root, "removed-workspace");
+		await managedDirectory(root, cwd);
+		await managedDirectory(root, removedCwd);
+		fs.rmSync(removedCwd, { recursive: true });
+		fs.writeFileSync(removedCwd, "not a directory", { mode: 0o600 });
+
+		const result = await listRecentSessions({ cwd, sessionsRoot: root, allWorkspaces: true });
+
+		expect(result).toMatchObject({ kind: "complete", entries: [], warnings: [] });
+	});
+
+	it("warns about removed workspace candidates during direct scans", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const removedCwd = path.join(root, "removed-workspace");
+		const directory = await managedDirectory(root, cwd);
+		fs.mkdirSync(removedCwd, { recursive: true, mode: 0o700 });
+		writeSession(directory, "stale-candidate", removedCwd, {}, 2_000);
+		fs.rmSync(removedCwd, { recursive: true });
+
+		const result = await listRecentSessions({ cwd, sessionsRoot: root });
+
+		expect(result).toMatchObject({
+			kind: "complete",
+			entries: [],
+			warnings: ["Ignored invalid managed session candidate: cwd_not_found"],
+		});
+	});
 	it("fails closed for an unsafe all-workspace sessions root", async () => {
 		if (process.platform === "win32") return;
 		const root = tempRoot();

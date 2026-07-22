@@ -44,8 +44,11 @@ function isExecutable(path: string): boolean {
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
+	const inherited = filterProcessEnv(Bun.env);
+	delete inherited.GJC_SESSION_FILE;
+	delete inherited.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
 	return {
-		...filterProcessEnv(Bun.env),
+		...inherited,
 		SHELL: shell,
 		GIT_EDITOR: "true",
 		GPG_TTY: "not a tty",

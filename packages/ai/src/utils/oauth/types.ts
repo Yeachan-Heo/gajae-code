@@ -9,7 +9,7 @@ export type OAuthCredentials = {
 };
 
 export type OAuthProvider =
-	| "alibaba-coding-plan"
+	| "alibaba-token-plan"
 	| "anthropic"
 	| "cerebras"
 	| "cloudflare-ai-gateway"

@@ -35,6 +35,19 @@ export function isSgrMouseSequence(sequence: string): boolean {
 function isSgrMousePrefix(sequence: string): boolean {
 	return sequence.startsWith(`${ESC}[<`);
 }
+function isHighSurrogate(codeUnit: number): boolean {
+	return codeUnit >= 0xd800 && codeUnit <= 0xdbff;
+}
+
+function isLowSurrogate(codeUnit: number): boolean {
+	return codeUnit >= 0xdc00 && codeUnit <= 0xdfff;
+}
+
+function singleCodePoint(sequence: string): number | undefined {
+	const codepoint = sequence.codePointAt(0);
+	if (codepoint === undefined) return undefined;
+	return sequence.length === (codepoint > 0xffff ? 2 : 1) ? codepoint : undefined;
+}
 
 function isUtf8LeadByte(byte: number): boolean {
 	return byte >= 0xc2 && byte <= 0xf4;
@@ -114,9 +127,9 @@ function isCompleteSequence(data: string): "complete" | "incomplete" | "not-esca
 		return afterEsc.length >= 2 ? "complete" : "incomplete";
 	}
 
-	// Meta key sequences: ESC followed by a single character
+	// Meta key sequences: ESC followed by a single Unicode code point
 	if (afterEsc.length === 1) {
-		return "complete";
+		return isHighSurrogate(afterEsc.charCodeAt(0)) ? "incomplete" : "complete";
 	}
 
 	// Unknown escape sequence - treat as complete
@@ -234,6 +247,18 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 
 		// Try to extract a sequence starting at this position
 		if (remaining.startsWith(ESC)) {
+			// A split Meta + supplementary code point stays buffered after its high
+			// surrogate. If the next code unit cannot complete that pair, flush the
+			// malformed Meta sequence without consuming the following input.
+			if (
+				remaining.length >= 3 &&
+				isHighSurrogate(remaining.charCodeAt(1)) &&
+				!isLowSurrogate(remaining.charCodeAt(2))
+			) {
+				sequences.push(remaining.slice(0, 2));
+				pos += 2;
+				continue;
+			}
 			// Find the end of this escape sequence
 			let seqEnd = 1;
 			while (seqEnd <= remaining.length) {
@@ -258,7 +283,19 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 				return { sequences, remainder: remaining };
 			}
 		} else {
-			// Not an escape sequence - take a single character
+			// Not an escape sequence - take a single Unicode code point. Keep a
+			// trailing high surrogate buffered so a following string chunk can
+			// complete it.
+			const firstCodeUnit = remaining.charCodeAt(0);
+			if (isHighSurrogate(firstCodeUnit)) {
+				if (remaining.length === 1) return { sequences, remainder: remaining };
+				const secondCodeUnit = remaining.charCodeAt(1);
+				if (isLowSurrogate(secondCodeUnit)) {
+					sequences.push(remaining.slice(0, 2));
+					pos += 2;
+					continue;
+				}
+			}
 			sequences.push(remaining[0]!);
 			pos++;
 		}
@@ -552,7 +589,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		return legacyMetaSequence(byte);
 	}
 	#emitDataSequence(sequence: string): void {
-		const rawCodepoint = sequence.length === 1 ? sequence.codePointAt(0) : undefined;
+		const rawCodepoint = singleCodePoint(sequence);
 		if (rawCodepoint !== undefined && rawCodepoint === this.#pendingKittyPrintableCodepoint) {
 			this.#pendingKittyPrintableCodepoint = undefined;
 			return;

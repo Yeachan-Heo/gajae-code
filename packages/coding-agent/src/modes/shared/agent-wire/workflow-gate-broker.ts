@@ -76,6 +76,13 @@ export interface NotificationGateResolutionOptions {
 	closeClaimInvalid(reason: string): void;
 }
 
+export class NotificationGatePolicyChangedError extends Error {
+	constructor() {
+		super("Notification policy changed while resolving the workflow gate");
+		this.name = "NotificationGatePolicyChangedError";
+	}
+}
+
 export interface AskSelectedAckRecoveryParticipant {
 	requestRecoveredAskSelectedAck(input: {
 		sessionId: string;
@@ -361,7 +368,8 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 								daemonDeadlineAt: Date.now() + 8_000,
 								hostTimeoutMs: 10_000,
 							});
-						} catch {
+						} catch (error) {
+							if (error instanceof NotificationGatePolicyChangedError) throw error;
 							outcome = { status: "unknown", reason: "host_timeout" };
 						}
 						this.#broker.updateAckPolicy(response.gate_id, {
@@ -378,6 +386,14 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 			else closeClaimInvalid(resolution.error?.code ?? "invalid_answer");
 			return resolution;
 		} catch (error) {
+			if (error instanceof NotificationGatePolicyChangedError) {
+				try {
+					closeClaimInvalid(error.message);
+				} finally {
+					this.quarantineGate(response.gate_id);
+				}
+				throw error;
+			}
 			closeClaimInvalid(error instanceof Error ? error.message : "invalid_answer");
 			this.#scheduleRecovery();
 			throw error;

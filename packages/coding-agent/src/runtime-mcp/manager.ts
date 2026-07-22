@@ -235,12 +235,24 @@ export class MCPManager {
 	#epoch = 0;
 	readonly #toolsOnly: boolean;
 	#toolsOnlyConfigLoaded = false;
+	#connectionSetSealed = false;
 
 	#serverError(message: string): string {
 		return this.#toolsOnly ? "MCP server unavailable" : message;
 	}
 	#assertRawMCPAccessAllowed(): void {
 		if (this.#toolsOnly) throw new Error("Tools-only MCP manager does not allow raw MCP access");
+	}
+	#assertConnectionSetMutable(): void {
+		if (this.#connectionSetSealed) throw new Error("MCP manager connection set is sealed");
+	}
+
+	sealConnectionSet(): void {
+		this.#connectionSetSealed = true;
+	}
+
+	isConnectionSetSealed(): boolean {
+		return this.#connectionSetSealed;
 	}
 
 	#isCurrentConnection(
@@ -379,6 +391,7 @@ export class MCPManager {
 	 * Returns tools and any connection errors.
 	 */
 	async discoverAndConnect(options?: MCPDiscoverOptions): Promise<MCPLoadResult> {
+		this.#assertConnectionSetMutable();
 		const hasConfigPath = options?.configPath !== undefined;
 		if (this.#toolsOnly !== hasConfigPath) {
 			throw new Error(
@@ -414,6 +427,7 @@ export class MCPManager {
 		onConnecting?: (serverNames: string[]) => void,
 	): Promise<MCPLoadResult> {
 		this.#assertRawMCPAccessAllowed();
+		this.#assertConnectionSetMutable();
 		return this.#connectServers(configs, sources, onConnecting);
 	}
 
@@ -923,6 +937,7 @@ export class MCPManager {
 	 */
 	async disconnectServer(name: string): Promise<void> {
 		this.#assertRawMCPAccessAllowed();
+		this.#assertConnectionSetMutable();
 		await this.#disconnectServer(name);
 	}
 
@@ -1050,7 +1065,7 @@ export class MCPManager {
 	 * Returns the new connection, or null if reconnection failed.
 	 */
 	async reconnectServer(name: string): Promise<MCPServerConnection | null> {
-		if (this.#toolsOnly) return null;
+		if (this.#toolsOnly || this.#connectionSetSealed) return null;
 		const pending = this.#pendingReconnections.get(name);
 		if (pending) return pending;
 

@@ -1450,6 +1450,9 @@ export class MCPCommandController {
 		if (!this.ctx.mcpManager) {
 			return;
 		}
+		if (this.ctx.mcpManager.isConnectionSetSealed()) {
+			throw new Error("This session's plugin-bundle MCP connections are fixed for its lifetime.");
+		}
 
 		// Disconnect all existing servers
 		await this.ctx.mcpManager.disconnectAll();

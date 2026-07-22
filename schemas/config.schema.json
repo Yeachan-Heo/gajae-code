@@ -71,6 +71,16 @@
 							},
 							"additionalProperties": false
 						},
+						"streaming": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"default": true
+								}
+							},
+							"additionalProperties": false
+						},
 						"rich": {
 							"type": "object",
 							"properties": {
@@ -89,6 +99,17 @@
 									"type": "boolean",
 									"description": "Include rich draft updates in Telegram notifications.",
 									"default": false
+								}
+							},
+							"additionalProperties": false
+						},
+						"toolActivity": {
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"type": "boolean",
+									"description": "Send Telegram updates for tool starts and completions.",
+									"default": true
 								}
 							},
 							"additionalProperties": false
@@ -409,6 +430,11 @@
 				},
 				"showSkillHud": {
 					"type": "boolean",
+					"default": true
+				},
+				"showActionHints": {
+					"type": "boolean",
+					"description": "Show contextual keyboard shortcuts in the status line",
 					"default": true
 				},
 				"leftSegments": {
@@ -1116,8 +1142,13 @@
 				},
 				"handoffSaveToDisk": {
 					"type": "boolean",
-					"description": "Save generated handoff documents to markdown files for the auto-handoff flow",
+					"description": "Save auto-triggered handoff documents as session artifacts (resolvable artifact:// URIs); manual /handoff does not save",
 					"default": false
+				},
+				"handoffPromptExtension": {
+					"type": "string",
+					"description": "Extra guidance appended to the default handoff-generation prompt for both manual /handoff and auto-handoff. It supplements, and never replaces, the built-in safety- and continuity-critical instructions.",
+					"default": ""
 				},
 				"remoteEnabled": {
 					"type": "boolean",
@@ -1890,7 +1921,7 @@
 			"properties": {
 				"insaneFallback": {
 					"type": "boolean",
-					"description": "Opt in to the vendored insane-search escalation for blocked public URL reads (403/WAF/JS-gated). Off by default. Requires preinstalled python3 + curl_cffi (and node + playwright/stealth for the browser phase); changes network posture by enabling TLS/browser impersonation for public pages.",
+					"description": "Compatibility-only preference. Remote renderer fallback stays disabled because it cannot preserve validated per-hop network routing.",
 					"default": false
 				}
 			},
@@ -2359,10 +2390,27 @@
 						"openai",
 						"gemini",
 						"openrouter",
-						"antigravity"
+						"antigravity",
+						"custom"
 					],
-					"description": "Provider for image generation tool",
+					"description": "Provider and model for image generation tool",
 					"default": "auto"
+				},
+				"imageModel": {
+					"type": "string",
+					"description": "Override the default image generation model for the selected provider"
+				},
+				"imageCustomUrl": {
+					"type": "string",
+					"description": "Base URL for custom OpenAI-compatible image endpoint"
+				},
+				"imageCustomKey": {
+					"type": "string",
+					"description": "API key for custom OpenAI-compatible image endpoint"
+				},
+				"imageCustomKeyEnv": {
+					"type": "string",
+					"description": "Environment variable name holding the API key for custom image endpoint"
 				},
 				"kimiApiFormat": {
 					"type": "string",

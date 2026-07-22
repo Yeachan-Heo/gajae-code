@@ -48,6 +48,31 @@ describe("executeBash", () => {
 		expect(result.cancelled).toBe(false);
 	});
 
+	it("scrubs inherited managed transcript paths from shell sessions", async () => {
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		const previousOwnerPath = process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
+		process.env.GJC_SESSION_FILE = "/managed/session.jsonl";
+		process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH = "/managed/owner.jsonl";
+		try {
+			await disposeAllShellSessions();
+			const result = await executeBash(
+				'printf "%s|%s" "$(printenv GJC_SESSION_FILE || printf unset)" "$(printenv GJC_MANAGED_OWNER_TRANSCRIPT_PATH || printf unset)"',
+				{
+					cwd: tempDir,
+					timeout: 5000,
+					sessionKey: "managed-env-scrub",
+				},
+			);
+			expect(result.output).toBe("unset|unset");
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			if (previousOwnerPath === undefined) delete process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
+			else process.env.GJC_MANAGED_OWNER_TRANSCRIPT_PATH = previousOwnerPath;
+			await disposeAllShellSessions();
+		}
+	});
+
 	it("retains then fully disposes persistent shell sessions (MEM-7)", async () => {
 		await disposeAllShellSessions();
 		expect(getShellSessionCount()).toBe(0);

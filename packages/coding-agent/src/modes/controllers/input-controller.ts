@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@gajae-code/tui";
-import { $env, sanitizeText } from "@gajae-code/utils";
+import { $env, logger, sanitizeText } from "@gajae-code/utils";
 import { type AppKeybinding, KEYBINDINGS } from "../../config/keybindings";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveSubskillActivationForSkillInvocation } from "../../extensibility/gjc-plugins";
@@ -22,12 +22,14 @@ import { getUserMessageViewportAnchorIds } from "../../session/session-manager";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
-import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
+import { ensureSupportedImageInput, ImageInputTooLargeError } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
-import { formatPastedImageReference, resolvePastedImagePath } from "../../utils/pasted-image-path";
+import { loadPastedImageBatch, PastedImageBatchError } from "../../utils/pasted-image-loading";
+import { formatPastedImageReference, parsePastedImagePaths } from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { ActionRegistry, APP_ACTION_METADATA } from "../action-registry";
 import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } from "../components/command-palette";
+import type { PasteTextContext } from "../components/custom-editor";
 import { QueuePaneComponent } from "../components/queue-pane";
 import { type QueuedMessageMoveDirection, QueuedMessageSelectorComponent } from "../components/queued-message-selector";
 
@@ -44,14 +46,23 @@ const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
 const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
 
+interface InputControllerDependencies {
+	loadPastedImageBatch?: typeof loadPastedImageBatch;
+}
+
 function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
 
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
+	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
 
-	constructor(private ctx: InteractiveModeContext) {
+	constructor(
+		private ctx: InteractiveModeContext,
+		dependencies: InputControllerDependencies = {},
+	) {
+		this.#loadPastedImageBatch = dependencies.loadPastedImageBatch ?? loadPastedImageBatch;
 		this.actionRegistry = new ActionRegistry({
 			context: undefined,
 			showError: actionId => this.ctx.showError(actionId),
@@ -585,11 +596,11 @@ export class InputController {
 		);
 		this.ctx.editor.onCopyPrompt = () => this.#executeAction("app.clipboard.copyPrompt");
 		this.#registerCommandPaletteAction("app.clipboard.copyPrompt", copyPrompt);
-		this.ctx.editor.onPasteText = text => this.handleTextPaste(text);
-		this.ctx.editor.onPastePendingInputCleared = (reason, droppedInputCount) => {
+		this.ctx.editor.onPasteText = (text, context) => this.handleTextPaste(text, context);
+		this.ctx.editor.onPastePendingInputCleared = (reason, restoredInputCount) => {
 			const reasonText = reason === "timeout" ? "timed out" : "exceeded the input queue limit";
 			this.ctx.showWarning(
-				`Paste handling ${reasonText}; discarded ${droppedInputCount} buffered input event${droppedInputCount === 1 ? "" : "s"}.`,
+				`Paste handling ${reasonText}; restored the original paste and ${restoredInputCount} buffered input event${restoredInputCount === 1 ? "" : "s"}.`,
 			);
 		};
 		const expandTools = () => this.toggleToolOutputExpansion();
@@ -741,6 +752,29 @@ export class InputController {
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
 		text = text.trim();
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
+		if (this.ctx.hasActiveBtw()) {
+			if (!text) return;
+			if (!text.startsWith("/")) {
+				const result = await this.ctx.handleBtwFollowUp(text);
+				if (result === "accepted" && this.#canModifyComposer(composer)) {
+					this.ctx.editor.setText("");
+					this.ctx.pendingImages = [];
+				}
+				return;
+			}
+		}
+
+		if (/^\/btw(?:\s|$)/.test(text)) {
+			const slashResult = await executeBuiltinSlashCommand(text, {
+				ctx: this.ctx,
+				handleBackgroundCommand: () => this.handleBackgroundCommand(),
+				composer,
+			});
+			if (slashResult === true) {
+				this.ctx.pendingImages = [];
+				return;
+			}
+		}
 
 		// Empty submit while streaming with queued messages: flush queues immediately
 		if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
@@ -1346,6 +1380,14 @@ export class InputController {
 	async handleFollowUp(): Promise<void> {
 		const text = this.ctx.editor.getText().trim();
 		if (!text) return;
+		// While /btw is open, plain text stays in the side chat. Slash-origin
+		// input keeps normal dispatch so commands remain available.
+		if (this.ctx.hasActiveBtw() && !text.startsWith("/")) {
+			if ((await this.ctx.handleBtwFollowUp(text)) === "accepted") {
+				this.ctx.editor.setText("");
+			}
+			return;
+		}
 
 		// Compaction first: while compacting, queue free text and `/skill:*`
 		// commands in the compaction-local queue. `flushCompactionQueue`
@@ -1522,46 +1564,96 @@ export class InputController {
 		return true;
 	}
 
-	handleTextPaste(text: string): boolean | Promise<boolean> {
-		const imagePath = resolvePastedImagePath(text, { cwd: this.ctx.sessionManager.getCwd() });
-		return imagePath ? this.#attachPastedImagePath(imagePath) : false;
+	handleTextPaste(text: string, context: PasteTextContext): boolean | Promise<boolean> {
+		if (this.ctx.isBashMode || this.ctx.isPythonMode) return false;
+		const parsed = parsePastedImagePaths(text, { cwd: this.ctx.sessionManager.getCwd() });
+		if (!parsed) return false;
+		if (parsed.kind === "too-many") {
+			this.ctx.showStatus(`Cannot attach more than ${parsed.maxCandidates} pasted images.`);
+			return false;
+		}
+		return this.#attachPastedImagePaths(parsed.paths, parsed.requiresConfirmation, context);
 	}
 
-	/**
-	 * Returns `false` on every failure path so the editor replays the original
-	 * bracketed paste — the raw path text must never be lost when attachment
-	 * is impossible (unsupported content, oversized image, load error).
-	 */
-	async #attachPastedImagePath(imagePath: string): Promise<boolean> {
+	/** Return false on every failure so CustomEditor restores the exact paste. */
+	async #attachPastedImagePaths(
+		imagePaths: readonly string[],
+		requiresConfirmation: boolean,
+		context: PasteTextContext,
+	): Promise<boolean> {
+		const signal = context.signal;
+		const editor = this.ctx.editor;
+		const editorText = editor.getText();
+		const pendingImages = this.ctx.pendingImages;
+		const pendingImageCount = pendingImages.length;
 		try {
-			const image = await loadImageInput({
-				path: imagePath,
-				cwd: this.ctx.sessionManager.getCwd(),
-				autoResize: this.ctx.settings.get("images.autoResize"),
-			});
-			if (!image) {
-				this.ctx.showStatus("Unsupported pasted image file");
-				return false;
+			if (requiresConfirmation) {
+				const selection = await this.ctx.showHookSelector(
+					`Attach ${imagePaths.length} pasted images?\nOnly attach files you intend to send to the model.`,
+					["Attach images", "Paste paths literally"],
+					{ signal, helpText: "Enter: choose · Esc: paste paths literally" },
+				);
+				signal.throwIfAborted();
+				if (selection !== "Attach images") return false;
 			}
 
-			this.ctx.pendingImages = [
-				...this.ctx.pendingImages,
-				{
-					type: "image",
-					data: image.data,
-					mimeType: image.mimeType,
-				},
-			];
-			this.ctx.editor.insertText(`${formatPastedImageReference(this.#nextImagePlaceholder(), image.resolvedPath)} `);
-			this.ctx.showStatus(`Attached image: ${path.basename(image.resolvedPath)}`, { dim: true });
-			this.ctx.ui.requestRender();
-			return true;
+			const loaded = await this.#loadPastedImageBatch({
+				paths: imagePaths,
+				autoResize: this.ctx.settings.get("images.autoResize"),
+				sourcePolicy: requiresConfirmation ? "confirmed" : "automatic-temp",
+				signal,
+			});
+			signal.throwIfAborted();
+			return context.commit(() => {
+				if (
+					this.ctx.editor !== editor ||
+					editor.getText() !== editorText ||
+					this.ctx.pendingImages !== pendingImages ||
+					pendingImages.length !== pendingImageCount
+				) {
+					return false;
+				}
+
+				const firstImageNumber = pendingImages.length + 1;
+				const references = loaded.sourcePaths.map((sourcePath, index) =>
+					formatPastedImageReference(`[image ${firstImageNumber + index}]`, sourcePath),
+				);
+				try {
+					editor.insertText(`${references.join(" ")} `);
+					this.ctx.pendingImages = [...pendingImages, ...loaded.images];
+				} catch (error) {
+					try {
+						editor.setText(editorText);
+					} catch {
+						// Preserve the original mutation error when rollback itself fails.
+					} finally {
+						this.ctx.pendingImages = pendingImages;
+					}
+					throw error;
+				}
+
+				try {
+					this.ctx.showStatus(
+						loaded.images.length === 1
+							? `Attached image: ${path.basename(loaded.sourcePaths[0] ?? "")}`
+							: `Attached ${loaded.images.length} images`,
+						{ dim: true },
+					);
+					this.ctx.ui.requestRender();
+				} catch (error) {
+					logger.warn("Pasted images attached but status rendering failed", { error: String(error) });
+				}
+				return true;
+			});
 		} catch (error) {
-			if (error instanceof ImageInputTooLargeError) {
+			if (signal.aborted) return false;
+			if (error instanceof ImageInputTooLargeError || error instanceof PastedImageBatchError) {
 				this.ctx.showStatus(error.message);
 				return false;
 			}
-			this.ctx.showStatus("Failed to attach pasted image");
+			this.ctx.showStatus(
+				imagePaths.length === 1 ? "Failed to attach pasted image" : "Failed to attach pasted images",
+			);
 			return false;
 		}
 	}

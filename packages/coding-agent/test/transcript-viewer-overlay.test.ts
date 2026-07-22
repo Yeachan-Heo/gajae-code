@@ -5,6 +5,7 @@ import type { AssistantMessage } from "@gajae-code/ai";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
+import { createToolTranscriptRenderDescriptor } from "../src/modes/components/tool-transcript-format";
 import {
 	type TranscriptViewerEntry,
 	TranscriptViewerOverlay,
@@ -260,6 +261,181 @@ test("reconciles missing IDs by position and keeps followed tail content visible
 	entries = [entryForOverlay("first", "first"), entryForOverlay("replacement", "replacement")];
 	positioned.refresh();
 	expect(positioned.selectedEntryId).toBe("replacement");
+});
+
+test("renders tool names, state-aware folded display, and preserves neighboring tool folds", () => {
+	const registry = new TranscriptItemRegistry();
+	const toolPayload = (id: string, resultText: string, isError: boolean, hasResult: boolean) => ({
+		text: `raw ${resultText}`,
+		metadata: {
+			name: "read",
+			arguments: { path: `${id}.ts` },
+			intent: "Inspect file",
+			resultText,
+			isError,
+			hasResult,
+		},
+		source: id,
+	});
+	registry.register({
+		id: "tool:first",
+		kind: "tool",
+		source: "first",
+		getPayload: () => toolPayload("first", "first result", false, true),
+	});
+	registry.register({
+		id: "tool:second",
+		kind: "tool",
+		source: "second",
+		getPayload: () => toolPayload("second", "", false, false),
+	});
+	const entries = transcriptViewerEntries(registry);
+	expect(entries.map(entry => entry.label)).toEqual(["read", "read"]);
+	expect(entries[0]?.getDisplayText?.(false)).toBe("path: first.ts\nInspect file");
+	expect(entries[0]?.getDisplayText?.(true)).toContain("first result");
+	expect(entries[1]?.getDisplayText?.(true)).toContain("⏳ pending");
+
+	const copied: string[] = [];
+	const viewer = new TranscriptViewerOverlay({
+		getEntries: () => transcriptViewerEntries(registry),
+		onClose: () => {},
+		copyToClipboard: text => copied.push(text),
+	});
+	viewer.handleInput("Y");
+	const copiedMetadata = JSON.parse(copied[0] ?? "") as Record<string, unknown>;
+	expect(Object.keys(copiedMetadata).sort()).toEqual([
+		"arguments",
+		"hasResult",
+		"intent",
+		"isError",
+		"name",
+		"resultText",
+	]);
+	viewer.handleInput(" ");
+	viewer.handleInput("j");
+	viewer.handleInput(" ");
+	viewer.handleInput("k");
+	expect(viewer.render(100).join("\n")).toContain("first result");
+	viewer.handleInput("j");
+	expect(viewer.render(100).join("\n")).toContain("⏳ pending");
+});
+
+test("preserves legacy tool payload text until complete formatter metadata is available", () => {
+	const registry = new TranscriptItemRegistry();
+	registry.register({
+		id: "tool:legacy",
+		kind: "tool",
+		source: "legacy",
+		getPayload: () => ({ text: "legacy default payload", metadata: {}, source: "legacy" }),
+	});
+	registry.register({
+		id: "tool:partial",
+		kind: "tool",
+		source: "partial",
+		getPayload: () => ({
+			text: "partial legacy payload",
+			metadata: { name: "bash", arguments: { command: "echo partial" }, resultText: "partial result" },
+			source: "partial",
+		}),
+	});
+	registry.register({
+		id: "tool:open",
+		kind: "tool",
+		source: "open",
+		getPayload: () => ({
+			text: "open canonical payload",
+			metadata: {
+				name: "bash",
+				arguments: { command: "echo open" },
+				resultText: "",
+				isError: false,
+				hasResult: false,
+			},
+			source: "open",
+		}),
+	});
+	const entries = transcriptViewerEntries(registry);
+	expect(entries[0]?.getDisplayText).toBeUndefined();
+	expect(entries[1]?.getDisplayText).toBeUndefined();
+	expect(entries[2]?.getDisplayText?.(true)).toBe("echo open\n⏳ pending");
+
+	const viewer = new TranscriptViewerOverlay({
+		getEntries: () => transcriptViewerEntries(registry),
+		onClose: () => {},
+	});
+	viewer.handleInput(" ");
+	const rendered = viewer.render(100).join("\n");
+	expect(rendered).toContain("legacy default payload");
+	expect(rendered).toContain("partial legacy payload");
+	expect(rendered).not.toContain("partial result");
+});
+
+test("sanitizes tool results and leaves expanded assistant text uncapped", () => {
+	const registry = new TranscriptItemRegistry();
+	registry.register({
+		id: "tool:chrome",
+		kind: "tool",
+		source: "chrome",
+		getPayload: () => ({
+			text: "raw",
+			metadata: {
+				name: "bash",
+				arguments: { command: "echo safe" },
+				resultText: "safe\x1b[2J\n# markdown-like",
+				isError: true,
+				hasResult: true,
+			},
+			source: "chrome",
+		}),
+	});
+	registry.register({
+		id: "assistant",
+		kind: "assistant-text",
+		source: "assistant",
+		getPayload: () => ({
+			text: Array.from({ length: 150 }, (_, index) => `assistant-${index}`).join("\n"),
+			metadata: {},
+			source: "assistant",
+		}),
+	});
+	const viewer = new TranscriptViewerOverlay({
+		getEntries: () => transcriptViewerEntries(registry),
+		onClose: () => {},
+	});
+	viewer.handleInput(" ");
+	let rendered = viewer.render(100).join("\n");
+	expect(rendered).toContain("✗ safe");
+	expect(rendered).not.toContain("\x1b[2J");
+	viewer.handleInput("j");
+	viewer.handleInput(" ");
+	viewer.handleInput("\n");
+	for (let index = 0; index < 20; index++) viewer.handleInput("\x1b[6~");
+	rendered = viewer.render(100).join("\n");
+	expect(rendered).toContain("assistant-149");
+});
+
+test("uses final rendered lines without Markdown processing and keeps raw ANSI-free", () => {
+	const canonical = "raw\x1b]52;c;copy\x07\x1b[31mstyled";
+	const viewer = new TranscriptViewerOverlay({
+		getEntries: () => [
+			entryForOverlay("rich", canonical, {
+				kind: "tool",
+				renderDescriptor: createToolTranscriptRenderDescriptor({
+					name: "bash",
+					args: {},
+					resultContent: "done",
+					hasResult: true,
+				}),
+				getDisplayText: () => "display",
+				richRenderEligible: true,
+			}),
+		],
+		onClose: () => {},
+	});
+	viewer.handleInput(" ");
+	expect(viewer.render(100).join("\n")).toContain("✓ done");
+	viewer.handleInput("r");
+	expect(viewer.render(100).join("\n")).not.toContain("\x1b[31mstyled");
 });
 
 function entryForOverlay(

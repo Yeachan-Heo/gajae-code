@@ -7,6 +7,7 @@
  * as well, so every surface reports the same numbers.
  */
 import { estimateTextTokensHeuristic } from "@gajae-code/agent-core/compaction";
+import { toolWireSchema } from "@gajae-code/ai/utils/schema/wire";
 import type { Skill } from "../extensibility/skills";
 import type { Tool } from "../tools";
 import type { AgentSession } from "./agent-session";
@@ -28,9 +29,13 @@ export function estimateToolSchemaTokens(
 	for (const tool of tools) {
 		fragments.push(tool.name, tool.description);
 		try {
-			fragments.push(JSON.stringify(tool.parameters ?? {}));
+			fragments.push(JSON.stringify(toolWireSchema(tool as never)));
 		} catch {
-			// Schema may contain functions or cycles; ignore.
+			try {
+				fragments.push(JSON.stringify(tool.parameters ?? {}));
+			} catch {
+				// Schema may contain functions or cycles; ignore.
+			}
 		}
 	}
 	return estimateTextTokensHeuristic(fragments);

@@ -8,7 +8,10 @@ import {
 	resolveManagedSessionScope,
 	SESSION_DIRECTORY_API_VERSION,
 } from "../src/sdk/session-directory";
-import { computeManagedScopeDigest } from "../src/session/internal/managed-session-scope";
+import {
+	computeManagedScopeDigest,
+	prepareManagedSessionScopeForWriteSync,
+} from "../src/session/internal/managed-session-scope";
 
 const temporaryDirectories: string[] = [];
 
@@ -56,6 +59,37 @@ describe("managed session directory SDK", () => {
 			}
 		},
 	);
+
+	it("creates managed scope components beneath the configured agent root", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-components-"));
+		temporaryDirectories.push(root);
+		const agentDir = path.join(root, "agent", "nested");
+		const cwd = path.join(root, "workspace");
+		await fs.mkdir(cwd);
+		const resolved = await resolveManagedSessionScope({ cwd, agentDir });
+		expect(resolved.kind).toBe("resolved");
+		if (resolved.kind !== "resolved") return;
+		expect(
+			prepareManagedSessionScopeForWriteSync({
+				...resolved.scope,
+				platform: process.platform === "win32" ? "win32" : "posix",
+			}),
+		).toMatchObject({ kind: "resolved" });
+		expect((await fs.stat(agentDir)).isDirectory()).toBe(true);
+		expect((await fs.stat(resolved.scope.sessionsRoot)).isDirectory()).toBe(true);
+	});
+
+	it("fails closed for a symlinked managed component", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-components-"));
+		temporaryDirectories.push(root);
+		const agentDir = path.join(root, "agent");
+		const outside = path.join(root, "outside");
+		const cwd = path.join(root, "workspace");
+		await Promise.all([fs.mkdir(agentDir), fs.mkdir(outside), fs.mkdir(cwd)]);
+		await fs.symlink(outside, path.join(agentDir, "sessions"), process.platform === "win32" ? "junction" : "dir");
+		const resolved = await resolveManagedSessionScope({ cwd, agentDir });
+		expect(resolved).toMatchObject({ kind: "error", code: "sessions_root_unavailable" });
+	});
 	it("pins the v2 digest wire format", () => {
 		expect(computeManagedScopeDigest("posix", "/workspace/a-b/c")).toBe(
 			"ckdstvtkkadas65jsj3gvlcstjat5o5yuwifaq2p3qrc5lmran5q",

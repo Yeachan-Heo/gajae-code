@@ -8,7 +8,7 @@ import { openLifecycleSessionManager, runSessionHost } from "../src/commands/sdk
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
-import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { brokerOwnerForTest, startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import {
 	deriveLifecycleDeadlines,
@@ -261,23 +261,6 @@ test("legacy metadata cleanup rejects mixed lifecycle and arbitrary receipt keys
 	}
 });
 
-async function stopDiscoveredBroker(agentDir: string): Promise<void> {
-	const discovery = await readSdkBrokerDiscovery(agentDir);
-	if (!discovery) return;
-	const stillOwned = (): boolean => processIncarnation(discovery.pid) === discovery.incarnation;
-	const waitForExit = async (timeoutMs: number): Promise<boolean> => {
-		const deadline = Date.now() + timeoutMs;
-		while (stillOwned() && Date.now() < deadline) await Bun.sleep(10);
-		return !stillOwned();
-	};
-	if (!stillOwned()) return;
-	process.kill(discovery.pid, "SIGTERM");
-	if (await waitForExit(2_000)) return;
-	if (!stillOwned()) return;
-	process.kill(discovery.pid, "SIGKILL");
-	if (!(await waitForExit(2_000))) throw new Error(`Test broker ${discovery.pid} did not exit after SIGKILL.`);
-}
-
 async function liveLifecycleSession(root: string, agentDir: string, sessionId: string, staleMarkerFirst = false) {
 	const stateRoot = path.join(root, ".gjc", "state");
 	const request = {
@@ -354,7 +337,7 @@ test("lifecycle child ignores a stale marker until its current effect marker rep
 test("lifecycle host rejects a transcript replaced after strict authorization before it can be consumed", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-transcript-race-"));
 	const agentDir = path.join(root, "agent");
-	const session = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+	const session = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 	try {
 		await session.ensureOnDisk();
 		const sessionPath = session.getSessionFile();
@@ -366,7 +349,7 @@ test("lifecycle host rejects a transcript replaced after strict authorization be
 		const candidate = inventory.candidates.find(item => item.path === sessionPath);
 		if (!candidate) throw new Error("Expected strict session candidate.");
 		const replacementPath = `${sessionPath}.replacement`;
-		await fs.writeFile(replacementPath, `${await fs.readFile(sessionPath, "utf8")}\n`);
+		await fs.writeFile(replacementPath, `${await fs.readFile(sessionPath, "utf8")}\n`, { mode: 0o600 });
 		const originalCapture = SessionManager.captureTranscriptStrict;
 		let replaced = false;
 		const replaceAfterAuthorization: typeof SessionManager.captureTranscriptStrict = (filePath, storage) => {
@@ -421,7 +404,7 @@ test("lifecycle fork rejects a source replaced after capture without destination
 	const targetCwd = path.join(root, "target");
 	await fs.mkdir(sourceCwd, { recursive: true });
 	await fs.mkdir(targetCwd, { recursive: true });
-	const source = SessionManager.create(sourceCwd, SessionManager.getDefaultSessionDir(sourceCwd, agentDir));
+	const source = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, agentDir));
 	try {
 		await source.ensureOnDisk();
 		const sourcePath = source.getSessionFile();
@@ -851,7 +834,7 @@ test("broker rejects a cross-workspace cold fork source before spawning", async 
 	try {
 		await fs.mkdir(sourceCwd, { recursive: true });
 		await fs.mkdir(targetCwd, { recursive: true });
-		const source = SessionManager.create(sourceCwd, SessionManager.getDefaultSessionDir(sourceCwd, agentDir));
+		const source = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, agentDir));
 		await source.ensureOnDisk();
 		const sourcePath = source.getSessionFile();
 		if (!sourcePath) throw new Error("Expected source session path.");
@@ -905,7 +888,7 @@ test("broker rejects duplicate owned source candidates before spawning", async (
 		const createDuplicate = async (suffix: string) => {
 			process.env.GJC_LIFECYCLE_REQUEST_ID = `duplicate-prepare-${suffix}`;
 			process.env.GJC_SESSION_ID = "duplicate-owned-source";
-			const session = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+			const session = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 			await session.ensureOnDisk();
 			const sourcePath = session.getSessionFile();
 			if (!sourcePath) throw new Error("Expected duplicate owned source path.");
@@ -990,7 +973,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		if (scopeResult.kind !== "resolved") throw new Error(scopeResult.message);
 		const sourceDir = SessionManager.getDefaultSessionDir(root, agentDir);
 		expect(sourceDir).toBe(scopeResult.scope.directoryPath);
-		const source = SessionManager.create(root, sourceDir);
+		const source = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 		await source.ensureOnDisk();
 		const sourceId = source.getSessionId();
 		const sourcePath = source.getSessionFile();
@@ -1169,7 +1152,7 @@ test("broker replays one identity-bound lifecycle metadata cleanup plan after th
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-delete-metadata-crash-"));
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(root, ".gjc", "state");
-	const saved = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+	const saved = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 	let crashing: Broker | undefined;
 	let reopened: Broker | undefined;
 	try {
@@ -1265,7 +1248,7 @@ test("broker uses incarnation-aware observations before fresh lifecycle metadata
 			["matching", "closed-incarnation", false],
 			["unreadable", undefined, false],
 		] as const) {
-			const saved = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+			const saved = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 			await saved.ensureOnDisk();
 			const sessionId = saved.getSessionId();
 			const sessionPath = saved.getSessionFile();
@@ -1313,7 +1296,7 @@ test("broker refuses fresh lifecycle cleanup when ready sibling has a different 
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-mismatched-ready-cleanup-"));
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(root, ".gjc", "state");
-	const saved = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+	const saved = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 	const broker = new Broker({ agentDir });
 	try {
 		await saved.ensureOnDisk();
@@ -1322,8 +1305,10 @@ test("broker refuses fresh lifecycle cleanup when ready sibling has a different 
 		if (!sessionPath) throw new Error("Expected persisted delete transcript.");
 		await saved.close();
 		const artifactsPath = sessionPath.slice(0, -6);
-		await fs.mkdir(path.join(artifactsPath, "nested"), { recursive: true });
-		await fs.writeFile(path.join(artifactsPath, "nested", "preserve.txt"), "preserve mismatch artifacts");
+		await fs.mkdir(path.join(artifactsPath, "nested"), { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsPath, "nested", "preserve.txt"), "preserve mismatch artifacts", {
+			mode: 0o600,
+		});
 
 		await broker.start();
 		await expect(
@@ -1391,7 +1376,7 @@ test("broker preserves ready-only lifecycle metadata without canonical marker au
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ready-only-cleanup-"));
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(root, ".gjc", "state");
-	const saved = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+	const saved = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 	const broker = new Broker({ agentDir });
 	try {
 		await saved.ensureOnDisk();
@@ -1400,8 +1385,10 @@ test("broker preserves ready-only lifecycle metadata without canonical marker au
 		if (!sessionPath) throw new Error("Expected persisted delete transcript.");
 		await saved.close();
 		const artifactsPath = sessionPath.slice(0, -6);
-		await fs.mkdir(path.join(artifactsPath, "nested"), { recursive: true });
-		await fs.writeFile(path.join(artifactsPath, "nested", "preserve.txt"), "preserve ready-only artifacts");
+		await fs.mkdir(path.join(artifactsPath, "nested"), { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(artifactsPath, "nested", "preserve.txt"), "preserve ready-only artifacts", {
+			mode: 0o600,
+		});
 
 		const deadOwner = Bun.spawn([process.execPath, "-e", ""]);
 		await deadOwner.exited;
@@ -2202,7 +2189,7 @@ await fs.rm(endpoint);
 `,
 		);
 		process.env.GJC_SDK_SESSION_COMMAND = `${process.execPath} ${fixture}`;
-		const saved = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+		const saved = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 		await saved.ensureOnDisk();
 		const sessionId = saved.getSessionId();
 		const sessionPath = saved.getSessionFile();
@@ -2272,7 +2259,7 @@ await fs.rm(endpoint);
 		const normalAgentDir = path.join(normalRoot, "agent");
 		const normalSaved = SessionManager.create(
 			normalRoot,
-			SessionManager.getDefaultSessionDir(normalRoot, normalAgentDir),
+			SessionManager.managedDestination(normalRoot, normalAgentDir),
 		);
 		try {
 			await normalSaved.ensureOnDisk();
@@ -2698,7 +2685,7 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-resume-live-"));
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(root, ".gjc", "state");
-	const savedSession = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, agentDir));
+	const savedSession = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 	await savedSession.ensureOnDisk();
 	const sessionId = savedSession.getSessionId();
 	const sessionPath = savedSession.getSessionFile();
@@ -2913,6 +2900,8 @@ test("shipped sdk session-host-internal stays alive only after a semantic ready 
 	const agentDir = path.join(root, "agent");
 	const sessionId = "shipped-subprocess";
 	brokerDirs.push(agentDir);
+	const brokerFixture = await startFixtureBrokerWithLeaseForTest({ agentDir });
+	expect(brokerOwnerForTest(agentDir)).toBeDefined();
 	try {
 		const { child, endpoint } = await liveLifecycleSession(root, agentDir, sessionId);
 		const client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 2_000, reconnectAttempts: 0 });
@@ -2939,7 +2928,8 @@ test("shipped sdk session-host-internal stays alive only after a semantic ready 
 		);
 		expect(broker.url).toStartWith("ws://127.0.0.1:");
 	} finally {
-		await stopDiscoveredBroker(agentDir);
+		await brokerFixture.lease.close();
+		expect(brokerOwnerForTest(agentDir)).toBeUndefined();
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);

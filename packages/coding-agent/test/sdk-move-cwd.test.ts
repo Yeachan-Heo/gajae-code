@@ -36,7 +36,7 @@ describe("createAgentSession cwd after /move", () => {
 		fs.mkdirSync(cwdA, { recursive: true });
 		fs.mkdirSync(cwdB, { recursive: true });
 
-		const sessionManager = SessionManager.create(cwdA, path.join(tempDir, "sessions"));
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
 		const { session } = await createAgentSession({
 			cwd: cwdA,
 			agentDir: tempDir,

@@ -5,13 +5,15 @@
  * .bashrc/.zshrc, which can be sourced before each command to provide a familiar
  * shell experience.
  */
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 
-const cachedSnapshotPaths = new Map<string, string>();
 const SNAPSHOT_TIMEOUT_MS = 2_000;
+const SNAPSHOT_ROOT_PREFIX = "gjc-shell-snapshots-";
+const PRIVATE_DIRECTORY_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
 
 function sanitizeSnapshotEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
 	const sanitized = { ...env };
@@ -23,8 +25,7 @@ function sanitizeSnapshotEnv(env: Record<string, string | undefined>): Record<st
 /**
  * Get the user's shell config file path.
  */
-function getShellConfigFile(shell: string): string {
-	const home = os.homedir();
+function getShellConfigFile(shell: string, home: string): string {
 	if (shell.includes("zsh")) return path.join(home, ".zshrc");
 	if (shell.includes("bash")) return path.join(home, ".bashrc");
 	return path.join(home, ".profile");
@@ -35,8 +36,7 @@ function getShellConfigFile(shell: string): string {
  * This script sources the user's rc file and extracts functions, aliases, and options.
  * Matches Anthropic Code's snapshot generation logic.
  */
-function generateSnapshotScript(shell: string, snapshotPath: string, rcFile: string): string {
-	const hasRcFile = fs.existsSync(rcFile);
+function generateSnapshotScript(shell: string, snapshotPath: string, rcFile: string, hasRcFile: boolean): string {
 	const isZsh = shell.includes("zsh");
 	const commonToolsRegex =
 		"^(ls|dir|vdir|cat|head|tail|less|more|grep|egrep|fgrep|rg|find|fd|locate|sed|awk|perl|cp|mv|rm|mkdir|rmdir|touch|chmod|chown|ln|pwd|readlink|stat|cut|sort|uniq|xargs|tee|tr|basename|dirname)$";
@@ -79,6 +79,7 @@ echo "shopt -s expand_aliases" >> "$SNAPSHOT_FILE"
 `;
 
 	return `
+umask 077
 SNAPSHOT_FILE='${escapedPath}'
 
 # Source user's rc file if it exists
@@ -114,6 +115,174 @@ fi
 `.trim();
 }
 
+interface ShellSnapshotCacheOptions {
+	tempRoot: string;
+	home: string | (() => string);
+	platform: NodeJS.Platform;
+}
+
+function ownedByCurrentUser(uid: number): boolean {
+	return typeof process.getuid !== "function" || uid === process.getuid();
+}
+
+async function isTrustedSnapshot(snapshotPath: string): Promise<boolean> {
+	try {
+		const stat = await fs.lstat(snapshotPath);
+		return stat.isFile() && !stat.isSymbolicLink() && ownedByCurrentUser(stat.uid) && (stat.mode & 0o077) === 0;
+	} catch {
+		return false;
+	}
+}
+
+function createShellSnapshotCache(options: ShellSnapshotCacheOptions) {
+	const cachedPaths = new Map<string, string>();
+	const inFlight = new Map<string, Promise<string | null>>();
+	let rootPath: string | null = null;
+	let rootInitialization: Promise<string> | null = null;
+	let cleanupAttempt: Promise<void> | null = null;
+	let cleaningUp = false;
+	let lifecycle = 0;
+
+	async function initializeRoot(): Promise<string> {
+		const root = await fs.mkdtemp(path.join(options.tempRoot, SNAPSHOT_ROOT_PREFIX));
+		try {
+			await fs.chmod(root, PRIVATE_DIRECTORY_MODE);
+			const stat = await fs.lstat(root);
+			if (
+				!stat.isDirectory() ||
+				stat.isSymbolicLink() ||
+				!ownedByCurrentUser(stat.uid) ||
+				(stat.mode & 0o777) !== 0o700
+			) {
+				throw new Error("Shell snapshot root is not owner-private");
+			}
+			return root;
+		} catch (error) {
+			await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+			throw error;
+		}
+	}
+
+	async function getRoot(): Promise<string> {
+		if (rootPath) return rootPath;
+		if (rootInitialization) return await rootInitialization;
+		const attempt = initializeRoot();
+		rootInitialization = attempt;
+		try {
+			rootPath = await attempt;
+			return rootPath;
+		} catch (error) {
+			if (rootInitialization === attempt) rootInitialization = null;
+			throw error;
+		}
+	}
+
+	async function createSnapshot(shell: string, env: Record<string, string | undefined>): Promise<string | null> {
+		const root = await getRoot();
+		const shellName = shell.includes("zsh") ? "zsh" : shell.includes("bash") ? "bash" : "sh";
+		const snapshotPath = path.join(root, `snapshot-${shellName}-${crypto.randomUUID()}.sh`);
+		let keep = false;
+		try {
+			const handle = await fs.open(snapshotPath, "wx", PRIVATE_FILE_MODE);
+			try {
+				await handle.chmod(PRIVATE_FILE_MODE);
+			} finally {
+				await handle.close();
+			}
+
+			const home = typeof options.home === "function" ? options.home() : options.home;
+			const rcFile = getShellConfigFile(shell, home);
+			const script = generateSnapshotScript(shell, snapshotPath, rcFile, await Bun.file(rcFile).exists());
+			const snapshotEnv = sanitizeSnapshotEnv(env);
+			const spawnEnv: Record<string, string> = {};
+			for (const [key, value] of Object.entries(snapshotEnv)) {
+				if (value !== undefined) spawnEnv[key] = value;
+			}
+			const child = Bun.spawn([shell, "-c", script], {
+				env: spawnEnv,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+				timeout: SNAPSHOT_TIMEOUT_MS,
+				killSignal: "SIGKILL",
+			});
+
+			await child.exited;
+			if (child.exitCode === 0 && (await isTrustedSnapshot(snapshotPath))) {
+				cachedPaths.set(shell, snapshotPath);
+				keep = true;
+				return snapshotPath;
+			}
+		} catch {
+			// Snapshot creation failed, proceed without it.
+		} finally {
+			if (!keep) await fs.unlink(snapshotPath).catch(() => {});
+		}
+		return null;
+	}
+
+	return {
+		async getOrCreateSnapshot(shell: string, env: Record<string, string | undefined>) {
+			if (options.platform === "win32" || cleaningUp) return null;
+			const currentLifecycle = lifecycle;
+			const cached = cachedPaths.get(shell);
+			if (cached && (await isTrustedSnapshot(cached))) {
+				return cleaningUp || lifecycle !== currentLifecycle ? null : cached;
+			}
+			if (cleaningUp || lifecycle !== currentLifecycle) return null;
+			if (cached) cachedPaths.delete(shell);
+			const pending = inFlight.get(shell);
+			if (pending) {
+				const snapshot = await pending;
+				return cleaningUp || lifecycle !== currentLifecycle ? null : snapshot;
+			}
+			const attempt = createSnapshot(shell, env);
+			inFlight.set(shell, attempt);
+			try {
+				const snapshot = await attempt;
+				return cleaningUp || lifecycle !== currentLifecycle ? null : snapshot;
+			} finally {
+				if (inFlight.get(shell) === attempt) inFlight.delete(shell);
+			}
+		},
+		async cleanup() {
+			if (cleanupAttempt) return await cleanupAttempt;
+			const attempt = (async () => {
+				cleaningUp = true;
+				lifecycle += 1;
+				try {
+					const pending: Promise<unknown>[] = [...inFlight.values()];
+					if (rootInitialization) pending.push(rootInitialization);
+					await Promise.allSettled(pending);
+					const root = rootPath ?? (await rootInitialization?.catch(() => null)) ?? null;
+					cachedPaths.clear();
+					inFlight.clear();
+					rootPath = null;
+					rootInitialization = null;
+					if (root) await fs.rm(root, { recursive: true, force: true });
+				} finally {
+					cleaningUp = false;
+				}
+			})();
+			cleanupAttempt = attempt;
+			try {
+				await attempt;
+			} finally {
+				if (cleanupAttempt === attempt) cleanupAttempt = null;
+			}
+		},
+	};
+}
+
+/** @internal Test-only factory for isolated filesystem and platform assertions. */
+export const createShellSnapshotCacheForTesting = createShellSnapshotCache;
+
+const processSnapshotCache = createShellSnapshotCache({
+	tempRoot: os.tmpdir(),
+	home: () => os.homedir(),
+	platform: process.platform,
+});
+
 /**
  * Create a shell snapshot, caching the result.
  * Returns the path to the snapshot file, or null if creation failed.
@@ -122,66 +291,7 @@ export async function getOrCreateSnapshot(
 	shell: string,
 	env: Record<string, string | undefined>,
 ): Promise<string | null> {
-	const cacheKey = shell;
-	// Return cached snapshot if valid
-	const cached = cachedSnapshotPaths.get(cacheKey);
-	if (cached && fs.existsSync(cached)) {
-		return cached;
-	}
-	if (cached) {
-		cachedSnapshotPaths.delete(cacheKey);
-	}
-
-	// Skip on Windows (no .bashrc in standard location)
-	if (process.platform === "win32") {
-		return null;
-	}
-
-	const rcFile = getShellConfigFile(shell);
-
-	// Create snapshot directory
-	const snapshotDir = path.join(os.tmpdir(), "gjc-shell-snapshots");
-	fs.mkdirSync(snapshotDir, { recursive: true });
-
-	// Generate unique snapshot path
-	const shellName = shell.includes("zsh") ? "zsh" : shell.includes("bash") ? "bash" : "sh";
-	const snapshotPath = path.join(snapshotDir, `snapshot-${shellName}-${crypto.randomUUID()}.sh`);
-
-	// Generate and execute snapshot script
-	const script = generateSnapshotScript(shell, snapshotPath, rcFile);
-
-	try {
-		const snapshotEnv = sanitizeSnapshotEnv(env);
-		const spawnEnv: Record<string, string> = {};
-		for (const [key, value] of Object.entries(snapshotEnv)) {
-			if (value !== undefined) {
-				spawnEnv[key] = value;
-			}
-		}
-		const child = Bun.spawn([shell, "-c", script], {
-			env: spawnEnv,
-			stdin: "ignore",
-			stdout: "ignore",
-			stderr: "ignore",
-			timeout: SNAPSHOT_TIMEOUT_MS,
-			killSignal: "SIGKILL",
-		});
-
-		await child.exited;
-		if (child.exitCode === 0 && fs.existsSync(snapshotPath)) {
-			cachedSnapshotPaths.set(cacheKey, snapshotPath);
-			return snapshotPath;
-		}
-	} catch {
-		// Snapshot creation failed, proceed without it
-	}
-
-	return null;
+	return await processSnapshotCache.getOrCreateSnapshot(shell, env);
 }
 
-postmortem.register("shell-snapshot", () => {
-	for (const snapshotPath of cachedSnapshotPaths.values()) {
-		fs.unlinkSync(snapshotPath);
-	}
-	cachedSnapshotPaths.clear();
-});
+postmortem.register("shell-snapshot", () => processSnapshotCache.cleanup());

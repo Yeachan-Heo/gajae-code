@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
-import { isEnoent } from "@gajae-code/utils";
+import { isEnoent } from "@gajae-code/utils/fs-error";
 import { InternalUrlRouter } from "../internal-urls";
 import { ToolError } from "./tool-errors";
 
@@ -10,13 +10,9 @@ const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const FILE_LINE_RANGE_RE = /^(?:L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|raw|conflicts)$/i;
 const FILE_LINE_RANGE_ONLY_RE = /^L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*$/i;
 const FILE_RAW_ONLY_RE = /^raw$/i;
-// Permissive selector chunk for internal URLs — accepts well-formed selectors
-// plus common malformed shapes (e.g. `:-N`) so the read tool peels the entire
-// selector chain off before dispatching to a protocol handler.
-const INTERNAL_URL_SELECTOR_PART_RE =
-	/^(?:raw|conflicts|L?\d+(?:[-+]L?\d+|-)?(?:,L?\d+(?:[-+]L?\d+|-)?)*|-\d+(?:[-+]\d+)?)$/i;
-// Schemes whose host grammar is identifier-shaped, so any trailing
-// `:<selector-chunk>` is unambiguously a read-tool selector.
+// Schemes whose authority grammar is identifier-shaped and may therefore carry
+// a read selector immediately after the authority. Colons in a path, query, or
+// fragment remain part of the URL and are never considered selectors.
 const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
 	agent: true,
 	artifact: true,
@@ -148,39 +144,50 @@ export function splitPathAndSel(rawPath: string): { path: string; sel?: string }
 /**
  * Variant of {@link splitPathAndSel} for internal URLs (`scheme://...`).
  *
- * The filesystem-path splitter is intentionally conservative: it refuses to
- * peel a trailing `:<chunk>` unless that chunk matches the strict selector
- * grammar. That rule is right for filesystem paths (a file named `a:1-50` is
- * legal) but wrong for internal URLs, where any trailing `:<chunk>` after the
- * scheme is unambiguously a read-tool selector — even if malformed (e.g.
- * `artifact://3:raw:-100`).
- *
- * This function iteratively peels selector-shaped chunks (well-formed plus
- * common malformed shapes like `:-N`) so the rest of the read tool can pass a
- * clean URL to the protocol handler and surface selector errors via parseSel
- * instead of as misleading "host invalid" errors from the handler.
- *
- * Falls back to the input unchanged when nothing matches.
+ * Artifact authorities are generated identifiers, so their complete tail is
+ * unambiguously a selector and malformed selectors can be rejected before
+ * resolving the artifact. Other resources may legitimately use colons in
+ * their identities, so they only lose strict, recognized selector suffixes.
+ * Skill authorities additionally use the active registry to distinguish a
+ * skill name from its selector without making path-utils depend on skills.
  */
-export function splitInternalUrlSel(rawPath: string): { path: string; sel?: string } {
+export function splitInternalUrlSel(
+	rawPath: string,
+	options: { activeSkillNames?: readonly string[] } = {},
+): { path: string; sel?: string } {
 	const schemeMatch = rawPath.match(INTERNAL_URL_SCHEME_RE);
 	if (!schemeMatch) return { path: rawPath };
-	if (!INTERNAL_SCHEMES_WITH_SELECTORS[schemeMatch[1].toLowerCase()]) return { path: rawPath };
+	const scheme = schemeMatch[1].toLowerCase();
+	if (!INTERNAL_SCHEMES_WITH_SELECTORS[scheme]) return { path: rawPath };
 
 	const schemeEnd = schemeMatch[0].length;
-	let path = rawPath;
-	const chunks: string[] = [];
-	while (true) {
-		const colon = path.lastIndexOf(":");
-		// Stop before crossing into the scheme separator `://`.
-		if (colon < schemeEnd) break;
-		const tail = path.slice(colon + 1);
-		if (!INTERNAL_URL_SELECTOR_PART_RE.test(tail)) break;
-		chunks.unshift(tail);
-		path = path.slice(0, colon);
+	const authorityTerminator = rawPath.slice(schemeEnd).search(/[/?#]/);
+	if (authorityTerminator !== -1) return { path: rawPath };
+	const authority = rawPath.slice(schemeEnd);
+	const firstColon = authority.indexOf(":");
+	if (firstColon === -1) return { path: rawPath };
+
+	if (scheme === "artifact") {
+		return { path: rawPath.slice(0, schemeEnd + firstColon), sel: authority.slice(firstColon + 1) };
 	}
-	if (chunks.length === 0) return { path: rawPath };
-	return { path, sel: chunks.join(":") };
+
+	if (scheme === "skill") {
+		const activeSkillNames = options.activeSkillNames ?? [];
+		if (activeSkillNames.includes(authority)) return { path: rawPath };
+		const skillName = activeSkillNames
+			.filter(name => authority.startsWith(`${name}:`))
+			.sort((a, b) => b.length - a.length)[0];
+		if (skillName) {
+			return {
+				path: `${rawPath.slice(0, schemeEnd)}${skillName}`,
+				sel: authority.slice(skillName.length + 1),
+			};
+		}
+	}
+
+	const strict = splitPathAndSel(authority);
+	if (strict.sel === undefined) return { path: rawPath };
+	return { path: `${rawPath.slice(0, schemeEnd)}${strict.path}`, sel: strict.sel };
 }
 
 function assertNotInternalUrl(expanded: string, original: string): void {

@@ -115,6 +115,8 @@ export interface OwnerOptions {
 	controlServerFactory?: (socketPath: string, handler: EndpointHandler) => ControlServer;
 	/** Test seam for deterministic lease-release teardown failures. */
 	leaseRelease?: typeof releaseLease;
+	/** Test seam for deterministic lease-heartbeat behavior (e.g. renewal barriers). */
+	leaseHeartbeat?: typeof heartbeat;
 	/** Test seams for frame persistence failures. */
 	framePersistence?: {
 		appendEvent?: typeof appendEvent;
@@ -150,6 +152,11 @@ export class RuntimeOwner {
 	#leaseEpoch = 0;
 	#leaseHeld = false;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
+	#heartbeatFenced = false;
+	// Every renewal the heartbeat interval starts is tracked here until it settles.
+	// Teardown drains the whole set so no already-started renewal can still be
+	// polling the lease mutation lock when releaseLease runs.
+	#heartbeatInFlight = new Set<Promise<unknown>>();
 	#socketPath: string;
 	#finalizeChecks?: FinalizeChecks;
 	#validationCommands?: ValidationCommandSpec[];
@@ -179,6 +186,7 @@ export class RuntimeOwner {
 			cleanupRetryMs: opts.cleanupRetryMs ?? DEFAULT_CLEANUP_RETRY_MS,
 			cleanupRetryLimit: opts.cleanupRetryLimit ?? Number.POSITIVE_INFINITY,
 			leaseRelease: opts.leaseRelease ?? releaseLease,
+			leaseHeartbeat: opts.leaseHeartbeat ?? heartbeat,
 		};
 		this.#finalizeChecks = opts.finalizeChecks;
 		this.#validationCommands = opts.validationCommands;
@@ -230,9 +238,23 @@ export class RuntimeOwner {
 		this.#leaseHeld = true;
 		this.#leaseEpoch = lease.leaseEpoch;
 		this.#heartbeatTimer = setInterval(() => {
-			void heartbeat(root, sessionId, this.ownerId, this.#opts.ttlMs, this.#opts.clock).catch(err => {
-				// Self-stop if a legitimate dead-owner takeover revoked our lease.
-				if (err instanceof Error && err.message.includes("not_lease_holder")) void this.stop().catch(() => {});
+			// Once teardown fences the heartbeat we must never start a renewal again:
+			// a renewal here would contend the lease mutation lock with the release
+			// path and can starve it (lease_lock_timeout).
+			if (this.#heartbeatFenced) return;
+			const renewal = this.#opts
+				.leaseHeartbeat(root, sessionId, this.ownerId, this.#opts.ttlMs, this.#opts.clock)
+				.catch(err => {
+					// Self-stop if a legitimate dead-owner takeover revoked our lease.
+					if (err instanceof Error && err.message.includes("not_lease_holder")) void this.stop().catch(() => {});
+				});
+			// Track every in-flight renewal so teardown can drain them ALL before
+			// releasing the lease. setInterval can start a new renewal before the
+			// previous one settles, and lock acquisition is non-FIFO, so awaiting only
+			// the latest would leave an older renewal able to contend releaseLease.
+			this.#heartbeatInFlight.add(renewal);
+			void renewal.finally(() => {
+				this.#heartbeatInFlight.delete(renewal);
 			});
 		}, this.#opts.heartbeatMs);
 		this.#heartbeatTimer.unref?.();
@@ -876,6 +898,14 @@ export class RuntimeOwner {
 		}
 		if (!this.#serverClosed) throw new AggregateError(failures, "Runtime owner endpoint cleanup failed.");
 
+		// Transport and endpoint are verified closed, so we are committed to
+		// surrendering the lease. Stop, fence, and join the heartbeat first: an
+		// in-flight or scheduled renewal would otherwise contend the lease mutation
+		// lock with releaseLease and can starve it (lease_lock_timeout). Fencing
+		// before release preserves exact-owner fencing — a fenced owner never renews,
+		// so it can neither revive its own lease nor touch a successor's.
+		await this.#fenceHeartbeat();
+
 		if (this.#leaseHeld) {
 			try {
 				await this.#opts.leaseRelease(this.#opts.root, this.#opts.sessionId, this.ownerId);
@@ -892,11 +922,37 @@ export class RuntimeOwner {
 		}
 		if (this.#leaseHeld) throw new AggregateError(failures, "Runtime owner lease cleanup failed.");
 
+		// Heartbeat was already fenced before the lease release above; this is a
+		// defensive no-op that also covers any path that skipped the release stage.
 		if (this.#heartbeatTimer) {
 			clearInterval(this.#heartbeatTimer);
 			this.#heartbeatTimer = null;
 		}
 		if (failures.length > 0) throw new AggregateError(failures, "Runtime owner cleanup failed.");
+	}
+
+	/**
+	 * Permanently stop the lease heartbeat and drain every in-flight renewal.
+	 *
+	 * Fencing is terminal: `#heartbeatFenced` stays set so no scheduled interval
+	 * callback can start a new renewal after teardown begins. The interval is
+	 * cleared, then EVERY renewal already started (there may be more than one, since
+	 * `setInterval` does not wait for the async `heartbeat()` of a prior tick) is
+	 * awaited so each releases the lease mutation lock before the release path
+	 * acquires it. This eliminates heartbeat/release self-contention on the
+	 * non-FIFO lock (lease_lock_timeout) without weakening exact-owner fencing.
+	 */
+	async #fenceHeartbeat(): Promise<void> {
+		this.#heartbeatFenced = true;
+		if (this.#heartbeatTimer) {
+			clearInterval(this.#heartbeatTimer);
+			this.#heartbeatTimer = null;
+		}
+		// Snapshot then drain: no new renewal can be added once fenced, so this
+		// settles every renewal that could still hold or be waiting on the lock.
+		const inFlight = [...this.#heartbeatInFlight];
+		this.#heartbeatInFlight.clear();
+		if (inFlight.length > 0) await Promise.allSettled(inFlight);
 	}
 }
 

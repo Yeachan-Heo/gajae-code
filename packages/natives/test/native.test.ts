@@ -15,6 +15,8 @@ import {
 	invalidateFsScanCache,
 	listWorkspace,
 	MacOSPowerAssertion,
+	Process,
+	ProcessStatus,
 	PtySession,
 	summarizeCode,
 	truncateToWidth,
@@ -88,6 +90,50 @@ describe("pi-natives", () => {
 	it("keeps native crash diagnostics opt-in", () => {
 		delete process.env.GJC_NATIVE_CRASH_DIAGNOSTICS;
 		expect(initNativeCrashDiagnostics()).toBe(false);
+	});
+
+	it("signals only the pinned root process", async () => {
+		if (process.platform === "darwin") return;
+
+		const childPidPath = path.join(testDir, `signal-root-child-${crypto.randomUUID()}.pid`);
+		const childProgram = "setInterval(() => {}, 1_000);";
+		const rootProgram = `
+			const fs = require("node:fs");
+			const child = Bun.spawn([process.execPath, "-e", ${JSON.stringify(childProgram)}], { detached: true, stdio: ["ignore", "ignore", "ignore"] });
+			fs.writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));
+			setInterval(() => {}, 1_000);
+		`;
+		const root = Bun.spawn([process.execPath, "-e", rootProgram], { stdio: ["ignore", "ignore", "ignore"] });
+		let childPid: number | undefined;
+		try {
+			for (let attempt = 0; attempt < 100 && childPid === undefined; attempt++) {
+				const marker = Bun.file(childPidPath);
+				if (!(await marker.exists())) {
+					await Bun.sleep(10);
+					continue;
+				}
+				const pid = Number.parseInt(await marker.text(), 10);
+				if (Number.isSafeInteger(pid) && pid > 0) childPid = pid;
+				else await Bun.sleep(10);
+			}
+			expect(childPid).toBeDefined();
+			if (childPid === undefined) return;
+
+			const rootReference = Process.fromPid(root.pid);
+			expect(rootReference).not.toBeNull();
+			expect(rootReference?.signalRoot(os.constants.signals.SIGTERM)).toBe(true);
+			await root.exited;
+
+			const childReference = Process.fromPid(childPid);
+			expect(childReference).not.toBeNull();
+			expect(childReference?.signalRoot(os.constants.signals.SIGKILL)).toBe(true);
+			expect(await childReference?.waitForExit({ timeoutMs: 2_000 })).toBe(true);
+			expect(childReference?.status()).toBe(ProcessStatus.Exited);
+		} finally {
+			if (childPid) Process.fromPid(childPid)?.signalRoot(os.constants.signals.SIGKILL);
+			Process.fromPid(root.pid)?.signalRoot(os.constants.signals.SIGKILL);
+			await fs.rm(childPidPath, { force: true });
+		}
 	});
 
 	describe("summarize", () => {

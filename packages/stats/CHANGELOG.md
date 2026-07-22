@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Compiled dashboard assets now remain in a validated in-memory archive map instead of being materialized in a predictable shared temporary cache.
+
 ## [0.5.1] - 2026-06-14
 
 - Version aligned with the 0.5.1 monorepo release; no functional changes in this package.

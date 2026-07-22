@@ -1,7 +1,7 @@
 Interacts with Language Server Protocol servers for code intelligence.
 
 <operations>
-- `diagnostics`: Get errors/warnings for a file, a glob of files, or the entire workspace (`file: "*"`)
+- `diagnostics`: Get errors/warnings for a concrete file or a glob of files
 - `definition`: Go to symbol definition → file path + position + 3-line source context
 - `type_definition`: Go to symbol type definition → file path + position + 3-line source context
 - `implementation`: Find concrete implementations → file path + position + 3-line source context
@@ -18,7 +18,7 @@ Interacts with Language Server Protocol servers for code intelligence.
 </operations>
 
 <parameters>
-- `file`: File path, glob pattern (e.g. `src/**/*.ts`), or `"*"` for workspace scope. Globs are expanded locally before dispatch. `"*"` routes `diagnostics`/`symbols`/`reload` to their workspace-wide form.
+- `file`: File path, glob pattern (e.g. `src/**/*.ts`), or `"*"` for workspace scope where supported. Globs are expanded locally before dispatch. `"*"` routes `symbols`/`reload` to their workspace-wide form; workspace build diagnostics are unavailable through `lsp`.
 - `line`: 1-indexed line number for position-based actions
 - `symbol`: Substring on the target line used to resolve column automatically. Append `#N` to pick the Nth occurrence on that line (1-indexed; default 1) — e.g. `foo#2` selects the second `foo`.
 - `query`: Symbol search query, code-action kind filter / selector (list/apply mode), or LSP method name when `action: request`
@@ -31,7 +31,7 @@ Interacts with Language Server Protocol servers for code intelligence.
 <caution>
 - Requires running LSP server for target language
 - Some operations require file to be saved to disk
-- Glob expansion samples up to 20 files per request; use `file: "*"` for broader coverage
+- Glob expansion samples up to 20 files per request; narrow broad patterns when they exceed that limit
 - When `symbol` is provided for position-based actions, missing symbols or out-of-bounds `#N` occurrence selectors return an explicit error instead of silently falling back
 </caution>
 

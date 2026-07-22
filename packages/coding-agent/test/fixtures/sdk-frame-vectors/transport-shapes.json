@@ -1,0 +1,14 @@
+{
+  "$schema": "sdk-frame-vectors/v1",
+  "kind": "record",
+  "name": "auth preface and transport failure shapes",
+  "lines": {
+    "authSuccess": "gjc-sdk-transport/1 token=discovery-token-required\n",
+    "authFailure": "{\"type\":\"transport_error\",\"code\":\"auth_failed\"}\n"
+  },
+  "frames": [
+    { "type": "disconnect", "code": "peer_closed" },
+    { "type": "transport_error", "code": "auth_failed" }
+  ],
+  "expectations": { "authPrefaceVersion": 1, "failureType": "transport_error" }
+}

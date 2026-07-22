@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Args, Command, Flags } from "@gajae-code/utils/cli";
+import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
 import { Broker } from "../sdk/broker/broker";
+import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
@@ -24,6 +25,7 @@ import {
 	type SdkStartupRollbackResult,
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
+import { runSdkServe } from "../sdk/transport/serve-cli";
 import {
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
@@ -166,7 +168,7 @@ export async function openLifecycleSessionManager(
 	if (request.operation === "session.resume") {
 		const opened = await SessionManager.openExistingStrict(
 			snapshot.identity,
-			parsed.sessionDir,
+			SessionManager.managedDestination(cwd, agentDir),
 			undefined,
 			migrationPolicy,
 		);
@@ -180,7 +182,12 @@ export async function openLifecycleSessionManager(
 			throw error;
 		}
 	} else {
-		const forked = await SessionManager.forkFromCaptured(snapshot, cwd, parsed.sessionDir, migrationPolicy);
+		const forked = await SessionManager.forkFromCaptured(
+			snapshot,
+			cwd,
+			SessionManager.managedDestination(cwd, agentDir),
+			migrationPolicy,
+		);
 		if (forked.kind === "error")
 			throw new Error("Lifecycle saved session authority changed while the session host forked it.");
 		sessionManager = forked.manager;
@@ -417,19 +424,51 @@ export async function runSessionHost(
 	await new Promise<void>(() => {});
 }
 
+export type SdkInternalArgv = { action: "broker-internal"; agentDir: string } | { action: "session-host-internal" };
+
+/** Parses the exact private argv contracts used by SDK child-process spawns. */
+export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
+	if (argv[0] === "session-host-internal" && argv.length === 1) return { action: "session-host-internal" };
+	if (argv[0] === "broker-internal" && argv.length === 3 && argv[1] === "--agent-dir" && argv[2])
+		return { action: "broker-internal", agentDir: argv[2] };
+	throw new CliParseError("Invalid internal SDK invocation.");
+}
+
+class SdkServeHelp extends Command {
+	static description = "gjc sdk serve --stdio | --socket <path> [--session <id>] [--pending-ceiling <bytes>]";
+	static flags = {
+		stdio: Flags.boolean({ description: "Serve SDK frames over standard input and output" }),
+		socket: Flags.string({ description: "Serve SDK frames over a Unix socket path" }),
+		session: Flags.string({ description: "Attach to a specific SDK session" }),
+		"pending-ceiling": Flags.string({ description: "Maximum queued relay bytes per direction" }),
+	};
+	async run(): Promise<void> {}
+}
+
 export default class Sdk extends Command {
-	static description = "SDK internal services";
-	static hidden = true;
-	static args = { action: Args.string({ required: true, options: ["broker-internal", "session-host-internal"] }) };
-	static flags = { "agent-dir": Flags.string({ description: "Internal broker agent directory" }) };
+	static description = "gjc sdk serve --stdio | --socket <path> [--session <id>] [--pending-ceiling <bytes>]";
+	static hidden = false;
+	static delegateHelp = true;
+	static args = { action: Args.string({ required: false, options: ["serve"] }) };
+	static flags = SdkServeHelp.flags;
 	async run(): Promise<void> {
-		const { args, flags } = await this.parse(Sdk);
-		if (args.action === "session-host-internal") {
+		const action = this.argv[0];
+		if (this.argv.includes("--help") || this.argv.includes("-h")) {
+			renderCommandHelp("gjc", action === "serve" ? "sdk serve" : "sdk", action === "serve" ? SdkServeHelp : Sdk);
+			return;
+		}
+		if (action === "serve") {
+			await runSdkServe(this.argv.slice(1));
+			return;
+		}
+		if (action !== "broker-internal" && action !== "session-host-internal")
+			throw new CliParseError("Expected action to be serve.");
+		const internal = parseSdkInternalArgv(this.argv);
+		if (internal.action === "session-host-internal") {
 			await runSessionHost();
 			return;
 		}
-		const agentDir = flags["agent-dir"] as string | undefined;
-		if (!agentDir) throw new Error("--agent-dir is required for sdk broker-internal.");
+		const agentDir = internal.agentDir;
 		const broker = new Broker({
 			agentDir,
 			resolveDirectoryMigration: async cwd => {
@@ -439,9 +478,9 @@ export default class Sdk extends Command {
 		});
 		await broker.start();
 		if (!broker.ownsDiscovery) return;
-		const stop = () => void broker.stop().finally(() => process.exit(0));
+		const stop = () => void broker.stop();
 		process.once("SIGTERM", stop);
 		process.once("SIGINT", stop);
-		await new Promise<void>(() => {});
+		await completeBrokerProcess(broker);
 	}
 }

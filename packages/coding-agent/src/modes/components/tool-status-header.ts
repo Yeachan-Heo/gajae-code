@@ -46,6 +46,7 @@ export interface StatusLineSettings {
 	previewHighlightSegment?: StatusLineSegmentId;
 	showHookStatus?: boolean;
 	showSkillHud?: boolean;
+	showActionHints?: boolean;
 	sessionAccent?: boolean;
 	maxRows?: number;
 }
@@ -199,6 +200,7 @@ export class StatusLineComponent implements Component {
 			separator: settings.get("statusLine.separator"),
 			showHookStatus: settings.get("statusLine.showHookStatus"),
 			showSkillHud: settings.get("statusLine.showSkillHud"),
+			showActionHints: settings.get("statusLine.showActionHints"),
 			segmentOptions: settings.getGroup("statusLine").segmentOptions,
 			sessionAccent: settings.get("statusLine.sessionAccent"),
 			maxRows: settings.get("statusLine.maxRows"),
@@ -791,7 +793,10 @@ export class StatusLineComponent implements Component {
 		}
 
 		const right: string[] = [];
-		const actionHints = getAvailableActionHints(this.#actionRegistry, this.#getKeybindings, width, this.#focusDomain);
+		const actionHints =
+			effectiveSettings.showActionHints === false
+				? []
+				: getAvailableActionHints(this.#actionRegistry, this.#getKeybindings, width, this.#focusDomain);
 		for (const segId of effectiveSettings.rightSegments) {
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {

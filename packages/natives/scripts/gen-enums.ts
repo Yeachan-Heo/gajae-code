@@ -111,7 +111,71 @@ function applyPathIdentityTypes(dts: string): string {
 			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }`;
 	const security = `export type NativeOwnerOnlySecurityResult =
-	| { ok: true; code?: never }
+	| {
+			ok: true;
+			platform: "linux";
+			kind: "file";
+			protocol: "apply" | "verify";
+			aclEvidence: {
+				access: {
+					clear: "cleared" | "already_absent" | "unsupported" | "not_run";
+					query: "absent" | "unsupported";
+				};
+				default?: never;
+			};
+			code?: never;
+			operation?: never;
+			attribute?: never;
+	  }
+	| {
+			ok: true;
+			platform: "linux";
+			kind: "directory";
+			protocol: "apply" | "verify";
+			aclEvidence: {
+				access: {
+					clear: "cleared" | "already_absent" | "unsupported" | "not_run";
+					query: "absent" | "unsupported";
+				};
+				default: {
+					clear: "cleared" | "already_absent" | "unsupported" | "not_run";
+					query: "absent" | "unsupported";
+				};
+			};
+			code?: never;
+			operation?: never;
+			attribute?: never;
+	  }
+	| {
+			ok: true;
+			platform?: never;
+			kind?: never;
+			protocol?: never;
+			aclEvidence?: never;
+			code?: never;
+			operation?: never;
+			attribute?: never;
+	  }
+	| {
+			ok: false;
+			code: "acl_denied" | "acl_io_error" | "acl_present" | "acl_malformed" | "acl_unknown";
+			operation: "clear" | "query";
+			attribute: "access" | "default";
+			platform?: never;
+			kind?: never;
+			protocol?: never;
+			aclEvidence?: never;
+	  }
+	| {
+			ok: false;
+			code: "acl_unavailable" | "acl_apply_failed" | "acl_verify_failed";
+			operation?: never;
+			attribute?: never;
+			platform?: never;
+			kind?: never;
+			protocol?: never;
+			aclEvidence?: never;
+	  }
 	| {
 			ok: false;
 			code:
@@ -119,12 +183,17 @@ function applyPathIdentityTypes(dts: string): string {
 				| "not_directory"
 				| "network_unsupported"
 				| "reparse_point"
-				| "acl_unavailable"
-				| "acl_apply_failed"
-				| "acl_verify_failed"
 				| "identity_unavailable"
+				| "identity_mismatch"
 				| "owner_mismatch"
+				| "mode_mismatch"
 				| "io_error";
+			operation?: never;
+			attribute?: never;
+			platform?: never;
+			kind?: never;
+			protocol?: never;
+			aclEvidence?: never;
 	  }`;
 	return dts
 		.replace(
@@ -136,11 +205,30 @@ function applyPathIdentityTypes(dts: string): string {
 			'export declare function applyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult',
 		)
 		.replace(
+			/^export declare function applyOwnerOnlyFdSecurity\([^\n]*$/m,
+			'export declare function applyOwnerOnlyFdSecurity(path: string, kind: "directory" | "file", callerFd: number): NativeOwnerOnlySecurityResult',
+		)
+		.replace(
+			/^export declare function verifyOwnerOnlyPathSecurityExpected\([^\n]*$/m,
+			'export declare function verifyOwnerOnlyPathSecurityExpected(path: string, kind: "directory" | "file", expectedDev: bigint, expectedIno: bigint): NativeOwnerOnlySecurityResult',
+		)
+		.replace(
 			/^export declare function verifyOwnerOnlyPathSecurity\([^\n]*$/m,
 			'export declare function verifyOwnerOnlyPathSecurity(path: string, kind: "directory" | "file"): NativeOwnerOnlySecurityResult',
 		)
+		.replace(
+			/^export declare function verifyOwnerOnlyFdSecurity\([^\n]*$/m,
+			'export declare function verifyOwnerOnlyFdSecurity(path: string, kind: "directory" | "file", callerFd: number): NativeOwnerOnlySecurityResult',
+		)
+		.replace(
+			/^export declare function repairOwnerOnlyPathSecurityExpected\([^\n]*$/m,
+			'export declare function repairOwnerOnlyPathSecurityExpected(path: string, kind: "directory" | "file", expectedDev: bigint, expectedIno: bigint): NativeOwnerOnlySecurityResult',
+		)
 		.replace(/export interface NativeCanonicalDirectoryIdentity \{[\s\S]*?\n\}/, identity)
-		.replace(/export interface NativeOwnerOnlySecurityResult \{[\s\S]*?\n\}/, security);
+		.replace(
+			/export (?:interface|type) NativeOwnerOnlySecurityResult[\s\S]*?(?=\n\n\/\*\* Bound endpoint info)/,
+			security,
+		);
 }
 
 function buildGeneratedBlock(dts: string): string {

@@ -180,6 +180,11 @@ function passingQualityGate(): string {
 			],
 			blockers: [],
 		},
+		criticReview: {
+			verdict: "OKAY",
+			evidence: "critic approved final aggregate",
+			blockers: [],
+		},
 		iteration: {
 			status: "passed",
 			evidence: "no verification findings remain after steering iterations",
@@ -3706,6 +3711,11 @@ describe("native GJC ultragoal runtime", () => {
 						evidence: "reran",
 						fullRerun: true,
 						rerunCommands: ["bun test:e2e"],
+						blockers: [],
+					},
+					criticReview: {
+						verdict: "OKAY",
+						evidence: "critic approved final aggregate",
 						blockers: [],
 					},
 				}),

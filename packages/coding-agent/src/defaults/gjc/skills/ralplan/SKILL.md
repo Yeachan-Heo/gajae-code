@@ -24,12 +24,6 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 - `--architect openai-code` / `--critic openai-code`: Use OpenAI code for that review pass when available; otherwise note the fallback and use default GJC review.
 - `--write --stage <type> --stage_n <N> --artifact <markdown file path or markdown string>`: Native writer for Planner/Architect/Critic/revision/ADR/final pending-approval markdown under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`; do not edit `.gjc/` directly.
 
-## Usage with interactive mode
-
-```
-/skill:ralplan --interactive "task description"
-```
-
 ## Corrupt current-session state recovery
 
 For corrupt, tampered, unreadable, or stale current-session ralplan state, run `gjc state clear --force --mode ralplan` scoped by `--session-id`, command payload, or `GJC_SESSION_ID`; it clears only ralplan state for that session.

@@ -74,6 +74,7 @@ interface PromptWaiter {
 	/** Highest inbound frame sequence already observed when the prompt was acknowledged. */
 	boundary: number;
 	correlation: PromptCorrelation;
+	messageProgress?: { textEmitted: boolean; thoughtEmitted: boolean };
 	pendingTerminal?: PromptCorrelation;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
@@ -1298,9 +1299,16 @@ export class AcpAgent implements Agent {
 		if (wirePayload) {
 			for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, {
 				cwd: record.cwd,
+				getMessageProgress: message => {
+					if (!activePrompt || !object(message)) return undefined;
+					activePrompt.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
+					return activePrompt.messageProgress;
+				},
 			}))
 				await this.#publishSessionUpdate(id, notification, adapter);
 		}
+		if (event.type === "message_end" && object(event.message)?.role === "assistant" && activePrompt)
+			activePrompt.messageProgress = undefined;
 		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter);
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
 	}

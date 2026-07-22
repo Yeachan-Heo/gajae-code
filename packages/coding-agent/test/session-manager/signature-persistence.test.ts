@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
-import { SessionManager, type SessionMessageEntry } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	CURRENT_SESSION_VERSION,
+	SessionManager,
+	type SessionMessageEntry,
+} from "@gajae-code/coding-agent/session/session-manager";
 import { getBlobsDir, TempDir } from "@gajae-code/utils";
 
 function isAssistantSessionEntry(entry: unknown): entry is SessionMessageEntry & { message: AssistantMessage } {
@@ -179,7 +183,7 @@ describe("SessionManager signature persistence", () => {
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected persisted session file");
 		const persistedBefore = await fs.readFile(sessionFile, "utf8");
-		expect(JSON.parse(persistedBefore.split("\n", 1)[0]!).version).toBe(4);
+		expect(JSON.parse(persistedBefore.split("\n", 1)[0]!).version).toBe(CURRENT_SESSION_VERSION);
 		await session.close();
 
 		const reloaded = await SessionManager.open(sessionFile);

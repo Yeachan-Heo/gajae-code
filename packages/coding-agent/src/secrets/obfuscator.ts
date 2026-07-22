@@ -1,3 +1,4 @@
+import { createHmac, randomBytes } from "node:crypto";
 import type { Message, TextContent } from "@gajae-code/ai";
 import { type SessionContext, transferSessionMessageIdentity } from "../session/session-manager";
 import { compileSecretRegex } from "./regex";
@@ -39,28 +40,28 @@ function generateDeterministicReplacement(secret: string): string {
 // Placeholder format
 // ═══════════════════════════════════════════════════════════════════════════
 
-const HASH_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-const HASH_LEN = 4;
+const PLACEHOLDER_DOMAIN = "gjc.secret-obfuscation.placeholder.v1\0";
+const PLACEHOLDER_RE = /#GJC1_[A-Za-z0-9_-]{22}#/g;
 
-/** Build an obfuscation placeholder for secret index N. Deterministic `#HASH#` token. */
-function buildPlaceholder(index: number): string {
-	let v = Bun.hash.xxHash32(String(index), 0x5345_4352);
-	let tag = "#";
-	for (let i = 0; i < HASH_LEN; i++) {
-		tag += HASH_CHARS[v % HASH_CHARS.length];
-		v = Math.floor(v / HASH_CHARS.length);
-	}
-	return `${tag}#`;
+/** Build a versioned, authenticated placeholder whose identity depends only on the key and secret. */
+function buildPlaceholder(secret: string, key: Uint8Array): string {
+	const tag = createHmac("sha256", key)
+		.update(PLACEHOLDER_DOMAIN)
+		.update(secret, "utf8")
+		.digest()
+		.subarray(0, 16)
+		.toString("base64url");
+	return `#GJC1_${tag}#`;
 }
-
-/** Regex to match obfuscation placeholders: #HASH# */
-const PLACEHOLDER_RE = /#[A-Z0-9]{4}#/g;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SecretObfuscator
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class SecretObfuscator {
+	/** Key used to authenticate reversible placeholders. */
+	#placeholderKey: Uint8Array;
+
 	/** Plain secrets: secret → index (known at construction) */
 	#plainMappings = new Map<string, number>();
 
@@ -97,14 +98,16 @@ export class SecretObfuscator {
 	/** Whether any secrets were configured */
 	#hasAny: boolean;
 
-	constructor(entries: SecretEntry[]) {
+	constructor(entries: SecretEntry[], key: Uint8Array = randomBytes(32)) {
+		if (key.byteLength !== 32) throw new Error("Secret obfuscation key must be 32 bytes");
+		this.#placeholderKey = Uint8Array.from(key);
 		let index = 0;
 		for (const entry of entries) {
 			const mode = entry.mode ?? "obfuscate";
 
 			if (entry.type === "plain") {
 				if (mode === "obfuscate") {
-					const placeholder = buildPlaceholder(index);
+					const placeholder = buildPlaceholder(entry.content, this.#placeholderKey);
 					this.#plainMappings.set(entry.content, index);
 					this.#obfuscateMappings.set(index, { secret: entry.content, placeholder });
 					this.#deobfuscateMap.set(placeholder, entry.content);
@@ -172,7 +175,7 @@ export class SecretObfuscator {
 					let index = this.#findObfuscateIndex(matchValue);
 					if (index === undefined) {
 						index = this.#nextIndex++;
-						const placeholder = buildPlaceholder(index);
+						const placeholder = buildPlaceholder(matchValue, this.#placeholderKey);
 						this.#obfuscateMappings.set(index, { secret: matchValue, placeholder });
 						this.#deobfuscateMap.set(placeholder, matchValue);
 						this.#obfuscateIndexBySecret.set(matchValue, index);

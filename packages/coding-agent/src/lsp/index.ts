@@ -461,88 +461,6 @@ async function waitForDiagnostics(
 	return getAcceptedDiagnostics(client.diagnostics.get(uri), expectedDocumentVersion, allowUnversioned) ?? [];
 }
 
-/** Project type detection result */
-interface ProjectType {
-	type: "rust" | "typescript" | "go" | "python" | "unknown";
-	command?: string[];
-	description: string;
-}
-
-/** Detect project type from root markers */
-function detectProjectType(cwd: string): ProjectType {
-	// Check for Rust (Cargo.toml)
-	if (fs.existsSync(path.join(cwd, "Cargo.toml"))) {
-		return { type: "rust", command: ["cargo", "check", "--message-format=short"], description: "Rust (cargo check)" };
-	}
-
-	// Check for TypeScript (tsconfig.json)
-	if (fs.existsSync(path.join(cwd, "tsconfig.json"))) {
-		return { type: "typescript", command: ["npx", "tsc", "--noEmit"], description: "TypeScript (tsc --noEmit)" };
-	}
-
-	// Check for Go (go.mod)
-	if (fs.existsSync(path.join(cwd, "go.mod"))) {
-		return { type: "go", command: ["go", "build", "./..."], description: "Go (go build)" };
-	}
-
-	// Check for Python (pyproject.toml or pyrightconfig.json)
-	if (fs.existsSync(path.join(cwd, "pyproject.toml")) || fs.existsSync(path.join(cwd, "pyrightconfig.json"))) {
-		return { type: "python", command: ["pyright"], description: "Python (pyright)" };
-	}
-
-	return { type: "unknown", description: "Unknown project type" };
-}
-
-/** Run workspace diagnostics command and parse output */
-async function runWorkspaceDiagnostics(
-	cwd: string,
-	signal?: AbortSignal,
-): Promise<{ output: string; projectType: ProjectType }> {
-	throwIfAborted(signal);
-	const projectType = detectProjectType(cwd);
-	if (!projectType.command) {
-		return {
-			output: `Cannot detect project type. Supported: Rust (Cargo.toml), TypeScript (tsconfig.json), Go (go.mod), Python (pyproject.toml)`,
-			projectType,
-		};
-	}
-	const proc = Bun.spawn(projectType.command, {
-		cwd,
-		stdout: "pipe",
-		stderr: "pipe",
-		windowsHide: true,
-	});
-	const abortHandler = () => {
-		proc.kill();
-	};
-	if (signal) {
-		signal.addEventListener("abort", abortHandler, { once: true });
-	}
-
-	try {
-		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-		await proc.exited;
-		throwIfAborted(signal);
-		const combined = (stdout + stderr).trim();
-		if (!combined) {
-			return { output: "No issues found", projectType };
-		}
-		// Limit output length
-		const lines = combined.split("\n");
-		if (lines.length > 50) {
-			return { output: `${lines.slice(0, 50).join("\n")}\n... and ${lines.length - 50} more lines`, projectType };
-		}
-		return { output: combined, projectType };
-	} catch (e) {
-		if (signal?.aborted) {
-			throw new ToolAbortError();
-		}
-		return { output: `Failed to run ${projectType.command.join(" ")}: ${e}`, projectType };
-	} finally {
-		signal?.removeEventListener("abort", abortHandler);
-	}
-}
-
 /** Result from getDiagnosticsForFile */
 export interface FileDiagnosticsResult {
 	/** Name of the LSP server used (if available) */
@@ -1235,16 +1153,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		// Diagnostics can be batch or single-file - queries all applicable servers
 		if (action === "diagnostics") {
 			if (file === "*") {
-				// `*` => run workspace diagnostics across all configured servers
-				const result = await runWorkspaceDiagnostics(this.session.cwd, signal);
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Workspace diagnostics (${result.projectType.description}):\n${result.output}`,
+							text: "Workspace build diagnostics are unavailable via lsp. Use a concrete file path or glob for language-server diagnostics, and use an execution-authorized tool to run build or typecheck commands.",
 						},
 					],
-					details: { action, success: true, request: params },
+					details: { action, success: false, request: params },
 				};
 			}
 
@@ -1253,7 +1169,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					content: [
 						{
 							type: "text",
-							text: "Error: file parameter required. Use `*` for workspace-wide diagnostics or a path/glob for specific files.",
+							text: "Error: file parameter required. Use a concrete file path or glob for diagnostics.",
 						},
 					],
 					details: { action, success: false, request: params },
@@ -1281,7 +1197,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			const allServerNames = new Set<string>();
 			if (truncatedGlobTargets) {
 				results.push(
-					`${theme.status.warning} Pattern matched more than ${MAX_GLOB_DIAGNOSTIC_TARGETS} files; showing first ${MAX_GLOB_DIAGNOSTIC_TARGETS}. Narrow the glob or use workspace diagnostics.`,
+					`${theme.status.warning} Pattern matched more than ${MAX_GLOB_DIAGNOSTIC_TARGETS} files; showing first ${MAX_GLOB_DIAGNOSTIC_TARGETS}. Narrow the glob for broader coverage.`,
 				);
 			}
 

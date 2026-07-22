@@ -59,6 +59,7 @@ function createInputControllerContext(options: {
 		skillCommands: new Map(),
 		pendingImages: options.pendingImages ?? [],
 		getSlashCommands: () => [{ name: "changelog", description: "Show changelog" }],
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 	if (options.delegated) {
 		ctx.showCommandPalette = (_commands, _actions, execute) => {
@@ -206,6 +207,7 @@ describe("CommandPalette", () => {
 			historyStorage: { getRecent: () => [] },
 			skillCommands: new Map([["skill:demo", { description: "Demo skill" }]]),
 			getSlashCommands: () => liveCommands,
+			hasActiveBtw: () => false,
 		} as unknown as InteractiveModeContext;
 		new InputController(ctx).openCommandPalette();
 		expect(overlay?.getEntries().map(entry => entry.label)).toEqual(
@@ -254,6 +256,7 @@ describe("CommandPalette", () => {
 			historyStorage: { getRecent: () => [] },
 			skillCommands: new Map(),
 			getSlashCommands: () => [{ name: "clear", description: "Clear the session" }],
+			hasActiveBtw: () => false,
 		} as unknown as InteractiveModeContext;
 		new InputController(ctx).openCommandPalette();
 		for (const key of "cycle mode") overlay?.handleInput(key);
@@ -297,6 +300,7 @@ describe("CommandPalette", () => {
 			historyStorage: { getRecent: () => [] },
 			skillCommands: new Map(),
 			getSlashCommands: () => [{ name: "changelog", description: "Show changelog" }],
+			hasActiveBtw: () => false,
 		} as unknown as InteractiveModeContext;
 		new InputController(ctx).openCommandPalette();
 		for (const key of "/changelog") overlay?.handleInput(key);

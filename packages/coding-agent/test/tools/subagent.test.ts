@@ -444,6 +444,49 @@ describe("SubagentTool", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
+	it("resume surfaces a manager failure reason instead of returning the stale terminal record", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		// Terminal, resumable record with a session file but NO resume runner:
+		// resumeSubagent() returns { ok: false, reason: "no_runner" }. The resume
+		// action must surface that reason, not silently return the stale record
+		// (which made ralplan believe the Planner had resumed when it had not).
+		manager.registerSubagentRecord({
+			subagentId: "0-NoRunner",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: "/tmp/0-NoRunner.jsonl",
+			resumable: true,
+		});
+
+		await expect(
+			tool.execute("subagent-resume", { action: "resume", id: "0-NoRunner", message: "revision pass" }),
+		).rejects.toThrow("no_runner");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("resume surfaces resume_failed when the runner yields no job", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		manager.setResumeRunner(() => undefined);
+		manager.registerSubagentRecord({
+			subagentId: "0-ResumeFailed",
+			ownerId: "0-Main",
+			currentJobId: null,
+			historicalJobIds: [],
+			status: "completed",
+			sessionFile: "/tmp/0-ResumeFailed.jsonl",
+			resumable: true,
+		});
+
+		await expect(
+			tool.execute("subagent-resume", { action: "resume", id: "0-ResumeFailed", message: "revision pass" }),
+		).rejects.toThrow("resume_failed");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
 	it("resume accepts id and rejects multi-id message broadcast", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());

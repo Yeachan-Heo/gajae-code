@@ -1227,6 +1227,8 @@ fn should_skip_env_var(key: &str) -> bool {
 		"BASH_ENV"
 			| "ENV"
 			| "HISTFILE"
+			| "GJC_SESSION_FILE"
+			| "GJC_MANAGED_OWNER_TRANSCRIPT_PATH"
 			| "HISTTIMEFORMAT"
 			| "HISTCMD"
 			| "PS0"

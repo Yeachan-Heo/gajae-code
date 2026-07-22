@@ -195,6 +195,31 @@ function bytesStreamFromChunks(chunks: Uint8Array[]): ReadableStream<Uint8Array>
 }
 
 describe("readSseEvents", () => {
+	it("applies optional UTF-8 event and stream byte budgets without changing defaults", async () => {
+		const payload = encoder.encode("data: \ud55c\n\n");
+		await expect(
+			collectAsync(readSseEvents(bytesStreamFromChunks([payload]), undefined, { maxEventBytes: payload.length })),
+		).resolves.toHaveLength(1);
+		await expect(
+			collectAsync(
+				readSseEvents(bytesStreamFromChunks([payload]), undefined, { maxEventBytes: payload.length - 1 }),
+			),
+		).rejects.toThrow("SSE event exceeds size limit");
+		await expect(
+			collectAsync(
+				readSseEvents(bytesStreamFromChunks([payload]), undefined, { maxTotalBytes: payload.length - 1 }),
+			),
+		).rejects.toThrow("SSE stream exceeds size limit");
+		await expect(collectAsync(readSseEvents(bytesStreamFromChunks([payload])))).resolves.toHaveLength(1);
+	});
+
+	it("rejects an oversized event before buffering split and multi-line data", async () => {
+		const chunks = [encoder.encode("data: 12\ndata:"), encoder.encode(" 3456\n\n")];
+		await expect(
+			collectAsync(readSseEvents(bytesStreamFromChunks(chunks), undefined, { maxEventBytes: 20 })),
+		).rejects.toThrow("SSE event exceeds size limit");
+	});
+
 	it("dispatches events on blank-line boundaries", async () => {
 		const stream = bytesStreamFromChunks([
 			encoder.encode('event: message_start\ndata: {"id":1}\n\n'),
@@ -221,8 +246,8 @@ describe("readSseEvents", () => {
 	});
 
 	it("does not carry pure comment keepalives into the next event raw lines", async () => {
-		const stream = bytesStreamFromChunks([encoder.encode(": keepalive\n\nevent: ping\ndata: ok\n\n")]);
-		const [evt] = await collectAsync(readSseEvents(stream));
+		const stream = bytesStreamFromChunks([encoder.encode(": 1\r\n\r\n: 2\r\n\r\nevent: ping\r\ndata: ok\r\n\r\n")]);
+		const [evt] = await collectAsync(readSseEvents(stream, undefined, { maxEventBytes: 25 }));
 		expect(evt.raw).toEqual(["event: ping", "data: ok"]);
 	});
 

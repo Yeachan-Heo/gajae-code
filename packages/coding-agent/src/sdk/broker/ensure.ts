@@ -19,12 +19,32 @@ const FIXTURE_DISCOVERY_TIMEOUT_MS = 30_000;
 const REAP_GRACEFUL_MS = 2_000;
 const REAP_SIGKILL_CAP_MS = 2_000;
 export interface FixtureBrokerLease {
+	/** Backward-compatible fixture cleanup alias for exact child termination. */
 	close(): Promise<void>;
+}
+
+export interface ExactFixtureBrokerLease extends FixtureBrokerLease {
+	/** Observes the retained child only; it never signals a process. */
+	waitForExit(timeoutMs: number): Promise<boolean>;
+	/** Signals only the retained ChildProcess, never a discovery-derived PID. */
+	terminateExactChild(): Promise<void>;
+}
+
+export interface FixtureBrokerCommand {
+	file: string;
+	args: readonly string[];
+	cwd?: string;
+	env?: NodeJS.ProcessEnv;
+}
+
+export interface StartedFixtureBrokerCommand {
+	lease: ExactFixtureBrokerLease;
+	control: NodeJS.WritableStream;
 }
 
 export interface StartedFixtureBroker {
 	discovery: BrokerDiscovery;
-	lease: FixtureBrokerLease;
+	lease: ExactFixtureBrokerLease;
 }
 
 interface BrokerOwner {
@@ -37,7 +57,7 @@ type EnsureOutcome =
 	| { kind: "external-discovery"; discovery: BrokerDiscovery }
 	| { kind: "prior-local-owner"; discovery: BrokerDiscovery; owner: BrokerOwner }
 	| { kind: "local-started-discovery"; discovery: BrokerDiscovery }
-	| { kind: "local-started-fixture"; discovery: BrokerDiscovery; owner: BrokerOwner };
+	| { kind: "local-started-fixture"; discovery: BrokerDiscovery; owner: BrokerOwner; child: ChildProcess };
 interface EnsureInFlight {
 	initiator: EnsureInitiator;
 	promise: Promise<EnsureOutcome>;
@@ -167,25 +187,46 @@ function fixtureLeaseUnavailable(): Error {
 	return new Error("fixture_broker_lease_unavailable");
 }
 
-function createFixtureLease(owner: BrokerOwner): FixtureBrokerLease {
-	let closeAttempt: Promise<void> | undefined;
-	let closed = false;
+function createFixtureLeaseFromChild(child: ChildProcess, terminate: () => Promise<void>): ExactFixtureBrokerLease {
+	let termination: Promise<void> | undefined;
+	const hasExited = (): boolean => child.exitCode !== null || child.signalCode !== null || child.pid === undefined;
+	const waitForExit = (timeoutMs: number): Promise<boolean> => {
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0)
+			return Promise.reject(new Error("Invalid fixture broker exit timeout."));
+		if (hasExited()) return Promise.resolve(true);
+		return new Promise(resolve => {
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const onExit = (): void => finish(true);
+			const finish = (exited: boolean): void => {
+				if (settled) return;
+				settled = true;
+				if (timer) clearTimeout(timer);
+				child.off("exit", onExit);
+				child.off("close", onExit);
+				resolve(exited && hasExited());
+			};
+			timer = setTimeout(() => finish(false), timeoutMs);
+			child.once("exit", onExit);
+			child.once("close", onExit);
+			if (hasExited()) finish(true);
+		});
+	};
 	return {
+		waitForExit,
+		terminateExactChild(): Promise<void> {
+			if (!termination) termination = terminate();
+			return termination;
+		},
 		close(): Promise<void> {
-			if (closed) return Promise.resolve();
-			if (closeAttempt) return closeAttempt;
-			closeAttempt = owner.stop().then(
-				() => {
-					closed = true;
-				},
-				(error: unknown) => {
-					closeAttempt = undefined;
-					throw error;
-				},
-			);
-			return closeAttempt;
+			if (!termination) termination = terminate();
+			return termination;
 		},
 	};
+}
+
+function createFixtureLease(owner: BrokerOwner, child: ChildProcess): ExactFixtureBrokerLease {
+	return createFixtureLeaseFromChild(child, () => owner.stop());
 }
 
 async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: EnsureInitiator): Promise<EnsureOutcome> {
@@ -226,7 +267,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			if (discovered) {
 				if (owner.markReady(discovered)) {
 					return initiator === "fixture-lease"
-						? { kind: "local-started-fixture", discovery: discovered, owner }
+						? { kind: "local-started-fixture", discovery: discovered, owner, child }
 						: { kind: "local-started-discovery", discovery: discovered };
 				}
 				await owner.stop();
@@ -280,8 +321,51 @@ export function startFixtureBrokerWithLeaseForTest(settings: EnsureBrokerSetting
 	const inFlight = startEnsure(settings, "fixture-lease");
 	return inFlight.promise.then(outcome => {
 		if (outcome.kind !== "local-started-fixture") throw fixtureLeaseUnavailable();
-		return { discovery: outcome.discovery, lease: createFixtureLease(outcome.owner) };
+		return { discovery: outcome.discovery, lease: createFixtureLease(outcome.owner, outcome.child) };
 	});
+}
+
+/**
+ * Test-only launch surface for topology fixtures. It accepts an already-resolved
+ * command and retains the exact spawned child; no production selection path
+ * reaches this function.
+ */
+export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBrokerCommand): StartedFixtureBrokerCommand {
+	if (!command.file || !Array.isArray(command.args)) throw new Error("Invalid fixture broker command.");
+	const child = spawn(command.file, [...command.args], {
+		cwd: command.cwd,
+		detached: true,
+		stdio: ["ignore", "ignore", "ignore", "pipe"],
+		env: command.env,
+	});
+	child.unref();
+	let spawnError: Error | undefined;
+	child.once("error", error => {
+		spawnError = error;
+	});
+	const control = child.stdio[3];
+	if (!control || typeof (control as NodeJS.WritableStream).write !== "function") {
+		try {
+			if (!child.kill("SIGKILL"))
+				throw new Error(
+					"Fixture broker fd 3 is unavailable and the exact child could not be synchronously terminated.",
+				);
+		} catch (reapError) {
+			throw new AggregateError(
+				[reapError],
+				"Fixture broker fd 3 is unavailable and the exact child could not be synchronously terminated.",
+			);
+		}
+		if (spawnError) throw new Error(`Failed to spawn fixture broker: ${spawnError.message}`);
+		throw new Error("Fixture broker fd 3 is unavailable.");
+	}
+	return {
+		lease: createFixtureLeaseFromChild(child, async () => {
+			await reapSpawnedBroker(child);
+			if (spawnError) throw new Error(`Failed to spawn fixture broker: ${spawnError.message}`);
+		}),
+		control: control as NodeJS.WritableStream,
+	};
 }
 
 /** Test hook: returns a stop handle for the detached broker this process spawned. */

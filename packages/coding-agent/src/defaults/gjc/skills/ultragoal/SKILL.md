@@ -50,8 +50,6 @@ goal({"op":"resume"})
 ```
 `drop` clears the active goal without exiting goal mode; `resume` reactivates a paused goal.
 
-Durable completion is single-source: `goals.json` defines which goals exist and their required state, while `ledger.jsonl` provides the receipt proof used to verify completion. Inline goal state is UX-only and is reconciled by the agent after durable completion, not by CLI checkpoints or hooks.
-
 ## Create goals
 
 1. Decide on the brief. To produce **multiple** stories, separate them with a reserved `@goal:` delimiter line; the title follows on the same line and the objective is everything beneath it until the next delimiter:
@@ -125,10 +123,12 @@ An active Ultragoal run must not give up on a blocker by pausing the goal and as
 - **`resolvable`** — anything the agent can act on: failing tests, missing implementation, a dependency to install, an ambiguous-but-inferable detail, investigation. **Never pause.** Exhaust autonomous resolution first: investigate, `gjc ultragoal steer --kind add_subgoal --title "Investigate blocker" --objective "..." --evidence "..." --rationale "..."`, delegate an `executor`, or preserve the blocker durably with `gjc ultragoal checkpoint --status blocked` / `gjc ultragoal record-review-blockers` and keep scheduling the next goal.
 - **`human_blocked`** — only the user can act: credentials/secrets, a manual or physical step, an external approval/decision, access the agent lacks. Pause is the last resort and is gated.
 
-`goal({"op":"pause"})` is **blocked at runtime** while an Ultragoal run is active unless the latest durable ledger event classifies the current blocker as `human_blocked`. To pause, record the classification immediately before pausing and cite the human-only dependency as evidence:
+`goal({"op":"pause"})` is **blocked at runtime** while an Ultragoal run is active unless the latest `blocker_classified` ledger event is `human_blocked` and a later bound clean pause terminal critic verdict is recorded for it (see [Terminal critic gate](#terminal-critic-gate)). `assertUltragoalPauseAllowed` first consumes a pre-existing give-up nudge (a durable ledger write) before it runs the read-only pause diagnostic; only `isUltragoalPauseBlocked` is a pure reader. To pause, first record the human-only classification and capture its event id, then record the terminal critic's clean bound pause verdict, and only then pause:
 
 ```sh
 gjc ultragoal classify-blocker --classification human_blocked --evidence "<the specific human-only dependency>" [--goal-id <id>]
+gjc ultragoal record-critic-verdict --terminus pause --classification-event-id <eventId> --verdict OKAY --evidence "<terminal critic evidence>"
+goal({"op":"pause"})
 ```
 
 Recording `--classification resolvable` is an audit note only; it never authorizes a pause. The `ask` tool stays blocked during active runs regardless of classification — record unresolved decisions as durable blockers instead of prompting.
@@ -345,6 +345,44 @@ Provide one `artifactRefs` entry per live surface actually exercised, using the 
 
 For CLI replay artifacts, the JSON at `path` must be an object like `{"schemaVersion":1,"kind":"cli-replay","replaySafe":true,"command":["bun","-e","console.log(\"ultragoal-cli-ok\")"],"cwd":".","env":{"LC_ALL":"C"},"timeoutMs":30000,"expectedExitCode":0,"recordedStdout":"ultragoal-cli-ok\n","recordedStderr":"","invariants":[{"type":"substring","value":"ultragoal-cli-ok"},{"type":"not-substring","value":"error"}]}`. Accepted replay fields are `command` (string array), optional `cwd`, safe `env`, `timeoutMs`, `expectedExitCode`, `recordedStdout`, `recordedStderr`, `normalization`, and `invariants`. The conservative command allowlist is intentionally small: `bun --version`, `node --version`, deterministic `bun/node -e "console.log(...)"`, `npm|pnpm|yarn --version`, `npm|pnpm|yarn list`, read-only `git status|rev-parse|merge-base|diff|show|log` with safe args, and `gjc read|status`. `env` must contain only safe deterministic variables, never credentials or machine/user-specific secrets. `normalization` is optional and, when provided, must be exactly the string `"default"` (the built-in normalizer already strips ANSI codes, normalizes line endings, scrubs paths, and trims trailing whitespace); object-shaped normalization is rejected. Invariants may be substring, regex, or not-substring checks; when present, they replace exact `recordedStdout` equality — without `invariants`, replayed normalized stdout must match `recordedStdout` exactly. Unsafe, non-deterministic, credentialed, interactive, or otherwise unallowlisted commands require audited `replayExempt` metadata with exact fields `reasonCode`, `reason`, `approvedBy`, and `fallbackArtifactRefs` plus a structurally valid same-surface fallback artifact. `reason` must be substantive and audited, and `approvedBy` must identify the verifier. Allowed `reasonCode` values are exactly `unsafe_side_effect`, `requires_credentials`, `requires_network`, `non_deterministic_external`, `destructive`, `interactive_only`, and `platform_unavailable`.
 
+## Terminal critic gate
+
+The terminal critic gate is a fail-closed, once-per-run-terminus review. It guards both terminal exits with a read-only `critic` role agent's `OKAY` verdict; it does not run per story. It is additive to, and does not change, the existing per-story `architect` review and `executor` QA/red-team lanes.
+
+### Completion terminus
+
+Before assembling the final-aggregate `--quality-gate-json`, the leader delegates the terminal critic. Only the final-aggregate completion checkpoint requires the additional top-level `criticReview` key; `criticReview` is tolerated but ignored on non-final checkpoints. A clean final aggregate requires `verdict: "OKAY"`, non-empty `evidence`, and an empty `blockers` array:
+
+```json
+{
+  "criticReview": {
+    "verdict": "OKAY",
+    "evidence": "terminal critic review of the final required-goal state",
+    "blockers": []
+  }
+}
+```
+
+### Pause/blocked terminus
+
+At a `human_blocked` terminus, the leader first runs `gjc ultragoal classify-blocker --classification human_blocked` (capturing that classification's ledger `eventId`), then delegates the terminal critic and records its verdict with `gjc ultragoal record-critic-verdict --terminus pause --classification-event-id <eventId>` before calling `goal({"op":"pause"})`. The pause is allowed only when a later fresh `critic_verdict` ledger receipt exists with `terminus: "pause"`, `verdict: "OKAY"`, non-empty evidence, an empty blockers array, the current `planGeneration`, and a `classificationEventId` bound to the latest `blocker_classified` event, which must be `human_blocked`. Freshness is scoped to the final required-goal state, so required-goal or steer changes stale the receipt, and a newer classification supersedes an older verdict.
+
+The critic must verify that the `human_blocked` classification is genuine, including catching false pauses where needed resources exist locally or the asserted blocker is resolvable. A `REJECT` (or `ITERATE`) verdict refuses the terminal pause; the run keeps executing. The pause (`goal({"op":"pause"})`) is the gated terminal park-and-wait exit — a per-goal `gjc ultragoal checkpoint --status blocked` remains available as non-terminal blocker bookkeeping that never signals run completion and keeps the blocker outstanding until resolved.
+
+### Invocation and containment
+
+At each terminus, the leader gives the read-only `critic` role agent `brief.md`, `goals.json`, `ledger.jsonl`, and the cumulative change set. For completion, invoke it before assembling the final-aggregate gate JSON. For pause, invoke it after the `human_blocked` classification and before `goal({"op":"pause"})`. The terminal critic must not spawn nested `ralplan`, `team`, `deep-interview`, or `ultragoal` workflows. This creates no interactive surface: `ask` remains blocked while an Ultragoal run is active.
+
+### Non-OKAY loop and ceiling
+
+For completion-side `ITERATE` or `REJECT`, the leader MUST first record the terminal verdict so the run-level counter observes it: `gjc ultragoal record-critic-verdict --terminus completion --verdict <ITERATE|REJECT> --evidence "<critic findings>"`; then record the findings with `gjc ultragoal record-review-blockers` and reopen the run. The dedicated counter ceiling is 5, independently of the give-up nudge budget, and is **RUN-LEVEL**: it counts every non-OKAY terminal-critic verdict across the whole run and all reopen cycles. On reaching that ceiling, both pause and final completion are blocked until a human or leader records `gjc ultragoal record-critic-gate-override --evidence "<authorization evidence>"`. There is no automatic pause override.
+
+This gate is always fail-closed and has no grandfathering: in-flight runs must obtain a terminal verdict when they reach a terminus.
+
+#### Deferred / out of scope
+
+Gating active-aggregate `goal drop` after nudge exhaustion is a known follow-up not covered by this gate; `drop` remains governed by the existing nudge discipline.
+
 ## Review mode
 
 `gjc ultragoal review` runs the same hardened gate against an already implemented PR, branch, or worktree. Use `--pr <number>` for a PR, `--branch <ref>` for a branch diff, omit both for the current worktree, and pass `--spec <path>` when a real contract exists. `--mode review-only` emits the verdict/findings without creating fix work; `--mode review-start` records review blockers for follow-up. Review mode validates the same `executorQa` shape and live-surface artifacts as `checkpoint --status complete`. A thin or derived-only contract can never clean-pass: the verdict is capped at `inconclusive: weak-contract` until a supplied spec or equivalent strong acceptance criteria are available.
@@ -374,4 +412,5 @@ The skill tool then dispatches `/skill:ralplan` or `/skill:deep-interview` same-
 - Never call `goal({"op":"complete"})` unless the aggregate run or legacy per-story goal is actually complete.
 - In aggregate mode, intermediate and final story checkpoints update durable `goals.json` state and append receipt proof to `ledger.jsonl`; the final story checkpoint creates the final aggregate receipt before the agent may call `goal({"op":"complete"})`.
 - Completion checkpoints require `--quality-gate-json` only. Shell commands and hooks must not mutate goal state; the agent reconciles inline goal-tool state after durable completion.
+- Final-aggregate completion additionally requires a `criticReview` `OKAY`; a `human_blocked` pause additionally requires a fresh `OKAY` `critic_verdict` receipt.
 - Treat `ledger.jsonl` as the durable audit trail; checkpoint after every success or failure.

@@ -10,21 +10,42 @@ level: 3
 source: "forked from upstream deep-interview skill and rebranded for GJC"
 ---
 
-<Purpose>
-Deep Interview implements Ouroboros-inspired Socratic questioning with mathematical ambiguity scoring. It replaces vague ideas with crystal-clear specifications by asking targeted questions that expose hidden assumptions, measuring clarity across weighted dimensions, and refusing to proceed until ambiguity drops below the resolved threshold for this run. The output feeds into a gated pipeline: **deep-interview → ralplan consensus refinement → pending approval → explicitly approved execution**, ensuring maximum clarity before any mutation starts.
-</Purpose>
+<Purpose_And_Principles>
+**DIPP-1 — Purpose.** Deep Interview applies Socratic questioning with mathematical ambiguity scoring to replace vague ideas with crystal-clear specifications: it exposes hidden assumptions, measures clarity across weighted dimensions, and refuses to proceed until ambiguity drops below the resolved threshold for this run. The output feeds into a gated pipeline: **deep-interview → ralplan consensus refinement → pending approval → explicitly approved execution**, ensuring maximum clarity before any mutation starts. AI can build anything. The hard part is knowing what to build. GJC planning Phase 0 expands ideas into specs via analyst + architect, but this single-pass approach struggles with genuinely vague inputs: it asks "what do you want?" instead of "what are you assuming?" Deep Interview iteratively exposes assumptions and mathematically gates readiness, ensuring the AI has genuine clarity before spending execution cycles. Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros), which demonstrated that specification quality is the primary bottleneck in AI-assisted development.
 
-<Use_When>
-- User has a vague idea and wants thorough requirements gathering before execution
-- User says "deep interview", "interview me", "ask me everything", "don't assume", "make sure you understand"
-- User says "ouroboros", "socratic", "I have a vague idea", "not sure exactly what I want"
-- User wants to avoid "that's not what I meant" outcomes from autonomous execution
-- Task is complex enough that jumping to code would waste cycles on scope discovery
-- User asks for implementation but the target, scope, acceptance criteria, or safety boundary is ambiguous enough that mutation would require guessing
-- User wants mathematically-validated clarity before committing to execution
-- User explicitly requests deep-interview even after being told the request is already clear, bounded, and low-risk
-- User requests a trace/research pre-step before the interview, e.g. `/skill:deep-interview --trace <idea>`
-</Use_When>
+**DIPP-2 — Use when.**
+
+> **Use when** the user wants requirements clarified before execution: a vague or exploratory idea ("I have a vague idea", "not sure exactly what I want"); an explicit request to interview ("deep interview", "interview me", "ask me everything", "don't assume", "make sure you understand", "ouroboros", "socratic"); a wish to avoid "that's not what I meant" outcomes from autonomous execution or to reach mathematically-validated clarity before committing to execution; a task complex enough that jumping to code would waste cycles on scope discovery; an implementation ask whose target, scope, acceptance criteria, or safety boundary is ambiguous enough that mutation would require guessing; or an explicit deep-interview request even after being told the request is already clear, bounded, and low-risk.
+> - User requests a trace/research pre-step before the interview, e.g. `/skill:deep-interview --trace <idea>`
+
+**DIPP-3 — Question pacing.**
+
+- Ask ONE question at a time -- never batch multiple questions
+
+**DIPP-4 — Language.**
+
+- Default to English when no language preference is explicit or obvious. Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; do not add language-specific special cases
+
+**DIPP-5 — Self-proofread.**
+
+- Before emitting any user-facing natural-language prose governed by `language.instruction`, perform one silent, best-effort self-proofread in the preserved session language for obvious spelling, spacing, grammar, inflection/particle, and word-choice errors, using the same language-agnostic pass for whatever language is active rather than special-casing any single language. Apply it only to newly generated prose and never announce the proofreading, show before/after text, apologize for it, or re-emit a corrected copy. Do not alter code blocks or identifiers, file paths, CLI commands, JSON/configuration keys, `ask` metadata keys, table/round structure, fixed labels, numeric scores, component ids, status tokens, user quotes or source text, Phase 0 threshold markers such as `Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThresholdSource>)`, or fixed paths such as `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`; still apply the self-proofread to generated natural-language clauses or cells inside those structures, including Why now rationale, gap text, next-target phrasing, and coverage notes
+
+**DIPP-6 — Weakest dimension.**
+
+- Target the WEAKEST clarity dimension with each question. Make weakest-dimension targeting explicit every round: name the weakest dimension, state its score/gap, and explain why the next question is aimed there
+
+**DIPP-7 — Prompt budget.**
+
+> Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts. If the user's initial context is oversized or likely to crowd out downstream prompts, create a concise prompt-safe summary first — one that preserves user intent, decisions, constraints, unknowns, cited files/symbols, and any explicit non-goals — and wait until that summary exists before ambiguity scoring, weakest-dimension selection, question generation, brownfield exploration prompts, spec crystallization, or any downstream execution handoff (bridge to `ralplan`, `ultragoal`, or `team`).
+
+**DIPP-8 — Artifact writes.**
+
+- Use the active GJC workflow/state CLI as the only sanctioned writer for `.gjc/` interview artifacts; do not edit `.gjc/` directly without an explicit force override.
+
+**DIPP-9 — Execution threshold.**
+
+- Do not proceed to execution until ambiguity ≤ the resolved threshold for this run and the user explicitly approves a scoped execution path
+</Purpose_And_Principles>
 
 <Do_Not_Use_When>
 - User has a detailed, specific request with file paths, function names, or acceptance criteria -- execute directly
@@ -35,27 +56,13 @@ Deep Interview implements Ouroboros-inspired Socratic questioning with mathemati
 - User already has a PRD or plan file and explicitly asks to execute it -- use the requested execution skill with that plan
 </Do_Not_Use_When>
 
-<Why_This_Exists>
-AI can build anything. The hard part is knowing what to build. GJC planning Phase 0 expands ideas into specs via analyst + architect, but this single-pass approach struggles with genuinely vague inputs. It asks "what do you want?" instead of "what are you assuming?" Deep Interview applies Socratic methodology to iteratively expose assumptions and mathematically gate readiness, ensuring the AI has genuine clarity before spending execution cycles.
-
-Inspired by the [Ouroboros project](https://github.com/Q00/ouroboros) which demonstrated that specification quality is the primary bottleneck in AI-assisted development.
-</Why_This_Exists>
-
 <Execution_Policy>
-- Ask ONE question at a time -- never batch multiple questions
-- Default to English when no language preference is explicit or obvious. Preserve the user/session language for every user-facing announcement, topology confirmation, option label, and interview question when state includes `language.instruction`; do not add language-specific special cases
-- Before emitting any user-facing natural-language prose governed by `language.instruction`, perform one silent, best-effort self-proofread in the preserved session language for obvious spelling, spacing, grammar, inflection/particle, and word-choice errors, using the same language-agnostic pass for whatever language is active rather than special-casing any single language. Apply it only to newly generated prose and never announce the proofreading, show before/after text, apologize for it, or re-emit a corrected copy. Do not alter code blocks or identifiers, file paths, CLI commands, JSON/configuration keys, `ask` metadata keys, table/round structure, fixed labels, numeric scores, component ids, status tokens, user quotes or source text, Phase 0 threshold markers such as `Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThresholdSource>)`, or fixed paths such as `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`; still apply the self-proofread to generated natural-language clauses or cells inside those structures, including Why now rationale, gap text, next-target phrasing, and coverage notes
-- Target the WEAKEST clarity dimension with each question
 - Before Round 1 ambiguity scoring, run a one-time Round 0 topology enumeration gate that confirms the top-level component list and locks it into state
-- Make weakest-dimension targeting explicit every round: name the weakest dimension, state its score/gap, and explain why the next question is aimed there
 - Gather codebase facts via focused read/search tools or a canonical read-only role agent (`planner`/`architect`) BEFORE asking the user about them
 - For brownfield confirmation questions, cite the repo evidence that triggered the question (file path, symbol, or pattern) instead of asking the user to rediscover it
 - Score ambiguity after every answer -- display the score transparently
 - When the locked topology has multiple active components, score and target each component explicitly so depth-first clarity on one component cannot hide ambiguity in siblings
-- Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts
-- If the user's initial context is oversized, create a concise prompt-safe summary first and wait for that summary before ambiguity scoring, question generation, or downstream execution handoff
 - Route ambiguous implementation asks to clarification, deep-interview, or downstream `ralplan` before mutation; do not infer missing target, scope, acceptance criteria, or safety boundary just to start coding.
-- Do not proceed to execution until ambiguity ≤ the resolved threshold for this run and the user explicitly approves a scoped execution path
 - Treat user wording such as `implementation`, "implementation plan", Korean `구현`, or "구현 계획" as describing the eventual target, not permission to implement now.
 - While still in deep-interview, do not implement, edit/write code, launch implementation workers, or start task/skill/ultragoal implementation; continue interviewing for scope, risks, acceptance criteria, and unknowns.
 - When the user wants interview output for eventual implementation, say: "I can interview for an implementation plan, but I won't implement during deep-interview." Then continue clarifying scope, risks, acceptance criteria, and unknowns.
@@ -165,9 +172,8 @@ Run this phase only when the active deep-interview state or invocation indicates
    - If any value is missing, return to Phase 0 instead of using a hardcoded threshold.
 3.6. **Normalize oversized initial context before state init**:
    - Inspect the initial idea plus any pasted artifacts, logs, transcripts, or file excerpts for prompt-budget risk before writing state or generating the first question.
-   - If the initial context is oversized or likely to crowd out downstream prompts, produce a concise prompt-safe summary that preserves user intent, decisions, constraints, unknowns, cited files/symbols, and any explicit non-goals.
+   - Apply the oversize summarize-first principle (DIPP-7) to produce the prompt-safe summary before state init.
    - Treat the summary as the canonical `initial_idea` and store the raw oversized material only as external/advisory context if it can be referenced safely; do not paste the raw oversized context into question-generation, ambiguity-scoring, spec-crystallization, or execution-handoff prompts.
-   - Wait until the summary exists before ambiguity scoring, weakest-dimension selection, brownfield exploration prompts, or any bridge to `ralplan`, `ultragoal`, or `team`.
 3.7. **Artifact path discipline**:
    - Final specs MUST resolve to `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly.
    - Write final specs and all ephemeral interview artifacts through the active GJC workflow/state CLI when available.
@@ -228,7 +234,7 @@ The first line of this announcement MUST be exactly the Phase 0 threshold marker
 > **Project type:** {greenfield|brownfield}
 > **Current ambiguity:** 100% (we haven't started yet)
 
-Before emitting the prose lines in this announcement, apply the `<Execution_Policy>` self-proofread once; keep the required threshold marker and the quoted `{initial_idea}` unchanged.
+Before emitting the prose lines in this announcement, apply the self-proofread once (DIPP-5); keep the required threshold marker and the quoted `{initial_idea}` unchanged.
 
 ## Round 0: Topology Enumeration Gate
 
@@ -362,7 +368,7 @@ Round {n} | Component: {target_component_name} | Targeting: {weakest_dimension} 
 
 Options should include contextually relevant choices plus free-text, translated/localized according to `language.instruction` when present.
 
-After applying `language.instruction` to the visible question, options, and generated rationale, apply the self-proofread once to new prose only; preserve only the Round/Component/Targeting/Ambiguity line structure, fixed labels, numeric ambiguity value, component/target identifiers, and `deepInterview.*` metadata keys. Do not exempt generated natural-language rationale such as Why now.
+After applying `language.instruction` to the visible question, options, and generated rationale, apply the self-proofread once to new prose only (DIPP-5); preserve only the Round/Component/Targeting/Ambiguity line structure, fixed labels, numeric ambiguity value, component/target identifiers, and `deepInterview.*` metadata keys. Do not exempt generated natural-language rationale such as Why now.
 
 When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line; if metadata cannot be supplied, the legacy formatted question text remains the fallback.
 
@@ -477,6 +483,7 @@ Respond as JSON. Include an additional "ontology" key containing the entities ar
 
 Greenfield: `ambiguity = 1 - (goal × 0.40 + constraints × 0.30 + criteria × 0.30)`
 Brownfield: `ambiguity = 1 - (goal × 0.35 + constraints × 0.25 + criteria × 0.25 + context × 0.15)`
+Brownfield adds the 15% Context Clarity dimension (Goal/Constraint/Criteria become 35/25/25) because safely modifying existing code requires understanding the system being changed.
 
 **Calculate ontology stability:**
 
@@ -524,18 +531,22 @@ Round {n} complete.
 
 Apply `language.instruction` when present before showing this progress report so status text, gaps, and next-target phrasing stay in the preserved session language.
 
-Then apply the self-proofread once to narrative status text, generated prose cells, gaps, and next-target phrasing; preserve only table structure, fixed status labels, scores, weights, component ids, and trigger tokens.
+Then apply the self-proofread once (DIPP-5) to narrative status text, generated prose cells, gaps, and next-target phrasing; preserve only table structure, fixed status labels, scores, weights, component ids, and trigger tokens.
 
 ### Step 2e: Update State
 
 Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round `gjc state write` is required for the answer shell; only scoring enrichment/state maintenance remains. When metadata is absent, use the legacy `gjc state write` path to persist the new round and never patch `.gjc/_session-{sessionid}/state` directly unless an explicit force override is active.
 Also recompute and persist `ambiguity_milestone` each round (detect band transitions for the Phase 3 panel), and persist `auto_answer_streak`, `refined_rounds`, `lateral_reviews`, and `lateral_panel_failures` alongside the existing fields.
 
-### Step 2f: Check Soft Limits
+### Step 2f: Check Tiered Confirmation Cadence
 
-- **Round 3+**: Allow early exit if user says "enough", "let's go", "build it"
-- **Round 10**: Show soft warning: "We're at 10 rounds. Current ambiguity: {score}%. Continue or proceed with current clarity?"
-- **Round 100**: Hard cap: "Maximum interview rounds reached. Proceeding with current clarity level ({score}%)."
+Confirmation cadence is tiered by round, adopted from ouroboros's ooo interview, while the hard safety cap is retained:
+
+- **Rounds 1-3 (auto-continue)**: minimum context gathering — proceed to the next question without a "continue?" prompt.
+- **Rounds 4-15 (ask to continue)**: after each round, ask "Continue, or proceed with current clarity ({score}%)?" so the user controls depth.
+- **Rounds 16+ (diminishing-returns warning)**: keep asking "Continue?" but prefix a diminishing-returns warning: "We're at {n} rounds (ambiguity: {score}%); each further round yields less. Continue or proceed?"
+- **Round 3+ early exit**: still allow immediate exit if the user says "enough", "let's go", "build it".
+- **Round 100 (hard cap)**: "Maximum interview rounds reached. Proceeding with current clarity level ({score}%)." The tiered cadence never removes this hard safety cap.
 
 ## Phase 3: Lateral Review Panel (milestone-triggered)
 
@@ -564,6 +575,24 @@ A transition occurs whenever the band changes versus the prior scored round — 
 
 **Bookkeeping:** record each convened panel in `state.lateral_reviews` (round, milestone transition or pre-answer trigger, personas dispatched, findings folded). On panel spawn or validation failure, fall back silently to the normal generated question and increment `lateral_panel_failures`; do not expose tool noise unless it changes the next user-facing question. The panel is a prompt-budgeted assist layer — summarize oversized context before dispatch.
 
+### Per-question advisory fanout lanes (distinct from the milestone panel)
+
+Separate from the milestone-triggered lateral panel above, a lightweight **advisory fanout** may assist any single question the main session is about to synthesize or route — especially when the user is terse, uncertain, or would benefit from selectable options instead of another open-ended prompt. Adopted from ouroboros's ooo interview, the standard lanes are:
+
+- `code_context` — inspect repo-local facts and reuse existing exploration before asking the user.
+- `web_context` — browse/search only when current external facts genuinely affect the answer.
+- `ambiguity_contrarian` — find hidden assumptions, vague terms, missing decisions, and risky defaults.
+- `answer_simplifier` — turn the question into 2-3 easy choices or one concise draft answer.
+- `architecture_implications` — check whether the answer changes ownership, interfaces, rollout, or system shape.
+
+Advisory fanout is an assist layer, not a decision maker: it never replaces or delays the single user-facing question, never adds a second question, and never forwards a synthesized answer without the user's approval, edit, or explicit auto-confirm request. It differs from the milestone panel in trigger (per-question, not band-transition) and intent (help the human answer this one question). When both would fire on the same round, run the milestone panel and fold advisory lanes into the same single question. Runtimes without a parallel subagent primitive process lanes sequentially; on lane failure, fall back silently to the normal generated question.
+
+### Structured adapter context and input safety (confused_terms / references / FREETEXT_FIELDS)
+
+`confused_terms` and `references` are optional structured adapter context queued at interview start. They are **non-behavioral**: they MUST NOT alter the first question, are never inferred from vocabulary density, and glossary help is limited to explicitly-confused terms while references are used only for contrast questions. Referenced `url`/`excerpt` values are inert strings that are **never auto-fetched**. These fields ride the `ask` tool `deepInterview` metadata and are carried into the gate `stage_state` as bounded, optional values.
+
+Input safety: user-facing free-text fields (an allowlist including `initial_context`, `user_response`, `goal`, `prompt`, `description`, `statement`) legitimately carry prose with shell metacharacters (`;`, `|`, `&`, backticks, `$()`) and must not be rejected as injection; structural fields (ids, categories, hashes) stay strictly validated. Runtime-ingested initial context, user responses, and each incoming structured adapter/LLM response are bounded by character-count DoS caps of 50,000, 10,000, and 100,000 characters respectively rather than by content inspection.
+
 ## Phase 4: Crystallize Spec
 
 When ambiguity ≤ threshold (or hard cap / early exit):
@@ -576,7 +605,7 @@ When ambiguity ≤ threshold (or hard cap / early exit):
 
 1. **Generate the specification** using opus model with the prompt-safe transcript. If the full interview transcript or initial context is too large, include the summary plus all concrete decisions, acceptance criteria, unresolved gaps, and ontology snapshots; never overflow the prompt with raw oversized context.
    - Apply `language.instruction` when present so user-facing prose in the spec preserves the session language; keep code identifiers, file paths, commands, JSON/settings keys, and quoted source text unchanged.
-   - Apply the self-proofread once to newly generated spec prose before persistence, including generated natural-language table cells such as coverage notes, while preserving transcript answers, quoted/source text, code identifiers, file paths, commands, JSON/settings keys, table structure/fixed labels, and `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` unchanged.
+   - Apply the self-proofread once (DIPP-5) to newly generated spec prose before persistence, including generated natural-language table cells such as coverage notes, while preserving transcript answers, quoted/source text, code identifiers, file paths, commands, JSON/settings keys, table structure/fixed labels, and `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` unchanged.
 2. **Write the final spec through the workflow CLI**: persist the artifact at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md`
    - Always use this exact final spec path. Prefer passing the spec markdown **inline** as the `--spec` value; only when it is too large to pass inline, stage it as a file in a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree and pass that path — never write scratch specs to the repo root, the project tree, or `.gjc/`.
    - Use the native deep-interview write command with `--write --stage final --slug {slug} --spec <markdown-or-path> [--json]` for artifact and state persistence; direct `.gjc/` file edits are forbidden unless an explicit force override is active.
@@ -865,7 +894,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 
 <Escalation_And_Stop_Conditions>
 - **Hard cap at 100 rounds**: Proceed with whatever clarity exists, noting the risk
-- **Soft warning at 10 rounds**: Offer to continue or proceed
+- **Tiered confirmation cadence**: rounds 1-3 auto-continue, rounds 4-15 ask to continue, rounds 16+ ask with a diminishing-returns warning
 - **Early exit (round 3+)**: Allow with warning if ambiguity > threshold
 - **User says "stop", "cancel", "abort"**: Stop immediately, save state for resume
 - **Ambiguity stalls** (same score +-0.05 for 3 rounds): Activate Ontologist mode to reframe
@@ -900,7 +929,7 @@ Optional settings in `.gjc/settings.json`:
     "deepInterview": {
       "ambiguityThreshold": <resolvedThreshold>,
       "maxRounds": 100,
-      "softWarningRounds": 10,
+      "softWarningRounds": 16,
       "minRoundsBeforeExit": 3,
       "enableChallengeAgents": true,
       "autoExecuteOnComplete": false,
@@ -938,14 +967,6 @@ The ralplan pre-approval gate already redirects vague prompts to planning. Deep 
 ```
 Vague prompt → ralplan gate → deep-interview (if extremely vague) → ralplan (with clear spec) → pending approval → explicitly approved execution
 ```
-
-## Brownfield vs Greenfield Weights
-
-See "Calculate ambiguity" in Step 2c for the weighted formulas. Brownfield adds a 15% Context Clarity dimension (Goal/Constraint/Criteria become 35/25/25) because safely modifying existing code requires understanding the system being changed.
-
-## Lateral Review Panel
-
-See Phase 3 for the full persona set (researcher/contrarian/simplifier, plus architect on scope change), the milestone bands, and the parallel independent-context dispatch.
 
 ## Ambiguity Score Interpretation
 

@@ -140,6 +140,7 @@ function createStubInputControllerContext(opts: {
 		compactionQueuedMessages: [],
 		locallySubmittedUserSignatures: new Set<string>(),
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
 	return { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage, sendCustomMessage, prompt };
@@ -592,6 +593,7 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 		},
 		updatePendingMessagesDisplay,
 		locallySubmittedUserSignatures: new Set<string>(),
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
 	return { ctx, editor, pendingMessagesContainer };
@@ -705,6 +707,7 @@ function createEventControllerFixtureForE10() {
 		addMessageToChat,
 		updatePendingMessagesDisplay,
 		session: {},
+		hasActiveBtw: () => false,
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);

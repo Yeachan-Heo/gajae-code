@@ -31,20 +31,50 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.3"
+              bun-version: "1.3.14"
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
          - name: Lint and type check (native-free)
            run: bun run ci:check:full
 
-   test:
+   # ---------------------------------------------------------------------------
+   # PR + main branch: sharded full test suite. Unlike dev CI (changed-path
+   # affected), Main CI runs the COMPLETE task union via CI_FORCE_FULL. Long-tail
+   # tasks are sub-split (coding-agent tests 16-way, rust-test 4 nextest
+   # partitions) so no single shard dominates wall-time. The `test` aggregate job
+   # keeps the stable branch-protection status name.
+   # ---------------------------------------------------------------------------
+   main_plan:
       if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
       runs-on: ubuntu-22.04
-      timeout-minutes: 60
+      timeout-minutes: 10
+      env:
+         CI_FORCE_FULL: "1"
+         CI_CODING_AGENT_TEST_SHARDS: "16"
+         CI_RUST_TEST_PARTITIONS: "4"
+      outputs:
+         matrix: ${{ steps.plan.outputs.matrix }}
+         has_tasks: ${{ steps.plan.outputs.has_tasks }}
+         has_native: ${{ steps.plan.outputs.has_native }}
+         has_python: ${{ steps.plan.outputs.has_python }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3.14"
+         - name: Compute full Main CI task matrix
+           id: plan
+           run: bun scripts/ci-dev-affected.ts --matrix-json
+
+   main_native:
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.main_plan.outputs.has_native == 'true' }}
+      needs: [main_plan]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 30
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
@@ -52,35 +82,137 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
+              bun-version: "1.3.14"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Build native addon (linux-x64 baseline + modern)
+           env:
+              TARGET_PLATFORM: linux
+              TARGET_ARCH: x64
+              TARGET_VARIANTS: baseline modern
+           run: bun run ci:build:native
+         - name: Verify required native addon variants
+           run: |
+              test -f packages/natives/native/pi_natives.linux-x64-baseline.node
+              test -f packages/natives/native/pi_natives.linux-x64-modern.node
+         - name: Upload native addon(s)
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: main-native-${{ github.run_id }}
+              path: |
+                 packages/natives/native/pi_natives.linux-x64-baseline.node
+                 packages/natives/native/pi_natives.linux-x64-modern.node
+              if-no-files-found: error
+              retention-days: 1
+              overwrite: true
+
+   main_python_matrix:
+      name: Python SDK / ${{ matrix.python-version }}
+      needs: [main_plan, main_native]
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && needs.main_plan.outputs.has_python == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
+      runs-on: ubuntu-22.04
+      timeout-minutes: 30
+      strategy:
+         fail-fast: false
+         matrix:
+            python-version: ["3.10", "3.11", "3.12", "3.13"]
+      env:
+         GJC_REAL_SESSION_TESTS: "1"
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
               bun-version: "1.3"
+         - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+           with:
+              python-version: ${{ matrix.python-version }}
+         - name: Download native addon(s)
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: main-native-${{ github.run_id }}
+              path: packages/natives/native
+         - run: bun install --frozen-lockfile
+         - run: bun run check:py-sdk
+         - run: bun run test:py-sdk
+         - run: bun run ci:test:py-sdk-build
+           if: ${{ matrix.python-version == '3.12' }}
+
+   main_shards:
+      name: test-shard / ${{ matrix.key }}
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && needs.main_plan.outputs.has_tasks == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
+      needs: [main_plan, main_native]
+      runs-on: ubuntu-22.04
+      timeout-minutes: ${{ matrix.rust && 90 || 60 }}
+      strategy:
+         fail-fast: false
+         max-parallel: 16
+         matrix: ${{ fromJSON(needs.main_plan.outputs.matrix) }}
+      env:
+         CI_FORCE_FULL: "1"
+         CI_CODING_AGENT_TEST_SHARDS: "16"
+         CI_RUST_TEST_PARTITIONS: "4"
+         AFFECTED_TASK_KEY: ${{ matrix.key }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.3.14"
          - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+           if: ${{ matrix.rust }}
            with:
               toolchain: nightly-2026-04-29
-         - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+         - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e  # v2
+           if: ${{ matrix.nextest }}
            with:
-              shared-key: test-linux-x64
+              tool: nextest@0.9.137
+         - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+           if: ${{ matrix.rust }}
+           with:
+              shared-key: main-rust-linux-x64
               save-if: ${{ github.ref == 'refs/heads/main' }}
               cache-workspace-crates: true
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
-         - name: Build native addon (linux-x64)
-           env:
-              TARGET_PLATFORM: linux
-              TARGET_ARCH: x64
-              TARGET_VARIANTS: baseline
-           run: bun run ci:build:native
-         - name: Runtime checks (needs native addon)
-           run: bun --cwd=packages/coding-agent run check:runtime
-         - name: Test workspace
+         - name: Download native addon(s)
+           if: ${{ matrix.native }}
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: main-native-${{ github.run_id }}
+              path: packages/natives/native
+         - name: Run task shard
            env:
               GITHUB_ACTIONS: ""
-           run: bun run test:ts
-         - name: CLI smoke test
-           run: bun run ci:test:smoke
+           run: bun scripts/ci-dev-affected.ts --task="$AFFECTED_TASK_KEY"
+
+   # Branch protection must keep requiring this stable aggregate status.
+   test:
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') }}
+      needs: [main_plan, main_native, main_python_matrix, main_shards]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 5
+      steps:
+         - name: Fail closed unless every shard succeeded
+           run: |
+              plan='${{ needs.main_plan.result }}'
+              native='${{ needs.main_native.result }}'
+              shards='${{ needs.main_shards.result }}'
+              python='${{ needs.main_python_matrix.result }}'
+              echo "main_plan=$plan main_native=$native main_python_matrix=$python main_shards=$shards"
+              test "$plan" = success
+              case "$native" in success|skipped) ;; *) echo "native gate failed"; exit 1;; esac
+              case "$python" in success|skipped) ;; *) echo "Python gate failed"; exit 1;; esac
+              test "$shards" = success
 
    # ---------------------------------------------------------------------------
    # Tag (vX.Y.Z) only: build native addons for every published platform,
@@ -134,12 +266,12 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.3"
+              bun-version: "1.3.14"
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
          - name: Download native addon(s)
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
@@ -187,12 +319,12 @@ jobs:
               node-version: "24"
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
            with:
-              bun-version: "1.3"
+              bun-version: "1.3.14"
          - name: Cache bun dependencies
            uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
            with:
               path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+              key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
          - name: Download all native addons
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4

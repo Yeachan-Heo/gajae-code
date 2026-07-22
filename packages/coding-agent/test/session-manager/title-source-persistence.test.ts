@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,38 +9,11 @@ import {
 	type SessionHeader,
 	SessionManager,
 } from "@gajae-code/coding-agent/session/session-manager";
-import {
-	FileSessionStorage,
-	type SessionStorageWriter,
-	type SessionStorageWriterOpenOptions,
-} from "@gajae-code/coding-agent/session/session-storage";
+import { FileSessionStorage, type SessionStorageWriter } from "@gajae-code/coding-agent/session/session-storage";
+import * as native from "@gajae-code/natives";
 import { getConfigRootDir, parseJsonlLenient, setAgentDir } from "@gajae-code/utils";
 
 import { makeAssistantMessage } from "./helpers";
-
-class FailingHeaderPatchStorage extends FileSessionStorage {
-	failHeaderPatchWrites = false;
-
-	override openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
-		const writer = super.openWriter(path, options);
-		return {
-			writeLine: async line => {
-				if (this.failHeaderPatchWrites && line.includes('"type":"header_patch"')) {
-					throw new Error("header patch write failed");
-				}
-				await writer.writeLine(line);
-			},
-			writeLineSync: line => writer.writeLineSync(line),
-			flush: () => writer.flush(),
-			fsync: () => writer.fsync(),
-			close: () => writer.close(),
-			closeSync: () => writer.closeSync(),
-			getError: () => writer.getError(),
-			getCloseState: () => writer.getCloseState(),
-			getCloseError: () => writer.getCloseError(),
-		};
-	}
-}
 
 function getHeader(entries: unknown[]): SessionHeader | undefined {
 	return entries.find(
@@ -333,7 +306,7 @@ describe("session title source persistence", () => {
 		it("rejects when the moved session cwd patch cannot be written", async () => {
 			const destinationCwd = path.join(testAgentDir, "destination-cwd");
 			fs.mkdirSync(destinationCwd, { recursive: true });
-			const storage = new FailingHeaderPatchStorage();
+			const storage = new FileSessionStorage();
 			const session = SessionManager.create(cwd, undefined, storage);
 			session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 			session.appendMessage(makeAssistantMessage());
@@ -341,8 +314,37 @@ describe("session title source persistence", () => {
 			const originalFile = session.getSessionFile();
 			expect(originalFile).toBeDefined();
 
-			storage.failHeaderPatchWrites = true;
-			await expect(session.moveTo(destinationCwd)).rejects.toThrow("header patch write failed");
+			const originalAppend = native.RecoveryFsRoot.prototype.appendManaged;
+			const append = vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
+				this: native.RecoveryFsRoot,
+				relativePath,
+				data,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			) {
+				if (Buffer.from(data).includes(Buffer.from('"type":"header_patch"')))
+					return { ok: false, code: "header_patch_write_failed" };
+				return originalAppend.call(
+					this,
+					relativePath,
+					data,
+					expectedDev,
+					expectedIno,
+					expectedSize,
+					expectedMtimeNs,
+					expectedCtimeNs,
+					expectedSha256,
+				);
+			});
+			try {
+				await expect(session.moveTo(destinationCwd)).rejects.toThrow("header_patch_write_failed");
+			} finally {
+				append.mockRestore();
+			}
 			expect(session.getCwd()).toBe(cwd);
 			expect(session.getSessionFile()).toBe(originalFile);
 			expect((await loadEntriesFromFile(originalFile!, storage))[0]).toMatchObject({ cwd });

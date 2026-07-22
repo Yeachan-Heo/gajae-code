@@ -41,6 +41,7 @@ function oauthCredential(overrides: Partial<ImportableCredential> = {}): Importa
 		origin: "claude-code-file",
 		source: "Claude Code (test)",
 		kind: "oauth",
+		expiresAt: Date.now() + 60_000,
 		redactedToken: "sk-a…oken",
 		credential: { type: "oauth", access: "a", refresh: "r", expires: Date.now() + 60_000 },
 		...overrides,
@@ -793,6 +794,24 @@ describe("setup credentials keychain and preview behavior", () => {
 		const payload = JSON.parse(stdout.trim());
 		expect(payload.importable).toEqual([]);
 		expect(JSON.stringify(payload)).not.toContain("api_key");
+	});
+
+	test("setup dry-run keeps expired OAuth discoveries visible but non-importable", async () => {
+		const reads = { discover: 0, keychain: 0 };
+		const expired = oauthCredential({
+			expiresAt: 0,
+			credential: { type: "oauth", access: "expired-access", refresh: "expired-refresh", expires: 0 },
+		});
+		await handleCredentialsSetup({ json: true, dryRun: true }, deps(reads, discovery([expired])));
+		const payload = JSON.parse(stdout.trim());
+		expect(payload.importable).toEqual([]);
+		expect(payload.skipped).toEqual([
+			expect.objectContaining({
+				source: "Claude Code (test)",
+				reason: "OAuth credential has no valid future expiry",
+			}),
+		]);
+		expect(payload.imported).toEqual([]);
 	});
 
 	test("denied keychain read records sanitized skip and continues", async () => {

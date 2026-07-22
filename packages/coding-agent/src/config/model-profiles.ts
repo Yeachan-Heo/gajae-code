@@ -136,25 +136,25 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "zai/glm-5.2:xhigh",
 	}),
 	profile("kimi-coding-plan-eco", ["kimi-code"], {
-		default: "kimi-code/kimi-k2.7-code:low",
-		executor: "kimi-code/kimi-k2.7-code:minimal",
-		planner: "kimi-code/kimi-k2.7-code:low",
-		critic: "kimi-code/kimi-k2.7-code:medium",
-		architect: "kimi-code/kimi-k2.7-code:high",
+		default: "kimi-code/k3:low",
+		executor: "kimi-code/k3:low",
+		planner: "kimi-code/k3:low",
+		critic: "kimi-code/k3:high",
+		architect: "kimi-code/k3:high",
 	}),
 	profile("kimi-coding-plan-medium", ["kimi-code"], {
-		default: "kimi-code/kimi-k2.7-code:medium",
-		executor: "kimi-code/kimi-k2.7-code:low",
-		planner: "kimi-code/kimi-k2.7-code:medium",
-		critic: "kimi-code/kimi-k2.7-code:high",
-		architect: "kimi-code/kimi-k2.7-code:xhigh",
+		default: "kimi-code/k3:high",
+		executor: "kimi-code/k3:low",
+		planner: "kimi-code/k3:high",
+		critic: "kimi-code/k3:high",
+		architect: "kimi-code/k3:max",
 	}),
 	profile("kimi-coding-plan-pro", ["kimi-code"], {
-		default: "kimi-code/kimi-k2.7-code:xhigh",
-		executor: "kimi-code/kimi-k2.7-code:medium",
-		planner: "kimi-code/kimi-k2.7-code:high",
-		critic: "kimi-code/kimi-k2.7-code:xhigh",
-		architect: "kimi-code/kimi-k2.7-code:xhigh",
+		default: "kimi-code/k3:max",
+		executor: "kimi-code/k3:high",
+		planner: "kimi-code/k3:high",
+		critic: "kimi-code/k3:max",
+		architect: "kimi-code/k3:max",
 	}),
 	profile("mimo-eco", ["xiaomi"], {
 		default: "xiaomi/mimo-v2.5-pro:low",
@@ -257,6 +257,20 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "minimax-code/minimax-m3:xhigh",
 		architect: "minimax-code/minimax-m3:xhigh",
 	}),
+	profile("alibaba-token-plan-balanced", ["alibaba-token-plan"], {
+		default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+		executor: "alibaba-token-plan/deepseek-v4-pro:xhigh",
+		planner: "alibaba-token-plan/glm-5.2:high",
+		architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		critic: "alibaba-token-plan/glm-5.2:high",
+	}),
+	profile("alibaba-token-plan-qwenmaxxing", ["alibaba-token-plan"], {
+		default: "alibaba-token-plan/qwen3.8-max-preview:medium",
+		executor: "alibaba-token-plan/qwen3.8-max-preview:low",
+		planner: "alibaba-token-plan/qwen3.8-max-preview:medium",
+		architect: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+		critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
+	}),
 	profile("opus-codex", ["anthropic", "openai-codex"], {
 		default: "anthropic/claude-opus-4-8:xhigh",
 		executor: "openai-codex/gpt-5.6-terra:low",
@@ -315,6 +329,8 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"minimax-eco": { displayName: "MiniMax Eco", providerGroup: "MINIMAX" },
 	"minimax-medium": { displayName: "MiniMax Medium", providerGroup: "MINIMAX" },
 	"minimax-pro": { displayName: "MiniMax Pro", providerGroup: "MINIMAX" },
+	"alibaba-token-plan-balanced": { displayName: "Balanced", providerGroup: "ALIBABA TOKEN PLAN" },
+	"alibaba-token-plan-qwenmaxxing": { displayName: "QwenMaxxing", providerGroup: "ALIBABA TOKEN PLAN" },
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
 	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
@@ -330,6 +346,7 @@ const PROFILE_GROUP_ORDER = [
 	"GROK",
 	"CURSOR",
 	"MINIMAX",
+	"ALIBABA TOKEN PLAN",
 	"COMBOS",
 ];
 
@@ -347,6 +364,7 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	"grok-build": "grok-build-pro",
 	cursor: "cursor-medium",
 	"minimax-code": "minimax-medium",
+	"alibaba-token-plan": "alibaba-token-plan-balanced",
 };
 
 export function getModelProfilePresentation(

@@ -1,0 +1,7 @@
+{
+  "$schema": "sdk-frame-vectors/v1",
+  "kind": "frame",
+  "name": "non-canonical action-needed preserves bytes",
+  "rawFrame": " { \"options\" : [\"caf\\u00e9\", \"\\u2603\"], \"kind\" : \"ask\", \"type\":\"action_needed\", \"id\":\"ask-1\", \"sessionId\":\"session-1\", \"unknown_future\":true } ",
+  "expectations": { "type": "action_needed", "bytePreservation": true }
+}

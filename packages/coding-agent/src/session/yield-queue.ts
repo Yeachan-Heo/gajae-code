@@ -107,6 +107,26 @@ export class YieldQueue {
 		this.#idleFlushPending = false;
 	}
 
+	/** Drop only the queued entries of a single kind, leaving other kinds intact. */
+	clearKind(kind: string): void {
+		this.#entries.delete(kind);
+	}
+
+	/**
+	 * Re-schedule an idle flush if work remains and the session is idle. Used after
+	 * a transition (e.g. handoff) releases a delivery fence so entries queued while
+	 * fenced are not stranded until an unrelated enqueue or agent yield.
+	 */
+	rearmIdle(): void {
+		if (this.#options.isStreaming()) return;
+		for (const entries of this.#entries.values()) {
+			if (entries.length > 0) {
+				this.#scheduleIdleFlush();
+				return;
+			}
+		}
+	}
+
 	#scheduleIdleFlush(): void {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;

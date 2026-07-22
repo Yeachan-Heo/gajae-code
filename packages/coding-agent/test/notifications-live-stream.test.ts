@@ -2,8 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Settings } from "../src/config/settings";
+import { getNotificationConfig } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
-import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import type { NotificationSessionContext } from "../src/sdk/bus/session-control";
+import { NotificationSessionController } from "../src/sdk/bus/session-control";
+import { type EnsureDaemonResult, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
+import { TelegramDaemonController } from "../src/sdk/bus/telegram-daemon-control";
 import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { renderThreadedFrame } from "../src/sdk/bus/threaded-render";
 import {
@@ -49,8 +54,8 @@ test("finalized turn_stream without a messageRef keeps legacy keyless behaviour 
 });
 
 // ---------------------------------------------------------------------------
-// 2) Core emit: message_update -> throttled live turn_stream frames, opt-in and
-//    redaction-aware, with the finalized turn carrying the same messageRef.
+// 2) Core emit: message_update -> throttled live turn_stream frames, durable
+//    Telegram preference with env override, and redaction-aware finalization.
 // ---------------------------------------------------------------------------
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -96,7 +101,22 @@ function setEnv(over: Partial<Record<(typeof envKeys)[number], string>>): void {
 	for (const [k, v] of Object.entries(over)) process.env[k] = v;
 }
 
-async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unknown; frames: Frame[] }> {
+async function bootSession(
+	settingsOverrides: Record<string, unknown> = {},
+	options: {
+		ensureTelegramDaemon?: (input: {
+			settings: Settings;
+			cwd: string;
+			sessionId: string;
+		}) => Promise<EnsureDaemonResult>;
+	} = {},
+): Promise<{
+	handlers: Map<string, Handler>;
+	ctx: NotificationSessionContext;
+	frames: Frame[];
+	settings: Settings;
+	controller: NotificationSessionController;
+}> {
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
@@ -107,7 +127,20 @@ async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unk
 	const agentDir = path.join(cwd, ".gjc", "agent");
 	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 	cleanupRoots.push(cleanup);
-	createNotificationsExtension(api, { settings: isolatedNotificationSettings(agentDir) });
+	const botToken = settingsOverrides["notifications.telegram.botToken"];
+	const chatId = settingsOverrides["notifications.telegram.chatId"];
+	if (typeof botToken === "string" && typeof chatId === "string") {
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			`notifications:\n  enabled: true\n  daemon:\n    idleTimeoutMs: 20\n  telegram:\n    botToken: ${JSON.stringify(botToken)}\n    chatId: ${JSON.stringify(chatId)}\n`,
+		);
+	}
+	const settings = isolatedNotificationSettings(agentDir, settingsOverrides);
+	const controller = new NotificationSessionController({
+		eligible: true,
+		getConfig: () => getNotificationConfig(settings),
+	});
+	createNotificationsExtension(api, { settings, controller, ensureTelegramDaemon: options.ensureTelegramDaemon });
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -119,12 +152,16 @@ async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unk
 		},
 		getContextUsage: () => undefined,
 		getModel: () => undefined,
-	} as never;
+	} as NotificationSessionContext;
 
 	registerNotificationRuntime(cleanup, {
 		key: `notification-session:${sid}`,
 		shutdown: async () => {
 			await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+			if (typeof botToken === "string" && typeof chatId === "string") {
+				const stopped = await new TelegramDaemonController(settings).stop();
+				if (!stopped.ok) throw new Error(`Failed to stop fixture Telegram daemon: ${stopped.message}`);
+			}
 		},
 	});
 	await handlers.get("session_start")!({ type: "session_start" }, ctx);
@@ -142,7 +179,7 @@ async function bootSession(): Promise<{ handlers: Map<string, Handler>; ctx: unk
 		ws.addEventListener("error", () => reject(new Error("ws error")));
 	});
 	await sleep(250);
-	return { handlers, ctx, frames };
+	return { handlers, ctx, frames, settings, controller };
 }
 
 const assistant = (content: string) => ({ type: "message_update", message: { role: "assistant", content } });
@@ -181,21 +218,205 @@ test("rapid live updates are throttled to a single frame within the interval", a
 	expect(live().length).toBe(1); // later updates fall inside the throttle window
 }, 15_000);
 
-test("no live frames are emitted when streaming is disabled, and finalized carries no messageRef", async () => {
-	setEnv({ GJC_NOTIFICATIONS: "1" }); // GJC_NOTIFICATIONS_STREAM unset -> off
-	const { handlers, ctx, frames } = await bootSession();
+test("defers a finalized turn during ownership preflight and flushes it once with the live message reference", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	let deferEnsure = false;
+	const ensureEntered = Promise.withResolvers<void>();
+	const releaseEnsure = Promise.withResolvers<void>();
+	const { handlers, ctx, frames, settings, controller } = await bootSession(
+		{
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": "123456:secret-token",
+			"notifications.telegram.chatId": "42",
+		},
+		{
+			ensureTelegramDaemon: async () => {
+				if (!deferEnsure) return "attached";
+				ensureEntered.resolve();
+				await releaseEnsure.promise;
+				return "attached";
+			},
+		},
+	);
+	deferEnsure = true;
+	const streams = () => frames.filter(frame => frame.type === "turn_stream");
+	await handlers.get("message_update")!(assistant("partial before preference save"), ctx);
+	await waitFor(() => streams().some(frame => frame.phase === "live"), 3000, "live frame");
+	const liveRef = streams().find(frame => frame.phase === "live")?.messageRef;
+
+	settings.set("notifications.telegram.streaming.enabled", false);
+	const reconciliation = controller.reconcileCurrentSession(ctx);
+	await Promise.race([
+		ensureEntered.promise,
+		Bun.sleep(3000).then(() => {
+			throw new Error("deferred ensure was not entered");
+		}),
+	]);
+	await handlers.get("turn_end")!(
+		{ type: "turn_end", message: { role: "assistant", content: "authoritative final during preflight" } },
+		ctx,
+	);
+	await sleep(50);
+	expect(streams().some(frame => frame.phase === "finalized")).toBe(false);
+
+	releaseEnsure.resolve();
+	await Promise.race([
+		reconciliation,
+		Bun.sleep(3000).then(() => {
+			throw new Error("reconciliation did not settle after ensure release");
+		}),
+	]);
+	await waitFor(() => streams().some(frame => frame.phase === "finalized"), 3000, "deferred finalized frame");
+	const finalized = streams().filter(frame => frame.phase === "finalized");
+	expect(finalized).toHaveLength(1);
+	expect(finalized[0]?.messageRef).toBe(liveRef);
+	expect(finalized[0]?.text).toContain("authoritative final during preflight");
+}, 20_000);
+
+test("a durable Telegram streaming disable before the first live frame leaves the final keyless", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	const { handlers, ctx, frames } = await bootSession({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "123456:secret-token",
+		"notifications.telegram.chatId": "42",
+		"notifications.telegram.streaming.enabled": false,
+	});
 
 	await handlers.get("message_update")!(assistant("should not stream"), ctx);
 	await sleep(200);
-	expect(frames.filter(f => f.type === "turn_stream" && f.phase === "live").length).toBe(0);
+	expect(frames.filter(frame => frame.type === "turn_stream" && frame.phase === "live")).toHaveLength(0);
 
 	await handlers.get("turn_end")!(
 		{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "final only" } },
 		ctx,
 	);
-	await waitFor(() => frames.some(f => f.type === "turn_stream" && f.phase === "finalized"), 3000, "finalized");
-	const final = frames.find(f => f.type === "turn_stream" && f.phase === "finalized")!;
+	await waitFor(
+		() => frames.some(frame => frame.type === "turn_stream" && frame.phase === "finalized"),
+		3000,
+		"finalized",
+	);
+	const final = frames.find(frame => frame.type === "turn_stream" && frame.phase === "finalized")!;
 	expect(final.messageRef).toBeUndefined();
+}, 15_000);
+
+test("a configured Telegram destination enables durable streaming by default", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	const { handlers, ctx, frames } = await bootSession({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "123456:secret-token",
+		"notifications.telegram.chatId": "42",
+	});
+
+	await handlers.get("message_update")!(assistant("enabled by durable default"), ctx);
+	await waitFor(
+		() => frames.some(frame => frame.type === "turn_stream" && frame.phase === "live"),
+		3000,
+		"durable-default live frame",
+	);
+	const live = frames.find(frame => frame.type === "turn_stream" && frame.phase === "live")!;
+	expect(live.text).toContain("enabled by durable default");
+	expect(live.messageRef).toBeDefined();
+}, 15_000);
+
+test("an explicit streaming environment disable takes precedence over the durable Telegram default", async () => {
+	setEnv({
+		GJC_NOTIFICATIONS: "1",
+		GJC_NOTIFICATIONS_STREAM: "off",
+		GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000",
+	});
+	const { handlers, ctx, frames } = await bootSession({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "123456:secret-token",
+		"notifications.telegram.chatId": "42",
+	});
+
+	await handlers.get("message_update")!(assistant("disabled by environment"), ctx);
+	await sleep(200);
+	expect(frames.filter(frame => frame.type === "turn_stream" && frame.phase === "live")).toHaveLength(0);
+
+	await handlers.get("turn_end")!(
+		{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "env-disabled final" } },
+		ctx,
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "turn_stream" && frame.phase === "finalized"),
+		3000,
+		"finalized",
+	);
+	const final = frames.find(frame => frame.type === "turn_stream" && frame.phase === "finalized")!;
+	expect(final.messageRef).toBeUndefined();
+}, 15_000);
+
+test("a mid-turn disable retains the streamed message for its authoritative final, then cleanly restarts next turn", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	const { handlers, ctx, frames, settings, controller } = await bootSession({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "123456:secret-token",
+		"notifications.telegram.chatId": "42",
+	});
+	const liveFrames = () => frames.filter(frame => frame.type === "turn_stream" && frame.phase === "live");
+
+	await handlers.get("message_update")!(assistant("before durable disable"), ctx);
+	await waitFor(() => liveFrames().length === 1, 3000, "initial live frame");
+	const firstLive = liveFrames()[0]!;
+
+	settings.set("notifications.telegram.streaming.enabled", false);
+	await controller.reconcileCurrentSession(ctx);
+	await handlers.get("message_update")!(assistant("must not add another live frame"), ctx);
+	await sleep(200);
+	expect(liveFrames()).toHaveLength(1);
+
+	await handlers.get("turn_end")!(
+		{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "authoritative final" } },
+		ctx,
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "turn_stream" && frame.phase === "finalized"),
+		3000,
+		"finalized",
+	);
+	const final = frames.find(frame => frame.type === "turn_stream" && frame.phase === "finalized")!;
+	expect(final.text).toContain("authoritative final");
+	expect(final.messageRef).toBe(firstLive.messageRef);
+
+	settings.set("notifications.telegram.streaming.enabled", true);
+	await controller.reconcileCurrentSession(ctx);
+	await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+	await handlers.get("message_update")!(assistant("new turn after re-enable"), ctx);
+	await waitFor(() => liveFrames().length === 2, 3000, "re-enabled live frame");
+	expect(liveFrames()[1]!.messageRef).not.toBe(firstLive.messageRef);
+}, 15_000);
+
+test("an atomic redact-and-disable refresh suppresses all later turn content", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
+	const { handlers, ctx, frames, settings, controller } = await bootSession({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": "123456:secret-token",
+		"notifications.telegram.chatId": "42",
+	});
+
+	await handlers.get("message_update")!(assistant("visible before privacy refresh"), ctx);
+	await waitFor(
+		() => frames.some(frame => frame.type === "turn_stream" && frame.phase === "live"),
+		3000,
+		"initial live frame",
+	);
+	const frameCountAtRefresh = frames.length;
+	await settings.commitAtomicBatch([
+		{ path: "notifications.redact", op: "set", value: true },
+		{ path: "notifications.telegram.streaming.enabled", op: "set", value: false },
+	]);
+	await controller.reconcileCurrentSession(ctx);
+
+	await handlers.get("message_update")!(assistant("secret after privacy refresh"), ctx);
+	await handlers.get("turn_end")!(
+		{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "secret final after privacy refresh" } },
+		ctx,
+	);
+	await sleep(200);
+
+	const laterTurnFrames = frames.slice(frameCountAtRefresh).filter(frame => frame.type === "turn_stream");
+	expect(laterTurnFrames).toEqual([]);
 }, 15_000);
 
 // ---------------------------------------------------------------------------

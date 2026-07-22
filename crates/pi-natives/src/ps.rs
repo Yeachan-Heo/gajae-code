@@ -112,6 +112,17 @@ impl Process {
 		self.inner.args()
 	}
 
+	/// Send `signal` only to this pinned process reference.
+	///
+	/// On Linux this uses the owned pidfd; on Windows it uses the owned process
+	/// handle. It deliberately never discovers descendants or signals a process
+	/// group. Returns `false` when the pinned process has already exited or the
+	/// operating system rejects delivery.
+	#[napi]
+	pub fn signal_root(&self, signal: i32) -> bool {
+		self.inner.signal_root(signal)
+	}
+
 	/// Send `signal` to this process and its descendants, children first.
 	///
 	/// On Linux and macOS the signal is forwarded as-is. On Windows there is no

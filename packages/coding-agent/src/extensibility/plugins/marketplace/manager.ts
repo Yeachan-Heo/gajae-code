@@ -12,12 +12,11 @@ import * as path from "node:path";
 
 import { isEnoent, logger, pathIsWithin } from "@gajae-code/utils";
 
-import { cachePlugin } from "./cache";
+import { cachePlugin, getCachedPluginPath } from "./cache";
 import { classifySource, fetchMarketplace, parseMarketplaceCatalog, promoteCloneToCache } from "./fetcher";
 import {
 	addInstalledPlugin,
 	addMarketplaceEntry,
-	collectReferencedPaths,
 	getInstalledPlugin,
 	getMarketplaceEntry,
 	readInstalledPluginsRegistry,
@@ -255,6 +254,7 @@ export class MarketplaceManager {
 		if (existing && existing.length > 0 && !force) {
 			throw new Error(`Plugin "${pluginId}" is already installed. Use force option to reinstall.`);
 		}
+		const existingCachePaths = existing ? await this.#validateCacheDeletionTargets(pluginId, existing) : [];
 
 		// 4. Resolve source path.
 		// marketplaceClonePath is the marketplace root — the directory containing .Anthropic model-plugin/
@@ -289,6 +289,9 @@ export class MarketplaceManager {
 		let cachePath!: string;
 		try {
 			version = await this.#resolvePluginVersion(pluginEntry, sourcePath);
+			if ([marketplace, name, version].some(component => /[. ]$/.test(component))) {
+				throw new Error(`Invalid cache identity for plugin "${pluginId}"`);
+			}
 			cachePath = await cachePlugin(sourcePath, this.#opts.pluginsCacheDir, marketplace, name, version);
 			await this.#writeEmbeddedLspConfig(pluginEntry, cachePath);
 		} finally {
@@ -311,11 +314,13 @@ export class MarketplaceManager {
 					? readInstalledPluginsRegistry(this.#opts.projectInstalledRegistryPath)
 					: Promise.resolve({ version: 2 as const, plugins: {} as Record<string, InstalledPluginEntry[]> }),
 			]);
-			const referenced = collectReferencedPaths(userReg, projectReg);
+			const referenced = this.#collectReferencedCacheIdentities(userReg, projectReg);
+			const cachePathIdentity = this.#cacheDeletionIdentity(cachePath);
 
-			for (const entry of existing) {
-				if (entry.installPath !== cachePath && !referenced.has(entry.installPath)) {
-					await fs.rm(entry.installPath, { recursive: true, force: true });
+			for (const existingCachePath of existingCachePaths) {
+				const existingIdentity = this.#cacheDeletionIdentity(existingCachePath);
+				if (existingIdentity !== cachePathIdentity && !referenced.has(existingIdentity)) {
+					await fs.rm(existingCachePath, { recursive: true, force: true });
 				}
 			}
 		}
@@ -395,6 +400,84 @@ export class MarketplaceManager {
 		return "0.0.0";
 	}
 
+	async #validateCacheDeletionTargets(pluginId: string, entries: readonly InstalledPluginEntry[]): Promise<string[]> {
+		const parsed = parsePluginId(pluginId);
+		if (!parsed) {
+			throw new Error(`Invalid plugin ID format: "${pluginId}". Expected "name@marketplace".`);
+		}
+
+		const targets: string[] = [];
+		for (const entry of entries) {
+			if ([parsed.marketplace, parsed.name, entry.version].some(component => /[. ]$/.test(component))) {
+				throw new Error(`Refusing to remove plugin "${pluginId}": invalid recorded cache identity`);
+			}
+
+			let targetPath: string;
+			try {
+				targetPath = getCachedPluginPath(
+					this.#opts.pluginsCacheDir,
+					parsed.marketplace,
+					parsed.name,
+					entry.version,
+				);
+			} catch (error) {
+				throw new Error(`Refusing to remove plugin "${pluginId}": invalid recorded cache identity`, {
+					cause: error,
+				});
+			}
+
+			if (entry.installPath !== targetPath) {
+				throw new Error(`Refusing to remove plugin "${pluginId}": recorded install path is not its cache path`);
+			}
+
+			try {
+				const stat = await fs.lstat(targetPath);
+				if (stat.isSymbolicLink()) {
+					throw new Error(`Refusing to remove plugin "${pluginId}": cache path is a symbolic link or junction`);
+				}
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+
+			targets.push(targetPath);
+		}
+		return targets;
+	}
+
+	#cacheDeletionIdentity(cachePath: string): string {
+		// Model Windows path identity on every host so reference protection is
+		// deterministic: case is ignored and trailing dots/spaces are discarded.
+		return path
+			.resolve(cachePath)
+			.split(path.sep)
+			.map(component => component.replace(/[. ]+$/, "").toLowerCase())
+			.join(path.sep);
+	}
+
+	#collectReferencedCacheIdentities(...registries: InstalledPluginsRegistry[]): Set<string> {
+		const identities = new Set<string>();
+		for (const registry of registries) {
+			for (const [pluginId, entries] of Object.entries(registry.plugins)) {
+				const parsed = parsePluginId(pluginId);
+				if (!parsed) continue;
+				for (const entry of entries) {
+					try {
+						const cachePath = getCachedPluginPath(
+							this.#opts.pluginsCacheDir,
+							parsed.marketplace,
+							parsed.name,
+							entry.version,
+						);
+						identities.add(this.#cacheDeletionIdentity(cachePath));
+					} catch {
+						// Invalid registry entries cannot identify a permitted cache target.
+					}
+				}
+			}
+		}
+		return identities;
+	}
+
 	async uninstallPlugin(pluginId: string, scope?: "user" | "project"): Promise<void> {
 		const parsed = parsePluginId(pluginId);
 		if (!parsed) {
@@ -434,6 +517,7 @@ export class MarketplaceManager {
 		const targetEntries = targetScope === "project" ? projectEntries! : userEntries!;
 		const targetReg = targetScope === "project" ? projectReg : userReg;
 		const registryPath = this.#registryPath(targetScope);
+		const targetCachePaths = await this.#validateCacheDeletionTargets(pluginId, targetEntries);
 
 		const updatedReg = removeInstalledPlugin(targetReg, pluginId);
 		await writeInstalledPluginsRegistry(registryPath, updatedReg);
@@ -445,11 +529,11 @@ export class MarketplaceManager {
 				? readInstalledPluginsRegistry(this.#opts.projectInstalledRegistryPath)
 				: Promise.resolve({ version: 2 as const, plugins: {} as Record<string, InstalledPluginEntry[]> }),
 		]);
-		const referenced = collectReferencedPaths(freshUserReg, freshProjectReg);
+		const referenced = this.#collectReferencedCacheIdentities(freshUserReg, freshProjectReg);
 
-		for (const entry of targetEntries) {
-			if (!referenced.has(entry.installPath)) {
-				await fs.rm(entry.installPath, { recursive: true, force: true });
+		for (const targetCachePath of targetCachePaths) {
+			if (!referenced.has(this.#cacheDeletionIdentity(targetCachePath))) {
+				await fs.rm(targetCachePath, { recursive: true, force: true });
 			}
 		}
 

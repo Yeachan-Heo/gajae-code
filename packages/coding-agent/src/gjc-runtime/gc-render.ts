@@ -39,7 +39,11 @@ function renderRecord(record: GcRecord): string {
 
 export function buildGcReportText(report: GcReport): string {
 	const lines: string[] = [];
-	lines.push(report.dry_run ? "gjc gc — dry run (no changes made; pass --prune to remove)" : "gjc gc — prune");
+	if (report.operation === "repair_session_index") {
+		lines.push("gjc gc — session-index repair (other stores are report-only)");
+	} else {
+		lines.push(report.dry_run ? "gjc gc — dry run (no changes made; pass --prune to remove)" : "gjc gc — prune");
+	}
 	lines.push("");
 
 	for (const store of GC_STORES) {
@@ -50,6 +54,20 @@ export function buildGcReportText(report: GcReport): string {
 		} else {
 			for (const record of records) lines.push(renderRecord(record));
 		}
+		lines.push("");
+	}
+
+	if (report.session_index) {
+		const index = report.session_index;
+		lines.push(`Session index: ${index.status}; valid prefix sequence=${index.valid_prefix_seq}`);
+		if (index.quarantine_path) lines.push(`  Quarantined suffix: ${index.quarantine_path}`);
+		if (index.reason) lines.push(`  ${index.reason}`);
+		if (index.status === "corrupt")
+			lines.push("  Run `gjc gc --repair-session-index` to quarantine the corrupt suffix.");
+		if (index.status === "unsupported")
+			lines.push("  Upgrade GJC before attempting a repair; no index data was changed.");
+		if (index.status === "repaired")
+			lines.push("  Restart or re-register hosts whose only registration was in the quarantined suffix.");
 		lines.push("");
 	}
 

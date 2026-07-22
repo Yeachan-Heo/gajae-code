@@ -6,8 +6,18 @@ import * as path from "node:path";
 import "../../src/tools/renderers";
 import { Settings } from "../../src/config/settings";
 import { ReadTool } from "../../src/tools/read";
-import { parseSqlitePathCandidates, parseSqliteSelector, renderTable } from "../../src/tools/sqlite-reader";
+import {
+	enforceSqliteQueryOnly,
+	executeReadQuery,
+	parseSqlitePathCandidates,
+	parseSqliteSelector,
+	renderTable,
+} from "../../src/tools/sqlite-reader";
 import { WriteTool } from "../../src/tools/write";
+
+const hostileSqliteSchemaName = "SqlItE_hostile_fixture";
+const ordinaryHostileTableName = "ordinary_hostile_table";
+const hostileSchemaNameOccurrences = 3;
 
 type ToolTextResult = {
 	content: Array<{ type: string; text?: string }>;
@@ -62,6 +72,14 @@ function createFixtureDatabase(dbPath: string): void {
 				id INTEGER PRIMARY KEY,
 				payload TEXT NOT NULL
 			);
+			CREATE TABLE sqlitefoo (
+				id INTEGER PRIMARY KEY,
+				label TEXT NOT NULL
+			);
+			CREATE TABLE sqliteXtable (
+				id INTEGER PRIMARY KEY,
+				label TEXT NOT NULL
+			);
 		`);
 
 		db.prepare("INSERT INTO users (name, email, status, created) VALUES (?, ?, ?, ?)").run(
@@ -110,11 +128,49 @@ function createFixtureDatabase(dbPath: string): void {
 
 		db.prepare("INSERT INTO composite (team_id, user_id, value) VALUES (?, ?, ?)").run(1, 2, "pair");
 		db.prepare("INSERT INTO wide_rows (id, payload) VALUES (?, ?)").run(1, "x".repeat(320));
+		db.prepare("INSERT INTO sqlitefoo (id, label) VALUES (?, ?)").run(1, "legal foo");
+		db.prepare("INSERT INTO sqliteXtable (id, label) VALUES (?, ?)").run(1, "legal X table");
 	} finally {
 		db.close();
 	}
 }
 
+async function createHostileSqliteSchemaRow(dbPath: string): Promise<void> {
+	if (ordinaryHostileTableName.length !== hostileSqliteSchemaName.length) {
+		throw new Error("Hostile SQLite schema names must have equal byte lengths");
+	}
+
+	const db = new Database(dbPath);
+	try {
+		db.run(`CREATE TABLE ${ordinaryHostileTableName} (id INTEGER PRIMARY KEY, label TEXT NOT NULL)`);
+		db.prepare(`INSERT INTO ${ordinaryHostileTableName} (id, label) VALUES (?, ?)`).run(1, "hostile");
+	} finally {
+		db.close();
+	}
+
+	const sourceBytes = new TextEncoder().encode(ordinaryHostileTableName);
+	const targetBytes = new TextEncoder().encode(hostileSqliteSchemaName);
+	if (sourceBytes.length !== 22 || targetBytes.length !== 22) {
+		throw new Error("Hostile SQLite schema names must be 22 ASCII bytes");
+	}
+
+	const databaseBytes = new Uint8Array(await Bun.file(dbPath).arrayBuffer());
+	let replacementCount = 0;
+	for (let offset = 0; offset <= databaseBytes.length - sourceBytes.length; offset += 1) {
+		if (sourceBytes.every((byte, index) => databaseBytes[offset + index] === byte)) {
+			databaseBytes.set(targetBytes, offset);
+			replacementCount += 1;
+			offset += sourceBytes.length - 1;
+		}
+	}
+
+	if (replacementCount !== hostileSchemaNameOccurrences) {
+		throw new Error(
+			`Expected exactly ${hostileSchemaNameOccurrences} hostile SQLite schema name replacements; found ${replacementCount}`,
+		);
+	}
+	await Bun.write(dbPath, databaseBytes);
+}
 function readUserEmail(dbPath: string, id: number): string | null {
 	const db = new Database(dbPath, { readonly: true });
 	try {
@@ -209,6 +265,56 @@ describe("SQLite tool support", () => {
 		});
 		expect(parseSqliteSelector("", "q=SELECT+1")).toEqual({ kind: "raw", sql: "SELECT 1" });
 	});
+
+	it("accepts exactly one explicit SELECT statement for raw reads", async () => {
+		const result = await readTool.execute("sqlite-raw-select", {
+			path: `${sqlitePath}?${new URLSearchParams({ q: "SELECT name FROM users WHERE id = 1;" })}`,
+		});
+		expect(getText(result)).toContain("Alice");
+		expect(parseSqliteSelector("", new URLSearchParams({ q: "SELECT ';' AS value" }).toString())).toEqual({
+			kind: "raw",
+			sql: "SELECT ';' AS value",
+		});
+	});
+
+	it("rejects non-SELECT and compound raw statements before execution", async () => {
+		const escapedPath = path.join(tmpDir, "escaped.sqlite");
+		for (const sql of [
+			"WITH rows AS (SELECT 1) SELECT * FROM rows",
+			"VALUES (1)",
+			"PRAGMA table_info(users)",
+			`ATTACH DATABASE '${escapedPath}' AS escaped`,
+			"VACUUM",
+			"CREATE TABLE escaped(value TEXT)",
+			"INSERT INTO users (name, email, status, created) VALUES ('X', 'x@example.com', 'active', 7)",
+			"UPDATE users SET name = 'X'",
+			"DELETE FROM users",
+			"SELECT 1; DELETE FROM users",
+			"SELECT 1\0; DELETE FROM users",
+			"-- comment\nSELECT 1",
+			"SELECT 1 /* comment */",
+		]) {
+			await expect(
+				readTool.execute("sqlite-raw-rejected", {
+					path: `${sqlitePath}?${new URLSearchParams({ q: sql })}`,
+				}),
+			).rejects.toThrow(/exactly one explicit SELECT/i);
+		}
+		expect(await fs.exists(escapedPath)).toBe(false);
+		expect(readUserCount(sqlitePath)).toBe(6);
+	});
+
+	it("rechecks raw query invariants at execution and enables query-only defense", () => {
+		const db = new Database(sqlitePath, { strict: true });
+		try {
+			expect(() => executeReadQuery(db, "DELETE FROM users")).toThrow(/exactly one explicit SELECT/i);
+			enforceSqliteQueryOnly(db);
+			expect(() => db.run("DELETE FROM users")).toThrow(/read.?only/i);
+		} finally {
+			db.close();
+		}
+		expect(readUserCount(sqlitePath)).toBe(6);
+	});
 	it("requires complete decimal integers for SQLite pagination", () => {
 		for (const value of ["2.5", "2rows", "2e1", "0x10"]) {
 			expect(() => parseSqliteSelector("users", `limit=${value}`)).toThrow(
@@ -245,6 +351,121 @@ describe("SQLite tool support", () => {
 		expect(text).toContain("slugs (2 rows)");
 		expect(text).toContain("notes (3 rows)");
 		expect(text).not.toContain("sqlite_sequence");
+	});
+
+	it("lists and reads legal tables whose names start with sqlite", async () => {
+		const list = getText(await readTool.execute("sqlite-legal-list", { path: sqlitePath }));
+		expect(list).toContain("sqlitefoo (1 rows)");
+		expect(list).toContain("sqliteXtable (1 rows)");
+
+		const schema = getText(await readTool.execute("sqlite-legal-schema", { path: `${sqlitePath}:sqlitefoo` }));
+		expect(schema).toContain("CREATE TABLE sqlitefoo");
+		expect(schema).toContain("Sample rows:");
+		expect(schema).toContain("legal foo");
+
+		const page = getText(
+			await readTool.execute("sqlite-legal-page", { path: `${sqlitePath}:sqlitefoo?limit=1&offset=0` }),
+		);
+		expect(page).toContain("legal foo");
+		expect(page).toMatch(/\|\s*1\s*\|/);
+
+		const query = getText(
+			await readTool.execute("sqlite-legal-query", {
+				path: `${sqlitePath}:sqlitefoo?where=label='legal foo'&limit=1`,
+			}),
+		);
+		expect(query).toContain("legal foo");
+		expect(query).toMatch(/\|\s*1\s*\|/);
+
+		expect(getText(await readTool.execute("sqlite-legal-foo", { path: `${sqlitePath}:sqlitefoo:1` }))).toContain(
+			"label: legal foo",
+		);
+		expect(getText(await readTool.execute("sqlite-legal-X", { path: `${sqlitePath}:sqliteXtable:1` }))).toContain(
+			"label: legal X table",
+		);
+	});
+
+	it("allows planned and executed writes to legal sqlite-prefixed tables", async () => {
+		const planWriteTool = new WriteTool(
+			createSession(tmpDir, {
+				getPlanModeState: () => ({ enabled: true, planFilePath: path.join(tmpDir, "plan.md") }),
+			}),
+		);
+		await expect(
+			planWriteTool.execute("sqlite-legal-plan", {
+				path: `${sqlitePath}:sqlitefoo:1`,
+				content: "{ label: 'blocked by plan' }",
+			}),
+		).rejects.toThrow(/Plan mode/i);
+
+		await writeTool.execute("sqlite-legal-execute", {
+			path: `${sqlitePath}:sqlitefoo:1`,
+			content: "{ label: 'updated legal foo' }",
+		});
+		expect(
+			getText(await readTool.execute("sqlite-legal-write-proof", { path: `${sqlitePath}:sqlitefoo:1` })),
+		).toContain("label: updated legal foo");
+	});
+
+	it("denies sqlite_sequence reads and every write operation before mutation", async () => {
+		const db = new Database(sqlitePath, { readonly: true });
+		const sequenceBefore = db
+			.prepare<{ name: string; seq: number }, []>("SELECT name, seq FROM sqlite_sequence")
+			.get();
+		db.close();
+		expect(sequenceBefore).toEqual({ name: "users", seq: 6 });
+
+		await expect(readTool.execute("sqlite-sequence-read", { path: `${sqlitePath}:sqlite_sequence` })).rejects.toThrow(
+			/not found/i,
+		);
+		for (const [operation, pathSuffix, content] of [
+			["insert", "", "{ name: 'users', seq: 7 }"],
+			["update", ":1", "{ seq: 7 }"],
+			["delete", ":1", ""],
+		] as const) {
+			await expect(
+				writeTool.execute(`sqlite-sequence-${operation}`, {
+					path: `${sqlitePath}:sqlite_sequence${pathSuffix}`,
+					content,
+				}),
+			).rejects.toThrow(/not found/i);
+		}
+
+		const verificationDb = new Database(sqlitePath, { readonly: true });
+		const sequenceAfter = verificationDb
+			.prepare<{ name: string; seq: number }, []>("SELECT name, seq FROM sqlite_sequence")
+			.get();
+		verificationDb.close();
+		expect(sequenceAfter).toEqual(sequenceBefore);
+	});
+
+	it("denies mixed-case sqlite schema rows after reopening the hostile fixture", async () => {
+		await createHostileSqliteSchemaRow(sqlitePath);
+
+		const db = new Database(sqlitePath, { readonly: true });
+		const hostileRow = db
+			.prepare<{ name: string; sql: string }, [string]>(
+				"SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+			)
+			.get(hostileSqliteSchemaName);
+		db.close();
+		expect(hostileRow).toEqual({
+			name: hostileSqliteSchemaName,
+			sql: `CREATE TABLE ${hostileSqliteSchemaName} (id INTEGER PRIMARY KEY, label TEXT NOT NULL)`,
+		});
+
+		expect(getText(await readTool.execute("sqlite-hostile-list", { path: sqlitePath }))).not.toContain(
+			hostileSqliteSchemaName,
+		);
+		await expect(
+			readTool.execute("sqlite-hostile-read", { path: `${sqlitePath}:${hostileSqliteSchemaName}:1` }),
+		).rejects.toThrow(/not found/i);
+		await expect(
+			writeTool.execute("sqlite-hostile-write", {
+				path: `${sqlitePath}:${hostileSqliteSchemaName}:1`,
+				content: "{ label: 'blocked' }",
+			}),
+		).rejects.toThrow(/not found/i);
 	});
 
 	it("lists tables for a .db database when the magic bytes match SQLite", async () => {
@@ -342,12 +563,12 @@ describe("SQLite tool support", () => {
 		).rejects.toThrow(/comments or statement terminators/i);
 	});
 
-	it("rejects mutating raw queries on the readonly connection", async () => {
+	it("rejects mutating raw queries at the selector boundary", async () => {
 		await expect(
 			readTool.execute("sqlite-raw-write", {
 				path: `${sqlitePath}?q=INSERT+INTO+users+(name,email,status,created)+VALUES+('X','x@example.com','active',7)`,
 			}),
-		).rejects.toThrow(/readonly/i);
+		).rejects.toThrow(/exactly one explicit SELECT/i);
 	});
 
 	it("rejects table names that do not exist instead of interpolating them", async () => {

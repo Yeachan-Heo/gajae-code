@@ -636,6 +636,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			internalRouter: InternalUrlRouter.instance(),
 			localOptions: {
 				getArtifactsDir: this.session.getArtifactsDir,
+				isManagedDestination: this.session.isManagedSessionDestination,
 				getSessionId: this.session.getSessionId,
 			},
 		};
@@ -643,7 +644,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...internalUrlOptions,
 			ensureLocalParentDirs: this.session.bashRestrictionProfile !== "read-only",
 		});
-		const sessionFile = this.session.getSessionFile?.() ?? null;
 		const expandedEnv = env
 			? Object.fromEntries(
 					await Promise.all(
@@ -662,7 +662,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			: undefined;
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
-				sessionFile,
+				sessionFile: null,
 				sessionId: this.session.getSessionId?.(),
 				cwd: this.session.cwd,
 			}),

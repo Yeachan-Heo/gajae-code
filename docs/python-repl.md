@@ -32,7 +32,7 @@ The tool is `concurrency = "exclusive"` for a session, so calls do not overlap.
 
 ## Kernel lifecycle
 
-Each kernel is a single Python subprocess: `python -u <runner.py>`. The runner is bundled with the host binary (Bun text import), written to `~/.gjc/python-env`-adjacent tmp cache once per script-hash, and reused by every subsequent spawn.
+Each kernel is a single Python subprocess: `python -u <runner.py>`. The bundled runner is materialized once per GJC process in a process-private temporary directory and file, then reused only by subsequent spawns within that process.
 
 Kernel startup sequence:
 

@@ -20,6 +20,19 @@ interface TestContext {
 	clearCount: () => number;
 }
 
+const TEST_PLUGIN_ID = "hello-plugin@test-marketplace";
+
+async function overwriteInstalledEntry(
+	ctx: TestContext,
+	patch: { installPath?: string; version?: string },
+): Promise<string> {
+	const registryPath = path.join(ctx.tmpDir, "installed_plugins.json");
+	const registry = await readInstalledPluginsRegistry(registryPath);
+	Object.assign(registry.plugins[TEST_PLUGIN_ID]![0], patch);
+	await Bun.write(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
+	return registryPath;
+}
+
 function createTestContext(): TestContext {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mgr-test-"));
 
@@ -227,6 +240,40 @@ describe("MarketplaceManager", () => {
 		expect(installed).toHaveLength(1);
 	});
 
+	it("installPlugin with force:true rejects an external registry path without changing the registry", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+		const externalDir = path.join(ctx.tmpDir, "outside-cache");
+		const sentinelPath = path.join(externalDir, "sentinel.txt");
+		await fs.promises.mkdir(externalDir);
+		await Bun.write(sentinelPath, "keep");
+		const registryPath = await overwriteInstalledEntry(ctx, { installPath: externalDir });
+		const registryBefore = await Bun.file(registryPath).text();
+
+		await expect(ctx.manager.installPlugin("hello-plugin", "test-marketplace", { force: true })).rejects.toThrow(
+			/recorded install path is not its cache path/,
+		);
+
+		expect(await Bun.file(sentinelPath).text()).toBe("keep");
+		expect(await Bun.file(registryPath).text()).toBe(registryBefore);
+	});
+
+	it("installPlugin rejects a version with Windows-lossy trailing punctuation", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		const [marketplace] = await ctx.manager.listMarketplaces();
+		const catalog = (await Bun.file(marketplace.catalogPath).json()) as {
+			plugins: Array<Record<string, unknown>>;
+		};
+		catalog.plugins[0] = { ...catalog.plugins[0], version: "1.0.0." };
+		await Bun.write(marketplace.catalogPath, `${JSON.stringify(catalog, null, 2)}\n`);
+
+		await expect(ctx.manager.installPlugin("hello-plugin", "test-marketplace")).rejects.toThrow(
+			/Invalid cache identity/,
+		);
+		const registry = await readInstalledPluginsRegistry(path.join(ctx.tmpDir, "installed_plugins.json"));
+		expect(registry.plugins).toEqual({});
+	});
+
 	it("installPlugin with nonexistent marketplace → clear error", async () => {
 		await expect(ctx.manager.installPlugin("hello-plugin", "no-such-market")).rejects.toThrow(
 			/Marketplace "no-such-market" not found/,
@@ -260,6 +307,85 @@ describe("MarketplaceManager", () => {
 
 	it("uninstallPlugin with invalid ID format → throws clear error", async () => {
 		await expect(ctx.manager.uninstallPlugin("no-at-sign")).rejects.toThrow(/Invalid plugin ID format/);
+	});
+
+	it("uninstallPlugin rejects an external registry path without deleting it or deregistering", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+		const externalDir = path.join(ctx.tmpDir, "outside-cache");
+		const sentinelPath = path.join(externalDir, "sentinel.txt");
+		await fs.promises.mkdir(externalDir);
+		await Bun.write(sentinelPath, "keep");
+		const registryPath = await overwriteInstalledEntry(ctx, { installPath: externalDir });
+		const registryBefore = await Bun.file(registryPath).text();
+
+		await expect(ctx.manager.uninstallPlugin(TEST_PLUGIN_ID)).rejects.toThrow(
+			/recorded install path is not its cache path/,
+		);
+
+		expect(await Bun.file(sentinelPath).text()).toBe("keep");
+		expect(await Bun.file(registryPath).text()).toBe(registryBefore);
+	});
+
+	it("uninstallPlugin rejects an aliased cache path", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		const entry = await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+		const cacheDir = path.dirname(entry.installPath);
+		const aliasedPath = `${cacheDir}${path.sep}..${path.sep}plugins${path.sep}${path.basename(entry.installPath)}`;
+		const registryPath = await overwriteInstalledEntry(ctx, { installPath: aliasedPath });
+		const registryBefore = await Bun.file(registryPath).text();
+
+		await expect(ctx.manager.uninstallPlugin(TEST_PLUGIN_ID)).rejects.toThrow(
+			/recorded install path is not its cache path/,
+		);
+
+		expect(fs.existsSync(entry.installPath)).toBe(true);
+		expect(await Bun.file(registryPath).text()).toBe(registryBefore);
+	});
+
+	it("uninstallPlugin rejects a malformed recorded version", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		const entry = await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+		const registryPath = await overwriteInstalledEntry(ctx, { version: "../outside" });
+		const registryBefore = await Bun.file(registryPath).text();
+
+		await expect(ctx.manager.uninstallPlugin(TEST_PLUGIN_ID)).rejects.toThrow(/invalid recorded cache identity/);
+
+		expect(fs.existsSync(entry.installPath)).toBe(true);
+		expect(await Bun.file(registryPath).text()).toBe(registryBefore);
+	});
+
+	it("uninstallPlugin rejects a version with Windows-lossy trailing punctuation", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		const entry = await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+		const registryPath = await overwriteInstalledEntry(ctx, {
+			installPath: `${entry.installPath}.`,
+			version: `${entry.version}.`,
+		});
+		const registryBefore = await Bun.file(registryPath).text();
+
+		await expect(ctx.manager.uninstallPlugin(TEST_PLUGIN_ID)).rejects.toThrow(/invalid recorded cache identity/);
+
+		expect(fs.existsSync(entry.installPath)).toBe(true);
+		expect(await Bun.file(registryPath).text()).toBe(registryBefore);
+	});
+
+	it("uninstallPlugin rejects a symbolic-link or junction cache entry", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		const entry = await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+		const externalDir = path.join(ctx.tmpDir, "outside-cache");
+		const sentinelPath = path.join(externalDir, "sentinel.txt");
+		await fs.promises.mkdir(externalDir);
+		await Bun.write(sentinelPath, "keep");
+		fs.rmSync(entry.installPath, { recursive: true, force: true });
+		fs.symlinkSync(externalDir, entry.installPath, process.platform === "win32" ? "junction" : "dir");
+		const registryPath = path.join(ctx.tmpDir, "installed_plugins.json");
+		const registryBefore = await Bun.file(registryPath).text();
+
+		await expect(ctx.manager.uninstallPlugin(TEST_PLUGIN_ID)).rejects.toThrow(/symbolic link or junction/);
+
+		expect(await Bun.file(sentinelPath).text()).toBe("keep");
+		expect(await Bun.file(registryPath).text()).toBe(registryBefore);
 	});
 
 	// ── setPluginEnabled ───────────────────────────────────────────────────
@@ -373,6 +499,40 @@ describe("MarketplaceManager", () => {
 
 		// Cache must still exist — project scope still references it.
 		expect(fs.existsSync(userEntry.installPath)).toBe(true);
+	});
+
+	it("uninstallPlugin preserves a shared cache referenced by a case-variant version", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		const userEntry = await ctx.manager.installPlugin("hello-plugin", "test-marketplace", { scope: "user" });
+		const uppercasePath = `${userEntry.installPath}-RC`;
+		const lowercasePath = `${userEntry.installPath}-rc`;
+		fs.renameSync(userEntry.installPath, uppercasePath);
+		await overwriteInstalledEntry(ctx, { installPath: uppercasePath, version: "1.0.0-RC" });
+
+		const projectRegistryPath = path.join(ctx.tmpDir, "project_installed_plugins.json");
+		await Bun.write(
+			projectRegistryPath,
+			`${JSON.stringify(
+				{
+					version: 2,
+					plugins: {
+						[TEST_PLUGIN_ID]: [
+							{ ...userEntry, scope: "project", installPath: lowercasePath, version: "1.0.0-rc" },
+						],
+					},
+				},
+				null,
+				2,
+			)}\n`,
+		);
+
+		await ctx.manager.uninstallPlugin(TEST_PLUGIN_ID, "user");
+
+		expect(fs.existsSync(uppercasePath)).toBe(true);
+		const userRegistry = await readInstalledPluginsRegistry(path.join(ctx.tmpDir, "installed_plugins.json"));
+		expect(userRegistry.plugins[TEST_PLUGIN_ID]).toBeUndefined();
+		const projectRegistry = await readInstalledPluginsRegistry(projectRegistryPath);
+		expect(projectRegistry.plugins[TEST_PLUGIN_ID]).toHaveLength(1);
 	});
 
 	it("setPluginEnabled with plugin in both scopes, no scope arg → throws disambiguation error", async () => {
@@ -499,6 +659,25 @@ describe("MarketplaceManager", () => {
 			const installed = await ctx.manager.listInstalledPlugins();
 			expect(installed).toHaveLength(1);
 			expect(installed[0].entries[0].version).toBe("2.0.0");
+		});
+
+		it("upgradePlugin rejects an external registry path without changing the registry", async () => {
+			await ctx.manager.addMarketplace(FIXTURE_DIR);
+			await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+			const externalDir = path.join(ctx.tmpDir, "outside-cache");
+			const sentinelPath = path.join(externalDir, "sentinel.txt");
+			await fs.promises.mkdir(externalDir);
+			await Bun.write(sentinelPath, "keep");
+			const registryPath = await overwriteInstalledEntry(ctx, { installPath: externalDir });
+			const registryBefore = await Bun.file(registryPath).text();
+			await bumpCatalogVersion("2.0.0");
+
+			await expect(ctx.manager.upgradePlugin(TEST_PLUGIN_ID)).rejects.toThrow(
+				/recorded install path is not its cache path/,
+			);
+
+			expect(await Bun.file(sentinelPath).text()).toBe("keep");
+			expect(await Bun.file(registryPath).text()).toBe(registryBefore);
 		});
 
 		it("upgradePlugin rejects invalid plugin ID", async () => {

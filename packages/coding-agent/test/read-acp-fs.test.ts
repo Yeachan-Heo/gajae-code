@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { getActiveSkills, setActiveSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import { InternalUrlRouter } from "@gajae-code/coding-agent/internal-urls";
 import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridge";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import type { ReadToolDetails } from "@gajae-code/coding-agent/tools/read";
@@ -109,5 +111,124 @@ describe("read tool ACP fs routing", () => {
 		expect(text).toContain("bridge two");
 		expect(text).not.toContain("Line 2 is beyond end");
 		expect(text).not.toContain("disk two");
+	});
+
+	it("rejects unknown and malformed internal selectors before resolving the resource", async () => {
+		const router = InternalUrlRouter.instance();
+		const previousSkillHandler = router.getHandler("skill");
+		router.register({
+			scheme: "skill",
+			immutable: true,
+			resolve: async () => ({ url: "skill://test", content: "", contentType: "text/markdown" }),
+		});
+		const resolveSpy = spyOn(router, "resolve").mockResolvedValue({
+			url: "artifact://3",
+			content: "one\ntwo\nthree\n",
+			contentType: "text/plain",
+		});
+		const tool = new ReadTool(createSession(tmpDir));
+		const previousSkills = getActiveSkills();
+		setActiveSkills([
+			{
+				name: "superpowers:brainstorming",
+				description: "",
+				filePath: "",
+				baseDir: "",
+				source: "test",
+			},
+		]);
+
+		try {
+			await expect(tool.execute("empty", { path: "artifact://3:" })).rejects.toThrow(
+				'Invalid internal URL selector "".',
+			);
+			await expect(tool.execute("unknown", { path: "artifact://3:bogus" })).rejects.toThrow(
+				'Invalid internal URL selector "bogus".',
+			);
+			await expect(tool.execute("unknown-compound", { path: "artifact://3:raw:bogus" })).rejects.toThrow(
+				'Invalid internal URL selector "raw:bogus".',
+			);
+			await expect(tool.execute("malformed-negative", { path: "artifact://3:-100" })).rejects.toThrow(
+				'Invalid internal URL selector "-100".',
+			);
+			await expect(tool.execute("malformed-compound", { path: "artifact://3:raw:-100" })).rejects.toThrow(
+				'Invalid internal URL selector "raw:-100".',
+			);
+			await expect(tool.execute("skill-empty", { path: "skill://superpowers:brainstorming:" })).rejects.toThrow(
+				'Invalid internal URL selector "".',
+			);
+			await expect(
+				tool.execute("skill-malformed", { path: "skill://superpowers:brainstorming:raw:-100" }),
+			).rejects.toThrow('Invalid internal URL selector "raw:-100".');
+
+			expect(resolveSpy).not.toHaveBeenCalled();
+		} finally {
+			resolveSpy.mockRestore();
+			if (previousSkillHandler) router.register(previousSkillHandler);
+			else router.unregister("skill");
+			setActiveSkills(previousSkills);
+		}
+	});
+
+	it("routes ordinary skill selectors after removing them from the resolver URL", async () => {
+		const router = InternalUrlRouter.instance();
+		const previousSkillHandler = router.getHandler("skill");
+		router.register({
+			scheme: "skill",
+			immutable: true,
+			resolve: async () => ({ url: "skill://test", content: "", contentType: "text/markdown" }),
+		});
+		const resolveSpy = spyOn(router, "resolve").mockResolvedValue({
+			url: "skill://brainstorming",
+			content: "one\ntwo\nthree\n",
+			contentType: "text/markdown",
+		});
+		const tool = new ReadTool(createSession(tmpDir));
+
+		try {
+			const raw = textOutput(await tool.execute("skill-raw", { path: "skill://brainstorming:raw" }));
+			const ranged = textOutput(await tool.execute("skill-range", { path: "skill://brainstorming:2-2" }));
+
+			expect(raw).toBe("one\ntwo\nthree\n");
+			expect(ranged).toContain("two");
+			expect(resolveSpy.mock.calls.map(([url]) => url)).toEqual(["skill://brainstorming", "skill://brainstorming"]);
+		} finally {
+			resolveSpy.mockRestore();
+			if (previousSkillHandler) router.register(previousSkillHandler);
+			else router.unregister("skill");
+		}
+	});
+
+	it("reads internal URLs without a selector and preserves valid selectors", async () => {
+		const router = InternalUrlRouter.instance();
+		const resolveSpy = spyOn(router, "resolve").mockResolvedValue({
+			url: "artifact://3",
+			content: "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n",
+			contentType: "text/plain",
+		});
+		const tool = new ReadTool(createSession(tmpDir));
+
+		try {
+			const raw = textOutput(await tool.execute("raw", { path: "artifact://3:raw" }));
+			const bounded = textOutput(await tool.execute("range", { path: "artifact://3:4-4" }));
+			const boundedRaw = textOutput(await tool.execute("range-raw", { path: "artifact://3:4-4:raw" }));
+			expect(textOutput(await tool.execute("default", { path: "artifact://3" }))).toContain("one");
+			expect(raw).toBe("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n");
+			expect(bounded).toContain("four");
+			expect(bounded).not.toContain("one");
+			expect(boundedRaw).toContain("four");
+			expect(boundedRaw).not.toContain("one");
+			expect(boundedRaw).not.toContain("eight");
+
+			expect(resolveSpy).toHaveBeenCalledTimes(4);
+			expect(resolveSpy.mock.calls.map(([url]) => url)).toEqual([
+				"artifact://3",
+				"artifact://3",
+				"artifact://3",
+				"artifact://3",
+			]);
+		} finally {
+			resolveSpy.mockRestore();
+		}
 	});
 });

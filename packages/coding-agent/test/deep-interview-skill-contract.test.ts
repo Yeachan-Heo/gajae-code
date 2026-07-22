@@ -107,9 +107,11 @@ describe("deep-interview self-proofread output rule", () => {
 		expect(skill).toContain("Before emitting the prose lines in this announcement, apply the");
 		expect(skill).toContain("apply the self-proofread once to new prose only");
 		expect(skill).toContain(
-			"apply the self-proofread once to narrative status text, generated prose cells, gaps, and next-target phrasing",
+			"apply the self-proofread once (DIPP-5) to narrative status text, generated prose cells, gaps, and next-target phrasing",
 		);
-		expect(skill).toContain("Apply the self-proofread once to newly generated spec prose before persistence");
+		expect(skill).toContain(
+			"Apply the self-proofread once (DIPP-5) to newly generated spec prose before persistence",
+		);
 	});
 
 	it("adds a Final_Checklist item for the silent self-proofread", () => {
@@ -145,5 +147,44 @@ describe("deep-interview ask clarification contract", () => {
 		);
 		expect(skill).toContain("bypasses Step 2b′ auto-answer, Step 2b″ free-text refine, Step 2c ambiguity scoring");
 		expect(skill).toContain("must not be recorded as a round answer");
+	});
+});
+
+describe("deep-interview ouroboros ooo-interview parity port", () => {
+	it("documents the tiered confirmation cadence while keeping the hard cap (feature B)", () => {
+		expect(skill).toMatch(/Tiered Confirmation Cadence/i);
+		expect(skill).toMatch(/Rounds 1-3 \(auto-continue\)/i);
+		expect(skill).toMatch(/Rounds 4-15 \(ask to continue\)/i);
+		expect(skill).toMatch(/Rounds 16\+ \(diminishing-returns warning\)/i);
+		expect(skill).toMatch(/never removes this hard safety cap/i);
+		expect(skill).toContain("Round 100");
+	});
+
+	it("documents advisory fanout lanes distinct from the milestone panel (feature C)", () => {
+		expect(skill).toMatch(/advisory fanout/i);
+		expect(skill).toMatch(/distinct from the milestone panel/i);
+		for (const lane of [
+			"code_context",
+			"web_context",
+			"ambiguity_contrarian",
+			"answer_simplifier",
+			"architecture_implications",
+		])
+			expect(skill).toContain(lane);
+	});
+
+	it("documents the confused_terms/references non-behavioral contract (feature A)", () => {
+		expect(skill).toContain("confused_terms");
+		expect(skill).toContain("references");
+		expect(skill).toMatch(/MUST NOT alter the first question/i);
+		expect(skill).toMatch(/never auto-fetched/i);
+	});
+
+	it("documents the FREETEXT_FIELDS allowlist + input size caps (feature D)", () => {
+		expect(skill).toContain("FREETEXT_FIELDS");
+		expect(skill).toMatch(/shell metacharacters/i);
+		expect(skill).toMatch(/50,000/);
+		expect(skill).toMatch(/10,000/);
+		expect(skill).toMatch(/character-count/i);
 	});
 });

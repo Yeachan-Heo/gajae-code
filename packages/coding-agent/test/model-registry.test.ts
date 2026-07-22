@@ -1428,6 +1428,46 @@ describe("ModelRegistry", () => {
 			expect(model?.contextWindow).toBe(272_000);
 			expect(model?.baseUrl).toBe("http://127.0.0.1:8317/v1");
 		});
+		test("id-only custom OpenAI-compatible models default to text-only input", () => {
+			writeRawModelsJson({
+				ali: {
+					baseUrl: "https://token-plan.example.com/compatible-mode/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "qwen3.8-max-preview" }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("ali", "qwen3.8-max-preview");
+			// No bundled reference and no explicit input → safe text-only default.
+			// Vision backends must set input: [text, image] or images are stripped.
+			expect(model?.input).toEqual(["text"]);
+			expect(model?.input.includes("image")).toBe(false);
+		});
+
+		test("custom OpenAI-compatible models honor explicit vision input", () => {
+			writeRawModelsJson({
+				ali: {
+					baseUrl: "https://token-plan.example.com/compatible-mode/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: "qwen3.8-max-preview",
+							name: "Qwen3.8 Max Preview",
+							reasoning: true,
+							input: ["text", "image"],
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("ali", "qwen3.8-max-preview");
+			expect(model?.input).toEqual(["text", "image"]);
+			expect(model?.input.includes("image")).toBe(true);
+		});
 
 		test("custom gpt-5.5 responses provider keeps the first-party context window when contextWindow is omitted", () => {
 			writeRawModelsJson({

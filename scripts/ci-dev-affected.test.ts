@@ -2,7 +2,7 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, loadBuildInventory, normalizeChangedPaths, packageScriptCommand, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 
 // Matrix planning validates live workspace and Cargo manifests in subprocesses.
 // Hosted runners can need more than Bun's 5s default during their first cold scan.
@@ -47,22 +47,22 @@ describe("planTasks command shape (issue #622)", () => {
 
 describe("dev-ci canonical-plan workflow contract", () => {
 	test("pins independent no-shard and multi-shard detached-document byte oracles", () => {
-		const noShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"pr\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"skipped\",\"shards\":\"skipped\",\"windowsDoctor\":\"skipped\",\"windowsDoctorRequired\":\"false\",\"hasNative\":\"false\",\"hasTasks\":\"false\"},\"taskIdentities\":[],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}\n";
-		const multiShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"push\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"success\",\"shards\":\"success\",\"windowsDoctor\":\"success\",\"windowsDoctorRequired\":\"true\",\"hasNative\":\"true\",\"hasTasks\":\"true\"},\"taskIdentities\":[{\"key\":\"one\",\"identity\":\"id-one\"},{\"key\":\"two\",\"identity\":\"id-two\"}],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},{\"name\":\".ci-dev-shard-receipts/0.json\",\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},{\"name\":\".ci-dev-shard-receipts/1.json\",\"sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}]}\n";
-		const noShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"588c6fef9fe2fd488a5f511c7e02e620c6c55a165d10997fa2d9aad24f5db746\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
-		const multiShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"276923dd0acb537de815b14eab377a2740224a4063679738cfd3bbae87324ba6\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
+		const noShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"pr\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"skipped\",\"shards\":\"skipped\",\"windowsDoctor\":\"skipped\",\"windowsDoctorRequired\":\"false\",\"telegramGuard\":\"skipped\",\"telegramGuardRequired\":\"false\",\"telegramWindows\":\"skipped\",\"telegramWindowsRequired\":\"false\",\"hasNative\":\"false\",\"hasTasks\":\"false\",\"darwinArm64TabWorkerSmoke\":\"skipped\",\"darwinArm64TabWorkerSmokeRequired\":\"false\"},\"taskIdentities\":[],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}]}\n";
+		const multiShardManifest = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"planMode\":\"push\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"},\"aggregateResults\":{\"plan\":\"success\",\"native\":\"success\",\"shards\":\"success\",\"windowsDoctor\":\"success\",\"windowsDoctorRequired\":\"true\",\"telegramGuard\":\"success\",\"telegramGuardRequired\":\"true\",\"telegramWindows\":\"success\",\"telegramWindowsRequired\":\"true\",\"hasNative\":\"true\",\"hasTasks\":\"true\",\"darwinArm64TabWorkerSmoke\":\"skipped\",\"darwinArm64TabWorkerSmokeRequired\":\"false\"},\"taskIdentities\":[{\"key\":\"one\",\"identity\":\"id-one\"},{\"key\":\"two\",\"identity\":\"id-two\"}],\"childEvidence\":[{\"name\":\".ci-dev-affected-plan.json\",\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},{\"name\":\".ci-dev-shard-receipts/0.json\",\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},{\"name\":\".ci-dev-shard-receipts/1.json\",\"sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}]}\n";
+		const noShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"54a4c5abf1fc7a81f2fee152dce6aba6d3838148b8cb0c193a868cf333fc52b2\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
+		const multiShardReceipt = "{\"schemaVersion\":1,\"subject\":\"ci-dev-affected-evidence\",\"manifestSha256\":\"0b8ee9d2d0d223ee62eb43ad67364116e9d882d08eb84aa3ba9d428a78bdae08\",\"sourceSha\":\"0123456789abcdef0123456789abcdef01234567\",\"planDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replayScope\":{\"repository\":\"owner/repo\",\"workflow\":\"Dev CI\",\"runId\":\"42\"}}\n";
 		const hash = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
-		expect(hash(noShardManifest)).toBe("588c6fef9fe2fd488a5f511c7e02e620c6c55a165d10997fa2d9aad24f5db746");
-		expect(hash(multiShardManifest)).toBe("276923dd0acb537de815b14eab377a2740224a4063679738cfd3bbae87324ba6");
-		expect(hash(noShardReceipt)).toBe("39f209e20824bec9839b6e9ffa8ce6a5f894b4190e80061c1635c46a645faa56");
-		expect(hash(multiShardReceipt)).toBe("0d939ebfb8e87300b3c8433e2a7e4499072f89f28fee1b3b164156b554d08eda");
+		expect(hash(noShardManifest)).toBe("54a4c5abf1fc7a81f2fee152dce6aba6d3838148b8cb0c193a868cf333fc52b2");
+		expect(hash(multiShardManifest)).toBe("0b8ee9d2d0d223ee62eb43ad67364116e9d882d08eb84aa3ba9d428a78bdae08");
+		expect(hash(noShardReceipt)).toBe("94811782eb24e82ea14b59b600a13f2b0969f50767b300910b8665855f534c19");
+		expect(hash(multiShardReceipt)).toBe("09341439a0211c277328dcb07117568d57a3ecddad4d35ae6f03dae57c37e260");
 	});
 	test("uses a detached finalized evidence producer and artifact-ID consumer", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
 		expect(workflow).toContain("  affected:\n    name: Affected path validation\n    if: ${{ always() }}");
-		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, windows-dev-doctor]");
+		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
 		expect(workflow).toContain("artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}");
 		expect(workflow).toContain("artifact-ids: ${{ needs.affected-evidence-producer.outputs.artifact_id }}");
@@ -79,6 +79,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain(".ci-dev-affected-evidence.json");
 		expect(workflow).toContain(".ci-dev-affected-evidence.receipt.json");
 		expect(workflow).not.toContain("evidencePath");
+		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}");
+		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.relevant }}");
+		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}");
+		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_REQUIRED:");
 		expect(workflow).not.toContain("pull_request_target");
 		expect(workflow).not.toContain("github.run_attempt");
 		expect(workflow).toContain("artifact_digest");
@@ -97,12 +101,64 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(protectedJob.slice(preparationStart, preparationEnd)).toContain("CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence");
 		expect(protectedJob.slice(validationStart)).toContain("CI_DEV_EVIDENCE_ROOT: ${{ runner.temp }}/ci-dev-affected-evidence");
 	});
+	test("gates exact-head Darwin tab-worker evidence through detached affected evidence", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		expect(workflow).toContain("has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}");
+		expect(workflow).toContain("affected-darwin-arm64-tab-worker-smoke:");
+		expect(workflow).toContain("runs-on: macos-14");
+		expect(workflow).toContain("TARGET_PLATFORM: darwin");
+		expect(workflow).toContain("TARGET_ARCH: arm64");
+		expect(workflow).toContain("process.platform");
+		expect(workflow).toContain("process.arch");
+		expect(workflow).toContain("Write immutable Darwin smoke receipt");
+		expect(workflow).toContain("dev-affected-darwin-receipt-${{ github.run_id }}");
+		const darwinReceiptUploadStart = workflow.indexOf("      - name: Upload Darwin smoke receipt");
+		const darwinReceiptUploadEnd = workflow.indexOf("\n\n  # One shard", darwinReceiptUploadStart);
+		expect(workflow.slice(darwinReceiptUploadStart, darwinReceiptUploadEnd)).toContain("overwrite: true");
+		expect(workflow).toContain("Download Darwin smoke receipt");
+		expect(workflow).toContain("Validate Darwin smoke receipt");
+		expect(workflow).toContain(".ci-dev-darwin-arm64-receipt.json");
+		expect(workflow).toContain("Validate finalized Darwin smoke receipt");
+		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT");
+		expect(workflow).toContain("CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED");
+	});
+
+	test("routes the Windows session-path regression suite onto windows-latest and requires it", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		expect(workflow).toContain("has_windows_session_path: ${{ steps.plan.outputs.has_windows_session_path }}");
+		const windowsJob = workflow.slice(workflow.indexOf("  windows-dev-doctor:"), workflow.indexOf("\n  affected-native:"));
+		expect(windowsJob).toContain("runs-on: windows-latest");
+		expect(windowsJob).toContain("needs.affected-plan.outputs.has_windows_session_path == 'true'");
+		expect(windowsJob).toContain("Windows session-path canonicalization regression");
+		expect(windowsJob).toContain("bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
+		// The required predicate must textually match the job gate so the aggregate
+		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
+		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
+		expect(requiredLines.length).toBe(2);
+		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
+	});
 
 	describe("detached evidence subprocess contract", () => {
 		const scriptPath = path.join(import.meta.dir, "ci-dev-affected.ts");
 		const repoRoot = path.join(import.meta.dir, "..");
 		const sourceSha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repoRoot }).stdout.toString().trim();
-		const baseAggregate = { plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false" };
+		const baseAggregate = {
+			plan: "success",
+			native: "skipped",
+			shards: "skipped",
+			python: "skipped",
+			windowsDoctor: "skipped",
+			windowsDoctorRequired: "false",
+			telegramGuard: "skipped",
+			telegramGuardRequired: "false",
+			telegramWindows: "skipped",
+			telegramWindowsRequired: "false",
+			hasNative: "false",
+			hasTasks: "false",
+			hasPython: "false",
+			darwinArm64TabWorkerSmoke: "skipped",
+			darwinArm64TabWorkerSmokeRequired: "false",
+		};
 		type EvidenceFixture = { root: string; env: Record<string, string>; plan: string; digest: string };
 
 		async function fixture(tasks: unknown[] = []): Promise<EvidenceFixture> {
@@ -115,6 +171,13 @@ describe("dev-ci canonical-plan workflow contract", () => {
 				CI_DEV_SOURCE_SHA: sourceSha, CI_DEV_PLAN_DIGEST: digest, CI_DEV_PLAN_MODE: "pr", GITHUB_REPOSITORY: "owner/repo", GITHUB_WORKFLOW: "Dev CI", GITHUB_RUN_ID: "42",
 				CI_DEV_PLAN_RESULT: baseAggregate.plan, CI_DEV_NATIVE_RESULT: baseAggregate.native, CI_DEV_SHARDS_RESULT: baseAggregate.shards, CI_DEV_WINDOWS_DOCTOR_RESULT: baseAggregate.windowsDoctor,
 				CI_DEV_WINDOWS_DOCTOR_REQUIRED: baseAggregate.windowsDoctorRequired, CI_DEV_HAS_NATIVE: baseAggregate.hasNative, CI_DEV_HAS_TASKS: baseAggregate.hasTasks,
+				CI_DEV_PYTHON_RESULT: baseAggregate.python, CI_DEV_HAS_PYTHON: baseAggregate.hasPython,
+				CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: baseAggregate.darwinArm64TabWorkerSmoke,
+				CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: baseAggregate.darwinArm64TabWorkerSmokeRequired,
+				CI_DEV_TELEGRAM_GUARD_RESULT: baseAggregate.telegramGuard,
+				CI_DEV_TELEGRAM_GUARD_REQUIRED: baseAggregate.telegramGuardRequired,
+				CI_DEV_TELEGRAM_WINDOWS_RESULT: baseAggregate.telegramWindows,
+				CI_DEV_TELEGRAM_WINDOWS_REQUIRED: baseAggregate.telegramWindowsRequired,
 			};
 			return { root, env, plan, digest };
 		}
@@ -226,6 +289,8 @@ describe("dev-ci canonical-plan workflow contract", () => {
 					expect((await invoke(env, "--validate-affected-evidence")).exitCode).toBe(1);
 					await fs.writeFile(manifestPath, originalManifest); await fs.writeFile(receiptPath, originalReceipt);
 				}
+				await resign(manifest => { delete (manifest.aggregateResults as Record<string, string>).hasPython; });
+				await resign(manifest => { delete (manifest.aggregateResults as Record<string, string>).python; });
 				await resign(manifest => { (manifest.replayScope as Record<string, string>).runId = "stale"; });
 				await resign(manifest => { manifest.sourceSha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"; });
 				await resign(manifest => { (manifest.aggregateResults as Record<string, string>).plan = "failure"; });
@@ -292,10 +357,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 
 	test("aggregate result truth table rejects every missing, failed, cancelled, and unplanned dependency", () => {
 		const valid: AffectedAggregateResults[] = [
-			{ plan: "success", native: "success", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "true", hasTasks: "true" },
-			{ plan: "success", native: "skipped", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "false", hasTasks: "false" },
-			{ plan: "success", native: "success", shards: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", hasNative: "true", hasTasks: "false" },
-			{ plan: "success", native: "skipped", shards: "success", windowsDoctor: "success", windowsDoctorRequired: "true", hasNative: "false", hasTasks: "true" },
+			{ plan: "success", native: "success", shards: "success", python: "success", windowsDoctor: "success", windowsDoctorRequired: "true", telegramGuard: "success", telegramGuardRequired: "true", telegramWindows: "success", telegramWindowsRequired: "true", hasNative: "true", hasTasks: "true", hasPython: "true", darwinArm64TabWorkerSmoke: "success", darwinArm64TabWorkerSmokeRequired: "true" },
+			{ plan: "success", native: "skipped", shards: "skipped", python: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", telegramGuard: "skipped", telegramGuardRequired: "false", telegramWindows: "skipped", telegramWindowsRequired: "false", hasNative: "false", hasTasks: "false", hasPython: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
+			{ plan: "success", native: "success", shards: "skipped", python: "skipped", windowsDoctor: "skipped", windowsDoctorRequired: "false", telegramGuard: "success", telegramGuardRequired: "true", telegramWindows: "success", telegramWindowsRequired: "true", hasNative: "true", hasTasks: "false", hasPython: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
+			{ plan: "success", native: "skipped", shards: "success", python: "skipped", windowsDoctor: "success", windowsDoctorRequired: "true", telegramGuard: "success", telegramGuardRequired: "true", telegramWindows: "success", telegramWindowsRequired: "true", hasNative: "false", hasTasks: "true", hasPython: "false", darwinArm64TabWorkerSmoke: "skipped", darwinArm64TabWorkerSmokeRequired: "false" },
 		];
 		for (const results of valid) expect(() => validateAffectedAggregate(results)).not.toThrow();
 
@@ -310,14 +375,36 @@ describe("dev-ci canonical-plan workflow contract", () => {
 			{ ...valid[0]!, windowsDoctor: "failure" },
 			{ ...valid[0]!, windowsDoctor: "cancelled" },
 			{ ...valid[0]!, windowsDoctor: "skipped" },
+			{ ...valid[0]!, darwinArm64TabWorkerSmoke: "failure" },
+			{ ...valid[0]!, darwinArm64TabWorkerSmoke: "cancelled" },
+			{ ...valid[0]!, darwinArm64TabWorkerSmoke: "skipped" },
+			{ ...valid[1]!, darwinArm64TabWorkerSmoke: "success" },
+			{ ...valid[1]!, darwinArm64TabWorkerSmokeRequired: "" },
+			{ ...valid[1]!, darwinArm64TabWorkerSmokeRequired: "maybe" },
+			{ ...valid[0]!, telegramGuard: "failure" },
+			{ ...valid[0]!, telegramGuard: "cancelled" },
+			{ ...valid[0]!, telegramGuard: "skipped" },
+			{ ...valid[0]!, telegramWindows: "failure" },
+			{ ...valid[0]!, telegramWindows: "cancelled" },
+			{ ...valid[0]!, telegramWindows: "skipped" },
+			{ ...valid[1]!, telegramGuardRequired: "" },
+			{ ...valid[1]!, telegramGuardRequired: "maybe" },
+			{ ...valid[1]!, telegramWindowsRequired: "" },
+			{ ...valid[1]!, telegramWindowsRequired: "maybe" },
 			{ ...valid[1]!, windowsDoctor: "success" },
+			{ ...valid[1]!, telegramGuard: "success" },
+			{ ...valid[1]!, telegramWindows: "success" },
 			{ ...valid[1]!, windowsDoctorRequired: "" },
 			{ ...valid[1]!, windowsDoctorRequired: "maybe" },
 			{ ...valid[1]!, hasNative: "" },
 			{ ...valid[1]!, hasTasks: "maybe" },
+			{ ...valid[1]!, hasPython: "maybe" },
+			{ ...valid[0]!, python: "skipped" },
+			{ ...valid[1]!, python: "success" },
 			{ ...valid[1]!, native: "success" },
 			{ ...valid[1]!, shards: "success" },
-		]) expect(() => validateAffectedAggregate(results)).toThrow();
+		])
+			expect(() => validateAffectedAggregate(results)).toThrow();
 	});
 });
 
@@ -455,6 +542,18 @@ describe("describeTasks matrix emission", () => {
 		}
 	});
 
+	test("push affected selftest runs selector and topology coverage for workflow and topology changes", () => {
+		for (const changedPath of [".github/workflows/dev-ci.yml", "scripts/dev-ci-guard-topology.test.ts"]) {
+			const task = planTasks([changedPath], packages).find(candidate => candidate.key === "affected-selftest");
+			expect(task?.command).toEqual([
+				"bun",
+				"test",
+				"scripts/ci-dev-affected.test.ts",
+				"scripts/dev-ci-guard-topology.test.ts",
+			]);
+		}
+	});
+
 	test("cwd is emitted repo-relative for package-scoped tasks", () => {
 		const entries = describeTasks(planForPaths(["packages/example/src/index.ts"]));
 		const pkgCheck = entries.find(entry => entry.key === "check:@gajae-code/example");
@@ -532,6 +631,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 
 		const output = await Bun.file(outputFile).text();
 		expect(output).toContain("has_tasks=true");
+		expect(output).toContain("has_python=false");
 		expect(output).toContain("has_native=true");
 		expect(output).toContain("changed_paths<<");
 
@@ -542,6 +642,18 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(matrix.include.some((shard: { key: string }) => shard.key.startsWith("cargo-build:"))).toBe(true);
 		// Native build tasks never appear as shards.
 		expect(matrix.include.every((shard: { key: string }) => shard.key !== "native-linux-x64")).toBe(true);
+	});
+	test("CI_FORCE_FULL emits Python work outside the shard matrix", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-python-full-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+		const { stdout, exitCode } = await runScript(["--matrix-json"], "", { CI_FORCE_FULL: "1", GITHUB_OUTPUT: outputFile });
+		expect(exitCode).toBe(0);
+		expect((JSON.parse(stdout.trim()) as Array<{ key: string }>).filter(entry => entry.key.startsWith("python-"))).toHaveLength(3);
+		const output = await Bun.file(outputFile).text();
+		expect(output).toContain("has_python=true");
+		const matrix = JSON.parse((output.split("\n").find(line => line.startsWith("matrix=")) ?? "matrix={}").slice("matrix=".length));
+		expect(matrix.include.some((entry: { key: string }) => entry.key.startsWith("python-"))).toBe(false);
 	});
 
 	test("changed-path ranges use the canonical source head instead of ambient PR merge SHA", async () => {
@@ -648,6 +760,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		expect(pr.exitCode).toBe(0);
 		expect((JSON.parse(pr.stdout.trim()) as Array<{ key: string }>).map(entry => entry.key)).toEqual([
 			"check:@gajae-code/natives",
+			"install-methods",
 			"native-linux-x64",
 			"ts-build:ts:Y29kaW5nLWFnZW50:cGFja2FnZXMvY29kaW5nLWFnZW50",
 			"ts-build:ts:c3RhdHM:cGFja2FnZXMvc3RhdHM",
@@ -665,6 +778,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
 			"check:@gajae-code/typescript-edit-benchmark", "test:@gajae-code/typescript-edit-benchmark",
 			"check:@gajae-code/utils", "test:@gajae-code/utils",
+			"install-methods",
 			"native-linux-x64",
 			"ts-build:ts:Y29kaW5nLWFnZW50:cGFja2FnZXMvY29kaW5nLWFnZW50",
 			"ts-build:ts:c3RhdHM:cGFja2FnZXMvc3RhdHM",
@@ -884,6 +998,58 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		});
 	});
 
+test("tab-worker graph changes always include install-methods and are Darwin relevant", () => {
+		for (const changedPath of [
+			"packages/coding-agent/src/tools/browser/tab-worker-entry.ts",
+			"packages/coding-agent/src/tools/browser/new-worker-helper.ts",
+			"packages/coding-agent/src/tools/browser/launch.ts",
+			"packages/coding-agent/src/tools/browser/readable.ts",
+			"packages/coding-agent/src/tools/browser/screenshot-format.ts",
+			"packages/coding-agent/src/eval/js/shared/runtime.ts",
+			"packages/coding-agent/src/eval/js/new-eval-helper.ts",
+			"packages/coding-agent/src/web/scrapers/html-to-markdown.ts",
+			"packages/coding-agent/src/web/scrapers/new-scraper-helper.ts",
+			"packages/coding-agent/src/utils/linkedom.ts",
+			"packages/coding-agent/src/utils/new-browser-safe-helper.ts",
+			"packages/utils/src/new-worker-safe-helper.ts",
+			"packages/coding-agent/src/tools/tool-errors.ts",
+			"packages/coding-agent/src/tools/path-utils.ts",
+			"packages/coding-agent/src/cli.ts",
+			"packages/coding-agent/scripts/compile-args.ts",
+			"packages/coding-agent/scripts/build-binary.ts",
+			"packages/natives/native/index.js",
+			"scripts/ci-build-native.ts",
+			"packages/coding-agent/src/tools/puppeteer/00_stealth_tampering.txt",
+			"packages/coding-agent/src/tools/puppeteer/15_stealth_webrtc.txt",
+		]) {
+			expect(isDarwinArm64TabWorkerSmokePath(changedPath)).toBe(true);
+			expect(needsDarwinArm64TabWorkerSmoke([changedPath])).toBe(true);
+			expect(targeted([changedPath]).map(task => task.key)).toContain("install-methods");
+			expect(planTasks([changedPath], targetingPackages).map(task => task.key)).toContain("install-methods");
+		}
+	});
+
+	test("irrelevant changes skip the Darwin smoke and install-methods", () => {
+		const paths = ["packages/coding-agent/src/edit/foo.ts"];
+		expect(needsDarwinArm64TabWorkerSmoke(paths)).toBe(false);
+		expect(targeted(paths).map(task => task.key)).not.toContain("install-methods");
+		expect(planTasks(paths, targetingPackages).map(task => task.key)).not.toContain("install-methods");
+	});
+
+	test("routes the Windows session-path regression for session I/O sources and its regression test", () => {
+		for (const changedPath of [
+			"packages/coding-agent/src/session/internal/managed-session-scope.ts",
+			"packages/coding-agent/src/session/blob-store.ts",
+			"packages/coding-agent/src/session/session-manager.ts",
+			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
+		]) {
+			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
+			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
+		}
+		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-store.ts")).toBe(false);
+		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
+	});
+
 	test("a deleted test path is not scheduled as a runnable test shard", () => {
 		const tasks = targeted(["packages/coding-agent/test/edit/deleted.test.ts"]);
 		const keys = tasks.map(task => task.key);
@@ -951,6 +1117,17 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(tasks[2]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
+	test("cache-eval evidence artifact adds its focused AI test without bypassing root fallback coverage", () => {
+		const tasks = targeted(["artifacts/architecture-2383-eval.json"]);
+		expect(tasks.map(task => task.key)).toEqual([
+			"test:packages/ai/test/anthropic-cache-eval.integration.test.ts",
+			"root-check",
+			"native-linux-x64",
+		]);
+		expect(tasks[0]?.command).toEqual(["bun", "test", "packages/ai/test/anthropic-cache-eval.integration.test.ts"]);
+		expect(tasks[1]?.command).toEqual(["bun", "run", "ci:check:full"]);
+		expect(tasks[2]?.command).toEqual(["bash", "-lc", 'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts']);
+	});
 
 	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run only", () => {
 		const tasks = targeted([".github/workflows/dev-ci.yml"]);
@@ -960,6 +1137,17 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	test("a CI harness script change plans ci-selftest + ci-dry-run (no yaml-parse)", () => {
 		const tasks = targeted(["scripts/ci-dev-affected.ts"]);
 		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
+	});
+
+	test("the dev CI guard topology test is scheduled and executed as a CI harness change", () => {
+		const tasks = targeted(["scripts/dev-ci-guard-topology.test.ts"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
+		expect(tasks.find(task => task.key === "ci-selftest")?.command).toEqual([
+			"bun",
+			"test",
+			"scripts/ci-dev-affected.test.ts",
+			"scripts/dev-ci-guard-topology.test.ts",
+		]);
 	});
 
 	test("native platform package changes plan release publish validation", () => {
@@ -1016,6 +1204,16 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	test("docs/changelog-only changes plan nothing expensive", () => {
 		expect(targeted(["docs/guide.md", "CHANGELOG.md", "packages/coding-agent/README.md"])).toEqual([]);
 	});
+
+test("Python SDK changes plan dedicated Python validation and one native build", () => {
+	const changed = ["python/gjc-sdk/gjc_sdk/client.py"];
+	for (const tasks of [planTasks(changed, packages), planTargetedTasks(changed, packages, [])]) {
+		expect(tasks.map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke", "native-linux-x64"]);
+		expect(tasks.filter(task => task.phase === "python").map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke"]);
+	}
+	const full = planFullTasks(packages);
+	expect(full.filter(task => task.phase === "python").map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke"]);
+});
 
 
 	test("native-consuming test files pull in a single native build task", () => {
@@ -1181,5 +1379,115 @@ describe("Cargo workspace ambiguity", () => {
 		expect(requiresCargoWorkspaceEmergency([first], supported)).toBe(true);
 		expect(requiresCargoWorkspaceEmergency([first, second], supported)).toBe(true);
 		expect(requiresCargoWorkspaceEmergency([unique], supported)).toBe(false);
+	});
+});
+
+describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
+	const fullModePackages: WorkspacePackage[] = [
+		{
+			name: "@gajae-code/coding-agent",
+			dir: "packages/coding-agent",
+			manifest: { name: "@gajae-code/coding-agent", scripts: { test: "true" } },
+		},
+		{
+			name: "@gajae-code/example",
+			dir: "packages/example",
+			manifest: { name: "@gajae-code/example", scripts: { check: "true", test: "true" } },
+		},
+	];
+
+	function withEnv<T>(env: Record<string, string | undefined>, run: () => T): T {
+		const previous = new Map<string, string | undefined>();
+		for (const [key, value] of Object.entries(env)) {
+			previous.set(key, process.env[key]);
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		try {
+			return run();
+		} finally {
+			for (const [key, value] of previous) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}
+
+	test("default env emits the complete task union and omits root-check", () => {
+		const keys = withEnv(
+			{ CI_CODING_AGENT_TEST_SHARDS: undefined, CI_RUST_TEST_PARTITIONS: undefined },
+			() => planFullTasks(fullModePackages).map(task => task.key),
+		);
+		// root-check is covered by the dedicated native-free `check` job.
+		expect(keys).not.toContain("root-check");
+		expect(keys).toContain("native-linux-x64");
+		expect(keys).toContain("root-test:release");
+		expect(keys).toContain("rust-check");
+		expect(keys).toContain("cli-smoke");
+		expect(keys).toContain("runtime-check");
+		expect(keys).toContain("test:@gajae-code/example");
+		// Default coding-agent shard count stays 8 (dev parity).
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
+		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
+		// Default rust-test stays a single unpartitioned task.
+		expect(keys).toContain("rust-test");
+		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);
+	});
+
+	test("no full-mode task uses the false-green standalone `bun --cwd` form (issue #622)", () => {
+		const tasks = withEnv({ CI_CODING_AGENT_TEST_SHARDS: "16", CI_RUST_TEST_PARTITIONS: "4" }, () =>
+			planFullTasks(fullModePackages),
+		);
+		for (const task of tasks) {
+			expect(task.command.some(arg => arg.startsWith("--cwd"))).toBe(false);
+		}
+		const runtimeCheck = tasks.find(task => task.key === "runtime-check");
+		expect(runtimeCheck?.command).toEqual(["bun", "run", "check:runtime"]);
+		expect(runtimeCheck?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
+	});
+
+	test("CI_CODING_AGENT_TEST_SHARDS overrides the coding-agent shard count", () => {
+		const keys = withEnv({ CI_CODING_AGENT_TEST_SHARDS: "16" }, () =>
+			planFullTasks(fullModePackages).map(task => task.key),
+		);
+		const shards = keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(shards.length).toBe(16);
+		expect(shards).toContain("test:@gajae-code/coding-agent:shard-1-of-16");
+		expect(shards).toContain("test:@gajae-code/coding-agent:shard-16-of-16");
+	});
+
+	test("CI_RUST_TEST_PARTITIONS splits rust-test into nextest partitions", () => {
+		const tasks = withEnv({ CI_RUST_TEST_PARTITIONS: "4" }, () => planFullTasks(fullModePackages));
+		const partitions = tasks.filter(task => task.key.startsWith("rust-test:partition-"));
+		expect(partitions.length).toBe(4);
+		expect(tasks.some(task => task.key === "rust-test")).toBe(false);
+		expect(partitions[0]?.command).toEqual(["bun", "scripts/run-rs-task.ts", "test:rs", "count:1/4"]);
+		expect(partitions[3]?.command).toEqual(["bun", "scripts/run-rs-task.ts", "test:rs", "count:4/4"]);
+		const described = describeTasks(partitions);
+		for (const entry of described) {
+			expect(entry.rust).toBe(true);
+			expect(entry.nextest).toBe(true);
+			expect(entry.native).toBe(false);
+		}
+	});
+
+	test("invalid env values fall back to safe defaults", () => {
+		const keys = withEnv(
+			{ CI_CODING_AGENT_TEST_SHARDS: "0", CI_RUST_TEST_PARTITIONS: "abc" },
+			() => planFullTasks(fullModePackages).map(task => task.key),
+		);
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
+		expect(keys).toContain("rust-test");
+		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);
+	});
+
+	test("the native build task is the only nativeBuild entry and runtime consumers download it", () => {
+		const entries = withEnv({ CI_CODING_AGENT_TEST_SHARDS: "16", CI_RUST_TEST_PARTITIONS: "4" }, () =>
+			describeTasks(planFullTasks(fullModePackages)),
+		);
+		expect(entries.filter(entry => entry.nativeBuild).map(entry => entry.key)).toEqual(["native-linux-x64"]);
+		expect(entries.find(entry => entry.key === "cli-smoke")?.native).toBe(true);
+		expect(entries.find(entry => entry.key === "runtime-check")?.native).toBe(true);
+		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-16")?.native).toBe(true);
 	});
 });

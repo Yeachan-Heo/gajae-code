@@ -967,13 +967,18 @@ export function validateToolCall(tools: Tool[], toolCall: ToolCall): ToolCall["a
  */
 export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall["arguments"] {
 	const originalArgs = toolCall.arguments;
+	const rawValidation = tool.rawArgumentValidation?.(originalArgs);
+	if (rawValidation?.outcome === "reject") {
+		throw new Error(`Validation failed for tool "${toolCall.name}": raw arguments rejected before coercion`);
+	}
+	const rawArgs = rawValidation?.outcome === "accept" ? rawValidation.arguments : originalArgs;
 	const ctx = getValidationContext(tool);
 	const { json } = ctx;
 
 	// Always normalize first — strip null and string "null" from optional
 	// fields and substitute defaults. Handles LLM outputting string "null"
 	// to mean "no value" even when validation would otherwise pass.
-	let normalizedArgs: unknown = originalArgs;
+	let normalizedArgs: unknown = rawArgs;
 	let changed = false;
 	const initialNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
 	if (initialNormalization.changed) {

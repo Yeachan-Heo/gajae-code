@@ -106,6 +106,45 @@ describe("telegram reference client helpers", () => {
 		expect(m.inline_keyboard?.[0]?.[1]?.text).toBe("2");
 		expect(decodeCallbackData(m.inline_keyboard![0]![0]!.callback_data)).toEqual({ id: "a1", index: 0 });
 	});
+	test("renders only a valid recommended option in copied HTML and Markdown labels", () => {
+		const longSensitiveLabel = "<&_*".repeat(1024);
+		const options = ["First", longSensitiveLabel, "Third"];
+		const html = buildActionMessage({
+			kind: "ask",
+			id: "a1",
+			question: "Proceed?",
+			options,
+			recommendedIndex: 1,
+		});
+		const markdown = buildActionMarkdown({ kind: "ask", question: "Proceed?", options, recommendedIndex: 1 });
+
+		expect(html.text).toContain("(Recommended)");
+		expect(html.text).toContain("&lt;&amp;_*");
+		expect(html.inline_keyboard?.flat().some(button => button.text.includes("Recommended"))).toBe(false);
+		expect(html.text).not.toContain("First (Recommended)");
+		expect(html.inline_keyboard?.flat().map(button => button.text)).toEqual(["1", "2", "3"]);
+		expect(decodeCallbackData(html.inline_keyboard![0]![1]!.callback_data)).toEqual({ id: "a1", index: 1 });
+		expect(markdown).toContain(`${longSensitiveLabel} (Recommended)`);
+	});
+
+	test.each([
+		undefined,
+		-1,
+		3,
+		1.5,
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		"1",
+		null,
+	])("ignores malformed recommendedIndex %p", recommendedIndex => {
+		const options = ["First", "Second", "Third"];
+		expect(
+			buildActionMessage({ kind: "ask", id: "a1", question: "Proceed?", options, recommendedIndex }).text,
+		).not.toContain("(Recommended)");
+		expect(buildActionMarkdown({ kind: "ask", question: "Proceed?", options, recommendedIndex })).not.toContain(
+			"(Recommended)",
+		);
+	});
 
 	test("buildActionMessage renders free-text ask and idle ping", () => {
 		const freeText = buildActionMessage({ kind: "ask", id: "a1", question: "Name?" });

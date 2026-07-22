@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "kind": "package-test-report",
+  "story": "G002-ws2",
+  "suites": [
+    {
+      "command": "bun --cwd packages/coding-agent test test/g006-ws2-redteam.test.ts",
+      "pass": 2,
+      "fail": 4,
+      "verdict": "blocked"
+    },
+    {
+      "command": "bun --cwd packages/coding-agent test test/g006-ws2-redteam.test.ts test/ansi-display-validator.test.ts test/tool-render-lines.test.ts test/tool-transcript-format.test.ts test/transcript-viewer-overlay.test.ts test/transcript-viewer-perf.test.ts test/g005-ws5-redteam.test.ts test/transcript-adapter-parity.test.ts test/g002-redteam.test.ts test/g001-redteam.test.ts test/g001-toolrender-redteam.test.ts",
+      "pass": 66,
+      "fail": 4,
+      "verdict": "blocked; the ten pre-existing focused suites passed, while four new G006 adversarial cases failed"
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "validator-evasion",
+      "scenario": "Split ESC, malformed/nested CSI, empty and huge SGR parameters, colon CSI, C1 CSI, lone ESC, overlong parameters, OSC containing SGR, and BS/CR overwrite controls.",
+      "verdict": "failed",
+      "evidence": "validateDisplayLine preserves ESC[38;5;;m, ESC[;m, ESC[999999999m, and the overlong numeric SGR sequence."
+    },
+    {
+      "id": "trusted-render-lines-bypass",
+      "scenario": "A selected expanded custom (non-tool) entry supplies renderLines.",
+      "verdict": "failed",
+      "evidence": "TranscriptViewerOverlay renders TRUSTED from the custom entry because the gate checks renderLines, selected, expanded, and raw only; it does not require entry.kind === tool."
+    },
+    {
+      "id": "input-budget-boundaries-and-degradation",
+      "scenario": "Exact and one-over byte, line, scalar, depth, and node limits; 33-depth and 100k-wide details must not throw.",
+      "verdict": "failed",
+      "evidence": "Exact 1 MiB, 50k-line, and 8192-scalar details payloads degrade because exceedsInputBudget measures the whole render descriptor, including descriptor keys and other strings. The deep and 100k-wide no-throw checks executed successfully before the boundary assertion."
+    },
+    {
+      "id": "diff-json-unicode-wrapping",
+      "scenario": "Hostile OSC/SGR diff and JSON values at width 8 with emoji and CJK.",
+      "verdict": "failed",
+      "evidence": "At least one emitted wrapped rich line has an active SGR state without a terminating reset, violating the per-line balanced/terminated-SGR requirement."
+    },
+    {
+      "id": "post-wrap-diff-cap",
+      "scenario": "200 short diff lines at width 80, preserving call/status lines and appending an unstyled result-only sentinel.",
+      "verdict": "passed",
+      "evidence": "Exactly one unstyled sentinel, ... 100 more lines, was emitted; call path and status remained present."
+    },
+    {
+      "id": "copy-and-raw",
+      "scenario": "Canonical hostile payload with rich rendered lines, y-copy, and r raw toggle.",
+      "verdict": "passed",
+      "evidence": "Copy remained byte-exact canonical payload; raw bypassed rich lines and sanitized canonical SGR."
+    }
+  ],
+  "blockers": [
+    {
+      "id": "G006-01",
+      "severity": "high",
+      "repro": "validateDisplayLine('x\\x1b[38;5;;my') and validateDisplayLine('x\\x1b[999999999my') retain live ESC sequences.",
+      "requiredFix": "Accept only bounded, syntactically valid numeric SGR parameter lists; reject empty parameter segments and bound parameter length/value."
+    },
+    {
+      "id": "G006-02",
+      "severity": "high",
+      "repro": "Create a TranscriptViewerEntry with kind: 'custom' and renderLines; select and expand it. TranscriptViewerOverlay renders renderLines directly.",
+      "requiredFix": "Restrict the trusted renderLines branch to entry.kind === 'tool' in addition to selected, expanded, and non-raw state."
+    },
+    {
+      "id": "G006-03",
+      "severity": "medium",
+      "repro": "renderToolDisplayLines(descriptor({ detailsData: { value: 'x'.repeat(8192) } }), 80, theme) includes the input-truncated hint.",
+      "requiredFix": "Apply advertised input budgets to source payload dimensions, not descriptor framing/metadata overhead, or revise the contract and exported limits."
+    },
+    {
+      "id": "G006-04",
+      "severity": "medium",
+      "repro": "Render hostile diff/JSON at width 8; the G006 balanced-SGR assertion finds an output line with active SGR and no reset.",
+      "requiredFix": "Ensure wrapping closes active SGR at each emitted-line boundary and restores it only on the following line."
+    }
+  ]
+}

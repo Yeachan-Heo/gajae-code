@@ -288,6 +288,41 @@ describe("AsyncJobManager subagent pause/resume/queue", () => {
 		await manager.dispose({ timeoutMs: 500 });
 	});
 
+	test("resume whose runner job throws marks the subagent failed and delivers the error", async () => {
+		// Backs the task resume-runner fix: a resumed subprocess that aborted or
+		// exited non-zero throws, so the resumed job must end `failed` (not
+		// `completed`), and the error text must be delivered to the leader.
+		const { manager, completions } = makeManager();
+		manager.registerResumeDescriptor({
+			subagentId: "R",
+			ownerId: "owner-1",
+			data: { sessionFile: "/tmp/R.jsonl" },
+		});
+		manager.setResumeRunner(subagentId =>
+			manager.register(
+				"task",
+				subagentId,
+				async (): Promise<SubagentRunOutcome> => {
+					throw new Error("resumed subagent failed");
+				},
+				{
+					id: "R-resume",
+					ownerId: "owner-1",
+					metadata: { subagent: { id: subagentId, agent: "planner", agentSource: "bundled" } },
+				},
+			),
+		);
+
+		const res = manager.resumeSubagent("R", { ownerId: "owner-1" }, "revision");
+		expect(res.ok).toBe(true);
+		await manager.waitForAll();
+		await manager.drainDeliveries({ timeoutMs: 500 });
+
+		expect(manager.getSubagentRecord("R", { ownerId: "owner-1" })?.status).toBe("failed");
+		expect(completions.some(completion => completion.text.includes("resumed subagent failed"))).toBe(true);
+		await manager.dispose({ timeoutMs: 500 });
+	});
+
 	test("pause after completion is a no-op (completion wins) (AC8)", async () => {
 		const { manager, completions } = makeManager();
 		const a = spawnControllable(manager, "A");

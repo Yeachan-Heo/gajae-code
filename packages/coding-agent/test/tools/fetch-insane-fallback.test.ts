@@ -49,7 +49,7 @@ describe("tryInsaneFallback gating", () => {
 		expect(bridgeSpy).not.toHaveBeenCalled();
 	});
 
-	it("rejects a guard-blocked target without spawning the engine", async () => {
+	it("disables enabled compatibility fallback before guard or bridge calls", async () => {
 		const guardSpy = vi
 			.spyOn(urlGuard, "validatePublicHttpUrlForInsane")
 			.mockResolvedValue({ ok: false, reason: "private, loopback, link-local, or reserved IP literal" });
@@ -62,12 +62,12 @@ describe("tryInsaneFallback gating", () => {
 			notes,
 		});
 		expect(result).toBeNull();
-		expect(guardSpy).toHaveBeenCalledTimes(1);
+		expect(guardSpy).not.toHaveBeenCalled();
 		expect(bridgeSpy).not.toHaveBeenCalled();
-		expect(notes.some(n => n.startsWith("insane fallback blocked:"))).toBe(true);
+		expect(notes).toContain(bridge.INSANE_NOTES.securityDisabled);
 	});
 
-	it("returns a method:insane result on bridge success", async () => {
+	it("ignores mocked bridge success while production fallback is disabled", async () => {
 		vi.spyOn(urlGuard, "validatePublicHttpUrlForInsane").mockResolvedValue({
 			ok: true,
 			url: new URL("https://example.com/x"),
@@ -86,9 +86,8 @@ describe("tryInsaneFallback gating", () => {
 			settings: Settings.isolated({ "web.insaneFallback": true }),
 			notes,
 		});
-		expect(result).not.toBeNull();
-		expect(result?.method).toBe("insane");
-		expect(result?.content).toContain("recovered public content");
+		expect(result).toBeNull();
+		expect(notes).toContain(bridge.INSANE_NOTES.securityDisabled);
 	});
 
 	it("returns null and appends notes on bridge failure", async () => {
@@ -110,7 +109,7 @@ describe("tryInsaneFallback gating", () => {
 			notes,
 		});
 		expect(result).toBeNull();
-		expect(notes).toContain(bridge.INSANE_NOTES.authRequired);
+		expect(notes).toContain(bridge.INSANE_NOTES.securityDisabled);
 	});
 });
 
@@ -183,14 +182,14 @@ describe("renderUrl hard-fail hook (integration via ReadTool)", () => {
 		expect(bridgeSpy).not.toHaveBeenCalled();
 	});
 
-	it("escalates to the engine and returns method:insane on success when enabled", async () => {
+	it("keeps failed rendering local when compatibility fallback is enabled", async () => {
 		mock403();
 		vi.spyOn(urlGuard, "validatePublicHttpUrlForInsane").mockResolvedValue({
 			ok: true,
 			url: new URL("https://blocked.example/x"),
 			addresses: ["93.184.216.34"],
 		});
-		vi.spyOn(bridge, "tryInsaneFetch").mockResolvedValue({
+		const bridgeSpy = vi.spyOn(bridge, "tryInsaneFetch").mockResolvedValue({
 			ok: true,
 			content: "content via insane route",
 			profileUsed: "safari",
@@ -198,7 +197,8 @@ describe("renderUrl hard-fail hook (integration via ReadTool)", () => {
 		});
 		const tool = new ReadTool(createSession({ "web.insaneFallback": true }));
 		const result = await tool.execute("r2", { path: "https://blocked.example/x" });
-		expect(result.details?.method).toBe("insane");
+		expect(result.details?.method).toBe("failed");
+		expect(bridgeSpy).not.toHaveBeenCalled();
 	});
 
 	it("frames fetched content as untrusted and neutralizes closing-tag spoofing", async () => {
@@ -219,7 +219,7 @@ describe("renderUrl hard-fail hook (integration via ReadTool)", () => {
 		});
 		const text = result.content[0]?.type === "text" ? result.content[0].text : undefined;
 		expect(text).toStartWith("<untrusted-content>\n");
-		expect(text).toContain("&lt;/untrusted-content>");
+		expect(text).not.toContain("spoofed");
 		expect(text?.match(/<\/untrusted-content>/g)).toHaveLength(1);
 	});
 

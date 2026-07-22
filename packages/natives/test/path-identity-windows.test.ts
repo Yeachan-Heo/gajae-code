@@ -11,8 +11,10 @@ import {
 	exactRestore,
 	exactUnlink,
 	renameNoReplacePath,
+	repairOwnerOnlyPathSecurityExpected,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
+	verifyOwnerOnlyPathSecurityExpected,
 } from "../native/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -55,6 +57,10 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		await fs.symlink(target, alias, "junction");
 
 		const rejected = { ok: false, code: "reparse_point" } as const;
+		expect(repairOwnerOnlyPathSecurityExpected(alias, "directory", 0n, 0n)).toEqual(rejected);
+		expect(repairOwnerOnlyPathSecurityExpected(path.join(alias, "state.json"), "file", 0n, 0n)).toEqual(rejected);
+		expect(verifyOwnerOnlyPathSecurityExpected(alias, "directory", 0n, 0n)).toEqual(rejected);
+		expect(verifyOwnerOnlyPathSecurityExpected(path.join(alias, "state.json"), "file", 0n, 0n)).toEqual(rejected);
 		expect(applyOwnerOnlyPathSecurity(alias, "directory")).toEqual(rejected);
 		expect(verifyOwnerOnlyPathSecurity(alias, "directory")).toEqual(rejected);
 		expect(applyOwnerOnlyPathSecurity(path.join(alias, "state.json"), "file")).toEqual(rejected);
@@ -123,6 +129,65 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
 		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
 		expect(await fs.readFile(file, "utf8")).toBe(contents);
+	});
+	it("repairs a legacy inherited ACL only for the captured directory and file identities", async () => {
+		const root = await temporaryDirectory();
+		const directory = path.join(root, "legacy-managed");
+		const file = path.join(directory, "state.json");
+		const contents = '{"legacy":true}';
+		await fs.mkdir(directory);
+		await fs.writeFile(file, contents);
+		const directoryStat = await fs.stat(directory, { bigint: true });
+		const fileStat = await fs.stat(file, { bigint: true });
+
+		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expect(repairOwnerOnlyPathSecurityExpected(file, "directory", fileStat.dev, fileStat.ino)).toMatchObject({
+			ok: false,
+		});
+		expect(await fs.readFile(file, "utf8")).toBe(contents);
+		expect(repairOwnerOnlyPathSecurityExpected(directory, "directory", directoryStat.dev, directoryStat.ino)).toEqual(
+			{ ok: true },
+		);
+		expect(repairOwnerOnlyPathSecurityExpected(file, "file", fileStat.dev, fileStat.ino)).toEqual({ ok: true });
+		expect(verifyOwnerOnlyPathSecurity(directory, "directory")).toEqual({ ok: true });
+		expect(verifyOwnerOnlyPathSecurity(file, "file")).toEqual({ ok: true });
+		expect(await fs.readFile(file, "utf8")).toBe(contents);
+	});
+	it("verifies only the captured identity without mutating a swapped replacement", async () => {
+		const root = await temporaryDirectory();
+		const target = path.join(root, "target.json");
+		const retained = path.join(root, "retained.json");
+		await fs.writeFile(target, "authorized");
+		expect(applyOwnerOnlyPathSecurity(target, "file")).toEqual({ ok: true });
+		const identity = await fs.stat(target, { bigint: true });
+		expect(verifyOwnerOnlyPathSecurityExpected(target, "file", identity.dev, identity.ino)).toEqual({ ok: true });
+		await fs.rename(target, retained);
+		await fs.writeFile(target, "replacement");
+
+		expect(verifyOwnerOnlyPathSecurityExpected(target, "file", identity.dev, identity.ino)).toEqual({
+			ok: false,
+			code: "identity_mismatch",
+		});
+		expect(verifyOwnerOnlyPathSecurity(target, "file")).toEqual({ ok: false, code: "acl_verify_failed" });
+		expect(await fs.readFile(target, "utf8")).toBe("replacement");
+		expect(await fs.readFile(retained, "utf8")).toBe("authorized");
+	});
+	it("rejects a swapped replacement before any expected-identity ACL repair", async () => {
+		const root = await temporaryDirectory();
+		const target = path.join(root, "target.json");
+		const retained = path.join(root, "retained.json");
+		await fs.writeFile(target, "authorized");
+		const identity = await fs.stat(target, { bigint: true });
+		await fs.rename(target, retained);
+		await fs.writeFile(target, "replacement");
+
+		expect(repairOwnerOnlyPathSecurityExpected(target, "file", identity.dev, identity.ino)).toEqual({
+			ok: false,
+			code: "identity_mismatch",
+		});
+		expect(await fs.readFile(target, "utf8")).toBe("replacement");
+		expect(await fs.readFile(retained, "utf8")).toBe("authorized");
 	});
 	it("rejects a contended cross-parent destination without replacing its committed bytes", async () => {
 		const root = await temporaryDirectory();
@@ -402,6 +467,10 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 
 	it("classifies UNC paths as unsupported network identities without probing a share", () => {
 		expect(canonicalExistingDirectoryIdentity(String.raw`\\server\share\workspace`)).toEqual({
+			ok: false,
+			code: "network_unsupported",
+		});
+		expect(repairOwnerOnlyPathSecurityExpected(String.raw`\\server\share\workspace`, "directory", 0n, 0n)).toEqual({
 			ok: false,
 			code: "network_unsupported",
 		});

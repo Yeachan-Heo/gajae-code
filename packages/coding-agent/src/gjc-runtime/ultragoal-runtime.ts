@@ -6,15 +6,37 @@ import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "..
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import {
+	CRITIC_GATE_HARD_STOP_EVENT,
+	CRITIC_GATE_OVERRIDE_EVENT,
+	CRITIC_VERDICT_EVENT,
+	type CriticVerdict,
+	computeCriticVerdictPlanGeneration,
 	computeUltragoalPlanGeneration,
+	countNonOkayTerminalCriticVerdicts,
 	findFreshBatchCloseReceipt,
 	findLedgerReceiptEvent,
+	isCleanPauseCriticVerdictShape,
 	requiredUltragoalGoals,
+	TERMINAL_CRITIC_CEILING,
+	terminalCriticCeilingReached,
+	terminalCriticGateOverridden,
+	terminalCriticHardStopReached,
 	validateDeferredMemberReceiptFresh,
 	validateReceiptFreshBase,
 } from "./ultragoal-receipt-freshness";
 
-export { computeUltragoalPlanGeneration, receiptRelevantGoals } from "./ultragoal-receipt-freshness";
+export {
+	CRITIC_GATE_HARD_STOP_EVENT,
+	CRITIC_GATE_OVERRIDE_EVENT,
+	CRITIC_VERDICT_EVENT,
+	type CriticVerdict,
+	computeUltragoalPlanGeneration,
+	countTerminalCriticVerdicts,
+	receiptRelevantGoals,
+	TERMINAL_CRITIC_CEILING,
+	terminalCriticCeilingReached,
+	terminalCriticGateOverridden,
+} from "./ultragoal-receipt-freshness";
 
 import { gjcRoot, sessionUltragoalDir } from "./session-layout";
 import {
@@ -33,6 +55,20 @@ import {
 	writeGuardedJsonAtomic,
 } from "./state-writer";
 
+export {
+	captureUltragoalRecoverySnapshot,
+	parseStrictTerminalTranscript,
+	persistUltragoalRecoveryDecision,
+	planUltragoalOwnerLossRecovery,
+	type UltragoalOwnerLossReceipt,
+	type UltragoalRecoveryBinding,
+	type UltragoalRecoveryDecision,
+	type UltragoalRecoverySnapshot,
+	validateOwnerLossBinding,
+	validateRawUltragoalEvidence,
+	validateRecoveryAdmission,
+	validateRecoveryPath,
+} from "./ultragoal-owner-loss-recovery";
 export type UltragoalGjcGoalMode = "aggregate" | "per-story";
 export type UltragoalGoalStatus =
 	| "pending"
@@ -413,7 +449,6 @@ export const DEFAULT_ULTRAGOAL_NUDGE_BUDGET = 10;
 export function countUltragoalNudges(ledger: readonly UltragoalLedgerEvent[], goalId: string): number {
 	return ledger.filter(event => event.event === "nudge" && event.goalId === goalId).length;
 }
-
 function parseNudgeBudgetValue(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : null;
 }
@@ -2500,12 +2535,23 @@ async function validateCompletionQualityGate(
 	} = {},
 ): Promise<void> {
 	const batchMode = options.goal?.validationBatch;
+	const receiptKind =
+		options.plan && options.goal && options.ledger
+			? chooseReceiptKind(options.plan, options.ledger, options.goal, "complete")
+			: undefined;
+	const isFinalAggregate = receiptKind === "final-aggregate";
 	if (batchMode && options.goal && options.goal.id !== batchMode.finalGoalId) {
 		validateDeferredCompletionQualityGate(gate, options.goal, batchMode, options.changeSet);
 		return;
 	}
 	if (batchMode && options.goal && options.goal.id === batchMode.finalGoalId) {
-		const allowedKeys = new Set(["architectReview", "executorQa", "iteration", "validationBatchClose"]);
+		const allowedKeys = new Set([
+			"architectReview",
+			"executorQa",
+			"iteration",
+			"validationBatchClose",
+			"criticReview",
+		]);
 		const unsupportedKeys = Object.keys(gate).filter(key => !allowedKeys.has(key));
 		if (unsupportedKeys.length > 0)
 			throw new Error(`qualityGate contains unsupported keys: ${unsupportedKeys.join(", ")}`);
@@ -2520,8 +2566,8 @@ async function validateCompletionQualityGate(
 	}
 	const allowedKeys = new Set(
 		batchMode
-			? ["architectReview", "executorQa", "iteration", "validationBatchClose"]
-			: ["architectReview", "executorQa", "iteration"],
+			? ["architectReview", "executorQa", "iteration", "validationBatchClose", "criticReview"]
+			: ["architectReview", "executorQa", "iteration", "criticReview"],
 	);
 	const unsupportedKeys = Object.keys(gate).filter(key => !allowedKeys.has(key));
 	if (unsupportedKeys.length > 0) {
@@ -2532,6 +2578,25 @@ async function validateCompletionQualityGate(
 	const iteration = qualityGateObject(gate.iteration);
 	if (!architectReview || !executorQa || !iteration) {
 		throw new Error("qualityGate requires architectReview, executorQa, and iteration objects");
+	}
+	if (isFinalAggregate) {
+		if (
+			options.ledger &&
+			terminalCriticCeilingReached(options.ledger) &&
+			!terminalCriticGateOverridden(options.ledger)
+		) {
+			throw new Error(
+				"checkpoint --status complete blocked: terminal-critic ceiling reached; requires human/leader gjc ultragoal record-critic-gate-override before completion",
+			);
+		}
+		const criticReview = qualityGateObject(gate.criticReview);
+		if (criticReview?.verdict !== "OKAY") {
+			throw new Error(
+				"checkpoint --status complete (final aggregate) requires criticReview with verdict OKAY, non-empty evidence, and empty blockers",
+			);
+		}
+		requireNonEmptyString(criticReview.evidence, "criticReview.evidence");
+		requireEmptyBlockers(criticReview.blockers, "criticReview.blockers");
 	}
 	if (
 		architectReview.architectureStatus !== CLEAN_ARCHITECT_STATUS ||
@@ -3536,10 +3601,10 @@ export async function recordUltragoalReviewBlockers(input: {
 export type UltragoalBlockerClassification = "human_blocked" | "resolvable";
 
 /**
- * Record an audited blocker triage classification in the durable ledger. A
- * `human_blocked` classification is the only thing that authorizes
- * `goal({"op":"pause"})` while an Ultragoal run is active; `resolvable` is an
- * audit note and never unblocks pause.
+ * Record an audited blocker triage classification in the durable ledger. Pause
+ * requires the latest `blocker_classified` event to be `human_blocked` and a
+ * later clean pause terminal critic verdict bound to that classification; `resolvable`
+ * is an audit note and never unblocks pause.
  */
 export async function recordUltragoalBlockerClassification(input: {
 	cwd: string;
@@ -3558,6 +3623,130 @@ export async function recordUltragoalBlockerClassification(input: {
 		...(input.goalId?.trim() ? { goalId: input.goalId.trim() } : {}),
 		evidence,
 	});
+}
+
+export async function recordUltragoalCriticVerdict(input: {
+	cwd: string;
+	terminus: "completion" | "pause";
+	verdict: CriticVerdict;
+	evidence: string;
+	blockers?: string[];
+	goalId?: string;
+	classificationEventId?: string;
+}): Promise<UltragoalLedgerEvent> {
+	const evidence = input.evidence.trim();
+	if (!evidence) throw new Error("record-critic-verdict --evidence is required");
+	if (input.terminus !== "completion" && input.terminus !== "pause") {
+		throw new Error('record-critic-verdict --terminus must be "completion" or "pause"');
+	}
+	if (input.verdict !== "OKAY" && input.verdict !== "ITERATE" && input.verdict !== "REJECT") {
+		throw new Error("record-critic-verdict --verdict must be OKAY, ITERATE, or REJECT");
+	}
+	const blockers = stringArray(input.blockers ?? []);
+	if (!blockers) throw new Error("record-critic-verdict --blockers-json must be a JSON string array");
+	if (input.terminus === "completion" && input.verdict === "OKAY" && blockers.length > 0) {
+		throw new Error("OKAY critic verdict must have empty blockers");
+	}
+	const classificationEventId = input.classificationEventId?.trim();
+	if (input.terminus === "pause" && !classificationEventId) {
+		throw new Error("record-critic-verdict --classification-event-id is required for pause verdicts");
+	}
+	const resolvedSessionId = resolveGjcSessionForWrite(input.cwd, {
+		envSessionId: process.env.GJC_SESSION_ID,
+	}).gjcSessionId;
+	const paths = getUltragoalPaths(input.cwd, resolvedSessionId);
+	return withWorkflowStateLock(
+		paths.ledgerPath,
+		async () => {
+			const plan = await readUltragoalPlan(input.cwd, resolvedSessionId);
+			if (!plan) throw new Error("record-critic-verdict requires an active ultragoal plan");
+			const ledger = await readUltragoalLedger(input.cwd, resolvedSessionId);
+			if (input.terminus === "pause") {
+				const latestClassification = [...ledger].reverse().find(event => event.event === "blocker_classified");
+				if (
+					latestClassification?.classification !== "human_blocked" ||
+					latestClassification.eventId !== classificationEventId
+				) {
+					throw new Error(
+						"record-critic-verdict pause requires --classification-event-id to name the latest human_blocked classification",
+					);
+				}
+			}
+			const planGeneration = computeCriticVerdictPlanGeneration(plan);
+			if (
+				input.terminus === "pause" &&
+				input.verdict === "OKAY" &&
+				!isCleanPauseCriticVerdictShape(
+					{
+						event: CRITIC_VERDICT_EVENT,
+						terminus: input.terminus,
+						verdict: input.verdict,
+						evidence,
+						blockers,
+						planGeneration,
+						classificationEventId,
+					},
+					planGeneration,
+					classificationEventId!,
+				)
+			) {
+				throw new Error("OKAY critic verdict must have empty blockers");
+			}
+			const criticVerdict = await appendLedger(
+				input.cwd,
+				{
+					event: CRITIC_VERDICT_EVENT,
+					terminus: input.terminus,
+					verdict: input.verdict,
+					evidence,
+					blockers,
+					planGeneration,
+					...(classificationEventId ? { classificationEventId } : {}),
+					...(input.goalId?.trim() ? { goalId: input.goalId.trim() } : {}),
+				},
+				resolvedSessionId,
+			);
+			const updatedLedger = [...ledger, criticVerdict];
+			const count = countNonOkayTerminalCriticVerdicts(updatedLedger);
+			if (count >= TERMINAL_CRITIC_CEILING && !terminalCriticHardStopReached(updatedLedger)) {
+				await appendLedger(
+					input.cwd,
+					{
+						event: CRITIC_GATE_HARD_STOP_EVENT,
+						planGeneration,
+						reason: "Terminal critic verdict ceiling reached.",
+						count,
+					},
+					resolvedSessionId,
+				);
+			}
+			return criticVerdict;
+		},
+		{ cwd: input.cwd },
+	);
+}
+
+export async function recordUltragoalCriticGateOverride(input: {
+	cwd: string;
+	evidence: string;
+}): Promise<UltragoalLedgerEvent> {
+	const evidence = input.evidence.trim();
+	if (!evidence) throw new Error("record-critic-gate-override --evidence is required");
+	const resolvedSessionId = resolveGjcSessionForWrite(input.cwd, {
+		envSessionId: process.env.GJC_SESSION_ID,
+	}).gjcSessionId;
+	const paths = getUltragoalPaths(input.cwd, resolvedSessionId);
+	return withWorkflowStateLock(
+		paths.ledgerPath,
+		async () => {
+			const ledger = await readUltragoalLedger(input.cwd, resolvedSessionId);
+			if (!terminalCriticHardStopReached(ledger)) {
+				throw new Error("record-critic-gate-override requires a durably recorded terminal critic hard stop");
+			}
+			return appendLedger(input.cwd, { event: CRITIC_GATE_OVERRIDE_EVENT, evidence }, resolvedSessionId);
+		},
+		{ cwd: input.cwd },
+	);
 }
 
 type UltragoalReviewMode = "review-only" | "review-start";
@@ -3958,7 +4147,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 			"  $ gjc ultragoal classify-blocker --classification <human_blocked|resolvable> --evidence <text> [FLAGS]",
 			"",
 			"FLAGS",
-			"      --classification=<value>     Required. human_blocked authorizes pause only as the latest ledger event; resolvable never authorizes pause",
+			"      --classification=<value>     Required. human_blocked must be the latest blocker_classified event; pause also requires a later bound clean pause terminal critic OKAY verdict; resolvable never authorizes pause",
 			"      --evidence=<value>           Required. Specific blocker evidence; must name the human-only dependency for human_blocked",
 			"      --goal-id=<value>            Optional durable .gjc/ultragoal goal id, e.g. G001",
 			"      --json                       Output a machine-readable receipt",
@@ -3969,6 +4158,44 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 			"",
 		].join("\n");
 	}
+	if (subject === "record-critic-verdict") {
+		return [
+			"Run native GJC Ultragoal workflow commands",
+			"",
+			"USAGE",
+			"  $ gjc ultragoal record-critic-verdict --terminus <completion|pause> --verdict <OKAY|ITERATE|REJECT> --evidence <text> [--blockers-json <json>] [--goal-id <id>] [--classification-event-id <id>]",
+			"",
+			"FLAGS",
+			"      --terminus=<value>           Required. completion or pause",
+			"      --verdict=<value>            Required. OKAY, ITERATE, or REJECT",
+			"      --evidence=<value>           Required. Specific evidence supporting the verdict",
+			"      --blockers-json=<value>      Optional JSON string array of blockers",
+			"      --goal-id=<value>            Optional durable .gjc/ultragoal goal id, e.g. G001",
+			"      --classification-event-id=<id> Required for pause verdicts; binds the human_blocked classification",
+			"      --json                       Output a machine-readable receipt",
+			"",
+			"EXAMPLES",
+			'  $ gjc ultragoal record-critic-verdict --terminus completion --verdict OKAY --evidence "all final-aggregate checkpoint evidence is current"',
+			"",
+		].join("\n");
+	}
+	if (subject === "record-critic-gate-override") {
+		return [
+			"Run native GJC Ultragoal workflow commands",
+			"",
+			"USAGE",
+			"  $ gjc ultragoal record-critic-gate-override --evidence <text> [--json]",
+			"",
+			"FLAGS",
+			"      --evidence=<value>           Required. Human/leader authorization evidence for the terminal-critic ceiling override",
+			"      --json                       Output a machine-readable receipt",
+			"",
+			"EXAMPLES",
+			'  $ gjc ultragoal record-critic-gate-override --evidence "leader approved another terminal attempt after reviewing all five findings"',
+			"",
+		].join("\n");
+	}
+
 	return [
 		"Run native GJC Ultragoal workflow commands",
 		"",
@@ -3984,11 +4211,14 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		"  steer",
 		"  record-review-blockers",
 		"  classify-blocker",
+		"  record-critic-verdict",
+		"  record-critic-gate-override",
+
 		"  start-pipeline-overlap",
 		"  join-pipeline-overlap",
 		"  rebaseline-pipeline-overlap",
 		"",
-		"Run `gjc ultragoal checkpoint --help`, `gjc ultragoal review --help`, or `gjc ultragoal classify-blocker --help` for command-specific requirements.",
+		"Run `gjc ultragoal checkpoint --help`, `gjc ultragoal review --help`, `gjc ultragoal classify-blocker --help`, `gjc ultragoal record-critic-verdict --help`, or `gjc ultragoal record-critic-gate-override --help` for command-specific requirements.",
 		"",
 	].join("\n");
 }
@@ -4340,8 +4570,53 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 								ok: true,
 								event: "blocker_classified",
 								classification: event.classification,
+								event_id: event.eventId,
 							})
-						: `Recorded blocker classification: ${String(event.classification)}.\n`,
+						: `Recorded blocker classification: ${String(event.classification)} event-id=${String(event.eventId)}.\n`,
+				};
+			}
+			case "record-critic-verdict": {
+				const blockersJson = flagValue(args, "--blockers-json");
+				const blockers =
+					blockersJson === undefined ? undefined : stringArray(await readStructuredValue(cwd, blockersJson));
+				if (blockersJson !== undefined && !blockers) {
+					throw new Error("record-critic-verdict --blockers-json must be a JSON string array");
+				}
+				const event = await recordUltragoalCriticVerdict({
+					cwd,
+					terminus: (flagValue(args, "--terminus") ?? "") as "completion" | "pause",
+					verdict: (flagValue(args, "--verdict") ?? "") as CriticVerdict,
+					evidence: flagValue(args, "--evidence") ?? "",
+					blockers: blockers ?? undefined,
+					goalId: flagValue(args, "--goal-id"),
+					classificationEventId: flagValue(args, "--classification-event-id"),
+				});
+				return {
+					status: 0,
+					stdout: json
+						? renderCliWriteReceipt({
+								ok: true,
+								event: CRITIC_VERDICT_EVENT,
+								terminus: event.terminus,
+								verdict: event.verdict,
+							})
+						: `Recorded critic verdict: ${String(event.verdict)} (${String(event.terminus)}).\n`,
+				};
+			}
+			case "record-critic-gate-override": {
+				const event = await recordUltragoalCriticGateOverride({
+					cwd,
+					evidence: flagValue(args, "--evidence") ?? "",
+				});
+				return {
+					status: 0,
+					stdout: json
+						? renderCliWriteReceipt({
+								ok: true,
+								event: CRITIC_GATE_OVERRIDE_EVENT,
+								event_id: event.eventId,
+							})
+						: `Recorded terminal critic gate override event-id=${String(event.eventId)}.\n`,
 				};
 			}
 			case "start-pipeline-overlap": {
@@ -4421,6 +4696,8 @@ const RECONCILE_COMMANDS = new Set([
 	"record-review-blockers",
 	"review",
 	"classify-blocker",
+	"record-critic-verdict",
+	"record-critic-gate-override",
 	"start-pipeline-overlap",
 	"join-pipeline-overlap",
 	"rebaseline-pipeline-overlap",

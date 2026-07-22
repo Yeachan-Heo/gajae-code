@@ -1,0 +1,9 @@
+{
+  "$schema": "sdk-frame-vectors/v1",
+  "kind": "generator",
+  "name": "large reverse frame generator",
+  "prefix": "{\"type\":\"turn_stream\",\"data\":\"",
+  "suffix": "\"}",
+  "generate": { "character": "a", "count": 1048577 },
+  "expectations": { "minimumBytes": 1048577, "reversePerFrameLimit": "none" }
+}

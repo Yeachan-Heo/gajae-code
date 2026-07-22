@@ -154,10 +154,12 @@ async function resolveRecentScopes(
 			agentDir,
 			sessionsRoot,
 		});
-		if (
-			resolved.kind !== "resolved" ||
-			(expectedDirectory !== undefined && resolved.scope.directoryPath !== expectedDirectory)
-		) {
+		if (resolved.kind !== "resolved") {
+			if (resolved.code !== "cwd_missing" && resolved.code !== "cwd_not_directory")
+				warnings.push("Ignored invalid managed session scope binding.");
+			return;
+		}
+		if (expectedDirectory !== undefined && resolved.scope.directoryPath !== expectedDirectory) {
 			warnings.push("Ignored invalid managed session scope binding.");
 			return;
 		}
@@ -232,7 +234,14 @@ export async function listRecentSessions(deps: RecentActivityDeps): Promise<List
 			return { kind: "error", code: "managed_scan_failed", message: listed.message };
 		}
 		candidates.push(...listed.owned);
-		warnings.push(...listed.invalid.map(invalid => `Ignored invalid managed session candidate: ${invalid.code}`));
+		warnings.push(
+			...listed.invalid
+				.filter(
+					invalid =>
+						!deps.allWorkspaces || (invalid.code !== "cwd_not_found" && invalid.code !== "cwd_not_directory"),
+				)
+				.map(invalid => `Ignored invalid managed session candidate: ${invalid.code}`),
+		);
 	}
 
 	const entries: RecentSessionEntry[] = [];

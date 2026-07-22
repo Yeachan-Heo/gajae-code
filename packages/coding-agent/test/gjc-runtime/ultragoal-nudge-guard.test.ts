@@ -19,6 +19,7 @@ import {
 	readUltragoalLedger,
 	readUltragoalPlan,
 	recordUltragoalBlockerClassification,
+	recordUltragoalCriticVerdict,
 	recordUltragoalNudgeIfBudgetRemaining,
 	resolveUltragoalNudgeBudget,
 	selectUltragoalNudgeTarget,
@@ -122,19 +123,21 @@ describe("ultragoal nudge guard", () => {
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await setProjectBudget(cwd, 1);
 		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
-		await recordUltragoalBlockerClassification({
-			cwd,
-			classification: "human_blocked",
-			evidence: "User must provide production API credentials",
-		});
-		// Budget 1: first pause attempt is nudged even though the blocker is human_blocked.
+		// Budget 1: the first pause attempt is nudged before the human-only blocker is classified.
 		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/try-harder nudge \(1\/1\)/);
-		// Re-record human_blocked as the latest event, then exhausted budget falls back to today's allowance.
-		await recordUltragoalBlockerClassification({
+		const classification = await recordUltragoalBlockerClassification({
 			cwd,
 			classification: "human_blocked",
 			evidence: "User must provide production API credentials",
 		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict: "OKAY",
+			evidence: "critic confirms the remaining blocker requires human action",
+			classificationEventId: classification.eventId,
+		});
+		// The exhausted budget now falls back to the bound clean human-blocked allowance.
 		await expect(assertUltragoalPauseAllowed(cwd)).resolves.toBeUndefined();
 	});
 

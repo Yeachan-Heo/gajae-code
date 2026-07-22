@@ -16,8 +16,8 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
-		id: "alibaba-coding-plan",
-		name: "Alibaba Coding Plan",
+		id: "alibaba-token-plan",
+		name: "Alibaba Token Plan",
 		available: true,
 	},
 	{
@@ -371,6 +371,7 @@ export async function refreshOAuthToken(
 		case "together":
 		case "litellm":
 		case "lm-studio":
+		case "alibaba-token-plan":
 		case "ollama":
 		case "ollama-cloud":
 		case "xiaomi":

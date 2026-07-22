@@ -2,7 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { Snowflake, untilAborted } from "@gajae-code/utils";
+import { untilAborted } from "@gajae-code/utils/abortable";
+import { Snowflake } from "@gajae-code/utils/snowflake";
 import type { HTMLElement } from "linkedom";
 import type {
 	Browser,
@@ -17,8 +18,6 @@ import type {
 import { JsRuntime, type RuntimeHooks } from "../../eval/js/shared/runtime";
 import type { JsDisplayOutput } from "../../eval/js/shared/types";
 import { resizeImage } from "../../utils/image-resize";
-import { resolveToCwd } from "../path-utils";
-import { formatScreenshot } from "../render-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tool-errors";
 import {
 	applyStealthPatches,
@@ -28,6 +27,7 @@ import {
 	loadPuppeteerInWorker,
 } from "./launch";
 import { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./readable";
+import { formatScreenshot } from "./screenshot-format";
 import type {
 	Observation,
 	ObservationEntry,
@@ -41,6 +41,7 @@ import type {
 	WorkerInbound,
 	WorkerInitPayload,
 } from "./tab-protocol";
+import { resolveTabWorkerPath } from "./tab-worker-path-resolver";
 
 declare global {
 	interface Element extends HTMLElement {}
@@ -813,7 +814,8 @@ export class WorkerCore {
 			{ type: "image", data: buffer.toBase64(), mimeType: "image/png" },
 			{ maxWidth: 1024, maxHeight: 1024, maxBytes: 150 * 1024, jpegQuality: 70 },
 		);
-		const explicitPath = opts.save ? resolveToCwd(opts.save, session.cwd) : undefined;
+		const explicitPath = opts.save ? resolveTabWorkerPath(opts.save, session.cwd) : undefined;
+
 		const dest =
 			explicitPath ??
 			(session.browserScreenshotDir
@@ -950,7 +952,7 @@ export class WorkerCore {
 			page.locator(normalizeSelector(selector)).setTimeout(timeoutMs).waitHandle(),
 		)) as ElementHandle;
 		try {
-			const absolute = filePaths.map(filePath => resolveToCwd(filePath, session.cwd));
+			const absolute = filePaths.map(filePath => resolveTabWorkerPath(filePath, session.cwd));
 			const upload = handle as unknown as { uploadFile: (...paths: string[]) => Promise<void> };
 			const tagName = (await untilAborted(signal, () =>
 				handle.evaluate(el => (el as unknown as { tagName: string }).tagName),

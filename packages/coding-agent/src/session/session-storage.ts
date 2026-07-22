@@ -5,6 +5,11 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 
 import { isEnoent, pathIsWithin, peekFile, toError } from "@gajae-code/utils";
+import {
+	assertManagedDirectoryRoot,
+	type ManagedDirectoryRoot,
+	validateNativeSecurityResult,
+} from "./internal/managed-session-storage";
 
 const utf8Decoder = new TextDecoder("utf-8");
 function canonicalPathSync(value: string): string {
@@ -89,7 +94,40 @@ export interface SessionStorageWriterOpenOptions {
 	onError?: (err: Error) => void;
 	/** Injectable OS-close dispatcher; defaults to `fs.closeSync`. */
 	closeAdapter?: SessionStorageWriterCloseAdapter;
+	/** Opaque authority for default-computed managed destinations only. */
+	securityContext?: SessionStorageSecurityContext;
 }
+
+/**
+ * Immutable authority attached only to a computed managed session destination.
+ * A caller-supplied pathname never receives this capability, even when it
+ * happens to equal the current default session directory.
+ */
+export interface ManagedSessionSecurityContext {
+	readonly kind: "managed";
+	readonly agentDir: string;
+	readonly sessionsRoot: string;
+	readonly sessionDir: string;
+	readonly rootAuthority: ManagedDirectoryRoot;
+	readonly retainedAuthority?: native.RecoveryFsRoot;
+}
+
+const managedSecurityContexts = new WeakSet<ManagedSessionSecurityContext>();
+
+/** @internal Create the only accepted managed writer authority object. */
+export function createManagedSessionSecurityContext(input: {
+	agentDir: string;
+	sessionsRoot: string;
+	sessionDir: string;
+	rootAuthority: ManagedDirectoryRoot;
+	retainedAuthority?: native.RecoveryFsRoot;
+}): ManagedSessionSecurityContext {
+	const context = Object.freeze({ kind: "managed" as const, ...input });
+	managedSecurityContexts.add(context);
+	return context;
+}
+
+export type SessionStorageSecurityContext = ManagedSessionSecurityContext | undefined;
 
 export interface SessionStorageWriter {
 	writeLine(line: string): Promise<void>;
@@ -268,8 +306,6 @@ const defaultCloseAdapter: SessionStorageWriterCloseAdapter = {
 	},
 };
 
-type NativeSecurity = { ok: true } | { ok: false; code: string };
-
 type NativeExactUnlinkResult = { ok: true; detachedPath?: string } | { ok: false; code: string; detachedPath?: string };
 type NativeExactUnlink = (
 	path: string,
@@ -309,6 +345,7 @@ type NativeDirectoryTreeEntry = {
 	ino: string;
 	size: string;
 	mtimeNs: string;
+	ctimeNs: string;
 	sha256?: string;
 };
 export type NativeDirectoryTreeSnapshot = {
@@ -349,11 +386,57 @@ function exactUnlinkFailure(result: NativeExactUnlinkResult): SessionDeleteVerif
 				: "stat";
 	return new SessionDeleteVerificationError(kind, `Exact transcript deletion rejected: ${result.code}`);
 }
-function secureOwnerOnlyFile(pathname: string): void {
-	const applied = native.applyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
-	if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
-	const verified = native.verifyOwnerOnlyPathSecurity(pathname, "file") as NativeSecurity;
-	if (!verified.ok) throw new Error(`Owner-only security rejected ${pathname}: ${verified.code}`);
+
+function isValidManagedSecurityContext(value: SessionStorageSecurityContext): value is ManagedSessionSecurityContext {
+	if (
+		value?.kind !== "managed" ||
+		!Object.isFrozen(value) ||
+		!managedSecurityContexts.has(value) ||
+		!pathIsWithin(value.agentDir, value.sessionsRoot) ||
+		!pathIsWithin(value.sessionsRoot, value.sessionDir)
+	) {
+		return false;
+	}
+	assertManagedDirectoryRoot(value.rootAuthority);
+	if (!pathIsWithin(value.rootAuthority.canonicalPath, value.agentDir)) return false;
+	return true;
+}
+
+function secureOwnerOnlyFileDescriptor(
+	pathname: string,
+	fd: number,
+	operation: "apply" | "verify",
+	securityContext: SessionStorageSecurityContext,
+): void {
+	if (securityContext && !isValidManagedSecurityContext(securityContext))
+		throw new Error("Invalid managed session security context");
+	if (process.platform !== "linux" || !securityContext) {
+		if (operation === "apply") {
+			const applied = validateNativeSecurityResult(
+				native.applyOwnerOnlyPathSecurity(pathname, "file"),
+				"apply",
+				"file",
+			);
+			if (!applied.ok) throw new Error(`Owner-only security rejected ${pathname}: ${applied.code}`);
+		}
+		const verified = validateNativeSecurityResult(
+			native.verifyOwnerOnlyPathSecurity(pathname, "file"),
+			"verify",
+			"file",
+		);
+		if (!verified.ok) throw new Error(`Owner-only security rejected ${pathname}: ${verified.code}`);
+		return;
+	}
+	if (!pathIsWithin(securityContext.sessionDir, pathname))
+		throw new Error(`Managed writer escaped its session directory: ${pathname}`);
+	const result = validateNativeSecurityResult(
+		operation === "apply"
+			? native.applyOwnerOnlyFdSecurity(pathname, "file", fd)
+			: native.verifyOwnerOnlyFdSecurity(pathname, "file", fd),
+		operation,
+		"file",
+	);
+	if (!result.ok) throw new Error(`Owner-only security rejected ${pathname}: ${result.code}`);
 }
 
 /** Reject a symlink/junction/reparse component before a storage path is created or opened. */
@@ -383,35 +466,41 @@ const writerRegistry = new FinalizationRegistry<number>(fd => {
 
 class FileSessionStorageWriter implements SessionStorageWriter {
 	#fd: number;
+	#path: string;
+
 	#closeState: SessionStorageWriterCloseState = "open";
 	#closeError: Error | undefined;
 	#error: Error | undefined;
 	#onError: ((err: Error) => void) | undefined;
 	#closeAdapter: SessionStorageWriterCloseAdapter;
+	#securityContext: SessionStorageSecurityContext;
 
 	constructor(fpath: string, options?: SessionStorageWriterOpenOptions) {
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
+		this.#securityContext = options?.securityContext;
 		const flags = options?.flags ?? "a";
 		const dir = path.dirname(fpath);
 		assertNoReparsePath(dir);
 		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		assertNoReparsePath(dir);
 		assertNoReparsePath(fpath);
-		// The creation mode prevents a POSIX exposure before the native verifier runs.
+		// Never truncate before the descriptor and its terminal pathname have passed native security.
 		const openFlags =
 			(flags === "w"
-				? fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC
+				? fs.constants.O_WRONLY | fs.constants.O_CREAT
 				: fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND) | (fs.constants.O_NOFOLLOW ?? 0);
 		const fd = fs.openSync(fpath, openFlags, 0o600);
 		try {
-			// Do not rely on directory inheritance: secure and verify every file independently.
-			secureOwnerOnlyFile(fpath);
+			secureOwnerOnlyFileDescriptor(fpath, fd, "apply", this.#securityContext);
+			if (flags === "w") fs.ftruncateSync(fd, 0);
 		} catch (error) {
 			fs.closeSync(fd);
 			throw error;
 		}
 		this.#fd = fd;
+		this.#path = fpath;
+
 		writerRegistry.register(this, this.#fd, this);
 	}
 
@@ -469,6 +558,7 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		if (this.#error) throw this.#error;
 		try {
 			fs.fsyncSync(this.#fd);
+			secureOwnerOnlyFileDescriptor(this.#path, this.#fd, "verify", this.#securityContext);
 		} catch (err) {
 			throw this.#recordError(err);
 		}
@@ -481,6 +571,14 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		// for this numeric fd again; surface the stored non-quiescent error.
 		if (this.#closeState === "close_unknown") throw this.#closeError!;
 		// State is "open" or "close_failed_retryable": a close may be dispatched.
+		try {
+			secureOwnerOnlyFileDescriptor(this.#path, this.#fd, "verify", this.#securityContext);
+		} catch (err) {
+			// Verification happens before the OS-close dispatch, so descriptor ownership remains proven.
+			this.#closeState = "close_failed_retryable";
+			this.#closeError = toError(err);
+			throw this.#closeError;
+		}
 		try {
 			this.#closeAdapter.close(this.#fd);
 		} catch (err) {

@@ -150,6 +150,36 @@ describe("end-to-end via the broker", () => {
 		expect(gateAnswerToResult(singleQ, { selected: ["JWT"] }).selectedOptions).toEqual(["JWT"]);
 	});
 
+	it("rejects oversized structured deep-interview Other answers while keeping the gate pending", async () => {
+		const advanced: unknown[] = [];
+		const broker = new WorkflowGateBroker("run-di-oversized", new MemoryGateStore(), {
+			advance: (_gate, answer) => {
+				advanced.push(answer);
+			},
+		});
+		const question: AskGateQuestion = {
+			...singleQ,
+			deepInterview: { round: 1, component: "auth", dimension: "goal", ambiguity: 0.5 },
+		};
+		const gate = broker.openGate(questionToGate(question), activeContinuation());
+		const oversized = await broker.resolve({
+			gate_id: gate.gate_id,
+			answer: { selected: [], other: true, custom: "한".repeat(10_001) },
+		});
+
+		expect(oversized.status).toBe("rejected");
+		expect(oversized.error?.errors.some(error => error.keyword === "maxLength")).toBe(true);
+		expect(broker.listPendingGates()).toContainEqual(gate);
+		expect(advanced).toEqual([]);
+
+		const boundary = await broker.resolve({
+			gate_id: gate.gate_id,
+			answer: { selected: [], other: true, custom: "한".repeat(10_000) },
+		});
+		expect(boundary.status).toBe("accepted");
+		expect(advanced).toHaveLength(1);
+	});
+
 	it("accepts single-select normal selection, Other-only, and clarification paths", async () => {
 		const advanced: unknown[] = [];
 		const broker = new WorkflowGateBroker("run-di-valid", new MemoryGateStore(), {
@@ -232,5 +262,217 @@ describe("questionToGate structured deep-interview metadata", () => {
 		const state = gate.context?.stage_state as Record<string, unknown>;
 		expect(state.round).toBe(3);
 		expect(state.deep_interview_metadata).toBeUndefined();
+	});
+});
+
+describe("questionToGate confused_terms + references adapter context", () => {
+	it("threads bounded confused_terms and references into stage_state", () => {
+		const gate = questionToGate({
+			id: "q-adapter",
+			question: "Round 1 | Component: Intake | Targeting: Goal | Ambiguity: 50%\n\nWhat is the core entity?",
+			options: [{ label: "Task" }, { label: "Project" }],
+			deepInterview: {
+				round: 1,
+				component: "intake",
+				dimension: "goal",
+				ambiguity: 0.5,
+				confused_terms: ["idempotency", "backpressure"],
+				references: [
+					{
+						reference_id: "r1",
+						label: "RFC 42",
+						origin: "user",
+						url: "https://example.com/rfc42",
+						excerpt: "the contract; see $() note",
+					},
+				],
+			},
+		});
+		const state = gate.context?.stage_state as Record<string, unknown>;
+		expect(state.confused_terms).toEqual(["idempotency", "backpressure"]);
+		expect(Array.isArray(state.references)).toBe(true);
+		expect((state.references as Array<Record<string, unknown>>)[0]?.reference_id).toBe("r1");
+	});
+
+	it("accepts emoji adapter metadata at code-point boundaries", () => {
+		const term = "😀".repeat(256);
+		const longText = "😀".repeat(2048);
+		const gate = questionToGate({
+			id: "q-non-ascii-boundary",
+			question: "Round 1 | Ambiguity: 50%",
+			options: [{ label: "x" }],
+			deepInterview: {
+				round_id: "😀".repeat(128),
+				round: 1,
+				component: "😀".repeat(128),
+				dimension: "😀".repeat(128),
+				ambiguity: 0.5,
+				confused_terms: [term],
+				references: [{ reference_id: term, label: term, origin: term, url: longText, excerpt: longText }],
+			},
+		});
+
+		const state = gate.context?.stage_state as Record<string, unknown>;
+		expect(state.confused_terms).toEqual([term]);
+		expect(state.references).toEqual([
+			{ reference_id: term, label: term, origin: term, url: longText, excerpt: longText },
+		]);
+		expect(state.round_id).toBe("😀".repeat(128));
+	});
+
+	it("rejects adapter metadata beyond character-count boundaries", () => {
+		expect(() =>
+			questionToGate({
+				id: "q-non-ascii-overflow",
+				question: "Round 1 | Ambiguity: 50%",
+				options: [{ label: "x" }],
+				deepInterview: {
+					round: 1,
+					component: "intake",
+					dimension: "goal",
+					ambiguity: 0.5,
+					confused_terms: ["😀".repeat(257)],
+				},
+			}),
+		).toThrow(/confused_terms/);
+	});
+
+	it("rejects emoji core metadata beyond 128 code points", () => {
+		const base = {
+			id: "q-core-overflow",
+			question: "Round 1 | Ambiguity: 50%",
+			options: [{ label: "x" }],
+		};
+		for (const field of ["round_id", "component", "dimension"] as const)
+			expect(() =>
+				questionToGate({
+					...base,
+					deepInterview: {
+						round_id: "r1",
+						round: 1,
+						component: "c",
+						dimension: "goal",
+						ambiguity: 0.5,
+						[field]: "😀".repeat(129),
+					},
+				}),
+			).toThrow(new RegExp(field));
+	});
+
+	it("omits adapter context when absent (unchanged behavior)", () => {
+		const gate = questionToGate({
+			id: "q-noadapter",
+			question: "Round 2 | Targeting: Constraints | Ambiguity: 40%",
+			options: [{ label: "x" }],
+			deepInterview: { round: 2, component: "intake", dimension: "constraints", ambiguity: 0.4 },
+		});
+		const state = gate.context?.stage_state as Record<string, unknown>;
+		expect(state.confused_terms).toBeUndefined();
+		expect(state.references).toBeUndefined();
+	});
+
+	it("rejects malformed confused_terms and references", () => {
+		expect(() =>
+			questionToGate({
+				id: "q-bad-terms",
+				question: "Round 1 | Ambiguity: 50%",
+				options: [{ label: "x" }],
+				deepInterview: {
+					round: 1,
+					component: "intake",
+					dimension: "goal",
+					ambiguity: 0.5,
+					confused_terms: [123 as unknown as string],
+				},
+			}),
+		).toThrow(/confused_terms/);
+		expect(() =>
+			questionToGate({
+				id: "q-bad-refs",
+				question: "Round 1 | Ambiguity: 50%",
+				options: [{ label: "x" }],
+				deepInterview: {
+					round: 1,
+					component: "intake",
+					dimension: "goal",
+					ambiguity: 0.5,
+					references: [
+						{ reference_id: "r1" } as unknown as { reference_id: string; label: string; origin: string },
+					],
+				},
+			}),
+		).toThrow(/references/);
+	});
+
+	it("rejects sparse arrays and prototype-backed adapter references", () => {
+		const sparseTerms = new Array<string>(1);
+		expect(() =>
+			questionToGate({
+				id: "q-sparse-terms",
+				question: "Round 1 | Ambiguity: 50%",
+				options: [{ label: "x" }],
+				deepInterview: {
+					round: 1,
+					component: "intake",
+					dimension: "goal",
+					ambiguity: 0.5,
+					confused_terms: sparseTerms,
+				},
+			}),
+		).toThrow(/confused_terms/);
+
+		const inherited = Object.create({ reference_id: "r1", label: "label", origin: "user" }) as {
+			reference_id: string;
+			label: string;
+			origin: string;
+		};
+		expect(() =>
+			questionToGate({
+				id: "q-inherited-reference",
+				question: "Round 1 | Ambiguity: 50%",
+				options: [{ label: "x" }],
+				deepInterview: {
+					round: 1,
+					component: "intake",
+					dimension: "goal",
+					ambiguity: 0.5,
+					references: [inherited],
+				},
+			}),
+		).toThrow(/references/);
+	});
+
+	it("rejects every adapter string field one character beyond its schema limit", () => {
+		const base = {
+			id: "q-adapter-overflow",
+			question: "Round 1 | Ambiguity: 50%",
+			options: [{ label: "x" }],
+		};
+		for (const field of ["reference_id", "label", "origin"] as const)
+			expect(() =>
+				questionToGate({
+					...base,
+					deepInterview: {
+						round: 1,
+						component: "intake",
+						dimension: "goal",
+						ambiguity: 0.5,
+						references: [{ reference_id: "r1", label: "label", origin: "user", [field]: "😀".repeat(257) }],
+					},
+				}),
+			).toThrow(/references/);
+		for (const field of ["url", "excerpt"] as const)
+			expect(() =>
+				questionToGate({
+					...base,
+					deepInterview: {
+						round: 1,
+						component: "intake",
+						dimension: "goal",
+						ambiguity: 0.5,
+						references: [{ reference_id: "r1", label: "label", origin: "user", [field]: "😀".repeat(2049) }],
+					},
+				}),
+			).toThrow(/references/);
 	});
 });

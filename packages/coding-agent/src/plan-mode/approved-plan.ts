@@ -114,6 +114,7 @@ interface RenameApprovedPlanFileOptions {
 	planFilePath: string;
 	finalPlanFilePath: string;
 	getArtifactsDir: () => string | null;
+	isManagedDestination?: () => boolean;
 	getSessionId: () => string | null;
 }
 
@@ -124,12 +125,13 @@ function assertLocalUrl(path: string, label: "source" | "destination"): void {
 }
 
 export async function renameApprovedPlanFile(options: RenameApprovedPlanFileOptions): Promise<void> {
-	const { planFilePath, finalPlanFilePath, getArtifactsDir, getSessionId } = options;
+	const { planFilePath, finalPlanFilePath, getArtifactsDir, getSessionId, isManagedDestination } = options;
 	assertLocalUrl(planFilePath, "source");
 	assertLocalUrl(finalPlanFilePath, "destination");
 
 	const resolveOptions = {
 		getArtifactsDir: () => getArtifactsDir(),
+		isManagedDestination,
 		getSessionId: () => getSessionId(),
 	};
 	const resolvedSource = resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), resolveOptions);

@@ -789,6 +789,77 @@ describe("kimi model detection via detectCompat", () => {
 	});
 });
 
+describe("DeepSeek strict mode via OpenRouter", () => {
+	function deepseekModel(overrides: Partial<Model<"openai-completions">> = {}): Model<"openai-completions"> {
+		return {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			id: "deepseek/deepseek-v4-pro",
+			reasoning: true,
+			...overrides,
+		} as Model<"openai-completions">;
+	}
+
+	it("disables strict mode for DeepSeek V4 via OpenRouter", () => {
+		const model = deepseekModel({
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(false);
+	});
+
+	it("disables strict mode for DeepSeek V4 flash via OpenRouter", () => {
+		const model = deepseekModel({
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			id: "deepseek/deepseek-v4-flash",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(false);
+	});
+
+	it("keeps strict mode enabled for non-DeepSeek models via OpenRouter", () => {
+		const model = deepseekModel({
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			id: "anthropic/claude-sonnet-4-20250514",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(true);
+	});
+
+	it("keeps strict mode enabled for GPT via OpenRouter", () => {
+		const model = deepseekModel({
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			id: "openai/gpt-5",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(true);
+	});
+
+	it("keeps strict mode enabled for DeepSeek direct API", () => {
+		const model = deepseekModel({
+			provider: "deepseek",
+			baseUrl: "https://api.deepseek.com/v1",
+			id: "deepseek-chat",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(true);
+	});
+
+	it("keeps strict mode disabled for DeepSeek via NVIDIA NIM (nvidia does not support strict)", () => {
+		const model = deepseekModel({
+			provider: "nvidia",
+			baseUrl: "https://integrate.api.nvidia.com/v1",
+			id: "deepseek-ai/deepseek-v4-flash",
+		});
+		const compat = detectCompat(model);
+		expect(compat.supportsStrictMode).toBe(false);
+	});
+});
+
 describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 	function nvidiaDeepseekModel(): Model<"openai-completions"> {
 		return {

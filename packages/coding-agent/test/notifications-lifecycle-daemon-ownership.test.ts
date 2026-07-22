@@ -166,7 +166,7 @@ describe("daemon lifecycle-control ownership (G008)", () => {
 		}
 	});
 });
-test("persists generation 5 for an acquired owner so a current daemon attaches without restart", async () => {
+test("persists the current generation for an acquired owner so a current daemon attaches without restart", async () => {
 	const agentDir = tempAgentDir();
 	const s = settings(agentDir);
 	const acquired = await acquireDaemonOwnership({
@@ -174,9 +174,8 @@ test("persists generation 5 for an acquired owner so a current daemon attaches w
 		tokenFingerprint: tokenFingerprint("tok"),
 		chatId: "42",
 		pid: process.pid,
-		randomId: () => "generation-five-owner",
+		randomId: () => "current-generation-owner",
 	});
 	expect(acquired.acquired).toBe(true);
-	expect(DAEMON_GENERATION).toBe(5);
-	expect((await readDaemonState(s))?.generation).toBe(5);
+	expect((await readDaemonState(s))?.generation).toBe(DAEMON_GENERATION);
 });

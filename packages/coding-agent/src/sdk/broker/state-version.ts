@@ -13,8 +13,11 @@ export class UnsupportedStateVersionError extends Error {
 	constructor(
 		readonly file: string,
 		readonly version: number,
+		readonly maximumSupportedVersion = SDK_STATE_VERSION,
 	) {
-		super(`Unsupported SDK state version ${version} in ${file}; maximum supported version is ${SDK_STATE_VERSION}.`);
+		super(
+			`Unsupported SDK state version ${version} in ${file}; maximum supported version is ${maximumSupportedVersion}.`,
+		);
 		this.name = "UnsupportedStateVersionError";
 	}
 }
@@ -38,7 +41,7 @@ export function assertSupportedSnapshotVersion(file: string, value: unknown): vo
 	const record = value as { version?: unknown; stateVersion?: unknown };
 	for (const version of [record.version, record.stateVersion]) {
 		if (typeof version === "number" && Number.isFinite(version) && version > SESSION_INDEX_SNAPSHOT_VERSION) {
-			throw new UnsupportedStateVersionError(file, version);
+			throw new UnsupportedStateVersionError(file, version, SESSION_INDEX_SNAPSHOT_VERSION);
 		}
 	}
 }

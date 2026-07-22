@@ -127,6 +127,7 @@ describe("dead tab recovery descriptors (#2437)", () => {
 			send: () => {},
 			onMessage: () => () => {},
 			onError: () => () => {},
+			onClose: () => () => {},
 			terminate,
 		};
 		const browser = {

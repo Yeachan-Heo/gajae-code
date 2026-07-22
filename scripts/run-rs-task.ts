@@ -61,10 +61,35 @@ if (taskName !== "fmt:rs" && !(isCI() || (await hasRustAffectingChanges()))) {
 }
 
 for (const command of TASK_COMMANDS[taskName]) {
-	const exitCode = await runCommand(command);
+	const exitCode = await runCommand(withPartition(taskName, withCiProfile(taskName, command)));
 	if (exitCode !== 0) {
 		process.exit(exitCode);
 	}
+}
+
+// Main CI splits rust-test into nextest partitions. An optional `count:i/N`
+// third argument shards the test set for `test:rs` by appending
+// `--partition count:i/N` to the nextest invocation. Other tasks ignore it.
+function withPartition(task: RustTaskName, command: readonly string[]): readonly string[] {
+	const partition = process.argv[3]?.trim();
+	if (task !== "test:rs" || !partition) {
+		return command;
+	}
+	if (!/^count:\d+\/\d+$/.test(partition)) {
+		console.error(`Invalid rust-test partition '${partition}'; expected count:<i>/<N>.`);
+		process.exit(1);
+	}
+	if (command[1] !== "nextest") {
+		return command;
+	}
+	return [...command, "--partition", partition];
+}
+
+function withCiProfile(task: RustTaskName, command: readonly string[]): readonly string[] {
+	if (task !== "test:rs" || !isCI() || command[1] !== "nextest") {
+		return command;
+	}
+	return [...command.filter(arg => arg !== "--status-level=fail" && arg !== "--final-status-level=fail"), "--profile", "ci"];
 }
 
 function isRustTaskName(value: string | undefined): value is RustTaskName {

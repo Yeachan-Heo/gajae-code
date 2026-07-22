@@ -71,10 +71,12 @@ describe("headless bare resume", () => {
 	}, 10_000);
 
 	it("preserves version and help fast paths when resume is also present", async () => {
-		const version = await runHeadlessBareResume(["--resume", "--version"]);
-		expect(version.exitCode).toBe(0);
-		expect(version.stdout).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
-		expect(version.stderr).toBe("");
+		for (const versionFlag of ["--version", "-v"]) {
+			const version = await runHeadlessBareResume(["--resume", versionFlag]);
+			expect(version.exitCode).toBe(0);
+			expect(version.stdout).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
+			expect(version.stderr).toBe("");
+		}
 
 		const help = await runHeadlessBareResume(["--resume", "--help"]);
 		expect(help.exitCode).toBe(0);

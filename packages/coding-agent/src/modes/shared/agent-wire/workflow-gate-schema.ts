@@ -12,6 +12,7 @@
  * swapped in later without changing callers.
  */
 import { createHash } from "node:crypto";
+import { deepInterviewCharacterCount } from "../../../gjc-runtime/deep-interview-state";
 import type { JsonSchema, WorkflowGateValidationError } from "./workflow-gate-types";
 
 /** Keywords this wrapper understands. Any other keyword is rejected. */
@@ -238,7 +239,8 @@ function validateValue(schema: JsonSchema, value: unknown, path: string, errors:
 		if (!ok) errors.push({ path, keyword: "enum", message: "value not in enum", expected: schema.enum });
 	}
 	if (typeof value === "string") {
-		if (schema.minLength !== undefined && value.length < schema.minLength) {
+		const characterCount = deepInterviewCharacterCount(value);
+		if (schema.minLength !== undefined && characterCount < schema.minLength) {
 			errors.push({
 				path,
 				keyword: "minLength",
@@ -246,7 +248,7 @@ function validateValue(schema: JsonSchema, value: unknown, path: string, errors:
 				expected: schema.minLength,
 			});
 		}
-		if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+		if (schema.maxLength !== undefined && characterCount > schema.maxLength) {
 			errors.push({
 				path,
 				keyword: "maxLength",

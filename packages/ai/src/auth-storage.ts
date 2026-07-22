@@ -1587,9 +1587,9 @@ export class AuthStorage {
 				});
 				break;
 			}
-			case "alibaba-coding-plan": {
-				const { loginAlibabaCodingPlan } = await import("./utils/oauth/alibaba-coding-plan");
-				const apiKey = await loginAlibabaCodingPlan(ctrl);
+			case "alibaba-token-plan": {
+				const { loginAlibabaTokenPlan } = await import("./utils/oauth/alibaba-token-plan");
+				const apiKey = await loginAlibabaTokenPlan(ctrl);
 				await saveApiKeyCredential(apiKey);
 				return;
 			}

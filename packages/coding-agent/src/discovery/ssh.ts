@@ -5,11 +5,12 @@
  * Priority: 5 (low, project/user config discovery)
  */
 import * as path from "node:path";
-import { getSSHConfigPath, tryParseJson } from "@gajae-code/utils";
+import { getSSHConfigPath, logger, tryParseJson } from "@gajae-code/utils";
 import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
 import { type SSHHost, sshCapability } from "../capability/ssh";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
+import { validateSshDestination } from "../ssh/utils";
 import { expandTilde } from "../tools/path-utils";
 import { createSourceMeta, expandEnvVarsDeep } from "./helpers";
 
@@ -56,6 +57,16 @@ function normalizeHost(
 ): SSHHost | null {
 	if (!raw.host) {
 		warnings.push(`Missing host for SSH entry: ${name}`);
+		return null;
+	}
+	const destinationError = validateSshDestination(raw.username, raw.host);
+	if (destinationError) {
+		warnings.push(`Invalid destination for SSH entry ${name}: ${destinationError}`);
+		logger.warn("Ignoring SSH entry with invalid destination", {
+			name,
+			path: source.path,
+			reason: destinationError,
+		});
 		return null;
 	}
 

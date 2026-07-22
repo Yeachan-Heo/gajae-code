@@ -7,6 +7,7 @@ import { createInterface } from "node:readline/promises";
 import { APP_NAME } from "@gajae-code/utils/dirs";
 import chalk from "chalk";
 import { Settings, type SettingsAtomicPatch } from "../config/settings";
+import { isProcessIncarnation, processIncarnation } from "../sdk/broker/process-incarnation";
 import { type EnsureChatDaemonResult, ensureDiscordDaemon, ensureSlackDaemon } from "../sdk/bus/chat-daemon-control";
 import { getNotificationConfig, maskToken, tokenFingerprint } from "../sdk/bus/config";
 import {
@@ -29,7 +30,11 @@ import {
 	sanitizeDiagnostic,
 	sendNotificationTest,
 } from "../sdk/bus/notification-service";
-import { ensureTelegramDaemonRunningDetailed, readDaemonState } from "../sdk/bus/telegram-daemon";
+import {
+	type EnsureTelegramDaemonDetailedResult,
+	ensureTelegramDaemonRunningDetailed,
+	readDaemonState,
+} from "../sdk/bus/telegram-daemon";
 import { runDaemonInternal } from "../sdk/bus/telegram-daemon-cli";
 import {
 	runTelegramSetup as runTelegramPairingSetup,
@@ -82,10 +87,10 @@ export interface NotifyCommandDeps {
 	setupTimers?: TelegramSetupTimers;
 	setupAbortSignal?: AbortSignal;
 	setupPidAlive?: (pid: number) => boolean;
-	ensureProviderDaemon?: (
-		provider: "discord" | "slack",
-		settings: Settings,
-	) => Promise<EnsureChatDaemonResult | "failed">;
+	/** Injectable process-start provenance reader for ambient Telegram setup preflight. */
+	setupPidIncarnation?: (pid: number) => string | undefined;
+	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<EnsureChatDaemonResult>;
+	ensureTelegramDaemon?: (settings: Settings) => Promise<EnsureTelegramDaemonDetailedResult>;
 }
 
 export function parseNotifyArgs(args: string[]): NotifyCommandArgs | undefined {
@@ -313,12 +318,22 @@ async function ensureConfiguredProviderDaemon(
 	provider: "discord" | "slack",
 	settings: Settings,
 	deps: NotifyCommandDeps,
-): Promise<EnsureChatDaemonResult | "failed"> {
+): Promise<EnsureChatDaemonResult> {
 	try {
 		if (deps.ensureProviderDaemon) return await deps.ensureProviderDaemon(provider, settings);
 		return provider === "discord" ? await ensureDiscordDaemon(settings) : await ensureSlackDaemon(settings);
-	} catch {
-		return "failed";
+	} catch (error) {
+		const cfg = getNotificationConfig(settings);
+		const detail = sanitizeDiagnostic(
+			sanitizeDiagnostic(
+				error instanceof Error ? error.message : String(error),
+				provider === "discord" ? cfg.discord.botToken : cfg.slack.appToken,
+			),
+			provider === "discord" ? cfg.discord.botToken : cfg.slack.botToken,
+		);
+		throw new Error(`${provider === "discord" ? "Discord" : "Slack"} daemon did not become ready: ${detail}`, {
+			cause: error,
+		});
 	}
 }
 
@@ -393,11 +408,13 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 					reconcileCurrentSession: async () => undefined,
 				},
 				reconnect: async () =>
-					await ensureTelegramDaemonRunningDetailed({
-						settings,
-						cwd: process.cwd(),
-						sessionId: `notify-cli-${process.pid}`,
-					}),
+					deps.ensureTelegramDaemon
+						? await deps.ensureTelegramDaemon(settings)
+						: await ensureTelegramDaemonRunningDetailed({
+								settings,
+								cwd: process.cwd(),
+								sessionId: `notify-cli-${process.pid}`,
+							}),
 				persistInactive: async marker => await persistTelegramActivationMarker(settings, marker),
 				clearInactive: async marker => await clearTelegramActivationMarker(settings, marker),
 				marker: activationMarker,
@@ -446,14 +463,19 @@ async function resolveSetupPreflight(settings: Settings, deps: NotifyCommandDeps
 		const state = await readDaemonState(settings);
 		if (!state) return { storedChatId: cfg.chatId };
 		const validPid = Number.isSafeInteger(state.pid) && state.pid > 0;
-		// Owner-proof: only block discovery for a daemon we can positively prove is
-		// live (present state with a valid, alive pid). A malformed/no-pid record is
-		// not evidence of a live poller, mirroring recoverNotifications' semantics.
-		if (!validPid) return { storedChatId: cfg.chatId };
+		if (!validPid || !(deps.setupPidAlive ?? daemonPidAlive)(state.pid)) return { storedChatId: cfg.chatId };
+		const persistedIncarnation = state.incarnation;
+		const currentIncarnation = (deps.setupPidIncarnation ?? processIncarnation)(state.pid);
+		if (
+			!isProcessIncarnation(persistedIncarnation) ||
+			!isProcessIncarnation(currentIncarnation) ||
+			persistedIncarnation !== currentIncarnation
+		)
+			return { storedChatId: cfg.chatId };
 		return {
 			storedChatId: cfg.chatId,
 			daemon: {
-				live: (deps.setupPidAlive ?? daemonPidAlive)(state.pid),
+				live: true,
 				tokenFingerprint: typeof state.tokenFingerprint === "string" ? state.tokenFingerprint : undefined,
 				chatId: typeof state.chatId === "string" ? state.chatId : undefined,
 			},

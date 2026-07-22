@@ -3,6 +3,12 @@
 ## [Unreleased]
 
 ### Fixed
+
+- Managed model fallback now accepts `reasoning_summary_start`, `reasoning_summary_delta`, and `reasoning_summary_end` assistant events instead of failing them as local snapshot errors.
+
+## [0.11.3] - 2026-07-19
+
+### Fixed
 - Pre-compaction pruning now preserves bounded, actionable error evidence instead of discarding it, while enforcing exact positive-savings admission and accounting so a prune is only applied when it demonstrably reduces context cost (#2635).
 
 ## [0.11.1] - 2026-07-16

@@ -1,4 +1,3 @@
-import { Buffer } from "node:buffer";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -6,6 +5,18 @@ import { VERSION } from "@gajae-code/utils/dirs";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
+import {
+	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
+	MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV,
+	MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
+	MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
+	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
+} from "./managed-owner-admission";
+import {
+	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_RUN_ID_ENV,
+	MANAGED_OWNER_SUPERVISOR_ARG,
+} from "./managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
@@ -42,6 +53,7 @@ import {
 	type OwnerIsolationProbeSync,
 	planTmuxOwnerIsolationSync,
 	replaceOwnerGenerationSync,
+	resolveManagedOwnerPredecessorSync,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
 import {
@@ -152,6 +164,9 @@ export interface TmuxLaunchPlan {
 	sessionStateFile?: string | null;
 	/** Immutable Linux-managed owner provenance, assigned immediately before creation. */
 	ownerGeneration?: string;
+	/** Immutable run and endpoint identities bound into the supervised command. */
+	ownerRunId?: string;
+	ownerIncarnation?: string;
 	/** Generation state captured before owner-isolation planning; required for publication CAS. */
 	ownerGenerationBaseline?: import("./tmux-owner-isolation").OwnerGenerationBaseline;
 	/** Native tmux session identity emitted atomically by `new-session -P -F`. */
@@ -334,6 +349,7 @@ interface CommandResolutionContext {
 	extraEnv?: Record<string, string>;
 	tmuxExitMarkerPath?: string;
 	platform?: NodeJS.Platform;
+	managedOwnerSupervisor?: boolean;
 }
 
 function parseLaunchPolicy(env: NodeJS.ProcessEnv): LaunchPolicy {
@@ -553,8 +569,15 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 			tmuxExitMarkerPath: context.tmuxExitMarkerPath,
 		});
 	const command = resolveCurrentGjcCommand(context);
-	const quoted = [...command, ...stripRootTmuxFlag(rawArgs)].map(shellQuote).join(" ");
-	const invocation = `env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments(context.extraEnv)} ${quoted}`;
+	const childArgs = stripRootTmuxFlag(rawArgs);
+	const supervisorEnv: Record<string, string> = context.managedOwnerSupervisor
+		? { GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]) }
+		: {};
+	const invocationArgs = context.managedOwnerSupervisor
+		? [...command, MANAGED_OWNER_SUPERVISOR_ARG]
+		: [...command, ...childArgs];
+	const quoted = invocationArgs.map(shellQuote).join(" ");
+	const invocation = `env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments({ ...context.extraEnv, ...supervisorEnv })} ${quoted}`;
 	if (!context.tmuxExitMarkerPath) return `exec ${invocation}`;
 	return `${buildPosixTmuxExitMarkerPrefix(context.tmuxExitMarkerPath)}; ${invocation}; exit $?`;
 }
@@ -1026,15 +1049,29 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	};
 }
 
+function trustedReplacementAuthority(
+	stateDir: string,
+	sessionId: string,
+	baseline: ReturnType<typeof captureOwnerGenerationBaselineSync>,
+): ReturnType<typeof resolveManagedOwnerPredecessorSync> {
+	return resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline);
+}
+
 function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
 	if (plan.ownerGeneration) return;
 	const sessionId = plan.sessionId ?? plan.sessionName;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
+	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+	const replacement = trustedReplacementAuthority(stateDir, sessionId, baseline);
 	const generation = crypto.randomUUID();
-	// Stage the generation in the child command. It becomes current only after
+	const runId = crypto.randomUUID();
+	const incarnation = crypto.randomUUID();
+	plan.ownerGenerationBaseline = baseline;
+	// Stage immutable identity in the child command. It becomes current only after
 	// immutable creation proof and ownership tagging complete.
-
 	plan.ownerGeneration = generation;
+	plan.ownerRunId = runId;
+	plan.ownerIncarnation = incarnation;
 	const innerCommand = buildInnerCommand(
 		{
 			cwd: plan.cwd,
@@ -1047,11 +1084,24 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
 				[GJC_TMUX_OWNER_SERVER_KEY_ENV]: plan.tmuxCommand,
+				[MANAGED_OWNER_RUN_ID_ENV]: runId,
+				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
+				...(replacement
+					? {
+							[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: replacement.predecessorToken,
+							[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: replacement.generation,
+							[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: replacement.runId,
+							[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: replacement.incarnation,
+							[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]:
+								context.env?.GJC_SESSION_FILE ?? process.env.GJC_SESSION_FILE ?? "",
+						}
+					: {}),
 			},
 			// Linux managed owner close signals the pane PID. Do not place the exit-marker shell
 			// in front of it; `buildInnerCommand` therefore execs the GJC owner directly.
 			tmuxExitMarkerPath: plan.platform === "linux" ? undefined : tmuxExitMarkerPath(plan.sessionStateFile ?? ""),
 			platform: plan.platform,
+			managedOwnerSupervisor: plan.platform === "linux",
 		},
 		context.rawArgs,
 	);
@@ -1182,7 +1232,7 @@ function createIsolatedTmuxSession(
 ): TmuxSpawnResult {
 	const sessionId = plan.sessionId ?? plan.sessionName;
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
-	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+	const baseline = plan.ownerGenerationBaseline ?? captureOwnerGenerationBaselineSync(stateDir, sessionId);
 	plan.ownerGenerationBaseline = baseline;
 	const ownerPlan = planTmuxOwnerIsolationSync(
 		{
@@ -1572,6 +1622,11 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		return true;
 	}
 	try {
+		resolveManagedOwnerPredecessorSync(
+			path.dirname(plan.sessionStateFile!),
+			plan.sessionId!,
+			plan.ownerGenerationBaseline!,
+		);
 		replaceOwnerGenerationSync(
 			path.dirname(plan.sessionStateFile!),
 			plan.sessionId!,

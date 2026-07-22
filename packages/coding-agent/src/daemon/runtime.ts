@@ -32,12 +32,12 @@ const COMPILED_RELOAD_WARNING =
 export function resolveGjcRuntimeSpawnInfo(execPath: string = process.execPath): GjcRuntimeSpawnInfo {
 	const base = path.basename(execPath).toLowerCase();
 	const fromSource = base === "bun" || base === "node" || base.startsWith("bun") || base.startsWith("node");
-	const mainScript = fromSource && typeof Bun !== "undefined" ? (Bun as unknown as { main?: string }).main : undefined;
+	const sourceEntry = fromSource ? path.resolve(import.meta.dir, "../../bin/gjc.js") : undefined;
 	if (fromSource) {
 		return {
 			execPath,
 			mode: "source",
-			argsPrefix: mainScript ? [mainScript] : [],
+			argsPrefix: sourceEntry ? [sourceEntry] : [],
 			reloadPicksUpSourceEdits: true,
 		};
 	}

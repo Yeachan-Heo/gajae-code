@@ -16,6 +16,7 @@ import {
 	filterAutoImportOAuthCredentials,
 	formatCredentialSummary,
 	formatDiscoverySummary,
+	getAutoImportOAuthCredentialSkips,
 	importCredentials,
 	isAutoImportOAuthCredential,
 } from "../src/setup/credential-import";
@@ -419,47 +420,34 @@ describe("auto-import OAuth filter and orchestrator", () => {
 			origin: "claude-code-file" as const,
 			source: "Claude Code (test)",
 			kind: "oauth" as const,
+			expiresAt: Date.now() + 60_000,
 			redactedToken: "sk-a…oken",
-			credential: { type: "oauth" as const, access: "a", refresh: "r", expires: Date.now() },
+			credential: { type: "oauth" as const, access: "a", refresh: "r", expires: Date.now() + 60_000 },
 			...overrides,
 		};
 	}
 
-	test("OAuth-only accept/reject matrix", () => {
-		const accepted = [
-			oauthCredential(),
-			oauthCredential({ origin: "claude-code-keychain", source: "Claude Code (macOS Keychain)" }),
-			oauthCredential({ provider: "openai-codex", origin: "codex-file", source: "Codex CLI (~/.codex/auth.json)" }),
-		];
+	test("auto-import requires a finite OAuth expiry strictly after the captured clock", () => {
+		const now = 1_000;
+		const futureClaude = oauthCredential();
+		const futureCodex = oauthCredential({ provider: "openai-codex", origin: "codex-file" });
 		const rejected = [
-			oauthCredential({
-				provider: "openai-codex",
-				origin: "codex-file",
-				kind: "api_key",
-				credential: { type: "api_key", key: "k" },
-			}),
-			oauthCredential({
-				provider: "anthropic",
-				origin: "claude-code-file",
-				kind: "oauth",
-				credential: { type: "api_key", key: "k" },
-			}),
-			oauthCredential({
-				provider: "anthropic",
-				origin: "claude-code-keychain",
-				kind: "api_key",
-				credential: { type: "api_key", key: "k" },
-			}),
-			oauthCredential({
-				provider: "openai-codex",
-				origin: "codex-file",
-				kind: "oauth",
-				credential: { type: "api_key", key: "k" },
-			}),
+			oauthCredential({ expiresAt: undefined }),
+			oauthCredential({ expiresAt: Number.NaN }),
+			oauthCredential({ expiresAt: 0 }),
+			oauthCredential({ expiresAt: now }),
+			oauthCredential({ expiresAt: now - 1 }),
+			oauthCredential({ provider: "openai-codex", origin: "codex-file", expiresAt: undefined }),
 		];
-		for (const credential of accepted) expect(isAutoImportOAuthCredential(credential)).toBe(true);
-		for (const credential of rejected) expect(isAutoImportOAuthCredential(credential)).toBe(false);
-		expect(filterAutoImportOAuthCredentials([...accepted, ...rejected])).toEqual(accepted);
+
+		for (const credential of [futureClaude, futureCodex])
+			expect(isAutoImportOAuthCredential(credential, now)).toBe(true);
+		for (const credential of rejected) expect(isAutoImportOAuthCredential(credential, now)).toBe(false);
+		expect(getAutoImportOAuthCredentialSkips([...rejected, futureClaude], now)).toHaveLength(rejected.length);
+		expect(filterAutoImportOAuthCredentials([...rejected, futureClaude, futureCodex])).toEqual([
+			futureClaude,
+			futureCodex,
+		]);
 	});
 
 	test("provider-origin pairings reject impossible source/provider combinations", () => {
@@ -470,12 +458,12 @@ describe("auto-import OAuth filter and orchestrator", () => {
 		const invalidCodexClaudeFile = oauthCredential({ provider: "openai-codex", origin: "claude-code-file" });
 		const invalidCodexClaudeKeychain = oauthCredential({ provider: "openai-codex", origin: "claude-code-keychain" });
 
-		expect(isAutoImportOAuthCredential(validAnthropicFile)).toBe(true);
-		expect(isAutoImportOAuthCredential(validAnthropicKeychain)).toBe(true);
-		expect(isAutoImportOAuthCredential(validCodexFile)).toBe(true);
-		expect(isAutoImportOAuthCredential(invalidAnthropicCodexFile)).toBe(false);
-		expect(isAutoImportOAuthCredential(invalidCodexClaudeFile)).toBe(false);
-		expect(isAutoImportOAuthCredential(invalidCodexClaudeKeychain)).toBe(false);
+		expect(isAutoImportOAuthCredential(validAnthropicFile, 1_000)).toBe(true);
+		expect(isAutoImportOAuthCredential(validAnthropicKeychain, 1_000)).toBe(true);
+		expect(isAutoImportOAuthCredential(validCodexFile, 1_000)).toBe(true);
+		expect(isAutoImportOAuthCredential(invalidAnthropicCodexFile, 1_000)).toBe(false);
+		expect(isAutoImportOAuthCredential(invalidCodexClaudeFile, 1_000)).toBe(false);
+		expect(isAutoImportOAuthCredential(invalidCodexClaudeKeychain, 1_000)).toBe(false);
 		expect(
 			filterAutoImportOAuthCredentials([
 				validAnthropicFile,
@@ -504,6 +492,26 @@ describe("auto-import OAuth filter and orchestrator", () => {
 		expect(calls).toEqual(["anthropic"]);
 		expect(result.imported).toEqual([credential]);
 		expect(result.discovered).toBe(true);
+	});
+	test("orchestrator leaves expired discoveries available for UI inspection without importing them", async () => {
+		const expired = oauthCredential({
+			expiresAt: 0,
+			credential: { type: "oauth", access: "a", refresh: "r", expires: 0 },
+		});
+		const calls: string[] = [];
+		const result = await runExternalCredentialAutoImport({
+			authStorage: {
+				importCredentialIfAbsent: async (provider: string) => {
+					calls.push(provider);
+					return { inserted: true, reason: "inserted", provider, entries: [] };
+				},
+			},
+			discover: async () => ({ importable: [expired], skipped: [], environment: [] }),
+			trigger: "startup",
+		});
+		expect(calls).toEqual([]);
+		expect(result.imported).toEqual([]);
+		expect(result.discovery?.importable).toEqual([expired]);
 	});
 
 	test("notice is emitted only when imported and includes exact rotation warning", () => {

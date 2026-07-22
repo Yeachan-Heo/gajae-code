@@ -6,6 +6,7 @@
  * and get back a unified array of MCP servers.
  */
 
+import type { Settings } from "../config/settings";
 /**
  * Context passed to every provider loader.
  */
@@ -72,6 +73,8 @@ export interface LoadOptions {
 	includeDisabled?: boolean;
 	/** Explicit disabled extension IDs to apply instead of settings. */
 	disabledExtensions?: string[];
+	/** Session settings whose provider policy applies to this load. */
+	settings?: Settings;
 }
 
 /**

@@ -5,7 +5,6 @@
  */
 
 import { createHash } from "node:crypto";
-import * as fs from "node:fs/promises";
 import path from "node:path";
 import type {
 	AgentEvent,
@@ -50,6 +49,7 @@ import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import { validateAllocatedTaskId } from "./id";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
@@ -227,6 +227,7 @@ export interface ExecutorOptions {
 	 * artifacts directory (no per-subagent subdir).
 	 */
 	parentArtifactManager?: ArtifactManager;
+	managedPersistence?: ManagedTaskPersistence;
 	parentHindsightSessionState?: HindsightSessionState;
 	/**
 	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
@@ -240,6 +241,45 @@ export interface ExecutorOptions {
 	/** Skills to autoload via sendCustomMessage before the first prompt */
 	autoloadSkills?: Skill[];
 	forkContextSeed?: ForkContextSeed;
+}
+
+export class ManagedTaskPersistence {
+	readonly #artifacts: ArtifactManager;
+	readonly #taskId: string;
+
+	constructor(artifacts: ArtifactManager, taskId: string) {
+		this.#artifacts = artifacts;
+		this.#taskId = validateAllocatedTaskId(taskId);
+		if (!artifacts.getManagedSubtreeRootAuthority())
+			throw new Error("Managed task persistence authority is unavailable");
+	}
+
+	async openSession(): Promise<SessionManager> {
+		const store = this.#artifacts.getManagedStore();
+		if (!store) throw new Error("Managed task persistence authority is unavailable");
+		this.#artifacts.assertManagedBinding();
+		const sessionFile = path.join(this.#artifacts.dir, `${this.#taskId}.jsonl`);
+		const session = await SessionManager.openNestedManaged(
+			sessionFile,
+			SessionManager.nestedManagedDestination(store, this.#artifacts.dir),
+			store,
+		);
+		this.#artifacts.assertManagedBinding();
+		return session;
+	}
+
+	async publishOutput(rawOutput: string, metadata: Uint8Array): Promise<void> {
+		await this.#artifacts.publishManagedOutputGeneration(
+			`${this.#taskId}.md.selector.json`,
+			`${this.#taskId}.md`,
+			Buffer.from(rawOutput, "utf8"),
+			metadata,
+		);
+	}
+}
+
+export function createManagedTaskPersistence(artifacts: ArtifactManager, taskId: string): ManagedTaskPersistence {
+	return new ManagedTaskPersistence(artifacts, taskId);
 }
 
 export function renderSubagentUserPrompt(assignment: string, independentMode: boolean): string {
@@ -888,7 +928,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				task,
 				assignment,
 				progress: { ...progress },
-				sessionFile: subtaskSessionFile,
+				sessionFile: null,
 			});
 		}
 		lastProgressEmitMs = Date.now();
@@ -1354,9 +1394,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
-			const sessionManager = sessionFile
-				? await awaitAbortable(SessionManager.open(sessionFile))
-				: SessionManager.inMemory(worktree ?? cwd);
+			const sessionManager = options.managedPersistence
+				? await awaitAbortable(options.managedPersistence.openSession())
+				: sessionFile
+					? await awaitAbortable(
+							SessionManager.open(sessionFile, SessionManager.explicitDestination(path.dirname(sessionFile))),
+						)
+					: SessionManager.inMemory(worktree ?? cwd);
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
 			}
@@ -1556,7 +1600,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					agentSource: agent.source,
 					description: options.description,
 					status: "started",
-					sessionFile: subtaskSessionFile,
+					sessionFile: null,
 					index,
 				});
 			}
@@ -1915,37 +1959,38 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// Write output artifact (input and jsonl already written in real-time)
 	// Compute output metadata for agent:// URL integration
 	let outputMeta: { lineCount: number; charCount: number; byteSize?: number; sha256?: string } | undefined;
-	let outputPath: string | undefined;
-	if (options.artifactsDir) {
-		const candidateOutputPath = path.join(options.artifactsDir, `${id}.md`);
+	// Never overwrite the artifact with empty output: a failed/no-op resume leg
+	// carries no new information and must preserve the previous retained output.
+	if (options.artifactsDir && rawOutput.length > 0) {
+		const managedPersistence = options.managedPersistence;
 		try {
-			await Bun.write(candidateOutputPath, rawOutput);
 			const byteSize = Buffer.byteLength(rawOutput, "utf8");
 			const lineCount = rawOutput.split("\n").length;
 			const sha256 = createHash("sha256").update(rawOutput).digest("hex");
 			const createdAt = new Date().toISOString();
-			await Bun.write(
-				`${candidateOutputPath}.meta.json`,
+			if (!managedPersistence) await Bun.write(path.join(options.artifactsDir, `${id}.md`), rawOutput);
+			const metadataBytes = Buffer.from(
 				JSON.stringify({ id, kind: "agent-output", sizeBytes: byteSize, lineCount, sha256, createdAt }, null, 2),
+				"utf8",
 			);
-			outputPath = candidateOutputPath;
+			if (managedPersistence) await managedPersistence.publishOutput(rawOutput, metadataBytes);
+			else await Bun.write(path.join(options.artifactsDir, `${id}.md.meta.json`), metadataBytes);
 			outputMeta = {
 				lineCount,
 				charCount: rawOutput.length,
 				byteSize,
 				sha256,
 			};
-		} catch {
-			// Output or metadata write failed: never advertise an unverifiable
-			// artifact. Best-effort remove any orphaned `.md`/sidecar so a later
-			// agent:// read cannot serve unverified content. Non-fatal.
-			outputPath = undefined;
-			outputMeta = undefined;
-			try {
-				await fs.rm(candidateOutputPath, { force: true });
-				await fs.rm(`${candidateOutputPath}.meta.json`, { force: true });
-			} catch {
-				// best-effort cleanup; ignore
+		} catch (error) {
+			if (!managedPersistence) {
+				// A missing sidecar keeps a partial immutable output invisible to agent://.
+				outputMeta = undefined;
+			} else {
+				const message = error instanceof Error ? error.message : String(error);
+				stderr = `${stderr}${stderr ? "\n" : ""}Managed output publication failed: ${message}`;
+				exitCode = 1;
+				paused = false;
+				progress.retryFailure = { attempt: 0, errorMessage: `Managed output publication failed: ${message}` };
 			}
 		}
 	}
@@ -1978,7 +2023,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			agentSource: agent.source,
 			description: options.description,
 			status: progress.status as "completed" | "failed" | "aborted" | "paused",
-			sessionFile: subtaskSessionFile,
+			sessionFile: null,
 			index,
 		});
 	}
@@ -2008,7 +2053,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		paused,
 		usage: hasUsage ? accumulatedUsage : undefined,
 		usageCostBreakdownComplete: hasUsage && usageCostBreakdownComplete ? true : undefined,
-		outputPath,
+		outputPath: undefined,
 		extractedToolData: progress.extractedToolData,
 		retryFailure: progress.retryFailure,
 		outputMeta,

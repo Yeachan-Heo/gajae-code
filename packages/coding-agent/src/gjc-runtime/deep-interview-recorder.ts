@@ -8,7 +8,9 @@ import {
 } from "./deep-interview-ambiguity";
 import {
 	answerHash,
+	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentManifest,
+	assertDeepInterviewStructuredResponseWithinLimit,
 	createDeepInterviewIntentManifest,
 	type DeepInterviewEstablishedFact,
 	type DeepInterviewIntentItem,
@@ -17,6 +19,7 @@ import {
 	type DeepInterviewStateEnvelope,
 	type DeepInterviewTriggerMetadata,
 	deriveRoundKey,
+	MAX_USER_RESPONSE_LENGTH,
 	normalizeDeepInterviewEnvelope,
 	questionHash,
 	reviewDeepInterviewIntent,
@@ -426,6 +429,9 @@ export async function appendOrMergeDeepInterviewRound(
 	input: DeepInterviewAnswerInput,
 	options: { sessionId?: string } = {},
 ): Promise<{ action: AppendOrMergeAction; record: DeepInterviewRoundRecord; disputedFactIds?: string[] }> {
+	assertDeepInterviewStructuredResponseWithinLimit(input);
+	if (input.customInput !== undefined)
+		assertDeepInterviewInputWithinLimit(input.customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 	const envelope = await readEnvelope(statePath);
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const shell = buildAnswerShell({
@@ -547,6 +553,7 @@ export async function enrichDeepInterviewRoundScoring(
 	input: DeepInterviewScoringInput,
 	options: { sessionId?: string } = {},
 ): Promise<{ record: DeepInterviewRoundRecord }> {
+	assertDeepInterviewStructuredResponseWithinLimit(input);
 	const envelope = await readEnvelope(statePath);
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const rounds = readRounds(envelope);

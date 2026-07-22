@@ -290,12 +290,14 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 	});
 
 	it("a late successful yield does not flip a timed-out run to success", async () => {
+		vi.useFakeTimers();
 		// A hung subagent emits a successful `yield` event during teardown (after
 		// the timer has already aborted). Without the fix, `hasYield=true` would
 		// make finalizeSubprocessOutput zero the exit code and `wasAborted`
 		// would resolve to false — silently masking the runtime-limit breach.
 		const settings = Settings.isolated({ "task.maxRuntimeMs": 30 });
 		const { promise: hang, resolve: releaseHang } = Promise.withResolvers<void>();
+		const promptStarted = Promise.withResolvers<void>();
 		let listenerRef: ((event: AgentSessionEvent) => void) | undefined;
 		let abortCount = 0;
 		const session: Partial<AgentSession> = {
@@ -313,6 +315,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 				return () => {};
 			},
 			prompt: async (_text: string, _options?: PromptOptions) => {
+				promptStarted.resolve();
 				await hang;
 			},
 			waitForIdle: async () => {
@@ -339,11 +342,14 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 		};
 		mockCreateAgentSession(session as AgentSession);
 
-		const result = await runSubprocess({
+		const pending = runSubprocess({
 			...baseOptions,
 			id: "subagent-late-yield",
 			settings,
 		});
+		await promptStarted.promise;
+		vi.advanceTimersByTime(30);
+		const result = await pending;
 
 		expect(abortCount).toBeGreaterThanOrEqual(1);
 		expect(result.aborted).toBe(true);

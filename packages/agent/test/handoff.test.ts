@@ -111,4 +111,71 @@ describe("handoff helpers", () => {
 		expect(promptBlock.text).toContain("Write a handoff document");
 		expect(promptBlock.text).toContain("Additional focus: preserve failing test name");
 	});
+
+	test("appends the prompt extension without replacing the base handoff prompt", () => {
+		const base = renderHandoffPrompt();
+		const rendered = renderHandoffPrompt(undefined, "Prefer terse bullet summaries.");
+
+		// The immutable safety/structure core is preserved verbatim.
+		expect(rendered).toContain("Write a handoff document");
+		expect(rendered).toContain("Output ONLY the handoff document.");
+		expect(rendered).toContain("Use exactly this structure:");
+		// Every required base section still renders, in order.
+		for (const section of ["## Goal", "## Progress", "## Key Decisions", "## Next Steps"]) {
+			expect(rendered).toContain(section);
+		}
+		// The extension is additive and framed as a supplement — never a replacement —
+		// and is appended AFTER the required structure, not spliced in or replacing it.
+		expect(rendered).toContain("Prefer terse bullet summaries.");
+		expect(rendered).toContain("supplements — does not replace");
+		expect(rendered.indexOf("Prefer terse bullet summaries.")).toBeGreaterThan(rendered.indexOf("## Next Steps"));
+		expect(rendered.length).toBeGreaterThan(base.length);
+	});
+
+	test("renders both custom focus and the prompt extension together", () => {
+		const rendered = renderHandoffPrompt("preserve failing test name", "Prefer terse bullet summaries.");
+
+		expect(rendered).toContain("Additional focus: preserve failing test name");
+		expect(rendered).toContain("Prefer terse bullet summaries.");
+		expect(rendered).toContain("Write a handoff document");
+		// The extension block is appended before the custom-focus block.
+		expect(rendered.indexOf("Prefer terse bullet summaries.")).toBeLessThan(
+			rendered.indexOf("Additional focus: preserve failing test name"),
+		);
+	});
+
+	test("returns the immutable base prompt when neither focus nor extension is provided", () => {
+		const base = renderHandoffPrompt();
+
+		expect(renderHandoffPrompt(undefined, undefined)).toBe(base);
+		expect(base).not.toContain("supplements — does not replace");
+		expect(base).not.toContain("Additional focus:");
+	});
+
+	test("threads the prompt extension through generateHandoff", async () => {
+		const completeSimpleSpy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValue(createAssistantMessage([{ type: "text", text: "## Goal\nContinue" }]));
+
+		await generateHandoff([{ role: "user", content: "start", timestamp: 1 }], getTestModel(), "test-key", {
+			systemPrompt: ["Live system prompt"],
+			tools: [],
+			customInstructions: "preserve failing test name",
+			promptExtension: "Prefer terse bullet summaries.",
+			initiatorOverride: "agent",
+		});
+
+		const call = completeSimpleSpy.mock.calls[0];
+		if (!call) throw new Error("Expected completeSimple call");
+		const [, context] = call;
+		const lastMessage = context.messages[context.messages.length - 1];
+		if (lastMessage?.role !== "user" || !Array.isArray(lastMessage.content)) {
+			throw new Error("Expected trailing handoff prompt user message");
+		}
+		const promptBlock = lastMessage.content[0];
+		if (promptBlock?.type !== "text") throw new Error("Expected text handoff prompt block");
+		expect(promptBlock.text).toContain("Prefer terse bullet summaries.");
+		expect(promptBlock.text).toContain("Additional focus: preserve failing test name");
+		expect(promptBlock.text).toContain("Write a handoff document");
+	});
 });

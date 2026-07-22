@@ -185,16 +185,13 @@ describe("AgentSession silent-abort marker stamping", () => {
 		// `displayEvent = { ...event, message: { ...message, content } }` spread copy
 		// in `#handleAgentEvent`. The marker must be stamped BEFORE that spread so
 		// `displayEvent.message.errorMessage` inherits via the spread.
-		const placeholder = "#AAAA#"; // shape produced by buildPlaceholder for index 0
 		const obfuscator = new SecretObfuscator([{ type: "plain", content: "SECRET_VALUE" }]);
-		// Confirm our placeholder choice matches the obfuscator's deterministic output:
-		// the test asserts a real deobfuscation diff by checking the emitted content
+		// The test asserts a real deobfuscation diff by checking the emitted content
 		// differs from the input ref, which is what we actually care about. The exact
 		// placeholder string doesn't matter as long as it's a known secret reference.
 		const obfuscatedText = obfuscator.obfuscate("hello SECRET_VALUE world");
 		// Sanity: obfuscation produced a placeholder embedded in the text.
 		expect(obfuscatedText).not.toBe("hello SECRET_VALUE world");
-		void placeholder;
 
 		fixture = await createSessionWithObfuscator(obfuscator);
 		const { session } = fixture;

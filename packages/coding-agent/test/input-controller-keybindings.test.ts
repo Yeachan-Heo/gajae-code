@@ -1,15 +1,25 @@
-import { beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-
+import { defaultEditorTheme } from "../../tui/test/test-themes";
+import { CustomEditor, type PasteTextContext } from "../src/modes/components/custom-editor";
 import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
 import { InputController } from "../src/modes/controllers/input-controller";
 import { initTheme } from "../src/modes/theme/theme";
 import type { CompactionQueuedMessage, ComposerSubmissionOptions, InteractiveModeContext } from "../src/modes/types";
 import type { QueuedMessageEditEntry } from "../src/session/agent-session";
+import type { LoadedPastedImageBatch, LoadPastedImageBatchOptions } from "../src/utils/pasted-image-loading";
+import { formatPastedImageReference } from "../src/utils/pasted-image-path";
 
+afterEach(() => {
+	vi.useRealTimers();
+});
+
+function pasteTextContext(signal = new AbortController().signal): PasteTextContext {
+	return { signal, commit: commit => commit() };
+}
 type FakeEditor = {
 	onEscape?: () => void;
 	shouldBypassAutocompleteOnEscape?: () => boolean;
@@ -24,7 +34,7 @@ type FakeEditor = {
 	onHistorySearch?: () => void;
 	onShowHotkeys?: () => void;
 	onPasteImage?: () => Promise<boolean>;
-	onPasteText?: (text: string) => boolean | Promise<boolean>;
+	onPasteText?: (text: string, context: PasteTextContext) => boolean | Promise<boolean>;
 	onCopyPrompt?: () => void;
 	onExpandTools?: () => void;
 	onToggleThinking?: () => void;
@@ -66,6 +76,7 @@ async function createContext(options?: {
 	const handleBashCommand = vi.fn(async () => {});
 	const showStatus = vi.fn();
 	const onInputCallback = vi.fn();
+	const showHookSelector = vi.fn(async () => "Attach images" as string | undefined);
 	const toggleIrcSidebar = vi.fn();
 	const startPendingSubmission = vi.fn(
 		(
@@ -154,7 +165,12 @@ async function createContext(options?: {
 	};
 	const ctx = {
 		editor: editor as unknown as InteractiveModeContext["editor"],
-		ui: { requestRender: vi.fn(), setFocus: vi.fn() } as unknown as InteractiveModeContext["ui"],
+		ui: {
+			requestRender: vi.fn(),
+			setFocus: vi.fn(),
+			followLiveViewport: vi.fn(),
+			scrollViewportPages: vi.fn(),
+		} as unknown as InteractiveModeContext["ui"],
 		editorContainer: editorContainer as unknown as InteractiveModeContext["editorContainer"],
 		loadingAnimation: undefined,
 		autoCompactionLoader: undefined,
@@ -253,6 +269,7 @@ async function createContext(options?: {
 		showWarning: vi.fn(),
 		showStatus,
 		showError: vi.fn(),
+		showHookSelector,
 
 		hasActiveBtw: vi.fn(() => false),
 	} as unknown as InteractiveModeContext;
@@ -270,6 +287,7 @@ async function createContext(options?: {
 			updatePendingMessagesDisplay,
 			handleBashCommand,
 			showStatus,
+			showHookSelector,
 			queueCompactionMessage,
 			popLastQueuedMessage,
 			clearQueue,
@@ -923,37 +941,301 @@ describe("InputController keybinding setup", () => {
 	});
 });
 
-describe("InputController pasted clipboard image paths", () => {
+describe("InputController pasted image path transactions", () => {
 	const RED_1X1_PNG_BASE64 =
 		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
-	it("attaches terminal-pasted clipboard temp images and preserves the source path in the placeholder", async () => {
+	it("attaches one clipboard-temp image without confirmation", async () => {
 		const imagePath = path.join(os.tmpdir(), `clipboard-2026-06-04-120441-${process.pid.toString(36)}CAC144E7.png`);
 		await Bun.write(imagePath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
 		try {
 			const { InputController, ctx, editor, spies } = await createContext();
 			const controller = new InputController(ctx);
-
 			controller.setupKeyHandlers();
-			const handled = await editor.onPasteText?.(`${imagePath}\n`);
+			const handled = await editor.onPasteText?.(`${imagePath}\n`, pasteTextContext());
 
 			expect(handled).toBe(true);
 			expect(editor.getText()).toBe(`[image 1] source=${JSON.stringify(imagePath)} `);
 			expect(ctx.pendingImages).toHaveLength(1);
 			expect(ctx.pendingImages[0]?.mimeType).toBe("image/png");
-			expect(spies.showStatus).toHaveBeenCalledWith(`Attached image: ${imagePath.split("/").at(-1)}`, { dim: true });
+			expect(spies.showHookSelector).not.toHaveBeenCalled();
+			expect(spies.showStatus).toHaveBeenCalledWith(`Attached image: ${path.basename(imagePath)}`, { dim: true });
 		} finally {
 			await fs.rm(imagePath, { force: true });
 		}
 	});
 
-	it("leaves ordinary pasted text for the editor", async () => {
+	it("confirms and atomically attaches saved-image batches in source order", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-pasted-images-"));
+		const first = path.join(directory, "first.png");
+		const second = path.join(directory, "second.png");
+		await Bun.write(first, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(second, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			ctx.pendingImages = [{ type: "image", data: "existing", mimeType: "image/png" }];
+			const insertText = vi.spyOn(editor, "insertText");
+			const requestRender = vi.spyOn(ctx.ui, "requestRender");
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+
+			const handled = await editor.onPasteText?.(`${first} ${second}`, pasteTextContext());
+
+			expect(handled).toBe(true);
+			expect(spies.showHookSelector).toHaveBeenCalledWith(
+				expect.stringContaining("Attach 2 pasted images?"),
+				["Attach images", "Paste paths literally"],
+				expect.objectContaining({ signal: expect.any(AbortSignal) }),
+			);
+			expect(editor.getText()).toBe(
+				`${formatPastedImageReference("[image 2]", first)} ${formatPastedImageReference("[image 3]", second)} `,
+			);
+			expect(ctx.pendingImages).toHaveLength(3);
+			expect(insertText).toHaveBeenCalledTimes(1);
+			expect(requestRender).toHaveBeenCalledTimes(1);
+			expect(spies.showStatus).toHaveBeenCalledWith("Attached 2 images", { dim: true });
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("rolls back composer state when the attachment commit throws", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-rollback-"));
+		const first = path.join(directory, "first.png");
+		const second = path.join(directory, "second.png");
+		await Bun.write(first, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(second, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor } = await createContext();
+			const existingImage: InteractiveModeContext["pendingImages"][number] = {
+				type: "image",
+				data: "existing",
+				mimeType: "image/png",
+			};
+			ctx.pendingImages = [existingImage];
+			editor.setText("draft ");
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+			const setText = editor.setText.bind(editor);
+			vi.spyOn(editor, "setText").mockImplementation(text => {
+				setText(text);
+				editor.onChange?.(text);
+			});
+			vi.spyOn(editor, "insertText").mockImplementationOnce(text => {
+				editor.setText(`partial ${text}`);
+				throw new Error("commit failed");
+			});
+
+			const handled = await editor.onPasteText?.(`${first} ${second}`, pasteTextContext());
+
+			expect(handled).toBe(false);
+			expect(editor.getText()).toBe("draft ");
+			expect(ctx.pendingImages).toEqual([existingImage]);
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a successful attachment consumed when status rendering fails", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-status-"));
+		const first = path.join(directory, "first.png");
+		const second = path.join(directory, "second.png");
+		await Bun.write(first, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(second, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			spies.showStatus.mockImplementationOnce(() => {
+				throw new Error("render failed");
+			});
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+
+			const handled = await editor.onPasteText?.(`${first} ${second}`, pasteTextContext());
+
+			expect(handled).toBe(true);
+			expect(editor.getText()).toContain("[image 1]");
+			expect(ctx.pendingImages).toHaveLength(2);
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("uses confirmation rejection as a literal-paste bypass without filesystem access", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		spies.showHookSelector.mockResolvedValueOnce("Paste paths literally");
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		const handled = await editor.onPasteText?.("/missing/first.png /missing/second.png", pasteTextContext());
+
+		expect(handled).toBe(false);
+		expect(editor.getText()).toBe("");
+		expect(ctx.pendingImages).toEqual([]);
+		expect(spies.showStatus).not.toHaveBeenCalled();
+	});
+
+	it("leaves image path lists literal in bash and Python composer modes", async () => {
+		for (const mode of ["bash", "python"] as const) {
+			const { InputController, ctx, editor, spies } = await createContext();
+			ctx.isBashMode = mode === "bash";
+			ctx.isPythonMode = mode === "python";
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+			const handled = await editor.onPasteText?.("/tmp/first.png /tmp/second.png", pasteTextContext());
+			expect(handled).toBe(false);
+			expect(spies.showHookSelector).not.toHaveBeenCalled();
+		}
+	});
+
+	it("does not attach after the paste transaction is aborted", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		const abortController = new AbortController();
+		abortController.abort(new Error("expired"));
+
+		const handled = await editor.onPasteText?.(
+			"/tmp/first.png /tmp/second.png",
+			pasteTextContext(abortController.signal),
+		);
+
+		expect(handled).toBe(false);
+		expect(editor.getText()).toBe("");
+		expect(ctx.pendingImages).toEqual([]);
+		expect(spies.showStatus).not.toHaveBeenCalled();
+	});
+
+	it("integrates editor timeout abort with controller loading and exact replay", async () => {
+		vi.useFakeTimers();
+		const { InputController, ctx } = await createContext();
+		const realEditor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = realEditor;
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const finished = Promise.withResolvers<void>();
+		const loadPastedImageBatch = vi.fn(
+			async (options: LoadPastedImageBatchOptions): Promise<LoadedPastedImageBatch> => {
+				started.resolve();
+				try {
+					await release.promise;
+					options.signal.throwIfAborted();
+					return { images: [], loadedInputs: [], sourcePaths: [] };
+				} finally {
+					finished.resolve();
+				}
+			},
+		);
+		const controller = new InputController(ctx, { loadPastedImageBatch });
+		controller.setupKeyHandlers();
+
+		realEditor.handleInput("before ");
+		realEditor.handleInput("\x1b[200~/tmp/first.png /tmp/second.png \x1b[201~");
+		realEditor.handleInput("after");
+		await started.promise;
+		expect(realEditor.getText()).toBe("before ");
+
+		vi.advanceTimersByTime(5_000);
+		expect(realEditor.getText()).toBe("before /tmp/first.png /tmp/second.png after");
+		expect(ctx.pendingImages).toEqual([]);
+
+		release.resolve();
+		await finished.promise;
+		expect(realEditor.getText()).toBe("before /tmp/first.png /tmp/second.png after");
+		expect(ctx.pendingImages).toEqual([]);
+		realEditor.dispose();
+	});
+
+	it("processes a command prefix before a coalesced image-path paste", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const realEditor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = realEditor;
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		realEditor.handleInput("!echo \x1b[200~/tmp/first.png /tmp/second.png\x1b[201~");
+		await Bun.sleep(0);
+
+		expect(ctx.isBashMode).toBe(true);
+		expect(realEditor.getText()).toBe("!echo /tmp/first.png /tmp/second.png");
+		expect(spies.showHookSelector).not.toHaveBeenCalled();
+		expect(ctx.pendingImages).toEqual([]);
+		realEditor.dispose();
+	});
+
+	it("replays confirmed path text literally when the user declines attachment", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		spies.showHookSelector.mockResolvedValueOnce("Paste paths literally");
+		const realEditor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = realEditor;
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		realEditor.handleInput("before \x1b[200~/tmp/first.png /tmp/second.png\x1b[201~ after");
+		await Bun.sleep(0);
+
+		expect(realEditor.getText()).toBe("before /tmp/first.png /tmp/second.png after");
+		expect(ctx.pendingImages).toEqual([]);
+		realEditor.dispose();
+	});
+
+	it("does not commit into a successor composer", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-successor-"));
+		const first = path.join(directory, "first.png");
+		const second = path.join(directory, "second.png");
+		await Bun.write(first, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(second, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			const successorInsertText = vi.fn();
+			const replacementImage: InteractiveModeContext["pendingImages"][number] = {
+				type: "image",
+				data: "replacement",
+				mimeType: "image/png",
+			};
+			const successor = {
+				...editor,
+				insertText: successorInsertText,
+			} as unknown as InteractiveModeContext["editor"];
+			spies.showHookSelector.mockImplementationOnce(async () => {
+				editor.setText("replacement draft");
+				ctx.pendingImages = [replacementImage];
+				ctx.editor = successor;
+				return "Attach images";
+			});
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+
+			const handled = await editor.onPasteText?.(`${first} ${second}`, pasteTextContext());
+
+			expect(handled).toBe(false);
+			expect(editor.getText()).toBe("replacement draft");
+			expect(successorInsertText).not.toHaveBeenCalled();
+			expect(ctx.pendingImages).toEqual([replacementImage]);
+			expect(spies.showStatus).not.toHaveBeenCalled();
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects over-limit lists before opening paths", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		const text = Array.from({ length: 17 }, (_, index) => `/missing/${index}.png`).join(" ");
+
+		const handled = await editor.onPasteText?.(text, pasteTextContext());
+
+		expect(handled).toBe(false);
+		expect(ctx.pendingImages).toEqual([]);
+		expect(spies.showHookSelector).not.toHaveBeenCalled();
+		expect(spies.showStatus).toHaveBeenCalledWith("Cannot attach more than 16 pasted images.");
+	});
+
+	it("leaves ordinary single saved paths literal", async () => {
 		const { InputController, ctx, editor } = await createContext();
 		const controller = new InputController(ctx);
-
 		controller.setupKeyHandlers();
-		const handled = await editor.onPasteText?.("/tmp/not-a-clipboard-image.png");
-
+		const handled = await editor.onPasteText?.("/tmp/not-a-clipboard-image.png", pasteTextContext());
 		expect(handled).toBe(false);
 		expect(editor.getText()).toBe("");
 		expect(ctx.pendingImages).toHaveLength(0);

@@ -225,6 +225,28 @@ describe("lifecycle command parser (G009)", () => {
 			}),
 		).toMatch(/in progress/i);
 
+		const uncertain = {
+			type: "session_lifecycle_error",
+			requestId: "r",
+			status: "error",
+			reason: "terminal_uncertain",
+			message: "outcome unknown",
+		} as const;
+		const createUncertain = formatLifecycleOutcome(uncertain, "session_create");
+		expect(createUncertain).toContain("already be starting");
+		expect(createUncertain).toContain("starting it twice");
+
+		const closeUncertain = formatLifecycleOutcome(uncertain, "session_close");
+		expect(closeUncertain).toContain("already be closed");
+		expect(closeUncertain).not.toContain("starting it twice");
+
+		const resumeUncertain = formatLifecycleOutcome(uncertain, "session_resume");
+		expect(resumeUncertain).toContain("reattached or restarting");
+		expect(resumeUncertain).not.toContain("starting it twice");
+
+		const genericUncertain = formatLifecycleOutcome(uncertain);
+		expect(genericUncertain).not.toContain("starting it twice");
+
 		// ambiguous_target lists candidates.
 		const amb = formatLifecycleOutcome({
 			type: "session_lifecycle_error",

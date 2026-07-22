@@ -1142,7 +1142,9 @@ fn ensure_not_current_arbitrated_presentation(
 
 #[cfg(test)]
 mod tests {
-	use super::{ActionIdentity, PresentationLease, ensure_not_current_arbitrated_presentation};
+	use super::{
+		ActionIdentity, PresentationLease, ensure_not_current_arbitrated_presentation, parse_needed,
+	};
 
 	#[test]
 	fn ephemeral_turn_mapping_preserves_question_and_tuple_without_token() {
@@ -1205,6 +1207,38 @@ mod tests {
 			.expect_err("exact arbitrated presentation must reject id-only resolution");
 			assert!(error.reason.contains(method));
 		}
+	}
+	#[test]
+	fn register_ask_input_preserves_recommended_index_and_legacy_omission() {
+		let needed = parse_needed(
+			r#"{"id":"a1","kind":"ask","sessionId":"session","options":["Yes","No"],"recommendedIndex":4294967295}"#,
+		)
+		.expect("valid N-API registerAsk input");
+		assert_eq!(needed.recommended_index, Some(u32::MAX));
+		let roundtrip = serde_json::to_string(&needed).unwrap();
+		assert!(roundtrip.contains(r#""recommendedIndex":4294967295"#));
+		assert_eq!(parse_needed(&roundtrip).unwrap().recommended_index, Some(u32::MAX));
+
+		let legacy =
+			parse_needed(r#"{"id":"legacy","kind":"ask","sessionId":"session","options":["Yes"]}"#)
+				.expect("legacy N-API registerAsk input");
+		assert_eq!(legacy.recommended_index, None);
+		assert!(
+			!serde_json::to_string(&legacy)
+				.unwrap()
+				.contains("recommendedIndex")
+		);
+	}
+
+	#[test]
+	fn register_ask_input_drops_malformed_recommended_index_but_rejects_required_field_failure() {
+		for malformed in ["null", "1.5", "-1", r#""1""#, "true", "[]", "{}", "4294967296"] {
+			let input = format!(
+				r#"{{"id":"a1","kind":"ask","sessionId":"session","options":["Yes"],"recommendedIndex":{malformed}}}"#
+			);
+			assert_eq!(parse_needed(&input).unwrap().recommended_index, None, "{malformed}");
+		}
+		assert!(parse_needed(r#"{"kind":"ask","sessionId":"session"}"#).is_err());
 	}
 
 	#[test]

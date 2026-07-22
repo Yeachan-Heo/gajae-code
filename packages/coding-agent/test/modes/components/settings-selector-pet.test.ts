@@ -17,7 +17,11 @@ afterEach(() => {
 	resetSettingsForTest();
 });
 
-function makeComponent(petAvailable: boolean, callbacks: Record<string, unknown>): SettingsSelectorComponent {
+function makeComponent(
+	petAvailable: boolean,
+	callbacks: Record<string, unknown>,
+	terminalEnv?: NodeJS.ProcessEnv,
+): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
 		{
 			availableThinkingLevels: [],
@@ -26,6 +30,7 @@ function makeComponent(petAvailable: boolean, callbacks: Record<string, unknown>
 			availableModelProfiles: [],
 			cwd: process.cwd(),
 			petAvailable,
+			terminalEnv,
 		},
 		{ onChange: () => {}, onCancel: () => {}, ...callbacks },
 	);
@@ -75,7 +80,7 @@ describe("SettingsSelectorComponent pet capability", () => {
 
 	it("shows the actionable unavailable warning inside the pet submenu", () => {
 		settings.set("pet.mode", "red");
-		const component = makeComponent(false, {});
+		const component = makeComponent(false, {}, {});
 
 		openPetSetting(component);
 		const submenu = stripVTControlCharacters(component.render(200).join("\n"));
@@ -83,6 +88,21 @@ describe("SettingsSelectorComponent pet capability", () => {
 		// Same guidance as startup and /pet (normal-terminal variant in tests);
 		// dimmed option descriptions alone are not sufficient.
 		expect(submenu).toContain("Ghostty");
+	});
+
+	it.each([
+		["TMUX", { TMUX: "/tmp/host,1,0" }],
+		["tmux TERM", { TERM: "tmux-256color" }],
+	])("shows multiplexer recovery guidance for %s without normal-terminal guidance", (_name, terminalEnv) => {
+		settings.set("pet.mode", "red");
+		const component = makeComponent(false, {}, terminalEnv);
+
+		openPetSetting(component);
+		const submenu = stripVTControlCharacters(component.render(200).join("\n"));
+
+		expect(submenu).toContain("outside the multiplexer");
+		expect(submenu).toContain("PI_FORCE_IMAGE_PROTOCOL=sixel");
+		expect(submenu).not.toContain("Ghostty");
 	});
 
 	it("does not persist pet.mode when the commit policy rejects at select time", () => {

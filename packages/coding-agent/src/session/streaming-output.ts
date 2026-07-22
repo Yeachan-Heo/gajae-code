@@ -54,6 +54,10 @@ export interface OutputSummary {
 }
 
 export interface OutputSinkOptions {
+	/**
+	 * Deprecated managed artifact pathname. Bare paths are deliberately ignored:
+	 * streaming output must be terminally published through ArtifactManager.
+	 */
 	artifactPath?: string;
 	artifactId?: string;
 	/** Tail buffer budget (bytes). Default DEFAULT_MAX_BYTES. */
@@ -736,6 +740,8 @@ export class OutputSink {
 			artifactMaxBytes = DEFAULT_ARTIFACT_MAX_BYTES,
 			coalesceSanitize = process.env.PI_OUTPUT_SANITIZE_COALESCE === "1",
 		} = options ?? {};
+		// Managed callers omit artifactPath at the allocation boundary; explicit callers
+		// retain the existing pathname-backed streaming contract.
 		this.#artifactPath = artifactPath;
 		this.#artifactId = artifactId;
 		this.#spillThreshold = spillThreshold;

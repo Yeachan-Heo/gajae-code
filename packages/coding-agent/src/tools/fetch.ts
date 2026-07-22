@@ -4,7 +4,7 @@ import type { AgentToolResult } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { htmlToMarkdown } from "@gajae-code/natives";
 import { type Component, Text } from "@gajae-code/tui";
-import { $which, ptree, truncate } from "@gajae-code/utils";
+import { ptree, truncate } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
@@ -15,10 +15,8 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { parseHtmlLazy } from "../utils/linkedom";
-import { ensureTool } from "../utils/tools-manager";
-import { INSANE_NOTES, tryInsaneFetch } from "../web/insane/bridge";
-import { validatePublicHttpUrl, validatePublicHttpUrlForInsane } from "../web/insane/url-guard";
-import { extractWithParallel, findParallelApiKey, getParallelExtractContent } from "../web/parallel";
+import { INSANE_NOTES } from "../web/insane/bridge";
+import { validatePublicHttpUrl } from "../web/insane/url-guard";
 import { specialHandlers } from "../web/scrapers";
 import type { RenderResult } from "../web/scrapers/types";
 import { finalizeOutput, loadPage, looksLikeHtml, MAX_OUTPUT_CHARS } from "../web/scrapers/types";
@@ -92,13 +90,6 @@ const MAX_INLINE_IMAGE_OUTPUT_BYTES = 300 * 1024;
 // =============================================================================
 // Utilities
 // =============================================================================
-
-/**
- * Check if a command exists (cross-platform)
- */
-function hasCommand(cmd: string): boolean {
-	return Boolean($which(cmd));
-}
 
 /**
  * Build llms.txt candidates scoped to the requested URL
@@ -537,96 +528,18 @@ async function parseFeedToMarkdown(content: string, maxItems = 10): Promise<stri
 	return content; // Fall back to raw content
 }
 
-/**
- * Render HTML to markdown using Parallel, jina, trafilatura, lynx (in order of preference)
- */
-async function renderHtmlToText(
-	url: string,
+export async function renderHtmlToText(
 	html: string,
-	timeout: number,
-	settings: Settings,
-	userSignal: AbortSignal | undefined,
-	storage: AgentStorage | null,
+	signal?: AbortSignal,
 ): Promise<{ content: string; ok: boolean; method: string }> {
-	const signal = ptree.combineSignals(userSignal, timeout * 1000);
-	const execOptions = {
-		mode: "group" as const,
-		allowNonZero: true,
-		allowAbort: true,
-		stderr: "full" as const,
-		signal,
-	};
-
-	// Try Parallel extract first when credentials are configured
-	if (settings.get("providers.parallelFetch") && findParallelApiKey(storage)) {
-		try {
-			const parallelResult = await extractWithParallel(
-				[url],
-				{
-					objective: "Extract the main content",
-					excerpts: true,
-					fullContent: false,
-					signal,
-				},
-				storage,
-			);
-			const firstDocument = parallelResult.results[0];
-			if (firstDocument) {
-				const content = getParallelExtractContent(firstDocument);
-				if (content.trim().length > 100 && !isLowQualityOutput(content)) {
-					return { content, ok: true, method: "parallel" };
-				}
-			}
-		} catch {
-			// Parallel extract failed, continue to next method
-			signal?.throwIfAborted();
-		}
-	}
-
-	// Try jina first (reader API)
 	try {
-		const jinaUrl = `https://r.jina.ai/${url}`;
-		const response = await fetch(jinaUrl, {
-			headers: { Accept: "text/markdown" },
-			signal,
-		});
-		if (response.ok) {
-			const content = await response.text();
-			if (content.trim().length > 100 && !isLowQualityOutput(content)) {
-				return { content, ok: true, method: "jina" };
-			}
-		}
-	} catch {
-		// Jina failed, continue to next method
 		signal?.throwIfAborted();
-	}
-
-	// Try trafilatura (auto-install via uv/pip)
-	const trafilatura = await ensureTool("trafilatura", { signal, silent: true });
-	if (trafilatura) {
-		const result = await ptree.exec([trafilatura, "-u", url, "--output-format", "markdown"], execOptions);
-		if (result.ok && result.stdout.trim().length > 100) {
-			return { content: result.stdout, ok: true, method: "trafilatura" };
-		}
-	}
-
-	// Try lynx (can't auto-install, system package)
-	const lynx = hasCommand("lynx");
-	if (lynx) {
-		const result = await ptree.exec(["lynx", "-dump", "-nolist", "-width", "250", url], execOptions);
-		if (result.ok) {
-			return { content: result.stdout, ok: true, method: "lynx" };
-		}
-	}
-
-	// Fall back to native converter (fastest, no network/subprocess)
-	try {
 		const content = await htmlToMarkdown(html, { cleanContent: true });
 		if (content.trim().length > 100 && !isLowQualityOutput(content)) {
 			return { content, ok: true, method: "native" };
 		}
 	} catch {
-		// Native converter failed, continue to next method
+		// Native conversion failed; the caller returns its bounded raw HTML.
 		signal?.throwIfAborted();
 	}
 	return { content: "", ok: false, method: "none" };
@@ -707,14 +620,6 @@ async function handleSpecialUrls(
 // Main Render Function
 // =============================================================================
 
-/**
- * Opt-in insane-search fallback for blocked / degraded public URL reads.
- *
- * Returns a finalized `method: "insane"` result on success, or null (so the
- * caller continues with its normal degraded behavior). Fail-closed: no note,
- * guard DNS, dependency probe, or subprocess when raw mode or the opt-in
- * setting is off. The public-URL guard runs BEFORE any probe/spawn.
- */
 export async function tryInsaneFallback(args: {
 	url: string;
 	finalUrl: string;
@@ -727,32 +632,7 @@ export async function tryInsaneFallback(args: {
 }): Promise<FetchRenderResult | null> {
 	if (args.raw) return null;
 	if (args.settings.get("web.insaneFallback") !== true) return null;
-
-	const target = args.finalUrl || args.url;
-	const guard = await validatePublicHttpUrlForInsane(target);
-	if (!guard.ok) {
-		args.notes.push(INSANE_NOTES.guardBlocked(guard.reason));
-		return null;
-	}
-
-	const result = await tryInsaneFetch(guard.url.toString(), {
-		timeoutMs: args.timeout * 1000,
-		signal: args.signal,
-	});
-	if (result.ok) {
-		const output = finalizeOutput(result.content);
-		return {
-			url: args.url,
-			finalUrl: target,
-			contentType: "text/markdown",
-			method: "insane",
-			content: output.content,
-			fetchedAt: args.fetchedAt,
-			truncated: output.truncated,
-			notes: [...args.notes, ...result.notes],
-		};
-	}
-	for (const note of result.notes) args.notes.push(note);
+	args.notes.push(INSANE_NOTES.securityDisabled);
 	return null;
 }
 
@@ -772,6 +652,7 @@ async function renderUrl(
 	if (signal?.aborted) {
 		throw new ToolAbortError();
 	}
+	const preflightSignal = ptree.combineSignals(signal, timeout * 1000);
 
 	// Handle internal protocol URLs (e.g., pi-internal://) - return empty
 	if (url.startsWith("pi-internal://")) {
@@ -789,7 +670,8 @@ async function renderUrl(
 
 	// Step 0: Normalize URL (ensure scheme for special handlers)
 	url = normalizeUrl(url);
-	const publicUrl = await validatePublicHttpUrl(url);
+	const publicUrl = await validatePublicHttpUrl(url, { signal: preflightSignal });
+	if (signal?.aborted) throw new ToolAbortError();
 	if (!publicUrl.ok) {
 		notes.push(`Blocked URL fetch: target URL is not public HTTP(S): ${publicUrl.reason}`);
 		return {
@@ -1138,10 +1020,10 @@ async function renderUrl(
 			throw new ToolAbortError();
 		}
 
-		// 5E: Render HTML with lynx or html2text
-		const htmlResult = await renderHtmlToText(finalUrl, rawContent, timeout, settings, signal, storage);
+		// 5E: Render only the bytes already fetched above.
+		const htmlResult = await renderHtmlToText(rawContent, signal);
 		if (!htmlResult.ok) {
-			notes.push("html rendering failed (lynx/html2text unavailable)");
+			notes.push("native HTML rendering failed");
 			const insane = await tryInsaneFallback({ url, finalUrl, timeout, raw, settings, signal, fetchedAt, notes });
 			if (insane) return insane;
 			const output = finalizeOutput(rawContent);

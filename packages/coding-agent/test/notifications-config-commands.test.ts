@@ -5,6 +5,7 @@ import {
 	parseInThreadConfigCommand,
 	parseRichToggleCommand,
 	parseTelegramControlCommand,
+	parseToolActivityToggleCommand,
 } from "../src/sdk/bus/config-commands";
 
 describe("parseInThreadConfigCommand", () => {
@@ -71,6 +72,31 @@ describe("parseRichToggleCommand", () => {
 		expect(parseRichToggleCommand("/verbose")).toBeUndefined();
 		expect(parseRichToggleCommand("rich on")).toBeUndefined();
 		expect(parseRichToggleCommand("")).toBeUndefined();
+	});
+});
+
+describe("parseToolActivityToggleCommand", () => {
+	test("parses exact on/off aliases and matching bot suffixes", () => {
+		expect(parseToolActivityToggleCommand("/toolactivity on")).toBe(true);
+		expect(parseToolActivityToggleCommand("/toolactivity true")).toBe(true);
+		expect(parseToolActivityToggleCommand("/toolactivity 1")).toBe(true);
+		expect(parseToolActivityToggleCommand("/toolactivity off")).toBe(false);
+		expect(parseToolActivityToggleCommand("/toolactivity false")).toBe(false);
+		expect(parseToolActivityToggleCommand("/toolactivity 0")).toBe(false);
+		expect(parseToolActivityToggleCommand("/TOOLACTIVITY@GajaeCodeBot OFF", "GajaeCodeBot")).toBe(false);
+	});
+
+	test("fails closed for malformed, trailing, unrelated, and foreign-addressed commands", () => {
+		expect(parseToolActivityToggleCommand("/toolactivity")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/toolactivity maybe")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/toolactivity off accidental")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/toolactivity@OtherBot off", "GajaeCodeBot")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/toolactivity@ off", "GajaeCodeBot")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/toolactivity@@ off", "GajaeCodeBot")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/toolactivity@GajaeCodeBot@OtherBot off", "GajaeCodeBot")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/toolactivity@GajaeCodeBot off")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("/tools off")).toBeUndefined();
+		expect(parseToolActivityToggleCommand("toolactivity off")).toBeUndefined();
 	});
 });
 

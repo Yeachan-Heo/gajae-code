@@ -391,7 +391,7 @@ export function formatCredentialSummary(credential: ImportableCredential): strin
 	const identityPart = identity ? ` ${identity}` : "";
 	let expiry = "";
 	if (credential.kind === "oauth" && credential.expiresAt !== undefined) {
-		expiry = credential.expiresAt < Date.now() ? " [expired]" : "";
+		expiry = credential.expiresAt <= Date.now() ? " [expired]" : "";
 	}
 	return `${provider} · ${kind}${identityPart} · token ${credential.redactedToken}${expiry} (from ${credential.source})`;
 }
@@ -413,7 +413,10 @@ export function formatDiscoverySummary(result: CredentialDiscoveryResult): strin
 	return lines;
 }
 
-export function isAutoImportOAuthCredential(credential: ImportableCredential): boolean {
+/** Reason shown when automatic OAuth import rejects an unusable discovery record. */
+export const INVALID_AUTO_IMPORT_OAUTH_EXPIRY_REASON = "OAuth credential has no valid future expiry";
+
+function hasAutoImportOAuthProviderOrigin(credential: ImportableCredential): boolean {
 	return (
 		AUTO_IMPORT_OAUTH_PROVIDER_ORIGINS[credential.provider]?.has(credential.origin) === true &&
 		credential.kind === "oauth" &&
@@ -421,8 +424,30 @@ export function isAutoImportOAuthCredential(credential: ImportableCredential): b
 	);
 }
 
+export function isAutoImportOAuthCredential(credential: ImportableCredential, now: number = Date.now()): boolean {
+	return (
+		hasAutoImportOAuthProviderOrigin(credential) &&
+		typeof credential.expiresAt === "number" &&
+		Number.isFinite(credential.expiresAt) &&
+		credential.expiresAt > now
+	);
+}
+
+/** Keep rejected OAuth discoveries visible to operators without offering them for automatic import. */
+export function getAutoImportOAuthCredentialSkips(
+	credentials: readonly ImportableCredential[],
+	now: number = Date.now(),
+): SkippedCredential[] {
+	return credentials.flatMap(credential =>
+		hasAutoImportOAuthProviderOrigin(credential) && !isAutoImportOAuthCredential(credential, now)
+			? [{ origin: credential.origin, source: credential.source, reason: INVALID_AUTO_IMPORT_OAUTH_EXPIRY_REASON }]
+			: [],
+	);
+}
+
 export function filterAutoImportOAuthCredentials(credentials: readonly ImportableCredential[]): ImportableCredential[] {
-	return credentials.filter(isAutoImportOAuthCredential);
+	const now = Date.now();
+	return credentials.filter(credential => isAutoImportOAuthCredential(credential, now));
 }
 
 /**

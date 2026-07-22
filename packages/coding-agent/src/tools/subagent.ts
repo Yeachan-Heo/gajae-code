@@ -227,6 +227,8 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
 				if (!result.ok && result.reason === "not_found") {
 					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
+				} else if (!result.ok) {
+					throw new ToolError(`Failed to resume subagent ${record.subagentId}: ${result.reason ?? "unknown"}.`);
 				} else {
 					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 				}

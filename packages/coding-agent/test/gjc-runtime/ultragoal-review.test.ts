@@ -241,6 +241,11 @@ function passingQualityGate(): Record<string, unknown> {
 			rerunCommands: ["bun test:e2e"],
 			blockers: [],
 		},
+		criticReview: {
+			verdict: "OKAY",
+			evidence: "critic approved final aggregate",
+			blockers: [],
+		},
 	};
 }
 
@@ -389,6 +394,11 @@ describe("ultragoal review command", () => {
 						evidence: "no verification findings remain after steering iterations",
 						fullRerun: true,
 						rerunCommands: ["bun test:e2e"],
+						blockers: [],
+					},
+					criticReview: {
+						verdict: "OKAY",
+						evidence: "critic approved final aggregate",
 						blockers: [],
 					},
 				}),

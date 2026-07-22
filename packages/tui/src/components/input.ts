@@ -64,8 +64,12 @@ export class Input implements Component, Focusable {
 
 	handleInput(data: string): void {
 		// Handle bracketed paste mode
-		const paste = this.#pasteHandler.process(data);
+		const paste =
+			data === "\x1b" && !this.#pasteHandler.hasPendingFrame
+				? ({ handled: false } as const)
+				: this.#pasteHandler.process(data);
 		if (paste.handled) {
+			if (paste.leading.length > 0) this.handleInput(paste.leading);
 			if (paste.pasteContent !== undefined) {
 				this.#handlePaste(paste.pasteContent);
 				if (paste.remaining.length > 0) {

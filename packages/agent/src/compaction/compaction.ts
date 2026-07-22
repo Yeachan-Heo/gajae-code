@@ -973,6 +973,12 @@ export interface HandoffOptions {
 	/** Live agent tool list — same purpose. Forced to `toolChoice: "none"`. */
 	tools?: AgentTool<any>[];
 	customInstructions?: string;
+	/**
+	 * Optional user-configured extension appended to the base handoff prompt.
+	 * It SUPPLEMENTS the immutable base (safety/continuity structure); it never
+	 * replaces `HANDOFF_DOCUMENT_PROMPT`.
+	 */
+	promptExtension?: string;
 	convertToLlm?: ConvertToLlm;
 	initiatorOverride?: MessageAttribution;
 	metadata?: Record<string, unknown>;
@@ -993,10 +999,11 @@ export interface HandoffOptions {
 	preferWebsockets?: boolean;
 }
 
-export function renderHandoffPrompt(customInstructions?: string): string {
-	if (!customInstructions) return HANDOFF_DOCUMENT_PROMPT;
+export function renderHandoffPrompt(customInstructions?: string, promptExtension?: string): string {
+	if (!customInstructions && !promptExtension) return HANDOFF_DOCUMENT_PROMPT;
 	return prompt.render(handoffDocumentPrompt, {
 		additionalFocus: customInstructions,
+		promptExtension,
 	});
 }
 
@@ -1012,7 +1019,7 @@ export async function generateHandoff(
 		...llmMessages,
 		{
 			role: "user",
-			content: [{ type: "text", text: renderHandoffPrompt(options.customInstructions) }],
+			content: [{ type: "text", text: renderHandoffPrompt(options.customInstructions, options.promptExtension) }],
 			attribution: "agent",
 			timestamp: Date.now(),
 		},

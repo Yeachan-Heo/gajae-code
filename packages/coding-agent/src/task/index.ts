@@ -43,11 +43,11 @@ import {
 
 // Import review tools for side effects (registers subagent tool handlers)
 import "../tools/review";
-import type { LocalProtocolOptions } from "../internal-urls";
+import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
-import { renderSubagentUserPrompt, runSubprocess } from "./executor";
+import { createManagedTaskPersistence, renderSubagentUserPrompt, runSubprocess } from "./executor";
 import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
@@ -581,7 +581,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						);
 						const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 						const singleResult = result.details?.results[0];
-						return singleResult?.paused ? { kind: "paused" } : finalText;
+						if (singleResult?.paused) return { kind: "paused" };
+						// A resumed subprocess that aborted or exited non-zero is a failed
+						// resume, not a completed one. Throw the rendered failure summary
+						// (finalText) so the leg is reported failed instead of being
+						// returned as successful continuation.
+						if (singleResult && ((singleResult.aborted ?? false) || singleResult.exitCode !== 0)) {
+							throw new Error(finalText);
+						}
+						return finalText;
 					},
 					{
 						id: `${descriptor.task.id}-resume-${Snowflake.next()}`,
@@ -623,8 +631,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			});
 		};
 		const frozenForkSeeds = new Map<string, ForkContextSeed>();
+		const asyncParentArtifactManager = this.session.getArtifactManager?.() ?? undefined;
 		const parentSessionFileForBatch = this.session.getSessionFile();
 		const batchArtifactsDir = parentSessionFileForBatch ? parentSessionFileForBatch.slice(0, -6) : null;
+		let externalTaskSessionsDir: string | undefined;
+		if (!batchArtifactsDir) {
+			const asyncLocalOptions: LocalProtocolOptions = {
+				getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
+				isManagedDestination: this.session.isManagedSessionDestination,
+				getSessionId: this.session.getSessionId ?? (() => null),
+			};
+			await initializeLocalRoot(asyncLocalOptions);
+			externalTaskSessionsDir = resolveLocalUrlToPath("local://subagents/sessions", asyncLocalOptions);
+			await fs.mkdir(externalTaskSessionsDir, { recursive: true, mode: 0o700 });
+		}
 
 		for (let i = 0; i < taskItems.length; i++) {
 			const taskItem = taskItems[i];
@@ -652,7 +672,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const singleParams: TaskParams = { ...params, tasks: [taskItem] };
 			const label = uniqueId;
 			try {
-				const subtaskSessionFile = batchArtifactsDir ? path.join(batchArtifactsDir, `${uniqueId}.jsonl`) : null;
+				const managedPersistence = asyncParentArtifactManager?.getManagedStore()
+					? createManagedTaskPersistence(asyncParentArtifactManager, uniqueId)
+					: undefined;
+				const subtaskSessionFile = managedPersistence
+					? null
+					: path.join(batchArtifactsDir ?? externalTaskSessionsDir!, `${uniqueId}.jsonl`);
 				const jobId = manager.register(
 					"task",
 					label,
@@ -810,8 +835,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						currentJobId: jobId,
 						historicalJobIds: [],
 						status: manager.getJob(jobId)?.status ?? "running",
-						sessionFile: subtaskSessionFile,
-						resumable: !!batchArtifactsDir,
+						sessionFile: null,
+						resumable: true,
 					});
 				}
 			} catch (error) {
@@ -1132,6 +1157,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// Share the parent session's local:// root with subagents so they read/write the same scratch space
 		const localProtocolOptions: LocalProtocolOptions = {
 			getArtifactsDir: this.session.getArtifactsDir ?? (() => null),
+			isManagedDestination: this.session.isManagedSessionDestination,
 			getSessionId: this.session.getSessionId ?? (() => null),
 		};
 
@@ -1141,6 +1167,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		// Initialize progress tracking
 		const progressMap = new Map<number, AgentProgress>();
+		const isolatedPatchBytes = new Map<string, Buffer>();
 
 		// Update callback
 		const emitProgress = () => {
@@ -1201,14 +1228,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				};
 			}
 
-			// Write parent conversation context for subagents. When IRC is available,
-			// subagents should ask live peers instead of reading a stale markdown dump.
-			await fs.mkdir(effectiveArtifactsDir, { recursive: true });
+			// Place fork-context handoff material in the session-scoped external local
+			// root. Subagent prompts may expose this path to subprocesses, so it must
+			// never carry managed transcript/artifact authority.
 			const shouldWriteConversationContext = !hasAvailableIrcTool(this.session);
 			const compactContext = shouldWriteConversationContext ? this.session.getCompactContext?.() : undefined;
 			let contextFilePath: string | undefined;
 			if (compactContext) {
-				contextFilePath = path.join(effectiveArtifactsDir, "context.md");
+				await initializeLocalRoot(localProtocolOptions);
+				contextFilePath = resolveLocalUrlToPath("local://subagents/context.md", localProtocolOptions);
+				await fs.mkdir(path.dirname(contextFilePath), { recursive: true, mode: 0o700 });
 				await Bun.write(contextFilePath, compactContext);
 			}
 
@@ -1307,7 +1336,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					recommendedMode: advisory.recommendedMode,
 					reasons: advisory.reasons,
 				};
-				const taskSessionFile = overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null;
+				const managedPersistence = parentArtifactManager?.getManagedStore()
+					? createManagedTaskPersistence(parentArtifactManager, task.id)
+					: undefined;
+				const taskSessionFile = managedPersistence
+					? null
+					: (overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null);
 				if (!isIsolated) {
 					const result = await runSubprocess({
 						cwd: this.session.cwd,
@@ -1330,6 +1364,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						sessionFile: taskSessionFile,
 						persistArtifacts: !!artifactsDir,
 						artifactsDir: effectiveArtifactsDir,
+						managedPersistence,
 						contextFile: contextFilePath,
 						ircAvailable: hasAvailableIrcTool(this.session),
 						enableLsp: subagentLspEnabled,
@@ -1394,6 +1429,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						sessionFile: taskSessionFile,
 						persistArtifacts: !!artifactsDir,
 						artifactsDir: effectiveArtifactsDir,
+						managedPersistence,
 						contextFile: contextFilePath,
 						ircAvailable: hasAvailableIrcTool(this.session),
 						enableLsp: subagentLspEnabled,
@@ -1465,9 +1501,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					if (resultWithForkContext.exitCode === 0) {
 						try {
 							const delta = await captureDeltaPatch(isolationDir, taskBaseline);
+							await initializeLocalRoot(localProtocolOptions);
 							const artifactId = validateAllocatedTaskId(task.id);
-							const patchPath = path.join(effectiveArtifactsDir, `${artifactId}.patch`);
+							const patchPath = resolveLocalUrlToPath(
+								`local://subagents/${artifactId}.patch`,
+								localProtocolOptions,
+							);
+							await fs.mkdir(path.dirname(patchPath), { recursive: true, mode: 0o700 });
 							await Bun.write(patchPath, delta.rootPatch);
+							isolatedPatchBytes.set(patchPath, Buffer.from(delta.rootPatch, "utf8"));
 							const producedChanges = Boolean(delta.rootPatch.trim() || delta.nestedPatches.length);
 							return {
 								...resultWithForkContext,
@@ -1622,19 +1664,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							changesApplied = false;
 							hadAnyChanges = false;
 						} else {
-							const patchStats = await Promise.all(
-								patchesInOrder.map(async patchPath => ({
-									patchPath,
-									size: (await fs.stat(patchPath)).size,
-								})),
-							);
+							const patchStats = patchesInOrder.map(patchPath => ({
+								patchPath,
+								size: isolatedPatchBytes.get(patchPath)?.byteLength ?? -1,
+							}));
+							if (patchStats.some(patch => patch.size < 0)) {
+								throw new Error("Captured isolated patch bytes are unavailable");
+							}
 							const nonEmptyPatches = patchStats.filter(patch => patch.size > 0).map(patch => patch.patchPath);
 							if (nonEmptyPatches.length === 0) {
 								changesApplied = true;
 								hadAnyChanges = false;
 							} else {
-								const patchTexts = await Promise.all(
-									nonEmptyPatches.map(async patchPath => Bun.file(patchPath).text()),
+								const patchTexts = nonEmptyPatches.map(patchPath =>
+									isolatedPatchBytes.get(patchPath)!.toString("utf8"),
 								);
 								const combinedPatch = patchTexts
 									.map(text => (text.endsWith("\n") ? text : `${text}\n`))

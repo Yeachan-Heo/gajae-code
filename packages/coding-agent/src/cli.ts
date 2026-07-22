@@ -9,6 +9,7 @@ import { Args, type CliConfig, Command, type CommandEntry, Flags, run } from "@g
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
 import { isTmuxOwnerIsolationCliArgv, runTmuxOwnerIsolationCliFromStdin } from "./gjc-runtime/tmux-owner-isolation-cli";
+import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -252,16 +253,15 @@ function isSubcommand(first: string | undefined): boolean {
 }
 
 /**
- * Smoke-test entry. Spawns the stats sync worker, pings it, exits.
+ * Smoke-test entry. Spawns the stats sync worker and the browser tab worker, then verifies their protocol.
  *
- * Purpose: catch the silent worker-load regressions that hit compiled
- * binaries (issues #1011 and #1027). Neither `--version` nor
- * `stats --summary` actually spawns a Worker on a fresh install — the
- * sync path early-returns when no session files exist. This probe is the
- * minimal end-to-end test that proves `new Worker(...)` resolves and the
- * bundled worker module evaluates successfully. Wired into
- * `scripts/install-tests/run-ci.sh` so binary / source-link / tarball
- * installs all exercise it on every CI run.
+ * Purpose: catch silent compiled-worker load regressions (issues #1011,
+ * #1027, and #2598). Neither `--version` nor `stats --summary` spawns both
+ * worker entries on a fresh install. This probe proves each bundled worker
+ * module resolves and evaluates; the tab-worker probe also completes its
+ * bootstrap/closed protocol without launching a browser. Wired into
+ * `scripts/install-tests/run-ci.sh` so binary / source-link / tarball installs
+ * exercise it on every CI run.
  */
 async function runSmokeTest(): Promise<void> {
 	const { smokeTestSyncWorker } = await import("@gajae-code/stats");
@@ -278,6 +278,7 @@ async function runSmokeTest(): Promise<void> {
 	if (typeof h02ScoreSequenceFuzzy !== "function" || typeof h01FindBestFuzzyMatch !== "function") {
 		throw new Error("smoke-test: native fuzzy exports missing from embedded addon");
 	}
+	await smokeTestTabWorker();
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -286,9 +287,34 @@ export function normalizeResumeAlias(argv: readonly string[]): string[] {
 	return argv.length === 1 && argv[0] === "resume" ? ["--resume"] : [...argv];
 }
 
+function routeLegacyRootArgv(argv: readonly string[]): string[] | undefined {
+	if (argv[0] === "coordinator-mcp") return ["mcp-serve", "coordinator", ...argv.slice(1)];
+	if (argv[0] !== "--team") return undefined;
+	const sizeValues: string[] = [];
+	const remaining: string[] = [];
+	for (let index = 1; index < argv.length; index++) {
+		const arg = argv[index] ?? "";
+		if (arg === "--team-size") {
+			sizeValues.push(argv[index + 1] ?? "");
+			index++;
+		} else if (arg.startsWith("--team-size=")) {
+			sizeValues.push(arg.slice("--team-size=".length));
+		} else {
+			remaining.push(arg);
+		}
+	}
+	const size = sizeValues[0];
+	if (sizeValues.length !== 1 || !size || !/^[1-9]\d*$/.test(size)) {
+		return ["team", "0", "invalid legacy --team-size"];
+	}
+	return ["team", size, ...remaining];
+}
+
 /** Apply the same default-launch routing used by runCli after root fast paths. */
 export function routeRootArgv(argv: readonly string[]): string[] {
 	const normalizedArgv = normalizeResumeAlias(argv);
+	const legacyArgv = routeLegacyRootArgv(normalizedArgv);
+	if (legacyArgv) return legacyArgv;
 	const first = normalizedArgv[0];
 	return first === "--help" || first === "-h" || first === "--version" || first === "-v" || first === "help"
 		? normalizedArgv
@@ -347,11 +373,9 @@ export async function runCli(argv: string[]): Promise<void> {
 		process.exitCode = await runFixtureReport(id);
 		return;
 	}
-	if (isStatsHelpFastPath(argv)) {
-		showStatsFastHelp();
-		return;
-	}
-	if (hasRootHelpFlag(argv)) {
+	const normalizedArgv = normalizeResumeAlias(argv);
+	const legacyArgv = routeLegacyRootArgv(normalizedArgv);
+	if (!legacyArgv && hasRootHelpFlag(normalizedArgv)) {
 		const { renderRootHelp } = await import("@gajae-code/utils/cli");
 		const { getExtraHelpText } = await import("./cli/fast-help");
 		renderRootHelp({ bin: APP_NAME, version: VERSION, commands: new Map([["launch", RootHelpCommand]]) });
@@ -361,14 +385,16 @@ export async function runCli(argv: string[]): Promise<void> {
 		}
 		return;
 	}
-	if (hasRootVersionFlag(argv)) {
+	if (!legacyArgv && hasRootVersionFlag(normalizedArgv)) {
 		process.stdout.write(`${APP_NAME}/${VERSION}\n`);
 		return;
 	}
+	const runArgv = legacyArgv ?? routeRootArgv(normalizedArgv);
+	if (isStatsHelpFastPath(runArgv)) {
+		showStatsFastHelp();
+		return;
+	}
 	await installRuntimeGlobals();
-	// --help and --version are handled by run() directly, don't rewrite those.
-	// Everything else that isn't a known subcommand routes to "launch".
-	const runArgv = routeRootArgv(argv);
 	return run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp });
 }
 

@@ -34,6 +34,43 @@ describe("KeybindingsManager", () => {
 		]);
 		expect(keybindings.getKeys("tui.editor.cursorLeft")).toEqual(["left", "ctrl+b"]);
 	});
+
+	describe("user binding ownership", () => {
+		it("clones array bindings passed to the constructor", () => {
+			const bindings = { "tui.select.up": ["down"] as ("down" | "up")[] };
+			const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, bindings);
+
+			bindings["tui.select.up"].push("up");
+
+			expect(keybindings.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(keybindings.getKeys("tui.select.up")).toEqual(["down"]);
+			expect(keybindings.matches("\x1b[B", "tui.select.up")).toBe(true);
+			expect(keybindings.matches("\x1b[A", "tui.select.up")).toBe(false);
+		});
+
+		it("clones array bindings passed to setUserBindings", () => {
+			const keybindings = new KeybindingsManager(TUI_KEYBINDINGS);
+			const bindings = { "tui.select.up": ["down"] as ("down" | "up")[] };
+
+			keybindings.setUserBindings(bindings);
+			bindings["tui.select.up"].push("up");
+
+			expect(keybindings.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(keybindings.getKeys("tui.select.up")).toEqual(["down"]);
+		});
+
+		it("does not share returned configuration arrays between instances", () => {
+			const bindings = { "tui.select.up": ["down"] as ("down" | "up")[] };
+			const first = new KeybindingsManager(TUI_KEYBINDINGS, bindings);
+			const second = new KeybindingsManager(TUI_KEYBINDINGS, bindings);
+			(first.getUserBindings()["tui.select.up"] as string[]).push("up");
+
+			expect(first.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(second.getUserBindings()["tui.select.up"]).toEqual(["down"]);
+			expect(first.getKeys("tui.select.up")).toEqual(["down"]);
+			expect(second.getKeys("tui.select.up")).toEqual(["down"]);
+		});
+	});
 });
 
 describe("detectDefaultKeyCollisions", () => {

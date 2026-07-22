@@ -62,7 +62,7 @@ async function managedWorkspace(
 		// This is setup only: parallel ingress requests never inherit these variables.
 		process.env.GJC_LIFECYCLE_REQUEST_ID = `prepare-${name.toLowerCase()}-${sessionId}`;
 		process.env.GJC_SESSION_ID = sessionId;
-		const session = SessionManager.create(cwd, scopeDir);
+		const session = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 		await session.ensureOnDisk();
 		const sourcePath = session.getSessionFile();
 		if (!sourcePath) throw new Error("Product session API did not create a saved session path.");
@@ -282,7 +282,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 			expect(resolved.kind).toBe("resolved");
 			if (resolved.kind !== "resolved") throw new Error(resolved.message);
 			expect(fixtureSessionDir).toBe(resolved.scope.directoryPath);
-			const savedSession = SessionManager.create(repo, fixtureSessionDir);
+			const savedSession = SessionManager.create(repo, SessionManager.managedDestination(repo, agentDir));
 			await savedSession.ensureOnDisk();
 			const sourceId = savedSession.getSessionId();
 			const sourcePath = savedSession.getSessionFile();

@@ -1124,26 +1124,26 @@ export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelM
 }
 
 // ---------------------------------------------------------------------------
-// Alibaba Coding Plan
+// Alibaba Token Plan
 // ---------------------------------------------------------------------------
 
-export interface AlibabaCodingPlanModelManagerConfig {
+export interface AlibabaTokenPlanModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
 }
 
-export function alibabaCodingPlanModelManagerOptions(
-	config?: AlibabaCodingPlanModelManagerConfig,
+export function alibabaTokenPlanModelManagerOptions(
+	config?: AlibabaTokenPlanModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? "https://coding-intl.dashscope.aliyuncs.com/v1";
-	const references = createBundledReferenceMap<"openai-completions">("alibaba-coding-plan");
+	const baseUrl = config?.baseUrl ?? "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+	const references = createBundledReferenceMap<"openai-completions">("alibaba-token-plan");
 	return {
-		providerId: "alibaba-coding-plan",
+		providerId: "alibaba-token-plan",
 		fetchDynamicModels: () =>
 			fetchOpenAICompatibleModels({
 				api: "openai-completions",
-				provider: "alibaba-coding-plan",
+				provider: "alibaba-token-plan",
 				baseUrl,
 				apiKey,
 				mapModel: (entry, defaults) => {
@@ -2356,11 +2356,11 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDe
 			reasoningContentField: "reasoning_content",
 		},
 	}),
-	// --- Alibaba Coding Plan ---
+	// --- Alibaba Token Plan ---
 	openAiCompletionsDescriptor(
-		"alibaba-coding-plan",
-		"alibaba-coding-plan",
-		"https://coding-intl.dashscope.aliyuncs.com/v1",
+		"alibaba-token-plan",
+		"alibaba-token-plan",
+		"https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
 		{
 			compat: {
 				supportsDeveloperRole: false,

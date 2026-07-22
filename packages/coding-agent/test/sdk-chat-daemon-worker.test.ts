@@ -179,6 +179,9 @@ class FakeSdkClient implements ChatDaemonSdkClient {
 	sent: Record<string, unknown>[] = [];
 	requests: Record<string, unknown>[] = [];
 	handler: ((frame: Record<string, unknown>) => void) | undefined;
+	replayEvents: Record<string, unknown>[] = [
+		{ type: "event", name: "session_ready", sessionId: "session", generation: 1 },
+	];
 	#sentWaiters: Array<{ predicate: (frame: Record<string, unknown>) => boolean; resolve: () => void }> = [];
 	#requestWaiters: Array<{ predicate: (frame: Record<string, unknown>) => boolean; resolve: () => void }> = [];
 	onFrame(handler: (frame: Record<string, unknown>) => void): () => void {
@@ -216,8 +219,7 @@ class FakeSdkClient implements ChatDaemonSdkClient {
 	async request(frame: Record<string, unknown>): Promise<Record<string, unknown>> {
 		this.requests.push(frame);
 		this.#resolveRequestWaiters();
-		if (frame.type === "event_replay")
-			return { events: [{ type: "event", name: "session_ready", sessionId: "session", generation: 1 }] };
+		if (frame.type === "event_replay") return { events: this.replayEvents };
 		return { ok: true, result: { source: "sdk", body: "daemon-result-secret" } };
 	}
 	send(frame: Record<string, unknown>): void {
@@ -272,6 +274,11 @@ describe("chat daemon worker", () => {
 								repo: "replay-repo",
 								branch: "replay-branch",
 							},
+						},
+						{
+							type: "event",
+							name: "turn_stream",
+							payload: { type: "turn_stream", phase: "live", sessionId: "session", text: "replayed live" },
 						},
 					],
 				};
@@ -332,9 +339,31 @@ describe("chat daemon worker", () => {
 			threadId: "thread-1",
 			content: "GJC identity header\ntitle: Replay identity\nrepo: replay-repo\nbranch: replay-branch",
 		});
+		client.handler?.({ type: "turn_stream", phase: "live", sessionId: "session", text: "direct live" });
+		client.handler?.({
+			type: "event",
+			name: "turn_stream",
+			payload: { type: "turn_stream", phase: "live", sessionId: "session", text: "wrapped live" },
+		});
+		await Bun.sleep(10);
+		expect(provider.messages.some(message => /(?:replayed|direct|wrapped) live/.test(message.content))).toBe(false);
 		client.handler?.({ type: "turn_stream", sessionId: "session", text: "outbound" });
 		await turnStreamPosted;
 		expect(provider.messages).toContainEqual({ threadId: "thread-1", content: "GJC turn stream\noutbound" });
+		const finalizedTurnStreamPosted = provider.waitForMessage(
+			message => message.content === "GJC turn stream\nfinalized",
+		);
+		client.handler?.({ type: "turn_stream", phase: "finalized", sessionId: "session", text: "finalized" });
+		await finalizedTurnStreamPosted;
+		const wrappedMissingPhasePosted = provider.waitForMessage(
+			message => message.content === "GJC turn stream\nwrapped missing phase",
+		);
+		client.handler?.({
+			type: "event",
+			name: "turn_stream",
+			payload: { type: "turn_stream", sessionId: "session", text: "wrapped missing phase" },
+		});
+		await wrappedMissingPhasePosted;
 		const actionPosted = provider.waitForMessage(message => message.components !== undefined);
 		client.handler?.({
 			type: "action_needed",
@@ -786,6 +815,12 @@ describe("chat daemon worker", () => {
 		const provider = new FakeSlackProvider();
 		const client = new FakeSdkClient();
 		const broker = new FakeSdkClient();
+		client.replayEvents = [
+			{ type: "event", name: "session_ready", sessionId: "session", generation: 1 },
+			{ type: "turn_stream", phase: "live", sessionId: "session", text: "replayed live" },
+			{ type: "turn_stream", phase: "finalized", sessionId: "session", text: "replayed finalized" },
+			{ type: "turn_stream", sessionId: "session", text: "replayed missing phase" },
+		];
 		const runtime = new ChatDaemonRuntime(
 			{
 				kind: "slack",
@@ -813,6 +848,20 @@ describe("chat daemon worker", () => {
 			},
 		);
 		await runtime.start();
+		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\nreplayed finalized");
+		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\nreplayed missing phase");
+		client.handler?.({ type: "turn_stream", phase: "live", sessionId: "session", text: "direct live" });
+		client.handler?.({
+			type: "event",
+			name: "turn_stream",
+			payload: { type: "turn_stream", phase: "live", sessionId: "session", text: "wrapped live" },
+		});
+		await Bun.sleep(10);
+		expect(provider.posts.some(post => /(?:replayed|direct|wrapped) live/.test(post.text))).toBe(false);
+		client.handler?.({ type: "turn_stream", phase: "finalized", sessionId: "session", text: "direct finalized" });
+		client.handler?.({ type: "turn_stream", sessionId: "session", text: "direct missing phase" });
+		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\ndirect finalized");
+		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\ndirect missing phase");
 		const rootTs = provider.posts[0]?.clientMsgId === undefined ? undefined : "1.1";
 		expect(rootTs).toBeDefined();
 		const command = (eventId: string, clientMsgId: string, text: string): SlackSocketEnvelope => ({

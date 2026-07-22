@@ -1,5 +1,4 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { $ } from "bun";
 import {
@@ -14,6 +13,7 @@ import {
 	getTotalMessageCount,
 	syncAllSessions,
 } from "./aggregator";
+import { createCompiledClientAssetHandler } from "./compiled-client-assets";
 import embeddedClientArchiveTxt from "./embedded-client.generated.txt";
 
 const getEmbeddedClientArchive = (() => {
@@ -29,59 +29,7 @@ const IS_BUN_COMPILED =
 	import.meta.url.includes("$bunfs") ||
 	import.meta.url.includes("~BUN") ||
 	import.meta.url.includes("%7EBUN");
-
-const COMPILED_CLIENT_DIR_ROOT = path.join(os.tmpdir(), "gjc-stats-client");
-let compiledClientDirPromise: Promise<string> | null = null;
-
-function sanitizeArchivePath(archivePath: string): string | null {
-	const normalized = archivePath.replaceAll("\\", "/").replace(/^\.\//, "");
-	if (!normalized || normalized === ".") return null;
-	if (normalized.includes("..") || path.isAbsolute(normalized)) return null;
-	return normalized;
-}
-
-async function extractEmbeddedClientArchive(archiveBytes: Buffer, outputDir: string): Promise<void> {
-	const archive = new Bun.Archive(archiveBytes);
-	const files = await archive.files();
-	const extractRoot = path.resolve(outputDir);
-
-	for (const [archivePath, file] of files) {
-		const sanitizedPath = sanitizeArchivePath(archivePath);
-		if (!sanitizedPath) continue;
-		const destinationPath = path.resolve(extractRoot, sanitizedPath);
-		if (!destinationPath.startsWith(extractRoot + path.sep)) {
-			throw new Error(`Archive entry escapes extraction directory: ${archivePath}`);
-		}
-		await Bun.write(destinationPath, file);
-	}
-}
-
-async function getCompiledClientDir(): Promise<string> {
-	if (!IS_BUN_COMPILED) return STATIC_DIR;
-	if (compiledClientDirPromise) return compiledClientDirPromise;
-
-	const archiveBytes = getEmbeddedClientArchive?.();
-	if (!archiveBytes) {
-		throw new Error("Compiled stats client bundle missing. Rebuild binary with embedded stats assets.");
-	}
-
-	compiledClientDirPromise = (async () => {
-		const bundleHash = Bun.hash(archiveBytes).toString(16);
-		const outputDir = path.join(COMPILED_CLIENT_DIR_ROOT, bundleHash);
-		const markerPath = path.join(outputDir, "index.html");
-		try {
-			const marker = await fs.stat(markerPath);
-			if (marker.isFile()) return outputDir;
-		} catch {}
-
-		await fs.rm(outputDir, { recursive: true, force: true });
-		await fs.mkdir(outputDir, { recursive: true });
-		await extractEmbeddedClientArchive(archiveBytes, outputDir);
-		return outputDir;
-	})();
-
-	return compiledClientDirPromise;
-}
+const compiledClientAssets = createCompiledClientAssetHandler(() => getEmbeddedClientArchive?.() ?? null);
 
 async function getLatestMtime(dir: string): Promise<number> {
 	const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -247,9 +195,10 @@ async function handleApi(req: Request): Promise<Response> {
  * Handle static file requests.
  */
 async function handleStatic(requestPath: string): Promise<Response> {
-	const staticDir = IS_BUN_COMPILED ? await getCompiledClientDir() : STATIC_DIR;
+	if (IS_BUN_COMPILED) return await compiledClientAssets.response(requestPath);
+
 	const filePath = requestPath === "/" ? "/index.html" : requestPath;
-	const fullPath = path.join(staticDir, filePath);
+	const fullPath = path.join(STATIC_DIR, filePath);
 
 	const file = Bun.file(fullPath);
 	if (await file.exists()) {
@@ -257,7 +206,7 @@ async function handleStatic(requestPath: string): Promise<Response> {
 	}
 
 	// SPA fallback
-	const index = Bun.file(path.join(staticDir, "index.html"));
+	const index = Bun.file(path.join(STATIC_DIR, "index.html"));
 	if (await index.exists()) {
 		return new Response(index);
 	}

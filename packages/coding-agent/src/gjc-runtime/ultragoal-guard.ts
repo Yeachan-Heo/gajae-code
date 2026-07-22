@@ -2,6 +2,10 @@ import * as fs from "node:fs/promises";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import { resolveGjcSessionForRead, SessionResolutionError } from "./session-resolution";
 import {
+	findCleanPauseCriticVerdict,
+	findLedgerReceiptEvent,
+	terminalCriticCeilingReached,
+	terminalCriticGateOverridden,
 	validateDeferredMemberReceiptFresh,
 	validateReceiptFreshBase,
 	validateSupersededFinalAggregateReceipt,
@@ -32,6 +36,7 @@ export type UltragoalGuardState =
 	| "active_dirty_quality_gate"
 	| "active_review_blocked_unrecorded"
 	| "active_review_blocked_recorded"
+	| "active_missing_critic_verdict"
 	| "unreadable_fail_closed";
 
 export interface UltragoalGuardDiagnostic {
@@ -71,12 +76,12 @@ function objectiveMatches(currentGoal: CurrentGoalLike, plan: UltragoalPlan, ses
 	return plan.goals.some(goal => goal.objective === normalized);
 }
 
-function isKnownUltragoalObjective(currentObjective: string): boolean {
+export function isKnownUltragoalObjective(currentObjective: string): boolean {
 	const normalized = currentObjective.trim();
-	return (
-		normalized === DEFAULT_ULTRAGOAL_OBJECTIVE ||
-		(normalized.includes(".gjc/ultragoal/goals.json") && normalized.includes(".gjc/ultragoal/ledger.jsonl"))
-	);
+	// Exact default aggregate objective only. Substring path sniffing previously
+	// treated arbitrary objectives that merely mentioned goals.json/ledger paths
+	// as Ultragoal-owned, which could mis-arm guards. Prefer fail-closed.
+	return normalized === DEFAULT_ULTRAGOAL_OBJECTIVE;
 }
 
 async function ultragoalReadPaths(
@@ -256,6 +261,31 @@ export function validateCompletionReceipt(input: {
 			goalId: input.goal.id,
 		};
 	}
+	if (input.receiptKind === "final-aggregate") {
+		const checkpointEvent = findLedgerReceiptEvent(input.ledger, receipt);
+		if (checkpointEvent) {
+			const qualityGate =
+				typeof checkpointEvent.qualityGateJson === "object" &&
+				checkpointEvent.qualityGateJson !== null &&
+				!Array.isArray(checkpointEvent.qualityGateJson)
+					? (checkpointEvent.qualityGateJson as Record<string, unknown>)
+					: undefined;
+			const criticReview =
+				qualityGate &&
+				typeof qualityGate.criticReview === "object" &&
+				qualityGate.criticReview !== null &&
+				!Array.isArray(qualityGate.criticReview)
+					? (qualityGate.criticReview as Record<string, unknown>)
+					: undefined;
+			if (criticReview?.verdict !== "OKAY") {
+				return {
+					state: "active_missing_critic_verdict",
+					message: `Ultragoal ${input.goal.id} final aggregate receipt checkpoint requires criticReview with verdict OKAY.`,
+					goalId: input.goal.id,
+				};
+			}
+		}
+	}
 	if (receipt.validationBatch?.role === "deferred-member") {
 		return validateDeferredMemberReceiptFresh({
 			plan: input.plan,
@@ -274,6 +304,15 @@ export function validateCompletionReceipt(input: {
 		receiptKind: input.receiptKind,
 	});
 	if (baseDiagnostic) return baseDiagnostic;
+	if (input.receiptKind === "final-aggregate") {
+		if (terminalCriticCeilingReached(input.ledger) && !terminalCriticGateOverridden(input.ledger)) {
+			return {
+				state: "active_stale_receipt",
+				message: `Ultragoal ${input.goal.id} final aggregate receipt is stale because the terminal-critic ceiling is currently reached.`,
+				goalId: input.goal.id,
+			};
+		}
+	}
 	if (receipt.validationBatch?.role === "batch-close") {
 		for (const memberId of receipt.validationBatch.memberIds) {
 			const member = input.plan.goals.find(goal => goal.id === memberId);
@@ -856,10 +895,10 @@ export interface UltragoalPauseBlockDiagnostic {
 
 /**
  * While an Ultragoal run is active, `goal({"op":"pause"})` is only allowed when the
- * current durable Ultragoal state is readable and the latest durable ledger event
- * classifies the current blocker as `human_blocked`. Resolvable blockers must be
- * worked, not parked. Reads fail closed so unreadable durable state or ledger data
- * blocks pause rather than silently allowing a give-up.
+ * current durable Ultragoal state is readable, the latest `blocker_classified`
+ * event is `human_blocked`, and a later fresh clean pause terminal critic verdict is bound to
+ * that exact classification. Reads fail closed so unreadable durable state or
+ * ledger data blocks pause rather than silently allowing a give-up.
  */
 export async function isUltragoalPauseBlocked(cwd: string): Promise<UltragoalPauseBlockDiagnostic> {
 	if (!cwd) return { blocked: false, reason: "No cwd to resolve durable Ultragoal state." };
@@ -880,14 +919,53 @@ export async function isUltragoalPauseBlocked(cwd: string): Promise<UltragoalPau
 			reason: `Unable to read durable Ultragoal ledger: ${error instanceof Error ? error.message : String(error)}`,
 		};
 	}
-	const latest = ledger.at(-1);
-	if (latest?.event === "blocker_classified" && latest.classification === "human_blocked") {
-		return { blocked: false, reason: "Latest Ultragoal ledger event classifies the blocker as human_blocked." };
+	if (terminalCriticCeilingReached(ledger) && !terminalCriticGateOverridden(ledger)) {
+		return {
+			blocked: true,
+			reason:
+				"The Ultragoal run hit the terminal-critic ceiling; requires human/leader `gjc ultragoal record-critic-gate-override` before further terminal attempts.",
+		};
+	}
+
+	const classification = [...ledger].reverse().find(event => event.event === "blocker_classified");
+	if (classification?.classification !== "human_blocked") {
+		return {
+			blocked: true,
+			reason:
+				"An Ultragoal run is active. Pausing requires the latest blocker_classified event to be human_blocked, followed by a bound clean pause terminal critic verdict.",
+		};
+	}
+	if (typeof classification.eventId !== "string" || !classification.eventId.trim()) {
+		return {
+			blocked: true,
+			reason:
+				"Pausing requires a later fresh clean pause terminal critic OKAY verdict bound to the latest human_blocked blocker_classified event; a REJECT/ITERATE/stale/missing verdict blocks the pause and the run must keep executing.",
+		};
+	}
+	let plan: UltragoalPlan | null;
+	try {
+		plan = await readUltragoalPlan(cwd);
+	} catch (error) {
+		return {
+			blocked: true,
+			reason: `Unable to read durable Ultragoal plan for pause critic verdict: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	if (!plan) {
+		return { blocked: true, reason: "Unable to read durable Ultragoal plan for pause critic verdict." };
+	}
+	const criticVerdict = findCleanPauseCriticVerdict(plan, ledger, classification.eventId);
+	if (!criticVerdict) {
+		return {
+			blocked: true,
+			reason:
+				"Pausing requires a later fresh clean pause terminal critic OKAY verdict bound to the latest human_blocked blocker_classified event; a REJECT/ITERATE/stale/missing verdict blocks the pause and the run must keep executing.",
+		};
 	}
 	return {
-		blocked: true,
+		blocked: false,
 		reason:
-			"An Ultragoal run is active. Pausing requires the current blocker to be classified human_blocked as the latest ledger event.",
+			"Latest blocker_classified event is human_blocked with a later fresh clean bound pause terminal critic verdict.",
 	};
 }
 
@@ -902,7 +980,7 @@ export async function assertUltragoalPauseAllowed(cwd: string): Promise<void> {
 		[
 			diagnostic.reason,
 			"Resolvable blockers must be worked, not paused: investigate, `gjc ultragoal steer --kind add_subgoal`, delegate an executor, or `gjc ultragoal record-review-blockers`.",
-			'If the blocker is genuinely human-only, record `gjc ultragoal classify-blocker --classification human_blocked --evidence "<human-only dependency>"` immediately before pausing.',
+			'If the blocker is genuinely human-only, record `gjc ultragoal classify-blocker --classification human_blocked --evidence "<human-only dependency>"`, then record a clean bound `gjc ultragoal record-critic-verdict --terminus pause --classification-event-id <eventId> --verdict OKAY --evidence "<critic evidence>"` before pausing.',
 		].join("\n"),
 	);
 }

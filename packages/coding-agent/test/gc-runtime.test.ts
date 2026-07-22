@@ -1,4 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	collectGcReport,
 	computeExitCode,
@@ -10,11 +13,41 @@ import {
 	gcProbeToLeasePidStatus,
 	runGjcGcCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { SessionIndex } from "../src/sdk/broker/session-index";
+
+const originalAgentDir = getAgentDir();
+let perTestAgentDir: string;
+
+beforeEach(async () => {
+	perTestAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gc-runtime-agent-"));
+	setAgentDir(perTestAgentDir);
+});
+
+async function sessionIndexAgentDir(): Promise<string> {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gc-session-index-"));
+	setAgentDir(agentDir);
+	return agentDir;
+}
+
+async function appendSessionIndexEvent(agentDir: string): Promise<void> {
+	const index = await new SessionIndex(agentDir).open();
+	await index.append({
+		type: "host_registered",
+		sessionId: "gc-session",
+		locator: { repo: "/tmp/repo", stateRoot: "/tmp/state" },
+		endpointGeneration: 1,
+		pid: process.pid,
+		endpointMtimeMs: Date.now(),
+	});
+}
 
 const originalKill = process.kill.bind(process);
 
-afterEach(() => {
+afterEach(async () => {
 	process.kill = originalKill;
+	setAgentDir(originalAgentDir);
+	await fs.rm(perTestAgentDir, { recursive: true, force: true });
 });
 
 function stubKill(impl: (pid: number) => void): void {
@@ -209,12 +242,23 @@ describe("runGjcGcCommand", () => {
 		expect(result.status).toBe(2);
 		expect(result.stderr).toContain("unknown_flag");
 	});
+	test("rejects repair combined with prune or dry-run", async () => {
+		for (const args of [
+			["--repair-session-index", "--prune"],
+			["--repair-session-index", "--dry-run"],
+		]) {
+			const result = await runGjcGcCommand(args, "/tmp", {}, adapters);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("repair_session_index_cannot_combine");
+		}
+	});
 
 	test("--json emits a report with all five store arrays", async () => {
 		const result = await runGjcGcCommand(["--json"], "/tmp", {}, adapters);
 		expect(result.status).toBe(0);
 		const parsed = JSON.parse(result.stdout);
 		expect(parsed.dry_run).toBe(true);
+		expect(parsed.operation).toBe("dry_run");
 		expect(Object.keys(parsed.stores).sort()).toEqual([
 			"file_locks",
 			"harness_leases",
@@ -252,5 +296,42 @@ describe("runGjcGcCommand", () => {
 		expect(parsed.dry_run).toBe(false);
 		expect(parsed.counts.removed).toBe(1);
 		expect(result.status).toBe(0);
+	});
+
+	test("includes healthy session-index diagnosis in ordinary JSON output", async () => {
+		const agentDir = await sessionIndexAgentDir();
+		await appendSessionIndexEvent(agentDir);
+		const result = await runGjcGcCommand(["--json"], "/tmp", {}, adapters);
+		const report = JSON.parse(result.stdout);
+		expect(report.session_index).toMatchObject({ status: "healthy", valid_prefix_seq: 1 });
+		expect(result.status).toBe(0);
+		await fs.rm(agentDir, { recursive: true, force: true });
+	});
+
+	test("reports corrupt session-index diagnostics without repairing", async () => {
+		const agentDir = await sessionIndexAgentDir();
+		await appendSessionIndexEvent(agentDir);
+		const log = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+		await fs.appendFile(log, "broken\n");
+		const before = await fs.readFile(log, "utf8");
+		const result = await runGjcGcCommand(["--json"], "/tmp", {}, adapters);
+		const report = JSON.parse(result.stdout);
+		expect(report.session_index).toMatchObject({ status: "corrupt", valid_prefix_seq: 1 });
+		expect(await fs.readFile(log, "utf8")).toBe(before);
+		expect(result.status).toBe(1);
+		await fs.rm(agentDir, { recursive: true, force: true });
+	});
+
+	test("fails closed for unsupported session-index versions", async () => {
+		const agentDir = await sessionIndexAgentDir();
+		const log = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+		await fs.mkdir(path.dirname(log), { recursive: true });
+		await fs.writeFile(log, `${JSON.stringify({ version: 99 })}\n`);
+		const result = await runGjcGcCommand(["--json"], "/tmp", {}, adapters);
+		const report = JSON.parse(result.stdout);
+		expect(report.session_index.status).toBe("unsupported");
+		expect(report.session_index.reason).toContain("Unsupported SDK state version");
+		expect(result.status).toBe(1);
+		await fs.rm(agentDir, { recursive: true, force: true });
 	});
 });

@@ -275,30 +275,32 @@ describe("CLI help load order", () => {
 		await fs.mkdir(xdg, { recursive: true });
 		await fs.mkdir(agentDir, { recursive: true });
 
-		const proc = Bun.spawn([process.execPath, cliEntry, "--tmux", "--version"], {
-			cwd: repoRoot,
-			stdout: "pipe",
-			stderr: "pipe",
-			env: {
-				...process.env,
-				HOME: home,
-				XDG_CONFIG_HOME: xdg,
-				XDG_DATA_HOME: xdg,
-				PI_CODING_AGENT_DIR: agentDir,
-				PI_NO_TITLE: "1",
-				NO_COLOR: "1",
-			},
-		});
+		for (const versionFlag of ["--version", "-v"]) {
+			const proc = Bun.spawn([process.execPath, cliEntry, "--tmux", versionFlag], {
+				cwd: repoRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					HOME: home,
+					XDG_CONFIG_HOME: xdg,
+					XDG_DATA_HOME: xdg,
+					PI_CODING_AGENT_DIR: agentDir,
+					PI_NO_TITLE: "1",
+					NO_COLOR: "1",
+				},
+			});
 
-		const [stdout, stderr, exitCode] = await Promise.all([
-			readStream(proc.stdout as ReadableStream<Uint8Array>),
-			readStream(proc.stderr as ReadableStream<Uint8Array>),
-			proc.exited,
-		]);
+			const [stdout, stderr, exitCode] = await Promise.all([
+				readStream(proc.stdout as ReadableStream<Uint8Array>),
+				readStream(proc.stderr as ReadableStream<Uint8Array>),
+				proc.exited,
+			]);
 
-		expect(exitCode).toBe(0);
-		expect(stdout).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
-		expect(stderr).toBe("");
+			expect(exitCode).toBe(0);
+			expect(stdout).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
+			expect(stderr).toBe("");
+		}
 	}, 15_000);
 	it("package bin wrapper executes CLI help when imported by a Bun global shim", async () => {
 		if (Bun.semver.order(Bun.version, "1.3.14") < 0) {

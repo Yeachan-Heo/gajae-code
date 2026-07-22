@@ -1,3 +1,11 @@
+import {
+	classifyStateArgv,
+	STATE_ACTION_NAMES,
+	type StateAction,
+	type StateArgvClassification,
+} from "../gjc-runtime/state-argv";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
+
 export interface BashAllowedPrefixesCheck {
 	allowed: boolean;
 	reason?: string;
@@ -11,9 +19,8 @@ export interface BashRestrictionOptions {
 
 const SHELL_CONTROL_CHARS = new Set([";", "|", "&", "<", ">", "(", ")"]);
 const UNSAFE_UNQUOTED_EXPANSION_CHARS = new Set(["$", "*", "?", "[", "]", "{", "}", "~"]);
-const STATE_FLAGS_WITH_VALUES = new Set(["--input", "--mode", "--session-id", "--thread-id", "--turn-id", "--to"]);
-const STATE_ACTIONS = new Set(["read", "write", "clear", "contract", "handoff"]);
 const ALLOWED_STATE_ACTIONS = new Set(["read", "write", "contract"]);
+const CANONICAL_STATE_TARGETS = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 const READ_ONLY_COMMANDS = new Set(["grep", "rg", "tree", "ls", "pwd", "wc", "du", "file", "stat"]);
 
 function parseShellWords(command: string): { words: string[]; reason?: string } {
@@ -21,6 +28,7 @@ function parseShellWords(command: string): { words: string[]; reason?: string } 
 	let current = "";
 	let quote: "single" | "double" | null = null;
 
+	let wordStarted = false;
 	for (let index = 0; index < command.length; index += 1) {
 		const char = command[index]!;
 		const next = command[index + 1];
@@ -54,10 +62,12 @@ function parseShellWords(command: string): { words: string[]; reason?: string } 
 
 		if (char === "'") {
 			quote = "single";
+			wordStarted = true;
 			continue;
 		}
 		if (char === '"') {
 			quote = "double";
+			wordStarted = true;
 			continue;
 		}
 		if (char === "`" || (char === "$" && next === "(")) {
@@ -73,9 +83,10 @@ function parseShellWords(command: string): { words: string[]; reason?: string } 
 			return { words, reason: `shell expansion character '${char}' is not allowed in restricted bash commands` };
 		}
 		if (/\s/u.test(char)) {
-			if (current.length > 0) {
+			if (wordStarted) {
 				words.push(current);
 				current = "";
+				wordStarted = false;
 			}
 			continue;
 		}
@@ -83,12 +94,13 @@ function parseShellWords(command: string): { words: string[]; reason?: string } 
 			return { words, reason: "backslash escapes are not allowed in restricted bash commands" };
 		}
 		current += char;
+		wordStarted = true;
 	}
 
 	if (quote !== null) {
 		return { words, reason: "unterminated quote in restricted bash command" };
 	}
-	if (current.length > 0) words.push(current);
+	if (wordStarted) words.push(current);
 	return { words };
 }
 
@@ -101,28 +113,62 @@ function wordsStartWith(words: readonly string[], prefix: readonly string[]): bo
 	return prefix.every((word, index) => words[index] === word);
 }
 
-function parseStateAction(words: readonly string[]): string | undefined {
-	const args = words.slice(2);
-	const positional: string[] = [];
-	let skipNext = false;
-	for (const arg of args) {
-		if (skipNext) {
-			skipNext = false;
-			continue;
-		}
-		if (STATE_FLAGS_WITH_VALUES.has(arg)) {
-			skipNext = true;
-			continue;
-		}
-		if (!arg.startsWith("-")) positional.push(arg);
+function malformedStateShape(): StateActionClassification {
+	return { reason: "restricted role-agent bash only allows documented `gjc state` action shapes" };
+}
+
+interface ParsedStateAction {
+	action: string;
+	target: string;
+}
+
+interface StateActionClassification {
+	parsed?: ParsedStateAction;
+	reason?: string;
+}
+
+function hasDocumentedStatePositionals(classification: StateArgvClassification): boolean {
+	const [first, second, third] = classification.positionals;
+	if (third) return false;
+	if (!second) return true;
+	return STATE_ACTION_NAMES.has(first as StateAction) || STATE_ACTION_NAMES.has(second as StateAction);
+}
+
+function classifyStateAction(words: readonly string[]): StateActionClassification {
+	const classification = classifyStateArgv(words.slice(2));
+	if (
+		classification.unknownFlags.length > 0 ||
+		classification.flags.some(flag => flag.malformed) ||
+		!hasDocumentedStatePositionals(classification)
+	) {
+		return malformedStateShape();
 	}
 
-	const [first, second, third] = positional;
-	if (!first) return "read";
-	if (STATE_ACTIONS.has(first)) return second ? undefined : first;
-	if (!second) return "read";
-	if (!STATE_ACTIONS.has(second)) return undefined;
-	return third ? undefined : second;
+	const modeFlags = classification.flags.filter(flag => flag.name === "--mode");
+	const inputFlags = classification.flags.filter(flag => flag.name === "--input");
+	if (modeFlags.length > 1 || inputFlags.length > 1) {
+		return { reason: "restricted role-agent bash rejects repeated or conflicting `gjc state` target selectors" };
+	}
+	if (classification.inputs.some(input => input.kind === "file")) {
+		return { reason: "restricted role-agent bash does not allow file-backed `gjc state --input` values" };
+	}
+	if (classification.inputs.some(input => input.kind === "invalid")) return malformedStateShape();
+
+	const runtimeTarget = classification.runtimeSelectorCandidates.find(candidate => candidate.value)?.value;
+	const suppliedTargets = classification.selectorCandidates
+		.map(candidate => candidate.value)
+		.filter((target): target is string => target !== undefined);
+	const distinctTargets = new Set(suppliedTargets);
+	if (distinctTargets.size > 1 || (runtimeTarget && suppliedTargets.some(target => target !== runtimeTarget))) {
+		return {
+			reason:
+				"restricted role-agent bash rejects conflicting `gjc state` selectors that disagree with runtime precedence",
+		};
+	}
+	if (!runtimeTarget || !CANONICAL_STATE_TARGETS.has(runtimeTarget)) {
+		return { reason: "restricted role-agent bash requires a canonical workflow skill for `gjc state` commands" };
+	}
+	return { parsed: { action: classification.effectiveAction, target: runtimeTarget } };
 }
 
 function optionWords(words: readonly string[]): string[] {
@@ -189,15 +235,19 @@ function validateMatchedGjcCommand(words: readonly string[]): BashAllowedPrefixe
 	}
 
 	if (words[1] === "state") {
-		const action = parseStateAction(words);
-		if (!action) {
+		const classification = classifyStateAction(words);
+		if (!classification.parsed) {
 			return {
 				allowed: false,
-				reason: "restricted role-agent bash only allows documented `gjc state` action shapes",
+				reason:
+					classification.reason ?? "restricted role-agent bash only allows documented `gjc state` action shapes",
 			};
 		}
-		if (!ALLOWED_STATE_ACTIONS.has(action)) {
-			return { allowed: false, reason: `restricted role-agent bash does not allow \`gjc state ${action}\`` };
+		if (!ALLOWED_STATE_ACTIONS.has(classification.parsed.action)) {
+			return {
+				allowed: false,
+				reason: `restricted role-agent bash does not allow \`gjc state ${classification.parsed.action}\``,
+			};
 		}
 		return { allowed: true };
 	}

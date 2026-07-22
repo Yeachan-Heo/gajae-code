@@ -8,9 +8,12 @@ import type { SessionMessageEntry } from "../../session/session-manager";
 import { parseSessionEntries } from "../../session/session-manager";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
 import { theme } from "../theme/theme";
+import {
+	buildToolTranscriptEntry,
+	composeToolText,
+	createToolTranscriptRenderDescriptor,
+} from "./tool-transcript-format";
 import { type TranscriptViewerEntry, TranscriptViewerOverlay } from "./transcript-viewer-overlay";
-
-const MAX_TOOL_ARGS_CHARS = 500;
 
 /** Session-observer adapter. The shared viewer owns navigation and fold state. */
 export class SessionObserverOverlayComponent extends TranscriptViewerOverlay {
@@ -149,7 +152,7 @@ export class SessionObserverOverlayComponent extends TranscriptViewerOverlay {
 	}
 }
 
-function entriesFromMessages(entries: readonly SessionMessageEntry[]): TranscriptViewerEntry[] {
+export function entriesFromMessages(entries: readonly SessionMessageEntry[]): TranscriptViewerEntry[] {
 	const results = new Map<string, ToolResultMessage>();
 	for (const entry of entries)
 		if (entry.message.role === "toolResult") results.set(entry.message.toolCallId, entry.message);
@@ -191,25 +194,42 @@ function entriesFromMessages(entries: readonly SessionMessageEntry[]): Transcrip
 							.map(part => part.text)
 							.join("\n")
 							.trim() ?? "";
-					const summary = formatToolArgs(content.name, content.arguments);
-					const callText = [summary, content.intent].filter(Boolean).join("\n");
-					const resultDisplay = result?.isError ? `✗ ${resultText || "Error"}` : resultText || "✓ done";
-					output.push({
-						id: `tool:${content.id}`,
-						kind: "tool",
-						label: content.name,
-						payload: {
-							text: [callText, resultDisplay].filter(Boolean).join("\n"),
-							metadata: {
-								name: content.name,
-								arguments: content.arguments,
-								intent: content.intent,
-								isError: result?.isError ?? false,
-							},
-							source: { call: content, result },
+					const canonicalPayload = {
+						text: composeToolText({
+							name: content.name,
+							args: content.arguments,
+							intent: content.intent,
+							resultText,
+							isError: result?.isError ?? false,
+							hasResult: results.has(content.id),
+						}),
+						metadata: {
+							name: content.name,
+							arguments: content.arguments,
+							intent: content.intent,
+							resultText,
+							isError: result?.isError ?? false,
+							hasResult: results.has(content.id),
+							detailsData: result?.details,
 						},
-						foldable: true,
-					});
+						source: { call: content, result },
+					};
+					output.push(
+						buildToolTranscriptEntry({
+							canonicalPayload,
+							renderDescriptor: createToolTranscriptRenderDescriptor({
+								name: content.name,
+								args: content.arguments,
+								intent: content.intent,
+								resultContent: resultText,
+								isError: result?.isError,
+								hasResult: results.has(content.id),
+								detailsData: result?.details,
+							}),
+							capabilities: { copyable: true, foldable: true, rawViewable: true },
+							identity: { id: `tool:${content.id}`, label: content.name, display: "full" },
+						}),
+					);
 				}
 			});
 		}
@@ -232,23 +252,6 @@ function entriesFromMessages(entries: readonly SessionMessageEntry[]): Transcrip
 		}
 	}
 	return output;
-}
-
-function formatToolArgs(name: string, args: Record<string, unknown>): string {
-	if (name === "read" || name === "write" || name === "edit") return args.path ? `path: ${args.path}` : "";
-	if (name === "bash") return typeof args.command === "string" ? args.command.replaceAll("\t", "    ") : "";
-	if (name === "search")
-		return [
-			args.pattern ? `pattern: ${args.pattern}` : "",
-			Array.isArray(args.paths) ? `paths: ${args.paths.join(", ")}` : "",
-		]
-			.filter(Boolean)
-			.join(", ");
-	return Object.entries(args)
-		.filter(([key]) => !key.startsWith("_"))
-		.map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
-		.join(", ")
-		.slice(0, MAX_TOOL_ARGS_CHARS);
 }
 
 function truncateThinking(text: string, expanded: boolean): string {

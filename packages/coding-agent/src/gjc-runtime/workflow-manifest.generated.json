@@ -1515,10 +1515,58 @@
           "record-review-blockers",
           "steer",
           "classify-blocker",
+          "record-critic-verdict",
+          "record-critic-gate-override",
           "rebaseline-pipeline-overlap"
         ],
         "name": "evidence",
         "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "record-critic-verdict"
+        ],
+        "enumValues": [
+          "completion",
+          "pause"
+        ],
+        "name": "terminus",
+        "required": true,
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "record-critic-verdict"
+        ],
+        "enumValues": [
+          "OKAY",
+          "ITERATE",
+          "REJECT"
+        ],
+        "name": "verdict",
+        "required": true,
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "record-critic-verdict"
+        ],
+        "name": "blockers-json",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "record-critic-verdict"
+        ],
+        "name": "goal-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "record-critic-verdict"
+        ],
+        "name": "classification-event-id",
         "type": "string"
       },
       {
@@ -1743,6 +1791,8 @@
           "record-review-blockers",
           "steer",
           "classify-blocker",
+          "record-critic-verdict",
+          "record-critic-gate-override",
           "start-pipeline-overlap",
           "join-pipeline-overlap",
           "rebaseline-pipeline-overlap"
@@ -1828,6 +1878,14 @@
       },
       {
         "name": "classify-blocker",
+        "surface": "command-positional"
+      },
+      {
+        "name": "record-critic-verdict",
+        "surface": "command-positional"
+      },
+      {
+        "name": "record-critic-gate-override",
         "surface": "command-positional"
       },
       {

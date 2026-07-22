@@ -119,6 +119,11 @@ async function writeDogfoodArtifacts(
 
 function qualityGate(): Record<string, unknown> {
 	return {
+		criticReview: {
+			verdict: "OKAY",
+			evidence: "critic approved the final aggregate dogfood completion",
+			blockers: [],
+		},
 		architectReview: {
 			architectureStatus: "CLEAR",
 			productStatus: "CLEAR",

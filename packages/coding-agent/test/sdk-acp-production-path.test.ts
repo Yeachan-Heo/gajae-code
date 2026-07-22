@@ -333,6 +333,42 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
 	await Bun.sleep(20);
 	expect(firstSettled).toBe(false);
+	promptSocket!.send(
+		JSON.stringify({
+			type: "event",
+			payload: {
+				event_type: "message_update",
+				event: {
+					type: "message_update",
+					message: { role: "assistant", content: [{ type: "text", text: "first" }] },
+					assistantMessageEvent: { type: "text_delta", delta: "first" },
+				},
+			},
+		}),
+	);
+	for (const text of ["first", "second"]) {
+		promptSocket!.send(
+			JSON.stringify({
+				type: "event",
+				payload: {
+					event_type: "message_end",
+					event: {
+						type: "message_end",
+						message: { role: "assistant", content: [{ type: "text", text }] },
+					},
+				},
+			}),
+		);
+	}
+	await waitFor(
+		() => updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").length === 2,
+		"per-message ACP chunks",
+	);
+	expect(
+		updates
+			.filter(update => update.update.sessionUpdate === "agent_message_chunk")
+			.map(update => (update.update as { content: { text: string } }).content.text),
+	).toEqual(["first", "second"]);
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
 	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
 	expect(await bounded(firstPrompt, "first prompt completion")).toEqual({ stopReason: "end_turn" });
@@ -358,12 +394,9 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		updates.filter(update => {
 			const payload = update.update as {
 				sessionUpdate?: string;
-				content?: Array<{ content?: { text?: string } }>;
+				content?: { text?: string };
 			};
-			return (
-				payload.sessionUpdate === "agent_message_chunk" &&
-				payload.content?.some(item => /failed/i.test(item.content?.text ?? ""))
-			);
+			return payload.sessionUpdate === "agent_message_chunk" && /failed/i.test(payload.content?.text ?? "");
 		}),
 	).toHaveLength(0);
 	const abortFailurePrompt = agent.prompt({

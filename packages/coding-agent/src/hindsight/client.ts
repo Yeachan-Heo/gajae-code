@@ -12,6 +12,8 @@ import type { HindsightConfig } from "./config";
 
 const USER_AGENT = "oh-my-gajae-code";
 const DEFAULT_USER_AGENT = USER_AGENT;
+const REQUEST_TIMEOUT_MS = 30_000;
+const RESPONSE_MAX_BYTES = 8 * 1024 * 1024;
 
 export type Budget = "low" | "mid" | "high" | string;
 export type TagsMatch = "any" | "all" | "any_strict" | "all_strict";
@@ -208,6 +210,49 @@ interface RequestOptions {
 	query?: Record<string, unknown>;
 	/** Return null instead of throwing on a 404 response. */
 	allow404?: boolean;
+}
+
+class ResponseTooLargeError extends Error {}
+
+async function readResponseText(response: Response): Promise<string> {
+	const contentLength = response.headers.get("content-length");
+	if (contentLength !== null) {
+		const declaredBytes = Number(contentLength);
+		if (Number.isFinite(declaredBytes) && declaredBytes > RESPONSE_MAX_BYTES) {
+			void response.body?.cancel().catch(() => undefined);
+			throw new ResponseTooLargeError();
+		}
+	}
+
+	const reader = response.body?.getReader();
+	if (!reader) return "";
+
+	const chunks: Uint8Array[] = [];
+	let totalBytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value || value.byteLength === 0) continue;
+
+			totalBytes += value.byteLength;
+			if (totalBytes > RESPONSE_MAX_BYTES) {
+				void reader.cancel().catch(() => undefined);
+				throw new ResponseTooLargeError();
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	const bytes = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return new TextDecoder().decode(bytes);
 }
 
 export class HindsightApi {
@@ -489,7 +534,8 @@ export class HindsightApi {
 			if (qs) url += `?${qs}`;
 		}
 
-		const init: RequestInit = { method, headers: this.#headers };
+		const requestSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+		const init: RequestInit = { method, headers: this.#headers, signal: requestSignal };
 		if (opts?.body !== undefined) {
 			init.body = JSON.stringify(pruneUndefined(opts.body));
 		}
@@ -498,6 +544,9 @@ export class HindsightApi {
 		try {
 			response = await fetch(url, init);
 		} catch (err) {
+			if (requestSignal.aborted) {
+				throw new HindsightError(`${operation} request failed: timed out`);
+			}
 			throw new HindsightError(
 				`${operation} request failed: ${err instanceof Error ? err.message : String(err)}`,
 				undefined,
@@ -506,10 +555,24 @@ export class HindsightApi {
 		}
 
 		if (opts?.allow404 && response.status === 404) {
+			await response.body?.cancel().catch(() => undefined);
 			return null as T;
 		}
 
-		const text = await response.text();
+		let text: string;
+		try {
+			text = await readResponseText(response);
+		} catch (err) {
+			const reason = requestSignal.aborted
+				? "timed out"
+				: err instanceof ResponseTooLargeError
+					? "response exceeded size limit"
+					: "response could not be read";
+			throw new HindsightError(`${operation} request failed: ${reason}`, response.status);
+		}
+		if (requestSignal.aborted) {
+			throw new HindsightError(`${operation} request failed: timed out`, response.status);
+		}
 		const parsed = text ? safeJsonParse(text) : null;
 
 		if (!response.ok) {

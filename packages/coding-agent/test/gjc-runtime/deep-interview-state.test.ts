@@ -1,15 +1,23 @@
 import { describe, expect, it } from "bun:test";
+import { deriveDeepInterviewHud } from "@gajae-code/coding-agent/skill-state/workflow-hud";
 import {
+	assertDeepInterviewEnvelopeInputLimits,
+	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentReview,
+	assertDeepInterviewStructuredResponseWithinLimit,
 	createDeepInterviewIntentManifest,
+	DEEP_INTERVIEW_FREETEXT_FIELDS,
 	deepInterviewObservedIntentDigest,
 	deriveRoundKey,
+	isDeepInterviewFreeTextField,
+	MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
+	MAX_INITIAL_CONTEXT_LENGTH,
+	MAX_USER_RESPONSE_LENGTH,
 	mergeDeepInterviewEnvelope,
 	mergeDeepInterviewRounds,
 	normalizeDeepInterviewEnvelope,
 	reviewDeepInterviewIntent,
-} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
-import { deriveDeepInterviewHud } from "@gajae-code/coding-agent/skill-state/workflow-hud";
+} from "../../src/gjc-runtime/deep-interview-state";
 
 function inner(envelope: { state?: Record<string, unknown> }): Record<string, unknown> {
 	return (envelope.state ?? {}) as Record<string, unknown>;
@@ -367,5 +375,85 @@ describe("deep-interview-state: intent contract", () => {
 			{ replace: true },
 		);
 		expect(preserved.state).toMatchObject({ intent_contract_required: true, intent_contract: locked, rounds: [] });
+	});
+});
+
+describe("deep-interview-state: free-text field allowlist + input size limits", () => {
+	it("marks prose fields as free-text and structural fields as not", () => {
+		expect(isDeepInterviewFreeTextField("initial_context")).toBe(true);
+		expect(isDeepInterviewFreeTextField("user_response")).toBe(true);
+		expect(isDeepInterviewFreeTextField("goal")).toBe(true);
+		expect(isDeepInterviewFreeTextField("id")).toBe(false);
+		expect(isDeepInterviewFreeTextField("category")).toBe(false);
+		expect(DEEP_INTERVIEW_FREETEXT_FIELDS.has("description")).toBe(true);
+	});
+
+	it("accepts shell metacharacters in free-text prose within the size cap", () => {
+		const prose = "run `git status`; echo $(pwd) | grep x && true";
+		expect(() => assertDeepInterviewInputWithinLimit(prose, MAX_USER_RESPONSE_LENGTH, "user_response")).not.toThrow();
+	});
+
+	it("enforces the size caps", () => {
+		expect(() =>
+			assertDeepInterviewInputWithinLimit(
+				"x".repeat(MAX_INITIAL_CONTEXT_LENGTH + 1),
+				MAX_INITIAL_CONTEXT_LENGTH,
+				"initial_context",
+			),
+		).toThrow(/exceeds max length/);
+		expect(() =>
+			assertDeepInterviewInputWithinLimit("x".repeat(MAX_USER_RESPONSE_LENGTH), MAX_USER_RESPONSE_LENGTH),
+		).not.toThrow();
+	});
+
+	it("bounds one serialized structured response using JavaScript Unicode string length", () => {
+		const propertyOverhead = JSON.stringify({ response: "" }).length;
+		const exact = { response: "한".repeat(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH - propertyOverhead) };
+		const oversized = { response: "한".repeat(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH - propertyOverhead + 1) };
+
+		expect(JSON.stringify(exact)).toHaveLength(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH);
+		expect(() => assertDeepInterviewStructuredResponseWithinLimit(exact)).not.toThrow();
+		expect(JSON.stringify(oversized)).toHaveLength(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH + 1);
+		expect(() => assertDeepInterviewStructuredResponseWithinLimit(oversized)).toThrow(
+			"structured deep-interview response exceeds max length 100000",
+		);
+	});
+
+	it("allows optional undefined object fields that JSON serialization omits", () => {
+		expect(() =>
+			assertDeepInterviewStructuredResponseWithinLimit({
+				question: "What is the boundary?",
+				round_id: undefined,
+				customInput: undefined,
+			}),
+		).not.toThrow();
+	});
+	it("rejects non-serializable structured responses", () => {
+		const cyclic: { self?: unknown } = {};
+		cyclic.self = cyclic;
+		expect(() => assertDeepInterviewStructuredResponseWithinLimit(cyclic)).toThrow(
+			"invalid structured deep-interview response",
+		);
+	});
+
+	it("bounds legacy round answer aliases before persistence without constraining generated answer objects", () => {
+		const exact = "😀".repeat(MAX_USER_RESPONSE_LENGTH);
+		for (const field of ["custom_input", "customInput", "user_response", "answer"] as const) {
+			expect(() =>
+				assertDeepInterviewEnvelopeInputLimits({ state: { rounds: [{ [field]: exact }] } }),
+			).not.toThrow();
+			expect(() =>
+				assertDeepInterviewEnvelopeInputLimits({ state: { rounds: [{ [field]: `${exact}😀` }] } }),
+			).toThrow(`state.rounds[0].${field} exceeds max length 10000`);
+		}
+		expect(() =>
+			assertDeepInterviewEnvelopeInputLimits({ state: { rounds: [{ lifecycle: "scored", answer: { score: 1 } }] } }),
+		).not.toThrow();
+	});
+
+	it("pins the documented cap values", () => {
+		expect(MAX_INITIAL_CONTEXT_LENGTH).toBe(50_000);
+		expect(MAX_USER_RESPONSE_LENGTH).toBe(10_000);
+		expect(MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH).toBe(100_000);
 	});
 });

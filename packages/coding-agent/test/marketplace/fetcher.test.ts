@@ -1,7 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as dns from "node:dns/promises";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
+import * as http from "node:http";
+import * as https from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Readable } from "node:stream";
 
 import {
 	classifySource,
@@ -11,6 +16,37 @@ import {
 
 // Fixture lives at test/marketplace/fixtures/valid-marketplace/
 const FIXTURE_DIR = path.join(import.meta.dir, "fixtures", "valid-marketplace");
+const MAX_CATALOG_BYTES = 2 * 1024 * 1024;
+const CORE_HTTP_REQUEST = http.request;
+
+function response(
+	body: string | Uint8Array,
+	options: { status?: number; headers?: http.IncomingHttpHeaders; peer?: string; rawHeaders?: string[] } = {},
+) {
+	const message = Readable.from([body]) as unknown as http.IncomingMessage;
+	Object.defineProperties(message, {
+		headers: { value: options.headers ?? {} },
+		rawHeaders: { value: options.rawHeaders ?? [] },
+		socket: { value: { remoteAddress: options.peer ?? "8.8.8.8" } },
+		statusCode: { value: options.status ?? 200 },
+		statusMessage: { value: "Test" },
+	});
+	return message;
+}
+
+function mockHttpRequests(nextResponse: (options: https.RequestOptions, call: number) => http.IncomingMessage) {
+	const requests: https.RequestOptions[] = [];
+	const request = ((options: https.RequestOptions, callback?: (message: http.IncomingMessage) => void) => {
+		requests.push(options);
+		const client = new EventEmitter() as EventEmitter & { destroy: () => void; end: () => void };
+		client.destroy = () => {};
+		client.end = () => queueMicrotask(() => callback?.(nextResponse(options, requests.length)));
+		return client as unknown as http.ClientRequest;
+	}) as typeof http.request;
+	vi.spyOn(http, "request").mockImplementation(request);
+	vi.spyOn(https, "request").mockImplementation(request as typeof https.request);
+	return requests;
+}
 
 // ── classifySource ────────────────────────────────────────────────────
 
@@ -153,9 +189,11 @@ describe("fetchMarketplace", () => {
 
 	beforeEach(() => {
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-fetcher-test-"));
+		vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ordinary fetch must not run"));
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	});
 
@@ -178,6 +216,212 @@ describe("fetchMarketplace", () => {
 		// Use a path that resolves within tmpDir but doesn't exist
 		const fakeSrc = path.join(tmpDir, "ghost-marketplace");
 		await expect(fetchMarketplace(fakeSrc, tmpDir)).rejects.toThrow(/Marketplace catalog not found/);
+	});
+
+	it("binds a hostname request to the single approved DNS answer", async () => {
+		let resolution = 0;
+		const dnsLookup = vi
+			.spyOn(dns, "lookup")
+			.mockImplementation((async () => [
+				{ address: resolution++ === 0 ? "8.8.8.8" : "127.0.0.1", family: 4 },
+			]) as unknown as typeof dns.lookup);
+		const requests = mockHttpRequests(() =>
+			response(JSON.stringify({ name: "remote-market", owner: { name: "x" }, plugins: [] }), {
+				peer: "::ffff:8.8.8.8",
+			}),
+		);
+
+		await fetchMarketplace("https://rebind.example/marketplace.json", tmpDir);
+
+		expect(dnsLookup).toHaveBeenCalledTimes(1);
+		expect(globalThis.fetch).not.toHaveBeenCalled();
+		expect(requests[0]?.agent).toBe(false);
+		expect(requests[0]?.headers).toMatchObject({ Connection: "close", Host: "rebind.example" });
+		expect(requests[0]).toMatchObject({
+			insecureHTTPParser: false,
+			maxHeaderSize: 16 * 1024,
+			rejectUnauthorized: true,
+			servername: "rebind.example",
+		});
+		expect(requests[0]?.lookup).toBeFunction();
+		const allCallback = vi.fn();
+		requests[0]?.lookup?.("rebind.example", { all: true }, allCallback);
+		expect(allCallback).toHaveBeenCalledWith(null, [{ address: "8.8.8.8", family: 4 }]);
+		for (const [hostname, family] of [
+			["other.example", 4],
+			["rebind.example", 6],
+		] as const) {
+			const rejectedCallback = vi.fn();
+			requests[0]?.lookup?.(hostname, { family }, rejectedCallback);
+			expect(rejectedCallback.mock.calls[0]?.[0]).toMatchObject({ code: "ENOTFOUND" });
+		}
+	});
+
+	it("passes the pinned lookup and original Host through core http.request", async () => {
+		vi.spyOn(dns, "lookup").mockImplementation((async () => [
+			{ address: "8.8.8.8", family: 4 },
+		]) as unknown as typeof dns.lookup);
+		const requests = mockHttpRequests(() =>
+			response(JSON.stringify({ name: "core-proof", owner: { name: "x" }, plugins: [] })),
+		);
+		await fetchMarketplace("http://pinned.example/marketplace.json", tmpDir);
+
+		const hostSeen = Promise.withResolvers<string>();
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				hostSeen.resolve(request.headers.get("host") ?? "");
+				return new Response();
+			},
+		});
+		const finished = Promise.withResolvers<void>();
+		const coreRequest = CORE_HTTP_REQUEST(
+			{
+				...requests[0],
+				port: server.port,
+				lookup: (hostname, options, callback) =>
+					requests[0]?.lookup?.(hostname, options, (error, approved, family) => {
+						const selected = typeof approved === "string" ? approved : approved[0]?.address;
+						expect(selected).toBe("8.8.8.8");
+						const local = typeof approved === "string" ? "127.0.0.1" : [{ address: "127.0.0.1", family: 4 }];
+						callback(error, local, family);
+					}),
+			},
+			response => {
+				response.resume();
+				response.once("end", finished.resolve);
+			},
+		);
+		try {
+			coreRequest.once("error", finished.reject);
+			coreRequest.end();
+			await finished.promise;
+			expect(await hostSeen.promise).toBe("pinned.example");
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	it("preserves public IP literals and omits SNI for HTTPS literals", async () => {
+		const requests = mockHttpRequests((_options, call) =>
+			response(JSON.stringify({ name: `literal-${call}`, owner: { name: "x" }, plugins: [] }), {
+				peer: call === 1 ? "8.8.8.8" : "2606:4700:4700::1111",
+			}),
+		);
+		await fetchMarketplace("https://8.8.8.8/marketplace.json", tmpDir);
+		await fetchMarketplace("http://[2606:4700:4700::1111]/marketplace.json", tmpDir);
+		expect(requests[0]).toMatchObject({ hostname: "8.8.8.8", servername: undefined });
+		expect(requests[1]).toMatchObject({ hostname: "2606:4700:4700::1111" });
+		expect(requests[1]?.headers).toMatchObject({ Host: "[2606:4700:4700::1111]" });
+	});
+
+	it("rejects a connected peer outside the approved DNS answers before caching", async () => {
+		vi.spyOn(dns, "lookup").mockImplementation((async () => [
+			{ address: "8.8.8.8", family: 4 },
+		]) as unknown as typeof dns.lookup);
+		const message = response(JSON.stringify({ name: "peer-mismatch", owner: { name: "x" }, plugins: [] }), {
+			peer: "127.0.0.1",
+		});
+		const destroy = vi.spyOn(message, "destroy");
+		mockHttpRequests(() => message);
+
+		await expect(fetchMarketplace("http://rebind.example/marketplace.json", tmpDir)).rejects.toThrow(
+			/connected peer/,
+		);
+
+		expect(destroy).toHaveBeenCalled();
+		expect(fs.readdirSync(tmpDir)).toEqual([]);
+	});
+
+	it("rejects credentialed and private targets before opening a request", async () => {
+		const requests = mockHttpRequests(() => response(""));
+
+		for (const source of ["http://user@8.8.8.8/marketplace.json", "http://127.0.0.1/marketplace.json"]) {
+			await expect(fetchMarketplace(source, tmpDir)).rejects.toThrow(/not public HTTP\(S\)/);
+		}
+		expect(requests).toHaveLength(0);
+	});
+
+	it("revalidates redirects before opening the next request", async () => {
+		const requests = mockHttpRequests(() =>
+			response("", { status: 302, headers: { location: "http://127.0.0.1/marketplace.json" } }),
+		);
+
+		await expect(fetchMarketplace("http://8.8.8.8/marketplace.json", tmpDir)).rejects.toThrow(/not public HTTP\(S\)/);
+		expect(requests).toHaveLength(1);
+	});
+
+	it("rejects missing redirect locations and excessive redirect chains", async () => {
+		let requests = mockHttpRequests(() => response("", { status: 302 }));
+		await expect(fetchMarketplace("http://8.8.8.8/marketplace.json", tmpDir)).rejects.toThrow(/Location/);
+		expect(requests).toHaveLength(1);
+
+		vi.restoreAllMocks();
+		requests = mockHttpRequests(() => response("", { status: 302, headers: { location: "/marketplace.json" } }));
+		await expect(fetchMarketplace("http://8.8.8.8/marketplace.json", tmpDir)).rejects.toThrow(/redirects/);
+		expect(requests).toHaveLength(6);
+	});
+
+	it("rejects declared and chunked bodies above two MiB", async () => {
+		let message = response("", { headers: { "content-length": String(MAX_CATALOG_BYTES + 1) } });
+		let destroy = vi.spyOn(message, "destroy");
+		mockHttpRequests(() => message);
+		await expect(fetchMarketplace("http://8.8.8.8/marketplace.json", tmpDir)).rejects.toThrow(/2 MiB/);
+		expect(destroy).toHaveBeenCalled();
+
+		vi.restoreAllMocks();
+		message = response(new Uint8Array(MAX_CATALOG_BYTES + 1));
+		destroy = vi.spyOn(message, "destroy");
+		mockHttpRequests(() => message);
+		await expect(fetchMarketplace("http://8.8.8.8/marketplace.json", tmpDir)).rejects.toThrow(/2 MiB/);
+		expect(destroy).toHaveBeenCalled();
+	});
+
+	it("rejects duplicate Content-Length and Content-Length plus Transfer-Encoding", async () => {
+		const framingCases: Array<[string[], string, RegExp]> = [
+			[["Content-Length", "1", "Content-Length", "1"], "1", /framing/],
+			[["Content-Length", "1", "Transfer-Encoding", "chunked"], "1", /framing/],
+			[["Content-Length", "invalid"], "invalid", /Content-Length/],
+		];
+		for (const [rawHeaders, contentLength, expected] of framingCases) {
+			const message = response("x", { headers: { "content-length": contentLength }, rawHeaders });
+			mockHttpRequests(() => message);
+			await expect(fetchMarketplace("http://8.8.8.8/marketplace.json", tmpDir)).rejects.toThrow(expected);
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("destroys an in-flight request when the single deadline aborts", async () => {
+		const controller = new AbortController();
+		vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+		const opened = Promise.withResolvers<void>();
+		const client = new EventEmitter() as EventEmitter & { destroy: () => void; end: () => void };
+		client.destroy = vi.fn();
+		client.end = opened.resolve;
+		vi.spyOn(http, "request").mockReturnValue(client as unknown as http.ClientRequest);
+		const operation = fetchMarketplace("http://8.8.8.8/marketplace.json", tmpDir);
+		await opened.promise;
+		controller.abort(new DOMException("deadline", "TimeoutError"));
+		await expect(operation).rejects.toThrow(/Timed out/);
+		expect(client.destroy).toHaveBeenCalled();
+		expect(fs.readdirSync(tmpDir)).toEqual([]);
+	});
+
+	it("follows a bounded public redirect and caches a valid catalog", async () => {
+		const catalog = JSON.stringify({ name: "redirect-market", owner: { name: "x" }, plugins: [] });
+		const requests = mockHttpRequests((_options, call) =>
+			call === 1
+				? response("", { status: 302, headers: { location: "http://1.1.1.1/catalog.json" } })
+				: response(catalog, { peer: "1.1.1.1" }),
+		);
+
+		const result = await fetchMarketplace("http://8.8.8.8/marketplace.json", tmpDir);
+
+		expect(result.catalog.name).toBe("redirect-market");
+		expect(requests).toHaveLength(2);
+		expect(requests[1]?.signal).toBe(requests[0]?.signal);
+		expect(fs.readFileSync(path.join(tmpDir, "redirect-market", "marketplace.json"), "utf8")).toBe(catalog);
 	});
 
 	// Network-dependent tests — skip in CI / offline environments.

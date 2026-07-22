@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, getPuppeteerDir, logger } from "@gajae-code/utils";
+import { getPuppeteerDir } from "@gajae-code/utils/dirs";
+import * as logger from "@gajae-code/utils/logger";
+import { $which } from "@gajae-code/utils/which";
 import * as browsers from "@puppeteer/browsers";
 import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
 import { PUPPETEER_REVISIONS } from "puppeteer-core/internal/revisions.js";

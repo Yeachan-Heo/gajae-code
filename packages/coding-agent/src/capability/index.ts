@@ -41,6 +41,8 @@ const disabledProviders = new Set<string>();
 
 /** Settings manager for persistence (if set) */
 let settings: Settings | null = null;
+/** Session-local settings keyed by normalized working directory. */
+const settingsByCwd = new Map<string, Settings>();
 
 // =============================================================================
 // Registration API
@@ -208,8 +210,9 @@ async function loadImpl<T>(
  * Filter providers based on options and disabled state.
  */
 function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
-	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledProviders.has(p.id));
-
+	const activeSettings = options.settings ?? settingsByCwd.get(path.normalize(options.cwd ?? getProjectDir()));
+	const activeDisabledProviders = new Set(activeSettings?.get("disabledProviders") ?? disabledProviders);
+	let providers = (capability.providers as Provider<T>[]).filter(p => !activeDisabledProviders.has(p.id));
 	if (options.providers) {
 		const allowed = new Set(options.providers);
 		providers = providers.filter(p => allowed.has(p.id));
@@ -249,63 +252,68 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
  * Call this once on startup to enable persistent provider state.
  */
 export function initializeWithSettings(activeSettings: Settings): void {
+	settingsByCwd.set(path.normalize(activeSettings.getCwd()), activeSettings);
 	settings = activeSettings;
-	// Load disabled providers from settings
-	const disabled = settings.get("disabledProviders");
+	const disabled = activeSettings.get("disabledProviders");
 	disabledProviders.clear();
-	for (const id of disabled) {
-		disabledProviders.add(id);
-	}
+	for (const id of disabled) disabledProviders.add(id);
 }
 
 /**
  * Persist current disabled providers to settings.
  */
-function persistDisabledProviders(): void {
-	if (settings) {
-		settings.set("disabledProviders", Array.from(disabledProviders));
-	}
+function persistDisabledProviders(activeSettings: Settings, providers: ReadonlySet<string>): void {
+	activeSettings.set("disabledProviders", Array.from(providers));
 }
 
-/**
- * Disable a provider globally (across all capabilities).
- */
-export function disableProvider(providerId: string): void {
-	disabledProviders.add(providerId);
-	persistDisabledProviders();
+/** Disable a provider for the supplied session settings. */
+export function disableProvider(
+	providerId: string,
+	activeSettings: Settings = settings ??
+		(() => {
+			throw new Error("Capability settings unavailable");
+		})(),
+): void {
+	const providers = new Set(activeSettings.get("disabledProviders"));
+	providers.add(providerId);
+	persistDisabledProviders(activeSettings, providers);
 }
 
-/**
- * Enable a previously disabled provider.
- */
-export function enableProvider(providerId: string): void {
-	disabledProviders.delete(providerId);
-	persistDisabledProviders();
+/** Enable a provider for the supplied session settings. */
+export function enableProvider(
+	providerId: string,
+	activeSettings: Settings = settings ??
+		(() => {
+			throw new Error("Capability settings unavailable");
+		})(),
+): void {
+	const providers = new Set(activeSettings.get("disabledProviders"));
+	providers.delete(providerId);
+	persistDisabledProviders(activeSettings, providers);
 }
 
-/**
- * Check if a provider is enabled.
- */
-export function isProviderEnabled(providerId: string): boolean {
-	return !disabledProviders.has(providerId);
+/** Check whether a provider is enabled by the supplied session settings. */
+export function isProviderEnabled(
+	providerId: string,
+	activeSettings: Settings | undefined = settings ?? undefined,
+): boolean {
+	return !new Set(activeSettings?.get("disabledProviders") ?? disabledProviders).has(providerId);
 }
 
-/**
- * Get list of all disabled provider IDs.
- */
-export function getDisabledProviders(): string[] {
-	return Array.from(disabledProviders);
+/** Get disabled providers from the supplied session settings. */
+export function getDisabledProviders(activeSettings: Settings | undefined = settings ?? undefined): string[] {
+	return [...(activeSettings?.get("disabledProviders") ?? disabledProviders)];
 }
 
-/**
- * Set disabled providers from a list (replaces current set).
- */
-export function setDisabledProviders(providerIds: string[]): void {
-	disabledProviders.clear();
-	for (const id of providerIds) {
-		disabledProviders.add(id);
-	}
-	persistDisabledProviders();
+/** Replace disabled providers for the supplied session settings. */
+export function setDisabledProviders(
+	providerIds: string[],
+	activeSettings: Settings = settings ??
+		(() => {
+			throw new Error("Capability settings unavailable");
+		})(),
+): void {
+	persistDisabledProviders(activeSettings, new Set(providerIds));
 }
 
 // =============================================================================

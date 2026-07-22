@@ -23,6 +23,7 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 - Do not invent problems; report no issues found when the plan passes.
 - Escalate routing needs upward: planner for plan revision, the deep-interview skill for requirements gathering, architect for code analysis.
 - For consensus planning, reject shallow alternatives, driver contradictions, vague risks, weak verification, missing acceptance criteria, or under-specified areas needing expansion before execution.
+- Prefer practical sufficiency over endless logical completeness: do not demand preemptive logic for edge cases that are not actually observed or evidenced, yet still require extensibility and robustness when observability-based evidence shows the investment is worth the token and time.
 </constraints>
 
 <execution_loop>

@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -295,6 +295,27 @@ it("preserves tool arguments, intent, empty errors, thinking caps, paging, and o
 		rendered = overlay.render(100).join("\n");
 		expect(rendered).toContain("page-line-");
 		expect(rendered).toMatch(/\[\d+-\d+\/\d+\]/);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("renders an unmatched observer tool call as pending instead of done", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "g002-observer-pending-"));
+	try {
+		const file = sessionFile(dir, "pending", [
+			message("a1", {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "pending-tool", name: "read", arguments: { path: "src/file.ts" } }],
+				timestamp: Date.now(),
+			}),
+		]);
+		const overlay = new SessionObserverOverlayComponent(observerRegistry([
+			{ id: "pending", kind: "subagent", label: "Pending", status: "active", sessionFile: file, lastUpdate: 1 },
+		]), () => {}, ["ctrl+s"]);
+		const rendered = overlay.render(100).join("\n");
+		expect(rendered).toContain("⏳ pending");
+		expect(rendered).not.toContain("✓ done");
 	} finally {
 		fs.rmSync(dir, { recursive: true, force: true });
 	}

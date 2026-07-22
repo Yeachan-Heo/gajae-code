@@ -669,6 +669,8 @@ export interface SettingsRuntimeContext {
 	cwd: string;
 	/** Whether this terminal can render the pet overlay. */
 	petAvailable?: boolean;
+	/** Terminal environment used to select unavailable-pet guidance. Omitted in production to use Bun.env. */
+	terminalEnv?: NodeJS.ProcessEnv;
 }
 
 /** Status line settings subset for preview */
@@ -896,7 +898,7 @@ export class SettingsSelectorComponent extends Container {
 			options = createPetSelectItems(options, currentValue, petAvailable);
 			// Unsupported terminals must see the same actionable guidance the
 			// startup notice and /pet show, not only dimmed option descriptions.
-			if (!petAvailable) description = getPetUnavailableWarning();
+			if (!petAvailable) description = getPetUnavailableWarning(this.context.terminalEnv);
 		}
 		// Preview handlers
 		let onPreview: ((value: string) => void | Promise<void>) | undefined;

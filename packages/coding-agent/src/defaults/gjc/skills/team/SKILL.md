@@ -7,25 +7,23 @@ source: "forked from upstream team skill and rebranded for GJC"
 
 # Team Skill
 
+## Purpose & Principles
+
 `$team` is the tmux-based multi-worker execution mode for GJC. It starts real GJC worker CLI sessions by splitting the current tmux leader window and coordinates them through `.gjc/_session-{sessionid}/state/team/...` files plus CLI team interop (`gjc team api ...`) and state files.
 
 This skill is operationally sensitive. Treat it as an operator workflow, not a generic prompt pattern. In GJC App or plain outside-tmux sessions, do not present `$team` / `gjc team` as directly available; launch GJC CLI from shell first, or stay on the nearest app-safe surface until the user explicitly wants the tmux runtime.
-
-## Corrupt current-session state recovery
-
-When team detects its own current-session state is corrupt, tampered, unreadable, or stale on resume, run `gjc state clear --force --mode team` before reseeding or restarting. Scope the clear to the current session via `--session-id`, the command payload, or `GJC_SESSION_ID`; it clears only team state for that session and never clears other skills or sessions.
-
-## Team vs Native Subagents
 
 - Use **GJC native subagents** for bounded, in-session parallelism where one leader thread can fan out a few independent subtasks and wait for them directly.
 - Use **`gjc team`** when you need durable visible tmux workers, shared task state, worker mailbox files, worktrees, explicit lifecycle control, or long-running execution that must survive beyond one local reasoning burst.
 - Native subagents can complement team execution, but they do **not** replace the tmux team runtime's stateful coordination contract.
 
-## What This Skill Must Do
-
-## GPT-5.5 Guidance Alignment
-
 Use the shared workflow guidance pattern: outcome-first framing, concise visible updates for multi-step work, local overrides for the active workflow branch, validation proportional to risk, explicit stop rules, and automatic continuation for safe reversible steps. Ask only for material, destructive, credentialed, external-production, or preference-dependent branches.
+
+## Corrupt current-session state recovery
+
+When team detects its own current-session state is corrupt, tampered, unreadable, or stale on resume, run `gjc state clear --force --mode team` before reseeding or restarting. Scope the clear to the current session via `--session-id`, the command payload, or `GJC_SESSION_ID`; it clears only team state for that session and never clears other skills or sessions.
+
+## What This Skill Must Do
 
 When user triggers `$team`, the agent must:
 

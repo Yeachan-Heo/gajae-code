@@ -1,7 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
+
 import * as path from "node:path";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { isEnoent, TempDir } from "@gajae-code/utils";
+import * as native from "@gajae-code/natives";
+import { getAgentDir, isEnoent, setAgentDir, TempDir } from "@gajae-code/utils";
 
 async function fileExists(p: string): Promise<boolean> {
 	try {
@@ -71,6 +73,90 @@ describe("SessionManager draft", () => {
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
 		expect(await fileExists(sessionFile)).toBe(true);
+	});
+
+	it("persists managed drafts across close and resume without exposing a draft pathname", async () => {
+		using tempDir = TempDir.createSync("@pi-session-managed-draft-resume-");
+		const previousAgentDir = getAgentDir();
+		const agentDir = path.join(tempDir.path(), "agent");
+		try {
+			setAgentDir(agentDir);
+			const session = SessionManager.create(tempDir.path());
+			session.appendMessage({ role: "user", content: "draft only", timestamp: 1 });
+			await session.saveDraft("managed unsent text");
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed session file");
+			await session.close();
+
+			const resumed = await SessionManager.open(
+				sessionFile,
+				SessionManager.managedDestination(tempDir.path(), agentDir),
+			);
+			expect(await resumed.consumeDraft()).toBe("managed unsent text");
+			expect(await resumed.consumeDraft()).toBeNull();
+			await resumed.close();
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
+	});
+
+	it("clears persisted managed drafts before a later resume", async () => {
+		using tempDir = TempDir.createSync("@pi-session-managed-draft-clear-");
+		const previousAgentDir = getAgentDir();
+		const agentDir = path.join(tempDir.path(), "agent");
+		try {
+			setAgentDir(agentDir);
+			const session = SessionManager.create(tempDir.path());
+			session.appendMessage({ role: "user", content: "draft only", timestamp: 1 });
+			await session.saveDraft("remove me");
+			await session.saveDraft("");
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed session file");
+			await session.close();
+
+			const resumed = await SessionManager.open(
+				sessionFile,
+				SessionManager.managedDestination(tempDir.path(), agentDir),
+			);
+			expect(await resumed.consumeDraft()).toBeNull();
+			await resumed.close();
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
+	});
+
+	it("keeps the prior managed draft when its replacement fails", async () => {
+		if (process.platform !== "linux") return;
+		using tempDir = TempDir.createSync("@pi-session-managed-draft-replace-");
+		const previousAgentDir = getAgentDir();
+		const agentDir = path.join(tempDir.path(), "agent");
+		try {
+			setAgentDir(agentDir);
+			const session = SessionManager.create(tempDir.path());
+			session.appendMessage({ role: "user", content: "draft only", timestamp: 1 });
+			await session.saveDraft("authorized draft");
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed session file");
+			const replaceManaged = native.RecoveryFsRoot.prototype as unknown as {
+				replaceManaged: (...args: unknown[]) => unknown;
+			};
+			const replace = vi.spyOn(replaceManaged, "replaceManaged").mockReturnValue({ ok: false, code: "io_error" });
+			try {
+				await expect(session.saveDraft("replacement draft")).rejects.toThrow("io_error");
+			} finally {
+				replace.mockRestore();
+			}
+			await session.close();
+
+			const resumed = await SessionManager.open(
+				sessionFile,
+				SessionManager.managedDestination(tempDir.path(), agentDir),
+			);
+			expect(await resumed.consumeDraft()).toBe("authorized draft");
+			await resumed.close();
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
 	});
 
 	it("is a no-op for in-memory sessions", async () => {

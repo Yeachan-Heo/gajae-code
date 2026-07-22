@@ -8,6 +8,7 @@ import {
 import {
 	createUltragoalPlan,
 	recordUltragoalBlockerClassification,
+	recordUltragoalCriticVerdict,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 
 const TEST_SESSION_ID = "ultragoal-pause-guard-redteam-session";
@@ -43,12 +44,19 @@ afterEach(async () => {
 });
 
 describe("ultragoal pause guard red-team coverage", () => {
-	it("treats a human_blocked classification as stale after a later ledger event", async () => {
+	it("treats a human_blocked classification as stale after a later classification", async () => {
 		const cwd = await createActiveRun();
-		await recordUltragoalBlockerClassification({
+		const classification = await recordUltragoalBlockerClassification({
 			cwd,
 			classification: "human_blocked",
 			evidence: "User must provide production credentials",
+		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict: "OKAY",
+			evidence: "critic confirms the blocker requires human action",
+			classificationEventId: classification.eventId,
 		});
 		expect((await isUltragoalPauseBlocked(cwd)).blocked).toBe(false);
 
@@ -60,17 +68,24 @@ describe("ultragoal pause guard red-team coverage", () => {
 
 		const diagnostic = await isUltragoalPauseBlocked(cwd);
 		expect(diagnostic.blocked).toBe(true);
-		expect(diagnostic.reason).toContain("latest ledger event");
+		expect(diagnostic.reason).toContain("latest blocker_classified event");
 	});
 
-	it("assertUltragoalPauseAllowed throws while blocked and resolves when latest event is human_blocked", async () => {
+	it("assertUltragoalPauseAllowed throws while blocked and resolves with a bound human_blocked classification", async () => {
 		const cwd = await createActiveRun();
 		await expect(assertUltragoalPauseAllowed(cwd)).rejects.toThrow(/Pausing requires/);
 
-		await recordUltragoalBlockerClassification({
+		const classification = await recordUltragoalBlockerClassification({
 			cwd,
 			classification: "human_blocked",
 			evidence: "User must perform manual production approval",
+		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict: "OKAY",
+			evidence: "critic confirms the blocker requires human action",
+			classificationEventId: classification.eventId,
 		});
 
 		await expect(assertUltragoalPauseAllowed(cwd)).resolves.toBeUndefined();

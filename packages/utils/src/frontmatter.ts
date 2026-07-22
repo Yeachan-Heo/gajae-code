@@ -124,18 +124,30 @@ export function parseFrontmatter(
 	const loc = location ?? source;
 	const frontmatter: Record<string, unknown> = { ...fallback };
 
-	const normalized = normalize ? stripHtmlComments(content.replace(/\r\n?/g, "\n")) : content;
-	if (!normalized.startsWith("---")) {
+	// Normalize away a leading UTF-8 BOM and CRLF line endings before matching so
+	// a BOM-prefixed but otherwise valid document is still recognized as
+	// frontmatter (BOM-prefixed Markdown is common on Windows-authored files).
+	const normalized = normalize ? stripHtmlComments(content.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n")) : content;
+	// A frontmatter block opens with a line that is exactly `---` (trailing
+	// spaces/tabs allowed). A bare `----` banner or a `--- text` heading is not
+	// an opener, so a document without frontmatter keeps its body intact rather
+	// than having content silently consumed by the fixed-offset slicing below.
+	const open = normalized.match(/^---[ \t]*(?:\n|$)/);
+	if (!open) {
 		return { frontmatter, body: normalized };
 	}
 
-	const endIndex = normalized.indexOf("\n---", 3);
-	if (endIndex === -1) {
+	// The block closes at the next line that is exactly `---`. Searching from the
+	// end of the opening `---` (offset 3, not the whole opener) keeps an empty
+	// block (`---\n---`) matching as empty frontmatter.
+	const afterOpen = normalized.slice(3);
+	const close = afterOpen.match(/\n---[ \t]*(?:\n|$)/);
+	if (!close || close.index === undefined) {
 		return { frontmatter, body: normalized };
 	}
 
-	const metadata = normalized.slice(4, endIndex);
-	const body = normalized.slice(endIndex + 4).trim();
+	const metadata = afterOpen.slice(open[0].length - 3, close.index);
+	const body = afterOpen.slice(close.index + close[0].length).trim();
 
 	try {
 		// Replace tabs with spaces for YAML compatibility, use failsafe mode for robustness

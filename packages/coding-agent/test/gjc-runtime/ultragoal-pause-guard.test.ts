@@ -5,6 +5,7 @@ import { isUltragoalPauseBlocked } from "@gajae-code/coding-agent/gjc-runtime/ul
 import {
 	createUltragoalPlan,
 	recordUltragoalBlockerClassification,
+	recordUltragoalCriticVerdict,
 } from "@gajae-code/coding-agent/gjc-runtime/ultragoal-runtime";
 
 const TEST_SESSION_ID = "ultragoal-pause-guard-test-session";
@@ -40,7 +41,27 @@ describe("ultragoal pause guard", () => {
 		expect(diagnostic.reason).toContain("human_blocked");
 	});
 
-	it("allows pause after the latest ledger event classifies the blocker human_blocked", async () => {
+	it("allows pause after a human_blocked classification has a bound clean critic verdict", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		const classification = await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "human_blocked",
+			evidence: "User must provide production API credentials",
+		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict: "OKAY",
+			evidence: "critic confirms human-only blocker",
+			classificationEventId: classification.eventId,
+		});
+		const diagnostic = await isUltragoalPauseBlocked(cwd);
+		expect(diagnostic.blocked).toBe(false);
+	});
+
+	it("blocks pause when human_blocked has no critic verdict", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 		await createUltragoalPlan({ cwd, brief: "Implement the story" });
@@ -50,7 +71,30 @@ describe("ultragoal pause guard", () => {
 			evidence: "User must provide production API credentials",
 		});
 		const diagnostic = await isUltragoalPauseBlocked(cwd);
-		expect(diagnostic.blocked).toBe(false);
+		expect(diagnostic.blocked).toBe(true);
+		expect(diagnostic.reason).toContain("fresh clean pause terminal critic OKAY verdict");
+	});
+
+	it("blocks pause when the bound critic verdict is REJECT", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: "Implement the story" });
+		const classification = await recordUltragoalBlockerClassification({
+			cwd,
+			classification: "human_blocked",
+			evidence: "User must provide production API credentials",
+		});
+		await recordUltragoalCriticVerdict({
+			cwd,
+			terminus: "pause",
+			verdict: "REJECT",
+			evidence: "critic found unresolved risk",
+			blockers: ["Resolve the risk"],
+			classificationEventId: classification.eventId,
+		});
+		const diagnostic = await isUltragoalPauseBlocked(cwd);
+		expect(diagnostic.blocked).toBe(true);
+		expect(diagnostic.reason).toContain("fresh clean pause terminal critic OKAY verdict");
 	});
 
 	it("still blocks pause when the latest classification is resolvable", async () => {

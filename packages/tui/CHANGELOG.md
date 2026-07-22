@@ -3,7 +3,26 @@
 ## [Unreleased]
 ### Fixed
 
+- Internal transcript PageUp/PageDown now continues through tool-output and other non-semantic rows instead of intermittently becoming a no-op after a semantic viewport anchor was established.
+
+### Fixed
+
+- Spurious resize events with unchanged terminal dimensions (iTerm2 tab switches and window focus changes deliver SIGWINCH without a size change) no longer trigger a forced full redraw. On hosts still using the full clear+replay path (legacy multiplexer opt-in, non-process terminals) that redraw cleared scrollback (`2J`/`H`/`3J`) and replayed the entire transcript, which could park the native viewport at the top of the thread when returning to the tab. `requestResizeRender()` now forces only when the grid size actually changed since the last committed frame; same-size events fall through to a no-op diff render.
+
+## [0.11.4] - 2026-07-20
+### Fixed
+
+- Keybinding configuration arrays are now defensively copied so external mutations cannot diverge snapshots from resolved key matches.
+- Supplementary Unicode terminal input now crosses the stdin decoding boundary as complete code points instead of separate UTF-16 surrogate events.
+- Bracketed-paste framing now preserves ordinary input before coalesced or split start markers, retains split end markers byte-for-byte, and reprocesses multiple framed pastes in order instead of dropping command prefixes.
+
+## [0.11.3] - 2026-07-19
+### Fixed
+
+- Keybinding configuration arrays are now defensively copied so external mutations cannot diverge snapshots from resolved key matches.
 - Suppressed slash-command and skill autocomplete inside line-local single-backtick code spans while preserving path completion and ordinary slash matching outside literals (#2619).
+- Supplementary Unicode terminal input now crosses the stdin decoding boundary as complete code points instead of separate UTF-16 surrogate events.
+- Bracketed-paste framing now preserves ordinary input before coalesced or split start markers, retains split end markers byte-for-byte, and reprocesses multiple framed pastes in order instead of dropping command prefixes.
 
 ## [0.11.0] - 2026-07-15
 ### Fixed

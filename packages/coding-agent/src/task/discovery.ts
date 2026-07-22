@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { isProviderEnabled } from "../capability";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
+import type { Settings } from "../config/settings";
 import { listClaudePluginRoots } from "../discovery/helpers";
 import { rootContainsGjcManifest } from "../extensibility/gjc-plugins/paths";
 import { loadBundledAgents, parseAgent } from "./agents";
@@ -57,8 +58,13 @@ async function loadAgentsFromDir(dir: string, source: AgentSource): Promise<Agen
  * Precedence (highest wins): .gjc project, .gjc user, GJC plugins, then bundled
  *
  * @param cwd - Current working directory for project agent discovery
+ * @param activeSettings - Settings used to resolve enabled providers.
  */
-export async function discoverAgents(cwd: string, home: string = os.homedir()): Promise<DiscoveryResult> {
+export async function discoverAgents(
+	cwd: string,
+	home: string = os.homedir(),
+	activeSettings?: Settings,
+): Promise<DiscoveryResult> {
 	const resolvedCwd = path.resolve(cwd);
 	const agentSources = Array.from(new Set(getConfigDirs("", { project: false }).map(entry => entry.source)));
 
@@ -91,7 +97,7 @@ export async function discoverAgents(cwd: string, home: string = os.homedir()): 
 	}
 
 	// Load agents from GJC marketplace plugins.
-	const { roots: pluginRoots } = isProviderEnabled("claude-plugins")
+	const { roots: pluginRoots } = isProviderEnabled("claude-plugins", activeSettings)
 		? await listClaudePluginRoots(home, resolvedCwd)
 		: { roots: [] };
 	const nonGjcPluginRoots = [];

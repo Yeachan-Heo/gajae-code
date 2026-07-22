@@ -18,7 +18,11 @@ import {
 } from "../hooks/codex-native-hooks-config";
 import { theme } from "../modes/theme/theme";
 import { formatCredentialAutoImportResult, runExternalCredentialAutoImport } from "../setup/credential-auto-import";
-import { filterAutoImportOAuthCredentials, formatDiscoverySummary } from "../setup/credential-import";
+import {
+	formatDiscoverySummary,
+	getAutoImportOAuthCredentialSkips,
+	isAutoImportOAuthCredential,
+} from "../setup/credential-import";
 import {
 	formatHermesSetupResult,
 	type HermesSetupFlags,
@@ -596,8 +600,10 @@ export async function handleCredentialsSetup(
 			trigger: "setup-cli",
 		});
 		const result = preview.discovery ?? { importable: [], skipped: [], environment: [] };
-		const candidates = filterAutoImportOAuthCredentials(result.importable);
-		const filteredResult = { ...result, importable: candidates };
+		const now = Date.now();
+		const candidates = result.importable.filter(credential => isAutoImportOAuthCredential(credential, now));
+		const autoImportSkips = getAutoImportOAuthCredentialSkips(result.importable, now);
+		const filteredResult = { ...result, importable: candidates, skipped: [...result.skipped, ...autoImportSkips] };
 		const redactedPlan = {
 			importable: candidates.map(c => ({
 				provider: c.provider,
@@ -607,7 +613,7 @@ export async function handleCredentialsSetup(
 				expiresAt: c.expiresAt,
 				redactedToken: c.redactedToken,
 			})),
-			skipped: result.skipped,
+			skipped: filteredResult.skipped,
 			environment: result.environment,
 			keychainChecked: flags.keychain === true,
 		};
