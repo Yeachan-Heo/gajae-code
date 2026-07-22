@@ -125,6 +125,24 @@ it("treats explicit broker env as a complete allowlist and still scrubs runtime 
 	expect(environment.AMBIENT_SENTINEL).toBeUndefined();
 });
 
+it("scrubs inherited coordinator, readiness, and tmux ownership from detached brokers", () => {
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {
+		environment: { PATH: process.env.PATH },
+	});
+	const environment = brokerSpawnEnvironmentForTest(command, {
+		PATH: process.env.PATH,
+		GJC_COORDINATOR_SESSION_ID: "parent-session",
+		GJC_COORDINATOR_SESSION_STATE_FILE: "/parent/runtime-state.json",
+		GJC_COORDINATOR_SESSION_READINESS_FILE: "/parent/readiness.json",
+		GJC_TMUX_OWNER_GENERATION: "parent-owner",
+		GJC_TMUX_LAUNCHED: "1",
+		TMUX: "/tmp/tmux-parent,123,0",
+		TMUX_PANE: "%42",
+		OWNED_SENTINEL: "kept",
+	});
+	expect(environment).toEqual({ PATH: process.env.PATH, OWNED_SENTINEL: "kept" });
+});
+
 it("fails closed when compiled marker evidence disagrees", () => {
 	expect(() =>
 		resolveSdkInternalSpawnCommandForTest("broker-internal", {

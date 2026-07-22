@@ -269,11 +269,15 @@ export class ExtensionUiController {
 			}
 			case "queue.message.update": {
 				const id = String(input.id);
-				const old = session.removeQueuedMessageForEditing(id);
+				const runtimeTurnId = session.getQueuedRuntimeTurnIdForEditing(id);
+				const old = session.removeQueuedMessageForEditing(id, { preserveRuntimeTurnId: true });
 				const patch = input.patch as { text?: unknown };
 				if (old === undefined || typeof patch?.text !== "string")
 					throw Object.assign(new Error("Queued message update is invalid."), { code: "invalid_message" });
-				await session.sendUserMessage(patch.text, { deliverAs: id.startsWith("steer:") ? "steer" : "followUp" });
+				await session.sendUserMessage(patch.text, {
+					deliverAs: id.startsWith("steer:") ? "steer" : "followUp",
+					...(runtimeTurnId === undefined ? {} : { runtimeTurnId }),
+				});
 				return { updated: true };
 			}
 			case "extension.set_enabled": {

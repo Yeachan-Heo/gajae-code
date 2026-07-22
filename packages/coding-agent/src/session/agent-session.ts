@@ -1806,6 +1806,8 @@ export class AgentSession {
 	// async event handlers settle. Subscribers treat agent_end as readiness, so
 	// publishing it earlier lets a successor corrupt the prior prompt's lifecycle.
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
+	/** Retains the terminal receipt identity while its agent_end publication is deferred. */
+	#coordinatorRuntimeTurnByDeferredAgentEnd = new WeakMap<AgentSessionEvent, string | null>();
 	// A scheduled continuation owns this terminal boundary until it either starts
 	// the successor or proves it cannot. Holds prevent a false idle event while
 	// preserving the predecessor for cancellation and preflight failures.
@@ -2133,12 +2135,14 @@ export class AgentSession {
 			return;
 		}
 		this.#pendingAgentEndEmit = undefined;
+		const runtimeTurnId = this.#coordinatorRuntimeTurnByDeferredAgentEnd.get(pending) ?? null;
+		this.#coordinatorRuntimeTurnByDeferredAgentEnd.delete(pending);
 		this.#agentEndPublicationInFlight++;
-		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending);
+		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, runtimeTurnId);
 		void this.#agentEndPublicationPromise;
 	}
 
-	async #publishDeferredAgentEnd(pending: AgentSessionEvent): Promise<void> {
+	async #publishDeferredAgentEnd(pending: AgentSessionEvent, runtimeTurnId: string | null): Promise<void> {
 		try {
 			// Worker integration is first-party lifecycle persistence, not an extension
 			// hook. Make it durable before publishing the terminal boundary while user
@@ -2147,7 +2151,7 @@ export class AgentSession {
 			// Persist before notifying synchronous subscribers: a subscriber may start a
 			// successor prompt from agent_end, whose running state must serialize after
 			// this terminal boundary rather than be overwritten by it.
-			this.#persistRuntimeStateInBackground(pending);
+			this.#persistRuntimeStateInBackground(pending, runtimeTurnId);
 			this.#emit(pending);
 			void this.#queueExtensionEvent(pending, undefined, true);
 		} finally {
@@ -3093,6 +3097,7 @@ export class AgentSession {
 		// from abort while either barrier is active permits a successor to race the
 		// prior prompt's cleanup.
 		if (event.type === "agent_end" && (this.#promptInFlightCount > 0 || this.#agentEventHandlersInFlight > 0)) {
+			this.#coordinatorRuntimeTurnByDeferredAgentEnd.set(event, this.#activeCoordinatorRuntimeTurnId);
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
@@ -8378,6 +8383,8 @@ export class AgentSession {
 	clearQueue(): { steering: string[]; followUp: string[] } {
 		const steering = this.#steeringMessages.map(e => e.text);
 		const followUp = this.#followUpMessages.map(e => e.text);
+		for (const entry of [...this.#steeringMessages, ...this.#followUpMessages])
+			this.#cancelQueuedCoordinatorRuntimeTurn(entry.runtimeTurnId);
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
 		this.agent.clearAllQueues();
@@ -8436,7 +8443,32 @@ export class AgentSession {
 		return entries;
 	}
 
-	removeQueuedMessageForEditing(id: string): string | undefined {
+	/** Returns an opaque coordinator receipt id only for an in-process queue replacement. */
+	getQueuedRuntimeTurnIdForEditing(id: string): string | undefined {
+		const [mode, sequenceText] = id.split(":");
+		if ((mode !== "steer" && mode !== "followUp") || sequenceText === undefined) return undefined;
+		const sequence = Number(sequenceText);
+		if (!Number.isInteger(sequence)) return undefined;
+		const primary = mode === "steer" ? this.#steeringMessages : this.#followUpMessages;
+		const secondary = mode === "steer" ? this.#followUpMessages : this.#steeringMessages;
+		return (
+			primary.find(entry => entry.sequence === sequence)?.runtimeTurnId ??
+			secondary.find(entry => entry.sequence === sequence)?.runtimeTurnId
+		);
+	}
+
+	#cancelQueuedCoordinatorRuntimeTurn(runtimeTurnId: string | undefined): void {
+		if (!runtimeTurnId) return;
+		this.#persistRuntimeStateInBackground(
+			{
+				type: "agent_end",
+				messages: [{ role: "assistant", content: [], stopReason: "error" } as unknown as AssistantMessage],
+			},
+			runtimeTurnId,
+		);
+	}
+
+	removeQueuedMessageForEditing(id: string, options?: { preserveRuntimeTurnId?: boolean }): string | undefined {
 		const [mode, sequenceText] = id.split(":");
 		if ((mode !== "steer" && mode !== "followUp") || sequenceText === undefined) return undefined;
 		const sequence = Number(sequenceText);
@@ -8458,6 +8490,7 @@ export class AgentSession {
 		} else {
 			this.agent.removeFollowUpAt(index);
 		}
+		if (!options?.preserveRuntimeTurnId) this.#cancelQueuedCoordinatorRuntimeTurn(entry?.runtimeTurnId);
 		return entry?.text;
 	}
 

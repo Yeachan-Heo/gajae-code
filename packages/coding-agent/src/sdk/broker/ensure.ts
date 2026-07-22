@@ -176,6 +176,15 @@ function registerBrokerOwner(
 function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const environment = { ...(override ?? command.env) };
 	delete environment.BUN_OPTIONS;
+	for (const key of Object.keys(environment)) {
+		if (
+			key.startsWith("GJC_COORDINATOR_SESSION_") ||
+			key.startsWith("GJC_TMUX_") ||
+			key === "TMUX" ||
+			key === "TMUX_PANE"
+		)
+			delete environment[key];
+	}
 	if (command.kind === "bun-source") {
 		delete environment.PI_COMPILED;
 		delete environment.GJC_COMPILED;
