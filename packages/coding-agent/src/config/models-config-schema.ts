@@ -197,6 +197,25 @@ const LocalOpenAICompatSchema = z
 
 export const ProviderAuthSchema = z.enum(["apiKey", "none", "oauth"]);
 
+export const CANONICAL_PROVIDER_ID_PATTERN = "^[a-z0-9]+(?:[._-][a-z0-9]+)*$";
+export const CANONICAL_PROVIDER_ID_MAX_BYTES = 64;
+
+const canonicalProviderIdPattern = new RegExp(CANONICAL_PROVIDER_ID_PATTERN);
+const providerIdEncoder = new TextEncoder();
+
+export function isCanonicalProviderId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		canonicalProviderIdPattern.test(value) &&
+		providerIdEncoder.encode(value).byteLength <= CANONICAL_PROVIDER_ID_MAX_BYTES
+	);
+}
+
+export const CanonicalProviderIdSchema = z
+	.string()
+	.regex(canonicalProviderIdPattern, `Provider ID must match ${CANONICAL_PROVIDER_ID_PATTERN}`)
+	.max(CANONICAL_PROVIDER_ID_MAX_BYTES, `Provider ID must be at most ${CANONICAL_PROVIDER_ID_MAX_BYTES} UTF-8 bytes`);
+
 export type ProviderAuthMode = z.infer<typeof ProviderAuthSchema>;
 export type ProviderDiscovery = z.infer<typeof ProviderDiscoverySchema>;
 
@@ -250,7 +269,7 @@ const EquivalenceConfigSchema = z.object({
 
 export const ModelsConfigSchema = z
 	.object({
-		providers: z.record(z.string(), ProviderConfigSchema).optional(),
+		providers: z.record(CanonicalProviderIdSchema, ProviderConfigSchema).optional(),
 		modelBindings: ModelBindingsSchema.optional(),
 		equivalence: EquivalenceConfigSchema.optional(),
 		profiles: ProfilesSchema.optional(),

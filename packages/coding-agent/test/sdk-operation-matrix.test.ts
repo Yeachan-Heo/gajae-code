@@ -43,6 +43,14 @@ const expectedDispositions: Record<string, Record<string, AdapterDisposition>> =
 		acp: "generic_safe",
 		daemonCli: "generic_safe",
 	},
+	Q26: {
+		telegram: "generic_safe",
+		discord: "generic_safe",
+		slack: "generic_safe",
+		mcp: "generic_safe",
+		acp: "generic_safe",
+		daemonCli: "generic_safe",
+	},
 	C52: {
 		telegram: "prohibited",
 		discord: "prohibited",
@@ -83,7 +91,7 @@ describe("SDK operation matrix", () => {
 		const registryById = new Map(OPERATIONS.map(operation => [operation.id, operation]));
 		const inventoryIds = registryInventory.map(row => row.sourceId.replace("registry:", ""));
 		expect(new Set(inventoryIds)).toEqual(new Set(registryById.keys()));
-		expect(registryInventory).toHaveLength(90);
+		expect(registryInventory).toHaveLength(91);
 
 		for (const row of registryInventory) {
 			const id = row.sourceId.startsWith("registry:") ? row.sourceId.slice("registry:".length) : row.sourceId;
@@ -102,7 +110,7 @@ describe("SDK operation matrix", () => {
 	it("keeps control errors, query continuity, counts, and the stage-05 adapter partition explicit", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(52);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(7);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(25);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(26);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		for (const operation of OPERATIONS.filter(operation => operation.kind === "control"))
 			expect(operation.errorCodes.length).toBeGreaterThan(0);

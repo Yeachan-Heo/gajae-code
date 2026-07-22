@@ -2150,6 +2150,8 @@ describe("ModelRegistry", () => {
 
 			expect(registry.getAvailable().some(model => model.provider === "github-copilot")).toBe(false);
 			expect(registry.getDiscoverableProviders()).not.toContain("ollama");
+			expect(registry.getActiveProviders().some(provider => provider.provider === "github-copilot")).toBe(false);
+			expect(registry.getActiveProviders().some(provider => provider.provider === "ollama")).toBe(false);
 		});
 
 		test("refresh skips discovery probes for disabled local providers", async () => {
@@ -3494,5 +3496,148 @@ describe("ModelRegistry", () => {
 			expect(getOpenAICompat(model)?.supportsStore).toBe(false);
 			expect(await registry.getApiKeyForProvider("local")).toBe("LOCAL_TEST_KEY");
 		});
+	});
+	test("resolves active providers from credentials and configured credentialless models without I/O", () => {
+		writeRawModelsJson({
+			"zeta.provider": {
+				baseUrl: "https://zeta.example.com/v1",
+				api: "openai-responses",
+				apiKey: "ZETA_KEY",
+				models: [{ id: "zeta-model" }],
+			},
+			"alpha-provider": {
+				baseUrl: "https://alpha.example.com/v1",
+				api: "openai-responses",
+				apiKey: "ALPHA_KEY",
+				models: [{ id: "alpha-model" }],
+			},
+			"local-provider": {
+				baseUrl: "http://127.0.0.1:1234/v1",
+				api: "openai-responses",
+				auth: "none",
+				models: [{ id: "local-model" }],
+			},
+		});
+		using _hook = hookFetch(() => {
+			throw new Error("active-provider resolution must not perform I/O");
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getActiveProviders()).toEqual([
+			{ provider: "alpha-provider", connectionKind: "credential" },
+			{ provider: "local-provider", connectionKind: "credentialless" },
+			{ provider: "zeta.provider", connectionKind: "credential" },
+		]);
+		const current = registry.find("local-provider", "local-model");
+		expect(registry.getActiveProviders(current)).toEqual(registry.getActiveProviders());
+	});
+
+	test("tracks credential addition, replacement, removal, dedupe, and registry-only exclusions", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const anthropicRows = () => registry.getActiveProviders().filter(provider => provider.provider === "anthropic");
+
+		expect(registry.getAll().some(model => model.provider === "anthropic")).toBe(true);
+		expect(anthropicRows()).toEqual([]);
+
+		await authStorage.set("anthropic", [
+			{ type: "api_key", key: "sk-ant-account-a" },
+			{ type: "api_key", key: "sk-ant-account-b" },
+		]);
+		expect(anthropicRows()).toEqual([{ provider: "anthropic", connectionKind: "credential" }]);
+
+		await authStorage.set("anthropic", [{ type: "api_key", key: "sk-ant-replacement" }]);
+		expect(anthropicRows()).toEqual([{ provider: "anthropic", connectionKind: "credential" }]);
+
+		authStorage.setRuntimeApiKey("unknown-provider", "unknown-provider-key");
+		expect(registry.getActiveProviders().some(provider => provider.provider === "unknown-provider")).toBe(false);
+
+		await authStorage.set("anthropic", []);
+		expect(anthropicRows()).toEqual([]);
+	});
+
+	test("does not advertise cached discovery-only models until exact fresh discovery succeeds", () => {
+		const cachedModel: Model<"openai-responses"> = {
+			id: "cached-model",
+			name: "Cached Model",
+			api: "openai-responses",
+			provider: "discovery-provider",
+			baseUrl: "http://127.0.0.1:1234/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 8192,
+		};
+		writeRawModelsJson({
+			"discovery-provider": {
+				baseUrl: "http://127.0.0.1:1234/v1",
+				api: "openai-responses",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		writeModelCache("discovery-provider", Date.now(), [cachedModel], true, "", cacheDbPath);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("cached");
+		expect(registry.getActiveProviders()).toEqual([]);
+	});
+	test("requires fresh exact discovery evidence while static models stay active", async () => {
+		let response: "empty" | "unavailable" | "ok" = "empty";
+		writeRawModelsJson({
+			"discovery-provider": {
+				baseUrl: "https://discovery.example.com/v1",
+				api: "openai-responses",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+			mixed: {
+				baseUrl: "https://mixed.example.com/v1",
+				api: "openai-responses",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+				models: [{ id: "mixed-static" }],
+			},
+			"unauthenticated-provider": {
+				baseUrl: "https://unauthenticated.example.com/v1",
+				api: "openai-responses",
+				apiKeyEnv: "GJC_TEST_MISSING_ACTIVE_PROVIDER_KEY",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		using _hook = hookFetch(input => {
+			const url = String(input);
+			if (url.includes("unauthenticated.example.com")) throw new Error("unauthenticated discovery must not fetch");
+			if (response === "unavailable") return new Response("unavailable", { status: 503 });
+			return new Response(JSON.stringify({ data: response === "ok" ? [{ id: "fresh-model" }] : [] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("idle");
+		expect(registry.getActiveProviders()).toEqual([{ provider: "mixed", connectionKind: "credentialless" }]);
+
+		await registry.refreshProvider("discovery-provider", "online");
+		expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("empty");
+		expect(registry.getActiveProviders()).toEqual([{ provider: "mixed", connectionKind: "credentialless" }]);
+
+		response = "unavailable";
+		await registry.refreshProvider("discovery-provider", "online");
+		expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("unavailable");
+		expect(registry.getActiveProviders()).toEqual([{ provider: "mixed", connectionKind: "credentialless" }]);
+
+		await registry.refreshProvider("unauthenticated-provider", "online");
+		expect(registry.getProviderDiscoveryState("unauthenticated-provider")?.status).toBe("unauthenticated");
+		expect(registry.getActiveProviders()).toEqual([{ provider: "mixed", connectionKind: "credentialless" }]);
+
+		response = "ok";
+		await registry.refreshProvider("discovery-provider", "online");
+		expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("ok");
+		expect(registry.getActiveProviders()).toEqual([
+			{ provider: "discovery-provider", connectionKind: "credentialless" },
+			{ provider: "mixed", connectionKind: "credentialless" },
+		]);
 	});
 });

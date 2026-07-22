@@ -8,7 +8,9 @@
 		"providers": {
 			"type": "object",
 			"propertyNames": {
-				"type": "string"
+				"type": "string",
+				"maxLength": 64,
+				"pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
 			},
 			"additionalProperties": {
 				"type": "object",

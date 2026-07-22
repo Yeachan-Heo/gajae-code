@@ -38,6 +38,25 @@ equivalence:
 
 `provider-id` is the canonical provider key used across selection and auth lookup.
 
+Provider map keys are validated at configuration and runtime registration boundaries. A
+provider ID must match this exact ASCII grammar:
+
+```text
+^[a-z0-9]+(?:[._-][a-z0-9]+)*$
+```
+
+Provider IDs are limited to 64 UTF-8 bytes. The separators `.`, `_`, and `-` may
+appear only between non-empty lowercase alphanumeric segments; uppercase letters,
+whitespace, repeated or leading/trailing separators, and other punctuation are
+invalid. Valid examples include `llama.cpp` and `corp.proxy-1`.
+
+GJC does not trim, case-fold, alias, rewrite, or otherwise normalize provider IDs.
+The key is the identity used by model selection, authentication lookup, and SDK
+responses. Existing custom configurations with legacy invalid keys must be renamed
+explicitly in `models.yml`; they are not silently migrated or matched through an
+alias. Update any `provider/model` selectors and related bindings to use the
+renamed canonical key.
+
 `equivalence` is optional and configures canonical model grouping on top of concrete provider models:
 
 - `overrides` maps an exact concrete selector (`provider/modelId`) to an official upstream canonical id
