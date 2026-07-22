@@ -317,6 +317,16 @@ export const SETTINGS_SCHEMA = {
 			editing: "notification-atomic",
 		},
 	},
+	"notifications.telegram.topics.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "notifications",
+			label: "Telegram Topic Threads",
+			description: "Create per-session Telegram forum topics. Off delivers every frame flat to the paired chat.",
+			editing: "notification-atomic",
+		},
+	},
 	"notifications.telegram.topics.nameTemplate": { type: "string", default: undefined },
 	"notifications.discord.botToken": { type: "string", default: undefined },
 	"notifications.discord.applicationId": { type: "string", default: undefined },
@@ -3809,6 +3819,7 @@ export interface NotificationsSettings {
 			enabled: boolean;
 		};
 		topics: {
+			enabled: boolean;
 			nameTemplate: string | undefined;
 		};
 	};

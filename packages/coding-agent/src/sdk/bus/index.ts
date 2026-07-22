@@ -1069,7 +1069,7 @@ const defaultConfig: NotificationConfig = {
 	richDraft: { enabled: false },
 	toolActivity: { enabled: true },
 	streaming: { enabled: true },
-	topics: {},
+	topics: { enabled: true },
 	btw: { enabled: true },
 };
 

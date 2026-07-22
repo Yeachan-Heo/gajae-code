@@ -5,6 +5,7 @@
 
 - `/btw` now opens an ephemeral multi-turn side chat: plain text continues the side thread until Esc returns to the main chat, while visible text-only context stays outside the main transcript and session observability/debug hooks and is scrubbed synchronously on close or abort.
 - Added `statusLine.showActionHints` (default: `true`) to hide contextual action hints while retaining configured status-line segments.
+- Added `notifications.telegram.topics.enabled` (default: `true`). Off skips per-session Telegram forum-topic creation entirely and delivers every notification frame flat to the paired chat — useful for private-chat pairings where thread-addressed messages render as noisy quote-replies of the topic service message (#2855). Existing topic records are ignored (not deleted) while disabled, and the Threaded Mode nudge is suppressed since flat delivery is the requested mode.
 
 ### Fixed
 

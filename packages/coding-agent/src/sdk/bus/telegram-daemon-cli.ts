@@ -101,6 +101,8 @@ export function createLightweightDaemonSettings(input: {
 					return snapshot.slack.channelId;
 				case "notifications.slack.authorizedUserId":
 					return snapshot.slack.authorizedUserId;
+				case "notifications.telegram.topics.enabled":
+					return snapshot.telegram.topics.enabled;
 				case "notifications.telegram.topics.nameTemplate":
 					return snapshot.telegram.topics.nameTemplate;
 				case "notifications.telegram.rich.enabled":

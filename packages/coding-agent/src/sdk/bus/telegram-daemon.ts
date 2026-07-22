@@ -2710,11 +2710,13 @@ export interface TelegramDaemonOptions {
 	/** Tool start/completion messages (enabled by default). */
 	toolActivity?: { enabled: boolean };
 	/**
-	 * Per-session Telegram forum-topic naming. `nameTemplate` supports the
-	 * `{repo}`, `{branch}`, and `{title}` placeholders; unset preserves the
-	 * built-in `{repo}/{branch} - {title}` composition and its fallbacks.
+	 * Per-session Telegram forum-topic behavior. `enabled: false` skips topic
+	 * creation entirely and delivers every frame flat to the paired chat;
+	 * `nameTemplate` supports the `{repo}`, `{branch}`, and `{title}`
+	 * placeholders; unset preserves the built-in `{repo}/{branch} - {title}`
+	 * composition and its fallbacks.
 	 */
-	topics?: { nameTemplate?: string };
+	topics?: { enabled?: boolean; nameTemplate?: string };
 }
 
 interface SessionSocket {
@@ -4477,6 +4479,9 @@ export class TelegramNotificationDaemon {
 	}
 
 	private async existingTopicForPrivateChat(sessionId: string): Promise<string | undefined> {
+		// With topics disabled, ignore previously created topic records so every
+		// frame (including sessions with an existing topic) routes flat.
+		if (!this.topicsEnabled()) return undefined;
 		return (await this.topicAuthorityLease(sessionId))?.topicId;
 	}
 
@@ -4562,13 +4567,20 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
+	/** Operator switch: `notifications.telegram.topics.enabled` (default on). */
+	private topicsEnabled(): boolean {
+		return this.opts.topics?.enabled !== false;
+	}
+
 	/**
 	 * Resolve (creating once via `createForumTopic`) the forum topic for a
 	 * session. On capability failure (e.g. Threaded Mode off) this returns
 	 * `undefined`; callers then flat-deliver to a private paired chat (with a
-	 * one-time nudge) or drop fail-closed for a non-private chat.
+	 * one-time nudge) or drop fail-closed for a non-private chat. When topics
+	 * are disabled by config, every caller takes the same flat path.
 	 */
 	private async ensureTopic(sessionId: string, name: string): Promise<string | undefined> {
+		if (!this.topicsEnabled()) return undefined;
 		if (!(await this.pairedChatIsPrivate())) return undefined;
 		const existing = this.topics.get(sessionId);
 		if (existing?.authorityState === "delete_pending") return undefined;
@@ -5269,6 +5281,9 @@ export class TelegramNotificationDaemon {
 
 	/** Tell the user once (per daemon run) how to enable Threaded Mode. */
 	private async notifyThreadedFallback(): Promise<void> {
+		// Flat delivery is the explicitly requested mode when topics are disabled;
+		// nudging the operator to enable Threaded Mode would be wrong.
+		if (!this.topicsEnabled()) return;
 		if (this.threadedFallbackNoticeSent || !(await this.pairedChatIsPrivate())) return;
 		this.threadedFallbackNoticeSent = true;
 		try {
@@ -5347,6 +5362,17 @@ export class TelegramNotificationDaemon {
 
 	/** Send a single `typing` chat action into a busy session's topic (best-effort). */
 	private async sendTyping(sessionId: string): Promise<void> {
+		if (!this.topicsEnabled()) {
+			// Flat mode: keep the typing indicator, but never target a stale topic
+			// record left over from a previous topics-enabled run.
+			if (!(await this.pairedChatIsPrivate())) return;
+			try {
+				await this.botApi.call("sendChatAction", { chat_id: this.opts.chatId, action: "typing" });
+			} catch {
+				// Best-effort: a failed chat action must never stop the daemon.
+			}
+			return;
+		}
 		const topicLease = await this.topicAuthorityLease(sessionId);
 		if (!topicLease || !this.topicLeaseIsCurrent(topicLease)) return;
 		const topicId = topicLease.topicId;

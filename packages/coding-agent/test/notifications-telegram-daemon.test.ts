@@ -7712,6 +7712,109 @@ test("threaded mode off: frames fall back to the flat paired chat with a one-tim
 	expect(ask).toBeTruthy();
 	expect(ask!.body.reply_markup?.inline_keyboard?.length).toBeGreaterThan(0);
 });
+
+test("topics disabled by config: no createForumTopic, frames deliver flat without a nudge", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = (async (method: string, body: any) => {
+		bot.calls.push({ method, body });
+		if (method === "createForumTopic")
+			throw new Error("createForumTopic must not be called when topics are disabled");
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "sendMessage") return { ok: true, result: { message_id: bot.calls.length } };
+		return { ok: true, result: true };
+	}) as any;
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		rich: { enabled: false },
+		topics: { enabled: false },
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+
+	await daemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "context_update",
+		sessionId: "S",
+		lastMessage: "hello world",
+	});
+	await daemon.handleSessionMessage(session as any, {
+		type: "action_needed",
+		sessionId: "S",
+		id: "ask1",
+		kind: "ask",
+		question: "Proceed?",
+		options: ["Yes", "No"],
+	});
+
+	expect(bot.calls.filter(c => c.method === "createForumTopic")).toHaveLength(0);
+	const sends = bot.calls.filter(c => c.method === "sendMessage");
+	expect(sends.length).toBeGreaterThan(0);
+	expect(sends.every(c => c.body.message_thread_id === undefined)).toBe(true);
+	// Explicitly disabled topics are the requested mode, not a capability failure:
+	// the Threaded Mode nudge must not be sent.
+	expect(sends.filter(c => String(c.body.text).includes(THREADED_FALLBACK_NOTICE))).toHaveLength(0);
+	const ask = sends.find(c => String(c.body.text).includes("Proceed?"));
+	expect(ask).toBeTruthy();
+	expect(ask!.body.reply_markup?.inline_keyboard?.length).toBeGreaterThan(0);
+});
+
+test("topics disabled by config: an existing topic record is ignored and delivery goes flat", async () => {
+	// Seed a topic registry record with an enabled daemon, then restart disabled:
+	// the stale record must not resurrect threaded delivery.
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const enabledDaemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	await enabledDaemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	expect(bot.calls.some(c => c.method === "createForumTopic")).toBe(true);
+
+	const bot2 = new FakeBotApi();
+	const disabledDaemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot2,
+		topics: { enabled: false },
+	});
+	await disabledDaemon.loadTopics();
+	await disabledDaemon.handleSessionMessage(session as any, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+	await disabledDaemon.handleSessionMessage(session as any, {
+		type: "context_update",
+		sessionId: "S",
+		lastMessage: "flat now",
+	});
+
+	expect(bot2.calls.filter(c => c.method === "createForumTopic")).toHaveLength(0);
+	const sends = bot2.calls.filter(c => c.method === "sendMessage");
+	expect(sends.length).toBeGreaterThan(0);
+	expect(sends.every(c => c.body.message_thread_id === undefined)).toBe(true);
+});
 test("topic creation transport failures fail closed without flat delivery", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();

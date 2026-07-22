@@ -87,6 +87,7 @@ const BASE_CFG: NotificationConfig = {
 		enabled: true,
 	},
 	topics: {
+		enabled: true,
 		nameTemplate: undefined,
 	},
 	idleTimeoutMs: 60000,
@@ -228,6 +229,7 @@ describe("notifications config", () => {
 				enabled: false,
 			},
 			topics: {
+				enabled: true,
 				nameTemplate: undefined,
 			},
 			idleTimeoutMs: 1234,

@@ -71,6 +71,7 @@ export interface NotificationSettingsSnapshot {
 			enabled: boolean;
 		};
 		topics: {
+			enabled: boolean;
 			nameTemplate?: string;
 		};
 	};
@@ -176,6 +177,7 @@ export function parseNotificationSettingsSnapshot(rawConfig?: unknown): Notifica
 				enabled: notificationSettingsBoolean(streaming.enabled, true),
 			},
 			topics: {
+				enabled: notificationSettingsBoolean(topics.enabled, true),
 				nameTemplate: notificationSettingsString(topics.nameTemplate),
 			},
 		},
@@ -245,6 +247,12 @@ export interface NotificationConfig {
 		enabled: boolean;
 	};
 	topics: {
+		/**
+		 * Master switch for per-session Telegram forum topics. `true` (default)
+		 * preserves Threaded Mode; `false` skips topic creation entirely and
+		 * delivers every frame flat to the paired chat.
+		 */
+		enabled: boolean;
 		/**
 		 * Optional Telegram forum-topic name template with `{repo}`, `{branch}`,
 		 * and `{title}` placeholders. Unset preserves the built-in

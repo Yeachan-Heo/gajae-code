@@ -50,7 +50,7 @@ function snapshot(overrides: Partial<NotificationSettingsSnapshot> = {}): Notifi
 			richDraft: { enabled: false },
 			toolActivity: { enabled: true },
 			streaming: { enabled: true },
-			topics: {},
+			topics: { enabled: true },
 		},
 		discord: {},
 		slack: {},

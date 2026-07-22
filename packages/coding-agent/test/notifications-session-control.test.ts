@@ -33,7 +33,7 @@ const BASE_CONFIG: NotificationConfig = {
 	richDraft: { enabled: false },
 	toolActivity: { enabled: true },
 	streaming: { enabled: true },
-	topics: { nameTemplate: undefined },
+	topics: { enabled: true, nameTemplate: undefined },
 	btw: { enabled: true },
 };
 

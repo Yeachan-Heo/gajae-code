@@ -68,7 +68,7 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 				rich: { enabled: true },
 				richDraft: { enabled: false },
 				toolActivity: { enabled: true },
-				topics: { nameTemplate: undefined },
+				topics: { enabled: true, nameTemplate: undefined },
 				btw: { enabled: true },
 				streaming: { enabled: true },
 			})
@@ -103,7 +103,7 @@ async function loadConfig(agentDir: string, kind: ChatDaemonKind): Promise<ChatD
 			rich: { enabled: true },
 			richDraft: { enabled: false },
 			toolActivity: { enabled: true },
-			topics: { nameTemplate: undefined },
+			topics: { enabled: true, nameTemplate: undefined },
 			btw: { enabled: true },
 			streaming: { enabled: true },
 		})
