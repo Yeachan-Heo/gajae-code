@@ -29,4 +29,4 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * in generation 17, and fail-closed blank-token validation plus lifecycle-startup
  * stop fencing in generation 18.
  */
-export const DAEMON_GENERATION = 18;
+export const DAEMON_GENERATION = 19;
