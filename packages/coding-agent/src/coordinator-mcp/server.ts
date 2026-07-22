@@ -3123,11 +3123,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		sessionId: unknown,
 		timeoutMs: unknown,
 		pollIntervalMs: unknown,
+		session?: Record<string, unknown>,
 	): Promise<Record<string, unknown>> {
 		const timeout = boundedAwaitTurnTimeoutMs(timeoutMs);
 		const pollInterval = boundedPollIntervalMs(pollIntervalMs);
 		const deadline = Date.now() + timeout;
 		let payload = await readTurnPayload(turnId, sessionId);
+		const initialTurn = payload.turn as TurnRecord;
+		let wasBusy = initialTurn.delivery?.delivered === true && initialTurn.status === "active";
+		let sdkQueryInterval = 0;
 		while (
 			payload.ok === true &&
 			!TERMINAL_TURN_STATUSES.has((payload.turn as TurnRecord).status) &&
@@ -3137,6 +3141,31 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const remainingMs = deadline - Date.now();
 			await waitForTurnStateChange(namespaceDir, payload.turn as TurnRecord, Math.min(pollInterval, remainingMs));
 			payload = await readTurnPayload(turnId, sessionId);
+			if (session && payload.ok === true && !TERMINAL_TURN_STATUSES.has((payload.turn as TurnRecord).status)) {
+				sdkQueryInterval += pollInterval;
+				if (sdkQueryInterval >= 2_000) {
+					sdkQueryInterval = 0;
+					try {
+						const ctxStatus = await queryContextStatus(session);
+						if (ctxStatus.is_streaming) {
+							wasBusy = true;
+						} else if (wasBusy && !ctxStatus.is_streaming) {
+							const prevState = await readSessionState(namespaceDir, sessionId as string);
+							await writeSessionState(namespaceDir, sessionId as string, "completed", {
+								currentTurnId: turnId as string,
+								lastTurnId: prevState?.last_turn_id ?? null,
+								live: (ctxStatus.live as boolean | null | undefined) ?? null,
+								reason: "sdk_idle_detected",
+								source: "coordinator",
+							});
+							payload = await readTurnPayload(turnId, sessionId);
+							break;
+						}
+					} catch {
+						// SDK query failure is non-fatal; fall back to file polling.
+					}
+				}
+			}
 		}
 		if (
 			payload.ok === true &&
@@ -3988,6 +4017,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											sessionId,
 											args.timeout_ms,
 											args.poll_interval_ms,
+											session,
 										),
 									}
 								: response;
@@ -4221,7 +4251,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return await readTurnPayload(args.turn_id, args.session_id);
 			}
 			if (name === "gjc_coordinator_await_turn") {
-				return await awaitTurnPayload(args.turn_id, args.session_id, args.timeout_ms, args.poll_interval_ms);
+				const sid = safeExternalId("session", args.session_id);
+				const sessionRecord = asRecord(await readJsonFile(sessionFile(sid))) ?? undefined;
+				return await awaitTurnPayload(
+					args.turn_id,
+					args.session_id,
+					args.timeout_ms,
+					args.poll_interval_ms,
+					sessionRecord,
+				);
 			}
 			if (name === "gjc_coordinator_submit_question_answer") {
 				requireCoordinatorMutation(config, "questions", args);
