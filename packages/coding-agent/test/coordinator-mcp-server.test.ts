@@ -802,6 +802,65 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(controls.some(control => control.operation === "session.close")).toBe(true);
 		expect(Date.parse(turn.started_at)).toBeFinite();
 	});
+	it("preserves ephemeral ownership while settling and closing a lifecycle-created terminal session", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const brokerSessions: Array<Record<string, unknown>> = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, brokerSessions);
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prompt: "finish and close",
+			idempotency_key: "terminal-lifecycle-session",
+			allow_mutation: true,
+		});
+		const sessionId = started.session_id as string;
+		const turnId = started.turn_id as string;
+		const runtimeDir = sessionRuntimeDir(root, sessionId);
+		await fs.mkdir(runtimeDir, { recursive: true });
+		await Bun.write(
+			path.join(runtimeDir, "runtime-state.json"),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "completed",
+				ready_for_input: true,
+				current_turn_id: null,
+				last_turn_id: null,
+				updated_at: new Date().toISOString(),
+				ended_at: new Date().toISOString(),
+				source: "agent_session_event",
+				live: false,
+				reason: null,
+				final_response: {
+					text: "done",
+					format: "markdown",
+					source: "agent_end",
+					artifact_path: null,
+					truncated: false,
+				},
+			}),
+		);
+
+		await expect(
+			server.callTool("gjc_coordinator_await_turn", { turn_id: turnId, timeout_ms: 50 }),
+		).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "completed" },
+		});
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: sessionId, allow_mutation: true }),
+		).resolves.toMatchObject({ ok: true, closed: true });
+		expect(brokerSessions).toEqual([]);
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({
+				input: expect.objectContaining({
+					sessionId,
+					endpointGeneration: 1,
+					endpointIncarnation: expect.stringMatching(/^[a-f0-9]{64}$/),
+				}),
+			}),
+		]);
+	});
 
 	it("adopts attributable runtime failure with a safe error projection", async () => {
 		const root = await tempRoot();
@@ -1933,6 +1992,35 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		]);
 		expect(await Bun.file(idleFile).exists()).toBe(false);
 		expect(await Bun.file(path.join(sessionsDir, "registered-session.json")).exists()).toBe(true);
+	});
+	it("idle reaps a lifecycle-created session without broad process cleanup", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const brokerSessions: Array<Record<string, unknown>> = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, brokerSessions);
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "idle-lifecycle-session",
+			allow_mutation: true,
+		});
+		const sessionId = (started.lifecycle as { session_id: string }).session_id;
+		const namespaceDir = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const sessionFile = path.join(namespaceDir, "sessions", `${sessionId}.json`);
+		const session = JSON.parse(await fs.readFile(sessionFile, "utf8"));
+		await Bun.write(
+			sessionFile,
+			JSON.stringify({ ...session, created_at: new Date(Date.now() - 31 * 60_000).toISOString() }),
+		);
+		await fs.rm(path.join(namespaceDir, "session-states", `${sessionId}.json`));
+
+		expect(await server.sessionReaper.sweepOnce()).toBe(1);
+		expect(brokerSessions).toEqual([]);
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({
+				input: expect.objectContaining({ sessionId, endpointIncarnation: session.endpoint_incarnation }),
+				idempotencyKey: `coordinator-reap:${sessionId}:${session.endpoint_incarnation}`,
+			}),
+		]);
 	});
 	describe("Coordinator MCP real broker lifecycle", () => {
 		for (const discoveryState of [

@@ -4158,6 +4158,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							session = normalizeSession({
 								session_id: sessionId,
 								cwd: sessionCwd,
+								ephemeral: true,
 								...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
 								broker_workspace: binding.workspace,
 								endpoint_generation: binding.endpointGeneration,
