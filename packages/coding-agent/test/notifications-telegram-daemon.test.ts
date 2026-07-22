@@ -14869,7 +14869,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			lastSeq: 0,
 			events: [],
 		});
-		await Bun.sleep(1);
+		expect(session.logicalSessionIdTrusted).toBe(true);
 		await daemon.handleSessionMessage(session, {
 			type: "turn_stream",
 			sessionId: "FRESH",
@@ -14885,9 +14885,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		await replay;
 		const internals = daemon as unknown as {
 			flushPool(): Promise<void>;
-			pendingThreadedFrames: Map<string, unknown[]>;
 		};
-		for (let attempt = 0; attempt < 20 && internals.pendingThreadedFrames.has("FRESH"); attempt++) await Bun.sleep(1);
 		await internals.flushPool();
 
 		expect(session.replayPending).toBe(false);
@@ -15296,7 +15294,7 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 			lastSeq: 0,
 			events: [],
 		});
-		await Bun.sleep(1);
+		expect(session.logicalSessionIdTrusted).toBe(true);
 		await daemon.handleSessionMessage(session, {
 			type: "turn_stream",
 			sessionId: "A",
@@ -15304,13 +15302,12 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		});
 		const internals = daemon as unknown as {
 			flushPool(): Promise<void>;
-			pendingThreadedFrames: Map<string, unknown[]>;
 		};
-		for (let attempt = 0; attempt < 20 && !internals.pendingThreadedFrames.has("A"); attempt++) await Bun.sleep(1);
-		expect(internals.pendingThreadedFrames.get("A")).toHaveLength(1);
+		expect(
+			bot.calls.some(call => call.method === "sendMessage" && call.body.text === "drains after eager create"),
+		).toBe(false);
 		releaseCreate.resolve({ ok: true, result: { message_thread_id: 101 } });
 		await replay;
-		for (let attempt = 0; attempt < 20 && internals.pendingThreadedFrames.has("A"); attempt++) await Bun.sleep(1);
 		await internals.flushPool();
 		expect(session.replayPending).toBe(false);
 		expect(session.recoveryLease?.state).toBe("authorized");

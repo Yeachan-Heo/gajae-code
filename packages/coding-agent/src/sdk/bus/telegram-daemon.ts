@@ -4597,6 +4597,18 @@ export class TelegramNotificationDaemon {
 		logicalSessionId: string;
 	}): Promise<boolean> {
 		if (this.#creationLeaseAllows(socketLease)) return true;
+		// Replay has authenticated the exact open transport but has not yet entered
+		// its recovery claim. Its eager create remains a transport-local claim; keep
+		// the result for that claim so recovery can bind it, rather than compensating
+		// it before endpoint authority is classified.
+		if (
+			socketLease.token === 0 &&
+			socketLease.logicalSessionId === socketLease.session.sessionId &&
+			socketLease.session.logicalSessionIdTrusted &&
+			!socketLease.session.recoveryLease &&
+			this.#ownsLiveOpenEndpoint(socketLease.session, this.#endpointBinding(socketLease.session))
+		)
+			return true;
 		if (
 			socketLease.token === 0 &&
 			socketLease.session.logicalSessionIdTrusted &&
@@ -5126,7 +5138,7 @@ export class TelegramNotificationDaemon {
 			(!session.logicalSessionIdTrusted || sessionId !== this.#logicalSessionId(session))
 		)
 			return undefined;
-		if (capturedCreationLease && !this.#leaseTokenAllows(capturedCreationLease)) return undefined;
+		if (capturedCreationLease && !(await this.#awaitCreationLeaseAuthority(capturedCreationLease))) return undefined;
 		const creationBinding = session ? this.#endpointBinding(session) : undefined;
 		const creationLeaseEpoch = this.topics.authorityEpoch(sessionId);
 		let acceptedTopicId: string | undefined;
@@ -6480,9 +6492,17 @@ export class TelegramNotificationDaemon {
 			// that races that claim must await its own public creation before classifying
 			// endpoint authority; otherwise the registry correctly sees an in-flight
 			// claim as ambiguous and rejects a valid bootstrap.
-			if (!this.topics.get(session.sessionId) && this.#ownsLiveOpenEndpoint(session, endpointBinding)) {
+			if (
+				!this.topics.get(session.sessionId) &&
+				this.#ownsLiveOpenEndpoint(session, endpointBinding) &&
+				this.topics.endpointAuthority(endpointBinding, session).state === "none"
+			) {
 				try {
-					await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, {}), session);
+					await this.ensureTopic(session.sessionId, this.topicNameFor(session.sessionId, {}), session, {
+						session,
+						token: 0,
+						logicalSessionId: session.sessionId,
+					});
 				} catch (error) {
 					logger.warn(
 						`notifications: Telegram replay topic creation failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
@@ -6527,6 +6547,13 @@ export class TelegramNotificationDaemon {
 				this.dropSession(session, "recovery_rejected");
 				return;
 			}
+			// The eager transport create can settle while replay is recovering its
+			// authority. Once that authority is exact, drain frames held for that
+			// topic through the newly authorized lease rather than relying on the
+			// open-handler's earlier provisional drain.
+			const recoveredTopicLease = this.topicAuthorityLeaseFromRegistry(this.#logicalSessionId(session));
+			if (recoveredTopicLease)
+				await this.flushPendingThreadedFrames(recoveredTopicLease.sessionId, recoveredTopicLease);
 			session.replayPending = false;
 			// Replay restores durable attachment state only. Live notification effects
 			// (turn streams, context updates, lifecycle messages) may already have been
