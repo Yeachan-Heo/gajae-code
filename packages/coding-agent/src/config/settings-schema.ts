@@ -1389,6 +1389,17 @@ export const SETTINGS_SCHEMA = {
 		ui: { tab: "interaction", label: "Collapse Changelog", description: "Show condensed changelog after updates" },
 	},
 
+	"beginnerMode.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Beginner Mode",
+			description:
+				"Explain in plain, jargon-free language with everyday analogies. Aimed at non-developers learning to code.",
+		},
+	},
+
 	// Notifications
 	"completion.notify": {
 		type: "enum",

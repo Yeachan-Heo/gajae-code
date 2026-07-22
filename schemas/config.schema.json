@@ -1025,6 +1025,17 @@
 			"description": "Show condensed changelog after updates",
 			"default": false
 		},
+		"beginnerMode": {
+			"type": "object",
+			"properties": {
+				"enabled": {
+					"type": "boolean",
+					"description": "Explain in plain, jargon-free language with everyday analogies. Aimed at non-developers learning to code.",
+					"default": false
+				}
+			},
+			"additionalProperties": false
+		},
 		"completion": {
 			"type": "object",
 			"properties": {

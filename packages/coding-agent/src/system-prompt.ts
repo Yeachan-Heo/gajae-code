@@ -371,6 +371,8 @@ export interface BuildSystemPromptOptions {
 	toolDiscoveryActive?: boolean;
 	/** Encourage the agent to delegate via tasks unless changes are trivial. */
 	eagerTasks?: boolean;
+	/** Explain concepts in plain, jargon-free language with everyday analogies for non-developers. */
+	beginnerMode?: boolean;
 	/** Rules with alwaysApply=true — their full content is injected into the prompt. */
 	alwaysApplyRules?: AlwaysApplyRule[];
 	/** Whether secret obfuscation is active. When true, explains the redaction format in the prompt. */
@@ -438,6 +440,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		intentField,
 		toolDiscoveryActive = false,
 		eagerTasks = false,
+		beginnerMode = false,
 		secretsEnabled = false,
 		workspaceTree: providedWorkspaceTree,
 		subagent = false,
@@ -612,6 +615,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		intentField: intentField ?? "",
 		toolDiscoveryActive: toolDiscoveryActive && hasHiddenToolDiscoveryTool,
 		eagerTasks,
+		beginnerMode,
 		secretsEnabled,
 		subagent,
 	};
