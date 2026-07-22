@@ -1,23 +1,42 @@
 # Deep-interview typed repair CLI (v1)
 
-This is the native, JSON-only repair and inspection surface for an existing GJC deep-interview session. It does not run the interview; `/skill:deep-interview` does that. Use these commands to diagnose and repair a repairable active session without editing state files.
+This is the native repair and inspection surface for an existing GJC deep-interview session. It does not run the interview; `/skill:deep-interview` does that. Use its CLI-owned drafts to repair a repairable active session without editing state files.
 
 > Do **not** use `grep`, `sed`, direct `.gjc/` edits, generic envelope replacement, or `--force` to repair this state. Run `sanity-check`, inspect the reported selector, then use the matching typed command with the current revision.
 
-## Wire rules and command grammars
+## Normal-flow draft protocol
 
-All typed commands require `--json`; flags are `--name value` only (no `--name=value`), cannot repeat, and no positional arguments are accepted. `session-id` and identifiers match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. JSON rejects duplicate keys at every depth.
+All commands require `--json`; flags are `--name value` only, cannot repeat, and identifiers match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Normal mutations use CLI-owned drafts, never caller-serialized JSON:
 
+```text
+gjc deep-interview draft create  --for initialize-context|confirm-topology|record-answer|apply-round-result --session-id ID [identity flags] --json
+gjc deep-interview draft edit    --draft-id ID --expected-draft-revision N --op set|append|remove --path /pointer [--value SCALAR|--value-file PATH|--null] --json
+gjc deep-interview draft show    --draft-id ID --json
+gjc deep-interview draft check   --draft-id ID --json
+gjc deep-interview draft rebase  --draft-id ID --expected-draft-revision N --to-state-revision N --json
+gjc deep-interview draft discard --draft-id ID --expected-draft-revision N --json
+```
+
+Create returns `draft_id`, `draft_revision`, and state `base_revision`. Every edit/rebase is CAS on `draft_revision` and returns its next value. `check` validates the complete bounded payload against current state without consuming or mutating it; it reports when the draft base is stale. To rebase a state-stale active draft, pass the caller-observed current state revision as `--to-state-revision`, then check again. Drafts are private workspace/session-bound CLI storage, atomically written with restrictive permissions, automatically expired/cleaned up, and retained briefly after consumption for idempotent receipts. Do not read, copy, or reconstruct draft storage.
+
+Use only kind-allowed JSON-pointer paths. `set` writes one scalar: use `--value` for strings/numbers/booleans, `--null` for null, and `--value-file` only for bounded text. `append` without a value creates an object scaffold for an array, then scalar-edit its leaves (for example `/components/0/id`). `remove` takes no value. Build arrays and nested objects with scaffolds and scalar edits, never inline JSON.
+
+After check, consume through the matching typed command: `gjc deep-interview initialize-context|confirm-topology|record-answer|apply-round-result --draft-id ID --expected-draft-revision <latest_draft_revision> --json`. Consume applies state CAS from the draft base revision, stamps a receipt, and marks the draft consumed. There is no public `draft consume` command. `record-answer` remains recorder-first: draft recovery is only for an answer shell the `ask` recorder did not persist. Full payload/envelope reconstruction is forbidden in normal flow.
+
+`inspect` and `sanity-check` stay direct bounded reads:
+```text
+gjc deep-interview inspect --session-id ID --selector summary|recent-scored|pending|round|topology|facts|triggers|floor [--round-key KEY] [--limit 1..25] [--cursor CURSOR] --json
+gjc deep-interview sanity-check --session-id ID --json
+```
+
+## Legacy compatibility: inline JSON request forms
+The request forms below are complete for compatibility callers only. Do not use them in normal setup, topology, answer fallback, or round-result flow.
 ```text
 gjc deep-interview initialize-context --session-id ID --schema-version 1 --expected-revision N --input-json JSON --json
 gjc deep-interview confirm-topology    --session-id ID --schema-version 1 --expected-revision N --input-json JSON --json
 gjc deep-interview record-answer       --session-id ID --schema-version 1 --expected-revision N --round N --question-id ID --question-json JSON_STRING --answer-json JSON [--round-id ID] [--component-id ID] [--dimension goal|constraints|criteria|context] --json
 gjc deep-interview apply-round-result  --session-id ID --schema-version 1 --expected-revision N --round N --question-id ID --result-json JSON [--round-id ID] --json
-gjc deep-interview inspect             --session-id ID --selector summary|recent-scored|pending|round|topology|facts|triggers|floor [--round-key KEY] [--limit 1..25] [--cursor CURSOR] --json
-gjc deep-interview sanity-check        --session-id ID --json
 ```
-
-`round-key` is required only for `inspect --selector round`. `limit` and `cursor` are allowed only for `recent-scored`, `pending`, `facts`, and `triggers`. Mutations require non-negative safe-integer `expected-revision`; `round` is a positive safe integer.
 
 ## Closed request schemas
 
@@ -88,7 +107,7 @@ Scores are finite `[0,1]` values with at most four decimal places. The dimension
 
 Every nested object is closed. Lists have a 64-item cap and share a 64-item result budget; IDs are unique where applicable. Relationships must refer to entities in the same request; fact operations must refer to valid existing/new facts. `disputed` and `unresolved` triggers require a rationale. Trigger score and ambiguity transition metrics are native-derived and never accepted from callers. `counter_deltas` are safe integers with absolute value at most 10,000.
 
-## Mutation lifecycle, CAS, receipts, and warnings
+## Legacy mutation lifecycle, receipts, and warnings
 
 The normal lifecycle is: initialize missing context → confirm topology → record an answer shell (`answered`) → apply its round result (`scored`). Every mutation is compare-and-swap on `state_revision`: re-inspect or use the prior successful response's `state_revision` before the next write. A matching replay is a success with `written:false`; it does not advance the revision. Existing different setup is `DI_SETUP_CONFLICT`; a different confirmed topology is `DI_TOPOLOGY_CONFLICT`; a changed pending answer is `DI_ANSWER_CONFLICT`; a changed scored answer is `DI_SHELL_CONFLICT`; a different result for a scored round is `DI_ROUND_RESULT_CONFLICT`.
 
@@ -160,25 +179,36 @@ Paged collections sort deterministically: recent scored by descending `(round, r
 
 Errors are JSON on stderr: `{ "ok": false, "issue": { "code": "…", "message": "…" } }`.
 
-## Strict-flow example
-
-A native kickoff/seed must create the session baseline before typed repair commands can mutate it. The following values match the passing strict-flow fixture's greenfield flow. Each mutation's `--expected-revision` is the preceding committed revision.
+## Normal-flow lifecycle example
 
 ```sh
-# Native kickoff/seed establishes the baseline at revision 0.
-gjc deep-interview --session-id strict-flow --threshold 0.0001 --json "strict flow"
+# Create, edit, check, then consume setup. Capture each response's revisions.
+gjc deep-interview draft create --for initialize-context --session-id strict-flow --json
+gjc deep-interview draft edit --draft-id <setup> --expected-draft-revision 1 --op set --path /type --value greenfield --json
+gjc deep-interview draft edit --draft-id <setup> --expected-draft-revision 2 --op set --path /threshold --value 0.0001 --json
+gjc deep-interview draft check --draft-id <setup> --json
+gjc deep-interview initialize-context --draft-id <setup> --expected-draft-revision <latest_draft_revision> --json
 
-# initialize: expected 0 → revision 1
-gjc deep-interview initialize-context --session-id strict-flow --schema-version 1 --expected-revision 0 --input-json '{"type":"greenfield","threshold":0.0001}' --json
+# Build topology with an append scaffold, then consume it.
+gjc deep-interview draft create --for confirm-topology --session-id strict-flow --json
+gjc deep-interview draft edit --draft-id <topology> --expected-draft-revision 1 --op append --path /components --json
+gjc deep-interview draft edit --draft-id <topology> --expected-draft-revision 2 --op set --path /components/0/id --value core --json
+gjc deep-interview draft edit --draft-id <topology> --expected-draft-revision 3 --op set --path /components/0/name --value Core --json
+gjc deep-interview draft check --draft-id <topology> --json
+gjc deep-interview confirm-topology --draft-id <topology> --expected-draft-revision <latest_draft_revision> --json
 
-# topology: expected 1 → revision 2
-gjc deep-interview confirm-topology --session-id strict-flow --schema-version 1 --expected-revision 1 --input-json '{"components":[{"id":"core","name":"Core","status":"active","active":true}],"deferred_components":[]}' --json
+# `ask` normally records this answer. Only recorder recovery creates this draft.
+gjc deep-interview draft create --for record-answer --session-id strict-flow --round 1 --question-id q1 --round-id r1 --component-id core --dimension goal --json
+gjc deep-interview draft edit --draft-id <answer> --expected-draft-revision 1 --op set --path /question --value Question --json
+gjc deep-interview draft edit --draft-id <answer> --expected-draft-revision 2 --op append --path /answer/selected_options --json
+gjc deep-interview draft edit --draft-id <answer> --expected-draft-revision 3 --op set --path /answer/selected_options/0 --value Yes --json
+gjc deep-interview draft edit --draft-id <answer> --expected-draft-revision 4 --op set --path /answer/custom_input --null --json
+gjc deep-interview draft check --draft-id <answer> --json
+gjc deep-interview record-answer --draft-id <answer> --expected-draft-revision <latest_draft_revision> --json
 
-# answer: expected 2 → revision 3
-gjc deep-interview record-answer --session-id strict-flow --schema-version 1 --expected-revision 2 --round 1 --question-id q1 --round-id r1 --question-json '"Question"' --answer-json '{"selected_options":["Yes"],"custom_input":null}' --component-id core --dimension goal --json
-
-# result: expected 3 → revision 4
-gjc deep-interview apply-round-result --session-id strict-flow --schema-version 1 --expected-revision 3 --round 1 --question-id q1 --round-id r1 --result-json '{"global_scores":{"goal":0.5000,"constraints":0.5000,"criteria":0.5000},"component_updates":[{"component_id":"core","scores":{"goal":0.5000,"constraints":0.5000,"criteria":0.5000}}],"targeting":{"target_component_id":"core","target_dimension":"goal","weakest_component_id":"core","weakest_dimension":"goal","last_targeted_component_id":null},"triggers":[],"fact_ops":[],"ontology":{"entities":[],"relationships":[],"reasoning":[]},"bookkeeping":{"resolution":"direct","round_ids":["r1"],"counter_deltas":{"asked":1}}}' --json
-gjc deep-interview inspect --session-id strict-flow --selector recent-scored --limit 10 --json
-gjc deep-interview sanity-check --session-id strict-flow --json
+# Create/check/consume an apply-round-result draft after inspecting the pending shell.
+gjc deep-interview draft create --for apply-round-result --session-id strict-flow --round-key <round_key> --json
+gjc deep-interview draft edit --draft-id <result> --expected-draft-revision 1 --op set --path /global_scores/goal --value 0.5000 --json
+gjc deep-interview draft check --draft-id <result> --json
+gjc deep-interview apply-round-result --draft-id <result> --expected-draft-revision <latest_draft_revision> --json
 ```
