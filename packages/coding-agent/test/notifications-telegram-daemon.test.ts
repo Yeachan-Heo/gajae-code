@@ -15872,3 +15872,54 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		).toEqual([909]);
 	});
 });
+test("malformed createForumTopic response is attempted once per endpoint", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	const originalCall = bot.call.bind(bot);
+	bot.call = async (method, body, options) => {
+		if (method === "createForumTopic") {
+			bot.calls.push({ method, body, options });
+			return { ok: true, result: true };
+		}
+		return originalCall(method, body, options);
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+	});
+
+	daemon.connectSession("S", "ws://first", "token");
+	await Bun.sleep(20);
+	const first = daemon.sessions.get("S")!;
+	await expect(
+		daemon.handleSessionMessage(first, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "gajae-code",
+			branch: "dev",
+		}),
+	).rejects.toThrow("invalid message_thread_id");
+	await daemon.handleSessionMessage(first, {
+		type: "turn_stream",
+		sessionId: "S",
+		text: "must not retry",
+	});
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+	(first.ws as unknown as FakeWs).close();
+
+	daemon.connectSession("S", "ws://replacement", "token");
+	const replacement = daemon.sessions.get("S")!;
+	await expect(
+		daemon.handleSessionMessage(replacement, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "gajae-code",
+			branch: "dev",
+		}),
+	).rejects.toThrow("invalid message_thread_id");
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(2);
+});

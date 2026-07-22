@@ -258,6 +258,7 @@ const BTW_QUESTION_LIMIT_TEXT = "Question must be at most 4096 Unicode scalar va
 type ParsedBtwCommand = { kind: "question"; question: string } | { kind: "ignored" };
 type TelegramFileDownload = { bytes: Buffer } | { failure: "download_failed" | "too_large" };
 class ThreadedModeCapabilityRefusal extends Error {}
+class MalformedForumTopicResponse extends Error {}
 
 /** Only an explicit Bot API capability refusal may enable flat private-chat delivery. */
 function isThreadedModeCapabilityRefusal(response: unknown): boolean {
@@ -2963,6 +2964,13 @@ export class TelegramNotificationDaemon {
 	private readonly botApi: BotApi;
 	private readonly effects = new TelegramEffectSupervisor();
 	private readonly topics = new TopicRegistry();
+	/**
+	 * A malformed successful create response is ambiguous: Telegram may have
+	 * created the topic even though the daemon cannot address it. Fence retries
+	 * for the same endpoint so discovery/replay loops cannot create unbounded
+	 * orphan topics. A replacement endpoint gets one fresh attempt.
+	 */
+	private readonly malformedTopicCreates = new Map<string, string>();
 	/** Serializes registry snapshots so an older atomic write cannot overwrite newer rename state. */
 	/** Legacy sockets have no durable token, so explicit teardown is their revocation fence. */
 	private readonly droppedSessions = new WeakSet<SessionSocket>();
@@ -5117,6 +5125,8 @@ export class TelegramNotificationDaemon {
 		if (session && sessionId === session.sessionId && this.#logicalSessionId(session) !== sessionId) return undefined;
 		const capturedCreationLease = creationLease ?? (session ? this.#socketLease(session, sessionId) : undefined);
 		if (session?.logicalSessionIdTrusted && !capturedCreationLease) return undefined;
+		const creationEndpointKey = session?.endpointDigest ?? session?.endpointKey ?? "unbound";
+		if (this.malformedTopicCreates.get(sessionId) === creationEndpointKey) return undefined;
 		const existing = this.topics.get(sessionId);
 		if (existing?.authorityState === "delete_pending" || existing?.bindingMalformed) return undefined;
 		if (existing) return existing.topicId;
@@ -5141,9 +5151,12 @@ export class TelegramNotificationDaemon {
 					const res = await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name });
 					if (isThreadedModeCapabilityRefusal(res)) throw new ThreadedModeCapabilityRefusal();
 					const tid = (res as { result?: { message_thread_id?: unknown } }).result?.message_thread_id;
-					if (typeof tid !== "number" || !Number.isSafeInteger(tid) || tid <= 0)
-						throw new Error("createForumTopic: invalid message_thread_id");
+					if (typeof tid !== "number" || !Number.isSafeInteger(tid) || tid <= 0) {
+						this.malformedTopicCreates.set(sessionId, creationEndpointKey);
+						throw new MalformedForumTopicResponse("createForumTopic: invalid message_thread_id");
+					}
 					acceptedTopicId = String(tid);
+					this.malformedTopicCreates.delete(sessionId);
 					if (capturedCreationLease && !(await this.#awaitCreationLeaseAuthority(capturedCreationLease))) {
 						if (
 							!this.topics.fenceAcceptedCreateForLease(
