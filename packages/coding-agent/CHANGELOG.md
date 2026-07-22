@@ -29,6 +29,7 @@
 - Repeated byte-identical stale SDK broker locks no longer cause startup to loop when a prior tombstone exists.
 - ConversationStore now tolerates only unsupported Windows parent-directory durability errors after preserving temporary-file fsync and atomic rename.
 - Ralplan no longer re-asks for execution approval when the user already explicitly named `ultragoal` or `team` in the current turn; that naming is the consent.
+- Interactive Windows startup now stays keyboard-ready with large session histories and native multiplexers by showing an interactive-only bootstrap before the first TUI start, deferring bounded recent-session discovery until afterward, and reducing psmux frame pressure while preserving the three-second animation and update checks.
 
 - Cron guidance now routes silent recurring polling and event-driven PR/CI watchers to `monitor`, because every cron firing starts a normal assistant turn and prompt wording cannot reliably suppress its response.
 - Ordinary `ask` calls now normalize a provider-emitted `deepInterview: null` placeholder instead of misclassifying it as malformed Round-0 intent recovery data and rejecting it before coercion.
