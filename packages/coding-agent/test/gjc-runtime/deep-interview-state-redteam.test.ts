@@ -6,6 +6,8 @@ import {
 	appendOrMergeDeepInterviewRound,
 	enrichDeepInterviewRoundScoring,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import { runDeepInterviewRepairCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-repair";
+import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import {
 	mergeDeepInterviewEnvelope,
 	mergeDeepInterviewRounds,
@@ -37,6 +39,26 @@ async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-di-redteam-"));
 	tempRoots.push(dir);
 	return dir;
+}
+async function seedRecorderState(cwd: string): Promise<void> {
+	const result = await runNativeDeepInterviewCommand(["--json", "seed recorder state"], cwd);
+	expect(result.status).toBe(0);
+	const initialized = await runDeepInterviewRepairCommand(
+		[
+			"initialize-context",
+			"--session-id",
+			TEST_SESSION_ID,
+			"--schema-version",
+			"1",
+			"--expected-revision",
+			"0",
+			"--input-json",
+			'{"type":"greenfield","threshold":0.05}',
+			"--json",
+		],
+		cwd,
+	);
+	expect(initialized.status).toBe(0);
 }
 
 function inner(envelope: { state?: Record<string, unknown> }): Record<string, unknown> {
@@ -292,6 +314,7 @@ describe("deep-interview redteam: writer and recorder integration", () => {
 	it("preserves all recorder rounds across multiple sequential partial state writes", async () => {
 		const cwd = await tempDir();
 		const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(
 			cwd,
 			statePath,
@@ -310,7 +333,7 @@ describe("deep-interview redteam: writer and recorder integration", () => {
 			{
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.4 },
+				scores: { goal: 0.4, constraints: 0.4, criteria: 0.4 },
 				ambiguity: 0.61,
 			},
 			{ sessionId: TEST_SESSION_ID },
@@ -364,11 +387,16 @@ describe("deep-interview redteam: writer and recorder integration", () => {
 		expect(await fs.readFile(statePath, "utf-8")).toBe(corruptBytes);
 
 		await expect(
-			appendOrMergeDeepInterviewRound(cwd, statePath, {
-				round: 1,
-				questionId: "q1",
-				questionText: "Should not migrate",
-			}),
+			appendOrMergeDeepInterviewRound(
+				cwd,
+				statePath,
+				{
+					round: 1,
+					questionId: "q1",
+					questionText: "Should not migrate",
+				},
+				{ sessionId: TEST_SESSION_ID },
+			),
 		).rejects.toThrow(/corrupt|tampered|refusing to overwrite/);
 		expect(await fs.readFile(statePath, "utf-8")).toBe(corruptBytes);
 	});

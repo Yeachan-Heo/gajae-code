@@ -12,6 +12,8 @@ import {
 	readDeepInterviewStateCompact,
 	validateDeepInterviewScoredTransition,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
+import { runDeepInterviewRepairCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-repair";
+import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { askSchema } from "@gajae-code/coding-agent/tools/ask";
 
@@ -23,6 +25,27 @@ async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-deep-interview-recorder-redteam-"));
 	tempRoots.push(dir);
 	return dir;
+}
+
+async function seedRecorderState(cwd: string): Promise<void> {
+	const result = await runNativeDeepInterviewCommand(["--json", "seed recorder state"], cwd);
+	expect(result.status).toBe(0);
+	const initialized = await runDeepInterviewRepairCommand(
+		[
+			"initialize-context",
+			"--session-id",
+			TEST_SESSION_ID,
+			"--schema-version",
+			"1",
+			"--expected-revision",
+			"0",
+			"--input-json",
+			'{"type":"greenfield","threshold":0.05}',
+			"--json",
+		],
+		cwd,
+	);
+	expect(initialized.status).toBe(0);
 }
 
 beforeAll(() => {
@@ -119,6 +142,7 @@ describe("deep-interview recorder redteam: persistence merge invariants", () => 
 	it("replace-then-enrich keeps exactly one record and enriches the replacement answer", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ selectedOptions: ["A"] }), {
 			sessionId: TEST_SESSION_ID,
 		});
@@ -138,7 +162,7 @@ describe("deep-interview recorder redteam: persistence merge invariants", () => 
 				interviewId: "iv-redteam",
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.35 },
+				scores: { goal: 0.35, constraints: 0.35, criteria: 0.35 },
 				ambiguity: 0.7,
 			},
 			{ sessionId: TEST_SESSION_ID },
@@ -153,6 +177,7 @@ describe("deep-interview recorder redteam: persistence merge invariants", () => 
 	it("idempotent replay across persistence returns noop and does not append", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 		const first = await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput(), {
 			sessionId: TEST_SESSION_ID,
 		});
@@ -214,10 +239,11 @@ describe("deep-interview recorder redteam: validator bypass attempts", () => {
 	});
 });
 
-describe("deep-interview recorder redteam: out-of-order re-score never compares against a future round", () => {
-	it("re-scoring an earlier round compares against its chronological predecessor, not a later scored round", async () => {
+describe("deep-interview recorder redteam: native trigger metrics reject stale ambiguity", () => {
+	it("rejects scoring a later round while a lower round is pending", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 
 		// Round 1: chronological predecessor — low ambiguity, high goal clarity.
 		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 1, questionId: "q1" }), {
@@ -230,60 +256,38 @@ describe("deep-interview recorder redteam: out-of-order re-score never compares 
 				interviewId: "iv-redteam",
 				round: 1,
 				questionId: "q1",
-				scores: { goal: 0.6 },
+				scores: { goal: 0.6, constraints: 0.6, criteria: 0.6 },
 				ambiguity: 0.4,
 			},
 			{ sessionId: TEST_SESSION_ID },
 		);
 
-		// Round 2: answered shell, deferred for an out-of-order re-score below.
+		// Round 2 remains pending, so native chronology rejects scoring round 3.
 		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 2, questionId: "q2" }), {
 			sessionId: TEST_SESSION_ID,
 		});
-
-		// Round 3: a LATER scored round with high ambiguity / low goal clarity. If the
-		// validator compared against the latest round in array order, this "future" round
-		// would be picked as the baseline for round 2.
 		await appendOrMergeDeepInterviewRound(cwd, statePath, answerInput({ round: 3, questionId: "q3" }), {
 			sessionId: TEST_SESSION_ID,
 		});
-		await enrichDeepInterviewRoundScoring(
-			cwd,
-			statePath,
-			{
-				interviewId: "iv-redteam",
-				round: 3,
-				questionId: "q3",
-				scores: { goal: 0.2 },
-				ambiguity: 0.9,
-			},
-			{ sessionId: TEST_SESSION_ID },
-		);
-
-		// Re-score round 2 with an active goal trigger. This transition is VALID against
-		// round 1 (ambiguity rises 0.4 -> 0.5, goal does not improve 0.6 -> 0.5) but would
-		// be INVALID against the future round 3 (ambiguity 0.9 -> 0.5 does not rise; goal
-		// 0.2 -> 0.5 improves). It must succeed, proving the chronological prior is used.
-		await enrichDeepInterviewRoundScoring(
-			cwd,
-			statePath,
-			{
-				interviewId: "iv-redteam",
-				round: 2,
-				questionId: "q2",
-				scores: { goal: 0.5 },
-				ambiguity: 0.5,
-				triggers: [trigger({ dimension: "goal" })],
-			},
-			{ sessionId: TEST_SESSION_ID },
-		);
+		await expect(
+			enrichDeepInterviewRoundScoring(
+				cwd,
+				statePath,
+				{
+					interviewId: "iv-redteam",
+					round: 3,
+					questionId: "q3",
+					scores: { goal: 0.2, constraints: 0.2, criteria: 0.2 },
+					ambiguity: 0.9,
+				},
+				{ sessionId: TEST_SESSION_ID },
+			),
+		).rejects.toThrow("DI_STATE_SCHEMA_INVALID");
 
 		const rounds = await readPersistedRounds(statePath);
-		const round2 = rounds.find(r => r.round === 2);
-		expect(round2?.lifecycle).toBe("scored");
-		expect(round2?.ambiguity).toBe(0.5);
-		// Round 3 stays untouched as the later scored round.
-		expect(rounds.find(r => r.round === 3)?.lifecycle).toBe("scored");
+		expect(rounds.find(r => r.round === 2)?.lifecycle).toBe("answered");
+		expect(rounds.find(r => r.round === 3)?.lifecycle).toBe("answered");
+		expect(rounds.find(r => r.round === 3)?.ambiguity).toBeUndefined();
 	});
 });
 
@@ -345,6 +349,7 @@ describe("deep-interview recorder redteam: compact read transcript minimization"
 	it("returns only lastN scored rounds and separates all pending shells", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
+		await seedRecorderState(cwd);
 
 		for (let round = 1; round <= 6; round++) {
 			await appendOrMergeDeepInterviewRound(
@@ -360,7 +365,7 @@ describe("deep-interview recorder redteam: compact read transcript minimization"
 					interviewId: "iv-redteam",
 					round,
 					questionId: `q${round}`,
-					scores: { goal: 1 - round / 10 },
+					scores: { goal: 1 - round / 10, constraints: 1 - round / 10, criteria: 1 - round / 10 },
 					ambiguity: round / 10,
 				},
 				{ sessionId: TEST_SESSION_ID },

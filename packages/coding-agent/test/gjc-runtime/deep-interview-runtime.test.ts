@@ -7,6 +7,7 @@ import {
 	createDeepInterviewIntentManifest,
 	MAX_INITIAL_CONTEXT_LENGTH,
 	reviewDeepInterviewIntent,
+	validateDeepInterviewV1Envelope,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
 import {
@@ -69,6 +70,17 @@ describe("native gjc deep-interview runtime", () => {
 		expect(source).toContain("deliberate: Flags.boolean");
 		expect(source).toContain("trace: Flags.boolean");
 		expect(source).toContain("handoff: Flags.string");
+	});
+	it("routes kickoff locking and parent creation through state-writer", async () => {
+		const source = await fs.readFile(
+			path.join(codingAgentRoot, "src/gjc-runtime/deep-interview-runtime.ts"),
+			"utf-8",
+		);
+
+		expect(source).toMatch(/withWorkflowStateLock\(\s*`\$\{statePath\}\.kickoff`/);
+		expect(source).toMatch(/\n\s+\{ cwd \},\n\s+\);\n\}/);
+		expect(source).not.toContain('from "../config/file-lock"');
+		expect(source).not.toContain("fs.mkdir(path.dirname(statePath), { recursive: true });");
 	});
 
 	it("handles missing, valid, and corrupt deep-interview state during spec persistence", async () => {
@@ -498,7 +510,39 @@ describe("native gjc deep-interview runtime", () => {
 		expect(state.threshold).toBeCloseTo(0.05);
 		expect(state.threshold_source).toBe("default");
 		expect(state.state.initial_idea).toBe("my vague idea");
+		validateDeepInterviewV1Envelope(state);
+		expect(state.schema_version).toBe(1);
+		expect(state.state.type).toBe("greenfield");
+		expect(state.state.ontology_snapshots).toEqual([]);
+		expect(state.state.auto_researched_rounds).toEqual([]);
+		expect(state.state.auto_answered_rounds).toEqual([]);
+		expect(state.state.architect_failures).toBe(0);
+		expect(state.state.topology).toEqual({ status: "pending", components: [], deferred_components: [] });
 		expect(state.state.established_facts).toEqual([]);
+	});
+	it("surfaces threshold-config filesystem failures instead of treating them as absent", async () => {
+		const root = await tempDir();
+		const agentDir = await tempDir();
+		setAgentDir(agentDir);
+		await fs.mkdir(path.join(agentDir, "config.yml"));
+
+		const result = await runNativeDeepInterviewCommand(["idea"], root);
+
+		expect(result.status).toBe(1);
+		expect(result.stderr).toContain("config.yml");
+	});
+	it("uses exit 3 for corrupt kickoff state while preserving parser exit 2", async () => {
+		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(statePath, '{"state":', "utf-8");
+
+		const corrupt = await runNativeDeepInterviewCommand(["--json", "idea"], root);
+		expect(corrupt.status).toBe(3);
+		expect(corrupt.stderr).toContain("DI_STATE_CORRUPT");
+
+		const invalid = await runNativeDeepInterviewCommand(["--threshold", "not-a-number", "idea"], root);
+		expect(invalid.status).toBe(2);
 	});
 
 	it("rejects an oversized initial idea before seeding workflow state", async () => {
@@ -539,6 +583,7 @@ describe("native gjc deep-interview runtime", () => {
 
 		const state = JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "deep-interview"), "utf-8"));
 		expect(state.state.rounds).toEqual([]);
+		expect(state.state.type).toBe("brownfield");
 		expect(state.state.trace_summary).toEqual(payload.trace);
 		expect(state.state.codebase_context).toMatchObject({ source: "trace" });
 		expect(JSON.stringify(state.state.trace_summary)).not.toContain("raw content must not be copied");
@@ -576,6 +621,12 @@ describe("native gjc deep-interview runtime", () => {
 
 	it("keeps the normal no-trace deep-interview seed path unchanged", async () => {
 		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const stateDirectoryExistsBeforeKickoff = await fs
+			.stat(path.dirname(statePath))
+			.then(() => true)
+			.catch(() => false);
+		expect(stateDirectoryExistsBeforeKickoff).toBe(false);
 		const result = await runNativeDeepInterviewCommand(["--json", "my vague idea"], root);
 		expect(result.status).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
