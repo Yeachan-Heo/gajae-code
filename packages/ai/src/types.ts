@@ -711,7 +711,8 @@ export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: inf
 
 export type RawArgumentRejectionCode =
 	| "ask-intent-review-requires-positive-round"
-	| "ask-intent-contract-requires-non-empty-authority";
+	| "ask-intent-contract-requires-non-empty-authority"
+	| "ask-deep-interview-metadata-requires-deep-interview-gate";
 
 export type RawArgumentValidationResult =
 	| { outcome: "passthrough" }

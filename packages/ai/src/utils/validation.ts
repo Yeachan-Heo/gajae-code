@@ -963,6 +963,8 @@ const RAW_ARGUMENT_REJECTION_MESSAGES: Record<RawArgumentRejectionCode, string> 
 		"deepInterview.intent_review is post-Round-0 only and requires a positive round",
 	"ask-intent-contract-requires-non-empty-authority":
 		"deepInterview.intent_contract requires non-empty items and confirmation_options",
+	"ask-deep-interview-metadata-requires-deep-interview-gate":
+		"deepInterview metadata cannot be combined with a non-deep-interview workflowGate",
 };
 
 /**

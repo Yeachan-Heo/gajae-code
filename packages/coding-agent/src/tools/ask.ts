@@ -209,6 +209,16 @@ function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMe
 			const labels = new Set(value.options.map(option => option.label));
 			const contract = intentContract(value.deepInterview);
 			const review = intentReview(value.deepInterview);
+			if (
+				value.deepInterview &&
+				value.workflowGate &&
+				(value.workflowGate.stage !== "deep-interview" || value.workflowGate.kind !== "question")
+			)
+				context.addIssue({
+					code: "custom",
+					message: "deep-interview metadata requires a deep-interview question workflow gate",
+					path: ["workflowGate"],
+				});
 			if (contract && review)
 				context.addIssue({
 					code: "custom",
@@ -387,6 +397,12 @@ function knownIntentRejection(arguments_: Record<string, unknown>): RawArgumentV
 	const metadata = question.deepInterview;
 	const hasContract = Object.hasOwn(metadata, "intent_contract");
 	const hasReview = Object.hasOwn(metadata, "intent_review");
+	const workflowGate = question.workflowGate;
+	if (
+		Object.hasOwn(question, "workflowGate") &&
+		(!isPlainRecord(workflowGate) || workflowGate.stage !== "deep-interview" || workflowGate.kind !== "question")
+	)
+		return { outcome: "reject", code: "ask-deep-interview-metadata-requires-deep-interview-gate" };
 	if (hasReview && !hasContract && metadata.round === 0) {
 		return { outcome: "reject", code: "ask-intent-review-requires-positive-round" };
 	}
@@ -1154,6 +1170,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		if (customInput !== undefined && (meta || isDeepInterviewAskQuestion(q.question)))
 			assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 		if (!meta) return;
+		if (q.workflowGate && (q.workflowGate.stage !== "deep-interview" || q.workflowGate.kind !== "question")) return;
 		const cwd = this.session.cwd;
 		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const statePath = deepInterviewStatePath(cwd, sessionId);
