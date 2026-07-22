@@ -214,6 +214,21 @@
       },
       {
         "appliesToVerbs": [
+          "kickoff"
+        ],
+        "name": "trace",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "kickoff",
+          "write-spec"
+        ],
+        "name": "json",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
           "write-spec"
         ],
         "enumValues": [
@@ -256,10 +271,163 @@
       },
       {
         "appliesToVerbs": [
-          "write-spec"
+          "initialize-context",
+          "confirm-topology",
+          "record-answer",
+          "apply-round-result",
+          "inspect",
+          "sanity-check"
+        ],
+        "name": "session-id",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "initialize-context",
+          "confirm-topology",
+          "record-answer",
+          "apply-round-result",
+          "inspect",
+          "sanity-check"
         ],
         "name": "json",
+        "required": true,
         "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "initialize-context",
+          "confirm-topology",
+          "record-answer",
+          "apply-round-result"
+        ],
+        "name": "schema-version",
+        "required": true,
+        "type": "number"
+      },
+      {
+        "appliesToVerbs": [
+          "initialize-context",
+          "confirm-topology",
+          "record-answer",
+          "apply-round-result"
+        ],
+        "name": "expected-revision",
+        "required": true,
+        "type": "number"
+      },
+      {
+        "appliesToVerbs": [
+          "initialize-context",
+          "confirm-topology"
+        ],
+        "name": "input-json",
+        "required": true,
+        "type": "object"
+      },
+      {
+        "appliesToVerbs": [
+          "record-answer",
+          "apply-round-result"
+        ],
+        "name": "round",
+        "required": true,
+        "type": "number"
+      },
+      {
+        "appliesToVerbs": [
+          "record-answer",
+          "apply-round-result"
+        ],
+        "name": "question-id",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "record-answer",
+          "apply-round-result"
+        ],
+        "name": "round-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "record-answer"
+        ],
+        "name": "component-id",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "record-answer"
+        ],
+        "name": "dimension",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "record-answer"
+        ],
+        "name": "answer-json",
+        "required": true,
+        "type": "object"
+      },
+      {
+        "appliesToVerbs": [
+          "record-answer"
+        ],
+        "name": "question-json",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "apply-round-result"
+        ],
+        "name": "result-json",
+        "required": true,
+        "type": "object"
+      },
+      {
+        "appliesToVerbs": [
+          "inspect"
+        ],
+        "enumValues": [
+          "summary",
+          "recent-scored",
+          "pending",
+          "round",
+          "topology",
+          "facts",
+          "triggers",
+          "floor"
+        ],
+        "name": "selector",
+        "required": true,
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "inspect"
+        ],
+        "name": "round-key",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "inspect"
+        ],
+        "name": "cursor",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "inspect"
+        ],
+        "name": "limit",
+        "type": "number"
       },
       {
         "name": "args",
@@ -304,6 +472,30 @@
       {
         "name": "write-spec",
         "surface": "command-flag"
+      },
+      {
+        "name": "initialize-context",
+        "surface": "command-positional"
+      },
+      {
+        "name": "confirm-topology",
+        "surface": "command-positional"
+      },
+      {
+        "name": "record-answer",
+        "surface": "command-positional"
+      },
+      {
+        "name": "apply-round-result",
+        "surface": "command-positional"
+      },
+      {
+        "name": "inspect",
+        "surface": "command-positional"
+      },
+      {
+        "name": "sanity-check",
+        "surface": "command-positional"
       },
       {
         "name": "graph",
