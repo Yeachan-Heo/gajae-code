@@ -4,8 +4,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const skillPath = join(dirname(fileURLToPath(import.meta.url)), "../src/defaults/gjc/skills/deep-interview/SKILL.md");
+const statePath = join(dirname(fileURLToPath(import.meta.url)), "../src/gjc-runtime/deep-interview-state.ts");
 
 const skill = readFileSync(skillPath, "utf8");
+const stateSource = readFileSync(statePath, "utf8");
 
 function extractSection(content: string, sectionName: string): string {
 	const sectionMatch = content.match(new RegExp(`<${sectionName}>\\n([\\s\\S]*?)\\n</${sectionName}>`));
@@ -30,20 +32,64 @@ describe("deep-interview skill conflict-aware scoring contract", () => {
 		expect(skill).toMatch(/no separate penalty term/i);
 	});
 
-	it("requires structured scorer output for conflict transitions", () => {
+	it("keeps ambiguity derived by the native runtime", () => {
 		expect(skill).toMatch(/Structured scorer output is required/i);
 		expect(skill).toContain("affected_dimension");
-		expect(skill).toContain("prior_ambiguity");
-		expect(skill).toContain("new_ambiguity");
-		expect(skill).toContain("contradicted_established_fact");
+		expect(skill).toContain("prior_dimension_score");
+		expect(skill).toContain("new_dimension_score");
+		expect(skill).toContain("Do not include prior/new ambiguity");
+		expect(skill).not.toContain("prior_ambiguity");
+		expect(skill).not.toContain("new_ambiguity");
+		expect(skill).toContain("runtime validates and returns the authoritative ambiguity transition");
+		expect(skill).toContain("{<native>.native_projection.effective_ambiguity}");
 	});
+	it("renders progress exclusively from version 1 native projection paths", () => {
+		const steps = extractSection(skill, "Steps");
+		const applyIndex = steps.indexOf("### Step 2d: Apply Round Result and Report Progress");
+		const applyCommandIndex = steps.indexOf("gjc deep-interview apply-round-result", applyIndex);
+		const reportEndIndex = steps.indexOf("### Step 2e: Check Soft Limits", applyCommandIndex);
+		const report = steps.slice(applyCommandIndex, reportEndIndex);
+		const projectionStart = stateSource.indexOf("export interface DeepInterviewRoundResultProjection");
+		const projectionEnd = stateSource.indexOf("\n}", projectionStart);
+		const projectionContract = stateSource.slice(projectionStart, projectionEnd);
 
-	it("reports ambiguity direction and validates trigger transitions", () => {
-		expect(skill).toContain("{prior_score}% -> {score}% {up|down|flat}");
-		expect(skill).toMatch(/TRANSITION VALIDATION/i);
-		expect(skill).toMatch(
-			/trigger is present, the affected dimension must not improve and overall ambiguity must rise/i,
-		);
+		expect(applyIndex).toBeGreaterThanOrEqual(0);
+		expect(applyCommandIndex).toBeGreaterThan(applyIndex);
+		expect(report).toContain("consume `<native>.native_projection` as the version 1 native projection");
+		for (const path of [
+			"prior_effective_ambiguity",
+			"effective_ambiguity",
+			"direction",
+			"floor",
+			"ambiguity_milestone",
+			"targeting.target_component_id",
+			"targeting.target_dimension",
+			"topology_counts.active",
+			"topology_counts.deferred",
+			"topology_counts.total",
+			"ontology_counts.stable",
+			"ontology_counts.changed",
+			"ontology_counts.new",
+			"transition.auto_answer_streak",
+			"transition.lifecycle",
+			"transition.round_key",
+		]) {
+			expect(report).toContain(`<native>.native_projection.${path}`);
+			expect(projectionContract).toContain(`${path.split(".").at(-1)}:`);
+		}
+		for (const unavailable of [
+			"target_component_name",
+			"trigger_summary",
+			"dominant_floor_cause",
+			"entity_count",
+			"stability_ratio",
+			"prior_milestone",
+			"milestone_transition",
+			"weakest_dimension",
+			"weakest_dimension_rationale",
+			"threshold",
+		])
+			expect(report).not.toContain(`native.${unavailable}`);
 	});
 
 	it("documents convergence pacing as deferred", () => {
