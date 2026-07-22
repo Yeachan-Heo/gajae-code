@@ -1669,6 +1669,7 @@ export class AgentSession {
 
 	#skillsSettings: SkillsSettings | undefined;
 	#activeSkillState: { skill: string; sessionId?: string } | undefined;
+	#restoredWorkflowSkillState: { skill: string; sessionId: string } | undefined;
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
@@ -2490,15 +2491,21 @@ export class AgentSession {
 	}
 	/** Provider-facing ask metadata must expose only the active deep-interview phase. */
 	getDeepInterviewAskStage(): "topology" | "post-topology" | undefined {
-		const active = this.#activeSkillState;
+		const currentSessionId = this.sessionManager.getSessionId();
+		const inMemory = this.#activeSkillState;
+		const active =
+			inMemory && (!inMemory.sessionId || inMemory.sessionId === currentSessionId)
+				? inMemory
+				: this.#restoredWorkflowSkillState?.sessionId === currentSessionId
+					? this.#restoredWorkflowSkillState
+					: undefined;
 		if (active?.skill !== "deep-interview") return undefined;
-		const sessionId = active.sessionId ?? this.sessionManager.getSessionId();
 		try {
-			assertNonEmptyGjcSessionId(sessionId, "AgentSession.getDeepInterviewAskStage");
-			const stateDir = sessionStateDir(this.sessionManager.getCwd(), sessionId);
+			assertNonEmptyGjcSessionId(currentSessionId, "AgentSession.getDeepInterviewAskStage");
+			const stateDir = sessionStateDir(this.sessionManager.getCwd(), currentSessionId);
 			const filePath = path.join(
 				stateDir,
-				path.basename(sessionModeStatePath(this.sessionManager.getCwd(), sessionId, active.skill)),
+				path.basename(sessionModeStatePath(this.sessionManager.getCwd(), currentSessionId, active.skill)),
 			);
 			const raw = fs.readFileSync(filePath, "utf-8");
 			const parsed = JSON.parse(raw) as { state?: { intent_contract?: unknown } };
@@ -6815,7 +6822,12 @@ export class AgentSession {
 			// a predecessor session's workflow state to the current identity.
 			if (this.#isDisposed || this.sessionManager.getSessionId() !== sessionId) return;
 		}
-		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) this.#attachAskTool();
+		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
+			if (!inMemoryActiveSkill) this.#restoredWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
+			this.#attachAskTool();
+		} else if (this.#restoredWorkflowSkillState?.sessionId === sessionId) {
+			this.#restoredWorkflowSkillState = undefined;
+		}
 	}
 
 	#attachAskTool(): void {
@@ -7367,6 +7379,7 @@ export class AgentSession {
 			}
 		}
 		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
+		this.#restoredWorkflowSkillState = undefined;
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
 		if (active) {
 			await this.refreshGjcSubskillTools();

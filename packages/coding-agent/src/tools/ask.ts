@@ -378,9 +378,32 @@ function normalizeRoundZeroOptionalNulls(arguments_: Record<string, unknown>): R
 	if (changed) normalizedQuestion.deepInterview = normalizedDeepInterview;
 	return changed ? { ...arguments_, questions: [normalizedQuestion] } : arguments_;
 }
+
+function knownIntentRejection(arguments_: Record<string, unknown>): RawArgumentValidationResult | undefined {
+	if (!isPlainRecord(arguments_) || !Array.isArray(arguments_.questions) || arguments_.questions.length !== 1)
+		return undefined;
+	const question = arguments_.questions[0];
+	if (!isPlainRecord(question) || !isPlainRecord(question.deepInterview)) return undefined;
+	const metadata = question.deepInterview;
+	const hasContract = Object.hasOwn(metadata, "intent_contract");
+	const hasReview = Object.hasOwn(metadata, "intent_review");
+	if (hasReview && !hasContract && metadata.round === 0) {
+		return { outcome: "reject", code: "ask-intent-review-requires-positive-round" };
+	}
+	if (!hasContract || !isPlainRecord(metadata.intent_contract)) return undefined;
+	const contract = metadata.intent_contract;
+	if (
+		(Array.isArray(contract.items) && contract.items.length === 0) ||
+		(Array.isArray(contract.confirmation_options) && contract.confirmation_options.length === 0)
+	)
+		return { outcome: "reject", code: "ask-intent-contract-requires-non-empty-authority" };
+	return undefined;
+}
 function recoverRoundZeroIntentContract(arguments_: Record<string, unknown>): RawArgumentValidationResult {
 	if (!isRoundZeroRecoveryCandidate(arguments_)) return { outcome: "passthrough" };
 	const normalizedArguments = normalizeRoundZeroOptionalNulls(arguments_);
+	const knownRejection = knownIntentRejection(normalizedArguments);
+	if (knownRejection) return knownRejection;
 	if (!isOnlyPlainData(normalizedArguments) || !isPlainRecord(normalizedArguments)) return { outcome: "reject" };
 	if (
 		!hasExactOwnKeys(normalizedArguments, ["questions"]) ||

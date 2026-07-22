@@ -4,9 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
+import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { Settings } from "../src/config/settings";
-import { sessionStateDir } from "../src/gjc-runtime/session-layout";
+import { modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
@@ -299,16 +300,16 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 				message: {
 					role: "custom",
 					customType: SKILL_PROMPT_MESSAGE_TYPE,
-					content: "# Ultragoal",
+					content: "# Deep Interview",
 					display: true,
-					details: { name: "ultragoal" },
+					details: { name: "deep-interview" },
 					attribution: "agent",
 					timestamp: Date.now(),
 				},
 			});
 			for (let attempt = 0; attempt < 20 && !session.getActiveSkillState(); attempt += 1) await Bun.sleep(1);
 			expect(session.getActiveToolNames()).toContain("ask");
-			expect(session.getActiveSkillState()).toMatchObject({ skill: "ultragoal" });
+			expect(session.getActiveSkillState()).toMatchObject({ skill: "deep-interview" });
 
 			await expect(session.newSession()).resolves.toBe(true);
 			expect(session.getActiveToolNames()).not.toContain("ask");
@@ -340,6 +341,44 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			// Deterministic readiness contract: createAgentSession awaits
 			// workflowGateToolRestoration, so ask must be resident immediately.
 			expect(resumedSession.getActiveToolNames()).toContain("ask");
+			const askTool = resumedSession.agent.state.tools.find(tool => tool.name === "ask");
+			if (!askTool) throw new Error("Expected restored AskTool");
+			const reviewCall = {
+				type: "toolCall" as const,
+				id: "resumed-round-zero-review",
+				name: "ask",
+				arguments: {
+					questions: [
+						{
+							id: "topology",
+							question: "Confirm?",
+							options: [{ label: "Confirm" }],
+							deepInterview: {
+								round: 1,
+								component: "locked-intent",
+								dimension: "constraints",
+								ambiguity: 0.2,
+								intent_review: {
+									observed_items: [
+										{ id: "artifact:report", category: "artifact", statement: "Produce report" },
+									],
+									supporting_substitutions: [],
+									approval_options: ["Confirm"],
+								},
+							},
+						},
+					],
+				},
+			};
+			expect(() => validateToolArguments(askTool, reviewCall)).toThrow('Validation failed for tool "ask"');
+
+			const statePath = modeStatePath(tempDir, resumedSession.sessionId, "deep-interview");
+			const modeState = JSON.parse(await Bun.file(statePath).text());
+			modeState.state = { ...(modeState.state ?? {}), intent_contract: {} };
+			await Bun.write(statePath, JSON.stringify(modeState));
+			expect(validateToolArguments(askTool, reviewCall)).toMatchObject({
+				questions: [{ deepInterview: { intent_review: { approval_options: ["Confirm"] } } }],
+			});
 		} finally {
 			await resumedSession.dispose();
 			resumedAuthStorage.close();

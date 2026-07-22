@@ -12,6 +12,7 @@
 ### Changed
 
 - Replaced the `alibaba-coding-plan` provider with first-class `alibaba-token-plan` support. The `/login` OAuth list, provider descriptor, model manager, models.dev descriptor, and bundled `models.json` now target the maintained Alibaba Token Plan endpoint (`https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`, env `ALIBABA_TOKEN_PLAN_API_KEY`) and validate logins against `deepseek-v4-pro`. The retired `alibaba-coding-plan` provider pointed at `coding-intl.dashscope.aliyuncs.com`, which rejected real token-plan keys with 401 and was the only Alibaba entry exposed in `/login`.
+- Raw tool-argument rejection hooks can now select from bounded, authority-controlled correction codes. Unknown or extension-supplied values retain the byte-for-byte generic rejection instead of reaching model-visible validation errors.
 
 ## [0.11.4] - 2026-07-20
 

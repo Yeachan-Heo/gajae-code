@@ -3150,6 +3150,23 @@ describe("AskTool Round-0 intent recovery", () => {
 		expect(result.questions[0]).not.toHaveProperty("deepInterview");
 	});
 
+	it("returns bounded corrections for strict-wire intent constraints that local validation must enforce", () => {
+		const roundZeroReview = roundZeroPair();
+		Reflect.deleteProperty(roundZeroReview.questions[0].deepInterview, "intent_contract");
+		roundZeroReview.questions[0].deepInterview.intent_review.observed_items = [];
+		roundZeroReview.questions[0].deepInterview.intent_review.approval_options = [];
+		expect(() => validateAsk(roundZeroReview)).toThrow(
+			"deepInterview.intent_review is post-Round-0 only and requires a positive round",
+		);
+
+		const emptyContract = roundZeroPair();
+		Reflect.deleteProperty(emptyContract.questions[0].deepInterview, "intent_review");
+		emptyContract.questions[0].deepInterview.intent_contract.items = [];
+		emptyContract.questions[0].deepInterview.intent_contract.confirmation_options = [];
+		expect(() => validateAsk(emptyContract)).toThrow(
+			"deepInterview.intent_contract requires non-empty items and confirmation_options",
+		);
+	});
 	it("terminally rejects every recovery-shaped near-miss before coercion", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
 		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn() };

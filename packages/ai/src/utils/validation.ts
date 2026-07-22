@@ -25,7 +25,7 @@
 import { structuredCloneJSON } from "@gajae-code/utils";
 import type { ZodType } from "zod/v4";
 import type { $ZodIssue as ZodIssue } from "zod/v4/core";
-import type { Tool, ToolCall } from "../types";
+import type { RawArgumentRejectionCode, Tool, ToolCall } from "../types";
 import { upgradeJsonSchemaTo202012 } from "./schema/draft";
 import {
 	isJsonSchemaValueValid,
@@ -958,6 +958,13 @@ export function validateToolCall(tools: Tool[], toolCall: ToolCall): ToolCall["a
 	return validateToolArguments(tool, toolCall);
 }
 
+const RAW_ARGUMENT_REJECTION_MESSAGES: Record<RawArgumentRejectionCode, string> = {
+	"ask-intent-review-requires-positive-round":
+		"deepInterview.intent_review is post-Round-0 only and requires a positive round",
+	"ask-intent-contract-requires-non-empty-authority":
+		"deepInterview.intent_contract requires non-empty items and confirmation_options",
+};
+
 /**
  * Validates tool call arguments against the tool's schema (Zod or plain JSON
  * Schema). Applies LLM-quirk coercions (numeric strings, JSON-string
@@ -969,7 +976,13 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 	const originalArgs = toolCall.arguments;
 	const rawValidation = tool.rawArgumentValidation?.(originalArgs);
 	if (rawValidation?.outcome === "reject") {
-		throw new Error(`Validation failed for tool "${toolCall.name}": raw arguments rejected before coercion`);
+		const base = `Validation failed for tool "${toolCall.name}": raw arguments rejected before coercion`;
+		const code = rawValidation.code;
+		const correction =
+			typeof code === "string" && Object.hasOwn(RAW_ARGUMENT_REJECTION_MESSAGES, code)
+				? RAW_ARGUMENT_REJECTION_MESSAGES[code as RawArgumentRejectionCode]
+				: undefined;
+		throw new Error(correction ? `${base}; ${correction}` : base);
 	}
 	const rawArgs = rawValidation?.outcome === "accept" ? rawValidation.arguments : originalArgs;
 	const ctx = getValidationContext(tool);
