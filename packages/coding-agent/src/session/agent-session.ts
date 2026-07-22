@@ -3039,12 +3039,18 @@ export class AgentSession {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
+			runtimeTurnId: this.#activeCoordinatorRuntimeTurnId,
 		}).catch(() => {
 			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
 		});
 	}
 
+	#activeCoordinatorRuntimeTurnId: string | null = null;
+	#queuedCoordinatorRuntimeTurnIds: string[] = [];
+
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
+		if (event.type === "agent_start" && !this.#activeCoordinatorRuntimeTurnId)
+			this.#activeCoordinatorRuntimeTurnId = this.#queuedCoordinatorRuntimeTurnIds.shift() ?? null;
 		if (event.type === "turn_start") {
 			this.#extensionTurnGeneration++;
 			this.#closedExtensionTurnGeneration = undefined;
@@ -3089,6 +3095,7 @@ export class AgentSession {
 			void persistRuntimeState();
 			this.#emit(event);
 			await this.#emitExtensionEvent(event);
+			this.#activeCoordinatorRuntimeTurnId = null;
 			return;
 		}
 
@@ -8283,7 +8290,7 @@ export class AgentSession {
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void; runtimeTurnId?: string },
 	): Promise<void> {
 		// Normalize content to text string + optional images
 		let text: string;
@@ -8307,6 +8314,7 @@ export class AgentSession {
 
 		if (options?.deliverAs === "followUp") {
 			await this.#queueFollowUp(text, images, { claimsGenuineUserIntent: true });
+			if (options.runtimeTurnId) this.#queuedCoordinatorRuntimeTurnIds.push(options.runtimeTurnId);
 			options.onPreflightAccepted?.();
 			return;
 		}
@@ -8327,12 +8335,16 @@ export class AgentSession {
 			return;
 		}
 
-		// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
-		await this.prompt(text, {
-			expandPromptTemplates: false,
-			images,
-			onPreflightAccepted: options?.onPreflightAccepted,
-		});
+		this.#activeCoordinatorRuntimeTurnId = options?.runtimeTurnId ?? null;
+		try {
+			await this.prompt(text, {
+				expandPromptTemplates: false,
+				images,
+				onPreflightAccepted: options?.onPreflightAccepted,
+			});
+		} finally {
+			this.#activeCoordinatorRuntimeTurnId = null;
+		}
 	}
 
 	/**

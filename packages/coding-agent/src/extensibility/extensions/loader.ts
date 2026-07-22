@@ -240,7 +240,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void; runtimeTurnId?: string },
 	): Promise<void> {
 		return Promise.resolve(this.runtime.sendUserMessage(content, options));
 	}

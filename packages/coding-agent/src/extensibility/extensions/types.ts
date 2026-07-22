@@ -1122,7 +1122,7 @@ export interface ExtensionAPI {
 	/** Send a user message to the agent, or queue it when deliverAs is set. */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void },
+		options?: { deliverAs?: "steer" | "followUp"; onPreflightAccepted?: () => void; runtimeTurnId?: string },
 	): Promise<void>;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */

@@ -2226,15 +2226,24 @@ async function seedBrokerSessionWithActiveTurn(root: string, controls: SdkContro
 	expect(sent).toMatchObject({ ok: true });
 	const turnId = sent.turn_id;
 	if (typeof turnId !== "string") throw new Error("missing durable coordinator turn id");
-	return { server, turnId };
+	const persistedTurn = JSON.parse(
+		await fs.readFile(
+			path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${turnId}.json`),
+			"utf8",
+		),
+	) as { delivery?: { runtime_turn_id?: unknown } };
+	const runtimeTurnId = persistedTurn.delivery?.runtime_turn_id;
+	if (typeof runtimeTurnId !== "string") throw new Error("missing runtime turn id");
+	return { server, turnId, runtimeTurnId };
 }
 
-async function writeRuntimeAuthoredState(root: string, overrides: Record<string, unknown>) {
+async function writeRuntimeAuthoredState(root: string, runtimeTurnId: string, overrides: Record<string, unknown>) {
 	await Bun.write(
-		path.join(sessionRuntimeDir(root, "visible-session"), "runtime-state.json"),
+		path.join(sessionRuntimeDir(root, "visible-session"), "terminal-receipts", `${runtimeTurnId}.json`),
 		JSON.stringify({
 			schema_version: 1,
 			session_id: "visible-session",
+			runtime_turn_id: runtimeTurnId,
 			state: "completed",
 			ready_for_input: true,
 			current_turn_id: null,
@@ -2245,6 +2254,9 @@ async function writeRuntimeAuthoredState(root: string, overrides: Record<string,
 			event: "agent_end",
 			live: false,
 			reason: null,
+			cwd: root,
+			workdir: root,
+			session_file: null,
 			final_response: {
 				text: "utils/walletSync.ts summary",
 				format: "markdown",
@@ -2261,11 +2273,9 @@ describe("Coordinator MCP broker turn completion reconciliation", () => {
 	it("adopts the runtime-authored terminal state when the coordinator state is stuck at running", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
-		const { server, turnId } = await seedBrokerSessionWithActiveTurn(root, controls);
+		const { server, turnId, runtimeTurnId } = await seedBrokerSessionWithActiveTurn(root, controls);
 
-		// SDK broker sessions can't receive a per-session state-file env, so the runtime
-		// writes agent_end worktree-local while the coordinator's file stays at running.
-		await writeRuntimeAuthoredState(root, {});
+		await writeRuntimeAuthoredState(root, runtimeTurnId, {});
 
 		const read = await server.callTool("gjc_coordinator_read_turn", {
 			turn_id: turnId,
@@ -2283,9 +2293,9 @@ describe("Coordinator MCP broker turn completion reconciliation", () => {
 	it("surfaces a runtime-authored errored terminal state as a failed turn", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
-		const { server, turnId } = await seedBrokerSessionWithActiveTurn(root, controls);
+		const { server, turnId, runtimeTurnId } = await seedBrokerSessionWithActiveTurn(root, controls);
 
-		await writeRuntimeAuthoredState(root, {
+		await writeRuntimeAuthoredState(root, runtimeTurnId, {
 			state: "errored",
 			ready_for_input: false,
 			final_response: {
@@ -2313,12 +2323,19 @@ describe("Coordinator MCP broker turn completion reconciliation", () => {
 		const controls: SdkControl[] = [];
 		const { server, turnId } = await seedBrokerSessionWithActiveTurn(root, controls);
 
-		// A completion that ended before this turn started must not be adopted.
-		await writeRuntimeAuthoredState(root, {
-			updated_at: "2000-01-01T00:00:00.000Z",
-			ended_at: "2000-01-01T00:00:00.000Z",
-		});
+		await writeRuntimeAuthoredState(root, "sdk-turn-earlier", {});
 
+		const read = await server.callTool("gjc_coordinator_read_turn", {
+			turn_id: turnId,
+			session_id: "visible-session",
+		});
+		expect(read).toMatchObject({ ok: true, turn: { status: "active" } });
+	});
+	it("rejects corrupt terminal receipts rather than adopting another runtime turn", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const { server, turnId, runtimeTurnId } = await seedBrokerSessionWithActiveTurn(root, controls);
+		await writeRuntimeAuthoredState(root, runtimeTurnId, { event: "process_postmortem", cwd: "/tmp/foreign" });
 		const read = await server.callTool("gjc_coordinator_read_turn", {
 			turn_id: turnId,
 			session_id: "visible-session",

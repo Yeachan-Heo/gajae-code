@@ -201,6 +201,28 @@ describe("coordinator runtime state sidecar", () => {
 			setSystemTime();
 		}
 	});
+	it("writes an immutable terminal receipt for the correlated runtime turn", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "receipt-session";
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("Done"), {
+			sessionId: "fallback",
+			cwd: root,
+			sessionFile: null,
+			runtimeTurnId: "sdk-turn-1",
+		});
+		const receipt = await readJson(
+			path.join(sessionRuntimeDir(root, "receipt-session"), "terminal-receipts", "sdk-turn-1.json"),
+		);
+		expect(receipt).toMatchObject({
+			event: "agent_end",
+			runtime_turn_id: "sdk-turn-1",
+			session_id: "receipt-session",
+			state: "completed",
+			final_response: { text: "Done" },
+		});
+	});
 
 	it("always writes terminal final_response events", async () => {
 		const root = await tempRoot();

@@ -2021,6 +2021,7 @@ function sdkControlSurface(
 				api.sendUserMessage(content, {
 					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
 					onPreflightAccepted,
+					runtimeTurnId: turnId,
 				}),
 			);
 		} catch (error) {

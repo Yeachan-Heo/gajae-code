@@ -82,6 +82,8 @@ export interface RuntimeStateContext {
 	branch?: string | null;
 	/** Public-safe owner metadata used to persist the canonical terminal verdict. */
 	ownerTerminal?: OwnerTerminalContext | null;
+	/** Runtime turn correlation supplied by the SDK control plane. */
+	runtimeTurnId?: string | null;
 	/** Internal fail-closed marker set only when managed owner metadata is malformed or missing. */
 	ownerTerminalMetadataInvalid?: boolean;
 }
@@ -807,6 +809,19 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						};
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 						await writeStateFile(stateFile, payload);
+						if (
+							(state === "completed" || state === "errored") &&
+							typeof context.runtimeTurnId === "string" &&
+							/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(context.runtimeTurnId)
+						) {
+							const receipt = { ...payload, runtime_turn_id: context.runtimeTurnId };
+							const receiptFile = path.join(
+								sessionRuntimeDir(identity.cwd, identity.sessionId),
+								"terminal-receipts",
+								`${context.runtimeTurnId}.json`,
+							);
+							await writeStateFile(receiptFile, receipt);
+						}
 					}),
 			),
 	);
