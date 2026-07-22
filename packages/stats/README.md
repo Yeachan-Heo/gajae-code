@@ -60,7 +60,13 @@ console.log(stats.byModel[0].avgTokensPerSecond);
 | `GET /api/stats/models` | Per-model statistics |
 | `GET /api/stats/folders` | Per-folder/project statistics |
 | `GET /api/stats/timeseries` | Hourly time series data |
-| `GET /api/sync` | Trigger sync and return counts |
+| `POST /api/sync` | Trigger sync and return counts |
+
+## Local server security
+
+The dashboard binds only to `127.0.0.1`; the CLI opens its default browser URL through `localhost`. API requests must use HTTP, the server's actual port, and exactly `localhost` or `127.0.0.1`. Browser requests must remain same-origin, and session sync requires a same-origin `POST` request. The server does not enable cross-origin access or trust forwarded host headers.
+
+Reverse-proxy and non-loopback deployments are unsupported. They require a separate authenticated deployment boundary rather than relaxing these local-only checks.
 
 ## Data Storage
 

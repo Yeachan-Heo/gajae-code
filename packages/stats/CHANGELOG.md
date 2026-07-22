@@ -5,6 +5,7 @@
 ### Fixed
 
 - Compiled dashboard assets now remain in a validated in-memory archive map instead of being materialized in a predictable shared temporary cache.
+- Restricted the local dashboard API to its exact loopback authority and same-origin browser requests, with POST-only bounded session sync.
 
 ## [0.5.1] - 2026-06-14
 

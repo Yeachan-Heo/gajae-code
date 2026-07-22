@@ -30,6 +30,7 @@
 	"scripts": {
 		"build": "bun run build.ts",
 		"dev": "bun run src/index.ts",
+		"test": "bun test",
 		"check": "biome check . && bun run check:types",
 		"check:types": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
 		"lint": "biome lint .",

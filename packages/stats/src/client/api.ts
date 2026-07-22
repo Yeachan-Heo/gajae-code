@@ -10,6 +10,12 @@ import type {
 
 const API_BASE = "/api";
 
+interface SyncResponse {
+	processed: number;
+	files: number;
+	totalMessages: number;
+}
+
 export async function getStats(range = "24h"): Promise<DashboardStats> {
 	const res = await fetch(`${API_BASE}/stats?range=${encodeURIComponent(range)}`);
 	if (!res.ok) throw new Error("Failed to fetch stats");
@@ -52,10 +58,10 @@ export async function getRequestDetails(id: number): Promise<RequestDetails> {
 	return res.json() as Promise<RequestDetails>;
 }
 
-export async function sync(): Promise<any> {
-	const res = await fetch(`${API_BASE}/sync`);
+export async function sync(): Promise<SyncResponse> {
+	const res = await fetch(`${API_BASE}/sync`, { method: "POST" });
 	if (!res.ok) throw new Error("Failed to sync");
-	return res.json();
+	return res.json() as Promise<SyncResponse>;
 }
 
 export async function getBehaviorDashboardStats(range = "24h"): Promise<BehaviorDashboardStats> {
