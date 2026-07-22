@@ -2861,21 +2861,34 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
 			await ensureQuestionStateReady();
-			await ensureQuestionTransaction(id);
-			await withSessionTransaction(questionPaths, id, async transaction => {
-				const now = new Date().toISOString();
-				transaction.requests.operations[deletionId] = {
-					operation_id: deletionId,
-					tool: "gjc_coordinator_stop_session",
-					key_digest: deletionKey,
-					request_digest: deletionKey,
-					local_id: id,
-					phase: "remote_started",
-					intent: { kind: "reap", endpoint_incarnation: persistedIncarnation },
-					created_at: now,
-					updated_at: now,
-				};
-			});
+			// Pre-existing stuck stop/reap operations in the durable transaction
+			// file throw session_closing from ensureQuestionTransaction. Catch
+			// and delete the orphaned transaction so the reaper can proceed.
+			try {
+				await ensureQuestionTransaction(id);
+				await withSessionTransaction(questionPaths, id, async transaction => {
+					const now = new Date().toISOString();
+					transaction.requests.operations[deletionId] = {
+						operation_id: deletionId,
+						tool: "gjc_coordinator_stop_session",
+						key_digest: deletionKey,
+						request_digest: deletionKey,
+						local_id: id,
+						phase: "remote_started",
+						intent: { kind: "reap", endpoint_incarnation: persistedIncarnation },
+						created_at: now,
+						updated_at: now,
+					};
+				});
+			} catch (error) {
+				if (error instanceof Error && error.message === "session_closing") {
+					await fs.rm(path.join(questionPaths.sessions, safeExternalId("session", id), "transaction.v1.json"), {
+						force: true,
+					});
+				} else {
+					throw error;
+				}
+			}
 			await recordDeletionIntent(questionPaths, {
 				deletion_id: deletionId,
 				session_id: id,
@@ -2914,12 +2927,23 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					),
 				);
 			} catch (error) {
-				return {
-					ok: false,
-					reason: "close_failed",
-					detail: error instanceof SdkClientError ? error.code : "unavailable",
-					closed: false,
-				};
+				// When the broker session is already gone, skip the broker close and
+				// proceed with local coordinator cleanup. Returning early here leaves
+				// the deletion stuck in "intent" phase, which triggers session_closing
+				// on every subsequent read and blocks the session reaper permanently.
+				if (
+					error instanceof SdkClientError &&
+					(error.code === "not_found" || error.code === "resource_gone")
+				) {
+					// fall through to advanceDeletion + local cleanup
+				} else {
+					return {
+						ok: false,
+						reason: "close_failed",
+						detail: error instanceof SdkClientError ? error.code : "unavailable",
+						closed: false,
+					};
+				}
 			}
 			await advanceDeletion(questionPaths, deletionId, "broker_closed");
 
@@ -2927,7 +2951,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await exactBrokerSessionAuthority(id, workspace);
 				return { ok: false, reason: "endpoint_stale", closed: false };
 			} catch (error) {
-				if (!(error instanceof SdkClientError) || error.code !== "not_found")
+				if (!(error instanceof SdkClientError) || (error.code !== "not_found" && error.code !== "resource_gone"))
 					return {
 						ok: false,
 						reason: "close_failed",
@@ -2935,6 +2959,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						closed: false,
 					};
 			}
+			// Remove the durable transaction file so the namespace-registry does not
+			// rediscover a stuck stop/reap operation on coordinator restart.
+			await fs.rm(path.join(questionPaths.sessions, safeExternalId("session", id), "transaction.v1.json"), { force: true });
 			await fs.rm(sessionFile(id), { force: true });
 			await fs.rm(sessionStateFile(namespaceDir, id), { force: true });
 			await fs.rm(activeTurnFile(namespaceDir, id), { force: true });
@@ -4778,6 +4805,38 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return { jsonrpc: "2.0", id, result: textResult(payload, payload.ok === false) };
 		}
 		return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown_method:${request.method}` } };
+	}
+
+
+	// Clean up orphaned transaction files left by previous coordinator runs
+	// where broker close failed with resource_gone. Without this, every read
+	// path throws session_closing before the reaper can reach the session.
+	try {
+		const sessionEntries = nodeFs.readdirSync(questionPaths.sessions, { withFileTypes: true });
+		for (const entry of sessionEntries) {
+			if (!entry.isDirectory()) continue;
+			const txFile = path.join(questionPaths.sessions, entry.name, "transaction.v1.json");
+			let raw: string;
+			try {
+				raw = nodeFs.readFileSync(txFile, "utf8");
+			} catch {
+				continue;
+			}
+			const tx = JSON.parse(raw) as Record<string, unknown>;
+			const ops = asRecord(tx?.requests)?.operations as Record<string, Record<string, unknown>> | undefined;
+			if (!ops) continue;
+			const hasStuckReap = Object.values(ops).some(
+				op =>
+					op?.phase === "remote_started" &&
+					asRecord(op?.intent)?.kind != null &&
+					(asRecord(op?.intent)!.kind === "stop" || asRecord(op?.intent)!.kind === "reap"),
+			);
+			if (hasStuckReap) {
+				nodeFs.rmSync(txFile, { force: true });
+			}
+		}
+	} catch {
+		// namespace directory may not exist yet — safe to skip
 	}
 
 	return { config, callTool, handleJsonRpc, handle: handleJsonRpc, reapSession, sessionReaper };
