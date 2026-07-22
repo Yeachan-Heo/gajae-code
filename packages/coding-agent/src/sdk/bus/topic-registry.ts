@@ -73,6 +73,12 @@ export interface TopicEndpointBinding {
 	endpointGeneration?: number;
 }
 
+/** Discriminated durable endpoint authority for identity-less replay admission. */
+export type TopicEndpointAuthority =
+	| { state: "none" }
+	| { state: "unique"; sessionId: string }
+	| { state: "ambiguous" };
+
 /** Conditional rollback token for a delete fence publication. */
 export interface TopicDeleteAuthoritySnapshot {
 	sessionId: string;
@@ -81,7 +87,6 @@ export interface TopicDeleteAuthoritySnapshot {
 	authorityState?: TopicRecord["authorityState"];
 	fenceEpoch?: number;
 }
-
 
 function isValidBindingString(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
@@ -108,10 +113,6 @@ function hasCompleteBinding(record: TopicRecord): boolean {
 		(record.endpointGeneration === undefined || isValidBindingGeneration(record.endpointGeneration)) &&
 		(record.endpointIncarnation === undefined || isValidBindingGeneration(record.endpointIncarnation))
 	);
-}
-
-function hasMalformedBinding(record: TopicRecord): boolean {
-	return hasAnyBinding(record) && !hasCompleteBinding(record);
 }
 
 function hasValidBinding(binding: TopicEndpointBinding): boolean {
@@ -148,6 +149,10 @@ export class TopicRegistry {
 	private readonly inflight = new Map<string, Promise<TopicRecord>>();
 	/** Newly-created records being durably published; never routable until committed. */
 	private readonly staged = new Map<string, TopicRecord>();
+	/** Socket-specific provenance for transient endpoint claims. */
+	private readonly transientClaimants = new Map<string, object | undefined>();
+	/** Endpoint claims registered before a remote topic create can publish a record. */
+	private readonly creatingBindings = new Map<string, TopicEndpointBinding>();
 	/** Monotonic authority epochs, including deletion fences for absent records. */
 	private readonly epochs = new Map<string, number>();
 
@@ -188,7 +193,8 @@ export class TopicRegistry {
 				typeof raw.replaySeq === "number" &&
 				Number.isSafeInteger(raw.replaySeq) &&
 				raw.replaySeq >= 0;
-			const bindingMalformed = raw.bindingMalformed === true || !hasCompleteBinding(raw);
+			const legacyUnbound = !hasAnyBinding(raw);
+			const bindingMalformed = raw.bindingMalformed === true || (!legacyUnbound && !hasCompleteBinding(raw));
 			const candidateAuthorityEpoch = raw.authorityEpoch;
 			const rawAuthorityEpoch: number =
 				typeof candidateAuthorityEpoch === "number" &&
@@ -222,15 +228,16 @@ export class TopicRegistry {
 				...(isValidBindingString(raw.chatId) ? { chatId: raw.chatId } : {}),
 				...(isValidBindingString(raw.endpointKey) ? { endpointKey: raw.endpointKey } : {}),
 				...(isValidBindingString(raw.endpointDigest) ? { endpointDigest: raw.endpointDigest } : {}),
-				...(isValidBindingGeneration(raw.endpointGeneration)
-					? { endpointGeneration: raw.endpointGeneration }
-					: {}),
+				...(isValidBindingGeneration(raw.endpointGeneration) ? { endpointGeneration: raw.endpointGeneration } : {}),
 				...(isValidBindingGeneration(raw.endpointIncarnation)
 					? { endpointIncarnation: raw.endpointIncarnation }
 					: {}),
 				...(bindingMalformed ? { bindingMalformed: true as const } : {}),
 			};
 			this.epochs.set(sessionId, Math.max(fenceEpoch, record.authorityEpoch ?? 0));
+			// Pre-generation-17 records have no endpoint authority. Retire them locally:
+			// their unknown remote topic must neither be rebound nor deleted cross-chat.
+			if (legacyUnbound) continue;
 
 			this.topics.set(sessionId, record);
 		}
@@ -276,34 +283,64 @@ export class TopicRegistry {
 		);
 	}
 
-/** The existing topic record for a session, if any. */
-get(sessionId: string): TopicRecord | undefined {
-	return this.topics.get(sessionId);
-}
+	/** The existing topic record for a session, if any. */
+	get(sessionId: string): TopicRecord | undefined {
+		return this.topics.get(sessionId);
+	}
 
-/** Whether this session has an active, unambiguous topic authority. */
-isActiveUnambiguous(sessionId: string): boolean {
-	const record = this.topics.get(sessionId);
-	return record?.authorityState !== "delete_pending" && this.byTopic.get(record?.topicId ?? "") === sessionId;
-}
+	/** Whether this session has an active, unambiguous topic authority. */
+	isActiveUnambiguous(sessionId: string): boolean {
+		const record = this.topics.get(sessionId);
+		return record?.authorityState !== "delete_pending" && this.byTopic.get(record?.topicId ?? "") === sessionId;
+	}
 
 	/**
-	 * Resolve a uniquely bound logical owner for an identity-less replay. The
-	 * endpoint tuple is durable authority; transport ids alone never are.
+	 * Resolve endpoint authority for identity-less replay. An endpoint may bootstrap
+	 * only when no committed, staged, or pre-create claim can own it; malformed
+	 * partial bindings and deletion fences deliberately fail closed.
 	 */
-	uniqueSessionForEndpoint(binding: TopicEndpointBinding, excludedSessionId?: string): string | undefined {
-		if (!hasValidBinding(binding)) return undefined;
-		const matches = [...this.topics].flatMap(([sessionId, record]) =>
-			sessionId !== excludedSessionId &&
+	endpointAuthority(binding: TopicEndpointBinding, excludedTransientClaimant?: object): TopicEndpointAuthority {
+		if (!hasValidBinding(binding)) return { state: "ambiguous" };
+		const canClaim = (record: Pick<TopicRecord, "chatId" | "endpointKey" | "endpointDigest">): boolean =>
+			(record.chatId === undefined || record.chatId === binding.chatId) &&
+			(record.endpointKey === undefined || record.endpointKey === binding.endpointKey) &&
+			(record.endpointDigest === undefined || record.endpointDigest === binding.endpointDigest);
+		const committed = [...this.topics].filter(([, record]) => canClaim(record));
+		const excludesClaimant = (sessionId: string): boolean =>
+			excludedTransientClaimant !== undefined &&
+			this.transientClaimants.get(sessionId) === excludedTransientClaimant;
+		const staged = [...this.staged].filter(([sessionId, record]) => canClaim(record) && !excludesClaimant(sessionId));
+		const creating = [...this.creatingBindings].filter(
+			([sessionId, claim]) => canClaim(claim) && !excludesClaimant(sessionId),
+		);
+		if (committed.length === 0 && staged.length === 0 && creating.length === 0) return { state: "none" };
+		if (committed.length !== 1 || staged.length !== 0 || creating.length !== 0) return { state: "ambiguous" };
+		const [sessionId, record] = committed[0]!;
+		return record.chatId === binding.chatId &&
+			record.endpointKey === binding.endpointKey &&
+			record.endpointDigest === binding.endpointDigest &&
 			this.isActiveUnambiguous(sessionId) &&
-			!record.bindingMalformed &&
-			record.chatId === binding.chatId &&
+			!record.bindingMalformed
+			? { state: "unique", sessionId }
+			: { state: "ambiguous" };
+	}
+
+	/** Resolve a uniquely bound logical owner for callers that only need the owner. */
+	uniqueSessionForEndpoint(binding: TopicEndpointBinding): string | undefined {
+		const authority = this.endpointAuthority(binding);
+		return authority.state === "unique" ? authority.sessionId : undefined;
+	}
+
+	/** Whether this exact session owns the complete durable endpoint binding. */
+	matchesEndpoint(sessionId: string, binding: TopicEndpointBinding): boolean {
+		const record = this.topics.get(sessionId);
+		return (
+			this.isActiveUnambiguous(sessionId) &&
+			!record?.bindingMalformed &&
+			record?.chatId === binding.chatId &&
 			record.endpointKey === binding.endpointKey &&
 			record.endpointDigest === binding.endpointDigest
-				? [sessionId]
-				: [],
 		);
-		return matches.length === 1 ? matches[0] : undefined;
 	}
 
 	/**
@@ -368,7 +405,10 @@ isActiveUnambiguous(sessionId: string): boolean {
 	restoreEndpointBinding(
 		sessionId: string,
 		expected: TopicEndpointBinding,
-		previous: Pick<TopicRecord, "chatId" | "endpointKey" | "endpointDigest" | "endpointGeneration" | "endpointIncarnation">,
+		previous: Pick<
+			TopicRecord,
+			"chatId" | "endpointKey" | "endpointDigest" | "endpointGeneration" | "endpointIncarnation"
+		>,
 	): boolean {
 		const record = this.topics.get(sessionId);
 		if (
@@ -389,18 +429,19 @@ isActiveUnambiguous(sessionId: string): boolean {
 		return true;
 	}
 
-/**
- * Return the existing active topic for `sessionId`, or create one via
- * `create` (called only on first use).
- */
-async getOrCreateTopic(
-	sessionId: string,
-	create: () => Promise<unknown>,
-	now: () => number = Date.now,
-	name?: string,
-	binding?: TopicEndpointBinding,
-	commit?: () => Promise<void>,
-): Promise<TopicRecord> {
+	/**
+	 * Return the existing active topic for `sessionId`, or create one via
+	 * `create` (called only on first use).
+	 */
+	async getOrCreateTopic(
+		sessionId: string,
+		create: () => Promise<unknown>,
+		now: () => number = Date.now,
+		name?: string,
+		binding?: TopicEndpointBinding,
+		commit?: () => Promise<void>,
+		transientClaimant?: object,
+	): Promise<TopicRecord> {
 		const existing = this.topics.get(sessionId);
 		if (existing?.authorityState === "delete_pending") throw new Error("topic authority is deletion-fenced");
 		if (existing?.bindingMalformed) throw new Error("topic authority binding is quarantined");
@@ -408,6 +449,11 @@ async getOrCreateTopic(
 		const pending = this.inflight.get(sessionId);
 		if (pending) return pending;
 		const epoch = this.epochs.get(sessionId) ?? 0;
+		// Publish the compatible endpoint claim before invoking `create`: the callback
+		// may immediately begin a remote create and identity-less recovery must never
+		// observe a false absence during that await.
+		if (binding) this.creatingBindings.set(sessionId, binding);
+		this.transientClaimants.set(sessionId, transientClaimant);
 		const promise = (async () => {
 			const topicId = await create();
 			if (!isValidTopicId(topicId)) throw new Error("createForumTopic: invalid message_thread_id");
@@ -424,7 +470,9 @@ async getOrCreateTopic(
 							endpointKey: binding.endpointKey,
 							endpointDigest: binding.endpointDigest,
 							endpointIncarnation: 0,
-							...(binding.endpointGeneration === undefined ? {} : { endpointGeneration: binding.endpointGeneration }),
+							...(binding.endpointGeneration === undefined
+								? {}
+								: { endpointGeneration: binding.endpointGeneration }),
 						}
 					: {}),
 				...(revoked ? { authorityState: "delete_pending" as const } : {}),
@@ -462,6 +510,8 @@ async getOrCreateTopic(
 			return await promise;
 		} finally {
 			this.inflight.delete(sessionId);
+			this.creatingBindings.delete(sessionId);
+			this.transientClaimants.delete(sessionId);
 		}
 	}
 
@@ -604,10 +654,27 @@ async getOrCreateTopic(
 		} else {
 			record.authorityEpoch = snapshot.authorityEpoch;
 			record.authorityState = snapshot.authorityState;
-			if (this.byTopic.get(record.topicId) === undefined) this.byTopic.set(record.topicId, snapshot.sessionId);
+			this.rebuildInboundRoutes();
 		}
 		if (snapshot.fenceEpoch === undefined) this.epochs.delete(snapshot.sessionId);
 		else this.epochs.set(snapshot.sessionId, snapshot.fenceEpoch);
+		return true;
+	}
+
+	/** Restore the exact delete fence after a failed compensation publication. */
+	restoreDeleteFence(snapshot: TopicDeleteAuthoritySnapshot): boolean {
+		const record = this.topics.get(snapshot.sessionId);
+		const deleteEpoch = Math.max(snapshot.fenceEpoch ?? 0, snapshot.authorityEpoch ?? 0) + 1;
+		if (snapshot.topicId === undefined) {
+			if (record) return false;
+		} else if (!record || record.topicId !== snapshot.topicId) {
+			return false;
+		} else {
+			record.authorityEpoch = deleteEpoch;
+			record.authorityState = "delete_pending";
+			if (this.byTopic.get(record.topicId) === snapshot.sessionId) this.byTopic.delete(record.topicId);
+		}
+		this.epochs.set(snapshot.sessionId, deleteEpoch);
 		return true;
 	}
 
@@ -645,7 +712,9 @@ async getOrCreateTopic(
 						endpointKey: binding.endpointKey,
 						endpointDigest: binding.endpointDigest,
 						endpointIncarnation: 0,
-						...(binding.endpointGeneration === undefined ? {} : { endpointGeneration: binding.endpointGeneration }),
+						...(binding.endpointGeneration === undefined
+							? {}
+							: { endpointGeneration: binding.endpointGeneration }),
 					}
 				: {}),
 		};

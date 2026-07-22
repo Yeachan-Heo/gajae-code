@@ -71,7 +71,7 @@ function isolatedSettings(agentDir: string): Settings {
 		},
 	}) as Settings;
 }
-test("real notifications extension rebinds /btw with raw-question delegation and no main-session injection", async () => {
+test("real notifications extension rejects an in-flight /btw response after reconnect", async () => {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-btw-extension-e2e-"));
 	const cwd = path.join(agentDir, "repo");
 	const sessionId = "btw-extension-e2e";
@@ -160,26 +160,13 @@ test("real notifications extension rebinds /btw with raw-question delegation and
 		await sleep(80);
 		expect(btwCalls).toHaveLength(1);
 		providerResponse.resolve({ replyText: "| Formula | Value |\n| --- | --- |\n| $x^2$ | 4 |" });
-		await waitFor(() => bot.count("sendRichMessage") === richBefore + 1, "correlated rich /btw delivery");
+		await sleep(80);
 		expect(btwCalls).toHaveLength(1);
 		expect(btwCalls[0]!.question).toBe("exact side question");
 		expect(btwCalls[0]!.signal).toBeInstanceOf(AbortSignal);
 		expect(mainSessionInjections).toBe(0);
 		expect(bot.count("sendMessage")).toBe(sendMessageBefore);
-		const richCalls = bot.calls.filter(call => call.method === "sendRichMessage");
-		const richCall = richCalls.at(-1)!;
-		expect(richCalls).toHaveLength(richBefore + 1);
-		expect(richCall.body).toEqual({
-			chat_id: "42",
-			message_thread_id: THREAD_ID,
-			reply_parameters: { message_id: 870 },
-			rich_message: {
-				markdown: "| Formula | Value |\n| --- | --- |\n| $x^2$ | 4 |",
-				skip_entity_detection: true,
-			},
-		});
-		expect(richCall.options?.noRetry).toBe(true);
-		expect(richCall.options?.signal).toBeInstanceOf(AbortSignal);
+		expect(bot.count("sendRichMessage")).toBe(richBefore);
 	} finally {
 		if (handlers.has("session_shutdown")) await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
 		daemon.requestStop();
@@ -195,6 +182,7 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 		const settings = isolatedSettings(agentDir);
 		const sessionId = "btw-e2e";
 		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
 		await registerNotificationRoot({ settings, cwd, sessionId });
 		const server = new NotificationServer(sessionId, "token", path.join(cwd, ".gjc", "state"), true);
 		const inbound: Array<Record<string, unknown>> = [];
@@ -320,12 +308,13 @@ test("/btw travels through NotificationServer and a real WebSocket with one stri
 		throw err;
 	}
 }, 30_000);
-test("/btw reconnect rebinds the existing provider request without cancellation", async () => {
+test("/btw reconnect does not replay an in-flight provider request", async () => {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-btw-reconnect-e2e-"));
 	try {
 		const settings = isolatedSettings(agentDir);
 		const sessionId = "btw-reconnect-e2e";
 		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
 		await registerNotificationRoot({ settings, cwd, sessionId });
 		const inbound: Array<Record<string, unknown>> = [];
 		const cancelFrames: Array<Record<string, unknown>> = [];
@@ -391,6 +380,7 @@ test("/btw reconnect rebinds the existing provider request without cancellation"
 
 			daemon.sessions.get(sessionId)!.ws.close();
 			await waitFor(() => !daemon.sessions.has(sessionId) && server.clientCount() === 0, "transient transport loss");
+			await sleep(80);
 			expect(cancelFrames).toHaveLength(0);
 			expect(inbound).toHaveLength(1);
 
@@ -401,8 +391,7 @@ test("/btw reconnect rebinds the existing provider request without cancellation"
 			);
 			server.pushFrame(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["ephemeral_turn_v1"] }));
 			await waitFor(() => daemon.sessions.get(sessionId)?.hostGeneration === 4, "replacement generation-4 replay");
-			expect(inbound).toHaveLength(2);
-			expect(inbound[1]!.requestId).toBe(turn.requestId);
+			expect(inbound).toHaveLength(1);
 			expect(cancelFrames).toHaveLength(0);
 
 			const terminal = {
@@ -416,11 +405,11 @@ test("/btw reconnect rebinds the existing provider request without cancellation"
 				text: "survived replacement",
 			};
 			server.pushFrame(JSON.stringify(terminal));
-			await waitFor(() => bot.count("sendMessage") === beforeTerminal + 1, "single replacement terminal dispatch");
+			await sleep(80);
 			server.pushFrame(JSON.stringify(terminal));
 			await sleep(80);
-			expect(bot.count("sendMessage")).toBe(beforeTerminal + 1);
-			expect(inbound).toHaveLength(2);
+			expect(bot.count("sendMessage")).toBe(beforeTerminal);
+			expect(inbound).toHaveLength(1);
 			expect(cancelFrames).toHaveLength(0);
 		} finally {
 			daemon.requestStop();
@@ -439,6 +428,7 @@ test("/btw generation replacement terminalizes an old pending request exactly on
 		const settings = isolatedSettings(agentDir);
 		const sessionId = "btw-crash-e2e";
 		const cwd = path.join(agentDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
 		await registerNotificationRoot({ settings, cwd, sessionId });
 		const inbound: Array<Record<string, unknown>> = [];
 		const cancelFrames: Array<Record<string, unknown>> = [];
