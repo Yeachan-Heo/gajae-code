@@ -26,7 +26,8 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * legacy stopped-lock reclamation in generation 14, Windows expected-identity
  * ACL verification and repair in generation 15, identity-fenced stale endpoint
  * startup recovery in generation 16, Telegram topic recovery authority fencing
- * in generation 17, and fail-closed blank-token validation plus lifecycle-startup
- * stop fencing in generation 18.
+ * in generation 17, fail-closed blank-token validation plus lifecycle-startup
+ * stop fencing in generation 18, and native-authority contract changes in
+ * generation 19.
  */
 export const DAEMON_GENERATION = 19;

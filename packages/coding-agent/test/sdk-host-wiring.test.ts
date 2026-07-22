@@ -1254,9 +1254,9 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 				{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
 				{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
 			],
-			undefined,
+			{ runtimeTurnId: expect.any(String) },
 		],
-		[[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }]],
+		[[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }], { runtimeTurnId: expect.any(String) }],
 	]);
 });
 
@@ -1302,7 +1302,7 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
 	});
 	if (typeof commandId !== "string" || typeof turnId !== "string") throw new Error("missing follow-up correlation");
-	expect(sent).toEqual([["queued follow-up", { deliverAs: "followUp" }]]);
+	expect(sent).toEqual([["queued follow-up", { deliverAs: "followUp", runtimeTurnId: turnId }]]);
 	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),

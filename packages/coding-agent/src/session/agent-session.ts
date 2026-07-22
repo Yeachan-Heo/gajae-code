@@ -1192,8 +1192,9 @@ function extractPermissionLocations(
  *  custom messages queued during streaming) and is matched by the custom-role
  *  `message_start` dequeue branch; user-message pushes leave it undefined and
  *  rely on the existing text-equality match. `sequence` gives each queued chip a
- *  stable edit id while the display arrays preserve delivery order. */
-type QueuedDisplayEntry = { text: string; tag?: string; sequence: number };
+ *  stable edit id while the display arrays preserve delivery order. A coordinator
+ *  runtime turn id stays on its queued follow-up entry until that exact turn starts. */
+type QueuedDisplayEntry = { text: string; tag?: string; sequence: number; runtimeTurnId?: string };
 type IrcRosterClaim = { token: symbol; signature: string; epoch: number; message: CustomMessage };
 export type QueuedMessageEditMode = "steer" | "followUp";
 
@@ -1500,6 +1501,7 @@ export class AgentSession {
 	/** Tracks pending follow-up messages for UI display. Removed when delivered.
 	 *  See `#steeringMessages` for entry shape. */
 	#followUpMessages: QueuedDisplayEntry[] = [];
+	#coordinatorRuntimeTurnByQueuedMessage = new WeakMap<AgentMessage, string>();
 	#queuedDisplaySequence = 0;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
@@ -3034,23 +3036,29 @@ export class AgentSession {
 		}
 	};
 
-	#persistRuntimeStateInBackground(event: AgentSessionEvent): void {
+	#persistRuntimeStateInBackground(
+		event: AgentSessionEvent,
+		runtimeTurnId = this.#activeCoordinatorRuntimeTurnId,
+	): void {
 		void persistCoordinatorRuntimeStateFromEvent(event, {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
-			runtimeTurnId: this.#activeCoordinatorRuntimeTurnId,
+			runtimeTurnId,
 		}).catch(() => {
 			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
 		});
 	}
 
 	#activeCoordinatorRuntimeTurnId: string | null = null;
-	#queuedCoordinatorRuntimeTurnIds: string[] = [];
 
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
 		if (event.type === "agent_start" && !this.#activeCoordinatorRuntimeTurnId)
-			this.#activeCoordinatorRuntimeTurnId = this.#queuedCoordinatorRuntimeTurnIds.shift() ?? null;
+			this.#activeCoordinatorRuntimeTurnId = this.#followUpMessages[0]?.runtimeTurnId ?? null;
+		const terminalRuntimeTurnId =
+			event.type === "turn_end" && event.message.role === "assistant" && event.message.stopReason !== "toolUse"
+				? this.#activeCoordinatorRuntimeTurnId
+				: null;
 		if (event.type === "turn_start") {
 			this.#extensionTurnGeneration++;
 			this.#closedExtensionTurnGeneration = undefined;
@@ -3099,12 +3107,15 @@ export class AgentSession {
 			return;
 		}
 
-		// Local subscribers are part of the AgentSession control path: retryNow(),
-		// auto-continuation gates, goal reminders, and tests all observe these events
-		// synchronously. Coordinator sidecar writes and extension hooks are secondary
-		// sinks, so they must not delay or suppress local delivery.
+		if (terminalRuntimeTurnId && event.type === "turn_end") {
+			// A queued SDK follow-up can continue within the same agent loop, which
+			// has only one agent_end. Its assistant turn is nevertheless terminal for
+			// the durable coordinator turn that supplied this correlation.
+			this.#persistRuntimeStateInBackground({ type: "agent_end", messages: [event.message] }, terminalRuntimeTurnId);
+			this.#activeCoordinatorRuntimeTurnId = null;
+		}
 		this.#emit(event);
-		void persistRuntimeState();
+		if (!terminalRuntimeTurnId) void persistRuntimeState();
 		await this.#emitExtensionEvent(event);
 	}
 
@@ -3239,6 +3250,13 @@ export class AgentSession {
 			if (epoch !== undefined) {
 				this.#deepInterviewContinuationBudget = { epoch, committed: 0, reserved: 0 };
 				this.#deepInterviewTurnOwnerEpoch = epoch;
+			}
+		}
+		if (event.type === "message_start" && event.message.role === "user") {
+			const runtimeTurnId = this.#coordinatorRuntimeTurnByQueuedMessage.get(event.message);
+			if (runtimeTurnId) {
+				this.#coordinatorRuntimeTurnByQueuedMessage.delete(event.message);
+				this.#activeCoordinatorRuntimeTurnId = runtimeTurnId;
 			}
 		}
 		const userMessageText =
@@ -7968,15 +7986,18 @@ export class AgentSession {
 	async #queueFollowUp(
 		text: string,
 		images?: ImageContent[],
-		options?: { forceOneAtATime?: boolean; claimsGenuineUserIntent?: boolean },
+		options?: { forceOneAtATime?: boolean; claimsGenuineUserIntent?: boolean; runtimeTurnId?: string },
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		this.#followUpMessages.push(this.#createQueuedDisplayEntry(displayText));
+		const entry = this.#createQueuedDisplayEntry(displayText);
+		if (options?.runtimeTurnId) entry.runtimeTurnId = options.runtimeTurnId;
+		this.#followUpMessages.push(entry);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		if (options?.runtimeTurnId) this.#coordinatorRuntimeTurnByQueuedMessage.set(message, options.runtimeTurnId);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -8313,8 +8334,11 @@ export class AgentSession {
 		}
 
 		if (options?.deliverAs === "followUp") {
-			await this.#queueFollowUp(text, images, { claimsGenuineUserIntent: true });
-			if (options.runtimeTurnId) this.#queuedCoordinatorRuntimeTurnIds.push(options.runtimeTurnId);
+			await this.#queueFollowUp(text, images, {
+				claimsGenuineUserIntent: true,
+				forceOneAtATime: options.runtimeTurnId !== undefined,
+				runtimeTurnId: options.runtimeTurnId,
+			});
 			options.onPreflightAccepted?.();
 			return;
 		}
@@ -8343,7 +8367,7 @@ export class AgentSession {
 				onPreflightAccepted: options?.onPreflightAccepted,
 			});
 		} finally {
-			this.#activeCoordinatorRuntimeTurnId = null;
+			if (!this.#pendingAgentEndEmit) this.#activeCoordinatorRuntimeTurnId = null;
 		}
 	}
 
