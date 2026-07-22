@@ -85,6 +85,8 @@ describe("InteractiveMode.setEditorComponent", () => {
 		mode.rebuildChatFromMessages("replace-identity");
 		expect(reset).toHaveBeenCalledTimes(1);
 		expect(reconcile).not.toHaveBeenCalled();
+		reset.mockClear();
+		reconcile.mockClear();
 
 		mode.rebuildInitialMessages("reconcile-same-transcript", {
 			messages: [],
@@ -98,6 +100,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 			mode: "none",
 		});
 		expect(reconcile).toHaveBeenCalledTimes(1);
+		expect(reset).not.toHaveBeenCalled();
 	});
 
 	it("renders an idle extension custom message through the real rebuild boundary", async () => {

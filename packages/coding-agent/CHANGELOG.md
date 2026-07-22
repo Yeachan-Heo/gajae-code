@@ -26,6 +26,7 @@
 
 ### Fixed
 - Telegram `/session_recent` now retries one concurrently appended managed transcript and omits only candidates that remain unstable, preserving independently verified recent-session rows.
+- On Windows/psmux, `/resume` now commits immediate progress feedback and repaints only the live viewport instead of replaying the entire selected transcript, while preserving complete history and scroll navigation.
 - Repeated byte-identical stale SDK broker locks no longer cause startup to loop when a prior tombstone exists.
 - ConversationStore now tolerates only unsupported Windows parent-directory durability errors after preserving temporary-file fsync and atomic rename.
 - Ralplan no longer re-asks for execution approval when the user already explicitly named `ultragoal` or `team` in the current turn; that naming is the consent.

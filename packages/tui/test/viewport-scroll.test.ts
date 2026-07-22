@@ -105,6 +105,41 @@ function visible(term: VirtualTerminal): string[] {
 	return term.getViewport().map(line => line.trimEnd());
 }
 
+describe("TUI render commit barrier", () => {
+	it("resolves only after the requested frame reaches the terminal adapter", async () => {
+		const term = new VirtualTerminal(30, 5);
+		const tui = new TUI(term);
+		tui.addChild(new Lines(["committed-frame"]));
+		try {
+			tui.start();
+			term.clearWriteLog();
+			const commit = tui.requestRenderAndWait(false, "test.commit");
+			let emittedAtResolution = false;
+			void commit.then(() => {
+				emittedAtResolution = term.getWriteLog().join("").includes("committed-frame");
+			});
+
+			expect(emittedAtResolution).toBe(false);
+			await commit;
+			expect(emittedAtResolution).toBe(true);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("resolves without scheduling output after the TUI stops or the terminal is unavailable", async () => {
+		const stoppedTerm = new VirtualTerminal(30, 5);
+		const stoppedTui = new TUI(stoppedTerm);
+		stoppedTui.stop();
+		await stoppedTui.requestRenderAndWait(false, "test.stopped");
+
+		const unavailableTerm = new VirtualTerminal(30, 5);
+		Object.defineProperty(unavailableTerm, "available", { configurable: true, get: () => false });
+		const unavailableTui = new TUI(unavailableTerm);
+		await unavailableTui.requestRenderAndWait(false, "test.unavailable");
+	});
+});
+
 describe("TUI manual viewport paging", () => {
 	it("pages through the rendered transcript without editing content", async () => {
 		const term = new VirtualTerminal(30, 5);
@@ -841,7 +876,7 @@ describe("registered viewport anchor", () => {
 		}
 	});
 	it("resets stale manual intent when the transcript identity changes", async () => {
-		const term = new VirtualTerminal(30, 6);
+		const term = new VirtualTerminal(30, 6, { isProcessTerminal: true });
 		const tui = new TUI(term);
 		const transcriptA = new AnchoredTranscript();
 		for (let index = 0; index < 20; index++) transcriptA.addRow(`session-a-${index}`, `session-a-${index}`);
@@ -853,6 +888,7 @@ describe("registered viewport anchor", () => {
 			expect(tui.scrollViewportPages(-1)).toBe(true);
 			await term.flush();
 			expect(visible(term).some(line => line.includes("session-a-"))).toBe(true);
+			term.clearWriteLog();
 
 			const transcriptB = new AnchoredTranscript();
 			for (let index = 0; index < 8; index++) transcriptB.addRow(`session-b-${index}`, `session-b-${index}`);
@@ -862,6 +898,9 @@ describe("registered viewport anchor", () => {
 			tui.setViewportAnchorComponent(transcriptB);
 			tui.requestRender();
 			await settle(term);
+			const identityRender = term.getWriteLog().join("");
+			expect(identityRender).not.toContain("session-b-0");
+			expect(identityRender).toContain("session-b-7");
 			expect(visible(term).some(line => line.includes("session-b-"))).toBe(true);
 			expect(visible(term).some(line => line.includes("session-a-"))).toBe(false);
 		} finally {

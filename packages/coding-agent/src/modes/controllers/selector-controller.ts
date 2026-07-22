@@ -2134,9 +2134,11 @@ export class SelectorController {
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
 				sessions,
-				async sessionPath => {
+				sessionPath => {
 					done();
-					await this.handleResumeSession(sessionPath);
+					void this.handleResumeSession(sessionPath).catch(() => {
+						// The resume boundary commits its error frame before rethrowing for direct callers.
+					});
 				},
 				() => {
 					done();
@@ -2224,20 +2226,35 @@ export class SelectorController {
 	async handleResumeSession(sessionPath: string): Promise<void> {
 		const previousSessionId = this.ctx.sessionManager.getSessionId();
 		this.#clearTransientSessionUi();
-		const migrationPolicy =
-			this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
-		let writableSessionPath = sessionPath;
-		if (this.ctx.sessionManager.isManagedDestination()) {
-			const inspection = await SessionManager.inspectSessionTailReadOnly(sessionPath);
-			if (inspection.kind === "error") throw new Error(`Could not inspect selected session: ${inspection.reason}`);
-			writableSessionPath = await this.ctx.sessionManager.prepareManagedCandidateForStrictAdoption(
-				sessionPath,
-				migrationPolicy,
-				inspection.identity,
-			);
+		this.ctx.showStatus("Resuming session…");
+		await this.ctx.ui.requestRenderAndWait(false, "session.resume");
+		let resumed: boolean;
+		try {
+			const migrationPolicy =
+				this.ctx.settings?.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+			let writableSessionPath = sessionPath;
+			if (this.ctx.sessionManager.isManagedDestination()) {
+				const inspection = await SessionManager.inspectSessionTailReadOnly(sessionPath);
+				if (inspection.kind === "error")
+					throw new Error(`Could not inspect selected session: ${inspection.reason}`);
+				writableSessionPath = await this.ctx.sessionManager.prepareManagedCandidateForStrictAdoption(
+					sessionPath,
+					migrationPolicy,
+					inspection.identity,
+				);
+			}
+			// Switch session via AgentSession (emits hook and tool session events)
+			resumed = await this.ctx.session.switchSession(writableSessionPath);
+		} catch (error) {
+			this.ctx.showError(`Resume failed: ${error instanceof Error ? error.message : String(error)}`);
+			await this.ctx.ui.requestRenderAndWait(false, "session.resume");
+			throw error;
 		}
-		// Switch session via AgentSession (emits hook and tool session events)
-		if (!(await this.ctx.session.switchSession(writableSessionPath))) return;
+		if (!resumed) {
+			this.ctx.showStatus("Resume cancelled");
+			await this.ctx.ui.requestRenderAndWait(false, "session.resume");
+			return;
+		}
 		const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
 		if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
 		this.#refreshSessionTerminalTitle();

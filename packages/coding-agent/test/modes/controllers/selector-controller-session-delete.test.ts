@@ -41,6 +41,7 @@ function createContext(currentSessionFile: string): {
 	prepareManagedCandidateForStrictAdoption: Mock<(targetPath: string) => Promise<string>>;
 	listForResumePickerReadOnly: Mock<() => Promise<SessionInfo[]>>;
 	switchSession: Mock<(targetPath: string) => Promise<boolean>>;
+	requestRenderAndWait: Mock<() => Promise<void>>;
 } {
 	const calls: string[] = [];
 	let managedDestination = false;
@@ -71,6 +72,9 @@ function createContext(currentSessionFile: string): {
 	});
 	const prepareManagedCandidateForStrictAdoption = vi.fn(async (targetPath: string) => targetPath);
 	const listForResumePickerReadOnly = vi.fn(async () => [] as SessionInfo[]);
+	const requestRenderAndWait = vi.fn(async () => {
+		calls.push("ui.requestRenderAndWait");
+	});
 	const ctx = {
 		editorContainer,
 		editor: {},
@@ -79,6 +83,7 @@ function createContext(currentSessionFile: string): {
 			requestRender: vi.fn(() => {
 				calls.push("ui.requestRender");
 			}),
+			requestRenderAndWait,
 			resetViewportAnchorIntent: vi.fn(() => {
 				calls.push("ui.resetViewportAnchorIntent");
 			}),
@@ -151,7 +156,9 @@ function createContext(currentSessionFile: string): {
 		showStatus: vi.fn((message: string) => {
 			calls.push(`showStatus:${message}`);
 		}),
-		showError: vi.fn(),
+		showError: vi.fn((message: string) => {
+			calls.push(`showError:${message}`);
+		}),
 		resetIrcSidebarSession: vi.fn(() => {
 			calls.push("resetIrcSidebarSession");
 		}),
@@ -177,6 +184,7 @@ function createContext(currentSessionFile: string): {
 		prepareManagedCandidateForStrictAdoption,
 		listForResumePickerReadOnly,
 		switchSession,
+		requestRenderAndWait,
 	};
 }
 
@@ -191,6 +199,66 @@ beforeAll(() => {
 describe("SelectorController session deletion", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("commits resume feedback before awaiting session inspection or switching", async () => {
+		const barrier = Promise.withResolvers<void>();
+		const { ctx, calls, requestRenderAndWait, switchSession } = createContext("/tmp/project/sessions/a.jsonl");
+		requestRenderAndWait.mockImplementation(async () => {
+			calls.push("ui.requestRenderAndWait");
+			await barrier.promise;
+		});
+		const controller = new SelectorController(ctx);
+
+		const resume = controller.handleResumeSession("/tmp/project/sessions/b.jsonl");
+		await Promise.resolve();
+
+		expect(calls.slice(-2)).toEqual(["showStatus:Resuming session…", "ui.requestRenderAndWait"]);
+		expect(switchSession).not.toHaveBeenCalled();
+
+		barrier.resolve();
+		await resume;
+		expect(switchSession).toHaveBeenCalledTimes(1);
+	});
+
+	it("replaces committed resume progress when session switching is cancelled", async () => {
+		const { ctx, calls, requestRenderAndWait, switchSession } = createContext("/tmp/project/sessions/a.jsonl");
+		switchSession.mockResolvedValue(false);
+		const controller = new SelectorController(ctx);
+
+		await controller.handleResumeSession("/tmp/project/sessions/b.jsonl");
+
+		expect(calls.slice(-4)).toEqual([
+			"showStatus:Resuming session…",
+			"ui.requestRenderAndWait",
+			"showStatus:Resume cancelled",
+			"ui.requestRenderAndWait",
+		]);
+		expect(switchSession).toHaveBeenCalledTimes(1);
+		expect(requestRenderAndWait).toHaveBeenCalledTimes(2);
+		expect(ctx.rebuildInitialMessages).not.toHaveBeenCalled();
+		expect(ctx.reloadTodos).not.toHaveBeenCalled();
+		expect(ctx.showStatus).not.toHaveBeenCalledWith("Resumed session");
+	});
+
+	it("replaces committed resume progress and rethrows when session switching rejects", async () => {
+		const failure = new Error("switch failed");
+		const { ctx, calls, requestRenderAndWait, switchSession } = createContext("/tmp/project/sessions/a.jsonl");
+		switchSession.mockRejectedValue(failure);
+		const controller = new SelectorController(ctx);
+
+		await expect(controller.handleResumeSession("/tmp/project/sessions/b.jsonl")).rejects.toBe(failure);
+
+		expect(calls.slice(-4)).toEqual([
+			"showStatus:Resuming session…",
+			"ui.requestRenderAndWait",
+			"showError:Resume failed: switch failed",
+			"ui.requestRenderAndWait",
+		]);
+		expect(requestRenderAndWait).toHaveBeenCalledTimes(2);
+		expect(ctx.rebuildInitialMessages).not.toHaveBeenCalled();
+		expect(ctx.reloadTodos).not.toHaveBeenCalled();
+		expect(ctx.showStatus).not.toHaveBeenCalledWith("Resumed session");
 	});
 
 	it("resets manual viewport intent before rendering a different session", async () => {

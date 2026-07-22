@@ -632,6 +632,7 @@ export class TUI extends Container {
 	onDebug?: () => void;
 	#renderRequested = false;
 	#renderTimer: NodeJS.Timeout | undefined;
+	#renderCommitWaiters: Array<() => void> = [];
 	#lastRenderAt = 0;
 	static readonly #MIN_RENDER_INTERVAL_MS = 16;
 	// Input-priority scheduling: an input keystroke must never be starved behind a
@@ -648,6 +649,7 @@ export class TUI extends Container {
 	#manualViewportAnchor: ManualViewportAnchor | null = null;
 	#manualViewportFallbackAnchors: ManualViewportAnchor[] = [];
 	#reconcileMissingViewportAnchor = false;
+	#transcriptIdentityReplaced = false;
 	#lastCursorPosition: { row: number; col: number } | null = null;
 	#sixelProbePendingDa = false;
 	#sixelProbePendingGraphics = false;
@@ -808,6 +810,7 @@ export class TUI extends Container {
 		this.#manualViewportAnchor = null;
 		this.#manualViewportFallbackAnchors = [];
 		this.#reconcileMissingViewportAnchor = false;
+		this.#transcriptIdentityReplaced = true;
 		this.#viewportAnchorFrame = null;
 	}
 
@@ -1100,6 +1103,13 @@ export class TUI extends Container {
 			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 		}
 		this.#clearSixelProbeState();
+		this.#resolveRenderCommitWaiters();
+	}
+
+	#resolveRenderCommitWaiters(): void {
+		const waiters = this.#renderCommitWaiters;
+		this.#renderCommitWaiters = [];
+		for (const resolve of waiters) resolve();
 	}
 
 	#writeTerminal(data: string): boolean {
@@ -1297,6 +1307,7 @@ export class TUI extends Container {
 			this.#renderTimer = undefined;
 			if (renderMetrics.enabled) renderMetrics.setTimerGauge("tui.renderTimer", 0);
 		}
+		this.#resolveRenderCommitWaiters();
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.#previousLines.length > 0) {
 			const targetRow = this.#previousLines.length; // Line after the last content
@@ -1362,6 +1373,21 @@ export class TUI extends Container {
 		this.requestRender(dimensionsChanged && !useViewportRepaintPath(this.terminal), "resize");
 	}
 
+	/**
+	 * Request a render and resolve after that frame has emitted through the terminal
+	 * adapter. Stopped or unavailable terminals resolve immediately.
+	 */
+	requestRenderAndWait(force = false, source = "unknown"): Promise<void> {
+		if (this.#stopped || !this.terminalAvailable) {
+			if (!this.terminalAvailable) this.#markTerminalUnavailable();
+			return Promise.resolve();
+		}
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#renderCommitWaiters.push(resolve);
+		this.requestRender(force, source);
+		return promise;
+	}
+
 	requestRender(force = false, source = "unknown"): void {
 		if (!this.terminalAvailable) {
 			this.#markTerminalUnavailable();
@@ -1401,7 +1427,7 @@ export class TUI extends Container {
 				this.#renderRequested = false;
 				this.#lastRenderAt = performance.now();
 				const t0 = renderMetrics.now();
-				this.#doRender();
+				this.#commitRender();
 				if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			});
 			return;
@@ -1424,6 +1450,16 @@ export class TUI extends Container {
 		process.nextTick(() => this.#scheduleRender());
 	}
 
+	#commitRender(): void {
+		const waiters = this.#renderCommitWaiters;
+		this.#renderCommitWaiters = [];
+		try {
+			this.#doRender();
+		} finally {
+			for (const resolve of waiters) resolve();
+		}
+	}
+
 	#scheduleRender(): void {
 		if (this.#stopped || this.#renderTimer || !this.#renderRequested) {
 			return;
@@ -1439,7 +1475,7 @@ export class TUI extends Container {
 			this.#renderRequested = false;
 			this.#lastRenderAt = performance.now();
 			const t0 = renderMetrics.now();
-			this.#doRender();
+			this.#commitRender();
 			if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 			if (this.#renderRequested) {
 				this.#scheduleRender();
@@ -1465,7 +1501,7 @@ export class TUI extends Container {
 		this.#renderRequested = false;
 		this.#lastRenderAt = performance.now();
 		const t0 = renderMetrics.now();
-		this.#doRender();
+		this.#commitRender();
 		if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
 	}
 
@@ -2413,6 +2449,13 @@ export class TUI extends Container {
 			const msg = `[${new Date().toISOString()}] fullRender: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height})\n`;
 			this.#appendDebugRedrawLog(msg);
 		};
+		if (this.#transcriptIdentityReplaced) {
+			this.#transcriptIdentityReplaced = false;
+			if (useViewportRepaintPath(this.terminal) && this.#previousLines.length > 0) {
+				viewportRepaint("transcript identity replaced");
+				return;
+			}
+		}
 
 		// First render - just output everything without clearing (assumes clean screen)
 		if (this.#previousLines.length === 0 && !widthChanged && !heightChanged) {
