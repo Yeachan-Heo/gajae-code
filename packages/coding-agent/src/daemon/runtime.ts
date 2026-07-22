@@ -30,6 +30,7 @@ const COMPILED_RELOAD_WARNING =
  * own subcommand directly and cannot pick up workspace source edits.
  */
 export function resolveGjcRuntimeSpawnInfo(execPath: string = process.execPath): GjcRuntimeSpawnInfo {
+	if (!path.isAbsolute(execPath)) throw new Error("gjc_runtime_exec_path_not_absolute");
 	const base = path.basename(execPath).toLowerCase();
 	const fromSource = base === "bun" || base === "node" || base.startsWith("bun") || base.startsWith("node");
 	const sourceEntry = fromSource ? path.resolve(import.meta.dir, "../../bin/gjc.js") : undefined;

@@ -20,6 +20,7 @@
 - Corrected Telegram's uncertain lifecycle guidance so create, close, and resume commands describe their own possible outcome; close and resume no longer display the create-only duplicate-start warning.
 - Telegram ask notifications now preserve the authoritative recommended choice from native asks and workflow gates, marking that option as `(Recommended)` in the message body without changing button indices or submitted answers.
 - Telegram `/session_close` now fails closed when tmux disappearance cannot be confirmed, and publishes the managed owner verdict before locked terminal-state preservation so normal close finalization is not delayed behind that state path.
+- Telegram `/session_create worktree` now pins the active GJC runtime, enters the requested linked worktree, and keeps tmux project/branch metadata aligned without mutating the primary checkout.
 
 ## [0.11.6] - 2026-07-21
 ## [0.11.5] - 2026-07-20

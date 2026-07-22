@@ -185,6 +185,10 @@ describe("daemon runtime detection", () => {
 		expect(compiled.argsPrefix).toEqual([]);
 	});
 
+	test("rejects a relative runtime executable before spawning", () => {
+		expect(() => resolveGjcRuntimeSpawnInfo("gjc")).toThrow("gjc_runtime_exec_path_not_absolute");
+	});
+
 	test("chat daemon spawn uses source and compiled command forms", () => {
 		const source = buildChatDaemonSpawnArgs({
 			kind: "discord",

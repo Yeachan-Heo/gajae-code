@@ -1609,6 +1609,7 @@ describe("lifecycle control runtime", () => {
 			const result = await daemonSpawnCreate(
 				{ ...process.env, GJC_TMUX_COMMAND: tmux, TMUX_CALLS: callsFile },
 				{
+					execPath: "/opt/gjc current/gjc",
 					ownerIsolationProbe: {
 						readCallerCgroup: async () => "/gjc-lifecycle-test.scope\n",
 						probeServer: async () =>
@@ -1623,7 +1624,7 @@ describe("lifecycle control runtime", () => {
 									},
 					},
 				},
-			)(createFrame({ target: { kind: "existing_path", path: proj } }), {
+			)(createFrame({ target: { kind: "worktree", repo: proj, branch: "fix-telegram-close" } }), {
 				lifecycleRequestId: "lc-owner",
 				intendedSessionId: "owner-123",
 			});
@@ -1649,6 +1650,11 @@ describe("lifecycle control runtime", () => {
 			expect(calls).toContain("@gjc-owner-server-key");
 			expect(calls).not.toContain("GJC_OWNER_");
 			expect(calls).toContain(`GJC_COORDINATOR_SESSION_STATE_FILE='${result.sessionStateFile}'`);
+			expect(calls).toContain(
+				`GJC_MANAGED_OWNER_COMMAND_JSON='["/opt/gjc current/gjc","--worktree=fix-telegram-close"]'`,
+			);
+			expect(calls).toContain("'/opt/gjc current/gjc' '--internal-managed-owner-supervisor'");
+			expect(calls).not.toContain("@gjc-project");
 			expect(calls).not.toContain("gjc-lifecycle-owner-isolation");
 			fs.rmSync(root, { recursive: true, force: true });
 		},

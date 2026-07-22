@@ -15,6 +15,7 @@ import {
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
 } from "../gjc-runtime/session-state-sidecar";
+import { GJC_TMUX_BRANCH_OPTION, GJC_TMUX_PROJECT_OPTION, resolveGjcTmuxCommand } from "../gjc-runtime/tmux-common";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
 
@@ -56,6 +57,28 @@ export async function persistCoordinatorLaunchFailure(
 	};
 	await fs.mkdir(path.dirname(stateFile), { recursive: true });
 	await Bun.write(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+}
+
+function updateWorktreeTmuxMetadata(launch: PreparedLaunchWorktree): void {
+	const target = process.env.TMUX_PANE;
+	if (!launch.worktree.enabled) return;
+	if (!target) {
+		if (process.env[GJC_COORDINATOR_SESSION_ID_ENV]) throw new Error("worktree_tmux_pane_missing");
+		return;
+	}
+	const tmux = resolveGjcTmuxCommand(process.env);
+	const metadata: Array<[string, string]> = [[GJC_TMUX_PROJECT_OPTION, launch.cwd]];
+	if (!launch.worktree.detached) {
+		if (!launch.worktree.branchName) throw new Error("worktree_branch_missing");
+		metadata.push([GJC_TMUX_BRANCH_OPTION, launch.worktree.branchName]);
+	}
+	for (const [option, value] of metadata) {
+		const result = Bun.spawnSync([tmux, "set-option", "-t", target, option, value]);
+		if (result.exitCode !== 0) {
+			const detail = result.stderr.toString().trim();
+			throw new Error(`worktree_tmux_metadata_failed:${option}${detail ? `: ${detail}` : ""}`);
+		}
+	}
 }
 
 export default class Index extends Command {
@@ -222,8 +245,14 @@ export default class Index extends Command {
 			throw error;
 		}
 		if (launch.worktree.enabled) {
-			process.chdir(launch.cwd);
-			setProjectDir(launch.cwd);
+			try {
+				process.chdir(launch.cwd);
+				setProjectDir(launch.cwd);
+				updateWorktreeTmuxMetadata(launch);
+			} catch (error) {
+				await persistCoordinatorLaunchFailure(error, launch.cwd);
+				throw error;
+			}
 		}
 		const launchParsed = parseArgs(launch.args);
 		if (

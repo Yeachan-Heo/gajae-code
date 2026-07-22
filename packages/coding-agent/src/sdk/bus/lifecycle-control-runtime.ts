@@ -12,6 +12,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { NotificationControlServer as NativeNotificationControlServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
+import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { readLinuxProcStartTime } from "../../gjc-runtime/linux-proc";
 import {
 	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
@@ -782,6 +783,7 @@ async function completeLifecycleSpawnTransaction(input: {
 	ownerIsolationProbe?: OwnerIsolationProbe;
 	prepareSpawn?: () => void;
 	previousBaseline?: OwnerGenerationBaseline;
+	recordProjectMetadata?: boolean;
 }): Promise<void> {
 	const previousBaseline =
 		input.previousBaseline ?? (await captureOwnerGenerationBaseline(input.stateDir, input.sessionId));
@@ -807,7 +809,7 @@ async function completeLifecycleSpawnTransaction(input: {
 			{
 				sessionId: input.sessionId,
 				sessionStateFile: input.sessionStateFile,
-				project: input.cwd,
+				project: input.recordProjectMetadata === false ? undefined : input.cwd,
 				ownerGeneration: input.generation,
 				ownerServerKey: ownerExecution.serverKey,
 			},
@@ -860,7 +862,7 @@ async function completeLifecycleSpawnTransaction(input: {
 /** Real daemon-safe tmux launcher: canonical owner-isolation plan + GJC tags. */
 export function daemonSpawnCreate(
 	env: NodeJS.ProcessEnv = process.env,
-	opts: { ownerIsolationProbe?: OwnerIsolationProbe } = {},
+	opts: { ownerIsolationProbe?: OwnerIsolationProbe; execPath?: string } = {},
 ) {
 	return async (
 		frame: SessionCreateFrame,
@@ -871,6 +873,8 @@ export function daemonSpawnCreate(
 		const tmux = tmuxBinary.command;
 		const name = tmuxSessionNameFor(ids.intendedSessionId);
 		const { cwd, args } = buildCreateArgv(frame, ids);
+		const runtime = resolveGjcRuntimeSpawnInfo(opts.execPath);
+		const gjcCommand = [runtime.execPath, ...runtime.argsPrefix];
 		const sessionStateFile = lifecycleRuntimeStateFile(cwd, ids.intendedSessionId, name);
 		const stateDir = path.dirname(sessionStateFile);
 		const previousBaseline = await captureOwnerGenerationBaseline(stateDir, ids.intendedSessionId);
@@ -891,7 +895,7 @@ export function daemonSpawnCreate(
 			[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 			[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
 			[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
-			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(["gjc", ...args]),
+			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...gjcCommand, ...args]),
 			[MANAGED_OWNER_RUN_ID_ENV]: runId,
 			[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
 			...(predecessor
@@ -908,7 +912,7 @@ export function daemonSpawnCreate(
 		const envPairs = Object.entries(childEnv)
 			.map(([key, value]) => `${key}=${shellQuote(value)}`)
 			.join(" ");
-		const command = `cd ${shellQuote(cwd)} && exec env ${envPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
+		const command = `cd ${shellQuote(cwd)} && exec env ${envPairs} ${gjcCommand.map(shellQuote).join(" ")} ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
 		await completeLifecycleSpawnTransaction({
 			tmux,
 			env,
@@ -923,6 +927,7 @@ export function daemonSpawnCreate(
 			prepareSpawn: () => {
 				if (frame.target.kind === "plain_dir") fs.mkdirSync(cwd, { recursive: true });
 			},
+			recordProjectMetadata: frame.target.kind !== "worktree",
 			previousBaseline,
 		});
 
@@ -951,7 +956,7 @@ async function applyRequiredLifecycleTmuxMetadata(
 	metadata: {
 		sessionId: string;
 		sessionStateFile: string;
-		project: string;
+		project?: string;
 		ownerGeneration: string;
 		ownerServerKey: string;
 	},
@@ -960,7 +965,7 @@ async function applyRequiredLifecycleTmuxMetadata(
 	if (
 		!metadata.sessionId.trim() ||
 		!metadata.sessionStateFile.trim() ||
-		!metadata.project.trim() ||
+		(metadata.project !== undefined && !metadata.project.trim()) ||
 		!metadata.ownerGeneration.trim() ||
 		!metadata.ownerServerKey.trim()
 	)
@@ -1018,6 +1023,7 @@ export function daemonResumeSession(
 		sessionsRoot?: string;
 		listSessions?: (env: NodeJS.ProcessEnv) => GjcTmuxSessionStatus[];
 		ownerIsolationProbe?: OwnerIsolationProbe;
+		execPath?: string;
 	} = {},
 ) {
 	return async (target: {
@@ -1091,6 +1097,8 @@ export function daemonResumeSession(
 		const generation = crypto.randomUUID();
 		const runId = crypto.randomUUID();
 		const incarnation = crypto.randomUUID();
+		const runtime = resolveGjcRuntimeSpawnInfo(opts.execPath);
+		const gjcCommand = [runtime.execPath, ...runtime.argsPrefix];
 		const childEnv: Record<string, string> = {
 			GJC_TMUX_LAUNCHED: "1",
 			GJC_NOTIFICATIONS: "1",
@@ -1099,7 +1107,7 @@ export function daemonResumeSession(
 			[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 			[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
 			[GJC_TMUX_OWNER_SERVER_KEY_ENV]: "default",
-			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(["gjc", "--resume", resumeId]),
+			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...gjcCommand, "--resume", resumeId]),
 			[MANAGED_OWNER_RUN_ID_ENV]: runId,
 			[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
 			...(predecessor
@@ -1115,7 +1123,7 @@ export function daemonResumeSession(
 		const envPairs = Object.entries(childEnv)
 			.map(([key, value]) => `${key}=${shellQuote(value)}`)
 			.join(" ");
-		const command = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${envPairs} gjc ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
+		const command = `cd ${shellQuote(resolvedResumeCwd)} && exec env ${envPairs} ${gjcCommand.map(shellQuote).join(" ")} ${shellQuote(MANAGED_OWNER_SUPERVISOR_ARG)}`;
 		await completeLifecycleSpawnTransaction({
 			tmux,
 			env,
