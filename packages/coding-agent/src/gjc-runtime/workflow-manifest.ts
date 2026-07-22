@@ -22,7 +22,9 @@ export interface WorkflowVerb {
 	name: string;
 	planned?: boolean;
 	/** Invocation surface that exposes this verb in the real CLI parser. */
-	surface?: "state-action" | "command-positional" | "command-flag";
+	surface?: "state-action" | "command-positional" | "command-flag" | "draft-action";
+	/** Legacy surface retained for callers that have not migrated to normal typed commands. */
+	compatibilityOnly?: boolean;
 }
 
 export interface TypedArgSpec {
@@ -31,6 +33,7 @@ export interface TypedArgSpec {
 	enumValues?: string[];
 	required?: boolean;
 	appliesToVerbs?: string[];
+	compatibilityOnly?: boolean;
 	planned?: boolean;
 }
 
@@ -91,6 +94,9 @@ function stateVerbs(): WorkflowVerb[] {
 
 function positionalVerbs(names: readonly string[]): WorkflowVerb[] {
 	return names.map(name => verb(name, "command-positional"));
+}
+function draftVerbs(names: readonly string[]): WorkflowVerb[] {
+	return names.map(name => verb(name, "draft-action"));
 }
 
 function flagVerbs(names: readonly string[]): WorkflowVerb[] {
@@ -162,6 +168,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		verbs: [
 			...stateVerbs(),
 			...flagVerbs(["kickoff", "write-spec"]),
+			...draftVerbs(["draft create", "draft edit", "draft show", "draft check", "draft rebase", "draft discard"]),
 			...positionalVerbs([
 				"initialize-context",
 				"confirm-topology",
@@ -189,20 +196,74 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				name: "session-id",
 				type: "string",
 				required: true,
+				appliesToVerbs: ["draft create"],
+			},
+			{
+				name: "for",
+				type: "enum",
+				enumValues: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
+				required: true,
+				appliesToVerbs: ["draft create"],
+			},
+			{ name: "round-key", type: "string", appliesToVerbs: ["draft create"] },
+			{ name: "round", type: "number", appliesToVerbs: ["draft create"] },
+			{ name: "question-id", type: "string", appliesToVerbs: ["draft create"] },
+			{ name: "round-id", type: "string", appliesToVerbs: ["draft create"] },
+			{ name: "component-id", type: "string", appliesToVerbs: ["draft create"] },
+			{ name: "dimension", type: "string", appliesToVerbs: ["draft create"] },
+			{
+				name: "draft-id",
+				type: "string",
+				required: true,
 				appliesToVerbs: [
+					"draft edit",
+					"draft show",
+					"draft check",
+					"draft rebase",
+					"draft discard",
 					"initialize-context",
 					"confirm-topology",
 					"record-answer",
 					"apply-round-result",
-					"inspect",
-					"sanity-check",
 				],
 			},
+			{
+				name: "expected-draft-revision",
+				type: "number",
+				required: true,
+				appliesToVerbs: [
+					"draft edit",
+					"draft rebase",
+					"draft discard",
+					"initialize-context",
+					"confirm-topology",
+					"record-answer",
+					"apply-round-result",
+				],
+			},
+			{
+				name: "op",
+				type: "enum",
+				enumValues: ["set", "append", "remove"],
+				required: true,
+				appliesToVerbs: ["draft edit"],
+			},
+			{ name: "path", type: "string", required: true, appliesToVerbs: ["draft edit"] },
+			{ name: "value", type: "string", appliesToVerbs: ["draft edit"] },
+			{ name: "value-file", type: "string", appliesToVerbs: ["draft edit"] },
+			{ name: "null", type: "boolean", appliesToVerbs: ["draft edit"] },
+			{ name: "to-state-revision", type: "number", required: true, appliesToVerbs: ["draft rebase"] },
 			{
 				name: "json",
 				type: "boolean",
 				required: true,
 				appliesToVerbs: [
+					"draft create",
+					"draft edit",
+					"draft show",
+					"draft check",
+					"draft rebase",
+					"draft discard",
 					"initialize-context",
 					"confirm-topology",
 					"record-answer",
@@ -212,41 +273,82 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				],
 			},
 			{
+				name: "session-id",
+				type: "string",
+				required: true,
+				appliesToVerbs: ["inspect", "sanity-check"],
+			},
+			{
+				name: "session-id",
+				type: "string",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
+			},
+			{
 				name: "schema-version",
 				type: "number",
 				required: true,
+				compatibilityOnly: true,
 				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
 			},
 			{
 				name: "expected-revision",
 				type: "number",
 				required: true,
+				compatibilityOnly: true,
 				appliesToVerbs: ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"],
 			},
 			{
 				name: "input-json",
 				type: "object",
 				required: true,
+				compatibilityOnly: true,
 				appliesToVerbs: ["initialize-context", "confirm-topology"],
 			},
 			{
 				name: "round",
 				type: "number",
 				required: true,
+				compatibilityOnly: true,
 				appliesToVerbs: ["record-answer", "apply-round-result"],
 			},
 			{
 				name: "question-id",
 				type: "string",
 				required: true,
+				compatibilityOnly: true,
 				appliesToVerbs: ["record-answer", "apply-round-result"],
 			},
-			{ name: "round-id", type: "string", appliesToVerbs: ["record-answer", "apply-round-result"] },
-			{ name: "component-id", type: "string", appliesToVerbs: ["record-answer"] },
-			{ name: "dimension", type: "string", appliesToVerbs: ["record-answer"] },
-			{ name: "answer-json", type: "object", required: true, appliesToVerbs: ["record-answer"] },
-			{ name: "question-json", type: "string", required: true, appliesToVerbs: ["record-answer"] },
-			{ name: "result-json", type: "object", required: true, appliesToVerbs: ["apply-round-result"] },
+			{
+				name: "round-id",
+				type: "string",
+				compatibilityOnly: true,
+				appliesToVerbs: ["record-answer", "apply-round-result"],
+			},
+			{ name: "component-id", type: "string", compatibilityOnly: true, appliesToVerbs: ["record-answer"] },
+			{ name: "dimension", type: "string", compatibilityOnly: true, appliesToVerbs: ["record-answer"] },
+			{
+				name: "answer-json",
+				type: "object",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["record-answer"],
+			},
+			{
+				name: "question-json",
+				type: "string",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["record-answer"],
+			},
+			{
+				name: "result-json",
+				type: "object",
+				required: true,
+				compatibilityOnly: true,
+				appliesToVerbs: ["apply-round-result"],
+			},
 			{
 				name: "selector",
 				type: "enum",
