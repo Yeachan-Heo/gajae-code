@@ -2808,7 +2808,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const gateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Budget"] })),
 		};
 		const tool = new AskTool(
@@ -2835,7 +2835,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 	});
 
 	it("bounds the complete legacy and multi-question ask payload before any gate emission", async () => {
-		const gateEmitter = { isUnattended: () => true, emitGate: vi.fn(async () => ({ selected: ["A"] })) };
+		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn(async () => ({ selected: ["A"] })) };
 		const tool = new AskTool(
 			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
 		);
@@ -2862,7 +2862,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 
 	it("forwards bounded inert adapter context through the canonical gate", async () => {
 		const gateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Continue"] })),
 		};
 		const adapterContext = {
@@ -3103,7 +3103,7 @@ describe("AskTool Round-0 intent recovery", () => {
 
 	it("terminally rejects every recovery-shaped near-miss before coercion", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
-		const gateEmitter = { isUnattended: () => true, emitGate: vi.fn() };
+		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn() };
 		const tool = new AskTool(
 			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
 		);
@@ -3228,7 +3228,7 @@ describe("AskTool Round-0 intent recovery", () => {
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const gateEmitter = {
-			isUnattended: () => true,
+			supportsRemoteGateAnswers: () => true,
 			emitGate: vi.fn(async () => ({ selected: ["Looks right"] })),
 		};
 		const tool = new AskTool(

@@ -3091,7 +3091,7 @@ test("workflow gate recommendation projection marks only one exact hint without 
 		| undefined;
 	let terminalController: { completeGateInteractions: (gateId: string) => unknown } | undefined;
 	const workflowGate = {
-		isUnattended: () => true,
+		supportsRemoteGateAnswers: () => true,
 		onGateEmitted: (listener: typeof emitGate) => {
 			emitGate = listener;
 			return () => {};

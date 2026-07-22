@@ -186,7 +186,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 				required: true,
 			};
 			const emitter: WorkflowGateEmitter = {
-				isUnattended: () => true,
+				supportsRemoteGateAnswers: () => true,
 				emitGate: () => Promise.resolve(undefined),
 				listPendingGates: () => [pendingGate],
 			};
@@ -216,7 +216,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		});
 		try {
 			const emitter: WorkflowGateEmitter = {
-				isUnattended: () => true,
+				supportsRemoteGateAnswers: () => true,
 				emitGate: () => Promise.resolve(undefined),
 				listPendingGates: () => {
 					throw new Error("pending gate lookup failed");
