@@ -2931,10 +2931,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				// proceed with local coordinator cleanup. Returning early here leaves
 				// the deletion stuck in "intent" phase, which triggers session_closing
 				// on every subsequent read and blocks the session reaper permanently.
-				if (
-					error instanceof SdkClientError &&
-					(error.code === "not_found" || error.code === "resource_gone")
-				) {
+				if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "resource_gone")) {
 					// fall through to advanceDeletion + local cleanup
 				} else {
 					return {
@@ -2961,7 +2958,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			// Remove the durable transaction file so the namespace-registry does not
 			// rediscover a stuck stop/reap operation on coordinator restart.
-			await fs.rm(path.join(questionPaths.sessions, safeExternalId("session", id), "transaction.v1.json"), { force: true });
+			await fs.rm(path.join(questionPaths.sessions, safeExternalId("session", id), "transaction.v1.json"), {
+				force: true,
+			});
 			await fs.rm(sessionFile(id), { force: true });
 			await fs.rm(sessionStateFile(namespaceDir, id), { force: true });
 			await fs.rm(activeTurnFile(namespaceDir, id), { force: true });
@@ -4806,7 +4805,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		}
 		return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown_method:${request.method}` } };
 	}
-
 
 	// Clean up orphaned transaction files left by previous coordinator runs
 	// where broker close failed with resource_gone. Without this, every read
