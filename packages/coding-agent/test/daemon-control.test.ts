@@ -2629,7 +2629,16 @@ describe("topic registry reload persistence", () => {
 		const registry = new TopicRegistry();
 		registry.load({
 			topics: {
-				S1: { topicId: "100", identitySent: true, name: "repo/main - title", createdAt: 1 },
+				S1: {
+					topicId: "100",
+					identitySent: true,
+					name: "repo/main - title",
+					createdAt: 1,
+					chatId: "42",
+					endpointKey: "ws://reload",
+					endpointDigest: "reload-digest",
+					endpointGeneration: 1,
+				},
 			},
 		});
 		// identitySent must survive so a reloaded daemon does not re-emit the header.
