@@ -278,7 +278,7 @@
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "58752afc0f629a1d0e57ffc70e4b506397261f97aad7ff3d3fca5c4a40fa45d4",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:ownerPid": "31110dcdd6e0f5dbc8b4dce27383646b9c339739758623ab67dc40ddc36661e0",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:runChatDaemonInternal": "74c0a7c475325313453a4295479fd4cb2fcb3af6137426b8262b768d5bc276d0",
-    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.discord": "0b1f395846d19d6fa9b1b5f32dc527f229ffde2920e743d5bb0839202d59924f",
+    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.discord": "2ac755aae54b113ebaa8c1d764e9954462733d2105680eab50fa7e8cfd0fb771",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonAction": "d8acaf90439e410595b5cd56fd187001393ea943517a5563a4a2ea3c88d155ef",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonController": "476aad2ea908df7fb0cb72be8cea82007b245cd8228d2c7846fd31b3b6d1fb99",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:ChatDaemonKind": "b1c2906c4eb04e120c9ce42f8b549a68cfc834d29d4d745335712a7f61bf09f2",

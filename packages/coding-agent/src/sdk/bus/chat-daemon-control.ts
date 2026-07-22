@@ -31,7 +31,7 @@ export type ChatDaemonAction = "stop" | "reload";
  * repair for shared native authority.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 8,
+	discord: 9,
 	slack: 8,
 };
 
