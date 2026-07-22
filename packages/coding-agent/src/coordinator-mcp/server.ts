@@ -1053,9 +1053,9 @@ function canonicalCoordinatorEvent(
 
 function sortNewestFirst(records: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
 	return [...records].sort((left, right) => {
-		const leftTime = eventTimestamp(left) ?? "";
-		const rightTime = eventTimestamp(right) ?? "";
-		return rightTime.localeCompare(leftTime);
+		const timestampOrder = (eventTimestamp(right) ?? "").localeCompare(eventTimestamp(left) ?? "");
+		if (timestampOrder !== 0) return timestampOrder;
+		return canonicalJson(left).localeCompare(canonicalJson(right));
 	});
 }
 
@@ -3389,7 +3389,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					? null
 					: (Object.values(transaction.canonical.turns)
 							.filter(candidate => candidate.status === "queued")
-							.sort((left, right) => left.created_at.localeCompare(right.created_at))[0] ?? null);
+							.sort(
+								(left, right) =>
+									left.created_at.localeCompare(right.created_at) || left.turn_id.localeCompare(right.turn_id),
+							)[0] ?? null);
 			if (next) {
 				const timestamp = new Date().toISOString();
 				next.status = "active";
@@ -3398,6 +3401,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			transaction.canonical.queue.ordered_turn_ids = Object.values(transaction.canonical.turns)
 				.filter(candidate => candidate.status === "queued")
+				.sort(
+					(left, right) =>
+						left.created_at.localeCompare(right.created_at) || left.turn_id.localeCompare(right.turn_id),
+				)
 				.map(candidate => candidate.turn_id);
 			transaction.canonical.queue.active_turn_id = next?.turn_id ?? null;
 			transaction.canonical.queue.selected_promotion = next

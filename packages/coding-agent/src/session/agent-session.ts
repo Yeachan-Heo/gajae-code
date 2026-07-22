@@ -2190,6 +2190,7 @@ export class AgentSession {
 			sessionId: this.sessionId,
 			cwd: this.sessionManager.getCwd(),
 			sessionFile: this.sessionManager.getSessionFile(),
+			runtimeTurnIdProvider: () => this.#activeCoordinatorRuntimeTurnId,
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
@@ -8979,6 +8980,7 @@ export class AgentSession {
 
 	async #runNewSessionTransition(options?: NewSessionOptions): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
+		this.#assertNoCorrelatedQueuedTurnDestruction([...this.#steeringMessages, ...this.#followUpMessages]);
 		const previousWorkflowGateSessionId = this.sessionId;
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
 			this.#getSelectedDiscoveredBuiltinToolNames().filter(
@@ -9166,6 +9168,7 @@ export class AgentSession {
 	 * session identity and durable history trail.
 	 */
 	async clearContext(): Promise<boolean> {
+		this.#assertNoCorrelatedQueuedTurnDestruction([...this.#steeringMessages, ...this.#followUpMessages]);
 		this.#beginSessionTransition("clear-context");
 		try {
 			const sessionId = this.sessionId;
@@ -10521,6 +10524,7 @@ export class AgentSession {
 		if (this.isGeneratingHandoff || this.#handoffTransitionActive) {
 			throw Object.assign(new Error("A handoff is already in progress."), { code: "busy" });
 		}
+		this.#assertNoCorrelatedQueuedTurnDestruction([...this.#steeringMessages, ...this.#followUpMessages]);
 		// A manual/external handoff must not race an active turn: replacing the
 		// session and resetting the agent mid-stream can strand old-turn events
 		// onto the successor session. Auto-triggered handoffs run during
@@ -14452,6 +14456,7 @@ export class AgentSession {
 	 * @returns true if switch completed, false if cancelled by hook
 	 */
 	async switchSession(sessionPath: string): Promise<boolean> {
+		this.#assertNoCorrelatedQueuedTurnDestruction([...this.#steeringMessages, ...this.#followUpMessages]);
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();

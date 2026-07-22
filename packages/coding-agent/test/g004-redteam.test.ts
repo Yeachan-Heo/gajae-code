@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
+import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
@@ -159,6 +160,7 @@ describe("G004 sidecar cache and heartbeat red-team", () => {
 			sessionId: "fallback",
 			cwd: root,
 			sessionFile: null,
+			runtimeTurnIdProvider: () => "runtime-postmortem-turn",
 		});
 
 		const payload = await readJson(stateFile);
@@ -169,6 +171,15 @@ describe("G004 sidecar cache and heartbeat red-team", () => {
 			reason: "sigterm",
 			signal: "SIGTERM",
 			previous_runtime_state: "running",
+		});
+		expect(
+			await readJson(
+				path.join(sessionRuntimeDir(root, "g004-postmortem"), "terminal-receipts", "runtime-postmortem-turn.json"),
+			),
+		).toMatchObject({
+			session_id: "g004-postmortem",
+			state: "errored",
+			runtime_turn_id: "runtime-postmortem-turn",
 		});
 	});
 });

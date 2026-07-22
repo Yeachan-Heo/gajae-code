@@ -4588,7 +4588,18 @@ export class TelegramNotificationDaemon {
 	}
 
 	#creationLeaseAllows(socketLease: { session: SessionSocket; token: number; logicalSessionId: string }): boolean {
-		return this.#leaseTokenAllows(socketLease) || this.#isEagerCreationHandoff(socketLease);
+		if (this.#leaseTokenAllows(socketLease) || this.#isEagerCreationHandoff(socketLease)) return true;
+		// Replay has authenticated the exact open transport but has not yet entered
+		// its recovery claim. Its eager create remains a transport-local claim; keep
+		// the result for that claim so recovery can bind it, rather than compensating
+		// it before endpoint authority is classified.
+		return (
+			socketLease.token === 0 &&
+			socketLease.logicalSessionId === socketLease.session.sessionId &&
+			socketLease.session.logicalSessionIdTrusted &&
+			!socketLease.session.recoveryLease &&
+			this.#ownsLiveOpenEndpoint(socketLease.session, this.#endpointBinding(socketLease.session))
+		);
 	}
 
 	async #awaitCreationLeaseAuthority(socketLease: {
@@ -4597,18 +4608,6 @@ export class TelegramNotificationDaemon {
 		logicalSessionId: string;
 	}): Promise<boolean> {
 		if (this.#creationLeaseAllows(socketLease)) return true;
-		// Replay has authenticated the exact open transport but has not yet entered
-		// its recovery claim. Its eager create remains a transport-local claim; keep
-		// the result for that claim so recovery can bind it, rather than compensating
-		// it before endpoint authority is classified.
-		if (
-			socketLease.token === 0 &&
-			socketLease.logicalSessionId === socketLease.session.sessionId &&
-			socketLease.session.logicalSessionIdTrusted &&
-			!socketLease.session.recoveryLease &&
-			this.#ownsLiveOpenEndpoint(socketLease.session, this.#endpointBinding(socketLease.session))
-		)
-			return true;
 		if (
 			socketLease.token === 0 &&
 			socketLease.session.logicalSessionIdTrusted &&
@@ -5148,7 +5147,7 @@ export class TelegramNotificationDaemon {
 			const rec = await this.topics.getOrCreateTopic(
 				sessionId,
 				async () => {
-					if (capturedCreationLease && !this.#leaseTokenAllows(capturedCreationLease))
+					if (capturedCreationLease && !this.#creationLeaseAllows(capturedCreationLease))
 						throw new Error("topic authority was revoked during creation");
 					const res = await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name });
 					if (isThreadedModeCapabilityRefusal(res)) throw new ThreadedModeCapabilityRefusal();

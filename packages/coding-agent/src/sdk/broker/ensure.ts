@@ -183,6 +183,11 @@ function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: Nod
 			key.startsWith("GJC_MANAGED_OWNER_") ||
 			key === "GJC_TMUX_ACTIVE_SESSION" ||
 			key === "GJC_TMUX_LAUNCHED" ||
+			key === "GJC_SESSION_ID" ||
+			key === "GJC_LIFECYCLE_REQUEST_ID" ||
+			key === "GJC_SDK_SESSION_COMMAND" ||
+			key === "GJC_SESSION_PROMPT_ACCEPTED_JSON" ||
+			key === "GJC_SESSION_WORKTREE_BASELINE_DIRTY" ||
 			key === "TMUX" ||
 			key === "TMUX_PANE"
 		)

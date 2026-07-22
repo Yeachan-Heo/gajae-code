@@ -84,6 +84,8 @@ export interface RuntimeStateContext {
 	ownerTerminal?: OwnerTerminalContext | null;
 	/** Runtime turn correlation supplied by the SDK control plane. */
 	runtimeTurnId?: string | null;
+	/** Resolves the in-flight runtime turn during process postmortem. */
+	runtimeTurnIdProvider?: () => string | null | undefined;
 	/** Internal fail-closed marker set only when managed owner metadata is malformed or missing. */
 	ownerTerminalMetadataInvalid?: boolean;
 }
@@ -769,6 +771,29 @@ function contextWithManagedOwnerGeneration(context: RuntimeStateContext): Runtim
 	return ownerTerminal ? { ...context, ownerTerminal } : context;
 }
 
+function runtimeTurnIdForContext(context: RuntimeStateContext): string | null {
+	const runtimeTurnId = context.runtimeTurnId ?? context.runtimeTurnIdProvider?.() ?? null;
+	return typeof runtimeTurnId === "string" && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(runtimeTurnId)
+		? runtimeTurnId
+		: null;
+}
+
+async function writeRuntimeTurnReceipt(
+	context: RuntimeStateContext,
+	identity: RuntimeStateIdentity,
+	payload: Record<string, unknown>,
+): Promise<void> {
+	if (payload.state !== "completed" && payload.state !== "errored") return;
+	const runtimeTurnId = runtimeTurnIdForContext(context);
+	if (!runtimeTurnId) return;
+	const receiptFile = path.join(
+		sessionRuntimeDir(identity.cwd, identity.sessionId),
+		"terminal-receipts",
+		`${runtimeTurnId}.json`,
+	);
+	await writeStateFile(receiptFile, { ...payload, runtime_turn_id: runtimeTurnId });
+}
+
 export async function persistCoordinatorRuntimeStateFromEvent(
 	event: RuntimeStateEvent,
 	context: RuntimeStateContext,
@@ -809,19 +834,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						};
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 						await writeStateFile(stateFile, payload);
-						if (
-							(state === "completed" || state === "errored") &&
-							typeof context.runtimeTurnId === "string" &&
-							/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(context.runtimeTurnId)
-						) {
-							const receipt = { ...payload, runtime_turn_id: context.runtimeTurnId };
-							const receiptFile = path.join(
-								sessionRuntimeDir(identity.cwd, identity.sessionId),
-								"terminal-receipts",
-								`${context.runtimeTurnId}.json`,
-							);
-							await writeStateFile(receiptFile, receipt);
-						}
+						await writeRuntimeTurnReceipt(context, identity, payload);
 					}),
 			),
 	);
@@ -1088,6 +1101,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 							worktree_changed_since_baseline: details.worktreeChangedSinceBaseline,
 						};
 						await writeStateFileSync(stateFile, payload);
+						await writeRuntimeTurnReceipt(context, identity, payload);
 					}),
 			),
 	);

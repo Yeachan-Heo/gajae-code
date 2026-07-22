@@ -14837,6 +14837,47 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		).toBe(false);
 	});
 
+	test("replay admitted before eager privacy check preserves its creation lease", async () => {
+		FakeWs.instances = [];
+		const privacyGate = Promise.withResolvers<unknown>();
+		const bothPrivacyChecksStarted = Promise.withResolvers<void>();
+		let privacyChecks = 0;
+		const bot = new FakeBotApi();
+		const call = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "getChat") {
+				bot.calls.push({ method, body, options });
+				privacyChecks += 1;
+				if (privacyChecks === 2) bothPrivacyChecksStarted.resolve();
+				return await privacyGate.promise;
+			}
+			return await call(method, body, options);
+		};
+		const daemon = recoveryDaemon(tempAgentDir(), bot);
+		daemon.connectSession("FRESH", "ws://replay-before-privacy", "token");
+		const session = daemon.sessions.get("FRESH")!;
+		session.ws.dispatchEvent(new Event("open"));
+		const replay = daemon.handleSessionMessage(session, {
+			type: "event_replay_result",
+			ok: true,
+			id: session.replayId,
+			generation: 1,
+			lastSeq: 0,
+			events: [],
+		});
+		await bothPrivacyChecksStarted.promise;
+		expect(session.logicalSessionIdTrusted).toBe(true);
+		privacyGate.resolve({ ok: true, result: { type: "private" } });
+		await replay;
+
+		expect(session.replayPending).toBe(false);
+		expect(session.recoveryLease?.state).toBe("authorized");
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+		expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(0);
+		expect((daemon as any).topics.get("FRESH")).toMatchObject({ topicId: "3" });
+		expect((daemon as any).topics.get("FRESH")?.authorityState).not.toBe("delete_pending");
+	});
+
 	test("identity-less replay bootstraps a fresh open transport through its held eager create", async () => {
 		FakeWs.instances = [];
 		const createStarted = Promise.withResolvers<void>();
