@@ -3230,6 +3230,36 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
+	/**
+	 * Reconcile canonical predecessors before awaiting a queued turn. A queued turn's
+	 * own projection cannot change until its active predecessor terminalizes, so
+	 * watching only the queued turn would otherwise miss an already-durable exact
+	 * runtime receipt for that predecessor.
+	 */
+	async function sweepCanonicalPredecessorsForAwait(turn: TurnRecord): Promise<void> {
+		if (turn.status !== "queued") return;
+		await repairCanonicalProjections(turn.session_id);
+		const predecessors = await withSessionTransaction(questionPaths, turn.session_id, async transaction => {
+			const target = transaction.canonical.turns[turn.turn_id];
+			if (!target) return [];
+			return Object.values(transaction.canonical.turns)
+				.filter(candidate => {
+					if (candidate.turn_id === target.turn_id || TERMINAL_TURN_STATUSES.has(candidate.status as TurnStatus))
+						return false;
+					return (
+						candidate.created_at < target.created_at ||
+						(candidate.created_at === target.created_at && candidate.turn_id < target.turn_id)
+					);
+				})
+				.sort(
+					(left, right) =>
+						left.created_at.localeCompare(right.created_at) || left.turn_id.localeCompare(right.turn_id),
+				)
+				.map(turnFromCanonical);
+		});
+		for (const predecessor of predecessors) await readTurnPayload(predecessor.turn_id, predecessor.session_id);
+	}
+
 	async function awaitTurnPayload(
 		turnId: unknown,
 		sessionId: unknown,
@@ -3240,6 +3270,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const pollInterval = boundedPollIntervalMs(pollIntervalMs);
 		const deadline = Date.now() + timeout;
 		let payload = await readTurnPayload(turnId, sessionId);
+		if (payload.ok === true) await sweepCanonicalPredecessorsForAwait(payload.turn as TurnRecord);
+		if (payload.ok === true) payload = await readTurnPayload(turnId, sessionId);
 		while (
 			payload.ok === true &&
 			!TERMINAL_TURN_STATUSES.has((payload.turn as TurnRecord).status) &&
@@ -3249,6 +3281,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const remainingMs = deadline - Date.now();
 			await waitForTurnStateChange(namespaceDir, payload.turn as TurnRecord, Math.min(pollInterval, remainingMs));
 			payload = await readTurnPayload(turnId, sessionId);
+			if (payload.ok === true) await sweepCanonicalPredecessorsForAwait(payload.turn as TurnRecord);
+			if (payload.ok === true) payload = await readTurnPayload(turnId, sessionId);
 		}
 		if (
 			payload.ok === true &&

@@ -219,6 +219,34 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		await session.waitForIdle();
 	});
 
+	it("forbids destructive queue edits for coordinator-correlated turns", async () => {
+		const gate = Promise.withResolvers<void>();
+		session = buildSession([
+			async () => {
+				await gate.promise;
+				return { content: ["turn 1"] };
+			},
+			{ content: ["after queue"] },
+		]);
+		const first = session.prompt("p1");
+		await waitUntil(() => session!.isStreaming);
+		await session.sendUserMessage("coordinated follow-up", {
+			deliverAs: "followUp",
+			runtimeTurnId: "runtime-follow-up-1",
+		});
+		const [entry] = session.getQueuedMessageEntries();
+
+		expect(() => session!.removeQueuedMessageForEditing(entry?.id ?? "")).toThrow(
+			"coordinator-correlated queued turn",
+		);
+		expect(() => session!.clearQueue()).toThrow("coordinator-correlated queued turn");
+		expect(session.getQueuedMessages().followUp).toEqual(["coordinated follow-up"]);
+
+		gate.resolve();
+		await first;
+		await session.waitForIdle();
+	});
+
 	it("removes an arbitrary queued prompt selected for editing", async () => {
 		const gate = Promise.withResolvers<void>();
 		session = buildSession([

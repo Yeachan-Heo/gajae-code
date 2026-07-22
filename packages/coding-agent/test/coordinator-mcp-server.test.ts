@@ -2343,3 +2343,55 @@ describe("Coordinator MCP broker turn completion reconciliation", () => {
 		expect(read).toMatchObject({ ok: true, turn: { status: "active" } });
 	});
 });
+
+it("awaiting B sweeps A's canonical exact receipt before promoting and settling B", async () => {
+	const root = await tempRoot();
+	const controls: SdkControl[] = [];
+	const {
+		server,
+		turnId: firstTurnId,
+		runtimeTurnId: firstRuntimeTurnId,
+	} = await seedBrokerSessionWithActiveTurn(root, controls);
+	const queued = await server.callTool("gjc_coordinator_send_prompt", {
+		session_id: "visible-session",
+		prompt: "then summarize the second file",
+		queue: true,
+		idempotency_key: "await-queued-after-first",
+		allow_mutation: true,
+	});
+	expect(queued).toMatchObject({ ok: true, status: "queued", queued: true });
+	const secondTurnId = String(queued.turn_id);
+	const secondTurn = JSON.parse(
+		await fs.readFile(
+			path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${secondTurnId}.json`),
+			"utf8",
+		),
+	) as { delivery?: { runtime_turn_id?: unknown } };
+	const secondRuntimeTurnId = secondTurn.delivery?.runtime_turn_id;
+	if (typeof secondRuntimeTurnId !== "string") throw new Error("missing queued runtime turn id");
+	const awaiting = server.callTool("gjc_coordinator_await_turn", {
+		turn_id: secondTurnId,
+		session_id: "visible-session",
+		timeout_ms: 200,
+		poll_interval_ms: 5,
+	});
+	await Bun.sleep(20);
+	await writeRuntimeAuthoredState(root, firstRuntimeTurnId, {});
+	await writeRuntimeAuthoredState(root, secondRuntimeTurnId, {
+		final_response: {
+			text: "second file summary",
+			format: "markdown",
+			source: "agent_end",
+			artifact_path: null,
+			truncated: false,
+		},
+	});
+
+	await expect(awaiting).resolves.toMatchObject({
+		ok: true,
+		turn: { status: "completed", final_response: { text: "second file summary" } },
+	});
+	await expect(
+		server.callTool("gjc_coordinator_read_turn", { turn_id: firstTurnId, session_id: "visible-session" }),
+	).resolves.toMatchObject({ ok: true, turn: { status: "completed" } });
+});

@@ -368,6 +368,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						const patch = input.patch as { text?: unknown };
 						if (typeof patch?.text !== "string")
 							throw Object.assign(new Error("Queued message update is invalid."), { code: "invalid_message" });
+						if (session.getQueuedRuntimeTurnIdForEditing(id) !== undefined)
+							throw Object.assign(new Error("A coordinator-correlated queued turn cannot be updated."), {
+								code: "busy",
+							});
 						const runtimeTurnId = session.getQueuedRuntimeTurnIdForEditing(id);
 						const old = session.removeQueuedMessageForEditing(id);
 						if (old === undefined)

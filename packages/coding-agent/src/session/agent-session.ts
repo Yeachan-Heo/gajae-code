@@ -8392,7 +8392,15 @@ export class AgentSession {
 	 * Clear queued messages and return them.
 	 * Useful for restoring to editor when user aborts.
 	 */
+	#assertNoCorrelatedQueuedTurnDestruction(entries: readonly QueuedDisplayEntry[]): void {
+		if (entries.some(entry => entry.runtimeTurnId !== undefined))
+			throw Object.assign(new Error("A coordinator-correlated queued turn cannot be removed or cleared."), {
+				code: "busy",
+			});
+	}
+
 	clearQueue(): { steering: string[]; followUp: string[] } {
+		this.#assertNoCorrelatedQueuedTurnDestruction([...this.#steeringMessages, ...this.#followUpMessages]);
 		const steering = this.#steeringMessages.map(e => e.text);
 		const followUp = this.#followUpMessages.map(e => e.text);
 		this.#steeringMessages = [];
@@ -8482,6 +8490,7 @@ export class AgentSession {
 			index = queue.findIndex(entry => entry.sequence === sequence);
 		}
 		if (index === -1) return undefined;
+		this.#assertNoCorrelatedQueuedTurnDestruction([queue[index]!]);
 
 		const [entry] = queue.splice(index, 1);
 		if (resolvedMode === "steer") {
