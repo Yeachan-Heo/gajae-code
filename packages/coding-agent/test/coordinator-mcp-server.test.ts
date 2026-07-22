@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../src/coordinator-mcp/server";
+import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
 	buildAskGateAnswerSchema,
@@ -737,6 +738,171 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			advisory_status: { authority: "sdk", live: true, is_streaming: true },
 		});
 		expect(queries).toEqual(["Q12", "context.get"]);
+	});
+	it("adopts only attributable canonical agent terminal runtime state and clears the active-turn reaper blocker", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "finish durably",
+			idempotency_key: "terminal-runtime-state",
+			allow_mutation: true,
+		});
+		const turnId = sent.turn_id as string;
+		const turnFile = path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns", `${turnId}.json`);
+		const turn = JSON.parse(await fs.readFile(turnFile, "utf8")) as { started_at: string };
+		const runtimeDir = sessionRuntimeDir(root, "visible-session");
+		await fs.mkdir(runtimeDir, { recursive: true });
+		await Bun.write(
+			path.join(runtimeDir, "runtime-state.json"),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "visible-session",
+				state: "completed",
+				ready_for_input: true,
+				current_turn_id: null,
+				last_turn_id: null,
+				updated_at: new Date().toISOString(),
+				ended_at: new Date().toISOString(),
+				source: "agent_session_event",
+				live: false,
+				reason: null,
+				final_response: {
+					text: "authoritative final",
+					format: "markdown",
+					source: "agent_end",
+					artifact_path: null,
+					truncated: false,
+				},
+			}),
+		);
+
+		await expect(
+			server.callTool("gjc_coordinator_await_turn", { turn_id: turnId, timeout_ms: 50 }),
+		).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "completed", final_response: { text: "authoritative final" } },
+		});
+		const sessionFile = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"sessions",
+			"visible-session.json",
+		);
+		const session = JSON.parse(await fs.readFile(sessionFile, "utf8"));
+		await Bun.write(sessionFile, JSON.stringify({ ...session, ephemeral: true }));
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: "visible-session", allow_mutation: true }),
+		).resolves.toMatchObject({ ok: true, closed: true });
+		expect(controls.some(control => control.operation === "session.close")).toBe(true);
+		expect(Date.parse(turn.started_at)).toBeFinite();
+	});
+
+	it("adopts attributable runtime failure with a safe error projection", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "fail durably",
+			idempotency_key: "terminal-runtime-failure",
+			allow_mutation: true,
+		});
+		const runtimeDir = sessionRuntimeDir(root, "visible-session");
+		await fs.mkdir(runtimeDir, { recursive: true });
+		await Bun.write(
+			path.join(runtimeDir, "runtime-state.json"),
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "visible-session",
+				state: "errored",
+				ready_for_input: false,
+				current_turn_id: sent.turn_id,
+				last_turn_id: null,
+				updated_at: new Date().toISOString(),
+				ended_at: new Date().toISOString(),
+				source: "agent_session_event",
+				live: false,
+				reason: "agent_error",
+				error: { code: "agent_error", message: "safe runtime failure", recoverable: true },
+			}),
+		);
+		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
+			ok: true,
+			turn: { status: "failed", error: { code: "agent_error", message: "safe runtime failure" } },
+		});
+	});
+
+	it("ignores stale, mismatched, malformed, wrong-session/source, and out-of-root runtime states", async () => {
+		for (const invalid of [
+			"stale",
+			"mismatched",
+			"malformed",
+			"wrong-session",
+			"wrong-source",
+			"out-of-root",
+		] as const) {
+			const root = await tempRoot();
+			const server = await createSdkControlServer(root, []);
+			await registerSdkSession(server, root);
+			const sent = await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: "visible-session",
+				prompt: invalid,
+				idempotency_key: `invalid-runtime-${invalid}`,
+				allow_mutation: true,
+			});
+			const turnFile = path.join(
+				root,
+				".gjc",
+				"coordinator-state",
+				"local",
+				"repo",
+				"turns",
+				`${sent.turn_id}.json`,
+			);
+			const turn = JSON.parse(await fs.readFile(turnFile, "utf8")) as { started_at: string };
+			const runtimeDir = sessionRuntimeDir(root, "visible-session");
+			await fs.mkdir(runtimeDir, { recursive: true });
+			const runtimeFile = path.join(runtimeDir, "runtime-state.json");
+			const payload: Record<string, unknown> = {
+				schema_version: 1,
+				session_id: invalid === "wrong-session" ? "another-session" : "visible-session",
+				state: "completed",
+				ready_for_input: true,
+				current_turn_id: invalid === "stale" ? null : invalid === "mismatched" ? "turn-other" : sent.turn_id,
+				last_turn_id: null,
+				updated_at: new Date().toISOString(),
+				ended_at:
+					invalid === "stale" ? new Date(Date.parse(turn.started_at) - 1).toISOString() : new Date().toISOString(),
+				source: invalid === "wrong-source" ? "coordinator" : "agent_session_event",
+				live: false,
+				reason: null,
+				final_response: {
+					text: "must not settle",
+					format: "markdown",
+					source: "agent_end",
+					artifact_path: null,
+					truncated: false,
+				},
+			};
+			if (invalid === "malformed") payload.schema_version = "one";
+			if (invalid === "out-of-root") {
+				const outside = path.join(root, "outside-runtime-state.json");
+				await Bun.write(outside, JSON.stringify(payload));
+				await fs.symlink(outside, runtimeFile);
+			} else {
+				await Bun.write(runtimeFile, JSON.stringify(payload));
+			}
+			await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
+				ok: true,
+				turn: { status: "active" },
+			});
+		}
 	});
 	it("uses the generation-bound broker endpoint when a stale local endpoint file is absent", async () => {
 		const root = await tempRoot();

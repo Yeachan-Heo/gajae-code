@@ -12,6 +12,7 @@ import {
 	type CoordinatorToolName,
 } from "../coordinator/contract";
 import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
+import { sessionRuntimeDir } from "../gjc-runtime/session-layout";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
@@ -145,6 +146,7 @@ function reportableFinalResponse(response: CoordinatorFinalResponse): boolean {
 }
 
 interface RuntimeSessionStatePayload extends CoordinatorSessionState {
+	ended_at: string;
 	final_response?: CoordinatorFinalResponse;
 	error?: { code: string; message: string; recoverable: boolean } | null;
 }
@@ -1331,6 +1333,73 @@ async function clearActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<
 
 async function readSessionState(namespaceDir: string, sessionId: string): Promise<CoordinatorSessionState | null> {
 	return (await readJsonFile(sessionStateFile(namespaceDir, sessionId))) as CoordinatorSessionState | null;
+}
+
+function validCoordinatorFinalResponse(value: unknown): value is CoordinatorFinalResponse {
+	const response = asRecord(value);
+	return (
+		response !== null &&
+		(response.text === null || typeof response.text === "string") &&
+		response.format === "markdown" &&
+		(response.source === null || typeof response.source === "string") &&
+		(response.artifact_path === null || typeof response.artifact_path === "string") &&
+		typeof response.truncated === "boolean"
+	);
+}
+
+function validRuntimeError(value: unknown): value is { code: string; message: string; recoverable: boolean } {
+	const error = asRecord(value);
+	return (
+		error !== null &&
+		typeof error.code === "string" &&
+		typeof error.message === "string" &&
+		typeof error.recoverable === "boolean"
+	);
+}
+
+function validatedTerminalRuntimeState(value: unknown): RuntimeSessionStatePayload | null {
+	const state = asRecord(value);
+	if (
+		state?.schema_version !== 1 ||
+		typeof state.session_id !== "string" ||
+		(state.state !== "completed" && state.state !== "errored") ||
+		typeof state.ready_for_input !== "boolean" ||
+		(state.current_turn_id !== null && typeof state.current_turn_id !== "string") ||
+		(state.last_turn_id !== null && typeof state.last_turn_id !== "string") ||
+		typeof state.updated_at !== "string" ||
+		typeof state.ended_at !== "string" ||
+		state.source !== "agent_session_event" ||
+		(state.live !== null && typeof state.live !== "boolean") ||
+		(state.reason !== null && typeof state.reason !== "string") ||
+		(state.final_response !== undefined && !validCoordinatorFinalResponse(state.final_response)) ||
+		(state.error !== undefined && state.error !== null && !validRuntimeError(state.error))
+	)
+		return null;
+	return state as unknown as RuntimeSessionStatePayload;
+}
+
+async function readAttributableTerminalRuntimeState(
+	cwd: string,
+	turn: TurnRecord,
+): Promise<RuntimeSessionStatePayload | null> {
+	const runtimeDir = sessionRuntimeDir(cwd, turn.session_id);
+	const stateFile = path.join(runtimeDir, "runtime-state.json");
+	let canonicalRuntimeDir: string;
+	let canonicalStateFile: string;
+	try {
+		[canonicalRuntimeDir, canonicalStateFile] = await Promise.all([fs.realpath(runtimeDir), fs.realpath(stateFile)]);
+	} catch {
+		return null;
+	}
+	const relative = path.relative(canonicalRuntimeDir, canonicalStateFile);
+	if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+	const runtimeState = validatedTerminalRuntimeState(await readJsonFile(canonicalStateFile));
+	if (!runtimeState || runtimeState.session_id !== turn.session_id) return null;
+	if (runtimeState.current_turn_id !== null)
+		return runtimeState.current_turn_id === turn.turn_id ? runtimeState : null;
+	const endedAt = Date.parse(runtimeState.ended_at);
+	const startedAt = turn.started_at === null ? Number.NaN : Date.parse(turn.started_at);
+	return Number.isFinite(endedAt) && Number.isFinite(startedAt) && endedAt >= startedAt ? runtimeState : null;
 }
 
 async function writeSessionStateUnlocked(
@@ -3051,6 +3120,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		);
 		if (resolvedTurn !== turn) sessionState = await readSessionState(namespaceDir, resolvedTurn.session_id);
 		if (
+			session &&
+			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
+			sessionState?.state !== "completed" &&
+			sessionState?.state !== "errored"
+		) {
+			const cwd = optionalString(session.cwd);
+			const runtimeState = cwd ? await readAttributableTerminalRuntimeState(cwd, resolvedTurn) : null;
+			if (runtimeState) sessionState = runtimeState;
+		}
+		if (
 			sessionState?.state === "needs_user_input" &&
 			sessionState.current_turn_id === resolvedTurn.turn_id &&
 			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
@@ -3061,13 +3140,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			await writeTurnRecord(namespaceDir, resolvedTurn);
 			await writeActiveTurn(namespaceDir, resolvedTurn);
 		}
+		const terminalStateTimestamp = sessionState
+			? Date.parse((sessionState as RuntimeSessionStatePayload).ended_at ?? sessionState.updated_at)
+			: Number.NaN;
+		const turnStartedAt = resolvedTurn.started_at === null ? Number.NaN : Date.parse(resolvedTurn.started_at);
 		if (
 			sessionState &&
 			ACTIVE_TURN_STATUSES.has(resolvedTurn.status) &&
+			sessionState.source === "agent_session_event" &&
 			(sessionState.current_turn_id === resolvedTurn.turn_id ||
-				(sessionState.state === "errored" &&
-					sessionState.source === "agent_session_event" &&
-					sessionState.current_turn_id == null)) &&
+				(sessionState.current_turn_id == null &&
+					Number.isFinite(terminalStateTimestamp) &&
+					Number.isFinite(turnStartedAt) &&
+					terminalStateTimestamp >= turnStartedAt)) &&
 			(sessionState.state === "completed" || sessionState.state === "errored")
 		) {
 			resolvedTurn = await markTurnTerminalFromSessionState(resolvedTurn, sessionState);
