@@ -11,7 +11,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { verifyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { getAgentDir, getSessionsDir } from "@gajae-code/utils";
-import { FileSessionStorage } from "../../session/session-storage";
+import { FileSessionStorage, type SessionStorageSnapshot } from "../../session/session-storage";
 import {
 	type LogicalSessionCandidate,
 	listManagedSessionCandidates,
@@ -58,25 +58,52 @@ export interface RecentActivityDeps {
 	readInitialLines?: (file: string, maxLines: number) => string[];
 }
 
+class ManagedCandidateChangedError extends Error {}
+class ManagedCandidateUnavailableError extends Error {}
+
+const CHANGED_CANDIDATE_WARNING = "Ignored managed session candidate that changed during inspection.";
+
+function isAppendExtension(bytes: Uint8Array, candidate: LogicalSessionCandidate): boolean {
+	return (
+		bytes.byteLength >= candidate.identity.size &&
+		createHash("sha256").update(bytes.subarray(0, candidate.identity.size)).digest("hex") ===
+			candidate.identity.sha256
+	);
+}
+
 function readCandidateInitialLines(
 	candidate: LogicalSessionCandidate,
 	readInitialLines: ((file: string, maxLines: number) => string[]) | undefined,
+	appendBase?: LogicalSessionCandidate,
 ): string[] {
 	if (readInitialLines) return readInitialLines(candidate.path, 8);
 	if (candidate.provenance !== "legacy") {
 		const security = verifyOwnerOnlyPathSecurity(candidate.path, "file");
-		if (!security.ok) throw new Error(`Managed session metadata path is unsafe: ${security.code}`);
+		if (!security.ok) throw new ManagedCandidateUnavailableError("Managed session metadata path is unsafe.");
 	}
-	const snapshot = new FileSessionStorage().readSnapshotSync(candidate.path);
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = new FileSessionStorage().readSnapshotSync(candidate.path);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR")
+			throw new ManagedCandidateUnavailableError("Managed session metadata is unavailable.");
+		throw error;
+	}
+	const sameFile = snapshot.stat.dev === candidate.identity.dev && snapshot.stat.ino === candidate.identity.ino;
 	const digest = createHash("sha256").update(snapshot.bytes).digest("hex");
-	if (
-		snapshot.stat.dev !== candidate.identity.dev ||
-		snapshot.stat.ino !== candidate.identity.ino ||
-		snapshot.stat.size !== candidate.identity.size ||
-		snapshot.stat.mtimeNs !== candidate.identity.mtimeNs ||
-		digest !== candidate.identity.sha256
-	)
-		throw new Error("Managed session changed after ownership was verified.");
+	const exactIdentity =
+		sameFile &&
+		snapshot.stat.size === candidate.identity.size &&
+		snapshot.stat.mtimeNs === candidate.identity.mtimeNs &&
+		digest === candidate.identity.sha256;
+	if (appendBase && (!sameFile || !isAppendExtension(snapshot.bytes, appendBase)))
+		throw new ManagedCandidateUnavailableError("Managed session no longer extends the verified transcript.");
+	if (!exactIdentity) {
+		if (sameFile && isAppendExtension(snapshot.bytes, candidate))
+			throw new ManagedCandidateChangedError("Managed session was appended after ownership was verified.");
+		throw new ManagedCandidateUnavailableError("Managed session changed without an append-only extension.");
+	}
 	return Buffer.from(snapshot.bytes).toString("utf8").split("\n").slice(0, 8);
 }
 
@@ -227,13 +254,13 @@ export async function listRecentSessions(deps: RecentActivityDeps): Promise<List
 	const resolved = await resolveRecentScopes(deps);
 	if (resolved.kind === "error") return resolved;
 	const warnings = [...resolved.warnings];
-	const candidates: LogicalSessionCandidate[] = [];
+	const candidates: Array<{ scope: ManagedSessionScope; candidate: LogicalSessionCandidate }> = [];
 	for (const scope of resolved.scopes) {
 		const listed = await listManagedSessionCandidates({ scope });
 		if (listed.kind !== "complete") {
 			return { kind: "error", code: "managed_scan_failed", message: listed.message };
 		}
-		candidates.push(...listed.owned);
+		candidates.push(...listed.owned.map(candidate => ({ scope, candidate })));
 		warnings.push(
 			...listed.invalid
 				.filter(
@@ -245,28 +272,65 @@ export async function listRecentSessions(deps: RecentActivityDeps): Promise<List
 	}
 
 	const entries: RecentSessionEntry[] = [];
-	for (const candidate of candidates) {
-		let initialLines: string[];
+	for (const { scope, candidate } of candidates) {
+		let selected = candidate;
+		let initialLines: string[] | undefined;
 		try {
-			initialLines = readCandidateInitialLines(candidate, readInitialLines);
+			initialLines = readCandidateInitialLines(selected, readInitialLines);
 		} catch (error) {
-			return {
-				kind: "error",
-				code: "managed_scan_failed",
-				message: `Could not read managed session metadata: ${error instanceof Error ? error.message : String(error)}`,
-			};
+			if (error instanceof ManagedCandidateChangedError) {
+				const refreshed = await listManagedSessionCandidates({ scope });
+				if (refreshed.kind !== "complete")
+					return { kind: "error", code: "managed_scan_failed", message: refreshed.message };
+				const sameFile = refreshed.owned.find(
+					current =>
+						path.resolve(current.path) === path.resolve(candidate.path) &&
+						current.identity.dev === candidate.identity.dev &&
+						current.identity.ino === candidate.identity.ino,
+				);
+				if (sameFile) {
+					try {
+						initialLines = readCandidateInitialLines(sameFile, readInitialLines, candidate);
+						selected = sameFile;
+					} catch (retryError) {
+						if (
+							!(retryError instanceof ManagedCandidateChangedError) &&
+							!(retryError instanceof ManagedCandidateUnavailableError)
+						)
+							return {
+								kind: "error",
+								code: "managed_scan_failed",
+								message: `Could not read managed session metadata: ${
+									retryError instanceof Error ? retryError.message : String(retryError)
+								}`,
+							};
+					}
+				}
+			} else if (!(error instanceof ManagedCandidateUnavailableError)) {
+				return {
+					kind: "error",
+					code: "managed_scan_failed",
+					message: `Could not read managed session metadata: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				};
+			}
+			if (!initialLines) {
+				warnings.push(CHANGED_CANDIDATE_WARNING);
+				continue;
+			}
 		}
 		const meta = headerMeta(initialLines[0]);
 		const internal = isInternalSession(initialLines);
 		if (internal && !includeInternal) continue;
 		entries.push({
-			sessionId: candidate.sessionId,
-			path: candidate.cwd,
+			sessionId: selected.sessionId,
+			path: selected.cwd,
 			branch: meta.branch,
 			title: meta.title,
-			sessionStateFile: candidate.path,
-			mtimeMs: candidate.identity.mtimeMs,
-			currentTerminal: breadcrumbs.has(path.resolve(candidate.path)) || undefined,
+			sessionStateFile: selected.path,
+			mtimeMs: selected.identity.mtimeMs,
+			currentTerminal: breadcrumbs.has(path.resolve(selected.path)) || undefined,
 			internal: internal || undefined,
 		});
 	}

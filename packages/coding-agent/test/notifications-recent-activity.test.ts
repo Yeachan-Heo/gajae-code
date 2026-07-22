@@ -290,27 +290,134 @@ describe("recent-activity picker", () => {
 		expect(result.entries.map(entry => entry.sessionId)).toEqual(["authoritative-id"]);
 	});
 
-	it("rejects a transcript replaced after the readonly managed inventory is captured", async () => {
+	it("revalidates one concurrent append without discarding stable candidates", async () => {
 		const root = tempRoot();
 		const cwd = path.join(root, "workspace");
 		const directory = await managedDirectory(root, cwd);
-		const session = writeSession(directory, "stable", cwd, { title: "original" }, 9_000);
-		const originalReadSnapshot = FileSessionStorage.prototype.readSnapshotSync;
-		FileSessionStorage.prototype.readSnapshotSync = function (file: string) {
-			fs.writeFileSync(
-				session,
-				`${JSON.stringify({ type: "session", id: "stable", cwd, title: "replacement" })}\n`,
-				{ mode: 0o600 },
-			);
-			return originalReadSnapshot.call(this, file);
-		};
+		const changing = writeSession(directory, "changing", cwd, {}, 9_000);
+		writeSession(directory, "stable", cwd, {}, 10_000);
+		const original = FileSessionStorage.prototype.readSnapshotSync;
+		let appended = false;
+		let changingReads = 0;
+		const reader = vi.spyOn(FileSessionStorage.prototype, "readSnapshotSync").mockImplementation(function (
+			this: FileSessionStorage,
+			file: string,
+		) {
+			if (file === changing) changingReads++;
+			if (file === changing && !appended) {
+				appended = true;
+				fs.appendFileSync(changing, `${JSON.stringify({ type: "message", append: true })}\n`);
+			}
+			return original.call(this, file);
+		});
 		try {
-			await expect(listRecentSessions({ cwd, sessionsRoot: root })).resolves.toMatchObject({
-				kind: "error",
-				code: "managed_scan_failed",
-			});
+			const result = await listRecentSessions({ cwd, sessionsRoot: root });
+			expect(result).toMatchObject({ kind: "complete", warnings: [] });
+			if (result.kind !== "complete") return;
+			expect(result.entries.map(entry => entry.sessionId)).toEqual(["changing", "stable"]);
+			expect(changingReads).toBe(2);
 		} finally {
-			FileSessionStorage.prototype.readSnapshotSync = originalReadSnapshot;
+			reader.mockRestore();
+		}
+	});
+
+	it("omits a continuously changing candidate while retaining stable results", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const directory = await managedDirectory(root, cwd);
+		const changing = writeSession(directory, "changing", cwd, {}, 9_000);
+		writeSession(directory, "stable", cwd, {}, 10_000);
+		const original = FileSessionStorage.prototype.readSnapshotSync;
+		const reader = vi.spyOn(FileSessionStorage.prototype, "readSnapshotSync").mockImplementation(function (
+			this: FileSessionStorage,
+			file: string,
+		) {
+			if (file === changing) fs.appendFileSync(changing, `${JSON.stringify({ type: "message", append: true })}\n`);
+			return original.call(this, file);
+		});
+		try {
+			const result = await listRecentSessions({ cwd, sessionsRoot: root });
+			expect(result).toMatchObject({
+				kind: "complete",
+				warnings: ["Ignored managed session candidate that changed during inspection."],
+			});
+			if (result.kind !== "complete") return;
+			expect(result.entries.map(entry => entry.sessionId)).toEqual(["stable"]);
+		} finally {
+			reader.mockRestore();
+		}
+	});
+
+	it("omits a same-inode rewrite instead of adopting rewritten metadata", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const directory = await managedDirectory(root, cwd);
+		const changing = writeSession(directory, "changing", cwd, {}, 9_000);
+		writeSession(directory, "stable", cwd, {}, 10_000);
+		const original = FileSessionStorage.prototype.readSnapshotSync;
+		let rewritten = false;
+		const reader = vi.spyOn(FileSessionStorage.prototype, "readSnapshotSync").mockImplementation(function (
+			this: FileSessionStorage,
+			file: string,
+		) {
+			if (file === changing && !rewritten) {
+				rewritten = true;
+				fs.writeFileSync(
+					changing,
+					`${JSON.stringify({ type: "session", id: "rewritten", cwd, title: "rewritten" })}\n`,
+					{ mode: 0o600 },
+				);
+			}
+			return original.call(this, file);
+		});
+		try {
+			const result = await listRecentSessions({ cwd, sessionsRoot: root });
+			expect(result).toMatchObject({
+				kind: "complete",
+				warnings: ["Ignored managed session candidate that changed during inspection."],
+			});
+			if (result.kind !== "complete") return;
+			expect(result.entries.map(entry => entry.sessionId)).toEqual(["stable"]);
+		} finally {
+			reader.mockRestore();
+		}
+	});
+
+	it("omits a transcript replaced after the readonly managed inventory is captured", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const directory = await managedDirectory(root, cwd);
+		const changing = writeSession(directory, "changing", cwd, {}, 9_000);
+		writeSession(directory, "stable", cwd, {}, 10_000);
+		const replacement = path.join(root, "replacement.jsonl");
+		fs.writeFileSync(
+			replacement,
+			`${JSON.stringify({ type: "session", id: "replacement", cwd, title: "replacement" })}\n`,
+			{ mode: 0o600 },
+		);
+		secureOwnerOnlyFile(replacement);
+		const original = FileSessionStorage.prototype.readSnapshotSync;
+		let replaced = false;
+		const reader = vi.spyOn(FileSessionStorage.prototype, "readSnapshotSync").mockImplementation(function (
+			this: FileSessionStorage,
+			file: string,
+		) {
+			if (file === changing && !replaced) {
+				replaced = true;
+				fs.renameSync(replacement, changing);
+			}
+			return original.call(this, file);
+		});
+		try {
+			const result = await listRecentSessions({ cwd, sessionsRoot: root });
+			expect(result).toMatchObject({
+				kind: "complete",
+				warnings: ["Ignored managed session candidate that changed during inspection."],
+			});
+			if (result.kind !== "complete") return;
+			expect(result.entries.map(entry => entry.sessionId)).toEqual(["stable"]);
+		} finally {
+			reader.mockRestore();
 		}
 	});
 
@@ -324,6 +431,26 @@ describe("recent-activity picker", () => {
 		fs.symlinkSync(target, path.join(directory, "linked.jsonl"));
 		const result = await listRecentSessions({ cwd, sessionsRoot: root });
 		expect(result).toMatchObject({ kind: "complete", entries: [] });
+	});
+
+	it("preserves unexpected metadata reader failures as request errors", async () => {
+		const root = tempRoot();
+		const cwd = path.join(root, "workspace");
+		const directory = await managedDirectory(root, cwd);
+		writeSession(directory, "stable", cwd, {}, 10_000);
+
+		const result = await listRecentSessions({
+			cwd,
+			sessionsRoot: root,
+			readInitialLines: () => {
+				throw new Error("reader failed");
+			},
+		});
+		expect(result).toMatchObject({
+			kind: "error",
+			code: "managed_scan_failed",
+			message: "Could not read managed session metadata: reader failed",
+		});
 	});
 
 	it("returns a diagnostic instead of treating an invalid workspace as no sessions", async () => {
