@@ -1,4 +1,12 @@
 import { createHash } from "node:crypto";
+import {
+	clampReportedAmbiguity,
+	computeAmbiguityFloor,
+	type DeepInterviewAmbiguityMilestone,
+	deriveAmbiguityMilestone,
+	scoreToUnits,
+	weightedAmbiguityUnits,
+} from "./deep-interview-ambiguity";
 
 /**
  * Pure, dependency-free foundation for deep-interview state shape.
@@ -46,10 +54,6 @@ export interface DeepInterviewTriggerMetadata {
 	status: DeepInterviewTriggerStatus;
 	component: string;
 	dimension: string;
-	priorDimensionScore?: number;
-	newDimensionScore?: number;
-	priorAmbiguity?: number;
-	newAmbiguity?: number;
 	evidence?: string;
 	contradictedFactId?: string;
 	/** Required when status is `disputed` or `unresolved` to exempt the invariant. */
@@ -80,10 +84,12 @@ export interface DeepInterviewRoundRecord {
 	/** Deterministic floor in effect when this round was scored, when it clamped. */
 	ambiguity_floor?: number;
 	triggers?: DeepInterviewTriggerMetadata[];
+	round_result_digest?: string;
 }
 
 export interface DeepInterviewStateEnvelope {
 	threshold?: number;
+	threshold_units?: number;
 	threshold_source?: string;
 	state?: Record<string, unknown>;
 	[key: string]: unknown;
@@ -162,6 +168,7 @@ const HOISTED_STATE_FIELDS = [
 	"type",
 	"language",
 	"threshold",
+	"threshold_units",
 	"threshold_source",
 ] as const;
 
@@ -799,4 +806,907 @@ export function assertDeepInterviewIntentReview(
 		!recordedAnswers.some(answer => answer.round === value.approval_round && answer.answer_hash === value.answer_hash)
 	)
 		throw new Error("intent review approval evidence is invalid");
+}
+export type DeepInterviewDimension = "goal" | "constraints" | "criteria" | "context";
+export type DeepInterviewResolution =
+	| "auto_research_accepted"
+	| "auto_answer"
+	| "direct"
+	| "refined"
+	| "cited_confirmation";
+
+export interface DeepInterviewFactOperation {
+	op: "add" | "dispute" | "supersede";
+	id: string;
+	statement?: string;
+	component?: string;
+	dimension?: DeepInterviewDimension;
+	evidence?: string;
+	target_id?: string;
+}
+
+export interface DeepInterviewOntologyEntity {
+	id: string;
+	name: string;
+	type: string;
+	fields: string[];
+}
+
+export interface DeepInterviewOntologyRelationship {
+	id: string;
+	from_entity_id: string;
+	to_entity_id: string;
+	type: string;
+}
+
+export interface DeepInterviewOntologyReasoning {
+	statement: string;
+	evidence?: string;
+}
+
+export interface DeepInterviewOntologyInput {
+	entities: DeepInterviewOntologyEntity[];
+	relationships: DeepInterviewOntologyRelationship[];
+	reasoning: DeepInterviewOntologyReasoning[];
+}
+
+export interface DeepInterviewComponentUpdate {
+	component_id: string;
+	scores: Record<DeepInterviewDimension, number>;
+}
+
+/**
+ * Optional legacy assertions accepted only when they agree with the native
+ * target. The persisted target is always derived from component scores.
+ */
+export interface DeepInterviewTargetingInput {
+	target_component_id?: string;
+	target_dimension?: DeepInterviewDimension;
+	weakest_component_id?: string;
+	weakest_dimension?: DeepInterviewDimension;
+	last_targeted_component_id?: string | null;
+}
+
+export interface DeepInterviewRoundBookkeeping {
+	resolution: DeepInterviewResolution;
+	round_ids?: string[];
+	counter_deltas?: Record<string, number>;
+}
+
+/**
+ * Closed evidence submitted for one scoring transaction. All convergence values
+ * (ambiguity, floor, milestone, ontology counts, rotation, and streak) are
+ * native-derived and intentionally cannot be supplied here.
+ */
+export interface DeepInterviewRoundResultV1 {
+	global_scores: Record<DeepInterviewDimension, number>;
+	component_updates?: DeepInterviewComponentUpdate[];
+	targeting?: DeepInterviewTargetingInput;
+	triggers?: DeepInterviewTriggerMetadata[];
+	fact_ops?: DeepInterviewFactOperation[];
+	ontology?: DeepInterviewOntologyInput | DeepInterviewOntologyEntity[];
+	bookkeeping?: DeepInterviewRoundBookkeeping;
+	/** Compatibility adapter for recorder callers; never persisted as the v1 wire shape. */
+	component_scores?: Record<string, Record<DeepInterviewDimension, number>>;
+	auto_answered?: boolean;
+}
+
+/**
+ * Version 1 native projection returned by `apply-round-result` as
+ * `native_projection`. This is the complete renderable convergence surface;
+ * callers must not derive or supplement it from candidate scorer input.
+ */
+export interface DeepInterviewRoundResultProjection {
+	score_units: Partial<Record<DeepInterviewDimension, number>>;
+	weighted_ambiguity: number;
+	weighted_ambiguity_units: number;
+	floor: number;
+	floor_units: number;
+	floor_cause: ReturnType<typeof computeAmbiguityFloor>;
+	effective_ambiguity: number;
+	effective_ambiguity_units: number;
+	prior_effective_ambiguity: number | null;
+	direction: "increased" | "decreased" | "unchanged" | "initial";
+	ambiguity_milestone: DeepInterviewAmbiguityMilestone;
+	topology: unknown;
+	topology_counts: { active: number; deferred: number; total: number };
+	ontology: unknown;
+	ontology_counts: { stable: number; changed: number; new: number; basis: string };
+	targeting: {
+		target_component_id: string | null;
+		target_dimension: DeepInterviewDimension | null;
+		last_targeted_component_id: string | null;
+	};
+	transition: {
+		round_key: string;
+		lifecycle: "scored";
+		auto_answer_streak: number;
+	};
+}
+
+export type DeepInterviewApplyRoundResult =
+	| { kind: "noop"; envelope: DeepInterviewStateEnvelope; projection?: DeepInterviewRoundResultProjection }
+	| { kind: "write"; envelope: DeepInterviewStateEnvelope; projection: DeepInterviewRoundResultProjection };
+
+function canonicalJsonValue(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalJsonValue);
+	if (!isPlainObject(value)) {
+		if (typeof value === "number" && !Number.isFinite(value)) {
+			throw new TypeError("canonical JSON rejects non-finite numbers");
+		}
+		if (value === undefined) throw new TypeError("canonical JSON rejects undefined");
+		return value;
+	}
+	const output: Record<string, unknown> = {};
+	for (const key of Object.keys(value).sort()) output[key] = canonicalJsonValue(value[key]);
+	return output;
+}
+
+/** Strict UTF-8 JSON serialization used by v1 replay digests. */
+export function canonicalDeepInterviewJson(value: unknown): string {
+	return JSON.stringify(canonicalJsonValue(value));
+}
+
+export function deepInterviewRoundResultDigest(input: {
+	round: number;
+	question_id: string;
+	round_id?: string | null;
+	result: unknown;
+}): string {
+	return createHash("sha256")
+		.update(
+			canonicalDeepInterviewJson({
+				v: 1,
+				round: input.round,
+				question_id: input.question_id,
+				round_id: input.round_id ?? null,
+				result: input.result,
+			}),
+		)
+		.digest("hex");
+}
+
+/** Complete persisted answer identity; omitted optional values normalize to null. */
+export function deepInterviewAnswerIdentityEqual(
+	a: Pick<
+		DeepInterviewRoundRecord,
+		| "round"
+		| "round_key"
+		| "round_id"
+		| "question_id"
+		| "component"
+		| "dimension"
+		| "question_text"
+		| "question_hash"
+		| "selected_options"
+		| "custom_input"
+	>,
+	b: Pick<
+		DeepInterviewRoundRecord,
+		| "round"
+		| "round_key"
+		| "round_id"
+		| "question_id"
+		| "component"
+		| "dimension"
+		| "question_text"
+		| "question_hash"
+		| "selected_options"
+		| "custom_input"
+	>,
+): boolean {
+	return (
+		canonicalDeepInterviewJson({
+			round: a.round,
+			round_key: a.round_key,
+			round_id: a.round_id ?? null,
+			question_id: a.question_id ?? null,
+			component: a.component ?? null,
+			dimension: a.dimension ?? null,
+			question_text: a.question_text ?? null,
+			question_hash: a.question_hash,
+			selected_options: a.selected_options ?? [],
+			custom_input: a.custom_input ?? null,
+		}) ===
+		canonicalDeepInterviewJson({
+			round: b.round,
+			round_key: b.round_key,
+			round_id: b.round_id ?? null,
+			question_id: b.question_id ?? null,
+			component: b.component ?? null,
+			dimension: b.dimension ?? null,
+			question_text: b.question_text ?? null,
+			question_hash: b.question_hash,
+			selected_options: b.selected_options ?? [],
+			custom_input: b.custom_input ?? null,
+		})
+	);
+}
+
+/** Apply one closed v1 scoring round. The input contains evidence only; all convergence state is derived here. */
+export function applyDeepInterviewRoundResultV1(
+	envelopeValue: unknown,
+	roundKey: string,
+	result: DeepInterviewRoundResultV1,
+	now: string,
+): DeepInterviewApplyRoundResult {
+	const envelope = normalizeDeepInterviewEnvelope(envelopeValue);
+	const state = { ...(envelope.state ?? {}) };
+	const rounds = asRecordArray(state.rounds) as unknown as DeepInterviewRoundRecord[];
+	const index = rounds.findIndex(round => round.round_key === roundKey);
+	if (index < 0) throw new Error("DI_ROUND_NOT_FOUND");
+	const shell = rounds[index];
+	if (shell.lifecycle !== "answered" && shell.lifecycle !== "pending_scoring" && shell.lifecycle !== "scored")
+		throw new Error("DI_STATE_SCHEMA_INVALID");
+	if (typeof shell.question_id !== "string" || shell.question_id === "") throw new Error("DI_STATE_SCHEMA_INVALID");
+	const digest = deepInterviewRoundResultDigest({
+		round: shell.round,
+		question_id: shell.question_id,
+		round_id: shell.round_id ?? null,
+		result,
+	});
+	if (shell.lifecycle === "scored") {
+		if (shell.round_result_digest !== digest) throw new Error("DI_ROUND_RESULT_CONFLICT");
+		return { kind: "noop", envelope };
+	}
+
+	const type = state.type;
+	if (type !== "greenfield" && type !== "brownfield") throw new Error("DI_STATE_SCHEMA_INVALID");
+	const dimensions: DeepInterviewDimension[] =
+		type === "brownfield" ? ["goal", "constraints", "criteria", "context"] : ["goal", "constraints", "criteria"];
+	const componentScores =
+		result.component_scores ??
+		Object.fromEntries((result.component_updates ?? []).map(update => [update.component_id, update.scores]));
+	const finiteScore = (value: unknown): value is number =>
+		typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+	if (!dimensions.every(dimension => finiteScore(result.global_scores[dimension])))
+		throw new Error("DI_STATE_SCHEMA_INVALID");
+	if (
+		rounds.some(
+			round =>
+				round.lifecycle !== "scored" &&
+				(round.round < shell.round || (round.round === shell.round && round.round_key < shell.round_key)),
+		)
+	)
+		throw new Error("DI_STATE_SCHEMA_INVALID");
+
+	const topology = isPlainObject(state.topology) ? state.topology : undefined;
+	const activeComponents =
+		topology && Array.isArray(topology.components)
+			? topology.components.filter(
+					component => isPlainObject(component) && component.active !== false && component.status !== "deferred",
+				)
+			: [];
+	if (activeComponents.length > 0) {
+		for (const component of activeComponents) {
+			const id = component.id;
+			if (
+				typeof id !== "string" ||
+				!isPlainObject(componentScores[id]) ||
+				!dimensions.every(d => finiteScore(componentScores[id][d]))
+			)
+				throw new Error("DI_STATE_SCHEMA_INVALID");
+		}
+		for (const dimension of dimensions) {
+			const weakest = Math.min(
+				...activeComponents.map(component => componentScores[String(component.id)][dimension]),
+			);
+			if (result.global_scores[dimension] !== weakest) throw new Error("DI_STATE_SCHEMA_INVALID");
+		}
+	}
+	const facts = asRecordArray(state.established_facts);
+	for (const operation of result.fact_ops ?? []) {
+		if (!operation || typeof operation.id !== "string" || operation.id === "")
+			throw new Error("DI_STATE_SCHEMA_INVALID");
+		const factIndex = facts.findIndex(fact => fact.id === operation.id);
+		if (operation.op === "add") {
+			if (!operation.statement || factIndex >= 0) throw new Error("DI_STATE_SCHEMA_INVALID");
+			facts.push({
+				id: operation.id,
+				statement: operation.statement,
+				round: shell.round,
+				component: operation.component,
+				dimension: operation.dimension,
+				evidence: operation.evidence,
+				disputed: false,
+			});
+		} else if (operation.op === "dispute") {
+			if (factIndex < 0) throw new Error("DI_STATE_SCHEMA_INVALID");
+			facts[factIndex] = { ...facts[factIndex], disputed: true };
+		} else {
+			if (factIndex < 0 || !operation.target_id || !facts.some(fact => fact.id === operation.target_id))
+				throw new Error("DI_STATE_SCHEMA_INVALID");
+			facts[factIndex] = { ...facts[factIndex], disputed: true, superseded_by: operation.target_id };
+		}
+	}
+	for (const trigger of result.triggers ?? []) {
+		if (
+			!trigger ||
+			!["A", "B", "C", "D"].includes(trigger.kind) ||
+			!["active", "disputed", "unresolved"].includes(trigger.status) ||
+			typeof trigger.name !== "string" ||
+			trigger.name === "" ||
+			typeof trigger.component !== "string" ||
+			trigger.component === "" ||
+			!dimensions.includes(trigger.dimension as DeepInterviewDimension)
+		)
+			throw new Error("DI_STATE_SCHEMA_INVALID");
+		if ((trigger.status === "disputed" || trigger.status === "unresolved") && !trigger.rationale)
+			throw new Error("DI_STATE_SCHEMA_INVALID");
+		if (trigger.contradictedFactId && !facts.some(fact => fact.id === trigger.contradictedFactId))
+			throw new Error("DI_STATE_SCHEMA_INVALID");
+		if (
+			topology &&
+			Array.isArray(topology.components) &&
+			topology.components.length > 0 &&
+			!topology.components.some(component => isPlainObject(component) && component.id === trigger.component)
+		)
+			throw new Error("DI_STATE_SCHEMA_INVALID");
+	}
+	const priorSnapshot = Array.isArray(state.ontology_snapshots) ? state.ontology_snapshots.at(-1) : undefined;
+	const priorEntities =
+		isPlainObject(priorSnapshot) && Array.isArray(priorSnapshot.entities)
+			? priorSnapshot.entities.filter(isPlainObject)
+			: [];
+	const ontologyInput = result.ontology;
+	const entities = (Array.isArray(ontologyInput) ? ontologyInput : (ontologyInput?.entities ?? [])).map(entity => ({
+		...entity,
+		relationships: Array.isArray(ontologyInput)
+			? []
+			: (ontologyInput?.relationships ?? [])
+					.filter(
+						relationship => relationship.from_entity_id === entity.id || relationship.to_entity_id === entity.id,
+					)
+					.map(relationship => relationship.id),
+	}));
+	if (
+		!entities.every(
+			entity =>
+				entity &&
+				typeof entity.id === "string" &&
+				typeof entity.name === "string" &&
+				entity.name !== "" &&
+				typeof entity.type === "string" &&
+				Array.isArray(entity.fields) &&
+				Array.isArray(entity.relationships),
+		)
+	)
+		throw new Error("DI_STATE_SCHEMA_INVALID");
+	if (isPlainObject(priorSnapshot)) {
+		const priorSnapshotRound = priorSnapshot.round;
+		if (
+			typeof priorSnapshotRound !== "number" ||
+			!Number.isSafeInteger(priorSnapshotRound) ||
+			priorSnapshotRound >= shell.round
+		)
+			throw new Error("DI_STATE_SCHEMA_INVALID");
+	}
+	const basis = entities.length === 0 ? "no_entities" : priorSnapshot === undefined ? "first_round" : "compared";
+	const unmatchedPrior = new Set(priorEntities.map((_, index) => index));
+	const stableMatches = new Set<number>();
+	const changedMatches = new Set<number>();
+	if (basis === "compared") {
+		for (let current = 0; current < entities.length; current += 1) {
+			const prior = priorEntities.findIndex(
+				(entity, index) =>
+					unmatchedPrior.has(index) &&
+					entity.name === entities[current].name &&
+					entity.type === entities[current].type,
+			);
+			if (prior >= 0) {
+				unmatchedPrior.delete(prior);
+				stableMatches.add(current);
+			}
+		}
+		const candidates: { prior: number; current: number }[] = [];
+		for (let current = 0; current < entities.length; current += 1) {
+			if (stableMatches.has(current)) continue;
+			const fields = new Set(entities[current].fields);
+			for (const prior of unmatchedPrior) {
+				if (priorEntities[prior].type !== entities[current].type) continue;
+				const priorFields = new Set(priorEntities[prior].fields as unknown[]);
+				const overlap = [...fields].filter(field => priorFields.has(field)).length;
+				if (overlap * 2 > Math.max(fields.size, priorFields.size)) candidates.push({ prior, current });
+			}
+		}
+		candidates.sort(
+			(a, b) =>
+				String(priorEntities[a.prior].id).localeCompare(String(priorEntities[b.prior].id)) ||
+				String(entities[a.current].id).localeCompare(String(entities[b.current].id)),
+		);
+		const matchedCurrent = new Set<number>();
+		for (const candidate of candidates) {
+			if (unmatchedPrior.has(candidate.prior) && !matchedCurrent.has(candidate.current)) {
+				unmatchedPrior.delete(candidate.prior);
+				matchedCurrent.add(candidate.current);
+				changedMatches.add(candidate.current);
+			}
+		}
+	}
+	const stable = stableMatches.size;
+	const changed = changedMatches.size;
+	const fresh = entities.length - stable - changed;
+	const stabilityRatio =
+		basis === "compared" ? Math.floor(((stable + changed) * 10_000) / entities.length + 0.5) / 10_000 : null;
+	const ontologySnapshots = [
+		...(Array.isArray(state.ontology_snapshots) ? state.ontology_snapshots : []),
+		{
+			round: shell.round,
+			captured_at: now,
+			entities,
+			basis,
+			stable_entities: stable,
+			new_entities: fresh,
+			changed_entities: changed,
+			stability_ratio: stabilityRatio,
+		},
+	];
+
+	const nextTopology =
+		topology && Array.isArray(topology.components)
+			? {
+					...topology,
+					components: topology.components.map(component => {
+						if (!isPlainObject(component) || typeof component.id !== "string") return component;
+						const scores = componentScores[component.id];
+						return scores ? { ...component, clarity_scores: { ...scores } } : component;
+					}),
+				}
+			: state.topology;
+	const activeIds = activeComponents.map(component => String(component.id));
+	const componentWeakness = (id: string) => Math.min(...dimensions.map(dimension => componentScores[id][dimension]));
+	const weakestValue = activeIds.length === 0 ? undefined : Math.min(...activeIds.map(componentWeakness));
+	const tiedWeakest = activeIds.filter(id => componentWeakness(id) === weakestValue);
+	const previousTarget =
+		isPlainObject(topology) && typeof topology.last_targeted_component_id === "string"
+			? topology.last_targeted_component_id
+			: null;
+	const rotatedCandidates =
+		tiedWeakest.length > 1 && previousTarget !== null
+			? [...tiedWeakest].sort(
+					(a, b) =>
+						((activeIds.indexOf(a) - activeIds.indexOf(previousTarget) + activeIds.length) % activeIds.length) -
+						((activeIds.indexOf(b) - activeIds.indexOf(previousTarget) + activeIds.length) % activeIds.length),
+				)
+			: tiedWeakest;
+	const targetComponent = rotatedCandidates[0] ?? null;
+	const targetDimension =
+		targetComponent === null
+			? null
+			: dimensions.reduce((weakest, dimension) =>
+					componentScores[targetComponent][dimension] < componentScores[targetComponent][weakest]
+						? dimension
+						: weakest,
+				);
+	if (
+		result.targeting &&
+		((result.targeting.target_component_id !== undefined &&
+			result.targeting.target_component_id !== targetComponent) ||
+			(result.targeting.weakest_component_id !== undefined &&
+				result.targeting.weakest_component_id !== targetComponent) ||
+			(result.targeting.target_dimension !== undefined && result.targeting.target_dimension !== targetDimension) ||
+			(result.targeting.weakest_dimension !== undefined && result.targeting.weakest_dimension !== targetDimension))
+	)
+		throw new Error("DI_STATE_SCHEMA_INVALID");
+	const weightedUnits = weightedAmbiguityUnits(result.global_scores, type);
+	const weightedAmbiguity = weightedUnits / 10_000;
+	const resolution = result.bookkeeping?.resolution ?? (result.auto_answered ? "auto_answer" : "direct");
+	const priorStreak = typeof state.auto_answer_streak === "number" ? state.auto_answer_streak : 0;
+	const autoAnswerStreak =
+		resolution === "auto_answer" || resolution === "auto_research_accepted" ? priorStreak + 1 : 0;
+	const requestedRoundIds = result.bookkeeping?.round_ids ?? [roundKey];
+	const durableRoundReferences = new Set(
+		rounds.flatMap(round =>
+			typeof round.round_id === "string" && round.round_id !== ""
+				? [round.round_key, round.round_id]
+				: [round.round_key],
+		),
+	);
+	if (
+		new Set(requestedRoundIds).size !== requestedRoundIds.length ||
+		!requestedRoundIds.every(id => typeof id === "string" && durableRoundReferences.has(id))
+	)
+		throw new Error("DI_STATE_SCHEMA_INVALID");
+	const appendRoundIds = (field: string): string[] => [
+		...(Array.isArray(state[field]) ? state[field].filter((id): id is string => typeof id === "string") : []),
+		...requestedRoundIds.filter(id => !(Array.isArray(state[field]) ? state[field] : []).includes(id)),
+	];
+	const counters = { ...(isPlainObject(state.counters) ? state.counters : {}) };
+	for (const [key, delta] of Object.entries(result.bookkeeping?.counter_deltas ?? {})) {
+		if (
+			!Number.isSafeInteger(delta) ||
+			(typeof counters[key] !== "undefined" && !Number.isSafeInteger(counters[key]))
+		)
+			throw new Error("DI_STATE_SCHEMA_INVALID");
+		counters[key] = (typeof counters[key] === "number" ? counters[key] : 0) + delta;
+	}
+	const nextState: Record<string, unknown> = {
+		...state,
+		topology:
+			isPlainObject(nextTopology) && targetComponent !== null
+				? { ...nextTopology, last_targeted_component_id: targetComponent }
+				: nextTopology,
+		established_facts: facts,
+		ontology_snapshots: ontologySnapshots,
+		auto_answer_streak: autoAnswerStreak,
+		counters,
+		auto_answered_rounds:
+			resolution === "auto_answer" ? appendRoundIds("auto_answered_rounds") : state.auto_answered_rounds,
+		auto_research_accepted_rounds:
+			resolution === "auto_research_accepted"
+				? appendRoundIds("auto_research_accepted_rounds")
+				: state.auto_research_accepted_rounds,
+		refined_rounds: resolution === "refined" ? appendRoundIds("refined_rounds") : state.refined_rounds,
+	};
+	const floorBreakdown = computeAmbiguityFloor({
+		...nextState,
+		rounds: [...rounds, { ...shell, lifecycle: "scored" }],
+	});
+	const floor = floorBreakdown.floor;
+	const effectiveAmbiguity = clampReportedAmbiguity(weightedAmbiguity, floor).effective;
+	const threshold = state.threshold ?? envelope.threshold;
+	if (!finiteScore(threshold)) throw new Error("DI_STATE_SCHEMA_INVALID");
+	const thresholdUnits = state.threshold_units ?? envelope.threshold_units ?? scoreToUnits(threshold);
+	if (
+		typeof thresholdUnits !== "number" ||
+		!Number.isSafeInteger(thresholdUnits) ||
+		thresholdUnits < 1 ||
+		thresholdUnits > 10_000 ||
+		scoreToUnits(threshold) !== thresholdUnits
+	)
+		throw new Error("DI_STATE_SCHEMA_INVALID");
+	const milestone = deriveAmbiguityMilestone(scoreToUnits(effectiveAmbiguity), thresholdUnits);
+	nextState.threshold_units = thresholdUnits;
+	const priorScoredRounds = rounds
+		.filter(
+			round =>
+				round.lifecycle === "scored" &&
+				(round.round < shell.round || (round.round === shell.round && round.round_key < shell.round_key)),
+		)
+		.sort((a, b) => b.round - a.round || b.round_key.localeCompare(a.round_key));
+	const priorRound = priorScoredRounds[0];
+	const priorEffectiveAmbiguity = typeof priorRound?.ambiguity === "number" ? priorRound.ambiguity : null;
+	for (const trigger of result.triggers ?? []) {
+		if (trigger.status !== "active") continue;
+		const topologyComponents: unknown[] =
+			isPlainObject(topology) && Array.isArray(topology.components) ? topology.components : [];
+		const hasTopologyComponents = topologyComponents.length > 0;
+		const priorComponent = topologyComponents.find(
+			component => isPlainObject(component) && component.id === trigger.component,
+		);
+		const priorScores = isPlainObject(priorComponent) ? priorComponent.clarity_scores : undefined;
+		const priorDimension = hasTopologyComponents
+			? isPlainObject(priorScores)
+				? priorScores[trigger.dimension]
+				: undefined
+			: priorRound?.scores?.[trigger.dimension];
+		const candidateDimension = hasTopologyComponents
+			? componentScores[trigger.component]?.[trigger.dimension as DeepInterviewDimension]
+			: result.global_scores[trigger.dimension as DeepInterviewDimension];
+		if (
+			!priorRound ||
+			!finiteScore(priorDimension) ||
+			!finiteScore(candidateDimension) ||
+			!finiteScore(priorRound.ambiguity) ||
+			candidateDimension > priorDimension ||
+			effectiveAmbiguity <= priorRound.ambiguity
+		)
+			throw new Error("DI_STATE_SCHEMA_INVALID");
+	}
+	rounds[index] = {
+		...shell,
+		lifecycle: "scored",
+		scored_at: now,
+		scores: result.global_scores,
+		ambiguity: effectiveAmbiguity,
+		reported_ambiguity: weightedAmbiguity,
+		ambiguity_floor: floor,
+		triggers: result.triggers ?? [],
+		round_result_digest: digest,
+	};
+	nextState.rounds = rounds;
+	nextState.current_ambiguity = effectiveAmbiguity;
+	nextState.weighted_ambiguity = weightedAmbiguity;
+	nextState.effective_ambiguity = effectiveAmbiguity;
+	nextState.floor = floor;
+	nextState.ambiguity_milestone = milestone;
+	return {
+		kind: "write",
+		envelope: { ...envelope, state: nextState },
+		projection: {
+			score_units: Object.fromEntries(
+				dimensions.map(dimension => [dimension, scoreToUnits(result.global_scores[dimension])]),
+			) as Partial<Record<DeepInterviewDimension, number>>,
+			weighted_ambiguity: weightedAmbiguity,
+			weighted_ambiguity_units: weightedUnits,
+			floor,
+			floor_units: scoreToUnits(floor),
+			floor_cause: floorBreakdown,
+			effective_ambiguity: effectiveAmbiguity,
+			effective_ambiguity_units: scoreToUnits(effectiveAmbiguity),
+			prior_effective_ambiguity: priorEffectiveAmbiguity,
+			direction:
+				priorEffectiveAmbiguity === null
+					? "initial"
+					: effectiveAmbiguity > priorEffectiveAmbiguity
+						? "increased"
+						: effectiveAmbiguity < priorEffectiveAmbiguity
+							? "decreased"
+							: "unchanged",
+			ambiguity_milestone: milestone,
+			topology: nextState.topology,
+			topology_counts: {
+				active: activeComponents.length,
+				deferred: Array.isArray(topology?.components)
+					? topology.components.filter(component => isPlainObject(component) && component.status === "deferred")
+							.length
+					: 0,
+				total: Array.isArray(topology?.components) ? topology.components.length : 0,
+			},
+			ontology: ontologySnapshots.at(-1),
+			ontology_counts: { stable, changed, new: fresh, basis },
+			targeting: {
+				target_component_id: targetComponent,
+				target_dimension: targetDimension,
+				last_targeted_component_id: targetComponent,
+			},
+			transition: { round_key: roundKey, lifecycle: "scored", auto_answer_streak: autoAnswerStreak },
+		},
+	};
+}
+export function validateDeepInterviewV1Envelope(value: Record<string, unknown>): void {
+	const invalid = (): never => {
+		throw new Error("DI_STATE_SCHEMA_INVALID");
+	};
+	const validDate = (candidate: unknown): candidate is string =>
+		typeof candidate === "string" && Number.isFinite(Date.parse(candidate));
+	const validScore = (candidate: unknown): candidate is number => {
+		if (typeof candidate !== "number") return false;
+		try {
+			scoreToUnits(candidate);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	const stateValue = value.state;
+	if (value.skill !== "deep-interview" || value.schema_version !== 1 || !isPlainObject(stateValue)) return invalid();
+	const state = stateValue as Record<string, unknown>;
+	const type = state.type;
+	if (type !== "greenfield" && type !== "brownfield") return invalid();
+	const dimensions: DeepInterviewDimension[] =
+		type === "brownfield" ? ["goal", "constraints", "criteria", "context"] : ["goal", "constraints", "criteria"];
+	const isDimension = (candidate: unknown): candidate is DeepInterviewDimension =>
+		typeof candidate === "string" && dimensions.includes(candidate as DeepInterviewDimension);
+	const roundsValue = state.rounds;
+	const factsValue = state.established_facts;
+	const threshold = state.threshold ?? value.threshold;
+	const thresholdUnits = state.threshold_units;
+	if (
+		!validScore(threshold) ||
+		typeof thresholdUnits !== "number" ||
+		!Number.isSafeInteger(thresholdUnits) ||
+		thresholdUnits < 1 ||
+		thresholdUnits > 10_000 ||
+		scoreToUnits(threshold) !== thresholdUnits ||
+		!Array.isArray(roundsValue) ||
+		!Array.isArray(factsValue)
+	)
+		return invalid();
+	const rounds = roundsValue as unknown[];
+	const facts = factsValue as unknown[];
+
+	const topology = state.topology;
+	const componentIds = new Set<string>();
+	let hasTopologyComponents = false;
+	if (topology !== undefined) {
+		if (!isPlainObject(topology) || !Array.isArray(topology.components) || typeof topology.status !== "string")
+			return invalid();
+		const topologyRecord = topology as Record<string, unknown>;
+		const components = topologyRecord.components as unknown[];
+		for (const component of components) {
+			if (!isPlainObject(component)) return invalid();
+			const componentRecord = component as Record<string, unknown>;
+			const componentIdValue = componentRecord.id;
+			if (typeof componentIdValue !== "string" || componentIdValue === "" || componentIds.has(componentIdValue))
+				return invalid();
+			const componentId = componentIdValue;
+			componentIds.add(componentId);
+			if (componentRecord.active !== undefined && typeof componentRecord.active !== "boolean") return invalid();
+			if (componentRecord.clarity_scores !== undefined) {
+				const clarityScoresValue = componentRecord.clarity_scores;
+				if (!isPlainObject(clarityScoresValue)) return invalid();
+				const clarityScores = clarityScoresValue as Record<string, unknown>;
+				for (const dimension of dimensions) {
+					const score = clarityScores[dimension];
+					if (score !== undefined && score !== null && !validScore(score)) return invalid();
+				}
+			}
+		}
+		hasTopologyComponents = componentIds.size > 0;
+	}
+
+	const factIds = new Set<string>();
+	for (const fact of facts) {
+		if (!isPlainObject(fact)) return invalid();
+		const factRecord = fact as Record<string, unknown>;
+		const factIdValue = factRecord.id;
+		const factRoundValue = factRecord.round;
+		if (
+			typeof factIdValue !== "string" ||
+			factIdValue === "" ||
+			factIds.has(factIdValue) ||
+			typeof factRecord.statement !== "string" ||
+			factRecord.statement === "" ||
+			typeof factRoundValue !== "number" ||
+			!Number.isSafeInteger(factRoundValue) ||
+			factRoundValue < 1 ||
+			typeof factRecord.disputed !== "boolean"
+		)
+			return invalid();
+		const factId = factIdValue;
+		factIds.add(factId);
+		if (
+			factRecord.component !== undefined &&
+			(typeof factRecord.component !== "string" ||
+				factRecord.component === "" ||
+				(hasTopologyComponents && !componentIds.has(factRecord.component)))
+		)
+			return invalid();
+		if (factRecord.dimension !== undefined && !isDimension(factRecord.dimension)) return invalid();
+	}
+	for (const fact of facts) {
+		if (!isPlainObject(fact)) return invalid();
+		const factRecord = fact as Record<string, unknown>;
+		if (
+			factRecord.superseded_by !== undefined &&
+			(factRecord.disputed !== true || !factIds.has(String(factRecord.superseded_by)))
+		)
+			return invalid();
+	}
+
+	if (state.ontology_snapshots !== undefined) {
+		const ontologySnapshotsValue = state.ontology_snapshots;
+		if (!Array.isArray(ontologySnapshotsValue)) return invalid();
+		const ontologySnapshots = ontologySnapshotsValue as unknown[];
+		let priorRound = 0;
+		for (const snapshot of ontologySnapshots) {
+			if (!isPlainObject(snapshot)) return invalid();
+			const snapshotRecord = snapshot as Record<string, unknown>;
+			const snapshotRound = snapshotRecord.round;
+			const stableEntities = snapshotRecord.stable_entities;
+			const newEntities = snapshotRecord.new_entities;
+			const changedEntities = snapshotRecord.changed_entities;
+			const stabilityRatio = snapshotRecord.stability_ratio;
+			if (
+				typeof snapshotRound !== "number" ||
+				!Number.isSafeInteger(snapshotRound) ||
+				snapshotRound <= priorRound ||
+				!validDate(snapshotRecord.captured_at) ||
+				!Array.isArray(snapshotRecord.entities) ||
+				!["no_entities", "first_round", "compared"].includes(String(snapshotRecord.basis)) ||
+				typeof stableEntities !== "number" ||
+				!Number.isSafeInteger(stableEntities) ||
+				typeof newEntities !== "number" ||
+				!Number.isSafeInteger(newEntities) ||
+				typeof changedEntities !== "number" ||
+				!Number.isSafeInteger(changedEntities) ||
+				(stabilityRatio !== null && !validScore(stabilityRatio))
+			)
+				return invalid();
+			const entities = snapshotRecord.entities as unknown[];
+			if (
+				stableEntities < 0 ||
+				newEntities < 0 ||
+				changedEntities < 0 ||
+				stableEntities + newEntities + changedEntities !== entities.length ||
+				((snapshotRecord.basis === "no_entities" || snapshotRecord.basis === "first_round") &&
+					stabilityRatio !== null) ||
+				(snapshotRecord.basis === "compared" && stabilityRatio === null)
+			)
+				return invalid();
+			priorRound = snapshotRound;
+			for (const entity of entities) {
+				if (!isPlainObject(entity)) return invalid();
+				const entityRecord = entity as Record<string, unknown>;
+				if (
+					typeof entityRecord.id !== "string" ||
+					typeof entityRecord.name !== "string" ||
+					entityRecord.name === "" ||
+					typeof entityRecord.type !== "string" ||
+					!Array.isArray(entityRecord.fields) ||
+					!entityRecord.fields.every((field: unknown) => typeof field === "string") ||
+					!Array.isArray(entityRecord.relationships) ||
+					!entityRecord.relationships.every((relationship: unknown) => typeof relationship === "string")
+				)
+					return invalid();
+			}
+		}
+	}
+	if (state.auto_answered_rounds !== undefined) {
+		const autoAnsweredRoundsValue = state.auto_answered_rounds;
+		if (!Array.isArray(autoAnsweredRoundsValue)) return invalid();
+		const autoAnsweredRounds = autoAnsweredRoundsValue as unknown[];
+		if (!autoAnsweredRounds.every((key: unknown) => typeof key === "string")) return invalid();
+	}
+	for (const key of ["current_ambiguity", "weighted_ambiguity", "effective_ambiguity", "floor"] as const) {
+		if (state[key] !== undefined && !validScore(state[key])) return invalid();
+	}
+
+	for (const round of rounds) {
+		if (!isPlainObject(round)) return invalid();
+		const roundRecord = round as Record<string, unknown>;
+		const roundNumberValue = roundRecord.round;
+		const isRoundZeroIntentShell =
+			roundNumberValue === 0 && roundRecord.lifecycle === "answered" && roundRecord.scores === undefined;
+		if (
+			typeof roundRecord.round_key !== "string" ||
+			roundRecord.round_key === "" ||
+			typeof roundNumberValue !== "number" ||
+			!Number.isSafeInteger(roundNumberValue) ||
+			roundNumberValue < 0 ||
+			(roundNumberValue === 0 && !isRoundZeroIntentShell) ||
+			typeof roundRecord.question_id !== "string" ||
+			roundRecord.question_id === "" ||
+			typeof roundRecord.question_text !== "string" ||
+			typeof roundRecord.question_hash !== "string" ||
+			roundRecord.question_hash === "" ||
+			typeof roundRecord.answer_hash !== "string" ||
+			roundRecord.answer_hash === "" ||
+			!validDate(roundRecord.answered_at) ||
+			!["answered", "pending_scoring", "scored"].includes(String(roundRecord.lifecycle))
+		)
+			return invalid();
+		if (
+			roundRecord.component !== undefined &&
+			(typeof roundRecord.component !== "string" ||
+				roundRecord.component === "" ||
+				(hasTopologyComponents && !componentIds.has(roundRecord.component)))
+		)
+			return invalid();
+		if (
+			roundRecord.dimension !== undefined &&
+			!isDimension(roundRecord.dimension) &&
+			!(isRoundZeroIntentShell && roundRecord.dimension === "topology")
+		)
+			return invalid();
+		if (roundRecord.lifecycle !== "scored") continue;
+		const scoresValue = roundRecord.scores;
+		const triggersValue = roundRecord.triggers;
+		if (
+			!validDate(roundRecord.scored_at) ||
+			!isPlainObject(scoresValue) ||
+			!validScore(roundRecord.ambiguity) ||
+			!validScore(roundRecord.reported_ambiguity) ||
+			!validScore(roundRecord.ambiguity_floor) ||
+			typeof roundRecord.round_result_digest !== "string" ||
+			!/^[0-9a-f]{64}$/.test(roundRecord.round_result_digest) ||
+			!Array.isArray(triggersValue)
+		)
+			return invalid();
+		const scores = scoresValue as Record<string, unknown>;
+		if (!dimensions.every(dimension => validScore(scores[dimension]))) return invalid();
+		const triggers = triggersValue as unknown[];
+		for (const trigger of triggers) {
+			if (!isPlainObject(trigger)) return invalid();
+			const triggerRecord = trigger as Record<string, unknown>;
+			if (
+				!["A", "B", "C", "D"].includes(String(triggerRecord.kind)) ||
+				!["active", "disputed", "unresolved"].includes(String(triggerRecord.status)) ||
+				typeof triggerRecord.name !== "string" ||
+				typeof triggerRecord.component !== "string" ||
+				triggerRecord.component === "" ||
+				(hasTopologyComponents && !componentIds.has(triggerRecord.component)) ||
+				!isDimension(triggerRecord.dimension) ||
+				(triggerRecord.contradictedFactId !== undefined && !factIds.has(String(triggerRecord.contradictedFactId)))
+			)
+				return invalid();
+			if (
+				(triggerRecord.status === "disputed" || triggerRecord.status === "unresolved") &&
+				typeof triggerRecord.rationale !== "string"
+			)
+				return invalid();
+		}
+		void scores;
+	}
 }
