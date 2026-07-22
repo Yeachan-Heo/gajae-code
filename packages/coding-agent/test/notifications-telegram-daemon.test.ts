@@ -12273,6 +12273,44 @@ describe("Telegram tool activity capability and routing", () => {
 		expect(liveMessages.has("S:turn:one")).toBe(false);
 		expect(liveMessages.get("S:turn:two")).toBe(102);
 	});
+	test("recovered tool activity uses the delivered logical session for its start and terminal", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const bot = new FakeBotApi();
+		const daemon = recoveryDaemon(agentDir, bot);
+		await replayResumedIdentity(daemon, "TRANSPORT-A", "LOGICAL-B", { url: "ws://a", token: "a-token" });
+		const session = daemon.sessions.get("TRANSPORT-A")!;
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "LOGICAL-B",
+			toolCallId: "recovered-tool",
+			toolName: "read",
+			phase: "started",
+		});
+		const liveMessages = (daemon as unknown as { liveMessages: Map<string, number> }).liveMessages;
+		expect(liveMessages.get("LOGICAL-B:tool:recovered-tool")).toBe(1);
+		expect(liveMessages.has("TRANSPORT-A:tool:recovered-tool")).toBe(false);
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "LOGICAL-B",
+			toolCallId: "recovered-tool",
+			toolName: "read",
+			phase: "completed",
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
+		expect(bot.calls.filter(call => call.method === "editMessageText")).toEqual([
+			expect.objectContaining({
+				body: expect.objectContaining({ message_id: 1, text: expect.stringContaining("read — ok") }),
+			}),
+		]);
+		expect(liveMessages.has("LOGICAL-B:tool:recovered-tool")).toBe(false);
+		expect(
+			(daemon as unknown as { toolActivityOwners: Map<string, unknown> }).toolActivityOwners.has(
+				"LOGICAL-B:tool:recovered-tool",
+			),
+		).toBe(false);
+	});
 
 	test("failed terminal tool delivery evicts its key before a later reuse", async () => {
 		const agentDir = tempAgentDir();
@@ -14127,6 +14165,68 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		);
 		expect(persisted.closedEndpoints?.S).toBeUndefined();
 		expect((daemon as any).closedEndpointKeys.has("S")).toBe(false);
+	});
+	test("a replaced close restores its published fence without a second epoch and survives restart", async () => {
+		FakeWs.instances = [];
+		const agentDir = tempAgentDir();
+		const writeStarted = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		let armed = false;
+		let writes = 0;
+		const bot = new FakeBotApi();
+		const daemon = recoveryDaemon(
+			agentDir,
+			bot,
+			"42",
+			topicStateFs(async () => {
+				if (!armed || ++writes !== 2) return;
+				writeStarted.resolve();
+				await releaseWrite.promise;
+			}),
+		);
+		await replayResumedIdentity(daemon, "PREDECESSOR", "S", { url: "ws://old", token: "old-token" });
+		const predecessor = daemon.sessions.get("PREDECESSOR")!;
+		const topicId = bot.createdTopicThreadIds.at(-1)!;
+		armed = true;
+		const closing = daemon.handleSessionMessage(predecessor, { type: "session_closed", sessionId: "S" });
+		await writeStarted.promise;
+		daemon.connectSession("PREDECESSOR", "ws://replacement", "replacement-token");
+		releaseWrite.resolve();
+		await closing;
+
+		const persisted = await readTopicAuthorityState(agentDir);
+		expect(persisted.topics.S).toMatchObject({ topicId: String(topicId) });
+		expect(persisted.topics.S.authorityState).not.toBe("delete_pending");
+		expect(persisted.closedEndpoints?.PREDECESSOR).toBeUndefined();
+		await replayResumedIdentity(daemon, "PREDECESSOR", "S", {
+			url: "ws://replacement",
+			token: "replacement-token",
+			generation: 2,
+		});
+		bot.calls.length = 0;
+		await daemon.handleSessionMessage(daemon.sessions.get("PREDECESSOR")!, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "still active",
+		});
+		expect(bot.calls.filter(call => call.method === "sendMessage" && call.body.text === "still active")).toHaveLength(
+			1,
+		);
+
+		const restartedBot = new FakeBotApi();
+		const restarted = recoveryDaemon(agentDir, restartedBot);
+		await restarted.loadTopics();
+		await replayResumedIdentity(restarted, "RECOVERED", "S", { url: "ws://recovered", token: "recovered-token" });
+		await restarted.handleSessionMessage(restarted.sessions.get("RECOVERED")!, {
+			type: "turn_stream",
+			sessionId: "S",
+			phase: "finalized",
+			text: "routes after restart",
+		});
+		expect(
+			restartedBot.calls.filter(call => call.method === "sendMessage" && call.body.text === "routes after restart"),
+		).toHaveLength(1);
 	});
 
 	test("supersession rejects queued HTML continuations from the predecessor lease", async () => {

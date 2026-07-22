@@ -3695,11 +3695,12 @@ export class TelegramNotificationDaemon {
 							}
 							return;
 						}
-						const deleted = await this.deleteTopic(logicalSessionId, socketLease);
+						const deleted = await this.deleteTopic(logicalSessionId, socketLease, true);
 						if (!deleted && socketLease && !this.#deleteLeaseAllows(socketLease)) {
 							await this.#persistTopicMutation(
 								() => {
-									if (!this.topics.restoreDeleteAuthority(closeTopicAuthority)) return;
+									if (!this.topics.restoreDeleteAuthority(closeTopicAuthority))
+										throw new Error("close authority changed before compensation");
 									this.closedEndpointKeys.delete(session.sessionId);
 								},
 								() => {
@@ -4959,7 +4960,7 @@ export class TelegramNotificationDaemon {
 		const phase = typeof msg.phase === "string" ? msg.phase : undefined;
 		if (!toolCallId || !toolName || !phase) return undefined;
 		return {
-			sessionId: session.sessionId,
+			sessionId: this.#logicalSessionId(session),
 			toolCallId,
 			toolName,
 			endpointDigest: session.endpointDigest,
@@ -4970,7 +4971,8 @@ export class TelegramNotificationDaemon {
 
 	private toolActivityAuthorityIsCurrent(toolActivity: ToolActivityOwner): boolean {
 		if (this.revokedToolEndpoints.has(toolActivity.endpointDigest)) return false;
-		const session = this.sessions.get(toolActivity.sessionId);
+		const session =
+			this.logicalSessionOwners.get(toolActivity.sessionId) ?? this.sessions.get(toolActivity.sessionId);
 		if (toolActivity.endpointDigest === undefined) return session === undefined;
 		return session === toolActivity.session && session.endpointDigest === toolActivity.endpointDigest;
 	}
@@ -5261,8 +5263,9 @@ export class TelegramNotificationDaemon {
 	private async deleteTopic(
 		sessionId: string,
 		socketLease?: { session: SessionSocket; token: number; logicalSessionId: string },
+		deleteFenceAlreadyPublished = false,
 	): Promise<boolean> {
-		let record = this.topics.beginDelete(sessionId);
+		let record = deleteFenceAlreadyPublished ? this.topics.get(sessionId) : this.topics.beginDelete(sessionId);
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return false;
 		await this.persistTopics();
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return false;
@@ -6624,13 +6627,13 @@ export class TelegramNotificationDaemon {
 					toolAdmissionEpoch === this.toolActivityPolicyEpoch);
 			const abandonStaleToolStart = (): void => {
 				if (toolActivity?.phase !== "started") return;
-				const key = `${session.sessionId}:tool:${toolActivity.toolCallId}`;
+				const key = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
 				const owner = this.toolActivityOwners.get(key);
 				if (!this.liveMessages.has(key) && owner?.session === toolActivity.session)
 					this.toolActivityOwners.delete(key);
 			};
 			if (toolActivity) {
-				const liveKey = `${session.sessionId}:tool:${toolActivity.toolCallId}`;
+				const liveKey = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
 				const currentOwner = this.toolActivityOwners.get(liveKey);
 				if (toolActivity.phase === "started") {
 					if (!toolStartIsCurrent()) return;
