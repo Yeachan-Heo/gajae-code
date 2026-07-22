@@ -1,6 +1,6 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai";
-import { $env } from "@gajae-code/utils";
+import { $pickenv } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
@@ -27,10 +27,10 @@ const parseNumber = (value: string | undefined, defaultValue: number): number =>
 };
 
 /** Maximum output bytes per agent */
-export const MAX_OUTPUT_BYTES = parseNumber($env.PI_TASK_MAX_OUTPUT_BYTES, 500_000);
+export const MAX_OUTPUT_BYTES = parseNumber($pickenv("GJC_TASK_MAX_OUTPUT_BYTES", "PI_TASK_MAX_OUTPUT_BYTES"), 500_000);
 
 /** Maximum output lines per agent */
-export const MAX_OUTPUT_LINES = parseNumber($env.PI_TASK_MAX_OUTPUT_LINES, 5000);
+export const MAX_OUTPUT_LINES = parseNumber($pickenv("GJC_TASK_MAX_OUTPUT_LINES", "PI_TASK_MAX_OUTPUT_LINES"), 5000);
 
 /** EventBus channel for raw subagent events */
 export const TASK_SUBAGENT_EVENT_CHANNEL = "task:subagent:event";

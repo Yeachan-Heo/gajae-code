@@ -3,7 +3,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import { type AstReplaceChange, type AstReplaceFileChange, astEdit } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { $envpos, prompt, untilAborted } from "@gajae-code/utils";
+import { $pickenvpos, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { computeLineHash, HL_BODY_SEP } from "../hashline/hash";
@@ -199,7 +199,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				seenPatterns.add(pat);
 			}
 			const normalizedRewrites = Object.fromEntries(ops);
-			const maxFiles = $envpos("PI_MAX_AST_FILES", 1000);
+			const maxFiles = $pickenvpos(["GJC_MAX_AST_FILES", "PI_MAX_AST_FILES"], 1000);
 
 			const scope = await resolveToolSearchScope({
 				rawPaths: params.paths,

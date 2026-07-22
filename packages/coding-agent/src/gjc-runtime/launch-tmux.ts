@@ -705,7 +705,7 @@ function applyGjcTmuxRootTerminalTitleProfile(context: {
 }
 
 function shouldSetGjcTmuxRootTerminalTitle(parsed: Args, env: NodeJS.ProcessEnv): boolean {
-	return !parsed.noTitle && !env.PI_NO_TITLE;
+	return !parsed.noTitle && !(env.GJC_NO_TITLE || env.PI_NO_TITLE);
 }
 
 function buildTmuxRenameWindowArgs(title: string, target?: string): string[] {

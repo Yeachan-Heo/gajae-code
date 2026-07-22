@@ -11,7 +11,6 @@ import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { ImageContent } from "@gajae-code/ai";
 import {
-	$env,
 	$pickenv,
 	getAgentDir,
 	getProjectDir,
@@ -1613,9 +1612,9 @@ export async function runRootCommand(
 					process.stdout.write(`${chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Alt+N to cycle)")}`)}\n`);
 				}
 
-				if ($env.PI_TIMING) {
+				if ($pickenv("GJC_TIMING", "PI_TIMING")) {
 					logger.printTimings();
-					exitForTiming = $env.PI_TIMING === "x";
+					exitForTiming = $pickenv("GJC_TIMING", "PI_TIMING") === "x";
 				}
 
 				if (!exitForTiming) {
@@ -1660,7 +1659,7 @@ export async function runRootCommand(
 					initialImages,
 					suppressProcessExit: deps.suppressProcessExit,
 				});
-				if ($env.PI_TIMING) {
+				if ($pickenv("GJC_TIMING", "PI_TIMING")) {
 					logger.printTimings();
 				}
 			} finally {

@@ -1,5 +1,5 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { prompt } from "@gajae-code/utils";
+import { $pickenv, prompt } from "@gajae-code/utils";
 import type * as z from "zod/v4";
 import {
 	executeHashlineSingle,
@@ -352,11 +352,8 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #pendingDeferredFetches = new Map<string, AbortController>();
 
 	constructor(private readonly session: ToolSession) {
-		const {
-			PI_EDIT_FUZZY: editFuzzy = "auto",
-			PI_EDIT_FUZZY_THRESHOLD: editFuzzyThreshold = "auto",
-			PI_EDIT_VARIANT: envEditVariant = "auto",
-		} = Bun.env;
+		const { PI_EDIT_FUZZY: editFuzzy = "auto", PI_EDIT_FUZZY_THRESHOLD: editFuzzyThreshold = "auto" } = Bun.env;
+		const envEditVariant = $pickenv("GJC_EDIT_VARIANT", "PI_EDIT_VARIANT") ?? "auto";
 
 		this.#editMode = resolveConfiguredEditMode(envEditVariant);
 		this.#allowFuzzy = resolveAllowFuzzy(session, editFuzzy);

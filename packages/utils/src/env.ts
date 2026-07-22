@@ -279,3 +279,23 @@ export function $flag(name: string, def: boolean = false): boolean {
 	// would silently read as false while only `FOO=TRUE`/`FOO=1` worked.
 	return TRUTHY[value.toUpperCase()] === true;
 }
+
+/** Resolve the first flag among keys that has a set value (GJC-first, PI fallback). Matches $flag semantics per key. */
+export function $pickflag(...keys: string[]): boolean {
+	for (const key of keys) {
+		const value = $env[key]?.trim();
+		if (value) return TRUTHY[value.toUpperCase()] === true;
+	}
+	return false;
+}
+
+/** Resolve the first positive integer among keys, else defaultValue (GJC-first). Set-but-invalid keys are skipped. */
+export function $pickenvpos(keys: string[], defaultValue: number): number {
+	for (const key of keys) {
+		const raw = $env[key]?.trim();
+		if (!raw) continue;
+		const parsed = Number.parseInt(raw, 10);
+		if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+	}
+	return defaultValue;
+}

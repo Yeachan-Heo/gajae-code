@@ -13,6 +13,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import type * as winston from "winston";
 import { getLogsDir } from "./dirs";
+import { $pickenv } from "./env";
 
 /** Ensure a logs directory exists; return the resolved path. */
 function ensureDir(dir: string): string {
@@ -410,7 +411,7 @@ function printModuleLoadSummary(loads: Span[], depth: number, lines: string[]): 
 	}
 	const wall = unionEnd > unionStart ? unionEnd - unionStart : 0;
 	lines.push(`${childIndent}(modules): ${loads.length} loaded, wall ${fmtMs(wall)}, sum ${fmtMs(totalSelf)}`);
-	const showAll = process.env.PI_TIMING === "full";
+	const showAll = $pickenv("GJC_TIMING", "PI_TIMING") === "full";
 	const sorted = [...loads].sort((a, b) => durationOf(b) - durationOf(a));
 	const visible = showAll ? sorted : sorted.slice(0, MODULE_LOAD_VERBOSE_TOP);
 	for (const span of visible) {

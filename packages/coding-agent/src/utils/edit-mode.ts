@@ -1,4 +1,4 @@
-import { $env } from "@gajae-code/utils/env";
+import { $pickenv } from "@gajae-code/utils/env";
 
 export type EditMode = "replace" | "patch" | "hashline" | "vim" | "apply_patch";
 
@@ -34,7 +34,7 @@ export function resolveEditMode(session: EditModeSessionLike): EditMode {
 	const modelVariant = session.settings.getEditVariantForModel?.(activeModel);
 	if (modelVariant) return modelVariant;
 
-	const envMode = normalizeEditMode($env.PI_EDIT_VARIANT);
+	const envMode = normalizeEditMode($pickenv("GJC_EDIT_VARIANT", "PI_EDIT_VARIANT"));
 	if (envMode) return envMode;
 
 	const settingsMode = normalizeEditMode(String(session.settings.get("edit.mode") ?? ""));

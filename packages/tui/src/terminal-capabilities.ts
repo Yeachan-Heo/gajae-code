@@ -1,5 +1,5 @@
 import { encodeSixel } from "@gajae-code/natives";
-import { $env } from "@gajae-code/utils";
+import { $env, $pickenv } from "@gajae-code/utils";
 
 export enum ImageProtocol {
 	Kitty = "\x1b_G",
@@ -125,7 +125,7 @@ export function isCursorNeutralImagePermittedInFallback(): boolean {
 }
 
 function getForcedImageProtocol(): ImageProtocol | null | undefined {
-	const raw = $env.PI_FORCE_IMAGE_PROTOCOL?.trim().toLowerCase();
+	const raw = $pickenv("GJC_FORCE_IMAGE_PROTOCOL", "PI_FORCE_IMAGE_PROTOCOL")?.trim().toLowerCase();
 	if (!raw) return undefined;
 	if (raw === "kitty") return ImageProtocol.Kitty;
 	if (raw === "iterm2" || raw === "iterm") return ImageProtocol.Iterm2;
