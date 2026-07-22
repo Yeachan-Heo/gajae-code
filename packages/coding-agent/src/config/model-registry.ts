@@ -37,6 +37,11 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils
 import { $pickenv, isRecord, logger } from "@gajae-code/utils";
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
+import {
+	type ActiveProviderDescriptor,
+	ActiveProviderResolutionError,
+	projectActiveProviderDescriptors,
+} from "../sdk/providers";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
@@ -61,7 +66,10 @@ import {
 	mergeModelProfiles,
 } from "./model-profiles";
 import {
+	CANONICAL_PROVIDER_ID_MAX_BYTES,
+	CANONICAL_PROVIDER_ID_PATTERN,
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
+	isCanonicalProviderId,
 	type ModelOverride,
 	type ModelProfileConfig,
 	type ModelsConfig,
@@ -1002,6 +1010,12 @@ function getConfiguredProviderOrderFromSettings(): string[] {
 		return [];
 	}
 }
+interface ProviderActivityEvidence {
+	staticModelIds: ReadonlySet<string>;
+	staticConfigured: boolean;
+	discoveryConfigured: boolean;
+	implicitDiscovery: boolean;
+}
 
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
@@ -1016,6 +1030,9 @@ export class ModelRegistry {
 	#customProviderApiKeys: Map<string, string> = new Map();
 	#providerWebSearchModes: Map<string, WebSearchMode> = new Map();
 	#keylessProviders: Set<string> = new Set();
+	#providerActivity: ReadonlyMap<string, ProviderActivityEvidence> = new Map();
+	#configuredProviderIds: ReadonlySet<string> = new Set();
+	#configuredDiscoveryProviderIds: ReadonlySet<string> = new Set();
 	#discoveryManager = new ModelDiscoveryManager<DiscoveryProviderConfig>();
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
@@ -1160,6 +1177,8 @@ export class ModelRegistry {
 		this.#configError = configError;
 		this.#keylessProviders = keylessProviders;
 		this.#discoveryManager.setProviders(discoverableProviders);
+		this.#configuredProviderIds = new Set(configuredProviders);
+		this.#configuredDiscoveryProviderIds = new Set(discoverableProviders.map(provider => provider.provider));
 		this.#customModelOverlays = customModels;
 		this.#providerOverrides = overrides;
 		this.#modelOverrides = modelOverrides;
@@ -1180,10 +1199,41 @@ export class ModelRegistry {
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
 		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
 	}
 
+	#rebuildProviderActivity(): void {
+		const staticModelIds = new Map<string, Set<string>>();
+		for (const overlay of [...this.#customModelOverlays, ...this.#runtimeModelOverlays]) {
+			const modelIds = staticModelIds.get(overlay.provider) ?? new Set<string>();
+			modelIds.add(overlay.id);
+			staticModelIds.set(overlay.provider, modelIds);
+		}
+
+		const runtimeProviderIds = new Set(this.#runtimeProviderSourceByName.keys());
+		const providerIds = new Set<string>([
+			...this.#configuredProviderIds,
+			...this.#keylessProviders,
+			...this.#discoveryManager.providerIds(),
+			...runtimeProviderIds,
+			...staticModelIds.keys(),
+		]);
+		const activity = new Map<string, ProviderActivityEvidence>();
+		for (const provider of providerIds) {
+			const discoveryConfigured = this.#configuredDiscoveryProviderIds.has(provider);
+			const isDiscoveryProvider = this.#discoveryManager.providerIds().has(provider);
+			activity.set(provider, {
+				staticModelIds: new Set(staticModelIds.get(provider) ?? []),
+				staticConfigured:
+					staticModelIds.has(provider) || (this.#configuredProviderIds.has(provider) && !discoveryConfigured),
+				discoveryConfigured,
+				implicitDiscovery: isDiscoveryProvider && !discoveryConfigured,
+			});
+		}
+		this.#providerActivity = activity;
+	}
 	/** Load built-in models, applying provider-level overrides only.
 	 *  Per-model overrides are applied later by #applyModelOverrides. */
 	#loadBuiltInModels(overrides: Map<string, ProviderOverride>): Model<Api>[] {
@@ -2483,6 +2533,50 @@ export class ModelRegistry {
 		this.#availableModelsEnvFingerprint = envFingerprint;
 		return this.#availableModelsCache;
 	}
+	#isCredentiallessProviderModelActive(model: Model<Api>): boolean {
+		const evidence = this.#providerActivity.get(model.provider);
+		if (!evidence || (!evidence.staticConfigured && !evidence.discoveryConfigured && !evidence.implicitDiscovery)) {
+			return false;
+		}
+		if (evidence.staticConfigured && (!evidence.discoveryConfigured || evidence.staticModelIds.has(model.id))) {
+			return true;
+		}
+		const discoveryState = this.#discoveryManager.getState(model.provider);
+		return discoveryState?.status === "ok" && !discoveryState.stale && discoveryState.models.includes(model.id);
+	}
+
+	#activeConnectionKind(model: Model<Api>): ActiveProviderDescriptor["connectionKind"] | undefined {
+		if (this.authStorage.hasAuth(model.provider)) return "credential";
+		if (this.#keylessProviders.has(model.provider) && this.#isCredentiallessProviderModelActive(model)) {
+			return "credentialless";
+		}
+		return undefined;
+	}
+
+	getActiveProviders(currentModel?: Model<Api>): ActiveProviderDescriptor[] {
+		try {
+			const descriptors: ActiveProviderDescriptor[] = [];
+			const available = this.getAvailable();
+			for (const model of available) {
+				if (!isCanonicalProviderId(model.provider)) throw new ActiveProviderResolutionError();
+				const connectionKind = this.#activeConnectionKind(model);
+				if (connectionKind) descriptors.push({ provider: model.provider, connectionKind });
+			}
+			if (currentModel) {
+				if (!isCanonicalProviderId(currentModel.provider)) throw new ActiveProviderResolutionError();
+				const loadedModel = available.find(
+					model => model.provider === currentModel.provider && model.id === currentModel.id,
+				);
+				if (loadedModel) {
+					const connectionKind = this.#activeConnectionKind(loadedModel);
+					if (connectionKind) descriptors.push({ provider: loadedModel.provider, connectionKind });
+				}
+			}
+			return projectActiveProviderDescriptors(descriptors);
+		} catch {
+			throw new ActiveProviderResolutionError();
+		}
+	}
 
 	/**
 	 * Check whether auth is configured for a model's provider.
@@ -2650,6 +2744,11 @@ export class ModelRegistry {
 	 * If provider has oauth: registers OAuth provider for /login support.
 	 */
 	registerProvider(providerName: string, config: ProviderConfigInput, sourceId?: string): void {
+		if (!isCanonicalProviderId(providerName)) {
+			throw new Error(
+				`Provider ${providerName}: provider ID must match ${CANONICAL_PROVIDER_ID_PATTERN} and be at most ${CANONICAL_PROVIDER_ID_MAX_BYTES} UTF-8 bytes.`,
+			);
+		}
 		if (config.streamSimple && !config.api) {
 			throw new Error(`Provider ${providerName}: "api" is required when registering streamSimple.`);
 		}
@@ -2760,12 +2859,14 @@ export class ModelRegistry {
 						config.oauth.modifyModels(withRuntimeTransportOverride, credential),
 					);
 					this.#rebuildCanonicalIndex();
+					this.#rebuildProviderActivity();
 					return;
 				}
 			}
 
 			this.#models = applyFinalCodexGpt56ContextCap(withRuntimeTransportOverride);
 			this.#rebuildCanonicalIndex();
+			this.#rebuildProviderActivity();
 			return;
 		}
 
@@ -2795,6 +2896,7 @@ export class ModelRegistry {
 				return this.#applyProviderTransportOverride(m, transportOverride);
 			});
 			this.#rebuildCanonicalIndex();
+			this.#rebuildProviderActivity();
 		}
 	}
 

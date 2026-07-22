@@ -154,6 +154,7 @@ const queries = [
 	["resource.body", "Read a bounded resource continuation."],
 	["artifact.read", "Read a bounded artifact range."],
 	["runtime.jobs.list", "List managed jobs."],
+	["providers.list/active", "List active providers."],
 ] as const;
 
 const reverse = [
@@ -286,7 +287,8 @@ export const OPERATIONS: readonly Operation[] = [
 			kind: "query" as const,
 			description,
 			idempotency: "idempotent" as const,
-			errorCodes: ["invalid_request", "resource_gone"],
+			errorCodes:
+				id === "Q26" ? ["invalid_request", "resource_gone", "internal"] : ["invalid_request", "resource_gone"],
 			continuityClass: queryContinuityClass(id),
 			adapterDispositions: queryDisposition(id),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],

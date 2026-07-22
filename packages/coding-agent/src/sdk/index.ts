@@ -10,5 +10,6 @@ export type {
 	Q10ThinkingEffort,
 	Q10ThinkingMode,
 } from "./models";
+export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
 export * from "./session";
 export * from "./session-directory";

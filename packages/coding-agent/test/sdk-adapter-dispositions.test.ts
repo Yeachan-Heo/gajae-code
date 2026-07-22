@@ -28,7 +28,7 @@ const parityRows = (
 		rows: ParityRow[];
 	}
 ).rows;
-expect(parityRows).toHaveLength(546);
+expect(parityRows).toHaveLength(552);
 const parityPrefix: Record<Adapter, string> = {
 	telegram: "T",
 	discord: "D",

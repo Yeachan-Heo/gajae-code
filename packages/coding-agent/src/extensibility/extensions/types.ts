@@ -1197,22 +1197,24 @@ export interface ExtensionAPI {
 	 *
 	 * @example
 	 * // Register a new provider with custom models and streaming
-	 * pi.registerProvider("google-vertex-Anthropic model", {
-	 *   baseUrl: "https://us-east5-aiplatform.googleapis.com",
-	 *   apiKey: "GOOGLE_CLOUD_PROJECT",
-	 *   api: "vertex-Anthropic model-api",
+	 * pi.registerProvider("google-vertex-anthropic", {
+	 *   baseUrl: "https://{location}-aiplatform.googleapis.com",
+	 *   apiKey: "GOOGLE_CLOUD_API_KEY",
+	 *   api: "google-vertex",
 	 *   streamSimple: myStreamFunction,
 	 *   models: [
 	 *     {
-	 *       id: "Anthropic model-sonnet-4@20250514",
-	 *       name: "Anthropic model Sonnet 4 (Vertex)",
+	 *       id: "gemini-2.5-flash",
+	 *       name: "Gemini 2.5 Flash (Vertex)",
+	 *       api: "google-vertex",
 	 *       reasoning: true,
-	 *       thinking: { mode: "anthropic-adaptive", minLevel: "minimal", maxLevel: "high" },
+	 *       thinking: { mode: "budget", minLevel: "minimal", maxLevel: "high" },
 	 *       input: ["text", "image"],
-	 *       cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-	 *       contextWindow: 200000,
-	 *       maxTokens: 64000,
-	 *   ]
+	 *       cost: { input: 0.3, output: 2.5, cacheRead: 0.03, cacheWrite: 0 },
+	 *       contextWindow: 1048576,
+	 *       maxTokens: 65536,
+	 *     },
+	 *   ],
 	 * });
 	 *
 	 * @example

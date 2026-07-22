@@ -284,6 +284,76 @@ Malformed reasoning descriptors are not client-recoverable catalog data. The
 query returns the SDK's safe `internal` error rather than exposing a partially
 formed row or descriptor details.
 
+### Active provider query (Q26)
+
+`providers.list/active` returns the providers that the current runtime considers
+configured and eligible for model selection. It uses the same authenticated,
+paged query envelope as Q10:
+
+```json
+{
+  "type": "query_response",
+  "id": "q-active-providers",
+  "ok": true,
+  "page": {
+    "items": [
+      { "provider": "anthropic", "connectionKind": "credential" },
+      { "provider": "openai-codex", "connectionKind": "credential" }
+    ],
+    "complete": true
+  }
+}
+```
+
+When `complete` is `false`, issue the continuation query with the returned
+`continuationCursor`; do not merge pages from different query snapshots. The
+operation name is exactly `providers.list/active` (also addressable as `Q26`).
+
+Each item is the minimal, non-secret DTO
+`{ provider: string, connectionKind: "credential" | "credentialless" }`.
+TypeScript clients import `ActiveProviderDescriptor` and
+`ActiveProviderConnectionKind` from `@gajae-code/coding-agent/sdk`; the private
+`./sdk/providers` and `./sdk/providers.js` are private and not exported.
+Provider IDs are the canonical IDs used by Q10 `models.list/current`; they are
+returned byte-for-byte, without display-name aliases or normalization. Items
+are deduplicated and ordered deterministically by canonical provider ID in
+ascending UTF-8 byte order.
+
+To expose models from active providers, join the two query results by exact
+provider ID. Q10 remains the complete registry catalog; Q26 is not a model
+catalog and does not make registry-only providers active:
+
+```ts
+const activeProviderIds = new Set(
+  activeProviders.map(provider => provider.provider),
+);
+const availableModels = modelCatalog.filter(model =>
+  activeProviderIds.has(model.provider),
+);
+```
+
+`connectionKind: "credential"` means an active, recognized credential is
+available to the local runtime. `credentialless` means a configured local or
+otherwise supported credentialless provider is currently selectable. "Active"
+is a local eligibility statement, not a remote health, quota, account-status,
+or future-request success guarantee. The query does not invoke models, probe
+endpoints, refresh credentials, or consume provider quota.
+
+Results are computed from current runtime state on every request and require no
+process restart. Polling observes successful login, credential add/remove,
+disablement or replacement, and local-provider activation/deactivation. A
+provider that is installed but not configured and selectable is omitted.
+Multiple credentials for one provider still produce one item, and disabled
+credentials do not keep a provider active unless another eligible connection
+remains.
+
+The query fails atomically: it never returns a partial list. Resolver failures
+use the safe nested error `{ "code": "internal", "message": "Unable to resolve active providers." }`.
+Normal SDK transport failures retain the standard `unavailable`, `timeout`, and
+`connection_closed` error codes. Optional request IDs are preserved on errors;
+Q26 errors do not include `page` or `restartQuery` metadata and never expose
+credential, path, account, or provider-response details.
+
 ## Answer semantics
 
 A remote reply answers a pending ask in every session state:

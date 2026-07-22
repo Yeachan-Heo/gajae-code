@@ -60,6 +60,7 @@ import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import { projectQ10Models } from "../models.js";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { ActiveProviderResolutionError } from "../providers.js";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -1842,6 +1843,13 @@ function sdkQuerySurface(
 			const currentModel = ctx.model;
 			const currentThinkingLevel = api.getThinkingLevel();
 			return projectQ10Models({ models, currentModel, currentThinkingLevel });
+		},
+		getActiveProviders: () => {
+			try {
+				return ctx.modelRegistry.getActiveProviders(ctx.model);
+			} catch {
+				throw new ActiveProviderResolutionError();
+			}
 		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {

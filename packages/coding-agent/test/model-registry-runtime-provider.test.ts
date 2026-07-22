@@ -6,6 +6,7 @@ import { type AssistantMessageEventStream, clearCustomApis, Effort, getCustomApi
 import { getOAuthProviders, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials } from "@gajae-code/ai/utils/oauth/types";
 import { ModelRegistry, type ProviderConfigInput } from "@gajae-code/coding-agent/config/model-registry";
+import { ModelsConfigSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { Snowflake } from "@gajae-code/utils";
 
@@ -102,7 +103,7 @@ describe("ModelRegistry runtime provider registration", () => {
 			modelsJsonPath,
 			JSON.stringify({
 				providers: {
-					envProvider: {
+					"env-provider": {
 						baseUrl: "https://api.example.test/v1",
 						api: "openai-responses",
 						apiKeyEnv: keyEnv,
@@ -113,19 +114,84 @@ describe("ModelRegistry runtime provider registration", () => {
 		);
 		try {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const model = registry.find("envProvider", "env-model");
+			const model = registry.find("env-provider", "env-model");
 			expect(model).toBeDefined();
-			expect(await registry.getApiKeyForProvider("envProvider")).toBe("resolved-env-secret");
+			expect(await registry.getApiKeyForProvider("env-provider")).toBe("resolved-env-secret");
 
 			delete process.env[keyEnv];
 			authStorage.clearConfigApiKeys();
 			const missingEnvRegistry = new ModelRegistry(authStorage, modelsJsonPath);
-			expect(await missingEnvRegistry.getApiKeyForProvider("envProvider")).toBeUndefined();
+			expect(await missingEnvRegistry.getApiKeyForProvider("env-provider")).toBeUndefined();
 		} finally {
 			delete process.env[keyEnv];
 		}
 	});
+	test("rejects noncanonical config provider keys without normalization", () => {
+		const invalidIds = ["EnvProvider", "env provider", "env..provider", "env/provider", "env-provider-"];
+		for (const provider of invalidIds) {
+			const result = ModelsConfigSchema.safeParse({
+				providers: {
+					[provider]: {
+						baseUrl: "https://api.example.test/v1",
+						api: "openai-responses",
+					},
+				},
+			});
+			expect(result.success).toBe(false);
+		}
+		expect(
+			ModelsConfigSchema.safeParse({
+				providers: {
+					"env-provider": {
+						baseUrl: "https://api.example.test/v1",
+						api: "openai-responses",
+					},
+				},
+			}).success,
+		).toBe(true);
+		expect(ModelsConfigSchema.safeParse({ providers: { "llama.cpp": {} } }).success).toBe(true);
+		expect(ModelsConfigSchema.safeParse({ providers: { "corp.proxy-1": {} } }).success).toBe(true);
+		expect(ModelsConfigSchema.safeParse({ providers: { ["a".repeat(64)]: {} } }).success).toBe(true);
+		expect(ModelsConfigSchema.safeParse({ providers: { ["a".repeat(65)]: {} } }).success).toBe(false);
+	});
 
+	test("checks the checked-in provider propertyNames schema contract", async () => {
+		const schema = (await import("../../../schemas/models.schema.json")) as {
+			properties?: {
+				providers?: {
+					propertyNames?: {
+						type?: unknown;
+						maxLength?: unknown;
+						pattern?: unknown;
+					};
+				};
+			};
+		};
+		const propertyNames = schema.properties?.providers?.propertyNames;
+		expect(propertyNames).toEqual({
+			type: "string",
+			maxLength: 64,
+			pattern: "^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+		});
+
+		const pattern = new RegExp(String(propertyNames?.pattern));
+		const maxLength = Number(propertyNames?.maxLength);
+		const validIds = ["a", "llama.cpp", "corp.proxy-1", "a".repeat(64)];
+		expect(validIds.every(id => pattern.test(id) && new TextEncoder().encode(id).byteLength <= maxLength)).toBe(true);
+
+		const invalidIds = [
+			"EnvProvider",
+			"env/provider",
+			"env provider",
+			"env--provider",
+			"env-provider-",
+			"sk-live-secret=abc",
+			"a".repeat(65),
+		];
+		expect(invalidIds.every(id => !pattern.test(id) || new TextEncoder().encode(id).byteLength > maxLength)).toBe(
+			true,
+		);
+	});
 	test("loads Bedrock models without apiKey because AWS credential chain supplies auth", async () => {
 		await Bun.write(
 			modelsJsonPath,
@@ -174,6 +240,37 @@ describe("ModelRegistry runtime provider registration", () => {
 
 		const afterAnthropicCount = registry.getAll().filter(model => model.provider === "anthropic").length;
 		expect(afterAnthropicCount).toBe(beforeAnthropicCount);
+	});
+	test("rejects noncanonical runtime providers atomically and accepts the canonical replacement", () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const invalidConfig: ProviderConfigInput = {
+			baseUrl: "https://runtime.example.com/v1",
+			apiKey: "RUNTIME_KEY",
+			api: "custom-canonical-api",
+			streamSimple,
+			oauth: {
+				name: "Atomic OAuth",
+				login: async () => ({ access: "access", refresh: "refresh", expires: Date.now() + 60_000 }),
+				getApiKey: credentials => credentials.access,
+			},
+			models: [{ ...baseModel, id: "atomic-model" }],
+		};
+		const beforeModelCount = registry.getAll().length;
+
+		expect(() => registry.registerProvider("AtomicProvider", invalidConfig, "ext://atomic")).toThrow(
+			"provider ID must match",
+		);
+		expect(registry.getAll()).toHaveLength(beforeModelCount);
+		expect(registry.find("AtomicProvider", "atomic-model")).toBeUndefined();
+		expect(getCustomApi("custom-canonical-api")).toBeUndefined();
+		expect(getOAuthProviders().some(provider => provider.id === "AtomicProvider")).toBe(false);
+		expect(authStorage.hasAuth("AtomicProvider")).toBe(false);
+
+		registry.registerProvider("atomic-provider", invalidConfig, "ext://atomic");
+		expect(registry.find("atomic-provider", "atomic-model")).toBeDefined();
+		expect(getCustomApi("custom-canonical-api")).toBeDefined();
+		expect(getOAuthProviders().some(provider => provider.id === "atomic-provider")).toBe(true);
+		expect(authStorage.hasAuth("atomic-provider")).toBe(true);
 	});
 
 	test("registerProvider applies headers-only overrides to existing provider models across refresh", async () => {

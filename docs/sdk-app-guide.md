@@ -178,8 +178,10 @@ complete example and the optional threaded frames (`turn_stream`,
 
 Beyond frames, the WS surface exposes typed **control operations**
 (`turn.prompt`, `turn.steer`, `ask.answer`, `model.set`, `session.fork`,
-`bash.execute`, …) and **queries** (`transcript.list/body`, `diff.*`,
-`usage.get`, `models.list/current`, `workflow.gates.list`, …). See the
+(`bash.execute`, …) and **queries** (`transcript.list/body`, `diff.*`,
+`usage.get`, `models.list/current`, `providers.list/active`,
+`workflow.gates.list`, …). Use the active-provider query to filter the model
+catalog to locally configured, selectable providers. See the
 [SDK wire protocol & machine interfaces](./sdk.md) for the complete catalog.
 
 
