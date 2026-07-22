@@ -43,8 +43,17 @@ function stripInlineCode(line: string): string {
 function isRoleSelectorVerb(line: string, commandEndIndex: number): boolean {
 	return line.slice(0, commandEndIndex).endsWith("gjc team executor") && /\bgjc\s+team\s+executor\s+["'`]/u.test(line);
 }
-
-
+function resolveManifestVerb(
+	skill: CanonicalGjcWorkflowSkill,
+	command: string,
+): { verb: string; matchedLength: number } | undefined {
+	for (const verb of [...listVerbs(skill)].sort((a, b) => b.length - a.length)) {
+		const pattern = new RegExp(`^${verb.replaceAll(" ", "\\s+")}(?![a-z0-9-])`, "u");
+		const match = command.match(pattern);
+		if (match) return { verb, matchedLength: match[0].length };
+	}
+	return undefined;
+}
 function collectCommandRefs(file: string, content: string): CommandRef[] {
 	const refs: CommandRef[] = [];
 	const relative = path.relative(repoRoot, file);
@@ -55,10 +64,14 @@ function collectCommandRefs(file: string, content: string): CommandRef[] {
 		for (const match of line.matchAll(commandPattern)) {
 			const skill = match[1];
 			if (!isSkill(skill)) continue;
-			const verb = match[2] ?? "";
-			const command = match[0];
-			if (isRoleSelectorVerb(line, (match.index ?? 0) + command.length)) continue;
-			const valid = listVerbs(skill).includes(verb);
+			const firstVerbToken = match[2] ?? "";
+			const commandStart = match.index ?? 0;
+			const verbStart = commandStart + match[0].length - firstVerbToken.length;
+			if (isRoleSelectorVerb(line, verbStart + firstVerbToken.length)) continue;
+			const resolved = resolveManifestVerb(skill, line.slice(verbStart));
+			const verb = resolved?.verb ?? firstVerbToken;
+			const command = resolved ? line.slice(commandStart, verbStart + resolved.matchedLength) : match[0];
+			const valid = resolved !== undefined;
 			refs.push({ file: relative, line: i + 1, skill, verb, command, valid });
 		}
 	}
