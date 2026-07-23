@@ -136,6 +136,81 @@ test("stale-tag sidecars are inert and a stale writer cannot overwrite a success
 	expect(await renewOwnerHeartbeatSidecar({ settings: s, ownerId: "other", acquisitionId: "other", pid: process.pid })).toBe(false);
 });
 
+test("a stale rename landing after a steal stays inert and the successor self-heals", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const paths = daemonPaths(agentDir);
+	let now = 1;
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "a",
+		now: () => now,
+	});
+	await renewDaemonHeartbeat({ settings: s, ownerId: "a", acquisitionId: "a", pid: process.pid, now: () => now });
+	// Pause owner A's renewal at the exact post-final-lock-read pre-rename window.
+	let releaseRename: (() => void) | undefined;
+	const renamePaused = new Promise<void>(resolve => {
+		releaseRename = resolve;
+	});
+	let renameStarted: (() => void) | undefined;
+	const started = new Promise<void>(resolve => {
+		renameStarted = resolve;
+	});
+	const pausedFs: TelegramDaemonFs = {
+		...(fs.promises as unknown as TelegramDaemonFs),
+		rename: async (from, to) => {
+			renameStarted?.();
+			await renamePaused;
+			return await fs.promises.rename(from as string, to as string);
+		},
+	};
+	now = 10;
+	const inFlight = renewOwnerHeartbeatSidecar({
+		settings: s,
+		ownerId: "a",
+		acquisitionId: "a",
+		pid: process.pid,
+		now: () => now,
+		fs: pausedFs,
+	});
+	await started;
+	// Successor B steals on disk while A is paused past its final lock read.
+	const bState = {
+		...(await readDaemonState(s))!,
+		ownerId: "b",
+		acquisitionId: "b",
+		startedAt: 20,
+		heartbeatAt: 20,
+	};
+	fs.writeFileSync(paths.state, JSON.stringify(bState));
+	fs.writeFileSync(
+		paths.lock,
+		JSON.stringify({
+			pid: bState.pid,
+			incarnation: bState.incarnation,
+			ownerId: "b",
+			acquisitionId: "b",
+			startedAt: 20,
+		}),
+	);
+	// Resume A: its rename LANDS on the shared pathname.
+	releaseRename?.();
+	await inFlight;
+	// A's landed sidecar is tag-inert for B: freshness falls back to B's state floor.
+	const snapshot = await readOwnerFreshnessSnapshot({ settings: s });
+	expect(snapshot.ownerTag?.ownerId).toBe("b");
+	expect(snapshot.effectiveHeartbeatAt).toBe(20);
+	// B's own next renewal restores a matching fresh sidecar.
+	now = 30;
+	expect(
+		await renewOwnerHeartbeatSidecar({ settings: s, ownerId: "b", acquisitionId: "b", pid: process.pid, now: () => now }),
+	).toBe(true);
+	expect((await readOwnerFreshnessSnapshot({ settings: s })).effectiveHeartbeatAt).toBe(30);
+});
+
 test("modern owners without a matching lock are never fresh or current", async () => {
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
