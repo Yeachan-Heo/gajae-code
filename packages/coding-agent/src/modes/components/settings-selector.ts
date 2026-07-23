@@ -37,6 +37,8 @@ import { getPreset } from "./status-line/presets";
 import { ALL_SEGMENT_IDS } from "./status-line/segments";
 import type { StatusLineSegmentOptions } from "./tool-status-header";
 
+const NOTIFICATIONS_MINIMUM_CONTENT_ROWS = 14;
+
 /**
  * A submenu component for selecting from a list of options.
  */
@@ -746,6 +748,10 @@ export class SettingsSelectorComponent extends Container {
 	#currentTabId: SettingTab | "plugins" = "appearance";
 	#textInputActive = false;
 
+	get activeTabId(): SettingTab | "plugins" {
+		return this.#currentTabId;
+	}
+
 	constructor(
 		private readonly context: SettingsRuntimeContext,
 		private readonly callbacks: SettingsCallbacks,
@@ -772,6 +778,21 @@ export class SettingsSelectorComponent extends Container {
 
 		// Add bottom border
 		this.addChild(new DynamicBorder());
+	}
+
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		if (this.#currentTabId !== "notifications") return lines;
+
+		const minimumFrameRows = 1 + this.#tabBar.render(width).length + 1 + NOTIFICATIONS_MINIMUM_CONTENT_ROWS + 1;
+		if (lines.length >= minimumFrameRows) return lines;
+
+		const bottomBorder = lines.pop();
+		if (bottomBorder === undefined) {
+			throw new Error("Settings selector notifications frame is missing its bottom border");
+		}
+		lines.push(...Array.from({ length: minimumFrameRows - lines.length - 1 }, () => ""), bottomBorder);
+		return lines;
 	}
 
 	#switchToTab(tabId: SettingTab | "plugins"): void {
