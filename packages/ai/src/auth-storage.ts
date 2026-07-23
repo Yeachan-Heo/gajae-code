@@ -3202,10 +3202,38 @@ export class AuthStorage {
 			return { apiKey: result.apiKey, credential: updated };
 		} catch (error) {
 			const errorMsg = String(error);
+			// Peer-rotation recovery runs before ANY failure classification: a
+			// concurrent process may have rotated the refresh token, which
+			// invalidates the snapshot token we just attempted. Re-read the row —
+			// if the persisted refresh token changed, the peer's rotation succeeded
+			// and we pick up the fresh credential instead of disabling (definitive
+			// path) or temp-blocking (transient path) a row that is actually
+			// healthy. This matters for providers whose invalid-grant response does
+			// not match the definitive regex below (e.g. Kimi's 400 "The provided
+			// authorization grant is invalid"): with short-lived access tokens and
+			// multiple gjc processes sharing the store, the stale-snapshot failure
+			// would otherwise be misclassified as transient and the credential
+			// temp-blocked on every rotation race.
+			const attemptedCredentialId = this.#getStoredCredentials(provider)[selection.index]?.id;
+			if (attemptedCredentialId !== undefined) {
+				const latestRow = this.#store.listAuthCredentials(provider).find(row => row.id === attemptedCredentialId);
+				const latestCredential = latestRow?.credential;
+				if (latestCredential?.type === "oauth" && latestCredential.refresh !== selection.credential.refresh) {
+					logger.debug("OAuth refresh race detected; another process rotated token first", {
+						provider,
+						index: selection.index,
+						credentialId: attemptedCredentialId,
+					});
+					await this.reload();
+					return this.#resolveOAuthSelection(provider, sessionId, options);
+				}
+			}
 			// Only remove credentials for definitive auth failures
 			// Keep credentials for transient errors (network, 5xx) and block temporarily
 			const isDefinitiveFailure =
-				/invalid_grant|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(errorMsg) ||
+				/invalid_grant|grant is invalid|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(
+					errorMsg,
+				) ||
 				(/\b(401|403)\b/.test(errorMsg) && !/timeout|network|fetch failed|ECONNREFUSED/i.test(errorMsg));
 
 			logger.warn("OAuth token refresh failed", {
@@ -3216,27 +3244,6 @@ export class AuthStorage {
 			});
 
 			if (isDefinitiveFailure) {
-				// The credential at this index may have been rotated by another process between
-				// our in-memory snapshot and the refresh attempt: Anthropic rotates refresh
-				// tokens on every use, so the peer's success leaves our stored token invalid.
-				// Re-read the row from disk before marking it disabled — if the persisted
-				// refresh token has changed, the peer rotation succeeded and we should pick
-				// up the new credential instead of soft-deleting the row that the peer just
-				// updated.
-				const credentialId = this.#getStoredCredentials(provider)[selection.index]?.id;
-				if (credentialId !== undefined) {
-					const latestRow = this.#store.listAuthCredentials(provider).find(row => row.id === credentialId);
-					const latestCredential = latestRow?.credential;
-					if (latestCredential?.type === "oauth" && latestCredential.refresh !== selection.credential.refresh) {
-						logger.debug("OAuth refresh race detected; another process rotated token first", {
-							provider,
-							index: selection.index,
-							credentialId,
-						});
-						await this.reload();
-						return this.#resolveOAuthSelection(provider, sessionId, options);
-					}
-				}
 				// Permanently disable invalid credentials with an explicit cause for inspection/debugging.
 				// Use a CAS-style disable conditioned on the row still containing the stale credential
 				// we tried to refresh, so a peer rotation that lands between the pre-check above and

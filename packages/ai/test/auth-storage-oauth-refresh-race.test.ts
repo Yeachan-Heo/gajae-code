@@ -327,4 +327,91 @@ describe("AuthStorage OAuth refresh race", () => {
 		const retryKey = await authStorage.getApiKey("unit-oauth-rotation", sessionId);
 		expect(retryKey).toBe("access-b");
 	});
+
+	test("recovers from a non-definitive invalid-grant failure when a peer rotated the token", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		// Kimi-style failure: refresh-token rotation by a peer leaves our snapshot
+		// token rejected with a message that does NOT match the definitive-failure
+		// regex (HTTP 400 "The provided authorization grant is invalid", not the
+		// literal "invalid_grant"). Before the fix this was misclassified as
+		// transient and the healthy credential was temp-blocked for 5 minutes on
+		// every rotation race — with Kimi's ~12-minute access tokens and several
+		// gjc processes sharing the store, users saw repeated "logged out" states.
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "stale-access",
+				refresh: "stale-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+		const storedBefore = store.listAuthCredentials("anthropic");
+		expect(storedBefore).toHaveLength(1);
+		const credentialId = storedBefore[0]!.id;
+
+		// Peer process rotated the row first.
+		store.updateAuthCredential(credentialId, {
+			type: "oauth",
+			access: "fresh-access-from-peer",
+			refresh: "fresh-refresh-from-peer",
+			expires: Date.now() + 60 * 60_000,
+		});
+
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credentials) => {
+			if (credentials.refresh === "stale-refresh") {
+				throw new Error("Kimi token refresh failed: 400: The provided authorization grant is invalid");
+			}
+			return credentials;
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+			const credential = creds[provider];
+			if (!credential) return null;
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const apiKey = await authStorage!.getApiKey("anthropic", "session-kimi-race");
+
+			// The peer-rotated credential must be picked up — not temp-blocked.
+			expect(apiKey).toBe("fresh-access-from-peer");
+			expect(events).toHaveLength(0);
+
+			const stored = store!.listAuthCredentials("anthropic");
+			expect(stored).toHaveLength(1);
+			expect(stored[0]?.id).toBe(credentialId);
+			if (stored[0]?.credential.type === "oauth") {
+				expect(stored[0].credential.refresh).toBe("fresh-refresh-from-peer");
+			}
+		});
+	});
+
+	test("disables on a genuine Kimi-style invalid-grant failure with no peer rotation", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		// Same Kimi message shape, but no peer updated the row: the refresh token
+		// is genuinely revoked, so the credential must be disabled (and the
+		// onCredentialDisabled listener fired) instead of looping 5-minute
+		// temp-blocks forever.
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "expired-access",
+				refresh: "revoked-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async () => {
+			throw new Error("Kimi token refresh failed: 400: The provided authorization grant is invalid");
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			const apiKey = await authStorage!.getApiKey("anthropic", "session-kimi-revoked");
+
+			expect(apiKey).toBeUndefined();
+			expect(events).toHaveLength(1);
+			expect(events[0]?.disabledCause).toContain("authorization grant is invalid");
+		});
+	});
 });

@@ -6,6 +6,7 @@
 
 - OpenAI Responses / Codex native history replay no longer submits missing resident-image placeholders as `input_image.image_url`. Invalid values (including `[Session resident imageUrl blob missing: …]`) are dropped, or retained as `file_id`-only parts when a non-empty `file_id` is present, so a single unavailable historical image cannot brick `/retry` (#2924).
 - Raised the first-event stream timeout floor to five minutes for `alibaba-token-plan` models using the OpenAI Completions and Responses APIs, while preserving caller and environment overrides and the existing inter-event idle timeout.
+- OAuth refresh peer-rotation recovery now runs before failure classification instead of only on the definitive-failure path, and the definitive matcher recognizes the "grant is invalid" phrasing. Providers whose invalid-grant response does not contain the literal `invalid_grant` (e.g. Kimi's 400 "The provided authorization grant is invalid") previously had rotation races misclassified as transient, temp-blocking a healthy credential for five minutes on every race; with Kimi's ~12-minute access tokens and multiple processes sharing the credential store this surfaced as repeated logouts. Genuine revocations are now disabled with a cause instead of looping temp-blocks.
 
 ## [0.11.7] - 2026-07-22
 
