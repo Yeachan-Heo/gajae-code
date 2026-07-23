@@ -173,6 +173,7 @@ test("ensure cooldown preserves the first reload and attaches on the second auto
 
 	const current = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8")) as DaemonState;
 	current.generation = DAEMON_GENERATION - 1;
+	current.servingEpoch = undefined;
 	current.heartbeatAt = now;
 	fs.writeFileSync(daemonPaths(agentDir).state, JSON.stringify(current));
 	const attempt = JSON.parse(
@@ -188,6 +189,53 @@ test("ensure cooldown preserves the first reload and attaches on the second auto
 	).toBe("attached");
 	expect(spawns).toBe(1);
 	expect(signals).toHaveLength(1);
+});
+
+test("cooldown never attaches a non-ready servingEpoch predecessor", async () => {
+	const agentDir = tempDir();
+	const s = settings(agentDir);
+	const now = 1_000;
+	const signals: Array<[number, NodeJS.Signals]> = [];
+	writeLiveOwner(agentDir, {
+		pid: 999,
+		incarnation: "linux:100",
+		ownerId: "provisional-owner",
+		tokenFingerprint: tokenFingerprint("123456:secret-token"),
+		chatId: "42",
+		startedAt: now,
+		heartbeatAt: now,
+		roots: [],
+		version: DAEMON_VERSION,
+		generation: DAEMON_GENERATION - 1,
+		servingEpoch: undefined,
+		acquisitionId: "provisional-owner",
+	});
+	fs.writeFileSync(
+		path.join(daemonPaths(agentDir).dir, "telegram-daemon.reload-attempt.json"),
+		JSON.stringify({ lastReloadAt: now, ownerId: "provisional-owner", targetGeneration: DAEMON_GENERATION }),
+	);
+	const attemptPath = path.join(daemonPaths(agentDir).dir, "telegram-daemon.reload-attempt.json");
+	const deps = {
+		fs: daemonFs(),
+		pid: 4242,
+		now: () => now,
+		pidAlive: (pid: number) => pid === 999,
+		pidIncarnation: () => "linux:100",
+		sendSignal: (pid: number, signal: NodeJS.Signals) => signals.push([pid, signal]),
+		waitStepMs: 1,
+		readinessTimeoutMs: 1,
+		sleep: async () => undefined,
+		spawn: () => {
+			throw new Error("non-ready predecessor must not be replaced");
+		},
+	};
+	for (const sessionId of ["first", "second"]) {
+		expect(fs.existsSync(attemptPath)).toBe(true);
+		await expect(
+			ensureTelegramDaemonRunningDetailed({ settings: s, cwd: path.join(agentDir, sessionId), sessionId }, deps),
+		).resolves.toBe("blocked_identity");
+	}
+	expect(signals).toEqual([]);
 });
 
 test("concurrent generation upgrades reserve one reload attempt", async () => {

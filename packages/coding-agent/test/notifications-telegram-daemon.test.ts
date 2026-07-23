@@ -1421,6 +1421,7 @@ describe("telegram daemon", () => {
 								roots: [],
 								version: DAEMON_VERSION,
 								generation: DAEMON_GENERATION,
+								servingEpoch: SERVING_EPOCH,
 							}),
 						);
 					},
@@ -1907,10 +1908,11 @@ describe("telegram daemon", () => {
 				startedAt: 100,
 				heartbeatAt: 100,
 				roots: [],
-				version: 1,
+				version: DAEMON_VERSION,
 				generation: DAEMON_GENERATION,
 				acquisitionId: "old",
 				ownershipPhase: "ready",
+				servingEpoch: SERVING_EPOCH,
 			}),
 		);
 		const result = await acquireDaemonOwnership({
@@ -2179,12 +2181,11 @@ describe("telegram daemon", () => {
 	});
 
 	// -----------------------------------------------------------------------
-	// #2028: a rolling upgrade can leave a still-live PRE-upgrade daemon owning
+	// A rolling serving-epoch upgrade can leave a still-live predecessor owning
 	// the lock. Its persisted schema `version` is unchanged (1), so a freshly
-	// upgraded host used to treat it as a fresh live owner and silently attach —
-	// the old daemon speaks the old protocol without ask-ack/controls, so the new
-	// host's Selected acks are dropped. The persisted operational `generation`
-	// lets the new host detect the mismatch and reload instead of attaching.
+	// upgraded host must converge an earlier serving epoch instead of silently
+	// attaching. Generation is retained for guarded behavior inventory only;
+	// same-epoch live owners attach across generation changes.
 	// -----------------------------------------------------------------------
 	function liveOwnerState(extra: Partial<DaemonState> = {}): DaemonState {
 		return {
@@ -2310,10 +2311,10 @@ describe("telegram daemon", () => {
 		await expect(acquireDaemonOwnership(ownershipInput)).resolves.toEqual({ acquired: false, attached: true });
 	});
 
-	test("#2028 reloads a fully-provenanced owner without a generation", async () => {
+	test("servingEpoch predecessor without a generation requests convergence", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		writeLiveOwner(agentDir);
+		writeLiveOwner(agentDir, { servingEpoch: undefined });
 		const result = await acquireDaemonOwnership({
 			settings: s,
 			tokenFingerprint: "e60b05c186ca",
@@ -2324,7 +2325,7 @@ describe("telegram daemon", () => {
 		});
 		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
 	});
-	test("#2028 acquire flags a reload for a live daemon from the immediately preceding generation", async () => {
+	test("same servingEpoch attaches across an immediately preceding generation", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, heartbeatAt: Date.now() });
@@ -2336,7 +2337,31 @@ describe("telegram daemon", () => {
 			pidIncarnation: () => "linux:100",
 			now: () => Date.now(),
 		});
-		expect(result).toEqual({ acquired: false, attached: false, reloadRequired: true });
+		expect(result).toEqual({ acquired: false, attached: true });
+		await expect(
+			new TelegramDaemonController(s, {
+				now: () => 101,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: () => "linux:100",
+			}).status(),
+		).resolves.toMatchObject({ health: "running", pid: 999 });
+		const signals: Array<[number, string]> = [];
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: path.join(agentDir, "same-epoch-successor"), sessionId: "same-epoch-successor" },
+				{
+					now: () => 101,
+					pid: 4242,
+					pidAlive: pid => pid === 999,
+					pidIncarnation: () => "linux:100",
+					sendSignal: (pid, signal) => signals.push([pid, signal]),
+					spawn: () => {
+						throw new Error("same-epoch predecessor must attach");
+					},
+				},
+			),
+		).resolves.toBe("attached");
+		expect(signals).toEqual([]);
 	});
 
 	test("generation-less parent-format live owner remains blocked", async () => {
@@ -3019,12 +3044,12 @@ describe("telegram daemon", () => {
 		expect(sleeps).toEqual([1, 1, 1]);
 	});
 
-	test("generation 6 reloads a live generation-5 owner via a safe SIGTERM handoff", async () => {
+	test("servingEpoch predecessor reloads via a safe SIGTERM handoff", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		// Generation 5 predates the durable tool-activity policy but is otherwise a
-		// fresh live owner that a version-only check would attach to.
-		writeLiveOwner(agentDir, { generation: 5, heartbeatAt: Date.now() });
+		// An epoch-1 owner is otherwise fresh and live, but must converge before
+		// this host can attach to it.
+		writeLiveOwner(agentDir, { generation: 5, servingEpoch: undefined, heartbeatAt: Date.now() });
 		const paths = daemonPaths(agentDir);
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
@@ -3079,7 +3104,7 @@ describe("telegram daemon", () => {
 	test("detailed ensure reports reloaded only for the existing fresh-owner reloadRequired handoff", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, heartbeatAt: Date.now() });
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, servingEpoch: undefined, heartbeatAt: Date.now() });
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
 		const child = readyTelegramSpawnFixture({
@@ -3113,10 +3138,10 @@ describe("telegram daemon", () => {
 		expect(signals).toContainEqual([999, "SIGTERM"]);
 	});
 
-	test("generation reload fails when the stale owner never exits", async () => {
+	test("servingEpoch reload fails when the stale owner never exits", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		writeLiveOwner(agentDir, { generation: 5, heartbeatAt: 1_000 });
+		writeLiveOwner(agentDir, { generation: 5, servingEpoch: undefined, heartbeatAt: 1_000 });
 		let nowMs = 1_000;
 		let spawns = 0;
 
@@ -3147,7 +3172,7 @@ describe("telegram daemon", () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		let now = 1_000;
-		writeLiveOwner(agentDir, { heartbeatAt: now });
+		writeLiveOwner(agentDir, { servingEpoch: undefined, heartbeatAt: now });
 		const cwd = path.join(agentDir, "new-session");
 		await expect(
 			ensureTelegramDaemonRunningDetailed(
@@ -3175,7 +3200,7 @@ describe("telegram daemon", () => {
 		const newCwd = path.join(agentDir, "new-session");
 		await registerNotificationRoot({ settings: s, cwd: oldCwd, sessionId: "session" });
 		let now = 1_000;
-		writeLiveOwner(agentDir, { heartbeatAt: now });
+		writeLiveOwner(agentDir, { servingEpoch: undefined, heartbeatAt: now });
 		await expect(
 			ensureTelegramDaemonRunningDetailed(
 				{ settings: s, cwd: newCwd, sessionId: "session" },
@@ -3254,7 +3279,7 @@ describe("telegram daemon", () => {
 				pidAlive: pid => pid === 999,
 				pidIncarnation: () => "linux:100",
 			}),
-		).toBe(false);
+		).toBe(true);
 
 		const ownership = await acquireDaemonOwnership({
 			settings: s,

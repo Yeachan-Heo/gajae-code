@@ -1424,8 +1424,8 @@ async function legacyParentHandoffDecision(input: {
 	| undefined
 > {
 	const { state } = input;
-	if (state.generation !== 3) return { acquired: false, attached: false, blocked: true };
 	if (!input.pidAlive(state.pid)) return undefined;
+	if (state.generation !== 3) return { acquired: false, attached: false, blocked: true };
 	if (!ownerIdentityMatches(state, input.tokenFingerprint, input.chatId))
 		return { acquired: false, attached: false, blocked: true };
 	const incarnation = input.pidIncarnation(state.pid);
@@ -1527,12 +1527,7 @@ function isRecognizedLegacyGeneration(generation: number | undefined): boolean {
 	return generation === undefined || generation === 3;
 }
 
-/**
- * A predecessor is reloadable only when it has the complete modern ownership
- * proof. Generation is absent from the first fully-provenanced modern records,
- * so it is an incompatible predecessor too; parent-format records remain
- * excluded because they lack this ownership proof.
- */
+/** True when a modern owner carries complete ready-state provenance. */
 function hasFullModernOwnerProvenance(
 	state: DaemonState | undefined,
 	pidIncarnation?: (pid: number) => string | undefined,
@@ -1544,19 +1539,6 @@ function hasFullModernOwnerProvenance(
 			typeof state.acquisitionId === "string" &&
 			state.acquisitionId.length > 0 &&
 			ownerProvenanceMatches(state, pidIncarnation),
-	);
-}
-
-function isFullModernPredecessor(
-	state: DaemonState | undefined,
-	pidIncarnation?: (pid: number) => string | undefined,
-): boolean {
-	return Boolean(
-		hasFullModernOwnerProvenance(state, pidIncarnation) &&
-			(state?.generation === undefined ||
-				(Number.isSafeInteger(state?.generation) &&
-					(state?.generation as number) > 0 &&
-					(state?.generation as number) < DAEMON_GENERATION)),
 	);
 }
 
@@ -1761,8 +1743,14 @@ export async function acquireDaemonOwnership(input: {
 				pidIncarnation,
 			}) &&
 			(state.version !== DAEMON_VERSION ||
-				(state.servingEpoch === undefined ? 1 : state.servingEpoch) < SERVING_EPOCH ||
-				isFullModernPredecessor(state, pidIncarnation))
+				((state.servingEpoch === undefined ? 1 : state.servingEpoch) < SERVING_EPOCH &&
+					isSignalableMatchingOwner({
+						state,
+						tokenFingerprint: input.tokenFingerprint,
+						chatId: input.chatId,
+						pidAlive,
+						pidIncarnation,
+					})))
 		)
 			return { acquired: false, attached: false, reloadRequired: true };
 		return { acquired: false, attached: false, provisional: true };
