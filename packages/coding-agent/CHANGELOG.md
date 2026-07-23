@@ -4,7 +4,7 @@
 
 ### Added
 
-- Plans and delegated tasks can carry an authoritative repository binding (`gjc.repository_binding.v1`). Ultragoal plans and ralplan seeds stamp worktree/common-dir identity at creation, task items accept an optional binding, and spawn/goal-start fail closed when the active cwd is a sibling repository (#2901).
+- Plans and delegated tasks carry an authoritative repository binding (`gjc.repository_binding.v1`). Ultragoal/ralplan stamp identity at creation; task lanes stamp omitted bindings from session cwd **before** agent discovery; ralplan stage writes and handoff re-entry enforce the seed binding; declared paths must stay under the bound root; task receipts include the resolved identity; linked isolation worktrees must match the source repository (#2901).
 
 ### Fixed
 

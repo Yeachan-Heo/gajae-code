@@ -11,7 +11,15 @@ import {
 	type RalplanIndexRow,
 	summarizeRalplanIndex,
 } from "./ledger-event-renderer";
-import { captureRepositoryBinding } from "./repository-binding";
+import {
+	assertCwdMatchesRepositoryBinding,
+	assertPathUnderRepositoryBinding,
+	captureRepositoryBinding,
+	parseRepositoryBinding,
+	publicRepositoryBinding,
+	type RepositoryBinding,
+	RepositoryBindingError,
+} from "./repository-binding";
 import { GJC_RALPLAN_ARTIFACT_ENV, isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
 import { modeStatePath, sessionPlansDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
@@ -178,6 +186,43 @@ async function readActiveRunId(cwd: string, sessionId: string): Promise<string |
 	if (!candidate) return undefined;
 	assertSafePathComponent(candidate, "run-id");
 	return candidate;
+}
+
+/**
+ * Read the authoritative repository binding from ralplan run state and fail closed
+ * when the active cwd no longer matches (handoff / QA / stage write) (#2901).
+ */
+async function enforceRalplanRepositoryBinding(cwd: string, sessionId: string): Promise<RepositoryBinding> {
+	const statePath = ralplanStatePath(cwd, sessionId);
+	const existingRead = await readExistingStateForMutation(statePath);
+	if (existingRead.kind === "corrupt") {
+		throw new RalplanCommandError(
+			2,
+			`existing ralplan state is corrupt or tampered (${existingRead.error}); refusing to proceed at ${statePath}`,
+		);
+	}
+	if (existingRead.kind === "absent") {
+		// No prior seed — capture live authority so subsequent handoffs still have a stamp.
+		return publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
+	}
+	const raw = existingRead.value.repository_binding ?? existingRead.value.repositoryBinding;
+	try {
+		if (raw === undefined) {
+			// Legacy seeds without a field: stamp current cwd and require future writes match it.
+			return publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
+		}
+		const binding = parseRepositoryBinding(raw);
+		await assertCwdMatchesRepositoryBinding(cwd, binding);
+		return publicRepositoryBinding(binding);
+	} catch (error) {
+		if (error instanceof RepositoryBindingError) {
+			throw new RalplanCommandError(2, `ralplan repository binding rejected: ${error.message}`);
+		}
+		throw new RalplanCommandError(
+			2,
+			`ralplan repository binding rejected: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 }
 
 /**
@@ -652,6 +697,24 @@ async function buildRalplanHud(options: {
 async function handleArtifactWrite(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
 	const plannerState = parsePlannerStateArgs(args);
 	const resolved = await resolveArtifactArgs(args, cwd);
+	// Fail closed before stage persistence / path writes when cwd drifted to a sibling repo.
+	const repositoryBinding = await enforceRalplanRepositoryBinding(cwd, resolved.sessionId);
+	// Artifact file paths (when --artifact points at a file) must stay under the bound root.
+	const rawArtifact = flagValue(args, "--artifact");
+	if (rawArtifact && !isRestrictedRoleAgentBash()) {
+		const candidate = path.isAbsolute(rawArtifact) ? rawArtifact : path.resolve(cwd, rawArtifact);
+		try {
+			const stat = await fs.stat(candidate);
+			if (stat.isFile()) {
+				assertPathUnderRepositoryBinding(repositoryBinding, candidate);
+			}
+		} catch (error) {
+			if (error instanceof RepositoryBindingError) {
+				throw new RalplanCommandError(2, `ralplan repository binding rejected: ${error.message}`);
+			}
+			// Non-file / missing path is inline content; resolveArtifactContent already handled it.
+		}
+	}
 	const content = resolved.artifact.endsWith("\n") ? resolved.artifact : `${resolved.artifact}\n`;
 	const sha256 = createHash("sha256").update(content).digest("hex");
 
@@ -697,6 +760,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 		stage: persisted.stage,
 		stage_n: persisted.stageN,
 		sha256: persisted.sha256,
+		repository_binding: repositoryBinding,
 		created_at: persisted.createdAt,
 	};
 	if (persisted.pendingApprovalPath) payload.pending_approval_path = persisted.pendingApprovalPath;
@@ -810,7 +874,7 @@ function resolveConsensusArgs(args: readonly string[], cwd: string): ConsensusHa
 async function seedRalplanState(
 	cwd: string,
 	resolved: ConsensusHandoffArgs,
-): Promise<{ statePath: string; runId: string }> {
+): Promise<{ statePath: string; runId: string; repositoryBinding: RepositoryBinding }> {
 	const statePath = ralplanStatePath(cwd, resolved.sessionId);
 	// Reuse an existing run id when present so a re-invocation of `gjc ralplan "task"` doesn't
 	// orphan in-progress artifacts under a fresh run id.
@@ -818,7 +882,11 @@ async function seedRalplanState(
 	const runId = existingRunId ?? resolved.sessionId ?? defaultRunId();
 	assertSafePathComponent(runId, "run-id");
 	const now = new Date().toISOString();
-	const repositoryBinding = await captureRepositoryBinding(cwd, { displayPath: cwd });
+	// When an active seed already carries authority, re-entry must match it (fail closed).
+	// Otherwise stamp the current cwd as the durable binding for this run.
+	const repositoryBinding = existingRunId
+		? await enforceRalplanRepositoryBinding(cwd, resolved.sessionId)
+		: publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
 	const payload: Record<string, unknown> = {
 		active: true,
 		current_phase: "planner",
@@ -852,7 +920,7 @@ async function seedRalplanState(
 		},
 	});
 	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: statePath });
-	return { statePath, runId };
+	return { statePath, runId, repositoryBinding };
 }
 
 async function handleConsensusHandoff(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
@@ -860,7 +928,7 @@ async function handleConsensusHandoff(args: readonly string[], cwd: string): Pro
 	if (!resolved.task) {
 		throw new RalplanCommandError(2, 'gjc ralplan requires a task description, e.g. `gjc ralplan "<task>"`.');
 	}
-	const { statePath, runId } = await seedRalplanState(cwd, resolved);
+	const { statePath, runId, repositoryBinding } = await seedRalplanState(cwd, resolved);
 	const mode = resolved.deliberate ? "deliberate" : "short";
 	await syncRalplanHud({
 		cwd,
@@ -878,6 +946,7 @@ async function handleConsensusHandoff(args: readonly string[], cwd: string): Pro
 		state_path: statePath,
 		run_id: runId,
 		handoff: "/skill:ralplan",
+		repository_binding: repositoryBinding,
 	};
 	const stdout = resolved.json
 		? renderCliWriteReceipt({ ok: true, ...summary })

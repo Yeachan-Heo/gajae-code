@@ -15,6 +15,7 @@ import {
 	assertCwdMatchesRepositoryBinding,
 	assertPathUnderRepositoryBinding,
 	parseRepositoryBinding,
+	resolveTaskRepositoryBinding,
 } from "../src/gjc-runtime/repository-binding";
 import { readUltragoalPlan, startNextUltragoalGoal } from "../src/gjc-runtime/ultragoal-runtime";
 
@@ -127,14 +128,16 @@ async function main(): Promise<void> {
 		console.log(`fail_closed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 
-	// 5) Task binding validation shape
+	// 5) Task binding stamp + sibling fail-closed (pre-discovery authority)
 	console.log();
-	console.log("## 6) task repositoryBinding parse + match");
+	console.log("## 6) task binding stamp (omit declaration) + sibling reject");
+	const stamped = await resolveTaskRepositoryBinding(left, undefined);
+	console.log(`stamped_worktreeRoot=${stamped.worktreeRoot}`);
+	await assertCwdMatchesRepositoryBinding(left, stamped);
+	console.log("task_stamp_ok on LEFT");
 	const taskBinding = parseRepositoryBinding(plan.repositoryBinding);
-	await assertCwdMatchesRepositoryBinding(left, taskBinding);
-	console.log("task_binding_ok on LEFT");
 	try {
-		await assertCwdMatchesRepositoryBinding(right, taskBinding);
+		await resolveTaskRepositoryBinding(right, taskBinding);
 		console.error("FAIL: task binding should reject RIGHT");
 		process.exit(1);
 	} catch (error) {
@@ -160,6 +163,44 @@ async function main(): Promise<void> {
 		console.error("FAIL: ralplan state missing repository_binding");
 		process.exit(1);
 	}
+
+	// 7) Ralplan stage write on LEFT succeeds and echoes repository_binding
+	console.log();
+	console.log("## 9) gjc ralplan --write planner on LEFT (match)");
+	const notePath = path.join(left, "dogfood-planner.md");
+	await fsp.writeFile(notePath, "# dogfood planner\n");
+	const writeLeft = await runCli(
+		left,
+		["ralplan", "--write", "--stage", "planner", "--stage_n", "1", "--artifact", notePath, "--json"],
+		env,
+	);
+	console.log(`exit=${writeLeft.code}`);
+	console.log(writeLeft.stdout.trim() || writeLeft.stderr.trim());
+	if (writeLeft.code !== 0) process.exit(1);
+	const writePayload = JSON.parse(writeLeft.stdout) as { repository_binding?: { worktreeRoot?: string } };
+	if (!writePayload.repository_binding?.worktreeRoot) {
+		console.error("FAIL: write receipt missing repository_binding");
+		process.exit(1);
+	}
+
+	// 8) Copy seed authority into RIGHT session layout → stage write fails closed
+	console.log();
+	console.log("## 10) ralplan --write on RIGHT with LEFT binding (fail-closed)");
+	const rightStateDir = path.join(right, ".gjc", `_session-${sessionId}`, "state");
+	await fsp.mkdir(rightStateDir, { recursive: true });
+	await fsp.copyFile(statePath, path.join(rightStateDir, "ralplan-state.json"));
+	const writeRight = await runCli(
+		right,
+		["ralplan", "--write", "--stage", "architect", "--stage_n", "1", "--artifact", "# arch\n", "--json"],
+		env,
+	);
+	console.log(`exit=${writeRight.code}`);
+	console.log((writeRight.stderr || writeRight.stdout).trim());
+	if (writeRight.code === 0) {
+		console.error("FAIL: expected sibling write to fail closed");
+		process.exit(1);
+	}
+	console.log("fail_closed: ralplan write on sibling rejected");
 
 	console.log();
 	console.log("DOGFOOD_OK");

@@ -100,7 +100,9 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 			),
 		repositoryBinding: repositoryBindingSchema
 			.optional()
-			.describe("fail-closed repository identity; when set, must match the active worktree before spawn"),
+			.describe(
+				"authoritative repository identity; omitted items are stamped from session cwd before discovery/spawn and still fail closed on sibling drift",
+			),
 	});
 
 /** Single task item for parallel execution (default shape with context enabled). */
@@ -369,6 +371,19 @@ export interface SingleResult {
 	 * never changes the actual mode selection).
 	 */
 	forkContextAdvisory?: { recommendedMode: ForkContextMode; reasons: string[] };
+	/**
+	 * Resolved repository identity used for this task after pre-discovery stamping
+	 * and fail-closed validation (#2901).
+	 */
+	repositoryBinding?: {
+		schema: "gjc.repository_binding.v1";
+		worktreeRoot: string;
+		commonDir: string | null;
+		relativeSubdir?: string;
+		displayPath?: string;
+		head?: string;
+		branch?: string;
+	};
 }
 
 /** True only for complete, factual five-bucket cost accounting. */

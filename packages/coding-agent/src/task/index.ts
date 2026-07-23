@@ -44,9 +44,13 @@ import {
 // Import review tools for side effects (registers subagent tool handlers)
 import "../tools/review";
 import {
-	assertCwdMatchesRepositoryBinding,
-	parseRepositoryBinding,
+	assertExecutionRootMatchesRepositoryBinding,
+	assertPathUnderRepositoryBinding,
+	captureRepositoryBinding,
+	publicRepositoryBinding,
+	type RepositoryBinding,
 	RepositoryBindingError,
+	resolveTaskRepositoryBinding,
 } from "../gjc-runtime/repository-binding";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { generateCommitMessage } from "../utils/commit-message-generator";
@@ -133,20 +137,41 @@ function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
 	target.cost.total += cost.total;
 }
 
-async function validateTaskRepositoryBindings(cwd: string, tasks: readonly TaskItem[]): Promise<string | undefined> {
+/**
+ * Stamp/resolve repository authority for every task before agent discovery or spawn.
+ * Omitted bindings inherit the session worktree; declared ones must match it.
+ */
+async function resolveTaskItemsWithRepositoryBindings(
+	cwd: string,
+	tasks: readonly TaskItem[],
+): Promise<{ tasks: TaskItem[]; error?: string }> {
+	const resolved: TaskItem[] = [];
 	for (const task of tasks) {
-		if (!task.repositoryBinding) continue;
 		try {
-			const binding = parseRepositoryBinding(task.repositoryBinding);
-			await assertCwdMatchesRepositoryBinding(cwd, binding);
-		} catch (error) {
-			if (error instanceof RepositoryBindingError) {
-				return `Task "${task.id}" repository binding rejected: ${error.message}`;
+			const binding = await resolveTaskRepositoryBinding(cwd, task.repositoryBinding);
+			if (binding.relativeSubdir) {
+				assertPathUnderRepositoryBinding(binding, ".");
 			}
-			return `Task "${task.id}" repository binding rejected: ${error instanceof Error ? error.message : String(error)}`;
+			resolved.push({
+				...task,
+				repositoryBinding: binding,
+			});
+		} catch (error) {
+			const id = task.id?.trim() ? task.id : "(missing-id)";
+			if (error instanceof RepositoryBindingError) {
+				return { tasks: [], error: `Task "${id}" repository binding rejected: ${error.message}` };
+			}
+			return {
+				tasks: [],
+				error: `Task "${id}" repository binding rejected: ${error instanceof Error ? error.message : String(error)}`,
+			};
 		}
 	}
-	return undefined;
+	return { tasks: resolved };
+}
+
+function repositoryBindingFromTask(task: TaskItem): RepositoryBinding | undefined {
+	return task.repositoryBinding ? publicRepositoryBinding(task.repositoryBinding as RepositoryBinding) : undefined;
 }
 
 function validateTaskIdsForScheduling(tasks: readonly TaskItem[]): string | undefined {
@@ -420,12 +445,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			this.session.getSessionSpawns() ?? "*",
 		);
 	}
+	readonly #sessionRepositoryBinding: RepositoryBinding;
+
 	private constructor(
 		private readonly session: ToolSession,
 		discoveredAgents: AgentDefinition[],
+		sessionRepositoryBinding: RepositoryBinding,
 	) {
 		this.#blockedAgent = $pickenv("GJC_BLOCKED_AGENT", "PI_BLOCKED_AGENT");
 		this.#discoveredAgents = discoveredAgents;
+		this.#sessionRepositoryBinding = sessionRepositoryBinding;
 	}
 
 	#getTaskSimpleMode(): TaskSimpleMode {
@@ -433,11 +462,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	/**
-	 * Create a TaskTool instance with async agent discovery.
+	 * Create a TaskTool instance.
+	 * Repository authority is captured from session cwd *before* agent discovery so
+	 * multi-repo workspaces fail closed prior to context/discovery (#2901).
 	 */
 	static async create(session: ToolSession): Promise<TaskTool> {
+		const sessionRepositoryBinding = await captureRepositoryBinding(session.cwd, { displayPath: session.cwd });
+		// Authority check before discovery: session cwd must resolve to a stable binding.
+		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
 		const { agents } = await discoverAgents(session.cwd);
-		return new TaskTool(session, agents);
+		return new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
 	}
 
 	async execute(
@@ -453,17 +487,32 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return createTaskModeError(validationError);
 		}
 
-		const taskItems = params.tasks ?? [];
-		const taskIdValidationError = validateTaskIdsForScheduling(taskItems);
+		// Re-verify session authority before using any discovered agents or scheduling work.
+		try {
+			await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, this.#sessionRepositoryBinding);
+		} catch (error) {
+			const message =
+				error instanceof RepositoryBindingError
+					? error.message
+					: error instanceof Error
+						? error.message
+						: String(error);
+			return createTaskModeError(`Session repository binding rejected before task discovery: ${message}`);
+		}
+
+		const rawTaskItems = params.tasks ?? [];
+		const taskIdValidationError = validateTaskIdsForScheduling(rawTaskItems);
 		if (taskIdValidationError) {
 			return createTaskModeError(taskIdValidationError);
 		}
-		const repositoryBindingError = await validateTaskRepositoryBindings(this.session.cwd, taskItems);
-		if (repositoryBindingError) {
-			return createTaskModeError(repositoryBindingError);
+		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(this.session.cwd, rawTaskItems);
+		if (bindingResolution.error) {
+			return createTaskModeError(bindingResolution.error);
 		}
+		const taskItems = bindingResolution.tasks;
+		const paramsWithBindings: TaskParams = { ...params, tasks: taskItems };
 		if (taskItems.length === 0) {
-			return this.#executeSync(_toolCallId, params, signal, onUpdate);
+			return this.#executeSync(_toolCallId, paramsWithBindings, signal, onUpdate);
 		}
 		const agent = getAgent(this.#discoveredAgents, params.agent);
 		if (!agent) {
@@ -951,13 +1000,31 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		},
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
+		// Pre-discovery authority: session cwd must still match the capture from create().
+		try {
+			await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, this.#sessionRepositoryBinding);
+		} catch (error) {
+			const message =
+				error instanceof RepositoryBindingError
+					? error.message
+					: error instanceof Error
+						? error.message
+						: String(error);
+			return createTaskModeError(`Session repository binding rejected before task discovery: ${message}`);
+		}
+		const bindingResolution = await resolveTaskItemsWithRepositoryBindings(this.session.cwd, params.tasks ?? []);
+		if (bindingResolution.error) {
+			return createTaskModeError(bindingResolution.error);
+		}
+		const boundParams: TaskParams = { ...params, tasks: bindingResolution.tasks };
+
 		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
-		const { agent: agentName, context, schema: outputSchema } = params;
+		const { agent: agentName, context, schema: outputSchema } = boundParams;
 		const simpleMode = this.#getTaskSimpleMode();
 		const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
 		const sharedContext = contextEnabled ? context?.trim() : undefined;
 		const isolationMode = this.session.settings.get("task.isolation.mode");
-		const isolationRequested = "isolated" in params ? params.isolated === true : false;
+		const isolationRequested = "isolated" in boundParams ? boundParams.isolated === true : false;
 		const isIsolated = isolationMode !== "none" && isolationRequested;
 		const mergeMode = this.session.settings.get("task.isolation.merge");
 		const commitStyle = this.session.settings.get("task.isolation.commits");
@@ -965,7 +1032,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const taskDepth = this.session.taskDepth ?? 0;
 		const subagentLspEnabled = (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp");
 
-		if (isolationMode === "none" && "isolated" in params) {
+		if (isolationMode === "none" && "isolated" in boundParams) {
 			return {
 				content: [
 					{
@@ -1025,7 +1092,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const forkContextValidationError = validateForkContextRequests(
-			params.tasks ?? [],
+			boundParams.tasks ?? [],
 			agent,
 			this.session.settings.get("task.forkContext.enabled"),
 		);
@@ -1064,7 +1131,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			: (effectiveAgent.output ?? this.session.outputSchema);
 
 		// Handle empty or missing tasks
-		if (!params.tasks || params.tasks.length === 0) {
+		if (!boundParams.tasks || boundParams.tasks.length === 0) {
 			return {
 				content: [
 					{
@@ -1082,7 +1149,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 		}
 
-		const tasks = params.tasks;
+		const tasks = boundParams.tasks;
 		const missingTaskIndexes: number[] = [];
 		const idIndexes = new Map<string, number[]>();
 
@@ -1198,7 +1265,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const emitProgress = () => {
 			const progress = Array.from(progressMap.values()).sort((a, b) => a.index - b.index);
 			onUpdate?.({
-				content: [{ type: "text", text: `Running ${params.tasks.length} agents...` }],
+				content: [{ type: "text", text: `Running ${tasks.length} agents...` }],
 				details: {
 					projectAgentsDir,
 					results: [],
@@ -1367,7 +1434,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const taskSessionFile = managedPersistence
 					? null
 					: (overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null);
+				const taskRepositoryBinding = repositoryBindingFromTask(task) ?? this.#sessionRepositoryBinding;
+				// Declared paths (relativeSubdir) must stay under the bound root before spawn.
+				if (taskRepositoryBinding.relativeSubdir) {
+					assertPathUnderRepositoryBinding(taskRepositoryBinding, ".");
+				}
 				if (!isIsolated) {
+					await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, taskRepositoryBinding);
 					const result = await runSubprocess({
 						cwd: this.session.cwd,
 						agent: effectiveAgent,
@@ -1418,7 +1491,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						forkContextSeed,
 					});
-					return { ...result, ...(forkContext ? { forkContext } : {}), forkContextAdvisory };
+					return {
+						...result,
+						...(forkContext ? { forkContext } : {}),
+						forkContextAdvisory,
+						repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
+					};
 				}
 
 				const taskStart = Date.now();
@@ -1431,6 +1509,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 					isolationHandle = await ensureIsolation(repoRoot, task.id, preferredIsolationBackend);
 					const isolationDir = isolationHandle.mergedDir;
+					// Isolated worktrees must preserve the source repository identity (#2901).
+					await assertExecutionRootMatchesRepositoryBinding(isolationDir, taskRepositoryBinding);
 
 					const result = await runSubprocess({
 						cwd: this.session.cwd,
@@ -1487,6 +1567,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						...result,
 						...(forkContext ? { forkContext } : {}),
 						forkContextAdvisory,
+						repositoryBinding: publicRepositoryBinding(taskRepositoryBinding),
 					};
 					if (mergeMode === "branch" && resultWithForkContext.exitCode === 0) {
 						try {

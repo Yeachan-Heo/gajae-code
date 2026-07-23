@@ -48,6 +48,8 @@ export interface TaskResultReceipt {
 	extractedToolCounts?: Record<string, number>;
 	forkContext?: SingleResult["forkContext"];
 	forkContextAdvisory?: SingleResult["forkContextAdvisory"];
+	/** Resolved repository identity for this delegated lane (#2901). */
+	repositoryBinding?: SingleResult["repositoryBinding"];
 	roi?: TaskRoi;
 }
 
@@ -262,6 +264,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		extractedToolCounts,
 		forkContext: raw.forkContext,
 		forkContextAdvisory: raw.forkContextAdvisory,
+		repositoryBinding: raw.repositoryBinding,
 		roi: buildTaskRoi(raw),
 	};
 }

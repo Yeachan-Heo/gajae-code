@@ -5,6 +5,7 @@
  * from prose. Bindings carry a validated worktree root + git common-dir identity
  * so spawn/handoff can fail closed on mismatch.
  */
+import * as fssync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type GitRepository, head, repo } from "../utils/git";
@@ -46,6 +47,15 @@ export class RepositoryBindingError extends Error {
 async function realpathOrResolve(target: string): Promise<string> {
 	try {
 		return await fs.realpath(target);
+	} catch {
+		return path.resolve(target);
+	}
+}
+
+/** Sync realpath for path-under-root checks (handles macOS /var → /private/var). */
+function realpathSyncOrResolve(target: string): string {
+	try {
+		return fssync.realpathSync(target);
 	} catch {
 		return path.resolve(target);
 	}
@@ -175,9 +185,11 @@ export async function assertCwdMatchesRepositoryBinding(
 
 /** Ensure a declared target path resolves under the bound worktree root. */
 export function assertPathUnderRepositoryBinding(binding: RepositoryBinding, targetPath: string): string {
-	const root = path.resolve(binding.worktreeRoot);
-	const base = binding.relativeSubdir ? path.resolve(root, binding.relativeSubdir) : root;
-	const resolved = path.isAbsolute(targetPath) ? path.resolve(targetPath) : path.resolve(base, targetPath);
+	const root = realpathSyncOrResolve(binding.worktreeRoot);
+	const base = binding.relativeSubdir ? realpathSyncOrResolve(path.resolve(root, binding.relativeSubdir)) : root;
+	const candidate = path.isAbsolute(targetPath) ? path.resolve(targetPath) : path.resolve(base, targetPath);
+	// Prefer realpath when the path exists so macOS /var ↔ /private/var aliases match.
+	const resolved = realpathSyncOrResolve(candidate);
 	const relative = path.relative(root, resolved);
 	if (relative.startsWith("..") || path.isAbsolute(relative)) {
 		throw new RepositoryBindingError(
@@ -186,6 +198,56 @@ export function assertPathUnderRepositoryBinding(binding: RepositoryBinding, tar
 		);
 	}
 	return resolved;
+}
+
+/**
+ * Public identity snapshot for receipts/handoffs (no display-only fields required).
+ * Always includes the schema + durable roots so downstream lanes can re-verify.
+ */
+export function publicRepositoryBinding(binding: RepositoryBinding): RepositoryBinding {
+	return {
+		schema: REPOSITORY_BINDING_SCHEMA,
+		worktreeRoot: path.resolve(binding.worktreeRoot),
+		commonDir: binding.commonDir === null ? null : path.resolve(binding.commonDir),
+		...(binding.relativeSubdir ? { relativeSubdir: binding.relativeSubdir } : {}),
+		...(binding.displayPath ? { displayPath: binding.displayPath } : {}),
+		...(binding.head ? { head: binding.head } : {}),
+		...(binding.branch ? { branch: binding.branch } : {}),
+	};
+}
+
+/**
+ * Resolve the authoritative binding for a delegated task before discovery/spawn.
+ *
+ * - Missing declaration → stamp from session cwd (never leave authority implicit).
+ * - Declared binding → parse + fail closed unless it matches the active session worktree.
+ * - relativeSubdir (when present) must resolve under the bound root.
+ */
+export async function resolveTaskRepositoryBinding(
+	sessionCwd: string,
+	declared: unknown | undefined,
+): Promise<RepositoryBinding> {
+	const sessionBinding = await captureRepositoryBinding(sessionCwd, { displayPath: sessionCwd });
+	if (declared === undefined || declared === null) {
+		return publicRepositoryBinding(sessionBinding);
+	}
+	const taskBinding = parseRepositoryBinding(declared);
+	await assertCwdMatchesRepositoryBinding(sessionCwd, taskBinding);
+	if (taskBinding.relativeSubdir) {
+		assertPathUnderRepositoryBinding(taskBinding, ".");
+	}
+	return publicRepositoryBinding(taskBinding);
+}
+
+/**
+ * Ensure an execution/isolation root (cwd or worktree) still matches the bound identity.
+ * Used after isolation workspace creation so linked worktrees keep the source repository.
+ */
+export async function assertExecutionRootMatchesRepositoryBinding(
+	executionRoot: string,
+	binding: RepositoryBinding,
+): Promise<RepositoryBinding> {
+	return await assertCwdMatchesRepositoryBinding(executionRoot, binding);
 }
 
 /** Optional helper for tests and diagnostics. */
