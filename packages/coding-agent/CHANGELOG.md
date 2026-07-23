@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Parallel workers can no longer clobber existing regular files through whole-file `write` or `apply_patch` create operations. New-file creation uses atomic create-only semantics, and team tasks can declare exact `write_paths` so overlapping active claims are rejected and built-in mutations stay inside the claimed scope.
 - Runtime MCP OAuth credentials are now bound to their authorized server origin and token endpoint, reject redirecting refresh responses, and fail closed when legacy or changed configuration lacks an exact match.
 - `/share` now keeps full-session HTML in owner-private unpredictable staging until the share handler or `gh gist create` process has fully stopped; cancelling a blocked gist upload terminates and awaits that process before reporting cancellation and removing the export.
 - Telegram notification daemon self-heals degraded on-disk state: permanently missing scan roots are pruned (so one deleted worktree no longer disables orphan-topic cleanup), and retained exact-unlink transition/placeholder artifacts are reaped on ownership acquire and each scan. `gjc daemon reload` can recover without manual filesystem surgery (#2956).

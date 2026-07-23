@@ -3,6 +3,7 @@ import { isEnoent } from "@gajae-code/utils";
 import { generateDiffString } from "../edit/diff";
 import { getFileReadCache } from "../edit/file-read-cache";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "../edit/normalize";
+import { withEditPathMutation } from "../edit/path-mutation-lock";
 import { readEditFileText, serializeEditFileText } from "../edit/read-file";
 import type { EditToolDetails } from "../edit/renderer";
 import type { ToolSession } from "../tools";
@@ -10,6 +11,7 @@ import { assertEditableFileContent } from "../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import { outputMeta } from "../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../tools/plan-mode-guard";
+import { enforceTeamWriteScope } from "../tools/team-write-scope";
 import { HashlineMismatchError } from "./anchors";
 import { applyHashlineEdits, type HashlineApplyResult } from "./apply";
 import { buildCompactHashlineDiffPreview } from "./diff-preview";
@@ -108,6 +110,7 @@ async function preflightHashlineSection(options: ExecuteHashlineSingleOptions & 
 	const absolutePath = resolvePlanPath(session, sectionPath);
 	const { edits } = parseHashlineWithWarnings(diff);
 	enforcePlanModeWrite(session, sectionPath, { op: "update" });
+	await enforceTeamWriteScope(session, absolutePath);
 
 	const source = await readHashlineFile(absolutePath, sectionPath);
 	if (!source.exists && hasAnchorScopedEdit(edits)) throw new Error(`File not found: ${sectionPath}`);
@@ -141,6 +144,7 @@ async function executeHashlineSection(
 	const absolutePath = resolvePlanPath(session, sourcePath);
 	const { edits, warnings: parseWarnings } = parseHashlineWithWarnings(diff);
 	enforcePlanModeWrite(session, sourcePath, { op: "update" });
+	await enforceTeamWriteScope(session, absolutePath);
 
 	const source = await readHashlineFile(absolutePath, sourcePath);
 	if (!source.exists && hasAnchorScopedEdit(edits)) throw new Error(`File not found: ${sourcePath}`);
@@ -219,14 +223,22 @@ export async function executeHashlineSingle(
 	);
 
 	// Fast path: a single section needs no preflight pass.
-	if (sections.length === 1) return executeHashlineSection({ ...options, ...sections[0] });
+	if (sections.length === 1) {
+		const section = sections[0];
+		const absolutePath = resolvePlanPath(options.session, section.path);
+		return withEditPathMutation([absolutePath], () => executeHashlineSection({ ...options, ...section }));
+	}
 
 	// Multi-section: validate everything up front so we don't apply a partial batch.
 	for (const section of sections) await preflightHashlineSection({ ...options, ...section });
 
 	const results = [];
 	for (const section of sections) {
-		results.push({ path: section.path, result: await executeHashlineSection({ ...options, ...section }) });
+		const absolutePath = resolvePlanPath(options.session, section.path);
+		const result = await withEditPathMutation([absolutePath], () =>
+			executeHashlineSection({ ...options, ...section }),
+		);
+		results.push({ path: section.path, result });
 	}
 
 	return {

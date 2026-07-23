@@ -8,7 +8,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
-import { isEnoent } from "@gajae-code/utils";
+import { isEnoent, isRecord } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import {
 	type FileDiagnosticsResult,
@@ -26,6 +26,7 @@ import {
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd } from "../../tools/path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
+import { enforceTeamWriteScope } from "../../tools/team-write-scope";
 import { ToolError } from "../../tools/tool-errors";
 import {
 	ApplyPatchError,
@@ -70,6 +71,7 @@ export interface FileSystem {
 	exists(path: string): Promise<boolean>;
 	read(path: string): Promise<string>;
 	readBinary?: (path: string) => Promise<Uint8Array>;
+	create?: (path: string, content: string) => Promise<void>;
 	write(path: string, content: string): Promise<void>;
 	delete(path: string): Promise<void>;
 	mkdir(path: string): Promise<void>;
@@ -119,6 +121,14 @@ export const defaultFileSystem: FileSystem = {
 	},
 	async readBinary(path: string): Promise<Uint8Array> {
 		return fs.promises.readFile(path);
+	},
+	async create(path: string, content: string): Promise<void> {
+		const file = await fs.promises.open(path, "wx");
+		try {
+			await file.writeFile(await serializeEditFileText(path, path, content));
+		} finally {
+			await file.close();
+		}
 	},
 	async write(path: string, content: string): Promise<void> {
 		await Bun.write(path, await serializeEditFileText(path, path, content));
@@ -1469,6 +1479,9 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		if (!input.diff) {
 			throw new ApplyPatchError("Create operation requires diff (file content)");
 		}
+		if (await fs.exists(absolutePath)) {
+			throw new ApplyPatchError(`File already exists: ${input.path}. Use an update operation instead.`);
+		}
 		// Strip + prefixes if present (handles diffs formatted as additions)
 		const normalizedContent = normalizeCreateContent(input.diff);
 		const content = normalizedContent.endsWith("\n") ? normalizedContent : `${normalizedContent}\n`;
@@ -1478,7 +1491,14 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 			if (parentDir && parentDir !== ".") {
 				await fs.mkdir(parentDir);
 			}
-			await fs.write(absolutePath, content);
+			try {
+				await (fs.create ? fs.create(absolutePath, content) : fs.write(absolutePath, content));
+			} catch (error) {
+				if (isRecord(error) && error.code === "EEXIST") {
+					throw new ApplyPatchError(`File already exists: ${input.path}. Use an update operation instead.`);
+				}
+				throw error;
+			}
 		}
 
 		return {
@@ -1672,6 +1692,16 @@ class LspFileSystem implements FileSystem {
 		return bytes;
 	}
 
+	async create(path: string, content: string): Promise<void> {
+		const finalContent = await serializeEditFileText(path, path, content);
+		const file = await fs.promises.open(path, "wx");
+		try {
+			await file.writeFile(finalContent);
+		} finally {
+			await file.close();
+		}
+	}
+
 	async write(path: string, content: string): Promise<void> {
 		const file = this.#getFile(path);
 		const finalContent = await serializeEditFileText(path, path, content);
@@ -1744,6 +1774,8 @@ export async function executePatchSingle(
 	enforcePlanModeWrite(session, path, { op, move: rename });
 	const resolvedPath = resolvePlanPath(session, path);
 	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
+	await enforceTeamWriteScope(session, resolvedPath);
+	if (resolvedRename) await enforceTeamWriteScope(session, resolvedRename);
 
 	await assertEditableFile(resolvedPath, path);
 

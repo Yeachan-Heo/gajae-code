@@ -105,6 +105,7 @@ export interface GjcTeamTask {
 	lane?: string;
 	required_role?: string;
 	allowed_roles?: string[];
+	write_paths?: string[];
 	version: number;
 	claim?: GjcTeamTaskClaim;
 	created_at: string;
@@ -112,7 +113,7 @@ export interface GjcTeamTask {
 	completed_at?: string;
 }
 export type GjcTeamTaskMetadataInput = Partial<
-	Pick<GjcTeamTask, "owner" | "lane" | "required_role" | "allowed_roles" | "depends_on" | "blocked_by">
+	Pick<GjcTeamTask, "owner" | "lane" | "required_role" | "allowed_roles" | "depends_on" | "blocked_by" | "write_paths">
 >;
 export interface GjcTeamTaskWorker {
 	id: string;
@@ -154,6 +155,7 @@ const canonicalTaskKeys = new Set([
 	"lane",
 	"required_role",
 	"allowed_roles",
+	"write_paths",
 	"version",
 	"claim",
 	"created_at",
@@ -170,6 +172,45 @@ const isSafePersistedId = (value: unknown): value is string =>
 	isNonEmptyString(value) && /^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(value) && !value.includes("..");
 const isFiniteTimestamp = (value: unknown): value is string =>
 	typeof value === "string" && Number.isFinite(Date.parse(value));
+const WRITE_PATH_GLOB_PATTERN = /[*?[\]{}]/u;
+
+export function normalizeGjcTeamWritePaths(value: unknown): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error("invalid_write_paths");
+	const normalized = value.map(entry => {
+		if (typeof entry !== "string") throw new Error("invalid_write_path");
+		const candidate = entry.trim().replace(/\\/g, "/").normalize("NFC");
+		const segments = candidate.split("/");
+		if (
+			candidate.length === 0 ||
+			candidate.endsWith("/") ||
+			path.posix.isAbsolute(candidate) ||
+			/^[A-Za-z]:\//u.test(candidate) ||
+			segments.includes(".") ||
+			segments.includes("..") ||
+			WRITE_PATH_GLOB_PATTERN.test(candidate)
+		) {
+			throw new Error(`invalid_write_path:${candidate}`);
+		}
+		return path.posix.normalize(candidate);
+	});
+	const unique = [...new Set(normalized)].sort();
+	return unique.length > 0 ? unique : undefined;
+}
+
+function isCanonicalWritePaths(value: unknown): value is string[] {
+	if (!Array.isArray(value) || value.length === 0) return false;
+	try {
+		const normalized = normalizeGjcTeamWritePaths(value);
+		return (
+			normalized !== undefined &&
+			normalized.length === value.length &&
+			normalized.every((entry, index) => entry === value[index])
+		);
+	} catch {
+		return false;
+	}
+}
 
 /** The sole strict schema gate for persisted task and claim authority records. */
 export function isCanonicalPersistedGjcTeamTaskClaim(value: unknown): value is GjcTeamTaskClaim {
@@ -231,6 +272,7 @@ export function isCanonicalPersistedGjcTeamTask(value: unknown, fileId?: string)
 		(!Array.isArray(value.allowed_roles) || !value.allowed_roles.every(isNonEmptyString))
 	)
 		return false;
+	if (value.write_paths !== undefined && !isCanonicalWritePaths(value.write_paths)) return false;
 	if (
 		value.depends_on !== undefined &&
 		(!Array.isArray(value.depends_on) || !value.depends_on.every(isSafePersistedId))
@@ -322,6 +364,9 @@ export function taskMetadataFromInput(input: Record<string, unknown>, includeOwn
 		["blocked_by", optionalStringArray(input.blocked_by ?? input.blockedBy)],
 	] as const)
 		if (value) Object.assign(result, { [key]: value });
+	if (Object.hasOwn(input, "write_paths") || Object.hasOwn(input, "writePaths")) {
+		result.write_paths = normalizeGjcTeamWritePaths(input.write_paths ?? input.writePaths) ?? [];
+	}
 	return result;
 }
 export function normalizeGjcTeamTask(raw: GjcTeamTask): GjcTeamTask {
@@ -336,6 +381,7 @@ export function normalizeGjcTeamTask(raw: GjcTeamTask): GjcTeamTask {
 		lane: optionalString(raw.lane),
 		required_role: optionalString(raw.required_role),
 		allowed_roles: optionalStringArray(raw.allowed_roles),
+		write_paths: normalizeGjcTeamWritePaths(raw.write_paths),
 	};
 }
 function evidenceError(id: string, field: string) {
@@ -467,6 +513,30 @@ export async function readGjcTeamTasksFromDir(dir: string): Promise<GjcTeamTask[
 		throw error;
 	}
 }
+export async function readCanonicalGjcTeamTasksFromDir(dir: string): Promise<GjcTeamTask[]> {
+	try {
+		const entries = await fs.readdir(path.join(dir, "tasks"), {
+			withFileTypes: true,
+		});
+		const records = await Promise.all(
+			entries
+				.filter(entry => entry.isFile() && entry.name.endsWith(".json") && !entry.name.endsWith(".evidence.json"))
+				.map(async entry => ({
+					fileId: path.basename(entry.name, ".json"),
+					record: await readJson<unknown>(path.join(dir, "tasks", entry.name)),
+				})),
+		);
+		return records
+			.filter((entry): entry is { fileId: string; record: GjcTeamTask } =>
+				isCanonicalPersistedGjcTeamTask(entry.record, entry.fileId),
+			)
+			.map(({ record }) => normalizeGjcTeamTask(record))
+			.sort((a, b) => a.id.localeCompare(b.id));
+	} catch (error) {
+		if (isEnoent(error)) return [];
+		throw error;
+	}
+}
 async function writeGjcTeamTaskToDir(dir: string, task: GjcTeamTask): Promise<void> {
 	await writeJson(taskPath(dir, task.id), normalizeGjcTeamTask(task));
 }
@@ -484,6 +554,46 @@ function eligibility(task: GjcTeamTask, worker: GjcTeamTaskWorker, tasks: GjcTea
 	for (const dependency of task.depends_on ?? [])
 		if (!tasks.find(candidate => candidate.id === dependency && isGjcTeamTaskCompletionVerified(candidate)))
 			return `task_dependency_incomplete:${task.id}:${dependency}`;
+	return null;
+}
+
+function writePathKey(writePath: string): string {
+	return process.platform === "darwin" || process.platform === "win32"
+		? writePath.toLocaleLowerCase("en-US")
+		: writePath;
+}
+
+async function findActiveWriteScopeConflict(
+	dir: string,
+	task: GjcTeamTask,
+	tasks: GjcTeamTask[],
+): Promise<string | null> {
+	const writePaths = new Map((task.write_paths ?? []).map(writePath => [writePathKey(writePath), writePath]));
+	if (writePaths.size === 0) return null;
+	for (const candidate of tasks) {
+		if (candidate.id === task.id || !/^[A-Za-z0-9._-]+$/u.test(candidate.id)) continue;
+		const persistedCandidate = await readJson<unknown>(taskPath(dir, candidate.id));
+		if (!isCanonicalPersistedGjcTeamTask(persistedCandidate) || persistedCandidate.status !== "in_progress") continue;
+		const claim = claimRecord(await readJson<unknown>(claimPath(dir, candidate.id)));
+		if (
+			!claim ||
+			!persistedCandidate.claim ||
+			!isCanonicalPersistedGjcTeamTaskClaim(claim) ||
+			!isCanonicalPersistedGjcTeamTaskClaim(persistedCandidate.claim) ||
+			persistedCandidate.owner !== claim.owner ||
+			persistedCandidate.assignee !== claim.owner ||
+			persistedCandidate.claim.owner !== claim.owner ||
+			persistedCandidate.claim.token !== claim.token ||
+			persistedCandidate.claim.leased_until !== claim.leased_until ||
+			expired(claim.leased_until)
+		) {
+			continue;
+		}
+		const conflict = persistedCandidate.write_paths?.find(writePath => writePaths.has(writePathKey(writePath)));
+		if (conflict) {
+			return `write_scope_conflict:${task.id}:${candidate.id}:${writePaths.get(writePathKey(conflict)) ?? conflict}`;
+		}
+	}
 	return null;
 }
 function claimRecord(value: unknown): GjcTeamTaskClaim | undefined {
@@ -520,7 +630,14 @@ export interface GjcTeamTaskMutationCapability {
 		updates: Partial<
 			Pick<
 				GjcTeamTask,
-				"subject" | "description" | "blocked_by" | "depends_on" | "lane" | "required_role" | "allowed_roles"
+				| "subject"
+				| "description"
+				| "blocked_by"
+				| "depends_on"
+				| "lane"
+				| "required_role"
+				| "allowed_roles"
+				| "write_paths"
 			>
 		>,
 	): Promise<GjcTeamTask>;
@@ -637,7 +754,14 @@ export class GjcTeamTaskStore {
 		updates: Partial<
 			Pick<
 				GjcTeamTask,
-				"subject" | "description" | "blocked_by" | "depends_on" | "lane" | "required_role" | "allowed_roles"
+				| "subject"
+				| "description"
+				| "blocked_by"
+				| "depends_on"
+				| "lane"
+				| "required_role"
+				| "allowed_roles"
+				| "write_paths"
 			>
 		>,
 	) {
@@ -648,11 +772,21 @@ export class GjcTeamTaskStore {
 		updates: Partial<
 			Pick<
 				GjcTeamTask,
-				"subject" | "description" | "blocked_by" | "depends_on" | "lane" | "required_role" | "allowed_roles"
+				| "subject"
+				| "description"
+				| "blocked_by"
+				| "depends_on"
+				| "lane"
+				| "required_role"
+				| "allowed_roles"
+				| "write_paths"
 			>
 		>,
 	) {
 		const task = await this.read(id);
+		if (task.status === "in_progress" && updates.write_paths?.length === 0) {
+			throw new Error(`active_write_scope_clear_forbidden:${id}`);
+		}
 		const updated = normalizeGjcTeamTask({
 			...task,
 			...updates,
@@ -661,6 +795,10 @@ export class GjcTeamTaskStore {
 			version: task.version + 1,
 			updated_at: now(),
 		});
+		if (updated.status === "in_progress") {
+			const conflict = await findActiveWriteScopeConflict(this.dir, updated, await this.list());
+			if (conflict) throw new Error(conflict);
+		}
 		await writeGjcTeamTaskToDir(this.dir, updated);
 		await this.appendEvent({
 			type: "task_updated",
@@ -674,16 +812,29 @@ export class GjcTeamTaskStore {
 	}
 	async #claimUnlocked(worker: GjcTeamTaskWorker, id?: string): Promise<GjcTeamApiClaimResult> {
 		const tasks = await this.list();
-		const task = id
-			? tasks.find(candidate => candidate.id === id)
-			: tasks.find(candidate => eligibility(candidate, worker, tasks) === null);
+		let task = id ? tasks.find(candidate => candidate.id === id) : undefined;
+		let selectionConflict: string | null = null;
+		if (!id) {
+			for (const candidate of tasks) {
+				if (eligibility(candidate, worker, tasks)) continue;
+				const conflict = await findActiveWriteScopeConflict(this.dir, candidate, tasks);
+				if (conflict) {
+					selectionConflict ??= conflict;
+					continue;
+				}
+				task = candidate;
+				break;
+			}
+		}
 		if (!task)
 			return {
 				ok: false,
-				reason: id ? `task_not_found:${id}` : "no_pending_task",
+				reason: id ? `task_not_found:${id}` : (selectionConflict ?? "no_pending_task"),
 			};
 		const reason = eligibility(task, worker, tasks);
 		if (reason) return { ok: false, reason };
+		const conflict = await findActiveWriteScopeConflict(this.dir, task, tasks);
+		if (conflict) return { ok: false, reason: conflict };
 		const existing = task.claim ?? claimRecord(await readJson<unknown>(claimPath(this.dir, task.id)));
 		if (existing && !expired(existing.leased_until)) return { ok: false, reason: `task_already_claimed:${task.id}` };
 		const claim: GjcTeamTaskClaim = {
@@ -703,15 +854,17 @@ export class GjcTeamTaskStore {
 			throw error;
 		}
 		const current = await this.read(task.id);
-		const currentReason = eligibility(current, worker, await this.list());
-		if (currentReason || current.status !== "pending") {
+		const currentTasks = await this.list();
+		const currentReason = eligibility(current, worker, currentTasks);
+		const currentConflict = await findActiveWriteScopeConflict(this.dir, current, currentTasks);
+		if (currentReason || currentConflict || current.status !== "pending") {
 			await deleteIfOwned(claimPath(this.dir, task.id), {
 				...writerOptions(claimPath(this.dir, task.id), "prune", "rollback"),
 				predicate: current => (current as GjcTeamTaskClaim).token === claim.token,
 			});
 			return {
 				ok: false,
-				reason: currentReason ?? `task_not_pending:${task.id}`,
+				reason: currentReason ?? currentConflict ?? `task_not_pending:${task.id}`,
 			};
 		}
 		const updated = {

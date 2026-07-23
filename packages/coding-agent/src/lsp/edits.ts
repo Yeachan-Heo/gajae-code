@@ -1,6 +1,8 @@
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { withEditPathMutation } from "../edit/path-mutation-lock";
 import { formatPathRelativeToCwd } from "../tools/path-utils";
+import { enforceTeamWriteScope } from "../tools/team-write-scope";
 import { ToolError } from "../tools/tool-errors";
 import type {
 	CreateFile,
@@ -110,10 +112,13 @@ export function flattenWorkspaceTextEdits(edit: WorkspaceEdit): Map<string, Text
  * Apply text edits to a file.
  * Edits are applied in reverse order (bottom-to-top) to preserve line/character indices.
  */
-export async function applyTextEdits(filePath: string, edits: TextEdit[]): Promise<void> {
-	const content = await Bun.file(filePath).text();
-	const result = applyTextEditsToString(content, edits);
-	await Bun.write(filePath, result);
+export async function applyTextEdits(filePath: string, edits: TextEdit[], cwd: string): Promise<void> {
+	await enforceTeamWriteScope({ cwd }, filePath);
+	await withEditPathMutation([filePath], async () => {
+		const content = await Bun.file(filePath).text();
+		const result = applyTextEditsToString(content, edits);
+		await Bun.write(filePath, result);
+	});
 }
 
 // =============================================================================
@@ -133,7 +138,7 @@ export async function applyWorkspaceEdit(edit: WorkspaceEdit, cwd: string): Prom
 	const textEditsByUri = flattenWorkspaceTextEdits(edit);
 	for (const [uri, textEdits] of textEditsByUri) {
 		const filePath = uriToFile(uri);
-		await applyTextEdits(filePath, textEdits);
+		await applyTextEdits(filePath, textEdits, cwd);
 		applied.push(`Applied ${textEdits.length} edit(s) to ${formatPathRelativeToCwd(filePath, cwd)}`);
 	}
 
@@ -144,19 +149,29 @@ export async function applyWorkspaceEdit(edit: WorkspaceEdit, cwd: string): Prom
 			if (change.kind === "create") {
 				const createOp = change as CreateFile;
 				const filePath = uriToFile(createOp.uri);
-				await Bun.write(filePath, "");
+				await enforceTeamWriteScope({ cwd }, filePath);
+				await withEditPathMutation([filePath], async () => {
+					await fs.mkdir(path.dirname(filePath), { recursive: true });
+					const file = await fs.open(filePath, "wx");
+					await file.close();
+				});
 				applied.push(`Created ${formatPathRelativeToCwd(filePath, cwd)}`);
 			} else if (change.kind === "rename") {
 				const renameOp = change as RenameFile;
 				const oldPath = uriToFile(renameOp.oldUri);
 				const newPath = uriToFile(renameOp.newUri);
-				await fs.mkdir(path.dirname(newPath), { recursive: true });
-				await fs.rename(oldPath, newPath);
+				await enforceTeamWriteScope({ cwd }, oldPath);
+				await enforceTeamWriteScope({ cwd }, newPath);
+				await withEditPathMutation([oldPath, newPath], async () => {
+					await fs.mkdir(path.dirname(newPath), { recursive: true });
+					await fs.rename(oldPath, newPath);
+				});
 				applied.push(`Renamed ${formatPathRelativeToCwd(oldPath, cwd)} → ${formatPathRelativeToCwd(newPath, cwd)}`);
 			} else if (change.kind === "delete") {
 				const deleteOp = change as DeleteFile;
 				const filePath = uriToFile(deleteOp.uri);
-				await fs.rm(filePath, { recursive: true });
+				await enforceTeamWriteScope({ cwd }, filePath);
+				await withEditPathMutation([filePath], () => fs.rm(filePath, { recursive: true }));
 				applied.push(`Deleted ${formatPathRelativeToCwd(filePath, cwd)}`);
 			}
 		}

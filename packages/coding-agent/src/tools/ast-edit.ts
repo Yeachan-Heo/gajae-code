@@ -5,6 +5,7 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { $pickenvpos, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { withEditPathMutation } from "../edit/path-mutation-lock";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { computeLineHash, HL_BODY_SEP } from "../hashline/hash";
 import type { Theme } from "../modes/theme/theme";
@@ -31,6 +32,7 @@ import {
 	splitGroupsByBlankLine,
 } from "./render-utils";
 import { queueResolveHandler } from "./resolve";
+import { enforceTeamWriteScope } from "./team-write-scope";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -334,12 +336,20 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							sessionId: this.session.getSessionId?.() ?? undefined,
 							rawPaths: previewedFiles,
 						});
-						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-							rewrites: normalizedRewrites,
-							dryRun: false,
-							maxFiles,
-							failOnParseError: false,
-						});
+						const mutationPaths = previewedFiles.map(previewedFile =>
+							path.resolve(this.session.cwd, previewedFile),
+						);
+						for (const mutationPath of mutationPaths) {
+							await enforceTeamWriteScope(this.session, mutationPath);
+						}
+						const applyResult = await withEditPathMutation(mutationPaths, () =>
+							runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+								rewrites: normalizedRewrites,
+								dryRun: false,
+								maxFiles,
+								failOnParseError: false,
+							}),
+						);
 						const { errors: cappedApplyParseErrors, total: applyParseErrorsTotal } = capParseErrors(
 							applyResult.parseErrors,
 						);

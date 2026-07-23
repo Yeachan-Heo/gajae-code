@@ -47,6 +47,7 @@ import {
 	isCanonicalPersistedGjcTeamTask,
 	isCanonicalPersistedGjcTeamTaskClaim,
 	isGjcTeamTaskCompletionVerified,
+	normalizeGjcTeamWritePaths,
 	readGjcTeamTasksFromDir as readTasks,
 	taskMetadataFromInput,
 	withGjcTeamMutationFence,
@@ -1783,10 +1784,26 @@ interface GjcTeamInitialLane {
 	label: string;
 	title: string;
 	body: string;
+	writePaths?: string[];
 }
 
 function normalizeLaneId(label: string): string {
 	return `lane-${sanitizeName(label).toLowerCase() || stableHash(label).slice(0, 8)}`;
+}
+
+function finalizeInitialLane(current: { label: string; title: string; body: string[] }): GjcTeamInitialLane {
+	const body = current.body.join("\n").trim();
+	const declaredPaths = current.body.flatMap(line => {
+		const match = line.match(/^\s*Write paths?\s*:\s*(.+)\s*$/i);
+		return match?.[1]
+			? match[1]
+					.split(",")
+					.map(entry => entry.trim().replace(/^`|`$/g, ""))
+					.filter(Boolean)
+			: [];
+	});
+	const writePaths = normalizeGjcTeamWritePaths(declaredPaths);
+	return { label: current.label, title: current.title, body, writePaths };
 }
 
 function parseExplicitTeamLanes(task: string): GjcTeamInitialLane[] {
@@ -1799,7 +1816,7 @@ function parseExplicitTeamLanes(task: string): GjcTeamInitialLane[] {
 	for (const line of lines) {
 		const match = line.match(laneHeading);
 		if (match) {
-			if (current) lanes.push({ ...current, body: current.body.join("\n").trim() });
+			if (current) lanes.push(finalizeInitialLane(current));
 			current = {
 				label: match[1] ?? `${lanes.length + 1}`,
 				title: (match[2] ?? `Lane ${match[1] ?? lanes.length + 1}`).trim(),
@@ -1808,13 +1825,13 @@ function parseExplicitTeamLanes(task: string): GjcTeamInitialLane[] {
 			continue;
 		}
 		if (current && boundaryHeading.test(line)) {
-			lanes.push({ ...current, body: current.body.join("\n").trim() });
+			lanes.push(finalizeInitialLane(current));
 			current = null;
 			continue;
 		}
 		if (current) current.body.push(line);
 	}
-	if (current) lanes.push({ ...current, body: current.body.join("\n").trim() });
+	if (current) lanes.push(finalizeInitialLane(current));
 	return lanes.filter(lane => lane.body.length > 0 || lane.title.length > 0);
 }
 
@@ -1842,6 +1859,7 @@ function buildInitialTasks(task: string, workers: GjcTeamWorker[]): GjcTeamTask[
 				owner: worker.id,
 				lane: normalizeLaneId(lane.label),
 				required_role: worker.role,
+				write_paths: lane.writePaths,
 				version: 1,
 				created_at: now(),
 				updated_at: now(),
@@ -3566,7 +3584,14 @@ export async function updateGjcTeamTask(
 	updates: Partial<
 		Pick<
 			GjcTeamTask,
-			"subject" | "description" | "blocked_by" | "depends_on" | "lane" | "required_role" | "allowed_roles"
+			| "subject"
+			| "description"
+			| "blocked_by"
+			| "depends_on"
+			| "lane"
+			| "required_role"
+			| "allowed_roles"
+			| "write_paths"
 		>
 	>,
 	cwd = process.cwd(),

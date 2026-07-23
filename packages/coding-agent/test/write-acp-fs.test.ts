@@ -33,15 +33,15 @@ describe("write tool ACP fs routing", () => {
 		await fs.rm(tmpDir, { recursive: true, force: true });
 	});
 
-	it("routes plain text writes through the bridge and does not call Bun.write", async () => {
+	it("routes plain text writes through an atomic create-only bridge", async () => {
 		const filePath = path.join(tmpDir, "output.txt");
 
 		const bridge: ClientBridge = {
-			capabilities: { writeTextFile: true },
-			writeTextFile: async () => undefined,
+			capabilities: { createTextFile: true },
+			createTextFile: async () => undefined,
 		};
 
-		const bridgeSpy = spyOn(bridge, "writeTextFile");
+		const bridgeSpy = spyOn(bridge, "createTextFile");
 		const bunWriteSpy = spyOn(Bun, "write");
 
 		try {
@@ -58,5 +58,38 @@ describe("write tool ACP fs routing", () => {
 		} finally {
 			bunWriteSpy.mockRestore();
 		}
+	});
+
+	it("maps a client-side create conflict without touching local disk", async () => {
+		const filePath = path.join(tmpDir, "existing.txt");
+		const bridge: ClientBridge = {
+			capabilities: { createTextFile: true },
+			createTextFile: async () => {
+				throw Object.assign(new Error("already exists"), { code: "EEXIST" });
+			},
+		};
+		const bridgeSpy = spyOn(bridge, "createTextFile");
+
+		const tool = new WriteTool(createSession(tmpDir, bridge));
+		await expect(tool.execute("call-existing", { path: filePath, content: FILE_CONTENT })).rejects.toThrow(
+			/already exists/i,
+		);
+		expect(bridgeSpy).toHaveBeenCalledTimes(1);
+		expect(await Bun.file(filePath).exists()).toBe(false);
+	});
+
+	it("fails closed when the client cannot prove the path is absent", async () => {
+		const filePath = path.join(tmpDir, "unknown.txt");
+		const bridge: ClientBridge = {
+			capabilities: { writeTextFile: true },
+			writeTextFile: async () => undefined,
+		};
+		const bridgeSpy = spyOn(bridge, "writeTextFile");
+
+		const tool = new WriteTool(createSession(tmpDir, bridge));
+		await expect(tool.execute("call-unknown", { path: filePath, content: FILE_CONTENT })).rejects.toThrow(
+			/cannot guarantee atomic create-only writes/i,
+		);
+		expect(bridgeSpy).not.toHaveBeenCalled();
 	});
 });
