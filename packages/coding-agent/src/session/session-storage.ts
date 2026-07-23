@@ -713,7 +713,7 @@ export class FileSessionStorage implements SessionStorage {
 			pattern,
 			fileType: native.FileType.File,
 			recursive: false,
-			hidden: true,
+			hidden: false,
 			gitignore: false,
 			sortByMtime: true,
 		});

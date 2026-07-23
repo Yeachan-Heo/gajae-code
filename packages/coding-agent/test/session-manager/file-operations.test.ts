@@ -99,6 +99,29 @@ describe("findMostRecentSession", () => {
 		expect(await findMostRecentSession(tempDir)).toBe(valid);
 	});
 
+	it("excludes newer hidden transcripts from finding and continuing the most recent session", async () => {
+		const visible = path.join(tempDir, "visible.jsonl");
+		const hidden = path.join(tempDir, ".hidden.jsonl");
+		fs.writeFileSync(
+			visible,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "visible", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+		fs.writeFileSync(
+			hidden,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "hidden", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+		fs.utimesSync(visible, new Date(10_000), new Date(10_000));
+		fs.utimesSync(hidden, new Date(20_000), new Date(20_000));
+
+		expect(await findMostRecentSession(tempDir)).toBe(visible);
+		const resumed = await SessionManager.continueRecent(tempDir, tempDir);
+		try {
+			expect(resumed.getSessionId()).toBe("visible");
+		} finally {
+			await resumed.close();
+		}
+	});
+
 	it("skips malformed and future headers when listing, finding, and continuing an explicit directory", async () => {
 		const valid = path.join(tempDir, "valid-v5.jsonl");
 		const malformed = path.join(tempDir, "malformed-version.jsonl");
