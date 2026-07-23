@@ -35,5 +35,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * retained native cleanup authority revalidation in generation 23, and typed
  * retained exact-unlink cleanup authority acceptance (concrete detached
  * quarantine plus proven canonical absence) in generation 24.
+ * Generation 25 adds startup dead-root prune + leak-artifact self-heal
+ * on TelegramNotificationDaemon.run (#2956).
  */
-export const DAEMON_GENERATION = 24;
+export const DAEMON_GENERATION = 25;
