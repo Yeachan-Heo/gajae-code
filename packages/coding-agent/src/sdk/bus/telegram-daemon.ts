@@ -1687,9 +1687,8 @@ export async function acquireDaemonOwnership(input: {
 		input.ownerId ?? input.randomId?.() ?? `${pid}-${now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 	const roots = input.roots ?? (await readJson<{ roots?: string[] }>(fsImpl, paths.roots))?.roots ?? [];
 
-	// A fresh, identity-matching live owner running an OLDER generation than this
-	// build cannot serve our newer wire frames; signal a reload instead of a
-	// silent attach. Newer/equal generations attach as before (no downgrade).
+	// Generation is inventory-only: a lower servingEpoch triggers convergence,
+	// while same-epoch cross-generation owners attach.
 	const attachDecision = (
 		state: DaemonState | undefined,
 	):
@@ -2960,6 +2959,13 @@ export async function ensureTelegramDaemonRunningDetailed(
 							isFreshLiveOwner({
 								state,
 								now: t,
+								tokenFingerprint: fp,
+								chatId: cfg.chatId,
+								pidAlive,
+								pidIncarnation,
+							}) &&
+							isSignalableMatchingOwner({
+								state,
 								tokenFingerprint: fp,
 								chatId: cfg.chatId,
 								pidAlive,

@@ -3137,6 +3137,82 @@ describe("telegram daemon", () => {
 		expect(result).toBe("reloaded");
 		expect(signals).toContainEqual([999, "SIGTERM"]);
 	});
+	test("cooldown waits for a provisional successor's ready provenance before attaching", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const now = 1_000;
+		const paths = daemonPaths(agentDir);
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, servingEpoch: undefined, heartbeatAt: now });
+		fs.writeFileSync(
+			path.join(paths.dir, "telegram-daemon.reload-attempt.json"),
+			JSON.stringify({ lastReloadAt: now - 1, ownerId: "old", targetGeneration: DAEMON_GENERATION }),
+		);
+		const provisionalSuccessor = liveOwnerState({
+			ownerId: "successor",
+			acquisitionId: "successor-acquisition",
+			ownershipPhase: "provisional",
+			generation: DAEMON_GENERATION,
+			servingEpoch: SERVING_EPOCH,
+			heartbeatAt: now,
+		});
+		let nowCalls = 0;
+		const cooldownNow = () => {
+			nowCalls++;
+			// The fourth clock read is reloadNow, after the cooldown callback has read
+			// the reload-required predecessor and before its first cooldown poll.
+			if (nowCalls === 4) fs.writeFileSync(paths.state, JSON.stringify(provisionalSuccessor));
+			return now;
+		};
+		const sleeps: number[] = [];
+		const result = await ensureTelegramDaemonRunningDetailed(
+			{ settings: s, cwd: path.join(agentDir, "cooldown-successor"), sessionId: "cooldown-successor" },
+			{
+				now: cooldownNow,
+				pid: 4242,
+				pidAlive: pid => pid === 999,
+				pidIncarnation: () => "linux:100",
+				readinessTimeoutMs: 1,
+				waitStepMs: 1,
+				sleep: async ms => {
+					sleeps.push(ms);
+					expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({ ownershipPhase: "provisional" });
+					fs.writeFileSync(paths.state, JSON.stringify({ ...provisionalSuccessor, ownershipPhase: "ready" }));
+				},
+				spawn: () => {
+					throw new Error("ready successor should attach during cooldown");
+				},
+			},
+		);
+		expect(result).toBe("attached");
+		expect(nowCalls).toBe(6);
+		expect(sleeps).toEqual([1]);
+	});
+
+	test("cooldown attaches to a ready epoch-1 owner with matching provenance", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const now = 1_000;
+		const paths = daemonPaths(agentDir);
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, servingEpoch: undefined, heartbeatAt: now });
+		fs.writeFileSync(
+			path.join(paths.dir, "telegram-daemon.reload-attempt.json"),
+			JSON.stringify({ lastReloadAt: now - 1, ownerId: "old", targetGeneration: DAEMON_GENERATION }),
+		);
+		await expect(
+			ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: path.join(agentDir, "cooldown-ready"), sessionId: "cooldown-ready" },
+				{
+					now: () => now,
+					pid: 4242,
+					pidAlive: pid => pid === 999,
+					pidIncarnation: () => "linux:100",
+					spawn: () => {
+						throw new Error("ready predecessor should attach during cooldown");
+					},
+				},
+			),
+		).resolves.toBe("attached");
+	});
 
 	test("servingEpoch reload fails when the stale owner never exits", async () => {
 		const agentDir = tempAgentDir();
