@@ -2440,7 +2440,7 @@ export function convertAnthropicMessages(
 	messages: Message[],
 	model: Model<"anthropic-messages">,
 	isOAuthToken: boolean,
-	options?: { repairLatestAssistantThinking?: boolean },
+	options?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
 ): MessageParam[] {
 	const params: MessageParam[] = [];
 

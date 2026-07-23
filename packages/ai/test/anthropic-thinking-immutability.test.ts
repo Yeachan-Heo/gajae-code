@@ -226,4 +226,45 @@ describe("Anthropic thinking replay immutability", () => {
 			{ role: "user", content: "Continue." },
 		]);
 	});
+
+	it("drops thinking across every assistant turn for signature-invalid replay repair", () => {
+		const makeAssistant = (suffix: string, text: string): AssistantMessage => ({
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: `thinking ${suffix}`, thinkingSignature: `sig_${suffix}` },
+				{ type: "redactedThinking", data: `redacted-${suffix}` },
+				{ type: "text", text },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		const userA: UserMessage = { role: "user", content: "first", timestamp: Date.now() };
+		const userB: UserMessage = { role: "user", content: "second", timestamp: Date.now() };
+
+		const params = convertAnthropicMessages(
+			[userA, makeAssistant("early", "early answer"), userB, makeAssistant("late", "late answer")],
+			model,
+			false,
+			{ repairAllAssistantThinking: true },
+		);
+
+		expect(params).toEqual([
+			{ role: "user", content: "first" },
+			{ role: "assistant", content: [{ type: "text", text: "early answer" }] },
+			{ role: "user", content: "second" },
+			{ role: "assistant", content: [{ type: "text", text: "late answer" }] },
+			{ role: "user", content: "Continue." },
+		]);
+	});
 });

@@ -31,7 +31,7 @@ export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,
 	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
-	options?: { repairLatestAssistantThinking?: boolean },
+	options?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
 ): Message[] {
 	// Build a map of original tool call IDs to normalized IDs
 	const toolCallIdMap = new Map<string, string>();
@@ -73,15 +73,20 @@ export function transformMessages<TApi extends Api>(
 			// are kept so the second pass can either preserve real results or synthesize
 			// an explicit aborted result without leaving dangling tool_use blocks.
 			const hasPartialThinking = assistantMsg.stopReason === "aborted" || assistantMsg.stopReason === "error";
-			const dropLatestAssistantThinking =
-				options?.repairLatestAssistantThinking === true &&
-				index === latestAssistantIndex &&
+			// One-shot Anthropic replay repair. `repairLatestAssistantThinking` targets the
+			// "latest assistant message ... cannot be modified" 400; `repairAllAssistantThinking`
+			// targets the "Invalid `signature` in `thinking` block" 400, which can cite a block
+			// anywhere in the replayed history (e.g. after compaction/pruning rewrote an earlier
+			// turn), so the drop must apply to every assistant message.
+			const dropAssistantThinkingForRepair =
+				(options?.repairAllAssistantThinking === true ||
+					(options?.repairLatestAssistantThinking === true && index === latestAssistantIndex)) &&
 				model.api === "anthropic-messages" &&
 				assistantMsg.api === "anthropic-messages";
 
 			const transformedContent = assistantMsg.content.flatMap(block => {
 				if (block.type === "thinking") {
-					if (hasPartialThinking || dropLatestAssistantThinking) return [];
+					if (hasPartialThinking || dropAssistantThinkingForRepair) return [];
 					const sanitized = block;
 					if (mustPreserveLatestAnthropicThinking) return sanitized;
 					// For same model: keep thinking blocks with signatures (needed for replay)
@@ -97,7 +102,7 @@ export function transformMessages<TApi extends Api>(
 				}
 
 				if (block.type === "redactedThinking") {
-					if (hasPartialThinking || dropLatestAssistantThinking) return [];
+					if (hasPartialThinking || dropAssistantThinkingForRepair) return [];
 					if (mustPreserveLatestAnthropicThinking) return block;
 					if (isSameModel) return block;
 					return [];
