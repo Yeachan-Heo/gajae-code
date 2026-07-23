@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Ralplan can persist typed review conflicts and dispositions via a fail-closed `disposition` stage (`schema: ralplan.review_conflicts.v1`). Incompatible Architect/Critic actions on the same plan target block a clean join until an explicit disposition with owner and rationale is recorded (#2902).
+
 ### Fixed
 
 - On macOS, resuming a managed session no longer fails with `identity_mismatch` when the first write-append open changes only file `ctime` (e.g. APFS write-provenance / `com.apple.provenance`). `appendSync` allows a single bounded re-capture + retry when `dev`/`ino`/`size`/`mtime`/SHA-256 remain unchanged, and still rejects real content races and repeated ctime transitions (#2944).
