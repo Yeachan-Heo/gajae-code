@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- On macOS, resuming a managed session no longer fails with `identity_mismatch` when the first write-append open changes only file `ctime` (e.g. APFS write-provenance / `com.apple.provenance`). `appendSync` allows a single bounded re-capture + retry when `dev`/`ino`/`size`/`mtime`/SHA-256 remain unchanged, and still rejects real content races and repeated ctime transitions (#2944).
+
 ## [0.11.7] - 2026-07-22
 ### Added
 

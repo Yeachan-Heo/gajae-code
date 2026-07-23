@@ -675,7 +675,7 @@ export class ManagedSessionDescendantStore {
 	appendSync(relativePath: string, bytes: Uint8Array): void {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
-		const existing = this.readExpected(relativePath);
+		let existing = this.readExpected(relativePath);
 		if (!existing) throw new Error("managed_append_missing");
 		if (this.#authority) {
 			const appended = this.#authority.appendManaged(
@@ -692,20 +692,49 @@ export class ManagedSessionDescendantStore {
 			this.#assertBound();
 			return;
 		}
+		// On Darwin, the first write-append open can change only ctime (e.g. com.apple.provenance)
+		// while leaving dev/ino/size/mtime/content intact. Allow one bounded refresh+retry for that
+		// transition only; any other identity change or a second ctime transition stays fail-closed.
+		// See https://github.com/Yeachan-Heo/gajae-code/issues/2944
 		let fd: number | undefined;
+		let darwinCtimeRefreshConsumed = false;
 		try {
-			fd = fs.openSync(resolved, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
-			const before = identity(fs.fstatSync(fd, { bigint: true }));
-			if (!sameIdentity(before, existing.identity)) throw new Error("identity_mismatch");
-			secureFileDescriptor(resolved, fd, "verify");
-			let offset = 0;
-			while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
-			fs.fsyncSync(fd);
-			secureFileDescriptor(resolved, fd, "verify");
-			const after = identity(fs.fstatSync(fd, { bigint: true }));
-			const named = identity(fs.lstatSync(resolved, { bigint: true }));
-			if (!sameIdentity(after, named) || after.dev !== before.dev || after.ino !== before.ino)
-				throw new Error("identity_mismatch");
+			for (;;) {
+				fd = fs.openSync(resolved, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW);
+				const before = identity(fs.fstatSync(fd, { bigint: true }));
+				if (!sameIdentity(before, existing.identity)) {
+					const allowDarwinCtimeRefresh =
+						process.platform === "darwin" &&
+						!darwinCtimeRefreshConsumed &&
+						isCtimeOnlyIdentityMismatch(before, existing.identity);
+					if (!allowDarwinCtimeRefresh) throw new Error("identity_mismatch");
+					fs.closeSync(fd);
+					fd = undefined;
+					darwinCtimeRefreshConsumed = true;
+					const original = existing;
+					const refreshed = this.readExpected(relativePath);
+					if (
+						!refreshed ||
+						!sameStableIdentityIgnoringCtime(refreshed.identity, original.identity) ||
+						refreshed.identity.sha256 !== original.identity.sha256 ||
+						!refreshed.bytes.equals(original.bytes)
+					) {
+						throw new Error("identity_mismatch");
+					}
+					existing = refreshed;
+					continue;
+				}
+				secureFileDescriptor(resolved, fd, "verify");
+				let offset = 0;
+				while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+				fs.fsyncSync(fd);
+				secureFileDescriptor(resolved, fd, "verify");
+				const after = identity(fs.fstatSync(fd, { bigint: true }));
+				const named = identity(fs.lstatSync(resolved, { bigint: true }));
+				if (!sameIdentity(after, named) || after.dev !== before.dev || after.ino !== before.ino)
+					throw new Error("identity_mismatch");
+				break;
+			}
 		} finally {
 			if (fd !== undefined) fs.closeSync(fd);
 		}
@@ -1146,6 +1175,24 @@ function sameIdentity(left: ManagedFileSnapshot["identity"], right: ManagedFileS
 		left.mtimeNs === right.mtimeNs &&
 		left.ctimeNs === right.ctimeNs
 	);
+}
+
+/** Content/path identity that remains meaningful across a Darwin write-open ctime-only transition. */
+function sameStableIdentityIgnoringCtime(
+	left: ManagedFileSnapshot["identity"],
+	right: ManagedFileSnapshot["identity"],
+): boolean {
+	return (
+		left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs
+	);
+}
+
+/** True when observed identity matches expected on every field except ctimeNs. */
+function isCtimeOnlyIdentityMismatch(
+	observed: ManagedFileSnapshot["identity"],
+	expected: ManagedFileSnapshot["identity"],
+): boolean {
+	return sameStableIdentityIgnoringCtime(observed, expected) && observed.ctimeNs !== expected.ctimeNs;
 }
 
 function parseLock(pathname: string): LockRecord | undefined {
