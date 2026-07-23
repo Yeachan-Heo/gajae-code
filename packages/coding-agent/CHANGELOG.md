@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Plans and delegated tasks can carry an authoritative repository binding (`gjc.repository_binding.v1`). Ultragoal plans and ralplan seeds stamp worktree/common-dir identity at creation, task items accept an optional binding, and spawn/goal-start fail closed when the active cwd is a sibling repository (#2901).
+
 ### Fixed
 
 - On macOS, resuming a managed session no longer fails with `identity_mismatch` when the first write-append open changes only file `ctime` (e.g. APFS write-provenance / `com.apple.provenance`). `appendSync` allows a single bounded re-capture + retry when `dev`/`ino`/`size`/`mtime`/SHA-256 remain unchanged, and still rejects real content races and repeated ctime transitions (#2944).

@@ -23,6 +23,7 @@ import {
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
+import { captureRepositoryBinding } from "./repository-binding";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { getSkillManifest } from "./workflow-manifest";
 
@@ -817,6 +818,7 @@ async function seedRalplanState(
 	const runId = existingRunId ?? resolved.sessionId ?? defaultRunId();
 	assertSafePathComponent(runId, "run-id");
 	const now = new Date().toISOString();
+	const repositoryBinding = await captureRepositoryBinding(cwd, { displayPath: cwd });
 	const payload: Record<string, unknown> = {
 		active: true,
 		current_phase: "planner",
@@ -827,6 +829,7 @@ async function seedRalplanState(
 		task: resolved.task,
 		run_id: runId,
 		updated_at: now,
+		repository_binding: repositoryBinding,
 	};
 	if (resolved.architectKind) payload.architect_kind = resolved.architectKind;
 	if (resolved.criticKind) payload.critic_kind = resolved.criticKind;

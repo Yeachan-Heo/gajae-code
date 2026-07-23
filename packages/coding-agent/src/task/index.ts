@@ -43,6 +43,11 @@ import {
 
 // Import review tools for side effects (registers subagent tool handlers)
 import "../tools/review";
+import {
+	assertCwdMatchesRepositoryBinding,
+	parseRepositoryBinding,
+	RepositoryBindingError,
+} from "../gjc-runtime/repository-binding";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
@@ -126,6 +131,25 @@ function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
 	target.cost.cacheRead += cost.cacheRead;
 	target.cost.cacheWrite += cost.cacheWrite;
 	target.cost.total += cost.total;
+}
+
+async function validateTaskRepositoryBindings(
+	cwd: string,
+	tasks: readonly TaskItem[],
+): Promise<string | undefined> {
+	for (const task of tasks) {
+		if (!task.repositoryBinding) continue;
+		try {
+			const binding = parseRepositoryBinding(task.repositoryBinding);
+			await assertCwdMatchesRepositoryBinding(cwd, binding);
+		} catch (error) {
+			if (error instanceof RepositoryBindingError) {
+				return `Task "${task.id}" repository binding rejected: ${error.message}`;
+			}
+			return `Task "${task.id}" repository binding rejected: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+	return undefined;
 }
 
 function validateTaskIdsForScheduling(tasks: readonly TaskItem[]): string | undefined {
@@ -436,6 +460,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const taskIdValidationError = validateTaskIdsForScheduling(taskItems);
 		if (taskIdValidationError) {
 			return createTaskModeError(taskIdValidationError);
+		}
+		const repositoryBindingError = await validateTaskRepositoryBindings(this.session.cwd, taskItems);
+		if (repositoryBindingError) {
+			return createTaskModeError(repositoryBindingError);
 		}
 		if (taskItems.length === 0) {
 			return this.#executeSync(_toolCallId, params, signal, onUpdate);
