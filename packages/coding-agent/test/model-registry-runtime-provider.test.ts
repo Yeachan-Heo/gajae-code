@@ -9,6 +9,7 @@ import { ModelRegistry, type ProviderConfigInput } from "@gajae-code/coding-agen
 import { ModelsConfigSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { Snowflake } from "@gajae-code/utils";
+import modelsSchema from "../../../schemas/models.schema.json" with { type: "json" };
 
 describe("ModelRegistry runtime provider registration", () => {
 	let tempDir: string;
@@ -155,8 +156,8 @@ describe("ModelRegistry runtime provider registration", () => {
 		expect(ModelsConfigSchema.safeParse({ providers: { ["a".repeat(65)]: {} } }).success).toBe(false);
 	});
 
-	test("checks the checked-in provider propertyNames schema contract", async () => {
-		const schema = (await import("../../../schemas/models.schema.json")) as {
+	test("checks the checked-in provider propertyNames schema contract", () => {
+		const schema = modelsSchema as {
 			properties?: {
 				providers?: {
 					propertyNames?: {
