@@ -4,6 +4,7 @@ import { extractSegments, sliceWithWidth, Text } from "@gajae-code/tui";
 import { isEnoent, logger, prompt, untilAborted } from "@gajae-code/utils";
 import * as Diff from "diff";
 import * as z from "zod/v4";
+import { withEditPathMutation } from "../edit/path-mutation-lock";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
@@ -30,6 +31,7 @@ import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
 import { enforcePlanModeWrite } from "./plan-mode-guard";
 import { formatDiagnostics, replaceTabs } from "./render-utils";
 import { isSqliteFile, parseSqlitePathCandidates } from "./sqlite-reader";
+import { enforceTeamWriteScope } from "./team-write-scope";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -484,6 +486,7 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 
 	async #beforeMutate(buffer: VimBuffer): Promise<void> {
 		enforcePlanModeWrite(this.session, buffer.displayPath, { op: buffer.baseFingerprint ? "update" : "create" });
+		await enforceTeamWriteScope(this.session, buffer.filePath);
 		if (!buffer.editabilityChecked && buffer.baseFingerprint) {
 			await assertEditableFile(buffer.filePath, buffer.displayPath);
 			buffer.editabilityChecked = true;
@@ -492,19 +495,22 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 
 	async #saveBuffer(buffer: VimBuffer, options?: { force?: boolean }): Promise<VimSaveResult> {
 		enforcePlanModeWrite(this.session, buffer.displayPath, { op: buffer.baseFingerprint ? "update" : "create" });
-		if (buffer.baseFingerprint) {
-			await assertEditableFile(buffer.filePath, buffer.displayPath);
-		}
-		if (!options?.force) {
-			const diskFingerprint = await statFingerprint(buffer.filePath);
-			if (!fingerprintEqual(buffer.baseFingerprint, diskFingerprint)) {
-				throw new ToolError("File changed on disk since open; reload with :e! before saving.");
+		await enforceTeamWriteScope(this.session, buffer.filePath);
+		return withEditPathMutation([buffer.filePath], async () => {
+			if (buffer.baseFingerprint) {
+				await assertEditableFile(buffer.filePath, buffer.displayPath);
 			}
-		}
-		const content = `${buffer.getText()}${buffer.trailingNewline ? "\n" : ""}`;
-		const diagnostics = (await this.#writethrough(buffer.filePath, content)) as FileDiagnosticsResult | undefined;
-		const loaded = await this.#loadBuffer(buffer.displayPath);
-		return { loaded, diagnostics };
+			if (!options?.force) {
+				const diskFingerprint = await statFingerprint(buffer.filePath);
+				if (!fingerprintEqual(buffer.baseFingerprint, diskFingerprint)) {
+					throw new ToolError("File changed on disk since open; reload with :e! before saving.");
+				}
+			}
+			const content = `${buffer.getText()}${buffer.trailingNewline ? "\n" : ""}`;
+			const diagnostics = (await this.#writethrough(buffer.filePath, content)) as FileDiagnosticsResult | undefined;
+			const loaded = await this.#loadBuffer(buffer.displayPath);
+			return { loaded, diagnostics };
+		});
 	}
 
 	#renderFromEngine(

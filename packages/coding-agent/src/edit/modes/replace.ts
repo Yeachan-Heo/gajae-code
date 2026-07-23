@@ -11,6 +11,7 @@ import type { ToolSession } from "../../tools";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
+import { enforceTeamWriteScope } from "../../tools/team-write-scope";
 import { generateDiffString, replaceText } from "../diff";
 import {
 	countLeadingWhitespace,
@@ -1088,6 +1089,7 @@ export async function executeReplaceSingle(
 	}
 
 	const absolutePath = resolvePlanPath(session, path);
+	await enforceTeamWriteScope(session, absolutePath);
 	return withEditPathMutation([absolutePath], () =>
 		executeReplaceSingleUnderLock({
 			session,

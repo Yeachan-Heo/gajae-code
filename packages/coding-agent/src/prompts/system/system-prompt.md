@@ -160,7 +160,7 @@ For image understanding, call `{{toolRefs.read}}` on the image path; the image i
 - NEVER use shell coreutils (`cat`, `head`, `tail`, `less`, `more`, `ls`, `grep`, `rg`, `awk`, `sed`, `find`, `fd`, and equivalents) when a dedicated tool suffices; use `read`, `search`, `find`, `edit`, or `write`.
 {{#has tools "read"}}- File/dir reads → `{{toolRefs.read}}`.{{/has}}
 {{#has tools "edit"}}- Surgical text edits → `{{toolRefs.edit}}`.{{/has}}
-{{#has tools "write"}}- File create/overwrite → `{{toolRefs.write}}`.{{/has}}
+{{#has tools "write"}}- New file creation → `{{toolRefs.write}}`; modify existing files with `{{toolRefs.edit}}`.{{/has}}
 {{#has tools "lsp"}}- Code intelligence → `{{toolRefs.lsp}}`.{{/has}}
 {{#has tools "search"}}- Regex search → `{{toolRefs.search}}`.{{/has}}
 {{#has tools "find"}}- File globbing → `{{toolRefs.find}}`.{{/has}}

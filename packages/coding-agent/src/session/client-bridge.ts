@@ -14,6 +14,8 @@ export interface ClientBridgeCapabilities {
 	readTextFile?: boolean;
 	/** Client implements `fs/write_text_file`. */
 	writeTextFile?: boolean;
+	/** Client implements atomic create-only text file writes. */
+	createTextFile?: boolean;
 	/** Client implements the `terminal/*` family. */
 	terminal?: boolean;
 	/** Client implements `session/request_permission`. */
@@ -76,6 +78,7 @@ export interface ClientBridge {
 	readonly deferAgentInitiatedTurns?: boolean;
 	readTextFile?(params: { path: string; line?: number; limit?: number }): Promise<string>;
 	writeTextFile?(params: { path: string; content: string }): Promise<void>;
+	createTextFile?(params: { path: string; content: string }): Promise<void>;
 	createTerminal?(params: ClientBridgeCreateTerminalParams): Promise<ClientBridgeTerminalHandle>;
 	requestPermission?(
 		toolCall: ClientBridgePermissionToolCall,
