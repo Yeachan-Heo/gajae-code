@@ -725,9 +725,14 @@ export async function readOwnerFreshnessSnapshot(input: {
 	const rereadTag = ownerTagFromState(rereadState);
 	const stableTag = rereadTag && ownershipLockMatchesState(rereadLock, rereadState) ? rereadTag : null;
 	const stable = ownerTag && stableTag && sidecarMatchesOwnerTag({ ...ownerTag, heartbeatAt: 0 }, stableTag) ? stableTag : null;
+	const effectiveHeartbeatAt = stable
+		? sidecarMatchesOwnerTag(sidecar, stable)
+			? Math.max(rereadState?.heartbeatAt ?? 0, sidecar.heartbeatAt)
+			: rereadState?.heartbeatAt
+		: undefined;
 	return {
 		ownerTag: stable,
-		effectiveHeartbeatAt: stable && sidecarMatchesOwnerTag(sidecar, stable) ? Math.max(rereadState?.heartbeatAt ?? 0, sidecar.heartbeatAt) : rereadState?.heartbeatAt,
+		effectiveHeartbeatAt,
 		legacyEmbedded: false,
 		state: rereadState,
 	};
@@ -1731,12 +1736,14 @@ export function isFreshLiveOwner(input: {
 	effectiveHeartbeatAt?: number;
 }): boolean {
 	const { state } = input;
+	const heartbeatAt = Object.hasOwn(input, "effectiveHeartbeatAt") ? input.effectiveHeartbeatAt : state?.heartbeatAt;
 	return Boolean(
 		state &&
+			heartbeatAt !== undefined &&
 			hasSafeDaemonStateShape(state) &&
 			state.stoppedAt === undefined &&
 			ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
-			input.now - (input.effectiveHeartbeatAt ?? state.heartbeatAt) <= HEARTBEAT_TTL_MS &&
+			input.now - heartbeatAt <= HEARTBEAT_TTL_MS &&
 			input.pidAlive(state.pid) &&
 			ownerProvenanceMatches(state, input.pidIncarnation),
 	);
@@ -8774,6 +8781,11 @@ export class TelegramNotificationDaemon {
 				await this.runtime.sleep(10);
 			}
 		} finally {
+			this.running = false;
+			this.runtime.stop();
+			this.stopOwnershipHeartbeatTimer();
+			const heartbeatJoined = await this.runtime.joinExclusive("telegram-owner-heartbeat", BTW_SHUTDOWN_JOIN_MS);
+			if (!heartbeatJoined) logger.warn("heartbeat join timed out; retaining daemon ownership (release aborted)");
 			// A contender must not mutate durable owner state while unwinding startup.
 			if (ownershipProved) {
 				let toolShutdownError: unknown;
@@ -8785,16 +8797,10 @@ export class TelegramNotificationDaemon {
 				this.effects.beginShutdown();
 				this.#deliveryAbort.abort();
 				let persisted = false;
-				let heartbeatJoined = false;
 				const shutdown = this.effects.allowTerminal(async () => {
 					if (toolShutdownError) throw toolShutdownError;
 					await this.#drainBtwTurns();
 					await this.toolTerminalizationChain;
-					this.runtime.stop();
-					this.stopOwnershipHeartbeatTimer();
-					heartbeatJoined = await this.runtime.joinExclusive("telegram-owner-heartbeat", BTW_SHUTDOWN_JOIN_MS);
-					if (!heartbeatJoined)
-						logger.warn("heartbeat join timed out; retaining daemon ownership (release aborted)");
 					this.stopFlushTimer();
 					this.stopScanTimer();
 					this.stopTypingTimer();

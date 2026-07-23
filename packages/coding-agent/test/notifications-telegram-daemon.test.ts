@@ -136,6 +136,30 @@ test("stale-tag sidecars are inert and a stale writer cannot overwrite a success
 	expect(await renewOwnerHeartbeatSidecar({ settings: s, ownerId: "other", acquisitionId: "other", pid: process.pid })).toBe(false);
 });
 
+test("modern owners without a matching lock are never fresh or current", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const paths = daemonPaths(agentDir);
+	await acquireDaemonOwnership({ settings: s, tokenFingerprint: "fp", chatId: "42", pid: process.pid, randomId: () => "owner" });
+	const state = await readDaemonState(s);
+	fs.unlinkSync(paths.lock);
+	const missingLock = await readOwnerFreshnessSnapshot({ settings: s });
+	expect(missingLock.effectiveHeartbeatAt).toBeUndefined();
+	expect(
+		isCurrentCompatibleOwner({
+			state: missingLock.state,
+			now: Date.now(),
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pidAlive: () => true,
+			effectiveHeartbeatAt: missingLock.effectiveHeartbeatAt,
+		}),
+	).toBe(false);
+	fs.writeFileSync(paths.lock, JSON.stringify({ pid: process.pid, incarnation: state?.incarnation, ownerId: "other", acquisitionId: "other", startedAt: 1 }));
+	const mismatchedLock = await readOwnerFreshnessSnapshot({ settings: s });
+	expect(mismatchedLock.effectiveHeartbeatAt).toBeUndefined();
+});
+
 test("sidecar fence skips publication after the ownership lock changes", async () => {
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -2109,6 +2133,7 @@ describe("telegram daemon", () => {
 				servingEpoch: SERVING_EPOCH,
 			}),
 		);
+		fs.writeFileSync(paths.lock, JSON.stringify({ pid: 999, incarnation: "linux:100", ownerId: "old", acquisitionId: "old", startedAt: 100 }));
 		const result = await acquireDaemonOwnership({
 			settings: s,
 			tokenFingerprint: "fp",
@@ -3356,7 +3381,10 @@ describe("telegram daemon", () => {
 			nowCalls++;
 			// The fourth clock read is reloadNow, after the cooldown callback has read
 			// the reload-required predecessor and before its first cooldown poll.
-			if (nowCalls === 4) fs.writeFileSync(paths.state, JSON.stringify(provisionalSuccessor));
+			if (nowCalls === 4) {
+				fs.writeFileSync(paths.state, JSON.stringify(provisionalSuccessor));
+				fs.writeFileSync(paths.lock, JSON.stringify({ pid: provisionalSuccessor.pid, incarnation: provisionalSuccessor.incarnation, ownerId: provisionalSuccessor.ownerId, acquisitionId: provisionalSuccessor.acquisitionId, startedAt: provisionalSuccessor.startedAt }));
+			}
 			return now;
 		};
 		const sleeps: number[] = [];
@@ -3373,6 +3401,7 @@ describe("telegram daemon", () => {
 					sleeps.push(ms);
 					expect(JSON.parse(fs.readFileSync(paths.state, "utf8"))).toMatchObject({ ownershipPhase: "provisional" });
 					fs.writeFileSync(paths.state, JSON.stringify({ ...provisionalSuccessor, ownershipPhase: "ready" }));
+					fs.writeFileSync(paths.lock, JSON.stringify({ pid: provisionalSuccessor.pid, incarnation: provisionalSuccessor.incarnation, ownerId: provisionalSuccessor.ownerId, acquisitionId: provisionalSuccessor.acquisitionId, startedAt: provisionalSuccessor.startedAt }));
 				},
 				spawn: () => {
 					throw new Error("ready successor should attach during cooldown");

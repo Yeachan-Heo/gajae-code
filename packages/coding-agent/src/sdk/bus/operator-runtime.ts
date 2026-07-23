@@ -74,7 +74,7 @@ export class NotificationOperatorRuntime {
 	#stopRequested = false;
 	#activeAbort: AbortController | undefined;
 	#intervals = new Map<string, OperatorIntervalHandle>();
-	#exclusive = new Set<string>();
+	#exclusive = new Map<string, Promise<void>>();
 
 	#deps: NotificationOperatorTimerDeps;
 
@@ -130,7 +130,7 @@ export class NotificationOperatorRuntime {
 
 	stopInterval(name: string): void {
 		const timer = this.#intervals.get(name);
-		if (!timer) return;
+		if (timer === undefined) return;
 		const clearIntervalImpl = this.#deps.clearIntervalImpl ?? clearInterval;
 		clearIntervalImpl(timer);
 		this.#intervals.delete(name);
@@ -142,22 +142,36 @@ export class NotificationOperatorRuntime {
 
 	async runExclusive(name: string, fn: () => Promise<void>): Promise<void> {
 		if (this.#exclusive.has(name)) return;
-		this.#exclusive.add(name);
-		try {
-			await fn();
-		} finally {
-			this.#exclusive.delete(name);
-		}
+		let completion!: Promise<void>;
+		completion = (async () => {
+			try {
+				await fn();
+			} finally {
+				if (this.#exclusive.get(name) === completion) this.#exclusive.delete(name);
+			}
+		})();
+		this.#exclusive.set(name, completion);
+		await completion;
 	}
 
 	async joinExclusive(name: string, timeoutMs: number): Promise<boolean> {
-		const deadline = this.now() + timeoutMs;
-		while (this.#exclusive.has(name)) {
-			const remaining = deadline - this.now();
-			if (remaining <= 0) return false;
-			await this.sleep(Math.min(remaining, 10));
-		}
-		return true;
+		const completion = this.#exclusive.get(name);
+		if (!completion) return true;
+		const setTimeoutImpl = this.#deps.setTimeoutImpl ?? setTimeout;
+		const clearTimeoutImpl = this.#deps.clearTimeoutImpl ?? clearTimeout;
+		return await new Promise<boolean>(resolve => {
+			const timer = setTimeoutImpl(() => resolve(false), timeoutMs);
+			void completion.then(
+				() => {
+					clearTimeoutImpl(timer);
+					resolve(true);
+				},
+				() => {
+					clearTimeoutImpl(timer);
+					resolve(true);
+				},
+			);
+		});
 	}
 
 	sleep(ms: number, signal?: AbortSignal): Promise<void> {

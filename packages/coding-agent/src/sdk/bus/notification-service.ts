@@ -580,10 +580,9 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 	}
 
 	// Daemon ownership state (offline; read the persisted state file directly).
-	const paths = daemonPaths(opts.settings.getAgentDir());
 	const snapshot = await readOwnerFreshnessSnapshot({ settings: opts.settings, fs: fs as unknown as import("./telegram-daemon").TelegramDaemonFs });
-	const state = await readDaemonStateFile(fs, paths.state);
-	const heartbeatAt = snapshot.effectiveHeartbeatAt;
+	const state = snapshot.state ? parseDaemonState(JSON.stringify(snapshot.state)) : undefined;
+	const heartbeatAt = finiteNonNegativeNumber(snapshot.effectiveHeartbeatAt);
 	const daemon: DaemonHealth = {
 		present: Boolean(state),
 		ownerId: state?.ownerId,
