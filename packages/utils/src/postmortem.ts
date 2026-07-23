@@ -5,9 +5,12 @@
  * in response to process exit, signals, or fatal exceptions. It is intended to
  * allow reliably releasing resources or shutting down subprocesses, files, sockets, etc.
  */
+import * as fs from "node:fs";
 import inspector from "node:inspector";
+import * as path from "node:path";
 import { isMainThread } from "node:worker_threads";
 import { BROKEN_PIPE_EXIT_CODE, createProcessStdoutEpipeClassifier } from "./broken-pipe";
+import { getCrashLogPath } from "./dirs";
 import * as logger from "./logger";
 import { safeStderrWrite } from "./safe-stderr";
 
@@ -204,6 +207,52 @@ function formatFatalError(label: string, err: Error): string {
 	const formattedStack = stackLines.length > 0 ? `\n${stackLines.join("\n")}` : "";
 	return `\n[${label}] ${name}: ${message}${formattedStack}\n`;
 }
+/** Cap for the durable crash log; it is reset past this so a crash loop cannot fill the disk. */
+const CRASH_LOG_MAX_BYTES = 512 * 1024;
+
+/**
+ * Append a fatal-crash record to the dedicated, rotation-immune crash log
+ * (`~/.gjc/agent/gjc-crash.log`).
+ *
+ * The daily logger file is gzip-archived at date rollover by every gjc process
+ * independently; that shared-archive race can truncate a day's log to an empty
+ * `.gz`, destroying the `logger.error` crash record written here. This
+ * append-only file is never rotated, so a crash stays diagnosable regardless.
+ *
+ * Fully defensive: it never throws (a failing crash writer must not mask the
+ * original fatal) and uses synchronous IO so the record lands before
+ * `process.exit`. Returns the path written, or `undefined` on failure.
+ */
+export function recordFatalCrash(
+	label: string,
+	reason: unknown,
+	options: { path?: string; now?: Date } = {},
+): string | undefined {
+	try {
+		const err = errorForDiagnostic(reason);
+		const target = options.path ?? getCrashLogPath();
+		const now = options.now ?? new Date();
+		const report =
+			`${now.toISOString()} pid=${process.pid} [${label}] ` +
+			`${err.name || "Error"}: ${err.message || "(no message)"}\n` +
+			`${err.stack ?? ""}\n\n`;
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		let existingSize = 0;
+		try {
+			existingSize = fs.statSync(target).size;
+		} catch {}
+		// Reset (rather than append) when the file would exceed the cap so the
+		// newest crash is always retained without unbounded growth.
+		if (existingSize + Buffer.byteLength(report) > CRASH_LOG_MAX_BYTES) {
+			fs.writeFileSync(target, report, { mode: 0o600 });
+		} else {
+			fs.appendFileSync(target, report, { mode: 0o600 });
+		}
+		return target;
+	} catch {
+		return undefined;
+	}
+}
 
 async function exitQuietlyForAttributableStdoutEpipe(reason: Reason): Promise<void> {
 	if (ordinaryFatalStarted || quietShutdownStarted) return;
@@ -227,6 +276,10 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 	process.exitCode = 1;
 	const err = errorForDiagnostic(reason);
 	safeStderrWrite(formatFatalError(label, err));
+	// Persist to the rotation-immune crash log first, before cleanup (which may
+	// itself hang or fail), so the record survives even if the daily log is lost.
+	const crashLogPath = recordFatalCrash(label, err);
+	if (crashLogPath) safeStderrWrite(`[${label}] crash recorded at ${crashLogPath}\n`);
 	if (!quietShutdownStarted) {
 		logger.error(label === "Uncaught Exception" ? "Uncaught exception" : "Unhandled rejection", {
 			err,

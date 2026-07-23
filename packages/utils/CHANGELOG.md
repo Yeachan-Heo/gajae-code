@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ## [0.11.8] - 2026-07-23
+### Fixed
+
+- Fatal crashes (`uncaughtException` / `unhandledRejection`) are now also written to a dedicated, append-only crash log (`~/.gjc/agent/gjc-crash.log`, capped at 512 KB) in addition to the rotating daily logger file, and the fatal handler prints the crash-log path to stderr. The daily log is gzip-archived independently by every gjc process at date rollover; that shared-archive race can truncate a day's log to an empty `.gz` and destroy the `logger.error` crash record, leaving crashes undiagnosable. The rotation-immune crash log preserves the record regardless.
 
 ## [0.11.7] - 2026-07-22
 ### Added
