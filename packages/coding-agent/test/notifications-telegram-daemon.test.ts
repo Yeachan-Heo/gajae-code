@@ -112,6 +112,48 @@ test("steady ownership heartbeat advances only the owner-tagged sidecar", async 
 	expect((await readDaemonState(s))?.heartbeatAt).toBe(1);
 	expect((await readOwnerFreshnessSnapshot({ settings: s })).effectiveHeartbeatAt).toBe(2);
 });
+
+test("stale-tag sidecars are inert and a stale writer cannot overwrite a successor heartbeat", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const paths = daemonPaths(agentDir);
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "old",
+	});
+	fs.writeFileSync(paths.heartbeat, JSON.stringify({
+		pid: process.pid,
+		incarnation: process.platform === "darwin" ? undefined : "stale",
+		ownerId: "other",
+		acquisitionId: "other",
+		heartbeatAt: Date.now() + 60_000,
+	}));
+	const snapshot = await readOwnerFreshnessSnapshot({ settings: s });
+	expect(snapshot.effectiveHeartbeatAt).toBe((await readDaemonState(s))?.heartbeatAt);
+	expect(await renewOwnerHeartbeatSidecar({ settings: s, ownerId: "other", acquisitionId: "other", pid: process.pid })).toBe(false);
+});
+
+test("sidecar fence skips publication after the ownership lock changes", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const paths = daemonPaths(agentDir);
+	await acquireDaemonOwnership({ settings: s, tokenFingerprint: "fp", chatId: "42", pid: process.pid, randomId: () => "owner" });
+	const originalReadFile = fs.promises.readFile.bind(fs.promises);
+	let lockReads = 0;
+	const fencedFs: TelegramDaemonFs = {
+		...(fs.promises as unknown as TelegramDaemonFs),
+		readFile: async (file, encoding) => {
+			if (file === paths.lock && ++lockReads === 2)
+				return JSON.stringify({ pid: process.pid, incarnation: "changed", ownerId: "next", acquisitionId: "next", startedAt: 1 });
+			return await originalReadFile(file, encoding);
+		},
+	};
+	expect(await renewOwnerHeartbeatSidecar({ settings: s, ownerId: "owner", acquisitionId: "owner", pid: process.pid, fs: fencedFs })).toBe(false);
+	expect(fs.existsSync(paths.heartbeat)).toBe(false);
+});
 test("endpoint authority digest canonicalizes endpoint presentation and binds authenticated identity", () => {
 	const canonical = endpointAuthorityDigest("ws://LOCALHOST:80/sdk?ignored=yes#ignored", "token");
 	expect(canonical).toBe(endpointAuthorityDigest("ws://localhost/sdk", "token"));
@@ -1521,7 +1563,7 @@ describe("telegram daemon", () => {
 			...transitionFsCapabilities(),
 			mkdir: (file, opts) => fs.promises.mkdir(file, opts).then(() => undefined),
 			readFile: async (file, encoding) => {
-				if (file === paths.state && ++stateReads === 4) {
+				if (file === paths.state && ++stateReads === 6) {
 					boundAtStateRead = stateReads;
 					published = true;
 					childProvenanceAvailable = true;
@@ -1565,7 +1607,7 @@ describe("telegram daemon", () => {
 				},
 			),
 		).resolves.toBe("attached");
-		expect(boundAtStateRead).toBe(4);
+		expect(boundAtStateRead).toBe(6);
 		expect(spawned).toBe(1);
 		expect(published).toBe(true);
 		expect(JSON.parse(fs.readFileSync(paths.roots, "utf8"))).toMatchObject({
@@ -11097,7 +11139,12 @@ test("pollOnce backs off on a Telegram 409 conflict instead of processing update
 	expect(await daemon.pollOnce()).toBe(0);
 	expect(await daemon.pollOnce()).toBe(0);
 	expect(await daemon.pollOnce()).toBe(0);
-	expect(sleeps).toEqual([500, 1_000, 2_000, 4_000, 5_000, 5_000]);
+	expect(sleeps).toHaveLength(6);
+	expect(sleeps[0]).toBe(1_000);
+	for (let index = 1; index < sleeps.length; index++) {
+		if (sleeps[index] < 10_000) expect(sleeps[index]).toBeGreaterThanOrEqual(sleeps[index - 1] * 1.5);
+		expect(sleeps[index]).toBeLessThanOrEqual(Math.min(sleeps[index - 1] * 2, 10_000));
+	}
 });
 
 test("TelegramUpdatePoller logs getUpdates failures only on transition and reports suppressed recovery", async () => {

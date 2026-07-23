@@ -744,6 +744,13 @@ export async function renewOwnerHeartbeatSidecar(input: {
 		await fsImpl.unlink(tmp).catch(() => undefined);
 		return false;
 	}
+	// Revalidate the exact lock after the temporary sidecar exists so a stale
+	// writer cannot publish after ownership moved during its write.
+	const finalLock = await readOwnershipLock(fsImpl, paths.lock);
+	if (!ownershipLockMatchesState(finalLock, state)) {
+		await fsImpl.unlink(tmp).catch(() => undefined);
+		return false;
+	}
 	await fsImpl.rename(tmp, paths.heartbeat);
 	return true;
 }
@@ -1782,10 +1789,11 @@ export async function acquireDaemonOwnership(input: {
 	// Generation is inventory-only: a lower servingEpoch triggers convergence,
 	// while same-epoch cross-generation owners attach.
 	const attachDecision = (
-		state: DaemonState | undefined,
+		snapshot: Awaited<ReturnType<typeof readOwnerFreshnessSnapshot>>,
 	):
 		| { acquired: false; attached: boolean; blocked?: boolean; provisional?: boolean; reloadRequired?: boolean }
 		| undefined => {
+		const state = snapshot.state;
 		if (state && !hasSafeDaemonStateShape(state)) {
 			const malformed = state as Partial<DaemonState>;
 			if (
@@ -1818,6 +1826,7 @@ export async function acquireDaemonOwnership(input: {
 				chatId: input.chatId,
 				pidAlive,
 				pidIncarnation,
+				effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 			})
 		)
 			return { acquired: false, attached: true };
@@ -1832,6 +1841,7 @@ export async function acquireDaemonOwnership(input: {
 				chatId: input.chatId,
 				pidAlive,
 				pidIncarnation,
+				effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 			}) &&
 			(state.version !== DAEMON_VERSION ||
 				((state.servingEpoch === undefined ? 1 : state.servingEpoch) < SERVING_EPOCH &&
@@ -1885,7 +1895,8 @@ export async function acquireDaemonOwnership(input: {
 	const transition = await acquireTransitionLock({ fs: fsImpl, path: paths.steal, pidAlive, pidIncarnation });
 	if (!transition) return { acquired: false, attached: false, provisional: true };
 	try {
-		const rechecked = await readJson<DaemonState>(fsImpl, paths.state);
+		const recheckedSnapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: fsImpl });
+		const rechecked = recheckedSnapshot.state;
 		const recheckedLock = await readOwnershipLock(fsImpl, paths.lock);
 		const recheckedForeignOwner = classifyForeignLiveOwner({
 			state: rechecked,
@@ -1911,7 +1922,7 @@ export async function acquireDaemonOwnership(input: {
 			})
 		)
 			return { acquired: false, attached: false, blocked: true };
-		const recheckedDecision = isLegacyParentDaemonState(rechecked) ? undefined : attachDecision(rechecked);
+		const recheckedDecision = isLegacyParentDaemonState(rechecked) ? undefined : attachDecision(recheckedSnapshot);
 		if (
 			recheckedDecision &&
 			(recheckedDecision.attached ||
@@ -2346,7 +2357,8 @@ export async function waitForTelegramDaemonReady(input: {
 	const deadline = now() + timeoutMs;
 	const maxPolls = Math.ceil(timeoutMs / waitStepMs);
 	for (let poll = 0; poll <= maxPolls; poll++) {
-		const state = await readDaemonState(input.settings, input.fs);
+		const snapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: input.fs });
+		const state = snapshot.state;
 		if (
 			(!input.ownerId || state?.ownerId === input.ownerId) &&
 			(!input.acquisitionId || state?.acquisitionId === input.acquisitionId) &&
@@ -2365,6 +2377,7 @@ export async function waitForTelegramDaemonReady(input: {
 				chatId: input.chatId,
 				pidAlive,
 				pidIncarnation,
+				effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 			})
 		)
 			return true;
@@ -2434,7 +2447,8 @@ export async function confirmTelegramDaemonSpawn(input: {
 		sleep: input.sleep,
 	});
 	if (retired) return false;
-	const state = await readDaemonState(input.settings, input.fs);
+	const snapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: input.fs });
+	const state = snapshot.state;
 	if (
 		hasExactChildPid &&
 		isCurrentCompatibleOwner({
@@ -2444,6 +2458,7 @@ export async function confirmTelegramDaemonSpawn(input: {
 			chatId: input.chatId,
 			pidAlive: input.pidAlive ?? defaultPidAlive,
 			pidIncarnation: input.pidIncarnation ?? defaultPidIncarnation,
+			effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 		}) &&
 		(state?.ownerId !== input.spawned.acquisition.ownerId ||
 			state.acquisitionId !== input.spawned.acquisition.acquisitionId ||
@@ -3053,7 +3068,8 @@ export async function ensureTelegramDaemonRunningDetailed(
 					// Iteration-capped so a frozen `now` cannot spin forever.
 					const maxWaits = Math.ceil(waitBudgetMs / waitStepMs);
 					for (let waits = 0; waits <= maxWaits; waits++) {
-						const state = await readDaemonState(input.settings, fsImpl);
+						const snapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: fsImpl });
+						const state = snapshot.state;
 						const t = now();
 						if (
 							isFreshLiveOwner({
@@ -3063,6 +3079,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 								chatId: cfg.chatId,
 								pidAlive,
 								pidIncarnation,
+								effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 							}) &&
 							isSignalableMatchingOwner({
 								state,
@@ -3298,7 +3315,7 @@ export type TelegramPollResult =
 export interface TelegramUpdatePollerOptions {
 	botApi: BotApi;
 	runtime: NotificationOperatorRuntime;
-	backoff: OperatorBackoffPolicy;
+	backoff: { next(): number; reset(): void };
 	processUpdate: (update: unknown) => Promise<TelegramUpdateOutcome>;
 	health?: TelegramPollHealth;
 }
@@ -3357,6 +3374,20 @@ export class TelegramPollHealth {
 			previousStatus,
 			suppressedCount,
 		});
+	}
+}
+
+class JitteredPollConflictBackoff {
+	#currentMs = 0;
+
+	next(): number {
+		if (this.#currentMs === 0) this.#currentMs = POLL_BACKOFF_MS;
+		else this.#currentMs = Math.min(this.#currentMs * (1.5 + Math.random() * 0.5), 10_000);
+		return this.#currentMs;
+	}
+
+	reset(): void {
+		this.#currentMs = 0;
 	}
 }
 
@@ -3760,7 +3791,7 @@ export class TelegramNotificationDaemon {
 
 	private readonly runtime: NotificationOperatorRuntime;
 	private readonly sessionRouter: OperatorEventRouter<SessionSocket>;
-	private readonly pollConflictBackoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 5_000 });
+	private readonly pollConflictBackoff = new JitteredPollConflictBackoff();
 	private readonly loopBackoff = new OperatorBackoffPolicy({ initialMs: 250, maxMs: 4_000 });
 	private running = false;
 	/** Once set, a concurrent startup await can never restore a running daemon. */

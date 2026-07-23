@@ -29,6 +29,7 @@ import {
 } from "./config";
 import { type DaemonPaths, daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import { DAEMON_GENERATION } from "./telegram-daemon-contract";
+import { readOwnerFreshnessSnapshot } from "./telegram-daemon";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
 
@@ -580,8 +581,9 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 
 	// Daemon ownership state (offline; read the persisted state file directly).
 	const paths = daemonPaths(opts.settings.getAgentDir());
+	const snapshot = await readOwnerFreshnessSnapshot({ settings: opts.settings, fs: fs as unknown as import("./telegram-daemon").TelegramDaemonFs });
 	const state = await readDaemonStateFile(fs, paths.state);
-	const heartbeatAt = state?.heartbeatAt;
+	const heartbeatAt = snapshot.effectiveHeartbeatAt;
 	const daemon: DaemonHealth = {
 		present: Boolean(state),
 		ownerId: state?.ownerId,
