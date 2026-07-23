@@ -25,6 +25,10 @@ import {
 } from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { getSkillManifest } from "./workflow-manifest";
+import {
+	parseReviewConflictDocument,
+	serializeReviewConflictDocument,
+} from "./ralplan-review-conflicts";
 
 /**
  * Native implementation of `gjc ralplan`.
@@ -41,9 +45,11 @@ import { getSkillManifest } from "./workflow-manifest";
  * 2. **Artifact write**: `gjc ralplan --write --stage <type> --stage_n <N>
  *    (--artifact <path-or-string> | --artifact-env GJC_RALPLAN_ARTIFACT)
  *    [--run-id <id>] [--session-id <id>] [--json]` persists Planner / Architect
- *    / Critic / revision / post-interview / ADR / final markdown under `.gjc/plans/ralplan/<run-id>/`, maintains
- *    an `index.jsonl` audit log, copies `final` stages to `pending-approval.md`, and advances
- *    the HUD chip to reflect the latest persisted stage.
+ *    / Critic / disposition / revision / post-interview / ADR / final artifacts under
+ *    `.gjc/plans/ralplan/<run-id>/`, maintains an `index.jsonl` audit log, copies `final`
+ *    stages to `pending-approval.md`, and advances the HUD chip to reflect the latest
+ *    persisted stage. Disposition stage artifacts are fail-closed JSON documents that
+ *    record typed review conflicts and their explicit dispositions (#2902).
  */
 
 export interface RalplanCommandResult {
@@ -52,7 +58,16 @@ export interface RalplanCommandResult {
 	stderr?: string;
 }
 
-const KNOWN_STAGES = ["planner", "architect", "critic", "revision", "post-interview", "adr", "final"] as const;
+const KNOWN_STAGES = [
+	"planner",
+	"architect",
+	"critic",
+	"disposition",
+	"revision",
+	"post-interview",
+	"adr",
+	"final",
+] as const;
 type RalplanStage = (typeof KNOWN_STAGES)[number];
 
 const KNOWN_ARCHITECT_KINDS = new Set(["openai-code"]);
@@ -648,10 +663,28 @@ async function buildRalplanHud(options: {
 	});
 }
 
+/**
+ * Disposition-stage artifacts are machine-checkable JSON. Validate and
+ * re-serialize to canonical form so join gates and re-review share one shape.
+ */
+function normalizeDispositionArtifact(raw: string): string {
+	try {
+		const doc = parseReviewConflictDocument(raw);
+		return serializeReviewConflictDocument(doc);
+	} catch (error) {
+		throw new RalplanCommandError(
+			2,
+			`invalid ralplan disposition artifact: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
 async function handleArtifactWrite(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
 	const plannerState = parsePlannerStateArgs(args);
 	const resolved = await resolveArtifactArgs(args, cwd);
-	const content = resolved.artifact.endsWith("\n") ? resolved.artifact : `${resolved.artifact}\n`;
+	const normalizedArtifact =
+		resolved.stage === "disposition" ? normalizeDispositionArtifact(resolved.artifact) : resolved.artifact;
+	const content = normalizedArtifact.endsWith("\n") ? normalizedArtifact : `${normalizedArtifact}\n`;
 	const sha256 = createHash("sha256").update(content).digest("hex");
 
 	// Duplicate-write guard: a second `--write` for the same (stage, stage_n) must not
