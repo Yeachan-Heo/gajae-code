@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { type Context, getBundledModel, type Model } from "@gajae-code/ai";
+import { type Context, getBundledModel, type Model, validateToolArguments } from "@gajae-code/ai";
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
-import { toolWireSchema } from "@gajae-code/ai/utils/schema";
+import { isJsonSchemaValueValid, toolWireSchema } from "@gajae-code/ai/utils/schema";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createTools, type ToolSession } from "@gajae-code/coding-agent/tools";
 
@@ -63,6 +63,35 @@ function roundZeroIntentArguments(intentContract?: JsonObject, intentReview?: Js
 					...(intentContract === undefined ? {} : { intent_contract: intentContract }),
 					...(intentReview === undefined ? {} : { intent_review: intentReview }),
 				},
+			},
+		],
+	};
+}
+
+function positiveRoundIntentReviewArguments(): JsonObject {
+	return {
+		questions: [
+			{
+				id: "round-1-intent-review",
+				question: "Approve the observed intent",
+				options: [{ label: "Approve" }],
+				multi: null,
+				recommended: null,
+				deepInterview: {
+					round_id: null,
+					round: 1,
+					component: "locked-intent",
+					dimension: "constraints",
+					ambiguity: 0,
+					confused_terms: null,
+					references: null,
+					intent_review: {
+						observed_items: [],
+						supporting_substitutions: [],
+						approval_options: [],
+					},
+				},
+				workflowGate: null,
 			},
 		],
 	};
@@ -174,5 +203,38 @@ describe("issue #2643 — OpenAI completions AskTool wire contract", () => {
 			expect(branches.some(branch => hasProperties(branch, [expected]))).toBe(true);
 			expect(branches.some(branch => hasProperties(branch, [excluded]))).toBe(false);
 		}
+	});
+
+	it("routes wire-valid empty positive-round reviews to canonical Zod diagnostics", async () => {
+		// Given
+		const payload = await capturePayload("post-topology");
+		const parameters = askParametersFromPayload(payload);
+		const arguments_ = positiveRoundIntentReviewArguments();
+		const tool = await askTool("post-topology");
+		const validateRaw = tool.rawArgumentValidation;
+		if (!validateRaw) throw new Error("AskTool omitted raw argument validation");
+
+		// When
+		const rawValidation = validateRaw(arguments_);
+		let validationError: unknown;
+		try {
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "ask-positive-round-empty-review",
+				name: "ask",
+				arguments: arguments_,
+			});
+		} catch (error) {
+			validationError = error;
+		}
+
+		// Then
+		expect(isJsonSchemaValueValid(parameters, arguments_)).toBe(true);
+		expect(rawValidation).toEqual({ outcome: "passthrough" });
+		expect(validationError).toBeInstanceOf(Error);
+		if (!(validationError instanceof Error)) throw new Error("Expected canonical Ask validation to reject");
+		expect(validationError.message).toContain("questions/0/deepInterview/intent_review/observed_items");
+		expect(validationError.message).toContain("questions/0/deepInterview/intent_review/approval_options");
+		expect(validationError.message).not.toContain("raw arguments rejected before coercion");
 	});
 });

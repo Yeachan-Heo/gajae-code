@@ -428,7 +428,10 @@ function knownIntentRejection(arguments_: Record<string, unknown>): RawArgumentV
 		return { outcome: "reject", code: "ask-intent-contract-requires-non-empty-authority" };
 	return undefined;
 }
-function recoverRoundZeroIntentContract(arguments_: Record<string, unknown>): RawArgumentValidationResult {
+function recoverRoundZeroIntentContract(
+	arguments_: Record<string, unknown>,
+	stage?: "topology" | "post-topology",
+): RawArgumentValidationResult {
 	if (!isRoundZeroRecoveryCandidate(arguments_)) return { outcome: "passthrough" };
 	const normalizedArguments = normalizeRoundZeroOptionalNulls(arguments_);
 	const knownRejection = knownIntentRejection(normalizedArguments);
@@ -490,10 +493,19 @@ function recoverRoundZeroIntentContract(arguments_: Record<string, unknown>): Ra
 		"intent_contract",
 		"intent_review",
 	];
+	if (!hasOnlyAllowedOwnKeys(deepInterview, deepInterviewKeys)) return { outcome: "reject" };
 	if (
-		!hasOnlyAllowedOwnKeys(deepInterview, deepInterviewKeys) ||
-		!Object.hasOwn(deepInterview, "intent_contract") ||
-		!Object.hasOwn(deepInterview, "intent_review") ||
+		stage === "post-topology" &&
+		!hasIntentContract &&
+		hasIntentReview &&
+		typeof deepInterview.round === "number" &&
+		Number.isInteger(deepInterview.round) &&
+		deepInterview.round > 0
+	)
+		return { outcome: "passthrough" };
+	if (
+		!hasIntentContract ||
+		!hasIntentReview ||
 		deepInterview.round !== 0 ||
 		typeof deepInterview.component !== "string" ||
 		deepInterview.component !== "review-topology" ||
@@ -1152,7 +1164,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		if (stage === "post-topology") return postTopologyAskSchema;
 		return ordinaryAskSchema;
 	}
-	readonly rawArgumentValidation = recoverRoundZeroIntentContract;
+	readonly rawArgumentValidation = (arguments_: Record<string, unknown>): RawArgumentValidationResult =>
+		recoverRoundZeroIntentContract(arguments_, this.session.getDeepInterviewAskStage?.());
 	readonly strict = true;
 	readonly loadMode = "discoverable";
 
