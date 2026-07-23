@@ -4,6 +4,7 @@ import {
 	isUltragoalAskBlocked,
 	type UltragoalAskBlockDiagnostic,
 } from "../gjc-runtime/ultragoal-guard";
+import { getUltragoalStatus } from "../gjc-runtime/ultragoal-runtime";
 import { ToolError } from "./tool-errors";
 
 const ULTRAGOAL_ASK_GUARD = Symbol.for("gajae-code.ultragoalAskGuard");
@@ -51,6 +52,8 @@ export async function assertUltragoalAskAllowed(cwd: string, context: UltragoalA
 	const sessionId = sessionScopedAskGuardId(context, activeSkill);
 	const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
 	if (!diagnostic.active) return;
+	const summary = await getUltragoalStatus(cwd, sessionId);
+	if (summary.status === "complete") return;
 	const nudge = await consumeUltragoalAskNudge(cwd, sessionId);
 	if (nudge.nudged) throw new ToolError(nudge.message);
 	throw new ToolError(formatUltragoalAskBlockMessage(diagnostic));
