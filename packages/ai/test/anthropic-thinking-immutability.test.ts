@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { convertAnthropicMessages } from "@gajae-code/ai/providers/anthropic";
+import {
+	convertAnthropicMessages,
+	isAnthropicThinkingBlockMutationError,
+	isAnthropicThinkingSignatureInvalidError,
+} from "@gajae-code/ai/providers/anthropic";
 import type { AssistantMessage, Model, ToolResultMessage, UserMessage } from "@gajae-code/ai/types";
 
 const model: Model<"anthropic-messages"> = {
@@ -266,5 +270,34 @@ describe("Anthropic thinking replay immutability", () => {
 			{ role: "assistant", content: [{ type: "text", text: "late answer" }] },
 			{ role: "user", content: "Continue." },
 		]);
+	});
+});
+
+describe("Anthropic thinking replay 400 classification", () => {
+	const status400 = (message: string): Error => Object.assign(new Error(message), { status: 400 });
+	// Captured from a real session failure (2026-07-23): a historical thinking block
+	// whose signature no longer validates fails the whole request.
+	const signatureInvalidMessage =
+		'400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.24: Invalid `signature` in `thinking` block"},"request_id":"req_011CdHzaxJ77hsR8hX9U6QBH"}';
+	const latestMutationMessage =
+		'400 {"type":"error","error":{"type":"invalid_request_error","message":"The `thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."}}';
+
+	it("classifies the invalid-signature 400 variant", () => {
+		const error = status400(signatureInvalidMessage);
+		expect(isAnthropicThinkingSignatureInvalidError(error)).toBe(true);
+		// The latest-message repair matcher must NOT claim this variant: its repair
+		// scope (latest assistant only) cannot fix a historical block.
+		expect(isAnthropicThinkingBlockMutationError(error)).toBe(false);
+	});
+
+	it("keeps the latest-message mutation variant on the targeted matcher", () => {
+		const error = status400(latestMutationMessage);
+		expect(isAnthropicThinkingBlockMutationError(error)).toBe(true);
+		expect(isAnthropicThinkingSignatureInvalidError(error)).toBe(false);
+	});
+
+	it("requires HTTP 400 for the invalid-signature match", () => {
+		const error = Object.assign(new Error(signatureInvalidMessage.replace(/^400 /, "500 ")), { status: 500 });
+		expect(isAnthropicThinkingSignatureInvalidError(error)).toBe(false);
 	});
 });

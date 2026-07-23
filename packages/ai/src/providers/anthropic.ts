@@ -411,6 +411,23 @@ export function isAnthropicThinkingBlockMutationError(error: unknown): boolean {
 	);
 }
 
+/**
+ * 400 shape where a replayed `thinking`/`redacted_thinking` block fails signature
+ * validation, e.g. `messages.5.content.24: Invalid \`signature\` in \`thinking\` block`.
+ * Unlike the latest-assistant mutation error above, the cited block can sit anywhere
+ * in the replayed history, so recovery must repair every assistant message rather
+ * than only the latest one.
+ */
+export function isAnthropicThinkingSignatureInvalidError(error: unknown): boolean {
+	if (extractHttpStatusFromError(error) !== 400) return false;
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		/invalid_request_error/i.test(message) &&
+		/thinking|redacted_thinking/i.test(message) &&
+		/invalid\s+`?signature`?/i.test(message)
+	);
+}
+
 function hasStrictAnthropicTools(params: MessageCreateParamsStreaming): boolean {
 	const tools = params.tools as Array<{ strict?: unknown }> | undefined;
 	return tools?.some(tool => tool.strict === true) ?? false;
