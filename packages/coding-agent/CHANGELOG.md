@@ -5,6 +5,7 @@
 ### Fixed
 
 - On macOS, resuming a managed session no longer fails with `identity_mismatch` when the first write-append open changes only file `ctime` (e.g. APFS write-provenance / `com.apple.provenance`). `appendSync` allows a single bounded re-capture + retry when `dev`/`ino`/`size`/`mtime`/SHA-256 remain unchanged, and still rejects real content races and repeated ctime transitions (#2944).
+- Interactive `/resume` / `AgentSession.switchSession()` now awaits verified managed `local://` legacy-root migration for the newly selected session before post-commit lifecycle proceeds, matching cold-start `createAgentSession()` readiness from #2797 so synchronous `local://` resolution no longer fails with "legacy migration must complete before path resolution" after a mid-session switch (#2925).
 
 ## [0.11.7] - 2026-07-22
 ### Added

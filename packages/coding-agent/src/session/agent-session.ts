@@ -261,7 +261,7 @@ import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { buildSkillStopOutput, ensureWorkflowSkillActivationState } from "../hooks/skill-state";
-import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
+import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { resolveMemoryBackend } from "../memory-backend";
 import {
@@ -4554,6 +4554,8 @@ export class AgentSession {
 		return {
 			getArtifactsDir: () => this.sessionManager.getArtifactsDir(),
 			isManagedDestination: () => this.sessionManager.isManagedDestination(),
+			// Required for verified legacy local:// migration on managed sessions (#2797 / #2925).
+			getManagedLegacyLocalMigrationSource: () => this.sessionManager.getManagedLegacyLocalMigrationSource(),
 			getSessionId: () => this.sessionManager.getSessionId(),
 		};
 	}
@@ -14508,6 +14510,13 @@ export class AgentSession {
 				await this.sessionManager.ensureOnDisk();
 
 				if (switchingToDifferentSession) {
+					// Interactive /resume (and any other switchSession identity change) must
+					// await verified legacy local:// migration for the *new* session before
+					// post-commit session_switch / local path resolution. createAgentSession
+					// already does this at cold start (#2797); switchSession previously omitted
+					// it, so resolving local:// after /resume could fail-closed with
+					// "legacy migration must complete before path resolution" (#2925).
+					await initializeLocalRoot(this.#localProtocolOptions());
 					this.#resetHindsightConversationTrackingIfHindsight();
 					this.#resetIrcRosterDeliveryState();
 				}

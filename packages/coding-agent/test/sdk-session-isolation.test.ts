@@ -157,6 +157,76 @@ describe("createAgentSession session storage isolation", () => {
 			await session.dispose();
 		}
 	}, 20_000);
+
+	it("migrates a switched managed session's legacy local:// root before resolution (#2925)", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-switch-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+
+		// Session A — start here so createAgentSession initializes A's local root only.
+		const sessionA = SessionManager.create(cwd, destination);
+		sessionA.appendMessage({ role: "user", content: "session A", timestamp: Date.now() });
+		await sessionA.flush();
+		const sessionAFile = sessionA.getSessionFile();
+		if (!sessionAFile) throw new Error("Expected session A path");
+		await sessionA.close();
+
+		// Session B — carry a legacy artifacts/local tree that needs verified migration.
+		const sessionB = SessionManager.create(cwd, destination);
+		sessionB.appendMessage({ role: "user", content: "session B", timestamp: Date.now() });
+		await sessionB.flush();
+		const sessionBFile = sessionB.getSessionFile();
+		if (!sessionBFile) throw new Error("Expected session B path");
+		const sessionBArtifacts = sessionB.getArtifactsDir();
+		if (!sessionBArtifacts) throw new Error("Expected session B artifacts path");
+		const legacyLocalRoot = path.join(sessionBArtifacts, "local");
+		fs.mkdirSync(legacyLocalRoot, { recursive: true, mode: 0o700 });
+		fs.writeFileSync(path.join(legacyLocalRoot, "switched.md"), "switched-bytes", { mode: 0o600 });
+		await sessionB.close();
+
+		const managerA = await SessionManager.open(sessionAFile, destination);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: managerA,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		try {
+			expect(await session.switchSession(sessionBFile)).toBe(true);
+
+			const localOptions = {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				isManagedDestination: () => session.sessionManager.isManagedDestination(),
+				getManagedLegacyLocalMigrationSource: () => session.sessionManager.getManagedLegacyLocalMigrationSource(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			};
+			const resolved = resolveLocalUrlToPath("local://switched.md", localOptions);
+			expect(resolved).toBe(path.join(resolveLocalRoot(localOptions), "switched.md"));
+			expect(fs.readFileSync(resolved, "utf8")).toBe("switched-bytes");
+			// Legacy source retired after verified migration (marker may be verified or cleanup_pending).
+			expect(fs.existsSync(path.join(legacyLocalRoot, "switched.md"))).toBe(false);
+			const marker = fs.readFileSync(
+				path.join(resolveLocalRoot(localOptions), ".gjc-local-legacy-migrated-v1"),
+				"utf8",
+			);
+			expect(marker === "verified\n" || marker === "cleanup_pending\n").toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("initializes a default local root without shadowing an explicit owner", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-owner-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
