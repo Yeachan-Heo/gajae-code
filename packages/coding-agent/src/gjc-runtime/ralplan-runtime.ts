@@ -11,6 +11,7 @@ import {
 	type RalplanIndexRow,
 	summarizeRalplanIndex,
 } from "./ledger-event-renderer";
+import { captureRepositoryBinding } from "./repository-binding";
 import { GJC_RALPLAN_ARTIFACT_ENV, isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
 import { modeStatePath, sessionPlansDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
@@ -23,7 +24,6 @@ import {
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
-import { captureRepositoryBinding } from "./repository-binding";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { getSkillManifest } from "./workflow-manifest";
 

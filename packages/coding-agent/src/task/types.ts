@@ -79,11 +79,7 @@ const repositoryBindingSchema = z
 		schema: z.literal("gjc.repository_binding.v1"),
 		worktreeRoot: z.string().min(1).describe("canonical git worktree root"),
 		commonDir: z.string().min(1).nullable().describe("git common dir, or null outside a git checkout"),
-		relativeSubdir: z
-			.string()
-			.min(1)
-			.optional()
-			.describe("optional repo-relative subdirectory; not an absolute cwd"),
+		relativeSubdir: z.string().min(1).optional().describe("optional repo-relative subdirectory; not an absolute cwd"),
 		displayPath: z.string().min(1).optional().describe("human-facing path; never used for authority"),
 		head: z.string().min(1).optional(),
 		branch: z.string().min(1).optional(),
