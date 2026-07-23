@@ -182,7 +182,7 @@ function getByPath(obj: RawSettings, segments: string[]): unknown {
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
-	light: "blue-crab",
+	light: "blue-crab-light",
 } as const;
 
 function isLegacyThemeName(name: string): name is keyof typeof LEGACY_THEME_NAME_REPLACEMENTS {
@@ -1389,7 +1389,7 @@ export class Settings implements NotificationSettingsReader {
 			const migratedTheme = this.#migrateLegacyBuiltInThemeName(oldTheme);
 			if (oldTheme === "dark" && migratedTheme === "red-claw") {
 				raw.theme = { dark: migratedTheme };
-			} else if (oldTheme === "light" && migratedTheme === "blue-crab") {
+			} else if (oldTheme === "light" && migratedTheme === "blue-crab-light") {
 				raw.theme = { light: migratedTheme };
 			} else {
 				const slot = this.#getThemeSlotForName(migratedTheme);
