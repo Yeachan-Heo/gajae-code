@@ -9545,6 +9545,33 @@ test("topic creation transport failures fail closed without flat delivery", asyn
 	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
 });
 
+test("cooldown-suppressed topic creation is a quiet per-attempt refusal", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	bot.call = async (method, body) => {
+		bot.calls.push({ method, body });
+		if (method === "createForumTopic") return undefined;
+		return { ok: true, result: true };
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	Object.assign(daemon, { pairedChatPrivate: true });
+	const warning = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		await expect((daemon as any).ensureTopic("S", "topic")).resolves.toBeUndefined();
+		await expect((daemon as any).ensureTopic("S", "topic")).resolves.toBeUndefined();
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(2);
+		expect(warning).not.toHaveBeenCalled();
+	} finally {
+		warning.mockRestore();
+	}
+});
+
 test("malformed topic creation success is attempted once per endpoint and fails closed", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
@@ -13061,6 +13088,24 @@ describe("telegram daemon action-needed rich delivery (G004)", () => {
 			([, route]) => route.sessionId === "S" && route.actionId === "ask",
 		);
 		expect(askEntry).toBeDefined();
+	});
+
+	test("off (rich.enabled=false) ask stops HTML chunks on a cooldown-suppressed send", async () => {
+		FakeWs.instances = [];
+		const bot = new RichFakeBotApi();
+		const call = bot.call.bind(bot);
+		bot.call = async (method, body, options) =>
+			method === "sendMessage" ? undefined : await call(method, body, options);
+		const daemon = makeAskDaemon(bot, { enabled: false });
+		await daemon.handleSessionMessage(daemon.sessions.get("S")!, {
+			type: "action_needed",
+			kind: "ask",
+			id: "ask",
+			question: "Q",
+			options: ["Y", "N"],
+		});
+		expect(countMethod(bot, "sendMessage")).toBe(0);
+		expect(daemon.messageRoutes.size).toBe(0);
 	});
 });
 
@@ -17139,6 +17184,37 @@ test("Telegram Bot API 429 cooldown suppresses outbound calls while polling cont
 	} finally {
 		warning.mockRestore();
 	}
+});
+
+test("Telegram Bot API 429 cooldown starts when a delayed response is received", async () => {
+	const agentDir = tempAgentDir();
+	let now = 0;
+	const calls: string[] = [];
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: {
+			async call(method) {
+				calls.push(method);
+				if (method === "sendMessage" && calls.filter(entry => entry === "sendMessage").length === 1) {
+					now = 5_000;
+					return { ok: false, error_code: 429, parameters: { retry_after: 3 } };
+				}
+				return { ok: true, result: true };
+			},
+		},
+		WebSocketImpl: FakeWs as any,
+		now: () => now,
+	});
+	const api = (daemon as any).botApi as BotApi;
+	await api.call("sendMessage", { chat_id: 42, text: "delayed 429" });
+	now = 7_999;
+	expect(await api.call("sendMessage", { chat_id: 42, text: "still suppressed" })).toBeUndefined();
+	now = 8_000;
+	expect(await api.call("sendMessage", { chat_id: 42, text: "resumed" })).toMatchObject({ ok: true });
+	expect(calls.filter(method => method === "sendMessage")).toHaveLength(2);
 });
 
 test("Telegram Bot API 429 cooldown clamps malformed retry_after values and does not hot-loop", async () => {

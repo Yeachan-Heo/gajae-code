@@ -4452,7 +4452,12 @@ export function createNotificationsExtension(
 			const { settings, settingsAvailable } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
 			try {
-				return await ensureTelegramOwner(settings, binding.cwd, binding.sessionId);
+				const result = await ensureTelegramOwner(settings, binding.cwd, binding.sessionId);
+				const runtime = runtimes.get(binding.sessionId);
+				if (result === "ready" && runtime && isTelegramConfigured(resolveSettings(options.settings).cfg)) {
+					runtime.notificationRootRegistration = { settings, cwd: binding.cwd };
+				}
+				return result;
 			} catch {
 				return "failed";
 			}

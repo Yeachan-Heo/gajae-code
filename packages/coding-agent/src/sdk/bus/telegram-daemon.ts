@@ -4275,8 +4275,8 @@ export class TelegramNotificationDaemon {
 
 	private async refreshBotIdentity(): Promise<void> {
 		try {
-			const response = (await this.botApi.call("getMe", {})) as { result?: { username?: unknown } };
-			const username = response.result?.username;
+			const response = (await this.botApi.call("getMe", {})) as { result?: { username?: unknown } } | undefined;
+			const username = response?.result?.username;
 			this.botUsername =
 				typeof username === "string" && username.trim() ? username.trim().replace(/^@/, "") : undefined;
 		} catch {
@@ -4309,7 +4309,8 @@ export class TelegramNotificationDaemon {
 		}
 		const response = await this.effects.call(rawBotApi, method, body, callOpts);
 		const retryAfterMs = this.cooldownRetryAfterMs(response);
-		if (retryAfterMs !== undefined) this.botCooldownUntil = Math.max(this.botCooldownUntil, now + retryAfterMs);
+		if (retryAfterMs !== undefined)
+			this.botCooldownUntil = Math.max(this.botCooldownUntil, (this.opts.now?.() ?? Date.now()) + retryAfterMs);
 		return response;
 	}
 
@@ -6051,13 +6052,20 @@ export class TelegramNotificationDaemon {
 		let acceptedTopicId: string | undefined;
 		let acceptedTopicCompensated = false;
 		let acceptedTopicDeleteAttempted = false;
+		let creationSuppressed = false;
 		try {
 			const rec = await this.topics.getOrCreateTopic(
 				sessionId,
 				async () => {
 					if (capturedCreationLease && !this.#leaseTokenAllows(capturedCreationLease))
 						throw new Error("topic authority was revoked during creation");
-					const res = await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name });
+					const res = (await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name })) as
+						| { result?: { message_thread_id?: unknown } }
+						| undefined;
+					if (res === undefined) {
+						creationSuppressed = true;
+						return undefined;
+					}
 					if (isThreadedModeCapabilityRefusal(res)) throw new ThreadedModeCapabilityRefusal();
 					const response = res as {
 						ok?: unknown;
@@ -6141,7 +6149,7 @@ export class TelegramNotificationDaemon {
 			}
 			return rec.topicId;
 		} catch (err) {
-			if (err instanceof ThreadedModeCapabilityRefusal) return undefined;
+			if (creationSuppressed || err instanceof ThreadedModeCapabilityRefusal) return undefined;
 			if (
 				acceptedTopicId &&
 				!acceptedTopicCompensated &&
@@ -6740,9 +6748,9 @@ export class TelegramNotificationDaemon {
 							text: "Selected!",
 						},
 						{ signal: controller.signal, noRetry: true },
-					)) as { ok?: unknown; result?: { message_id?: unknown } };
-					const messageId = response.result?.message_id;
-					const delivered = response.ok === true && typeof messageId === "number";
+					)) as { ok?: unknown; result?: { message_id?: unknown } } | undefined;
+					const messageId = response?.result?.message_id;
+					const delivered = response?.ok === true && typeof messageId === "number";
 					this.finishSelectedAck(
 						selectedAck,
 						delivered ? { status: "delivered", messageId } : { status: "failed", reason: "telegram_rejected" },
@@ -6935,7 +6943,7 @@ export class TelegramNotificationDaemon {
 									text: chunks[0],
 									parse_mode: TELEGRAM_PARSE_MODE,
 								})) as { ok?: boolean; description?: string } | null;
-								edited = res?.ok !== false || /not modified/i.test(String(res?.description ?? ""));
+								edited = res?.ok === true || /not modified/i.test(String(res?.description ?? ""));
 							} catch {
 								edited = false;
 							}
@@ -7103,6 +7111,7 @@ export class TelegramNotificationDaemon {
 				ok?: unknown;
 				result?: { type?: unknown };
 			};
+			if (res === undefined) return "indeterminate";
 			if (res?.ok !== true) {
 				logger.warn("notifications: getChat privacy check indeterminate (non-success response)");
 				return "indeterminate";
@@ -7326,7 +7335,7 @@ export class TelegramNotificationDaemon {
 				parse_mode: TELEGRAM_PARSE_MODE,
 				reply_markup: { inline_keyboard },
 			});
-			if (response && typeof response === "object" && (response as { ok?: unknown }).ok === false) {
+			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
 				for (const alias of aliases) this.#modelChoiceAliases.delete(alias);
 				logger.warn("notifications: failed to send model selection keyboard");
 				return false;
@@ -7907,7 +7916,7 @@ export class TelegramNotificationDaemon {
 			// returns the last chunk's message_id (the reply-routable message).
 			const sendHtmlChunks = async (): Promise<number | undefined> => {
 				const chunks = splitTelegramHtml(rendered.text);
-				let result: { result?: { message_id?: number } } = {};
+				let result: { result?: { message_id?: number } } | undefined;
 				for (let i = 0; i < chunks.length; i++) {
 					if (!this.#leaseTokenAllows(socketLease) || (topicLease && !this.topicLeaseIsCurrent(topicLease)))
 						return undefined;
@@ -7917,9 +7926,10 @@ export class TelegramNotificationDaemon {
 						text: chunks[i]!,
 						parse_mode: TELEGRAM_PARSE_MODE,
 						...(i === chunks.length - 1 && inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),
-					})) as { result?: { message_id?: number } };
+					})) as { result?: { message_id?: number } } | undefined;
+					if (result === undefined) return undefined;
 				}
-				return result.result?.message_id;
+				return result?.result?.message_id;
 			};
 			const kind = msg.kind === "idle" ? "idle" : "ask";
 			if (this.opts.rich?.enabled !== false) {
