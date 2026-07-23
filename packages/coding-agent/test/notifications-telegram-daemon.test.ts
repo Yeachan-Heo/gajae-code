@@ -42,6 +42,8 @@ import {
 	registerNotificationRoot,
 	releaseDaemonOwnership,
 	renewDaemonHeartbeat,
+	readOwnerFreshnessSnapshot,
+	renewOwnerHeartbeatSidecar,
 	retireProvisionalDaemonOwnership,
 	spawnTelegramDaemonOwner,
 	TelegramBotTransport,
@@ -74,6 +76,42 @@ function attachmentAccess(daemon: TelegramNotificationDaemon): AttachmentTestAcc
 	return daemon as unknown as AttachmentTestAccess;
 }
 
+
+test("steady ownership heartbeat advances only the owner-tagged sidecar", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	let now = 1;
+	const ownership = await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+		now: () => now,
+	});
+	expect(ownership.acquired).toBe(true);
+	expect(
+		await renewDaemonHeartbeat({
+			settings: s,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			pid: process.pid,
+			now: () => now,
+		}),
+	).toBe(true);
+	now = 2;
+	expect(
+		await renewOwnerHeartbeatSidecar({
+			settings: s,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			pid: process.pid,
+			now: () => now,
+		}),
+	).toBe(true);
+	expect((await readDaemonState(s))?.heartbeatAt).toBe(1);
+	expect((await readOwnerFreshnessSnapshot({ settings: s })).effectiveHeartbeatAt).toBe(2);
+});
 test("endpoint authority digest canonicalizes endpoint presentation and binds authenticated identity", () => {
 	const canonical = endpointAuthorityDigest("ws://LOCALHOST:80/sdk?ignored=yes#ignored", "token");
 	expect(canonical).toBe(endpointAuthorityDigest("ws://localhost/sdk", "token"));
