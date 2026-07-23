@@ -36,9 +36,7 @@ async function main(): Promise<void> {
 	const dogfoodRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-dogfood-2902-"));
 	const sessionId = `dogfood-2902-${process.pid}`;
 	const env = { ...process.env, GJC_SESSION_ID: sessionId };
-	const short = Bun.spawnSync(["git", "-C", repoRoot, "rev-parse", "--short", "HEAD"]).stdout
-		.toString()
-		.trim();
+	const short = Bun.spawnSync(["git", "-C", repoRoot, "rev-parse", "--short", "HEAD"]).stdout.toString().trim();
 
 	console.log("# Dogfood: ralplan review conflicts (#2902)");
 	console.log(`root=${dogfoodRoot}`);
@@ -125,17 +123,7 @@ async function main(): Promise<void> {
 	console.log("## 3) disposition stage with complete dispositions (expect accept)");
 	const closed = await runCli(
 		dogfoodRoot,
-		[
-			"ralplan",
-			"--write",
-			"--stage",
-			"disposition",
-			"--stage_n",
-			"1",
-			"--artifact",
-			closedPath,
-			"--json",
-		],
+		["ralplan", "--write", "--stage", "disposition", "--stage_n", "1", "--artifact", closedPath, "--json"],
 		env,
 	);
 	console.log(`exit=${closed.code}`);

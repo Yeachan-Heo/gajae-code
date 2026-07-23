@@ -20,6 +20,7 @@ import {
 	type RepositoryBinding,
 	RepositoryBindingError,
 } from "./repository-binding";
+import { parseReviewConflictDocument, serializeReviewConflictDocument } from "./ralplan-review-conflicts";
 import { GJC_RALPLAN_ARTIFACT_ENV, isRestrictedRoleAgentBash } from "./restricted-role-agent-bash";
 import { modeStatePath, sessionPlansDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
@@ -34,10 +35,6 @@ import {
 } from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { getSkillManifest } from "./workflow-manifest";
-import {
-	parseReviewConflictDocument,
-	serializeReviewConflictDocument,
-} from "./ralplan-review-conflicts";
 
 /**
  * Native implementation of `gjc ralplan`.

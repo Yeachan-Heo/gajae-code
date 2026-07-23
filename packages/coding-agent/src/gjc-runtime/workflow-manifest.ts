@@ -226,16 +226,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{
 				name: "stage",
 				type: "enum",
-				enumValues: [
-					"planner",
-					"architect",
-					"critic",
-					"disposition",
-					"revision",
-					"post-interview",
-					"adr",
-					"final",
-				],
+				enumValues: ["planner", "architect", "critic", "disposition", "revision", "post-interview", "adr", "final"],
 				appliesToVerbs: ["write-artifact"],
 			},
 			{ name: "stage_n", type: "number", appliesToVerbs: ["write-artifact"] },

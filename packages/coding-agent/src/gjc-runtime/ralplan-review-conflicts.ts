@@ -12,12 +12,7 @@ export const RALPLAN_REVIEW_CONFLICTS_SCHEMA = "ralplan.review_conflicts.v1" as 
 export type ReviewAction = "add" | "remove" | "change" | "clarify";
 export type ReviewRole = "architect" | "critic";
 export type ReviewSeverity = "info" | "watch" | "block";
-export type DispositionChoice =
-	| "accept_architect"
-	| "accept_critic"
-	| "synthesize"
-	| "defer_user"
-	| "reject_both";
+export type DispositionChoice = "accept_architect" | "accept_critic" | "synthesize" | "defer_user" | "reject_both";
 
 export interface ReviewSourceReceipt {
 	stage: "architect" | "critic";
@@ -167,7 +162,10 @@ function parseFinding(value: unknown, index: number): ReviewFinding {
 		severity: parseSeverity(value.severity, `findings[${index}].severity`),
 		evidence: nonEmptyString(value.evidence, `findings[${index}].evidence`),
 		sourceRole: parseRole(value.sourceRole ?? value.source_role, `findings[${index}].sourceRole`),
-		sourceReceipt: parseSourceReceipt(value.sourceReceipt ?? value.source_receipt, `findings[${index}].sourceReceipt`),
+		sourceReceipt: parseSourceReceipt(
+			value.sourceReceipt ?? value.source_receipt,
+			`findings[${index}].sourceReceipt`,
+		),
 	};
 	const proposedOwner = value.proposedOwner ?? value.proposed_owner;
 	if (proposedOwner !== undefined) {
@@ -189,7 +187,10 @@ function parseDisposition(value: unknown, index: number): ConflictDisposition {
 		conflictId: nonEmptyString(value.conflictId ?? value.conflict_id, `dispositions[${index}].conflictId`),
 		choice: parseDispositionChoice(value.choice, `dispositions[${index}].choice`),
 		rationale: nonEmptyString(value.rationale, `dispositions[${index}].rationale`),
-		decisionOwner: nonEmptyString(value.decisionOwner ?? value.decision_owner, `dispositions[${index}].decisionOwner`),
+		decisionOwner: nonEmptyString(
+			value.decisionOwner ?? value.decision_owner,
+			`dispositions[${index}].decisionOwner`,
+		),
 		affectedSections,
 	};
 	const at = value.dispositionedAt ?? value.dispositioned_at;
@@ -261,9 +262,7 @@ export function evaluateReviewJoinGate(
 	dispositions: readonly ConflictDisposition[],
 	precomputedConflicts?: readonly ReviewConflict[],
 ): JoinGateResult {
-	const derived = precomputedConflicts
-		? precomputedConflicts.map(c => ({ ...c }))
-		: detectReviewConflicts(findings);
+	const derived = precomputedConflicts ? precomputedConflicts.map(c => ({ ...c })) : detectReviewConflicts(findings);
 	const withStatus = applyDispositions(derived, dispositions);
 	const knownIds = new Set(withStatus.map(c => c.conflictId));
 	const openConflictIds = withStatus.filter(c => c.status === "open").map(c => c.conflictId);

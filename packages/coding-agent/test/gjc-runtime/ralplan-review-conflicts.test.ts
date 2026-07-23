@@ -10,8 +10,7 @@ import {
 } from "../../src/gjc-runtime/ralplan-review-conflicts";
 
 function finding(
-	partial: Pick<ReviewFinding, "findingId" | "targetId" | "action" | "sourceRole"> &
-		Partial<ReviewFinding>,
+	partial: Pick<ReviewFinding, "findingId" | "targetId" | "action" | "sourceRole"> & Partial<ReviewFinding>,
 ): ReviewFinding {
 	return {
 		severity: "block",
@@ -51,9 +50,7 @@ describe("ralplan review conflicts (#2902)", () => {
 		];
 		const conflicts = detectReviewConflicts(findings);
 		expect(conflicts).toHaveLength(1);
-		expect(conflicts[0]!.conflictId).toBe(
-			"conflict:contract.state_classification:arch-1:crit-1",
-		);
+		expect(conflicts[0]!.conflictId).toBe("conflict:contract.state_classification:arch-1:crit-1");
 		expect(conflicts[0]!.status).toBe("open");
 		expect(conflicts[0]!.sourceRoles.sort()).toEqual(["architect", "critic"]);
 	});
