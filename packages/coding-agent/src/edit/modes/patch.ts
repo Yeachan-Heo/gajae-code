@@ -44,6 +44,7 @@ import {
 	restoreLineEndings,
 	stripBom,
 } from "../normalize";
+import { withEditPathMutation } from "../path-mutation-lock";
 import { readEditFileText, serializeEditFileText } from "../read-file";
 import type { EditToolDetails, LspBatchRequest } from "../renderer";
 import {
@@ -93,6 +94,12 @@ export interface ApplyPatchOptions {
 	fuzzyThreshold?: number;
 	allowFuzzy?: boolean;
 	fs?: FileSystem;
+	/**
+	 * When false, skip durable cross-process file locks (in-process path mutex
+	 * still serializes). Defaults to true for the real filesystem and false for
+	 * injectible `fs` implementations.
+	 */
+	crossProcessLock?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1409,13 +1416,27 @@ function applyHunksToContent(
 
 /**
  * Apply a patch operation to the filesystem.
+ *
+ * Concurrent mutations of the same absolute path are serialized (in-process always;
+ * cross-process file lock when using the real filesystem) so disjoint concurrent
+ * edits cannot silently overwrite each other (#2900).
  */
 export async function applyPatch(input: PatchInput, options: ApplyPatchOptions): Promise<ApplyPatchResult> {
-	return applyNormalizedPatch(input, options);
+	const resolvePath = (p: string): string => resolveToCwd(p, options.cwd);
+	const absolutePath = resolvePath(input.path);
+	const mutationPaths = [absolutePath];
+	if (input.rename) {
+		const destPath = resolvePath(input.rename);
+		if (destPath !== absolutePath) mutationPaths.push(destPath);
+	}
+	const usingDefaultFs = options.fs === undefined || options.fs === defaultFileSystem;
+	const crossProcess = options.crossProcessLock ?? usingDefaultFs;
+	return withEditPathMutation(mutationPaths, () => applyNormalizedPatch(input, options), { crossProcess });
 }
 
 /**
  * Apply a normalized patch operation to the filesystem.
+ * Caller must already hold path mutation rights when concurrent writers exist.
  * @internal
  */
 async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOptions): Promise<ApplyPatchResult> {
@@ -1514,6 +1535,12 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 	const isMove = Boolean(input.rename) && destPath !== absolutePath;
 
 	if (!dryRun) {
+		// Commit-time CAS: reject if another writer mutated the file after our
+		// authoritative read (e.g. a process that did not take the path lock).
+		const commitContent = await readExistingPatchFile(fs, absolutePath, input.path);
+		if (commitContent !== originalContent) {
+			throw new ApplyPatchError(`concurrent edit conflict: file changed since read: ${input.path}`);
+		}
 		if (isMove) {
 			const parentDir = path.dirname(destPath);
 			if (parentDir && parentDir !== ".") {
