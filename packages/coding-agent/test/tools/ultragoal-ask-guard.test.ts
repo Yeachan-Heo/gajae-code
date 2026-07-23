@@ -270,6 +270,46 @@ describe("ultragoal ask guard", () => {
 		expect(select).not.toHaveBeenCalled();
 	});
 
+	it("allows ask without consuming nudges when every ultragoal story is terminal", async () => {
+		const cwd = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({
+			cwd,
+			brief: "@goal First\nFirst story\n@goal Second\nSecond story\n@goal Third\nThird story",
+		});
+		const paths = getUltragoalPaths(cwd);
+		const plan = JSON.parse(await fs.readFile(paths.goalsPath, "utf8"));
+		const now = new Date().toISOString();
+		for (const goal of plan.goals) {
+			goal.status = "complete";
+			goal.updatedAt = now;
+			goal.completedAt = now;
+			delete goal.completionVerification;
+		}
+		await fs.writeFile(paths.goalsPath, JSON.stringify(plan, null, 2));
+
+		const execute = vi.fn(async () => {});
+		const guarded = guardToolForUltragoalAsk(
+			stubAskTool(execute),
+			() => cwd,
+			() => ({
+				activeSkillState: { skill: "ultragoal", session_id: TEST_SESSION_ID },
+				sessionId: TEST_SESSION_ID,
+			}),
+		);
+
+		for (let attempt = 0; attempt < 7; attempt += 1) {
+			await expect(guarded.execute("call", {}, undefined, undefined, undefined as never)).resolves.toBeDefined();
+		}
+
+		expect(execute).toHaveBeenCalledTimes(7);
+		const ledger = (await fs.readFile(paths.ledgerPath, "utf8"))
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line));
+		expect(ledger.filter(event => event.event === "nudge" && event.surface === "ask")).toHaveLength(0);
+	});
 	it("allows ask when the ultragoal run is verified complete", async () => {
 		const cwd = await tempDir();
 		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
