@@ -691,6 +691,22 @@ function sidecarMatchesOwnerTag(
 	);
 }
 
+/**
+ * A corrupt, truncated, or otherwise unreadable sidecar must never break a
+ * freshness read: the sidecar is advisory-only, so any read/parse failure
+ * degrades to "no sidecar" (state-floor freshness), never a throw.
+ */
+async function readSidecarLenient(fsImpl: TelegramDaemonFs, file: string): Promise<OwnerHeartbeatSidecar | undefined> {
+	try {
+		const parsed: unknown = JSON.parse(await fsImpl.readFile(file, "utf8"));
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+			? (parsed as OwnerHeartbeatSidecar)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export async function readOwnerFreshnessSnapshot(input: {
 	settings: Settings;
 	fs?: TelegramDaemonFs;
@@ -703,7 +719,7 @@ export async function readOwnerFreshnessSnapshot(input: {
 	const lock = await readOwnershipLock(fsImpl, paths.lock);
 	const ownerTag = tag && ownershipLockMatchesState(lock, state) ? tag : null;
 	if (legacyEmbedded) return { ownerTag, effectiveHeartbeatAt: state?.heartbeatAt, legacyEmbedded, state };
-	const sidecar = await readJson<OwnerHeartbeatSidecar>(fsImpl, paths.heartbeat);
+	const sidecar = await readSidecarLenient(fsImpl, paths.heartbeat);
 	const rereadState = await readJson<DaemonState>(fsImpl, paths.state);
 	const rereadLock = await readOwnershipLock(fsImpl, paths.lock);
 	const rereadTag = ownerTagFromState(rereadState);

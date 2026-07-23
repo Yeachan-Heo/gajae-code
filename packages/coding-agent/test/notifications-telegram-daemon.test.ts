@@ -240,6 +240,33 @@ test("steady sidecar renewal creates no transition markers and calls no exactUnl
 	expect(stealTouches).toBe(0);
 	expect(leakArtifacts()).toEqual(before);
 });
+test("corrupt or directory sidecar degrades to state-floor freshness and never throws", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const paths = daemonPaths(agentDir);
+	let now = 1;
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+		now: () => now,
+	});
+	await renewDaemonHeartbeat({ settings: s, ownerId: "owner", acquisitionId: "owner", pid: process.pid, now: () => now });
+	const floor = (await readDaemonState(s))?.heartbeatAt;
+	for (const corrupt of ["{truncated", "", "[1,2]", "null", '{"heartbeatAt":NaN}']) {
+		fs.rmSync(paths.heartbeat, { force: true, recursive: true });
+		fs.writeFileSync(paths.heartbeat, corrupt);
+		const snapshot = await readOwnerFreshnessSnapshot({ settings: s });
+		expect(snapshot.effectiveHeartbeatAt).toBe(floor);
+	}
+	fs.rmSync(paths.heartbeat, { force: true, recursive: true });
+	fs.mkdirSync(paths.heartbeat);
+	const snapshot = await readOwnerFreshnessSnapshot({ settings: s });
+	expect(snapshot.effectiveHeartbeatAt).toBe(floor);
+	fs.rmSync(paths.heartbeat, { force: true, recursive: true });
+});
 
 test("endpoint authority digest canonicalizes endpoint presentation and binds authenticated identity", () => {
 	const canonical = endpointAuthorityDigest("ws://LOCALHOST:80/sdk?ignored=yes#ignored", "token");
