@@ -87,6 +87,43 @@ function createAnthropicThinking400(): MockAnthropicRequest {
 	};
 }
 
+// Real captured session failure (2026-07-23): the cited block index points into
+// HISTORY, not the latest assistant message.
+function createAnthropicSignatureInvalid400(): MockAnthropicRequest {
+	return {
+		async withResponse() {
+			const error = new Error(
+				'400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.5.content.24: Invalid `signature` in `thinking` block"}}',
+			);
+			(error as { status?: number }).status = 400;
+			throw error;
+		},
+	};
+}
+
+function makeSignedAssistant(suffix: string, text: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [
+			{ type: "thinking", thinking: `thinking ${suffix}`, thinkingSignature: `sig_${suffix}` },
+			{ type: "text", text },
+		],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
 describe("Anthropic thinking replay repair retry", () => {
 	it("retries once without latest assistant thinking blocks after the Anthropic 400 invariant error", async () => {
 		const user: UserMessage = {
@@ -136,6 +173,75 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(JSON.stringify(requestBodies[1])).not.toContain("synthetic_sig");
 		expect(JSON.stringify(requestBodies[1])).not.toContain("redacted_thinking");
 		expect(JSON.stringify(requestBodies[1])).toContain("visible answer");
+	});
+
+	it("retries once with thinking dropped from EVERY assistant turn after the invalid-signature 400", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("early", "early answer"),
+				{ ...user, content: "second", timestamp: Date.now() + 1 },
+				makeSignedAssistant("late", "late answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 2 },
+			],
+		};
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			return (attempt === 1 ? createAnthropicSignatureInvalid400() : createSuccessfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(requestBodies).toHaveLength(2);
+		const firstBody = JSON.stringify(requestBodies[0]);
+		expect(firstBody).toContain("sig_early");
+		expect(firstBody).toContain("sig_late");
+		// The repaired replay must drop the HISTORICAL signed block, not only the
+		// latest one — a latest-only repair would resend sig_early and 400 again.
+		const secondBody = JSON.stringify(requestBodies[1]);
+		expect(secondBody).not.toContain("sig_early");
+		expect(secondBody).not.toContain("sig_late");
+		expect(secondBody).toContain("early answer");
+		expect(secondBody).toContain("late answer");
+	});
+
+	it("stops after exactly two requests when the invalid-signature 400 persists", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("early", "early answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 1 },
+			],
+		};
+		const requestBodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			return createAnthropicSignatureInvalid400() as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(400);
+		expect(result.errorMessage).toContain("Invalid `signature`");
+		expect(requestBodies).toHaveLength(2);
 	});
 
 	it("does not retry or scrub history for non-matching Anthropic 400 errors", async () => {

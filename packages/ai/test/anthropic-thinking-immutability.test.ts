@@ -300,4 +300,15 @@ describe("Anthropic thinking replay 400 classification", () => {
 		const error = Object.assign(new Error(signatureInvalidMessage.replace(/^400 /, "500 ")), { status: 500 });
 		expect(isAnthropicThinkingSignatureInvalidError(error)).toBe(false);
 	});
+
+	it("rejects non-Error inputs and unrelated thinking-config 400s", () => {
+		expect(isAnthropicThinkingSignatureInvalidError(undefined)).toBe(false);
+		expect(isAnthropicThinkingSignatureInvalidError("Invalid `signature` in `thinking` block")).toBe(false);
+		// A thinking-related 400 without a signature complaint must not trigger the
+		// all-history thinking drop.
+		const budgetError = status400(
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"thinking.budget_tokens: Input should be greater than or equal to 1024"}}',
+		);
+		expect(isAnthropicThinkingSignatureInvalidError(budgetError)).toBe(false);
+	});
 });
