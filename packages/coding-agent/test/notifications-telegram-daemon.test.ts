@@ -7523,10 +7523,14 @@ describe("telegram daemon", () => {
 		now = 10_000;
 		[...timers.values()].find(timer => timer.ms === 5_000)?.callback();
 		for (let attempts = 0; attempts < 20; attempts++) {
-			if ((await readDaemonState(s))?.heartbeatAt === now) break;
+			const heartbeat = JSON.parse(await fs.promises.readFile(daemonPaths(agentDir).heartbeat, "utf8")) as {
+				heartbeatAt: number;
+			};
+			if (heartbeat.heartbeatAt === now) break;
 			await Bun.sleep(5);
 		}
-		expect((await readDaemonState(s))?.heartbeatAt).toBe(now);
+		expect((await readDaemonState(s))?.heartbeatAt).toBe(0);
+		expect(JSON.parse(await fs.promises.readFile(daemonPaths(agentDir).heartbeat, "utf8"))).toMatchObject({ heartbeatAt: now });
 
 		daemon.requestStop();
 		releasePoll();

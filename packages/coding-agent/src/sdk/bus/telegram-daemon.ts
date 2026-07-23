@@ -658,6 +658,96 @@ function ownershipLockMatchesState(lock: OwnershipLockRead, state: DaemonState |
 	);
 }
 
+type OwnerHeartbeatSidecar = {
+	pid: number;
+	incarnation: string;
+	ownerId: string;
+	acquisitionId: string;
+	heartbeatAt: number;
+};
+
+function ownerTagFromState(state: DaemonState | undefined): Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | undefined {
+	if (!state || !hasSafeDaemonStateShape(state) || state.stoppedAt !== undefined || !state.ownerId || !state.acquisitionId)
+		return undefined;
+	return { pid: state.pid, incarnation: state.incarnation, ownerId: state.ownerId, acquisitionId: state.acquisitionId };
+}
+
+function sidecarMatchesOwnerTag(
+	sidecar: OwnerHeartbeatSidecar | undefined,
+	tag: Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | undefined,
+): sidecar is OwnerHeartbeatSidecar {
+	return Boolean(
+		sidecar &&
+		tag &&
+		validDaemonPid(sidecar.pid) &&
+		isProcessIncarnation(sidecar.incarnation) &&
+		typeof sidecar.ownerId === "string" &&
+		typeof sidecar.acquisitionId === "string" &&
+		Number.isSafeInteger(sidecar.heartbeatAt) &&
+		sidecar.pid === tag.pid &&
+		sidecar.incarnation === tag.incarnation &&
+		sidecar.ownerId === tag.ownerId &&
+		sidecar.acquisitionId === tag.acquisitionId,
+	);
+}
+
+export async function readOwnerFreshnessSnapshot(input: {
+	settings: Settings;
+	fs?: TelegramDaemonFs;
+}): Promise<{ ownerTag: Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | null; effectiveHeartbeatAt: number | undefined; legacyEmbedded: boolean; state: DaemonState | undefined }> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	const state = await readJson<DaemonState>(fsImpl, paths.state);
+	const legacyEmbedded = Boolean(state && (isGenerationAbsentParentDaemonState(state) || isGeneration3ReleaseDaemonState(state)));
+	const tag = ownerTagFromState(state);
+	const lock = await readOwnershipLock(fsImpl, paths.lock);
+	const ownerTag = tag && ownershipLockMatchesState(lock, state) ? tag : null;
+	if (legacyEmbedded) return { ownerTag, effectiveHeartbeatAt: state?.heartbeatAt, legacyEmbedded, state };
+	const sidecar = await readJson<OwnerHeartbeatSidecar>(fsImpl, paths.heartbeat);
+	const rereadState = await readJson<DaemonState>(fsImpl, paths.state);
+	const rereadLock = await readOwnershipLock(fsImpl, paths.lock);
+	const rereadTag = ownerTagFromState(rereadState);
+	const stableTag = rereadTag && ownershipLockMatchesState(rereadLock, rereadState) ? rereadTag : null;
+	const stable = ownerTag && stableTag && sidecarMatchesOwnerTag({ ...ownerTag, heartbeatAt: 0 }, stableTag) ? stableTag : null;
+	return {
+		ownerTag: stable,
+		effectiveHeartbeatAt: stable && sidecarMatchesOwnerTag(sidecar, stable) ? Math.max(rereadState?.heartbeatAt ?? 0, sidecar.heartbeatAt) : rereadState?.heartbeatAt,
+		legacyEmbedded: false,
+		state: rereadState,
+	};
+}
+
+/** Marker-free steady heartbeat renewal. The final lock reread fences a stale writer. */
+export async function renewOwnerHeartbeatSidecar(input: {
+	settings: Settings;
+	ownerId: string;
+	acquisitionId?: string;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+	pid?: number;
+	pidIncarnation?: (pid: number) => string | undefined;
+}): Promise<boolean> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	const state = await readJson<DaemonState>(fsImpl, paths.state);
+	const pid = input.pid ?? state?.pid;
+	const incarnation = (input.pidIncarnation ?? defaultPidIncarnation)(pid ?? 0);
+	const acquisitionId = input.acquisitionId ?? input.ownerId;
+	if (!state || !validDaemonPid(pid) || !isProcessIncarnation(incarnation) || state.pid !== pid || state.incarnation !== incarnation || state.ownerId !== input.ownerId || state.acquisitionId !== acquisitionId || state.stoppedAt !== undefined)
+		return false;
+	const sidecar: OwnerHeartbeatSidecar = { pid, incarnation, ownerId: input.ownerId, acquisitionId, heartbeatAt: (input.now ?? Date.now)() };
+	const tmp = `${paths.heartbeat}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+	await fsImpl.writeFile(tmp, `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o600 });
+	await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
+	const lock = await readOwnershipLock(fsImpl, paths.lock);
+	if (!ownershipLockMatchesState(lock, state)) {
+		await fsImpl.unlink(tmp).catch(() => undefined);
+		return false;
+	}
+	await fsImpl.rename(tmp, paths.heartbeat);
+	return true;
+}
+
 function ownershipLockMatchesStoppedState(
 	lock: OwnershipLockRead,
 	state: unknown,
@@ -1615,6 +1705,7 @@ export function isFreshLiveOwner(input: {
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
+	effectiveHeartbeatAt?: number;
 }): boolean {
 	const { state } = input;
 	return Boolean(
@@ -1622,7 +1713,7 @@ export function isFreshLiveOwner(input: {
 			hasSafeDaemonStateShape(state) &&
 			state.stoppedAt === undefined &&
 			ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
-			input.now - state.heartbeatAt <= HEARTBEAT_TTL_MS &&
+			input.now - (input.effectiveHeartbeatAt ?? state.heartbeatAt) <= HEARTBEAT_TTL_MS &&
 			input.pidAlive(state.pid) &&
 			ownerProvenanceMatches(state, input.pidIncarnation),
 	);
@@ -1636,6 +1727,7 @@ export function isCurrentCompatibleOwner(input: {
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
+	effectiveHeartbeatAt?: number;
 }): boolean {
 	const state = input.state;
 	return Boolean(
@@ -2041,7 +2133,15 @@ export async function renewDaemonHeartbeat(input: {
 				});
 			return false;
 		}
-		return true;
+		return await renewOwnerHeartbeatSidecar({
+			settings: input.settings,
+			ownerId: input.ownerId,
+			acquisitionId,
+			fs: fsImpl,
+			now: input.now,
+			pid,
+			pidIncarnation: input.pidIncarnation,
+		});
 	} finally {
 		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
@@ -6984,12 +7084,10 @@ export class TelegramNotificationDaemon {
 		this.runtime.stopInterval("telegram-flush");
 	}
 	private async renewOwnershipHeartbeat(): Promise<boolean> {
-		return renewDaemonHeartbeat({
+		return renewOwnerHeartbeatSidecar({
 			settings: this.opts.settings,
 			ownerId: this.opts.ownerId,
 			acquisitionId: this.opts.ownerId,
-			tokenFingerprint: tokenFingerprint(this.opts.botToken),
-			chatId: this.opts.chatId,
 			fs: this.fsImpl,
 			now: this.opts.now,
 			pid: this.opts.pid ?? process.pid,
@@ -8584,12 +8682,10 @@ export class TelegramNotificationDaemon {
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
 				if (
-					!(await renewDaemonHeartbeat({
+					!(await renewOwnerHeartbeatSidecar({
 						settings: this.opts.settings,
 						ownerId: this.opts.ownerId,
 						acquisitionId: this.opts.ownerId,
-						tokenFingerprint: tokenFingerprint(this.opts.botToken),
-						chatId: this.opts.chatId,
 						fs: this.fsImpl,
 						now: this.opts.now,
 						pid: this.opts.pid ?? process.pid,
@@ -8642,12 +8738,16 @@ export class TelegramNotificationDaemon {
 				this.effects.beginShutdown();
 				this.#deliveryAbort.abort();
 				let persisted = false;
+				let heartbeatJoined = false;
 				const shutdown = this.effects.allowTerminal(async () => {
 					if (toolShutdownError) throw toolShutdownError;
 					await this.#drainBtwTurns();
 					await this.toolTerminalizationChain;
 					this.runtime.stop();
 					this.stopOwnershipHeartbeatTimer();
+					heartbeatJoined = await this.runtime.joinExclusive("telegram-owner-heartbeat", BTW_SHUTDOWN_JOIN_MS);
+					if (!heartbeatJoined)
+						logger.warn("heartbeat join timed out; retaining daemon ownership (release aborted)");
 					this.stopFlushTimer();
 					this.stopScanTimer();
 					this.stopTypingTimer();
@@ -8672,7 +8772,7 @@ export class TelegramNotificationDaemon {
 					deadline.promise,
 				]);
 				clearTimeout(deadlineTimer);
-				const quiesced = completed && (await this.effects.join(BTW_SHUTDOWN_JOIN_MS));
+				const quiesced = completed && heartbeatJoined && (await this.effects.join(BTW_SHUTDOWN_JOIN_MS));
 				if (!quiesced || !persisted) {
 					logger.warn("notifications: shutdown was not durably quiesced; retaining daemon ownership");
 				} else {

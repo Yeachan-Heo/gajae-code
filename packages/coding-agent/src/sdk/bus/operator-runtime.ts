@@ -150,6 +150,16 @@ export class NotificationOperatorRuntime {
 		}
 	}
 
+	async joinExclusive(name: string, timeoutMs: number): Promise<boolean> {
+		const deadline = this.now() + timeoutMs;
+		while (this.#exclusive.has(name)) {
+			const remaining = deadline - this.now();
+			if (remaining <= 0) return false;
+			await this.sleep(Math.min(remaining, 10));
+		}
+		return true;
+	}
+
 	sleep(ms: number, signal?: AbortSignal): Promise<void> {
 		return new Promise<void>(resolve => {
 			if (signal?.aborted) return resolve();
