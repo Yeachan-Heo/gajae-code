@@ -271,6 +271,60 @@ describe("Anthropic thinking replay immutability", () => {
 			{ role: "user", content: "Continue." },
 		]);
 	});
+
+	it("keeps cross-model thinking as text during signature-invalid replay repair", () => {
+		const userA: UserMessage = { role: "user", content: "first", timestamp: Date.now() };
+		const userB: UserMessage = { role: "user", content: "second", timestamp: Date.now() };
+		// Replayed history from a DIFFERENT Anthropic model: its thinking was never
+		// sent as a signed block by this model, so it degrades to plain text and
+		// cannot be the signature failure — repair must not delete it.
+		const crossModelAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "important prior reasoning", thinkingSignature: "sig_other_model" },
+				{ type: "text", text: "cross-model answer" },
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-opus-4-1",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const sameModelAssistant: AssistantMessage = {
+			...crossModelAssistant,
+			model: model.id,
+			content: [
+				{ type: "thinking", thinking: "same-model thinking", thinkingSignature: "sig_same_model" },
+				{ type: "text", text: "same-model answer" },
+			],
+		};
+
+		const params = convertAnthropicMessages([userA, crossModelAssistant, userB, sameModelAssistant], model, false, {
+			repairAllAssistantThinking: true,
+		});
+
+		expect(params).toEqual([
+			{ role: "user", content: "first" },
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "important prior reasoning" },
+					{ type: "text", text: "cross-model answer" },
+				],
+			},
+			{ role: "user", content: "second" },
+			{ role: "assistant", content: [{ type: "text", text: "same-model answer" }] },
+			{ role: "user", content: "Continue." },
+		]);
+	});
 });
 
 describe("Anthropic thinking replay 400 classification", () => {

@@ -77,7 +77,9 @@ export function transformMessages<TApi extends Api>(
 			// "latest assistant message ... cannot be modified" 400; `repairAllAssistantThinking`
 			// targets the "Invalid `signature` in `thinking` block" 400, which can cite a block
 			// anywhere in the replayed history (e.g. after compaction/pruning rewrote an earlier
-			// turn), so the drop must apply to every assistant message.
+			// turn), so the drop must apply to every assistant message. Within each
+			// message only blocks that would replay as native thinking/redacted_thinking
+			// are dropped; cross-model reasoning degrades to text and is preserved.
 			const dropAssistantThinkingForRepair =
 				(options?.repairAllAssistantThinking === true ||
 					(options?.repairLatestAssistantThinking === true && index === latestAssistantIndex)) &&
@@ -86,8 +88,14 @@ export function transformMessages<TApi extends Api>(
 
 			const transformedContent = assistantMsg.content.flatMap(block => {
 				if (block.type === "thinking") {
-					if (hasPartialThinking || dropAssistantThinkingForRepair) return [];
+					if (hasPartialThinking) return [];
 					const sanitized = block;
+					// Repair must only drop blocks that would otherwise replay as native
+					// thinking. Cross-model/provider reasoning degrades to unsigned text
+					// below and was never replayed as a signed block, so it cannot be the
+					// signature failure — dropping it would silently lose valid context.
+					const replaysAsNativeThinking = mustPreserveLatestAnthropicThinking || isSameModel;
+					if (dropAssistantThinkingForRepair && replaysAsNativeThinking) return [];
 					if (mustPreserveLatestAnthropicThinking) return sanitized;
 					// For same model: keep thinking blocks with signatures (needed for replay)
 					// even if the thinking text is empty (OpenAI encrypted reasoning)
@@ -102,7 +110,13 @@ export function transformMessages<TApi extends Api>(
 				}
 
 				if (block.type === "redactedThinking") {
-					if (hasPartialThinking || dropAssistantThinkingForRepair) return [];
+					if (hasPartialThinking) return [];
+					// Same restriction as thinking blocks: cross-model/provider redacted
+					// blocks already drop below, so repair only needs to cover blocks that
+					// would replay as native redacted_thinking.
+					if (dropAssistantThinkingForRepair && (mustPreserveLatestAnthropicThinking || isSameModel)) {
+						return [];
+					}
 					if (mustPreserveLatestAnthropicThinking) return block;
 					if (isSameModel) return block;
 					return [];

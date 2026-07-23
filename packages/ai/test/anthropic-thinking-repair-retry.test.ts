@@ -1,7 +1,8 @@
-import { describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { streamAnthropic } from "@gajae-code/ai/providers/anthropic";
-import type { AssistantMessage, Context, Model, UserMessage } from "@gajae-code/ai/types";
+import type { AssistantMessage, Context, Model, Tool, UserMessage } from "@gajae-code/ai/types";
+import { clearToolChoiceIncapabilityRegistryForTests } from "@gajae-code/ai/utils/tool-choice-capability";
 
 const model: Model<"anthropic-messages"> = {
 	api: "anthropic-messages",
@@ -289,5 +290,84 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(result.errorMessage).toContain("max_tokens is too low");
 		expect(requestBodies).toHaveLength(1);
 		expect(JSON.stringify(requestBodies[0])).toContain("synthetic_sig");
+	});
+
+	describe("cumulative degradation across fallbacks", () => {
+		beforeEach(() => clearToolChoiceIncapabilityRegistryForTests());
+
+		const tool: Tool = {
+			name: "read",
+			description: "Read",
+			parameters: { type: "object", properties: {}, additionalProperties: false },
+		};
+
+		const createForcedToolChoice400 = (): MockAnthropicRequest => ({
+			async withResponse() {
+				const error = new Error("400 invalid_request_error: tool_choice is not supported by this model");
+				(error as { status?: number }).status = 400;
+				throw error;
+			},
+		});
+
+		const makeContext = (): Context => ({
+			messages: [
+				{ role: "user", content: "first", timestamp: Date.now() },
+				makeSignedAssistant("history", "history answer"),
+				{ role: "user", content: "next prompt", timestamp: Date.now() + 1 },
+			],
+			tools: [tool],
+		});
+
+		it("keeps thinking repair active when a later forced-tool_choice fallback rebuilds params", async () => {
+			const requestBodies: unknown[] = [];
+			let attempt = 0;
+			const create = ((body: unknown) => {
+				requestBodies.push(body);
+				attempt += 1;
+				if (attempt === 1) return createAnthropicSignatureInvalid400() as never;
+				if (attempt === 2) return createForcedToolChoice400() as never;
+				return createSuccessfulRequest() as never;
+			}) as unknown as Anthropic["messages"]["create"];
+			const client = { messages: { create } } as Anthropic;
+
+			const result = await streamAnthropic(model, makeContext(), { client, toolChoice: "any" }).result();
+
+			expect(result.stopReason).toBe("stop");
+			expect(requestBodies).toHaveLength(3);
+			// Signature repair activates on attempt 2; the forced-tool_choice fallback
+			// rebuild (attempt 3) must not reintroduce the dropped signature, and must
+			// drop the forced tool_choice.
+			expect(JSON.stringify(requestBodies[1])).not.toContain("sig_history");
+			const thirdBody = JSON.stringify(requestBodies[2]);
+			expect(thirdBody).not.toContain("sig_history");
+			expect(thirdBody).not.toContain("tool_choice");
+			expect((requestBodies[2] as { tool_choice?: unknown }).tool_choice).toBeUndefined();
+			expect(thirdBody).toContain("history answer");
+		});
+
+		it("keeps forced-tool_choice drop active when a later signature repair rebuilds params", async () => {
+			const requestBodies: unknown[] = [];
+			let attempt = 0;
+			const create = ((body: unknown) => {
+				requestBodies.push(body);
+				attempt += 1;
+				if (attempt === 1) return createForcedToolChoice400() as never;
+				if (attempt === 2) return createAnthropicSignatureInvalid400() as never;
+				return createSuccessfulRequest() as never;
+			}) as unknown as Anthropic["messages"]["create"];
+			const client = { messages: { create } } as Anthropic;
+
+			const result = await streamAnthropic(model, makeContext(), { client, toolChoice: "any" }).result();
+
+			expect(result.stopReason).toBe("stop");
+			expect(requestBodies).toHaveLength(3);
+			// Forced tool_choice is dropped from attempt 2 onward; the signature-repair
+			// rebuild (attempt 3) must not reintroduce it, and must drop the signature.
+			expect((requestBodies[1] as { tool_choice?: unknown }).tool_choice).toBeUndefined();
+			const thirdBody = JSON.stringify(requestBodies[2]);
+			expect(thirdBody).not.toContain("sig_history");
+			expect((requestBodies[2] as { tool_choice?: unknown }).tool_choice).toBeUndefined();
+			expect(thirdBody).toContain("history answer");
+		});
 	});
 });

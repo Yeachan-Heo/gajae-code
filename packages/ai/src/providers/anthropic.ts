@@ -1333,16 +1333,19 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let strictFallbackErrorMessage: string | undefined;
 			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
 			let droppedForcedToolChoice = false;
-			const prepareParams = async (paramsOptions?: {
-				repairLatestAssistantThinking?: boolean;
-				repairAllAssistantThinking?: boolean;
-				dropForcedToolChoice?: boolean;
-			}): Promise<MessageCreateParamsStreaming> => {
+			let repairLatestAssistantThinking = false;
+			let repairAllAssistantThinking = false;
+			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
+				// Degradation state is cumulative: every fallback rebuild must merge all
+				// repairs activated so far. Rebuilding from only the immediate call lets
+				// a later strict/forced-tool/fast-mode fallback reintroduce the rejected
+				// shape (e.g. invalid thinking signatures or forced tool_choice), and
+				// the one-shot thinking-repair guard then blocks recovery.
 				let nextParams = buildParams(model, baseUrl, context, isOAuthToken, options, disableStrictTools, {
-					repairLatestAssistantThinking: paramsOptions?.repairLatestAssistantThinking === true,
-					repairAllAssistantThinking: paramsOptions?.repairAllAssistantThinking === true,
+					repairLatestAssistantThinking,
+					repairAllAssistantThinking,
 				});
-				if (paramsOptions?.dropForcedToolChoice === true) {
+				if (droppedForcedToolChoice) {
 					delete nextParams.tool_choice;
 				}
 				if (disableStrictTools) {
@@ -1776,7 +1779,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							registryKey: resolveToolChoice(model, options?.toolChoice).registryKey,
 						});
 						droppedForcedToolChoice = true;
-						params = await prepareParams({ dropForcedToolChoice: true });
+						params = await prepareParams();
 						providerRetryAttempt = 0;
 						resetOutputForRetry();
 						continue;
@@ -1794,11 +1797,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
 						});
 						thinkingRepairAttempted = true;
-						params = await prepareParams(
-							thinkingSignatureInvalid
-								? { repairAllAssistantThinking: true }
-								: { repairLatestAssistantThinking: true },
-						);
+						if (thinkingSignatureInvalid) {
+							repairAllAssistantThinking = true;
+						} else {
+							repairLatestAssistantThinking = true;
+						}
+						params = await prepareParams();
 						providerRetryAttempt = 0;
 						resetOutputForRetry();
 						continue;
