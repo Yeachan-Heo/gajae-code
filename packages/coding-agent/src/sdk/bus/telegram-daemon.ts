@@ -3854,6 +3854,9 @@ export class TelegramNotificationDaemon {
 	private readonly pool: RateLimitPool<TelegramQueuePayload>;
 	private readonly poller: TelegramUpdatePoller;
 	private readonly dispatchState = new TelegramEventDispatchState();
+	/** Bot-wide flood-control window; inbound polling remains eligible during it. */
+	private botCooldownUntil = 0;
+	private warnedBotCooldownUntil = 0;
 	/** Original markdown of rich messages we sent (chat+message_id), for restoring reply context on inbound replies. */
 	private readonly replyStore: ReplySentStore;
 	/** Per-session debounce + monotonic draft-id state for opt-in draft streaming. */
@@ -4286,6 +4289,30 @@ export class TelegramNotificationDaemon {
 		return formatLifecycleOutcome(r, verb);
 	}
 
+	private cooldownRetryAfterMs(response: unknown): number | undefined {
+		if (!response || typeof response !== "object") return undefined;
+		const error = response as { ok?: unknown; error_code?: unknown; parameters?: { retry_after?: unknown } };
+		if (error.ok !== false || error.error_code !== 429) return undefined;
+		const retryAfter = error.parameters?.retry_after;
+		const seconds = typeof retryAfter === "number" && Number.isFinite(retryAfter) ? retryAfter : 30;
+		return Math.min(3600, Math.max(1, seconds)) * 1_000;
+	}
+
+	private async callBotApi(rawBotApi: BotApi, method: string, body: unknown, callOpts?: { signal?: AbortSignal; noRetry?: boolean }): Promise<unknown> {
+		const now = this.opts.now?.() ?? Date.now();
+		if (method !== "getUpdates" && now < this.botCooldownUntil) {
+			if (this.warnedBotCooldownUntil !== this.botCooldownUntil) {
+				this.warnedBotCooldownUntil = this.botCooldownUntil;
+				logger.warn("notifications: Telegram Bot API flood-control cooldown suppressing outbound calls");
+			}
+			return undefined;
+		}
+		const response = await this.effects.call(rawBotApi, method, body, callOpts);
+		const retryAfterMs = this.cooldownRetryAfterMs(response);
+		if (retryAfterMs !== undefined) this.botCooldownUntil = Math.max(this.botCooldownUntil, now + retryAfterMs);
+		return response;
+	}
+
 	constructor(private readonly opts: TelegramDaemonOptions) {
 		this.fsImpl = opts.fs ?? nodeFs;
 		this.replyStore = new ReplySentStore({ agentDir: opts.settings.getAgentDir(), fs: opts.fs });
@@ -4299,7 +4326,7 @@ export class TelegramNotificationDaemon {
 				setTimeoutImpl: opts.setTimeoutImpl,
 			});
 		this.botApi = {
-			call: (method, body, callOpts) => this.effects.call(rawBotApi, method, body, callOpts),
+			call: (method, body, callOpts) => this.callBotApi(rawBotApi, method, body, callOpts),
 		};
 		this.runtime = new NotificationOperatorRuntime({
 			now: opts.now,
