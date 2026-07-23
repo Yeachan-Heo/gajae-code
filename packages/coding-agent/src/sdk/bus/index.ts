@@ -4790,6 +4790,9 @@ export function createNotificationsExtension(
 	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): void => {
 		if (!text || text === rt.preAskFlushedText || !rt.notificationsActive || rt.policySuspended) return;
 		rt.preAskFlushedText = text;
+		// Ask lead-ins supersede any deferred lean settled answer from earlier turns
+		// so agent_end does not re-emit stale intermediate narration (#2863 review).
+		if (!finalAnswer) rt.pendingSettled = undefined;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
 		// async-queued and none landed before this flush, reuse the per-turn ref
@@ -4941,6 +4944,10 @@ export function createNotificationsExtension(
 					text,
 					...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
 				};
+			} else {
+				// Lead-in already flushed: drop any older deferred settled text so idle
+				// does not re-emit intermediate narration after the ask prompt (#2863).
+				rt.pendingSettled = undefined;
 			}
 		}
 		resetTurnStreamState(rt);

@@ -441,6 +441,56 @@ test("a distinct lean answer after a pre-ask lead-in streams only at agent_end",
 	}
 }, 30000);
 
+test("lean does not re-emit intermediate narration after a later ask lead-in at idle", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		// Intermediate tool-turn narration is deferred under lean.
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "Intermediate narration" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "Intermediate narration" } },
+			ctx,
+		);
+		await sleep(100);
+		expect(turnStreams().length).toBe(0);
+
+		// Later ask lead-in flushes immediately and must supersede the deferred text.
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "Choose one:" } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-1", args: {} },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "ask lead-in");
+		expect(turnStreams()[0]!.text).toContain("Choose one:");
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(false);
+
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: "Choose one:" } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await sleep(200);
+
+		// Idle must not re-emit "Intermediate narration" as finalAnswer after the ask lead-in.
+		const finals = turnStreams().filter(f => finalAnswerOf(f) === true);
+		expect(finals.length).toBe(0);
+		expect(turnStreams().some(f => f.text?.includes("Intermediate narration"))).toBe(false);
+		expect(turnStreams().length).toBe(1);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
 test("lean ask-free turns emit a single settled turn_stream only at agent_end", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
