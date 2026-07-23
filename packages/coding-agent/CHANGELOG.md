@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Plans and delegated tasks can carry an authoritative repository binding (`gjc.repository_binding.v1`). Ultragoal plans and ralplan seeds stamp worktree/common-dir identity at creation, task items accept an optional binding, and spawn/goal-start fail closed when the active cwd is a sibling repository (#2901).
+
 ### Fixed
 
 - Telegram notification daemon self-heals degraded on-disk state: permanently missing scan roots are pruned (so one deleted worktree no longer disables orphan-topic cleanup), and retained exact-unlink transition/placeholder artifacts are reaped on ownership acquire and each scan. `gjc daemon reload` can recover without manual filesystem surgery (#2956).

@@ -6,6 +6,12 @@ import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "..
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { DEFAULT_ULTRAGOAL_OBJECTIVE } from "./goal-mode-request";
 import {
+	assertCwdMatchesRepositoryBinding,
+	captureRepositoryBinding,
+	parseRepositoryBinding,
+	type RepositoryBinding,
+} from "./repository-binding";
+import {
 	CRITIC_GATE_HARD_STOP_EVENT,
 	CRITIC_GATE_OVERRIDE_EVENT,
 	CRITIC_VERDICT_EVENT,
@@ -192,6 +198,8 @@ export interface UltragoalPlan {
 	gjcObjective: string;
 	gjcObjectiveAliases?: string[];
 	goals: UltragoalGoal[];
+	/** Authoritative repository identity for multi-repo fail-closed spawn (#2901). */
+	repositoryBinding?: RepositoryBinding;
 	createdAt: string;
 	updatedAt: string;
 	[key: string]: unknown;
@@ -1349,6 +1357,10 @@ function normalizePlan(raw: unknown): UltragoalPlan {
 				(value): value is string => typeof value === "string" && value.trim().length > 0,
 			)
 		: undefined;
+	let repositoryBinding: RepositoryBinding | undefined;
+	if (record.repositoryBinding !== undefined) {
+		repositoryBinding = parseRepositoryBinding(record.repositoryBinding);
+	}
 	return {
 		version: 1,
 		brief,
@@ -1358,6 +1370,7 @@ function normalizePlan(raw: unknown): UltragoalPlan {
 		goals,
 		createdAt,
 		updatedAt,
+		...(repositoryBinding ? { repositoryBinding } : {}),
 		...(typeof record.state_revision === "number" && Number.isFinite(record.state_revision)
 			? { state_revision: record.state_revision }
 			: {}),
@@ -1558,12 +1571,16 @@ export async function createUltragoalPlan(input: {
 		goal.validationBatch = validationBatchByGoalId.get(goal.id);
 		validateValidationBatchPipelineExclusion(goal);
 	}
+	const repositoryBinding = await captureRepositoryBinding(input.cwd, {
+		displayPath: input.cwd,
+	});
 	const plan: UltragoalPlan = {
 		version: 1,
 		brief,
 		gjcGoalMode: input.gjcGoalMode ?? "aggregate",
 		gjcObjective: DEFAULT_ULTRAGOAL_OBJECTIVE,
 		goals,
+		repositoryBinding,
 		createdAt: now,
 		updatedAt: now,
 	};
@@ -1695,6 +1712,13 @@ export async function startNextUltragoalGoal(input: {
 }> {
 	const plan = await readUltragoalPlan(input.cwd, input.sessionId);
 	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
+	// Fail closed: delegated execution requires stamped repository authority (#2901).
+	if (!plan.repositoryBinding) {
+		throw new Error(
+			"Ultragoal plan is missing repositoryBinding; recreate goals so the plan is bound to an authoritative repository identity.",
+		);
+	}
+	await assertCwdMatchesRepositoryBinding(input.cwd, plan.repositoryBinding);
 	const retryFailed = input.retryFailed === true;
 	const goal = chooseNextGoal(plan, retryFailed);
 	if (!goal) {
