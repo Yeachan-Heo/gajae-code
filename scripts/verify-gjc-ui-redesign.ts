@@ -33,11 +33,13 @@ console.log("\nGJC UI redesign verification passed.");
 async function verifyThemeDefaults(): Promise<GateResult> {
 	const settings = await readText("packages/coding-agent/src/config/settings-schema.ts");
 	const themeRuntime = await readText("packages/coding-agent/src/modes/theme/theme.ts");
-	const redClaw = await readJson("packages/coding-agent/src/modes/theme/defaults/red-claw.json");
-	const blueCrab = await readJson("packages/coding-agent/src/modes/theme/defaults/blue-crab.json");
 	const defaultIndex = await readText("packages/coding-agent/src/modes/theme/defaults/index.ts");
-	const colors = isRecord(redClaw.colors) ? redClaw.colors : {};
-	const vars = isRecord(redClaw.vars) ? redClaw.vars : {};
+	const crustaceanThemes = [
+		["red-claw", await readJson("packages/coding-agent/src/modes/theme/defaults/red-claw.json")],
+		["red-claw-light", await readJson("packages/coding-agent/src/modes/theme/defaults/red-claw-light.json")],
+		["blue-crab", await readJson("packages/coding-agent/src/modes/theme/defaults/blue-crab.json")],
+		["blue-crab-light", await readJson("packages/coding-agent/src/modes/theme/defaults/blue-crab-light.json")],
+	] as const;
 
 	const semanticPairs = [
 		["accent", "error"],
@@ -46,43 +48,96 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 		["error", "warning"],
 		["error", "toolDiffRemoved"],
 	] as const;
-	const semanticFindings = semanticPairs
-		.filter(([left, right]) => resolveColor(colors[left], vars) === resolveColor(colors[right], vars))
-		.map(([left, right]) => `${left} matches ${right}`);
-
-	const expectedBuiltIns = ["blue-crab", "claude-code", "codex", "gruvbox-dark", "opencode", "red-claw"];
-	const retainedBuiltIns =
-		[...defaultIndex.matchAll(/^import /gm)].length === expectedBuiltIns.length &&
-		[...defaultIndex.matchAll(/^\t/gm)].length === expectedBuiltIns.length &&
-		defaultIndex.includes('"blue-crab": blue_crab') &&
-		defaultIndex.includes('"claude-code": claude_code') &&
-		defaultIndex.includes("\tcodex,") &&
-		defaultIndex.includes('"gruvbox-dark": gruvbox_dark') &&
-		defaultIndex.includes("\topencode,") &&
-		defaultIndex.includes('"red-claw": red_claw') &&
-		!defaultIndex.includes("dark_") &&
-		!defaultIndex.includes("light_") &&
-		isRecord(blueCrab.colors);
-
-	return {
-		name: "red-claw/blue-crab theme defaults and semantic token split",
-		passed:
-			settings.includes('default: "red-claw"') &&
-			settings.includes('default: "blue-crab"') &&
-			themeRuntime.includes('autoDarkTheme: string = "red-claw"') &&
-			themeRuntime.includes('autoLightTheme: string = "blue-crab"') &&
-			retainedBuiltIns &&
+	const semanticFindings: string[] = [];
+	let brandMappingsValid = true;
+	for (const [name, themeJson] of crustaceanThemes) {
+		const colors = isRecord(themeJson.colors) ? themeJson.colors : {};
+		const vars = isRecord(themeJson.vars) ? themeJson.vars : {};
+		if (Object.keys(colors).length === 0 || Object.keys(vars).length === 0) {
+			semanticFindings.push(`${name} is missing colors or vars`);
+			brandMappingsValid = false;
+			continue;
+		}
+		for (const [left, right] of semanticPairs) {
+			if (resolveColor(colors[left], vars) === resolveColor(colors[right], vars)) {
+				semanticFindings.push(`${name}: ${left} matches ${right}`);
+			}
+		}
+		brandMappingsValid =
+			brandMappingsValid &&
 			resolveColor(colors.accent, vars) === resolveColor(vars.claw, vars) &&
 			resolveColor(colors.error, vars) === resolveColor(vars.dangerRed, vars) &&
 			resolveColor(colors.warning, vars) === resolveColor(vars.warningAmber, vars) &&
-			resolveColor(colors.toolDiffRemoved, vars) === resolveColor(vars.diffRemovalRed, vars) &&
+			resolveColor(colors.toolDiffRemoved, vars) === resolveColor(vars.diffRemovalRed, vars);
+	}
+
+	const expectedBuiltIns = [
+		"blue-crab",
+		"blue-crab-light",
+		"claude-code",
+		"codex",
+		"gruvbox-dark",
+		"opencode",
+		"red-claw",
+		"red-claw-light",
+	];
+	const expectedImports = [
+		'import blue_crab from "./blue-crab.json" with { type: "json" };',
+		'import blue_crab_light from "./blue-crab-light.json" with { type: "json" };',
+		'import claude_code from "./claude-code.json" with { type: "json" };',
+		'import codex from "./codex.json" with { type: "json" };',
+		'import gruvbox_dark from "./gruvbox-dark.json" with { type: "json" };',
+		'import opencode from "./opencode.json" with { type: "json" };',
+		'import red_claw from "./red-claw.json" with { type: "json" };',
+		'import red_claw_light from "./red-claw-light.json" with { type: "json" };',
+	];
+	const expectedEntries = [
+		'"blue-crab": blue_crab',
+		'"blue-crab-light": blue_crab_light',
+		'"claude-code": claude_code',
+		"\tcodex,",
+		'"gruvbox-dark": gruvbox_dark',
+		"\topencode,",
+		'"red-claw": red_claw',
+		'"red-claw-light": red_claw_light',
+	];
+	const retainedBuiltIns =
+		[...defaultIndex.matchAll(/^import /gm)].length === expectedBuiltIns.length &&
+		[...defaultIndex.matchAll(/^\t/gm)].length === expectedBuiltIns.length &&
+		expectedImports.every(expected => defaultIndex.includes(expected)) &&
+		expectedEntries.every(expected => defaultIndex.includes(expected));
+
+	const darkThemeStart = settings.indexOf('"theme.dark": {');
+	const lightThemeStart = settings.indexOf('"theme.light": {');
+	const symbolPresetStart = settings.indexOf("\tsymbolPreset:", lightThemeStart);
+	const darkThemeBlock =
+		darkThemeStart >= 0 && lightThemeStart > darkThemeStart ? settings.slice(darkThemeStart, lightThemeStart) : "";
+	const lightThemeBlock =
+		lightThemeStart >= 0 && symbolPresetStart > lightThemeStart
+			? settings.slice(lightThemeStart, symbolPresetStart)
+			: "";
+	const settingsDarkDefault = darkThemeBlock.includes('default: "red-claw"');
+	const settingsLightDefault = lightThemeBlock.includes('default: "blue-crab-light"');
+	const runtimeDarkDefault = themeRuntime.includes('var autoDarkTheme: string = "red-claw";');
+	const runtimeLightDefault = themeRuntime.includes('var autoLightTheme: string = "blue-crab-light";');
+
+	return {
+		name: "crustacean theme defaults and semantic token split",
+		passed:
+			settingsDarkDefault &&
+			settingsLightDefault &&
+			runtimeDarkDefault &&
+			runtimeLightDefault &&
+			retainedBuiltIns &&
+			brandMappingsValid &&
 			semanticFindings.length === 0,
 		details: [
-			`settings default red-claw: ${settings.includes('default: "red-claw"')}`,
-			`settings default blue-crab: ${settings.includes('default: "blue-crab"')}`,
-			`runtime autoDarkTheme red-claw: ${themeRuntime.includes('autoDarkTheme: string = "red-claw"')}`,
-			`runtime autoLightTheme blue-crab: ${themeRuntime.includes('autoLightTheme: string = "blue-crab"')}`,
+			`settings default red-claw: ${settingsDarkDefault}`,
+			`settings default blue-crab-light: ${settingsLightDefault}`,
+			`runtime autoDarkTheme red-claw: ${runtimeDarkDefault}`,
+			`runtime autoLightTheme blue-crab-light: ${runtimeLightDefault}`,
 			`expected built-in themes (${expectedBuiltIns.join(", ")}): ${retainedBuiltIns}`,
+			`brand mappings valid: ${brandMappingsValid}`,
 			`semantic collisions: ${semanticFindings.join("; ") || "<none>"}`,
 		],
 	};
@@ -171,18 +226,18 @@ async function verifyDocsBranding(): Promise<GateResult> {
 		name: "public docs current GJC crustacean theme direction",
 		passed:
 			rootReadme.includes("default dark TUI identity is the GJC red-claw theme") &&
-			rootReadme.includes("light-appearance terminals default to the bundled blue-crab theme") &&
+			rootReadme.includes("light-appearance terminals default to the bundled blue-crab-light theme") &&
 			packageReadme.includes("defaults to the bundled `red-claw`") &&
-			packageReadme.includes("bundled `blue-crab` theme") &&
+			packageReadme.includes("bundled `blue-crab-light` theme") &&
 			themeDoc.includes('theme.dark = "red-claw"') &&
-			themeDoc.includes('theme.light = "blue-crab"'),
+			themeDoc.includes('theme.light = "blue-crab-light"'),
 		details: [
 			`README GJC red-claw default: ${rootReadme.includes("default dark TUI identity is the GJC red-claw theme")}`,
-			`README blue-crab light default: ${rootReadme.includes("light-appearance terminals default to the bundled blue-crab theme")}`,
+			`README blue-crab-light light default: ${rootReadme.includes("light-appearance terminals default to the bundled blue-crab-light theme")}`,
 			`package README default red-claw: ${packageReadme.includes("defaults to the bundled `red-claw`")}`,
-			`package README default blue-crab: ${packageReadme.includes("bundled `blue-crab` theme")}`,
+			`package README default blue-crab-light: ${packageReadme.includes("bundled `blue-crab-light` theme")}`,
 			`theme docs default red-claw: ${themeDoc.includes('theme.dark = "red-claw"')}`,
-			`theme docs default blue-crab: ${themeDoc.includes('theme.light = "blue-crab"')}`,
+			`theme docs default blue-crab-light: ${themeDoc.includes('theme.light = "blue-crab-light"')}`,
 		],
 	};
 }
