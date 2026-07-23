@@ -229,6 +229,8 @@ jobs:
         run: |
           bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test packages/coding-agent/test/session-manager/session-directory.test.ts -t "(quarantines and restores the complete legacy artifact topology|captures the transcript after artifact detach|retains a detached legacy artifact root|rejects an omitted prepared quarantine|stops after artifact detach)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   windows-telegram-daemon-safety:
     name: Windows Telegram daemon safety

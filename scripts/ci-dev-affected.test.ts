@@ -126,16 +126,41 @@ describe("dev-ci canonical-plan workflow contract", () => {
 	test("routes the Windows session-path regression suite onto windows-latest and requires it", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("has_windows_session_path: ${{ steps.plan.outputs.has_windows_session_path }}");
-		const windowsJob = workflow.slice(workflow.indexOf("  windows-dev-doctor:"), workflow.indexOf("\n  affected-native:"));
+		const jobStart = workflow.indexOf("  windows-dev-doctor:");
+		const jobEnd = workflow.indexOf("\n  windows-telegram-daemon-safety:", jobStart);
+		expect(jobStart).toBeGreaterThan(-1);
+		expect(jobEnd).toBeGreaterThan(jobStart);
+		const windowsJob = workflow.slice(jobStart, jobEnd);
+		const requiredPredicate =
+			"contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true'";
 		expect(windowsJob).toContain("runs-on: windows-latest");
-		expect(windowsJob).toContain("needs.affected-plan.outputs.has_windows_session_path == 'true'");
-		expect(windowsJob).toContain("Windows session-path canonicalization regression");
-		expect(windowsJob).toContain("bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
-		// The required predicate must textually match the job gate so the aggregate
-		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
-		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
-		expect(requiredLines.length).toBe(2);
-		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
+		expect(windowsJob).toContain(
+			`if: \${{ needs.affected-plan.outputs.relevant == 'true' && (${requiredPredicate}) }}`,
+		);
+		const buildStart = windowsJob.indexOf("      - name: Build native addon (win32-x64 baseline)");
+		const regressionStart = windowsJob.indexOf("      - name: Windows session-path canonicalization regression");
+		expect(buildStart).toBeGreaterThan(-1);
+		expect(regressionStart).toBeGreaterThan(buildStart);
+		const buildStep = windowsJob.slice(buildStart, windowsJob.indexOf("\n      - name:", buildStart + 1));
+		expect(buildStep).toContain("TARGET_PLATFORM: win32");
+		expect(buildStep).toContain("TARGET_ARCH: x64");
+		expect(buildStep).toContain("TARGET_VARIANTS: baseline");
+		expect(buildStep.split("\n").filter(line => line.trim().startsWith("run:"))).toEqual([
+			"        run: bun run ci:build:native",
+		]);
+		const regressionStep = windowsJob.slice(regressionStart);
+		expect(regressionStep.split("\n").filter(line => line.trim().startsWith("bun test "))).toEqual([
+			"          bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
+			'          bun test packages/coding-agent/test/session-manager/session-directory.test.ts -t "(quarantines and restores the complete legacy artifact topology|captures the transcript after artifact detach|retains a detached legacy artifact root|rejects an omitted prepared quarantine|stops after artifact detach)"',
+		]);
+		const requiredLines = workflow
+			.split("\n")
+			.filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"))
+			.map(line => line.trim());
+		expect(requiredLines).toEqual([
+			`CI_DEV_WINDOWS_DOCTOR_REQUIRED: \${{ ${requiredPredicate} }}`,
+			`CI_DEV_WINDOWS_DOCTOR_REQUIRED: \${{ ${requiredPredicate} }}`,
+		]);
 	});
 
 	describe("detached evidence subprocess contract", () => {
@@ -775,6 +800,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
 			"check:@gajae-code/stats",
+			"test:@gajae-code/stats",
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
 			"check:@gajae-code/typescript-edit-benchmark", "test:@gajae-code/typescript-edit-benchmark",
 			"check:@gajae-code/utils", "test:@gajae-code/utils",
@@ -1040,8 +1066,10 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		for (const changedPath of [
 			"packages/coding-agent/src/session/internal/managed-session-scope.ts",
 			"packages/coding-agent/src/session/blob-store.ts",
+			"packages/coding-agent/src/session/internal/managed-session-storage.ts",
 			"packages/coding-agent/src/session/session-manager.ts",
 			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
+			"packages/coding-agent/test/session-manager/session-directory.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
