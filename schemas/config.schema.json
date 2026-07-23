@@ -418,7 +418,7 @@
 				"light": {
 					"type": "string",
 					"description": "Theme used when terminal has light background",
-					"default": "blue-crab"
+					"default": "blue-crab-light"
 				}
 			},
 			"additionalProperties": false
