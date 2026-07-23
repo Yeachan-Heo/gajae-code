@@ -426,6 +426,7 @@ function getTrailingPartialDeepseekToken(text: string): string {
 	return tail;
 }
 
+const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS = 300_000;
 const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI completions stream timed out while waiting for the first event";
 
@@ -562,8 +563,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					openaiStream = await createCompletionsStream("none");
 				}
 			}
+			const firstEventFallbackMs =
+				model.provider === "alibaba-token-plan" ? ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS : undefined;
 			const firstEventWatchdog = createWatchdog(
-				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs),
+				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs),
 				() => abortTracker.abortLocally(firstEventTimeoutAbortError),
 			);
 			if (premiumRequestsTotal !== undefined) {
