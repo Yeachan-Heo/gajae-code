@@ -37,7 +37,11 @@ async function buildEnvelope(ctx, page, html, resp, automation) {
   try { finalUrl = page.url(); } catch (_e) {}
   let status = 0;
   try { status = resp ? resp.status() : 0; } catch (_e) {}
-  return JSON.stringify({ html, finalUrl, status, cookies, userAgent, automation });
+  // innerText feeds the render-merge step: SPAs often expose visible text
+  // only via innerText, which the extractor compares against the body text.
+  let innerText = '';
+  try { innerText = await page.evaluate(() => document.body && document.body.innerText || ''); } catch (_e) {}
+  return JSON.stringify({ html, finalUrl, status, cookies, userAgent, automation, innerText });
 }
 
 
