@@ -42,3 +42,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 28 rejects special files before retained native authority opens.
  */
 export const DAEMON_GENERATION = 28;
+
+/**
+ * Compatibility epoch for serving daemon lifecycle requests. Epoch 1 covers
+ * all builds published before this field existed.
+ */
+export const SERVING_EPOCH = 2;

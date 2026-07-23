@@ -31,7 +31,7 @@ import {
 	releaseDaemonTransitionLock,
 	sanitizeDiagnostic,
 } from "./notification-service";
-import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
+import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION, SERVING_EPOCH } from "./telegram-daemon-contract";
 import {
 	type DaemonProcessReference,
 	type TelegramDaemonControlDeps,
@@ -39,7 +39,7 @@ import {
 } from "./telegram-daemon-control";
 import { type TelegramSetupPreflight, withTelegramSetupLease } from "./telegram-setup";
 
-export { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
+export { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION, SERVING_EPOCH } from "./telegram-daemon-contract";
 
 import {
 	buildButtonGrid,
@@ -132,6 +132,8 @@ export interface DaemonState {
 	 * notification wire protocol version. Absent on pre-generation state.
 	 */
 	generation?: number;
+	/** Lifecycle-serving compatibility epoch; absent pre-epoch records are epoch 1. */
+	servingEpoch?: number;
 	stoppedAt?: number;
 }
 export interface TelegramDaemonFs {
@@ -1220,7 +1222,9 @@ export function hasSafeDaemonStateShape(state: unknown): state is DaemonState {
 			candidate.version === DAEMON_VERSION &&
 			(candidate.generation === undefined ||
 				(Number.isSafeInteger(candidate.generation) && (candidate.generation as number) > 0)) &&
-			(candidate.stoppedAt === undefined || Number.isSafeInteger(candidate.stoppedAt)),
+			(candidate.stoppedAt === undefined || Number.isSafeInteger(candidate.stoppedAt)) &&
+			(candidate.servingEpoch === undefined ||
+				(Number.isSafeInteger(candidate.servingEpoch) && (candidate.servingEpoch as number) > 0)),
 	);
 }
 
@@ -1420,6 +1424,7 @@ async function legacyParentHandoffDecision(input: {
 	| undefined
 > {
 	const { state } = input;
+	if (state.generation !== 3) return { acquired: false, attached: false, blocked: true };
 	if (!input.pidAlive(state.pid)) return undefined;
 	if (!ownerIdentityMatches(state, input.tokenFingerprint, input.chatId))
 		return { acquired: false, attached: false, blocked: true };
@@ -1656,8 +1661,7 @@ export function isCurrentCompatibleOwner(input: {
 			state?.ownershipPhase === "ready" &&
 			typeof state.acquisitionId === "string" &&
 			state.acquisitionId.length > 0 &&
-			Number.isSafeInteger(state.generation) &&
-			(state.generation as number) >= DAEMON_GENERATION,
+			(state.servingEpoch === undefined ? 1 : state.servingEpoch) >= SERVING_EPOCH,
 	);
 }
 
@@ -1756,7 +1760,9 @@ export async function acquireDaemonOwnership(input: {
 				pidAlive,
 				pidIncarnation,
 			}) &&
-			(state.version !== DAEMON_VERSION || isFullModernPredecessor(state, pidIncarnation))
+			(state.version !== DAEMON_VERSION ||
+				(state.servingEpoch === undefined ? 1 : state.servingEpoch) < SERVING_EPOCH ||
+				isFullModernPredecessor(state, pidIncarnation))
 		)
 			return { acquired: false, attached: false, reloadRequired: true };
 		return { acquired: false, attached: false, provisional: true };
@@ -1923,6 +1929,7 @@ export async function acquireDaemonOwnership(input: {
 			roots,
 			version: DAEMON_VERSION,
 			generation: DAEMON_GENERATION,
+			servingEpoch: SERVING_EPOCH,
 		} satisfies DaemonState);
 		if (
 			!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition })) ||
@@ -2032,6 +2039,7 @@ export async function renewDaemonHeartbeat(input: {
 				incarnation,
 				ownershipPhase: "ready",
 				heartbeatAt: (input.now ?? Date.now)(),
+				servingEpoch: SERVING_EPOCH,
 			});
 		} catch {
 			if (expectedLock && reboundLock)
