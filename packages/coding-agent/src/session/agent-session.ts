@@ -799,8 +799,14 @@ const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 
 const ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba-token-plan";
 const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MESSAGES = {
-	"openai-responses": "OpenAI responses stream timed out while waiting for the first event",
-	"openai-completions": "OpenAI completions stream timed out while waiting for the first event",
+	"openai-responses": new Set([
+		"Provider stream timed out while waiting for the first event",
+		"OpenAI responses stream timed out while waiting for the first event",
+	]),
+	"openai-completions": new Set([
+		"Provider stream timed out while waiting for the first event",
+		"OpenAI completions stream timed out while waiting for the first event",
+	]),
 } as const;
 
 function hasBareDefaultRetryDisqualifyingFacts(message: AssistantMessage): boolean {
@@ -1632,6 +1638,7 @@ export class AgentSession {
 	#defaultFallbackController: FallbackChainController | undefined;
 	#overflowMaintenanceAttempts = 0;
 	#defaultFallbackExhaustedLastTurn = false;
+
 	#fallbackInvocationId = 0;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
@@ -12705,7 +12712,7 @@ export class AgentSession {
 		);
 	}
 
-	#alibabaTokenPlanCanonicalTimeoutForApi(api: string): string | undefined {
+	#alibabaTokenPlanTimeoutMessagesForApi(api: string): ReadonlySet<string> | undefined {
 		if (api === "openai-responses" || api === "openai-completions") {
 			return ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MESSAGES[api];
 		}
@@ -12714,18 +12721,23 @@ export class AgentSession {
 
 	#isAlibabaTokenPlanFirstEventTimeout(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || message.provider !== ALIBABA_TOKEN_PLAN_PROVIDER) return false;
-		const canonicalMessage = this.#alibabaTokenPlanCanonicalTimeoutForApi(message.api);
-		return canonicalMessage !== undefined && message.errorMessage === canonicalMessage;
+		const timeoutMessages = this.#alibabaTokenPlanTimeoutMessagesForApi(message.api);
+		return timeoutMessages?.has(message.errorMessage ?? "") ?? false;
 	}
 
 	#isAlibabaTokenPlanCompactionTimeout(candidate: Model, errorMessage: string): boolean {
 		if (candidate.provider !== ALIBABA_TOKEN_PLAN_PROVIDER) return false;
-		const canonicalMessage = this.#alibabaTokenPlanCanonicalTimeoutForApi(candidate.api);
-		if (canonicalMessage === undefined) return false;
-		return (
-			errorMessage === `Summarization failed: ${canonicalMessage}` ||
-			errorMessage === `Turn prefix summarization failed: ${canonicalMessage}`
-		);
+		const timeoutMessages = this.#alibabaTokenPlanTimeoutMessagesForApi(candidate.api);
+		if (!timeoutMessages) return false;
+		for (const timeoutMessage of timeoutMessages) {
+			if (
+				errorMessage === `Summarization failed: ${timeoutMessage}` ||
+				errorMessage === `Turn prefix summarization failed: ${timeoutMessage}`
+			) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	#isTerminalProviderFirstEventTimeout(message: AssistantMessage): boolean {
@@ -12738,7 +12750,6 @@ export class AgentSession {
 			this.#isAlibabaTokenPlanCompactionTimeout(candidate, errorMessage)
 		);
 	}
-
 	#isRetryableError(message: AssistantMessage): boolean {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
@@ -12981,6 +12992,7 @@ export class AgentSession {
 
 	async #resetDefaultFallbackForNewTurn(): Promise<void> {
 		const controller = this.#defaultFallbackChain();
+
 		if (this.#defaultFallbackExhaustedLastTurn) {
 			this.#defaultFallbackExhaustedLastTurn = false;
 			controller.resetForNewTurn();
@@ -13077,7 +13089,7 @@ export class AgentSession {
 		}
 		if (this.#isTerminalProviderFirstEventTimeout(outcome.failure.message)) {
 			// The managed transport discarded this attempt before session policy saw it.
-			// Remove its provisional controller charge and surface the original message.
+			// Remove its provisional charge without changing sticky fallback selection.
 			this.#defaultFallbackChain().discardStartedAttempt();
 			return {
 				type: "terminal",

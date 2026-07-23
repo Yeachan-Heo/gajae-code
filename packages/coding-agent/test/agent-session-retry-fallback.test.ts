@@ -603,7 +603,7 @@ describe("AgentSession retry fallback", () => {
 		]);
 	});
 
-	it("surfaces an exact Alibaba timeout before managed transport fallback precedence", async () => {
+	it("surfaces an exported Alibaba timeout before managed transport fallback precedence", async () => {
 		const primary = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
@@ -633,7 +633,7 @@ describe("AgentSession retry fallback", () => {
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
 						stopReason: "error",
-						errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+						errorMessage: "Provider stream timed out while waiting for the first event",
 						transportFailure: { kind: "transport", status: 503 },
 						timestamp: Date.now(),
 					};
@@ -662,7 +662,7 @@ describe("AgentSession retry fallback", () => {
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
 		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
-		await session.prompt("Do not replay exact Alibaba timeout through managed fallback");
+		await session.prompt("Do not replay the exported Alibaba timeout through managed fallback");
 		await session.waitForIdle();
 
 		expect(calls).toBe(1);
@@ -679,10 +679,98 @@ describe("AgentSession retry fallback", () => {
 			provider: primary.provider,
 			api: primary.api,
 			model: primary.id,
-			errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+			errorMessage: "Provider stream timed out while waiting for the first event",
 			transportFailure: { kind: "transport", status: 503 },
 		});
 		expect(final.errorMessage).not.toContain("Model fallback chain exhausted");
+	});
+
+	it("keeps a managed fallback cursor sticky after an exported Alibaba timeout", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+
+		const requestedModels: string[] = [];
+		let fallbackCalls = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				if (requestedModel.provider === primary.provider) {
+					return createMockModel({ responses: [{ throw: "Provider server error" }] }).stream(
+						requestedModel,
+						context,
+						options,
+					);
+				}
+				fallbackCalls++;
+				if (fallbackCalls > 1) {
+					return createMockModel({ responses: [{ content: ["Fallback recovered on the next turn"] }] }).stream(
+						requestedModel,
+						context,
+						options,
+					);
+				}
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure: AssistantMessage = {
+						role: "assistant",
+						content: [],
+						api: requestedModel.api,
+						provider: requestedModel.provider,
+						model: requestedModel.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "error",
+						errorMessage: "Provider stream timed out while waiting for the first event",
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 1,
+			"retry.baseDelayMs": 1,
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Reach the Alibaba fallback once");
+		await session.waitForIdle();
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`]);
+		expect(getLastAssistantMessage(session)).toMatchObject({
+			provider: fallback.provider,
+			stopReason: "error",
+			errorMessage: "Provider stream timed out while waiting for the first event",
+		});
+
+		await session.prompt("Keep the sticky fallback on the next turn");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primary.provider}/${primary.id}`,
+			`${fallback.provider}/${fallback.id}`,
+			`${fallback.provider}/${fallback.id}`,
+		]);
+		expect(session.model).toMatchObject({ provider: fallback.provider, id: fallback.id });
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
 	});
 
 	it("treats legacy usage-limit text without transport facts as terminal for a managed chain", async () => {

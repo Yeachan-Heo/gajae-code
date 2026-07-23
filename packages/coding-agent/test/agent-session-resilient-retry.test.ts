@@ -135,8 +135,8 @@ describe("AgentSession resilient retry", () => {
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, opts) => {
-				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				calls++;
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				if (calls > 1 && options.recoveredContent) {
 					return createMockModel({ responses: [{ content: [options.recoveredContent] }] }).stream(
 						requestedModel,
@@ -770,13 +770,13 @@ describe("AgentSession resilient retry", () => {
 		const cases = [
 			{
 				model: responsesModel,
-				errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+				errorMessage: "Provider stream timed out while waiting for the first event",
 				settingsOverrides: { "retry.maxRetries": 10 },
 				bareDefault: false,
 			},
 			{
 				model: completionsModel,
-				errorMessage: "OpenAI completions stream timed out while waiting for the first event",
+				errorMessage: "Provider stream timed out while waiting for the first event",
 				settingsOverrides: undefined,
 				bareDefault: true,
 			},
@@ -824,7 +824,7 @@ describe("AgentSession resilient retry", () => {
 		const alibabaModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
 		const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!alibabaModel || !anthropicModel) throw new Error("Expected bundled test models");
-		const timeoutMessage = "OpenAI responses stream timed out while waiting for the first event";
+		const timeoutMessage = "Provider stream timed out while waiting for the first event";
 		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
 		const retryRequestedModels: string[] = [];

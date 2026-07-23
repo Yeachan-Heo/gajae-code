@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentOptions } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, type Model, stream as streamModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -134,6 +134,7 @@ describe("AgentSession managed fallback upstream request counts", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
 		authStorage.setRuntimeApiKey("openai", "openai-test-key");
+		authStorage.setRuntimeApiKey("alibaba-token-plan", "alibaba-token-plan-test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 	});
@@ -168,6 +169,101 @@ describe("AgentSession managed fallback upstream request counts", () => {
 		return { primary, fallback };
 	}
 
+	it("does not replay exported Alibaba lazy-stream timeouts for direct or managed-fallback requests", async () => {
+		const timeoutMessage = "Provider stream timed out while waiting for the first event";
+		const originalTimeout = Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS;
+		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "5";
+		try {
+			const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+			const completionsModel = getBundledModel("alibaba-token-plan", "deepseek-v4-pro");
+			const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!responsesModel || !completionsModel || !primary) throw new Error("Expected bundled test models");
+
+			for (const model of [responsesModel, completionsModel]) {
+				const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+					(async () =>
+						new Response(
+							new ReadableStream<Uint8Array>({
+								start() {},
+							}),
+							{ status: 200, headers: { "content-type": "text/event-stream" } },
+						)) as unknown as typeof fetch,
+				);
+				const directAgent = new Agent({
+					getApiKey: provider => `${provider}-test-key`,
+					initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+					streamFn: streamModel,
+				});
+				const directSettings = Settings.isolated({
+					"compaction.enabled": false,
+					"retry.baseDelayMs": 1,
+					"retry.maxRetries": 10,
+				});
+				directSettings.setModelRole("default", selector(model));
+				session = new AgentSession({
+					agent: directAgent,
+					sessionManager: SessionManager.inMemory(),
+					settings: directSettings,
+					modelRegistry,
+				});
+
+				await session.prompt(`Direct exported timeout for ${model.api}`);
+				await session.waitForIdle();
+
+				expect(fetchSpy).toHaveBeenCalledTimes(1);
+				expect(session.messages.at(-1)).toMatchObject({
+					role: "assistant",
+					provider: model.provider,
+					api: model.api,
+					stopReason: "error",
+					errorMessage: timeoutMessage,
+				});
+				await session.dispose();
+				session = undefined;
+				fetchSpy.mockRestore();
+			}
+
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+				(async () =>
+					new Response(
+						new ReadableStream<Uint8Array>({
+							start() {},
+						}),
+						{ status: 200, headers: { "content-type": "text/event-stream" } },
+					)) as unknown as typeof fetch,
+			);
+			const fallback = responsesModel;
+			const managedAgent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) =>
+					model.provider === primary.provider ? rateLimitStream(model) : streamModel(model, context, options),
+			});
+			const managedSettings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 1 });
+			managedSettings.setModelRole("default", selector(primary));
+			session = new AgentSession({
+				agent: managedAgent,
+				sessionManager: SessionManager.inMemory(),
+				settings: managedSettings,
+				modelRegistry,
+			});
+			session.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
+
+			await session.prompt("Reach one exported Alibaba fallback request");
+			await session.waitForIdle();
+
+			expect(fetchSpy).toHaveBeenCalledTimes(1);
+			expect(session.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				provider: fallback.provider,
+				stopReason: "error",
+				errorMessage: timeoutMessage,
+			});
+		} finally {
+			if (originalTimeout === undefined) delete Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS;
+			else Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = originalTimeout;
+		}
+	});
 	it("N=1 sends one managed request to each chain entry without a hidden replay", async () => {
 		const calls: StreamCall[] = [];
 		const { primary, fallback } = createSession(1, (model, _context, options) => {
