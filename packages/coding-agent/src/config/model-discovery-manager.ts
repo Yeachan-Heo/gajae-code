@@ -165,9 +165,11 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 				? cached
 					? "cached"
 					: "idle"
-				: result.models.length > 0
+				: result.fetched && result.models.length > 0
 					? "ok"
-					: "empty";
+					: result.models.length > 0
+						? "cached"
+						: "empty";
 		const state: ProviderDiscoveryState = {
 			provider: provider.provider,
 			status,

@@ -186,6 +186,7 @@ function context(
 					},
 				},
 			],
+			getActiveProviders: () => [{ provider: "fixture-provider", connectionKind: "credential" }],
 		},
 		getSystemPrompt: () => ["test"],
 		isIdle: () => live.idle ?? true,
@@ -2277,6 +2278,21 @@ test("SDK host binds session query and control seams and excludes uninstalled re
 		const response = await request(`query-${query}`, { type: "query_request", id: `query-${query}`, query });
 		expect(response).toMatchObject({ ok: true, page: { items: [expect.objectContaining(expected)] } });
 	}
+	const activeProviders = await request("query-Q28", {
+		type: "query_request",
+		id: "query-Q28",
+		query: "Q28",
+	});
+	expect(activeProviders).toEqual({
+		type: "query_response",
+		id: "query-Q28",
+		ok: true,
+		page: {
+			items: [{ provider: "fixture-provider", connectionKind: "credential" }],
+			complete: true,
+			revision: "1",
+		},
+	});
 	for (const query of ["Q10", "models.list/current", "models.list", "models.current"]) {
 		const response = await request(`query-${query}`, {
 			type: "query_request",

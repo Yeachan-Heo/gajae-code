@@ -6,6 +6,7 @@ import { type AssistantMessageEventStream, clearCustomApis, Effort, getCustomApi
 import { getOAuthProviders, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials } from "@gajae-code/ai/utils/oauth/types";
 import { ModelRegistry, type ProviderConfigInput } from "@gajae-code/coding-agent/config/model-registry";
+import { ModelsConfigSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { Snowflake } from "@gajae-code/utils";
 
@@ -102,7 +103,7 @@ describe("ModelRegistry runtime provider registration", () => {
 			modelsJsonPath,
 			JSON.stringify({
 				providers: {
-					envProvider: {
+					"env-provider": {
 						baseUrl: "https://api.example.test/v1",
 						api: "openai-responses",
 						apiKeyEnv: keyEnv,
@@ -113,19 +114,39 @@ describe("ModelRegistry runtime provider registration", () => {
 		);
 		try {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const model = registry.find("envProvider", "env-model");
+			const model = registry.find("env-provider", "env-model");
 			expect(model).toBeDefined();
-			expect(await registry.getApiKeyForProvider("envProvider")).toBe("resolved-env-secret");
+			expect(await registry.getApiKeyForProvider("env-provider")).toBe("resolved-env-secret");
 
 			delete process.env[keyEnv];
 			authStorage.clearConfigApiKeys();
 			const missingEnvRegistry = new ModelRegistry(authStorage, modelsJsonPath);
-			expect(await missingEnvRegistry.getApiKeyForProvider("envProvider")).toBeUndefined();
+			expect(await missingEnvRegistry.getApiKeyForProvider("env-provider")).toBeUndefined();
 		} finally {
 			delete process.env[keyEnv];
 		}
 	});
-
+	test("preserves existing config provider ID compatibility without normalization", () => {
+		const legacyIds = [
+			"EnvProvider",
+			"env provider",
+			"env..provider",
+			"env/provider",
+			"env-provider-",
+			"a".repeat(65),
+		];
+		for (const provider of legacyIds) {
+			const result = ModelsConfigSchema.safeParse({
+				providers: {
+					[provider]: {
+						baseUrl: "https://api.example.test/v1",
+						api: "openai-responses",
+					},
+				},
+			});
+			expect(result.success).toBe(true);
+		}
+	});
 	test("loads Bedrock models without apiKey because AWS credential chain supplies auth", async () => {
 		await Bun.write(
 			modelsJsonPath,
@@ -174,6 +195,27 @@ describe("ModelRegistry runtime provider registration", () => {
 
 		const afterAnthropicCount = registry.getAll().filter(model => model.provider === "anthropic").length;
 		expect(afterAnthropicCount).toBe(beforeAnthropicCount);
+	});
+	test("preserves runtime provider IDs exactly across models, APIs, OAuth, and auth lookup", () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const config: ProviderConfigInput = {
+			baseUrl: "https://runtime.example.com/v1",
+			apiKey: "RUNTIME_KEY",
+			api: "custom-legacy-id-api",
+			streamSimple,
+			oauth: {
+				name: "Legacy ID OAuth",
+				login: async () => ({ access: "access", refresh: "refresh", expires: Date.now() + 60_000 }),
+				getApiKey: credentials => credentials.access,
+			},
+			models: [{ ...baseModel, id: "atomic-model" }],
+		};
+
+		registry.registerProvider("Atomic Provider", config, "ext://atomic");
+		expect(registry.find("Atomic Provider", "atomic-model")).toBeDefined();
+		expect(getCustomApi("custom-legacy-id-api")).toBeDefined();
+		expect(getOAuthProviders().some(provider => provider.id === "Atomic Provider")).toBe(true);
+		expect(authStorage.hasAuth("Atomic Provider")).toBe(true);
 	});
 
 	test("registerProvider applies headers-only overrides to existing provider models across refresh", async () => {

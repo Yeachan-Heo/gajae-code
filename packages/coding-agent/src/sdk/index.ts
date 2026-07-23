@@ -22,5 +22,6 @@ export type {
 	Q10ThinkingMode,
 } from "./models";
 export * from "./prompt-status";
+export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
 export * from "./session";
 export * from "./session-directory";

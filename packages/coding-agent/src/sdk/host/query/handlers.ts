@@ -1,4 +1,6 @@
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
+import type { ActiveProviderDescriptor } from "../../providers.js";
+import { ActiveProviderResolutionError } from "../../providers.js";
 import {
 	assertCursorSelector,
 	type CursorEnvelope,
@@ -22,6 +24,7 @@ export interface SessionSurface {
 	getUsage(): unknown | Promise<unknown>;
 	getModels(): unknown | Promise<unknown>;
 	getSkillState(): unknown | Promise<unknown>;
+	getActiveProviders?(): ActiveProviderDescriptor[] | Promise<ActiveProviderDescriptor[]>;
 	/** Q12 rows preserve workflow gate fields and include stable durable gate metadata. */
 	getGates(): unknown | Promise<unknown>;
 	getConfigItems(): unknown | Promise<unknown>;
@@ -97,6 +100,7 @@ const sources: Record<string, { resource: string; method: keyof SessionSurface; 
 	Q21: { resource: "queue", method: "getQueueMessages", mvcc: true },
 	Q22: { resource: "extensions", method: "getExtensions", mvcc: true },
 	Q25: { resource: "jobs", method: "getJobs", mvcc: false },
+	Q28: { resource: "activeProviders", method: "getActiveProviders", mvcc: false },
 	Q27: { resource: "modelProfiles", method: "getModelProfiles", mvcc: true },
 };
 const names = [
@@ -127,6 +131,7 @@ const names = [
 	"runtime.jobs.list",
 	"turn.prompt_status",
 	"models.profiles.list",
+	"providers.list/active",
 ];
 
 export class QueryHandlers {
@@ -137,12 +142,12 @@ export class QueryHandlers {
 		private readonly cursors: CursorRegistry,
 	) {}
 	async dispatch(request: QueryRequest): Promise<QueryResponse> {
+		const query = request.query.startsWith("Q")
+			? request.query
+			: request.query === "models.list" || request.query === "models.current"
+				? "Q10"
+				: `Q${String(names.indexOf(request.query) + 1).padStart(2, "0")}`;
 		try {
-			const query = request.query.startsWith("Q")
-				? request.query
-				: request.query === "models.list" || request.query === "models.current"
-					? "Q10"
-					: `Q${String(names.indexOf(request.query) + 1).padStart(2, "0")}`;
 			if (
 				this.surface.installedQueries instanceof Set &&
 				!this.surface.installedQueries.has(names[Number(query.slice(1)) - 1] ?? "")
@@ -161,6 +166,8 @@ export class QueryHandlers {
 				return this.#error(request, "invalid_request", false, "models.profiles.list does not accept input fields.");
 			if (query === "Q27" && typeof this.surface.getModelProfiles !== "function")
 				return this.#error(request, "unavailable", false, "models.profiles.list is unavailable for this session.");
+			if (query === "Q28" && typeof this.surface.getActiveProviders !== "function")
+				return this.#error(request, "unavailable", false, "providers.list/active is unavailable for this session.");
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
 			return await this.#pageSource(request, query, source);
@@ -250,7 +257,12 @@ export class QueryHandlers {
 				source.resource === "transcript" ? { highWatermark: cursor.highWatermark } : {},
 			);
 		} else {
-			snapshot = await (this.surface[source.method] as () => unknown)();
+			try {
+				snapshot = await (this.surface[source.method] as () => unknown)();
+			} catch (error) {
+				if (queryId === "Q28") throw new ActiveProviderResolutionError();
+				throw error;
+			}
 			revision = await this.revisions.createRevision(source.resource, resourceId, snapshot);
 		}
 		if (snapshot === undefined) return this.#error(request, "resource_gone");

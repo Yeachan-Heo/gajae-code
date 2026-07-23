@@ -2150,6 +2150,8 @@ describe("ModelRegistry", () => {
 
 			expect(registry.getAvailable().some(model => model.provider === "github-copilot")).toBe(false);
 			expect(registry.getDiscoverableProviders()).not.toContain("ollama");
+			expect(registry.getActiveProviders().some(provider => provider.provider === "github-copilot")).toBe(false);
+			expect(registry.getActiveProviders().some(provider => provider.provider === "ollama")).toBe(false);
 		});
 
 		test("refresh skips discovery probes for disabled local providers", async () => {
@@ -3493,6 +3495,343 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("http://127.0.0.1:1234/v1");
 			expect(getOpenAICompat(model)?.supportsStore).toBe(false);
 			expect(await registry.getApiKeyForProvider("local")).toBe("LOCAL_TEST_KEY");
+		});
+	});
+	describe("active provider resolution", () => {
+		const activeRowsFor = (registry: ModelRegistry, providerIds: readonly string[]) => {
+			const selected = new Set(providerIds);
+			return registry.getActiveProviders().filter(provider => selected.has(provider.provider));
+		};
+		test("resolves active providers from credentials and configured credentialless models without I/O", () => {
+			writeRawModelsJson({
+				"zeta.provider": {
+					baseUrl: "https://zeta.example.com/v1",
+					api: "openai-responses",
+					apiKey: "ZETA_KEY",
+					models: [{ id: "zeta-model" }],
+				},
+				"alpha-provider": {
+					baseUrl: "https://alpha.example.com/v1",
+					api: "openai-responses",
+					apiKey: "ALPHA_KEY",
+					models: [{ id: "alpha-model" }],
+				},
+				"local-provider": {
+					baseUrl: "http://127.0.0.1:1234/v1",
+					api: "openai-responses",
+					auth: "none",
+					models: [{ id: "local-model" }],
+				},
+			});
+			using _hook = hookFetch(() => {
+				throw new Error("active-provider resolution must not perform I/O");
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(activeRowsFor(registry, ["alpha-provider", "local-provider", "zeta.provider"])).toEqual([
+				{ provider: "alpha-provider", connectionKind: "credential" },
+				{ provider: "local-provider", connectionKind: "credentialless" },
+				{ provider: "zeta.provider", connectionKind: "credential" },
+			]);
+			const current = registry.find("local-provider", "local-model");
+			expect(registry.getActiveProviders(current)).toEqual(registry.getActiveProviders());
+		});
+		test("keeps bundled credentialed providers active when discovery is configured", () => {
+			writeRawModelsJson({
+				openai: {
+					baseUrl: "https://openai.example.com/v1",
+					apiKey: "OPENAI_TEST_KEY",
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+					models: [],
+				},
+			});
+			using _hook = hookFetch(() => {
+				throw new Error("active-provider resolution must not perform discovery I/O");
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.getProviderDiscoveryState("openai")?.status).toBe("idle");
+			expect(registry.find("openai", "gpt-4o-mini")).toBeDefined();
+			expect(activeRowsFor(registry, ["openai"])).toEqual([{ provider: "openai", connectionKind: "credential" }]);
+		});
+
+		test("tracks credential addition, replacement, removal, dedupe, and registry-only exclusions", async () => {
+			writeRawModelsJson({
+				"tracked-provider": {
+					baseUrl: "https://tracked.example.com/v1",
+					api: "openai-responses",
+					apiKeyEnv: "GJC_TEST_MISSING_TRACKED_PROVIDER_KEY",
+					models: [{ id: "tracked-model" }],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const trackedRows = () => activeRowsFor(registry, ["tracked-provider"]);
+
+			expect(registry.find("tracked-provider", "tracked-model")).toBeDefined();
+			expect(trackedRows()).toEqual([]);
+
+			await authStorage.set("tracked-provider", [
+				{ type: "api_key", key: "account-a" },
+				{ type: "api_key", key: "account-b" },
+			]);
+			expect(trackedRows()).toEqual([{ provider: "tracked-provider", connectionKind: "credential" }]);
+
+			await authStorage.set("tracked-provider", [{ type: "api_key", key: "replacement" }]);
+			expect(trackedRows()).toEqual([{ provider: "tracked-provider", connectionKind: "credential" }]);
+
+			authStorage.setRuntimeApiKey("unknown-provider", "unknown-provider-key");
+			expect(registry.getActiveProviders().some(provider => provider.provider === "unknown-provider")).toBe(false);
+
+			await authStorage.set("tracked-provider", []);
+			expect(trackedRows()).toEqual([]);
+		});
+
+		test("does not advertise a fresh configured-discovery cache reused without a probe", async () => {
+			const cachedModel: Model<"openai-responses"> = {
+				id: "cached-model",
+				name: "Cached Model",
+				api: "openai-responses",
+				provider: "discovery-provider",
+				baseUrl: "http://127.0.0.1:1234/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "http://127.0.0.1:1234/v1",
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			writeModelCache("discovery-provider", Date.now(), [cachedModel], true, "", cacheDbPath);
+			using _hook = hookFetch(() => {
+				throw new Error("online-if-uncached must reuse the fresh cache");
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("cached");
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("cached");
+			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([]);
+		});
+		test("does not advertise authenticated descriptor-only cached models without activity evidence", () => {
+			const cachedModel: Model<"openai-completions"> = {
+				id: "cached-vllm-model",
+				name: "Cached vLLM Model",
+				api: "openai-completions",
+				provider: "vllm",
+				baseUrl: "http://127.0.0.1:8000/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeModelCache("vllm", Date.now(), [cachedModel], true, "", cacheDbPath);
+			authStorage.setRuntimeApiKey("vllm", "cached-vllm-key");
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.find("vllm", "cached-vllm-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("does not treat descriptor overrides as configured static models", () => {
+			const cachedModel: Model<"openai-completions"> = {
+				id: "cached-vllm-model",
+				name: "Cached vLLM Model",
+				api: "openai-completions",
+				provider: "vllm",
+				baseUrl: "http://127.0.0.1:8000/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeRawModelsJson({
+				vllm: { baseUrl: "http://127.0.0.1:8000/v1", apiKey: "configured-vllm-key" },
+			});
+			writeModelCache("vllm", Date.now(), [cachedModel], true, "", cacheDbPath);
+			authStorage.setRuntimeApiKey("vllm", "cached-vllm-key");
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.find("vllm", "cached-vllm-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("does not advertise descriptor-only providers from a fresh cache reused offline", async () => {
+			const cachedModel: Model<"openai-completions"> = {
+				id: "cached-vllm-model",
+				name: "Cached vLLM Model",
+				api: "openai-completions",
+				provider: "vllm",
+				baseUrl: "http://127.0.0.1:8000/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			writeModelCache("vllm", Date.now(), [cachedModel], true, "", cacheDbPath);
+			authStorage.setRuntimeApiKey("vllm", "cached-vllm-key");
+			using _hook = hookFetch(() => {
+				throw new Error("online-if-uncached must reuse the fresh cache");
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("advertises descriptor-only providers after a fresh online-if-uncached discovery", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+
+			expect(registry.find("vllm", "fresh-vllm-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+		});
+		test("invalidates descriptor discovery evidence after a transport override", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			registry.registerProvider("vllm", { baseUrl: "http://127.0.0.1:9000/v1" });
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("does not restore descriptor evidence after an in-flight discovery is invalidated", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			let resolveResponse!: (response: Response) => void;
+			const response = new Promise<Response>(resolve => {
+				resolveResponse = resolve;
+			});
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return response;
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const refresh = registry.refreshProvider("vllm", "online");
+			await Bun.sleep(0);
+			registry.registerProvider("vllm", { baseUrl: "http://127.0.0.1:9000/v1" });
+			resolveResponse(
+				new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await refresh;
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("invalidates descriptor discovery evidence after a config reload", async () => {
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "fresh-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online");
+			writeRawModelsJson({ vllm: { baseUrl: "http://127.0.0.1:9000/v1", apiKey: "fresh-vllm-key" } });
+			const updatedAt = new Date(Date.now() + 1000);
+			fs.utimesSync(modelsJsonPath, updatedAt, updatedAt);
+			await registry.refreshProvider("openai", "offline");
+
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
+		});
+		test("requires fresh exact discovery evidence while static models stay active", async () => {
+			let response: "empty" | "unavailable" | "ok" = "empty";
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+				mixed: {
+					baseUrl: "https://mixed.example.com/v1",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+					models: [{ id: "mixed-static" }],
+				},
+				"unauthenticated-provider": {
+					baseUrl: "https://unauthenticated.example.com/v1",
+					api: "openai-responses",
+					apiKeyEnv: "GJC_TEST_MISSING_ACTIVE_PROVIDER_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url.includes("unauthenticated.example.com"))
+					throw new Error("unauthenticated discovery must not fetch");
+				if (response === "unavailable") return new Response("unavailable", { status: 503 });
+				return new Response(JSON.stringify({ data: response === "ok" ? [{ id: "fresh-model" }] : [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("idle");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
+
+			await registry.refreshProvider("discovery-provider", "online");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("empty");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
+
+			response = "unavailable";
+			await registry.refreshProvider("discovery-provider", "online");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("unavailable");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
+
+			await registry.refreshProvider("unauthenticated-provider", "online");
+			expect(registry.getProviderDiscoveryState("unauthenticated-provider")?.status).toBe("unauthenticated");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
+
+			response = "ok";
+			await registry.refreshProvider("discovery-provider", "online");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("ok");
+			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
+				{ provider: "discovery-provider", connectionKind: "credential" },
+				{ provider: "mixed", connectionKind: "credentialless" },
+			]);
 		});
 	});
 });
