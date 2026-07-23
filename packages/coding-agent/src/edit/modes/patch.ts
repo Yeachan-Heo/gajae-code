@@ -96,8 +96,11 @@ export interface ApplyPatchOptions {
 	fs?: FileSystem;
 	/**
 	 * When false, skip durable cross-process file locks (in-process path mutex
-	 * still serializes). Defaults to true for the real filesystem and false for
-	 * injectible `fs` implementations.
+	 * still serializes). Defaults to true only for the real `defaultFileSystem`
+	 * (or when `fs` is omitted). Disk-backed adapters that are not
+	 * `defaultFileSystem` (notably production `LspFileSystem` via
+	 * `executePatchSingle`) MUST pass `crossProcessLock: true` explicitly —
+	 * object identity is not a durable-lock capability probe.
 	 */
 	crossProcessLock?: boolean;
 }
@@ -1762,11 +1765,16 @@ export async function executePatchSingle(
 
 	const input: PatchInput = { path: resolvedPath, op, rename: resolvedRename, diff };
 	const patchFileSystem = new LspFileSystem(writethrough, signal, batchRequest, beginDeferredDiagnosticsForPath);
+	// Production edit path uses LspFileSystem (disk-backed writethrough), which is
+	// not `defaultFileSystem` by object identity. Force durable cross-process
+	// locking so multi-process agents cannot silently race past the path mutex
+	// (#2900 review: do not infer lock capability from FileSystem identity).
 	const result = await applyPatch(input, {
 		cwd: session.cwd,
 		fs: patchFileSystem,
 		fuzzyThreshold,
 		allowFuzzy,
+		crossProcessLock: true,
 	});
 
 	// Post-write verification: only meaningful for in-place updates where the
