@@ -1639,6 +1639,50 @@ export function getUltragoalRunCompletionState(
 	};
 }
 
+/**
+ * Discriminated next-action for `complete-goals` handoff (#2903).
+ * `none` is reserved for genuine completion; `execute-goal` always carries a goal.
+ */
+export type UltragoalCompleteNextActionKind =
+	| "none"
+	| "execute-goal"
+	| "retry-failed"
+	| "resolve-blockers"
+	| "final-aggregate-receipt";
+
+export type UltragoalCompleteNextAction = {
+	kind: UltragoalCompleteNextActionKind;
+	goal?: UltragoalGoal;
+	blockedGoals?: UltragoalGoal[];
+	failedGoals?: UltragoalGoal[];
+};
+
+/**
+ * Resolve the actionable next step after scheduling / complete-goals.
+ * Blocked and review_blocked goals remain unschedulable; they surface as
+ * `resolve-blockers` instead of a contradictory `execute-goal` without goal_id.
+ */
+export function resolveUltragoalCompleteNextAction(
+	plan: UltragoalPlan,
+	options: { retryFailed?: boolean; selectedGoal?: UltragoalGoal } = {},
+): UltragoalCompleteNextAction {
+	const state = getUltragoalRunCompletionState(plan, { retryFailed: options.retryFailed });
+	// Genuine completion keeps next_action=`none` (historical complete-goals contract).
+	// final-aggregate-receipt is reserved for a future dedicated handoff; do not remap
+	// allComplete here so aggregate runs still finish with `none` / complete text.
+	if (state.allComplete) return { kind: "none" };
+	const goal = options.selectedGoal ?? state.nextGoal;
+	if (goal) return { kind: "execute-goal", goal };
+	const blockedGoals = state.incompleteGoals.filter(
+		item => item.status === "blocked" || item.status === "review_blocked",
+	);
+	if (blockedGoals.length > 0) return { kind: "resolve-blockers", blockedGoals };
+	const failedGoals = state.incompleteGoals.filter(item => item.status === "failed");
+	if (failedGoals.length > 0) return { kind: "retry-failed", failedGoals };
+	// Incomplete but not schedulable (unexpected statuses): still actionable, not "none".
+	return { kind: "resolve-blockers", blockedGoals: state.incompleteGoals };
+}
+
 export async function startNextUltragoalGoal(input: {
 	cwd: string;
 	retryFailed?: boolean;
@@ -1647,11 +1691,20 @@ export async function startNextUltragoalGoal(input: {
 	plan: UltragoalPlan;
 	goal?: UltragoalGoal;
 	allComplete: boolean;
+	nextAction: UltragoalCompleteNextAction;
 }> {
 	const plan = await readUltragoalPlan(input.cwd, input.sessionId);
 	if (!plan) throw new Error("No ultragoal plan found. Run `gjc ultragoal create-goals --brief ...` first.");
-	const goal = chooseNextGoal(plan, input.retryFailed === true);
-	if (!goal) return { plan, allComplete: getUltragoalRunCompletionState(plan).allComplete };
+	const retryFailed = input.retryFailed === true;
+	const goal = chooseNextGoal(plan, retryFailed);
+	if (!goal) {
+		const state = getUltragoalRunCompletionState(plan, { retryFailed });
+		return {
+			plan,
+			allComplete: state.allComplete,
+			nextAction: resolveUltragoalCompleteNextAction(plan, { retryFailed }),
+		};
+	}
 	if (goal.status !== "active") {
 		const now = new Date().toISOString();
 		goal.status = "active";
@@ -1661,7 +1714,12 @@ export async function startNextUltragoalGoal(input: {
 		await writePlan(input.cwd, plan, input.sessionId);
 		await appendLedger(input.cwd, { event: "goal_started", goalId: goal.id }, input.sessionId);
 	}
-	return { plan, goal, allComplete: false };
+	return {
+		plan,
+		goal,
+		allComplete: false,
+		nextAction: { kind: "execute-goal", goal },
+	};
 }
 
 async function readStructuredValue(cwd: string, value: string): Promise<unknown> {
@@ -4237,31 +4295,111 @@ function renderStatus(summary: UltragoalStatusSummary, json: boolean): string {
 	return renderUltragoalStatusMarkdown(summary);
 }
 
+function summarizeBlockedGoalForHandoff(goal: UltragoalGoal): {
+	id: string;
+	status: UltragoalGoalStatus;
+	evidence?: string;
+} {
+	const evidence = typeof goal.evidence === "string" && goal.evidence.trim() ? goal.evidence.trim() : undefined;
+	return {
+		id: goal.id,
+		status: goal.status,
+		...(evidence ? { evidence } : {}),
+	};
+}
+
 function renderCompleteHandoff(
-	result: { plan: UltragoalPlan; goal?: UltragoalGoal; allComplete: boolean },
+	result: {
+		plan: UltragoalPlan;
+		goal?: UltragoalGoal;
+		allComplete: boolean;
+		nextAction?: UltragoalCompleteNextAction;
+	},
 	json: boolean,
 	cwd: string,
 ): string {
+	const nextAction =
+		result.nextAction ??
+		resolveUltragoalCompleteNextAction(result.plan, {
+			selectedGoal: result.goal,
+		});
+	const goalsPath = getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath;
+
 	if (json) {
-		return renderCliWriteReceipt({
+		const receipt: Record<string, unknown> = {
 			ok: true,
 			all_complete: result.allComplete,
-			next_action: result.allComplete ? "none" : "execute-goal",
-			goal_id: result.goal?.id,
-			goal_status: result.goal?.status,
+			next_action: nextAction.kind,
 			gjc_objective: result.plan.gjcObjective,
-			goals_path: getUltragoalPaths(cwd, currentUltragoalSessionId(cwd)).goalsPath,
-		});
+			goals_path: goalsPath,
+		};
+		if (nextAction.kind === "execute-goal" && nextAction.goal) {
+			receipt.goal_id = nextAction.goal.id;
+			receipt.goal_status = nextAction.goal.status;
+		}
+		if (nextAction.kind === "resolve-blockers" && nextAction.blockedGoals) {
+			receipt.blocked_goals = nextAction.blockedGoals.map(summarizeBlockedGoalForHandoff);
+			receipt.blocked_goal_ids = nextAction.blockedGoals.map(goal => goal.id);
+			receipt.recovery_hints = [
+				"gjc ultragoal classify-blocker --help",
+				"gjc ultragoal record-review-blockers --help",
+				"gjc ultragoal steer --kind add_subgoal --help",
+				"gjc ultragoal steer --kind mark_blocked_superseded --help",
+			];
+		}
+		if (nextAction.kind === "retry-failed" && nextAction.failedGoals) {
+			receipt.failed_goal_ids = nextAction.failedGoals.map(goal => goal.id);
+			receipt.recovery_hints = ["gjc ultragoal complete-goals --retry-failed"];
+		}
+		if (nextAction.kind === "final-aggregate-receipt") {
+			receipt.recovery_hints = [
+				"Finalize the aggregate completion receipt before treating the ultragoal run as closed.",
+			];
+		}
+		return renderCliWriteReceipt(receipt);
 	}
-	if (result.allComplete) return "ultragoal complete all=true\n";
-	if (!result.goal) return "ultragoal next-action=none\n";
-	return [
-		`ultragoal next-action=execute-goal goal-id=${result.goal.id}`,
-		`objective=${result.goal.objective}`,
-		`gjc-objective=${result.plan.gjcObjective}`,
-		"checkpoint requires=architectReview:CLEAR+APPROVE,executorQa:passed",
-		"",
-	].join("\n");
+
+	if (nextAction.kind === "none" || (result.allComplete && nextAction.kind !== "final-aggregate-receipt")) {
+		return "ultragoal complete all=true\n";
+	}
+	if (nextAction.kind === "final-aggregate-receipt") {
+		return [
+			"ultragoal next-action=final-aggregate-receipt",
+			"hint=finalize the aggregate completion receipt before treating the run as closed",
+			"",
+		].join("\n");
+	}
+	if (nextAction.kind === "execute-goal" && nextAction.goal) {
+		return [
+			`ultragoal next-action=execute-goal goal-id=${nextAction.goal.id}`,
+			`objective=${nextAction.goal.objective}`,
+			`gjc-objective=${result.plan.gjcObjective}`,
+			"checkpoint requires=architectReview:CLEAR+APPROVE,executorQa:passed",
+			"",
+		].join("\n");
+	}
+	if (nextAction.kind === "resolve-blockers" && nextAction.blockedGoals && nextAction.blockedGoals.length > 0) {
+		const ids = nextAction.blockedGoals.map(goal => goal.id).join(",");
+		const statuses = nextAction.blockedGoals.map(goal => `${goal.id}:${goal.status}`).join(",");
+		return [
+			"ultragoal next-action=resolve-blockers",
+			`blocked-goal-ids=${ids}`,
+			`blocked-statuses=${statuses}`,
+			"hint=resolve blockers via classify-blocker / record-review-blockers / steer --kind add_subgoal (or audited mark_blocked_superseded); blocked goals stay unschedulable",
+			"",
+		].join("\n");
+	}
+	if (nextAction.kind === "retry-failed" && nextAction.failedGoals && nextAction.failedGoals.length > 0) {
+		const ids = nextAction.failedGoals.map(goal => goal.id).join(",");
+		return [
+			"ultragoal next-action=retry-failed",
+			`failed-goal-ids=${ids}`,
+			"hint=run `gjc ultragoal complete-goals --retry-failed` after the failure is addressed",
+			"",
+		].join("\n");
+	}
+	// Fail closed: never claim complete or execute-goal without a goal id.
+	return "ultragoal next-action=resolve-blockers\nhint=no schedulable goal; inspect goals.json and ledger\n";
 }
 function renderCheckpointContinuation(
 	result: UltragoalCheckpointContinuation,

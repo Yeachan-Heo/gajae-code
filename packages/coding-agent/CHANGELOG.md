@@ -10,6 +10,7 @@
 - Concurrent edits to the same file path are serialized through a path-scoped mutation lock (in-process always; durable cross-process lock on the real filesystem). Disjoint concurrent `applyPatch` / replace mutations no longer silently overwrite each other, and a commit-time content check rejects writers that observe a mid-flight change (#2900).
 - Concurrent edits to the same file path are serialized through a path-scoped mutation lock (in-process always; durable cross-process lock on the real filesystem). Disjoint concurrent `applyPatch` / replace mutations no longer silently overwrite each other, and a commit-time content check rejects writers that observe a mid-flight change. The production `executePatchSingle` / `LspFileSystem` path explicitly enables the durable lock rather than inferring it from FileSystem object identity (#2900).
 - Lean notification verbosity no longer floods remote clients with intermediate tool-turn `turn_stream` frames. Under `/lean`, the latest assistant answer is deferred until `agent_end` (idle); ask lead-ins still flush immediately before inline buttons, and `/verbose` keeps per-turn streaming (including opt-in live frames) (#2863).
+- Ultragoal `complete-goals` no longer reports contradictory next actions when every incomplete story is `blocked` or `review_blocked`. Text and JSON now agree on `next-action=resolve-blockers` with blocked goal IDs/status; failed-only schedules surface `retry-failed`; `execute-goal` always includes a `goal_id` (#2903).
 
 ## [0.11.7] - 2026-07-22
 ### Added
