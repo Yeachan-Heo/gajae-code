@@ -2946,7 +2946,7 @@ export async function reclaimDeadDaemonOwner(input: {
  * while exposing whether a #2028 generation handoff was required.
  */
 export async function ensureTelegramDaemonRunningDetailed(
-	input: { settings: Settings; cwd: string; sessionId: string },
+	input: { settings: Settings; cwd: string; sessionId: string; registerRoot?: boolean },
 	deps: TelegramDaemonDeps = {},
 ): Promise<EnsureTelegramDaemonDetailedResult> {
 	const cfg = getNotificationConfig(input.settings);
@@ -3052,7 +3052,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 	}
 	if (spawned.result === "attached" && spawned.reloadRequired) {
 		const previous = await readNotificationRootRegistration({ ...input, fs: deps.fs });
-		await registerNotificationRoot({ ...input, fs: deps.fs });
+		if (input.registerRoot !== false) await registerNotificationRoot({ ...input, fs: deps.fs });
 		const fsImpl = deps.fs ?? nodeFs;
 		const now = deps.now ?? Date.now;
 		const pidAlive = deps.pidAlive ?? defaultPidAlive;
@@ -3146,7 +3146,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 		return "reloaded";
 	}
 	if (spawned.result !== "owner_spawned") {
-		await registerNotificationRoot({ ...input, fs: deps.fs });
+		if (input.registerRoot !== false) await registerNotificationRoot({ ...input, fs: deps.fs });
 		return "attached";
 	}
 	if (
@@ -3165,7 +3165,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 			timeoutMs: deps.readinessTimeoutMs,
 		})
 	) {
-		await registerNotificationRoot({ ...input, fs: deps.fs });
+		if (input.registerRoot !== false) await registerNotificationRoot({ ...input, fs: deps.fs });
 		return "spawned";
 	}
 	throw new Error("Telegram daemon did not become ready after spawning");

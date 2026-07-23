@@ -89,6 +89,7 @@ import {
 	type EnsureDaemonResult,
 	endpointAuthorityDigest,
 	ensureTelegramDaemonRunningDetailed,
+	unregisterNotificationRoot,
 } from "./telegram-daemon";
 
 // ===========================================================================
@@ -909,6 +910,8 @@ interface SessionRuntime {
 	hostStopped: boolean;
 	serverStopped: boolean;
 	brokerRegistrationReleased: boolean;
+	/** Managed Telegram root registration released during terminal teardown. */
+	notificationRootRegistration?: { settings: Settings; cwd: string };
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
@@ -3040,6 +3043,19 @@ export function createNotificationsExtension(
 			hostStopped: rt.hostStopped && rt.serverStopped,
 			brokerRegistrationReleased: rt.brokerRegistrationReleased,
 		});
+		if (rt.notificationRootRegistration) {
+			try {
+				await unregisterNotificationRoot({
+					settings: rt.notificationRootRegistration.settings,
+					cwd: rt.notificationRootRegistration.cwd,
+					sessionId: id,
+				});
+				rt.notificationRootRegistration = undefined;
+			} catch (e) {
+				ownerReleaseFailures.push(e);
+				logger.warn(`notifications: Telegram root unregister failed: ${String(e)}`);
+			}
+		}
 		if (ownerReleaseFailures.length > 0) {
 			cleanupRetries.set(id, rt);
 			throw new AggregateError(ownerReleaseFailures, `SDK notification runtime ${id} owner release failed.`);
@@ -3641,6 +3657,7 @@ export function createNotificationsExtension(
 			inFlightTools: new Map<string, { toolName: string; args: unknown }>(),
 			deferredGatePresentations: [],
 			deferredInboundControls: [],
+			notificationRootRegistration: undefined,
 		};
 		const initializedRuntime = runtime;
 		runtimes.set(id, initializedRuntime);
@@ -4136,6 +4153,7 @@ export function createNotificationsExtension(
 						await cleanupAbandonedStartup();
 						return result;
 					}
+					if (isTelegramConfigured(cfg)) runtime.notificationRootRegistration = { settings, cwd: ctx.cwd };
 				} catch (error) {
 					const result = failLifecycleStartup("failed", error);
 					finishStartup(result);
