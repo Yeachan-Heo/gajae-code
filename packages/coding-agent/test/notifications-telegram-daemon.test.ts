@@ -17095,3 +17095,81 @@ describe("telegram daemon /btw reservation and capability boundaries", () => {
 		).toEqual([909]);
 	});
 });
+
+test("Telegram Bot API 429 cooldown suppresses outbound calls while polling continues and expires", async () => {
+	const agentDir = tempAgentDir();
+	let now = 0;
+	const bot = new FakeBotApi();
+	const call = bot.call.bind(bot);
+	let sendAttempts = 0;
+	bot.call = async (method, body, options) => {
+		if (method === "sendMessage") {
+			sendAttempts++;
+			if (sendAttempts === 1) {
+				bot.calls.push({ method, body, options });
+				return { ok: false, error_code: 429, parameters: { retry_after: 3 } };
+			}
+		}
+		return await call(method, body, options);
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as any,
+		now: () => now,
+	});
+	const api = (daemon as any).botApi as BotApi;
+	const warning = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		expect(await api.call("sendMessage", { chat_id: 42, text: "first" })).toMatchObject({ error_code: 429 });
+		expect(await api.call("sendMessage", { chat_id: 42, text: "suppressed" })).toBeUndefined();
+		expect(await api.call("createForumTopic", { chat_id: 42, name: "suppressed" })).toBeUndefined();
+		expect(bot.calls.filter(entry => entry.method === "sendMessage")).toHaveLength(1);
+		expect(bot.calls.filter(entry => entry.method === "createForumTopic")).toHaveLength(0);
+		expect(await api.call("getUpdates", { timeout: 0 })).toMatchObject({ ok: true });
+		expect(bot.calls.filter(entry => entry.method === "getUpdates")).toHaveLength(1);
+		expect(warning.mock.calls.filter(call => String(call[0]).includes("flood-control cooldown"))).toHaveLength(1);
+
+		now = 3_000;
+		expect(await api.call("sendMessage", { chat_id: 42, text: "resumed" })).toMatchObject({ ok: true });
+		expect(sendAttempts).toBe(2);
+	} finally {
+		warning.mockRestore();
+	}
+});
+
+test("Telegram Bot API 429 cooldown clamps malformed retry_after values and does not hot-loop", async () => {
+	for (const [retryAfter, expectedMs] of [["x", 30_000], [-5, 1_000], [1e9, 3_600_000]] as const) {
+		const agentDir = tempAgentDir();
+		let now = 0;
+		const calls: string[] = [];
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: {
+				async call(method) {
+					calls.push(method);
+					return method === "sendMessage"
+						? { ok: false, error_code: 429, parameters: { retry_after: retryAfter } }
+						: { ok: true, result: [] };
+				},
+			},
+			WebSocketImpl: FakeWs as any,
+			now: () => now,
+		});
+		const api = (daemon as any).botApi as BotApi;
+		await api.call("sendMessage", { chat_id: 42, text: "429" });
+		for (let i = 0; i < 10; i++) await api.call("sendMessage", { chat_id: 42, text: "suppressed" });
+		expect(calls.filter(method => method === "sendMessage")).toHaveLength(1);
+		now = expectedMs - 1;
+		expect(await api.call("sendMessage", { chat_id: 42, text: "still suppressed" })).toBeUndefined();
+		now++;
+		await api.call("sendMessage", { chat_id: 42, text: "expired" });
+		expect(calls.filter(method => method === "sendMessage")).toHaveLength(2);
+	}
+});
