@@ -1,14 +1,33 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import {
+	getItermPetUnavailableReason,
 	PET_CAPABILITY_SETTLE_MS,
+	setVerifiedItermPetAvailability,
 	warnWhenPetCapabilitySettled,
 } from "@gajae-code/coding-agent/modes/components/pet-capability";
 import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@gajae-code/tui";
 
 const originalProtocol = TERMINAL.imageProtocol;
 
+describe("getItermPetUnavailableReason", () => {
+	it("does not report an iTerm reason before iTerm availability is published", () => {
+		expect(getItermPetUnavailableReason()).toBeUndefined();
+	});
+
+	it("preserves the published iTerm probe failure reason", () => {
+		setVerifiedItermPetAvailability({
+			available: false,
+			mode: "direct",
+			epoch: 1,
+			reason: "probe-timeout",
+		});
+
+		expect(getItermPetUnavailableReason()).toBe("probe-timeout");
+	});
+});
 afterEach(() => {
 	setTerminalImageProtocol(originalProtocol);
+	setVerifiedItermPetAvailability(undefined);
 	vi.useRealTimers();
 	vi.restoreAllMocks();
 });
@@ -34,6 +53,21 @@ describe("warnWhenPetCapabilitySettled", () => {
 
 			// The probe succeeds (e.g. Windows Terminal answering XTSMGRAPHICS).
 			setTerminalImageProtocol(ImageProtocol.Sixel);
+			vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS * 2);
+
+			expect(onUnavailable).not.toHaveBeenCalled();
+		} finally {
+			dispose();
+		}
+	});
+	it("cancels when verified iTerm availability arrives before the deadline", () => {
+		vi.useFakeTimers();
+		setTerminalImageProtocol(null);
+		const onUnavailable = vi.fn();
+
+		const dispose = warnWhenPetCapabilitySettled({ probePending: true, onUnavailable });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
 			vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS * 2);
 
 			expect(onUnavailable).not.toHaveBeenCalled();

@@ -7,6 +7,8 @@ export enum ImageProtocol {
 	Sixel = "\x1bPq",
 }
 
+const ITERM2_MULTIPART_IMAGE_PREFIX = "\x1b]1337;MultipartFile=";
+
 export enum NotifyProtocol {
 	Bell = "\x07",
 	Osc99 = "\x1b]99;;",
@@ -30,6 +32,10 @@ export class TerminalInfo {
 		if (!this.imageProtocol) return false;
 		if (this.imageProtocol === ImageProtocol.Sixel) {
 			return SIXEL_DCS_START_REGEX.test(line.slice(0, 128));
+		}
+		if (this.imageProtocol === ImageProtocol.Iterm2) {
+			const prefix = line.slice(0, 64);
+			return prefix.includes(ImageProtocol.Iterm2) || prefix.includes(ITERM2_MULTIPART_IMAGE_PREFIX);
 		}
 		return line.slice(0, 64).includes(this.imageProtocol);
 	}
@@ -791,4 +797,135 @@ export function imageFallback(mimeType: string, dimensions?: ImageDimensions, fi
 	parts.push(`[${mimeType}]`);
 	if (dimensions) parts.push(`${dimensions.widthPx}x${dimensions.heightPx}`);
 	return `[Image: ${parts.join(" ")}]`;
+}
+export type Iterm2Capability = { readonly key: string; readonly value: string };
+export type Iterm2CapabilityReply = "complete-f" | "missing-f" | "invalid-f" | undefined;
+
+const ITERM2_CAPABILITY_REPLY_REGEX = /\x1b\]1337;Capabilities(?:=|:)([^\x07\x1b]*)(?:\x07|\x1b\\)/gu;
+const ITERM2_FEATURE_TOKEN_REGEX = /^[A-Z][a-z]*[0-9]*$/u;
+
+/**
+ * Classifies complete iTerm2 capability replies. An absent result means the
+ * input does not yet contain a complete capability frame.
+ */
+export function parseITerm2CapabilityReply(input: Uint8Array | string): Iterm2CapabilityReply {
+	const value = typeof input === "string" ? input : new TextDecoder().decode(input);
+	let complete = false;
+	for (const match of value.matchAll(ITERM2_CAPABILITY_REPLY_REGEX)) {
+		complete = true;
+		const featureString = match[1] ?? "";
+		const tokens: string[] = featureString.match(/[A-Z][a-z]*[0-9]*/gu) ?? [];
+		if (tokens.join("") !== featureString || !tokens.every(token => ITERM2_FEATURE_TOKEN_REGEX.test(token))) {
+			return "invalid-f";
+		}
+		if (tokens.includes("F")) return "complete-f";
+	}
+	return complete ? "missing-f" : undefined;
+}
+
+const ITERM2_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+const ITERM2_MAX_CAPABILITY_BYTES = 4096;
+
+function assertIterm2Base64(value: string): void {
+	if (value.length % 4 !== 0 || !ITERM2_BASE64.test(value)) throw new Error("Invalid RFC 4648 base64");
+}
+
+export function encodeITerm2Multipart(
+	base64Data: string,
+	options: { width?: number | string; height?: number | string } = {},
+): string[] {
+	assertIterm2Base64(base64Data);
+	const validate = (value: number | string, label: string): number | string => {
+		if (
+			typeof value === "number" &&
+			(!Number.isFinite(value) || !Number.isInteger(value) || value <= 0 || value > 0xffff)
+		)
+			throw new Error(`Invalid iTerm2 ${label}`);
+		if (typeof value === "string" && !/^[A-Za-z0-9]+$/u.test(value)) throw new Error(`Invalid iTerm2 ${label}`);
+		return value;
+	};
+	const width = validate(options.width ?? "auto", "width");
+	const height = validate(options.height ?? "auto", "height");
+	const size = Buffer.from(base64Data, "base64").byteLength;
+	const name = Buffer.from("gajae-pet.gif").toString("base64");
+	const records = [
+		`\x1b]1337;MultipartFile=;name=${name};size=${size};width=${width};height=${height};inline=1;preserveAspectRatio=0:\x07`,
+	];
+	for (let i = 0; i < base64Data.length; i += 200) {
+		records.push(`\x1b]1337;FilePart=${base64Data.slice(i, i + 200)}\x07`);
+	}
+	records.push("\x1b]1337;FileEnd\x07");
+	for (const record of records) {
+		if (Buffer.byteLength(`\x1bPtmux;${record.replaceAll("\x1b", "\x1b\x1b")}\x1b\\`, "utf8") > 256)
+			throw new Error("iTerm2 record exceeds tmux limit");
+	}
+	return records;
+}
+
+export function wrapITerm2RecordForTmux(record: string): string {
+	const wrapped = `\x1bPtmux;${record.replaceAll("\x1b", "\x1b\x1b")}\x1b\\`;
+	if (Buffer.byteLength(wrapped, "utf8") > 256) throw new Error("iTerm2 record exceeds tmux limit");
+	return wrapped;
+}
+
+export function wrapITerm2RecordsForTmux(records: readonly string[]): string[] {
+	return records.map(wrapITerm2RecordForTmux);
+}
+
+function parseIterm2CapabilityString(value: string): Iterm2Capability[] {
+	const out: Iterm2Capability[] = [];
+	for (const pair of value.split(";")) {
+		const i = pair.indexOf("=");
+		if (i > 0) out.push({ key: pair.slice(0, i), value: pair.slice(i + 1) });
+		else if (i < 0 && pair.length > 0) out.push({ key: pair, value: "" });
+	}
+	return out;
+}
+
+export function parseITerm2Capabilities(input: string): Iterm2Capability[] {
+	const parser = new Iterm2CapabilitiesParser();
+	return parser.push(input);
+}
+
+export class Iterm2CapabilitiesParser {
+	#buffer = "";
+	push(input: Uint8Array | string): Iterm2Capability[] {
+		this.#buffer += typeof input === "string" ? input : new TextDecoder().decode(input);
+		const out: Iterm2Capability[] = [];
+		while (true) {
+			const marker = this.#buffer.indexOf("\x1b]1337;Capabilities=");
+			if (marker < 0) {
+				this.#buffer = this.#buffer.slice(-32);
+				break;
+			}
+			const valueStart = marker + "\x1b]1337;Capabilities=".length;
+			let end = -1;
+			for (let i = valueStart; i < this.#buffer.length; i++) {
+				if (this.#buffer[i] === "\x07") {
+					end = i + 1;
+					break;
+				}
+				if (this.#buffer[i] === "\x1b" && this.#buffer[i + 1] === "\\") {
+					end = i + 2;
+					break;
+				}
+				if (i - valueStart > ITERM2_MAX_CAPABILITY_BYTES) {
+					end = -2;
+					break;
+				}
+			}
+			if (end === -1) break;
+			if (end === -2) {
+				this.#buffer = this.#buffer.slice(valueStart + 1);
+				continue;
+			}
+			const terminatorLength = this.#buffer[end - 2] === "\x1b" ? 2 : 1;
+			out.push(...parseIterm2CapabilityString(this.#buffer.slice(valueStart, end - terminatorLength)));
+			this.#buffer = this.#buffer.slice(end);
+		}
+		return out;
+	}
+	reset(): void {
+		this.#buffer = "";
+	}
 }

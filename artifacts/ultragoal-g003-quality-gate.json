@@ -1,0 +1,114 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "agent://321-ItermSizeArchitectureFinal approved raster/display separation, direct and managed geometry, atomic cell-metric resize, fit/lease behavior, and regression coverage with no findings.",
+    "commands": ["agent://321-ItermSizeArchitectureFinal"],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "agent://322-ItermSizeExecutorQaFinal passed direct/tmux headers, 36x36 raster quality, displaySize cache identity, metric resize, and narrow-terminal fit/lease guards; focused and full TUI suites passed.",
+    "e2eCommands": ["bun test packages/tui/test/iterm2-protocol.test.ts packages/tui/test/gajae-pet.test.ts packages/coding-agent/test/gajae-pet-widget.test.ts"],
+    "redTeamCommands": ["cd packages/tui && bun test"],
+    "artifactRefs": [
+      {
+        "id": "g003-package-report",
+        "kind": "api-package-test-report",
+        "path": "artifacts/ultragoal-g003-iterm-size-test-report.json",
+        "description": "Focused and full-suite package behavior report for iTerm cell-size parity"
+      }
+    ],
+    "contractCoverage": [
+      {
+        "id": "display-parity",
+        "contractRef": "G003 display footprint parity",
+        "obligation": "Present the 36x36 pet raster in the same 4x2 terminal-cell footprint as Ghostty.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["package-tests"],
+        "adversarialCaseRefs": ["retina-units"]
+      },
+      {
+        "id": "transport-parity",
+        "contractRef": "G003 direct and managed modes",
+        "obligation": "Emit identical cell geometry in direct and tmux-wrapped iTerm headers.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["package-tests"],
+        "adversarialCaseRefs": ["managed-wrapping"]
+      },
+      {
+        "id": "resize-fit-safety",
+        "contractRef": "G003 resize and composer safety",
+        "obligation": "Update geometry atomically on font resize and suppress output when the composer cannot fit.",
+        "status": "covered",
+        "surfaceEvidenceRefs": ["package-tests"],
+        "adversarialCaseRefs": ["metric-change", "narrow-terminal"]
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "id": "package-tests",
+        "contractRef": "G003 observable protocol and widget behavior",
+        "surface": "package",
+        "invocation": "bun test packages/tui/test/iterm2-protocol.test.ts packages/tui/test/gajae-pet.test.ts packages/coding-agent/test/gajae-pet-widget.test.ts; cd packages/tui && bun test",
+        "verdict": "passed",
+        "artifactRefs": ["g003-package-report"]
+      }
+    ],
+    "adversarialCases": [
+      {
+        "id": "retina-units",
+        "contractRef": "G003 display footprint parity",
+        "scenario": "Pixel dimensions are interpreted as device pixels on a Retina iTerm display.",
+        "expectedBehavior": "Display dimensions use terminal cells while raster dimensions remain 36x36 pixels.",
+        "verdict": "passed",
+        "artifactRefs": ["g003-package-report"]
+      },
+      {
+        "id": "managed-wrapping",
+        "contractRef": "G003 direct and managed modes",
+        "scenario": "Multipart headers are wrapped one record at a time for tmux passthrough.",
+        "expectedBehavior": "The wrapped header retains width=4;height=2 and cursor ordering remains correct.",
+        "verdict": "passed",
+        "artifactRefs": ["g003-package-report"]
+      },
+      {
+        "id": "metric-change",
+        "contractRef": "G003 resize and composer safety",
+        "scenario": "Cell metrics change from 9x18 to 18x18 while the pet lease is active.",
+        "expectedBehavior": "The old lease is invalidated and reserve, cursor, rectangle, and header update to 2x2 in the same tick.",
+        "verdict": "passed",
+        "artifactRefs": ["g003-package-report"]
+      },
+      {
+        "id": "narrow-terminal",
+        "contractRef": "G003 resize and composer safety",
+        "scenario": "The terminal becomes too narrow for the framed composer and pet reserve.",
+        "expectedBehavior": "Raster submission stops and the owned lease is invalidated without composer overlap.",
+        "verdict": "passed",
+        "artifactRefs": ["g003-package-report"]
+      }
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "agent://324-ItermSizeSlopCleaner reported zero blocking/advisory findings; the focused 54-test suite, Biome check, and git diff check were rerun clean afterward.",
+    "fullRerun": true,
+    "rerunCommands": [
+      "bun test packages/tui/test/iterm2-protocol.test.ts packages/tui/test/gajae-pet.test.ts packages/coding-agent/test/gajae-pet-widget.test.ts",
+      "bunx biome check packages/tui/src/components/gajae-pet.ts packages/tui/test/gajae-pet.test.ts packages/tui/test/iterm2-protocol.test.ts packages/coding-agent/src/modes/components/gajae-pet-widget.ts packages/coding-agent/test/gajae-pet-widget.test.ts",
+      "git diff --check"
+    ],
+    "blockers": []
+  },
+  "criticReview": {
+    "verdict": "OKAY",
+    "evidence": "agent://327-ItermSizeTerminalCriticFinal found complete focused/full verification and no missing evidence, approving the G003 completion checkpoint.",
+    "blockers": []
+  }
+}

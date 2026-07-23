@@ -29,6 +29,55 @@ import {
 	visibleWidth,
 	visibleWidths,
 } from "./utils";
+export type CellRect = Readonly<{ column: number; row: number; width: number; height: number }>;
+export type RasterLeaseToken = Readonly<{ ownerId: string; generation: number; rect: CellRect }>;
+export type RasterLeaseInvalidatedNotification = Readonly<{
+	type: "raster-lease-invalidated";
+	queueId: number;
+	token: RasterLeaseToken;
+	cause:
+		| "intersecting-generic-output"
+		| "full-redraw"
+		| "resize"
+		| "terminal-loss"
+		| "capability-loss"
+		| "mode-off"
+		| "dispose"
+		| "explicit";
+	eraseAck: TerminalOutputAck;
+}>;
+export type RasterLeaseRequest = Readonly<{
+	ownerId: string;
+	rect: CellRect;
+	erase: Readonly<{ type: "raster-erase"; bytes: Uint8Array }>;
+	onInvalidated?: (notice: RasterLeaseInvalidatedNotification) => void;
+}>;
+export type TerminalOutputOperation =
+	| Readonly<{ type: "generic-render"; rect: CellRect; bytes: Uint8Array }>
+	| Readonly<{ type: "generic-full-redraw"; rect: CellRect; bytes: Uint8Array }>
+	| Readonly<{
+			type: "raster-multipart-batch";
+			records: readonly Uint8Array[];
+			prefix?: Uint8Array;
+			afterPrefix?: () => Promise<boolean>;
+			replayPrefix?: Uint8Array;
+			suffix?: Uint8Array;
+			abortSuffix?: Uint8Array;
+			restoreCursorVisibility?: boolean;
+	  }>
+	| Readonly<{ type: "raster-erase"; bytes: Uint8Array }>
+	| Readonly<{ type: "raster-probe"; bytes: Uint8Array }>
+	| Readonly<{ type: "queued-output"; bytes: Uint8Array }>;
+export type TerminalOutputAck = Readonly<{
+	queueId: number;
+	operation: TerminalOutputOperation["type"];
+	status: "written" | "stale-token" | "revoked" | "failed";
+	token?: RasterLeaseToken;
+}>;
+export type LifecycleCleanupAck = Readonly<{ attempted: number; written: number; stillPending: number }>;
+export type RasterLeaseAcquireResult =
+	| Readonly<{ status: "acquired"; token: RasterLeaseToken }>
+	| Readonly<{ status: "rejected"; reason: "invalid-geometry" | "terminal-unavailable" | "owner-conflict" }>;
 
 const SEGMENT_RESET = "\x1b[0m";
 /**
@@ -38,6 +87,8 @@ const SEGMENT_RESET = "\x1b[0m";
  * diffing so `#previousLines` mirrors what was actually written.
  */
 const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
+/** CSI 6 terminal-cell dimensions beyond this cannot produce a safe pet raster. */
+const MAX_CELL_DIMENSION_PX = 512;
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
@@ -671,6 +722,32 @@ export class TUI extends Container {
 	#terminalUnavailable = false;
 	#bottomPinnedComponent: Component | null = null;
 	#pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
+	#rasterGeneration = 0;
+	#rasterQueueId = 0;
+	#rasterLeases = new Map<
+		string,
+		{
+			token: RasterLeaseToken;
+			erase: Uint8Array;
+			callback?: (n: RasterLeaseInvalidatedNotification) => void;
+			revoked: boolean;
+		}
+	>();
+	#rasterCleanup = new Map<
+		string,
+		{
+			token: RasterLeaseToken;
+			erase: Uint8Array;
+			callback?: (n: RasterLeaseInvalidatedNotification) => void;
+			queueId: number;
+			cause: RasterLeaseInvalidatedNotification["cause"];
+			terminalGeneration: number;
+		}
+	>();
+	#rasterIngress: Promise<unknown> = Promise.resolve();
+	#rasterPending = 0;
+	#pendingDependentGenericBytes: Array<{ bytes: Uint8Array; rect: CellRect; blockedBy: string[] }> = [];
+	#terminalGeneration = 0;
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -739,7 +816,16 @@ export class TUI extends Container {
 	override dispose(): void {
 		this.#unsubscribeTabWidthChange?.();
 		this.#unsubscribeTabWidthChange = undefined;
+		this.#finalizeRasterLeases("terminal-loss");
 		super.dispose();
+	}
+	#finalizeRasterLeases(cause: RasterLeaseInvalidatedNotification["cause"]): void {
+		this.#revokeRasterLeases(cause);
+		void this.notifyTerminalLifecycle({
+			kind: "explicit-cleanup",
+			source: "tui",
+			terminalGeneration: this.#terminalGeneration,
+		});
 	}
 
 	get fullRedraws(): number {
@@ -1068,6 +1154,382 @@ export class TUI extends Container {
 		for (const overlay of this.overlayStack) overlay.mouseBounds = undefined;
 	}
 
+	acquireRasterLease(request: RasterLeaseRequest): Promise<RasterLeaseAcquireResult> {
+		return this.#enqueueRaster(() => {
+			if (
+				!request ||
+				typeof request.ownerId !== "string" ||
+				!request.rect ||
+				typeof request.erase !== "object" ||
+				request.erase.type !== "raster-erase" ||
+				!(request.erase.bytes instanceof Uint8Array) ||
+				(request.onInvalidated !== undefined && typeof request.onInvalidated !== "function")
+			)
+				return { status: "rejected", reason: "invalid-geometry" };
+			if (!this.#validRect(request.rect)) return { status: "rejected", reason: "invalid-geometry" };
+			if (!this.terminalAvailable) return { status: "rejected", reason: "terminal-unavailable" };
+			if (
+				this.#rasterLeases.has(request.ownerId) ||
+				this.#rasterCleanup.has(request.ownerId) ||
+				[...this.#rasterLeases.values()].some(l => this.#intersects(l.token.rect, request.rect)) ||
+				[...this.#rasterCleanup.values()].some(l => this.#intersects(l.token.rect, request.rect))
+			)
+				return { status: "rejected", reason: "owner-conflict" };
+			const token = Object.freeze({
+				ownerId: request.ownerId,
+				generation: ++this.#rasterGeneration,
+				rect: Object.freeze({ ...request.rect }),
+			});
+			this.#rasterLeases.set(request.ownerId, {
+				token,
+				erase: new Uint8Array(request.erase.bytes),
+				callback: request.onInvalidated,
+				revoked: false,
+			});
+			return { status: "acquired", token };
+		});
+	}
+	submitTerminalOutput(
+		request: Readonly<{ operation: TerminalOutputOperation; token?: RasterLeaseToken }>,
+	): Promise<TerminalOutputAck> {
+		return this.#enqueueRaster(async () => {
+			const id = ++this.#rasterQueueId;
+			const rawOperation =
+				request && typeof request === "object" ? (request as { operation?: unknown }).operation : undefined;
+			const operation =
+				rawOperation &&
+				typeof rawOperation === "object" &&
+				typeof (rawOperation as { type?: unknown }).type === "string"
+					? (rawOperation as { type: string }).type
+					: "queued-output";
+			const failed = () => ({
+				queueId: id,
+				operation: operation as TerminalOutputOperation["type"],
+				status: "failed" as const,
+			});
+			if (!rawOperation || typeof rawOperation !== "object") return failed();
+			const op = rawOperation as unknown as TerminalOutputOperation;
+			if (
+				![
+					"generic-render",
+					"generic-full-redraw",
+					"raster-multipart-batch",
+					"raster-erase",
+					"raster-probe",
+					"queued-output",
+				].includes(op.type as string)
+			)
+				return failed();
+			if (
+				(op.type === "generic-render" || op.type === "generic-full-redraw") &&
+				(!this.#validRect(op.rect as CellRect) || !(op.bytes instanceof Uint8Array))
+			)
+				return failed();
+			if (
+				op.type === "raster-multipart-batch" &&
+				(!Array.isArray(op.records) ||
+					!op.records.every((b: unknown) => b instanceof Uint8Array) ||
+					(op.prefix !== undefined && !(op.prefix instanceof Uint8Array)) ||
+					(op.afterPrefix !== undefined && typeof op.afterPrefix !== "function") ||
+					(op.replayPrefix !== undefined && !(op.replayPrefix instanceof Uint8Array)) ||
+					(op.suffix !== undefined && !(op.suffix instanceof Uint8Array)) ||
+					(op.abortSuffix !== undefined && !(op.abortSuffix instanceof Uint8Array)) ||
+					(op.restoreCursorVisibility !== undefined && typeof op.restoreCursorVisibility !== "boolean") ||
+					((op.replayPrefix !== undefined || op.abortSuffix !== undefined) &&
+						(op.prefix === undefined || op.afterPrefix === undefined)))
+			)
+				return failed();
+			if (
+				(op.type === "raster-erase" || op.type === "raster-probe" || op.type === "queued-output") &&
+				!(op.bytes instanceof Uint8Array)
+			)
+				return failed();
+			if (op.type.startsWith("raster-") && op.type !== "raster-probe") {
+				const lease = request?.token && this.#rasterLeases.get(request.token.ownerId);
+				if (!lease || lease.revoked || lease.token !== request?.token)
+					return { queueId: id, operation: op.type, status: lease?.revoked ? "revoked" : "stale-token" };
+			}
+			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
+				const prefixWritten = this.#guardTerminalOperation(() =>
+					this.terminal.write(new TextDecoder().decode(op.prefix)),
+				);
+				if (!prefixWritten) return failed();
+				const abortBarrier = () => {
+					const abortSuffix = op.abortSuffix === undefined ? "" : new TextDecoder().decode(op.abortSuffix);
+					const cursorVisibility = op.restoreCursorVisibility ? this.#cursorVisibilitySequence() : "";
+					if (abortSuffix || cursorVisibility)
+						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
+				};
+				const flushed = await this.terminal.flush?.();
+				if (flushed === false) {
+					abortBarrier();
+					return failed();
+				}
+				let afterPrefixSucceeded: boolean;
+				try {
+					afterPrefixSucceeded = await op.afterPrefix();
+				} catch {
+					abortBarrier();
+					return failed();
+				}
+				if (afterPrefixSucceeded !== true) {
+					abortBarrier();
+					return failed();
+				}
+				const currentLease = this.#rasterLeases.get(request.token?.ownerId ?? "");
+				if (!currentLease || currentLease.revoked || currentLease.token !== request.token) {
+					abortBarrier();
+					return { queueId: id, operation: op.type, status: currentLease?.revoked ? "revoked" : "stale-token" };
+				}
+			}
+			const bytes =
+				op.type === "raster-multipart-batch"
+					? op.records.map((b: Uint8Array) => new TextDecoder().decode(b)).join("")
+					: new TextDecoder().decode(op.bytes);
+			const finalBytes =
+				op.type === "raster-multipart-batch"
+					? `${op.afterPrefix === undefined && op.prefix !== undefined ? new TextDecoder().decode(op.prefix) : ""}${op.replayPrefix !== undefined ? new TextDecoder().decode(op.replayPrefix) : ""}${bytes}${op.suffix !== undefined ? new TextDecoder().decode(op.suffix) : ""}${op.restoreCursorVisibility ? this.#cursorVisibilitySequence() : ""}`
+					: bytes;
+			const dependent = op.type === "generic-render" || op.type === "generic-full-redraw";
+			const ok = dependent
+				? this.#writeProtectedRenderIngress(finalBytes)
+				: this.#guardTerminalOperation(() => this.terminal.write(finalBytes));
+			if (!ok && dependent) {
+				const rect = (op as { rect: CellRect }).rect;
+				const blockedBy = [...this.#rasterCleanup.entries()]
+					.filter(([, record]) => this.#intersects(record.token.rect, rect))
+					.map(([owner]) => owner);
+				this.#pendingDependentGenericBytes.push({ bytes: new Uint8Array(op.bytes), rect, blockedBy });
+			}
+			return { queueId: id, operation: op.type, status: ok ? "written" : "failed", token: request.token };
+		});
+	}
+	invalidateRasterLease(
+		request: Readonly<{ token: RasterLeaseToken; cause: RasterLeaseInvalidatedNotification["cause"] }>,
+	): Promise<TerminalOutputAck> {
+		return this.#enqueueRaster(() => {
+			const id = ++this.#rasterQueueId,
+				lease = this.#rasterLeases.get(request.token.ownerId);
+			if (!lease || lease.token !== request.token)
+				return { queueId: id, operation: "raster-erase", status: "stale-token" as const };
+			lease.revoked = true;
+			this.#rasterLeases.delete(request.token.ownerId);
+			const erase = this.#cursorGuardedRasterSequence(new TextDecoder().decode(lease.erase));
+			const ok = this.#guardTerminalOperation(() => this.terminal.write(erase));
+			if (!ok)
+				this.#rasterCleanup.set(request.token.ownerId, {
+					token: lease.token,
+					erase: lease.erase,
+					callback: lease.callback,
+					queueId: id,
+					cause: request.cause,
+					terminalGeneration: this.#terminalGeneration,
+				});
+			else
+				lease.callback?.({
+					type: "raster-lease-invalidated",
+					queueId: id,
+					token: lease.token,
+					cause: request.cause,
+					eraseAck: { queueId: id, operation: "raster-erase", status: "written", token: lease.token },
+				});
+			return {
+				queueId: id,
+				operation: "raster-erase" as const,
+				status: ok ? ("written" as const) : ("failed" as const),
+				token: lease.token,
+			};
+		});
+	}
+	notifyTerminalLifecycle(event: {
+		kind: "availability-restored" | "explicit-cleanup";
+		source: "tui" | "interactive-mode" | "transport";
+		terminalGeneration: number;
+	}): Promise<LifecycleCleanupAck> {
+		if (
+			!event ||
+			(event.kind !== "availability-restored" && event.kind !== "explicit-cleanup") ||
+			(event.source !== "tui" && event.source !== "interactive-mode" && event.source !== "transport") ||
+			!Number.isSafeInteger(event.terminalGeneration) ||
+			event.terminalGeneration < 0
+		) {
+			return Promise.reject(new TypeError("invalid terminal lifecycle event"));
+		}
+		return this.#enqueueRaster(() => {
+			if (event.terminalGeneration !== this.#terminalGeneration)
+				return { attempted: 0, written: 0, stillPending: 0 };
+			let attempted = 0,
+				written = 0;
+			for (const [owner, r] of this.#rasterCleanup) {
+				r.terminalGeneration = this.#terminalGeneration;
+				attempted++;
+				if (this.#writeLifecycleCleanup(this.#cursorGuardedRasterSequence(new TextDecoder().decode(r.erase)))) {
+					written++;
+					this.#rasterCleanup.delete(owner);
+					const ack: TerminalOutputAck = {
+						queueId: r.queueId,
+						operation: "raster-erase",
+						status: "written",
+						token: r.token,
+					};
+					r.callback?.({
+						type: "raster-lease-invalidated",
+						queueId: r.queueId,
+						token: r.token,
+						cause: r.cause,
+						eraseAck: ack,
+					});
+					const index = this.#pendingDependentGenericBytes.findIndex(item => item.blockedBy.includes(owner));
+					if (index >= 0) {
+						const item = this.#pendingDependentGenericBytes[index];
+						const blocked = [...this.#rasterLeases.values(), ...this.#rasterCleanup.values()].some(record =>
+							this.#intersects(record.token.rect, item.rect),
+						);
+						if (!blocked && this.#writeDisjointDependentIngress(new TextDecoder().decode(item.bytes), item.rect))
+							this.#pendingDependentGenericBytes.splice(index, 1);
+					}
+				} else {
+					r.terminalGeneration = this.#terminalGeneration;
+				}
+			}
+			if (written > 0) this.requestRender(true);
+			return { attempted, written, stillPending: this.#rasterCleanup.size };
+		});
+	}
+	#enqueueRaster<T>(fn: () => T | Promise<T>): Promise<T> {
+		this.#rasterPending++;
+		const next: Promise<T> = this.#rasterIngress.then(fn) as Promise<T>;
+		this.#rasterIngress = next.catch(() => undefined);
+		void next.then(
+			() => {
+				this.#rasterPending--;
+			},
+			() => {
+				this.#rasterPending--;
+			},
+		);
+		return next;
+	}
+	#validRect(r: CellRect): boolean {
+		return (
+			Object.values(r).every(Number.isSafeInteger) &&
+			r.column >= 0 &&
+			r.row >= 0 &&
+			r.width > 0 &&
+			r.height > 0 &&
+			r.column + r.width <= this.terminal.columns &&
+			r.row + r.height <= this.terminal.rows
+		);
+	}
+	#unleasedRowSegments(row: number, width: number): Array<{ column: number; width: number }> {
+		let segments = [{ column: 0, width }];
+		for (const lease of this.#rasterLeases.values()) {
+			const rect = lease.token.rect;
+			if (row < rect.row || row >= rect.row + rect.height) continue;
+			const protectedStart = rect.column;
+			const protectedEnd = rect.column + rect.width;
+			const next: Array<{ column: number; width: number }> = [];
+			for (const segment of segments) {
+				const segmentEnd = segment.column + segment.width;
+				if (protectedEnd <= segment.column || protectedStart >= segmentEnd) {
+					next.push(segment);
+					continue;
+				}
+				if (protectedStart > segment.column)
+					next.push({ column: segment.column, width: protectedStart - segment.column });
+				if (protectedEnd < segmentEnd) next.push({ column: protectedEnd, width: segmentEnd - protectedEnd });
+			}
+			segments = next;
+		}
+		return segments;
+	}
+	#intersects(a: CellRect, b: CellRect): boolean {
+		return (
+			a.column < b.column + b.width &&
+			b.column < a.column + a.width &&
+			a.row < b.row + b.height &&
+			b.row < a.row + a.height
+		);
+	}
+	#writeProtectedRender(buffer: string): boolean {
+		if (this.#rasterPending === 0 && this.#rasterLeases.size === 0 && this.#rasterCleanup.size === 0)
+			return this.#writeProtectedRenderIngress(buffer);
+		this.#enqueueRaster(() => this.#writeProtectedRenderIngress(buffer));
+		return true;
+	}
+	#writeRasterPreservingRender(buffer: string): boolean {
+		if (this.#rasterPending === 0 && this.#rasterCleanup.size === 0)
+			return this.#writeRasterPreservingRenderIngress(buffer);
+		this.#enqueueRaster(() => this.#writeRasterPreservingRenderIngress(buffer));
+		return true;
+	}
+	#writeRasterPreservingRenderIngress(buffer: string): boolean {
+		if (this.#rasterCleanup.size > 0) return this.#writeProtectedRenderIngress(buffer);
+		return this.#writeTerminal(buffer);
+	}
+	#writeDisjointDependentIngress(buffer: string, rect: CellRect): boolean {
+		if (
+			[...this.#rasterLeases.values(), ...this.#rasterCleanup.values()].some(record =>
+				this.#intersects(record.token.rect, rect),
+			)
+		)
+			return false;
+		return this.#guardTerminalOperation(() => this.terminal.write(buffer));
+	}
+	#writeProtectedRenderIngress(buffer: string): boolean {
+		const affected = [...this.#rasterLeases.values()];
+		const pending = [...this.#rasterCleanup.values()];
+		if (pending.length > 0) return false;
+		if (affected.length === 0 && pending.length === 0) return this.#writeTerminal(buffer);
+		const queueId = ++this.#rasterQueueId;
+		const cleanup = [
+			...pending.map(r => new TextDecoder().decode(r.erase)),
+			...affected.map(lease => new TextDecoder().decode(lease.erase)),
+		].join("");
+		const ok = this.#guardTerminalOperation(() => this.terminal.write(cleanup + buffer));
+		if (!ok) {
+			this.#terminalUnavailable = true;
+			this.#previousLines = [];
+			this.#renderRequested = true;
+			for (const lease of affected) {
+				this.#rasterLeases.delete(lease.token.ownerId);
+				this.#rasterCleanup.set(lease.token.ownerId, {
+					token: lease.token,
+					erase: lease.erase,
+					callback: lease.callback,
+					queueId,
+					cause: "intersecting-generic-output",
+					terminalGeneration: this.#terminalGeneration,
+				});
+			}
+			return false;
+		}
+		this.#rasterCleanup.clear();
+		for (const lease of affected) {
+			this.#rasterLeases.delete(lease.token.ownerId);
+		}
+		for (const record of pending) {
+			const ack: TerminalOutputAck = { queueId, operation: "raster-erase", status: "written", token: record.token };
+			record.callback?.({
+				type: "raster-lease-invalidated",
+				queueId,
+				token: record.token,
+				cause: record.cause,
+				eraseAck: ack,
+			});
+		}
+		for (const lease of affected) {
+			const ack: TerminalOutputAck = { queueId, operation: "raster-erase", status: "written", token: lease.token };
+			lease.callback?.({
+				type: "raster-lease-invalidated",
+				queueId,
+				token: lease.token,
+				cause: "intersecting-generic-output",
+				eraseAck: ack,
+			});
+		}
+		return true;
+	}
 	start(): void {
 		this.#stopped = false;
 		this.#terminalUnavailable = false;
@@ -1075,11 +1537,25 @@ export class TUI extends Container {
 		this.terminal.start(
 			data => this.#handleInput(data),
 			() => {
+				this.#revokeRasterLeases("resize");
 				this.invalidate();
-				this.requestResizeRender();
+				this.notifyTerminalLifecycle({
+					kind: "explicit-cleanup",
+					source: "tui",
+					terminalGeneration: this.#terminalGeneration,
+				}).then(result => {
+					if (result.stillPending === 0) this.requestResizeRender();
+				});
 			},
 		);
 		this.flushTerminalCleanup();
+		if (this.#rasterCleanup.size > 0) {
+			void this.notifyTerminalLifecycle({
+				kind: "availability-restored",
+				source: "tui",
+				terminalGeneration: this.#terminalGeneration,
+			});
+		}
 		this.#hideCursor();
 		this.#querySixelSupport();
 		this.#queryCellSize();
@@ -1089,8 +1565,28 @@ export class TUI extends Container {
 	get terminalAvailable(): boolean {
 		return !this.#terminalUnavailable && this.terminal.available;
 	}
-
+	get terminalGeneration(): number {
+		return this.#terminalGeneration;
+	}
+	#revokeRasterLeases(cause: RasterLeaseInvalidatedNotification["cause"]): void {
+		const queueId = ++this.#rasterQueueId;
+		for (const lease of this.#rasterLeases.values()) {
+			lease.revoked = true;
+			this.#rasterCleanup.set(lease.token.ownerId, {
+				token: lease.token,
+				erase: lease.erase,
+				callback: lease.callback,
+				queueId,
+				cause,
+				terminalGeneration: this.#terminalGeneration,
+			});
+		}
+		this.#rasterLeases.clear();
+	}
 	#markTerminalUnavailable(): void {
+		this.#terminalGeneration++;
+		for (const record of this.#rasterCleanup.values()) record.terminalGeneration = this.#terminalGeneration;
+		this.#revokeRasterLeases("terminal-loss");
 		this.#terminalUnavailable = true;
 		this.#stopped = true;
 		this.#renderRequested = false;
@@ -1132,11 +1628,33 @@ export class TUI extends Container {
 		return true;
 	}
 
+	#writeLifecycleCleanup(data: string): boolean {
+		if (!this.terminal.available) {
+			this.#markTerminalUnavailable();
+			return false;
+		}
+		try {
+			this.terminal.write(data);
+		} catch {
+			this.#markTerminalUnavailable();
+			return false;
+		}
+		if (!this.terminal.available) {
+			this.#markTerminalUnavailable();
+			return false;
+		}
+		this.#terminalUnavailable = false;
+		return true;
+	}
+
 	addInputListener(listener: InputListener): () => void {
 		this.#inputListeners.add(listener);
 		return () => {
 			this.#inputListeners.delete(listener);
 		};
+	}
+	drainInput(maxMs: number, quiescenceMs: number): Promise<void> {
+		return this.terminal.drainInput(maxMs, quiescenceMs);
 	}
 
 	removeInputListener(listener: InputListener): void {
@@ -1289,6 +1807,7 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		this.#finalizeRasterLeases("terminal-loss");
 		this.flushTerminalCleanup();
 		this.#clearSixelProbeState();
 		this.#stopped = true;
@@ -1571,7 +2090,14 @@ export class TUI extends Container {
 
 		const heightPx = parseInt(match[1], 10);
 		const widthPx = parseInt(match[2], 10);
-		if (heightPx <= 0 || widthPx <= 0) {
+		if (
+			!Number.isSafeInteger(heightPx) ||
+			!Number.isSafeInteger(widthPx) ||
+			heightPx <= 0 ||
+			widthPx <= 0 ||
+			heightPx > MAX_CELL_DIMENSION_PX ||
+			widthPx > MAX_CELL_DIMENSION_PX
+		) {
 			return true;
 		}
 
@@ -2089,25 +2615,36 @@ export class TUI extends Container {
 		const maxViewportTop = Math.max(0, lines.length - (allowPastLiveBottom ? 1 : height));
 		const nextViewportTop = Math.max(0, Math.min(maxViewportTop, viewportTop));
 		const currentScreenRow = Math.max(0, Math.min(height - 1, this.#hardwareCursorRow - this.#viewportTopRow));
-		let buffer = "\x1b[?2026h";
-		if (currentScreenRow > 0) {
-			buffer += `\x1b[${currentScreenRow}A`;
+		const visibleLines = lines.slice(nextViewportTop, nextViewportTop + height);
+		const preserveRasterLeases =
+			this.#rasterLeases.size > 0 &&
+			this.#rasterCleanup.size === 0 &&
+			!visibleLines.some(line => TERMINAL.isImageLine(line));
+		let buffer = `\x1b[?2026h${preserveRasterLeases ? "\x1b[?25l" : ""}`;
+		if (!preserveRasterLeases) {
+			if (currentScreenRow > 0) {
+				buffer += `\x1b[${currentScreenRow}A`;
+			}
+			buffer += "\r";
 		}
-		buffer += "\r";
 
 		for (let screenRow = 0; screenRow < height; screenRow++) {
-			if (screenRow > 0) buffer += "\r\n";
-			buffer += "\x1b[2K";
+			if (preserveRasterLeases) buffer += `\x1b[${screenRow + 1};1H`;
+			else if (screenRow > 0) buffer += "\r\n";
 			const lineIndex = nextViewportTop + screenRow;
-			if (lineIndex >= lines.length) continue;
-			const line = lines[lineIndex];
-			const isImage = TERMINAL.isImageLine(line);
-			if (!isImage && this.#visibleWidthForDifferentialGuard(line) > width) {
-				let truncatedLine = truncateToWidth(line, width, Ellipsis.Omit);
-				truncatedLine += truncatedLine.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET;
-				buffer += truncatedLine;
+			const line = lineIndex < lines.length ? lines[lineIndex] : "";
+			let renderedLine = line;
+			if (this.#visibleWidthForDifferentialGuard(line) > width) {
+				renderedLine = truncateToWidth(line, width, Ellipsis.Omit);
+				renderedLine += renderedLine.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET;
+			}
+			if (preserveRasterLeases) {
+				for (const segment of this.#unleasedRowSegments(screenRow, width)) {
+					buffer += `\x1b[${segment.column + 1}G\x1b[${segment.width}X`;
+					buffer += `${sliceByColumn(renderedLine, segment.column, segment.width, true)}${SEGMENT_RESET}`;
+				}
 			} else {
-				buffer += line;
+				buffer += `\x1b[2K${renderedLine}`;
 			}
 		}
 
@@ -2122,7 +2659,8 @@ export class TUI extends Container {
 		this.#hardwareCursorRow = cursorToRow;
 		buffer += cursorSeq;
 		buffer += "\x1b[?2026l";
-		if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, lines.length)) return false;
+		if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, lines.length, preserveRasterLeases))
+			return false;
 
 		if (this.#debugRedraw) {
 			const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (lines=${lines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
@@ -2355,53 +2893,21 @@ export class TUI extends Container {
 		const viewportRepaint = (reason: string): void => {
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
-			const nextViewportTop = Math.max(0, newLines.length - height);
-			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
-			let buffer = "\x1b[?2026h";
-			if (currentScreenRow > 0) {
-				buffer += `\x1b[${currentScreenRow}A`;
-			}
-			buffer += "\r";
-			for (let screenRow = 0; screenRow < height; screenRow++) {
-				if (screenRow > 0) buffer += "\r\n";
-				buffer += "\x1b[2K";
-				const lineIndex = nextViewportTop + screenRow;
-				if (lineIndex >= newLines.length) continue;
-				const line = newLines[lineIndex];
-				const isImage = TERMINAL.isImageLine(line);
-				if (!isImage && this.#visibleWidthForDifferentialGuard(line) > width) {
-					let truncatedLine = truncateToWidth(line, width, Ellipsis.Omit);
-					truncatedLine += truncatedLine.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET;
-					buffer += truncatedLine;
-				} else {
-					buffer += line;
-				}
-			}
-
-			const finalPhysicalRow = nextViewportTop + Math.max(0, height - 1);
-			let cursorSeq = "\x1b[?25l";
-			let cursorToRow = finalPhysicalRow;
-			if (cursorPos && cursorPos.row >= nextViewportTop && cursorPos.row < nextViewportTop + height) {
-				const cursor = this.#cursorControlSequence(cursorPos, newLines.length, finalPhysicalRow);
-				cursorSeq = cursor.seq;
-				cursorToRow = cursor.toRow;
-			}
-			this.#hardwareCursorRow = cursorToRow;
-			buffer += cursorSeq;
-			buffer += "\x1b[?2026l";
-			if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
-
-			if (this.#debugRedraw) {
-				const msg = `[${new Date().toISOString()}] viewportRepaint: ${reason} (prev=${this.#previousLines.length}, new=${newLines.length}, height=${height}, viewportTop=${nextViewportTop})\n`;
-				this.#appendDebugRedrawLog(msg);
-			}
+			if (
+				!this.#repaintViewportFromLines(
+					newLines,
+					width,
+					height,
+					Math.max(0, newLines.length - height),
+					cursorPos,
+					reason,
+				)
+			)
+				return;
 			// Viewport repaint deliberately prioritizes the live viewport over
 			// historical scrollback repair. After offscreen changes, #previousLines
 			// tracks the desired logical transcript, not every byte emitted into the
 			// terminal scrollback.
-			this.#cursorRow = Math.max(0, newLines.length - 1);
-			this.#maxLinesRendered = newLines.length;
-			this.#viewportTopRow = nextViewportTop;
 			this.#previousLines = newLines;
 			this.#previousWidth = width;
 			this.#previousHeight = height;
@@ -2499,6 +3005,14 @@ export class TUI extends Container {
 			this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
 			return;
 		}
+		if (
+			this.#rasterLeases.size > 0 &&
+			this.#rasterCleanup.size === 0 &&
+			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
+		) {
+			viewportRepaint("changed frame with active raster lease");
+			return;
+		}
 
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
 		if (newLines.length < this.#previousLines.length && nextLiveViewportTop !== prevViewportTop) {
@@ -2575,10 +3089,21 @@ export class TUI extends Container {
 		}
 
 		// Render from first changed line to end
+		const renderEnd = Math.min(lastChanged, newLines.length - 1);
 		// Build buffer with all updates wrapped in synchronized output
 		let buffer = "\x1b[?2026h"; // Begin synchronized output
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
+		const appendWillScroll = appendStart && moveTargetRow >= prevViewportBottom;
+		if (
+			(moveTargetRow > prevViewportBottom || appendWillScroll || renderEnd > prevViewportBottom) &&
+			this.#rasterLeases.size > 0 &&
+			this.#rasterCleanup.size === 0 &&
+			!newLines.slice(Math.max(0, newLines.length - height)).some(line => TERMINAL.isImageLine(line))
+		) {
+			viewportRepaint("streaming append with active raster lease");
+			return;
+		}
 		if (moveTargetRow > prevViewportBottom) {
 			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
 			const moveToBottom = height - 1 - currentScreenRow;
@@ -2602,12 +3127,15 @@ export class TUI extends Container {
 
 		buffer += appendStart ? "\r\n" : "\r"; // Move to column 0
 
-		// Only render changed lines (firstChanged to lastChanged), not all lines to end
-		// This reduces flicker when only a single line changes (e.g., spinner animation)
-		const renderEnd = Math.min(lastChanged, newLines.length - 1);
+		// Only render changed lines (firstChanged to lastChanged), not all lines to end.
+		// This reduces flicker when only a single line changes (e.g., spinner animation).
+		const preserveRasterLeases =
+			this.#rasterLeases.size > 0 &&
+			this.#rasterCleanup.size === 0 &&
+			moveTargetRow <= prevViewportBottom &&
+			!newLines.slice(firstChanged, renderEnd + 1).some(line => TERMINAL.isImageLine(line));
 		for (let i = firstChanged; i <= renderEnd; i++) {
 			if (i > firstChanged) buffer += "\r\n";
-			buffer += "\x1b[2K"; // Clear current line
 			const line = newLines[i];
 			let truncatedLine = line;
 			const isImage = TERMINAL.isImageLine(line);
@@ -2634,8 +3162,18 @@ export class TUI extends Container {
 				truncatedLine += truncatedLine.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET;
 			}
 			// Non-image lines are pre-terminated/normalized by #applyLineResets;
-			// truncated lines re-append LINE_TERMINATOR above.
-			buffer += truncatedLine;
+			// truncated lines re-append LINE_TERMINATOR above. While a raster lease
+			// occupies this screen row, clear and redraw only the complementary cell
+			// spans so ordinary input cannot erase the inline image.
+			if (preserveRasterLeases) {
+				const screenRow = i - viewportTop;
+				for (const segment of this.#unleasedRowSegments(screenRow, width)) {
+					buffer += `\x1b[${segment.column + 1}G\x1b[${segment.width}X`;
+					buffer += `${sliceByColumn(truncatedLine, segment.column, segment.width, true)}${SEGMENT_RESET}`;
+				}
+			} else {
+				buffer += `\x1b[2K${truncatedLine}`;
+			}
 		}
 
 		// Track where cursor ended up after rendering
@@ -2693,7 +3231,8 @@ export class TUI extends Container {
 		}
 
 		// Write entire buffer at once
-		if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length)) return;
+		if (!this.#writeRenderBufferAndReanchorImeCursor(buffer, cursorPos, newLines.length, preserveRasterLeases))
+			return;
 
 		// Track cursor position for next render.
 		// cursorRow tracks end of content (for viewport calculation).
@@ -2747,11 +3286,26 @@ export class TUI extends Container {
 
 		return { seq, toRow: targetRow };
 	}
+	#cursorVisibilitySequence(): string {
+		if (this.#showHardwareCursor || this.#imeCursorActive)
+			return this.#useImeBlockCursor ? "\x1b[2 q\x1b[?25h" : "\x1b[?25h";
+		return this.#useImeBlockCursor ? "\x1b[0 q\x1b[?25l" : "\x1b[?25l";
+	}
+	#cursorGuardedRasterSequence(payload: string): string {
+		return `\x1b[?2026h\x1b7\x1b[?25l${payload}\x1b8${this.#cursorVisibilitySequence()}\x1b[?2026l`;
+	}
 
 	/** Retain terminal cleanup until a write succeeds, even after its component is disposed. */
 	queueTerminalCleanup(payload: string, onDelivered?: () => void): void {
 		this.#pendingTerminalCleanup.push({ payload, onDelivered });
 		this.flushTerminalCleanup();
+	}
+
+	/** Queue protocol-neutral output behind the same terminal ordering as renders. */
+	queueTerminalOutput(payload: string): Promise<TerminalOutputAck> {
+		return this.submitTerminalOutput({
+			operation: { type: "queued-output", bytes: new TextEncoder().encode(payload) },
+		});
 	}
 
 	/** Retry queued terminal cleanup after terminal recovery or before shutdown. */
@@ -2780,6 +3334,7 @@ export class TUI extends Container {
 		buffer: string,
 		cursorPos: { row: number; col: number } | null,
 		totalLines: number,
+		preserveRasterLeases = false,
 	): boolean {
 		const overlay = this.#postRenderEmitter?.();
 		if (overlay) {
@@ -2788,9 +3343,28 @@ export class TUI extends Container {
 			// area is cleared and redrawn.
 			buffer += `\x1b[?2026h\x1b7${overlay}\x1b8\x1b[?2026l`;
 		}
-		if (!this.#writeTerminal(buffer)) return false;
-		if (!this.#imeCursorActive) return true;
-		return this.#writeCursorPosition(cursorPos, totalLines);
+		const writeIngress = preserveRasterLeases
+			? (bytes: string) => this.#writeRasterPreservingRenderIngress(bytes)
+			: (bytes: string) => this.#writeProtectedRenderIngress(bytes);
+		if (!this.#imeCursorActive)
+			return preserveRasterLeases ? this.#writeRasterPreservingRender(buffer) : this.#writeProtectedRender(buffer);
+		const write = () => {
+			const { seq, toRow } = this.#cursorControlSequence(cursorPos, totalLines, this.#hardwareCursorRow);
+			const ok = writeIngress(buffer + seq);
+			if (ok) this.#hardwareCursorRow = toRow;
+			else this.#hardwareCursorRow = 0;
+			return ok;
+		};
+		if (
+			this.#rasterPending === 0 &&
+			this.#rasterCleanup.size === 0 &&
+			(preserveRasterLeases || this.#rasterLeases.size === 0)
+		) {
+			if (!writeIngress(buffer)) return false;
+			return this.#writeCursorPosition(cursorPos, totalLines);
+		}
+		this.#enqueueRaster(write);
+		return true;
 	}
 
 	/**

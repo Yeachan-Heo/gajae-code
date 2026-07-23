@@ -88,6 +88,7 @@ export interface Terminal {
 
 	// Write output to terminal
 	write(data: string): void;
+	flush?(): Promise<boolean>;
 
 	// Whether terminal output is still writable
 	get available(): boolean;
@@ -796,6 +797,20 @@ export class ProcessTerminal implements Terminal {
 				// Ignore logging errors
 			}
 		}
+	}
+
+	async flush(): Promise<boolean> {
+		if (this.#dead) return false;
+		const { promise, resolve } = Promise.withResolvers<boolean>();
+		try {
+			process.stdout.write("", () => {
+				resolve(!this.#dead);
+			});
+		} catch (err) {
+			this.#markUnavailable(err, "flush");
+			resolve(false);
+		}
+		return await promise;
 	}
 
 	#safeWrite(data: string): void {

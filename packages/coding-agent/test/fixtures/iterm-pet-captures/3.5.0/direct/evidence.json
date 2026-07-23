@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "status": "passed",
+  "reason": null,
+  "failures": {
+    "directFailure": "passed",
+    "managedFailure": "not_tested",
+    "reason": "Direct capability probe succeeded and current live direct rendering is normal based on the supplied screenshot."
+  },
+  "missing-f": {
+    "outcome": "missing-f",
+    "status": "recorded",
+    "producer": "gjc-iterm-live-capture-v1",
+    "provenance": "controlled fixture capture",
+    "capturedAt": "2026-01-01T00:00:00Z"
+  },
+  "invalid-f": {
+    "outcome": "invalid-f",
+    "status": "recorded",
+    "producer": "gjc-iterm-live-capture-v1",
+    "provenance": "controlled fixture capture",
+    "capturedAt": "2026-01-01T00:00:00Z"
+  },
+  "probe-timeout": {
+    "outcome": "probe-timeout",
+    "status": "recorded",
+    "producer": "gjc-iterm-live-capture-v1",
+    "provenance": "controlled fixture capture",
+    "capturedAt": "2026-01-01T00:00:00Z"
+  },
+  "erase": {
+    "outcome": "erase",
+    "status": "recorded",
+    "producer": "gjc-iterm-live-capture-v1",
+    "provenance": "controlled fixture capture",
+    "capturedAt": "2026-01-01T00:00:00Z"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "producer": "gjc-iterm-live-capture-v1",
+  "provenance": "controlled fixture capture",
+  "capturedAt": "2026-01-01T00:00:00Z",
+  "status": "captured",
+  "reason": null,
+  "failures": {
+    "directFailure": "failed",
+    "managedFailure": "failed"
+  },
+  "missing-f": {
+    "outcome": "missing-f",
+    "status": "recorded",
+    "producer": "gjc-iterm-live-capture-v1",
+    "provenance": "controlled fixture capture",
+    "capturedAt": "2026-01-01T00:00:00Z"
+  },
+  "invalid-f": {
+    "outcome": "invalid-f",
+    "status": "recorded",
+    "producer": "gjc-iterm-live-capture-v1",
+    "provenance": "controlled fixture capture",
+    "capturedAt": "2026-01-01T00:00:00Z"
+  },
+  "probe-timeout": {
+    "outcome": "probe-timeout",
+    "status": "recorded",
+    "producer": "gjc-iterm-live-capture-v1",
+    "provenance": "controlled fixture capture",
+    "capturedAt": "2026-01-01T00:00:00Z"
+  },
+  "topology-ineligible": {
+    "outcome": "topology-ineligible",
+    "status": "recorded",
+    "producer": "gjc-iterm-live-capture-v1",
+    "provenance": "controlled fixture capture",
+    "capturedAt": "2026-01-01T00:00:00Z"
+  },
+  "erase": {
+    "outcome": "erase",
+    "status": "recorded",
+    "producer": "gjc-iterm-live-capture-v1",
+    "provenance": "controlled fixture capture",
+    "capturedAt": "2026-01-01T00:00:00Z"
+  }
+}

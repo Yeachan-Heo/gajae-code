@@ -1,0 +1,402 @@
+{
+  "schemaVersion": 1,
+  "version": "3.6.11",
+  "iTermVersion": "3.6.11",
+  "mode": "direct",
+  "gitRevision": "4b9d8c8e02be27bad40136d12e11d33417771a51",
+  "producer": "gjc-iterm-live-capture-v1",
+  "synthetic": false,
+  "provenance": "Controlled Red/Blue/state cases use deterministic hash-bound skin/state-specific representative rasters; PNG is live visual evidence proving static rendering and placement only, with no animation timing claim.",
+  "capturedAt": "2026-07-23T06:24:00+09:00",
+  "environment": {
+    "fixtureKind": "controlled-raster-comparison",
+    "fontFamily": "synthetic",
+    "fontSize": 12,
+    "zoom": 1,
+    "columns": 80,
+    "rows": 24,
+    "cellWidthPx": 8,
+    "cellHeightPx": 16
+  },
+  "liveEnvironment": {
+    "iTermVersion": "3.6.11",
+    "mode": "direct",
+    "os": "macOS",
+    "architecture": "arm64",
+    "command": "gjc iterm pet capture --mode direct",
+    "capturedAt": "2026-07-23T06:24:00+09:00",
+    "screenshotPixels": "3024x1964",
+    "sourceProvenance": "Source temp screenshot: /tmp/gjc-iterm-3.6.11-direct.png; static single-frame only; no animation timing observed."
+  },
+  "cacheLimits": {
+    "maxEntries": 32,
+    "maxRetainedBytes": 8388608
+  },
+  "artifacts": [
+    {
+      "path": "artifacts/8c0f293817e7f1d84d8152b3004ad5629eb3ae44773236ec28c9f44aa948f793.rgba",
+      "sha256": "8c0f293817e7f1d84d8152b3004ad5629eb3ae44773236ec28c9f44aa948f793",
+      "format": "rgba8",
+      "role": "controlled-representative",
+      "provenance": "Deterministic Red/idle controlled representative raster; hash-bound state evidence; not live animation timing evidence."
+    },
+    {
+      "path": "artifacts/d24ea090277aa4a7ba1f2b9139d7adb92baa43c4c087a9ce32bdd1a81282d997.rgba",
+      "sha256": "d24ea090277aa4a7ba1f2b9139d7adb92baa43c4c087a9ce32bdd1a81282d997",
+      "format": "rgba8",
+      "role": "controlled-representative",
+      "provenance": "Deterministic Red/working controlled representative raster; hash-bound state evidence; not live animation timing evidence."
+    },
+    {
+      "path": "artifacts/a5bf6323513b0cd49d33fef609b0bcd07d528e18340aa5b0c5ea0ae51edbd7b0.rgba",
+      "sha256": "a5bf6323513b0cd49d33fef609b0bcd07d528e18340aa5b0c5ea0ae51edbd7b0",
+      "format": "rgba8",
+      "role": "controlled-representative",
+      "provenance": "Deterministic Red/burst controlled representative raster; hash-bound state evidence; not live animation timing evidence."
+    },
+    {
+      "path": "artifacts/1688be1f97e7e4dc376ab54211fe819bd0d1bb77bd50d1df2410ae0fd158b860.rgba",
+      "sha256": "1688be1f97e7e4dc376ab54211fe819bd0d1bb77bd50d1df2410ae0fd158b860",
+      "format": "rgba8",
+      "role": "controlled-representative",
+      "provenance": "Deterministic Red/preview controlled representative raster; hash-bound state evidence; not live animation timing evidence."
+    },
+    {
+      "path": "artifacts/6052f90cd09bdc27198405195b48180b8a0c96a385ba4139655a4867d9c7303b.rgba",
+      "sha256": "6052f90cd09bdc27198405195b48180b8a0c96a385ba4139655a4867d9c7303b",
+      "format": "rgba8",
+      "role": "controlled-representative",
+      "provenance": "Deterministic Blue/idle controlled representative raster; hash-bound state evidence; not live animation timing evidence."
+    },
+    {
+      "path": "artifacts/b39f83aacd35b54b0e709dc7f90fc836615a979119e8e18d2dc84d3a1fb6a3e0.rgba",
+      "sha256": "b39f83aacd35b54b0e709dc7f90fc836615a979119e8e18d2dc84d3a1fb6a3e0",
+      "format": "rgba8",
+      "role": "controlled-representative",
+      "provenance": "Deterministic Blue/working controlled representative raster; hash-bound state evidence; not live animation timing evidence."
+    },
+    {
+      "path": "artifacts/480eef1079f8267384fa286270e831838416fecdec0e2946f9c4d08d1015c5e9.rgba",
+      "sha256": "480eef1079f8267384fa286270e831838416fecdec0e2946f9c4d08d1015c5e9",
+      "format": "rgba8",
+      "role": "controlled-representative",
+      "provenance": "Deterministic Blue/burst controlled representative raster; hash-bound state evidence; not live animation timing evidence."
+    },
+    {
+      "path": "artifacts/d9514ee0c0bf755def2b2b2ba5e0264ca57e47dc10d81dc1a76b94d7d99d2c68.rgba",
+      "sha256": "d9514ee0c0bf755def2b2b2ba5e0264ca57e47dc10d81dc1a76b94d7d99d2c68",
+      "format": "rgba8",
+      "role": "controlled-representative",
+      "provenance": "Deterministic Blue/preview controlled representative raster; hash-bound state evidence; not live animation timing evidence."
+    },
+    {
+      "path": "artifacts/d135c5c954943147397ba4a95b7887e26bae204d4d57d18500c3234df5b048db.png",
+      "sha256": "d135c5c954943147397ba4a95b7887e26bae204d4d57d18500c3234df5b048db",
+      "format": "png",
+      "role": "current-live-render",
+      "classification": "current",
+      "observedResult": "passed",
+      "provenance": "Live iTerm 3.6.11 direct macOS arm64 screenshot; static rendering and placement only; no animation timing observed"
+    }
+  ],
+  "visualEvidence": [
+    {
+      "artifactSha256": "d135c5c954943147397ba4a95b7887e26bae204d4d57d18500c3234df5b048db",
+      "role": "current-live-render",
+      "classification": "current",
+      "observedResult": "passed",
+      "provenance": "Live iTerm 3.6.11 direct macOS arm64 screenshot; static rendering and placement only; no animation timing observed",
+      "capturedAt": "2026-07-23T06:24:00+09:00",
+      "screenshot": {
+        "width": 3024,
+        "height": 1964
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "red-idle",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/8c0f293817e7f1d84d8152b3004ad5629eb3ae44773236ec28c9f44aa948f793.rgba",
+      "actualCapture": "artifacts/8c0f293817e7f1d84d8152b3004ad5629eb3ae44773236ec28c9f44aa948f793.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "red-working",
+      "skin": "Red",
+      "state": "working",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/d24ea090277aa4a7ba1f2b9139d7adb92baa43c4c087a9ce32bdd1a81282d997.rgba",
+      "actualCapture": "artifacts/d24ea090277aa4a7ba1f2b9139d7adb92baa43c4c087a9ce32bdd1a81282d997.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "red-burst",
+      "skin": "Red",
+      "state": "burst",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/a5bf6323513b0cd49d33fef609b0bcd07d528e18340aa5b0c5ea0ae51edbd7b0.rgba",
+      "actualCapture": "artifacts/a5bf6323513b0cd49d33fef609b0bcd07d528e18340aa5b0c5ea0ae51edbd7b0.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "red-preview",
+      "skin": "Red",
+      "state": "preview",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/1688be1f97e7e4dc376ab54211fe819bd0d1bb77bd50d1df2410ae0fd158b860.rgba",
+      "actualCapture": "artifacts/1688be1f97e7e4dc376ab54211fe819bd0d1bb77bd50d1df2410ae0fd158b860.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "blue-idle",
+      "skin": "Blue",
+      "state": "idle",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/6052f90cd09bdc27198405195b48180b8a0c96a385ba4139655a4867d9c7303b.rgba",
+      "actualCapture": "artifacts/6052f90cd09bdc27198405195b48180b8a0c96a385ba4139655a4867d9c7303b.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "blue-working",
+      "skin": "Blue",
+      "state": "working",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/b39f83aacd35b54b0e709dc7f90fc836615a979119e8e18d2dc84d3a1fb6a3e0.rgba",
+      "actualCapture": "artifacts/b39f83aacd35b54b0e709dc7f90fc836615a979119e8e18d2dc84d3a1fb6a3e0.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "blue-burst",
+      "skin": "Blue",
+      "state": "burst",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/480eef1079f8267384fa286270e831838416fecdec0e2946f9c4d08d1015c5e9.rgba",
+      "actualCapture": "artifacts/480eef1079f8267384fa286270e831838416fecdec0e2946f9c4d08d1015c5e9.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "blue-preview",
+      "skin": "Blue",
+      "state": "preview",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/d9514ee0c0bf755def2b2b2ba5e0264ca57e47dc10d81dc1a76b94d7d99d2c68.rgba",
+      "actualCapture": "artifacts/d9514ee0c0bf755def2b2b2ba5e0264ca57e47dc10d81dc1a76b94d7d99d2c68.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "missing-f",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "missing-f",
+      "expectedLogicalRaster": "",
+      "actualCapture": "",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {},
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 0
+      },
+      "evidence": "evidence.json#/missing-f"
+    },
+    {
+      "id": "invalid-f",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "invalid-f",
+      "expectedLogicalRaster": "",
+      "actualCapture": "",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {},
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 0
+      },
+      "evidence": "evidence.json#/invalid-f"
+    },
+    {
+      "id": "probe-timeout",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "probe-timeout",
+      "expectedLogicalRaster": "",
+      "actualCapture": "",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {},
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 0
+      },
+      "evidence": "evidence.json#/probe-timeout"
+    },
+    {
+      "id": "erase",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "erase",
+      "expectedLogicalRaster": "",
+      "actualCapture": "",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {},
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 0
+      },
+      "evidence": "evidence.json#/erase"
+    }
+  ]
+}

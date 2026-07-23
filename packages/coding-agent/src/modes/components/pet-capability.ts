@@ -6,8 +6,9 @@ import {
 	shouldProbeSixelCapability,
 	TERMINAL,
 } from "@gajae-code/tui";
+import type { PetTransportAvailability } from "./iterm-pet-transport";
 
-export type PetPixelProtocol = "sixel" | "kitty";
+export type PetPixelProtocol = "sixel" | "kitty" | "iterm";
 
 export const PET_UNAVAILABLE_DESCRIPTION = "Unavailable: requires compatible Kitty or Sixel overlay rendering";
 export const PET_SAVED_UNAVAILABLE_DESCRIPTION =
@@ -21,9 +22,34 @@ export function getPetUnavailableWarning(env: NodeJS.ProcessEnv = Bun.env): stri
 	return isUnderTerminalMultiplexer(env) ? PET_MULTIPLEXER_UNAVAILABLE_WARNING : PET_UNAVAILABLE_WARNING;
 }
 
+let latestItermAvailability: PetTransportAvailability | undefined;
+let verifiedItermAvailability: PetTransportAvailability | undefined;
+const verifiedItermListeners = new Set<(availability: PetTransportAvailability | undefined) => void>();
+export function subscribeVerifiedItermPetAvailability(
+	callback: (availability: PetTransportAvailability | undefined) => void,
+): () => void {
+	verifiedItermListeners.add(callback);
+	return () => verifiedItermListeners.delete(callback);
+}
+export function setVerifiedItermPetAvailability(availability: PetTransportAvailability | undefined): void {
+	latestItermAvailability = availability;
+	verifiedItermAvailability = availability?.available ? availability : undefined;
+	for (const listener of verifiedItermListeners) listener(verifiedItermAvailability);
+}
+export function getItermPetAvailability(): PetTransportAvailability | undefined {
+	return latestItermAvailability;
+}
+export function getVerifiedItermPetAvailability(): PetTransportAvailability | undefined {
+	return verifiedItermAvailability;
+}
+export function getItermPetUnavailableReason(): string | undefined {
+	return latestItermAvailability?.available ? undefined : latestItermAvailability?.reason;
+}
+
 export function getPetPixelProtocol(): PetPixelProtocol | null {
 	if (TERMINAL.imageProtocol === ImageProtocol.Kitty) return "kitty";
 	if (TERMINAL.imageProtocol === ImageProtocol.Sixel) return "sixel";
+	if (verifiedItermAvailability?.available) return "iterm";
 	return null;
 }
 
@@ -96,15 +122,20 @@ export function warnWhenPetCapabilitySettled(options: {
 	}
 	const isAvailable = options.isAvailable ?? isPetAvailable;
 	let settled = false;
+	let unsubscribeIterm = () => {};
 	const finish = () => {
 		if (settled) return;
 		settled = true;
 		clearTimeout(timer);
 		unsubscribe();
+		unsubscribeIterm();
 	};
 	const unsubscribe = onImageProtocolChanged(protocol => {
 		if (!protocol) return;
 		finish();
+	});
+	unsubscribeIterm = subscribeVerifiedItermPetAvailability(availability => {
+		if (availability?.available) finish();
 	});
 	const timer = setTimeout(() => {
 		finish();

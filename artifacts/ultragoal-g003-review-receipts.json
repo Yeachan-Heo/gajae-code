@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "kind": "review-receipts",
+  "goalId": "G003",
+  "checkpointOrdering": "Goal status is expected to remain active until this terminal critic approves; the completion checkpoint follows the critic verdict.",
+  "architectReview": {
+    "source": "agent://321-ItermSizeArchitectureFinal",
+    "verdict": "CLEAR — APPROVE",
+    "findings": [],
+    "evidence": "Raster/display dimensions are separated; exact 4x2 direct/tmux geometry is covered; font resize updates reserve, rect and header atomically; fit and lease behavior is guarded."
+  },
+  "executorQa": {
+    "source": "agent://322-ItermSizeExecutorQaFinal",
+    "verdict": "passed",
+    "findings": [],
+    "evidence": "Direct and managed headers, 36x36 raster quality, displaySize cache identity, 9x18 to 18x18 resize, and narrow-terminal fit/lease guards all satisfy the contract."
+  },
+  "cleanup": {
+    "source": "agent://324-ItermSizeSlopCleaner",
+    "verdict": "CLEAR — APPROVE",
+    "blockingCount": 0,
+    "advisories": [],
+    "evidence": "No blocking or advisory AI-slop findings; no cleanup required."
+  },
+  "verification": {
+    "artifact": "artifacts/ultragoal-g003-iterm-size-test-report.json",
+    "focused": "54 pass, 0 fail",
+    "fullTui": "863 pass, 6 skip, 0 fail",
+    "tuiTypecheck": "passed",
+    "biomeAndDiffCheck": "passed"
+  }
+}

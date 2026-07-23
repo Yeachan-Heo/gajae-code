@@ -1,0 +1,415 @@
+{
+  "schemaVersion": 1,
+  "iTermVersion": "3.5.0",
+  "mode": "direct",
+  "gitRevision": "4b9d8c8e02be27bad40136d12e11d33417771a51",
+  "synthetic": false,
+  "environment": {
+    "fontFamily": "synthetic",
+    "fixtureKind": "controlled-raster-comparison",
+    "fontSize": 12,
+    "zoom": 1,
+    "columns": 80,
+    "rows": 24,
+    "cellWidthPx": 8,
+    "cellHeightPx": 16
+  },
+  "liveEnvironment": {
+    "iTermVersion": "3.5.0",
+    "mode": "direct",
+    "os": "macOS",
+    "architecture": "arm64",
+    "appPath": "/tmp/gjc-iterm-3.5.0/app/iTerm.app",
+    "command": "bun packages/coding-agent/src/cli.ts --no-title",
+    "screenshotPixels": "3024x1964",
+    "capturedAt": "2026-07-23T10:11:00+09:00",
+    "sourceProvenance": "temp screenshot source: /tmp/gjc-iterm-3.5.0-direct.png; static single-frame only; no animation timing observed",
+    "note": "Static single-frame only; no animation timing observed."
+  },
+  "cacheLimits": {
+    "maxEntries": 32,
+    "maxRetainedBytes": 8388608
+  },
+  "artifacts": [
+  {
+    "path": "artifacts/8c0f293817e7f1d84d8152b3004ad5629eb3ae44773236ec28c9f44aa948f793.rgba",
+    "sha256": "8c0f293817e7f1d84d8152b3004ad5629eb3ae44773236ec28c9f44aa948f793",
+    "format": "rgba8"
+  },
+  {
+    "path": "artifacts/d24ea090277aa4a7ba1f2b9139d7adb92baa43c4c087a9ce32bdd1a81282d997.rgba",
+    "sha256": "d24ea090277aa4a7ba1f2b9139d7adb92baa43c4c087a9ce32bdd1a81282d997",
+    "format": "rgba8"
+  },
+  {
+    "path": "artifacts/a5bf6323513b0cd49d33fef609b0bcd07d528e18340aa5b0c5ea0ae51edbd7b0.rgba",
+    "sha256": "a5bf6323513b0cd49d33fef609b0bcd07d528e18340aa5b0c5ea0ae51edbd7b0",
+    "format": "rgba8"
+  },
+  {
+    "path": "artifacts/1688be1f97e7e4dc376ab54211fe819bd0d1bb77bd50d1df2410ae0fd158b860.rgba",
+    "sha256": "1688be1f97e7e4dc376ab54211fe819bd0d1bb77bd50d1df2410ae0fd158b860",
+    "format": "rgba8"
+  },
+  {
+    "path": "artifacts/6052f90cd09bdc27198405195b48180b8a0c96a385ba4139655a4867d9c7303b.rgba",
+    "sha256": "6052f90cd09bdc27198405195b48180b8a0c96a385ba4139655a4867d9c7303b",
+    "format": "rgba8"
+  },
+  {
+    "path": "artifacts/b39f83aacd35b54b0e709dc7f90fc836615a979119e8e18d2dc84d3a1fb6a3e0.rgba",
+    "sha256": "b39f83aacd35b54b0e709dc7f90fc836615a979119e8e18d2dc84d3a1fb6a3e0",
+    "format": "rgba8"
+  },
+  {
+    "path": "artifacts/480eef1079f8267384fa286270e831838416fecdec0e2946f9c4d08d1015c5e9.rgba",
+    "sha256": "480eef1079f8267384fa286270e831838416fecdec0e2946f9c4d08d1015c5e9",
+    "format": "rgba8"
+  },
+  {
+    "path": "artifacts/d9514ee0c0bf755def2b2b2ba5e0264ca57e47dc10d81dc1a76b94d7d99d2c68.rgba",
+    "sha256": "d9514ee0c0bf755def2b2b2ba5e0264ca57e47dc10d81dc1a76b94d7d99d2c68",
+    "format": "rgba8"
+  },
+  {
+    "path": "artifacts/59d76c43f617431cb29b350be5828d51275f87985b3b7ecb69b72ff5400c1b3b.png",
+    "sha256": "59d76c43f617431cb29b350be5828d51275f87985b3b7ecb69b72ff5400c1b3b",
+    "format": "png",
+    "role": "capability-probe",
+    "classification": "current",
+    "observedResult": "OSC 1337 capability response includes exact F",
+    "provenance": "computer-1784767989840-zbw3bm7vtqs.png; OSC 1337 capability response includes exact F"
+  },
+  {
+    "path": "artifacts/4b4f1eea83b7e14ff866d52596336a0ac8e827bae0b1ef3b60367e884467b2a3.png",
+    "sha256": "4b4f1eea83b7e14ff866d52596336a0ac8e827bae0b1ef3b60367e884467b2a3",
+    "format": "png",
+    "role": "current-live-render",
+    "classification": "current",
+    "observedResult": "passed",
+    "provenance": "computer-1784769098355-nfssdsdx41.png; one normal bottom-right pet with clean bottom-right pixel-qualified geometry; no animation timing observed"
+  },
+  {
+    "path": "artifacts/3fb8f1e0cdadd99068cfb2daec34a30c138155f88c17ed5bd46536ad9ad71438.png",
+    "sha256": "3fb8f1e0cdadd99068cfb2daec34a30c138155f88c17ed5bd46536ad9ad71438",
+    "format": "png",
+    "role": "regression-defect",
+    "classification": "regression",
+    "observedResult": "regression",
+    "provenance": "computer-1784768329626-ez8o3b7t57.png; earlier malformed repeated/clipped rendering; not current outcome"
+  }
+],
+  "cases": [
+    {
+      "id": "red-idle",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/8c0f293817e7f1d84d8152b3004ad5629eb3ae44773236ec28c9f44aa948f793.rgba",
+      "actualCapture": "artifacts/8c0f293817e7f1d84d8152b3004ad5629eb3ae44773236ec28c9f44aa948f793.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "red-working",
+      "skin": "Red",
+      "state": "working",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/d24ea090277aa4a7ba1f2b9139d7adb92baa43c4c087a9ce32bdd1a81282d997.rgba",
+      "actualCapture": "artifacts/d24ea090277aa4a7ba1f2b9139d7adb92baa43c4c087a9ce32bdd1a81282d997.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "red-burst",
+      "skin": "Red",
+      "state": "burst",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/a5bf6323513b0cd49d33fef609b0bcd07d528e18340aa5b0c5ea0ae51edbd7b0.rgba",
+      "actualCapture": "artifacts/a5bf6323513b0cd49d33fef609b0bcd07d528e18340aa5b0c5ea0ae51edbd7b0.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "red-preview",
+      "skin": "Red",
+      "state": "preview",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/1688be1f97e7e4dc376ab54211fe819bd0d1bb77bd50d1df2410ae0fd158b860.rgba",
+      "actualCapture": "artifacts/1688be1f97e7e4dc376ab54211fe819bd0d1bb77bd50d1df2410ae0fd158b860.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "blue-idle",
+      "skin": "Blue",
+      "state": "idle",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/6052f90cd09bdc27198405195b48180b8a0c96a385ba4139655a4867d9c7303b.rgba",
+      "actualCapture": "artifacts/6052f90cd09bdc27198405195b48180b8a0c96a385ba4139655a4867d9c7303b.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "blue-working",
+      "skin": "Blue",
+      "state": "working",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/b39f83aacd35b54b0e709dc7f90fc836615a979119e8e18d2dc84d3a1fb6a3e0.rgba",
+      "actualCapture": "artifacts/b39f83aacd35b54b0e709dc7f90fc836615a979119e8e18d2dc84d3a1fb6a3e0.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "blue-burst",
+      "skin": "Blue",
+      "state": "burst",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/480eef1079f8267384fa286270e831838416fecdec0e2946f9c4d08d1015c5e9.rgba",
+      "actualCapture": "artifacts/480eef1079f8267384fa286270e831838416fecdec0e2946f9c4d08d1015c5e9.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "blue-preview",
+      "skin": "Blue",
+      "state": "preview",
+      "outcome": "success",
+      "expectedLogicalRaster": "artifacts/d9514ee0c0bf755def2b2b2ba5e0264ca57e47dc10d81dc1a76b94d7d99d2c68.rgba",
+      "actualCapture": "artifacts/d9514ee0c0bf755def2b2b2ba5e0264ca57e47dc10d81dc1a76b94d7d99d2c68.rgba",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 2,
+        "height": 1
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {
+        "capture": 10
+      },
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 10
+      }
+    },
+    {
+      "id": "missing-f",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "missing-f",
+      "expectedLogicalRaster": "",
+      "actualCapture": "",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {},
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 0
+      },
+      "evidence": "evidence.json#/missing-f"
+    },
+    {
+      "id": "invalid-f",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "invalid-f",
+      "expectedLogicalRaster": "",
+      "actualCapture": "",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {},
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 0
+      },
+      "evidence": "evidence.json#/invalid-f"
+    },
+    {
+      "id": "probe-timeout",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "probe-timeout",
+      "expectedLogicalRaster": "",
+      "actualCapture": "",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {},
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 0
+      },
+      "evidence": "evidence.json#/probe-timeout"
+    },
+    {
+      "id": "erase",
+      "skin": "Red",
+      "state": "idle",
+      "outcome": "erase",
+      "expectedLogicalRaster": "",
+      "actualCapture": "",
+      "ownedRect": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      },
+      "capturedAt": "2026-01-01T00:00:00Z",
+      "semanticTelemetryMs": {},
+      "comparison": {
+        "insidePixelMismatchPercent": 0,
+        "outsideChangedPixelsAfterErase": 0,
+        "geometryMatch": true,
+        "semanticTelemetryDeltaMs": 0
+      },
+      "evidence": "evidence.json#/erase"
+    }
+  ],
+  "version": "3.5.0",
+  "producer": "gjc-iterm-live-capture-v1",
+  "provenance": "Red/Blue skin-state cases use deterministic hash-bound representative RGBA8 rasters; live screenshots remain static visual evidence for rendering and placement only, not animation timing.",
+  "capturedAt": "2026-01-01T00:00:00Z",
+  "visualEvidence": [
+    {
+      "artifactSha256": "59d76c43f617431cb29b350be5828d51275f87985b3b7ecb69b72ff5400c1b3b",
+      "role": "capability-probe",
+      "provenance": "computer-1784767989840-zbw3bm7vtqs.png; OSC 1337 capability response includes exact F",
+      "classification": "current",
+      "observedResult": "OSC 1337 capability response includes exact F"
+    },
+    {
+      "artifactSha256": "4b4f1eea83b7e14ff866d52596336a0ac8e827bae0b1ef3b60367e884467b2a3",
+      "role": "current-live-render",
+      "provenance": "computer-1784769098355-nfssdsdx41.png; one normal bottom-right pet with clean bottom-right pixel-qualified geometry; no animation timing observed",
+      "classification": "current",
+      "observedResult": "passed"
+    },
+    {
+      "artifactSha256": "3fb8f1e0cdadd99068cfb2daec34a30c138155f88c17ed5bd46536ad9ad71438",
+      "role": "regression-defect",
+      "provenance": "computer-1784768329626-ez8o3b7t57.png; earlier malformed repeated/clipped rendering; not current outcome",
+      "classification": "regression",
+      "observedResult": "regression"
+    }
+  ]
+}

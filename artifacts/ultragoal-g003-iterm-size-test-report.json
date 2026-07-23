@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "goalId": "G003",
+  "surface": "tui-package",
+  "contract": "Present the iTerm2 Gajae Pet in the same terminal-cell footprint as the Ghostty Kitty pet while retaining high-resolution raster data.",
+  "commands": [
+    {
+      "command": "bun test packages/tui/test/iterm2-protocol.test.ts packages/tui/test/gajae-pet.test.ts packages/coding-agent/test/gajae-pet-widget.test.ts",
+      "exitCode": 0,
+      "summary": "54 pass, 0 fail, 247 assertions across 3 files"
+    },
+    {
+      "command": "bun test",
+      "cwd": "packages/tui",
+      "exitCode": 0,
+      "summary": "863 pass, 6 skip, 0 fail, 6757 assertions across 74 files"
+    },
+    {
+      "command": "bun run check:types",
+      "cwd": "packages/tui",
+      "exitCode": 0,
+      "summary": "TypeScript check passed"
+    },
+    {
+      "command": "bunx biome check packages/tui/src/components/gajae-pet.ts packages/tui/test/gajae-pet.test.ts packages/tui/test/iterm2-protocol.test.ts packages/coding-agent/src/modes/components/gajae-pet-widget.ts packages/coding-agent/test/gajae-pet-widget.test.ts && git diff --check",
+      "exitCode": 0,
+      "summary": "Biome and whitespace checks passed"
+    }
+  ],
+  "invariants": [
+    "A 36x36 GIF raster is presented as 4x2 terminal cells at 9x18 cell metrics.",
+    "Direct and managed tmux records both declare width=4;height=2.",
+    "The GIF cache distinguishes pixel-sized and cell-sized presentation artifacts.",
+    "A 9x18 to 18x18 metric change atomically updates reserve and presentation to 2x2 cells.",
+    "Narrow terminals suppress raster submission and invalidate the owned lease."
+  ],
+  "knownUnrelatedTypecheckFailures": [
+    "packages/coding-agent/test/sdk-workflow-gate-emitter.test.ts WorkflowGateEmitter fixture mismatch",
+    "packages/coding-agent/test/tools/ask.test.ts WorkflowGateEmitter fixture mismatch"
+  ],
+  "verdict": "passed"
+}

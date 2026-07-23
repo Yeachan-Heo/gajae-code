@@ -13,6 +13,7 @@ export class VirtualTerminal implements Terminal {
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
 	#writeLog: string[] = [];
+	#failWrites = 0;
 	private _columns: number;
 	private _rows: number;
 
@@ -57,7 +58,14 @@ export class VirtualTerminal implements Terminal {
 	}
 
 	write(data: string): void {
+		if (this.#failWrites > 0) {
+			this.#failWrites--;
+			throw new Error("injected terminal write failure");
+		}
 		this.#write(data);
+	}
+	failNextWrites(count = 1): void {
+		this.#failWrites += count;
 	}
 
 	getWriteLog(): string[] {
@@ -138,11 +146,37 @@ export class VirtualTerminal implements Terminal {
 		this.#write(active ? "\x1b]9;4;3\x07" : "\x1b]9;4;0;\x07");
 	}
 
-	/** Wait for TUI's throttled render pipeline to settle (matches the 16ms frame budget). */
+	/** Wait until scheduled renders and terminal writes have become idle. */
 	async waitForRender(): Promise<void> {
-		await new Promise<void>(resolve => process.nextTick(resolve));
-		await new Promise<void>(resolve => setTimeout(resolve, 20));
-		await this.flush();
+		const baselineWrites = this.#writeLog.length;
+		let previousWrites = baselineWrites;
+		let stableTurns = 0;
+		let sawWrite = false;
+		const timeoutMs = 1000;
+		const renderIntervalMs = 16;
+		const quietWindowMs = renderIntervalMs * 2;
+		const startedAt = Date.now();
+		const deadline = startedAt + timeoutMs;
+
+		while (Date.now() < deadline) {
+			await new Promise<void>(resolve => process.nextTick(resolve));
+			await new Promise<void>(resolve => setImmediate(resolve));
+			await this.flush();
+
+			const writes = this.#writeLog.length;
+			if (writes !== baselineWrites) sawWrite = true;
+			if (writes === previousWrites) stableTurns++;
+			else stableTurns = 0;
+			if (stableTurns >= 2 && (sawWrite || Date.now() - startedAt >= quietWindowMs)) {
+				return;
+			}
+			previousWrites = writes;
+			await new Promise<void>(resolve => setTimeout(resolve, renderIntervalMs));
+		}
+
+		throw new Error(
+			`Timed out waiting for virtual terminal render: writes=${this.#writeLog.length}, baseline=${baselineWrites}, stableTurns=${stableTurns}`,
+		);
 	}
 
 	// Test-specific methods not in Terminal interface
@@ -171,11 +205,12 @@ export class VirtualTerminal implements Terminal {
 	/**
 	 * Wait for all pending writes to complete. Viewport and scroll buffer will be updated.
 	 */
-	async flush(): Promise<void> {
+	async flush(): Promise<boolean> {
 		// Write an empty string to ensure all previous writes are flushed
-		return new Promise<void>(resolve => {
+		await new Promise<void>(resolve => {
 			this.xterm.write("", () => resolve());
 		});
+		return true;
 	}
 
 	/**

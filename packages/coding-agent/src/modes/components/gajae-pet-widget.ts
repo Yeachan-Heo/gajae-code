@@ -1,22 +1,29 @@
 import {
 	type AnimationRegistration,
 	buildGajaePixelFrames,
+	burstTimeline,
+	type CellRect,
 	type Component,
 	type Container,
 	type GajaePixelFrameName,
 	type GajaePixelFrames,
 	getCellDimensions,
+	getGajaePetGifCached,
+	idleTimeline,
 	PARA_PARA_STEPS,
 	PET_SKINS,
 	type PetMode,
 	type PetSkinId,
 	petBurstDurationMs,
 	petBurstFrame,
+	type RasterLeaseToken,
 	registerAnimationCallback,
 	type TUI,
+	workingTimeline,
+	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "./custom-editor";
-import { getPetPixelProtocol } from "./pet-capability";
+import { getItermPetUnavailableReason, getPetPixelProtocol, getVerifiedItermPetAvailability } from "./pet-capability";
 
 /** Re-exported from the tui skin registry so widget-relative imports stay valid. */
 export type { PetMode, PetSkinId };
@@ -131,8 +138,9 @@ export class PetFramedEditor implements Component {
  * Rendering has two paths that share one payload builder:
  * - a post-render emitter re-draws the sprite after every TUI write (line
  *   renders clear the pet cells, so the overlay must be re-applied), and
- * - frame advances write the payload directly to the terminal, because the
- *   TUI skips writes entirely when no component line changed.
+ * - frame advances queue the payload through the TUI because a frame swap
+ *   changes no component line.
+ *
  *
  * Requires a sixel- or kitty-graphics terminal (`pixelProtocol()`).
  */
@@ -151,7 +159,7 @@ export class GajaePetWidget {
 	#flexUntil = 0;
 	#nextAutoFlexAt = 0;
 	#autoFlexGapMs: [number, number] | null;
-	#forcedProtocol: "sixel" | "kitty" | undefined;
+	#forcedProtocol: "sixel" | "kitty" | "iterm" | undefined;
 	/** Cell metrics the current frames were built for; a change triggers a rebuild. */
 	#builtCellW = 0;
 	#builtCellH = 0;
@@ -169,6 +177,14 @@ export class GajaePetWidget {
 	 * stayed available, since a failed render write drops availability.
 	 */
 	#frameCleanupAwaitingAck = false;
+	#itermLease: RasterLeaseToken | undefined;
+	#disposePromise: Promise<void> | undefined;
+	#itermProtocol = false;
+	#itermLastSemantic = "";
+	#itermOwner = `gajae-pet-${Math.random().toString(36).slice(2)}`;
+	#itermGeneration = 0;
+	#itermSubmitPending = false;
+	#syncManagedItermCursor: (row: number, column: number) => Promise<boolean>;
 
 	constructor(options: {
 		ui: TUI;
@@ -178,6 +194,7 @@ export class GajaePetWidget {
 		isWorking: () => boolean;
 		/** Rows rendered below the composer box (pet floor + hook widgets). */
 		getComposerBottomOffset: () => number;
+		syncManagedItermCursor: (row: number, column: number) => Promise<boolean>;
 		forcePixelProtocol?: "sixel" | "kitty";
 		/** Random [min, max] ms between auto-flexes; null disables. */
 		autoFlexGapMs?: [number, number] | null;
@@ -189,13 +206,14 @@ export class GajaePetWidget {
 		this.#framedEditor = new PetFramedEditor(options.editor);
 		this.#isWorking = options.isWorking;
 		this.#getComposerBottomOffset = options.getComposerBottomOffset;
+		this.#syncManagedItermCursor = options.syncManagedItermCursor;
 		this.#forcedProtocol = options.forcePixelProtocol;
 		this.#autoFlexGapMs =
 			options.autoFlexGapMs === undefined ? [AUTO_FLEX_MIN_GAP_MS, AUTO_FLEX_MAX_GAP_MS] : options.autoFlexGapMs;
 	}
 
 	/** Protocol available for the real-pixel pet, if any. */
-	static pixelProtocol(): "sixel" | "kitty" | null {
+	static pixelProtocol(): "sixel" | "kitty" | "iterm" | null {
 		return getPetPixelProtocol();
 	}
 
@@ -209,6 +227,20 @@ export class GajaePetWidget {
 
 	setMode(mode: PetMode): void {
 		this.#applyMode(mode, true);
+	}
+
+	/**
+	 * Suspend iTerm rendering after capability loss without changing the saved/user mode.
+	 * A later verified availability emission can resume rendering in the same mode.
+	 */
+	async suspendItermCapability(): Promise<void> {
+		if (this.#disposed) return;
+		this.#itermGeneration++;
+		const lease = this.#itermLease;
+		this.#itermLease = undefined;
+		this.#itermLastSemantic = "";
+		if (lease) await this.#ui.invalidateRasterLease({ token: lease, cause: "capability-loss" });
+		this.#ui.requestRender(true);
 	}
 
 	/** Live preview during a selector: change the sprite without re-mounting the
@@ -230,6 +262,13 @@ export class GajaePetWidget {
 		if (this.#disposed || mode === this.#mode) return;
 
 		if (mode === "off") {
+			this.#itermGeneration++;
+			if (this.#itermLease) {
+				void this.#ui.invalidateRasterLease({ token: this.#itermLease, cause: "mode-off" });
+				this.#itermLease = undefined;
+			}
+			this.#itermLastSemantic = "";
+			this.#itermProtocol = false;
 			this.#writeImageCleanup();
 			this.#mode = "off";
 			this.#animation?.unregister();
@@ -245,6 +284,12 @@ export class GajaePetWidget {
 
 		const protocol = this.#forcedProtocol ?? GajaePetWidget.pixelProtocol();
 		if (!protocol) return;
+		this.#itermGeneration++;
+		if (this.#itermLease) {
+			void this.#ui.invalidateRasterLease({ token: this.#itermLease, cause: "explicit" });
+			this.#itermLease = undefined;
+		}
+		this.#itermLastSemantic = "";
 		if (this.#mode !== "off") this.#writeImageCleanup();
 		this.#mode = mode;
 		this.#frame = "base";
@@ -262,7 +307,7 @@ export class GajaePetWidget {
 	}
 
 	/** (Re)build the encoded frames for the current terminal cell metrics. */
-	#buildPixel(protocol: "sixel" | "kitty"): void {
+	#buildPixel(protocol: "sixel" | "kitty" | "iterm"): void {
 		const cell = getCellDimensions();
 		this.#builtCellW = cell.widthPx;
 		this.#builtCellH = cell.heightPx;
@@ -271,6 +316,13 @@ export class GajaePetWidget {
 			this.#kittyImageId ??= allocatePetKittyImageId();
 			this.#kittyCleanupPending = true;
 		}
+		if (protocol === "iterm") {
+			this.#itermProtocol = true;
+			this.#pixel = undefined;
+			this.#framedEditor.setReserve(Math.max(1, Math.ceil((2 * cell.heightPx) / cell.widthPx)) + PET_SIDE_MARGIN);
+			return;
+		}
+		this.#itermProtocol = false;
 		this.#pixel = buildGajaePixelFrames({
 			protocol,
 			skin,
@@ -287,6 +339,11 @@ export class GajaePetWidget {
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		this.#itermGeneration++;
+		if (this.#itermLease) {
+			void this.#ui.invalidateRasterLease({ token: this.#itermLease, cause: "dispose" });
+			this.#itermLease = undefined;
+		}
 		const kittyImageId = this.#kittyImageId;
 		const cleanupPayload = this.#imageCleanupPayload();
 		try {
@@ -314,6 +371,19 @@ export class GajaePetWidget {
 				this.#mountEditor(false);
 			}
 		}
+	}
+	async disposeAsync(): Promise<void> {
+		if (!this.#disposePromise) {
+			this.dispose();
+			this.#disposePromise = this.#ui
+				.notifyTerminalLifecycle({
+					kind: "explicit-cleanup",
+					source: "interactive-mode",
+					terminalGeneration: this.#ui.terminalGeneration,
+				})
+				.then(() => undefined);
+		}
+		await this.#disposePromise;
 	}
 
 	/** Clear the shared post-render slot only while this widget still owns it. */
@@ -361,6 +431,167 @@ export class GajaePetWidget {
 		return "base";
 	}
 
+	#tickIterm(now: number): void {
+		const cell = getCellDimensions();
+		const pixelColumns = Math.max(1, Math.ceil((2 * cell.heightPx) / cell.widthPx));
+		const pixelRows = 2;
+		let metricsChanged = false;
+		if (cell.widthPx !== this.#builtCellW || cell.heightPx !== this.#builtCellH) {
+			metricsChanged = true;
+			this.#itermGeneration++;
+			const lease = this.#itermLease;
+			this.#itermLease = undefined;
+			this.#itermLastSemantic = "";
+			if (lease) void this.#ui.invalidateRasterLease({ token: lease, cause: "resize" });
+			this.#builtCellW = cell.widthPx;
+			this.#builtCellH = cell.heightPx;
+			this.#framedEditor.setReserve(pixelColumns + PET_SIDE_MARGIN);
+		}
+		// iTerm uses the same framed-editor invariant as the other pixel protocols.
+		if (!this.#framedEditor.canFit(this.#ui.terminal.columns)) {
+			if (!metricsChanged) {
+				this.#itermGeneration++;
+				const lease = this.#itermLease;
+				this.#itermLease = undefined;
+				if (lease) void this.#ui.invalidateRasterLease({ token: lease, cause: "resize" });
+			}
+			this.#itermLastSemantic = "";
+			return;
+		}
+		// iTerm advances its inline-image cursor past the image. Align to the
+		// composer's bottom edge only when rows below the composer leave room for
+		// that advance; otherwise retain one safety row to prevent a viewport scroll.
+		const terminalRows = this.#ui.terminal.rows;
+		const composerBottom = terminalRows - this.#getComposerBottomOffset();
+		const desiredRow = composerBottom - pixelRows;
+		const maxSafeRow = terminalRows - pixelRows - PET_RAISE_ROWS;
+		const rect: CellRect = {
+			column: Math.max(0, this.#ui.terminal.columns - pixelColumns - PET_SIDE_MARGIN),
+			row: Math.max(0, Math.min(desiredRow, maxSafeRow)),
+			width: pixelColumns,
+			height: pixelRows,
+		};
+		const availability = getVerifiedItermPetAvailability();
+		if (!availability?.available || getItermPetUnavailableReason() || !this.#ui.terminalAvailable) return;
+		const semantic = `${this.#mode}:${this.#isWorking()}:${this.#flexUntil > now}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
+		if (this.#itermSubmitPending || (semantic === this.#itermLastSemantic && this.#itermLease)) return;
+		this.#itermLastSemantic = semantic;
+		this.#itermSubmitPending = true;
+		const generation = this.#itermGeneration;
+		void this.#submitIterm(rect, now, generation, availability.epoch, availability.mode, semantic).finally(() => {
+			this.#itermSubmitPending = false;
+			if (!this.#itermLease) this.#itermLastSemantic = "";
+		});
+	}
+	async #submitIterm(
+		rect: CellRect,
+		now: number,
+		generation: number,
+		epoch: number,
+		mode: "direct" | "managed",
+		semantic: string,
+	): Promise<void> {
+		const current = () => {
+			const availability = getVerifiedItermPetAvailability();
+			return (
+				!this.#disposed &&
+				generation === this.#itermGeneration &&
+				availability?.available === true &&
+				availability.epoch === epoch &&
+				availability.mode === mode &&
+				this.#framedEditor.canFit(this.#ui.terminal.columns)
+			);
+		};
+		let token = this.#itermLease;
+		if (
+			token &&
+			(token.rect.column !== rect.column ||
+				token.rect.row !== rect.row ||
+				token.rect.width !== rect.width ||
+				token.rect.height !== rect.height)
+		) {
+			await this.#ui.invalidateRasterLease({ token, cause: "resize" });
+			if (this.#itermLease === token) this.#itermLease = undefined;
+			token = undefined;
+		}
+		if (!current()) return;
+		if (!token) {
+			const acquired = await this.#ui.acquireRasterLease({
+				ownerId: this.#itermOwner,
+				rect,
+				erase: {
+					type: "raster-erase",
+					bytes: new TextEncoder().encode(
+						Array.from(
+							{ length: rect.height },
+							(_, row) => `\x1b[${rect.row + row + 1};${rect.column + 1}H\x1b[${rect.width}X`,
+						).join(""),
+					),
+				},
+				onInvalidated: notice => {
+					if (this.#itermLease === notice.token) {
+						this.#itermLease = undefined;
+						this.#itermLastSemantic = "";
+					}
+				},
+			});
+			if (!current() || acquired.status !== "acquired") {
+				if (acquired.status === "acquired")
+					await this.#ui.invalidateRasterLease({ token: acquired.token, cause: "capability-loss" });
+				return;
+			}
+			token = acquired.token;
+			this.#itermLease = token;
+		}
+		this.#itermLastSemantic = semantic;
+		const working = this.#isWorking();
+		const frames =
+			this.#flexUntil > now
+				? burstTimeline(this.#mode === "off" ? "red" : this.#mode)
+				: working
+					? workingTimeline()
+					: idleTimeline();
+		const cell = getCellDimensions();
+		const gif = getGajaePetGifCached({
+			skin: this.#mode === "off" ? "red" : this.#mode,
+			timeline: frames,
+			cellWidthPx: cell.widthPx,
+			cellHeightPx: cell.heightPx,
+			targetRows: 2,
+			rectangle: { width: rect.width * cell.widthPx, height: rect.height * cell.heightPx },
+			// Cell units match Kitty placement sizing and avoid Retina pixel-unit shrinkage.
+			displaySize: { width: rect.width, height: rect.height },
+		});
+		const cursorPosition = `\x1b[${rect.row + 1};${rect.column + 1}H`;
+		const cursorRestore =
+			mode === "managed" ? `${wrapITerm2RecordForTmux("\x1b8\x1b[?2026l")}\x1b8` : "\x1b8\x1b[?2026l";
+		const encodedRecords = (mode === "managed" ? gif.tmuxDcs : gif.multipart).map(record =>
+			new TextEncoder().encode(record),
+		);
+		const submit = await this.#ui.submitTerminalOutput({
+			token,
+			operation: {
+				type: "raster-multipart-batch",
+				// Keep iTerm's hardware and IME cursor visually anchored while the inline
+				// image protocol temporarily uses the terminal cursor for placement.
+				prefix: new TextEncoder().encode(
+					mode === "managed"
+						? `${wrapITerm2RecordForTmux("\x1b[?2026h\x1b7\x1b[?25l")}\x1b7${cursorPosition}`
+						: `\x1b[?2026h\x1b7\x1b[?25l${cursorPosition}`,
+				),
+				afterPrefix: mode === "managed" ? () => this.#syncManagedItermCursor(rect.row, rect.column) : undefined,
+				replayPrefix: mode === "managed" ? new TextEncoder().encode(cursorPosition) : undefined,
+				records: encodedRecords,
+				suffix: new TextEncoder().encode(cursorRestore),
+				abortSuffix: mode === "managed" ? new TextEncoder().encode(cursorRestore) : undefined,
+				restoreCursorVisibility: true,
+			},
+		});
+		if (!current() || submit.status !== "written") {
+			await this.#ui.invalidateRasterLease({ token, cause: "capability-loss" });
+			if (this.#itermLease === token) this.#itermLease = undefined;
+		}
+	}
 	#scheduleAutoFlex(now: number): void {
 		if (!this.#autoFlexGapMs) return;
 		const [min, max] = this.#autoFlexGapMs;
@@ -368,6 +599,22 @@ export class GajaePetWidget {
 	}
 
 	#tick(now: number): void {
+		// Random show-off, both while idle and while working. Each skin's burst runs for
+		// its own length (RedGajae a brief flex; BlueGajae a para-para cycle plus sob).
+		if (this.#autoFlexGapMs && now >= this.#flexUntil) {
+			if (this.#nextAutoFlexAt === 0) {
+				this.#scheduleAutoFlex(now);
+			} else if (now >= this.#nextAutoFlexAt) {
+				const skin = this.#mode === "off" ? "red" : this.#mode;
+				const burstMs = petBurstDurationMs(PET_SKINS[skin].burst);
+				this.#flexUntil = now + burstMs;
+				this.#scheduleAutoFlex(now + burstMs);
+			}
+		}
+		if (this.#itermProtocol) {
+			this.#tickIterm(now);
+			return;
+		}
 		if (this.#mode === "off" || !this.#pixel) return;
 		// A font/zoom change resizes the terminal cells; rebuild the frames so the
 		// kitty image and its sub-cell drop match the new cell metrics.
@@ -380,25 +627,13 @@ export class GajaePetWidget {
 				this.#ui.requestRender(true);
 			}
 		}
-		// Random show-off, both while idle and while working. Each skin's burst runs for
-		// its own length (RedGajae a brief flex; BlueGajae a para-para cycle plus sob).
-		if (this.#autoFlexGapMs && now >= this.#flexUntil) {
-			if (this.#nextAutoFlexAt === 0) {
-				this.#scheduleAutoFlex(now);
-			} else if (now >= this.#nextAutoFlexAt) {
-				const burstMs = petBurstDurationMs(PET_SKINS[this.#mode].burst);
-				this.#flexUntil = now + burstMs;
-				this.#scheduleAutoFlex(now + burstMs);
-			}
-		}
 		const frame = this.#pickFrame(now);
 		if (frame === this.#frame) return;
 		this.#frame = frame;
-		// Write directly: a frame swap changes no component line, so the TUI
-		// would skip the render write (and with it the post-render emitter).
+		// Queue frame swaps through TUI so they share ordering with generic renders.
 		const payload = this.#overlayPayload(true) ?? "";
 		if (payload && this.#ui.terminalAvailable) {
-			this.#ui.terminal.write(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`);
+			void this.#ui.queueTerminalOutput(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`);
 		}
 	}
 
@@ -444,24 +679,15 @@ export class GajaePetWidget {
 	}
 
 	/**
-	 * Best-effort direct erase of the on-screen pet image. Cleanup authority is
-	 * consumed only after the write is actually delivered: an unavailable
-	 * terminal or a throwing write keeps the erase pending so a later mode
-	 * switch or dispose can retry it.
+	 * Queue erase/delete through TUI and consume cleanup authority only on written acknowledgement.
 	 */
 	#writeImageCleanup(): void {
 		if (!this.#ui.terminalAvailable) return;
 		const payload = this.#imageCleanupPayload();
 		if (!payload) return;
-		try {
-			this.#ui.terminal.write(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`);
-		} catch {
-			// Keep the footprint/placement authority; the terminal write layer
-			// reports availability separately and callers retry on the next
-			// lifecycle transition.
-			return;
-		}
-		this.#consumeCleanupAuthority();
+		void this.#ui.queueTerminalOutput(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`).then(ack => {
+			if (ack.status === "written") this.#consumeCleanupAuthority();
+		});
 	}
 
 	/** Draw escape payload at the pet's absolute position. */

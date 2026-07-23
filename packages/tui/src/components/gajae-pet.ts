@@ -1,3 +1,5 @@
+import { encodeITerm2Multipart, wrapITerm2RecordsForTmux } from "../terminal-capabilities";
+
 /**
  * ┌─ GAJAE PET SPRITE SPEC ────────────────────────────────────────────────┐
  * The pet is a 16×16 pixel sprite drawn beside the composer. Everything here is
@@ -203,7 +205,8 @@ const PIXEL_GRIDS: Record<GajaePixelFrameName, string[]> = {
 };
 
 /** Para-para work dance beats: the working loop and each skin's burst "work-in" intro. */
-export const PARA_PARA_STEPS: ReadonlyArray<readonly [GajaePixelFrameName, number]> = [
+export type GajaeGifFrameTuple = readonly [GajaePixelFrameName, number];
+export const PARA_PARA_STEPS: readonly GajaeGifFrameTuple[] = [
 	["danceL", 300],
 	["danceR", 300],
 	["base", 260],
@@ -218,9 +221,13 @@ export const PARA_PARA_STEPS: ReadonlyArray<readonly [GajaePixelFrameName, numbe
  */
 export interface PetBurst {
 	/** Frames played once, in order, at the start of the burst. */
-	intro: ReadonlyArray<readonly [GajaePixelFrameName, number]>;
+	intro: readonly GajaeGifFrameTuple[];
 	/** Frames cycled every `stepMs` for `ms` after the intro (a held or looping finish). */
-	tail?: { frames: readonly GajaePixelFrameName[]; stepMs: number; ms: number };
+	tail?: {
+		frames: readonly GajaePixelFrameName[];
+		stepMs: number;
+		ms: number;
+	};
 }
 
 /** Everything that defines a pet skin: identity, UI copy, colors and behavior. */
@@ -261,19 +268,19 @@ export const PET_SKINS: Record<PetSkinId, PetSkin> = {
 
 /** Total burst duration (intro beats plus the looping tail). */
 export function petBurstDurationMs(burst: PetBurst): number {
-	const introMs = burst.intro.reduce((sum, [, ms]) => sum + ms, 0);
+	const introMs = burst.intro.reduce((sum, [, delayMs]) => sum + delayMs, 0);
 	return introMs + (burst.tail?.ms ?? 0);
 }
 
 /** The frame to show `elapsed` ms into a burst (`now` cycles the looping tail). */
 export function petBurstFrame(burst: PetBurst, elapsed: number, now: number): GajaePixelFrameName {
 	let t = elapsed;
-	for (const [frame, ms] of burst.intro) {
-		if (t < ms) return frame;
-		t -= ms;
+	for (const [name, delayMs] of burst.intro) {
+		if (t < delayMs) return name;
+		t -= delayMs;
 	}
 	const tail = burst.tail;
-	if (!tail) return burst.intro[burst.intro.length - 1][0];
+	if (!tail || tail.frames.length === 0) return burst.intro[burst.intro.length - 1]?.[0] ?? "base";
 	return tail.frames[Math.floor(now / tail.stepMs) % tail.frames.length];
 }
 
@@ -284,6 +291,276 @@ export const __gajaePetTestHooks = {
 	},
 };
 
+export interface GajaeGifFrame {
+	readonly name: GajaePixelFrameName;
+	readonly delayMs: number;
+}
+export type GajaeGifTimeline = readonly GajaeGifFrame[];
+export interface GajaeGifRectangle {
+	readonly width?: number;
+	readonly height?: number;
+}
+export interface GajaeGifDisplaySize {
+	/** iTerm2 display width: bare numbers are terminal cells; strings may use px or auto. */
+	readonly width: number | string;
+	/** iTerm2 display height: bare numbers are terminal cells; strings may use px or auto. */
+	readonly height: number | string;
+}
+export interface GajaePetGifArtifact {
+	readonly bytes: Uint8Array;
+	readonly base64: string;
+	readonly width: number;
+	readonly height: number;
+	readonly frames: readonly GajaeGifFrame[];
+	readonly skin: PetSkinId;
+	readonly multipart: readonly string[];
+	readonly tmuxDcs: readonly string[];
+}
+export interface GajaePetGifOptions {
+	readonly skin?: PetSkinId;
+	readonly timeline?: GajaeGifTimeline;
+	readonly cellWidthPx?: number;
+	readonly cellHeightPx?: number;
+	readonly targetRows?: number;
+	readonly rectangle?: GajaeGifRectangle;
+	readonly displaySize?: GajaeGifDisplaySize;
+}
+const GIF_CLEAR = 256,
+	GIF_END = 257;
+function gifLzw(pixels: number[], minCodeSize = 8): Uint8Array {
+	const out: number[] = [],
+		codes = pixels.flatMap(p => [GIF_CLEAR, p]).concat(GIF_END);
+	let bits = 0,
+		value = 0;
+	for (const code of codes) {
+		value |= code << bits;
+		bits += minCodeSize + 1;
+		while (bits >= 8) {
+			out.push(value & 255);
+			value >>>= 8;
+			bits -= 8;
+		}
+	}
+	if (bits) out.push(value & 255);
+	const blocks: number[] = [minCodeSize];
+	for (let i = 0; i < out.length; i += 255) {
+		const part = out.slice(i, i + 255);
+		blocks.push(part.length, ...part);
+	}
+	blocks.push(0);
+	return Uint8Array.from(blocks);
+}
+export const idleTimeline = (): GajaeGifTimeline => [
+	{ name: "base", delayMs: 700 },
+	{ name: "gazeL", delayMs: 180 },
+	{ name: "base", delayMs: 700 },
+	{ name: "gazeR", delayMs: 180 },
+	{ name: "flicker", delayMs: 120 },
+];
+export const workingTimeline = (): GajaeGifTimeline => PARA_PARA_STEPS.map(([name, delayMs]) => ({ name, delayMs }));
+export const burstTimeline = (skin: PetSkinId = "red"): GajaeGifTimeline => {
+	const burst = PET_SKINS[skin].burst;
+	const frames: GajaeGifFrame[] = burst.intro.map(([name, delayMs]) => ({ name, delayMs }));
+	const tail = burst.tail;
+	if (!tail || tail.frames.length === 0) return frames;
+	for (let elapsed = 0; elapsed < tail.ms; elapsed += tail.stepMs) {
+		frames.push({
+			name: tail.frames[Math.floor(elapsed / tail.stepMs) % tail.frames.length],
+			delayMs: Math.min(tail.stepMs, tail.ms - elapsed),
+		});
+	}
+	return frames;
+};
+export const previewTimeline = (skin: PetSkinId = "red"): GajaeGifTimeline => burstTimeline(skin);
+function isGifTimeline(input: GajaePetGifOptions | GajaeGifTimeline): input is GajaeGifTimeline {
+	return Array.isArray(input);
+}
+function gifOptions(input: GajaePetGifOptions | GajaeGifTimeline): Required<
+	Pick<GajaePetGifOptions, "skin" | "timeline" | "cellWidthPx" | "cellHeightPx" | "targetRows">
+> & {
+	rectangle?: GajaeGifRectangle;
+	displaySize?: GajaeGifDisplaySize;
+} {
+	if (isGifTimeline(input)) {
+		return { skin: "red", timeline: input, cellWidthPx: 1, cellHeightPx: 1, targetRows: 16 };
+	}
+	return {
+		skin: input.skin ?? "red",
+		timeline: input.timeline ?? idleTimeline(),
+		cellWidthPx: input.cellWidthPx ?? 1,
+		cellHeightPx: input.cellHeightPx ?? 1,
+		targetRows: input.targetRows ?? 16,
+		rectangle: input.rectangle,
+		displaySize: input.displaySize,
+	};
+}
+export function encodeGajaePetGif(input: GajaePetGifOptions | GajaeGifTimeline = {}): GajaePetGifArtifact {
+	const o = gifOptions(input),
+		rect = o.rectangle ?? {};
+	if (o.timeline.length === 0) throw new Error("GIF timeline must not be empty");
+	for (const frame of o.timeline) {
+		if (!Number.isFinite(frame.delayMs) || frame.delayMs < 0) throw new Error("Invalid GIF frame delay");
+	}
+	const width = rect.width ?? rect.height ?? Math.round(Math.max(1, o.targetRows * o.cellHeightPx));
+	const height = rect.height ?? Math.round(Math.max(1, o.targetRows * o.cellHeightPx));
+	const valid = (n: number, label: string): number => {
+		if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0 || n > 0xffff) throw new Error(`Invalid GIF ${label}`);
+		return n;
+	};
+	valid(width, "width");
+	valid(height, "height");
+	if (width * height * o.timeline.length > 64 * 1024 * 1024) throw new Error("GIF allocation exceeds safety budget");
+	const paletteKeys = Object.keys(PET_SKINS[o.skin].palette).filter(k => k !== ".");
+	const palette = [[0, 0, 0], ...paletteKeys.map(k => PET_SKINS[o.skin].palette[k]!)];
+	const chunks: number[] = [
+		...Buffer.from("GIF89a"),
+		width & 255,
+		width >> 8,
+		height & 255,
+		height >> 8,
+		0xf7,
+		0,
+		0,
+		...palette.flat(),
+		...Array((256 - palette.length) * 3).fill(0),
+		33,
+		255,
+		11,
+		...Buffer.from("NETSCAPE2.0"),
+		3,
+		1,
+		0,
+		0,
+		0,
+	];
+	for (const frame of o.timeline) {
+		const pixels: number[] = [],
+			grid = PIXEL_GRIDS[frame.name];
+		for (let y = 0; y < height; y++)
+			for (let x = 0; x < width; x++) {
+				const sx = Math.min(15, Math.floor((x * 16) / width));
+				const sy = Math.min(15, Math.floor((y * 16) / height));
+				const ch = grid[sy][sx];
+				pixels.push(ch === "." ? 0 : Math.max(1, paletteKeys.indexOf(ch) + 1));
+			}
+		const delay = Math.round(frame.delayMs / 10);
+		chunks.push(
+			33,
+			249,
+			4,
+			0x09,
+			delay & 255,
+			delay >> 8,
+			0,
+			0,
+			44,
+			0,
+			0,
+			0,
+			0,
+			width & 255,
+			width >> 8,
+			height & 255,
+			height >> 8,
+			0,
+			...gifLzw(pixels),
+		);
+	}
+	chunks.push(59);
+	const bytes = Uint8Array.from(chunks);
+	const base64 = Buffer.from(bytes).toString("base64");
+	const multipart = encodeITerm2Multipart(base64, {
+		width: o.displaySize?.width ?? `${width}px`,
+		height: o.displaySize?.height ?? `${height}px`,
+	});
+	const tmuxDcs = wrapITerm2RecordsForTmux(multipart);
+	return {
+		bytes,
+		base64,
+		width,
+		height,
+		frames: [...o.timeline],
+		skin: o.skin,
+		multipart,
+		tmuxDcs,
+	};
+}
+const gifCache = new Map<string, GajaePetGifArtifact>();
+let gifCacheBytes = 0;
+let gifCacheBase64Bytes = 0;
+let gifCacheMultipartBytes = 0;
+let gifCacheTmuxDcsBytes = 0;
+let gifCacheEvictions = 0;
+const GIF_CACHE_MAX_ENTRIES = 32;
+const GIF_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const byteLength = (value: string): number => Buffer.byteLength(value, "utf8");
+
+export function getGajaePetGifCached(input: GajaePetGifOptions | GajaeGifTimeline = {}): GajaePetGifArtifact {
+	const o = gifOptions(input),
+		key = JSON.stringify([
+			o.skin,
+			o.timeline,
+			o.cellWidthPx,
+			o.cellHeightPx,
+			o.targetRows,
+			o.rectangle,
+			o.displaySize,
+		]),
+		hit = gifCache.get(key);
+	if (hit) {
+		gifCache.delete(key);
+		gifCache.set(key, hit);
+		return hit;
+	}
+	const value = encodeGajaePetGif(o);
+	gifCache.set(key, value);
+	gifCacheBytes += value.bytes.byteLength;
+	gifCacheBase64Bytes += byteLength(value.base64);
+	gifCacheMultipartBytes += value.multipart.reduce((sum, record) => sum + byteLength(record), 0);
+	gifCacheTmuxDcsBytes += value.tmuxDcs.reduce((sum, record) => sum + byteLength(record), 0);
+	while (
+		gifCache.size > GIF_CACHE_MAX_ENTRIES ||
+		gifCacheBytes + gifCacheBase64Bytes + gifCacheMultipartBytes + gifCacheTmuxDcsBytes > GIF_CACHE_MAX_BYTES
+	) {
+		const k = gifCache.keys().next().value as string,
+			old = gifCache.get(k)!;
+		gifCache.delete(k);
+		gifCacheBytes -= old.bytes.byteLength;
+		gifCacheBase64Bytes -= byteLength(old.base64);
+		gifCacheMultipartBytes -= old.multipart.reduce((sum, record) => sum + byteLength(record), 0);
+		gifCacheTmuxDcsBytes -= old.tmuxDcs.reduce((sum, record) => sum + byteLength(record), 0);
+		gifCacheEvictions++;
+	}
+	return value;
+}
+export function getGajaePetGifCacheStats(): {
+	size: number;
+	bytes: number;
+	gifBytes: number;
+	base64Bytes: number;
+	multipartBytes: number;
+	tmuxDcsBytes: number;
+	evictions: number;
+} {
+	return {
+		size: gifCache.size,
+		bytes: gifCacheBytes + gifCacheBase64Bytes + gifCacheMultipartBytes + gifCacheTmuxDcsBytes,
+		gifBytes: gifCacheBytes,
+		base64Bytes: gifCacheBase64Bytes,
+		multipartBytes: gifCacheMultipartBytes,
+		tmuxDcsBytes: gifCacheTmuxDcsBytes,
+		evictions: gifCacheEvictions,
+	};
+}
+export function resetGajaePetGifCache(): void {
+	gifCache.clear();
+	gifCacheBytes = 0;
+	gifCacheBase64Bytes = 0;
+	gifCacheMultipartBytes = 0;
+	gifCacheTmuxDcsBytes = 0;
+	gifCacheEvictions = 0;
+}
+export const clearGajaePetGifCache = resetGajaePetGifCache;
 /** Encode a grid as a transparent SIXEL image, optionally bottom-aligned by top padding. */
 export function encodeGridSixel(
 	grid: string[],
@@ -447,7 +724,8 @@ export function buildGajaePixelFrames(options: {
 	const topPaddingPx =
 		allocatedHeightPx - visibleHeightPx + (options.protocol === "sixel" ? (options.sixelTopPaddingPx ?? 0) : 0);
 	const heightPx = visibleHeightPx + topPaddingPx;
-	const rasterRows = Math.ceil(heightPx / options.cellHeightPx);
+	const kittyYOffsetPx = options.protocol === "kitty" ? Math.max(0, Math.round(options.kittyCellYOffsetPx ?? 0)) : 0;
+	const rasterRows = Math.ceil((heightPx + kittyYOffsetPx) / options.cellHeightPx);
 	// Center the square sprite in its (cols * cellWidth) block, which the ceil()
 	// column rounding can make wider than the sprite itself.
 	const horizontalPaddingPx = Math.max(0, columns * options.cellWidthPx - widthPx);

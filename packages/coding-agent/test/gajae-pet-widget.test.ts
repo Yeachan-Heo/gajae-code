@@ -5,9 +5,11 @@ import {
 	getCellDimensions,
 	setCellDimensions,
 	type TUI,
+	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "../src/modes/components/custom-editor";
 import { GajaePetWidget, PetFramedEditor } from "../src/modes/components/gajae-pet-widget";
+import { setVerifiedItermPetAvailability } from "../src/modes/components/pet-capability";
 
 function makeStubs(columns = 80, rows = 30) {
 	const written: string[] = [];
@@ -26,6 +28,12 @@ function makeStubs(columns = 80, rows = 30) {
 	let emitter: (() => string | null) | undefined;
 	let available = true;
 	let failWrites = false;
+	let rasterToken = 0;
+	const rasterOutputs: Uint8Array[] = [];
+	const rasterCursorVisibilityRestores: Array<boolean | undefined> = [];
+	const invalidatedRasterLeases: Array<{ token: unknown; cause?: string }> = [];
+	let delayRasterAcquire = false;
+	const rasterAcquireWaiters: Array<() => void> = [];
 	const pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
 	const flushTerminalCleanup = () => {
 		while (available && pendingTerminalCleanup.length > 0) {
@@ -60,6 +68,42 @@ function makeStubs(columns = 80, rows = 30) {
 			return available;
 		},
 		terminal,
+		acquireRasterLease: async (request: {
+			ownerId: string;
+			rect: { column: number; row: number; width: number; height: number };
+		}) => {
+			const result = {
+				status: "acquired",
+				token: { ownerId: request.ownerId, generation: ++rasterToken, rect: request.rect },
+			};
+			if (!delayRasterAcquire) return result;
+			return await new Promise(resolve => rasterAcquireWaiters.push(() => resolve(result)));
+		},
+		invalidateRasterLease: async (request: { token: unknown; cause?: string }) => {
+			invalidatedRasterLeases.push(request);
+			return { status: "invalidated" };
+		},
+		queueTerminalOutput: async (payload: string) => {
+			if (failWrites || !available) return { status: "failed" as const };
+			written.push(payload);
+			return { status: "written" as const };
+		},
+		submitTerminalOutput: async (request: {
+			operation: {
+				prefix?: Uint8Array;
+				replayPrefix?: Uint8Array;
+				records: Uint8Array[];
+				suffix?: Uint8Array;
+				restoreCursorVisibility?: boolean;
+			};
+		}) => {
+			rasterCursorVisibilityRestores.push(request.operation.restoreCursorVisibility);
+			if (request.operation.prefix) rasterOutputs.push(request.operation.prefix);
+			if (request.operation.replayPrefix) rasterOutputs.push(request.operation.replayPrefix);
+			rasterOutputs.push(...request.operation.records);
+			if (request.operation.suffix) rasterOutputs.push(request.operation.suffix);
+			return { status: "written" };
+		},
 	} as unknown as TUI;
 	const editorContainer = new Container();
 	const floorContainer = new Container();
@@ -84,7 +128,19 @@ function makeStubs(columns = 80, rows = 30) {
 		},
 		flushTerminalCleanup,
 		getPendingTerminalCleanupCount: () => pendingTerminalCleanup.length,
+		getRasterOutputs: () => rasterOutputs,
+		getInvalidatedRasterLeases: () => invalidatedRasterLeases,
+		getRasterCursorVisibilityRestores: () => rasterCursorVisibilityRestores,
+		getPendingRasterAcquireCount: () => rasterAcquireWaiters.length,
+		setRasterAcquireDelayed: (value: boolean) => {
+			delayRasterAcquire = value;
+			if (!value) while (rasterAcquireWaiters.length) rasterAcquireWaiters.shift()?.();
+		},
 	};
+}
+
+async function flushAsyncChain() {
+	for (let i = 0; i < 4; i++) await Promise.resolve();
 }
 
 function makeWidget(
@@ -105,6 +161,7 @@ function makeWidget(
 		floorContainer: stubs.floorContainer,
 		isWorking: options.isWorking ?? (() => false),
 		getComposerBottomOffset: () => stubs.floorContainer.render(columns).length + (options.bottomOffset ?? 0),
+		syncManagedItermCursor: async () => true,
 		forcePixelProtocol: options.protocol === null ? undefined : (options.protocol ?? "sixel"),
 		autoFlexGapMs: options.autoFlexGapMs !== undefined ? options.autoFlexGapMs : null,
 	});
@@ -195,15 +252,14 @@ describe("GajaePetWidget", () => {
 		}
 	});
 
-	it("retains cleanup authority when the render write that carried it fails, and dispose retries", () => {
+	it("retains cleanup authority when the queued TUI output fails, and dispose retries", () => {
 		const { widget, written, getEmitter, setTerminalSize, setTerminalAvailable } = makeWidget();
 		widget.setMode("red");
 		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
 		setTerminalSize(12, 30);
 
-		// The emitter hands the cleanup payload to the TUI, but the enclosing
-		// render write fails (availability drops), so delivery is never
-		// acknowledged and the authority must survive.
+		// The emitter hands the cleanup payload to the TUI, but queued delivery
+		// fails (availability drops), so delivery is never acknowledged and the authority must survive.
 		expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
 		setTerminalAvailable(false);
 		expect(getEmitter()?.()).toBeNull();
@@ -277,6 +333,7 @@ describe("GajaePetWidget", () => {
 				floorContainer: stubs.floorContainer,
 				isWorking: () => false,
 				getComposerBottomOffset: () => 0,
+				syncManagedItermCursor: async () => true,
 				forcePixelProtocol: "kitty",
 				autoFlexGapMs: null,
 			});
@@ -304,7 +361,7 @@ describe("GajaePetWidget", () => {
 		third.dispose();
 	});
 
-	it("completes logical teardown when the cleanup write throws", () => {
+	it("completes logical teardown when the queued cleanup output fails", () => {
 		const { widget, editorContainer, getEmitter, getRenderedWidth, setWriteFailure } = makeWidget();
 		widget.setMode("red");
 		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
@@ -312,7 +369,7 @@ describe("GajaePetWidget", () => {
 		setWriteFailure(true);
 		widget.dispose();
 
-		// The thrown write must not abort teardown: the shared emitter slot is
+		// The failed queued output must not abort teardown: the shared emitter slot is
 		// released, the composer is unframed, and the widget is terminal.
 		expect(getEmitter()).toBeUndefined();
 		expect(widget.mode).toBe("off");
@@ -332,6 +389,7 @@ describe("GajaePetWidget", () => {
 				floorContainer: stubs.floorContainer,
 				isWorking: () => false,
 				getComposerBottomOffset: () => stubs.floorContainer.render(80).length,
+				syncManagedItermCursor: async () => true,
 				forcePixelProtocol: "sixel",
 				autoFlexGapMs: null,
 			});
@@ -363,6 +421,7 @@ describe("GajaePetWidget", () => {
 				floorContainer: stubs.floorContainer,
 				isWorking: () => false,
 				getComposerBottomOffset: () => stubs.floorContainer.render(80).length,
+				syncManagedItermCursor: async () => true,
 				forcePixelProtocol: "sixel",
 				autoFlexGapMs: null,
 			});
@@ -424,7 +483,7 @@ describe("GajaePetWidget", () => {
 		expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
 	});
 
-	it("retains Sixel cleanup authority when the erase write throws and retries on dispose", () => {
+	it("retains Sixel cleanup authority when queued erase output fails and retries on dispose", () => {
 		const { widget, written, getEmitter, setWriteFailure } = makeWidget();
 		widget.setMode("red");
 		expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
@@ -504,7 +563,7 @@ describe("GajaePetWidget", () => {
 		}
 	});
 
-	it("writes frames directly to the terminal when the UI is quiet", () => {
+	it("queues frames through the TUI when the UI is quiet", async () => {
 		vi.useFakeTimers();
 		const { widget, written } = makeWidget();
 		try {
@@ -512,6 +571,7 @@ describe("GajaePetWidget", () => {
 			written.length = 0;
 			// Idle loop leaves "base" at 1100ms; advance into the gazeL window.
 			vi.advanceTimersByTime(1200);
+			await flushAsyncChain();
 			expect(written.length).toBeGreaterThan(0);
 			expect(written.some(chunk => chunk.includes("\x1b[?2026h\x1b7") && chunk.includes("\x1bP0;1;0q"))).toBe(true);
 			// Transparent sixel frames clear only the reserved pet cells inside
@@ -519,6 +579,7 @@ describe("GajaePetWidget", () => {
 			expect(written.some(chunk => chunk.includes("\x1b[0m") && chunk.includes("\x1b[4X"))).toBe(true);
 		} finally {
 			widget.dispose();
+			await flushAsyncChain();
 		}
 	});
 
@@ -635,11 +696,277 @@ describe("GajaePetWidget", () => {
 			floorContainer: stubs.floorContainer,
 			isWorking: () => false,
 			getComposerBottomOffset: () => 0,
+			syncManagedItermCursor: async () => true,
 		});
 		widget.setMode("red");
 		expect(widget.mode).toBe("off");
 		expect(stubs.getEmitter()).toBeUndefined();
 		widget.dispose();
+	});
+	it("anchors the iTerm pet bottom row to the composer's bottom edge", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, { bottomOffset: 2, protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+
+			// composerBottom = 28; a two-row image starts at zero-based row 26,
+			// so its second row shares the composer's zero-based bottom row 27.
+			const records = stubs.getRasterOutputs().map(record => new TextDecoder().decode(record));
+			expect(records[0]).toBe("\x1b[?2026h\x1b7\x1b[?25l\x1b[27;76H");
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+
+	it("keeps cursor and multipart ordering for direct and managed iTerm records", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, { protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			const directRecords = stubs.getRasterOutputs().map(record => new TextDecoder().decode(record));
+			expect(directRecords[0]).toBe("\x1b[?2026h\x1b7\x1b[?25l\x1b[28;76H");
+			expect(directRecords[1]).toContain("\x1b]1337;MultipartFile=");
+			expect(directRecords[1]).toContain("width=4;height=2;");
+			expect(directRecords[1]).toContain("size=");
+			expect(directRecords[1]).toContain("inline=1;preserveAspectRatio=0:");
+			expect(directRecords.slice(1).filter(record => record.includes("\x1b[28;76H")).length).toBe(0);
+			expect(directRecords.slice(1).every(record => !record.includes("\x1b[28;76H"))).toBe(true);
+			expect(directRecords.at(-2)).toBe("\x1b]1337;FileEnd\x07");
+			expect(directRecords.at(-1)).toBe("\x1b8\x1b[?2026l");
+
+			stubs.widget.setMode("off");
+			await flushAsyncChain();
+			setVerifiedItermPetAvailability({ available: true, mode: "managed", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			const managedRecords = stubs
+				.getRasterOutputs()
+				.slice(directRecords.length)
+				.map(record => new TextDecoder().decode(record));
+			expect(managedRecords[0]).toBe(`${wrapITerm2RecordForTmux("\x1b[?2026h\x1b7\x1b[?25l")}\x1b7\x1b[28;76H`);
+			expect(managedRecords[1]).toBe("\x1b[28;76H");
+			expect(managedRecords[2]).toContain("\x1bPtmux;\x1b\x1b]1337;MultipartFile=");
+			expect(managedRecords[2]).toContain("width=4;height=2;");
+			expect(managedRecords[2]).not.toContain("\x1b[28;76H");
+			expect(managedRecords.at(-2)).toBe("\x1bPtmux;\x1b\x1b]1337;FileEnd\x07\x1b\\");
+			expect(managedRecords.at(-1)).toBe(`${wrapITerm2RecordForTmux("\x1b8\x1b[?2026l")}\x1b8`);
+			expect(managedRecords.slice(3, -2).every(record => record.startsWith("\x1bPtmux;"))).toBe(true);
+			expect(managedRecords.slice(3, -2).every(record => !record.includes("\x1b[28;76H"))).toBe(true);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+	it("updates iTerm cell geometry atomically when font metrics change", async () => {
+		vi.useFakeTimers();
+		const original = getCellDimensions();
+		const stubs = makeWidget(80, 30, { protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			stubs.editorContainer.render(80);
+			const previousRecordCount = stubs.getRasterOutputs().length;
+			expect(stubs.getRenderedWidth()).toBe(75);
+
+			setCellDimensions({ widthPx: 18, heightPx: 18 });
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			stubs.editorContainer.render(80);
+			const resizedRecords = stubs
+				.getRasterOutputs()
+				.slice(previousRecordCount)
+				.map(record => new TextDecoder().decode(record));
+			expect(stubs.getRenderedWidth()).toBe(77);
+			expect(resizedRecords[0]).toBe("\x1b[?2026h\x1b7\x1b[?25l\x1b[28;78H");
+			expect(resizedRecords[1]).toContain("width=2;height=2;");
+		} finally {
+			setCellDimensions(original);
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+
+	it("guards direct and managed iTerm raster submission when the framed editor cannot fit", async () => {
+		vi.useFakeTimers();
+		for (const mode of ["direct", "managed"] as const) {
+			const stubs = makeWidget(12, 30, { protocol: null });
+			try {
+				setVerifiedItermPetAvailability({ available: true, mode, epoch: 1 });
+				stubs.widget.setMode("red");
+				stubs.editorContainer.render(12);
+				vi.advanceTimersByTime(80);
+				await flushAsyncChain();
+				expect(stubs.getRasterOutputs()).toHaveLength(0);
+				expect(stubs.getRenderedWidth()).toBe(12);
+
+				stubs.setTerminalSize(80, 30);
+				stubs.editorContainer.render(80);
+				expect(stubs.getRenderedWidth()).toBe(75);
+				vi.advanceTimersByTime(80);
+				await flushAsyncChain();
+				const normalRecords = stubs.getRasterOutputs().map(record => new TextDecoder().decode(record));
+				expect(normalRecords[0]).toBe(
+					mode === "managed"
+						? `${wrapITerm2RecordForTmux("\x1b[?2026h\x1b7\x1b[?25l")}\x1b7\x1b[28;76H`
+						: "\x1b[?2026h\x1b7\x1b[?25l\x1b[28;76H",
+				);
+				expect(normalRecords.some(record => record.includes("MultipartFile="))).toBe(true);
+				expect(normalRecords.at(-2)).toContain("FileEnd");
+				expect(normalRecords.at(-1)).toContain("\x1b[?2026l");
+
+				stubs.setTerminalSize(12, 30);
+				stubs.editorContainer.render(12);
+				expect(stubs.getRenderedWidth()).toBe(12);
+				vi.advanceTimersByTime(80);
+				await flushAsyncChain();
+				const beforeNarrowing = stubs.getRasterOutputs().length;
+				const cleanup = stubs.getEmitter()?.();
+				expect(cleanup ?? "").not.toContain("MultipartFile=");
+				await flushAsyncChain();
+				expect(stubs.getRasterOutputs()).toHaveLength(beforeNarrowing);
+				expect(stubs.getInvalidatedRasterLeases().at(-1)?.cause).toBe("resize");
+			} finally {
+				setVerifiedItermPetAvailability(undefined);
+				stubs.widget.dispose();
+			}
+		}
+	});
+	it("drops stale async completion after mode-off", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, { protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.setRasterAcquireDelayed(true);
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			stubs.widget.setMode("off");
+			stubs.setRasterAcquireDelayed(false);
+			await flushAsyncChain();
+			expect(stubs.getRasterOutputs()).toHaveLength(0);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+	it("coalesces animation ticks while an iTerm raster submission is pending", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, { protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.setRasterAcquireDelayed(true);
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(800);
+			await flushAsyncChain();
+
+			expect(stubs.getPendingRasterAcquireCount()).toBe(1);
+			expect(stubs.getRasterOutputs()).toHaveLength(0);
+
+			stubs.setRasterAcquireDelayed(false);
+			await flushAsyncChain();
+			const headers = stubs
+				.getRasterOutputs()
+				.map(record => new TextDecoder().decode(record))
+				.filter(record => record.includes("MultipartFile="));
+			expect(headers).toHaveLength(1);
+			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+	it("runs scheduled auto-flex bursts on the iTerm raster path", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, {
+			protocol: null,
+			autoFlexGapMs: [500, 500],
+			isWorking: () => true,
+		});
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.widget.isFlexing).toBe(false);
+
+			vi.advanceTimersByTime(560);
+			await flushAsyncChain();
+
+			expect(stubs.widget.isFlexing).toBe(true);
+			const headers = stubs
+				.getRasterOutputs()
+				.map(record => new TextDecoder().decode(record))
+				.filter(record => record.includes("MultipartFile="));
+			expect(headers).toHaveLength(2);
+			const sizes = headers.map(header => Number(/;size=(\d+);/u.exec(header)?.[1]));
+			expect(sizes[1]).toBeGreaterThan(sizes[0]);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+	it("reuses one raster lease and applies cursor visibility for idle-working-idle transitions", async () => {
+		vi.useFakeTimers();
+		let working = false;
+		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true]);
+
+			working = true;
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true, true]);
+
+			working = false;
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getRasterCursorVisibilityRestores()).toEqual([true, true, true]);
+			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
+	});
+	it("settles after replacing the idle raster with the working raster", async () => {
+		vi.useFakeTimers();
+		let working = false;
+		const stubs = makeWidget(80, 30, { protocol: null, isWorking: () => working });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+
+			working = true;
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			vi.advanceTimersByTime(800);
+			await flushAsyncChain();
+
+			const headers = stubs
+				.getRasterOutputs()
+				.map(record => new TextDecoder().decode(record))
+				.filter(record => record.includes("MultipartFile="));
+			expect(headers).toHaveLength(2);
+			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(0);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
 	});
 });
 

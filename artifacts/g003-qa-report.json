@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "kind": "tui-parity-test-report",
+  "cases": [
+    {
+      "name": "OFFSCREEN-MUTATION",
+      "status": "passed",
+      "checks": [
+        "viewport byte-equal",
+        "scrollback byte-equal",
+        "write sequence byte-equal"
+      ]
+    },
+    {
+      "name": "PREFIX-COLLISION",
+      "status": "passed",
+      "checks": [
+        "viewport byte-equal",
+        "scrollback byte-equal",
+        "write sequence byte-equal"
+      ]
+    },
+    {
+      "name": "SCROLLBACK-INTEGRITY",
+      "status": "passed",
+      "checks": [
+        "viewport byte-equal",
+        "scrollback byte-equal",
+        "write sequence byte-equal"
+      ]
+    },
+    {
+      "name": "RESIZE-STORM",
+      "status": "passed",
+      "checks": [
+        "viewport byte-equal",
+        "scrollback byte-equal",
+        "write sequence byte-equal"
+      ]
+    },
+    {
+      "name": "OVERLAY",
+      "status": "passed",
+      "checks": [
+        "viewport byte-equal",
+        "scrollback byte-equal",
+        "write sequence byte-equal"
+      ]
+    },
+    {
+      "name": "SHRINK",
+      "status": "passed",
+      "checks": [
+        "viewport byte-equal",
+        "scrollback byte-equal",
+        "write sequence byte-equal"
+      ]
+    },
+    {
+      "name": "ALTERNATING on/off/on",
+      "status": "passed",
+      "checks": [
+        "first on run byte-equal",
+        "off run byte-equal",
+        "second on run byte-equal"
+      ]
+    },
+    {
+      "name": "BOUNDED-WORK",
+      "status": "passed",
+      "checks": [
+        "normalized <= 20",
+        "diffed <= 20"
+      ],
+      "metrics": {
+        "normalized": {
+          "last": 20,
+          "max": 50000
+        },
+        "diffed": {
+          "last": 20,
+          "max": 20
+        },
+        "offscreenScan": {
+          "last": 49981,
+          "max": 49981
+        }
+      }
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "passed": 8,
+    "failed": 0
+  }
+}
