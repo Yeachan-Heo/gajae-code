@@ -354,6 +354,30 @@ with `requestedProfile` where applicable, whole exact `availableProfiles` entrie
 that fit the detail budget, and `discoveryQuery: "models.profiles.list"`. The
 discovery pointer is authoritative when the bounded error cannot include every ID.
 
+### Active provider query (Q28)
+
+`Q28` / `providers.list/active` pages the providers currently eligible for model
+selection through the same authenticated, retained-snapshot envelope as Q10. Each
+row is the non-secret DTO `{ provider, connectionKind }`, where `connectionKind`
+is `credential` or `credentialless`.
+
+Provider IDs are returned exactly as they appear in Q10 `model.provider`: existing
+mixed-case, spaced, punctuated, and long custom IDs are preserved without aliases
+or normalization. Rows are deduplicated and ordered by UTF-8 provider bytes.
+Join Q28 to Q10 by exact provider ID; Q10 remains the full configured catalog.
+
+A credentialed discovery-only provider appears only after fresh discovery proves
+the exact model is usable. Static configured models can appear without a network
+probe. The query never invokes a model, refreshes credentials, probes a remote
+account, or exposes credentials, account metadata, paths, or provider responses.
+
+Resolver failures are atomic and return
+`{ "code": "internal", "message": "Unable to resolve active providers." }`.
+They omit a page and restart metadata. An expired continuation follows the shared
+cursor contract and returns `error.code: "cursor_expired"` with
+`error.restartQuery: true`. Malformed cursor strings return `invalid_cursor`;
+cross-query or selector mismatches return `invalid_input`.
+
 ## Answer semantics
 
 A remote reply answers a pending ask in every session state:

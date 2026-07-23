@@ -62,6 +62,7 @@ import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } fro
 import { projectQ10Models } from "../models.js";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { ActiveProviderResolutionError } from "../providers.js";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -1864,6 +1865,13 @@ function sdkQuerySurface(
 		},
 		getModelProfiles: () =>
 			projectModelProfileCatalog(ctx.modelRegistry.getModelProfiles(), ctx.modelRegistry.getError()),
+		getActiveProviders: () => {
+			try {
+				return ctx.modelRegistry.getActiveProviders(ctx.model);
+			} catch {
+				throw new ActiveProviderResolutionError();
+			}
+		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {
 			const workflowGate = ctx.workflowGate;
@@ -1980,6 +1988,19 @@ function sdkControlSurface(
 		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {
+		const selector = id.trim();
+		const exactMatch = ctx.modelRegistry
+			.getAll()
+			.find(candidate => `${candidate.provider}/${candidate.id}` === selector);
+		if (exactMatch) return exactMatch;
+
+		const normalized = selector.toLowerCase();
+		const exactMatches = ctx.modelRegistry
+			.getAll()
+			.filter(candidate => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalized);
+		if (exactMatches.length === 1) return exactMatches[0];
+		if (exactMatches.length > 1)
+			throw Object.assign(new Error(`Model ${id} is ambiguous.`), { code: "invalid_input" });
 		const [provider, ...modelId] = id.split("/");
 		const model =
 			modelId.length > 0

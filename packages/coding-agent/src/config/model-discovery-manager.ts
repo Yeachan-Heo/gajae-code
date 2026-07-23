@@ -89,6 +89,11 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 		const state = this.#states.get(provider);
 		return state === undefined ? undefined : this.#snapshot(state);
 	}
+	invalidate(provider: string): void {
+		this.#invalidate(provider);
+		this.#states.delete(provider);
+		this.#lastWarnings.delete(provider);
+	}
 
 	loadCached(provider: TProvider, cacheDbPath?: string): readonly Model<Api>[] {
 		const cache = readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
@@ -165,9 +170,11 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 				? cached
 					? "cached"
 					: "idle"
-				: result.models.length > 0
+				: result.fetched && result.models.length > 0
 					? "ok"
-					: "empty";
+					: result.models.length > 0
+						? "cached"
+						: "empty";
 		const state: ProviderDiscoveryState = {
 			provider: provider.provider,
 			status,

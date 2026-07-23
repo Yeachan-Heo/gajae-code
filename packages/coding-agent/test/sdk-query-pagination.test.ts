@@ -4,8 +4,9 @@ import { mkdtemp, readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BrokerWorkflowGateEmitter, FileGateStore } from "../src/modes/shared/agent-wire/workflow-gate-broker";
-import { CursorRegistry, cursorMac, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
+import { CURSOR_TTL_MS, CursorRegistry, cursorMac, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
 import { Q10ThinkingMetadataError } from "../src/sdk/models.js";
+import type { ActiveProviderDescriptor } from "../src/sdk/providers.js";
 
 const huge = (value: string) => `${value}${"x".repeat(140_000)}`;
 function surface(transcript: unknown[] = []) {
@@ -18,6 +19,7 @@ function surface(transcript: unknown[] = []) {
 		getUsage: () => ({}),
 		getModels: () => [],
 		getSkillState: () => [],
+		getActiveProviders: () => [],
 		getGates: () => [],
 		getConfigItems: () => [],
 		getSessionMetadata: () => ({}),
@@ -41,6 +43,185 @@ function handlers(transcript: unknown[]) {
 }
 
 describe("SDK query pagination", () => {
+	it("returns the exact Q28 standard page in surface order and enforces installed-query authority", async () => {
+		const activeProviders: ActiveProviderDescriptor[] = [
+			{ provider: "anthropic", connectionKind: "credential" },
+			{ provider: "openai", connectionKind: "credentialless" },
+		];
+		const store = new RevisionStore("s1");
+		const query = new QueryHandlers(
+			{
+				...surface(),
+				getActiveProviders: () => activeProviders,
+				installedQueries: new Set(["providers.list/active"]),
+			},
+			"s1",
+			store,
+			new CursorRegistry("token", store),
+		);
+		const response = await query.dispatch({ query: "providers.list/active", id: "q28", connectionId: "c" });
+		expect(response).toEqual({
+			id: "q28",
+			ok: true,
+			page: { items: activeProviders, complete: true, revision: "1" },
+		});
+
+		const notInstalled = new QueryHandlers(
+			{
+				...surface(),
+				getActiveProviders: () => activeProviders,
+				installedQueries: new Set(["models.list/current"]),
+			},
+			"s1",
+			store,
+			new CursorRegistry("token", store),
+		);
+		const rejected = await notInstalled.dispatch({ query: "providers.list/active", id: "q28", connectionId: "c" });
+		expect(rejected).toMatchObject({
+			id: "q28",
+			ok: false,
+			error: {
+				code: "operation_not_session_owned",
+				message: "providers.list/active is not installed for this session.",
+			},
+		});
+		expect(rejected.page).toBeUndefined();
+	});
+
+	it("keeps Q28 continuation order and snapshot contents after the surface mutates", async () => {
+		const initialProviders: ActiveProviderDescriptor[] = [
+			{ provider: huge("anthropic"), connectionKind: "credential" },
+			{ provider: huge("openai"), connectionKind: "credentialless" },
+			{ provider: huge("google"), connectionKind: "credential" },
+		];
+		const activeProviders = [...initialProviders];
+		const store = new RevisionStore("s1");
+		const query = new QueryHandlers(
+			{
+				...surface(),
+				getActiveProviders: () => activeProviders,
+				installedQueries: new Set(["providers.list/active"]),
+			},
+			"s1",
+			store,
+			new CursorRegistry("token", store),
+		);
+
+		const first = await query.dispatch({ query: "providers.list/active", connectionId: "c" });
+		expect(first.page).toMatchObject({
+			items: [initialProviders[0]],
+			complete: false,
+			revision: "1",
+			preview: true,
+		});
+		expect(first.page?.continuationCursor).toEqual(expect.any(String));
+
+		activeProviders[1] = { provider: "mutated", connectionKind: "credential" };
+		const second = await query.dispatch({
+			query: "providers.list/active",
+			cursor: first.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(second.page).toMatchObject({
+			items: [initialProviders[1]],
+			complete: false,
+			revision: "1",
+			preview: true,
+		});
+
+		const third = await query.dispatch({
+			query: "providers.list/active",
+			cursor: second.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(third.page?.items).toEqual([initialProviders[2]]);
+		expect(third.page?.complete).toBe(true);
+		expect(
+			[...(first.page?.items ?? []), ...(second.page?.items ?? []), ...(third.page?.items ?? [])].map(
+				item => (item as { provider: string }).provider,
+			),
+		).toEqual(initialProviders.map(item => item.provider));
+	});
+	it("returns shared restart metadata when a Q28 continuation expires", async () => {
+		let now = 1_000;
+		const activeProviders: ActiveProviderDescriptor[] = [
+			{ provider: huge("provider-one"), connectionKind: "credential" },
+			{ provider: huge("provider-two"), connectionKind: "credentialless" },
+		];
+		const store = new RevisionStore("s1", () => now);
+		const query = new QueryHandlers(
+			{
+				...surface(),
+				getActiveProviders: () => activeProviders,
+				installedQueries: new Set(["providers.list/active"]),
+			},
+			"s1",
+			store,
+			new CursorRegistry("token", store, () => now),
+		);
+
+		const first = await query.dispatch({ query: "providers.list/active", connectionId: "c" });
+		expect(first.page?.complete).toBe(false);
+		now += CURSOR_TTL_MS + 1;
+		const expired = await query.dispatch({
+			query: "providers.list/active",
+			cursor: first.page?.continuationCursor,
+			connectionId: "c",
+		});
+
+		expect(expired).toMatchObject({
+			ok: false,
+			error: { code: "cursor_expired", message: "cursor_expired", restartQuery: true },
+		});
+		expect(expired.page).toBeUndefined();
+	});
+
+	it("rejects Q10 and Q28 cursor reuse across query resources", async () => {
+		const models = [
+			{ id: "model-one", name: huge("model-one") },
+			{ id: "model-two", name: huge("model-two") },
+		];
+		const activeProviders: ActiveProviderDescriptor[] = [
+			{ provider: huge("provider-one"), connectionKind: "credential" },
+			{ provider: huge("provider-two"), connectionKind: "credentialless" },
+		];
+		const store = new RevisionStore("s1");
+		const query = new QueryHandlers(
+			{
+				...surface(),
+				getModels: () => models,
+				getActiveProviders: () => activeProviders,
+				installedQueries: new Set(["models.list/current", "providers.list/active"]),
+			},
+			"s1",
+			store,
+			new CursorRegistry("token", store),
+		);
+
+		const q10First = await query.dispatch({ query: "Q10", connectionId: "c" });
+		expect(q10First.page?.complete).toBe(false);
+		const q28WithQ10Cursor = await query.dispatch({
+			query: "providers.list/active",
+			cursor: q10First.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(q28WithQ10Cursor.error).toMatchObject({
+			code: "invalid_input",
+			message: "cursor does not match query",
+		});
+
+		const q28First = await query.dispatch({ query: "providers.list/active", connectionId: "c" });
+		expect(q28First.page?.complete).toBe(false);
+		const q10WithQ28Cursor = await query.dispatch({
+			query: "Q10",
+			cursor: q28First.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(q10WithQ28Cursor.error).toMatchObject({
+			code: "invalid_input",
+			message: "cursor does not match query",
+		});
+	});
 	it("keeps transcript pages to their first stable prefix while entries append", async () => {
 		const transcript = [
 			{ id: "one", body: huge("one") },

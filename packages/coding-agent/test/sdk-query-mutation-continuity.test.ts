@@ -21,6 +21,7 @@ function surface(queue: unknown[], config: unknown[]) {
 		getUsage: () => ({}),
 		getModels: () => [],
 		getSkillState: () => [],
+		getActiveProviders: () => [],
 		getGates: () => [],
 		getConfigItems: () => config,
 		getSessionMetadata: () => ({}),
