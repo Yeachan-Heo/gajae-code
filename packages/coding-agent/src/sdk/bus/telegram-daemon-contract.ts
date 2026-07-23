@@ -32,8 +32,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * fencing, attested generation-bearing pre-incarnation owner handoff in
  * generation 20, guarded modern generation-absent predecessor signaling in
  * generation 21, dead Windows v0.10 owner replacement in generation 22, and
- * retained native cleanup authority revalidation in generation 23, and typed
+ * retained native cleanup authority revalidation in generation 23, typed
  * retained exact-unlink cleanup authority acceptance (concrete detached
- * quarantine plus proven canonical absence) in generation 24.
+ * quarantine plus proven canonical absence) in generation 24, and
+ * session-scoped status command routing in generation 25.
  */
-export const DAEMON_GENERATION = 24;
+export const DAEMON_GENERATION = 25;
