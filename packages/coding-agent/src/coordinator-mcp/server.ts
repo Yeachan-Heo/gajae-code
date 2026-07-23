@@ -58,6 +58,7 @@ import {
 	deterministicOutboxId,
 	initializeCoordinatorNamespace,
 	recordDeletionIntent,
+	recoverIncompleteDeletions,
 	repairProjections,
 	withAdmittedSessionTransaction,
 	withNamespaceRegistry,
@@ -1922,7 +1923,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	let questionStateReady: Promise<void> | null = null;
 
 	function ensureQuestionStateReady(): Promise<void> {
-		questionStateReady ??= initializeCoordinatorNamespace(questionPaths);
+		questionStateReady ??= initializeCoordinatorNamespace(questionPaths).then(() =>
+			recoverIncompleteDeletions(questionPaths).then(() => undefined),
+		);
 		return questionStateReady;
 	}
 
@@ -4804,37 +4807,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return { jsonrpc: "2.0", id, result: textResult(payload, payload.ok === false) };
 		}
 		return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown_method:${request.method}` } };
-	}
-
-	// Clean up orphaned transaction files left by previous coordinator runs
-	// where broker close failed with resource_gone. Without this, every read
-	// path throws session_closing before the reaper can reach the session.
-	try {
-		const sessionEntries = nodeFs.readdirSync(questionPaths.sessions, { withFileTypes: true });
-		for (const entry of sessionEntries) {
-			if (!entry.isDirectory()) continue;
-			const txFile = path.join(questionPaths.sessions, entry.name, "transaction.v1.json");
-			let raw: string;
-			try {
-				raw = nodeFs.readFileSync(txFile, "utf8");
-			} catch {
-				continue;
-			}
-			const tx = JSON.parse(raw) as Record<string, unknown>;
-			const ops = asRecord(tx?.requests)?.operations as Record<string, Record<string, unknown>> | undefined;
-			if (!ops) continue;
-			const hasStuckReap = Object.values(ops).some(
-				op =>
-					op?.phase === "remote_started" &&
-					asRecord(op?.intent)?.kind != null &&
-					(asRecord(op?.intent)!.kind === "stop" || asRecord(op?.intent)!.kind === "reap"),
-			);
-			if (hasStuckReap) {
-				nodeFs.rmSync(txFile, { force: true });
-			}
-		}
-	} catch {
-		// namespace directory may not exist yet — safe to skip
 	}
 
 	return { config, callTool, handleJsonRpc, handle: handleJsonRpc, reapSession, sessionReaper };

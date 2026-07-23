@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
@@ -274,6 +275,11 @@ export interface NamespaceRegistryV1 {
 	namespace_id: string;
 	creations: Record<string, CreationRequestV1>;
 	deletions: Record<string, NamespaceDeletionEntryV1>;
+}
+export interface RecoveryResult {
+	recovered: number;
+	orphaned: number;
+	errors: number;
 }
 export interface CoordinatorStatePaths {
 	root: string;
@@ -759,6 +765,17 @@ export async function recordDeletionIntent(
 		registry.deletions[entry.deletion_id] = existing ?? entry;
 	});
 }
+function mutateDeletionEntry(
+	entry: NamespaceDeletionEntryV1,
+	phase: NamespaceDeletionEntryV1["phase"],
+	cleanup?: Partial<NamespaceDeletionEntryV1["cleanup"]>,
+	safeResponse?: Record<string, unknown>,
+): void {
+	entry.phase = phase;
+	if (cleanup) entry.cleanup = { ...entry.cleanup, ...cleanup };
+	entry.updated_at = new Date().toISOString();
+	if (safeResponse) entry.safe_response = safeResponse;
+}
 
 export async function advanceDeletion(
 	paths: CoordinatorStatePaths,
@@ -770,9 +787,105 @@ export async function advanceDeletion(
 	await withNamespaceRegistry(paths, async registry => {
 		const entry = registry.deletions[deletionId];
 		if (!entry) throw new Error("resource_gone");
-		entry.phase = phase;
-		entry.cleanup = { ...entry.cleanup, ...cleanup };
-		entry.updated_at = new Date().toISOString();
-		if (safeResponse) entry.safe_response = safeResponse;
+		mutateDeletionEntry(entry, phase, cleanup, safeResponse);
 	});
+}
+
+export async function recoverIncompleteDeletions(paths: CoordinatorStatePaths): Promise<RecoveryResult> {
+	const result: RecoveryResult = { recovered: 0, orphaned: 0, errors: 0 };
+	const recoveryCleanup = { wal: true, turns: true, reports: false, session: true, events: true };
+	const recoveryResponse = { ok: true, closed: true };
+
+	try {
+		await withNamespaceRegistry(paths, async registry => {
+			let entries: Dirent[];
+			try {
+				entries = await fs.readdir(paths.sessions, { withFileTypes: true });
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+				throw error;
+			}
+
+			// Pass 1: Scan transaction files for stuck stop/reap operations
+			for (const dirEntry of entries) {
+				if (!dirEntry.isDirectory()) continue;
+				const sessionId = dirEntry.name;
+
+				try {
+					const txPath = path.join(paths.sessions, sessionId, "transaction.v1.json");
+					const tx = await readJson<CoordinatorSessionTransactionV1>(txPath);
+					if (!tx) continue;
+
+					const ops = tx.requests?.operations;
+					if (!ops) continue;
+
+					const hasStuckOp = Object.values(ops).some(
+						op => op?.phase === "remote_started" && (op?.intent?.kind === "stop" || op?.intent?.kind === "reap"),
+					);
+					if (!hasStuckOp) continue;
+
+					// Find matching deletion entry by session_id and incarnation
+					const deletionEntry = Object.values(registry.deletions).find(
+						d =>
+							d.session_id === tx.session_id &&
+							d.endpoint_incarnation === tx.endpoint?.incarnation &&
+							d.phase !== "completed",
+					);
+
+					if (deletionEntry) {
+						if (deletionEntry.phase === "uncertain") {
+							console.warn(
+								`[recoverIncompleteDeletions] uncertain deletion ${deletionEntry.deletion_id} for session ${sessionId}`,
+							);
+						}
+						mutateDeletionEntry(deletionEntry, "completed", recoveryCleanup, recoveryResponse);
+						result.recovered++;
+					} else {
+						result.orphaned++;
+					}
+
+					await fs.rm(txPath, { force: true });
+				} catch {
+					result.errors++;
+				}
+			}
+
+			// Pass 2: Advance non-completed deletion entries that lack a valid transaction
+			for (const deletion of Object.values(registry.deletions)) {
+				if (deletion.phase === "completed") continue;
+
+				try {
+					const txPath = path.join(paths.sessions, deletion.session_id, "transaction.v1.json");
+					const tx = await readJson<CoordinatorSessionTransactionV1>(txPath);
+
+					if (tx && tx.endpoint?.incarnation === deletion.endpoint_incarnation) {
+						// Transaction exists with matching incarnation — delete it
+						await fs.rm(txPath, { force: true });
+					}
+					// No transaction or stale incarnation: advance without tx deletion
+
+					if (deletion.phase === "uncertain") {
+						console.warn(
+							`[recoverIncompleteDeletions] uncertain deletion ${deletion.deletion_id} for session ${deletion.session_id}`,
+						);
+					}
+					mutateDeletionEntry(deletion, "completed", recoveryCleanup, recoveryResponse);
+					result.recovered++;
+				} catch {
+					result.errors++;
+				}
+			}
+		});
+	} catch {
+		// Namespace registry unavailable during startup — safe to skip
+		return result;
+	}
+
+	if (result.recovered > 0 || result.orphaned > 0) {
+		console.log(
+			`[recoverIncompleteDeletions] recovered=${result.recovered} orphaned=${result.orphaned} errors=${result.errors}`,
+		);
+	}
+
+	return result;
 }
