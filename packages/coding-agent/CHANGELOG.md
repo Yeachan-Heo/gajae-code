@@ -5,6 +5,7 @@
 ### Fixed
 
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
+- The Telegram `/usage` report now groups quota windows by provider, so every provider that reports usage (not only the Anthropic 5h/7d windows) is shown. Previously all providers were merged into a single 5-hour/weekly pair keyed only by window kind, which hid every non-Anthropic provider; the report also now surfaces non-5h/7d windows, credential tiers, and derives the used fraction from `used`/`limit` when a fraction is not provided.
 
 ## [0.11.8] - 2026-07-23
 ### Added

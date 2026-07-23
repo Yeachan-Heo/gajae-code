@@ -1280,7 +1280,9 @@ function formatLocalUsage(ctx: ExtensionContext): string {
 }
 
 interface SafeUsageWindow {
-	kind: "5h" | "7d";
+	key: string;
+	label: string;
+	tier?: string;
 	usedFraction?: number;
 	resetsAt?: number;
 }
@@ -1338,37 +1340,90 @@ function shouldReplaceUsageWindow(current: SafeUsageWindow, candidate: SafeUsage
 	return current.resetsAt === undefined || candidate.resetsAt < current.resetsAt;
 }
 
-function formatRemoteUsageWindows(reports: unknown): string[] {
+function formatUsageProviderName(provider: string): string {
+	return provider
+		.split(/[-_]/g)
+		.map(part => (part ? part[0].toUpperCase() + part.slice(1) : ""))
+		.join(" ");
+}
+
+function usageWindowLabel(limit: Record<string, unknown>): string {
+	const kind = classifyUsageWindow(limit);
+	if (kind === "5h") return "5-hour limit";
+	if (kind === "7d") return "Weekly limit";
+	const window = isRecord(limit.window) ? limit.window : undefined;
+	const scope = isRecord(limit.scope) ? limit.scope : undefined;
+	for (const candidate of [window?.label, limit.label, window?.id, scope?.windowId]) {
+		if (typeof candidate === "string" && candidate.trim()) return candidate;
+	}
+	return "limit";
+}
+
+function usageWindowKey(limit: Record<string, unknown>): string {
+	const kind = classifyUsageWindow(limit);
+	if (kind) return kind;
+	const window = isRecord(limit.window) ? limit.window : undefined;
+	const scope = isRecord(limit.scope) ? limit.scope : undefined;
+	for (const candidate of [window?.id, scope?.windowId, limit.id]) {
+		if (typeof candidate === "string" && candidate.trim()) return candidate.toLowerCase();
+	}
+	return usageWindowLabel(limit).toLowerCase();
+}
+
+function usageWindowSortWeight(key: string): number {
+	if (key === "5h") return 0;
+	if (key === "7d") return 1;
+	return 2;
+}
+
+// Group provider-reported limits by provider so every registered provider (not
+// just the Anthropic 5h/7d windows) shows up in the Telegram `/usage` report.
+export function formatRemoteUsageWindows(reports: unknown): string[] {
 	if (!Array.isArray(reports)) return [];
-	const windows = new Map<SafeUsageWindow["kind"], SafeUsageWindow>();
+	const byProvider = new Map<string, Map<string, SafeUsageWindow>>();
 	for (const report of reports) {
 		if (!isRecord(report) || !Array.isArray(report.limits)) continue;
+		const provider = typeof report.provider === "string" && report.provider ? report.provider : "unknown";
+		const windows = byProvider.get(provider) ?? new Map<string, SafeUsageWindow>();
+		byProvider.set(provider, windows);
 		for (const value of report.limits) {
 			if (!isRecord(value)) continue;
-			const kind = classifyUsageWindow(value);
-			if (!kind) continue;
 			const window = isRecord(value.window) ? value.window : undefined;
 			const amount = isRecord(value.amount) ? value.amount : undefined;
+			const scope = isRecord(value.scope) ? value.scope : undefined;
 			const usedFraction = getUsageUsedFraction(amount);
 			const resetsAt = window?.resetsAt;
+			const tier = scope?.tier;
 			const candidate: SafeUsageWindow = {
-				kind,
+				key: usageWindowKey(value),
+				label: usageWindowLabel(value),
+				...(typeof tier === "string" && tier ? { tier } : {}),
 				...(typeof usedFraction === "number" && Number.isFinite(usedFraction) ? { usedFraction } : {}),
 				...(typeof resetsAt === "number" && Number.isFinite(resetsAt) ? { resetsAt } : {}),
 			};
-			const current = windows.get(kind);
-			if (!current || shouldReplaceUsageWindow(current, candidate)) windows.set(kind, candidate);
+			const current = windows.get(candidate.key);
+			if (!current || shouldReplaceUsageWindow(current, candidate)) windows.set(candidate.key, candidate);
 		}
 	}
-	return (["5h", "7d"] as const).flatMap(kind => {
-		const window = windows.get(kind);
-		if (!window) return [];
-		const details = [kind === "5h" ? "5-hour limit" : "Weekly limit"];
-		if (window.usedFraction !== undefined) details.push(`${Number((window.usedFraction * 100).toFixed(1))}% used`);
-		const resetTime = window.resetsAt === undefined ? undefined : formatStableResetTime(window.resetsAt);
-		if (resetTime) details.push(`resets ${resetTime}`);
-		return [details.join(" — ")];
-	});
+
+	const lines: string[] = [];
+	for (const [provider, windows] of [...byProvider.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+		const entries = [...windows.values()].sort(
+			(left, right) =>
+				usageWindowSortWeight(left.key) - usageWindowSortWeight(right.key) || left.label.localeCompare(right.label),
+		);
+		if (entries.length === 0) continue;
+		if (lines.length > 0) lines.push("");
+		lines.push(formatUsageProviderName(provider));
+		for (const window of entries) {
+			const details = [window.tier ? `${window.label} (${window.tier})` : window.label];
+			if (window.usedFraction !== undefined) details.push(`${Number((window.usedFraction * 100).toFixed(1))}% used`);
+			const resetTime = window.resetsAt === undefined ? undefined : formatStableResetTime(window.resetsAt);
+			if (resetTime) details.push(`resets ${resetTime}`);
+			lines.push(`- ${details.join(" — ")}`);
+		}
+	}
+	return lines;
 }
 
 async function formatUsage(ctx: ExtensionContext, api: ExtensionAPI): Promise<string> {

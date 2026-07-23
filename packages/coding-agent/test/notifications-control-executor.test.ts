@@ -246,7 +246,10 @@ describe("executeNotificationControlCommand", () => {
 		const apiState = fakeApi();
 		apiState.setUsageReports([
 			{
-				provider: secret,
+				// Provider is an enum-like identifier that is intentionally displayed as a
+				// group header; every other field below stays a secret sentinel to prove
+				// credentials/PII are never projected into the report.
+				provider: "claude",
 				metadata: { accountId: secret, email: secret, baseUrl: secret },
 				raw: { accessToken: secret },
 				limits: [
@@ -289,8 +292,9 @@ describe("executeNotificationControlCommand", () => {
 				"Cost: $0.012345",
 				"",
 				"Usage windows",
-				"5-hour limit — 90% used — resets 2027-01-02 03:04:05 UTC",
-				"Weekly limit — 25% used — resets 2026-01-09 03:04:05 UTC",
+				"Claude",
+				"- 5-hour limit — 90% used — resets 2027-01-02 03:04:05 UTC",
+				"- Weekly limit — 25% used — resets 2026-01-09 03:04:05 UTC",
 			].join("\n"),
 		});
 		expect(apiState.usageFetchCalls).toBe(1);
