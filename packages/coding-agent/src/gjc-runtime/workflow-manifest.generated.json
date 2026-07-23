@@ -391,6 +391,9 @@
         "id": "critic"
       },
       {
+        "id": "disposition"
+      },
+      {
         "id": "revision"
       },
       {
@@ -433,6 +436,21 @@
       },
       {
         "from": "critic",
+        "to": "disposition",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "architect",
+        "to": "disposition",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "disposition",
+        "to": "revision",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "critic",
         "to": "revision",
         "verb": "write-artifact"
       },
@@ -443,6 +461,11 @@
       },
       {
         "from": "critic",
+        "to": "post-interview",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "disposition",
         "to": "post-interview",
         "verb": "write-artifact"
       },
@@ -478,6 +501,11 @@
       },
       {
         "from": "critic",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "disposition",
         "to": "handoff",
         "verb": "handoff"
       },
@@ -645,6 +673,7 @@
           "planner",
           "architect",
           "critic",
+          "disposition",
           "revision",
           "post-interview",
           "adr",
