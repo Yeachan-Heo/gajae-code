@@ -469,6 +469,11 @@ async function editPayload(draft: Draft, flags: Map<string, string>): Promise<vo
 		if (flags.has("--value") || flags.has("--value-file")) throw new Error("DI_DRAFT_INVALID_ARGUMENT");
 		output.push({});
 	} else {
+		if (!flags.has("--value") && !flags.has("--value-file") && target === undefined) {
+			// A valueless append initializes a missing scalar array without admitting raw JSON.
+			if (!Array.isArray(parent)) parent[key] = output;
+			return;
+		}
 		output.push(await suppliedValue(flags, descriptor.item));
 	}
 	if (!Array.isArray(parent)) parent[key] = output;

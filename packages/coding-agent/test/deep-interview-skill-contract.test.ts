@@ -255,6 +255,27 @@ describe("deep-interview CLI-owned draft contract", () => {
 		expect(steps).toContain("--op append");
 		expect(steps).toContain("draft_revision");
 	});
+	it("documents public flag grammar and valueless append behavior without permitting raw JSON", () => {
+		const steps = extractSection(skill, "Steps");
+		const toolUsage = extractSection(skill, "Tool_Usage");
+
+		expect(repairCli).toContain(
+			"Value-taking flags use exactly `--name value`; `--json` and `--null` are standalone flags and take no value.",
+		);
+		expect(repairCli).toContain(
+			"A valueless `append` on a missing object-item array appends an `{}` scaffold; on a missing scalar-item array it initializes `[]`.",
+		);
+		expect(repairCli).toContain(
+			"An existing scalar-item array still requires `--value` or `--value-file` for `append`.",
+		);
+		expect(repairCli).toContain("--op append --path /deferred_components --json");
+		expect(toolUsage).toContain(
+			"value-taking flags use exactly `--name value`, while `--json` and `--null` take no value",
+		);
+		expect(steps).toContain("valueless append on a missing scalar-item array initializes `[]`");
+		expect(steps).toContain("--op append --path /deferred_components --json");
+		expect(toolUsage).toContain("Never construct a full payload");
+	});
 
 	it("documents CAS-protected private draft consumption", () => {
 		const toolUsage = extractSection(skill, "Tool_Usage");

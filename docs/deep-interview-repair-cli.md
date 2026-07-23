@@ -6,7 +6,7 @@ This is the native repair and inspection surface for an existing GJC deep-interv
 
 ## Normal-flow draft protocol
 
-All commands require `--json`; flags are `--name value` only, cannot repeat, and identifiers match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Normal mutations use CLI-owned drafts, never caller-serialized JSON:
+All commands require standalone `--json`. Value-taking flags use exactly `--name value`; `--json` and `--null` are standalone flags and take no value. Flags cannot repeat, and identifiers match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Normal mutations use CLI-owned drafts, never caller-serialized JSON:
 
 ```text
 gjc deep-interview draft create  --for initialize-context|confirm-topology|record-answer|apply-round-result --session-id ID [identity flags] --json
@@ -19,7 +19,7 @@ gjc deep-interview draft discard --draft-id ID --expected-draft-revision N --jso
 
 Create returns `draft_id`, `draft_revision`, and state `base_revision`. Every edit/rebase is CAS on `draft_revision` and returns its next value. `check` validates the complete bounded payload against current state without consuming or mutating it; it reports when the draft base is stale. To rebase a state-stale active draft, pass the caller-observed current state revision as `--to-state-revision`, then check again. Drafts are private workspace/session-bound CLI storage, atomically written with restrictive permissions, automatically expired/cleaned up, and retained briefly after consumption for idempotent receipts. Do not read, copy, or reconstruct draft storage.
 
-Use only kind-allowed JSON-pointer paths. `set` writes one scalar: use `--value` for strings/numbers/booleans, `--null` for null, and `--value-file` only for bounded text. `append` without a value creates an object scaffold for an array, then scalar-edit its leaves (for example `/components/0/id`). `remove` takes no value. Build arrays and nested objects with scaffolds and scalar edits, never inline JSON.
+Use only kind-allowed JSON-pointer paths. `set` writes one scalar: use `--value` for strings/numbers/booleans, `--null` for null, and `--value-file` only for bounded text. A valueless `append` on a missing object-item array appends an `{}` scaffold; on a missing scalar-item array it initializes `[]`. An existing scalar-item array still requires `--value` or `--value-file` for `append`. `remove` takes no value. Build arrays and nested objects with scaffolds and scalar edits, never inline JSON.
 
 After check, consume through the matching typed command: `gjc deep-interview initialize-context|confirm-topology|record-answer|apply-round-result --draft-id ID --expected-draft-revision <latest_draft_revision> --json`. Consume applies state CAS from the draft base revision, stamps a receipt, and marks the draft consumed. There is no public `draft consume` command. `record-answer` remains recorder-first: draft recovery is only for an answer shell the `ask` recorder did not persist. Full payload/envelope reconstruction is forbidden in normal flow.
 
@@ -189,11 +189,12 @@ gjc deep-interview draft edit --draft-id <setup> --expected-draft-revision 2 --o
 gjc deep-interview draft check --draft-id <setup> --json
 gjc deep-interview initialize-context --draft-id <setup> --expected-draft-revision <latest_draft_revision> --json
 
-# Build topology with an append scaffold, then consume it.
+# Build topology with an object-item append scaffold and initialize zero deferrals, then consume it.
 gjc deep-interview draft create --for confirm-topology --session-id strict-flow --json
 gjc deep-interview draft edit --draft-id <topology> --expected-draft-revision 1 --op append --path /components --json
 gjc deep-interview draft edit --draft-id <topology> --expected-draft-revision 2 --op set --path /components/0/id --value core --json
 gjc deep-interview draft edit --draft-id <topology> --expected-draft-revision 3 --op set --path /components/0/name --value Core --json
+gjc deep-interview draft edit --draft-id <topology> --expected-draft-revision 4 --op append --path /deferred_components --json
 gjc deep-interview draft check --draft-id <topology> --json
 gjc deep-interview confirm-topology --draft-id <topology> --expected-draft-revision <latest_draft_revision> --json
 

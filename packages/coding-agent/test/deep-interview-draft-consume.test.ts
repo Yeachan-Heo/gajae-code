@@ -146,24 +146,25 @@ async function populateCompleteResult(cwd: string, input: Draft): Promise<Draft>
 		["/targeting/weakest_dimension", "goal"],
 	])
 		current = await edit(cwd, current.id, current.draft_revision, "set", target, value);
-	current = draft(
-		await runDeepInterviewDraftCommand(
-			[
-				"edit",
-				"--draft-id",
-				current.id,
-				"--expected-draft-revision",
-				String(current.draft_revision),
-				"--op",
-				"set",
-				"--path",
-				"/targeting/last_targeted_component_id",
-				"--null",
-				"--json",
-			],
-			cwd,
-		),
-	);
+	const nullEdit = await native(cwd, [
+		"draft",
+		"edit",
+		"--draft-id",
+		current.id,
+		"--expected-draft-revision",
+		String(current.draft_revision),
+		"--op",
+		"set",
+		"--path",
+		"/targeting/last_targeted_component_id",
+		"--null",
+		"--json",
+	]);
+	expect(
+		((json(nullEdit).draft as { payload: Record<string, unknown> }).payload.targeting as Record<string, unknown>)
+			.last_targeted_component_id,
+	).toBeNull();
+	current = draft(nullEdit);
 	return current;
 }
 
@@ -210,6 +211,29 @@ describe("CLI-owned deep-interview draft consumption", () => {
 			topology = await edit(env.cwd, topology.id, topology.draft_revision, "append", "/deferred_components", "core");
 			expect(json(await consume(env.cwd, "confirm-topology", topology))).toMatchObject({ consumed: true });
 			expect((await state(env.cwd, "topology")).state_revision).toBe(2);
+		} finally {
+			await env.restore();
+		}
+	});
+	it("initializes required empty scalar arrays through the public draft route", async () => {
+		const env = await workspace();
+		try {
+			await kickoff(env.cwd, "zero-deferrals");
+			const setup = await setSetup(env.cwd, await create(env.cwd, "initialize-context", "zero-deferrals"));
+			json(await consume(env.cwd, "initialize-context", setup));
+			let topology = await create(env.cwd, "confirm-topology", "zero-deferrals");
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "append", "/components");
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "set", "/components/0/id", "core");
+			topology = await edit(env.cwd, topology.id, topology.draft_revision, "append", "/deferred_components");
+			expect(json(await native(env.cwd, ["draft", "check", "--draft-id", topology.id, "--json"]))).toMatchObject({
+				valid: true,
+			});
+			expect(json(await consume(env.cwd, "confirm-topology", topology))).toMatchObject({ consumed: true });
+			expect(
+				((await state(env.cwd, "zero-deferrals")).state as { topology: Record<string, unknown> }).topology,
+			).toMatchObject({
+				deferred_components: [],
+			});
 		} finally {
 			await env.restore();
 		}
