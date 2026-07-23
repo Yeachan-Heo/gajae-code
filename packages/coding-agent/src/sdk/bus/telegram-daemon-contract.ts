@@ -34,7 +34,9 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * generation 21, dead Windows v0.10 owner replacement in generation 22, and
  * retained native cleanup authority revalidation in generation 23, typed
  * retained exact-unlink cleanup authority acceptance (concrete detached
- * quarantine plus proven canonical absence) in generation 24, and
- * session-scoped status command routing in generation 26.
+ * quarantine plus proven canonical absence) in generation 24.
+ * Generation 25 adds startup dead-root prune + leak-artifact self-heal
+ * on TelegramNotificationDaemon.run (#2956), and generation 26 adds
+ * session-scoped status command routing.
  */
 export const DAEMON_GENERATION = 26;
