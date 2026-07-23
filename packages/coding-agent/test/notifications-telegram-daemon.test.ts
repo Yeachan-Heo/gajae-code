@@ -2232,7 +2232,9 @@ describe("telegram daemon", () => {
 		async servingEpoch => {
 			const agentDir = tempAgentDir();
 			const s = setPrivateAgentDir(settings(agentDir), agentDir);
-			const state = { ...liveOwnerState(), servingEpoch };
+			// Intentionally malformed runtime JSON: cross the type boundary explicitly.
+			const state = { ...liveOwnerState(), servingEpoch } as unknown as Partial<DaemonState> &
+				ReturnType<typeof liveOwnerState>;
 			writeLiveOwner(agentDir, state);
 			expect(hasSafeDaemonStateShape(state)).toBe(false);
 			await expect(
