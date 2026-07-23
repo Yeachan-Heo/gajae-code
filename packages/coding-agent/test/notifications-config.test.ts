@@ -81,7 +81,7 @@ const BASE_CFG: NotificationConfig = {
 		enabled: false,
 	},
 	toolActivity: {
-		enabled: true,
+		enabled: false,
 	},
 	streaming: {
 		enabled: true,
@@ -222,7 +222,7 @@ describe("notifications config", () => {
 				enabled: false,
 			},
 			toolActivity: {
-				enabled: true,
+				enabled: false,
 			},
 			streaming: {
 				enabled: false,
@@ -232,6 +232,34 @@ describe("notifications config", () => {
 			},
 			idleTimeoutMs: 1234,
 		});
+	});
+
+	test("getNotificationConfig preserves an explicit tool-activity opt-in", () => {
+		const settings = Settings.isolated({
+			"notifications.telegram.toolActivity.enabled": true,
+		});
+
+		expect(getNotificationConfig(settings).toolActivity.enabled).toBe(true);
+	});
+	test("generated schema advertises tool activity as opt-in", async () => {
+		const schema = JSON.parse(
+			await Bun.file(path.join(import.meta.dir, "../../../schemas/config.schema.json")).text(),
+		) as {
+			properties: {
+				notifications: {
+					properties: {
+						telegram: {
+							properties: {
+								toolActivity: { properties: { enabled: { default?: unknown } } };
+							};
+						};
+					};
+				};
+			};
+		};
+		expect(
+			schema.properties.notifications.properties.telegram.properties.toolActivity.properties.enabled.default,
+		).toBe(false);
 	});
 
 	test("getNotificationConfig validates and projects durable Telegram activation markers", () => {

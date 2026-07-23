@@ -3423,7 +3423,7 @@ export interface TelegramDaemonOptions {
 	rich?: { enabled: boolean };
 	/** Opt-in rich-draft streaming of live turn previews (off by default; see rich-draft.ts). */
 	richDraft?: { enabled: boolean };
-	/** Tool start/completion messages (enabled by default). */
+	/** Tool start/completion messages (off by default; explicit opt-in only). */
 	toolActivity?: { enabled: boolean };
 	/**
 	 * Per-session Telegram forum-topic naming. `nameTemplate` supports the
@@ -5829,7 +5829,7 @@ export class TelegramNotificationDaemon {
 		this.pendingThreadedFrames.delete(sessionId);
 		for (const frame of frames) {
 			if (frame.logicalSessionId !== sessionId || !this.#leaseTokenAllows(frame.socketLease)) continue;
-			if (frame.msg.type === "tool_activity" && this.opts.toolActivity?.enabled === false) continue;
+			if (frame.msg.type === "tool_activity" && this.opts.toolActivity?.enabled !== true) continue;
 			await this.submitThreadedFrame(sessionId, frame.send, topicLease, frame.toolActivity, frame.socketLease);
 		}
 	}
@@ -6472,7 +6472,7 @@ export class TelegramNotificationDaemon {
 			if (
 				toolActivity?.phase === "started" &&
 				(this.toolActivityStopping ||
-					this.opts.toolActivity?.enabled === false ||
+					this.opts.toolActivity?.enabled !== true ||
 					toolActivity.policyEpoch !== this.toolActivityPolicyEpoch ||
 					!this.toolActivityAuthorityIsCurrent(toolActivity))
 			) {
@@ -7172,7 +7172,7 @@ export class TelegramNotificationDaemon {
 			return;
 		}
 		if (session.replayPending) {
-			if (msg?.type === "tool_activity" && (this.opts.toolActivity?.enabled === false || this.toolActivityStopping))
+			if (msg?.type === "tool_activity" && (this.opts.toolActivity?.enabled !== true || this.toolActivityStopping))
 				return;
 			const matchingReplay = msg?.type === "event_replay_result" && msg.id === session.replayId;
 			if (!matchingReplay) {
@@ -7528,6 +7528,7 @@ export class TelegramNotificationDaemon {
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
 			const threadedFrame = msg as Record<string, unknown>;
 			const toolActivity = this.toolActivityOwner(session, threadedFrame);
+			if (threadedFrame.type === "tool_activity" && !toolActivity) return;
 			const toolAdmissionEpoch = toolActivity
 				? (this.replayToolActivityEpochs.get(threadedFrame) ?? this.toolActivityPolicyEpoch)
 				: undefined;
@@ -7536,7 +7537,7 @@ export class TelegramNotificationDaemon {
 				toolActivity?.phase !== "started" ||
 				(this.toolActivityAuthorityIsCurrent(toolActivity) &&
 					!this.toolActivityStopping &&
-					this.opts.toolActivity?.enabled !== false &&
+					this.opts.toolActivity?.enabled === true &&
 					toolAdmissionEpoch === this.toolActivityPolicyEpoch);
 			const abandonStaleToolStart = (): void => {
 				if (toolActivity?.phase !== "started") return;
@@ -7553,7 +7554,7 @@ export class TelegramNotificationDaemon {
 					this.toolActivityOwners.set(liveKey, toolActivity);
 				} else {
 					if (currentOwner && currentOwner.session !== session) return;
-					if (this.opts.toolActivity?.enabled === false) {
+					if (this.opts.toolActivity?.enabled !== true) {
 						if (!currentOwner) return;
 						if (!this.liveMessages.has(liveKey)) {
 							// A start may already be granted to the serialized dispatcher but not

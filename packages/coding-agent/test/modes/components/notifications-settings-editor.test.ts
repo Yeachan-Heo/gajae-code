@@ -242,11 +242,13 @@ function enterTelegramTokenWithoutChat(component: NotificationsSettingsEditorCom
 }
 
 describe("NotificationsSettingsEditorComponent", () => {
-	it("defaults the unsaved streaming preference on before asynchronous state loads", () => {
+	it("defaults unsaved Telegram tool activity off and streaming on before asynchronous state loads", () => {
 		const component = new NotificationsSettingsEditorComponent(new FakeNotificationsOperations());
 		select(component, 10);
 		component.handleInput("\n");
-		select(component, 5);
+		select(component, 4);
+		expect(render(component)).toContain("Telegram tool activity: off");
+		select(component, 1);
 		expect(render(component)).toContain("Telegram streaming: on");
 	});
 	it("requires an explicit provider choice before the optional private-chat ID step", async () => {

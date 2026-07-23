@@ -282,7 +282,7 @@
   },
   "digests": {
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:defaultPidAlive": "4b35a9534120b352539eb85c65099b9bc0adddd08ad53df7efae92ba98f35455",
-    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "58752afc0f629a1d0e57ffc70e4b506397261f97aad7ff3d3fca5c4a40fa45d4",
+    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "c504685a903febb570c32f90fd1466dab845c392baf6a5a61e293197230d60cb",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:ownerPid": "31110dcdd6e0f5dbc8b4dce27383646b9c339739758623ab67dc40ddc36661e0",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:runChatDaemonInternal": "74c0a7c475325313453a4295479fd4cb2fcb3af6137426b8262b768d5bc276d0",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.discord": "a3d11990f9582c78ce7a275d92b53d81703048a7b2504771ee6bf900c3f5e127",
@@ -360,7 +360,7 @@
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:start": "947e8ba6e57e70b420665a9678c606b94751073716c046c40f14f3a6f2e306c3",
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:stop": "c8bcd881cc0331fb0565a82d997805f939701b12a80e03177192dbd5935824ff",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:defaultPidAlive": "4b35a9534120b352539eb85c65099b9bc0adddd08ad53df7efae92ba98f35455",
-    "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "58752afc0f629a1d0e57ffc70e4b506397261f97aad7ff3d3fca5c4a40fa45d4",
+    "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "c504685a903febb570c32f90fd1466dab845c392baf6a5a61e293197230d60cb",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:ownerPid": "31110dcdd6e0f5dbc8b4dce27383646b9c339739758623ab67dc40ddc36661e0",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:runChatDaemonInternal": "74c0a7c475325313453a4295479fd4cb2fcb3af6137426b8262b768d5bc276d0",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-control.ts:CHAT_DAEMON_GENERATIONS.slack": "be6cf35b0edcfd9a0090c0ab90ae1babd4d2eb8616443ed30209c1f5427d0395",
