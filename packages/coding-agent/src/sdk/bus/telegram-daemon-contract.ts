@@ -35,6 +35,6 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * retained native cleanup authority revalidation in generation 23, typed
  * retained exact-unlink cleanup authority acceptance (concrete detached
  * quarantine plus proven canonical absence) in generation 24, and
- * session-scoped status command routing in generation 25.
+ * session-scoped status command routing in generation 26.
  */
-export const DAEMON_GENERATION = 25;
+export const DAEMON_GENERATION = 26;

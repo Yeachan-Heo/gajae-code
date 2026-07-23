@@ -2217,9 +2217,9 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while session-scoped status routing uses generation 25", () => {
+	test("keeps wire protocol 3 while session-scoped status routing uses generation 26", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		expect(DAEMON_GENERATION).toBe(25);
+		expect(DAEMON_GENERATION).toBe(26);
 	});
 
 	test("#2028 reloads a fully-provenanced owner without a generation", async () => {
