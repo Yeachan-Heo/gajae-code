@@ -13174,7 +13174,14 @@ describe("Telegram tool activity capability and routing", () => {
 			toolName: "subagent",
 			phase: "started",
 		});
-		expect(internal.pool.pending).toBe(1);
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "queued",
+			toolName: "subagent",
+			phase: "completed",
+		});
+		expect(internal.pool.pending).toBe(2);
 
 		await daemon.handleTelegramUpdate({
 			update_id: 965,
@@ -13182,6 +13189,7 @@ describe("Telegram tool activity capability and routing", () => {
 		});
 		expect(internal.pool.pending).toBe(0);
 		expect(bot.calls.some(call => String(call.body.text).includes("subagent — started"))).toBe(false);
+		expect(bot.calls.some(call => String(call.body.text).includes("subagent — ok"))).toBe(false);
 	});
 
 	test("/toolactivity off orders a granted start before its racing terminal and acknowledgement", async () => {

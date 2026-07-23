@@ -8060,9 +8060,14 @@ export class TelegramNotificationDaemon {
 					this.toolActivityPolicyEpoch++;
 					this.opts.toolActivity = { enabled: desired };
 					if (!desired) {
-						const removedTools = this.pool.removeWhere(
-							item => item.lane === "live" && item.coalesceKey?.startsWith("tool:") === true,
-						);
+						const removedTools = this.pool.removeWhere(item => {
+							const toolActivity = item.payload.toolActivity;
+							if (!toolActivity) return false;
+							if (toolActivity.phase === "started") return true;
+							const key = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
+							const owner = this.toolActivityOwners.get(key);
+							return !this.liveMessages.has(key) || owner?.session !== toolActivity.session;
+						});
 						for (const item of removedTools) {
 							const toolActivity = item.payload.toolActivity;
 							if (!toolActivity) continue;
