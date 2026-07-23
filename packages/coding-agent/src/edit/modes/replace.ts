@@ -55,6 +55,7 @@ void import("@gajae-code/natives")
 		// Native unavailable; fuzzy matching uses the TS fallback.
 	});
 
+import { withEditPathMutation } from "../path-mutation-lock";
 import { readEditFileText, serializeEditFileText } from "../read-file";
 import type { EditToolDetails, LspBatchRequest } from "../renderer";
 
@@ -1087,6 +1088,47 @@ export async function executeReplaceSingle(
 	}
 
 	const absolutePath = resolvePlanPath(session, path);
+	return withEditPathMutation([absolutePath], () =>
+		executeReplaceSingleUnderLock({
+			session,
+			path,
+			params,
+			signal,
+			batchRequest,
+			allowFuzzy,
+			fuzzyThreshold,
+			writethrough,
+			beginDeferredDiagnosticsForPath,
+			absolutePath,
+			old_text,
+			new_text,
+			all,
+		}),
+	);
+}
+
+async function executeReplaceSingleUnderLock(
+	options: ExecuteReplaceSingleOptions & {
+		absolutePath: string;
+		old_text: string;
+		new_text: string;
+		all: boolean | undefined;
+	},
+): Promise<AgentToolResult<EditToolDetails, typeof replaceEditEntrySchema>> {
+	const {
+		path,
+		signal,
+		batchRequest,
+		allowFuzzy,
+		fuzzyThreshold,
+		writethrough,
+		beginDeferredDiagnosticsForPath,
+		absolutePath,
+		old_text,
+		new_text,
+		all,
+	} = options;
+
 	const rawContent = await readEditFileText(absolutePath, path);
 	const { bom, text: content } = stripBom(rawContent);
 	const originalEnding = detectLineEnding(content);
