@@ -1335,17 +1335,13 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let droppedForcedToolChoice = false;
 			const prepareParams = async (paramsOptions?: {
 				repairLatestAssistantThinking?: boolean;
+				repairAllAssistantThinking?: boolean;
 				dropForcedToolChoice?: boolean;
 			}): Promise<MessageCreateParamsStreaming> => {
-				let nextParams = buildParams(
-					model,
-					baseUrl,
-					context,
-					isOAuthToken,
-					options,
-					disableStrictTools,
-					paramsOptions?.repairLatestAssistantThinking === true,
-				);
+				let nextParams = buildParams(model, baseUrl, context, isOAuthToken, options, disableStrictTools, {
+					repairLatestAssistantThinking: paramsOptions?.repairLatestAssistantThinking === true,
+					repairAllAssistantThinking: paramsOptions?.repairAllAssistantThinking === true,
+				});
 				if (paramsOptions?.dropForcedToolChoice === true) {
 					delete nextParams.tool_choice;
 				}
@@ -1785,18 +1781,24 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						resetOutputForRetry();
 						continue;
 					}
+					const thinkingSignatureInvalid = isAnthropicThinkingSignatureInvalidError(streamFailure);
 					if (
 						!options?.fallbackManaged &&
 						!thinkingRepairAttempted &&
 						firstTokenTime === undefined &&
-						isAnthropicThinkingBlockMutationError(streamFailure)
+						(thinkingSignatureInvalid || isAnthropicThinkingBlockMutationError(streamFailure))
 					) {
-						logger.debug("anthropic: repairing latest assistant thinking replay after provider rejection", {
+						logger.debug("anthropic: repairing assistant thinking replay after provider rejection", {
 							model: model.id,
+							scope: thinkingSignatureInvalid ? "all" : "latest",
 							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
 						});
 						thinkingRepairAttempted = true;
-						params = await prepareParams({ repairLatestAssistantThinking: true });
+						params = await prepareParams(
+							thinkingSignatureInvalid
+								? { repairAllAssistantThinking: true }
+								: { repairLatestAssistantThinking: true },
+						);
 						providerRetryAttempt = 0;
 						resetOutputForRetry();
 						continue;
@@ -2260,13 +2262,13 @@ function buildParams(
 	isOAuthToken: boolean,
 	options?: AnthropicOptions,
 	disableStrictTools = false,
-	repairLatestAssistantThinking = false,
+	thinkingRepair?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
 ): MessageCreateParamsStreaming {
 	const { mode: cacheMode, cacheControl } = getCacheControl(model, baseUrl, options?.cacheRetention);
 
 	const params: AnthropicSamplingParams = {
 		model: model.id,
-		messages: convertAnthropicMessages(context.messages, model, isOAuthToken, { repairLatestAssistantThinking }),
+		messages: convertAnthropicMessages(context.messages, model, isOAuthToken, thinkingRepair),
 		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
 		stream: true,
 	};
