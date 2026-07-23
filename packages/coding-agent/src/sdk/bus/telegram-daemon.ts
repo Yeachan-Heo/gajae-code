@@ -3673,7 +3673,7 @@ export class TelegramNotificationDaemon {
 	 * payload. Remember that ambiguity per endpoint so later frames cannot repeat
 	 * the external side effect. Explicit API failures remain retryable.
 	 */
-	#malformedTopicCreateEndpoints = new Map<string, string>();
+	readonly #malformedTopicCreateEndpoints = new Map<string, string>();
 	/** Serializes registry snapshots so an older atomic write cannot overwrite newer rename state. */
 	/** Legacy sockets have no durable token, so explicit teardown is their revocation fence. */
 	private readonly droppedSessions = new WeakSet<SessionSocket>();
