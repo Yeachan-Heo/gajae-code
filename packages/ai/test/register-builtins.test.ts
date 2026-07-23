@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { setBedrockProviderModule, streamBedrock } from "../src/providers/register-builtins";
+import {
+	resolveLazyStreamFirstEventFallbackMs,
+	setBedrockProviderModule,
+	streamBedrock,
+} from "../src/providers/register-builtins";
 import type { AssistantMessage, Context, Model } from "../src/types";
 import type { AssistantMessageEventStream } from "../src/utils/event-stream";
 
@@ -172,5 +176,10 @@ describe("register-builtins lazy streams", () => {
 		}
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("Request was aborted");
+	});
+	it("uses a five-minute outer first-event fallback for Alibaba Token Plan", () => {
+		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan")).toBe(300_000);
+		expect(resolveLazyStreamFirstEventFallbackMs("openai")).toBeUndefined();
+		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan", 42_000)).toBe(42_000);
 	});
 });

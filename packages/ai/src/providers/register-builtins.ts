@@ -190,6 +190,15 @@ interface LazyStreamLimits {
 const GOOGLE_GEMINI_CLI_LAZY_STREAM_LIMITS: LazyStreamLimits = {
 	defaultFirstEventTimeoutMs: 300_000,
 };
+const ALIBABA_TOKEN_PLAN_LAZY_STREAM_FIRST_EVENT_TIMEOUT_MS = 300_000;
+
+export function resolveLazyStreamFirstEventFallbackMs(
+	provider: string,
+	configuredFallbackMs?: number,
+): number | undefined {
+	if (configuredFallbackMs !== undefined) return configuredFallbackMs;
+	return provider === "alibaba-token-plan" ? ALIBABA_TOKEN_PLAN_LAZY_STREAM_FIRST_EVENT_TIMEOUT_MS : undefined;
+}
 
 function forwardStream<TApi extends Api>(
 	target: EventStreamImpl,
@@ -202,11 +211,14 @@ function forwardStream<TApi extends Api>(
 	(async () => {
 		try {
 			const idleTimeoutMs = options.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(limits?.defaultIdleTimeoutMs);
+			const firstEventFallbackMs = resolveLazyStreamFirstEventFallbackMs(
+				model.provider,
+				limits?.defaultFirstEventTimeoutMs,
+			);
 			const watchedSource = iterateWithIdleTimeout(source, {
 				idleTimeoutMs,
 				firstItemTimeoutMs:
-					options.streamFirstEventTimeoutMs ??
-					getStreamFirstEventTimeoutMs(idleTimeoutMs, limits?.defaultFirstEventTimeoutMs),
+					options.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs),
 				errorMessage: LAZY_STREAM_IDLE_TIMEOUT_ERROR,
 				firstItemErrorMessage: LAZY_STREAM_FIRST_EVENT_TIMEOUT_ERROR,
 				onIdle: () => abortTracker.abortLocally(new Error(LAZY_STREAM_IDLE_TIMEOUT_ERROR)),
