@@ -938,6 +938,172 @@ function notificationRootForCwd(cwd: string): string {
 	return path.join(cwd, ".gjc", "state");
 }
 
+/**
+ * Leak artifact prefixes left when native exact-unlink cleanup is retained
+ * (#2956). Nothing previously reaped these; they accumulate in the notifications
+ * directory across ownership transitions.
+ */
+export const NOTIFICATION_LEAK_ARTIFACT_PREFIXES = [
+	".gjc-delete-daemon-transition-",
+	".gjc-exact-unlink-placeholder-",
+	".gjc-delete-notification-endpoint-",
+] as const;
+
+/** Grace window before a leak artifact is reaped (covers in-flight unlinks). */
+export const NOTIFICATION_LEAK_ARTIFACT_GRACE_MS = 5 * 60_000;
+
+/** True when a path is permanently gone (not a transient I/O blip). */
+export function isPermanentMissingPathError(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return code === "ENOENT" || code === "ENOTDIR";
+}
+
+export function isNotificationLeakArtifactName(name: string): boolean {
+	return NOTIFICATION_LEAK_ARTIFACT_PREFIXES.some(prefix => name.startsWith(prefix));
+}
+
+type NotificationRootsRegistry = {
+	version?: number;
+	roots?: string[];
+	managedRoots?: string[];
+	sessions?: Record<string, string>;
+};
+
+/**
+ * Drop permanently missing scan roots from the durable registry under the roots
+ * lock. Session map entries that pointed only at those roots are removed too.
+ */
+export async function pruneMissingNotificationRoots(input: {
+	settings: Settings;
+	fs?: TelegramDaemonFs;
+	/** When set, only these roots are considered; otherwise every registered root is probed. */
+	candidates?: readonly string[];
+}): Promise<{ pruned: string[]; remaining: number }> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	await ensureDir(fsImpl, paths.dir);
+	const pruned: string[] = [];
+	let remaining = 0;
+	await withFileLock(
+		paths.roots,
+		async () => {
+			const current = (await readJson<NotificationRootsRegistry>(fsImpl, paths.roots)) ?? {};
+			const roots = [...(current.roots ?? [])];
+			const managedRoots = new Set(current.managedRoots ?? []);
+			const sessions = { ...(current.sessions ?? {}) };
+			const candidateSet = input.candidates ? new Set(input.candidates) : undefined;
+			const survivors: string[] = [];
+			for (const root of roots) {
+				if (candidateSet && !candidateSet.has(root)) {
+					survivors.push(root);
+					continue;
+				}
+				const sdkDir = path.join(root, "sdk");
+				try {
+					await fsImpl.readdir(sdkDir);
+					survivors.push(root);
+				} catch (error) {
+					if (!isPermanentMissingPathError(error)) {
+						// Transient unreadable: keep for the next pass.
+						survivors.push(root);
+						continue;
+					}
+					// Also accept a missing sdk dir when the root itself is still a directory
+					// (empty registration) — still permanently useless for scans.
+					try {
+						await fsImpl.readdir(root);
+					} catch (rootError) {
+						if (!isPermanentMissingPathError(rootError)) {
+							survivors.push(root);
+							continue;
+						}
+					}
+					pruned.push(root);
+					managedRoots.delete(root);
+					for (const [sessionId, mapped] of Object.entries(sessions)) {
+						if (mapped === root) delete sessions[sessionId];
+					}
+				}
+			}
+			remaining = survivors.length;
+			if (pruned.length === 0) return;
+			await writeJsonAtomic(fsImpl, paths.roots, {
+				version: 1,
+				roots: Array.from(new Set(survivors)).sort(),
+				managedRoots: Array.from(managedRoots).sort(),
+				sessions,
+			});
+		},
+		{ staleMs: 10_000 },
+	);
+	return { pruned, remaining };
+}
+
+/**
+ * Reap retained exact-unlink / ownership-transition quarantine files older than
+ * the grace window from the notifications directory.
+ */
+export async function reapStaleNotificationArtifacts(input: {
+	settings: Settings;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+	graceMs?: number;
+}): Promise<{ removed: string[]; skipped: number }> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	await ensureDir(fsImpl, paths.dir);
+	const now = input.now?.() ?? Date.now();
+	const graceMs = input.graceMs ?? NOTIFICATION_LEAK_ARTIFACT_GRACE_MS;
+	const removed: string[] = [];
+	let skipped = 0;
+	let names: string[];
+	try {
+		names = await fsImpl.readdir(paths.dir);
+	} catch (error) {
+		if (isPermanentMissingPathError(error)) return { removed, skipped };
+		throw error;
+	}
+	for (const name of names) {
+		if (!isNotificationLeakArtifactName(name)) continue;
+		const file = path.join(paths.dir, name);
+		try {
+			const stat = fsImpl.stat ? await fsImpl.stat(file) : undefined;
+			const age = stat ? now - stat.mtimeMs : Number.POSITIVE_INFINITY;
+			if (Number.isFinite(age) && age < graceMs) {
+				skipped += 1;
+				continue;
+			}
+			await fsImpl.unlink(file);
+			removed.push(file);
+		} catch (error) {
+			if (isPermanentMissingPathError(error)) continue;
+			// Best-effort: a busy file must not fail daemon ownership.
+			skipped += 1;
+		}
+	}
+	return { removed, skipped };
+}
+
+/**
+ * Startup / ownership self-heal: prune dead roots and reap leak artifacts so
+ * `gjc daemon reload` recovers a degraded install without manual surgery (#2956).
+ */
+export async function healTelegramDaemonNotificationState(input: {
+	settings: Settings;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+	graceMs?: number;
+}): Promise<{ prunedRoots: string[]; removedArtifacts: string[] }> {
+	const prune = await pruneMissingNotificationRoots(input);
+	const reap = await reapStaleNotificationArtifacts(input);
+	if (prune.pruned.length > 0 || reap.removed.length > 0) {
+		logger.warn(
+			`notifications: self-heal pruned ${prune.pruned.length} dead root(s), reaped ${reap.removed.length} leak artifact(s)`,
+		);
+	}
+	return { prunedRoots: prune.pruned, removedArtifacts: reap.removed };
+}
+
 function validBotToken(token: unknown): token is string {
 	return typeof token === "string" && token.trim().length > 0;
 }
@@ -4269,13 +4435,20 @@ export class TelegramNotificationDaemon {
 		const paths = daemonPaths(this.opts.settings.getAgentDir());
 		const rootState = await readJson<{ roots?: string[] }>(this.fsImpl, paths.roots);
 		const endpointSessionIds = new Set<string>();
+		// Permanent absences prune; only transient I/O keeps orphan reconciliation
+		// gated (so one deleted worktree cannot disable cleanup forever) (#2956).
 		let allRootsReadable = true;
+		const permanentlyMissingRoots: string[] = [];
 		for (const root of rootState?.roots ?? []) {
 			const dir = path.join(root, "sdk");
 			let files: string[];
 			try {
 				files = await this.fsImpl.readdir(dir);
-			} catch {
+			} catch (error) {
+				if (isPermanentMissingPathError(error)) {
+					permanentlyMissingRoots.push(root);
+					continue;
+				}
 				allRootsReadable = false;
 				continue;
 			}
@@ -4323,6 +4496,27 @@ export class TelegramNotificationDaemon {
 					this.connectSession(sessionId, endpoint.url, endpoint.token);
 				} catch {}
 			}
+		}
+		if (permanentlyMissingRoots.length > 0) {
+			try {
+				await pruneMissingNotificationRoots({
+					settings: this.opts.settings,
+					fs: this.fsImpl,
+					candidates: permanentlyMissingRoots,
+				});
+			} catch (error) {
+				logger.warn(`notifications: dead-root prune failed: ${sanitizeDiagnostic(String(error))}`);
+			}
+		}
+		// Best-effort periodic reap of retained exact-unlink quarantines (#2956).
+		try {
+			await reapStaleNotificationArtifacts({
+				settings: this.opts.settings,
+				fs: this.fsImpl,
+				now: this.opts.now,
+			});
+		} catch (error) {
+			logger.warn(`notifications: leak-artifact reap failed: ${sanitizeDiagnostic(String(error))}`);
 		}
 		if (allRootsReadable) {
 			for (const sessionId of this.topics.sessionIds()) {
@@ -8259,6 +8453,17 @@ export class TelegramNotificationDaemon {
 			ownershipProved = true;
 			this.running = !this.stopRequested;
 			if (!this.running) return;
+			// Self-heal durable notification state before any scan/poll work so
+			// `daemon reload` recovers dead roots + leak artifacts (#2956).
+			try {
+				await healTelegramDaemonNotificationState({
+					settings: this.opts.settings,
+					fs: this.fsImpl,
+					now: this.opts.now,
+				});
+			} catch (error) {
+				logger.warn(`notifications: startup self-heal failed: ${sanitizeDiagnostic(String(error))}`);
+			}
 			// Owner-only: start lifecycle control immediately after ownership proof,
 			// before timers or pre-poll startup work can invalidate this run.
 			// Best-effort; notification delivery remains available on failure.
