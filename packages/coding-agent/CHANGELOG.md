@@ -10,6 +10,9 @@
 ### Added
 
 - Plans and delegated tasks carry an authoritative repository binding (`gjc.repository_binding.v1`). Ultragoal/ralplan stamp identity at creation; task lanes stamp omitted bindings from session cwd **before** agent discovery; ralplan stage writes and handoff re-entry enforce the seed binding; declared paths must stay under the bound root; task receipts include the resolved identity; linked isolation worktrees must match the source repository (#2901).
+### Added
+
+- Ralplan can persist typed review conflicts and dispositions via a fail-closed `disposition` stage (`schema: ralplan.review_conflicts.v1`). Incompatible Architect/Critic actions on the same plan target block a clean join until an explicit disposition with owner and rationale is recorded (#2902).
 
 ### Fixed
 

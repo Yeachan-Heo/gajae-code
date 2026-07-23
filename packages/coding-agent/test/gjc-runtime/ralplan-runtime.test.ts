@@ -488,6 +488,75 @@ describe("native gjc ralplan runtime — --write artifact path", () => {
 		const writePayload = JSON.parse(write.stdout ?? "{}") as { run_id: string };
 		expect(writePayload.run_id).toBe(handoffPayload.run_id);
 	});
+
+	it("disposition stage fails closed on open conflicts and accepts a complete disposition document", async () => {
+		const root = await tempDir();
+		const findings = [
+			{
+				findingId: "arch-1",
+				targetId: "contract.field",
+				action: "remove",
+				severity: "block",
+				evidence: "redundant with session identity",
+				sourceRole: "architect",
+				sourceReceipt: { stage: "architect", stageN: 1, path: "/tmp/a.md", sha256: "a" },
+			},
+			{
+				findingId: "crit-1",
+				targetId: "contract.field",
+				action: "add",
+				severity: "watch",
+				evidence: "needed for multi-repo binding",
+				sourceRole: "critic",
+				sourceReceipt: { stage: "critic", stageN: 1, path: "/tmp/c.md", sha256: "c" },
+			},
+		];
+		const openPath = path.join(root, "open-disposition.json");
+		await fs.writeFile(
+			openPath,
+			JSON.stringify({
+				schema: "ralplan.review_conflicts.v1",
+				plannerStageN: 1,
+				findings,
+				dispositions: [],
+			}),
+		);
+		const open = await runNativeRalplanCommand(
+			["--write", "--stage", "disposition", "--stage_n", "1", "--artifact", openPath],
+			root,
+		);
+		expect(open.status).toBe(2);
+		expect(open.stderr).toContain("Join blocked");
+
+		const closedPath = path.join(root, "closed-disposition.json");
+		await fs.writeFile(
+			closedPath,
+			JSON.stringify({
+				schema: "ralplan.review_conflicts.v1",
+				plannerStageN: 1,
+				findings,
+				dispositions: [
+					{
+						conflictId: "conflict:contract.field:arch-1:crit-1",
+						choice: "accept_architect",
+						rationale: "Field duplicates existing session identity.",
+						decisionOwner: "ralplan-leader",
+						affectedSections: ["## Contracts"],
+					},
+				],
+			}),
+		);
+		const closed = await runNativeRalplanCommand(
+			["--write", "--stage", "disposition", "--stage_n", "1", "--artifact", closedPath, "--json"],
+			root,
+		);
+		expect(closed.status).toBe(0);
+		const payload = JSON.parse(closed.stdout ?? "{}") as { path: string; stage: string };
+		expect(payload.stage).toBe("disposition");
+		const body = await fs.readFile(payload.path, "utf-8");
+		expect(body).toContain("ralplan.review_conflicts.v1");
+		expect(body).toContain("dispositioned");
+	});
 });
 
 describe("native gjc ralplan runtime — run-state phase coherence", () => {

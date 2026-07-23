@@ -92,6 +92,7 @@ const RALPLAN_STAGE_CODES: Record<string, string> = {
 	revision: "R",
 	architect: "A",
 	critic: "C",
+	disposition: "X",
 	adr: "D",
 	"post-interview": "I",
 	final: "F",
