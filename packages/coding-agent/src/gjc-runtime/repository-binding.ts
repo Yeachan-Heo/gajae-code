@@ -7,7 +7,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { head, repo, type GitRepository } from "../utils/git";
+import { type GitRepository, head, repo } from "../utils/git";
 
 export const REPOSITORY_BINDING_SCHEMA = "gjc.repository_binding.v1" as const;
 
@@ -66,9 +66,7 @@ export async function captureRepositoryBinding(
 ): Promise<RepositoryBinding> {
 	const resolvedCwd = await realpathOrResolve(cwd);
 	const repository = await repo.resolve(resolvedCwd);
-	const worktreeRoot = repository
-		? await realpathOrResolve(repository.repoRoot)
-		: resolvedCwd;
+	const worktreeRoot = repository ? await realpathOrResolve(repository.repoRoot) : resolvedCwd;
 	const commonDir = repository ? await realpathOrResolve(repository.commonDir) : null;
 
 	let headSha: string | undefined;
@@ -85,9 +83,7 @@ export async function captureRepositoryBinding(
 		schema: REPOSITORY_BINDING_SCHEMA,
 		worktreeRoot,
 		commonDir,
-		...(options.relativeSubdir
-			? { relativeSubdir: normalizeRelativeSubdir(options.relativeSubdir) }
-			: {}),
+		...(options.relativeSubdir ? { relativeSubdir: normalizeRelativeSubdir(options.relativeSubdir) } : {}),
 		...(options.displayPath ? { displayPath: options.displayPath } : {}),
 		...(headSha ? { head: headSha } : {}),
 		...(branch ? { branch } : {}),
@@ -96,15 +92,15 @@ export async function captureRepositoryBinding(
 }
 
 function normalizeRelativeSubdir(relative: string): string {
-	const normalized = relative.replaceAll("\\", "/").replace(/^\.\/+/u, "").replace(/\/+$/u, "");
+	const normalized = relative
+		.replaceAll("\\", "/")
+		.replace(/^\.\/+/u, "")
+		.replace(/\/+$/u, "");
 	if (normalized === "" || normalized === ".") {
 		throw new RepositoryBindingError("invalid_binding", "relativeSubdir must be a non-empty relative path");
 	}
 	if (path.isAbsolute(normalized) || normalized.split("/").includes("..")) {
-		throw new RepositoryBindingError(
-			"invalid_binding",
-			"relativeSubdir must be repo-relative without '..' segments",
-		);
+		throw new RepositoryBindingError("invalid_binding", "relativeSubdir must be repo-relative without '..' segments");
 	}
 	return normalized;
 }
@@ -129,10 +125,10 @@ export function parseRepositoryBinding(value: unknown): RepositoryBinding {
 	const commonDir =
 		commonDirRaw === null || commonDirRaw === undefined
 			? null
-			: nonEmptyString(commonDirRaw) ??
+			: (nonEmptyString(commonDirRaw) ??
 				(() => {
 					throw new RepositoryBindingError("invalid_binding", "commonDir must be a string or null");
-				})();
+				})());
 	const relativeSubdirRaw = value.relativeSubdir ?? value.relative_subdir;
 	const relativeSubdir =
 		relativeSubdirRaw === undefined ? undefined : normalizeRelativeSubdir(String(relativeSubdirRaw));

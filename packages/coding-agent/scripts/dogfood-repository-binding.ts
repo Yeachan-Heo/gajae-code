@@ -37,7 +37,11 @@ async function initRepo(root: string): Promise<void> {
 	await runGit(root, ["commit", "-m", `init ${path.basename(root)}`]);
 }
 
-async function runCli(cwd: string, args: string[], env: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string; stderr: string }> {
+async function runCli(
+	cwd: string,
+	args: string[],
+	env: NodeJS.ProcessEnv,
+): Promise<{ code: number; stdout: string; stderr: string }> {
 	const proc = Bun.spawn(["bun", cli, ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
 	const [code, stdout, stderr] = await Promise.all([
 		proc.exited,
@@ -64,7 +68,9 @@ async function main(): Promise<void> {
 	console.log(`session=${sessionId}`);
 	console.log(`cli=${cli}`);
 	console.log(`bun=${Bun.version}`);
-	console.log(`commit=${Bun.spawnSync(["git", "-C", repoRoot, "rev-parse", "--short", "HEAD"]).stdout.toString().trim()}`);
+	console.log(
+		`commit=${Bun.spawnSync(["git", "-C", repoRoot, "rev-parse", "--short", "HEAD"]).stdout.toString().trim()}`,
+	);
 	console.log();
 
 	// 1) Product CLI: create goals stamps binding

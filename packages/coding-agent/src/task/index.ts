@@ -133,10 +133,7 @@ function addUsageTotals(target: Usage, usage: Partial<Usage>): void {
 	target.cost.total += cost.total;
 }
 
-async function validateTaskRepositoryBindings(
-	cwd: string,
-	tasks: readonly TaskItem[],
-): Promise<string | undefined> {
+async function validateTaskRepositoryBindings(cwd: string, tasks: readonly TaskItem[]): Promise<string | undefined> {
 	for (const task of tasks) {
 		if (!task.repositoryBinding) continue;
 		try {
