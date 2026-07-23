@@ -94,6 +94,7 @@ export const NOTIFICATIONS_SETTINGS_SHOWCASE_TARGETED_UNICODE_VARIANTS: readonly
 ];
 
 export type NotificationsSettingsShowcaseRenderMode = "unicode-color" | "ascii-no-color";
+export type NotificationsSettingsShowcaseTheme = "red-claw" | "red-claw-light" | "blue-crab-light";
 
 export interface NotificationsSettingsShowcaseCopy {
 	english: string;
@@ -1051,13 +1052,16 @@ async function navigateToState(
 	}
 }
 
-async function configureDeterministicTheme(renderMode: NotificationsSettingsShowcaseRenderMode): Promise<() => void> {
+async function configureDeterministicTheme(
+	renderMode: NotificationsSettingsShowcaseRenderMode,
+	themeName: NotificationsSettingsShowcaseTheme = "red-claw",
+): Promise<() => void> {
 	const originalColorTerm = Bun.env.COLORTERM;
 	const originalChalkLevel = chalk.level;
 	Bun.env.COLORTERM = "truecolor";
 	chalk.level = 3;
 	try {
-		await initTheme(false, renderMode === "ascii-no-color" ? "ascii" : "unicode", false, "red-claw", "red-claw");
+		await initTheme(false, renderMode === "ascii-no-color" ? "ascii" : "unicode", false, themeName, themeName);
 	} catch (error) {
 		chalk.level = originalChalkLevel;
 		throw error;
@@ -1076,12 +1080,38 @@ function renderTerminalSurface(
 	stateId: NotificationsSettingsShowcaseStateId,
 ): string {
 	const lines = component.render(viewport.columns);
-	const tabLines = component.children[1]?.render(viewport.columns).length ?? 0;
-	const contentStart = 1 + tabLines + 1;
-	const minimumFrameRows = contentStart + 14 + 1;
-	const paddingBeforeClosingBorder = Math.max(0, minimumFrameRows - lines.length);
-	if (paddingBeforeClosingBorder > 0) {
-		lines.splice(Math.max(0, lines.length - 1), 0, ...Array.from({ length: paddingBeforeClosingBorder }, () => ""));
+	if (lines.length === 0) {
+		throw new Error(`Notifications selector ${stateId} produced an empty live production render`);
+	}
+
+	// Live production frame is top border + tab bar + spacer + content + bottom border.
+	// Capture the component-produced frame only. Fail closed on missing structure; never
+	// splice synthetic blanks ahead of the closing border to invent a taller frame.
+	const topBorder = lines[0] ?? "";
+	if (!topBorder) {
+		throw new Error(`Notifications selector ${stateId} missing top border row`);
+	}
+	let tabEnd = 1;
+	while (tabEnd < lines.length && (lines[tabEnd] ?? "") !== "") tabEnd += 1;
+	const tabLineCount = tabEnd - 1;
+	if (tabLineCount <= 0) {
+		throw new Error(`Notifications selector ${stateId} missing settings tab bar rows`);
+	}
+	if (tabEnd >= lines.length || (lines[tabEnd] ?? "") !== "") {
+		throw new Error(`Notifications selector ${stateId} missing spacer after tab bar`);
+	}
+
+	let bottomBorderIndex = lines.length - 1;
+	while (bottomBorderIndex > tabEnd && (lines[bottomBorderIndex] ?? "") === "") bottomBorderIndex -= 1;
+	if (bottomBorderIndex <= tabEnd) {
+		throw new Error(`Notifications selector ${stateId} missing closing border from live production render`);
+	}
+	const contentStart = tabEnd + 1;
+	const contentRows = bottomBorderIndex - contentStart;
+	if (contentRows <= 0) {
+		throw new Error(
+			`Notifications selector ${stateId} live frame has no content rows between tab spacer and closing border`,
+		);
 	}
 	if (lines.length > viewport.rows) {
 		throw new Error(`Notifications selector ${stateId} exceeds ${viewport.id}: rendered ${lines.length} rows`);
@@ -1092,18 +1122,20 @@ function renderTerminalSurface(
 
 export async function renderNotificationsSettingsShowcase(
 	entry: NotificationsSettingsShowcaseEntry,
+	themeName: NotificationsSettingsShowcaseTheme = "red-claw",
+	options: { selectedActionIndex?: number } = {},
 ): Promise<NotificationsSettingsShowcaseRender> {
 	showcaseState(entry.stateId);
-	const restoreChalk = await configureDeterministicTheme(entry.renderMode);
+	await Settings.init({ inMemory: true });
+	const restoreChalk = await configureDeterministicTheme(entry.renderMode, themeName);
 	let component: SettingsSelectorComponent | undefined;
 	try {
-		await Settings.init({ inMemory: true });
 		const operations = new DeterministicNotificationsEditorOperations(entry.stateId, SHOWCASE_CLOCK);
 		component = new SettingsSelectorComponent(
 			{
 				availableThinkingLevels: [],
 				thinkingLevel: undefined,
-				availableThemes: ["red-claw"],
+				availableThemes: [themeName],
 				availableModelProfiles: [],
 				cwd: "/showcase",
 			},
@@ -1111,8 +1143,21 @@ export async function renderNotificationsSettingsShowcase(
 			operations,
 		);
 		selectNotifications(component);
+		if (component.activeTabId !== "notifications") {
+			throw new Error(`Notifications showcase selected unexpected tab: ${component.activeTabId}`);
+		}
 		await settleEditor();
 		const navigation = await navigateToState(component, entry.stateId);
+		if (options.selectedActionIndex !== undefined) {
+			if (
+				!Number.isInteger(options.selectedActionIndex) ||
+				options.selectedActionIndex < 0 ||
+				options.selectedActionIndex > 10
+			) {
+				throw new Error(`Invalid Notifications home action index: ${options.selectedActionIndex}`);
+			}
+			selectAction(component, options.selectedActionIndex);
+		}
 		const rendered = renderTerminalSurface(component, entry.viewport, entry.stateId);
 		const terminalAnsiText = entry.renderMode === "ascii-no-color" ? Bun.stripANSI(rendered) : rendered;
 		return {

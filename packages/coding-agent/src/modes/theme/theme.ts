@@ -1782,7 +1782,7 @@ var themeReloadTimer: NodeJS.Timeout | undefined;
 var sigwinchHandler: (() => void) | undefined;
 var autoDetectedTheme: boolean = false;
 var autoDarkTheme: string = "red-claw";
-var autoLightTheme: string = "blue-crab";
+var autoLightTheme: string = "blue-crab-light";
 var onThemeChangeCallback: (() => void) | undefined;
 var themeLoadRequestId: number = 0;
 var previewThemeActive: boolean = false;
@@ -1803,7 +1803,7 @@ export async function initTheme(
 ): Promise<void> {
 	autoDetectedTheme = true;
 	autoDarkTheme = darkTheme ?? "red-claw";
-	autoLightTheme = lightTheme ?? "blue-crab";
+	autoLightTheme = lightTheme ?? "blue-crab-light";
 	const name = getDefaultTheme();
 	previewThemeActive = false;
 	currentThemeName = name;

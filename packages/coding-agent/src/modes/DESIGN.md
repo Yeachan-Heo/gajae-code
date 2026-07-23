@@ -412,3 +412,315 @@ differently named bundles, and a stored `uri#ref` differs from a bare `uri`, so
 locator-based refusal would refuse installs that should proceed. Refusing on a
 guess is worse than reporting the real failure, so identity must be readable for
 refusal to apply.
+
+## Light-theme compliance contract
+
+This section is the first-party contract for `red-claw-light` and
+`blue-crab-light`. It strengthens, but does not replace, the Notifications
+contract above. The compliance fixture must request one of those two names
+through a closed typed union and must call the named production components.
+It must not draw a parallel settings list, transcript, diff, markdown,
+syntax, status line, or overflow facsimile.
+
+### Actual consumer and contrast inventory
+
+`pageBg` below means the selected theme's export page background. `default`
+means the terminal's declared light background, which the fixture fixes to
+`pageBg`. Text pairings require WCAG contrast of at least **4.5:1**.
+Structural/non-text pairings require at least **3:1**. IDs are stable test
+contract values; a consumer addition or role change must update this table
+and the test-side expected set together.
+
+| ID | Production consumer and state | Foreground role | Background role | Class | Minimum | Evidence scene |
+| --- | --- | --- | --- | --- | --- | --- |
+| `settings-border` | `DynamicBorder.render` frame rule | `border` | `pageBg` | structural | 3:1 | `normal-default` |
+| `settings-tab-label` | `getTabBarTheme().label` | `accent` | `pageBg` | text | 4.5:1 | `normal-default` |
+| `settings-tab-active` | `getTabBarTheme().active` | `text` | `selectedBg` | text | 4.5:1 | `selected-focus-active` |
+| `settings-tab-selected-fill` | active tab fill | `selectedBg` | `pageBg` | structural | 3:1 | `selected-focus-active` |
+| `settings-tab-inactive` | `getTabBarTheme().inactive` | `muted` | `pageBg` | text | 4.5:1 | `normal-default` |
+| `settings-tab-hint` | `getTabBarTheme().hint` | `dim` | `pageBg` | text | 4.5:1 | `normal-default` |
+| `settings-list-selected-label` | `getSettingsListTheme().label(true)` | `accent` | `pageBg` | text | 4.5:1 | `selected-focus-active` |
+| `settings-list-selected-value` | `getSettingsListTheme().value(true)` | `accent` | `pageBg` | text | 4.5:1 | `selected-focus-active` |
+| `settings-list-value` | `getSettingsListTheme().value(false)` | `muted` | `pageBg` | text | 4.5:1 | `normal-default` |
+| `settings-list-description` | `getSettingsListTheme().description` | `dim` | `pageBg` | text | 4.5:1 | `normal-default` |
+| `settings-list-cursor` | `getSettingsListTheme().cursor` | `accent` | `pageBg` | text | 4.5:1 | `selected-focus-active` |
+| `settings-list-hint` | `getSettingsListTheme().hint` | `dim` | `pageBg` | text | 4.5:1 | `normal-default` |
+| `select-list-selected` | `getSelectListTheme` selected prefix/text | `accent` | `pageBg` | text | 4.5:1 | `selected-focus-active` |
+| `select-list-secondary` | description, scroll position, no-match | `muted` | `pageBg` | text | 4.5:1 | `empty` |
+| `submenu-title` | settings submenu title | `accent` | `pageBg` | text | 4.5:1 | `expanded` |
+| `submenu-secondary` | submenu description/preview | `muted` | `pageBg` | text | 4.5:1 | `expanded` |
+| `submenu-unavailable` | unavailable preview fallback | `dim` | `pageBg` | text | 4.5:1 | `disabled` |
+| `provider-title` | `ProviderOnboardingSelector` bold title | `text` | `pageBg` | text | 4.5:1 | `normal-default` |
+| `provider-selected` | onboarding selected option/cursor | `accent` | `pageBg` | text | 4.5:1 | `selected-focus-active` |
+| `provider-secondary` | onboarding subtitle/option description | `muted` | `pageBg` | text | 4.5:1 | `normal-default` |
+| `assistant-header` | `AssistantMessageComponent` header | `statusLineModel` | `pageBg` | text | 4.5:1 | `status` |
+| `assistant-thinking` | thinking markdown and label | `thinkingText` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `assistant-error` | abort/error line | `error` | `pageBg` | text | 4.5:1 | `error` |
+| `assistant-usage` | token-usage line | `dim` | `pageBg` | text | 4.5:1 | `status` |
+| `tool-pending-title` | `ToolExecutionComponent` pending title | `toolTitle` | `toolPendingBg` | text | 4.5:1 | `pending-loading` |
+| `tool-pending-output` | pending output/args | `toolOutput` | `toolPendingBg` | text | 4.5:1 | `pending-loading` |
+| `tool-success-title` | completed tool title | `toolTitle` | `toolSuccessBg` | text | 4.5:1 | `success` |
+| `tool-success-output` | completed tool output | `toolOutput` | `toolSuccessBg` | text | 4.5:1 | `success` |
+| `tool-error-title` | failed tool title | `toolTitle` | `toolErrorBg` | text | 4.5:1 | `error` |
+| `tool-error-output` | failed tool output | `toolOutput` | `toolErrorBg` | text | 4.5:1 | `error` |
+| `diff-added` | `renderDiff` added line | `toolDiffAdded` | `toolSuccessBg` | text | 4.5:1 | `diff` |
+| `diff-removed` | `renderDiff` removed line | `toolDiffRemoved` | `toolErrorBg` | text | 4.5:1 | `diff` |
+| `diff-context` | `renderDiff` context line | `toolDiffContext` | `pageBg` | text | 4.5:1 | `diff` |
+| `markdown-heading` | production Markdown heading | `mdHeading` | `pageBg` | text | 4.5:1 | `markdown` |
+| `markdown-link` | production Markdown link | `mdLink` | `pageBg` | text | 4.5:1 | `markdown` |
+| `markdown-link-url` | production Markdown URL | `mdLinkUrl` | `pageBg` | text | 4.5:1 | `markdown` |
+| `markdown-code` | inline code | `mdCode` | `pageBg` | text | 4.5:1 | `markdown` |
+| `markdown-code-block` | fenced code text | `mdCodeBlock` | `pageBg` | text | 4.5:1 | `markdown` |
+| `markdown-code-border` | fenced code border | `mdCodeBlockBorder` | `pageBg` | structural | 3:1 | `markdown` |
+| `markdown-quote` | quote text | `mdQuote` | `pageBg` | text | 4.5:1 | `markdown` |
+| `markdown-quote-border` | quote border | `mdQuoteBorder` | `pageBg` | structural | 3:1 | `markdown` |
+| `markdown-rule` | horizontal rule | `mdHr` | `pageBg` | structural | 3:1 | `markdown` |
+| `markdown-bullet` | list bullet | `mdListBullet` | `pageBg` | text | 4.5:1 | `markdown` |
+| `syntax-comment` | highlighted comment | `syntaxComment` | `pageBg` | text | 4.5:1 | `syntax` |
+| `syntax-keyword` | highlighted keyword | `syntaxKeyword` | `pageBg` | text | 4.5:1 | `syntax` |
+| `syntax-function` | highlighted function | `syntaxFunction` | `pageBg` | text | 4.5:1 | `syntax` |
+| `syntax-variable` | highlighted variable | `syntaxVariable` | `pageBg` | text | 4.5:1 | `syntax` |
+| `syntax-string` | highlighted string | `syntaxString` | `pageBg` | text | 4.5:1 | `syntax` |
+| `syntax-number` | highlighted number | `syntaxNumber` | `pageBg` | text | 4.5:1 | `syntax` |
+| `syntax-type` | highlighted type | `syntaxType` | `pageBg` | text | 4.5:1 | `syntax` |
+| `syntax-operator` | highlighted operator | `syntaxOperator` | `pageBg` | text | 4.5:1 | `syntax` |
+| `syntax-punctuation` | highlighted punctuation | `syntaxPunctuation` | `pageBg` | text | 4.5:1 | `syntax` |
+| `status-group` | `StatusLineComponent` group text | `text` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-separator` | status group separator | `statusLineSep` | `userMessageBg` | structural | 3:1 | `status` |
+| `status-model` | model segment | `statusLineModel` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-path` | path segment | `statusLinePath` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-clean` | clean/staged segment | `statusLineGitClean` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-dirty` | dirty/spend segment | `statusLineGitDirty` | `userMessageBg` | text | 4.5:1 | `warning` |
+| `status-context` | healthy context segment | `statusLineContext` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-output` | output/rate segment | `statusLineOutput` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-cost` | cost segment | `statusLineCost` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-subagents` | subagent/jobs segment | `statusLineSubagents` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-success` | status-line success state | `success` | `pageBg` | text | 4.5:1 | `success` |
+| `status-warning` | status-line warning state | `warning` | `pageBg` | text | 4.5:1 | `warning` |
+| `status-error` | status-line error/aborted state | `error` | `pageBg` | text | 4.5:1 | `error` |
+| `status-pending` | pending status icon/description | `muted` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `status-running` | running status icon/title | `accent` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `chrome-border-accent` | tree/compaction and high-attention chrome | `borderAccent` | `pageBg` | text | 4.5:1 | `status` |
+| `chrome-border-muted` | welcome pills/decorative rails | `borderMuted` | `pageBg` | structural | 3:1 | `normal-default` |
+| `user-message-text` | `UserMessageComponent` text | `userMessageText` | `userMessageBg` | text | 4.5:1 | `normal-default` |
+| `custom-message-label` | custom/skill/hook/summary labels | `customMessageLabel` | `customMessageBg` | text | 4.5:1 | `expanded` |
+| `custom-message-text` | custom/skill/hook/summary content | `customMessageText` | `customMessageBg` | text | 4.5:1 | `expanded` |
+| `thinking-off` | `Theme.getThinkingBorderColor` off level | `thinkingOff` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `thinking-minimal` | `Theme.getThinkingBorderColor` minimal level | `thinkingMinimal` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `thinking-low` | `Theme.getThinkingBorderColor` low level | `thinkingLow` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `thinking-medium` | `Theme.getThinkingBorderColor` medium level | `thinkingMedium` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `thinking-high` | `Theme.getThinkingBorderColor` high level | `thinkingHigh` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `thinking-xhigh` | `Theme.getThinkingBorderColor` xhigh level | `thinkingXhigh` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `bash-mode` | shell label/execution frame | `bashMode` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `python-mode` | eval execution frame | `pythonMode` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `status-spend` | input/total/usage segments | `statusLineSpend` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-staged` | staged git marker | `statusLineStaged` | `userMessageBg` | text | 4.5:1 | `status` |
+| `status-unstaged` | unstaged git marker | `statusLineDirty` | `userMessageBg` | text | 4.5:1 | `warning` |
+| `status-untracked` | untracked git marker | `statusLineUntracked` | `userMessageBg` | text | 4.5:1 | `warning` |
+
+Background-only roles are proven by the foreground rows that name them in the
+Background role column; they do not require synthetic self-pairing rows.
+`statusLineBg` is an intentionally unpainted compatibility/schema token:
+`StatusLineComponent` deliberately uses `userMessageBg` instead
+(`tool-status-header.ts:773-779`).
+
+`tools-markdown.ts` produces unstyled Markdown source and is therefore not a
+theme consumer. `settings-defs.ts` defines data and conditions but does not
+paint a role. These exclusions are explicit, not omitted coverage.
+
+The complete sentinel covers every sorted token from `THEME_COLOR_KEYS` and the
+resolved `background` (`pageBg`), while the now-84-row table covers every actual
+in-scope foreground/structural consumer. Tests must reject a missing, extra,
+duplicate, unresolved, or undocumented consumer/pairing. Semantic colors
+`accent`, `success`, `warning`, `error`,
+and `toolDiffRemoved` must remain pairwise distinct. Theme JSON may be
+changed only when a failing documented pairing proves the token is the
+source defect; a shared resolver or dark-theme change requires architecture
+review.
+
+### States, non-color cues, and responsive behavior
+
+The actual showcase covers default, selected/focused/active, disabled,
+pending/loading, empty, success, warning, error, confirmation, expanded,
+collapsed, permission failure, and connection failure. Hover is N/A for a
+terminal. Loading is N/A for the settings/theme selectors themselves because
+their asynchronous theme list resolves before mount; the production
+`ToolExecutionComponent` supplies pending/loading evidence. Sticky content is
+N/A for those selectors; their production behavior is `maxVisible` windowing.
+
+Meaning must survive color removal: selection uses `❯` or `>` plus position
+and active-tab text; pending/running names the operation; success, warning,
+error, permission failure, and connection failure use symbols plus prose;
+confirmation presents explicit action labels; disabled work names the reason;
+expanded/collapsed states retain disclosure text; focus retains the cursor.
+The six ASCII/no-color scenes are the required proof, not a waiver for other
+states.
+
+Canonical viewports are 80x24, 120x36, and 160x48. At 80 columns the selected
+action, one-line status, and navigation hint remain simultaneously visible.
+At all widths use ANSI-aware cell width and grapheme spans. JavaScript string
+length is not a layout oracle. The linked `overflow-top`,
+`overflow-middle`, and `overflow-bottom` scenes drive one production
+`SettingsList`/`SelectList` corpus through its real `maxVisible` window.
+For every theme and canonical viewport metadata records `item_count`,
+`selected_index`, `window_start`, `window_end`, `visible_item_ids`,
+`scroll_position`, `sticky_top_row_ids`, and `sticky_bottom_row_ids`. The
+triplet proves first/interior/final boundaries and identical opening
+frame/header and closing hint/border signatures; metadata-only assertions are
+insufficient.
+
+Korean, Japanese, Chinese, and mixed CJK/Latin content must preserve grapheme
+clusters and semantic units. Phrase/action/status boundaries, masked-secret
+markers, and short code/config identifiers may not split. Each language has
+eight Unicode captures: two themes at 80x24, 120x36, 160x48, and 48x36. Any
+bad semantic break blocks completion.
+
+### Light showcase matrix and theme identity
+
+The Unicode baseline scene IDs are exactly:
+
+`normal-default`, `selected-focus-active`, `disabled`, `pending-loading`,
+`empty`, `success`, `warning`, `error`, `confirmation`, `expanded`,
+`collapsed`, `permission-failure`, `connection-failure`, `diff`, `markdown`,
+`syntax`, `status`, `overflow-top`, `overflow-middle`, `overflow-bottom`,
+`wrap-korean`, `wrap-japanese`, `wrap-chinese`, and
+`wrap-mixed-cjk-latin`.
+
+Cross 24 scenes with two themes and three canonical viewports for 144 entries.
+Add `ascii-no-color` at 80x24 for `selected-focus-active`,
+`pending-loading`, `warning`, `error`, `confirmation`, and `status` for each
+theme (12). Add `unicode-color` at 48x36 for the four wrapping scenes for each
+theme (8). The exact total is **164 entries**. The key is
+`{theme}/{scene}/{viewport}/{render_mode}`.
+
+Every entry contains exactly `terminal.txt`, `terminal-ansi.txt`,
+`terminal.html`, `metadata.json`, and `terminal.png`, producing exactly
+**820 hashed entry leaves**. Root `manifest.json`,
+`capture-environment.json`, `review-input.json`, `run-receipt.json`, and the
+later `independent-review.json` are control artifacts and are not included in
+820.
+
+Before rendering, the fixture requires
+`requested_theme === resolved_theme === manifest_key_theme`. There is no
+fallback. The normalized complete role map and its SHA-256 sentinel are
+repeated in metadata, the HTML theme declaration, the SVG display list, PNG
+sentinel samples, and the manifest. Unknown names, duplicate theme sentinel
+hashes, or any requested/resolved/key/role/sentinel mismatch fail before a
+complete entry is written.
+
+### PNG, fonts, and capture environment
+
+The evidence helper parses ANSI once into a canonical cell grid. Plain text,
+HTML, and a transient SVG are serializers of that grid. The SVG is
+rasterized in-process by the exact direct development dependency
+`@resvg/resvg-js@2.6.2`; it is not retained as a sixth artifact. Browser,
+remote, platform screenshot, capture-only CSS layout, and a second terminal
+renderer are forbidden.
+
+Cell geometry is fixed to `cell_width_px = 10`, `cell_height_px = 20`,
+`baseline_px = 15`, `horizontal_padding_px = 16` per side,
+`vertical_padding_px = 16` per side, and `device_pixel_ratio = 1`. PNG
+dimensions are `(columns * 10 + 32) × (rows * 20 + 32)`. Graphemes are placed
+by cell coordinate and wcwidth span.
+
+No font bytes are vendored. Canonical Darwin capture resolves, in order:
+
+| Script | Requested/POST name | System path | Version | File SHA-256 |
+| --- | --- | --- | --- | --- |
+| Latin/terminal | Menlo Regular / `Menlo-Regular` | `/System/Library/Fonts/Menlo.ttc` | 132907 | `dc256e0b39c2a6fec947129d421fef41b8b429f58f9b6e5d1b148c87f775c1f6` |
+| Korean | Apple SD Gothic Neo Regular / `AppleSDGothicNeo-Regular` | `/System/Library/Fonts/AppleSDGothicNeo.ttc` | 65536 | `e33989af92c53dd2b80efd88f50c404094a046658d0e7a7692619587570e616c` |
+| Japanese | Hiragino Sans W3 / `HiraginoSans-W3` | `/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc` | 541327 | `833776a6fd68e2c71c0c52fd8041195bd3d0a336cdb278170b7ad71c7e1b3475` |
+| Simplified Chinese | PingFang SC Regular / `PingFangSC-Regular` | `/System/Library/AssetsV2/com_apple_MobileAsset_Font8/86ba2c91f017a3749571a82f2c6d890ac7ffb2fb.asset/AssetData/PingFang.ttc` | 327680 | `9ff3ce9439fe285cdabb46f9ceb46b1ac58f1ca07e6f4a764e8286db621a0af9` |
+
+Each font record includes requested/resolved family and PostScript name,
+system path, version, file hash, covered script, and `source: system`. A
+missing/substituted canonical face fails canonical capture. Documented local
+fallbacks may produce non-canonical evidence but may not claim byte
+determinism.
+
+`capture-environment.json` records OS/version/build, architecture, exact Bun
+version, lockfile hash, Resvg package/native hashes, helper/ANSI-parser/cell
+width/SVG serializer versions, locale, `TZ=UTC`, font records, geometry, DPR,
+and color profile. Its canonical-field SHA-256 is the environment ID. Two
+clean captures may claim byte determinism only with identical source,
+inputs, command, and environment ID; all deterministic leaves, PNG bytes,
+and decoded RGBA hashes must match. Run time, elapsed time, and output path
+are isolated in `run-receipt.json`.
+
+`manifest.json` also records the exact path/hash/byte-length records from
+`LIGHT_THEME_EVIDENCE_SOURCE_PATHS`, plus their aggregate source fingerprint and
+Git/worktree revision. Evidence validation recomputes that set from the current
+worktree; any contract, theme, production renderer, dependency lock, fixture,
+capture-helper, capture-script, or validator change makes the capture stale.
+
+Across different environments, acceptance uses identical matrix, replayed
+cell-grid hash, text, ANSI semantics, grapheme spans, role-per-cell and
+occupancy maps, sticky/window metadata, valid PNG dimensions/RGBA, theme
+sentinel samples, and human semantic review. PNG format/dimensions alone are
+not evidence.
+
+### Notifications byte-equivalence gate
+
+The frozen pre-refactor baseline is
+`.gjc/qa/gjc-light-theme-compliance/notifications-baseline`, manifest
+SHA-256
+`a6bcbad31ec45f68f37f8dd354a64f189c9764e77ee5f24a4fad73e27ec75acb`.
+The canonical command remains the command above and remains default
+red-claw. It must produce exactly 108 keys and 432 entry leaves, four files
+per entry, with no PNG. Every paired entry byte and the manifest
+key/file/SHA-256/byte-length map must match the baseline. State IDs, localized
+copy, viewport/render-mode extras, fixture timestamp, and review-input counts
+must match. Only external receipt revision/time/elapsed/output-path fields may
+differ. There is no theme-aware or structural-diff exception.
+
+### Independent review schema version 1
+
+`independent-review.json` rejects unknown top-level fields except optional
+string `notes`. It requires:
+
+- literal `schema_version: 1`, `decision: "pass"`, and a UTC `reviewed_at`
+  after capture and before any later source/output change;
+- non-empty reviewer `id`, `role`, and `affiliation`;
+- independence arrays for implementation and capture author IDs, false
+  `reviewer_authored_implementation` and `reviewer_authored_capture`, a
+  non-empty basis, and no reviewer ID in either author array;
+- manifest relative path, lowercase SHA-256, source revision, environment ID,
+  expected/observed entry counts 164, and expected/observed leaf counts 820;
+- exactly 164 unique `reviewed_entry_keys`, set-equal to the manifest;
+- passing plain, ANSI, HTML, metadata, PNG, and integrity format results;
+- exact theme keys `red-claw-light` and `blue-crab-light`, 82 reviewed entries
+  each, with passing requested/resolved/sentinel and contrast/cue results;
+- exact language keys Korean, Japanese, Chinese, and mixed CJK/Latin, each
+  listing its exact eight Unicode keys and passing grapheme/semantic results;
+- exact overflow top/middle/bottom sets of six canonical keys each;
+- one `sticky_virtualized` result naming the production import and
+  `maxVisible-windowed` mechanism, listing all 18 linked keys, with passing
+  sticky-row, boundary, and metadata results;
+- the exact 12 no-color keys and a passing cue result;
+- findings with stable ID, severity
+  `blocker|high|medium|low|note`, entry keys, description, and disposition;
+  pass requires no unresolved finding and `blocker_count: 0`; and
+- a non-empty attestation that the reviewer recomputed integrity, inspected
+  all 164 entries rather than sampling, checked this DESIGN contract and
+  acceptance criteria, and authored neither implementation nor capture.
+
+A missing/excess key, count-only claim, stale binding, reviewer overlap,
+unresolved finding, or schema mismatch fails closed. Any later source,
+deterministic leaf, manifest, environment, or review-input change invalidates
+the receipt and requires full recapture and independent re-review.
+
+### Decision record and provenance
+
+Decision: keep the canonical Notifications evidence byte-stable and add a
+dedicated production-renderer-backed light-theme fixture with a shared
+ANSI-cell-grid evidence helper, exact local Resvg rasterization, the 164/820
+matrix, and exhaustive independent review. Theme tests alone, repurposing
+Notifications, browser screenshots, vendored fonts, cross-machine PNG byte
+goldens, representative pairing samples, and sampled review are rejected.
+
+Consequences: the coding-agent package owns one exact rasterizer development
+dependency; generated evidence stays under `.gjc/qa` and is not committed;
+canonical Darwin captures depend on the recorded installed fonts; theme or
+consumer fixes require a failing inventory row; and every post-review change
+forces recapture/re-review. No third-party corpus, screenshot, font, brand
+guide, prompt pack, or raw reference asset is copied into source control.

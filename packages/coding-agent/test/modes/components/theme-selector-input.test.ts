@@ -126,7 +126,7 @@ describe("ThemeSelectorComponent input handling", () => {
 		selector.getSelectList().handleInput("\x1b[B");
 		selector.getSelectList().handleInput("\n");
 
-		expect(settings.get("theme.dark")).toBe("blue-crab");
+		expect(settings.get("theme.dark")).toBe("red-claw-light");
 		expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(ctx.editor);
 		expect(ctx.statusLine.invalidate).toHaveBeenCalled();
 		expect(ctx.updateEditorTopBorder).toHaveBeenCalled();
