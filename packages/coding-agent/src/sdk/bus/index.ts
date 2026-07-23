@@ -951,6 +951,12 @@ interface SessionRuntime {
 	turnClosed?: boolean;
 	/** Finalized while provisional policy was held; flush exactly once on stable activation. */
 	pendingFinal?: { text?: string; messageRef?: string };
+	/**
+	 * Lean-mode deferred final answer: latest assistant text observed at `turn_end`,
+	 * emitted once at `agent_end` so intermediate tool-turn narration does not flood
+	 * remote clients. Cleared after flush or when replaced by a newer turn.
+	 */
+	pendingSettled?: { text: string; messageRef?: string };
 	/** Durable gates emitted while ownership is provisional; presented only after stable activation. */
 	deferredGatePresentations: Array<() => void>;
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
@@ -4597,20 +4603,43 @@ export function createNotificationsExtension(
 		if (!pending) return;
 		rt.pendingFinal = undefined;
 		if (pending.text && rt.notificationsActive && !rt.redact) {
-			try {
-				pushSessionFrame(rt, {
-					type: "turn_stream",
-					sessionId: id,
-					phase: "finalized",
-					finalAnswer: true,
+			// Under lean, hold intermediate finals until agent_end when the agent is still
+			// running so provisional-policy activation cannot reintroduce per-turn spam.
+			if (rt.verbosity === "lean" && rt.busy) {
+				rt.pendingSettled = {
 					text: pending.text,
 					...(pending.messageRef ? { messageRef: pending.messageRef } : {}),
-				});
-			} catch (error) {
-				logger.warn(`notifications: pushFrame (pending turn) failed: ${String(error)}`);
+				};
+			} else {
+				try {
+					pushSessionFrame(rt, {
+						type: "turn_stream",
+						sessionId: id,
+						phase: "finalized",
+						finalAnswer: true,
+						text: pending.text,
+						...(pending.messageRef ? { messageRef: pending.messageRef } : {}),
+					});
+				} catch (error) {
+					logger.warn(`notifications: pushFrame (pending turn) failed: ${String(error)}`);
+				}
 			}
 		}
 		resetTurnStreamState(rt);
+	};
+
+	/** Emit the deferred lean settled answer exactly once (agent_end / idle). */
+	const flushPendingSettled = (rt: SessionRuntime, id: string): void => {
+		const settled = rt.pendingSettled;
+		rt.pendingSettled = undefined;
+		if (!settled?.text || !rt.notificationsActive || rt.redact || rt.policySuspended) return;
+		const previousLiveRef = rt.liveRef;
+		if (settled.messageRef) rt.liveRef = settled.messageRef;
+		try {
+			flushTurnText(rt, id, settled.text, true);
+		} finally {
+			if (!settled.messageRef) rt.liveRef = previousLiveRef;
+		}
 	};
 
 	// Drive the live typing indicator: mark busy when the agent loop starts so
@@ -4714,9 +4743,14 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: noteIdle failed: ${String(e)}`);
 		}
 
+		// Lean: emit the latest deferred assistant answer exactly once at idle.
+		// Intermediate tool-turn narration was held on turn_end; ask lead-ins were
+		// already flushed immediately and deduped via preAskFlushedText.
+		flushPendingSettled(rt, id);
+
 		// On idle, stream a context update with metadata (token/model usage +
-		// working-tree diff) unless redaction is on. The agent's last message is
-		// NOT repeated here — it is already streamed once via `turn_stream`.
+		// working-tree diff) unless redaction is on. Under verbose the agent's last
+		// message is already streamed per turn_end; lean flushes it just above.
 		if (!rt.redact && rt.verbosity === "verbose") {
 			const usage = (
 				ctx as { getContextUsage?: () => { tokens: number | null; contextWindow: number } | undefined }
@@ -4745,12 +4779,12 @@ export function createNotificationsExtension(
 		}
 	});
 
-	// Stream viable agent output per turn (the live thread mirror). Unlike idle,
-	// turn output is expected to be multiple messages — one per turn that
-	// produced assistant text. Tool-only turns yield no text and are skipped.
-	// Redaction suppresses streamed content (only the one-time identity header
-	// survives redaction). The daemon coalesces/throttles these via its shared
-	// rate-limit pool before sending to Telegram.
+	// Stream viable agent output. Verbose mirrors each turn that produced assistant
+	// text. Lean defers the latest answer until agent_end (idle) so tool-heavy runs
+	// do not flood remote clients with intermediate narration; ask lead-ins still
+	// flush immediately. Tool-only turns yield no text and are skipped. Redaction
+	// suppresses streamed content (only the one-time identity header survives).
+	// The daemon coalesces/throttles these via its shared rate-limit pool.
 	// Push the in-flight turn's assistant text as a finalized turn_stream, deduped
 	// against what was already flushed for this turn (the pre-ask lead-in).
 	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): void => {
@@ -4896,19 +4930,33 @@ export function createNotificationsExtension(
 			rt.turnClosed = true;
 			return;
 		}
-		if (text) flushTurnText(rt, id, text, true);
+		if (text) {
+			if (rt.verbosity === "verbose") {
+				// Verbose: one finalized turn_stream per turn with assistant text.
+				flushTurnText(rt, id, text, true);
+			} else if (text !== rt.preAskFlushedText) {
+				// Lean: hold the latest answer until agent_end. Skip when this turn
+				// already flushed the same text as an ask lead-in (no duplicate at idle).
+				rt.pendingSettled = {
+					text,
+					...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
+				};
+			}
+		}
 		resetTurnStreamState(rt);
 	});
 
-	// Live streaming (opt-in): push throttled in-progress assistant text as
-	// non-finalized turn_stream frames so remote clients edit one message as the
-	// turn streams. The finalized frame (turn_end) carries the same messageRef and
-	// lands the authoritative text. Suppressed under redaction.
+	// Live streaming (opt-in + verbose only): push throttled in-progress assistant
+	// text as non-finalized turn_stream frames so remote clients edit one message
+	// as the turn streams. Lean keeps settled-answer-only delivery; live frames
+	// are suppressed even when the stream preference is on. The finalized frame
+	// (turn_end / agent_end) carries the same messageRef and lands the authoritative
+	// text. Suppressed under redaction.
 	api.on("message_update", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
-		if (!rt?.notificationsActive || !rt.stream || rt.redact || rt.turnClosed) return;
+		if (!rt?.notificationsActive || !rt.stream || rt.redact || rt.turnClosed || rt.verbosity !== "verbose") return;
 		if ((event.message as { role?: unknown }).role !== "assistant") return;
 		if (rt.liveRef === undefined && rt.turnSeq !== undefined) {
 			rt.liveRef = String(rt.turnSeq);
