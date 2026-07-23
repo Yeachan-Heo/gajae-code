@@ -170,7 +170,7 @@ export function parseNotificationSettingsSnapshot(rawConfig?: unknown): Notifica
 				enabled: notificationSettingsBoolean(richDraft.enabled, false),
 			},
 			toolActivity: {
-				enabled: notificationSettingsBoolean(toolActivity.enabled, true),
+				enabled: notificationSettingsBoolean(toolActivity.enabled, false),
 			},
 			streaming: {
 				enabled: notificationSettingsBoolean(streaming.enabled, true),

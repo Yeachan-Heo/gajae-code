@@ -109,7 +109,7 @@
 								"enabled": {
 									"type": "boolean",
 									"description": "Send Telegram updates for tool starts and completions.",
-									"default": true
+									"default": false
 								}
 							},
 							"additionalProperties": false

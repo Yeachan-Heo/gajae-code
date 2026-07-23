@@ -315,10 +315,13 @@ The managed daemon can render:
 - activity/typing indicators;
 - inbound delivery acknowledgements.
 
-Tool activity updates such as `⚙ read — ok` are enabled by default. Send
-`/toolactivity off` in the paired private chat to suppress them globally, or
-`/toolactivity on` to restore them. The toggle is durable, works without a connected session, and
-is also available under `/settings` → **Notifications** → **Preferences**.
+Per-tool activity is off by default so important notifications remain visible. This
+includes `bash`, `read`, `task`, and subagent start/completion bubbles, including
+both `ok` and `error` results. Send `/toolactivity on` in the paired private chat
+to opt in globally, or `/toolactivity off` to suppress these bubbles again. The
+toggle is durable, works without an active GJC session, and has an equivalent
+control under `/settings` → **Notifications** → **Preferences**. Turning it off
+does not affect assistant output, ask prompts, or session notifications.
 
 Reply paths:
 
