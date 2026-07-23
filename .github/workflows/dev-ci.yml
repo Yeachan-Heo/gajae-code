@@ -227,7 +227,7 @@ jobs:
       - name: Windows session-path canonicalization regression
         shell: pwsh
         run: |
-          bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts
+          bun test packages/coding-agent/test/session-manager/windows-canonical-path.test.ts packages/coding-agent/test/session-manager/session-directory.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   windows-telegram-daemon-safety:

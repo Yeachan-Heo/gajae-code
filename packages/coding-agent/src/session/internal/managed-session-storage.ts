@@ -1505,13 +1505,16 @@ export async function copyManagedFileNoReplace(
 	source: string,
 	destination: string,
 	snapshot = captureManagedFileNoFollow(source),
+	assertPublicationConsent?: () => void,
 	root?: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
 ): Promise<void> {
+	assertPublicationConsent?.();
 	const named = captureManagedFileNoFollow(source);
+	assertPublicationConsent?.();
 	if (!sameIdentity(snapshot.identity, named.identity) || !snapshot.bytes.equals(named.bytes))
 		throw new Error("source_changed");
-	await publishManagedFileNoReplace(destination, snapshot.bytes, undefined, root, policy);
+	await publishManagedFileNoReplace(destination, snapshot.bytes, assertPublicationConsent, root, policy);
 	const destinationSnapshot = captureManagedFileNoFollow(destination);
 	if (!destinationSnapshot.bytes.equals(snapshot.bytes)) throw new Error("durability_failed");
 }

@@ -11,7 +11,9 @@ import {
 	prepareManagedSessionScopeForWrite,
 	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
+import * as managedStorage from "../../src/session/internal/managed-session-storage";
 import {
+	copyManagedFileNoReplace,
 	publishManagedFileNoReplace,
 	validateNativeSecurityResult,
 } from "../../src/session/internal/managed-session-storage";
@@ -299,6 +301,27 @@ describe("managed session write protocol", () => {
 		expect(await fs.readFile(destination, "utf8")).toBe("managed\n");
 		expect((await fs.readdir(scope.directoryPath)).filter(name => name.endsWith(".staging"))).toEqual([]);
 	});
+	it("forwards copy consent through the final no-replace publication boundary", async () => {
+		const { scope } = await fixture();
+		await prepareManagedSessionScopeForWrite(scope);
+		const source = path.join(scope.directoryPath, "copy-source.jsonl");
+		const destination = path.join(scope.directoryPath, "copy-destination.jsonl");
+		await fs.writeFile(source, "managed\n");
+		let consentChecks = 0;
+		const assertPublicationConsent = (): void => {
+			consentChecks++;
+			if (consentChecks === 4) throw new Error("migration_busy");
+		};
+
+		await expect(copyManagedFileNoReplace(source, destination, undefined, assertPublicationConsent)).rejects.toThrow(
+			"migration_busy",
+		);
+
+		expect(consentChecks).toBe(4);
+		await expect(fs.access(destination)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await fs.readFile(source, "utf8")).toBe("managed\n");
+		expect((await fs.readdir(scope.directoryPath)).filter(name => name.endsWith(".staging"))).toEqual([]);
+	});
 	it("quarantines and restores the complete legacy artifact topology before committing migration authority", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
@@ -430,6 +453,103 @@ describe("managed session write protocol", () => {
 		if (!detached) throw new Error("Missing retained detached artifact root");
 		expect(await fs.readFile(path.join(legacy, detached, "payload.txt"), "utf8")).toBe("authoritative");
 	});
+	it("captures the transcript after artifact detach and immediately supplies that snapshot to copy", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "transcript-capture-order.jsonl");
+		const sourceArtifacts = source.slice(0, -6);
+		await fs.mkdir(sourceArtifacts, { recursive: true });
+		await fs.writeFile(source, transcript("transcript-capture-order", cwd));
+		await fs.writeFile(path.join(sourceArtifacts, "payload.txt"), "authoritative");
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+
+		const exactUnlink = native.exactUnlink;
+		const capture = managedStorage.captureManagedFileNoFollow;
+		const copy = managedStorage.copyManagedFileNoReplace;
+		const beforeArtifactTransaction = capture(source);
+		let artifactDetached = false;
+		let copyObserved = false;
+		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			const result = exactUnlink(pathname, identity);
+			if (identity.directory && identity.detachOnly && result.ok) {
+				artifactDetached = true;
+				syncFs.chmodSync(source, 0o444);
+				syncFs.chmodSync(source, 0o600);
+				const afterArtifactDetach = capture(source);
+				expect(afterArtifactDetach.identity.dev).toBe(beforeArtifactTransaction.identity.dev);
+				expect(afterArtifactDetach.identity.ino).toBe(beforeArtifactTransaction.identity.ino);
+				expect(afterArtifactDetach.identity.size).toBe(beforeArtifactTransaction.identity.size);
+				expect(afterArtifactDetach.identity.mtimeNs).toBe(beforeArtifactTransaction.identity.mtimeNs);
+				expect(afterArtifactDetach.identity.sha256).toBe(beforeArtifactTransaction.identity.sha256);
+				expect(afterArtifactDetach.identity.ctimeNs).not.toBe(beforeArtifactTransaction.identity.ctimeNs);
+			}
+			return result;
+		});
+		const copySpy = vi
+			.spyOn(managedStorage, "copyManagedFileNoReplace")
+			.mockImplementation(async (sourcePath, destinationPath, snapshot, consent, root, policy) => {
+				if (sourcePath === source) {
+					expect(artifactDetached).toBe(true);
+					expect(snapshot).toEqual(capture(source));
+					expect(snapshot?.identity.ctimeNs).not.toBe(beforeArtifactTransaction.identity.ctimeNs);
+					copyObserved = true;
+				}
+				return copy(sourcePath, destinationPath, snapshot, consent, root, policy);
+			});
+		try {
+			const opened = await openManagedCandidateForWrite(scope, listed.owned[0]);
+			expect(opened).toMatchObject({ kind: "opened", migrated: true });
+		} finally {
+			copySpy.mockRestore();
+			unlink.mockRestore();
+		}
+		expect(copyObserved).toBe(true);
+	});
+	it.skipIf(process.platform !== "win32")(
+		"uses native artifact-root size authority when Bun reports a different directory size",
+		async () => {
+			const { cwd, sessionsRoot, scope } = await fixture();
+			const legacy = legacyDirectory(sessionsRoot, cwd);
+			const source = path.join(legacy, "mixed-directory-size.jsonl");
+			const sourceArtifacts = source.slice(0, -6);
+			await fs.mkdir(sourceArtifacts, { recursive: true });
+			await fs.writeFile(source, transcript("mixed-directory-size", cwd));
+			await fs.writeFile(path.join(sourceArtifacts, "payload.txt"), "payload");
+			const nativeTree = native.snapshotDirectoryTree(sourceArtifacts);
+			if (!nativeTree.ok || !nativeTree.snapshot) throw new Error("Missing native artifact snapshot");
+			const nativeRoot = nativeTree.snapshot.entries.find(entry => entry.relativePath === "");
+			if (!nativeRoot) throw new Error("Missing native artifact root");
+			const nativeSize = BigInt(nativeRoot.size);
+			const syntheticBunSize = nativeSize === 0n ? 4096n : 0n;
+			const lstatSync = syncFs.lstatSync;
+			const syntheticLstatSync = ((...args: Parameters<typeof syncFs.lstatSync>) => {
+				const stat = lstatSync(...args);
+				if (!stat) return stat;
+				const pathname = args[0];
+				if (
+					typeof pathname === "string" &&
+					typeof stat.size === "bigint" &&
+					stat.isDirectory() &&
+					(path.resolve(pathname) === path.resolve(sourceArtifacts) ||
+						path.basename(pathname).startsWith(".gjc-migrate-"))
+				) {
+					Object.defineProperty(stat, "size", { value: syntheticBunSize });
+				}
+				return stat;
+			}) as typeof syncFs.lstatSync;
+			const lstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(syntheticLstatSync);
+			try {
+				const listed = listManagedCandidates(scope);
+				if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+				const opened = await openManagedCandidateForWrite(scope, listed.owned[0]);
+				expect(opened).toMatchObject({ kind: "opened", migrated: true });
+				expect(syntheticBunSize).not.toBe(nativeSize);
+			} finally {
+				lstat.mockRestore();
+			}
+		},
+	);
 	it("retains a detached legacy artifact root when exact restoration collides", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
@@ -461,6 +581,306 @@ describe("managed session write protocol", () => {
 		if (!detached) throw new Error("Missing retained detached artifact root");
 		expect(await fs.readFile(path.join(legacy, detached, "payload.txt"), "utf8")).toBe("authoritative");
 		expect(await fs.readFile(source, "utf8")).toBe(transcript("restore-collision", cwd));
+	});
+	it("retries a prepared migration after the authorized artifact root was already restored", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "prepared-restored.jsonl");
+		const sourceArtifacts = source.slice(0, -6);
+		await fs.mkdir(path.join(sourceArtifacts, "nested"), { recursive: true });
+		await fs.writeFile(source, transcript("prepared-restored", cwd));
+		await fs.writeFile(path.join(sourceArtifacts, "nested", "payload.txt"), "authoritative");
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+
+		const exactRestore = native.exactRestore;
+		let forcedFailure = false;
+		const restore = vi.spyOn(native, "exactRestore").mockImplementation((detachedPath, originalPath, identity) => {
+			const result = exactRestore(detachedPath, originalPath, identity);
+			if (!forcedFailure && result.ok && path.basename(detachedPath).startsWith(".gjc-migrate-")) {
+				forcedFailure = true;
+				return { ...result, ok: false, code: "forced_post_restore_failure" };
+			}
+			return result;
+		});
+		try {
+			await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({
+				kind: "error",
+				code: "durability_failed",
+			});
+		} finally {
+			restore.mockRestore();
+		}
+		expect(forcedFailure).toBe(true);
+		expect(await fs.readFile(path.join(sourceArtifacts, "nested", "payload.txt"), "utf8")).toBe("authoritative");
+
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		expect((await fs.readdir(receipts)).filter(name => name.endsWith(".prepared.json"))).toHaveLength(1);
+		const retryListing = listManagedCandidates(scope);
+		if (retryListing.kind !== "complete") throw new Error(retryListing.message);
+		const retryCandidate = retryListing.owned.find(candidate => candidate.path === source);
+		if (!retryCandidate) throw new Error("Missing retained legacy candidate");
+
+		const retried = await openManagedCandidateForWrite(scope, retryCandidate);
+		expect(retried).toMatchObject({ kind: "opened", migrated: true });
+		if (retried.kind !== "opened") throw new Error(retried.message);
+		expect(await fs.readFile(path.join(retried.path.slice(0, -6), "nested", "payload.txt"), "utf8")).toBe(
+			"authoritative",
+		);
+		expect((await fs.readdir(receipts)).filter(name => name.endsWith(".prepared.json"))).toHaveLength(0);
+		expect((await fs.readdir(receipts)).filter(name => name.endsWith(".published.json"))).toHaveLength(0);
+	});
+	it.skipIf(process.platform !== "win32")(
+		"rejects a prepared receipt with a non-deterministic detached artifact path before mutation",
+		async () => {
+			const { cwd, sessionsRoot, scope } = await fixture();
+			const legacy = legacyDirectory(sessionsRoot, cwd);
+			const source = path.join(legacy, "prepared-path-tamper.jsonl");
+			const sourceArtifacts = source.slice(0, -6);
+			await fs.mkdir(sourceArtifacts, { recursive: true });
+			await fs.writeFile(source, transcript("prepared-path-tamper", cwd));
+			await fs.writeFile(path.join(sourceArtifacts, "payload.txt"), "authoritative");
+			const listed = listManagedCandidates(scope);
+			if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+
+			const exactRestore = native.exactRestore;
+			let forcedFailure = false;
+			const restoreFailure = vi
+				.spyOn(native, "exactRestore")
+				.mockImplementation((detachedPath, originalPath, identity) => {
+					const result = exactRestore(detachedPath, originalPath, identity);
+					if (!forcedFailure && result.ok && path.basename(detachedPath).startsWith(".gjc-migrate-")) {
+						forcedFailure = true;
+						return { ...result, ok: false, code: "forced_post_restore_failure" };
+					}
+					return result;
+				});
+			try {
+				await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({
+					kind: "error",
+					code: "durability_failed",
+				});
+			} finally {
+				restoreFailure.mockRestore();
+			}
+			expect(forcedFailure).toBe(true);
+
+			const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+			const preparedName = (await fs.readdir(receipts)).find(name => name.endsWith(".prepared.json"));
+			if (!preparedName) throw new Error("Missing prepared receipt");
+			const preparedPath = path.join(receipts, preparedName);
+			const prepared = JSON.parse(await fs.readFile(preparedPath, "utf8")) as {
+				sourceArtifactQuarantine?: { detachedPath?: string };
+			};
+			if (!prepared.sourceArtifactQuarantine) throw new Error("Missing prepared artifact authority");
+			prepared.sourceArtifactQuarantine.detachedPath = path.join(legacy, ".gjc-migrate-forged-artifacts");
+			await fs.writeFile(preparedPath, `${JSON.stringify(prepared)}\n`);
+
+			const restore = vi.spyOn(native, "exactRestore");
+			const unlink = vi.spyOn(native, "exactUnlink");
+			try {
+				const retryListing = listManagedCandidates(scope);
+				if (retryListing.kind !== "complete") throw new Error(retryListing.message);
+				const retryCandidate = retryListing.owned.find(candidate => candidate.path === source);
+				if (!retryCandidate) throw new Error("Missing retained legacy candidate");
+				await expect(openManagedCandidateForWrite(scope, retryCandidate)).resolves.toMatchObject({
+					kind: "error",
+					code: "durability_failed",
+				});
+			} finally {
+				restore.mockRestore();
+				unlink.mockRestore();
+			}
+			expect(restore).not.toHaveBeenCalled();
+			expect(unlink).not.toHaveBeenCalled();
+			expect(await fs.readFile(path.join(sourceArtifacts, "payload.txt"), "utf8")).toBe("authoritative");
+			expect(await fs.readFile(preparedPath, "utf8")).toContain(".gjc-migrate-forged-artifacts");
+			expect(
+				(await fs.readdir(receipts)).filter(
+					name => name.endsWith(".json") && !name.endsWith(".prepared.json") && !name.endsWith(".published.json"),
+				),
+			).toHaveLength(0);
+		},
+	);
+	it("rejects an omitted prepared quarantine when deterministic detached evidence exists", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "prepared-quarantine-omitted.jsonl");
+		const sourceArtifacts = source.slice(0, -6);
+		await fs.mkdir(sourceArtifacts, { recursive: true });
+		await fs.writeFile(source, transcript("prepared-quarantine-omitted", cwd));
+		await fs.writeFile(path.join(sourceArtifacts, "payload.txt"), "authoritative");
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+
+		const exactUnlink = native.exactUnlink;
+		let interrupted = false;
+		const unlinkFailure = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			const result = exactUnlink(pathname, identity);
+			if (!interrupted && identity.directory && identity.detachOnly && result.ok) {
+				interrupted = true;
+				throw new Error("simulated_crash_after_detach");
+			}
+			return result;
+		});
+		try {
+			await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({ kind: "error" });
+		} finally {
+			unlinkFailure.mockRestore();
+		}
+		expect(interrupted).toBe(true);
+
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		const preparedName = (await fs.readdir(receipts)).find(name => name.endsWith(".prepared.json"));
+		if (!preparedName) throw new Error("Missing prepared receipt");
+		const preparedPath = path.join(receipts, preparedName);
+		const prepared = JSON.parse(await fs.readFile(preparedPath, "utf8")) as Record<string, unknown>;
+		delete prepared.sourceArtifactQuarantine;
+		await fs.writeFile(preparedPath, `${JSON.stringify(prepared)}\n`);
+
+		const restore = vi.spyOn(native, "exactRestore");
+		const unlink = vi.spyOn(native, "exactUnlink");
+		try {
+			const retryListing = listManagedCandidates(scope);
+			if (retryListing.kind !== "complete") throw new Error(retryListing.message);
+			const retryCandidate = retryListing.owned.find(candidate => candidate.path === source);
+			if (!retryCandidate) throw new Error("Missing retained legacy candidate");
+			await expect(openManagedCandidateForWrite(scope, retryCandidate)).resolves.toMatchObject({
+				kind: "error",
+				code: "durability_failed",
+			});
+		} finally {
+			restore.mockRestore();
+			unlink.mockRestore();
+		}
+		expect(restore).not.toHaveBeenCalled();
+		expect(unlink).not.toHaveBeenCalled();
+		const detached = (await fs.readdir(legacy)).find(
+			name => name.startsWith(".gjc-migrate-") && name.endsWith("-artifacts"),
+		);
+		if (!detached) throw new Error("Missing retained detached evidence");
+		expect(await fs.readFile(path.join(legacy, detached, "payload.txt"), "utf8")).toBe("authoritative");
+	});
+	it("recovers a prepared migration whose artifact root was detached before an interrupted return", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "prepared-detached.jsonl");
+		const sourceArtifacts = source.slice(0, -6);
+		await fs.mkdir(sourceArtifacts, { recursive: true });
+		await fs.writeFile(source, transcript("prepared-detached", cwd));
+		await fs.writeFile(path.join(sourceArtifacts, "payload.txt"), "authoritative");
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+
+		const exactUnlink = native.exactUnlink;
+		let interrupted = false;
+		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			const result = exactUnlink(pathname, identity);
+			if (!interrupted && identity.directory && identity.detachOnly && result.ok) {
+				interrupted = true;
+				throw new Error("simulated_crash_after_detach");
+			}
+			return result;
+		});
+		try {
+			await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({ kind: "error" });
+		} finally {
+			unlink.mockRestore();
+		}
+		expect(interrupted).toBe(true);
+		await expect(fs.access(sourceArtifacts)).rejects.toMatchObject({ code: "ENOENT" });
+		const detached = (await fs.readdir(legacy)).find(
+			name => name.startsWith(".gjc-migrate-") && name.endsWith("-artifacts"),
+		);
+		if (!detached) throw new Error("Missing retained detached root");
+		expect(await fs.readFile(path.join(legacy, detached, "payload.txt"), "utf8")).toBe("authoritative");
+
+		const retryListing = listManagedCandidates(scope);
+		if (retryListing.kind !== "complete") throw new Error(retryListing.message);
+		const retryCandidate = retryListing.owned.find(candidate => candidate.path === source);
+		if (!retryCandidate) throw new Error("Missing retained legacy candidate");
+		const retried = await openManagedCandidateForWrite(scope, retryCandidate);
+		expect(retried).toMatchObject({ kind: "opened", migrated: true });
+		if (retried.kind !== "opened") throw new Error(retried.message);
+		expect(await fs.readFile(path.join(sourceArtifacts, "payload.txt"), "utf8")).toBe("authoritative");
+		expect(await fs.readFile(path.join(retried.path.slice(0, -6), "payload.txt"), "utf8")).toBe("authoritative");
+	});
+	it("rejects false native restore success and re-establishes the exact source root", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "false-restore-success.jsonl");
+		const sourceArtifacts = source.slice(0, -6);
+		await fs.mkdir(sourceArtifacts, { recursive: true });
+		await fs.writeFile(source, transcript("false-restore-success", cwd));
+		await fs.writeFile(path.join(sourceArtifacts, "payload.txt"), "authoritative");
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+
+		const exactRestore = native.exactRestore;
+		let lied = false;
+		const restore = vi.spyOn(native, "exactRestore").mockImplementation((detachedPath, originalPath, identity) => {
+			if (!lied && path.basename(detachedPath).startsWith(".gjc-migrate-")) {
+				lied = true;
+				return { ok: true };
+			}
+			return exactRestore(detachedPath, originalPath, identity);
+		});
+		try {
+			await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({
+				kind: "error",
+				code: "durability_failed",
+			});
+		} finally {
+			restore.mockRestore();
+		}
+		expect(lied).toBe(true);
+		expect(await fs.readFile(path.join(sourceArtifacts, "payload.txt"), "utf8")).toBe("authoritative");
+		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+		expect(
+			(await fs.readdir(receipts)).filter(
+				name => name.endsWith(".json") && !name.endsWith(".prepared.json") && !name.endsWith(".published.json"),
+			),
+		).toHaveLength(0);
+	});
+	it("stops after artifact detach when picker identity changes before publication", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "picker-loss-after-detach.jsonl");
+		const sourceArtifacts = source.slice(0, -6);
+		await fs.mkdir(sourceArtifacts, { recursive: true });
+		await fs.writeFile(source, transcript("picker-loss-after-detach", cwd, "original"));
+		await fs.writeFile(path.join(sourceArtifacts, "payload.txt"), "authoritative");
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+
+		const replacement = transcript("picker-loss-after-detach", cwd, "replacement");
+		const exactUnlink = native.exactUnlink;
+		let replaced = false;
+		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			const result = exactUnlink(pathname, identity);
+			if (!replaced && identity.directory && identity.detachOnly && result.ok) {
+				replaced = true;
+				syncFs.unlinkSync(source);
+				syncFs.writeFileSync(source, replacement);
+			}
+			return result;
+		});
+		try {
+			await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({
+				kind: "error",
+				code: "source_changed",
+			});
+		} finally {
+			unlink.mockRestore();
+		}
+		expect(replaced).toBe(true);
+		expect(await fs.readFile(source, "utf8")).toBe(replacement);
+		await expect(fs.access(sourceArtifacts)).rejects.toMatchObject({ code: "ENOENT" });
+		const detached = (await fs.readdir(legacy)).find(
+			name => name.startsWith(".gjc-migrate-") && name.endsWith("-artifacts"),
+		);
+		if (!detached) throw new Error("Missing retained detached root");
+		expect(await fs.readFile(path.join(legacy, detached, "payload.txt"), "utf8")).toBe("authoritative");
 	});
 	it("lists disabled legacy candidates read-only, rejects mutation, then migrates safely when re-enabled", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
