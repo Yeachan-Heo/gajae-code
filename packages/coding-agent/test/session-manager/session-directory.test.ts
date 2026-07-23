@@ -1399,25 +1399,28 @@ describe("managed session write protocol", () => {
 		} finally {
 			remove.mockRestore();
 		}
-		const tombstones = path.join(scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
-		const firstName = (await fs.readdir(tombstones)).find(name => name.includes(".cleanup-pending-1"));
-		if (!firstName) throw new Error("Missing initial cleanup receipt");
-		const firstPath = path.join(tombstones, firstName);
-		const first = JSON.parse(await fs.readFile(firstPath, "utf8")) as Record<string, unknown>;
-		const forged = {
-			...first,
-			attempt: 2,
-			detachedArtifactsPath: path.join(path.dirname(source), ".gjc-delete-forged-artifacts"),
-			plannedArtifactsPath: path.join(path.dirname(source), ".gjc-delete-forged-next-artifacts"),
-			plannedTranscriptPath: path.join(path.dirname(source), ".gjc-delete-forged-next-transcript"),
-		};
-		await fs.writeFile(firstPath.replace("cleanup-pending-1", "cleanup-pending-2"), JSON.stringify(forged));
-		await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({
-			kind: "error",
-			code: "durability_failed",
-		});
-		expect(await fs.stat(source)).toBeDefined();
-		unlink.mockRestore();
+		try {
+			const tombstones = path.join(scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
+			const firstName = (await fs.readdir(tombstones)).find(name => name.includes(".cleanup-pending-1"));
+			if (!firstName) throw new Error("Missing initial cleanup receipt");
+			const firstPath = path.join(tombstones, firstName);
+			const first = JSON.parse(await fs.readFile(firstPath, "utf8")) as Record<string, unknown>;
+			const forged = {
+				...first,
+				attempt: 2,
+				detachedArtifactsPath: path.join(path.dirname(source), ".gjc-delete-forged-artifacts"),
+				plannedArtifactsPath: path.join(path.dirname(source), ".gjc-delete-forged-next-artifacts"),
+				plannedTranscriptPath: path.join(path.dirname(source), ".gjc-delete-forged-next-transcript"),
+			};
+			await fs.writeFile(firstPath.replace("cleanup-pending-1", "cleanup-pending-2"), JSON.stringify(forged));
+			await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({
+				kind: "error",
+				code: "durability_failed",
+			});
+			expect(await fs.stat(source)).toBeDefined();
+		} finally {
+			unlink.mockRestore();
+		}
 	});
 
 	it("reconciles transcript post-quarantine cleanup from a sidecar on a fresh scope", async () => {
