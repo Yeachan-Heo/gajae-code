@@ -135,4 +135,75 @@ describe("concurrent path mutation (#2900)", () => {
 		const joined = events.join(",");
 		expect(joined === "a-start,a-end,b-start,b-end" || joined === "b-start,b-end,a-start,a-end").toBe(true);
 	});
+
+	/**
+	 * Production `executePatchSingle` uses `LspFileSystem`, which is disk-backed but
+	 * is NOT `defaultFileSystem` by object identity. Cross-process locking must be
+	 * opted in explicitly for that path (#2900 review).
+	 */
+	it("disk-backed non-default FileSystem still serializes across processes when crossProcessLock is true", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-concurrent-edit-lsp-"));
+		temporaryDirectories.push(root);
+		const filePath = path.join(root, "file.txt");
+		await fsp.writeFile(filePath, "a\nb\nc\n", "utf8");
+
+		const patchModule = path.resolve(import.meta.dir, "../../src/edit/modes/patch.ts");
+		// Standalone worker: custom disk FileSystem (LspFileSystem-shaped) + explicit lock.
+		const workerSource = `
+import * as fsp from "node:fs/promises";
+import { applyPatch } from ${JSON.stringify(patchModule)};
+
+const filePath = process.argv[2]!;
+const from = process.argv[3]!;
+const to = process.argv[4]!;
+const delayMs = Number(process.argv[5] ?? "30");
+
+const diskFs = {
+	exists: async (p: string) => {
+		try {
+			await fsp.access(p);
+			return true;
+		} catch {
+			return false;
+		}
+	},
+	read: async (p: string) => fsp.readFile(p, "utf8"),
+	write: async (p: string, content: string) => {
+		await Bun.sleep(delayMs);
+		await fsp.writeFile(p, content, "utf8");
+	},
+	delete: async (p: string) => fsp.unlink(p),
+	mkdir: async (p: string) => {
+		await fsp.mkdir(p, { recursive: true });
+	},
+};
+
+await applyPatch(
+	{ path: filePath, op: "update", diff: \`@@\\n-\${from}\\n+\${to}\` },
+	{ cwd: ${JSON.stringify(root)}, fs: diskFs, allowFuzzy: false, crossProcessLock: true },
+);
+`;
+		const workerTs = path.join(root, "worker.ts");
+		await fsp.writeFile(workerTs, workerSource, "utf8");
+
+		const spawnWorker = (from: string, to: string) =>
+			Bun.spawn(["bun", "run", workerTs, filePath, from, to, "40"], {
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: root,
+			});
+
+		const a = spawnWorker("a", "A");
+		const b = spawnWorker("c", "C");
+		const [codeA, codeB] = await Promise.all([a.exited, b.exited]);
+		const stderrA = await new Response(a.stderr).text();
+		const stderrB = await new Response(b.stderr).text();
+		if (codeA !== 0) throw new Error(`worker A failed (${codeA}): ${stderrA}`);
+		if (codeB !== 0) throw new Error(`worker B failed (${codeB}): ${stderrB}`);
+
+		const text = await fsp.readFile(filePath, "utf8");
+		expect(text.includes("A")).toBe(true);
+		expect(text.includes("C")).toBe(true);
+		expect(text).toBe("A\nb\nC\n");
+	});
 });
