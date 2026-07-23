@@ -278,6 +278,13 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-telegram-daemon-self-heal.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-telegram-daemon.test.ts"
 			]
 		},
@@ -342,6 +349,13 @@
 				"bun",
 				"test",
 				"packages/coding-agent/test/telegram-send-tool.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/telegram-setup-preflight.test.ts"
 			]
 		}
 	],
