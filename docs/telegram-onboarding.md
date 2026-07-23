@@ -326,8 +326,8 @@ Reply paths:
 - reply in the session topic with free text when forum-topic routing is
   available;
 - send in-topic config commands:
-  - `/verbose`
-  - `/lean`
+  - `/verbose` — per-tool-turn assistant text (and opt-in live streaming)
+  - `/lean` — settled assistant answer when the agent reaches idle, plus immediate ask lead-ins (default; no intermediate tool-turn flood)
   - `/verbosity <lean|verbose>`
   - `/redact <on|off>`
   - `/btw <question>` is available only in an authorized, known private-session

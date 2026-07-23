@@ -135,7 +135,12 @@ async function bootSession(
 			`notifications:\n  enabled: true\n  daemon:\n    idleTimeoutMs: 20\n  telegram:\n    botToken: ${JSON.stringify(botToken)}\n    chatId: ${JSON.stringify(chatId)}\n`,
 		);
 	}
-	const settings = isolatedNotificationSettings(agentDir, settingsOverrides);
+	// Live streaming and per-turn finals are verbose-mode contracts. Lean defers
+	// settled answers to agent_end and suppresses live frames (#2863).
+	const settings = isolatedNotificationSettings(agentDir, {
+		"notifications.verbosity": "verbose",
+		...settingsOverrides,
+	});
 	const controller = new NotificationSessionController({
 		eligible: true,
 		getConfig: () => getNotificationConfig(settings),
@@ -183,6 +188,26 @@ async function bootSession(
 }
 
 const assistant = (content: string) => ({ type: "message_update", message: { role: "assistant", content } });
+
+test("lean suppresses live frames even when streaming is enabled", async () => {
+	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "1" });
+	const { handlers, ctx, frames } = await bootSession({ "notifications.verbosity": "lean" });
+	const streams = () => frames.filter(f => f.type === "turn_stream");
+
+	await handlers.get("message_update")!(assistant("partial while tools run"), ctx);
+	await handlers.get("turn_end")!(
+		{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "partial while tools run" } },
+		ctx,
+	);
+	await sleep(200);
+	expect(streams().some(f => f.phase === "live")).toBe(false);
+	expect(streams().some(f => f.phase === "finalized")).toBe(false);
+
+	await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+	await waitFor(() => streams().some(f => f.phase === "finalized"), 3000, "settled lean frame");
+	expect(streams().filter(f => f.phase === "finalized")).toHaveLength(1);
+	expect(streams().find(f => f.phase === "finalized")!.text).toContain("partial while tools run");
+}, 15_000);
 
 test("message_update emits a live turn_stream whose messageRef matches the finalized turn", async () => {
 	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });

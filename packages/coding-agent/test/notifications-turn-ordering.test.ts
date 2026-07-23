@@ -157,7 +157,7 @@ test("assistant text preceding an ask is flushed before the ask and not duplicat
 		await sleep(150);
 		expect(turnStreams().length).toBe(1);
 
-		// A later turn with different text streams once at turn_end.
+		// A later turn with different text is held under lean until agent_end.
 		await handlers.get("message_end")!(
 			{ type: "message_end", message: { role: "assistant", content: "All done." } },
 			ctx,
@@ -166,7 +166,11 @@ test("assistant text preceding an ask is flushed before the ask and not duplicat
 			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: "All done." } },
 			ctx,
 		);
-		await waitFor(() => turnStreams().length === 2, 3000, "second turn_stream");
+		await sleep(150);
+		expect(turnStreams().length).toBe(1);
+
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await waitFor(() => turnStreams().length === 2, 3000, "settled turn_stream at idle");
 		expect(turnStreams()[1]!.text).toContain("All done.");
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
@@ -324,11 +328,11 @@ test("session shutdown emits session_closed before stopping the endpoint", async
 // --- Turn-output streaming: observable ordering & dedup ---------------------
 // These assert the WS-observable turn_stream contract: the pre-ask lead-in is
 // flushed BEFORE the ask (not held until turn_end), identical text is deduped
-// within a turn, distinct text streams again, and an ask-free turn streams
-// exactly once. All turn output arrives as a `finalized`-phase frame.
+// within a turn, lean defers the settled answer until agent_end, and verbose
+// still streams per turn_end. All turn output arrives as a `finalized`-phase frame.
 //
 // The emit site tags each turn_stream with a `finalAnswer` bit (false for the
-// pre-ask lead-in, true at turn_end). The Rust wire struct `TurnStream`
+// pre-ask lead-in, true at settled final). The Rust wire struct `TurnStream`
 // (crates/gjc-sdk/src/protocol.rs) carries it as an optional
 // `final_answer` (serialized `finalAnswer`), so the bit is asserted here at the
 // WS-observable level; the `finalAnswer` -> `richMarkdown` mapping itself is
@@ -375,7 +379,7 @@ test("a pre-ask lead-in is flushed as a finalized turn_stream before the ask, an
 	}
 }, 30000);
 
-test("a distinct turn_end after a pre-ask lead-in streams a second finalized turn_stream", async () => {
+test("a distinct lean answer after a pre-ask lead-in streams only at agent_end", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
 	try {
@@ -394,7 +398,23 @@ test("a distinct turn_end after a pre-ask lead-in streams a second finalized tur
 		expect(phaseOf(turnStreams()[0]!)).toBe("finalized");
 		expect(finalAnswerOf(turnStreams()[0]!)).toBe(false);
 
-		// A later turn resolves with DIFFERENT text: it streams once more, finalized.
+		// Intermediate tool-turn narration must not flood under lean.
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "Checking the merge base." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{
+				type: "turn_end",
+				turnIndex: 1,
+				message: { role: "assistant", content: "Checking the merge base." },
+			},
+			ctx,
+		);
+		await sleep(150);
+		expect(turnStreams().length).toBe(1);
+
+		// Latest settled answer overwrites the deferred text and flushes at idle.
 		await handlers.get("message_end")!(
 			{ type: "message_end", message: { role: "assistant", content: "Done, merged the feature branch." } },
 			ctx,
@@ -402,12 +422,16 @@ test("a distinct turn_end after a pre-ask lead-in streams a second finalized tur
 		await handlers.get("turn_end")!(
 			{
 				type: "turn_end",
-				turnIndex: 1,
+				turnIndex: 2,
 				message: { role: "assistant", content: "Done, merged the feature branch." },
 			},
 			ctx,
 		);
-		await waitFor(() => turnStreams().length === 2, 3000, "final turn_stream");
+		await sleep(150);
+		expect(turnStreams().length).toBe(1);
+
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await waitFor(() => turnStreams().length === 2, 3000, "settled turn_stream");
 		expect(turnStreams()[1]!.text).toContain("Done, merged the feature branch.");
 		expect(phaseOf(turnStreams()[1]!)).toBe("finalized");
 		expect(finalAnswerOf(turnStreams()[1]!)).toBe(true);
@@ -417,7 +441,7 @@ test("a distinct turn_end after a pre-ask lead-in streams a second finalized tur
 	}
 }, 30000);
 
-test("a turn_end with no preceding ask streams a single finalized turn_stream", async () => {
+test("lean ask-free turns emit a single settled turn_stream only at agent_end", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
 	try {
@@ -425,19 +449,34 @@ test("a turn_end with no preceding ask streams a single finalized turn_stream", 
 		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
 
 		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "Working on it…" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "Working on it…" } },
+			ctx,
+		);
+		await sleep(150);
+		expect(turnStreams().length).toBe(0);
+
+		await handlers.get("message_end")!(
 			{ type: "message_end", message: { role: "assistant", content: "All finished." } },
 			ctx,
 		);
 		await handlers.get("turn_end")!(
-			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "All finished." } },
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: "All finished." } },
 			ctx,
 		);
-		await waitFor(() => turnStreams().length === 1, 3000, "final turn_stream");
+		await sleep(150);
+		expect(turnStreams().length).toBe(0);
+
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await waitFor(() => turnStreams().length === 1, 3000, "settled turn_stream");
 		expect(turnStreams()[0]!.text).toContain("All finished.");
 		expect(phaseOf(turnStreams()[0]!)).toBe("finalized");
 		expect(finalAnswerOf(turnStreams()[0]!)).toBe(true);
 
-		// No second frame for a single ask-free turn.
+		// No second frame for a single agent settle.
 		await sleep(150);
 		expect(turnStreams().length).toBe(1);
 	} finally {
@@ -446,21 +485,69 @@ test("a turn_end with no preceding ask streams a single finalized turn_stream", 
 	}
 }, 30000);
 
+test("verbose still streams a finalized turn_stream at each turn_end", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "verbose" }));
+		await waitFor(() => frames.some(f => f.type === "config_update" && f.verbosity === "verbose"), 3000, "verbose");
+
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "Step one complete." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "Step one complete." } },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "first verbose turn_stream");
+		expect(turnStreams()[0]!.text).toContain("Step one complete.");
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(true);
+
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "All finished." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: "All finished." } },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 2, 3000, "second verbose turn_stream");
+		expect(turnStreams()[1]!.text).toContain("All finished.");
+		expect(finalAnswerOf(turnStreams()[1]!)).toBe(true);
+
+		// agent_end must not re-emit already-streamed verbose turns.
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await sleep(150);
+		expect(turnStreams().length).toBe(2);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
 const messageRefOf = (f: Frame): string | undefined => (f as { messageRef?: string }).messageRef;
 
-// Decision A / Pro round-5 regression: a stream-enabled turn must finalize as an
-// editable (messageRef-bearing) frame even when live frames were async and none
-// landed before turn_end — so the daemon keeps it on the HTML edit path and never
-// rich-promotes a streamed final — and a late message_update after turn_end must
-// be dropped so no stale live edit follows the final.
+// Decision A / Pro round-5 regression: a stream-enabled *verbose* turn must finalize
+// as an editable (messageRef-bearing) frame even when live frames were async and
+// none landed before turn_end — so the daemon keeps it on the HTML edit path and
+// never rich-promotes a streamed final — and a late message_update after turn_end
+// must be dropped so no stale live edit follows the final. Lean deliberately
+// suppresses live streaming and defers settled answers to agent_end.
 test("stream-enabled final always carries a messageRef and a late message_update is dropped", async () => {
 	const prevN = process.env.GJC_NOTIFICATIONS;
 	const prevS = process.env.GJC_NOTIFICATIONS_STREAM;
 	process.env.GJC_NOTIFICATIONS = "1";
 	process.env.GJC_NOTIFICATIONS_STREAM = "1";
 	try {
-		const { handlers, ctx, frames } = await setup();
+		const { handlers, ctx, frames, ws, token, sid } = await setup();
 		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		ws.send(JSON.stringify({ type: "config_command", sessionId: sid, token, verbosity: "verbose" }));
+		await waitFor(() => frames.some(f => f.type === "config_update" && f.verbosity === "verbose"), 3000, "verbose");
 
 		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
 		// turn_end with NO preceding message_update (live frames were async / none landed).
