@@ -154,6 +154,93 @@ test("sidecar fence skips publication after the ownership lock changes", async (
 	expect(await renewOwnerHeartbeatSidecar({ settings: s, ownerId: "owner", acquisitionId: "owner", pid: process.pid, fs: fencedFs })).toBe(false);
 	expect(fs.existsSync(paths.heartbeat)).toBe(false);
 });
+test("post-TTL owner with a fresh sidecar stays accepted while a stalled sidecar goes stale", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	let now = 1_000;
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+		now: () => now,
+	});
+	await renewDaemonHeartbeat({ settings: s, ownerId: "owner", acquisitionId: "owner", pid: process.pid, now: () => now });
+	// Advance far past the TTL: the frozen state.heartbeatAt alone is stale.
+	now += 3 * 20_000;
+	await renewOwnerHeartbeatSidecar({ settings: s, ownerId: "owner", acquisitionId: "owner", pid: process.pid, now: () => now });
+	const state = await readDaemonState(s);
+	const snapshot = await readOwnerFreshnessSnapshot({ settings: s });
+	expect(now - (state?.heartbeatAt ?? 0)).toBeGreaterThan(20_000);
+	expect(snapshot.effectiveHeartbeatAt).toBe(now);
+	expect(
+		isFreshLiveOwner({
+			state,
+			now,
+			tokenFingerprint: "fp",
+			chatId: "42",
+			pidAlive: () => true,
+			effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
+		}),
+	).toBe(true);
+	// Without the sidecar-derived freshness the same owner is stale — the
+	// snapshot is load-bearing for post-TTL acceptance.
+	expect(
+		isFreshLiveOwner({ state, now, tokenFingerprint: "fp", chatId: "42", pidAlive: () => true }),
+	).toBe(false);
+});
+
+test("steady sidecar renewal creates no transition markers and calls no exactUnlink", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const paths = daemonPaths(agentDir);
+	let now = 1;
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+		now: () => now,
+	});
+	await renewDaemonHeartbeat({ settings: s, ownerId: "owner", acquisitionId: "owner", pid: process.pid, now: () => now });
+	const leakArtifacts = () =>
+		fs
+			.readdirSync(paths.dir)
+			.filter(name => name.startsWith(".gjc-delete-daemon-transition-") || name.startsWith(".gjc-exact-unlink-placeholder-"));
+	const before = leakArtifacts();
+	let exactUnlinks = 0;
+	let stealTouches = 0;
+	const spyFs: TelegramDaemonFs = {
+		...(fs.promises as unknown as TelegramDaemonFs),
+		exactUnlink: async () => {
+			exactUnlinks += 1;
+			throw new Error("steady sidecar renewal must never call exactUnlink");
+		},
+		writeFile: async (file, data, opts) => {
+			if (String(file).includes(path.basename(paths.steal))) stealTouches += 1;
+			return await fs.promises.writeFile(file as string, data as string, opts as never);
+		},
+	};
+	for (let tick = 0; tick < 25; tick++) {
+		now += 5_000;
+		expect(
+			await renewOwnerHeartbeatSidecar({
+				settings: s,
+				ownerId: "owner",
+				acquisitionId: "owner",
+				pid: process.pid,
+				now: () => now,
+				fs: spyFs,
+			}),
+		).toBe(true);
+	}
+	expect(exactUnlinks).toBe(0);
+	expect(stealTouches).toBe(0);
+	expect(leakArtifacts()).toEqual(before);
+});
+
 test("endpoint authority digest canonicalizes endpoint presentation and binds authenticated identity", () => {
 	const canonical = endpointAuthorityDigest("ws://LOCALHOST:80/sdk?ignored=yes#ignored", "token");
 	expect(canonical).toBe(endpointAuthorityDigest("ws://localhost/sdk", "token"));
