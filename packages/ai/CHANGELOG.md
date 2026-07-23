@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenAI Responses / Codex native history replay no longer submits missing resident-image placeholders as `input_image.image_url`. Invalid values (including `[Session resident imageUrl blob missing: …]`) are dropped, or retained as `file_id`-only parts when a non-empty `file_id` is present, so a single unavailable historical image cannot brick `/retry` (#2924).
+
 ## [0.11.7] - 2026-07-22
 
 ### Changed

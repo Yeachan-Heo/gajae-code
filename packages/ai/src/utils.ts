@@ -271,17 +271,53 @@ function normalizeResponsesImageUrlForReplay(value: unknown): NormalizedResponse
 	return { imageUrl: stringifyResponsesStringParamForReplay(value) };
 }
 
+/**
+ * OpenAI Responses `input_image.image_url` must be a fetchable HTTP(S) URL or an
+ * image data URI. Session resident-blob materialization may leave a human-readable
+ * placeholder like `[Session resident imageUrl blob missing: sha256:…; …]` in this
+ * field; replaying that string as `image_url` makes Codex reject the entire turn
+ * with `invalid_value` (#2924).
+ */
+function isProviderSafeResponsesImageUrl(value: string): boolean {
+	const url = value.trim();
+	if (url.length === 0) return false;
+	if (url.startsWith("https://") || url.startsWith("http://")) return true;
+	// Accept only image data URIs — other data: schemes are not valid image inputs.
+	if (url.startsWith("data:image/")) return true;
+	return false;
+}
+
+function hasNonEmptyResponsesFileId(part: Record<string, unknown>): boolean {
+	return typeof part.file_id === "string" && part.file_id.trim().length > 0;
+}
+
 function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
 	if (typeof content === "string") return neutralizeReservedControlTokens(content.toWellFormed());
 	if (!Array.isArray(content)) return content;
-	return content.map(part => {
-		if (!part || typeof part !== "object") return part;
+	const sanitizedContent: unknown[] = [];
+	for (const part of content) {
+		if (!part || typeof part !== "object") {
+			sanitizedContent.push(part);
+			continue;
+		}
 		const sanitizedPart = { ...(part as Record<string, unknown>) };
 		if ("text" in sanitizedPart) {
 			sanitizedPart.text = normalizeResponsesMessageTextForReplay(sanitizedPart.text);
 		}
 		if ("image_url" in sanitizedPart) {
 			const normalizedImageUrl = normalizeResponsesImageUrlForReplay(sanitizedPart.image_url);
+			if (!isProviderSafeResponsesImageUrl(normalizedImageUrl.imageUrl)) {
+				// Keep the part when a provider file_id can stand alone; otherwise drop
+				// only this image part so neighboring text/history still replays.
+				if (!hasNonEmptyResponsesFileId(sanitizedPart)) continue;
+				delete sanitizedPart.image_url;
+				if (sanitizedPart.type === "image_url") sanitizedPart.type = "input_image";
+				if ("detail" in sanitizedPart && !isResponsesImageDetail(sanitizedPart.detail)) {
+					delete sanitizedPart.detail;
+				}
+				sanitizedContent.push(sanitizedPart);
+				continue;
+			}
 			sanitizedPart.image_url = normalizedImageUrl.imageUrl;
 			if (sanitizedPart.type === "image_url") {
 				sanitizedPart.type = "input_image";
@@ -292,8 +328,9 @@ function sanitizeResponsesMessageContentForReplay(content: unknown): unknown {
 				delete sanitizedPart.detail;
 			}
 		}
-		return sanitizedPart;
-	});
+		sanitizedContent.push(sanitizedPart);
+	}
+	return sanitizedContent;
 }
 
 function sanitizeResponsesStringFieldsForReplay(item: Record<string, unknown>): void {
