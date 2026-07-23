@@ -30,9 +30,9 @@ function createAsyncMutex(): AsyncMutex {
 				locked = true;
 				return () => release();
 			}
-			await new Promise<void>(resolve => {
-				waiters.push(resolve);
-			});
+			const { promise, resolve } = Promise.withResolvers<void>();
+			waiters.push(resolve);
+			await promise;
 			return () => release();
 		},
 	};

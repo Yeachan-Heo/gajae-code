@@ -1433,7 +1433,9 @@ export async function applyPatch(input: PatchInput, options: ApplyPatchOptions):
 		if (destPath !== absolutePath) mutationPaths.push(destPath);
 	}
 	const usingDefaultFs = options.fs === undefined || options.fs === defaultFileSystem;
-	const crossProcess = options.crossProcessLock ?? usingDefaultFs;
+	// dryRun/preview must stay read-only: never create durable `<path>.lock` dirs
+	// (would fail on read-only parents and mutate the FS during preview) (#2900 review).
+	const crossProcess = options.dryRun === true ? false : (options.crossProcessLock ?? usingDefaultFs);
 	return withEditPathMutation(mutationPaths, () => applyNormalizedPatch(input, options), { crossProcess });
 }
 

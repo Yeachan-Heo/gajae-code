@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { applyPatch, type FileSystem } from "../../src/edit/modes/patch";
+import { applyPatch, type FileSystem, previewPatch } from "../../src/edit/modes/patch";
 import { withEditPathMutation } from "../../src/edit/path-mutation-lock";
 
 const temporaryDirectories: string[] = [];
@@ -205,5 +205,32 @@ await applyPatch(
 		expect(text.includes("A")).toBe(true);
 		expect(text.includes("C")).toBe(true);
 		expect(text).toBe("A\nb\nC\n");
+	});
+
+	it("previewPatch stays read-only: succeeds under a non-writable parent without creating .lock", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-preview-readonly-"));
+		temporaryDirectories.push(root);
+		const parent = path.join(root, "ro-parent");
+		await fsp.mkdir(parent);
+		const filePath = path.join(parent, "file.txt");
+		await fsp.writeFile(filePath, "a\nb\nc\n", "utf8");
+		await fsp.chmod(parent, 0o555);
+
+		try {
+			const result = await previewPatch(
+				{ path: filePath, op: "update", diff: "@@\n-a\n+A" },
+				{ cwd: root, allowFuzzy: false },
+			);
+			expect(result.change.type).toBe("update");
+			if (result.change.type === "update") {
+				expect(result.change.newContent).toContain("A");
+			}
+			// Durable lock would be `${filePath}.lock` next to the file.
+			await expect(fsp.access(`${filePath}.lock`)).rejects.toBeDefined();
+			const text = await fsp.readFile(filePath, "utf8");
+			expect(text).toBe("a\nb\nc\n");
+		} finally {
+			await fsp.chmod(parent, 0o755);
+		}
 	});
 });
