@@ -5,6 +5,7 @@
 ### Fixed
 
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
+- Windows managed-session resume no longer reports `durability_failed` when Bun rejects `fsync` on the read-only descriptor used to revalidate an existing canonical binding; Windows now uses an owner-writable descriptor for that durability fence while retaining no-follow and pre/post identity/content checks.
 
 ## [0.11.8] - 2026-07-23
 ### Added

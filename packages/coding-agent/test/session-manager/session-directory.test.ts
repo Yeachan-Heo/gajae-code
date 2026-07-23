@@ -234,6 +234,12 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 });
 
 describe("managed session write protocol", () => {
+	it("revalidates an existing canonical binding without a Windows fsync failure", async () => {
+		const { scope } = await fixture();
+
+		await expect(prepareManagedSessionScopeForWrite(scope)).resolves.toMatchObject({ kind: "resolved" });
+		await expect(prepareManagedSessionScopeForWrite(scope)).resolves.toMatchObject({ kind: "resolved" });
+	});
 	it("copy-retains a legacy candidate and coalesces it to its committed v2 transcript", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);

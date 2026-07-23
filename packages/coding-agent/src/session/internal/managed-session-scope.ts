@@ -579,7 +579,12 @@ function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
 	if (captured.bytes.toString("utf8") !== expected) throw new Error("binding_invalid");
 	let descriptor: number | undefined;
 	try {
-		descriptor = fs.openSync(bindingPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		// Bun on Windows rejects fsync on a read-only file descriptor with EPERM.
+		// The managed binding is owner-writable, so reopen it read/write only for the durability fence.
+		descriptor = fs.openSync(
+			bindingPath,
+			(process.platform === "win32" ? fs.constants.O_RDWR : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW,
+		);
 		const before = fs.fstatSync(descriptor, { bigint: true });
 		if (
 			before.dev !== captured.identity.dev ||
