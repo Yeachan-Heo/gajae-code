@@ -1018,8 +1018,8 @@ function draftCommandArgs(args: readonly string[]): string[] {
 			continue;
 		}
 		normalized.push(argument);
-		if ((argument === "--null" || argument === "--json") && !args[index + 1]?.startsWith("--")) continue;
-		if (argument === "--null" || argument === "--json") normalized.push("true");
+		if (argument === "--json" && !args[index + 1]?.startsWith("--")) continue;
+		if (argument === "--json") normalized.push("true");
 	}
 	return normalized;
 }
