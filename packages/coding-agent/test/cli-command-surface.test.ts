@@ -146,6 +146,7 @@ process.exitCode = await child.exited;`;
 			"team",
 			"ultragoal",
 			"gc",
+			"github-review",
 			"ralplan",
 			"config",
 			"stats",
