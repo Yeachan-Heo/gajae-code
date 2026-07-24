@@ -11,7 +11,7 @@
 
 - Rejected subagent schema payloads now retain their complete structured data in canonical output artifacts; inline results remain bounded while `agent://` output stays lossless (#2894).
 - Managed legacy-session artifact migration now validates Windows directory roots from the native tree snapshot, tolerates only lazy metadata on plain Windows directories, and replays both clean and cleanup-pending detaches while retaining fail-closed receipt validation. Canonical binding durability sync uses a writable no-follow handle on Windows NTFS stacks that reject `FlushFileBuffers` on read-only handles (#3015, #2913).
-- A single managed session tombstone that fails to reconcile (e.g. an artifact directory identity mismatch) no longer blocks resume or delete of every other session in the same managed scope; the failure is isolated to that tombstone and logged, unless it belongs to the session currently being opened, which still fails closed (#<issue-1-number>).
+- A single managed session tombstone that fails to reconcile (e.g. an artifact directory identity mismatch) no longer blocks resume or delete of every other session in the same managed scope; the failure is isolated to that tombstone and logged, unless it belongs to the session currently being opened, which still fails closed.
 
 ## [0.11.8] - 2026-07-23
 ### Added
