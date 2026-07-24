@@ -115,6 +115,34 @@ function typedOpaqueOverflowStream(model: Model): AssistantMessageEventStream {
 	});
 	return stream;
 }
+
+function alibabaFirstEventTimeoutStream(model: Model, release: Promise<void>): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	void release.then(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: "Provider stream timed out while waiting for the first event",
+			errorStatus: 503,
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
 function successfulStream(model: Model, content = "Recovered"): AssistantMessageEventStream {
 	return createMockModel({ responses: [{ content: [content] }] }).stream(model, {
 		systemPrompt: [],
@@ -149,9 +177,10 @@ describe("AgentSession managed fallback upstream request counts", () => {
 	function createSession(
 		maxAttempts: number,
 		streamFn: AgentOptions["streamFn"],
+		models?: { primary: Model; fallback: Model },
 	): { primary: Model; fallback: Model } {
-		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
-		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		const primary = models?.primary ?? getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = models?.fallback ?? getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
@@ -423,6 +452,84 @@ describe("AgentSession managed fallback upstream request counts", () => {
 			}),
 		]);
 	});
+	for (const delivery of ["steer", "followUp"] as const) {
+		it(`resets predecessor accounting only when an accepted queued ${delivery} successor starts`, async () => {
+			const primary = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+			const fallback = getBundledModel("openai", "gpt-4o-mini");
+			if (!primary || !fallback) throw new Error("Expected bundled test models");
+			const calls: string[] = [];
+			const timeoutStarted = Promise.withResolvers<void>();
+			const releaseTimeout = Promise.withResolvers<void>();
+			let primaryCalls = 0;
+			createSession(
+				1,
+				(model, _context, _options) => {
+					calls.push(selector(model));
+					if (selector(model) !== selector(primary)) {
+						return successfulStream(model, `Recovered queued ${delivery} successor`);
+					}
+					primaryCalls += 1;
+					if (primaryCalls === 1 || primaryCalls === 3) return typedOpaqueOverflowStream(model);
+					if (primaryCalls === 2) {
+						timeoutStarted.resolve();
+						return alibabaFirstEventTimeoutStream(model, releaseTimeout.promise);
+					}
+					return typedRateLimitStream(model, 50);
+				},
+				{ primary, fallback },
+			);
+			const events: AgentSessionEvent[] = [];
+			const successorQueued = Promise.withResolvers<void>();
+			let queuedSuccessor = false;
+			session!.subscribe(event => {
+				events.push(event);
+				if (event.type !== "agent_end" || queuedSuccessor) return;
+				queuedSuccessor = true;
+				queueMicrotask(() => {
+					void session![delivery](`Queued ${delivery} successor`).then(
+						() => successorQueued.resolve(),
+						error => successorQueued.reject(error),
+					);
+				});
+			});
+
+			const predecessor = session!.prompt("Charge overflow before exact Alibaba timeout");
+			await timeoutStarted.promise;
+			releaseTimeout.resolve();
+			await successorQueued.promise;
+			await predecessor;
+			await session!.waitForIdle();
+
+			expect(calls).toEqual([
+				selector(primary),
+				selector(primary),
+				selector(primary),
+				selector(primary),
+				selector(fallback),
+			]);
+			expect(events.filter(event => event.type === "agent_end")).toHaveLength(2);
+			expect(session!.messages).toContainEqual(
+				expect.objectContaining({
+					role: "assistant",
+					provider: primary.provider,
+					api: primary.api,
+					stopReason: "error",
+					errorMessage: "Provider stream timed out while waiting for the first event",
+				}),
+			);
+			expect(events).toContainEqual(
+				expect.objectContaining({
+					type: "model_fallback_switched",
+					from: selector(primary),
+					to: selector(fallback),
+					reason: "rate_limit",
+					attemptsUsed: 1,
+				}),
+			);
+			expect(session!.agent.hasQueuedMessages()).toBe(false);
+			expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		});
+	}
 	it("N=3 performs exactly three upstream attempts before switching and reports attemptsUsed", async () => {
 		const calls: StreamCall[] = [];
 		const fallbackSwitches: Array<Extract<AgentSessionEvent, { type: "model_fallback_switched" }>> = [];

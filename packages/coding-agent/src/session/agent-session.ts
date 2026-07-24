@@ -4016,8 +4016,21 @@ export class AgentSession {
 						return;
 					}
 					const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
+					const startsQueuedSuccessor =
+						this.agent.state.messages.at(-1)?.role === "assistant" && this.agent.hasQueuedMessages();
 					try {
-						await this.agent.continue(this.#managedFallbackPromptOptions());
+						await this.agent.continue({
+							...this.#managedFallbackPromptOptions(),
+							// Reset only after continue() has claimed the queued turn. Skipped or stale
+							// continuations retain predecessor accounting, and resetAttemptBudget keeps
+							// the sticky fallback cursor unchanged.
+							onRunAccepted: startsQueuedSuccessor
+								? () => {
+										this.#defaultFallbackChain().resetAttemptBudget();
+										this.#overflowMaintenanceAttempts = 0;
+									}
+								: undefined,
+						});
 					} catch (error) {
 						this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
 						throw error;
