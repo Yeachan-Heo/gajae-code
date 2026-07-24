@@ -153,7 +153,10 @@ test("failed generation reload stays blocked during cooldown and retries after e
 		[999, "SIGTERM"],
 		[999, "SIGKILL"],
 	]);
-	const firstAttempt = JSON.parse(fs.readFileSync(attemptPath, "utf8")) as { lastReloadAt: number; targetGeneration: number };
+	const firstAttempt = JSON.parse(fs.readFileSync(attemptPath, "utf8")) as {
+		lastReloadAt: number;
+		targetGeneration: number;
+	};
 	expect(firstAttempt).toMatchObject({ lastReloadAt: 1_000, targetGeneration: DAEMON_GENERATION });
 
 	await expect(

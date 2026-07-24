@@ -44,16 +44,20 @@ function mockFs(
 	for (const [file, value] of [...store]) {
 		if (!file.endsWith("telegram-daemon.state.json")) continue;
 		const state = JSON.parse(value) as Record<string, unknown>;
-		if (typeof state.pid !== "number" || typeof state.incarnation !== "string" || typeof state.ownerId !== "string") continue;
+		if (typeof state.pid !== "number" || typeof state.incarnation !== "string" || typeof state.ownerId !== "string")
+			continue;
 		const lock = file.replace("telegram-daemon.state.json", "telegram-daemon.lock");
 		if (!store.has(lock))
-			store.set(lock, JSON.stringify({
-				pid: state.pid,
-				incarnation: state.incarnation,
-				ownerId: state.ownerId,
-				acquisitionId: state.acquisitionId ?? state.ownerId,
-				startedAt: state.startedAt,
-			}));
+			store.set(
+				lock,
+				JSON.stringify({
+					pid: state.pid,
+					incarnation: state.incarnation,
+					ownerId: state.ownerId,
+					acquisitionId: state.acquisitionId ?? state.ownerId,
+					startedAt: state.startedAt,
+				}),
+			);
 	}
 	const revisions = new Map<string, number>([...store.keys()].map(file => [file, 1]));
 	const unlinked: string[] = [];

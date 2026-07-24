@@ -608,7 +608,12 @@ describe("TelegramDaemonController.reload", () => {
 				if (published) return;
 				published = true;
 				oldAlive = false;
-				const successor = freshState({ pid: 1001, incarnation: "linux:101", ownerId: "next", acquisitionId: "next" });
+				const successor = freshState({
+					pid: 1001,
+					incarnation: "linux:101",
+					ownerId: "next",
+					acquisitionId: "next",
+				});
 				writeState(agentDir, successor);
 				writeOwnershipLock(agentDir, successor);
 			},

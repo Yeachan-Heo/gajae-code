@@ -666,10 +666,23 @@ type OwnerHeartbeatSidecar = {
 	heartbeatAt: number;
 };
 
-function ownerTagFromState(state: DaemonState | undefined): Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | undefined {
-	if (!state || !hasSafeDaemonStateShape(state) || state.stoppedAt !== undefined || !state.ownerId || !state.acquisitionId)
+function ownerTagFromState(
+	state: DaemonState | undefined,
+): Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | undefined {
+	if (
+		!state ||
+		!hasSafeDaemonStateShape(state) ||
+		state.stoppedAt !== undefined ||
+		!state.ownerId ||
+		!state.acquisitionId
+	)
 		return undefined;
-	return { pid: state.pid, incarnation: state.incarnation, ownerId: state.ownerId, acquisitionId: state.acquisitionId };
+	return {
+		pid: state.pid,
+		incarnation: state.incarnation,
+		ownerId: state.ownerId,
+		acquisitionId: state.acquisitionId,
+	};
 }
 
 function sidecarMatchesOwnerTag(
@@ -678,16 +691,16 @@ function sidecarMatchesOwnerTag(
 ): sidecar is OwnerHeartbeatSidecar {
 	return Boolean(
 		sidecar &&
-		tag &&
-		validDaemonPid(sidecar.pid) &&
-		isProcessIncarnation(sidecar.incarnation) &&
-		typeof sidecar.ownerId === "string" &&
-		typeof sidecar.acquisitionId === "string" &&
-		Number.isSafeInteger(sidecar.heartbeatAt) &&
-		sidecar.pid === tag.pid &&
-		sidecar.incarnation === tag.incarnation &&
-		sidecar.ownerId === tag.ownerId &&
-		sidecar.acquisitionId === tag.acquisitionId,
+			tag &&
+			validDaemonPid(sidecar.pid) &&
+			isProcessIncarnation(sidecar.incarnation) &&
+			typeof sidecar.ownerId === "string" &&
+			typeof sidecar.acquisitionId === "string" &&
+			Number.isSafeInteger(sidecar.heartbeatAt) &&
+			sidecar.pid === tag.pid &&
+			sidecar.incarnation === tag.incarnation &&
+			sidecar.ownerId === tag.ownerId &&
+			sidecar.acquisitionId === tag.acquisitionId,
 	);
 }
 
@@ -707,14 +720,18 @@ async function readSidecarLenient(fsImpl: TelegramDaemonFs, file: string): Promi
 	}
 }
 
-export async function readOwnerFreshnessSnapshot(input: {
-	settings: Settings;
-	fs?: TelegramDaemonFs;
-}): Promise<{ ownerTag: Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | null; effectiveHeartbeatAt: number | undefined; legacyEmbedded: boolean; state: DaemonState | undefined }> {
+export async function readOwnerFreshnessSnapshot(input: { settings: Settings; fs?: TelegramDaemonFs }): Promise<{
+	ownerTag: Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | null;
+	effectiveHeartbeatAt: number | undefined;
+	legacyEmbedded: boolean;
+	state: DaemonState | undefined;
+}> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	const state = await readJson<DaemonState>(fsImpl, paths.state);
-	const legacyEmbedded = Boolean(state && (isGenerationAbsentParentDaemonState(state) || isGeneration3ReleaseDaemonState(state)));
+	const legacyEmbedded = Boolean(
+		state && (isGenerationAbsentParentDaemonState(state) || isGeneration3ReleaseDaemonState(state)),
+	);
 	const tag = ownerTagFromState(state);
 	const lock = await readOwnershipLock(fsImpl, paths.lock);
 	const ownerTag = tag && ownershipLockMatchesState(lock, state) ? tag : null;
@@ -724,7 +741,8 @@ export async function readOwnerFreshnessSnapshot(input: {
 	const rereadLock = await readOwnershipLock(fsImpl, paths.lock);
 	const rereadTag = ownerTagFromState(rereadState);
 	const stableTag = rereadTag && ownershipLockMatchesState(rereadLock, rereadState) ? rereadTag : null;
-	const stable = ownerTag && stableTag && sidecarMatchesOwnerTag({ ...ownerTag, heartbeatAt: 0 }, stableTag) ? stableTag : null;
+	const stable =
+		ownerTag && stableTag && sidecarMatchesOwnerTag({ ...ownerTag, heartbeatAt: 0 }, stableTag) ? stableTag : null;
 	const effectiveHeartbeatAt = stable
 		? sidecarMatchesOwnerTag(sidecar, stable)
 			? Math.max(rereadState?.heartbeatAt ?? 0, sidecar.heartbeatAt)
@@ -754,9 +772,24 @@ export async function renewOwnerHeartbeatSidecar(input: {
 	const pid = input.pid ?? state?.pid;
 	const incarnation = (input.pidIncarnation ?? defaultPidIncarnation)(pid ?? 0);
 	const acquisitionId = input.acquisitionId ?? input.ownerId;
-	if (!state || !validDaemonPid(pid) || !isProcessIncarnation(incarnation) || state.pid !== pid || state.incarnation !== incarnation || state.ownerId !== input.ownerId || state.acquisitionId !== acquisitionId || state.stoppedAt !== undefined)
+	if (
+		!state ||
+		!validDaemonPid(pid) ||
+		!isProcessIncarnation(incarnation) ||
+		state.pid !== pid ||
+		state.incarnation !== incarnation ||
+		state.ownerId !== input.ownerId ||
+		state.acquisitionId !== acquisitionId ||
+		state.stoppedAt !== undefined
+	)
 		return false;
-	const sidecar: OwnerHeartbeatSidecar = { pid, incarnation, ownerId: input.ownerId, acquisitionId, heartbeatAt: (input.now ?? Date.now)() };
+	const sidecar: OwnerHeartbeatSidecar = {
+		pid,
+		incarnation,
+		ownerId: input.ownerId,
+		acquisitionId,
+		heartbeatAt: (input.now ?? Date.now)(),
+	};
 	const tmp = `${paths.heartbeat}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
 	await fsImpl.writeFile(tmp, `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o600 });
 	await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
@@ -4305,7 +4338,12 @@ export class TelegramNotificationDaemon {
 		return Math.min(3600, Math.max(1, seconds)) * 1_000;
 	}
 
-	private async callBotApi(rawBotApi: BotApi, method: string, body: unknown, callOpts?: { signal?: AbortSignal; noRetry?: boolean }): Promise<unknown> {
+	private async callBotApi(
+		rawBotApi: BotApi,
+		method: string,
+		body: unknown,
+		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
+	): Promise<unknown> {
 		const now = this.opts.now?.() ?? Date.now();
 		if (method !== "getUpdates" && now < this.botCooldownUntil) {
 			if (this.warnedBotCooldownUntil !== this.botCooldownUntil) {

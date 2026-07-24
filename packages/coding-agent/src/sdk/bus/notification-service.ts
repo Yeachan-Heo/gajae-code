@@ -28,8 +28,8 @@ import {
 	tokenFingerprint,
 } from "./config";
 import { type DaemonPaths, daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
-import { DAEMON_GENERATION } from "./telegram-daemon-contract";
 import { readOwnerFreshnessSnapshot } from "./telegram-daemon";
+import { DAEMON_GENERATION } from "./telegram-daemon-contract";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
 
@@ -580,7 +580,10 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 	}
 
 	// Daemon ownership state (offline; read the persisted state file directly).
-	const snapshot = await readOwnerFreshnessSnapshot({ settings: opts.settings, fs: fs as unknown as import("./telegram-daemon").TelegramDaemonFs });
+	const snapshot = await readOwnerFreshnessSnapshot({
+		settings: opts.settings,
+		fs: fs as unknown as import("./telegram-daemon").TelegramDaemonFs,
+	});
 	const state = snapshot.state ? parseDaemonState(JSON.stringify(snapshot.state)) : undefined;
 	const heartbeatAt = finiteNonNegativeNumber(snapshot.effectiveHeartbeatAt);
 	const daemon: DaemonHealth = {

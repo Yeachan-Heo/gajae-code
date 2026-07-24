@@ -16,6 +16,7 @@ import type { CasReceipt } from "../src/config/atomic-yaml-patch";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 import { getNotificationConfig, maskToken, tokenFingerprint } from "../src/sdk/bus/config";
 import { createTelegramActivationMarker, telegramActivationIdentity } from "../src/sdk/bus/notification-orchestration";
+import { daemonPaths } from "../src/sdk/bus/telegram-daemon";
 import {
 	createLightweightDaemonSettings,
 	loadLightweightDaemonSettings,
@@ -23,8 +24,6 @@ import {
 	runDaemonInternal,
 } from "../src/sdk/bus/telegram-daemon-cli";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../src/sdk/bus/telegram-setup";
-import { daemonPaths } from "../src/sdk/bus/telegram-daemon";
-
 
 type FakeCall = { method: string; body: Record<string, unknown> };
 

@@ -134,7 +134,6 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
-
 async function activeDaemonOwnsToken(input: { botToken: string; chatId: string }): Promise<boolean> {
 	const snapshot = await readOwnerFreshnessSnapshot({ settings: { getAgentDir } as never });
 	const state = snapshot.state;

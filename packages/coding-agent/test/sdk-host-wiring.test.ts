@@ -32,10 +32,10 @@ import type { InteractiveModeContext } from "../src/modes/types";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension, PresentationArbiter } from "../src/sdk/bus";
-import * as telegramDaemon from "../src/sdk/bus/telegram-daemon";
+import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { getNotificationConfig } from "../src/sdk/bus/config";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
-import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
+import * as telegramDaemon from "../src/sdk/bus/telegram-daemon";
 import { SessionSdkHost } from "../src/sdk/host";
 import {
 	attachLifecycleStartupCapability,
@@ -469,20 +469,40 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 	try {
 		const sessionContext = context(cwd, sessionId);
-		const handlers = start(sessionContext, settings, () => {}, false, new Map(), { startupCapability: capability, lifecycleRequired: true }, true, async input => {
-			await telegramDaemon.registerNotificationRoot(input);
-			return "attached";
-		});
+		const handlers = start(
+			sessionContext,
+			settings,
+			() => {},
+			false,
+			new Map(),
+			{ startupCapability: capability, lifecycleRequired: true },
+			true,
+			async input => {
+				await telegramDaemon.registerNotificationRoot(input);
+				return "attached";
+			},
+		);
 		await expect(capability.promise).resolves.toEqual({ status: "started" });
 		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
 		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 		expect(unregister).toHaveBeenCalledTimes(1);
-		expect(errorSpy.mock.calls.some(([message]) => String(message).includes(`SDK notification runtime ${sessionId} owner release failed`))).toBe(true);
+		expect(
+			errorSpy.mock.calls.some(([message]) =>
+				String(message).includes(`SDK notification runtime ${sessionId} owner release failed`),
+			),
+		).toBe(true);
 		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({ version: 1, roots: [], managedRoots: [], sessions: {} });
-		await expect(handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext)).resolves.toBeUndefined();
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
+			version: 1,
+			roots: [],
+			managedRoots: [],
+			sessions: {},
+		});
+		await expect(
+			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
+		).resolves.toBeUndefined();
 	} finally {
 		unregister.mockRestore();
 		errorSpy.mockRestore();
@@ -494,7 +514,10 @@ test("Telegram root ownership is recorded when reconciliation configures Telegra
 	dirs.push(cwd);
 	const sessionId = `telegram-root-reconcile-${Date.now()}`;
 	const settings = telegramSettings(path.join(cwd, "agent"), false);
-	const controller = new NotificationSessionController({ eligible: true, getConfig: () => getNotificationConfig(settings) });
+	const controller = new NotificationSessionController({
+		eligible: true,
+		getConfig: () => getNotificationConfig(settings),
+	});
 	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
 	let registrations = 0;
 	const sessionContext = context(cwd, sessionId);
@@ -517,11 +540,20 @@ test("Telegram root ownership is recorded when reconciliation configures Telegra
 	expect(registrations).toBe(0);
 	settings.set("notifications.telegram.botToken", "123456:token");
 	settings.set("notifications.telegram.chatId", "42");
-	await expect(controller.reconcileCurrentSession(sessionContext as never)).resolves.toMatchObject({ outcome: "started" });
+	await expect(controller.reconcileCurrentSession(sessionContext as never)).resolves.toMatchObject({
+		outcome: "started",
+	});
 	const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
 	expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
-	await expect(handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext)).resolves.toBeUndefined();
-	expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({ version: 1, roots: [], managedRoots: [], sessions: {} });
+	await expect(
+		handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
+	).resolves.toBeUndefined();
+	expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
+		version: 1,
+		roots: [],
+		managedRoots: [],
+		sessions: {},
+	});
 }, 60_000);
 
 test("production SDK host starts exactly one instrumented server (no duplicate auto-host)", async () => {
