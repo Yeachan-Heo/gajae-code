@@ -3095,7 +3095,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 						const state = snapshot.state;
 						const t = now();
 						if (
-							isFreshLiveOwner({
+							isCurrentCompatibleOwner({
 								state,
 								now: t,
 								tokenFingerprint: fp,
@@ -3103,19 +3103,16 @@ export async function ensureTelegramDaemonRunningDetailed(
 								pidAlive,
 								pidIncarnation,
 								effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
-							}) &&
-							isSignalableMatchingOwner({
-								state,
-								tokenFingerprint: fp,
-								chatId: cfg.chatId,
-								pidAlive,
-								pidIncarnation,
 							})
 						)
 							return "attached" as const;
 						if (t >= deadline) break;
 						await sleep(waitStepMs);
 					}
+					// Keep the reservation after a failed reload so concurrent ensures do not
+					// repeatedly signal the same incompatible predecessor. Surface the failed
+					// convergence; the next ensure after cooldown expiry retries the reload.
+					return "blocked_identity" as const;
 				}
 				await writeJsonAtomic(fsImpl, reloadAttemptPath, {
 					lastReloadAt: reloadNow,
@@ -3133,6 +3130,16 @@ export async function ensureTelegramDaemonRunningDetailed(
 			}),
 		);
 		if (reloadResult === "attached") return "attached";
+		if (reloadResult === "blocked_identity") {
+			await restoreNotificationRootRegistration({
+				settings: input.settings,
+				sessionId: input.sessionId,
+				registeredRoot: root,
+				previous,
+				fs: deps.fs,
+			});
+			return "blocked_identity";
+		}
 		if (reloadResult !== "reloaded") {
 			await restoreNotificationRootRegistration({
 				settings: input.settings,

@@ -3548,14 +3548,16 @@ describe("telegram daemon", () => {
 		expect(sleeps).toEqual([1]);
 	});
 
-	test("cooldown attaches to a ready epoch-1 owner with matching provenance", async () => {
+	test("cooldown blocks a ready epoch-1 owner with matching provenance", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const now = 1_000;
 		const paths = daemonPaths(agentDir);
+		const attemptPath = path.join(paths.dir, "telegram-daemon.reload-attempt.json");
+		const signals: Array<[number, NodeJS.Signals]> = [];
 		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, servingEpoch: undefined, heartbeatAt: now });
 		fs.writeFileSync(
-			path.join(paths.dir, "telegram-daemon.reload-attempt.json"),
+			attemptPath,
 			JSON.stringify({ lastReloadAt: now - 1, ownerId: "old", targetGeneration: DAEMON_GENERATION }),
 		);
 		await expect(
@@ -3566,12 +3568,21 @@ describe("telegram daemon", () => {
 					pid: 4242,
 					pidAlive: pid => pid === 999,
 					pidIncarnation: () => "linux:100",
+					sendSignal: (pid, signal) => signals.push([pid, signal]),
+					sleep: async () => undefined,
+					waitStepMs: 1,
+					readinessTimeoutMs: 1,
 					spawn: () => {
-						throw new Error("ready predecessor should attach during cooldown");
+						throw new Error("cooldown must not replace the epoch-1 predecessor");
 					},
 				},
 			),
-		).resolves.toBe("attached");
+		).resolves.toBe("blocked_identity");
+		expect(signals).toEqual([]);
+		expect(JSON.parse(fs.readFileSync(attemptPath, "utf8"))).toMatchObject({
+			lastReloadAt: now - 1,
+			targetGeneration: DAEMON_GENERATION,
+		});
 	});
 
 	test("servingEpoch reload fails when the stale owner never exits", async () => {
