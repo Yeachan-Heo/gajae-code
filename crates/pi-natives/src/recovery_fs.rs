@@ -26,7 +26,11 @@ use sha2::{Digest, Sha256};
 const MAX_CONTENT_BYTES: u64 = 1024 * 1024;
 const MAX_MANAGED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANAGED_TREE_DEPTH: usize = 32;
-const MAX_MANAGED_TREE_FILES: u64 = 10_000;
+const MAX_MANAGED_TREE_FILES: u64 = 50_000;
+// Entries include files and directories. Leave room for the artifact directory,
+// nested directories, and managed transcript, binding, and receipt metadata
+// while preserving the TypeScript artifact-file limit.
+const MAX_MANAGED_TREE_ENTRIES: u64 = 60_000;
 const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
@@ -2285,7 +2289,7 @@ fn snapshot_tree_fd(
 	entries: &mut Vec<crate::path_identity::NativeDirectoryTreeEntry>,
 ) -> Result<(), &'static str> {
 	budget.entries = budget.entries.checked_add(1).ok_or("content_too_large")?;
-	if budget.entries > MAX_MANAGED_TREE_FILES {
+	if budget.entries > MAX_MANAGED_TREE_ENTRIES {
 		return Err("content_too_large");
 	}
 	if depth > MAX_MANAGED_TREE_DEPTH {

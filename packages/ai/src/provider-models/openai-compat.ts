@@ -1100,6 +1100,26 @@ export function zenmuxModelManagerOptions(config?: ZenMuxModelManagerConfig): Mo
 }
 
 // ---------------------------------------------------------------------------
+// 10.5.1 OpenGateway by Sionic AI
+// ---------------------------------------------------------------------------
+
+export interface OpenGatewayModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+/**
+ * OpenGateway by Sionic AI — an OpenAI-compatible gateway that fronts OpenAI,
+ * Anthropic, and Google models behind one API key. Models are discovered from
+ * the OpenAI-compatible `/v1/models` endpoint.
+ */
+export function opengatewayModelManagerOptions(
+	config?: OpenGatewayModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	return createSimpleOpenAICompletionsOptions("opengateway", "https://apis.opengateway.ai/v1", config);
+}
+
+// ---------------------------------------------------------------------------
 // 10.6 Kilo Gateway
 // ---------------------------------------------------------------------------
 

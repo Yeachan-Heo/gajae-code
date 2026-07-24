@@ -26,9 +26,10 @@ import {
 } from "./native-publish-outcome";
 
 export const MANAGED_ARTIFACT_MAX_DEPTH = 32;
-export const MANAGED_ARTIFACT_MAX_FILES = 10_000;
+export const MANAGED_ARTIFACT_MAX_FILES = 50_000;
 export const MANAGED_ARTIFACT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MANAGED_ARTIFACT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+export const MANAGED_ARTIFACT_COPY_BATCH_SIZE = 256;
 const LOCK_LEASE_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
@@ -120,6 +121,7 @@ export type ManagedStorageFailure =
 	| "destination_conflict"
 	| "source_changed"
 	| "unsafe_artifacts"
+	| "artifact_capacity_exceeded"
 	| "durability_failed"
 	| "atomic_unavailable"
 	| "durability_not_provable"
@@ -1638,8 +1640,20 @@ export async function acquireManagedLock(
 	}
 }
 
+export interface ManagedArtifactTreeLimits {
+	maxFiles?: number;
+	maxTotalBytes?: number;
+}
+
 /** Bounds a no-follow artifact tree before it can be copied or deleted. */
-export function validateManagedArtifactTree(root: string): void {
+export function validateManagedArtifactTree(root: string, limits: ManagedArtifactTreeLimits = {}): void {
+	const clampLimit = (limit: number | undefined, maximum: number): number => {
+		if (limit === undefined) return maximum;
+		if (!Number.isFinite(limit) || !Number.isInteger(limit) || limit <= 0) throw new Error("unsafe_artifacts");
+		return Math.min(limit, maximum);
+	};
+	const maxFiles = clampLimit(limits.maxFiles, MANAGED_ARTIFACT_MAX_FILES);
+	const maxTotalBytes = clampLimit(limits.maxTotalBytes, MANAGED_ARTIFACT_MAX_TOTAL_BYTES);
 	let files = 0;
 	let bytes = 0;
 	const visit = (directory: string, depth: number): void => {
@@ -1656,8 +1670,7 @@ export function validateManagedArtifactTree(root: string): void {
 			if (!stat.isFile() || stat.size > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("unsafe_artifacts");
 			files++;
 			bytes += stat.size;
-			if (files > MANAGED_ARTIFACT_MAX_FILES || bytes > MANAGED_ARTIFACT_MAX_TOTAL_BYTES)
-				throw new Error("unsafe_artifacts");
+			if (files > maxFiles || bytes > maxTotalBytes) throw new Error("artifact_capacity_exceeded");
 		}
 	};
 	const rootStat = fs.lstatSync(root);

@@ -40,6 +40,7 @@ export type OAuthProvider =
 	| "openai-codex-device"
 	| "opencode-go"
 	| "opencode-zen"
+	| "opengateway"
 	| "parallel"
 	| "perplexity"
 	| "qianfan"

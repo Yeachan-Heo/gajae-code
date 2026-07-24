@@ -1998,6 +1998,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "opengateway": {
+				const { loginOpenGateway } = await import("./utils/oauth/opengateway");
+				const apiKey = await loginOpenGateway(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			default: {
 				const customProvider = getOAuthProvider(provider);
 				if (!customProvider) {
