@@ -1394,10 +1394,20 @@ pub(crate) mod platform {
 		let name = CString::new(final_name)
 			.map_err(|_| NativeOwnerOnlySecurityResult::failure("io_error"))?;
 		let named = statat(&current, &name)?;
+		let expected_kind = if kind == "directory" {
+			libc::S_IFDIR
+		} else {
+			libc::S_IFREG
+		};
 		let is_directory = named.st_mode & libc::S_IFMT == libc::S_IFDIR;
+		if named.st_mode & libc::S_IFMT != expected_kind {
+			return Err(NativeOwnerOnlySecurityResult::failure("not_directory"));
+		}
 		let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDONLY;
 		if is_directory {
 			flags |= libc::O_DIRECTORY;
+		} else {
+			flags |= libc::O_NONBLOCK;
 		}
 		// SAFETY: current is retained, name is validated and NUL-terminated, and
 		// O_NOFOLLOW rejects symlinks.
@@ -1428,11 +1438,6 @@ pub(crate) mod platform {
 		if !stat_same_object(&named, &initial) {
 			return Err(NativeOwnerOnlySecurityResult::failure("identity_mismatch"));
 		}
-		let expected_kind = if kind == "directory" {
-			libc::S_IFDIR
-		} else {
-			libc::S_IFREG
-		};
 		if initial.st_mode & libc::S_IFMT != expected_kind {
 			return Err(NativeOwnerOnlySecurityResult::failure("not_directory"));
 		}

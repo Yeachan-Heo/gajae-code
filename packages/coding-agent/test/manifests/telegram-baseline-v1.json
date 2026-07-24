@@ -278,6 +278,41 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-telegram-daemon-2956-redteam.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-telegram-daemon-2956.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-telegram-daemon-2960-redteam.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-telegram-daemon-2960.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-telegram-daemon-self-heal.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-telegram-daemon.test.ts"
 			]
 		},
@@ -342,6 +377,13 @@
 				"bun",
 				"test",
 				"packages/coding-agent/test/telegram-send-tool.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/telegram-setup-preflight.test.ts"
 			]
 		}
 	],

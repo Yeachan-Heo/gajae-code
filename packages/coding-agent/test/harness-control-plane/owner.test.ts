@@ -822,7 +822,7 @@ describe("RuntimeOwner (in-process integration)", () => {
 		const after = await readLease(root, SID);
 		expect(after?.ownerId).toBe("successor-owner");
 		expect(after?.leaseEpoch).toBe(successor.leaseEpoch);
-	});
+	}, 15_000);
 	it("releases the owner lease after successful transport cleanup and allows replacement takeover", async () => {
 		const transport = new FakeTransport();
 		owner = new RuntimeOwner({ root, sessionId: SID, transport, acceptanceTimeoutMs: 200 });

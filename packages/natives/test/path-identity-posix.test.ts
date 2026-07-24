@@ -145,6 +145,15 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		});
 		expect((await fs.stat(directory)).mode & 0o777).toBe(0o755);
 	});
+	it("rejects a FIFO without blocking on open", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const fifo = path.join(root, "state.fifo");
+		const created = Bun.spawnSync(["mkfifo", fifo]);
+		expect(created.exitCode, created.stderr.toString()).toBe(0);
+
+		expect(verifyOwnerOnlyPathSecurity(fifo, "file")).toEqual({ ok: false, code: "not_directory" });
+	});
 	it("rejects an unauthorized exact-unlink identity without deleting a replacement", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
 		temporaryDirectories.push(root);
