@@ -22,14 +22,44 @@ const finalPlanContractPatterns = [
 	/Final plan must include ADR \(Decision, Drivers, Alternatives considered, Why chosen, Consequences, Follow-ups\)/u,
 	/workflowGate: \{ stage: "ralplan", kind: "approval" \}/u,
 	/mark the plan `pending approval`/u,
+	/Recommended execution: <ultragoal\|team> — <reason>/u,
+	/Recommend \*\*ultragoal\*\* by default/u,
+	/Recommend \*\*team\*\* only when the finalized plan specifically requires tmux-backed live worker coordination/u,
+	/`recommended` index to the matching execution option/u,
+	/Always offer all four choices: \*\*Approve execution via ultragoal\*\*, \*\*Approve execution via team\*\*, \*\*Refine further\*\*, and \*\*Stop here\*\*/u,
 ] as const;
 
 const criticApprovalContractPatterns = [
-	/Any non-`OKAY` Critic verdict \(`ITERATE` or `REJECT`\)/u,
+	/non-`OKAY` Critic verdict/u,
 	/until Critic returns `OKAY` \*\*and\*\* Architect is `CLEAR`\/`APPROVE`/u,
-	/without Critic `OKAY` plus Architect `CLEAR`\/`APPROVE`/u,
 	/After the review join gate has both Critic `OKAY` and Architect `CLEAR`\/`APPROVE`/u,
 	/re-check the review join gate \(Critic `OKAY` plus Architect `CLEAR`\/`APPROVE`/u,
+] as const;
+
+const convergenceContractPatterns = [
+	/Convergence contract/u,
+	/blocker ledger with stable IDs/u,
+	/materially incompatible contracts/u,
+	/`NEW` blocker after pass 2 requires newly inspected evidence or a regression introduced by the revision/u,
+	/Resolve open choices autonomously before asking/u,
+	/right-size it into the smallest safe executable slice/u,
+	/never add unofficial "expanded" or extra review passes/u,
+	/At the ceiling, do not spawn more reviewers/u,
+	/MUST resume or steer the persisted Planner immediately in the same turn/u,
+	/Background completion notifications are never user prompts/u,
+	/start exactly one fresh ralplan run bound to that narrower choice without waiting for additional user instruction/u,
+	/Use `ask` only when that order still leaves an irreversible user-visible fork/u,
+] as const;
+
+const roleConvergencePatterns = [
+	{ name: "planner", pattern: /Blocker Resolution Ledger/u },
+	{ name: "architect", pattern: /exact closure text/u },
+	{ name: "critic", pattern: /distinguish execution blockers from bounded follow-up notes/u },
+] as const;
+const roleAutonomyPatterns = [
+	{ name: "planner", pattern: /Resolve missing choices autonomously/u },
+	{ name: "architect", pattern: /Do not require user confirmation merely because another design is possible/u },
+	{ name: "critic", pattern: /Do not force a user round-trip merely because another viable preference exists/u },
 ] as const;
 
 const ralplanReviewPipelineContractPatterns = [
@@ -91,6 +121,20 @@ describe("ralplan decision artifacts", () => {
 
 		for (const pattern of ralplanReviewPipelineContractPatterns) {
 			expect(content).toMatch(pattern);
+		}
+		for (const pattern of convergenceContractPatterns) {
+			expect(content).toMatch(pattern);
+		}
+		for (const contract of roleConvergencePatterns) {
+			const agent = getBundledAgent(contract.name);
+			if (!agent) throw new Error(`missing bundled ${contract.name} agent`);
+			expect(agent.systemPrompt).toMatch(contract.pattern);
+			expect(agent.systemPrompt).toMatch(/stable blocker/u);
+		}
+		for (const contract of roleAutonomyPatterns) {
+			const agent = getBundledAgent(contract.name);
+			if (!agent) throw new Error(`missing bundled ${contract.name} agent`);
+			expect(agent.systemPrompt).toMatch(contract.pattern);
 		}
 		for (const pattern of staleReviewPipelineContractPatterns) {
 			expect(content).not.toMatch(pattern);

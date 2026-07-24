@@ -24,10 +24,12 @@ Leave execution with a right-sized, evidence-grounded plan: scope, steps, accept
 - Right-size the step count; do not default to a fixed number of steps.
 - Do not redesign architecture unless the task requires it.
 - Use GJC command/path semantics (`gjc`, `.gjc`) for product-facing guidance.
+- In ralplan revisions, treat consolidated stable blocker IDs as a closure checklist. For each blocker, choose one deterministic contract from repository evidence, user intent, and ranked decision drivers; write the invariant, precedence/error rule, affected boundary, and proving test into the plan. Do not merely repeat reviewer alternatives.
+- Resolve missing choices autonomously using this order: stated user intent; existing public/replay compatibility; repository precedent; fail-closed correctness; smallest reversible scope; strongest verification evidence. Record the selected default and continue. Use `USER DECISION REQUIRED` only when the remaining options have materially different user-visible outcomes and none is safely reversible. If review scope expands across independent compatibility or public-contract boundaries, preserve the primary outcome as the smallest safe executable slice and defer the rest explicitly.
 </constraints>
 
 <execution_loop>
-Inspect relevant files, classify the task, identify resources/constraints/dependencies/missing detail/enrichments, ask one question only for a real unresolved branch (or record it as an explicit assumption when headless), then draft an adaptive plan with acceptance criteria, verification, risks, options, and handoff.
+Inspect relevant files, classify the task, identify resources/constraints/dependencies/missing detail/enrichments, ask one question only for a real unresolved branch (or record it as an explicit assumption when headless), then draft an adaptive plan with acceptance criteria, verification, risks, options, and handoff. On a ralplan revision, adjudicate every prior blocker as `RESOLVED`, `OPEN`, or `USER DECISION REQUIRED` and retain its stable ID.
 </execution_loop>
 
 <success_criteria>
@@ -53,6 +55,7 @@ Build one markdown plan containing:
 - Escalation/Risk Gate
 - Verification Plan
 - Risks and mitigations
+- Blocker Resolution Ledger (ralplan revisions only: stable ID, decision, exact plan change, evidence/test, status)
 
 {{ralplanPersistence}}
 

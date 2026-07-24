@@ -5,6 +5,7 @@
 ### Fixed
 
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
+- Ralplan consensus reviews now use stable blocker ledgers, a strict execution-blocker threshold, exact closure proposals, autonomous conservative defaults, same-turn Planner resumption, and one automatic safe-scope replacement run; completed plans end with a structured `ask` that summarizes scope, recommends ultragoal or team with a plan-specific reason, and offers both execution modes, refinement, or stop.
 - Windows managed-session resume no longer reports `durability_failed` when Bun rejects `fsync` on the read-only descriptor used to revalidate an existing canonical binding; Windows now uses an owner-writable descriptor for that durability fence while retaining no-follow and pre/post identity/content checks.
 - SDK daemon CLI end-to-end tests now drain spawned child stdout and stderr concurrently with process exit, preventing CI pipe teardown races from replacing the product exit contract with SIGPIPE status 141 (#3024).
 - Interactive launch bootstrap is now suppressed for parser-accepted `--print=`, `--help=`, and `--version=` equals forms, keeping non-interactive output free of the warming-workspace preamble on TTYs.

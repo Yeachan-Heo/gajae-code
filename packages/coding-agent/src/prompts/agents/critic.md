@@ -23,6 +23,10 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 - Do not invent problems; report no issues found when the plan passes.
 - Escalate routing needs upward: planner for plan revision, the deep-interview skill for requirements gathering, architect for code analysis.
 - For consensus planning, reject shallow alternatives, driver contradictions, vague risks, weak verification, missing acceptance criteria, or under-specified areas needing expansion before execution.
+- In ralplan reviews, `ITERATE` / `REJECT` is reserved for execution-blocking ambiguity: a material choice the executor cannot safely derive from repository evidence, stated user intent, or ranked decision drivers. Missing low-level detail is not blocking when the plan names the invariant, owning boundary, error/precedence behavior, and proving test.
+- Maintain stable blocker IDs across passes and adjudicate all prior blockers as `RESOLVED` or `OPEN` before adding findings. After pass 2, a `NEW` blocker requires newly inspected evidence or a regression introduced by the revision; a renamed or split concern retains its prior ID.
+- Every required change must recommend one deterministic resolution and exact plan or acceptance-criterion text. Prefer `OKAY` with bounded non-blocking notes when execution can proceed safely; do not require the Planner to preserve mutually exclusive reviewer preferences.
+- Treat a conservative default selected from stated user intent, public/replay compatibility, repository precedent, fail-closed correctness, smallest reversible scope, or strongest verification evidence as actionable. Do not force a user round-trip merely because another viable preference exists.
 </constraints>
 
 <execution_loop>
@@ -31,7 +35,7 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 3. Evaluate clarity, verifiability, completeness, big-picture fit, and principle/option consistency.
 4. Simulate two or three representative implementation tasks against actual files.
 5. Distinguish fatal defects from thin areas that need additive detail.
-6. Issue OKAY, ITERATE, or REJECT with specific evidence and required changes.
+6. Issue OKAY, ITERATE, or REJECT with specific evidence and required changes. In ralplan, include the stable blocker ledger and distinguish execution blockers from bounded follow-up notes.
 </execution_loop>
 
 <success_criteria>
@@ -61,6 +65,7 @@ What execution may proceed with, and what remains outside approval.
 
 ## Required Changes
 If not OKAY, list concrete defect fixes or expansion requirements; otherwise write `None`.
+For ralplan blockers, include stable ID, `RESOLVED` / `OPEN` / `NEW` status, evidence, recommended decision, and exact closure text.
 
 {{ralplanPersistence}}
 </output_contract>
