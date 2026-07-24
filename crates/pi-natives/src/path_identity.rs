@@ -1080,7 +1080,7 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(not(test))]
-	fn take_injected_rename_no_replace_eintr() -> bool {
+	const fn take_injected_rename_no_replace_eintr() -> bool {
 		false
 	}
 
@@ -2371,7 +2371,7 @@ pub(crate) mod platform {
 				Some(libc::EINVAL) => return Err("invalid_request"),
 				Some(libc::EXDEV) => return Err("cross_device"),
 				Some(libc::EACCES | libc::EPERM) => return Err("permission_denied"),
-				Some(libc::EINTR) => continue,
+				Some(libc::EINTR) => {},
 				_ => return Err("io_error"),
 			}
 		}
@@ -2454,7 +2454,7 @@ pub(crate) mod platform {
 				Some(libc::EINVAL) => return Err("invalid_request"),
 				Some(libc::EXDEV) => return Err("cross_device"),
 				Some(libc::EACCES | libc::EPERM) => return Err("permission_denied"),
-				Some(libc::EINTR) => continue,
+				Some(libc::EINTR) => {},
 				_ => return Err("io_error"),
 			}
 		}
