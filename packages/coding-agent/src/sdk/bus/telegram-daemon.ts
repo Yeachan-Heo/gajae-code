@@ -5705,7 +5705,12 @@ export class TelegramNotificationDaemon {
 		const toolCallId = typeof msg.toolCallId === "string" ? msg.toolCallId : undefined;
 		const toolName = typeof msg.toolName === "string" ? msg.toolName : undefined;
 		const phase = typeof msg.phase === "string" ? msg.phase : undefined;
-		if (!toolCallId || !toolName || !phase) return undefined;
+		if (
+			!toolCallId ||
+			!toolName ||
+			(phase !== "started" && phase !== "completed" && phase !== "failed" && phase !== "cancelled")
+		)
+			return undefined;
 		return {
 			sessionId: this.#logicalSessionId(session),
 			toolCallId,
