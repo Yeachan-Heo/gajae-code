@@ -60,29 +60,36 @@ describe("routing adversarial contract probes", () => {
 		expect(effectiveFallbackDelay(100, 1_000, 1, THREE_HOURS_MS, () => 1)).toBe(THREE_HOURS_MS);
 	});
 
-	test("charges rotated-entry retries against the chain-wide attempt budget", () => {
+	test("tries a rotated Fable credential once before falling back to Opus", () => {
+		const fable = "anthropic/claude-fable-5:high";
+		const opus = "anthropic/claude-opus-5:high";
 		const controller = new FallbackChainController(
-			{ role: "default", entries: ["xai/grok", "anthropic/claude"], origin: "test", explicitHead: true },
-			1,
+			{ role: "default", entries: [fable, opus], origin: "test", explicitHead: true },
+			3,
 		);
-		controller.onAttemptStarted();
-		expect(controller.onAttemptFailure("quota", "429")).toBe("advance");
-		expect(controller.currentSelector()).toBe("anthropic/claude");
+
+		for (let attempt = 1; attempt <= 3; attempt += 1) {
+			controller.onAttemptStarted();
+			expect(controller.onAttemptFailure("quota", `Fable credential A ${attempt}`)).toBe(
+				attempt < 3 ? "retry" : "advance",
+			);
+		}
+		expect(controller.currentSelector()).toBe(opus);
 
 		expect(controller.restorePreviousEntryForRetry()).toBe(true);
-		expect(controller.currentSelector()).toBe("xai/grok");
-		expect(controller.attemptsUsed).toBe(0);
-		expect(controller.totalAttemptsUsed).toBe(1);
-		expect(controller.tried).toHaveLength(1);
+		expect(controller.currentSelector()).toBe(fable);
+		expect(controller.attemptsUsed).toBe(2);
+		expect(controller.totalAttemptsUsed).toBe(3);
 
 		controller.onAttemptStarted();
-		expect(controller.onAttemptFailure("quota", "429 again")).toBe("exhausted");
-		expect(controller.totalAttemptsUsed).toBe(2);
-		expect(controller.tried).toHaveLength(2);
-		expect(controller.currentSelector()).toBeUndefined();
+		expect(controller.onAttemptFailure("quota", "Fable credential B")).toBe("advance");
+		expect(controller.currentSelector()).toBe(opus);
+		expect(controller.restorePreviousEntryForRetry()).toBe(false);
+		expect(controller.totalAttemptsUsed).toBe(4);
+		expect(controller.tried.map(failure => failure.selector)).toEqual([fable, fable, fable, fable]);
 	});
 
-	test("caps multiple credential rotations at the configured chain budget", () => {
+	test("bounds credential rotations without starving downstream entries", () => {
 		const controller = new FallbackChainController(
 			{
 				role: "default",
@@ -93,25 +100,27 @@ describe("routing adversarial contract probes", () => {
 			1,
 		);
 
-		for (let attempt = 1; attempt <= 3; attempt += 1) {
-			controller.onAttemptStarted();
-			const outcome = controller.onAttemptFailure("quota", `429 credential ${attempt}`);
-			expect(controller.totalAttemptsUsed).toBe(attempt);
-			expect(controller.tried).toHaveLength(attempt);
-			if (attempt < 3) {
-				expect(outcome).toBe("advance");
-				expect(controller.restorePreviousEntryForRetry()).toBe(true);
-				expect(controller.attemptsUsed).toBe(0);
-			} else {
-				expect(outcome).toBe("exhausted");
-			}
-		}
-
-		expect(controller.currentSelector()).toBeUndefined();
 		controller.onAttemptStarted();
-		expect(controller.onAttemptFailure("quota", "budget already exhausted")).toBe("exhausted");
-		expect(controller.totalAttemptsUsed).toBe(3);
-		expect(controller.tried).toHaveLength(3);
+		expect(controller.onAttemptFailure("quota", "grok credential A")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(true);
+		controller.onAttemptStarted();
+		expect(controller.onAttemptFailure("quota", "grok credential B")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(false);
+		expect(controller.currentSelector()).toBe("anthropic/claude");
+
+		controller.onAttemptStarted();
+		expect(controller.onAttemptFailure("quota", "claude credential A")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(true);
+		controller.onAttemptStarted();
+		expect(controller.onAttemptFailure("quota", "claude credential B")).toBe("advance");
+		expect(controller.restorePreviousEntryForRetry()).toBe(false);
+		expect(controller.currentSelector()).toBe("openai/gpt");
+
+		controller.onAttemptStarted();
+		expect(controller.onAttemptFailure("quota", "gpt exhausted")).toBe("exhausted");
+		expect(controller.totalAttemptsUsed).toBe(5);
+		expect(controller.tried).toHaveLength(5);
+		expect(controller.currentSelector()).toBeUndefined();
 	});
 
 	test("invalidates availability for every auth and environment mutation while preserving identity between mutations", () => {
