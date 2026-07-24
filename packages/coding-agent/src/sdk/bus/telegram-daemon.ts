@@ -8080,12 +8080,23 @@ export class TelegramNotificationDaemon {
 				? (this.replayToolActivityEpochs.get(threadedFrame) ?? this.toolActivityPolicyEpoch)
 				: undefined;
 			if (toolActivity) toolActivity.policyEpoch = toolAdmissionEpoch;
-			const toolStartIsCurrent = (): boolean =>
-				toolActivity?.phase !== "started" ||
-				(this.toolActivityAuthorityIsCurrent(toolActivity) &&
-					!this.toolActivityStopping &&
-					this.opts.toolActivity?.enabled === true &&
-					toolAdmissionEpoch === this.toolActivityPolicyEpoch);
+			const toolFrameIsCurrent = (): boolean => {
+				if (!toolActivity) return true;
+				if (toolActivity.phase === "started") {
+					return (
+						this.toolActivityAuthorityIsCurrent(toolActivity) &&
+						!this.toolActivityStopping &&
+						this.opts.toolActivity?.enabled === true &&
+						toolAdmissionEpoch === this.toolActivityPolicyEpoch
+					);
+				}
+				const liveKey = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
+				const owner = this.toolActivityOwners.get(liveKey);
+				if (owner && owner.session !== session) return false;
+				if (this.opts.toolActivity?.enabled === true && toolAdmissionEpoch === this.toolActivityPolicyEpoch)
+					return true;
+				return this.liveMessages.has(liveKey) && owner?.session === session;
+			};
 			const abandonStaleToolStart = (): void => {
 				if (toolActivity?.phase !== "started") return;
 				const key = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
@@ -8097,7 +8108,7 @@ export class TelegramNotificationDaemon {
 				const liveKey = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
 				const currentOwner = this.toolActivityOwners.get(liveKey);
 				if (toolActivity.phase === "started") {
-					if (!toolStartIsCurrent()) return;
+					if (!toolFrameIsCurrent()) return;
 					this.toolActivityOwners.set(liveKey, toolActivity);
 				} else {
 					if (currentOwner && currentOwner.session !== session) return;
@@ -8131,7 +8142,7 @@ export class TelegramNotificationDaemon {
 			const socketLease = this.#socketLease(session, logicalSessionId);
 			if (!socketLease) return;
 			const existingTopic = await this.existingTopicForPrivateChat(logicalSessionId);
-			if (!toolStartIsCurrent()) {
+			if (!toolFrameIsCurrent()) {
 				abandonStaleToolStart();
 				return;
 			}
@@ -8195,7 +8206,7 @@ export class TelegramNotificationDaemon {
 				await this.reconcileUserTopicName(topicLease);
 				return;
 			}
-			if (!toolStartIsCurrent()) {
+			if (!toolFrameIsCurrent()) {
 				abandonStaleToolStart();
 				return;
 			}
