@@ -105,6 +105,12 @@ export class WebhookRouter {
 		if (isBot(user)) return silent("bot author");
 		const body = (comment.body as string | undefined) ?? "";
 		if (!mentionsBot(body, this.config.botAliases)) return silent("no trigger");
+		if (!this.isTrusted(comment.author_association)) {
+			// Inline replies drive a terminal-capable session; unknown accounts
+			// get NO ack and NO session (prompt-injection surface).
+			this.service.logEvent("unauthorized", { repo, kind: "review_comment", login: user.login });
+			return silent("author not authorized");
+		}
 		await this.service.ackReaction(repo, comment.id as number | undefined, true);
 		const pr = (payload.pull_request ?? {}) as { number?: number };
 		const num = pr.number ?? 0;
@@ -135,9 +141,15 @@ export class WebhookRouter {
 		const body = (comment.body as string | undefined) ?? "";
 		const num = issue.number ?? 0;
 		const command = parseCommand(body, this.config.botAliases);
+		if ((command || mentionsBot(body, this.config.botAliases)) && !this.isTrusted(comment.author_association)) {
+			// Commands and chat spawn terminal-capable sessions as the daemon's
+			// OS user; unknown accounts get NO ack and NO session.
+			this.service.logEvent("unauthorized", { repo, pr: num, kind: "issue_comment", login: user.login });
+			return silent("author not authorized");
+		}
 		if (command) {
 			await this.service.ackReaction(repo, comment.id as number | undefined);
-			const handled = await this.handleCommand(command.cmd, command.args, repo, num);
+			const handled = await this.handleCommand(command.cmd, command.args, repo, num, comment.author_association);
 			if (handled) return handled;
 		}
 		if (action === "edited") return silent("edited without new command"); // 중복 채팅 응답 방지
@@ -147,7 +159,13 @@ export class WebhookRouter {
 	}
 
 	/** Handle `<mention> <cmd>`. Returns null for unrecognized commands (falls through to chat). */
-	private async handleCommand(cmd: string, args: string, repo: string, num: number): Promise<RouteAction | null> {
+	private async handleCommand(
+		cmd: string,
+		args: string,
+		repo: string,
+		num: number,
+		authorAssociation: unknown,
+	): Promise<RouteAction | null> {
 		switch (cmd) {
 			case "help":
 				return run(replyInstr(this.ctx, repo, num, helpText(this.ctx)));
@@ -160,7 +178,7 @@ export class WebhookRouter {
 			case "review":
 				return await this.handleReviewCommand(repo, num);
 			case "pause":
-				this.service.store.setPrState(repo, num, { paused: true });
+				await this.service.store.setPrState(repo, num, { paused: true });
 				return run(
 					replyInstr(
 						this.ctx,
@@ -170,7 +188,7 @@ export class WebhookRouter {
 					),
 				);
 			case "resume":
-				this.service.store.setPrState(repo, num, { paused: false });
+				await this.service.store.setPrState(repo, num, { paused: false });
 				return run(
 					replyInstr(
 						this.ctx,
@@ -179,9 +197,16 @@ export class WebhookRouter {
 						`▶️ 자동 리뷰 재개. \`${this.ctx.mention} review\` 로 지금 바로 돌릴 수도 있어.`,
 					),
 				);
-			case "learn":
+			case "learn": {
+				// `learn` is persistent prompt state injected into every future
+				// review — a stricter trust boundary than one-shot commands.
+				if (!this.isAllowed(authorAssociation, this.config.learnAssociations)) {
+					this.service.logEvent("unauthorized", { repo, pr: num, kind: "learn" });
+					return run(replyInstr(this.ctx, repo, num, "🔒 `learn` 은 리포 오너만 쓸 수 있어."));
+				}
 				this.service.addLearning(repo, args);
 				return run(replyInstr(this.ctx, repo, num, `🧠 학습함: ${args}  (이후 리뷰에 반영할게.)`));
+			}
 			default:
 				return null;
 		}
@@ -198,12 +223,12 @@ export class WebhookRouter {
 			this.service.logEvent("cmd_review_no_sha", { repo, pr: num });
 			return run(forceReviewInstr(this.ctx, repo, num));
 		}
-		const { status, state } = this.service.store.tryAcquireReview(repo, num, sha, this.config.maxInflight);
+		const { status, state } = await this.service.store.tryAcquireReview(repo, num, sha, this.config.maxInflight);
 		this.service.logEvent("trigger", { mode: "cmd_review", repo, pr: num, sha, gate: status });
 		switch (status) {
 			case "duplicate": {
 				if (state.dup_notified_sha === sha) return silent("duplicate already notified"); // 재알림 스팸 금지
-				this.service.store.setPrState(repo, num, { dup_notified_sha: sha });
+				await this.service.store.setPrState(repo, num, { dup_notified_sha: sha });
 				return run(
 					replyInstr(
 						this.ctx,
@@ -246,6 +271,7 @@ export class WebhookRouter {
 			draft?: boolean;
 			user?: GithubUser;
 			head?: { sha?: string };
+			author_association?: unknown;
 		};
 		if (pr.draft) return silent("draft");
 		if (isBot(pr.user ?? {})) return silent("bot author");
@@ -259,7 +285,7 @@ export class WebhookRouter {
 		const lastSha = prState.last_reviewed_sha;
 		if (lastSha && lastSha === headSha) return silent("sha already reviewed"); // 재배달/무변경 push 방지
 
-		const { status } = this.service.store.tryAcquireReview(repo, num, headSha, this.config.maxInflight);
+		const { status } = await this.service.store.tryAcquireReview(repo, num, headSha, this.config.maxInflight);
 		this.service.logEvent("trigger", { mode: "auto", action, repo, pr: num, sha: headSha, gate: status });
 		if (status !== "acquired") return silent(`gate ${status}`); // 완료헬퍼·sweeper가 이어받음
 
@@ -269,10 +295,21 @@ export class WebhookRouter {
 		const instruction = buildReview(this.ctx, repo, num, headSha, {
 			closeLine: closeLineFor(this.ctx, repo, num, headSha),
 			incremental,
+			// The 4.5 cleanup mutates via the operator's user-scoped `gh`;
+			// only trusted PR authors may steer that lane.
+			resolveOutdatedThreads: this.isTrusted(pr.author_association),
 			baseSha: lastSha,
 			config: cfg,
 			learnings,
 		});
 		return run(instruction, { repo, pr: num, sha: headSha });
+	}
+
+	private isTrusted(association: unknown): boolean {
+		return this.isAllowed(association, this.config.allowedAssociations);
+	}
+
+	private isAllowed(association: unknown, allowed: string[]): boolean {
+		return typeof association === "string" && allowed.includes(association.toUpperCase());
 	}
 }

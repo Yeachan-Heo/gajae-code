@@ -88,7 +88,7 @@ export async function completeReviewRun(
 	try {
 		const ok = verdict === "success";
 		const conclusion: Verdict = verdict === "success" || verdict === "failure" ? verdict : "neutral";
-		const result = service.store.completeReview(repo, pr, sha, ok);
+		const result = await service.store.completeReview(repo, pr, sha, ok);
 		if (result.stale) {
 			// A newer review owns the lock — just close our own check by sha.
 			await service.closeCheck(repo, sha, null, conclusion);

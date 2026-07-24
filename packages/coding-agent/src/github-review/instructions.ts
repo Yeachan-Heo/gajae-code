@@ -141,6 +141,13 @@ export interface BuildReviewOptions {
 	closeLine?: string;
 	force?: boolean;
 	incremental?: boolean;
+	/**
+	 * Include the incremental outdated-thread cleanup (4.5). It routes
+	 * resolveReviewThread mutations through the operator's user-scoped `gh`
+	 * (App tokens are FORBIDDEN there), so callers must only enable it for
+	 * trusted PR authors.
+	 */
+	resolveOutdatedThreads?: boolean;
 	baseSha?: string;
 	config?: RepoReviewConfig;
 	learnings?: string;
@@ -157,7 +164,14 @@ export function buildReview(
 	headSha: string,
 	options: BuildReviewOptions = {},
 ): string {
-	const { closeLine = "", force = false, incremental = false, baseSha, learnings = "" } = options;
+	const {
+		closeLine = "",
+		force = false,
+		incremental = false,
+		baseSha,
+		learnings = "",
+		resolveOutdatedThreads = false,
+	} = options;
 	const cfg = options.config ?? {};
 	const jsonTemplate = REVIEW_JSON.replace("<COMMIT>", headSha);
 	const fetch =
@@ -205,7 +219,7 @@ export function buildReview(
 		`   ② terminal로 게시: ${ctx.postCmd} api --method POST repos/${repo}/pulls/${num}/reviews ` +
 		`--input /tmp/${ctx.markerPrefix}-review-${num}.json\n` +
 		"   JSON 깨졌으면 comments 빼고 body만이라도 반드시 게시.\n";
-	const outdated = !inc
+	const outdated = !(inc && resolveOutdatedThreads)
 		? ""
 		: "4.5) **해소된 이전 지적 정리**: 이번 diff 에서 변경/삭제된 라인의 봇 스레드만 GraphQL 로 resolve" +
 			`(reviewThreads 조회 → isResolved=false + 작성자 login == "${ctx.botLogin}" ` +

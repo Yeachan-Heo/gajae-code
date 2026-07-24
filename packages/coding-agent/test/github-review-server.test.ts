@@ -12,7 +12,7 @@ import {
 	verifySignature,
 } from "../src/github-review/server";
 import { ReviewService } from "../src/github-review/service";
-import { detectMissedPrs } from "../src/github-review/sweeper";
+import { detectMissedPrs, runSweep } from "../src/github-review/sweeper";
 
 const SECRET = "s3cret";
 const tmps: string[] = [];
@@ -44,6 +44,8 @@ function testConfig(overrides: Partial<GithubReviewConfig> = {}): GithubReviewCo
 		cwd: os.tmpdir(),
 		dataDir,
 		ignoreRepos: [],
+		allowedAssociations: ["OWNER", "MEMBER", "COLLABORATOR"],
+		learnAssociations: ["OWNER"],
 		repoConfigFile: ".gajae.yaml",
 		inflightStaleSeconds: 20 * 60,
 		sweepIntervalSeconds: 0,
@@ -90,11 +92,11 @@ describe("verifySignature", () => {
 
 describe("DeliveryLog", () => {
 	test("dedupes and bounds memory", () => {
-		const log = new DeliveryLog(4);
+		const log = new DeliveryLog(undefined, 6 * 3600_000, 4);
 		expect(log.alreadySeen("a")).toBe(false);
 		expect(log.alreadySeen("a")).toBe(true);
 		for (const id of ["b", "c", "d", "e"]) log.alreadySeen(id);
-		// "a" was evicted by the LRU trim → treated as new again
+		// "a" was evicted by the capacity bound → treated as new again
 		expect(log.alreadySeen("a")).toBe(false);
 	});
 });
@@ -149,9 +151,9 @@ describe("completeReviewRun", () => {
 		const config = testConfig();
 		const service = new ReviewService(config);
 		// Start a review with a pending supersede and a recorded check.
-		service.store.tryAcquireReview("acme/web", 42, "aaa");
-		service.store.setPrState("acme/web", 42, { check_id: 77 });
-		service.store.tryAcquireReview("acme/web", 42, "bbb");
+		await service.store.tryAcquireReview("acme/web", 42, "aaa");
+		await service.store.setPrState("acme/web", 42, { check_id: 77 });
+		await service.store.tryAcquireReview("acme/web", 42, "bbb");
 
 		const closedChecks: Array<{ id: number; conclusion: string }> = [];
 		const statusLines: string[] = [];
@@ -189,7 +191,7 @@ describe("completeReviewRun", () => {
 	test("stale completion only closes its own check by sha", async () => {
 		const config = testConfig();
 		const service = new ReviewService(config);
-		service.store.tryAcquireReview("acme/web", 42, "newer");
+		await service.store.tryAcquireReview("acme/web", 42, "newer");
 		const closed: Array<number | null> = [];
 		service.closeCheck = async (_repo, _sha, checkId) => {
 			closed.push(checkId);
@@ -201,6 +203,49 @@ describe("completeReviewRun", () => {
 		await completeReviewRun(service, "acme/web", 42, "older", "failure");
 		expect(closed).toEqual([null]); // sha-lookup path, no stored id
 		expect(service.store.getPrState("acme/web", 42).in_flight_sha).toBe("newer");
+	});
+});
+
+describe("runSweep", () => {
+	test("force-completes stale in-flight state through the idempotent completion path", async () => {
+		const config = testConfig({ inflightStaleSeconds: 60 });
+		const service = new ReviewService(config);
+		await service.store.setPrState("acme/web", 7, {
+			review_status: "in_flight",
+			in_flight_sha: "deadsha",
+			in_flight_since: Math.floor(Date.now() / 1000) - 3600,
+			check_id: 5,
+		});
+		service.tokens.tokenOrEmpty = async () => "t";
+		service.api.tryRequest = (async (apiPath: string) => {
+			if (apiPath.includes("/pulls?")) return []; // no open PRs → no check sweep
+			return null;
+		}) as typeof service.api.tryRequest;
+		const closed: Array<{ checkId: number | null; conclusion: string }> = [];
+		service.closeCheck = async (_r, _s, checkId, conclusion) => {
+			closed.push({ checkId, conclusion });
+			return 1;
+		};
+		service.upsertStatusLine = async () => 1;
+		const result = await runSweep(service, {});
+		expect(result.forceCompleted).toBe(1);
+		expect(closed).toEqual([{ checkId: 5, conclusion: "failure" }]);
+		expect(service.store.getPrState("acme/web", 7).review_status).toBe("failed");
+	});
+
+	test("dry run reports without mutating", async () => {
+		const config = testConfig({ inflightStaleSeconds: 60 });
+		const service = new ReviewService(config);
+		await service.store.setPrState("acme/web", 7, {
+			review_status: "in_flight",
+			in_flight_sha: "deadsha",
+			in_flight_since: Math.floor(Date.now() / 1000) - 3600,
+		});
+		service.tokens.tokenOrEmpty = async () => "t";
+		service.api.tryRequest = (async () => null) as typeof service.api.tryRequest;
+		const result = await runSweep(service, { dryRun: true });
+		expect(result.forceCompleted).toBe(1);
+		expect(service.store.getPrState("acme/web", 7).review_status).toBe("in_flight");
 	});
 });
 

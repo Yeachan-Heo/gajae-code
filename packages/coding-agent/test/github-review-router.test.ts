@@ -31,6 +31,8 @@ function testConfig(dataDir: string, overrides: Partial<GithubReviewConfig> = {}
 		cwd: os.tmpdir(),
 		dataDir,
 		ignoreRepos: ["polybetbot"],
+		allowedAssociations: ["OWNER", "MEMBER", "COLLABORATOR"],
+		learnAssociations: ["OWNER"],
 		repoConfigFile: ".gajae.yaml",
 		inflightStaleSeconds: 20 * 60,
 		sweepIntervalSeconds: 0,
@@ -92,6 +94,7 @@ function prEvent(
 		number: 42,
 		pull_request: {
 			draft: false,
+			author_association: "OWNER",
 			user: { login: "human", type: "User" },
 			head: { sha: "abc1234def" },
 			...prOverrides,
@@ -105,7 +108,7 @@ function commentEvent(body: string, overrides: Record<string, unknown> = {}): Re
 	return {
 		action: "created",
 		issue: { number: 42, title: "T", pull_request: {} },
-		comment: { id: 7, body, user: { login: "human", type: "User" } },
+		comment: { id: 7, body, author_association: "OWNER", user: { login: "human", type: "User" } },
 		repository: { full_name: "acme/web" },
 		...overrides,
 	};
@@ -144,13 +147,13 @@ describe("pull_request auto review", () => {
 
 	test("paused PR → silent", async () => {
 		const h = makeHarness();
-		h.service.store.setPrState("acme/web", 42, { paused: true });
+		await h.service.store.setPrState("acme/web", 42, { paused: true });
 		expect((await h.router.route(prEvent())).kind).toBe("silent");
 	});
 
 	test("same sha already reviewed → silent (redelivery guard)", async () => {
 		const h = makeHarness();
-		h.service.store.setPrState("acme/web", 42, { last_reviewed_sha: "abc1234def" });
+		await h.service.store.setPrState("acme/web", 42, { last_reviewed_sha: "abc1234def" });
 		expect((await h.router.route(prEvent({ action: "synchronize" }))).kind).toBe("silent");
 	});
 
@@ -165,7 +168,7 @@ describe("pull_request auto review", () => {
 
 	test("synchronize after a review → incremental (compare, resolve step, no dedup)", async () => {
 		const h = makeHarness();
-		h.service.store.setPrState("acme/web", 42, { last_reviewed_sha: "oldsha9999" });
+		await h.service.store.setPrState("acme/web", 42, { last_reviewed_sha: "oldsha9999" });
 		const action = asRun(await h.router.route(prEvent({ action: "synchronize" })));
 		expect(action.instruction).toContain("repos/acme/web/compare/oldsha9999...abc1234def");
 		expect(action.instruction).toContain("증분");
@@ -243,7 +246,7 @@ describe("issue_comment commands", () => {
 
 	test("@gajae review honors the gate: duplicate notifies once, then silent", async () => {
 		const h = makeHarness({ headSha: "abc1234def" });
-		h.service.store.tryAcquireReview("acme/web", 42, "abc1234def");
+		await h.service.store.tryAcquireReview("acme/web", 42, "abc1234def");
 		const first = asRun(await h.router.route(commentEvent("@gajae review")));
 		expect(first.instruction).toContain("이미 이 커밋");
 		const second = await h.router.route(commentEvent("@gajae review"));
@@ -252,12 +255,12 @@ describe("issue_comment commands", () => {
 
 	test("@gajae review supersede / queue replies", async () => {
 		const h = makeHarness({ headSha: "newsha0000" });
-		h.service.store.tryAcquireReview("acme/web", 42, "oldsha1111");
+		await h.service.store.tryAcquireReview("acme/web", 42, "oldsha1111");
 		const superseded = asRun(await h.router.route(commentEvent("@gajae review")));
 		expect(superseded.instruction).toContain("다시 리뷰할게");
 
 		const q = makeHarness({ headSha: "abc1234def", config: { maxInflight: 1 } });
-		q.service.store.tryAcquireReview("acme/other", 9, "zzz");
+		await q.service.store.tryAcquireReview("acme/other", 9, "zzz");
 		const queued = asRun(await q.router.route(commentEvent("@gajae review")));
 		expect(queued.instruction).toContain("대기열");
 	});
@@ -332,6 +335,7 @@ describe("pull_request_review_comment", () => {
 				line: 10,
 				diff_hunk: "@@ -1 +1 @@",
 				body,
+				author_association: "MEMBER",
 				user: { login: "human", type: "User" },
 			},
 			repository: { full_name: "acme/web" },
@@ -351,6 +355,63 @@ describe("pull_request_review_comment", () => {
 		const h = makeHarness();
 		expect((await h.router.route(reviewCommentEvent("그냥 리뷰 코멘트"))).kind).toBe("silent");
 		expect((await h.router.route(reviewCommentEvent("@gajae hi", { action: "edited" }))).kind).toBe("silent");
+	});
+});
+
+describe("authorization gates", () => {
+	test("untrusted commenter: command and chat are dropped with no ack, no session", async () => {
+		const h = makeHarness();
+		const evt = commentEvent("@gajae review");
+		(evt.comment as Record<string, unknown>).author_association = "NONE";
+		const action = await h.router.route(evt);
+		expect(action.kind).toBe("silent");
+		const chat = commentEvent("가재야 이거 어때?");
+		(chat.comment as Record<string, unknown>).author_association = "FIRST_TIME_CONTRIBUTOR";
+		expect((await h.router.route(chat)).kind).toBe("silent");
+		expect(h.acks).toEqual([]); // no 👀 for unauthorized authors
+	});
+
+	test("untrusted inline review commenter is dropped before ack", async () => {
+		const h = makeHarness();
+		const evt = {
+			action: "created",
+			pull_request: { number: 42 },
+			comment: {
+				id: 55,
+				pull_request_review_id: 999,
+				path: "src/a.ts",
+				line: 10,
+				diff_hunk: "@@",
+				body: "@gajae 왜 이래?",
+				author_association: "NONE",
+				user: { login: "rando", type: "User" },
+			},
+			repository: { full_name: "acme/web" },
+		};
+		expect((await h.router.route(evt)).kind).toBe("silent");
+		expect(h.acks).toEqual([]);
+	});
+
+	test("learn requires learnAssociations (OWNER); members get a refusal reply", async () => {
+		const h = makeHarness();
+		const evt = commentEvent("@gajae learn 아무 규칙");
+		(evt.comment as Record<string, unknown>).author_association = "MEMBER";
+		const action = asRun(await h.router.route(evt));
+		expect(action.instruction).toContain("🔒");
+		expect(h.service.getLearnings("acme/web")).toBe("");
+		const owner = commentEvent("@gajae learn 진짜 규칙");
+		const learned = asRun(await h.router.route(owner));
+		expect(learned.instruction).toContain("학습함");
+		expect(h.service.getLearnings("acme/web")).toContain("진짜 규칙");
+	});
+
+	test("untrusted PR author still gets a review, but WITHOUT user-token thread cleanup", async () => {
+		const h = makeHarness();
+		await h.service.store.setPrState("acme/web", 42, { last_reviewed_sha: "oldsha9999" });
+		const evt = prEvent({ action: "synchronize" }, { author_association: "NONE" });
+		const action = asRun(await h.router.route(evt));
+		expect(action.instruction).toContain("증분");
+		expect(action.instruction).not.toContain("resolveReviewThread"); // operator-token lane gated
 	});
 });
 

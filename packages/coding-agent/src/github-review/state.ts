@@ -51,8 +51,12 @@ const LOCK_STALE_MS = 30_000;
 const LOCK_SPIN_MS = 25;
 const LOCK_TIMEOUT_MS = 10_000;
 
-/** Cross-process mutex via exclusive lockdir creation with stale takeover. */
-function withFileLock<T>(lockDir: string, fn: () => T): T {
+/**
+ * Cross-process mutex via exclusive lockdir creation with stale takeover.
+ * Waiting is async so a contended lock never stalls the webhook server's
+ * event loop (a crashed holder is taken over after LOCK_STALE_MS).
+ */
+async function withFileLock<T>(lockDir: string, fn: () => T): Promise<T> {
 	const deadline = Date.now() + LOCK_TIMEOUT_MS;
 	for (;;) {
 		try {
@@ -69,10 +73,7 @@ function withFileLock<T>(lockDir: string, fn: () => T): T {
 				continue; // raced with the holder's release — retry immediately
 			}
 			if (Date.now() > deadline) throw new Error(`state lock timeout: ${lockDir}`);
-			const until = Date.now() + LOCK_SPIN_MS;
-			while (Date.now() < until) {
-				/* short blocking spin: state ops are millisecond-scale */
-			}
+			await new Promise(resolve => setTimeout(resolve, LOCK_SPIN_MS));
 		}
 	}
 	try {
@@ -126,7 +127,7 @@ export class ReviewStateStore {
 		return this.load()[this.key(repo, pr)] ?? {};
 	}
 
-	setPrState(repo: string, pr: number, fields: Partial<PrState>): PrState {
+	setPrState(repo: string, pr: number, fields: Partial<PrState>): Promise<PrState> {
 		return withFileLock(this.lockDir, () => {
 			const state = this.load();
 			const cur: PrState = { ...state[this.key(repo, pr)], ...fields, updated_at: this.now() };
@@ -159,7 +160,7 @@ export class ReviewStateStore {
 		pr: number,
 		sha: string,
 		maxInflight?: number,
-	): { status: GateStatus; state: PrState } {
+	): Promise<{ status: GateStatus; state: PrState }> {
 		const now = this.now();
 		return withFileLock(this.lockDir, () => {
 			const state = this.load();
@@ -203,7 +204,7 @@ export class ReviewStateStore {
 	 * stale=true → a newer run owns the lock; the caller must not drain or
 	 * touch shared state, only clean up artifacts it created itself.
 	 */
-	completeReview(repo: string, pr: number, sha: string, ok: boolean): CompleteResult {
+	completeReview(repo: string, pr: number, sha: string, ok: boolean): Promise<CompleteResult> {
 		const now = this.now();
 		return withFileLock(this.lockDir, () => {
 			const state = this.load();

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Built-in GitHub code-review bot: `gjc github-review serve` runs a GitHub App webhook server that reviews PRs in embedded agent sessions (inline comments, walkthrough summaries with diagrams and a closing poem, incremental re-reviews). Includes a per-PR CAS review gate (dedup/supersede/concurrency queue), check-run lifecycle with an idempotent `complete` helper, an in-process sweeper for stuck runs and lost webhooks, persisted delivery-replay dedup, `author_association`-based authorization for commands/chat (`learn` is owner-only by default), and an App-identity `gh` passthrough. Configured via `~/.gjc/github-review.json` and `GJC_GHR_*` env overrides; per-repo tuning via a config file at the PR head. See `docs/github-review.md`.
+
 ### Fixed
 
 - Aligned the startup GJC Forge splash border with the composer trailing gutter, including the one-row constrained fallback.

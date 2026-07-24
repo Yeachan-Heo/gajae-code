@@ -9,7 +9,9 @@
  * interval (no external cron needed).
  */
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
 import * as http from "node:http";
+import * as path from "node:path";
 import type { GithubReviewConfig } from "./config";
 import { WebhookRouter } from "./router";
 import { InstructionRunner } from "./runner";
@@ -27,17 +29,56 @@ export function verifySignature(secret: string, body: Uint8Array, header: string
 	return crypto.timingSafeEqual(Buffer.from(got, "utf8"), Buffer.from(expected, "utf8"));
 }
 
-/** GitHub redelivers; small LRU of processed delivery ids. */
+/**
+ * Replay guard for webhook deliveries. GitHub redelivers with the same
+ * `X-GitHub-Delivery` id; a captured signed payload replayed later gets a
+ * fresh id, so ids are only accepted while their timestamp window is open,
+ * and the log is persisted so a restart does not reset dedup.
+ */
 export class DeliveryLog {
-	private readonly seen: string[] = [];
+	private seen = new Map<string, number>();
 
-	constructor(private readonly capacity = 500) {}
+	constructor(
+		private readonly filePath?: string,
+		private readonly windowMs = 6 * 3600_000,
+		private readonly capacity = 5000,
+		private readonly now: () => number = Date.now,
+	) {
+		if (filePath && fs.existsSync(filePath)) {
+			try {
+				this.seen = new Map(
+					Object.entries(JSON.parse(fs.readFileSync(filePath, "utf8")) as Record<string, number>),
+				);
+			} catch {
+				/* corrupt log → start fresh */
+			}
+		}
+	}
 
 	alreadySeen(id: string): boolean {
-		if (this.seen.includes(id)) return true;
-		this.seen.push(id);
-		if (this.seen.length > this.capacity) this.seen.splice(0, Math.floor(this.capacity / 2));
+		const now = this.now();
+		for (const [key, ts] of this.seen) {
+			if (now - ts > this.windowMs) this.seen.delete(key);
+		}
+		if (this.seen.has(id)) return true;
+		this.seen.set(id, now);
+		while (this.seen.size > this.capacity) {
+			const oldest = this.seen.keys().next().value;
+			if (oldest === undefined) break;
+			this.seen.delete(oldest);
+		}
+		this.persist();
 		return false;
+	}
+
+	private persist(): void {
+		if (!this.filePath) return;
+		try {
+			fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+			fs.writeFileSync(this.filePath, JSON.stringify(Object.fromEntries(this.seen)));
+		} catch {
+			/* memory dedup still works */
+		}
 	}
 }
 
@@ -79,7 +120,7 @@ export async function startGithubReviewServer(
 	const service = new ReviewService(config);
 	const router = new WebhookRouter(config, service);
 	const runner = new InstructionRunner(service, log);
-	const deliveries = new DeliveryLog();
+	const deliveries = new DeliveryLog(path.join(config.dataDir, "deliveries.json"));
 
 	const server = http.createServer((req, res) => {
 		void (async () => {

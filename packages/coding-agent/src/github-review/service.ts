@@ -161,7 +161,7 @@ export class ReviewService {
 		let cid = this.store.getPrState(repo, pr).summary_comment_id ?? null;
 		if (!cid) {
 			cid = await this.findSummaryCommentId(token, repo, pr);
-			if (cid) this.store.setPrState(repo, pr, { summary_comment_id: cid });
+			if (cid) await this.store.setPrState(repo, pr, { summary_comment_id: cid });
 		}
 		if (cid) {
 			const comment = await this.api.tryRequest<{ body?: string }>(`/repos/${repo}/issues/comments/${cid}`, {
@@ -191,7 +191,7 @@ export class ReviewService {
 			token,
 		});
 		if (created?.id) {
-			this.store.setPrState(repo, pr, { summary_comment_id: created.id });
+			await this.store.setPrState(repo, pr, { summary_comment_id: created.id });
 			return created.id;
 		}
 		return null;
@@ -201,7 +201,7 @@ export class ReviewService {
 	async startReviewAcks(repo: string, pr: number, headSha: string): Promise<number | null> {
 		const checkId = await this.createCheck(repo, headSha);
 		if (checkId) {
-			this.store.setPrState(repo, pr, { check_id: checkId });
+			await this.store.setPrState(repo, pr, { check_id: checkId });
 			this.logEvent("check_created", { repo, pr, sha: headSha, check_id: checkId });
 		}
 		await this.upsertStatusLine(

@@ -47,6 +47,14 @@ export interface GithubReviewConfig {
 	dataDir: string;
 	/** Repos (substring match, case-insensitive) the bot must never touch. */
 	ignoreRepos: string[];
+	/**
+	 * `author_association` values allowed to run commands, chat, and inline
+	 * replies, and whose pushes may trigger user-token thread cleanup.
+	 * Everything else is dropped BEFORE any ack or session dispatch.
+	 */
+	allowedAssociations: string[];
+	/** `author_association` values allowed to use `learn` (persistent prompt state). */
+	learnAssociations: string[];
 	/** Per-repo config filename fetched from the PR head, e.g. ".gajae.yaml". */
 	repoConfigFile: string;
 	/** In-flight reviews older than this are considered crashed (seconds). */
@@ -156,6 +164,8 @@ export function loadGithubReviewConfig(filePath?: string, env: NodeJS.ProcessEnv
 		cwd: expandHome(env.GJC_GHR_CWD ?? str(file.cwd) ?? os.homedir()),
 		dataDir: expandHome(dataDir),
 		ignoreRepos: strList(file.ignoreRepos) ?? DEFAULTS.ignoreRepos,
+		allowedAssociations: strList(file.allowedAssociations) ?? ["OWNER", "MEMBER", "COLLABORATOR"],
+		learnAssociations: strList(file.learnAssociations) ?? ["OWNER"],
 		repoConfigFile: str(file.repoConfigFile) ?? DEFAULTS.repoConfigFile,
 		inflightStaleSeconds:
 			num(env.GJC_GHR_INFLIGHT_STALE_SEC) ?? num(file.inflightStaleSeconds) ?? DEFAULTS.inflightStaleSeconds,
