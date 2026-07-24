@@ -253,7 +253,13 @@ describe("subagent warning injection", () => {
 		it("preserves long findings in explicit yields, fallback completions, and placeholder rejections", () => {
 			const data = {
 				findings: Array.from({ length: 20 }, (_, index) => ({
-					message: `finding ${index}: ${"detail ".repeat(40)}${index === 19 ? "LONG-FINDINGS-TAIL-SENTINEL" : ""}`,
+					title: `finding ${index}`,
+					body: `${"detail ".repeat(40)}${index === 19 ? "LONG-FINDINGS-TAIL-SENTINEL" : ""}`,
+					priority: 1,
+					confidence: 1,
+					file_path: "src/example.ts",
+					line_start: 1,
+					line_end: 1,
 				})),
 				tail: "LONG-FINDINGS-TAIL-SENTINEL",
 			};

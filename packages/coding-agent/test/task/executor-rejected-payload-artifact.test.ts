@@ -52,7 +52,7 @@ function createSession(data: unknown): AgentSession {
 		setConfiguredModelChain: () => {},
 		getConfiguredModelChain: () => undefined,
 		seedDefaultFallbackResolution: () => {},
-		subscribe: listener => {
+		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => listeners.splice(listeners.indexOf(listener), 1);
 		},
