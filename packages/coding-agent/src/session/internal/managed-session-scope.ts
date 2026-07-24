@@ -569,7 +569,11 @@ function fsyncManagedParent(pathname: string): void {
 	}
 }
 
-function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
+export function canonicalBindingOpenFlags(platform: NodeJS.Platform = process.platform): number {
+	return (platform === "win32" ? fs.constants.O_RDWR : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW;
+}
+
+export function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
 	let captured: ManagedFileSnapshot;
 	try {
 		captured = captureManagedFileNoFollow(bindingPath);
@@ -581,10 +585,7 @@ function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
 	try {
 		// Bun on Windows rejects fsync on a read-only file descriptor with EPERM.
 		// The managed binding is owner-writable, so reopen it read/write only for the durability fence.
-		descriptor = fs.openSync(
-			bindingPath,
-			(process.platform === "win32" ? fs.constants.O_RDWR : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW,
-		);
+		descriptor = fs.openSync(bindingPath, canonicalBindingOpenFlags());
 		const before = fs.fstatSync(descriptor, { bigint: true });
 		if (
 			before.dev !== captured.identity.dev ||
@@ -2306,10 +2307,11 @@ function sameDirectoryObject(leftPath: string, rightPath: string): boolean {
 	}
 }
 
-function matchesMigrationArtifactRoot(
+export function matchesMigrationArtifactRoot(
 	pathname: string,
-	identity: DetachedArtifactRoot["identity"],
+	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint },
 	expectedTree: NativeDirectoryTreeSnapshot,
+	platform: NodeJS.Platform = process.platform,
 ): boolean {
 	try {
 		const stat = fs.lstatSync(pathname, { bigint: true });
@@ -2332,18 +2334,17 @@ function matchesMigrationArtifactRoot(
 			!observed.snapshot ||
 			!expectedRoot ||
 			!observedRoot ||
-			(process.platform === "win32" &&
+			(platform === "win32" &&
 				(observedRoot.dev !== identity.dev.toString() ||
 					observedRoot.ino !== identity.ino.toString() ||
 					BigInt(observedRoot.size) !== identity.size ||
 					BigInt(observedRoot.mtimeNs) !== identity.mtimeNs)) ||
-			(process.platform !== "win32" &&
-				(stat.size !== identity.size || stat.mtimeNs !== identity.mtimeNs))
+			(platform !== "win32" && (stat.size !== identity.size || stat.mtimeNs !== identity.mtimeNs))
 		)
 			return false;
 		const directoryEntryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
 			JSON.stringify(
-				process.platform === "win32"
+				platform === "win32"
 					? [entry.relativePath, entry.kind, entry.dev, entry.ino]
 					: [entry.relativePath, entry.kind, entry.dev, entry.ino, entry.size, entry.mtimeNs],
 			);
@@ -2481,7 +2482,7 @@ function detachArtifactRootForMigration(plan: DetachedArtifactRoot): {
 	return { detached, cleanup };
 }
 
-function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandidate): void {
+export function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandidate): void {
 	const preparedReceipt = receiptPathFor(scope, source, "prepared");
 	const detachedReceipt = receiptPathFor(scope, source, "detached");
 	const receipt = fs.existsSync(detachedReceipt) ? detachedReceipt : preparedReceipt;
