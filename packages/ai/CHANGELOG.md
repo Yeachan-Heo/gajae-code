@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.11.9] - 2026-07-24
 ### Fixed
 
 - Credential selection and aggregate usage callers now stop awaiting immediately when their own signal aborts without cancelling shared usage fetches, and ranking deadlines no longer re-await the same stalled usage request during credential resolution.

@@ -5,6 +5,8 @@
 
 - The built-in `claude-opus`, `opus-codex`, and `fable-opus-codex` presets now use `anthropic/claude-opus-5` instead of `anthropic/claude-opus-4-8`, with effort suffixes preserved; `packages/ai/src/models.json` was regenerated so `anthropic/claude-opus-5` resolves; non-opus roles (`anthropic/claude-sonnet-5` executor/planner overrides, codex and fable roles) are unchanged.
 
+## [0.11.9] - 2026-07-24
+
 ### Fixed
 
 - Restricted role-agent `bash` now accepts literal mid-word tildes, so git revision syntax such as `git diff HEAD~1` no longer has to be quoted. Bash performs tilde expansion only at the start of a word, so word-initial forms (`~`, `~/path`, `~user`) remain blocked.
