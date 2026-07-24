@@ -720,12 +720,17 @@ async function readSidecarLenient(fsImpl: TelegramDaemonFs, file: string): Promi
 	}
 }
 
-export async function readOwnerFreshnessSnapshot(input: { settings: Settings; fs?: TelegramDaemonFs }): Promise<{
+export interface OwnerFreshnessSnapshot {
 	ownerTag: Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | null;
 	effectiveHeartbeatAt: number | undefined;
 	legacyEmbedded: boolean;
 	state: DaemonState | undefined;
-}> {
+}
+
+export async function readOwnerFreshnessSnapshot(input: {
+	settings: Settings;
+	fs?: TelegramDaemonFs;
+}): Promise<OwnerFreshnessSnapshot> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	const state = await readJson<DaemonState>(fsImpl, paths.state);
@@ -956,6 +961,7 @@ async function ownershipLockIsReclaimable(input: {
 interface NotificationRootRegistration {
 	root?: string;
 	managed?: boolean;
+	token?: string;
 }
 
 async function readNotificationRootRegistration(input: {
@@ -964,12 +970,17 @@ async function readNotificationRootRegistration(input: {
 	fs?: TelegramDaemonFs;
 }): Promise<NotificationRootRegistration> {
 	const fsImpl = input.fs ?? nodeFs;
-	const current = await readJson<{ sessions?: Record<string, string>; managedRoots?: string[] }>(
-		fsImpl,
-		daemonPaths(input.settings.getAgentDir()).roots,
-	);
+	const current = await readJson<{
+		sessions?: Record<string, string>;
+		managedRoots?: string[];
+		registrationTokens?: Record<string, string>;
+	}>(fsImpl, daemonPaths(input.settings.getAgentDir()).roots);
 	const root = current?.sessions?.[input.sessionId];
-	return { root, managed: root !== undefined && current?.managedRoots?.includes(root) === true };
+	return {
+		root,
+		managed: root !== undefined && current?.managedRoots?.includes(root) === true,
+		token: current?.registrationTokens?.[input.sessionId],
+	};
 }
 
 /** Restore a session root only if this ensure operation still owns its registration. */
@@ -977,6 +988,8 @@ async function restoreNotificationRootRegistration(input: {
 	settings: Settings;
 	sessionId: string;
 	registeredRoot: string;
+	/** Token minted by this operation's own registration; a newer replacement registration's token fences the rollback. */
+	registeredToken?: string;
 	previous: NotificationRootRegistration;
 	fs?: TelegramDaemonFs;
 }): Promise<void> {
@@ -987,14 +1000,25 @@ async function restoreNotificationRootRegistration(input: {
 		paths.roots,
 		async () => {
 			const current =
-				(await readJson<{ roots?: string[]; managedRoots?: string[]; sessions?: Record<string, string> }>(
-					fsImpl,
-					paths.roots,
-				)) ?? {};
+				(await readJson<{
+					roots?: string[];
+					managedRoots?: string[];
+					sessions?: Record<string, string>;
+					registrationTokens?: Record<string, string>;
+				}>(fsImpl, paths.roots)) ?? {};
 			const sessions = { ...(current.sessions ?? {}) };
 			if (sessions[input.sessionId] !== input.registeredRoot) return;
+			if (
+				input.registeredToken !== undefined &&
+				current.registrationTokens?.[input.sessionId] !== undefined &&
+				current.registrationTokens[input.sessionId] !== input.registeredToken
+			)
+				return;
+			const registrationTokens = { ...(current.registrationTokens ?? {}) };
 			if (input.previous.root) sessions[input.sessionId] = input.previous.root;
 			else delete sessions[input.sessionId];
+			if (input.previous.token !== undefined) registrationTokens[input.sessionId] = input.previous.token;
+			else delete registrationTokens[input.sessionId];
 			const referencedRoots = new Set(Object.values(sessions));
 			const roots = new Set(current.roots ?? []);
 			const managedRoots = new Set(current.managedRoots ?? []);
@@ -1012,10 +1036,17 @@ async function restoreNotificationRootRegistration(input: {
 				roots: Array.from(roots).sort(),
 				managedRoots: Array.from(managedRoots).sort(),
 				sessions,
+				registrationTokens,
 			});
 		},
 		{ staleMs: 10_000 },
 	);
+}
+
+export interface RegisterNotificationRootResult {
+	root: string;
+	/** Per-registration ownership token fencing a stale same-session cleanup from deleting a live replacement registration. */
+	token: string;
 }
 
 export async function registerNotificationRoot(input: {
@@ -1023,22 +1054,26 @@ export async function registerNotificationRoot(input: {
 	cwd: string;
 	sessionId: string;
 	fs?: TelegramDaemonFs;
-}): Promise<string> {
+}): Promise<RegisterNotificationRootResult> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	await ensureDir(fsImpl, paths.dir);
 	const root = notificationRootForCwd(input.cwd);
+	const token = crypto.randomUUID();
 	await withFileLock(
 		paths.roots,
 		async () => {
 			const current =
-				(await readJson<{ roots?: string[]; managedRoots?: string[]; sessions?: Record<string, string> }>(
-					fsImpl,
-					paths.roots,
-				)) ?? {};
+				(await readJson<{
+					roots?: string[];
+					managedRoots?: string[];
+					sessions?: Record<string, string>;
+					registrationTokens?: Record<string, string>;
+				}>(fsImpl, paths.roots)) ?? {};
 			const roots = new Set(current.roots ?? []);
 			const managedRoots = new Set(current.managedRoots ?? []);
 			const sessions = { ...(current.sessions ?? {}) };
+			const registrationTokens = { ...(current.registrationTokens ?? {}) };
 			const previousRoot = sessions[input.sessionId];
 			const rootAlreadyPresent = roots.has(root);
 			roots.add(root);
@@ -1046,6 +1081,7 @@ export async function registerNotificationRoot(input: {
 			// survive a later session rollback or unregister.
 			if (!rootAlreadyPresent) managedRoots.add(root);
 			sessions[input.sessionId] = root;
+			registrationTokens[input.sessionId] = token;
 			if (previousRoot && previousRoot !== root && managedRoots.has(previousRoot)) {
 				const previousStillReferenced = Object.values(sessions).includes(previousRoot);
 				if (!previousStillReferenced) {
@@ -1058,11 +1094,12 @@ export async function registerNotificationRoot(input: {
 				roots: Array.from(roots).sort(),
 				managedRoots: Array.from(managedRoots).sort(),
 				sessions,
+				registrationTokens,
 			});
 		},
 		{ staleMs: 10_000 },
 	);
-	return root;
+	return { root, token };
 }
 
 export interface UnregisterNotificationRootResult {
@@ -1076,6 +1113,8 @@ export async function unregisterNotificationRoot(input: {
 	cwd: string;
 	sessionId: string;
 	fs?: TelegramDaemonFs;
+	/** Ownership token minted by this runtime's own registration; a stale cleanup presenting an older token never deletes a replacement registration. */
+	registrationToken?: string;
 }): Promise<UnregisterNotificationRootResult> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
@@ -1089,6 +1128,7 @@ export async function unregisterNotificationRoot(input: {
 				roots?: string[];
 				managedRoots?: string[];
 				sessions?: Record<string, string>;
+				registrationTokens?: Record<string, string>;
 			}>(fsImpl, paths.roots);
 			if (!current) return;
 			const sessions = { ...(current.sessions ?? {}) };
@@ -1098,7 +1138,23 @@ export async function unregisterNotificationRoot(input: {
 				remainingRoots = (current.roots ?? []).length;
 				return;
 			}
+			// Same sessionId + same cwd re-registration records an identical root, so
+			// the root match alone cannot distinguish a replaced registration: fence
+			// on the per-registration token. Legacy token-less registrations keep the
+			// old root-match behavior.
+			const recordedToken = current.registrationTokens?.[input.sessionId];
+			if (
+				recordedToken !== undefined &&
+				input.registrationToken !== undefined &&
+				recordedToken !== input.registrationToken
+			) {
+				logger.warn("notifications: fenced stale Telegram root unregister against a live replacement registration");
+				remainingRoots = (current.roots ?? []).length;
+				return;
+			}
 			delete sessions[input.sessionId];
+			const registrationTokens = { ...(current.registrationTokens ?? {}) };
+			delete registrationTokens[input.sessionId];
 			const rootStillReferenced = Object.values(sessions).includes(root);
 			const managedRoots = new Set(current.managedRoots ?? []);
 			const roots = (current.roots ?? []).filter(
@@ -1111,6 +1167,7 @@ export async function unregisterNotificationRoot(input: {
 				roots: Array.from(new Set(roots)).sort(),
 				managedRoots: Array.from(managedRoots).sort(),
 				sessions,
+				registrationTokens,
 			});
 		},
 		{ staleMs: 10_000 },
@@ -1151,6 +1208,7 @@ type NotificationRootsRegistry = {
 	roots?: string[];
 	managedRoots?: string[];
 	sessions?: Record<string, string>;
+	registrationTokens?: Record<string, string>;
 };
 
 /**
@@ -1175,6 +1233,7 @@ export async function pruneMissingNotificationRoots(input: {
 			const roots = [...(current.roots ?? [])];
 			const managedRoots = new Set(current.managedRoots ?? []);
 			const sessions = { ...(current.sessions ?? {}) };
+			const registrationTokens = { ...(current.registrationTokens ?? {}) };
 			const candidateSet = input.candidates ? new Set(input.candidates) : undefined;
 			const survivors: string[] = [];
 			for (const root of roots) {
@@ -1205,7 +1264,10 @@ export async function pruneMissingNotificationRoots(input: {
 					pruned.push(root);
 					managedRoots.delete(root);
 					for (const [sessionId, mapped] of Object.entries(sessions)) {
-						if (mapped === root) delete sessions[sessionId];
+						if (mapped === root) {
+							delete sessions[sessionId];
+							delete registrationTokens[sessionId];
+						}
 					}
 				}
 			}
@@ -1216,6 +1278,7 @@ export async function pruneMissingNotificationRoots(input: {
 				roots: Array.from(new Set(survivors)).sort(),
 				managedRoots: Array.from(managedRoots).sort(),
 				sessions,
+				registrationTokens,
 			});
 		},
 		{ staleMs: 10_000 },
@@ -1845,7 +1908,7 @@ export async function acquireDaemonOwnership(input: {
 	// Generation is inventory-only: a lower servingEpoch triggers convergence,
 	// while same-epoch cross-generation owners attach.
 	const attachDecision = (
-		snapshot: Awaited<ReturnType<typeof readOwnerFreshnessSnapshot>>,
+		snapshot: OwnerFreshnessSnapshot,
 	):
 		| { acquired: false; attached: boolean; blocked?: boolean; provisional?: boolean; reloadRequired?: boolean }
 		| undefined => {
@@ -2200,15 +2263,48 @@ export async function renewDaemonHeartbeat(input: {
 				});
 			return false;
 		}
-		return await renewOwnerHeartbeatSidecar({
-			settings: input.settings,
-			ownerId: input.ownerId,
-			acquisitionId,
-			fs: fsImpl,
-			now: input.now,
+		// Initial sidecar proof is part of ready publication: a failed
+		// write/rename/lock-fence after the ready write would otherwise leave a
+		// durable fresh-heartbeat ready record for a daemon whose run() is about
+		// to exit, and contenders would attach to the dead owner until TTL
+		// expiry. Roll forward to a terminal state (mirroring
+		// retireProvisionalDaemonOwnership) and exact-unlink the ownership lock.
+		let sidecarRenewed = false;
+		try {
+			sidecarRenewed = await renewOwnerHeartbeatSidecar({
+				settings: input.settings,
+				ownerId: input.ownerId,
+				acquisitionId,
+				fs: fsImpl,
+				now: input.now,
+				pid,
+				pidIncarnation: input.pidIncarnation,
+			});
+		} catch {
+			sidecarRenewed = false;
+		}
+		if (sidecarRenewed) return true;
+		logger.warn(
+			"notifications: Telegram daemon initial heartbeat sidecar proof failed; rolling ready publication forward to retired",
+		);
+		const published = {
+			...state,
+			launcherPid: state.pid,
 			pid,
-			pidIncarnation: input.pidIncarnation,
-		});
+			incarnation,
+			ownershipPhase: "ready" as const,
+		};
+		const lock = await readOwnershipLock(fsImpl, paths.lock);
+		if (ownershipLockMatchesState(lock, published)) {
+			await writeJsonAtomic(fsImpl, paths.state, {
+				...published,
+				ownershipPhase: "retired" as const,
+				stoppedAt: (input.now ?? Date.now)(),
+			});
+			if (await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
+				await unlinkOwnershipLockExactly(fsImpl, paths.lock, lock);
+		}
+		return false;
 	} finally {
 		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
@@ -2387,7 +2483,7 @@ async function bindProvisionalDaemonPid(input: {
 	}
 }
 
-/** Wait for a matching current-generation daemon to publish a ready state. */
+/** Wait for a matching compatible owner to publish a ready state. Readiness is serving-epoch gated (same-epoch cross-generation owners attach, per isCurrentCompatibleOwner); generation is inventory-only here. Mutation paths still require exact current-generation equality. */
 export async function waitForTelegramDaemonReady(input: {
 	settings: Settings;
 	ownerId?: string;
@@ -2419,7 +2515,7 @@ export async function waitForTelegramDaemonReady(input: {
 			(!input.ownerId || state?.ownerId === input.ownerId) &&
 			(!input.acquisitionId || state?.acquisitionId === input.acquisitionId) &&
 			state?.ownershipPhase === "ready" &&
-			state.generation === DAEMON_GENERATION &&
+			Number.isSafeInteger(state.generation) &&
 			ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
 			ownerProvenanceMatches(state, pidIncarnation) &&
 			pidAlive(state.pid) &&
@@ -2979,7 +3075,14 @@ export async function reclaimDeadDaemonOwner(input: {
  * while exposing whether a #2028 generation handoff was required.
  */
 export async function ensureTelegramDaemonRunningDetailed(
-	input: { settings: Settings; cwd: string; sessionId: string; registerRoot?: boolean },
+	input: {
+		settings: Settings;
+		cwd: string;
+		sessionId: string;
+		registerRoot?: boolean;
+		/** Receives each registration this ensure operation minted so the caller can fence its own later cleanup. */
+		onRegistered?: (registration: RegisterNotificationRootResult) => void;
+	},
 	deps: TelegramDaemonDeps = {},
 ): Promise<EnsureTelegramDaemonDetailedResult> {
 	const cfg = getNotificationConfig(input.settings);
@@ -3085,7 +3188,12 @@ export async function ensureTelegramDaemonRunningDetailed(
 	}
 	if (spawned.result === "attached" && spawned.reloadRequired) {
 		const previous = await readNotificationRootRegistration({ ...input, fs: deps.fs });
-		if (input.registerRoot !== false) await registerNotificationRoot({ ...input, fs: deps.fs });
+		let registeredToken: string | undefined;
+		if (input.registerRoot !== false) {
+			const registered = await registerNotificationRoot({ ...input, fs: deps.fs });
+			registeredToken = registered.token;
+			input.onRegistered?.(registered);
+		}
 		const fsImpl = deps.fs ?? nodeFs;
 		const now = deps.now ?? Date.now;
 		const pidAlive = deps.pidAlive ?? defaultPidAlive;
@@ -3168,6 +3276,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 				settings: input.settings,
 				sessionId: input.sessionId,
 				registeredRoot: root,
+				registeredToken,
 				previous,
 				fs: deps.fs,
 			});
@@ -3178,6 +3287,7 @@ export async function ensureTelegramDaemonRunningDetailed(
 				settings: input.settings,
 				sessionId: input.sessionId,
 				registeredRoot: root,
+				registeredToken,
 				previous,
 				fs: deps.fs,
 			});
@@ -3186,7 +3296,10 @@ export async function ensureTelegramDaemonRunningDetailed(
 		return "reloaded";
 	}
 	if (spawned.result !== "owner_spawned") {
-		if (input.registerRoot !== false) await registerNotificationRoot({ ...input, fs: deps.fs });
+		if (input.registerRoot !== false) {
+			const registered = await registerNotificationRoot({ ...input, fs: deps.fs });
+			input.onRegistered?.(registered);
+		}
 		return "attached";
 	}
 	if (
@@ -3205,7 +3318,10 @@ export async function ensureTelegramDaemonRunningDetailed(
 			timeoutMs: deps.readinessTimeoutMs,
 		})
 	) {
-		if (input.registerRoot !== false) await registerNotificationRoot({ ...input, fs: deps.fs });
+		if (input.registerRoot !== false) {
+			const registered = await registerNotificationRoot({ ...input, fs: deps.fs });
+			input.onRegistered?.(registered);
+		}
 		return "spawned";
 	}
 	throw new Error("Telegram daemon did not become ready after spawning");
@@ -3897,6 +4013,8 @@ export class TelegramNotificationDaemon {
 	/** Bot-wide flood-control window; inbound polling remains eligible during it. */
 	private botCooldownUntil = 0;
 	private warnedBotCooldownUntil = 0;
+	/** Count of outbound calls suppressed by the cooldown sentinel; lets a flush grant detect mid-item suppression. */
+	private suppressedBotCalls = 0;
 	/** Original markdown of rich messages we sent (chat+message_id), for restoring reply context on inbound replies. */
 	private readonly replyStore: ReplySentStore;
 	/** Per-session debounce + monotonic draft-id state for opt-in draft streaming. */
@@ -4350,6 +4468,7 @@ export class TelegramNotificationDaemon {
 				this.warnedBotCooldownUntil = this.botCooldownUntil;
 				logger.warn("notifications: Telegram Bot API flood-control cooldown suppressing outbound calls");
 			}
+			this.suppressedBotCalls++;
 			return undefined;
 		}
 		const response = await this.effects.call(rawBotApi, method, body, callOpts);
@@ -6841,6 +6960,25 @@ export class TelegramNotificationDaemon {
 				this.pool.settle(item.itemId!, "removed");
 				continue;
 			}
+			// Cooldown fail-closed: while a bot-wide 429 cooldown is active every
+			// outbound call is suppressed by callBotApi (undefined sentinel, nothing
+			// sent), so this grant must never settle "accepted". Requeue the
+			// untouched item — suppression proves nothing left, so exactly-once
+			// holds; the flush timer retries after the cooldown and the preserved
+			// deadlineAt still bounds a permanent 429 — and record the drained
+			// grant as ambiguous, matching the btw uncertain/ambiguous precedent.
+			if (this.runtime.now() < this.botCooldownUntil) {
+				this.submitPool({
+					sessionId: item.sessionId,
+					lane: item.lane,
+					coalesceKey: item.coalesceKey,
+					deadlineAt: item.deadlineAt,
+					payload: item.payload,
+				});
+				this.pool.settle(item.itemId!, "ambiguous");
+				continue;
+			}
+			const suppressedBefore = this.suppressedBotCalls;
 			let disposition: "accepted" | "ambiguous" | "rejected" = "accepted";
 			try {
 				// Draft streaming (opt-in, off by default): stream a live turn frame as a
@@ -7062,6 +7200,10 @@ export class TelegramNotificationDaemon {
 				disposition = "ambiguous";
 				if (item.payload.toolActivity?.phase === "started") this.toolActivityAmbiguous = true;
 			} finally {
+				// Mid-item suppression (cooldown engaged by a concurrent 429 after
+				// this grant's pre-check) can leave calls silently unsent without a
+				// throw; a possibly-undelivered send must never settle "accepted".
+				if (disposition === "accepted" && this.suppressedBotCalls !== suppressedBefore) disposition = "ambiguous";
 				this.pool.settle(item.itemId!, disposition);
 				// A terminal tool frame owns the end of this coalescing key even when both
 				// edit and fallback delivery fail. Retaining the old message id would leak

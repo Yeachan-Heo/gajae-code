@@ -911,7 +911,7 @@ interface SessionRuntime {
 	serverStopped: boolean;
 	brokerRegistrationReleased: boolean;
 	/** Managed Telegram root registration released during terminal teardown. */
-	notificationRootRegistration?: { settings: Settings; cwd: string };
+	notificationRootRegistration?: { settings: Settings; cwd: string; registrationToken?: string };
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
@@ -2876,13 +2876,19 @@ export function createNotificationsExtension(
 		settings: Settings,
 		cwd: string,
 		id: string,
+		onRegistered?: (registrationToken: string) => void,
 	): Promise<"ready" | "blocked_identity"> {
 		if (options.ensureTelegramDaemon) {
 			return (await options.ensureTelegramDaemon({ settings, cwd, sessionId: id })) === "blocked"
 				? "blocked_identity"
 				: "ready";
 		}
-		return (await ensureTelegramDaemonRunningDetailed({ settings, cwd, sessionId: id })) === "blocked_identity"
+		return (await ensureTelegramDaemonRunningDetailed({
+			settings,
+			cwd,
+			sessionId: id,
+			onRegistered: registration => onRegistered?.(registration.token),
+		})) === "blocked_identity"
 			? "blocked_identity"
 			: "ready";
 	}
@@ -2891,9 +2897,10 @@ export function createNotificationsExtension(
 		cfg: NotificationConfig,
 		cwd: string,
 		id: string,
+		onRegistered?: (registrationToken: string) => void,
 	): Promise<boolean> {
 		if (isTelegramConfigured(cfg)) {
-			if ((await ensureTelegramOwner(settings, cwd, id)) === "blocked_identity") return false;
+			if ((await ensureTelegramOwner(settings, cwd, id, onRegistered)) === "blocked_identity") return false;
 		}
 		await ensureConfiguredProviderDaemons(settings, cfg, options.ensureProviderDaemon);
 		return true;
@@ -3049,6 +3056,7 @@ export function createNotificationsExtension(
 					settings: rt.notificationRootRegistration.settings,
 					cwd: rt.notificationRootRegistration.cwd,
 					sessionId: id,
+					registrationToken: rt.notificationRootRegistration.registrationToken,
 				});
 				rt.notificationRootRegistration = undefined;
 			} catch (e) {
@@ -4147,13 +4155,19 @@ export function createNotificationsExtension(
 			}
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				try {
-					if (!(await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id))) {
+					let registrationToken: string | undefined;
+					if (
+						!(await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id, token => {
+							registrationToken = token;
+						}))
+					) {
 						const result = failLifecycleStartup("failed", "Telegram daemon ownership is blocked.");
 						finishStartup(result);
 						await cleanupAbandonedStartup();
 						return result;
 					}
-					if (isTelegramConfigured(cfg)) runtime.notificationRootRegistration = { settings, cwd: ctx.cwd };
+					if (isTelegramConfigured(cfg))
+						runtime.notificationRootRegistration = { settings, cwd: ctx.cwd, registrationToken };
 				} catch (error) {
 					const result = failLifecycleStartup("failed", error);
 					finishStartup(result);
@@ -4452,10 +4466,13 @@ export function createNotificationsExtension(
 			const { settings, settingsAvailable } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
 			try {
-				const result = await ensureTelegramOwner(settings, binding.cwd, binding.sessionId);
+				let registrationToken: string | undefined;
+				const result = await ensureTelegramOwner(settings, binding.cwd, binding.sessionId, token => {
+					registrationToken = token;
+				});
 				const runtime = runtimes.get(binding.sessionId);
 				if (result === "ready" && runtime && isTelegramConfigured(resolveSettings(options.settings).cfg)) {
-					runtime.notificationRootRegistration = { settings, cwd: binding.cwd };
+					runtime.notificationRootRegistration = { settings, cwd: binding.cwd, registrationToken };
 				}
 				return result;
 			} catch {

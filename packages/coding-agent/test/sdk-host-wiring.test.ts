@@ -499,6 +499,7 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 			roots: [],
 			managedRoots: [],
 			sessions: {},
+			registrationTokens: {},
 		});
 		await expect(
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
@@ -553,6 +554,7 @@ test("Telegram root ownership is recorded when reconciliation configures Telegra
 		roots: [],
 		managedRoots: [],
 		sessions: {},
+		registrationTokens: {},
 	});
 }, 60_000);
 

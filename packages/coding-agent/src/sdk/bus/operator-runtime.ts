@@ -159,19 +159,19 @@ export class NotificationOperatorRuntime {
 		if (!completion) return true;
 		const setTimeoutImpl = this.#deps.setTimeoutImpl ?? setTimeout;
 		const clearTimeoutImpl = this.#deps.clearTimeoutImpl ?? clearTimeout;
-		return await new Promise<boolean>(resolve => {
-			const timer = setTimeoutImpl(() => resolve(false), timeoutMs);
-			void completion.then(
-				() => {
-					clearTimeoutImpl(timer);
-					resolve(true);
-				},
-				() => {
-					clearTimeoutImpl(timer);
-					resolve(true);
-				},
-			);
-		});
+		const { promise, resolve } = Promise.withResolvers<boolean>();
+		const timer = setTimeoutImpl(() => resolve(false), timeoutMs);
+		void completion.then(
+			() => {
+				clearTimeoutImpl(timer);
+				resolve(true);
+			},
+			() => {
+				clearTimeoutImpl(timer);
+				resolve(true);
+			},
+		);
+		return await promise;
 	}
 
 	sleep(ms: number, signal?: AbortSignal): Promise<void> {
