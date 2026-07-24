@@ -524,7 +524,6 @@ pub enum ToolActivityPhase {
 	Completed,
 	Failed,
 	Cancelled,
-	Unknown,
 }
 
 /// One-time per-session identity header, pinned at thread creation.
@@ -1582,10 +1581,10 @@ mod tests {
 			(ToolActivityPhase::Completed, "completed"),
 			(ToolActivityPhase::Failed, "failed"),
 			(ToolActivityPhase::Cancelled, "cancelled"),
-			(ToolActivityPhase::Unknown, "unknown"),
 		] {
 			assert_eq!(serde_json::to_string(&phase).unwrap(), format!("\"{expected}\""));
 		}
+		assert!(serde_json::from_str::<ToolActivityPhase>("\"unknown\"").is_err());
 	}
 
 	#[test]

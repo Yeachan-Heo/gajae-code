@@ -343,7 +343,7 @@ test("reasoning summaries require canonical summaryText and never fall back to e
 	});
 }, 30000);
 
-test("redact transition terminalizes visible tools before suppressing later detail", async () => {
+test("redact transition cancels visible tools before suppressing later detail", async () => {
 	await withNotifications(async () => {
 		const result = await setup();
 		await result.handlers.get("tool_execution_start")!(
@@ -356,13 +356,13 @@ test("redact transition terminalizes visible tools before suppressing later deta
 		await waitFor(
 			() =>
 				activityFrames(result.frames).some(
-					frame => frame.toolCallId === "redact-transition" && frame.phase === "unknown",
+					frame => frame.toolCallId === "redact-transition" && frame.phase === "cancelled",
 				),
 			"redact transition terminal frame",
 		);
 		const terminalIndex = result.frames.findIndex(
 			frame =>
-				frame.type === "tool_activity" && frame.toolCallId === "redact-transition" && frame.phase === "unknown",
+				frame.type === "tool_activity" && frame.toolCallId === "redact-transition" && frame.phase === "cancelled",
 		);
 		const configIndex = result.frames.findIndex(frame => frame.type === "config_update" && frame.redact === true);
 		expect(terminalIndex).toBeGreaterThanOrEqual(0);
@@ -382,17 +382,17 @@ test("redact transition terminalizes visible tools before suppressing later deta
 		const frames = activityFrames(result.frames).filter(frame => frame.toolCallId === "redact-transition");
 		expect(frames).toEqual([
 			expect.objectContaining({ phase: "started" }),
-			expect.objectContaining({ phase: "unknown" }),
+			expect.objectContaining({ phase: "cancelled" }),
 		]);
 	});
 }, 30000);
 
-test("agent end and session shutdown terminalize open tool activity", async () => {
+test("agent end and session shutdown use explicit synthetic terminal phases", async () => {
 	await withNotifications(async () => {
 		const result = await setup();
 		for (const [toolCallId, stopReason, phase] of [
 			["cancelled-call", "cancelled", "cancelled"],
-			["unknown-call", undefined, "unknown"],
+			["failed-call", undefined, "failed"],
 		] as const) {
 			await result.handlers.get("tool_execution_start")!(
 				{ type: "tool_execution_start", toolCallId, toolName: "shell", args: {} } as never,
@@ -413,12 +413,12 @@ test("agent end and session shutdown terminalize open tool activity", async () =
 		await waitFor(
 			() =>
 				activityFrames(result.frames).some(
-					frame => frame.toolCallId === "shutdown-call" && frame.phase === "unknown",
+					frame => frame.toolCallId === "shutdown-call" && frame.phase === "cancelled",
 				),
 			"shutdown terminal frame",
 		);
 		const shutdownTerminals = activityFrames(result.frames).filter(
-			frame => frame.toolCallId === "shutdown-call" && frame.phase === "unknown",
+			frame => frame.toolCallId === "shutdown-call" && frame.phase === "cancelled",
 		);
 		expect(shutdownTerminals).toHaveLength(1);
 	});
