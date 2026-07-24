@@ -157,7 +157,9 @@ async function resolveFixtureLogs(fixtureId: string): Promise<ResolvedFixtureLog
 	// schema-valid all-zero report. Require the session root to exist; a real
 	// session with no turns yet still reads as a legitimate empty log set.
 	if (!(await directoryExists(session.sessionRoot))) return { kind: "unknown" };
-	const logs = await readTaskTokenLogs(path.join(session.sessionRoot, "token-logs"));
+	// Keep reports layout-affine to the physical root selected by resolution.
+	const tokenLogDir = path.join(session.sessionRoot, "token-logs");
+	const logs = await readTaskTokenLogs(tokenLogDir);
 	return { kind: "logs", logs };
 }
 

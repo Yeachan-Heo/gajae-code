@@ -28,7 +28,7 @@ import { runExtensionCompact, runExtensionSetModel } from "../extensibility/exte
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import { buildAgentSubskillInjection, renderAgentPromptAdditions } from "../extensibility/gjc-plugins";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
-import { sessionRoot } from "../gjc-runtime/session-layout";
+import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
@@ -1514,9 +1514,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? { id, name: agent.name, description: agent.description }
 				: undefined;
 			let subagentTokenTurn = 0;
-			const tokenLogDir = options.parentSessionId
-				? path.join(sessionRoot(cwd, options.parentSessionId), "token-logs")
+			const parentSession = options.parentSessionId
+				? await resolveGjcSessionForRead(cwd, { flagValue: options.parentSessionId })
 				: undefined;
+			const tokenLogDir = parentSession ? path.join(parentSession.sessionRoot, "token-logs") : undefined;
 			const subagentTelemetry: AgentTelemetryConfig | undefined =
 				options.parentTelemetry && subagentAgentIdentity
 					? {

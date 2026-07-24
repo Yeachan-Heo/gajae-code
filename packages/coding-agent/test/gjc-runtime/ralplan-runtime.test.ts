@@ -9,8 +9,10 @@ import {
 import {
 	activeEntryPath,
 	activeSnapshotPath,
+	legacySessionRoot,
 	modeStatePath,
 	sessionPlansDir,
+	canonicalSessionRoot as sessionRoot,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { readVisibleSkillActiveState } from "@gajae-code/coding-agent/skill-state/active-state";
 
@@ -57,6 +59,28 @@ describe("native gjc ralplan runtime — consensus handoff", () => {
 		expect(state.mode).toBe("deliberate");
 		expect(state.interactive).toBe(true);
 		expect(state.task).toBe("make state native");
+	});
+	it("keeps an existing legacy ralplan workflow write under its legacy root", async () => {
+		const root = await tempDir();
+		const legacyRoot = legacySessionRoot(root, TEST_SESSION_ID);
+		const legacyStatePath = path.join(legacyRoot, "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(legacyStatePath), { recursive: true });
+		await fs.writeFile(
+			legacyStatePath,
+			`${JSON.stringify({ skill: "ralplan", active: true, current_phase: "planner", run_id: "legacy-run" })}\n`,
+			"utf-8",
+		);
+
+		const result = await runNativeRalplanCommand(["--json", "continue legacy"], root);
+
+		expect(result.status).toBe(0);
+		expect(JSON.parse(await fs.readFile(legacyStatePath, "utf-8"))).toMatchObject({
+			run_id: "legacy-run",
+			task: "continue legacy",
+		});
+		await expect(fs.access(path.join(legacyRoot, "state", "skill-active-state.json"))).resolves.toBeNull();
+		await expect(fs.access(path.join(legacyRoot, "state", "active", "ralplan.json"))).resolves.toBeNull();
+		await expect(fs.access(sessionRoot(root, TEST_SESSION_ID))).rejects.toThrow();
 	});
 
 	it("emits receipt-only json for consensus handoff", async () => {

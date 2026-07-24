@@ -1,29 +1,33 @@
 /**
- * Pure path layout for session-scoped GJC workflow state.
+ * Path layout for session-scoped GJC workflow state.
  *
- * Every generated/runtime artifact for a GJC session lives under
- * `<cwd>/.gjc/_session-{encodedSessionId}/...`. The `_session-` prefix is what
- * discriminates a session directory from shared, user-authored/installed config
- * (settings.json, secrets.yml, agents/, gjc-plugins/, agent/, python-env/, user
- * skills/commands), which always stays at the `.gjc/` root.
+ * Fresh sessions live under `<cwd>/.gjc/sessions/_session-{encodedSessionId}`.
+ * Existing legacy sessions remain at `<cwd>/.gjc/_session-{encodedSessionId}`.
+ * Shared, user-authored/installed config always stays at the `.gjc/` root.
  *
- * This module is PURE and acyclic: every export is a deterministic function of
- * its arguments. It never reads `process.env` and never touches the filesystem.
- * Session resolution (flag/payload/env/latest-activity-marker) and any
- * filesystem scanning live in `session-resolution.ts`, the boundary module.
+ * Pure candidate constructors are exported for boundary resolution. The
+ * compatibility `sessionRoot(cwd, id)` helper performs an exact synchronous
+ * affinity check so older ID-based consumers cannot split a resumed legacy
+ * session into a new canonical sibling.
  */
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 export const GJC_DIR = ".gjc";
+export const GJC_SESSIONS_DIR = "sessions";
 export const GJC_SESSION_PREFIX = "_session-";
 export const GJC_SESSION_ACTIVITY_FILE = ".session-activity.json";
 
 /** Source that produced a resolved GJC session id, for audit/diagnostics. */
 export type GjcSessionSource = "flag" | "payload" | "env" | "latest";
 
+export type GjcSessionLayout = "canonical" | "legacy";
+
 export interface GjcSessionContext {
 	gjcSessionId: string;
+	/** Physical root selected by session resolution. */
 	sessionRoot: string;
+	layout: GjcSessionLayout;
 	source: GjcSessionSource;
 }
 
@@ -68,10 +72,49 @@ export function gjcRoot(cwd: string): string {
 	return path.join(cwd, GJC_DIR);
 }
 
-/** The per-session root directory: `<cwd>/.gjc/_session-{encodedId}`. */
+/** Container for canonical session roots: `<cwd>/.gjc/sessions`. */
+export function gjcSessionsRoot(cwd: string): string {
+	return path.join(gjcRoot(cwd), GJC_SESSIONS_DIR);
+}
+
+/** Pure canonical root constructor for fresh sessions. */
+export function canonicalSessionRoot(cwd: string, gjcSessionId: string): string {
+	assertNonEmptyGjcSessionId(gjcSessionId, "canonicalSessionRoot");
+	return path.join(gjcSessionsRoot(cwd), sessionDirName(gjcSessionId));
+}
+
+function existingDirectory(candidate: string): boolean {
+	try {
+		const stat = fs.statSync(candidate);
+		if (!stat.isDirectory()) throw new Error(`GJC session root is not a directory: ${candidate}`);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+/**
+ * Compatibility root resolver for existing ID-based consumers.
+ *
+ * A unique legacy or canonical root remains authoritative. A missing session
+ * selects the canonical location for creation. Duplicate roots fail closed.
+ */
 export function sessionRoot(cwd: string, gjcSessionId: string): string {
-	assertNonEmptyGjcSessionId(gjcSessionId, "sessionRoot");
-	return path.join(gjcRoot(cwd), `${GJC_SESSION_PREFIX}${encodeSessionSegment(gjcSessionId)}`);
+	const canonical = canonicalSessionRoot(cwd, gjcSessionId);
+	const legacy = legacySessionRoot(cwd, gjcSessionId);
+	const hasCanonical = existingDirectory(canonical);
+	const hasLegacy = existingDirectory(legacy);
+	if (hasCanonical && hasLegacy) {
+		throw new Error(`duplicate GJC session roots for session id "${gjcSessionId}"`);
+	}
+	return hasLegacy ? legacy : canonical;
+}
+
+/** Legacy per-session root: `<cwd>/.gjc/_session-{encodedId}`. */
+export function legacySessionRoot(cwd: string, gjcSessionId: string): string {
+	assertNonEmptyGjcSessionId(gjcSessionId, "legacySessionRoot");
+	return path.join(gjcRoot(cwd), sessionDirName(gjcSessionId));
 }
 
 /** Directory name (no path) for a session id, e.g. `_session-abc`. */

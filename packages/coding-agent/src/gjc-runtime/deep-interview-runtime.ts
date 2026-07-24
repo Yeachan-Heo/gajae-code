@@ -22,7 +22,6 @@ import {
 	validateDeepInterviewV1Envelope,
 } from "./deep-interview-state";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
-import { modeStatePath, sessionSpecsDir } from "./session-layout";
 import { resolveGjcSessionForWrite } from "./session-resolution";
 import { runNativeStateCommand } from "./state-runtime";
 import {
@@ -152,10 +151,16 @@ function defaultSpecSlug(now: Date = new Date()): string {
 }
 
 export function deepInterviewStatePath(cwd: string, sessionId?: string): string {
-	const resolvedSessionId = sessionId?.trim() || process.env.GJC_SESSION_ID?.trim();
-	if (!resolvedSessionId) throw new Error("deep-interview state path requires a session id");
-	return modeStatePath(cwd, resolvedSessionId, "deep-interview");
+	const session = resolveGjcSessionForWrite(cwd, {
+		payloadSessionId: sessionId,
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	return deepInterviewStatePathForRoot(session.sessionRoot);
 }
+function deepInterviewStatePathForRoot(sessionRoot: string): string {
+	return path.join(sessionRoot, "state", "deep-interview-state.json");
+}
+
 
 async function resolveSpecContent(rawSpec: string, cwd: string): Promise<string> {
 	const candidate = path.isAbsolute(rawSpec) ? rawSpec : path.resolve(cwd, rawSpec);
@@ -304,6 +309,7 @@ interface ResolvedDeepInterviewArgs {
 	threshold: number;
 	thresholdSource: string;
 	sessionId: string;
+	sessionRoot: string;
 	idea: string;
 	language?: DeepInterviewLanguagePreference;
 	trace?: DeepInterviewTraceSummary;
@@ -605,6 +611,7 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 		threshold,
 		thresholdSource,
 		sessionId,
+		sessionRoot: session.sessionRoot,
 		idea,
 		language: resolveDeepInterviewLanguagePreference(idea),
 		trace,
@@ -676,7 +683,8 @@ export async function persistDeepInterviewSpec(
 		MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
 		"structured deep-interview response",
 	);
-	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
+	const session = resolveGjcSessionForWrite(cwd, { payloadSessionId: resolved.sessionId });
+	const statePath = deepInterviewStatePathForRoot(session.sessionRoot);
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt" && !resolved.force) {
 		throw new DeepInterviewCommandError(
@@ -688,7 +696,7 @@ export async function persistDeepInterviewSpec(
 
 	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
 	const intentReview = resolveLockedIntentReview(existing, content);
-	const specPath = path.join(sessionSpecsDir(cwd, resolved.sessionId), `deep-interview-${resolved.slug}.md`);
+	const specPath = path.join(session.sessionRoot, "specs", `deep-interview-${resolved.slug}.md`);
 	await writeArtifact(specPath, content, {
 		cwd,
 		audit: {
@@ -697,13 +705,14 @@ export async function persistDeepInterviewSpec(
 			owner: "gjc-runtime",
 			skill: "deep-interview",
 			sessionId: resolved.sessionId,
+			sessionRoot: session.sessionRoot,
 		},
 	});
 
 	const sha256 = createHash("sha256").update(content).digest("hex");
 	const createdAt = new Date().toISOString();
 	await appendJsonl(
-		path.join(sessionSpecsDir(cwd, resolved.sessionId), "deep-interview-index.jsonl"),
+		path.join(session.sessionRoot, "specs", "deep-interview-index.jsonl"),
 		{ slug: resolved.slug, stage: resolved.stage, path: specPath, created_at: createdAt, sha256 },
 		{
 			cwd,
@@ -713,6 +722,7 @@ export async function persistDeepInterviewSpec(
 				owner: "gjc-runtime",
 				skill: "deep-interview",
 				sessionId: resolved.sessionId,
+				sessionRoot: session.sessionRoot,
 			},
 		},
 	);
@@ -751,13 +761,14 @@ export async function persistDeepInterviewSpec(
 			owner: "gjc-runtime",
 			skill: "deep-interview",
 			sessionId: resolved.sessionId,
+			sessionRoot: session.sessionRoot,
 			forced: resolved.force,
 		},
 	});
 	await runDeepInterviewPostCommitEffects({
 		cwd,
 		statePath,
-		sessionId: resolved.sessionId ?? "",
+		sessionId: resolved.sessionId,
 		envelope: normalizeDeepInterviewEnvelope(payload),
 		revision: 0,
 		writer: "deep-interview-runtime",
@@ -798,7 +809,7 @@ async function seedDeepInterviewState(
 	cwd: string,
 	resolved: ResolvedDeepInterviewArgs,
 ): Promise<{ statePath: string; warnings: unknown[] }> {
-	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
+	const statePath = deepInterviewStatePathForRoot(resolved.sessionRoot);
 	return withWorkflowStateLock(
 		`${statePath}.kickoff`,
 		async () => {
@@ -913,6 +924,7 @@ async function seedDeepInterviewState(
 					owner: "gjc-runtime",
 					skill: "deep-interview",
 					sessionId: resolved.sessionId,
+					sessionRoot: resolved.sessionRoot,
 				},
 			});
 			const stamped = await readExistingStateForMutation(statePath);

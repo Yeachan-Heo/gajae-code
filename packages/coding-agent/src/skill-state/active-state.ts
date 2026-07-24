@@ -105,6 +105,8 @@ export interface SyncSkillActiveStateOptions {
 	active: boolean;
 	phase?: string;
 	sessionId?: string;
+	/** Physical session root selected by session resolution, when layout-affinity matters. */
+	sessionRoot?: string;
 	threadId?: string;
 	turnId?: string;
 	nowIso?: string;
@@ -362,10 +364,12 @@ export function normalizeSkillActiveState(raw: unknown): SkillActiveState | null
 	};
 }
 
-export function getSkillActiveStatePaths(cwd: string, sessionId?: string): SkillActiveStatePaths {
+export function getSkillActiveStatePaths(cwd: string, sessionId?: string, sessionRoot?: string): SkillActiveStatePaths {
 	const normalizedSessionId = safeString(sessionId).trim();
 	assertNonEmptyGjcSessionId(normalizedSessionId, "getSkillActiveStatePaths");
-	const sessionPath = activeSnapshotPath(cwd, normalizedSessionId);
+	const sessionPath = sessionRoot?.trim()
+		? path.join(path.resolve(sessionRoot), "state", SKILL_ACTIVE_STATE_FILE)
+		: activeSnapshotPath(cwd, normalizedSessionId);
 	return { rootPath: sessionPath, sessionPath };
 }
 
@@ -601,13 +605,14 @@ async function mergeVisibleEntries(
 	cwd: string,
 	sessionState: SkillActiveState | null,
 	sessionId: string,
+	sessionRoot?: string,
 ): Promise<SkillActiveEntry[]> {
 	// Use the raw (active + inactive) rows so a handoff demotion stays visible
 	// long enough to supersede a stale same-skill row before the active filter.
 	// Per-skill files in active/<skill>.json are authoritative and are merged
 	// after the derived snapshot cache, so a stale skill-active-state.json row
 	// cannot override the latest entry file.
-	const entries = [...rawActiveEntries(sessionState), ...(await readActiveEntries(cwd, { sessionId }))];
+	const entries = [...rawActiveEntries(sessionState), ...(await readActiveEntries(cwd, { sessionId, sessionRoot }))];
 	const merged = new Map(entries.map(entry => [entryKey(entry), entry]));
 	const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
 	const visibleEntries = dedupeVisibleBySkill([...merged.values()], sessionId)
@@ -771,7 +776,14 @@ export async function readVisibleSkillActiveState(
 
 function activeStateWriterAudit(verb: string, sessionScope?: ActiveSessionScope | string) {
 	const sessionId = typeof sessionScope === "string" ? sessionScope : sessionScope?.sessionId;
-	return { category: "state" as const, verb, owner: "gjc-runtime" as const, ...(sessionId ? { sessionId } : {}) };
+	const sessionRoot = typeof sessionScope === "string" ? undefined : sessionScope?.sessionRoot;
+	return {
+		category: "state" as const,
+		verb,
+		owner: "gjc-runtime" as const,
+		...(sessionId ? { sessionId } : {}),
+		...(sessionRoot ? { sessionRoot } : {}),
+	};
 }
 
 async function persistActiveEntry(
@@ -832,11 +844,12 @@ async function activeSubskillsForExistingEntry(
 	cwd: string,
 	sessionId: string | undefined,
 	skill: string,
+	sessionRoot?: string,
 ): Promise<ActiveSubskillEntry[] | undefined> {
 	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
-	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
+	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId, sessionRoot);
 	const sessionState = await readRawActiveStateForHandoff(sessionPath, false);
-	const existing = (await mergeVisibleEntries(cwd, sessionState, resolvedSessionId)).find(
+	const existing = (await mergeVisibleEntries(cwd, sessionState, resolvedSessionId, sessionRoot)).find(
 		entry => entry.skill === skill,
 	);
 	return existing?.active_subskills;
@@ -846,7 +859,7 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 	if (!options.sessionId) return;
 	const preservedActiveSubskills =
 		options.active_subskills === undefined
-			? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill)
+			? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill, options.sessionRoot)
 			: undefined;
 	const nowIso = options.nowIso ?? new Date().toISOString();
 	const hud = normalizeWorkflowHudSummary(options.hud);
@@ -874,7 +887,7 @@ export async function syncSkillActiveState(options: SyncSkillActiveStateOptions)
 			? { committed_mode_state_revision: options.committedModeRevision }
 			: {}),
 	};
-	const sessionScope = { sessionId: options.sessionId };
+	const sessionScope = { sessionId: options.sessionId, sessionRoot: options.sessionRoot };
 	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);
 	await persistActiveEntry(options.cwd, sessionScope, entry);
 	await rebuildActiveState(options.cwd, sessionScope);
@@ -899,7 +912,8 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 	const calleeEntry = buildSyncEntry(options.callee, nowIso);
 	const sessionId = options.callee.sessionId ?? options.caller.sessionId;
 	assertNonEmptyGjcSessionId(sessionId, "applyHandoffToActiveState");
-	const { sessionPath } = getSkillActiveStatePaths(options.cwd, sessionId);
+	const sessionRoot = options.callee.sessionRoot ?? options.caller.sessionRoot;
+	const { sessionPath } = getSkillActiveStatePaths(options.cwd, sessionId, sessionRoot);
 	const readState = (filePath: string) => readRawActiveStateForHandoff(filePath, options.strict === true);
 	await readState(sessionPath);
 
@@ -938,7 +952,7 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 	};
 
 	const prior = await readState(sessionPath);
-	await writeEntries({ sessionId }, prior);
+	await writeEntries({ sessionId, sessionRoot }, prior);
 }
 
 function buildSyncEntry(options: SyncSkillActiveStateOptions, nowIso: string): SkillActiveEntry {

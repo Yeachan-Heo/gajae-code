@@ -7,8 +7,8 @@ import { buildTeamHudSummary as buildWorkflowTeamHudSummary } from "../skill-sta
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
 import type { GcPidProbe, GcRecord } from "./gc-runtime";
 import { applyGjcTmuxProfile } from "./launch-tmux";
-import { modeStatePath, sessionIdFromDirName, sessionReportsDir, teamStateRoot } from "./session-layout";
-import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
+import { GJC_SESSION_ACTIVITY_FILE, sessionIdFromDirName } from "./session-layout";
+import { resolveGjcSessionForWrite } from "./session-resolution";
 import {
 	AlreadyExistsError,
 	appendJsonl as appendJsonlAudited,
@@ -700,7 +700,7 @@ export function resolveGjcTeamStateRoot(cwd = process.cwd(), env: NodeJS.Process
 	const session = resolveGjcSessionForWrite(cwd, {
 		envSessionId: env.GJC_SESSION_ID,
 	});
-	return teamStateRoot(cwd, session.gjcSessionId);
+	return path.join(session.sessionRoot, "state", "team");
 }
 
 async function readJsonFile<T>(filePath: string): Promise<T | null> {
@@ -1285,17 +1285,32 @@ const workerOrchestrationRuntime: GjcTeamWorkerOrchestrationRuntime = {
 	readSnapshot: readGjcTeamSnapshot,
 };
 
-function teamModeStatePath(cwd: string, sessionId: string): string {
-	return modeStatePath(cwd, sessionId, "team");
+function teamModeStatePath(sessionRoot: string): string {
+	return path.join(sessionRoot, "state", "team-state.json");
+}
+
+async function writeTeamActivityMarker(sessionRoot: string, sessionId: string, writtenPath: string): Promise<void> {
+	const markerPath = path.join(sessionRoot, GJC_SESSION_ACTIVITY_FILE);
+	await fs.mkdir(path.dirname(markerPath), { recursive: true });
+	await fs.writeFile(
+		markerPath,
+		`${JSON.stringify(
+			{ session_id: sessionId, updated_at: new Date().toISOString(), writer: "team-runtime", path: writtenPath },
+			null,
+			2,
+		)}\n`,
+		"utf-8",
+	);
 }
 
 export async function persistGjcTeamModeStateSummary(snapshot: GjcTeamSnapshot, cwd = process.cwd()): Promise<void> {
 	const active = snapshot.phase !== "complete" && snapshot.phase !== "cancelled";
 	const updatedAt = now();
-	const sessionId = resolveGjcSessionForWrite(cwd, {
+	const session = resolveGjcSessionForWrite(cwd, {
 		envSessionId: process.env.GJC_SESSION_ID,
-	}).gjcSessionId;
-	const statePath = teamModeStatePath(cwd, sessionId);
+	});
+	const sessionId = session.gjcSessionId;
+	const statePath = teamModeStatePath(session.sessionRoot);
 	await writeWorkflowEnvelopeAtomic(
 		statePath,
 		{
@@ -1326,10 +1341,7 @@ export async function persistGjcTeamModeStateSummary(snapshot: GjcTeamSnapshot, 
 			},
 		},
 	);
-	await writeSessionActivityMarker(cwd, sessionId, {
-		writer: "team-runtime",
-		path: statePath,
-	});
+	await writeTeamActivityMarker(session.sessionRoot, sessionId, statePath);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -2042,16 +2054,10 @@ function integrationReportPath(dir: string): string {
 	return path.join(dir, "integration-report.md");
 }
 function commitHygieneLedgerPath(config: GjcTeamConfig): string {
-	return path.join(
-		sessionReportsDir(
-			config.leader_cwd,
-			resolveGjcSessionForWrite(config.leader_cwd, {
-				envSessionId: process.env.GJC_SESSION_ID,
-			}).gjcSessionId,
-		),
-		"team-commit-hygiene",
-		`${config.team_name}.ledger.json`,
-	);
+	const session = resolveGjcSessionForWrite(config.leader_cwd, {
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	return path.join(session.sessionRoot, "reports", "team-commit-hygiene", `${config.team_name}.ledger.json`);
 }
 function integrationNowState(
 	status: GjcTeamIntegrationStatus,
@@ -2144,8 +2150,8 @@ const UNMERGED_GIT_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "
 // The enumerated form drifted: subtrees outside the list (for example the
 // extragoal gate receipts from docs/extragoal-skill-template.md, or the
 // session-root `.session-activity.json` marker) were auto-committed and merged
-// into the leader branch on projects that do not gitignore `.gjc/_session-*/`.
-const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [".gjc/_session-*/"];
+// into the leader branch on projects that do not gitignore generated GJC roots.
+const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [".gjc/_session-*/", ".gjc/sessions/_session-*/"];
 
 function parsePorcelainStatusFiles(stdout: string): string[] {
 	return stdout

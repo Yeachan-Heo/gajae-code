@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	assertUltragoalPauseAllowed,
 	isUltragoalPauseBlocked,
@@ -34,7 +35,7 @@ async function createActiveRun(): Promise<string> {
 }
 
 function ultragoalPath(cwd: string, file: "goals.json" | "ledger.jsonl"): string {
-	return path.join(cwd, ".gjc", `_session-${TEST_SESSION_ID}`, "ultragoal", file);
+	return path.join(sessionUltragoalDir(cwd, TEST_SESSION_ID), file);
 }
 
 afterEach(async () => {

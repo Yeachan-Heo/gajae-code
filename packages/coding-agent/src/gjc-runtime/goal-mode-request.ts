@@ -9,8 +9,8 @@ import {
 	type ModeChangeEntry,
 	type SessionEntry,
 } from "../session/session-manager";
-import { sessionStateDir, sessionUltragoalDir } from "./session-layout";
-import { resolveGjcSessionForRead, resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
+import { GJC_SESSION_ACTIVITY_FILE } from "./session-layout";
+import { resolveGjcSessionForRead, resolveGjcSessionForWrite } from "./session-resolution";
 import { removeFileAudited, writeJsonAtomic } from "./state-writer";
 
 export const GJC_SESSION_FILE_ENV = "GJC_SESSION_FILE";
@@ -54,12 +54,35 @@ function isEnoent(error: unknown): boolean {
 	);
 }
 
-function requestPath(cwd: string, sessionId: string): string {
-	return path.join(sessionStateDir(cwd, sessionId), "goal-mode-request.json");
+function requestPath(sessionRoot: string): string {
+	return path.join(sessionRoot, "state", "goal-mode-request.json");
 }
 
-function ultragoalGoalsPath(cwd: string, sessionId: string): string {
-	return path.join(sessionUltragoalDir(cwd, sessionId), "goals.json");
+function ultragoalGoalsPath(sessionRoot: string): string {
+	return path.join(sessionRoot, "ultragoal", "goals.json");
+}
+
+async function writeGoalModeRequestActivityMarker(
+	sessionRoot: string,
+	sessionId: string,
+	writtenPath: string,
+): Promise<void> {
+	const markerPath = path.join(sessionRoot, GJC_SESSION_ACTIVITY_FILE);
+	await fs.mkdir(path.dirname(markerPath), { recursive: true });
+	await fs.writeFile(
+		markerPath,
+		`${JSON.stringify(
+			{
+				session_id: sessionId,
+				updated_at: new Date().toISOString(),
+				writer: "goal-mode-request",
+				path: writtenPath,
+			},
+			null,
+			2,
+		)}\n`,
+		"utf-8",
+	);
 }
 
 function isCreateGoalsArg(value: string): boolean {
@@ -75,10 +98,11 @@ export async function readUltragoalGjcObjective(
 	cwd: string,
 	sessionId?: string | null,
 ): Promise<{ objective: string; goalsPath: string; provenance: Extract<GoalProvenance, { source: "ultragoal" }> }> {
-	const session = sessionId?.trim()
-		? { gjcSessionId: sessionId.trim() }
-		: await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
-	const goalsPath = ultragoalGoalsPath(cwd, session.gjcSessionId);
+	const session = await resolveGjcSessionForRead(cwd, {
+		payloadSessionId: sessionId?.trim() || undefined,
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const goalsPath = ultragoalGoalsPath(session.sessionRoot);
 	try {
 		const plan = (await Bun.file(goalsPath).json()) as UltragoalPlanShape;
 		const objective = typeof plan.gjcObjective === "string" ? plan.gjcObjective.trim() : "";
@@ -110,10 +134,11 @@ export async function writePendingGoalModeRequest(input: {
 }): Promise<PendingGoalModeRequest> {
 	const objective = input.objective.trim();
 	if (!objective) throw new Error("goal objective is required");
-	const resolvedSessionId =
-		input.sessionId?.trim() ||
-		resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
-	const sessionId = resolvedSessionId;
+	const session = resolveGjcSessionForWrite(input.cwd, {
+		payloadSessionId: input.sessionId?.trim() || undefined,
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const sessionId = session.gjcSessionId;
 	const request: PendingGoalModeRequest = {
 		version: REQUEST_VERSION,
 		kind: "goal_mode_request",
@@ -125,12 +150,12 @@ export async function writePendingGoalModeRequest(input: {
 
 		...(sessionId ? { sessionId } : {}),
 	};
-	const filePath = requestPath(input.cwd, sessionId);
+	const filePath = requestPath(session.sessionRoot);
 	await writeJsonAtomic(filePath, request, {
 		cwd: input.cwd,
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", sessionId },
 	});
-	await writeSessionActivityMarker(input.cwd, sessionId, { writer: "goal-mode-request", path: filePath });
+	await writeGoalModeRequestActivityMarker(session.sessionRoot, sessionId, filePath);
 	return request;
 }
 
@@ -234,10 +259,11 @@ export async function consumePendingGoalModeRequest(
 	cwd: string,
 	currentSessionId?: string | null,
 ): Promise<PendingGoalModeRequest | null> {
-	const session = currentSessionId?.trim()
-		? { gjcSessionId: currentSessionId.trim() }
-		: await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID });
-	const filePath = requestPath(cwd, session.gjcSessionId);
+	const session = await resolveGjcSessionForRead(cwd, {
+		payloadSessionId: currentSessionId?.trim() || undefined,
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const filePath = requestPath(session.sessionRoot);
 	let raw: unknown;
 	try {
 		raw = await Bun.file(filePath).json();

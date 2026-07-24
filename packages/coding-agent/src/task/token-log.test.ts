@@ -1,8 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GJC_SESSION_ACTIVITY_FILE, sessionRoot } from "../gjc-runtime/session-layout";
+import {
+	GJC_SESSION_ACTIVITY_FILE,
+	legacySessionRoot,
+	canonicalSessionRoot as sessionRoot,
+} from "../gjc-runtime/session-layout";
 import {
 	computeCacheHitRate,
 	persistTaskTokenLog,
@@ -117,6 +121,50 @@ describe("task token log", () => {
 			await expect(resolveTaskTokenLogDir(cwd, { getSessionId: () => currentSessionId }, "")).resolves.toBe(
 				join(sessionRoot(cwd, currentSessionId), "token-logs"),
 			);
+		});
+	});
+	it("persists an existing legacy session token log without creating a canonical sibling", async () => {
+		await withTempDir(async cwd => {
+			const sessionId = "legacy-session";
+			await mkdir(legacySessionRoot(cwd, sessionId), { recursive: true });
+			const dir = await resolveTaskTokenLogDir(cwd, { getSessionId: () => sessionId }, "");
+			const entry = taskTokenLogFromChat(
+				{ inputTokens: 1, outputTokens: 2, cachedInputTokens: 0, cacheWriteTokens: 0 },
+				{ subagentId: "root", turn: 1, at: "2026-01-01T00:00:00.000Z" },
+			);
+
+			expect(dir).toBe(join(legacySessionRoot(cwd, sessionId), "token-logs"));
+			await persistTaskTokenLog(entry, { dir: dir! });
+			expect(await readTaskTokenLogs(dir!)).toEqual([entry]);
+			await expect(access(sessionRoot(cwd, sessionId))).rejects.toThrow();
+		});
+	});
+	it("persists a new session token log under the canonical sessions root", async () => {
+		await withTempDir(async cwd => {
+			const sessionId = "new-session";
+			const dir = await resolveTaskTokenLogDir(cwd, { getSessionId: () => sessionId }, "");
+			const entry = taskTokenLogFromChat(
+				{ inputTokens: 1, outputTokens: 2, cachedInputTokens: 0, cacheWriteTokens: 0 },
+				{ subagentId: "root", turn: 1, at: "2026-01-01T00:00:00.000Z" },
+			);
+
+			expect(dir).toBe(join(sessionRoot(cwd, sessionId), "token-logs"));
+			await persistTaskTokenLog(entry, { dir: dir! });
+			expect(await readTaskTokenLogs(dir!)).toEqual([entry]);
+			await expect(access(legacySessionRoot(cwd, sessionId))).rejects.toThrow();
+		});
+	});
+	it("fails closed without creating token logs when both session layouts exist", async () => {
+		await withTempDir(async cwd => {
+			const sessionId = "duplicate-session";
+			await mkdir(sessionRoot(cwd, sessionId), { recursive: true });
+			await mkdir(legacySessionRoot(cwd, sessionId), { recursive: true });
+
+			await expect(resolveTaskTokenLogDir(cwd, { getSessionId: () => sessionId }, "")).rejects.toThrow(
+				"duplicate GJC session roots",
+			);
+			await expect(access(join(sessionRoot(cwd, sessionId), "token-logs"))).rejects.toThrow();
+			await expect(access(join(legacySessionRoot(cwd, sessionId), "token-logs"))).rejects.toThrow();
 		});
 	});
 

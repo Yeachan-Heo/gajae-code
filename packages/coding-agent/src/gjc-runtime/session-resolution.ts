@@ -15,15 +15,22 @@
  * Writes require one of (1)-(3). Auto-detect fails closed on zero candidates or
  * ambiguous ties.
  */
+import type { Dirent } from "node:fs";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	canonicalSessionRoot,
 	GJC_SESSION_ACTIVITY_FILE,
+	GJC_SESSION_PREFIX,
 	type GjcSessionContext,
+	type GjcSessionLayout,
 	type GjcSessionSource,
 	gjcRoot,
+	gjcSessionsRoot,
+	legacySessionRoot,
+	sessionDirName,
 	sessionIdFromDirName,
-	sessionRoot,
 } from "./session-layout";
 
 /** Window within which two activity timestamps are treated as an ambiguous tie. */
@@ -39,7 +46,7 @@ export interface SessionIdSources {
 export class SessionResolutionError extends Error {
 	constructor(
 		message: string,
-		readonly code: "blank_flag" | "unsafe_session" | "no_session" | "ambiguous" | "missing_for_write",
+		readonly code: "blank_flag" | "unsafe_session" | "no_session" | "ambiguous" | "duplicate" | "missing_for_write",
 	) {
 		super(message);
 		this.name = "SessionResolutionError";
@@ -99,11 +106,7 @@ export function resolveGjcSessionForWrite(cwd: string, sources: SessionIdSources
 			"missing_for_write",
 		);
 	}
-	return {
-		gjcSessionId: resolved.gjcSessionId,
-		sessionRoot: sessionRoot(cwd, resolved.gjcSessionId),
-		source: resolved.source,
-	};
+	return resolveExistingSessionContext(cwd, resolved.gjcSessionId, resolved.source);
 }
 
 /**
@@ -112,27 +115,21 @@ export function resolveGjcSessionForWrite(cwd: string, sources: SessionIdSources
  */
 export async function resolveGjcSessionForRead(cwd: string, sources: SessionIdSources): Promise<GjcSessionContext> {
 	const resolved = resolveSessionIdFromSources(sources);
-	if (resolved) {
-		return {
-			gjcSessionId: resolved.gjcSessionId,
-			sessionRoot: sessionRoot(cwd, resolved.gjcSessionId),
-			source: resolved.source,
-		};
-	}
-	const latest = await detectLatestSession(cwd);
-	return { gjcSessionId: latest.gjcSessionId, sessionRoot: latest.sessionRoot, source: "latest" };
+	if (resolved) return resolveExistingSessionContext(cwd, resolved.gjcSessionId, resolved.source);
+	return detectLatestSession(cwd);
 }
 
 interface SessionCandidate {
 	gjcSessionId: string;
 	sessionRoot: string;
+	layout: GjcSessionLayout;
 	activityMs: number;
 }
 
 /**
- * Scan `.gjc/_session-*` directories and select the most-recently-active one by
- * its activity marker. Never uses raw directory mtime. Throws on zero candidates
- * or an ambiguous tie.
+ * Scan canonical and legacy `_session-*` directories and select the
+ * most-recently-active one by its activity marker. Never uses raw directory
+ * mtime. Throws on zero candidates, duplicate ids, or an ambiguous tie.
  */
 export async function detectLatestSession(cwd: string): Promise<GjcSessionContext> {
 	const candidates = await collectActiveSessionCandidates(cwd);
@@ -153,29 +150,80 @@ export async function detectLatestSession(cwd: string): Promise<GjcSessionContex
 			"ambiguous",
 		);
 	}
-	return { gjcSessionId: first.gjcSessionId, sessionRoot: first.sessionRoot, source: "latest" };
+	return {
+		gjcSessionId: first.gjcSessionId,
+		sessionRoot: first.sessionRoot,
+		layout: first.layout,
+		source: "latest",
+	};
+}
+
+function duplicateSessionError(gjcSessionId: string): SessionResolutionError {
+	return new SessionResolutionError(`duplicate GJC session roots for session id "${gjcSessionId}"`, "duplicate");
+}
+
+function isDirectory(root: string): boolean {
+	try {
+		const stat = fsSync.statSync(root);
+		if (!stat.isDirectory()) throw new Error(`GJC session root is not a directory: ${root}`);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+function resolveExistingSessionContext(cwd: string, gjcSessionId: string, source: GjcSessionSource): GjcSessionContext {
+	const canonicalRoot = canonicalSessionRoot(cwd, gjcSessionId);
+	const legacyRoot = legacySessionRoot(cwd, gjcSessionId);
+	const hasCanonical = isDirectory(canonicalRoot);
+	const hasLegacy = isDirectory(legacyRoot);
+	if (hasCanonical && hasLegacy) throw duplicateSessionError(gjcSessionId);
+	if (hasLegacy) return { gjcSessionId, sessionRoot: legacyRoot, layout: "legacy", source };
+	return {
+		gjcSessionId,
+		sessionRoot: canonicalRoot,
+		layout: "canonical",
+		source,
+	};
 }
 
 async function collectActiveSessionCandidates(cwd: string): Promise<SessionCandidate[]> {
-	const root = gjcRoot(cwd);
-	let entries: import("node:fs").Dirent[];
-	try {
-		entries = await fs.readdir(root, { withFileTypes: true });
-	} catch {
-		return [];
+	const roots: readonly [GjcSessionLayout, string][] = [
+		["canonical", gjcSessionsRoot(cwd)],
+		["legacy", gjcRoot(cwd)],
+	];
+	const sessions = new Map<string, { sessionRoot: string; layout: GjcSessionLayout }>();
+	for (const [layout, root] of roots) {
+		let entries: Dirent[];
+		try {
+			entries = await fs.readdir(root, { withFileTypes: true });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		for (const entry of entries) {
+			if (!entry.name.startsWith(GJC_SESSION_PREFIX)) continue;
+			const gjcSessionId = sessionIdFromDirName(entry.name);
+			if (!gjcSessionId || entry.name !== sessionDirName(gjcSessionId) || !entry.isDirectory()) {
+				throw new SessionResolutionError(
+					`invalid GJC session root entry: ${path.join(root, entry.name)}`,
+					"unsafe_session",
+				);
+			}
+			assertSafeResolvedSessionId(gjcSessionId);
+			const sessionRoot = path.join(root, entry.name);
+			if (sessions.has(gjcSessionId)) throw duplicateSessionError(gjcSessionId);
+			sessions.set(gjcSessionId, { sessionRoot, layout });
+		}
 	}
 	const candidates: SessionCandidate[] = [];
-	for (const entry of entries) {
-		if (!entry.isDirectory()) continue;
-		const gjcSessionId = sessionIdFromDirName(entry.name);
-		if (!gjcSessionId) continue;
-		assertSafeResolvedSessionId(gjcSessionId);
-		const dir = path.join(root, entry.name);
-		const activityMs = await readActivityMs(path.join(dir, GJC_SESSION_ACTIVITY_FILE));
+	for (const [gjcSessionId, session] of sessions) {
+		const activityMs = await readActivityMs(path.join(session.sessionRoot, GJC_SESSION_ACTIVITY_FILE));
 		// Sessions with no readable activity marker are considered inactive and
 		// are not selected for auto-detect.
 		if (activityMs === undefined) continue;
-		candidates.push({ gjcSessionId, sessionRoot: dir, activityMs });
+		candidates.push({ gjcSessionId, ...session, activityMs });
 	}
 	return candidates;
 }
@@ -184,8 +232,9 @@ async function readActivityMs(markerPath: string): Promise<number | undefined> {
 	let raw: string;
 	try {
 		raw = await fs.readFile(markerPath, "utf-8");
-	} catch {
-		return undefined;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
 	}
 	try {
 		const parsed = JSON.parse(raw) as { updated_at?: unknown };
@@ -199,8 +248,9 @@ async function readActivityMs(markerPath: string): Promise<number | undefined> {
 	try {
 		const stat = await fs.stat(markerPath);
 		return stat.mtimeMs;
-	} catch {
-		return undefined;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
 	}
 }
 
@@ -220,7 +270,8 @@ export async function writeSessionActivityMarker(
 	gjcSessionId: string,
 	info: ActivityMarkerInfo,
 ): Promise<void> {
-	const markerPath = path.join(sessionRoot(cwd, gjcSessionId), GJC_SESSION_ACTIVITY_FILE);
+	const session = resolveExistingSessionContext(cwd, gjcSessionId, "payload");
+	const markerPath = path.join(session.sessionRoot, GJC_SESSION_ACTIVITY_FILE);
 	await fs.mkdir(path.dirname(markerPath), { recursive: true });
 	const payload = {
 		session_id: gjcSessionId,

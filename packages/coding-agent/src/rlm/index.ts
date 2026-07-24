@@ -4,14 +4,18 @@
  * Composes a research session over the existing agent/session loop (python
  * kernel + read + web_search + read-only bash), optional DATA.md context, live
  * notebook.ipynb, first-class complete_research report synthesis, autonomous
- * goal-arg execution, and resumable .gjc/rlm/<session> artifacts.
+ * goal-arg execution, and resumable session-scoped RLM artifacts.
  */
 import * as fs from "node:fs/promises";
 import { getProjectDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../cli/args";
 import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import { resolveSessionIdFromSources, writeSessionActivityMarker } from "../gjc-runtime/session-resolution";
+import {
+	resolveGjcSessionForWrite,
+	resolveSessionIdFromSources,
+	writeSessionActivityMarker,
+} from "../gjc-runtime/session-resolution";
 import { type RlmPreset, runRootCommand } from "../main";
 import rlmReportCommandPrompt from "../prompts/system/rlm-report-command.md" with { type: "text" };
 import type { CreateAgentSessionOptions } from "../sdk";
@@ -261,18 +265,21 @@ export function ensureRlmGjcSessionId(): string {
 export async function runRlmCommand(argv: string[]): Promise<void> {
 	const cwd = getProjectDir();
 	ensureRlmGjcSessionId();
+	const parentSession = resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID });
 	const { dataPath, resumeSessionId, minSuccessfulRuns, rest } = extractRlmFlags(argv);
 	const dataContext = await loadRlmDataContext(cwd, dataPath);
 
 	const sessionId = resumeSessionId ?? generateRlmSessionId();
-	const paths = resolveRlmArtifactPaths(cwd, sessionId);
-	if (resumeSessionId && !(await rlmSessionExists(cwd, resumeSessionId))) {
+	const paths = resolveRlmArtifactPaths(cwd, sessionId, parentSession.sessionRoot);
+	if (resumeSessionId && !(await rlmSessionExists(cwd, resumeSessionId, parentSession.sessionRoot))) {
 		throw new Error(`RLM session not found: ${resumeSessionId}`);
 	}
 	await ensureRlmSessionDir(paths);
 	await fs.mkdir(paths.agentSessionDir, { recursive: true });
 
-	const existingNotebook = resumeSessionId ? await readRlmNotebookIfPresent(cwd, sessionId) : undefined;
+	const existingNotebook = resumeSessionId
+		? await readRlmNotebookIfPresent(cwd, sessionId, parentSession.sessionRoot)
+		: undefined;
 	const existingMetadata = await loadExistingMetadata(paths);
 	const notebook = new RlmNotebookWriter(paths.notebookPath, existingNotebook);
 	const pythonTool = createRlmPythonTool({

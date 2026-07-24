@@ -4,10 +4,13 @@ import * as path from "node:path";
 import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import {
 	activeSnapshotPath,
+	legacySessionRoot,
 	modeStatePath,
+	canonicalSessionRoot as sessionRoot,
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { writeActiveEntry } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -52,6 +55,78 @@ describe("native gjc state runtime", () => {
 		const result = await runNativeStateCommand(["read", "--json"], root);
 		expect(result.status).toBe(0);
 		expect(envelopeState(result.stdout)).toEqual({});
+	});
+	it("describes state paths through the resolved session root", async () => {
+		const root = await tempDir();
+		const result = await runNativeStateCommand(["contract", "--mode", "ralplan", "--json"], root);
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain("<resolved-session-root>/state/skill-active-state.json");
+		expect(result.stdout).toContain(".gjc/sessions/_session-{sessionid}");
+		expect(result.stdout).toContain(".gjc/_session-{sessionid}");
+	});
+	it("creates a new state session only under the canonical sessions root", async () => {
+		const root = await tempDir();
+
+		const result = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "canonical" })],
+			root,
+		);
+
+		expect(result.status).toBe(0);
+		expect(JSON.parse(await fs.readFile(modeStatePath(root, TEST_SESSION_ID, "ralplan"), "utf-8"))).toMatchObject({
+			marker: "canonical",
+		});
+		await expect(fs.access(legacySessionRoot(root, TEST_SESSION_ID))).rejects.toThrow();
+	});
+	it("keeps an existing legacy state session layout-affine", async () => {
+		const root = await tempDir();
+		const legacyStatePath = path.join(legacySessionRoot(root, TEST_SESSION_ID), "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(legacyStatePath), { recursive: true });
+		await fs.writeFile(legacyStatePath, `${JSON.stringify({ marker: "legacy" })}\n`, "utf-8");
+
+		const result = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ next_marker: "legacy-write" })],
+			root,
+		);
+
+		expect(result.status).toBe(0);
+		expect(JSON.parse(await fs.readFile(legacyStatePath, "utf-8"))).toMatchObject({
+			marker: "legacy",
+			next_marker: "legacy-write",
+		});
+		await expect(fs.access(sessionRoot(root, TEST_SESSION_ID))).rejects.toThrow();
+	});
+	it("fails closed without mutating either state layout when both session roots exist", async () => {
+		const root = await tempDir();
+		const canonicalStatePath = modeStatePath(root, TEST_SESSION_ID, "ralplan");
+		const legacyStatePath = path.join(legacySessionRoot(root, TEST_SESSION_ID), "state", "ralplan-state.json");
+		await fs.mkdir(path.dirname(canonicalStatePath), { recursive: true });
+		await fs.mkdir(path.dirname(legacyStatePath), { recursive: true });
+		await fs.writeFile(canonicalStatePath, `${JSON.stringify({ marker: "canonical" })}\n`, "utf-8");
+		await fs.writeFile(legacyStatePath, `${JSON.stringify({ marker: "legacy" })}\n`, "utf-8");
+
+		const result = await runNativeStateCommand(
+			["write", "--mode", "ralplan", "--input", JSON.stringify({ marker: "split" })],
+			root,
+		);
+
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("duplicate GJC session roots");
+		await expect(fs.readFile(canonicalStatePath, "utf-8")).resolves.toBe(
+			`${JSON.stringify({ marker: "canonical" })}\n`,
+		);
+		await expect(fs.readFile(legacyStatePath, "utf-8")).resolves.toBe(`${JSON.stringify({ marker: "legacy" })}\n`);
+	});
+	it("rejects an active-state root that does not match session affinity before writing", async () => {
+		const root = await tempDir();
+		const outsideRoot = path.join(root, "outside-session");
+		await expect(
+			writeActiveEntry(root, { sessionId: TEST_SESSION_ID, sessionRoot: outsideRoot }, "ralplan", {
+				skill: "ralplan",
+				active: true,
+			}),
+		).rejects.toThrow(/does not match the resolved root/);
+		await expect(fs.access(outsideRoot)).rejects.toThrow();
 	});
 	it("treats an empty first positional as absent instead of clearing state", async () => {
 		const root = await tempDir();
