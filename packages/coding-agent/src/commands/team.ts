@@ -75,7 +75,7 @@ function parseInputFlag(argv: string[]): Record<string, unknown> {
 
 export default class Team extends Command {
 	static description =
-		"Run native GJC tmux team orchestration from inside an existing tmux/GJC --tmux session; --dry-run writes ephemeral .gjc/_session-{sessionid}/state/team state only";
+		"Run native GJC tmux team orchestration from inside an existing tmux/GJC --tmux session; --dry-run writes ephemeral state under the resolved session root (fresh: .gjc/sessions/_session-{sessionid}/state/team; existing legacy sessions remain at .gjc/_session-{sessionid}/state/team)";
 	static strict = false;
 
 	static args = {
@@ -89,7 +89,7 @@ export default class Team extends Command {
 		json: Flags.boolean({ char: "j", description: "Emit machine-readable JSON", default: false }),
 		"dry-run": Flags.boolean({
 			description:
-				"Create ephemeral .gjc/_session-{sessionid}/state/team state without starting tmux panes; do not commit generated state",
+				"Create ephemeral state under the resolved session root without starting tmux panes; do not commit generated state (fresh: .gjc/sessions/_session-{sessionid}/state/team; existing legacy sessions remain at .gjc/_session-{sessionid}/state/team)",
 			default: false,
 		}),
 	};
@@ -212,7 +212,7 @@ export default class Team extends Command {
 			`workers: ${snapshot.workers.length}`,
 			...(dryRun
 				? [
-						"dry-run: wrote ephemeral .gjc/_session-{sessionid}/state/team state only; do not commit generated .gjc state",
+						"dry-run: wrote ephemeral state under the resolved session root only; do not commit generated .gjc state",
 					]
 				: []),
 		]);

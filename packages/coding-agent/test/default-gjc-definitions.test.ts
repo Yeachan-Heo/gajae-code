@@ -658,7 +658,7 @@ Project executor override body.
 		expect(deepInterview).toBeDefined();
 		const content = deepInterview?.content ?? "";
 
-		for (const required of ["ask", ".gjc/_session-{sessionid}/state", "pending approval"]) {
+		for (const required of ["ask", "<resolved-session-root>/state", "pending approval"]) {
 			expect(content).toContain(required);
 		}
 		expect(content).toContain("/skill:ralplan");
@@ -666,6 +666,7 @@ Project executor override body.
 		expect(content).toContain("`gjc ralplan` is a native CLI");
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden unless an explicit force override is active");
 		expect(content).toContain("Normal interview persistence uses CLI-owned drafts");
+		expect(content).toContain("do not edit `<resolved-session-root>/state` directly without force override");
 		expect(content).toContain("gjc state clear --force --mode deep-interview");
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
@@ -703,12 +704,12 @@ Project executor override body.
 		expect(content).toContain("--stage planner");
 		expect(content).toContain("--stage architect");
 		expect(content).toContain("--stage critic");
-		expect(content).toContain("do not directly edit `.gjc/_session-{sessionid}/plans`");
+		expect(content).toContain("do not directly edit `<resolved-session-root>/plans`");
 		expect(content).toContain("gjc state clear --force --mode ralplan");
 		expect(content).toContain('workflowGate: { stage: "ralplan", kind: "approval" }');
 		expect(content).toContain("RPC/headless clients receive a `ralplan`/`approval` workflow gate");
 		expect(content).toContain(
-			"Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden",
+			"Direct `write`, `edit`, or `ast_edit` calls against `<resolved-session-root>/specs`, `<resolved-session-root>/plans`, `<resolved-session-root>/state`, or any other `.gjc/` path are forbidden",
 		);
 	});
 

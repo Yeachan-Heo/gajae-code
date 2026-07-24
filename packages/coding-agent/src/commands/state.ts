@@ -3,7 +3,7 @@ import { runNativeStateCommand } from "../gjc-runtime/state-runtime";
 
 export default class State extends Command {
 	static description =
-		"Read or update current-session GJC workflow state receipts under .gjc/_session-{sessionid}/state";
+		"Read or update current-session GJC workflow state receipts under the resolved session root (fresh: .gjc/sessions/_session-{sessionid}/state; existing legacy sessions remain at .gjc/_session-{sessionid}/state)";
 	static strict = false;
 	static examples = [
 		'$ gjc state read --input \'{"mode":"deep-interview"}\' --json',

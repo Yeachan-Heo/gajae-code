@@ -1,7 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ChatUsageSnapshot, CostEstimate } from "@gajae-code/agent-core";
-import { sessionRoot } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead, SessionResolutionError } from "../gjc-runtime/session-resolution";
 import type { TaskTokenLog, TaskTokenMetrics } from "./types";
 
@@ -76,19 +75,18 @@ export async function resolveTaskTokenLogDir(
 	sessionManager: TaskTokenLogSessionManager | undefined,
 	envSessionId: string | undefined = process.env.GJC_SESSION_ID,
 ): Promise<string | undefined> {
-	// Prefer the canonical SessionManager id so root turns land in the SAME
-	// `<session>/token-logs` dir the task executor uses for subagent turns and
-	// that `gjc --fixture <id>` reads from. Fall back to the env/latest-active
-	// session only when no manager id is available (e.g. lifecycle launches where
-	// the SDK adopts a pre-allocated id internally). Never let a best-effort
-	// telemetry side channel crash startup — swallow every SessionResolutionError.
+	// Resolve the manager id, env id, or latest-active session to its physical
+	// root. Existing legacy sessions stay layout-affine; only the established
+	// absence-of-any-session telemetry case is suppressed.
 	const managerId = sessionManager?.getSessionId();
-	if (managerId) return path.join(sessionRoot(cwd, managerId), "token-logs");
 	try {
-		const session = await resolveGjcSessionForRead(cwd, { envSessionId });
+		const session = await resolveGjcSessionForRead(cwd, {
+			flagValue: managerId || undefined,
+			envSessionId,
+		});
 		return path.join(session.sessionRoot, "token-logs");
 	} catch (error) {
-		if (error instanceof SessionResolutionError) return undefined;
+		if (error instanceof SessionResolutionError && error.code === "no_session") return undefined;
 		throw error;
 	}
 }

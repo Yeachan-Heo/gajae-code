@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+### Changed
+- Workflow state now resolves fresh sessions under `.gjc/sessions/_session-{id}` while existing legacy sessions retain immutable affinity to `.gjc/_session-{id}`. The runtime does not migrate or dual-write; cross-layout duplicates fail closed, and unsupported downgrade attempts remain visibly rejected.
 ### Fixed
 
 - Interactive prompt cancellation now reaches API-key preflight through `ModelRegistry`, allowing aborted submissions to clear immediately even while a shared credential-usage request continues in the background.

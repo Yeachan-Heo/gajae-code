@@ -13,8 +13,10 @@ import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ra
 import {
 	activeSnapshotPath,
 	auditPath,
+	legacySessionRoot,
 	modeStatePath,
 	sessionPlansDir,
+	canonicalSessionRoot as sessionRoot,
 	sessionSpecsDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 
@@ -111,6 +113,28 @@ describe("native gjc deep-interview runtime", () => {
 		const validState = JSON.parse(await fs.readFile(validStatePath, "utf-8"));
 		expect(validState.transcript).toEqual([{ question: "q", answer: "a" }]);
 		expect(validState.spec_slug).toBe("valid-state");
+	});
+	it("keeps an existing legacy deep-interview workflow write under its legacy root", async () => {
+		const root = await tempDir();
+		const legacyRoot = legacySessionRoot(root, TEST_SESSION_ID);
+		const legacyStatePath = path.join(legacyRoot, "state", "deep-interview-state.json");
+		await fs.mkdir(path.dirname(legacyStatePath), { recursive: true });
+		await fs.writeFile(legacyStatePath, `${JSON.stringify({ rounds: [] })}\n`, "utf-8");
+
+		const result = await runNativeDeepInterviewCommand(
+			["--write", "--stage", "final", "--slug", "legacy-affinity", "--spec", "# Legacy", "--json"],
+			root,
+		);
+
+		expect(result.status).toBe(0);
+		expect(JSON.parse(await fs.readFile(legacyStatePath, "utf-8"))).toMatchObject({
+			spec_slug: "legacy-affinity",
+		});
+		await expect(
+			fs.readFile(path.join(legacyRoot, "specs", "deep-interview-legacy-affinity.md"), "utf-8"),
+		).resolves.toBe("# Legacy\n");
+		await expect(fs.access(path.join(legacyRoot, "state", "skill-active-state.json"))).resolves.toBeNull();
+		await expect(fs.access(sessionRoot(root, TEST_SESSION_ID))).rejects.toThrow();
 	});
 
 	it("enforces locked-intent review before creating a spec while preserving legacy handoff", async () => {
