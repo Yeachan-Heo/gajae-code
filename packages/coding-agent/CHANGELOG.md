@@ -11,6 +11,8 @@
 
 - Rejected subagent schema payloads now retain their complete structured data in canonical output artifacts; inline results remain bounded while `agent://` output stays lossless (#2894).
 - Managed legacy-session artifact migration now validates Windows directory roots from the native tree snapshot, tolerates only lazy metadata on plain Windows directories, and replays both clean and cleanup-pending detaches while retaining fail-closed receipt validation. Canonical binding durability sync uses a writable no-follow handle on Windows NTFS stacks that reject `FlushFileBuffers` on read-only handles (#3015, #2913).
+- `gjc resume` and delete no longer pay a durable (fsync-backed) lock acquisition for managed session tombstones that have nothing left to reconcile; a scope with many accumulated already-completed tombstones opens noticeably faster (#<issue-2-number>).
+
 ## [0.11.8] - 2026-07-23
 ### Added
 
