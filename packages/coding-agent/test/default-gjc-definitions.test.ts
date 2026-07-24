@@ -666,7 +666,9 @@ Project executor override body.
 		expect(content).toContain("`gjc ralplan` is a native CLI");
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden unless an explicit force override is active");
 		expect(content).toContain("Normal interview persistence uses CLI-owned drafts");
-		expect(content).toContain("do not edit `<resolved-session-root>/state` directly without force override");
+		expect(content).toContain(
+			"do not read or edit `<resolved-session-root>/state` files directly unless an explicit force override is active",
+		);
 		expect(content).toContain("gjc state clear --force --mode deep-interview");
 		expect(content).toContain("default `0.05`");
 		expect(content).toContain("language.instruction");
