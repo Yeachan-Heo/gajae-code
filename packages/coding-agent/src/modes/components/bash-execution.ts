@@ -16,7 +16,9 @@ import {
 } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
+import { formatInvocationCommand } from "../../tools/invocation-display";
 import type { TruncationMeta } from "../../tools/output-meta";
+import { replaceTabs } from "../../tools/render-utils";
 import {
 	containsSixelSequence,
 	getSixelLineMask,
@@ -51,6 +53,8 @@ export class BashExecutionComponent extends Container {
 	#chunkGate = false;
 	#contentContainer: Container;
 	#headerText: Text;
+	#colorKey: "dim" | "bashMode";
+	#shellLabel: string;
 
 	constructor(
 		private readonly command: string,
@@ -60,21 +64,14 @@ export class BashExecutionComponent extends Container {
 		super();
 
 		// Use dim border for excluded-from-context commands (!! prefix)
-		const colorKey = excludeFromContext ? "dim" : "bashMode";
-		const { contentContainer, loader } = buildExecutionFrame(this, ui, colorKey);
+		this.#colorKey = excludeFromContext ? "dim" : "bashMode";
+		this.#shellLabel = excludeFromContext ? "shell · no context" : "shell";
+		const { contentContainer, loader } = buildExecutionFrame(this, ui, this.#colorKey);
 		this.#contentContainer = contentContainer;
 		this.#loader = loader;
 
 		// Command header: terse shell rail, no extra render work on streaming chunks.
-		const shellLabel = excludeFromContext ? "shell · no context" : "shell";
-		this.#headerText = new Text(
-			`${theme.fg(colorKey, theme.bold(shellLabel))} ${theme.fg("dim", "·")} ${theme.fg(
-				colorKey,
-				theme.bold(`$ ${command}`),
-			)}`,
-			1,
-			0,
-		);
+		this.#headerText = new Text(this.#formatHeader(), 1, 0);
 		this.#contentContainer.addChild(this.#headerText);
 		this.#contentContainer.addChild(this.#loader);
 	}
@@ -84,6 +81,7 @@ export class BashExecutionComponent extends Container {
 	 */
 	setExpanded(expanded: boolean): void {
 		this.#expanded = expanded;
+		this.#headerText.setText(this.#formatHeader());
 		this.#updateDisplay();
 	}
 
@@ -221,6 +219,14 @@ export class BashExecutionComponent extends Container {
 			if (footer) this.#contentContainer.addChild(footer);
 		}
 		this.#displayBuiltWithGraphicsFallback = fallbackActive;
+	}
+
+	#formatHeader(): string {
+		const command = replaceTabs(sanitizeText(formatInvocationCommand(this.command, this.#expanded)));
+		return `${theme.fg(this.#colorKey, theme.bold(this.#shellLabel))} ${theme.fg("dim", "·")} ${theme.fg(
+			this.#colorKey,
+			theme.bold(`$ ${command}`),
+		)}`;
 	}
 
 	#clampDisplayLine(line: string): string {

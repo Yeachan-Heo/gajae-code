@@ -38,7 +38,7 @@ describe("bashToolRenderer", () => {
 			uiTheme,
 		);
 		const rendered = sanitizeText(component.render(120).join("\n"));
-		expect(rendered).toContain('MERMAID="line \\"one\\"\\ntwo"');
+		expect(rendered).toContain('MERMAID="<multiline, 2 lines, 14 B>"');
 		expect(rendered).toContain("printf '%s' \"$MERMAID\"");
 	});
 
@@ -55,7 +55,7 @@ describe("bashToolRenderer", () => {
 			uiTheme,
 		);
 		const rendered = sanitizeText(component.render(120).join("\n"));
-		expect(rendered).toContain('MERMAID="line 1\\nline 2"');
+		expect(rendered).toContain('MERMAID="<multiline, 2 lines, 13 B>"');
 		expect(rendered).toContain("printf '%s' \"$MERMAID\"");
 	});
 

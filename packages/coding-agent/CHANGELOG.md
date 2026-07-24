@@ -7,6 +7,7 @@
 - Interactive prompt cancellation now reaches API-key preflight through `ModelRegistry`, allowing aborted submissions to clear immediately even while a shared credential-usage request continues in the background.
 - Alibaba Token Plan canonical first-event timeouts now surface without session retry/fallback replay and are not internally retried by auto-compaction, preventing repeated provider usage (#3026).
 - Delegated-task and subagent status surfaces now distinguish provider recovery from normal running, identify first-event versus idle-stream stalls, show retry budget and provider-progress age, and aggregate concurrent degradation by provider (#3071).
+- Bash invocation rendering now collapses multiline and oversized payloads by default while preserving expandable safe detail, and redacts credential keys and token-shaped values across streaming, success, error, and expanded views (#3072).
 
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
 - Windows managed-session resume no longer reports `durability_failed` when Bun rejects `fsync` on the read-only descriptor used to revalidate an existing canonical binding; Windows now uses an owner-writable descriptor for that durability fence while retaining no-follow and pre/post identity/content checks.
