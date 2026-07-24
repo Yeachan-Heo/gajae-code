@@ -1,8 +1,13 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added the Anthropic **Claude Opus 5** (`anthropic/claude-opus-5`) bundled catalog entry: 1M-token context window, 128k max output, text + image input, adaptive thinking through `max`, and $5 / $25 per MTok with $0.50 cache reads and $6.25 5-minute cache writes. Catalog-only — the Anthropic provider default (`claude-sonnet-5`) and every built-in model profile are unchanged.
+
 ### Fixed
 
+- Fixed adaptive thinking being billed but never displayed whenever an Anthropic model id did not have the exact `claude-opus-<major>-<minor>` shape. `supportsAdaptiveThinkingDisplay` was a per-provider regex duplicated in the Anthropic Messages and Bedrock Converse transports, and it is now one shared predicate in `model-thinking.ts` that parses the Anthropic model version, the same authority `hasOpus47ApiRestrictions` already uses. Three id classes change behavior (same failure class as #2791): dateless ids (`claude-opus-5`, including region-prefixed Bedrock forms) and gateway dot-form ids (`claude-opus-4.7` / `claude-opus-4.8` / `-fast` on `github-copilot`, `vercel-ai-gateway`, `zenmux`) now send `display: "summarized"` instead of inheriting Anthropic's `omitted` default and no longer attach the redundant `interleaved-thinking-2025-05-14` beta; date-suffixed Opus 4.0 ids (`claude-opus-4-20250514` and its Bedrock variants) are no longer misread as version 4.20250514, so these budget-thinking models regain the interleaved-thinking beta they need. Opus 4.6, every Sonnet/Haiku, `-latest` aliases, and non-Anthropic ids are unaffected.
 - Credential selection and aggregate usage callers now stop awaiting immediately when their own signal aborts without cancelling shared usage fetches, and ranking deadlines no longer re-await the same stalled usage request during credential resolution.
 - Kimi Code now allows one continuous 300-second first-event wait before aborting, while preserving explicit caller and environment timeout overrides and the existing inter-event idle timeout.
 

@@ -5,10 +5,12 @@ import {
 	clampThinkingLevelForModel,
 	Effort,
 	enrichModelThinking,
+	hasOpus47ApiRestrictions,
 	linkOpenAIPromotionTargets,
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
+	supportsAdaptiveThinkingDisplay,
 } from "@gajae-code/ai/model-thinking";
 import type { Api, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
 
@@ -183,6 +185,64 @@ describe("model thinking metadata", () => {
 		expect(fableBedrock.thinking?.maxLevel).toBe(Effort.High);
 		expect(mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.High)).toBe("high");
 		expect(() => mapEffortToAnthropicAdaptiveEffort(fableBedrock, Effort.XHigh)).toThrow(/not supported/);
+	});
+
+	it("classifies dateless Opus 5 ids as adaptive thinking with xhigh + max support", () => {
+		const opus5 = createModel({
+			id: "claude-opus-5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+		});
+		const opus5Bedrock = createModel({
+			id: "us.anthropic.claude-opus-5",
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
+		});
+
+		expect(opus5.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.Max,
+		});
+		expect(mapEffortToAnthropicAdaptiveEffort(opus5, Effort.XHigh)).toBe("xhigh");
+		expect(mapEffortToAnthropicAdaptiveEffort(opus5, Effort.Max)).toBe("max");
+
+		// Bedrock Converse lacks the Messages-only xhigh preset (same split as Opus 4.7+).
+		expect(opus5Bedrock.thinking?.mode).toBe("anthropic-adaptive");
+		expect(opus5Bedrock.thinking?.maxLevel).toBe(Effort.Max);
+		expect(() => mapEffortToAnthropicAdaptiveEffort(opus5Bedrock, Effort.XHigh)).toThrow(/not supported/);
+		expect(mapEffortToAnthropicAdaptiveEffort(opus5Bedrock, Effort.Max)).toBe("max");
+	});
+
+	it("reports Opus 4.7+ restrictions and adaptive display for single-segment Opus versions", () => {
+		// Both Anthropic transports gate `display: "summarized"` on this predicate.
+		// A regex expecting `claude-opus-<major>-<minor>` never matched the dateless
+		// `claude-opus-5` id, so Opus 5 thinking was billed and never displayed.
+		expect(hasOpus47ApiRestrictions("claude-opus-5")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-5")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("us.anthropic.claude-opus-5")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-7")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("claude-fable-5")).toBe(true);
+		// Opus 4.6 and every Sonnet reject the field.
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-6")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("claude-sonnet-5")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("gpt-5.6-sol")).toBe(false);
+	});
+
+	it("resolves adaptive display for dot-form ids and rejects date-suffixed Opus 4", () => {
+		// Gateways publish dot-form ids (`claude-opus-4.8`), which the dash-only
+		// regex never matched: Copilot / Vercel AI Gateway / ZenMux Opus 4.7+ were
+		// billed for adaptive thinking that streamed no content.
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4.8")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("anthropic/claude-opus-4.7-fast")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4.6")).toBe(false);
+		// `claude-opus-4-20250514` is dated Opus 4.0, not version 4.20250514. The
+		// dash-only regex read the date as the minor version and misclassified it
+		// as Opus 4.7+, which also suppressed the interleaved-thinking beta these
+		// budget-thinking models need.
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-20250514")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("us.anthropic.claude-opus-4-20250514-v1:0")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-1-20250805")).toBe(false);
 	});
 });
 
