@@ -61,6 +61,18 @@ function transcript(id: string, cwd: string, detail = ""): string {
 	return `${JSON.stringify({ type: "session", id, timestamp: "2026-01-01T00:00:00.000Z", cwd })}\n${JSON.stringify({ type: "message", detail })}\n`;
 }
 
+function strictTranscript(id: string, cwd: string): string {
+	const header = { type: "session", id, timestamp: new Date(0).toISOString(), cwd, version: 3 };
+	const message = {
+		type: "message",
+		id: "message",
+		parentId: null,
+		timestamp: new Date(0).toISOString(),
+		message: { role: "user", content: "resume", timestamp: 0 },
+	};
+	return `${JSON.stringify(header)}\n${JSON.stringify(message)}\n`;
+}
+
 async function fixture() {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-write-"));
 	temporaryDirectories.push(root);
@@ -336,6 +348,33 @@ describe("managed session write protocol", () => {
 			expect(receipt.artifactManifest).toHaveLength(count + 1);
 		}
 	}, 120_000);
+	it("returns a typed strict-open capacity failure and clamps injected artifact limits", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "strict-artifact-capacity.jsonl");
+		const artifacts = source.slice(0, -6);
+		await fs.mkdir(artifacts, { recursive: true });
+		await fs.writeFile(source, strictTranscript("strict-artifact-capacity", cwd));
+		for (let index = 0; index <= MANAGED_ARTIFACT_MAX_FILES; index++) {
+			syncFs.writeFileSync(path.join(artifacts, `${index}.bin`), "");
+		}
+
+		expect(() => validateManagedArtifactTree(artifacts, { maxFiles: MANAGED_ARTIFACT_MAX_FILES + 1 })).toThrow(
+			"artifact_capacity_exceeded",
+		);
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const inspection = await SessionManager.inspectSessionTailReadOnly(source);
+		if (inspection.kind === "error") throw new Error(`Expected resumable source session, got ${inspection.reason}`);
+		const opened = await SessionManager.openExistingStrict(
+			inspection.identity,
+			SessionManager.managedDestination(cwd, path.dirname(sessionsRoot)),
+		);
+		expect(opened).toMatchObject({
+			kind: "error",
+			reason: "artifact_capacity_exceeded",
+			message: `Legacy session artifacts exceed the migration capacity (${MANAGED_ARTIFACT_MAX_FILES.toLocaleString()} files or 512 MiB).`,
+		});
+	}, 120_000);
 
 	it("distinguishes artifact capacity from unsafe topology violations", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-artifact-validation-"));
@@ -343,8 +382,13 @@ describe("managed session write protocol", () => {
 		syncFs.writeFileSync(path.join(root, "first"), "");
 		syncFs.writeFileSync(path.join(root, "second"), "");
 		expect(() => validateManagedArtifactTree(root, { maxFiles: 1 })).toThrow("artifact_capacity_exceeded");
-		syncFs.writeFileSync(path.join(root, "bytes"), "x");
-		expect(() => validateManagedArtifactTree(root, { maxTotalBytes: 0 })).toThrow("artifact_capacity_exceeded");
+		syncFs.writeFileSync(path.join(root, "bytes"), "xx");
+		expect(() => validateManagedArtifactTree(root, { maxTotalBytes: 1 })).toThrow("artifact_capacity_exceeded");
+		expect(() => validateManagedArtifactTree(root, { maxFiles: 0 })).toThrow("unsafe_artifacts");
+		expect(() => validateManagedArtifactTree(root, { maxFiles: Number.POSITIVE_INFINITY })).toThrow(
+			"unsafe_artifacts",
+		);
+		expect(() => validateManagedArtifactTree(root, { maxTotalBytes: 1.5 })).toThrow("unsafe_artifacts");
 		await fs.unlink(path.join(root, "bytes"));
 
 		const symlink = path.join(root, "symlink");

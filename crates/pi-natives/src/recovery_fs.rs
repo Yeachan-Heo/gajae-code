@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 const MAX_CONTENT_BYTES: u64 = 1024 * 1024;
 const MAX_MANAGED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANAGED_TREE_DEPTH: usize = 32;
-const MAX_MANAGED_TREE_FILES: u64 = 10_000;
+const MAX_MANAGED_TREE_FILES: u64 = 50_000;
 const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]

@@ -2646,17 +2646,15 @@ async function copyArtifacts(
 	const destinationRoot = destinationTranscript.slice(0, -6);
 	for (let start = 0; start < manifest.length; start += MANAGED_ARTIFACT_COPY_BATCH_SIZE) {
 		const batch = manifest.slice(start, start + MANAGED_ARTIFACT_COPY_BATCH_SIZE);
+		revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
+		lock.assertOwned();
 		for (const entry of batch) {
-			revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
-			lock.assertOwned();
 			const source = path.join(sourceRoot, entry.path);
 			const destination = path.join(destinationRoot, entry.path);
 			if (entry.kind === "directory") {
 				if (entry.path === "") {
-					revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
 					ensureManagedDirectory(destinationRoot, root);
 				} else {
-					revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
 					ensureManagedDirectory(destination, root);
 				}
 				continue;
@@ -2668,7 +2666,6 @@ async function copyArtifacts(
 			)
 				throw new Error("source_changed");
 			try {
-				revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
 				await copyManagedFileNoReplace(source, destination, snapshot, root);
 			} catch (error) {
 				if ((error as Error).message !== "destination_conflict") throw error;
@@ -2681,6 +2678,7 @@ async function copyArtifacts(
 			)
 				throw new Error("durability_failed");
 		}
+		if (start + batch.length < manifest.length) await new Promise<void>(resolve => setTimeout(resolve, 0));
 	}
 	if (!manifestMatches(sourceTranscript, manifest, sourceRoot) || !manifestMatches(destinationTranscript, manifest))
 		throw new Error("durability_failed");
