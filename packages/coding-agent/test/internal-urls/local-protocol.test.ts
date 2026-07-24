@@ -395,6 +395,28 @@ describe("LocalProtocolHandler", () => {
 		});
 	});
 
+	it("resolves local:// paths synchronously when the marker is left in cleanup_pending from a prior process", async () => {
+		// A migration that lands its data but fails to retire the old legacy
+		// source (see "migrates verified legacy artifacts/local content into
+		// external scratch exactly once", above) persists the marker as
+		// "cleanup_pending\n" — a state the async reader already treats as a
+		// completed migration. If a *new* process later resolves a local://
+		// URL for the same session before ever awaiting the async gate, it
+		// hits the sync fast path (initializeLocalRootSyncWhenLegacyAbsent)
+		// directly against that on-disk marker, with no in-memory cache entry
+		// to short-circuit the read. That path must agree with the async
+		// reader instead of failing closed with "Unsafe local:// migration
+		// marker" on a state that is, in fact, safe.
+		const sessionId = `cleanup-pending-sync-${crypto.randomUUID()}`;
+		await withLocalRoot(sessionId, async root => {
+			await fs.writeFile(path.join(root, ".gjc-local-legacy-migrated-v1"), "cleanup_pending\n", {
+				mode: 0o600,
+			});
+			const options = { getSessionId: () => sessionId, getArtifactsDir: () => null };
+			expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
+		});
+	});
+
 	it("resolves a stable external path before initialization", async () => {
 		const options = {
 			getSessionId: () => "session/fallback",

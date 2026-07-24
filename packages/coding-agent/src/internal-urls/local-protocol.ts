@@ -541,7 +541,15 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 	const marker = path.join(localRoot, LEGACY_MIGRATION_MARKER);
 	try {
 		const value = fsSync.readFileSync(marker, "utf8");
-		if (value !== "verified\n" && value !== "absent\n") throw new Error("Unsafe local:// migration marker");
+		// "cleanup_pending" means the migrated data already landed in localRoot and is
+		// safe to resolve paths against; only retiring the old legacy source directory
+		// (a separate, non-blocking step retried elsewhere) is still outstanding. The
+		// async reader (readMigrationMarker, above) already treats it as a completed
+		// migration for this same reason — this sync gate must agree, or a legacy
+		// migration that reached this exact, safe state on a prior run permanently
+		// fails path resolution on every later run.
+		if (value !== "verified\n" && value !== "absent\n" && value !== "cleanup_pending\n")
+			throw new Error("Unsafe local:// migration marker");
 		initializedLocalRoots.add(localRoot);
 		return;
 	} catch (error) {
