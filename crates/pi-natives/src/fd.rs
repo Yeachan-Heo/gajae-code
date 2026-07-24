@@ -14,39 +14,39 @@ use crate::{fs_cache, task};
 #[napi(object)]
 pub struct FuzzyFindOptions<'env> {
 	/// Fuzzy query to match against file paths (case-insensitive).
-	pub query:       String,
+	pub query: String,
 	/// Directory to search.
-	pub path:        String,
+	pub path: String,
 	/// Include hidden files (default: false).
-	pub hidden:      Option<bool>,
+	pub hidden: Option<bool>,
 	/// Respect .gitignore (default: true).
-	pub gitignore:   Option<bool>,
+	pub gitignore: Option<bool>,
 	/// Enable shared filesystem scan cache (default: false).
-	pub cache:       Option<bool>,
+	pub cache: Option<bool>,
 	/// Maximum number of matches to return (default: 100).
 	pub max_results: Option<u32>,
 	/// Abort signal for cancelling the operation.
-	pub signal:      Option<Unknown<'env>>,
+	pub signal: Option<Unknown<'env>>,
 	/// Timeout in milliseconds for the operation.
-	pub timeout_ms:  Option<u32>,
+	pub timeout_ms: Option<u32>,
 }
 
 /// A single match in fuzzy find results.
 #[napi(object)]
 pub struct FuzzyFindMatch {
 	/// Relative path from the search root (uses `/` separators).
-	pub path:         String,
+	pub path: String,
 	/// Whether this entry is a directory.
 	pub is_directory: bool,
 	/// Match quality score (higher is better).
-	pub score:        u32,
+	pub score: u32,
 }
 
 /// Result of fuzzy file path search.
 #[napi(object)]
 pub struct FuzzyFindResult {
 	/// Matched entries (up to `maxResults`).
-	pub matches:       Vec<FuzzyFindMatch>,
+	pub matches: Vec<FuzzyFindMatch>,
 	/// Total number of matches found (may exceed `matches.len()`).
 	pub total_matches: u32,
 }
@@ -152,12 +152,12 @@ fn score_fuzzy_path(
 }
 
 struct FuzzyFindConfig {
-	query:       String,
-	path:        String,
-	hidden:      Option<bool>,
-	gitignore:   Option<bool>,
+	query: String,
+	path: String,
+	hidden: Option<bool>,
+	gitignore: Option<bool>,
 	max_results: Option<u32>,
-	cache:       Option<bool>,
+	cache: Option<bool>,
 }
 
 fn score_entries(

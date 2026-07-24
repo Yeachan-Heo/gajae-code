@@ -45,11 +45,11 @@ pub enum CoordError {
 	/// finite number. Side-effecting actions must reject rather than clamp.
 	OutOfBounds {
 		/// Offending X pixel.
-		x:         f64,
+		x: f64,
 		/// Offending Y pixel.
-		y:         f64,
+		y: f64,
 		/// Normalized display width in pixels.
-		width_px:  u32,
+		width_px: u32,
 		/// Normalized display height in pixels.
 		height_px: u32,
 	},
@@ -89,17 +89,17 @@ impl std::error::Error for CoordError {}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NormalizedDisplay {
 	/// Screenshot width in physical pixels.
-	pub width_px:  u32,
+	pub width_px: u32,
 	/// Screenshot height in physical pixels.
 	pub height_px: u32,
 	/// Physical-pixels-per-logical-point along X.
-	pub scale_x:   f64,
+	pub scale_x: f64,
 	/// Physical-pixels-per-logical-point along Y.
-	pub scale_y:   f64,
+	pub scale_y: f64,
 	/// Logical origin X of the display (points).
-	pub origin_x:  f64,
+	pub origin_x: f64,
 	/// Logical origin Y of the display (points).
-	pub origin_y:  f64,
+	pub origin_y: f64,
 }
 
 impl NormalizedDisplay {

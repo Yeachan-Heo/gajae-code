@@ -412,13 +412,8 @@ mod tests {
 		let sup = live_supervisor();
 		// drag to out-of-bounds: press happens then error -> release_all leaves nothing
 		// held.
-		let action = InputAction::Drag {
-			x:      0.0,
-			y:      0.0,
-			to_x:   999.0,
-			to_y:   0.0,
-			button: MouseButton::Left,
-		};
+		let action =
+			InputAction::Drag { x: 0.0, y: 0.0, to_x: 999.0, to_y: 0.0, button: MouseButton::Left };
 		let (res, ops) = run(&action, &sup, true, None, 0);
 		assert!(matches!(res, Err(ExecError::Coord(_))));
 		let downs = ops

@@ -31,15 +31,15 @@ impl ComputerController {
 		let frame =
 			capture_primary_display().map_err(|err| napi::Error::from_reason(format!("{err}")))?;
 		Ok(ComputerScreenshot {
-			png:           Uint8Array::from(frame.png),
-			width_px:      frame.display.width_px,
-			height_px:     frame.display.height_px,
-			scale_x:       frame.display.scale_x,
-			scale_y:       frame.display.scale_y,
-			origin_x:      frame.display.origin_x,
-			origin_y:      frame.display.origin_y,
+			png: Uint8Array::from(frame.png),
+			width_px: frame.display.width_px,
+			height_px: frame.display.height_px,
+			scale_x: frame.display.scale_x,
+			scale_y: frame.display.scale_y,
+			origin_x: frame.display.origin_x,
+			origin_y: frame.display.origin_y,
 			display_epoch: frame.display_epoch as f64,
-			capture_id:    frame.capture_id,
+			capture_id: frame.capture_id,
 		})
 	}
 
@@ -62,11 +62,10 @@ impl ComputerController {
 		y: f64,
 		button: Option<String>,
 	) -> napi::Result<()> {
-		Self::execute(expected_epoch, InputAction::DoubleClick {
-			x,
-			y,
-			button: parse_button(button)?,
-		})
+		Self::execute(
+			expected_epoch,
+			InputAction::DoubleClick { x, y, button: parse_button(button)? },
+		)
 	}
 
 	#[napi]
@@ -84,13 +83,10 @@ impl ComputerController {
 		to_y: f64,
 		button: Option<String>,
 	) -> napi::Result<()> {
-		Self::execute(expected_epoch, InputAction::Drag {
-			x,
-			y,
-			to_x,
-			to_y,
-			button: parse_button(button)?,
-		})
+		Self::execute(
+			expected_epoch,
+			InputAction::Drag { x, y, to_x, to_y, button: parse_button(button)? },
+		)
 	}
 
 	#[napi]

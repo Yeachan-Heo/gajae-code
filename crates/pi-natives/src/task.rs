@@ -169,9 +169,9 @@ pub struct Blocking<T>
 where
 	T: Send + 'static,
 {
-	tag:          &'static str,
+	tag: &'static str,
 	cancel_token: CancelToken,
-	work:         Option<Box<dyn FnOnce(CancelToken) -> Result<T> + Send>>,
+	work: Option<Box<dyn FnOnce(CancelToken) -> Result<T> + Send>>,
 }
 
 impl<T> Task for Blocking<T>
@@ -303,9 +303,9 @@ mod tests {
 	#[test]
 	fn blocking_compute_catches_non_string_panic_as_error() {
 		let mut task = Blocking {
-			tag:          "test_non_string_panic",
+			tag: "test_non_string_panic",
 			cancel_token: CancelToken::default(),
-			work:         Some(Box::new(|_| -> Result<String> { std::panic::panic_any(42) })),
+			work: Some(Box::new(|_| -> Result<String> { std::panic::panic_any(42) })),
 		};
 
 		let result = task.compute();
@@ -326,9 +326,9 @@ mod tests {
 	#[test]
 	fn blocking_compute_catches_panic_as_error() {
 		let mut task = Blocking {
-			tag:          "test_panic",
+			tag: "test_panic",
 			cancel_token: CancelToken::default(),
-			work:         Some(Box::new(|_| -> Result<String> { panic!("native boom") })),
+			work: Some(Box::new(|_| -> Result<String> { panic!("native boom") })),
 		};
 
 		let result = task.compute();
@@ -344,9 +344,9 @@ mod tests {
 	#[test]
 	fn blocking_compute_catches_string_panic_payload_as_error() {
 		let mut task = Blocking {
-			tag:          "test_string_panic",
+			tag: "test_string_panic",
 			cancel_token: CancelToken::default(),
-			work:         Some(Box::new(|_| -> Result<String> {
+			work: Some(Box::new(|_| -> Result<String> {
 				std::panic::panic_any(String::from("owned native boom"))
 			})),
 		};

@@ -37,90 +37,90 @@ struct ScopeMatchers {
 	comment: Scope,
 
 	// String (index 4)
-	string:             Scope,
+	string: Scope,
 	constant_character: Scope,
-	meta_string:        Scope,
+	meta_string: Scope,
 
 	// Number (index 5)
 	constant_numeric: Scope,
 	constant_integer: Scope,
-	constant:         Scope,
+	constant: Scope,
 
 	// Keyword (index 1)
-	keyword:          Scope,
-	storage_type:     Scope,
+	keyword: Scope,
+	storage_type: Scope,
 	storage_modifier: Scope,
 
 	// Function (index 2)
 	entity_name_function: Scope,
-	support_function:     Scope,
-	meta_function_call:   Scope,
-	variable_function:    Scope,
+	support_function: Scope,
+	meta_function_call: Scope,
+	variable_function: Scope,
 
 	// Type (index 6)
-	entity_name_type:      Scope,
-	support_type:          Scope,
-	support_class:         Scope,
-	entity_name_class:     Scope,
-	entity_name_struct:    Scope,
-	entity_name_enum:      Scope,
+	entity_name_type: Scope,
+	support_type: Scope,
+	support_class: Scope,
+	entity_name_class: Scope,
+	entity_name_struct: Scope,
+	entity_name_enum: Scope,
 	entity_name_interface: Scope,
-	entity_name_trait:     Scope,
+	entity_name_trait: Scope,
 
 	// Operator (index 7)
-	keyword_operator:     Scope,
+	keyword_operator: Scope,
 	punctuation_accessor: Scope,
 
 	// Punctuation (index 8)
 	punctuation: Scope,
 
 	// Variable (index 3)
-	variable:    Scope,
+	variable: Scope,
 	entity_name: Scope,
-	meta_path:   Scope,
+	meta_path: Scope,
 
 	// Diff (indices 9, 10)
-	markup_inserted:  Scope,
-	markup_deleted:   Scope,
+	markup_inserted: Scope,
+	markup_deleted: Scope,
 	meta_diff_header: Scope,
-	meta_diff_range:  Scope,
+	meta_diff_range: Scope,
 }
 
 impl ScopeMatchers {
 	fn new() -> Self {
 		Self {
-			comment:               Scope::new("comment").unwrap(),
-			string:                Scope::new("string").unwrap(),
-			constant_character:    Scope::new("constant.character").unwrap(),
-			meta_string:           Scope::new("meta.string").unwrap(),
-			constant_numeric:      Scope::new("constant.numeric").unwrap(),
-			constant_integer:      Scope::new("constant.integer").unwrap(),
-			constant:              Scope::new("constant").unwrap(),
-			keyword:               Scope::new("keyword").unwrap(),
-			storage_type:          Scope::new("storage.type").unwrap(),
-			storage_modifier:      Scope::new("storage.modifier").unwrap(),
-			entity_name_function:  Scope::new("entity.name.function").unwrap(),
-			support_function:      Scope::new("support.function").unwrap(),
-			meta_function_call:    Scope::new("meta.function-call").unwrap(),
-			variable_function:     Scope::new("variable.function").unwrap(),
-			entity_name_type:      Scope::new("entity.name.type").unwrap(),
-			support_type:          Scope::new("support.type").unwrap(),
-			support_class:         Scope::new("support.class").unwrap(),
-			entity_name_class:     Scope::new("entity.name.class").unwrap(),
-			entity_name_struct:    Scope::new("entity.name.struct").unwrap(),
-			entity_name_enum:      Scope::new("entity.name.enum").unwrap(),
+			comment: Scope::new("comment").unwrap(),
+			string: Scope::new("string").unwrap(),
+			constant_character: Scope::new("constant.character").unwrap(),
+			meta_string: Scope::new("meta.string").unwrap(),
+			constant_numeric: Scope::new("constant.numeric").unwrap(),
+			constant_integer: Scope::new("constant.integer").unwrap(),
+			constant: Scope::new("constant").unwrap(),
+			keyword: Scope::new("keyword").unwrap(),
+			storage_type: Scope::new("storage.type").unwrap(),
+			storage_modifier: Scope::new("storage.modifier").unwrap(),
+			entity_name_function: Scope::new("entity.name.function").unwrap(),
+			support_function: Scope::new("support.function").unwrap(),
+			meta_function_call: Scope::new("meta.function-call").unwrap(),
+			variable_function: Scope::new("variable.function").unwrap(),
+			entity_name_type: Scope::new("entity.name.type").unwrap(),
+			support_type: Scope::new("support.type").unwrap(),
+			support_class: Scope::new("support.class").unwrap(),
+			entity_name_class: Scope::new("entity.name.class").unwrap(),
+			entity_name_struct: Scope::new("entity.name.struct").unwrap(),
+			entity_name_enum: Scope::new("entity.name.enum").unwrap(),
 			entity_name_interface: Scope::new("entity.name.interface").unwrap(),
-			entity_name_trait:     Scope::new("entity.name.trait").unwrap(),
-			keyword_operator:      Scope::new("keyword.operator").unwrap(),
-			punctuation_accessor:  Scope::new("punctuation.accessor").unwrap(),
-			punctuation:           Scope::new("punctuation").unwrap(),
-			variable:              Scope::new("variable").unwrap(),
-			entity_name:           Scope::new("entity.name").unwrap(),
-			meta_path:             Scope::new("meta.path").unwrap(),
-			markup_inserted:       Scope::new("markup.inserted").unwrap(),
-			markup_deleted:        Scope::new("markup.deleted").unwrap(),
-			meta_diff_header:      Scope::new("meta.diff.header").unwrap(),
-			meta_diff_range:       Scope::new("meta.diff.range").unwrap(),
+			entity_name_trait: Scope::new("entity.name.trait").unwrap(),
+			keyword_operator: Scope::new("keyword.operator").unwrap(),
+			punctuation_accessor: Scope::new("punctuation.accessor").unwrap(),
+			punctuation: Scope::new("punctuation").unwrap(),
+			variable: Scope::new("variable").unwrap(),
+			entity_name: Scope::new("entity.name").unwrap(),
+			meta_path: Scope::new("meta.path").unwrap(),
+			markup_inserted: Scope::new("markup.inserted").unwrap(),
+			markup_deleted: Scope::new("markup.deleted").unwrap(),
+			meta_diff_header: Scope::new("meta.diff.header").unwrap(),
+			meta_diff_range: Scope::new("meta.diff.range").unwrap(),
 		}
 	}
 }
@@ -135,27 +135,27 @@ fn get_scope_matchers() -> &'static ScopeMatchers {
 #[napi(object)]
 pub struct HighlightColors {
 	/// ANSI color for comments.
-	pub comment:     String,
+	pub comment: String,
 	/// ANSI color for keywords.
-	pub keyword:     String,
+	pub keyword: String,
 	/// ANSI color for function names.
-	pub function:    String,
+	pub function: String,
 	/// ANSI color for variables and identifiers.
-	pub variable:    String,
+	pub variable: String,
 	/// ANSI color for string literals.
-	pub string:      String,
+	pub string: String,
 	/// ANSI color for numeric literals.
-	pub number:      String,
+	pub number: String,
 	/// ANSI color for type identifiers.
-	pub r#type:      String,
+	pub r#type: String,
 	/// ANSI color for operators.
-	pub operator:    String,
+	pub operator: String,
 	/// ANSI color for punctuation tokens.
 	pub punctuation: String,
 	/// ANSI color for diff inserted lines.
-	pub inserted:    Option<String>,
+	pub inserted: Option<String>,
 	/// ANSI color for diff deleted lines.
-	pub deleted:     Option<String>,
+	pub deleted: Option<String>,
 }
 
 /// Language alias mappings: (aliases, target syntax name).

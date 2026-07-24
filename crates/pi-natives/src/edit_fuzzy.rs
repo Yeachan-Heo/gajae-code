@@ -20,23 +20,23 @@ env_uint! {
 pub struct H01BestFuzzyMatch {
 	pub actual_text: String,
 	pub start_index: u32,
-	pub start_line:  u32,
-	pub confidence:  f64,
+	pub start_line: u32,
+	pub confidence: f64,
 }
 
 #[napi(object)]
 pub struct H01BestFuzzyMatchResult {
-	pub best:                  Option<H01BestFuzzyMatch>,
+	pub best: Option<H01BestFuzzyMatch>,
 	pub above_threshold_count: u32,
-	pub second_best_score:     f64,
+	pub second_best_score: f64,
 }
 
 #[napi(object)]
 pub struct H02SequenceFuzzyResult {
-	pub index:             Option<u32>,
-	pub confidence:        f64,
-	pub match_count:       u32,
-	pub match_indices:     Vec<u32>,
+	pub index: Option<u32>,
+	pub confidence: f64,
+	pub match_count: u32,
+	pub match_indices: Vec<u32>,
 	pub second_best_score: f64,
 }
 
@@ -251,9 +251,9 @@ fn levenshtein_dp(a: &[u16], b: &[u16]) -> usize {
 }
 
 struct MyersPattern {
-	units:       Vec<u16>,
-	masks:       HashMap<u16, u128>,
-	high_bit:    u128,
+	units: Vec<u16>,
+	masks: HashMap<u16, u128>,
+	high_bit: u128,
 	active_bits: u128,
 }
 
@@ -398,8 +398,8 @@ fn best_core_one_line(
 			best = Some(H01BestFuzzyMatch {
 				actual_text: String::from_utf16_lossy(line.units),
 				start_index: offsets[start] as u32,
-				start_line:  (start + 1) as u32,
-				confidence:  score,
+				start_line: (start + 1) as u32,
+				confidence: score,
 			});
 		} else if score > second_best_score {
 			second_best_score = score;
@@ -442,8 +442,8 @@ fn best_core(
 			best = Some(H01BestFuzzyMatch {
 				actual_text: String::from_utf16_lossy(&actual_units),
 				start_index: offsets[start] as u32,
-				start_line:  (start + 1) as u32,
-				confidence:  score,
+				start_line: (start + 1) as u32,
+				confidence: score,
 			});
 		} else if score > second_best_score {
 			second_best_score = score;
@@ -484,9 +484,9 @@ pub fn h01_find_best_fuzzy_match(
 	// cannot block a native thread.
 	if content_units.len() > *MAX_FUZZY_UNITS || target_units.len() > *MAX_FUZZY_UNITS {
 		return Ok(H01BestFuzzyMatchResult {
-			best:                  None,
+			best: None,
 			above_threshold_count: 0,
-			second_best_score:     0.0,
+			second_best_score: 0.0,
 		});
 	}
 	let content_units = content_units.to_vec();
@@ -496,9 +496,9 @@ pub fn h01_find_best_fuzzy_match(
 	if target_lines.is_empty() || target_units.is_empty() || target_lines.len() > content_lines.len()
 	{
 		return Ok(H01BestFuzzyMatchResult {
-			best:                  None,
+			best: None,
 			above_threshold_count: 0,
-			second_best_score:     0.0,
+			second_best_score: 0.0,
 		});
 	}
 	let offsets = line_offsets(&content_lines);
@@ -543,10 +543,10 @@ pub fn h02_score_sequence_fuzzy(
 	let pattern_units: Vec<Vec<u16>> = pattern.iter().map(|s| s.encode_utf16().collect()).collect();
 	if pattern_units.is_empty() || pattern_units.len() > line_units.len() {
 		return H02SequenceFuzzyResult {
-			index:             None,
-			confidence:        0.0,
-			match_count:       0,
-			match_indices:     Vec::new(),
+			index: None,
+			confidence: 0.0,
+			match_count: 0,
+			match_indices: Vec::new(),
 			second_best_score: 0.0,
 		};
 	}

@@ -29,23 +29,23 @@ const ISO_UNAVAILABLE_PREFIX: &str = "ISO_UNAVAILABLE:";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[napi]
 pub enum IsoBackendKind {
-	Apfs              = 0,
-	Btrfs             = 1,
-	Zfs               = 2,
-	LinuxReflink      = 3,
-	Overlayfs         = 4,
+	Apfs = 0,
+	Btrfs = 1,
+	Zfs = 2,
+	LinuxReflink = 3,
+	Overlayfs = 4,
 	WindowsBlockClone = 5,
-	Projfs            = 6,
-	Rcopy             = 7,
+	Projfs = 6,
+	Rcopy = 7,
 }
 
 /// How a single file changed between `lower` and `merged`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[napi]
 pub enum IsoChangeKind {
-	Added    = 0,
+	Added = 0,
 	Modified = 1,
-	Removed  = 2,
+	Removed = 2,
 }
 
 /// Probe result for a specific isolation backend.
@@ -54,23 +54,23 @@ pub struct IsoProbeResult {
 	/// True when the backend's prerequisites are satisfied.
 	pub available: bool,
 	/// Human-readable explanation when `available` is false.
-	pub reason:    Option<String>,
+	pub reason: Option<String>,
 	/// Resolved backend kind.
-	pub kind:      IsoBackendKind,
+	pub kind: IsoBackendKind,
 }
 
 /// Outcome of [`iso_resolve`].
 #[napi(object)]
 pub struct IsoResolveResult {
 	/// Backend that will actually be tried first.
-	pub kind:       IsoBackendKind,
+	pub kind: IsoBackendKind,
 	/// Host-available backends in retry order, starting with `kind`.
 	pub candidates: Vec<IsoBackendKind>,
 	/// True when the resolver fell back from `preferred` (or from the
 	/// first automatic candidate) to a different backend.
-	pub fell_back:  bool,
+	pub fell_back: bool,
 	/// Human-readable reason for the fallback, if any.
-	pub reason:     Option<String>,
+	pub reason: Option<String>,
 }
 
 /// One entry in an [`IsoDiff`].
@@ -78,7 +78,7 @@ pub struct IsoResolveResult {
 pub struct IsoFileChange {
 	/// Path relative to `merged`.
 	pub path: String,
-	pub op:   IsoChangeKind,
+	pub op: IsoChangeKind,
 	/// Unified-diff text. `None` (`null` in JS) means the file is binary;
 	/// read it directly from `merged` if you need the bytes.
 	pub diff: Option<String>,
@@ -102,11 +102,7 @@ pub fn iso_probe(kind: Option<IsoBackendKind>) -> IsoProbeResult {
 	let resolved = kind.map_or_else(BackendKind::native, from_napi_kind);
 	let backend = pi_iso::backend(resolved);
 	let probe = backend.probe();
-	IsoProbeResult {
-		available: probe.available,
-		reason:    probe.reason,
-		kind:      to_napi_kind(resolved),
-	}
+	IsoProbeResult { available: probe.available, reason: probe.reason, kind: to_napi_kind(resolved) }
 }
 
 /// Pick the best backend available right now. `preferred` is treated as
@@ -115,14 +111,14 @@ pub fn iso_probe(kind: Option<IsoBackendKind>) -> IsoProbeResult {
 pub fn iso_resolve(preferred: Option<IsoBackendKind>) -> IsoResolveResult {
 	let resolution = pi_iso::resolve(preferred.map(from_napi_kind));
 	IsoResolveResult {
-		kind:       to_napi_kind(resolution.kind),
+		kind: to_napi_kind(resolution.kind),
 		candidates: resolution
 			.candidates
 			.into_iter()
 			.map(to_napi_kind)
 			.collect(),
-		fell_back:  resolution.fell_back,
-		reason:     resolution.reason,
+		fell_back: resolution.fell_back,
+		reason: resolution.reason,
 	}
 }
 
@@ -227,7 +223,7 @@ fn into_iso_diff(diff: Diff) -> IsoDiff {
 			.into_iter()
 			.map(|f| IsoFileChange {
 				path: f.path.to_string_lossy().into_owned(),
-				op:   to_napi_change_kind(f.op),
+				op: to_napi_change_kind(f.op),
 				diff: f.diff,
 			})
 			.collect(),

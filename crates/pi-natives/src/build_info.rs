@@ -2,7 +2,7 @@ use napi_derive::napi;
 
 #[napi(object)]
 pub struct BuildInfo {
-	pub version:      String,
+	pub version: String,
 	#[napi(js_name = "languageSet")]
 	pub language_set: String,
 }
@@ -10,7 +10,7 @@ pub struct BuildInfo {
 #[napi]
 pub fn native_build_info() -> BuildInfo {
 	BuildInfo {
-		version:      env!("CARGO_PKG_VERSION").to_string(),
+		version: env!("CARGO_PKG_VERSION").to_string(),
 		language_set: if cfg!(feature = "full-langs") {
 			"full"
 		} else {

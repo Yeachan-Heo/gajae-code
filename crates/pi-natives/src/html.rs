@@ -13,7 +13,7 @@ pub struct HtmlToMarkdownOptions {
 	/// Remove navigation elements, forms, headers, footers.
 	pub clean_content: Option<bool>,
 	/// Skip images during conversion.
-	pub skip_images:   Option<bool>,
+	pub skip_images: Option<bool>,
 }
 
 /// Convert HTML source to Markdown with optional preprocessing.
@@ -33,10 +33,10 @@ pub fn html_to_markdown(
 		let conversion_opts = ConversionOptions {
 			skip_images,
 			preprocessing: PreprocessingOptions {
-				enabled:           clean_content,
-				preset:            PreprocessingPreset::Aggressive,
+				enabled: clean_content,
+				preset: PreprocessingPreset::Aggressive,
 				remove_navigation: true,
-				remove_forms:      true,
+				remove_forms: true,
 			},
 			..Default::default()
 		};

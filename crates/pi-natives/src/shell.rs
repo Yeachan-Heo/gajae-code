@@ -27,19 +27,19 @@ const SHELL_LOSS_MARKER_PREFIX: &str = "\n[Shell output truncated: ";
 #[derive(Debug, Clone, Default)]
 pub struct MinimizerOptions {
 	/// Master switch. Absent / false = disabled.
-	pub enabled:           Option<bool>,
+	pub enabled: Option<bool>,
 	/// Optional path to a TOML settings file whose values override
 	/// field-level defaults. `~` is expanded.
-	pub settings_path:     Option<String>,
+	pub settings_path: Option<String>,
 	/// Optional xxHash64 digest (hex) of the settings file contents. When
 	/// supplied, the engine refuses to honor a settings file whose hash does
 	/// not match — a lightweight trust gate for agent-controllable paths.
-	pub settings_hash:     Option<String>,
+	pub settings_hash: Option<String>,
 	/// Opt-in allowlist of program names (e.g. `"git"`). When empty or
 	/// absent, all built-in filters are active.
-	pub only:              Option<Vec<String>>,
+	pub only: Option<Vec<String>>,
 	/// Program names explicitly excluded from minimization.
-	pub except:            Option<Vec<String>>,
+	pub except: Option<Vec<String>>,
 	/// Maximum captured bytes per command before the engine falls back to
 	/// the raw, un-minimized output. Default 4 MiB.
 	pub max_capture_bytes: Option<u32>,
@@ -48,11 +48,11 @@ pub struct MinimizerOptions {
 impl From<MinimizerOptions> for minimizer::MinimizerOptions {
 	fn from(value: MinimizerOptions) -> Self {
 		Self {
-			enabled:           value.enabled,
-			settings_path:     value.settings_path,
-			settings_hash:     value.settings_hash,
-			only:              value.only,
-			except:            value.except,
+			enabled: value.enabled,
+			settings_path: value.settings_path,
+			settings_hash: value.settings_hash,
+			only: value.only,
+			except: value.except,
 			max_capture_bytes: value.max_capture_bytes,
 		}
 	}
@@ -62,19 +62,19 @@ impl From<MinimizerOptions> for minimizer::MinimizerOptions {
 #[napi(object)]
 pub struct ShellOptions {
 	/// Environment variables to apply once per session.
-	pub session_env:   Option<HashMap<String, String>>,
+	pub session_env: Option<HashMap<String, String>>,
 	/// Optional snapshot file to source on session creation.
 	pub snapshot_path: Option<String>,
 	/// Optional per-command output minimizer configuration.
-	pub minimizer:     Option<MinimizerOptions>,
+	pub minimizer: Option<MinimizerOptions>,
 }
 
 impl From<ShellOptions> for CoreShellOptions {
 	fn from(value: ShellOptions) -> Self {
 		Self {
-			session_env:   value.session_env,
+			session_env: value.session_env,
 			snapshot_path: value.snapshot_path,
-			minimizer:     value.minimizer.map(Into::into),
+			minimizer: value.minimizer.map(Into::into),
 		}
 	}
 }
@@ -83,36 +83,36 @@ impl From<ShellOptions> for CoreShellOptions {
 #[napi(object)]
 pub struct ShellRunOptions<'env> {
 	/// Command string to execute in the shell.
-	pub command:    String,
+	pub command: String,
 	/// Working directory for the command.
-	pub cwd:        Option<String>,
+	pub cwd: Option<String>,
 	/// Environment variables to apply for this command only.
-	pub env:        Option<HashMap<String, String>>,
+	pub env: Option<HashMap<String, String>>,
 	/// Timeout in milliseconds before cancelling the command.
 	pub timeout_ms: Option<u32>,
 	/// Abort signal for cancelling the operation.
-	pub signal:     Option<Unknown<'env>>,
+	pub signal: Option<Unknown<'env>>,
 }
 
 /// Options for executing a shell command via brush-core.
 #[napi(object)]
 pub struct ShellExecuteOptions<'env> {
 	/// Command string to execute in the shell.
-	pub command:       String,
+	pub command: String,
 	/// Working directory for the command.
-	pub cwd:           Option<String>,
+	pub cwd: Option<String>,
 	/// Environment variables to apply for this command only.
-	pub env:           Option<HashMap<String, String>>,
+	pub env: Option<HashMap<String, String>>,
 	/// Environment variables to apply once per session.
-	pub session_env:   Option<HashMap<String, String>>,
+	pub session_env: Option<HashMap<String, String>>,
 	/// Timeout in milliseconds before cancelling the command.
-	pub timeout_ms:    Option<u32>,
+	pub timeout_ms: Option<u32>,
 	/// Optional snapshot file to source on session creation.
 	pub snapshot_path: Option<String>,
 	/// Optional per-command output minimizer configuration.
-	pub minimizer:     Option<MinimizerOptions>,
+	pub minimizer: Option<MinimizerOptions>,
 	/// Abort signal for cancelling the operation.
-	pub signal:        Option<Unknown<'env>>,
+	pub signal: Option<Unknown<'env>>,
 }
 
 /// Telemetry for a single minimization.
@@ -126,27 +126,27 @@ pub struct ShellExecuteOptions<'env> {
 pub struct MinimizerResult {
 	/// Dispatch label produced by the minimizer (e.g. `"git"`,
 	/// `"pipeline:gradle"`, `"pipeline+builtin"`).
-	pub filter:        String,
+	pub filter: String,
 	/// The minimized replacement text. Callers that streamed raw chunks
 	/// during execution should clear and replace their accumulated output
 	/// with this text.
-	pub text:          String,
+	pub text: String,
 	/// The full original capture, before minimization.
 	pub original_text: String,
 	/// Captured byte length before minimization.
-	pub input_bytes:   u32,
+	pub input_bytes: u32,
 	/// Byte length of the minimized text the consumer received.
-	pub output_bytes:  u32,
+	pub output_bytes: u32,
 }
 
 impl From<CoreMinimizerResult> for MinimizerResult {
 	fn from(value: CoreMinimizerResult) -> Self {
 		Self {
-			filter:        value.filter,
-			text:          value.text,
+			filter: value.filter,
+			text: value.text,
 			original_text: value.original_text,
-			input_bytes:   value.input_bytes,
-			output_bytes:  value.output_bytes,
+			input_bytes: value.input_bytes,
+			output_bytes: value.output_bytes,
 		}
 	}
 }
@@ -210,9 +210,9 @@ impl Shell {
 		let cancel_token = task::CancelToken::new(options.timeout_ms, options.signal);
 		let inner = Arc::clone(&self.inner);
 		let run_options = CoreShellRunOptions {
-			command:    options.command,
-			cwd:        options.cwd,
-			env:        options.env,
+			command: options.command,
+			cwd: options.cwd,
+			env: options.env,
 			timeout_ms: options.timeout_ms,
 		};
 		task::future(env, "shell.run", async move {
@@ -253,13 +253,13 @@ pub fn execute_shell<'env>(
 ) -> Result<PromiseRaw<'env, ShellRunResult>> {
 	let cancel_token = task::CancelToken::new(options.timeout_ms, options.signal);
 	let exec_options = CoreShellExecuteOptions {
-		command:       options.command,
-		cwd:           options.cwd,
-		env:           options.env,
-		session_env:   options.session_env,
-		timeout_ms:    options.timeout_ms,
+		command: options.command,
+		cwd: options.cwd,
+		env: options.env,
+		session_env: options.session_env,
+		timeout_ms: options.timeout_ms,
 		snapshot_path: options.snapshot_path,
-		minimizer:     options.minimizer.map(Into::into),
+		minimizer: options.minimizer.map(Into::into),
 	};
 	task::future(env, "shell.execute", async move {
 		let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
@@ -336,7 +336,7 @@ fn bridge_chunks(
 #[napi(object)]
 pub struct BashFixupResult {
 	/// Possibly-rewritten command. Equal to the input when no fixup fired.
-	pub command:  String,
+	pub command: String,
 	/// Substrings removed, in source order — suitable for a user-facing notice.
 	pub stripped: Vec<String>,
 }
@@ -416,9 +416,9 @@ mod tests {
 			shell
 				.run(
 					CoreShellRunOptions {
-						command:    "/bin/sh -c 'printf \"%d\\n\" \"$$\"; sleep 0.5'".to_string(),
-						cwd:        None,
-						env:        None,
+						command: "/bin/sh -c 'printf \"%d\\n\" \"$$\"; sleep 0.5'".to_string(),
+						cwd: None,
+						env: None,
 						timeout_ms: None,
 					},
 					Some(tx),
@@ -459,9 +459,9 @@ mod tests {
 			shell
 				.run(
 					CoreShellRunOptions {
-						command:    "sh -c 'sleep 30 & wait'".to_string(),
-						cwd:        None,
-						env:        None,
+						command: "sh -c 'sleep 30 & wait'".to_string(),
+						cwd: None,
+						env: None,
 						timeout_ms: None,
 					},
 					None,

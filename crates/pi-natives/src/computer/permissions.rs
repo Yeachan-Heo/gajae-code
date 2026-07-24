@@ -57,7 +57,7 @@ impl TccPermission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreflightStatus {
 	/// Whether Accessibility (input injection) is granted.
-	pub accessibility:    bool,
+	pub accessibility: bool,
 	/// Whether Screen Recording (capture) is granted.
 	pub screen_recording: bool,
 }
@@ -107,7 +107,7 @@ pub fn screen_recording_granted() -> bool {
 #[must_use]
 pub fn preflight() -> PreflightStatus {
 	PreflightStatus {
-		accessibility:    accessibility_granted(),
+		accessibility: accessibility_granted(),
 		screen_recording: screen_recording_granted(),
 	}
 }

@@ -32,9 +32,9 @@ pub const HEARTBEAT_FRESH_MS: u64 = 2_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupervisorStatus {
 	/// Input is latched off until a user-only reset.
-	pub suspended:       bool,
+	pub suspended: bool,
 	/// The global stop path (hotkey/event-tap) reports itself live.
-	pub hotkey_live:     bool,
+	pub hotkey_live: bool,
 	/// The stop path's heartbeat is within [`HEARTBEAT_FRESH_MS`].
 	pub heartbeat_fresh: bool,
 }
@@ -49,8 +49,8 @@ impl SupervisorStatus {
 
 /// Process-global kill-switch state.
 pub struct Supervisor {
-	suspended:         AtomicBool,
-	hotkey_live:       AtomicBool,
+	suspended: AtomicBool,
+	hotkey_live: AtomicBool,
 	last_heartbeat_ms: AtomicU64,
 }
 
@@ -65,8 +65,8 @@ impl Supervisor {
 	#[must_use]
 	pub const fn new() -> Self {
 		Self {
-			suspended:         AtomicBool::new(false),
-			hotkey_live:       AtomicBool::new(false),
+			suspended: AtomicBool::new(false),
+			hotkey_live: AtomicBool::new(false),
 			last_heartbeat_ms: AtomicU64::new(0),
 		}
 	}
@@ -120,8 +120,8 @@ impl Supervisor {
 	pub fn status_at(&self, now_ms: u64) -> SupervisorStatus {
 		let last = self.last_heartbeat_ms.load(Ordering::SeqCst);
 		SupervisorStatus {
-			suspended:       self.suspended.load(Ordering::SeqCst),
-			hotkey_live:     self.hotkey_live.load(Ordering::SeqCst),
+			suspended: self.suspended.load(Ordering::SeqCst),
+			hotkey_live: self.hotkey_live.load(Ordering::SeqCst),
 			heartbeat_fresh: now_ms.saturating_sub(last) <= HEARTBEAT_FRESH_MS,
 		}
 	}

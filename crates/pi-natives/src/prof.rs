@@ -28,19 +28,19 @@ thread_local! {
 #[derive(Clone)]
 struct ProfileSample {
 	/// Stack of region names (from root to leaf).
-	stack:        SmallVec<[&'static str; 4]>,
+	stack: SmallVec<[&'static str; 4]>,
 	/// Duration in microseconds.
-	duration_us:  u64,
+	duration_us: u64,
 	/// Timestamp (microseconds since process start).
 	timestamp_us: u64,
 }
 
 /// Circular buffer for samples.
 struct CircularBuffer {
-	samples:   Vec<ProfileSample>,
-	capacity:  usize,
+	samples: Vec<ProfileSample>,
+	capacity: usize,
 	write_pos: usize,
-	count:     usize,
+	count: usize,
 }
 
 impl CircularBuffer {
@@ -71,7 +71,7 @@ impl CircularBuffer {
 /// RAII guard that records timing when dropped.
 pub struct ProfileGuard {
 	region: &'static str,
-	start:  Instant,
+	start: Instant,
 }
 
 impl ProfileGuard {
@@ -117,13 +117,13 @@ pub fn profile_region(region: &'static str) -> ProfileGuard {
 #[derive(Clone)]
 pub struct WorkProfile {
 	/// Folded stack format for flamegraph tools.
-	pub folded:       String,
+	pub folded: String,
 	/// Markdown summary of profiling results.
-	pub summary:      String,
+	pub summary: String,
 	/// SVG flamegraph (if generation succeeded).
-	pub svg:          Option<String>,
+	pub svg: Option<String>,
 	/// Total profiled duration in milliseconds.
-	pub total_ms:     f64,
+	pub total_ms: f64,
 	/// Number of samples collected.
 	pub sample_count: u32,
 }

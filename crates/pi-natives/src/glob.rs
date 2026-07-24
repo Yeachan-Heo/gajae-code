@@ -31,54 +31,54 @@ use crate::{fs_cache, glob_util, task};
 #[napi(object)]
 pub struct GlobOptions<'env> {
 	/// Glob pattern to match (e.g., "*.ts").
-	pub pattern:              String,
+	pub pattern: String,
 	/// Directory to search.
-	pub path:                 String,
+	pub path: String,
 	/// Filter by file type: "file", "dir", or "symlink". Symlinks are
 	/// matched for file/dir filters based on their target type.
-	pub file_type:            Option<FileType>,
+	pub file_type: Option<FileType>,
 	/// Match simple patterns recursively by default (`*.ts` -> recursive).
-	pub recursive:            Option<bool>,
+	pub recursive: Option<bool>,
 	/// Include hidden files (default: false).
-	pub hidden:               Option<bool>,
+	pub hidden: Option<bool>,
 	/// Maximum number of results to return.
-	pub max_results:          Option<u32>,
+	pub max_results: Option<u32>,
 	/// Respect .gitignore files (default: true).
-	pub gitignore:            Option<bool>,
+	pub gitignore: Option<bool>,
 	/// Enable shared filesystem scan cache (default: false).
-	pub cache:                Option<bool>,
+	pub cache: Option<bool>,
 	/// Sort results by mtime (most recent first) before applying limit.
-	pub sort_by_mtime:        Option<bool>,
+	pub sort_by_mtime: Option<bool>,
 	/// Include `node_modules` entries when the pattern does not explicitly
 	/// mention them.
 	pub include_node_modules: Option<bool>,
 	/// Abort signal for cancelling the operation.
-	pub signal:               Option<Unknown<'env>>,
+	pub signal: Option<Unknown<'env>>,
 	/// Timeout in milliseconds for the operation.
-	pub timeout_ms:           Option<u32>,
+	pub timeout_ms: Option<u32>,
 }
 
 /// Result payload returned by a glob operation.
 #[napi(object)]
 pub struct GlobResult {
 	/// Matched filesystem entries.
-	pub matches:       Vec<GlobMatch>,
+	pub matches: Vec<GlobMatch>,
 	/// Number of returned matches (`matches.len()`), clamped to `u32::MAX`.
 	pub total_matches: u32,
 }
 
 /// Internal runtime config for a single glob execution.
 struct GlobConfig {
-	root:                  std::path::PathBuf,
-	pattern:               String,
-	recursive:             bool,
-	include_hidden:        bool,
-	file_type_filter:      Option<FileType>,
-	max_results:           usize,
-	use_gitignore:         bool,
+	root: std::path::PathBuf,
+	pattern: String,
+	recursive: bool,
+	include_hidden: bool,
+	file_type_filter: Option<FileType>,
+	max_results: usize,
+	use_gitignore: bool,
 	mentions_node_modules: bool,
-	sort_by_mtime:         bool,
-	use_cache:             bool,
+	sort_by_mtime: bool,
+	use_cache: bool,
 }
 
 fn resolve_symlink_target_type(root: &Path, relative_path: &str) -> Option<FileType> {

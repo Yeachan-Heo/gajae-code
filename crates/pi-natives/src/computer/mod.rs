@@ -56,23 +56,23 @@ pub use supervisor::{Supervisor, SupervisorStatus};
 #[napi(object)]
 pub struct ComputerScreenshot {
 	/// PNG-encoded image bytes.
-	pub png:           Uint8Array,
+	pub png: Uint8Array,
 	/// Screenshot width in physical pixels.
-	pub width_px:      u32,
+	pub width_px: u32,
 	/// Screenshot height in physical pixels.
-	pub height_px:     u32,
+	pub height_px: u32,
 	/// Physical-pixels-per-logical-point along X.
-	pub scale_x:       f64,
+	pub scale_x: f64,
 	/// Physical-pixels-per-logical-point along Y.
-	pub scale_y:       f64,
+	pub scale_y: f64,
 	/// Logical origin X of the display (points).
-	pub origin_x:      f64,
+	pub origin_x: f64,
 	/// Logical origin Y of the display (points).
-	pub origin_y:      f64,
+	pub origin_y: f64,
 	/// Stable hash of the display geometry used for stale-display checks.
 	pub display_epoch: f64,
 	/// Process-local opaque capture id.
-	pub capture_id:    u32,
+	pub capture_id: u32,
 }
 
 /// Capture the primary display for JS callers (macOS).
@@ -90,15 +90,15 @@ pub fn computer_screenshot() -> napi::Result<ComputerScreenshot> {
 		let frame = capture::capture_primary_display()
 			.map_err(|err| napi::Error::from_reason(format!("{err}")))?;
 		Ok(ComputerScreenshot {
-			png:           Uint8Array::from(frame.png),
-			width_px:      frame.display.width_px,
-			height_px:     frame.display.height_px,
-			scale_x:       frame.display.scale_x,
-			scale_y:       frame.display.scale_y,
-			origin_x:      frame.display.origin_x,
-			origin_y:      frame.display.origin_y,
+			png: Uint8Array::from(frame.png),
+			width_px: frame.display.width_px,
+			height_px: frame.display.height_px,
+			scale_x: frame.display.scale_x,
+			scale_y: frame.display.scale_y,
+			origin_x: frame.display.origin_x,
+			origin_y: frame.display.origin_y,
 			display_epoch: frame.display_epoch as f64,
-			capture_id:    frame.capture_id,
+			capture_id: frame.capture_id,
 		})
 	}
 	#[cfg(not(target_os = "macos"))]

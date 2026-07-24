@@ -59,10 +59,10 @@ mod platform {
 	/// Layout matches `CFRunLoopTimerContext` from CoreFoundation.
 	#[repr(C)]
 	struct TimerContext {
-		version:          CFIndex,
-		info:             *mut c_void,
-		retain:           *const c_void,
-		release:          *const c_void,
+		version: CFIndex,
+		info: *mut c_void,
+		retain: *const c_void,
+		release: *const c_void,
 		copy_description: *const c_void,
 	}
 
@@ -276,7 +276,7 @@ mod platform {
 	/// Internal state for a running observer.
 	pub struct ObserverInner {
 		run_loop: Arc<Mutex<Option<SendableRunLoop>>>,
-		thread:   Option<JoinHandle<()>>,
+		thread: Option<JoinHandle<()>>,
 	}
 
 	impl ObserverInner {
@@ -325,10 +325,10 @@ mod platform {
 					// 2. Polls `CFPreferencesCopyAppValue` every 2 s so we catch theme changes even
 					//    if the Mach-port notification does not fire on this thread.
 					let timer_ctx = TimerContext {
-						version:          0,
-						info:             ctx_ptr.cast::<c_void>(),
-						retain:           ptr::null(),
-						release:          ptr::null(),
+						version: 0,
+						info: ctx_ptr.cast::<c_void>(),
+						retain: ptr::null(),
+						release: ptr::null(),
 						copy_description: ptr::null(),
 					};
 					let timer = CFRunLoopTimerCreate(

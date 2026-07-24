@@ -21,15 +21,15 @@ use crate::task;
 #[napi(object)]
 pub struct ProcessTerminateOptions<'env> {
 	/// Also signal the process group when supported by the platform.
-	pub group:       Option<bool>,
+	pub group: Option<bool>,
 	/// Milliseconds to wait after polite termination before hard-killing.
 	/// Omit to use the default grace period. Pass a negative value to skip the
 	/// graceful phase and hard-kill immediately.
 	pub graceful_ms: Option<i32>,
 	/// Milliseconds to wait after hard-kill for the process tree to exit.
-	pub timeout_ms:  Option<u32>,
+	pub timeout_ms: Option<u32>,
 	/// Abort signal for cancelling termination while waiting.
-	pub signal:      Option<Unknown<'env>>,
+	pub signal: Option<Unknown<'env>>,
 }
 
 /// Options for waiting on a process exit.
@@ -39,7 +39,7 @@ pub struct ProcessWaitOptions<'env> {
 	/// Milliseconds to wait before returning false. Omit to wait indefinitely.
 	pub timeout_ms: Option<u32>,
 	/// Abort signal for cancelling the wait.
-	pub signal:     Option<Unknown<'env>>,
+	pub signal: Option<Unknown<'env>>,
 }
 
 /// Current state of a process reference.

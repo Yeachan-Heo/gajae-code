@@ -33,9 +33,9 @@ use crate::{env_uint, task};
 #[napi]
 pub enum FileType {
 	/// Regular file.
-	File    = 1,
+	File = 1,
 	/// Directory.
-	Dir     = 2,
+	Dir = 2,
 	/// Symbolic link.
 	Symlink = 3,
 }
@@ -45,14 +45,14 @@ pub enum FileType {
 #[napi(object)]
 pub struct GlobMatch {
 	/// Relative path from the search root, using forward slashes.
-	pub path:      String,
+	pub path: String,
 	/// Resolved filesystem type for the match.
 	pub file_type: FileType,
 	/// Modification time in milliseconds since Unix epoch (from
 	/// `symlink_metadata`).
-	pub mtime:     Option<f64>,
+	pub mtime: Option<f64>,
 	/// File size in bytes for regular files.
-	pub size:      Option<f64>,
+	pub size: Option<f64>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -95,11 +95,11 @@ pub fn grep_workers() -> usize {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CacheKey {
-	root:              PathBuf,
-	include_hidden:    bool,
-	use_gitignore:     bool,
+	root: PathBuf,
+	include_hidden: bool,
+	use_gitignore: bool,
 	skip_node_modules: bool,
-	detail:            ScanDetail,
+	detail: ScanDetail,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -110,17 +110,17 @@ pub enum ScanDetail {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ScanOptions {
-	pub include_hidden:    bool,
-	pub use_gitignore:     bool,
+	pub include_hidden: bool,
+	pub use_gitignore: bool,
 	pub skip_node_modules: bool,
-	pub follow_links:      bool,
-	pub detail:            ScanDetail,
+	pub follow_links: bool,
+	pub detail: ScanDetail,
 }
 
 #[derive(Clone)]
 struct CacheEntry {
 	created_at: Instant,
-	entries:    Vec<GlobMatch>,
+	entries: Vec<GlobMatch>,
 }
 
 static FS_CACHE: LazyLock<DashMap<CacheKey, CacheEntry>> = LazyLock::new(DashMap::new);
@@ -128,7 +128,7 @@ static FS_CACHE: LazyLock<DashMap<CacheKey, CacheEntry>> = LazyLock::new(DashMap
 /// Result of a cache-aware scan, including the age of the cached data.
 pub struct ScanResult {
 	/// Scanned filesystem entries.
-	pub entries:      Vec<GlobMatch>,
+	pub entries: Vec<GlobMatch>,
 	/// How old the cached data is in milliseconds (0 = freshly scanned).
 	pub cache_age_ms: u64,
 }
@@ -292,13 +292,13 @@ pub fn build_walker(
 }
 
 struct EntryVisitor<'a> {
-	root:           &'a Path,
-	detail:         ScanDetail,
-	ct:             &'a task::CancelToken,
-	entries:        Vec<GlobMatch>,
+	root: &'a Path,
+	detail: ScanDetail,
+	ct: &'a task::CancelToken,
+	entries: Vec<GlobMatch>,
 	shared_entries: Arc<Mutex<Vec<Vec<GlobMatch>>>>,
-	error:          Arc<Mutex<Option<String>>>,
-	visited:        usize,
+	error: Arc<Mutex<Option<String>>>,
+	visited: usize,
 }
 
 impl Drop for EntryVisitor<'_> {
@@ -337,23 +337,23 @@ impl ParallelVisitor for EntryVisitor<'_> {
 }
 
 struct EntryVisitorBuilder<'a> {
-	root:           &'a Path,
-	detail:         ScanDetail,
-	ct:             &'a task::CancelToken,
+	root: &'a Path,
+	detail: ScanDetail,
+	ct: &'a task::CancelToken,
 	shared_entries: Arc<Mutex<Vec<Vec<GlobMatch>>>>,
-	error:          Arc<Mutex<Option<String>>>,
+	error: Arc<Mutex<Option<String>>>,
 }
 
 impl<'a> ParallelVisitorBuilder<'a> for EntryVisitorBuilder<'a> {
 	fn build(&mut self) -> Box<dyn ParallelVisitor + 'a> {
 		Box::new(EntryVisitor {
-			root:           self.root,
-			detail:         self.detail,
-			ct:             self.ct,
-			entries:        Vec::new(),
+			root: self.root,
+			detail: self.detail,
+			ct: self.ct,
+			entries: Vec::new(),
 			shared_entries: Arc::clone(&self.shared_entries),
-			error:          Arc::clone(&self.error),
-			visited:        0,
+			error: Arc::clone(&self.error),
+			visited: 0,
 		})
 	}
 }
@@ -457,11 +457,11 @@ pub fn get_or_scan(
 	}
 
 	let key = CacheKey {
-		root:              root.to_path_buf(),
-		include_hidden:    options.include_hidden,
-		use_gitignore:     options.use_gitignore,
+		root: root.to_path_buf(),
+		include_hidden: options.include_hidden,
+		use_gitignore: options.use_gitignore,
 		skip_node_modules: options.skip_node_modules,
-		detail:            options.detail,
+		detail: options.detail,
 	};
 
 	let now = Instant::now();
@@ -469,7 +469,7 @@ pub fn get_or_scan(
 		let age = now.duration_since(entry.created_at);
 		if age < Duration::from_millis(ttl) {
 			return Ok(ScanResult {
-				entries:      entry.entries.clone(),
+				entries: entry.entries.clone(),
 				cache_age_ms: age.as_millis() as u64,
 			});
 		}
@@ -495,11 +495,11 @@ pub fn force_rescan(
 	ct: &task::CancelToken,
 ) -> Result<Vec<GlobMatch>> {
 	let key = CacheKey {
-		root:              root.to_path_buf(),
-		include_hidden:    options.include_hidden,
-		use_gitignore:     options.use_gitignore,
+		root: root.to_path_buf(),
+		include_hidden: options.include_hidden,
+		use_gitignore: options.use_gitignore,
 		skip_node_modules: options.skip_node_modules,
-		detail:            options.detail,
+		detail: options.detail,
 	};
 	FS_CACHE.remove(&key);
 
@@ -697,11 +697,11 @@ mod tests {
 		let entries = super::collect_entries(
 			root.path(),
 			super::ScanOptions {
-				include_hidden:    true,
-				use_gitignore:     false,
+				include_hidden: true,
+				use_gitignore: false,
 				skip_node_modules: true,
-				follow_links:      false,
-				detail:            super::ScanDetail::Full,
+				follow_links: false,
+				detail: super::ScanDetail::Full,
 			},
 			&ct,
 		)
@@ -724,11 +724,11 @@ mod tests {
 		let result = super::collect_entries(
 			root.path(),
 			super::ScanOptions {
-				include_hidden:    true,
-				use_gitignore:     false,
+				include_hidden: true,
+				use_gitignore: false,
 				skip_node_modules: true,
-				follow_links:      false,
-				detail:            super::ScanDetail::Minimal,
+				follow_links: false,
+				detail: super::ScanDetail::Minimal,
 			},
 			&ct,
 		);
@@ -759,11 +759,11 @@ mod tests {
 		let entries = super::force_rescan(
 			root.path(),
 			super::ScanOptions {
-				include_hidden:    true,
-				use_gitignore:     false,
+				include_hidden: true,
+				use_gitignore: false,
 				skip_node_modules: true,
-				follow_links:      false,
-				detail:            super::ScanDetail::Full,
+				follow_links: false,
+				detail: super::ScanDetail::Full,
 			},
 			false,
 			&ct,
@@ -776,11 +776,11 @@ mod tests {
 		let entries = super::force_rescan(
 			root.path(),
 			super::ScanOptions {
-				include_hidden:    true,
-				use_gitignore:     false,
+				include_hidden: true,
+				use_gitignore: false,
 				skip_node_modules: false,
-				follow_links:      false,
-				detail:            super::ScanDetail::Full,
+				follow_links: false,
+				detail: super::ScanDetail::Full,
 			},
 			false,
 			&ct,
@@ -798,11 +798,11 @@ mod tests {
 		let minimal = super::collect_entries(
 			root.path(),
 			super::ScanOptions {
-				include_hidden:    true,
-				use_gitignore:     false,
+				include_hidden: true,
+				use_gitignore: false,
 				skip_node_modules: true,
-				follow_links:      false,
-				detail:            super::ScanDetail::Minimal,
+				follow_links: false,
+				detail: super::ScanDetail::Minimal,
 			},
 			&ct,
 		)
@@ -817,11 +817,11 @@ mod tests {
 		let full = super::collect_entries(
 			root.path(),
 			super::ScanOptions {
-				include_hidden:    true,
-				use_gitignore:     false,
+				include_hidden: true,
+				use_gitignore: false,
 				skip_node_modules: true,
-				follow_links:      false,
-				detail:            super::ScanDetail::Full,
+				follow_links: false,
+				detail: super::ScanDetail::Full,
 			},
 			&ct,
 		)

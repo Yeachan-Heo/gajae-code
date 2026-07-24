@@ -35,7 +35,7 @@ struct CgPoint {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CgSize {
-	width:  f64,
+	width: f64,
 	height: f64,
 }
 
@@ -43,7 +43,7 @@ struct CgSize {
 #[derive(Clone, Copy)]
 struct CgRect {
 	origin: CgPoint,
-	size:   CgSize,
+	size: CgSize,
 }
 
 type CgDirectDisplayId = u32;
@@ -120,13 +120,13 @@ const DISPLAY_EPOCH_MASK: u64 = (1_u64 << JS_SAFE_INTEGER_BITS) - 1;
 /// A captured primary-display frame.
 pub struct CapturedFrame {
 	/// Coordinate descriptor for the captured display.
-	pub display:       NormalizedDisplay,
+	pub display: NormalizedDisplay,
 	/// PNG-encoded RGBA image bytes.
-	pub png:           Vec<u8>,
+	pub png: Vec<u8>,
 	/// Stable hash of the display geometry used for stale-display checks.
 	pub display_epoch: u64,
 	/// Process-local opaque capture id.
-	pub capture_id:    u32,
+	pub capture_id: u32,
 }
 
 /// Capture the current primary display as a PNG plus its coordinate descriptor.
@@ -211,7 +211,7 @@ fn frame_from_image(
 
 	let rect = CgRect {
 		origin: CgPoint { x: 0.0, y: 0.0 },
-		size:   CgSize { width: width as f64, height: height as f64 },
+		size: CgSize { width: width as f64, height: height as f64 },
 	};
 	// SAFETY: `context` and `image` are non-null; `rect` matches the buffer the
 	// context was created over, so the draw stays in bounds.

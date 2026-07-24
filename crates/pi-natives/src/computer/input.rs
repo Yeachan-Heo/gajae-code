@@ -106,8 +106,8 @@ pub fn key_code_for(name: &str) -> Option<u16> {
 /// Orchestrates input actions over an [`EventSink`], tracking held buttons so
 /// [`InputController::release_all`] can clean up after an abort or error.
 pub struct InputController<S: EventSink> {
-	sink:         S,
-	cursor:       LogicalPoint,
+	sink: S,
+	cursor: LogicalPoint,
 	held_buttons: Vec<MouseButton>,
 }
 
@@ -534,11 +534,14 @@ mod tests {
 		let mut c = InputController::new(RecordingSink::default());
 		c.click(&display(), 100.0, 50.0, MouseButton::Left).unwrap();
 		let at = LogicalPoint { x: 50.0, y: 25.0 };
-		assert_eq!(c.into_ops(), vec![
-			SinkOp::Move(at),
-			SinkOp::Button { at, button: MouseButton::Left, down: true },
-			SinkOp::Button { at, button: MouseButton::Left, down: false },
-		]);
+		assert_eq!(
+			c.into_ops(),
+			vec![
+				SinkOp::Move(at),
+				SinkOp::Button { at, button: MouseButton::Left, down: true },
+				SinkOp::Button { at, button: MouseButton::Left, down: false },
+			]
+		);
 	}
 
 	#[test]
@@ -571,9 +574,9 @@ mod tests {
 		assert_eq!(
 			ops.last(),
 			Some(&SinkOp::Button {
-				at:     LogicalPoint { x: 50.0, y: 25.0 },
+				at: LogicalPoint { x: 50.0, y: 25.0 },
 				button: MouseButton::Left,
-				down:   false,
+				down: false,
 			})
 		);
 	}
@@ -625,12 +628,15 @@ mod tests {
 		let mut c = InputController::new(RecordingSink::default());
 		c.keypress(&["enter".to_string(), "tab".to_string()])
 			.unwrap();
-		assert_eq!(c.ops_ref(), &[
-			SinkOp::Key { code: 36, down: true },
-			SinkOp::Key { code: 36, down: false },
-			SinkOp::Key { code: 48, down: true },
-			SinkOp::Key { code: 48, down: false },
-		]);
+		assert_eq!(
+			c.ops_ref(),
+			&[
+				SinkOp::Key { code: 36, down: true },
+				SinkOp::Key { code: 36, down: false },
+				SinkOp::Key { code: 48, down: true },
+				SinkOp::Key { code: 48, down: false },
+			]
+		);
 		let err = c
 			.keypress(&["definitely-not-a-key".to_string()])
 			.unwrap_err();
@@ -778,10 +784,10 @@ mod live_tests {
 		act(InputAction::Type { text: "line two alpha beta gamma delta epsilon".to_string() });
 		act(InputAction::DoubleClick { x: cx, y: cy, button: MouseButton::Left }); // 6 double_click
 		act(InputAction::Drag {
-			x:      cx - 120.0,
-			y:      cy,
-			to_x:   cx + 120.0,
-			to_y:   cy,
+			x: cx - 120.0,
+			y: cy,
+			to_x: cx + 120.0,
+			to_y: cy,
 			button: MouseButton::Left,
 		}); // 7 drag
 		act(InputAction::Scroll { x: cx, y: cy, scroll_x: 0.0, scroll_y: -120.0 }); // 8 scroll

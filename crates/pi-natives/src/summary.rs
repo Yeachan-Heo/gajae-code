@@ -6,13 +6,13 @@ use napi_derive::napi;
 #[napi(object)]
 pub struct SummaryOptions {
 	/// Source code to summarize.
-	pub code:              String,
+	pub code: String,
 	/// Language alias (e.g. "rust", "typescript") used before path inference.
-	pub lang:              Option<String>,
+	pub lang: Option<String>,
 	/// File path used to infer language by extension when `lang` is omitted.
-	pub path:              Option<String>,
+	pub path: Option<String>,
 	/// Minimum total node lines before eliding a body/literal node.
-	pub min_body_lines:    Option<u32>,
+	pub min_body_lines: Option<u32>,
 	/// Minimum total comment lines before eliding a multiline block comment.
 	pub min_comment_lines: Option<u32>,
 }
@@ -20,36 +20,36 @@ pub struct SummaryOptions {
 #[napi(object)]
 pub struct SummarySegment {
 	/// "kept" or "elided".
-	pub kind:       String,
+	pub kind: String,
 	/// 1-based inclusive start line.
 	pub start_line: u32,
 	/// 1-based inclusive end line.
-	pub end_line:   u32,
+	pub end_line: u32,
 	/// Verbatim text for kept segments; absent for elided segments.
-	pub text:       Option<String>,
+	pub text: Option<String>,
 }
 
 #[napi(object)]
 pub struct SummaryResult {
 	/// Canonical language name when parsing succeeded.
-	pub language:    Option<String>,
+	pub language: Option<String>,
 	/// True when tree-sitter parsed the source without syntax errors.
-	pub parsed:      bool,
+	pub parsed: bool,
 	/// True when at least one elision span was emitted.
-	pub elided:      bool,
+	pub elided: bool,
 	/// Total source lines.
 	pub total_lines: u32,
 	/// Kept/elided segments in source order.
-	pub segments:    Vec<SummarySegment>,
+	pub segments: Vec<SummarySegment>,
 }
 
 impl From<pi_ast::summary::SummarySegment> for SummarySegment {
 	fn from(value: pi_ast::summary::SummarySegment) -> Self {
 		Self {
-			kind:       value.kind,
+			kind: value.kind,
 			start_line: value.start_line,
-			end_line:   value.end_line,
-			text:       value.text,
+			end_line: value.end_line,
+			text: value.text,
 		}
 	}
 }
@@ -57,11 +57,11 @@ impl From<pi_ast::summary::SummarySegment> for SummarySegment {
 impl From<pi_ast::summary::SummaryResult> for SummaryResult {
 	fn from(value: pi_ast::summary::SummaryResult) -> Self {
 		Self {
-			language:    value.language,
-			parsed:      value.parsed,
-			elided:      value.elided,
+			language: value.language,
+			parsed: value.parsed,
+			elided: value.elided,
 			total_lines: value.total_lines,
-			segments:    value.segments.into_iter().map(Into::into).collect(),
+			segments: value.segments.into_iter().map(Into::into).collect(),
 		}
 	}
 }
@@ -69,10 +69,10 @@ impl From<pi_ast::summary::SummaryResult> for SummaryResult {
 #[napi]
 pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
 	pi_ast::summary::summarize_code(pi_ast::summary::SummaryOptions {
-		code:              options.code,
-		lang:              options.lang,
-		path:              options.path,
-		min_body_lines:    options.min_body_lines,
+		code: options.code,
+		lang: options.lang,
+		path: options.path,
+		min_body_lines: options.min_body_lines,
 		min_comment_lines: options.min_comment_lines,
 	})
 	.map(Into::into)

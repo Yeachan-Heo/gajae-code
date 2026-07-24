@@ -131,20 +131,20 @@ fn sync_parent(parent: &File) -> std::io::Result<()> {
 #[derive(PartialEq, Eq)]
 
 pub struct RecoveryFsIdentity {
-	pub dev:      String,
-	pub ino:      String,
-	pub size:     String,
+	pub dev: String,
+	pub ino: String,
+	pub size: String,
 	pub mtime_ns: String,
 	pub ctime_ns: String,
-	pub sha256:   Option<String>,
+	pub sha256: Option<String>,
 }
 
 #[napi(object)]
 pub struct RecoveryFsResult {
-	pub ok:       bool,
-	pub code:     Option<String>,
+	pub ok: bool,
+	pub code: Option<String>,
 	pub identity: Option<RecoveryFsIdentity>,
-	pub data:     Option<Uint8Array>,
+	pub data: Option<Uint8Array>,
 }
 
 /// Fail-closed outcome for a removal whose detached object remains retained.
@@ -152,30 +152,30 @@ pub struct RecoveryFsResult {
 /// or delete the retained object.
 #[napi(object)]
 pub struct RecoveryFsRetainedCleanupResult {
-	pub ok:            bool,
-	pub code:          Option<String>,
+	pub ok: bool,
+	pub code: Option<String>,
 	pub recovery_path: Option<String>,
-	pub identity:      Option<RecoveryFsIdentity>,
+	pub identity: Option<RecoveryFsIdentity>,
 	pub tree_snapshot: Option<crate::path_identity::NativeDirectoryTreeSnapshot>,
 }
 
 impl RecoveryFsRetainedCleanupResult {
 	fn failure(code: &str) -> Self {
 		Self {
-			ok:            false,
-			code:          Some(code.to_owned()),
+			ok: false,
+			code: Some(code.to_owned()),
 			recovery_path: None,
-			identity:      None,
+			identity: None,
 			tree_snapshot: None,
 		}
 	}
 
 	fn retained_file(recovery_path: String, identity: RecoveryFsIdentity) -> Self {
 		Self {
-			ok:            false,
-			code:          Some("cleanup_pending".to_owned()),
+			ok: false,
+			code: Some("cleanup_pending".to_owned()),
 			recovery_path: Some(recovery_path),
-			identity:      Some(identity),
+			identity: Some(identity),
 			tree_snapshot: None,
 		}
 	}
@@ -185,10 +185,10 @@ impl RecoveryFsRetainedCleanupResult {
 		tree_snapshot: crate::path_identity::NativeDirectoryTreeSnapshot,
 	) -> Self {
 		Self {
-			ok:            false,
-			code:          Some("cleanup_pending".to_owned()),
+			ok: false,
+			code: Some("cleanup_pending".to_owned()),
 			recovery_path: Some(recovery_path),
-			identity:      None,
+			identity: None,
 			tree_snapshot: Some(tree_snapshot),
 		}
 	}
@@ -200,12 +200,7 @@ impl RecoveryFsResult {
 	}
 
 	fn data(identity: RecoveryFsIdentity, data: Vec<u8>) -> Self {
-		Self {
-			ok:       true,
-			code:     None,
-			identity: Some(identity),
-			data:     Some(Uint8Array::from(data)),
-		}
+		Self { ok: true, code: None, identity: Some(identity), data: Some(Uint8Array::from(data)) }
 	}
 
 	fn failure(code: &str) -> Self {
@@ -217,10 +212,10 @@ impl RecoveryFsResult {
 #[napi(object)]
 #[derive(Clone)]
 pub struct RecoveryFsPublishSyncFailure {
-	pub phase:       String,
+	pub phase: String,
 	pub parent_role: String,
-	pub os_code:     Option<i32>,
-	pub kind:        String,
+	pub os_code: Option<i32>,
+	pub kind: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -240,25 +235,25 @@ impl From<&'static str> for RetainedPublishError {
 /// Bounded, path-free diagnostic evidence for one retained publication.
 #[napi(object)]
 pub struct RecoveryFsPublishDiagnostic {
-	pub schema_version:   u32,
+	pub schema_version: u32,
 	pub collection_state: String,
-	pub os_code:          Option<i32>,
-	pub sync_failures:    Option<Vec<RecoveryFsPublishSyncFailure>>,
+	pub os_code: Option<i32>,
+	pub sync_failures: Option<Vec<RecoveryFsPublishSyncFailure>>,
 }
 
 /// Explicit mutation and durability outcome for retained no-replace
 /// publication.
 #[napi(object)]
 pub struct RecoveryFsPublishResult {
-	pub ok:               bool,
-	pub code:             Option<String>,
-	pub identity:         Option<RecoveryFsIdentity>,
-	pub mutation_state:   String,
+	pub ok: bool,
+	pub code: Option<String>,
+	pub identity: Option<RecoveryFsIdentity>,
+	pub mutation_state: String,
 	pub durability_state: String,
-	pub reason:           String,
-	pub primitive:        String,
-	pub phase:            String,
-	pub diagnostic:       RecoveryFsPublishDiagnostic,
+	pub reason: String,
+	pub primitive: String,
+	pub phase: String,
+	pub diagnostic: RecoveryFsPublishDiagnostic,
 }
 
 impl RecoveryFsPublishResult {
@@ -428,7 +423,7 @@ fn publish_unknown_failure(code: &'static str, phase: &str) -> RecoveryFsPublish
 #[napi]
 pub struct RecoveryFsRoot {
 	#[cfg(target_os = "linux")]
-	root:     Mutex<Option<File>>,
+	root: Mutex<Option<File>>,
 	#[cfg(target_os = "linux")]
 	recovery: Mutex<Option<File>>,
 }
@@ -796,15 +791,15 @@ impl RecoveryFsRoot {
 			let root = self.root.lock();
 			let Some(root) = root.as_ref() else {
 				return crate::path_identity::NativeDirectoryTreeResult {
-					ok:       false,
-					code:     Some("closed".to_owned()),
+					ok: false,
+					code: Some("closed".to_owned()),
 					snapshot: None,
 				};
 			};
 			snapshot_managed_tree(root, &relative_path).unwrap_or_else(|code| {
 				crate::path_identity::NativeDirectoryTreeResult {
-					ok:       false,
-					code:     Some(code.to_owned()),
+					ok: false,
+					code: Some(code.to_owned()),
 					snapshot: None,
 				}
 			})
@@ -813,8 +808,8 @@ impl RecoveryFsRoot {
 		{
 			let _ = relative_path;
 			crate::path_identity::NativeDirectoryTreeResult {
-				ok:       false,
-				code:     Some("unsupported_platform".to_owned()),
+				ok: false,
+				code: Some("unsupported_platform".to_owned()),
 				snapshot: None,
 			}
 		}
@@ -1203,12 +1198,12 @@ fn identity(file: &File) -> Result<RecoveryFsIdentity, &'static str> {
 		return Err("io_error");
 	}
 	Ok(RecoveryFsIdentity {
-		dev:      stat.st_dev.to_string(),
-		ino:      stat.st_ino.to_string(),
-		size:     (stat.st_size as u64).to_string(),
+		dev: stat.st_dev.to_string(),
+		ino: stat.st_ino.to_string(),
+		size: (stat.st_size as u64).to_string(),
 		mtime_ns: stat_mtime_ns(&stat).to_string(),
 		ctime_ns: stat_ctime_ns(&stat).to_string(),
-		sha256:   None,
+		sha256: None,
 	})
 }
 
@@ -1230,12 +1225,12 @@ fn regular_identity(file: &File) -> Result<RecoveryFsIdentity, &'static str> {
 		return Err("hard_link");
 	}
 	Ok(RecoveryFsIdentity {
-		dev:      stat.st_dev.to_string(),
-		ino:      stat.st_ino.to_string(),
-		size:     (stat.st_size as u64).to_string(),
+		dev: stat.st_dev.to_string(),
+		ino: stat.st_ino.to_string(),
+		size: (stat.st_size as u64).to_string(),
 		mtime_ns: stat_mtime_ns(&stat).to_string(),
 		ctime_ns: stat_ctime_ns(&stat).to_string(),
-		sha256:   None,
+		sha256: None,
 	})
 }
 
@@ -2274,8 +2269,8 @@ fn tree_entry(
 
 #[cfg(target_os = "linux")]
 struct TreeBudget {
-	entries:     u64,
-	files:       u64,
+	entries: u64,
+	files: u64,
 	total_bytes: u64,
 }
 
@@ -2512,8 +2507,8 @@ fn snapshot_managed_tree(
 	}
 	let entry = entries.first().ok_or("io_error")?;
 	Ok(crate::path_identity::NativeDirectoryTreeResult {
-		ok:       true,
-		code:     None,
+		ok: true,
+		code: None,
 		snapshot: Some(crate::path_identity::NativeDirectoryTreeSnapshot {
 			root_dev: entry.dev.clone(),
 			root_ino: entry.ino.clone(),

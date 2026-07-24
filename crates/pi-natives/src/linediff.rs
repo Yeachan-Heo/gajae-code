@@ -18,9 +18,9 @@ use napi_derive::napi;
 /// the TS `generateDiffString` formatter does not consume).
 #[napi(object)]
 pub struct LineDiffPart {
-	pub added:   bool,
+	pub added: bool,
 	pub removed: bool,
-	pub value:   String,
+	pub value: String,
 }
 
 /// jsdiff line tokenizer (default options). Returns byte ranges into `value`;
@@ -83,14 +83,14 @@ fn tokenize_ranges(value: &str) -> Vec<(usize, usize)> {
 #[derive(Clone, Copy)]
 struct PathNode {
 	old_pos: isize,
-	last:    Option<usize>,
+	last: Option<usize>,
 }
 
 struct Comp {
-	count:   usize,
-	added:   bool,
+	count: usize,
+	added: bool,
 	removed: bool,
-	prev:    Option<usize>,
+	prev: Option<usize>,
 }
 
 /// jsdiff `addToPath` (with `oneChangePerToken` = false).

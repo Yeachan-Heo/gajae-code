@@ -41,11 +41,11 @@ fn saturating_increment(counter: &AtomicU64) {
 #[napi(object)]
 pub struct NotificationEndpoint {
 	/// Bind host (loopback).
-	pub host:       String,
+	pub host: String,
 	/// Bound port.
-	pub port:       u32,
+	pub port: u32,
 	/// `ws://host:port` URL.
-	pub url:        String,
+	pub url: String,
 	/// The session id this endpoint serves.
 	pub session_id: String,
 }
@@ -55,11 +55,11 @@ pub struct NotificationEndpoint {
 pub struct ReplyEvent {
 	/// The transient action/presentation id being answered. This is not the
 	/// durable workflow gate id.
-	pub id:               String,
+	pub id: String,
 	/// JSON-encoded `ReplyAnswer` (number, string, or `{selected,custom}`).
-	pub answer_json:      String,
+	pub answer_json: String,
 	/// Optional idempotency key supplied by the client.
-	pub idempotency_key:  Option<String>,
+	pub idempotency_key: Option<String>,
 	/// One-shot receipt binding this callback to the atomically claimed reply.
 	pub reply_receipt_id: String,
 }
@@ -71,7 +71,7 @@ pub struct ReplyEvent {
 /// persist, inspect, or treat it as workflow-gate authority.
 #[napi(object)]
 pub struct PresentationLease {
-	pub action_id:          String,
+	pub action_id: String,
 	pub registration_epoch: i64,
 }
 
@@ -85,24 +85,22 @@ pub struct RetireIfUnclaimedResult {
 /// Typed terminal acknowledgement result returned by acknowledgement promises.
 #[napi(object)]
 pub struct AskSelectedAckOutcomeEvent {
-	pub status:     String,
+	pub status: String,
 	pub message_id: Option<i64>,
-	pub reason:     Option<String>,
+	pub reason: Option<String>,
 }
 
 impl From<gjc_sdk::protocol::AskSelectedAckOutcome> for AskSelectedAckOutcomeEvent {
 	fn from(outcome: gjc_sdk::protocol::AskSelectedAckOutcome) -> Self {
 		use gjc_sdk::protocol::AskSelectedAckOutcome;
 		match outcome {
-			AskSelectedAckOutcome::Delivered { message_id } => Self {
-				status:     "delivered".to_owned(),
-				message_id: Some(message_id),
-				reason:     None,
+			AskSelectedAckOutcome::Delivered { message_id } => {
+				Self { status: "delivered".to_owned(), message_id: Some(message_id), reason: None }
 			},
 			AskSelectedAckOutcome::Failed { reason } => Self {
-				status:     "failed".to_owned(),
+				status: "failed".to_owned(),
 				message_id: None,
-				reason:     Some(
+				reason: Some(
 					serde_json::to_value(reason)
 						.expect("ack reason serializes")
 						.as_str()
@@ -111,9 +109,9 @@ impl From<gjc_sdk::protocol::AskSelectedAckOutcome> for AskSelectedAckOutcomeEve
 				),
 			},
 			AskSelectedAckOutcome::Unknown { reason } => Self {
-				status:     "unknown".to_owned(),
+				status: "unknown".to_owned(),
 				message_id: None,
-				reason:     Some(
+				reason: Some(
 					serde_json::to_value(reason)
 						.expect("ack reason serializes")
 						.as_str()
@@ -132,37 +130,37 @@ impl From<gjc_sdk::protocol::AskSelectedAckOutcome> for AskSelectedAckOutcomeEve
 pub struct InboundEvent {
 	/// Inbound kind (`user_message`, `ephemeral_turn`,
 	/// `ephemeral_turn_cancel`, `config_command`, or `control_command`).
-	pub kind:          String,
+	pub kind: String,
 	/// Server-authenticated identity of the WebSocket connection that delivered
 	/// this event.
 	pub connection_id: String,
 	/// The session this inbound belongs to.
-	pub session_id:    String,
+	pub session_id: String,
 	/// Free-text body (`user_message` or `ephemeral_turn` only).
-	pub text:          Option<String>,
+	pub text: Option<String>,
 	/// Telegram update id for dedupe (`user_message`, `ephemeral_turn`, or
 	/// `ephemeral_turn_cancel` only).
-	pub update_id:     Option<i64>,
+	pub update_id: Option<i64>,
 	/// Originating thread/topic id (`user_message`, `ephemeral_turn`, or
 	/// `ephemeral_turn_cancel` only).
-	pub thread_id:     Option<String>,
+	pub thread_id: Option<String>,
 	/// Originating Telegram message id (`ephemeral_turn` and
 	/// `ephemeral_turn_cancel` only).
-	pub message_id:    Option<i64>,
+	pub message_id: Option<i64>,
 	/// Requested verbosity `"lean"|"verbose"` (`config_command` only).
-	pub verbosity:     Option<String>,
+	pub verbosity: Option<String>,
 	/// Requested redaction state (`config_command` only).
-	pub redact:        Option<bool>,
+	pub redact: Option<bool>,
 	/// Client-generated request id (`ephemeral_turn`, `ephemeral_turn_cancel`,
 	/// or `control_command` only).
-	pub request_id:    Option<String>,
+	pub request_id: Option<String>,
 	/// Cancellation reason (`ephemeral_turn_cancel` only).
-	pub reason:        Option<String>,
+	pub reason: Option<String>,
 	/// JSON-encoded command payload (`control_command` only).
-	pub command_json:  Option<String>,
+	pub command_json: Option<String>,
 	/// Inline image attachments forwarded with the message (`user_message`
 	/// only).
-	pub images:        Option<Vec<InboundImageEvent>>,
+	pub images: Option<Vec<InboundImageEvent>>,
 }
 
 /// One inline image attachment forwarded with an inbound user message.
@@ -178,7 +176,7 @@ pub struct InboundImageEvent {
 #[napi(object)]
 pub struct SdkFrameEvent {
 	pub connection_id: String,
-	pub json:          String,
+	pub json: String,
 }
 
 /// Callback delivering a connection's negotiated v3 capabilities
@@ -211,12 +209,12 @@ pub struct NotificationServer {
 #[napi(object)]
 pub struct KnownGoodFrameStats {
 	/// Frames constructed as `TurnStream` without parsing a JSON string.
-	pub known_good_turn_stream_frames:       f64,
+	pub known_good_turn_stream_frames: f64,
 	/// JSON serde parses of externally supplied `turn_stream` frames.
 	pub turn_stream_serde_validation_parses: f64,
 	/// Base64 characters encoded in Rust for `file_attachment` frames (the JS
 	/// side crosses raw `Buffer` bytes and never allocates the base64 string).
-	pub file_attachment_rust_base64_chars:   f64,
+	pub file_attachment_rust_base64_chars: f64,
 }
 
 #[napi]
@@ -327,10 +325,10 @@ impl NotificationServer {
 			let task = napi::tokio::spawn(async move {
 				while let Some(reply) = rx.recv().await {
 					let event = ReplyEvent {
-						id:               reply.reply.id,
-						answer_json:      serde_json::to_string(&reply.reply.answer)
+						id: reply.reply.id,
+						answer_json: serde_json::to_string(&reply.reply.answer)
 							.unwrap_or_else(|_| "null".to_owned()),
-						idempotency_key:  reply.reply.idempotency_key,
+						idempotency_key: reply.reply.idempotency_key,
 						reply_receipt_id: reply.reply_receipt_id,
 					};
 					tsfn.call(Ok(event), ThreadsafeFunctionCallMode::NonBlocking);
@@ -685,9 +683,9 @@ impl NotificationServer {
 		let file_attachment_rust_base64_chars =
 			self.file_attachment_base64_chars.load(Ordering::Relaxed);
 		KnownGoodFrameStats {
-			known_good_turn_stream_frames:       known_good_turn_stream_frames as f64,
+			known_good_turn_stream_frames: known_good_turn_stream_frames as f64,
 			turn_stream_serde_validation_parses: turn_stream_serde_validation_parses as f64,
-			file_attachment_rust_base64_chars:   file_attachment_rust_base64_chars as f64,
+			file_attachment_rust_base64_chars: file_attachment_rust_base64_chars as f64,
 		}
 	}
 
@@ -933,11 +931,11 @@ impl NotificationServer {
 #[napi(object)]
 pub struct ControlEndpoint {
 	/// Bind host (loopback).
-	pub host:     String,
+	pub host: String,
 	/// Bound port.
-	pub port:     u32,
+	pub port: u32,
 	/// `ws://host:port` URL.
-	pub url:      String,
+	pub url: String,
 	/// The daemon owner id this control endpoint serves.
 	pub owner_id: String,
 }
@@ -946,9 +944,9 @@ pub struct ControlEndpoint {
 #[napi(object)]
 pub struct LifecycleRequestEvent {
 	/// One of `"session_create"`, `"session_close"`, `"session_resume"`.
-	pub kind:         String,
+	pub kind: String,
 	/// The request correlation id to echo in the response.
-	pub request_id:   String,
+	pub request_id: String,
 	/// JSON-encoded `LifecycleClientMessage` with the control `token` stripped.
 	/// The ingress already authenticated the frame, so the secret is never
 	/// forwarded into JS; all other (non-token) fields are preserved.
@@ -965,8 +963,8 @@ pub struct LifecycleRequestEvent {
 /// [`Self::start`].
 #[napi]
 pub struct NotificationControlServer {
-	config:     Mutex<Option<ControlServerConfig>>,
-	handle:     Mutex<Option<ControlServerHandle>>,
+	config: Mutex<Option<ControlServerConfig>>,
+	handle: Mutex<Option<ControlServerHandle>>,
 	on_request: Mutex<Option<ThreadsafeFunction<LifecycleRequestEvent>>>,
 }
 
@@ -982,8 +980,8 @@ impl NotificationControlServer {
 		let mut config = ControlServerConfig::new(token, owner_id);
 		config.agent_dir = agent_dir.map(PathBuf::from);
 		Self {
-			config:     Mutex::new(Some(config)),
-			handle:     Mutex::new(None),
+			config: Mutex::new(Some(config)),
+			handle: Mutex::new(None),
 			on_request: Mutex::new(None),
 		}
 	}
@@ -1165,16 +1163,18 @@ mod tests {
 
 	#[test]
 	fn ephemeral_turn_mapping_preserves_question_and_tuple_without_token() {
-		let event =
-			super::ephemeral_turn_event("connection-1".to_owned(), gjc_sdk::protocol::EphemeralTurn {
+		let event = super::ephemeral_turn_event(
+			"connection-1".to_owned(),
+			gjc_sdk::protocol::EphemeralTurn {
 				session_id: "session".to_owned(),
-				token:      "secret".to_owned(),
+				token: "secret".to_owned(),
 				request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
-				update_id:  7,
+				update_id: 7,
 				message_id: 9,
-				thread_id:  "11".to_owned(),
-				question:   "What changed?".to_owned(),
-			});
+				thread_id: "11".to_owned(),
+				question: "What changed?".to_owned(),
+			},
+		);
 		assert_eq!(event.connection_id, "connection-1");
 		assert_eq!(event.kind, "ephemeral_turn");
 		assert_eq!(event.session_id, "session");
@@ -1193,12 +1193,12 @@ mod tests {
 			"connection-2".to_owned(),
 			gjc_sdk::protocol::EphemeralTurnCancel {
 				session_id: "session".to_owned(),
-				token:      "secret".to_owned(),
+				token: "secret".to_owned(),
 				request_id: "btw:123e4567-e89b-42d3-a456-426614174000".to_owned(),
-				update_id:  7,
+				update_id: 7,
 				message_id: 9,
-				thread_id:  "11".to_owned(),
-				reason:     gjc_sdk::protocol::EphemeralTurnCancelReason::DaemonShutdown,
+				thread_id: "11".to_owned(),
+				reason: gjc_sdk::protocol::EphemeralTurnCancelReason::DaemonShutdown,
 			},
 		);
 		assert_eq!(event.connection_id, "connection-2");
@@ -1294,7 +1294,7 @@ mod tests {
 		assert_eq!(
 			server
 				.retire_if_unclaimed(PresentationLease {
-					action_id:          "presentation".to_owned(),
+					action_id: "presentation".to_owned(),
 					registration_epoch: lease.registration_epoch + 1,
 				})
 				.expect("forged lease is rejected without touching the registry")

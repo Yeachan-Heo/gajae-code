@@ -17,7 +17,7 @@ use crate::task;
 #[napi(object)]
 pub struct ClipboardImage {
 	/// PNG-encoded image bytes.
-	pub data:      Uint8Array,
+	pub data: Uint8Array,
 	/// MIME type for the encoded image payload.
 	pub mime_type: String,
 }
@@ -70,7 +70,7 @@ pub fn read_image_from_clipboard() -> task::Promise<Option<ClipboardImage>> {
 			Ok(image) => {
 				let bytes = encode_png(image)?;
 				Ok(Some(ClipboardImage {
-					data:      Uint8Array::from(bytes),
+					data: Uint8Array::from(bytes),
 					mime_type: "image/png".to_string(),
 				}))
 			},
