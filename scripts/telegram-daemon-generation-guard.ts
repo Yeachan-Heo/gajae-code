@@ -61,7 +61,7 @@ type GuardManifest = {
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "9541718e76791cc6c19ed9870a8a0bc60a96341eb658b2307588f0146389a131";
+const PROTECTED_INVENTORY_SHA256 = "82ec515526cf82ca0dadc6107f06504d285d03a1ef52e610e95021918f93f7a4";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -113,6 +113,19 @@ export const CHAT_CONFIG_PROTECTED_DECLARATIONS = {
 	slack: ["getNotificationConfig", "notificationConfigFromFile", "isSlackConfigured", "tokenFingerprint"],
 } as const;
 
+/** Telegram tool-activity defaults and delivery admission must stay generation-fenced. */
+export const TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS = {
+	[config]: ["parseNotificationSettingsSnapshot"],
+	[telegramDaemon]: [
+		"TOOL_ACTIVITY_CAPABILITY",
+		"toolActivityOwner",
+		"toolActivityAuthorityIsCurrent",
+		"toolActivityDeliveryIsCurrent",
+		"handleSessionMessage",
+		"processTelegramUpdate",
+	],
+} as const;
+
 /** Chat credential, provenance, and persistence are shared takeover authority. */
 export const CHAT_OWNER_LOCK_PROTECTED_DECLARATIONS = [
 	"identityFor",
@@ -156,6 +169,14 @@ function validateChatConfigInventory(inventory: Inventory): void {
 		const symbols = inventory[family][config];
 		if (!symbols || CHAT_CONFIG_PROTECTED_DECLARATIONS[family].some(symbol => !symbols.includes(symbol)))
 			throw new Error(`telegram-daemon-generation-guard: chat configuration primitives must be protected by the ${family} generation contract`);
+	}
+}
+
+function validateTelegramToolActivityInventory(inventory: Inventory): void {
+	for (const [file, required] of Object.entries(TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS)) {
+		const symbols = inventory.telegram[file];
+		if (!symbols || required.some(symbol => !symbols.includes(symbol)))
+			throw new Error("telegram-daemon-generation-guard: Telegram tool-activity configuration and delivery policy must be protected by the Telegram generation contract");
 	}
 }
 
@@ -205,6 +226,7 @@ export function validateInventory(inventory: Inventory = protectedInventory): vo
 	validateChatOwnerLockInventory(inventory);
 	validateChatCliInventory(inventory);
 	validateChatConfigInventory(inventory);
+	validateTelegramToolActivityInventory(inventory);
 }
 
 export function validateManifest(value: unknown = manifest): asserts value is GuardManifest {
@@ -548,7 +570,7 @@ export function isLegacyBootstrapBase(base: ReadonlyMap<string, string | undefin
 			if (declaration?.type !== "VariableDeclaration") return [];
 			return declaration.declarations.map((item: any) => item.id?.name).filter((name: unknown): name is string => typeof name === "string");
 		});
-		if (exportedNames.sort().join(",") !== "DAEMON_GENERATION,NOTIFICATION_PROTOCOL_VERSION,SERVING_EPOCH") return false;
+		if (exportedNames.sort().join(",") !== "DAEMON_GENERATION,NOTIFICATION_PROTOCOL_VERSION") return false;
 		const protocol = declarationNode(program, "NOTIFICATION_PROTOCOL_VERSION");
 		const generation = declarationNode(program, "DAEMON_GENERATION");
 		const protocolDeclaration = protocol?.declarations?.find((item: any) => item.id?.name === "NOTIFICATION_PROTOCOL_VERSION");

@@ -193,8 +193,10 @@ export const CLIENT_PING_PONG_CAPABILITY = "client_ping_pong";
 /** Capability required for typed controls and semantic Selected acknowledgement frames. */
 export const ASK_SELECTED_ACK_CAPABILITY = "ask_selected_ack_v1";
 export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
-/** Capability required for tool lifecycle and reasoning-summary frames. */
-export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
+/** Capability for the closed tool phase set: started, completed, failed, and cancelled. */
+export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
+/** Receive-only compatibility capability for pre-v2 hosts. */
+export const LEGACY_TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
 
 const nodeFs: TelegramDaemonFs = {
 	...(fs.promises as unknown as TelegramDaemonFs),
@@ -3863,6 +3865,8 @@ interface SessionSocket {
 	/** True once the server advertised the `client_ping_pong` capability. */
 	capable: boolean;
 	ephemeralCapable: boolean;
+	/** Tool activity contract advertised by the connected host. */
+	toolActivityCapability?: "v1" | "v2";
 	/** Timestamp (via opts.now) of the last received pong; seeds the TTL window. */
 	lastPongAt: number;
 	/** Nonce of the most recent in-flight ping, if any. */
@@ -3913,6 +3917,7 @@ interface ToolActivityOwner {
 	session: SessionSocket;
 	phase: "started" | "terminal";
 	policyEpoch?: number;
+	summaryFreeSend?: ThreadedSend;
 }
 
 interface PendingThreadedFrame {
@@ -4654,6 +4659,11 @@ export class TelegramNotificationDaemon {
 				matches: msg => msg.type === "hello",
 				handle: (session, msg) => {
 					const caps = Array.isArray(msg.capabilities) ? msg.capabilities : [];
+					session.toolActivityCapability = caps.includes(TOOL_ACTIVITY_CAPABILITY)
+						? "v2"
+						: caps.includes(LEGACY_TOOL_ACTIVITY_CAPABILITY)
+							? "v1"
+							: undefined;
 					if (caps.includes("ephemeral_turn_v1")) session.ephemeralCapable = true;
 					if (caps.includes(CLIENT_PING_PONG_CAPABILITY)) {
 						session.capable = true;
@@ -5186,6 +5196,7 @@ export class TelegramNotificationDaemon {
 								ASK_CONTROLS_CAPABILITY,
 								ASK_SELECTED_ACK_CAPABILITY,
 								TOOL_ACTIVITY_CAPABILITY,
+								LEGACY_TOOL_ACTIVITY_CAPABILITY,
 								"ephemeral_turn_v1",
 							],
 						}),
@@ -5279,12 +5290,12 @@ export class TelegramNotificationDaemon {
 				for (const item of claimedItems) {
 					const { messageId, owner } = item;
 					const backlogKey = `${owner.endpointDigest}\0${owner.sessionId}\0${owner.toolCallId}\0${messageId}`;
-					const send = renderThreadedFrame({
+					const send = this.renderThreadedFrame({
 						type: "tool_activity",
 						sessionId: owner.sessionId,
 						toolCallId: owner.toolCallId,
 						toolName: owner.toolName,
-						phase: "unknown",
+						phase: "cancelled",
 					});
 					if (!send?.text) continue;
 					let failure: unknown;
@@ -5923,7 +5934,7 @@ export class TelegramNotificationDaemon {
 			typeof msg.sessionId !== "string" ||
 			!msg.sessionId.trim() ||
 			msg.sessionId === this.#logicalSessionId(session) ||
-			(msg.type !== "config_update" && !renderThreadedFrame(msg))
+			(msg.type !== "config_update" && !this.renderThreadedFrame(msg))
 		)
 			return;
 		if (!session.logicalSessionIdTrusted) return;
@@ -6204,6 +6215,30 @@ export class TelegramNotificationDaemon {
 			session,
 			phase: phase === "started" ? "started" : "terminal",
 		};
+	}
+	private renderThreadedFrame(frame: Record<string, unknown>): ThreadedSend | undefined {
+		if (
+			frame.type === "tool_activity" &&
+			frame.phase !== "started" &&
+			frame.phase !== "completed" &&
+			frame.phase !== "failed" &&
+			frame.phase !== "cancelled"
+		)
+			return undefined;
+		return renderThreadedFrame(frame);
+	}
+	private toolActivityFrameWithoutSummaries(frame: Record<string, unknown>): Record<string, unknown> {
+		const summaryFree = { ...frame };
+		delete summaryFree.argsSummary;
+		delete summaryFree.resultSummary;
+		return summaryFree;
+	}
+	private toolActivitySummariesAreCurrent(toolActivity: ToolActivityOwner): boolean {
+		return (
+			this.opts.toolActivity?.enabled === true &&
+			toolActivity.policyEpoch === this.toolActivityPolicyEpoch &&
+			this.toolActivityAuthorityIsCurrent(toolActivity)
+		);
 	}
 
 	private toolActivityAuthorityIsCurrent(toolActivity: ToolActivityOwner): boolean {
@@ -7121,7 +7156,8 @@ export class TelegramNotificationDaemon {
 				}
 				continue;
 			}
-			const { send, topicLease, socketLease } = item.payload;
+			let { send } = item.payload;
+			const { topicLease, socketLease } = item.payload;
 			if (
 				(socketLease && !this.#leaseTokenAllows(socketLease)) ||
 				(topicLease && !this.topicLeaseIsCurrent(topicLease))
@@ -7145,6 +7181,12 @@ export class TelegramNotificationDaemon {
 				this.pool.settle(item.itemId!, "removed");
 				continue;
 			}
+			if (
+				toolActivity?.phase === "terminal" &&
+				!this.toolActivitySummariesAreCurrent(toolActivity) &&
+				toolActivity.summaryFreeSend
+			)
+				send = toolActivity.summaryFreeSend;
 			// Threaded topic when available; otherwise deliver flat to the paired chat.
 			const threadField = topicId ? { message_thread_id: Number(topicId) } : {};
 			const ckey = send.editable ? item.coalesceKey : undefined;
@@ -7731,6 +7773,11 @@ export class TelegramNotificationDaemon {
 	async handleSessionMessage(session: SessionSocket, msg: any): Promise<void> {
 		if (msg?.type === "hello") {
 			const capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : [];
+			session.toolActivityCapability = capabilities.includes(TOOL_ACTIVITY_CAPABILITY)
+				? "v2"
+				: capabilities.includes(LEGACY_TOOL_ACTIVITY_CAPABILITY)
+					? "v1"
+					: undefined;
 			if (capabilities.includes("ephemeral_turn_v1")) {
 				session.ephemeralCapable = true;
 				this.#resumeBtwTurnsForSession(session);
@@ -8096,7 +8143,20 @@ export class TelegramNotificationDaemon {
 			return;
 		}
 		if (typeof msg?.type === "string" && TelegramNotificationDaemon.THREADED_FRAMES.has(msg.type)) {
-			const threadedFrame = msg as Record<string, unknown>;
+			let threadedFrame = msg as Record<string, unknown>;
+			if (threadedFrame.type === "tool_activity" && threadedFrame.phase === "unknown") {
+				const toolCallId = typeof threadedFrame.toolCallId === "string" ? threadedFrame.toolCallId : undefined;
+				const liveKey = toolCallId ? `${this.#logicalSessionId(session)}:tool:${toolCallId}` : undefined;
+				const visibleOwner = liveKey ? this.toolActivityOwners.get(liveKey) : undefined;
+				if (
+					session.toolActivityCapability !== "v1" ||
+					!liveKey ||
+					visibleOwner?.session !== session ||
+					!this.liveMessages.has(liveKey)
+				)
+					return;
+				threadedFrame = { ...this.toolActivityFrameWithoutSummaries(threadedFrame), phase: "cancelled" };
+			}
 			const toolActivity = this.toolActivityOwner(session, threadedFrame);
 			if (threadedFrame.type === "tool_activity" && !toolActivity) return;
 			const toolAdmissionEpoch = toolActivity
@@ -8135,7 +8195,17 @@ export class TelegramNotificationDaemon {
 					}
 				}
 			}
-			const send = renderThreadedFrame(msg);
+			const summaryFreeToolFrame =
+				toolActivity?.phase === "terminal" ? this.toolActivityFrameWithoutSummaries(threadedFrame) : threadedFrame;
+			const renderedFrame =
+				toolActivity?.phase === "terminal" && !this.toolActivitySummariesAreCurrent(toolActivity)
+					? summaryFreeToolFrame
+					: threadedFrame;
+			const send = this.renderThreadedFrame(renderedFrame);
+			if (toolActivity?.phase === "terminal") {
+				const summaryFreeSend = this.renderThreadedFrame(summaryFreeToolFrame);
+				if (summaryFreeSend) toolActivity.summaryFreeSend = summaryFreeSend;
+			}
 			if (!send) return;
 			const transportLogicalSessionId = this.#logicalSessionId(session);
 			// Preserve legacy identity routing for direct/non-replay session callers.
