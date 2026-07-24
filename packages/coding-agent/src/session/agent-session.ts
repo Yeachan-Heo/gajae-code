@@ -785,6 +785,22 @@ type RetryErrorClassification =
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
+const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
+	"anthropic-messages": new Set([
+		"Provider stream timed out while waiting for the first event",
+		"Anthropic stream timed out while waiting for the first event",
+	]),
+	"openai-completions": new Set([
+		"Provider stream timed out while waiting for the first event",
+		"OpenAI completions stream timed out while waiting for the first event",
+	]),
+} as const;
+
+const ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba-token-plan";
+const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MESSAGES = {
+	"openai-responses": "OpenAI responses stream timed out while waiting for the first event",
+	"openai-completions": "OpenAI completions stream timed out while waiting for the first event",
+} as const;
 
 function hasBareDefaultRetryDisqualifyingFacts(message: AssistantMessage): boolean {
 	if (message.errorKind !== undefined || message.errorStatus !== undefined) return true;
@@ -12432,6 +12448,7 @@ export class AgentSession {
 							}
 							const retryAfterMs = this.#parseRetryAfterMsFromError(message);
 							const shouldRetry =
+								!this.#isTerminalProviderCompactionTimeout(candidate, message) &&
 								retrySettings.enabled &&
 								attempt < retrySettings.maxRetries &&
 								(retryAfterMs !== undefined ||
@@ -12617,7 +12634,61 @@ export class AgentSession {
 	 * unknown/no-code errors are retryable.
 	 */
 
+	#isKimiCodeFirstEventTimeout(message: AssistantMessage): boolean {
+		if (message.stopReason !== "error" || message.provider !== "kimi-code") return false;
+		const errorMessage = message.errorMessage ?? "";
+		if (message.api === "anthropic-messages") {
+			return KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES["anthropic-messages"].has(errorMessage);
+		}
+		if (message.api === "openai-completions") {
+			return KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES["openai-completions"].has(errorMessage);
+		}
+		return false;
+	}
+
+	#isKimiCodeCompactionTimeout(candidate: Model, errorMessage: string): boolean {
+		if (candidate.provider !== "kimi-code") return false;
+		return /^(?:Summarization failed|Turn prefix summarization failed): (?:Provider|Anthropic|OpenAI completions) stream timed out while waiting for the first event$/.test(
+			errorMessage,
+		);
+	}
+
+	#alibabaTokenPlanCanonicalTimeoutForApi(api: string): string | undefined {
+		if (api === "openai-responses" || api === "openai-completions") {
+			return ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MESSAGES[api];
+		}
+		return undefined;
+	}
+
+	#isAlibabaTokenPlanFirstEventTimeout(message: AssistantMessage): boolean {
+		if (message.stopReason !== "error" || message.provider !== ALIBABA_TOKEN_PLAN_PROVIDER) return false;
+		const canonicalMessage = this.#alibabaTokenPlanCanonicalTimeoutForApi(message.api);
+		return canonicalMessage !== undefined && message.errorMessage === canonicalMessage;
+	}
+
+	#isAlibabaTokenPlanCompactionTimeout(candidate: Model, errorMessage: string): boolean {
+		if (candidate.provider !== ALIBABA_TOKEN_PLAN_PROVIDER) return false;
+		const canonicalMessage = this.#alibabaTokenPlanCanonicalTimeoutForApi(candidate.api);
+		if (canonicalMessage === undefined) return false;
+		return (
+			errorMessage === `Summarization failed: ${canonicalMessage}` ||
+			errorMessage === `Turn prefix summarization failed: ${canonicalMessage}`
+		);
+	}
+
+	#isTerminalProviderFirstEventTimeout(message: AssistantMessage): boolean {
+		return this.#isKimiCodeFirstEventTimeout(message) || this.#isAlibabaTokenPlanFirstEventTimeout(message);
+	}
+
+	#isTerminalProviderCompactionTimeout(candidate: Model, errorMessage: string): boolean {
+		return (
+			this.#isKimiCodeCompactionTimeout(candidate, errorMessage) ||
+			this.#isAlibabaTokenPlanCompactionTimeout(candidate, errorMessage)
+		);
+	}
+
 	#isRetryableError(message: AssistantMessage): boolean {
+		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
 		const transportFailure = message.transportFailure;
 		const contextWindow = this.model?.contextWindow ?? 0;
@@ -12765,6 +12836,9 @@ export class AgentSession {
 		// is also authoritative except for rate-limit copy where providers may have
 		// parsed an incidental quota number such as "400 requests per minute".
 		if (isTerminalHttp4xx && (explicitStatus !== undefined || !/rate.?limit|too many requests/i.test(err))) {
+			return "terminal";
+		}
+		if (this.#isTerminalProviderFirstEventTimeout(message)) {
 			return "terminal";
 		}
 		// A first-event timeout on ollama-cloud (the ollama-chat API) must not
@@ -12946,6 +13020,18 @@ export class AgentSession {
 						stopReason: "error",
 						messages: [outcome.message],
 					});
+				},
+			};
+		}
+		if (this.#isTerminalProviderFirstEventTimeout(outcome.failure.message)) {
+			// The managed transport discarded this attempt before session policy saw it.
+			// Remove its provisional controller charge and surface the original message.
+			this.#defaultFallbackChain().discardStartedAttempt();
+			return {
+				type: "terminal",
+				terminal: {
+					stopReason: "error",
+					messages: [outcome.failure.message],
 				},
 			};
 		}

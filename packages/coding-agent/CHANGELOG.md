@@ -4,11 +4,14 @@
 
 ### Fixed
 
+- Alibaba Token Plan canonical first-event timeouts now surface without session retry/fallback replay and are not internally retried by auto-compaction, preventing repeated provider usage (#3026).
+
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
 - Windows managed-session resume no longer reports `durability_failed` when Bun rejects `fsync` on the read-only descriptor used to revalidate an existing canonical binding; Windows now uses an owner-writable descriptor for that durability fence while retaining no-follow and pre/post identity/content checks.
 - SDK daemon CLI end-to-end tests now drain spawned child stdout and stderr concurrently with process exit, preventing CI pipe teardown races from replacing the product exit contract with SIGPIPE status 141 (#3024).
 - Interactive launch bootstrap is now suppressed for parser-accepted `--print=`, `--help=`, and `--version=` equals forms, keeping non-interactive output free of the warming-workspace preamble on TTYs.
 - Managed legacy-session artifact migration now accepts up to 50,000 files, processes copy work in bounded batches, and reports capacity exhaustion separately from unsafe artifact topology (#2935).
+- Kimi Code first-event timeouts now surface after the provider's continuous first-event wait instead of replaying the full request from zero.
 
 - Rejected subagent schema payloads now retain their complete structured data in canonical output artifacts; inline results remain bounded while `agent://` output stays lossless (#2894).
 - Managed legacy-session artifact migration now validates Windows directory roots from the native tree snapshot, tolerates only lazy metadata on plain Windows directories, and replays both clean and cleanup-pending detaches while retaining fail-closed receipt validation. Canonical binding durability sync uses a writable no-follow handle on Windows NTFS stacks that reject `FlushFileBuffers` on read-only handles (#3015, #2913).
