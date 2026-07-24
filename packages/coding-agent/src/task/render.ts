@@ -30,6 +30,7 @@ import {
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine } from "../tui";
 import {
 	collectProviderDegradationGroups,
+	hasActiveProviderRetryInTaskDetails,
 	providerProgressAgeLabel,
 	providerRetryPhaseLabel,
 } from "./provider-retry-status";
@@ -966,7 +967,8 @@ export function renderResult(
 				.u32(spinnerFrame ?? 0)
 				.u32(width)
 				.digest();
-			if (cached?.key === key) return cached.lines;
+			const hasDynamicRetry = hasActiveProviderRetryInTaskDetails(details);
+			if (!hasDynamicRetry && cached?.key === key) return cached.lines;
 
 			const lines: string[] = [];
 
@@ -1011,7 +1013,7 @@ export function renderResult(
 			if (lines.length === 0) {
 				const text = fallbackText.trim() ? fallbackText : "No results";
 				const result = [theme.fg("dim", truncateToWidth(text, width))];
-				cached = { key, lines: result };
+				if (!hasDynamicRetry) cached = { key, lines: result };
 				return result;
 			}
 
@@ -1033,9 +1035,9 @@ export function renderResult(
 			}
 
 			const indented = lines.map(line =>
-				line.length > 0 ? truncateToWidth(`   ${line}`, width, Ellipsis.Omit) : "",
+				line.length > 0 ? truncateToWidth(`   ${replaceTabs(line)}`, width, Ellipsis.Omit) : "",
 			);
-			cached = { key, lines: indented };
+			if (!hasDynamicRetry) cached = { key, lines: indented };
 			return indented;
 		},
 		invalidate() {
@@ -1089,6 +1091,7 @@ function renderNestedTaskTree(
 		}
 		const inflight = details.progress;
 		if (inflight && inflight.length > 0) {
+			lines.push(...renderProviderDegradationNotices(inflight, theme));
 			inflight.forEach((prog, index) => {
 				const isLast = index === inflight.length - 1;
 				lines.push(...renderAgentProgress(prog, isLast, expanded, theme, spinnerFrame, staticTime));

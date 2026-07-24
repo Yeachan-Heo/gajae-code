@@ -402,6 +402,137 @@ describe("subagent await renderer body cache (PR2)", () => {
 		],
 	});
 
+	const nestedRetry = (
+		provider = "anthropic",
+		errorMessage = "Anthropic stream stalled while waiting for the next event",
+	): SubagentToolDetails => ({
+		subagents: [
+			snapshot({
+				id: "0-Nested",
+				liveProgressAvailable: true,
+				progress: progress({
+					id: "0-Nested",
+					currentTool: "task",
+					inflightTaskDetails: {
+						projectAgentsDir: null,
+						results: [],
+						totalDurationMs: 0,
+						progress: [
+							progress({
+								id: "0-Nested.0-Child",
+								retryState: {
+									attempt: 2,
+									maxAttempts: 4,
+									kind: "idle_stream_stall",
+									provider,
+									lastProviderProgressAtMs: 0,
+									delayMs: 60_000,
+									errorMessage,
+									startedAtMs: 0,
+								},
+							}),
+							progress({
+								id: "0-Nested.1-Child",
+								retryState: {
+									attempt: 2,
+									maxAttempts: 4,
+									kind: "idle_stream_stall",
+									provider,
+									lastProviderProgressAtMs: 0,
+									delayMs: 60_000,
+									errorMessage,
+									startedAtMs: 0,
+								},
+							}),
+						],
+					},
+				}),
+			}),
+		],
+	});
+
+	it("refreshes nested retry age and countdown on await-body updates", () => {
+		const details = nestedRetry();
+		const originalNow = Date.now;
+		try {
+			Date.now = () => 20_000;
+			const first = renderWith(details).join("\n");
+			Date.now = () => 35_000;
+			const second = renderWith(details).join("\n");
+
+			expect(first).toContain("provider degraded: 2 subagents retrying on anthropic");
+			expect(first).toContain("last provider progress 20s ago");
+			expect(first).toContain("in 40.0s");
+			expect(second).toContain("last provider progress 35s ago");
+			expect(second).toContain("in 25.0s");
+			expect(second).not.toEqual(first);
+		} finally {
+			Date.now = originalNow;
+		}
+	});
+
+	it("bounds dynamic nested retry lines and sanitizes tabs at narrow widths", () => {
+		const lines = renderWith(nestedRetry("anthropic\tproduction", `provider\terror ${"x".repeat(160)}`), {
+			width: 40,
+		});
+		expect(lines.every(line => Bun.stringWidth(Bun.stripANSI(line)) <= 40)).toBe(true);
+		expect(lines.join("\n")).not.toContain("\t");
+	});
+
+	it("keeps nested retry groups isolated by snapshot and bypasses only their dynamic cache entries", () => {
+		const firstNested = nestedRetry();
+		const secondNested = nestedRetry();
+		secondNested.subagents[0] = snapshot({
+			id: "0-OtherNested",
+			liveProgressAvailable: true,
+			progress: progress({
+				id: "0-OtherNested",
+				currentTool: "task",
+				inflightTaskDetails: firstNested.subagents[0]?.progress?.inflightTaskDetails,
+			}),
+		});
+		const combined: SubagentToolDetails = { subagents: [...firstNested.subagents, ...secondNested.subagents] };
+		const healthy = live("0-Healthy");
+		const originalNow = Date.now;
+		try {
+			Date.now = () => 20_000;
+			renderWith(healthy);
+			expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);
+			expect(subagentBodyCacheTestHooks.size).toBe(1);
+			const first = renderWith(combined).join("\n");
+			Date.now = () => 35_000;
+			const second = renderWith(combined).join("\n");
+			const notice = "provider degraded: 2 subagents retrying on anthropic";
+			expect(first.split(notice).length - 1).toBe(2);
+			expect(second).toContain("last provider progress 35s ago");
+			expect(subagentBodyCacheTestHooks.bodyRenders).toBe(5);
+			expect(subagentBodyCacheTestHooks.size).toBe(1);
+			renderWith(healthy);
+			expect(subagentBodyCacheTestHooks.bodyRenders).toBe(5);
+			expect(subagentBodyCacheTestHooks.size).toBe(1);
+		} finally {
+			Date.now = originalNow;
+		}
+	});
+
+	it("does not aggregate matching retrying siblings from separate await requests", () => {
+		const retryState = {
+			attempt: 1,
+			maxAttempts: 3,
+			kind: "provider_error" as const,
+			provider: "anthropic",
+			delayMs: 10_000,
+			errorMessage: "provider unavailable",
+			startedAtMs: 0,
+		};
+		const request = (id: string): SubagentToolDetails => ({
+			subagents: [snapshot({ id, liveProgressAvailable: true, progress: progress({ id, retryState }) })],
+		});
+		const notice = "provider degraded: 2 subagents retrying on anthropic";
+		expect(renderWith(request("0-RequestA")).join("\n")).not.toContain(notice);
+		expect(renderWith(request("0-RequestB")).join("\n")).not.toContain(notice);
+	});
+
 	it("reuses the cached heavy body across component recreation for identical content", () => {
 		renderWith(live("0-A"));
 		expect(subagentBodyCacheTestHooks.bodyRenders).toBe(1);

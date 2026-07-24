@@ -161,6 +161,62 @@ describe("task renderer: nested live rendering", () => {
 		expect(text).toContain("2.1 Parent>DeltaSub");
 	});
 
+	it("aggregates nested same-provider retries and refreshes their age without content mutation", async () => {
+		const retryingChild = (id: string): AgentProgress => ({
+			...makeRunningSubProgress(id, `${id} retrying`),
+			retryState: {
+				attempt: 2,
+				maxAttempts: 4,
+				kind: "idle_stream_stall",
+				provider: "anthropic",
+				lastProviderProgressAtMs: 0,
+				delayMs: 60_000,
+				errorMessage: "Anthropic stream stalled while waiting for the next event",
+				startedAtMs: 0,
+			},
+		});
+		const parent = makeRunningProgress({
+			id: "2-NestedRetryParent",
+			currentTool: "task",
+			inflightTaskDetails: {
+				projectAgentsDir: null,
+				results: [],
+				totalDurationMs: 0,
+				progress: [retryingChild("2-NestedRetryParent.0-Alpha"), retryingChild("2-NestedRetryParent.1-Beta")],
+			},
+		});
+		const theme = (await getThemeByName("red-claw"))!;
+		const component = taskToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "Running 1 agents..." }],
+				details: {
+					projectAgentsDir: null,
+					results: [],
+					totalDurationMs: 0,
+					progress: [parent],
+				} satisfies TaskToolDetails,
+			},
+			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			theme,
+		);
+		const originalNow = Date.now;
+		try {
+			Date.now = () => 20_000;
+			const first = Bun.stripANSI(component.render(160).join("\n"));
+			Date.now = () => 35_000;
+			const second = Bun.stripANSI(component.render(160).join("\n"));
+
+			const notice = "provider degraded: 2 subagents retrying on anthropic";
+			expect(first).toContain(notice);
+			expect(first.split(notice).length - 1).toBe(1);
+			expect(first).toContain("last provider progress 20s ago");
+			expect(second).toContain("last provider progress 35s ago");
+			expect(second).not.toEqual(first);
+		} finally {
+			Date.now = originalNow;
+		}
+	});
+
 	it("renders requested model substitution in live progress", async () => {
 		const text = await render(
 			makeRunningProgress({
@@ -220,5 +276,62 @@ describe("task renderer: nested live rendering", () => {
 		const zetaIdx = text.indexOf("Zeta running");
 		// Completed entries are emitted before the in-flight snapshot.
 		expect(epsilonIdx).toBeLessThan(zetaIdx);
+	});
+	it("aggregates direct retry siblings once per owning list without hiding healthy or separate nested work", async () => {
+		const retry = (id: string): AgentProgress => ({
+			...makeRunningSubProgress(id, `${id}\tretrying`),
+			retryState: {
+				attempt: 1,
+				maxAttempts: 3,
+				kind: "idle_stream_stall",
+				provider: "anthropic",
+				lastProviderProgressAtMs: 0,
+				delayMs: 60_000,
+				errorMessage: `stream\tstalled ${"x".repeat(120)}`,
+				startedAtMs: 0,
+			},
+		});
+		const healthy = makeRunningSubProgress("5-Parent.2-Healthy", "Healthy child remains visible");
+		const parent = makeRunningProgress({
+			id: "5-Parent",
+			currentTool: "task",
+			inflightTaskDetails: {
+				projectAgentsDir: null,
+				results: [],
+				totalDurationMs: 0,
+				progress: [retry("5-Parent.0-First"), retry("5-Parent.1-Second"), healthy],
+			},
+			extractedToolData: {
+				task: [
+					{ projectAgentsDir: null, results: [], totalDurationMs: 0, progress: [retry("5-Elsewhere.0-Only")] },
+				],
+			},
+		});
+		const theme = (await getThemeByName("red-claw"))!;
+		const component = taskToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "Running" }],
+				details: { projectAgentsDir: null, results: [], totalDurationMs: 0, progress: [parent] },
+			},
+			{ expanded: true, isPartial: true, spinnerFrame: 0 },
+			theme,
+		);
+		const originalNow = Date.now;
+		try {
+			Date.now = () => 20_000;
+			const first = Bun.stripANSI(component.render(160).join("\n"));
+			Date.now = () => 35_000;
+			const second = Bun.stripANSI(component.render(160).join("\n"));
+			const notice = "provider degraded: 2 subagents retrying on anthropic";
+			expect(first.split(notice).length - 1).toBe(1);
+			expect(first).toContain("Healthy child remains visible");
+			expect(first.indexOf("5.0 Parent>First")).toBeLessThan(first.indexOf("Healthy child remains visible"));
+			expect(first).toContain("last provider progress 20s ago");
+			expect(second).toContain("last provider progress 35s ago");
+			expect(first).not.toContain("\t");
+			expect(component.render(40).every(line => Bun.stringWidth(Bun.stripANSI(line)) <= 40)).toBe(true);
+		} finally {
+			Date.now = originalNow;
+		}
 	});
 });

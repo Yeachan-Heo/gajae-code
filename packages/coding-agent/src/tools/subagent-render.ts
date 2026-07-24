@@ -13,6 +13,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import {
 	collectProviderDegradationGroups,
+	hasActiveProviderRetryInProgress,
 	providerProgressAgeLabel,
 	providerRetryPhaseLabel,
 } from "../task/provider-retry-status";
@@ -47,7 +48,8 @@ const PREVIEW_LINE_WIDTH = 80;
  * wall-clock displays are deliberately kept OUT of the cached body — the animated
  * spinner and the fresh duration live in the cheap per-subagent status line, and
  * `renderSubagentLiveProgress` is invoked with `staticTime` so current-tool elapsed
- * and retry countdowns are never baked into cached lines.
+ * and retry countdowns are never baked into cached lines. Snapshots with an active
+ * retry anywhere in their nested task tree bypass this cache and render dynamically.
  */
 const SUBAGENT_BODY_CACHE_MAX = 128;
 const subagentBodyCache = new Map<bigint, string[]>();
@@ -82,6 +84,15 @@ export const subagentBodyCacheTestHooks = {
 	},
 };
 
+function snapshotHasActiveRetry(snapshot: SubagentSnapshot): boolean {
+	if (snapshot.liveProgressAvailable === false || !snapshot.progress) return false;
+	return hasActiveProviderRetryInProgress(snapshot.progress);
+}
+
+function boundSubagentBodyLines(lines: string[], width: number): string[] {
+	return lines.map(line => (line.length > 0 ? truncateToWidth(replaceTabs(line), width, Ellipsis.Omit) : ""));
+}
+
 function renderCachedSubagentBody(
 	snapshot: SubagentSnapshot,
 	signature: string,
@@ -97,9 +108,7 @@ function renderCachedSubagentBody(
 		subagentBodyCache.set(key, hit);
 		return hit;
 	}
-	const lines = renderSubagentSnapshotBody(snapshot, expanded, theme).map(line =>
-		line.length > 0 ? truncateToWidth(line, width, Ellipsis.Omit) : "",
-	);
+	const lines = boundSubagentBodyLines(renderSubagentSnapshotBody(snapshot, expanded, theme), width);
 	subagentBodyRenderCount += 1;
 	subagentBodyCache.set(key, lines);
 	if (subagentBodyCache.size > SUBAGENT_BODY_CACHE_MAX) {
@@ -107,6 +116,16 @@ function renderCachedSubagentBody(
 		if (oldest !== undefined) subagentBodyCache.delete(oldest);
 	}
 	return lines;
+}
+
+function renderDynamicSubagentBody(
+	snapshot: SubagentSnapshot,
+	expanded: boolean,
+	width: number,
+	theme: Theme,
+): string[] {
+	subagentBodyRenderCount += 1;
+	return boundSubagentBodyLines(renderSubagentSnapshotBody(snapshot, expanded, theme, false), width);
 }
 
 function statusIconKind(status: SubagentSnapshot["status"]): ToolUIStatus {
@@ -147,10 +166,14 @@ function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spin
 	return `${icon} ${id} ${status} ${duration}`;
 }
 
-// Heavy, cacheable per-subagent body: a pure function of (snapshot content, expanded,
-// theme). No spinner frame and no wall-clock displays leak in (live progress uses
-// `staticTime`), so the module body cache can never serve stale or frozen-ticking lines.
-function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolean, theme: Theme): string[] {
+// Heavy per-subagent body. The cache path uses staticTime=true; the bounded dynamic
+// path opts into wall-clock displays when an active retry exists in the nested tree.
+function renderSubagentSnapshotBody(
+	snapshot: SubagentSnapshot,
+	expanded: boolean,
+	theme: Theme,
+	staticTime = true,
+): string[] {
 	const lines: string[] = [];
 
 	// Static receipt fields (parity with the markdown content for non-await actions).
@@ -185,9 +208,9 @@ function renderSubagentSnapshotBody(snapshot: SubagentSnapshot, expanded: boolea
 	// exists (subagent.ts #liveProgressFields), but the renderer also honors an
 	// explicit `liveProgressAvailable: false` so stale retained progress can never
 	// resurrect a live panel (AC5). `staticTime` keeps wall-clock displays out of
-	// these cached lines.
+	// cached lines when the body is served by the cache.
 	if (snapshot.progress && snapshot.liveProgressAvailable !== false) {
-		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, true)) {
+		for (const pl of renderSubagentLiveProgress(snapshot.progress, expanded, theme, undefined, staticTime)) {
 			lines.push(`  ${pl}`);
 		}
 	} else if (snapshot.liveProgressAvailable && (snapshot.status === "running" || snapshot.status === "queued")) {
@@ -262,11 +285,17 @@ export const subagentToolRenderer = {
 					},
 					theme,
 				);
-				const out: string[] = [truncateToWidth(header, width, Ellipsis.Omit)];
+				const out: string[] = [truncateToWidth(replaceTabs(header), width, Ellipsis.Omit)];
 				// Discoverability: the inline panel is a bounded preview; the session
 				// observer (ctrl+s) streams the full per-subagent message history.
 				if (runningCount > 0) {
-					out.push(truncateToWidth(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`, width, Ellipsis.Omit));
+					out.push(
+						truncateToWidth(
+							replaceTabs(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`),
+							width,
+							Ellipsis.Omit,
+						),
+					);
 				}
 				const liveProgress = subagents.flatMap(snapshot =>
 					snapshot.progress && snapshot.liveProgressAvailable !== false ? [snapshot.progress] : [],
@@ -274,7 +303,9 @@ export const subagentToolRenderer = {
 				for (const group of collectProviderDegradationGroups(liveProgress)) {
 					out.push(
 						truncateToWidth(
-							`  ${theme.fg("warning", `provider degraded: ${group.count} subagents retrying on ${group.provider}`)}`,
+							replaceTabs(
+								`  ${theme.fg("warning", `provider degraded: ${group.count} subagents retrying on ${group.provider}`)}`,
+							),
 							width,
 							Ellipsis.Omit,
 						),
@@ -285,15 +316,19 @@ export const subagentToolRenderer = {
 					subagentAwaitRenderedStateSignature([snapshot], result.details),
 				);
 				subagents.forEach((snapshot, index) => {
-					// Fresh per-subagent status line (cheap), then the cached heavy body.
+					// Fresh per-subagent status line (cheap), then a cached or dynamic body.
 					out.push(
 						truncateToWidth(
-							renderSubagentStatusLine(snapshot, theme, options.spinnerFrame),
+							replaceTabs(renderSubagentStatusLine(snapshot, theme, options.spinnerFrame)),
 							width,
 							Ellipsis.Omit,
 						),
 					);
-					out.push(...renderCachedSubagentBody(snapshot, snapshotSignatures![index]!, expanded, width, theme));
+					out.push(
+						...(snapshotHasActiveRetry(snapshot)
+							? renderDynamicSubagentBody(snapshot, expanded, width, theme)
+							: renderCachedSubagentBody(snapshot, snapshotSignatures![index]!, expanded, width, theme)),
+					);
 				});
 				return out;
 			},

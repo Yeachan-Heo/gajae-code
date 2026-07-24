@@ -1,4 +1,4 @@
-import type { AgentProgress } from "./types";
+import type { AgentProgress, TaskToolDetails } from "./types";
 
 export type ProviderRetryKind = NonNullable<AgentProgress["retryState"]>["kind"];
 
@@ -31,6 +31,43 @@ export function providerProgressAgeLabel(retryState: NonNullable<AgentProgress["
 	if (retryState.lastProviderProgressAtMs === undefined) return "no provider events yet";
 	const ageSeconds = Math.max(0, Math.floor((nowMs - retryState.lastProviderProgressAtMs) / 1000));
 	return `last provider progress ${ageSeconds}s ago`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object";
+}
+
+function isTaskToolDetails(value: unknown): value is TaskToolDetails {
+	return (
+		isRecord(value) && Array.isArray(value.results) && (value.progress === undefined || Array.isArray(value.progress))
+	);
+}
+
+function isAgentProgress(value: unknown): value is AgentProgress {
+	return isRecord(value) && typeof value.status === "string";
+}
+
+export function hasActiveProviderRetryInTaskDetails(details: TaskToolDetails, seen = new WeakSet<object>()): boolean {
+	if (!isTaskToolDetails(details) || seen.has(details)) return false;
+	seen.add(details);
+	for (const progress of details.progress ?? []) {
+		if (isAgentProgress(progress) && hasActiveProviderRetryInProgress(progress, seen)) return true;
+	}
+	return false;
+}
+
+export function hasActiveProviderRetryInProgress(progress: AgentProgress, seen = new WeakSet<object>()): boolean {
+	if (!isAgentProgress(progress) || seen.has(progress)) return false;
+	seen.add(progress);
+	if (progress.status === "running" && progress.retryState) return true;
+
+	const nestedTaskData = isRecord(progress.extractedToolData) ? progress.extractedToolData.task : undefined;
+	if (Array.isArray(nestedTaskData)) {
+		for (const nestedDetails of nestedTaskData) {
+			if (hasActiveProviderRetryInTaskDetails(nestedDetails as TaskToolDetails, seen)) return true;
+		}
+	}
+	return hasActiveProviderRetryInTaskDetails(progress.inflightTaskDetails as TaskToolDetails, seen);
 }
 
 export interface ProviderDegradationGroup {
