@@ -2515,11 +2515,11 @@ describe("telegram daemon", () => {
 			}),
 		);
 	}
-	test("keeps wire protocol 3 while generation 28 rejects special-file authority", () => {
+	test("keeps wire protocol 3 while generation 29 adds structural lifecycle safeguards", () => {
 		expect(NOTIFICATION_PROTOCOL_VERSION).toBe(3);
-		// Generation 27 refreshes native authority; generation 28 rejects special
-		// files before authority opens.
-		expect(DAEMON_GENERATION).toBe(28);
+		// Generation 29 layers serving-epoch convergence, sidecar heartbeat, root GC,
+		// and Bot API cooldown hardening onto generations 27-28 authority changes.
+		expect(DAEMON_GENERATION).toBe(29);
 	});
 	test.each(["1", 0, -1, 1.5, 2 ** 53, Number.NaN])(
 		"servingEpoch %p is malformed and has no lifecycle authority",
@@ -3397,16 +3397,22 @@ describe("telegram daemon", () => {
 		expect(after.roots).toContain(path.join(cwd, ".gjc", "state"));
 	});
 
-	test("detailed ensure reports reloaded only for the existing fresh-owner reloadRequired handoff", async () => {
+	test("D6a: epoch-1-to-epoch-2 convergence reloads exactly one ready owner before replacement polling", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, servingEpoch: undefined, heartbeatAt: Date.now() });
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION, servingEpoch: undefined, heartbeatAt: Date.now() });
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
+		let spawns = 0;
+		let oldAliveAtSpawn: boolean | undefined;
 		const child = readyTelegramSpawnFixture({
 			settings: s,
 			firstChildPid: 4244,
-			onSpawn: pid => alive.add(pid),
+			onSpawn: () => {
+				spawns++;
+				oldAliveAtSpawn = alive.has(999);
+				alive.add(4244);
+			},
 		});
 		const result = await ensureTelegramDaemonRunningDetailed(
 			{ settings: s, cwd: path.join(agentDir, "new-session"), sessionId: "new-session" },
@@ -3432,6 +3438,60 @@ describe("telegram daemon", () => {
 		);
 		expect(result).toBe("reloaded");
 		expect(signals).toContainEqual([999, "SIGTERM"]);
+		expect(spawns).toBe(1);
+		expect(oldAliveAtSpawn).toBe(false);
+		const after = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8"));
+		expect(after).toMatchObject({ generation: DAEMON_GENERATION, servingEpoch: SERVING_EPOCH, ownershipPhase: "ready" });
+	});
+	test("D6b: forced hard-kill waits for captured-owner death before spawning a single replacement", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		let now = 101;
+		const alive = new Set<number>([999]);
+		const signals: Array<[number, NodeJS.Signals]> = [];
+		let oldAliveAtSpawn: boolean | undefined;
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION, heartbeatAt: 100 });
+		const child = readyTelegramSpawnFixture({
+			settings: s,
+			firstChildPid: 4244,
+			now: () => now,
+			onSpawn: () => {
+				oldAliveAtSpawn = alive.has(999);
+				alive.add(4244);
+			},
+		});
+		const result = await new TelegramDaemonController(s, {
+			platform: "linux",
+			now: () => now,
+			ownerPid: 4242,
+			pidAlive: pid => alive.has(pid),
+			pidIncarnation: () => "linux:100",
+			processReference: pid =>
+				pid === 999
+					? {
+							incarnation: "linux:100",
+							termination: "cooperative",
+							signalRoot: signal => {
+								signals.push([pid, signal]);
+								if (signal === "SIGKILL") alive.delete(pid);
+							},
+						}
+					: undefined,
+			spawn: child.spawn,
+			sleep: async ms => {
+				now += ms;
+				if (!alive.has(999)) await child.sleep();
+			},
+			waitStepMs: 1,
+			readinessTimeoutMs: 2,
+		}).reload({ force: true, gracefulTimeoutMs: 1, killTimeoutMs: 1 });
+		expect(result.ok).toBe(true);
+		expect(signals).toEqual([
+			[999, "SIGTERM"],
+			[999, "SIGKILL"],
+		]);
+		expect(oldAliveAtSpawn).toBe(false);
+		expect(signals.some(([pid]) => pid === 4244)).toBe(false);
 	});
 	test("cooldown waits for a provisional successor's ready provenance before attaching", async () => {
 		const agentDir = tempAgentDir();
@@ -8075,7 +8135,7 @@ describe("telegram daemon connection-drop resilience", () => {
 		expect(FakeWs.instances[1]!.readyState).toBe(FakeWs.OPEN);
 	});
 
-	test("stale CONNECTING predecessor is replaced and cannot publish or route after delayed open", async () => {
+	test("D6c: connect-only empty replay creates no topic until one identity frame arrives", async () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
@@ -8126,8 +8186,10 @@ describe("telegram daemon connection-drop resilience", () => {
 			id: active.replayId,
 			generation: 1,
 			lastSeq: 0,
-			events: [{ payload: { type: "identity_header", sessionId: "S", repo: "r", branch: "b" } }],
+			events: [],
 		});
+		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+		await daemon.handleSessionMessage(active, { type: "identity_header", sessionId: "S", repo: "r", branch: "b" });
 		expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
 		await daemon.handleSessionMessage(active, { type: "turn_stream", sessionId: "S", text: "successor routes" });
 		expect(
