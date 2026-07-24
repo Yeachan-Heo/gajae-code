@@ -171,9 +171,14 @@ function legalOutcome(outcome: NativePublishOutcome): boolean {
 			outcome.durabilityState === "not_attempted" &&
 			preMutationReasons.has(outcome.reason) &&
 			((outcome.phase === "rename" &&
-				["destination_exists", "atomic_unavailable", "cross_device", "permission_denied", "io_failure"].includes(
-					outcome.reason,
-				)) ||
+				[
+					"destination_exists",
+					"atomic_unavailable",
+					"cross_device",
+					"permission_denied",
+					"io_failure",
+					"interrupted",
+				].includes(outcome.reason)) ||
 				(outcome.phase === "preflight" &&
 					!["atomic_unavailable", "cross_device", "interrupted"].includes(outcome.reason)) ||
 				(outcome.phase === "file_sync" && outcome.reason === "io_failure"))

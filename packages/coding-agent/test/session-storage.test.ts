@@ -72,6 +72,14 @@ describe("native publish outcome classification", () => {
 			["cross_device", "cross_device"],
 			["permission_denied", "permission_denied"],
 			["io_failure", "io_error"],
+			// A signal landing on the no-replace rename syscall before it enters the
+			// kernel never mutates the filesystem, so a pre-mutation "interrupted"
+			// envelope for the rename phase must classify (and permit staging
+			// cleanup) exactly like the other retryable pre-mutation reasons above.
+			// Regression coverage for a large legacy-session migration crashing with
+			// an uncaught "durability_failed" the first time a rename syscall was
+			// interrupted partway through migrating thousands of artifact files.
+			["interrupted", "interrupted"],
 		] as const) {
 			const outcome = classifyNativePublishOutcome({ ...preMutation, reason, code, phase: "rename" });
 			expect(outcome.reason).toBe(reason);

@@ -224,7 +224,12 @@ impl NativeNoReplaceResult {
 				Some("reparse_point" | "identity_mismatch") => {
 					("not_committed", "not_attempted", "identity_violation")
 				},
-				// EINTR and unclassified failures leave the syscall's namespace effect
+				// A signal landing before the syscall entered the kernel (or between
+				// retries exhausting the bounded restart loop) never mutates the
+				// filesystem: rename()/renameat2()/renameatx_np() are not partially
+				// observable on EINTR for local filesystems, unlike e.g. close().
+				Some("interrupted") => ("not_committed", "not_attempted", "interrupted"),
+				// Unclassified failures leave the syscall's namespace effect
 				// ambiguous. Never authorize staging cleanup from them.
 				_ => ("unknown", "not_provable", "unknown"),
 			}
@@ -1042,6 +1047,42 @@ pub(crate) mod platform {
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, digest_reader, io_code, security_io_code, sha256,
 	};
+
+	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
+	/// arriving mid-syscall leaves no filesystem side effect (the syscall never
+	/// committed), so restarting is always safe; the bound only guards against a
+	/// pathological signal storm turning a retry loop into a hang.
+	const EINTR_RETRY_LIMIT: u32 = 8;
+
+	/// Test-only fault injection: the next N calls into the no-replace rename
+	/// primitive report a synthetic EINTR before the real syscall runs, letting
+	/// tests exercise the restart loop without racing a real signal.
+	#[cfg(test)]
+	thread_local! {
+		static RENAME_NO_REPLACE_EINTR_INJECT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+	}
+
+	#[cfg(test)]
+	pub(super) fn inject_rename_no_replace_eintr(count: u32) {
+		RENAME_NO_REPLACE_EINTR_INJECT.with(|remaining| remaining.set(count));
+	}
+
+	#[cfg(test)]
+	fn take_injected_rename_no_replace_eintr() -> bool {
+		RENAME_NO_REPLACE_EINTR_INJECT.with(|remaining| {
+			let current = remaining.get();
+			if current == 0 {
+				return false;
+			}
+			remaining.set(current - 1);
+			true
+		})
+	}
+
+	#[cfg(not(test))]
+	fn take_injected_rename_no_replace_eintr() -> bool {
+		false
+	}
 
 	#[cfg(test)]
 	static AFTER_EXCHANGE_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
@@ -2299,32 +2340,42 @@ pub(crate) mod platform {
 		source: &CString,
 		destination: &CString,
 	) -> Result<(), &'static str> {
-		// SAFETY: the descriptor and both NUL-terminated CString pointers remain valid.
-		let result = unsafe {
-			libc::syscall(
-				libc::SYS_renameat2,
-				source_parent_fd,
-				source.as_ptr(),
-				destination_parent_fd,
-				destination.as_ptr(),
-				libc::RENAME_NOREPLACE,
-			)
-		};
-		if result == 0 {
-			Ok(())
-		} else {
+		// A signal delivered while the syscall is blocked yields EINTR without any
+		// filesystem side effect (the rename simply did not happen yet). POSIX
+		// wrappers conventionally restart in that case; retry a bounded number of
+		// times so a stray signal during a large migration cannot surface as a
+		// spurious, unretried failure. Any other errno is returned immediately.
+		for _ in 0..EINTR_RETRY_LIMIT {
+			if take_injected_rename_no_replace_eintr() {
+				continue;
+			}
+			// SAFETY: the descriptor and both NUL-terminated CString pointers remain valid.
+			let result = unsafe {
+				libc::syscall(
+					libc::SYS_renameat2,
+					source_parent_fd,
+					source.as_ptr(),
+					destination_parent_fd,
+					destination.as_ptr(),
+					libc::RENAME_NOREPLACE,
+				)
+			};
+			if result == 0 {
+				return Ok(());
+			}
 			match std::io::Error::last_os_error().raw_os_error() {
-				Some(libc::EEXIST) => Err("quarantine_collision"),
-				Some(libc::ENOSYS) => Err("atomic_unavailable"),
+				Some(libc::EEXIST) => return Err("quarantine_collision"),
+				Some(libc::ENOSYS) => return Err("atomic_unavailable"),
 				// Fixed no-replace syscall arguments make EINVAL an invocation/filesystem
 				// divergence, not proof that the primitive is unavailable.
-				Some(libc::EINVAL) => Err("invalid_request"),
-				Some(libc::EXDEV) => Err("cross_device"),
-				Some(libc::EACCES | libc::EPERM) => Err("permission_denied"),
-				Some(libc::EINTR) => Err("interrupted"),
-				_ => Err("io_error"),
+				Some(libc::EINVAL) => return Err("invalid_request"),
+				Some(libc::EXDEV) => return Err("cross_device"),
+				Some(libc::EACCES | libc::EPERM) => return Err("permission_denied"),
+				Some(libc::EINTR) => continue,
+				_ => return Err("io_error"),
 			}
 		}
+		Err("interrupted")
 	}
 
 	#[cfg(target_os = "linux")]
@@ -2375,29 +2426,39 @@ pub(crate) mod platform {
 		destination: &CString,
 	) -> Result<(), &'static str> {
 		const RENAME_EXCL: u32 = 0x0000_0004;
-		// SAFETY: both descriptors and NUL-terminated CString pointers remain valid.
-		if unsafe {
-			renameatx_np(
-				source_parent_fd,
-				source.as_ptr(),
-				destination_parent_fd,
-				destination.as_ptr(),
-				RENAME_EXCL,
-			)
-		} == 0
-		{
-			Ok(())
-		} else {
+		// A signal delivered while the syscall is blocked yields EINTR without any
+		// filesystem side effect (the rename simply did not happen yet). POSIX
+		// wrappers conventionally restart in that case; retry a bounded number of
+		// times so a stray signal during a large migration cannot surface as a
+		// spurious, unretried failure. Any other errno is returned immediately.
+		for _ in 0..EINTR_RETRY_LIMIT {
+			if take_injected_rename_no_replace_eintr() {
+				continue;
+			}
+			// SAFETY: both descriptors and NUL-terminated CString pointers remain valid.
+			let result = unsafe {
+				renameatx_np(
+					source_parent_fd,
+					source.as_ptr(),
+					destination_parent_fd,
+					destination.as_ptr(),
+					RENAME_EXCL,
+				)
+			};
+			if result == 0 {
+				return Ok(());
+			}
 			match std::io::Error::last_os_error().raw_os_error() {
-				Some(libc::EEXIST) => Err("quarantine_collision"),
-				Some(libc::ENOSYS) => Err("atomic_unavailable"),
-				Some(libc::EINVAL) => Err("invalid_request"),
-				Some(libc::EXDEV) => Err("cross_device"),
-				Some(libc::EACCES | libc::EPERM) => Err("permission_denied"),
-				Some(libc::EINTR) => Err("interrupted"),
-				_ => Err("io_error"),
+				Some(libc::EEXIST) => return Err("quarantine_collision"),
+				Some(libc::ENOSYS) => return Err("atomic_unavailable"),
+				Some(libc::EINVAL) => return Err("invalid_request"),
+				Some(libc::EXDEV) => return Err("cross_device"),
+				Some(libc::EACCES | libc::EPERM) => return Err("permission_denied"),
+				Some(libc::EINTR) => continue,
+				_ => return Err("io_error"),
 			}
 		}
+		Err("interrupted")
 	}
 
 	#[cfg(target_os = "macos")]
@@ -5811,6 +5872,100 @@ mod retained_broker_publication_tests {
 
 		assert_eq!(publication.observe(), "replaced");
 		assert_eq!(publication.heartbeat("not-a-timestamp"), "ambiguous");
+	}
+}
+
+/// Regression coverage for a large legacy-session migration crashing with
+/// `durability_failed`: a signal landing mid-syscall on the no-replace rename
+/// primitive (used to publish every migrated artifact file) used to surface
+/// as a single unretried EINTR, which the JS layer's exhaustive reason match
+/// falls back to classifying as a fatal, unrecoverable durability failure —
+/// even though nothing was ever mutated. Migrating thousands of artifacts
+/// performs thousands of these renames, making a stray signal increasingly
+/// likely to hit over the course of one migration. The fix restarts the
+/// syscall on EINTR (bounded, since nothing committed) instead of failing.
+#[cfg(all(test, unix))]
+mod rename_no_replace_eintr_tests {
+	use std::{
+		path::PathBuf,
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::{platform, rename_no_replace_path};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"gjc-rename-no-replace-eintr-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+			));
+			std::fs::create_dir(&path).expect("create eintr temp directory");
+			// macOS's default temp root (/var/...) is itself a symlink to
+			// /private/var/...; the no-replace rename primitive under test walks
+			// every path component with O_NOFOLLOW and fails closed on any
+			// symlink, so the canonical (fully resolved) path is required here.
+			let resolved = std::fs::canonicalize(&path).expect("canonicalize eintr temp directory");
+			Self(resolved)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[test]
+	fn rename_no_replace_restarts_past_transient_eintr() {
+		let dir = TempDir::new();
+		let source = dir.0.join("source.tmp");
+		let destination = dir.0.join("destination.tmp");
+		std::fs::write(&source, b"payload").expect("write rename source");
+
+		// Fewer injected EINTRs than the retry bound: the rename must still
+		// commit, proving a stray signal no longer aborts the migration.
+		platform::inject_rename_no_replace_eintr(3);
+		let result = rename_no_replace_path(
+			source.to_string_lossy().into_owned(),
+			destination.to_string_lossy().into_owned(),
+		);
+		assert!(result.ok, "{:?} / {}", result.code, result.reason);
+		assert_eq!(result.reason, "none");
+		assert_eq!(
+			std::fs::read(&destination).expect("read migrated destination"),
+			b"payload"
+		);
+	}
+
+	#[test]
+	fn rename_no_replace_still_fails_closed_once_eintr_exhausts_the_retry_bound() {
+		let dir = TempDir::new();
+		let source = dir.0.join("source.tmp");
+		let destination = dir.0.join("destination.tmp");
+		std::fs::write(&source, b"payload").expect("write rename source");
+
+		// More injected EINTRs than the retry bound: the bound must still be
+		// enforced so a genuine signal storm cannot hang the migration forever.
+		platform::inject_rename_no_replace_eintr(64);
+		let result = rename_no_replace_path(
+			source.to_string_lossy().into_owned(),
+			destination.to_string_lossy().into_owned(),
+		);
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("interrupted"));
+		assert_eq!(result.reason, "interrupted");
+		assert_eq!(result.mutation_state, "not_committed");
+		// Nothing committed: the source is untouched and no destination exists.
+		assert_eq!(std::fs::read(&source).expect("read retained source"), b"payload");
+		assert!(!destination.exists());
+
+		// Clear the injector so later tests in this process are unaffected.
+		platform::inject_rename_no_replace_eintr(0);
 	}
 }
 
