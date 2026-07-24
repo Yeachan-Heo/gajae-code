@@ -7618,6 +7618,10 @@ export class TelegramNotificationDaemon {
 					this.topics.get(logicalSessionId)?.bindingMalformed
 				)
 					return;
+				if (!toolFrameIsCurrent()) {
+					abandonStaleToolStart();
+					return;
+				}
 				await this.deliverFlatFallback(logicalSessionId, send, toolActivity, socketLease);
 				return;
 			}
