@@ -66,6 +66,26 @@ describe("composer layout allocation", () => {
 			}),
 		).toMatchObject({ transcriptRows: 0, editorMaxRows: 3, autocompleteRows: 0 });
 	});
+
+	it("collapses optional widgets before they can displace the editor on a small terminal", () => {
+		expect(
+			allocateComposerLayout({
+				terminalRows: 8,
+				editorRows: 18,
+				statusRows: 1,
+				widgetRowsAbove: 4,
+				widgetRowsBelow: 12,
+				autocompleteRows: 0,
+			}),
+		).toEqual({
+			transcriptRows: 1,
+			editorMaxRows: 6,
+			statusRows: 1,
+			widgetRowsAbove: 0,
+			widgetRowsBelow: 0,
+			autocompleteRows: 0,
+		});
+	});
 });
 
 describe("sticky transcript viewport behavior", () => {
@@ -219,6 +239,62 @@ describe("InteractiveMode transcript integration", () => {
 		const revealed = mode.ui.renderWithViewportAnchors(60);
 		expect(revealed.anchors.some(anchor => anchor?.id === target!.id)).toBe(true);
 		expect(mode.transcriptViewport.getState().followTail).toBe(false);
+	});
+
+	it("keeps the same durable message point visible across transcript width reflow", async () => {
+		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+		await mode.init();
+		mode.transcriptViewport.setHeight(4);
+		for (let index = 0; index < 6; index++) {
+			mode.addMessageToChat({
+				role: "user",
+				content: `durable ${index} ${"한글 semantic viewport ".repeat(8)}`,
+				timestamp: index + 1,
+			});
+		}
+		mode.editor.setText("draft wrapping changes the composer height ".repeat(24));
+		const fullTranscript = mode.chatContainer.renderWithViewportAnchors(80);
+		const target = fullTranscript.anchors.find(anchor => anchor !== null && anchor.graphemeStart > 0);
+		expect(target).not.toBeNull();
+		mode.ui.renderWithViewportAnchors(80);
+		expect(mode.ui.revealViewportAnchor(target!.id, "top")).toBe(true);
+
+		const wide = mode.ui.renderWithViewportAnchors(80);
+		const wideAnchor = wide.anchors.find(anchor => anchor?.id === target!.id);
+		expect(wideAnchor).not.toBeNull();
+		const narrow = mode.ui.renderWithViewportAnchors(32);
+		const restored = narrow.anchors.find(anchor => anchor?.id === target!.id);
+
+		expect(restored).not.toBeNull();
+		expect(restored!.graphemeStart).toBeLessThanOrEqual(wideAnchor!.graphemeStart);
+		expect(restored!.graphemeEnd).toBeGreaterThan(wideAnchor!.graphemeStart);
+		expect(mode.transcriptViewport.getState().followTail).toBe(false);
+	});
+
+	it("does not turn trailing unanchored status rows into unseen transcript content after reflow", async () => {
+		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+		await mode.init();
+		mode.transcriptViewport.setHeight(4);
+		for (let index = 0; index < 4; index++) {
+			mode.addMessageToChat({ role: "user", content: `seen ${index} ${"한글 ".repeat(12)}`, timestamp: index + 1 });
+		}
+		mode.statusContainer.addChild(new Text("unanchored status\nunanchored detail"));
+		mode.ui.renderWithViewportAnchors(80);
+		mode.transcriptViewport.scrollBy(-2);
+
+		mode.ui.renderWithViewportAnchors(32);
+		expect(mode.transcriptViewport.getState().unseenRows).toBe(0);
+		mode.btwContainer.addChild(new Text("unseen unanchored row"));
+		mode.ui.renderWithViewportAnchors(32);
+		const unanchoredUnseenRows = mode.transcriptViewport.getState().unseenRows;
+		expect(unanchoredUnseenRows).toBeGreaterThan(0);
+
+		mode.addMessageToChat({ role: "user", content: `new durable ${"추가 ".repeat(10)}`, timestamp: 10 });
+		mode.ui.renderWithViewportAnchors(64);
+		const unseenAfterAppend = mode.transcriptViewport.getState().unseenRows;
+		expect(unseenAfterAppend).toBeGreaterThan(unanchoredUnseenRows);
+		mode.ui.renderWithViewportAnchors(28);
+		expect(mode.transcriptViewport.getState().unseenRows).toBeGreaterThanOrEqual(unseenAfterAppend);
 	});
 	it("replaces the editor once, transfers layout and text, and preserves overlay focus", () => {
 		mode.editor.setText("preserved draft");

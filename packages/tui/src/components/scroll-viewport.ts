@@ -1,8 +1,18 @@
 import type { Component } from "../tui";
 
+export interface ScrollViewportReflowAnchor {
+	id: string;
+	graphemeOffset: number;
+	viewportRow: number;
+}
+
 export interface ScrollViewportSource {
 	getRowCount(width: number): number;
 	renderRows(width: number, startRow: number, endRow: number): string[];
+	captureReflowAnchor?(startRow: number, endRow: number): ScrollViewportReflowAnchor | undefined;
+	resolveReflowAnchor?(anchor: ScrollViewportReflowAnchor): number | undefined;
+	captureReflowSeenState?(rowExclusive: number): unknown;
+	resolveReflowUnseenRows?(seenState: unknown): number | undefined;
 }
 
 export interface ScrollViewportOptions {
@@ -35,6 +45,16 @@ export class ScrollViewport implements Component {
 	#initialized = false;
 	#lastWidth: number | undefined;
 	#distanceFromTail = 0;
+	#semanticSeenState: unknown;
+	#unanchoredUnseenRows = 0;
+	#pendingReflowSnapshot:
+		| {
+				width: number;
+				readingAnchor: ScrollViewportReflowAnchor | undefined;
+				seenState: unknown;
+				distanceFromTail: number;
+		  }
+		| undefined;
 
 	constructor(
 		private readonly source: ScrollViewportSource,
@@ -96,18 +116,44 @@ export class ScrollViewport implements Component {
 
 	invalidate(): void {}
 
+	prepareForLayout(width: number): void {
+		this.#pendingReflowSnapshot = this.#captureReflowSnapshot(width);
+	}
+
 	render(width: number): string[] {
-		const totalRows = toNonNegativeInteger(this.source.getRowCount(width), 0);
 		const widthChanged = this.#lastWidth !== undefined && width !== this.#lastWidth;
-		const distanceFromTail = this.#distanceFromTail;
+		const reflowSnapshot =
+			this.#pendingReflowSnapshot?.width === width
+				? this.#pendingReflowSnapshot
+				: this.#captureReflowSnapshot(width);
+		this.#pendingReflowSnapshot = undefined;
+		const totalRows = toNonNegativeInteger(this.source.getRowCount(width), 0);
 		const previousUnseenRows = this.#unseenRows;
-		this.#updateTotalRows(totalRows, widthChanged, previousUnseenRows);
+		const activeSeenState = reflowSnapshot?.seenState ?? this.#semanticSeenState;
+		const semanticUnseenRows =
+			activeSeenState === undefined ? undefined : this.source.resolveReflowUnseenRows?.(activeSeenState);
+		const resolvedUnseenRows =
+			semanticUnseenRows === undefined ? undefined : semanticUnseenRows + this.#unanchoredUnseenRows;
+		this.#updateTotalRows(totalRows, widthChanged, previousUnseenRows, resolvedUnseenRows);
+		if (!widthChanged && semanticUnseenRows !== undefined) {
+			this.#unanchoredUnseenRows = Math.max(0, this.#unseenRows - semanticUnseenRows);
+		}
 
 		if (this.#followTail) {
 			this.#offset = this.#maxOffset();
 			this.#markTailSeen();
 		} else {
-			if (widthChanged) this.#offset = Math.max(0, this.#maxOffset() - distanceFromTail);
+			const anchoredRow = reflowSnapshot?.readingAnchor
+				? this.source.resolveReflowAnchor?.(reflowSnapshot.readingAnchor)
+				: undefined;
+			if (reflowSnapshot?.readingAnchor && anchoredRow !== undefined) {
+				this.#offset = anchoredRow - reflowSnapshot.readingAnchor.viewportRow;
+			} else if (widthChanged) {
+				this.#offset = Math.max(
+					0,
+					this.#maxOffset() - (reflowSnapshot?.distanceFromTail ?? this.#distanceFromTail),
+				);
+			}
 			this.#clampOffset();
 			if (this.#offset === this.#maxOffset()) this.#markTailSeen();
 		}
@@ -127,12 +173,20 @@ export class ScrollViewport implements Component {
 		return visibleRows;
 	}
 
-	#updateTotalRows(totalRows: number, widthChanged: boolean, previousUnseenRows: number): void {
+	#updateTotalRows(
+		totalRows: number,
+		widthChanged: boolean,
+		previousUnseenRows: number,
+		resolvedUnseenRows: number | undefined,
+	): void {
 		if (!this.#initialized) {
 			this.#initialized = true;
 			this.#seenTailRows = totalRows;
 		} else if (widthChanged) {
-			this.#seenTailRows = Math.max(0, totalRows - previousUnseenRows);
+			this.#seenTailRows =
+				resolvedUnseenRows === undefined
+					? Math.max(0, totalRows - previousUnseenRows)
+					: Math.max(0, totalRows - Math.min(resolvedUnseenRows, totalRows));
 		} else if (totalRows < this.#totalRows) {
 			this.#seenTailRows = Math.min(this.#seenTailRows, totalRows);
 		}
@@ -140,8 +194,27 @@ export class ScrollViewport implements Component {
 		this.#unseenRows = this.#followTail ? 0 : Math.max(0, totalRows - this.#seenTailRows);
 	}
 
+	#captureReflowSnapshot(width: number):
+		| {
+				width: number;
+				readingAnchor: ScrollViewportReflowAnchor | undefined;
+				seenState: unknown;
+				distanceFromTail: number;
+		  }
+		| undefined {
+		if (this.#lastWidth === undefined || width === this.#lastWidth || this.#followTail) return undefined;
+		const visibleAnchorRows = this.#unseenRows > 0 ? Math.max(0, this.#height - 1) : this.#height;
+		return {
+			width,
+			readingAnchor: this.source.captureReflowAnchor?.(this.#offset, this.#offset + visibleAnchorRows),
+			seenState: this.#semanticSeenState ?? this.source.captureReflowSeenState?.(this.#seenTailRows),
+			distanceFromTail: this.#distanceFromTail,
+		};
+	}
 	#markTailSeen(): void {
 		this.#seenTailRows = this.#totalRows;
+		this.#semanticSeenState = this.source.captureReflowSeenState?.(this.#totalRows);
+		this.#unanchoredUnseenRows = 0;
 		this.#unseenRows = 0;
 	}
 

@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Sticky composer layout now collapses optional pet and hook-widget rows before reducing the bordered editor, keeping long drafts visible and cursor-bearing on small terminal grids.
+- Paused transcript browsing now restores the same durable message and grapheme position after width reflow instead of relying only on distance from the transcript tail.
+
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
 - Windows managed-session resume no longer reports `durability_failed` when Bun rejects `fsync` on the read-only descriptor used to revalidate an existing canonical binding; Windows now uses an owner-writable descriptor for that durability fence while retaining no-follow and pre/post identity/content checks.
 - SDK daemon CLI end-to-end tests now drain spawned child stdout and stderr concurrently with process exit, preventing CI pipe teardown races from replacing the product exit contract with SIGPIPE status 141 (#3024).

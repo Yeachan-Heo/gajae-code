@@ -557,6 +557,23 @@ describe("InteractiveMode.setEditorComponent", () => {
 		assertComposerFollowsStatusLine();
 	});
 
+	it("keeps the composer on-screen by collapsing pet and lower widgets first", async () => {
+		vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+		forceTerminalSize(mode, 48, 8);
+		await mode.init();
+		mode.editor.setText(Array.from({ length: 12 }, (_value, index) => `draft-${index}`).join("\n"));
+		mode.petFloorContainer.addChild(new Text("pet-a\npet-b\npet-c"));
+		mode.hookWidgetContainerBelow.addChild(new Text("lower-a\nlower-b\nlower-c"));
+
+		const rendered = mode.ui.render(48);
+		const visible = rendered.map(stripRenderControls).join("\n");
+
+		expect(rendered.length).toBeLessThanOrEqual(8);
+		expect(rendered.join("\n")).toContain(CURSOR_MARKER);
+		expect(visible).not.toContain("pet-a");
+		expect(visible).not.toContain("lower-a");
+	});
+
 	it("keeps the welcome splash viewport-bound when /new shows a notification", async () => {
 		const width = 100;
 		const rows = 28;

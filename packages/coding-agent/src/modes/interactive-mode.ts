@@ -4,6 +4,7 @@ import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gaja
 import type {
 	Component,
 	EditorTheme,
+	ScrollViewportReflowAnchor,
 	ScrollViewportSource,
 	SlashCommand,
 	ViewportAnchorProvider,
@@ -221,6 +222,23 @@ function renderWorkingMessage(message: string, accent?: WorkingMessageAccent): s
 
 const EDITOR_FALLBACK_ROWS = 24;
 
+class BudgetedContainer extends Container {
+	#rowBudget: number | undefined;
+
+	setRowBudget(rowBudget: number | undefined): void {
+		this.#rowBudget = rowBudget === undefined ? undefined : Math.max(0, Math.floor(rowBudget));
+	}
+
+	measureRows(width: number): number {
+		return super.render(width).length;
+	}
+
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		return this.#rowBudget === undefined ? lines : lines.slice(0, this.#rowBudget);
+	}
+}
+
 class TranscriptViewportSource implements ScrollViewportSource {
 	#rendered: ViewportAnchorRender = { lines: [], anchors: [] };
 
@@ -241,6 +259,49 @@ class TranscriptViewportSource implements ScrollViewportSource {
 
 	renderAnchors(startRow: number, endRow: number): Array<ViewportAnchorRow | null> {
 		return this.#rendered.anchors.slice(startRow, endRow);
+	}
+
+	captureReflowAnchor(startRow: number, endRow: number): ScrollViewportReflowAnchor | undefined {
+		for (let row = startRow; row < Math.min(endRow, this.#rendered.anchors.length); row++) {
+			const anchor = this.#rendered.anchors[row];
+			if (!anchor) continue;
+			return { id: anchor.id, graphemeOffset: anchor.graphemeStart, viewportRow: row - startRow };
+		}
+		return undefined;
+	}
+
+	captureReflowSeenState(rowExclusive: number): unknown {
+		const seenGraphemeEnds = new Map<string, number>();
+		for (const anchor of this.#rendered.anchors.slice(0, rowExclusive)) {
+			if (!anchor) continue;
+			seenGraphemeEnds.set(anchor.id, Math.max(seenGraphemeEnds.get(anchor.id) ?? 0, anchor.graphemeEnd));
+		}
+		return seenGraphemeEnds;
+	}
+
+	resolveReflowUnseenRows(seenState: unknown): number | undefined {
+		if (!(seenState instanceof Map)) return undefined;
+		const seenGraphemeEnds = seenState as Map<unknown, unknown>;
+		let unseenRows = 0;
+		for (const anchor of this.#rendered.anchors) {
+			if (!anchor) continue;
+			const seenGraphemeEnd = seenGraphemeEnds.get(anchor.id);
+			if (typeof seenGraphemeEnd !== "number" || anchor.graphemeEnd > seenGraphemeEnd) unseenRows++;
+		}
+		return unseenRows;
+	}
+
+	resolveReflowAnchor(anchor: ScrollViewportReflowAnchor): number | undefined {
+		let lastMatchingRow: number | undefined;
+		for (let row = 0; row < this.#rendered.anchors.length; row++) {
+			const candidate = this.#rendered.anchors[row];
+			if (candidate?.id !== anchor.id) continue;
+			lastMatchingRow = row;
+			if (anchor.graphemeOffset >= candidate.graphemeStart && anchor.graphemeOffset < candidate.graphemeEnd) {
+				return row;
+			}
+		}
+		return lastMatchingRow;
 	}
 
 	findAnchorRow(id: string): number {
@@ -266,6 +327,7 @@ class LayoutScrollViewport extends ScrollViewport implements ViewportAnchorProvi
 	}
 
 	renderWithViewportAnchors(width: number): ViewportAnchorRender {
+		this.prepareForLayout(width);
 		this.updateLayout(width);
 		const lines = super.render(width);
 		const state = this.getState();
@@ -367,9 +429,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	transcriptViewport: ScrollViewport;
 	editor: CustomEditor;
 	editorContainer: Container;
-	hookWidgetContainerAbove: Container;
-	hookWidgetContainerBelow: Container;
-	petFloorContainer: Container = new Container();
+	hookWidgetContainerAbove: BudgetedContainer;
+	hookWidgetContainerBelow: BudgetedContainer;
+	petFloorContainer: BudgetedContainer = new BudgetedContainer();
 	petWidget: GajaePetWidget | undefined;
 	statusLine: StatusLineComponent;
 
@@ -630,8 +692,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		} catch (error) {
 			logger.warn("History storage unavailable", { error: String(error) });
 		}
-		this.hookWidgetContainerAbove = new Container();
-		this.hookWidgetContainerBelow = new Container();
+		this.hookWidgetContainerAbove = new BudgetedContainer();
+		this.hookWidgetContainerBelow = new BudgetedContainer();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor);
 		this.statusLine = new StatusLineComponent(session, {
@@ -1150,19 +1212,25 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.setMaxHeight(EDITOR_MAX_ROWS);
 		this.editor.setAutocompleteRowBudget(0);
 		const editorRows = this.editor.render(width).length;
+		const measuredWidgetRowsAbove = this.hookWidgetContainerAbove.measureRows(width);
+		const measuredPetRows = this.petFloorContainer.measureRows(width);
+		const measuredWidgetRowsBelow = this.hookWidgetContainerBelow.measureRows(width);
 		const layout = allocateComposerLayout({
 			terminalRows,
 			editorRows,
 			statusRows: this.statusLine.render(width).length,
-			widgetRowsAbove: this.hookWidgetContainerAbove.render(width).length,
-			widgetRowsBelow:
-				this.petFloorContainer.render(width).length + this.hookWidgetContainerBelow.render(width).length,
+			widgetRowsAbove: measuredWidgetRowsAbove,
+			widgetRowsBelow: measuredPetRows + measuredWidgetRowsBelow,
 			autocompleteRows: this.editor.isAutocompleteOpen() ? this.editor.getAutocompleteMaxVisible() + 1 : 0,
 		});
 		this.#composerLayout = layout;
 		this.transcriptViewport.setHeight(layout.transcriptRows);
 		this.editor.setMaxHeight(layout.editorMaxRows);
 		this.editor.setAutocompleteRowBudget(layout.autocompleteRows);
+		this.hookWidgetContainerAbove.setRowBudget(layout.widgetRowsAbove);
+		const hookRowsBelow = Math.min(measuredWidgetRowsBelow, layout.widgetRowsBelow);
+		this.hookWidgetContainerBelow.setRowBudget(hookRowsBelow);
+		this.petFloorContainer.setRowBudget(Math.max(0, layout.widgetRowsBelow - hookRowsBelow));
 	}
 
 	#measureTranscriptPrefixRows(width: number): number {

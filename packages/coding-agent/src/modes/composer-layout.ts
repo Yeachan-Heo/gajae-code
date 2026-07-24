@@ -24,27 +24,34 @@ function rows(value: number): number {
 }
 
 /**
- * Allocate terminal rows without depending on component state. The editor gets
- * enough border-inclusive space for one cursor-bearing content row even when
- * the terminal is smaller than its chrome. Measured status and widget rows are
- * treated as fixed, conservative reservations; autocomplete consumes only
- * otherwise available space and leaves a transcript row whenever possible.
+ * Allocate terminal rows without depending on component state. The bordered
+ * editor is the primary invariant: optional widgets are admitted only after
+ * the editor, autocomplete, and (when possible) one transcript row fit.
  */
 export function allocateComposerLayout(input: ComposerLayoutInput): ComposerLayout {
 	const terminalRows = rows(input.terminalRows);
 	const statusRows = rows(input.statusRows);
-	const widgetRowsAbove = rows(input.widgetRowsAbove);
-	const widgetRowsBelow = rows(input.widgetRowsBelow);
-	const fixedChromeRows = statusRows + widgetRowsAbove + widgetRowsBelow;
+	const requestedWidgetRowsAbove = rows(input.widgetRowsAbove);
+	const requestedWidgetRowsBelow = rows(input.widgetRowsBelow);
 	const measuredEditorRows = Math.max(EDITOR_MIN_ROWS, rows(input.editorRows));
+	const transcriptReserve = terminalRows > statusRows + EDITOR_MIN_ROWS ? 1 : 0;
 	const editorMaxRows = Math.max(
 		EDITOR_MIN_ROWS,
-		Math.min(EDITOR_MAX_ROWS, measuredEditorRows, Math.max(EDITOR_MIN_ROWS, terminalRows - fixedChromeRows)),
+		Math.min(
+			EDITOR_MAX_ROWS,
+			measuredEditorRows,
+			Math.max(EDITOR_MIN_ROWS, terminalRows - statusRows - transcriptReserve),
+		),
 	);
-	const remainingRows = Math.max(0, terminalRows - fixedChromeRows - editorMaxRows);
+	let remainingRows = Math.max(0, terminalRows - statusRows - editorMaxRows);
 	const requestedAutocompleteRows = rows(input.autocompleteRows);
-	const autocompleteRows = Math.min(requestedAutocompleteRows, Math.max(0, remainingRows - 1));
-	const transcriptRows = Math.max(0, remainingRows - autocompleteRows);
+	const autocompleteRows = Math.min(requestedAutocompleteRows, Math.max(0, remainingRows - transcriptReserve));
+	remainingRows -= autocompleteRows;
+
+	const optionalWidgetBudget = Math.max(0, remainingRows - transcriptReserve);
+	const widgetRowsAbove = Math.min(requestedWidgetRowsAbove, optionalWidgetBudget);
+	const widgetRowsBelow = Math.min(requestedWidgetRowsBelow, optionalWidgetBudget - widgetRowsAbove);
+	const transcriptRows = Math.max(0, remainingRows - widgetRowsAbove - widgetRowsBelow);
 
 	return {
 		transcriptRows,

@@ -43,6 +43,77 @@ class ReflowingRowSource implements ScrollViewportSource {
 	}
 }
 
+class SemanticallyReflowingRowSource implements ScrollViewportSource {
+	#currentRows: Array<{ id: string; graphemeOffset: number; text: string }> = [];
+	appendedMessages = 0;
+	captureRanges: Array<{ startRow: number; endRow: number }> = [];
+
+	#rows(width: number): Array<{ id: string; graphemeOffset: number; text: string }> {
+		const rows =
+			width >= 20
+				? [
+						{ id: "a", graphemeOffset: 0, text: "a-wide" },
+						{ id: "a", graphemeOffset: 8, text: "a-tail" },
+						{ id: "b", graphemeOffset: 0, text: "b-wide" },
+						{ id: "b", graphemeOffset: 8, text: "b-tail" },
+						{ id: "c", graphemeOffset: 0, text: "c-wide" },
+					]
+				: [
+						{ id: "a", graphemeOffset: 0, text: "a-narrow-0" },
+						{ id: "a", graphemeOffset: 4, text: "a-narrow-1" },
+						{ id: "a", graphemeOffset: 8, text: "a-narrow-2" },
+						{ id: "b", graphemeOffset: 0, text: "b-narrow-0" },
+						{ id: "b", graphemeOffset: 4, text: "b-narrow-1" },
+						{ id: "b", graphemeOffset: 8, text: "b-narrow-2" },
+						{ id: "c", graphemeOffset: 0, text: "c-narrow-0" },
+					];
+		for (let index = 1; index <= this.appendedMessages; index++) {
+			rows.push({ id: `d-${index}`, graphemeOffset: 0, text: `d-${index}-0` });
+			if (width < 20) rows.push({ id: `d-${index}`, graphemeOffset: 4, text: `d-${index}-1` });
+		}
+		return rows;
+	}
+
+	getRowCount(width: number): number {
+		this.#currentRows = this.#rows(width);
+		return this.#currentRows.length;
+	}
+
+	renderRows(_width: number, startRow: number, endRow: number): string[] {
+		return this.#currentRows.slice(startRow, endRow).map(row => row.text);
+	}
+
+	captureReflowAnchor(startRow: number, endRow: number) {
+		this.captureRanges.push({ startRow, endRow });
+		const row = this.#currentRows.slice(startRow, endRow).at(0);
+		return row ? { id: row.id, graphemeOffset: row.graphemeOffset, viewportRow: 0 } : undefined;
+	}
+
+	resolveReflowAnchor(anchor: { id: string; graphemeOffset: number }): number | undefined {
+		const exact = this.#currentRows.findIndex(
+			row => row.id === anchor.id && row.graphemeOffset === anchor.graphemeOffset,
+		);
+		return exact < 0 ? undefined : exact;
+	}
+
+	captureReflowSeenState(rowExclusive: number): unknown {
+		const seen = new Map<string, number>();
+		for (const row of this.#currentRows.slice(0, rowExclusive)) {
+			seen.set(row.id, Math.max(seen.get(row.id) ?? 0, row.graphemeOffset + 1));
+		}
+		return seen;
+	}
+
+	resolveReflowUnseenRows(seenState: unknown): number | undefined {
+		if (!(seenState instanceof Map)) return undefined;
+		const seen = seenState as Map<unknown, unknown>;
+		return this.#currentRows.filter(row => {
+			const seenEnd = seen.get(row.id);
+			return typeof seenEnd !== "number" || row.graphemeOffset >= seenEnd;
+		}).length;
+	}
+}
+
 const makeRows = (count: number): string[] => Array.from({ length: count }, (_value, index) => `row-${index}`);
 
 const plain = (lines: string[]): string[] => lines.map(line => stripVTControlCharacters(line));
@@ -158,6 +229,61 @@ describe("ScrollViewport", () => {
 
 		expect(viewport.render(40)).toEqual(["row-3", "row-4", "row-5"]);
 		expect(viewport.getState()).toMatchObject({ offset: 3, unseenRows: 0, followTail: false });
+	});
+
+	it("preserves the semantic reading point across width reflow when the source supplies anchors", () => {
+		const viewport = new ScrollViewport(new SemanticallyReflowingRowSource(), { height: 2, followTail: false });
+
+		expect(viewport.render(40)).toEqual(["a-wide", "a-tail"]);
+		viewport.setOffset(2);
+		expect(viewport.render(40)).toEqual(["b-wide", "b-tail"]);
+
+		expect(viewport.render(10)).toEqual(["b-narrow-0", "b-narrow-1"]);
+		expect(viewport.getState()).toMatchObject({ offset: 3, followTail: false, unseenRows: 0 });
+	});
+
+	it("keeps appended rows unseen when content growth and width reflow happen together", () => {
+		const source = new SemanticallyReflowingRowSource();
+		const viewport = new ScrollViewport(source, { height: 2 });
+
+		viewport.render(40);
+		viewport.setOffset(2);
+		source.appendedMessages = 1;
+		viewport.render(40);
+		expect(viewport.getState().unseenRows).toBe(1);
+
+		source.appendedMessages = 2;
+		expect(viewport.render(10)).toEqual(["b-narrow-0", "b-narrow-1"]);
+		expect(viewport.getState()).toMatchObject({ offset: 3, unseenRows: 4, followTail: false });
+	});
+
+	it("retains semantic unseen state across repeated width reflows", () => {
+		const source = new SemanticallyReflowingRowSource();
+		const viewport = new ScrollViewport(source, { height: 2 });
+
+		viewport.render(40);
+		viewport.setOffset(2);
+		source.appendedMessages = 2;
+		viewport.render(10);
+		const firstUnseenRows = viewport.getState().unseenRows;
+		expect(firstUnseenRows).toBe(4);
+
+		viewport.render(40);
+		expect(viewport.getState().unseenRows).toBe(2);
+	});
+
+	it("does not anchor width reflow to the row replaced by a one-row unseen indicator", () => {
+		const source = new SemanticallyReflowingRowSource();
+		const viewport = new ScrollViewport(source, { height: 1 });
+
+		viewport.render(40);
+		viewport.scrollBy(-1);
+		source.appendedMessages = 1;
+		viewport.render(40);
+		expect(viewport.getState().unseenRows).toBe(1);
+
+		viewport.render(10);
+		expect(source.captureRanges.at(-1)).toEqual({ startRow: 3, endRow: 3 });
 	});
 
 	it("counts real appended rows as unseen when width is unchanged", () => {

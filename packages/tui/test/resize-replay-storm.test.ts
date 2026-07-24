@@ -120,10 +120,10 @@ describe("multiplexer resize replay storm regression", () => {
 
 			const out = term.getWriteLog().join("");
 			// force=true still resets #previousWidth to -1, but the widthChanged guard
-			// now routes to viewport repaint: at most `rows` distinct lines, never the
-			// full 60-line transcript.
+			// now routes to a viewport repaint anchored at the live grid origin: at most
+			// `rows` distinct lines, never the full 60-line transcript.
 			expect(distinctReplayedLineMarkers(out)).toBeLessThanOrEqual(term.rows + 2);
-			expect(out).toContain("\x1b[29A\r");
+			expect(out).toContain("\x1b[?2026h\x1b[H");
 
 			tui.stop();
 		});

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Scroll viewports can preserve a source-provided semantic row anchor across width reflow, with the previous distance-from-tail behavior retained as a fallback for non-semantic sources.
+- Resize repaint goldens and multiplexer assertions now cover absolute CUP-home anchoring rather than the obsolete relative cursor-up sequence.
+
 ## [0.11.8] - 2026-07-23
 
 ## [0.11.7] - 2026-07-22
