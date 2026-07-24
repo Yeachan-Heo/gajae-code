@@ -12,7 +12,9 @@ import {
 	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
 import {
+	MANAGED_ARTIFACT_MAX_FILES,
 	publishManagedFileNoReplace,
+	validateManagedArtifactTree,
 	validateNativeSecurityResult,
 } from "../../src/session/internal/managed-session-storage";
 import { SessionManager } from "../../src/session/session-manager";
@@ -305,6 +307,65 @@ describe("managed session write protocol", () => {
 		expect(await fs.readFile(destination, "utf8")).toBe("managed\n");
 		expect((await fs.readdir(scope.directoryPath)).filter(name => name.endsWith(".staging"))).toEqual([]);
 	});
+	it("migrates legacy artifact directories at and around the former file-count cap", async () => {
+		expect(MANAGED_ARTIFACT_MAX_FILES).toBeGreaterThan(10_001);
+		for (const count of [9_999, 10_000, 10_001]) {
+			const { cwd, sessionsRoot, scope } = await fixture();
+			const legacy = legacyDirectory(sessionsRoot, cwd);
+			const source = path.join(legacy, `artifact-cap-${count}.jsonl`);
+			const artifacts = source.slice(0, -6);
+			await fs.mkdir(artifacts, { recursive: true });
+			await fs.writeFile(source, transcript(`artifact-cap-${count}`, cwd));
+			for (let index = 0; index < count; index++) syncFs.writeFileSync(path.join(artifacts, `${index}.bin`), "");
+
+			const listed = listManagedCandidates(scope);
+			if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+			const opened = await openManagedCandidateForWrite(scope, listed.owned[0]);
+			expect(opened).toMatchObject({ kind: "opened", migrated: true });
+			if (opened.kind !== "opened") continue;
+			expect((await fs.readdir(opened.path.slice(0, -6))).filter(name => name.endsWith(".bin"))).toHaveLength(count);
+			expect((await fs.readdir(artifacts)).filter(name => name.endsWith(".bin"))).toHaveLength(count);
+			const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
+			const committed = (await fs.readdir(receipts)).find(
+				name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed",
+			);
+			if (!committed) throw new Error("Missing committed migration receipt");
+			const receipt = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
+				artifactManifest?: unknown[];
+			};
+			expect(receipt.artifactManifest).toHaveLength(count + 1);
+		}
+	}, 120_000);
+
+	it("distinguishes artifact capacity from unsafe topology violations", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-artifact-validation-"));
+		temporaryDirectories.push(root);
+		syncFs.writeFileSync(path.join(root, "first"), "");
+		syncFs.writeFileSync(path.join(root, "second"), "");
+		expect(() => validateManagedArtifactTree(root, { maxFiles: 1 })).toThrow("artifact_capacity_exceeded");
+		syncFs.writeFileSync(path.join(root, "bytes"), "x");
+		expect(() => validateManagedArtifactTree(root, { maxTotalBytes: 0 })).toThrow("artifact_capacity_exceeded");
+		await fs.unlink(path.join(root, "bytes"));
+
+		const symlink = path.join(root, "symlink");
+		await fs.rm(path.join(root, "second"));
+		await fs.symlink(path.join(root, "first"), symlink);
+		expect(() => validateManagedArtifactTree(root)).toThrow("unsafe_artifacts");
+		await fs.unlink(symlink);
+
+		const hardlink = path.join(root, "hardlink");
+		await fs.link(path.join(root, "first"), hardlink);
+		expect(() => validateManagedArtifactTree(root)).toThrow("unsafe_artifacts");
+		await fs.unlink(hardlink);
+
+		let nested = root;
+		for (let depth = 0; depth <= 32; depth++) {
+			nested = path.join(nested, "nested");
+			await fs.mkdir(nested);
+		}
+		expect(() => validateManagedArtifactTree(root)).toThrow("unsafe_artifacts");
+	});
+
 	it("quarantines and restores the complete legacy artifact topology before committing migration authority", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);

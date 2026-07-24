@@ -18,6 +18,9 @@ import {
 } from "../session-storage";
 import {
 	acquireManagedLock,
+	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
+	MANAGED_ARTIFACT_MAX_FILES,
+	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
 	assertManagedDirectoryRoot,
 	captureManagedFileNoFollow,
 	captureManagedFilePrefixNoFollow,
@@ -199,6 +202,7 @@ export type ManagedOpenFailure =
 	| "destination_conflict"
 	| "source_changed"
 	| "unsafe_artifacts"
+	| "artifact_capacity_exceeded"
 	| "durability_failed"
 	| "atomic_unavailable"
 	| "invalid_request"
@@ -1081,6 +1085,7 @@ function expectedFailure(error: unknown): ManagedOpenFailure {
 		message === "destination_conflict" ||
 		message === "source_changed" ||
 		message === "unsafe_artifacts" ||
+		message === "artifact_capacity_exceeded" ||
 		message === "durability_failed" ||
 		message === "atomic_unavailable" ||
 		message === "invalid_request" ||
@@ -2639,40 +2644,43 @@ async function copyArtifacts(
 	const sourceRoot = sourceRootOverride ?? sourceTranscript.slice(0, -6);
 	if (!manifestMatches(sourceTranscript, manifest, sourceRoot)) throw new Error("source_changed");
 	const destinationRoot = destinationTranscript.slice(0, -6);
-	for (const entry of manifest) {
-		revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
-		lock.assertOwned();
-		const source = path.join(sourceRoot, entry.path);
-		const destination = path.join(destinationRoot, entry.path);
-		if (entry.kind === "directory") {
-			if (entry.path === "") {
-				revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
-				ensureManagedDirectory(destinationRoot, root);
-			} else {
-				revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
-				ensureManagedDirectory(destination, root);
-			}
-			continue;
-		}
-		const snapshot = captureManagedFileNoFollow(source);
-		if (
-			snapshot.bytes.byteLength !== entry.size ||
-			createHash("sha256").update(snapshot.bytes).digest("hex") !== entry.sha256
-		)
-			throw new Error("source_changed");
-		try {
+	for (let start = 0; start < manifest.length; start += MANAGED_ARTIFACT_COPY_BATCH_SIZE) {
+		const batch = manifest.slice(start, start + MANAGED_ARTIFACT_COPY_BATCH_SIZE);
+		for (const entry of batch) {
 			revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
-			await copyManagedFileNoReplace(source, destination, snapshot, root);
-		} catch (error) {
-			if ((error as Error).message !== "destination_conflict") throw error;
+			lock.assertOwned();
+			const source = path.join(sourceRoot, entry.path);
+			const destination = path.join(destinationRoot, entry.path);
+			if (entry.kind === "directory") {
+				if (entry.path === "") {
+					revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
+					ensureManagedDirectory(destinationRoot, root);
+				} else {
+					revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
+					ensureManagedDirectory(destination, root);
+				}
+				continue;
+			}
+			const snapshot = captureManagedFileNoFollow(source);
+			if (
+				snapshot.bytes.byteLength !== entry.size ||
+				createHash("sha256").update(snapshot.bytes).digest("hex") !== entry.sha256
+			)
+				throw new Error("source_changed");
+			try {
+				revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
+				await copyManagedFileNoReplace(source, destination, snapshot, root);
+			} catch (error) {
+				if ((error as Error).message !== "destination_conflict") throw error;
+			}
+			lock.assertOwned();
+			const copied = captureManagedFileNoFollow(destination);
+			if (
+				copied.bytes.byteLength !== entry.size ||
+				createHash("sha256").update(copied.bytes).digest("hex") !== entry.sha256
+			)
+				throw new Error("durability_failed");
 		}
-		lock.assertOwned();
-		const copied = captureManagedFileNoFollow(destination);
-		if (
-			copied.bytes.byteLength !== entry.size ||
-			createHash("sha256").update(copied.bytes).digest("hex") !== entry.sha256
-		)
-			throw new Error("durability_failed");
 	}
 	if (!manifestMatches(sourceTranscript, manifest, sourceRoot) || !manifestMatches(destinationTranscript, manifest))
 		throw new Error("durability_failed");
@@ -3295,7 +3303,16 @@ export async function openManagedCandidateForWrite(
 			};
 		}
 		const code = expectedFailure(error);
-		return { kind: "error", code, message: error instanceof Error ? error.message : "Managed migration failed." };
+		return {
+			kind: "error",
+			code,
+			message:
+				code === "artifact_capacity_exceeded"
+					? `Legacy session artifacts exceed the migration capacity (${MANAGED_ARTIFACT_MAX_FILES.toLocaleString()} files or ${MANAGED_ARTIFACT_MAX_TOTAL_BYTES / 1024 / 1024} MiB).`
+					: error instanceof Error
+						? error.message
+						: "Managed migration failed.",
+		};
 	} finally {
 		if (lock) await lock.release().catch(() => undefined);
 	}
