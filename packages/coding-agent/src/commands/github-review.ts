@@ -35,17 +35,18 @@ export default class GithubReview extends Command {
 	];
 
 	async run(): Promise<void> {
-		const { flags } = await this.parse(GithubReview);
-		const argv = this.argv.filter(a => a !== "--dry-run" && a !== "--json" && a !== "-j");
-		const configFlagIndex = argv.indexOf("--config");
-		if (configFlagIndex >= 0) argv.splice(configFlagIndex, 2);
-		const [action, ...rest] = argv;
+		const action = this.argv[0];
 		if (!action || !ACTIONS.has(action)) {
 			console.error(`Unknown github-review action: ${action ?? "(none)"}`);
 			console.error(`Valid actions: ${[...ACTIONS].join(", ")}`);
 			process.exitCode = 2;
 			return;
 		}
+		// `gh` is a raw passthrough: everything after it belongs to gh, so it
+		// must bypass our flag parser (`--json`, `--config` are valid gh flags).
+		if (action === "gh") return await this.gh(this.argv.slice(1));
+		const { flags, argv } = await this.parse(GithubReview);
+		const rest = (argv as string[]).slice(1);
 		const { loadGithubReviewConfig } = await import("../github-review/config");
 		const config = loadGithubReviewConfig(flags.config);
 
@@ -81,16 +82,6 @@ export default class GithubReview extends Command {
 				console.log(await new AppTokenProvider(config).token());
 				return;
 			}
-			case "gh": {
-				const { AppTokenProvider } = await import("../github-review/github");
-				const token = await new AppTokenProvider(config).token();
-				const child = spawn("gh", rest, {
-					stdio: "inherit",
-					env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token },
-				});
-				process.exitCode = await new Promise<number>(resolve => child.on("close", code => resolve(code ?? 1)));
-				return;
-			}
 			case "status": {
 				const { ReviewService } = await import("../github-review/service");
 				const service = new ReviewService(config);
@@ -99,6 +90,18 @@ export default class GithubReview extends Command {
 				return;
 			}
 		}
+	}
+
+	/** Run `gh` authenticated as the App (config from default path / GJC_GHR_* env). */
+	private async gh(args: string[]): Promise<void> {
+		const { loadGithubReviewConfig } = await import("../github-review/config");
+		const { AppTokenProvider } = await import("../github-review/github");
+		const token = await new AppTokenProvider(loadGithubReviewConfig()).token();
+		const child = spawn("gh", args, {
+			stdio: "inherit",
+			env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token },
+		});
+		process.exitCode = await new Promise<number>(resolve => child.on("close", code => resolve(code ?? 1)));
 	}
 
 	private async serve(config: import("../github-review/config").GithubReviewConfig): Promise<void> {
