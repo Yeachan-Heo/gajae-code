@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 26;
+export const GUARD_CONTRACT_VERSION = 27;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -61,7 +61,7 @@ type GuardManifest = {
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "82ec515526cf82ca0dadc6107f06504d285d03a1ef52e610e95021918f93f7a4";
+const PROTECTED_INVENTORY_SHA256 = "39d01bfad41216ea32ec0e8c8b66c50f69222ea098c4f1cc775ebc656a25b74b";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -118,11 +118,14 @@ export const TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS = {
 	[config]: ["parseNotificationSettingsSnapshot"],
 	[telegramDaemon]: [
 		"TOOL_ACTIVITY_CAPABILITY",
+		"LEGACY_TOOL_ACTIVITY_CAPABILITY",
+		"negotiateToolActivityCapability",
 		"toolActivityOwner",
 		"toolActivityAuthorityIsCurrent",
 		"toolActivityDeliveryIsCurrent",
 		"handleSessionMessage",
 		"processTelegramUpdate",
+		"createSessionRouter",
 	],
 } as const;
 
@@ -212,7 +215,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 26) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 27) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
