@@ -860,6 +860,61 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("reanchors at viewport home when responsive width reflow moves the physical cursor", async () => {
+			Bun.env.TMUX = "1";
+			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
+			const term = new VirtualTerminal(72, 12, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const logicalRows = Array.from(
+				{ length: 18 },
+				(_value, index) =>
+					`turn-${index.toString().padStart(2, "0")} 한국어 responsive transcript content ${"segment ".repeat(5)}`,
+			);
+			const component: Component = {
+				invalidate() {},
+				render(width: number): string[] {
+					const chunkWidth = Math.max(1, width);
+					return logicalRows.flatMap(row => {
+						const chunks: string[] = [];
+						for (let offset = 0; offset < row.length; offset += chunkWidth) {
+							chunks.push(row.slice(offset, offset + chunkWidth));
+						}
+						return chunks;
+					});
+				},
+			};
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				for (const width of [34, 88, 26, 72]) {
+					// Model terminals that reflow the hardware cursor independently during resize.
+					term.write("\x1b[7;20HSTALE-RESIZE-CELL");
+					await term.flush();
+					term.clearWriteLog();
+					term.resize(width, 12);
+					await settle(term);
+
+					const referenceTerm = new VirtualTerminal(width, 12, { isProcessTerminal: true });
+					const referenceTui = new TUI(referenceTerm);
+					referenceTui.addChild(component);
+					try {
+						referenceTui.start();
+						await settle(referenceTerm);
+						expect(visible(term)).toEqual(visible(referenceTerm));
+					} finally {
+						referenceTui.stop();
+					}
+					const writes = term.getWriteLog().join("");
+					expect(writes).toContain("\x1b[H");
+					expect(writes).not.toContain("STALE-RESIZE-CELL");
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("overflow content appears once across buffer without duplicate row IDs", async () => {
 			const term = new VirtualTerminal(32, 5);
 			const tui = new TUI(term);

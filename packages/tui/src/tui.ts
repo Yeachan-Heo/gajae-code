@@ -2385,12 +2385,11 @@ export class TUI extends Container {
 			this.#fullRedrawCount += 1;
 			if (renderMetrics.enabled) renderMetrics.recordFullRedraw(reason);
 			const nextViewportTop = Math.max(0, newLines.length - height);
-			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
-			let buffer = "\x1b[?2026h";
-			if (currentScreenRow > 0) {
-				buffer += `\x1b[${currentScreenRow}A`;
-			}
-			buffer += "\r";
+			// A terminal resize may reflow the physical cursor independently of our
+			// logical cursor bookkeeping. Re-anchor at the live viewport origin with
+			// absolute CUP home before repainting; relative cursor-up math can start
+			// midway down the resized grid and leave duplicated/stale rows behind.
+			let buffer = "\x1b[?2026h\x1b[H";
 			for (let screenRow = 0; screenRow < height; screenRow++) {
 				if (screenRow > 0) buffer += "\r\n";
 				buffer += "\x1b[2K";
