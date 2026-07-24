@@ -527,9 +527,9 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:writeJsonAtomic": "a768c87646d56cf28b0adbd596884c964aed54ea40775517fa385c111af05a5b"
   },
   "nativeAuthoritySha256": {
-    "crates/pi-natives/src/path_identity.rs": "c2c4d0be8e3e50c3938d73959da141055e914348cab30b1061b62491e8dcb80d",
+    "crates/pi-natives/src/path_identity.rs": "27fc137d1cbb0b773e8654fc3f77b7aa17322dd94fed638c947a22bcfe7759d4",
     "crates/pi-natives/src/ps.rs": "7696078e123b9beecc7252371c71eab2cec590413be6e6ddf4692ff6fe8c41e1",
-    "crates/pi-shell/src/process.rs": "785e41bf94d69a085eaa621dfbad0f7dd629d99559fc81a75331466755e04227",
+    "crates/pi-shell/src/process.rs": "63eb3b3cd6a6a64dd172fbc7df0ab4fde11eadd4015e2408b9f7b94775f6a5e4",
     "packages/natives/native/index.d.ts": "c61e02fd4712c822d30fb4b1496f064097a38718c9443bef526711f828165c50",
     "packages/coding-agent/src/sdk/broker/process-incarnation.ts": "cedd073107475b238757c6167129484ccec27fe49a2fb52b72f71592d78a7814"
   }
