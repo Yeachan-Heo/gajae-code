@@ -18,6 +18,13 @@ import {
 import type { AgentSession } from "../../../src/session/agent-session";
 import { renderStatusLine } from "../../../src/tui";
 import {
+	LIGHT_THEME_CONSUMER_ATLAS_PRODUCTION_IMPORTS,
+	LIGHT_THEME_CONSUMER_ATLAS_PRODUCTION_SYMBOLS,
+	LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS,
+	type LightThemeConsumerAtlasViewport,
+	renderLightThemeConsumerAtlas,
+} from "./light-theme-consumer-atlas";
+import {
 	NOTIFICATIONS_SETTINGS_SHOWCASE_ENTRIES,
 	type NotificationsSettingsShowcaseEntry,
 	type NotificationsSettingsShowcaseStateId,
@@ -27,7 +34,7 @@ import {
 /**
  * Deterministic light-theme compliance showcase.
  *
- * Source of truth for the 164-key matrix. Renders actual production components
+ * Source of truth for the 170-key matrix. Renders actual production components
  * and theme resolution with fail-closed identity checks. Performs no network or
  * fixture filesystem I/O.
  */
@@ -60,6 +67,7 @@ export const LIGHT_THEME_COMPLIANCE_SCENE_IDS = [
 	"wrap-japanese",
 	"wrap-chinese",
 	"wrap-mixed-cjk-latin",
+	"consumer-atlas",
 ] as const;
 export type LightThemeComplianceSceneId = (typeof LIGHT_THEME_COMPLIANCE_SCENE_IDS)[number];
 
@@ -73,7 +81,8 @@ export const LIGHT_THEME_COMPLIANCE_CJK_VIEWPORT = { id: "48x36", columns: 48, r
 
 export type LightThemeComplianceViewport =
 	| (typeof LIGHT_THEME_COMPLIANCE_VIEWPORTS)[number]
-	| typeof LIGHT_THEME_COMPLIANCE_CJK_VIEWPORT;
+	| typeof LIGHT_THEME_COMPLIANCE_CJK_VIEWPORT
+	| LightThemeConsumerAtlasViewport;
 
 export type LightThemeComplianceRenderMode = "unicode-color" | "ascii-no-color";
 
@@ -129,7 +138,14 @@ export interface LightThemeComplianceProvenance {
 	productionSymbols: readonly string[];
 	captureMode: "live-production-renderers";
 	fixedClockTimestamp: string;
-	sceneFamily: "notifications-settings" | "diff" | "markdown" | "syntax" | "status" | "status-line-cues";
+	sceneFamily:
+		| "notifications-settings"
+		| "diff"
+		| "markdown"
+		| "syntax"
+		| "status"
+		| "status-line-cues"
+		| "consumer-atlas";
 	notificationsStateId?: NotificationsSettingsShowcaseStateId;
 	cjkLanguage?: "korean" | "japanese" | "chinese" | "mixed-cjk-latin";
 	noColorCues?: readonly string[];
@@ -147,7 +163,7 @@ export interface LightThemeComplianceRender {
 	key: string;
 }
 
-export const LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT = 164;
+export const LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT = 170;
 
 const SHOWCASE_CLOCK = {
 	now: () => 1_700_000_042_000,
@@ -247,6 +263,7 @@ export const LIGHT_THEME_COMPLIANCE_ENTRIES: readonly LightThemeComplianceEntry[
 	const entries: LightThemeComplianceEntry[] = [];
 	for (const themeName of LIGHT_THEME_COMPLIANCE_THEMES) {
 		for (const sceneId of LIGHT_THEME_COMPLIANCE_SCENE_IDS) {
+			if (sceneId === "consumer-atlas") continue;
 			for (const viewport of LIGHT_THEME_COMPLIANCE_VIEWPORTS) {
 				entries.push({
 					key: buildMatrixKey(themeName, sceneId, viewport.id, "unicode-color"),
@@ -273,6 +290,15 @@ export const LIGHT_THEME_COMPLIANCE_ENTRIES: readonly LightThemeComplianceEntry[
 				theme: themeName,
 				sceneId,
 				viewport: LIGHT_THEME_COMPLIANCE_CJK_VIEWPORT,
+				renderMode: "unicode-color",
+			});
+		}
+		for (const viewport of LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS) {
+			entries.push({
+				key: buildMatrixKey(themeName, "consumer-atlas", viewport.id, "unicode-color"),
+				theme: themeName,
+				sceneId: "consumer-atlas",
+				viewport,
 				renderMode: "unicode-color",
 			});
 		}
@@ -757,6 +783,21 @@ export async function renderLightThemeComplianceShowcase(
 		const themeIdentity = await resolveThemeIdentity(requestedTheme, entry.theme);
 
 		switch (entry.sceneId) {
+			case "consumer-atlas": {
+				const atlasViewport = entry.viewport as LightThemeConsumerAtlasViewport;
+				const ansi = renderLightThemeConsumerAtlas(atlasViewport);
+				return finalizeRender(ansi, entry.renderMode, themeIdentity, entry, null, {
+					fixtureSource: "packages/coding-agent/test/fixtures/tui/light-theme-compliance-showcase.ts",
+					productionImports: [
+						"packages/coding-agent/test/fixtures/tui/light-theme-consumer-atlas.ts",
+						...LIGHT_THEME_CONSUMER_ATLAS_PRODUCTION_IMPORTS,
+					],
+					productionSymbols: [...LIGHT_THEME_CONSUMER_ATLAS_PRODUCTION_SYMBOLS],
+					captureMode: "live-production-renderers",
+					fixedClockTimestamp: FIXED_CLOCK_TIMESTAMP,
+					sceneFamily: "consumer-atlas",
+				});
+			}
 			case "diff": {
 				const ansi = renderDiffScene(entry.viewport);
 				return finalizeRender(ansi, entry.renderMode, themeIdentity, entry, null, {
