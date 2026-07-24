@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
-import { logger } from "@gajae-code/utils";
+import * as logger from "@gajae-code/utils/logger";
 
 const TEST_SESSION_ID = "test-session";
 

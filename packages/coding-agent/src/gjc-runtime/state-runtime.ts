@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
+// Subpath import keeps this module native-free for gjc-state-gates (the package
+// barrel pulls procmgr/ptree → @gajae-code/natives).
+import * as logger from "@gajae-code/utils/logger";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import {
 	applyHandoffToActiveState,
