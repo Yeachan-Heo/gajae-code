@@ -82,9 +82,29 @@ describe("bash invocation display safety", () => {
 		}
 	});
 
+	it("redacts ANSI-C escaped sensitive flags and complete backtick substitutions", () => {
+		const cases: Array<[command: string, secret: string]> = [
+			["curl --coo$'\\x6b'ie=hex-secret", "hex-secret"],
+			["curl --coo$'\\153'ie=octal-secret", "octal-secret"],
+			["curl --coo$'\\u006b'ie=unicode-secret", "unicode-secret"],
+			["curl --coo$'\\U0000006b'ie=long-unicode-secret", "long-unicode-secret"],
+			["curl --coo$'\\n'kie=standard-control-secret", "standard-control-secret"],
+			["curl --coo$'\\c@'kie=control-secret", "control-secret"],
+			["curl --password=`printf backtick-equals-secret`", "backtick-equals-secret"],
+			["curl --authorization `printf backtick-separated-secret`", "backtick-separated-secret"],
+		];
+		for (const expanded of [false, true]) {
+			for (const [command, secret] of cases) {
+				const displayed = formatInvocationCommand(command, expanded);
+				expect(displayed).not.toContain(secret);
+				expect(displayed).toContain("<redacted>");
+			}
+		}
+	});
+
 	it("preserves safe quoted equals and command substitutions", () => {
-		const command = "printf '%s' 'a=b' $(printf visible)";
-		expect(formatInvocationCommand(command, true)).toBe(command);
+		const commands = ["printf '%s' 'a=b' $(printf visible)", "printf '%s' `printf visible legacy`"];
+		for (const command of commands) expect(formatInvocationCommand(command, true)).toBe(command);
 	});
 
 	it("redacts password and username-only userinfo for generic credential URLs", () => {
@@ -230,6 +250,29 @@ describe("bash invocation display safety", () => {
 		expect(rendered).not.toContain(maliciousUrl);
 		expect(rendered).not.toContain("\x07");
 		expect(Bun.stripANSI(rendered)).toContain("API_TOKEN='<redacted>' printf 'red'link");
+	});
+
+	it("keeps ANSI-C and backtick secrets out of every Bash invocation header", async () => {
+		const theme = (await getThemeByName("red-claw"))!;
+		const command =
+			"curl --coo$'\\x6b'ie=card-secret --password=`printf equals-secret` --authorization `printf separated-secret`";
+		const toolCard = bashToolRenderer
+			.renderCall({ command }, { expanded: true, isPartial: true }, theme)
+			.render(180)
+			.join("\n");
+		const execution = new BashExecutionComponent(command, ui, false);
+		execution.setExpanded(true);
+		const executionHeader = execution.render(180).join("\n");
+		const overlay = new BashInteractiveOverlayComponent(command, theme, () => 24, xterm.Terminal);
+		const overlayHeader = overlay.render(180).join("\n");
+		overlay.dispose();
+
+		for (const rendered of [toolCard, executionHeader, overlayHeader]) {
+			expect(rendered).not.toContain("card-secret");
+			expect(rendered).not.toContain("equals-secret");
+			expect(rendered).not.toContain("separated-secret");
+			expect(Bun.stripANSI(rendered)).toContain("<redacted>");
+		}
 	});
 
 	it("keeps the shell execution header bounded and never reveals secrets when expanded", () => {
