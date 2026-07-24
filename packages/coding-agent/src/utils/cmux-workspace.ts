@@ -4,6 +4,8 @@ const CMUX_COMMAND = "cmux";
 const CMUX_WORKSPACE_ID_ENV = "CMUX_WORKSPACE_ID";
 const CMUX_NO_RENAME_ENV = "GJC_NO_CMUX_RENAME";
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+const CMUX_SURFACE_ID_ENV = "CMUX_SURFACE_ID";
+const CMUX_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const CMUX_WORKSPACE_TITLE_PREFIX = "GJC: ";
 const CMUX_WORKSPACE_RENAME_TIMEOUT_MS = 1500;
 const CMUX_WORKSPACE_LIST_TIMEOUT_MS = 1500;
@@ -54,6 +56,20 @@ function isEnvSet(value: string | undefined): boolean {
 	if (!value) return false;
 	const normalized = value.trim().toLowerCase();
 	return normalized !== "" && normalized !== "0" && normalized !== "false";
+}
+/** Returns a cmux identifier only when it is safe to pass as one argv element. */
+export function getCmuxEnvironmentIdentifier(
+	env: NodeJS.ProcessEnv,
+	name: typeof CMUX_WORKSPACE_ID_ENV | typeof CMUX_SURFACE_ID_ENV,
+): string | null {
+	const value = env[name]?.trim();
+	return value && CMUX_IDENTIFIER_PATTERN.test(value) ? value : null;
+}
+
+/** Removes controls and caps text shown in cmux-managed presentation surfaces. */
+export function sanitizeCmuxDisplayText(value: string | undefined, maxLength = 512): string {
+	if (!value) return "";
+	return value.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim().slice(0, Math.max(0, maxLength));
 }
 
 export function sanitizeCmuxWorkspaceTitle(title: string | undefined): string | undefined {

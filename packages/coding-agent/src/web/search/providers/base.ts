@@ -1,5 +1,6 @@
 import type { AuthStorage } from "@gajae-code/ai";
 import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "../types";
+import type { InsaneRouteDependencies } from "./insane";
 
 /**
  * Shared web search parameters passed to providers.
@@ -73,6 +74,8 @@ export interface SearchParams {
 	 */
 	sessionId?: string;
 	activeModelContext?: ActiveSearchModelContext;
+	/** Optional guarded request seam for Insane public-route callers. */
+	insaneRouteDependencies?: InsaneRouteDependencies;
 }
 
 /** Base class for web search providers. */

@@ -442,6 +442,8 @@ Extra conditional behavior:
 | `GJC_PLAN_MODEL`              | Ephemeral model-role override for `plan` (CLI `--plan` takes precedence)                           |
 | `GJC_NO_TITLE`                | If set (any non-empty value), disables auto session title generation on first user message         |
 | `GJC_NO_CMUX_RENAME`         | If set (any non-empty value), disables renaming the containing cmux workspace to the current session name |
+| `CMUX_WORKSPACE_ID`            | cmux-provided workspace identifier. A valid identifier is required before optional cmux browser/agent-surface presentation can activate, but presentation stays off unless the `cmux.presentation` setting is enabled; GJC verifies the local cmux CLI separately. |
+| `CMUX_SURFACE_ID`              | Optional cmux-provided surface identifier. An invalid non-empty value is diagnostic-only and does not grant presentation capability. |
 | `NULL_PROMPT`                | If `true`, system prompt builder returns empty string                                              |
 | `GJC_BLOCKED_AGENT`           | Blocks a specific subagent type in task tool                                                       |
 | `GJC_SUBPROCESS_CMD`          | Overrides subagent spawn command (`gjc` / `gjc.cmd` resolution bypass)                             |

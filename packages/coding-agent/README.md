@@ -25,6 +25,17 @@ gjc config set completion.notifyCommand 'cmux notify --title "$GJC_NOTIFICATION_
 ```
 
 When GJC runs inside a cmux terminal (`CMUX_WORKSPACE_ID` is set), GJC best-effort renames that cmux workspace to the current GJC session name (with a `GJC: ` prefix) — but only when the workspace still has its default title, so a name you pinned (or one set by a peer session sharing the workspace) is never overwritten. Opt out with `GJC_NO_CMUX_RENAME=1`.
+## cmux presentation integration
+
+When GJC is launched in cmux, it can make a best-effort, presentation-only projection without taking control of work. It is **opt-in and off by default**: enable the `cmux.presentation` setting, and it activates only when `CMUX_WORKSPACE_ID` matches `cmux --id-format uuids identify` and the local `cmux` CLI verifies its public `help` and `capabilities` commands.
+
+- Public top-level HTTP(S) URL reads, including `:raw`, open a **redacted** `origin + pathname` (no query string, fragment, or credentialed URL) in cmux's browser with `--focus false`, bounded by the read's abort signal and a hard deadline. Web searches are **not** presented: the query is never sent to Google or any other engine, and provider selection is never overridden. This applies to `gjc-read` and in-session URL reads.
+- The presenter is scoped to that invocation or GJC session. It is optional: a missing, invalid, or incompatible cmux environment/CLI, a timeout, or a command failure leaves the read, search, and agent session behavior unchanged.
+- A normal interactive GJC session makes one one-way projection of existing subagent progress and lifecycle events into retained `agent-session` surfaces. Surface titles are built only from non-sensitive structured status (agent role and current tool name); raw output, descriptions, URLs, and credentials are never projected. GJC never creates or controls subagents through cmux, and it never closes those surfaces; users clean them up.
+- Capability verification is bounded to two attempts. Command failures disable presentation for the remaining scope; diagnostics are capped at eight operation-level messages and redact URLs and credential-like values. Presentation never changes fetch/search authority or results.
+- The `read` tool's opt-in Insane fallback uses only typed, guarded direct public routes for Reddit, X/Twitter, YouTube, and Hacker News, and never discovery. The selectable `insane` **search** provider additionally uses keyless DuckDuckGo discovery to find candidate public URLs for text queries, then routes each candidate through the same guarded path. Both reject private, authenticated, blocked, and unsupported targets rather than using cookies, TLS impersonation, login/paywall bypasses, or a generic Insane renderer. See [web_search](../../docs/tools/web_search.md).
+
+This integration does not alter non-cmux behavior or the ownership-guarded cmux workspace-title behavior above.
 
 Windows Terminal may keep BEL (`[Console]::Write([char]7)`) silent depending on profile and system sound settings even when `notifications.terminalBell` is enabled. For an audible Windows completion beep, configure a user-level PowerShell command hook instead:
 

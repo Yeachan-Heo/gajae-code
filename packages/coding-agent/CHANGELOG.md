@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an **opt-in, default-off** verified cmux presentation integration (`cmux.presentation` setting). When enabled inside a verified cmux session, GJC opens **redacted** public URL reads (origin + pathname only; query strings, fragments, and credentialed URLs are never sent) in a no-focus cmux browser, bounded by the read's abort signal and a hard deadline, and makes a retained, presentation-only projection of subagent lifecycle/progress whose surface titles carry only non-sensitive structured status (agent role and current tool). Web-search queries are never presented, so provider choice is preserved and no undisclosed recipient is added. cmux never owns execution or surface cleanup; the guarded, typed public-route Insane read fallback stays direct-only with no generic renderer, while the selectable `insane` search provider keeps keyless DuckDuckGo discovery for text queries.
+
 ### Fixed
 
 - Alibaba Token Plan canonical first-event timeouts now surface without session retry/fallback replay and are not internally retried by auto-compaction, preventing repeated provider usage (#3026).

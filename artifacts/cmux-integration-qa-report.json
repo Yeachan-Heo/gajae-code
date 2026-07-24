@@ -1,0 +1,175 @@
+{
+  "kind": "api-package-test-report",
+  "scope": "cmux review-fix diff (6 maintainer-blocking items) — package-level QA/red-team, read-only",
+  "timestamp": "2026-07-24",
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed"
+  },
+  "environment": {
+    "mode": "read-only QA; source and .gjc/ not modified",
+    "cmuxCli": "cmux 0.64.20 (100) [14e3400b9] — present and live in this workspace",
+    "callerEnv": {
+      "CMUX_WORKSPACE_ID": "present, matches `cmux --id-format uuids identify` caller.workspace_id",
+      "CMUX_SURFACE_ID": "present, matches caller.surface_id"
+    },
+    "liveCmuxCommandsRun": ["cmux --version", "cmux help", "cmux capabilities", "cmux --id-format uuids identify"],
+    "liveCmuxCommandsDeliberatelyNotRun": [
+      "cmux browser open",
+      "cmux new-surface",
+      "cmux rename-tab",
+      "cmux close-surface"
+    ],
+    "environmentMutation": "none — no cmux browser/agent-session surface was created against the live socket; all presenter-invocation behavior was exercised through mocked CmuxResearchPresenter/CmuxCommandRunner seams per existing test conventions"
+  },
+  "commands": [
+    {
+      "command": "bun test test/cmux-integration.test.ts test/tools/fetch-insane-fallback.test.ts test/tools/fetch-kagi-toggle.test.ts test/tools/web-search-codex.test.ts test/tools/web-search-duckduckgo.test.ts test/tools/web-search-exa.test.ts test/tools/web-search-gemini.test.ts test/tools/web-search-insane.test.ts test/tools/web-search-kagi.test.ts test/tools/web-search-parallel.test.ts test/tools/web-search-searxng.test.ts test/tools/web-search-tavily.test.ts test/tools/fetch.test.ts (cwd: packages/coding-agent)",
+      "result": "passed: 141 tests, 1 skip, 0 failures, 330 expect() calls, 2.02s (superset of the narrower 3-file, 36-test/92-expect suite touched by this diff)"
+    },
+    {
+      "command": "bun run check:types (cwd: packages/coding-agent)",
+      "result": "passed: tsc -p tsconfig.json --noEmit — no diagnostics"
+    },
+    {
+      "command": "bunx biome lint src/tools/fetch.ts src/cmux/integration.ts src/web/search/index.ts src/web/search/providers/insane.ts src/cli/web-search-cli.ts src/sdk/session.ts src/config/settings-schema.ts test/cmux-integration.test.ts test/tools/fetch-insane-fallback.test.ts test/tools/web-search-insane.test.ts (cwd: packages/coding-agent)",
+      "result": "passed: OK, no diagnostics on the changed files (the one unrelated pre-existing warning noted in constraints is outside this file set)"
+    },
+    {
+      "command": "cmux --version; cmux help; cmux capabilities; cmux --id-format uuids identify (read-only, no surfaces opened)",
+      "result": "passed: live cmux 0.64.20 grammar includes 'browser open', '--focus', 'new-surface', 'agent-session', 'surface', 'identify', 'capabilities' (satisfies isHelpEvidence); identify returns caller.workspace_id/caller.surface_id matching this session's CMUX_WORKSPACE_ID/CMUX_SURFACE_ID, confirming the adapter's verification grammar still matches the real CLI"
+    },
+    {
+      "command": "ad hoc: bun test packages/coding-agent/test/_qa-temp-cmux-bounded.test.ts (temp file, deleted after run; not part of the committed diff)",
+      "result": "passed: mounted a `presentResearch` presenter that returns a promise which never resolves/rejects, with `cmux.presentation: true`; ReadTool.execute completed in 2.21s (bounded by presentResearchBounded's Math.min(timeout*1000, 2000)=2000ms race) and returned the fetched content unaffected — the never-settling presenter did not block or fail the read"
+    },
+    {
+      "command": "ad hoc: bun test packages/coding-agent/test/_qa-temp-cmux-default-off.test.ts (temp file, deleted after run; not part of the committed diff)",
+      "result": "passed: with `cmux.presentation` left unset (Settings.isolated default), settings.get('cmux.presentation') === false and a spy presenter's presentResearch was never invoked during a successful read — confirms default-off, opt-in-only presentation"
+    }
+  ],
+  "contractCoverage": [
+    {
+      "contract": "1. Sensitive web-search query is never presented to any cmux/browser surface, and provider selection (including explicit provider choice) is preserved",
+      "result": "passed",
+      "evidence": "web/search/index.ts: executeSearch no longer accepts or calls `presentation?.presentResearch({kind:'query',...})` (removed entirely, confirmed by diff and a repo-wide grep for `presentResearch(` finding only the URL-shaped call site in tools/fetch.ts). `CmuxResearchPresenter.presentResearch` signature changed to `(url: string, signal?)` — a query string can no longer be passed even by mistake. `params.provider` is still passed straight through unmodified to `resolveProviderChain` (comment: 'Coalescing to auto here would silently bypass that preference'). CmuxPresentationAdapter test asserts no call argument ever contains 'google.com'. Web-search CLI (`web-search-cli.ts`) no longer imports/creates a cmux presentation object at all."
+    },
+    {
+      "contract": "2. redactUrlForPresentation strips query string, fragment, and userinfo; returns null for credentialed/non-http(s) URLs",
+      "result": "passed",
+      "evidence": "fetch.ts: `redactUrlForPresentation` returns `${url.origin}${url.pathname}` only, rejects url.username/url.password, and rejects non-http(s) protocols. Unit test `redactUrlForPresentation` (fetch-insane-fallback.test.ts) verifies: X-Amz-Signature query stripped, #token fragment stripped, alice:password@ URL -> null, file:// -> null, malformed string -> null. Confirmed passing (part of the 141-test run)."
+    },
+    {
+      "contract": "3. cmux tab titles built from a subagent progress event carrying secrets contain only controlled agent/tool tokens, never free text/descriptions/URLs/secrets",
+      "result": "passed",
+      "evidence": "cmux/integration.ts: `ProgressLike` interface only has id/status/agent/currentTool (description/task/recentOutput fields removed from the type entirely); `#progressText` only reads `progress.agent`/`progress.currentTool`, each filtered through `safeSurfaceToken` (regex `^[A-Za-z0-9][A-Za-z0-9 ._:/-]{0,63}$`, rejecting anything with `=`, `://`, spaces-only free text patterns that don't match the identifier grammar). Test 'never projects raw output, descriptions, or secrets into tab titles' feeds a progress payload with description/task/recentOutput containing X-Amz-Signature, a postgres credentialed URL, and 'token'/'password' strings, then asserts the resulting rename-tab title contains only 'executor' and 'Tool: web_search' and none of the secret substrings. Confirmed passing."
+    },
+    {
+      "contract": "4a. A never-settling or slow presenter cannot block, delay, or fail the primary read (bounded by signal + hard deadline)",
+      "result": "passed",
+      "evidence": "fetch.ts: `presentResearchBounded` races `presenter.presentResearch(...)` (swallowing rejections) against a `setTimeout` capped at `Math.max(250, deadlineMs)`, called from `renderUrl` with `deadlineMs = Math.min(timeout*1000, 2000)`. QA red-team test (ad hoc, this run): a presenter whose `presentResearch` returns a promise that never resolves or rejects still let `ReadTool.execute` complete in 2.21s and return the fetched content, proving the read is not blocked."
+    },
+    {
+      "contract": "4b. defaultRunner kills the spawned cmux CLI child process on abort/timeout instead of leaking it",
+      "result": "passed",
+      "evidence": "cmux/integration.ts `defaultRunner`: attaches a `setTimeout(kill, timeoutMs)` and an abort listener that both call `kill()` (which calls `process.kill()` and marks `terminated`), returning exitCode 124 on either path; listeners/timers are cleaned up in a `finally`. Verified by static code read only in this pass (spawning/killing a real child process was intentionally not exercised live to avoid touching the workstation's process/cmux environment); this matches the pattern already covered indirectly by the adapter's mocked-runner circuit-breaker tests."
+    },
+    {
+      "contract": "5. Default-off `cmux.presentation` setting means no presentation activity without opt-in",
+      "result": "passed",
+      "evidence": "config/settings-schema.ts: `cmux.presentation` has `default: false`. sdk/session.ts only constructs `CmuxPresentationAdapter`/`CmuxProjectionSubscription` when `!isCanonicalSubSession && settings.get('cmux.presentation') === true`. tools/fetch.ts `renderUrl` only calls `presentResearchBounded` when `presenter && settings.get('cmux.presentation') === true`. QA red-team test (ad hoc, this run): with the setting left unset, `settings.get('cmux.presentation')` reads `false` and a spy presenter's `presentResearch` was never invoked during a successful read."
+    },
+    {
+      "contract": "6. An aborted signal makes tryInsaneFallback throw (propagate ToolAbortError) rather than swallow the abort as an ordinary failure",
+      "result": "passed",
+      "evidence": "tools/fetch.ts `tryInsaneFallback` now has two explicit `if (args.signal?.aborted) throw new ToolAbortError();` guards (before and after `routeInsanePublicUrl`). Unit test 'propagates abort instead of swallowing it as an ordinary failure' pre-aborts an AbortController and asserts `tryInsaneFallback(...)` rejects. Confirmed passing."
+    },
+    {
+      "contract": "7a. renderHtmlToText low-quality rejection restored (short/JS-gated/nav-heavy content is not treated as a successful native render)",
+      "result": "passed",
+      "evidence": "tools/fetch.ts `renderHtmlToText` now gates success on `content.trim().length > 100 && !isLowQualityOutput(content)` (previously only checked `content.trim()` truthiness). A caller with genuinely low-quality rendered HTML now correctly falls through to the Insane/llms.txt/document-extraction fallback chain in `renderUrl` instead of being returned as a false-positive success. Confirmed by direct diff read and passing `fetch.test.ts`/`fetch-insane-fallback.test.ts` (existing renderUrl integration coverage for the JS-gated/low-quality fallback branch)."
+    },
+    {
+      "contract": "7b. Insane search provider handles text queries via keyless DuckDuckGo discovery (not just direct URL routing)",
+      "result": "passed",
+      "evidence": "web/search/providers/insane.ts `searchInsane`: for a non-URL text query, calls `searchDuckDuckGo({ query: discoveryQuery(params.query), ... })` for keyless discovery, then routes each discovered candidate URL through the same guarded `routeInsanePublicUrl` path, deduplicating and capping at `numResults`; falls closed with a clear `SearchProviderError` when nothing routes. Test 'routes discovered public URLs for non-URL text queries' (query 'reddit test' resolves via DuckDuckGo HTML scrape -> reddit RSS route) and 'emits a diagnostic when configured Insane falls back to DuckDuckGo' both pass; 'rejects unsupported URLs instead of unsafe generic browsing' confirms direct URL-shaped queries still fail closed without DuckDuckGo discovery (read path stays direct-URL-only, no generic browsing bypass)."
+    }
+  ],
+  "surfaceEvidence": {
+    "package": "@gajae-code/coding-agent",
+    "webSearchPresentationRemoval": {
+      "result": "passed",
+      "evidence": "src/web/search/index.ts, src/web/search/providers/insane.ts, src/cli/web-search-cli.ts — no cmux presentation seam remains in the search path; `getSearchTools()`/`webSearchCustomTool` no longer accept a presenter argument; `runSearchCommand` no longer creates or disposes a `CmuxInvocationPresentation`."
+    },
+    "urlReadPresentationBounding": {
+      "result": "passed",
+      "evidence": "src/tools/fetch.ts — `redactUrlForPresentation` + `presentResearchBounded` gate cmux presentation for URL reads behind default-off `cmux.presentation`, origin+pathname-only redaction, and a signal+deadline race; verified statically and via ad hoc QA tests in this run."
+    },
+    "cmuxTabTitleProjection": {
+      "result": "passed",
+      "evidence": "src/cmux/integration.ts — `CmuxProjectionSubscription`/`safeSurfaceToken`/`ProgressLike` restrict tab-title content to identifier-shaped agent/tool tokens only; covered by the existing 'never projects raw output, descriptions, or secrets into tab titles' unit test."
+    },
+    "insaneFallbackAbortAndGating": {
+      "result": "passed",
+      "evidence": "src/tools/fetch.ts `tryInsaneFallback`/`classifyInsaneFallback`/`getInsaneFallbackOutcome` — abort propagation, raw/disabled/unsupported/401/forbidden/non-transient gating, and cmuxVerified gating all covered by fetch-insane-fallback.test.ts (30 assertions, all passing)."
+    },
+    "insaneSearchDiscovery": {
+      "result": "passed",
+      "evidence": "src/web/search/providers/insane.ts — DuckDuckGo-backed discovery for text queries restored alongside direct-URL routing and fail-closed behavior for unsupported/unroutable targets; covered by web-search-insane.test.ts (19 assertions, all passing)."
+    },
+    "sessionWiringDefaultOff": {
+      "result": "passed",
+      "evidence": "src/sdk/session.ts — cmux adapter/projection construction is conditioned on `settings.get('cmux.presentation') === true` and `!isCanonicalSubSession`; src/config/settings-schema.ts and schemas/config.schema.json both declare `cmux.presentation` default `false`."
+    }
+  },
+  "adversarialCases": [
+    {
+      "case": "Sensitive web-search query string must not reach any cmux/browser/search-engine surface, and explicit provider choice must survive unmodified",
+      "result": "passed",
+      "method": "static + repo-wide grep for `presentResearch(`/`kind: \"query\"` in the search path (none found) + existing adapter test asserting no call argument contains 'google.com' + read of `resolveProviderChain` passthrough comment"
+    },
+    {
+      "case": "Presigned S3 URL, token fragment, and credentialed URL must never be presented verbatim",
+      "result": "passed",
+      "method": "unit (redactUrlForPresentation test, part of the 141-test run)"
+    },
+    {
+      "case": "Subagent progress payload with description/task/recentOutput containing X-Amz-Signature, a credentialed postgres URL, 'password', and 'token' must not leak into a cmux tab title",
+      "result": "passed",
+      "method": "unit (CmuxProjectionSubscription test, part of the 141-test run)"
+    },
+    {
+      "case": "Presenter whose presentResearch promise never settles must not block or fail a URL read",
+      "result": "passed",
+      "method": "ad hoc red-team test (this run): elapsed 2.21s, bounded by presentResearchBounded's 2000ms race; read succeeded with fetched content intact"
+    },
+    {
+      "case": "cmux.presentation left at its (false) default must result in zero presentation calls during a successful read",
+      "result": "passed",
+      "method": "ad hoc red-team test (this run): settings.get('cmux.presentation') === false confirmed; spy presenter never invoked"
+    },
+    {
+      "case": "Pre-aborted signal passed into tryInsaneFallback must throw ToolAbortError, not resolve/swallow as an ordinary null/failure",
+      "result": "passed",
+      "method": "unit (tryInsaneFallback abort test, part of the 141-test run)"
+    },
+    {
+      "case": "renderHtmlToText must reject short/JS-gated/nav-heavy converted content as non-'ok' instead of returning a false-positive successful native render",
+      "result": "passed",
+      "method": "static diff read (`content.trim().length > 100 && !isLowQualityOutput(content)` gate) + passing renderUrl low-quality-fallback integration coverage in fetch.test.ts/fetch-insane-fallback.test.ts"
+    },
+    {
+      "case": "Insane provider given a plain text query (not a URL) must discover and route through DuckDuckGo rather than failing closed immediately or falling back to unsafe generic browsing",
+      "result": "passed",
+      "method": "unit (searchInsane DuckDuckGo-discovery test + fallback-diagnostic test, part of the 141-test run); adversarial companion case (direct unsupported URL still fails closed without discovery) also passing"
+    }
+  ],
+  "blockers": [],
+  "artifactRefs": [
+    {
+      "kind": "api-package-test-report",
+      "path": "artifacts/cmux-integration-qa-report.json"
+    }
+  ]
+}

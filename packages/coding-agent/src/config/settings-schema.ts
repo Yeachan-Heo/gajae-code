@@ -2470,9 +2470,19 @@ export const SETTINGS_SCHEMA = {
 		default: false,
 		ui: {
 			tab: "tools",
-			label: "Insane Search Fallback (Compatibility)",
+			label: "Insane Safe-Route Fallback",
 			description:
-				"Compatibility-only preference. Remote renderer fallback stays disabled because it cannot preserve validated per-hop network routing.",
+				"After verified cmux presentation yields no usable public content, allow guarded direct routes for supported Reddit, X, YouTube, and Hacker News URLs. Authentication, private targets, and the generic renderer remain disabled.",
+		},
+	},
+	"cmux.presentation": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "cmux Presentation (opt-in)",
+			description:
+				"When running inside a verified cmux session, present redacted public URL reads in a no-focus cmux browser and project subagent status to cmux surfaces. Default off; never sends query strings, credentials, or raw output, and never overrides web-search provider choice.",
 		},
 	},
 

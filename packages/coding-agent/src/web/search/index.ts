@@ -17,6 +17,7 @@ import type { ToolSession } from "../../tools";
 import { formatAge } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
 import { getSearchProviderLabel, prewarmSearchProviders, resolveProviderChain, type SearchProvider } from "./provider";
+import type { InsaneRouteDependencies } from "./providers/insane";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
 import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "./types";
 import { SearchProviderError } from "./types";
@@ -146,6 +147,7 @@ interface ExecuteSearchOptions {
 	sessionId?: string;
 	signal?: AbortSignal;
 	activeModelContext?: ActiveSearchModelContext;
+	insaneRouteDependencies?: InsaneRouteDependencies;
 }
 
 /**
@@ -170,7 +172,7 @@ async function executeSearch(
 	params: SearchQueryParams,
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	const { authStorage, sessionId, signal, activeModelContext } = options;
+	const { authStorage, sessionId, signal, activeModelContext, insaneRouteDependencies } = options;
 	// Pass `params.provider` straight through: when omitted (the normal model-facing
 	// path) it is `undefined`, so `resolveProviderChain` applies the settings-configured
 	// preferred provider. Coalescing to "auto" here would silently bypass that preference.
@@ -204,6 +206,7 @@ async function executeSearch(
 		authStorage,
 		sessionId,
 		activeModelContext,
+		insaneRouteDependencies,
 	};
 
 	// Hedged fallback: when DuckDuckGo (keyless, cheap) is a non-primary member
@@ -298,6 +301,7 @@ export async function runSearchQuery(
 		sessionId?: string;
 		signal?: AbortSignal;
 		activeModelContext?: ActiveSearchModelContext;
+		insaneRouteDependencies?: InsaneRouteDependencies;
 	} = {},
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
 	const authStorage = options.authStorage ?? (await discoverAuthStorage());
@@ -306,6 +310,7 @@ export async function runSearchQuery(
 		sessionId: options.sessionId,
 		signal: options.signal,
 		activeModelContext: options.activeModelContext,
+		insaneRouteDependencies: options.insaneRouteDependencies,
 	});
 }
 
@@ -360,7 +365,12 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 		const activeModelContext = this.#session.model
 			? this.#session.modelRegistry?.getActiveSearchModelContext(this.#session.model)
 			: undefined;
-		return executeSearch(_toolCallId, params, { authStorage, sessionId, signal, activeModelContext });
+		return executeSearch(_toolCallId, params, {
+			authStorage,
+			sessionId,
+			signal,
+			activeModelContext,
+		});
 	}
 }
 
@@ -397,7 +407,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRende
 	},
 };
 
-export function getSearchTools(): CustomTool<any, any>[] {
+export function getSearchTools(): CustomTool<typeof webSearchSchema, SearchRenderDetails>[] {
 	return [webSearchCustomTool];
 }
 

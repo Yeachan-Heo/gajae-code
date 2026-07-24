@@ -16,6 +16,7 @@ import {
 	type SearchQueryParams,
 } from "../web/search/index";
 import { SEARCH_PROVIDER_ORDER, setPreferredSearchProvider, setSearchFallbackProviders } from "../web/search/provider";
+import type { InsaneRouteDependencies } from "../web/search/providers/insane";
 import { applyConfiguredSearchTimeout } from "../web/search/providers/utils";
 import { renderSearchResult } from "../web/search/render";
 import type { SearchProviderId } from "../web/search/types";
@@ -37,6 +38,8 @@ export interface SearchCommandArgs {
 	enableImageSearch?: boolean;
 	enableVideoUnderstanding?: boolean;
 	noInlineCitations?: boolean;
+	/** Optional guarded request seam for programmatic callers. */
+	insaneRouteDependencies?: InsaneRouteDependencies;
 }
 
 const PROVIDERS: Array<SearchProviderId | "auto"> = ["auto", ...SEARCH_PROVIDER_ORDER];
@@ -201,7 +204,9 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 		no_inline_citations: cmd.noInlineCitations,
 	};
 
-	const result = await runSearchQuery(params);
+	const result = await runSearchQuery(params, {
+		insaneRouteDependencies: cmd.insaneRouteDependencies,
+	});
 	const component = renderSearchResult(result, { expanded: cmd.expanded, isPartial: false }, theme, {
 		query: cmd.query,
 		allowLongAnswer: true,

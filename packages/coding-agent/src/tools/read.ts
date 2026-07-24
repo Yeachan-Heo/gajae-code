@@ -1570,6 +1570,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					{
 						ensureArtifact: true,
 						preferCached: true,
+						presenter: this.session.presentation,
 					},
 				);
 				return this.#buildInMemoryTextResult(cached.output, parsedUrlTarget.offset, parsedUrlTarget.limit, {
@@ -1580,7 +1581,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					wrapUntrusted: true,
 				});
 			}
-			return executeReadUrl(this.session, { path: parsedUrlTarget.path, raw: parsedUrlTarget.raw }, signal);
+			return executeReadUrl(
+				this.session,
+				{ path: parsedUrlTarget.path, raw: parsedUrlTarget.raw },
+				signal,
+				this.session.presentation,
+			);
 		}
 
 		// Handle internal URLs (agent://, artifact://, memory://, rule://, local://, gjc://, issue://, pr://).
