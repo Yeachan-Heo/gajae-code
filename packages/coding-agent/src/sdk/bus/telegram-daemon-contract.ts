@@ -37,8 +37,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * cooldown and lazy Telegram topic lifecycle safeguards (#2956, #2960, #2984).
  * Generation 27 refreshes retained native path and process authority semantics.
  * Generation 28 rejects special files before retained native authority opens.
+ * Generation 29 adds serving-epoch compatibility, sidecar heartbeat, root GC,
+ * and Bot API cooldown structural fixes (#2956, #2960, #3048).
  */
-export const DAEMON_GENERATION = 28;
+export const DAEMON_GENERATION = 29;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers

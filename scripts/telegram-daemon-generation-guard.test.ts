@@ -440,7 +440,7 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 	test("bootstraps only the complete legacy protocol-3 topology", () => {
 		const base = files({ telegramOwnership: "return true;" });
 		base.delete("scripts/telegram-daemon-generation-guard.ts");
-		base.set(telegramContract, "export const NOTIFICATION_PROTOCOL_VERSION = 3;\nexport const DAEMON_GENERATION = NOTIFICATION_PROTOCOL_VERSION;");
+		base.set(telegramContract, "export const NOTIFICATION_PROTOCOL_VERSION = 3;\nexport const DAEMON_GENERATION = NOTIFICATION_PROTOCOL_VERSION;\nexport const SERVING_EPOCH = 1;");
 		base.set(chatControl, legacyChatDaemonControl);
 		const head = files({ telegramGeneration: 4, telegramOwnership: "return true;", chatLifecycle: "return true;" });
 		expect(isLegacyBootstrapBase(base)).toBe(true);
@@ -464,7 +464,7 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 	test("bootstraps the exact guard-less numeric-generation-6 legacy topology", () => {
 		const base = files({ telegramOwnership: "return true;" });
 		base.delete(guardScript);
-		base.set(telegramContract, "export const NOTIFICATION_PROTOCOL_VERSION = 3;\nexport const DAEMON_GENERATION = 6;");
+		base.set(telegramContract, "export const NOTIFICATION_PROTOCOL_VERSION = 3;\nexport const DAEMON_GENERATION = 6;\nexport const SERVING_EPOCH = 1;");
 		base.set(chatControl, legacyChatDaemonControl);
 		const head = files({ telegramGeneration: 7, discordGeneration: 2, slackGeneration: 2, telegramOwnership: "return true;", chatLifecycle: "return true;" });
 		expect(isLegacyBootstrapBase(base)).toBe(true);
