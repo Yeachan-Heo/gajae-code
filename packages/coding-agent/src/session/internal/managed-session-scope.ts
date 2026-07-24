@@ -2335,46 +2335,30 @@ export function matchesMigrationArtifactRoot(
 			(platform !== "win32" && (stat.size !== identity.size || stat.mtimeNs !== identity.mtimeNs))
 		)
 			return false;
-		const directoryEntryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
-			JSON.stringify(
-				platform === "win32"
-					? [entry.relativePath, entry.kind, entry.dev, entry.ino]
-					: [entry.relativePath, entry.kind, entry.dev, entry.ino, entry.size, entry.mtimeNs],
-			);
-		const strictEntryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
-			JSON.stringify([
-				entry.relativePath,
-				entry.kind,
-				entry.dev,
-				entry.ino,
-				entry.size,
-				entry.mtimeNs,
-				entry.ctimeNs,
-				entry.sha256,
-			]);
-		const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
-			entry.kind === "directory" ? directoryEntryKey(entry) : strictEntryKey(entry);
-		const expectedEntries = expectedTree.entries.map(entryKey).sort();
-		const observedEntries = observed.snapshot.entries.map(entryKey).sort();
-		return (
-			expectedEntries.length === observedEntries.length &&
-			expectedEntries.every((entry, index) => entry === observedEntries[index])
-		);
+		return sameArtifactTree(expectedTree, observed.snapshot, { platform, phase: "migration" });
 	} catch {
 		return false;
 	}
 }
 
-function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot): boolean {
-	return (
-		matchesMigrationArtifactRoot(pathname, plan.identity, plan.tree) &&
-		sameDirectoryObject(path.dirname(pathname), path.dirname(plan.detachedPath))
-	);
-}
+type ArtifactTreeComparisonPolicy = {
+	platform?: NodeJS.Platform;
+	phase?: "migration" | "strict";
+};
 
-function sameArtifactTree(left: NativeDirectoryTreeSnapshot, right: NativeDirectoryTreeSnapshot): boolean {
-	const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
-		JSON.stringify([
+function sameArtifactTree(
+	left: NativeDirectoryTreeSnapshot,
+	right: NativeDirectoryTreeSnapshot,
+	policy: ArtifactTreeComparisonPolicy = {},
+): boolean {
+	const { platform = process.platform, phase = "strict" } = policy;
+	const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string => {
+		// pi-iso accepts Windows plain directories by stable file id and kind only: NTFS can lazily
+		// update directory size, mtime, and ctime while enumeration trails an open handle. All other
+		// platforms and phases compare every captured field, including nested-directory ctime.
+		if (phase === "migration" && platform === "win32" && entry.kind === "directory")
+			return JSON.stringify([entry.relativePath, entry.kind, entry.dev, entry.ino]);
+		return JSON.stringify([
 			entry.relativePath,
 			entry.kind,
 			entry.dev,
@@ -2384,14 +2368,21 @@ function sameArtifactTree(left: NativeDirectoryTreeSnapshot, right: NativeDirect
 			entry.ctimeNs,
 			entry.sha256,
 		]);
+	};
+	const leftEntries = left.entries.map(entryKey).sort();
+	const rightEntries = right.entries.map(entryKey).sort();
 	return (
 		left.rootDev === right.rootDev &&
 		left.rootIno === right.rootIno &&
-		left.entries.length === right.entries.length &&
-		left.entries
-			.map(entryKey)
-			.sort()
-			.every((entry, index) => entry === right.entries.map(entryKey).sort()[index])
+		leftEntries.length === rightEntries.length &&
+		leftEntries.every((entry, index) => entry === rightEntries[index])
+	);
+}
+
+function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot): boolean {
+	return (
+		matchesMigrationArtifactRoot(pathname, plan.identity, plan.tree) &&
+		sameDirectoryObject(path.dirname(pathname), path.dirname(plan.detachedPath))
 	);
 }
 
@@ -2430,10 +2421,11 @@ function cleanupAuthorityMatches(cleanup: SourceArtifactCleanup, parent: string)
 	}
 }
 
-function detachArtifactRootForMigration(plan: DetachedArtifactRoot): {
-	detached: DetachedArtifactRoot;
-	cleanup?: SourceArtifactCleanup;
-} {
+function detachArtifactRootForMigration(
+	plan: DetachedArtifactRoot,
+):
+	| { detached: DetachedArtifactRoot; detachOutcome: "clean" }
+	| { detached: DetachedArtifactRoot; detachOutcome: "cleanup_pending"; cleanup: SourceArtifactCleanup } {
 	const result = native.exactUnlink(plan.originalPath, {
 		...plan.identity,
 		directory: true,
@@ -2460,7 +2452,7 @@ function detachArtifactRootForMigration(plan: DetachedArtifactRoot): {
 		process.platform === "win32" ? fs.realpathSync.native(result.detachedPath) : result.detachedPath;
 	if (!matchesDetachedArtifactRoot(detachedPath, plan)) throw new Error("durability_failed");
 	const detached = { ...plan, detachedPath };
-	if (!cleanupPending) return { detached };
+	if (!cleanupPending) return { detached, detachOutcome: "clean" };
 	const placeholder = result.retainedPlaceholderPath!;
 	const stat = fs.lstatSync(placeholder, { bigint: true });
 	if (!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(placeholder) !== path.dirname(plan.originalPath))
@@ -2475,7 +2467,7 @@ function detachArtifactRootForMigration(plan: DetachedArtifactRoot): {
 	};
 	if (!snapshot.ok || !snapshot.snapshot || !cleanupAuthorityMatches(cleanup, path.dirname(plan.originalPath)))
 		throw new Error("durability_failed");
-	return { detached, cleanup };
+	return { detached, detachOutcome: "cleanup_pending", cleanup };
 }
 
 export function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandidate): void {
@@ -2497,6 +2489,7 @@ export function restorePreparedArtifactRoot(scope: ManagedScope, source: Managed
 			identity?: Record<string, unknown>;
 			tree?: unknown;
 		};
+		detachOutcome?: unknown;
 	};
 	try {
 		record = JSON.parse(captureManagedFileNoFollow(receipt).bytes.toString("utf8")) as typeof record;
@@ -2520,39 +2513,46 @@ export function restorePreparedArtifactRoot(scope: ManagedScope, source: Managed
 		typeof identity.mtimeNs !== "string"
 	)
 		throw new Error("durability_failed");
-	if (receipt === detachedReceipt && quarantine.role !== "detached_artifact_root")
-		throw new Error("durability_failed");
-	if (receipt === detachedReceipt && record.sourceArtifactCleanup !== undefined) {
-		const cleanup = record.sourceArtifactCleanup;
-		const cleanupIdentity = cleanup.identity;
-		const cleanupTree = artifactTreeSnapshot(cleanup.tree);
-		if (
-			cleanup.state !== "cleanup_pending" ||
-			cleanup.role !== "exchange_placeholder" ||
-			typeof cleanup.retainedPath !== "string" ||
-			!cleanupIdentity ||
-			typeof cleanupIdentity.dev !== "string" ||
-			typeof cleanupIdentity.ino !== "string" ||
-			typeof cleanupIdentity.size !== "string" ||
-			typeof cleanupIdentity.mtimeNs !== "string" ||
-			!cleanupTree ||
-			!cleanupAuthorityMatches(
-				{
-					state: "cleanup_pending",
-					role: "exchange_placeholder",
-					retainedPath: cleanup.retainedPath,
-					identity: {
-						dev: BigInt(cleanupIdentity.dev),
-						ino: BigInt(cleanupIdentity.ino),
-						size: BigInt(cleanupIdentity.size),
-						mtimeNs: BigInt(cleanupIdentity.mtimeNs),
+	if (receipt === detachedReceipt) {
+		if (quarantine.role !== "detached_artifact_root") throw new Error("durability_failed");
+		if (record.detachOutcome === "clean") {
+			if (record.sourceArtifactCleanup !== undefined || fs.existsSync(quarantine.path))
+				throw new Error("durability_failed");
+		} else if (record.detachOutcome === "cleanup_pending") {
+			const cleanup = record.sourceArtifactCleanup;
+			if (!cleanup) throw new Error("durability_failed");
+			const cleanupIdentity = cleanup.identity;
+			const cleanupTree = artifactTreeSnapshot(cleanup.tree);
+			if (
+				cleanup.state !== "cleanup_pending" ||
+				cleanup.role !== "exchange_placeholder" ||
+				typeof cleanup.retainedPath !== "string" ||
+				!cleanupIdentity ||
+				typeof cleanupIdentity.dev !== "string" ||
+				typeof cleanupIdentity.ino !== "string" ||
+				typeof cleanupIdentity.size !== "string" ||
+				typeof cleanupIdentity.mtimeNs !== "string" ||
+				!cleanupTree ||
+				!cleanupAuthorityMatches(
+					{
+						state: "cleanup_pending",
+						role: "exchange_placeholder",
+						retainedPath: cleanup.retainedPath,
+						identity: {
+							dev: BigInt(cleanupIdentity.dev),
+							ino: BigInt(cleanupIdentity.ino),
+							size: BigInt(cleanupIdentity.size),
+							mtimeNs: BigInt(cleanupIdentity.mtimeNs),
+						},
+						tree: cleanupTree,
 					},
-					tree: cleanupTree,
-				},
-				path.dirname(source.path),
+					path.dirname(source.path),
+				)
 			)
-		)
+				throw new Error("durability_failed");
+		} else {
 			throw new Error("durability_failed");
+		}
 	}
 
 	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
@@ -2680,6 +2680,7 @@ function migrationReceipt(
 		role?: "detached_artifact_root";
 	},
 	sourceArtifactCleanup?: SourceArtifactCleanup,
+	detachOutcome?: "clean" | "cleanup_pending",
 ): Uint8Array {
 	lock.assertOwned();
 	const destinationRecord =
@@ -2697,7 +2698,7 @@ function migrationReceipt(
 					header: { id: destination.sessionId, cwd: destination.cwd },
 				};
 	return new TextEncoder().encode(
-		`${JSON.stringify({ schemaVersion: 2, state, policy: "copy-retain", attemptId: lock.attemptId, scope: scopeDigest(scope.platform, scope.canonicalCwd), source: { path: source.path, sessionId: source.sessionId, header: { id: source.sessionId, cwd: source.cwd }, identity: source.identity, sha256: source.identity.sha256 }, destination: destinationRecord, artifactManifest: manifest, ...(sourceArtifactQuarantine ? { sourceArtifactQuarantine } : {}), ...(sourceArtifactCleanup ? { sourceArtifactCleanup } : {}) }, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
+		`${JSON.stringify({ schemaVersion: 2, state, policy: "copy-retain", attemptId: lock.attemptId, scope: scopeDigest(scope.platform, scope.canonicalCwd), source: { path: source.path, sessionId: source.sessionId, header: { id: source.sessionId, cwd: source.cwd }, identity: source.identity, sha256: source.identity.sha256 }, destination: destinationRecord, artifactManifest: manifest, ...(sourceArtifactQuarantine ? { sourceArtifactQuarantine } : {}), ...(sourceArtifactCleanup ? { sourceArtifactCleanup } : {}), ...(detachOutcome ? { detachOutcome } : {}) }, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
 	);
 }
 
@@ -3118,7 +3119,7 @@ export async function openManagedCandidateForWrite(
 		if (artifactPlan) {
 			const detached = detachArtifactRootForMigration(artifactPlan);
 			detachedArtifacts = detached.detached;
-			sourceArtifactCleanup = detached.cleanup;
+			sourceArtifactCleanup = detached.detachOutcome === "cleanup_pending" ? detached.cleanup : undefined;
 			const detachedReceipt = receiptPathFor(scope, afterLock, "detached");
 			const detachedRecord = migrationReceipt(
 				scope,
@@ -3135,6 +3136,7 @@ export async function openManagedCandidateForWrite(
 					role: "detached_artifact_root",
 				},
 				sourceArtifactCleanup,
+				detached.detachOutcome,
 			);
 			try {
 				await publishManagedFileNoReplace(

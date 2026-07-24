@@ -53,7 +53,10 @@ async function fixture() {
 	return { cwd, agentDir, sessionsRoot, scope: resolved.scope };
 }
 
-async function interruptedArtifactMigration(id: string) {
+async function interruptedArtifactMigration(
+	id: string,
+	detachOutcome: "clean" | "cleanup_pending" = "cleanup_pending",
+) {
 	const { cwd, agentDir, sessionsRoot, scope } = await fixture();
 	const legacy = legacyDirectory(sessionsRoot, cwd);
 	const source = path.join(legacy, `${id}.jsonl`);
@@ -63,6 +66,23 @@ async function interruptedArtifactMigration(id: string) {
 	await fs.writeFile(source, transcript(id, cwd));
 	const listed = listManagedCandidates(scope);
 	if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing legacy candidate");
+	const artifactSnapshot = native.snapshotDirectoryTree(artifacts);
+	if (!artifactSnapshot.ok || !artifactSnapshot.snapshot) throw new Error("Native snapshot unavailable");
+	let detachedPath: string | undefined;
+	const snapshotDirectoryTree = native.snapshotDirectoryTree;
+	vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname =>
+		pathname === detachedPath ? { ok: true, snapshot: artifactSnapshot.snapshot } : snapshotDirectoryTree(pathname),
+	);
+	const exactUnlink = native.exactUnlink;
+	vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+		if (pathname !== artifacts || !identity.directory || !identity.detachOnly || !identity.quarantineName)
+			return exactUnlink(pathname, identity);
+		detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
+		syncFs.renameSync(pathname, detachedPath);
+		if (detachOutcome === "clean") return { ok: true, detachedPath };
+		syncFs.mkdirSync(pathname);
+		return { ok: false, code: "cleanup_pending", detachedPath, retainedPlaceholderPath: pathname };
+	});
 	vi.spyOn(native, "exactRestore").mockReturnValue({ ok: false, code: "io_error" });
 	expect(await openManagedCandidateForWrite(scope, listed.owned[0])).toMatchObject({
 		kind: "error",
@@ -120,12 +140,13 @@ describe("managed session Windows durability", () => {
 		expect(await fs.readFile(binding, "utf8")).toBe(expected);
 	});
 
-	it("uses native Windows root metadata for prepared receipt validation while rejecting file-content drift", async () => {
+	it("uses native Windows root metadata, tolerates pi-iso directory metadata drift, and rejects same-size content drift", async () => {
 		const root = temporaryDirectory("gjc-native-root-authority-");
 		temporaryDirectories.push(root);
 		const artifacts = path.join(root, "artifacts");
-		await fs.mkdir(artifacts);
-		const payload = path.join(artifacts, "payload.txt");
+		const nested = path.join(artifacts, "nested");
+		await fs.mkdir(nested, { recursive: true });
+		const payload = path.join(nested, "payload.txt");
 		await fs.writeFile(payload, "original");
 		const stat = syncFs.lstatSync(artifacts, { bigint: true });
 		const snapshot = native.snapshotDirectoryTree(artifacts);
@@ -149,11 +170,13 @@ describe("managed session Windows durability", () => {
 				...observed,
 				snapshot: {
 					...observed.snapshot,
-					entries: observed.snapshot.entries.map(entry =>
-						entry.relativePath === ""
-							? { ...entry, size: authoritativeSize, mtimeNs: nativeRoot.mtimeNs }
-							: entry,
-					),
+					entries: observed.snapshot.entries.map(entry => {
+						if (entry.relativePath === "")
+							return { ...entry, size: authoritativeSize, mtimeNs: nativeRoot.mtimeNs };
+						if (entry.relativePath === "nested" && entry.kind === "directory")
+							return { ...entry, size: "0", mtimeNs: "0", ctimeNs: "0" };
+						return entry;
+					}),
 				},
 			};
 		});
@@ -164,18 +187,53 @@ describe("managed session Windows durability", () => {
 			mtimeNs: BigInt(nativeRoot.mtimeNs),
 		};
 		expect(matchesMigrationArtifactRoot(artifacts, identity, expectedTree, "win32")).toBe(true);
-		await fs.writeFile(payload, "drifted");
+		await fs.writeFile(payload, "modified");
 		expect(matchesMigrationArtifactRoot(artifacts, identity, expectedTree, "win32")).toBe(false);
 	});
 
-	it("replays a clean detached receipt that omits sourceArtifactCleanup", async () => {
-		const interrupted = await interruptedArtifactMigration("clean-detached");
+	it("rejects POSIX nested-directory ctime drift", async () => {
+		const root = temporaryDirectory("gjc-posix-directory-ctime-");
+		temporaryDirectories.push(root);
+		const artifacts = path.join(root, "artifacts");
+		await fs.mkdir(path.join(artifacts, "nested"), { recursive: true });
+		const stat = syncFs.lstatSync(artifacts, { bigint: true });
+		const snapshot = native.snapshotDirectoryTree(artifacts);
+		if (!snapshot.ok || !snapshot.snapshot) throw new Error("Native snapshot unavailable");
+		const snapshotDirectoryTree = native.snapshotDirectoryTree;
+		vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname => {
+			const observed = snapshotDirectoryTree(pathname);
+			if (!observed.ok || !observed.snapshot) return observed;
+			return {
+				...observed,
+				snapshot: {
+					...observed.snapshot,
+					entries: observed.snapshot.entries.map(entry =>
+						entry.relativePath === "nested" && entry.kind === "directory"
+							? { ...entry, ctimeNs: (BigInt(entry.ctimeNs) + 1n).toString() }
+							: entry,
+					),
+				},
+			};
+		});
+		expect(
+			matchesMigrationArtifactRoot(
+				artifacts,
+				{ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs },
+				snapshot.snapshot,
+				"darwin",
+			),
+		).toBe(false);
+	});
+
+	it("replays a genuinely clean detached receipt", async () => {
+		const interrupted = await interruptedArtifactMigration("clean-detached", "clean");
 		const record = JSON.parse(await fs.readFile(interrupted.receipt, "utf8")) as {
+			detachOutcome?: unknown;
 			sourceArtifactQuarantine?: { detachedPath?: string; tree?: unknown };
 			sourceArtifactCleanup?: unknown;
 		};
-		delete record.sourceArtifactCleanup;
-		await fs.writeFile(interrupted.receipt, `${JSON.stringify(record)}\n`);
+		expect(record.detachOutcome).toBe("clean");
+		expect(record.sourceArtifactCleanup).toBeUndefined();
 		vi.restoreAllMocks();
 		const detachedPath = record.sourceArtifactQuarantine?.detachedPath;
 		const tree = record.sourceArtifactQuarantine?.tree;
@@ -198,10 +256,11 @@ describe("managed session Windows durability", () => {
 		expect((await fs.stat(interrupted.artifacts)).isDirectory()).toBe(true);
 	});
 
-	it("fails closed for a detached receipt with partial cleanup-pending authority", async () => {
-		const interrupted = await interruptedArtifactMigration("partial-cleanup");
+	it("fails closed when cleanup authority is deleted from a cleanup-pending receipt", async () => {
+		const interrupted = await interruptedArtifactMigration("deleted-cleanup-authority", "cleanup_pending");
 		const record = JSON.parse(await fs.readFile(interrupted.receipt, "utf8")) as Record<string, unknown>;
-		record.sourceArtifactCleanup = { state: "cleanup_pending", role: "exchange_placeholder" };
+		expect(record.detachOutcome).toBe("cleanup_pending");
+		delete record.sourceArtifactCleanup;
 		await fs.writeFile(interrupted.receipt, `${JSON.stringify(record)}\n`);
 		vi.restoreAllMocks();
 		const resolved = resolveManagedScope({
