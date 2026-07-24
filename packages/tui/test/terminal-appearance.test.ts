@@ -236,6 +236,41 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		terminal.stop();
 	});
 
+	it("recovers keyboard input after a dropped OSC 11 reply latches the pending query (watchdog)", () => {
+		vi.useFakeTimers();
+		const { terminal, received } = setupTerminal();
+
+		// Prime the OSC 11 reassembly buffer with a partial reply whose terminator
+		// never arrives (dropped/mangled by a multiplexer or TERM=dumb host).
+		process.stdin.emit("data", "\x1b]11;rgb:00");
+		vi.advanceTimersByTime(50); // flush StdinBuffer so the partial is delivered
+
+		// The pending-query watchdog must clear the latch after its bounded wait so
+		// stdin stops being treated as OSC 11 continuation.
+		vi.advanceTimersByTime(1000);
+
+		process.stdin.emit("data", "a");
+		expect(received).toContain("a");
+
+		terminal.stop();
+	});
+
+	it("bounds the OSC 11 reassembly buffer so a keystroke flood is not swallowed (cap)", () => {
+		vi.useFakeTimers();
+		const { terminal, received } = setupTerminal();
+
+		// Prime the reassembly buffer with a never-terminated partial reply.
+		process.stdin.emit("data", "\x1b]11;rgb:00");
+		vi.advanceTimersByTime(50);
+
+		// Without a bound this swallows every following keystroke forever. Past the
+		// cap the buffer resets and subsequent keys reach the input handler.
+		for (let i = 0; i < 80; i++) process.stdin.emit("data", "x");
+		expect(received).toContain("x");
+
+		terminal.stop();
+	});
+
 	it("DA1 from old query does not cancel new queued query", () => {
 		vi.useFakeTimers();
 		const { terminal, queryCount, sentinelCount } = setupTerminal();

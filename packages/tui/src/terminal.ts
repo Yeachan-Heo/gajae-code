@@ -222,6 +222,10 @@ export class ProcessTerminal implements Terminal {
 	#privateCsiResponseBuffer = "";
 	#pendingDa1Sentinels = 0;
 	#osc11PollTimer?: Timer;
+	// Bounds the OSC 11 / DA1 pending-query window so a dropped or mangled reply
+	// (a terminal multiplexer, or a TERM=dumb host that does not round-trip
+	// private-mode replies) cannot latch #osc11Pending forever and freeze stdin.
+	#osc11QueryWatchdog?: Timer;
 	#mode2031DebounceTimer?: Timer;
 	#progressTimer?: ReturnType<typeof setInterval>;
 	#mouseEnabled = false;
@@ -495,12 +499,26 @@ export class ProcessTerminal implements Terminal {
 				} else {
 					this.#osc11ResponseBuffer += sequence;
 					const osc11Match = this.#osc11ResponseBuffer.match(osc11ResponsePattern);
-					if (!osc11Match) return;
-					const [, rHex, gHex, bHex] = osc11Match;
-					this.#osc11Pending = false;
-					this.#osc11ResponseBuffer = "";
-					this.#handleOsc11Response(rHex!, gHex!, bHex!);
-					return;
+					if (osc11Match) {
+						const [, rHex, gHex, bHex] = osc11Match;
+						this.#osc11Pending = false;
+						this.#osc11ResponseBuffer = "";
+						this.#clearOsc11QueryWatchdog();
+						this.#handleOsc11Response(rHex!, gHex!, bHex!);
+						return;
+					}
+					// Bound the OSC 11 reassembly buffer. A real reply is <=~25 bytes; if
+					// the terminator is dropped or mangled (a multiplexer, or a TERM=dumb
+					// host) an unbounded buffer swallows every following keystroke and
+					// freezes input. Past the cap, abandon reassembly and let the current
+					// sequence fall through as normal input.
+					if (this.#osc11ResponseBuffer.length > 64) {
+						this.#osc11Pending = false;
+						this.#osc11ResponseBuffer = "";
+						this.#clearOsc11QueryWatchdog();
+					} else {
+						return;
+					}
 				}
 			}
 
@@ -558,6 +576,37 @@ export class ProcessTerminal implements Terminal {
 		this.#pendingDa1Sentinels++;
 		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
 		this.#safeWrite("\x1b[c"); // DA1 sentinel
+		this.#armOsc11QueryWatchdog();
+	}
+
+	// OSC 11 pending-query watchdog. If neither the OSC 11 reply nor its DA1
+	// sentinel comes back (dropped by a multiplexer or a TERM=dumb host that does
+	// not round-trip private-mode replies), #osc11Pending / #pendingDa1Sentinels
+	// would latch forever: #queryBackgroundColor stops re-querying and the OSC 11
+	// reassembly branch swallows keystrokes. Force-resolve the cycle after a
+	// bounded wait so the state machine self-heals.
+	#armOsc11QueryWatchdog(): void {
+		this.#clearOsc11QueryWatchdog();
+		this.#osc11QueryWatchdog = setTimeout(() => {
+			this.#osc11QueryWatchdog = undefined;
+			if (this.#dead) return;
+			if (!this.#osc11Pending && this.#pendingDa1Sentinels === 0) return;
+			this.#osc11Pending = false;
+			this.#osc11ResponseBuffer = "";
+			this.#pendingDa1Sentinels = 0;
+			if (this.#osc11QueryQueued && !this.#dead) {
+				this.#osc11QueryQueued = false;
+				this.#startOsc11Query();
+			}
+		}, 1000);
+		this.#osc11QueryWatchdog.unref?.();
+	}
+
+	#clearOsc11QueryWatchdog(): void {
+		if (this.#osc11QueryWatchdog) {
+			clearTimeout(this.#osc11QueryWatchdog);
+			this.#osc11QueryWatchdog = undefined;
+		}
 	}
 	/**
 	 * Parse an OSC 11 background color response and compute BT.601 luminance.
