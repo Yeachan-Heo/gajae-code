@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { ImageProtocol, TERMINAL, Text } from "@gajae-code/tui";
-import { getProjectDir, isEnoent, logger, prompt } from "@gajae-code/utils";
+import { getProjectDir, isEnoent, logger, prompt, sanitizeText } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { AsyncJobManager } from "../async";
 import { type BashResult, executeBash } from "../exec/bash-executor";
@@ -1194,14 +1194,17 @@ export function getBashEnvForDisplay(args: BashRenderArgs): Record<string, strin
 }
 
 export function formatBashCommand(args: BashRenderArgs, expanded = false): string {
-	const command = replaceTabs(formatInvocationCommand(args.command || "…", expanded));
+	const command = formatInvocationCommand(args.command || "…", expanded);
 	const prompt = "$";
 	const cwd = getProjectDir();
 	const displayWorkdir = formatToolWorkingDirectory(args.cwd, cwd);
 	const renderedCommand = [formatBashEnvAssignments(getBashEnvForDisplay(args), expanded), command]
 		.filter(Boolean)
 		.join(" ");
-	return displayWorkdir ? `${prompt} cd ${displayWorkdir} && ${renderedCommand}` : `${prompt} ${renderedCommand}`;
+	const invocation = displayWorkdir
+		? `${prompt} cd ${displayWorkdir} && ${renderedCommand}`
+		: `${prompt} ${renderedCommand}`;
+	return replaceTabs(sanitizeText(invocation));
 }
 
 /**
@@ -1212,14 +1215,15 @@ export function formatBashCommand(args: BashRenderArgs, expanded = false): strin
  * `theme.fg("dim", ...)` form render only the first line as dim.
  */
 export function formatBashCommandLines(args: BashRenderArgs, uiTheme: Theme, expanded = false): string[] {
-	const command = replaceTabs(formatInvocationCommand(args.command || "…", expanded));
+	const command = replaceTabs(sanitizeText(formatInvocationCommand(args.command || "…", expanded)));
 	const cwd = getProjectDir();
 	const displayWorkdir = formatToolWorkingDirectory(args.cwd, cwd);
 	const envAssignments = formatBashEnvAssignments(getBashEnvForDisplay(args), expanded);
 	const prefixParts = ["$"];
 	if (displayWorkdir) prefixParts.push(`cd ${displayWorkdir} &&`);
 	if (envAssignments) prefixParts.push(envAssignments);
-	const prefix = uiTheme.fg("dim", `${prefixParts.join(" ")} `);
+	const prefixText = replaceTabs(sanitizeText(`${prefixParts.join(" ")} `));
+	const prefix = uiTheme.fg("dim", prefixText);
 	const highlightedLines = highlightCode(command, "bash");
 	if (highlightedLines.length === 0) return [prefix.trimEnd()];
 	return highlightedLines.map((line, i) => (i === 0 ? `${prefix}${line}` : line));

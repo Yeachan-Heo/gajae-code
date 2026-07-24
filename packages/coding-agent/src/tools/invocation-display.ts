@@ -1,3 +1,4 @@
+import { Ellipsis, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { PREVIEW_LIMITS, TRUNCATE_LENGTHS } from "./render-utils";
 
 export const REDACTED_INVOCATION_VALUE = "<redacted>";
@@ -7,7 +8,7 @@ const SENSITIVE_NAME_PATTERN =
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const TOKEN_VALUE_PATTERN =
 	/\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]{16,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/g;
-const URL_CREDENTIAL_PATTERN = /(https?:\/\/[^\s:/@]+:)([^\s@]+)(@)/gi;
+const URL_CREDENTIAL_PATTERN = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^\s:/?#@]*):([^\s/?#@]*)(@)/g;
 const LONG_VALUE_CHARS = TRUNCATE_LENGTHS.LINE;
 
 function formatByteSize(value: string): string {
@@ -31,7 +32,11 @@ export function redactInvocationValuePatterns(value: string): string {
 	return value
 		.replace(BEARER_PATTERN, "Bearer <redacted>")
 		.replace(TOKEN_VALUE_PATTERN, REDACTED_INVOCATION_VALUE)
-		.replace(URL_CREDENTIAL_PATTERN, `$1${REDACTED_INVOCATION_VALUE}$3`);
+		.replace(
+			URL_CREDENTIAL_PATTERN,
+			(_match, scheme: string, user: string, _password: string, at: string) =>
+				`${scheme}${user}:${REDACTED_INVOCATION_VALUE}${at}`,
+		);
 }
 
 function displayValue(value: string, expanded: boolean, sensitive: boolean): string {
@@ -65,61 +70,123 @@ export function formatInvocationEnvironment(env: Record<string, string> | undefi
 		.join(" ");
 }
 
-function findClosingQuote(value: string, start: number, quote: string): number {
-	for (let index = start; index < value.length; index += 1) {
-		if (value[index] === "\\") {
+interface ShellWordSpan {
+	start: number;
+	end: number;
+	value: string;
+}
+
+interface ShellWordWrapper {
+	prefix: string;
+	value: string;
+	suffix: string;
+}
+
+function findShellWordSpans(command: string): ShellWordSpan[] {
+	const spans: ShellWordSpan[] = [];
+	let index = 0;
+	while (index < command.length) {
+		while (index < command.length && /[\s;&|()<>]/.test(command[index] ?? "")) index += 1;
+		if (index >= command.length) break;
+		const start = index;
+		let quote: "single" | "double" | "ansi-c" | undefined;
+		while (index < command.length) {
+			const character = command[index] ?? "";
+			if (!quote && /[\s;&|()<>]/.test(character)) break;
+			if (quote === "single") {
+				index += 1;
+				if (character === "'") quote = undefined;
+				continue;
+			}
+			if (quote === "double" || quote === "ansi-c") {
+				if (character === "\\") {
+					index = Math.min(index + 2, command.length);
+					continue;
+				}
+				index += 1;
+				if ((quote === "double" && character === '"') || (quote === "ansi-c" && character === "'")) {
+					quote = undefined;
+				}
+				continue;
+			}
+			if (character === "\\") {
+				index = Math.min(index + 2, command.length);
+				continue;
+			}
+			if (character === '"') {
+				quote = "double";
+				index += 1;
+				continue;
+			}
+			if (character === "'") {
+				quote = index > start && command[index - 1] === "$" ? "ansi-c" : "single";
+				index += 1;
+				continue;
+			}
 			index += 1;
+		}
+		spans.push({ start, end: index, value: command.slice(start, index) });
+	}
+	return spans;
+}
+
+function splitShellWordWrapper(value: string): ShellWordWrapper {
+	if (value.startsWith("$'") && value.endsWith("'")) {
+		return { prefix: "$'", value: value.slice(2, -1), suffix: "'" };
+	}
+	const quote = value[0];
+	if ((quote === "'" || quote === '"') && value.endsWith(quote)) {
+		return { prefix: quote, value: value.slice(1, -1), suffix: quote };
+	}
+	return { prefix: "", value, suffix: "" };
+}
+
+function replaceShellWordValue(value: string, displayed: string): string {
+	const wrapper = splitShellWordWrapper(value);
+	return `${wrapper.prefix}${displayed}${wrapper.suffix}`;
+}
+
+function isSensitiveFlagName(name: string): boolean {
+	return /^--?/.test(name) && isSensitiveInvocationName(name.replace(/^--?/, "").replaceAll("-", "_"));
+}
+
+function redactShellWords(command: string, expanded: boolean): string {
+	const spans = findShellWordSpans(command);
+	const replacements = new Map<number, string>();
+	for (const [index, span] of spans.entries()) {
+		if (replacements.has(index)) continue;
+		const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(span.value);
+		if (assignment) {
+			const [, key, rawValue] = assignment;
+			const wrapper = splitShellWordWrapper(rawValue);
+			const displayed = displayValue(wrapper.value, expanded, isSensitiveInvocationName(key));
+			replacements.set(index, `${key}=${wrapper.prefix}${displayed}${wrapper.suffix}`);
 			continue;
 		}
-		if (value[index] === quote) return index;
-	}
-	return -1;
-}
 
-function redactEmbeddedAssignments(command: string, expanded: boolean): string {
-	const assignmentPattern = /(^|[\s;])([A-Za-z_][A-Za-z0-9_]*)=(['"])/gm;
-	let cursor = 0;
+		const equals = span.value.indexOf("=");
+		const flag = equals < 0 ? span.value : span.value.slice(0, equals);
+		if (!isSensitiveFlagName(flag)) continue;
+		if (equals >= 0) {
+			const rawValue = span.value.slice(equals + 1);
+			replacements.set(index, `${flag}=${replaceShellWordValue(rawValue, REDACTED_INVOCATION_VALUE)}`);
+			continue;
+		}
+
+		const next = spans[index + 1];
+		if (next && /^\s+$/.test(command.slice(span.end, next.start))) {
+			replacements.set(index + 1, replaceShellWordValue(next.value, REDACTED_INVOCATION_VALUE));
+		}
+	}
+
 	let output = "";
-	for (let match = assignmentPattern.exec(command); match; match = assignmentPattern.exec(command)) {
-		const [token, prefix, key, quote] = match;
-		const valueStart = match.index + token.length;
-		const valueEnd = findClosingQuote(command, valueStart, quote);
-		if (valueEnd < 0) continue;
-		output += command.slice(cursor, match.index);
-		const value = command.slice(valueStart, valueEnd);
-		const displayed = displayValue(value, expanded, isSensitiveInvocationName(key));
-		output += `${prefix}${key}=${quote}${displayed}${quote}`;
-		cursor = valueEnd + 1;
-		assignmentPattern.lastIndex = cursor;
+	let cursor = 0;
+	for (const [index, span] of spans.entries()) {
+		output += command.slice(cursor, span.start);
+		output += replacements.get(index) ?? span.value;
+		cursor = span.end;
 	}
-	output += command.slice(cursor);
-	return output.replace(
-		/(^|[\s;])([A-Za-z_][A-Za-z0-9_]*)=([^\s;'"]+)/gm,
-		(_match, prefix: string, key: string, value: string) =>
-			`${prefix}${key}=${displayValue(value, expanded, isSensitiveInvocationName(key))}`,
-	);
-}
-
-function redactSensitiveFlags(command: string): string {
-	const flagName =
-		"(--?[A-Za-z0-9_-]*(?:token|secret|password|passwd|pwd|credential|authorization|api[-_]?key)[A-Za-z0-9_-]*)";
-	let redacted = command.replace(
-		new RegExp(`${flagName}=(['"])([\\s\\S]*?)\\2`, "gi"),
-		(_match, flag: string, quote: string) => `${flag}=${quote}${REDACTED_INVOCATION_VALUE}${quote}`,
-	);
-	redacted = redacted.replace(
-		new RegExp(`${flagName}(\\s+)(['"])([\\s\\S]*?)\\3`, "gi"),
-		(_match, flag: string, spacing: string, quote: string) =>
-			`${flag}${spacing}${quote}${REDACTED_INVOCATION_VALUE}${quote}`,
-	);
-	redacted = redacted.replace(
-		new RegExp(`${flagName}=([^\\s'"]+)`, "gi"),
-		(_match, flag: string) => `${flag}=${REDACTED_INVOCATION_VALUE}`,
-	);
-	return redacted.replace(
-		new RegExp(`${flagName}(\\s+)([^\\s'"]+)`, "gi"),
-		(_match, flag: string, spacing: string) => `${flag}${spacing}${REDACTED_INVOCATION_VALUE}`,
-	);
+	return output + command.slice(cursor);
 }
 
 function collapseMultilineCommand(command: string): string {
@@ -142,12 +209,20 @@ function collapseLongUnquotedArguments(command: string): string {
 	);
 }
 
+function boundCollapsedLines(command: string): string {
+	return command
+		.split("\n")
+		.map(line =>
+			visibleWidth(line) > LONG_VALUE_CHARS ? truncateToWidth(line, LONG_VALUE_CHARS, Ellipsis.Unicode) : line,
+		)
+		.join("\n");
+}
+
 export function formatInvocationCommand(command: string, expanded: boolean): string {
-	let displayed = redactEmbeddedAssignments(command, expanded);
-	displayed = redactSensitiveFlags(displayed);
+	let displayed = redactShellWords(command, expanded);
 	displayed = redactInvocationValuePatterns(displayed);
 	if (expanded) return displayed;
 	displayed = collapseLongQuotedArguments(displayed);
 	displayed = collapseLongUnquotedArguments(displayed);
-	return collapseMultilineCommand(displayed);
+	return boundCollapsedLines(collapseMultilineCommand(displayed));
 }

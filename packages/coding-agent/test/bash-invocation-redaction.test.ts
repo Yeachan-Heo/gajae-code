@@ -48,6 +48,33 @@ describe("bash invocation display safety", () => {
 		}
 	});
 
+	it("redacts complete shell words across escaped, ANSI-C, assignment, and cookie forms", () => {
+		const command = String.raw`PASSWORD=$'top secret' curl --password "top \"secret\" suffix" --cookie=$'session secret' --authorization BearerValue`;
+		for (const expanded of [false, true]) {
+			const displayed = formatInvocationCommand(command, expanded);
+			expect(displayed).not.toContain("top secret");
+			expect(displayed).not.toContain("suffix");
+			expect(displayed).not.toContain("session secret");
+			expect(displayed).not.toContain("BearerValue");
+			expect(displayed).toContain("PASSWORD=$'<redacted>'");
+			expect(displayed).toContain('--password "<redacted>"');
+			expect(displayed).toContain("--cookie=$'<redacted>'");
+		}
+	});
+
+	it("redacts password userinfo for generic credential URLs and empty users", () => {
+		const command =
+			"printf %s postgres://user:db-secret@host/db https://:empty-user-secret@example.test ftp://name:p:a:ss@host/path";
+		const displayed = formatInvocationCommand(command, true);
+
+		expect(displayed).not.toContain("db-secret");
+		expect(displayed).not.toContain("empty-user-secret");
+		expect(displayed).not.toContain("p:a:ss");
+		expect(displayed).toContain("postgres://user:<redacted>@host/db");
+		expect(displayed).toContain("https://:<redacted>@example.test");
+		expect(displayed).toContain("ftp://name:<redacted>@host/path");
+	});
+
 	it("keeps short safe commands readable and collapses large arguments", () => {
 		expect(formatInvocationCommand("git status --short", false)).toBe("git status --short");
 		const longArgument = JSON.stringify({ body: "x".repeat(300) });
@@ -61,6 +88,16 @@ describe("bash invocation display safety", () => {
 		const unquoted = formatInvocationCommand(`printf %s ${"y".repeat(300)}`, false);
 		expect(unquoted).toContain("<argument,");
 		expect(unquoted).not.toContain("y".repeat(100));
+	});
+
+	it("hard-bounds retained lines from oversized multiline quoted payloads", () => {
+		const oversized = "界".repeat(10_000);
+		const command = `printf '%s' '${oversized}\nsecond\nthird\nfourth'`;
+		const collapsed = formatInvocationCommand(command, false);
+
+		expect(collapsed).toContain("<multiline command, 4 lines,");
+		expect(collapsed).not.toContain("界".repeat(100));
+		for (const line of collapsed.split("\n")) expect(visibleWidth(line)).toBeLessThanOrEqual(110);
 	});
 
 	it("applies the same redaction and expansion policy to bash tool arguments", () => {
@@ -110,6 +147,45 @@ describe("bash invocation display safety", () => {
 		for (const output of rendered) {
 			expect(output).not.toContain(secret);
 			expect(Bun.stripANSI(output)).toContain("<redacted>");
+		}
+	});
+
+	it("sanitizes terminal controls before every bash tool-card invocation render", async () => {
+		const theme = (await getThemeByName("red-claw"))!;
+		const maliciousUrl = "https://evil.test";
+		const args = {
+			command: `printf '\x1b[31mred\x1b[0m\x07'\x1b]8;;${maliciousUrl}\x07link\x1b]8;;\x07`,
+			env: { SAFE: `ok\x1b]2;owned\x07` },
+		};
+		expect(formatBashCommand(args, true)).toBe("$ SAFE=\"ok\" printf 'red'link");
+
+		const rendered = [
+			bashToolRenderer.renderCall(args, { expanded: false, isPartial: true }, theme).render(120).join("\n"),
+			bashToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "ok" }], details: {}, isError: false },
+					{ expanded: false, isPartial: false },
+					theme,
+					args,
+				)
+				.render(120)
+				.join("\n"),
+			bashToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "failed" }], details: {}, isError: true },
+					{ expanded: true, isPartial: false },
+					theme,
+					args,
+				)
+				.render(120)
+				.join("\n"),
+		];
+
+		for (const output of rendered) {
+			expect(output).not.toContain(maliciousUrl);
+			expect(output).not.toContain("owned");
+			expect(output).not.toContain("\x07");
+			expect(Bun.stripANSI(output)).toContain("printf 'red'link");
 		}
 	});
 
