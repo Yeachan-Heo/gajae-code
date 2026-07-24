@@ -1216,14 +1216,17 @@ pub mod capabilities {
 	pub const ASK_CONTROLS_V1: &str = "ask_controls_v1";
 	/// Correlated, origin-bound `Selected!` acknowledgement requests.
 	pub const ASK_SELECTED_ACK_V1: &str = "ask_selected_ack_v1";
-	/// Receive-only compatibility token for the original open-ended tool activity contract.
+	/// Receive-only compatibility token for the original open-ended tool
+	/// activity contract.
 	pub const TOOL_ACTIVITY_LEGACY_V1: &str = "tool_activity_v1";
-	/// Tool activity contract with the closed started/completed/failed/cancelled phase set.
+	/// Tool activity contract with the closed started/completed/failed/cancelled
+	/// phase set.
 	pub const TOOL_ACTIVITY_V2: &str = "tool_activity_v2";
 	/// Current tool activity admission token used by the native server.
 	///
-	/// The identifier is retained to avoid widening this capability-only protocol change
-	/// across native server call sites; its advertised value is the v2 contract.
+	/// The identifier is retained to avoid widening this capability-only
+	/// protocol change across native server call sites; its advertised value is
+	/// the v2 contract.
 	pub const TOOL_ACTIVITY_V1: &str = TOOL_ACTIVITY_V2;
 	/// Ephemeral side-turn request, cancellation, and terminal result frames.
 	pub const EPHEMERAL_TURN_V1: &str = "ephemeral_turn_v1";

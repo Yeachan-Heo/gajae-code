@@ -1,5 +1,5 @@
 {
-  "contractVersion": 27,
+  "contractVersion": 28,
   "inventory": {
     "telegram": {
       "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts": [
@@ -26,6 +26,9 @@
       ],
       "packages/coding-agent/src/sdk/bus/config.ts": [
         "parseNotificationSettingsSnapshot"
+      ],
+      "packages/coding-agent/src/sdk/host/host.ts": [
+        "TOOL_ACTIVITY_CAPABILITY"
       ],
       "packages/coding-agent/src/sdk/bus/telegram-daemon.ts": [
         "TelegramDaemonOwnershipPhase",
@@ -546,7 +549,8 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:unregisterNotificationRoot": "f29a0e6c318d283d56ea54888af48724faa64f21f4d1399e3d5fd2c099239d4a",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:validBotToken": "aad5ee94c6b599c43fd087cd133ee07d11601b94091b9e5e8f58b5bf27429afa",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:waitForTelegramDaemonReady": "fe21962bdcf6501a7ba4ea7e04bf442394e35cba4f296fd3469c680730b1cdfb",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:writeJsonAtomic": "a768c87646d56cf28b0adbd596884c964aed54ea40775517fa385c111af05a5b"
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:writeJsonAtomic": "a768c87646d56cf28b0adbd596884c964aed54ea40775517fa385c111af05a5b",
+    "telegram:packages/coding-agent/src/sdk/host/host.ts:TOOL_ACTIVITY_CAPABILITY": "547f80bd6b3bd1c615fc3d885e507aba4418e6c4c54c47d36938b8b2e5d2abd7"
   },
   "nativeAuthoritySha256": {
     "crates/pi-natives/src/path_identity.rs": "27fc137d1cbb0b773e8654fc3f77b7aa17322dd94fed638c947a22bcfe7759d4",

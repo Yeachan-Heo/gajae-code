@@ -18,7 +18,7 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	connectionCapabilities?: (connectionId: string) => ReadonlySet<string> | undefined;
 }
 
-const TOOL_ACTIVITY_V1 = "tool_activity_v1";
+const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 const CAP_GATED_FRAME_KINDS = new Set(["tool_activity", "reasoning_summary"]);
 const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 
@@ -233,7 +233,7 @@ export class SessionSdkHost {
 					const replay = this.events.replay(sinceSeq, sinceGeneration);
 					const capabilities = this.#options.connectionCapabilities?.(connectionId) ?? EMPTY_CAPABILITIES;
 					const events = replay.events.filter(
-						event => !CAP_GATED_FRAME_KINDS.has(String(event.kind)) || capabilities.has(TOOL_ACTIVITY_V1),
+						event => !CAP_GATED_FRAME_KINDS.has(String(event.kind)) || capabilities.has(TOOL_ACTIVITY_CAPABILITY),
 					);
 					await this.#send(connectionId, {
 						type: "event_replay_result",
