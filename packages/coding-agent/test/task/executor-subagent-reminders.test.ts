@@ -285,8 +285,13 @@ describe("runSubprocess yield reminders", () => {
 			});
 		});
 
-		const session = createMockSession(({ emit }) => {
+		const session = createMockSession(({ emit, state }) => {
 			const assistant = { ...createAssistantStopMessage("streaming"), provider: "test", model: "mock" };
+			const baseline = {
+				...assistant,
+				content: [{ type: "text" as const, text: "baseline" }],
+				timestamp: assistant.timestamp - 1_000,
+			};
 			const errored = { ...assistant, stopReason: "error" as const, errorMessage: "upstream failed" };
 			const update = (assistantMessageEvent: AssistantMessageEvent) =>
 				emit({ type: "message_update", message: { ...assistant }, assistantMessageEvent });
@@ -299,9 +304,17 @@ describe("runSubprocess yield reminders", () => {
 					errorMessage: "provider stream stalled",
 				});
 			const flush = () => emit({ type: "agent_end", messages: [], stopReason: "completed" });
+			state.messages.push(baseline);
 
 			currentEvent = "retry-1";
 			retry(1);
+			currentEvent = "baseline-replay-update";
+			emit({
+				type: "message_update",
+				message: { ...baseline },
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "replay", partial: { ...baseline } },
+			});
+			flush();
 			currentEvent = "errored-assistant-start";
 			emit({ type: "message_start", message: errored });
 			flush();
@@ -401,6 +414,7 @@ describe("runSubprocess yield reminders", () => {
 			"errored-assistant-start",
 			"aborted-assistant-start",
 			"user-start",
+			"baseline-replay-update",
 			"control-update",
 			"error-update",
 			"malformed-update",
@@ -513,6 +527,8 @@ describe("runSubprocess yield reminders", () => {
 			emit({ type: "message_start", message: terminal });
 			currentEvent = "terminal-end";
 			emit({ type: "message_end", message: terminal });
+			currentEvent = "cancelled-agent-end";
+			emit({ type: "agent_end", messages: [terminal], stopReason: "cancelled" });
 			currentEvent = "failed-end";
 			emit({ type: "auto_retry_end", success: false, attempt: 1, finalError: "provider failed" });
 			currentEvent = "retry-2";
@@ -545,6 +561,9 @@ describe("runSubprocess yield reminders", () => {
 			modelRegistry,
 		});
 		const secondRetry = progressUpdates.find(update => update.event === "retry-2")?.progress.retryState;
+		const cancelledRetry = progressUpdates.find(update => update.event === "cancelled-agent-end")?.progress
+			.retryState;
+		expect(cancelledRetry).toMatchObject({ attempt: 1, provider: "test" });
 		expect(secondRetry).toMatchObject({ attempt: 2, provider: "test" });
 		expect(secondRetry?.lastProviderProgressAtMs).toBeUndefined();
 		expect(result.exitCode).toBe(0);

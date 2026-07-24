@@ -867,6 +867,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let sessionEventOrdinal = 0;
 	let retryStartOrdinal = 0;
 	const seenAssistantMessages = new WeakSet<AgentMessage>();
+	const seenAssistantMessageIdentities = new Set<string>();
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage = {
@@ -1012,6 +1013,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			: undefined;
 	};
 
+	const getAssistantMessageIdentity = (message: AgentMessage): string | undefined => {
+		if (message.role !== "assistant") return undefined;
+		const model = getMessageModelString(message);
+		const timestamp = "timestamp" in message ? message.timestamp : undefined;
+		if (!model || typeof timestamp !== "number") return undefined;
+		const responseId = "responseId" in message && typeof message.responseId === "string" ? message.responseId : "";
+		return JSON.stringify([model, timestamp, responseId]);
+	};
+
+	const rememberAssistantMessage = (message: AgentMessage): void => {
+		seenAssistantMessages.add(message);
+		const identity = getAssistantMessageIdentity(message);
+		if (identity) seenAssistantMessageIdentities.add(identity);
+	};
+
 	const isProviderAssistantMessage = (message: AgentMessage): message is AssistantMessage =>
 		message.role === "assistant" &&
 		"stopReason" in message &&
@@ -1057,7 +1073,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		event: Extract<AgentEvent, { type: "message_start" | "message_update" }>,
 		eventOrdinal: number,
 	): boolean => {
-		if (!progress.retryState || eventOrdinal <= retryStartOrdinal || seenAssistantMessages.has(event.message))
+		const messageIdentity = getAssistantMessageIdentity(event.message);
+		if (
+			!progress.retryState ||
+			eventOrdinal <= retryStartOrdinal ||
+			seenAssistantMessages.has(event.message) ||
+			(messageIdentity !== undefined && seenAssistantMessageIdentities.has(messageIdentity))
+		)
 			return false;
 		if (!hasMatchingActiveProviderModel(event.message)) return false;
 		if (event.type === "message_start") return isSuccessfulProviderAssistantMessage(event.message);
@@ -1112,7 +1134,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (event.message.role !== "assistant") break;
 				const retryWasActive = Boolean(progress.retryState);
 				const recoversRetry = isProviderBackedRecoveryEvent(event, eventOrdinal);
-				seenAssistantMessages.add(event.message);
+				rememberAssistantMessage(event.message);
 				if (recoversRetry || !retryWasActive) {
 					lastProviderProgressAtMs = now;
 					resetRecentOutput();
@@ -1237,7 +1259,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (event.message.role !== "assistant") break;
 				const retryWasActive = Boolean(progress.retryState);
 				const recoversRetry = isProviderBackedRecoveryEvent(event, eventOrdinal);
-				if (!retryWasActive) seenAssistantMessages.add(event.message);
+				if (!retryWasActive) rememberAssistantMessage(event.message);
 				if (recoversRetry || !retryWasActive) lastProviderProgressAtMs = now;
 				if (recoversRetry) {
 					progress.retryState = undefined;
@@ -1809,7 +1831,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (event.type === "auto_retry_start") {
 					retryStartOrdinal = eventOrdinal;
 					for (const message of session.messages) {
-						if (message.role === "assistant") seenAssistantMessages.add(message);
+						if (message.role === "assistant") rememberAssistantMessage(message);
 					}
 					progress.retryState = {
 						attempt: event.attempt,
