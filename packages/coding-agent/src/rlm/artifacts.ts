@@ -1,5 +1,5 @@
 /**
- * RLM session artifact layout under <cwd>/.gjc/_session-{gjcSessionId}/rlm/<rlmSessionId>/.
+ * RLM session artifact layout under <GJC session root>/rlm/<rlmSessionId>/.
  *
  * The GJC session id (process boundary) scopes the directory; the RLM session id
  * names the individual research run within it. The two ids are kept distinct.
@@ -7,7 +7,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { readNotebookDocument } from "../edit/notebook";
-import { rlmArtifactRoot } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForWrite } from "../gjc-runtime/session-resolution";
 import type { RlmArtifactPaths } from "./types";
 
@@ -26,15 +25,13 @@ export function generateRlmSessionId(now: Date = new Date()): string {
 	return `${stamp}-${suffix}`;
 }
 
-export function resolveRlmArtifactPaths(cwd: string, sessionId: string): RlmArtifactPaths {
+export function resolveRlmArtifactPaths(cwd: string, sessionId: string, gjcSessionRoot?: string): RlmArtifactPaths {
 	if (!isValidRlmSessionId(sessionId)) {
 		throw new Error(`Invalid RLM session id: ${JSON.stringify(sessionId)}`);
 	}
-	const dir = rlmArtifactRoot(
-		cwd,
-		resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId,
-		sessionId,
-	);
+	const sessionRoot =
+		gjcSessionRoot ?? resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).sessionRoot;
+	const dir = path.join(sessionRoot, RLM_DIR_SEGMENT, sessionId);
 	return {
 		dir,
 		notebookPath: path.join(dir, "notebook.ipynb"),
@@ -48,8 +45,8 @@ export async function ensureRlmSessionDir(paths: RlmArtifactPaths): Promise<void
 	await fs.mkdir(paths.dir, { recursive: true });
 }
 
-export async function rlmSessionExists(cwd: string, sessionId: string): Promise<boolean> {
-	const paths = resolveRlmArtifactPaths(cwd, sessionId);
+export async function rlmSessionExists(cwd: string, sessionId: string, gjcSessionRoot?: string): Promise<boolean> {
+	const paths = resolveRlmArtifactPaths(cwd, sessionId, gjcSessionRoot);
 	try {
 		const stat = await fs.stat(paths.dir);
 		return stat.isDirectory();
@@ -58,8 +55,8 @@ export async function rlmSessionExists(cwd: string, sessionId: string): Promise<
 	}
 }
 
-export async function readRlmNotebookIfPresent(cwd: string, sessionId: string) {
-	const paths = resolveRlmArtifactPaths(cwd, sessionId);
+export async function readRlmNotebookIfPresent(cwd: string, sessionId: string, gjcSessionRoot?: string) {
+	const paths = resolveRlmArtifactPaths(cwd, sessionId, gjcSessionRoot);
 	try {
 		return await readNotebookDocument(paths.notebookPath, paths.notebookPath);
 	} catch (error) {

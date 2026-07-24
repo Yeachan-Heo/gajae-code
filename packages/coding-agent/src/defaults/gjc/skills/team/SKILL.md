@@ -5,11 +5,16 @@ description: Multi-worker GJC tmux team orchestration
 source: "forked from upstream team skill and rebranded for GJC"
 ---
 
+<resolved-session-root>
+`<resolved-session-root>` is the session artifact directory: fresh sessions use `.gjc/sessions/_session-{sessionid}`; a unique existing legacy session remains at `.gjc/_session-{sessionid}`. There is no automatic migration, and older binaries do not discover nested session paths.
+</resolved-session-root>
+
+
 # Team Skill
 
 ## Purpose & Principles
 
-`$team` is the tmux-based multi-worker execution mode for GJC. It starts real GJC worker CLI sessions by splitting the current tmux leader window and coordinates them through `.gjc/_session-{sessionid}/state/team/...` files plus CLI team interop (`gjc team api ...`) and state files.
+`$team` is the tmux-based multi-worker execution mode for GJC. It starts real GJC worker CLI sessions by splitting the current tmux leader window and coordinates them through `<resolved-session-root>/state/team/...` files plus CLI team interop (`gjc team api ...`) and state files.
 
 This skill is operationally sensitive. Treat it as an operator workflow, not a generic prompt pattern. In GJC App or plain outside-tmux sessions, do not present `$team` / `gjc team` as directly available; launch GJC CLI from shell first, or stay on the nearest app-safe surface until the user explicitly wants the tmux runtime.
 
@@ -64,9 +69,9 @@ requiring a separate linked execution loop up front. GJC team supports current-w
 
 ### Team + Ultragoal bridge
 
-Use `$ultragoal` for durable leader-owned goal/ledger tracking and `$team` for parallel visible tmux execution lanes. When Team is launched with an active `.gjc/_session-{sessionid}/ultragoal/goals.json`, worker task/status context may include leader-owned Ultragoal context: `.gjc/_session-{sessionid}/ultragoal/goals.json`, `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl`, the active goal id, GJC goal mode, and the `fresh_leader_goal_get_required` checkpoint policy.
+Use `$ultragoal` for durable leader-owned goal/ledger tracking and `$team` for parallel visible tmux execution lanes. When Team is launched with an active `<resolved-session-root>/ultragoal/goals.json`, worker task/status context may include leader-owned Ultragoal context: `<resolved-session-root>/ultragoal/goals.json`, `<resolved-session-root>/ultragoal/ledger.jsonl`, the active goal id, GJC goal mode, and the `fresh_leader_goal_get_required` checkpoint policy.
 
-Workers provide task status and verification evidence only. They do not own Ultragoal goal state, create worker ledgers, mutate `.gjc/_session-{sessionid}/ultragoal`, auto-launch Team from Ultragoal, or perform hidden GJC goal mutation. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Ultragoal does not auto-launch Team and performs no hidden goal mutation. The leader uses terminal Team evidence plus the current-session active GJC goal snapshot and strict quality gate to run `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/_session-{sessionid}/ultragoal and <id>>" --quality-gate-json <quality-gate-json-or-path>`.
+Workers provide task status and verification evidence only. They do not own Ultragoal goal state, create worker ledgers, mutate `<resolved-session-root>/ultragoal`, auto-launch Team from Ultragoal, or perform hidden GJC goal mutation. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Ultragoal does not auto-launch Team and performs no hidden goal mutation. The leader uses terminal Team evidence plus the current-session active GJC goal snapshot and strict quality gate to run `gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning <resolved-session-root>/ultragoal and <id>>" --quality-gate-json <quality-gate-json-or-path>`.
 
 ### Worker command override
 
@@ -143,19 +148,19 @@ When `$team` is used as a follow-up mode from ralplan, carry forward the approve
 1. Parse args (`N`, `agent-type`, task), default to 3 workers, and cap workers at 20.
 2. Non-dry-run: detect the current tmux leader context with `display-message -p "#S:#I #{pane_id}"` before creating state or worktrees.
 3. Initialize team state:
-   - `.gjc/_session-{sessionid}/state/team/<team>/config.json`
-   - `.gjc/_session-{sessionid}/state/team/<team>/manifest.v2.json`
-   - `.gjc/_session-{sessionid}/state/team/<team>/tasks/task-*.json` (one per explicit lane section, otherwise one worker-owned compatibility task per worker)
-   - `.gjc/_session-{sessionid}/state/team/<team>/mailbox/worker-1.json`
-   - `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/status.json`
-   - `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/lifecycle.json`
-   - `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/heartbeat.json`
+   - `<resolved-session-root>/state/team/<team>/config.json`
+   - `<resolved-session-root>/state/team/<team>/manifest.v2.json`
+   - `<resolved-session-root>/state/team/<team>/tasks/task-*.json` (one per explicit lane section, otherwise one worker-owned compatibility task per worker)
+   - `<resolved-session-root>/state/team/<team>/mailbox/worker-1.json`
+   - `<resolved-session-root>/state/team/<team>/workers/<worker>/status.json`
+   - `<resolved-session-root>/state/team/<team>/workers/<worker>/lifecycle.json`
+   - `<resolved-session-root>/state/team/<team>/workers/<worker>/heartbeat.json`
 4. Resolve the worker command from `GJC_TEAM_WORKER_COMMAND` or the active `gjc` entrypoint.
 5. Split the current tmux window like GJC team: worker 1 is split horizontally to the right of the leader, workers 2..N are vertically stacked in the right column, then `select-layout main-vertical` and `main-pane-width` keep leader-left/worker-right at roughly 50/50.
 6. Launch the worker with:
    - `GJC_TEAM_NAME=<team>`
    - `GJC_TEAM_WORKER_ID=worker-1`
-   - `GJC_TEAM_STATE_ROOT=<leader-cwd>/.gjc/_session-{sessionid}/state/team`
+   - `GJC_TEAM_STATE_ROOT=<leader-cwd>/<resolved-session-root>/state/team`
    - optional `GJC_TEAM_WORKTREE_PATH=<path>` when worktree mode is active
 7. Automatically integrate worker worktree commits during leader monitoring:
    - dirty worker worktrees are auto-checkpointed before integration
@@ -234,7 +239,7 @@ Semantics:
 - `list`: pure read path; lists known teams without integrating worker commits.
 - API/read-only snapshot operations are pure unless explicitly documented as a monitor path.
 - `claim-task`: mutating task path; before granting a new claim, it recovers expired claims and rejects claims from workers already classified as not live.
-- `shutdown`: writes per-worker graceful `shutdown-request.json`, moves lifecycle through `draining` to `stopped`, kills the recorded worker pane when it still belongs to the stored tmux target, removes clean created worktrees, marks worker runtime status stopped, and sets phase from task, lifecycle, and integration state: `complete` only when all tasks have verified `completion_evidence`, every worker has matching graceful shutdown lifecycle evidence, and no integration request/conflict is pending; `awaiting_integration` when tasks and lifecycle are complete but leader integration still requires action; `failed` when tasks failed/blocked or completed tasks lack valid evidence; and `cancelled` when work remains pending or in progress. It preserves `.gjc/_session-{sessionid}/state/team/<team>` as evidence.
+- `shutdown`: writes per-worker graceful `shutdown-request.json`, moves lifecycle through `draining` to `stopped`, kills the recorded worker pane when it still belongs to the stored tmux target, removes clean created worktrees, marks worker runtime status stopped, and sets phase from task, lifecycle, and integration state: `complete` only when all tasks have verified `completion_evidence`, every worker has matching graceful shutdown lifecycle evidence, and no integration request/conflict is pending; `awaiting_integration` when tasks and lifecycle are complete but leader integration still requires action; `failed` when tasks failed/blocked or completed tasks lack valid evidence; and `cancelled` when work remains pending or in progress. It preserves `<resolved-session-root>/state/team/<team>` as evidence.
 
 ## Data Plane and Control Plane
 
@@ -246,26 +251,26 @@ Semantics:
 
 ### Data Plane
 
-- `.gjc/_session-{sessionid}/state/team/<team>/config.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/manifest.v2.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/phase.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/events.jsonl`
-- `.gjc/_session-{sessionid}/state/team/<team>/trace.jsonl`
-- `.gjc/_session-{sessionid}/state/team/<team>/trace-errors.jsonl`
-- `.gjc/_session-{sessionid}/state/team/<team>/telemetry.jsonl`
-- `.gjc/_session-{sessionid}/state/team/<team>/monitor-snapshot.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/integration-report.md`
-- `.gjc/_session-{sessionid}/state/team/<team>/tasks/task-1.json` (includes structured `completion_evidence` after completed transitions)
-- `.gjc/_session-{sessionid}/state/team/<team>/mailbox/worker-1/<message-id>.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/mailbox/worker-1.json` (legacy compatibility view)
-- `.gjc/_session-{sessionid}/state/team/<team>/notifications/<notification-id>.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/startup-ack.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/status.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/lifecycle.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/heartbeat.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/shutdown-request.json`
-- `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/nudges/<fingerprint>.json`
-- `.gjc/_session-{sessionid}/reports/team-commit-hygiene/<team>.ledger.json`
+- `<resolved-session-root>/state/team/<team>/config.json`
+- `<resolved-session-root>/state/team/<team>/manifest.v2.json`
+- `<resolved-session-root>/state/team/<team>/phase.json`
+- `<resolved-session-root>/state/team/<team>/events.jsonl`
+- `<resolved-session-root>/state/team/<team>/trace.jsonl`
+- `<resolved-session-root>/state/team/<team>/trace-errors.jsonl`
+- `<resolved-session-root>/state/team/<team>/telemetry.jsonl`
+- `<resolved-session-root>/state/team/<team>/monitor-snapshot.json`
+- `<resolved-session-root>/state/team/<team>/integration-report.md`
+- `<resolved-session-root>/state/team/<team>/tasks/task-1.json` (includes structured `completion_evidence` after completed transitions)
+- `<resolved-session-root>/state/team/<team>/mailbox/worker-1/<message-id>.json`
+- `<resolved-session-root>/state/team/<team>/mailbox/worker-1.json` (legacy compatibility view)
+- `<resolved-session-root>/state/team/<team>/notifications/<notification-id>.json`
+- `<resolved-session-root>/state/team/<team>/workers/<worker>/startup-ack.json`
+- `<resolved-session-root>/state/team/<team>/workers/<worker>/status.json`
+- `<resolved-session-root>/state/team/<team>/workers/<worker>/lifecycle.json`
+- `<resolved-session-root>/state/team/<team>/workers/<worker>/heartbeat.json`
+- `<resolved-session-root>/state/team/<team>/workers/<worker>/shutdown-request.json`
+- `<resolved-session-root>/state/team/<team>/workers/<worker>/nudges/<fingerprint>.json`
+- `<resolved-session-root>/reports/team-commit-hygiene/<team>.ledger.json`
 
 ## Team Mutation Interop (CLI-first)
 
@@ -303,10 +308,10 @@ GJC ports team-mode concepts from `../../oh-my-codex`, not code or OMX/Codex-spe
 
 | Concept | GJC-native equivalent |
 |---------|-----------------------|
-| Worker identity/inbox/mailbox paths | `.gjc/_session-{sessionid}/state/team/<team>/workers/<worker>/identity.json`, `inbox.md`, and per-message mailbox records under `.gjc/_session-{sessionid}/state/team/<team>/mailbox/<worker>/`. |
+| Worker identity/inbox/mailbox paths | `<resolved-session-root>/state/team/<team>/workers/<worker>/identity.json`, `inbox.md`, and per-message mailbox records under `<resolved-session-root>/state/team/<team>/mailbox/<worker>/`. |
 | Startup ACK | `gjc team api worker-startup-ack`, persisted as `workers/<worker>/startup-ack.json`. |
 | Claim-safe lifecycle APIs | `claim-task`, `transition-task-status`, and `release-task-claim` with worker ownership and claim-token guards. |
-| Delivery states and deferred pane attempts | Native notification records under `.gjc/_session-{sessionid}/state/team/<team>/notifications/` with `pending`, `sent`, `queued`, `deferred`, `failed`, `delivered`, and `acknowledged` states. |
+| Delivery states and deferred pane attempts | Native notification records under `<resolved-session-root>/state/team/<team>/notifications/` with `pending`, `sent`, `queued`, `deferred`, `failed`, `delivered`, and `acknowledged` states. |
 | Non-destructive leader nudges | Lifecycle nudge records under `workers/<worker>/nudges/`; GJC suggests inspection/relaunch but never auto-kills or auto-relaunches workers. |
 
 Forbidden assumptions: do not copy OMX paths, Codex notify payload formats, OMX process names, or source code directly. Keep tmux as the current runtime; native split-worker TUI remains roadmap-only.
@@ -318,7 +323,7 @@ Worker protocol:
 - Claim pending work with `claim-task`.
 - Transition the task to `completed`, `failed`, or `blocked` with `transition-task-status`, including claim token and evidence for completion.
 - Commit or leave worktree changes in the worker worktree; the leader `monitor`/`resume` path will auto-checkpoint dirty worktrees and integrate committed history where possible.
-- Record implementation/verification evidence in normal task output and state files; leader integration/conflict notifications are delivered through `.gjc/_session-{sessionid}/state/team/<team>/mailbox/leader-fixed.json`.
+- Record implementation/verification evidence in normal task output and state files; leader integration/conflict notifications are delivered through `<resolved-session-root>/state/team/<team>/mailbox/leader-fixed.json`.
 
 ## Environment Knobs
 
@@ -332,7 +337,7 @@ Useful runtime env vars:
 - `GJC_TEAM_WORKER_COMMAND`
   - worker command override (default resolves to active GJC entrypoint or `gjc`)
 - `GJC_TEAM_STATE_ROOT`
-  - team state root override (default `<cwd>/.gjc/_session-{sessionid}/state/team`)
+  - team state root override (default `<cwd>/<resolved-session-root>/state/team`)
 
 ## Failure Modes and Diagnosis
 
@@ -345,18 +350,18 @@ Operator note (important for GJC panes):
 
 - **Outside tmux:** non-dry-run launch fails before team state or worktrees are created. Start `gjc team` from an attached tmux leader pane.
 - **Split failure:** startup records a failed phase if state was already initialized, rolls back created worktrees, and never kills the leader tmux session.
-- **Worker API ENOENT:** team state is missing or `GJC_TEAM_STATE_ROOT` points somewhere else. Check `.gjc/_session-{sessionid}/state/team/<team>/` before assuming worker failure.
+- **Worker API ENOENT:** team state is missing or `GJC_TEAM_STATE_ROOT` points somewhere else. Check `<resolved-session-root>/state/team/<team>/` before assuming worker failure.
 - **Stale pane on shutdown:** shutdown only kills a recorded worker pane when it still belongs to the stored `tmux_target` and is not the leader pane. Stale panes outside that target require manual inspection.
-- **Integration conflict:** `gjc team monitor <team>` / `resume` aborts the failing merge, cherry-pick, or worker rebase; `gjc team status <team>` is read-only inspection. Inspect `.gjc/_session-{sessionid}/state/team/<team>/integration-report.md`, `.gjc/_session-{sessionid}/state/team/<team>/events.jsonl`, `.gjc/_session-{sessionid}/state/team/<team>/mailbox/leader-fixed.json`, and `.gjc/_session-{sessionid}/reports/team-commit-hygiene/<team>.ledger.json`.
+- **Integration conflict:** `gjc team monitor <team>` / `resume` aborts the failing merge, cherry-pick, or worker rebase; `gjc team status <team>` is read-only inspection. Inspect `<resolved-session-root>/state/team/<team>/integration-report.md`, `<resolved-session-root>/state/team/<team>/events.jsonl`, `<resolved-session-root>/state/team/<team>/mailbox/leader-fixed.json`, and `<resolved-session-root>/reports/team-commit-hygiene/<team>.ledger.json`.
 
 ### Safe Manual Intervention (last resort)
 
 Use only after checking `gjc team status <team>` and state evidence:
 
 1. Inspect team files:
-   - `.gjc/_session-{sessionid}/state/team/<team>/config.json`
-   - `.gjc/_session-{sessionid}/state/team/<team>/tasks/task-1.json`
-   - `.gjc/_session-{sessionid}/state/team/<team>/mailbox/worker-1.json`
+   - `<resolved-session-root>/state/team/<team>/config.json`
+   - `<resolved-session-root>/state/team/<team>/tasks/task-1.json`
+   - `<resolved-session-root>/state/team/<team>/mailbox/worker-1.json`
 2. Use supported team surfaces before manual pane intervention:
    - `gjc team status <team>` for current recorded state
    - `gjc team monitor <team>` when a live monitor/update loop is needed
@@ -407,7 +412,7 @@ When operating this skill, provide concrete progress evidence:
 
 1. Team started line (`Team started: <name>`)
 2. tmux target and worker pane id
-3. task state from read-only `gjc team status <team>`, mutating `gjc team monitor <team>`, or `.gjc/_session-{sessionid}/state/team/<team>/tasks/task-1.json`
+3. task state from read-only `gjc team status <team>`, mutating `gjc team monitor <team>`, or `<resolved-session-root>/state/team/<team>/tasks/task-1.json`
 4. shutdown outcome (`phase=complete`, worker status `stopped`) when the run is terminal; incomplete shutdowns must report `phase=cancelled`/`failed`, and integration-blocked shutdowns must report `phase=awaiting_integration`
 
 Do not claim success without file/pane evidence.
@@ -425,7 +430,7 @@ Use the `gjc team ...` CLI as the supported team-launch surface. For automation,
 - **`gjc team monitor <team>`** — Follow live progress through the supported runtime surface.
 - **`gjc team shutdown <team>`** — Stop recorded active workers and move the team toward terminal state.
 - **`gjc team api <team>`** — Use only for documented programmatic operations exposed by the team runtime.
-- **Team state files** — Inspect `.gjc/_session-{sessionid}/state/team/<team>/` when you need status, task, or mailbox evidence after launch.
+- **Team state files** — Inspect `<resolved-session-root>/state/team/<team>/` when you need status, task, or mailbox evidence after launch.
 
 ### Cleanup distinction
 
@@ -462,4 +467,4 @@ When the team task-set completes OR the user requests return to planning/persist
 gjc state team write --input '{"current_phase":"handoff"}' --json
 ```
 
-The skill tool then dispatches `/skill:ralplan`, `/skill:deep-interview`, or `/skill:ultragoal` same-turn and runs `gjc state team handoff --to <ralplan|deep-interview|ultragoal> --json` in-process to atomically demote team, promote the callee, and sync both `.gjc/_session-{sessionid}/state/skill-active-state.json` files. You do not need to run the handoff verb yourself.
+The skill tool then dispatches `/skill:ralplan`, `/skill:deep-interview`, or `/skill:ultragoal` same-turn and runs `gjc state team handoff --to <ralplan|deep-interview|ultragoal> --json` in-process to atomically demote team, promote the callee, and sync both `<resolved-session-root>/state/skill-active-state.json` files. You do not need to run the handoff verb yourself.

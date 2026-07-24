@@ -17,6 +17,7 @@ import {
 	activeSnapshotPath as layoutActiveSnapshotPath,
 	activeStateDir as layoutActiveStateDir,
 	auditPath as layoutAuditPath,
+	sessionRoot as layoutSessionRoot,
 	transactionJournalPath as layoutTransactionJournalPath,
 } from "./session-layout";
 import { RequiredOnWriteEnvelopeSchema } from "./state-schema";
@@ -63,6 +64,8 @@ export interface StateWriterReceiptContext {
 export interface StateWriterAuditContext {
 	cwd?: string;
 	sessionId?: string;
+	/** Physical session root selected by session resolution, when layout-affinity matters. */
+	sessionRoot?: string;
 	category: WriterCategory;
 	verb: string;
 	owner: WorkflowStateMutationOwner;
@@ -183,6 +186,8 @@ export interface DeleteResult {
 
 export interface ActiveSessionScope {
 	sessionId?: string;
+	/** Physical session root selected by session resolution, when layout-affinity matters. */
+	sessionRoot?: string;
 }
 
 export interface ActiveEntryWriteResult {
@@ -386,8 +391,26 @@ function requireSessionId(sessionScope: string | ActiveSessionScope | undefined,
 	if (!normalizedSessionId) throw new Error(`a non-empty GJC session id is required (${source})`);
 	return normalizedSessionId;
 }
+function validatedSessionRoot(
+	cwd: string,
+	sessionScope: string | ActiveSessionScope | undefined,
+	source: string,
+): string | undefined {
+	if (typeof sessionScope === "string") return undefined;
+	const suppliedRoot = sessionScope?.sessionRoot?.trim();
+	if (!suppliedRoot) return undefined;
+	const sessionId = requireSessionId(sessionScope, source);
+	const expectedRoot = path.resolve(layoutSessionRoot(cwd, sessionId));
+	const resolvedRoot = path.resolve(suppliedRoot);
+	if (resolvedRoot !== expectedRoot) {
+		throw new Error(`session root does not match the resolved root for "${sessionId}": ${resolvedRoot}`);
+	}
+	return expectedRoot;
+}
 
 function activeStateDir(cwd: string, sessionScope?: string | ActiveSessionScope): string {
+	const sessionRoot = validatedSessionRoot(cwd, sessionScope, "activeStateDir");
+	if (sessionRoot) return path.join(sessionRoot, "state", "active");
 	return layoutActiveStateDir(cwd, requireSessionId(sessionScope, "activeStateDir"));
 }
 
@@ -404,10 +427,17 @@ function invalidateActiveStateCacheForScope(cwd: string, sessionScope?: string |
 }
 
 function activeSnapshotPath(cwd: string, sessionScope?: string | ActiveSessionScope): string {
+	const sessionRoot = validatedSessionRoot(cwd, sessionScope, "activeSnapshotPath");
+	if (sessionRoot) return path.join(sessionRoot, "state", "skill-active-state.json");
 	return layoutActiveSnapshotPath(cwd, requireSessionId(sessionScope, "activeSnapshotPath"));
 }
 
 function activeEntryPath(cwd: string, sessionScope: string | ActiveSessionScope | undefined, skill: string): string {
+	const sessionRoot = validatedSessionRoot(cwd, sessionScope, "activeEntryPath");
+	if (sessionRoot) {
+		const canonicalPath = layoutActiveEntryPath(cwd, requireSessionId(sessionScope, "activeEntryPath"), skill);
+		return path.join(activeStateDir(cwd, sessionScope), path.basename(canonicalPath));
+	}
 	return layoutActiveEntryPath(cwd, requireSessionId(sessionScope, "activeEntryPath"), skill);
 }
 
@@ -570,18 +600,28 @@ async function maybeAudit(mutatedPath: string, options?: StateWriterOptions): Pr
 	if (!options?.audit) return;
 	const audit = options.audit;
 	const cwd = path.resolve(audit.cwd ?? options.cwd ?? process.cwd());
-	await appendAuditEntry(cwd, options?.audit?.sessionId ?? "", {
-		ts: new Date().toISOString(),
-		skill: audit.skill,
-		category: audit.category,
-		verb: audit.verb,
-		owner: audit.owner,
-		mutation_id: audit.mutationId ?? randomUUID(),
-		from_phase: audit.fromPhase,
-		to_phase: audit.toPhase,
-		forced: audit.forced ?? false,
-		paths: [mutatedPath],
-	});
+	const sessionId = audit.sessionId?.trim() ?? "";
+	if (!sessionId) throw new Error("a non-empty GJC session id is required (maybeAudit)");
+	const filePath = audit.sessionRoot?.trim()
+		? resolveGjcTarget(path.join(path.resolve(audit.sessionRoot), "state", "audit.jsonl"), cwd)
+		: resolveGjcTarget(layoutAuditPath(cwd, sessionId), cwd);
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await fs.appendFile(
+		filePath,
+		`${JSON.stringify({
+			ts: new Date().toISOString(),
+			skill: audit.skill,
+			category: audit.category,
+			verb: audit.verb,
+			owner: audit.owner,
+			mutation_id: audit.mutationId ?? randomUUID(),
+			from_phase: audit.fromPhase,
+			to_phase: audit.toPhase,
+			forced: audit.forced ?? false,
+			paths: [mutatedPath],
+		})}\n`,
+		"utf-8",
+	);
 }
 
 async function atomicWrite(filePath: string, content: string): Promise<string> {
@@ -1128,9 +1168,11 @@ export async function removeFileAudited(targetPath: string, options?: StateWrite
 }
 
 /**
- * Active entry files under `.gjc/_session-{id}/state/active/<skill>.json` are authoritative. The
- * adjacent `skill-active-state.json` file is only a derived cache rebuilt from
- * those entries, so concurrent snapshot rebuilds can race without losing any
+ * Active entry files under `<resolved-session-root>/state/active/<skill>.json`
+ * are authoritative. Fresh sessions resolve beneath `.gjc/sessions/`; a unique
+ * existing legacy root remains authoritative by affinity. The adjacent
+ * `skill-active-state.json` file is only a derived cache rebuilt from those
+ * entries, so concurrent snapshot rebuilds can race without losing any
  * writer's per-skill state.
  */
 export async function writeActiveEntry(

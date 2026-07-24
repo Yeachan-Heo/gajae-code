@@ -21,11 +21,12 @@ import {
 	questionHash,
 	reviewDeepInterviewIntent,
 } from "./deep-interview-state";
-import { writeSessionActivityMarker } from "./session-resolution";
+import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { readExistingStateForMutation, transformGuardedWorkflowEnvelopeAtomic } from "./state-writer";
 
 export * from "./deep-interview-ambiguity";
 export * from "./deep-interview-state";
+
 
 /**
  * Runtime-owned deep-interview round recorder (conflict-aware scoring support).
@@ -337,12 +338,16 @@ async function syncRecorderHud(
 	sessionId: string | undefined,
 ): Promise<void> {
 	const phase = typeof envelope.current_phase === "string" ? envelope.current_phase : "interviewing";
+	const sessionRoot = sessionId
+		? resolveGjcSessionForWrite(cwd, { payloadSessionId: sessionId }).sessionRoot
+		: undefined;
 	await syncSkillActiveState({
 		cwd,
 		skill: "deep-interview",
 		active: phase !== "complete",
 		phase,
 		sessionId,
+		...(sessionRoot ? { sessionRoot } : {}),
 		source: "gjc-runtime-deep-interview-recorder",
 		hud: deriveDeepInterviewHud(envelope, { phase }),
 		...(typeof envelope.state_revision === "number" ? { committedModeRevision: envelope.state_revision } : {}),
@@ -439,6 +444,7 @@ export async function appendOrMergeDeepInterviewRound(
 	if (input.customInput !== undefined)
 		assertDeepInterviewInputWithinLimit(input.customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 	if (!options.sessionId) throw new Error("deep-interview recorder requires a session id");
+	const session = resolveGjcSessionForWrite(cwd, { payloadSessionId: options.sessionId });
 	const initial = await readEnvelope(statePath);
 	let result: AppendOrMergeResult | undefined;
 	const now = new Date().toISOString();
@@ -459,6 +465,7 @@ export async function appendOrMergeDeepInterviewRound(
 			owner: "gjc-runtime",
 			skill: "deep-interview",
 			sessionId: options.sessionId,
+			sessionRoot: session.sessionRoot,
 		},
 		transform: current => {
 			const envelope = ensureDeepInterviewStateShape(current);
@@ -612,6 +619,7 @@ export async function enrichDeepInterviewRoundScoring(
 ): Promise<{ record: DeepInterviewRoundRecord; warnings: DeepInterviewPostCommitWarning[] }> {
 	assertDeepInterviewStructuredResponseWithinLimit(input);
 	if (!options.sessionId) throw new Error("deep-interview recorder requires a session id");
+	const session = resolveGjcSessionForWrite(cwd, { payloadSessionId: options.sessionId });
 	const initial = await readEnvelope(statePath);
 	const now = new Date().toISOString();
 	let record: DeepInterviewRoundRecord | undefined;
@@ -632,6 +640,7 @@ export async function enrichDeepInterviewRoundScoring(
 			owner: "gjc-runtime",
 			skill: "deep-interview",
 			sessionId: options.sessionId,
+			sessionRoot: session.sessionRoot,
 		},
 		transform: current => {
 			const envelope = ensureDeepInterviewStateShape(current);

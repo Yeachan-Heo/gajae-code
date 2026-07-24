@@ -39,13 +39,14 @@ import {
 	mergeDeepInterviewEnvelope,
 	normalizeDeepInterviewEnvelope,
 } from "./deep-interview-state";
-import { activeSnapshotPath, auditPath, modeStatePath, sessionStateDir } from "./session-layout";
 import {
-	resolveGjcSessionForRead,
-	resolveGjcSessionForWrite,
-	SessionResolutionError,
-	writeSessionActivityMarker,
-} from "./session-resolution";
+	activeSnapshotPath,
+	auditPath,
+	type GjcSessionContext,
+	modeStatePath,
+	sessionStateDir,
+} from "./session-layout";
+import { resolveGjcSessionForRead, resolveGjcSessionForWrite, SessionResolutionError } from "./session-resolution";
 import { classifyStateArgv, firstStateFlagValue, type StateAction, type StateArgvClassification } from "./state-argv";
 import { renderStateGraph, type StateGraphFormat } from "./state-graph";
 import { migrateAndPersistLegacyState, migrateWorkflowState } from "./state-migrations";
@@ -83,8 +84,10 @@ import { getSkillManifest, isKnownWorkflowState, isValidTransition } from "./wor
  * Native implementation of the `gjc state read|write|clear` command surface.
  *
  * Simple file-receipt operations against session-scoped state under
- * `.gjc/_session-{id}/state/`. This is the sanctioned CLI mediator for
- * mutation-guarded GJC state — agents call it instead of editing those files directly.
+ * `.gjc/sessions/_session-{id}/state/`. A unique existing legacy
+ * `.gjc/_session-{id}/state/` root remains authoritative for compatibility.
+ * This is the sanctioned CLI mediator for mutation-guarded GJC state — agents
+ * call it instead of editing those files directly.
  */
 
 export interface StateCommandResult {
@@ -149,6 +152,7 @@ async function readInputJson(value: string | undefined, cwd: string): Promise<Re
 interface ResolvedSelectors {
 	mode: CanonicalGjcWorkflowSkill | undefined;
 	gjcSessionId: string;
+	sessionRoot: string;
 	threadId: string | undefined;
 	turnId: string | undefined;
 	payload: Record<string, unknown> | undefined;
@@ -196,6 +200,7 @@ async function resolveSelectors(args: readonly string[], cwd: string, action: St
 	return {
 		mode: mode as CanonicalGjcWorkflowSkill | undefined,
 		gjcSessionId: session.gjcSessionId,
+		sessionRoot: session.sessionRoot,
 		threadId,
 		turnId,
 		payload,
@@ -214,8 +219,16 @@ async function inferModeFromActiveState(
 	return canonical ?? undefined;
 }
 
-function stateDirFor(cwd: string, sessionId: string): string {
-	return sessionStateDir(cwd, sessionId);
+function stateDirForRoot(sessionRoot: string): string {
+	return path.join(sessionRoot, "state");
+}
+
+function modeStateFileForRoot(sessionRoot: string, mode: string): string {
+	return path.join(stateDirForRoot(sessionRoot), `${mode}-state.json`);
+}
+
+function activeStateFileForRoot(sessionRoot: string): string {
+	return path.join(stateDirForRoot(sessionRoot), SKILL_ACTIVE_STATE_FILE);
 }
 
 function modeStateFile(cwd: string, mode: string, sessionId: string): string {
@@ -230,11 +243,32 @@ function stateRelativePath(cwd: string, filePath: string): string {
 	return path.relative(cwd, filePath).split(path.sep).join(path.posix.sep);
 }
 
-async function touchStateActivityMarker(cwd: string, sessionId: string, filePath: string): Promise<void> {
-	await writeSessionActivityMarker(cwd, sessionId, {
-		writer: "state-runtime",
-		path: stateRelativePath(cwd, filePath),
-	});
+async function touchStateActivityMarker(
+	sessionOrCwd: Pick<GjcSessionContext, "gjcSessionId" | "sessionRoot"> | string,
+	cwdOrSessionId: string,
+	filePath: string,
+): Promise<void> {
+	const session =
+		typeof sessionOrCwd === "string"
+			? resolveGjcSessionForWrite(sessionOrCwd, { payloadSessionId: cwdOrSessionId })
+			: sessionOrCwd;
+	const cwd = typeof sessionOrCwd === "string" ? sessionOrCwd : cwdOrSessionId;
+	const markerPath = path.join(session.sessionRoot, ".session-activity.json");
+	await fs.mkdir(path.dirname(markerPath), { recursive: true });
+	await fs.writeFile(
+		markerPath,
+		`${JSON.stringify(
+			{
+				session_id: session.gjcSessionId,
+				updated_at: new Date().toISOString(),
+				writer: "state-runtime",
+				path: stateRelativePath(cwd, filePath),
+			},
+			null,
+			2,
+		)}\n`,
+		"utf-8",
+	);
 }
 
 async function readActivePhaseForSkill(
@@ -350,10 +384,6 @@ function doctorProblem(
 	return skill
 		? { type, skill, path: pathValue, message, fixCommand }
 		: { type, path: pathValue, message, fixCommand };
-}
-
-function activeEntryDir(cwd: string, sessionId: string): string {
-	return path.join(stateDirFor(cwd, sessionId), "active");
 }
 
 function skillFromActiveValue(value: unknown): string | undefined {
@@ -482,7 +512,7 @@ async function collectDoctorSummary(
 		const snapshotPath = activeStateFile(cwd, scopeSessionId);
 		const snapshot = await readRawJson(snapshotPath);
 		if (snapshot.exists) filesScanned += 1;
-		const entryFiles = await listJsonFiles(activeEntryDir(cwd, scopeSessionId));
+		const entryFiles = await listJsonFiles(path.join(root, "active"));
 		const entrySkills = new Set<string>();
 		for (const entryPath of entryFiles) {
 			filesScanned += 1;
@@ -670,6 +700,7 @@ async function writeJsonAtomic(
 	verb: "write" | "clear" | "handoff" | "reconcile" = "write",
 	options?: {
 		sessionId: string;
+		sessionRoot?: string;
 		skill?: CanonicalGjcWorkflowSkill;
 		mutationId?: string;
 		force?: boolean;
@@ -697,6 +728,7 @@ async function writeJsonAtomic(
 		policy: "source",
 		audit: {
 			sessionId: options?.sessionId ?? "",
+			sessionRoot: options?.sessionRoot,
 			category: "state",
 			verb,
 			owner: options?.owner ?? "gjc-state-cli",
@@ -933,6 +965,7 @@ async function syncWorkflowSkillState(options: {
 	cwd: string;
 	mode: CanonicalGjcWorkflowSkill;
 	sessionId: string;
+	sessionRoot?: string;
 	threadId?: string;
 	turnId?: string;
 	active: boolean;
@@ -947,6 +980,7 @@ async function syncWorkflowSkillState(options: {
 			active: options.active,
 			phase: options.phase,
 			sessionId: options.sessionId,
+			sessionRoot: options.sessionRoot,
 			threadId: options.threadId,
 			turnId: options.turnId,
 			source: "gjc-state-cli",
@@ -980,13 +1014,13 @@ export async function reconcileWorkflowSkillState(options: {
 	payload: Record<string, unknown>;
 	sourceRevision?: number;
 }): Promise<{ stateFile: string }> {
-	const { gjcSessionId: sessionId } = resolveGjcSessionForWrite(options.cwd, {
+	const session = resolveGjcSessionForWrite(options.cwd, {
 		payloadSessionId: options.sessionId,
 		envSessionId: process.env.GJC_SESSION_ID,
 	});
 	return withWorkflowStateLock(
-		path.relative(options.cwd, modeStateFile(options.cwd, options.mode, sessionId)),
-		async () => reconcileWorkflowSkillStateUnlocked(options, sessionId),
+		path.relative(options.cwd, modeStateFileForRoot(session.sessionRoot, options.mode)),
+		async () => reconcileWorkflowSkillStateUnlocked(options, session.gjcSessionId),
 	);
 }
 
@@ -1106,7 +1140,7 @@ export async function readWorkflowStateJson(
 		payloadSessionId: sessionId,
 		envSessionId: process.env.GJC_SESSION_ID,
 	});
-	return (await readJsonFile(modeStateFile(cwd, skill, session.gjcSessionId))) ?? {};
+	return (await readJsonFile(modeStateFileForRoot(session.sessionRoot, skill))) ?? {};
 }
 
 async function handleRead(args: readonly string[], cwd: string): Promise<StateCommandResult> {
@@ -1114,8 +1148,8 @@ async function handleRead(args: readonly string[], cwd: string): Promise<StateCo
 	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, selectors.gjcSessionId));
 	const fields = parseFieldsFlag(args);
 	if (mode) {
-		const filePath = modeStateFile(cwd, mode, selectors.gjcSessionId);
-		const existing = await readWorkflowStateJson(cwd, mode, selectors.gjcSessionId);
+		const filePath = modeStateFileForRoot(selectors.sessionRoot, mode);
+		const existing = (await readJsonFile(filePath)) ?? {};
 		const envelope = { skill: mode, state: existing, storage_path: filePath };
 		const manifest = getSkillManifest(mode);
 		if (fields) {
@@ -1143,7 +1177,7 @@ async function handleRead(args: readonly string[], cwd: string): Promise<StateCo
 				: renderStateMarkdown(mode, envelope, manifest),
 		};
 	}
-	const filePath = activeStateFile(cwd, selectors.gjcSessionId);
+	const filePath = activeStateFileForRoot(selectors.sessionRoot);
 	const existingRaw = await readJsonValue(filePath);
 	const existing = isPlainObject(existingRaw) ? existingRaw : null;
 	return { status: 0, stdout: `${JSON.stringify(existing ?? {}, null, 2)}\n` };
@@ -1158,8 +1192,8 @@ async function handleStatus(args: readonly string[], cwd: string): Promise<State
 			"gjc state status requires --mode <skill>, positional <skill>, input.skill, or an active workflow in the current session active state",
 		);
 	}
-	const filePath = modeStateFile(cwd, mode, selectors.gjcSessionId);
-	const existing = await readWorkflowStateJson(cwd, mode, selectors.gjcSessionId);
+	const filePath = modeStateFileForRoot(selectors.sessionRoot, mode);
+	const existing = (await readJsonFile(filePath)) ?? {};
 	const summary = buildStateStatusSummary(
 		mode,
 		{ skill: mode, state: existing, storage_path: filePath },
@@ -1174,7 +1208,7 @@ async function handleStatus(args: readonly string[], cwd: string): Promise<State
 
 async function handleWrite(args: readonly string[], cwd: string): Promise<StateCommandResult> {
 	const selectors = await resolveSelectors(args, cwd, "write");
-	const { gjcSessionId: sessionId, threadId, turnId, payload } = selectors;
+	const { gjcSessionId: sessionId, sessionRoot, threadId, turnId, payload } = selectors;
 	if (!payload) throw new StateCommandError(2, "gjc state write requires --input '<json>'");
 	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, sessionId));
 	if (!mode)
@@ -1190,7 +1224,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 			throw new StateCommandError(2, error instanceof Error ? error.message : String(error));
 		}
 	}
-	const filePath = modeStateFile(cwd, mode, sessionId);
+	const filePath = modeStateFileForRoot(sessionRoot, mode);
 	const forced = hasFlag(args, "--force");
 	return await withWorkflowStateLock(
 		filePath,
@@ -1293,6 +1327,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				revision: stampedRevision,
 			} = await writeJsonAtomic(cwd, filePath, merged, "write", {
 				sessionId,
+				sessionRoot,
 				skill: mode,
 				mutationId,
 				force: forced,
@@ -1314,6 +1349,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				cwd,
 				mode,
 				sessionId,
+				sessionRoot,
 				threadId,
 				turnId,
 				active,
@@ -1321,7 +1357,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				payload: merged,
 				receipt,
 			});
-			await touchStateActivityMarker(cwd, sessionId, filePath);
+			await touchStateActivityMarker({ gjcSessionId: sessionId, sessionRoot }, cwd, filePath);
 
 			return {
 				status: 0,
@@ -1344,7 +1380,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 
 async function handleClear(args: readonly string[], cwd: string): Promise<StateCommandResult> {
 	const selectors = await resolveSelectors(args, cwd, "clear");
-	const { gjcSessionId: sessionId, threadId, turnId } = selectors;
+	const { gjcSessionId: sessionId, sessionRoot, threadId, turnId } = selectors;
 	const mode = selectors.mode ?? (await inferModeFromActiveState(cwd, sessionId));
 	if (!mode)
 		throw new StateCommandError(
@@ -1352,7 +1388,7 @@ async function handleClear(args: readonly string[], cwd: string): Promise<StateC
 			"gjc state clear requires --mode <skill>, positional <skill>, input.skill, or an active workflow in the current session active state",
 		);
 
-	const filePath = modeStateFile(cwd, mode, sessionId);
+	const filePath = modeStateFileForRoot(sessionRoot, mode);
 	const forced = hasFlag(args, "--force");
 	return await withWorkflowStateLock(
 		filePath,
@@ -1395,6 +1431,7 @@ async function handleClear(args: readonly string[], cwd: string): Promise<StateC
 			cleared.receipt = receipt;
 			const { warning: outOfBandWarning, stamped } = await writeJsonAtomic(cwd, filePath, cleared, "clear", {
 				sessionId,
+				sessionRoot,
 				skill: mode,
 				mutationId,
 				force: forced,
@@ -1408,13 +1445,14 @@ async function handleClear(args: readonly string[], cwd: string): Promise<StateC
 				cwd,
 				mode,
 				sessionId,
+				sessionRoot,
 				threadId,
 				turnId,
 				active: false,
 				phase: "complete",
 				payload: cleared,
 			});
-			await touchStateActivityMarker(cwd, sessionId, filePath);
+			await touchStateActivityMarker({ gjcSessionId: sessionId, sessionRoot }, cwd, filePath);
 			return {
 				status: 0,
 				stdout: renderCliWriteReceipt({

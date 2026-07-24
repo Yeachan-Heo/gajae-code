@@ -2845,6 +2845,10 @@ describe("native gjc team runtime", () => {
 		const protectedReportPath = `.gjc/_session-${TEST_SESSION_ID}/reports/team-commit-hygiene/demo.ledger.json`;
 		const protectedGatePath = `.gjc/_session-${TEST_SESSION_ID}/extragoal/gate-1.md`;
 		const protectedActivityPath = `.gjc/_session-${TEST_SESSION_ID}/.session-activity.json`;
+		const canonicalTeamPath = `.gjc/sessions/_session-${TEST_SESSION_ID}/state/team/demo/worker.json`;
+		const canonicalReportPath = `.gjc/sessions/_session-${TEST_SESSION_ID}/reports/team-commit-hygiene/demo.ledger.json`;
+		const canonicalGatePath = `.gjc/sessions/_session-${TEST_SESSION_ID}/extragoal/gate-1.md`;
+		const canonicalActivityPath = `.gjc/sessions/_session-${TEST_SESSION_ID}/.session-activity.json`;
 		expect(
 			classifyGjcTeamCheckpointFiles([
 				"src/feature.ts",
@@ -2852,10 +2856,23 @@ describe("native gjc team runtime", () => {
 				protectedReportPath,
 				protectedGatePath,
 				protectedActivityPath,
+				canonicalTeamPath,
+				canonicalReportPath,
+				canonicalGatePath,
+				canonicalActivityPath,
 			]),
 		).toEqual({
 			eligible: ["src/feature.ts"],
-			protected: [protectedTeamPath, protectedReportPath, protectedGatePath, protectedActivityPath],
+			protected: [
+				protectedTeamPath,
+				protectedReportPath,
+				protectedGatePath,
+				protectedActivityPath,
+				canonicalTeamPath,
+				canonicalReportPath,
+				canonicalGatePath,
+				canonicalActivityPath,
+			],
 		});
 
 		cleanupRoot = await createGitRepo();

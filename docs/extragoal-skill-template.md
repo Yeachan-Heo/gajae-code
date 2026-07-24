@@ -190,12 +190,13 @@ The Extragoal leader is an LLM interpreting this checklist as prompt policy; the
 
 ## Artifacts and reporting
 
-Persist each round under the session state dir:
+Persist each round under the resolved session root:
 
-- `.gjc/_session-{sessionid}/extragoal/gate-<round>.md` — bundle receipt (diff stat + head SHA), raw reviewer output, findings, triage table.
+- Fresh sessions use `.gjc/sessions/_session-{sessionid}/extragoal/gate-<round>.md` — bundle receipt (diff stat + head SHA), raw reviewer output, findings, triage table.
+- Existing legacy sessions retain immutable affinity to `.gjc/_session-{sessionid}/extragoal/gate-<round>.md`; there is no migration or dual-write. Cross-layout duplicates fail closed, and unsupported downgrade attempts remain visibly rejected.
 - Final report — findings, triage dispositions, fix commit SHAs, and re-sign receipts, appended to the normal ultragoal completion evidence.
 
-Extragoal is a local skill, so it writes this one non-contract subtree directly; the bundled-skill `.gjc` write discipline (sanctioned CLI writers only) continues to cover the contract surfaces (`state/`, `specs/`, `plans/`, `ultragoal/`). Gate artifacts inherit whatever the bundle contained — treat them as sensitive, and never commit `.gjc/_session-*` gate artifacts.
+Extragoal is a local skill, so it writes this one non-contract subtree directly; the bundled-skill `.gjc` write discipline (sanctioned CLI writers only) continues to cover the contract surfaces (`state/`, `specs/`, `plans/`, `ultragoal/`). Gate artifacts inherit whatever the bundle contained — treat them as sensitive, and add both `.gjc/sessions/_session-*` and `.gjc/_session-*` to ignores; never commit either generated artifact pattern.
 
 ## Guards
 
