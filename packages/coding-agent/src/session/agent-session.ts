@@ -9139,6 +9139,10 @@ export class AgentSession {
 		nextDiscoverySessionToolNames: string[] | undefined,
 		previousSessionFile: string | undefined,
 	): Promise<void> {
+		// The successor is a fresh managed session identity; synchronous local://
+		// resolution fails closed until verified legacy migration runs for it.
+		// Await the same readiness gate as cold start (#2797) and /resume (#2925).
+		await initializeLocalRoot(this.#localProtocolOptions());
 		this.#clearConstructorToolSelectionAuthority();
 		const inheritedThinkingLevel = resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
 		this.#thinkingLevel = inheritedThinkingLevel;
@@ -9252,6 +9256,9 @@ export class AgentSession {
 
 			// Update agent session ID
 			this.#syncAgentSessionId();
+			// Fork rotates the session identity (and copies artifacts), so await the
+			// legacy local:// migration gate for the successor (#2797 / #2925).
+			await initializeLocalRoot(this.#localProtocolOptions());
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 
@@ -10659,6 +10666,10 @@ export class AgentSession {
 				successorSessionFile = this.sessionFile;
 				this.agent.reset();
 				this.#syncAgentSessionId();
+				// Successor identity is live inside the reversible prepare window; a
+				// migration-gate failure here rolls back. Required before any local://
+				// resolution against the handed-off session (#2797 / #2925).
+				await initializeLocalRoot(this.#localProtocolOptions());
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				this.#steeringMessages = [];
 				this.#followUpMessages = [];
@@ -14800,6 +14811,9 @@ export class AgentSession {
 			}
 			this.#syncTodoPhasesFromBranch();
 			this.#syncAgentSessionId();
+			// Branch/jump establishes a new session identity; await the legacy
+			// local:// migration gate before resolution (#2797 / #2925).
+			await initializeLocalRoot(this.#localProtocolOptions());
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
