@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import {
+	acquireManagedLock,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
@@ -31,6 +32,69 @@ import {
 	type VerifiedSessionDeleteTarget,
 } from "../src/session/session-storage";
 
+describe("managed storage lock recovery", () => {
+	it("reclaims a dead owner's unexpired lease instead of returning migration_busy", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-dead-managed-lock-"));
+		try {
+			const exited = Bun.spawn([process.execPath, "-e", "process.exit(0)"], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			await exited.exited;
+			const locksDirectory = path.join(root, "locks");
+			await fsp.mkdir(locksDirectory, { mode: 0o700 });
+			const lockPath = path.join(locksDirectory, "resume.lock");
+			const now = Date.now();
+			await fsp.writeFile(
+				lockPath,
+				`${JSON.stringify({
+					attemptId: "abandoned-attempt",
+					pid: exited.pid,
+					processStartId: "abandoned-process",
+					createdAt: now,
+					heartbeatAt: now,
+					leaseExpiresAt: now + 60_000,
+				})}\n`,
+				{ mode: 0o600 },
+			);
+
+			const lock = await acquireManagedLock(locksDirectory, "resume");
+			try {
+				expect(lock.path).toBe(lockPath);
+				expect(lock.attemptId).not.toBe("abandoned-attempt");
+				lock.assertOwned();
+			} finally {
+				await lock.release();
+			}
+		} finally {
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not reclaim a live owner's unexpired lease", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "gjc-live-managed-lock-"));
+		try {
+			const locksDirectory = path.join(root, "locks");
+			await fsp.mkdir(locksDirectory, { mode: 0o700 });
+			const lockPath = path.join(locksDirectory, "resume.lock");
+			const now = Date.now();
+			const record = {
+				attemptId: "live-attempt",
+				pid: process.pid,
+				processStartId: "live-process",
+				createdAt: now,
+				heartbeatAt: now,
+				leaseExpiresAt: now + 60_000,
+			};
+			await fsp.writeFile(lockPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+
+			await expect(acquireManagedLock(locksDirectory, "resume")).rejects.toThrow("migration_busy");
+			expect(JSON.parse(await fsp.readFile(lockPath, "utf8"))).toEqual(record);
+		} finally {
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	}, 10_000);
+});
 describe("native publish outcome classification", () => {
 	const preMutation = {
 		ok: false,

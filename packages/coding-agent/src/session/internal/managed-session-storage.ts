@@ -1615,8 +1615,10 @@ export async function acquireManagedLock(
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			const owner = parseLock(lockPath);
-			if (owner && owner.leaseExpiresAt < Date.now()) {
-				const ownerGone = ownerDefinitelyGone(owner);
+			const ownerGone = owner ? ownerDefinitelyGone(owner) : false;
+			// A crashed process cannot renew or publish through its descriptor. Reclaim it
+			// immediately instead of waiting for the still-future lease to expire.
+			if (owner && (ownerGone || owner.leaseExpiresAt < Date.now())) {
 				if (staleObservedAt === undefined) staleObservedAt = Date.now();
 				if (ownerGone || Date.now() - staleObservedAt >= LOCK_STALE_RECHECK_MS) {
 					const quarantine = `${lockPath}.${randomUUID()}.stale`;
