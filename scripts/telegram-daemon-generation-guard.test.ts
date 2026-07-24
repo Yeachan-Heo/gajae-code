@@ -76,6 +76,17 @@ const chatConfigHelpers = {
 	discord: ["getNotificationConfig", "notificationConfigFromFile", "isDiscordConfigured", "tokenFingerprint"],
 	slack: ["getNotificationConfig", "notificationConfigFromFile", "isSlackConfigured", "tokenFingerprint"],
 } as const;
+const telegramToolActivityDeclarations = {
+	[config]: ["parseNotificationSettingsSnapshot"],
+	[telegramDaemon]: [
+		"TOOL_ACTIVITY_CAPABILITY",
+		"toolActivityOwner",
+		"toolActivityAuthorityIsCurrent",
+		"toolActivityDeliveryIsCurrent",
+		"handleSessionMessage",
+		"processTelegramUpdate",
+	],
+} as const;
 const helperInventory = {
 	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: [...telegramHandoffHelpers] },
 	discord: { [chatControl]: ["CHAT_DAEMON_GENERATIONS.discord", ...chatTakeoverHelpers] },
@@ -270,6 +281,42 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 		if (helper.family === "telegram") expect(bumped.telegramGenerationBumped).toBe(true);
 		else expect(bumped.chatGenerationBumped[helper.family]).toBe(true);
 	}
+});
+
+test("requires a Telegram bump for tool-activity defaults and delivery admission policy", () => {
+	for (const [file, declarations] of Object.entries(telegramToolActivityDeclarations)) {
+		for (const name of declarations) {
+			const missing = mappedHelperMutation({ family: "telegram", file, name, generationBumped: false });
+			expect(missing.protectedChanges).toContain(`telegram:${file}:${name}`);
+			expect(missing.telegramGenerationBumped).toBe(false);
+			expect(mappedHelperMutation({ family: "telegram", file, name, generationBumped: true }).telegramGenerationBumped).toBe(true);
+		}
+	}
+});
+
+test("detects restoring tool activity to default-on and bypassing daemon admission", () => {
+	const policyInventory = {
+		telegram: {
+			[config]: ["parseNotificationSettingsSnapshot"],
+			[telegramDaemon]: ["handleSessionMessage"],
+		},
+		discord: {},
+		slack: {},
+	} as const;
+	const base = files({ telegramGeneration: 6 });
+	const head = files({ telegramGeneration: 6 });
+	base.set(config, "export function parseNotificationSettingsSnapshot() { return { toolActivity: { enabled: false } }; }");
+	head.set(config, "export function parseNotificationSettingsSnapshot() { return { toolActivity: { enabled: true } }; }");
+	base.set(telegramDaemon, "export class TelegramDaemon { handleSessionMessage() { return this.opts.toolActivity?.enabled === true; } }");
+	head.set(telegramDaemon, "export class TelegramDaemon { handleSessionMessage() { return true; } }");
+	const missing = evaluate(base, head, policyInventory);
+	expect(missing.protectedChanges).toEqual(
+		expect.arrayContaining([
+			`telegram:${config}:parseNotificationSettingsSnapshot`,
+			`telegram:${telegramDaemon}:handleSessionMessage`,
+		]),
+	);
+	expect(missing.telegramGenerationBumped).toBe(false);
 });
 
 	test("requires a bump for the affected chat kind, not the other kind", () => {
@@ -594,7 +641,7 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(() => validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: narrowed })).toThrow("Telegram owner-lock handoff primitives");
 	});
 
-	test("rejects inventories missing required Telegram lifecycle, lease, chat CLI, or provider configuration authorities", () => {
+	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, chat CLI, or provider configuration authorities", () => {
 		for (const symbol of ["validBotToken", "requestStop", "startLifecycleControl", "run"] as const) {
 			const telegram = mutableInventory();
 			telegram.telegram[telegramDaemon] = telegram.telegram[telegramDaemon]!.filter(name => name !== symbol);
@@ -603,6 +650,15 @@ test("fails closed when a protected native authority declaration is missing or m
 		const telegram = mutableInventory();
 		telegram.telegram[telegramDaemon] = telegram.telegram[telegramDaemon]!.filter(name => name !== "writeJsonAtomic");
 		expect(() => validateInventory(telegram)).toThrow("Telegram owner-lock handoff primitives");
+		for (const [file, declarations] of Object.entries(telegramToolActivityDeclarations)) {
+			for (const symbol of declarations) {
+				const toolActivity = mutableInventory();
+				const remaining = toolActivity.telegram[file]!.filter(name => name !== symbol);
+				if (remaining.length === 0) delete toolActivity.telegram[file];
+				else toolActivity.telegram[file] = remaining;
+				expect(() => validateInventory(toolActivity)).toThrow("Telegram tool-activity configuration and delivery policy");
+			}
+		}
 		for (const symbol of ["DaemonProcessReference", "defaultProcessReference"] as const) {
 			const processAuthority = mutableInventory();
 			processAuthority.telegram[telegramControl] = processAuthority.telegram[telegramControl]!.filter(name => name !== symbol);

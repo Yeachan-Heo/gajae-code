@@ -36,6 +36,7 @@ import {
 	ensureTelegramDaemonRunningDetailed,
 	isCurrentCompatibleOwner,
 	isFreshLiveOwner,
+	LEGACY_TOOL_ACTIVITY_CAPABILITY,
 	readAttestedLegacyDaemonOwner,
 	readDaemonState,
 	registerNotificationRoot,
@@ -7516,6 +7517,7 @@ describe("telegram daemon connection-drop resilience", () => {
 				"client_ping_pong",
 				"ask_controls_v1",
 				"ask_selected_ack_v1",
+				"tool_activity_v2",
 				"tool_activity_v1",
 				"ephemeral_turn_v1",
 			],
@@ -12753,7 +12755,7 @@ describe("telegram daemon /rich toggle (G005)", () => {
 });
 
 describe("Telegram tool activity capability and routing", () => {
-	test("advertises tool_activity_v1 and routes new threaded frame kinds", () => {
+	test("advertises tool_activity_v2 with receive-only legacy-v1 compatibility", () => {
 		FakeWs.instances = [];
 		const agentDir = tempAgentDir();
 		const daemon = new TelegramNotificationDaemon({
@@ -12768,6 +12770,7 @@ describe("Telegram tool activity capability and routing", () => {
 		FakeWs.instances[0]!.dispatchEvent(new Event("open"));
 		const hello = FakeWs.instances[0]!.sent.map(frame => JSON.parse(frame)).find(frame => frame.type === "hello");
 		expect(hello.capabilities).toContain(TOOL_ACTIVITY_CAPABILITY);
+		expect(hello.capabilities).toContain(LEGACY_TOOL_ACTIVITY_CAPABILITY);
 		const threadedFrames = (TelegramNotificationDaemon as any).THREADED_FRAMES as Set<string>;
 		expect(threadedFrames.has("tool_activity")).toBe(true);
 		expect(threadedFrames.has("reasoning_summary")).toBe(true);
@@ -12853,6 +12856,111 @@ describe("Telegram tool activity capability and routing", () => {
 		});
 
 		expect(bot.calls).toHaveLength(importantCallCount);
+	});
+	test("legacy-v1 unknown closes only an already-visible start as summary-free cancelled", async () => {
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+		});
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "legacy-visible",
+			toolName: "read",
+			phase: "started",
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "legacy-visible",
+			toolName: "read",
+			phase: "unknown",
+			argsSummary: "secret args",
+			resultSummary: "secret result",
+		});
+
+		const edit = bot.calls.find(call => call.method === "editMessageText");
+		expect(String(edit?.body.text)).toContain("read — cancelled");
+		expect(String(edit?.body.text)).not.toContain("secret");
+	});
+
+	test("v2 rejects unknown and legacy-v1 cannot create an unknown terminal without a visible owner", async () => {
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+		});
+		const session = richSession();
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "v2-rejected",
+			toolName: "read",
+			phase: "unknown",
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "hello",
+			capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY],
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "legacy-orphan",
+			toolName: "read",
+			phase: "unknown",
+		});
+
+		expect(bot.calls).toHaveLength(0);
+	});
+	test("daemon renderer rejects unsupported tool phases instead of producing an unknown terminal", () => {
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: new FakeBotApi(),
+			toolActivity: { enabled: true },
+		});
+		const render = (
+			daemon as unknown as {
+				renderThreadedFrame(frame: Record<string, unknown>): { text: string } | undefined;
+			}
+		).renderThreadedFrame.bind(daemon);
+
+		expect(
+			render({
+				type: "tool_activity",
+				toolCallId: "unsupported",
+				toolName: "read",
+				phase: "surprised",
+			}),
+		).toBeUndefined();
 	});
 	test("explicit off suppresses all noisy tool bubbles without suppressing session, assistant, or ask notifications", async () => {
 		const agentDir = tempAgentDir();
@@ -12977,10 +13085,15 @@ describe("Telegram tool activity capability and routing", () => {
 			toolCallId: "visible",
 			toolName: "read",
 			phase: "completed",
+			argsSummary: "secret opt-out args",
+			resultSummary: "secret opt-out result",
 		});
-		expect(
-			bot.calls.some(call => call.method === "editMessageText" && String(call.body.text).includes("read — ok")),
-		).toBe(true);
+		const terminalEdit = bot.calls.find(
+			call => call.method === "editMessageText" && String(call.body.text).includes("read — ok"),
+		);
+		expect(terminalEdit).toBeDefined();
+		expect(String(terminalEdit?.body.text)).not.toContain("secret opt-out args");
+		expect(String(terminalEdit?.body.text)).not.toContain("secret opt-out result");
 
 		const deliveredCount = bot.calls.length;
 		await daemon.handleSessionMessage(session, {
@@ -13054,6 +13167,8 @@ describe("Telegram tool activity capability and routing", () => {
 			toolCallId: "visible-terminal",
 			toolName: "read",
 			phase: "completed",
+			argsSummary: "stale policy args",
+			resultSummary: "stale policy result",
 		});
 		expect(internal.pool.pending).toBe(1);
 		await daemon.handleTelegramUpdate({
@@ -13064,9 +13179,12 @@ describe("Telegram tool activity capability and routing", () => {
 
 		nowMs += 1_000;
 		await internal.flushPool();
-		expect(
-			bot.calls.some(call => call.method === "editMessageText" && String(call.body.text).includes("read — ok")),
-		).toBe(true);
+		const terminalEdit = bot.calls.find(
+			call => call.method === "editMessageText" && String(call.body.text).includes("read — ok"),
+		);
+		expect(terminalEdit).toBeDefined();
+		expect(String(terminalEdit?.body.text)).not.toContain("stale policy args");
+		expect(String(terminalEdit?.body.text)).not.toContain("stale policy result");
 	});
 
 	test("/toolactivity rejects invalid input and foreign suffixes while addressed on/off persists and reports status", async () => {
@@ -13601,8 +13719,11 @@ describe("Telegram tool activity capability and routing", () => {
 		await (oldDaemon as unknown as { toolShutdownBarrier: Promise<void> }).toolShutdownBarrier;
 		expect(bot.calls.filter(call => call.method === "editMessageText")).toHaveLength(1);
 		expect(
-			bot.calls.some(call => call.method === "editMessageText" && String(call.body.text).includes("read — unknown")),
+			bot.calls.some(
+				call => call.method === "editMessageText" && String(call.body.text).includes("read — cancelled"),
+			),
 		).toBe(true);
+		expect(bot.calls.some(call => String(call.body.text).includes("read — unknown"))).toBe(false);
 
 		const callsAfterCleanup = bot.calls.length;
 		const successor = new TelegramNotificationDaemon({
@@ -13857,9 +13978,10 @@ describe("Telegram tool activity capability and routing", () => {
 		);
 		expect(
 			bot.calls.some(
-				call => call.method === "editMessageText" && String(call.body.text).includes("subagent — unknown"),
+				call => call.method === "editMessageText" && String(call.body.text).includes("subagent — cancelled"),
 			),
 		).toBe(true);
+		expect(bot.calls.some(call => String(call.body.text).includes("subagent — unknown"))).toBe(false);
 	});
 
 	test("strict shutdown sees a delayed best-effort cleanup failure", async () => {
