@@ -2315,17 +2315,10 @@ export function matchesMigrationArtifactRoot(
 ): boolean {
 	try {
 		const stat = fs.lstatSync(pathname, { bigint: true });
-		if (
-			!stat.isDirectory() ||
-			stat.isSymbolicLink() ||
-			stat.dev !== identity.dev ||
-			stat.ino !== identity.ino
-		)
+		if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== identity.dev || stat.ino !== identity.ino)
 			return false;
 		const observed = native.snapshotDirectoryTree(pathname);
-		const expectedRoot = expectedTree.entries.find(
-			entry => entry.relativePath === "" && entry.kind === "directory",
-		);
+		const expectedRoot = expectedTree.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
 		const observedRoot = observed.snapshot?.entries.find(
 			entry => entry.relativePath === "" && entry.kind === "directory",
 		);
@@ -2363,7 +2356,10 @@ export function matchesMigrationArtifactRoot(
 			entry.kind === "directory" ? directoryEntryKey(entry) : strictEntryKey(entry);
 		const expectedEntries = expectedTree.entries.map(entryKey).sort();
 		const observedEntries = observed.snapshot.entries.map(entryKey).sort();
-		return expectedEntries.length === observedEntries.length && expectedEntries.every((entry, index) => entry === observedEntries[index]);
+		return (
+			expectedEntries.length === observedEntries.length &&
+			expectedEntries.every((entry, index) => entry === observedEntries[index])
+		);
 	} catch {
 		return false;
 	}
@@ -2562,22 +2558,32 @@ export function restorePreparedArtifactRoot(scope: ManagedScope, source: Managed
 	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
 	const assertPreparedTree = (pathname: string): void => {
 		if (
-			!matchesMigrationArtifactRoot(pathname, {
-				dev: BigInt(identity.dev),
-				ino: BigInt(identity.ino),
-				size: BigInt(identity.size),
-				mtimeNs: BigInt(identity.mtimeNs),
-			}, expectedTree)
+			!matchesMigrationArtifactRoot(
+				pathname,
+				{
+					dev: BigInt(identity.dev),
+					ino: BigInt(identity.ino),
+					size: BigInt(identity.size),
+					mtimeNs: BigInt(identity.mtimeNs),
+				},
+				expectedTree,
+			)
 		)
 			throw new Error("durability_failed");
 	};
 	if (fs.existsSync(quarantine.path)) {
-		if (matchesMigrationArtifactRoot(quarantine.path, {
-			dev: BigInt(identity.dev),
-			ino: BigInt(identity.ino),
-			size: BigInt(identity.size),
-			mtimeNs: BigInt(identity.mtimeNs),
-		}, expectedTree)) {
+		if (
+			matchesMigrationArtifactRoot(
+				quarantine.path,
+				{
+					dev: BigInt(identity.dev),
+					ino: BigInt(identity.ino),
+					size: BigInt(identity.size),
+					mtimeNs: BigInt(identity.mtimeNs),
+				},
+				expectedTree,
+			)
+		) {
 			assertPreparedTree(quarantine.path);
 		}
 		// A changed source pathname is independent retained authority. Do not replace

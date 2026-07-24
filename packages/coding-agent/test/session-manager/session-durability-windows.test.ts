@@ -10,15 +10,17 @@ import {
 	listManagedCandidates,
 	matchesMigrationArtifactRoot,
 	openManagedCandidateForWrite,
-	restorePreparedArtifactRoot,
 	resolveManagedScope,
+	restorePreparedArtifactRoot,
 } from "../../src/session/internal/managed-session-scope";
 
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
 	vi.restoreAllMocks();
-	await Promise.all(temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
+	await Promise.all(
+		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
+	);
 });
 
 function temporaryDirectory(prefix: string): string {
@@ -26,7 +28,13 @@ function temporaryDirectory(prefix: string): string {
 }
 
 function legacyDirectory(sessionsRoot: string, cwd: string): string {
-	return path.join(sessionsRoot, `--${path.resolve(cwd).replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
+	return path.join(
+		sessionsRoot,
+		`--${path
+			.resolve(cwd)
+			.replace(/^[/\\]/, "")
+			.replace(/[/\\:]/g, "-")}--`,
+	);
 }
 
 function transcript(id: string, cwd: string): string {
@@ -63,7 +71,15 @@ async function interruptedArtifactMigration(id: string) {
 	const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
 	const name = (await fs.readdir(receipts)).find(entry => entry.endsWith(".detached.json"));
 	if (!name) throw new Error("Missing detached receipt");
-	return { cwd, agentDir, sessionsRoot, source, artifacts, candidate: listed.owned[0], receipt: path.join(receipts, name) };
+	return {
+		cwd,
+		agentDir,
+		sessionsRoot,
+		source,
+		artifacts,
+		candidate: listed.owned[0],
+		receipt: path.join(receipts, name),
+	};
 }
 
 describe("managed session Windows durability", () => {
@@ -114,7 +130,9 @@ describe("managed session Windows durability", () => {
 		const stat = syncFs.lstatSync(artifacts, { bigint: true });
 		const snapshot = native.snapshotDirectoryTree(artifacts);
 		if (!snapshot.ok || !snapshot.snapshot) throw new Error("Native snapshot unavailable");
-		const nativeRoot = snapshot.snapshot.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
+		const nativeRoot = snapshot.snapshot.entries.find(
+			entry => entry.relativePath === "" && entry.kind === "directory",
+		);
 		if (!nativeRoot) throw new Error("Native root missing");
 		const authoritativeSize = (BigInt(nativeRoot.size) + 1n).toString();
 		const expectedTree = {
@@ -132,12 +150,19 @@ describe("managed session Windows durability", () => {
 				snapshot: {
 					...observed.snapshot,
 					entries: observed.snapshot.entries.map(entry =>
-						entry.relativePath === "" ? { ...entry, size: authoritativeSize, mtimeNs: nativeRoot.mtimeNs } : entry,
+						entry.relativePath === ""
+							? { ...entry, size: authoritativeSize, mtimeNs: nativeRoot.mtimeNs }
+							: entry,
 					),
 				},
 			};
 		});
-		const identity = { dev: stat.dev, ino: stat.ino, size: BigInt(authoritativeSize), mtimeNs: BigInt(nativeRoot.mtimeNs) };
+		const identity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			size: BigInt(authoritativeSize),
+			mtimeNs: BigInt(nativeRoot.mtimeNs),
+		};
 		expect(matchesMigrationArtifactRoot(artifacts, identity, expectedTree, "win32")).toBe(true);
 		await fs.writeFile(payload, "drifted");
 		expect(matchesMigrationArtifactRoot(artifacts, identity, expectedTree, "win32")).toBe(false);
@@ -159,7 +184,11 @@ describe("managed session Windows durability", () => {
 		vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname =>
 			pathname === detachedPath ? { ok: true, snapshot: tree } : snapshotDirectoryTree(pathname),
 		);
-		const resolved = resolveManagedScope({ cwd: interrupted.cwd, agentDir: interrupted.agentDir, sessionsRoot: interrupted.sessionsRoot });
+		const resolved = resolveManagedScope({
+			cwd: interrupted.cwd,
+			agentDir: interrupted.agentDir,
+			sessionsRoot: interrupted.sessionsRoot,
+		});
 		if (resolved.kind !== "resolved") throw new Error(resolved.message);
 		const restarted = listManagedCandidates(resolved.scope);
 		if (restarted.kind !== "complete") throw new Error("Could not list restarted candidates");
@@ -175,7 +204,11 @@ describe("managed session Windows durability", () => {
 		record.sourceArtifactCleanup = { state: "cleanup_pending", role: "exchange_placeholder" };
 		await fs.writeFile(interrupted.receipt, `${JSON.stringify(record)}\n`);
 		vi.restoreAllMocks();
-		const resolved = resolveManagedScope({ cwd: interrupted.cwd, agentDir: interrupted.agentDir, sessionsRoot: interrupted.sessionsRoot });
+		const resolved = resolveManagedScope({
+			cwd: interrupted.cwd,
+			agentDir: interrupted.agentDir,
+			sessionsRoot: interrupted.sessionsRoot,
+		});
 		if (resolved.kind !== "resolved") throw new Error(resolved.message);
 		const restarted = listManagedCandidates(resolved.scope);
 		if (restarted.kind !== "complete") throw new Error("Could not list restarted candidates");
