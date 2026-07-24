@@ -82,6 +82,37 @@ describe("bash invocation display safety", () => {
 		}
 	});
 
+	it("redacts complete quoted and nested substitution spans in collapsed and expanded views", () => {
+		const cases: Array<[command: string, expected: string, secrets: string[]]> = [
+			['curl --password="$(printf "secret value")"', 'curl --password="<redacted>"', ["secret", "value"]],
+			['curl --password="$(echo $(printf "deep secret"))"', 'curl --password="<redacted>"', ["deep", "secret"]],
+			[
+				'curl --password="$(printf "%s" "literal ) ( secret")"',
+				'curl --password="<redacted>"',
+				["literal", "secret"],
+			],
+			['curl --password="`printf "legacy secret"`"', 'curl --password="<redacted>"', ["legacy", "secret"]],
+			[
+				'curl --password="`echo $(printf "nested legacy secret")`"',
+				'curl --password="<redacted>"',
+				["nested", "legacy", "secret"],
+			],
+			[
+				'curl --authorization "$(printf "separated secret")"',
+				'curl --authorization "<redacted>"',
+				["separated", "secret"],
+			],
+		];
+
+		for (const expanded of [false, true]) {
+			for (const [command, expected, secrets] of cases) {
+				const displayed = formatInvocationCommand(command, expanded);
+				expect(displayed).toBe(expected);
+				for (const secret of secrets) expect(displayed).not.toContain(secret);
+			}
+		}
+	});
+
 	it("redacts ANSI-C escaped sensitive flags and complete backtick substitutions", () => {
 		const cases: Array<[command: string, secret: string]> = [
 			["curl --coo$'\\x6b'ie=hex-secret", "hex-secret"],
@@ -250,6 +281,23 @@ describe("bash invocation display safety", () => {
 		expect(rendered).not.toContain(maliciousUrl);
 		expect(rendered).not.toContain("\x07");
 		expect(Bun.stripANSI(rendered)).toContain("API_TOKEN='<redacted>' printf 'red'link");
+	});
+
+	it("keeps quoted nested substitutions out of collapsed and expanded standard Bash cards", async () => {
+		const theme = (await getThemeByName("red-claw"))!;
+		const command = 'curl --password="$(echo $(printf "deep secret value"))"';
+
+		for (const expanded of [false, true]) {
+			const rendered = bashToolRenderer
+				.renderCall({ command }, { expanded, isPartial: true }, theme)
+				.render(120)
+				.join("\n");
+			const plain = Bun.stripANSI(rendered);
+			expect(plain).toContain('curl --password="<redacted>"');
+			expect(plain).not.toContain("deep");
+			expect(plain).not.toContain("secret value");
+			for (const line of rendered.split("\n")) expect(visibleWidth(line)).toBeLessThanOrEqual(120);
+		}
 	});
 
 	it("keeps ANSI-C and backtick secrets out of every Bash invocation header", async () => {

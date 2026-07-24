@@ -97,6 +97,13 @@ interface ShellWordWrapper {
 }
 
 type ShellQuote = "single" | "double" | "ansi-c" | "backtick";
+type ShellScanQuote = Exclude<ShellQuote, "backtick">;
+
+interface ShellScanFrame {
+	kind: "word" | "substitution" | "backtick";
+	quote?: ShellScanQuote;
+	parenthesisDepth: number;
+}
 
 function findShellWordSpans(command: string): ShellWordSpan[] {
 	const spans: ShellWordSpan[] = [];
@@ -105,33 +112,45 @@ function findShellWordSpans(command: string): ShellWordSpan[] {
 		while (index < command.length && /[\s;&|()<>]/.test(command[index] ?? "")) index += 1;
 		if (index >= command.length) break;
 		const start = index;
-		let quote: ShellQuote | undefined;
-		let substitutionDepth = 0;
+		const frames: ShellScanFrame[] = [{ kind: "word", parenthesisDepth: 0 }];
 		while (index < command.length) {
+			const frame = frames.at(-1)!;
 			const character = command[index] ?? "";
-			if (quote === "single") {
+			if (frame.quote === "single") {
 				index += 1;
-				if (character === "'") quote = undefined;
+				if (character === "'") frame.quote = undefined;
 				continue;
 			}
-			if (quote === "double" || quote === "ansi-c") {
+			if (frame.quote === "ansi-c") {
 				if (character === "\\") {
 					index = Math.min(index + 2, command.length);
 					continue;
 				}
 				index += 1;
-				if ((quote === "double" && character === '"') || (quote === "ansi-c" && character === "'")) {
-					quote = undefined;
-				}
+				if (character === "'") frame.quote = undefined;
 				continue;
 			}
-			if (quote === "backtick") {
+			if (frame.quote === "double") {
 				if (character === "\\") {
 					index = Math.min(index + 2, command.length);
 					continue;
 				}
+				if (character === '"') {
+					frame.quote = undefined;
+					index += 1;
+					continue;
+				}
+				if (character === "$" && command[index + 1] === "(") {
+					frames.push({ kind: "substitution", parenthesisDepth: 1 });
+					index += 2;
+					continue;
+				}
+				if (character === "`") {
+					frames.push({ kind: "backtick", parenthesisDepth: 0 });
+					index += 1;
+					continue;
+				}
 				index += 1;
-				if (character === "`") quote = undefined;
 				continue;
 			}
 			if (character === "\\") {
@@ -139,29 +158,37 @@ function findShellWordSpans(command: string): ShellWordSpan[] {
 				continue;
 			}
 			if (character === '"') {
-				quote = "double";
+				frame.quote = "double";
 				index += 1;
 				continue;
 			}
 			if (character === "'") {
-				quote = index > start && command[index - 1] === "$" ? "ansi-c" : "single";
-				index += 1;
-				continue;
-			}
-			if (character === "`") {
-				quote = "backtick";
-				index += 1;
-				continue;
-			}
-			if (substitutionDepth > 0) {
-				if (character === "(") substitutionDepth += 1;
-				if (character === ")") substitutionDepth -= 1;
+				frame.quote = index > start && command[index - 1] === "$" ? "ansi-c" : "single";
 				index += 1;
 				continue;
 			}
 			if (character === "$" && command[index + 1] === "(") {
-				substitutionDepth = 1;
+				frames.push({ kind: "substitution", parenthesisDepth: 1 });
 				index += 2;
+				continue;
+			}
+			if (character === "`") {
+				if (frame.kind === "backtick") frames.pop();
+				else frames.push({ kind: "backtick", parenthesisDepth: 0 });
+				index += 1;
+				continue;
+			}
+			if (frame.kind === "substitution") {
+				if (character === "(") frame.parenthesisDepth += 1;
+				if (character === ")") {
+					frame.parenthesisDepth -= 1;
+					if (frame.parenthesisDepth === 0) frames.pop();
+				}
+				index += 1;
+				continue;
+			}
+			if (frame.kind === "backtick") {
+				index += 1;
 				continue;
 			}
 			if (/[\s;&|()<>]/.test(character)) break;
