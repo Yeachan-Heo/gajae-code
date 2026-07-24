@@ -2513,6 +2513,12 @@ export function restorePreparedArtifactRoot(scope: ManagedScope, source: Managed
 		typeof identity.mtimeNs !== "string"
 	)
 		throw new Error("durability_failed");
+	const artifactIdentity = {
+		dev: BigInt(identity.dev),
+		ino: BigInt(identity.ino),
+		size: BigInt(identity.size),
+		mtimeNs: BigInt(identity.mtimeNs),
+	};
 	if (receipt === detachedReceipt) {
 		if (quarantine.role !== "detached_artifact_root") throw new Error("durability_failed");
 		if (record.detachOutcome === "clean") {
@@ -2561,10 +2567,7 @@ export function restorePreparedArtifactRoot(scope: ManagedScope, source: Managed
 			!matchesMigrationArtifactRoot(
 				pathname,
 				{
-					dev: BigInt(identity.dev),
-					ino: BigInt(identity.ino),
-					size: BigInt(identity.size),
-					mtimeNs: BigInt(identity.mtimeNs),
+					...artifactIdentity,
 				},
 				expectedTree,
 			)
@@ -2576,10 +2579,7 @@ export function restorePreparedArtifactRoot(scope: ManagedScope, source: Managed
 			matchesMigrationArtifactRoot(
 				quarantine.path,
 				{
-					dev: BigInt(identity.dev),
-					ino: BigInt(identity.ino),
-					size: BigInt(identity.size),
-					mtimeNs: BigInt(identity.mtimeNs),
+					...artifactIdentity,
 				},
 				expectedTree,
 			)
@@ -2592,10 +2592,7 @@ export function restorePreparedArtifactRoot(scope: ManagedScope, source: Managed
 	}
 	assertPreparedTree(quarantine.detachedPath);
 	const result = native.exactRestore(quarantine.detachedPath, quarantine.path, {
-		dev: BigInt(identity.dev),
-		ino: BigInt(identity.ino),
-		size: BigInt(identity.size),
-		mtimeNs: BigInt(identity.mtimeNs),
+		...artifactIdentity,
 		directory: true,
 	});
 	if (!result.ok) throw new Error("durability_failed");

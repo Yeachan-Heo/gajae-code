@@ -3,6 +3,7 @@ import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
 import {
 	canonicalBindingOpenFlags,
@@ -229,7 +230,7 @@ describe("managed session Windows durability", () => {
 		const interrupted = await interruptedArtifactMigration("clean-detached", "clean");
 		const record = JSON.parse(await fs.readFile(interrupted.receipt, "utf8")) as {
 			detachOutcome?: unknown;
-			sourceArtifactQuarantine?: { detachedPath?: string; tree?: unknown };
+			sourceArtifactQuarantine?: { detachedPath?: string; tree?: NativeDirectoryTreeSnapshot };
 			sourceArtifactCleanup?: unknown;
 		};
 		expect(record.detachOutcome).toBe("clean");
