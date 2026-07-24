@@ -99,6 +99,29 @@ describe("findMostRecentSession", () => {
 		expect(await findMostRecentSession(tempDir)).toBe(valid);
 	});
 
+	it("excludes newer hidden transcripts from finding and continuing the most recent session", async () => {
+		const visible = path.join(tempDir, "visible.jsonl");
+		const hidden = path.join(tempDir, ".hidden.jsonl");
+		fs.writeFileSync(
+			visible,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "visible", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+		fs.writeFileSync(
+			hidden,
+			`${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "hidden", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+		fs.utimesSync(visible, new Date(10_000), new Date(10_000));
+		fs.utimesSync(hidden, new Date(20_000), new Date(20_000));
+
+		expect(await findMostRecentSession(tempDir)).toBe(visible);
+		const resumed = await SessionManager.continueRecent(tempDir, tempDir);
+		try {
+			expect(resumed.getSessionId()).toBe("visible");
+		} finally {
+			await resumed.close();
+		}
+	});
+
 	it("skips malformed and future headers when listing, finding, and continuing an explicit directory", async () => {
 		const valid = path.join(tempDir, "valid-v5.jsonl");
 		const malformed = path.join(tempDir, "malformed-version.jsonl");
@@ -162,6 +185,143 @@ describe("getRecentSessions", () => {
 
 		expect(sessions).toHaveLength(5);
 		expect(sessions.map(session => session.name)).toContain("Recent Session 4");
+	});
+
+	it("orders native mtime candidates deterministically before reading them", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionDir = "/sessions";
+		const paths = ["b.jsonl", "c.jsonl", "a.jsonl"].map(name => `${sessionDir}/${name}`);
+		for (const file of paths) {
+			storage.writeTextSync(
+				file,
+				`${JSON.stringify({
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: path.basename(file, ".jsonl"),
+					timestamp: "2025-01-01T00:00:00Z",
+					cwd: "/tmp",
+					title: path.basename(file, ".jsonl"),
+				})}\n`,
+			);
+		}
+		storage.listFilesByMtime = () =>
+			Promise.resolve([
+				{ path: paths[0], mtimeMs: 20 },
+				{ path: paths[1], mtimeMs: 10 },
+				{ path: paths[2], mtimeMs: 20 },
+			]);
+
+		const sessions = await getRecentSessions(sessionDir, 3, storage);
+
+		expect(sessions.map(session => session.path)).toEqual([paths[2], paths[0], paths[1]]);
+	});
+
+	it("falls back to bounded JavaScript list/stat ordering when native mtime listing rejects", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionDir = "/sessions";
+		const older = `${sessionDir}/older.jsonl`;
+		const newer = `${sessionDir}/newer.jsonl`;
+		for (const file of [older, newer]) {
+			storage.writeTextSync(
+				file,
+				`${JSON.stringify({
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: path.basename(file, ".jsonl"),
+					timestamp: "2025-01-01T00:00:00Z",
+					cwd: "/tmp",
+					title: path.basename(file, ".jsonl"),
+				})}\n`,
+			);
+		}
+		let listCalls = 0;
+		let statCalls = 0;
+		const listFilesSync = storage.listFilesSync.bind(storage);
+		const statSync = storage.statSync.bind(storage);
+		storage.listFilesByMtime = () => Promise.reject(new Error("native unavailable"));
+		storage.listFilesSync = (dir, pattern) => {
+			if (pattern === "*.jsonl") listCalls += 1;
+			return listFilesSync(dir, pattern);
+		};
+		storage.statSync = file => {
+			statCalls += 1;
+			const stat = statSync(file);
+			return { ...stat, mtimeMs: file === newer ? 20 : 10 };
+		};
+
+		const sessions = await getRecentSessions(sessionDir, 1, storage);
+
+		expect(sessions.map(session => session.path)).toEqual([newer]);
+		expect(listCalls).toBe(1);
+		expect(statCalls).toBe(2);
+	});
+
+	it("opens only a bounded newest candidate set when the welcome trail has a small limit", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionDir = "/sessions";
+		let prefixReads = 0;
+		const readTextPrefix = storage.readTextPrefix.bind(storage);
+		storage.readTextPrefix = async (file, maxBytes) => {
+			prefixReads += 1;
+			return readTextPrefix(file, maxBytes);
+		};
+		for (let index = 0; index < 500; index++) {
+			storage.writeTextSync(
+				`${sessionDir}/session-${index}.jsonl`,
+				`${JSON.stringify({
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: `session-${index}`,
+					timestamp: "2025-01-01T00:00:00Z",
+					cwd: "/tmp",
+					title: `Session ${index}`,
+				})}\n`,
+			);
+		}
+
+		const sessions = await getRecentSessions(sessionDir, 5, storage);
+
+		expect(sessions).toHaveLength(5);
+		expect(prefixReads).toBe(32);
+	});
+
+	it("continues after an invalid first batch without reading past the boundary containing a valid session", async () => {
+		const storage = new MemorySessionStorage();
+		const sessionDir = "/sessions";
+		const candidates: Array<{ path: string; mtimeMs: number }> = [];
+		let prefixReads = 0;
+		const readTextPrefix = storage.readTextPrefix.bind(storage);
+		storage.readTextPrefix = async (file, maxBytes) => {
+			prefixReads += 1;
+			return readTextPrefix(file, maxBytes);
+		};
+		for (let index = 0; index < 33; index++) {
+			const file = `${sessionDir}/session-${index.toString().padStart(2, "0")}.jsonl`;
+			candidates.push({ path: file, mtimeMs: 100 - index });
+			storage.writeTextSync(
+				file,
+				index === 32
+					? `${JSON.stringify({
+							type: "session",
+							version: CURRENT_SESSION_VERSION,
+							id: "valid-boundary",
+							timestamp: "2025-01-01T00:00:00Z",
+							cwd: "/tmp",
+							title: "Valid boundary",
+						})}\n`
+					: `${JSON.stringify({
+							type: "session",
+							version: CURRENT_SESSION_VERSION + 1,
+							id: `future-${index}`,
+							timestamp: "2025-01-01T00:00:00Z",
+							cwd: "/tmp",
+						})}\n`,
+			);
+		}
+		storage.listFilesByMtime = () => Promise.resolve(candidates);
+
+		expect(await findMostRecentSession(sessionDir, storage)).toBe(candidates[32]?.path);
+		expect(prefixReads).toBe(33);
 	});
 
 	it("replays trailing header patches for transcripts larger than the listing prefix", async () => {

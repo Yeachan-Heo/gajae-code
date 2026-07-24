@@ -4,8 +4,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const skillPath = join(dirname(fileURLToPath(import.meta.url)), "../src/defaults/gjc/skills/deep-interview/SKILL.md");
+const statePath = join(dirname(fileURLToPath(import.meta.url)), "../src/gjc-runtime/deep-interview-state.ts");
 
+const repairCliPath = join(dirname(fileURLToPath(import.meta.url)), "../../../docs/deep-interview-repair-cli.md");
 const skill = readFileSync(skillPath, "utf8");
+const stateSource = readFileSync(statePath, "utf8");
+const repairCli = readFileSync(repairCliPath, "utf8");
 
 function extractSection(content: string, sectionName: string): string {
 	const sectionMatch = content.match(new RegExp(`<${sectionName}>\\n([\\s\\S]*?)\\n</${sectionName}>`));
@@ -30,20 +34,64 @@ describe("deep-interview skill conflict-aware scoring contract", () => {
 		expect(skill).toMatch(/no separate penalty term/i);
 	});
 
-	it("requires structured scorer output for conflict transitions", () => {
+	it("keeps ambiguity derived by the native runtime", () => {
 		expect(skill).toMatch(/Structured scorer output is required/i);
 		expect(skill).toContain("affected_dimension");
-		expect(skill).toContain("prior_ambiguity");
-		expect(skill).toContain("new_ambiguity");
-		expect(skill).toContain("contradicted_established_fact");
+		expect(skill).toContain("prior_dimension_score");
+		expect(skill).toContain("new_dimension_score");
+		expect(skill).toContain("Do not include prior/new ambiguity");
+		expect(skill).not.toContain("prior_ambiguity");
+		expect(skill).not.toContain("new_ambiguity");
+		expect(skill).toContain("runtime validates and returns the authoritative ambiguity transition");
+		expect(skill).toContain("{<native>.native_projection.effective_ambiguity}");
 	});
+	it("renders progress exclusively from version 1 native projection paths", () => {
+		const steps = extractSection(skill, "Steps");
+		const applyIndex = steps.indexOf("### Step 2d: Apply Round Result and Report Progress");
+		const applyCommandIndex = steps.indexOf("gjc deep-interview apply-round-result", applyIndex);
+		const reportEndIndex = steps.indexOf("### Step 2e: Check Soft Limits", applyCommandIndex);
+		const report = steps.slice(applyCommandIndex, reportEndIndex);
+		const projectionStart = stateSource.indexOf("export interface DeepInterviewRoundResultProjection");
+		const projectionEnd = stateSource.indexOf("\n}", projectionStart);
+		const projectionContract = stateSource.slice(projectionStart, projectionEnd);
 
-	it("reports ambiguity direction and validates trigger transitions", () => {
-		expect(skill).toContain("{prior_score}% -> {score}% {up|down|flat}");
-		expect(skill).toMatch(/TRANSITION VALIDATION/i);
-		expect(skill).toMatch(
-			/trigger is present, the affected dimension must not improve and overall ambiguity must rise/i,
-		);
+		expect(applyIndex).toBeGreaterThanOrEqual(0);
+		expect(applyCommandIndex).toBeGreaterThan(applyIndex);
+		expect(report).toContain("consume `<native>.native_projection` as the version 1 native projection");
+		for (const path of [
+			"prior_effective_ambiguity",
+			"effective_ambiguity",
+			"direction",
+			"floor",
+			"ambiguity_milestone",
+			"targeting.target_component_id",
+			"targeting.target_dimension",
+			"topology_counts.active",
+			"topology_counts.deferred",
+			"topology_counts.total",
+			"ontology_counts.stable",
+			"ontology_counts.changed",
+			"ontology_counts.new",
+			"transition.auto_answer_streak",
+			"transition.lifecycle",
+			"transition.round_key",
+		]) {
+			expect(report).toContain(`<native>.native_projection.${path}`);
+			expect(projectionContract).toContain(`${path.split(".").at(-1)}:`);
+		}
+		for (const unavailable of [
+			"target_component_name",
+			"trigger_summary",
+			"dominant_floor_cause",
+			"entity_count",
+			"stability_ratio",
+			"prior_milestone",
+			"milestone_transition",
+			"weakest_dimension",
+			"weakest_dimension_rationale",
+			"threshold",
+		])
+			expect(report).not.toContain(`native.${unavailable}`);
 	});
 
 	it("documents convergence pacing as deferred", () => {
@@ -186,5 +234,84 @@ describe("deep-interview ouroboros ooo-interview parity port", () => {
 		expect(skill).toMatch(/50,000/);
 		expect(skill).toMatch(/10,000/);
 		expect(skill).toMatch(/character-count/i);
+	});
+});
+describe("deep-interview CLI-owned draft contract", () => {
+	it("uses drafts for all normal-flow payloads and preserves recorder-first answers", () => {
+		const steps = extractSection(skill, "Steps");
+		for (const kind of ["initialize-context", "confirm-topology", "record-answer", "apply-round-result"]) {
+			expect(steps).toContain(`--for ${kind}`);
+			expect(steps).toContain(`${kind} --draft-id <draft_id>`);
+		}
+		expect(steps).not.toContain("draft create --kind");
+		for (const forbidden of ["--input-json", "--question-json", "--answer-json", "--result-json"]) {
+			expect(steps).not.toContain(forbidden);
+		}
+		expect(steps).toContain("Recorder-first remains mandatory");
+		expect(steps).toContain("draft check --draft-id <draft_id>");
+		expect(steps).toContain("--expected-draft-revision <draft_revision>");
+		expect(steps).toContain("--value");
+		expect(steps).toContain("--null");
+		expect(steps).toContain("--op append");
+		expect(steps).toContain("draft_revision");
+	});
+	it("documents public flag grammar and valueless append behavior without permitting raw JSON", () => {
+		const steps = extractSection(skill, "Steps");
+		const toolUsage = extractSection(skill, "Tool_Usage");
+
+		expect(repairCli).toContain(
+			"Value-taking flags use exactly `--name value`; `--json` and `--null` are standalone flags and take no value.",
+		);
+		expect(repairCli).toContain(
+			"A valueless `append` on a missing object-item array appends an `{}` scaffold; on a missing scalar-item array it initializes `[]`.",
+		);
+		expect(repairCli).toContain(
+			"An existing scalar-item array still requires `--value` or `--value-file` for `append`.",
+		);
+		expect(repairCli).toContain("--op append --path /deferred_components --json");
+		expect(toolUsage).toContain(
+			"value-taking flags use exactly `--name value`, while `--json` and `--null` take no value",
+		);
+		expect(steps).toContain("valueless append on a missing scalar-item array initializes `[]`");
+		expect(steps).toContain("--op append --path /deferred_components --json");
+		expect(toolUsage).toContain("Never construct a full payload");
+	});
+
+	it("documents CAS-protected private draft consumption", () => {
+		const toolUsage = extractSection(skill, "Tool_Usage");
+		const normalFlowDocs = repairCli.slice(0, repairCli.indexOf("## Legacy compatibility:"));
+		const typedConsumeExamples = [
+			...(skill.match(
+				/^gjc deep-interview (?:initialize-context|confirm-topology|record-answer|apply-round-result) --draft-id [^\n]+$/gm,
+			) ?? []),
+			...(repairCli.match(
+				/^gjc deep-interview (?:initialize-context|confirm-topology|record-answer|apply-round-result) --draft-id [^\n]+$/gm,
+			) ?? []),
+		];
+
+		expect(toolUsage).toContain("draft create|edit|show|check|rebase|discard");
+		expect(toolUsage).toContain("there is no public `draft consume` command");
+		expect(skill).not.toMatch(/\bgjc deep-interview draft consume\b/);
+		expect(normalFlowDocs).not.toMatch(
+			/\bgjc deep-interview draft consume\b|--input-json|--question-json|--answer-json|--result-json/,
+		);
+		expect(typedConsumeExamples).toHaveLength(8);
+		expect(normalFlowDocs).toContain("--draft-id ID --expected-draft-revision <latest_draft_revision> --json");
+		for (const example of typedConsumeExamples) {
+			expect(example).toContain("--expected-draft-revision <latest_draft_revision>");
+			expect(example).toContain("--json");
+		}
+
+		for (const command of ["create", "edit", "show", "check", "rebase", "discard"]) {
+			expect(normalFlowDocs).toMatch(new RegExp(`draft ${command}[^\\n]*--json`));
+		}
+		expect(normalFlowDocs).toContain(
+			"draft rebase  --draft-id ID --expected-draft-revision N --to-state-revision N --json",
+		);
+		expect(normalFlowDocs).toContain("draft discard --draft-id ID --expected-draft-revision N --json");
+		expect(normalFlowDocs).toContain("without consuming or mutating it; it reports when the draft base is stale");
+		expect(normalFlowDocs).toContain("caller-observed current state revision as `--to-state-revision`");
+		expect(toolUsage).toContain("Inline JSON request flags are compatibility-only");
+		expect(toolUsage).toContain("Never construct a full payload");
 	});
 });

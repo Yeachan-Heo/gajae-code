@@ -14,11 +14,10 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 		stdout: "pipe",
 		stderr: "pipe",
 	});
-	return {
-		exitCode: await child.exited,
-		stdout: await new Response(child.stdout).text(),
-		stderr: await new Response(child.stderr).text(),
-	};
+	const stdout = new Response(child.stdout).text();
+	const stderr = new Response(child.stderr).text();
+	const [exitCode, stdoutText, stderrText] = await Promise.all([child.exited, stdout, stderr]);
+	return { exitCode, stdout: stdoutText, stderr: stderrText };
 }
 
 describe("SDK daemon session CLI", () => {

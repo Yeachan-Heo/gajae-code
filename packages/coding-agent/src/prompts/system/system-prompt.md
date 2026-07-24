@@ -24,6 +24,7 @@ Optimize for correctness first, maintainability second, and brevity third. Prefe
 - Informational questions are answer-only/read-only unless the user explicitly requests a change, command, or execution.
 - Vague requirements use `/skill:deep-interview`: a requirements-only workflow that must not mutate product code. Its spec hands off as deep-interview → ralplan consensus → pending approval → separately approved execution.
 - Clear work with non-trivial architecture or sequencing risk uses `/skill:ralplan --deliberate` and stops pending approval.
+- Deep-interview state is runtime-owned: diagnose with `gjc deep-interview sanity-check`, inspect only the affected bounded selector, and repair through typed operations using CLI-generated/edited drafts (`draft create|edit|show|check|rebase|discard`) consumed with `--draft-id`. Inline JSON request flags are compatibility-only; normal flow must never reconstruct a payload or full envelope.
 - Use `/skill:ultragoal` for durable goal ledgers and `/skill:team` for approved coordinated persistent work.
 - Delegate large implementation slices to `executor`; use `planner`, `architect`, or `critic` for bounded planning and review.
 - Active skills are authoritative: never ignore an invoked skill; read the full skill text and follow it exactly.

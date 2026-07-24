@@ -2110,41 +2110,90 @@ export async function recoverOrphanedBackups(sessionDir: string, storage: Sessio
 }
 
 /**
- * Reads all session files from the directory and returns them sorted by mtime (newest first).
- * Uses low-level file I/O to efficiently read only the first 4KB of each file
- * to extract the JSON header and first user message without loading entire session logs into memory.
+ * Returns session metadata sorted by mtime (newest first).
+ *
+ * Directory entries are cheap to stat, but opening every transcript before applying a
+ * small caller limit makes welcome-screen startup scale with the entire session history.
+ * Rank paths first, then read bounded batches until the requested number of valid
+ * sessions has been found. Invalid or future-version files do not prevent older valid
+ * sessions from filling the result.
  */
-async function getSortedSessions(sessionDir: string, storage: SessionStorage): Promise<RecentSessionInfo[]> {
+async function getSortedSessions(
+	sessionDir: string,
+	storage: SessionStorage,
+	limit?: number,
+): Promise<RecentSessionInfo[]> {
 	await recoverOrphanedBackups(sessionDir, storage);
 	try {
-		const files: string[] = storage.listFilesSync(sessionDir, "*.jsonl");
+		let candidates: Array<{ path: string; mtime: number }> | undefined;
+		if (storage.listFilesByMtime) {
+			try {
+				candidates = (await storage.listFilesByMtime(sessionDir, "*.jsonl")).map(candidate => ({
+					path: candidate.path,
+					mtime: candidate.mtimeMs,
+				}));
+			} catch (error) {
+				logger.warn("Native session mtime listing failed; using JavaScript fallback", {
+					sessionDir,
+					error: toError(error).message,
+				});
+			}
+		} else {
+			logger.debug("Native session mtime listing unavailable; using JavaScript fallback", { sessionDir });
+		}
+		candidates ??= storage.listFilesSync(sessionDir, "*.jsonl").flatMap(path => {
+			try {
+				return [{ path, mtime: storage.statSync(path).mtimeMs }];
+			} catch {
+				return [];
+			}
+		});
+		candidates.sort((left, right) => {
+			if (left.mtime !== right.mtime) return right.mtime - left.mtime;
+			return left.path < right.path ? -1 : left.path > right.path ? 1 : 0;
+		});
+
 		const sessions: RecentSessionInfo[] = [];
-		await Promise.all(
-			files.map(async (path: string) => {
-				try {
-					const buffer = Buffer.allocUnsafe(SESSION_LIST_PREFIX_BYTES);
-					const content = await readSessionListPrefix(path, storage, buffer);
-					const entries = parseJsonlLenient<Record<string, unknown>>(content);
-					if (entries.length === 0) return;
-					const header = entries[0] as Record<string, unknown>;
-					if (
-						header.type !== "session" ||
-						typeof header.id !== "string" ||
-						!isSupportedSessionVersion(header.version)
-					)
-						return;
-					if (typeof header.version === "number" && header.version >= 4) {
-						for (const patch of await readSessionListTrailingPatches(path, storage, buffer)) {
-							applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
+		const batchSize = Math.max(32, limit ?? 0);
+
+		for (
+			let offset = 0;
+			offset < candidates.length && (limit === undefined || sessions.length < limit);
+			offset += batchSize
+		) {
+			const batch = candidates.slice(offset, offset + batchSize);
+			const parsed = await Promise.all(
+				batch.map(async candidate => {
+					try {
+						const buffer = Buffer.allocUnsafe(SESSION_LIST_PREFIX_BYTES);
+						const content = await readSessionListPrefix(candidate.path, storage, buffer);
+						const entries = parseJsonlLenient<Record<string, unknown>>(content);
+						if (entries.length === 0) return undefined;
+						const header = entries[0] as Record<string, unknown>;
+						if (
+							header.type !== "session" ||
+							typeof header.id !== "string" ||
+							!isSupportedSessionVersion(header.version)
+						)
+							return undefined;
+						if (typeof header.version === "number" && header.version >= 4) {
+							for (const patch of await readSessionListTrailingPatches(candidate.path, storage, buffer)) {
+								applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
+							}
 						}
+						const firstPrompt = header.title ? undefined : extractFirstUserPrompt(entries);
+						return new RecentSessionInfo(candidate.path, candidate.mtime, header, firstPrompt);
+					} catch {
+						return undefined;
 					}
-					const mtime = storage.statSync(path).mtimeMs;
-					const firstPrompt = header.title ? undefined : extractFirstUserPrompt(entries);
-					sessions.push(new RecentSessionInfo(path, mtime, header, firstPrompt));
-				} catch {}
-			}),
-		);
-		return sessions.sort((a, b) => b.mtime - a.mtime);
+				}),
+			);
+			for (const session of parsed) {
+				if (session) sessions.push(session);
+				if (limit !== undefined && sessions.length >= limit) break;
+			}
+		}
+		return sessions;
 	} catch {
 		return [];
 	}
@@ -2155,7 +2204,7 @@ export async function findMostRecentSession(
 	sessionDir: string,
 	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<string | null> {
-	const sessions = await getSortedSessions(sessionDir, storage);
+	const sessions = await getSortedSessions(sessionDir, storage, 1);
 	return sessions[0]?.path || null;
 }
 
@@ -3427,8 +3476,7 @@ export async function getRecentSessions(
 	limit = DEFAULT_WELCOME_RECENT_SESSION_LIMIT,
 	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<RecentSessionInfo[]> {
-	const sessions = await getSortedSessions(sessionDir, storage);
-	return sessions.slice(0, limit);
+	return getSortedSessions(sessionDir, storage, limit);
 }
 
 /**

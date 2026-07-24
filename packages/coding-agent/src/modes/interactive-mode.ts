@@ -70,6 +70,7 @@ import type { ToolExecutionHandle } from "./components/tool-execution";
 import { StatusLineComponent } from "./components/tool-status-header";
 import { composeToolText } from "./components/tool-transcript-format";
 import {
+	type RecentSession,
 	WelcomeComponent,
 	type WelcomeLogoMode,
 	type LspServerInfo as WelcomeLspServerInfo,
@@ -631,15 +632,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		const modelName = this.session.model?.name ?? "Unknown";
 		const providerName = this.session.model?.provider ?? "Unknown";
 
-		// Get recent sessions
-		const recentSessions = await logger.time("InteractiveMode.init:recentSessions", () =>
-			getRecentSessions(this.sessionManager.getSessionDir()).then(sessions =>
-				sessions.map(s => ({
-					name: s.name,
-					timeAgo: s.timeAgo,
-				})),
-			),
-		);
+		// Session history is display-only. Never hold the editor and keyboard behind
+		// transcript I/O; populate the welcome trail after the interactive surface exists.
+		const recentSessions: RecentSession[] = [];
 
 		const startupQuiet = settings.get("startup.quiet");
 		const welcomeLogoMode = resolveWelcomeLogoMode(settings.get("startup.welcomeBannerMode"));
@@ -763,6 +758,31 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.settings.get("tasksPane.defaultVisible")) this.showTasksPane();
 		this.#syncIrcSidebarAvailabilityFromSettings();
 		this.ui.requestRender(true);
+		if (this.#welcomeComponent) {
+			const welcomeComponent = this.#welcomeComponent;
+			const recentSessionsTimer = setTimeout(() => {
+				void logger
+					.time("InteractiveMode.init:recentSessions", () =>
+						getRecentSessions(this.sessionManager.getSessionDir()),
+					)
+					.then(sessions => {
+						if (this.#welcomeComponent !== welcomeComponent) return;
+						welcomeComponent.setRecentSessions(
+							sessions.map(session => ({
+								name: session.name,
+								timeAgo: session.timeAgo,
+							})),
+						);
+						this.ui.requestRender();
+					})
+					.catch(error => {
+						logger.debug("Failed to load recent sessions for welcome screen", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+			}, 0);
+			recentSessionsTimer.unref?.();
+		}
 
 		// GitHub star reminder (interactive-only). Register the decline-driven
 		// injection contributor and schedule the launch nudge after the first

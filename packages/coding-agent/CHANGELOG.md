@@ -6,6 +6,7 @@
 
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
 - Windows managed-session resume no longer reports `durability_failed` when Bun rejects `fsync` on the read-only descriptor used to revalidate an existing canonical binding; Windows now uses an owner-writable descriptor for that durability fence while retaining no-follow and pre/post identity/content checks.
+- SDK daemon CLI end-to-end tests now drain spawned child stdout and stderr concurrently with process exit, preventing CI pipe teardown races from replacing the product exit contract with SIGPIPE status 141 (#3024).
 
 ## [0.11.8] - 2026-07-23
 ### Added
@@ -51,6 +52,7 @@
 - ACP session close now rotates idempotency keys for resumed attachment generations while retaining the same key across terminally uncertain close retries.
 - ConversationStore now tolerates only unsupported Windows parent-directory durability errors after preserving temporary-file fsync and atomic rename.
 - Ralplan no longer re-asks for execution approval when the user already explicitly named `ultragoal` or `team` in the current turn; that naming is the consent.
+- Interactive Windows startup now stays keyboard-ready with large session histories and native multiplexers by showing an interactive-only bootstrap before the first TUI start, deferring bounded recent-session discovery until afterward, and reducing psmux frame pressure while preserving the three-second animation and update checks.
 
 - Cron guidance now routes silent recurring polling and event-driven PR/CI watchers to `monitor`, because every cron firing starts a normal assistant turn and prompt wording cannot reliably suppress its response.
 - Ordinary `ask` calls now normalize a provider-emitted `deepInterview: null` placeholder instead of misclassifying it as malformed Round-0 intent recovery data and rejecting it before coercion.
@@ -275,11 +277,11 @@
 
 ## [0.10.1] - 2026-07-13
 
+- Deep-interview bundled guidance now uses the typed native setup, topology, answer-recovery, round-result, selective inspection, and sanity-check commands for normal workflow state changes. Generic `gjc state` remains limited to documented compatibility/recovery handoff paths; ambiguity, receipts, revisions, topology persistence, and diagnosis/repair remain runtime-owned.
 ### Added
 
 - Added an owner-proof idle session reaper and `gjc_coordinator_stop_session` for ephemeral (delegate-created) coordinator sessions. Termination goes exclusively through the canonical SDK broker `session.close` lifecycle (durable process identity verified before close) — never a raw `process.kill` or tmux control. The reaper re-validates ephemeral and no-active-turn state at close time under the same per-session mutation lock as delegate reuse, and purges coordinator metadata only after SDK closure is verified, retaining it when closure cannot be confirmed (#2080).
 
-- Added an owner-proof idle session reaper and `gjc_coordinator_stop_session` for ephemeral (delegate-created) coordinator sessions. Termination goes exclusively through the owner-proof `forceCloseGjcTmuxSession` path (pid, native session id, owner generation, server key, and start time all verified before SIGTERM) — never a raw `process.kill`. The reaper binds each close to the persisted runtime-state file, re-validates ephemeral and no-active-turn at kill time under the same per-session mutation lock as delegate reuse, and purges state only on verified termination (#2080).
 - SDK clients can now pass an explicit thinking level to `model.set`, atomically applying the effective model and thinking level to the active session and the machine-global default for future sessions, while project policy and resumed session history retain precedence.
 - Context-usage tokens/% now use provider-reported usage as the single source of truth on every surface. `AgentSession.getContextUsage()` returns a source-tagged snapshot (`source: "provider_anchor" | "heuristic" | "unknown"`), and the status-line `context_pct` segment, inline model percentage, and `/context` totals consume that snapshot instead of recomputing an independent heuristic sum — so footer, status line, `/context`, ACP, and RPC can no longer disagree about the same session state. Heuristic estimation now applies only when no provider anchor exists (session start, aborted/error-only turns), and that fallback now includes the fixed system-prompt/tool/skill context it previously omitted. The pre-prompt compaction estimate honors the latest-compaction boundary (never anchors on stale pre-compaction usage totals), unknown post-compaction usage stays unknown (status line renders `?`; ACP omits the `usage_update` instead of reporting `used: 0`), and `/context` labels its total by provenance with a reconciliation line when the estimated category composition diverges from the provider-reported total.
 - Post-durable default-model-selection failures now expose a stable SDK error with bounded `restored`, `partial`, or `unknown` rollback state; preflight and validation errors remain unchanged.
