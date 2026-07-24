@@ -1,7 +1,15 @@
 import { type Agent, type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai";
-import type { Component, EditorTheme, SlashCommand } from "@gajae-code/tui";
+import type {
+	Component,
+	EditorTheme,
+	ScrollViewportSource,
+	SlashCommand,
+	ViewportAnchorProvider,
+	ViewportAnchorRender,
+	ViewportAnchorRow,
+} from "@gajae-code/tui";
 import {
 	Container,
 	clearRenderCache,
@@ -9,9 +17,13 @@ import {
 	Loader,
 	onImageProtocolChanged,
 	ProcessTerminal,
+	renderComponentWithViewportAnchors,
+	replaceTabs,
+	ScrollViewport,
 	Spacer,
 	Text,
 	TUI,
+	truncateToWidth,
 } from "@gajae-code/tui";
 import { APP_NAME, adjustHsv, getProjectDir, logger, postmortem } from "@gajae-code/utils";
 import chalk from "chalk";
@@ -75,6 +87,7 @@ import {
 	type WelcomeLogoMode,
 	type LspServerInfo as WelcomeLspServerInfo,
 } from "./components/welcome";
+import { allocateComposerLayout, type ComposerLayout, EDITOR_MAX_ROWS } from "./composer-layout";
 import { BtwController } from "./controllers/btw-controller";
 import { CommandController } from "./controllers/command-controller";
 import { EventController } from "./controllers/event-controller";
@@ -206,10 +219,80 @@ function renderWorkingMessage(message: string, accent?: WorkingMessageAccent): s
 	);
 }
 
-const EDITOR_MAX_HEIGHT_MIN = 6;
-const EDITOR_MAX_HEIGHT_MAX = 18;
-const EDITOR_RESERVED_ROWS = 12;
 const EDITOR_FALLBACK_ROWS = 24;
+
+class TranscriptViewportSource implements ScrollViewportSource {
+	#rendered: ViewportAnchorRender = { lines: [], anchors: [] };
+
+	constructor(private readonly containers: readonly Component[]) {}
+
+	getRowCount(width: number): number {
+		const rendered = this.containers.map(container => renderComponentWithViewportAnchors(container, width));
+		this.#rendered = {
+			lines: rendered.flatMap(result => result.lines),
+			anchors: rendered.flatMap(result => result.anchors),
+		};
+		return this.#rendered.lines.length;
+	}
+
+	renderRows(_width: number, startRow: number, endRow: number): string[] {
+		return this.#rendered.lines.slice(startRow, endRow);
+	}
+
+	renderAnchors(startRow: number, endRow: number): Array<ViewportAnchorRow | null> {
+		return this.#rendered.anchors.slice(startRow, endRow);
+	}
+
+	findAnchorRow(id: string): number {
+		return this.#rendered.anchors.findIndex(anchor => anchor?.id === id);
+	}
+
+	invalidate(): void {
+		for (const container of this.containers) container.invalidate();
+	}
+}
+
+class LayoutScrollViewport extends ScrollViewport implements ViewportAnchorProvider {
+	constructor(
+		private readonly viewportSource: TranscriptViewportSource,
+		private readonly updateLayout: (width: number) => void,
+		private readonly renderUnseenIndicator: (width: number, unseenRows: number) => string,
+	) {
+		super(viewportSource);
+	}
+
+	override render(width: number): string[] {
+		return this.renderWithViewportAnchors(width).lines;
+	}
+
+	renderWithViewportAnchors(width: number): ViewportAnchorRender {
+		this.updateLayout(width);
+		const lines = super.render(width);
+		const state = this.getState();
+		const visibleRows = Math.min(state.totalRows - state.offset, state.height);
+		const anchors = this.viewportSource.renderAnchors(state.offset, state.offset + visibleRows);
+		while (anchors.length < lines.length) anchors.unshift(null);
+		if (!state.followTail && state.unseenRows > 0 && lines.length > 0) {
+			lines[lines.length - 1] = this.renderUnseenIndicator(width, state.unseenRows);
+			anchors[anchors.length - 1] = null;
+		}
+		return { lines, anchors };
+	}
+
+	revealViewportAnchor(id: string, alignment: "top" | "center" | "bottom"): boolean {
+		const row = this.viewportSource.findAnchorRow(id);
+		if (row < 0) return false;
+		const height = this.getState().height;
+		const offset =
+			alignment === "top" ? row : alignment === "center" ? row - Math.floor(height / 2) : row - height + 1;
+		this.setOffset(Math.max(0, offset));
+		return true;
+	}
+
+	override invalidate(): void {
+		this.viewportSource.invalidate();
+	}
+}
 
 const HUD_NOTE_SUP_DIGITS: Record<string, string> = {
 	"0": "\u2070",
@@ -281,6 +364,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	statusContainer: Container;
 	todoContainer: Container;
 	btwContainer: Container;
+	transcriptViewport: ScrollViewport;
 	editor: CustomEditor;
 	editorContainer: Container;
 	hookWidgetContainerAbove: Container;
@@ -369,6 +453,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #planModeController: PlanModeController;
 	#sttController: SttModeController | undefined;
 	#resizeHandler?: () => void;
+	#transcriptInputUnsubscribe?: () => void;
+	#composerLayout: ComposerLayout | undefined;
 	#observerRegistry: SessionObserverRegistry;
 	#transcriptRegistry = new TranscriptItemRegistry();
 
@@ -529,9 +615,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.onAutocompleteUpdate = () => {
 			this.ui.requestRender();
 		};
-		this.#syncEditorMaxHeight();
+		this.editor.setMaxHeight(EDITOR_MAX_ROWS);
 		this.#resizeHandler = () => {
-			this.#syncEditorMaxHeight();
+			this.transcriptViewport.invalidate();
 			this.updateEditorChrome();
 			this.editor.invalidate();
 			this.#invalidateIrcSidebarRender();
@@ -554,6 +640,25 @@ export class InteractiveMode implements InteractiveModeContext {
 			keyDisplayContext: this.#keyDisplayContext,
 		});
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
+		const transcriptSource = new TranscriptViewportSource([
+			this.#ircSplitView,
+			this.pendingMessagesContainer,
+			this.statusContainer,
+			this.todoContainer,
+			this.btwContainer,
+		]);
+		this.transcriptViewport = new LayoutScrollViewport(
+			transcriptSource,
+			width => {
+				this.#updateComposerLayout(width);
+			},
+			(width, unseenRows) => {
+				const rowLabel = unseenRows === 1 ? "row" : "rows";
+				const shortcut = this.keybindings.getDisplayString("app.transcript.tail") || "Alt+End";
+				const text = replaceTabs(`↓ ${unseenRows} unseen ${rowLabel} · ${shortcut}: return to tail`);
+				return truncateToWidth(theme.fg("muted", text), Math.max(0, width));
+			},
+		);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
 
@@ -669,19 +774,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#welcomeComponent.playIntro(() => this.ui.requestRender());
 		}
 
-		this.ui.addChild(this.#ircSplitView);
-		this.ui.setViewportAnchorComponent(this.#ircSplitView);
-
-		this.ui.addChild(this.pendingMessagesContainer);
-		this.ui.addChild(this.statusContainer);
-		this.ui.addChild(this.todoContainer);
-		this.ui.addChild(this.btwContainer);
+		this.ui.addChild(this.transcriptViewport);
+		this.ui.setViewportAnchorComponent(this.transcriptViewport);
 		this.ui.addChild(this.statusLine); // Main status rail + hook statuses; composer chrome is rendered by the editor.
 		this.ui.addChild(this.hookWidgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
 		this.ui.addChild(this.petFloorContainer);
 		this.ui.addChild(this.hookWidgetContainerBelow);
-		this.ui.setBottomPinnedComponent(this.statusLine);
+		this.ui.setBottomPinnedComponent(null);
 		this.ui.setFocus(this.editor);
 		this.petWidget?.dispose();
 		this.petWidget = this.#createPetWidget(this.editor);
@@ -715,6 +815,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
+		this.#transcriptInputUnsubscribe = this.ui.addInputListener(data => this.#handleTranscriptInput(data));
 
 		// Wire observer registry to EventBus
 		if (this.#eventBus) {
@@ -753,7 +854,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		pushTerminalTitle();
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.updateEditorChrome();
-		this.#syncEditorMaxHeight();
+		this.#updateComposerLayout(Math.max(1, this.ui.terminal.columns));
 		this.isInitialized = true;
 		if (this.settings.get("tasksPane.defaultVisible")) this.showTasksPane();
 		this.#syncIrcSidebarAvailabilityFromSettings();
@@ -1041,15 +1142,51 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	#computeEditorMaxHeight(): number {
-		const rows = this.ui.terminal.rows;
-		const terminalRows = Number.isFinite(rows) && rows > 0 ? rows : EDITOR_FALLBACK_ROWS;
-		const maxHeight = terminalRows - EDITOR_RESERVED_ROWS;
-		return Math.max(EDITOR_MAX_HEIGHT_MIN, Math.min(EDITOR_MAX_HEIGHT_MAX, maxHeight));
+	#updateComposerLayout(width: number): void {
+		const terminalRowsValue = this.ui.terminal.rows;
+		const viewportRows =
+			Number.isFinite(terminalRowsValue) && terminalRowsValue > 0 ? terminalRowsValue : EDITOR_FALLBACK_ROWS;
+		const terminalRows = Math.max(0, viewportRows - this.#measureTranscriptPrefixRows(width));
+		this.editor.setMaxHeight(EDITOR_MAX_ROWS);
+		this.editor.setAutocompleteRowBudget(0);
+		const editorRows = this.editor.render(width).length;
+		const layout = allocateComposerLayout({
+			terminalRows,
+			editorRows,
+			statusRows: this.statusLine.render(width).length,
+			widgetRowsAbove: this.hookWidgetContainerAbove.render(width).length,
+			widgetRowsBelow:
+				this.petFloorContainer.render(width).length + this.hookWidgetContainerBelow.render(width).length,
+			autocompleteRows: this.editor.isAutocompleteOpen() ? this.editor.getAutocompleteMaxVisible() + 1 : 0,
+		});
+		this.#composerLayout = layout;
+		this.transcriptViewport.setHeight(layout.transcriptRows);
+		this.editor.setMaxHeight(layout.editorMaxRows);
+		this.editor.setAutocompleteRowBudget(layout.autocompleteRows);
 	}
 
-	#syncEditorMaxHeight(): void {
-		this.editor.setMaxHeight(this.#computeEditorMaxHeight());
+	#measureTranscriptPrefixRows(width: number): number {
+		const transcriptIndex = this.ui.children.indexOf(this.transcriptViewport);
+		if (transcriptIndex <= 0) return 0;
+		return this.ui.children
+			.slice(0, transcriptIndex)
+			.reduce((rows, component) => rows + component.render(width).length, 0);
+	}
+
+	#handleTranscriptInput(data: string): { consume?: boolean } | undefined {
+		if (this.ui.hasOverlay() || this.editor.isAutocompleteOpen()) return undefined;
+		const pageRows = Math.max(1, this.transcriptViewport.getState().height - 1);
+		if (this.keybindings.matches(data, "app.transcript.pageUp")) {
+			this.transcriptViewport.scrollBy(-pageRows);
+		} else if (this.keybindings.matches(data, "app.transcript.pageDown")) {
+			this.transcriptViewport.scrollBy(pageRows);
+		} else if (this.keybindings.matches(data, "app.transcript.tail")) {
+			this.transcriptViewport.scrollToTail();
+		} else {
+			return undefined;
+		}
+		this.ui.requestRender();
+		return { consume: true };
 	}
 
 	#isPromptDeliveryBusy(): boolean {
@@ -1340,6 +1477,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			process.stdout.removeListener("resize", this.#resizeHandler);
 			this.#resizeHandler = undefined;
 		}
+		if (this.#transcriptInputUnsubscribe) {
+			this.#transcriptInputUnsubscribe();
+			this.#transcriptInputUnsubscribe = undefined;
+		}
 		if (this.unsubscribe) {
 			this.unsubscribe();
 		}
@@ -1440,20 +1581,20 @@ export class InteractiveMode implements InteractiveModeContext {
 		nextEditor.onAutocompleteUpdate = () => {
 			this.ui.requestRender();
 		};
-		nextEditor.setMaxHeight(this.#computeEditorMaxHeight());
+		nextEditor.setMaxHeight(this.#composerLayout?.editorMaxRows ?? EDITOR_MAX_ROWS);
+		nextEditor.setAutocompleteRowBudget(this.#composerLayout?.autocompleteRows ?? 0);
 		if (this.historyStorage) {
 			nextEditor.setHistoryStorage(this.historyStorage);
 		}
 		nextEditor.setText(previousText);
-		previousEditor.dispose();
-
 		const petMode = settings.get("pet.mode");
 		this.petWidget?.dispose();
 
-		this.editorContainer.clear();
+		this.editorContainer.detachChild(previousEditor);
 		this.editor = nextEditor;
 		this.editorContainer.addChild(nextEditor);
-		this.ui.setFocus(nextEditor);
+		this.ui.replaceFocusTarget(previousEditor, nextEditor);
+		previousEditor.dispose();
 
 		this.petWidget = this.#createPetWidget(nextEditor);
 		this.petWidget.setMode(petMode);

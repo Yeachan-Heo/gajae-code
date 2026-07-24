@@ -168,6 +168,9 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.transcript.browse` | _(none)_ | composer |
 | `app.transcript.prevTurn` | _(none)_ | composer |
 | `app.transcript.nextTurn` | _(none)_ | composer |
+| `app.transcript.pageUp` | alt+pageUp | composer |
+| `app.transcript.pageDown` | alt+pageDown | composer |
+| `app.transcript.tail` | alt+end | composer |
 | `app.mode.cycle` | _(none)_ | composer |
 | `app.tasks.toggle` | alt+t | composer |
 | `app.queue.togglePane` | _(none)_ | composer |

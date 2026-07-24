@@ -166,6 +166,14 @@ export interface ViewportAnchorProvider extends Component {
 	renderWithViewportAnchors(width: number): ViewportAnchorRender;
 }
 
+export interface ViewportAnchorRevealer extends Component {
+	revealViewportAnchor(id: ViewportAnchorId, alignment: "top" | "center" | "bottom"): boolean;
+}
+
+export function isViewportAnchorRevealer(component: Component): component is ViewportAnchorRevealer {
+	return "revealViewportAnchor" in component && typeof component.revealViewportAnchor === "function";
+}
+
 export interface ViewportAnchorSource {
 	id: ViewportAnchorId;
 }
@@ -787,6 +795,16 @@ export class TUI extends Container {
 		}
 	}
 
+	/** Replace a mounted focus target without leaving stale overlay restoration references. */
+	replaceFocusTarget(previous: Component, next: Component): void {
+		if (this.#focusedComponent === previous) {
+			this.setFocus(next);
+		}
+		for (const overlay of this.overlayStack) {
+			if (overlay.preFocus === previous) overlay.preFocus = next;
+		}
+	}
+
 	setBottomPinnedComponent(component: Component | null): void {
 		this.#bottomPinnedComponent = component;
 		this.requestRender();
@@ -820,6 +838,17 @@ export class TUI extends Container {
 	revealViewportAnchor(id: ViewportAnchorId, alignment: "top" | "center" | "bottom"): boolean {
 		const height = this.terminal.rows;
 		const width = this.terminal.columns;
+		const anchorComponent = this.#viewportAnchorComponent;
+		if (height > 0 && width > 0 && anchorComponent && isViewportAnchorRevealer(anchorComponent)) {
+			const revealed = anchorComponent.revealViewportAnchor(id, alignment);
+			if (revealed) {
+				this.#manualViewportTop = undefined;
+				this.#manualViewportAnchor = null;
+				this.#manualViewportFallbackAnchors = [];
+				this.requestRender();
+				return true;
+			}
+		}
 		const frame = this.#viewportAnchorFrame;
 		if (height <= 0 || width <= 0 || this.#previousLines.length === 0 || frame === null) return false;
 

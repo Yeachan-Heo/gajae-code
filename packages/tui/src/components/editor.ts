@@ -462,6 +462,7 @@ export class Editor implements Component, Focusable {
 	#autocompleteRequestId: number = 0;
 	#autocompleteOrigin?: { docVersion: number; cursorLine: number; cursorCol: number };
 	#autocompleteMaxVisible: number = 5;
+	#autocompleteRowBudget: number | undefined;
 	onAutocompleteUpdate?: () => void;
 
 	// Paste tracking for large pastes
@@ -627,6 +628,15 @@ export class Editor implements Component, Focusable {
 		if (this.#autocompleteMaxVisible !== newMaxVisible) {
 			this.#autocompleteMaxVisible = newMaxVisible;
 		}
+	}
+
+	getAutocompleteRowBudget(): number | undefined {
+		return this.#autocompleteRowBudget;
+	}
+
+	setAutocompleteRowBudget(rowBudget: number | undefined): void {
+		this.#autocompleteRowBudget =
+			rowBudget === undefined ? undefined : Number.isFinite(rowBudget) ? Math.max(0, Math.floor(rowBudget)) : 0;
 	}
 
 	setHistoryStorage(storage: HistoryStorage): void {
@@ -1106,7 +1116,7 @@ export class Editor implements Component, Focusable {
 
 		// Add autocomplete list if active
 		if (this.#autocompleteState && this.#autocompleteList) {
-			const autocompleteResult = this.#autocompleteList.render(renderWidth);
+			const autocompleteResult = this.#autocompleteList.render(renderWidth, this.#autocompleteRowBudget);
 			result.push(...autocompleteResult);
 		}
 

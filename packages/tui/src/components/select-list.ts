@@ -15,6 +15,7 @@ function sanitizeSingleLine(text: string): string {
 }
 
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(value, max));
+const toRowBudget = (value: number): number => (Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0);
 
 export interface SelectItem {
 	value: string;
@@ -97,7 +98,10 @@ export class SelectList implements Component {
 		// No cached state to invalidate currently
 	}
 
-	render(width: number): string[] {
+	render(width: number, rowBudget?: number): string[] {
+		const budget = rowBudget === undefined ? undefined : toRowBudget(rowBudget);
+		if (budget === 0) return [];
+
 		const lines: string[] = [];
 
 		// If no items match filter, show message
@@ -107,12 +111,21 @@ export class SelectList implements Component {
 		}
 
 		const primaryColumnWidth = this.#getPrimaryColumnWidth();
+		let itemLimit = budget === undefined ? this.maxVisible : Math.min(this.maxVisible, budget);
+		let { startIndex, endIndex } = this.#getVisibleRange(itemLimit);
+		let showScrollInfo = startIndex > 0 || endIndex < this.#filteredItems.length;
 
-		// Calculate visible range with scrolling. Selection owns the viewport when
-		// present; otherwise navigation moves an independent viewport anchor.
-		const startIndex =
-			this.#selectedIndex >= 0 ? this.#startIndexForSelection(this.#selectedIndex) : this.#clampedViewportStart();
-		const endIndex = Math.min(startIndex + this.maxVisible, this.#filteredItems.length);
+		// Runtime budgets include the scroll indicator. Keep at least one item row so
+		// the current selection remains visible when only one row is available.
+		if (budget !== undefined && showScrollInfo) {
+			if (budget === 1) {
+				showScrollInfo = false;
+			} else {
+				itemLimit = Math.min(this.maxVisible, budget - 1);
+				({ startIndex, endIndex } = this.#getVisibleRange(itemLimit));
+				showScrollInfo = startIndex > 0 || endIndex < this.#filteredItems.length;
+			}
+		}
 
 		// Render visible items
 		for (let i = startIndex; i < endIndex; i++) {
@@ -126,14 +139,25 @@ export class SelectList implements Component {
 
 		// Add scroll indicators if needed. With no selectable item the position
 		// is reported as "-" so an all-disabled list never claims a selection.
-		if (startIndex > 0 || endIndex < this.#filteredItems.length) {
+		if (showScrollInfo) {
 			const position = this.#selectedIndex >= 0 ? `${this.#selectedIndex + 1}` : "-";
 			const scrollText = `  (${position}/${this.#filteredItems.length})`;
-			// Truncate if too long for terminal
 			lines.push(this.theme.scrollInfo(truncateToWidth(scrollText, width - 2, Ellipsis.Omit)));
 		}
 
 		return lines;
+	}
+
+	#getVisibleRange(itemLimit: number): { startIndex: number; endIndex: number } {
+		const visibleItems = Math.max(0, itemLimit);
+		const startIndex =
+			this.#selectedIndex >= 0
+				? this.#startIndexForSelection(this.#selectedIndex, visibleItems)
+				: this.#clampedViewportStart(visibleItems);
+		return {
+			startIndex,
+			endIndex: Math.min(startIndex + visibleItems, this.#filteredItems.length),
+		};
 	}
 
 	handleInput(keyData: string): void {
@@ -324,16 +348,16 @@ export class SelectList implements Component {
 		return this.#filteredItems.every(item => !item.disabled);
 	}
 
-	#maxViewportStart(): number {
-		return Math.max(0, this.#filteredItems.length - this.maxVisible);
+	#maxViewportStart(visibleItems: number = this.maxVisible): number {
+		return Math.max(0, this.#filteredItems.length - visibleItems);
 	}
 
-	#clampedViewportStart(): number {
-		return Math.max(0, Math.min(this.#viewportStartIndex, this.#maxViewportStart()));
+	#clampedViewportStart(visibleItems: number = this.maxVisible): number {
+		return Math.max(0, Math.min(this.#viewportStartIndex, this.#maxViewportStart(visibleItems)));
 	}
 
-	#startIndexForSelection(index: number): number {
-		return Math.max(0, Math.min(index - Math.floor(this.maxVisible / 2), this.#maxViewportStart()));
+	#startIndexForSelection(index: number, visibleItems: number = this.maxVisible): number {
+		return Math.max(0, Math.min(index - Math.floor(visibleItems / 2), this.#maxViewportStart(visibleItems)));
 	}
 
 	#syncViewportToIndex(index: number): void {
