@@ -2283,7 +2283,7 @@ function planArtifactRootForMigration(sourceTranscript: string, operation: strin
 			dev: stat.dev,
 			ino: stat.ino,
 			size: process.platform === "win32" ? BigInt(root.size) : stat.size,
-			mtimeNs: stat.mtimeNs,
+			mtimeNs: process.platform === "win32" ? BigInt(root.mtimeNs) : stat.mtimeNs,
 		},
 		tree,
 	};
@@ -2306,25 +2306,73 @@ function sameDirectoryObject(leftPath: string, rightPath: string): boolean {
 	}
 }
 
-function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot): boolean {
+function matchesMigrationArtifactRoot(
+	pathname: string,
+	identity: DetachedArtifactRoot["identity"],
+	expectedTree: NativeDirectoryTreeSnapshot,
+): boolean {
 	try {
 		const stat = fs.lstatSync(pathname, { bigint: true });
-		const snapshot = native.snapshotDirectoryTree(pathname);
-		const root = snapshot.snapshot?.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
-		return (
-			stat.isDirectory() &&
-			!stat.isSymbolicLink() &&
-			stat.dev === plan.identity.dev &&
-			stat.ino === plan.identity.ino &&
-			stat.mtimeNs === plan.identity.mtimeNs &&
-			(process.platform === "win32"
-				? snapshot.ok && !!root && BigInt(root.size) === plan.identity.size
-				: stat.size === plan.identity.size) &&
-			sameDirectoryObject(path.dirname(pathname), path.dirname(plan.detachedPath))
+		if (
+			!stat.isDirectory() ||
+			stat.isSymbolicLink() ||
+			stat.dev !== identity.dev ||
+			stat.ino !== identity.ino
+		)
+			return false;
+		const observed = native.snapshotDirectoryTree(pathname);
+		const expectedRoot = expectedTree.entries.find(
+			entry => entry.relativePath === "" && entry.kind === "directory",
 		);
+		const observedRoot = observed.snapshot?.entries.find(
+			entry => entry.relativePath === "" && entry.kind === "directory",
+		);
+		if (
+			!observed.ok ||
+			!observed.snapshot ||
+			!expectedRoot ||
+			!observedRoot ||
+			(process.platform === "win32" &&
+				(observedRoot.dev !== identity.dev.toString() ||
+					observedRoot.ino !== identity.ino.toString() ||
+					BigInt(observedRoot.size) !== identity.size ||
+					BigInt(observedRoot.mtimeNs) !== identity.mtimeNs)) ||
+			(process.platform !== "win32" &&
+				(stat.size !== identity.size || stat.mtimeNs !== identity.mtimeNs))
+		)
+			return false;
+		const directoryEntryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
+			JSON.stringify(
+				process.platform === "win32"
+					? [entry.relativePath, entry.kind, entry.dev, entry.ino]
+					: [entry.relativePath, entry.kind, entry.dev, entry.ino, entry.size, entry.mtimeNs],
+			);
+		const strictEntryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
+			JSON.stringify([
+				entry.relativePath,
+				entry.kind,
+				entry.dev,
+				entry.ino,
+				entry.size,
+				entry.mtimeNs,
+				entry.ctimeNs,
+				entry.sha256,
+			]);
+		const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
+			entry.kind === "directory" ? directoryEntryKey(entry) : strictEntryKey(entry);
+		const expectedEntries = expectedTree.entries.map(entryKey).sort();
+		const observedEntries = observed.snapshot.entries.map(entryKey).sort();
+		return expectedEntries.length === observedEntries.length && expectedEntries.every((entry, index) => entry === observedEntries[index]);
 	} catch {
 		return false;
 	}
+}
+
+function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot): boolean {
+	return (
+		matchesMigrationArtifactRoot(pathname, plan.identity, plan.tree) &&
+		sameDirectoryObject(path.dirname(pathname), path.dirname(plan.detachedPath))
+	);
 }
 
 function sameArtifactTree(left: NativeDirectoryTreeSnapshot, right: NativeDirectoryTreeSnapshot): boolean {
@@ -2477,12 +2525,12 @@ function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandida
 		throw new Error("durability_failed");
 	if (receipt === detachedReceipt && quarantine.role !== "detached_artifact_root")
 		throw new Error("durability_failed");
-	if (receipt === detachedReceipt) {
+	if (receipt === detachedReceipt && record.sourceArtifactCleanup !== undefined) {
 		const cleanup = record.sourceArtifactCleanup;
-		const cleanupIdentity = cleanup?.identity;
-		const cleanupTree = artifactTreeSnapshot(cleanup?.tree);
+		const cleanupIdentity = cleanup.identity;
+		const cleanupTree = artifactTreeSnapshot(cleanup.tree);
 		if (
-			cleanup?.state !== "cleanup_pending" ||
+			cleanup.state !== "cleanup_pending" ||
 			cleanup.role !== "exchange_placeholder" ||
 			typeof cleanup.retainedPath !== "string" ||
 			!cleanupIdentity ||
@@ -2512,21 +2560,23 @@ function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandida
 
 	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
 	const assertPreparedTree = (pathname: string): void => {
-		validateManagedArtifactTree(pathname);
-		const observed = native.snapshotDirectoryTree(pathname);
-		if (!observed.ok || !observed.snapshot || !sameArtifactTree(observed.snapshot, expectedTree))
+		if (
+			!matchesMigrationArtifactRoot(pathname, {
+				dev: BigInt(identity.dev),
+				ino: BigInt(identity.ino),
+				size: BigInt(identity.size),
+				mtimeNs: BigInt(identity.mtimeNs),
+			}, expectedTree)
+		)
 			throw new Error("durability_failed");
 	};
 	if (fs.existsSync(quarantine.path)) {
-		const existing = fs.lstatSync(quarantine.path, { bigint: true });
-		if (
-			!existing.isSymbolicLink() &&
-			existing.isDirectory() &&
-			existing.dev === BigInt(identity.dev) &&
-			existing.ino === BigInt(identity.ino) &&
-			existing.size === BigInt(identity.size) &&
-			existing.mtimeNs === BigInt(identity.mtimeNs)
-		) {
+		if (matchesMigrationArtifactRoot(quarantine.path, {
+			dev: BigInt(identity.dev),
+			ino: BigInt(identity.ino),
+			size: BigInt(identity.size),
+			mtimeNs: BigInt(identity.mtimeNs),
+		}, expectedTree)) {
 			assertPreparedTree(quarantine.path);
 		}
 		// A changed source pathname is independent retained authority. Do not replace
