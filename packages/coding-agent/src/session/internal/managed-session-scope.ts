@@ -2789,6 +2789,7 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 		const tombstone = path.join(directory, name);
 		const targets = retiredTargets(scope, tombstone);
 		if (!targets) continue;
+		if (targets.every(target => cleanupCompleted(scope, tombstone, target))) continue;
 		let lock: ManagedStorageLock | undefined;
 		try {
 			lock = await acquireManagedLock(
