@@ -1009,7 +1009,6 @@ async function restoreNotificationRootRegistration(input: {
 			const sessions = { ...(current.sessions ?? {}) };
 			if (sessions[input.sessionId] !== input.registeredRoot) return;
 			if (
-				input.registeredToken !== undefined &&
 				current.registrationTokens?.[input.sessionId] !== undefined &&
 				current.registrationTokens[input.sessionId] !== input.registeredToken
 			)
@@ -1139,15 +1138,11 @@ export async function unregisterNotificationRoot(input: {
 				return;
 			}
 			// Same sessionId + same cwd re-registration records an identical root, so
-			// the root match alone cannot distinguish a replaced registration: fence
-			// on the per-registration token. Legacy token-less registrations keep the
-			// old root-match behavior.
+			// the root match alone cannot distinguish a replaced registration. Any
+			// token-bearing registration requires the caller to present that exact token;
+			// only genuinely legacy token-less rows retain root-match cleanup behavior.
 			const recordedToken = current.registrationTokens?.[input.sessionId];
-			if (
-				recordedToken !== undefined &&
-				input.registrationToken !== undefined &&
-				recordedToken !== input.registrationToken
-			) {
+			if (recordedToken !== undefined && recordedToken !== input.registrationToken) {
 				logger.warn("notifications: fenced stale Telegram root unregister against a live replacement registration");
 				remainingRoots = (current.roots ?? []).length;
 				return;
@@ -2238,18 +2233,20 @@ export async function renewDaemonHeartbeat(input: {
 				})))
 		)
 			return false;
+		const heartbeatAt = (input.now ?? Date.now)();
+		const boundState: DaemonState = {
+			...state,
+			// Preserve the source launcher PID so concurrent ensures can recognize
+			// this bound child as its successor while it is still provisional.
+			launcherPid: state.pid,
+			pid,
+			incarnation,
+			ownershipPhase: "provisional",
+			heartbeatAt,
+			servingEpoch: SERVING_EPOCH,
+		};
 		try {
-			await writeJsonAtomic(fsImpl, paths.state, {
-				...state,
-				// Preserve the source launcher PID so concurrent ensures can recognize
-				// this ready PID as its child rather than excluding it as the launcher.
-				launcherPid: state.pid,
-				pid,
-				incarnation,
-				ownershipPhase: "ready",
-				heartbeatAt: (input.now ?? Date.now)(),
-				servingEpoch: SERVING_EPOCH,
-			});
+			await writeJsonAtomic(fsImpl, paths.state, boundState);
 		} catch {
 			if (expectedLock && reboundLock)
 				await rollbackOwnershipLockRebind({
@@ -2263,12 +2260,20 @@ export async function renewDaemonHeartbeat(input: {
 				});
 			return false;
 		}
-		// Initial sidecar proof is part of ready publication: a failed
-		// write/rename/lock-fence after the ready write would otherwise leave a
-		// durable fresh-heartbeat ready record for a daemon whose run() is about
-		// to exit, and contenders would attach to the dead owner until TTL
-		// expiry. Roll forward to a terminal state (mirroring
-		// retireProvisionalDaemonOwnership) and exact-unlink the ownership lock.
+		const retireBoundOwnership = async (): Promise<void> => {
+			const lock = await readOwnershipLock(fsImpl, paths.lock);
+			if (!ownershipLockMatchesState(lock, boundState)) return;
+			await writeJsonAtomic(fsImpl, paths.state, {
+				...boundState,
+				ownershipPhase: "retired",
+				stoppedAt: (input.now ?? Date.now)(),
+			}).catch(() => undefined);
+			if (await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
+				await unlinkOwnershipLockExactly(fsImpl, paths.lock, lock);
+		};
+		// The durable sidecar must exist and match the rebound ownership lock before
+		// any observer can see ownershipPhase:"ready". A provisional state may be
+		// fresh, but readiness waiters categorically refuse to attach to it.
 		let sidecarRenewed = false;
 		try {
 			sidecarRenewed = await renewOwnerHeartbeatSidecar({
@@ -2276,35 +2281,28 @@ export async function renewDaemonHeartbeat(input: {
 				ownerId: input.ownerId,
 				acquisitionId,
 				fs: fsImpl,
-				now: input.now,
+				now: () => heartbeatAt,
 				pid,
 				pidIncarnation: input.pidIncarnation,
 			});
 		} catch {
 			sidecarRenewed = false;
 		}
-		if (sidecarRenewed) return true;
-		logger.warn(
-			"notifications: Telegram daemon initial heartbeat sidecar proof failed; rolling ready publication forward to retired",
-		);
-		const published = {
-			...state,
-			launcherPid: state.pid,
-			pid,
-			incarnation,
-			ownershipPhase: "ready" as const,
-		};
-		const lock = await readOwnershipLock(fsImpl, paths.lock);
-		if (ownershipLockMatchesState(lock, published)) {
-			await writeJsonAtomic(fsImpl, paths.state, {
-				...published,
-				ownershipPhase: "retired" as const,
-				stoppedAt: (input.now ?? Date.now)(),
-			});
-			if (await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
-				await unlinkOwnershipLockExactly(fsImpl, paths.lock, lock);
+		if (!sidecarRenewed) {
+			logger.warn(
+				"notifications: Telegram daemon initial heartbeat sidecar proof failed; retiring provisional ownership",
+			);
+			await retireBoundOwnership();
+			return false;
 		}
-		return false;
+		try {
+			await writeJsonAtomic(fsImpl, paths.state, { ...boundState, ownershipPhase: "ready" });
+			return true;
+		} catch {
+			logger.warn("notifications: Telegram daemon ready publication failed after sidecar proof; retiring ownership");
+			await retireBoundOwnership();
+			return false;
+		}
 	} finally {
 		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
@@ -3830,6 +3828,30 @@ type SelectedAckOutcome =
 	| { status: "unknown"; reason: "transport_ambiguous" | "shutdown" };
 type BtwQueuedDeliveryOutcome = "accepted" | "not_delivered" | "uncertain" | "stale" | "partial_accepted";
 
+type BotApiCallOutcome =
+	| { kind: "accepted" }
+	| { kind: "rejected" }
+	| { kind: "retryable"; retryAfterMs: number }
+	| { kind: "unknown" };
+
+function classifyBotApiCallOutcome(response: unknown, cooldownSuppressed = false): BotApiCallOutcome {
+	if (cooldownSuppressed) return { kind: "retryable", retryAfterMs: 0 };
+	if (!response || typeof response !== "object") return { kind: "unknown" };
+	const body = response as {
+		ok?: unknown;
+		error_code?: unknown;
+		parameters?: { retry_after?: unknown };
+	};
+	if (body.ok === false && body.error_code === 429) {
+		const retryAfter = body.parameters?.retry_after;
+		const seconds = typeof retryAfter === "number" && Number.isFinite(retryAfter) ? retryAfter : 30;
+		return { kind: "retryable", retryAfterMs: Math.min(3600, Math.max(1, seconds)) * 1_000 };
+	}
+	if (body.ok === true) return { kind: "accepted" };
+	if (body.ok === false) return { kind: "rejected" };
+	return { kind: "unknown" };
+}
+
 interface BtwQueuedDelivery {
 	pending: PendingBtwTurn;
 	body: Record<string, unknown>;
@@ -4013,8 +4035,10 @@ export class TelegramNotificationDaemon {
 	/** Bot-wide flood-control window; inbound polling remains eligible during it. */
 	private botCooldownUntil = 0;
 	private warnedBotCooldownUntil = 0;
-	/** Count of outbound calls suppressed by the cooldown sentinel; lets a flush grant detect mid-item suppression. */
-	private suppressedBotCalls = 0;
+	/** Central outcome counters let each flush grant detect accepted, rejected, and retryable Bot API calls. */
+	private acceptedBotCalls = 0;
+	private rejectedBotCalls = 0;
+	private retryableBotCalls = 0;
 	/** Original markdown of rich messages we sent (chat+message_id), for restoring reply context on inbound replies. */
 	private readonly replyStore: ReplySentStore;
 	/** Per-session debounce + monotonic draft-id state for opt-in draft streaming. */
@@ -4447,13 +4471,11 @@ export class TelegramNotificationDaemon {
 		return formatLifecycleOutcome(r, verb);
 	}
 
-	private cooldownRetryAfterMs(response: unknown): number | undefined {
-		if (!response || typeof response !== "object") return undefined;
-		const error = response as { ok?: unknown; error_code?: unknown; parameters?: { retry_after?: unknown } };
-		if (error.ok !== false || error.error_code !== 429) return undefined;
-		const retryAfter = error.parameters?.retry_after;
-		const seconds = typeof retryAfter === "number" && Number.isFinite(retryAfter) ? retryAfter : 30;
-		return Math.min(3600, Math.max(1, seconds)) * 1_000;
+	private recordBotApiOutcome(outcome: BotApiCallOutcome, method: string): void {
+		if (method === "getUpdates") return;
+		if (outcome.kind === "accepted") this.acceptedBotCalls++;
+		else if (outcome.kind === "rejected") this.rejectedBotCalls++;
+		else if (outcome.kind === "retryable") this.retryableBotCalls++;
 	}
 
 	private async callBotApi(
@@ -4468,13 +4490,17 @@ export class TelegramNotificationDaemon {
 				this.warnedBotCooldownUntil = this.botCooldownUntil;
 				logger.warn("notifications: Telegram Bot API flood-control cooldown suppressing outbound calls");
 			}
-			this.suppressedBotCalls++;
+			this.recordBotApiOutcome(classifyBotApiCallOutcome(undefined, true), method);
 			return undefined;
 		}
 		const response = await this.effects.call(rawBotApi, method, body, callOpts);
-		const retryAfterMs = this.cooldownRetryAfterMs(response);
-		if (retryAfterMs !== undefined)
-			this.botCooldownUntil = Math.max(this.botCooldownUntil, (this.opts.now?.() ?? Date.now()) + retryAfterMs);
+		const outcome = classifyBotApiCallOutcome(response);
+		this.recordBotApiOutcome(outcome, method);
+		if (outcome.kind === "retryable")
+			this.botCooldownUntil = Math.max(
+				this.botCooldownUntil,
+				(this.opts.now?.() ?? Date.now()) + outcome.retryAfterMs,
+			);
 		return response;
 	}
 
@@ -6850,15 +6876,35 @@ export class TelegramNotificationDaemon {
 					this.pool.settle(item.itemId!, "ambiguous");
 					continue;
 				}
+				const retryableBefore = this.retryableBotCalls;
 				try {
 					const response = await this.botApi.call("sendMessage", btwDelivery.body, {
 						noRetry: true,
 						signal: btwDelivery.signal,
 					});
-					const accepted = response && typeof response === "object" && (response as { ok?: unknown }).ok === true;
-					const rejected = response && typeof response === "object" && (response as { ok?: unknown }).ok === false;
-					btwDelivery.finish(accepted ? "accepted" : rejected ? "not_delivered" : "uncertain");
-					this.pool.settle(item.itemId!, accepted ? "accepted" : rejected ? "rejected" : "ambiguous");
+					if (this.retryableBotCalls !== retryableBefore) {
+						this.submitPool({
+							sessionId: item.sessionId,
+							lane: item.lane,
+							coalesceKey: item.coalesceKey,
+							deadlineAt: item.deadlineAt,
+							payload: item.payload,
+						});
+						this.pool.settle(item.itemId!, "ambiguous");
+						continue;
+					}
+					const outcome = classifyBotApiCallOutcome(response);
+					btwDelivery.finish(
+						outcome.kind === "accepted"
+							? "accepted"
+							: outcome.kind === "rejected"
+								? "not_delivered"
+								: "uncertain",
+					);
+					this.pool.settle(
+						item.itemId!,
+						outcome.kind === "accepted" ? "accepted" : outcome.kind === "rejected" ? "rejected" : "ambiguous",
+					);
 				} catch {
 					btwDelivery.finish("uncertain");
 					this.pool.settle(item.itemId!, "ambiguous");
@@ -6895,6 +6941,7 @@ export class TelegramNotificationDaemon {
 					() => controller.abort(),
 					Math.min(8_000, remaining),
 				);
+				const retryableBefore = this.retryableBotCalls;
 				try {
 					if (
 						!this.#leaseTokenAllows(selectedAck.socketLease) ||
@@ -6913,6 +6960,24 @@ export class TelegramNotificationDaemon {
 						},
 						{ signal: controller.signal, noRetry: true },
 					)) as { ok?: unknown; result?: { message_id?: unknown } } | undefined;
+					if (this.retryableBotCalls !== retryableBefore) {
+						this.pool.settle(item.itemId!, "ambiguous");
+						if (this.effects.stopping) {
+							this.finishSelectedAck(selectedAck, { status: "unknown", reason: "shutdown" });
+						} else {
+							const retry = this.pool.submit({
+								sessionId: item.sessionId,
+								lane: item.lane,
+								coalesceKey: item.coalesceKey,
+								deadlineAt: item.deadlineAt,
+								payload: item.payload,
+							});
+							selectedAck.itemId = retry.itemId;
+							selectedAck.state = "queued";
+							selectedAck.controller = undefined;
+						}
+						continue;
+					}
 					const messageId = response?.result?.message_id;
 					const delivered = response?.ok === true && typeof messageId === "number";
 					this.finishSelectedAck(
@@ -6960,25 +7025,9 @@ export class TelegramNotificationDaemon {
 				this.pool.settle(item.itemId!, "removed");
 				continue;
 			}
-			// Cooldown fail-closed: while a bot-wide 429 cooldown is active every
-			// outbound call is suppressed by callBotApi (undefined sentinel, nothing
-			// sent), so this grant must never settle "accepted". Requeue the
-			// untouched item — suppression proves nothing left, so exactly-once
-			// holds; the flush timer retries after the cooldown and the preserved
-			// deadlineAt still bounds a permanent 429 — and record the drained
-			// grant as ambiguous, matching the btw uncertain/ambiguous precedent.
-			if (this.runtime.now() < this.botCooldownUntil) {
-				this.submitPool({
-					sessionId: item.sessionId,
-					lane: item.lane,
-					coalesceKey: item.coalesceKey,
-					deadlineAt: item.deadlineAt,
-					payload: item.payload,
-				});
-				this.pool.settle(item.itemId!, "ambiguous");
-				continue;
-			}
-			const suppressedBefore = this.suppressedBotCalls;
+			const acceptedBefore = this.acceptedBotCalls;
+			const rejectedBefore = this.rejectedBotCalls;
+			const retryableBefore = this.retryableBotCalls;
 			let disposition: "accepted" | "ambiguous" | "rejected" = "accepted";
 			try {
 				// Draft streaming (opt-in, off by default): stream a live turn frame as a
@@ -7200,10 +7249,25 @@ export class TelegramNotificationDaemon {
 				disposition = "ambiguous";
 				if (item.payload.toolActivity?.phase === "started") this.toolActivityAmbiguous = true;
 			} finally {
-				// Mid-item suppression (cooldown engaged by a concurrent 429 after
-				// this grant's pre-check) can leave calls silently unsent without a
-				// throw; a possibly-undelivered send must never settle "accepted".
-				if (disposition === "accepted" && this.suppressedBotCalls !== suppressedBefore) disposition = "ambiguous";
+				const retryable = this.retryableBotCalls !== retryableBefore;
+				if (retryable) {
+					if (this.acceptedBotCalls === acceptedBefore) {
+						this.submitPool({
+							sessionId: item.sessionId,
+							lane: item.lane,
+							coalesceKey: item.coalesceKey,
+							deadlineAt: item.deadlineAt,
+							payload: item.payload,
+						});
+					}
+					disposition = "ambiguous";
+				} else if (
+					disposition === "accepted" &&
+					this.acceptedBotCalls === acceptedBefore &&
+					this.rejectedBotCalls !== rejectedBefore
+				) {
+					disposition = "rejected";
+				}
 				this.pool.settle(item.itemId!, disposition);
 				// A terminal tool frame owns the end of this coalescing key even when both
 				// edit and fallback delivery fail. Retaining the old message id would leak

@@ -64,6 +64,20 @@ describe("notification operator runtime core", () => {
 		expect(intervals.size).toBe(0);
 	});
 
+	test("synchronous exclusive failure releases the name for a successor", async () => {
+		const runtime = new NotificationOperatorRuntime();
+		await expect(
+			runtime.runExclusive("scan", () => {
+				throw new Error("sync failure");
+			}),
+		).rejects.toThrow("sync failure");
+		let secondRan = false;
+		await runtime.runExclusive("scan", async () => {
+			secondRan = true;
+		});
+		expect(secondRan).toBe(true);
+	});
+
 	test("shares bounded backoff semantics independently of Telegram", () => {
 		const backoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 2_000 });
 		expect([backoff.next(), backoff.next(), backoff.next(), backoff.next()]).toEqual([500, 1_000, 2_000, 2_000]);

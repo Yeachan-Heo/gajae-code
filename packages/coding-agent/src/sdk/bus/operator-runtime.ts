@@ -142,16 +142,18 @@ export class NotificationOperatorRuntime {
 
 	async runExclusive(name: string, fn: () => Promise<void>): Promise<void> {
 		if (this.#exclusive.has(name)) return;
-		let completion!: Promise<void>;
-		completion = (async () => {
+		const completion = Promise.withResolvers<void>();
+		this.#exclusive.set(name, completion.promise);
+		try {
 			try {
-				await fn();
-			} finally {
-				if (this.#exclusive.get(name) === completion) this.#exclusive.delete(name);
+				void fn().then(completion.resolve, completion.reject);
+			} catch (error) {
+				completion.reject(error);
 			}
-		})();
-		this.#exclusive.set(name, completion);
-		await completion;
+			await completion.promise;
+		} finally {
+			if (this.#exclusive.get(name) === completion.promise) this.#exclusive.delete(name);
+		}
 	}
 
 	async joinExclusive(name: string, timeoutMs: number): Promise<boolean> {

@@ -89,6 +89,7 @@ import {
 	type EnsureDaemonResult,
 	endpointAuthorityDigest,
 	ensureTelegramDaemonRunningDetailed,
+	type RegisterNotificationRootResult,
 	unregisterNotificationRoot,
 } from "./telegram-daemon";
 
@@ -2835,6 +2836,7 @@ export function createNotificationsExtension(
 			settings: Settings;
 			cwd: string;
 			sessionId: string;
+			onRegistered?: (registration: RegisterNotificationRootResult) => void;
 		}) => Promise<EnsureDaemonResult>;
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
@@ -2879,7 +2881,12 @@ export function createNotificationsExtension(
 		onRegistered?: (registrationToken: string) => void,
 	): Promise<"ready" | "blocked_identity"> {
 		if (options.ensureTelegramDaemon) {
-			return (await options.ensureTelegramDaemon({ settings, cwd, sessionId: id })) === "blocked"
+			return (await options.ensureTelegramDaemon({
+				settings,
+				cwd,
+				sessionId: id,
+				onRegistered: registration => onRegistered?.(registration.token),
+			})) === "blocked"
 				? "blocked_identity"
 				: "ready";
 		}
@@ -4471,8 +4478,16 @@ export function createNotificationsExtension(
 					registrationToken = token;
 				});
 				const runtime = runtimes.get(binding.sessionId);
-				if (result === "ready" && runtime && isTelegramConfigured(resolveSettings(options.settings).cfg)) {
+				const configured = isTelegramConfigured(resolveSettings(options.settings).cfg);
+				if (result === "ready" && runtime && !runtime.stopping && configured) {
 					runtime.notificationRootRegistration = { settings, cwd: binding.cwd, registrationToken };
+				} else if (registrationToken !== undefined) {
+					await unregisterNotificationRoot({
+						settings,
+						cwd: binding.cwd,
+						sessionId: binding.sessionId,
+						registrationToken,
+					});
 				}
 				return result;
 			} catch {

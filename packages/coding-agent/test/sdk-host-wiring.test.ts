@@ -114,7 +114,12 @@ function start(
 	commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>(),
 	lifecycle?: { startupCapability: SdkStartupCapability; lifecycleRequired: true },
 	autoStart = true,
-	ensureTelegramDaemon?: (input: { settings: Settings; cwd: string; sessionId: string }) => Promise<"attached">,
+	ensureTelegramDaemon?: (input: {
+		settings: Settings;
+		cwd: string;
+		sessionId: string;
+		onRegistered?: (registration: telegramDaemon.RegisterNotificationRootResult) => void;
+	}) => Promise<"attached">,
 	controller?: NotificationSessionController,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
@@ -463,8 +468,15 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 	const sessionId = `telegram-root-retry-${Date.now()}`;
 	const settings = telegramSettings(path.join(cwd, "agent"), true);
 	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
-	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot").mockImplementationOnce(async () => {
-		throw new Error("roots write failed");
+	const unregisterImpl = telegramDaemon.unregisterNotificationRoot;
+	let initialRegistrationToken: string | undefined;
+	let failedInitialCleanup = false;
+	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot").mockImplementation(async input => {
+		if (!failedInitialCleanup && input.registrationToken === initialRegistrationToken) {
+			failedInitialCleanup = true;
+			throw new Error("roots write failed");
+		}
+		return await unregisterImpl(input);
 	});
 	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 	try {
@@ -478,7 +490,9 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 			{ startupCapability: capability, lifecycleRequired: true },
 			true,
 			async input => {
-				await telegramDaemon.registerNotificationRoot(input);
+				const registration = await telegramDaemon.registerNotificationRoot(input);
+				initialRegistrationToken ??= registration.token;
+				input.onRegistered?.(registration);
 				return "attached";
 			},
 		);
@@ -486,13 +500,18 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
 		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
-		expect(unregister).toHaveBeenCalledTimes(1);
+		expect(unregister).toHaveBeenCalledTimes(2);
+		expect(unregister.mock.calls.map(call => call[0].registrationToken)).toEqual([
+			expect.any(String),
+			expect.any(String),
+		]);
+		expect(unregister.mock.calls[1]?.[0].registrationToken).not.toBe(unregister.mock.calls[0]?.[0].registrationToken);
 		expect(
 			errorSpy.mock.calls.some(([message]) =>
 				String(message).includes(`SDK notification runtime ${sessionId} owner release failed`),
 			),
 		).toBe(true);
-		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBeUndefined();
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
 			version: 1,
@@ -501,6 +520,7 @@ test("Telegram root release failure is retained and retried through lifecycle sh
 			sessions: {},
 			registrationTokens: {},
 		});
+		expect(unregister).toHaveBeenCalledTimes(3);
 		await expect(
 			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
 		).resolves.toBeUndefined();
@@ -532,7 +552,8 @@ test("Telegram root ownership is recorded when reconciliation configures Telegra
 		true,
 		async input => {
 			registrations++;
-			await telegramDaemon.registerNotificationRoot(input);
+			const registration = await telegramDaemon.registerNotificationRoot(input);
+			input.onRegistered?.(registration);
 			return "attached";
 		},
 		controller,

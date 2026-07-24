@@ -28,7 +28,7 @@ import {
 	tokenFingerprint,
 } from "./config";
 import { type DaemonPaths, daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
-import { readOwnerFreshnessSnapshot } from "./telegram-daemon";
+import { type OwnerFreshnessSnapshot, readOwnerFreshnessSnapshot, type TelegramDaemonFs } from "./telegram-daemon";
 import { DAEMON_GENERATION } from "./telegram-daemon-contract";
 
 const DEFAULT_API_BASE = "https://api.telegram.org";
@@ -579,11 +579,19 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 		checks.push({ name: "config", level: "ok", detail: "enabled with at least one configured adapter" });
 	}
 
-	// Daemon ownership state (offline; read the persisted state file directly).
-	const snapshot = await readOwnerFreshnessSnapshot({
-		settings: opts.settings,
-		fs: fs as unknown as import("./telegram-daemon").TelegramDaemonFs,
-	});
+	// Daemon ownership state (offline; corrupt or unreadable state degrades to a
+	// warning instead of making the health command itself fail).
+	let daemonStateUnreadable = false;
+	let snapshot: OwnerFreshnessSnapshot;
+	try {
+		snapshot = await readOwnerFreshnessSnapshot({
+			settings: opts.settings,
+			fs: fs as unknown as TelegramDaemonFs,
+		});
+	} catch {
+		daemonStateUnreadable = true;
+		snapshot = { ownerTag: null, effectiveHeartbeatAt: undefined, legacyEmbedded: false, state: undefined };
+	}
 	const state = snapshot.state ? parseDaemonState(JSON.stringify(snapshot.state)) : undefined;
 	const heartbeatAt = finiteNonNegativeNumber(snapshot.effectiveHeartbeatAt);
 	const daemon: DaemonHealth = {
@@ -604,7 +612,9 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 		currentGeneration: DAEMON_GENERATION,
 		generationRelation: daemonGenerationRelation(state),
 	};
-	if (!state) {
+	if (daemonStateUnreadable) {
+		checks.push({ name: "daemon", level: "warn", detail: "daemon ownership record is corrupt or unreadable" });
+	} else if (!state) {
 		checks.push({ name: "daemon", level: "ok", detail: "no daemon ownership record (none running)" });
 	} else if (!daemon.alive) {
 		checks.push({

@@ -242,6 +242,23 @@ describe("notification-service health", () => {
 		expect(report.checks.find(c => c.name === "daemon")?.detail).toContain("recovery");
 	});
 
+	test("corrupt daemon state degrades to a health warning", async () => {
+		const { fs, store } = mockFs({});
+		store.set(statePath, '{"pid":1000');
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: () => true },
+		});
+		expect(report.daemon.present).toBe(false);
+		expect(report.overall).toBe("warn");
+		expect(report.checks.find(check => check.name === "daemon")).toEqual({
+			name: "daemon",
+			level: "warn",
+			detail: "daemon ownership record is corrupt or unreadable",
+		});
+	});
+
 	test("a live daemon owning a different identity is flagged", async () => {
 		const { fs } = mockFs({
 			[statePath]: daemonStateJson({ pid: 1000, chatId: "99999", heartbeatAt: 1_490 }),
