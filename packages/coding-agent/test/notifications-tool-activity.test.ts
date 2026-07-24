@@ -506,6 +506,93 @@ test("tool ending during Telegram owner preflight is cancelled once when redacti
 	});
 }, 30000);
 
+test("tool ending during Telegram owner preflight completes once when non-redaction remains committed", async () => {
+	await withNotifications(async () => {
+		let deferEnsure = false;
+		const ensureEntered = Promise.withResolvers<void>();
+		const releaseEnsure = Promise.withResolvers<void>();
+		const result = await setup(
+			{ safeSummary: kind => `owner-preflight-${kind}-summary-sentinel` },
+			{
+				settingsOverrides: {
+					"notifications.enabled": true,
+					"notifications.redact": false,
+					"notifications.verbosity": "verbose",
+					"notifications.telegram.botToken": "123456:secret-token",
+					"notifications.telegram.chatId": "42",
+				},
+				ensureTelegramDaemon: async () => {
+					if (!deferEnsure) return "attached";
+					ensureEntered.resolve();
+					await releaseEnsure.promise;
+					return "attached";
+				},
+			},
+		);
+		if (!result.controller) throw new Error("Expected configured notification runtime.");
+
+		await result.handlers.get("tool_execution_start")!(
+			{
+				type: "tool_execution_start",
+				toolCallId: "preflight-non-redaction",
+				toolName: "shell",
+				args: { secret: "owner-preflight-args-sentinel" },
+			} as never,
+			result.ctx,
+		);
+		await waitFor(() => activityFrames(result.frames).length === 1, "started tool frame");
+
+		deferEnsure = true;
+		const reconciliation = result.controller.reconcileCurrentSession(result.ctx);
+		await Promise.race([
+			ensureEntered.promise,
+			sleep(3000).then(() => {
+				throw new Error("Telegram owner preflight was not entered");
+			}),
+		]);
+		await result.handlers.get("tool_execution_end")!(
+			{
+				type: "tool_execution_end",
+				toolCallId: "preflight-non-redaction",
+				toolName: "shell",
+				result: { secret: "owner-preflight-result-sentinel" },
+				isError: false,
+			} as never,
+			result.ctx,
+		);
+		await sleep(50);
+		expect(activityFrames(result.frames)).toHaveLength(1);
+
+		releaseEnsure.resolve();
+		await reconciliation;
+		await waitFor(
+			() =>
+				activityFrames(result.frames).some(
+					frame => frame.toolCallId === "preflight-non-redaction" && frame.phase === "completed",
+				),
+			"committed non-redaction terminal frame",
+		);
+
+		const toolFrames = activityFrames(result.frames).filter(frame => frame.toolCallId === "preflight-non-redaction");
+		expect(toolFrames).toEqual([
+			expect.objectContaining({ phase: "started" }),
+			expect.objectContaining({ phase: "completed" }),
+		]);
+		for (const frame of toolFrames) {
+			expect(frame.argsSummary).toBeUndefined();
+			expect(frame.resultSummary).toBeUndefined();
+		}
+		expect(JSON.stringify(toolFrames)).not.toContain("sentinel");
+
+		await result.handlers.get("agent_end")!({ type: "agent_end" } as never, result.ctx);
+		await result.handlers.get("session_shutdown")!({ type: "session_shutdown" } as never, result.ctx);
+		await sleep(50);
+		expect(activityFrames(result.frames).filter(frame => frame.toolCallId === "preflight-non-redaction")).toEqual(
+			toolFrames,
+		);
+	});
+}, 30000);
+
 test("agent end and session shutdown use explicit synthetic terminal phases", async () => {
 	await withNotifications(async () => {
 		const result = await setup();
