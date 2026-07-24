@@ -486,11 +486,12 @@ function buildSchemaViolationOutcome(
 		missing.length > 0
 			? `schema_violation: missing required fields: ${missing.join(", ")}`
 			: `schema_violation: ${failure.message}`;
+	const dataPreview = previewOffendingData(data);
 	const payload = {
 		error: "schema_violation",
 		message: failure.message,
 		missingRequired: missing,
-		data: previewOffendingData(data),
+		data,
 	};
 	let rawOutput: string;
 	try {
@@ -498,7 +499,7 @@ function buildSchemaViolationOutcome(
 	} catch {
 		rawOutput = `{"error":"schema_violation","message":${JSON.stringify(headline)}}`;
 	}
-	return { rawOutput, stderr: headline, exitCode: 1 };
+	return { rawOutput, stderr: `${headline}. Offending data preview: ${dataPreview}`, exitCode: 1 };
 }
 
 function buildPlaceholderYieldOutcome(
@@ -541,9 +542,16 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 				const completeData = normalizeCompleteData(submitData, reportFindings);
 				const { validator, error: schemaError } = buildOutputValidator(outputSchema);
 				if (schemaError) {
-					rawOutput = `{"error":"schema_violation","message":"invalid output schema: ${schemaError.replace(/"/g, '\\"')}"}`;
-					stderr = `schema_violation: invalid output schema: ${schemaError}`;
-					exitCode = 1;
+					const outcome = buildSchemaViolationOutcome(
+						{
+							message: `invalid output schema: ${schemaError}`,
+							missingRequired: [],
+						},
+						completeData,
+					);
+					rawOutput = outcome.rawOutput;
+					stderr = outcome.stderr;
+					exitCode = outcome.exitCode;
 				} else {
 					const placeholderPath = findPlaceholderYieldPath(completeData);
 					if (placeholderPath) {
