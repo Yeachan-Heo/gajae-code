@@ -7603,10 +7603,16 @@ export class TelegramNotificationDaemon {
 				const toolCallId = typeof threadedFrame.toolCallId === "string" ? threadedFrame.toolCallId : undefined;
 				const liveKey = toolCallId ? `${this.#logicalSessionId(session)}:tool:${toolCallId}` : undefined;
 				const visibleOwner = liveKey ? this.toolActivityOwners.get(liveKey) : undefined;
+				if (session.toolActivityCapability !== "v1" || !liveKey || visibleOwner?.session !== session) return;
+				if (!this.liveMessages.has(liveKey)) {
+					// WebSocket callbacks are fire-and-forget: an ordered legacy start can
+					// own this key before its serialized send records the visible message.
+					await this.flushChain;
+				}
+				const settledOwner = this.toolActivityOwners.get(liveKey);
 				if (
 					session.toolActivityCapability !== "v1" ||
-					!liveKey ||
-					visibleOwner?.session !== session ||
+					settledOwner?.session !== session ||
 					!this.liveMessages.has(liveKey)
 				)
 					return;
