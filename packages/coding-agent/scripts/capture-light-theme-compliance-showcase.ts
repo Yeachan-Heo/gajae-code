@@ -9,6 +9,7 @@ import {
 	type LightThemeComplianceEntry,
 	renderLightThemeComplianceShowcase,
 } from "../test/fixtures/tui/light-theme-compliance-showcase";
+import { LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS } from "../test/fixtures/tui/light-theme-consumer-atlas";
 import {
 	assertHtmlThemeIdentity,
 	assertThemeEvidenceIdentity,
@@ -28,7 +29,7 @@ import {
 const CAPTURE_TOOL_VERSION = "gjc-light-theme-compliance-v1";
 const CANONICAL_COMMAND =
 	"bun packages/coding-agent/scripts/capture-light-theme-compliance-showcase.ts --output .gjc/qa/gjc-light-theme-compliance/current";
-const EXPECTED_LEAF_COUNT = 820;
+const EXPECTED_LEAF_COUNT = 850;
 
 interface ArtifactFile {
 	path: string;
@@ -233,9 +234,11 @@ async function main(): Promise<void> {
 			themes: LIGHT_THEME_COMPLIANCE_THEMES,
 			scene_ids: LIGHT_THEME_COMPLIANCE_SCENE_IDS,
 			canonical_viewports: LIGHT_THEME_COMPLIANCE_VIEWPORTS,
+			consumer_atlas_viewports: LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS,
 			baseline_count: 144,
 			ascii_no_color_count: 12,
 			cjk_48x36_count: 8,
+			consumer_atlas_count: 6,
 		},
 		control_files: ["capture-environment.json", "review-input.json", "run-receipt.json"],
 		entries,
@@ -247,13 +250,13 @@ async function main(): Promise<void> {
 		manifest_sha256: manifestSha256,
 		source_revision: source.source_revision,
 		environment_id: environment.environment_id,
-		expected_entry_count: 164,
-		expected_leaf_count: 820,
+		expected_entry_count: LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT,
+		expected_leaf_count: EXPECTED_LEAF_COUNT,
 		reviewed_entry_keys: keys,
 		reviewer_output_file: "independent-review.json",
 		requirements: [
 			"Recompute every leaf hash and byte length before visual inspection.",
-			"Inspect all 164 entries without sampling, including every CJK, overflow, and no-color key.",
+			"Inspect all 170 entries without sampling, including every consumer-atlas, CJK, overflow, and no-color key.",
 			"Reject any requested/resolved/key/sentinel mismatch, bad semantic wrap, hidden tail, or unresolved finding.",
 		],
 	});

@@ -151,6 +151,12 @@ function expectedNoColorKeys(): string[] {
 		.sort();
 }
 
+function expectedConsumerAtlasKeys(): string[] {
+	return LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.sceneId === "consumer-atlas")
+		.map(entry => entry.key)
+		.sort();
+}
+
 function validateIndependentReview(
 	value: unknown,
 	manifest: ArtifactManifest,
@@ -216,10 +222,10 @@ function validateIndependentReview(
 	for (const [key, expected] of [
 		["source_revision", manifest.source_revision],
 		["environment_id", manifest.environment_id],
-		["expected_entry_count", 164],
-		["observed_entry_count", 164],
-		["expected_leaf_count", 820],
-		["observed_leaf_count", 820],
+		["expected_entry_count", 170],
+		["observed_entry_count", 170],
+		["expected_leaf_count", 850],
+		["observed_leaf_count", 850],
 	] as const) {
 		if (value.manifest[key] !== expected) throw new Error(`Review manifest ${key} mismatch`);
 	}
@@ -227,11 +233,11 @@ function validateIndependentReview(
 	const reviewedKeys = stringArray(value.inspection.reviewed_entry_keys, "reviewed keys").sort();
 	const manifestKeys = manifest.entries.map(entry => entry.key).sort();
 	if (
-		reviewedKeys.length !== 164 ||
-		new Set(reviewedKeys).size !== 164 ||
+		reviewedKeys.length !== 170 ||
+		new Set(reviewedKeys).size !== 170 ||
 		reviewedKeys.join("\n") !== manifestKeys.join("\n")
 	) {
-		throw new Error("Review did not inspect the exact 164-key set");
+		throw new Error("Review did not inspect the exact 170-key set");
 	}
 	if (!isRecord(value.inspection.formats)) throw new Error("Review formats are missing");
 	for (const key of ["plain", "ansi", "html", "metadata", "png", "integrity"]) {
@@ -247,7 +253,7 @@ function validateIndependentReview(
 		const result = value.inspection.themes[themeName];
 		if (
 			!isRecord(result) ||
-			result.reviewed_entry_count !== 82 ||
+			result.reviewed_entry_count !== 85 ||
 			result.requested_resolved_sentinel !== "pass" ||
 			result.contrast_and_cues !== "pass"
 		) {
@@ -308,6 +314,17 @@ function validateIndependentReview(
 	) {
 		throw new Error("Sticky/window review failed");
 	}
+	const consumerAtlas = value.inspection.consumer_atlas;
+	if (!isRecord(consumerAtlas)) throw new Error("Consumer-atlas review is missing");
+	const consumerAtlasKeys = stringArray(consumerAtlas.reviewed_entry_keys, "consumer-atlas keys").sort();
+	if (
+		consumerAtlasKeys.join("\n") !== expectedConsumerAtlasKeys().join("\n") ||
+		consumerAtlas.production_component_rendering !== "pass" ||
+		consumerAtlas.named_consumer_coverage !== "pass" ||
+		consumerAtlas.responsive_widths !== "pass"
+	) {
+		throw new Error("Consumer-atlas review failed");
+	}
 	const noColor = value.inspection.no_color_cues;
 	if (!isRecord(noColor)) throw new Error("No-color review is missing");
 	const noColorKeys = stringArray(noColor.reviewed_entry_keys, "no-color keys").sort();
@@ -344,12 +361,12 @@ function validateIndependentReview(
 }
 
 describe("GJC light-theme compliance fixture", () => {
-	it("defines the exact 164-key matrix without gaps or duplicates", () => {
-		expect(LIGHT_THEME_COMPLIANCE_SCENE_IDS).toHaveLength(24);
+	it("defines the exact 170-key matrix without gaps or duplicates", () => {
+		expect(LIGHT_THEME_COMPLIANCE_SCENE_IDS).toHaveLength(25);
 		expect(LIGHT_THEME_COMPLIANCE_ENTRIES).toHaveLength(LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT);
-		expect(new Set(LIGHT_THEME_COMPLIANCE_ENTRIES.map(entry => entry.key)).size).toBe(164);
+		expect(new Set(LIGHT_THEME_COMPLIANCE_ENTRIES.map(entry => entry.key)).size).toBe(170);
 		for (const themeName of LIGHT_THEME_COMPLIANCE_THEMES) {
-			expect(LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.theme === themeName)).toHaveLength(82);
+			expect(LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.theme === themeName)).toHaveLength(85);
 		}
 		expect(LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.renderMode === "ascii-no-color")).toHaveLength(12);
 		expect(
@@ -359,6 +376,17 @@ describe("GJC light-theme compliance fixture", () => {
 		).toHaveLength(8);
 		expect(LIGHT_THEME_COMPLIANCE_ASCII_NO_COLOR_SCENES).toHaveLength(6);
 		expect(LIGHT_THEME_COMPLIANCE_CJK_SCENES).toHaveLength(4);
+		const atlasEntries = LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.sceneId === "consumer-atlas");
+		expect(atlasEntries).toHaveLength(6);
+		expect(atlasEntries.map(entry => entry.viewport.columns).sort((a, b) => a - b)).toEqual([
+			80, 80, 120, 120, 160, 160,
+		]);
+		for (const themeName of LIGHT_THEME_COMPLIANCE_THEMES) {
+			const themeAtlas = atlasEntries.filter(entry => entry.theme === themeName);
+			expect(themeAtlas).toHaveLength(3);
+			expect(themeAtlas.map(entry => entry.viewport.columns).sort((a, b) => a - b)).toEqual([80, 120, 160]);
+			expect(themeAtlas.every(entry => entry.renderMode === "unicode-color")).toBe(true);
+		}
 	});
 
 	it("renders every key through the declared production surface with fail-closed identity", async () => {
@@ -505,6 +533,54 @@ describe("GJC light-theme compliance fixture", () => {
 		expect(png.nonUniform).toBe(true);
 		expect([...png.bytes.slice(0, 8)]).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
 	});
+	it("renders consumer-atlas through production components with exact provenance", async () => {
+		const requiredSymbols = [
+			"ProviderOnboardingSelectorComponent",
+			"AssistantMessageComponent",
+			"UserMessageComponent",
+			"CustomMessageComponent",
+			"ToolExecutionComponent",
+			"BashExecutionComponent",
+			"EvalExecutionComponent",
+			"WelcomeComponent",
+			"TreeSelectorComponent",
+			"getThinkingBorderColor",
+		] as const;
+		const atlasEntries = LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.sceneId === "consumer-atlas");
+		expect(atlasEntries).toHaveLength(6);
+		for (const entry of atlasEntries) {
+			const rendered = await renderLightThemeComplianceShowcase(entry);
+			expect(rendered.provenance.sceneFamily).toBe("consumer-atlas");
+			for (const symbol of requiredSymbols) {
+				expect(rendered.provenance.productionSymbols).toContain(symbol);
+			}
+			const text = rendered.terminalText;
+			expect(text).toContain("Provider onboarding");
+			expect(text).toContain("gajae");
+			expect(text).toContain("Atlas assistant body");
+			expect(text).toContain("showcase provider error");
+			expect(text).toContain("Atlas user prompt");
+			expect(text).toContain("[atlas-skill]");
+			expect(text).toContain("showcase-pending");
+			expect(text).toContain("printf pending");
+			expect(text).toContain("tool success output");
+			expect(text).toContain("tool error output");
+			expect(text).toContain("printf atlas-bash");
+			expect(text).toContain("atlas bash stdout");
+			expect(text).toContain('print("atlas-eval")');
+			expect(text).toContain("atlas eval stdout");
+			expect(text).toContain("GJC Forge");
+			expect(text).toContain("[compaction: 10k tokens]");
+			expect(text).toContain("128");
+			expect(text).toContain("64");
+			expect(text).toContain("thinking-off");
+			expect(text).toContain("thinking-minimal");
+			expect(text).toContain("thinking-low");
+			expect(text).toContain("thinking-medium");
+			expect(text).toContain("thinking-high");
+			expect(text).toContain("thinking-xhigh");
+		}
+	}, 30_000);
 });
 
 describe("generated light-theme compliance evidence", () => {
@@ -520,11 +596,11 @@ describe("generated light-theme compliance evidence", () => {
 			expect(manifest.source_revision).toBe(currentSource.source_revision);
 			expect(manifest.source_fingerprint).toBe(currentSource.source_fingerprint);
 			expect(manifest.source_files).toEqual([...currentSource.source_files]);
-			expect(manifest.expected_entry_count).toBe(164);
-			expect(manifest.entry_count).toBe(164);
-			expect(manifest.expected_leaf_count).toBe(820);
-			expect(manifest.leaf_count).toBe(820);
-			expect(new Set(manifest.entries.map(entry => entry.key)).size).toBe(164);
+			expect(manifest.expected_entry_count).toBe(170);
+			expect(manifest.entry_count).toBe(170);
+			expect(manifest.expected_leaf_count).toBe(850);
+			expect(manifest.leaf_count).toBe(850);
+			expect(new Set(manifest.entries.map(entry => entry.key)).size).toBe(170);
 			expect(manifest.entry_count).toBe(manifest.entries.length);
 			expect(manifest.leaf_count).toBe(manifest.entries.reduce((total, entry) => total + entry.files.length, 0));
 			let observedLeaves = 0;
@@ -552,7 +628,7 @@ describe("generated light-theme compliance evidence", () => {
 					);
 				}
 			}
-			expect(observedLeaves).toBe(820);
+			expect(observedLeaves).toBe(850);
 			const runReceipt = JSON.parse(await Bun.file(path.join(evidenceRoot, "run-receipt.json")).text()) as unknown;
 			expect(isRecord(runReceipt)).toBe(true);
 			if (!isRecord(runReceipt) || typeof runReceipt.captured_at !== "string") {
