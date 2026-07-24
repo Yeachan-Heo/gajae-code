@@ -450,19 +450,19 @@ and the test-side expected set together.
 | `submenu-title` | settings submenu title | `accent` | `pageBg` | text | 4.5:1 | `expanded` |
 | `submenu-secondary` | submenu description/preview | `muted` | `pageBg` | text | 4.5:1 | `expanded` |
 | `submenu-unavailable` | unavailable preview fallback | `dim` | `pageBg` | text | 4.5:1 | `disabled` |
-| `provider-title` | `ProviderOnboardingSelector` bold title | `text` | `pageBg` | text | 4.5:1 | `normal-default` |
-| `provider-selected` | onboarding selected option/cursor | `accent` | `pageBg` | text | 4.5:1 | `selected-focus-active` |
-| `provider-secondary` | onboarding subtitle/option description | `muted` | `pageBg` | text | 4.5:1 | `normal-default` |
-| `assistant-header` | `AssistantMessageComponent` header | `statusLineModel` | `pageBg` | text | 4.5:1 | `status` |
-| `assistant-thinking` | thinking markdown and label | `thinkingText` | `pageBg` | text | 4.5:1 | `pending-loading` |
-| `assistant-error` | abort/error line | `error` | `pageBg` | text | 4.5:1 | `error` |
-| `assistant-usage` | token-usage line | `dim` | `pageBg` | text | 4.5:1 | `status` |
-| `tool-pending-title` | `ToolExecutionComponent` pending title | `toolTitle` | `toolPendingBg` | text | 4.5:1 | `pending-loading` |
-| `tool-pending-output` | pending output/args | `toolOutput` | `toolPendingBg` | text | 4.5:1 | `pending-loading` |
-| `tool-success-title` | completed tool title | `toolTitle` | `toolSuccessBg` | text | 4.5:1 | `success` |
-| `tool-success-output` | completed tool output | `toolOutput` | `toolSuccessBg` | text | 4.5:1 | `success` |
-| `tool-error-title` | failed tool title | `toolTitle` | `toolErrorBg` | text | 4.5:1 | `error` |
-| `tool-error-output` | failed tool output | `toolOutput` | `toolErrorBg` | text | 4.5:1 | `error` |
+| `provider-title` | `ProviderOnboardingSelector` bold title | `text` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `provider-selected` | onboarding selected option/cursor | `accent` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `provider-secondary` | onboarding subtitle/option description | `muted` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `assistant-header` | `AssistantMessageComponent` header | `statusLineModel` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `assistant-thinking` | thinking markdown and label | `thinkingText` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `assistant-error` | abort/error line | `error` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `assistant-usage` | token-usage line | `dim` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `tool-pending-title` | `ToolExecutionComponent` pending title | `toolTitle` | `toolPendingBg` | text | 4.5:1 | `consumer-atlas` |
+| `tool-pending-output` | pending output/args | `toolOutput` | `toolPendingBg` | text | 4.5:1 | `consumer-atlas` |
+| `tool-success-title` | completed tool title | `toolTitle` | `toolSuccessBg` | text | 4.5:1 | `consumer-atlas` |
+| `tool-success-output` | completed tool output | `toolOutput` | `toolSuccessBg` | text | 4.5:1 | `consumer-atlas` |
+| `tool-error-title` | failed tool title | `toolTitle` | `toolErrorBg` | text | 4.5:1 | `consumer-atlas` |
+| `tool-error-output` | failed tool output | `toolOutput` | `toolErrorBg` | text | 4.5:1 | `consumer-atlas` |
 | `diff-added` | `renderDiff` added line | `toolDiffAdded` | `toolSuccessBg` | text | 4.5:1 | `diff` |
 | `diff-removed` | `renderDiff` removed line | `toolDiffRemoved` | `toolErrorBg` | text | 4.5:1 | `diff` |
 | `diff-context` | `renderDiff` context line | `toolDiffContext` | `pageBg` | text | 4.5:1 | `diff` |
@@ -500,19 +500,19 @@ and the test-side expected set together.
 | `status-error` | status-line error/aborted state | `error` | `pageBg` | text | 4.5:1 | `error` |
 | `status-pending` | pending status icon/description | `muted` | `pageBg` | text | 4.5:1 | `pending-loading` |
 | `status-running` | running status icon/title | `accent` | `pageBg` | text | 4.5:1 | `pending-loading` |
-| `chrome-border-accent` | tree/compaction and high-attention chrome | `borderAccent` | `pageBg` | text | 4.5:1 | `status` |
-| `chrome-border-muted` | welcome pills/decorative rails | `borderMuted` | `pageBg` | structural | 3:1 | `normal-default` |
-| `user-message-text` | `UserMessageComponent` text | `userMessageText` | `userMessageBg` | text | 4.5:1 | `normal-default` |
-| `custom-message-label` | custom/skill/hook/summary labels | `customMessageLabel` | `customMessageBg` | text | 4.5:1 | `expanded` |
-| `custom-message-text` | custom/skill/hook/summary content | `customMessageText` | `customMessageBg` | text | 4.5:1 | `expanded` |
-| `thinking-off` | `Theme.getThinkingBorderColor` off level | `thinkingOff` | `pageBg` | text | 4.5:1 | `pending-loading` |
-| `thinking-minimal` | `Theme.getThinkingBorderColor` minimal level | `thinkingMinimal` | `pageBg` | text | 4.5:1 | `pending-loading` |
-| `thinking-low` | `Theme.getThinkingBorderColor` low level | `thinkingLow` | `pageBg` | text | 4.5:1 | `pending-loading` |
-| `thinking-medium` | `Theme.getThinkingBorderColor` medium level | `thinkingMedium` | `pageBg` | text | 4.5:1 | `pending-loading` |
-| `thinking-high` | `Theme.getThinkingBorderColor` high level | `thinkingHigh` | `pageBg` | text | 4.5:1 | `pending-loading` |
-| `thinking-xhigh` | `Theme.getThinkingBorderColor` xhigh level | `thinkingXhigh` | `pageBg` | text | 4.5:1 | `pending-loading` |
-| `bash-mode` | shell label/execution frame | `bashMode` | `pageBg` | text | 4.5:1 | `pending-loading` |
-| `python-mode` | eval execution frame | `pythonMode` | `pageBg` | text | 4.5:1 | `pending-loading` |
+| `chrome-border-accent` | tree/compaction and high-attention chrome | `borderAccent` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `chrome-border-muted` | welcome pills/decorative rails | `borderMuted` | `pageBg` | structural | 3:1 | `consumer-atlas` |
+| `user-message-text` | `UserMessageComponent` text | `userMessageText` | `userMessageBg` | text | 4.5:1 | `consumer-atlas` |
+| `custom-message-label` | custom/skill/hook/summary labels | `customMessageLabel` | `customMessageBg` | text | 4.5:1 | `consumer-atlas` |
+| `custom-message-text` | custom/skill/hook/summary content | `customMessageText` | `customMessageBg` | text | 4.5:1 | `consumer-atlas` |
+| `thinking-off` | `Theme.getThinkingBorderColor` off level | `thinkingOff` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `thinking-minimal` | `Theme.getThinkingBorderColor` minimal level | `thinkingMinimal` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `thinking-low` | `Theme.getThinkingBorderColor` low level | `thinkingLow` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `thinking-medium` | `Theme.getThinkingBorderColor` medium level | `thinkingMedium` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `thinking-high` | `Theme.getThinkingBorderColor` high level | `thinkingHigh` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `thinking-xhigh` | `Theme.getThinkingBorderColor` xhigh level | `thinkingXhigh` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `bash-mode` | shell label/execution frame | `bashMode` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
+| `python-mode` | eval execution frame | `pythonMode` | `pageBg` | text | 4.5:1 | `consumer-atlas` |
 | `status-spend` | input/total/usage segments | `statusLineSpend` | `userMessageBg` | text | 4.5:1 | `status` |
 | `status-staged` | staged git marker | `statusLineStaged` | `userMessageBg` | text | 4.5:1 | `status` |
 | `status-unstaged` | unstaged git marker | `statusLineDirty` | `userMessageBg` | text | 4.5:1 | `warning` |
@@ -577,7 +577,7 @@ bad semantic break blocks completion.
 
 ### Light showcase matrix and theme identity
 
-The Unicode baseline scene IDs are exactly:
+The 24 Unicode baseline scene IDs are exactly:
 
 `normal-default`, `selected-focus-active`, `disabled`, `pending-loading`,
 `empty`, `success`, `warning`, `error`, `confirmation`, `expanded`,
@@ -586,19 +586,20 @@ The Unicode baseline scene IDs are exactly:
 `wrap-korean`, `wrap-japanese`, `wrap-chinese`, and
 `wrap-mixed-cjk-latin`.
 
-Cross 24 scenes with two themes and three canonical viewports for 144 entries.
-Add `ascii-no-color` at 80x24 for `selected-focus-active`,
+Cross those scenes with two themes and three canonical viewports for 144
+entries. Add `ascii-no-color` at 80x24 for `selected-focus-active`,
 `pending-loading`, `warning`, `error`, `confirmation`, and `status` for each
 theme (12). Add `unicode-color` at 48x36 for the four wrapping scenes for each
-theme (8). The exact total is **164 entries**. The key is
-`{theme}/{scene}/{viewport}/{render_mode}`.
+theme (8). Add the production-backed `consumer-atlas` scene at 80x128,
+120x128, and 160x128 for each theme (6). The exact total is **170 entries**.
+The key is `{theme}/{scene}/{viewport}/{render_mode}`.
 
 Every entry contains exactly `terminal.txt`, `terminal-ansi.txt`,
 `terminal.html`, `metadata.json`, and `terminal.png`, producing exactly
-**820 hashed entry leaves**. Root `manifest.json`,
+**850 hashed entry leaves**. Root `manifest.json`,
 `capture-environment.json`, `review-input.json`, `run-receipt.json`, and the
 later `independent-review.json` are control artifacts and are not included in
-820.
+850.
 
 Before rendering, the fixture requires
 `requested_theme === resolved_theme === manifest_key_theme`. There is no
@@ -685,10 +686,10 @@ string `notes`. It requires:
   `reviewer_authored_implementation` and `reviewer_authored_capture`, a
   non-empty basis, and no reviewer ID in either author array;
 - manifest relative path, lowercase SHA-256, source revision, environment ID,
-  expected/observed entry counts 164, and expected/observed leaf counts 820;
-- exactly 164 unique `reviewed_entry_keys`, set-equal to the manifest;
+  expected/observed entry counts 170, and expected/observed leaf counts 850;
+- exactly 170 unique `reviewed_entry_keys`, set-equal to the manifest;
 - passing plain, ANSI, HTML, metadata, PNG, and integrity format results;
-- exact theme keys `red-claw-light` and `blue-crab-light`, 82 reviewed entries
+- exact theme keys `red-claw-light` and `blue-crab-light`, 85 reviewed entries
   each, with passing requested/resolved/sentinel and contrast/cue results;
 - exact language keys Korean, Japanese, Chinese, and mixed CJK/Latin, each
   listing its exact eight Unicode keys and passing grapheme/semantic results;
@@ -696,12 +697,15 @@ string `notes`. It requires:
 - one `sticky_virtualized` result naming the production import and
   `maxVisible-windowed` mechanism, listing all 18 linked keys, with passing
   sticky-row, boundary, and metadata results;
+- one `consumer_atlas` result listing the exact six atlas keys, with passing
+  production-component rendering, named-consumer coverage, and responsive-width
+  results;
 - the exact 12 no-color keys and a passing cue result;
 - findings with stable ID, severity
   `blocker|high|medium|low|note`, entry keys, description, and disposition;
   pass requires no unresolved finding and `blocker_count: 0`; and
 - a non-empty attestation that the reviewer recomputed integrity, inspected
-  all 164 entries rather than sampling, checked this DESIGN contract and
+  all 170 entries rather than sampling, checked this DESIGN contract and
   acceptance criteria, and authored neither implementation nor capture.
 
 A missing/excess key, count-only claim, stale binding, reviewer overlap,
@@ -713,7 +717,7 @@ the receipt and requires full recapture and independent re-review.
 
 Decision: keep the canonical Notifications evidence byte-stable and add a
 dedicated production-renderer-backed light-theme fixture with a shared
-ANSI-cell-grid evidence helper, exact local Resvg rasterization, the 164/820
+ANSI-cell-grid evidence helper, exact local Resvg rasterization, the 170/850
 matrix, and exhaustive independent review. Theme tests alone, repurposing
 Notifications, browser screenshots, vendored fonts, cross-machine PNG byte
 goldens, representative pairing samples, and sampled review are rejected.
