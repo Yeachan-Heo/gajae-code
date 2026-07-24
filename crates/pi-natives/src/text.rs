@@ -33,9 +33,9 @@ pub enum Ellipsis {
 	/// Use a single Unicode ellipsis character ("…").
 	Unicode = 0,
 	/// Use three ASCII dots ("...").
-	Ascii = 1,
+	Ascii   = 1,
 	/// Omit ellipsis entirely.
-	Omit = 2,
+	Omit    = 2,
 }
 
 fn build_utf16_string(mut data: Vec<u16>) -> Utf16String {
@@ -60,7 +60,7 @@ fn build_utf16_string_preserve_nul(data: Vec<u16>) -> Utf16String {
 #[napi(object)]
 pub struct SliceResult {
 	/// UTF-16 slice containing the selected text.
-	pub text: Utf16String,
+	pub text:  Utf16String,
 	/// Visible width of the slice in terminal cells.
 	pub width: u32,
 }
@@ -69,13 +69,13 @@ pub struct SliceResult {
 #[napi(object)]
 pub struct ExtractSegmentsResult {
 	/// UTF-16 content before the overlay region.
-	pub before: Utf16String,
+	pub before:       Utf16String,
 	/// Visible width of the `before` segment.
 	pub before_width: u32,
 	/// UTF-16 content after the overlay region.
-	pub after: Utf16String,
+	pub after:        Utf16String,
 	/// Visible width of the `after` segment.
-	pub after_width: u32,
+	pub after_width:  u32,
 }
 
 // ============================================================================
@@ -97,8 +97,8 @@ const COLOR_NONE: ColorVal = 0;
 #[derive(Clone, Copy, Default)]
 struct AnsiState {
 	attrs: u16,
-	fg: ColorVal,
-	bg: ColorVal,
+	fg:    ColorVal,
+	bg:    ColorVal,
 }
 
 impl AnsiState {
@@ -1399,10 +1399,10 @@ pub fn extract_segments(
 	);
 
 	Ok(ExtractSegmentsResult {
-		before: build_utf16_string(before),
+		before:       build_utf16_string(before),
 		before_width: crate::utils::clamp_u32(bw as u64),
-		after: build_utf16_string(after),
-		after_width: crate::utils::clamp_u32(aw as u64),
+		after:        build_utf16_string(after),
+		after_width:  crate::utils::clamp_u32(aw as u64),
 	})
 }
 

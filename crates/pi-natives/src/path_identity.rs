@@ -90,10 +90,10 @@ pub fn retain_broker_publication(
 /// Result of resolving an existing directory to its stable platform identity.
 #[napi(object)]
 pub struct NativeCanonicalDirectoryIdentity {
-	pub ok: bool,
-	pub platform: Option<String>,
+	pub ok:             bool,
+	pub platform:       Option<String>,
 	pub canonical_path: Option<String>,
-	pub code: Option<String>,
+	pub code:           Option<String>,
 }
 
 /// Evidence for one Linux POSIX ACL attribute.
@@ -106,21 +106,21 @@ pub struct NativeAclAttributeEvidence {
 /// Bounded Linux POSIX ACL evidence for an owner-only result.
 #[napi(object)]
 pub struct NativeAclEvidence {
-	pub access: NativeAclAttributeEvidence,
+	pub access:  NativeAclAttributeEvidence,
 	pub default: Option<NativeAclAttributeEvidence>,
 }
 
 /// Result of applying or checking owner-only path security.
 #[napi(object)]
 pub struct NativeOwnerOnlySecurityResult {
-	pub ok: bool,
-	pub platform: Option<String>,
-	pub kind: Option<String>,
-	pub protocol: Option<String>,
+	pub ok:           bool,
+	pub platform:     Option<String>,
+	pub kind:         Option<String>,
+	pub protocol:     Option<String>,
 	pub acl_evidence: Option<NativeAclEvidence>,
-	pub code: Option<String>,
-	pub operation: Option<String>,
-	pub attribute: Option<String>,
+	pub code:         Option<String>,
+	pub operation:    Option<String>,
+	pub attribute:    Option<String>,
 }
 
 /// Caller-supplied identity and preauthorized quarantine evidence for exact
@@ -128,34 +128,34 @@ pub struct NativeOwnerOnlySecurityResult {
 
 #[napi(object)]
 pub struct NativeExactFileIdentity {
-	pub dev: BigInt,
-	pub ino: BigInt,
-	pub size: BigInt,
-	pub mtime_ns: BigInt,
+	pub dev:             BigInt,
+	pub ino:             BigInt,
+	pub size:            BigInt,
+	pub mtime_ns:        BigInt,
 	/// When true, atomically detach a directory rather than deleting a regular
 	/// file.
-	pub directory: Option<bool>,
+	pub directory:       Option<bool>,
 	/// Keep a regular file in quarantine after its identity has been verified
 	/// instead of unlinking it. This makes cross-device retirement recoverable.
-	pub detach_only: Option<bool>,
+	pub detach_only:     Option<bool>,
 	/// A caller-persisted, single-component no-replace quarantine destination.
 	/// Required for every exact deletion so authority survives a post-detach
 	/// crash.
 	pub quarantine_name: Option<String>,
 	/// SHA-256 of regular-file bytes. Required for regular-file deletion and
 	/// verified from the detached object before unlinking it.
-	pub sha256: Option<String>,
+	pub sha256:          Option<String>,
 }
 
 struct ExactFileIdentity {
-	dev: u64,
-	ino: u64,
-	size: u64,
-	mtime_ns: i64,
-	directory: bool,
-	detach_only: bool,
+	dev:             u64,
+	ino:             u64,
+	size:            u64,
+	mtime_ns:        i64,
+	directory:       bool,
+	detach_only:     bool,
 	quarantine_name: Option<String>,
-	sha256: Option<[u8; 32]>,
+	sha256:          Option<[u8; 32]>,
 }
 /// Typed result of an identity-bound regular-file deletion or directory detach.
 #[napi(object)]
@@ -176,32 +176,32 @@ pub struct NativeExactUnlinkResult {
 /// Bounded, path-free evidence for one publish operation.
 #[napi(object)]
 pub struct NativePublishSyncFailure {
-	pub phase: String,
+	pub phase:       String,
 	pub parent_role: String,
-	pub os_code: i32,
-	pub kind: String,
+	pub os_code:     i32,
+	pub kind:        String,
 }
 
 /// Bounded, path-free evidence for one publish operation.
 #[napi(object)]
 pub struct NativePublishDiagnostic {
-	pub schema_version: u32,
+	pub schema_version:   u32,
 	pub collection_state: String,
-	pub os_code: Option<i32>,
-	pub sync_failures: Option<Vec<NativePublishSyncFailure>>,
+	pub os_code:          Option<i32>,
+	pub sync_failures:    Option<Vec<NativePublishSyncFailure>>,
 }
 
 /// Dedicated result for an atomic no-replace namespace publication.
 #[napi(object)]
 pub struct NativeNoReplaceResult {
-	pub ok: bool,
-	pub code: Option<String>,
-	pub mutation_state: String,
+	pub ok:               bool,
+	pub code:             Option<String>,
+	pub mutation_state:   String,
 	pub durability_state: String,
-	pub reason: String,
-	pub primitive: String,
-	pub phase: String,
-	pub diagnostic: NativePublishDiagnostic,
+	pub reason:           String,
+	pub primitive:        String,
+	pub phase:            String,
+	pub diagnostic:       NativePublishDiagnostic,
 }
 
 impl NativeNoReplaceResult {
@@ -230,12 +230,12 @@ impl NativeNoReplaceResult {
 			}
 		};
 		Self {
-			ok: result.ok,
-			code: result.code,
-			mutation_state: mutation_state.to_owned(),
+			ok:               result.ok,
+			code:             result.code,
+			mutation_state:   mutation_state.to_owned(),
 			durability_state: durability_state.to_owned(),
-			reason: reason.to_owned(),
-			primitive: if cfg!(target_os = "linux") {
+			reason:           reason.to_owned(),
+			primitive:        if cfg!(target_os = "linux") {
 				"renameat2_noreplace"
 			} else if cfg!(target_os = "macos") {
 				"renameatx_np_excl"
@@ -245,7 +245,7 @@ impl NativeNoReplaceResult {
 				"unsupported"
 			}
 			.to_owned(),
-			phase: if mutation_state == "committed" {
+			phase:            if mutation_state == "committed" {
 				"complete"
 			} else if matches!(reason, "invalid_request" | "identity_violation") {
 				"preflight"
@@ -253,11 +253,11 @@ impl NativeNoReplaceResult {
 				"rename"
 			}
 			.to_owned(),
-			diagnostic: NativePublishDiagnostic {
-				schema_version: 1,
+			diagnostic:       NativePublishDiagnostic {
+				schema_version:   1,
 				collection_state: "unavailable".to_owned(),
-				os_code: None,
-				sync_failures: None,
+				os_code:          None,
+				sync_failures:    None,
 			},
 		}
 	}
@@ -270,13 +270,13 @@ impl NativeNoReplaceResult {
 
 pub struct NativeDirectoryTreeEntry {
 	pub relative_path: String,
-	pub kind: String,
-	pub dev: String,
-	pub ino: String,
-	pub size: String,
-	pub mtime_ns: String,
-	pub ctime_ns: String,
-	pub sha256: Option<String>,
+	pub kind:          String,
+	pub dev:           String,
+	pub ino:           String,
+	pub size:          String,
+	pub mtime_ns:      String,
+	pub ctime_ns:      String,
+	pub sha256:        Option<String>,
 }
 
 /// Stable evidence returned by `snapshot_directory_tree` and consumed verbatim
@@ -286,13 +286,13 @@ pub struct NativeDirectoryTreeEntry {
 pub struct NativeDirectoryTreeSnapshot {
 	pub root_dev: String,
 	pub root_ino: String,
-	pub entries: Vec<NativeDirectoryTreeEntry>,
+	pub entries:  Vec<NativeDirectoryTreeEntry>,
 }
 
 #[napi(object)]
 pub struct NativeDirectoryTreeResult {
-	pub ok: bool,
-	pub code: Option<String>,
+	pub ok:       bool,
+	pub code:     Option<String>,
 	pub snapshot: Option<NativeDirectoryTreeSnapshot>,
 }
 
@@ -475,15 +475,20 @@ fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileId
 impl NativeCanonicalDirectoryIdentity {
 	fn success(platform: &str, canonical_path: String) -> Self {
 		Self {
-			ok: true,
-			platform: Some(platform.to_owned()),
+			ok:             true,
+			platform:       Some(platform.to_owned()),
 			canonical_path: Some(canonical_path),
-			code: None,
+			code:           None,
 		}
 	}
 
 	fn failure(code: &str) -> Self {
-		Self { ok: false, platform: None, canonical_path: None, code: Some(code.to_owned()) }
+		Self {
+			ok:             false,
+			platform:       None,
+			canonical_path: None,
+			code:           Some(code.to_owned()),
+		}
 	}
 }
 
@@ -491,14 +496,14 @@ impl NativeOwnerOnlySecurityResult {
 	#[allow(dead_code, reason = "used by non-Linux platform implementations")]
 	const fn success() -> Self {
 		Self {
-			ok: true,
-			platform: None,
-			kind: None,
-			protocol: None,
+			ok:           true,
+			platform:     None,
+			kind:         None,
+			protocol:     None,
 			acl_evidence: None,
-			code: None,
-			operation: None,
-			attribute: None,
+			code:         None,
+			operation:    None,
+			attribute:    None,
 		}
 	}
 
@@ -509,12 +514,12 @@ impl NativeOwnerOnlySecurityResult {
 		default_evidence: Option<(&str, &str)>,
 	) -> Self {
 		Self {
-			ok: true,
-			platform: Some("linux".to_owned()),
-			kind: Some(kind.to_owned()),
-			protocol: Some("apply".to_owned()),
+			ok:           true,
+			platform:     Some("linux".to_owned()),
+			kind:         Some(kind.to_owned()),
+			protocol:     Some("apply".to_owned()),
 			acl_evidence: Some(NativeAclEvidence {
-				access: NativeAclAttributeEvidence {
+				access:  NativeAclAttributeEvidence {
 					clear: access_clear.to_owned(),
 					query: access_query.to_owned(),
 				},
@@ -523,20 +528,20 @@ impl NativeOwnerOnlySecurityResult {
 					query: query.to_owned(),
 				}),
 			}),
-			code: None,
-			operation: None,
-			attribute: None,
+			code:         None,
+			operation:    None,
+			attribute:    None,
 		}
 	}
 
 	fn linux_verified_success(kind: &str, access_query: &str, default_query: Option<&str>) -> Self {
 		Self {
-			ok: true,
-			platform: Some("linux".to_owned()),
-			kind: Some(kind.to_owned()),
-			protocol: Some("verify".to_owned()),
+			ok:           true,
+			platform:     Some("linux".to_owned()),
+			kind:         Some(kind.to_owned()),
+			protocol:     Some("verify".to_owned()),
 			acl_evidence: Some(NativeAclEvidence {
-				access: NativeAclAttributeEvidence {
+				access:  NativeAclAttributeEvidence {
 					clear: "not_run".to_owned(),
 					query: access_query.to_owned(),
 				},
@@ -545,22 +550,22 @@ impl NativeOwnerOnlySecurityResult {
 					query: query.to_owned(),
 				}),
 			}),
-			code: None,
-			operation: None,
-			attribute: None,
+			code:         None,
+			operation:    None,
+			attribute:    None,
 		}
 	}
 
 	fn failure(code: &str) -> Self {
 		Self {
-			ok: false,
-			platform: None,
-			kind: None,
-			protocol: None,
+			ok:           false,
+			platform:     None,
+			kind:         None,
+			protocol:     None,
 			acl_evidence: None,
-			code: Some(code.to_owned()),
-			operation: None,
-			attribute: None,
+			code:         Some(code.to_owned()),
+			operation:    None,
+			attribute:    None,
 		}
 	}
 
@@ -573,14 +578,14 @@ impl NativeOwnerOnlySecurityResult {
 			_ => "acl_unknown",
 		};
 		Self {
-			ok: false,
-			platform: None,
-			kind: None,
-			protocol: None,
+			ok:           false,
+			platform:     None,
+			kind:         None,
+			protocol:     None,
 			acl_evidence: None,
-			code: Some(code.to_owned()),
-			operation: Some(operation.to_owned()),
-			attribute: Some(attribute.to_owned()),
+			code:         Some(code.to_owned()),
+			operation:    Some(operation.to_owned()),
+			attribute:    Some(attribute.to_owned()),
 		}
 	}
 }
@@ -881,16 +886,16 @@ mod publication {
 
 	pub(super) struct RetainedPublication {
 		// Declaration order is drop order: release publication authority first.
-		discovery: File,
-		_owner: File,
-		_lock: File,
-		_root: File,
-		root_identity: Identity,
-		lock_identity: Identity,
-		owner_identity: Identity,
+		discovery:          File,
+		_owner:             File,
+		_lock:              File,
+		_root:              File,
+		root_identity:      Identity,
+		lock_identity:      Identity,
+		owner_identity:     Identity,
 		discovery_identity: Identity,
-		heartbeat_offset: u64,
-		agent_dir: PathBuf,
+		heartbeat_offset:   u64,
+		agent_dir:          PathBuf,
 	}
 
 	impl RetainedPublication {
@@ -1217,20 +1222,20 @@ pub(crate) mod platform {
 	}
 
 	struct AuthorityEdge {
-		parent: File,
+		parent:         File,
 		parent_initial: libc::stat,
-		name: CString,
-		child: File,
-		child_initial: libc::stat,
+		name:           CString,
+		child:          File,
+		child_initial:  libc::stat,
 	}
 
 	struct CheckedPathAuthority {
-		file: File,
-		parent: File,
+		file:           File,
+		parent:         File,
 		parent_initial: libc::stat,
-		name: CString,
-		initial: libc::stat,
-		edges: Vec<AuthorityEdge>,
+		name:           CString,
+		initial:        libc::stat,
+		edges:          Vec<AuthorityEdge>,
 	}
 
 	const fn stat_same_object(left: &libc::stat, right: &libc::stat) -> bool {
@@ -1598,14 +1603,12 @@ pub(crate) mod platform {
 		match classify_acl_observation(AclOperation::Query, attribute, result, errno) {
 			AclObservation::Absent => Ok("absent"),
 			AclObservation::Unsupported => Ok("unsupported"),
-			AclObservation::Present => Err(acl_observation_failure(
-				AclOperation::Query,
-				attribute,
-				match attribute {
+			AclObservation::Present => {
+				Err(acl_observation_failure(AclOperation::Query, attribute, match attribute {
 					AclAttribute::Access => "acl_access_present",
 					AclAttribute::Default => "acl_default_present",
-				},
-			)),
+				}))
+			},
 			AclObservation::Failure(code) => {
 				Err(acl_observation_failure(AclOperation::Query, attribute, code))
 			},
@@ -2448,8 +2451,8 @@ pub(crate) mod platform {
 	#[derive(Clone, Copy)]
 
 	struct ExchangePlaceholderIdentity {
-		dev: u64,
-		ino: u64,
+		dev:       u64,
+		ino:       u64,
 		directory: bool,
 	}
 
@@ -3640,9 +3643,9 @@ mod platform {
 	#[repr(C)]
 	struct HandleRenameInformation {
 		replace_if_exists: u8,
-		root_directory: HANDLE,
-		file_name_length: u32,
-		file_name: [u16; 1],
+		root_directory:    HANDLE,
+		file_name_length:  u32,
+		file_name:         [u16; 1],
 	}
 
 	fn wide(path: &Path) -> Vec<u16> {
@@ -3768,9 +3771,9 @@ mod platform {
 
 	#[repr(C)]
 	struct UnicodeString {
-		length: u16,
+		length:         u16,
 		maximum_length: u16,
-		buffer: *mut u16,
+		buffer:         *mut u16,
 	}
 
 	#[repr(C)]
@@ -3785,7 +3788,7 @@ mod platform {
 
 	#[repr(C)]
 	struct IoStatusBlock {
-		status: i32,
+		status:      i32,
 		information: usize,
 	}
 
@@ -3835,20 +3838,20 @@ mod platform {
 	#[repr(C)]
 	struct FileIdBothDirectoryInformation {
 		next_entry_offset: u32,
-		file_index: u32,
-		creation_time: i64,
-		last_access_time: i64,
-		last_write_time: i64,
-		change_time: i64,
-		end_of_file: i64,
-		allocation_size: i64,
-		file_attributes: u32,
-		file_name_length: u32,
-		ea_size: u32,
+		file_index:        u32,
+		creation_time:     i64,
+		last_access_time:  i64,
+		last_write_time:   i64,
+		change_time:       i64,
+		end_of_file:       i64,
+		allocation_size:   i64,
+		file_attributes:   u32,
+		file_name_length:  u32,
+		ea_size:           u32,
 		short_name_length: i8,
-		short_name: [u16; 12],
-		file_id: i64,
-		file_name: [u16; 1],
+		short_name:        [u16; 12],
+		file_id:           i64,
+		file_name:         [u16; 1],
 	}
 
 	const FILE_OPEN: u32 = 1;
@@ -3859,7 +3862,7 @@ mod platform {
 	const SYNCHRONIZE: u32 = 0x0010_0000;
 
 	struct HeldExact {
-		target: HANDLE,
+		target:    HANDLE,
 		// Every component is held until the caller has completed its security-sensitive
 		// handle operation. This prevents an ancestor junction replacement from changing
 		// the parent used by rename, disposition, or ACL changes.
@@ -3944,9 +3947,9 @@ mod platform {
 			return Err("io_error");
 		}
 		let mut object_name = UnicodeString {
-			length: (name.len() * size_of::<u16>()) as u16,
+			length:         (name.len() * size_of::<u16>()) as u16,
 			maximum_length: (name.len() * size_of::<u16>()) as u16,
-			buffer: name.as_mut_ptr(),
+			buffer:         name.as_mut_ptr(),
 		};
 		let mut attributes = ObjectAttributes {
 			length: size_of::<ObjectAttributes>() as u32,
@@ -5262,10 +5265,10 @@ mod platform {
 
 	fn set_handle_attributes(handle: HANDLE, attributes: u32) -> Result<(), &'static str> {
 		let mut basic = FILE_BASIC_INFO {
-			CreationTime: 0,
+			CreationTime:   0,
 			LastAccessTime: 0,
-			LastWriteTime: 0,
-			ChangeTime: 0,
+			LastWriteTime:  0,
+			ChangeTime:     0,
 			FileAttributes: attributes,
 		};
 		if unsafe {
@@ -5872,14 +5875,14 @@ mod exact_unlink_placeholder_tests {
 		fs::write(&successor, b"live successor").expect("write successor");
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev: metadata.dev(),
-			ino: metadata.ino(),
-			size: metadata.size(),
-			mtime_ns: metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory: false,
-			detach_only: false,
+			dev:             metadata.dev(),
+			ino:             metadata.ino(),
+			size:            metadata.size(),
+			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:       false,
+			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
-			sha256: Some(sha256(b"stale")),
+			sha256:          Some(sha256(b"stale")),
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -5928,14 +5931,14 @@ mod exact_unlink_placeholder_tests {
 		}
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev: metadata.dev(),
-			ino: metadata.ino(),
-			size: metadata.size(),
-			mtime_ns: metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory: target_is_directory,
-			detach_only: false,
+			dev:             metadata.dev(),
+			ino:             metadata.ino(),
+			size:            metadata.size(),
+			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:       target_is_directory,
+			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
-			sha256: (!target_is_directory).then(|| sha256(b"stale")),
+			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -5991,14 +5994,14 @@ mod exact_unlink_placeholder_tests {
 		}
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev: metadata.dev(),
-			ino: metadata.ino(),
-			size: metadata.size(),
-			mtime_ns: metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory: target_is_directory,
-			detach_only: false,
+			dev:             metadata.dev(),
+			ino:             metadata.ino(),
+			size:            metadata.size(),
+			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:       target_is_directory,
+			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
-			sha256: (!target_is_directory).then(|| sha256(b"stale")),
+			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -6059,14 +6062,14 @@ mod exact_unlink_placeholder_tests {
 		}
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev: metadata.dev(),
-			ino: metadata.ino(),
-			size: metadata.size(),
-			mtime_ns: metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory: target_is_directory,
-			detach_only: false,
+			dev:             metadata.dev(),
+			ino:             metadata.ino(),
+			size:            metadata.size(),
+			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:       target_is_directory,
+			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
-			sha256: (!target_is_directory).then(|| sha256(b"stale")),
+			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -6209,14 +6212,14 @@ mod exact_unlink_placeholder_tests {
 		fs::write(&target, b"stale").expect("write stale target");
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev: metadata.dev(),
-			ino: metadata.ino(),
-			size: metadata.size(),
-			mtime_ns: metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory: false,
-			detach_only: false,
+			dev:             metadata.dev(),
+			ino:             metadata.ino(),
+			size:            metadata.size(),
+			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:       false,
+			detach_only:     false,
 			quarantine_name: Some(".quarantine".to_owned()),
-			sha256: Some(sha256(b"stale")),
+			sha256:          Some(sha256(b"stale")),
 		};
 		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
 		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
@@ -6447,8 +6450,8 @@ mod sha256_tests {
 	#[test]
 	fn digest_reader_streams_large_files_in_bounded_reads() {
 		struct ChunkedReader {
-			bytes: Vec<u8>,
-			offset: usize,
+			bytes:    Vec<u8>,
+			offset:   usize,
 			max_read: usize,
 		}
 

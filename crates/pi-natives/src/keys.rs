@@ -77,9 +77,9 @@ const MOD_NUM_LOCK: u32 = 128;
 #[napi]
 pub enum KeyEventType {
 	/// Key press event.
-	Press = 1,
+	Press   = 1,
 	/// Key repeat event.
-	Repeat = 2,
+	Repeat  = 2,
 	/// Key release event.
 	Release = 3,
 }
@@ -144,27 +144,27 @@ const fn keypad_operator_text_codepoint(codepoint: i32) -> Option<i32> {
 
 /// Parsed Kitty keyboard protocol sequence (subset we care about).
 struct ParsedKittySequence {
-	codepoint: i32,
-	shifted_key: Option<i32>,
+	codepoint:       i32,
+	shifted_key:     Option<i32>,
 	base_layout_key: Option<i32>,
-	text_codepoint: Option<i32>,
-	modifier: u32,
-	event_type: Option<u32>,
+	text_codepoint:  Option<i32>,
+	modifier:        u32,
+	event_type:      Option<u32>,
 }
 
 /// Parsed Kitty keyboard protocol sequence result for a Kitty input sequence.
 #[napi(object)]
 pub struct ParsedKittyResult {
 	/// Primary codepoint associated with the key.
-	pub codepoint: i32,
+	pub codepoint:       i32,
 	/// Optional shifted key codepoint from the sequence.
-	pub shifted_key: Option<i32>,
+	pub shifted_key:     Option<i32>,
 	/// Optional base layout key codepoint from the sequence.
 	pub base_layout_key: Option<i32>,
 	/// Modifier bitmask (shift/alt/ctrl), excluding lock bits.
-	pub modifier: u32,
+	pub modifier:        u32,
 	/// Optional event type (1 = press, 2 = repeat, 3 = release).
-	pub event_type: Option<KeyEventType>,
+	pub event_type:      Option<KeyEventType>,
 }
 
 /// Perfect hash map for legacy sequences - O(1) lookup
@@ -409,11 +409,11 @@ pub fn matches_key(data: String, key_id: String, kitty_protocol_active: bool) ->
 #[napi]
 pub fn parse_kitty_sequence(data: String) -> Option<ParsedKittyResult> {
 	parse_kitty_sequence_bytes(data.as_bytes()).map(|p| ParsedKittyResult {
-		codepoint: p.codepoint,
-		shifted_key: p.shifted_key,
+		codepoint:       p.codepoint,
+		shifted_key:     p.shifted_key,
 		base_layout_key: p.base_layout_key,
-		modifier: p.modifier,
-		event_type: optional_kitty_event_type(p.event_type),
+		modifier:        p.modifier,
+		event_type:      optional_kitty_event_type(p.event_type),
 	})
 }
 
@@ -422,7 +422,7 @@ pub fn parse_kitty_sequence(data: String) -> Option<ParsedKittyResult> {
 // =============================================================================
 
 struct ParsedKeyId<'a> {
-	key: &'a str,
+	key:      &'a str,
 	modifier: u32,
 }
 
