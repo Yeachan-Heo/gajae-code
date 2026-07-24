@@ -14149,6 +14149,96 @@ describe("Telegram tool activity capability and routing", () => {
 		expect(String(edit?.body.text)).toContain("read — cancelled");
 		expect(String(edit?.body.text)).not.toContain("secret");
 	});
+	test("legacy-v1 unknown waits for an ordered in-flight start and settles it exactly once", async () => {
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+		});
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+
+		const startSendEntered = Promise.withResolvers<void>();
+		const releaseStartSend = Promise.withResolvers<void>();
+		const originalCall = bot.call.bind(bot);
+		bot.call = async (method, body, options) => {
+			if (method === "sendMessage" && String((body as { text?: unknown }).text).includes("read — started")) {
+				startSendEntered.resolve();
+				await releaseStartSend.promise;
+			}
+			return await originalCall(method, body, options);
+		};
+
+		const started = daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "legacy-race",
+			toolName: "read",
+			phase: "started",
+		});
+		await startSendEntered.promise;
+		const runtime = daemon as unknown as {
+			liveMessages: Map<string, number>;
+			toolActivityOwners: Map<string, unknown>;
+		};
+		expect(runtime.toolActivityOwners.has("S:tool:legacy-race")).toBe(true);
+		expect(runtime.liveMessages.has("S:tool:legacy-race")).toBe(false);
+		expect(bot.calls).toHaveLength(0);
+		let unknownSettled = false;
+		const unknown = daemon
+			.handleSessionMessage(session, {
+				type: "tool_activity",
+				sessionId: "S",
+				toolCallId: "legacy-race",
+				toolName: "read",
+				phase: "unknown",
+				argsSummary: "secret race args",
+				resultSummary: "secret race result",
+			})
+			.finally(() => {
+				unknownSettled = true;
+			});
+		await Promise.resolve();
+		expect(unknownSettled).toBe(false);
+
+		releaseStartSend.resolve();
+		await Promise.all([started, unknown]);
+
+		const starts = bot.calls.filter(
+			call => call.method === "sendMessage" && String(call.body.text).includes("read — started"),
+		);
+		const cancelledEdits = bot.calls.filter(
+			call => call.method === "editMessageText" && String(call.body.text).includes("read — cancelled"),
+		);
+		expect(starts).toHaveLength(1);
+		expect(cancelledEdits).toHaveLength(1);
+		expect(String(cancelledEdits[0]!.body.text)).not.toContain("secret race");
+		expect(cancelledEdits[0]!.body.message_id).toBe(1);
+
+		expect(runtime.liveMessages.has("S:tool:legacy-race")).toBe(false);
+		expect(runtime.toolActivityOwners.has("S:tool:legacy-race")).toBe(false);
+
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "legacy-race",
+			toolName: "read",
+			phase: "unknown",
+		});
+		expect(bot.calls.filter(call => call.method === "editMessageText")).toHaveLength(1);
+		expect(bot.calls).toHaveLength(2);
+	});
 
 	test("v2 remains strict after later v1 and capability-absent hello frames", async () => {
 		const bot = new FakeBotApi();
