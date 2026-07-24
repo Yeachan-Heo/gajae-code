@@ -231,7 +231,7 @@ describe("subagent warning injection", () => {
 			const data = {
 				findings: [
 					{
-						message: `${"a".repeat(497)}😀\"\\\n한국어`,
+						message: `${"a".repeat(497)}😀"\\\n한국어`,
 						tail: "REJECTED-PAYLOAD-TAIL-SENTINEL",
 					},
 				],
@@ -257,7 +257,11 @@ describe("subagent warning injection", () => {
 				})),
 				tail: "LONG-FINDINGS-TAIL-SENTINEL",
 			};
-			const invalidSchema = { type: "object", properties: { accepted: { type: "boolean" } }, required: ["accepted"] };
+			const invalidSchema = {
+				type: "object",
+				properties: { accepted: { type: "boolean" } },
+				required: ["accepted"],
+			};
 			const explicit = finalizeSubprocessOutput({
 				rawOutput: "ignored",
 				exitCode: 0,

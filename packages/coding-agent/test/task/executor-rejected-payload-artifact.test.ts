@@ -22,7 +22,14 @@ function createMessage(): AssistantMessage {
 		api: "openai-responses",
 		provider: "openai",
 		model: "mock",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
 		stopReason: "stop",
 		timestamp: Date.now(),
 	};
@@ -49,7 +56,12 @@ function createSession(data: unknown): AgentSession {
 		},
 		prompt: async () => {
 			emit({ type: "message_end", message });
-			emit({ type: "tool_execution_end", toolCallId: "yield-large-rejection", toolName: "yield", result: { content: [], details: { status: "success", data } } });
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "yield-large-rejection",
+				toolName: "yield",
+				result: { content: [], details: { status: "success", data } },
+			});
 			emit({ type: "agent_end", messages: [message], stopReason: "completed" });
 		},
 		waitForIdle: async () => {},
@@ -90,7 +102,11 @@ describe("rejected payload output artifact", () => {
 			subagentId: id,
 			artifactsDir,
 			settings: Settings.isolated(),
-			modelRegistry: { refresh: async () => {}, getAvailable: () => [], getApiKey: async () => kNoAuth } as unknown as import("../../src/config/model-registry").ModelRegistry,
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [],
+				getApiKey: async () => kNoAuth,
+			} as unknown as import("../../src/config/model-registry").ModelRegistry,
 			enableLsp: false,
 			outputSchema: { type: "object", properties: { accepted: { type: "boolean" } }, required: ["accepted"] },
 		});
