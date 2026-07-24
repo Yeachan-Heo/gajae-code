@@ -46,6 +46,7 @@ source: "forked from upstream deep-interview skill and rebranded for GJC"
 **DIPP-8 — Artifact writes.**
 
 - Use the active GJC workflow/state CLI as the only sanctioned writer for `.gjc/` interview artifacts; do not edit `.gjc/` directly without an explicit force override.
+- Resolve the active session root before state access, and do not edit `<resolved-session-root>/state` directly without force override.
 
 **DIPP-9 — Execution threshold.**
 
