@@ -17870,6 +17870,62 @@ test("initiating 429 flush response requeues and settles ambiguous before retry"
 	}
 });
 
+test("concurrent accepted typing cannot suppress requeue of the current retryable item", async () => {
+	const agentDir = tempAgentDir();
+	const now = 0;
+	const bot = new FakeBotApi();
+	const realCall = bot.call.bind(bot);
+	const sendStarted = Promise.withResolvers<void>();
+	const releaseRetryable = Promise.withResolvers<void>();
+	bot.call = async (method, body, options) => {
+		if (method === "sendMessage") {
+			bot.calls.push({ method, body, options });
+			sendStarted.resolve();
+			await releaseRetryable.promise;
+			return { ok: false, error_code: 429, parameters: { retry_after: 3 } };
+		}
+		return await realCall(method, body, options);
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+		WebSocketImpl: FakeWs as never,
+		now: () => now,
+	});
+	const internal = daemon as unknown as {
+		pool: {
+			pending: number;
+			submit(item: object): void;
+			settle(itemId: string, disposition: "accepted" | "ambiguous" | "rejected" | "removed"): void;
+		};
+		flushPool(): Promise<void>;
+		botApi: BotApi;
+	};
+	const settle = spyOn(internal.pool, "settle");
+	try {
+		internal.pool.submit({
+			sessionId: "S",
+			lane: "finalized",
+			itemId: "concurrent-429",
+			payload: { send: { method: "sendMessage", lane: "finalized", text: "retry me" } },
+		});
+		const flushing = internal.flushPool();
+		await sendStarted.promise;
+		await internal.botApi.call("sendChatAction", { chat_id: "42", action: "typing" });
+		expect(bot.calls.some(call => call.method === "sendChatAction")).toBe(true);
+		releaseRetryable.resolve();
+		await flushing;
+
+		expect(settle).toHaveBeenCalledWith("concurrent-429", "ambiguous");
+		expect(internal.pool.pending).toBe(1);
+	} finally {
+		settle.mockRestore();
+	}
+});
+
 test("mid-item cooldown suppression flips an otherwise-accepted grant to ambiguous", async () => {
 	const agentDir = tempAgentDir();
 	const now = 0;
@@ -17896,7 +17952,6 @@ test("mid-item cooldown suppression flips an otherwise-accepted grant to ambiguo
 	});
 	const internal = daemon as unknown as {
 		botCooldownUntil: number;
-		retryableBotCalls: number;
 		pool: {
 			pending: number;
 			submit(item: object): void;
@@ -17918,7 +17973,6 @@ test("mid-item cooldown suppression flips an otherwise-accepted grant to ambiguo
 		});
 		await internal.flushPool();
 		expect(internal.botCooldownUntil).toBeGreaterThan(0);
-		expect(internal.retryableBotCalls).toBeGreaterThan(0);
 		// The suppressed send neither threw nor delivered; the grant must not
 		// record a possibly-undelivered frame as accepted.
 		expect(settle).toHaveBeenCalledWith("draft-item", "ambiguous");

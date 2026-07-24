@@ -958,13 +958,13 @@ async function ownershipLockIsReclaimable(input: {
 	);
 }
 
-interface NotificationRootRegistration {
+export interface NotificationRootRegistration {
 	root?: string;
 	managed?: boolean;
 	token?: string;
 }
 
-async function readNotificationRootRegistration(input: {
+export async function readNotificationRootRegistration(input: {
 	settings: Settings;
 	sessionId: string;
 	fs?: TelegramDaemonFs;
@@ -3834,6 +3834,11 @@ type BotApiCallOutcome =
 	| { kind: "retryable"; retryAfterMs: number }
 	| { kind: "unknown" };
 
+interface BotApiCallResult {
+	response: unknown;
+	outcome: BotApiCallOutcome;
+}
+
 function classifyBotApiCallOutcome(response: unknown, cooldownSuppressed = false): BotApiCallOutcome {
 	if (cooldownSuppressed) return { kind: "retryable", retryAfterMs: 0 };
 	if (!response || typeof response !== "object") return { kind: "unknown" };
@@ -4035,10 +4040,6 @@ export class TelegramNotificationDaemon {
 	/** Bot-wide flood-control window; inbound polling remains eligible during it. */
 	private botCooldownUntil = 0;
 	private warnedBotCooldownUntil = 0;
-	/** Central outcome counters let each flush grant detect accepted, rejected, and retryable Bot API calls. */
-	private acceptedBotCalls = 0;
-	private rejectedBotCalls = 0;
-	private retryableBotCalls = 0;
 	/** Original markdown of rich messages we sent (chat+message_id), for restoring reply context on inbound replies. */
 	private readonly replyStore: ReplySentStore;
 	/** Per-session debounce + monotonic draft-id state for opt-in draft streaming. */
@@ -4471,37 +4472,45 @@ export class TelegramNotificationDaemon {
 		return formatLifecycleOutcome(r, verb);
 	}
 
-	private recordBotApiOutcome(outcome: BotApiCallOutcome, method: string): void {
-		if (method === "getUpdates") return;
-		if (outcome.kind === "accepted") this.acceptedBotCalls++;
-		else if (outcome.kind === "rejected") this.rejectedBotCalls++;
-		else if (outcome.kind === "retryable") this.retryableBotCalls++;
-	}
-
 	private async callBotApi(
 		rawBotApi: BotApi,
 		method: string,
 		body: unknown,
 		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
-	): Promise<unknown> {
+	): Promise<BotApiCallResult> {
 		const now = this.opts.now?.() ?? Date.now();
 		if (method !== "getUpdates" && now < this.botCooldownUntil) {
 			if (this.warnedBotCooldownUntil !== this.botCooldownUntil) {
 				this.warnedBotCooldownUntil = this.botCooldownUntil;
 				logger.warn("notifications: Telegram Bot API flood-control cooldown suppressing outbound calls");
 			}
-			this.recordBotApiOutcome(classifyBotApiCallOutcome(undefined, true), method);
-			return undefined;
+			const outcome = classifyBotApiCallOutcome(undefined, true);
+			return { response: undefined, outcome };
 		}
 		const response = await this.effects.call(rawBotApi, method, body, callOpts);
 		const outcome = classifyBotApiCallOutcome(response);
-		this.recordBotApiOutcome(outcome, method);
 		if (outcome.kind === "retryable")
 			this.botCooldownUntil = Math.max(
 				this.botCooldownUntil,
 				(this.opts.now?.() ?? Date.now()) + outcome.retryAfterMs,
 			);
-		return response;
+		return { response, outcome };
+	}
+
+	private readonly callBotApiClassified: (
+		method: string,
+		body: unknown,
+		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
+	) => Promise<BotApiCallResult>;
+
+	private botApiWithOutcomeCollector(outcomes: BotApiCallOutcome[]): BotApi {
+		return {
+			call: async (method, body, callOpts) => {
+				const result = await this.callBotApiClassified(method, body, callOpts);
+				outcomes.push(result.outcome);
+				return result.response;
+			},
+		};
 	}
 
 	constructor(private readonly opts: TelegramDaemonOptions) {
@@ -4516,8 +4525,9 @@ export class TelegramNotificationDaemon {
 				fetchImpl: opts.fetchImpl,
 				setTimeoutImpl: opts.setTimeoutImpl,
 			});
+		this.callBotApiClassified = (method, body, callOpts) => this.callBotApi(rawBotApi, method, body, callOpts);
 		this.botApi = {
-			call: (method, body, callOpts) => this.callBotApi(rawBotApi, method, body, callOpts),
+			call: async (method, body, callOpts) => (await this.callBotApiClassified(method, body, callOpts)).response,
 		};
 		this.runtime = new NotificationOperatorRuntime({
 			now: opts.now,
@@ -6876,13 +6886,12 @@ export class TelegramNotificationDaemon {
 					this.pool.settle(item.itemId!, "ambiguous");
 					continue;
 				}
-				const retryableBefore = this.retryableBotCalls;
 				try {
-					const response = await this.botApi.call("sendMessage", btwDelivery.body, {
+					const { outcome } = await this.callBotApiClassified("sendMessage", btwDelivery.body, {
 						noRetry: true,
 						signal: btwDelivery.signal,
 					});
-					if (this.retryableBotCalls !== retryableBefore) {
+					if (outcome.kind === "retryable") {
 						this.submitPool({
 							sessionId: item.sessionId,
 							lane: item.lane,
@@ -6893,7 +6902,6 @@ export class TelegramNotificationDaemon {
 						this.pool.settle(item.itemId!, "ambiguous");
 						continue;
 					}
-					const outcome = classifyBotApiCallOutcome(response);
 					btwDelivery.finish(
 						outcome.kind === "accepted"
 							? "accepted"
@@ -6941,7 +6949,6 @@ export class TelegramNotificationDaemon {
 					() => controller.abort(),
 					Math.min(8_000, remaining),
 				);
-				const retryableBefore = this.retryableBotCalls;
 				try {
 					if (
 						!this.#leaseTokenAllows(selectedAck.socketLease) ||
@@ -6951,7 +6958,7 @@ export class TelegramNotificationDaemon {
 						this.pool.settle(item.itemId!, "rejected");
 						continue;
 					}
-					const response = (await this.botApi.call(
+					const { response, outcome } = await this.callBotApiClassified(
 						"sendMessage",
 						{
 							chat_id: this.opts.chatId,
@@ -6959,8 +6966,8 @@ export class TelegramNotificationDaemon {
 							text: "Selected!",
 						},
 						{ signal: controller.signal, noRetry: true },
-					)) as { ok?: unknown; result?: { message_id?: unknown } } | undefined;
-					if (this.retryableBotCalls !== retryableBefore) {
+					);
+					if (outcome.kind === "retryable") {
 						this.pool.settle(item.itemId!, "ambiguous");
 						if (this.effects.stopping) {
 							this.finishSelectedAck(selectedAck, { status: "unknown", reason: "shutdown" });
@@ -6978,8 +6985,9 @@ export class TelegramNotificationDaemon {
 						}
 						continue;
 					}
-					const messageId = response?.result?.message_id;
-					const delivered = response?.ok === true && typeof messageId === "number";
+					const typedResponse = response as { ok?: unknown; result?: { message_id?: unknown } } | undefined;
+					const messageId = typedResponse?.result?.message_id;
+					const delivered = typedResponse?.ok === true && typeof messageId === "number";
 					this.finishSelectedAck(
 						selectedAck,
 						delivered ? { status: "delivered", messageId } : { status: "failed", reason: "telegram_rejected" },
@@ -7025,9 +7033,8 @@ export class TelegramNotificationDaemon {
 				this.pool.settle(item.itemId!, "removed");
 				continue;
 			}
-			const acceptedBefore = this.acceptedBotCalls;
-			const rejectedBefore = this.rejectedBotCalls;
-			const retryableBefore = this.retryableBotCalls;
+			const itemOutcomes: BotApiCallOutcome[] = [];
+			const itemBotApi = this.botApiWithOutcomeCollector(itemOutcomes);
 			let disposition: "accepted" | "ambiguous" | "rejected" = "accepted";
 			try {
 				// Draft streaming (opt-in, off by default): stream a live turn frame as a
@@ -7066,7 +7073,7 @@ export class TelegramNotificationDaemon {
 				}
 				if (send.method === "sendPhoto" && send.photoBase64) {
 					// Real photo upload (the default botApi multiparts base64 -> file).
-					await this.botApi.call("sendPhoto", {
+					await itemBotApi.call("sendPhoto", {
 						chat_id: this.opts.chatId,
 						...threadField,
 						photo: send.photoBase64,
@@ -7075,7 +7082,7 @@ export class TelegramNotificationDaemon {
 						parse_mode: TELEGRAM_PARSE_MODE,
 					});
 				} else if (send.method === "sendDocument" && send.documentBase64) {
-					await this.botApi.call("sendDocument", {
+					await itemBotApi.call("sendDocument", {
 						chat_id: this.opts.chatId,
 						...threadField,
 						document: send.documentBase64,
@@ -7105,7 +7112,7 @@ export class TelegramNotificationDaemon {
 								(topicLease && !this.topicLeaseIsCurrent(topicLease))
 							)
 								return;
-							await this.botApi.call("sendMessage", {
+							await itemBotApi.call("sendMessage", {
 								chat_id: this.opts.chatId,
 								...threadField,
 								text: chunks[0]!,
@@ -7135,7 +7142,7 @@ export class TelegramNotificationDaemon {
 							}
 						};
 						const richMessageId = await deliverRichWithFallback(
-							this.botApi,
+							itemBotApi,
 							{ chat_id: this.opts.chatId, ...threadField },
 							send,
 							AbortSignal.any([this.#deliveryAbort.signal, AbortSignal.timeout(30_000)]),
@@ -7169,7 +7176,7 @@ export class TelegramNotificationDaemon {
 									(topicLease && !this.topicLeaseIsCurrent(topicLease))
 								)
 									return;
-								const res = (await this.botApi.call("editMessageText", {
+								const res = (await itemBotApi.call("editMessageText", {
 									chat_id: this.opts.chatId,
 									message_id: existingId,
 									text: chunks[0],
@@ -7185,7 +7192,7 @@ export class TelegramNotificationDaemon {
 								(!socketLease || this.#leaseTokenAllows(socketLease)) &&
 								(!topicLease || this.topicLeaseIsCurrent(topicLease))
 							) {
-								const res = (await this.botApi.call("sendMessage", {
+								const res = (await itemBotApi.call("sendMessage", {
 									chat_id: this.opts.chatId,
 									...threadField,
 									text: chunks[0]!,
@@ -7201,7 +7208,7 @@ export class TelegramNotificationDaemon {
 								(topicLease && !this.topicLeaseIsCurrent(topicLease))
 							)
 								return;
-							const res = (await this.botApi.call("sendMessage", {
+							const res = (await itemBotApi.call("sendMessage", {
 								chat_id: this.opts.chatId,
 								...threadField,
 								text: chunks[0]!,
@@ -7249,9 +7256,11 @@ export class TelegramNotificationDaemon {
 				disposition = "ambiguous";
 				if (item.payload.toolActivity?.phase === "started") this.toolActivityAmbiguous = true;
 			} finally {
-				const retryable = this.retryableBotCalls !== retryableBefore;
+				const retryable = itemOutcomes.some(outcome => outcome.kind === "retryable");
+				const accepted = itemOutcomes.some(outcome => outcome.kind === "accepted");
+				const rejected = itemOutcomes.some(outcome => outcome.kind === "rejected");
 				if (retryable) {
-					if (this.acceptedBotCalls === acceptedBefore) {
+					if (!accepted) {
 						this.submitPool({
 							sessionId: item.sessionId,
 							lane: item.lane,
@@ -7261,11 +7270,7 @@ export class TelegramNotificationDaemon {
 						});
 					}
 					disposition = "ambiguous";
-				} else if (
-					disposition === "accepted" &&
-					this.acceptedBotCalls === acceptedBefore &&
-					this.rejectedBotCalls !== rejectedBefore
-				) {
+				} else if (disposition === "accepted" && !accepted && rejected) {
 					disposition = "rejected";
 				}
 				this.pool.settle(item.itemId!, disposition);
