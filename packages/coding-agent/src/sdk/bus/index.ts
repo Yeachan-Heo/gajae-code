@@ -4420,7 +4420,7 @@ export function createNotificationsExtension(
 			runtime.redact = policy.redact;
 			runtime.verbosity = policy.verbosity;
 			runtime.stream = policy.stream;
-			if (redactionEnabled) terminalizeInFlightTools(runtime, runtime.id, "cancelled");
+			if (redactionEnabled) terminalizeInFlightTools(runtime, runtime.id, "cancelled", true);
 		},
 		activate: binding => {
 			const runtime = runtimes.get(binding.sessionId);
@@ -4647,8 +4647,13 @@ export function createNotificationsExtension(
 		await rotateSessionAuthority(event, ctx, false);
 	});
 
-	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "failed"): void => {
-		if (rt.notificationsActive && !rt.redact) {
+	const terminalizeInFlightTools = (
+		rt: SessionRuntime,
+		id: string,
+		phase: "cancelled" | "failed",
+		allowSafeRedactedFrame = false,
+	): void => {
+		if (rt.notificationsActive && (!rt.redact || allowSafeRedactedFrame)) {
 			for (const [toolCallId, { toolName }] of rt.inFlightTools) {
 				try {
 					pushSessionFrame(rt, { type: "tool_activity", sessionId: id, toolCallId, toolName, phase });
