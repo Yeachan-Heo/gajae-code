@@ -64,17 +64,42 @@ describe("bash invocation display safety", () => {
 		}
 	});
 
-	it("redacts password userinfo for generic credential URLs and empty users", () => {
+	it("redacts logically constructed sensitive flags and command-substitution values", () => {
 		const command =
-			"printf %s postgres://user:db-secret@host/db https://:empty-user-secret@example.test ftp://name:p:a:ss@host/path";
+			"curl --coo$'kie'=session-secret --coo$'kie'\"=\"joined-secret --password=$(printf supersecret) --authorization $(printf authsecret) \"--password=quoted-secret\"";
+		for (const expanded of [false, true]) {
+			const displayed = formatInvocationCommand(command, expanded);
+			expect(displayed).not.toContain("session-secret");
+			expect(displayed).not.toContain("supersecret");
+			expect(displayed).not.toContain("authsecret");
+			expect(displayed).not.toContain("quoted-secret");
+			expect(displayed).not.toContain("joined-secret");
+			expect(displayed).toContain("--coo$'kie'=<redacted>");
+			expect(displayed).toContain("--password=<redacted>");
+			expect(displayed).toContain("--authorization <redacted>");
+			if (expanded) expect(displayed).toContain('"--password=<redacted>"');
+			expect(displayed).toContain("--cookie=<redacted>");
+		}
+	});
+
+	it("preserves safe quoted equals and command substitutions", () => {
+		const command = "printf '%s' 'a=b' $(printf visible)";
+		expect(formatInvocationCommand(command, true)).toBe(command);
+	});
+
+	it("redacts password and username-only userinfo for generic credential URLs", () => {
+		const command =
+			"printf %s postgres://user:db-secret@host/db https://:empty-user-secret@example.test ftp://name:p:a:ss@host/path https://opaque-api-token@example.test/path";
 		const displayed = formatInvocationCommand(command, true);
 
 		expect(displayed).not.toContain("db-secret");
 		expect(displayed).not.toContain("empty-user-secret");
 		expect(displayed).not.toContain("p:a:ss");
+		expect(displayed).not.toContain("opaque-api-token");
 		expect(displayed).toContain("postgres://user:<redacted>@host/db");
 		expect(displayed).toContain("https://:<redacted>@example.test");
 		expect(displayed).toContain("ftp://name:<redacted>@host/path");
+		expect(displayed).toContain("https://<redacted>@example.test/path");
 	});
 
 	it("keeps short safe commands readable and collapses large arguments", () => {

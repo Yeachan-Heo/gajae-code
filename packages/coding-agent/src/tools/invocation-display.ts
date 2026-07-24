@@ -8,7 +8,7 @@ const SENSITIVE_NAME_PATTERN =
 const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const TOKEN_VALUE_PATTERN =
 	/\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]{16,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/g;
-const URL_CREDENTIAL_PATTERN = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^\s:/?#@]*):([^\s/?#@]*)(@)/g;
+const URL_CREDENTIAL_PATTERN = /\b([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^\s/?#@]+)(@)/g;
 const LONG_VALUE_CHARS = TRUNCATE_LENGTHS.LINE;
 
 function formatByteSize(value: string): string {
@@ -32,11 +32,11 @@ export function redactInvocationValuePatterns(value: string): string {
 	return value
 		.replace(BEARER_PATTERN, "Bearer <redacted>")
 		.replace(TOKEN_VALUE_PATTERN, REDACTED_INVOCATION_VALUE)
-		.replace(
-			URL_CREDENTIAL_PATTERN,
-			(_match, scheme: string, user: string, _password: string, at: string) =>
-				`${scheme}${user}:${REDACTED_INVOCATION_VALUE}${at}`,
-		);
+		.replace(URL_CREDENTIAL_PATTERN, (_match, scheme: string, userinfo: string, at: string) => {
+			const colon = userinfo.indexOf(":");
+			if (colon < 0) return `${scheme}${REDACTED_INVOCATION_VALUE}${at}`;
+			return `${scheme}${userinfo.slice(0, colon)}:${REDACTED_INVOCATION_VALUE}${at}`;
+		});
 }
 
 function displayValue(value: string, expanded: boolean, sensitive: boolean): string {
@@ -90,9 +90,9 @@ function findShellWordSpans(command: string): ShellWordSpan[] {
 		if (index >= command.length) break;
 		const start = index;
 		let quote: "single" | "double" | "ansi-c" | undefined;
+		let substitutionDepth = 0;
 		while (index < command.length) {
 			const character = command[index] ?? "";
-			if (!quote && /[\s;&|()<>]/.test(character)) break;
 			if (quote === "single") {
 				index += 1;
 				if (character === "'") quote = undefined;
@@ -123,11 +123,128 @@ function findShellWordSpans(command: string): ShellWordSpan[] {
 				index += 1;
 				continue;
 			}
+			if (substitutionDepth > 0) {
+				if (character === "(") substitutionDepth += 1;
+				if (character === ")") substitutionDepth -= 1;
+				index += 1;
+				continue;
+			}
+			if (character === "$" && command[index + 1] === "(") {
+				substitutionDepth = 1;
+				index += 2;
+				continue;
+			}
+			if (/[\s;&|()<>]/.test(character)) break;
 			index += 1;
 		}
 		spans.push({ start, end: index, value: command.slice(start, index) });
 	}
 	return spans;
+}
+
+function cookShellWord(value: string): string {
+	let output = "";
+	let index = 0;
+	let quote: "single" | "double" | "ansi-c" | undefined;
+	while (index < value.length) {
+		const character = value[index] ?? "";
+		if (quote === "single") {
+			index += 1;
+			if (character === "'") quote = undefined;
+			else output += character;
+			continue;
+		}
+		if (quote === "double" || quote === "ansi-c") {
+			if (character === "\\" && index + 1 < value.length) {
+				output += value[index + 1] ?? "";
+				index += 2;
+				continue;
+			}
+			index += 1;
+			if ((quote === "double" && character === '"') || (quote === "ansi-c" && character === "'")) {
+				quote = undefined;
+			} else {
+				output += character;
+			}
+			continue;
+		}
+		if (character === "\\" && index + 1 < value.length) {
+			output += value[index + 1] ?? "";
+			index += 2;
+			continue;
+		}
+		if (character === "$" && value[index + 1] === "'") {
+			quote = "ansi-c";
+			index += 2;
+			continue;
+		}
+		if (character === '"') {
+			quote = "double";
+			index += 1;
+			continue;
+		}
+		if (character === "'") {
+			quote = "single";
+			index += 1;
+			continue;
+		}
+		output += character;
+		index += 1;
+	}
+	return output;
+}
+
+function findShellWordEquals(value: string): number {
+	let index = 0;
+	let quote: "single" | "double" | "ansi-c" | undefined;
+	let substitutionDepth = 0;
+	while (index < value.length) {
+		const character = value[index] ?? "";
+		if (quote === "single") {
+			index += 1;
+			if (character === "'") quote = undefined;
+			continue;
+		}
+		if (quote === "double" || quote === "ansi-c") {
+			if (character === "\\") {
+				index = Math.min(index + 2, value.length);
+				continue;
+			}
+			index += 1;
+			if ((quote === "double" && character === '"') || (quote === "ansi-c" && character === "'")) {
+				quote = undefined;
+			}
+			continue;
+		}
+		if (character === "\\") {
+			index = Math.min(index + 2, value.length);
+			continue;
+		}
+		if (character === '"') {
+			quote = "double";
+			index += 1;
+			continue;
+		}
+		if (character === "'") {
+			quote = index > 0 && value[index - 1] === "$" ? "ansi-c" : "single";
+			index += 1;
+			continue;
+		}
+		if (substitutionDepth > 0) {
+			if (character === "(") substitutionDepth += 1;
+			if (character === ")") substitutionDepth -= 1;
+			index += 1;
+			continue;
+		}
+		if (character === "$" && value[index + 1] === "(") {
+			substitutionDepth = 1;
+			index += 2;
+			continue;
+		}
+		if (character === "=") return index;
+		index += 1;
+	}
+	return -1;
 }
 
 function splitShellWordWrapper(value: string): ShellWordWrapper {
@@ -155,21 +272,31 @@ function redactShellWords(command: string, expanded: boolean): string {
 	const replacements = new Map<number, string>();
 	for (const [index, span] of spans.entries()) {
 		if (replacements.has(index)) continue;
-		const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(span.value);
-		if (assignment) {
-			const [, key, rawValue] = assignment;
+		const rawEquals = findShellWordEquals(span.value);
+		const cookedWord = cookShellWord(span.value);
+		const logicalEquals = cookedWord.indexOf("=");
+		const rawName = rawEquals < 0 ? span.value : span.value.slice(0, rawEquals);
+		const logicalName = logicalEquals < 0 ? cookedWord : cookedWord.slice(0, logicalEquals);
+		if (rawEquals >= 0 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(logicalName)) {
+			const rawValue = span.value.slice(rawEquals + 1);
 			const wrapper = splitShellWordWrapper(rawValue);
-			const displayed = displayValue(wrapper.value, expanded, isSensitiveInvocationName(key));
-			replacements.set(index, `${key}=${wrapper.prefix}${displayed}${wrapper.suffix}`);
+			const displayed = displayValue(wrapper.value, expanded, isSensitiveInvocationName(logicalName));
+			replacements.set(index, `${rawName}=${wrapper.prefix}${displayed}${wrapper.suffix}`);
+			continue;
+		}
+		if (rawEquals < 0 && logicalEquals >= 0 && isSensitiveInvocationName(logicalName)) {
+			replacements.set(index, replaceShellWordValue(span.value, `${logicalName}=${REDACTED_INVOCATION_VALUE}`));
 			continue;
 		}
 
-		const equals = span.value.indexOf("=");
-		const flag = equals < 0 ? span.value : span.value.slice(0, equals);
-		if (!isSensitiveFlagName(flag)) continue;
-		if (equals >= 0) {
-			const rawValue = span.value.slice(equals + 1);
-			replacements.set(index, `${flag}=${replaceShellWordValue(rawValue, REDACTED_INVOCATION_VALUE)}`);
+		if (!isSensitiveFlagName(logicalName)) continue;
+		if (rawEquals >= 0) {
+			const rawValue = span.value.slice(rawEquals + 1);
+			replacements.set(index, `${rawName}=${replaceShellWordValue(rawValue, REDACTED_INVOCATION_VALUE)}`);
+			continue;
+		}
+		if (logicalEquals >= 0) {
+			replacements.set(index, replaceShellWordValue(span.value, `${logicalName}=${REDACTED_INVOCATION_VALUE}`));
 			continue;
 		}
 
