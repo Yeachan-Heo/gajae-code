@@ -111,6 +111,92 @@ export function injectImageGenerationModels(models: Model[]): void {
 	}
 }
 
+/**
+ * A first-party model transcribed from published provider documentation, kept as
+ * a typed generator input instead of a hand-edit in the generated catalog.
+ */
+interface FirstPartyCatalogSeed {
+	/** Upstream-shaped entry; normalization (name scrub, thinking, limits) runs later. */
+	readonly model: Model;
+	/** Published documentation the fields were transcribed from. */
+	readonly provenance: {
+		readonly sources: readonly string[];
+		readonly retrievedAt: string;
+	};
+}
+
+/**
+ * Typed catalog seeds for first-party models that live upstream sources do not
+ * return yet.
+ *
+ * models.dev and provider discovery stay the primary sources: a seed is skipped
+ * whenever a live source returned the same provider/model key. A seed does
+ * outrank the previously generated `src/models.json` row, so correcting a seed
+ * field corrects the regenerated catalog instead of losing to the stale row it
+ * bootstrapped. The seed is upstream-shaped and flows through the same pipeline
+ * as every other entry (`applyGlobalModelsDevFallback`,
+ * `applyGeneratedModelPolicies`, name scrubbing, thinking inference), and the
+ * emitted row carries `catalogProvenance` so the artifact records which
+ * documentation produced its fields.
+ */
+export const FIRST_PARTY_CATALOG_SEEDS: readonly FirstPartyCatalogSeed[] = [
+	{
+		// Claude Opus 5: GA on the Claude API, announced 2026-07-24.
+		model: {
+			id: "claude-opus-5",
+			name: "Claude Opus 5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		} satisfies Model<"anthropic-messages">,
+		provenance: {
+			sources: [
+				"https://platform.claude.com/docs/en/about-claude/models/overview",
+				"https://platform.claude.com/docs/en/about-claude/pricing",
+			],
+			retrievedAt: "2026-07-25",
+		},
+	},
+];
+
+function modelKey(model: Pick<Model, "provider" | "id">): string {
+	return `${model.provider}/${model.id}`;
+}
+
+/**
+ * Merge typed catalog seeds for provider/model keys the live sources did not
+ * return, binding each seed's provenance into the emitted row. Idempotent: a key
+ * already present in `models` is left untouched, so live upstream metadata wins.
+ */
+export function injectFirstPartyCatalogSeeds(models: Model[]): void {
+	const present = new Set(models.map(modelKey));
+	for (const seed of FIRST_PARTY_CATALOG_SEEDS) {
+		if (present.has(modelKey(seed.model))) {
+			continue;
+		}
+		present.add(modelKey(seed.model));
+		models.push({
+			...seed.model,
+			input: [...seed.model.input],
+			cost: { ...seed.model.cost },
+			catalogProvenance: {
+				sources: [...seed.provenance.sources],
+				retrievedAt: seed.provenance.retrievedAt,
+			},
+		});
+	}
+}
+
+/** Provider/model keys the typed seed table owns. */
+export function firstPartyCatalogSeedKeys(): ReadonlySet<string> {
+	return new Set(FIRST_PARTY_CATALOG_SEEDS.map(seed => modelKey(seed.model)));
+}
+
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars) {
 		const value = $env[envVar as keyof typeof $env];
@@ -395,56 +481,52 @@ async function fetchCodexDiscoveryModels(): Promise<Model<"openai-codex-response
 	}
 }
 
-async function generateModels() {
-	// Fetch models from dynamic sources
-	const modelsDevModels = await loadModelsDevData();
-	const catalogProviderModels = (
-		await Promise.all(
-			PROVIDER_DESCRIPTORS.filter(isCatalogDescriptor).map(descriptor => fetchProviderModelsFromCatalog(descriptor)),
-		)
-	).flat();
-	const gitLabDuoModels = getGitLabDuoModels();
-	// Combine models (models.dev has priority)
-	let allModels = applyGlobalModelsDevFallback(
-		[...modelsDevModels, ...catalogProviderModels, ...gitLabDuoModels, ...createAzureOpenAICatalogModels()],
-		modelsDevModels,
-	);
+/** Inputs the deterministic catalog composition consumes. */
+export interface ComposeCatalogInput {
+	/** Everything live sources returned this run (models.dev, catalog descriptors, discovery). */
+	readonly liveModels: readonly Model[];
+	/** models.dev rows only; used for the same-id metadata fallback. */
+	readonly modelsDevModels: readonly Model[];
+	/** Previously generated catalog, used as the last-resort fallback. */
+	readonly previousCatalog: Record<string, Record<string, Model>>;
+}
+
+// Discovery-only providers (local inference servers) — never bundle static models.
+const DISCOVERY_ONLY_PROVIDERS = new Set(["ollama", "vllm"]);
+
+/**
+ * Compose the bundled catalog from live sources, typed seeds, and the previously
+ * generated catalog. Pure: no network, no credentials, no filesystem — same
+ * inputs always yield the same output, which is what the generation tests assert.
+ *
+ * Precedence, highest first:
+ *   1. live sources (models.dev, catalog descriptors, provider discovery)
+ *   2. `FIRST_PARTY_CATALOG_SEEDS` (documented transcriptions)
+ *   3. the previously generated catalog (static-only and auth-gated providers)
+ */
+export function composeCatalog(input: ComposeCatalogInput): Record<string, Record<string, Model>> {
+	let allModels = applyGlobalModelsDevFallback([...input.liveModels], input.modelsDevModels);
 
 	if (!allModels.some(model => model.provider === "cloudflare-ai-gateway")) {
 		allModels.push(CLOUDFLARE_FALLBACK_MODEL);
 	}
 
-	const specialDiscoverySources = [
-		{ label: "Antigravity", fetch: fetchAntigravityModels },
-		{ label: "OpenAI code", fetch: fetchCodexDiscoveryModels },
-	] as const;
-	const specialDiscoveries = await Promise.all(
-		specialDiscoverySources.map(async source => ({
-			label: source.label,
-			models: await source.fetch(),
-		})),
-	);
-	for (const discovery of specialDiscoveries) {
-		if (discovery.models.length > 0) {
-			console.log(`Added ${discovery.models.length} models from ${discovery.label} discovery`);
-			allModels.push(...discovery.models);
-		}
-	}
+	// Typed seeds outrank the previously generated rows they bootstrapped, so a
+	// seed correction reaches the regenerated catalog; live sources still win.
+	injectFirstPartyCatalogSeeds(allModels);
 
 	// Merge previous models.json entries as fallback for any provider/model
 	// not fetched dynamically. This replaces all hardcoded fallback lists —
 	// static-only providers (vertex, gemini-cli), auth-gated providers when
 	// credentials are unavailable, and ad-hoc model additions all persist
 	// through the existing models.json seed.
-	// Discovery-only providers (local inference servers) — never bundle static models.
-	const discoveryOnlyProviders = new Set(["ollama", "vllm"]);
-	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
+	const resolvedKeys = new Set(allModels.map(modelKey));
 
-	for (const models of Object.values(prevModelsJson as Record<string, Record<string, Model>>)) {
+	for (const models of Object.values(input.previousCatalog)) {
 		for (const model of Object.values(models)) {
 			if (
-				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
-				!discoveryOnlyProviders.has(model.provider) &&
+				!resolvedKeys.has(modelKey(model)) &&
+				!DISCOVERY_ONLY_PROVIDERS.has(model.provider) &&
 				!isRetiredBundledModel(model)
 			) {
 				allModels.push(model.provider === "openai" ? { ...model, baseUrl: "" } : model);
@@ -453,7 +535,7 @@ async function generateModels() {
 	}
 	allModels = allModels.filter(model => !isRetiredBundledModel(model));
 
-	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
+	allModels = applyGlobalModelsDevFallback(allModels, input.modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
 	allModels = applyClaudeOpusVisionCorrections(allModels);
@@ -464,7 +546,7 @@ async function generateModels() {
 	// Group by provider and sort each provider's models
 	const providers: Record<string, Record<string, Model>> = {};
 	for (const model of allModels) {
-		if (discoveryOnlyProviders.has(model.provider)) continue;
+		if (DISCOVERY_ONLY_PROVIDERS.has(model.provider)) continue;
 		if (!providers[model.provider]) {
 			providers[model.provider] = {};
 		}
@@ -488,12 +570,54 @@ async function generateModels() {
 	for (const key in MODELS) {
 		MODELS[key] = sortObj(MODELS[key]);
 	}
+	return MODELS;
+}
+
+async function generateModels() {
+	// Fetch models from dynamic sources
+	const modelsDevModels = await loadModelsDevData();
+	const catalogProviderModels = (
+		await Promise.all(
+			PROVIDER_DESCRIPTORS.filter(isCatalogDescriptor).map(descriptor => fetchProviderModelsFromCatalog(descriptor)),
+		)
+	).flat();
+	const gitLabDuoModels = getGitLabDuoModels();
+	const liveModels: Model[] = [
+		...modelsDevModels,
+		...catalogProviderModels,
+		...gitLabDuoModels,
+		...createAzureOpenAICatalogModels(),
+	];
+
+	const specialDiscoverySources = [
+		{ label: "Antigravity", fetch: fetchAntigravityModels },
+		{ label: "OpenAI code", fetch: fetchCodexDiscoveryModels },
+	] as const;
+	const specialDiscoveries = await Promise.all(
+		specialDiscoverySources.map(async source => ({
+			label: source.label,
+			models: await source.fetch(),
+		})),
+	);
+	for (const discovery of specialDiscoveries) {
+		if (discovery.models.length > 0) {
+			console.log(`Added ${discovery.models.length} models from ${discovery.label} discovery`);
+			liveModels.push(...discovery.models);
+		}
+	}
+
+	const MODELS = composeCatalog({
+		liveModels,
+		modelsDevModels,
+		previousCatalog: prevModelsJson as Record<string, Record<string, Model>>,
+	});
 
 	// Generate JSON file
 	await Bun.write(path.join(packageRoot, "src/models.json"), JSON.stringify(MODELS, null, "	"));
 	console.log("Generated src/models.json");
 
 	// Print statistics
+	const allModels = Object.values(MODELS).flatMap(models => Object.values(models));
 	const totalModels = allModels.length;
 	const reasoningModels = allModels.filter(m => m.reasoning).length;
 

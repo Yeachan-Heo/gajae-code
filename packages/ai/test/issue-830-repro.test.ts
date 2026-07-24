@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Effort } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { DEFAULT_MODEL_PER_PROVIDER, PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import { MODELS_DEV_PROVIDER_DESCRIPTORS } from "../src/provider-models/openai-compat";
@@ -76,5 +77,30 @@ describe("Anthropic Sonnet 5 model catalog support", () => {
 		expect(sonnet5?.api).toBe("anthropic-messages");
 		expect(sonnet5?.reasoning).toBe(true);
 		expect(sonnet46?.api).toBe("anthropic-messages");
+	});
+});
+
+describe("Anthropic Opus 5 model catalog support", () => {
+	test("registers Opus 5 with published Anthropic limits and pricing", () => {
+		const opus5 = getBundledModel("anthropic", "claude-opus-5");
+		expect(opus5?.api).toBe("anthropic-messages");
+		expect(opus5?.baseUrl).toBe("https://api.anthropic.com");
+		expect(opus5?.reasoning).toBe(true);
+		expect(opus5?.input).toEqual(["text", "image"]);
+		expect(opus5?.contextWindow).toBe(1_000_000);
+		expect(opus5?.maxTokens).toBe(128_000);
+		expect(opus5?.cost).toEqual({ input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 });
+		expect(opus5?.thinking).toEqual({
+			mode: "anthropic-adaptive",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.Max,
+		});
+	});
+
+	test("keeps the Anthropic provider default and older Opus entries untouched", () => {
+		const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "anthropic");
+		expect(descriptor?.defaultModel).toBe("claude-sonnet-5");
+		expect(DEFAULT_MODEL_PER_PROVIDER.anthropic).toBe("claude-sonnet-5");
+		expect(getBundledModel("anthropic", "claude-opus-4-8")?.api).toBe("anthropic-messages");
 	});
 });

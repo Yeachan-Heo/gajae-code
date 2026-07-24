@@ -19,7 +19,11 @@ import {
 	logger,
 	readSseEvents,
 } from "@gajae-code/utils";
-import { hasOpus47ApiRestrictions, mapEffortToAnthropicAdaptiveEffort } from "../model-thinking";
+import {
+	hasOpus47ApiRestrictions,
+	mapEffortToAnthropicAdaptiveEffort,
+	supportsAdaptiveThinkingDisplay,
+} from "../model-thinking";
 import { calculateCost } from "../models";
 import { isUsageLimitError } from "../rate-limit-utils";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
@@ -307,22 +311,6 @@ type AnthropicSamplingParams = MessageCreateParamsStreaming & {
 
 const ANTHROPIC_STOP_SEQUENCES_MAX = 4;
 let warnedStopSequencesTrim = false;
-
-/**
- * Adaptive thinking `display` is supported starting with Anthropic model Opus 4.7.
- * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
- * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
- * "omitted" — thinking tokens are billed but no content streams back — so it
- * must opt in like Opus 4.7+ (issue #2791).
- */
-function supportsAdaptiveThinkingDisplay(modelId: string): boolean {
-	if (/claude-fable-\d/.test(modelId)) return true;
-	const match = /claude-opus-(\d+)-(\d+)/.exec(modelId);
-	if (!match) return false;
-	const major = Number(match[1]);
-	const minor = Number(match[2]);
-	return major > 4 || (major === 4 && minor >= 7);
-}
 
 const ANTHROPIC_PROVIDER_SESSION_STATE_KEY = "anthropic-messages";
 

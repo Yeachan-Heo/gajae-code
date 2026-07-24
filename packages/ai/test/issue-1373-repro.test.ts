@@ -100,6 +100,16 @@ describe("issue #1373: Bedrock Claude thinkingDisplay", () => {
 		});
 	});
 
+	it("defaults adaptive thinking to display=summarized on Opus 5 dateless ids", async () => {
+		const payload = await captureBedrockPayload(adaptiveModel("us.anthropic.claude-opus-5"), {
+			reasoning: Effort.High,
+		});
+		expect(payload.additionalModelRequestFields?.thinking).toMatchObject({
+			type: "adaptive",
+			display: "summarized",
+		});
+	});
+
 	it("respects explicit thinkingDisplay='omitted' on Opus 4.7+", async () => {
 		const payload = await captureBedrockPayload(adaptiveModel("eu.anthropic.claude-opus-4-7"), {
 			reasoning: Effort.High,

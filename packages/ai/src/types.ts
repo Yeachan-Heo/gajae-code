@@ -960,6 +960,22 @@ export interface ModelRequestTransform {
 	extraBody?: Record<string, unknown>;
 }
 
+/**
+ * Published provider documentation a bundled catalog row was transcribed from.
+ *
+ * Set by the catalog generator for first-party models it seeds from typed inputs
+ * (a model published after the last upstream snapshot, or any regeneration
+ * without network access or provider credentials). Rows resolved from a live
+ * upstream source carry no provenance, so the presence of this field identifies
+ * exactly which fields came from a documented transcription.
+ */
+export interface CatalogProvenance {
+	/** Documentation URLs the fields were transcribed from. */
+	sources: readonly string[];
+	/** ISO `YYYY-MM-DD` date the documentation was read. */
+	retrievedAt: string;
+}
+
 export interface Model<TApi extends Api = any> {
 	id: string;
 	name: string;
@@ -1045,4 +1061,9 @@ export interface Model<TApi extends Api = any> {
 	 * `options.isOAuth = true` for the underlying provider call.
 	 */
 	isOAuth?: boolean;
+	/**
+	 * Documentation the generator transcribed this bundled row from. Only set for
+	 * typed generator seeds; live upstream rows leave it unset.
+	 */
+	catalogProvenance?: CatalogProvenance;
 }

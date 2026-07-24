@@ -350,6 +350,24 @@ export function hasOpus47ApiRestrictions(modelId: string): boolean {
 	return semverGte(parsed.version, "4.7") && parsed.kind === "opus";
 }
 
+/**
+ * Adaptive thinking `display` is supported starting with Anthropic model Opus 4.7.
+ * Older adaptive-thinking models (Opus 4.6, Sonnet 4.6+) reject the field.
+ * Fable (5+) postdates Opus 4.7, accepts `display`, and defaults it to
+ * "omitted" — thinking tokens are billed but no content streams back — so it
+ * must opt in like Opus 4.7+ (issue #2791).
+ *
+ * Version parsing (not id-shape matching) is the authority here: dateless ids
+ * carry a single version segment (`claude-opus-5`), and Bedrock ids add
+ * region/inference-profile prefixes (`eu.anthropic.claude-opus-5`).
+ */
+export function supportsAdaptiveThinkingDisplay(modelId: string): boolean {
+	const parsed = parseAnthropicModel(getCanonicalModelId(modelId));
+	if (!parsed) return false;
+	if (parsed.kind === "fable") return true;
+	return parsed.kind === "opus" && semverGte(parsed.version, "4.7");
+}
+
 function anthropicModelHasRealXHighEffort<TApi extends Api>(model: ApiModel<TApi>): boolean {
 	if (model.api !== "anthropic-messages") return false;
 	const parsedModel = parseKnownModel(model.id);
