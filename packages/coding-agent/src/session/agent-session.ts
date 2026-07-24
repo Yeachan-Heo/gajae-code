@@ -7530,7 +7530,11 @@ export class AgentSession {
 			}
 
 			// Validate API key
-			const apiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
+			const apiKey = await this.#awaitPromptPreflight(
+				generation,
+				preflightSignal,
+				this.#modelRegistry.getApiKey(this.model, this.sessionId, { signal: preflightSignal }),
+			);
 			if (!apiKey) {
 				throw new Error(formatNoCredentialOnboardingError(this.model.provider));
 			}

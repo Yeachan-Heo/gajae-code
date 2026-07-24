@@ -16,6 +16,8 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
+import { submitInteractiveInput } from "@gajae-code/coding-agent/main";
+import type { SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
@@ -122,6 +124,81 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Cleanup
 		await session.abort();
 		await firstPrompt.catch(() => {}); // Ignore abort error
+	});
+
+	it("aborts stalled API-key preflight, clears the submission, and accepts the next prompt", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: () => {
+				streamCalls += 1;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message = createAssistantMessage("ok");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-preflight-cancel.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		const apiKeyGate = Promise.withResolvers<string | undefined>();
+		let stallApiKey = true;
+		let preflightSignal: AbortSignal | undefined;
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (_model, _sessionId, options) => {
+			preflightSignal = options?.signal;
+			return stallApiKey ? apiKeyGate.promise : "test-key";
+		});
+		session = new AgentSession({ agent, sessionManager, settings: Settings.isolated(), modelRegistry });
+
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+		};
+		const input: SubmittedUserInput = {
+			text: "cancel during auth",
+			images: undefined,
+			cancelled: false,
+			started: false,
+		};
+		const submission = submitInteractiveInput(mode, session, input);
+		const submissionOutcome = submission.then(() => "settled" as const);
+		let abort: Promise<void> | undefined;
+		try {
+			await waitFor(() => preflightSignal !== undefined);
+
+			abort = session.abort();
+			const outcome = await Promise.race([submissionOutcome, Bun.sleep(100).then(() => "pending" as const)]);
+			apiKeyGate.resolve("test-key");
+			await submission;
+			await abort;
+
+			expect(outcome).toBe("settled");
+			expect(preflightSignal?.aborted).toBe(true);
+			expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
+			expect(mode.showError).not.toHaveBeenCalled();
+			expect(session.isStreaming).toBe(false);
+			expect(
+				agent.state.messages.filter(message => message.role === "user" || message.role === "assistant"),
+			).toEqual([]);
+
+			stallApiKey = false;
+			await session.prompt("after abort");
+
+			expect(streamCalls).toBe(1);
+			expect(agent.state.messages.filter(message => message.role === "user")).toHaveLength(1);
+			expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+		} finally {
+			apiKeyGate.resolve("test-key");
+			await Promise.allSettled(abort ? [submission, abort] : [submission]);
+		}
 	});
 
 	it("should allow steer() while streaming", async () => {

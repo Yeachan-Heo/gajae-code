@@ -2564,13 +2564,14 @@ export class ModelRegistry {
 	async getApiKey(
 		model: Model<Api>,
 		sessionId?: string,
-		options: { credentialSelector?: AuthCredentialSelector } = {},
+		options: { credentialSelector?: AuthCredentialSelector; signal?: AbortSignal } = {},
 	): Promise<string | undefined> {
 		return this.#getApiKeyOrNoAuth(model.provider, () =>
 			this.authStorage.getApiKey(model.provider, sessionId, {
 				baseUrl: model.baseUrl,
 				modelId: model.id,
 				credentialSelector: options.credentialSelector,
+				signal: options.signal,
 			}),
 		);
 	}
@@ -2582,12 +2583,13 @@ export class ModelRegistry {
 		provider: string,
 		sessionId?: string,
 		baseUrl?: string,
-		options: { credentialSelector?: AuthCredentialSelector } = {},
+		options: { credentialSelector?: AuthCredentialSelector; signal?: AbortSignal } = {},
 	): Promise<string | undefined> {
 		return this.#getApiKeyOrNoAuth(provider, () =>
 			this.authStorage.getApiKey(provider, sessionId, {
 				baseUrl,
 				credentialSelector: options.credentialSelector,
+				signal: options.signal,
 			}),
 		);
 	}
