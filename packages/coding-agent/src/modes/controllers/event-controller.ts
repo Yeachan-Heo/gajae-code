@@ -13,6 +13,7 @@ import {
 } from "../../modes/components/read-tool-group";
 import { TodoReminderComponent } from "../../modes/components/todo-reminder";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
+import type { DurableHistoryEvent, ToolExecutionHandle } from "../../modes/components/tool-execution";
 import { TtsrNotificationComponent } from "../../modes/components/ttsr-notification";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
@@ -116,6 +117,7 @@ export class EventController {
 	#ircExpiryTimers = new Map<string, NodeJS.Timeout>();
 	#renderedIrcComponents = new Map<string, readonly Component[]>();
 	#toolIntentCache = new Map<string, { args: unknown; intent: string | undefined }>();
+	#durableHistorySources = new Set<ToolExecutionHandle>();
 	#thinkingContentIndices = new Set<number>();
 	#handlers: AgentSessionEventHandlers;
 
@@ -160,8 +162,44 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 		}
 		this.clearIrcExpiryTimers();
+		this.#durableHistorySources.clear();
 	}
 
+	#trackDurableHistorySource(source: ToolExecutionHandle): void {
+		if (!source.getDurableHistoryEvent && !source.getDurableHistoryEvents) return;
+		this.#durableHistorySources.add(source);
+	}
+
+	/**
+	 * Consume durable tool snapshots only after the shared transcript write has
+	 * been accepted by the terminal.
+	 */
+	acknowledgeAcceptedRenderEvent(width = this.ctx.ui.terminal.columns): void {
+		let budget = 256;
+		for (const source of this.#durableHistorySources) {
+			if (budget <= 0) break;
+			let events: readonly DurableHistoryEvent[];
+			try {
+				events = source.getDurableHistoryEvents
+					? source.getDurableHistoryEvents(width)
+					: source.getDurableHistoryEvent
+						? [source.getDurableHistoryEvent(width)].filter(
+								(event): event is DurableHistoryEvent => event !== undefined,
+							)
+						: [];
+			} catch {
+				continue;
+			}
+			const accepted = events.slice(0, budget);
+			for (const event of accepted) {
+				source.acknowledgeDurableHistoryEvent?.(event.identity, event.revision);
+			}
+			budget -= accepted.length;
+			if (accepted.length === events.length && events.length > 0 && events.every(event => event.final)) {
+				this.#durableHistorySources.delete(source);
+			}
+		}
+	}
 	#resetReadGroup(): void {
 		this.#lastReadGroup = undefined;
 	}
@@ -175,6 +213,7 @@ export class EventController {
 			group.setExpanded(this.ctx.toolOutputExpanded);
 			addChatChild(this.ctx, group);
 			this.#lastReadGroup = group;
+			this.#trackDurableHistorySource(group);
 		}
 		return this.#lastReadGroup;
 	}
@@ -245,6 +284,7 @@ export class EventController {
 		this.ctx.promptSuggestion?.onAgentStart();
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
+		this.#durableHistorySources.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
 		if (this.ctx.retryEscapeHandler) {
@@ -706,6 +746,7 @@ export class EventController {
 			);
 			component.setExpanded(this.ctx.toolOutputExpanded);
 			this.ctx.pendingTools.set(event.toolCallId, component);
+			this.#trackDurableHistorySource(component);
 			addChatChild(this.ctx, component);
 			this.ctx.ui.requestRender();
 		}

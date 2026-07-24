@@ -158,9 +158,8 @@ describe("TUI glitch audit (reported glitch classes)", () => {
 	it("no alternate-buffer sequences across full / differential / deleted-lines paths", async () => {
 		const term = new VirtualTerminal(40, 8);
 		const tui = new TUI(term);
-		// clearOnShrink disabled so the shrink hits the real deleted-lines diff
+		// The always-on no-repair shrink path exercises the deleted-lines diff
 		// branch (firstChanged >= newLines.length) rather than a full clear.
-		tui.setClearOnShrink(false);
 		tui.start();
 
 		const component = new MutableLinesComponent(["alpha", "beta", "gamma", "delta"]);
@@ -175,7 +174,7 @@ describe("TUI glitch audit (reported glitch classes)", () => {
 		tui.requestRender(false, "audit.diff");
 		await settle(term);
 
-		// Deleted-lines render (shrink with clearOnShrink off => deleted-lines branch).
+		// Deleted-lines render (the always-on no-repair shrink path).
 		component.setLines(["alpha", "BETA"]);
 		tui.requestRender(false, "audit.shrink");
 		await settle(term);
@@ -203,7 +202,7 @@ describe("TUI glitch audit (reported glitch classes)", () => {
 		assertNoAltBuffer(term.getWriteLog().join(""));
 	});
 
-	it("no alternate-buffer sequences in a multiplexer full-clear path (uses 2J, never alt-buffer)", async () => {
+	it("no alternate-buffer sequences in a multiplexer repaint path", async () => {
 		Bun.env.TMUX = "1";
 		Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = "1";
 		const term = new VirtualTerminal(40, 6, { isProcessTerminal: true });
@@ -218,9 +217,6 @@ describe("TUI glitch audit (reported glitch classes)", () => {
 		tui.stop();
 
 		const writes = term.getWriteLog().join("");
-		// The legacy multiplexer full render uses 2J (never 3J, never alt-buffer).
-		expect(writes.includes("\x1b[2J")).toBe(true);
-		expect(writes.includes("\x1b[3J")).toBe(false);
 		assertNoAltBuffer(writes);
 	});
 

@@ -23,7 +23,7 @@ Boundary rule: the TUI engine is message-agnostic. It only knows `Component.rend
 
 ## Boot and component tree assembly
 
-`InteractiveMode` constructs `TUI(new ProcessTerminal(), settings.get("showHardwareCursor"))`, applies `settings.get("clearOnShrink")`, and creates persistent containers:
+`InteractiveMode` constructs `TUI(new ProcessTerminal(), settings.get("showHardwareCursor"))` and creates persistent containers:
 
 - `chatContainer`
 - `pendingMessagesContainer`

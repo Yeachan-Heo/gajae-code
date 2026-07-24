@@ -145,6 +145,18 @@ export interface ToolExecutionOptions {
 	editAllowFuzzy?: boolean;
 	hashlineAutoDropPureInsertDuplicates?: boolean;
 }
+export type DurableHistoryEvent = Readonly<{
+	identity: string;
+	revision: number;
+	final: boolean;
+	snapshot: readonly string[];
+}>;
+
+export interface DurableHistoryEventSource {
+	getDurableHistoryEvent(width: number): DurableHistoryEvent | undefined;
+	acknowledgeDurableHistoryEvent(identity: string, revision: number): void;
+	getDurableHistoryEvents?(width: number): readonly DurableHistoryEvent[];
+}
 
 export interface ToolExecutionHandle {
 	updateArgs(args: any, toolCallId?: string): void;
@@ -168,6 +180,9 @@ export interface ToolExecutionHandle {
 	 * back to {@link setExpanded}.
 	 */
 	setManuallyExpanded?(expanded: boolean): void;
+	getDurableHistoryEvent?(width: number): DurableHistoryEvent | undefined;
+	getDurableHistoryEvents?(width: number): readonly DurableHistoryEvent[];
+	acknowledgeDurableHistoryEvent?(identity: string, revision: number): void;
 }
 
 /**
@@ -220,6 +235,12 @@ export class ToolExecutionComponent extends Container {
 	#spinnerAnimation?: AnimationRegistration;
 	// Track if args are still being streamed (for edit/write spinner)
 	#argsComplete = false;
+	#toolCallId: string | undefined;
+	#durableRevision = 0;
+	#durableAcknowledgedRevision = 0;
+	#pendingPreviewWork = 0;
+	#pendingImageWork = 0;
+	#imageConversionsInFlight = new Set<number>();
 	#renderState: {
 		spinnerFrame?: number;
 		expanded: boolean;
@@ -240,6 +261,11 @@ export class ToolExecutionComponent extends Container {
 		_toolCallId?: string,
 	) {
 		super();
+		// Keep accepting the historical cwd,id ordering while allowing the
+		// durable identity to be supplied in the first optional slot. Paths are
+		// unambiguous here because they contain a separator or begin with ".".
+		const cwdIsPath = cwd === "." || cwd.startsWith("./") || cwd.startsWith("../") || cwd.startsWith("/") || cwd.includes("\\");
+		this.#toolCallId = _toolCallId ?? (cwdIsPath ? undefined : cwd);
 		this.#toolName = toolName;
 		this.#toolLabel = tool?.label ?? toolName;
 		this.#showImages = options.showImages ?? true;
@@ -248,7 +274,7 @@ export class ToolExecutionComponent extends Container {
 		this.#hashlineAutoDropPureInsertDuplicates = options.hashlineAutoDropPureInsertDuplicates;
 		this.#tool = tool;
 		this.#ui = ui;
-		this.#cwd = cwd;
+		this.#cwd = _toolCallId === undefined && !cwdIsPath ? getProjectDir() : cwd;
 		this.#shareArgsWithRenderer = argsCanBeSharedWithRenderer(toolName, tool);
 		this.#lastArgsReference = args;
 		this.#args = this.#shareArgsWithRenderer ? args : cloneToolArgs(args);
@@ -274,9 +300,44 @@ export class ToolExecutionComponent extends Container {
 
 		this.#updateDisplay();
 		void this.#runPreviewDiff();
+		this.#bumpDurableRevision();
+	}
+	#bumpDurableRevision(): void {
+		this.#durableRevision += 1;
+	}
+
+	getDurableHistoryEvent(width: number): DurableHistoryEvent | undefined {
+		const identity = this.#toolCallId;
+		if (!identity) return undefined;
+
+		const safeWidth = Number.isFinite(width) && width > 0 ? Math.floor(width) : 1;
+		const snapshot = Object.freeze(this.render(safeWidth).slice());
+		return Object.freeze({
+			identity,
+			revision: this.#durableRevision,
+			final:
+				this.#argsComplete &&
+				!this.#isPartial &&
+				!this.#spinnerAnimation &&
+				this.#pendingPreviewWork === 0 &&
+				this.#pendingImageWork === 0,
+			snapshot,
+		});
+	}
+	getDurableHistoryEvents(width: number): readonly DurableHistoryEvent[] {
+		const event = this.getDurableHistoryEvent(width);
+		return event ? [event] : [];
+	}
+
+	acknowledgeDurableHistoryEvent(identity: string, revision: number): void {
+		if (identity !== this.#toolCallId) return;
+		if (!Number.isSafeInteger(revision) || revision <= 0 || revision > this.#durableRevision) return;
+		if (revision <= this.#durableAcknowledgedRevision) return;
+		this.#durableAcknowledgedRevision = revision;
 	}
 
 	updateArgs(args: any, _toolCallId?: string): void {
+		this.#bumpDurableRevision();
 		if (args !== this.#lastArgsReference) {
 			this.#lastArgsReference = args;
 			this.#argsIdentityVersion += 1;
@@ -292,6 +353,7 @@ export class ToolExecutionComponent extends Container {
 	 * This triggers an immediate final diff computation for edit-like tools.
 	 */
 	setArgsComplete(_toolCallId?: string): void {
+		this.#bumpDurableRevision();
 		this.#argsComplete = true;
 		this.#updateSpinnerAnimation();
 		void this.#runPreviewDiff();
@@ -327,6 +389,7 @@ export class ToolExecutionComponent extends Container {
 		this.#editDiffAbort?.abort();
 		const controller = new AbortController();
 		this.#editDiffAbort = controller;
+		this.#pendingPreviewWork += 1;
 
 		try {
 			const isStreaming = !this.#argsComplete;
@@ -347,6 +410,11 @@ export class ToolExecutionComponent extends Container {
 		} catch (err) {
 			if (controller.signal.aborted) return;
 			logger.warn("Edit preview diff failed", { tool: this.#toolName, error: String(err) });
+		} finally {
+			this.#pendingPreviewWork -= 1;
+			if (!controller.signal.aborted && this.#editDiffAbort === controller) {
+				this.#bumpDurableRevision();
+			}
 		}
 	}
 
@@ -359,6 +427,7 @@ export class ToolExecutionComponent extends Container {
 		isPartial = false,
 		_toolCallId?: string,
 	): void {
+		this.#bumpDurableRevision();
 		this.#textOutputCache = undefined;
 		this.#result = result;
 		this.#isPartial = isPartial;
@@ -400,6 +469,9 @@ export class ToolExecutionComponent extends Container {
 			// Skip if already PNG or already converted
 			if (img.mimeType === "image/png") continue;
 			if (this.#convertedImages.has(i)) continue;
+			if (this.#imageConversionsInFlight.has(i)) continue;
+			this.#imageConversionsInFlight.add(i);
+			this.#pendingImageWork += 1;
 
 			// Convert async - catch errors from processing
 			const index = i;
@@ -413,6 +485,11 @@ export class ToolExecutionComponent extends Container {
 				})
 				.catch(() => {
 					// Ignore conversion failures - display will use original image format
+				})
+				.finally(() => {
+					this.#imageConversionsInFlight.delete(index);
+					this.#pendingImageWork -= 1;
+					this.#bumpDurableRevision();
 				});
 		}
 	}
@@ -434,11 +511,13 @@ export class ToolExecutionComponent extends Container {
 				if (frameCount === 0) return;
 				this.#spinnerFrame = ((this.#spinnerFrame ?? -1) + 1) % frameCount;
 				this.#renderState.spinnerFrame = this.#spinnerFrame;
+				this.#bumpDurableRevision();
 				this.#ui.requestRender();
 			}, 80);
 		} else if (!needsSpinner && this.#spinnerAnimation) {
 			this.#spinnerAnimation.unregister();
 			this.#spinnerAnimation = undefined;
+			this.#bumpDurableRevision();
 		}
 	}
 
@@ -446,11 +525,13 @@ export class ToolExecutionComponent extends Container {
 	 * Stop spinner animation and cleanup resources.
 	 */
 	stopAnimation(): void {
+		const hadSpinner = !!this.#spinnerAnimation;
 		if (this.#spinnerAnimation) {
 			this.#spinnerAnimation.unregister();
 			this.#spinnerAnimation = undefined;
 			this.#spinnerFrame = undefined;
 		}
+		if (hadSpinner) this.#bumpDurableRevision();
 		this.#editDiffAbort?.abort();
 		this.#editDiffAbort = undefined;
 	}
@@ -462,7 +543,8 @@ export class ToolExecutionComponent extends Container {
 
 	/** Applies automatic expansion unless this renderer instance has an explicit fold choice. */
 	setExpanded(expanded: boolean): void {
-		if (this.#manuallyExpanded !== undefined) return;
+		if (this.#manuallyExpanded !== undefined || this.#expanded === expanded) return;
+		this.#bumpDurableRevision();
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}
@@ -472,12 +554,16 @@ export class ToolExecutionComponent extends Container {
 	 * Transcript rebuilds recreate components from global state and drop this pin.
 	 */
 	setManuallyExpanded(expanded: boolean): void {
+		if (this.#manuallyExpanded === expanded && this.#expanded === expanded) return;
+		this.#bumpDurableRevision();
 		this.#manuallyExpanded = expanded;
 		this.#expanded = expanded;
 		this.#updateDisplay();
 	}
 
 	setShowImages(show: boolean): void {
+		if (this.#showImages === show) return;
+		this.#bumpDurableRevision();
 		this.#showImages = show;
 		this.#textOutputCache = undefined;
 		this.#updateDisplay();
@@ -485,11 +571,13 @@ export class ToolExecutionComponent extends Container {
 
 	override invalidate(): void {
 		super.invalidate();
+		this.#bumpDurableRevision();
 		this.#updateDisplay();
 	}
 
 	override render(width: number): string[] {
 		if (this.#displayBuiltWithGraphicsFallback !== isTerminalGraphicsFallbackActive()) {
+			this.#bumpDurableRevision();
 			this.#updateDisplay();
 		}
 		return super.render(width);

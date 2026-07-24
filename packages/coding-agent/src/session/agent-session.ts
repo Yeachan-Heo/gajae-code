@@ -89,6 +89,7 @@ import type {
 	Usage,
 	UsageReport,
 } from "@gajae-code/ai";
+import type { TuiTransactionObservation } from "@gajae-code/tui";
 import {
 	classifyContextOverflow,
 	clearAnthropicFastModeFallback,
@@ -197,6 +198,7 @@ import { onAppendOnlyModeChanged } from "../config/settings";
 import type { SettingPath } from "../config/settings-schema";
 import { getDefault } from "../config/settings-schema";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
+import { TuiTransactionHistory } from "../debug/tui-transaction-history";
 import { loadCapability } from "../discovery";
 import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
 import { MAX_EDIT_FILE_BYTES } from "../edit/read-file";
@@ -515,6 +517,8 @@ export interface AgentSessionConfig {
 	onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	/** Per-session raw SSE diagnostic buffer */
 	rawSseDebugBuffer?: RawSseDebugBuffer;
+	/** Runtime-only shared TUI transaction metadata history. */
+	tuiTransactionHistory?: TuiTransactionHistory;
 	/** Current session message-to-LLM conversion pipeline */
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
@@ -1858,6 +1862,7 @@ export class AgentSession {
 	#fastModeAutoDisabledProviderKeys = new Set<string>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
+	readonly tuiTransactionHistory: TuiTransactionHistory;
 
 	#acquirePowerAssertion(): void {
 		if (process.platform !== "darwin") return;
@@ -2209,6 +2214,8 @@ export class AgentSession {
 		this.#recoveryHydrationContext = config.recoveryHydrationContext;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
 		this.#retainedMemorySampler = config.retainedMemorySampler;
+		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
+		this.tuiTransactionHistory = config.tuiTransactionHistory ?? new TuiTransactionHistory();
 		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
@@ -11104,6 +11111,10 @@ export class AgentSession {
 
 	setRetainedMemorySampler(sampler: (() => RetainedMemorySample) | undefined): void {
 		this.#retainedMemorySampler = sampler;
+	}
+
+	recordTuiTransactionObservation(observation: TuiTransactionObservation): void {
+		this.tuiTransactionHistory.record(observation, this.sessionManager.getSessionId());
 	}
 
 	#defaultResourceSample(): EmergencyCompactionSample {

@@ -1472,9 +1472,6 @@ export class SelectorController {
 					});
 				break;
 			}
-			case "clearOnShrink":
-				this.ctx.ui.setClearOnShrink(value as boolean);
-				break;
 
 			case "autocompleteMaxVisible":
 				this.ctx.editor.setAutocompleteMaxVisible(typeof value === "number" ? value : Number(value));

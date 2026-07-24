@@ -57,7 +57,6 @@ describe("EventController completion viewport", () => {
 		"GJC_TMUX_LAUNCHED",
 		"TERMUX_VERSION",
 		"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
-		"PI_CLEAR_ON_SHRINK",
 		"PI_TUI_VIRTUAL_VIEWPORT",
 	] as const;
 	let previousEnv = new Map<string, string | undefined>();
@@ -95,126 +94,123 @@ describe("EventController completion viewport", () => {
 		];
 
 		for (const testCase of cases) {
-			for (const clearOnShrink of [false, true]) {
-				const scenarioEnv = new Map(envKeys.map(key => [key, Bun.env[key]]));
-				for (const key of envKeys) delete Bun.env[key];
-				Object.assign(Bun.env, testCase.env);
-				Bun.env.GJC_NOTIFY = "off";
-				try {
-					if (testCase.nativeWindows) {
-						expect(shouldUseViewportRepaintForHost({}, "win32", { includeNativeWindows: true })).toBe(true);
-					}
-
-					const term = new VirtualTerminal(40, 18, { isProcessTerminal: true });
-					const ui = new TUI(term);
-					ui.setClearOnShrink(clearOnShrink);
-					const chatContainer = new Container();
-					const startMessage = assistantMessage("streaming assistant response");
-					const message = assistantMessage("final assistant response");
-					const anchorId = `assistant:test:${testCase.label}:${clearOnShrink}`;
-					associateSessionMessageViewportAnchorId(startMessage, anchorId);
-					const streamingComponent = new AssistantMessageComponent(startMessage, false, undefined, anchorId);
-					const split = new IrcSplitViewComponent(chatContainer, new IrcObservationLedger(), {
-						fg: (_color: "dim" | "accent", text: string) => text,
-						bold: (text: string) => text,
-						boxSharp: { vertical: "│" },
-					});
-					const pendingMessagesContainer = new Container();
-					const statusContainer = new Container();
-					statusContainer.addChild(new Text("working", 0, 0));
-					const todoContainer = new Container();
-					const btwContainer = new Container();
-					const statusLine = new Text("status", 0, 0);
-					const editor = new Text("editor", 0, 0);
-					ui.addChild(split);
-					ui.setViewportAnchorComponent(split);
-					ui.addChild(pendingMessagesContainer);
-					ui.addChild(statusContainer);
-					ui.addChild(todoContainer);
-					ui.addChild(btwContainer);
-					ui.addChild(statusLine);
-					ui.addChild(editor);
-					ui.setBottomPinnedComponent(statusLine);
-					const stopLoading = vi.fn();
-					const ctx = {
-						isInitialized: true,
-						ui,
-						chatContainer,
-						pendingMessagesContainer,
-						statusContainer,
-						todoContainer,
-						btwContainer,
-						statusLine,
-						editor: { getText: () => "" },
-						getUserMessageText: (userMessage: { content: string }) => userMessage.content,
-						streamingComponent,
-						streamingMessage: startMessage,
-						loadingAnimation: { stop: stopLoading },
-						pendingTools: new Map(),
-						planModeController: { flushPendingModelSwitch: async () => {} },
-						updateEditorTopBorder: () => {},
-						updateEditorBorderColor: () => {},
-						session: {
-							isTtsrAbortPending: false,
-							retryAttempt: 0,
-							isCompacting: true,
-							getLastAssistantMessage: () => message,
-						},
-						sessionManager: { getSessionName: () => "", getCwd: () => process.cwd() },
-						isBackgrounded: false,
-					} as unknown as InteractiveModeContext;
-					const uiHelpers = new UiHelpers(ctx);
-					for (let index = 0; index < 30; index++) {
-						uiHelpers.addMessageToChat({ role: "user", content: `history-${index}`, timestamp: index + 1 });
-					}
-					chatContainer.addChild(streamingComponent);
-					const controller = new EventController(ctx);
-					try {
-						ui.start();
-						await term.waitForRender();
-						expect(ui.scrollViewportPages(-1), `${testCase.label} clear=${clearOnShrink}`).toBe(true);
-						await term.flush();
-						if (testCase.resizeHeight !== undefined) {
-							term.resize(40, testCase.resizeHeight);
-							await term.waitForRender();
-						}
-						const before = term.getViewport().map(line => line.trimEnd());
-						const beforeHistory = before.flatMap((line, index) =>
-							line.includes("history-") ? [{ index, line }] : [],
-						);
-						expect(beforeHistory.length, JSON.stringify(before)).toBeGreaterThanOrEqual(3);
-						term.clearWriteLog();
-						await controller.handleEvent({ type: "message_end", message });
-						expect(getSessionMessageViewportAnchorId(message)).toBe(anchorId);
-						await term.waitForRender();
-						await controller.handleEvent({ type: "agent_end", messages: [message] });
-						await term.waitForRender();
-						expect(stopLoading, `${testCase.label} clear=${clearOnShrink}`).toHaveBeenCalledTimes(1);
-						expect(ctx.loadingAnimation, `${testCase.label} clear=${clearOnShrink}`).toBeUndefined();
-						expect(statusContainer.children, `${testCase.label} clear=${clearOnShrink}`).toHaveLength(0);
-						const after = term.getViewport().map(line => line.trimEnd());
-						for (const entry of beforeHistory) expect(after[entry.index]).toBe(entry.line);
-						const writes = term.getWriteLog().join("");
-						expect(writes).not.toContain("\x1b[2J\x1b[H");
-						expect(writes).not.toContain("\x1b[3J");
-						const visibleHistoryNumbers = beforeHistory.flatMap(entry => {
-							const match = /history-(\d+)/.exec(entry.line);
-							return match ? [Number(match[1])] : [];
-						});
-						const firstVisibleHistory = Math.min(...visibleHistoryNumbers);
-						for (let index = 0; index < firstVisibleHistory; index++) {
-							expect(writes).not.toMatch(new RegExp(`history-${index}(?!\\d)`));
-						}
-						term.clearWriteLog();
-						ui.requestRender();
-						await term.waitForRender();
-						expect(term.getWriteLog(), `${testCase.label} clear=${clearOnShrink} immediate no-op`).toEqual([]);
-					} finally {
-						ui.stop();
-					}
-				} finally {
-					restoreEnv(scenarioEnv);
+			const scenarioEnv = new Map(envKeys.map(key => [key, Bun.env[key]]));
+			for (const key of envKeys) delete Bun.env[key];
+			Object.assign(Bun.env, testCase.env);
+			Bun.env.GJC_NOTIFY = "off";
+			try {
+				if (testCase.nativeWindows) {
+					expect(shouldUseViewportRepaintForHost({}, "win32", { includeNativeWindows: true })).toBe(true);
 				}
+
+				const term = new VirtualTerminal(40, 18, { isProcessTerminal: true });
+				const ui = new TUI(term);
+				const chatContainer = new Container();
+				const startMessage = assistantMessage("streaming assistant response");
+				const message = assistantMessage("final assistant response");
+				const anchorId = `assistant:test:${testCase.label}`;
+				associateSessionMessageViewportAnchorId(startMessage, anchorId);
+				const streamingComponent = new AssistantMessageComponent(startMessage, false, undefined, anchorId);
+				const split = new IrcSplitViewComponent(chatContainer, new IrcObservationLedger(), {
+					fg: (_color: "dim" | "accent", text: string) => text,
+					bold: (text: string) => text,
+					boxSharp: { vertical: "│" },
+				});
+				const pendingMessagesContainer = new Container();
+				const statusContainer = new Container();
+				statusContainer.addChild(new Text("working", 0, 0));
+				const todoContainer = new Container();
+				const btwContainer = new Container();
+				const statusLine = new Text("status", 0, 0);
+				const editor = new Text("editor", 0, 0);
+				ui.addChild(split);
+				ui.setViewportAnchorComponent(split);
+				ui.addChild(pendingMessagesContainer);
+				ui.addChild(statusContainer);
+				ui.addChild(todoContainer);
+				ui.addChild(btwContainer);
+				ui.addChild(statusLine);
+				ui.addChild(editor);
+				ui.setBottomPinnedComponent(statusLine);
+				const stopLoading = vi.fn();
+				const ctx = {
+					isInitialized: true,
+					ui,
+					chatContainer,
+					pendingMessagesContainer,
+					statusContainer,
+					todoContainer,
+					btwContainer,
+					statusLine,
+					editor: { getText: () => "" },
+					getUserMessageText: (userMessage: { content: string }) => userMessage.content,
+					streamingComponent,
+					streamingMessage: startMessage,
+					loadingAnimation: { stop: stopLoading },
+					pendingTools: new Map(),
+					planModeController: { flushPendingModelSwitch: async () => {} },
+					updateEditorTopBorder: () => {},
+					updateEditorBorderColor: () => {},
+					session: {
+						isTtsrAbortPending: false,
+						retryAttempt: 0,
+						isCompacting: true,
+						getLastAssistantMessage: () => message,
+					},
+					sessionManager: { getSessionName: () => "", getCwd: () => process.cwd() },
+					isBackgrounded: false,
+				} as unknown as InteractiveModeContext;
+				const uiHelpers = new UiHelpers(ctx);
+				for (let index = 0; index < 30; index++) {
+					uiHelpers.addMessageToChat({ role: "user", content: `history-${index}`, timestamp: index + 1 });
+				}
+				chatContainer.addChild(streamingComponent);
+				const controller = new EventController(ctx);
+				try {
+					ui.start();
+					await term.waitForRender();
+					expect(ui.scrollViewportPages(-1), `${testCase.label}`).toBe(true);
+					await term.flush();
+					if (testCase.resizeHeight !== undefined) {
+						term.resize(40, testCase.resizeHeight);
+						await term.waitForRender();
+					}
+					const before = term.getViewport().map(line => line.trimEnd());
+					const beforeHistory = before.flatMap((line, index) =>
+						line.includes("history-") ? [{ index, line }] : [],
+					);
+					expect(beforeHistory.length, JSON.stringify(before)).toBeGreaterThanOrEqual(3);
+					term.clearWriteLog();
+					await controller.handleEvent({ type: "message_end", message });
+					expect(getSessionMessageViewportAnchorId(message)).toBe(anchorId);
+					await term.waitForRender();
+					await controller.handleEvent({ type: "agent_end", messages: [message] });
+					await term.waitForRender();
+					expect(stopLoading, `${testCase.label}`).toHaveBeenCalledTimes(1);
+					expect(ctx.loadingAnimation, `${testCase.label}`).toBeUndefined();
+					expect(statusContainer.children, `${testCase.label}`).toHaveLength(0);
+					const after = term.getViewport().map(line => line.trimEnd());
+					for (const entry of beforeHistory) expect(after[entry.index]).toBe(entry.line);
+					const writes = term.getWriteLog().join("");
+					expect(writes).not.toContain("\x1b[2J\x1b[H");
+					expect(writes).not.toContain("\x1b[3J");
+					const visibleHistoryNumbers = beforeHistory.flatMap(entry => {
+						const match = /history-(\d+)/.exec(entry.line);
+						return match ? [Number(match[1])] : [];
+					});
+					const firstVisibleHistory = Math.min(...visibleHistoryNumbers);
+					for (let index = 0; index < firstVisibleHistory; index++) {
+						expect(writes).not.toMatch(new RegExp(`history-${index}(?!\\d)`));
+					}
+					term.clearWriteLog();
+					ui.requestRender();
+					await term.waitForRender();
+					expect(term.getWriteLog(), `${testCase.label} immediate no-op`).toEqual([]);
+				} finally {
+					ui.stop();
+				}
+			} finally {
+				restoreEnv(scenarioEnv);
 			}
 		}
 	});

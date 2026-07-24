@@ -57,8 +57,6 @@ describe("TUI terminal-state regressions", () => {
 		"ZELLIJ",
 		"GJC_TMUX_LAUNCHED",
 		"TERMUX_VERSION",
-		"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
-		"PI_CLEAR_ON_SHRINK",
 		"PI_TUI_VIRTUAL_VIEWPORT",
 	] as const;
 	let previousHostEnv = new Map<string, string | undefined>();
@@ -136,7 +134,6 @@ describe("TUI terminal-state regressions", () => {
 			const term = new VirtualTerminal(40, 10);
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(["A", "B", "C", "D", "E"]);
-			tui.setClearOnShrink(true);
 			tui.addChild(component);
 
 			try {
@@ -162,7 +159,6 @@ describe("TUI terminal-state regressions", () => {
 			const term = new VirtualTerminal(20, 5);
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(rows("row-", 10));
-			tui.setClearOnShrink(false);
 			tui.addChild(component);
 
 			try {
@@ -180,11 +176,10 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
-		it("clears row 0 when content shrinks to empty without clearOnShrink", async () => {
+		it("clears row 0 when content shrinks to empty", async () => {
 			const term = new VirtualTerminal(40, 10);
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(["A"]);
-			tui.setClearOnShrink(false);
 			tui.addChild(component);
 
 			try {
@@ -217,13 +212,75 @@ describe("TUI terminal-state regressions", () => {
 					await settle(term);
 					term.clearWriteLog();
 					component.setLines(rows("line-", 8));
-					tui.setClearOnShrink(true);
 					tui.requestRender();
 					await settle(term);
 					expect(visible(term)).toEqual(["line-3", "line-4", "line-5", "line-6", "line-7"]);
 					expect(term.getWriteLog().join("")).not.toContain("\x1b[2J\x1b[H");
 				} finally {
 					tui.stop();
+				}
+			});
+		});
+		describe("forced render lifecycle", () => {
+			it("does not replay an overflow transcript after a viewport-safe force and ordinary no-op", async () => {
+				Bun.env.PI_TUI_VIRTUAL_VIEWPORT = "1";
+				const term = new VirtualTerminal(24, 5, { isProcessTerminal: true });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(rows("line-", 12));
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					term.clearWriteLog();
+					tui.requestRender(true, "test.overflow.force");
+					await settle(term);
+
+					term.clearWriteLog();
+					tui.requestRender(false, "test.overflow.noop");
+					await settle(term);
+
+					const writes = term.getWriteLog().join("");
+					expect(writes).not.toContain("line-0");
+					expect(writes).not.toContain("\x1b[2J\x1b[H");
+
+					const scrollback = term.getScrollBuffer();
+					for (let i = 0; i < 12; i++) {
+						expect(countMatches(scrollback, new RegExp(`\\bline-${i}\\b`))).toBe(1);
+					}
+				} finally {
+					tui.stop();
+				}
+			});
+
+			it("keeps the final stream row intact when the shell writes after a transient viewport paint", async () => {
+				const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(rows("stream-", 8));
+				tui.addChild(component);
+				let stopped = false;
+
+				try {
+					tui.start();
+					await settle(term);
+
+					component.setLines([...rows("stream-", 9), "FINAL_STREAM_ROW"]);
+					tui.requestRender(true, "test.transient.final-stream");
+					await settle(term);
+
+					tui.stop();
+					stopped = true;
+					term.write("SHELL_MARKER");
+					await term.flush();
+
+					const scrollback = term.getScrollBuffer().map(line => line.trim());
+					const finalRow = scrollback.lastIndexOf("FINAL_STREAM_ROW");
+					const shellMarker = scrollback.lastIndexOf("SHELL_MARKER");
+					expect(finalRow).toBeGreaterThanOrEqual(0);
+					expect(shellMarker).toBeGreaterThan(finalRow);
+				} finally {
+					if (!stopped) tui.stop();
 				}
 			});
 		});
@@ -255,10 +312,11 @@ describe("TUI terminal-state regressions", () => {
 	});
 
 	describe("resize + viewport behavior", () => {
-		it("clears preexisting shell rows on startup and resize redraw", async () => {
+		it("preserves preexisting shell rows without startup clear", async () => {
 			const term = new VirtualTerminal(50, 5);
 			term.write("shell-0\r\nshell-1\r\nshell-2\r\nshell-3\r\nshell-4\r\n");
 			await settle(term);
+			term.clearWriteLog();
 
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(rows("ui-", 8));
@@ -272,7 +330,10 @@ describe("TUI terminal-state regressions", () => {
 				await settle(term);
 
 				const buffer = term.getScrollBuffer().join("\n");
-				expect(buffer.includes("shell-")).toBeFalsy();
+				expect(buffer).toContain("shell-");
+				const writes = term.getWriteLog().join("");
+				expect(writes).not.toContain("\x1b[2J");
+				expect(writes).not.toContain("\x1b[3J");
 			} finally {
 				tui.stop();
 			}
@@ -761,7 +822,6 @@ describe("TUI terminal-state regressions", () => {
 	describe("scrollback integrity", () => {
 		it("repaints only the visible viewport for offscreen changes in tmux", async () => {
 			Bun.env.TMUX = "1";
-			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 
 			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
@@ -792,39 +852,9 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
-		it("keeps a legacy full-render kill switch for multiplexer viewport repaint", async () => {
-			Bun.env.TMUX = "1";
-			Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER = "1";
-
-			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
-			const tui = new TUI(term);
-			const lines = rows("line-", 80);
-			const component = new MutableLinesComponent(lines);
-			tui.addChild(component);
-
-			try {
-				tui.start();
-				await settle(term);
-
-				term.clearWriteLog();
-				const nextLines = [...lines];
-				nextLines[0] = "updated-offscreen-header";
-				component.setLines(nextLines);
-				tui.requestRender();
-				await settle(term);
-
-				const writes = term.getWriteLog().join("");
-				expect(writes).toContain("\x1b[2J\x1b[H");
-				expect(writes).not.toContain("\x1b[3J");
-				expect(writes).toContain("updated-offscreen-header");
-			} finally {
-				tui.stop();
-			}
-		});
 
 		it("refreshes newly visible rows after a tmux height increase", async () => {
 			Bun.env.TMUX = "1";
-			delete Bun.env.PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER;
 
 			const term = new VirtualTerminal(32, 5, { isProcessTerminal: true });
 			const tui = new TUI(term);
@@ -949,6 +979,54 @@ describe("TUI terminal-state regressions", () => {
 					const prev = Number.parseInt(viewport[i - 1]!.slice(5), 10);
 					const next = Number.parseInt(viewport[i]!.slice(5), 10);
 					expect(next - prev).toBe(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+		it("keeps numbered streaming rows durable when offscreen history mutates during viewport repaint", async () => {
+			const term = new VirtualTerminal(36, 6, { isProcessTerminal: true });
+			const tui = new TUI(term);
+			const history = new MutableLinesComponent(rows("history-", 8));
+			const streamRows = ["stream-0"];
+			const stream = new MutableLinesComponent(streamRows);
+			const footer = new MutableLinesComponent(["FOOTER_MARKER"]);
+			tui.addChild(history);
+			tui.addChild(stream);
+			tui.addChild(footer);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				for (let i = 1; i <= 32; i++) {
+					history.setLines([`history-mutated-${i}`, ...rows("history-", 7)]);
+					streamRows.push(`stream-${i}`);
+					stream.setLines(streamRows);
+					term.clearWriteLog();
+					tui.requestRender(false, "test.offscreen-history-stream");
+					await settle(term);
+
+					const writes = term.getWriteLog().join("");
+					expect(writes).toContain("FOOTER_MARKER");
+					expect(writes).not.toContain(`history-mutated-${i}`);
+
+					const viewport = visible(term);
+					expect(viewport.filter(line => line.trim() === "FOOTER_MARKER")).toHaveLength(1);
+
+					const scrollback = term.getScrollBuffer();
+					expect(scrollback.filter(line => line.trim() === "FOOTER_MARKER")).toHaveLength(1);
+					for (const label of streamRows) {
+						expect(scrollback.filter(line => line.trim() === label), `${label} should appear exactly once`).toHaveLength(1);
+					}
+				}
+
+				const scrollback = term.getScrollBuffer();
+				let previousPosition = -1;
+				for (const label of streamRows) {
+					const position = scrollback.findIndex(line => line.trim() === label);
+					expect(position).toBeGreaterThan(previousPosition);
+					previousPosition = position;
 				}
 			} finally {
 				tui.stop();
@@ -1129,7 +1207,6 @@ describe("TUI terminal-state regressions", () => {
 		it("all cursor sequences fall inside BSU/ESU brackets on deleted-lines render", async () => {
 			const term = new VirtualTerminal(40, 10);
 			const tui = new TUI(term);
-			tui.setClearOnShrink(true);
 
 			const component = new MutableLinesComponent(["A", "B", "C", "D"]);
 			tui.addChild(component);

@@ -177,6 +177,9 @@ describe("G011 batched text natives red-team", () => {
 		const width = 18;
 		const term = new VirtualTerminal(width, 8);
 		const image = `${ImageProtocol.Kitty}a=T,f=100;${"Q".repeat(64)}\x1b\\`;
+		term.write("existing terminal state\r\n");
+		await term.flush();
+		term.clearWriteLog();
 		const lines = [
 			"ascii short",
 			"中文中文中文中文中文 overflow",
@@ -186,13 +189,16 @@ describe("G011 batched text natives red-team", () => {
 			"thai กำลังทดสอบยาวมาก",
 		];
 		const expectedPayload = lines.map(line => renderedLineReference(line, width)).join("\r\n");
-		const expectedFullWrite = `\x1b[?2004h\x1b[?25l\x1b[16t\x1b[?2026h\x1b[2J\x1b[H\x1b[3J${expectedPayload}\x1b[?25l\x1b[?2026l`;
+		const expectedFullWrite = `\x1b[?2004h\x1b[?25l\x1b[16t\x1b[?2026h${expectedPayload}\x1b[?25l\x1b[?2026l`;
 		const tui = new TUI(term);
 		try {
 			tui.addChild(new FixedLines(lines));
 			tui.start();
 			await settle(term);
 			const actual = term.getWriteLog().join("");
+			expect(actual).not.toContain("\x1b[2J");
+			expect(actual).not.toContain("\x1b[3J");
+			expect(term.getScrollBuffer().some(line => line.includes("existing terminal state"))).toBe(true);
 			const diffAt = findFirstDiff(actual, expectedFullWrite);
 			record({
 				id: "FRAME-PARITY",

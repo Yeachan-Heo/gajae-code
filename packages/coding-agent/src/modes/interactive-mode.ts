@@ -511,7 +511,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui = new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"), {
 			enableMouse: settings.get("mouse.enabled"),
 		});
-		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
+		this.ui.setTransactionObserver(observation => {
+			this.session.recordTuiTransactionObservation(observation);
+			if (observation.classification === "shared" && observation.outcome === "accepted") {
+				this.#eventController.acknowledgeAcceptedRenderEvent(this.ui.terminal.columns);
+			}
+		});
 		this.chatContainer = new Container();
 		this.#ircSplitView = new IrcSplitViewComponent(this.chatContainer, this.ircLedger, () => theme);
 		this.pendingMessagesContainer = new Container();
@@ -1313,6 +1318,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#petUnavailableWarningDisposer = undefined;
 		this.petWidget?.dispose();
 		this.petWidget = undefined;
+		this.ui.setTransactionObserver(undefined);
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;

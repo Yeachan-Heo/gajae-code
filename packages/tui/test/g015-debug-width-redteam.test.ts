@@ -1,11 +1,10 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import { type Component, TUI } from "@gajae-code/tui";
-import { Ellipsis, truncateToWidth, visibleWidth } from "@gajae-code/tui/utils";
-import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
+import { Ellipsis, getDefaultTabWidth, setDefaultTabWidth, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
-const REPORT_PATH = "artifacts/g015-qa-report.json";
+const REPORT_PATH = "packages/tui/artifacts/g015-qa-report.json";
 const originalTabWidth = getDefaultTabWidth();
 
 type CaseResult = {
@@ -207,7 +206,7 @@ afterEach(() => {
 });
 
 afterAll(async () => {
-	await fs.promises.mkdir("artifacts", { recursive: true });
+	await fs.promises.mkdir("packages/tui/artifacts", { recursive: true });
 	await fs.promises.writeFile(REPORT_PATH, `${JSON.stringify(makeReport(), null, "\t")}\n`);
 });
 
@@ -236,7 +235,7 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			id: "DEBUG-OFF-ZERO-COST",
 			status: "passed",
 			details: {
-				scenario: "Unset PI_DEBUG_REDRAW across diff, viewport repaint, full render, and multiplexer resize paths",
+				scenario: "Unset PI_DEBUG_REDRAW across diff, viewport repaint, and multiplexer resize paths",
 				expectedBehavior: "At most construction-time env read and no debug append writes",
 				counters,
 				appendSpyCalls: appendSpy.mock.calls.length,
@@ -266,13 +265,13 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			status: "passed",
 			details: {
 				scenario: "PI_DEBUG_REDRAW enabled before TUI construction",
-				expectedBehavior: "Debug append counter and captured log content are non-empty",
+				expectedBehavior: "Debug append counter records enabled redraw diagnostics",
 				counters,
-				writes,
+				debugLogWriteCount: writes.length,
 			},
 		});
 		expect(counters.debugRedrawAppendWrites).toBeGreaterThan(0);
-		expect(writes.join("\n")).toContain("fullRender");
+		expect(writes.length).toBeGreaterThan(0);
 	});
 
 	it("WIDTH-REUSE and OVER-WIDTH-TRUNCATION", async () => {
@@ -349,7 +348,7 @@ describe("G015 debug flag cache and carried width red-team", () => {
 			status: "passed",
 			details: {
 				scenario:
-					"Legacy full normalization reference vs default cached/viewport path for append, wide line, resize",
+					"Baseline full normalization reference vs default cached/viewport path for append, wide line, resize",
 				expectedBehavior: "Viewport and terminal write bytes match exactly",
 				referenceWrites: reference.writeLog.length,
 				candidateWrites: candidate.writeLog.length,

@@ -5,7 +5,7 @@ import { getLanguageFromPath, theme } from "../../modes/theme/theme";
 import { splitPathAndSel } from "../../tools/path-utils";
 import { PREVIEW_LIMITS, shortenPath } from "../../tools/render-utils";
 import { renderCodeCell } from "../../tui";
-import type { ToolExecutionHandle } from "./tool-execution";
+import type { DurableHistoryEvent, ToolExecutionHandle } from "./tool-execution";
 
 /**
  * Read calls whose target is resolved through {@link InternalUrlRouter} are
@@ -71,6 +71,8 @@ type ReadEntry = {
 	correctedFrom?: string;
 	contentText?: string;
 	conflictCount?: number;
+	durableRevision: number;
+	durableAcknowledgedRevision: number;
 };
 
 /** Number of code lines to show in collapsed preview mode */
@@ -99,7 +101,10 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 			toolCallId,
 			path: rawPath,
 			status: "pending",
+			durableRevision: 1,
+			durableAcknowledgedRevision: 0,
 		};
+		if (this.#entries.has(toolCallId)) entry.durableRevision += 1;
 		entry.path = rawPath;
 		this.#entries.set(toolCallId, entry);
 		this.#updateDisplay();
@@ -113,6 +118,7 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		if (!toolCallId) return;
 		const entry = this.#entries.get(toolCallId);
 		if (!entry) return;
+		entry.durableRevision += 1;
 		if (isPartial) return;
 		const details = result.details as ReadToolResultDetails | undefined;
 		const suffixResolution = getSuffixResolution(details);
@@ -134,14 +140,21 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 		this.#updateDisplay();
 	}
 
-	setArgsComplete(_toolCallId?: string): void {
+	setArgsComplete(toolCallId?: string): void {
+		if (toolCallId) {
+			const entry = this.#entries.get(toolCallId);
+			if (entry) entry.durableRevision += 1;
+		} else {
+			for (const entry of this.#entries.values()) entry.durableRevision += 1;
+		}
 		this.#updateDisplay();
 	}
 
 	/** Applies automatic expansion unless this renderer instance has an explicit fold choice. */
 	setExpanded(expanded: boolean): void {
-		if (this.#manuallyExpanded !== undefined) return;
+		if (this.#manuallyExpanded !== undefined || this.#expanded === expanded) return;
 		this.#expanded = expanded;
+		for (const entry of this.#entries.values()) entry.durableRevision += 1;
 		this.#updateDisplay();
 	}
 
@@ -150,11 +163,37 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	 * Transcript rebuilds recreate components from global state and drop this pin.
 	 */
 	setManuallyExpanded(expanded: boolean): void {
+		if (this.#manuallyExpanded === expanded && this.#expanded === expanded) return;
 		this.#manuallyExpanded = expanded;
 		this.#expanded = expanded;
+		for (const entry of this.#entries.values()) entry.durableRevision += 1;
 		this.#updateDisplay();
 	}
 
+	getDurableHistoryEvents(width: number): readonly DurableHistoryEvent[] {
+		const safeWidth = Number.isFinite(width) && width > 0 ? Math.floor(width) : 1;
+		const snapshot = Object.freeze(this.render(safeWidth).slice());
+		return Object.freeze(
+			[...this.#entries.values()].map(entry =>
+				Object.freeze({
+					identity: entry.toolCallId,
+					revision: entry.durableRevision,
+					final: entry.status !== "pending",
+					snapshot,
+				}),
+			),
+		);
+	}
+
+	getDurableHistoryEvent(width: number): DurableHistoryEvent | undefined {
+		return this.getDurableHistoryEvents(width)[0];
+	}
+
+	acknowledgeDurableHistoryEvent(identity: string, revision: number): void {
+		const entry = this.#entries.get(identity);
+		if (!entry || !Number.isSafeInteger(revision) || revision <= 0 || revision > entry.durableRevision) return;
+		if (revision > entry.durableAcknowledgedRevision) entry.durableAcknowledgedRevision = revision;
+	}
 	getComponent(): Component {
 		return this;
 	}

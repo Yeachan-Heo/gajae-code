@@ -191,6 +191,26 @@ describe("ReadToolGroupComponent", () => {
 		new InputController(ctx).setToolsExpanded(true);
 		expect(legacy.setExpanded).toHaveBeenCalledWith(true);
 	});
+	it("keeps grouped read durable identities and finality independent per entry", () => {
+		const component = new ReadToolGroupComponent();
+		component.updateArgs({ path: "/tmp/one.ts" }, "read-1");
+		component.updateArgs({ path: "/tmp/two.ts" }, "read-2");
+
+		const initial = component.getDurableHistoryEvents(100);
+		expect(initial.map(event => event.identity)).toEqual(["read-1", "read-2"]);
+		expect(initial.every(event => !event.final)).toBe(true);
+
+		component.updateResult({ content: [{ type: "text", text: "one" }] }, false, "read-1");
+		const updated = component.getDurableHistoryEvents(100);
+		expect(updated[0]?.identity).toBe("read-1");
+		expect(updated[0]?.revision).toBeGreaterThan(initial[0]!.revision);
+		expect(updated[0]?.final).toBe(true);
+		expect(updated[1]?.identity).toBe("read-2");
+		expect(updated[1]?.final).toBe(false);
+
+		component.acknowledgeDurableHistoryEvent("read-1", updated[0]!.revision);
+		expect(component.getDurableHistoryEvent(100)?.identity).toBe("read-1");
+	});
 });
 
 describe("readArgsTargetInternalUrl", () => {

@@ -926,15 +926,6 @@ export const SETTINGS_SCHEMA = {
 		ui: { tab: "appearance", label: "Show Hardware Cursor", description: "Show terminal cursor for IME support" },
 	},
 
-	clearOnShrink: {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "appearance",
-			label: "Clear on Shrink",
-			description: "Clear empty rows when content shrinks (may cause flicker)",
-		},
-	},
 
 	// ────────────────────────────────────────────────────────────────────────
 	// Model

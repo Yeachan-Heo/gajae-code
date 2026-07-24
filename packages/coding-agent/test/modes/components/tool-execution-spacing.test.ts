@@ -102,3 +102,64 @@ it("replaces generic SIXEL output while the IRC sidebar is visible and restores 
 	split.setVisible(false);
 	expect(split.render(120).join("\n")).toContain(sixel);
 });
+
+describe("ToolExecutionComponent durable lifecycle", () => {
+	it("keeps the tool identity stable while revisions advance to a final event", () => {
+		const component = new ToolExecutionComponent(
+			"custom",
+			{ path: "/tmp/example.ts" },
+			{},
+			undefined,
+			uiStub,
+			"tool-call-1",
+		);
+
+		const initial = component.getDurableHistoryEvent(80)!;
+		expect(initial.identity).toBe("tool-call-1");
+		expect(initial.revision).toBeGreaterThan(0);
+		expect(initial.final).toBe(false);
+
+		component.updateArgs({ path: "/tmp/example.ts", content: "updated" }, "different-call-id");
+		const streaming = component.getDurableHistoryEvent(80)!;
+		expect(streaming.identity).toBe(initial.identity);
+		expect(streaming.revision).toBeGreaterThan(initial.revision);
+		expect(streaming.final).toBe(false);
+
+		component.setArgsComplete("different-call-id");
+		const argsComplete = component.getDurableHistoryEvent(80)!;
+		expect(argsComplete.identity).toBe(initial.identity);
+		expect(argsComplete.revision).toBeGreaterThan(streaming.revision);
+		expect(argsComplete.final).toBe(false);
+
+		component.updateResult({ content: [{ type: "text", text: "done" }] }, false, "different-call-id");
+		const completed = component.getDurableHistoryEvent(80)!;
+		expect(completed.identity).toBe(initial.identity);
+		expect(completed.revision).toBeGreaterThan(argsComplete.revision);
+		expect(completed.final).toBe(true);
+		expect(completed.snapshot.join("\n")).toContain("done");
+	});
+
+	it("does not emit a durable event without a tool call identity", () => {
+		const component = new ToolExecutionComponent("custom", {}, {}, undefined, uiStub);
+
+		expect(component.getDurableHistoryEvent(80)).toBeUndefined();
+	});
+
+	it("ignores invalid or foreign acknowledgements without changing the durable revision", () => {
+		const component = new ToolExecutionComponent("custom", {}, {}, undefined, uiStub, "tool-call-2");
+		const event = component.getDurableHistoryEvent(80)!;
+
+		component.acknowledgeDurableHistoryEvent("other-call", event.revision);
+		component.acknowledgeDurableHistoryEvent("tool-call-2", 0);
+		component.acknowledgeDurableHistoryEvent("tool-call-2", event.revision + 1);
+
+		const afterInvalidAcks = component.getDurableHistoryEvent(80)!;
+		expect(afterInvalidAcks.identity).toBe(event.identity);
+		expect(afterInvalidAcks.revision).toBe(event.revision);
+		expect(afterInvalidAcks.final).toBe(false);
+
+		component.acknowledgeDurableHistoryEvent("tool-call-2", event.revision);
+		const afterValidAck = component.getDurableHistoryEvent(80)!;
+		expect(afterValidAck).toEqual(event);
+	});
+});

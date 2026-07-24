@@ -77,6 +77,12 @@ export interface Terminal {
 	// Enable or disable opt-in SGR mouse reporting. Implementations that do not
 	// own a real terminal may ignore this.
 	setMouseEnabled?(enabled: boolean): void;
+	/**
+	 * Register a bounded terminal response parser before sending a query.
+	 * Implementations with a shared stdin response registry consume matching
+	 * frames before forwarding remaining bytes to TUI input listeners.
+	 */
+	registerResponse?<T>(request: TerminalResponseRequest<T>): (() => void) | undefined;
 
 	/**
 	 * Drain stdin before exiting to prevent Kitty key release events from
@@ -179,8 +185,222 @@ const stdoutErrorSubscribers = new Set<(err: Error) => void>();
 export function __stdoutErrorSubscriberCountForTests(): number {
 	return stdoutErrorSubscribers.size;
 }
+export interface TerminalResponseFrame<T> {
+	start: number;
+	end: number;
+	value: T;
+}
+
+export interface TerminalResponseParse<T> {
+	frame?: TerminalResponseFrame<T>;
+	partialStart?: number;
+}
+
+export interface TerminalResponseRequest<T> {
+	/** Stable request identity; used by callers to correlate a completion. */
+	id: string;
+	/** Higher-priority requests win when two framers start at the same byte. */
+	priority?: number;
+	/** Parses the currently buffered bytes without mutating the input. */
+	parse(buffer: string): TerminalResponseParse<T>;
+	/** Called exactly once when a complete frame is consumed. */
+	onComplete(value: T, frame: string): void;
+	/** Called when the request expires before a complete frame arrives. */
+	onExpire?: () => void;
+	/** Maximum time this request may remain armed. */
+	expiresInMs?: number;
+}
+
+export interface TerminalResponseRegistryOptions {
+	maxBytes?: number;
+	onForward?: (data: string) => void;
+}
+interface TerminalResponseRegistryEntry {
+	request: TerminalResponseRequest<unknown>;
+	serial: number;
+	timer?: Timer;
+}
+/**
+ * Serializes terminal probe response consumption.
+ *
+ * A response is consumed only after its request is armed and its framer has
+ * produced a complete frame. Bytes before an armed frame, interrupted partial
+ * frames, expired buffers, and over-limit buffers are returned unchanged.
+ */
+export class TerminalResponseRegistry {
+	#buffer = "";
+	#serial = 0;
+	#maxBytes: number;
+	#onForward?: (data: string) => void;
+	#requests: TerminalResponseRegistryEntry[] = [];
+
+	constructor(options: TerminalResponseRegistryOptions = {}) {
+		this.#maxBytes = Math.max(1, Math.trunc(options.maxBytes ?? 4096));
+		this.#onForward = options.onForward;
+	}
+
+	arm<T>(request: TerminalResponseRequest<T>): () => void {
+		for (const entry of [...this.#requests]) {
+			if (entry.request.id === request.id) this.#remove(entry);
+		}
+		const entry: TerminalResponseRegistryEntry = {
+			request: request as TerminalResponseRequest<unknown>,
+			serial: this.#serial++,
+		};
+		this.#requests.push(entry);
+		if (request.expiresInMs !== undefined && request.expiresInMs > 0) {
+			entry.timer = setTimeout(() => {
+				this.#remove(entry);
+				this.#emit(this.#drain());
+				request.onExpire?.();
+			}, request.expiresInMs);
+			entry.timer.unref?.();
+		}
+		return () => this.#remove(entry);
+	}
+
+	/** Feed one decoded stdin chunk and return bytes that remain user input. */
+	consume(data: string): string {
+		if (data.length === 0) return "";
+		this.#buffer += data;
+		if (this.#buffer.length > this.#maxBytes) {
+			const forwarded = this.#buffer;
+			this.#buffer = "";
+			this.#clearRequests();
+			this.#emit(forwarded);
+			return forwarded;
+		}
+		return this.#drain();
+	}
+
+	/** Forward and clear all buffered bytes, disarming every request. */
+	stop(): string {
+		this.#clearRequests();
+		const forwarded = this.#buffer;
+		this.#buffer = "";
+		this.#emit(forwarded);
+		return forwarded;
+	}
+	disarm(id: string): void {
+		for (const entry of [...this.#requests]) {
+			if (entry.request.id === id) this.#remove(entry);
+		}
+	}
+
+	get pendingCount(): number {
+		return this.#requests.length;
+	}
+
+	#drain(): string {
+		let forwarded = "";
+		for (;;) {
+			if (this.#buffer.length === 0) break;
+			const complete: Array<{
+				entry: TerminalResponseRegistryEntry;
+				frame: TerminalResponseFrame<unknown>;
+			}> = [];
+			let partialStart: number | undefined;
+			for (const entry of this.#requests) {
+				const parsed = entry.request.parse(this.#buffer);
+				if (
+					parsed.frame &&
+					parsed.frame.start >= 0 &&
+					parsed.frame.end > parsed.frame.start &&
+					parsed.frame.end <= this.#buffer.length
+				) {
+					complete.push({ entry, frame: parsed.frame });
+				} else if (
+					parsed.partialStart !== undefined &&
+					parsed.partialStart >= 0 &&
+					parsed.partialStart < this.#buffer.length
+				) {
+					partialStart =
+						partialStart === undefined ? parsed.partialStart : Math.min(partialStart, parsed.partialStart);
+				}
+			}
+			if (partialStart !== undefined && complete.length > 0) {
+				const earliestCompleteStart = Math.min(...complete.map(candidate => candidate.frame.start));
+				const nextEscape = this.#buffer.indexOf("\x1b", partialStart + 1);
+				if (nextEscape > partialStart && nextEscape <= earliestCompleteStart) {
+					forwarded += this.#buffer.slice(0, nextEscape);
+					this.#buffer = this.#buffer.slice(nextEscape);
+					continue;
+				}
+			}
+			if (complete.length > 0) {
+				complete.sort(
+					(a, b) =>
+						a.frame.start - b.frame.start ||
+						(b.entry.request.priority ?? 0) - (a.entry.request.priority ?? 0) ||
+						a.entry.serial - b.entry.serial,
+				);
+				const selected = complete[0]!;
+				forwarded += this.#buffer.slice(0, selected.frame.start);
+				const frameText = this.#buffer.slice(selected.frame.start, selected.frame.end);
+				this.#buffer = this.#buffer.slice(selected.frame.end);
+				this.#remove(selected.entry);
+				selected.entry.request.onComplete(selected.frame.value, frameText);
+				continue;
+			}
+			if (partialStart !== undefined) {
+				forwarded += this.#buffer.slice(0, partialStart);
+				this.#buffer = this.#buffer.slice(partialStart);
+				const nextEscape = this.#buffer.indexOf("\x1b", 1);
+				if (nextEscape > 0) {
+					forwarded += this.#buffer.slice(0, nextEscape);
+					this.#buffer = this.#buffer.slice(nextEscape);
+					continue;
+				}
+				break;
+			}
+			forwarded += this.#buffer;
+			this.#buffer = "";
+			break;
+		}
+		return forwarded;
+	}
+
+	#emit(data: string): void {
+		if (data) this.#onForward?.(data);
+	}
+
+	#remove(entry: TerminalResponseRegistryEntry): void {
+		const index = this.#requests.indexOf(entry);
+		if (index < 0) return;
+		this.#requests.splice(index, 1);
+		if (entry.timer) clearTimeout(entry.timer);
+	}
+
+	#clearRequests(): void {
+		for (const entry of this.#requests) {
+			if (entry.timer) clearTimeout(entry.timer);
+		}
+		this.#requests = [];
+	}
+}
 export function __stdoutErrorDispatcherInstalledForTests(): boolean {
 	return process.stdout.listeners("error").includes(dispatchStdoutError);
+}
+
+function regexResponseParser<T>(
+	completePattern: RegExp,
+	partialPattern: RegExp,
+	map: (match: RegExpExecArray) => T,
+): (buffer: string) => TerminalResponseParse<T> {
+	return (buffer: string): TerminalResponseParse<T> => {
+		const complete = completePattern.exec(buffer);
+		const partial = partialPattern.exec(buffer);
+		if (complete && (partial === null || complete.index <= partial.index)) {
+			return {
+				frame: {
+					start: complete.index,
+					end: complete.index + complete[0].length,
+					value: map(complete),
+				},
+			};
+		}
+		return partial ? { partialStart: partial.index } : {};
+	};
 }
 const dispatchStdoutError = (err: Error): void => {
 	for (const subscriber of stdoutErrorSubscribers) subscriber(err);
@@ -207,6 +427,7 @@ export class ProcessTerminal implements Terminal {
 	#modifyOtherKeysActive = false;
 	#modifyOtherKeysTimeout?: Timer;
 	#stdinBuffer?: StdinBuffer;
+	#responseRegistry?: TerminalResponseRegistry;
 	#stdinDataHandler?: (data: string | Buffer) => void;
 	#dead = false;
 	#writeLogPath = $pickenv("GJC_TUI_WRITE_LOG", "PI_TUI_WRITE_LOG") || "";
@@ -218,8 +439,6 @@ export class ProcessTerminal implements Terminal {
 	#appearance: TerminalAppearance | undefined;
 	#osc11Pending = false;
 	#osc11QueryQueued = false;
-	#osc11ResponseBuffer = "";
-	#privateCsiResponseBuffer = "";
 	#pendingDa1Sentinels = 0;
 	#osc11PollTimer?: Timer;
 	#mode2031DebounceTimer?: Timer;
@@ -237,6 +456,10 @@ export class ProcessTerminal implements Terminal {
 
 	get appearance(): TerminalAppearance | undefined {
 		return this.#appearance;
+	}
+
+	registerResponse<T>(request: TerminalResponseRequest<T>): (() => void) | undefined {
+		return this.#responseRegistry?.arm(request);
 	}
 
 	onAppearanceChange(callback: (appearance: TerminalAppearance) => void): void {
@@ -385,140 +608,75 @@ export class ProcessTerminal implements Terminal {
 	 */
 	#setupStdinBuffer(): void {
 		this.#stdinBuffer = new StdinBuffer({ timeout: 10 });
+		let consumingSynchronously = false;
+		this.#responseRegistry = new TerminalResponseRegistry({
+			maxBytes: 512,
+			onForward: data => {
+				if (!consumingSynchronously) forwardInput(data);
+			},
+		});
 
-		// Kitty protocol response pattern: \x1b[?<flags>u
-		const kittyResponsePattern = /^\x1b\[\?(\d+)u$/;
+		const armModeResponse = (): void => {
+			this.#responseRegistry!.arm({
+				id: "terminal.appearance.mode2031",
+				parse: regexResponseParser(
+					/\x1b\[\?997;([12])n/u,
+					/\x1b\[\?997;[12]?$/u,
+					match => (match[1] === "1" ? "dark" : "light"),
+				),
+				onComplete: () => {
+					this.#stopOsc11Poll();
+					if (this.#mode2031DebounceTimer) clearTimeout(this.#mode2031DebounceTimer);
+					this.#mode2031DebounceTimer = setTimeout(() => {
+						this.#mode2031DebounceTimer = undefined;
+						this.#queryBackgroundColor();
+					}, 100);
+					armModeResponse();
+				},
+				onExpire: armModeResponse,
+				expiresInMs: 1000,
+			});
+		};
+		armModeResponse();
 
-		// Mode 2031 DSR response: \x1b[?997;{1=dark,2=light}n
-		const appearanceDsrPattern = /^\x1b\[\?997;([12])n$/;
+		/**
+		 * TerminalResponseRegistry deliberately returns an interrupted probe and
+		 * the following escape as one value. ProcessTerminal historically
+		 * delivers each input escape separately, so discard the interrupted
+		 * response prefix here while preserving the new user escape.
+		 */
+		const forwardInput = (data: string): void => {
+			const inputHandler = this.#inputHandler;
+			if (!inputHandler) return;
 
-		// OSC 11 response: \x1b]11;rgb:RR/GG/BB or rgba:RR/GG/BB, terminated by BEL or ST.
-		const osc11ResponsePattern =
-			/^\x1b\]11;rgba?:([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})(?:\x07|\x1b\\)$/;
+			let cursor = 0;
+			let probeStart = data.indexOf("\x1b");
+			while (probeStart >= 0) {
+				const nextEscape = data.indexOf("\x1b", probeStart + 1);
+				if (
+					nextEscape > probeStart &&
+					(/^\x1b\]11;[^\x1b\x07]*$/u.test(data.slice(probeStart, nextEscape)) ||
+						/^\x1b\[\?[\d;]*$/u.test(data.slice(probeStart, nextEscape)))
+				) {
+					if (probeStart > cursor) inputHandler(data.slice(cursor, probeStart));
+					cursor = nextEscape;
+					probeStart = data.indexOf("\x1b", cursor);
+					continue;
+				}
+				probeStart = data.indexOf("\x1b", probeStart + 1);
+			}
+			if (cursor < data.length) inputHandler(data.slice(cursor));
+		};
 
-		// DA1 (Primary Device Attributes) response: \x1b[?...c
-		const da1ResponsePattern = /^\x1b\[\?[\d;]*c$/;
-
-		// Private CSI partial: \x1b[?<digits/semicolons>... — incomplete probe response
-		// that the StdinBuffer flushed before the terminator arrived (split across
-		// stdin reads). Used to reassemble DA1, kitty, and Mode 2031 replies.
-		const privateCsiPartialPattern = /^\x1b\[\?[\d;]*$/;
-
-		// Forward individual sequences to the input handler
 		this.#stdinBuffer.on("data", (sequence: string) => {
-			// Reassemble split private CSI responses (DA1, kitty keyboard, Mode 2031).
-			// When the terminal writes the response slowly enough that the StdinBuffer's
-			// flush timeout elapses mid-sequence, the prefix `\x1b[?<digits>` arrives as
-			// one event and the tail `;...<terminator>` arrives as individual character
-			// events that would otherwise leak into the prompt as keystrokes. See #1238.
-			if (
-				this.#privateCsiResponseBuffer ||
-				(privateCsiPartialPattern.test(sequence) && this.#pendingDa1Sentinels > 0)
-			) {
-				if (this.#privateCsiResponseBuffer && sequence.startsWith("\x1b")) {
-					// New escape arrived mid-reassembly — abandon partial and re-process the new sequence.
-					this.#privateCsiResponseBuffer = "";
-				} else {
-					this.#privateCsiResponseBuffer += sequence;
-					// Cap accumulator to defend against runaway partials if the terminator never arrives.
-					if (this.#privateCsiResponseBuffer.length > 256) {
-						this.#privateCsiResponseBuffer = "";
-						return;
-					}
-					const lastChar = this.#privateCsiResponseBuffer.at(-1)!;
-					const lastCode = lastChar.charCodeAt(0);
-					if (lastCode >= 0x40 && lastCode <= 0x7e) {
-						// Terminator byte arrived. Fall through to the pattern checks with the
-						// reassembled sequence so the existing DA1/kitty/Mode 2031 handlers run.
-						sequence = this.#privateCsiResponseBuffer;
-						this.#privateCsiResponseBuffer = "";
-					} else if (!privateCsiPartialPattern.test(this.#privateCsiResponseBuffer)) {
-						// Diverged from a valid private CSI prefix (unexpected byte). Drop the
-						// probe noise we ate; do not forward to the input handler.
-						this.#privateCsiResponseBuffer = "";
-						return;
-					} else {
-						// Still accumulating.
-						return;
-					}
-				}
+			consumingSynchronously = true;
+			let forwarded = "";
+			try {
+				forwarded = this.#responseRegistry!.consume(sequence);
+			} finally {
+				consumingSynchronously = false;
 			}
-
-			// Check for Kitty protocol response (only if not already enabled)
-			if (!this.#kittyProtocolActive) {
-				const match = sequence.match(kittyResponsePattern);
-				if (match) {
-					if (this.#modifyOtherKeysTimeout) {
-						clearTimeout(this.#modifyOtherKeysTimeout);
-						this.#modifyOtherKeysTimeout = undefined;
-					}
-					this.#kittyProtocolActive = true;
-					setKittyProtocolActive(true);
-
-					// Enable Kitty keyboard protocol (push flags)
-					// Flag 1 = disambiguate escape codes
-					// Flag 2 = report event types (press/repeat/release)
-					// Flag 4 = report alternate keys
-					this.#safeWrite("\x1b[>7u");
-					return; // Don't forward protocol response to TUI
-				}
-			}
-
-			// DA1 response: swallow our sentinel reply regardless of whether OSC 11
-			// already succeeded. Other terminal probes should never see these replies.
-			if (da1ResponsePattern.test(sequence) && this.#pendingDa1Sentinels > 0) {
-				this.#pendingDa1Sentinels--;
-				if (this.#osc11Pending) {
-					// DA1 arrived before OSC 11 response: terminal does not support
-					// OSC 11. Clear the pending state without starting a queued query
-					// (queued query is started below, after sentinel is consumed).
-					this.#osc11Pending = false;
-					this.#osc11ResponseBuffer = "";
-				}
-				// Now that this DA1 cycle is complete, start any queued query.
-				if (this.#osc11QueryQueued && !this.#dead) {
-					this.#osc11QueryQueued = false;
-					this.#startOsc11Query();
-				}
-				return;
-			}
-
-			// OSC 11 replies can be split if the stdin buffer flushes a partial sequence.
-			// Accumulate fragments until the BEL/ST terminator arrives, then parse once.
-			// If a new escape sequence arrives (not the ST terminator), abort buffering
-			// and forward it as normal input so user keystrokes are never swallowed.
-			if (this.#osc11Pending && (this.#osc11ResponseBuffer || sequence.startsWith("\x1b]11;"))) {
-				if (this.#osc11ResponseBuffer && sequence.startsWith("\x1b") && sequence !== "\x1b\\") {
-					// New escape sequence arrived mid-buffer — not an OSC 11 continuation.
-					this.#osc11ResponseBuffer = "";
-					// Fall through to normal input handling below.
-				} else {
-					this.#osc11ResponseBuffer += sequence;
-					const osc11Match = this.#osc11ResponseBuffer.match(osc11ResponsePattern);
-					if (!osc11Match) return;
-					const [, rHex, gHex, bHex] = osc11Match;
-					this.#osc11Pending = false;
-					this.#osc11ResponseBuffer = "";
-					this.#handleOsc11Response(rHex!, gHex!, bHex!);
-					return;
-				}
-			}
-
-			// Mode 2031 change notification: re-query OSC 11 with 100ms debounce
-			// (Neovim convention — coalesces rapid notifications during transitions)
-			const appearanceMatch = sequence.match(appearanceDsrPattern);
-			if (appearanceMatch) {
-				this.#stopOsc11Poll();
-				if (this.#mode2031DebounceTimer) clearTimeout(this.#mode2031DebounceTimer);
-				this.#mode2031DebounceTimer = setTimeout(() => {
-					this.#mode2031DebounceTimer = undefined;
-					this.#queryBackgroundColor();
-				}, 100);
-				return;
-			}
-			if (this.#inputHandler) {
-				this.#inputHandler(sequence);
-			}
+			if (forwarded) forwardInput(forwarded);
 		});
 
 		// Re-wrap paste content with bracketed paste markers for existing editor handling
@@ -553,9 +711,51 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	#startOsc11Query(): void {
+		this.#osc11QueryQueued = false;
 		this.#osc11Pending = true;
-		this.#osc11ResponseBuffer = "";
 		this.#pendingDa1Sentinels++;
+		this.#responseRegistry?.arm<{ r: string; g: string; b: string }>({
+			id: "terminal.appearance.osc11",
+			priority: 20,
+			parse: regexResponseParser(
+				/\x1b\]11;rgba?:([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})(?:\x07|\x1b\\)/u,
+				/\x1b\]11;[^\x07]*$/u,
+				match => ({ r: match[1]!, g: match[2]!, b: match[3]! }),
+			),
+			onComplete: value => {
+				this.#osc11Pending = false;
+				this.#handleOsc11Response(value.r, value.g, value.b);
+			},
+			onExpire: () => {
+				this.#osc11Pending = false;
+			},
+			expiresInMs: 1000,
+		});
+		this.#responseRegistry?.arm({
+			id: "terminal.appearance.da1",
+			priority: 10,
+			parse: regexResponseParser(
+				/\x1b\[\?[\d;]*c/u,
+				/\x1b\[\?[\d;]*$/u,
+				() => undefined,
+			),
+			onComplete: () => {
+				this.#pendingDa1Sentinels = Math.max(0, this.#pendingDa1Sentinels - 1);
+				if (this.#osc11Pending) {
+					this.#osc11Pending = false;
+					this.#responseRegistry?.disarm("terminal.appearance.osc11");
+				}
+				if (this.#pendingDa1Sentinels === 0 && this.#osc11QueryQueued && !this.#dead) {
+					this.#osc11QueryQueued = false;
+					this.#startOsc11Query();
+				}
+			},
+			onExpire: () => {
+				this.#pendingDa1Sentinels = Math.max(0, this.#pendingDa1Sentinels - 1);
+				if (this.#osc11Pending) this.#osc11Pending = false;
+			},
+			expiresInMs: 1000,
+		});
 		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
 		this.#safeWrite("\x1b[c"); // DA1 sentinel
 	}
@@ -626,6 +826,25 @@ export class ProcessTerminal implements Terminal {
 		if (!keyboardEnhancementEnabled()) {
 			return;
 		}
+		this.#responseRegistry?.arm({
+			id: "terminal.keyboard.kitty",
+			priority: 30,
+			parse: regexResponseParser(
+				/\x1b\[\?(\d+)u/u,
+				/\x1b\[\?\d*$/u,
+				match => Number.parseInt(match[1]!, 10),
+			),
+			onComplete: () => {
+				if (this.#modifyOtherKeysTimeout) {
+					clearTimeout(this.#modifyOtherKeysTimeout);
+					this.#modifyOtherKeysTimeout = undefined;
+				}
+				this.#kittyProtocolActive = true;
+				setKittyProtocolActive(true);
+				this.#safeWrite("\x1b[>7u");
+			},
+			expiresInMs: 150,
+		});
 		this.#safeWrite("\x1b[?u");
 		// Windows Terminal and conhost do not implement the Kitty keyboard
 		// protocol, so the query above never activates it there. They do honor the
@@ -720,8 +939,8 @@ export class ProcessTerminal implements Terminal {
 		this.#appearanceCallbacks = [];
 		this.#osc11Pending = false;
 		this.#osc11QueryQueued = false;
-		this.#osc11ResponseBuffer = "";
-		this.#privateCsiResponseBuffer = "";
+		this.#responseRegistry?.stop();
+		this.#responseRegistry = undefined;
 		this.#pendingDa1Sentinels = 0;
 
 		// Disable Kitty keyboard protocol if not already done by drainInput()
@@ -822,6 +1041,8 @@ export class ProcessTerminal implements Terminal {
 	#markUnavailable(err: unknown, operation: string): void {
 		if (this.#dead) return;
 		this.#dead = true;
+		this.#responseRegistry?.stop();
+		this.#responseRegistry = undefined;
 		this.#clearProgressTimer();
 		this.#stopOsc11Poll();
 		if (this.#mode2031DebounceTimer) {

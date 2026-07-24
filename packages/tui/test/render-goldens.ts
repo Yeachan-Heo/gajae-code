@@ -221,7 +221,6 @@ export const RENDER_GOLDEN_FIXTURES: GoldenFixture[] = [
 		rows: 12,
 		coverage: ["long transcript append", "shrink clear", "height change"],
 		async run(tui, term) {
-			tui.setClearOnShrink(true);
 			const component = new MutableLinesComponent(
 				Array.from({ length: 26 }, (_v, i) => `transcript-${String(i).padStart(2, "0")} :: stable append`),
 			);

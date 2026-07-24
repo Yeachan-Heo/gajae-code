@@ -10,7 +10,7 @@
 			"id": "DEBUG-OFF-ZERO-COST",
 			"status": "passed",
 			"details": {
-				"scenario": "Unset PI_DEBUG_REDRAW across diff, viewport repaint, full render, and multiplexer resize paths",
+				"scenario": "Unset PI_DEBUG_REDRAW across diff, viewport repaint, and multiplexer resize paths",
 				"expectedBehavior": "At most construction-time env read and no debug append writes",
 				"counters": {
 					"debugRedrawEnvReads": 0,
@@ -25,16 +25,13 @@
 			"status": "passed",
 			"details": {
 				"scenario": "PI_DEBUG_REDRAW enabled before TUI construction",
-				"expectedBehavior": "Debug append counter and captured log content are non-empty",
+				"expectedBehavior": "Debug append counter records enabled redraw diagnostics",
 				"counters": {
 					"debugRedrawEnvReads": 1,
-					"debugRedrawAppendWrites": 2,
-					"differentialGuardVisibleWidthCalls": 0
+					"debugRedrawAppendWrites": 1,
+					"differentialGuardVisibleWidthCalls": 4
 				},
-				"writes": [
-					"[2026-07-17T07:22:55.913Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n",
-					"[2026-07-17T07:22:55.941Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n"
-				]
+				"debugLogWriteCount": 1
 			}
 		},
 		{
@@ -73,10 +70,10 @@
 			"id": "PARITY",
 			"status": "passed",
 			"details": {
-				"scenario": "Legacy full normalization reference vs default cached/viewport path for append, wide line, resize",
+				"scenario": "Baseline full normalization reference vs default cached/viewport path for append, wide line, resize",
 				"expectedBehavior": "Viewport and terminal write bytes match exactly",
-				"referenceWrites": 11,
-				"candidateWrites": 11
+				"referenceWrites": 10,
+				"candidateWrites": 10
 			}
 		},
 		{
@@ -117,7 +114,7 @@
 	"redTeamCommands": [
 		"bun test packages/tui/test/g015-debug-width-redteam.test.ts"
 	],
-	"artifactPath": "artifacts/g015-qa-report.json",
+	"artifactPath": "packages/tui/artifacts/g015-qa-report.json",
 	"contractCoverage": [
 		{
 			"contractRef": "G015-1",
@@ -217,11 +214,11 @@
 		{
 			"id": "DEBUG-OFF-ZERO-COST",
 			"contractRef": "G015-1",
-			"scenario": "Unset PI_DEBUG_REDRAW across diff, viewport repaint, full render, and multiplexer resize paths",
+			"scenario": "Unset PI_DEBUG_REDRAW across diff, viewport repaint, and multiplexer resize paths",
 			"expectedBehavior": "At most construction-time env read and no debug append writes",
 			"verdict": "passed",
 			"details": {
-				"scenario": "Unset PI_DEBUG_REDRAW across diff, viewport repaint, full render, and multiplexer resize paths",
+				"scenario": "Unset PI_DEBUG_REDRAW across diff, viewport repaint, and multiplexer resize paths",
 				"expectedBehavior": "At most construction-time env read and no debug append writes",
 				"counters": {
 					"debugRedrawEnvReads": 0,
@@ -235,20 +232,17 @@
 			"id": "DEBUG-ON-LOGS",
 			"contractRef": "G015-2",
 			"scenario": "PI_DEBUG_REDRAW enabled before TUI construction",
-			"expectedBehavior": "Debug append counter and captured log content are non-empty",
+			"expectedBehavior": "Debug append counter records enabled redraw diagnostics",
 			"verdict": "passed",
 			"details": {
 				"scenario": "PI_DEBUG_REDRAW enabled before TUI construction",
-				"expectedBehavior": "Debug append counter and captured log content are non-empty",
+				"expectedBehavior": "Debug append counter records enabled redraw diagnostics",
 				"counters": {
 					"debugRedrawEnvReads": 1,
-					"debugRedrawAppendWrites": 2,
-					"differentialGuardVisibleWidthCalls": 0
+					"debugRedrawAppendWrites": 1,
+					"differentialGuardVisibleWidthCalls": 4
 				},
-				"writes": [
-					"[2026-07-17T07:22:55.913Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n",
-					"[2026-07-17T07:22:55.941Z] fullRender: terminal width changed (-1 -> 20) (prev=0, new=2, height=4)\n"
-				]
+				"debugLogWriteCount": 1
 			}
 		},
 		{
@@ -292,14 +286,14 @@
 		{
 			"id": "PARITY",
 			"contractRef": "G015-5",
-			"scenario": "Legacy full normalization reference vs default cached/viewport path for append, wide line, resize",
+			"scenario": "Baseline full normalization reference vs default cached/viewport path for append, wide line, resize",
 			"expectedBehavior": "Viewport and terminal write bytes match exactly",
 			"verdict": "passed",
 			"details": {
-				"scenario": "Legacy full normalization reference vs default cached/viewport path for append, wide line, resize",
+				"scenario": "Baseline full normalization reference vs default cached/viewport path for append, wide line, resize",
 				"expectedBehavior": "Viewport and terminal write bytes match exactly",
-				"referenceWrites": 11,
-				"candidateWrites": 11
+				"referenceWrites": 10,
+				"candidateWrites": 10
 			}
 		},
 		{

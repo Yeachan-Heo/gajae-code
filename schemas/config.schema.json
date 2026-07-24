@@ -630,11 +630,6 @@
 			"description": "Show terminal cursor for IME support",
 			"default": true
 		},
-		"clearOnShrink": {
-			"type": "boolean",
-			"description": "Clear empty rows when content shrinks (may cause flicker)",
-			"default": false
-		},
 		"defaultThinkingLevel": {
 			"type": "string",
 			"enum": [

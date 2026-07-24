@@ -15,7 +15,7 @@ import { renderMetrics } from "./metrics";
 
 export { Ellipsis } from "@gajae-code/natives";
 
-export { getDefaultTabWidth, getIndentation } from "@gajae-code/utils";
+export { getDefaultTabWidth, getIndentation, setDefaultTabWidth } from "@gajae-code/utils";
 /** Test-only performance counters for advisory baseline tests. */
 export const __textHelperPerfCounters = {
 	truncateToWidthCalls: 0,

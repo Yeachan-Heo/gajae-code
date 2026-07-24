@@ -41,7 +41,6 @@ function normalizeFullRedrawCause(cause: string): string {
 	if (c.startsWith("first render")) return "first render";
 	if (c.startsWith("terminal width changed")) return "terminal width changed";
 	if (c.startsWith("terminal height changed")) return "terminal height changed";
-	if (c.startsWith("clearonshrink")) return "clearOnShrink";
 	if (c.startsWith("extralines > height")) return "extraLines > height";
 	if (c.startsWith("firstchanged < viewporttop")) return "firstChanged < viewportTop";
 	return cause;
@@ -49,8 +48,8 @@ function normalizeFullRedrawCause(cause: string): string {
 
 /**
  * Full-redraw causes that are expected and do not count toward repaint storms.
- * These are legitimate, unavoidable full repaints (first frame, resize, shrink
- * clearing). Steady-stream storms come from any other repeated full redraw.
+ * These are legitimate, unavoidable full repaints (first frame, resize).
+ * Steady-stream storms come from any other repeated full redraw.
  */
 function isExpectedFullRedraw(cause: string): boolean {
 	const c = cause.toLowerCase();
@@ -58,7 +57,6 @@ function isExpectedFullRedraw(cause: string): boolean {
 		c.startsWith("first render") ||
 		c.includes("width changed") ||
 		c.includes("height changed") ||
-		c.startsWith("clearonshrink") ||
 		c.includes("forced") ||
 		c.includes("force")
 	);
