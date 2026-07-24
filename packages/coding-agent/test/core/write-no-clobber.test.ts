@@ -74,4 +74,21 @@ describe("whole-file creation safety", () => {
 		await expect(create).rejects.toThrow(/already exists.*update/i);
 		expect(await fs.readFile(filePath, "utf8")).toBe("original\n");
 	});
+
+	it("rejects apply_patch moves when the destination already exists", async () => {
+		const workspace = await createWorkspace();
+		const sourcePath = path.join(workspace, "source.ts");
+		const destinationPath = path.join(workspace, "destination.ts");
+		await fs.writeFile(sourcePath, "source\n", "utf8");
+		await fs.writeFile(destinationPath, "destination\n", "utf8");
+
+		await expect(
+			applyPatch(
+				{ path: sourcePath, op: "update", rename: destinationPath, diff: "@@\n-source\n+updated" },
+				{ cwd: workspace },
+			),
+		).rejects.toThrow(/Destination already exists/);
+		expect(await fs.readFile(sourcePath, "utf8")).toBe("source\n");
+		expect(await fs.readFile(destinationPath, "utf8")).toBe("destination\n");
+	});
 });

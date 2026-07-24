@@ -3,12 +3,11 @@ import path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { isEnoent, logger, once, prompt, untilAborted } from "@gajae-code/utils";
 import type { BunFile } from "bun";
-import { withEditPathMutation } from "../edit/path-mutation-lock";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
-import { enforceTeamWriteScope } from "../tools/team-write-scope";
+import { withTeamWriteScopeMutation } from "../tools/team-write-scope";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
@@ -1524,20 +1523,17 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			}
 
 			const pairPaths = pairs.flatMap(pair => [uriToFile(pair.oldUri), uriToFile(pair.newUri)]);
-			await withEditPathMutation([source, dest], async () => {
-				await enforceTeamWriteScope(this.session, source);
-				await enforceTeamWriteScope(this.session, dest);
-				for (const pairPath of pairPaths) {
-					await enforceTeamWriteScope(this.session, pairPath);
-				}
+			await withTeamWriteScopeMutation(this.session, [source, dest, ...pairPaths], async canonicalPaths => {
+				const canonicalSource = canonicalPaths[0]!;
+				const canonicalDest = canonicalPaths[1]!;
 				try {
-					await fs.promises.lstat(dest);
+					await fs.promises.lstat(canonicalDest);
 					throw new ToolError(`Destination already exists: ${formatPathRelativeToCwd(dest, this.session.cwd)}`);
 				} catch (error) {
 					if (!isEnoent(error)) throw error;
 				}
-				await fs.promises.mkdir(path.dirname(dest), { recursive: true });
-				await fs.promises.rename(source, dest);
+				await fs.promises.mkdir(path.dirname(canonicalDest), { recursive: true });
+				await fs.promises.rename(canonicalSource, canonicalDest);
 			});
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
 

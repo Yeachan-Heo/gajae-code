@@ -1,5 +1,5 @@
 /** File-backed team task store, claims, leases, and completion evidence. */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { sessionIdFromDirName } from "./session-layout";
@@ -537,8 +537,39 @@ export async function readCanonicalGjcTeamTasksFromDir(dir: string): Promise<Gjc
 		throw error;
 	}
 }
-async function writeGjcTeamTaskToDir(dir: string, task: GjcTeamTask): Promise<void> {
-	await writeJson(taskPath(dir, task.id), normalizeGjcTeamTask(task));
+async function writeGjcTeamTaskToDir(dir: string, task: GjcTeamTask, previousTask?: GjcTeamTask): Promise<void> {
+	const normalized = normalizeGjcTeamTask(task);
+	const configPath = path.join(dir, "config.json");
+	const config = await readJson<unknown>(configPath);
+	if (!isRecord(config)) {
+		await writeJson(taskPath(dir, task.id), normalized);
+		return;
+	}
+	const taskIds = Array.isArray(config.task_ids)
+		? config.task_ids.filter((taskId): taskId is string => typeof taskId === "string")
+		: [];
+	const taskAuthorities = isRecord(config.task_authorities) ? config.task_authorities : {};
+	const persistedAuthority = taskAuthorities[normalized.id];
+	if (
+		persistedAuthority !== undefined &&
+		(typeof persistedAuthority !== "string" ||
+			persistedAuthority !== gjcTeamTaskAuthorityDigest(previousTask ?? normalized))
+	) {
+		throw new Error(`task_authority_mismatch:${normalized.id}`);
+	}
+	if (previousTask && persistedAuthority === undefined) {
+		throw new Error(`task_authority_missing:${normalized.id}`);
+	}
+	await writeJson(taskPath(dir, task.id), normalized);
+	await writeJson(configPath, {
+		...config,
+		task_ids: [...new Set([...taskIds, normalized.id])].sort(),
+		task_authorities: {
+			...taskAuthorities,
+			[normalized.id]: gjcTeamTaskAuthorityDigest(normalized),
+		},
+		updated_at: new Date().toISOString(),
+	});
 }
 
 function eligibility(task: GjcTeamTask, worker: GjcTeamTaskWorker, tasks: GjcTeamTask[]): string | null {
@@ -563,12 +594,80 @@ function writePathKey(writePath: string): string {
 		: writePath;
 }
 
+export function gjcTeamTaskAuthorityDigest(task: GjcTeamTask): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify({
+				id: task.id,
+				subject: task.subject,
+				description: task.description,
+				title: task.title,
+				objective: task.objective,
+				status: task.status,
+				assignee: task.assignee ?? null,
+				owner: task.owner ?? null,
+				result: task.result ?? null,
+				completion_evidence: task.completion_evidence ?? null,
+				error: task.error ?? null,
+				blocked_by: task.blocked_by ?? null,
+				depends_on: task.depends_on ?? null,
+				lane: task.lane ?? null,
+				required_role: task.required_role ?? null,
+				allowed_roles: task.allowed_roles ?? null,
+				write_paths: task.write_paths ?? null,
+				version: task.version,
+				claim: task.claim ?? null,
+				created_at: task.created_at,
+				updated_at: task.updated_at,
+				completed_at: task.completed_at ?? null,
+			}),
+		)
+		.digest("hex");
+}
+
+async function resolvePotentialRealPath(candidate: string): Promise<string> {
+	let cursor = path.resolve(candidate);
+	const suffix: string[] = [];
+	while (true) {
+		try {
+			return path.join(await fs.realpath(cursor), ...suffix);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			const parent = path.dirname(cursor);
+			if (parent === cursor) throw error;
+			suffix.unshift(path.basename(cursor));
+			cursor = parent;
+		}
+	}
+}
+
+async function canonicalWritePathKey(root: string, writePath: string): Promise<string> {
+	const canonicalRoot = await fs.realpath(root);
+	const canonicalPath = await resolvePotentialRealPath(path.join(canonicalRoot, writePath));
+	try {
+		const stat = await fs.stat(canonicalPath);
+		if (stat.isFile()) return `inode:${stat.dev}:${stat.ino}`;
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	return writePathKey(path.relative(canonicalRoot, canonicalPath).split(path.sep).join("/"));
+}
+
 async function findActiveWriteScopeConflict(
 	dir: string,
 	task: GjcTeamTask,
 	tasks: GjcTeamTask[],
 ): Promise<string | null> {
-	const writePaths = new Map((task.write_paths ?? []).map(writePath => [writePathKey(writePath), writePath]));
+	const config = await readJson<unknown>(path.join(dir, "config.json"));
+	const root = isRecord(config) && typeof config.leader_cwd === "string" ? config.leader_cwd : undefined;
+	const writePaths = new Map(
+		await Promise.all(
+			(task.write_paths ?? []).map(
+				async writePath =>
+					[root ? await canonicalWritePathKey(root, writePath) : writePathKey(writePath), writePath] as const,
+			),
+		),
+	);
 	if (writePaths.size === 0) return null;
 	for (const candidate of tasks) {
 		if (candidate.id === task.id || !/^[A-Za-z0-9._-]+$/u.test(candidate.id)) continue;
@@ -589,9 +688,17 @@ async function findActiveWriteScopeConflict(
 		) {
 			continue;
 		}
-		const conflict = persistedCandidate.write_paths?.find(writePath => writePaths.has(writePathKey(writePath)));
+		let conflict: string | undefined;
+		for (const writePath of persistedCandidate.write_paths ?? []) {
+			const candidateKey = root ? await canonicalWritePathKey(root, writePath) : writePathKey(writePath);
+			if (writePaths.has(candidateKey)) {
+				conflict = writePath;
+				break;
+			}
+		}
 		if (conflict) {
-			return `write_scope_conflict:${task.id}:${candidate.id}:${writePaths.get(writePathKey(conflict)) ?? conflict}`;
+			const conflictKey = root ? await canonicalWritePathKey(root, conflict) : writePathKey(conflict);
+			return `write_scope_conflict:${task.id}:${candidate.id}:${writePaths.get(conflictKey) ?? conflict}`;
 		}
 	}
 	return null;
@@ -650,7 +757,7 @@ export interface GjcTeamTaskMutationCapability {
 		evidenceInput?: unknown,
 	): Promise<GjcTeamTask>;
 	release(id: string, token: string, workerId: string): Promise<GjcTeamTask>;
-	writeRecovered(task: GjcTeamTask): Promise<void>;
+	writeRecovered(task: GjcTeamTask): Promise<boolean>;
 }
 
 export async function withGjcTeamTaskMutation<T>(
@@ -691,7 +798,26 @@ export class GjcTeamTaskStore {
 			transition: (id, status, token, workerId, evidenceInput) =>
 				track(() => this.#transitionUnlocked(id, status, token, workerId, evidenceInput)),
 			release: (id, token, workerId) => track(() => this.#releaseUnlocked(id, token, workerId)),
-			writeRecovered: task => track(() => writeGjcTeamTaskToDir(this.dir, task)),
+			writeRecovered: task =>
+				track(async () => {
+					const previousTask = (await this.list()).find(candidate => candidate.id === task.id);
+					try {
+						await writeGjcTeamTaskToDir(this.dir, task, previousTask);
+						return true;
+					} catch (error) {
+						const reason = error instanceof Error ? error.message : String(error);
+						if (!reason.startsWith("task_authority_mismatch:") && !reason.startsWith("task_authority_missing:")) {
+							throw error;
+						}
+						await this.appendEvent({
+							type: "task_recovery_rejected",
+							task_id: task.id,
+							message: "Rejected task recovery because persisted authority changed",
+							data: { reason },
+						});
+						return false;
+					}
+				}),
 		});
 		let callbackResult: T | undefined;
 		let callbackError: unknown;
@@ -799,7 +925,7 @@ export class GjcTeamTaskStore {
 			const conflict = await findActiveWriteScopeConflict(this.dir, updated, await this.list());
 			if (conflict) throw new Error(conflict);
 		}
-		await writeGjcTeamTaskToDir(this.dir, updated);
+		await writeGjcTeamTaskToDir(this.dir, updated, task);
 		await this.appendEvent({
 			type: "task_updated",
 			task_id: id,
@@ -877,7 +1003,7 @@ export class GjcTeamTaskStore {
 			updated_at: now(),
 		};
 		try {
-			await writeGjcTeamTaskToDir(this.dir, updated);
+			await writeGjcTeamTaskToDir(this.dir, updated, current);
 		} catch (error) {
 			await deleteIfOwned(claimPath(this.dir, task.id), {
 				...writerOptions(claimPath(this.dir, task.id), "prune", "rollback"),
@@ -931,7 +1057,7 @@ export class GjcTeamTaskStore {
 			...(terminal ? { completed_at: transitionedAt } : {}),
 			...(evidence ? { completion_evidence: evidence } : {}),
 		};
-		await writeGjcTeamTaskToDir(this.dir, updated);
+		await writeGjcTeamTaskToDir(this.dir, updated, task);
 		if (terminal)
 			await removeFileAudited(claimPath(this.dir, id), writerOptions(claimPath(this.dir, id), "prune", "terminal"));
 		const data: Record<string, unknown> = { status };
@@ -965,7 +1091,7 @@ export class GjcTeamTaskStore {
 			version: task.version + 1,
 			updated_at: now(),
 		};
-		await writeGjcTeamTaskToDir(this.dir, updated);
+		await writeGjcTeamTaskToDir(this.dir, updated, task);
 		await deleteIfOwned(claimPath(this.dir, id), {
 			...writerOptions(claimPath(this.dir, id), "prune", "release"),
 			predicate: current => (current as GjcTeamTaskClaim).token === token,
