@@ -11,6 +11,7 @@ import {
 	prepareManagedSessionScopeForWrite,
 	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
+import * as managedSessionStorage from "../../src/session/internal/managed-session-storage";
 import {
 	publishManagedFileNoReplace,
 	validateNativeSecurityResult,
@@ -1125,6 +1126,30 @@ describe("managed session write protocol", () => {
 			expect(firstListed.owned.map(candidate => candidate.sessionId)).toEqual(["first"]);
 		if (secondListed.kind === "complete")
 			expect(secondListed.owned.map(candidate => candidate.sessionId)).toEqual(["second"]);
+	});
+	it("skips durable lock acquisition when a tombstone's targets are already cleanup_completed", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const source = path.join(legacy, "already-done.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(source, transcript("already-done", cwd));
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
+
+		await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({
+			kind: "deleted",
+		});
+
+		const restarted = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+		if (restarted.kind !== "resolved") throw new Error(restarted.message);
+
+		const lock = vi.spyOn(managedSessionStorage, "acquireManagedLock");
+		try {
+			expect((await prepareManagedSessionScopeForWrite(restarted.scope)).kind).toBe("resolved");
+			expect(lock).not.toHaveBeenCalled();
+		} finally {
+			lock.mockRestore();
+		}
 	});
 	it("reconciles a crash-after-tombstone on a fresh scope without resurrecting the candidate", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
