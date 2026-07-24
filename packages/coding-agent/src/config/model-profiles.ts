@@ -100,11 +100,11 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "opencode-go/deepseek-v4-pro",
 	}),
 	profile("claude-opus", ["anthropic"], {
-		default: "anthropic/claude-opus-4-8:xhigh",
+		default: "anthropic/claude-opus-5:xhigh",
 		executor: "anthropic/claude-sonnet-5",
-		planner: "anthropic/claude-opus-4-8:low",
-		critic: "anthropic/claude-opus-4-8:high",
-		architect: "anthropic/claude-opus-4-8:xhigh",
+		planner: "anthropic/claude-opus-5:low",
+		critic: "anthropic/claude-opus-5:high",
+		architect: "anthropic/claude-opus-5:xhigh",
 	}),
 	profile("claude-fable", ["anthropic"], {
 		default: "anthropic/claude-fable-5:xhigh",
@@ -271,7 +271,7 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "alibaba-token-plan/qwen3.8-max-preview:xhigh",
 	}),
 	profile("opus-codex", ["anthropic", "openai-codex"], {
-		default: "anthropic/claude-opus-4-8:xhigh",
+		default: "anthropic/claude-opus-5:xhigh",
 		executor: "openai-codex/gpt-5.6-terra:low",
 		planner: "anthropic/claude-sonnet-5",
 		critic: "openai-codex/gpt-5.6-sol:xhigh",
@@ -287,8 +287,8 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	profile("fable-opus-codex", ["anthropic", "openai-codex"], {
 		default: "anthropic/claude-fable-5:high",
 		executor: "openai-codex/gpt-5.6-terra:medium",
-		planner: "anthropic/claude-opus-4-8:medium",
-		critic: "anthropic/claude-opus-4-8:high",
+		planner: "anthropic/claude-opus-5:medium",
+		critic: "anthropic/claude-opus-5:high",
 		architect: "openai-codex/gpt-5.6-sol:xhigh",
 	}),
 ];

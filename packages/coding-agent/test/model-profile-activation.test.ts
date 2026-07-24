@@ -91,6 +91,11 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.XHigh,
 			}),
+			model("anthropic", "claude-opus-5", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.Max,
+			}),
 			model("anthropic", "claude-fable-5", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
@@ -564,7 +569,7 @@ describe("model profile activation", () => {
 		[
 			"opus-codex",
 			{
-				default: "anthropic/claude-opus-4-8:xhigh",
+				default: "anthropic/claude-opus-5:xhigh",
 				executor: "openai-codex/gpt-5.6-terra:low",
 				planner: "anthropic/claude-sonnet-5",
 				critic: "openai-codex/gpt-5.6-sol:xhigh",
@@ -586,8 +591,8 @@ describe("model profile activation", () => {
 			{
 				default: "anthropic/claude-fable-5:high",
 				executor: "openai-codex/gpt-5.6-terra:medium",
-				planner: "anthropic/claude-opus-4-8:medium",
-				critic: "anthropic/claude-opus-4-8:high",
+				planner: "anthropic/claude-opus-5:medium",
+				critic: "anthropic/claude-opus-5:high",
 				architect: "openai-codex/gpt-5.6-sol:xhigh",
 			},
 		],

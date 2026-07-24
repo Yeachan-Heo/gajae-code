@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The built-in `Claude Opus`, `Opus + Codex`, and `Fable + Opus + Codex` model profiles now target **Claude Opus 5** (`claude-opus-5`) instead of Opus 4.8 for their Anthropic roles — the newest, same-priced Opus.
+
 ### Fixed
 
 - Alibaba Token Plan canonical first-event timeouts now surface without session retry/fallback replay and are not internally retried by auto-compaction, preventing repeated provider usage (#3026).
