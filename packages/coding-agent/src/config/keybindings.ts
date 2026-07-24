@@ -58,6 +58,9 @@ interface AppKeybindings {
 	"app.transcript.browse": true;
 	"app.transcript.prevTurn": true;
 	"app.transcript.nextTurn": true;
+	"app.transcript.pageUp": true;
+	"app.transcript.pageDown": true;
+	"app.transcript.tail": true;
 	"app.mode.cycle": true;
 	"app.tasks.toggle": true;
 	"app.queue.togglePane": true;
@@ -247,6 +250,18 @@ export const KEYBINDINGS = {
 	"app.transcript.nextTurn": {
 		defaultKeys: [],
 		description: "Jump to next user turn",
+	},
+	"app.transcript.pageUp": {
+		defaultKeys: "alt+pageUp",
+		description: "Scroll transcript up one page",
+	},
+	"app.transcript.pageDown": {
+		defaultKeys: "alt+pageDown",
+		description: "Scroll transcript down one page",
+	},
+	"app.transcript.tail": {
+		defaultKeys: "alt+end",
+		description: "Return transcript to the latest output",
 	},
 	"app.mode.cycle": {
 		defaultKeys: [],

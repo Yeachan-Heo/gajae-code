@@ -604,6 +604,13 @@
 - Registered the optional `gjc acp` subcommand so Zed/custom ACP clients can launch the ACP stdio server through the documented command entrypoint, and documented the Zed `agent_servers` custom-agent shape (#1327).
 - Compiled binaries can now include the hidden Telegram daemon CLI entrypoint without hanging root startup, and release builds preserve that entry so `gjc notify daemon-internal --smoke` is available in standalone binaries (#1288).
 - Documented Windows Terminal BEL limitations for terminal bell notifications and added a PowerShell `completion.notifyCommand` beep workaround example (#1318).
+### Added
+
+- Added sticky transcript browsing above the persistent composer: `Alt+PageUp` / `Alt+PageDown` browse history without moving input focus, streamed rows remain unseen while browsing, and `Alt+End` returns to the live tail.
+
+### Changed
+
+- Bounded the composer to 18 terminal rows with internal cursor-following scroll and deterministic tiny-terminal degradation so long prompts no longer displace the transcript.
 
 ## [0.7.8] - 2026-06-30
 ### Added
