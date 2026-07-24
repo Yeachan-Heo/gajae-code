@@ -1,9 +1,8 @@
 //! Canonical directory identity and fail-closed path security helpers.
 
-use std::{
-	io::{self, Read},
-	path::{Component, Path, PathBuf},
-};
+#[cfg(any(unix, test))]
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
 
 use napi::{
 	JsString,
@@ -339,6 +338,7 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(unix)]
 	fn detached_failure_with_placeholder(
 		code: &str,
 		path: String,
@@ -354,6 +354,7 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(unix)]
 	fn detached_failure_with_unknown(code: &str, path: String, unknown_path: String) -> Self {
 		Self {
 			ok: false,
@@ -365,6 +366,7 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(unix)]
 	fn retained_placeholder_failure(code: &str, placeholder_path: String) -> Self {
 		Self {
 			ok: false,
@@ -376,6 +378,7 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
+	#[cfg(unix)]
 	fn retained_unknown_failure(code: &str, unknown_path: String) -> Self {
 		Self {
 			ok: false,
@@ -418,6 +421,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 	hasher.finalize().into()
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn digest_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
 	let mut hasher = Sha256::new();
 	let mut chunk = [0u8; 16 * 1024];
@@ -593,6 +597,7 @@ impl NativeOwnerOnlySecurityResult {
 	}
 }
 
+#[cfg(unix)]
 fn io_code(error: &io::Error) -> &'static str {
 	match error.kind() {
 		io::ErrorKind::NotFound => "not_found",
@@ -601,6 +606,7 @@ fn io_code(error: &io::Error) -> &'static str {
 	}
 }
 
+#[cfg(unix)]
 fn security_io_code(error: &io::Error) -> &'static str {
 	match error.kind() {
 		io::ErrorKind::NotFound => "not_found",
@@ -1384,25 +1390,28 @@ pub(crate) mod platform {
 		let name = CString::new(final_name)
 			.map_err(|_| NativeOwnerOnlySecurityResult::failure("io_error"))?;
 		let named = statat(&current, &name)?;
-		let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
-		if named.st_mode & libc::S_IFMT == libc::S_IFDIR {
-			flags |= libc::O_RDONLY | libc::O_DIRECTORY;
-		} else {
-			#[cfg(target_os = "macos")]
-			{
-				// A hostile macOS ACL may deny read access to its owner. Open the
-				// retained regular-file authority for writes so the ACL can still be
-				// inspected and repaired without reading or changing file contents.
-				flags |= libc::O_WRONLY;
-			}
-			#[cfg(not(target_os = "macos"))]
-			{
-				flags |= libc::O_RDONLY;
-			}
+		let is_directory = named.st_mode & libc::S_IFMT == libc::S_IFDIR;
+		let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_RDONLY;
+		if is_directory {
+			flags |= libc::O_DIRECTORY;
 		}
 		// SAFETY: current is retained, name is validated and NUL-terminated, and
 		// O_NOFOLLOW rejects symlinks.
-		let target_fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+		let mut target_fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+		#[cfg(target_os = "macos")]
+		if target_fd < 0 && !is_directory {
+			let read_error = std::io::Error::last_os_error();
+			if read_error.raw_os_error() == Some(libc::EACCES) {
+				// A hostile macOS ACL may deny reads while leaving owner writes
+				// available. Retry only that denial with write authority so ACLs can
+				// be inspected and repaired without changing file contents.
+				// SAFETY: this retries the same retained parent and validated final component.
+				target_fd =
+					unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags | libc::O_WRONLY) };
+			} else {
+				return Err(NativeOwnerOnlySecurityResult::failure(security_code(&read_error)));
+			}
+		}
 		if target_fd < 0 {
 			return Err(NativeOwnerOnlySecurityResult::failure(security_code(
 				&std::io::Error::last_os_error(),
