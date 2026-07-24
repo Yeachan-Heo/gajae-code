@@ -161,7 +161,6 @@ function deepInterviewStatePathForRoot(sessionRoot: string): string {
 	return path.join(sessionRoot, "state", "deep-interview-state.json");
 }
 
-
 async function resolveSpecContent(rawSpec: string, cwd: string): Promise<string> {
 	const candidate = path.isAbsolute(rawSpec) ? rawSpec : path.resolve(cwd, rawSpec);
 	try {
