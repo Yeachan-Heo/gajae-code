@@ -28,6 +28,11 @@ import {
 	type SubmitReviewDetails,
 } from "../tools/review";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine } from "../tui";
+import {
+	collectProviderDegradationGroups,
+	providerProgressAgeLabel,
+	providerRetryPhaseLabel,
+} from "./provider-retry-status";
 import type { TaskResultReceipt } from "./receipt";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { AgentProgress, TaskParams, TaskToolDetails } from "./types";
@@ -121,6 +126,15 @@ function normalizeReportFindings(value: unknown): ReportFindingDetails[] {
 
 function formatModelSubstitutionWarning(warning: { requested: string; effective: string }): string {
 	return `Requested model substituted: ${warning.requested} -> ${warning.effective}`;
+}
+
+function renderProviderDegradationNotices(progress: readonly AgentProgress[], theme: Theme): string[] {
+	return collectProviderDegradationGroups(progress).map(group =>
+		theme.fg(
+			"warning",
+			truncateToWidth(replaceTabs(`provider degraded: ${group.count} subagents retrying on ${group.provider}`), 100),
+		),
+	);
 }
 
 function formatJsonScalar(value: unknown, _theme: Theme): string {
@@ -548,14 +562,11 @@ function renderAgentProgress(
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
 	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}`;
 
-	// Show retry-blocked badge so the parent immediately sees that a child
-	// is sleeping on a provider 429, not silently progressing. Wins over the
-	// generic running spinner because "we're waiting on a quota window" is
-	// the operationally meaningful state.
+	// A provider recovery loop is operationally distinct from normal agent work.
 	if (progress.retryState && progress.status === "running") {
-		statusLine += ` ${formatBadge("retrying", "warning", theme)}`;
+		statusLine += ` ${formatBadge("provider degraded", "warning", theme)}`;
 	} else if (progress.retryFailure && (progress.status === "failed" || progress.status === "aborted")) {
-		statusLine += ` ${formatBadge("rate-limited", "error", theme)}`;
+		statusLine += ` ${formatBadge("provider failed", "error", theme)}`;
 	} else if (progress.status === "failed" || progress.status === "aborted") {
 		const statusLabel = progress.status === "failed" ? "failed" : "aborted";
 		statusLine += ` ${formatBadge(statusLabel, iconColor, theme)}`;
@@ -615,8 +626,10 @@ function renderAgentProgress(
 	// keep spinning while a child sleeps on a 3-hour provider rate-limit.
 	if (progress.retryState && progress.status === "running") {
 		const attemptLabel = progress.retryState.unbounded
-			? `attempt ${progress.retryState.attempt}`
-			: `${progress.retryState.attempt}/${progress.retryState.maxAttempts}`;
+			? `attempt ${progress.retryState.attempt}, unbounded`
+			: `attempt ${progress.retryState.attempt} of ${progress.retryState.maxAttempts}, bounded`;
+		const phaseLabel = providerRetryPhaseLabel(progress.retryState.kind);
+		const progressAge = staticTime ? "" : ` · ${providerProgressAgeLabel(progress.retryState, Date.now())}`;
 		// `staticTime` omits the wall-clock countdown so a cached await body stays a
 		// pure function of its key (the producer already drops time-only churn).
 		let waitLabel = "";
@@ -624,7 +637,7 @@ function renderAgentProgress(
 			const remainingMs = Math.max(0, progress.retryState.startedAtMs + progress.retryState.delayMs - Date.now());
 			waitLabel = remainingMs > 0 ? ` in ${formatDuration(remainingMs)}` : " now";
 		}
-		const summary = `retrying ${attemptLabel}${waitLabel}: ${truncateToWidth(replaceTabs(progress.retryState.errorMessage), 60)}`;
+		const summary = `${phaseLabel} · retrying ${attemptLabel}${waitLabel}${progressAge}: ${truncateToWidth(replaceTabs(progress.retryState.errorMessage), 60)}`;
 		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", summary)}`);
 	} else if (progress.retryFailure && progress.status !== "running") {
 		const summary = `auto-retry gave up after ${progress.retryFailure.attempt} attempt${
@@ -960,6 +973,7 @@ export function renderResult(
 			const shouldRenderProgress =
 				Boolean(details.progress && details.progress.length > 0) && (isPartial || details.results.length === 0);
 			if (shouldRenderProgress && details.progress) {
+				lines.push(...renderProviderDegradationNotices(details.progress, theme));
 				details.progress.forEach((progress, i) => {
 					const isLast = i === details.progress!.length - 1;
 					lines.push(...renderAgentProgress(progress, isLast, expanded, theme, spinnerFrame));

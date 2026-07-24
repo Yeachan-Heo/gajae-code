@@ -50,6 +50,7 @@ import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { validateAllocatedTaskId } from "./id";
+import { classifyProviderRetry, providerNameFromModel } from "./provider-retry-status";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
@@ -846,6 +847,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let resolvedModelString: string | undefined;
 	let lastAssistantModelString: string | undefined;
 	let effectiveThinkingLevelForWarning: ThinkingLevel | undefined;
+	let lastProviderProgressAtMs: number | undefined;
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage = {
@@ -1049,6 +1051,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		switch (event.type) {
 			case "message_start":
 				if (event.message?.role === "assistant") {
+					lastProviderProgressAtMs = now;
 					resetRecentOutput();
 				}
 				break;
@@ -1164,6 +1167,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			case "message_update": {
 				if (event.message?.role !== "assistant") break;
+				lastProviderProgressAtMs = now;
 				const assistantEvent = (
 					event as AgentEvent & {
 						assistantMessageEvent?: { type?: string; delta?: string };
@@ -1188,6 +1192,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// Extract text from assistant and toolResult messages (not user prompts)
 				const role = event.message?.role;
 				if (role === "assistant") {
+					lastProviderProgressAtMs = now;
 					const messageContent =
 						getMessageContent(event.message) || (event as AgentEvent & { content?: unknown }).content;
 					if (messageContent && Array.isArray(messageContent)) {
@@ -1742,6 +1747,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						attempt: event.attempt,
 						maxAttempts: event.maxAttempts,
 						unbounded: event.unbounded,
+						kind: classifyProviderRetry(event.errorMessage),
+						provider: providerNameFromModel(lastAssistantModelString ?? resolvedModelString),
+						lastProviderProgressAtMs,
 						delayMs: event.delayMs,
 						errorMessage: event.errorMessage,
 						startedAtMs: Date.now(),

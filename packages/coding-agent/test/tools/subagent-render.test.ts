@@ -204,6 +204,66 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("bash");
 	});
 
+	it("distinguishes first-event timeout recovery from normal running", () => {
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-FirstEvent",
+					liveProgressAvailable: true,
+					progress: progress({
+						id: "0-FirstEvent",
+						retryState: {
+							attempt: 2,
+							maxAttempts: 4,
+							kind: "first_event_timeout",
+							provider: "openai-responses",
+							delayMs: 5_000,
+							errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+							startedAtMs: Date.now(),
+						},
+					}),
+				}),
+			],
+		});
+
+		expect(out).toContain("provider degraded");
+		expect(out).toContain("first event timeout");
+		expect(out).toContain("no provider events yet");
+		expect(out).toContain("retrying attempt 2 of 4, bounded");
+	});
+
+	it("shows idle-stream progress age and aggregates same-provider degradation", () => {
+		const lastProviderProgressAtMs = Date.now() - 12_000;
+		const retryState = {
+			attempt: 1,
+			maxAttempts: 3,
+			kind: "idle_stream_stall" as const,
+			provider: "anthropic",
+			lastProviderProgressAtMs,
+			delayMs: 10_000,
+			errorMessage: "Anthropic stream stalled while waiting for the next event",
+			startedAtMs: Date.now(),
+		};
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-StalledA",
+					liveProgressAvailable: true,
+					progress: progress({ id: "0-StalledA", retryState }),
+				}),
+				snapshot({
+					id: "0-StalledB",
+					liveProgressAvailable: true,
+					progress: progress({ id: "0-StalledB", retryState }),
+				}),
+			],
+		});
+
+		expect(out).toContain("provider degraded: 2 subagents retrying on anthropic");
+		expect(out).toContain("stream stalled");
+		expect(out).toMatch(/last provider progress 1[12]s ago/);
+	});
+
 	it("preserves static receipt fields for non-await actions (guidance, output ref, description, agent, assignment, truncation)", () => {
 		const out = render({
 			subagents: [

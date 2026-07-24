@@ -285,6 +285,9 @@ export interface AgentProgress {
 		attempt: number;
 		maxAttempts: number;
 		unbounded?: boolean;
+		kind: "first_event_timeout" | "idle_stream_stall" | "provider_error";
+		provider?: string;
+		lastProviderProgressAtMs?: number;
 		delayMs: number;
 		errorMessage: string;
 		startedAtMs: number;

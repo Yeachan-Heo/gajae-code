@@ -11,6 +11,11 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
+import {
+	collectProviderDegradationGroups,
+	providerProgressAgeLabel,
+	providerRetryPhaseLabel,
+} from "../task/provider-retry-status";
 import { renderSubagentLiveProgress } from "../task/render";
 import { Ellipsis, Hasher, renderStatusLine } from "../tui";
 import {
@@ -131,7 +136,13 @@ function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spin
 		snapshot.status === "running" ? spinnerFrame : undefined,
 	);
 	const id = theme.fg("muted", truncateToWidth(replaceTabs(snapshot.id), PREVIEW_LINE_WIDTH, Ellipsis.Unicode));
-	const status = theme.fg("dim", snapshot.status);
+	const retryState = snapshot.liveProgressAvailable !== false ? snapshot.progress?.retryState : undefined;
+	const status = retryState
+		? theme.fg(
+				"warning",
+				`provider degraded · ${providerRetryPhaseLabel(retryState.kind)} · ${providerProgressAgeLabel(retryState, Date.now())}`,
+			)
+		: theme.fg("dim", snapshot.status);
 	const duration = theme.fg("dim", formatDuration(snapshot.durationMs));
 	return `${icon} ${id} ${status} ${duration}`;
 }
@@ -256,6 +267,18 @@ export const subagentToolRenderer = {
 				// observer (ctrl+s) streams the full per-subagent message history.
 				if (runningCount > 0) {
 					out.push(truncateToWidth(`  ${theme.fg("dim", "(ctrl+s to observe sessions)")}`, width, Ellipsis.Omit));
+				}
+				const liveProgress = subagents.flatMap(snapshot =>
+					snapshot.progress && snapshot.liveProgressAvailable !== false ? [snapshot.progress] : [],
+				);
+				for (const group of collectProviderDegradationGroups(liveProgress)) {
+					out.push(
+						truncateToWidth(
+							`  ${theme.fg("warning", `provider degraded: ${group.count} subagents retrying on ${group.provider}`)}`,
+							width,
+							Ellipsis.Omit,
+						),
+					);
 				}
 
 				snapshotSignatures ??= subagents.map(snapshot =>
