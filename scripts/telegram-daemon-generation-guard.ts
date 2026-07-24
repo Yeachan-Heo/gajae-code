@@ -8,10 +8,11 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 27;
+export const GUARD_CONTRACT_VERSION = 28;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
+const sdkHost = "packages/coding-agent/src/sdk/host/host.ts";
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
@@ -61,7 +62,7 @@ type GuardManifest = {
  * endpoint or provider generations: they do not replace daemon owners.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "39d01bfad41216ea32ec0e8c8b66c50f69222ea098c4f1cc775ebc656a25b74b";
+const PROTECTED_INVENTORY_SHA256 = "caea0dbab69af5b4eb3d94bfbeec64ec1c30a9b0894054cb7005bde687ee961b";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -116,6 +117,7 @@ export const CHAT_CONFIG_PROTECTED_DECLARATIONS = {
 /** Telegram tool-activity defaults and delivery admission must stay generation-fenced. */
 export const TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS = {
 	[config]: ["parseNotificationSettingsSnapshot"],
+	[sdkHost]: ["TOOL_ACTIVITY_CAPABILITY"],
 	[telegramDaemon]: [
 		"TOOL_ACTIVITY_CAPABILITY",
 		"LEGACY_TOOL_ACTIVITY_CAPABILITY",
@@ -215,7 +217,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 27) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 28) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
