@@ -14063,6 +14063,13 @@ describe("Telegram tool activity capability and routing", () => {
 			sessionId: "S",
 			toolCallId: "malformed-omitted-option",
 		});
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "unknown-phase-omitted-option",
+			toolName: "bash",
+			phase: "surprised",
+		});
 		expect(bot.calls).toHaveLength(importantCallCount);
 	});
 	test("rejects malformed tool activity even when activity is enabled", async () => {
@@ -14088,6 +14095,13 @@ describe("Telegram tool activity capability and routing", () => {
 			type: "tool_activity",
 			sessionId: "S",
 			toolCallId: "malformed-enabled",
+		});
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "unknown-phase-enabled",
+			toolName: "read",
+			phase: "surprised",
 		});
 
 		expect(bot.calls).toHaveLength(importantCallCount);
