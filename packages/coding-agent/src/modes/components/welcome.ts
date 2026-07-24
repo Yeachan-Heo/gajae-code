@@ -665,8 +665,16 @@ function gradientLogo(lines: readonly string[], phase = 0, shine?: ShineConfig):
 
 /** Total length of the intro animation. */
 const INTRO_MS = 3000;
-/** Render cadence during the intro (~30fps). */
-const INTRO_TICK_MS = 33;
+/** Resolve the intro cadence without making tests mutate global process state. */
+export function resolveWelcomeIntroTickMs(
+	platform: NodeJS.Platform = process.platform,
+	tmux = process.env.TMUX,
+): number {
+	return platform === "win32" && tmux ? 100 : 33;
+}
+
+/** Render at 30fps directly, but cap native Windows multiplexers at 10fps to avoid ConPTY output backpressure. */
+const INTRO_TICK_MS = resolveWelcomeIntroTickMs();
 /** Number of full gradient rotations the sweep performs before settling. */
 const INTRO_SWEEPS = 2.5;
 /** Number of times the shine highlight crosses the diagonal across the intro. */

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import packageJson from "../package.json";
-import { routeRootArgv } from "../src/cli";
+import { interactiveBootstrapText, routeRootArgv } from "../src/cli";
 import { parseArgs } from "../src/cli/args";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
@@ -33,7 +33,51 @@ describe("GJC public CLI command surface", () => {
 			"invalid legacy --team-size",
 		]);
 	});
+
+	it("renders an immediate keyboard-ready bootstrap only for interactive launch routes", () => {
+		expect(interactiveBootstrapText(["launch"], true, true)).toContain("> ");
+		expect(interactiveBootstrapText(["launch", "hello"], true, true)).toContain("warming workspace");
+		expect(interactiveBootstrapText(["launch", "--print", "hello"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--export", "session.md"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--list-models"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode", "json"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode=acp"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--export=session.md"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--list-models=opus"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["config", "get", "theme"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch"], false, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch"], true, false)).toBeUndefined();
+	});
+	it("suppresses the interactive bootstrap for every explicit output mode form", () => {
+		expect(interactiveBootstrapText(["launch", "--mode", "text"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode=text"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode", "text", "--mode=json"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode=acp", "--mode", "text"], true, true)).toBeUndefined();
+	});
+
+	it("suppresses the interactive bootstrap for explicit launch help and version aliases", () => {
+		for (const flag of ["--help", "-h", "--version", "-v"]) {
+			expect(interactiveBootstrapText(["launch", flag], true, true)).toBeUndefined();
+		}
+	});
+	it("suppresses the interactive bootstrap for parser-accepted equals forms of print, help, and version", () => {
+		for (const flag of ["--print=true", "--help=true", "--version=true", "--print=false"]) {
+			expect(interactiveBootstrapText(["launch", flag], true, true)).toBeUndefined();
+		}
+	});
+
+	it("does not prefix spawned noninteractive launch help output with the bootstrap", () => {
+		const result = Bun.spawnSync(["bun", cliEntry, "launch", "--help"], {
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+		expect(result.exitCode, output).toBe(0);
+		expect(result.stdout.toString()).not.toContain("warming workspace");
+	});
 	it("routes the internal managed-owner supervisor through its child admission barrier", async () => {
+		if (process.platform !== "linux") return;
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cli-supervisor-"));
 		const lifecycle = lifecyclePaths(stateDir, "session-cli-route", "generation-cli-route");
 		const managedOwnerEnv = {

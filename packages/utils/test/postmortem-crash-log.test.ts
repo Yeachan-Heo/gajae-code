@@ -1,0 +1,215 @@
+import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { CRASH_LOG_MAX_BYTES, CRASH_RECORD_MAX_BYTES, recordFatalCrash } from "../src/postmortem";
+
+function tempCrashLog(): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-crash-log-"));
+	// Nested path proves the writer creates missing parent directories.
+	return path.join(dir, "agent", "gjc-crash.log");
+}
+
+const POSTMORTEM_SOURCE = path.resolve(import.meta.dir, "../src/postmortem.ts");
+
+function spawnBun(script: string, options: { args?: string[]; env?: Record<string, string> } = {}) {
+	const result = Bun.spawnSync({
+		cmd: [process.execPath, script, ...(options.args ?? [])],
+		stdout: "pipe",
+		stderr: "pipe",
+		env: { ...process.env, ...options.env },
+	});
+	return {
+		exitCode: result.exitCode,
+		stdout: result.stdout.toString(),
+		stderr: result.stderr.toString(),
+	};
+}
+
+describe("recordFatalCrash", () => {
+	it("writes a structured, diagnosable record for an Error", () => {
+		const target = tempCrashLog();
+		const err = new Error("boom while streaming");
+		const now = new Date("2026-07-23T21:22:31.647Z");
+
+		const written = recordFatalCrash("Uncaught Exception", err, { path: target, now });
+
+		expect(written).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("2026-07-23T21:22:31.647Z");
+		expect(contents).toContain(`pid=${process.pid}`);
+		expect(contents).toContain("[Uncaught Exception]");
+		expect(contents).toContain("Error: boom while streaming");
+		// The full stack must be present so the crash is actually diagnosable.
+		expect(contents).toContain(err.stack ?? "MISSING_STACK");
+	});
+
+	it("stringifies non-Error rejection reasons", () => {
+		const target = tempCrashLog();
+		const written = recordFatalCrash("Unhandled Rejection", "Request was aborted", { path: target });
+		expect(written).toBe(target);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("[Unhandled Rejection]");
+		expect(contents).toContain("Request was aborted");
+	});
+
+	it("appends successive crashes rather than overwriting", () => {
+		const target = tempCrashLog();
+		recordFatalCrash("Uncaught Exception", new Error("first"), { path: target });
+		recordFatalCrash("Uncaught Exception", new Error("second"), { path: target });
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("Error: first");
+		expect(contents).toContain("Error: second");
+		expect(contents.indexOf("first")).toBeLessThan(contents.indexOf("second"));
+	});
+
+	it("resets past the size cap so a crash loop cannot grow unbounded", () => {
+		const target = tempCrashLog();
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		// Pre-fill beyond the 512KB cap.
+		fs.writeFileSync(target, "x".repeat(600 * 1024));
+		recordFatalCrash("Uncaught Exception", new Error("post-cap crash"), { path: target });
+		const size = fs.statSync(target).size;
+		expect(size).toBeLessThan(CRASH_LOG_MAX_BYTES);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("Error: post-cap crash");
+		// Old oversized content is gone; newest crash retained.
+		expect(contents).not.toContain("x".repeat(1024));
+	});
+
+	it("bounds a single oversized record so it cannot bypass the file cap", () => {
+		const target = tempCrashLog();
+		const huge = new Error(`megacrash ${"z".repeat(1024 * 1024)}`);
+
+		recordFatalCrash("Uncaught Exception", huge, { path: target });
+
+		const size = fs.statSync(target).size;
+		expect(size).toBeLessThanOrEqual(CRASH_RECORD_MAX_BYTES);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("megacrash");
+		expect(contents).toContain("[crash record truncated]");
+	});
+
+	it("truncates on a UTF-8 boundary without replacement characters", () => {
+		const target = tempCrashLog();
+		// Multi-byte characters right at the truncation boundary.
+		const message = `한국어 메시지 ${"가".repeat(CRASH_RECORD_MAX_BYTES)}`;
+
+		recordFatalCrash("Uncaught Exception", new Error(message), { path: target });
+
+		const size = fs.statSync(target).size;
+		expect(size).toBeLessThanOrEqual(CRASH_RECORD_MAX_BYTES);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("[crash record truncated]");
+		expect(contents).not.toContain("�");
+	});
+
+	it("redacts credential material before persisting", () => {
+		const target = tempCrashLog();
+		const bearer = "Bearer abcdef0123456789abcdef0123456789";
+		const apiKey = "sk-abcdef0123456789abcdef";
+		const github = "ghp_abcdef0123456789abcdef0123";
+		const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+		const refresh = `"refresh_token": "rt-abcdef0123456789"`;
+		const err = new Error(`auth failed: ${bearer}, ${apiKey}, ${github}, ${jwt}, ${refresh}, password=hunter2secret`);
+
+		recordFatalCrash("Uncaught Exception", err, { path: target });
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("auth failed");
+		expect(contents).toContain("«redacted»");
+		expect(contents).not.toContain("abcdef0123456789");
+		expect(contents).not.toContain("hunter2secret");
+		expect(contents).not.toContain("dozjgNryP4J3jVmNHl0w5N");
+		// The key context survives so the record stays diagnosable.
+		expect(contents).toContain('"refresh_token": "«redacted»');
+	});
+
+	it("enforces owner-only permissions on a pre-existing file", () => {
+		if (process.platform === "win32") return;
+		const target = tempCrashLog();
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(target, "prior content\n", { mode: 0o644 });
+		fs.chmodSync(target, 0o644);
+
+		recordFatalCrash("Uncaught Exception", new Error("perm check"), { path: target });
+
+		expect(fs.statSync(target).mode & 0o777).toBe(0o600);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("prior content");
+		expect(contents).toContain("perm check");
+	});
+
+	it("stays bounded when concurrent writers cross the cap simultaneously", () => {
+		const target = tempCrashLog();
+		const dir = path.dirname(path.dirname(target));
+		const writerScript = path.join(dir, "crash-writer.ts");
+		fs.writeFileSync(
+			writerScript,
+			`import { recordFatalCrash } from ${JSON.stringify(POSTMORTEM_SOURCE)};\n` +
+				`const target = process.argv[2];\n` +
+				`const payload = "y".repeat(48 * 1024);\n` +
+				`for (let i = 0; i < 10; i++) recordFatalCrash("Uncaught Exception", new Error(payload + i), { path: target });\n`,
+		);
+		const writerCount = 6;
+		const results = Array.from({ length: writerCount }, () => spawnBun(writerScript, { args: [target] }));
+		for (const result of results) expect(result.exitCode).toBe(0);
+
+		// stat-then-append races across processes may overshoot the cap, but only
+		// by at most one bounded record per racing writer.
+		const sizeAfterRace = fs.statSync(target).size;
+		expect(sizeAfterRace).toBeLessThanOrEqual(CRASH_LOG_MAX_BYTES + writerCount * CRASH_RECORD_MAX_BYTES);
+
+		// A subsequent write observes the overshoot, resets, and retains the
+		// newest crash within the cap.
+		recordFatalCrash("Uncaught Exception", new Error("post-race crash"), { path: target });
+		const finalSize = fs.statSync(target).size;
+		expect(finalSize).toBeLessThanOrEqual(CRASH_LOG_MAX_BYTES);
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("post-race crash");
+	});
+
+	it("never throws when the target path is unwritable", () => {
+		// A path whose parent is an existing file cannot be created as a directory.
+		const fileAsParent = tempCrashLog();
+		fs.mkdirSync(path.dirname(fileAsParent), { recursive: true });
+		fs.writeFileSync(fileAsParent, "i am a file");
+		const bogus = path.join(fileAsParent, "nested", "gjc-crash.log");
+		const result = recordFatalCrash("Uncaught Exception", new Error("x"), { path: bogus });
+		expect(result).toBeUndefined();
+	});
+});
+
+describe("fatal handler process fixtures", () => {
+	function runFatalFixture(body: string): { exitCode: number; stderr: string; crashLog: string } {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-fatal-fixture-"));
+		const script = path.join(dir, "fixture.ts");
+		fs.writeFileSync(script, `import ${JSON.stringify(POSTMORTEM_SOURCE)};\n${body}\n`);
+		const result = spawnBun(script, {
+			env: { GJC_CODING_AGENT_DIR: path.join(dir, "agent") },
+		});
+		return { ...result, crashLog: path.join(dir, "agent", "gjc-crash.log") };
+	}
+
+	it("persists an uncaught exception to the crash log before exiting 1", () => {
+		const { exitCode, stderr, crashLog } = runFatalFixture(`throw new Error("spawned uncaught boom");`);
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("spawned uncaught boom");
+		expect(stderr).toContain("crash recorded at");
+		const contents = fs.readFileSync(crashLog, "utf8");
+		expect(contents).toContain("[Uncaught Exception]");
+		expect(contents).toContain("spawned uncaught boom");
+	});
+
+	it("persists an unhandled rejection to the crash log before exiting 1", () => {
+		const { exitCode, stderr, crashLog } = runFatalFixture(
+			`void Promise.reject(new Error("spawned rejection boom"));`,
+		);
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain("spawned rejection boom");
+		expect(stderr).toContain("crash recorded at");
+		const contents = fs.readFileSync(crashLog, "utf8");
+		expect(contents).toContain("[Unhandled Rejection]");
+		expect(contents).toContain("spawned rejection boom");
+	});
+});

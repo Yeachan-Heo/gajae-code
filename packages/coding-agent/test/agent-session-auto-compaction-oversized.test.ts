@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
-import { getBundledModel } from "@gajae-code/ai";
+import { getBundledModel, type Model } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
@@ -65,6 +65,31 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 			sessionManager.appendMessage(assistant);
 		}
 	}
+	function replaceSession(model: Model, settingsOverrides: Record<string, unknown> = {}): void {
+		authStorage.setRuntimeApiKey(model.provider, "test-key");
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.keepRecentTokens": 1,
+				"contextPromotion.enabled": false,
+				"retry.enabled": false,
+				"todo.reminders": false,
+				...settingsOverrides,
+			}),
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+	}
 
 	it("skips an unchanged oversized auto-maintenance retry after a context-length failure", async () => {
 		appendConversation();
@@ -109,5 +134,32 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 		await session.runIdleCompaction();
 
 		expect(compactSpy).toHaveBeenCalledTimes(4);
+	});
+	it("does not retry a Kimi Code compaction first-event timeout on the same candidate", async () => {
+		const model = getBundledModel("kimi-code", "kimi-k2.5");
+		if (!model) throw new Error("Expected bundled Kimi Code model");
+		await session.dispose();
+		replaceSession(model, {
+			"retry.enabled": true,
+			"retry.maxRetries": 2,
+			"retry.baseDelayMs": 1,
+		});
+		appendConversation("Kimi compaction timeout");
+		const compactSpy = vi
+			.spyOn(compactionModule, "compact")
+			.mockImplementation((_preparation, candidate) =>
+				Promise.reject(
+					new Error(
+						candidate.provider === "kimi-code"
+							? "Summarization failed: Provider stream timed out while waiting for the first event"
+							: "terminal compaction failure",
+					),
+				),
+			);
+
+		await session.runIdleCompaction();
+
+		const matchingCalls = compactSpy.mock.calls.filter(([, candidate]) => candidate.id === model.id);
+		expect(matchingCalls).toHaveLength(1);
 	});
 });

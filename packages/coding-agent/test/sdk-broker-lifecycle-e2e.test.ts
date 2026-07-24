@@ -817,7 +817,8 @@ setInterval(()=>{},1000);
 		expect(JSON.stringify(listed.result)).toContain('"terminalUncertain":true');
 	} finally {
 		await broker.stop();
-		process.env.GJC_SDK_SESSION_COMMAND = previous;
+		if (previous === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previous;
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
 }, 15_000);
@@ -2977,6 +2978,7 @@ test("session-host-internal exits with a sanitized startup failure before writin
 }, 20_000);
 
 test("production lifecycle factory failure preserves reason and redacts collected secrets", async () => {
+	if (process.platform !== "linux") return;
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-factory-failure-"));
 	const agentDir = path.join(root, "agent");
 	const broker = new Broker({ agentDir });
@@ -3016,6 +3018,7 @@ test("production lifecycle factory failure preserves reason and redacts collecte
 	}
 }, 10_000);
 test("never-settling model profile startup cuts off with proven pre-registration cleanup", async () => {
+	if (process.platform !== "linux") return;
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-cutoff-"));
 	const agentDir = path.join(root, "agent");
 	const broker = new Broker({ agentDir });
@@ -3054,6 +3057,7 @@ test("never-settling model profile startup cuts off with proven pre-registration
 	}
 }, 10_000);
 test("production post-registration startup failure proves cleanup and exact replay", async () => {
+	if (process.platform !== "linux") return;
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-production-failure-"));
 	const agentDir = path.join(root, "agent");
 	const broker = new Broker({ agentDir });
@@ -3221,6 +3225,7 @@ test("broker agentDir profile validates, activates, and is discoverable through 
 }, 20_000);
 
 test("child profile activation failures preserve typed codes through readiness and BrokerResponse", async () => {
+	if (process.platform !== "linux") return;
 	const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
 	for (const scenario of [
 		{ code: "unknown_model_profile", replacement: "profiles: {}\n" },

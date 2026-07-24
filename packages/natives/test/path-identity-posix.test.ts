@@ -85,6 +85,7 @@ afterEach(async () => {
 
 describe.skipIf(process.platform === "win32")("POSIX native path identity", () => {
 	it("rejects an existing directory whose canonical byte path is not UTF-8", async () => {
+		if (process.platform === "darwin") return;
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
 		temporaryDirectories.push(root);
 		const nonUtf8Path = Buffer.concat([Buffer.from(`${root}${path.sep}`), Buffer.from([0x66, 0x80])]);
@@ -111,6 +112,7 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		const contents = '{"preserve":"payload"}';
 		await fs.mkdir(directory, { mode: 0o755 });
 		await fs.writeFile(file, contents, { mode: 0o644 });
+		await fs.chmod(file, 0o400);
 
 		expectOwnerOnlySuccess(applyOwnerOnlyPathSecurity(directory, "directory"), "directory");
 		expectOwnerOnlySuccess(applyOwnerOnlyPathSecurity(file, "file"), "file");

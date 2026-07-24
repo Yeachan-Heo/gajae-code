@@ -96,14 +96,15 @@ If this raw bundled skill is loaded by GJC's native skill loader through `/skill
 ## Corrupt current-session state recovery
 
 When deep-interview detects its own current-session state is corrupt, tampered, unreadable, or stale on resume, run `gjc state clear --force --mode deep-interview` before reseeding or restarting. Scope the clear to the current session via `--session-id`, the command payload, or `GJC_SESSION_ID`; it clears only deep-interview state for that session and never clears other skills or sessions.
+For ordinary diagnosis, run `gjc deep-interview sanity-check --session-id <id> --json` first, then use the issue's selector with `inspect` to read only the affected summary, topology, pending shell, round, facts, triggers, or floor. Repair a healthy, repairable local issue with its matching typed operation (`initialize-context`, `confirm-topology`, `record-answer`, or `apply-round-result`) and the current revision. Do not use grep/sed edits, direct `.gjc/` edits, generic envelope replacement, or `--force` as a repair mechanism; use generic `gjc state` only for the compatibility clear/handoff paths documented here.
 
 ## Phase 0: Resolve Ambiguity Threshold (blocking prerequisite)
 
 Complete this phase before Phase 1, before brownfield exploration, before GJC state persistence, before Round 0, and before any ambiguity scoring. Do not continue if the resolved threshold and source are unknown.
 
-1. **Prefer pre-resolved native state**:
-   - First inspect active deep-interview state with `gjc state deep-interview read --json`.
-   - If state contains a finite numeric `threshold` and a non-empty `threshold_source`, use those values, set `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`, and skip optional settings-file reads. This is the normal `/skill:deep-interview` path because the native hook already resolved settings quietly before loading the skill.
+1. **Inspect the native summary first**:
+   - Run `gjc deep-interview inspect --session-id <id> --selector summary --json`.
+   - If the summary contains a finite `threshold` and its preserved source is available from native state, use those values, set `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`, and skip optional settings-file reads. This is the normal `/skill:deep-interview` path because the native hook already resolved settings quietly before loading the skill.
 2. **Only if native state lacks a resolved threshold, read threshold settings in runtime precedence order**:
    - YAML config first: read the **single** modern config path the environment selects — `$GJC_CODING_AGENT_DIR/config.yml` when `GJC_CODING_AGENT_DIR` is set, else `$GJC_CONFIG_DIR/agent/config.yml` when `GJC_CONFIG_DIR` is set, else `~/.gjc/agent/config.yml`. Do not cascade through the other YAML locations when the selected one is absent or invalid.
    - Then JSON settings: project settings `./.gjc/settings.json`, then user settings `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`.
@@ -119,19 +120,19 @@ Deep Interview threshold: <resolvedThresholdPercent> (source: <resolvedThreshold
 ```
 
 5. **Carry threshold source forward mechanically**:
-   - Substitute `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` throughout the remaining instructions before continuing.
-   - Include `threshold_source` in the first `gjc state write` payload and preserve it on later state updates; do not edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
+   - Pass threshold/source only as bounded setup evidence to `initialize-context`; native state owns the envelope, revision, receipt, lifecycle, derived ambiguity, and later updates. Do not reconstruct or submit a generic state envelope during normal flow.
    - Include both threshold and source in the final spec metadata.
 - Read any `language` object from active deep-interview state and carry `language.instruction` forward mechanically. If absent, default to English unless `{{ARGUMENTS}}` makes another user/session language obvious or the user explicitly requests another language. Do not add language-specific special cases.
 
 ## Phase 0.5: Suitability Gate
 
-Run this gate after the Phase 0 threshold marker and before Phase 1, brownfield exploration, `gjc state write`, Round 0, ambiguity scoring, or spec writing.
+Run this gate after the Phase 0 threshold marker and before Phase 1, brownfield exploration, typed initialization, Round 0, ambiguity scoring, or spec writing.
 
 If the user request appended after this skill as the final `User:` line is already clear, bounded, low-risk, and asks for a quick fix, single change, known file/symbol edit, explicit command, or direct answer:
 
 1. **Stop deep-interview immediately**:
-   - First inspect current-session state with `gjc state read --mode deep-interview --json` (include `--session-id <current-session-id>` when available).
+   - First inspect current-session state with `gjc deep-interview inspect --session-id <current-session-id> --selector summary --json`.
+   - For compatibility-only recovery where typed inspection is unavailable, `gjc state read --mode deep-interview --json` may confirm whether this narrow clear is safe; never use it to rebuild or replace state.
    - Clear through `gjc state clear --force --mode deep-interview --json` only when the state is a newly seeded empty interview: no recorded `rounds`, no `spec_path`, no `handoff_from`, no final/pending spec, and no user-confirmed topology.
    - If state already contains rounds, a spec path, handoff metadata, pending approval, or confirmed topology, do not clear it. Preserve the active interview and ask the user whether to continue, cancel, or explicitly clear the workflow.
    - Do not initialize deep-interview state.
@@ -181,46 +182,17 @@ Run this phase only when the active deep-interview state or invocation indicates
    - Preferred: pass the spec markdown **inline** to the native deep-interview write command (`--write … --spec "<markdown>"`) — no scratch file is needed. The CLI is the only sanctioned writer for `.gjc/_session-{sessionid}/specs`.
    - Only if a spec is too large to pass inline, stage it with the `write` tool to a system temp directory (`os.tmpdir()`/`$TMPDIR`, `/tmp`, `/var/tmp`) outside the project tree, then pass that path to `--spec`. The planning phase-boundary block tolerates these neutral temp writes; never stage interview artifacts inside the repo or under `.gjc/`, and do not improvise repo-relative scratch files.
 
-4. **Initialize state** via `gjc state write`:
-
-```json
-{
-  "active": true,
-  "current_phase": "interviewing",
-  "state": {
-    "interview_id": "<uuid>",
-    "type": "greenfield|brownfield",
-    "initial_idea": "<prompt-safe initial-context summary or user input>",
-    "initial_context_summary": "<summary if oversized, else null>",
-    "rounds": [],
-    "established_facts": [],
-    "current_ambiguity": 1.0,
-    "threshold": <resolvedThreshold>,
-    "threshold_source": "<resolvedThresholdSource>",
-    "language": "<existing language object from active state, if present>",
-    "trace_summary": "<bounded trace summary when --trace is active, else null>",
-    "codebase_context": null,
-    "topology": {
-      "status": "pending|confirmed|legacy_missing",
-      "confirmed_at": null,
-      "components": [],
-      "deferrals": [],
-      "last_targeted_component_id": null
-    },
-    "ontology_snapshots": [],
-    "auto_researched_rounds": [],
-    "auto_answered_rounds": [],
-    "lateral_reviews": [],
-    "lateral_panel_failures": 0,
-    "auto_answer_streak": 0,
-    "refined_rounds": [],
-    "closure_overrides": [],
-    "restated_goal": null,
-    "ambiguity_milestone": "initial",
-    "architect_failures": 0
-  }
-}
+4. **Initialize through a CLI-owned draft.** Create an `initialize-context` draft, edit only its bounded fields, check it, then consume it through the typed command. Never serialize a setup request, envelope, or derived values inline:
+```sh
+gjc deep-interview draft create --for initialize-context --session-id <id> --json
+# Capture draft_id and draft_revision from the response.
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /type --value greenfield --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /initial_idea --value "<prompt-safe idea>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /threshold_source --value "<source>" --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview initialize-context --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
+`draft create` records the state base revision; every edit returns the next `draft_revision`. The native runtime validates, consumes, stamps, and owns the complete state. Retain the returned state revision for inspection only; mutations consume their own checked draft.
 
 5. **Announce the interview** to the user:
 
@@ -267,46 +239,20 @@ Options should include contextually relevant choices such as **Looks right**, **
 
 The Round 0 `ask` call MUST include `deepInterview.round = 0`, `deepInterview.component = "review-topology"`, `deepInterview.dimension = "topology"`, `deepInterview.intent_contract.items` containing the exact displayed locked-intent items, and `deepInterview.intent_contract.confirmation_options` listing only the displayed affirmative labels that lock the proposal (normally **Looks right**). The runtime recorder canonicalizes and locks this contract only when the user selects one of those labels; correction, deferral, free-text, and clarification answers never lock the pre-question proposal. Do not manually copy raw free text into intent evidence, and do not continue if this required recorder write fails.
 
-3. **Lock topology into state** after the answer. Store a normalized component list and confirmation timestamp:
-
-```json
-{
-  "topology": {
-    "status": "confirmed",
-    "confirmed_at": "<ISO-8601 timestamp>",
-    "components": [
-      {
-        "id": "component-slug",
-        "name": "Component Name",
-        "description": "Confirmed top-level outcome",
-        "status": "active|deferred",
-        "evidence": ["initial prompt phrase or brownfield citation"],
-        "clarity_scores": {
-          "goal": null,
-          "constraints": null,
-          "criteria": null,
-          "context": null
-        },
-        "weakest_dimension": null
-      }
-    ],
-    "deferrals": [
-      {
-        "component_id": "component-slug",
-        "reason": "User-confirmed deferral reason",
-        "confirmed_at": "<ISO-8601 timestamp>"
-      }
-    ],
-    "last_targeted_component_id": null
-  }
-}
+3. **Lock topology through a CLI-owned draft** after the answer. Create a `confirm-topology` draft, use a valueless append on a missing object-item array to add an `{}` scaffold, set scalar leaves, and check it. A valueless append on a missing scalar-item array initializes `[]`; on an existing scalar-item array, append still requires `--value` or `--value-file`. For a topology with zero deferrals, initialize `/deferred_components` with that valueless scalar-array append, then consume it:
+```sh
+gjc deep-interview draft create --for confirm-topology --session-id <id> --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op append --path /components --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /components/0/id --value <component_id> --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /components/0/name --value "<component name>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op append --path /deferred_components --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview confirm-topology --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
+The recorder still persists `state.intent_contract` from the Round 0 `ask` answer. The runtime validates pending/legacy state, preserves declared ordering, detects conflicting confirmations, derives component state, and returns the new revision. Do not replace `topology` through `gjc state write`.
+It contains the four exact categories `artifact`, `surface`, `integration`, and `constraint`; every item has a unique category-prefixed ID (for example `surface:review`). The recorder canonically sorts items, persists the full SHA-256 manifest digest, and binds confirmation to a redacted answer-hash reference. Before spec persistence, include every preserved locked ID literally in the final spec. For a proposed missing locked ID, ask one intent-review question through `ask`; the runtime records `pending` unless the user selects an exact approval option, and spec persistence/handoff fail closed for missing, stale, or unrecorded reduction-review evidence. Intent review authorizes only that output reduction, never execution or handoff.
 
-In the same Round 0 answer, the runtime recorder persists `state.intent_contract` version 1 from `deepInterview.intent_contract.items`. It contains the four exact categories `artifact`, `surface`, `integration`, and `constraint`; every item has a unique category-prefixed ID (for example `surface:review`) and a bounded non-empty statement. The recorder canonically sorts items, persists the full SHA-256 manifest digest, and binds confirmation to a redacted answer-hash reference. The confirmation answer locks this manifest before Round 1; later prose, inferred implementation detail, raw answer content, or a regenerated digest cannot replace it.
-
-Before spec persistence, include every preserved locked ID literally in the final spec. Additions and clarifications need no extra question; the runtime derives and persists a `not_required` review when every locked ID remains. For any proposed missing locked ID, ask one intent-review question through `ask` and include `deepInterview.intent_review` with the proposed `observed_items`, every `supporting_substitution`, and the exact `approval_options` labels that count as approval. The runtime recorder writes `pending` when the user does not approve and writes `approved` only when an approval option is selected, binding the review to the recorder-generated answer hash without storing raw answer text. Approved reductions require every removed ID to map to an observed replacement ID. Spec persistence and handoff fail closed for missing, pending, malformed, stale, or unrecorded reduction review evidence. Intent review approves only that output reduction and never authorizes execution or ralplan handoff.
-
-4. **Legacy state migration:** When resuming an existing `deep-interview` state file that lacks `topology`, treat it as `"status": "legacy_missing"`. If no final `spec_path` exists yet, run Round 0 before the next ambiguity scoring pass and then continue with the existing transcript. If a final spec already exists, do not rewrite history; note in any handoff that topology was not captured for that legacy interview.
+4. **Legacy state migration:** When a resumed legacy interview lacks confirmed topology and no final `spec_path` exists, run Round 0 and use `confirm-topology` before the next ambiguity scoring pass. If a final spec already exists, do not rewrite history; note in any handoff that topology was not captured for that legacy interview.
 
 5. **Single-component pass-through:** If the user confirms one active component, Phase 2 proceeds with the existing flow while still carrying `topology.components[0]` into scoring and spec output.
 
@@ -370,9 +316,19 @@ Options should include contextually relevant choices plus free-text, translated/
 
 After applying `language.instruction` to the visible question, options, and generated rationale, apply the self-proofread once to new prose only (DIPP-5); preserve only the Round/Component/Targeting/Ambiguity line structure, fixed labels, numeric ambiguity value, component/target identifiers, and `deepInterview.*` metadata keys. Do not exempt generated natural-language rationale such as Why now.
 
-When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line; if metadata cannot be supplied, the legacy formatted question text remains the fallback.
+When calling `ask`, SHOULD include optional structured metadata so the runtime can record the round without manual state writes: `deepInterview.round_id?`, `deepInterview.round`, `deepInterview.component`, `deepInterview.dimension`, and `deepInterview.ambiguity`. Keep this metadata aligned with the visible Round/Component/Targeting/Ambiguity line. Recorder-first remains mandatory. If the runtime did not record the answer shell, inspect `pending` or `round` to obtain its identity, then create a `record-answer` draft with that identity, edit scalar leaves, scaffold option arrays, and consume it:
+```sh
+gjc deep-interview draft create --for record-answer --session-id <id> --round <n> --question-id <id> [--round-id <id>] [--component-id <id>] [--dimension <dimension>] --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /question --value "<question>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op append --path /answer/selected_options --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /answer/selected_options/0 --value "<selected option>" --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /answer/custom_input --null --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview record-answer --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
+```
+Do not recreate transcript, rounds, or generic state JSON.
 
-If the `ask` tool returns `clarificationQuestion`, treat it as a non-answer about the displayed choices. Answer the clarification briefly from the current interview context, then call `ask` again with the exact original question, options, and `deepInterview.*` metadata. A clarification bypasses Step 2b′ auto-answer, Step 2b″ free-text refine, Step 2c ambiguity scoring, Step 2d progress reporting, and Step 2e state updates; it must not be recorded as a round answer. This does not violate the one-question-per-round rule because the round remains unresolved until the user submits a real listed option or `Other` answer.
+If the `ask` tool returns `clarificationQuestion`, treat it as a non-answer about the displayed choices. Answer the clarification briefly from the current interview context, then call `ask` again with the exact original question, options, and `deepInterview.*` metadata. A clarification bypasses Step 2b′ auto-answer, Step 2b″ free-text refine, Step 2c ambiguity scoring, Step 2d apply-and-report, and Step 2e soft-limit checks; it must not be recorded as a round answer. This does not violate the one-question-per-round rule because the round remains unresolved until the user submits a real listed option or `Other` answer.
 
 ### Step 2b′: Auto-Answer Opted-Out Questions
 
@@ -406,24 +362,17 @@ Ambiguity-raising triggers:
 
 Use **mechanism A** for every ambiguity rise: a trigger LOWERS the affected component/dimension clarity score, and the existing weighted formula raises ambiguity. There is **no separate penalty term**; ambiguity remains bounded by the same greenfield/brownfield formula.
 
-**Deterministic ambiguity floor (runtime-enforced).** The runtime independently computes a code-level floor from persisted state and clamps every reported ambiguity to `max(reported, floor)` at write time — the scorer cannot under-report below what code can objectively measure:
+**Native ambiguity and floor.** Submit candidate component scores, trigger/fact operations, ontology evidence, targeting, and bookkeeping in `RoundResult`; the runtime alone derives weighted ambiguity, floor, effective ambiguity, milestone, ontology stability, trigger correspondence, rotation, and auto-resolution streak. Do not calculate, assert, or persist any of those derived values in the request.
 
-- `+0.10` per established fact marked `disputed` that has no `superseded_by` resolution (contradiction pressure)
-- `+0.05` per active topology component whose goal/constraints/criteria clarity is still unscored (gap pressure — persist `topology.components[].clarity_scores` every round or the floor blocks convergence)
-- `+0.05 × (auto-answered rounds / scored rounds)` (assumption dilution)
-
-Cooperate with the floor rather than fight it:
-- Replacing an already-scored answer for the same round (a retraction/pivot) automatically marks that round's established facts as disputed; ambiguity rises mechanically even when no trigger is reported. Treat a floor-driven rise as trigger evidence and score the affected dimensions accordingly.
-- A disputed fact keeps the floor at or above `0.10` — above the default threshold — so convergence is blocked until the dispute is resolved: either the user re-confirms the original fact (set `disputed: false`) or the superseding decision is recorded as a new established fact and the old fact gets `superseded_by: <new fact id>`. Never delete the contradicted fact.
-- When the effective score was clamped upward, the persisted round carries `reported_ambiguity` (your raw score) and `ambiguity_floor`; report the floor and its dominant cause in the Step 2d table instead of pretending the raw score held.
+The native floor retains contradiction pressure, unscored active-component pressure, and auto-answer dilution. A disputed fact blocks convergence until it is resolved through the typed fact operation; never delete contradicted history. When the response reports a clamp, show the returned floor and dominant cause rather than inventing a score.
 
 The rise is SILENT: no modal, no forced-resolution step, and no dedicated conflict UI. Surface it through the normal per-round report and by targeting the next question at the affected component/dimension.
 
-Structured scorer output is required. Include `triggers`, `trigger_status`, `affected_component`, `affected_dimension`, `prior_dimension_score`, `new_dimension_score`, `prior_ambiguity`, `new_ambiguity`, `evidence`, `contradicted_established_fact` when relevant, and `disputed_unresolved_rationale` when applicable.
+Structured scorer output is required. Include `triggers`, `trigger_status`, `affected_component`, `affected_dimension`, `prior_dimension_score`, `new_dimension_score`, `evidence`, `contradicted_established_fact` when relevant, and `disputed_unresolved_rationale` when applicable. Do not include prior/new ambiguity, floor, effective ambiguity, or milestone assertions.
 
 Established-facts maintenance: promote stable confirmed decisions into `state.established_facts` with source/evidence; when a new answer contradicts an established fact, mark the fact disputed and preserve the contradicted fact instead of deleting it. When the user later confirms the new direction, record the superseding decision as a new established fact and set `superseded_by: <new fact id>` on the disputed fact — that is the only way to release the deterministic floor pressure while keeping the audit trail.
 
-TRANSITION VALIDATION: if a trigger is present, the affected dimension must not improve and overall ambiguity must rise vs the prior scored round, unless the trigger is explicitly marked disputed or unresolved with rationale.
+TRANSITION VALIDATION: if a trigger is present, the affected dimension must not improve unless the trigger is explicitly marked disputed or unresolved with rationale. The runtime validates and returns the authoritative ambiguity transition.
 
 Convergence Pacing deferral: do not add a min-round floor, score-drop cap, confidence dampening, or other explicit pacing brake. Bidirectional scoring is the pacing mechanism.
 
@@ -464,7 +413,7 @@ Also identify:
 - weakest_dimension: the single lowest-confidence dimension for that component this round
 - weakest_dimension_rationale: one sentence explaining why this component/dimension pair is the highest-leverage target for the next question
 - component_scores: object keyed by component id, with per-dimension scores and gaps
-- structured_scorer_output: object containing triggers, trigger_status, affected_component, affected_dimension, prior_dimension_score, new_dimension_score, prior_ambiguity, new_ambiguity, evidence, contradicted_established_fact when relevant, and disputed_unresolved_rationale when applicable
+- structured_scorer_output: object containing triggers, trigger_status, affected_component, affected_dimension, prior_dimension_score, new_dimension_score, evidence, contradicted_established_fact when relevant, and disputed_unresolved_rationale when applicable; do not include ambiguity, floor, or milestone values
 
 5. Ontology Extraction: Identify all key entities (nouns) discussed in the transcript.
 
@@ -479,85 +428,51 @@ For each entity provide:
 Respond as JSON. Include an additional "ontology" key containing the entities array alongside the dimension scores.
 ```
 
-**Calculate ambiguity:**
+**Ontology input:** provide entities, relationships, and concise reasoning in `RoundResult`. The runtime determines first-round/no-entity handling, exact-name stability, deterministic renamed matching, counts, ratio, and snapshot persistence. Report the returned ontology result; do not send caller-computed counts, ratios, or snapshots.
 
-Greenfield: `ambiguity = 1 - (goal × 0.40 + constraints × 0.30 + criteria × 0.30)`
-Brownfield: `ambiguity = 1 - (goal × 0.35 + constraints × 0.25 + criteria × 0.25 + context × 0.15)`
-Brownfield adds the 15% Context Clarity dimension (Goal/Constraint/Criteria become 35/25/25) because safely modifying existing code requires understanding the system being changed.
-
-**Calculate ontology stability:**
-
-**Round 1 special case:** For the first round, skip stability comparison. All entities are "new". Set stability_ratio = N/A. If any round produces zero entities, set stability_ratio = N/A (avoids division by zero).
-
-For rounds 2+, compare with the previous round's entity list:
-- `stable_entities`: entities present in both rounds with the same name
-- `changed_entities`: entities with different names but the same type AND >50% field overlap (treated as renamed, not new+removed)
-- `new_entities`: entities in this round not matched by name or fuzzy-match to any previous entity
-- `removed_entities`: entities in the previous round not matched to any current entity
-- `stability_ratio`: (stable + changed) / total_entities (0.0 to 1.0, where 1.0 = fully converged)
-
-This formula counts renamed entities (changed) toward stability. Renamed entities indicate the concept persists even if the name shifted — this is convergence, not instability. Two entities with different names but the same `type` and >50% field overlap should be classified as "changed" (renamed), not as one removed and one added.
-
-**Show your work:** Before reporting stability numbers, briefly list which entities were matched (by name or fuzzy) and which are new/removed. This lets the user sanity-check the matching.
-
-Store the ontology snapshot (entities + stability_ratio + matching_reasoning) in `state.ontology_snapshots[]`.
-
-### Step 2d: Report Progress
-
-After scoring, show the user their progress:
-
+### Step 2d: Apply Round Result and Report Progress
+After `ask` has recorded (or `record-answer` has recovered) the answer shell, inspect `pending` or `round` for its identity. Create an `apply-round-result` draft, edit only bounded scorer evidence, check it, and consume it once:
+```sh
+gjc deep-interview draft create --for apply-round-result --session-id <id> --round-key <round_key> --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <draft_revision> --op set --path /global_scores/goal --value 0.8 --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op append --path /component_updates --json
+gjc deep-interview draft edit --draft-id <draft_id> --expected-draft-revision <next_draft_revision> --op set --path /component_updates/0/component_id --value <component_id> --json
+gjc deep-interview draft check --draft-id <draft_id> --json
+gjc deep-interview apply-round-result --draft-id <draft_id> --expected-draft-revision <latest_draft_revision> --json
 ```
+`RoundResult` remains candidate scores, component updates, triggers, fact operations, ontology input, targeting, and bookkeeping only. The runtime performs one authoritative transaction, returns native-derived scoring and the new revision, and rejects stale, conflicting, malformed, or unrecoverable state. Never enrich a round through `gjc state write`.
+
+After the typed transaction succeeds, consume `<native>.native_projection` as the version 1 native projection. Render only the paths listed below; do not report candidate values, inspect-state values, locally calculated values, names, weights, gaps, thresholds, ratios, causes, or milestone transitions that the projection does not expose.
+
+```text
 Round {n} complete.
 
-| Dimension | Score | Weight | Weighted | Gap |
-|-----------|-------|--------|----------|-----|
-| Goal | {s} | {w} | {s*w} | {gap or "Clear"} |
-| Constraints | {s} | {w} | {s*w} | {gap or "Clear"} |
-| Success Criteria | {s} | {w} | {s*w} | {gap or "Clear"} |
-| Context (brownfield) | {s} | {w} | {s*w} | {gap or "Clear"} |
-| **Ambiguity** | | | **{prior_score}% -> {score}% {up|down|flat}** | {if up: trigger name such as "A direct contradiction"} |
-| **Floor** (only when clamped) | | | **{floor}%** | {dominant cause: disputed fact / unscored component / auto-answer dilution} |
-
-**Topology:** Targeted {target_component_name} | Active: {active_component_count} | Deferred: {deferred_component_count} | Next rotation after: {last_targeted_component_id}
-
-**Ontology:** {entity_count} entities | Stability: {stability_ratio} | New: {new} | Changed: {changed} | Stable: {stable}
-**Milestone:** {prior_milestone} → {current_milestone}{milestone_transition ? " — lateral panel convened" : ""}
-
-**Next target:** {target_component_name} / {weakest_dimension} — {weakest_dimension_rationale}
-
-{score <= threshold ? "Clarity threshold met! Ready to proceed." : "Focusing next question on: {weakest_dimension}"}
-
+Ambiguity: prior {<native>.native_projection.prior_effective_ambiguity}; current {<native>.native_projection.effective_ambiguity} ({<native>.native_projection.direction})
+Floor: {<native>.native_projection.floor}
+Milestone: {<native>.native_projection.ambiguity_milestone}
+Topology: target {<native>.native_projection.targeting.target_component_id}; active {<native>.native_projection.topology_counts.active}; deferred {<native>.native_projection.topology_counts.deferred}; total {<native>.native_projection.topology_counts.total}
+Ontology: stable {<native>.native_projection.ontology_counts.stable}; changed {<native>.native_projection.ontology_counts.changed}; new {<native>.native_projection.ontology_counts.new}
+Next target: {<native>.native_projection.targeting.target_component_id} / {<native>.native_projection.targeting.target_dimension}
+Auto-answer streak: {<native>.native_projection.transition.auto_answer_streak}
 ```
 
-Apply `language.instruction` when present before showing this progress report so status text, gaps, and next-target phrasing stay in the preserved session language.
+`prior_effective_ambiguity` may be `null` on the first scored round; show that returned value rather than inventing a prior percentage. The transition lifecycle and round identity remain available at `<native>.native_projection.transition.lifecycle` and `<native>.native_projection.transition.round_key` for control flow, but are not progress prose.
 
-Then apply the self-proofread once (DIPP-5) to narrative status text, generated prose cells, gaps, and next-target phrasing; preserve only table structure, fixed status labels, scores, weights, component ids, and trigger tokens.
+Apply `language.instruction` when present before showing this progress report; apply the self-proofread once (DIPP-5) to narrative status text, generated prose cells, gaps, and next-target phrasing while preserving the real native projection paths and fixed report structure.
 
-### Step 2e: Update State
-
-Update state in two phases. The `ask` answer is first recorded by the runtime as an `answered` shell. Scoring then enriches the same round record to `scored` with global scores, per-component `topology.components[].clarity_scores`, `topology.components[].weakest_dimension`, trigger metadata, established-facts changes, ontology snapshot, `topology.last_targeted_component_id`, `auto_researched_rounds`, `auto_answered_rounds`, and `architect_failures`. When `deepInterview` ask metadata is present, no manual per-round `gjc state write` is required for the answer shell; only scoring enrichment/state maintenance remains. When metadata is absent, use the legacy `gjc state write` path to persist the new round and never patch `.gjc/_session-{sessionid}/state` directly unless an explicit force override is active.
-Also recompute and persist `ambiguity_milestone` each round (detect band transitions for the Phase 3 panel), and persist `auto_answer_streak`, `refined_rounds`, `lateral_reviews`, and `lateral_panel_failures` alongside the existing fields.
-
-### Step 2f: Check Tiered Confirmation Cadence
+### Step 2e: Check Tiered Confirmation Cadence
 
 Confirmation cadence is tiered by round, adopted from ouroboros's ooo interview, while the hard safety cap is retained:
 
 - **Rounds 1-3 (auto-continue)**: minimum context gathering — proceed to the next question without a "continue?" prompt.
-- **Rounds 4-15 (ask to continue)**: after each round, ask "Continue, or proceed with current clarity ({score}%)?" so the user controls depth.
-- **Rounds 16+ (diminishing-returns warning)**: keep asking "Continue?" but prefix a diminishing-returns warning: "We're at {n} rounds (ambiguity: {score}%); each further round yields less. Continue or proceed?"
+- **Rounds 4-15 (ask to continue)**: after each round, ask "Continue, or proceed with current clarity ({<native>.native_projection.effective_ambiguity}%)?" so the user controls depth.
+- **Rounds 16+ (diminishing-returns warning)**: keep asking "Continue?" but prefix a diminishing-returns warning: "We're at {n} rounds (ambiguity: {<native>.native_projection.effective_ambiguity}%); each further round yields less. Continue or proceed?"
 - **Round 3+ early exit**: still allow immediate exit if the user says "enough", "let's go", "build it".
-- **Round 100 (hard cap)**: "Maximum interview rounds reached. Proceeding with current clarity level ({score}%)." The tiered cadence never removes this hard safety cap.
+- **Round 100 (hard cap)**: "Maximum interview rounds reached. Proceeding with current clarity level ({<native>.native_projection.effective_ambiguity}%)." The tiered cadence never removes this hard safety cap.
 
 ## Phase 3: Lateral Review Panel (milestone-triggered)
 
-The interview convenes a short multi-persona panel at **ambiguity-milestone transitions** instead of at fixed round numbers. Define milestone bands from the round's ambiguity score:
-
-| Band | Ambiguity |
-|------|-----------|
-| `initial` | > 0.60 |
-| `progress` | 0.60 ≥ a > 0.30 |
-| `refined` | 0.30 ≥ a > threshold |
-| `ready` | ≤ threshold |
+The runtime returns the sole ready-first milestone mapping: `ready` when effective ambiguity is at or below the frozen threshold; otherwise `initial` above 0.60, `progress` above 0.30, and `refined` at or below 0.30. Use the returned milestone rather than recalculating bands.
 
 A transition occurs whenever the band changes versus the prior scored round — in either direction, since bidirectional scoring can move the band back up. On a transition, and also before synthesizing any agent-supplied answer (auto-research candidates, an auto-answer, or a code/brownfield auto-confirm that carries real interpretation), convene the panel before generating or asking the next question.
 
@@ -657,7 +572,7 @@ Spec structure:
 {List stable confirmed decisions promoted into `state.established_facts`, including source round, evidence, and disputed status when any fact was contradicted.}
 
 ## Trigger Metadata
-{Summarize per-round trigger metadata: trigger label/status, affected component/dimension, prior -> new ambiguity direction, evidence, contradicted established fact when relevant, and disputed/unresolved rationale when applicable.}
+{Summarize per-round trigger metadata: trigger label/status, affected component/dimension, native-returned effective ambiguity transition, evidence, contradicted established fact when relevant, and disputed/unresolved rationale when applicable.}
 
 ## Lateral Review Panel
 {Summarize convened panels: round, milestone transition or pre-answer trigger, personas dispatched, and the concrete findings folded into questions. Note any lateral_panel_failures.}
@@ -800,7 +715,7 @@ Skipping any stage is possible but reduces quality assurance:
 - Use `read/search/find exploration or a bounded read-only planner/architect subagent` for brownfield codebase exploration (run BEFORE asking user about codebase)
 - Use opus model (temperature 0.1) for ambiguity scoring — consistency is critical
 - Round 0 topology confirmation happens before ambiguity scoring; Phase 2 scoring must honor locked topology and rotate targeting across active components when more than one is present
-- Use `gjc state write` / `gjc state read` for interview state persistence; the initial and subsequent deep-interview state payloads must include `threshold_source` alongside `threshold`; do not edit `.gjc/_session-{sessionid}/state` directly without force override.
+- Normal interview persistence uses CLI-owned drafts: `gjc deep-interview draft create|edit|show|check|rebase|discard`, followed by the matching typed command with `--draft-id --expected-draft-revision <latest_draft_revision> --json`. All public draft commands require standalone `--json`; value-taking flags use exactly `--name value`, while `--json` and `--null` take no value, and there is no public `draft consume` command. Use `--value`, standalone `--null`, and append scaffolds for bounded payload fields: valueless append on a missing object-item array appends `{}`, valueless append on a missing scalar-item array initializes `[]`, and appending to an existing scalar-item array requires `--value` or `--value-file`. Retain each returned `draft_revision`. `check` reports a stale state base but does not mutate; explicitly `rebase` only with the caller-observed `--to-state-revision` and then check again. Inline JSON request flags are compatibility-only. Never construct a full payload or generic `gjc state write --input` envelope. Generic `gjc state` remains compatibility/recovery-only for the explicit clear and final handoff paths; never edit `.gjc/_session-{sessionid}/state` directly without force override.
 - Use the GJC workflow CLI to save the final spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
 - Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
 - The lateral-review panel spawns read-only persona subagents (Task tool) in parallel with independent context; it is an assist layer, never an executor and never the completion authority
@@ -942,7 +857,7 @@ Optional settings in `.gjc/settings.json`:
 
 ## Resume
 
-If interrupted, run `/skill:deep-interview` again. The skill resumes from GJC workflow state via `gjc state read`; do not read or edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
+If interrupted, run `/skill:deep-interview` again. Resume through `gjc deep-interview inspect --session-id <id> --selector summary --json`, then selectively inspect topology, pending shells, recent scored rounds, facts, triggers, or floor as needed; do not read or edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
 
 ## Integration with staged team routing
 

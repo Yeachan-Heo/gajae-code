@@ -191,7 +191,7 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		assertKeys(deepSeedPayload, ["state_path", "handoff"]);
 		expect(deepSeedPayload.handoff).toBe("/skill:deep-interview");
 		expect(scrub(deepSeed.stdout ?? "")).toMatchInlineSnapshot(`
-			"{"skill":"deep-interview","resolution":"standard","threshold":0.05,"threshold_source":"flag:explicit","idea":"clarify this idea","state_path":"/tmp/SCRUBBED","handoff":"/skill:deep-interview"}
+			"{"skill":"deep-interview","resolution":"standard","threshold":0.05,"threshold_source":"flag:explicit","idea":"clarify this idea","state_path":"/tmp/SCRUBBED","warnings":[],"handoff":"/skill:deep-interview"}
 			"
 			`);
 		const blockedDeepWrite = await runNativeDeepInterviewCommand(

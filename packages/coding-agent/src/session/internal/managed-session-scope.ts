@@ -24,6 +24,9 @@ import {
 	copyManagedFileNoReplace,
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
+	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
+	MANAGED_ARTIFACT_MAX_FILES,
+	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
 	type ManagedDirectoryRoot,
 	type ManagedFileSnapshot,
 	ManagedPublishError,
@@ -199,6 +202,7 @@ export type ManagedOpenFailure =
 	| "destination_conflict"
 	| "source_changed"
 	| "unsafe_artifacts"
+	| "artifact_capacity_exceeded"
 	| "durability_failed"
 	| "atomic_unavailable"
 	| "invalid_request"
@@ -569,7 +573,11 @@ function fsyncManagedParent(pathname: string): void {
 	}
 }
 
-function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
+export function canonicalBindingOpenFlags(platform: NodeJS.Platform = process.platform): number {
+	return (platform === "win32" ? fs.constants.O_RDWR : fs.constants.O_RDONLY) | fs.constants.O_NOFOLLOW;
+}
+
+export function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
 	let captured: ManagedFileSnapshot;
 	try {
 		captured = captureManagedFileNoFollow(bindingPath);
@@ -579,7 +587,9 @@ function fsyncCanonicalBinding(bindingPath: string, expected: string): void {
 	if (captured.bytes.toString("utf8") !== expected) throw new Error("binding_invalid");
 	let descriptor: number | undefined;
 	try {
-		descriptor = fs.openSync(bindingPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		// Bun on Windows rejects fsync on a read-only file descriptor with EPERM.
+		// The managed binding is owner-writable, so reopen it read/write only for the durability fence.
+		descriptor = fs.openSync(bindingPath, canonicalBindingOpenFlags());
 		const before = fs.fstatSync(descriptor, { bigint: true });
 		if (
 			before.dev !== captured.identity.dev ||
@@ -1075,6 +1085,7 @@ function expectedFailure(error: unknown): ManagedOpenFailure {
 		message === "destination_conflict" ||
 		message === "source_changed" ||
 		message === "unsafe_artifacts" ||
+		message === "artifact_capacity_exceeded" ||
 		message === "durability_failed" ||
 		message === "atomic_unavailable" ||
 		message === "invalid_request" ||
@@ -2278,7 +2289,7 @@ function planArtifactRootForMigration(sourceTranscript: string, operation: strin
 			dev: stat.dev,
 			ino: stat.ino,
 			size: process.platform === "win32" ? BigInt(root.size) : stat.size,
-			mtimeNs: stat.mtimeNs,
+			mtimeNs: process.platform === "win32" ? BigInt(root.mtimeNs) : stat.mtimeNs,
 		},
 		tree,
 	};
@@ -2301,30 +2312,59 @@ function sameDirectoryObject(leftPath: string, rightPath: string): boolean {
 	}
 }
 
-function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot): boolean {
+export function matchesMigrationArtifactRoot(
+	pathname: string,
+	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint },
+	expectedTree: NativeDirectoryTreeSnapshot,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
 	try {
 		const stat = fs.lstatSync(pathname, { bigint: true });
-		const snapshot = native.snapshotDirectoryTree(pathname);
-		const root = snapshot.snapshot?.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
-		return (
-			stat.isDirectory() &&
-			!stat.isSymbolicLink() &&
-			stat.dev === plan.identity.dev &&
-			stat.ino === plan.identity.ino &&
-			stat.mtimeNs === plan.identity.mtimeNs &&
-			(process.platform === "win32"
-				? snapshot.ok && !!root && BigInt(root.size) === plan.identity.size
-				: stat.size === plan.identity.size) &&
-			sameDirectoryObject(path.dirname(pathname), path.dirname(plan.detachedPath))
+		if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== identity.dev || stat.ino !== identity.ino)
+			return false;
+		const observed = native.snapshotDirectoryTree(pathname);
+		const expectedRoot = expectedTree.entries.find(entry => entry.relativePath === "" && entry.kind === "directory");
+		const observedRoot = observed.snapshot?.entries.find(
+			entry => entry.relativePath === "" && entry.kind === "directory",
 		);
+		if (
+			!observed.ok ||
+			!observed.snapshot ||
+			!expectedRoot ||
+			!observedRoot ||
+			(platform === "win32" &&
+				(observedRoot.dev !== identity.dev.toString() ||
+					observedRoot.ino !== identity.ino.toString() ||
+					BigInt(observedRoot.size) !== identity.size ||
+					BigInt(observedRoot.mtimeNs) !== identity.mtimeNs)) ||
+			(platform !== "win32" && (stat.size !== identity.size || stat.mtimeNs !== identity.mtimeNs))
+		)
+			return false;
+		return sameArtifactTree(expectedTree, observed.snapshot, { platform, phase: "migration" });
 	} catch {
 		return false;
 	}
 }
 
-function sameArtifactTree(left: NativeDirectoryTreeSnapshot, right: NativeDirectoryTreeSnapshot): boolean {
-	const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string =>
-		JSON.stringify([
+type ArtifactTreeComparisonPolicy = {
+	platform?: NodeJS.Platform;
+	phase?: "migration" | "strict";
+};
+
+function sameArtifactTree(
+	left: NativeDirectoryTreeSnapshot,
+	right: NativeDirectoryTreeSnapshot,
+	policy: ArtifactTreeComparisonPolicy = {},
+): boolean {
+	const { platform = process.platform, phase = "strict" } = policy;
+	const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string => {
+		// Detaching the root directory changes its ctime without changing the preserved artifact tree;
+		// root identity and mtime are checked above. pi-iso also accepts Windows plain directories by
+		// stable file id and kind only because NTFS can lazily update their metadata while enumeration
+		// trails an open handle. All other platforms and nested directories compare every captured field.
+		if (phase === "migration" && entry.kind === "directory" && (entry.relativePath === "" || platform === "win32"))
+			return JSON.stringify([entry.relativePath, entry.kind, entry.dev, entry.ino]);
+		return JSON.stringify([
 			entry.relativePath,
 			entry.kind,
 			entry.dev,
@@ -2334,14 +2374,21 @@ function sameArtifactTree(left: NativeDirectoryTreeSnapshot, right: NativeDirect
 			entry.ctimeNs,
 			entry.sha256,
 		]);
+	};
+	const leftEntries = left.entries.map(entryKey).sort();
+	const rightEntries = right.entries.map(entryKey).sort();
 	return (
 		left.rootDev === right.rootDev &&
 		left.rootIno === right.rootIno &&
-		left.entries.length === right.entries.length &&
-		left.entries
-			.map(entryKey)
-			.sort()
-			.every((entry, index) => entry === right.entries.map(entryKey).sort()[index])
+		leftEntries.length === rightEntries.length &&
+		leftEntries.every((entry, index) => entry === rightEntries[index])
+	);
+}
+
+function matchesDetachedArtifactRoot(pathname: string, plan: DetachedArtifactRoot): boolean {
+	return (
+		matchesMigrationArtifactRoot(pathname, plan.identity, plan.tree) &&
+		sameDirectoryObject(path.dirname(pathname), path.dirname(plan.detachedPath))
 	);
 }
 
@@ -2380,10 +2427,11 @@ function cleanupAuthorityMatches(cleanup: SourceArtifactCleanup, parent: string)
 	}
 }
 
-function detachArtifactRootForMigration(plan: DetachedArtifactRoot): {
-	detached: DetachedArtifactRoot;
-	cleanup?: SourceArtifactCleanup;
-} {
+function detachArtifactRootForMigration(
+	plan: DetachedArtifactRoot,
+):
+	| { detached: DetachedArtifactRoot; detachOutcome: "clean" }
+	| { detached: DetachedArtifactRoot; detachOutcome: "cleanup_pending"; cleanup: SourceArtifactCleanup } {
 	const result = native.exactUnlink(plan.originalPath, {
 		...plan.identity,
 		directory: true,
@@ -2410,7 +2458,7 @@ function detachArtifactRootForMigration(plan: DetachedArtifactRoot): {
 		process.platform === "win32" ? fs.realpathSync.native(result.detachedPath) : result.detachedPath;
 	if (!matchesDetachedArtifactRoot(detachedPath, plan)) throw new Error("durability_failed");
 	const detached = { ...plan, detachedPath };
-	if (!cleanupPending) return { detached };
+	if (!cleanupPending) return { detached, detachOutcome: "clean" };
 	const placeholder = result.retainedPlaceholderPath!;
 	const stat = fs.lstatSync(placeholder, { bigint: true });
 	if (!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(placeholder) !== path.dirname(plan.originalPath))
@@ -2425,10 +2473,14 @@ function detachArtifactRootForMigration(plan: DetachedArtifactRoot): {
 	};
 	if (!snapshot.ok || !snapshot.snapshot || !cleanupAuthorityMatches(cleanup, path.dirname(plan.originalPath)))
 		throw new Error("durability_failed");
-	return { detached, cleanup };
+	return { detached, detachOutcome: "cleanup_pending", cleanup };
 }
 
-function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandidate): void {
+export function restorePreparedArtifactRoot(
+	scope: ManagedScope,
+	source: ManagedCandidate,
+	lock?: ManagedStorageLock,
+): void {
 	const preparedReceipt = receiptPathFor(scope, source, "prepared");
 	const detachedReceipt = receiptPathFor(scope, source, "detached");
 	const receipt = fs.existsSync(detachedReceipt) ? detachedReceipt : preparedReceipt;
@@ -2447,6 +2499,7 @@ function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandida
 			identity?: Record<string, unknown>;
 			tree?: unknown;
 		};
+		detachOutcome?: unknown;
 	};
 	try {
 		record = JSON.parse(captureManagedFileNoFollow(receipt).bytes.toString("utf8")) as typeof record;
@@ -2470,57 +2523,87 @@ function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandida
 		typeof identity.mtimeNs !== "string"
 	)
 		throw new Error("durability_failed");
-	if (receipt === detachedReceipt && quarantine.role !== "detached_artifact_root")
-		throw new Error("durability_failed");
-	if (receipt === detachedReceipt) {
-		const cleanup = record.sourceArtifactCleanup;
-		const cleanupIdentity = cleanup?.identity;
-		const cleanupTree = artifactTreeSnapshot(cleanup?.tree);
+	const artifactIdentity = {
+		dev: BigInt(identity.dev),
+		ino: BigInt(identity.ino),
+		size: BigInt(identity.size),
+		mtimeNs: BigInt(identity.mtimeNs),
+	};
+	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
+	const assertPreparedTree = (pathname: string): void => {
 		if (
-			cleanup?.state !== "cleanup_pending" ||
-			cleanup.role !== "exchange_placeholder" ||
-			typeof cleanup.retainedPath !== "string" ||
-			!cleanupIdentity ||
-			typeof cleanupIdentity.dev !== "string" ||
-			typeof cleanupIdentity.ino !== "string" ||
-			typeof cleanupIdentity.size !== "string" ||
-			typeof cleanupIdentity.mtimeNs !== "string" ||
-			!cleanupTree ||
-			!cleanupAuthorityMatches(
+			!matchesMigrationArtifactRoot(
+				pathname,
 				{
-					state: "cleanup_pending",
-					role: "exchange_placeholder",
-					retainedPath: cleanup.retainedPath,
-					identity: {
-						dev: BigInt(cleanupIdentity.dev),
-						ino: BigInt(cleanupIdentity.ino),
-						size: BigInt(cleanupIdentity.size),
-						mtimeNs: BigInt(cleanupIdentity.mtimeNs),
-					},
-					tree: cleanupTree,
+					...artifactIdentity,
 				},
-				path.dirname(source.path),
+				expectedTree,
 			)
 		)
 			throw new Error("durability_failed");
+	};
+	if (receipt === detachedReceipt) {
+		if (quarantine.role !== "detached_artifact_root") throw new Error("durability_failed");
+		if (record.detachOutcome === "clean") {
+			if (record.sourceArtifactCleanup !== undefined) throw new Error("durability_failed");
+			const originalExists = fs.existsSync(quarantine.path);
+			const detachedExists = fs.existsSync(quarantine.detachedPath);
+			if (originalExists) {
+				if (detachedExists) throw new Error("durability_failed");
+				assertPreparedTree(quarantine.path);
+				if (lock) {
+					lock.assertOwned();
+					fs.unlinkSync(receipt);
+					fsyncManagedParent(receipt);
+				}
+				return;
+			}
+		} else if (record.detachOutcome === "cleanup_pending") {
+			const cleanup = record.sourceArtifactCleanup;
+			if (!cleanup) throw new Error("durability_failed");
+			const cleanupIdentity = cleanup.identity;
+			const cleanupTree = artifactTreeSnapshot(cleanup.tree);
+			if (
+				cleanup.state !== "cleanup_pending" ||
+				cleanup.role !== "exchange_placeholder" ||
+				typeof cleanup.retainedPath !== "string" ||
+				!cleanupIdentity ||
+				typeof cleanupIdentity.dev !== "string" ||
+				typeof cleanupIdentity.ino !== "string" ||
+				typeof cleanupIdentity.size !== "string" ||
+				typeof cleanupIdentity.mtimeNs !== "string" ||
+				!cleanupTree ||
+				!cleanupAuthorityMatches(
+					{
+						state: "cleanup_pending",
+						role: "exchange_placeholder",
+						retainedPath: cleanup.retainedPath,
+						identity: {
+							dev: BigInt(cleanupIdentity.dev),
+							ino: BigInt(cleanupIdentity.ino),
+							size: BigInt(cleanupIdentity.size),
+							mtimeNs: BigInt(cleanupIdentity.mtimeNs),
+						},
+						tree: cleanupTree,
+					},
+					path.dirname(source.path),
+				)
+			)
+				throw new Error("durability_failed");
+		} else {
+			throw new Error("durability_failed");
+		}
 	}
 
-	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
-	const assertPreparedTree = (pathname: string): void => {
-		validateManagedArtifactTree(pathname);
-		const observed = native.snapshotDirectoryTree(pathname);
-		if (!observed.ok || !observed.snapshot || !sameArtifactTree(observed.snapshot, expectedTree))
-			throw new Error("durability_failed");
-	};
 	if (fs.existsSync(quarantine.path)) {
-		const existing = fs.lstatSync(quarantine.path, { bigint: true });
 		if (
-			!existing.isSymbolicLink() &&
-			existing.isDirectory() &&
-			existing.dev === BigInt(identity.dev) &&
-			existing.ino === BigInt(identity.ino) &&
-			existing.size === BigInt(identity.size) &&
-			existing.mtimeNs === BigInt(identity.mtimeNs)
+			matchesMigrationArtifactRoot(
+				quarantine.path,
+				{
+					...artifactIdentity,
+				},
+				expectedTree,
+			)
 		) {
 			assertPreparedTree(quarantine.path);
 		}
@@ -2530,10 +2613,7 @@ function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandida
 	}
 	assertPreparedTree(quarantine.detachedPath);
 	const result = native.exactRestore(quarantine.detachedPath, quarantine.path, {
-		dev: BigInt(identity.dev),
-		ino: BigInt(identity.ino),
-		size: BigInt(identity.size),
-		mtimeNs: BigInt(identity.mtimeNs),
+		...artifactIdentity,
 		directory: true,
 	});
 	if (!result.ok) throw new Error("durability_failed");
@@ -2564,40 +2644,41 @@ async function copyArtifacts(
 	const sourceRoot = sourceRootOverride ?? sourceTranscript.slice(0, -6);
 	if (!manifestMatches(sourceTranscript, manifest, sourceRoot)) throw new Error("source_changed");
 	const destinationRoot = destinationTranscript.slice(0, -6);
-	for (const entry of manifest) {
+	for (let start = 0; start < manifest.length; start += MANAGED_ARTIFACT_COPY_BATCH_SIZE) {
+		const batch = manifest.slice(start, start + MANAGED_ARTIFACT_COPY_BATCH_SIZE);
 		revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
 		lock.assertOwned();
-		const source = path.join(sourceRoot, entry.path);
-		const destination = path.join(destinationRoot, entry.path);
-		if (entry.kind === "directory") {
-			if (entry.path === "") {
-				revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
-				ensureManagedDirectory(destinationRoot, root);
-			} else {
-				revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
-				ensureManagedDirectory(destination, root);
+		for (const entry of batch) {
+			const source = path.join(sourceRoot, entry.path);
+			const destination = path.join(destinationRoot, entry.path);
+			if (entry.kind === "directory") {
+				if (entry.path === "") {
+					ensureManagedDirectory(destinationRoot, root);
+				} else {
+					ensureManagedDirectory(destination, root);
+				}
+				continue;
 			}
-			continue;
+			const snapshot = captureManagedFileNoFollow(source);
+			if (
+				snapshot.bytes.byteLength !== entry.size ||
+				createHash("sha256").update(snapshot.bytes).digest("hex") !== entry.sha256
+			)
+				throw new Error("source_changed");
+			try {
+				await copyManagedFileNoReplace(source, destination, snapshot, root);
+			} catch (error) {
+				if ((error as Error).message !== "destination_conflict") throw error;
+			}
+			lock.assertOwned();
+			const copied = captureManagedFileNoFollow(destination);
+			if (
+				copied.bytes.byteLength !== entry.size ||
+				createHash("sha256").update(copied.bytes).digest("hex") !== entry.sha256
+			)
+				throw new Error("durability_failed");
 		}
-		const snapshot = captureManagedFileNoFollow(source);
-		if (
-			snapshot.bytes.byteLength !== entry.size ||
-			createHash("sha256").update(snapshot.bytes).digest("hex") !== entry.sha256
-		)
-			throw new Error("source_changed");
-		try {
-			revalidatePickerConsent(scope, expectedCandidate, expectedIdentity);
-			await copyManagedFileNoReplace(source, destination, snapshot, root);
-		} catch (error) {
-			if ((error as Error).message !== "destination_conflict") throw error;
-		}
-		lock.assertOwned();
-		const copied = captureManagedFileNoFollow(destination);
-		if (
-			copied.bytes.byteLength !== entry.size ||
-			createHash("sha256").update(copied.bytes).digest("hex") !== entry.sha256
-		)
-			throw new Error("durability_failed");
+		if (start + batch.length < manifest.length) await new Promise<void>(resolve => setTimeout(resolve, 0));
 	}
 	if (!manifestMatches(sourceTranscript, manifest, sourceRoot) || !manifestMatches(destinationTranscript, manifest))
 		throw new Error("durability_failed");
@@ -2618,6 +2699,7 @@ function migrationReceipt(
 		role?: "detached_artifact_root";
 	},
 	sourceArtifactCleanup?: SourceArtifactCleanup,
+	detachOutcome?: "clean" | "cleanup_pending",
 ): Uint8Array {
 	lock.assertOwned();
 	const destinationRecord =
@@ -2635,7 +2717,7 @@ function migrationReceipt(
 					header: { id: destination.sessionId, cwd: destination.cwd },
 				};
 	return new TextEncoder().encode(
-		`${JSON.stringify({ schemaVersion: 2, state, policy: "copy-retain", attemptId: lock.attemptId, scope: scopeDigest(scope.platform, scope.canonicalCwd), source: { path: source.path, sessionId: source.sessionId, header: { id: source.sessionId, cwd: source.cwd }, identity: source.identity, sha256: source.identity.sha256 }, destination: destinationRecord, artifactManifest: manifest, ...(sourceArtifactQuarantine ? { sourceArtifactQuarantine } : {}), ...(sourceArtifactCleanup ? { sourceArtifactCleanup } : {}) }, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
+		`${JSON.stringify({ schemaVersion: 2, state, policy: "copy-retain", attemptId: lock.attemptId, scope: scopeDigest(scope.platform, scope.canonicalCwd), source: { path: source.path, sessionId: source.sessionId, header: { id: source.sessionId, cwd: source.cwd }, identity: source.identity, sha256: source.identity.sha256 }, destination: destinationRecord, artifactManifest: manifest, ...(sourceArtifactQuarantine ? { sourceArtifactQuarantine } : {}), ...(sourceArtifactCleanup ? { sourceArtifactCleanup } : {}), ...(detachOutcome ? { detachOutcome } : {}) }, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
 	);
 }
 
@@ -2652,7 +2734,10 @@ async function removeStagedReceipts(scope: ManagedScope, candidate: ManagedCandi
 		const pathname = receiptPathFor(scope, candidate, state);
 		try {
 			const stat = fs.lstatSync(pathname);
-			if (stat.isFile() || stat.isSymbolicLink()) await fs.promises.unlink(pathname);
+			if (stat.isFile() || stat.isSymbolicLink()) {
+				await fs.promises.unlink(pathname);
+				fsyncManagedParent(pathname);
+			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
@@ -2979,7 +3064,7 @@ export async function openManagedCandidateForWrite(
 
 		scopeRoot(scope);
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);
-		restorePreparedArtifactRoot(scope, afterLock);
+		restorePreparedArtifactRoot(scope, afterLock, heldLock);
 		scopeRoot(scope);
 
 		let sourceSnapshot = captureManagedFileNoFollow(afterLock.path);
@@ -3056,7 +3141,7 @@ export async function openManagedCandidateForWrite(
 		if (artifactPlan) {
 			const detached = detachArtifactRootForMigration(artifactPlan);
 			detachedArtifacts = detached.detached;
-			sourceArtifactCleanup = detached.cleanup;
+			sourceArtifactCleanup = detached.detachOutcome === "cleanup_pending" ? detached.cleanup : undefined;
 			const detachedReceipt = receiptPathFor(scope, afterLock, "detached");
 			const detachedRecord = migrationReceipt(
 				scope,
@@ -3073,6 +3158,7 @@ export async function openManagedCandidateForWrite(
 					role: "detached_artifact_root",
 				},
 				sourceArtifactCleanup,
+				detached.detachOutcome,
 			);
 			try {
 				await publishManagedFileNoReplace(
@@ -3215,7 +3301,16 @@ export async function openManagedCandidateForWrite(
 			};
 		}
 		const code = expectedFailure(error);
-		return { kind: "error", code, message: error instanceof Error ? error.message : "Managed migration failed." };
+		return {
+			kind: "error",
+			code,
+			message:
+				code === "artifact_capacity_exceeded"
+					? `Legacy session artifacts exceed the migration capacity (${MANAGED_ARTIFACT_MAX_FILES.toLocaleString()} files or ${MANAGED_ARTIFACT_MAX_TOTAL_BYTES / 1024 / 1024} MiB).`
+					: error instanceof Error
+						? error.message
+						: "Managed migration failed.",
+		};
 	} finally {
 		if (lock) await lock.release().catch(() => undefined);
 	}

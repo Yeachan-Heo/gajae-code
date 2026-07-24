@@ -4,9 +4,8 @@
  * Lightweight utilities for calling MCP servers directly via HTTP
  * without maintaining persistent connections.
  */
-// biome-ignore assist/source/organizeImports: Keep independent MCP security imports on separate merge anchors.
-import { cancelMCPStream, MCP_HTTP_TIMEOUT_MS, MCP_MAX_CONTENT_BYTES, readMCPResponseText } from "./content-limits";
 import { logger } from "@gajae-code/utils";
+import { cancelMCPStream, MCP_HTTP_TIMEOUT_MS, MCP_MAX_CONTENT_BYTES, readMCPResponseText } from "./content-limits";
 import { redactMCPDiagnosticValue, redactMCPEndpoint } from "./redaction";
 
 /** Parse SSE response format (lines starting with "data: ") */

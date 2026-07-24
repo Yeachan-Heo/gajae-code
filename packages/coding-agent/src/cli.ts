@@ -118,6 +118,36 @@ Options:
 `);
 }
 
+export function interactiveBootstrapText(
+	argv: readonly string[],
+	stdinIsTTY = process.stdin.isTTY,
+	stdoutIsTTY = process.stdout.isTTY,
+): string | undefined {
+	if (!stdinIsTTY || !stdoutIsTTY || argv[0] !== "launch") return undefined;
+	for (let index = 1; index < argv.length; index++) {
+		const arg = argv[index];
+		if (
+			arg === "--print" ||
+			arg?.startsWith("--print=") ||
+			arg === "-p" ||
+			arg === "--export" ||
+			arg?.startsWith("--export=") ||
+			arg === "--list-models" ||
+			arg?.startsWith("--list-models=") ||
+			arg === "--mode" ||
+			arg?.startsWith("--mode=") ||
+			arg === "--help" ||
+			arg?.startsWith("--help=") ||
+			arg === "-h" ||
+			arg === "--version" ||
+			arg?.startsWith("--version=") ||
+			arg === "-v"
+		)
+			return undefined;
+	}
+	return "\u001b[?25h\u001b[38;5;45mGJC\u001b[0m warming workspace\r\n\r\n> ";
+}
+
 function isNotifyDaemonInternalFastPath(argv: string[]): boolean {
 	return argv[0] === "notify" && argv[1] === "daemon-internal";
 }
@@ -412,6 +442,8 @@ export async function runCli(argv: string[]): Promise<void> {
 		showStatsFastHelp();
 		return;
 	}
+	const bootstrap = interactiveBootstrapText(runArgv);
+	if (bootstrap) process.stdout.write(bootstrap);
 	await installRuntimeGlobals();
 	return run({ bin: APP_NAME, version: VERSION, argv: runArgv, commands, help: showHelp });
 }

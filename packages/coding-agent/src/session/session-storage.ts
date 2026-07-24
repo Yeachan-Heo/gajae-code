@@ -167,6 +167,8 @@ export interface SessionStorage {
 	readSnapshotSync?(path: string): SessionStorageSnapshot;
 	statSync(path: string): SessionStorageStat;
 	listFilesSync(dir: string, pattern: string): string[];
+	/** List matching files with mtimes without issuing one JavaScript stat call per path. */
+	listFilesByMtime?(dir: string, pattern: string): Promise<Array<{ path: string; mtimeMs: number }>>;
 	/**
 	 * Strict directory scan that never suppresses scan/root errors. Used by strict
 	 * authorization inventory; the forgiving {@link listFilesSync} stays display-only.
@@ -704,6 +706,21 @@ export class FileSessionStorage implements SessionStorage {
 		} catch {
 			return [];
 		}
+	}
+	async listFilesByMtime(dir: string, pattern: string): Promise<Array<{ path: string; mtimeMs: number }>> {
+		const result = await native.glob({
+			path: dir,
+			pattern,
+			fileType: native.FileType.File,
+			recursive: false,
+			hidden: false,
+			gitignore: false,
+			sortByMtime: true,
+		});
+		return result.matches.map(match => ({
+			path: path.join(dir, match.path),
+			mtimeMs: match.mtime ?? 0,
+		}));
 	}
 
 	listFilesStrictSync(dir: string, pattern: string): string[] {
@@ -1469,6 +1486,12 @@ export class MemorySessionStorage implements SessionStorage {
 			files.push(path);
 		}
 		return files;
+	}
+	listFilesByMtime(dir: string, pattern: string): Promise<Array<{ path: string; mtimeMs: number }>> {
+		const files = this.listFilesSync(dir, pattern)
+			.map(path => ({ path, mtimeMs: this.statSync(path).mtimeMs }))
+			.sort((a, b) => b.mtimeMs - a.mtimeMs);
+		return Promise.resolve(files);
 	}
 	listFilesStrictSync(dir: string, pattern: string): string[] {
 		// In-memory scan never suppresses; identical to the display scan.

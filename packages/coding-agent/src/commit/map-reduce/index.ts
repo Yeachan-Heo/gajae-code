@@ -1,6 +1,6 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai";
-import { $env } from "@gajae-code/utils";
+import { $pickenv } from "@gajae-code/utils";
 import { parseFileDiffs } from "../../commit/git/diff";
 import type { ConventionalAnalysis } from "../../commit/types";
 import { isExcludedFile } from "../../commit/utils/exclusions";
@@ -34,7 +34,7 @@ export interface MapReduceInput {
 }
 
 export function shouldUseMapReduce(diff: string, settings?: MapReduceSettings): boolean {
-	if ($env.PI_COMMIT_MAP_REDUCE?.toLowerCase() === "false") return false;
+	if ($pickenv("GJC_COMMIT_MAP_REDUCE", "PI_COMMIT_MAP_REDUCE")?.toLowerCase() === "false") return false;
 	if (settings?.enabled === false) return false;
 	const minFiles = settings?.minFiles ?? MIN_FILES_FOR_MAP_REDUCE;
 	const maxFileTokens = settings?.maxFileTokens ?? MAX_FILE_TOKENS;

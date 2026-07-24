@@ -3,9 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
-import { syncSkillActiveState } from "../skill-state/active-state";
-import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
+import { scoreToUnits } from "./deep-interview-ambiguity";
+import { runDeepInterviewDraftCommand } from "./deep-interview-draft";
+import { runDeepInterviewPostCommitEffects } from "./deep-interview-recorder";
+import { isDeepInterviewRepairVerb, runDeepInterviewRepairCommand } from "./deep-interview-repair";
 import {
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentReview,
@@ -17,12 +19,20 @@ import {
 	MAX_INITIAL_CONTEXT_LENGTH,
 	normalizeDeepInterviewEnvelope,
 	reviewDeepInterviewIntent,
+	validateDeepInterviewV1Envelope,
 } from "./deep-interview-state";
 import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { modeStatePath, sessionSpecsDir } from "./session-layout";
-import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
+import { resolveGjcSessionForWrite } from "./session-resolution";
 import { runNativeStateCommand } from "./state-runtime";
-import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
+import {
+	appendJsonl,
+	readExistingStateForMutation,
+	verifyWorkflowEnvelopeReceiptValue,
+	withWorkflowStateLock,
+	writeArtifact,
+	writeWorkflowEnvelopeAtomic,
+} from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 
 export * from "./deep-interview-recorder";
@@ -354,7 +364,7 @@ async function readSettingsAmbiguityThreshold(
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
 		if (err.code === "ENOENT") return undefined;
-		return undefined;
+		throw new Error(`failed to read deep-interview threshold config ${settingsPath}: ${err.message}`);
 	}
 	let parsed: unknown;
 	try {
@@ -364,7 +374,7 @@ async function readSettingsAmbiguityThreshold(
 	}
 	const candidate = (parsed as { gjc?: { deepInterview?: { ambiguityThreshold?: unknown } } })?.gjc?.deepInterview
 		?.ambiguityThreshold;
-	if (typeof candidate !== "number" || !Number.isFinite(candidate) || candidate <= 0 || candidate > 1) {
+	if (typeof candidate !== "number" || !isIntegralScore(candidate) || candidate <= 0) {
 		return undefined;
 	}
 	return { threshold: candidate, source: settingsPath };
@@ -380,16 +390,23 @@ function modernSettingsPath(): string {
 
 async function readModernSettingsAmbiguityThreshold(): Promise<{ threshold: number; source: string } | undefined> {
 	const modernConfigPath = modernSettingsPath();
+	let raw: string;
+	try {
+		raw = await fs.readFile(modernConfigPath, "utf-8");
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT") return undefined;
+		throw new Error(`failed to read deep-interview threshold config ${modernConfigPath}: ${err.message}`);
+	}
 	let parsed: unknown;
 	try {
-		parsed = YAML.parse(await fs.readFile(modernConfigPath, "utf-8"));
+		parsed = YAML.parse(raw);
 	} catch {
 		return undefined;
 	}
 	const candidate = (parsed as { gjc?: { deepInterview?: { ambiguityThreshold?: unknown } } })?.gjc?.deepInterview
 		?.ambiguityThreshold;
-	if (typeof candidate !== "number" || !Number.isFinite(candidate) || candidate <= 0 || candidate > 1)
-		return undefined;
+	if (typeof candidate !== "number" || !isIntegralScore(candidate) || candidate <= 0) return undefined;
 	return { threshold: candidate, source: modernConfigPath };
 }
 
@@ -504,6 +521,15 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 	};
 }
 
+function isIntegralScore(value: number): boolean {
+	try {
+		scoreToUnits(value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): Promise<ResolvedDeepInterviewArgs> {
 	const session = resolveGjcSessionForWrite(cwd, {
 		flagValue: flagValue(args, "--session-id"),
@@ -524,10 +550,10 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 	const thresholdOverride = flagValue(args, "--threshold");
 	if (thresholdOverride !== undefined) {
 		const parsed = Number(thresholdOverride);
-		if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) {
+		if (!isIntegralScore(parsed) || parsed <= 0) {
 			throw new DeepInterviewCommandError(
 				2,
-				`invalid --threshold: ${thresholdOverride}. Expected 0 < threshold <= 1.`,
+				`invalid --threshold: ${thresholdOverride}. Expected integral 1e-4 units in (0, 1].`,
 			);
 		}
 		threshold = parsed;
@@ -545,7 +571,16 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 
 	const ideaParts: string[] = [];
 	let skipNext = false;
+	let positionalOnly = false;
 	for (const arg of args) {
+		if (positionalOnly) {
+			ideaParts.push(arg);
+			continue;
+		}
+		if (arg === "--") {
+			positionalOnly = true;
+			continue;
+		}
 		if (skipNext) {
 			skipNext = false;
 			continue;
@@ -719,13 +754,13 @@ export async function persistDeepInterviewSpec(
 			forced: resolved.force,
 		},
 	});
-	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "deep-interview-runtime", path: statePath });
-	await syncDeepInterviewHud({
+	await runDeepInterviewPostCommitEffects({
 		cwd,
-		sessionId: resolved.sessionId,
-		payload,
-		phase: "handoff",
-		specStatus: "persisted",
+		statePath,
+		sessionId: resolved.sessionId ?? "",
+		envelope: normalizeDeepInterviewEnvelope(payload),
+		revision: 0,
+		writer: "deep-interview-runtime",
 	});
 
 	return {
@@ -738,91 +773,169 @@ export async function persistDeepInterviewSpec(
 	};
 }
 
-async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepInterviewArgs): Promise<string> {
-	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
-	assertDeepInterviewInputWithinLimit(resolved.idea, MAX_INITIAL_CONTEXT_LENGTH, "initial_idea");
-	const now = new Date().toISOString();
-	const payload: Record<string, unknown> = {
-		active: true,
-		current_phase: "interviewing",
-		skill: "deep-interview",
-		version: WORKFLOW_STATE_VERSION,
-		resolution: resolved.resolution,
-		threshold: resolved.threshold,
-		threshold_source: resolved.thresholdSource,
-		state: {
-			initial_idea: resolved.idea,
-			intent_contract_required: true,
-			rounds: [],
-			established_facts: [],
-			current_ambiguity: 1.0,
-			threshold: resolved.threshold,
-			threshold_source: resolved.thresholdSource,
-		},
-		updated_at: now,
-	};
-	if (resolved.trace) {
-		payload.trace = resolved.trace;
-		(payload.state as Record<string, unknown>).trace = resolved.trace;
-		(payload.state as Record<string, unknown>).trace_summary = resolved.trace;
-		(payload.state as Record<string, unknown>).codebase_context = {
-			source: "trace",
-			summary: resolved.trace.findings,
-			relevant_paths: resolved.trace.relevant_paths,
-			project_hints: resolved.trace.project_hints,
-		};
-	}
-	if (resolved.language) {
-		payload.language = resolved.language;
-		(payload.state as Record<string, unknown>).language = resolved.language;
-	}
-	if (resolved.sessionId) payload.session_id = resolved.sessionId;
-	await writeWorkflowEnvelopeAtomic(statePath, payload, {
-		cwd,
-		receipt: {
-			cwd,
-			skill: "deep-interview",
-			owner: "gjc-runtime",
-			command: "gjc deep-interview seed",
-			sessionId: resolved.sessionId,
-			nowIso: now,
-		},
-		audit: {
-			category: "state",
-			verb: "write",
-			owner: "gjc-runtime",
-			skill: "deep-interview",
-			sessionId: resolved.sessionId,
-		},
-	});
-	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "deep-interview-runtime", path: statePath });
-	await syncDeepInterviewHud({ cwd, sessionId: resolved.sessionId, payload, phase: "interviewing" });
-	return statePath;
+function isEmptyPendingTopology(value: unknown): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const topology = value as Record<string, unknown>;
+	return (
+		topology.status === "pending" &&
+		Array.isArray(topology.components) &&
+		topology.components.length === 0 &&
+		Array.isArray(topology.deferred_components) &&
+		topology.deferred_components.length === 0
+	);
 }
-
-async function syncDeepInterviewHud(options: {
-	cwd: string;
-	sessionId?: string;
-	payload: Record<string, unknown>;
-	phase?: string;
-	specStatus?: string;
-}): Promise<void> {
-	try {
-		const phase =
-			options.phase ??
-			(typeof options.payload.current_phase === "string" ? options.payload.current_phase : "interviewing");
-		await syncSkillActiveState({
-			cwd: options.cwd,
-			skill: "deep-interview",
-			active: phase !== "complete",
-			phase,
-			sessionId: options.sessionId,
-			source: "gjc-deep-interview-native",
-			hud: deriveDeepInterviewHud(options.payload, { phase, specStatus: options.specStatus }),
-		});
-	} catch {
-		// HUD sync is best-effort and must not change command semantics.
-	}
+function isUnresolvedNativeSetup(value: unknown): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const state = value as Record<string, unknown>;
+	return (
+		state.setup !== null &&
+		typeof state.setup === "object" &&
+		!Array.isArray(state.setup) &&
+		(state.setup as Record<string, unknown>).status === "unresolved"
+	);
+}
+async function seedDeepInterviewState(
+	cwd: string,
+	resolved: ResolvedDeepInterviewArgs,
+): Promise<{ statePath: string; warnings: unknown[] }> {
+	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
+	return withWorkflowStateLock(
+		`${statePath}.kickoff`,
+		async () => {
+			const existing = await readExistingStateForMutation(statePath);
+			if (existing.kind === "valid") {
+				try {
+					if (verifyWorkflowEnvelopeReceiptValue(existing.value, statePath) !== "native-valid")
+						throw new Error("invalid receipt");
+					validateDeepInterviewV1Envelope(existing.value);
+				} catch {
+					throw new DeepInterviewCommandError(3, "DI_STATE_CORRUPT");
+				}
+				const phase =
+					typeof existing.value.current_phase === "string" ? existing.value.current_phase : "interviewing";
+				if (phase === "complete" || phase === "handoff" || existing.value.active === false)
+					throw new DeepInterviewCommandError(3, "DI_PHASE_NOT_REPAIRABLE");
+				const priorState =
+					existing.value.state && typeof existing.value.state === "object" && !Array.isArray(existing.value.state)
+						? (existing.value.state as Record<string, unknown>)
+						: {};
+				const exactEmptyNativeSeed =
+					isUnresolvedNativeSetup(priorState) &&
+					priorState.type === (resolved.trace ? "brownfield" : "greenfield") &&
+					existing.value.skill === "deep-interview" &&
+					existing.value.active === true &&
+					phase === "interviewing" &&
+					existing.value.resolution === resolved.resolution &&
+					existing.value.threshold === resolved.threshold &&
+					existing.value.threshold_source === resolved.thresholdSource &&
+					priorState.initial_idea === resolved.idea &&
+					priorState.intent_contract_required === true &&
+					Array.isArray(priorState.rounds) &&
+					priorState.rounds.length === 0 &&
+					Array.isArray(priorState.established_facts) &&
+					priorState.established_facts.length === 0 &&
+					Array.isArray(priorState.ontology_snapshots) &&
+					priorState.ontology_snapshots.length === 0 &&
+					Array.isArray(priorState.auto_researched_rounds) &&
+					priorState.auto_researched_rounds.length === 0 &&
+					Array.isArray(priorState.auto_answered_rounds) &&
+					priorState.auto_answered_rounds.length === 0 &&
+					isEmptyPendingTopology(priorState.topology) &&
+					priorState.architect_failures === 0 &&
+					priorState.current_ambiguity === 1 &&
+					JSON.stringify(existing.value.trace) === JSON.stringify(resolved.trace) &&
+					JSON.stringify(existing.value.language) === JSON.stringify(resolved.language);
+				if (exactEmptyNativeSeed) return { statePath, warnings: [] };
+				throw new DeepInterviewCommandError(2, "DI_INTERVIEW_ALREADY_ACTIVE");
+			}
+			if (existing.kind === "corrupt") throw new DeepInterviewCommandError(3, "DI_STATE_CORRUPT");
+			const now = new Date().toISOString();
+			const type = resolved.trace ? "brownfield" : "greenfield";
+			const payload: Record<string, unknown> = {
+				active: true,
+				current_phase: "interviewing",
+				schema_version: 1,
+				skill: "deep-interview",
+				version: WORKFLOW_STATE_VERSION,
+				resolution: resolved.resolution,
+				threshold: resolved.threshold,
+				threshold_units: scoreToUnits(resolved.threshold),
+				threshold_source: resolved.thresholdSource,
+				state: {
+					setup: { status: "unresolved" },
+					type,
+					initial_idea: resolved.idea,
+					intent_contract_required: true,
+					rounds: [],
+					established_facts: [],
+					topology: { status: "pending", components: [], deferred_components: [] },
+					ontology_snapshots: [],
+					auto_researched_rounds: [],
+					auto_answered_rounds: [],
+					architect_failures: 0,
+					current_ambiguity: 1.0,
+					threshold: resolved.threshold,
+					threshold_units: scoreToUnits(resolved.threshold),
+					threshold_source: resolved.thresholdSource,
+				},
+				updated_at: now,
+			};
+			validateDeepInterviewV1Envelope(payload);
+			if (resolved.trace) {
+				payload.trace = resolved.trace;
+				(payload.state as Record<string, unknown>).trace = resolved.trace;
+				(payload.state as Record<string, unknown>).trace_summary = resolved.trace;
+				(payload.state as Record<string, unknown>).codebase_context = {
+					source: "trace",
+					summary: resolved.trace.findings,
+					relevant_paths: resolved.trace.relevant_paths,
+					project_hints: resolved.trace.project_hints,
+				};
+			}
+			if (resolved.language) {
+				payload.language = resolved.language;
+				(payload.state as Record<string, unknown>).language = resolved.language;
+			}
+			if (resolved.sessionId) payload.session_id = resolved.sessionId;
+			await writeWorkflowEnvelopeAtomic(statePath, payload, {
+				cwd,
+				receipt: {
+					cwd,
+					skill: "deep-interview",
+					owner: "gjc-runtime",
+					command: "gjc deep-interview seed",
+					sessionId: resolved.sessionId,
+					nowIso: now,
+				},
+				audit: {
+					category: "state",
+					verb: "write",
+					owner: "gjc-runtime",
+					skill: "deep-interview",
+					sessionId: resolved.sessionId,
+				},
+			});
+			const stamped = await readExistingStateForMutation(statePath);
+			if (stamped.kind !== "valid") throw new DeepInterviewCommandError(3, "DI_STATE_CORRUPT");
+			try {
+				if (verifyWorkflowEnvelopeReceiptValue(stamped.value, statePath) !== "native-valid")
+					throw new Error("invalid receipt");
+				validateDeepInterviewV1Envelope(stamped.value);
+			} catch {
+				throw new DeepInterviewCommandError(3, "DI_STATE_CORRUPT");
+			}
+			const warnings = await runDeepInterviewPostCommitEffects({
+				cwd,
+				statePath,
+				sessionId: resolved.sessionId ?? "",
+				envelope: normalizeDeepInterviewEnvelope(stamped.value),
+				revision: typeof stamped.value.state_revision === "number" ? stamped.value.state_revision : 0,
+				writer: "deep-interview-runtime",
+			});
+			return { statePath, warnings };
+		},
+		{ cwd },
+	);
 }
 
 async function handleSpecWrite(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
@@ -888,6 +1001,28 @@ async function handleSpecWrite(args: readonly string[], cwd: string): Promise<De
 				.join("\n");
 	return { status: 0, stdout };
 }
+function isDeepInterviewRepairInvocation(args: readonly string[]): boolean {
+	const separator = args.indexOf("--");
+	return (separator === -1 || separator > 0) && isDeepInterviewRepairVerb(args[0] ?? "");
+}
+function isDeepInterviewDraftInvocation(args: readonly string[]): boolean {
+	const separator = args.indexOf("--");
+	return (separator === -1 || separator > 0) && args[0] === "draft";
+}
+function draftCommandArgs(args: readonly string[]): string[] {
+	const normalized: string[] = [];
+	for (let index = 1; index < args.length; index++) {
+		const argument = args[index];
+		if (argument === "--for") {
+			normalized.push("--kind", args[++index] ?? "");
+			continue;
+		}
+		normalized.push(argument);
+		if (argument === "--json" && !args[index + 1]?.startsWith("--")) continue;
+		if (argument === "--json") normalized.push("true");
+	}
+	return normalized;
+}
 
 export async function runNativeDeepInterviewCommand(
 	args: string[],
@@ -895,14 +1030,39 @@ export async function runNativeDeepInterviewCommand(
 ): Promise<DeepInterviewCommandResult> {
 	try {
 		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd);
+		if (isDeepInterviewRepairInvocation(args)) return await runDeepInterviewRepairCommand(args, cwd);
+		if (isDeepInterviewDraftInvocation(args)) return await runDeepInterviewDraftCommand(draftCommandArgs(args), cwd);
 		const resolved = await resolveDeepInterviewArgs(args, cwd);
 		if (!resolved.idea) {
+			const existing = await readExistingStateForMutation(deepInterviewStatePath(cwd, resolved.sessionId));
+			if (existing.kind === "valid") {
+				const phase =
+					typeof existing.value.current_phase === "string" ? existing.value.current_phase : "interviewing";
+				if (phase === "complete" || existing.value.active === false)
+					throw new DeepInterviewCommandError(
+						2,
+						"deep-interview session is terminal; start a new session to kick off another interview.",
+					);
+				const state = existing.value.state as Record<string, unknown> | undefined;
+				return {
+					status: 0,
+					stdout: `${JSON.stringify({
+						skill: "deep-interview",
+						resumed: true,
+						session_id: resolved.sessionId ?? null,
+						state_path: deepInterviewStatePath(cwd, resolved.sessionId),
+						state_revision: existing.value.state_revision ?? 0,
+						idea: typeof state?.initial_idea === "string" ? state.initial_idea : null,
+						handoff: "/skill:deep-interview",
+					})}\n`,
+				};
+			}
 			throw new DeepInterviewCommandError(
 				2,
 				'gjc deep-interview requires an idea, e.g. `gjc deep-interview "<idea>"`.',
 			);
 		}
-		const statePath = await seedDeepInterviewState(cwd, resolved);
+		const seeded = await seedDeepInterviewState(cwd, resolved);
 
 		const summary = {
 			skill: "deep-interview",
@@ -912,13 +1072,14 @@ export async function runNativeDeepInterviewCommand(
 			idea: resolved.idea,
 			language: resolved.language,
 			trace: resolved.trace,
-			state_path: statePath,
+			state_path: seeded.statePath,
+			warnings: seeded.warnings,
 			handoff: "/skill:deep-interview",
 		};
 		const stdout = resolved.json
 			? `${JSON.stringify(summary)}\n`
 			: [
-					`deep-interview seed state_path=${statePath}`,
+					`deep-interview seed state_path=${seeded.statePath}`,
 					`resolution=${resolved.resolution} threshold=${resolved.threshold} threshold_source=${resolved.thresholdSource}`,
 					resolved.trace ? `trace=enabled bounded_paths=${resolved.trace.relevant_paths.length}` : undefined,
 					"handoff=/skill:deep-interview",

@@ -112,6 +112,7 @@ describe("AgentSession resilient retry", () => {
 	}
 
 	function buildStatusErrorSession(options: {
+		model?: Model;
 		errorMessage?: string;
 		errorStatus?: number;
 		errorKind?: AssistantMessage["errorKind"];
@@ -119,14 +120,22 @@ describe("AgentSession resilient retry", () => {
 		recoveredContent?: string;
 		partialContent?: string;
 		bareDefault?: boolean;
+		messageApi?: AssistantMessage["api"];
+		messageProvider?: string;
+		messageModel?: string;
+		requestedModels?: string[];
+		settingsOverrides?: Record<string, unknown>;
 	}): AgentSession {
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const model = options.model ?? getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled test model to exist");
+		authStorage.setRuntimeApiKey(model.provider, `${model.provider}-test-key`);
+		const requestedModels = options.requestedModels ?? [];
 		let calls = 0;
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, opts) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				calls++;
 				if (calls > 1 && options.recoveredContent) {
 					return createMockModel({ responses: [{ content: [options.recoveredContent] }] }).stream(
@@ -140,9 +149,9 @@ describe("AgentSession resilient retry", () => {
 					const message: AssistantMessage = {
 						role: "assistant",
 						content: options.partialContent ? [{ type: "text", text: options.partialContent }] : [],
-						api: requestedModel.api,
-						provider: requestedModel.provider,
-						model: requestedModel.id,
+						api: options.messageApi ?? requestedModel.api,
+						provider: options.messageProvider ?? requestedModel.provider,
+						model: options.messageModel ?? requestedModel.id,
 						usage: {
 							input: 0,
 							output: 0,
@@ -173,6 +182,7 @@ describe("AgentSession resilient retry", () => {
 						"retry.maxDelayMs": 10,
 						"retry.maxRetries": 1,
 					}),
+			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
@@ -180,13 +190,14 @@ describe("AgentSession resilient retry", () => {
 
 	// Builds a session pinned to an explicit model (e.g. ollama-cloud) so
 	// provider-scoped retry behavior can be exercised. The mock streams as
-	// itself, so the active model's API — not the errored message's API — is
-	// what the classifier reads.
+	// itself, so the active model's API remains authoritative for provider-scoped
+	// policies that intentionally use active-model state (such as #713).
 	function buildModelSession(options: {
 		model: Model;
 		responses: Array<{ throw: string } | { content: string[] }>;
 		settingsOverrides?: Record<string, unknown>;
 		requestedModels?: string[];
+		bareDefault?: boolean;
 	}): AgentSession {
 		const { model } = options;
 		authStorage.setRuntimeApiKey(model.provider, `${model.provider}-test-key`);
@@ -202,9 +213,13 @@ describe("AgentSession resilient retry", () => {
 		});
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.baseDelayMs": 1,
-			"retry.maxDelayMs": 10,
-			"retry.maxRetries": 1,
+			...(options.bareDefault
+				? {}
+				: {
+						"retry.baseDelayMs": 1,
+						"retry.maxDelayMs": 10,
+						"retry.maxRetries": 1,
+					}),
 			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
@@ -746,6 +761,163 @@ describe("AgentSession resilient retry", () => {
 		expect(lastAssistant(sess).stopReason).toBe("stop");
 	});
 
+	it("surfaces exact Alibaba Token Plan first-event timeouts without retrying", async () => {
+		const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		const completionsModel = getBundledModel("alibaba-token-plan", "deepseek-v4-pro");
+		if (!responsesModel || !completionsModel) throw new Error("Expected bundled Alibaba Token Plan models");
+
+		const cases = [
+			{
+				model: responsesModel,
+				errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+				settingsOverrides: { "retry.maxRetries": 10 },
+				bareDefault: false,
+			},
+			{
+				model: completionsModel,
+				errorMessage: "OpenAI completions stream timed out while waiting for the first event",
+				settingsOverrides: undefined,
+				bareDefault: true,
+			},
+		] as const;
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		for (const testCase of cases) {
+			const requestedModels: string[] = [];
+			session = buildStatusErrorSession({
+				model: testCase.model,
+				errorMessage: testCase.errorMessage,
+				recoveredContent: "unused retry",
+				requestedModels,
+				bareDefault: testCase.bareDefault,
+				settingsOverrides: testCase.settingsOverrides,
+			});
+			const { retryStartEvents, retryEndEvents } = track(session);
+
+			await session.prompt(`Alibaba ${testCase.model.api} first-event timeout`);
+			await session.waitForIdle();
+
+			expect(requestedModels).toEqual([`${testCase.model.provider}/${testCase.model.id}`]);
+			expect(retryStartEvents).toHaveLength(0);
+			expect(retryEndEvents).toHaveLength(0);
+			expect(waitSpy).not.toHaveBeenCalled();
+			const final = lastAssistant(session);
+			expect(final).toMatchObject({
+				stopReason: "error",
+				provider: testCase.model.provider,
+				api: testCase.model.api,
+				model: testCase.model.id,
+				errorMessage: testCase.errorMessage,
+			});
+			expect(session.isRetrying).toBe(false);
+			expect(session.isStreaming).toBe(false);
+
+			await session.dispose();
+			session = undefined;
+			waitSpy.mockClear();
+		}
+	});
+
+	it("uses failed AssistantMessage identity rather than the active model for Alibaba timeout policy", async () => {
+		const alibabaModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!alibabaModel || !anthropicModel) throw new Error("Expected bundled test models");
+		const timeoutMessage = "OpenAI responses stream timed out while waiting for the first event";
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		const retryRequestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model: alibabaModel,
+			errorMessage: timeoutMessage,
+			messageProvider: "openai",
+			messageApi: "openai-responses",
+			recoveredContent: "recovered after provider mismatch",
+			requestedModels: retryRequestedModels,
+		});
+		const retryEvents = track(session);
+		await session.prompt("Alibaba active model with non-Alibaba failed message");
+		await session.waitForIdle();
+		expect(retryRequestedModels).toHaveLength(2);
+		expect(retryEvents.retryStartEvents).toHaveLength(1);
+		expect(lastAssistant(session).stopReason).toBe("stop");
+		await session.dispose();
+		session = undefined;
+		waitSpy.mockClear();
+
+		const terminalRequestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model: anthropicModel,
+			errorMessage: timeoutMessage,
+			messageProvider: "alibaba-token-plan",
+			messageApi: "openai-responses",
+			messageModel: alibabaModel.id,
+			recoveredContent: "should-not-reach",
+			requestedModels: terminalRequestedModels,
+		});
+		const terminalEvents = track(session);
+		await session.prompt("Non-Alibaba active model with Alibaba failed message");
+		await session.waitForIdle();
+		expect(terminalRequestedModels).toHaveLength(1);
+		expect(terminalEvents.retryStartEvents).toHaveLength(0);
+		expect(waitSpy).not.toHaveBeenCalled();
+		expect(lastAssistant(session)).toMatchObject({
+			stopReason: "error",
+			provider: "alibaba-token-plan",
+			api: "openai-responses",
+			model: alibabaModel.id,
+			errorMessage: timeoutMessage,
+		});
+	});
+
+	it("keeps Alibaba near misses, cross-API text, and unrelated transient failures retryable", async () => {
+		const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
+		const completionsModel = getBundledModel("alibaba-token-plan", "deepseek-v4-pro");
+		if (!responsesModel || !completionsModel) throw new Error("Expected bundled Alibaba Token Plan models");
+		const cases = [
+			{
+				model: responsesModel,
+				errorMessage: "Error: OpenAI responses stream timed out while waiting for the first event",
+			},
+			{
+				model: responsesModel,
+				errorMessage: "OpenAI responses stream timed out while waiting for the first event.",
+			},
+			{
+				model: responsesModel,
+				errorMessage: "OpenAI completions stream timed out while waiting for the first event",
+			},
+			{
+				model: completionsModel,
+				errorMessage: "OpenAI responses stream timed out while waiting for the first event",
+			},
+			{ model: completionsModel, errorMessage: "Alibaba stream stalled while waiting for the next event" },
+			{ model: completionsModel, errorMessage: "503 service unavailable" },
+			{ model: completionsModel, errorMessage: "429 rate limit exceeded" },
+			{ model: completionsModel, errorMessage: "network error: connection reset" },
+		] as const;
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		for (const testCase of cases) {
+			const requestedModels: string[] = [];
+			session = buildModelSession({
+				model: testCase.model,
+				responses: [{ throw: testCase.errorMessage }, { content: ["recovered"] }],
+				requestedModels,
+			});
+			const { retryStartEvents, retryEndEvents } = track(session);
+			await session.prompt(`Alibaba non-terminal ${testCase.errorMessage}`);
+			await session.waitForIdle();
+			expect(requestedModels).toHaveLength(2);
+			expect(retryStartEvents).toHaveLength(1);
+			expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
+			expect(lastAssistant(session).stopReason).toBe("stop");
+			expect(waitSpy).toHaveBeenCalled();
+			await session.dispose();
+			session = undefined;
+			waitSpy.mockClear();
+		}
+	});
+
 	it("bounds ollama-cloud first-event timeout retries instead of looping unbounded (#713)", async () => {
 		// ollama-cloud (ollama-chat API) can stall before its first token even
 		// for tiny prompts. Unbounded continuation retries re-issue the full
@@ -778,6 +950,26 @@ describe("AgentSession resilient retry", () => {
 		expect(last.stopReason).toBe("error");
 		expect(last.errorMessage).toContain("first event");
 		expect(waitSpy).toHaveBeenCalled();
+	});
+	it("surfaces a Kimi Code first-event timeout after its continuous wait without replaying the request", async () => {
+		const model = getBundledModel("kimi-code", "kimi-k2.5");
+		if (!model) throw new Error("Expected bundled Kimi Code test model to exist");
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			model,
+			errorMessage: "Provider stream timed out while waiting for the first event",
+			requestedModels,
+		});
+		const { retryStartEvents, retryEndEvents } = track(session);
+
+		await session.prompt("slow Kimi request");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(retryEndEvents).toHaveLength(0);
+		expect(requestedModels).toHaveLength(1);
+		expect(lastAssistant(session).stopReason).toBe("error");
+		expect(lastAssistant(session).errorMessage).toContain("first event");
 	});
 
 	it("keeps first-party first-event timeout retries unbounded (#713 scope guard)", async () => {

@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { visibleWidth } from "@gajae-code/tui";
-import { WelcomeComponent } from "../src/modes/components/welcome";
+import { resolveWelcomeIntroTickMs, WelcomeComponent } from "../src/modes/components/welcome";
 import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
 
 const originalBuildChannel = process.env.GJC_BUILD_CHANNEL;
@@ -17,6 +17,14 @@ beforeAll(async () => {
 	const theme = await getThemeByName("red-claw");
 	if (!theme) throw new Error("Failed to load red-claw theme");
 	setThemeInstance(theme);
+});
+
+describe("welcome intro cadence", () => {
+	it("reduces frame pressure only for native Windows multiplexers", () => {
+		expect(resolveWelcomeIntroTickMs("win32", "psmux,1,0")).toBe(100);
+		expect(resolveWelcomeIntroTickMs("win32", "")).toBe(33);
+		expect(resolveWelcomeIntroTickMs("linux", "tmux,1,0")).toBe(33);
+	});
 });
 
 function stripRenderControls(line: string): string {
