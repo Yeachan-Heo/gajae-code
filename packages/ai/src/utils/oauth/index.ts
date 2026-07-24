@@ -241,6 +241,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "opengateway",
+		name: "OpenGateway by Sionic AI",
+		available: true,
+	},
+	{
 		id: "vllm",
 		name: "vLLM (Local OpenAI-compatible)",
 		available: true,
@@ -386,6 +391,7 @@ export async function refreshOAuthToken(
 		case "vercel-ai-gateway":
 		case "qwen-portal":
 		case "zenmux":
+		case "opengateway":
 		case "vllm":
 			// API keys / static bearer tokens don't expire, return as-is
 			newCredentials = credentials;

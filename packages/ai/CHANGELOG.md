@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added first-class support for **OpenGateway by Sionic AI**, an OpenAI-compatible gateway. Registers the `opengateway` provider descriptor, `/login` OAuth entry (API-key paste validated against `https://apis.opengateway.ai/v1/models`), `OPENGATEWAY_API_KEY` environment resolution, and bundled `models.json` seed models. Models are discovered dynamically from the OpenAI-compatible `/v1/models` endpoint (base URL `https://apis.opengateway.ai/v1`).
+
 ## [0.11.8] - 2026-07-23
 
 ### Fixed

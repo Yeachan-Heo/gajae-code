@@ -61333,6 +61333,78 @@
 			"maxTokens": 131072
 		}
 	},
+	"opengateway": {
+		"openai/gpt-4o": {
+			"id": "openai/gpt-4o",
+			"name": "GPT-4o (OpenGateway)",
+			"api": "openai-completions",
+			"provider": "opengateway",
+			"baseUrl": "https://apis.opengateway.ai/v1",
+			"reasoning": false,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.5,
+				"output": 10,
+				"cacheRead": 1.25,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384
+		},
+		"anthropic/claude-sonnet-4-5": {
+			"id": "anthropic/claude-sonnet-4-5",
+			"name": "Anthropic Sonnet 4.5 (OpenGateway)",
+			"api": "openai-completions",
+			"provider": "opengateway",
+			"baseUrl": "https://apis.opengateway.ai/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 3,
+				"output": 15,
+				"cacheRead": 0.3,
+				"cacheWrite": 3.75
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"google/gemini-2.5-pro": {
+			"id": "google/gemini-2.5-pro",
+			"name": "Gemini 2.5 Pro (OpenGateway)",
+			"api": "openai-completions",
+			"provider": "opengateway",
+			"baseUrl": "https://apis.opengateway.ai/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 1.25,
+				"output": 10,
+				"cacheRead": 0.31,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 65536,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		}
+	},
 	"openrouter": {
 		"~anthropic/claude-fable-latest": {
 			"id": "~anthropic/claude-fable-latest",
