@@ -1661,7 +1661,9 @@ export function validateDeepInterviewV1Envelope(value: Record<string, unknown>):
 			roundRecord.component !== undefined &&
 			(typeof roundRecord.component !== "string" ||
 				roundRecord.component === "" ||
-				(hasTopologyComponents && !componentIds.has(roundRecord.component)))
+				(hasTopologyComponents &&
+					!componentIds.has(roundRecord.component) &&
+					!(isRoundZeroIntentShell && roundRecord.component === "review-topology")))
 		)
 			return invalid();
 		if (
