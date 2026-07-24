@@ -103,6 +103,20 @@ async function interruptedArtifactMigration(
 	};
 }
 
+async function restartedLegacy(interrupted: Awaited<ReturnType<typeof interruptedArtifactMigration>>) {
+	const resolved = resolveManagedScope({
+		cwd: interrupted.cwd,
+		agentDir: interrupted.agentDir,
+		sessionsRoot: interrupted.sessionsRoot,
+	});
+	if (resolved.kind !== "resolved") throw new Error(resolved.message);
+	const restarted = listManagedCandidates(resolved.scope);
+	if (restarted.kind !== "complete") throw new Error("Could not list restarted candidates");
+	const legacy = restarted.owned.find(candidate => candidate.provenance === "legacy");
+	if (!legacy) throw new Error("Missing restarted legacy candidate");
+	return { scope: resolved.scope, legacy };
+}
+
 describe("managed session Windows durability", () => {
 	it("selects writable no-follow binding flags only on win32", () => {
 		expect(canonicalBindingOpenFlags("win32")).toBe(syncFs.constants.O_RDWR | syncFs.constants.O_NOFOLLOW);
@@ -255,6 +269,76 @@ describe("managed session Windows durability", () => {
 		if (!legacy) throw new Error("Missing restarted legacy candidate");
 		expect(() => restorePreparedArtifactRoot(resolved.scope, legacy)).not.toThrow();
 		expect((await fs.stat(interrupted.artifacts)).isDirectory()).toBe(true);
+	});
+
+	it("reconciles a clean receipt left after restoration before a second restart", async () => {
+		const interrupted = await interruptedArtifactMigration("clean-restored-stale-receipt", "clean");
+		const record = JSON.parse(await fs.readFile(interrupted.receipt, "utf8")) as {
+			sourceArtifactQuarantine?: { detachedPath?: string; tree?: NativeDirectoryTreeSnapshot };
+		};
+		const detachedPath = record.sourceArtifactQuarantine?.detachedPath;
+		const tree = record.sourceArtifactQuarantine?.tree;
+		if (!detachedPath || !tree) throw new Error("Missing detached artifact authority");
+		vi.restoreAllMocks();
+		const snapshotDirectoryTree = native.snapshotDirectoryTree;
+		vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname =>
+			pathname === detachedPath || pathname === interrupted.artifacts
+				? { ok: true, snapshot: tree }
+				: snapshotDirectoryTree(pathname),
+		);
+		const first = await restartedLegacy(interrupted);
+		let restored = false;
+		const exactRestore = native.exactRestore;
+		vi.spyOn(native, "exactRestore").mockImplementation((...args) => {
+			restored = true;
+			return exactRestore(...args);
+		});
+		const unlinkOriginal = syncFs.promises.unlink.bind(syncFs.promises);
+		const unlink = vi.spyOn(syncFs.promises, "unlink").mockImplementation(pathname => {
+			if (restored) return Promise.reject(new Error("injected unlink failure"));
+			return unlinkOriginal(pathname);
+		});
+		expect(await openManagedCandidateForWrite(first.scope, first.legacy)).toMatchObject({
+			kind: "error",
+			code: "durability_failed",
+		});
+		unlink.mockRestore();
+		expect((await fs.stat(interrupted.artifacts)).isDirectory()).toBe(true);
+		const stale = JSON.parse(await fs.readFile(interrupted.receipt, "utf8")) as {
+			detachOutcome?: unknown;
+			sourceArtifactQuarantine?: { detachedPath?: string };
+		};
+		expect(stale.detachOutcome).toBe("clean");
+		expect(stale.sourceArtifactQuarantine?.detachedPath).toBeDefined();
+		if (stale.sourceArtifactQuarantine?.detachedPath)
+			await expect(fs.access(stale.sourceArtifactQuarantine.detachedPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+		const second = await restartedLegacy(interrupted);
+		expect(await openManagedCandidateForWrite(second.scope, second.legacy)).toMatchObject({ kind: "opened" });
+	});
+
+	it("fails closed when a clean receipt's original artifact root was replaced", async () => {
+		const interrupted = await interruptedArtifactMigration("clean-replaced-root", "clean");
+		vi.restoreAllMocks();
+		await fs.mkdir(interrupted.artifacts);
+		await fs.writeFile(path.join(interrupted.artifacts, "foreign.txt"), "foreign");
+		const restarted = await restartedLegacy(interrupted);
+		expect(() => restorePreparedArtifactRoot(restarted.scope, restarted.legacy)).toThrow("durability_failed");
+	});
+
+	it("fails closed when clean or cleanup-pending receipts omit detachOutcome", async () => {
+		for (const detachOutcome of ["clean", "cleanup_pending"] as const) {
+			const interrupted = await interruptedArtifactMigration(
+				`missing-detach-outcome-${detachOutcome}`,
+				detachOutcome,
+			);
+			const record = JSON.parse(await fs.readFile(interrupted.receipt, "utf8")) as Record<string, unknown>;
+			delete record.detachOutcome;
+			await fs.writeFile(interrupted.receipt, `${JSON.stringify(record)}\n`);
+			vi.restoreAllMocks();
+			const restarted = await restartedLegacy(interrupted);
+			expect(() => restorePreparedArtifactRoot(restarted.scope, restarted.legacy)).toThrow("durability_failed");
+		}
 	});
 
 	it("fails closed when cleanup authority is deleted from a cleanup-pending receipt", async () => {

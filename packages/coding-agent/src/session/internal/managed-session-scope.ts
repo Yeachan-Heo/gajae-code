@@ -2470,7 +2470,11 @@ function detachArtifactRootForMigration(
 	return { detached, detachOutcome: "cleanup_pending", cleanup };
 }
 
-export function restorePreparedArtifactRoot(scope: ManagedScope, source: ManagedCandidate): void {
+export function restorePreparedArtifactRoot(
+	scope: ManagedScope,
+	source: ManagedCandidate,
+	lock?: ManagedStorageLock,
+): void {
 	const preparedReceipt = receiptPathFor(scope, source, "prepared");
 	const detachedReceipt = receiptPathFor(scope, source, "detached");
 	const receipt = fs.existsSync(detachedReceipt) ? detachedReceipt : preparedReceipt;
@@ -2519,11 +2523,35 @@ export function restorePreparedArtifactRoot(scope: ManagedScope, source: Managed
 		size: BigInt(identity.size),
 		mtimeNs: BigInt(identity.mtimeNs),
 	};
+	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
+	const assertPreparedTree = (pathname: string): void => {
+		if (
+			!matchesMigrationArtifactRoot(
+				pathname,
+				{
+					...artifactIdentity,
+				},
+				expectedTree,
+			)
+		)
+			throw new Error("durability_failed");
+	};
 	if (receipt === detachedReceipt) {
 		if (quarantine.role !== "detached_artifact_root") throw new Error("durability_failed");
 		if (record.detachOutcome === "clean") {
-			if (record.sourceArtifactCleanup !== undefined || fs.existsSync(quarantine.path))
-				throw new Error("durability_failed");
+			if (record.sourceArtifactCleanup !== undefined) throw new Error("durability_failed");
+			const originalExists = fs.existsSync(quarantine.path);
+			const detachedExists = fs.existsSync(quarantine.detachedPath);
+			if (originalExists) {
+				if (detachedExists) throw new Error("durability_failed");
+				assertPreparedTree(quarantine.path);
+				if (lock) {
+					lock.assertOwned();
+					fs.unlinkSync(receipt);
+					fsyncManagedParent(receipt);
+				}
+				return;
+			}
 		} else if (record.detachOutcome === "cleanup_pending") {
 			const cleanup = record.sourceArtifactCleanup;
 			if (!cleanup) throw new Error("durability_failed");
@@ -2561,19 +2589,6 @@ export function restorePreparedArtifactRoot(scope: ManagedScope, source: Managed
 		}
 	}
 
-	const expectedTree = artifactTreeSnapshot(quarantine.tree)!;
-	const assertPreparedTree = (pathname: string): void => {
-		if (
-			!matchesMigrationArtifactRoot(
-				pathname,
-				{
-					...artifactIdentity,
-				},
-				expectedTree,
-			)
-		)
-			throw new Error("durability_failed");
-	};
 	if (fs.existsSync(quarantine.path)) {
 		if (
 			matchesMigrationArtifactRoot(
@@ -2712,7 +2727,10 @@ async function removeStagedReceipts(scope: ManagedScope, candidate: ManagedCandi
 		const pathname = receiptPathFor(scope, candidate, state);
 		try {
 			const stat = fs.lstatSync(pathname);
-			if (stat.isFile() || stat.isSymbolicLink()) await fs.promises.unlink(pathname);
+			if (stat.isFile() || stat.isSymbolicLink()) {
+				await fs.promises.unlink(pathname);
+				fsyncManagedParent(pathname);
+			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
@@ -3039,7 +3057,7 @@ export async function openManagedCandidateForWrite(
 
 		scopeRoot(scope);
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);
-		restorePreparedArtifactRoot(scope, afterLock);
+		restorePreparedArtifactRoot(scope, afterLock, heldLock);
 		scopeRoot(scope);
 
 		let sourceSnapshot = captureManagedFileNoFollow(afterLock.path);
