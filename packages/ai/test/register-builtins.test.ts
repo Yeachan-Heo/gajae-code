@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import "../src/providers/openai-completions";
+import "../src/providers/openai-responses";
+import { getBundledModel } from "../src/models";
 import {
 	resolveLazyStreamFirstEventFallbackMs,
 	setBedrockProviderModule,
 	streamBedrock,
 } from "../src/providers/register-builtins";
+import { stream as streamModel } from "../src/stream";
 import type { AssistantMessage, Context, Model } from "../src/types";
 import type { AssistantMessageEventStream } from "../src/utils/event-stream";
 
@@ -196,6 +200,7 @@ describe("resolveLazyStreamFirstEventFallbackMs", () => {
 describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 	afterEach(() => {
 		vi.useRealTimers();
+		vi.restoreAllMocks();
 	});
 
 	function createAlibabaModel(): Model<"bedrock-converse-stream"> {
@@ -233,6 +238,24 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 				await new Promise<never>(() => {});
 			},
 		} as unknown as AssistantMessageEventStream;
+	}
+
+	function createDelayedSseResponse(delayMs: number, events: unknown[]): Response {
+		const encoder = new TextEncoder();
+		const payload = `${events
+			.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`)
+			.join("\n\n")}\n\n`;
+		return new Response(
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					setTimeout(() => {
+						controller.enqueue(encoder.encode(payload));
+						controller.close();
+					}, delayMs);
+				},
+			}),
+			{ status: 200, headers: { "content-type": "text/event-stream" } },
+		);
 	}
 
 	it("alibaba-token-plan survives past the 120s shared default outer watchdog", async () => {
@@ -331,5 +354,109 @@ describe("outer lazy-stream first-event watchdog (fake timers)", () => {
 		const result = await stream.result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Provider stream timed out while waiting for the first event");
+	});
+	it("keeps the exported OpenAI Completions lazy path alive past 120s for Alibaba", async () => {
+		vi.useFakeTimers();
+		const model = getBundledModel("alibaba-token-plan", "glm-5.2") as Model<"openai-completions">;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((async () =>
+			createDelayedSseResponse(150_000, [
+				{
+					id: "chatcmpl-delayed",
+					object: "chat.completion.chunk",
+					created: 0,
+					model: model.id,
+					choices: [{ index: 0, delta: { content: "Hello delayed" } }],
+				},
+				{
+					id: "chatcmpl-delayed",
+					object: "chat.completion.chunk",
+					created: 0,
+					model: model.id,
+					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+					usage: {
+						prompt_tokens: 5,
+						completion_tokens: 2,
+						total_tokens: 7,
+						prompt_tokens_details: { cached_tokens: 0 },
+					},
+				},
+				"[DONE]",
+			])) as unknown as typeof fetch);
+
+		const lazyStream = streamModel(model, baseContext, { apiKey: "test-key" });
+		await flush();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+		vi.advanceTimersByTime(120_000);
+		await flush();
+		let settled = false;
+		void lazyStream.result().then(() => {
+			settled = true;
+		});
+		await flush();
+		expect(settled).toBe(false);
+
+		vi.advanceTimersByTime(30_000);
+		await flush();
+		const result = await lazyStream.result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toContainEqual({ type: "text", text: "Hello delayed" });
+	});
+
+	it("keeps the exported OpenAI Responses lazy path alive past 120s for Alibaba", async () => {
+		vi.useFakeTimers();
+		const model = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview") as Model<"openai-responses">;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((async () =>
+			createDelayedSseResponse(150_000, [
+				{ type: "response.created", response: { id: "resp-delayed" } },
+				{
+					type: "response.output_item.added",
+					item: { type: "message", id: "msg-delayed", role: "assistant", status: "in_progress", content: [] },
+				},
+				{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+				{ type: "response.output_text.delta", delta: "Hello delayed" },
+				{
+					type: "response.output_item.done",
+					item: {
+						type: "message",
+						id: "msg-delayed",
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text: "Hello delayed" }],
+					},
+				},
+				{
+					type: "response.completed",
+					response: {
+						id: "resp-delayed",
+						status: "completed",
+						usage: {
+							input_tokens: 5,
+							output_tokens: 2,
+							total_tokens: 7,
+							input_tokens_details: { cached_tokens: 0 },
+						},
+					},
+				},
+			])) as unknown as typeof fetch);
+
+		const lazyStream = streamModel(model, baseContext, { apiKey: "test-key" });
+		await flush();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+		vi.advanceTimersByTime(120_000);
+		await flush();
+		let settled = false;
+		void lazyStream.result().then(() => {
+			settled = true;
+		});
+		await flush();
+		expect(settled).toBe(false);
+
+		vi.advanceTimersByTime(30_000);
+		await flush();
+		const result = await lazyStream.result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content[0]).toMatchObject({ type: "text", text: "Hello delayed" });
 	});
 });
