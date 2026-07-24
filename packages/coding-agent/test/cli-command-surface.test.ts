@@ -60,6 +60,11 @@ describe("GJC public CLI command surface", () => {
 			expect(interactiveBootstrapText(["launch", flag], true, true)).toBeUndefined();
 		}
 	});
+	it("suppresses the interactive bootstrap for parser-accepted equals forms of print, help, and version", () => {
+		for (const flag of ["--print=true", "--help=true", "--version=true", "--print=false"]) {
+			expect(interactiveBootstrapText(["launch", flag], true, true)).toBeUndefined();
+		}
+	});
 
 	it("does not prefix spawned noninteractive launch help output with the bootstrap", () => {
 		const result = Bun.spawnSync(["bun", cliEntry, "launch", "--help"], {

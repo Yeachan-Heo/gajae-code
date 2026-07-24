@@ -128,6 +128,7 @@ export function interactiveBootstrapText(
 		const arg = argv[index];
 		if (
 			arg === "--print" ||
+			arg?.startsWith("--print=") ||
 			arg === "-p" ||
 			arg === "--export" ||
 			arg?.startsWith("--export=") ||
@@ -136,8 +137,10 @@ export function interactiveBootstrapText(
 			arg === "--mode" ||
 			arg?.startsWith("--mode=") ||
 			arg === "--help" ||
+			arg?.startsWith("--help=") ||
 			arg === "-h" ||
 			arg === "--version" ||
+			arg?.startsWith("--version=") ||
 			arg === "-v"
 		)
 			return undefined;
