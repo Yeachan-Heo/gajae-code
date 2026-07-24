@@ -5936,10 +5936,7 @@ mod rename_no_replace_eintr_tests {
 		);
 		assert!(result.ok, "{:?} / {}", result.code, result.reason);
 		assert_eq!(result.reason, "none");
-		assert_eq!(
-			std::fs::read(&destination).expect("read migrated destination"),
-			b"payload"
-		);
+		assert_eq!(std::fs::read(&destination).expect("read migrated destination"), b"payload");
 	}
 
 	#[test]
