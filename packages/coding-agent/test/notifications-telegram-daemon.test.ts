@@ -14150,7 +14150,52 @@ describe("Telegram tool activity capability and routing", () => {
 		expect(String(edit?.body.text)).not.toContain("secret");
 	});
 
-	test("v2 rejects unknown and legacy-v1 cannot create an unknown terminal without a visible owner", async () => {
+	test("v2 remains strict after later v1 and capability-absent hello frames", async () => {
+		const bot = new FakeBotApi();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(tempAgentDir()),
+			ownerId: "owner",
+			botToken: "tok",
+			chatId: "42",
+			botApi: bot,
+			toolActivity: { enabled: true },
+		});
+		const session = richSession();
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [TOOL_ACTIVITY_CAPABILITY] });
+		await daemon.handleSessionMessage(session, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "repo",
+			branch: "branch",
+		});
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "v2-visible",
+			toolName: "read",
+			phase: "started",
+		});
+		expect(bot.calls.length).toBeGreaterThan(0);
+
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, {
+			type: "hello",
+			capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY],
+		});
+		await daemon.handleSessionMessage(session, { type: "hello" });
+		expect(session.toolActivityCapability).toBe("v2");
+		await daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "v2-visible",
+			toolName: "read",
+			phase: "unknown",
+		});
+
+		expect(bot.calls).toHaveLength(0);
+	});
+	test("v1 upgrades to v2 and then strictly rejects unknown for a visible start", async () => {
 		const bot = new FakeBotApi();
 		const daemon = new TelegramNotificationDaemon({
 			settings: settings(tempAgentDir()),
@@ -14162,28 +14207,32 @@ describe("Telegram tool activity capability and routing", () => {
 		});
 		const session = richSession();
 		await daemon.handleSessionMessage(session, {
+			type: "hello",
+			capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY],
+		});
+		await daemon.handleSessionMessage(session, {
 			type: "identity_header",
 			sessionId: "S",
 			repo: "repo",
 			branch: "branch",
 		});
 		bot.calls = [];
-		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [TOOL_ACTIVITY_CAPABILITY] });
 		await daemon.handleSessionMessage(session, {
 			type: "tool_activity",
 			sessionId: "S",
-			toolCallId: "v2-rejected",
+			toolCallId: "upgraded-visible",
 			toolName: "read",
-			phase: "unknown",
+			phase: "started",
 		});
-		await daemon.handleSessionMessage(session, {
-			type: "hello",
-			capabilities: [LEGACY_TOOL_ACTIVITY_CAPABILITY],
-		});
+		expect(bot.calls.length).toBeGreaterThan(0);
+
+		bot.calls = [];
+		await daemon.handleSessionMessage(session, { type: "hello", capabilities: [TOOL_ACTIVITY_CAPABILITY] });
+		expect(session.toolActivityCapability).toBe("v2");
 		await daemon.handleSessionMessage(session, {
 			type: "tool_activity",
 			sessionId: "S",
-			toolCallId: "legacy-orphan",
+			toolCallId: "upgraded-visible",
 			toolName: "read",
 			phase: "unknown",
 		});

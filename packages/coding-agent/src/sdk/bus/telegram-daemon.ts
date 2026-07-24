@@ -197,6 +197,16 @@ export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 /** Receive-only compatibility capability for pre-v2 hosts. */
 export const LEGACY_TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
+type ToolActivityCapability = "v1" | "v2";
+
+function negotiateToolActivityCapability(
+	current: ToolActivityCapability | undefined,
+	capabilities: unknown[],
+): ToolActivityCapability | undefined {
+	if (current === "v2" || capabilities.includes(TOOL_ACTIVITY_CAPABILITY)) return "v2";
+	if (current === "v1" || capabilities.includes(LEGACY_TOOL_ACTIVITY_CAPABILITY)) return "v1";
+	return undefined;
+}
 
 const nodeFs: TelegramDaemonFs = {
 	...(fs.promises as unknown as TelegramDaemonFs),
@@ -4659,11 +4669,7 @@ export class TelegramNotificationDaemon {
 				matches: msg => msg.type === "hello",
 				handle: (session, msg) => {
 					const caps = Array.isArray(msg.capabilities) ? msg.capabilities : [];
-					session.toolActivityCapability = caps.includes(TOOL_ACTIVITY_CAPABILITY)
-						? "v2"
-						: caps.includes(LEGACY_TOOL_ACTIVITY_CAPABILITY)
-							? "v1"
-							: undefined;
+					session.toolActivityCapability = negotiateToolActivityCapability(session.toolActivityCapability, caps);
 					if (caps.includes("ephemeral_turn_v1")) session.ephemeralCapable = true;
 					if (caps.includes(CLIENT_PING_PONG_CAPABILITY)) {
 						session.capable = true;
@@ -7773,11 +7779,7 @@ export class TelegramNotificationDaemon {
 	async handleSessionMessage(session: SessionSocket, msg: any): Promise<void> {
 		if (msg?.type === "hello") {
 			const capabilities = Array.isArray(msg.capabilities) ? msg.capabilities : [];
-			session.toolActivityCapability = capabilities.includes(TOOL_ACTIVITY_CAPABILITY)
-				? "v2"
-				: capabilities.includes(LEGACY_TOOL_ACTIVITY_CAPABILITY)
-					? "v1"
-					: undefined;
+			session.toolActivityCapability = negotiateToolActivityCapability(session.toolActivityCapability, capabilities);
 			if (capabilities.includes("ephemeral_turn_v1")) {
 				session.ephemeralCapable = true;
 				this.#resumeBtwTurnsForSession(session);
