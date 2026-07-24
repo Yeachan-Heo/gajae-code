@@ -111,6 +111,70 @@ export function injectImageGenerationModels(models: Model[]): void {
 	}
 }
 
+/**
+ * A first-party model transcribed from published provider documentation, kept as
+ * a typed generator input instead of a hand-edit in the generated catalog.
+ */
+interface FirstPartyCatalogSeed {
+	/** Upstream-shaped entry; normalization (name scrub, thinking, limits) runs later. */
+	readonly model: Model;
+	/** Published documentation the fields were transcribed from. */
+	readonly provenance: {
+		readonly sources: readonly string[];
+		readonly retrievedAt: string;
+	};
+}
+
+/**
+ * Typed catalog seeds for freshly published first-party models.
+ *
+ * models.dev and provider discovery stay the primary sources. A model published
+ * after the last upstream snapshot — or any regeneration without network access
+ * or provider credentials — would otherwise drop the entry, so each seed is
+ * merged only when the dynamic sources did not return the same provider/model
+ * key, then flows through the same pipeline as every other entry
+ * (`applyGlobalModelsDevFallback`, `applyGeneratedModelPolicies`, name
+ * scrubbing, thinking inference). No field is fixed up in `src/models.json`.
+ */
+export const FIRST_PARTY_CATALOG_SEEDS: readonly FirstPartyCatalogSeed[] = [
+	{
+		// Claude Opus 5: GA on the Claude API, announced 2026-07-24.
+		model: {
+			id: "claude-opus-5",
+			name: "Claude Opus 5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		} satisfies Model<"anthropic-messages">,
+		provenance: {
+			sources: [
+				"https://platform.claude.com/docs/en/about-claude/models/overview",
+				"https://platform.claude.com/docs/en/about-claude/pricing",
+			],
+			retrievedAt: "2026-07-25",
+		},
+	},
+];
+
+/**
+ * Merge typed catalog seeds for provider/model keys the dynamic sources and the
+ * previous bundled catalog did not supply. Idempotent: seeding an array that
+ * already carries the key is a no-op, so upstream metadata always wins.
+ */
+export function injectFirstPartyCatalogSeeds(models: Model[]): void {
+	for (const seed of FIRST_PARTY_CATALOG_SEEDS) {
+		if (models.some(model => model.provider === seed.model.provider && model.id === seed.model.id)) {
+			continue;
+		}
+		models.push({ ...seed.model, input: [...seed.model.input], cost: { ...seed.model.cost } });
+	}
+}
+
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars) {
 		const value = $env[envVar as keyof typeof $env];
@@ -451,6 +515,9 @@ async function generateModels() {
 			}
 		}
 	}
+	// Typed first-party seeds fill models that neither the dynamic sources nor the
+	// previous catalog carried, then normalize with everything else below.
+	injectFirstPartyCatalogSeeds(allModels);
 	allModels = allModels.filter(model => !isRetiredBundledModel(model));
 
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
