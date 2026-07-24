@@ -44,7 +44,7 @@ describe("SelectorController command palette", () => {
 			editorContainer: component,
 			editor: {},
 			restoreComposer: vi.fn(),
-			keybindings: { getKeys: () => [] },
+			keybindings: { getDisplayString: () => "" },
 			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
 			showError,
 		} as unknown as InteractiveModeContext;
@@ -68,5 +68,45 @@ describe("SelectorController command palette", () => {
 		await errorShown.promise;
 
 		expect(showError).toHaveBeenCalledWith("external editor failed");
+	});
+	it("uses effective display strings and omits unbound action shortcuts", () => {
+		const component = { clear: vi.fn(), addChild: vi.fn() };
+		const keybindings = {
+			getDisplayString(action: string) {
+				return (
+					{
+						"app.darwin": "⌥↑",
+						"app.textual": "Alt+Up",
+						"app.unbound": "",
+					}[action] ?? ""
+				);
+			},
+		};
+		const ctx = {
+			editorContainer: component,
+			editor: {},
+			restoreComposer: vi.fn(),
+			keybindings,
+			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+			showError: vi.fn(),
+		} as unknown as InteractiveModeContext;
+		const controller = new SelectorController(ctx);
+
+		controller.showCommandPalette(
+			[],
+			[
+				{ id: "app.darwin", label: "Darwin", handler: () => {} },
+				{ id: "app.textual", label: "Textual", handler: () => {} },
+				{ id: "app.unbound", label: "Unbound", handler: () => {} },
+			],
+			async () => {},
+		);
+
+		const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
+		expect(palette.getEntries().map(entry => [entry.label, entry.keybinding])).toEqual([
+			["Darwin", "⌥↑"],
+			["Textual", "Alt+Up"],
+			["Unbound", undefined],
+		]);
 	});
 });

@@ -2,12 +2,15 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai";
 import type { AgentSession } from "../session/agent-session";
 import { formatClampedModelSelector } from "../thinking";
+import { validateModelProfileName } from "./model-profile-contract";
 import {
 	aggregateModelProfileRequiredProviders,
-	formatAvailableProfileNames,
 	formatModelProfileDisplayLabel,
 	resolveProfileBindings,
 } from "./model-profiles";
+
+export { resolveModelProfileName } from "./model-profile-contract";
+
 import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	type GjcModelAssignmentTargetId,
@@ -23,8 +26,6 @@ import {
 } from "./model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { Settings } from "./settings";
-
-const LEGACY_MODEL_PROFILE_ALIASES: ReadonlyMap<string, string> = new Map([["codex-standard", "codex-medium"]]);
 
 type ModelProfileActivationSession = Pick<
 	AgentSession,
@@ -50,7 +51,7 @@ export interface PrepareModelProfileActivationOptions {
 		| "resolveCanonicalModel"
 		| "getCanonicalVariants"
 		| "getCanonicalId"
-	>;
+	> & { getError?: ModelRegistry["getError"] };
 	settings: Pick<Settings, "get">;
 	profileName: string;
 }
@@ -236,14 +237,6 @@ export function formatModelProfileCredentialError(profileLabel: string, provider
 	return `Model profile "${profileLabel}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
 }
 
-export function resolveModelProfileName(profileName: string, profiles: ReadonlyMap<string, unknown>): string {
-	// A retired-name alias is fallback-only: never shadow a profile that actually
-	// exists under the requested name (e.g. a user-defined `codex-standard`).
-	if (profiles.has(profileName)) return profileName;
-	const replacement = LEGACY_MODEL_PROFILE_ALIASES.get(profileName);
-	return replacement && profiles.has(replacement) ? replacement : profileName;
-}
-
 /**
  * Rewrite a selector only within the selector provider's own alternative group.
  * Strict providers are never rewritten, and authenticated alternative providers
@@ -348,12 +341,8 @@ export async function prepareModelProfileActivation(
 	options: PrepareModelProfileActivationOptions,
 ): Promise<PreparedModelProfileActivation> {
 	const profiles = options.modelRegistry.getModelProfiles();
-	const profileName = resolveModelProfileName(options.profileName, profiles);
-	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName);
-	if (!profile) {
-		const available = formatAvailableProfileNames(profiles);
-		throw new Error(`Unknown model profile "${options.profileName}". Available profiles: ${available}`);
-	}
+	const profileName = validateModelProfileName(options.profileName, profiles, options.modelRegistry.getError?.());
+	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName)!;
 	const profileLabel = formatModelProfileDisplayLabel(profile);
 
 	const requiredProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);

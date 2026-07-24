@@ -1,3 +1,8 @@
+import {
+	isModelProfileError,
+	type ModelProfileErrorCode,
+	type ModelProfileErrorDetails,
+} from "../config/model-profile-contract";
 export type SdkStartupPhase = "registration" | "startup";
 
 export type SdkStartupReason = "disabled" | "ineligible" | "factory_absent" | "runner_absent" | "pending" | "failed";
@@ -6,6 +11,8 @@ export interface SdkStartupFailure {
 	phase: SdkStartupPhase;
 	reason: SdkStartupReason;
 	message: string;
+	code?: ModelProfileErrorCode;
+	details?: ModelProfileErrorDetails;
 }
 
 export type SdkStartupResult = { status: "started" } | { status: "failed"; failure: SdkStartupFailure };
@@ -134,7 +141,8 @@ export function normalizeSdkStartupFailure(
 							? "SDK startup did not complete before readiness cutoff."
 							: FALLBACK_MESSAGE;
 	const message = sanitizeSdkStartupMessage(error, knownSecrets);
-	return { phase, reason, message: message === FALLBACK_MESSAGE ? fallback : message };
+	const profileError = isModelProfileError(error) ? { code: error.code, details: error.details } : {};
+	return { phase, reason, message: message === FALLBACK_MESSAGE ? fallback : message, ...profileError };
 }
 
 /** Collect process-scoped credentials without exposing a raw-secret API. */

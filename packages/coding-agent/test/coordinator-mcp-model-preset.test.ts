@@ -24,21 +24,23 @@ describe("resolveCoordinatorMpreset", () => {
 		}
 	});
 
-	it("rejects an explicit blank or whitespace-only selection instead of silently omitting it", async () => {
+	it("rejects explicit empty and unconfigured whitespace selections without silently omitting them", async () => {
 		for (const raw of ["", "   "]) {
 			await expect(resolveCoordinatorMpreset(raw, loaderWithProfiles(customProfile("alpha")))).resolves.toEqual({
 				ok: false,
 				reason: "unknown_model_profile",
-				mpreset: "",
+				mpreset: raw,
 				available_profiles: ["alpha"],
 			});
 		}
 	});
 
-	it("accepts and trims a known built-in profile", async () => {
+	it("preserves exact profile identity instead of trimming a padded key", async () => {
 		await expect(resolveCoordinatorMpreset("  codex-eco  ", builtinLoader)).resolves.toEqual({
-			ok: true,
-			mpreset: "codex-eco",
+			ok: false,
+			reason: "unknown_model_profile",
+			mpreset: "  codex-eco  ",
+			available_profiles: ["codex-eco"],
 		});
 	});
 

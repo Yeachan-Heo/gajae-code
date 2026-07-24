@@ -5607,7 +5607,8 @@ mod owner_only_security_tests {
 	};
 
 	use super::{
-		apply_owner_only_path_security, rename_no_replace_path, verify_owner_only_path_security,
+		NativeExactUnlinkResult, NativeNoReplaceResult, apply_owner_only_path_security,
+		rename_no_replace_path, verify_owner_only_path_security,
 	};
 
 	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);

@@ -4,12 +4,17 @@
  * Usage: bun scripts/mine-compaction-history.ts [--json] [--since YYYY-MM-DD]
  */
 
+import { createHash } from "node:crypto";
 import { createReadStream, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 const SESSIONS_ROOT = join(homedir(), ".gjc", "agent", "sessions");
+
+function opaqueSessionId(sessionFile: string): string {
+  return `session:${createHash("sha256").update(sessionFile).digest("hex").slice(0, 16)}`;
+}
 const JULY_START = "2026-07-01";
 const JULY_END = "2026-07-17";
 const OVERFLOW_PATTERN =
@@ -372,7 +377,7 @@ async function mineFile(
       const [provider] = currentModel?.split("/") ?? [];
       const evidence: CompactionEvidence = {
         timestamp: typeof entry.timestamp === "string" ? entry.timestamp : "",
-        sessionFile: path,
+        sessionFile: opaqueSessionId(path),
         tokensBefore,
         model: currentModel ?? null,
         provider: provider ?? null,
@@ -427,7 +432,7 @@ async function main() {
   const dailyAggregates = [...daily.values()].sort((a, b) => a.key.localeCompare(b.key)).map((aggregate) => ({ ...serializeAggregate(aggregate), day: aggregate.key, week: undefined }));
   const output = {
     provenance: {
-      sessionStore: SESSIONS_ROOT,
+      sessionStore: "Local GJC session store (path redacted)",
       modelWindowMap: "User ~/.gjc/agent/models.yml, verified 2026-07-16; exact provider/model keys precede documented provider/model prefixes.",
       thresholdSemantics: "Pre-#1021 uses maxOutputTokens=128000 for known mapped models; post-#1021 uses maxOutputTokens=0.",
     },

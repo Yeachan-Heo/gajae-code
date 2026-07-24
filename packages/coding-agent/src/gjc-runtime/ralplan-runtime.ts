@@ -735,7 +735,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 				`refusing to overwrite ralplan ${resolved.stage} stage ${resolved.stageN} at ${existingArtifact.path}: an artifact with different content already exists (existing sha256=${existingArtifact.sha256}, new sha256=${sha256}). Use a new --stage_n to record another pass.`,
 			);
 		}
-		return buildDeduplicatedResult(resolved, existingArtifact, sha256, cwd);
+		return buildDeduplicatedResult(resolved, existingArtifact, sha256, cwd, repositoryBinding);
 	}
 
 	// Keep run-state `current_phase` coherent with the stage being persisted.
@@ -781,6 +781,7 @@ function buildDeduplicatedResult(
 	existing: ExistingStageArtifact,
 	sha256: string,
 	cwd: string,
+	repositoryBinding: RepositoryBinding,
 ): RalplanCommandResult {
 	const payload: Record<string, unknown> = {
 		run_id: resolved.runId,
@@ -788,6 +789,7 @@ function buildDeduplicatedResult(
 		stage: resolved.stage,
 		stage_n: resolved.stageN,
 		sha256,
+		repository_binding: repositoryBinding,
 		created_at: existing.createdAt,
 		deduplicated: true,
 	};

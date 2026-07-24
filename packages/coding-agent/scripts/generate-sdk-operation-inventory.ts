@@ -39,6 +39,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setForcedToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveSkillState": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveSkillPhase": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getDeepInterviewAskStage":
+		"internal AskTool schema-selection accessor, not a user-facing SDK control seam",
 	"agent_session:peekQueueInvoker": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:peekStandingResolveHandler": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:setStandingResolveHandler": "internal accessor/plumbing, not a user-facing control seam",

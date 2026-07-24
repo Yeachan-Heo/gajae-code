@@ -3,12 +3,10 @@ import {
 	type AutocompleteProvider,
 	CombinedAutocompleteProvider,
 	extractSlashCommandTokenPrefix,
-	getKeybindings,
 	getSlashCommandMatchRank,
 	type SlashCommand,
 } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../config/keybindings";
-import { formatKeyHints } from "../config/keybindings";
 import { isSettingsInitialized, settings } from "../config/settings";
 import { applyEmojiCompletion, getEmojiSuggestions, isEmojiPrefix, tryEmojiInlineReplace } from "./emoji-autocomplete";
 
@@ -399,12 +397,11 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 export function createPromptActionAutocompleteProvider(
 	options: PromptActionAutocompleteOptions,
 ): PromptActionAutocompleteProvider {
-	const editorKeybindings = getKeybindings();
 	const actions: PromptActionDefinition[] = [
 		{
 			id: "new-session",
 			label: "Start new session",
-			description: formatKeyHints(options.keybindings.getKeys("app.session.new")) || "/new",
+			description: options.keybindings.getDisplayString("app.session.new"),
 			keywords: ["new", "session", "fresh", "clear", "start", "conversation"],
 			execute: options.newSession,
 		},
@@ -418,21 +415,21 @@ export function createPromptActionAutocompleteProvider(
 		{
 			id: "copy-line",
 			label: "Copy current line",
-			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.copyLine")),
+			description: options.keybindings.getDisplayString("app.clipboard.copyLine"),
 			keywords: ["copy", "line", "clipboard", "current"],
 			execute: options.copyCurrentLine,
 		},
 		{
 			id: "copy-prompt",
 			label: "Copy whole prompt",
-			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.copyPrompt")),
+			description: options.keybindings.getDisplayString("app.clipboard.copyPrompt"),
 			keywords: ["copy", "prompt", "clipboard", "message"],
 			execute: options.copyPrompt,
 		},
 		{
 			id: "paste-image",
 			label: "Paste image from clipboard",
-			description: formatKeyHints(options.keybindings.getKeys("app.clipboard.pasteImage")),
+			description: options.keybindings.getDisplayString("app.clipboard.pasteImage"),
 			keywords: ["paste", "image", "clipboard", "screenshot", "attach", "vision"],
 			execute: options.pasteImage,
 		},
@@ -446,7 +443,7 @@ export function createPromptActionAutocompleteProvider(
 		{
 			id: "undo",
 			label: "Undo",
-			description: formatKeyHints(editorKeybindings.getKeys("tui.editor.undo")),
+			description: options.keybindings.getDisplayString("tui.editor.undo"),
 			keywords: ["undo", "revert", "edit", "history"],
 			execute: options.undo,
 		},
@@ -467,14 +464,14 @@ export function createPromptActionAutocompleteProvider(
 		{
 			id: "cursor-line-start",
 			label: "Move cursor to beginning of line",
-			description: formatKeyHints(editorKeybindings.getKeys("tui.editor.cursorLineStart")),
+			description: options.keybindings.getDisplayString("tui.editor.cursorLineStart"),
 			keywords: ["move", "cursor", "line", "start", "beginning", "home"],
 			execute: options.moveCursorToLineStart,
 		},
 		{
 			id: "cursor-line-end",
 			label: "Move cursor to end of line",
-			description: formatKeyHints(editorKeybindings.getKeys("tui.editor.cursorLineEnd")),
+			description: options.keybindings.getDisplayString("tui.editor.cursorLineEnd"),
 			keywords: ["move", "cursor", "line", "end"],
 			execute: options.moveCursorToLineEnd,
 		},

@@ -11,6 +11,7 @@ import { SILENT_ABORT_MARKER } from "@gajae-code/coding-agent/session/messages";
 import { Text } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { formatKeyHints } from "../src/config/keybindings";
 import { ModelRegistry } from "../src/config/model-registry";
 import { planSnapshotHash } from "../src/modes/components/plan-preview-overlay";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
@@ -208,7 +209,7 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(selector).toHaveBeenCalledWith(
 			"# Plan\n\nDo the thing.",
 			expect.objectContaining({
-				externalEditorKey: "Ctrl+G",
+				externalEditorKey: formatKeyHints(["ctrl+g"]),
 				externalEditorKeys: ["ctrl+g"],
 				onExternalEditor: expect.any(Function),
 			}),

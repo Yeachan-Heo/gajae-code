@@ -1,3 +1,4 @@
+import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
 import {
 	assertCursorSelector,
 	type CursorEnvelope,
@@ -43,6 +44,10 @@ export interface SessionSurface {
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 
 	getJobs(): unknown | Promise<unknown>;
+	/** Q26 keyed lookup of a submitted prompt's authoritative reconciliation status. */
+	getPromptStatus?(selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown | Promise<unknown>;
+	/** Q27 effective model-profile catalog from the live session registry. */
+	getModelProfiles?(): unknown[] | Promise<unknown[]>;
 	/** Query rows backed by the session's installed binding map. */
 	installedQueries?: ReadonlySet<string>;
 }
@@ -66,7 +71,7 @@ export interface QueryResponse {
 	ok: boolean;
 	page?: QueryPage;
 	result?: unknown;
-	error?: { code: string; message: string; restartQuery?: boolean };
+	error?: { code: string; message: string; restartQuery?: boolean; details?: unknown };
 }
 
 const sources: Record<string, { resource: string; method: keyof SessionSurface; mvcc: boolean }> = {
@@ -92,6 +97,7 @@ const sources: Record<string, { resource: string; method: keyof SessionSurface; 
 	Q21: { resource: "queue", method: "getQueueMessages", mvcc: true },
 	Q22: { resource: "extensions", method: "getExtensions", mvcc: true },
 	Q25: { resource: "jobs", method: "getJobs", mvcc: false },
+	Q27: { resource: "modelProfiles", method: "getModelProfiles", mvcc: true },
 };
 const names = [
 	"transcript.list",
@@ -119,6 +125,8 @@ const names = [
 	"resource.body",
 	"artifact.read",
 	"runtime.jobs.list",
+	"turn.prompt_status",
+	"models.profiles.list",
 ];
 
 export class QueryHandlers {
@@ -147,13 +155,18 @@ export class QueryHandlers {
 				);
 			if (query === "Q02") return await this.#transcriptBody(request);
 			if (query === "Q23") return await this.#resourceBody(request);
+			if (query === "Q26") return await this.#promptStatus(request);
 			if (query === "Q24") return await this.#artifact(request);
+			if (query === "Q27" && request.input && Object.keys(request.input).length > 0)
+				return this.#error(request, "invalid_request", false, "models.profiles.list does not accept input fields.");
+			if (query === "Q27" && typeof this.surface.getModelProfiles !== "function")
+				return this.#error(request, "unavailable", false, "models.profiles.list is unavailable for this session.");
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
 			return await this.#pageSource(request, query, source);
 		} catch (error) {
 			if (error instanceof CursorError) return this.#error(request, error.code, error.restartQuery, error.message);
-			if (isTypedError(error)) return this.#error(request, error.code, false, error.message);
+			if (isTypedError(error)) return this.#error(request, error.code, false, error.message, error.details);
 			return this.#error(request, "internal", false, error instanceof Error ? error.message : String(error));
 		}
 	}
@@ -504,8 +517,60 @@ export class QueryHandlers {
 		return { id: request.id, ok: true, page };
 	}
 
-	#error(request: QueryRequest, code: string, restartQuery = false, message = code): QueryResponse {
-		return { id: request.id, ok: false, error: { code, message, ...(restartQuery ? { restartQuery: true } : {}) } };
+	async #promptStatus(request: QueryRequest): Promise<QueryResponse> {
+		if (request.cursor)
+			return this.#error(request, "invalid_request", false, "turn.prompt_status does not support cursors.");
+		const input = request.input ?? {};
+		for (const key of Object.keys(input))
+			if (key !== "commandId" && key !== "turnId" && key !== "clientRef")
+				return this.#error(
+					request,
+					"invalid_request",
+					false,
+					`turn.prompt_status does not accept selector field "${key}".`,
+				);
+		const commandId = typeof input.commandId === "string" && input.commandId ? input.commandId : undefined;
+		const turnId = typeof input.turnId === "string" && input.turnId ? input.turnId : undefined;
+		const rawClientRef = typeof input.clientRef === "string" ? input.clientRef : undefined;
+		const trimmedClientRef = rawClientRef?.trim();
+		if (rawClientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"clientRef must be a non-empty string of at most 128 characters.",
+			);
+		const clientRef = trimmedClientRef || undefined;
+		if ((commandId === undefined) !== (turnId === undefined))
+			return this.#error(request, "invalid_request", false, "commandId and turnId must be provided together.");
+		if (commandId !== undefined && clientRef !== undefined)
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"Provide exactly one selector: a commandId/turnId pair or a clientRef.",
+			);
+		if (commandId === undefined && clientRef === undefined)
+			return this.#error(
+				request,
+				"invalid_request",
+				false,
+				"turn.prompt_status requires a commandId/turnId pair or a clientRef.",
+			);
+		if (typeof this.surface.getPromptStatus !== "function")
+			return this.#error(request, "unavailable", false, "turn.prompt_status is unavailable for this session.");
+		const result = await this.surface.getPromptStatus(
+			clientRef !== undefined ? { clientRef } : { commandId: commandId!, turnId: turnId! },
+		);
+		return { id: request.id, ok: true, result };
+	}
+
+	#error(request: QueryRequest, code: string, restartQuery = false, message = code, details?: unknown): QueryResponse {
+		return {
+			id: request.id,
+			ok: false,
+			error: { code, message, ...(restartQuery ? { restartQuery: true } : {}), ...(details ? { details } : {}) },
+		};
 	}
 }
 function selectorFor(queryId: string, input: Record<string, unknown> | undefined): CursorSelector {
@@ -521,7 +586,7 @@ function idOf(value: unknown): string | undefined {
 function lastId(value: unknown): string | undefined {
 	return Array.isArray(value) ? idOf(value.at(-1)) : undefined;
 }
-function isTypedError(error: unknown): error is { code: string; message: string } {
+function isTypedError(error: unknown): error is { code: string; message: string; details?: unknown } {
 	return Boolean(
 		error &&
 			typeof error === "object" &&

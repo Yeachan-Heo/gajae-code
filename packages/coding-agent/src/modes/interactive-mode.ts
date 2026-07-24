@@ -16,7 +16,13 @@ import {
 import { APP_NAME, adjustHsv, getProjectDir, logger, postmortem } from "@gajae-code/utils";
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
-import { type AppKeybinding, KeybindingsManager } from "../config/keybindings";
+import {
+	type AppKeybinding,
+	formatKeyHint,
+	formatKeyHints,
+	KeybindingsManager,
+	type KeyDisplayContext,
+} from "../config/keybindings";
 import { isSettingsInitialized, type Settings, settings } from "../config/settings";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import type {
@@ -106,8 +112,15 @@ import {
 import type { ParsedIrcMessage } from "./utils/irc-message";
 import { addChatChild, prepareTranscriptRebuild, UiHelpers } from "./utils/ui-helpers";
 
-const COMPOSER_NEWLINE_HINT = process.platform === "win32" ? "Alt+Enter/Ctrl+J" : "Shift+Enter/Ctrl+J";
-export const DEFAULT_COMPOSER_PLACEHOLDER = `Type your message... ${COMPOSER_NEWLINE_HINT}: New line · Ctrl+C: Clear · Ctrl+R: Search history · Shift+Tab: Reasoning`;
+export function getDefaultComposerPlaceholder(context: KeyDisplayContext = { platform: process.platform }): string {
+	const newlineKeys = context.platform === "win32" ? ["alt+enter", "ctrl+j"] : ["shift+enter", "ctrl+j"];
+	return `Type your message... ${formatKeyHints(newlineKeys, context)}: New line · ${formatKeyHint(
+		"ctrl+c",
+		context,
+	)}: Clear · ${formatKeyHint("ctrl+r", context)}: Search history · ${formatKeyHint("shift+tab", context)}: Reasoning`;
+}
+
+export const DEFAULT_COMPOSER_PLACEHOLDER = getDefaultComposerPlaceholder();
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
 
 const IRC_SIDEBAR_TOGGLE_SHADOWING_ACTIONS: readonly AppKeybinding[] = [
@@ -128,23 +141,6 @@ export function getWelcomeTranscriptReservedRows(chatContainer: Container, width
 	return chatContainer.children.length === 0 || chatContainer.children.length > WELCOME_RESERVED_CONTAINER_CHILD_LIMIT
 		? 0
 		: chatContainer.render(width).length;
-}
-const FRIENDLY_KEY_PARTS: Record<string, string> = {
-	alt: "Alt",
-	cmd: "Cmd",
-	command: "Cmd",
-	ctrl: "Ctrl",
-	enter: "Enter",
-	meta: process.platform === "darwin" ? "Command" : "Meta",
-	option: "Option",
-	shift: "Shift",
-};
-
-function formatShortcutForPlaceholder(key: string): string {
-	return key
-		.split("+")
-		.map(part => FRIENDLY_KEY_PARTS[part.toLowerCase()] ?? (part.length === 1 ? part.toUpperCase() : part))
-		.join("+");
 }
 
 const HINT_SHIMMER_PALETTE: ShimmerPalette = {
@@ -170,7 +166,7 @@ function configureDefaultComposerChrome(editor: CustomEditor): void {
 	editor.setClosedBorderBox(true);
 	editor.setPromptGutter(undefined);
 	editor.setInputPrefix(getDefaultInputPrefix());
-	editor.setPlaceholder(DEFAULT_COMPOSER_PLACEHOLDER);
+	editor.setPlaceholder(getDefaultComposerPlaceholder());
 	editor.setPaddingX(1);
 	editor.setRightGutterWidth(1);
 	editor.setTopBorder(undefined);
@@ -353,6 +349,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#petUnavailableWarningDisposer?: () => void;
 	readonly #version: string;
 	readonly #changelogMarkdown: string | undefined;
+	readonly #keyDisplayContext: KeyDisplayContext;
 
 	readonly lspServers: LspStartupServerInfo[] | undefined = undefined;
 	mcpManager?: import("../runtime-mcp").MCPManager;
@@ -400,6 +397,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		lspServers: LspStartupServerInfo[] | undefined = undefined,
 		mcpManager?: import("../runtime-mcp").MCPManager,
 		eventBus?: EventBus,
+		keyDisplayContext: KeyDisplayContext = { platform: process.platform },
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
@@ -438,6 +436,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.lspServers = lspServers;
 		this.mcpManager = mcpManager;
 		this.#eventBus = eventBus;
+		this.#keyDisplayContext = keyDisplayContext;
+		this.keybindings.setDisplayContext(this.#keyDisplayContext);
 		const thisMode = this;
 		this.#goalModeController = new GoalModeController({
 			session: this.session,
@@ -519,6 +519,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.btwContainer = new Container();
 		this.editor = new CustomEditor(getEditorTheme());
 		configureDefaultComposerChrome(this.editor);
+		this.editor.setPlaceholder(this.#getComposerPlaceholder());
 		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		this.editor.setAutocompleteMaxVisible(settings.get("autocompleteMaxVisible"));
 		this.editor.onAutocompleteCancel = () => {
@@ -546,7 +547,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.hookWidgetContainerBelow = new Container();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor);
-		this.statusLine = new StatusLineComponent(session, { version: this.#version, focusDomain: "composer" });
+		this.statusLine = new StatusLineComponent(session, {
+			version: this.#version,
+			focusDomain: "composer",
+			keyDisplayContext: this.#keyDisplayContext,
+		});
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
 
 		this.hideThinkingBlock = settings.get("hideThinkingBlock");
@@ -603,6 +608,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.isInitialized) return;
 
 		this.keybindings = logger.time("InteractiveMode.init:keybindings", () => KeybindingsManager.create());
+		this.keybindings.setDisplayContext(this.#keyDisplayContext);
 
 		// Register session manager flush for signal handlers (SIGINT, SIGTERM, SIGHUP)
 		this.#cleanupUnsubscribe = postmortem.register("session-manager-flush", () => this.sessionManager.flush());
@@ -660,6 +666,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					getReservedBottomRows: getWelcomeReservedBottomRows,
 					changelogMarkdown: this.#changelogMarkdown,
 					collapseChangelog: settings.get("collapseChangelog"),
+					keyDisplayContext: this.#keyDisplayContext,
 				},
 			);
 
@@ -810,6 +817,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		onThemeChange(() => {
 			clearRenderCache();
 			configureDefaultComposerChrome(this.editor);
+			this.editor.setPlaceholder(this.#getComposerPlaceholder());
 			this.ui.invalidate();
 			this.updateEditorChrome();
 			this.ui.requestRender();
@@ -1041,12 +1049,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#getComposerPlaceholder(): string {
-		if (!this.#isPromptDeliveryBusy()) return DEFAULT_COMPOSER_PLACEHOLDER;
-		const enterAction = this.settings.get("busyPromptMode") === "steer" ? "Steer" : "Queue";
-		const parts = [`Enter: ${enterAction}`];
+		const defaultPlaceholder = getDefaultComposerPlaceholder(this.#keyDisplayContext);
+		if (!this.#isPromptDeliveryBusy()) return defaultPlaceholder;
+		const submitAction = this.settings.get("busyPromptMode") === "steer" ? "Steer" : "Queue";
+		const submitKey = this.keybindings.getDisplayString("tui.input.submit", this.#keyDisplayContext);
+		const parts = submitKey ? [`${submitKey}: ${submitAction}`] : [];
 		const queueKey = this.#getMessageQueueShortcut();
-		if (queueKey) parts.push(`${formatShortcutForPlaceholder(queueKey)}: Queue`);
-		return `${DEFAULT_COMPOSER_PLACEHOLDER} · ${parts.join(" · ")}`;
+		if (queueKey) parts.push(`${formatKeyHint(queueKey, this.#keyDisplayContext)}: Queue`);
+		return parts.length > 0 ? `${defaultPlaceholder} · ${parts.join(" · ")}` : defaultPlaceholder;
 	}
 
 	#getWelcomeReservedRows(width: number): number {
@@ -1401,6 +1411,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			: new CustomEditor(getEditorTheme());
 
 		configureDefaultComposerChrome(nextEditor);
+		nextEditor.setPlaceholder(this.#getComposerPlaceholder());
 		nextEditor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		nextEditor.setAutocompleteMaxVisible(this.settings.get("autocompleteMaxVisible"));
 		nextEditor.onAutocompleteCancel = () => {

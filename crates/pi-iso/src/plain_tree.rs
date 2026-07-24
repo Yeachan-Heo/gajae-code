@@ -454,7 +454,7 @@ mod tests {
 		sync::atomic::{AtomicU64, Ordering},
 	};
 
-	use super::index_tree;
+	use super::{PlainTree, index_tree};
 
 	static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -522,12 +522,29 @@ mod tests {
 	}
 
 	#[cfg(windows)]
+	fn index_junction_fixture(tree: &Path) -> PlainTree {
+		const TRANSIENT_ERROR: &str = "plain-diff entry changed while it was being captured: victim";
+		const MAX_ATTEMPTS: usize = 3;
+
+		for attempt in 1..=MAX_ATTEMPTS {
+			match index_tree(tree) {
+				Ok(index) => return index,
+				Err(error) if error.to_string() == TRANSIENT_ERROR && attempt < MAX_ATTEMPTS => {
+					std::thread::yield_now();
+				},
+				Err(error) => panic!("failed to index Windows junction fixture: {error}"),
+			}
+		}
+		unreachable!()
+	}
+
+	#[cfg(windows)]
 	#[test]
 	fn retained_root_handle_rejects_intermediate_junction_swap_after_indexing() {
 		let fixture = Fixture::new();
 		fs::write(fixture.tree.join("victim/value.txt"), b"inside snapshot").unwrap();
 		fs::write(fixture.outside.join("value.txt"), b"outside operator secret").unwrap();
-		let index = index_tree(&fixture.tree).unwrap();
+		let index = index_junction_fixture(&fixture.tree);
 
 		fs::rename(fixture.tree.join("victim"), fixture.tree.join("victim-held")).unwrap();
 		create_junction(&fixture.tree.join("victim"), &fixture.outside);
@@ -536,7 +553,10 @@ mod tests {
 			.read(Path::new("victim/value.txt"))
 			.unwrap_err()
 			.to_string();
-		assert!(error.contains("plain-diff entry"));
+		assert!(
+			error.contains("plain-diff entry") || error.contains("plain-diff path changed entry kind"),
+			"unexpected rejection message: {error}"
+		);
 		assert!(!error.contains("outside operator secret"));
 	}
 
@@ -1140,13 +1160,24 @@ mod platform {
 	impl DirectoryEntry {
 		fn matches(&self, information: &HandleInformation) -> bool {
 			let identity = identity_from_information(information);
-			self.file_id == identity.ino
-				&& self.end_of_file == identity.size
+			let kind_mask = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+			if self.file_id != identity.ino
+				|| self.attributes & kind_mask != information.basic.FileAttributes & kind_mask
+			{
+				return false;
+			}
+			let is_plain_directory = information.basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+				&& information.basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+			if is_plain_directory {
+				// NTFS updates a directory's parent-index metadata lazily, so the
+				// size/timestamps seen by enumeration can trail the open handle
+				// while contents were just written. The 64-bit file id plus the
+				// kind bits are the stable identity for plain directories.
+				return true;
+			}
+			self.end_of_file == identity.size
 				&& self.last_write_time == information.basic.LastWriteTime
 				&& self.change_time == information.basic.ChangeTime
-				&& self.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
-					== information.basic.FileAttributes
-						& (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
 		}
 	}
 

@@ -245,6 +245,7 @@ import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import type { HookCommandContext } from "../extensibility/hooks/types";
 import { buildSkillPromptMessage, type Skill, type SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
+import { assertDeepInterviewIntentManifest } from "../gjc-runtime/deep-interview-state";
 import { buildGjcRuntimeSessionEnv, consumePendingGoalModeRequest } from "../gjc-runtime/goal-mode-request";
 import {
 	assertNonEmptyGjcSessionId,
@@ -1669,6 +1670,7 @@ export class AgentSession {
 
 	#skillsSettings: SkillsSettings | undefined;
 	#activeSkillState: { skill: string; sessionId?: string } | undefined;
+	#restoredWorkflowSkillState: { skill: string; sessionId: string } | undefined;
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
@@ -2484,6 +2486,34 @@ export class AgentSession {
 			const raw = fs.readFileSync(filePath, "utf-8");
 			const parsed = JSON.parse(raw) as { current_phase?: unknown };
 			return typeof parsed.current_phase === "string" ? parsed.current_phase : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	/** Provider-facing ask metadata must expose only the active deep-interview phase. */
+	getDeepInterviewAskStage(): "topology" | "post-topology" | undefined {
+		const currentSessionId = this.sessionManager.getSessionId();
+		const inMemory = this.#activeSkillState;
+		const active =
+			inMemory && (!inMemory.sessionId || inMemory.sessionId === currentSessionId)
+				? inMemory
+				: this.#restoredWorkflowSkillState?.sessionId === currentSessionId
+					? this.#restoredWorkflowSkillState
+					: undefined;
+		if (active?.skill !== "deep-interview") return undefined;
+		try {
+			assertNonEmptyGjcSessionId(currentSessionId, "AgentSession.getDeepInterviewAskStage");
+			const stateDir = sessionStateDir(this.sessionManager.getCwd(), currentSessionId);
+			const filePath = path.join(
+				stateDir,
+				path.basename(sessionModeStatePath(this.sessionManager.getCwd(), currentSessionId, active.skill)),
+			);
+			const raw = fs.readFileSync(filePath, "utf-8");
+			const parsed = JSON.parse(raw) as { state?: { intent_contract?: unknown } };
+			const intentContract = parsed.state?.intent_contract;
+			if (intentContract === undefined) return "topology";
+			assertDeepInterviewIntentManifest(intentContract);
+			return "post-topology";
 		} catch {
 			return undefined;
 		}
@@ -6783,8 +6813,9 @@ export class AgentSession {
 		if (!activeSkill) {
 			try {
 				const activeState = await readVisibleSkillActiveState(this.sessionManager.getCwd(), sessionId);
-				activeSkill =
-					activeState?.skill ?? activeState?.active_skills?.find(entry => entry.active !== false)?.skill;
+				activeSkill = activeState?.active_skills?.find(
+					entry => entry.active !== false && entry.session_id === sessionId,
+				)?.skill;
 			} catch (error) {
 				logger.warn("Failed to read durable workflow skill state while restoring ask tool", {
 					error: error instanceof Error ? error.message : String(error),
@@ -6796,7 +6827,12 @@ export class AgentSession {
 			// a predecessor session's workflow state to the current identity.
 			if (this.#isDisposed || this.sessionManager.getSessionId() !== sessionId) return;
 		}
-		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) this.#attachAskTool();
+		if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill.trim())) {
+			if (!inMemoryActiveSkill) this.#restoredWorkflowSkillState = { skill: activeSkill.trim(), sessionId };
+			this.#attachAskTool();
+		} else if (this.#restoredWorkflowSkillState?.sessionId === sessionId) {
+			this.#restoredWorkflowSkillState = undefined;
+		}
 	}
 
 	#attachAskTool(): void {
@@ -7348,6 +7384,7 @@ export class AgentSession {
 			}
 		}
 		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
+		this.#restoredWorkflowSkillState = undefined;
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
 		if (active) {
 			await this.refreshGjcSubskillTools();

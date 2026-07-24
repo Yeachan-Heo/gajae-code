@@ -137,7 +137,7 @@ function invoke(
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
-			return surface.prompt(text(input), input.images);
+			return surface.prompt(text(input), input.images, input.clientRef as string | undefined);
 		case "turn.steer":
 			return surface.steer(text(input));
 		case "turn.follow_up":

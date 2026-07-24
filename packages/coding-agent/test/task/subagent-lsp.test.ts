@@ -4,6 +4,7 @@ import { AsyncJobManager } from "../../src/async";
 import type { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import type { LoadExtensionsResult } from "../../src/extensibility/extensions/types";
+import * as repositoryBindingModule from "../../src/gjc-runtime/repository-binding";
 import type { PlanModeState } from "../../src/plan-mode/state";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
@@ -163,6 +164,14 @@ function mockIsolation(): void {
 	vi.spyOn(worktreeModule, "ensureIsolation").mockResolvedValue(isolationHandle);
 	vi.spyOn(worktreeModule, "captureDeltaPatch").mockResolvedValue({ rootPatch: "", nestedPatches: [] });
 	vi.spyOn(worktreeModule, "cleanupIsolation").mockResolvedValue();
+	const binding: repositoryBindingModule.RepositoryBinding = {
+		schema: "gjc.repository_binding.v1",
+		worktreeRoot: "/repo",
+		commonDir: null,
+		displayPath: "/repo",
+	};
+	vi.spyOn(repositoryBindingModule, "resolveTaskRepositoryBinding").mockResolvedValue(binding);
+	vi.spyOn(repositoryBindingModule, "assertExecutionRootMatchesRepositoryBinding").mockResolvedValue(binding);
 }
 
 describe("subagent LSP availability", () => {

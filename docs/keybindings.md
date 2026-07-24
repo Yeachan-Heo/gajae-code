@@ -8,14 +8,18 @@ User remaps live in `~/.gjc/agent/keybindings.json`. The file is a JSON object w
 
 ```json
 {
-  "app.commandPalette.open": "Ctrl+P",
-  "app.model.cycleForward": "Alt+N",
-  "app.model.selectTemporary": "Alt+P",
-  "app.plan.toggle": "Alt+Shift+P"
+  "app.commandPalette.open": "ctrl+p",
+  "app.model.cycleForward": "alt+n",
+  "app.model.selectTemporary": "alt+p",
+  "app.plan.toggle": "alt+shift+p"
 }
 ```
 
-Chord names are case-insensitive and use the same notation shown in the UI, such as `Ctrl+P`, `Alt+N`, `Alt+Shift+P`, `Shift+Enter`, and `Ctrl+Backspace`.
+Chord names are case-insensitive. New configuration should use canonical textual IDs rather than matching the labels shown in the UI.
+Configuration uses portable canonical key IDs, not the labels printed by a particular host: use `ctrl`, `alt`, `shift`, and `super` with a key name, for example `ctrl+p`, `alt+enter`, `shift+tab`, and `super+c`. Matching is case-insensitive, but new configuration should use this canonical textual form so the same file remains portable.
+
+Runtime UI labels are platform-native. On macOS, `Ctrl`, `Alt`, `Shift`, and `Super` display as `⌃`, `⌥`, `⇧`, and `⌘`; MacBook keycaps such as Return, Escape, Tab, Delete, and the arrow keys display as `↩`, `⎋`, `⇥`, `⌫`/`⌦`, and arrows. These glyphs are display labels only: configure `super+c`, not `⌘C`, and `alt+enter`, not `⌥↩`.
+Static onboarding and generated reference material describe shipped defaults and must stay host-independent. The active runtime surface is authoritative for effective bindings after user remaps and extensions load: use `/hotkeys` to see those bindings on the current platform.
 
 Set an action to an empty array to disable it:
 
@@ -29,25 +33,25 @@ Set an action to an empty array to disable it:
 
 | Action ID | Default | Meaning |
 | --- | --- | --- |
-| `app.commandPalette.open` | `Ctrl+P` | Open the command palette |
-| `app.model.cycleForward` | `Alt+N` | Cycle role models forward |
-| `app.model.cycleBackward` | `Alt+Shift+N` | Cycle role models backward |
-| `app.model.selectTemporary` | `Alt+P` | Pick a model temporarily for this session |
-| `app.model.select` | `Ctrl+L` | Open the model selector and set roles |
-| `app.plan.toggle` | `Alt+Shift+P` | Toggle plan mode |
-| `app.history.search` | `Ctrl+R` | Search prompt history |
-| `app.tools.expand` | `Ctrl+O` | Toggle tool-output expansion |
-| `app.thinking.toggle` | `Ctrl+T` | Toggle thinking-block visibility |
-| `app.thinking.cycle` | `Shift+Tab` | Cycle thinking level |
-| `app.editor.external` | `Ctrl+G` | Edit the draft in `$VISUAL` / `$EDITOR` |
-| `app.message.followUp` | _(none)_ | Optional remap for a follow-up message; `Ctrl+Enter` is reserved for editor newline |
-| `app.message.queue` | `Alt+Enter` (`Alt+Q` on darwin/win32) | Explicitly queue a message for the next turn |
-| `app.message.dequeue` | `Alt+Up` | Dequeue a queued message back into the editor |
+| `app.commandPalette.open` | `ctrl+p` | Open the command palette |
+| `app.model.cycleForward` | `alt+n` | Cycle role models forward |
+| `app.model.cycleBackward` | `alt+shift+n` | Cycle role models backward |
+| `app.model.selectTemporary` | `alt+p` | Pick a model temporarily for this session |
+| `app.model.select` | `ctrl+l` | Open the model selector and set roles |
+| `app.plan.toggle` | `alt+shift+p` | Toggle plan mode |
+| `app.history.search` | `ctrl+r` | Search prompt history |
+| `app.tools.expand` | `ctrl+o` | Toggle tool-output expansion |
+| `app.thinking.toggle` | `ctrl+t` | Toggle thinking-block visibility |
+| `app.thinking.cycle` | `shift+tab` | Cycle thinking level |
+| `app.editor.external` | `ctrl+g` | Edit the draft in `$VISUAL` / `$EDITOR` |
+| `app.message.followUp` | _(none)_ | Optional remap for a follow-up message; `ctrl+enter` is reserved for editor newline |
+| `app.message.queue` | `alt+enter` (`alt+q` on darwin/win32) | Explicitly queue a message for the next turn |
+| `app.message.dequeue` | `alt+up` | Dequeue a queued message back into the editor |
 
-| `app.clipboard.copyLine` | `Alt+Shift+L` | Copy the current line |
-| `app.clipboard.copyPrompt` | `Alt+Shift+C` | Copy the whole prompt |
-| `app.stt.toggle` | `Alt+H` | Toggle speech-to-text recording |
-| `app.irc.sidebar.toggle` | `Alt+I` | Toggle IRC sidebar |
+| `app.clipboard.copyLine` | `alt+shift+l` | Copy the current line |
+| `app.clipboard.copyPrompt` | `alt+shift+c` | Copy the whole prompt |
+| `app.stt.toggle` | `alt+h` | Toggle speech-to-text recording |
+| `app.irc.sidebar.toggle` | `alt+i` | Toggle IRC sidebar |
 
 Older unqualified action names are migrated when `keybindings.json` is loaded, but new docs and new configs should use the namespaced action IDs above.
 

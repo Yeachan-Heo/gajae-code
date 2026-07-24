@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { detectDefaultKeyCollisions, KeybindingsManager, TUI_KEYBINDINGS } from "@gajae-code/tui/keybindings";
+import { isKeyId } from "@gajae-code/tui/keys";
 
 describe("KeybindingsManager", () => {
 	it("does not evict selector confirm when input submit is rebound", () => {
@@ -33,6 +34,21 @@ describe("KeybindingsManager", () => {
 			},
 		]);
 		expect(keybindings.getKeys("tui.editor.cursorLeft")).toEqual(["left", "ctrl+b"]);
+	});
+
+	it("keeps page navigation bindings canonical across manager outputs", () => {
+		const keybindings = new KeybindingsManager(TUI_KEYBINDINGS);
+
+		expect(keybindings.getKeys("tui.editor.pageUp")).toEqual(["pageUp"]);
+		expect(keybindings.getKeys("tui.editor.pageDown")).toEqual(["pageDown"]);
+
+		const resolved = keybindings.getResolvedBindings();
+		expect(resolved["tui.editor.pageUp"]).toBe("pageUp");
+		expect(resolved["tui.editor.pageDown"]).toBe("pageDown");
+		expect(isKeyId(keybindings.getKeys("tui.editor.pageUp")[0]!)).toBe(true);
+		expect(isKeyId(keybindings.getKeys("tui.editor.pageDown")[0]!)).toBe(true);
+		expect(isKeyId(resolved["tui.editor.pageUp"] as string)).toBe(true);
+		expect(isKeyId(resolved["tui.editor.pageDown"] as string)).toBe(true);
 	});
 
 	describe("user binding ownership", () => {

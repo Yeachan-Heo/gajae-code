@@ -40,6 +40,7 @@ class SdkSessionCliError extends Error {
 		readonly code: string,
 		message: string,
 		readonly exitCode: 1 | 2,
+		readonly details?: unknown,
 	) {
 		super(message);
 	}
@@ -261,7 +262,12 @@ export async function runSdkSessionCli(
 			error instanceof SdkSessionCliError
 				? error
 				: error instanceof SdkClientError
-					? new SdkSessionCliError(error.code, error.message, 1)
+					? new SdkSessionCliError(
+							error.code,
+							error.message,
+							1,
+							(error.details as { details?: unknown } | undefined)?.details,
+						)
 					: error instanceof SdkDiscoveryError
 						? new SdkSessionCliError(error.code, error.message, 1)
 						: new SdkSessionCliError(
@@ -269,7 +275,14 @@ export async function runSdkSessionCli(
 								error instanceof Error ? error.message : "SDK operation failed.",
 								1,
 							);
-		writeOutput({ ok: false, error: { code: cliError.code, message: cliError.message } });
+		writeOutput({
+			ok: false,
+			error: {
+				code: cliError.code,
+				message: cliError.message,
+				...(cliError.details ? { details: cliError.details } : {}),
+			},
+		});
 		setExitCode(cliError.exitCode);
 	}
 }

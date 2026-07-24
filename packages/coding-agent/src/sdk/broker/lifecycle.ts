@@ -8,6 +8,13 @@ import * as native from "@gajae-code/natives";
 import { resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
+	isModelProfileError,
+	type ModelProfileErrorDetails,
+	validateModelProfileName,
+} from "../../config/model-profile-contract";
+import { mergeModelProfiles } from "../../config/model-profiles";
+import { ModelsConfigFile } from "../../config/model-registry";
+import {
 	ensureLaunchWorktree,
 	ensureReusableNodeModules,
 	type GjcLaunchWorktreePlan,
@@ -326,12 +333,34 @@ function serializeCleanupIdentity(identity: CleanupIdentity): BrokerCleanupIdent
 	};
 }
 
-const fail = (code: string, message: string, cleanup?: CleanupEvidence): BrokerResponse => ({
+const fail = (
+	code: string,
+	message: string,
+	cleanup?: CleanupEvidence,
+	details?: ModelProfileErrorDetails,
+): BrokerResponse => ({
 	ok: false,
-	error: { code: code as never, message, ...(cleanup ? { cleanup } : {}) },
+	error: { code: code as never, message, ...(details ? { details } : {}), ...(cleanup ? { cleanup } : {}) },
 });
 function text(value: unknown): string | undefined {
 	return typeof value === "string" && value ? value : undefined;
+}
+
+function validateBrokerModelPreset(agentDir: string, requestedProfile: string): string | BrokerResponse {
+	const modelsConfigFile = ModelsConfigFile.relocate(path.join(agentDir, "models.yml"));
+	modelsConfigFile.invalidate();
+	const loaded = modelsConfigFile.tryLoad();
+	const profiles = mergeModelProfiles(loaded.status === "ok" ? loaded.value.profiles : undefined);
+	try {
+		return validateModelProfileName(requestedProfile, profiles, loaded.status === "error" ? loaded.error : undefined);
+	} catch (error) {
+		if (isModelProfileError(error)) return fail(error.code, error.message, undefined, error.details);
+		throw error;
+	}
+}
+
+export function validateBrokerModelPresetForTest(agentDir: string, requestedProfile: string): string | BrokerResponse {
+	return validateBrokerModelPreset(agentDir, requestedProfile);
 }
 
 function readinessTimeout(input: Input): number | BrokerResponse {
@@ -624,7 +653,7 @@ type ReadyAuthority = {
 };
 type ReadinessResult =
 	| { kind: "ready"; authority: ReadyAuthority }
-	| { kind: "startup_failed"; message: string }
+	| { kind: "startup_failed"; failure: SdkStartupFailure }
 	| { kind: "child_exited" }
 	| { kind: "timeout" };
 const processIncarnationReadersForTest = new WeakMap<Broker, (pid: number) => string | undefined>();
@@ -797,19 +826,25 @@ function isLifecycleTranscriptEvidence(value: unknown): value is LifecycleTransc
 function isSdkStartupFailure(value: unknown): value is SdkStartupFailure {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const failure = value as Record<string, unknown>;
-	return (
-		Object.keys(failure).length === 3 &&
-		(failure.phase === "registration" || failure.phase === "startup") &&
-		(failure.reason === "disabled" ||
-			failure.reason === "ineligible" ||
-			failure.reason === "factory_absent" ||
-			failure.reason === "runner_absent" ||
-			failure.reason === "pending" ||
-			failure.reason === "failed") &&
-		typeof failure.message === "string" &&
-		Buffer.byteLength(failure.message) > 0 &&
-		Buffer.byteLength(failure.message) <= 512
-	);
+	const keys = Object.keys(failure);
+	if (
+		!keys.every(
+			key => key === "phase" || key === "reason" || key === "message" || key === "code" || key === "details",
+		) ||
+		(failure.phase !== "registration" && failure.phase !== "startup") ||
+		(failure.reason !== "disabled" &&
+			failure.reason !== "ineligible" &&
+			failure.reason !== "factory_absent" &&
+			failure.reason !== "runner_absent" &&
+			failure.reason !== "pending" &&
+			failure.reason !== "failed") ||
+		typeof failure.message !== "string" ||
+		Buffer.byteLength(failure.message) === 0 ||
+		Buffer.byteLength(failure.message) > 512
+	)
+		return false;
+	if (failure.code === undefined && failure.details === undefined) return keys.length === 3;
+	return keys.length === 5 && isModelProfileError(failure);
 }
 
 function isLifecycleFailureArtifact(value: unknown): value is LifecycleFailureArtifact {
@@ -818,8 +853,14 @@ function isLifecycleFailureArtifact(value: unknown): value is LifecycleFailureAr
 	if (!isEffectMarker(record)) return false;
 	const artifact = value as LifecycleFailureArtifact;
 	return (
-		Object.keys(record).length === (artifact.transcript === undefined ? 7 : 8) &&
-		isSdkStartupFailure({ phase: artifact.phase, reason: artifact.reason, message: artifact.message }) &&
+		Object.keys(record).length ===
+			7 + (artifact.code === undefined ? 0 : 2) + (artifact.transcript === undefined ? 0 : 1) &&
+		isSdkStartupFailure({
+			phase: artifact.phase,
+			reason: artifact.reason,
+			message: artifact.message,
+			...(artifact.code === undefined ? {} : { code: artifact.code, details: artifact.details }),
+		}) &&
 		isRollbackResult(artifact.rollback) &&
 		(artifact.transcript === undefined || isLifecycleTranscriptEvidence(artifact.transcript))
 	);
@@ -865,6 +906,8 @@ export async function writeSessionLifecycleFailure(
 		...(transcript ? { transcript } : {}),
 	};
 	const bytes = Buffer.from(canonicalJson(artifact), "utf8");
+	if (bytes.length > MAX_LIFECYCLE_METADATA_BYTES)
+		throw new Error("Lifecycle startup failure exceeds the metadata size ceiling.");
 	const target = lifecycleFailurePath(root, id, effectMarker);
 	const temporary = path.join(directory, `.${id}.lifecycle.failure.${effectMarker}.${randomUUID()}.tmp`);
 	let published = false;
@@ -1711,6 +1754,22 @@ async function readSessionLifecycleFailure(
 		?.artifact;
 }
 
+export async function readSessionLifecycleFailureForTest(
+	root: string,
+	id: string,
+	expected: { pid: number; effectMarker: string; incarnation: string },
+): Promise<SdkStartupFailure | undefined> {
+	const artifact = await readSessionLifecycleFailure(root, id, expected);
+	return artifact
+		? {
+				phase: artifact.phase,
+				reason: artifact.reason,
+				message: artifact.message,
+				...(artifact.code === undefined ? {} : { code: artifact.code, details: artifact.details }),
+			}
+		: undefined;
+}
+
 async function hasDurableProcessIdentity(
 	root: string,
 	id: string,
@@ -2102,14 +2161,14 @@ async function waitForReady(
 ): Promise<ReadinessResult> {
 	while (timing.now() < deadline) {
 		const startupFailure = await readSessionLifecycleFailure(root, id, expected);
-		if (startupFailure) return { kind: "startup_failed", message: startupFailure.message };
+		if (startupFailure) return { kind: "startup_failed", failure: startupFailure };
 		if (
 			observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
 			"exited"
 		) {
 			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
 			return finalStartupFailure
-				? { kind: "startup_failed", message: finalStartupFailure.message }
+				? { kind: "startup_failed", failure: finalStartupFailure }
 				: { kind: "child_exited" };
 		}
 		try {
@@ -2237,6 +2296,8 @@ async function launchInput(
 	const requested = sessionId(input);
 	if (requested !== undefined && !isCanonicalSessionId(requested))
 		return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	if (input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
+		return fail("invalid_input", "modelPreset must be a non-empty exact profile ID.");
 	const modelPreset = text(input.modelPreset);
 
 	if (operation === "session.create")
@@ -2661,6 +2722,11 @@ async function executeLifecycleResponse(
 
 		const launch = await launchInput(broker, operation, input);
 		if ("ok" in launch) return launch;
+		if (launch.modelPreset) {
+			const validatedModelPreset = validateBrokerModelPreset(broker.settings.agentDir, launch.modelPreset);
+			if (typeof validatedModelPreset !== "string") return validatedModelPreset;
+			launch.modelPreset = validatedModelPreset;
+		}
 		if (!hasProcessIncarnationAuthority())
 			return fail(
 				"incarnation_unavailable",
@@ -2814,7 +2880,12 @@ async function executeLifecycleResponse(
 					`Session ${launch.id} did not become ready and its spawned process could not be verified dead.`,
 				);
 			return readiness.kind === "startup_failed"
-				? fail("spawn_failed", readiness.message)
+				? fail(
+						readiness.failure.code ?? "spawn_failed",
+						readiness.failure.message,
+						undefined,
+						readiness.failure.details,
+					)
 				: readiness.kind === "child_exited"
 					? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
 					: fail(
@@ -3391,6 +3462,9 @@ export async function executeLifecycle(
 				phase: evidence.artifact.phase,
 				reason: evidence.artifact.reason,
 				message: evidence.artifact.message,
+				...(evidence.artifact.code === undefined
+					? {}
+					: { code: evidence.artifact.code, details: evidence.artifact.details }),
 				rollback: {
 					endpointGeneration: evidence.artifact.rollback.endpointGeneration,
 					fenced: evidence.artifact.rollback.fenced,
@@ -3455,11 +3529,18 @@ export async function executeLifecycle(
 				: startupFailure && cleanupProof
 					? {
 							ok: false,
-							error: {
-								code: "spawn_failed",
-								message: "No ready SDK endpoint remains available.",
-								endpoint: "unavailable",
-							},
+							error: startupFailure.code
+								? {
+										code: startupFailure.code,
+										message: startupFailure.message,
+										details: startupFailure.details!,
+										endpoint: "unavailable" as const,
+									}
+								: {
+										code: "spawn_failed",
+										message: "No ready SDK endpoint remains available.",
+										endpoint: "unavailable" as const,
+									},
 							...(durableEffects ? { durableEffects } : {}),
 							startupFailure,
 						}

@@ -122,7 +122,7 @@ export class PlanPreviewOverlay extends Container {
 				? `${this.#inputKind === "notes" ? "Notes" : `Comment for source line ${this.#sourceLine}`} (Enter save, Esc cancel): ${this.#input.getValue()}`
 				: this.#focus === "sourceSelect"
 					? `Source line ${this.#sourceLine}/${this.lines.length || 1}  j/k:select  c:comment  Esc:done`
-					: `${this.#scroll + 1}-${Math.min(this.#scroll + height, body.length)}/${body.length || 1}  s:source line  n:notes  ${this.options.externalEditorKey ? `${this.options.externalEditorKey.toLowerCase()}:edit  ` : ""}Tab:actions  PgUp/PgDn:page`;
+					: `${this.#scroll + 1}-${Math.min(this.#scroll + height, body.length)}/${body.length || 1}  s:source line  n:notes  ${this.options.externalEditorKey ? `${this.options.externalEditorKey}:edit  ` : ""}Tab:actions  PgUp/PgDn:page`;
 
 		const rendered = [
 			new DynamicBorder().render(width)[0] ?? "",

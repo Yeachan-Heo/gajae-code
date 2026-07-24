@@ -284,6 +284,76 @@ Malformed reasoning descriptors are not client-recoverable catalog data. The
 query returns the SDK's safe `internal` error rather than exposing a partially
 formed row or descriptor details.
 
+## Prompt acceptance and reconciliation (Q26)
+
+`turn.prompt` returns `{ accepted: true, commandId, turnId, clientRef? }` only after
+its asynchronous preflight accepts the prompt. This acknowledgement is not a
+process-durable terminal result. The authoritative public reconciliation query is
+`Q26` / `turn.prompt_status`, scoped to the same live session runtime.
+
+Callers that must recover from a lost acknowledgement should assign one fresh
+`clientRef` (a trimmed, non-empty string of at most 128 characters) to each logical
+prompt. Reconnect to the same session endpoint and query with exactly one selector:
+
+```json
+{ "type": "query_request", "query": "turn.prompt_status",
+  "input": { "clientRef": "request-018f" } }
+```
+
+or:
+
+```json
+{ "type": "query_request", "query": "turn.prompt_status",
+  "input": { "commandId": "command-id", "turnId": "turn-id" } }
+```
+
+The result status is `accepted`, `in_flight`, `terminal_ok`, `failed`, or
+`unknown`. Known records include `acceptedAt`; in-flight and terminal records add
+`startedAt` and/or `terminalAt`; failed records add a bounded sanitized
+`error.code` and `error.message`. Cursors, partial generated-ID pairs, mixed
+selectors, and extra selector fields are rejected.
+
+Reconciliation state survives client disconnect/reconnect, not session-process
+restart. Active records are capped at 128 and are never aged or evicted. Terminal
+records are retained for 15 minutes, capped at 256, and evicted oldest-terminal
+first. Restart or eviction honestly returns `unknown`; that means the prior outcome
+is unknowable, not that execution did not occur.
+
+`turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
+does not replay a response or produce `idempotency_conflict`. A retained duplicate
+`clientRef` fails before execution with `client_ref_conflict`, but callers must not
+reuse a `clientRef` as a retry mechanism: after eviction the same value can identify
+a new prompt while the old outcome remains unknown.
+
+## Model profile discovery and validation (Q27)
+
+`Q27` / `models.profiles.list` pages the effective model-profile catalog owned by
+the attached session. Rows are sorted by exact ID and contain only:
+
+```json
+{ "id": "codex-medium", "displayName": "codex-medium", "source": "builtin" }
+```
+
+`source` is `builtin` or `configured`. Profiles from `<agentDir>/models.yml`
+override built-ins with the same exact ID, including their display label. Profile
+IDs are not trimmed, case-folded, sanitized, or restricted to safe-token names;
+discover the exact ID and send it unchanged. The retired `codex-standard` alias is
+fallback-only and never shadows a configured profile with that exact ID.
+
+Q27 uses retained-revision, connection-bound pagination. Continue an issued cursor
+to finish its stable snapshot; a fresh cursorless query observes the current
+registry. The query accepts no root, path, or selector input. An invalid or
+unreadable `models.yml` fails closed with `model_profile_registry_error` rather
+than returning a plausible built-ins-only catalog.
+
+Broker `session.create`, `session.fork`, and `session.resume` validate `modelPreset`
+before spawning against the same `<broker.settings.agentDir>/models.yml` authority
+that the child receives through `GJC_AGENT_DIR` / `GJC_CODING_AGENT_DIR`. Unknown
+IDs return `unknown_model_profile`. Both typed errors include bounded `details`
+with `requestedProfile` where applicable, whole exact `availableProfiles` entries
+that fit the detail budget, and `discoveryQuery: "models.profiles.list"`. The
+discovery pointer is authoritative when the bounded error cannot include every ID.
+
 ## Answer semantics
 
 A remote reply answers a pending ask in every session state:

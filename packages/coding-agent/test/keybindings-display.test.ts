@@ -1,31 +1,88 @@
 import { describe, expect, it } from "bun:test";
-import { defaultMessageQueueKeysForPlatform, KeybindingsManager } from "../src/config/keybindings";
+import {
+	defaultMessageQueueKeysForPlatform,
+	formatAccessibleKeyHint,
+	formatAccessibleKeyHints,
+	formatKeyHint,
+	formatKeyHints,
+	KeybindingsManager,
+} from "../src/config/keybindings";
 import type { Extension, ExtensionRuntime } from "../src/extensibility/extensions";
 import { ExtensionRunner } from "../src/extensibility/extensions";
 
 describe("KeybindingsManager.getDisplayString", () => {
-	it("formats a single binding as a human-readable key hint", () => {
+	it("formats bindings using the supplied platform context", () => {
 		const keybindings = KeybindingsManager.inMemory({
 			"app.message.dequeue": "alt+up",
-		});
-
-		expect(keybindings.getDisplayString("app.message.dequeue")).toBe("Alt+Up");
-	});
-
-	it("formats multiple bindings with the existing separator", () => {
-		const keybindings = KeybindingsManager.inMemory({
 			"app.clipboard.copyPrompt": ["alt+shift+c", "ctrl+shift+c"],
 		});
 
-		expect(keybindings.getDisplayString("app.clipboard.copyPrompt")).toBe("Alt+Shift+C/Ctrl+Shift+C");
+		expect(keybindings.getDisplayString("app.message.dequeue", { platform: "darwin" })).toBe("⌥↑");
+		expect(keybindings.getDisplayString("app.clipboard.copyPrompt", { platform: "win32" })).toBe(
+			"Alt+Shift+C/Ctrl+Shift+C",
+		);
+	});
+	it("uses the configured default context across composed consumers", () => {
+		const keybindings = KeybindingsManager.inMemory({
+			"app.commandPalette.open": "super+p",
+		});
+		keybindings.setDisplayContext({ platform: "darwin" });
+
+		expect(keybindings.getDisplayString("app.commandPalette.open")).toBe("⌘P");
+		expect(keybindings.getDisplayString("app.commandPalette.open", { platform: "linux" })).toBe("Super+P");
 	});
 
 	it("returns an empty string when the action has no binding", () => {
 		const keybindings = KeybindingsManager.inMemory({
 			"app.clipboard.copyPrompt": [],
 		});
-
 		expect(keybindings.getDisplayString("app.clipboard.copyPrompt")).toBe("");
+	});
+});
+
+describe("accessibility-oriented key hint formatting", () => {
+	it("expands Darwin glyph chords without changing concise display strings", () => {
+		const keybindings = KeybindingsManager.inMemory({
+			"app.model.select": "ctrl+l",
+			"app.thinking.cycle": "shift+tab",
+		});
+		keybindings.setDisplayContext({ platform: "darwin" });
+
+		expect(formatAccessibleKeyHint("ctrl+l", { platform: "darwin" })).toBe("⌃L (Control+L)");
+		expect(formatAccessibleKeyHint("shift+tab", { platform: "darwin" })).toBe("⇧⇥ (Shift+Tab)");
+		expect(formatAccessibleKeyHint("ctrl+alt+shift+super+enter", { platform: "darwin" })).toBe(
+			"⌃⌥⇧⌘↩ (Control+Option+Shift+Command+Enter)",
+		);
+		expect(formatAccessibleKeyHint("alt+backspace", { platform: "darwin" })).toBe("⌥⌫ (Option+Backspace)");
+		expect(keybindings.getAccessibleDisplayString("app.model.select")).toBe("⌃L (Control+L)");
+		expect(keybindings.getAccessibleDisplayString("app.thinking.cycle")).toBe("⇧⇥ (Shift+Tab)");
+		expect(keybindings.getDisplayString("app.model.select")).toBe("⌃L");
+	});
+
+	it("keeps multiple bindings delimited and non-Darwin labels concise", () => {
+		expect(formatAccessibleKeyHints(["ctrl+l", "shift+tab"], { platform: "darwin" })).toBe(
+			"⌃L (Control+L)/⇧⇥ (Shift+Tab)",
+		);
+		expect(formatAccessibleKeyHint("ctrl+l", { platform: "linux" })).toBe("Ctrl+L");
+		expect(formatAccessibleKeyHints(["ctrl+l", "shift+tab"], { platform: "win32" })).toBe("Ctrl+L/Shift+Tab");
+	});
+});
+
+describe("platform-aware key hint formatting", () => {
+	it("formats modifier order, special keys, and literal plus on all platforms", () => {
+		expect(formatKeyHint("super+ctrl+p", { platform: "darwin" })).toBe("⌃⌘P");
+		expect(formatKeyHint("ctrl+alt+shift+super+enter", { platform: "darwin" })).toBe("⌃⌥⇧⌘↩");
+		expect(formatKeyHint("ctrl++", { platform: "darwin" })).toBe("⌃+");
+		expect(formatKeyHint("ctrl+backspace", { platform: "darwin" })).toBe("⌃⌫");
+		expect(formatKeyHint("alt+left", { platform: "darwin" })).toBe("⌥←");
+		expect(formatKeyHint("super+p", { platform: "win32" })).toBe("Super+P");
+		expect(formatKeyHint("ctrl+escape", { platform: "linux" })).toBe("Ctrl+Esc");
+		expect(formatKeyHints(["alt+up", "ctrl++"], { platform: "linux" })).toBe("Alt+Up/Ctrl++");
+	});
+
+	it("uses a fixed safe fallback for invalid input", () => {
+		expect(formatKeyHint("command+p", { platform: "darwin" })).toBe("Invalid keybinding");
+		expect(formatKeyHint("ctrl+\u001b[31m", { platform: "linux" })).toBe("Invalid keybinding");
 	});
 });
 
@@ -36,7 +93,7 @@ describe("message keybinding defaults", () => {
 		expect(keybindings.getKeys("app.message.followUp")).toEqual([]);
 		expect(keybindings.getDisplayString("app.message.followUp")).toBe("");
 		expect(keybindings.getDisplayString("app.message.queue")).toBe(
-			process.platform === "win32" || process.platform === "darwin" ? "Alt+Q" : "Alt+Enter",
+			process.platform === "darwin" ? "⌥Q" : process.platform === "win32" ? "Alt+Q" : "Alt+Enter",
 		);
 	});
 
@@ -44,7 +101,9 @@ describe("message keybinding defaults", () => {
 		const keybindings = KeybindingsManager.inMemory();
 
 		expect(keybindings.getKeys("app.message.dequeue")).toEqual(["alt+up", "alt+down"]);
-		expect(keybindings.getDisplayString("app.message.dequeue")).toBe("Alt+Up/Alt+Down");
+		expect(keybindings.getDisplayString("app.message.dequeue")).toBe(
+			process.platform === "darwin" ? "⌥↑/⌥↓" : "Alt+Up/Alt+Down",
+		);
 	});
 
 	it("uses Alt+Q for native Windows and macOS queue shortcuts", () => {

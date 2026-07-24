@@ -49,6 +49,49 @@ const USAGE = [
 	"/session_recent [create|resume]",
 ].join("\n");
 
+function tokenizeLifecycleCommand(value: string): string[] | undefined {
+	const tokens: string[] = [];
+	let token = "";
+	let quote: '"' | "'" | undefined;
+	let started = false;
+	for (let index = 0; index < value.length; index++) {
+		const character = value[index]!;
+		if (character === "\\") {
+			const next = value[index + 1];
+			if (next !== undefined && (next === "\\" || next === '"' || next === "'" || /\s/u.test(next))) {
+				token += next;
+				index++;
+			} else token += character;
+			started = true;
+			continue;
+		}
+		if (quote) {
+			if (character === quote) quote = undefined;
+			else token += character;
+			started = true;
+			continue;
+		}
+		if (character === '"' || character === "'") {
+			quote = character;
+			started = true;
+			continue;
+		}
+		if (/\s/u.test(character)) {
+			if (started) {
+				tokens.push(token);
+				token = "";
+				started = false;
+			}
+			continue;
+		}
+		token += character;
+		started = true;
+	}
+	if (quote) return undefined;
+	if (started) tokens.push(token);
+	return tokens;
+}
+
 /** True when the text begins with any /session_* token, regardless of addressability. */
 export function isLifecycleCommandLikeText(text: string | undefined): boolean {
 	if (!text) return false;
@@ -98,8 +141,10 @@ export function parseLifecycleCommand(
 	text: string | undefined,
 	ctx: { chatType?: string; botUsername?: string } = {},
 ): ParsedLifecycleCommand {
+	const tokens = tokenizeLifecycleCommand((text ?? "").trim());
+	if (!tokens) return { kind: "usage", message: USAGE };
+	const [rawCommand, ...args] = tokens;
 	const raw = (text ?? "").trim();
-	const [rawCommand, ...args] = raw.split(/\s+/);
 	const command = normalizeLifecycleCommandToken(rawCommand ?? "", ctx);
 	if (command === undefined) return { kind: "none" };
 
@@ -140,9 +185,8 @@ export function parseLifecycleCommand(
 
 	// /session_create <kind> ... [--mpreset <profile>]
 	const { positional, modelPreset } = extractModelPreset(args);
-	if (modelPreset !== undefined && !isSafeIdentifier(modelPreset)) {
+	if (modelPreset !== undefined && modelPreset.length === 0)
 		return { kind: "reject", reason: "invalid_target", message: `Invalid model preset name.\n\n${USAGE}` };
-	}
 	const kind = positional[0];
 	if (kind === "path") {
 		if (positional.length !== 2) return { kind: "usage", message: USAGE };

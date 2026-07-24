@@ -398,13 +398,22 @@ Project executor override body.
 		const decomposition = extractPromptSection(systemPrompt, "decomposition");
 
 		expect(routing).toContain("Clear, low-risk implementation requests use direct tools");
+		expect(routing).toContain("Small verification needs do not turn a clear request into a planning workflow");
+		expect(routing).toContain(
+			"Ambiguous implementation asks with a missing target, scope, acceptance criteria, or safety boundary",
+		);
 		expect(routing).toContain("Informational questions are answer-only/read-only");
 		expect(routing).toContain("Vague requirements use `/skill:deep-interview`");
+		expect(routing).toContain("requirements-only workflow that must not mutate product code");
 		expect(routing).toContain("`/skill:ralplan --deliberate`");
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
-		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(6);
+		expect(routing).toContain("read the full skill text and follow it exactly");
+		expect(routing).toContain(
+			"Before explicit execution approval, planning and interview workflows NEVER edit product source",
+		);
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(9);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 

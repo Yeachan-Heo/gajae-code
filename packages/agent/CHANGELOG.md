@@ -2,11 +2,11 @@
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-07-23
+
 ### Fixed
 
 - Managed model fallback now accepts `reasoning_summary_start`, `reasoning_summary_delta`, and `reasoning_summary_end` assistant events instead of failing them as local snapshot errors.
-## [0.11.7] - 2026-07-22
-
 ## [0.11.3] - 2026-07-19
 
 ### Fixed

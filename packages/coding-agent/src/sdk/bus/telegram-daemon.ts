@@ -3668,6 +3668,12 @@ export class TelegramNotificationDaemon {
 	private readonly botApi: BotApi;
 	private readonly effects = new TelegramEffectSupervisor();
 	private readonly topics = new TopicRegistry();
+	/**
+	 * Telegram may accept createForumTopic while returning an unusable success
+	 * payload. Remember that ambiguity per endpoint so later frames cannot repeat
+	 * the external side effect. Explicit API failures remain retryable.
+	 */
+	readonly #malformedTopicCreateEndpoints = new Map<string, string>();
 	/** Serializes registry snapshots so an older atomic write cannot overwrite newer rename state. */
 	/** Legacy sockets have no durable token, so explicit teardown is their revocation fence. */
 	private readonly droppedSessions = new WeakSet<SessionSocket>();
@@ -5844,6 +5850,9 @@ export class TelegramNotificationDaemon {
 		if (session && sessionId === session.sessionId && this.#logicalSessionId(session) !== sessionId) return undefined;
 		const capturedCreationLease = creationLease ?? (session ? this.#socketLease(session, sessionId) : undefined);
 		if (session?.logicalSessionIdTrusted && !capturedCreationLease) return undefined;
+		const creationEndpointKey = session?.endpointDigest ?? session?.endpointKey ?? "unbound";
+		if (this.#malformedTopicCreateEndpoints.get(sessionId) === creationEndpointKey)
+			throw new Error("createForumTopic: invalid message_thread_id");
 		const existing = this.topics.get(sessionId);
 		if (existing?.authorityState === "delete_pending" || existing?.bindingMalformed) return undefined;
 		if (existing) return existing.topicId;
@@ -5867,10 +5876,17 @@ export class TelegramNotificationDaemon {
 						throw new Error("topic authority was revoked during creation");
 					const res = await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name });
 					if (isThreadedModeCapabilityRefusal(res)) throw new ThreadedModeCapabilityRefusal();
-					const tid = (res as { result?: { message_thread_id?: unknown } }).result?.message_thread_id;
-					if (typeof tid !== "number" || !Number.isSafeInteger(tid) || tid <= 0)
+					const response = res as {
+						ok?: unknown;
+						result?: { message_thread_id?: unknown };
+					};
+					const tid = response.result?.message_thread_id;
+					if (typeof tid !== "number" || !Number.isSafeInteger(tid) || tid <= 0) {
+						if (response.ok === true) this.#malformedTopicCreateEndpoints.set(sessionId, creationEndpointKey);
 						throw new Error("createForumTopic: invalid message_thread_id");
+					}
 					acceptedTopicId = String(tid);
+					this.#malformedTopicCreateEndpoints.delete(sessionId);
 					if (capturedCreationLease && !(await this.#awaitCreationLeaseAuthority(capturedCreationLease))) {
 						if (
 							!this.topics.fenceAcceptedCreateForLease(

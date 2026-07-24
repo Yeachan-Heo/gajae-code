@@ -363,7 +363,7 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 				payload: expect.objectContaining({
 					commandId: response.result?.commandId,
 					turnId: response.result?.turnId,
-					error: { code: "unavailable", message: "submission failed after acceptance" },
+					error: { code: "unavailable", message: "Prompt submission failed." },
 				}),
 			}),
 		]),

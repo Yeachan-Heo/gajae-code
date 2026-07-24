@@ -5,6 +5,7 @@ import {
 	type KeybindingDefinitions,
 	type KeybindingsConfig,
 	type KeyId,
+	parseKeyId,
 	setKeybindings,
 	TUI_KEYBINDINGS,
 	KeybindingsManager as TuiKeybindingsManager,
@@ -352,10 +353,29 @@ function toKeybindingsConfig(value: unknown): KeybindingsConfig {
 			logger.info("Ignoring unknown keybinding entry", { key });
 			continue;
 		}
-		if (val === undefined) config[key] = undefined;
-		else if (typeof val === "string") config[key] = val as KeyId;
-		else if (Array.isArray(val) && val.every(v => typeof v === "string")) config[key] = val as KeyId[];
-		else logger.info("Ignoring malformed keybinding entry", { key });
+		if (val === undefined) {
+			config[key] = undefined;
+			continue;
+		}
+
+		const keys = typeof val === "string" ? [val] : Array.isArray(val) ? val : undefined;
+		if (!keys?.every(keyValue => typeof keyValue === "string")) {
+			logger.info("Ignoring malformed keybinding entry", { key });
+			continue;
+		}
+
+		const normalizedKeys: KeyId[] = [];
+		for (const keyValue of keys) {
+			const parsedKey = parseKeyId(keyValue);
+			if (!parsedKey) {
+				logger.info("Ignoring invalid keybinding entry", { key, category: "invalid-keybinding" });
+				normalizedKeys.length = 0;
+				break;
+			}
+			normalizedKeys.push(parsedKey.keyId);
+		}
+		if (normalizedKeys.length !== keys.length) continue;
+		config[key] = typeof val === "string" ? normalizedKeys[0] : normalizedKeys;
 	}
 	return config;
 }
@@ -461,10 +481,17 @@ function migrateKeybindingsConfigFile(agentDir: string): void {
  */
 export class KeybindingsManager extends TuiKeybindingsManager {
 	#configPath: string | undefined;
+	#displayContext: KeyDisplayContext = runtimeKeyDisplayContext;
 
 	constructor(userBindings: KeybindingsConfig = {}, configPath?: string) {
-		super(KEYBINDINGS, userBindings);
+		super(KEYBINDINGS, toKeybindingsConfig(userBindings));
 		this.#configPath = configPath;
+	}
+	/**
+	 * Replace user bindings only after canonical grammar validation.
+	 */
+	override setUserBindings(userBindings: KeybindingsConfig): void {
+		super.setUserBindings(toKeybindingsConfig(userBindings));
 	}
 
 	/**
@@ -485,6 +512,13 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	static inMemory(userBindings: KeybindingsConfig = {}): KeybindingsManager {
 		return new KeybindingsManager(userBindings);
 	}
+	/**
+	 * Set the default display context used by composed surfaces that do not
+	 * supply an explicit context.
+	 */
+	setDisplayContext(context: KeyDisplayContext): void {
+		this.#displayContext = context;
+	}
 
 	/**
 	 * Reload keybindings from the config file.
@@ -504,9 +538,29 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 	/**
 	 * Get display string for a keybinding (e.g., "ctrl+c/escape").
 	 */
-	getDisplayString(keybinding: Keybinding): string {
+	getDisplayString(keybinding: Keybinding, context: KeyDisplayContext = this.#displayContext): string {
 		const keys = this.getKeys(keybinding);
-		return formatKeyHints(keys.length === 0 ? [] : keys);
+		return formatKeyHints(keys, context);
+	}
+	/**
+	 * Get an accessibility-oriented display string for help surfaces.
+	 * Darwin chords include both the concise glyphs and expanded key names.
+	 */
+	getAccessibleDisplayString(keybinding: Keybinding, context: KeyDisplayContext = this.#displayContext): string {
+		const keys = this.getKeys(keybinding);
+		return formatAccessibleKeyHints(keys, context);
+	}
+	/**
+	 * Format a fixed key chord using this manager's display context.
+	 */
+	formatKeyHint(key: string): string {
+		return formatKeyHint(key, this.#displayContext);
+	}
+	/**
+	 * Format a fixed key chord for accessibility-oriented help surfaces.
+	 */
+	formatAccessibleKeyHint(key: string): string {
+		return formatAccessibleKeyHint(key, this.#displayContext);
 	}
 
 	/**
@@ -520,13 +574,20 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 /**
  * Key hint formatting utilities for UI labels.
  */
-const MODIFIER_LABELS: Record<string, string> = {
+export interface KeyDisplayContext {
+	platform: NodeJS.Platform;
+}
+
+const runtimeKeyDisplayContext: KeyDisplayContext = { platform: process.platform };
+
+const TEXTUAL_MODIFIER_LABELS: Record<string, string> = {
 	ctrl: "Ctrl",
-	shift: "Shift",
 	alt: "Alt",
+	shift: "Shift",
+	super: "Super",
 };
 
-const KEY_LABELS: Record<string, string> = {
+const TEXTUAL_KEY_LABELS: Record<string, string> = {
 	esc: "Esc",
 	escape: "Esc",
 	enter: "Enter",
@@ -535,33 +596,105 @@ const KEY_LABELS: Record<string, string> = {
 	tab: "Tab",
 	backspace: "Backspace",
 	delete: "Delete",
+	insert: "Insert",
+	clear: "Clear",
 	home: "Home",
 	end: "End",
-	pageup: "PgUp",
-	pagedown: "PgDn",
+	pageUp: "PgUp",
+	pageDown: "PgDn",
 	up: "Up",
 	down: "Down",
 	left: "Left",
 	right: "Right",
 };
 
-function formatKeyPart(part: string): string {
-	const lower = part.toLowerCase();
-	const modifier = MODIFIER_LABELS[lower];
-	if (modifier) return modifier;
-	const label = KEY_LABELS[lower];
+const DARWIN_MODIFIER_LABELS: Record<string, string> = {
+	ctrl: "⌃",
+	alt: "⌥",
+	shift: "⇧",
+	super: "⌘",
+};
+
+const DARWIN_KEY_LABELS: Record<string, string> = {
+	...TEXTUAL_KEY_LABELS,
+	esc: "⎋",
+	escape: "⎋",
+	enter: "↩",
+	return: "↩",
+	tab: "⇥",
+	backspace: "⌫",
+	delete: "⌦",
+	up: "↑",
+	down: "↓",
+	left: "←",
+	right: "→",
+};
+const DARWIN_ACCESSIBLE_MODIFIER_LABELS: Record<string, string> = {
+	ctrl: "Control",
+	alt: "Option",
+	shift: "Shift",
+	super: "Command",
+};
+
+const DARWIN_ACCESSIBLE_KEY_LABELS: Record<string, string> = {
+	...TEXTUAL_KEY_LABELS,
+	esc: "Escape",
+	escape: "Escape",
+	pageUp: "Page Up",
+	pageDown: "Page Down",
+};
+
+const DISPLAY_MODIFIER_ORDER = ["ctrl", "alt", "shift", "super"] as const;
+const INVALID_KEYBINDING_DISPLAY = "Invalid keybinding";
+
+function formatBaseKey(baseKey: string, labels: Record<string, string>): string {
+	const label = labels[baseKey];
 	if (label) return label;
-	if (part.length === 1) return part.toUpperCase();
-	return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
+	if (baseKey.length === 1) return baseKey.toUpperCase();
+	return `${baseKey.charAt(0).toUpperCase()}${baseKey.slice(1)}`;
 }
 
-export function formatKeyHint(key: KeyId): string {
-	return key.split("+").map(formatKeyPart).join("+");
+export function formatKeyHint(key: string, context: KeyDisplayContext = runtimeKeyDisplayContext): string {
+	const parsed = parseKeyId(key);
+	if (!parsed) return INVALID_KEYBINDING_DISPLAY;
+
+	const darwin = context.platform === "darwin";
+	const modifierLabels = darwin ? DARWIN_MODIFIER_LABELS : TEXTUAL_MODIFIER_LABELS;
+	const baseLabels = darwin ? DARWIN_KEY_LABELS : TEXTUAL_KEY_LABELS;
+	const modifiers = DISPLAY_MODIFIER_ORDER.filter(modifier => parsed.modifiers.includes(modifier)).map(
+		modifier => modifierLabels[modifier],
+	);
+	const parts = [...modifiers, formatBaseKey(parsed.baseKey, baseLabels)];
+	return parts.join(darwin ? "" : "+");
 }
 
-export function formatKeyHints(keys: KeyId | KeyId[]): string {
-	const list = Array.isArray(keys) ? keys : [keys];
-	return list.map(formatKeyHint).join("/");
+export function formatAccessibleKeyHint(key: string, context: KeyDisplayContext = runtimeKeyDisplayContext): string {
+	const concise = formatKeyHint(key, context);
+	if (context.platform !== "darwin" || concise === INVALID_KEYBINDING_DISPLAY) return concise;
+
+	const parsed = parseKeyId(key);
+	if (!parsed) return INVALID_KEYBINDING_DISPLAY;
+	const modifiers = DISPLAY_MODIFIER_ORDER.filter(modifier => parsed.modifiers.includes(modifier)).map(
+		modifier => DARWIN_ACCESSIBLE_MODIFIER_LABELS[modifier],
+	);
+	const expanded = [...modifiers, formatBaseKey(parsed.baseKey, DARWIN_ACCESSIBLE_KEY_LABELS)].join("+");
+	return concise === expanded ? concise : `${concise} (${expanded})`;
+}
+
+export function formatKeyHints(
+	keys: string | readonly string[],
+	context: KeyDisplayContext = runtimeKeyDisplayContext,
+): string {
+	const list: readonly string[] = typeof keys === "string" ? [keys] : keys;
+	return list.map(key => formatKeyHint(key, context)).join("/");
+}
+
+export function formatAccessibleKeyHints(
+	keys: string | readonly string[],
+	context: KeyDisplayContext = runtimeKeyDisplayContext,
+): string {
+	const list: readonly string[] = typeof keys === "string" ? [keys] : keys;
+	return list.map(key => formatAccessibleKeyHint(key, context)).join("/");
 }
 
 export type { Keybinding, KeybindingsConfig, KeyId };

@@ -17,7 +17,7 @@ function createProvider() {
 			{ name: "goal", description: "Toggle team goal mode for this session" },
 		],
 		basePath: "/tmp",
-		keybindings: { getKeys: () => [] } as unknown as KeybindingsManager,
+		keybindings: { getKeys: () => [], getDisplayString: () => "" } as unknown as KeybindingsManager,
 		copyCurrentLine: () => {},
 		copyPrompt: () => {},
 		pasteImage: () => {},

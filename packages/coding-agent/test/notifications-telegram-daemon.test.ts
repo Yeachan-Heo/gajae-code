@@ -9019,7 +9019,7 @@ test("topic creation transport failures fail closed without flat delivery", asyn
 	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
 });
 
-test("malformed topic creation success fails closed without flat delivery", async () => {
+test("malformed topic creation success is attempted once per endpoint and fails closed", async () => {
 	const agentDir = tempAgentDir();
 	const bot = new FakeBotApi();
 	bot.call = async (method, body) => {
@@ -9035,7 +9035,66 @@ test("malformed topic creation success fails closed without flat delivery", asyn
 		chatId: "42",
 		botApi: bot,
 	});
-	const session = { sessionId: "S", token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	const session = {
+		sessionId: "S",
+		endpointDigest: "endpoint-1",
+		token: "tok",
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
+
+	for (let attempt = 0; attempt < 2; attempt++) {
+		await expect(
+			daemon.handleSessionMessage(session as never, {
+				type: "identity_header",
+				sessionId: "S",
+				repo: "r",
+				branch: "b",
+			}),
+		).rejects.toThrow("invalid message_thread_id");
+	}
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(1);
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+
+	await expect(
+		daemon.handleSessionMessage({ ...session, endpointDigest: "endpoint-2" } as never, {
+			type: "identity_header",
+			sessionId: "S",
+			repo: "r",
+			branch: "b",
+		}),
+	).rejects.toThrow("invalid message_thread_id");
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(2);
+});
+
+test("explicit topic creation failure remains retryable", async () => {
+	const agentDir = tempAgentDir();
+	const bot = new FakeBotApi();
+	let createAttempts = 0;
+	bot.call = async (method, body) => {
+		bot.calls.push({ method, body });
+		if (method === "getChat") return { ok: true, result: { type: "private" } };
+		if (method === "createForumTopic") {
+			createAttempts++;
+			if (createAttempts === 1) return { ok: false, error_code: 429, description: "Too Many Requests" };
+			return { ok: true, result: { message_thread_id: 42 } };
+		}
+		return { ok: true, result: { message_id: 1 } };
+	};
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "owner",
+		botToken: "tok",
+		chatId: "42",
+		botApi: bot,
+	});
+	const session = {
+		sessionId: "S",
+		endpointDigest: "endpoint-1",
+		token: "tok",
+		ws: { readyState: 1, send() {} },
+		pending: new Map(),
+	};
 
 	await expect(
 		daemon.handleSessionMessage(session as never, {
@@ -9045,7 +9104,15 @@ test("malformed topic creation success fails closed without flat delivery", asyn
 			branch: "b",
 		}),
 	).rejects.toThrow("invalid message_thread_id");
-	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(0);
+	await daemon.handleSessionMessage(session as never, {
+		type: "identity_header",
+		sessionId: "S",
+		repo: "r",
+		branch: "b",
+	});
+
+	expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(2);
+	expect(bot.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
 });
 
 test("topic persistence failures fail closed without flat delivery", async () => {

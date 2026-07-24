@@ -1,6 +1,7 @@
 import { type Component, padding, TERMINAL, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { APP_NAME } from "@gajae-code/utils";
 import { formatBuildLabel } from "../../build-metadata";
+import { formatKeyHint, type KeyDisplayContext } from "../../config/keybindings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 
 export interface RecentSession {
@@ -21,26 +22,28 @@ export interface WelcomeComponentOptions {
 	changelogMarkdown?: string;
 	collapseChangelog?: boolean;
 	buildLabel?: string;
+	keyDisplayContext?: KeyDisplayContext;
 }
 
 const WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 9;
 const DEFAULT_WHATS_NEW_ROWS = 3;
 const MAX_WHATS_NEW_ROWS = 12;
-const NEWLINE_FLOW_KEY =
-	process.platform === "win32" ? { key: "alt+enter", label: "newline" } : { key: "ctrl+j", label: "newline" };
 
-const FLOW_KEY_ITEMS: ReadonlyArray<{ key: string; label: string }> = [
-	{ key: "/", label: "commands" },
-	{ key: "#", label: "actions" },
-	{ key: "!", label: "shell" },
-	{ key: "$", label: "python" },
-	{ key: "?", label: "keymap" },
-	{ key: "ctrl+l", label: "model" },
-	{ key: "shift+tab", label: "reasoning" },
-	{ key: "tab", label: "complete" },
-	NEWLINE_FLOW_KEY,
-	{ key: "ctrl+c", label: "clear" },
-];
+function flowKeyItems(context: KeyDisplayContext): ReadonlyArray<{ key: string; label: string }> {
+	const newlineKey = context.platform === "win32" ? "alt+enter" : "ctrl+j";
+	return [
+		{ key: "/", label: "commands" },
+		{ key: "#", label: "actions" },
+		{ key: "!", label: "shell" },
+		{ key: "$", label: "python" },
+		{ key: "?", label: "keymap" },
+		{ key: "ctrl+l", label: "model" },
+		{ key: "shift+tab", label: "reasoning" },
+		{ key: "tab", label: "complete" },
+		{ key: newlineKey, label: "newline" },
+		{ key: "ctrl+c", label: "clear" },
+	];
+}
 
 /**
  * GJC-native launch surface with compact command affordances, project
@@ -325,7 +328,8 @@ export class WelcomeComponent implements Component {
 	}
 
 	#flowKeyItemText(item: { key: string; label: string }): string {
-		return `${theme.fg("dim", item.key)}${theme.fg("muted", ` ${item.label}`)}`;
+		const context = this.options.keyDisplayContext ?? { platform: process.platform };
+		return `${theme.fg("dim", formatKeyHint(item.key, context))}${theme.fg("muted", ` ${item.label}`)}`;
 	}
 
 	#flowKeyRows(width: number): string[] {
@@ -333,7 +337,7 @@ export class WelcomeComponent implements Component {
 		const separator = ` ${theme.fg("dim", "·")} `;
 		const rows: string[] = [];
 		let current = "";
-		for (const item of FLOW_KEY_ITEMS) {
+		for (const item of flowKeyItems(this.options.keyDisplayContext ?? { platform: process.platform })) {
 			const segment = this.#flowKeyItemText(item);
 			const next = current ? `${current}${separator}${segment}` : segment;
 			if (current && visibleWidth(next) > contentWidth) {
@@ -352,7 +356,7 @@ export class WelcomeComponent implements Component {
 		const rowLimit = Math.max(1, Math.floor(maxRows));
 		if (rows.length <= rowLimit) return rows;
 		if (rowLimit === 1) {
-			const firstItem = FLOW_KEY_ITEMS[0];
+			const firstItem = flowKeyItems(this.options.keyDisplayContext ?? { platform: process.platform })[0];
 			const firstSegment = firstItem ? this.#flowKeyItemText(firstItem) : theme.fg("dim", "keys");
 			return [this.#fitToWidth(` ${firstSegment} ${theme.fg("dim", "· … ")}${theme.bold("/help")}`, width)];
 		}

@@ -299,7 +299,21 @@ async function readCachedRustdocCrate(
 ): Promise<{ crate: RustdocCrate; fetchedAt: string } | null> {
 	const cachePath = getDocsRsCachePath(target);
 	try {
-		const [jsonStr, stat] = await Promise.all([Bun.file(cachePath).text(), fs.stat(cachePath)]);
+		const stat = await fs.stat(cachePath);
+		if (stat.size > MAX_BYTES) {
+			await fs.rm(cachePath, { force: true });
+			return null;
+		}
+
+		const cacheBytes = await Bun.file(cachePath)
+			.slice(0, MAX_BYTES + 1)
+			.arrayBuffer();
+		if (cacheBytes.byteLength > MAX_BYTES) {
+			await fs.rm(cachePath, { force: true });
+			return null;
+		}
+
+		const jsonStr = Buffer.from(cacheBytes).toString("utf-8");
 		const crate = tryParseJson<RustdocCrate>(jsonStr);
 		if (!crate?.index) return null;
 		return { crate, fetchedAt: stat.mtime.toISOString() };
@@ -378,10 +392,21 @@ export const handleDocsRs: SpecialHandler = async (
 		const requestSignal = ptree.combineSignals(signal, timeout * 1000);
 		const response = await fetch(jsonUrl, {
 			signal: requestSignal,
-			headers: { "User-Agent": "gjc-web-fetch/1.0", Accept: "application/gzip" },
+			headers: {
+				"User-Agent": "gjc-web-fetch/1.0",
+				Accept: "application/gzip",
+				"Accept-Encoding": "identity",
+			},
 			redirect: "follow",
+			decompress: false,
 		});
 		if (!response.ok) return null;
+
+		const contentEncoding = response.headers.get("Content-Encoding");
+		if (contentEncoding && contentEncoding.trim().toLowerCase() !== "identity") {
+			await response.body?.cancel();
+			return null;
+		}
 
 		const reader = response.body?.getReader();
 		if (!reader) return null;
@@ -394,13 +419,13 @@ export const handleDocsRs: SpecialHandler = async (
 			chunks.push(value);
 			totalSize += value.length;
 			if (totalSize > MAX_BYTES) {
-				reader.cancel();
-				break;
+				await reader.cancel();
+				return null;
 			}
 		}
 
 		const compressed = Buffer.concat(chunks);
-		const jsonStr = gunzipSync(compressed).toString("utf-8");
+		const jsonStr = gunzipSync(compressed, { maxOutputLength: MAX_BYTES }).toString("utf-8");
 		crate_ = tryParseJson<RustdocCrate>(jsonStr);
 		if (crate_?.index) {
 			await writeCachedRustdocCrate(target, jsonStr);

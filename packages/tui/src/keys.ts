@@ -117,6 +117,7 @@ type SymbolKey =
 	| "\\"
 	| ";"
 	| "'"
+	| '"'
 	| ","
 	| "."
 	| "/"
@@ -173,10 +174,10 @@ type SpecialKey =
 	| "f11"
 	| "f12";
 
-type BaseKey = Letter | Digit | SymbolKey | SpecialKey;
-type ModifierName = "ctrl" | "shift" | "alt" | "super";
+export type BaseKey = Letter | Digit | SymbolKey | SpecialKey;
+export type KeyModifier = "ctrl" | "shift" | "alt" | "super";
 
-type ModifiedKeyId<Key extends string, RemainingModifiers extends ModifierName = ModifierName> = {
+type ModifiedKeyId<Key extends string, RemainingModifiers extends KeyModifier = KeyModifier> = {
 	[M in RemainingModifiers]: `${M}+${Key}` | `${M}+${ModifiedKeyId<Key, Exclude<RemainingModifiers, M>>}`;
 }[RemainingModifiers];
 
@@ -185,6 +186,123 @@ type ModifiedKeyId<Key extends string, RemainingModifiers extends ModifierName =
  * Provides autocomplete and catches typos at compile time.
  */
 export type KeyId = BaseKey | ModifiedKeyId<BaseKey>;
+
+export interface ParsedKeyId {
+	keyId: KeyId;
+	modifiers: KeyModifier[];
+	baseKey: BaseKey;
+}
+
+const BASE_KEYS = new Set<string>([
+	..."abcdefghijklmnopqrstuvwxyz",
+	..."0123456789",
+	"`",
+	"-",
+	"=",
+	"[",
+	"]",
+	"\\",
+	";",
+	"'",
+	'"',
+	",",
+	".",
+	"/",
+	"!",
+	"@",
+	"#",
+	"$",
+	"%",
+	"^",
+	"&",
+	"*",
+	"(",
+	")",
+	"_",
+	"+",
+	"|",
+	"~",
+	"{",
+	"}",
+	":",
+	"<",
+	">",
+	"?",
+	"escape",
+	"esc",
+	"enter",
+	"return",
+	"tab",
+	"space",
+	"backspace",
+	"delete",
+	"insert",
+	"clear",
+	"home",
+	"end",
+	"pageup",
+	"pagedown",
+	"up",
+	"down",
+	"left",
+	"right",
+	"f1",
+	"f2",
+	"f3",
+	"f4",
+	"f5",
+	"f6",
+	"f7",
+	"f8",
+	"f9",
+	"f10",
+	"f11",
+	"f12",
+]);
+
+const KEY_MODIFIERS: readonly KeyModifier[] = ["ctrl", "alt", "shift", "super"];
+
+/**
+ * Parse a case-insensitive key identifier into normalized dispatch parts.
+ * The legacy `plus` base-key alias normalizes to `+`; the trailing `+` in
+ * values such as `ctrl++` is the literal plus base.
+ */
+export function parseKeyId(value: string): ParsedKeyId | undefined {
+	if (hasControlChars(value) || value.length === 0) return undefined;
+
+	const lowerCaseValue = value
+		.trim()
+		.toLowerCase()
+		.replace(/\s*\+\s*/g, "+");
+	const normalized = lowerCaseValue === "plus" ? "+" : lowerCaseValue.replace(/\+plus$/, "++");
+	const baseKey = normalized.endsWith("+") ? "+" : normalized.split("+").pop();
+	if (!baseKey || !BASE_KEYS.has(baseKey)) return undefined;
+
+	const modifierSource = normalized.slice(0, normalized.length - baseKey.length);
+	const modifierParts =
+		modifierSource.length === 0
+			? []
+			: modifierSource
+					.slice(0, -1)
+					.split("+")
+					.map(part => part.trim());
+	if (modifierParts.some(part => !KEY_MODIFIERS.includes(part as KeyModifier))) return undefined;
+
+	const modifiers = modifierParts as KeyModifier[];
+	if (new Set(modifiers).size !== modifiers.length) return undefined;
+
+	const canonicalBase = baseKey === "pageup" ? "pageUp" : baseKey === "pagedown" ? "pageDown" : baseKey;
+	return {
+		keyId: [...modifiers, canonicalBase].join("+") as KeyId,
+		modifiers,
+		baseKey: canonicalBase as BaseKey,
+	};
+}
+
+/** Whether a value is a valid canonical key identifier. */
+export function isKeyId(value: string): value is KeyId {
+	return parseKeyId(value)?.keyId === value;
+}
 
 /**
  * Typed helper for constructing key identifiers with autocomplete.

@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 23;
+export const GUARD_CONTRACT_VERSION = 25;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -18,14 +18,31 @@ const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
-const nativeAuthorityFamilies = {
-	"crates/pi-natives/src/path_identity.rs": ["telegram", "discord", "slack"],
-	"crates/pi-natives/src/ps.rs": ["telegram", "discord", "slack"],
-	"crates/pi-shell/src/process.rs": ["telegram", "discord", "slack"],
-	"packages/natives/native/index.d.ts": ["telegram", "discord", "slack"],
-	"packages/coding-agent/src/sdk/broker/process-incarnation.ts": ["telegram", "discord", "slack"],
-} as const satisfies Record<string, readonly Family[]>;
-const nativeAuthoritySources = Object.keys(nativeAuthorityFamilies) as Array<keyof typeof nativeAuthorityFamilies>;
+const nativeAuthorityDeclarations = {
+	"crates/pi-natives/src/path_identity.rs": [
+		"retain_broker_publication",
+		"canonical_existing_directory_identity",
+		"apply_owner_only_path_security",
+		"verify_owner_only_path_security",
+		"verify_owner_only_path_security_expected",
+		"repair_owner_only_path_security_expected",
+		"apply_owner_only_fd_security",
+		"verify_owner_only_fd_security",
+		"exact_unlink",
+		"exact_restore",
+		"rename_no_replace_path",
+		"snapshot_directory_tree",
+		"exact_remove_directory_tree",
+	],
+	"crates/pi-natives/src/ps.rs": ["napi impl Process"],
+	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "current_descendant_pids", "add_new_descendants"],
+	"packages/natives/native/index.d.ts": ["Process"],
+	"packages/coding-agent/src/sdk/broker/process-incarnation.ts": ["isProcessIncarnation", "processIncarnation"],
+} as const;
+const nativeAuthorityFamilies = Object.fromEntries(
+	Object.keys(nativeAuthorityDeclarations).map(source => [source, ["telegram", "discord", "slack"]]),
+) as unknown as Record<keyof typeof nativeAuthorityDeclarations, readonly Family[]>;
+const nativeAuthoritySources = Object.keys(nativeAuthorityDeclarations) as Array<keyof typeof nativeAuthorityDeclarations>;
 
 type Family = "telegram" | "discord" | "slack";
 type Inventory = Readonly<Record<Family, Readonly<Record<string, readonly string[]>>>>;
@@ -174,7 +191,7 @@ function inventoryHash(inventory: Inventory): string {
 }
 
 export function validateInventory(inventory: Inventory = protectedInventory): void {
-	if (GUARD_CONTRACT_VERSION !== 23) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
+	if (GUARD_CONTRACT_VERSION !== 25) throw new Error("telegram-daemon-generation-guard: unsupported guard contract version");
 	for (const [family, files] of Object.entries(inventory)) {
 		for (const [file, symbols] of Object.entries(files)) {
 			if (!file || symbols.length === 0 || new Set(symbols).size !== symbols.length)
@@ -238,17 +255,18 @@ export async function currentTreeDigests(): Promise<Record<string, string>> {
 }
 
 export async function manifestForCurrentTree(): Promise<GuardManifest> {
-	validateManifest();
+	validateInventory(manifest.inventory as Inventory);
 	const nativeAuthoritySha256 = Object.fromEntries(
 		await Promise.all(
-			nativeAuthoritySources.map(async source => [
-				source,
-				crypto.createHash("sha256").update(await Bun.file(path.join(root, source)).text()).digest("hex"),
-			]),
+			nativeAuthoritySources.map(async source => {
+				const digest = nativeAuthorityDigest(source, await Bun.file(path.join(root, source)).text());
+				if (!digest) throw new Error(`telegram-daemon-generation-guard: native authority declaration is missing, ambiguous, or malformed: ${source}`);
+				return [source, digest];
+			}),
 		),
 	) as GuardManifest["nativeAuthoritySha256"];
 	return {
-		contractVersion: manifest.contractVersion,
+		contractVersion: GUARD_CONTRACT_VERSION,
 		inventory: manifest.inventory as Inventory,
 		digests: Object.fromEntries(Object.entries(await currentTreeDigests()).sort()),
 		nativeAuthoritySha256,
@@ -269,6 +287,8 @@ export async function writeManifest(target = path.join(root, manifestScript)): P
 
 export async function validateCurrentTreeManifest(): Promise<void> {
 	const actual = await manifestForCurrentTree();
+	if (manifest.contractVersion !== actual.contractVersion)
+		throw new Error("telegram-daemon-generation-guard: semantic manifest contract version does not match the current guard");
 	const expected = JSON.stringify(Object.entries(manifest.digests).sort());
 	if (JSON.stringify(Object.entries(actual.digests).sort()) !== expected)
 		throw new Error("telegram-daemon-generation-guard: semantic manifest declaration digests do not byte-match the current tree");
@@ -558,8 +578,138 @@ export type Evaluation = {
 	guardContractBumped: boolean;
 };
 
-function authorityDigest(source: string | undefined): string | undefined {
-	return source === undefined ? undefined : crypto.createHash("sha256").update(source).digest("hex");
+function nativeAuthorityDigest(source: keyof typeof nativeAuthorityDeclarations, content: string | undefined): string | undefined {
+	const declarations = extractNativeDeclarations(source, content);
+	if ([...declarations.values()].some(declaration => !declaration?.valid)) return undefined;
+	return crypto.createHash("sha256").update([...declarations.values()].map(declaration => declaration!.canonical).join("\n")).digest("hex");
+}
+
+function rustLexicalSource(source: string): { code: string; valid: boolean } {
+	const code = source.split("");
+	const blank = (start: number, end: number) => {
+		for (let index = start; index < end; index++) if (code[index] !== "\n") code[index] = " ";
+	};
+	const isIdentifier = (value: string | undefined) => value !== undefined && /[A-Za-z0-9_]/.test(value);
+	for (let index = 0; index < source.length;) {
+		if (source.startsWith("//", index)) {
+			const end = source.indexOf("\n", index);
+			blank(index, end === -1 ? source.length : end);
+			index = end === -1 ? source.length : end;
+			continue;
+		}
+		if (source.startsWith("/*", index)) {
+			const start = index;
+			let depth = 1;
+			index += 2;
+			while (index < source.length && depth > 0) {
+				if (source.startsWith("/*", index)) {
+					depth++;
+					index += 2;
+				} else if (source.startsWith("*/", index)) {
+					depth--;
+					index += 2;
+				} else index++;
+			}
+			if (depth !== 0) return { code: code.join(""), valid: false };
+			blank(start, index);
+			continue;
+		}
+		const raw = /^(?:br|r)(#+)?"/.exec(source.slice(index));
+		if (raw && !isIdentifier(source[index - 1])) {
+			const start = index;
+			const hashes = raw[1] ?? "";
+			const close = `"${hashes}`;
+			index += raw[0].length;
+			const end = source.indexOf(close, index);
+			if (end === -1) return { code: code.join(""), valid: false };
+			index = end + close.length;
+			blank(start, index);
+			continue;
+		}
+		const quote = source[index] === '"' ? index : source.startsWith('b"', index) && !isIdentifier(source[index - 1]) ? index + 1 : -1;
+		if (quote !== -1) {
+			const start = index;
+			index = quote + 1;
+			let closed = false;
+			while (index < source.length) {
+				if (source[index] === "\\") index += 2;
+				else if (source[index] === '"') {
+					index++;
+					closed = true;
+					break;
+				} else if (source[index++] === "\n") return { code: code.join(""), valid: false };
+			}
+			if (!closed || index > source.length) return { code: code.join(""), valid: false };
+			blank(start, index);
+			continue;
+		}
+		const charStart = source[index] === "'" ? index : source.startsWith("b'", index) && !isIdentifier(source[index - 1]) ? index + 1 : -1;
+		if (charStart !== -1) {
+			const start = index;
+			index = charStart + 1;
+			let closed = false;
+			while (index < source.length && source[index] !== "\n") {
+				if (source[index] === "\\") index += 2;
+				else if (source[index] === "'") {
+					index++;
+					closed = true;
+					break;
+				} else index++;
+			}
+			if (closed) {
+				blank(start, index);
+				continue;
+			}
+			const lifetime = /^[A-Za-z_][A-Za-z0-9_]*/.exec(source.slice(charStart + 1));
+			const lifetimeEnd = lifetime ? charStart + 1 + lifetime[0].length : -1;
+			if (!lifetime || !/[\s,:>+)]/.test(source[lifetimeEnd] ?? "")) return { code: code.join(""), valid: false };
+			index = start + 1;
+			continue;
+		}
+		index++;
+	}
+	return { code: code.join(""), valid: true };
+}
+
+function rustDeclaration(source: string, selector: string): Declaration {
+	const lexical = rustLexicalSource(source);
+	if (!lexical.valid) return malformedDeclaration();
+	const declarationName = selector;
+	const prefix = declarationName === "napi impl Process"
+		? "#\\[napi\\](?:\\s*#\\[[^\\]]+\\])*\\s*impl\\s+Process\\b"
+		: declarationName === "impl Process"
+			? "impl\\s+Process\\b"
+			: `(?:#\\[[^\\]]+\\]\\s*)*pub(?:\\(super\\))?\\s+(?:async\\s+)?fn\\s+${declarationName}\\b`;
+	const pattern = new RegExp(prefix, "g");
+	const matches = [...lexical.code.matchAll(pattern)];
+	if (matches.length === 0) return undefined;
+	const declarations: string[] = [];
+	for (const match of matches) {
+		const start = match.index!;
+		const headerEnd = start + match[0].length;
+		const open = lexical.code.indexOf("{", headerEnd);
+		if (open === -1 || /;|\b(?:pub\s+)?(?:async\s+)?fn\b|\bimpl\b/.test(lexical.code.slice(headerEnd, open))) return malformedDeclaration();
+		let depth = 0;
+		let end = -1;
+		for (let index = open; index < lexical.code.length; index++) {
+			if (lexical.code[index] === "{") depth++;
+			else if (lexical.code[index] === "}" && --depth === 0) {
+				end = index + 1;
+				break;
+			}
+		}
+		if (end === -1) return malformedDeclaration();
+		declarations.push(source.slice(start, end));
+	}
+	const text = declarations.join("\n");
+	return { text, canonical: text.replace(/\/\*[\s\S]*?\*\/|\/\/.*|\s+/g, ""), valid: true };
+}
+
+function extractNativeDeclarations(source: keyof typeof nativeAuthorityDeclarations, content: string | undefined): Map<string, Declaration> {
+	const selectors = nativeAuthorityDeclarations[source];
+	if (content === undefined) return new Map(selectors.map(selector => [selector, undefined]));
+	if (source.endsWith(".rs")) return new Map(selectors.map(selector => [selector, rustDeclaration(content, selector)]));
+	return extractDeclarations(content, selectors);
 }
 
 function inventoryFromManifestSource(source: string | undefined): Inventory | undefined {
@@ -611,8 +761,12 @@ export function evaluate(
 		}
 	}
 	for (const source of nativeAuthoritySources) {
-		if (authorityDigest(base.get(source)) === authorityDigest(head.get(source))) continue;
-		for (const family of nativeAuthorityFamilies[source]) protectedChanges.push(`${family}:${source}:authority`);
+		if (!base.has(source) && !head.has(source)) continue;
+		const before = nativeAuthorityDigest(source, base.get(source));
+		const after = nativeAuthorityDigest(source, head.get(source));
+		const label = `${source}:authority`;
+		if (!before || !after) malformedDeclarations.push(label);
+		if (before !== after) for (const family of nativeAuthorityFamilies[source]) protectedChanges.push(`${family}:${label}`);
 	}
 	const nativeAuthorityChanges = protectedChanges.filter(change => change.endsWith(":authority"));
 	const guardPolicyChanged =

@@ -1,11 +1,17 @@
 import { describe, expect, it } from "bun:test";
 import type {
+	ModelProfileCatalogItem,
+	ModelProfileErrorDetails,
 	Q10CurrentThinkingLevel,
 	Q10Model,
 	Q10SettableThinkingLevel,
 	Q10ThinkingCapabilities,
 	Q10ThinkingEffort,
 	Q10ThinkingMode,
+	TurnPromptAcceptedResult,
+	TurnPromptInput,
+	TurnPromptReconciliation,
+	TurnPromptStatusSelector,
 } from "@gajae-code/coding-agent/sdk";
 import * as publicSdk from "@gajae-code/coding-agent/sdk";
 import * as bus from "@gajae-code/coding-agent/sdk/bus";
@@ -14,7 +20,7 @@ import * as root from "../src/index";
 import * as sdk from "../src/sdk";
 import * as session from "../src/sdk/session";
 
-const q10DtoTypes:
+const sdkCapabilityDtoTypes:
 	| [
 			Q10Model,
 			Q10ThinkingCapabilities,
@@ -22,10 +28,16 @@ const q10DtoTypes:
 			Q10SettableThinkingLevel,
 			Q10CurrentThinkingLevel,
 			Q10ThinkingMode,
+			ModelProfileCatalogItem,
+			ModelProfileErrorDetails,
+			TurnPromptAcceptedResult,
+			TurnPromptReconciliation,
+			TurnPromptStatusSelector,
+			TurnPromptInput,
 	  ]
 	| undefined = undefined;
 
-void q10DtoTypes;
+void sdkCapabilityDtoTypes;
 
 describe("SDK package exports", () => {
 	it("preserves the session SDK surface and bus namespace after the namespace move", () => {
@@ -37,6 +49,9 @@ describe("SDK package exports", () => {
 	it("loads the public SDK and bus package subpaths", () => {
 		expect(publicSdk.createAgentSession).toBeFunction();
 		expect(bus.createNotificationsExtension).toBeFunction();
+		expect(publicSdk.UnknownModelProfileError).toBeFunction();
+		expect(publicSdk.ModelProfileRegistryError).toBeFunction();
+		expect(publicSdk.MODEL_PROFILE_DISCOVERY_QUERY).toBe("models.profiles.list");
 	});
 
 	it.each([

@@ -3,6 +3,7 @@ import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
+import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import {
 	type DirectoryMigrationPolicy,
 	listManagedSessionCandidates,
@@ -142,6 +143,7 @@ export type BrokerResponse =
 			error: {
 				code: BrokerErrorCode;
 				message: string;
+				details?: ModelProfileErrorDetails;
 				endpoint?: "unavailable";
 				cleanup?: BrokerCleanupEvidence;
 			};

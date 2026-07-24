@@ -82,6 +82,47 @@ const helperInventory = {
 	slack: { [chatControl]: ["CHAT_DAEMON_GENERATIONS.slack", ...chatTakeoverHelpers] },
 } as const;
 
+const nativeAuthoritySources = {
+	"crates/pi-natives/src/path_identity.rs": [
+		"retain_broker_publication",
+		"canonical_existing_directory_identity",
+		"apply_owner_only_path_security",
+		"verify_owner_only_path_security",
+		"verify_owner_only_path_security_expected",
+		"repair_owner_only_path_security_expected",
+		"apply_owner_only_fd_security",
+		"verify_owner_only_fd_security",
+		"exact_unlink",
+		"exact_restore",
+		"rename_no_replace_path",
+		"snapshot_directory_tree",
+		"exact_remove_directory_tree",
+	],
+	"crates/pi-natives/src/ps.rs": ["napi impl Process"],
+	"crates/pi-shell/src/process.rs": ["impl Process", "kill_process_group", "current_descendant_pids", "add_new_descendants"],
+	"packages/natives/native/index.d.ts": ["Process"],
+	"packages/coding-agent/src/sdk/broker/process-incarnation.ts": ["isProcessIncarnation", "processIncarnation"],
+} as const;
+
+function nativeAuthorityFiles(): Array<[string, string]> {
+	return [
+		[
+			"crates/pi-natives/src/path_identity.rs",
+			[
+				...nativeAuthoritySources["crates/pi-natives/src/path_identity.rs"].map(name => `pub fn ${name}() {}`),
+				`mod platform {\n${nativeAuthoritySources["crates/pi-natives/src/path_identity.rs"].map(name => `\tpub(super) fn ${name}() {}`).join("\n")}\n}`,
+			].join("\n"),
+		],
+		["crates/pi-natives/src/ps.rs", "#[napi]\nimpl Process {}"],
+		[
+			"crates/pi-shell/src/process.rs",
+			"impl Process { pub fn incarnation(&self) {} }\npub fn kill_process_group() {}\npub fn current_descendant_pids() {}\npub fn add_new_descendants() {}",
+		],
+		["packages/natives/native/index.d.ts", "export declare class Process {}"],
+		["packages/coding-agent/src/sdk/broker/process-incarnation.ts", "export function isProcessIncarnation() {}\nexport function processIncarnation() {}"],
+	];
+}
+
 function helperFiles(input: { telegramGeneration: number; discordGeneration: number; slackGeneration: number }): Map<string, string> {
 	return new Map([
 		[telegramContract, `export const DAEMON_GENERATION = ${input.telegramGeneration};`],
@@ -93,6 +134,7 @@ function helperFiles(input: { telegramGeneration: number; discordGeneration: num
 				...chatTakeoverHelpers.map(name => `export function ${name}() { return "${name}"; }`),
 			].join("\n"),
 		],
+		...nativeAuthorityFiles(),
 	]);
 }
 
@@ -163,6 +205,7 @@ function files(input: {
 				`class ChatDaemonController { classify() { return "compatible"; } async operate() { ${input.chatLifecycle ?? ""} } }`,
 			].join("\n"),
 		],
+		...nativeAuthorityFiles(),
 	]);
 }
 
@@ -438,52 +481,102 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 		}
 	});
 
-	test("requires mapped family generation bumps for native lifecycle authority changes", () => {
-		const sources = [
-			["crates/pi-natives/src/path_identity.rs", ["telegram", "discord", "slack"]],
-			["crates/pi-natives/src/ps.rs", ["telegram", "discord", "slack"]],
-			["crates/pi-shell/src/process.rs", ["telegram", "discord", "slack"]],
-			["packages/natives/native/index.d.ts", ["telegram", "discord", "slack"]],
-			["packages/coding-agent/src/sdk/broker/process-incarnation.ts", ["telegram", "discord", "slack"]],
-		] as const;
-		for (const [source, families] of sources) {
-			const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
-			const head = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
-			base.set(source, "authority: base");
-			head.set(source, "authority: head");
-			const missingBumps = decide(base, head);
-			expect(missingBumps.nativeAuthorityChanges).toEqual(families.map(family => `${family}:${source}:authority`));
-			expect(missingBumps.telegramGenerationBumped).toBe(false);
-			for (const family of ["discord", "slack"] as const) expect(missingBumps.chatGenerationBumped[family]).toBe(false);
+test("ignores unrelated text in a shared native authority source", () => {
+	const source = "packages/coding-agent/src/sdk/broker/process-incarnation.ts";
+	const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+	const head = new Map(base);
+	head.set(source, `${head.get(source)}\n// unrelated diagnostic text`);
+	const result = decide(base, head);
+	expect(result.nativeAuthorityChanges).toEqual([]);
+	expect(result.telegramGenerationBumped).toBe(false);
+	expect(result.chatGenerationBumped).toEqual({ discord: false, slack: false });
+});
 
-			const bumped = files({
-				telegramGeneration: families.includes("telegram") ? 7 : 6,
-				discordGeneration: families.includes("discord") ? 5 : 4,
-				slackGeneration: families.includes("slack") ? 5 : 4,
-			});
-			bumped.set(source, "authority: head");
-			const verified = decide(base, bumped);
-			if (families.includes("telegram")) expect(verified.telegramGenerationBumped).toBe(true);
-			for (const family of ["discord", "slack"] as const) {
-				if (families.includes(family)) expect(verified.chatGenerationBumped[family]).toBe(true);
-			}
-		}
+test("requires every mapped generation bump for a protected native authority declaration", () => {
+	const source = "packages/coding-agent/src/sdk/broker/process-incarnation.ts";
+	const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+	const head = new Map(base);
+	head.set(source, (head.get(source) ?? "").replace("function processIncarnation() {}", "function processIncarnation() { return undefined; }"));
+	const result = decide(base, head);
+	expect(result.nativeAuthorityChanges).toEqual(["telegram:" + source + ":authority", "discord:" + source + ":authority", "slack:" + source + ":authority"]);
+	expect(result.telegramGenerationBumped).toBe(false);
+	expect(result.chatGenerationBumped).toEqual({ discord: false, slack: false });
+});
+
+test("accepts a protected native authority declaration change after every required generation bump", () => {
+	const source = "packages/coding-agent/src/sdk/broker/process-incarnation.ts";
+	const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+	const head = files({ telegramGeneration: 7, discordGeneration: 5, slackGeneration: 5 });
+	head.set(source, (head.get(source) ?? "").replace("function processIncarnation() {}", "function processIncarnation() { return undefined; }"));
+	const result = decide(base, head);
+	expect(result.nativeAuthorityChanges).toEqual(["telegram:" + source + ":authority", "discord:" + source + ":authority", "slack:" + source + ":authority"]);
+	expect(result.telegramGenerationBumped).toBe(true);
+	expect(result.chatGenerationBumped).toEqual({ discord: true, slack: true });
+});
+test("fails closed when a protected native authority declaration is missing or malformed", () => {
+	const source = "packages/coding-agent/src/sdk/broker/process-incarnation.ts";
+	const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+	const missing = new Map(base);
+	missing.set(source, "export function isProcessIncarnation() {}");
+	expect(decide(base, missing).malformedDeclarations).toContain(source + ":authority");
+	const malformed = new Map(base);
+	malformed.set(source, "export function isProcessIncarnation() {}\nexport function processIncarnation( {");
+	expect(decide(base, malformed).malformedDeclarations).toContain(source + ":authority");
+});
+	test("hashes restricted native path implementations behind public wrappers", () => {
+		const source = "crates/pi-natives/src/path_identity.rs";
+		const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+		const head = new Map(base);
+		head.set(
+			source,
+			(head.get(source) ?? "").replace(
+				"pub(super) fn apply_owner_only_path_security() {}",
+				"pub(super) fn apply_owner_only_path_security() { let changed = true; }",
+			),
+		);
+		expect(decide(base, head).nativeAuthorityChanges).toEqual([
+			"telegram:" + source + ":authority",
+			"discord:" + source + ":authority",
+			"slack:" + source + ":authority",
+		]);
 	});
 
-	test("does not require generation bumps when native lifecycle authorities are unchanged", () => {
+	test("hashes core Process methods used by daemon control", () => {
+		const source = "crates/pi-shell/src/process.rs";
 		const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
-		const head = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
-		for (const source of [
-			"crates/pi-natives/src/path_identity.rs",
-			"crates/pi-natives/src/ps.rs",
-			"crates/pi-shell/src/process.rs",
-			"packages/natives/native/index.d.ts",
-			"packages/coding-agent/src/sdk/broker/process-incarnation.ts",
-		]) {
-			base.set(source, "same authority");
-			head.set(source, "same authority");
-		}
-		expect(decide(base, head).nativeAuthorityChanges).toEqual([]);
+		const head = new Map(base);
+		head.set(source, (head.get(source) ?? "").replace("pub fn incarnation(&self) {}", "pub fn incarnation(&self) { let changed = true; }"));
+		expect(decide(base, head).nativeAuthorityChanges).toEqual([
+			"telegram:" + source + ":authority",
+			"discord:" + source + ":authority",
+			"slack:" + source + ":authority",
+		]);
+	});
+
+	test("hashes every Rust platform implementation and lexes declaration braces", () => {
+		const source = "crates/pi-shell/src/process.rs";
+		const platformSource = [
+			"impl Process {}",
+			"#[cfg(unix)] pub fn kill_process_group() { let normal = \"}\"; let raw = r###\"{ not a body }\"###; let byte = br#\"} not a body {\"#; let character = '{'; /* { nested /* } */ still comment } */ // }\n return 1; }",
+			"#[cfg(windows)] pub fn kill_process_group() { return 2; }",
+			"pub fn current_descendant_pids() { return 3; }",
+			"pub fn add_new_descendants() { return 4; }",
+		].join("\n");
+		const base = files({ telegramGeneration: 6, discordGeneration: 4, slackGeneration: 4 });
+		base.set(source, platformSource);
+		const commentOnly = new Map(base);
+		commentOnly.set(source, platformSource.replace("// }", "// { }"));
+		expect(decide(base, commentOnly).nativeAuthorityChanges).toEqual([]);
+		const changed = new Map(base);
+		changed.set(source, platformSource.replace("return 1;", "return 9;"));
+		expect(decide(base, changed).nativeAuthorityChanges).toEqual([
+			"telegram:" + source + ":authority",
+			"discord:" + source + ":authority",
+			"slack:" + source + ":authority",
+		]);
+		const malformed = new Map(base);
+		malformed.set(source, platformSource.replace('r###"{ not a body }"###', 'r###"{ unterminated'));
+		expect(decide(base, malformed).malformedDeclarations).toContain(source + ":authority");
 	});
 
 	test("semantic manifest rejects duplicate, moved, and narrowed inventories", () => {

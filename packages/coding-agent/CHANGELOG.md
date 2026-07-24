@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
+
+## [0.11.8] - 2026-07-23
+### Added
+
+- Keybinding configuration now keeps portable canonical text while runtime shortcut labels render platform-native, including concise MacBook glyphs in inline surfaces and glyph-plus-text accessibility labels in `/hotkeys` and `/help`; `/hotkeys` remains authoritative for effective remapped bindings.
+
 ### Added
 
 - Plans and delegated tasks carry an authoritative repository binding (`gjc.repository_binding.v1`). Ultragoal/ralplan stamp identity at creation; task lanes stamp omitted bindings from session cwd **before** agent discovery; ralplan stage writes and handoff re-entry enforce the seed binding; declared paths must stay under the bound root; task receipts include the resolved identity; linked isolation worktrees must match the source repository (#2901).
@@ -11,6 +20,7 @@
 - Parallel workers can no longer clobber existing regular files through whole-file `write` or `apply_patch` create operations. New-file creation uses atomic create-only semantics, and team tasks can declare exact `write_paths` so overlapping active claims are rejected and built-in mutations stay inside the claimed scope.
 - Runtime MCP OAuth credentials are now bound to their authorized server origin and token endpoint, reject redirecting refresh responses, and fail closed when legacy or changed configuration lacks an exact match.
 - `/share` now keeps full-session HTML in owner-private unpredictable staging until the share handler or `gh gist create` process has fully stopped; cancelling a blocked gist upload terminates and awaits that process before reporting cancellation and removing the export.
+- MCP diagnostics now redact opaque endpoint paths, user information, query values, and fragments without changing outbound requests, and parse-failure logs omit response bodies that could echo request secrets.
 - Telegram notification daemon self-heals degraded on-disk state: permanently missing scan roots are pruned (so one deleted worktree no longer disables orphan-topic cleanup), and retained exact-unlink transition/placeholder artifacts are reaped on ownership acquire and each scan. `gjc daemon reload` can recover without manual filesystem surgery (#2956).
 - On macOS, resuming a managed session no longer fails with `identity_mismatch` when the first write-append open changes only file `ctime` (e.g. APFS write-provenance / `com.apple.provenance`). `appendSync` allows a single bounded re-capture + retry when `dev`/`ino`/`size`/`mtime`/SHA-256 remain unchanged, and still rejects real content races and repeated ctime transitions (#2944).
 - Interactive `/resume` / `AgentSession.switchSession()` now awaits verified managed `local://` legacy-root migration for the newly selected session before post-commit lifecycle proceeds, matching cold-start `createAgentSession()` readiness from #2797 so synchronous `local://` resolution no longer fails with "legacy migration must complete before path resolution" after a mid-session switch (#2925).
@@ -19,6 +29,13 @@
 - Lean notification verbosity no longer floods remote clients with intermediate tool-turn `turn_stream` frames. Under `/lean`, the latest assistant answer is deferred until `agent_end` (idle); ask lead-ins still flush immediately before inline buttons, and `/verbose` keeps per-turn streaming (including opt-in live frames) (#2863).
 - Ultragoal `complete-goals` no longer reports contradictory next actions when every incomplete story is `blocked` or `review_blocked`. Text and JSON now agree on `next-action=resolve-blockers` with blocked goal IDs/status; failed-only schedules surface `retry-failed`; `execute-goal` always includes a `goal_id` (#2903).
 - Bound each Python tool bridge bearer capability to one active session registration, reject non-canonical or empty bearer credentials before lookup, and rotate authority whenever a retained session replaces its kernel.
+- Deep Interview now scopes provider-facing `ask` metadata to the persisted workflow stage, including after durable session resume: Round 0 advertises only the locked `intent_contract` branch, later rounds advertise ordinary and `intent_review` branches, foreign workflow gates cannot seed recorder state, and wire-valid empty positive-round reviews reach canonical Zod diagnostics while malformed authority remains fail-closed.
+- Bounded docs.rs rustdoc downloads, legacy cache reads, and gzip expansion before parsing or caching; transport-level content encoding is disabled and rejected so Bun cannot decompress outside the explicit output guard.
+
+### Added
+
+- Added SDK v3 prompt reconciliation through `turn.prompt_status` with caller-supplied `clientRef` correlation, bounded live-session lifecycle retention, reconnect-safe lookup, and explicit ordered non-replay semantics for `turn.prompt` (#2930).
+- Added `models.profiles.list` discovery of the effective built-in plus `models.yml` profile catalog, exact-ID pre-spawn validation that reloads host configuration for each lifecycle request, and structured `unknown_model_profile` / `model_profile_registry_error` details across lifecycle startup failures (#2931).
 
 ## [0.11.7] - 2026-07-22
 ### Added
@@ -26,6 +43,7 @@
 - `/btw` now opens an ephemeral multi-turn side chat: plain text continues the side thread until Esc returns to the main chat, while visible text-only context stays outside the main transcript and session observability/debug hooks and is scrubbed synchronously on close or abort.
 - Added `statusLine.showActionHints` (default: `true`) to hide contextual action hints while retaining configured status-line segments.
 - `skill_discovery` empty results now carry a `notice` when discovery config caused the emptiness — naming the exact disabled setting (`skills.enabled`, `skills.enablePiProject`, or `skills.enablePiUser`) and the `gjc config set` command to enable it. Previously a disabled config was indistinguishable from "no skills exist", silently hiding freshly written user/project skills.
+- `generate_image` now supports Alibaba Bailian (Token Plan) `wan2.7-image` as an image provider: set `providers.image` to `alibaba` (or let auto-detect find `ALIBABA_TOKEN_PLAN_API_KEY` / a registered `alibaba-token-plan` key), override the model with `providers.imageModel` (e.g. `wan2.7-image-pro`). Short-lived OSS result URLs are downloaded immediately, and image editing works via input images.
 
 ### Fixed
 - Telegram `/session_recent` now retries one concurrently appended managed transcript and omits only candidates that remain unstable, preserving independently verified recent-session rows.
@@ -39,6 +57,9 @@
 - SDK event replay authorization now refreshes the negotiated capability cache synchronously from the native-sanitized replay snapshot before host filtering, preserving initial and repeated-hello capability updates without trusting client frame claims.
 
 - Plugin-bundle HTTP and SSE MCP requests now bind every connection to a validated public address and revalidate bounded redirects before following them.
+- Deep Interview now exposes stage-specific provider-facing `ask` metadata: Round 0 advertises only the locked `intent_contract` branch, while later rounds advertise ordinary and `intent_review` branches, preventing strict-schema constraint stripping from making an invalid empty Round 0 review selectable.
+- Deep Interview now exposes stage-specific provider-facing `ask` metadata, including after durable session resume: Round 0 advertises only the locked `intent_contract` branch, while later rounds advertise ordinary and `intent_review` branches. Remaining strict-schema constraints that providers cannot express fail closed with bounded corrective guidance instead of an opaque retry loop.
+- Deep Interview now exposes stage-specific provider-facing `ask` metadata, including after durable session resume: Round 0 advertises only the locked `intent_contract` branch, while later rounds advertise ordinary and `intent_review` branches. Foreign workflow gates can no longer seed Deep Interview recorder state, and remaining strict-schema constraints that providers cannot express fail closed with bounded corrective guidance instead of an opaque retry loop.
 - Documented that custom OpenAI-compatible models omit vision by default: when `input` is unset, GJC treats the model as text-only and strips images with `[image omitted: model does not support vision]`. Vision backends must set `input: [text, image]` in `models.yml`.
 - Restored `/models` preset landing navigation after the Image Generation row and made compaction/pruning regression fixtures use an explicit 200K context boundary instead of a mutable provider descriptor default.
 - Fixed Windows legacy session artifact migration by using native directory identity size, a traversable detached-path alias, and writable file handles for final durability sync.

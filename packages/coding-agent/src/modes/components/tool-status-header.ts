@@ -3,8 +3,12 @@ import * as fs from "node:fs";
 import { type Component, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { formatCount, getProjectDir } from "@gajae-code/utils";
 import { $ } from "bun";
-import type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
-import { KEYBINDINGS } from "../../config/keybindings";
+import {
+	type AppKeybinding,
+	KEYBINDINGS,
+	type KeybindingsManager,
+	type KeyDisplayContext,
+} from "../../config/keybindings";
 import { settings } from "../../config/settings";
 import type { StatusLinePreset, StatusLineSegmentId, StatusLineSeparatorStyle } from "../../config/settings-schema";
 import { theme } from "../../modes/theme/theme";
@@ -56,6 +60,7 @@ export interface StatusLineComponentOptions {
 	actionRegistry?: ActionRegistry<void>;
 	getKeybindings?: () => KeybindingsManager;
 	focusDomain?: FocusDomain;
+	keyDisplayContext?: KeyDisplayContext;
 }
 
 export interface StatusLineActionHint {
@@ -93,6 +98,7 @@ export function getAvailableActionHints(
 	getKeybindings: (() => KeybindingsManager) | undefined,
 	width: number,
 	domain: FocusDomain = "composer",
+	keyDisplayContext?: KeyDisplayContext,
 ): StatusLineActionHint[] {
 	if (!actionRegistry || !getKeybindings || width <= 0) return [];
 	const keybindings = getKeybindings();
@@ -109,7 +115,9 @@ export function getAvailableActionHints(
 		if (!(bindingId in KEYBINDINGS)) continue;
 		const keys = keybindings.getKeys(bindingId);
 		if (keys.length === 0) continue;
-		const content = theme.fg("dim", keybindings.getDisplayString(bindingId)) + theme.fg("muted", ` ${action.title}`);
+		const content =
+			theme.fg("dim", keybindings.getDisplayString(bindingId, keyDisplayContext)) +
+			theme.fg("muted", ` ${action.title}`);
 		const nextWidth = visibleWidth(content) + (selected.length === 0 ? 0 : 3);
 		if (used + nextWidth > width) break;
 		selected.push({ id: action.id, content });
@@ -161,6 +169,7 @@ export class StatusLineComponent implements Component {
 	#actionRegistry: ActionRegistry<void> | undefined;
 	#getKeybindings: (() => KeybindingsManager) | undefined;
 	#focusDomain: FocusDomain;
+	#keyDisplayContext: KeyDisplayContext | undefined;
 
 	#resolvedSettingsCache:
 		| (Required<Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">> &
@@ -209,6 +218,7 @@ export class StatusLineComponent implements Component {
 		this.#actionRegistry = options.actionRegistry;
 		this.#getKeybindings = options.getKeybindings;
 		this.#focusDomain = options.focusDomain ?? "composer";
+		this.#keyDisplayContext = options.keyDisplayContext;
 	}
 
 	updateSettings(settings: StatusLineSettings): void {
@@ -796,7 +806,13 @@ export class StatusLineComponent implements Component {
 		const actionHints =
 			effectiveSettings.showActionHints === false
 				? []
-				: getAvailableActionHints(this.#actionRegistry, this.#getKeybindings, width, this.#focusDomain);
+				: getAvailableActionHints(
+						this.#actionRegistry,
+						this.#getKeybindings,
+						width,
+						this.#focusDomain,
+						this.#keyDisplayContext,
+					);
 		for (const segId of effectiveSettings.rightSegments) {
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {

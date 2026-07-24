@@ -160,20 +160,23 @@ const DeepInterviewMetadata = z.object({
 		.optional(),
 });
 
-const DeepInterviewMeta = z.union([
-	DeepInterviewMetadata.strict(),
-	DeepInterviewMetadata.extend({
-		round: z.literal(0),
-		component: z.literal("review-topology"),
-		dimension: z.literal("topology"),
-		intent_contract: DeepInterviewIntentContract,
-	}).strict(),
-	DeepInterviewMetadata.extend({
-		round: z.number().int().positive(),
-		intent_review: DeepInterviewIntentReview,
-	}).strict(),
-]);
+const DeepInterviewTopologyMeta = DeepInterviewMetadata.extend({
+	round: z.literal(0).describe("Round 0 topology confirmation"),
+	component: z.literal("review-topology"),
+	dimension: z.literal("topology"),
+	intent_contract: DeepInterviewIntentContract.describe("required Round 0 locked-intent contract"),
+}).strict();
 
+const DeepInterviewRoundMeta = DeepInterviewMetadata.extend({
+	round: z.number().int().positive().describe("positive interview round number"),
+}).strict();
+
+const DeepInterviewReviewMeta = DeepInterviewMetadata.extend({
+	round: z.number().int().positive().describe("positive post-Round-0 review number"),
+	intent_review: DeepInterviewIntentReview.describe("post-Round-0 locked-intent reduction review"),
+}).strict();
+
+const DeepInterviewMeta = z.union([DeepInterviewTopologyMeta, DeepInterviewRoundMeta, DeepInterviewReviewMeta]);
 type DeepInterviewMeta = z.infer<typeof DeepInterviewMeta>;
 
 function intentContract(
@@ -191,79 +194,116 @@ const WorkflowGateMeta = z.object({
 	kind: z.enum(["question", "approval", "execution"]).describe("workflow gate kind"),
 });
 
-const QuestionItem = z
-	.object({
-		id: z.string().describe("question id"),
-		question: z.string().describe("question text"),
-		options: z.array(OptionItem).describe("available options"),
-		multi: z.boolean().describe("allow multiple selections").optional(),
-		recommended: z.number().describe("recommended option index").optional(),
-		deepInterview: DeepInterviewMeta.describe("optional deep-interview round metadata").optional(),
-		workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
-	})
-	.superRefine((value, context) => {
-		const labels = new Set(value.options.map(option => option.label));
-		const contract = intentContract(value.deepInterview);
-		const review = intentReview(value.deepInterview);
-		if (contract && review)
-			context.addIssue({
-				code: "custom",
-				message: "intent contract and review are mutually exclusive",
-				path: ["deepInterview"],
-			});
-		if (
-			contract &&
-			(value.deepInterview?.round !== 0 ||
-				value.deepInterview.component !== "review-topology" ||
-				value.deepInterview.dimension !== "topology")
-		)
-			context.addIssue({
-				code: "custom",
-				message: "intent contract requires round-0 review topology metadata",
-				path: ["deepInterview"],
-			});
-		if (review && (value.deepInterview?.round ?? 0) <= 0)
-			context.addIssue({
-				code: "custom",
-				message: "intent review requires a positive round",
-				path: ["deepInterview", "round"],
-			});
-		if ((contract || review) && value.multi === true)
-			context.addIssue({ code: "custom", message: "intent gates must be single-select", path: ["multi"] });
-		const confirmationOptions = contract?.confirmation_options ?? [];
-		if (new Set(confirmationOptions).size !== confirmationOptions.length)
-			context.addIssue({
-				code: "custom",
-				message: "intent confirmation options must be unique",
-				path: ["deepInterview", "intent_contract"],
-			});
-		const approvalOptions = review?.approval_options ?? [];
-		if (new Set(approvalOptions).size !== approvalOptions.length)
-			context.addIssue({
-				code: "custom",
-				message: "intent approval options must be unique",
-				path: ["deepInterview", "intent_review"],
-			});
-		for (const label of confirmationOptions) {
-			if (!labels.has(label))
+function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMeta>) {
+	return z
+		.object({
+			id: z.string().describe("question id"),
+			question: z.string().describe("question text"),
+			options: z.array(OptionItem).describe("available options"),
+			multi: z.boolean().describe("allow multiple selections").optional(),
+			recommended: z.number().describe("recommended option index").optional(),
+			deepInterview: deepInterviewSchema.describe("optional deep-interview round metadata").optional(),
+			workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
+		})
+		.superRefine((value, context) => {
+			const labels = new Set(value.options.map(option => option.label));
+			const contract = intentContract(value.deepInterview);
+			const review = intentReview(value.deepInterview);
+			if (
+				value.deepInterview &&
+				value.workflowGate &&
+				(value.workflowGate.stage !== "deep-interview" || value.workflowGate.kind !== "question")
+			)
 				context.addIssue({
 					code: "custom",
-					message: "intent confirmation option must be displayed",
+					message: "deep-interview metadata requires a deep-interview question workflow gate",
+					path: ["workflowGate"],
+				});
+			if (contract && review)
+				context.addIssue({
+					code: "custom",
+					message: "intent contract and review are mutually exclusive",
+					path: ["deepInterview"],
+				});
+			if (
+				contract &&
+				(value.deepInterview?.round !== 0 ||
+					value.deepInterview.component !== "review-topology" ||
+					value.deepInterview.dimension !== "topology")
+			)
+				context.addIssue({
+					code: "custom",
+					message: "intent contract requires round-0 review topology metadata",
+					path: ["deepInterview"],
+				});
+			if (review && (value.deepInterview?.round ?? 0) <= 0)
+				context.addIssue({
+					code: "custom",
+					message: "intent review requires a positive round",
+					path: ["deepInterview", "round"],
+				});
+			if ((contract || review) && value.multi === true)
+				context.addIssue({ code: "custom", message: "intent gates must be single-select", path: ["multi"] });
+			const confirmationOptions = contract?.confirmation_options ?? [];
+			if (new Set(confirmationOptions).size !== confirmationOptions.length)
+				context.addIssue({
+					code: "custom",
+					message: "intent confirmation options must be unique",
 					path: ["deepInterview", "intent_contract"],
 				});
-		}
-		for (const label of approvalOptions) {
-			if (!labels.has(label))
+			const approvalOptions = review?.approval_options ?? [];
+			if (new Set(approvalOptions).size !== approvalOptions.length)
 				context.addIssue({
 					code: "custom",
-					message: "intent approval option must be displayed",
+					message: "intent approval options must be unique",
 					path: ["deepInterview", "intent_review"],
 				});
-		}
-	});
+			for (const label of confirmationOptions) {
+				if (!labels.has(label))
+					context.addIssue({
+						code: "custom",
+						message: "intent confirmation option must be displayed",
+						path: ["deepInterview", "intent_contract"],
+					});
+			}
+			for (const label of approvalOptions) {
+				if (!labels.has(label))
+					context.addIssue({
+						code: "custom",
+						message: "intent approval option must be displayed",
+						path: ["deepInterview", "intent_review"],
+					});
+			}
+		});
+}
+
+const QuestionItem = createQuestionItemSchema(DeepInterviewMeta);
+const TopologyQuestionItem = createQuestionItemSchema(DeepInterviewTopologyMeta);
+const PostTopologyQuestionItem = createQuestionItemSchema(z.union([DeepInterviewRoundMeta, DeepInterviewReviewMeta]));
+
+const OrdinaryQuestionItem = z.object({
+	id: z.string().describe("question id"),
+	question: z.string().describe("question text"),
+	options: z.array(OptionItem).describe("available options"),
+	multi: z.boolean().describe("allow multiple selections").optional(),
+	recommended: z.number().describe("recommended option index").optional(),
+	workflowGate: WorkflowGateMeta.describe("optional workflow gate stage/kind override").optional(),
+});
 
 export const askSchema = z.object({
 	questions: z.array(QuestionItem).min(1).describe("questions to ask"),
+});
+
+const topologyAskSchema = z.object({
+	questions: z.array(TopologyQuestionItem).min(1).describe("questions to ask"),
+});
+
+const postTopologyAskSchema = z.object({
+	questions: z.array(PostTopologyQuestionItem).min(1).describe("questions to ask"),
+});
+
+const ordinaryAskSchema = z.object({
+	questions: z.array(OrdinaryQuestionItem).min(1).describe("questions to ask"),
 });
 
 export type AskToolInput = z.infer<typeof askSchema>;
@@ -361,9 +401,41 @@ function normalizeRoundZeroOptionalNulls(arguments_: Record<string, unknown>): R
 	if (changed) normalizedQuestion.deepInterview = normalizedDeepInterview;
 	return changed ? { ...arguments_, questions: [normalizedQuestion] } : arguments_;
 }
-function recoverRoundZeroIntentContract(arguments_: Record<string, unknown>): RawArgumentValidationResult {
+
+function knownIntentRejection(arguments_: Record<string, unknown>): RawArgumentValidationResult | undefined {
+	if (!isPlainRecord(arguments_) || !Array.isArray(arguments_.questions) || arguments_.questions.length !== 1)
+		return undefined;
+	const question = arguments_.questions[0];
+	if (!isPlainRecord(question) || !isPlainRecord(question.deepInterview)) return undefined;
+	const metadata = question.deepInterview;
+	const hasContract = Object.hasOwn(metadata, "intent_contract");
+	const hasReview = Object.hasOwn(metadata, "intent_review");
+	const workflowGate = question.workflowGate;
+	if (
+		Object.hasOwn(question, "workflowGate") &&
+		(!isPlainRecord(workflowGate) || workflowGate.stage !== "deep-interview" || workflowGate.kind !== "question")
+	)
+		return { outcome: "reject", code: "ask-deep-interview-metadata-requires-deep-interview-gate" };
+	if (hasReview && !hasContract && metadata.round === 0) {
+		return { outcome: "reject", code: "ask-intent-review-requires-positive-round" };
+	}
+	if (!hasContract || !isPlainRecord(metadata.intent_contract)) return undefined;
+	const contract = metadata.intent_contract;
+	if (
+		(Array.isArray(contract.items) && contract.items.length === 0) ||
+		(Array.isArray(contract.confirmation_options) && contract.confirmation_options.length === 0)
+	)
+		return { outcome: "reject", code: "ask-intent-contract-requires-non-empty-authority" };
+	return undefined;
+}
+function recoverRoundZeroIntentContract(
+	arguments_: Record<string, unknown>,
+	stage?: "topology" | "post-topology",
+): RawArgumentValidationResult {
 	if (!isRoundZeroRecoveryCandidate(arguments_)) return { outcome: "passthrough" };
 	const normalizedArguments = normalizeRoundZeroOptionalNulls(arguments_);
+	const knownRejection = knownIntentRejection(normalizedArguments);
+	if (knownRejection) return knownRejection;
 	if (!isOnlyPlainData(normalizedArguments) || !isPlainRecord(normalizedArguments)) return { outcome: "reject" };
 	if (
 		!hasExactOwnKeys(normalizedArguments, ["questions"]) ||
@@ -389,6 +461,7 @@ function recoverRoundZeroIntentContract(arguments_: Record<string, unknown>): Ra
 	const deepInterview = question.deepInterview;
 	const hasIntentContract = Object.hasOwn(deepInterview, "intent_contract");
 	const hasIntentReview = Object.hasOwn(deepInterview, "intent_review");
+	if (hasIntentContract && hasIntentReview && stage !== "topology") return { outcome: "reject" };
 	if (hasIntentContract !== hasIntentReview && askSchema.safeParse(normalizedArguments).success)
 		return { outcome: "passthrough" };
 
@@ -421,10 +494,19 @@ function recoverRoundZeroIntentContract(arguments_: Record<string, unknown>): Ra
 		"intent_contract",
 		"intent_review",
 	];
+	if (!hasOnlyAllowedOwnKeys(deepInterview, deepInterviewKeys)) return { outcome: "reject" };
 	if (
-		!hasOnlyAllowedOwnKeys(deepInterview, deepInterviewKeys) ||
-		!Object.hasOwn(deepInterview, "intent_contract") ||
-		!Object.hasOwn(deepInterview, "intent_review") ||
+		stage === "post-topology" &&
+		!hasIntentContract &&
+		hasIntentReview &&
+		typeof deepInterview.round === "number" &&
+		Number.isInteger(deepInterview.round) &&
+		deepInterview.round > 0
+	)
+		return { outcome: "passthrough" };
+	if (
+		!hasIntentContract ||
+		!hasIntentReview ||
 		deepInterview.round !== 0 ||
 		typeof deepInterview.component !== "string" ||
 		deepInterview.component !== "review-topology" ||
@@ -1060,6 +1142,11 @@ function formatQuestionResult(result: QuestionResult): string {
 // =============================================================================
 
 type AskParams = AskToolInput;
+type AskParametersSchema =
+	| typeof ordinaryAskSchema
+	| typeof askSchema
+	| typeof topologyAskSchema
+	| typeof postTopologyAskSchema;
 
 /**
  * Ask tool for interactive user prompting during execution.
@@ -1067,13 +1154,19 @@ type AskParams = AskToolInput;
  * Allows gathering user preferences, clarifying instructions, and getting decisions
  * on implementation choices as the agent works.
  */
-export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
 	readonly description: string;
-	readonly parameters = askSchema;
-	readonly rawArgumentValidation = recoverRoundZeroIntentContract;
+	get parameters(): AskParametersSchema {
+		const stage = this.session.getDeepInterviewAskStage?.();
+		if (stage === "topology") return topologyAskSchema;
+		if (stage === "post-topology") return postTopologyAskSchema;
+		return ordinaryAskSchema;
+	}
+	readonly rawArgumentValidation = (arguments_: Record<string, unknown>): RawArgumentValidationResult =>
+		recoverRoundZeroIntentContract(arguments_, this.session.getDeepInterviewAskStage?.());
 	readonly strict = true;
 	readonly loadMode = "discoverable";
 
@@ -1108,6 +1201,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		if (customInput !== undefined && (meta || isDeepInterviewAskQuestion(q.question)))
 			assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 		if (!meta) return;
+		if (this.session.getDeepInterviewAskStage?.() === undefined) return;
+		if (q.workflowGate && (q.workflowGate.stage !== "deep-interview" || q.workflowGate.kind !== "question")) return;
 		const cwd = this.session.cwd;
 		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const statePath = deepInterviewStatePath(cwd, sessionId);

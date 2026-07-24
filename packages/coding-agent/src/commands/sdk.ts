@@ -295,14 +295,14 @@ export async function runSessionHost(
 		rollback.recordAbsent();
 		const failure = normalizeSdkStartupFailure("registration", "failed", error);
 		await writeFailure(failure, rollback.result);
-		throw new Error(failure.message);
+		throw failure;
 	}
 	const { parsed } = opened;
 	if ("failure" in created) {
 		created.rollback.recordAbsent();
 		await writeFailure(created.failure, created.rollback.result);
 
-		throw new Error(created.failure.message);
+		throw created.failure;
 	}
 	const { session, capability, rollback } = created;
 	let sessionDisposal: Promise<void> | undefined;

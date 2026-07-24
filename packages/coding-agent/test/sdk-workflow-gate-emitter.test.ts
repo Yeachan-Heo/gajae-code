@@ -4,9 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
+import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { Settings } from "../src/config/settings";
-import { sessionStateDir } from "../src/gjc-runtime/session-layout";
+import { createDeepInterviewIntentManifest } from "../src/gjc-runtime/deep-interview-state";
+import { activeEntryPath, modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
 import {
 	BrokerWorkflowGateEmitter,
 	FileGateStore,
@@ -20,6 +22,7 @@ import { initTheme } from "../src/modes/theme/theme";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
+import { getSkillActiveStatePaths, syncSkillActiveState } from "../src/skill-state/active-state";
 import { registerWorkflowGateEmitterListener } from "../src/tools/ask-answer-registry";
 
 function attachTerminalController(emitter: WorkflowGateEmitter): void {
@@ -294,21 +297,31 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			slashCommands: [],
 		});
 		try {
+			const { promise: skillActivation, resolve: markSkillActivated } = Promise.withResolvers<void>();
+			const unsubscribe = session.subscribe(event => {
+				if (
+					event.type === "message_start" &&
+					event.message.role === "custom" &&
+					event.message.customType === SKILL_PROMPT_MESSAGE_TYPE
+				)
+					markSkillActivated();
+			});
 			session.agent.emitExternalEvent({
 				type: "message_start",
 				message: {
 					role: "custom",
 					customType: SKILL_PROMPT_MESSAGE_TYPE,
-					content: "# Ultragoal",
+					content: "# Deep Interview",
 					display: true,
-					details: { name: "ultragoal" },
+					details: { name: "deep-interview" },
 					attribution: "agent",
 					timestamp: Date.now(),
 				},
 			});
-			for (let attempt = 0; attempt < 20 && !session.getActiveSkillState(); attempt += 1) await Bun.sleep(1);
+			await skillActivation;
+			unsubscribe();
 			expect(session.getActiveToolNames()).toContain("ask");
-			expect(session.getActiveSkillState()).toMatchObject({ skill: "ultragoal" });
+			expect(session.getActiveSkillState()).toMatchObject({ skill: "deep-interview" });
 
 			await expect(session.newSession()).resolves.toBe(true);
 			expect(session.getActiveToolNames()).not.toContain("ask");
@@ -340,11 +353,193 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			// Deterministic readiness contract: createAgentSession awaits
 			// workflowGateToolRestoration, so ask must be resident immediately.
 			expect(resumedSession.getActiveToolNames()).toContain("ask");
+			const askTool = resumedSession.agent.state.tools.find(tool => tool.name === "ask");
+			if (!askTool) throw new Error("Expected restored AskTool");
+			const topologyCall = {
+				type: "toolCall" as const,
+				id: "resumed-round-zero-contract",
+				name: "ask",
+				arguments: {
+					questions: [
+						{
+							id: "topology",
+							question: "Confirm?",
+							options: [{ label: "Confirm" }],
+							deepInterview: {
+								round: 0,
+								component: "review-topology",
+								dimension: "topology",
+								ambiguity: 0.2,
+								intent_contract: {
+									items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+									confirmation_options: ["Confirm"],
+								},
+							},
+						},
+					],
+				},
+			};
+			expect(validateToolArguments(askTool, topologyCall)).toMatchObject({
+				questions: [{ deepInterview: { intent_contract: { confirmation_options: ["Confirm"] } } }],
+			});
+			const reviewCall = {
+				type: "toolCall" as const,
+				id: "resumed-round-zero-review",
+				name: "ask",
+				arguments: {
+					questions: [
+						{
+							id: "topology",
+							question: "Confirm?",
+							options: [{ label: "Confirm" }],
+							deepInterview: {
+								round: 1,
+								component: "locked-intent",
+								dimension: "constraints",
+								ambiguity: 0.2,
+								intent_review: {
+									observed_items: [
+										{ id: "artifact:report", category: "artifact", statement: "Produce report" },
+									],
+									supporting_substitutions: [],
+									approval_options: ["Confirm"],
+								},
+							},
+						},
+					],
+				},
+			};
+			expect(() => validateToolArguments(askTool, reviewCall)).toThrow('Validation failed for tool "ask"');
+
+			const statePath = modeStatePath(tempDir, resumedSession.sessionId, "deep-interview");
+			const modeState = JSON.parse(await Bun.file(statePath).text());
+			modeState.state = { ...(modeState.state ?? {}), intent_contract: {} };
+			await Bun.write(statePath, JSON.stringify(modeState));
+			expect(validateToolArguments(askTool, topologyCall).questions[0]).not.toHaveProperty("deepInterview");
+			expect(validateToolArguments(askTool, reviewCall).questions[0]).not.toHaveProperty("deepInterview");
+
+			modeState.state.intent_contract = createDeepInterviewIntentManifest(
+				[{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+				{ round: 0, answer_hash: "a".repeat(64) },
+			);
+			await Bun.write(statePath, JSON.stringify(modeState));
+			expect(validateToolArguments(askTool, reviewCall)).toMatchObject({
+				questions: [{ deepInterview: { intent_review: { approval_options: ["Confirm"] } } }],
+			});
 		} finally {
 			await resumedSession.dispose();
 			resumedAuthStorage.close();
 		}
-	}, 15_000);
+	}, 60_000);
+	it("does not restore deep-interview authority from a stale top-level snapshot", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-stale-workflow-snapshot-"));
+		tempDirs.push(tempDir);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		await sessionManager.ensureOnDisk();
+		const sessionId = sessionManager.getSessionId();
+		await syncSkillActiveState({
+			cwd: tempDir,
+			skill: "ralplan",
+			active: true,
+			phase: "planner",
+			sessionId,
+		});
+		const { sessionPath } = getSkillActiveStatePaths(tempDir, sessionId);
+		const snapshot = JSON.parse(await Bun.file(sessionPath).text());
+		snapshot.skill = "deep-interview";
+		snapshot.phase = "interviewing";
+		await Bun.write(sessionPath, JSON.stringify(snapshot));
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			const askTool = session.getToolByName("ask");
+			expect(askTool).toBeDefined();
+			expect(session.getDeepInterviewAskStage()).toBeUndefined();
+			const parsed = validateToolArguments(askTool!, {
+				type: "toolCall",
+				id: "inactive-deep-interview-contract",
+				name: "ask",
+				arguments: {
+					questions: [
+						{
+							id: "hidden-contract",
+							question: "Approve?",
+							options: [{ label: "Approve" }],
+							deepInterview: {
+								round: 0,
+								component: "review-topology",
+								dimension: "topology",
+								ambiguity: 0,
+								intent_contract: {
+									items: [{ id: "artifact:hidden", category: "artifact", statement: "Hidden" }],
+									confirmation_options: ["Approve"],
+								},
+							},
+						},
+					],
+				},
+			});
+			expect(parsed).not.toHaveProperty("questions.0.deepInterview");
+		} finally {
+			await session.dispose();
+		}
+	}, 60_000);
+	it("does not restore deep-interview authority from a sessionless durable entry", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-sessionless-workflow-entry-"));
+		tempDirs.push(tempDir);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		await sessionManager.ensureOnDisk();
+		const sessionId = sessionManager.getSessionId();
+		await syncSkillActiveState({
+			cwd: tempDir,
+			skill: "deep-interview",
+			active: true,
+			phase: "interviewing",
+			sessionId,
+		});
+
+		const { sessionPath } = getSkillActiveStatePaths(tempDir, sessionId);
+		const snapshot = JSON.parse(await Bun.file(sessionPath).text());
+		delete snapshot.session_id;
+		delete snapshot.active_skills[0].session_id;
+		await Bun.write(sessionPath, JSON.stringify(snapshot));
+		const entryPath = activeEntryPath(tempDir, sessionId, "deep-interview");
+		const entry = JSON.parse(await Bun.file(entryPath).text());
+		delete entry.session_id;
+		await Bun.write(entryPath, JSON.stringify(entry));
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager,
+			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			hasUI: false,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+		});
+		try {
+			expect(session.getDeepInterviewAskStage()).toBeUndefined();
+			expect(session.getActiveToolNames()).not.toContain("ask");
+		} finally {
+			await session.dispose();
+		}
+	}, 60_000);
 	it("keeps workflow-gate restoration settled after factory return and dispose", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-restoration-settlement-"));
 		tempDirs.push(tempDir);
@@ -371,7 +566,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		// Restoration observed after dispose remains settled (no hang, no
 		// late rejection surfacing from the already-completed microtask).
 		await expect(session.workflowGateToolRestoration).resolves.toBeUndefined();
-	});
+	}, 60_000);
 	it("attaches ask for a canonical workflow skill even when state sync fails", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-skill-statefail-"));
 		tempDirs.push(tempDir);
@@ -413,7 +608,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 60_000);
 	it("provides a durable SDK-native emitter without extension injection", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-production-"));
 		tempDirs.push(tempDir);

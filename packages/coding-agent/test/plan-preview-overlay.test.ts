@@ -109,7 +109,7 @@ describe("PlanPreviewOverlay", () => {
 		overlay.handleInput("stale");
 		overlay.handleInput("\r");
 		expect(overlay.comments).toHaveLength(1);
-		expect(overlay.render(120).join("\n")).toContain("ctrl+g:edit");
+		expect(overlay.render(120).join("\n")).toContain("Ctrl+G:edit");
 		overlay.handleInput("\x07");
 		await Promise.resolve();
 		await Promise.resolve();

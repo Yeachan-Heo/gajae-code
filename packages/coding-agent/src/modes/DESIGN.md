@@ -94,6 +94,11 @@ empty space and list density for an operational setup flow.
   removing line breaks. Notification secrets will use the dedicated masked
   input from Work item 6; they must never appear in list values, descriptions,
   previews, artifacts, or logs.
+### Shortcut labels and binding authority
+
+Keybinding configuration is a portable canonical grammar: textual key IDs use `ctrl`, `alt`, `shift`, and `super` plus a key name (for example, `ctrl+p` or `alt+enter`). Do not serialize or require display-only labels. Runtime UI renders those IDs through the shared formatter for its explicit platform context; macOS uses MacBook-style glyphs (`⌃`, `⌥`, `⇧`, `⌘`, `↩`, `⎋`, `⇥`, `⌫`, `⌦`, and arrow glyphs) while other platforms use textual labels. A glyph is never configuration syntax.
+
+Static onboarding and generated documentation have authority only over shipped defaults. Keep generated tables host-independent by showing canonical textual IDs, not the capture host's labels. The runtime `KeybindingsManager` owns the effective binding set after user remaps and extensions load; `/hotkeys` and runtime hints must render that effective set with the platform context injected by their host. Do not let a static onboarding hint imply that it reflects remaps.
 
 ### Status, errors, confirmation, and disabled work
 

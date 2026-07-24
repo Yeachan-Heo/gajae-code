@@ -1,43 +1,9 @@
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { UnknownModelProfileError, validateModelProfileName } from "../config/model-profile-contract";
+import { mergeModelProfiles } from "../config/model-profiles";
 import { ModelsConfigSchema } from "../config/models-config-schema";
-
-/**
- * The coordinator runs in the shipped MCP process and must stay outside the
- * session host import graph. Keep this identity catalog in the coordinator
- * boundary; profile activation and model registry code belong to that host.
- */
-const BUILTIN_MODEL_PROFILE_NAMES = [
-	"codex-eco",
-	"codex-medium",
-	"codex-pro",
-	"opencodego",
-	"claude-opus",
-	"claude-fable",
-	"glm-eco",
-	"glm-medium",
-	"glm-pro",
-	"kimi-coding-plan-eco",
-	"kimi-coding-plan-medium",
-	"kimi-coding-plan-pro",
-	"mimo-eco",
-	"mimo-medium",
-	"mimo-pro",
-	"grok-eco",
-	"grok-medium",
-	"grok-pro",
-	"grok-build-pro",
-	"cursor-eco",
-	"cursor-medium",
-	"cursor-pro",
-	"minimax-eco",
-	"minimax-medium",
-	"minimax-pro",
-	"opus-codex",
-	"codex-opencodego",
-	"fable-opus-codex",
-] as const;
 
 export interface CoordinatorModelProfile {
 	name: string;
@@ -53,8 +19,6 @@ export type CoordinatorModelProfileLoader = () =>
 	| Promise<Map<string, CoordinatorModelProfile>>;
 
 const MAX_ECHOED_MPRESET_LENGTH = 128;
-const LEGACY_MODEL_PROFILE_ALIASES: ReadonlyMap<string, string> = new Map([["codex-standard", "codex-medium"]]);
-
 /**
  * Thrown by the default loader when `models.yml` exists but is invalid or
  * unreadable. This lets the resolver fail closed with a distinct, stable reason
@@ -69,34 +33,24 @@ export class CoordinatorModelProfileRegistryError extends Error {
 	}
 }
 
-function builtInCoordinatorModelProfiles(): Map<string, CoordinatorModelProfile> {
-	return new Map(BUILTIN_MODEL_PROFILE_NAMES.map(name => [name, { name }]));
+function coordinatorModelProfiles(
+	profiles?: Parameters<typeof mergeModelProfiles>[0],
+): Map<string, CoordinatorModelProfile> {
+	return new Map([...mergeModelProfiles(profiles).keys()].map(name => [name, { name }]));
 }
 
 export const loadCoordinatorModelProfiles: CoordinatorModelProfileLoader = async () => {
 	const modelsFile = Bun.file(path.join(getAgentDir(), "models.yml"));
-	if (!(await modelsFile.exists())) return builtInCoordinatorModelProfiles();
+	if (!(await modelsFile.exists())) return coordinatorModelProfiles();
 	try {
 		const parsed = YAML.parse(await modelsFile.text());
 		const config = ModelsConfigSchema.safeParse(parsed);
 		if (!config.success) throw config.error;
-		const profiles = builtInCoordinatorModelProfiles();
-		for (const name of Object.keys(config.data.profiles ?? {})) profiles.set(name, { name });
-		return profiles;
+		return coordinatorModelProfiles(config.data.profiles);
 	} catch (error) {
 		throw new CoordinatorModelProfileRegistryError(error);
 	}
 };
-
-function sortedProfileNames(profiles: ReadonlyMap<string, CoordinatorModelProfile>): string[] {
-	return [...profiles.keys()].sort((left, right) => left.localeCompare(right));
-}
-
-function resolveCoordinatorModelProfileName(profileName: string, profiles: ReadonlyMap<string, unknown>): string {
-	if (profiles.has(profileName)) return profileName;
-	const replacement = LEGACY_MODEL_PROFILE_ALIASES.get(profileName);
-	return replacement && profiles.has(replacement) ? replacement : profileName;
-}
 
 export type CoordinatorMpresetResolution =
 	| { ok: true; mpreset: string | null }
@@ -120,7 +74,7 @@ export async function resolveCoordinatorMpreset(
 	loadProfiles: CoordinatorModelProfileLoader,
 ): Promise<CoordinatorMpresetResolution> {
 	if (raw === undefined || raw === null) return { ok: true, mpreset: null };
-	const requested = typeof raw === "string" ? raw.trim() : "";
+	const requested = typeof raw === "string" ? raw : "";
 	const echoed = requested.slice(0, MAX_ECHOED_MPRESET_LENGTH);
 	let profiles: Map<string, CoordinatorModelProfile>;
 	try {
@@ -131,24 +85,17 @@ export async function resolveCoordinatorMpreset(
 		}
 		throw error;
 	}
-	// Non-string input and explicit blank/whitespace strings can never name a
-	// profile; only absent/null (handled above) means "no selection".
-	if (typeof raw !== "string" || requested.length === 0) {
-		return {
-			ok: false,
-			reason: "unknown_model_profile",
-			mpreset: echoed,
-			available_profiles: sortedProfileNames(profiles),
-		};
+	try {
+		const canonical = validateModelProfileName(requested, profiles);
+		return { ok: true, mpreset: canonical };
+	} catch (error) {
+		if (error instanceof UnknownModelProfileError)
+			return {
+				ok: false,
+				reason: "unknown_model_profile",
+				mpreset: error.details.requestedProfile.slice(0, MAX_ECHOED_MPRESET_LENGTH),
+				available_profiles: error.details.availableProfiles,
+			};
+		throw error;
 	}
-	const canonical = resolveCoordinatorModelProfileName(requested, profiles);
-	if (!profiles.has(canonical)) {
-		return {
-			ok: false,
-			reason: "unknown_model_profile",
-			mpreset: echoed,
-			available_profiles: sortedProfileNames(profiles),
-		};
-	}
-	return { ok: true, mpreset: canonical };
 }

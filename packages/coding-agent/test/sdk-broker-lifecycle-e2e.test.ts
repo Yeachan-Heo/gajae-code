@@ -3170,6 +3170,105 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 	}
 }, 20_000);
 
+test("broker agentDir profile validates, activates, and is discoverable through session Q27", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-agent-dir-"));
+	const cwd = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	await fs.mkdir(cwd, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true });
+	await Bun.write(
+		path.join(agentDir, "models.yml"),
+		`providers:\n  fixture:\n    baseUrl: https://example.invalid/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        contextWindow: 4096\n        maxTokens: 1024\nprofiles:\n  agent-dir-only:\n    display_name: Agent Dir Only\n    required_providers: [fixture]\n    model_mapping:\n      executor: fixture/fixture-model\n`,
+	);
+	const broker = new Broker({ agentDir });
+	try {
+		await broker.start();
+		const created = await broker.handleRequest(
+			"session.create",
+			{ cwd, modelPreset: "agent-dir-only", readinessTimeoutMs: 10_000 },
+			"agent-dir-profile-create",
+		);
+		if (!created.ok) throw new Error(created.error.message);
+		const { sessionId, endpoint } = created.result as {
+			sessionId: string;
+			endpoint: { url: string; token: string };
+		};
+		const client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 2_000, reconnectAttempts: 0 });
+		try {
+			expect(await client.query("models.profiles.list")).toMatchObject({
+				ok: true,
+				page: {
+					items: expect.arrayContaining([
+						expect.objectContaining({
+							id: "agent-dir-only",
+							displayName: "Agent Dir Only",
+							source: "configured",
+						}),
+					]),
+				},
+			});
+		} finally {
+			await client.close();
+		}
+		expect(await broker.handleRequest("session.close", { sessionId }, "agent-dir-profile-close")).toMatchObject({
+			ok: true,
+			result: { sessionId },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
+test("child profile activation failures preserve typed codes through readiness and BrokerResponse", async () => {
+	const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+	for (const scenario of [
+		{ code: "unknown_model_profile", replacement: "profiles: {}\n" },
+		{ code: "model_profile_registry_error", replacement: "profiles: [invalid\n" },
+	] as const) {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-sdk-${scenario.code}-`));
+		const cwd = path.join(root, "workspace");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await Bun.write(
+			path.join(agentDir, "models.yml"),
+			`providers:\n  fixture:\n    baseUrl: https://example.invalid/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        contextWindow: 4096\n        maxTokens: 1024\nprofiles:\n  agent-dir-only:\n    required_providers: [fixture]\n    model_mapping:\n      executor: fixture/fixture-model\n`,
+		);
+		const broker = new Broker({ agentDir });
+		setLifecycleCommandResolverForTest(broker, () => ({
+			file: "/bin/sh",
+			args: [
+				"-c",
+				`printf %s ${shellQuote(scenario.replacement)} > "$GJC_AGENT_DIR/models.yml"; exec ${shellQuote(process.execPath)} run ${shellQuote(cliEntrypoint)} sdk session-host-internal`,
+			],
+		}));
+		try {
+			await broker.start();
+			const response = await broker.handleRequest(
+				"session.create",
+				{ cwd, modelPreset: "agent-dir-only", readinessTimeoutMs: 10_000 },
+				`child-profile-${scenario.code}`,
+			);
+			expect(response).toMatchObject({
+				ok: false,
+				error: {
+					code: scenario.code,
+					details: { requestedProfile: "agent-dir-only", discoveryQuery: "models.profiles.list" },
+				},
+				startupFailure: {
+					code: scenario.code,
+					details: { requestedProfile: "agent-dir-only", discoveryQuery: "models.profiles.list" },
+				},
+			});
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}
+}, 40_000);
+
 test("broker close acknowledges before terminating the lifecycle child and preserves its terminal host index", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-close-subprocess-"));
 	const agentDir = path.join(root, "agent");

@@ -322,9 +322,17 @@ describe("lifecycle command parser (G009)", () => {
 		}
 	});
 
-	it("rejects injection-shaped --mpreset values", () => {
-		expect(parseLifecycleCommand("/session_create path /repo --mpreset 'bad;rm'").kind).toBe("reject");
-		expect(parseLifecycleCommand("/session_create path /repo --mpreset a$(whoami)").kind).toBe("reject");
+	it("preserves quoted and punctuation-bearing exact --mpreset IDs without shell interpretation", () => {
+		expect(parseLifecycleCommand(`/session_create path /repo --mpreset "custom profile/한글 !"`)).toEqual({
+			kind: "create",
+			target: { kind: "existing_path", path: "/repo" },
+			modelPreset: "custom profile/한글 !",
+		});
+		expect(parseLifecycleCommand("/session_create path /repo --mpreset 'bad;rm'")).toMatchObject({
+			kind: "create",
+			modelPreset: "bad;rm",
+		});
+		expect(parseLifecycleCommand(`/session_create path /repo --mpreset "unterminated`).kind).toBe("usage");
 	});
 
 	it("usage text includes --mpreset", () => {

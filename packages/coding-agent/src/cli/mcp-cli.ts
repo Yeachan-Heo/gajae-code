@@ -6,6 +6,7 @@
  */
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import { getMCPServer, readMCPConfigFile, removeMCPServer, upsertMCPServer } from "../runtime-mcp/config-writer";
+import { redactMCPEndpoint } from "../runtime-mcp/redaction";
 import type { MCPConfigFile, MCPServerConfig } from "../runtime-mcp/types";
 
 export type MCPAction = "add" | "list" | "remove";
@@ -141,24 +142,6 @@ function redactRecord(
 	);
 }
 
-function redactUrl(value: string | undefined): string | undefined {
-	if (!value) return value;
-	try {
-		const url = new URL(value);
-		if (url.username) url.username = REDACTED;
-		if (url.password) url.password = REDACTED;
-		if (url.search) {
-			for (const key of Array.from(url.searchParams.keys())) {
-				url.searchParams.set(key, REDACTED);
-			}
-		}
-		url.hash = "";
-		return url.toString();
-	} catch {
-		return SENSITIVE_KEY_PATTERN.test(value) ? REDACTED : value;
-	}
-}
-
 function redactArgs(args: string[] | undefined): string[] | undefined {
 	if (!args) return undefined;
 	const redacted: string[] = [];
@@ -196,7 +179,7 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 		if (headers) redacted.headers = headers;
 	}
 	if ("url" in redacted) {
-		const url = redactUrl(redacted.url);
+		const url = redactMCPEndpoint(redacted.url);
 		if (url) redacted.url = url;
 	}
 	if ("args" in redacted) {
@@ -207,7 +190,7 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 		redacted.auth = {
 			type: redacted.auth.type,
 			credentialId: redacted.auth.credentialId ? REDACTED : undefined,
-			tokenUrl: redactUrl(redacted.auth.tokenUrl),
+			tokenUrl: redactMCPEndpoint(redacted.auth.tokenUrl),
 			clientId: redacted.auth.clientId ? REDACTED : undefined,
 			clientSecret: redacted.auth.clientSecret ? REDACTED : undefined,
 		};
@@ -216,7 +199,7 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 		redacted.oauth = {
 			clientId: redacted.oauth.clientId ? REDACTED : undefined,
 			clientSecret: redacted.oauth.clientSecret ? REDACTED : undefined,
-			redirectUri: redactUrl(redacted.oauth.redirectUri),
+			redirectUri: redactMCPEndpoint(redacted.oauth.redirectUri),
 			callbackPort: redacted.oauth.callbackPort,
 			callbackPath: redacted.oauth.callbackPath,
 		};

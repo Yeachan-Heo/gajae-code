@@ -485,6 +485,7 @@ describe("AgentSession deep-interview continuation", () => {
 			getSessionFile: () => null,
 			getSessionSpawns: () => "*",
 			getSessionId: () => sessionManager.getSessionId(),
+			getDeepInterviewAskStage: () => "post-topology",
 		} as ToolSession);
 		const context = {
 			hasUI: true,

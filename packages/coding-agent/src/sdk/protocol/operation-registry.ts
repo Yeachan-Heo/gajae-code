@@ -154,6 +154,11 @@ const queries = [
 	["resource.body", "Read a bounded resource continuation."],
 	["artifact.read", "Read a bounded artifact range."],
 	["runtime.jobs.list", "List managed jobs."],
+	[
+		"turn.prompt_status",
+		"Read the authoritative reconciliation status of a submitted prompt by command/turn IDs or clientRef.",
+	],
+	["models.profiles.list", "List the effective built-in and configured model profiles for this session."],
 ] as const;
 
 const reverse = [
@@ -191,6 +196,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 
 function controlErrors(id: string): string[] {
 	const errors: Record<string, string[]> = {
+		C01: ["client_ref_conflict", "reconciliation_capacity"],
 		C06: ["action_claimed"],
 		C07: ["action_claimed", "terminal_uncertain"],
 		C08: ["action_claimed", "terminal_uncertain"],
@@ -224,14 +230,14 @@ function revision(id: string): string | undefined {
 }
 function queryContinuityClass(id: string): QueryContinuityClass {
 	if (["Q01", "Q02"].includes(id)) return "stable_prefix";
-	if (["Q04", "Q05", "Q06", "Q07", "Q08", "Q11", "Q12", "Q13", "Q20", "Q21", "Q22", "Q23"].includes(id))
+	if (["Q04", "Q05", "Q06", "Q07", "Q08", "Q11", "Q12", "Q13", "Q20", "Q21", "Q22", "Q23", "Q27"].includes(id))
 		return "retained_revision";
 	if (id === "Q24") return "content_addressed";
 	return "scalar_snapshot";
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q23", "Q24", "Q25"].includes(id))
+	if (["Q23", "Q24", "Q25", "Q26", "Q27"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }
@@ -263,7 +269,12 @@ export const OPERATIONS: readonly Operation[] = [
 			kind: "global" as const,
 			description,
 			idempotency: "idempotent" as const,
-			errorCodes: id === "G02" ? ["endpoint_credential_forbidden"] : ["invalid_request"],
+			errorCodes:
+				id === "G02"
+					? ["endpoint_credential_forbidden"]
+					: ["G03", "G04", "G05"].includes(id)
+						? ["invalid_request", "unknown_model_profile", "model_profile_registry_error"]
+						: ["invalid_request"],
 			adapterDispositions:
 				id === "G02"
 					? dispositions({
@@ -286,7 +297,10 @@ export const OPERATIONS: readonly Operation[] = [
 			kind: "query" as const,
 			description,
 			idempotency: "idempotent" as const,
-			errorCodes: ["invalid_request", "resource_gone"],
+			errorCodes:
+				id === "Q27"
+					? ["invalid_request", "resource_gone", "model_profile_registry_error"]
+					: ["invalid_request", "resource_gone"],
 			continuityClass: queryContinuityClass(id),
 			adapterDispositions: queryDisposition(id),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],

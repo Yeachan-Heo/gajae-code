@@ -19,4 +19,27 @@ describe("keybindings config", () => {
 		expect(await fs.readFile(file, "utf8")).toBe(malformed);
 		expect(await Bun.file(`${file}.bak`).exists()).toBe(false);
 	});
+	it("rejects invalid overrides atomically and retains defaults", async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-keybindings-"));
+		await fs.writeFile(
+			path.join(tempDir, "keybindings.json"),
+			JSON.stringify({
+				"app.clear": "command+p",
+				"app.message.dequeue": ["alt+up", "ctrl+\u001b[31m"],
+				"app.commandPalette.open": "CTRL+P",
+			}),
+		);
+
+		const keybindings = KeybindingsManager.create(tempDir);
+		expect(keybindings.getKeys("app.clear")).toEqual(["ctrl+c"]);
+		expect(keybindings.getKeys("app.message.dequeue")).toEqual(["alt+up", "alt+down"]);
+		expect(keybindings.getKeys("app.commandPalette.open")).toEqual(["ctrl+p"]);
+	});
+
+	it("accepts literal plus as a configured base key", async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-keybindings-"));
+		await fs.writeFile(path.join(tempDir, "keybindings.json"), JSON.stringify({ "app.clear": "ctrl++" }));
+
+		expect(KeybindingsManager.create(tempDir).getKeys("app.clear")).toEqual(["ctrl++"]);
+	});
 });

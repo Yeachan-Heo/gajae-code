@@ -1170,6 +1170,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			imageProvider === "gemini" ||
 			imageProvider === "openrouter" ||
 			imageProvider === "antigravity" ||
+			imageProvider === "alibaba" ||
 			imageProvider === "custom"
 		) {
 			setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
@@ -1523,6 +1524,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
 			getActiveSkillState: () => session?.getActiveSkillState(),
 			getActiveSkillPhase: () => session?.getActiveSkillPhase(),
+			getDeepInterviewAskStage: () => session?.getDeepInterviewAskStage(),
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			get model() {
 				return agent?.state.model ?? model;

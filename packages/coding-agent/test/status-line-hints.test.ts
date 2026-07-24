@@ -112,6 +112,33 @@ describe("status line action hints", () => {
 		expect(streamingStatus).not.toContain("Open command palette");
 		expect(visibleWidth(streamingStatus)).toBeLessThanOrEqual(120);
 	});
+	it("formats effective bound hints by platform while preserving availability, priority, and whole-width boundaries", () => {
+		const registry = new ActionRegistry<void>({ context: undefined, showError: () => {} });
+		registerAction(registry, "app.commandPalette.open", () => true);
+		registerAction(registry, "app.plan.toggle", () => true);
+		registerAction(registry, "app.model.select", () => false);
+		registerAction(registry, "app.history.search", () => true);
+		const keybindings = KeybindingsManager.inMemory({
+			"app.commandPalette.open": "super+alt+p",
+			"app.plan.toggle": [],
+		});
+		const darwin = getAvailableActionHints(registry, () => keybindings, 120, "composer", { platform: "darwin" });
+		const linux = getAvailableActionHints(registry, () => keybindings, 120, "composer", { platform: "linux" });
+
+		expect(darwin.map(hint => hint.id)).toEqual(["app.commandPalette.open", "app.history.search"]);
+		expect(Bun.stripANSI(darwin[0]?.content ?? "")).toBe("⌥⌘P Open command palette");
+		expect(Bun.stripANSI(linux[0]?.content ?? "")).toBe("Alt+Super+P Open command palette");
+		expect(darwin.map(hint => hint.id)).not.toContain("app.plan.toggle");
+		expect(darwin.map(hint => hint.id)).not.toContain("app.model.select");
+
+		const firstHintWidth = visibleWidth(darwin[0]?.content ?? "");
+		expect(
+			getAvailableActionHints(registry, () => keybindings, firstHintWidth, "composer", { platform: "darwin" }),
+		).toHaveLength(1);
+		expect(
+			getAvailableActionHints(registry, () => keybindings, firstHintWidth - 1, "composer", { platform: "darwin" }),
+		).toEqual([]);
+	});
 
 	it("hides contextual hints without suppressing configured status segments", () => {
 		expect(SETTINGS_SCHEMA["statusLine.showActionHints"].default).toBe(true);

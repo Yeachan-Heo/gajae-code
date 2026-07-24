@@ -70,6 +70,7 @@ const CP_KP_EQUALS: i32 = 57415;
 const MOD_SHIFT: u32 = 1;
 const MOD_ALT: u32 = 2;
 const MOD_CTRL: u32 = 4;
+const MOD_SUPER: u32 = 8;
 const MOD_NUM_LOCK: u32 = 128;
 
 /// Event types from Kitty keyboard protocol (flag 2).
@@ -463,6 +464,10 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 				modifier |= MOD_ALT;
 				continue;
 			},
+			b's' | b'S' if p.eq_ignore_ascii_case("super") => {
+				modifier |= MOD_SUPER;
+				continue;
+			},
 			_ => {},
 		}
 
@@ -625,10 +630,10 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 
 	// Named keys (case-insensitive)
 	if key.eq_ignore_ascii_case("escape") || key.eq_ignore_ascii_case("esc") {
-		if modifier != 0 {
-			return false;
+		if modifier == 0 {
+			return bytes == b"\x1b" || kitty_matches(CP_ESCAPE, 0);
 		}
-		return bytes == b"\x1b" || kitty_matches(CP_ESCAPE, 0);
+		return kitty_matches(CP_ESCAPE, modifier) || mok_matches(CP_ESCAPE, modifier);
 	}
 
 	if key.eq_ignore_ascii_case("space") {
@@ -1325,7 +1330,7 @@ fn parse_functional(bytes: &[u8]) -> Option<ParsedKittySequence> {
 
 fn format_kitty_key(parsed: &ParsedKittySequence) -> Option<Cow<'static, str>> {
 	let effective_mod = parsed.modifier & !LOCK_MASK;
-	if effective_mod & !(MOD_SHIFT | MOD_CTRL | MOD_ALT) != 0 {
+	if effective_mod & !(MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_SUPER) != 0 {
 		return None;
 	}
 	let effective_codepoint =
@@ -1427,6 +1432,9 @@ fn format_with_mods(mods: u32, key_name: &str) -> String {
 	if mods & MOD_ALT != 0 {
 		result.push_str("alt+");
 	}
+	if mods & MOD_SUPER != 0 {
+		result.push_str("super+");
+	}
 	result.push_str(key_name);
 	result
 }
@@ -1473,7 +1481,24 @@ mod tests {
 
 	#[test]
 	fn parse_key_ignores_kitty_sequences_with_unsupported_modifiers() {
-		assert_eq!(parse_key_inner(b"\x1b[99;9u", true).as_deref(), None);
+		assert_eq!(parse_key_inner(b"\x1b[99;17u", true).as_deref(), None);
+	}
+
+	#[test]
+	fn super_chords_match_and_parse_without_plain_key_dispatch() {
+		let super_p = b"\x1b[112;9u";
+		assert!(matches_key_inner(super_p, "super+p", true));
+		assert!(!matches_key_inner(super_p, "p", true));
+		assert!(!matches_key_inner(b"p", "super+p", true));
+		assert_eq!(parse_key_inner(super_p, true).as_deref(), Some("super+p"));
+	}
+
+	#[test]
+	fn modified_escape_matches_kitty_and_modify_other_keys() {
+		assert!(matches_key_inner(b"\x1b[27;5;27~", "ctrl+escape", false));
+		assert!(!matches_key_inner(b"\x1b[27;5;27~", "escape", false));
+		assert!(matches_key_inner(b"\x1b[27;5u", "ctrl+escape", true));
+		assert!(matches_key_inner(b"\x1b[27;9u", "super+escape", true));
 	}
 
 	#[test]
@@ -1496,6 +1521,12 @@ mod tests {
 		assert!(matches_key_inner(b"\x1b[57410u", "/", true));
 		assert_eq!(parse_key_inner(b"\x1b[57413;5u", true).as_deref(), Some("ctrl++"));
 		assert!(matches_key_inner(b"\x1b[57413;5u", "ctrl++", true));
+	}
+
+	#[test]
+	fn persisted_plus_aliases_match_literal_plus_keys() {
+		assert!(matches_key_inner(b"+", "plus", false));
+		assert!(matches_key_inner(b"\x1b[43;5u", "ctrl+plus", true));
 	}
 
 	#[test]

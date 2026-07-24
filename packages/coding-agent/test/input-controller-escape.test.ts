@@ -197,6 +197,7 @@ function createContext(): {
 		} as unknown as InteractiveModeContext["sessionManager"],
 		keybindings: {
 			getKeys: (action: string) => (action === "app.interrupt" ? ["escape"] : []),
+			getDisplayString: () => "",
 		} as unknown as InteractiveModeContext["keybindings"],
 		pendingImages: [],
 		lastEscapeTime: 0,

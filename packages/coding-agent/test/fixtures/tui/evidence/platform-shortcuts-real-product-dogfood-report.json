@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "kind": "compiled-tui-dogfood-report",
+  "headRole": "product-source",
+  "head": "1293711405de6c8a297e183f174ba2f907db12e6",
+  "buildCommand": [
+    "bun",
+    "--cwd=packages/coding-agent",
+    "run",
+    "build"
+  ],
+  "smokeCommands": [
+    [
+      "packages/coding-agent/dist/gjc",
+      "--version"
+    ],
+    [
+      "packages/coding-agent/dist/gjc",
+      "--smoke-test"
+    ]
+  ],
+  "dogfoodInvocation": "compiled packages/coding-agent/dist/gjc in a 120x36 xterm-256color PTY, opened /hotkeys, then Ctrl-C shutdown",
+  "binarySha256": "2692032ede9bc9442aa3be729bcd4b1e62059440e19b8664342d41218361e0a1",
+  "rawAnsiArtifact": "packages/coding-agent/test/fixtures/tui/evidence/platform-shortcuts-real-product-dogfood.ansi.gz",
+  "rawAnsiSha256": "e90f49f1be8c580237671925c9cc0eed16760eeacc785ca216f0d3c36d31cac7",
+  "rawAnsiBytes": 480940,
+  "observations": {
+    "composerPlaceholder": true,
+    "flowPanel": true,
+    "macControlGlyph": true,
+    "macShiftGlyph": true,
+    "newLineHint": true,
+    "clearHint": true,
+    "searchHistoryHint": true,
+    "accessibleHotkeysDualLabels": true
+  },
+  "excerpt": "⌃L model · ⇧⇥ reasoning · ⇥ complete · ⌃J newline | ⌃C clear",
+  "result": "passed",
+  "evidenceCommitNote": "The head field names the exact product-source commit used for the binary build and PTY capture. The containing commit is an evidence-only descendant; PR identity is intentionally excluded so replacement PRs cannot stale immutable product evidence."
+}

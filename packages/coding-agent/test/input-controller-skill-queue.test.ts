@@ -567,7 +567,7 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 // enqueueCustomMessageDisplay.
 // ============================================================================
 
-function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
+function createStubInteractiveModeContextForUiHelpers(session: AgentSession, dequeueDisplay = "Alt+Up") {
 	let editorText = "";
 	const editor: StubEditor = {
 		setText(text) {
@@ -589,7 +589,7 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 		session,
 		compactionQueuedMessages: [],
 		keybindings: {
-			getDisplayString: (_action: string) => "Alt+Up",
+			getDisplayString: (_action: string) => dequeueDisplay,
 		},
 		updatePendingMessagesDisplay,
 		locallySubmittedUserSignatures: new Set<string>(),
@@ -640,6 +640,27 @@ describe("UiHelpers / InputController against the queued-display layer (E8-E9)",
 		// chip appears verbatim. Matches the user-facing "Steer: /skill:..." format.
 		const rendered = pendingMessagesContainer.render(120).join("\n");
 		expect(rendered).toMatch(/Steer: \/skill:test-skill arg1 arg2/);
+	});
+	it("E8a: dequeue guidance uses effective display text and omits unbound controls", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		await session.followUp("queue this message");
+
+		const darwin = createStubInteractiveModeContextForUiHelpers(session, "⌥↑/⌥↓");
+		new UiHelpers(darwin.ctx).updatePendingMessagesDisplay();
+		expect(darwin.pendingMessagesContainer.render(120).join("\n")).toContain("⌥↑/⌥↓ to select/edit/reorder");
+
+		const textual = createStubInteractiveModeContextForUiHelpers(session, "Alt+Up/Alt+Down");
+		new UiHelpers(textual.ctx).updatePendingMessagesDisplay();
+		expect(textual.pendingMessagesContainer.render(120).join("\n")).toContain(
+			"Alt+Up/Alt+Down to select/edit/reorder",
+		);
+
+		const unbound = createStubInteractiveModeContextForUiHelpers(session, "");
+		new UiHelpers(unbound.ctx).updatePendingMessagesDisplay();
+		const unboundRendered = unbound.pendingMessagesContainer.render(120).join("\n");
+		expect(unboundRendered).not.toContain("to select/edit/reorder");
+		expect(unboundRendered).not.toContain("Alt+Up/Alt+Down");
 	});
 
 	it("E8b: updatePendingMessagesDisplay labels normal follow-up prompts as queued", async () => {

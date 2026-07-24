@@ -116,12 +116,20 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 		);
 		expect(ralplanReceipt.status).toBe(0);
 		const ralplanReceiptPayload = parseRequiredJson(ralplanReceipt.stdout, "ralplan receipt stdout");
+		const ralplanReceiptBinding = ralplanReceiptPayload.repository_binding;
+		expect(ralplanReceiptBinding).toEqual({
+			schema: "gjc.repository_binding.v1",
+			worktreeRoot: root,
+			commonDir: null,
+			displayPath: root,
+		});
 		assertKeys(ralplanReceiptPayload, [
 			"run_id",
 			"path",
 			"stage",
 			"stage_n",
 			"sha256",
+			"repository_binding",
 			"created_at",
 			"pending_approval_path",
 		]);
@@ -132,16 +140,45 @@ describe("CONSUMER/KEY-FIELD MATRIX for compact handoff payloads", () => {
 			  "stage": "final",
 			  "stage_n": 2,
 			  "sha256": "<sha256>",
+			  "repository_binding": {
+			    "schema": "gjc.repository_binding.v1",
+			    "worktreeRoot": "/tmp/SCRUBBED",
+			    "commonDir": null,
+			    "displayPath": "/tmp/SCRUBBED"
+			  },
 			  "created_at": "<iso>",
 			  "pending_approval_path": "/tmp/SCRUBBED"
 			}
 			"
 			`);
+		const deduplicatedRalplanReceipt = await runNativeRalplanCommand(
+			["--write", "--stage", "final", "--stage_n", "2", "--artifact", "# Final", "--run-id", "run-b", "--json"],
+			root,
+		);
+		expect(deduplicatedRalplanReceipt.status).toBe(0);
+		const deduplicatedPayload = parseRequiredJson(
+			deduplicatedRalplanReceipt.stdout,
+			"deduplicated ralplan receipt stdout",
+		);
+		expect(deduplicatedPayload.deduplicated).toBe(true);
+		expect(deduplicatedPayload.repository_binding).toEqual(ralplanReceiptBinding);
+		assertKeys(deduplicatedPayload, [
+			"run_id",
+			"path",
+			"stage",
+			"stage_n",
+			"sha256",
+			"repository_binding",
+			"created_at",
+			"pending_approval_path",
+		]);
 
 		const ralplanSeed = await runNativeRalplanCommand(["--json", "scope the work"], root);
 		expect(ralplanSeed.status).toBe(0);
+		const ralplanSeedPayload = parseRequiredJson(ralplanSeed.stdout, "ralplan seed stdout");
+		expect(ralplanSeedPayload.repository_binding).toEqual(ralplanReceiptBinding);
 		expect(scrub(ralplanSeed.stdout ?? "")).toMatchInlineSnapshot(`
-			"{"ok":true,"skill":"ralplan","mode":"short","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan"}
+			"{"ok":true,"skill":"ralplan","mode":"short","state_path":"/tmp/SCRUBBED","run_id":"run-b","handoff":"/skill:ralplan","repository_binding":{"schema":"gjc.repository_binding.v1","worktreeRoot":"/tmp/SCRUBBED","commonDir":null,"displayPath":"/tmp/SCRUBBED"}}
 			"
 			`);
 

@@ -1,6 +1,6 @@
 {
   "provenance": {
-    "sessionStore": "/Users/bellman/.gjc/agent/sessions",
+    "sessionStore": "Local GJC session store (path redacted)",
     "modelWindowMap": "User ~/.gjc/agent/models.yml, verified 2026-07-16; exact provider/model keys precede documented provider/model prefixes.",
     "thresholdSemantics": "Pre-#1021 uses maxOutputTokens=128000 for known mapped models; post-#1021 uses maxOutputTokens=0."
   },
@@ -474,7 +474,7 @@
   "compactionEvidence": [
     {
       "timestamp": "2026-05-30T02:40:34.989Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-tmux-launch-should-create-new-e7022b0d/2026-05-29T08-48-23-980Z_019e72eb-9bac-7000-ab6f-2ece99b818e0.jsonl",
+      "sessionFile": "session:ef85b600cc62184f",
       "tokensBefore": 269504,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -492,7 +492,7 @@
     },
     {
       "timestamp": "2026-06-04T02:31:03.577Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-gjc-cli-state-skills-42241789/2026-06-02T06-44-26-888Z_019e8713-9088-7000-a835-5acb3bb43105.jsonl",
+      "sessionFile": "session:78525ba4b1cb0a62",
       "tokensBefore": 975140,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -514,7 +514,7 @@
     },
     {
       "timestamp": "2026-06-02T07:02:29.230Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-gjc-cli-state-skills-42241789/2026-06-02T06-44-26-888Z_019e8713-9088-7000-a835-5acb3bb43105/0-MapCliStateSkillHud.jsonl",
+      "sessionFile": "session:74b1a5fe18bcbda1",
       "tokensBefore": 264324,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -536,7 +536,7 @@
     },
     {
       "timestamp": "2026-06-03T11:59:14.111Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-ultragoal-red-team-executor-too-good-to-be-true-b298811d/2026-06-03T09-06-19-456Z_019e8cbb-d0c0-7000-8aea-708b96d5c89d.jsonl",
+      "sessionFile": "session:20aa19a91cf26b34",
       "tokensBefore": 271154,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -554,7 +554,7 @@
     },
     {
       "timestamp": "2026-07-12T12:05:29.766Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code-website/2026-07-12T05-07-02-088Z_019f54b8-c148-7000-988f-04a995e51e8e.jsonl",
+      "sessionFile": "session:7e0ce2128e73eb6b",
       "tokensBefore": 348256,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -580,7 +580,7 @@
     },
     {
       "timestamp": "2026-07-13T00:15:59.741Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code-website/2026-07-12T05-07-02-088Z_019f54b8-c148-7000-988f-04a995e51e8e.jsonl",
+      "sessionFile": "session:7e0ce2128e73eb6b",
       "tokensBefore": 360402,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -598,7 +598,7 @@
     },
     {
       "timestamp": "2026-07-12T11:10:10.349Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code-website/2026-07-12T05-07-02-088Z_019f54b8-c148-7000-988f-04a995e51e8e/60-ReviewDocsC.jsonl",
+      "sessionFile": "session:3297147d8c6fbad7",
       "tokensBefore": 341422,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -620,7 +620,7 @@
     },
     {
       "timestamp": "2026-06-23T02:49:24.022Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-glm-connector-to-replicate-zcode-91abaf9f/2026-06-22T12-47-46-159Z_019eef5f-61ef-7000-99ec-2bc0914d8fa5.jsonl",
+      "sessionFile": "session:437d7ca288bb26b7",
       "tokensBefore": 851227,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -638,7 +638,7 @@
     },
     {
       "timestamp": "2026-07-12T07:18:22.899Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code-v1.0/2026-07-12T05-46-35-945Z_019f54dc-fa29-7000-aa88-a4e5090ff157.jsonl",
+      "sessionFile": "session:2fe494be80102158",
       "tokensBefore": 366463,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -660,7 +660,7 @@
     },
     {
       "timestamp": "2026-07-12T08:40:13.164Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code-v1.0/2026-07-12T05-46-35-945Z_019f54dc-fa29-7000-aa88-a4e5090ff157.jsonl",
+      "sessionFile": "session:2fe494be80102158",
       "tokensBefore": 371454,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -682,7 +682,7 @@
     },
     {
       "timestamp": "2026-07-13T00:17:37.267Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code-v1.0/2026-07-12T05-46-35-945Z_019f54dc-fa29-7000-aa88-a4e5090ff157.jsonl",
+      "sessionFile": "session:2fe494be80102158",
       "tokensBefore": 501057,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -700,7 +700,7 @@
     },
     {
       "timestamp": "2026-07-12T10:12:40.636Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code-v1.0/2026-07-12T05-46-35-945Z_019f54dc-fa29-7000-aa88-a4e5090ff157/25-G002ArchRecheck.jsonl",
+      "sessionFile": "session:4f6cba3be39d9272",
       "tokensBefore": 364468,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -722,7 +722,7 @@
     },
     {
       "timestamp": "2026-07-15T06:20:09.916Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-faet-codex-preset-amendments-2710e590/2026-07-13T08-25-29-961Z_019f5a94-d069-7000-a314-067fac5c5834.jsonl",
+      "sessionFile": "session:6cbb93982b7f7880",
       "tokensBefore": 340516,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -744,7 +744,7 @@
     },
     {
       "timestamp": "2026-07-13T13:34:54.997Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-faet-codex-preset-amendments-2710e590/2026-07-13T08-25-29-961Z_019f5a94-d069-7000-a314-067fac5c5834/10-PresetBenchmarkPlanner.jsonl",
+      "sessionFile": "session:6c70606cc20f1e0b",
       "tokensBefore": 353133,
       "model": "layofflabs/gpt-5.6-terra",
       "provider": "layofflabs",
@@ -762,7 +762,7 @@
     },
     {
       "timestamp": "2026-06-25T13:55:33.160Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-daemon-extensability-288f9695/2026-06-25T01-43-55-650Z_019efc72-b202-7000-9b82-c4dea60e4aee.jsonl",
+      "sessionFile": "session:b781842485651afb",
       "tokensBefore": 887324,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -780,7 +780,7 @@
     },
     {
       "timestamp": "2026-07-12T09:08:34.708Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-claudecode/2026-07-12T05-02-40-632Z_019f54b4-c3f8-7000-a6e8-dfe5427eaf62.jsonl",
+      "sessionFile": "session:8ea17f60a0b8dd2e",
       "tokensBefore": 366861,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -802,7 +802,7 @@
     },
     {
       "timestamp": "2026-07-12T10:26:39.637Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-claudecode/2026-07-12T05-02-40-632Z_019f54b4-c3f8-7000-a6e8-dfe5427eaf62.jsonl",
+      "sessionFile": "session:8ea17f60a0b8dd2e",
       "tokensBefore": 345379,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -824,7 +824,7 @@
     },
     {
       "timestamp": "2026-07-12T12:07:05.829Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-claudecode/2026-07-12T05-02-40-632Z_019f54b4-c3f8-7000-a6e8-dfe5427eaf62.jsonl",
+      "sessionFile": "session:8ea17f60a0b8dd2e",
       "tokensBefore": 365279,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -850,7 +850,7 @@
     },
     {
       "timestamp": "2026-07-12T10:13:06.255Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-claudecode/2026-07-12T05-02-40-632Z_019f54b4-c3f8-7000-a6e8-dfe5427eaf62/18-18-PostFixArchitect.jsonl",
+      "sessionFile": "session:31945e2743ca56b0",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -872,7 +872,7 @@
     },
     {
       "timestamp": "2026-07-12T12:57:33.773Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-claudecode/2026-07-12T05-02-40-632Z_019f54b4-c3f8-7000-a6e8-dfe5427eaf62/32-FinalCleanupStructured.jsonl",
+      "sessionFile": "session:05fb68f0779caaba",
       "tokensBefore": 331349,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -894,7 +894,7 @@
     },
     {
       "timestamp": "2026-07-04T04:46:16.723Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-gjc-gui-with-app-server-1116bf64/2026-07-03T06-47-42-689Z_019f26bb-b161-7000-8892-4da4d6051977.jsonl",
+      "sessionFile": "session:e94660037ebbdfaf",
       "tokensBefore": 1000025,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -916,7 +916,7 @@
     },
     {
       "timestamp": "2026-07-05T04:21:34.079Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-gjc-gui-with-app-server-1116bf64/2026-07-04T04-50-14-103Z_019f2b76-7fd7-7000-9d27-4c35ef3d228f.jsonl",
+      "sessionFile": "session:a42e502a413d46c9",
       "tokensBefore": 853694,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -934,7 +934,7 @@
     },
     {
       "timestamp": "2026-06-03T09:34:21.188Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 271407,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -952,7 +952,7 @@
     },
     {
       "timestamp": "2026-06-03T09:54:35.454Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 265639,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -970,7 +970,7 @@
     },
     {
       "timestamp": "2026-06-03T10:30:53.907Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 267117,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -988,7 +988,7 @@
     },
     {
       "timestamp": "2026-06-03T11:19:54.671Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 269530,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1006,7 +1006,7 @@
     },
     {
       "timestamp": "2026-06-03T11:29:59.021Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 271106,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1024,7 +1024,7 @@
     },
     {
       "timestamp": "2026-06-03T11:55:39.087Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1042,7 +1042,7 @@
     },
     {
       "timestamp": "2026-06-03T12:15:09.794Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 271328,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1060,7 +1060,7 @@
     },
     {
       "timestamp": "2026-06-03T12:28:22.175Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 264092,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1078,7 +1078,7 @@
     },
     {
       "timestamp": "2026-06-03T12:45:43.548Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 263688,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1096,7 +1096,7 @@
     },
     {
       "timestamp": "2026-06-03T13:22:24.826Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 261916,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1114,7 +1114,7 @@
     },
     {
       "timestamp": "2026-06-03T13:34:32.109Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 269261,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1132,7 +1132,7 @@
     },
     {
       "timestamp": "2026-06-03T14:32:39.711Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 266595,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1156,7 +1156,7 @@
     },
     {
       "timestamp": "2026-06-03T15:22:14.902Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 269613,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1174,7 +1174,7 @@
     },
     {
       "timestamp": "2026-06-03T15:37:39.362Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 265538,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1192,7 +1192,7 @@
     },
     {
       "timestamp": "2026-06-03T16:12:10.739Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 269387,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1216,7 +1216,7 @@
     },
     {
       "timestamp": "2026-06-03T16:46:30.813Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 271141,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1234,7 +1234,7 @@
     },
     {
       "timestamp": "2026-06-03T16:55:52.514Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 269618,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1252,7 +1252,7 @@
     },
     {
       "timestamp": "2026-06-03T17:38:34.279Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 269541,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1274,7 +1274,7 @@
     },
     {
       "timestamp": "2026-06-03T18:27:47.427Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 270916,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1296,7 +1296,7 @@
     },
     {
       "timestamp": "2026-06-03T19:33:43.914Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 269365,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1318,7 +1318,7 @@
     },
     {
       "timestamp": "2026-06-04T03:08:45.686Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 268789,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1336,7 +1336,7 @@
     },
     {
       "timestamp": "2026-06-04T03:13:45.381Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 268174,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1354,7 +1354,7 @@
     },
     {
       "timestamp": "2026-06-04T04:34:42.527Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 267620,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1378,7 +1378,7 @@
     },
     {
       "timestamp": "2026-06-04T05:10:50.114Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 257837,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1396,7 +1396,7 @@
     },
     {
       "timestamp": "2026-06-04T05:53:17.390Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1414,7 +1414,7 @@
     },
     {
       "timestamp": "2026-06-04T06:26:34.169Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 269758,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1432,7 +1432,7 @@
     },
     {
       "timestamp": "2026-06-04T07:10:27.314Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 266846,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1454,7 +1454,7 @@
     },
     {
       "timestamp": "2026-06-04T08:15:10.521Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 259168,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1476,7 +1476,7 @@
     },
     {
       "timestamp": "2026-06-04T09:06:02.823Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 270809,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1494,7 +1494,7 @@
     },
     {
       "timestamp": "2026-06-04T09:12:39.099Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 271101,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1512,7 +1512,7 @@
     },
     {
       "timestamp": "2026-06-04T14:09:17.557Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1536,7 +1536,7 @@
     },
     {
       "timestamp": "2026-06-04T16:34:09.024Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 354923,
       "model": "layofflabs/mimo-v2.5-pro",
       "provider": "layofflabs",
@@ -1554,7 +1554,7 @@
     },
     {
       "timestamp": "2026-06-04T20:24:38.447Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 479460,
       "model": "layofflabs/mimo-v2.5-pro",
       "provider": "layofflabs",
@@ -1572,7 +1572,7 @@
     },
     {
       "timestamp": "2026-06-04T21:07:38.382Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 630350,
       "model": "layofflabs/mimo-v2.5-pro",
       "provider": "layofflabs",
@@ -1590,7 +1590,7 @@
     },
     {
       "timestamp": "2026-06-05T00:49:41.708Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-claw-code/2026-06-03T08-54-27-626Z_019e8cb0-f42a-7000-b534-87ca10ce98ba.jsonl",
+      "sessionFile": "session:278a3b59889a24cf",
       "tokensBefore": 342960,
       "model": "layofflabs/mimo-v2.5-pro",
       "provider": "layofflabs",
@@ -1608,7 +1608,7 @@
     },
     {
       "timestamp": "2026-05-30T09:27:48.267Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-codex.gajae-code-worktrees-fix-state-model-session-id-hud-duplication-df196c1c/2026-05-30T07-58-43-550Z_019e77e4-7d5e-7000-b7c4-5292e7a2ed1d.jsonl",
+      "sessionFile": "session:b132994d4ceb038c",
       "tokensBefore": 269267,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1626,7 +1626,7 @@
     },
     {
       "timestamp": "2026-05-30T09:33:08.747Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-codex.gajae-code-worktrees-fix-state-model-session-id-hud-duplication-df196c1c/2026-05-30T07-58-43-550Z_019e77e4-7d5e-7000-b7c4-5292e7a2ed1d.jsonl",
+      "sessionFile": "session:b132994d4ceb038c",
       "tokensBefore": 265127,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1644,7 +1644,7 @@
     },
     {
       "timestamp": "2026-05-30T10:06:15.903Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-codex.gajae-code-worktrees-fix-state-model-session-id-hud-duplication-df196c1c/2026-05-30T07-58-43-550Z_019e77e4-7d5e-7000-b7c4-5292e7a2ed1d.jsonl",
+      "sessionFile": "session:b132994d4ceb038c",
       "tokensBefore": 271537,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -1662,7 +1662,7 @@
     },
     {
       "timestamp": "2026-06-14T05:31:44.654Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae/2026-06-13T02-07-18-076Z_019ebebb-c83c-7000-ba13-729ae571a037.jsonl",
+      "sessionFile": "session:c0fc91267d519cdf",
       "tokensBefore": 868331,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1680,7 +1680,7 @@
     },
     {
       "timestamp": "2026-07-11T07:59:08.982Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GPT-NSFW-MAKER/2026-07-11T06-11-18-052Z_019f4fcd-3ba4-7000-b430-8d2d557a1dc2.jsonl",
+      "sessionFile": "session:8311b1261c49e287",
       "tokensBefore": 248684,
       "model": "glm-zcode/glm-5.2",
       "provider": "glm-zcode",
@@ -1698,7 +1698,7 @@
     },
     {
       "timestamp": "2026-07-11T10:25:29.313Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GPT-NSFW-MAKER/2026-07-11T06-11-18-052Z_019f4fcd-3ba4-7000-b430-8d2d557a1dc2.jsonl",
+      "sessionFile": "session:8311b1261c49e287",
       "tokensBefore": 344616,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1722,7 +1722,7 @@
     },
     {
       "timestamp": "2026-07-11T10:27:23.786Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GPT-NSFW-MAKER/2026-07-11T06-11-18-052Z_019f4fcd-3ba4-7000-b430-8d2d557a1dc2.jsonl",
+      "sessionFile": "session:8311b1261c49e287",
       "tokensBefore": 344616,
       "model": "layofflabs/MiniMax-M3",
       "provider": "layofflabs",
@@ -1744,7 +1744,7 @@
     },
     {
       "timestamp": "2026-07-11T12:44:46.141Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GPT-NSFW-MAKER/2026-07-11T06-11-18-052Z_019f4fcd-3ba4-7000-b430-8d2d557a1dc2.jsonl",
+      "sessionFile": "session:8311b1261c49e287",
       "tokensBefore": 268516,
       "model": "qwen3-6-local/qwen3.6-35b-a3b-uncensored",
       "provider": "qwen3-6-local",
@@ -1766,7 +1766,7 @@
     },
     {
       "timestamp": "2026-07-10T02:14:29.567Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GPT-NSFW-MAKER/2026-07-09T15-25-28-332Z_019f477b-df8c-7000-abf9-63c5ce2efb0f.jsonl",
+      "sessionFile": "session:0def73059d126f2d",
       "tokensBefore": 258044,
       "model": "localproxy/qwen3.6-35b-a3b-uncensored",
       "provider": "localproxy",
@@ -1784,7 +1784,7 @@
     },
     {
       "timestamp": "2026-06-30T11:38:16.090Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 862770,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1806,7 +1806,7 @@
     },
     {
       "timestamp": "2026-06-30T15:49:50.970Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 865539,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1824,7 +1824,7 @@
     },
     {
       "timestamp": "2026-06-30T19:46:01.998Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 871417,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1842,7 +1842,7 @@
     },
     {
       "timestamp": "2026-07-01T01:02:44.448Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 852284,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1860,7 +1860,7 @@
     },
     {
       "timestamp": "2026-07-01T04:45:46.575Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 874676,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1878,7 +1878,7 @@
     },
     {
       "timestamp": "2026-07-01T08:47:52.839Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 860231,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1896,7 +1896,7 @@
     },
     {
       "timestamp": "2026-07-02T04:58:32.321Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 859287,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1914,7 +1914,7 @@
     },
     {
       "timestamp": "2026-07-02T13:02:16.122Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 858241,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -1932,7 +1932,7 @@
     },
     {
       "timestamp": "2026-07-02T17:27:08.462Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 857095,
       "model": "layofflabs-anthropic/claude-fable-5",
       "provider": "layofflabs-anthropic",
@@ -1950,7 +1950,7 @@
     },
     {
       "timestamp": "2026-07-02T21:56:04.112Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 854854,
       "model": "layofflabs-anthropic/claude-fable-5",
       "provider": "layofflabs-anthropic",
@@ -1968,7 +1968,7 @@
     },
     {
       "timestamp": "2026-07-03T04:10:46.000Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 857246,
       "model": "layofflabs-anthropic/claude-fable-5",
       "provider": "layofflabs-anthropic",
@@ -1986,7 +1986,7 @@
     },
     {
       "timestamp": "2026-07-04T06:13:24.027Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 860838,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2004,7 +2004,7 @@
     },
     {
       "timestamp": "2026-07-04T10:56:17.063Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 853506,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2022,7 +2022,7 @@
     },
     {
       "timestamp": "2026-07-04T21:40:44.157Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 864388,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2040,7 +2040,7 @@
     },
     {
       "timestamp": "2026-07-05T04:39:32.690Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 860397,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2058,7 +2058,7 @@
     },
     {
       "timestamp": "2026-07-05T11:51:34.075Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 861183,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2076,7 +2076,7 @@
     },
     {
       "timestamp": "2026-07-05T17:42:52.929Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 856203,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2094,7 +2094,7 @@
     },
     {
       "timestamp": "2026-07-05T22:12:38.973Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 853978,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2112,7 +2112,7 @@
     },
     {
       "timestamp": "2026-07-06T00:31:50.817Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-coding-agent-as-rust-binary-86195a6d/2026-06-30T02-37-33-710Z_019f1663-988e-7000-8d52-8533c3c6ffe4.jsonl",
+      "sessionFile": "session:577546f64279664b",
       "tokensBefore": 235996,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2142,7 +2142,7 @@
     },
     {
       "timestamp": "2026-06-16T00:34:49.678Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-telegram-remote-56fafb4d/2026-06-15T10-12-07-300Z_019ecac4-5e04-7000-8409-4b6a68ac9e25.jsonl",
+      "sessionFile": "session:8e77dd71576a57fd",
       "tokensBefore": 883683,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2160,7 +2160,7 @@
     },
     {
       "timestamp": "2026-06-16T18:52:07.411Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-telegram-remote-56fafb4d/2026-06-15T10-12-07-300Z_019ecac4-5e04-7000-8409-4b6a68ac9e25.jsonl",
+      "sessionFile": "session:8e77dd71576a57fd",
       "tokensBefore": 905898,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2182,7 +2182,7 @@
     },
     {
       "timestamp": "2026-06-17T04:56:18.573Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-telegram-remote-56fafb4d/2026-06-15T10-12-07-300Z_019ecac4-5e04-7000-8409-4b6a68ac9e25.jsonl",
+      "sessionFile": "session:8e77dd71576a57fd",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2204,7 +2204,7 @@
     },
     {
       "timestamp": "2026-06-17T06:18:32.967Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-telegram-remote-56fafb4d/2026-06-15T10-12-07-300Z_019ecac4-5e04-7000-8409-4b6a68ac9e25.jsonl",
+      "sessionFile": "session:8e77dd71576a57fd",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2226,7 +2226,7 @@
     },
     {
       "timestamp": "2026-06-17T07:13:43.691Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-telegram-remote-56fafb4d/2026-06-15T10-12-07-300Z_019ecac4-5e04-7000-8409-4b6a68ac9e25.jsonl",
+      "sessionFile": "session:8e77dd71576a57fd",
       "tokensBefore": 266379,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2248,7 +2248,7 @@
     },
     {
       "timestamp": "2026-06-20T07:08:09.864Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-notifications-sdk-c26274f7/2026-06-19T00-21-57-345Z_019edd41-7de1-7000-8ed1-29b7302eee8a.jsonl",
+      "sessionFile": "session:5d20da9d4eb25f23",
       "tokensBefore": 851796,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2266,7 +2266,7 @@
     },
     {
       "timestamp": "2026-07-16T07:48:36.711Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-tradfi-decay-arb/2026-07-15T02-16-38-947Z_019f638f-d723-7000-8d71-f961e0aaba63.jsonl",
+      "sessionFile": "session:e0e09045675407ed",
       "tokensBefore": 907055,
       "model": "layofflabs-anthropic/claude-fable-5",
       "provider": "layofflabs-anthropic",
@@ -2284,7 +2284,7 @@
     },
     {
       "timestamp": "2026-06-01T15:19:32.905Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-ultragoal-goal-tool-wiring-867db440/2026-06-01T06-52-29-464Z_019e81f4-9198-7000-842d-d353f3b221b6.jsonl",
+      "sessionFile": "session:d6dfa0ebc6218a01",
       "tokensBefore": 356926,
       "model": "layofflabs/claude-opus-4-7",
       "provider": "layofflabs",
@@ -2302,7 +2302,7 @@
     },
     {
       "timestamp": "2026-06-29T07:37:49.620Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-freerouter/2026-06-28T12-25-06-850Z_019f0e30-cc22-7000-af67-fafc0f6dc654.jsonl",
+      "sessionFile": "session:5f19e9f4fa615b12",
       "tokensBefore": 867027,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2320,7 +2320,7 @@
     },
     {
       "timestamp": "2026-06-03T11:02:53.772Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-subagent-pause-resume-372a400a/2026-06-03T02-20-25-065Z_019e8b48-3269-7000-9a1f-d00cae45638a.jsonl",
+      "sessionFile": "session:61e7eba79308ef5e",
       "tokensBefore": 271543,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2338,7 +2338,7 @@
     },
     {
       "timestamp": "2026-06-03T11:39:28.677Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-subagent-pause-resume-372a400a/2026-06-03T02-20-25-065Z_019e8b48-3269-7000-9a1f-d00cae45638a.jsonl",
+      "sessionFile": "session:61e7eba79308ef5e",
       "tokensBefore": 271543,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2356,7 +2356,7 @@
     },
     {
       "timestamp": "2026-06-15T16:08:49.549Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-long-running-session-freeze-die-bb5d37b8/2026-06-15T05-17-46-003Z_019ec9b6-e093-7000-afba-1ae3b313e9b8.jsonl",
+      "sessionFile": "session:24cec769479aaf3a",
       "tokensBefore": 899227,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2374,7 +2374,7 @@
     },
     {
       "timestamp": "2026-06-15T05:42:50.916Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-long-running-session-freeze-die-bb5d37b8/2026-06-15T05-17-46-003Z_019ec9b6-e093-7000-afba-1ae3b313e9b8/1-TimerListenerLeaks.jsonl",
+      "sessionFile": "session:965c660f597670bd",
       "tokensBefore": 270875,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2396,7 +2396,7 @@
     },
     {
       "timestamp": "2026-06-15T05:33:28.935Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-long-running-session-freeze-die-bb5d37b8/2026-06-15T05-17-46-003Z_019ec9b6-e093-7000-afba-1ae3b313e9b8/2-NativeFFISyncBlocking.jsonl",
+      "sessionFile": "session:b169024cb975ffef",
       "tokensBefore": 270624,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2418,7 +2418,7 @@
     },
     {
       "timestamp": "2026-06-03T09:41:07.082Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-xai-oauth-login-a3535720/2026-06-03T08-53-05-345Z_019e8caf-b2c1-7000-857e-69cd51acba68.jsonl",
+      "sessionFile": "session:8c4cf83b957ecce4",
       "tokensBefore": 255814,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2436,7 +2436,7 @@
     },
     {
       "timestamp": "2026-06-03T09:52:23.735Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-xai-oauth-login-a3535720/2026-06-03T08-53-05-345Z_019e8caf-b2c1-7000-857e-69cd51acba68.jsonl",
+      "sessionFile": "session:8c4cf83b957ecce4",
       "tokensBefore": 270741,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2454,7 +2454,7 @@
     },
     {
       "timestamp": "2026-06-24T04:17:32.970Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-session-creation-through-notification-sdk-fa2cf12e/2026-06-23T02-11-11-937Z_019ef23e-f1c1-7000-b96b-8f8bd0ffeb04.jsonl",
+      "sessionFile": "session:46656cf3ba3a30af",
       "tokensBefore": 882358,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2472,7 +2472,7 @@
     },
     {
       "timestamp": "2026-06-04T04:25:17.464Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.omx-worktrees-launch-research-autoreserach-token-leaks/2026-06-03T02-26-00-591Z_019e8b4d-510f-7000-a118-eb446e5e99e4.jsonl",
+      "sessionFile": "session:ead19e08af8aff29",
       "tokensBefore": 260167,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2494,7 +2494,7 @@
     },
     {
       "timestamp": "2026-06-04T05:11:06.639Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.omx-worktrees-launch-research-autoreserach-token-leaks/2026-06-03T02-26-00-591Z_019e8b4d-510f-7000-a118-eb446e5e99e4/18-PR1Inventory.jsonl",
+      "sessionFile": "session:233e59b5b4404656",
       "tokensBefore": 267810,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2516,7 +2516,7 @@
     },
     {
       "timestamp": "2026-07-11T01:42:44.293Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant.gajae-code-worktrees-feat-new-manifest-lazytick-binance-3851e842/2026-07-10T10-21-35-439Z_019f4b8c-054f-7000-87fc-6d4dcc3f12ce.jsonl",
+      "sessionFile": "session:768ac09a5b0676e7",
       "tokensBefore": 486821,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -2540,7 +2540,7 @@
     },
     {
       "timestamp": "2026-07-11T17:21:01.879Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant.gajae-code-worktrees-feat-new-manifest-lazytick-binance-3851e842/2026-07-10T10-21-35-439Z_019f4b8c-054f-7000-87fc-6d4dcc3f12ce.jsonl",
+      "sessionFile": "session:768ac09a5b0676e7",
       "tokensBefore": 867648,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2558,7 +2558,7 @@
     },
     {
       "timestamp": "2026-07-14T07:17:15.050Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant.gajae-code-worktrees-feat-new-manifest-lazytick-binance-3851e842/2026-07-10T10-21-35-439Z_019f4b8c-054f-7000-87fc-6d4dcc3f12ce.jsonl",
+      "sessionFile": "session:768ac09a5b0676e7",
       "tokensBefore": 892528,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2576,7 +2576,7 @@
     },
     {
       "timestamp": "2026-07-14T01:02:45.456Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant.gajae-code-worktrees-feat-new-manifest-lazytick-binance-3851e842/2026-07-10T10-21-35-439Z_019f4b8c-054f-7000-87fc-6d4dcc3f12ce/192-G004GateConfirm2.jsonl",
+      "sessionFile": "session:d928ce0c21fa678b",
       "tokensBefore": 368258,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -2598,7 +2598,7 @@
     },
     {
       "timestamp": "2026-07-12T13:47:42.772Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant.gajae-code-worktrees-feat-new-manifest-lazytick-binance-3851e842/2026-07-10T10-21-35-439Z_019f4b8c-054f-7000-87fc-6d4dcc3f12ce/161-G001Cleaner2.jsonl",
+      "sessionFile": "session:e0ad7ffbeeb3bc28",
       "tokensBefore": 368378,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -2620,7 +2620,7 @@
     },
     {
       "timestamp": "2026-05-30T09:22:50.247Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae.gajae-code-worktrees-feat-gajae-claw-pilot-fc60a4ef/2026-05-30T03-36-11-616Z_019e76f4-2260-7000-86fc-ed426a45b8cc.jsonl",
+      "sessionFile": "session:c24653eac287c64c",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2642,7 +2642,7 @@
     },
     {
       "timestamp": "2026-06-03T09:46:47.052Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-openclaw-hermes-etc-bridge-317c57b6/2026-06-03T08-45-21-532Z_019e8ca8-9efc-7000-8c76-3a34ec144fe1.jsonl",
+      "sessionFile": "session:a84357b6a862dede",
       "tokensBefore": 268964,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2664,7 +2664,7 @@
     },
     {
       "timestamp": "2026-06-25T06:57:22.820Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-plugin-bundle-architecture-64ec39e7/2026-06-25T01-20-48-312Z_019efc5d-86b8-7000-aeeb-5703cee50981.jsonl",
+      "sessionFile": "session:36ec3d719d6fa014",
       "tokensBefore": 856390,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2682,7 +2682,7 @@
     },
     {
       "timestamp": "2026-06-26T09:09:35.887Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-plugin-bundle-architecture-64ec39e7/2026-06-25T01-20-48-312Z_019efc5d-86b8-7000-aeeb-5703cee50981.jsonl",
+      "sessionFile": "session:36ec3d719d6fa014",
       "tokensBefore": 260296,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2704,7 +2704,7 @@
     },
     {
       "timestamp": "2026-06-17T04:08:21.921Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-opt-in-rlm-mode-f06dd435/2026-06-17T02-51-19-760Z_019ed37d-8750-7000-bba8-ed815923648e.jsonl",
+      "sessionFile": "session:6796acd9d8a687ac",
       "tokensBefore": 269856,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2726,7 +2726,7 @@
     },
     {
       "timestamp": "2026-06-17T05:23:21.875Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-opt-in-rlm-mode-f06dd435/2026-06-17T02-51-19-760Z_019ed37d-8750-7000-bba8-ed815923648e.jsonl",
+      "sessionFile": "session:6796acd9d8a687ac",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2748,7 +2748,7 @@
     },
     {
       "timestamp": "2026-06-17T06:04:19.410Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-opt-in-rlm-mode-f06dd435/2026-06-17T02-51-19-760Z_019ed37d-8750-7000-bba8-ed815923648e.jsonl",
+      "sessionFile": "session:6796acd9d8a687ac",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2770,7 +2770,7 @@
     },
     {
       "timestamp": "2026-06-17T07:15:50.214Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-opt-in-rlm-mode-f06dd435/2026-06-17T02-51-19-760Z_019ed37d-8750-7000-bba8-ed815923648e.jsonl",
+      "sessionFile": "session:6796acd9d8a687ac",
       "tokensBefore": 267424,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2792,7 +2792,7 @@
     },
     {
       "timestamp": "2026-06-17T07:50:04.624Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-opt-in-rlm-mode-f06dd435/2026-06-17T02-51-19-760Z_019ed37d-8750-7000-bba8-ed815923648e.jsonl",
+      "sessionFile": "session:6796acd9d8a687ac",
       "tokensBefore": 260068,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2814,7 +2814,7 @@
     },
     {
       "timestamp": "2026-06-17T08:44:35.965Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-opt-in-rlm-mode-f06dd435/2026-06-17T02-51-19-760Z_019ed37d-8750-7000-bba8-ed815923648e.jsonl",
+      "sessionFile": "session:6796acd9d8a687ac",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -2836,7 +2836,7 @@
     },
     {
       "timestamp": "2026-06-22T11:48:50.742Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-notification-surface-b0b320b3/2026-06-22T04-32-34-161Z_019eed9a-0371-7000-9cc1-603da49be889.jsonl",
+      "sessionFile": "session:f3a86722cc2d2556",
       "tokensBefore": 886315,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2854,7 +2854,7 @@
     },
     {
       "timestamp": "2026-06-01T09:57:23.283Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-ask-tool-visualization-1edb3609/2026-06-01T07-06-54-881Z_019e8201-c621-7000-b684-42e043a87f1b.jsonl",
+      "sessionFile": "session:8e10f1c09caff941",
       "tokensBefore": 355532,
       "model": "layofflabs/claude-opus-4-7",
       "provider": "layofflabs",
@@ -2872,7 +2872,7 @@
     },
     {
       "timestamp": "2026-06-01T10:19:06.833Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-ask-tool-visualization-1edb3609/2026-06-01T07-06-54-881Z_019e8201-c621-7000-b684-42e043a87f1b.jsonl",
+      "sessionFile": "session:8e10f1c09caff941",
       "tokensBefore": 398815,
       "model": "layofflabs/claude-opus-4-7",
       "provider": "layofflabs",
@@ -2890,7 +2890,7 @@
     },
     {
       "timestamp": "2026-07-11T02:27:13.691Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant.gajae-code-worktrees-audit-remediation/2026-07-10T01-30-58-241Z_019f49a6-3941-7000-9c7c-5270003dfe2b.jsonl",
+      "sessionFile": "session:d6c1b47ab9d0ff08",
       "tokensBefore": 916868,
       "model": "layofflabs-anthropic/claude-fable-5",
       "provider": "layofflabs-anthropic",
@@ -2908,7 +2908,7 @@
     },
     {
       "timestamp": "2026-07-11T16:29:35.843Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant.gajae-code-worktrees-audit-remediation/2026-07-10T01-30-58-241Z_019f49a6-3941-7000-9c7c-5270003dfe2b/146-RebaseAudit.jsonl",
+      "sessionFile": "session:b31c84ac20155981",
       "tokensBefore": 368610,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -2930,7 +2930,7 @@
     },
     {
       "timestamp": "2026-06-07T00:51:55.208Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-agent-control-plane-epic-66da01d6/2026-06-05T04-47-58-929Z_019e961c-03d1-7000-950b-3fff3fcdeec4.jsonl",
+      "sessionFile": "session:3898c795342e5b8d",
       "tokensBefore": 935832,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2948,7 +2948,7 @@
     },
     {
       "timestamp": "2026-07-09T15:21:47.873Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-06T05-40-05-908Z_019f35f0-de94-7000-9f6b-37b1ed92c096.jsonl",
+      "sessionFile": "session:feb32ef4daad7609",
       "tokensBefore": 828277,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -2972,7 +2972,7 @@
     },
     {
       "timestamp": "2026-07-06T05:34:24.281Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-06T01-16-50-470Z_019f34ff-d9a6-7000-aeb4-8f70f8f981b8.jsonl",
+      "sessionFile": "session:6b12a1eba6de6639",
       "tokensBefore": 251199,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -3000,7 +3000,7 @@
     },
     {
       "timestamp": "2026-07-10T04:10:19.037Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 370079,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3022,7 +3022,7 @@
     },
     {
       "timestamp": "2026-07-10T10:39:54.953Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 370883,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3046,7 +3046,7 @@
     },
     {
       "timestamp": "2026-07-10T11:57:03.857Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 370334,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3068,7 +3068,7 @@
     },
     {
       "timestamp": "2026-07-10T14:30:09.461Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 370344,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3090,7 +3090,7 @@
     },
     {
       "timestamp": "2026-07-10T16:39:48.352Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 371372,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3112,7 +3112,7 @@
     },
     {
       "timestamp": "2026-07-10T17:52:55.126Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 371471,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3136,7 +3136,7 @@
     },
     {
       "timestamp": "2026-07-10T19:43:10.287Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 371033,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3158,7 +3158,7 @@
     },
     {
       "timestamp": "2026-07-10T21:01:51.526Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3182,7 +3182,7 @@
     },
     {
       "timestamp": "2026-07-10T22:26:14.915Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 371392,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3204,7 +3204,7 @@
     },
     {
       "timestamp": "2026-07-11T01:26:49.656Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331.jsonl",
+      "sessionFile": "session:949900e2fad335ae",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3226,7 +3226,7 @@
     },
     {
       "timestamp": "2026-07-10T05:53:12.537Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331/70-G001ArchitectureReview.jsonl",
+      "sessionFile": "session:e29a704b0354d247",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3248,7 +3248,7 @@
     },
     {
       "timestamp": "2026-07-10T06:12:22.646Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-GodOS/2026-07-09T23-47-05-690Z_019f4947-1f5a-7000-8824-c27e55eea331/83-G001CleanupAfterProductFreeze.jsonl",
+      "sessionFile": "session:c72b7892a04d848e",
       "tokensBefore": 360927,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3270,7 +3270,7 @@
     },
     {
       "timestamp": "2026-06-17T03:21:48.566Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-computer-use-is-not-working-048bf437/2026-06-17T02-02-21-320Z_019ed350-b108-7000-ae4f-01e952561ec4.jsonl",
+      "sessionFile": "session:d685ae26b396adef",
       "tokensBefore": 263941,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3292,7 +3292,7 @@
     },
     {
       "timestamp": "2026-06-02T01:09:30.858Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-claude-monitor-cron-tool-9d470906/2026-06-01T15-19-20-798Z_019e83c4-9bde-7000-98d0-2687253b7ca5.jsonl",
+      "sessionFile": "session:d5921a268524bee1",
       "tokensBefore": 477412,
       "model": "layofflabs/claude-opus-4-7",
       "provider": "layofflabs",
@@ -3310,7 +3310,7 @@
     },
     {
       "timestamp": "2026-06-02T01:36:21.129Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-claude-monitor-cron-tool-9d470906/2026-06-01T15-19-20-798Z_019e83c4-9bde-7000-98d0-2687253b7ca5.jsonl",
+      "sessionFile": "session:d5921a268524bee1",
       "tokensBefore": 593134,
       "model": "layofflabs/claude-opus-4-7",
       "provider": "layofflabs",
@@ -3328,7 +3328,7 @@
     },
     {
       "timestamp": "2026-06-02T02:35:26.283Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-claude-monitor-cron-tool-9d470906/2026-06-01T15-19-20-798Z_019e83c4-9bde-7000-98d0-2687253b7ca5.jsonl",
+      "sessionFile": "session:d5921a268524bee1",
       "tokensBefore": 263844,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3346,7 +3346,7 @@
     },
     {
       "timestamp": "2026-06-02T02:59:46.434Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-claude-monitor-cron-tool-9d470906/2026-06-01T15-19-20-798Z_019e83c4-9bde-7000-98d0-2687253b7ca5.jsonl",
+      "sessionFile": "session:d5921a268524bee1",
       "tokensBefore": 269473,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3364,7 +3364,7 @@
     },
     {
       "timestamp": "2026-06-02T03:54:02.911Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-claude-monitor-cron-tool-9d470906/2026-06-01T15-19-20-798Z_019e83c4-9bde-7000-98d0-2687253b7ca5.jsonl",
+      "sessionFile": "session:d5921a268524bee1",
       "tokensBefore": 262059,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3386,7 +3386,7 @@
     },
     {
       "timestamp": "2026-06-04T05:18:08.355Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-runtime-enhancements-677fc000/2026-06-04T05-04-39-016Z_019e9104-ea68-7000-b738-67a39234a480/0-PerfLeakCrashMap.jsonl",
+      "sessionFile": "session:b67cd183b7cbdfa1",
       "tokensBefore": 261178,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3408,7 +3408,7 @@
     },
     {
       "timestamp": "2026-07-06T05:51:54.261Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-ultragoal-parllelism-747d82c9/2026-07-06T04-28-29-307Z_019f35af-4efb-7000-bf39-49ba2077218b.jsonl",
+      "sessionFile": "session:41eaf88f30e5e3c3",
       "tokensBefore": 269201,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3430,7 +3430,7 @@
     },
     {
       "timestamp": "2026-07-12T08:07:56.659Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-sticky-fallback-chain-4caf1ee4/2026-07-11T02-38-14-346Z_019f4f0a-2b4a-7000-a83e-803d1d51c98b.jsonl",
+      "sessionFile": "session:5e61d87bfb8dc9dd",
       "tokensBefore": 880941,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -3448,7 +3448,7 @@
     },
     {
       "timestamp": "2026-07-11T20:49:25.092Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-sticky-fallback-chain-4caf1ee4/2026-07-11T02-38-14-346Z_019f4f0a-2b4a-7000-a83e-803d1d51c98b/112-G005-ArchitectReview.jsonl",
+      "sessionFile": "session:b3706a5964a799d0",
       "tokensBefore": 292797,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3470,7 +3470,7 @@
     },
     {
       "timestamp": "2026-06-01T01:55:24.979Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-forking-contexts-f2e337b7/2026-06-01T00-37-43-932Z_019e809d-777c-7000-9e6e-21e6916321cc.jsonl",
+      "sessionFile": "session:a81929c29096a544",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3488,7 +3488,7 @@
     },
     {
       "timestamp": "2026-06-01T02:11:39.439Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-forking-contexts-f2e337b7/2026-06-01T00-37-43-932Z_019e809d-777c-7000-9e6e-21e6916321cc.jsonl",
+      "sessionFile": "session:a81929c29096a544",
       "tokensBefore": 267158,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3506,7 +3506,7 @@
     },
     {
       "timestamp": "2026-07-05T10:41:19.383Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-vibequant-execution-simple-crypto/2026-07-03T06-06-38-646Z_019f2696-1836-7000-83e9-40e2c4405419.jsonl",
+      "sessionFile": "session:0ba7783e560a5bd0",
       "tokensBefore": 851068,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -3524,7 +3524,7 @@
     },
     {
       "timestamp": "2026-07-01T02:27:36.095Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-vibequant-execution-simple-crypto/2026-06-30T04-49-21-678Z_019f16dc-430e-7000-8ec2-994a489412ea.jsonl",
+      "sessionFile": "session:5d0b19b637a58f3e",
       "tokensBefore": 853449,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -3542,7 +3542,7 @@
     },
     {
       "timestamp": "2026-07-03T03:36:23.253Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gjc-app-server/2026-07-02T11-52-24-795Z_019f22ac-4bdb-7000-b507-aabe059dd8cf.jsonl",
+      "sessionFile": "session:f09d1821627870fd",
       "tokensBefore": 1001486,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -3564,7 +3564,7 @@
     },
     {
       "timestamp": "2026-07-03T07:04:59.517Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gjc-app-server/2026-07-02T11-52-24-795Z_019f22ac-4bdb-7000-b507-aabe059dd8cf/94-TransportConsolidationPlan.jsonl",
+      "sessionFile": "session:dd02ad13f1a75675",
       "tokensBefore": 237566,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3586,7 +3586,7 @@
     },
     {
       "timestamp": "2026-07-11T06:04:31.784Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 736384,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3610,7 +3610,7 @@
     },
     {
       "timestamp": "2026-07-11T10:24:49.834Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 371046,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3632,7 +3632,7 @@
     },
     {
       "timestamp": "2026-07-11T13:56:00.891Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 371150,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3654,7 +3654,7 @@
     },
     {
       "timestamp": "2026-07-11T17:20:52.013Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 370045,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3678,7 +3678,7 @@
     },
     {
       "timestamp": "2026-07-11T21:13:07.951Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 366536,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3700,7 +3700,7 @@
     },
     {
       "timestamp": "2026-07-12T10:20:05.951Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 491664,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3722,7 +3722,7 @@
     },
     {
       "timestamp": "2026-07-12T16:44:04.057Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3744,7 +3744,7 @@
     },
     {
       "timestamp": "2026-07-12T18:44:20.011Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 362848,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3766,7 +3766,7 @@
     },
     {
       "timestamp": "2026-07-12T21:23:24.278Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3788,7 +3788,7 @@
     },
     {
       "timestamp": "2026-07-13T02:13:59.631Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125.jsonl",
+      "sessionFile": "session:d0a48ca178e18dc3",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3810,7 +3810,7 @@
     },
     {
       "timestamp": "2026-07-12T07:06:27.146Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125/340-MergedPrRedTeamQA.jsonl",
+      "sessionFile": "session:67fcca78a6a522fb",
       "tokensBefore": 371562,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3834,7 +3834,7 @@
     },
     {
       "timestamp": "2026-07-11T17:00:46.243Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125/225-G005ApprovalArchitecture.jsonl",
+      "sessionFile": "session:0715edd213f29b8b",
       "tokensBefore": 366568,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3856,7 +3856,7 @@
     },
     {
       "timestamp": "2026-07-13T05:33:29.725Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125/420-AuthorityLifecycleRereview.jsonl",
+      "sessionFile": "session:d40a3fdbeab7d885",
       "tokensBefore": 370284,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3878,7 +3878,7 @@
     },
     {
       "timestamp": "2026-07-12T07:12:19.431Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125/339-MergedPrArchitectReview.jsonl",
+      "sessionFile": "session:44a46090ca72117d",
       "tokensBefore": 355742,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3902,7 +3902,7 @@
     },
     {
       "timestamp": "2026-07-12T13:50:47.890Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-extend-notifications-sdk-c8c40665/2026-07-10T07-28-43-975Z_019f4aed-c3c7-7000-8bf9-d4549a24d125/357-FinalHeadRedTeam.jsonl",
+      "sessionFile": "session:43a2c1eac4a65ac6",
       "tokensBefore": 359500,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3924,7 +3924,7 @@
     },
     {
       "timestamp": "2026-06-12T05:28:24.471Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-support-more-steering-kinds-4175f135/2026-06-12T02-57-03-571Z_019eb9c2-fa53-7000-b721-81528960b9e9.jsonl",
+      "sessionFile": "session:03622945c9affa82",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -3948,7 +3948,7 @@
     },
     {
       "timestamp": "2026-06-30T12:43:54.809Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-git-daemon-53f11ce6/2026-06-30T02-43-37-743Z_019f1669-268f-7000-a2fc-2dbc00caa547.jsonl",
+      "sessionFile": "session:b44e7bf32b3afcea",
       "tokensBefore": 864125,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -3966,7 +3966,7 @@
     },
     {
       "timestamp": "2026-07-11T01:42:52.073Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-fix-arch-review-2026-07/2026-07-10T02-32-22-315Z_019f49de-702b-7000-a046-8084bb6b8f77.jsonl",
+      "sessionFile": "session:3f45a5067ca23c22",
       "tokensBefore": 619679,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -3990,7 +3990,7 @@
     },
     {
       "timestamp": "2026-07-11T21:56:34.101Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-fix-arch-review-2026-07/2026-07-10T02-32-22-315Z_019f49de-702b-7000-a046-8084bb6b8f77.jsonl",
+      "sessionFile": "session:3f45a5067ca23c22",
       "tokensBefore": 999697,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -4012,7 +4012,7 @@
     },
     {
       "timestamp": "2026-07-12T06:01:30.002Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-fix-arch-review-2026-07/2026-07-10T02-32-22-315Z_019f49de-702b-7000-a046-8084bb6b8f77/244-G020Review.jsonl",
+      "sessionFile": "session:f947b13c95fb0521",
       "tokensBefore": 369403,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -4034,7 +4034,7 @@
     },
     {
       "timestamp": "2026-07-12T06:50:42.478Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-fix-arch-review-2026-07/2026-07-10T02-32-22-315Z_019f49de-702b-7000-a046-8084bb6b8f77/248-G021Triage.jsonl",
+      "sessionFile": "session:d8ba97a7d6118dc6",
       "tokensBefore": 370331,
       "model": "layofflabs/gpt-5.6-terra",
       "provider": "layofflabs",
@@ -4056,7 +4056,7 @@
     },
     {
       "timestamp": "2026-06-01T03:56:12.145Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-skill-chaining-be58cdfd/2026-06-01T02-10-54-212Z_019e80f2-c484-7000-8d51-a4d4e3500b34.jsonl",
+      "sessionFile": "session:b8a20695fca82362",
       "tokensBefore": 453721,
       "model": "layofflabs/claude-opus-4-7",
       "provider": "layofflabs",
@@ -4074,7 +4074,7 @@
     },
     {
       "timestamp": "2026-06-01T04:03:37.394Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-skill-chaining-be58cdfd/2026-06-01T02-10-54-212Z_019e80f2-c484-7000-8d51-a4d4e3500b34.jsonl",
+      "sessionFile": "session:b8a20695fca82362",
       "tokensBefore": 486003,
       "model": "layofflabs/claude-opus-4-7",
       "provider": "layofflabs",
@@ -4092,7 +4092,7 @@
     },
     {
       "timestamp": "2026-06-03T10:46:22.937Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae.gajae-code-worktrees-feat-openclaw-hermes-hooks-b2bcc5e4/2026-06-02T14-37-47-564Z_019e88c4-ecac-7000-9411-21a9221bc099.jsonl",
+      "sessionFile": "session:ff606e838896cd9b",
       "tokensBefore": 598782,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4130,7 +4130,7 @@
     },
     {
       "timestamp": "2026-06-03T10:48:41.565Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-steer-interrupt-continue-6abcb4c3/2026-06-02T14-24-16-016Z_019e88b8-8a90-7000-a7d9-d76696466e08.jsonl",
+      "sessionFile": "session:18e9a198ba869449",
       "tokensBefore": 270125,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4152,7 +4152,7 @@
     },
     {
       "timestamp": "2026-06-02T03:31:19.465Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-theme-section-froze-8d47cceb/2026-06-02T00-47-21-389Z_019e85cc-a32d-7000-834d-335a924b6ed5.jsonl",
+      "sessionFile": "session:cfc1f45821e7ee7f",
       "tokensBefore": 270012,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4170,7 +4170,7 @@
     },
     {
       "timestamp": "2026-05-30T03:17:47.136Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-remove-token-budget-terminology-5a107bd6/2026-05-29T09-36-20-864Z_019e7317-8180-7000-b67f-17272ae2bc34.jsonl",
+      "sessionFile": "session:d441ebad836c1f64",
       "tokensBefore": 269320,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4188,7 +4188,7 @@
     },
     {
       "timestamp": "2026-06-18T06:20:07.278Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-18T06-14-53-029Z_019ed95e-3f65-7000-a928-cd8461bd6543.jsonl",
+      "sessionFile": "session:f2abc5a9e08dd20b",
       "tokensBefore": 95983,
       "model": "layofflabs-anthropic/claude-opus-4-8",
       "provider": "layofflabs-anthropic",
@@ -4210,7 +4210,7 @@
     },
     {
       "timestamp": "2026-07-16T14:00:04.463Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-16T04-25-00-737Z_019f692b-b841-7000-8544-ee73a4154c75.jsonl",
+      "sessionFile": "session:765f0cf501704af9",
       "tokensBefore": 483883,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -4238,7 +4238,7 @@
     },
     {
       "timestamp": "2026-07-17T14:56:05.265Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-16T04-25-00-737Z_019f692b-b841-7000-8544-ee73a4154c75.jsonl",
+      "sessionFile": "session:765f0cf501704af9",
       "tokensBefore": 852062,
       "model": "layofflabs-anthropic/claude-fable-5",
       "provider": "layofflabs-anthropic",
@@ -4256,7 +4256,7 @@
     },
     {
       "timestamp": "2026-06-16T03:45:53.884Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-16T01-31-16-924Z_019ece0d-e23c-7000-ae3f-6f13f726caea.jsonl",
+      "sessionFile": "session:2dcb1db5628864c6",
       "tokensBefore": 263931,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4278,7 +4278,7 @@
     },
     {
       "timestamp": "2026-06-16T05:04:49.047Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-16T01-31-16-924Z_019ece0d-e23c-7000-ae3f-6f13f726caea.jsonl",
+      "sessionFile": "session:2dcb1db5628864c6",
       "tokensBefore": 268466,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4300,7 +4300,7 @@
     },
     {
       "timestamp": "2026-07-09T10:01:58.849Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-09T08-16-12-795Z_019f45f2-dffb-7000-bd57-3beb223088da.jsonl",
+      "sessionFile": "session:1f8d40b0990659cc",
       "tokensBefore": 269092,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4322,7 +4322,7 @@
     },
     {
       "timestamp": "2026-07-09T06:55:58.341Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-09T04-07-25-275Z_019f450f-195b-7000-8bee-7584454d597a.jsonl",
+      "sessionFile": "session:d83ecd600c797018",
       "tokensBefore": 268388,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4344,7 +4344,7 @@
     },
     {
       "timestamp": "2026-07-09T09:26:35.442Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-09T04-07-25-275Z_019f450f-195b-7000-8bee-7584454d597a.jsonl",
+      "sessionFile": "session:d83ecd600c797018",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4366,7 +4366,7 @@
     },
     {
       "timestamp": "2026-06-13T01:26:09.374Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-13T00-22-15-928Z_019ebe5b-9e78-7000-af93-352e2ac8e377.jsonl",
+      "sessionFile": "session:aa1c86854f72e4a7",
       "tokensBefore": 258183,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4384,7 +4384,7 @@
     },
     {
       "timestamp": "2026-06-13T01:56:48.357Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-13T00-22-15-928Z_019ebe5b-9e78-7000-af93-352e2ac8e377.jsonl",
+      "sessionFile": "session:aa1c86854f72e4a7",
       "tokensBefore": 261500,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4402,7 +4402,7 @@
     },
     {
       "timestamp": "2026-06-13T02:07:51.491Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-13T00-22-15-928Z_019ebe5b-9e78-7000-af93-352e2ac8e377.jsonl",
+      "sessionFile": "session:aa1c86854f72e4a7",
       "tokensBefore": 268406,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4420,7 +4420,7 @@
     },
     {
       "timestamp": "2026-06-12T04:02:52.423Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-12T02-44-30-299Z_019eb9b7-7bdb-7000-a2d5-76778c166512.jsonl",
+      "sessionFile": "session:8eea3e33885eca41",
       "tokensBefore": 266397,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4444,7 +4444,7 @@
     },
     {
       "timestamp": "2026-06-02T17:28:37.773Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-02T15-25-23-504Z_019e88f0-80b0-7000-a286-321ce7b7e04e.jsonl",
+      "sessionFile": "session:3e5cc29557b29016",
       "tokensBefore": 271141,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4462,7 +4462,7 @@
     },
     {
       "timestamp": "2026-06-02T18:08:40.714Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-02T15-25-23-504Z_019e88f0-80b0-7000-a286-321ce7b7e04e.jsonl",
+      "sessionFile": "session:3e5cc29557b29016",
       "tokensBefore": 268398,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4480,7 +4480,7 @@
     },
     {
       "timestamp": "2026-06-01T07:27:02.804Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-01T04-44-53-738Z_019e817f-c06a-7000-beba-4cfdbda1cd51.jsonl",
+      "sessionFile": "session:94b77dd6e9a2ad51",
       "tokensBefore": 441306,
       "model": "layofflabs/claude-opus-4-7",
       "provider": "layofflabs",
@@ -4498,7 +4498,7 @@
     },
     {
       "timestamp": "2026-06-01T22:22:20.671Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-01T15-05-30-722Z_019e83b7-f162-7000-9645-6ad6aa86e24b.jsonl",
+      "sessionFile": "session:87250c2c607d1bfa",
       "tokensBefore": 351969,
       "model": "layofflabs/claude-opus-4-7",
       "provider": "layofflabs",
@@ -4516,7 +4516,7 @@
     },
     {
       "timestamp": "2026-07-01T02:57:33.800Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-01T02-55-51-551Z_019f1b9a-b4ff-7000-88dd-f2abbc88c80e.jsonl",
+      "sessionFile": "session:bcb5a4a09e967c44",
       "tokensBefore": 37533,
       "model": "localproxy/qwen3.6-35b-a3b-uncensored",
       "provider": "localproxy",
@@ -4538,7 +4538,7 @@
     },
     {
       "timestamp": "2026-07-03T03:14:13.282Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-03T02-46-53-884Z_019f25df-38bc-7000-b814-4ab3acc36e84.jsonl",
+      "sessionFile": "session:6c001e715e929f94",
       "tokensBefore": 267325,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4560,7 +4560,7 @@
     },
     {
       "timestamp": "2026-07-03T05:22:00.503Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-03T02-46-53-884Z_019f25df-38bc-7000-b814-4ab3acc36e84.jsonl",
+      "sessionFile": "session:6c001e715e929f94",
       "tokensBefore": 264617,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4582,7 +4582,7 @@
     },
     {
       "timestamp": "2026-07-01T06:33:48.420Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-01T05-39-09-780Z_019f1c30-3754-7000-b634-75d54f2dc70c/1-ArchitectPass2.jsonl",
+      "sessionFile": "session:9fb43c08162d975b",
       "tokensBefore": 267887,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4604,7 +4604,7 @@
     },
     {
       "timestamp": "2026-06-25T09:37:02.262Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-25T08-56-31-118Z_019efdfe-be8e-7000-aa6a-512c6ca4587a/0-ChangelogAccuracy.jsonl",
+      "sessionFile": "session:0a06655771cefb0c",
       "tokensBefore": 262892,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4626,7 +4626,7 @@
     },
     {
       "timestamp": "2026-06-04T16:20:58.126Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-04T15-42-31-774Z_019e934c-e95e-7000-a4cd-c89648f04f2b/2-TaskSubagent.jsonl",
+      "sessionFile": "session:b3f2629d2528c074",
       "tokensBefore": 270699,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4648,7 +4648,7 @@
     },
     {
       "timestamp": "2026-07-14T00:53:00.885Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-14T00-19-35-724Z_019f5dfe-50ac-7000-af6b-bff8d6db6ad1/0-ReleaseBlockerPlanner.jsonl",
+      "sessionFile": "session:43f55c2875f45cfc",
       "tokensBefore": 345227,
       "model": "layofflabs/gpt-5.6-terra",
       "provider": "layofflabs",
@@ -4670,7 +4670,7 @@
     },
     {
       "timestamp": "2026-07-13T03:07:57.063Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-13T02-21-58-931Z_019f5948-0113-7000-8b01-734bbbf0b8e8/0-G001ArchitectReview.jsonl",
+      "sessionFile": "session:e51c08b33167d8d4",
       "tokensBefore": 364662,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -4692,7 +4692,7 @@
     },
     {
       "timestamp": "2026-06-13T01:19:06.462Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-06-13T00-22-15-928Z_019ebe5b-9e78-7000-af93-352e2ac8e377/0-ReleaseNotesReview.jsonl",
+      "sessionFile": "session:18d9ecd02a42822a",
       "tokensBefore": 268812,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4714,7 +4714,7 @@
     },
     {
       "timestamp": "2026-07-16T19:13:23.055Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-16T04-25-00-737Z_019f692b-b841-7000-8544-ee73a4154c75/75-ImplementPromptTrim.jsonl",
+      "sessionFile": "session:091fe391812ab55e",
       "tokensBefore": 50560,
       "model": "layofflabs/gpt-5.6-terra",
       "provider": "layofflabs",
@@ -4740,7 +4740,7 @@
     },
     {
       "timestamp": "2026-07-10T01:30:04.566Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-10T01-13-23-580Z_019f4996-217c-7000-accb-ec3e61973414/2-PackageArchRustRefactor.jsonl",
+      "sessionFile": "session:0d38a4d74487e5ef",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -4762,7 +4762,7 @@
     },
     {
       "timestamp": "2026-07-13T08:24:58.091Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-13T08-13-02-304Z_019f5a89-67e0-7000-a58b-aa9e9fe84773/0-PRPortfolioPlanner.jsonl",
+      "sessionFile": "session:94b1912626c77adb",
       "tokensBefore": 360921,
       "model": "layofflabs/gpt-5.6-terra",
       "provider": "layofflabs",
@@ -4784,7 +4784,7 @@
     },
     {
       "timestamp": "2026-07-13T09:13:23.495Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-13T08-13-02-304Z_019f5a89-67e0-7000-a58b-aa9e9fe84773/0-PRPortfolioPlanner.jsonl",
+      "sessionFile": "session:94b1912626c77adb",
       "tokensBefore": 347206,
       "model": "layofflabs/gpt-5.6-terra",
       "provider": "layofflabs",
@@ -4806,7 +4806,7 @@
     },
     {
       "timestamp": "2026-07-13T13:40:36.746Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code/2026-07-13T08-13-02-304Z_019f5a89-67e0-7000-a58b-aa9e9fe84773/0-PRPortfolioPlanner.jsonl",
+      "sessionFile": "session:94b1912626c77adb",
       "tokensBefore": 361916,
       "model": "layofflabs/gpt-5.6-terra",
       "provider": "layofflabs",
@@ -4828,7 +4828,7 @@
     },
     {
       "timestamp": "2026-06-01T16:59:56.005Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-deep-interview-auto-modes-dcf8b80a/2026-06-01T09-30-05-586Z_019e8284-db92-7000-a937-ad1f246244b5.jsonl",
+      "sessionFile": "session:363acdd55c24892b",
       "tokensBefore": 271458,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4850,7 +4850,7 @@
     },
     {
       "timestamp": "2026-07-09T23:39:03.830Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant/2026-07-09T02-19-12-673Z_019f44ac-07a1-7000-bd00-3f65c680b6d4.jsonl",
+      "sessionFile": "session:0d8761f0019fd68b",
       "tokensBefore": 539792,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -4868,7 +4868,7 @@
     },
     {
       "timestamp": "2026-07-13T06:09:21.157Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant/2026-07-10T00-08-48-501Z_019f495b-0075-7000-b1d1-b4568c21e7df.jsonl",
+      "sessionFile": "session:7048e12ec3250583",
       "tokensBefore": 972892,
       "model": "layofflabs-anthropic/claude-fable-5",
       "provider": "layofflabs-anthropic",
@@ -4890,7 +4890,7 @@
     },
     {
       "timestamp": "2026-07-08T14:24:03.043Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant/2026-07-08T04-46-26-687Z_019f400c-777f-7000-8f79-fc395f06f1c1.jsonl",
+      "sessionFile": "session:a777a458f3784b5c",
       "tokensBefore": 767208,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -4918,7 +4918,7 @@
     },
     {
       "timestamp": "2026-07-12T04:49:16.267Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant/2026-07-10T00-08-48-501Z_019f495b-0075-7000-b1d1-b4568c21e7df/60-PRMergeConfirm.jsonl",
+      "sessionFile": "session:4a242bf460c26479",
       "tokensBefore": 344521,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -4940,7 +4940,7 @@
     },
     {
       "timestamp": "2026-07-13T06:17:23.009Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant/2026-07-10T00-08-48-501Z_019f495b-0075-7000-b1d1-b4568c21e7df/85-FcoBoundaryRecovery.jsonl",
+      "sessionFile": "session:1ccc5f5870b8d866",
       "tokensBefore": 353261,
       "model": "layofflabs/gpt-5.6-terra",
       "provider": "layofflabs",
@@ -4962,7 +4962,7 @@
     },
     {
       "timestamp": "2026-07-13T06:56:05.416Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-VibeQuant/2026-07-10T00-08-48-501Z_019f495b-0075-7000-b1d1-b4568c21e7df/85-FcoBoundaryRecovery.jsonl",
+      "sessionFile": "session:1ccc5f5870b8d866",
       "tokensBefore": 364661,
       "model": "layofflabs/gpt-5.6-terra",
       "provider": "layofflabs",
@@ -4984,7 +4984,7 @@
     },
     {
       "timestamp": "2026-06-02T15:17:04.544Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-gjc-backend-bridge-cb4f9662/2026-06-02T08-57-21-293Z_019e878d-3e8d-7000-ace3-96f67acf560c.jsonl",
+      "sessionFile": "session:f59b2ff1966ff22c",
       "tokensBefore": 267156,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -5002,7 +5002,7 @@
     },
     {
       "timestamp": "2026-06-02T15:32:20.351Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-gjc-backend-bridge-cb4f9662/2026-06-02T08-57-21-293Z_019e878d-3e8d-7000-ace3-96f67acf560c.jsonl",
+      "sessionFile": "session:f59b2ff1966ff22c",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -5020,7 +5020,7 @@
     },
     {
       "timestamp": "2026-06-02T16:39:18.862Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-gjc-backend-bridge-cb4f9662/2026-06-02T08-57-21-293Z_019e878d-3e8d-7000-ace3-96f67acf560c.jsonl",
+      "sessionFile": "session:f59b2ff1966ff22c",
       "tokensBefore": 271350,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -5038,7 +5038,7 @@
     },
     {
       "timestamp": "2026-06-02T17:14:25.415Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-gjc-backend-bridge-cb4f9662/2026-06-02T08-57-21-293Z_019e878d-3e8d-7000-ace3-96f67acf560c.jsonl",
+      "sessionFile": "session:f59b2ff1966ff22c",
       "tokensBefore": 271294,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -5056,7 +5056,7 @@
     },
     {
       "timestamp": "2026-07-10T02:32:19.122Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-gajae-code.gajae-code-worktrees-feat-gui-tui-parity-1717d183/2026-07-07T01-02-57-300Z_019f3a19-7f14-7000-9934-fbb40ab3f3b6.jsonl",
+      "sessionFile": "session:a2b044d94dfc0c24",
       "tokensBefore": 428628,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -5080,7 +5080,7 @@
     },
     {
       "timestamp": "2026-07-07T05:26:26.585Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-tradfi-strategies/2026-07-07T03-12-22-541Z_019f3a8f-fc0d-7000-8681-ef220001a0a0.jsonl",
+      "sessionFile": "session:022f9136332aa079",
       "tokensBefore": 0,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -5102,7 +5102,7 @@
     },
     {
       "timestamp": "2026-07-12T09:58:08.232Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-codex/2026-07-12T05-02-17-161Z_019f54b4-6849-7000-bf93-49a00bba238e.jsonl",
+      "sessionFile": "session:f64119691ba28b6b",
       "tokensBefore": 371186,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",
@@ -5126,7 +5126,7 @@
     },
     {
       "timestamp": "2026-06-17T07:36:54.198Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-codex/2026-06-17T05-32-06-944Z_019ed410-bba0-7000-84ca-e84861f093c6.jsonl",
+      "sessionFile": "session:bd1f51ad27d7a687",
       "tokensBefore": 271442,
       "model": "layofflabs/gpt-5.5",
       "provider": "layofflabs",
@@ -5150,7 +5150,7 @@
     },
     {
       "timestamp": "2026-07-12T08:45:32.977Z",
-      "sessionFile": "/Users/bellman/.gjc/agent/sessions/-Documents-Workspace-oh-my-codex/2026-07-12T05-02-17-161Z_019f54b4-6849-7000-bf93-49a00bba238e/13-ReleaseSlopCleaner.jsonl",
+      "sessionFile": "session:9b3ad8f07ab5ce9e",
       "tokensBefore": 365404,
       "model": "layofflabs/gpt-5.6-sol",
       "provider": "layofflabs",

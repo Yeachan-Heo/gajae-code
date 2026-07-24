@@ -170,7 +170,16 @@ const SHIFTED_SYMBOL_KEYS = new Set<string>([
 	"~",
 ]);
 
-const normalizeKeyId = (key: KeyId): KeyId => key.toLowerCase() as KeyId;
+const normalizeKeyId = (key: KeyId): KeyId => {
+	const normalized = key.toLowerCase();
+	if (normalized.endsWith("pageup")) {
+		return `${normalized.slice(0, -6)}pageUp` as KeyId;
+	}
+	if (normalized.endsWith("pagedown")) {
+		return `${normalized.slice(0, -8)}pageDown` as KeyId;
+	}
+	return normalized as KeyId;
+};
 
 function normalizeKeys(keys: KeyId | KeyId[] | undefined): KeyId[] {
 	if (keys === undefined) return [];

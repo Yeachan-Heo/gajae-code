@@ -117,7 +117,7 @@ describe("gjc mcp CLI helpers", () => {
 			},
 		});
 		const output = stdoutText(stdout);
-		expect(output).toContain("docs\thttp\thttps://example.test/mcp");
+		expect(output).toContain("docs\thttp\thttps://example.test/%3Credacted%3E");
 		expect(output).toContain("Status: storage-only");
 		expect(output).toContain("normal standalone gjc sessions do not load stored MCP registrations today");
 		expect(output).toContain('"Authorization": "<redacted>"');
@@ -139,7 +139,7 @@ describe("gjc mcp CLI helpers", () => {
 			name: "urlsecret",
 			flags: {
 				type: "http",
-				url: "https://user:pass@example.test/mcp?apiKey=url-secret&plain=value#frag",
+				url: "https://user:pass@example.test/path-token-secret?apiKey=url-secret&plain=value#frag",
 			},
 			cwd: projectDir,
 		});
@@ -148,6 +148,7 @@ describe("gjc mcp CLI helpers", () => {
 		let output = stdoutText(stdout);
 		expect(output).toContain("apiKey=%3Credacted%3E");
 		expect(output).not.toContain("user:pass");
+		expect(output).not.toContain("path-token-secret");
 		expect(output).not.toContain("url-secret");
 		expect(output).not.toContain("plain=value");
 		expect(output).not.toContain("#frag");
@@ -244,7 +245,7 @@ describe("gjc mcp CLI helpers", () => {
 		const output = stdoutText(stdout);
 		expect(output).toContain('"credentialId": "<redacted>"');
 		expect(output).toContain('"clientSecret": "<redacted>"');
-		expect(output).toContain('"redirectUri": "http://127.0.0.1/callback"');
+		expect(output).toContain('"redirectUri": "http://127.0.0.1/%3Credacted%3E"');
 		expect(output).not.toContain("future-secret");
 		expect(output).not.toContain("future-oauth-secret");
 		expect(output).not.toContain("raw-secret");

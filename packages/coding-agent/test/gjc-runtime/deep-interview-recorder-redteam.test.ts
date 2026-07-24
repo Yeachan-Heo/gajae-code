@@ -330,7 +330,7 @@ describe("deep-interview recorder redteam: ask schema boundaries", () => {
 			askSchema.safeParse(
 				askWithDeepInterview({
 					round_id: "rid-1",
-					round: 0,
+					round: 1,
 					component: "conflict-detection",
 					dimension: "goal",
 					ambiguity: 1,

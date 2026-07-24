@@ -2466,7 +2466,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockRejectedValue(
 			new Error("recorder boom"),
 		);
-		const tool = new AskTool(createSession({ getSessionId: () => "session-ask" }));
+		const tool = new AskTool(
+			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
+		);
 		const context = createContext({ select: async (_prompt, options) => options[1] });
 
 		const result = await tool.execute(
@@ -2501,13 +2503,74 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("deep-interview round recording failed"));
 	});
 
+	it("preserves a foreign workflow answer without writing its deep-interview metadata", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const tool = new AskTool(
+			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
+		);
+		const context = createContext({ select: async (_prompt, options) => options[0] });
+
+		const result = await tool.execute(
+			"call-foreign-workflow-metadata",
+			{
+				questions: [
+					{
+						id: "ralplan-approval",
+						question: "Approve the plan?",
+						options: [{ label: "Approve" }, { label: "Revise" }],
+						workflowGate: { stage: "ralplan", kind: "approval" },
+						deepInterview: {
+							round: 0,
+							component: "review-topology",
+							dimension: "topology",
+							ambiguity: 0,
+							intent_contract: {
+								items: [
+									{ id: "artifact:foreign-plan", category: "artifact", statement: "Execute foreign plan" },
+								],
+								confirmation_options: ["Approve"],
+							},
+						},
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Approve" });
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
+	it("preserves an inactive workflow answer without writing its deep-interview metadata", async () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const tool = new AskTool(createSession({ getSessionId: () => "session-ask" }));
+		const context = createContext({ select: async (_prompt, options) => options[0] });
+
+		const result = await tool.execute(
+			"call-inactive-workflow-metadata",
+			{ questions: [singleDeepInterviewQuestion()] },
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.content[0]).toMatchObject({ type: "text", text: "User selected: Budget" });
+		expect(recorder).not.toHaveBeenCalled();
+	});
+
 	it("does not synthesize or record intent authorization on ask timeout", async () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
 		});
 		const tool = new AskTool(
-			createSession({ settings: Settings.isolated({ "ask.timeout": 0.001 }), getSessionId: () => "session-ask" }),
+			createSession({
+				settings: Settings.isolated({ "ask.timeout": 0.001 }),
+				getSessionId: () => "session-ask",
+				getDeepInterviewAskStage: () => "post-topology",
+			}),
 		);
 		const context = createContext({
 			select: async (_prompt, _options, dialogOptions) => {
@@ -2629,7 +2692,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockImplementation(
 			() => new Promise(() => {}) as ReturnType<typeof deepInterviewRecorder.appendOrMergeDeepInterviewRound>,
 		);
-		const tool = new AskTool(createSession({ getSessionId: () => "session-ask" }));
+		const tool = new AskTool(
+			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
+		);
 		const context = createContext({ select: async (_prompt, options) => options[0] });
 		const started = performance.now();
 
@@ -2653,7 +2718,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 			record: {} as Awaited<ReturnType<typeof deepInterviewRecorder.appendOrMergeDeepInterviewRound>>["record"],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockRejectedValue(new Error("hud boom"));
-		const tool = new AskTool(createSession({ getSessionId: () => "session-ask" }));
+		const tool = new AskTool(
+			createSession({ getSessionId: () => "session-ask", getDeepInterviewAskStage: () => "post-topology" }),
+		);
 		const context = createContext({ select: async (_prompt, options) => options[0] });
 
 		const result = await tool.execute(
@@ -2675,7 +2742,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 
-		await new AskTool(createSession({ getSessionId: () => "single-session" })).execute(
+		await new AskTool(
+			createSession({ getSessionId: () => "single-session", getDeepInterviewAskStage: () => "post-topology" }),
+		).execute(
 			"call-single-meta",
 			{ questions: [singleDeepInterviewQuestion()] },
 			undefined,
@@ -2683,7 +2752,9 @@ describe("AskTool deep-interview recorder persistence", () => {
 			createContext({ select: async (_prompt, options) => options[0] }),
 		);
 
-		await new AskTool(createSession({ getSessionId: () => "multi-session" })).execute(
+		await new AskTool(
+			createSession({ getSessionId: () => "multi-session", getDeepInterviewAskStage: () => "post-topology" }),
+		).execute(
 			"call-multi-meta",
 			{
 				questions: [
@@ -2705,7 +2776,12 @@ describe("AskTool deep-interview recorder persistence", () => {
 			emitGate: vi.fn(async () => ({ selected: ["Timeline"] })),
 		};
 		await new AskTool(
-			createSession({ hasUI: false, getSessionId: () => "gate-session", getWorkflowGateEmitter: () => gateEmitter }),
+			createSession({
+				hasUI: false,
+				getSessionId: () => "gate-session",
+				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "post-topology",
+			}),
 		).execute("call-gate-meta", { questions: [singleDeepInterviewQuestion()] }, undefined, undefined, undefined);
 
 		expect(recorder).toHaveBeenCalledTimes(4);
@@ -2816,6 +2892,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 				hasUI: false,
 				getSessionId: () => "test-session",
 				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "post-topology",
 			} as Partial<ToolSession>),
 		);
 		const exact = deepInterviewQuestionAtPayloadLength(100_000);
@@ -3006,6 +3083,61 @@ describe("AskTool deep-interview recorder persistence", () => {
 			).success,
 		).toBe(false);
 	});
+	it("narrows provider-facing deep-interview metadata to the persisted workflow stage", () => {
+		const contractQuestion = {
+			questions: [
+				{
+					id: "topology",
+					question: "Confirm?",
+					options: [{ label: "Confirm" }],
+					deepInterview: {
+						round: 0,
+						component: "review-topology",
+						dimension: "topology",
+						ambiguity: 1,
+						intent_contract: {
+							items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+							confirmation_options: ["Confirm"],
+						},
+					},
+				},
+			],
+		};
+		const reviewQuestion = {
+			questions: [
+				{
+					id: "review",
+					question: "Approve?",
+					options: [{ label: "Approve" }],
+					deepInterview: {
+						round: 1,
+						component: "locked-intent",
+						dimension: "constraints",
+						ambiguity: 0.2,
+						intent_review: {
+							observed_items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+							supporting_substitutions: [],
+							approval_options: ["Approve"],
+						},
+					},
+				},
+			],
+		};
+
+		const topologyTool = new AskTool(createSession({ getDeepInterviewAskStage: () => "topology" }));
+		expect(topologyTool.parameters.safeParse(contractQuestion).success).toBe(true);
+		expect(topologyTool.parameters.safeParse(reviewQuestion).success).toBe(false);
+
+		const postTopologyTool = new AskTool(createSession({ getDeepInterviewAskStage: () => "post-topology" }));
+		expect(postTopologyTool.parameters.safeParse(contractQuestion).success).toBe(false);
+		expect(postTopologyTool.parameters.safeParse(reviewQuestion).success).toBe(true);
+
+		const inactiveTool = new AskTool(createSession());
+		const inactiveContract = inactiveTool.parameters.parse(contractQuestion);
+		const inactiveReview = inactiveTool.parameters.parse(reviewQuestion);
+		expect(inactiveContract.questions[0]).not.toHaveProperty("deepInterview");
+		expect(inactiveReview.questions[0]).not.toHaveProperty("deepInterview");
+	});
 });
 
 describe("AskTool Round-0 intent recovery", () => {
@@ -3037,8 +3169,8 @@ describe("AskTool Round-0 intent recovery", () => {
 		};
 	}
 
-	function validateAsk(arguments_: Record<string, unknown>) {
-		return validateToolArguments(new AskTool(createSession()), {
+	function validateAsk(arguments_: Record<string, unknown>, stage: "topology" | "post-topology" = "topology") {
+		return validateToolArguments(new AskTool(createSession({ getDeepInterviewAskStage: () => stage })), {
 			type: "toolCall",
 			id: "ask-round-0",
 			name: "ask",
@@ -3101,11 +3233,38 @@ describe("AskTool Round-0 intent recovery", () => {
 		expect(result.questions[0]).not.toHaveProperty("deepInterview");
 	});
 
+	it("returns bounded corrections for strict-wire intent constraints that local validation must enforce", () => {
+		const roundZeroReview = roundZeroPair();
+		Reflect.deleteProperty(roundZeroReview.questions[0].deepInterview, "intent_contract");
+		roundZeroReview.questions[0].deepInterview.intent_review.observed_items = [];
+		roundZeroReview.questions[0].deepInterview.intent_review.approval_options = [];
+		expect(() => validateAsk(roundZeroReview)).toThrow(
+			"deepInterview.intent_review is post-Round-0 only and requires a positive round",
+		);
+
+		const emptyContract = roundZeroPair();
+		Reflect.deleteProperty(emptyContract.questions[0].deepInterview, "intent_review");
+		emptyContract.questions[0].deepInterview.intent_contract.items = [];
+		emptyContract.questions[0].deepInterview.intent_contract.confirmation_options = [];
+		expect(() => validateAsk(emptyContract)).toThrow(
+			"deepInterview.intent_contract requires non-empty items and confirmation_options",
+		);
+
+		const foreignWorkflowContract = roundZeroPair({ stage: "ralplan", kind: "approval" });
+		Reflect.deleteProperty(foreignWorkflowContract.questions[0].deepInterview, "intent_review");
+		expect(() => validateAsk(foreignWorkflowContract)).toThrow(
+			"deepInterview metadata cannot be combined with a non-deep-interview workflowGate",
+		);
+	});
 	it("terminally rejects every recovery-shaped near-miss before coercion", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
 		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn() };
 		const tool = new AskTool(
-			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+			createSession({
+				hasUI: false,
+				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "topology",
+			} as Partial<ToolSession>),
 		);
 		const execute = spyOn(tool, "execute");
 		const validateCandidate = (arguments_: Record<string, unknown>) =>
@@ -3232,7 +3391,12 @@ describe("AskTool Round-0 intent recovery", () => {
 			emitGate: vi.fn(async () => ({ selected: ["Looks right"] })),
 		};
 		const tool = new AskTool(
-			createSession({ hasUI: false, getSessionId: () => "round-zero", getWorkflowGateEmitter: () => gateEmitter }),
+			createSession({
+				hasUI: false,
+				getSessionId: () => "round-zero",
+				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "topology",
+			}),
 		);
 		const rawHook = spyOn(tool, "rawArgumentValidation");
 		const execute = spyOn(tool, "execute");
@@ -3272,7 +3436,7 @@ describe("AskTool Round-0 intent recovery", () => {
 		postRoundReview.questions[0].deepInterview.round = 1;
 		postRoundReview.questions[0].deepInterview.component = "locked-intent";
 		postRoundReview.questions[0].deepInterview.dimension = "constraints";
-		expect(validateAsk(postRoundReview).questions[0]).toMatchObject({
+		expect(validateAsk(postRoundReview, "post-topology").questions[0]).toMatchObject({
 			deepInterview: { intent_review: expect.any(Object) },
 		});
 	});

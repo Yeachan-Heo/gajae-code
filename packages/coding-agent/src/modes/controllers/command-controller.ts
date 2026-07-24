@@ -10,11 +10,12 @@ import {
 	type UsageLimit,
 	type UsageReport,
 } from "@gajae-code/ai";
-import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
+import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
 import { formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
 import { reset as resetCapabilities } from "../../capability";
+import type { KeybindingsManager } from "../../config/keybindings";
 import { clearClaudePluginRootsCache } from "../../discovery/helpers";
 import { loadCustomShare } from "../../export/custom-share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
@@ -35,7 +36,7 @@ import { EvalExecutionComponent } from "../../modes/components/eval-execution";
 import { getMarkdownTheme, getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import { computeContextBreakdown, renderContextUsage } from "../../modes/utils/context-usage";
-import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
+import { buildHotkeysMarkdown, formatHotkeyMarkdownCode } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
@@ -58,6 +59,39 @@ function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown:
 	ctx.chatContainer.addChild(new Markdown(markdown.trim(), 1, 1, getMarkdownTheme()));
 	ctx.chatContainer.addChild(new DynamicBorder());
 	ctx.ui.requestRender();
+}
+
+export function buildHelpMarkdown(keybindings: Pick<KeybindingsManager, "getAccessibleDisplayString">): string {
+	const displayKey = (action: Keybinding): string => keybindings.getAccessibleDisplayString(action) || "Disabled";
+	const sessionNewKey = formatHotkeyMarkdownCode(displayKey("app.session.new"));
+	const selectModelKey = formatHotkeyMarkdownCode(displayKey("app.model.select"));
+	const autocompleteNavigationKeys = formatHotkeyMarkdownCode(
+		`${displayKey("tui.select.up")}/${displayKey("tui.select.down")}`,
+		false,
+	);
+	const autocompleteConfirmKeys = formatHotkeyMarkdownCode(
+		`${displayKey("tui.input.submit")}/${displayKey("tui.input.tab")}`,
+		false,
+	);
+
+	return [
+		"**Beginner actions**",
+		"",
+		"| Action | How |",
+		"|---|---|",
+		`| Start a fresh session | ${sessionNewKey} or \`/new\` |`,
+		"| Resume another session | `/resume` |",
+		"| Show session details | `/session info` |",
+		"| Delete current session transcript/artifacts | `/session delete` |",
+		`| Select a model | \`/model\` or ${selectModelKey} |`,
+		"| Show all shortcuts | `?` on an empty prompt or `/hotkeys` |",
+		"",
+		"**Finding commands**",
+		"",
+		`- Type \`/\` to browse slash commands, then use ${autocompleteNavigationKeys} and ${autocompleteConfirmKeys}.`,
+		"- Type `#` to browse prompt actions like starting a session, pasting an image, or moving the cursor.",
+		"- Type `!` for shell commands and `$` for Python snippets.",
+	].join("\n");
 }
 
 export class CommandController {
@@ -605,26 +639,7 @@ export class CommandController {
 	}
 
 	handleHelpCommand(): void {
-		const sessionNewKey = this.ctx.keybindings.getDisplayString("app.session.new") || "/new";
-		const markdown = [
-			"**Beginner actions**",
-			"",
-			"| Action | How |",
-			"|---|---|",
-			`| Start a fresh session | \`${sessionNewKey}\` or \`/new\` |`,
-			"| Resume another session | `/resume` |",
-			"| Show session details | `/session info` |",
-			"| Delete current session transcript/artifacts | `/session delete` |",
-			"| Select a model | `/model` or `Ctrl+L` |",
-			"| Show all shortcuts | `?` on an empty prompt or `/hotkeys` |",
-			"",
-			"**Finding commands**",
-			"",
-			"- Type `/` to browse slash commands, then use arrows and Enter/Tab.",
-			"- Type `#` to browse prompt actions like starting a session, pasting an image, or moving the cursor.",
-			"- Type `!` for shell commands and `$` for Python snippets.",
-		].join("\n");
-		showMarkdownPanel(this.ctx, "GJC Help", markdown);
+		showMarkdownPanel(this.ctx, "GJC Help", buildHelpMarkdown(this.ctx.keybindings));
 	}
 
 	handleToolsCommand(): void {

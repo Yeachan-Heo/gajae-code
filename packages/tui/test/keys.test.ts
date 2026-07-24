@@ -1,5 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { extractPrintableText, matchesKey, parseKey, setKittyProtocolActive } from "@gajae-code/tui/keys";
+import {
+	extractPrintableText,
+	isKeyId,
+	matchesKey,
+	parseKey,
+	parseKeyId,
+	setKittyProtocolActive,
+} from "@gajae-code/tui/keys";
 
 describe("matchesKey", () => {
 	it("matches ctrl+letter sequences", () => {
@@ -80,6 +87,15 @@ describe("matchesKey", () => {
 		expect(matchesKey("\x1b[57400;133u", "1")).toBe(false);
 		setKittyProtocolActive(false);
 	});
+
+	it("keeps Super chords distinct from their plain keys", () => {
+		setKittyProtocolActive(true);
+		const superP = "\x1b[112;9u";
+		expect(matchesKey(superP, "super+p")).toBe(true);
+		expect(matchesKey(superP, "p")).toBe(false);
+		expect(matchesKey("p", "super+p")).toBe(false);
+		setKittyProtocolActive(false);
+	});
 });
 
 describe("parseKey", () => {
@@ -140,9 +156,15 @@ describe("parseKey", () => {
 		setKittyProtocolActive(false);
 	});
 
+	it("parses Kitty Super chords", () => {
+		setKittyProtocolActive(true);
+		expect(parseKey("\x1b[112;9u")).toBe("super+p");
+		setKittyProtocolActive(false);
+	});
+
 	it("ignores Kitty sequences with unsupported modifiers", () => {
 		setKittyProtocolActive(true);
-		expect(parseKey("\x1b[99;9u")).toBeUndefined();
+		expect(parseKey("\x1b[99;17u")).toBeUndefined();
 		setKittyProtocolActive(false);
 	});
 });
@@ -162,11 +184,53 @@ describe("extractPrintableText", () => {
 	});
 
 	it("ignores unsupported modifiers on Kitty CSI-u text", () => {
-		expect(extractPrintableText("\x1b[99;9u")).toBeUndefined();
-		expect(extractPrintableText("\x1b[97;9;229u")).toBeUndefined();
+		expect(extractPrintableText("\x1b[99;17u")).toBeUndefined();
+		expect(extractPrintableText("\x1b[97;17;229u")).toBeUndefined();
 	});
 
 	it("preserves Kitty CSI-u text-field decoding for supported modifiers", () => {
 		expect(extractPrintableText("\x1b[97;1;229u")).toBe("å");
+	});
+});
+describe("KeyId grammar", () => {
+	it("parses canonical keys case-insensitively", () => {
+		expect(parseKeyId("CTRL+Shift+C")?.keyId).toBe("ctrl+shift+c");
+		expect(isKeyId("super+p")).toBe(true);
+		expect(parseKeyId(" Ctrl + C ")?.keyId).toBe("ctrl+c");
+		expect(isKeyId("ctrl+c")).toBe(true);
+		expect(isKeyId("CTRL+C")).toBe(false);
+		expect(isKeyId("ctrl+plus")).toBe(false);
+		expect(isKeyId(" Ctrl + C ")).toBe(false);
+		expect(isKeyId("pageUp")).toBe(true);
+		expect(isKeyId("pageDown")).toBe(true);
+		expect(isKeyId("pageup")).toBe(false);
+		expect(isKeyId("pagedown")).toBe(false);
+	});
+
+	it("accepts literal plus keys and rejects malformed plus chains", () => {
+		expect(parseKeyId("+")).toMatchObject({ keyId: "+", baseKey: "+" });
+		expect(parseKeyId("ctrl++")).toMatchObject({ keyId: "ctrl++", baseKey: "+" });
+		expect(parseKeyId("plus")).toMatchObject({ keyId: "+", baseKey: "+" });
+		expect(parseKeyId("ctrl+plus")).toMatchObject({ keyId: "ctrl++", baseKey: "+" });
+		expect(parseKeyId("++")).toBeUndefined();
+		expect(parseKeyId("ctrl+")).toBeUndefined();
+		expect(parseKeyId("ctrl+++")).toBeUndefined();
+	});
+
+	it("rejects aliases, duplicates, malformed chains, unknown keys, and controls", () => {
+		for (const key of [
+			"cmd+p",
+			"command+p",
+			"meta+p",
+			"option+p",
+			"ctrl+ctrl+c",
+			"ctrl++x",
+			"ctrl+unknown",
+			"ctrl+\u001b",
+			"ctrl+c\n",
+		]) {
+			expect(parseKeyId(key)).toBeUndefined();
+			expect(isKeyId(key)).toBe(false);
+		}
 	});
 });
