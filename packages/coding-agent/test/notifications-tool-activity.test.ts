@@ -102,7 +102,7 @@ async function setup(
 		ws.addEventListener("open", () => resolve());
 		ws.addEventListener("error", () => reject(new Error("websocket error")));
 	});
-	ws.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v1"] }));
+	ws.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2"] }));
 	await sleep(50);
 	await sleep(250);
 	return { handlers, ctx, frames, ws, sessionId, token, settings, controller };
@@ -148,7 +148,7 @@ describe("notification tool activity projection", () => {
 });
 
 describe("SDK replay capability filter", () => {
-	test("filters gated frames without tool_activity_v1 and keeps them with it", async () => {
+	test("filters gated frames without tool_activity_v2 and keeps them with it", async () => {
 		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
 		const sent: Array<{ connectionId: string; frame: Record<string, unknown> }> = [];
 		const host = new SessionSdkHost({
@@ -159,7 +159,7 @@ describe("SDK replay capability filter", () => {
 				connectionId === "legacy"
 					? new Set()
 					: connectionId === "capable"
-						? new Set(["tool_activity_v1"])
+						? new Set(["tool_activity_v2"])
 						: undefined,
 			sendFrame: (connectionId, frame) => {
 				sent.push({ connectionId, frame });
