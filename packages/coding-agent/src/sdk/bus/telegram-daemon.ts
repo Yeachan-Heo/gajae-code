@@ -6208,6 +6208,26 @@ export class TelegramNotificationDaemon {
 		if (toolActivity.endpointDigest === undefined) return session === undefined;
 		return session === toolActivity.session && session.endpointDigest === toolActivity.endpointDigest;
 	}
+	private toolActivityDeliveryIsCurrent(toolActivity: ToolActivityOwner): boolean {
+		const key = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
+		const owner = this.toolActivityOwners.get(key);
+		if (owner && owner.session !== toolActivity.session) return false;
+		if (toolActivity.phase === "started") {
+			return (
+				this.toolActivityAuthorityIsCurrent(toolActivity) &&
+				!this.toolActivityStopping &&
+				this.opts.toolActivity?.enabled === true &&
+				toolActivity.policyEpoch === this.toolActivityPolicyEpoch
+			);
+		}
+		if (
+			this.toolActivityAuthorityIsCurrent(toolActivity) &&
+			this.opts.toolActivity?.enabled === true &&
+			toolActivity.policyEpoch === this.toolActivityPolicyEpoch
+		)
+			return true;
+		return this.liveMessages.has(key) && owner?.session === toolActivity.session;
+	}
 	private async submitThreadedFrame(
 		sessionId: string,
 		send: ThreadedSend,
@@ -6961,13 +6981,7 @@ export class TelegramNotificationDaemon {
 		}
 		for (const item of batch) {
 			const toolActivity = item.payload.toolActivity;
-			if (
-				toolActivity?.phase === "started" &&
-				(this.toolActivityStopping ||
-					this.opts.toolActivity?.enabled !== true ||
-					toolActivity.policyEpoch !== this.toolActivityPolicyEpoch ||
-					!this.toolActivityAuthorityIsCurrent(toolActivity))
-			) {
+			if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) {
 				const key = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
 				const owner = this.toolActivityOwners.get(key);
 				if (!this.liveMessages.has(key) && owner?.session === toolActivity.session)
@@ -7440,10 +7454,14 @@ export class TelegramNotificationDaemon {
 		socketLease?: { session: SessionSocket; token: number; logicalSessionId: string },
 	): Promise<void> {
 		if ((socketLease && !this.#leaseTokenAllows(socketLease)) || !(await this.pairedChatIsPrivate())) return;
+		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
 		if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
 		await this.notifyThreadedFallback(socketLease);
+		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
 		if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
+		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
 		if (send.identity && this.flatIdentitySent.has(sessionId)) return;
+		if (toolActivity && !this.toolActivityDeliveryIsCurrent(toolActivity)) return;
 		this.submitPool({
 			sessionId,
 			lane: send.lane,
@@ -8080,23 +8098,7 @@ export class TelegramNotificationDaemon {
 				? (this.replayToolActivityEpochs.get(threadedFrame) ?? this.toolActivityPolicyEpoch)
 				: undefined;
 			if (toolActivity) toolActivity.policyEpoch = toolAdmissionEpoch;
-			const toolFrameIsCurrent = (): boolean => {
-				if (!toolActivity) return true;
-				if (toolActivity.phase === "started") {
-					return (
-						this.toolActivityAuthorityIsCurrent(toolActivity) &&
-						!this.toolActivityStopping &&
-						this.opts.toolActivity?.enabled === true &&
-						toolAdmissionEpoch === this.toolActivityPolicyEpoch
-					);
-				}
-				const liveKey = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
-				const owner = this.toolActivityOwners.get(liveKey);
-				if (owner && owner.session !== session) return false;
-				if (this.opts.toolActivity?.enabled === true && toolAdmissionEpoch === this.toolActivityPolicyEpoch)
-					return true;
-				return this.liveMessages.has(liveKey) && owner?.session === session;
-			};
+			const toolFrameIsCurrent = (): boolean => !toolActivity || this.toolActivityDeliveryIsCurrent(toolActivity);
 			const abandonStaleToolStart = (): void => {
 				if (toolActivity?.phase !== "started") return;
 				const key = `${toolActivity.sessionId}:tool:${toolActivity.toolCallId}`;
