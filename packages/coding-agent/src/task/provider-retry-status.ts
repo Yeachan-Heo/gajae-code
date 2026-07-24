@@ -78,7 +78,7 @@ export interface ProviderDegradationGroup {
 export function collectProviderDegradationGroups(progress: readonly AgentProgress[]): ProviderDegradationGroup[] {
 	const counts = new Map<string, number>();
 	for (const item of progress) {
-		if (item.status !== "running" || !item.retryState) continue;
+		if (!isAgentProgress(item) || item.status !== "running" || !item.retryState) continue;
 		const provider = item.retryState.provider ?? "provider";
 		counts.set(provider, (counts.get(provider) ?? 0) + 1);
 	}

@@ -972,20 +972,23 @@ export function renderResult(
 
 			const lines: string[] = [];
 
-			const shouldRenderProgress =
-				Boolean(details.progress && details.progress.length > 0) && (isPartial || details.results.length === 0);
+			const hasProgress = Boolean(details.progress && details.progress.length > 0);
+			const shouldRenderProgress = hasProgress && (isPartial || details.results.length === 0);
+			const hasResults = details.results.length > 0;
+			if (hasResults) {
+				details.results.forEach((res, i) => {
+					const isLast = !shouldRenderProgress && i === details.results.length - 1;
+					lines.push(...renderAgentResult(res, isLast, expanded, theme));
+				});
+			}
 			if (shouldRenderProgress && details.progress) {
 				lines.push(...renderProviderDegradationNotices(details.progress, theme));
 				details.progress.forEach((progress, i) => {
 					const isLast = i === details.progress!.length - 1;
 					lines.push(...renderAgentProgress(progress, isLast, expanded, theme, spinnerFrame));
 				});
-			} else if (details.results && details.results.length > 0) {
-				details.results.forEach((res, i) => {
-					const isLast = i === details.results.length - 1;
-					lines.push(...renderAgentResult(res, isLast, expanded, theme));
-				});
-
+			}
+			if (hasResults && !shouldRenderProgress) {
 				const abortedCount = details.results.filter(r => r.status === "aborted").length;
 				const mergeFailedCount = details.results.filter(r => r.status === "merge_failed").length;
 				const successCount = details.results.filter(r => r.status === "completed").length;
@@ -1081,15 +1084,14 @@ function renderNestedTaskTree(
 ): string[] {
 	const lines: string[] = [];
 	for (const details of detailsList) {
-		const hasResults = Boolean(details.results && details.results.length > 0);
-		if (hasResults) {
+		const inflight = details.progress;
+		const hasInflight = Boolean(inflight && inflight.length > 0);
+		if (details.results && details.results.length > 0) {
 			details.results.forEach((result, index) => {
-				const isLast = index === details.results.length - 1;
+				const isLast = !hasInflight && index === details.results.length - 1;
 				lines.push(...renderAgentResult(result, isLast, expanded, theme));
 			});
-			continue;
 		}
-		const inflight = details.progress;
 		if (inflight && inflight.length > 0) {
 			lines.push(...renderProviderDegradationNotices(inflight, theme));
 			inflight.forEach((prog, index) => {

@@ -1012,10 +1012,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			: undefined;
 	};
 
-	const hasMatchingActiveProviderModel = (message: AgentMessage): message is AssistantMessage =>
+	const isProviderAssistantMessage = (message: AgentMessage): message is AssistantMessage =>
 		message.role === "assistant" &&
 		"stopReason" in message &&
 		Array.isArray(message.content) &&
+		getMessageModelString(message) !== undefined;
+
+	const isSuccessfulProviderAssistantMessage = (message: AgentMessage): message is AssistantMessage =>
+		isProviderAssistantMessage(message) &&
+		message.stopReason !== "error" &&
+		message.stopReason !== "aborted" &&
+		message.errorMessage === undefined &&
+		message.errorKind === undefined &&
+		message.transportFailure === undefined;
+
+	const hasMatchingActiveProviderModel = (message: AgentMessage): message is AssistantMessage =>
+		isProviderAssistantMessage(message) &&
 		activeProviderModelString !== undefined &&
 		getMessageModelString(message) === activeProviderModelString;
 
@@ -1034,6 +1046,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		}
 	};
 
+	const getProviderTextDelta = (event: Extract<AgentEvent, { type: "message_update" }>): string | undefined => {
+		const update = (event as { assistantMessageEvent?: unknown }).assistantMessageEvent;
+		if (!update || typeof update !== "object") return undefined;
+		const record = update as { type?: unknown; delta?: unknown };
+		return record.type === "text_delta" && typeof record.delta === "string" ? record.delta : undefined;
+	};
+
 	const isProviderBackedRecoveryEvent = (
 		event: Extract<AgentEvent, { type: "message_start" | "message_update" }>,
 		eventOrdinal: number,
@@ -1041,16 +1060,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		if (!progress.retryState || eventOrdinal <= retryStartOrdinal || seenAssistantMessages.has(event.message))
 			return false;
 		if (!hasMatchingActiveProviderModel(event.message)) return false;
-		if (event.type === "message_start") {
-			const message = event.message;
-			return (
-				message.stopReason !== "error" &&
-				message.stopReason !== "aborted" &&
-				message.errorMessage === undefined &&
-				message.errorKind === undefined &&
-				message.transportFailure === undefined
-			);
-		}
+		if (event.type === "message_start") return isSuccessfulProviderAssistantMessage(event.message);
 		return isProviderStreamingUpdate(event);
 	};
 
@@ -1233,9 +1243,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					progress.retryState = undefined;
 					flushProgress = true;
 				}
-				if (event.assistantMessageEvent.type === "text_delta") {
-					appendRecentOutputTail(event.assistantMessageEvent.delta);
-				}
+				const textDelta = getProviderTextDelta(event);
+				if (textDelta !== undefined) appendRecentOutputTail(textDelta);
 				break;
 			}
 
@@ -1243,7 +1252,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// Extract text from assistant and toolResult messages (not user prompts)
 				const role = event.message?.role;
 				if (role === "assistant") {
-					lastProviderProgressAtMs = now;
+					if (isSuccessfulProviderAssistantMessage(event.message)) lastProviderProgressAtMs = now;
 					const messageContent =
 						getMessageContent(event.message) || (event as AgentEvent & { content?: unknown }).content;
 					if (messageContent && Array.isArray(messageContent)) {

@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { AgentProgress, TaskResultReceipt, TaskToolDetails } from "@gajae-code/coding-agent/task";
 import { taskToolRenderer } from "@gajae-code/coding-agent/task/render";
+import { collectProviderDegradationGroups } from "../../src/task/provider-retry-status";
 
 // Defends the live-rendering contract for the `task` tool: while a Level-1
 // subagent is still mid-flight, any nested `task` activity it has produced
@@ -159,6 +160,70 @@ describe("task renderer: nested live rendering", () => {
 		expect(text).toContain("Delta child running");
 		expect(text).toContain("2.0 Parent>GammaSub");
 		expect(text).toContain("2.1 Parent>DeltaSub");
+	});
+
+	it("keeps completed and running siblings visible in mixed root and nested snapshots", async () => {
+		const completed = makeCompletedSubResult("2-Mixed.0-Done", "Completed sibling remains visible");
+		const running = makeRunningSubProgress("2-Mixed.1-Live", "Running sibling remains visible");
+		const theme = (await getThemeByName("red-claw"))!;
+		const rootComponent = taskToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "Running mixed task" }],
+				details: {
+					projectAgentsDir: null,
+					results: [completed],
+					totalDurationMs: completed.durationMs,
+					progress: [running],
+				},
+			},
+			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			theme,
+		);
+		const rootText = Bun.stripANSI(rootComponent.render(160).join("\n"));
+		expect(rootText).toContain("Completed sibling remains visible");
+		expect(rootText).toContain("Running sibling remains visible");
+		expect(rootText.indexOf("Completed sibling remains visible")).toBeLessThan(
+			rootText.indexOf("Running sibling remains visible"),
+		);
+
+		const nestedText = await render(
+			makeRunningProgress({
+				id: "2-Mixed",
+				currentTool: "task",
+				inflightTaskDetails: {
+					projectAgentsDir: null,
+					results: [completed],
+					totalDurationMs: completed.durationMs,
+					progress: [running],
+				},
+			}),
+		);
+		expect(nestedText).toContain("Completed sibling remains visible");
+		expect(nestedText).toContain("Running sibling remains visible");
+		expect(nestedText.indexOf("Completed sibling remains visible")).toBeLessThan(
+			nestedText.indexOf("Running sibling remains visible"),
+		);
+	});
+
+	it("ignores malformed progress entries while grouping valid retry siblings", () => {
+		const retrying = (id: string): AgentProgress => ({
+			...makeRunningSubProgress(id, id),
+			retryState: {
+				attempt: 1,
+				maxAttempts: 3,
+				kind: "provider_error",
+				provider: "anthropic",
+				delayMs: 1_000,
+				errorMessage: "provider unavailable",
+				startedAtMs: 0,
+			},
+		});
+		const groups = collectProviderDegradationGroups([
+			null,
+			retrying("2-Guard.0-First"),
+			retrying("2-Guard.1-Second"),
+		] as unknown as AgentProgress[]);
+		expect(groups).toEqual([{ provider: "anthropic", count: 2 }]);
 	});
 
 	it("aggregates nested same-provider retries and refreshes their age without content mutation", async () => {

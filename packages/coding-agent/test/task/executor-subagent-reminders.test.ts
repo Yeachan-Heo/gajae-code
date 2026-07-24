@@ -333,6 +333,13 @@ describe("runSubprocess yield reminders", () => {
 				assistantMessageEvent: { type: "text_delta" } as unknown as AssistantMessageEvent,
 			});
 			flush();
+			currentEvent = "missing-update";
+			emit({
+				type: "message_update",
+				message: { ...assistant },
+				assistantMessageEvent: undefined,
+			} as unknown as AgentSessionEvent);
+			flush();
 			currentEvent = "qualifying-update";
 			update({ type: "text_delta", contentIndex: 0, delta: "ok", partial: assistant });
 			currentEvent = "delayed-end";
@@ -397,6 +404,7 @@ describe("runSubprocess yield reminders", () => {
 			"control-update",
 			"error-update",
 			"malformed-update",
+			"missing-update",
 		]) {
 			expect(states(event).at(-1)?.retryState).toMatchObject({ attempt: 1, provider: "test" });
 		}
@@ -472,6 +480,73 @@ describe("runSubprocess yield reminders", () => {
 
 		const retryStart = progressUpdates.find(update => update.event === "auto_retry_start");
 		expect(retryStart?.progress.retryState?.provider).toBe("fallback");
+		expect(result.exitCode).toBe(0);
+	});
+
+	it("does not count synthesized terminal message ends as provider progress", async () => {
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			progressUpdates.push({
+				event: currentEvent,
+				progress: structuredClone((payload as { progress: AgentProgress }).progress),
+			});
+		});
+		const session = createMockSession(({ emit }) => {
+			const terminal = {
+				...createAssistantStopMessage("terminal failure"),
+				provider: "test",
+				model: "mock",
+				stopReason: "error" as const,
+				errorMessage: "provider failed",
+			};
+			currentEvent = "retry-1";
+			emit({
+				type: "auto_retry_start",
+				attempt: 1,
+				maxAttempts: 3,
+				delayMs: 1_000,
+				errorMessage: "provider failed",
+			});
+			currentEvent = "terminal-start";
+			emit({ type: "message_start", message: terminal });
+			currentEvent = "terminal-end";
+			emit({ type: "message_end", message: terminal });
+			currentEvent = "failed-end";
+			emit({ type: "auto_retry_end", success: false, attempt: 1, finalError: "provider failed" });
+			currentEvent = "retry-2";
+			emit({
+				type: "auto_retry_start",
+				attempt: 2,
+				maxAttempts: 3,
+				delayMs: 1_000,
+				errorMessage: "provider failed again",
+			});
+			currentEvent = "tool_execution_end";
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "terminal-progress-guard",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: {} },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-terminal-progress-guard",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+		const secondRetry = progressUpdates.find(update => update.event === "retry-2")?.progress.retryState;
+		expect(secondRetry).toMatchObject({ attempt: 2, provider: "test" });
+		expect(secondRetry?.lastProviderProgressAtMs).toBeUndefined();
 		expect(result.exitCode).toBe(0);
 	});
 
