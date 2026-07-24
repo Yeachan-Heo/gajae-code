@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { ImageProtocol, TERMINAL, Text } from "@gajae-code/tui";
-import { getProjectDir, isEnoent, logger, prompt, sanitizeText } from "@gajae-code/utils";
+import { getProjectDir, isEnoent, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { AsyncJobManager } from "../async";
 import { type BashResult, executeBash } from "../exec/bash-executor";
@@ -29,7 +29,6 @@ import { checkBashInterception } from "./bash-interceptor";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
 import { checkComposerBashPolicy } from "./composer-bash-policy";
-import { formatInvocationCommand, formatInvocationEnvironment } from "./invocation-display";
 import { formatStyledTruncationWarning, type OutputMeta, stripOutputNotice } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
@@ -177,8 +176,23 @@ function normalizeBashEnv(env: Record<string, string> | undefined): Record<strin
 	return normalized;
 }
 
-function formatBashEnvAssignments(env: Record<string, string> | undefined, expanded: boolean): string {
-	return formatInvocationEnvironment(env, expanded);
+function escapeBashEnvValueForDisplay(value: string): string {
+	return value
+		.replaceAll("\\", "\\\\")
+		.replaceAll("\n", "\\n")
+		.replaceAll("\r", "\\r")
+		.replaceAll("\t", "\\t")
+		.replaceAll('"', '\\"')
+		.replaceAll("$", "\\$")
+		.replaceAll("`", "\\`");
+}
+
+function formatBashEnvAssignments(env: Record<string, string> | undefined): string {
+	if (!env || Object.keys(env).length === 0) return "";
+	return Object.entries(env)
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([key, value]) => `${key}="${escapeBashEnvValueForDisplay(value)}"`)
+		.join(" ");
 }
 
 function unescapePartialJsonString(value: string): string {
@@ -1193,18 +1207,13 @@ export function getBashEnvForDisplay(args: BashRenderArgs): Record<string, strin
 	return args.env ?? partialEnv;
 }
 
-export function formatBashCommand(args: BashRenderArgs, expanded = false): string {
-	const command = formatInvocationCommand(args.command || "…", expanded);
+export function formatBashCommand(args: BashRenderArgs): string {
+	const command = replaceTabs(args.command || "…");
 	const prompt = "$";
 	const cwd = getProjectDir();
 	const displayWorkdir = formatToolWorkingDirectory(args.cwd, cwd);
-	const renderedCommand = [formatBashEnvAssignments(getBashEnvForDisplay(args), expanded), command]
-		.filter(Boolean)
-		.join(" ");
-	const invocation = displayWorkdir
-		? `${prompt} cd ${displayWorkdir} && ${renderedCommand}`
-		: `${prompt} ${renderedCommand}`;
-	return replaceTabs(sanitizeText(invocation));
+	const renderedCommand = [formatBashEnvAssignments(getBashEnvForDisplay(args)), command].filter(Boolean).join(" ");
+	return displayWorkdir ? `${prompt} cd ${displayWorkdir} && ${renderedCommand}` : `${prompt} ${renderedCommand}`;
 }
 
 /**
@@ -1214,16 +1223,15 @@ export function formatBashCommand(args: BashRenderArgs, expanded = false): strin
  * reset SGR state at line boundaries, which made the previous single-string
  * `theme.fg("dim", ...)` form render only the first line as dim.
  */
-export function formatBashCommandLines(args: BashRenderArgs, uiTheme: Theme, expanded = false): string[] {
-	const command = replaceTabs(sanitizeText(formatInvocationCommand(args.command || "…", expanded)));
+export function formatBashCommandLines(args: BashRenderArgs, uiTheme: Theme): string[] {
+	const command = replaceTabs(args.command || "…");
 	const cwd = getProjectDir();
 	const displayWorkdir = formatToolWorkingDirectory(args.cwd, cwd);
-	const envAssignments = formatBashEnvAssignments(getBashEnvForDisplay(args), expanded);
+	const envAssignments = formatBashEnvAssignments(getBashEnvForDisplay(args));
 	const prefixParts = ["$"];
 	if (displayWorkdir) prefixParts.push(`cd ${displayWorkdir} &&`);
 	if (envAssignments) prefixParts.push(envAssignments);
-	const prefixText = replaceTabs(sanitizeText(`${prefixParts.join(" ")} `));
-	const prefix = uiTheme.fg("dim", prefixText);
+	const prefix = uiTheme.fg("dim", `${prefixParts.join(" ")} `);
 	const highlightedLines = highlightCode(command, "bash");
 	if (highlightedLines.length === 0) return [prefix.trimEnd()];
 	return highlightedLines.map((line, i) => (i === 0 ? `${prefix}${line}` : line));
@@ -1242,7 +1250,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 	return {
 		renderCall(args: TArgs, options: RenderResultOptions, uiTheme: Theme): Component {
 			const renderArgs = toBashRenderArgs(args, config);
-			const cmdText = formatBashCommand(renderArgs, options.expanded);
+			const cmdText = formatBashCommand(renderArgs);
 			const title = config.resolveTitle(args, options);
 			const text = renderStatusLine({ icon: "pending", title, description: cmdText }, uiTheme);
 			return new Text(text, 0, 0);
@@ -1259,7 +1267,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 			args?: TArgs,
 		): Component {
 			const renderArgs = toBashRenderArgs(args, config);
-
+			const cmdLines = args ? formatBashCommandLines(renderArgs, uiTheme) : undefined;
 			const isError = result.isError === true;
 			const icon = options.isPartial ? "pending" : isError ? "error" : "success";
 			const title = config.resolveTitle(args, options);
@@ -1273,7 +1281,6 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 					const { renderContext } = options;
 					const expanded = renderContext?.expanded ?? options.expanded;
 					const previewLines = renderContext?.previewLines ?? BASH_DEFAULT_PREVIEW_LINES;
-					const cmdLines = args ? formatBashCommandLines(renderArgs, uiTheme, expanded) : undefined;
 
 					// Get output from context (preferred) or fall back to result content.
 					// Strip the LLM-facing notice appended by wrappedExecute so we don't
