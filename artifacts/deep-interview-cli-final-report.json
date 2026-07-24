@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "kind": "cli-test-report",
+  "scope": "typed deep-interview diagnosis/repair CLI v1",
+  "commands": [
+    {
+      "name": "package check",
+      "observedResult": "passed"
+    },
+    {
+      "name": "manifest check",
+      "observedResult": "passed"
+    },
+    {
+      "name": "test suite",
+      "observedResult": "389 tests, 0 failures, 1976 assertions"
+    },
+    {
+      "name": "gjc writer routing gate",
+      "observedResult": "passed"
+    },
+    {
+      "name": "public version sync",
+      "observedResult": "passed"
+    }
+  ],
+  "qualityGates": {
+    "cleaner": "134 PASS",
+    "architect": "154 CLEAR; 157 CLEAR/READY/APPROVE",
+    "qa": "155 pass/pass/pass",
+    "critic": "161 OKAY"
+  }
+}

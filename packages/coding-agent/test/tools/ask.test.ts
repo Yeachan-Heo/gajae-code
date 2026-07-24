@@ -487,6 +487,7 @@ describe("AskTool cancellation", () => {
 		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		const exact = "😀".repeat(10_000);
 		const local = new AskTool(createSession({ getSessionId: () => "test-session" }));
@@ -2089,6 +2090,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const tool = new AskTool(createSession({ getSessionId: () => "session-structured-scroll" }));
@@ -2135,6 +2137,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const tool = new AskTool(createSession({ getSessionId: () => "session-restate-select" }));
@@ -2181,6 +2184,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const tool = new AskTool(createSession({ getSessionId: () => "session-restate-custom" }));
@@ -2235,6 +2239,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const tool = new AskTool(createSession({ getSessionId: () => "session-clarification-inline" }));
@@ -2279,6 +2284,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		const tool = new AskTool(createSession({ getSessionId: () => "session-clarification-multi" }));
 		let step = 0;
@@ -2322,6 +2328,7 @@ describe("AskTool deep-interview rendering middleware", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		const tool = new AskTool(createSession({ getSessionId: () => "session-clarification-editor" }));
 		const editor = vi.fn(
@@ -2564,6 +2571,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		const tool = new AskTool(
 			createSession({
@@ -2640,6 +2648,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		const tool = new AskTool(
 			createSession({ settings: Settings.isolated({ "ask.timeout": 0.001 }), getSessionId: () => "session-ask" }),
@@ -2716,6 +2725,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as Awaited<ReturnType<typeof deepInterviewRecorder.appendOrMergeDeepInterviewRound>>["record"],
+			warnings: [],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockRejectedValue(new Error("hud boom"));
 		const tool = new AskTool(
@@ -2739,6 +2749,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as Awaited<ReturnType<typeof deepInterviewRecorder.appendOrMergeDeepInterviewRound>>["record"],
+			warnings: [],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 
@@ -2881,6 +2892,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		const appendSpy = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const gateEmitter = {
@@ -3384,6 +3396,7 @@ describe("AskTool Round-0 intent recovery", () => {
 		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound").mockResolvedValue({
 			action: "created",
 			record: {} as AppendOrMergeResult["record"],
+			warnings: [],
 		});
 		spyOn(deepInterviewRecorder, "syncDeepInterviewRecorderHud").mockResolvedValue(undefined);
 		const gateEmitter = {
