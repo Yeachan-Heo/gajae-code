@@ -38,7 +38,9 @@ function createMessage(): AssistantMessage {
 function createSession(data: unknown): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const message = createMessage();
-	const emit = (event: AgentEvent) => listeners.forEach(listener => listener(event));
+	const emit = (event: AgentEvent) => {
+		for (const listener of listeners) listener(event);
+	};
 	return {
 		state: { messages: [] },
 		agent: { state: { systemPrompt: ["test"] } },
