@@ -4103,7 +4103,7 @@ export function createNotificationsExtension(
 					}
 					if (typeof inbound.redact === "boolean") {
 						if (inbound.redact && !runtime.committedRedact) {
-							terminalizeInFlightTools(runtime, runtime.id, "unknown");
+							terminalizeInFlightTools(runtime, runtime.id, "cancelled");
 						}
 						runtime.committedRedact = inbound.redact;
 						runtime.redact = inbound.redact;
@@ -4459,7 +4459,7 @@ export function createNotificationsExtension(
 			runtime.redact = policy.redact;
 			runtime.verbosity = policy.verbosity;
 			runtime.stream = policy.stream;
-			if (redactionEnabled) terminalizeInFlightTools(runtime, runtime.id, "unknown");
+			if (redactionEnabled) terminalizeInFlightTools(runtime, runtime.id, "cancelled");
 		},
 		activate: binding => {
 			const runtime = runtimes.get(binding.sessionId);
@@ -4702,7 +4702,7 @@ export function createNotificationsExtension(
 		await rotateSessionAuthority(event, ctx, false);
 	});
 
-	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "unknown"): void => {
+	const terminalizeInFlightTools = (rt: SessionRuntime, id: string, phase: "cancelled" | "failed"): void => {
 		if (rt.notificationsActive && !rt.redact) {
 			for (const [toolCallId, { toolName }] of rt.inFlightTools) {
 				try {
@@ -4858,7 +4858,7 @@ export function createNotificationsExtension(
 			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}
 		rt.activePromptCorrelation = undefined;
-		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "unknown");
+		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "failed");
 		try {
 			pushSessionFrame(rt, { type: "activity", sessionId: id, state: "idle" });
 		} catch (e) {
@@ -5172,7 +5172,7 @@ export function createNotificationsExtension(
 		await Promise.allSettled([...branchStartupTasks]);
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (rt) terminalizeInFlightTools(rt, id, "unknown");
+		if (rt) terminalizeInFlightTools(rt, id, "cancelled");
 		const controllerStop =
 			typeof ctx.sessionManager.getCwd === "function" ? controller.stopCurrentSession(ctx) : Promise.resolve(false);
 		void controllerStop.catch(error => logger.warn(`notifications: controller shutdown failed: ${String(error)}`));
