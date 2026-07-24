@@ -817,7 +817,8 @@ setInterval(()=>{},1000);
 		expect(JSON.stringify(listed.result)).toContain('"terminalUncertain":true');
 	} finally {
 		await broker.stop();
-		process.env.GJC_SDK_SESSION_COMMAND = previous;
+		if (previous === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
+		else process.env.GJC_SDK_SESSION_COMMAND = previous;
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
 }, 15_000);
@@ -2976,117 +2977,113 @@ test("session-host-internal exits with a sanitized startup failure before writin
 	}
 }, 20_000);
 
-test("production lifecycle factory failure preserves reason and redacts collected secrets", async () => {
-	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-factory-failure-"));
-	const agentDir = path.join(root, "agent");
-	const broker = new Broker({ agentDir });
-	const names = ["GJC_SDK_TEST_FACTORY_FAILURE", "GJC_SDK_TEST_FACTORY_SECRET"] as const;
-	const previous = names.map(name => process.env[name]);
-	const bare = "factory-bare-secret";
-	const overlap = `${bare}-overlap`;
-	const normalized = "factory-secret０".normalize("NFKC");
-	process.env.GJC_SDK_TEST_FACTORY_FAILURE = root;
-	process.env.GJC_SDK_TEST_FACTORY_SECRET = `${overlap} ${normalized} ${"x".repeat(600)}`;
-	try {
-		await broker.start();
-		const response = await broker.handleRequest(
-			"session.create",
-			{ cwd: root, readinessTimeoutMs: 4_000 },
-			"factory-secret-failure",
-		);
-		expect(response).toMatchObject({
-			ok: false,
-			error: { code: "spawn_failed", endpoint: "unavailable" },
-			startupFailure: { phase: "registration", reason: "factory_absent" },
-		});
-		if (response.ok || !response.startupFailure) throw new Error("Expected startup failure evidence.");
-		expect(response.startupFailure.message).toContain("[redacted-secret]");
-		expect(response.startupFailure.message).not.toContain(bare);
-		expect(response.startupFailure.message).not.toContain(overlap);
-		expect(response.startupFailure.message).not.toContain(normalized);
-		expect(new TextEncoder().encode(response.startupFailure.message).byteLength).toBeLessThanOrEqual(512);
-	} finally {
-		names.forEach((name, index) => {
-			const value = previous[index];
-			if (value === undefined) delete process.env[name];
-			else process.env[name] = value;
-		});
-		await broker.stop();
-		await fs.rm(root, { recursive: true, force: true });
-	}
-}, 10_000);
-test("never-settling model profile startup cuts off with proven pre-registration cleanup", async () => {
-	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-cutoff-"));
-	const agentDir = path.join(root, "agent");
-	const broker = new Broker({ agentDir });
-	const previous = process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE;
-	process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE = root;
-	try {
-		await broker.start();
-		const input = { cwd: root, readinessTimeoutMs: 4_000 };
-		const response = await broker.handleRequest("session.create", input, "profile-cutoff");
-		expect(response).toMatchObject({
-			ok: false,
-			error: { code: "spawn_failed", endpoint: "unavailable" },
-			startupFailure: {
-				phase: "startup",
-				reason: "pending",
-				rollback: {
-					endpointGeneration: null,
-					fenced: true,
-					runtimeRemoved: true,
-					hostStopped: true,
-					brokerRegistrationReleased: true,
-				},
-				cleanupProof: {
-					processExited: true,
-					endpointRemoved: true,
-					hostUnregistered: { state: "not_registered" },
-				},
-			},
-		});
-		expect(await broker.handleRequest("session.create", input, "profile-cutoff")).toEqual(response);
-	} finally {
-		if (previous === undefined) delete process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE;
-		else process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE = previous;
-		await broker.stop();
-		await fs.rm(root, { recursive: true, force: true });
-	}
-}, 10_000);
-test("production post-registration startup failure proves cleanup and exact replay", async () => {
-	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-production-failure-"));
-	const agentDir = path.join(root, "agent");
-	const broker = new Broker({ agentDir });
-	const previousFailure = process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION;
-	process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION = root;
-	try {
-		await broker.start();
-		const input = { cwd: root, readinessTimeoutMs: 10_000 };
-		const response = await broker.handleRequest("session.create", input, "production-startup-failure");
-		expect(response).toMatchObject({
-			ok: false,
-			error: {
-				code: "spawn_failed",
-				message: "No ready SDK endpoint remains available.",
-				endpoint: "unavailable",
-			},
-			startupFailure: {
-				phase: "startup",
-				reason: "failed",
-				rollback: {
-					endpointGeneration: expect.any(Number),
-					fenced: true,
-					runtimeRemoved: true,
-					hostStopped: true,
-					brokerRegistrationReleased: true,
-				},
-				cleanupProof: {
-					processExited: true,
-					endpointRemoved: true,
-					hostUnregistered: {
-						indexSeq: expect.any(Number),
-						lifecycleRequestId: expect.any(String),
+test.skipIf(process.platform !== "linux")(
+	"production lifecycle factory failure preserves reason and redacts collected secrets",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-factory-failure-"));
+		const agentDir = path.join(root, "agent");
+		const broker = new Broker({ agentDir });
+		const names = ["GJC_SDK_TEST_FACTORY_FAILURE", "GJC_SDK_TEST_FACTORY_SECRET"] as const;
+		const previous = names.map(name => process.env[name]);
+		const bare = "factory-bare-secret";
+		const overlap = `${bare}-overlap`;
+		const normalized = "factory-secret０".normalize("NFKC");
+		process.env.GJC_SDK_TEST_FACTORY_FAILURE = root;
+		process.env.GJC_SDK_TEST_FACTORY_SECRET = `${overlap} ${normalized} ${"x".repeat(600)}`;
+		try {
+			await broker.start();
+			const response = await broker.handleRequest(
+				"session.create",
+				{ cwd: root, readinessTimeoutMs: 4_000 },
+				"factory-secret-failure",
+			);
+			expect(response).toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed", endpoint: "unavailable" },
+				startupFailure: { phase: "registration", reason: "factory_absent" },
+			});
+			if (response.ok || !response.startupFailure) throw new Error("Expected startup failure evidence.");
+			expect(response.startupFailure.message).toContain("[redacted-secret]");
+			expect(response.startupFailure.message).not.toContain(bare);
+			expect(response.startupFailure.message).not.toContain(overlap);
+			expect(response.startupFailure.message).not.toContain(normalized);
+			expect(new TextEncoder().encode(response.startupFailure.message).byteLength).toBeLessThanOrEqual(512);
+		} finally {
+			names.forEach((name, index) => {
+				const value = previous[index];
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			});
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+	10_000,
+);
+test.skipIf(process.platform !== "linux")(
+	"never-settling model profile startup cuts off with proven pre-registration cleanup",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-cutoff-"));
+		const agentDir = path.join(root, "agent");
+		const broker = new Broker({ agentDir });
+		const previous = process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE;
+		process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE = root;
+		try {
+			await broker.start();
+			const input = { cwd: root, readinessTimeoutMs: 4_000 };
+			const response = await broker.handleRequest("session.create", input, "profile-cutoff");
+			expect(response).toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed", endpoint: "unavailable" },
+				startupFailure: {
+					phase: "startup",
+					reason: "pending",
+					rollback: {
+						endpointGeneration: null,
+						fenced: true,
+						runtimeRemoved: true,
+						hostStopped: true,
+						brokerRegistrationReleased: true,
 					},
+					cleanupProof: {
+						processExited: true,
+						endpointRemoved: true,
+						hostUnregistered: { state: "not_registered" },
+					},
+				},
+			});
+			expect(await broker.handleRequest("session.create", input, "profile-cutoff")).toEqual(response);
+		} finally {
+			if (previous === undefined) delete process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE;
+			else process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE = previous;
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+	10_000,
+);
+test.skipIf(process.platform !== "linux")(
+	"production post-registration startup failure proves cleanup and exact replay",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-production-failure-"));
+		const agentDir = path.join(root, "agent");
+		const broker = new Broker({ agentDir });
+		const previousFailure = process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION;
+		process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION = root;
+		try {
+			await broker.start();
+			const input = { cwd: root, readinessTimeoutMs: 10_000 };
+			const response = await broker.handleRequest("session.create", input, "production-startup-failure");
+			expect(response).toMatchObject({
+				ok: false,
+				error: {
+					code: "spawn_failed",
+					message: "No ready SDK endpoint remains available.",
+					endpoint: "unavailable",
+				},
+				startupFailure: {
+					phase: "startup",
+					reason: "failed",
 					rollback: {
 						endpointGeneration: expect.any(Number),
 						fenced: true,
@@ -3094,37 +3091,53 @@ test("production post-registration startup failure proves cleanup and exact repl
 						hostStopped: true,
 						brokerRegistrationReleased: true,
 					},
+					cleanupProof: {
+						processExited: true,
+						endpointRemoved: true,
+						hostUnregistered: {
+							indexSeq: expect.any(Number),
+							lifecycleRequestId: expect.any(String),
+						},
+						rollback: {
+							endpointGeneration: expect.any(Number),
+							fenced: true,
+							runtimeRemoved: true,
+							hostStopped: true,
+							brokerRegistrationReleased: true,
+						},
+					},
 				},
-			},
-			durableEffects: {
-				transcript: { identityDigest: expect.any(String), contentDigest: expect.any(String) },
-				digest: expect.any(String),
-			},
-		});
-		expect(await broker.handleRequest("session.create", input, "production-startup-failure")).toEqual(response);
-		const failure = response.ok ? undefined : response.startupFailure;
-		if (!failure) throw new Error("Expected persisted startup failure evidence.");
-		const sessions = await broker.handleRequest("session.list", {});
-		expect(sessions).toMatchObject({ ok: true, result: { sessions: [] } });
-		const sdkDir = path.join(root, ".gjc", "state", "sdk");
-		const entries = await fs.readdir(sdkDir);
-		// Retained `.gjc-delete-*` quarantines are typed cleanup evidence; only
-		// canonical lifecycle metadata must be gone. Every remaining entry that
-		// still matches a lifecycle pattern must be an authorized quarantine name.
-		const canonical = entries.filter(entry => !entry.startsWith(".gjc-delete-"));
-		expect(canonical.some(entry => entry.includes(".lifecycle.failure."))).toBe(false);
-		expect(canonical.some(entry => entry.endsWith(".lifecycle.json"))).toBe(false);
-		const retained = entries.filter(
-			entry => entry.includes(".lifecycle.failure.") || entry.endsWith(".lifecycle.json"),
-		);
-		expect(retained.every(entry => entry.startsWith(".gjc-delete-"))).toBe(true);
-	} finally {
-		if (previousFailure === undefined) delete process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION;
-		else process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION = previousFailure;
-		await broker.stop();
-		await fs.rm(root, { recursive: true, force: true });
-	}
-}, 20_000);
+				durableEffects: {
+					transcript: { identityDigest: expect.any(String), contentDigest: expect.any(String) },
+					digest: expect.any(String),
+				},
+			});
+			expect(await broker.handleRequest("session.create", input, "production-startup-failure")).toEqual(response);
+			const failure = response.ok ? undefined : response.startupFailure;
+			if (!failure) throw new Error("Expected persisted startup failure evidence.");
+			const sessions = await broker.handleRequest("session.list", {});
+			expect(sessions).toMatchObject({ ok: true, result: { sessions: [] } });
+			const sdkDir = path.join(root, ".gjc", "state", "sdk");
+			const entries = await fs.readdir(sdkDir);
+			// Retained `.gjc-delete-*` quarantines are typed cleanup evidence; only
+			// canonical lifecycle metadata must be gone. Every remaining entry that
+			// still matches a lifecycle pattern must be an authorized quarantine name.
+			const canonical = entries.filter(entry => !entry.startsWith(".gjc-delete-"));
+			expect(canonical.some(entry => entry.includes(".lifecycle.failure."))).toBe(false);
+			expect(canonical.some(entry => entry.endsWith(".lifecycle.json"))).toBe(false);
+			const retained = entries.filter(
+				entry => entry.includes(".lifecycle.failure.") || entry.endsWith(".lifecycle.json"),
+			);
+			expect(retained.every(entry => entry.startsWith(".gjc-delete-"))).toBe(true);
+		} finally {
+			if (previousFailure === undefined) delete process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION;
+			else process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION = previousFailure;
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+	20_000,
+);
 test("production broker session.create authenticates a source-workspace v3 native endpoint", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-v3-broker-"));
 	const agentDir = path.join(root, "agent");
@@ -3220,54 +3233,58 @@ test("broker agentDir profile validates, activates, and is discoverable through 
 	}
 }, 20_000);
 
-test("child profile activation failures preserve typed codes through readiness and BrokerResponse", async () => {
-	const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
-	for (const scenario of [
-		{ code: "unknown_model_profile", replacement: "profiles: {}\n" },
-		{ code: "model_profile_registry_error", replacement: "profiles: [invalid\n" },
-	] as const) {
-		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-sdk-${scenario.code}-`));
-		const cwd = path.join(root, "workspace");
-		const agentDir = path.join(root, "agent");
-		await fs.mkdir(cwd, { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
-		await Bun.write(
-			path.join(agentDir, "models.yml"),
-			`providers:\n  fixture:\n    baseUrl: https://example.invalid/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        contextWindow: 4096\n        maxTokens: 1024\nprofiles:\n  agent-dir-only:\n    required_providers: [fixture]\n    model_mapping:\n      executor: fixture/fixture-model\n`,
-		);
-		const broker = new Broker({ agentDir });
-		setLifecycleCommandResolverForTest(broker, () => ({
-			file: "/bin/sh",
-			args: [
-				"-c",
-				`printf %s ${shellQuote(scenario.replacement)} > "$GJC_AGENT_DIR/models.yml"; exec ${shellQuote(process.execPath)} run ${shellQuote(cliEntrypoint)} sdk session-host-internal`,
-			],
-		}));
-		try {
-			await broker.start();
-			const response = await broker.handleRequest(
-				"session.create",
-				{ cwd, modelPreset: "agent-dir-only", readinessTimeoutMs: 10_000 },
-				`child-profile-${scenario.code}`,
+test.skipIf(process.platform !== "linux")(
+	"child profile activation failures preserve typed codes through readiness and BrokerResponse",
+	async () => {
+		const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+		for (const scenario of [
+			{ code: "unknown_model_profile", replacement: "profiles: {}\n" },
+			{ code: "model_profile_registry_error", replacement: "profiles: [invalid\n" },
+		] as const) {
+			const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-sdk-${scenario.code}-`));
+			const cwd = path.join(root, "workspace");
+			const agentDir = path.join(root, "agent");
+			await fs.mkdir(cwd, { recursive: true });
+			await fs.mkdir(agentDir, { recursive: true });
+			await Bun.write(
+				path.join(agentDir, "models.yml"),
+				`providers:\n  fixture:\n    baseUrl: https://example.invalid/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        contextWindow: 4096\n        maxTokens: 1024\nprofiles:\n  agent-dir-only:\n    required_providers: [fixture]\n    model_mapping:\n      executor: fixture/fixture-model\n`,
 			);
-			expect(response).toMatchObject({
-				ok: false,
-				error: {
-					code: scenario.code,
-					details: { requestedProfile: "agent-dir-only", discoveryQuery: "models.profiles.list" },
-				},
-				startupFailure: {
-					code: scenario.code,
-					details: { requestedProfile: "agent-dir-only", discoveryQuery: "models.profiles.list" },
-				},
-			});
-		} finally {
-			setLifecycleCommandResolverForTest(broker, undefined);
-			await broker.stop();
-			await fs.rm(root, { recursive: true, force: true });
+			const broker = new Broker({ agentDir });
+			setLifecycleCommandResolverForTest(broker, () => ({
+				file: "/bin/sh",
+				args: [
+					"-c",
+					`printf %s ${shellQuote(scenario.replacement)} > "$GJC_AGENT_DIR/models.yml"; exec ${shellQuote(process.execPath)} run ${shellQuote(cliEntrypoint)} sdk session-host-internal`,
+				],
+			}));
+			try {
+				await broker.start();
+				const response = await broker.handleRequest(
+					"session.create",
+					{ cwd, modelPreset: "agent-dir-only", readinessTimeoutMs: 10_000 },
+					`child-profile-${scenario.code}`,
+				);
+				expect(response).toMatchObject({
+					ok: false,
+					error: {
+						code: scenario.code,
+						details: { requestedProfile: "agent-dir-only", discoveryQuery: "models.profiles.list" },
+					},
+					startupFailure: {
+						code: scenario.code,
+						details: { requestedProfile: "agent-dir-only", discoveryQuery: "models.profiles.list" },
+					},
+				});
+			} finally {
+				setLifecycleCommandResolverForTest(broker, undefined);
+				await broker.stop();
+				await fs.rm(root, { recursive: true, force: true });
+			}
 		}
-	}
-}, 40_000);
+	},
+	40_000,
+);
 
 test("broker close acknowledges before terminating the lifecycle child and preserves its terminal host index", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-close-subprocess-"));

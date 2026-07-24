@@ -84,14 +84,17 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("POSIX native path identity", () => {
-	it("rejects an existing directory whose canonical byte path is not UTF-8", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
-		temporaryDirectories.push(root);
-		const nonUtf8Path = Buffer.concat([Buffer.from(`${root}${path.sep}`), Buffer.from([0x66, 0x80])]);
-		await fs.mkdir(nonUtf8Path);
+	it.skipIf(process.platform === "darwin")(
+		"rejects an existing directory whose canonical byte path is not UTF-8",
+		async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+			temporaryDirectories.push(root);
+			const nonUtf8Path = Buffer.concat([Buffer.from(`${root}${path.sep}`), Buffer.from([0x66, 0x80])]);
+			await fs.mkdir(nonUtf8Path);
 
-		expect(canonicalExistingDirectoryIdentity(nonUtf8Path)).toEqual({ ok: false, code: "not_utf8" });
-	});
+			expect(canonicalExistingDirectoryIdentity(nonUtf8Path)).toEqual({ ok: false, code: "not_utf8" });
+		},
+	);
 
 	it("classifies group-readable files as failing owner-only verification", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));

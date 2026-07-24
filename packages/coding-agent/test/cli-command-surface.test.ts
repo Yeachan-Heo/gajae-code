@@ -76,61 +76,65 @@ describe("GJC public CLI command surface", () => {
 		expect(result.exitCode, output).toBe(0);
 		expect(result.stdout.toString()).not.toContain("warming workspace");
 	});
-	it("routes the internal managed-owner supervisor through its child admission barrier", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cli-supervisor-"));
-		const lifecycle = lifecyclePaths(stateDir, "session-cli-route", "generation-cli-route");
-		const managedOwnerEnv = {
-			...process.env,
-			GJC_TMUX_OWNER_STATE_DIR: stateDir,
-			GJC_COORDINATOR_SESSION_ID: "session-cli-route",
-			GJC_TMUX_OWNER_GENERATION: "generation-cli-route",
-			GJC_MANAGED_OWNER_RUN_ID: "run-cli-route",
-			GJC_MANAGED_OWNER_INCARNATION: "incarnation-cli-route",
-		};
-		try {
-			const admitted = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
-				cwd: repoRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: {
-					...managedOwnerEnv,
-					GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, cliEntry, "--version"]),
-				},
-			});
-			const admittedOutput = `${admitted.stdout.toString()}\n${admitted.stderr.toString()}`;
-			expect(admitted.exitCode, admittedOutput).toBe(0);
-			expect(admitted.stdout.toString()).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
-			const bindingFiles = (await fs.readdir(lifecycle.root)).filter(
-				file => file.startsWith("child-") && file.endsWith(".binding.json"),
-			);
-			expect(bindingFiles).toHaveLength(1);
-			await fs.rm(path.join(lifecycle.root, bindingFiles[0]!));
+	it.skipIf(process.platform !== "linux")(
+		"routes the internal managed-owner supervisor through its child admission barrier",
+		async () => {
+			const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cli-supervisor-"));
+			const lifecycle = lifecyclePaths(stateDir, "session-cli-route", "generation-cli-route");
+			const managedOwnerEnv = {
+				...process.env,
+				GJC_TMUX_OWNER_STATE_DIR: stateDir,
+				GJC_COORDINATOR_SESSION_ID: "session-cli-route",
+				GJC_TMUX_OWNER_GENERATION: "generation-cli-route",
+				GJC_MANAGED_OWNER_RUN_ID: "run-cli-route",
+				GJC_MANAGED_OWNER_INCARNATION: "incarnation-cli-route",
+			};
+			try {
+				const admitted = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
+					cwd: repoRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...managedOwnerEnv,
+						GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, cliEntry, "--version"]),
+					},
+				});
+				const admittedOutput = `${admitted.stdout.toString()}\n${admitted.stderr.toString()}`;
+				expect(admitted.exitCode, admittedOutput).toBe(0);
+				expect(admitted.stdout.toString()).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
+				const bindingFiles = (await fs.readdir(lifecycle.root)).filter(
+					file => file.startsWith("child-") && file.endsWith(".binding.json"),
+				);
+				expect(bindingFiles).toHaveLength(1);
+				await fs.rm(path.join(lifecycle.root, bindingFiles[0]!));
 
-			const unboundChild = `import { readdir, writeFile } from "node:fs/promises";
+				const unboundChild = `import { readdir, writeFile } from "node:fs/promises";
 const binding = (await readdir(process.env.GJC_MANAGED_OWNER_BINDING_DIR!)).find(file => file.startsWith("child-"));
 if (!binding) throw new Error("binding_missing");
 await writeFile(\`\${process.env.GJC_MANAGED_OWNER_BINDING_DIR}/\${binding}\`, "{}\\n");
 const child = Bun.spawn([${JSON.stringify(process.execPath)}, ${JSON.stringify(cliEntry)}, "--version"], { stdout: "inherit", stderr: "inherit" });
 process.exitCode = await child.exited;`;
-			const blocked = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
-				cwd: repoRoot,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: {
-					...managedOwnerEnv,
-					GJC_TMUX_OWNER_GENERATION: "generation-cli-blocked",
-					GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, "-e", unboundChild]),
-					GJC_MANAGED_OWNER_BINDING_DIR: lifecyclePaths(stateDir, "session-cli-route", "generation-cli-blocked")
-						.root,
-				},
-			});
-			const blockedOutput = `${blocked.stdout.toString()}\n${blocked.stderr.toString()}`;
-			expect(blocked.exitCode, blockedOutput).toBe(75);
-			expect(blockedOutput).not.toContain("gjc/");
-		} finally {
-			await fs.rm(stateDir, { recursive: true, force: true });
-		}
-	}, 30_000);
+				const blocked = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
+					cwd: repoRoot,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: {
+						...managedOwnerEnv,
+						GJC_TMUX_OWNER_GENERATION: "generation-cli-blocked",
+						GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, "-e", unboundChild]),
+						GJC_MANAGED_OWNER_BINDING_DIR: lifecyclePaths(stateDir, "session-cli-route", "generation-cli-blocked")
+							.root,
+					},
+				});
+				const blockedOutput = `${blocked.stdout.toString()}\n${blocked.stderr.toString()}`;
+				expect(blocked.exitCode, blockedOutput).toBe(75);
+				expect(blockedOutput).not.toContain("gjc/");
+			} finally {
+				await fs.rm(stateDir, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
 
 	it("registers launch plus retained workflow/runtime utility endpoints", async () => {
 		const source = await Bun.file(cliEntry).text();

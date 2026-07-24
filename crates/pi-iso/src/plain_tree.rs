@@ -454,7 +454,9 @@ mod tests {
 		sync::atomic::{AtomicU64, Ordering},
 	};
 
-	use super::{PlainTree, index_tree};
+	#[cfg(windows)]
+	use super::PlainTree;
+	use super::index_tree;
 
 	static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 

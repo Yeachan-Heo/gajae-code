@@ -131,6 +131,7 @@ function compactEvents(events: SessionIndexEvent[]): SessionIndexEvent[] {
 
 async function appendSync(file: string, value: string): Promise<void> {
 	const h = await fs.open(file, "a", 0o600);
+	let failure: { error: unknown } | undefined;
 	try {
 		const data = Buffer.from(`${value}\n`);
 		for (let offset = 0; offset < data.length; ) {
@@ -139,9 +140,18 @@ async function appendSync(file: string, value: string): Promise<void> {
 			offset += bytesWritten;
 		}
 		await h.sync();
-	} finally {
-		await h.close();
+	} catch (error) {
+		failure = { error };
 	}
+	try {
+		await h.close();
+	} catch (error) {
+		// Bun may report EBADF when concurrent child-pipe teardown has already
+		// released a fully written and fsynced append handle. The descriptor is
+		// closed in that case; every other close failure remains fatal.
+		if ((error as NodeJS.ErrnoException).code !== "EBADF" && failure === undefined) failure = { error };
+	}
+	if (failure !== undefined) throw failure.error;
 }
 
 async function syncDirectory(file: string): Promise<void> {
