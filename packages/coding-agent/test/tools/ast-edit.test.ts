@@ -179,6 +179,41 @@ describe("ast_edit tool schema", () => {
 		}
 	});
 
+	it("applies only files captured by the approved preview", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-frozen-targets-"));
+		try {
+			const previewedPath = path.join(tempDir, "previewed.ts");
+			const lateMatchPath = path.join(tempDir, "late.ts");
+			await Bun.write(previewedPath, "legacyWrap(x, value)\n");
+			await Bun.write(lateMatchPath, "otherWrap(x, value)\n");
+			const queue = new ToolChoiceQueue();
+			const tools = await createTools(
+				createTestSession(tempDir, {
+					getToolChoiceQueue: () => queue,
+					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
+					steer: () => {},
+				}),
+			);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			await tool!.execute("ast-edit-preview", {
+				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+				paths: [tempDir],
+			});
+			await Bun.write(lateMatchPath, "legacyWrap(x, value)\n");
+
+			queue.nextToolChoice();
+			const invoker = queue.peekInFlightInvoker()!;
+			await invoker({ action: "apply", reason: "apply frozen preview targets" });
+
+			expect(await Bun.file(previewedPath).text()).toBe("modernWrap(x, value)\n");
+			expect(await Bun.file(lateMatchPath).text()).toBe("legacyWrap(x, value)\n");
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("combines globbing from path and glob parameters", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-glob-"));
 		try {

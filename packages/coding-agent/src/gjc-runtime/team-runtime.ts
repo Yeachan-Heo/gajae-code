@@ -184,6 +184,8 @@ export interface GjcTeamConfig {
 	leader: GjcTeamLeader;
 	leader_cwd: string;
 	team_state_root: string;
+	task_ids?: string[];
+	task_authorities?: Record<string, string>;
 	workers: GjcTeamWorker[];
 	created_at: string;
 	updated_at: string;
@@ -988,9 +990,28 @@ async function pruneTeamWorkerGcRecordUnlocked(
 	if (!classifyTeamGcWorkerPids(pids, probe).removable) return false;
 
 	const claimDir = path.join(teamDirPath, "claims");
+	const rejectedRecoveryTaskIds = new Set<string>();
+	for (const task of await readTasks(teamDirPath)) {
+		if (task.claim?.owner !== workerId && task.assignee !== workerId) continue;
+		if (task.status === "completed" || task.status === "failed") continue;
+		if (
+			!(await capability.writeRecovered({
+				...task,
+				status: "pending",
+				assignee: undefined,
+				claim: undefined,
+				version: task.version + 1,
+				updated_at: now(),
+			}))
+		) {
+			rejectedRecoveryTaskIds.add(task.id);
+		}
+	}
+
 	try {
 		for (const entry of await fs.readdir(claimDir, { withFileTypes: true })) {
 			if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+			if (rejectedRecoveryTaskIds.has(path.basename(entry.name, ".json"))) continue;
 			const claimPath = path.join(claimDir, entry.name);
 			const claim = readClaimRecord(await readJsonFile<unknown>(claimPath));
 			if (claim?.owner !== workerId) continue;
@@ -998,19 +1019,6 @@ async function pruneTeamWorkerGcRecordUnlocked(
 		}
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
-	}
-
-	for (const task of await readTasks(teamDirPath)) {
-		if (task.claim?.owner !== workerId && task.assignee !== workerId) continue;
-		if (task.status === "completed" || task.status === "failed") continue;
-		await capability.writeRecovered({
-			...task,
-			status: "pending",
-			assignee: undefined,
-			claim: undefined,
-			version: task.version + 1,
-			updated_at: now(),
-		});
 	}
 
 	// Remove the stale worker record dir itself so a removable record always
@@ -3564,8 +3572,9 @@ async function integrateGjcWorkerCommits(
 	return integrationByWorker;
 }
 
-const writeInitialGjcTeamTask = (dir: string, task: GjcTeamTask) =>
-	withGjcTeamTaskMutation(taskStore(dir), capability => capability.writeRecovered(task));
+const writeInitialGjcTeamTask = async (dir: string, task: GjcTeamTask): Promise<void> => {
+	await withGjcTeamTaskMutation(taskStore(dir), capability => capability.writeRecovered(task));
+};
 
 export async function startGjcTeam(options: GjcTeamStartOptions): Promise<GjcTeamSnapshot> {
 	return startGjcTeamLaunch(
@@ -4422,10 +4431,7 @@ export async function createGjcTeamTask(
 	return withGjcTeamTaskMutation(taskStore(dir), async capability => {
 		const config = await readConfig(dir);
 		if (taskOptions.owner) assertKnownWorker(config, taskOptions.owner);
-		const task = await capability.create(subject, description, taskOptions);
-		config.updated_at = now();
-		await writeJsonFile(path.join(dir, "config.json"), config);
-		return task;
+		return capability.create(subject, description, taskOptions);
 	});
 }
 export async function updateGjcTeamTask(
@@ -4448,7 +4454,7 @@ export async function updateGjcTeamTask(
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<GjcTeamTask> {
 	const dir = await findTeamDir(teamName, cwd, env);
-	return taskStore(dir).update(taskId, updates);
+	return withGjcTeamTaskMutation(taskStore(dir), capability => capability.update(taskId, updates));
 }
 export async function claimGjcTeamTask(
 	teamName: string,

@@ -26,7 +26,7 @@ import {
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd } from "../../tools/path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
-import { enforceTeamWriteScope } from "../../tools/team-write-scope";
+import { withTeamWriteScopeMutation } from "../../tools/team-write-scope";
 import { ToolError } from "../../tools/tool-errors";
 import {
 	ApplyPatchError,
@@ -105,6 +105,8 @@ export interface ApplyPatchOptions {
 	 * object identity is not a durable-lock capability probe.
 	 */
 	crossProcessLock?: boolean;
+	/** @internal Caller already holds the complete mutation lock set. */
+	mutationLock?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1446,6 +1448,7 @@ export async function applyPatch(input: PatchInput, options: ApplyPatchOptions):
 	// dryRun/preview must stay read-only: never create durable `<path>.lock` dirs
 	// (would fail on read-only parents and mutate the FS during preview) (#2900 review).
 	const crossProcess = options.dryRun === true ? false : (options.crossProcessLock ?? usingDefaultFs);
+	if (options.mutationLock === false) return applyNormalizedPatch(input, options);
 	return withEditPathMutation(mutationPaths, () => applyNormalizedPatch(input, options), { crossProcess });
 }
 
@@ -1567,6 +1570,9 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 			throw new ApplyPatchError(`concurrent edit conflict: file changed since read: ${input.path}`);
 		}
 		if (isMove) {
+			if (await fs.exists(destPath)) {
+				throw new ApplyPatchError(`Destination already exists: ${input.rename}`);
+			}
 			const parentDir = path.dirname(destPath);
 			if (parentDir && parentDir !== ".") {
 				await fs.mkdir(parentDir);
@@ -1774,8 +1780,6 @@ export async function executePatchSingle(
 	enforcePlanModeWrite(session, path, { op, move: rename });
 	const resolvedPath = resolvePlanPath(session, path);
 	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
-	await enforceTeamWriteScope(session, resolvedPath);
-	if (resolvedRename) await enforceTeamWriteScope(session, resolvedRename);
 
 	await assertEditableFile(resolvedPath, path);
 
@@ -1803,13 +1807,27 @@ export async function executePatchSingle(
 	// not `defaultFileSystem` by object identity. Force durable cross-process
 	// locking so multi-process agents cannot silently race past the path mutex
 	// (#2900 review: do not infer lock capability from FileSystem identity).
-	const result = await applyPatch(input, {
-		cwd: session.cwd,
-		fs: patchFileSystem,
-		fuzzyThreshold,
-		allowFuzzy,
-		crossProcessLock: true,
-	});
+	const result = await withTeamWriteScopeMutation(
+		session,
+		resolvedRename ? [resolvedPath, resolvedRename] : [resolvedPath],
+		canonicalPaths =>
+			applyPatch(
+				{
+					...input,
+					path: canonicalPaths[0]!,
+					rename: resolvedRename ? canonicalPaths[1]! : undefined,
+				},
+				{
+					cwd: session.cwd,
+					fs: patchFileSystem,
+					fuzzyThreshold,
+					allowFuzzy,
+					crossProcessLock: true,
+					mutationLock: false,
+				},
+			),
+		{ crossProcess: true },
+	);
 
 	// Post-write verification: only meaningful for in-place updates where the
 	// patch actually changes content and the file is not being renamed away.
@@ -1823,7 +1841,7 @@ export async function executePatchSingle(
 	) {
 		let postEditContent: Uint8Array | undefined;
 		try {
-			postEditContent = await fs.promises.readFile(resolvedPath);
+			postEditContent = await fs.promises.readFile(result.change.path);
 		} catch (err) {
 			if (!isEnoent(err)) throw err;
 		}

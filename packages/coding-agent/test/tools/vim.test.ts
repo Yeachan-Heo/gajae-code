@@ -276,6 +276,31 @@ describe("vim tool", () => {
 		expect(saved).toContain("bar = foo + 1;");
 	});
 
+	it("does not create missing files through forced saves", async () => {
+		const filePath = path.join(tmpDir, "missing.ts");
+		const tool = new VimTool(createSession(tmpDir));
+
+		await tool.execute("open", { file: "missing.ts" });
+		await expect(
+			tool.execute("edit", { file: "missing.ts", steps: [step(["i"], "created elsewhere")] }),
+		).rejects.toThrow(/write tool to create/);
+		expect(await Bun.file(filePath).exists()).toBe(false);
+	});
+
+	it("does not let forced saves overwrite a changed file", async () => {
+		const filePath = path.join(tmpDir, "stale.ts");
+		await Bun.write(filePath, "original\n");
+		const tool = new VimTool(createSession(tmpDir));
+
+		await tool.execute("open", { file: "stale.ts" });
+		await tool.execute("edit", { file: "stale.ts", steps: [step(["ciwlocal<Esc>"])], pause: true });
+		await Bun.write(filePath, "external change\n");
+		await expect(tool.execute("save", { file: "stale.ts", steps: [step([":w!<CR>"])] })).rejects.toThrow(
+			/changed on disk/,
+		);
+		expect(await Bun.file(filePath).text()).toBe("external change\n");
+	});
+
 	it("keeps the cursor line visible after large jumps", async () => {
 		const filePath = path.join(tmpDir, "long.ts");
 		await Bun.write(filePath, Array.from({ length: 1100 }, (_, index) => `line ${index + 1};`).join("\n"));

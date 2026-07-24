@@ -843,10 +843,9 @@ export async function reconcileGjcTeamStaleClaimsUnlocked(
 			(await hasActiveContinuationHold(runtime, dir, claim.owner, config, task, claim))
 		)
 			continue;
-		await fs.rm(claimPath, { force: true });
-		recoveredClaims.push({ task_id: task.id, worker: claim.owner, reasons });
-		if (task.status === "in_progress")
-			await capability.writeRecovered(
+		if (
+			task.status === "in_progress" &&
+			!(await capability.writeRecovered(
 				normalizeGjcTeamTask({
 					...task,
 					status: "pending",
@@ -855,7 +854,12 @@ export async function reconcileGjcTeamStaleClaimsUnlocked(
 					version: task.version + 1,
 					updated_at: runtime.now(),
 				}),
-			);
+			))
+		) {
+			continue;
+		}
+		await fs.rm(claimPath, { force: true });
+		recoveredClaims.push({ task_id: task.id, worker: claim.owner, reasons });
 		await runtime.appendEvent(dir, {
 			type: "task_claim_recovered",
 			task_id: task.id,

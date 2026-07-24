@@ -31,6 +31,7 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { clampTimeout } from "@gajae-code/coding-agent/tools/tool-timeouts";
 import * as piUtils from "@gajae-code/utils";
 import { sanitizeText, TempDir } from "@gajae-code/utils";
+import { applyWorkspaceEdit } from "../../src/lsp/edits";
 
 describe("lsp regressions", () => {
 	afterEach(() => {
@@ -506,6 +507,36 @@ describe("lsp regressions", () => {
 			await fs.promises.rm(externalBinDir, { recursive: true, force: true });
 		}
 	});
+
+	it("rejects workspace renames when the destination already exists", async () => {
+		const tempDir = TempDir.createSync("@gjc-lsp-workspace-rename-");
+		try {
+			const source = path.join(tempDir.path(), "source.ts");
+			const destination = path.join(tempDir.path(), "destination.ts");
+			await Bun.write(source, "source\n");
+			await Bun.write(destination, "destination\n");
+
+			await expect(
+				applyWorkspaceEdit(
+					{
+						documentChanges: [
+							{
+								kind: "rename",
+								oldUri: fileToUri(source),
+								newUri: fileToUri(destination),
+							},
+						],
+					},
+					tempDir.path(),
+				),
+			).rejects.toThrow(/Destination already exists/);
+			expect(await Bun.file(source).text()).toBe("source\n");
+			expect(await Bun.file(destination).text()).toBe("destination\n");
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
 	it("rename_file applies LSP willRenameFiles edits and renames the file", async () => {
 		const tempDir = TempDir.createSync("@gjc-lsp-rename-file-");
 		try {

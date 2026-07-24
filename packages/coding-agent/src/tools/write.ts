@@ -7,7 +7,6 @@ import { Text } from "@gajae-code/tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { stripHashlinePrefixes } from "../edit";
-import { withEditPathMutation } from "../edit/path-mutation-lock";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
@@ -49,7 +48,7 @@ import {
 	updateRowByKey,
 	updateRowByRowId,
 } from "./sqlite-reader";
-import { enforceTeamWriteScope } from "./team-write-scope";
+import { enforceTeamWriteScope, withTeamWriteScopeMutation } from "./team-write-scope";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -466,7 +465,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const absolutePath = entry.absolutePath;
-		await enforceTeamWriteScope(this.session, absolutePath);
 		if (!(await fs.exists(absolutePath))) {
 			throw new ToolError(`Conflict #${entry.id} target '${entry.displayPath}' no longer exists.`);
 		}
@@ -524,8 +522,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				`Conflict #${id} not found. Conflict ids are registered when \`read\` surfaces a marker block; re-read the file to get a current id.`,
 			);
 		}
-		return withEditPathMutation([entry.absolutePath], () =>
-			this.#resolveConflict(entry, replacementContent, stripped, signal, context),
+		return withTeamWriteScopeMutation(this.session, [entry.absolutePath], ([canonicalPath]) =>
+			this.#resolveConflict(
+				{ ...entry, absolutePath: canonicalPath! },
+				replacementContent,
+				stripped,
+				signal,
+				context,
+			),
 		);
 	}
 
@@ -549,6 +553,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		stripped: boolean,
 		signal: AbortSignal | undefined,
 		context: AgentToolContext | undefined,
+		canonicalPaths: ReadonlyMap<string, string> = new Map(),
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const history = getConflictHistory(this.session);
 		const allEntries = history.entries();
@@ -560,9 +565,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 		const byFile = new Map<string, ConflictEntry[]>();
 		for (const entry of allEntries) {
-			const bucket = byFile.get(entry.absolutePath) ?? [];
+			const mutationPath = canonicalPaths.get(entry.absolutePath) ?? entry.absolutePath;
+			const bucket = byFile.get(mutationPath) ?? [];
 			bucket.push(entry);
-			byFile.set(entry.absolutePath, bucket);
+			byFile.set(mutationPath, bucket);
 		}
 
 		const batchRequest = getLspBatchRequest(context?.toolCall);
@@ -711,11 +717,21 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}
 				const result =
 					conflictUri.id === "*"
-						? await withEditPathMutation(
+						? await withTeamWriteScopeMutation(
+								this.session,
 								getConflictHistory(this.session)
 									.entries()
 									.map(entry => entry.absolutePath),
-								() => this.#resolveAllConflicts(cleanContent, stripped, signal, context),
+								canonicalPaths => {
+									const entries = getConflictHistory(this.session).entries();
+									return this.#resolveAllConflicts(
+										cleanContent,
+										stripped,
+										signal,
+										context,
+										new Map(entries.map((entry, index) => [entry.absolutePath, canonicalPaths[index]!])),
+									);
+								},
 							)
 						: await this.#resolveSingleConflictById(conflictUri.id, cleanContent, stripped, signal, context);
 				if (conflictUri.recoveredPrefix !== undefined) {
@@ -731,9 +747,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				enforcePlanModeWrite(this.session, resolvedArchivePath.archivePath, {
 					op: resolvedArchivePath.exists ? "update" : "create",
 				});
-				await enforceTeamWriteScope(this.session, resolvedArchivePath.absolutePath);
-
-				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath);
+				const archiveResult = await withTeamWriteScopeMutation(
+					this.session,
+					[resolvedArchivePath.absolutePath],
+					([canonicalPath]) =>
+						this.#writeArchiveEntry(cleanContent, {
+							...resolvedArchivePath,
+							absolutePath: canonicalPath!,
+						}),
+				);
 				if (stripped) {
 					const firstText = archiveResult.content.find(
 						(block): block is { type: "text"; text: string } =>
@@ -749,9 +771,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path);
 			if (resolvedSqlitePath) {
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
-				await enforceTeamWriteScope(this.session, resolvedSqlitePath.absolutePath);
-
-				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);
+				const sqliteResult = await withTeamWriteScopeMutation(
+					this.session,
+					[resolvedSqlitePath.absolutePath],
+					([canonicalPath]) =>
+						this.#writeSqliteRow(path, cleanContent, {
+							...resolvedSqlitePath,
+							absolutePath: canonicalPath!,
+						}),
+				);
 				if (stripped) {
 					const firstText = sqliteResult.content.find(
 						(block): block is { type: "text"; text: string } =>
@@ -768,23 +796,24 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const bridgeCapabilities = this.session.getClientBridge?.()?.capabilities;
 			const useBridge = bridgeCapabilities?.createTextFile === true;
 			enforcePlanModeWrite(this.session, path, { op: "create" });
-			await enforceTeamWriteScope(this.session, absolutePath);
 			if (bridgeCapabilities?.writeTextFile && !useBridge) {
 				throw new ToolError("Client bridge cannot guarantee atomic create-only writes.");
 			}
-			return withEditPathMutation(
+			return withTeamWriteScopeMutation(
+				this.session,
 				[absolutePath],
-				async () => {
+				async ([canonicalPath]) => {
+					const mutationPath = canonicalPath!;
 					// Try ACP bridge first — no disk write when client handles it
 					if (useBridge) {
-						const bridgePromise = this.#routeCreateThroughBridge(absolutePath, cleanContent);
+						const bridgePromise = this.#routeCreateThroughBridge(mutationPath, cleanContent);
 						if (!bridgePromise) throw new ToolError("Client bridge createTextFile capability is unavailable.");
 						try {
 							await bridgePromise;
 						} catch (error) {
 							throw new ToolError(error instanceof Error ? error.message : String(error));
 						}
-						invalidateFsScanAfterWrite(absolutePath);
+						invalidateFsScanAfterWrite(mutationPath);
 						const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 						let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
 						if (stripped) {
@@ -793,8 +822,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						return { content: [{ type: "text" as const, text: resultText }], details: {} };
 					}
 
-					await this.#createLocalFileExclusive(absolutePath, cleanContent);
-					invalidateFsScanAfterWrite(absolutePath);
+					await this.#createLocalFileExclusive(mutationPath, cleanContent);
+					invalidateFsScanAfterWrite(mutationPath);
 
 					const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 					let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;

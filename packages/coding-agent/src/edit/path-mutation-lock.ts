@@ -6,12 +6,15 @@
  * disjoint edits (https://github.com/Yeachan-Heo/gajae-code/issues/2900).
  *
  * - Always: in-process async mutex keyed by resolved absolute path.
- * - Optionally: durable cross-process `<path>.lock` via `withFileLock` for real
- *   filesystem mutations (subagents / separate processes).
+ * - Optionally: durable cross-process lock under the host temp directory via
+ *   `withFileLock` for real filesystem mutations (subagents / separate processes).
+ *   Detached locks survive source-directory renames and never create target parents.
  *
  * Nested acquisition of the same path is not supported; callers that already
  * hold the lock must not re-enter.
  */
+import { createHash } from "node:crypto";
+import * as os from "node:os";
 import * as path from "node:path";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
 
@@ -73,6 +76,11 @@ const DEFAULT_CROSS_PROCESS_LOCK: FileLockOptions = {
 	retryDelayMs: 50,
 };
 
+function durableMutationLockTarget(absolutePath: string): string {
+	const digest = createHash("sha256").update(path.resolve(absolutePath)).digest("hex");
+	return path.join(os.tmpdir(), "gjc-edit-path-locks", digest);
+}
+
 export type EditPathMutationOptions = {
 	/**
 	 * When true (default), also acquire a durable cross-process file lock.
@@ -104,7 +112,7 @@ export async function withEditPathMutation<T>(
 		const next = () => runAt(index + 1);
 		return withInProcessPathLock(target, async () => {
 			if (!crossProcess) return next();
-			return withFileLock(target, next, fileLock);
+			return withFileLock(durableMutationLockTarget(target), next, fileLock);
 		});
 	};
 

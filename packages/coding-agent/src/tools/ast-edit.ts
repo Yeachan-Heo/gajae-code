@@ -5,7 +5,6 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { $pickenvpos, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { withEditPathMutation } from "../edit/path-mutation-lock";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { computeLineHash, HL_BODY_SEP } from "../hashline/hash";
 import type { Theme } from "../modes/theme/theme";
@@ -17,7 +16,7 @@ import type { ToolSession } from ".";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { formatGroupedFiles } from "./grouped-file-output";
 import type { OutputMeta } from "./output-meta";
-import { resolveToolSearchScope } from "./path-utils";
+import { formatPathRelativeToCwd, resolveToolSearchScope } from "./path-utils";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -32,7 +31,7 @@ import {
 	splitGroupsByBlankLine,
 } from "./render-utils";
 import { queueResolveHandler } from "./resolve";
-import { enforceTeamWriteScope } from "./team-write-scope";
+import { withTeamWriteScopeMutation } from "./team-write-scope";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -60,6 +59,7 @@ interface AstEditCallOptions {
 interface AstEditAggregatedResult {
 	changes: AstReplaceChange[];
 	fileChanges: AstReplaceFileChange[];
+	absoluteFileChanges: AstReplaceFileChange[];
 	totalReplacements: number;
 	filesTouched: number;
 	filesSearched: number;
@@ -75,6 +75,7 @@ async function runAstEditTargets(
 ): Promise<AstEditAggregatedResult> {
 	const aggregatedChanges: AstReplaceChange[] = [];
 	const fileCounts = new Map<string, number>();
+	const absoluteFileCounts = new Map<string, number>();
 	const parseErrors: string[] = [];
 	let totalReplacements = 0;
 	let filesSearched = 0;
@@ -104,15 +105,21 @@ async function runAstEditTargets(
 			const absolute = path.resolve(target.basePath, fileChange.path);
 			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
 			fileCounts.set(rebased, (fileCounts.get(rebased) ?? 0) + fileChange.count);
+			absoluteFileCounts.set(absolute, (absoluteFileCounts.get(absolute) ?? 0) + fileChange.count);
 		}
 	}
 	const fileChanges: AstReplaceFileChange[] = Array.from(fileCounts, ([changePath, count]) => ({
 		path: changePath,
 		count,
 	}));
+	const absoluteFileChanges: AstReplaceFileChange[] = Array.from(absoluteFileCounts, ([changePath, count]) => ({
+		path: changePath,
+		count,
+	}));
 	return {
 		changes: aggregatedChanges,
 		fileChanges,
+		absoluteFileChanges,
 		totalReplacements,
 		filesTouched: fileChanges.length,
 		filesSearched,
@@ -122,7 +129,55 @@ async function runAstEditTargets(
 	};
 }
 
-function runAstEditOnce(
+async function runAstEditFiles(
+	files: readonly string[],
+	commonBasePath: string,
+	options: AstEditCallOptions,
+): Promise<AstEditAggregatedResult> {
+	const aggregatedChanges: AstReplaceChange[] = [];
+	const fileChanges: AstReplaceFileChange[] = [];
+	const absoluteFileChanges: AstReplaceFileChange[] = [];
+	const parseErrors: string[] = [];
+	let totalReplacements = 0;
+	let filesSearched = 0;
+	let limitReached = false;
+	let applied = !options.dryRun;
+	for (const file of files) {
+		const result = await astEdit({
+			rewrites: options.rewrites,
+			path: file,
+			dryRun: options.dryRun,
+			maxFiles: options.maxFiles,
+			failOnParseError: options.failOnParseError,
+			signal: options.signal,
+		});
+		const relativePath = path.relative(commonBasePath, file).replace(/\\/g, "/");
+		totalReplacements += result.totalReplacements;
+		filesSearched += result.filesSearched;
+		limitReached = limitReached || result.limitReached;
+		applied = applied && result.applied;
+		if (result.parseErrors) parseErrors.push(...result.parseErrors);
+		aggregatedChanges.push(...result.changes.map(change => ({ ...change, path: relativePath })));
+		const count = result.fileChanges.reduce((sum, change) => sum + change.count, 0);
+		if (count > 0) {
+			fileChanges.push({ path: relativePath, count });
+			absoluteFileChanges.push({ path: file, count });
+		}
+	}
+	return {
+		changes: aggregatedChanges,
+		fileChanges,
+		absoluteFileChanges,
+		totalReplacements,
+		filesTouched: fileChanges.length,
+		filesSearched,
+		applied,
+		limitReached,
+		parseErrors: parseErrors.length > 0 ? parseErrors : undefined,
+	};
+}
+
+async function runAstEditOnce(
 	targets: Array<{ basePath: string; glob?: string }> | undefined,
 	resolvedSearchPath: string,
 	globFilter: string | undefined,
@@ -131,7 +186,7 @@ function runAstEditOnce(
 	if (targets) {
 		return runAstEditTargets(targets, resolvedSearchPath, options);
 	}
-	return astEdit({
+	const result = await astEdit({
 		rewrites: options.rewrites,
 		path: resolvedSearchPath,
 		glob: globFilter,
@@ -140,6 +195,16 @@ function runAstEditOnce(
 		failOnParseError: options.failOnParseError,
 		signal: options.signal,
 	});
+	const isDirectory = (await Bun.file(resolvedSearchPath).stat()).isDirectory();
+	return {
+		...result,
+		absoluteFileChanges: result.fileChanges.map(change => ({
+			path: isDirectory
+				? path.resolve(resolvedSearchPath, change.path.startsWith("/") ? change.path.slice(1) : change.path)
+				: resolvedSearchPath,
+			count: change.count,
+		})),
+	};
 }
 
 export interface AstEditToolDetails {
@@ -336,27 +401,53 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							sessionId: this.session.getSessionId?.() ?? undefined,
 							rawPaths: previewedFiles,
 						});
-						const mutationPaths = previewedFiles.map(previewedFile =>
-							path.resolve(this.session.cwd, previewedFile),
+						const mutationPaths = result.absoluteFileChanges.map(change => change.path);
+						const previewAbsoluteCounts = new Map(
+							result.absoluteFileChanges.map(change => [path.resolve(change.path), change.count]),
 						);
-						for (const mutationPath of mutationPaths) {
-							await enforceTeamWriteScope(this.session, mutationPath);
-						}
-						const applyResult = await withEditPathMutation(mutationPaths, () =>
-							runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-								rewrites: normalizedRewrites,
-								dryRun: false,
-								maxFiles,
-								failOnParseError: false,
-							}),
+						const matchesPreview = (candidate: AstEditAggregatedResult): boolean => {
+							const candidateCounts = new Map(
+								candidate.absoluteFileChanges.map(change => [path.resolve(change.path), change.count]),
+							);
+							return (
+								candidate.totalReplacements === result.totalReplacements &&
+								candidate.filesTouched === result.filesTouched &&
+								[...previewAbsoluteCounts].every(
+									([filePath, count]) => candidateCounts.get(filePath) === count,
+								) &&
+								[...candidateCounts].every(([filePath, count]) => previewAbsoluteCounts.get(filePath) === count)
+							);
+						};
+						let staleBeforeApply = false;
+						const applyResult = await withTeamWriteScopeMutation(
+							this.session,
+							mutationPaths,
+							async canonicalPaths => {
+								const lockedPreview = await runAstEditFiles(canonicalPaths, this.session.cwd, {
+									rewrites: normalizedRewrites,
+									dryRun: true,
+									maxFiles,
+									failOnParseError: false,
+								});
+								if (!matchesPreview(lockedPreview)) {
+									staleBeforeApply = true;
+									return lockedPreview;
+								}
+								return runAstEditFiles(canonicalPaths, this.session.cwd, {
+									rewrites: normalizedRewrites,
+									dryRun: false,
+									maxFiles,
+									failOnParseError: false,
+								});
+							},
 						);
 						const { errors: cappedApplyParseErrors, total: applyParseErrorsTotal } = capParseErrors(
 							applyResult.parseErrors,
 						);
 						const { record: recordAppliedFile, list: appliedFileList } = createFileRecorder();
 						const appliedFileReplacementCounts = new Map<string, number>();
-						for (const fileChange of applyResult.fileChanges) {
-							const relativePath = formatPath(fileChange.path);
+						for (const fileChange of applyResult.absoluteFileChanges) {
+							const relativePath = formatPathRelativeToCwd(fileChange.path, this.session.cwd);
 							recordAppliedFile(relativePath);
 							appliedFileReplacementCounts.set(
 								relativePath,
@@ -384,6 +475,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							fileReplacements: appliedFileReplacements,
 						};
 						const stalePreview =
+							staleBeforeApply ||
 							applyResult.totalReplacements !== result.totalReplacements ||
 							applyResult.filesTouched !== result.filesTouched ||
 							fileList.some(
@@ -393,8 +485,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 								filePath => fileReplacementCounts.get(filePath) !== appliedFileReplacementCounts.get(filePath),
 							);
 						if (stalePreview) {
-							const text =
-								applyResult.totalReplacements === 0
+							const text = staleBeforeApply
+								? `Preview is stale / no longer matches; no replacements were applied. Preview expected ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}.`
+								: applyResult.totalReplacements === 0
 									? `Preview is stale / no longer matches; no replacements were applied. Preview expected ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}.`
 									: applyResult.totalReplacements < result.totalReplacements
 										? `Preview is stale / no longer matches; only ${applyResult.totalReplacements} of ${result.totalReplacements} replacements were applied in ${applyResult.filesTouched} of ${result.filesTouched} files.`

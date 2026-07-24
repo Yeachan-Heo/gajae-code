@@ -13,6 +13,7 @@ import type {
 	GjcTeamWorktreeMode,
 } from "./team-runtime";
 import { createInitialGjcTeamWorkerMemoryGuardLedger, workerMemoryGuardLedgerPath } from "./team-worker-memory-guard";
+import { gjcTeamTaskAuthorityDigest } from "./team-store";
 
 /** Launch-specific option wiring kept separate from runtime dispatch. */
 export function withTeamLaunchTransport(
@@ -271,6 +272,8 @@ export async function startGjcTeamLaunch(
 		},
 		leader_cwd: cwd,
 		team_state_root: stateRoot,
+		task_ids: initialTasks.map(task => task.id).sort(),
+		task_authorities: Object.fromEntries(initialTasks.map(task => [task.id, gjcTeamTaskAuthorityDigest(task)])),
 		workers: workersWithAssignments,
 		created_at: createdAt,
 		updated_at: createdAt,
@@ -289,6 +292,8 @@ export async function startGjcTeamLaunch(
 		worker_cli_plan: config.worker_cli_plan,
 		tmux_command: config.tmux_command,
 		leader: config.leader,
+		task_ids: config.task_ids,
+		task_authorities: config.task_authorities,
 		workers: config.workers,
 		workspace_mode: config.workspace_mode,
 		dry_run: config.dry_run,

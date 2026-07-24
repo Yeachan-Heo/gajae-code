@@ -513,12 +513,13 @@ describe("splitHashlineInput — § headers", () => {
 });
 
 describe("hashline executor", () => {
-	it("creates a missing file with a file-scoped insert", async () => {
+	it("rejects a missing file and leaves creation to write", async () => {
 		await withTempDir(async tempDir => {
 			const input = `§new.ts\n»BOF\n${pl("export const x = 1;")}\n`;
-			const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, input));
-			expect(result.content[0]?.type === "text" ? result.content[0].text : "").toContain("new.ts:");
-			expect(await Bun.file(path.join(tempDir, "new.ts")).text()).toBe("export const x = 1;");
+			await expect(executeHashlineSingle(hashlineExecuteOptions(tempDir, input))).rejects.toThrow(
+				/File not found.*write tool/,
+			);
+			expect(await Bun.file(path.join(tempDir, "new.ts")).exists()).toBe(false);
 		});
 	});
 

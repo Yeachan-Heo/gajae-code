@@ -3,7 +3,6 @@ import { isEnoent } from "@gajae-code/utils";
 import { generateDiffString } from "../edit/diff";
 import { getFileReadCache } from "../edit/file-read-cache";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "../edit/normalize";
-import { withEditPathMutation } from "../edit/path-mutation-lock";
 import { readEditFileText, serializeEditFileText } from "../edit/read-file";
 import type { EditToolDetails } from "../edit/renderer";
 import type { ToolSession } from "../tools";
@@ -11,7 +10,7 @@ import { assertEditableFileContent } from "../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import { outputMeta } from "../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../tools/plan-mode-guard";
-import { enforceTeamWriteScope } from "../tools/team-write-scope";
+import { enforceTeamWriteScope, withTeamWriteScopeMutation } from "../tools/team-write-scope";
 import { HashlineMismatchError } from "./anchors";
 import { applyHashlineEdits, type HashlineApplyResult } from "./apply";
 import { buildCompactHashlineDiffPreview } from "./diff-preview";
@@ -39,13 +38,6 @@ async function readHashlineFile(absolutePath: string, pathText: string): Promise
 			return { exists: false, rawContent: "" };
 		throw error;
 	}
-}
-
-function hasAnchorScopedEdit(edits: HashlineEdit[]): boolean {
-	return edits.some(edit => {
-		if (edit.kind === "delete") return true;
-		return edit.cursor.kind === "before_anchor" || edit.cursor.kind === "after_anchor";
-	});
 }
 
 function formatNoChangeDiagnostic(pathText: string): string {
@@ -113,7 +105,7 @@ async function preflightHashlineSection(options: ExecuteHashlineSingleOptions & 
 	await enforceTeamWriteScope(session, absolutePath);
 
 	const source = await readHashlineFile(absolutePath, sectionPath);
-	if (!source.exists && hasAnchorScopedEdit(edits)) throw new Error(`File not found: ${sectionPath}`);
+	if (!source.exists) throw new Error(`File not found: ${sectionPath}. Use the write tool to create new files.`);
 	if (source.exists) assertEditableFileContent(source.rawContent, sectionPath);
 
 	const { text } = stripBom(source.rawContent);
@@ -130,6 +122,7 @@ async function preflightHashlineSection(options: ExecuteHashlineSingleOptions & 
 
 async function executeHashlineSection(
 	options: ExecuteHashlineSingleOptions & HashlineInputSection,
+	absolutePathOverride?: string,
 ): Promise<AgentToolResult<EditToolDetails, typeof hashlineEditParamsSchema>> {
 	const {
 		session,
@@ -141,13 +134,12 @@ async function executeHashlineSection(
 		beginDeferredDiagnosticsForPath,
 	} = options;
 
-	const absolutePath = resolvePlanPath(session, sourcePath);
+	const absolutePath = absolutePathOverride ?? resolvePlanPath(session, sourcePath);
 	const { edits, warnings: parseWarnings } = parseHashlineWithWarnings(diff);
 	enforcePlanModeWrite(session, sourcePath, { op: "update" });
-	await enforceTeamWriteScope(session, absolutePath);
 
 	const source = await readHashlineFile(absolutePath, sourcePath);
-	if (!source.exists && hasAnchorScopedEdit(edits)) throw new Error(`File not found: ${sourcePath}`);
+	if (!source.exists) throw new Error(`File not found: ${sourcePath}. Use the write tool to create new files.`);
 	if (source.exists) assertEditableFileContent(source.rawContent, sourcePath);
 
 	const { bom, text } = stripBom(source.rawContent);
@@ -226,7 +218,9 @@ export async function executeHashlineSingle(
 	if (sections.length === 1) {
 		const section = sections[0];
 		const absolutePath = resolvePlanPath(options.session, section.path);
-		return withEditPathMutation([absolutePath], () => executeHashlineSection({ ...options, ...section }));
+		return withTeamWriteScopeMutation(options.session, [absolutePath], ([canonicalPath]) =>
+			executeHashlineSection({ ...options, ...section }, canonicalPath),
+		);
 	}
 
 	// Multi-section: validate everything up front so we don't apply a partial batch.
@@ -235,8 +229,8 @@ export async function executeHashlineSingle(
 	const results = [];
 	for (const section of sections) {
 		const absolutePath = resolvePlanPath(options.session, section.path);
-		const result = await withEditPathMutation([absolutePath], () =>
-			executeHashlineSection({ ...options, ...section }),
+		const result = await withTeamWriteScopeMutation(options.session, [absolutePath], ([canonicalPath]) =>
+			executeHashlineSection({ ...options, ...section }, canonicalPath),
 		);
 		results.push({ path: section.path, result });
 	}

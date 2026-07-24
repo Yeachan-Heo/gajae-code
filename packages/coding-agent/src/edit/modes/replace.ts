@@ -11,7 +11,7 @@ import type { ToolSession } from "../../tools";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
-import { enforceTeamWriteScope } from "../../tools/team-write-scope";
+import { withTeamWriteScopeMutation } from "../../tools/team-write-scope";
 import { generateDiffString, replaceText } from "../diff";
 import {
 	countLeadingWhitespace,
@@ -56,7 +56,6 @@ void import("@gajae-code/natives")
 		// Native unavailable; fuzzy matching uses the TS fallback.
 	});
 
-import { withEditPathMutation } from "../path-mutation-lock";
 import { readEditFileText, serializeEditFileText } from "../read-file";
 import type { EditToolDetails, LspBatchRequest } from "../renderer";
 
@@ -1089,8 +1088,7 @@ export async function executeReplaceSingle(
 	}
 
 	const absolutePath = resolvePlanPath(session, path);
-	await enforceTeamWriteScope(session, absolutePath);
-	return withEditPathMutation([absolutePath], () =>
+	return withTeamWriteScopeMutation(session, [absolutePath], ([canonicalPath]) =>
 		executeReplaceSingleUnderLock({
 			session,
 			path,
@@ -1101,7 +1099,7 @@ export async function executeReplaceSingle(
 			fuzzyThreshold,
 			writethrough,
 			beginDeferredDiagnosticsForPath,
-			absolutePath,
+			absolutePath: canonicalPath!,
 			old_text,
 			new_text,
 			all,
