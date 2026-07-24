@@ -355,7 +355,14 @@ describe("subagentAwaitRenderedStateSignature", () => {
 				durationMs: 1_000,
 				currentTool: "read",
 				currentToolStartMs: 1_000,
-				retryState: { attempt: 1, maxAttempts: 3, delayMs: 5_000, errorMessage: "429", startedAtMs: 1_000 },
+				retryState: {
+					attempt: 1,
+					maxAttempts: 3,
+					kind: "provider_error",
+					delayMs: 5_000,
+					errorMessage: "429",
+					startedAtMs: 1_000,
+				},
 			}),
 		});
 		const later = makeSnapshot({
@@ -366,7 +373,14 @@ describe("subagentAwaitRenderedStateSignature", () => {
 				durationMs: 999_999,
 				currentTool: "read",
 				currentToolStartMs: 2_000,
-				retryState: { attempt: 1, maxAttempts: 3, delayMs: 5_000, errorMessage: "429", startedAtMs: 2_000 },
+				retryState: {
+					attempt: 1,
+					maxAttempts: 3,
+					kind: "provider_error",
+					delayMs: 5_000,
+					errorMessage: "429",
+					startedAtMs: 2_000,
+				},
 			}),
 		});
 		expect(subagentAwaitRenderedStateSignature([later])).toBe(subagentAwaitRenderedStateSignature([early]));
@@ -420,7 +434,14 @@ describe("subagentAwaitRenderedStateSignature", () => {
 				...s,
 				progress: {
 					...baseProgress,
-					retryState: { attempt: 1, maxAttempts: 3, delayMs: 1_000, errorMessage: "429", startedAtMs: 0 },
+					retryState: {
+						attempt: 1,
+						maxAttempts: 3,
+						kind: "provider_error",
+						delayMs: 1_000,
+						errorMessage: "429",
+						startedAtMs: 0,
+					},
 				},
 			}),
 			s => ({ ...s, progress: { ...baseProgress, retryFailure: { attempt: 3, errorMessage: "gave up" } } }),

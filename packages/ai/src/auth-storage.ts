@@ -2514,9 +2514,12 @@ export class AuthStorage {
 		if (storeHook) {
 			return storeHook(provider, credential, options?.signal);
 		}
-		return this.#fetchUsageCached(
-			this.#buildUsageRequestForOauth(provider, credential, options?.baseUrl),
-			options?.timeoutMs ?? this.#usageRequestTimeoutMs,
+		return raceUsageWithSignal(
+			this.#fetchUsageCached(
+				this.#buildUsageRequestForOauth(provider, credential, options?.baseUrl),
+				options?.timeoutMs ?? this.#usageRequestTimeoutMs,
+			),
+			options?.signal,
 		);
 	}
 
@@ -2568,7 +2571,7 @@ export class AuthStorage {
 		const cacheKey = this.#buildUsageReportsCacheKey(requests);
 
 		const inFlight = this.#usageReportsInFlight.get(cacheKey);
-		if (inFlight) return inFlight;
+		if (inFlight) return raceUsageWithSignal(inFlight, options?.signal);
 
 		const promise = (async () => {
 			if (options?.logDetails !== false) {
@@ -2616,7 +2619,7 @@ export class AuthStorage {
 		});
 
 		this.#usageReportsInFlight.set(cacheKey, promise);
-		return promise;
+		return raceUsageWithSignal(promise, options?.signal);
 	}
 
 	/**
@@ -2867,7 +2870,7 @@ export class AuthStorage {
 				const blockedUntil = this.#getCredentialBlockedUntil(args.providerKey, selection.index);
 				if (blockedUntil !== undefined) return { selection, usage: null, usageChecked: false, blockedUntil };
 				const usage = await this.#getUsageReport(args.provider, selection.credential, {
-					...args.options,
+					baseUrl: args.options?.baseUrl,
 					timeoutMs: this.#usageRequestTimeoutMs,
 				});
 				return { selection, usage, usageChecked: true, blockedUntil: undefined as number | undefined };
@@ -2880,16 +2883,21 @@ export class AuthStorage {
 		// path so memory drops immediately.
 		const timer = setTimeout(() => timeoutSignal.resolve(null), usageTimeout);
 		timer.unref?.();
-		const usageResults = await Promise.race([usagePromise, timeoutSignal.promise]).then(result => {
-			clearTimeout(timer);
-			return (
-				result ??
-				args.order.map(idx => {
-					const selection = args.credentials[idx];
-					return selection ? { selection, usage: null, usageChecked: false, blockedUntil: undefined } : null;
-				})
+		let resolvedUsageResults: Awaited<typeof usagePromise> | null;
+		try {
+			resolvedUsageResults = await raceUsageWithSignal(
+				Promise.race([usagePromise, timeoutSignal.promise]),
+				args.options?.signal,
 			);
-		});
+		} finally {
+			clearTimeout(timer);
+		}
+		const usageResults =
+			resolvedUsageResults ??
+			args.order.map(idx => {
+				const selection = args.credentials[idx];
+				return selection ? { selection, usage: null, usageChecked: true, blockedUntil: undefined } : null;
+			});
 
 		for (let orderPos = 0; orderPos < usageResults.length; orderPos += 1) {
 			const result = usageResults[orderPos];

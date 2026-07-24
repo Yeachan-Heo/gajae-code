@@ -936,6 +936,8 @@ function canonicalizeProgressForSignature(progress: AgentProgress): unknown {
 					attempt: progress.retryState.attempt,
 					maxAttempts: progress.retryState.maxAttempts,
 					unbounded: progress.retryState.unbounded ?? false,
+					kind: progress.retryState.kind,
+					provider: progress.retryState.provider ?? null,
 					delayMs: progress.retryState.delayMs,
 					errorMessage: progress.retryState.errorMessage,
 					// startedAtMs intentionally excluded (drives countdown only).

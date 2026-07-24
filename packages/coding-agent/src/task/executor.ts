@@ -15,7 +15,7 @@ import type {
 } from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
 import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
-import type { Message, Model, ServiceTier } from "@gajae-code/ai";
+import type { AssistantMessage, Message, Model, ServiceTier } from "@gajae-code/ai";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
@@ -50,6 +50,7 @@ import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { validateAllocatedTaskId } from "./id";
+import { classifyProviderRetry, providerNameFromModel } from "./provider-retry-status";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
@@ -79,6 +80,21 @@ const agentEventTypes = new Set<AgentEvent["type"]>([
 	"tool_execution_start",
 	"tool_execution_update",
 	"tool_execution_end",
+]);
+
+const providerStreamingUpdateTypes = new Set<string>([
+	"text_start",
+	"text_delta",
+	"text_end",
+	"thinking_start",
+	"thinking_delta",
+	"thinking_end",
+	"reasoning_summary_start",
+	"reasoning_summary_delta",
+	"reasoning_summary_end",
+	"toolcall_start",
+	"toolcall_delta",
+	"toolcall_end",
 ]);
 
 const isAgentEvent = (event: AgentSessionEvent): event is AgentEvent =>
@@ -845,7 +861,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let modelSubstitutionWarning: ModelSubstitutionWarning | undefined;
 	let resolvedModelString: string | undefined;
 	let lastAssistantModelString: string | undefined;
+	let activeProviderModelString: string | undefined;
 	let effectiveThinkingLevelForWarning: ThinkingLevel | undefined;
+	let lastProviderProgressAtMs: number | undefined;
+	let sessionEventOrdinal = 0;
+	let retryStartOrdinal = 0;
+	const seenAssistantMessages = new WeakSet<AgentMessage>();
+	const seenAssistantMessageIdentities = new Set<string>();
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage = {
@@ -927,7 +949,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const emitProgressNow = () => {
 		progress.durationMs = Date.now() - startTime;
-		onProgress?.({ ...progress });
+		const progressSnapshot = structuredClone(progress);
+		onProgress?.(progressSnapshot);
 		if (options.eventBus) {
 			options.eventBus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
 				index,
@@ -935,7 +958,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				agentSource: agent.source,
 				task,
 				assignment,
-				progress: { ...progress },
+				progress: progressSnapshot,
 				sessionFile: null,
 			});
 		}
@@ -990,6 +1013,79 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			: undefined;
 	};
 
+	const getAssistantMessageIdentity = (message: AgentMessage): string | undefined => {
+		if (message.role !== "assistant") return undefined;
+		const model = getMessageModelString(message);
+		const timestamp = "timestamp" in message ? message.timestamp : undefined;
+		if (!model || typeof timestamp !== "number") return undefined;
+		const responseId = "responseId" in message && typeof message.responseId === "string" ? message.responseId : "";
+		return JSON.stringify([model, timestamp, responseId]);
+	};
+
+	const rememberAssistantMessage = (message: AgentMessage): void => {
+		seenAssistantMessages.add(message);
+		const identity = getAssistantMessageIdentity(message);
+		if (identity) seenAssistantMessageIdentities.add(identity);
+	};
+
+	const isProviderAssistantMessage = (message: AgentMessage): message is AssistantMessage =>
+		message.role === "assistant" &&
+		"stopReason" in message &&
+		Array.isArray(message.content) &&
+		getMessageModelString(message) !== undefined;
+
+	const isSuccessfulProviderAssistantMessage = (message: AgentMessage): message is AssistantMessage =>
+		isProviderAssistantMessage(message) &&
+		message.stopReason !== "error" &&
+		message.stopReason !== "aborted" &&
+		message.errorMessage === undefined &&
+		message.errorKind === undefined &&
+		message.transportFailure === undefined;
+
+	const hasMatchingActiveProviderModel = (message: AgentMessage): message is AssistantMessage =>
+		isProviderAssistantMessage(message) &&
+		activeProviderModelString !== undefined &&
+		getMessageModelString(message) === activeProviderModelString;
+
+	const isProviderStreamingUpdate = (event: Extract<AgentEvent, { type: "message_update" }>): boolean => {
+		const update = event.assistantMessageEvent;
+		if (!update || typeof update !== "object" || !providerStreamingUpdateTypes.has(update.type)) return false;
+		if (!("partial" in update) || getMessageModelString(update.partial) !== activeProviderModelString) return false;
+		switch (update.type) {
+			case "text_delta":
+			case "thinking_delta":
+			case "reasoning_summary_delta":
+			case "toolcall_delta":
+				return typeof update.delta === "string";
+			default:
+				return typeof update.contentIndex === "number";
+		}
+	};
+
+	const getProviderTextDelta = (event: Extract<AgentEvent, { type: "message_update" }>): string | undefined => {
+		const update = (event as { assistantMessageEvent?: unknown }).assistantMessageEvent;
+		if (!update || typeof update !== "object") return undefined;
+		const record = update as { type?: unknown; delta?: unknown };
+		return record.type === "text_delta" && typeof record.delta === "string" ? record.delta : undefined;
+	};
+
+	const isProviderBackedRecoveryEvent = (
+		event: Extract<AgentEvent, { type: "message_start" | "message_update" }>,
+		eventOrdinal: number,
+	): boolean => {
+		const messageIdentity = getAssistantMessageIdentity(event.message);
+		if (
+			!progress.retryState ||
+			eventOrdinal <= retryStartOrdinal ||
+			seenAssistantMessages.has(event.message) ||
+			(messageIdentity !== undefined && seenAssistantMessageIdentities.has(messageIdentity))
+		)
+			return false;
+		if (!hasMatchingActiveProviderModel(event.message)) return false;
+		if (event.type === "message_start") return isSuccessfulProviderAssistantMessage(event.message);
+		return isProviderStreamingUpdate(event);
+	};
+
 	const updateRecentOutputLines = () => {
 		const lines = recentOutputTail.split("\n").filter(line => line.trim());
 		progress.recentOutput = lines.slice(-8).reverse();
@@ -1000,21 +1096,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		recentOutputTail += text;
 		if (recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES) {
 			recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
-		}
-		updateRecentOutputLines();
-	};
-
-	const replaceRecentOutputFromContent = (content: unknown[]) => {
-		recentOutputTail = "";
-		for (const block of content) {
-			if (!block || typeof block !== "object") continue;
-			const record = block as { type?: unknown; text?: unknown };
-			if (record.type !== "text" || typeof record.text !== "string") continue;
-			if (!record.text) continue;
-			recentOutputTail += record.text;
-			if (recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES) {
-				recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
-			}
 		}
 		updateRecentOutputLines();
 	};
@@ -1038,20 +1119,32 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		});
 	};
 
-	const processEvent = (event: AgentEvent) => {
+	const processEvent = (event: AgentEvent, eventOrdinal: number) => {
 		if (resolved) return;
 
 		forwardSubagentEvent(event);
 
 		const now = Date.now();
 		let flushProgress = false;
+		// A retry is recovered at the first assistant provider event, before the
+		// session emits auto_retry_end after message completion.
 
 		switch (event.type) {
-			case "message_start":
-				if (event.message?.role === "assistant") {
+			case "message_start": {
+				if (event.message.role !== "assistant") break;
+				const retryWasActive = Boolean(progress.retryState);
+				const recoversRetry = isProviderBackedRecoveryEvent(event, eventOrdinal);
+				rememberAssistantMessage(event.message);
+				if (recoversRetry || !retryWasActive) {
+					lastProviderProgressAtMs = now;
 					resetRecentOutput();
 				}
+				if (recoversRetry) {
+					progress.retryState = undefined;
+					flushProgress = true;
+				}
 				break;
+			}
 
 			case "tool_execution_start": {
 				progress.toolCount++;
@@ -1163,24 +1256,17 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			case "message_update": {
-				if (event.message?.role !== "assistant") break;
-				const assistantEvent = (
-					event as AgentEvent & {
-						assistantMessageEvent?: { type?: string; delta?: string };
-					}
-				).assistantMessageEvent;
-				if (assistantEvent?.type === "text_delta" && typeof assistantEvent.delta === "string") {
-					appendRecentOutputTail(assistantEvent.delta);
-					break;
+				if (event.message.role !== "assistant") break;
+				const retryWasActive = Boolean(progress.retryState);
+				const recoversRetry = isProviderBackedRecoveryEvent(event, eventOrdinal);
+				if (!retryWasActive) rememberAssistantMessage(event.message);
+				if (recoversRetry || !retryWasActive) lastProviderProgressAtMs = now;
+				if (recoversRetry) {
+					progress.retryState = undefined;
+					flushProgress = true;
 				}
-				if (assistantEvent && assistantEvent.type !== "text_delta") {
-					break;
-				}
-				const updateContent =
-					getMessageContent(event.message) || (event as AgentEvent & { content?: unknown }).content;
-				if (updateContent && Array.isArray(updateContent)) {
-					replaceRecentOutputFromContent(updateContent);
-				}
+				const textDelta = getProviderTextDelta(event);
+				if (textDelta !== undefined) appendRecentOutputTail(textDelta);
 				break;
 			}
 
@@ -1188,6 +1274,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// Extract text from assistant and toolResult messages (not user prompts)
 				const role = event.message?.role;
 				if (role === "assistant") {
+					if (isSuccessfulProviderAssistantMessage(event.message)) lastProviderProgressAtMs = now;
 					const messageContent =
 						getMessageContent(event.message) || (event as AgentEvent & { content?: unknown }).content;
 					if (messageContent && Array.isArray(messageContent)) {
@@ -1200,6 +1287,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					const assistantModel = getMessageModelString(event.message);
 					if (assistantModel) {
 						lastAssistantModelString = assistantModel;
+						activeProviderModelString = assistantModel;
 						if (resolvedModelString && assistantModel !== resolvedModelString && !modelSubstitutionWarning) {
 							modelSubstitutionWarning = {
 								requested: resolvedModelString,
@@ -1367,6 +1455,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			);
 			if (model) {
 				resolvedModelString = formatModelString(model);
+				activeProviderModelString = resolvedModelString;
 			}
 			if (authFallbackUsed && model && requestedModel) {
 				modelSubstitutionWarning = {
@@ -1737,11 +1826,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			const MAX_YIELD_RETRIES = 3;
 			unsubscribe = session.subscribe(event => {
+				sessionEventOrdinal += 1;
+				const eventOrdinal = sessionEventOrdinal;
 				if (event.type === "auto_retry_start") {
+					retryStartOrdinal = eventOrdinal;
+					for (const message of session.messages) {
+						if (message.role === "assistant") rememberAssistantMessage(message);
+					}
 					progress.retryState = {
 						attempt: event.attempt,
 						maxAttempts: event.maxAttempts,
 						unbounded: event.unbounded,
+						kind: classifyProviderRetry(event.errorMessage),
+						provider: providerNameFromModel(
+							activeProviderModelString ?? lastAssistantModelString ?? resolvedModelString,
+						),
+						lastProviderProgressAtMs,
 						delayMs: event.delayMs,
 						errorMessage: event.errorMessage,
 						startedAtMs: Date.now(),
@@ -1763,12 +1863,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					return;
 				}
 				if (event.type === "model_fallback_switched") {
+					activeProviderModelString = event.to;
 					forwardSubagentEvent(event);
 					return;
 				}
 				if (isAgentEvent(event)) {
 					try {
-						processEvent(event);
+						processEvent(event, eventOrdinal);
 					} catch (err) {
 						logger.error("Subagent event processing failed", {
 							error: err instanceof Error ? err.message : String(err),
