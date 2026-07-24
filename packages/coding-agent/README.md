@@ -25,6 +25,17 @@ gjc config set completion.notifyCommand 'cmux notify --title "$GJC_NOTIFICATION_
 ```
 
 When GJC runs inside a cmux terminal (`CMUX_WORKSPACE_ID` is set), GJC best-effort renames that cmux workspace to the current GJC session name (with a `GJC: ` prefix) — but only when the workspace still has its default title, so a name you pinned (or one set by a peer session sharing the workspace) is never overwritten. Opt out with `GJC_NO_CMUX_RENAME=1`.
+## cmux presentation integration
+
+When GJC is launched in cmux, it can make a best-effort, presentation-only projection without taking control of work. Activation is automatic only when `CMUX_WORKSPACE_ID` is a valid cmux identifier and the local `cmux` CLI successfully verifies its public `help`, `capabilities`, and `identify` commands. No GJC setting or credential enables it.
+
+- Public top-level HTTP(S) URL reads, including `:raw`, open that URL in cmux's browser with `--focus false`. Searches open a Google search URL with the query and the same no-focus behavior. This applies to `gjc-read` and `gjc q` / `gjc web-search` invocations as well as their corresponding in-session operations.
+- The presenter is scoped to that invocation or GJC session. It is optional: a missing, invalid, or incompatible cmux environment/CLI, a timeout, or a command failure leaves the read, search, and agent session behavior unchanged.
+- A normal interactive GJC session makes one one-way projection of existing subagent progress and lifecycle events into retained `agent-session` surfaces. GJC never creates or controls subagents through cmux, and it never closes those surfaces; users clean them up. It does not create a generic renderer or project arbitrary tool output.
+- Capability verification is bounded to two attempts. Command failures disable presentation for the remaining scope; diagnostics are capped at eight operation-level messages and redact URLs and credential-like values. Presentation never changes fetch/search authority or results.
+- The separate `insane` search provider remains limited to typed, guarded public routes for Reddit, X/Twitter, YouTube, and Hacker News. It rejects private, authenticated, blocked, and unsupported targets rather than using a browser, cookies, TLS impersonation, login/paywall bypasses, or a generic Insane renderer. See [web_search](../../docs/tools/web_search.md).
+
+This integration does not alter non-cmux behavior or the ownership-guarded cmux workspace-title behavior above.
 
 Windows Terminal may keep BEL (`[Console]::Write([char]7)`) silent depending on profile and system sound settings even when `notifications.terminalBell` is enabled. For an audible Windows completion beep, configure a user-level PowerShell command hook instead:
 

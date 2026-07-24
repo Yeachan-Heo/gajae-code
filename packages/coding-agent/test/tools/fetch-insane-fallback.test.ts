@@ -4,11 +4,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type SettingPath, Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
-import { tryInsaneFallback } from "@gajae-code/coding-agent/tools/fetch";
+import {
+	classifyInsaneFallback,
+	getInsaneFallbackOutcome,
+	tryInsaneFallback,
+} from "@gajae-code/coding-agent/tools/fetch";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import * as bridge from "@gajae-code/coding-agent/web/insane/bridge";
 import * as urlGuard from "@gajae-code/coding-agent/web/insane/url-guard";
 import * as scrapers from "@gajae-code/coding-agent/web/scrapers/types";
+import * as routes from "@gajae-code/coding-agent/web/search/providers/insane";
 import { Snowflake } from "@gajae-code/utils";
 
 const baseArgs = {
@@ -17,14 +22,16 @@ const baseArgs = {
 	timeout: 20,
 	signal: undefined as AbortSignal | undefined,
 	fetchedAt: new Date().toISOString(),
+	outcome: { kind: "http-failure" as const, status: 503, content: "", usableContent: false as const },
+	cmuxVerified: true,
 };
+const emptyHttpOutcome = (status: number) => getInsaneFallbackOutcome({ status, content: "" })!;
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("tryInsaneFallback gating", () => {
-	it("returns null with no guard or bridge call when raw mode is set", async () => {
-		const guardSpy = vi.spyOn(urlGuard, "validatePublicHttpUrlForInsane");
-		const bridgeSpy = vi.spyOn(bridge, "tryInsaneFetch");
+	it("skips direct routing when raw mode is set", async () => {
+		const routeSpy = vi.spyOn(routes, "routeInsanePublicUrl");
 		const notes: string[] = [];
 		const result = await tryInsaneFallback({
 			...baseArgs,
@@ -34,82 +41,108 @@ describe("tryInsaneFallback gating", () => {
 		});
 		expect(result).toBeNull();
 		expect(notes).toHaveLength(0);
-		expect(guardSpy).not.toHaveBeenCalled();
-		expect(bridgeSpy).not.toHaveBeenCalled();
+		expect(routeSpy).not.toHaveBeenCalled();
 	});
 
-	it("returns null with no guard or bridge call when the setting is off (default)", async () => {
-		const guardSpy = vi.spyOn(urlGuard, "validatePublicHttpUrlForInsane");
-		const bridgeSpy = vi.spyOn(bridge, "tryInsaneFetch");
+	it("skips direct routing when the setting is off", async () => {
+		const routeSpy = vi.spyOn(routes, "routeInsanePublicUrl");
 		const notes: string[] = [];
 		const result = await tryInsaneFallback({ ...baseArgs, raw: false, settings: Settings.isolated(), notes });
 		expect(result).toBeNull();
 		expect(notes).toHaveLength(0);
-		expect(guardSpy).not.toHaveBeenCalled();
-		expect(bridgeSpy).not.toHaveBeenCalled();
+		expect(routeSpy).not.toHaveBeenCalled();
 	});
 
-	it("disables enabled compatibility fallback before guard or bridge calls", async () => {
-		const guardSpy = vi
-			.spyOn(urlGuard, "validatePublicHttpUrlForInsane")
-			.mockResolvedValue({ ok: false, reason: "private, loopback, link-local, or reserved IP literal" });
-		const bridgeSpy = vi.spyOn(bridge, "tryInsaneFetch");
-		const notes: string[] = [];
+	it("does not route without verified cmux presentation", async () => {
+		const routeSpy = vi.spyOn(routes, "routeInsanePublicUrl");
 		const result = await tryInsaneFallback({
 			...baseArgs,
 			raw: false,
+			cmuxVerified: false,
 			settings: Settings.isolated({ "web.insaneFallback": true }),
-			notes,
-		});
-		expect(result).toBeNull();
-		expect(guardSpy).not.toHaveBeenCalled();
-		expect(bridgeSpy).not.toHaveBeenCalled();
-		expect(notes).toContain(bridge.INSANE_NOTES.securityDisabled);
-	});
-
-	it("ignores mocked bridge success while production fallback is disabled", async () => {
-		vi.spyOn(urlGuard, "validatePublicHttpUrlForInsane").mockResolvedValue({
-			ok: true,
-			url: new URL("https://example.com/x"),
-			addresses: ["93.184.216.34"],
-		});
-		vi.spyOn(bridge, "tryInsaneFetch").mockResolvedValue({
-			ok: true,
-			content: "recovered public content",
-			profileUsed: "chrome",
 			notes: [],
 		});
-		const notes: string[] = [];
-		const result = await tryInsaneFallback({
-			...baseArgs,
-			raw: false,
-			settings: Settings.isolated({ "web.insaneFallback": true }),
-			notes,
-		});
 		expect(result).toBeNull();
-		expect(notes).toContain(bridge.INSANE_NOTES.securityDisabled);
+		expect(routeSpy).not.toHaveBeenCalled();
 	});
 
-	it("returns null and appends notes on bridge failure", async () => {
-		vi.spyOn(urlGuard, "validatePublicHttpUrlForInsane").mockResolvedValue({
-			ok: true,
-			url: new URL("https://example.com/x"),
-			addresses: ["93.184.216.34"],
-		});
-		vi.spyOn(bridge, "tryInsaneFetch").mockResolvedValue({
-			ok: false,
-			reason: "auth-required",
-			notes: [bridge.INSANE_NOTES.authRequired],
+	it("denies 401 before every other fallback condition", () => {
+		expect(
+			classifyInsaneFallback({
+				url: "https://www.reddit.com/r/test",
+				raw: false,
+				enabled: true,
+				outcome: emptyHttpOutcome(401),
+			}),
+		).toEqual({ allowed: false, reason: "unauthorized" });
+	});
+
+	it("allows only a narrow empty WAF 403 and denies auth walls or usable content", () => {
+		expect(
+			classifyInsaneFallback({
+				url: "https://x.com/alice/status/1",
+				raw: false,
+				enabled: true,
+				outcome: getInsaneFallbackOutcome({ status: 403, content: "Cloudflare access denied" })!,
+			}),
+		).toEqual({ allowed: true, reason: "transient-http" });
+		expect(
+			classifyInsaneFallback({
+				url: "https://x.com/alice/status/1",
+				raw: false,
+				enabled: true,
+				outcome: getInsaneFallbackOutcome({ status: 403, content: "Cloudflare login required" })!,
+			}),
+		).toEqual({ allowed: false, reason: "forbidden" });
+	});
+
+	it("only permits explicit transient statuses and supported targets", () => {
+		expect(
+			classifyInsaneFallback({
+				url: "https://www.youtube.com/watch?v=test",
+				raw: false,
+				enabled: true,
+				outcome: emptyHttpOutcome(503),
+			}),
+		).toEqual({ allowed: true, reason: "transient-http" });
+		expect(
+			classifyInsaneFallback({
+				url: "https://example.com",
+				raw: false,
+				enabled: true,
+				outcome: emptyHttpOutcome(503),
+			}),
+		).toEqual({ allowed: false, reason: "unsupported-target" });
+	});
+
+	it("uses a direct public route without bridge compatibility fallback", async () => {
+		vi.spyOn(routes, "routeInsanePublicUrl").mockResolvedValue({
+			platform: "reddit",
+			route: "rss",
+			finalUrl: "https://www.reddit.com/r/test/.rss",
+			sources: [{ title: "Public post", url: "https://www.reddit.com/r/test", snippet: "public content" }],
+			attempts: [],
 		});
 		const notes: string[] = [];
 		const result = await tryInsaneFallback({
 			...baseArgs,
+			url: "https://www.reddit.com/r/test",
+			finalUrl: "https://www.reddit.com/r/test",
 			raw: false,
 			settings: Settings.isolated({ "web.insaneFallback": true }),
+			outcome: emptyHttpOutcome(503),
 			notes,
 		});
-		expect(result).toBeNull();
-		expect(notes).toContain(bridge.INSANE_NOTES.securityDisabled);
+		expect(result?.method).toBe("insane-public-route");
+		expect(notes).toContain("Used Insane direct public route (transient-http)");
+	});
+	it("does not route a generic 5xx response with usable content", () => {
+		expect(
+			getInsaneFallbackOutcome({
+				status: 503,
+				content: "usable ".repeat(40),
+			}),
+		).toBeNull();
 	});
 });
 

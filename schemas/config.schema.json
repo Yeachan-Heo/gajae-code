@@ -1926,7 +1926,7 @@
 			"properties": {
 				"insaneFallback": {
 					"type": "boolean",
-					"description": "Compatibility-only preference. Remote renderer fallback stays disabled because it cannot preserve validated per-hop network routing.",
+					"description": "After verified cmux presentation yields no usable public content, allow guarded direct routes for supported Reddit, X, YouTube, and Hacker News URLs. Authentication, private targets, and the generic renderer remain disabled.",
 					"default": false
 				}
 			},

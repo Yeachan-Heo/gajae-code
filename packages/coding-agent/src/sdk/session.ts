@@ -43,6 +43,7 @@ import {
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
 import { loadCapability } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
+import { CmuxPresentationAdapter, CmuxProjectionSubscription } from "../cmux/integration";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -1038,6 +1039,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
+	const cmuxAdapter = isCanonicalSubSession ? undefined : new CmuxPresentationAdapter();
+	const cmuxProjectionSubscription = cmuxAdapter ? new CmuxProjectionSubscription(eventBus, cmuxAdapter) : undefined;
 
 	registerSshCleanup();
 	registerPythonCleanup();
@@ -1511,6 +1514,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			workspaceTree: resolvedWorkspaceTree,
 			skills,
 			eventBus,
+			presentation: cmuxAdapter,
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,
 			taskDepth: options.taskDepth ?? 0,
@@ -1650,7 +1654,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Add web search tools
 		if (options.toolNames?.includes("web_search")) {
-			customTools.push(...getSearchTools());
+			customTools.push(...getSearchTools(cmuxAdapter));
 		}
 
 		const getReservedSubskillToolNames = () => [
@@ -2707,6 +2711,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					try {
 						agentRegistry.unregister(resolvedAgentId);
 						releaseCredentialDisabledSubscription();
+						cmuxProjectionSubscription?.dispose();
+						cmuxAdapter?.dispose();
 						releaseLocalProtocolOverride();
 					} finally {
 						closeOwnedAuthStorage();
@@ -2831,6 +2837,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Release the subscription if the throw happened after install but before the
 		// dispose-wrap took ownership.
 		releaseCredentialDisabledSubscription();
+		cmuxProjectionSubscription?.dispose();
+		cmuxAdapter?.dispose();
 		try {
 			if (hasSession) {
 				await session.dispose();

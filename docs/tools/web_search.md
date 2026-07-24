@@ -2,7 +2,7 @@
 
 > Run one web query through the first available search provider and return LLM-formatted answer, source URLs, and optional citations.
 
-> Note: `insane-search` is **not** a `web_search` provider and does not affect search-provider selection. It is an opt-in fallback for the `read` tool's URL fetch path (`web.insaneFallback`); see `docs/tools/read.md`.
+> Note: `insane` is a selectable keyless safe-public-route provider for Reddit, X/Twitter, YouTube, and Hacker News. The `read` tool may also use the same guarded direct-route implementation under the narrower verified-cmux fallback contract documented in `docs/tools/read.md`.
 
 ## Source
 - Entry: `packages/coding-agent/src/web/search/index.ts`
@@ -32,6 +32,7 @@
   - `packages/coding-agent/src/web/parallel.ts` — Parallel search/extract HTTP client.
   - `packages/coding-agent/src/web/kagi.ts` — Kagi HTTP client.
   - `packages/coding-agent/src/tools/index.ts` — built-in tool registration and enable flag.
+  - `packages/coding-agent/src/cmux/integration.ts` — optional no-focus cmux browser presentation for searches.
 
 ## Inputs
 
@@ -43,6 +44,12 @@
 | `max_tokens` | `number` | No | Passed through as `maxOutputTokens` / `max_tokens` only by Anthropic, Gemini, and Perplexity API-key mode. Ignored by the other providers. |
 | `temperature` | `number` | No | Passed through only by Anthropic, Gemini, and Perplexity API-key mode. Ignored by the other providers. |
 | `num_search_results` | `number` | No | Requested upstream search breadth. For most providers this is the same count used for returned sources. Perplexity is the only adapter that keeps it distinct from `limit`. |
+
+### cmux presentation
+
+When `CMUX_WORKSPACE_ID` is a valid cmux identifier and the local CLI verifies `cmux help`, `cmux capabilities`, and `cmux identify`, a search is also presented as `https://www.google.com/search?q=<encoded query>` through `cmux browser open ... --focus false`. This is automatic and best-effort for `gjc q` / `gjc web-search` and in-session searches; it needs no GJC setting or credentials.
+
+Presentation is invocation- or session-scoped, never changes provider selection, authority, requests, results, or errors, and is disabled for that scope after a command failure. It is absent outside verified cmux and does not change normal non-cmux behavior.
 
 ## Outputs
 The tool returns a single text content block plus structured `details`.
@@ -101,9 +108,10 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 - **Provider adapters**
   - **Insane** — `packages/coding-agent/src/web/search/providers/insane.ts`
     - Availability: always available; no API key, OAuth, cookies, browser profile, subprocess, or auto-installed dependency.
-    - Querying: if the query is a supported public URL, tries deterministic no-auth public routes first; otherwise uses DuckDuckGo discovery and enriches supported result URLs through the same safe routes.
-    - Safe upstream concepts ported: Phase 0 public route table and route-attempt metadata for Reddit RSS, X/Twitter tweet-result/oEmbed/syndication, YouTube oEmbed/channel feed, and Hacker News Firebase item metadata.
-    - Explicitly not ported from upstream: TLS impersonation, Playwright/browser fallback, cookie warming/storage, CAPTCHA/paywall/login bypasses, credential storage, and auto dependency installation. Unsupported or blocked routes fail closed with a provider error.
+    - Supported direct targets: guarded public HTTP(S) Reddit, X/Twitter, YouTube, and Hacker News URLs only. It tries deterministic no-auth public routes for those platforms; it does not use DuckDuckGo discovery.
+    - Safe upstream concepts ported: Phase 0 route attempts only — Reddit RSS; X tweet-result, oEmbed, and syndication; YouTube oEmbed and channel feeds; and Hacker News Firebase item metadata.
+    - The public-network guard applies to each request and redirect. Private/non-public, authenticated, blocked, paywalled, or unsupported targets fail closed as typed `SearchProviderError` results; a blocked guard route is `public_route_blocked`.
+    - Explicitly not ported from upstream: TLS impersonation, Playwright/browser fallback, cookie warming/storage, CAPTCHA/paywall/login bypasses, credential storage, and auto dependency installation. There is no generic Insane renderer.
     - `limit` / `num_search_results`: collapsed together, clamped to `1..20`, default `10`.
     - Output: `sources` only, with snippets annotated by the public route used and `searchQueries` containing compact route-attempt diagnostics.
   - **Tavily** — `packages/coding-agent/src/web/search/providers/tavily.ts`

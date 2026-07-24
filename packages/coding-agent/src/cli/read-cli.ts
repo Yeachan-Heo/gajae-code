@@ -7,6 +7,7 @@
  */
 import { getProjectDir } from "@gajae-code/utils";
 import chalk from "chalk";
+import { createCmuxInvocationPresentation } from "../cmux/integration";
 import { Settings } from "../config/settings";
 import type { ToolSession } from "../tools";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
@@ -26,10 +27,12 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 	const cwd = getProjectDir();
 	const settings = await Settings.init({ cwd });
 
+	const presentation = createCmuxInvocationPresentation();
 	const session: ToolSession = {
 		cwd,
 		hasUI: false,
 		settings,
+		presentation: presentation.presentation,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 	};
@@ -53,5 +56,7 @@ export async function runReadCommand(cmd: ReadCommandArgs): Promise<void> {
 	} catch (err) {
 		process.stderr.write(`${chalk.red(renderError(err))}\n`);
 		process.exit(1);
+	} finally {
+		presentation.dispose();
 	}
 }

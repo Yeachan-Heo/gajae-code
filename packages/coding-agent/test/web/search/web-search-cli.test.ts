@@ -6,6 +6,7 @@ import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { parseSearchArgs, runSearchCommand } from "../../../src/cli/web-search-cli";
 import Search from "../../../src/commands/web-search";
 import { resetSettingsForTest, Settings } from "../../../src/config/settings";
+import type { InsaneRouteDependencies } from "../../../src/web/search/providers/insane";
 
 describe("web search CLI args", () => {
 	it("parses inline xAI search flags", () => {
@@ -138,13 +139,23 @@ describe("web search CLI settings", () => {
 			}
 			return new Response("", { status: 404 });
 		}) as typeof fetch);
+		const insaneRouteDependencies: InsaneRouteDependencies = {
+			guardedFetch: async (url, init) => {
+				const logicalUrl = new URL(url);
+				return { ok: true, response: await fetch(url, init), logicalUrl, wireUrl: logicalUrl };
+			},
+		};
 		let output = "";
 		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
 			output += String(chunk);
 			return true;
 		});
 
-		await runSearchCommand({ query: "https://www.reddit.com/r/test", expanded: false });
+		await runSearchCommand({
+			query: "https://www.reddit.com/r/test",
+			expanded: false,
+			insaneRouteDependencies,
+		});
 
 		expect(Bun.stripANSI(output)).toContain("Provider: Insane");
 		expect(Bun.stripANSI(output)).toContain("Alias Provider");

@@ -1,0 +1,124 @@
+{
+  "kind": "api-package-test-report",
+  "scope": "Frozen cmux integration final QA/red-team rerun",
+  "timestamp": "2026-07-24",
+  "status": "passed",
+  "e2eStatus": "passed",
+  "redTeamStatus": "passed",
+  "environment": {
+    "cmuxVersion": "cmux 0.64.20 (100) [14e3400b9]",
+    "accessMode": "automation",
+    "callerEnv": {
+      "CMUX_WORKSPACE_ID": "present",
+      "CMUX_SURFACE_ID": "present"
+    },
+    "environmentMutation": "none"
+  },
+  "commands": [
+    {
+      "command": "bun test test/cmux-integration.test.ts test/cmux-workspace.test.ts test/tools/fetch-insane-fallback.test.ts test/tools/web-search-insane.test.ts test/web/search/web-search-cli.test.ts (cwd: packages/coding-agent)",
+      "result": "passed: 56 tests, 0 failures, 116 expectations"
+    },
+    {
+      "command": "bun test test/tools/subagent-live-progress.test.ts test/web/insane/url-guard.test.ts test/web/scrapers/public-url-guard.test.ts (cwd: packages/coding-agent)",
+      "result": "passed: 39 tests, 0 failures, 164 expectations"
+    },
+    {
+      "command": "bun run check:types (cwd: packages/coding-agent)",
+      "result": "passed: tsc -p tsconfig.json --noEmit"
+    },
+    {
+      "command": "cmux --version; cmux help; cmux capabilities; cmux --id-format uuids identify; cmux --id-format both identify",
+      "result": "passed: cmux 0.64.20 automation mode exposes browser, agent-session, capabilities, identify, and UUID caller.workspace_id/caller.surface_id fields"
+    },
+    {
+      "command": "bun -e adapter activation harness with live help/capabilities/--id-format uuids identify and intercepted browser open (cwd: packages/coding-agent)",
+      "result": "passed: presented=true, capability=verified; calls were help, capabilities, --id-format uuids identify, then browser open https://example.com/qa --focus false; no live browser or agent-session surface command executed"
+    }
+  ],
+  "contractCoverage": [
+    {
+      "contract": "Verified activation requires safe environment identifiers plus matching UUID caller identity",
+      "result": "passed",
+      "evidence": "Live cmux 0.64.20 UUID identify response matched the caller UUID shape; adapter harness verified capability using [--id-format, uuids, identify]."
+    },
+    {
+      "contract": "Activation checks help, capabilities, and identity with two-attempt bounded failure behavior",
+      "result": "passed",
+      "evidence": "cmux-integration.test.ts covers absent/partial/stale identity, retry, failure circuit, and diagnostic redaction; live grammar and capability endpoint succeeded."
+    },
+    {
+      "contract": "Research presentation is no-focus and does not alter fetch/search authority or result behavior",
+      "result": "passed",
+      "evidence": "Harness observed [browser, open, https://example.com/qa, --focus, false] only through an intercept; fetch and CLI focused suites passed."
+    },
+    {
+      "contract": "Only canonical public URLs preflight for presentation; raw mode presents but cannot invoke Insane fallback",
+      "result": "passed",
+      "evidence": "fetch-insane-fallback.test.ts passed."
+    },
+    {
+      "contract": "Sensitive transient outcomes remain denied: 401/authentication/CAPTCHA/paywall/private/unsupported and non-WAF 403",
+      "result": "passed",
+      "evidence": "fetch-insane-fallback.test.ts and web-search-insane.test.ts passed."
+    },
+    {
+      "contract": "Guarded public routes reject private addresses, proxy/Unix targets, malformed redirects, mixed/rebound DNS, and redirect-limit excess",
+      "result": "passed",
+      "evidence": "url-guard.test.ts and public-url-guard.test.ts passed."
+    },
+    {
+      "contract": "Per-ID agent surface updates serialize terminal/progress updates, deduplicate stable IDs, and retain no execution or cleanup ownership",
+      "result": "passed",
+      "evidence": "cmux-integration.test.ts plus subagent-live-progress.test.ts passed."
+    },
+    {
+      "contract": "Parent-only composition preserves canonical-subsession and non-cmux behavior; standalone read/search CLI composition remains parity-safe",
+      "result": "passed",
+      "evidence": "cmux-integration.test.ts, subagent-live-progress.test.ts, and web-search-cli.test.ts passed."
+    }
+  ],
+  "surfaceEvidence": {
+    "liveActivation": {
+      "result": "passed",
+      "evidence": "Real cmux UUID identification was consumed by the adapter verification path; verified activation completed before an intercepted no-focus browser request."
+    },
+    "browserAndAgentSurfaceSafety": {
+      "result": "passed",
+      "evidence": "No browser open, new-surface, rename-tab, close-surface, or cleanup command was sent to the live cmux service; harness intercepted the post-verification browser request."
+    },
+    "researchAndFallback": {
+      "result": "passed",
+      "evidence": "Focused fetch fallback, Insane search, URL guard, and public scraper guard suites passed."
+    },
+    "cliAndRuntimeComposition": {
+      "result": "passed",
+      "evidence": "Standalone web-search CLI, subagent lifecycle/progress, workspace, and cmux adapter suites passed; type check passed."
+    },
+    "nonCmuxParity": {
+      "result": "passed",
+      "evidence": "Absent/invalid cmux environments are covered as disabled without cmux invocation; presentation remains optional and invocation/session scoped."
+    }
+  },
+  "adversarialCases": [
+    {"case": "missing, partial, invalid, or stale environment identity", "result": "passed-unit"},
+    {"case": "UUID identity verification against real cmux 0.64.20 output", "result": "passed-live"},
+    {"case": "timeout, retry, circuit disablement, bounded and redacted diagnostics", "result": "passed-unit"},
+    {"case": "public canonical preflight before presentation", "result": "passed-unit"},
+    {"case": "raw presentation with no Insane fallback", "result": "passed-unit"},
+    {"case": "401, auth, CAPTCHA, paywall, private, and unsupported transient outcomes", "result": "passed-unit"},
+    {"case": "403 eligibility limited to positive WAF classification", "result": "passed-unit"},
+    {"case": "malformed and redirect-limit routes; DNS rebind/mixed records; proxy and Unix targets", "result": "passed-unit"},
+    {"case": "ordered per-ID terminal/progress updates, duplicate creation avoidance, and stable-ID projection", "result": "passed-unit"},
+    {"case": "parent versus canonical-subsession composition and no executor ownership", "result": "passed-unit"},
+    {"case": "standalone CLI and non-cmux parity/failure fallback", "result": "passed-unit"},
+    {"case": "real activation without destructive surface changes", "result": "passed-live-intercepted"}
+  ],
+  "blockers": [],
+  "artifactRefs": [
+    {
+      "kind": "api-package-test-report",
+      "path": "artifacts/cmux-integration-qa-report.json"
+    }
+  ]
+}

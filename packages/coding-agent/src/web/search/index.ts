@@ -8,6 +8,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { AuthStorage } from "@gajae-code/ai";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import type { CmuxResearchPresenter } from "../../cmux/integration";
 import type { CustomTool, CustomToolContext, RenderResultOptions } from "../../extensibility/custom-tools/types";
 import type { Theme } from "../../modes/theme/theme";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
@@ -17,6 +18,7 @@ import type { ToolSession } from "../../tools";
 import { formatAge } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
 import { getSearchProviderLabel, prewarmSearchProviders, resolveProviderChain, type SearchProvider } from "./provider";
+import type { InsaneRouteDependencies } from "./providers/insane";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
 import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "./types";
 import { SearchProviderError } from "./types";
@@ -146,6 +148,8 @@ interface ExecuteSearchOptions {
 	sessionId?: string;
 	signal?: AbortSignal;
 	activeModelContext?: ActiveSearchModelContext;
+	presentation?: CmuxResearchPresenter;
+	insaneRouteDependencies?: InsaneRouteDependencies;
 }
 
 /**
@@ -170,7 +174,12 @@ async function executeSearch(
 	params: SearchQueryParams,
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	const { authStorage, sessionId, signal, activeModelContext } = options;
+	const { authStorage, sessionId, signal, activeModelContext, presentation, insaneRouteDependencies } = options;
+	try {
+		await presentation?.presentResearch({ kind: "query", query: params.query });
+	} catch {
+		// Presentation is optional and must never affect search authority or results.
+	}
 	// Pass `params.provider` straight through: when omitted (the normal model-facing
 	// path) it is `undefined`, so `resolveProviderChain` applies the settings-configured
 	// preferred provider. Coalescing to "auto" here would silently bypass that preference.
@@ -204,6 +213,7 @@ async function executeSearch(
 		authStorage,
 		sessionId,
 		activeModelContext,
+		insaneRouteDependencies,
 	};
 
 	// Hedged fallback: when DuckDuckGo (keyless, cheap) is a non-primary member
@@ -298,6 +308,8 @@ export async function runSearchQuery(
 		sessionId?: string;
 		signal?: AbortSignal;
 		activeModelContext?: ActiveSearchModelContext;
+		presentation?: CmuxResearchPresenter;
+		insaneRouteDependencies?: InsaneRouteDependencies;
 	} = {},
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
 	const authStorage = options.authStorage ?? (await discoverAuthStorage());
@@ -306,6 +318,8 @@ export async function runSearchQuery(
 		sessionId: options.sessionId,
 		signal: options.signal,
 		activeModelContext: options.activeModelContext,
+		presentation: options.presentation,
+		insaneRouteDependencies: options.insaneRouteDependencies,
 	});
 }
 
@@ -360,45 +374,60 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 		const activeModelContext = this.#session.model
 			? this.#session.modelRegistry?.getActiveSearchModelContext(this.#session.model)
 			: undefined;
-		return executeSearch(_toolCallId, params, { authStorage, sessionId, signal, activeModelContext });
+		return executeSearch(_toolCallId, params, {
+			authStorage,
+			sessionId,
+			signal,
+			activeModelContext,
+			presentation: this.#session.presentation,
+		});
 	}
 }
 
 /** Web search tool as CustomTool (for TUI rendering support) */
-export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRenderDetails> = {
-	name: "web_search",
-	label: "Web Search",
-	description: prompt.render(webSearchDescription),
-	parameters: webSearchSchema,
+export function createWebSearchCustomTool(
+	presentation?: CmuxResearchPresenter,
+): CustomTool<typeof webSearchSchema, SearchRenderDetails> {
+	return {
+		name: "web_search",
+		label: "Web Search",
+		description: prompt.render(webSearchDescription),
+		parameters: webSearchSchema,
 
-	async execute(
-		toolCallId: string,
-		params: SearchToolParams,
-		_onUpdate,
-		ctx: CustomToolContext,
-		signal?: AbortSignal,
-	) {
-		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
-		const sessionId = ctx.sessionManager.getSessionId();
-		return executeSearch(toolCallId, params, {
-			authStorage,
-			sessionId,
-			signal,
-			activeModelContext: ctx.model ? ctx.modelRegistry?.getActiveSearchModelContext(ctx.model) : undefined,
-		});
-	},
+		async execute(
+			toolCallId: string,
+			params: SearchToolParams,
+			_onUpdate,
+			ctx: CustomToolContext,
+			signal?: AbortSignal,
+		) {
+			const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
+			const sessionId = ctx.sessionManager.getSessionId();
+			return executeSearch(toolCallId, params, {
+				authStorage,
+				sessionId,
+				signal,
+				activeModelContext: ctx.model ? ctx.modelRegistry?.getActiveSearchModelContext(ctx.model) : undefined,
+				presentation,
+			});
+		},
 
-	renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
-		return renderSearchCall(args, options, theme);
-	},
+		renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
+			return renderSearchCall(args, options, theme);
+		},
 
-	renderResult(result, options: RenderResultOptions, theme: Theme) {
-		return renderSearchResult(result, options, theme);
-	},
-};
+		renderResult(result, options: RenderResultOptions, theme: Theme) {
+			return renderSearchResult(result, options, theme);
+		},
+	};
+}
+/** Context-free compatibility export for external custom-tool consumers. */
+export const webSearchCustomTool = createWebSearchCustomTool();
 
-export function getSearchTools(): CustomTool<any, any>[] {
-	return [webSearchCustomTool];
+export function getSearchTools(
+	presentation?: CmuxResearchPresenter,
+): CustomTool<typeof webSearchSchema, SearchRenderDetails>[] {
+	return [createWebSearchCustomTool(presentation)];
 }
 
 export {

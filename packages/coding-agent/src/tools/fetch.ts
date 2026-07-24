@@ -4,7 +4,8 @@ import type { AgentToolResult } from "@gajae-code/agent-core";
 import type { ImageContent, TextContent } from "@gajae-code/ai";
 import { htmlToMarkdown } from "@gajae-code/natives";
 import { type Component, Text } from "@gajae-code/tui";
-import { ptree, truncate } from "@gajae-code/utils";
+import { ptree, sanitizeText, truncate } from "@gajae-code/utils";
+import type { CmuxResearchPresenter } from "../cmux/integration";
 import type { Settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
@@ -15,12 +16,12 @@ import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { parseHtmlLazy } from "../utils/linkedom";
-import { INSANE_NOTES } from "../web/insane/bridge";
 import { validatePublicHttpUrl } from "../web/insane/url-guard";
 import { specialHandlers } from "../web/scrapers";
 import type { RenderResult } from "../web/scrapers/types";
 import { finalizeOutput, loadPage, looksLikeHtml, MAX_OUTPUT_CHARS } from "../web/scrapers/types";
 import { convertWithMarkit, fetchBinary } from "../web/scrapers/utils";
+import { routeInsanePublicUrl } from "../web/search/providers/insane";
 import { applyListLimit } from "./list-limit";
 import { formatStyledArtifactReference, type OutputMeta } from "./output-meta";
 import { formatExpandHint, getDomain, replaceTabs } from "./render-utils";
@@ -535,7 +536,7 @@ export async function renderHtmlToText(
 	try {
 		signal?.throwIfAborted();
 		const content = await htmlToMarkdown(html, { cleanContent: true });
-		if (content.trim().length > 100 && !isLowQualityOutput(content)) {
+		if (content.trim()) {
 			return { content, ok: true, method: "native" };
 		}
 	} catch {
@@ -620,6 +621,84 @@ async function handleSpecialUrls(
 // Main Render Function
 // =============================================================================
 
+export type InsaneFallbackOutcome =
+	| { kind: "http-failure"; status: number; content: string; usableContent: false }
+	| { kind: "javascript-empty"; status: number; content: string; usableContent: false };
+
+export type InsaneFallbackDecision =
+	| { allowed: true; reason: "transient-http" | "javascript-empty" }
+	| {
+			allowed: false;
+			reason: "raw" | "disabled" | "unsupported-target" | "unauthorized" | "forbidden" | "non-transient";
+	  };
+
+const INSANE_SUPPORTED_HOSTS = [
+	"reddit.com",
+	"redd.it",
+	"x.com",
+	"twitter.com",
+	"youtube.com",
+	"youtu.be",
+	"news.ycombinator.com",
+] as const;
+const INSANE_TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const INSANE_AUTH_MARKERS = ["login", "sign in", "auth", "paywall", "captcha"] as const;
+const INSANE_NARROW_WAF_MARKERS = ["cloudflare", "access denied", "just a moment"] as const;
+
+function isInsaneSupportedPublicUrl(rawUrl: string): boolean {
+	try {
+		const url = new URL(rawUrl);
+		const hostname = url.hostname.toLowerCase().replace(/^www\./, "");
+		return INSANE_SUPPORTED_HOSTS.some(host => hostname === host || hostname.endsWith(`.${host}`));
+	} catch {
+		return false;
+	}
+}
+
+function hasUsableInsaneFallbackContent(content: string): boolean {
+	return (
+		content
+			.replace(/<[^>]*>/g, "")
+			.replace(/\s+/g, " ")
+			.trim().length > 160
+	);
+}
+
+export function getInsaneFallbackOutcome(args: {
+	status?: number;
+	content: string;
+	javascriptEmpty?: boolean;
+}): InsaneFallbackOutcome | null {
+	if (args.status === undefined) return null;
+	if (hasUsableInsaneFallbackContent(args.content)) return null;
+	return args.javascriptEmpty
+		? { kind: "javascript-empty", status: args.status, content: args.content, usableContent: false }
+		: { kind: "http-failure", status: args.status, content: args.content, usableContent: false };
+}
+
+export function classifyInsaneFallback(args: {
+	url: string;
+	raw: boolean;
+	enabled: boolean;
+	outcome: InsaneFallbackOutcome;
+}): InsaneFallbackDecision {
+	if (args.raw) return { allowed: false, reason: "raw" };
+	if (!args.enabled) return { allowed: false, reason: "disabled" };
+	if (!isInsaneSupportedPublicUrl(args.url)) return { allowed: false, reason: "unsupported-target" };
+	if (args.outcome.status === 401) return { allowed: false, reason: "unauthorized" };
+
+	const content = args.outcome.content.toLowerCase();
+	const hasAuthWall = INSANE_AUTH_MARKERS.some(marker => content.includes(marker));
+	if (hasAuthWall) return { allowed: false, reason: "forbidden" };
+	if (args.outcome.status === 403) {
+		const hasNarrowWafMarker = INSANE_NARROW_WAF_MARKERS.some(marker => content.includes(marker));
+		return hasNarrowWafMarker ? { allowed: true, reason: "transient-http" } : { allowed: false, reason: "forbidden" };
+	}
+	if (args.outcome.kind === "javascript-empty") return { allowed: true, reason: "javascript-empty" };
+	if (INSANE_TRANSIENT_STATUSES.has(args.outcome.status)) return { allowed: true, reason: "transient-http" };
+	return { allowed: false, reason: "non-transient" };
+}
+
 export async function tryInsaneFallback(args: {
 	url: string;
 	finalUrl: string;
@@ -629,11 +708,39 @@ export async function tryInsaneFallback(args: {
 	signal: AbortSignal | undefined;
 	fetchedAt: string;
 	notes: string[];
+	outcome: InsaneFallbackOutcome;
+	cmuxVerified: boolean;
 }): Promise<FetchRenderResult | null> {
-	if (args.raw) return null;
-	if (args.settings.get("web.insaneFallback") !== true) return null;
-	args.notes.push(INSANE_NOTES.securityDisabled);
-	return null;
+	if (!args.cmuxVerified) return null;
+	const decision = classifyInsaneFallback({
+		url: args.finalUrl,
+		raw: args.raw,
+		enabled: args.settings.get("web.insaneFallback") === true,
+		outcome: args.outcome,
+	});
+	if (!decision.allowed) return null;
+
+	const route = await routeInsanePublicUrl(args.finalUrl, args.signal);
+	if (!route || !("sources" in route) || route.sources.length === 0) return null;
+	const content = sanitizeText(
+		route.sources
+			.map(source =>
+				[source.title, source.snippet, source.author].filter((value): value is string => Boolean(value)).join("\n"),
+			)
+			.join("\n\n"),
+	);
+	if (!content.trim()) return null;
+	args.notes.push(`Used Insane direct public route (${decision.reason})`);
+	return {
+		url: args.url,
+		finalUrl: route.finalUrl,
+		contentType: "text/plain",
+		method: "insane-public-route",
+		content,
+		fetchedAt: args.fetchedAt,
+		truncated: false,
+		notes: args.notes,
+	};
 }
 
 /**
@@ -646,6 +753,7 @@ async function renderUrl(
 	settings: Settings,
 	signal: AbortSignal | undefined,
 	storage: AgentStorage | null,
+	presenter?: CmuxResearchPresenter,
 ): Promise<FetchRenderResult> {
 	const notes: string[] = [];
 	const fetchedAt = new Date().toISOString();
@@ -686,6 +794,12 @@ async function renderUrl(
 		};
 	}
 	url = publicUrl.url.toString();
+	let cmuxVerified = false;
+	try {
+		cmuxVerified = (await presenter?.presentResearch({ kind: "url", url })) === true;
+	} catch {
+		// Presentation is optional and must never affect the fetch result.
+	}
 
 	// Step 1: Try special handlers for known sites (unless raw mode)
 	if (!raw) {
@@ -702,16 +816,21 @@ async function renderUrl(
 		const failureNote =
 			response.error ?? (response.status ? `Failed to fetch URL (HTTP ${response.status})` : "Failed to fetch URL");
 		notes.push(failureNote);
-		const insane = await tryInsaneFallback({
-			url,
-			finalUrl: response.finalUrl || url,
-			timeout,
-			raw,
-			settings,
-			signal,
-			fetchedAt,
-			notes,
-		});
+		const outcome = getInsaneFallbackOutcome({ status: response.status, content: response.content });
+		const insane = outcome
+			? await tryInsaneFallback({
+					url,
+					finalUrl: response.finalUrl || url,
+					timeout,
+					raw,
+					settings,
+					signal,
+					fetchedAt,
+					notes,
+					outcome,
+					cmuxVerified,
+				})
+			: null;
 		if (insane) return insane;
 		return {
 			url,
@@ -1024,7 +1143,21 @@ async function renderUrl(
 		const htmlResult = await renderHtmlToText(rawContent, signal);
 		if (!htmlResult.ok) {
 			notes.push("native HTML rendering failed");
-			const insane = await tryInsaneFallback({ url, finalUrl, timeout, raw, settings, signal, fetchedAt, notes });
+			const outcome = getInsaneFallbackOutcome({ status: response.status, content: rawContent });
+			const insane = outcome
+				? await tryInsaneFallback({
+						url,
+						finalUrl,
+						timeout,
+						raw,
+						settings,
+						signal,
+						fetchedAt,
+						notes,
+						outcome,
+						cmuxVerified,
+					})
+				: null;
 			if (insane) return insane;
 			const output = finalizeOutput(rawContent);
 			return {
@@ -1086,16 +1219,25 @@ async function renderUrl(
 				};
 			}
 
-			const insaneLowQuality = await tryInsaneFallback({
-				url,
-				finalUrl,
-				timeout,
-				raw,
-				settings,
-				signal,
-				fetchedAt,
-				notes,
+			const outcome = getInsaneFallbackOutcome({
+				status: response.status,
+				content: rawContent,
+				javascriptEmpty: true,
 			});
+			const insaneLowQuality = outcome
+				? await tryInsaneFallback({
+						url,
+						finalUrl,
+						timeout,
+						raw,
+						settings,
+						signal,
+						fetchedAt,
+						notes,
+						outcome,
+						cmuxVerified,
+					})
+				: null;
 			if (insaneLowQuality) return insaneLowQuality;
 			notes.push("Page appears to require JavaScript or is mostly navigation");
 		}
@@ -1206,7 +1348,7 @@ async function buildReadUrlCacheEntry(
 	session: ToolSession,
 	params: { path: string; raw?: boolean },
 	signal?: AbortSignal,
-	options?: { ensureArtifact?: boolean },
+	options?: { ensureArtifact?: boolean; presenter?: CmuxResearchPresenter },
 ): Promise<ReadUrlCacheEntry> {
 	const { path: url, raw = false } = params;
 
@@ -1217,7 +1359,7 @@ async function buildReadUrlCacheEntry(
 	}
 
 	const storage = session.settings.getStorage();
-	const result = await renderUrl(url, effectiveTimeout, raw, session.settings, signal, storage);
+	const result = await renderUrl(url, effectiveTimeout, raw, session.settings, signal, storage, options?.presenter);
 	const output = buildUrlReadOutput(result, result.content);
 	const artifactId = options?.ensureArtifact ? await persistReadUrlArtifact(session, output) : undefined;
 
@@ -1241,7 +1383,7 @@ export async function loadReadUrlCacheEntry(
 	session: ToolSession,
 	params: { path: string; raw?: boolean },
 	signal?: AbortSignal,
-	options?: { ensureArtifact?: boolean; preferCached?: boolean },
+	options?: { ensureArtifact?: boolean; preferCached?: boolean; presenter?: CmuxResearchPresenter },
 ): Promise<ReadUrlCacheEntry> {
 	const raw = params.raw ?? false;
 	const cached = readUrlCache.get(getReadUrlCacheKey(session, params.path, raw));
@@ -1256,6 +1398,7 @@ export async function loadReadUrlCacheEntry(
 
 	const fresh = await buildReadUrlCacheEntry(session, params, signal, {
 		ensureArtifact: options?.ensureArtifact,
+		presenter: options?.presenter,
 	});
 	cacheReadUrlEntry(session, params.path, raw, fresh);
 	return fresh;
@@ -1285,8 +1428,9 @@ export async function executeReadUrl(
 	session: ToolSession,
 	params: { path: string; raw?: boolean },
 	signal?: AbortSignal,
+	presenter?: CmuxResearchPresenter,
 ): Promise<AgentToolResult<ReadUrlToolDetails>> {
-	let cacheEntry = await loadReadUrlCacheEntry(session, params, signal, { preferCached: true });
+	let cacheEntry = await loadReadUrlCacheEntry(session, params, signal, { preferCached: true, presenter });
 	const truncation = truncateHead(cacheEntry.output, {
 		maxBytes: DEFAULT_MAX_BYTES,
 		maxLines: FETCH_DEFAULT_MAX_LINES,

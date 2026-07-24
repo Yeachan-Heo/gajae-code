@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an opt-in-by-environment, verified cmux presentation integration: public URL reads (including raw mode) and searches open no-focus browser surfaces, while interactive sessions make a retained, presentation-only projection of subagent lifecycle/progress. cmux never owns execution or surface cleanup, and the guarded typed public-route-only `insane` provider remains without a generic renderer.
+
 ### Fixed
 
 - Alibaba Token Plan canonical first-event timeouts now surface without session retry/fallback replay and are not internally retried by auto-compaction, preventing repeated provider usage (#3026).

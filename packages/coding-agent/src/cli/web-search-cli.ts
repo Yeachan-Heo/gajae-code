@@ -6,6 +6,7 @@
 
 import { APP_NAME } from "@gajae-code/utils";
 import chalk from "chalk";
+import { createCmuxInvocationPresentation } from "../cmux/integration";
 import { Settings } from "../config/settings";
 import { initTheme, theme } from "../modes/theme/theme";
 import {
@@ -16,6 +17,7 @@ import {
 	type SearchQueryParams,
 } from "../web/search/index";
 import { SEARCH_PROVIDER_ORDER, setPreferredSearchProvider, setSearchFallbackProviders } from "../web/search/provider";
+import type { InsaneRouteDependencies } from "../web/search/providers/insane";
 import { applyConfiguredSearchTimeout } from "../web/search/providers/utils";
 import { renderSearchResult } from "../web/search/render";
 import type { SearchProviderId } from "../web/search/types";
@@ -37,6 +39,8 @@ export interface SearchCommandArgs {
 	enableImageSearch?: boolean;
 	enableVideoUnderstanding?: boolean;
 	noInlineCitations?: boolean;
+	/** Optional guarded request seam for programmatic callers. */
+	insaneRouteDependencies?: InsaneRouteDependencies;
 }
 
 const PROVIDERS: Array<SearchProviderId | "auto"> = ["auto", ...SEARCH_PROVIDER_ORDER];
@@ -201,18 +205,26 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 		no_inline_citations: cmd.noInlineCitations,
 	};
 
-	const result = await runSearchQuery(params);
-	const component = renderSearchResult(result, { expanded: cmd.expanded, isPartial: false }, theme, {
-		query: cmd.query,
-		allowLongAnswer: true,
-		maxAnswerLines: cmd.expanded ? undefined : 6,
-	});
+	const presentation = createCmuxInvocationPresentation();
+	try {
+		const result = await runSearchQuery(params, {
+			presentation: presentation.presentation,
+			insaneRouteDependencies: cmd.insaneRouteDependencies,
+		});
+		const component = renderSearchResult(result, { expanded: cmd.expanded, isPartial: false }, theme, {
+			query: cmd.query,
+			allowLongAnswer: true,
+			maxAnswerLines: cmd.expanded ? undefined : 6,
+		});
 
-	const width = Math.max(60, process.stdout.columns ?? 100);
-	process.stdout.write(`${component.render(width).join("\n")}\n`);
+		const width = Math.max(60, process.stdout.columns ?? 100);
+		process.stdout.write(`${component.render(width).join("\n")}\n`);
 
-	if (result.details?.error) {
-		process.exitCode = 1;
+		if (result.details?.error) {
+			process.exitCode = 1;
+		}
+	} finally {
+		presentation.dispose();
 	}
 }
 

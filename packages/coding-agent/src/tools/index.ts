@@ -1,9 +1,12 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai";
 import { $env, logger } from "@gajae-code/utils";
+import type { CmuxResearchPresenter } from "../cmux/integration";
+import type { ModelRegistry } from "../config/model-registry";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
+import type { FileReadCache } from "../edit/file-read-cache";
 import { isTruthyPythonFlag } from "../eval/py/env";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { Skill } from "../extensibility/skills";
@@ -20,14 +23,20 @@ import type {
 	PurgeQueuedCustomMessagesResult,
 } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
+import type { AuthStorage } from "../session/auth-storage";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import type { SkillActiveEntry } from "../skill-state/active-state";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
-import type { DiscoverableTool, DiscoverableToolSearchIndex } from "../tool-discovery/tool-index";
+import type {
+	DiscoverableTool,
+	DiscoverableToolSearchIndex,
+	DiscoverableToolSource,
+} from "../tool-discovery/tool-index";
 import type { EventBus } from "../utils/event-bus";
+import type { NamedToolChoiceResult } from "../utils/tool-choice";
 import { WebSearchTool } from "../web/search";
 import type { WorkspaceTree } from "../workspace-tree";
 import { AskTool } from "./ask";
@@ -40,6 +49,7 @@ import { BrowserTool } from "./browser";
 import { CalculatorTool } from "./calculator";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
 import { ComputerTool, isComputerCallable, isComputerLoadablePlatform } from "./computer";
+import type { ConflictHistory } from "./conflict-detect";
 import { CronTool } from "./cron";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
@@ -244,6 +254,8 @@ export interface ToolSession {
 	hasEditTool?: boolean;
 	/** Event bus for tool/extension communication */
 	eventBus?: EventBus;
+	/** Optional presentation-only cmux seam for approved public research. */
+	presentation?: CmuxResearchPresenter;
 	/** Output schema for structured completion (subagents) */
 	outputSchema?: unknown;
 	/** Whether to include the yield tool by default */
@@ -303,9 +315,9 @@ export interface ToolSession {
 	/** Get the current session model string, regardless of how it was chosen */
 	getActiveModelString?: () => string | undefined;
 	/** Auth storage for passing to subagents (avoids re-discovery) */
-	authStorage?: import("../session/auth-storage").AuthStorage;
+	authStorage?: AuthStorage;
 	/** Model registry for passing to subagents (avoids re-discovery) */
-	modelRegistry?: import("../config/model-registry").ModelRegistry;
+	modelRegistry?: ModelRegistry;
 	/** Agent output manager for unique agent:// IDs across task invocations */
 	agentOutputManager?: AgentOutputManager;
 	/** Settings instance for passing to subagents */
@@ -340,9 +352,7 @@ export interface ToolSession {
 	/** Whether any form of tool discovery is active (tools.discoveryMode !== "off" or mcp.discoveryMode). */
 	isToolDiscoveryEnabled?: () => boolean;
 	/** Get all hidden-but-discoverable tools for search_tool_bm25 prompts. */
-	getDiscoverableTools?: (filter?: {
-		source?: import("../tool-discovery/tool-index").DiscoverableToolSource;
-	}) => DiscoverableTool[];
+	getDiscoverableTools?: (filter?: { source?: DiscoverableToolSource }) => DiscoverableTool[];
 	/** Get the cached generic discoverable search index. */
 	getDiscoverableToolSearchIndex?: () => DiscoverableToolSearchIndex;
 	/** Get tool names activated by prior search_tool_bm25 calls (all sources). */
@@ -354,7 +364,7 @@ export interface ToolSession {
 	/** Build a model-provider-specific ToolChoice that targets the named tool, or undefined if unsupported. */
 	buildToolChoice?(toolName: string): ToolChoice | undefined;
 	/** Build a named tool-choice decision, preserving whether exact named forcing survived capability degradation. */
-	buildToolChoiceResult?(toolName: string): import("../utils/tool-choice").NamedToolChoiceResult;
+	buildToolChoiceResult?(toolName: string): NamedToolChoiceResult;
 	/** Steer a hidden custom message into the conversation (e.g. a preview reminder). */
 	steer?(message: { customType: string; content: string; details?: unknown }): void;
 	/** Peek the currently in-flight tool-choice queue directive's invocation handler. Used by the `resolve` tool to dispatch to the pending action. */
@@ -374,13 +384,13 @@ export interface ToolSession {
 	 *  `read`/`search`. Used by hashline anchor-stale recovery to reconstruct
 	 *  the version the model authored anchors against when the file changed
 	 *  out-of-band. Lazily initialized by `getFileReadCache`. */
-	fileReadCache?: import("../edit/file-read-cache").FileReadCache;
+	fileReadCache?: FileReadCache;
 
 	/** Per-session log of unresolved git merge conflict regions surfaced by
 	 *  `read`. Each entry gets a stable id N referenced by `write conflict://N`
 	 *  to splice the recorded region with replacement content. Lazily initialized
 	 *  by `getConflictHistory`. */
-	conflictHistory?: import("./conflict-detect").ConflictHistory;
+	conflictHistory?: ConflictHistory;
 
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;

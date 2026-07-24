@@ -16,6 +16,7 @@
   - `packages/coding-agent/src/workspace-tree.ts` — render directory trees.
   - `packages/coding-agent/src/edit/file-read-cache.ts` — cache read lines for later hashline edit recovery.
   - `packages/coding-agent/src/tools/index.ts` — registers `read: s => new ReadTool(s)`.
+  - `packages/coding-agent/src/cmux/integration.ts` — optional cmux presentation for validated public top-level URL reads.
 
 ## Inputs
 
@@ -43,6 +44,12 @@ Validation in `parseLineRangeChunk()`:
 Selector parsing intentionally falls through for unrecognized trailing `:...`; archive and SQLite paths consume their own colon syntax.
 
 URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts` and support only `:raw`, `:N`, `:A-B`, and `:A+C` — no optional `L` prefix there.
+
+### cmux presentation
+
+For a top-level public HTTP(S) URL, `fetch.ts` may make an independent, best-effort presentation call before fetching. This includes `:raw`; raw still controls content rendering, not browser presentation. When `CMUX_WORKSPACE_ID` is a valid cmux identifier and the local `cmux` CLI verifies `help`, `capabilities`, and `identify`, GJC opens the validated URL with `cmux browser open <url> --focus false`.
+
+This is presentation only: it has no effect on fetch permission, redirects, rendered output, errors, caching, or the normal non-cmux path. Missing/invalid cmux context, verification failure, timeout, or a later cmux command error silently leaves the read result unchanged and disables presentation for that invocation. `gjc-read` receives this invocation-scoped behavior; interactive sessions use the same optional session-scoped presenter.
 
 ## Outputs
 - Single-shot `AgentToolResult` built through `toolResult()` in `packages/coding-agent/src/tools/tool-result.ts`.
@@ -228,15 +235,12 @@ Notes: ...
 - `method` records the winning path (`json`, `feed`, `text`, `alternate-markdown`, `md-suffix`, `content-negotiation`, `image`, `markit`, `llms.txt`, `raw`, `raw-html`, `insane`, etc.).
 - URL reads may return an inline image block when the fetched resource is a supported image and survives resizing.
 
-### Insane Search fallback (opt-in)
+### Insane Search safe-route fallback (opt-in)
 
-- Setting: `web.insaneFallback` (default **off**). When enabled, blocked or degraded public URL reads escalate through the vendored [`fivetaku/insane-search`](https://github.com/fivetaku/insane-search) engine (`packages/coding-agent/vendor/insane-search`) before `read` gives up.
-- It runs at three points in `renderUrl()`: the hard fetch failure (`!response.ok`, e.g. 403/WAF), the renderer-failure raw-HTML branch, and the low-quality/JS-gated branch — the latter only after the existing document-extraction and `llms.txt` fallbacks fail. A successful escalation is tagged `Method: insane`.
-- **Public content only.** A pre-spawn guard (`src/web/insane/url-guard.ts`) rejects non-HTTP(S) schemes, URL credentials, `localhost`/`.local`/`.internal` hosts, loopback/private/link-local/reserved IPs (IPv4, IPv6, and IPv4-mapped IPv6), and DNS names that resolve to any private/reserved address — **before** any dependency probe or subprocess runs.
-- **Raw mode is never escalated.** `read <url>:raw` performs no guard DNS, no dependency probe, and no subprocess.
-- **Dependencies are required, never auto-installed.** Phase 0–2 need `python3` + `curl_cffi`; the browser phase needs `node` + `playwright`/`playwright-extra`/`puppeteer-extra-plugin-stealth` under `vendor/insane-search/engine/templates`. Missing dependencies surface a stable `insane fallback unavailable: …` note and `read` continues with its normal degraded result.
-- **Login/paywall is not bypassed.** An `authentication required` verdict maps to a note (`insane fallback stopped: authentication required`) and normal degraded output.
-- **Residual risk:** the engine performs its own network requests and may follow redirects that this guard never re-validates. This is accepted, documented risk, mitigated by validating the input target and keeping the feature opt-in/off by default. Enabling it changes network posture by allowing TLS/browser impersonation for public pages.
+- Setting: `web.insaneFallback` (default **off**). The fallback is considered only after a validated public URL was successfully presented through a verified cmux adapter and the normal read produced no usable content.
+- Eligible targets are public Reddit, X/Twitter, YouTube, and Hacker News URLs only. Eligible failures are narrowly classified HTTP/WAF or JavaScript-gate outcomes; `401`, authentication, CAPTCHA, paywall, credentials, private/internal hosts, unsupported domains, raw mode, and unclassified tool failures never route to Insane.
+- Every generated public route and redirect hop uses the shared guarded public fetch path with manual redirect validation and address pinning. Guard failure preserves the original degraded read result.
+- The generic vendored renderer remains security-disabled. No browser cookies, profile state, headers, form data, subprocess renderer, TLS impersonation, or authenticated context is forwarded.
 
 ## Side Effects
 - Filesystem
