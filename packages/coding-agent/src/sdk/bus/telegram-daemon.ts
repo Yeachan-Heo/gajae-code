@@ -8060,6 +8060,10 @@ export class TelegramNotificationDaemon {
 					this.toolActivityPolicyEpoch++;
 					this.opts.toolActivity = { enabled: desired };
 					if (!desired) {
+						// A start can already own a granted Bot API call without having a
+						// visible message id yet. Settle that dispatch boundary before pruning
+						// queued terminals so its eventual completion/error edit is preserved.
+						await this.flushChain;
 						const removedTools = this.pool.removeWhere(item => {
 							const toolActivity = item.payload.toolActivity;
 							if (!toolActivity) return false;

@@ -13192,7 +13192,7 @@ describe("Telegram tool activity capability and routing", () => {
 		expect(bot.calls.some(call => String(call.body.text).includes("subagent — ok"))).toBe(false);
 	});
 
-	test("/toolactivity off orders a granted start before its racing terminal and acknowledgement", async () => {
+	test("/toolactivity off preserves a queued terminal for an already-granted start", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		const bot = new FakeBotApi();
@@ -13232,6 +13232,13 @@ describe("Telegram tool activity capability and routing", () => {
 			phase: "started",
 		});
 		await entered.promise;
+		const terminal = daemon.handleSessionMessage(session, {
+			type: "tool_activity",
+			sessionId: "S",
+			toolCallId: "granted",
+			toolName: "read",
+			phase: "completed",
+		});
 		const toggle = daemon.handleTelegramUpdate({
 			update_id: 964,
 			message: { chat: { id: 42, type: "private" }, text: "/toolactivity off", message_id: 4 },
@@ -13243,13 +13250,6 @@ describe("Telegram tool activity capability and routing", () => {
 			await Bun.sleep(5);
 		}
 		expect(runtime.opts.toolActivity?.enabled).toBe(false);
-		const terminal = daemon.handleSessionMessage(session, {
-			type: "tool_activity",
-			sessionId: "S",
-			toolCallId: "granted",
-			toolName: "read",
-			phase: "completed",
-		});
 
 		release.resolve();
 		await Promise.all([toolSend, toggle, terminal]);
