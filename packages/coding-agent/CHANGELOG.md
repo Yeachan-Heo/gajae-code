@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Workflow state readers no longer write corrupt-state or out-of-band warnings straight to `process.stderr` during interactive sessions. Warnings go through the TUI-safe file logger; CLI `gjc state` still surfaces structured warnings on the command result stderr path so the live prompt is not painted over mid-frame (#3002).
 - Telegram notification topics now fence malformed successful `createForumTopic` responses per session endpoint, preventing repeated ambiguous topic creation while keeping explicit Bot API failures retryable.
 
 ## [0.11.8] - 2026-07-23

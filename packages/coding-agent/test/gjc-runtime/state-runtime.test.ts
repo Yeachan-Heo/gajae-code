@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { deepInterviewCharacterCount } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
@@ -7,7 +7,8 @@ import {
 	modeStatePath,
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { readWorkflowStateJson, runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { logger } from "@gajae-code/utils";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -94,6 +95,34 @@ describe("native gjc state runtime", () => {
 
 		const status = await runNativeStateCommand(["status", "--mode", "ralplan", "--json"], root);
 		expect(status.status).toBe(0);
+	});
+
+	it("does not paint corrupt ultragoal-state warnings onto process.stderr (#3002)", async () => {
+		const root = await tempDir();
+		const stateDir = sessionStateDir(root, TEST_SESSION_ID);
+		await fs.mkdir(stateDir, { recursive: true });
+		const corruptPath = path.join(stateDir, "ultragoal-state.json");
+		await fs.writeFile(corruptPath, "{not json");
+
+		const stderrWrites: string[] = [];
+		const stderrSpy = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderrWrites.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const state = await readWorkflowStateJson(root, "ultragoal", TEST_SESSION_ID);
+			expect(state).toEqual({});
+			const painted = stderrWrites.join("");
+			expect(painted).not.toContain("WARNING:");
+			expect(painted).not.toContain("ignoring corrupt state");
+			expect(
+				warn.mock.calls.some(call => typeof call[0] === "string" && call[0].includes("ignoring corrupt state")),
+			).toBe(true);
+		} finally {
+			warn.mockRestore();
+			stderrSpy.mockRestore();
+		}
 	});
 
 	it('supports the legacy --input \'{"mode":"..."}\' payload shape for read', async () => {

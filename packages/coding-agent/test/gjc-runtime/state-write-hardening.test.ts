@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { modeStatePath, sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { runNativeStateCommand } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { logger } from "@gajae-code/utils";
 
 const TEST_SESSION_ID = "test-session";
 
@@ -175,13 +176,19 @@ describe("gjc state write hardening", () => {
 		const root = await tempDir();
 		await writeRawState(root, "ralplan", "{broken json");
 		const stderr = captureStderrWrites();
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const read = await runNativeStateCommand(["read", "--mode", "ralplan", "--json"], root);
 			expect(read.status).toBe(0);
 			const status = await runNativeStateCommand(["status", "--mode", "ralplan", "--json"], root);
 			expect(status.status).toBe(0);
-			expect(stderr.writes.join("")).toContain("ignoring corrupt state");
+			// TUI-safe: never paint raw warning bytes into the alternate-screen stream (#3002).
+			expect(stderr.writes.join("")).not.toContain("ignoring corrupt state");
+			expect(
+				warn.mock.calls.some(call => typeof call[0] === "string" && call[0].includes("ignoring corrupt state")),
+			).toBe(true);
 		} finally {
+			warn.mockRestore();
 			stderr.restore();
 		}
 

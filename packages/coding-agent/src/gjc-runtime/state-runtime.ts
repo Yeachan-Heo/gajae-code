@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import {
 	applyHandoffToActiveState,
@@ -265,6 +266,16 @@ async function describeStaleClearState(
 	return undefined;
 }
 
+/**
+ * Route workflow-state warnings through the file logger (console transport off
+ * by default) so interactive TUI sessions never paint raw bytes into the
+ * alternate-screen stream. CLI commands still surface structured warnings via
+ * {@link StateCommandResult.stderr} where applicable.
+ */
+function emitStateWarning(message: string, context?: Record<string, unknown>): void {
+	logger.warn(message, context);
+}
+
 async function readJsonFile(filePath: string): Promise<Record<string, unknown> | null> {
 	try {
 		const raw = await fs.readFile(filePath, "utf-8");
@@ -276,7 +287,10 @@ async function readJsonFile(filePath: string): Promise<Record<string, unknown> |
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
 		if (err.code === "ENOENT") return null;
-		process.stderr.write(`WARNING: failed to read ${filePath}; ignoring corrupt state: ${err.message}\n`);
+		emitStateWarning(`WARNING: failed to read ${filePath}; ignoring corrupt state: ${err.message}`, {
+			filePath,
+			error: err.message,
+		});
 		return null;
 	}
 }
@@ -287,7 +301,10 @@ async function readJsonValue(filePath: string): Promise<unknown | null> {
 	} catch (error) {
 		const err = error as NodeJS.ErrnoException;
 		if (err.code === "ENOENT") return null;
-		process.stderr.write(`WARNING: failed to read ${filePath}; ignoring corrupt state: ${err.message}\n`);
+		emitStateWarning(`WARNING: failed to read ${filePath}; ignoring corrupt state: ${err.message}`, {
+			filePath,
+			error: err.message,
+		});
 		return null;
 	}
 }
@@ -1603,7 +1620,7 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 			toPhase: "handoff",
 		});
 		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { steps: ["caller-mode-state"] });
-		if (callerWrite.warning) process.stderr.write(`${callerWrite.warning}\n`);
+		if (callerWrite.warning) emitStateWarning(callerWrite.warning, { skill: caller, verb: "handoff" });
 		const stampedCallerReceipt = isPlainObject(callerWrite.stamped.receipt) ? callerWrite.stamped.receipt : {};
 		await syncSkillActiveState({
 			cwd,
@@ -1646,6 +1663,7 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 					active_state: activeStateFile(cwd, sessionId),
 				},
 			}),
+			...(callerWrite.warning ? { stderr: `${callerWrite.warning}\n` } : {}),
 		};
 	}
 
@@ -1746,7 +1764,9 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 	);
 	const stampedCallerReceipt = isPlainObject(callerWrite.stamped.receipt) ? callerWrite.stamped.receipt : {};
 	const stampedCalleeReceipt = isPlainObject(calleeWrite.stamped.receipt) ? calleeWrite.stamped.receipt : {};
-	for (const warning of warnings) process.stderr.write(`${warning}\n`);
+	for (const warning of warnings) {
+		emitStateWarning(warning, { skill: caller, verb: "handoff", to: callee });
+	}
 	if (process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER === mutationId) {
 		throw new StateCommandError(1, `injected handoff failure after caller write for ${mutationId}`);
 	}
@@ -1818,6 +1838,7 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 				active_state: activeStateFile(cwd, sessionId),
 			},
 		}),
+		...(warnings.length > 0 ? { stderr: `${warnings.join("\n")}\n` } : {}),
 	};
 }
 
