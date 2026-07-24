@@ -28,8 +28,8 @@ const MAX_MANAGED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANAGED_TREE_DEPTH: usize = 32;
 const MAX_MANAGED_TREE_FILES: u64 = 50_000;
 // Entries include files and directories. Leave room for the artifact directory,
-// nested directories, and managed transcript, binding, and receipt metadata while
-// preserving the TypeScript artifact-file limit.
+// nested directories, and managed transcript, binding, and receipt metadata
+// while preserving the TypeScript artifact-file limit.
 const MAX_MANAGED_TREE_ENTRIES: u64 = 60_000;
 const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
