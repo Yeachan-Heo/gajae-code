@@ -17,6 +17,7 @@ import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import type { Theme } from "../modes/theme/theme";
 import { OutputSink, type OutputSummary } from "../session/streaming-output";
 import { sanitizeWithOptionalSixelPassthrough } from "../utils/sixel";
+import { formatInvocationCommand } from "./invocation-display";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
 import { formatStatusIcon, replaceTabs } from "./render-utils";
 
@@ -91,7 +92,7 @@ function normalizeInputForPty(data: string, applicationCursorKeysMode: boolean):
 	}
 	return data;
 }
-class BashInteractiveOverlayComponent implements Component {
+export class BashInteractiveOverlayComponent implements Component {
 	#terminal: XtermTerminalType;
 	#state: "running" | "complete" | "timed_out" | "killed" = "running";
 	#exitCode: number | undefined;
@@ -251,7 +252,8 @@ class BashInteractiveOverlayComponent implements Component {
 		const prefix = `${statusIcon} ${title} `;
 		const suffix = ` ${statusBadge}`;
 		const available = Math.max(1, innerWidth - visibleWidth(prefix) - visibleWidth(suffix));
-		const cmd = truncateToWidth(this.uiTheme.fg("muted", replaceTabs(this.command)), available);
+		const displayedCommand = replaceTabs(sanitizeText(formatInvocationCommand(this.command, false)));
+		const cmd = truncateToWidth(this.uiTheme.fg("muted", displayedCommand), available);
 		const header = truncateToWidth(`${prefix}${cmd}${suffix}`, innerWidth);
 		const footer =
 			this.#state === "running"

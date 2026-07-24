@@ -2,12 +2,14 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import { BashExecutionComponent } from "@gajae-code/coding-agent/modes/components/bash-execution";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import { bashToolRenderer, formatBashCommand } from "@gajae-code/coding-agent/tools/bash";
+import { BashInteractiveOverlayComponent } from "@gajae-code/coding-agent/tools/bash-interactive";
 import {
 	formatInvocationCommand,
 	formatInvocationEnvironment,
 } from "@gajae-code/coding-agent/tools/invocation-display";
 import type { TUI } from "@gajae-code/tui";
 import { visibleWidth } from "@gajae-code/tui";
+import xterm from "@xterm/headless";
 
 const ui = { requestRender: () => {} } as unknown as TUI;
 
@@ -187,6 +189,22 @@ describe("bash invocation display safety", () => {
 			expect(output).not.toContain("\x07");
 			expect(Bun.stripANSI(output)).toContain("printf 'red'link");
 		}
+	});
+
+	it("redacts and sanitizes the interactive PTY overlay header", async () => {
+		const theme = (await getThemeByName("red-claw"))!;
+		const secret = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+		const maliciousUrl = "https://evil.test";
+		const command = `API_TOKEN='${secret}' printf '\x1b[31mred\x1b[0m\x07'\x1b]8;;${maliciousUrl}\x07link\x1b]8;;\x07`;
+		const component = new BashInteractiveOverlayComponent(command, theme, () => 24, xterm.Terminal);
+
+		const rendered = component.render(100).join("\n");
+		component.dispose();
+
+		expect(rendered).not.toContain(secret);
+		expect(rendered).not.toContain(maliciousUrl);
+		expect(rendered).not.toContain("\x07");
+		expect(Bun.stripANSI(rendered)).toContain("API_TOKEN='<redacted>' printf 'red'link");
 	});
 
 	it("keeps the shell execution header bounded and never reveals secrets when expanded", () => {
