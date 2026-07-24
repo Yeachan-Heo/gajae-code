@@ -547,7 +547,7 @@ export class SessionMigrationPolicyError extends Error {
 	}
 }
 
-class SessionArtifactCapacityError extends Error {
+export class SessionArtifactCapacityError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "SessionArtifactCapacityError";
@@ -7926,6 +7926,10 @@ export class SessionManager {
 			);
 			if (opened.kind === "error") {
 				if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
+				if (opened.reason === "artifact_capacity_exceeded")
+					throw new SessionArtifactCapacityError(
+						opened.message ?? "Session artifacts exceed the migration capacity.",
+					);
 				return undefined;
 			}
 			return opened.manager;

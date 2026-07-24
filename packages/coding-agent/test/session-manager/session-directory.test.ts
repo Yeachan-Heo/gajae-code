@@ -17,7 +17,7 @@ import {
 	validateManagedArtifactTree,
 	validateNativeSecurityResult,
 } from "../../src/session/internal/managed-session-storage";
-import { SessionManager } from "../../src/session/session-manager";
+import { SessionArtifactCapacityError, SessionManager } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
 const temporaryDirectories: string[] = [];
@@ -348,7 +348,7 @@ describe("managed session write protocol", () => {
 			expect(receipt.artifactManifest).toHaveLength(count + 1);
 		}
 	}, 120_000);
-	it("returns a typed strict-open capacity failure and clamps injected artifact limits", async () => {
+	it("returns a typed strict-open capacity failure and surfaces it from continueRecent", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
 		const source = path.join(legacy, "strict-artifact-capacity.jsonl");
@@ -374,6 +374,14 @@ describe("managed session write protocol", () => {
 			reason: "artifact_capacity_exceeded",
 			message: `Legacy session artifacts exceed the migration capacity (${MANAGED_ARTIFACT_MAX_FILES.toLocaleString()} files or 512 MiB).`,
 		});
+		await expect(
+			SessionManager.continueRecent(cwd, SessionManager.managedDestination(cwd, path.dirname(sessionsRoot))),
+		).rejects.toThrow(
+			`Legacy session artifacts exceed the migration capacity (${MANAGED_ARTIFACT_MAX_FILES.toLocaleString()} files or 512 MiB).`,
+		);
+		await expect(
+			SessionManager.continueRecent(cwd, SessionManager.managedDestination(cwd, path.dirname(sessionsRoot))),
+		).rejects.toThrow(SessionArtifactCapacityError);
 	}, 120_000);
 
 	it("distinguishes artifact capacity from unsafe topology violations", async () => {
