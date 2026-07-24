@@ -483,11 +483,13 @@ function readyTelegramSpawnFixture({
 	firstChildPid,
 	now,
 	onSpawn,
+	onReady,
 }: {
 	settings: Settings;
 	firstChildPid: number;
 	now?: () => number;
 	onSpawn?: (pid: number, command: string, args: string[]) => void;
+	onReady?: () => void;
 }) {
 	let nextChildPid = firstChildPid;
 	let pending: { ownerId: string; pid: number } | undefined;
@@ -511,9 +513,10 @@ function readyTelegramSpawnFixture({
 					now,
 				}),
 			).toBe(true);
+			onReady?.();
 		},
 		sleep: async () => {
-			if (pending)
+			if (pending) {
 				await renewDaemonHeartbeat({
 					settings,
 					ownerId: pending.ownerId,
@@ -522,6 +525,8 @@ function readyTelegramSpawnFixture({
 					pidIncarnation: () => "linux:100",
 					now,
 				});
+				onReady?.();
+			}
 		},
 	};
 }
@@ -610,6 +615,41 @@ class FakeBotApi {
 		if (method === "sendMessage" || method === "sendRichMessage")
 			return { ok: true, result: { message_id: this.calls.length } };
 		return { ok: true, result: true };
+	}
+}
+
+class SinglePollerBotApi extends FakeBotApi {
+	inFlightOwner: string | undefined;
+	conflicts: string[] = [];
+	events: Array<{ type: "start" | "conflict" | "end"; owner: string }> = [];
+	#release: (() => void) | undefined;
+
+	override async call(method: string, body: unknown, options?: { noRetry?: boolean; signal?: AbortSignal }): Promise<unknown> {
+		if (method !== "getUpdates") return await super.call(method, body, options);
+		const owner = (body as { owner: string }).owner;
+		this.calls.push({ method, body, options });
+		if (this.inFlightOwner) {
+			this.conflicts.push(owner);
+			this.events.push({ type: "conflict", owner });
+			return { ok: false, error_code: 409, description: "Conflict: terminated by other getUpdates request" };
+		}
+		this.inFlightOwner = owner;
+		this.events.push({ type: "start", owner });
+		await new Promise<void>(resolve => (this.#release = resolve));
+		this.events.push({ type: "end", owner });
+		this.inFlightOwner = undefined;
+		this.#release = undefined;
+		return { ok: true, result: [] };
+	}
+
+	start(owner: string): void {
+		void this.call("getUpdates", { owner });
+	}
+
+	async stop(owner: string): Promise<void> {
+		if (this.inFlightOwner !== owner) throw new Error(`Expected ${owner} to be polling`);
+		this.#release?.();
+		await Promise.resolve();
 	}
 }
 async function unavailableControlHarness(fsImpl?: TelegramDaemonFs) {
@@ -3397,14 +3437,18 @@ describe("telegram daemon", () => {
 		expect(after.roots).toContain(path.join(cwd, ".gjc", "state"));
 	});
 
-	test("D6a: epoch-1-to-epoch-2 convergence reloads exactly one ready owner before replacement polling", async () => {
+	test("D6a: lower-generation predecessor stops polling before the epoch-2 successor is ready", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
-		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION, servingEpoch: undefined, heartbeatAt: Date.now() });
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION - 1, servingEpoch: undefined, heartbeatAt: Date.now() });
+		const bot = new SinglePollerBotApi();
 		const alive = new Set<number>([999, 4242]);
 		const signals: Array<[number, string]> = [];
 		let spawns = 0;
 		let oldAliveAtSpawn: boolean | undefined;
+		let successorPolling = false;
+		bot.start("predecessor");
+		await Promise.resolve();
 		const child = readyTelegramSpawnFixture({
 			settings: s,
 			firstChildPid: 4244,
@@ -3412,6 +3456,12 @@ describe("telegram daemon", () => {
 				spawns++;
 				oldAliveAtSpawn = alive.has(999);
 				alive.add(4244);
+			},
+			onReady: () => {
+				if (!successorPolling) {
+					successorPolling = true;
+					bot.start("successor");
+				}
 			},
 		});
 		const result = await ensureTelegramDaemonRunningDetailed(
@@ -3425,10 +3475,12 @@ describe("telegram daemon", () => {
 						? {
 								incarnation: "linux:100",
 								termination: "cooperative",
-
 								signalRoot: sig => {
 									signals.push([pid, sig]);
-									if (sig === "SIGTERM") alive.delete(pid);
+									if (sig === "SIGTERM") {
+										alive.delete(pid);
+										void bot.stop("predecessor");
+									}
 								},
 							}
 						: undefined,
@@ -3436,21 +3488,33 @@ describe("telegram daemon", () => {
 				spawn: child.spawn,
 			},
 		);
+		await Promise.resolve();
 		expect(result).toBe("reloaded");
 		expect(signals).toContainEqual([999, "SIGTERM"]);
 		expect(spawns).toBe(1);
 		expect(oldAliveAtSpawn).toBe(false);
+		expect(bot.events).toEqual([
+			{ type: "start", owner: "predecessor" },
+			{ type: "end", owner: "predecessor" },
+			{ type: "start", owner: "successor" },
+		]);
+		expect(bot.conflicts).toEqual([]);
 		const after = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8"));
 		expect(after).toMatchObject({ generation: DAEMON_GENERATION, servingEpoch: SERVING_EPOCH, ownershipPhase: "ready" });
+		await bot.stop("successor");
 	});
-	test("D6b: forced hard-kill waits for captured-owner death before spawning a single replacement", async () => {
+	test("D6b: SIGKILL fences the poller before the successor becomes ready", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(settings(agentDir), agentDir);
 		let now = 101;
+		const bot = new SinglePollerBotApi();
 		const alive = new Set<number>([999]);
 		const signals: Array<[number, NodeJS.Signals]> = [];
 		let oldAliveAtSpawn: boolean | undefined;
+		let successorPolling = false;
 		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION, heartbeatAt: 100 });
+		bot.start("predecessor");
+		await Promise.resolve();
 		const child = readyTelegramSpawnFixture({
 			settings: s,
 			firstChildPid: 4244,
@@ -3458,6 +3522,12 @@ describe("telegram daemon", () => {
 			onSpawn: () => {
 				oldAliveAtSpawn = alive.has(999);
 				alive.add(4244);
+			},
+			onReady: () => {
+				if (!successorPolling) {
+					successorPolling = true;
+					bot.start("successor");
+				}
 			},
 		});
 		const result = await new TelegramDaemonController(s, {
@@ -3473,7 +3543,10 @@ describe("telegram daemon", () => {
 							termination: "cooperative",
 							signalRoot: signal => {
 								signals.push([pid, signal]);
-								if (signal === "SIGKILL") alive.delete(pid);
+								if (signal === "SIGKILL") {
+									alive.delete(pid);
+									void bot.stop("predecessor");
+								}
 							},
 						}
 					: undefined,
@@ -3485,13 +3558,22 @@ describe("telegram daemon", () => {
 			waitStepMs: 1,
 			readinessTimeoutMs: 2,
 		}).reload({ force: true, gracefulTimeoutMs: 1, killTimeoutMs: 1 });
+		await Promise.resolve();
 		expect(result.ok).toBe(true);
 		expect(signals).toEqual([
 			[999, "SIGTERM"],
 			[999, "SIGKILL"],
 		]);
 		expect(oldAliveAtSpawn).toBe(false);
-		expect(signals.some(([pid]) => pid === 4244)).toBe(false);
+		const predecessorStoppedAt = bot.events.findIndex(event => event.type === "end" && event.owner === "predecessor");
+		const successorStartedAt = bot.events.findIndex(event => event.type === "start" && event.owner === "successor");
+		expect(predecessorStoppedAt).toBeGreaterThanOrEqual(0);
+		expect(successorStartedAt).toBeGreaterThan(predecessorStoppedAt);
+		expect(bot.conflicts.length).toBeLessThanOrEqual(1);
+		// A SIGKILL handoff may have bounded transient 409s before death, but the
+		// single-poller bridge must see no overlap once the captured owner is dead.
+		expect(bot.events.slice(predecessorStoppedAt + 1).some(event => event.type === "conflict")).toBe(false);
+		await bot.stop("successor");
 	});
 	test("cooldown waits for a provisional successor's ready provenance before attaching", async () => {
 		const agentDir = tempAgentDir();
