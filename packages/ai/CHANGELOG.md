@@ -8,6 +8,7 @@
 ### Added
 
 - Added first-class support for **OpenGateway by Sionic AI**, an OpenAI-compatible gateway. Registers the `opengateway` provider descriptor, `/login` OAuth entry (API-key paste validated against `https://apis.opengateway.ai/v1/models`), `OPENGATEWAY_API_KEY` environment resolution, and bundled `models.json` seed models. Models are discovered dynamically from the OpenAI-compatible `/v1/models` endpoint (base URL `https://apis.opengateway.ai/v1`).
+- Added **Claude Opus 5** (`claude-opus-5`) to the bundled `anthropic` model catalog: 1M context window, 128k max output, thinking on with the full effort ladder through `max`, and standard Opus pricing ($5/$25 per MTok, cache 0.5/6.25) — unchanged from Opus 4.8. As the newest Opus, it becomes the canonical target for the `claude-opus-latest` family alias.
 
 ## [0.11.8] - 2026-07-23
 
