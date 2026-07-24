@@ -2353,10 +2353,11 @@ function sameArtifactTree(
 ): boolean {
 	const { platform = process.platform, phase = "strict" } = policy;
 	const entryKey = (entry: NativeDirectoryTreeSnapshot["entries"][number]): string => {
-		// pi-iso accepts Windows plain directories by stable file id and kind only: NTFS can lazily
-		// update directory size, mtime, and ctime while enumeration trails an open handle. All other
-		// platforms and phases compare every captured field, including nested-directory ctime.
-		if (phase === "migration" && platform === "win32" && entry.kind === "directory")
+		// Detaching the root directory changes its ctime without changing the preserved artifact tree;
+		// root identity and mtime are checked above. pi-iso also accepts Windows plain directories by
+		// stable file id and kind only because NTFS can lazily update their metadata while enumeration
+		// trails an open handle. All other platforms and nested directories compare every captured field.
+		if (phase === "migration" && entry.kind === "directory" && (entry.relativePath === "" || platform === "win32"))
 			return JSON.stringify([entry.relativePath, entry.kind, entry.dev, entry.ino]);
 		return JSON.stringify([
 			entry.relativePath,

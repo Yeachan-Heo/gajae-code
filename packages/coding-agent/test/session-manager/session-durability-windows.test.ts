@@ -206,6 +206,39 @@ describe("managed session Windows durability", () => {
 		expect(matchesMigrationArtifactRoot(artifacts, identity, expectedTree, "win32")).toBe(false);
 	});
 
+	it("tolerates a POSIX root ctime change caused by detaching artifacts", async () => {
+		const root = temporaryDirectory("gjc-posix-root-ctime-");
+		temporaryDirectories.push(root);
+		const artifacts = path.join(root, "artifacts");
+		await fs.mkdir(artifacts);
+		const stat = syncFs.lstatSync(artifacts, { bigint: true });
+		const snapshot = native.snapshotDirectoryTree(artifacts);
+		if (!snapshot.ok || !snapshot.snapshot) throw new Error("Native snapshot unavailable");
+		const snapshotDirectoryTree = native.snapshotDirectoryTree;
+		vi.spyOn(native, "snapshotDirectoryTree").mockImplementation(pathname => {
+			const observed = snapshotDirectoryTree(pathname);
+			if (!observed.ok || !observed.snapshot) return observed;
+			return {
+				...observed,
+				snapshot: {
+					...observed.snapshot,
+					entries: observed.snapshot.entries.map(entry =>
+						entry.relativePath === "" && entry.kind === "directory"
+							? { ...entry, ctimeNs: (BigInt(entry.ctimeNs) + 1n).toString() }
+							: entry,
+					),
+				},
+			};
+		});
+		expect(
+			matchesMigrationArtifactRoot(
+				artifacts,
+				{ dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs },
+				snapshot.snapshot,
+				"darwin",
+			),
+		).toBe(true);
+	});
 	it("rejects POSIX nested-directory ctime drift", async () => {
 		const root = temporaryDirectory("gjc-posix-directory-ctime-");
 		temporaryDirectories.push(root);
