@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { deriveAmbiguityMilestone } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-ambiguity";
+import { deriveAmbiguityMilestone, scoreToUnits } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-ambiguity";
 import {
 	answerHash,
 	appendOrMergeDeepInterviewRound,
@@ -338,6 +338,34 @@ describe("deep-interview v1 core contracts", () => {
 			deepInterviewRoundResultDigest({ result: { a: { alpha: 1, beta: 2 }, z: ["x"] }, round: 1, question_id: "q" }),
 		);
 		expect(canonicalDeepInterviewJson({ b: 1, a: 2 })).toBe('{"a":2,"b":1}');
+		// Decoded requests materialize every optional key, so an absent optional field
+		// arrives as `undefined`. It must serialize like an omitted key instead of
+		// throwing, and both spellings must digest identically.
+		expect(canonicalDeepInterviewJson({ a: 1, targeting: undefined })).toBe('{"a":1}');
+		expect(
+			deepInterviewRoundResultDigest({
+				round: 1,
+				question_id: "q",
+				result: { global_scores: { goal: 0.5 }, targeting: undefined, ontology: undefined },
+			}),
+		).toBe(deepInterviewRoundResultDigest({ round: 1, question_id: "q", result: { global_scores: { goal: 0.5 } } }));
+		// Array elements and the top-level value stay strict: `undefined` there is an
+		// encoding bug, not an absent field.
+		expect(() => canonicalDeepInterviewJson([1, undefined])).toThrow("canonical JSON rejects undefined");
+		expect(() => canonicalDeepInterviewJson(undefined)).toThrow("canonical JSON rejects undefined");
+
+		// `0.69 * 10_000` is `6900.000000000001` in IEEE-754; ambiguity round-trips
+		// through `units / 10_000`, so these ordinary scores must convert cleanly
+		// while genuinely off-grid precision stays rejected.
+		expect(scoreToUnits(0.69)).toBe(6_900);
+		expect(scoreToUnits(0.07)).toBe(700);
+		expect(scoreToUnits(0.29)).toBe(2_900);
+		expect(scoreToUnits(0.0001)).toBe(1);
+		expect(scoreToUnits(0)).toBe(0);
+		expect(scoreToUnits(1)).toBe(10_000);
+		expect(() => scoreToUnits(0.00005)).toThrow("integral 1e-4 units");
+		expect(() => scoreToUnits(0.05000000000000001)).toThrow("integral 1e-4 units");
+		expect(() => scoreToUnits(1.5)).toThrow("finite in [0, 1]");
 
 		const filePath = "/tmp/state.json";
 		const envelope = {
