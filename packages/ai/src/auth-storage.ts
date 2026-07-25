@@ -3488,6 +3488,7 @@ export class AuthStorage {
 				}
 				return selectedCredential.credential.access;
 			}
+			return undefined;
 		}
 
 		const apiKeySelection = this.#selectCredentialByType(provider, "api_key");

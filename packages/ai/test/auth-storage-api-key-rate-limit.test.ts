@@ -61,6 +61,19 @@ describe("AuthStorage api-key usage-limit fallback", () => {
 		authStorage.setRuntimeCredentialSelector("zai", { kind: "id", value: String(selected.id) });
 		expect(await authStorage.peekApiKey("zai")).toBe("zai-key-2");
 	});
+	it("does not fall back from an expired selected OAuth credential", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		await authStorage.set("zai", [
+			{ type: "oauth", access: "expired-oauth", refresh: "expired-refresh", expires: Date.now() - 1 },
+			{ type: "api_key", key: "unselected-api-key" },
+		]);
+		const selected = store.listAuthCredentials("zai")[0];
+		if (!selected) throw new Error("missing test credential");
+		authStorage.setRuntimeCredentialSelector("zai", { kind: "id", value: String(selected.id) });
+
+		expect(await authStorage.peekApiKey("zai")).toBeUndefined();
+	});
 	it("fingerprints dynamically resolved stored API keys", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 

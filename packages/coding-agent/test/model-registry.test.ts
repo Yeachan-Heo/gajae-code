@@ -3664,10 +3664,7 @@ describe("ModelRegistry", () => {
 				},
 			});
 			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
-			let resolveResponse!: (response: Response) => void;
-			const response = new Promise<Response>(resolve => {
-				resolveResponse = resolve;
-			});
+			const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();
 			using _hook = hookFetch(() => response);
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 
@@ -3771,10 +3768,7 @@ describe("ModelRegistry", () => {
 					discovery: { type: "openai-models-list" },
 				},
 			});
-			let resolveResponse!: (response: Response) => void;
-			const response = new Promise<Response>(resolve => {
-				resolveResponse = resolve;
-			});
+			const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();
 			using _hook = hookFetch(() => response);
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 
@@ -3926,10 +3920,7 @@ describe("ModelRegistry", () => {
 		});
 		test("does not restore descriptor evidence after an in-flight discovery is invalidated", async () => {
 			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
-			let resolveResponse!: (response: Response) => void;
-			const response = new Promise<Response>(resolve => {
-				resolveResponse = resolve;
-			});
+			const { promise: response, resolve: resolveResponse } = Promise.withResolvers<Response>();
 			using _hook = hookFetch(input => {
 				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
 				return response;
@@ -3952,14 +3943,8 @@ describe("ModelRegistry", () => {
 		test("does not let an older descriptor refresh overwrite a newer failed probe", async () => {
 			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
 			let calls = 0;
-			let resolveOlder!: (response: Response) => void;
-			let resolveNewer!: (response: Response) => void;
-			const olderResponse = new Promise<Response>(resolve => {
-				resolveOlder = resolve;
-			});
-			const newerResponse = new Promise<Response>(resolve => {
-				resolveNewer = resolve;
-			});
+			const { promise: olderResponse, resolve: resolveOlder } = Promise.withResolvers<Response>();
+			const { promise: newerResponse, resolve: resolveNewer } = Promise.withResolvers<Response>();
 			using _hook = hookFetch(() => (calls++ === 0 ? olderResponse : newerResponse));
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 
