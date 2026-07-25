@@ -66,6 +66,26 @@ describe("LifecycleLedger compaction directory barrier", () => {
 		const agentDir = tempDir("gjc-ledger-sync-fail-");
 		await expect(compactOnce(agentDir)).rejects.toMatchObject({ code: "EACCES" });
 	});
+
+	it("completes the compaction when the real barrier tolerates a classified Windows sync failure", async () => {
+		// Route the consumer through the REAL barrier implementation while the
+		// injected directory handle raises the genuine Windows EPERM.
+		mock.module("../src/utils/directory-sync", () => ({
+			...realDirectorySync,
+			syncDirectoryBestEffort: (directory: string) =>
+				realDirectorySync.syncDirectoryBestEffort(directory, {
+					platform: "win32",
+					open: async () => ({
+						sync: async () => {
+							throw errnoError("EPERM");
+						},
+						close: async () => {},
+					}),
+				}),
+		}));
+		const agentDir = tempDir("gjc-ledger-sync-tolerated-");
+		await expect(compactOnce(agentDir)).resolves.toBeUndefined();
+	});
 });
 
 describe("writeSessionLifecycleFailure directory barrier", () => {
