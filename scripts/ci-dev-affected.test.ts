@@ -1133,19 +1133,32 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(tasks[2]?.command).toEqual(["bash", "-lc", 'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts']);
 	});
 
-	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run only", () => {
+	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run + workflow-permissions", () => {
 		const tasks = targeted([".github/workflows/dev-ci.yml"]);
-		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "yaml-parse"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "workflow-permissions", "yaml-parse"]);
 	});
 
-	test("a CI harness script change plans ci-selftest + ci-dry-run (no yaml-parse)", () => {
+	test("broad planner schedules workflow permission regression for workflow and checker changes", () => {
+		for (const changedPath of [".github/workflows/dev-ci.yml", "scripts/check-workflow-permissions.ts"]) {
+			const task = planTasks([changedPath], targetingPackages).find(candidate => candidate.key === "workflow-permissions");
+			expect(task).toBeDefined();
+			expect(task?.command).toEqual(["bun", "test", "scripts/check-workflow-permissions.test.ts", "scripts/release-policy.test.ts"]);
+		}
+	});
+
+	test("a CI harness script change plans ci-selftest + ci-dry-run + workflow-permissions (no yaml-parse)", () => {
 		const tasks = targeted(["scripts/ci-dev-affected.ts"]);
-		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "workflow-permissions"]);
+	});
+
+	test("a workflow permission checker change plans its own regression", () => {
+		const tasks = targeted(["scripts/check-workflow-permissions.ts"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "workflow-permissions"]);
 	});
 
 	test("the dev CI guard topology test is scheduled and executed as a CI harness change", () => {
 		const tasks = targeted(["scripts/dev-ci-guard-topology.test.ts"]);
-		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest"]);
+		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "workflow-permissions"]);
 		expect(tasks.find(task => task.key === "ci-selftest")?.command).toEqual([
 			"bun",
 			"test",
