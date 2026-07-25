@@ -130,7 +130,11 @@ function compactEvents(events: SessionIndexEvent[]): SessionIndexEvent[] {
 	return kept;
 }
 
-async function appendSync(file: string, value: string): Promise<void> {
+async function appendSync(
+	file: string,
+	value: string,
+	syncFile: (handle: fs.FileHandle) => Promise<void> = handle => handle.sync(),
+): Promise<void> {
 	const h = await fs.open(file, "a", 0o600);
 	let failure: { error: unknown } | undefined;
 	try {
@@ -140,7 +144,7 @@ async function appendSync(file: string, value: string): Promise<void> {
 			if (bytesWritten <= 0) throw new Error("Unable to append session index entry");
 			offset += bytesWritten;
 		}
-		await h.sync();
+		await syncFile(h);
 	} catch (error) {
 		failure = { error };
 	}
@@ -197,12 +201,14 @@ export class SessionIndex {
 	static #operations = new Map<string, Promise<void>>();
 	static #openGroups = new Map<string, SessionIndexOpenGroup>();
 	#agentDir: string;
+	#syncFile: (handle: fs.FileHandle) => Promise<void>;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
 	#logOffset = 0;
 	#corruptSuffix = false;
-	constructor(agentDir: string) {
+	constructor(agentDir: string, syncFile: (handle: fs.FileHandle) => Promise<void> = handle => handle.sync()) {
 		this.#agentDir = agentDir;
+		this.#syncFile = syncFile;
 	}
 	static #enqueue<T>(indexPath: string, operation: () => Promise<T>): Promise<T> {
 		const previous = SessionIndex.#operations.get(indexPath) ?? Promise.resolve();
@@ -523,7 +529,7 @@ export class SessionIndex {
 					ts: input.ts ?? Date.now(),
 				};
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
-				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+				await appendSync(logFor(this.#agentDir), JSON.stringify(event), this.#syncFile);
 				await this.#refreshUnderLock();
 				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
 				return event;
@@ -560,7 +566,7 @@ export class SessionIndex {
 		);
 		const h = await fs.open(tmp, "r");
 		try {
-			await h.sync();
+			await this.#syncFile(h);
 		} finally {
 			await h.close();
 		}
