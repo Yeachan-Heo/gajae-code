@@ -57,6 +57,8 @@ interface HookReceiver {
 	nextDelivery: () => Promise<ReceivedPost>;
 	/** When set, holds responses open until released (for queue-collapse tests). */
 	hold: boolean;
+	/** When set, answers /hook/gjc with 404 (route-negotiation tests). */
+	gjcRouteMissing: boolean;
 	releaseHeld: () => void;
 	stop: () => void;
 }
@@ -69,6 +71,7 @@ function startHookReceiver(): HookReceiver {
 		port: 0,
 		received,
 		hold: false,
+		gjcRouteMissing: false,
 		nextDelivery: () => {
 			const { promise, resolve } = Promise.withResolvers<ReceivedPost>();
 			waiters.push(resolve);
@@ -90,6 +93,9 @@ function startHookReceiver(): HookReceiver {
 				token: request.headers.get("X-Orca-Agent-Hook-Token"),
 				body: (await request.json()) as ReceivedPost["body"],
 			};
+			if (receiver.gjcRouteMissing && post.url === "/hook/gjc") {
+				return new Response("not found", { status: 404 });
+			}
 			received.push(post);
 			const pendingWaiters = waiters;
 			waiters = [];
@@ -149,8 +155,9 @@ describe("parseOrcaEndpointFile", () => {
 
 describe("buildOrcaHookUrl", () => {
 	it("builds a loopback URL for a strictly numeric port", () => {
-		expect(buildOrcaHookUrl("57343")).toBe("http://127.0.0.1:57343/hook/pi");
-		expect(buildOrcaHookUrl("007")).toBe("http://127.0.0.1:7/hook/pi");
+		expect(buildOrcaHookUrl("57343")).toBe("http://127.0.0.1:57343/hook/gjc");
+		expect(buildOrcaHookUrl("007")).toBe("http://127.0.0.1:7/hook/gjc");
+		expect(buildOrcaHookUrl("57343", "/hook/pi")).toBe("http://127.0.0.1:57343/hook/pi");
 	});
 
 	it("rejects authority-injection and malformed port values", () => {
@@ -272,7 +279,7 @@ describe("createOrcaStatusBridge delivery", () => {
 		let delivery = receiver.nextDelivery();
 		handlers.get("session_start")?.({ type: "session_start" }, ctx);
 		let post = await delivery;
-		expect(post.url).toBe("/hook/pi");
+		expect(post.url).toBe("/hook/gjc");
 		expect(post.token).toBe("test-token-1234");
 		expect(post.body.paneKey).toBe("tab-1:leaf-1");
 		expect(post.body.tabId).toBe("tab-1");
@@ -532,6 +539,27 @@ describe("createOrcaStatusBridge delivery", () => {
 		expect(env.ORCA_PI_PREFILL).toBeUndefined();
 	});
 
+	it("falls back to the pi route once when Orca answers 404 for /hook/gjc", async () => {
+		const receiver = startHookReceiver();
+		cleanups.push(receiver.stop);
+		receiver.gjcRouteMissing = true;
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, { env: bridgeEnv(receiver) });
+		const ctx = fakeContext();
+
+		const first = receiver.nextDelivery();
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		const post = await first;
+		// The 404'd /hook/gjc attempt is not recorded; the same event lands on /hook/pi.
+		expect(post.url).toBe("/hook/pi");
+		expect(post.body.payload.hook_event_name).toBe("agent_start");
+
+		// Negotiation is sticky: later events go straight to the pi route.
+		const second = receiver.nextDelivery();
+		handlers.get("tool_execution_end")?.({ type: "tool_execution_end", toolCallId: "c1", toolName: "bash" }, ctx);
+		expect((await second).url).toBe("/hook/pi");
+	});
+
 	it("stays inert without Orca coordinates", async () => {
 		const { api, handlers } = captureHandlers();
 		createOrcaStatusBridge(api, { env: { ORCA_PANE_KEY: "tab-1:leaf-1" } as NodeJS.ProcessEnv });
@@ -565,7 +593,7 @@ describe("createOrcaStatusBridge delivery", () => {
 		expect(spawned).toHaveLength(1);
 		// curlrc processing disabled before any other option.
 		expect(spawned[0].command[1]).toBe("-q");
-		expect(spawned[0].command).toContain("http://127.0.0.1:1/hook/pi");
+		expect(spawned[0].command).toContain("http://127.0.0.1:1/hook/gjc");
 		expect(spawned[0].command).toContain("X-Orca-Agent-Hook-Token: test-token-1234");
 		expect(JSON.parse(spawned[0].body).payload.hook_event_name).toBe("agent_start");
 		// Second delivery attempt while the first child is alive is dropped.
