@@ -1989,17 +1989,19 @@ function sdkControlSurface(
 	};
 	const resolveModel = (id: string) => {
 		const selector = id.trim();
-		const exactMatch = ctx.modelRegistry
-			.getAll()
-			.find(candidate => `${candidate.provider}/${candidate.id}` === selector);
-		if (exactMatch) return exactMatch;
-
-		const normalized = selector.toLowerCase();
 		const exactMatches = ctx.modelRegistry
 			.getAll()
-			.filter(candidate => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalized);
+			.filter(candidate => `${candidate.provider}/${candidate.id}` === selector);
 		if (exactMatches.length === 1) return exactMatches[0];
 		if (exactMatches.length > 1)
+			throw Object.assign(new Error(`Model ${id} is ambiguous.`), { code: "invalid_input" });
+
+		const normalized = selector.toLowerCase();
+		const caseInsensitiveMatches = ctx.modelRegistry
+			.getAll()
+			.filter(candidate => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalized);
+		if (caseInsensitiveMatches.length === 1) return caseInsensitiveMatches[0];
+		if (caseInsensitiveMatches.length > 1)
 			throw Object.assign(new Error(`Model ${id} is ambiguous.`), { code: "invalid_input" });
 		const [provider, ...modelId] = id.split("/");
 		const model =
