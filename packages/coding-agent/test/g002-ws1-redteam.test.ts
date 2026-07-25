@@ -51,6 +51,7 @@ function controller(messages: AgentMessage[], revealViewportAnchor = vi.fn((_id:
 	const session = { messages };
 	const ctx = {
 		session,
+		editor: { getText: () => "draft" },
 		ui: { revealViewportAnchor },
 		showTranscriptViewer,
 		showError: vi.fn(),
