@@ -118,6 +118,14 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 			const exit = await owner.awaitExit({ timeoutMs: 2_000 });
 			expect(exit.exited).toBe(true);
 			await waitFor(() => liveOwnedProcessCount() === before, 2_000, "live count baseline after concurrent dispose");
+			// The child's TERM trap appends the marker asynchronously, so awaitExit can
+			// return before that write lands under shard load. Poll for the single
+			// terminating signal instead of sampling the file once.
+			await waitForAsync(
+				async () => (await Bun.file(tmp).text()).split("\n").filter(line => line === "term").length === 1,
+				2_000,
+				"single term marker after concurrent dispose",
+			);
 			const marker = await Bun.file(tmp).text();
 			expect(marker.split("\n").filter(line => line === "term")).toHaveLength(1);
 		} finally {
