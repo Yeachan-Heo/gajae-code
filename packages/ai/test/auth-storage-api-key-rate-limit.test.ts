@@ -84,7 +84,10 @@ describe("AuthStorage api-key usage-limit fallback", () => {
 			await authStorage.peekApiKey("zai");
 			const first = authStorage.getProviderEvidenceGeneration("zai");
 			process.env.GJC_TEST_DYNAMIC_KEY = "credential-b";
-			expect(authStorage.getProviderEvidenceGeneration("zai")).not.toBe(first);
+			const second = authStorage.getProviderEvidenceGeneration("zai");
+			expect(second).not.toBe(first);
+			delete process.env.GJC_TEST_DYNAMIC_KEY;
+			expect(authStorage.getProviderEvidenceGeneration("zai")).not.toBe(second);
 		} finally {
 			if (original === undefined) delete process.env.GJC_TEST_DYNAMIC_KEY;
 			else process.env.GJC_TEST_DYNAMIC_KEY = original;
