@@ -1166,6 +1166,97 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(payload.output_config).toEqual({ effort: "high" });
 	});
 
+	it("requests summarized adaptive thinking for dot-separated gateway Opus ids", async () => {
+		// github-copilot, vercel-ai-gateway and zenmux ship Opus 4.7/4.8 with a dot
+		// between the version segments; the display opt-in must not depend on the
+		// separator.
+		const payload = (await captureAnthropicPayload(
+			{
+				...ANTHROPIC_MODEL,
+				id: "claude-opus-4.8",
+				name: "Anthropic Opus 4.8",
+				thinking: {
+					mode: "anthropic-adaptive",
+					minLevel: Effort.Minimal,
+					maxLevel: Effort.Max,
+				},
+			},
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{
+				thinkingEnabled: true,
+				reasoning: Effort.High,
+			},
+		)) as {
+			thinking?: { type?: string; display?: string };
+			output_config?: { effort?: string };
+		};
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "high" });
+	});
+
+	it("requests summarized adaptive thinking for dateless Opus major-version ids", async () => {
+		const payload = (await captureAnthropicPayload(
+			{
+				...ANTHROPIC_MODEL,
+				id: "claude-opus-5",
+				name: "Anthropic Opus 5",
+				thinking: {
+					mode: "anthropic-adaptive",
+					minLevel: Effort.Minimal,
+					maxLevel: Effort.Max,
+				},
+			},
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{
+				thinkingEnabled: true,
+				reasoning: Effort.High,
+			},
+		)) as {
+			thinking?: { type?: string; display?: string };
+			output_config?: { effort?: string };
+		};
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "high" });
+	});
+
+	it("keeps the interleaved-thinking beta for date-suffixed Opus 4.0 and drops it for Opus 4.7+", () => {
+		// `claude-opus-4-20250514` is Opus 4.0 with a release-date suffix, so it
+		// still needs the beta; Opus 4.7+ carries adaptive display instead.
+		const opus40 = buildAnthropicClientOptions({
+			model: { ...ANTHROPIC_MODEL, id: "claude-opus-4-20250514", name: "Anthropic Opus 4.0" },
+			apiKey: "sk-ant-api-test",
+			extraBetas: [],
+			stream: true,
+			interleavedThinking: true,
+		});
+		const opus48 = buildAnthropicClientOptions({
+			model: { ...ANTHROPIC_MODEL, id: "claude-opus-4-8", name: "Anthropic Opus 4.8" },
+			apiKey: "sk-ant-api-test",
+			extraBetas: [],
+			stream: true,
+			interleavedThinking: true,
+		});
+		const gatewayOpus48 = buildAnthropicClientOptions({
+			model: { ...ANTHROPIC_MODEL, id: "claude-opus-4.8", name: "Anthropic Opus 4.8" },
+			apiKey: "sk-ant-api-test",
+			extraBetas: [],
+			stream: true,
+			interleavedThinking: true,
+		});
+
+		expect(opus40.defaultHeaders["Anthropic-Beta"]).toContain("interleaved-thinking-2025-05-14");
+		expect(opus48.defaultHeaders["Anthropic-Beta"]).not.toContain("interleaved-thinking-2025-05-14");
+		expect(gatewayOpus48.defaultHeaders["Anthropic-Beta"]).not.toContain("interleaved-thinking-2025-05-14");
+	});
+
 	it("maps Opus max reasoning to Anthropic adaptive max", async () => {
 		const payload = (await captureAnthropicPayload(
 			{

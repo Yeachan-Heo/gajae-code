@@ -5,6 +5,7 @@
 
 - Credential selection and aggregate usage callers now stop awaiting immediately when their own signal aborts without cancelling shared usage fetches, and ranking deadlines no longer re-await the same stalled usage request during credential resolution.
 - Kimi Code now allows one continuous 300-second first-event wait before aborting, while preserving explicit caller and environment timeout overrides and the existing inter-event idle timeout.
+- Anthropic adaptive-thinking `display` support is now decided by the parsed model version instead of a dash-separated id-shape regex, and the predicate is shared by the Anthropic and Bedrock providers instead of being duplicated in both. Replaying the previous regex across the 510 bundled `anthropic-messages` / `bedrock-converse-stream` ids changes 11 verdicts, all corrections: the eight dot-separated gateway ids (`github-copilot/claude-opus-4.{7,8}`, `vercel-ai-gateway/anthropic/claude-opus-4.{7,8}` and their `-fast` variants, `zenmux/anthropic/claude-opus-4.{7,8}`) were omitting `display: "summarized"` and therefore billing thinking tokens without streaming the summary (#2791 class), and the three date-suffixed Opus 4.0 ids (`anthropic/claude-opus-4-20250514`, `{us,eu}.anthropic.claude-opus-4-20250514-v1:0`) were parsed as minor version `20250514`, classified as Opus 4.7+, and had the `interleaved-thinking-2025-05-14` beta they still need suppressed. Dateless major-version ids such as `claude-opus-5` are now recognized as well.
 
 ### Added
 

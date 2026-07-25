@@ -9,6 +9,7 @@ import {
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
+	supportsAdaptiveThinkingDisplay,
 } from "@gajae-code/ai/model-thinking";
 import type { Api, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
 
@@ -37,6 +38,52 @@ describe("thinking control modes", () => {
 		const modes: readonly ThinkingControlMode[] = THINKING_CONTROL_MODES;
 		expect(modes).toEqual(["effort", "budget", "google-level", "anthropic-adaptive", "anthropic-budget-effort"]);
 		expect(new Set(modes).size).toBe(modes.length);
+	});
+});
+
+describe("supportsAdaptiveThinkingDisplay", () => {
+	it("opts Opus 4.7+ into summarized display across every bundled id shape", () => {
+		// Dash-separated first-party ids.
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-7")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-8")).toBe(true);
+		// Dot-separated gateway ids (github-copilot, vercel-ai-gateway, zenmux).
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4.7")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4.8")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("anthropic/claude-opus-4.8")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("anthropic/claude-opus-4.8-fast")).toBe(true);
+		// Dateless major-version ids.
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-5")).toBe(true);
+		// Bedrock region / inference-profile prefixes.
+		expect(supportsAdaptiveThinkingDisplay("us.anthropic.claude-opus-4-8")).toBe(true);
+		expect(supportsAdaptiveThinkingDisplay("global.anthropic.claude-opus-4-7")).toBe(true);
+		// Fable defaults display to "omitted" too (issue #2791).
+		expect(supportsAdaptiveThinkingDisplay("claude-fable-5")).toBe(true);
+	});
+
+	it("keeps pre-4.7 Anthropic models off the display field they reject", () => {
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-6")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4.6")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-5-20251101")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-1-20250805")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("claude-sonnet-4-5")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("claude-sonnet-5")).toBe(false);
+	});
+
+	it("reads the version segment, not a date suffix, for Opus 4.0 snapshots", () => {
+		// `20250514` is the release date of Opus 4.0, not minor version 20250514:
+		// these ids still need the interleaved-thinking beta.
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-20250514")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("us.anthropic.claude-opus-4-20250514-v1:0")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("eu.anthropic.claude-opus-4-20250514-v1:0")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("claude-opus-4-0")).toBe(false);
+	});
+
+	it("returns false for ids outside the Anthropic opus/fable families", () => {
+		expect(supportsAdaptiveThinkingDisplay("claude-3-opus-20240229")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("anthropic.claude-3-opus-20240229-v1:0")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("gpt-5.6-sol")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("glm-5.2")).toBe(false);
+		expect(supportsAdaptiveThinkingDisplay("")).toBe(false);
 	});
 });
 
