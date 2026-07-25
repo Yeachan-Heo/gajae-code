@@ -18,6 +18,7 @@ import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
+import { isUnsupportedWindowsDirectorySyncError } from "../utils/directory-sync";
 import {
 	type CoordinatorModelProfileLoader,
 	loadCoordinatorModelProfiles,
@@ -790,6 +791,9 @@ async function writeCoordinatorIdempotencyFile(file: string, value: CoordinatorT
 		const directory = await fs.open(path.dirname(file), "r");
 		try {
 			await directory.sync();
+		} catch (error) {
+			// Windows cannot fsync a directory handle; rename durability is best-effort there.
+			if (!isUnsupportedWindowsDirectorySyncError(error)) throw error;
 		} finally {
 			await directory.close();
 		}
