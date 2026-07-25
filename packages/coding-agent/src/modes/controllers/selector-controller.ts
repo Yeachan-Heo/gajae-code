@@ -67,6 +67,7 @@ import {
 	readNotificationRootRegistration,
 	resolveTelegramSetupPreflight,
 	unregisterNotificationRoot,
+	withNotificationRootRegistryFence,
 } from "../../sdk/bus/telegram-daemon";
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
@@ -217,6 +218,12 @@ export interface NotificationsEditorAdapterContext {
 	notifyConfigChanged?: () => Promise<void> | void;
 }
 
+type TelegramDaemonStopResult = {
+	ok: boolean;
+	message: string;
+	before?: { health?: string };
+};
+
 export interface NotificationsEditorOperationDependencies {
 	getNotificationConfig: typeof getNotificationConfig;
 	maskToken: typeof maskToken;
@@ -234,13 +241,15 @@ export interface NotificationsEditorOperationDependencies {
 	removeTelegramConfiguration: typeof removeTelegramConfiguration;
 	readNotificationRootRegistration: typeof readNotificationRootRegistration;
 	unregisterNotificationRoot: typeof unregisterNotificationRoot;
+	stopTelegramDaemonIfRootRegistryFenceMatches(input: {
+		settings: Settings;
+		registryFingerprint: string;
+		stop: () => Promise<TelegramDaemonStopResult>;
+	}): Promise<boolean>;
+
 	reloadTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
 	restartTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
-	stopTelegramDaemon(settings: Settings): Promise<{
-		ok: boolean;
-		message: string;
-		before?: { health?: string };
-	}>;
+	stopTelegramDaemon(settings: Settings): Promise<TelegramDaemonStopResult>;
 }
 
 const notificationEditorOperationDependencies: NotificationsEditorOperationDependencies = {
@@ -260,6 +269,16 @@ const notificationEditorOperationDependencies: NotificationsEditorOperationDepen
 	removeTelegramConfiguration,
 	readNotificationRootRegistration,
 	unregisterNotificationRoot,
+	stopTelegramDaemonIfRootRegistryFenceMatches: async input =>
+		await withNotificationRootRegistryFence({
+			settings: input.settings,
+			registryFingerprint: input.registryFingerprint,
+			action: async () => {
+				const stopped = await input.stop();
+				if (!stopped.ok) throw new Error(stopped.message);
+			},
+		}),
+
 	reloadTelegramDaemon: async settings =>
 		await new TelegramDaemonController(settings).reload({ spawnIfStopped: false }),
 	restartTelegramDaemon: async settings =>
@@ -638,9 +657,12 @@ export function createNotificationsEditorOperations(
 								sessionId: ctx.sessionManager.getSessionId(),
 								registrationToken: registration.token,
 							});
-							if (unregistered.remainingRoots === 0) {
-								const stopped = await services.stopTelegramDaemon(ctx.settings);
-								if (!stopped.ok) throw new Error(stopped.message);
+							if (unregistered.registryFingerprint !== undefined) {
+								await services.stopTelegramDaemonIfRootRegistryFenceMatches({
+									settings: ctx.settings,
+									registryFingerprint: unregistered.registryFingerprint,
+									stop: () => services.stopTelegramDaemon(ctx.settings),
+								});
 							}
 						},
 					},

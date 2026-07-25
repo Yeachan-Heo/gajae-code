@@ -56,6 +56,7 @@ import {
 	TOOL_ACTIVITY_CAPABILITY,
 	unregisterNotificationRoot,
 	waitForTelegramDaemonReady,
+	withNotificationRootRegistryFence,
 } from "../src/sdk/bus/telegram-daemon";
 import { ownerPidFromOwnerId, runDaemonInternal, runDaemonSmoke } from "../src/sdk/bus/telegram-daemon-cli";
 import { NOTIFICATION_PROTOCOL_VERSION } from "../src/sdk/bus/telegram-daemon-contract";
@@ -5337,6 +5338,97 @@ describe("telegram daemon", () => {
 		// Still the original owner; the new session's root is registered onto it.
 		expect(JSON.parse(fs.readFileSync(paths.state, "utf8")).ownerId).toBe("old");
 		expect(fs.existsSync(paths.roots)).toBe(true);
+	});
+
+	test("ensure converges after a fenced last-root stop races attach-before-registration", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(settings(agentDir), agentDir);
+		const paths = daemonPaths(agentDir);
+		writeLiveOwner(agentDir, { generation: DAEMON_GENERATION, heartbeatAt: Date.now() });
+		const stoppedRegistration = await registerNotificationRoot({
+			settings: s,
+			cwd: path.join(agentDir, "stopped-session"),
+			sessionId: "stopped-session",
+		});
+		const unregistered = await unregisterNotificationRoot({
+			settings: s,
+			cwd: path.join(agentDir, "stopped-session"),
+			sessionId: "stopped-session",
+			registrationToken: stoppedRegistration.token,
+		});
+		if (!unregistered.registryFingerprint) throw new Error("Expected empty root registry fingerprint");
+
+		let oldOwnerAlive = true;
+		let replacementAlive = false;
+		const stopOwnsRoots = Promise.withResolvers<void>();
+		const resumeStop = Promise.withResolvers<void>();
+		const registrationBlocked = Promise.withResolvers<void>();
+		const resumeRegistration = Promise.withResolvers<void>();
+		const child = readyTelegramSpawnFixture({
+			settings: s,
+			firstChildPid: 4243,
+			onSpawn: () => (replacementAlive = true),
+		});
+		const fencedStop = withNotificationRootRegistryFence({
+			settings: s,
+			registryFingerprint: unregistered.registryFingerprint,
+			action: async () => {
+				stopOwnsRoots.resolve();
+				await resumeStop.promise;
+				oldOwnerAlive = false;
+				await releaseDaemonOwnership({
+					settings: s,
+					ownerId: "old",
+					acquisitionId: "old",
+					pid: 999,
+					generation: DAEMON_GENERATION,
+					pidIncarnation: () => "linux:100",
+				});
+			},
+		});
+		await stopOwnsRoots.promise;
+		const realSleep = Bun.sleep.bind(Bun);
+		const sleepSpy = vi.spyOn(Bun, "sleep").mockImplementation((duration?: number | Date) => {
+			if (duration === 100) {
+				registrationBlocked.resolve();
+				return resumeRegistration.promise;
+			}
+			return realSleep(duration ?? 0);
+		});
+		try {
+			const ensuring = ensureTelegramDaemonRunningDetailed(
+				{ settings: s, cwd: path.join(agentDir, "replacement-session"), sessionId: "replacement-session" },
+				{
+					pid: 4242,
+					pidAlive: pid => (pid === 999 && oldOwnerAlive) || pid === 4242 || (pid === 4243 && replacementAlive),
+					pidIncarnation: () => "linux:100",
+					spawn: child.spawn,
+					sleep: child.sleep,
+				},
+			);
+			await registrationBlocked.promise;
+			resumeStop.resolve();
+			expect(await fencedStop).toBe(true);
+			resumeRegistration.resolve();
+			expect(await ensuring).toBe("spawned");
+			const replacement = await readDaemonState(s);
+			expect(replacement).toMatchObject({ pid: 4243, ownershipPhase: "ready", generation: DAEMON_GENERATION });
+			expect(
+				isCurrentCompatibleOwner({
+					state: replacement,
+					now: Date.now(),
+					tokenFingerprint: tokenFingerprint("123456:secret-token"),
+					chatId: "42",
+					pidAlive: pid => pid === 4243 && replacementAlive,
+					pidIncarnation: () => "linux:100",
+				}),
+			).toBe(true);
+			expect(JSON.parse(fs.readFileSync(paths.roots, "utf8"))).toMatchObject({
+				sessions: { "replacement-session": path.join(agentDir, "replacement-session", ".gjc", "state") },
+			});
+		} finally {
+			sleepSpy.mockRestore();
+		}
 	});
 
 	test("idle self-exit after timeout releases ownership", async () => {

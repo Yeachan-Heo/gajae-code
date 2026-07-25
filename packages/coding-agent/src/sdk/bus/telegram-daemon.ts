@@ -243,6 +243,18 @@ const RELOAD_FRESHNESS_WAIT_MS = 15_000;
 const RELOAD_CONTROLLER_GRACEFUL_MS = 8_000;
 const RELOAD_CONTROLLER_KILL_MS = 3_000;
 const RELOAD_RESERVATION_HEADROOM_MS = 10_000;
+const ROOTS_REGISTRATION_LOCK_RETRY_DELAY_MS = 100;
+const ROOTS_REGISTRATION_LOCK_HEADROOM_MS = 5_000;
+const ROOTS_REGISTRATION_LOCK_RETRIES =
+	Math.ceil(
+		(RELOAD_CONTROLLER_GRACEFUL_MS + RELOAD_CONTROLLER_KILL_MS + ROOTS_REGISTRATION_LOCK_HEADROOM_MS) /
+			ROOTS_REGISTRATION_LOCK_RETRY_DELAY_MS,
+	) + 1;
+const ROOTS_REGISTRATION_LOCK_OPTIONS = {
+	staleMs: 10_000,
+	retries: ROOTS_REGISTRATION_LOCK_RETRIES,
+	retryDelayMs: ROOTS_REGISTRATION_LOCK_RETRY_DELAY_MS,
+};
 
 /**
  * File-lock options whose acquisition budget covers the full reload-reservation
@@ -1096,7 +1108,7 @@ export async function registerNotificationRoot(input: {
 				registrationTokens,
 			});
 		},
-		{ staleMs: 10_000 },
+		ROOTS_REGISTRATION_LOCK_OPTIONS,
 	);
 	return { root, token };
 }
@@ -1104,6 +1116,8 @@ export async function registerNotificationRoot(input: {
 export interface UnregisterNotificationRootResult {
 	root: string;
 	remainingRoots: number;
+	/** Opaque fingerprint of the exact registry written by this successful unregister. */
+	registryFingerprint?: string;
 }
 
 /** Remove one session's Telegram scan root without disturbing other live session roots. */
@@ -1120,15 +1134,11 @@ export async function unregisterNotificationRoot(input: {
 	const root = notificationRootForCwd(input.cwd);
 	await ensureDir(fsImpl, paths.dir);
 	let remainingRoots = 0;
+	let registryFingerprint: string | undefined;
 	await withFileLock(
 		paths.roots,
 		async () => {
-			const current = await readJson<{
-				roots?: string[];
-				managedRoots?: string[];
-				sessions?: Record<string, string>;
-				registrationTokens?: Record<string, string>;
-			}>(fsImpl, paths.roots);
+			const current = await readJson<NotificationRootsRegistry>(fsImpl, paths.roots);
 			if (!current) return;
 			const sessions = { ...(current.sessions ?? {}) };
 			// A stale cleanup from a previous registration must not remove a newer
@@ -1157,17 +1167,46 @@ export async function unregisterNotificationRoot(input: {
 			);
 			if (!rootStillReferenced) managedRoots.delete(root);
 			remainingRoots = roots.length;
-			await writeJsonAtomic(fsImpl, paths.roots, {
+			const nextRegistry: NotificationRootsRegistry = {
 				version: 1,
 				roots: Array.from(new Set(roots)).sort(),
 				managedRoots: Array.from(managedRoots).sort(),
 				sessions,
 				registrationTokens,
-			});
+			};
+			await writeJsonAtomic(fsImpl, paths.roots, nextRegistry);
+			registryFingerprint = notificationRootRegistryFingerprint(nextRegistry);
 		},
 		{ staleMs: 10_000 },
 	);
-	return { root, remainingRoots };
+	return registryFingerprint === undefined ? { root, remainingRoots } : { root, remainingRoots, registryFingerprint };
+}
+
+/** Run an action while the roots registry lock excludes any registration or unregister. */
+export async function withNotificationRootRegistryFence(input: {
+	settings: Settings;
+	registryFingerprint: string;
+	action: () => Promise<void>;
+	fs?: TelegramDaemonFs;
+}): Promise<boolean> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	await ensureDir(fsImpl, paths.dir);
+	return await withFileLock(
+		paths.roots,
+		async () => {
+			const current = await readJson<NotificationRootsRegistry>(fsImpl, paths.roots);
+			if (
+				!current ||
+				(current.roots ?? []).length !== 0 ||
+				notificationRootRegistryFingerprint(current) !== input.registryFingerprint
+			)
+				return false;
+			await input.action();
+			return true;
+		},
+		{ staleMs: 10_000 },
+	);
 }
 
 function notificationRootForCwd(cwd: string): string {
@@ -1205,6 +1244,29 @@ type NotificationRootsRegistry = {
 	sessions?: Record<string, string>;
 	registrationTokens?: Record<string, string>;
 };
+
+function notificationRootRegistryFingerprint(registry: NotificationRootsRegistry): string {
+	return crypto
+		.createHash("sha256")
+		.update(
+			JSON.stringify({
+				version: registry.version,
+				roots: Array.from(new Set(registry.roots ?? [])).sort(),
+				managedRoots: Array.from(new Set(registry.managedRoots ?? [])).sort(),
+				sessions: Object.fromEntries(
+					Object.entries(registry.sessions ?? {}).sort(([left], [right]) =>
+						left < right ? -1 : left > right ? 1 : 0,
+					),
+				),
+				registrationTokens: Object.fromEntries(
+					Object.entries(registry.registrationTokens ?? {}).sort(([left], [right]) =>
+						left < right ? -1 : left > right ? 1 : 0,
+					),
+				),
+			}),
+		)
+		.digest("hex");
+}
 
 /**
  * Drop permanently missing scan roots from the durable registry under the roots
@@ -3072,7 +3134,7 @@ export async function reclaimDeadDaemonOwner(input: {
  * Ensure a configured daemon owns this session root, preserving ownership safety
  * while exposing whether a #2028 generation handoff was required.
  */
-export async function ensureTelegramDaemonRunningDetailed(
+async function ensureTelegramDaemonRunningDetailedOnce(
 	input: {
 		settings: Settings;
 		cwd: string;
@@ -3323,6 +3385,45 @@ export async function ensureTelegramDaemonRunningDetailed(
 		return "spawned";
 	}
 	throw new Error("Telegram daemon did not become ready after spawning");
+}
+
+/**
+ * Ensure a configured daemon owns this session root, preserving ownership safety
+ * while exposing whether a #2028 generation handoff was required.
+ */
+export async function ensureTelegramDaemonRunningDetailed(
+	input: {
+		settings: Settings;
+		cwd: string;
+		sessionId: string;
+		registerRoot?: boolean;
+		/** Receives each registration this ensure operation minted so the caller can fence its own later cleanup. */
+		onRegistered?: (registration: RegisterNotificationRootResult) => void;
+	},
+	deps: TelegramDaemonDeps = {},
+): Promise<EnsureTelegramDaemonDetailedResult> {
+	const result = await ensureTelegramDaemonRunningDetailedOnce(input, deps);
+	if (input.registerRoot === false || (result !== "attached" && result !== "spawned")) return result;
+
+	const cfg = getNotificationConfig(input.settings);
+	if (!isTelegramConfigured(cfg)) return "disabled";
+	const ownerIsCurrent = async (): Promise<boolean> => {
+		const snapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: deps.fs });
+		return isCurrentCompatibleOwner({
+			state: snapshot.state,
+			now: (deps.now ?? Date.now)(),
+			tokenFingerprint: tokenFingerprint(cfg.botToken),
+			chatId: cfg.chatId,
+			pidAlive: deps.pidAlive ?? defaultPidAlive,
+			pidIncarnation: deps.pidIncarnation ?? defaultPidIncarnation,
+			effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
+		});
+	};
+	if (await ownerIsCurrent()) return result;
+
+	const converged = await ensureTelegramDaemonRunningDetailedOnce({ ...input, registerRoot: false }, deps);
+	if (converged === "disabled" || converged === "blocked_identity") return converged;
+	return (await ownerIsCurrent()) ? converged : "blocked_identity";
 }
 
 /**
