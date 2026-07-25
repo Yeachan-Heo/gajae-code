@@ -34,7 +34,7 @@ import {
 /**
  * Deterministic light-theme compliance showcase.
  *
- * Source of truth for the 170-key matrix. Renders actual production components
+ * Source of truth for the 180-key matrix. Renders actual production components
  * and theme resolution with fail-closed identity checks. Performs no network or
  * fixture filesystem I/O.
  */
@@ -84,7 +84,7 @@ export type LightThemeComplianceViewport =
 	| typeof LIGHT_THEME_COMPLIANCE_CJK_VIEWPORT
 	| LightThemeConsumerAtlasViewport;
 
-export type LightThemeComplianceRenderMode = "unicode-color" | "ascii-no-color";
+export type LightThemeComplianceRenderMode = "unicode-color" | "unicode-256-color" | "ascii-no-color";
 
 export const LIGHT_THEME_COMPLIANCE_ASCII_NO_COLOR_SCENES = [
 	"selected-focus-active",
@@ -100,6 +100,12 @@ export const LIGHT_THEME_COMPLIANCE_CJK_SCENES = [
 	"wrap-japanese",
 	"wrap-chinese",
 	"wrap-mixed-cjk-latin",
+] as const satisfies readonly LightThemeComplianceSceneId[];
+
+export const LIGHT_THEME_COMPLIANCE_ANSI_256_SCENES = [
+	"selected-focus-active",
+	"wrap-mixed-cjk-latin",
+	"consumer-atlas",
 ] as const satisfies readonly LightThemeComplianceSceneId[];
 
 export interface LightThemeComplianceEntry {
@@ -163,7 +169,8 @@ export interface LightThemeComplianceRender {
 	key: string;
 }
 
-export const LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT = 170;
+export const LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT = 180;
+export const LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT = LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT * 5;
 
 const SHOWCASE_CLOCK = {
 	now: () => 1_700_000_042_000,
@@ -302,6 +309,36 @@ export const LIGHT_THEME_COMPLIANCE_ENTRIES: readonly LightThemeComplianceEntry[
 				renderMode: "unicode-color",
 			});
 		}
+		for (const viewport of LIGHT_THEME_COMPLIANCE_VIEWPORTS) {
+			entries.push({
+				key: buildMatrixKey(themeName, "selected-focus-active", viewport.id, "unicode-256-color"),
+				theme: themeName,
+				sceneId: "selected-focus-active",
+				viewport,
+				renderMode: "unicode-256-color",
+			});
+		}
+		entries.push({
+			key: buildMatrixKey(
+				themeName,
+				"wrap-mixed-cjk-latin",
+				LIGHT_THEME_COMPLIANCE_CJK_VIEWPORT.id,
+				"unicode-256-color",
+			),
+			theme: themeName,
+			sceneId: "wrap-mixed-cjk-latin",
+			viewport: LIGHT_THEME_COMPLIANCE_CJK_VIEWPORT,
+			renderMode: "unicode-256-color",
+		});
+		const atlasViewport = LIGHT_THEME_CONSUMER_ATLAS_VIEWPORTS.find(viewport => viewport.columns === 120);
+		if (!atlasViewport) throw new Error("Light-theme compliance requires the 120-column consumer atlas");
+		entries.push({
+			key: buildMatrixKey(themeName, "consumer-atlas", atlasViewport.id, "unicode-256-color"),
+			theme: themeName,
+			sceneId: "consumer-atlas",
+			viewport: atlasViewport,
+			renderMode: "unicode-256-color",
+		});
 	}
 	return entries;
 })();
@@ -379,8 +416,8 @@ async function configureDeterministicLightTheme(
 ): Promise<() => void> {
 	const originalColorTerm = Bun.env.COLORTERM;
 	const originalChalkLevel = chalk.level;
-	Bun.env.COLORTERM = "truecolor";
-	chalk.level = 3;
+	Bun.env.COLORTERM = renderMode === "unicode-color" ? "truecolor" : "256color";
+	chalk.level = renderMode === "unicode-color" ? 3 : renderMode === "unicode-256-color" ? 2 : 3;
 	try {
 		// Pin both auto slots to the requested light theme so detection cannot fall back.
 		await initTheme(false, renderMode === "ascii-no-color" ? "ascii" : "unicode", false, themeName, themeName);
@@ -578,20 +615,31 @@ function notificationsEntryFor(
 	if (!stateId) {
 		throw new Error(`No notifications state mapping for scene ${sceneId}`);
 	}
+	const notificationsViewport = NOTIFICATIONS_SETTINGS_SHOWCASE_ENTRIES.find(
+		entry =>
+			entry.viewport.id === viewport.id &&
+			entry.viewport.columns === viewport.columns &&
+			entry.viewport.rows === viewport.rows,
+	)?.viewport;
+	if (!notificationsViewport) {
+		throw new Error(`No notifications viewport mapping for ${viewport.id}`);
+	}
 	const key = `${stateId}/${viewport.id}/${renderMode}`;
 	const exact = NOTIFICATIONS_SETTINGS_SHOWCASE_ENTRIES.find(entry => entry.key === key);
 	if (exact) return exact;
-	if (
-		renderMode !== "ascii-no-color" ||
-		viewport.id !== "80x24" ||
-		!ALLOWED_NON_CANONICAL_ASCII_STATE_IDS.has(stateId)
-	) {
+	const allowedAsciiVariant =
+		renderMode === "ascii-no-color" && viewport.id === "80x24" && ALLOWED_NON_CANONICAL_ASCII_STATE_IDS.has(stateId);
+	const allowedAnsi256Variant =
+		renderMode === "unicode-256-color" &&
+		stateId === "home-runtime-active" &&
+		LIGHT_THEME_COMPLIANCE_VIEWPORTS.some(candidate => candidate.id === viewport.id);
+	if (!allowedAsciiVariant && !allowedAnsi256Variant) {
 		throw new Error(`Light-theme showcase entry is not canonical or explicitly allowed: ${key}`);
 	}
 	return {
 		key,
 		stateId,
-		viewport,
+		viewport: notificationsViewport,
 		renderMode,
 	};
 }
@@ -747,6 +795,25 @@ function cjkLanguageFor(sceneId: LightThemeComplianceSceneId): LightThemeComplia
 	}
 }
 
+function downsampleTruecolorAnsiTo256(ansi: string): string {
+	return ansi.replace(
+		/\x1b\[(38|48);2;(\d+);(\d+);(\d+)m/g,
+		(_match: string, layer: string, redRaw: string, greenRaw: string, blueRaw: string): string => {
+			const red = Number(redRaw);
+			const green = Number(greenRaw);
+			const blue = Number(blueRaw);
+			let index: number;
+			if (red === green && green === blue) {
+				index = red < 8 ? 16 : red > 248 ? 231 : Math.round(((red - 8) / 247) * 24) + 232;
+			} else {
+				index =
+					16 + 36 * Math.round((red / 255) * 5) + 6 * Math.round((green / 255) * 5) + Math.round((blue / 255) * 5);
+			}
+			return `\x1b[${layer};5;${index}m`;
+		},
+	);
+}
+
 function finalizeRender(
 	ansi: string,
 	renderMode: LightThemeComplianceRenderMode,
@@ -755,7 +822,8 @@ function finalizeRender(
 	window: LightThemeComplianceWindowMetadata | null,
 	provenance: LightThemeComplianceProvenance,
 ): LightThemeComplianceRender {
-	const terminalAnsiText = renderMode === "ascii-no-color" ? Bun.stripANSI(ansi) : ansi;
+	const colorAdjustedAnsi = renderMode === "unicode-256-color" ? downsampleTruecolorAnsiTo256(ansi) : ansi;
+	const terminalAnsiText = renderMode === "ascii-no-color" ? Bun.stripANSI(colorAdjustedAnsi) : colorAdjustedAnsi;
 	return {
 		terminalText: Bun.stripANSI(terminalAnsiText),
 		terminalAnsiText,
