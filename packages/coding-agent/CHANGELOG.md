@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Changed
+
+- The built-in `claude-opus`, `opus-codex`, and `fable-opus-codex` presets now use `anthropic/claude-opus-5` instead of `anthropic/claude-opus-4-8`, with effort suffixes preserved; `packages/ai/src/models.json` was regenerated so `anthropic/claude-opus-5` resolves; non-opus roles (`anthropic/claude-sonnet-5` executor/planner overrides, codex and fable roles) are unchanged.
 
 ### Fixed
 
