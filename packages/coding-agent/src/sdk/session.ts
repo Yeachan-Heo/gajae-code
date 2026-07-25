@@ -428,6 +428,13 @@ export interface CreateAgentSessionOptions {
 	goalToolAllowedOps?: readonly ("create" | "get" | "complete" | "resume" | "drop" | "pause")[];
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
+	/**
+	 * Discoverable built-in tools that must stay in the initial active set even when
+	 * `tools.discoveryMode === "all"` would otherwise hide them behind `search_tool_bm25`.
+	 * Used for coordination tools (e.g. `irc`) that a subagent must be able to use
+	 * immediately without first spending a discovery round-trip to find them.
+	 */
+	alwaysActiveToolNames?: readonly string[];
 	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
 	agentRegistry?: AgentRegistry;
 	/** Parent task ID prefix for nested artifact naming (e.g., "6-Extensions") */
@@ -2329,6 +2336,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// from the initial set unless they were explicitly requested or restored from persistence.
 		// The model finds them via search_tool_bm25 and activates them on demand.
 		if (effectiveDiscoveryMode === "all") {
+			const alwaysActiveDiscoveredBuiltinNames = new Set(
+				(options.alwaysActiveToolNames ?? []).map(name => name.toLowerCase()),
+			);
 			const essentialBuiltinNames = new Set(computeEssentialBuiltinNames(settings));
 			const allowedDiscoveredBuiltinNames = options.discoverableToolAllowedNames
 				? new Set(options.discoverableToolAllowedNames.map(name => name.toLowerCase()))
@@ -2337,6 +2347,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const tool = toolRegistry.get(name);
 				if (!tool?.loadMode) return true; // not a built-in — leave MCP/custom/extension to existing logic
 				if (tool.loadMode === "essential") return true;
+				if (alwaysActiveDiscoveredBuiltinNames.has(name)) return true;
 				return essentialBuiltinNames.has(name);
 			});
 			explicitlyRequestedDiscoveredBuiltinToolNames = selectRestorableDiscoveredBuiltinToolNames(
