@@ -32,9 +32,10 @@ describe("stable release policy", () => {
 
 		expect(jobSection(ci, "binaries")).toContain("needs: [native]");
 		expect(jobSection(ci, "publish")).toContain("needs: [native, binaries]");
-		for (const stage of stages) {
-			expect(jobSection(ci, stage)).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') }}");
+		for (const stage of ["native", "binaries"]) {
+			expect(jobSection(ci, stage)).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') }}");
 		}
+		expect(jobSection(ci, "publish")).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}");
 
 		const publish = jobSection(ci, "publish");
 		expect(publish).toContain("--prepare-evidence --evidence-dir");
