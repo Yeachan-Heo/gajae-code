@@ -29,6 +29,14 @@
  * - Outbound previews are bounded (prompt/assistant text and serialized tool
  *   input) and the bridge is gated by the `orca.statusBridge` setting plus a
  *   `GJC_ORCA_STATUS_BRIDGE=0` environment kill-switch.
+ * - The default transport is a raw loopback TCP socket, so inherited
+ *   HTTP(S)_PROXY environment routing can never carry the token or payload
+ *   off-host (Bun's fetch — and its node:http shim — honor proxy env even
+ *   for 127.0.0.1 targets), matching the curl path's `--noproxy 127.0.0.1`.
+ * - `session_shutdown` disposes the bridge: the agent_end idle recheck timer,
+ *   queued post state, and the pane ownership marker (when owned by this
+ *   process) are released, so never-idle sessions cannot leak timers or
+ *   suppress the next pane process's reporting.
  *
  * Delivery is strictly best-effort: a missing, restarting, or slow Orca must
  * never surface errors inside the session or delay the agent loop.
@@ -36,6 +44,7 @@
 
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type {
@@ -145,6 +154,68 @@ export function buildOrcaHookUrl(
 }
 
 /**
+ * Proxy-immune loopback POST used as the default transport.
+ *
+ * Bun's `fetch` (and its `node:http` shim) honor inherited `HTTP(S)_PROXY`
+ * environment variables even for 127.0.0.1 targets, which would route the
+ * hook token and status payload through an arbitrary proxy. A raw TCP dial
+ * to the loopback address cannot be redirected by environment configuration.
+ * Exposed for tests; conforms to the `fetch` call shape the bridge uses.
+ */
+export async function loopbackHookFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+	const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+	if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port) {
+		throw new Error("loopbackHookFetch only accepts explicit http://127.0.0.1:<port> targets.");
+	}
+	const method = init?.method ?? "GET";
+	const headers = (init?.headers ?? {}) as Record<string, string>;
+	const body = typeof init?.body === "string" ? Buffer.from(init.body) : Buffer.alloc(0);
+	const signal = init?.signal ?? undefined;
+
+	return await new Promise<Response>((resolve, reject) => {
+		const socket = net.connect({ host: "127.0.0.1", port: Number(url.port) });
+		let settled = false;
+		let raw = "";
+		const fail = (error: Error): void => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			reject(error);
+		};
+		const onAbort = (): void => fail(new Error("Orca hook delivery aborted."));
+		signal?.addEventListener("abort", onAbort, { once: true });
+		socket.on("connect", () => {
+			const headerLines = Object.entries(headers)
+				.map(([name, value]) => `${name}: ${value}\r\n`)
+				.join("");
+			socket.write(
+				`${method} ${url.pathname} HTTP/1.1\r\n` +
+					`Host: 127.0.0.1:${url.port}\r\n` +
+					"Connection: close\r\n" +
+					`Content-Length: ${body.byteLength}\r\n` +
+					`${headerLines}\r\n`,
+			);
+			if (body.byteLength > 0) socket.write(body);
+		});
+		socket.on("data", chunk => {
+			raw += chunk.toString("utf8");
+		});
+		socket.on("error", error => fail(error instanceof Error ? error : new Error(String(error))));
+		socket.on("close", () => {
+			signal?.removeEventListener("abort", onAbort);
+			if (settled) return;
+			settled = true;
+			const match = raw.match(/^HTTP\/1\.[01] (\d{3})/);
+			if (!match) {
+				reject(new Error("Orca hook endpoint returned no HTTP status line."));
+				return;
+			}
+			resolve(new Response(null, { status: Number(match[1]) }));
+		});
+	});
+}
+
+/**
  * Parse an Orca endpoint file (`KEY=VALUE` POSIX env or `set KEY=VALUE`
  * Windows cmd form; tolerates CRLF line endings).
  */
@@ -248,13 +319,14 @@ interface PendingPost {
  */
 export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBridgeOptions = {}): void {
 	const env = options.env ?? process.env;
-	const fetchImpl = options.fetchImpl ?? fetch;
+	const fetchImpl = options.fetchImpl ?? loopbackHookFetch;
 	env[OWNERSHIP_ENV] = String(process.pid);
 
 	let sessionMetadata: Record<string, unknown> = {};
 	let warnedBadEndpoint = false;
 	// Latest-only delivery: a stalled Orca receiver must not queue up obsolete
 	// snapshots, and status posting must stay off the agent-loop critical path.
+	let disposed = false;
 	let activePost = false;
 	let pendingPost: PendingPost | null = null;
 	// Endpoint-file parse cache keyed by fstat identity of the pinned
@@ -523,6 +595,7 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 	}
 
 	function post(hookEventName: string, extra: Record<string, unknown> = {}): void {
+		if (disposed) return;
 		pendingPost = { hookEventName, extra };
 		drainPosts();
 	}
@@ -624,5 +697,25 @@ export function createOrcaStatusBridge(pi: ExtensionAPI, options: OrcaStatusBrid
 		pendingAgentEndContext = ctx;
 		pendingAgentEndCheck = setTimeout(checkPendingAgentEnd, 0);
 		pendingAgentEndCheck.unref?.();
+	});
+
+	// Bounded lifecycle: session shutdown disposes the bridge so a never-idle
+	// session cannot keep the agent_end recheck timer rescheduling forever,
+	// retain queued post state, or leave the pane ownership marker claimed —
+	// which would suppress reporting from the next process to own this pane.
+	// Shutdown is a definitive turn boundary: an agent_end still deferred on
+	// the idle recheck reports now (once), or the pane would stay 'working'
+	// forever after a shutdown that raced the deferred post. `post()` refuses
+	// new work after disposal, so the queue empties once and stays empty.
+	pi.on("session_shutdown", () => {
+		if (disposed) return;
+		const agentEndStillDeferred = pendingAgentEndContext !== null;
+		clearPendingAgentEndCheck();
+		if (agentEndStillDeferred) postAgentEndOnce();
+		disposed = true;
+		drainPosts();
+		if (env[OWNERSHIP_ENV] === String(process.pid)) {
+			delete env[OWNERSHIP_ENV];
+		}
 	});
 }

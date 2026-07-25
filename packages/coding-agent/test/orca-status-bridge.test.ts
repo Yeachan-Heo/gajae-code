@@ -560,6 +560,105 @@ describe("createOrcaStatusBridge delivery", () => {
 		expect((await second).url).toBe("/hook/pi");
 	});
 
+	it("uses a proxy-immune transport by default: inherited HTTP_PROXY never sees the payload", async () => {
+		const receiver = startHookReceiver();
+		cleanups.push(receiver.stop);
+		const proxyHits: string[] = [];
+		const proxyServer = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: request => {
+				proxyHits.push(request.url);
+				return new Response("via-proxy");
+			},
+		});
+		cleanups.push(() => proxyServer.stop(true));
+		const savedProxy = { HTTP_PROXY: process.env.HTTP_PROXY, http_proxy: process.env.http_proxy };
+		process.env.HTTP_PROXY = `http://127.0.0.1:${proxyServer.port}`;
+		process.env.http_proxy = process.env.HTTP_PROXY;
+		cleanups.push(() => {
+			if (savedProxy.HTTP_PROXY === undefined) delete process.env.HTTP_PROXY;
+			else process.env.HTTP_PROXY = savedProxy.HTTP_PROXY;
+			if (savedProxy.http_proxy === undefined) delete process.env.http_proxy;
+			else process.env.http_proxy = savedProxy.http_proxy;
+		});
+
+		const { api, handlers } = captureHandlers();
+		// No fetchImpl seam: exercises the real default transport.
+		createOrcaStatusBridge(api, { env: bridgeEnv(receiver) });
+		const delivery = receiver.nextDelivery();
+		handlers.get("agent_start")?.({ type: "agent_start" }, fakeContext());
+		const post = await delivery;
+		expect(post.url).toBe("/hook/gjc");
+		expect(post.token).toBe("test-token-1234");
+		expect(post.body.payload.hook_event_name).toBe("agent_start");
+		expect(proxyHits).toEqual([]);
+	});
+
+	it("disposes on session_shutdown: never-idle recheck stops and ownership is released", async () => {
+		const receiver = startHookReceiver();
+		cleanups.push(receiver.stop);
+		const { api, handlers } = captureHandlers();
+		const env = bridgeEnv(receiver);
+		createOrcaStatusBridge(api, { env });
+		expect(env.ORCA_PI_STATUS_OWNED).toBe(String(process.pid));
+		const ctx = fakeContext({ isIdle: () => false });
+
+		const started = receiver.nextDelivery();
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await started;
+		// Deterministic never-idle: the recheck loop is live when shutdown fires.
+		handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, ctx);
+		await Bun.sleep(80);
+		const finalPost = receiver.nextDelivery();
+		handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		expect(env.ORCA_PI_STATUS_OWNED).toBeUndefined();
+		// Shutdown is the turn boundary: the deferred agent_end reports exactly once.
+		expect((await finalPost).body.payload.hook_event_name).toBe("agent_end");
+		const before = receiver.received.length;
+		// Longer than the max recheck interval: a surviving timer would fire here.
+		await Bun.sleep(400);
+		expect(receiver.received.filter(post => post.body.payload.hook_event_name === "agent_end")).toHaveLength(1);
+		// Disposed bridge ignores later events entirely.
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await Bun.sleep(40);
+		expect(receiver.received.length).toBe(before);
+	});
+
+	it("flushes a snapshot queued at shutdown instead of dropping the final done state", async () => {
+		const receiver = startHookReceiver();
+		cleanups.push(receiver.stop);
+		const { api, handlers } = captureHandlers();
+		createOrcaStatusBridge(api, { env: bridgeEnv(receiver) });
+		const ctx = fakeContext();
+
+		// Hold the first post open so the next snapshot is queued, then shut
+		// down while it is still pending — the race print mode exhibits.
+		receiver.hold = true;
+		const first = receiver.nextDelivery();
+		handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await first;
+		handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, ctx);
+		await Bun.sleep(40);
+		handlers.get("session_shutdown")?.({ type: "session_shutdown" }, ctx);
+		const flushed = receiver.nextDelivery();
+		receiver.hold = false;
+		receiver.releaseHeld();
+		expect((await flushed).body.payload.hook_event_name).toBe("agent_end");
+	});
+
+	it("does not release a pane ownership marker another process has since claimed", async () => {
+		const receiver = startHookReceiver();
+		cleanups.push(receiver.stop);
+		const { api, handlers } = captureHandlers();
+		const env = bridgeEnv(receiver);
+		createOrcaStatusBridge(api, { env });
+		const otherPid = String(process.pid + 1);
+		env.ORCA_PI_STATUS_OWNED = otherPid;
+		handlers.get("session_shutdown")?.({ type: "session_shutdown" }, fakeContext());
+		expect(env.ORCA_PI_STATUS_OWNED).toBe(otherPid);
+	});
+
 	it("stays inert without Orca coordinates", async () => {
 		const { api, handlers } = captureHandlers();
 		createOrcaStatusBridge(api, { env: { ORCA_PANE_KEY: "tab-1:leaf-1" } as NodeJS.ProcessEnv });
