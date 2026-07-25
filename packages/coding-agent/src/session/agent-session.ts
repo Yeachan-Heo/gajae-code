@@ -9040,6 +9040,10 @@ export class AgentSession {
 			this.agent.reset();
 			if (!options?.drop) await this.sessionManager.flush();
 			await this.sessionManager.newSession(options);
+			// Gate the successor local:// root before the successor identity is
+			// published to the agent, the workflow-gate emitter, hooks, or any
+			// synchronous resolver (#2797 / #2925).
+			await initializeLocalRoot(this.#localProtocolOptions());
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -9107,6 +9111,10 @@ export class AgentSession {
 			this.#rebindProviderSessionState(new Map());
 			this.agent.reset();
 			await this.sessionManager.newSession(options);
+			// Gate the successor local:// root before the successor identity is
+			// published to the agent, the workflow-gate emitter, hooks, or any
+			// synchronous resolver (#2797 / #2925).
+			await initializeLocalRoot(this.#localProtocolOptions());
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -9139,10 +9147,6 @@ export class AgentSession {
 		nextDiscoverySessionToolNames: string[] | undefined,
 		previousSessionFile: string | undefined,
 	): Promise<void> {
-		// The successor is a fresh managed session identity; synchronous local://
-		// resolution fails closed until verified legacy migration runs for it.
-		// Await the same readiness gate as cold start (#2797) and /resume (#2925).
-		await initializeLocalRoot(this.#localProtocolOptions());
 		this.#clearConstructorToolSelectionAuthority();
 		const inheritedThinkingLevel = resolveThinkingLevelForModel(this.model, this.#getInheritedThinkingLevel());
 		this.#thinkingLevel = inheritedThinkingLevel;
@@ -9254,11 +9258,11 @@ export class AgentSession {
 				return false;
 			}
 
+			// Fork rotates the session identity (and copies artifacts); gate the
+			// successor local:// root before that identity is published (#2797 / #2925).
+			await initializeLocalRoot(this.#localProtocolOptions());
 			// Update agent session ID
 			this.#syncAgentSessionId();
-			// Fork rotates the session identity (and copies artifacts), so await the
-			// legacy local:// migration gate for the successor (#2797 / #2925).
-			await initializeLocalRoot(this.#localProtocolOptions());
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 
@@ -10664,12 +10668,12 @@ export class AgentSession {
 					previousSessionFile ? { parentSession: previousSessionFile } : undefined,
 				);
 				successorSessionFile = this.sessionFile;
+				// Gate the successor local:// root inside the reversible prepare
+				// window, before the successor identity is published; a gate failure
+				// here rolls back (#2797 / #2925).
+				await initializeLocalRoot(this.#localProtocolOptions());
 				this.agent.reset();
 				this.#syncAgentSessionId();
-				// Successor identity is live inside the reversible prepare window; a
-				// migration-gate failure here rolls back. Required before any local://
-				// resolution against the handed-off session (#2797 / #2925).
-				await initializeLocalRoot(this.#localProtocolOptions());
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				this.#steeringMessages = [];
 				this.#followUpMessages = [];
@@ -14595,6 +14599,10 @@ export class AgentSession {
 
 			try {
 				await this.sessionManager.setSessionFile(sessionPath);
+				// The successor identity is already rotated in the manager but not yet
+				// published; gate its local:// root before publication so no observer
+				// can resolve against an ungated root (#2797 / #2925).
+				if (switchingToDifferentSession) await initializeLocalRoot(this.#localProtocolOptions());
 				this.#syncAgentSessionId();
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 
@@ -14671,13 +14679,8 @@ export class AgentSession {
 				await this.sessionManager.ensureOnDisk();
 
 				if (switchingToDifferentSession) {
-					// Interactive /resume (and any other switchSession identity change) must
-					// await verified legacy local:// migration for the *new* session before
-					// post-commit session_switch / local path resolution. createAgentSession
-					// already does this at cold start (#2797); switchSession previously omitted
-					// it, so resolving local:// after /resume could fail-closed with
-					// "legacy migration must complete before path resolution" (#2925).
-					await initializeLocalRoot(this.#localProtocolOptions());
+					// The local:// migration gate for this successor already ran above,
+					// before the identity was published (#2797 / #2925).
 					this.#resetHindsightConversationTrackingIfHindsight();
 					this.#resetIrcRosterDeliveryState();
 				}
@@ -14809,11 +14812,11 @@ export class AgentSession {
 			} else {
 				this.sessionManager.createBranchedSession(selectedEntry.parentId);
 			}
+			// Branch/tree-jump establishes a new session identity; gate the successor
+			// local:// root before that identity is published (#2797 / #2925).
+			await initializeLocalRoot(this.#localProtocolOptions());
 			this.#syncTodoPhasesFromBranch();
 			this.#syncAgentSessionId();
-			// Branch/jump establishes a new session identity; await the legacy
-			// local:// migration gate before resolution (#2797 / #2925).
-			await initializeLocalRoot(this.#localProtocolOptions());
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();

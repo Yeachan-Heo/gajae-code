@@ -274,6 +274,71 @@ describe("createAgentSession session storage isolation", () => {
 		}
 	}, 30_000);
 
+	it("gates the successor local:// root before publishing the new session identity", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-order-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: manager,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		try {
+			const predecessorSessionId = manager.getSessionId();
+			// Observe every identity publication that follows the manager's rotation.
+			// The gate must already have produced the successor marker by then, so a
+			// synchronous observer can never resolve local:// against an ungated root.
+			const observations: Array<{ sessionId: string; markerExists: boolean }> = [];
+			const agentState = session.agent as unknown as { sessionId: string | undefined };
+			let publishedSessionId = agentState.sessionId;
+			Object.defineProperty(session.agent, "sessionId", {
+				configurable: true,
+				get: () => publishedSessionId,
+				set: (value: string | undefined) => {
+					publishedSessionId = value;
+					if (value && value !== predecessorSessionId) {
+						observations.push({
+							sessionId: value,
+							markerExists: fs.existsSync(
+								path.join(
+									resolveLocalRoot({
+										getArtifactsDir: () => manager.getArtifactsDir(),
+										isManagedDestination: () => manager.isManagedDestination(),
+										getSessionId: () => value,
+									}),
+									".gjc-local-legacy-migrated-v1",
+								),
+							),
+						});
+					}
+				},
+			});
+
+			expect(await session.newSession()).toBe(true);
+			const successorSessionId = manager.getSessionId();
+			expect(successorSessionId).not.toBe(predecessorSessionId);
+			expect(observations.length).toBeGreaterThan(0);
+			expect(observations.filter(o => !o.markerExists)).toEqual([]);
+			expect(observations.at(0)?.sessionId).toBe(successorSessionId);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("initializes a default local root without shadowing an explicit owner", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-local-owner-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
