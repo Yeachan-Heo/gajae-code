@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { closeSync, openSync } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 
@@ -7,17 +9,33 @@ const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 
 type CliResult = { exitCode: number; stdout: string; stderr: string };
 
+// Capture through files rather than pipes: a piped child that outlives the
+// parent's read teardown can be killed by SIGPIPE (exit 141) under CI load,
+// which masks the CLI's real exit contract.
 async function runCli(repo: string, agentDir: string, args: string[]): Promise<CliResult> {
-	const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "daemon", "session", ...args], {
-		cwd: repo,
-		env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const stdout = new Response(child.stdout).text();
-	const stderr = new Response(child.stderr).text();
-	const [exitCode, stdoutText, stderrText] = await Promise.all([child.exited, stdout, stderr]);
-	return { exitCode, stdout: stdoutText, stderr: stderrText };
+	const captureDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-cli-capture-"));
+	const stdoutPath = path.join(captureDir, "stdout");
+	const stderrPath = path.join(captureDir, "stderr");
+	const stdoutFd = openSync(stdoutPath, "w");
+	const stderrFd = openSync(stderrPath, "w");
+	try {
+		const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "daemon", "session", ...args], {
+			cwd: repo,
+			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
+			stdout: stdoutFd,
+			stderr: stderrFd,
+		});
+		const exitCode = await child.exited;
+		return {
+			exitCode,
+			stdout: await fs.readFile(stdoutPath, "utf8"),
+			stderr: await fs.readFile(stderrPath, "utf8"),
+		};
+	} finally {
+		closeSync(stdoutFd);
+		closeSync(stderrFd);
+		await fs.rm(captureDir, { recursive: true, force: true });
+	}
 }
 
 describe("SDK daemon session CLI", () => {
