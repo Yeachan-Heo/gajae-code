@@ -48,9 +48,17 @@ function rootArgs(overrides: Partial<Args> = {}): Args {
 }
 
 function fakeSessionResult(): CreateAgentSessionResult {
+	let activeModel = testModel;
 	const session = {
-		model: testModel,
+		get model() {
+			return activeModel;
+		},
 		extensionRunner: undefined,
+		getConfiguredModelChain: () => undefined,
+		setConfiguredModelChain: () => {},
+		setModelTemporary: async (model: typeof testModel) => {
+			activeModel = model;
+		},
 		dispose: async () => {},
 	} as unknown as AgentSession;
 	return {
@@ -751,6 +759,7 @@ describe("startup update contract", () => {
 		const exitSpy = vi.spyOn(process, "exit").mockImplementation((): never => {
 			throw exit;
 		});
+		const getApiKeySpy = vi.spyOn(AuthStorage.prototype, "getApiKey").mockResolvedValue(undefined);
 		const stderr: string[] = [];
 		const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
 			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
@@ -777,6 +786,7 @@ describe("startup update contract", () => {
 			expect(stderr.join("")).toContain('Model profile "codex-medium" requires credentials for: openai-codex');
 		} finally {
 			stderrSpy.mockRestore();
+			getApiKeySpy.mockRestore();
 			exitSpy.mockRestore();
 			authStorage.close();
 		}
