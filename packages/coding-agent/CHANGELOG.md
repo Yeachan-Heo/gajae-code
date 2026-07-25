@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- The synchronous `local://` resolver now accepts a `cleanup_pending` legacy-migration marker instead of rejecting it as unsafe. The async gate already treats that state as settled — entries are installed and content-verified, and only retirement of the legacy source is outstanding — so a managed session whose migration ended in `cleanup_pending` previously failed closed with "Unsafe local:// migration marker" on every `local://` read even though `initializeLocalRoot()` had succeeded. Both marker checks now share one settled-state definition; unrecognized marker values are still rejected. Follow-up to #3080; the asymmetry has been reachable since #2797.
 - Restricted role-agent `bash` now accepts literal mid-word tildes, so git revision syntax such as `git diff HEAD~1` no longer has to be quoted. Bash performs tilde expansion only at the start of a word, so word-initial forms (`~`, `~/path`, `~user`) remain blocked.
 - Restricted role-agent `bash` now rejects unquoted tildes at every bash expansion position inside assignment words, including the compound `name+=value` form, so `A=~`, `A+=~`, `foo=~root/bar`, `A=x:~`, `A+=x:~`, and repeated colon segments such as `a=x:~:y:~` fail closed. Tildes bash does not expand — mid-word git revisions (`HEAD~1`), non-assignment words (`--opt=~`, `1abc=~`, `a++=~`, `a+b=~`), and quoted forms — remain allowed (#3117).
 - ACP sessions now apply execution permission decisions to eval calls and to tools invoked from JavaScript or Python eval contexts, while non-ACP session behavior remains unchanged.
