@@ -3876,6 +3876,22 @@ describe("ModelRegistry", () => {
 			expect(registry.find("vllm", "fresh-vllm-model")).toBeDefined();
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
 		});
+		test("discovers descriptor-only providers on the first refresh with a stored API key", async () => {
+			await authStorage.set("vllm", [{ type: "api_key", key: "stored-vllm-key" }]);
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("http://127.0.0.1:8000/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "stored-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("vllm", "online-if-uncached");
+
+			expect(registry.find("vllm", "stored-vllm-model")).toBeDefined();
+			expect(activeRowsFor(registry, ["vllm"])).toEqual([{ provider: "vllm", connectionKind: "credential" }]);
+		});
 		test("invalidates descriptor discovery evidence when the credential changes", async () => {
 			authStorage.setRuntimeApiKey("vllm", "credential-a");
 			using _hook = hookFetch(

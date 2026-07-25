@@ -1941,22 +1941,21 @@ export class ModelRegistry {
 		// Use peekApiKey to avoid OAuth token refresh during discovery.
 		// The token is only needed if the dynamic fetch fires (cache miss),
 		// and failures there are handled gracefully.
-		const providerAuthGenerations = new Map(
-			[...standardProviderDescriptors, ...enabledSpecialProviderDescriptors].map(descriptor => [
-				descriptor.providerId,
-				this.authStorage.getProviderEvidenceGeneration(descriptor.providerId),
-			]),
-		);
-		const peekKey = (descriptor: { providerId: string }) => this.#peekApiKeyForProvider(descriptor.providerId);
-		const [standardProviderKeys, specialKeys] = await Promise.all([
+		const peekKey = async (descriptor: { providerId: string }) => {
+			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId);
+			return {
+				apiKey,
+				authGeneration: this.authStorage.getProviderEvidenceGeneration(descriptor.providerId),
+			};
+		};
+		const [standardProviderCredentials, specialProviderCredentials] = await Promise.all([
 			Promise.all(standardProviderDescriptors.map(peekKey)),
 			Promise.all(enabledSpecialProviderDescriptors.map(peekKey)),
 		]);
 		const options: ModelManagerDiscoveryOptions[] = [];
 		for (let i = 0; i < standardProviderDescriptors.length; i++) {
 			const descriptor = standardProviderDescriptors[i];
-			const apiKey = standardProviderKeys[i];
-			const authGeneration = providerAuthGenerations.get(descriptor.providerId);
+			const { apiKey, authGeneration } = standardProviderCredentials[i];
 			if (
 				authGeneration !== undefined &&
 				authGeneration === this.authStorage.getProviderEvidenceGeneration(descriptor.providerId) &&
@@ -1974,8 +1973,8 @@ export class ModelRegistry {
 
 		for (let i = 0; i < enabledSpecialProviderDescriptors.length; i++) {
 			const descriptor = enabledSpecialProviderDescriptors[i];
-			const key = descriptor.resolveKey(specialKeys[i]);
-			const authGeneration = providerAuthGenerations.get(descriptor.providerId);
+			const { apiKey: apiKeyValue, authGeneration } = specialProviderCredentials[i];
+			const key = descriptor.resolveKey(apiKeyValue);
 			if (
 				authGeneration !== undefined &&
 				authGeneration === this.authStorage.getProviderEvidenceGeneration(descriptor.providerId) &&
