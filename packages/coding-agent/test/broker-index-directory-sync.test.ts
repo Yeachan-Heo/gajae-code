@@ -5,8 +5,8 @@ import * as path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 
+const directorySyncModule = require.resolve("../src/utils/directory-sync");
 const realDirectorySync = { ...(await import("../src/utils/directory-sync")) };
-const realFs = { ...(await import("node:fs/promises")) };
 const tempDirs: string[] = [];
 
 function tempDir(prefix: string): string {
@@ -32,8 +32,7 @@ function installWindowsBarrier(code: string): void {
 				close: async () => {},
 			}),
 		});
-	for (const specifier of ["../src/utils/directory-sync", "../src/sdk/broker/../../utils/directory-sync"])
-		mock.module(specifier, () => ({ ...realDirectorySync, syncDirectoryBestEffort: barrier }));
+	mock.module(directorySyncModule, () => ({ ...realDirectorySync, syncDirectoryBestEffort: barrier }));
 }
 
 function installPosixBarrier(code: string): void {
@@ -47,8 +46,7 @@ function installPosixBarrier(code: string): void {
 				close: async () => {},
 			}),
 		});
-	for (const specifier of ["../src/utils/directory-sync", "../src/sdk/broker/../../utils/directory-sync"])
-		mock.module(specifier, () => ({ ...realDirectorySync, syncDirectoryBestEffort: barrier }));
+	mock.module(directorySyncModule, () => ({ ...realDirectorySync, syncDirectoryBestEffort: barrier }));
 }
 
 async function writeDiscovery(agentDir: string): Promise<void> {
@@ -68,21 +66,8 @@ async function writeDiscovery(agentDir: string): Promise<void> {
 	});
 }
 async function snapshotSessionIndex(agentDir: string): Promise<void> {
-	mock.module("node:fs/promises", () => ({
-		...realFs,
-		open: async (...args: Parameters<typeof realFs.open>) => {
-			const handle = await realFs.open(...args);
-			return new Proxy(handle, {
-				get(target, key) {
-					if (key === "sync") return async () => {};
-					const value = Reflect.get(target, key, target);
-					return typeof value === "function" ? value.bind(target) : value;
-				},
-			});
-		},
-	}));
 	const { SessionIndex } = await import("../src/sdk/broker/session-index");
-	const index = new SessionIndex(agentDir);
+	const index = new SessionIndex(agentDir, async () => {});
 	await index.append({
 		type: "host_registered",
 		sessionId: "session-1",
@@ -94,10 +79,8 @@ async function snapshotSessionIndex(agentDir: string): Promise<void> {
 }
 
 afterEach(() => {
-	mock.module("../src/utils/directory-sync", () => realDirectorySync);
-	mock.module("../src/sdk/broker/../../utils/directory-sync", () => realDirectorySync);
+	mock.module(directorySyncModule, () => realDirectorySync);
 	mock.restore();
-	mock.module("node:fs/promises", () => realFs);
 	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -107,8 +90,7 @@ describe("broker discovery and session index directory barriers", () => {
 			for (const code of ["EPERM", "EINVAL", "ENOTSUP", "EOPNOTSUPP"] as const) {
 				installWindowsBarrier(code);
 				await expect(write(tempDir(`gjc-${name.replace(" ", "-")}-${code}-`))).resolves.toBeUndefined();
-				mock.module("../src/utils/directory-sync", () => realDirectorySync);
-				mock.module("../src/sdk/broker/../../utils/directory-sync", () => realDirectorySync);
+				mock.module(directorySyncModule, () => realDirectorySync);
 			}
 		});
 
@@ -130,8 +112,7 @@ describe("broker discovery and session index directory barriers", () => {
 			for (const code of ["EPERM", "EINVAL", "ENOTSUP", "EOPNOTSUPP"] as const) {
 				installWindowsBarrier(code);
 				await expect(write(tempDir(`gjc-${name.replace(" ", "-")}-${code}-`))).resolves.toBeUndefined();
-				mock.module("../src/utils/directory-sync", () => realDirectorySync);
-				mock.module("../src/sdk/broker/../../utils/directory-sync", () => realDirectorySync);
+				mock.module(directorySyncModule, () => realDirectorySync);
 			}
 		});
 
