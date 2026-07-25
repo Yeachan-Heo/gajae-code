@@ -12,6 +12,17 @@ type CliResult = { exitCode: number; stdout: string; stderr: string };
 // Capture through files rather than pipes: a piped child that outlives the
 // parent's read teardown can be killed by SIGPIPE (exit 141) under CI load,
 // which masks the CLI's real exit contract.
+function closeCaptureFd(fd: number): void {
+	// Bun.spawn may close inherited capture FDs when a short-lived child exits,
+	// especially on fail-closed CLI paths. Ignore EBADF so teardown does not
+	// mask the CLI exit contract under CI load (see shard-6 post-#3076 red).
+	try {
+		closeSync(fd);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException | undefined)?.code !== "EBADF") throw error;
+	}
+}
+
 async function runCli(repo: string, agentDir: string, args: string[]): Promise<CliResult> {
 	const captureDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-cli-capture-"));
 	const stdoutPath = path.join(captureDir, "stdout");
@@ -26,14 +37,18 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 			stderr: stderrFd,
 		});
 		const exitCode = await child.exited;
+		// Close before reading so file contents are durable even if Bun still
+		// held a write handle; tolerate already-closed FDs from the child.
+		closeCaptureFd(stdoutFd);
+		closeCaptureFd(stderrFd);
 		return {
 			exitCode,
 			stdout: await fs.readFile(stdoutPath, "utf8"),
 			stderr: await fs.readFile(stderrPath, "utf8"),
 		};
 	} finally {
-		closeSync(stdoutFd);
-		closeSync(stderrFd);
+		closeCaptureFd(stdoutFd);
+		closeCaptureFd(stderrFd);
 		await fs.rm(captureDir, { recursive: true, force: true });
 	}
 }
