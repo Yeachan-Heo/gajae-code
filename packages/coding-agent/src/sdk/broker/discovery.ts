@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { type NativeRetainedBrokerPublication, retainBrokerPublication } from "@gajae-code/natives";
+import { syncDirectoryBestEffort } from "../../utils/directory-sync";
 import { processIncarnation } from "./process-incarnation";
 import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
 
@@ -130,22 +131,7 @@ async function syncFile(file: string): Promise<void> {
 }
 
 async function syncDirectory(directory: string): Promise<void> {
-	let handle: fs.FileHandle;
-	try {
-		handle = await fs.open(directory, "r");
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) return;
-		throw error;
-	}
-	try {
-		await handle.sync();
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (process.platform !== "win32" || (code !== "EPERM" && code !== "EACCES")) throw error;
-	} finally {
-		await handle.close();
-	}
+	await syncDirectoryBestEffort(directory);
 }
 export async function writeBrokerDiscovery(agentDir: string, discovery: BrokerDiscoveryWrite): Promise<void> {
 	const incarnation = discovery.incarnation ?? brokerProcessIncarnation(discovery.pid);

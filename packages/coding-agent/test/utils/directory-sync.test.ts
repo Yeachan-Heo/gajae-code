@@ -6,6 +6,9 @@ import {
 	type DirectorySyncHandle,
 	isUnsupportedWindowsDirectorySyncError,
 	syncDirectoryBestEffort,
+	syncDirectoryBestEffortSync,
+	syncDirectoryFullyBestEffort,
+	syncDirectoryFullyBestEffortSync,
 } from "../../src/utils/directory-sync";
 
 function errnoError(code: string): NodeJS.ErrnoException {
@@ -148,5 +151,68 @@ describe("syncDirectoryBestEffort", () => {
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}
+	});
+});
+describe("synchronous directory sync policies", () => {
+	it("tolerates only classified Windows sync failures for the durability contract", () => {
+		const calls: string[] = [];
+		syncDirectoryBestEffortSync("/state/sdk", {
+			platform: "win32",
+			open: directory => {
+				calls.push(`open:${directory}`);
+				return 1;
+			},
+			sync: () => {
+				calls.push("sync");
+				throw errnoError("EPERM");
+			},
+			close: () => calls.push("close"),
+		});
+		expect(calls).toEqual(["open:/state/sdk", "sync", "close"]);
+		for (const code of ["EACCES", "EBADF", "EIO"]) {
+			expect(() =>
+				syncDirectoryBestEffortSync("/state/sdk", {
+					platform: "win32",
+					open: () => 1,
+					sync: () => {
+						throw errnoError(code);
+					},
+					close: () => undefined,
+				}),
+			).toThrow(code);
+		}
+	});
+
+	it("fully best-effort policies ignore open, sync, and close failures", async () => {
+		await expect(
+			syncDirectoryFullyBestEffort("/state/sdk", {
+				open: async () => {
+					throw errnoError("EACCES");
+				},
+			}),
+		).resolves.toBeUndefined();
+		await expect(
+			syncDirectoryFullyBestEffort("/state/sdk", {
+				open: async () => ({
+					sync: async () => {
+						throw errnoError("EIO");
+					},
+					close: async () => {
+						throw errnoError("EBADF");
+					},
+				}),
+			}),
+		).resolves.toBeUndefined();
+		expect(() =>
+			syncDirectoryFullyBestEffortSync("/state/sdk", {
+				open: () => 1,
+				sync: () => {
+					throw errnoError("EIO");
+				},
+				close: () => {
+					throw errnoError("EBADF");
+				},
+			}),
+		).not.toThrow();
 	});
 });

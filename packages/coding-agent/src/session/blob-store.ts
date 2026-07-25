@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, logger } from "@gajae-code/utils";
+import { syncDirectoryFullyBestEffortSync } from "../utils/directory-sync";
 
 const BLOB_PREFIX = "blob:sha256:";
 
@@ -56,15 +57,7 @@ function makeBlobPutResult(hash: string, blobPath: string, bytes?: number): Blob
 }
 
 function fsyncDirBestEffortSync(dir: string): void {
-	let fd: number | null = null;
-	try {
-		fd = fs.openSync(dir, "r");
-		fs.fsyncSync(fd);
-	} catch {
-		// Best-effort only: some platforms/filesystems do not support fsync on directories.
-	} finally {
-		if (fd !== null) fs.closeSync(fd);
-	}
+	syncDirectoryFullyBestEffortSync(dir);
 }
 
 /**

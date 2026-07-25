@@ -1,3 +1,4 @@
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 
 /**
@@ -30,15 +31,18 @@ export interface DirectorySyncOptions {
 	open?: (directory: string) => Promise<DirectorySyncHandle>;
 }
 
+export interface DirectorySyncOptionsSync {
+	platform?: NodeJS.Platform;
+	/** Injectable directory-open seam for tests; production callers omit it. */
+	open?: (directory: string) => number;
+	sync?: (descriptor: number) => void;
+	close?: (descriptor: number) => void;
+}
+
 /**
  * Fsync a parent directory after an atomic publish (temp write → file fsync →
- * rename/link), tolerating exactly the unsupported Windows directory-sync
- * codes during the `sync()` stage.
- *
- * Error precedence is preserved end to end: directory `open()` failures,
- * unclassified `sync()` failures, and `close()` failures all propagate
- * fail-closed; only a classified Windows `sync()` failure is downgraded to a
- * best-effort barrier. The handle is always closed once opened.
+ * rename/link). Use this durability-contract policy where unsupported Windows
+ * directory sync is tolerated but all other failures remain fail-closed.
  */
 export async function syncDirectoryBestEffort(directory: string, options: DirectorySyncOptions = {}): Promise<void> {
 	const platform = options.platform ?? process.platform;
@@ -50,5 +54,65 @@ export async function syncDirectoryBestEffort(directory: string, options: Direct
 		if (!isUnsupportedWindowsDirectorySyncError(error, platform)) throw error;
 	} finally {
 		await handle.close();
+	}
+}
+/**
+ * Synchronous equivalent of `syncDirectoryBestEffort`.
+ */
+export function syncDirectoryBestEffortSync(directory: string, options: DirectorySyncOptionsSync = {}): void {
+	const platform = options.platform ?? process.platform;
+	const open = options.open ?? ((target: string): number => fsSync.openSync(target, "r"));
+	const sync = options.sync ?? fsSync.fsyncSync;
+	const close = options.close ?? fsSync.closeSync;
+	const descriptor = open(directory);
+	try {
+		try {
+			sync(descriptor);
+		} catch (error) {
+			if (!isUnsupportedWindowsDirectorySyncError(error, platform)) throw error;
+		}
+	} finally {
+		close(descriptor);
+	}
+}
+
+/**
+ * Fsync after a completed replacement where the durability barrier is purely
+ * best-effort. Unlike `syncDirectoryBestEffort`, open, sync, and close
+ * failures are all intentionally ignored.
+ */
+export async function syncDirectoryFullyBestEffort(
+	directory: string,
+	options: DirectorySyncOptions = {},
+): Promise<void> {
+	try {
+		const open = options.open ?? (async (target: string): Promise<DirectorySyncHandle> => fs.open(target, "r"));
+		const handle = await open(directory);
+		try {
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		// The completed rename remains valid when the optional barrier is unavailable.
+	}
+}
+
+/**
+ * Synchronous equivalent of `syncDirectoryFullyBestEffort`.
+ */
+export function syncDirectoryFullyBestEffortSync(directory: string, options: DirectorySyncOptionsSync = {}): void {
+	try {
+		const open = options.open ?? ((target: string): number => fsSync.openSync(target, "r"));
+		const sync = options.sync ?? fsSync.fsyncSync;
+		const close = options.close ?? fsSync.closeSync;
+		const descriptor = open(directory);
+		try {
+			sync(descriptor);
+		} finally {
+			close(descriptor);
+		}
+	} catch {
+		// The completed rename remains valid when the optional barrier is unavailable.
 	}
 }

@@ -56,6 +56,7 @@ import {
 	type GjcTmuxSessionStatus,
 	listGjcTmuxSessions,
 } from "../../gjc-runtime/tmux-sessions";
+import { isUnsupportedWindowsDirectorySyncError } from "../../utils/directory-sync";
 import type {
 	LifecycleErrorReason,
 	ResumeCandidate,
@@ -215,16 +216,6 @@ const LIFECYCLE_CONTROL_DIAGNOSTIC_LIMIT = 10;
 let lifecycleCompatibilityDiagnosticCount = 0;
 let lifecycleControlDiagnosticCount = 0;
 
-function isUnsupportedDirectorySyncError(error: unknown): boolean {
-	const code = (error as NodeJS.ErrnoException | undefined)?.code;
-	return (
-		code === "EINVAL" ||
-		code === "ENOTSUP" ||
-		code === "EOPNOTSUPP" ||
-		(process.platform === "win32" && code === "EPERM")
-	);
-}
-
 function recordBoundedLifecycleDiagnostic(message: string, compatibility = false): void {
 	if (compatibility) {
 		if (lifecycleCompatibilityDiagnosticCount >= LIFECYCLE_COMPATIBILITY_DIAGNOSTIC_LIMIT) return;
@@ -245,7 +236,7 @@ function fsyncLedgerParentDirectory(directory: string): void {
 	try {
 		dirFd = fs.openSync(directory, "r");
 	} catch (error) {
-		if (process.platform === "win32" && isUnsupportedDirectorySyncError(error)) {
+		if (isUnsupportedWindowsDirectorySyncError(error)) {
 			recordBoundedLifecycleDiagnostic("GJC lifecycle ledger directory sync unsupported", true);
 			return;
 		}
@@ -257,7 +248,7 @@ function fsyncLedgerParentDirectory(directory: string): void {
 	try {
 		fs.fsyncSync(dirFd);
 	} catch (error) {
-		if (process.platform === "win32" && isUnsupportedDirectorySyncError(error))
+		if (isUnsupportedWindowsDirectorySyncError(error))
 			recordBoundedLifecycleDiagnostic("GJC lifecycle ledger directory sync unsupported", true);
 		else syncFailure = error;
 	} finally {

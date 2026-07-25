@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils/dirs";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
+import { syncDirectoryBestEffortSync } from "../utils/directory-sync";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
 	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
@@ -1210,12 +1211,7 @@ function defaultOwnerIsolationProbe(
 				fs.fsyncSync(descriptor);
 				fs.closeSync(descriptor);
 				descriptor = undefined;
-				const directory = fs.openSync(root, "r");
-				try {
-					fs.fsyncSync(directory);
-				} finally {
-					fs.closeSync(directory);
-				}
+				syncDirectoryBestEffortSync(root);
 			} finally {
 				if (descriptor !== undefined) fs.closeSync(descriptor);
 			}

@@ -5,6 +5,7 @@ import { getAgentDbPath, getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { type ModelsConfig, ModelsConfigSchema } from "../config/models-config-schema";
 import { AuthStorage } from "../session/auth-storage";
+import { syncDirectoryFullyBestEffort } from "../utils/directory-sync";
 import providerPresets from "./provider-presets.json";
 
 export type ProviderCompatibility = "openai" | "anthropic";
@@ -275,16 +276,7 @@ async function writeModelsConfig(modelsPath: string, config: ModelsConfig): Prom
 			await tempHandle.close();
 		}
 		await fs.rename(tempPath, modelsPath);
-		try {
-			const directoryHandle = await fs.open(directory, "r");
-			try {
-				await directoryHandle.sync();
-			} finally {
-				await directoryHandle.close();
-			}
-		} catch {
-			// Directory fsync is unavailable on some filesystems; the replacement succeeded.
-		}
+		await syncDirectoryFullyBestEffort(directory);
 	} finally {
 		await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}

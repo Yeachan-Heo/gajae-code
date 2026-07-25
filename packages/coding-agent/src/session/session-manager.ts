@@ -33,6 +33,7 @@ import {
 import type { TtsrInjectionRecord } from "../export/ttsr";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
+import { syncDirectoryBestEffort } from "../utils/directory-sync";
 
 import * as git from "../utils/git";
 import { ArtifactManager } from "./artifacts";
@@ -2241,13 +2242,7 @@ export async function syncSessionMoveDirectory(
 	platform: NodeJS.Platform = process.platform,
 	openDirectory: (directory: string) => Promise<SessionMoveDirectoryHandle> = value => fs.promises.open(value, "r"),
 ): Promise<void> {
-	if (platform === "win32") return;
-	const handle = await openDirectory(directory);
-	try {
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
+	await syncDirectoryBestEffort(directory, { platform, open: openDirectory });
 }
 
 type CrossDeviceTreeIdentity = string;

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { YAML } from "bun";
+import { syncDirectoryFullyBestEffort } from "../utils/directory-sync";
 import { withFileLock } from "./file-lock";
 
 export interface AtomicYamlExpectedPrecondition {
@@ -227,17 +228,9 @@ async function readYaml(configPath: string): Promise<YamlReadResult> {
 }
 
 async function syncParentDirectory(directory: string): Promise<void> {
-	try {
-		const directoryHandle = await fs.open(directory, "r");
-		try {
-			await directoryHandle.sync();
-		} finally {
-			await directoryHandle.close();
-		}
-	} catch {
-		// Directory fsync is not supported by every platform/filesystem. The renamed
-		// destination remains valid even where the durability barrier is unavailable.
-	}
+	// Directory fsync is not supported by every platform/filesystem. The renamed
+	// destination remains valid even where the durability barrier is unavailable.
+	await syncDirectoryFullyBestEffort(directory);
 }
 
 async function replaceWithRetry(tempPath: string, configPath: string, options: AtomicYamlPatchOptions): Promise<void> {

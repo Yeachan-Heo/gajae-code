@@ -3,6 +3,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { openRecoveryFsRoot } from "@gajae-code/natives";
+import { syncDirectoryBestEffort } from "../utils/directory-sync";
 import {
 	MANAGED_OWNER_CHILD_TOKEN_ENV,
 	MANAGED_OWNER_GENERATION_ENV,
@@ -178,12 +179,7 @@ async function durableHandoff(
 	} finally {
 		await handle.close();
 	}
-	const directory = await fs.open(root, "r");
-	try {
-		await directory.sync();
-	} finally {
-		await directory.close();
-	}
+	await syncDirectoryBestEffort(root);
 }
 
 /**

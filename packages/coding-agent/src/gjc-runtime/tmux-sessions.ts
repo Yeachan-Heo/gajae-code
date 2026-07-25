@@ -4,6 +4,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process } from "@gajae-code/natives";
+import { syncDirectoryBestEffortSync } from "../utils/directory-sync";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { tmuxRuntimeSessionPath } from "./session-layout";
@@ -481,12 +482,7 @@ export function createGjcTmuxSession(
 				} finally {
 					fsSync.closeSync(descriptor);
 				}
-				const directory = fsSync.openSync(root, "r");
-				try {
-					fsSync.fsyncSync(directory);
-				} finally {
-					fsSync.closeSync(directory);
-				}
+				syncDirectoryBestEffortSync(root);
 			}),
 	};
 	if (resolveGjcTmuxBinary({ env, platform }).isPsmux)
