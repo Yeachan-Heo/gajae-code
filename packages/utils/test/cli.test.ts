@@ -12,6 +12,7 @@ class Demo extends Command {
 	};
 	static flags = {
 		scope: Flags.string({ description: "scope", options: ["user", "project"] }),
+		count: Flags.integer({ description: "count" }),
 	};
 	async run(): Promise<void> {
 		const { args } = await this.parse(Demo);
@@ -101,6 +102,28 @@ describe("cli parse — CliParseError for invalid input", () => {
 		const cmd = new Demo(["build", "--scope", "porject"], CFG);
 		await expect(cmd.parse(Demo)).rejects.toBeInstanceOf(CliParseError);
 		await expect(cmd.parse(Demo)).rejects.toThrow(/Expected --scope to be one of: user, project/);
+	});
+
+	it.each([
+		"12oops",
+		"1.5",
+		"1e3",
+		" 12 ",
+		"9007199254740992",
+	])("throws CliParseError for a non-exact integer flag value %j", async value => {
+		const cmd = new Demo(["build", "--count", value], CFG);
+		await expect(cmd.parse(Demo)).rejects.toBeInstanceOf(CliParseError);
+		await expect(cmd.parse(Demo)).rejects.toThrow(`Expected integer for --count, got "${value}"`);
+	});
+
+	it.each([
+		["--count=0", 0],
+		["--count=-12", -12],
+		["--count=0012", 12],
+	])("accepts exact integer flag token %j", async (flag, expected) => {
+		const cmd = new Demo(["build", flag], CFG);
+		const { flags } = await cmd.parse(Demo);
+		expect(flags.count).toBe(expected);
 	});
 
 	it("wraps node:util unknown-flag errors as CliParseError (strict command)", async () => {
