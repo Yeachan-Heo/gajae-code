@@ -4788,6 +4788,14 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 					goalId: flagValue(args, "--goal-id"),
 					classificationEventId: flagValue(args, "--classification-event-id"),
 				});
+				const warnings = Array.isArray(event.postCommitWarnings) ? event.postCommitWarnings : [];
+				const warningText = warnings
+					.map(warning =>
+						warning && typeof warning === "object" && !Array.isArray(warning)
+							? nonEmptyString((warning as JsonObject).message)
+							: null,
+					)
+					.filter((warning): warning is string => Boolean(warning));
 				return {
 					status: 0,
 					stdout: json
@@ -4796,8 +4804,12 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 								event: CRITIC_VERDICT_EVENT,
 								terminus: event.terminus,
 								verdict: event.verdict,
+								...(warnings.length > 0 ? { warnings } : {}),
 							})
 						: `Recorded critic verdict: ${String(event.verdict)} (${String(event.terminus)}).\n`,
+					...(warningText.length > 0
+						? { stderr: `${warningText.map(warning => `WARNING: ${warning}`).join("\n")}\n` }
+						: {}),
 				};
 			}
 			case "record-critic-gate-override": {
@@ -4805,6 +4817,14 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 					cwd,
 					evidence: flagValue(args, "--evidence") ?? "",
 				});
+				const warnings = Array.isArray(event.postCommitWarnings) ? event.postCommitWarnings : [];
+				const warningText = warnings
+					.map(warning =>
+						warning && typeof warning === "object" && !Array.isArray(warning)
+							? nonEmptyString((warning as JsonObject).message)
+							: null,
+					)
+					.filter((warning): warning is string => Boolean(warning));
 				return {
 					status: 0,
 					stdout: json
@@ -4812,8 +4832,12 @@ async function dispatchUltragoalCommand(args: string[], cwd: string): Promise<Ul
 								ok: true,
 								event: CRITIC_GATE_OVERRIDE_EVENT,
 								event_id: event.eventId,
+								...(warnings.length > 0 ? { warnings } : {}),
 							})
 						: `Recorded terminal critic gate override event-id=${String(event.eventId)}.\n`,
+					...(warningText.length > 0
+						? { stderr: `${warningText.map(warning => `WARNING: ${warning}`).join("\n")}\n` }
+						: {}),
 				};
 			}
 			case "start-pipeline-overlap": {
