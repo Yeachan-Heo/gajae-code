@@ -913,8 +913,8 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean",
-					"description": "Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disable to use native terminal or tmux scrollback and selection.",
-					"default": true
+					"description": "Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disabled by default to preserve native terminal or tmux scrollback and selection.",
+					"default": false
 				}
 			},
 			"additionalProperties": false

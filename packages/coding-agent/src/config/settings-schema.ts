@@ -1240,12 +1240,12 @@ export const SETTINGS_SCHEMA = {
 
 	"mouse.enabled": {
 		type: "boolean",
-		default: true,
+		default: false,
 		ui: {
 			tab: "interaction",
 			label: "Mouse Support",
 			description:
-				"Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disable to use native terminal or tmux scrollback and selection.",
+				"Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disabled by default to preserve native terminal or tmux scrollback and selection.",
 		},
 	},
 	// Conversation flow

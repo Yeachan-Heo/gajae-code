@@ -240,9 +240,9 @@ providers:
 - `set-clipboard on` and a readable copy-mode `mode-style`.
 - GJC ownership/identity tags (`@gjc-profile`, version, branch/project markers).
 
-This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a compatible tmux provider is available. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched. GJC's own mouse support still captures the wheel for virtual session scrolling by default; add `set -g mouse on` to your own `~/.tmux.conf` only when you also disable `mouse.enabled` and want tmux copy-mode scrolling.
+This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a compatible tmux provider is available. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched. GJC's own mouse support is disabled by default, so the host terminal or tmux retains wheel and selection behavior. Add `set -g mouse on` to your own `~/.tmux.conf` when you want tmux copy-mode scrolling.
 
-When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release. Set `mouse.enabled: false` to use the terminal's or tmux's native selection behavior instead.
+Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling. When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release.
 
 | Variable | Behavior |
 | --- | --- |
@@ -271,9 +271,9 @@ GJC does not currently expose a supported `GJC_TMUX_NAMESPACE` runtime knob or p
 
 #### WSL / Windows Terminal scrolling
 
-GJC enables SGR mouse support by default. While the interactive TUI is running, the wheel scrolls GJC's virtual session viewport before tmux or Windows Terminal scrollback, including inside `gjc --tmux`.
+GJC's SGR mouse support is disabled by default, so tmux or Windows Terminal retains wheel ownership. In a GJC-managed tmux session, the default profile's `mouse on` enters tmux copy-mode and scrolls pane history.
 
-Set `mouse.enabled: false` in GJC settings to return wheel ownership to tmux or the host terminal. In a GJC-managed tmux session, the default profile's `mouse on` then enters tmux copy-mode and scrolls pane history. Set `GJC_MOUSE=off` as well to skip tmux mouse capture and let Windows Terminal handle its native scrollback. Keyboard fallback for tmux copy-mode remains `Ctrl-b [`, followed by `PgUp`/arrows; press `q` to exit.
+Set `mouse.enabled: true` to make the wheel scroll GJC's virtual session viewport, including inside `gjc --tmux`. Set `GJC_MOUSE=off` as well as leaving GJC mouse support disabled to skip tmux mouse capture and let Windows Terminal handle its native scrollback. Keyboard fallback for tmux copy-mode remains `Ctrl-b [`, followed by `PgUp`/arrows; press `q` to exit.
 
 ### Team tmux backend, dry-run, and state paths
 
