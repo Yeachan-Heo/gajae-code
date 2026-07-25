@@ -9,10 +9,12 @@ import {
 	sha256,
 } from "../scripts/lib/terminal-visual-evidence";
 import {
+	LIGHT_THEME_COMPLIANCE_ANSI_256_SCENES,
 	LIGHT_THEME_COMPLIANCE_ASCII_NO_COLOR_SCENES,
 	LIGHT_THEME_COMPLIANCE_CJK_SCENES,
 	LIGHT_THEME_COMPLIANCE_ENTRIES,
 	LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT,
+	LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT,
 	LIGHT_THEME_COMPLIANCE_SCENE_IDS,
 	LIGHT_THEME_COMPLIANCE_THEMES,
 	LIGHT_THEME_COMPLIANCE_VIEWPORTS,
@@ -128,7 +130,7 @@ function readManifest(value: unknown): ArtifactManifest {
 
 function expectedLanguageKeys(sceneId: string): string[] {
 	return LIGHT_THEME_COMPLIANCE_ENTRIES.filter(
-		entry => entry.sceneId === sceneId && entry.renderMode === "unicode-color",
+		entry => entry.sceneId === sceneId && entry.renderMode !== "ascii-no-color",
 	)
 		.map(entry => entry.key)
 		.sort();
@@ -153,6 +155,12 @@ function expectedNoColorKeys(): string[] {
 
 function expectedConsumerAtlasKeys(): string[] {
 	return LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.sceneId === "consumer-atlas")
+		.map(entry => entry.key)
+		.sort();
+}
+
+function expectedAnsi256Keys(): string[] {
+	return LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.renderMode === "unicode-256-color")
 		.map(entry => entry.key)
 		.sort();
 }
@@ -222,10 +230,10 @@ function validateIndependentReview(
 	for (const [key, expected] of [
 		["source_revision", manifest.source_revision],
 		["environment_id", manifest.environment_id],
-		["expected_entry_count", 170],
-		["observed_entry_count", 170],
-		["expected_leaf_count", 850],
-		["observed_leaf_count", 850],
+		["expected_entry_count", LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT],
+		["observed_entry_count", LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT],
+		["expected_leaf_count", LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT],
+		["observed_leaf_count", LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT],
 	] as const) {
 		if (value.manifest[key] !== expected) throw new Error(`Review manifest ${key} mismatch`);
 	}
@@ -233,11 +241,11 @@ function validateIndependentReview(
 	const reviewedKeys = stringArray(value.inspection.reviewed_entry_keys, "reviewed keys").sort();
 	const manifestKeys = manifest.entries.map(entry => entry.key).sort();
 	if (
-		reviewedKeys.length !== 170 ||
-		new Set(reviewedKeys).size !== 170 ||
+		reviewedKeys.length !== LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT ||
+		new Set(reviewedKeys).size !== LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT ||
 		reviewedKeys.join("\n") !== manifestKeys.join("\n")
 	) {
-		throw new Error("Review did not inspect the exact 170-key set");
+		throw new Error(`Review did not inspect the exact ${LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT}-key set`);
 	}
 	if (!isRecord(value.inspection.formats)) throw new Error("Review formats are missing");
 	for (const key of ["plain", "ansi", "html", "metadata", "png", "integrity"]) {
@@ -253,7 +261,8 @@ function validateIndependentReview(
 		const result = value.inspection.themes[themeName];
 		if (
 			!isRecord(result) ||
-			result.reviewed_entry_count !== 85 ||
+			result.reviewed_entry_count !==
+				LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT / LIGHT_THEME_COMPLIANCE_THEMES.length ||
 			result.requested_resolved_sentinel !== "pass" ||
 			result.contrast_and_cues !== "pass"
 		) {
@@ -331,6 +340,17 @@ function validateIndependentReview(
 	if (noColorKeys.join("\n") !== expectedNoColorKeys().join("\n") || noColor.status !== "pass") {
 		throw new Error("No-color review failed");
 	}
+	const ansi256 = value.inspection.ansi_256_color;
+	if (!isRecord(ansi256)) throw new Error("256-color review is missing");
+	const ansi256Keys = stringArray(ansi256.reviewed_entry_keys, "256-color keys").sort();
+	if (
+		ansi256Keys.join("\n") !== expectedAnsi256Keys().join("\n") ||
+		ansi256.downsampling !== "pass" ||
+		ansi256.contrast !== "pass" ||
+		ansi256.non_color_cues !== "pass"
+	) {
+		throw new Error("256-color review failed");
+	}
 	if (!Array.isArray(value.findings)) throw new Error("Review findings must be an array");
 	const severities = new Set(["blocker", "high", "medium", "low", "note"]);
 	for (const [index, finding] of value.findings.entries()) {
@@ -361,12 +381,14 @@ function validateIndependentReview(
 }
 
 describe("GJC light-theme compliance fixture", () => {
-	it("defines the exact 170-key matrix without gaps or duplicates", () => {
+	it("defines the exact 180-key matrix without gaps or duplicates", () => {
 		expect(LIGHT_THEME_COMPLIANCE_SCENE_IDS).toHaveLength(25);
 		expect(LIGHT_THEME_COMPLIANCE_ENTRIES).toHaveLength(LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT);
-		expect(new Set(LIGHT_THEME_COMPLIANCE_ENTRIES.map(entry => entry.key)).size).toBe(170);
+		expect(new Set(LIGHT_THEME_COMPLIANCE_ENTRIES.map(entry => entry.key)).size).toBe(
+			LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT,
+		);
 		for (const themeName of LIGHT_THEME_COMPLIANCE_THEMES) {
-			expect(LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.theme === themeName)).toHaveLength(85);
+			expect(LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.theme === themeName)).toHaveLength(90);
 		}
 		expect(LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.renderMode === "ascii-no-color")).toHaveLength(12);
 		expect(
@@ -377,16 +399,29 @@ describe("GJC light-theme compliance fixture", () => {
 		expect(LIGHT_THEME_COMPLIANCE_ASCII_NO_COLOR_SCENES).toHaveLength(6);
 		expect(LIGHT_THEME_COMPLIANCE_CJK_SCENES).toHaveLength(4);
 		const atlasEntries = LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.sceneId === "consumer-atlas");
-		expect(atlasEntries).toHaveLength(6);
-		expect(atlasEntries.map(entry => entry.viewport.columns).sort((a, b) => a - b)).toEqual([
+		expect(atlasEntries).toHaveLength(8);
+		const truecolorAtlasEntries = atlasEntries.filter(entry => entry.renderMode === "unicode-color");
+		expect(truecolorAtlasEntries.map(entry => entry.viewport.columns).sort((a, b) => a - b)).toEqual([
 			80, 80, 120, 120, 160, 160,
 		]);
 		for (const themeName of LIGHT_THEME_COMPLIANCE_THEMES) {
-			const themeAtlas = atlasEntries.filter(entry => entry.theme === themeName);
+			const themeAtlas = truecolorAtlasEntries.filter(entry => entry.theme === themeName);
 			expect(themeAtlas).toHaveLength(3);
 			expect(themeAtlas.map(entry => entry.viewport.columns).sort((a, b) => a - b)).toEqual([80, 120, 160]);
-			expect(themeAtlas.every(entry => entry.renderMode === "unicode-color")).toBe(true);
 		}
+		expect(LIGHT_THEME_COMPLIANCE_ANSI_256_SCENES).toEqual([
+			"selected-focus-active",
+			"wrap-mixed-cjk-latin",
+			"consumer-atlas",
+		]);
+		const ansi256Entries = LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.renderMode === "unicode-256-color");
+		expect(ansi256Entries).toHaveLength(10);
+		expect(new Set(ansi256Entries.map(entry => entry.theme))).toEqual(new Set(LIGHT_THEME_COMPLIANCE_THEMES));
+		expect(
+			ansi256Entries.filter(entry => entry.sceneId === "selected-focus-active").map(entry => entry.viewport.columns),
+		).toEqual([80, 120, 160, 80, 120, 160]);
+		expect(ansi256Entries.filter(entry => entry.sceneId === "wrap-mixed-cjk-latin")).toHaveLength(2);
+		expect(ansi256Entries.filter(entry => entry.sceneId === "consumer-atlas")).toHaveLength(2);
 	});
 
 	it("renders every key through the declared production surface with fail-closed identity", async () => {
@@ -403,6 +438,35 @@ describe("GJC light-theme compliance fixture", () => {
 			if (entry.renderMode === "ascii-no-color") {
 				expect(rendered.terminalAnsiText).not.toContain("\x1b");
 				expect(rendered.provenance.noColorCues?.length).toBeGreaterThan(1);
+			}
+		}
+	}, 30_000);
+
+	it("renders deterministic 256-color downsampling with unchanged text and non-color cues", async () => {
+		const ansi256Entries = LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.renderMode === "unicode-256-color");
+		for (const entry of ansi256Entries) {
+			const rendered = await renderLightThemeComplianceShowcase(entry);
+			expect(rendered.terminalAnsiText, entry.key).toMatch(/\x1b\[(?:\d+;)*(?:38|48);5;\d+m/);
+			expect(rendered.terminalAnsiText, entry.key).not.toMatch(/\x1b\[(?:\d+;)*(?:38|48);2;/);
+			const truecolorEntry = LIGHT_THEME_COMPLIANCE_ENTRIES.find(
+				candidate =>
+					candidate.theme === entry.theme &&
+					candidate.sceneId === entry.sceneId &&
+					candidate.viewport.id === entry.viewport.id &&
+					candidate.renderMode === "unicode-color",
+			);
+			expect(truecolorEntry, `${entry.key} needs a truecolor counterpart`).toBeDefined();
+			const truecolor = await renderLightThemeComplianceShowcase(truecolorEntry!);
+			expect(rendered.terminalText, entry.key).toBe(truecolor.terminalText);
+			if (entry.sceneId === "wrap-mixed-cjk-latin") {
+				expect(rendered.terminalText).toContain("알림");
+				expect(rendered.terminalText).toContain("通知");
+			} else if (entry.sceneId === "consumer-atlas") {
+				expect(rendered.terminalText).toContain("Provider onboarding");
+				expect(rendered.terminalText).toContain("showcase-pending");
+				expect(rendered.terminalText).toContain("showcase-error");
+			} else {
+				expect(rendered.terminalText).toContain("ACTIVE");
 			}
 		}
 	}, 30_000);
@@ -547,7 +611,7 @@ describe("GJC light-theme compliance fixture", () => {
 			"getThinkingBorderColor",
 		] as const;
 		const atlasEntries = LIGHT_THEME_COMPLIANCE_ENTRIES.filter(entry => entry.sceneId === "consumer-atlas");
-		expect(atlasEntries).toHaveLength(6);
+		expect(atlasEntries).toHaveLength(8);
 		for (const entry of atlasEntries) {
 			const rendered = await renderLightThemeComplianceShowcase(entry);
 			expect(rendered.provenance.sceneFamily).toBe("consumer-atlas");
@@ -596,11 +660,13 @@ describe("generated light-theme compliance evidence", () => {
 			expect(manifest.source_revision).toBe(currentSource.source_revision);
 			expect(manifest.source_fingerprint).toBe(currentSource.source_fingerprint);
 			expect(manifest.source_files).toEqual([...currentSource.source_files]);
-			expect(manifest.expected_entry_count).toBe(170);
-			expect(manifest.entry_count).toBe(170);
-			expect(manifest.expected_leaf_count).toBe(850);
-			expect(manifest.leaf_count).toBe(850);
-			expect(new Set(manifest.entries.map(entry => entry.key)).size).toBe(170);
+			expect(manifest.expected_entry_count).toBe(LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT);
+			expect(manifest.entry_count).toBe(LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT);
+			expect(manifest.expected_leaf_count).toBe(LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT);
+			expect(manifest.leaf_count).toBe(LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT);
+			expect(new Set(manifest.entries.map(entry => entry.key)).size).toBe(
+				LIGHT_THEME_COMPLIANCE_EXPECTED_ENTRY_COUNT,
+			);
 			expect(manifest.entry_count).toBe(manifest.entries.length);
 			expect(manifest.leaf_count).toBe(manifest.entries.reduce((total, entry) => total + entry.files.length, 0));
 			let observedLeaves = 0;
@@ -628,7 +694,7 @@ describe("generated light-theme compliance evidence", () => {
 					);
 				}
 			}
-			expect(observedLeaves).toBe(850);
+			expect(observedLeaves).toBe(LIGHT_THEME_COMPLIANCE_EXPECTED_LEAF_COUNT);
 			const runReceipt = JSON.parse(await Bun.file(path.join(evidenceRoot, "run-receipt.json")).text()) as unknown;
 			expect(isRecord(runReceipt)).toBe(true);
 			if (!isRecord(runReceipt) || typeof runReceipt.captured_at !== "string") {

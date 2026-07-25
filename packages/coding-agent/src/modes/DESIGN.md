@@ -421,8 +421,9 @@ insufficient.
 Korean, Japanese, Chinese, and mixed CJK/Latin content must preserve grapheme
 clusters and semantic units. Phrase/action/status boundaries, masked-secret
 markers, and short code/config identifiers may not split. Each language has
-eight Unicode captures: two themes at 80x24, 120x36, 160x48, and 48x36. Any
-bad semantic break blocks completion.
+eight truecolor captures: two themes at 80x24, 120x36, 160x48, and 48x36.
+Mixed CJK/Latin also has one 256-color 48x36 capture per theme. Any bad
+semantic break blocks completion.
 
 ### Light showcase matrix and theme identity
 
@@ -440,15 +441,19 @@ entries. Add `ascii-no-color` at 80x24 for `selected-focus-active`,
 `pending-loading`, `warning`, `error`, `confirmation`, and `status` for each
 theme (12). Add `unicode-color` at 48x36 for the four wrapping scenes for each
 theme (8). Add the production-backed `consumer-atlas` scene at 80x128,
-120x128, and 160x128 for each theme (6). The exact total is **170 entries**.
-The key is `{theme}/{scene}/{viewport}/{render_mode}`.
+120x128, and 160x128 for each theme (6). Add `unicode-256-color` for
+`selected-focus-active` at all three canonical widths (6), mixed CJK/Latin at
+48x36 (2), and `consumer-atlas` at 120x128 (2). These ten captures exercise
+real 256-color downsampling, retain non-color cues, and must satisfy the same
+documented contrast thresholds after conversion. The exact total is **180
+entries**. The key is `{theme}/{scene}/{viewport}/{render_mode}`.
 
 Every entry contains exactly `terminal.txt`, `terminal-ansi.txt`,
 `terminal.html`, `metadata.json`, and `terminal.png`, producing exactly
-**850 hashed entry leaves**. Root `manifest.json`,
+**900 hashed entry leaves**. Root `manifest.json`,
 `capture-environment.json`, `review-input.json`, `run-receipt.json`, and the
 later `independent-review.json` are control artifacts and are not included in
-850.
+900.
 
 Before rendering, the fixture requires
 `requested_theme === resolved_theme === manifest_key_theme`. There is no
@@ -535,26 +540,29 @@ string `notes`. It requires:
   `reviewer_authored_implementation` and `reviewer_authored_capture`, a
   non-empty basis, and no reviewer ID in either author array;
 - manifest relative path, lowercase SHA-256, source revision, environment ID,
-  expected/observed entry counts 170, and expected/observed leaf counts 850;
-- exactly 170 unique `reviewed_entry_keys`, set-equal to the manifest;
+  expected/observed entry counts 180, and expected/observed leaf counts 900;
+- exactly 180 unique `reviewed_entry_keys`, set-equal to the manifest;
 - passing plain, ANSI, HTML, metadata, PNG, and integrity format results;
-- exact theme keys `red-claw-light` and `blue-crab-light`, 85 reviewed entries
+- exact theme keys `red-claw-light` and `blue-crab-light`, 90 reviewed entries
   each, with passing requested/resolved/sentinel and contrast/cue results;
-- exact language keys Korean, Japanese, Chinese, and mixed CJK/Latin, each
-  listing its exact eight Unicode keys and passing grapheme/semantic results;
+- exact language keys Korean, Japanese, Chinese, and mixed CJK/Latin: the
+  first three list their exact eight truecolor keys, while mixed CJK/Latin
+  also lists its two 256-color keys; all pass grapheme/semantic results;
 - exact overflow top/middle/bottom sets of six canonical keys each;
 - one `sticky_virtualized` result naming the production import and
   `maxVisible-windowed` mechanism, listing all 18 linked keys, with passing
   sticky-row, boundary, and metadata results;
-- one `consumer_atlas` result listing the exact six atlas keys, with passing
+- one `consumer_atlas` result listing the exact eight atlas keys, with passing
   production-component rendering, named-consumer coverage, and responsive-width
   results;
 - the exact 12 no-color keys and a passing cue result;
+- one `ansi_256_color` result listing the exact ten 256-color keys, with
+  passing downsampling, contrast, and non-color-cue results;
 - findings with stable ID, severity
   `blocker|high|medium|low|note`, entry keys, description, and disposition;
   pass requires no unresolved finding and `blocker_count: 0`; and
 - a non-empty attestation that the reviewer recomputed integrity, inspected
-  all 170 entries rather than sampling, checked this DESIGN contract and
+  all 180 entries rather than sampling, checked this DESIGN contract and
   acceptance criteria, and authored neither implementation nor capture.
 
 A missing/excess key, count-only claim, stale binding, reviewer overlap,
@@ -566,7 +574,7 @@ the receipt and requires full recapture and independent re-review.
 
 Decision: keep the canonical Notifications evidence byte-stable and add a
 dedicated production-renderer-backed light-theme fixture with a shared
-ANSI-cell-grid evidence helper, exact local Resvg rasterization, the 170/850
+ANSI-cell-grid evidence helper, exact local Resvg rasterization, the 180/900
 matrix, and exhaustive independent review. Theme tests alone, repurposing
 Notifications, browser screenshots, vendored fonts, cross-machine PNG byte
 goldens, representative pairing samples, and sampled review are rejected.
