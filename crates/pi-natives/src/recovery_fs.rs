@@ -23,14 +23,20 @@ use parking_lot::Mutex;
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 
+#[cfg(target_os = "linux")]
 const MAX_CONTENT_BYTES: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_MANAGED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_MANAGED_TREE_DEPTH: usize = 32;
+#[cfg(target_os = "linux")]
 const MAX_MANAGED_TREE_FILES: u64 = 50_000;
 // Entries include files and directories. Leave room for the artifact directory,
 // nested directories, and managed transcript, binding, and receipt metadata
 // while preserving the TypeScript artifact-file limit.
+#[cfg(target_os = "linux")]
 const MAX_MANAGED_TREE_ENTRIES: u64 = 60_000;
+#[cfg(target_os = "linux")]
 const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
@@ -170,6 +176,7 @@ impl RecoveryFsRetainedCleanupResult {
 		}
 	}
 
+	#[cfg(target_os = "linux")]
 	fn retained_file(recovery_path: String, identity: RecoveryFsIdentity) -> Self {
 		Self {
 			ok:            false,
@@ -180,6 +187,7 @@ impl RecoveryFsRetainedCleanupResult {
 		}
 	}
 
+	#[cfg(target_os = "linux")]
 	fn retained_tree(
 		recovery_path: String,
 		tree_snapshot: crate::path_identity::NativeDirectoryTreeSnapshot,
@@ -195,10 +203,12 @@ impl RecoveryFsRetainedCleanupResult {
 }
 
 impl RecoveryFsResult {
+	#[cfg(target_os = "linux")]
 	const fn success(identity: RecoveryFsIdentity) -> Self {
 		Self { ok: true, code: None, identity: Some(identity), data: None }
 	}
 
+	#[cfg(target_os = "linux")]
 	fn data(identity: RecoveryFsIdentity, data: Vec<u8>) -> Self {
 		Self {
 			ok:       true,
@@ -262,6 +272,7 @@ pub struct RecoveryFsPublishResult {
 }
 
 impl RecoveryFsPublishResult {
+	#[cfg(target_os = "linux")]
 	fn success(identity: RecoveryFsIdentity) -> Self {
 		Self::result(true, None, Some(identity), "committed", "proven", "none", "complete", None)
 	}

@@ -7,12 +7,9 @@
 export const NOTIFICATION_PROTOCOL_VERSION = 3;
 
 /**
- * Operational generation the current daemon build speaks. Decoupled from
- * {@link NOTIFICATION_PROTOCOL_VERSION} (#2304): additive `tool_activity` /
- * `reasoning_summary` frames do not bump the wire protocol version, but a
- * freshly-upgraded host must still recognize an older, still-live daemon that
- * predates capability-gated frame enforcement and trigger a reload. Bump this
- * on every daemon-behavior change independent of the wire version.
+ * Guarded behavior-inventory version for the current daemon build. Bump this
+ * on every guarded daemon-behavior change independent of the wire version; it
+ * does not force a live daemon reload by itself.
  * The current development baseline already includes #2299's generation 4,
  * incarnation fencing in generation 5, owner-lock authority in generation 6,
  * identity-atomic transition markers in generation 7, stable signaling plus
@@ -38,5 +35,16 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 25 adds startup dead-root prune + leak-artifact self-heal
  * on TelegramNotificationDaemon.run (#2958). Generation 26 adds bounded reload
  * cooldown and lazy Telegram topic lifecycle safeguards (#2956, #2960, #2984).
+ * Generation 27 refreshes retained native path and process authority semantics.
+ * Generation 28 rejects special files before retained native authority opens.
+ * Generation 29 adds serving-epoch compatibility, sidecar heartbeat, root GC,
+ * and Bot API cooldown structural fixes (#2956, #2960, #3048).
  */
-export const DAEMON_GENERATION = 26;
+export const DAEMON_GENERATION = 29;
+
+/**
+ * Serving-compatibility boundary for daemon lifecycle requests. Epoch 1 covers
+ * all builds published before this field existed; bump this to force serving
+ * convergence and reload of compatible live predecessors.
+ */
+export const SERVING_EPOCH = 2;

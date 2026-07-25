@@ -1336,6 +1336,13 @@ impl Process {
 	/// Linux delivers through the owned pidfd and Windows through the owned
 	/// process handle, so PID reuse cannot redirect the signal. Darwin has no
 	/// equivalent stable kernel authority and deliberately fails closed.
+	#[cfg_attr(
+		target_os = "macos",
+		allow(
+			clippy::missing_const_for_fn,
+			reason = "non-macOS implementations call the platform process authority"
+		)
+	)]
 	pub fn signal_root(&self, signal: i32) -> bool {
 		#[cfg(target_os = "macos")]
 		{

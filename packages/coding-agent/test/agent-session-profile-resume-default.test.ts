@@ -62,7 +62,7 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 
 	function resolveModels(): { base: Model; profileMain: Model } {
 		const base = modelRegistry.find("openai-codex", "gpt-5.5");
-		const profileMain = modelRegistry.find("anthropic", "claude-opus-4-8");
+		const profileMain = modelRegistry.find("anthropic", "claude-opus-5");
 		if (!base || !profileMain) {
 			throw new Error("Expected codex and anthropic opus models to exist");
 		}
@@ -82,7 +82,7 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		await session.setModelTemporary(profileMain, undefined, { persistAsSessionDefault: true });
 
 		// The default that resume restores is now the profile's main model.
-		expect(session.sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-opus-4-8");
+		expect(session.sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-opus-5");
 		// Global default setting is untouched (apply-for-this-session semantics).
 		expect(session.settings.getModelRole("default")).toBe(globalDefaultBefore);
 	});
@@ -96,7 +96,7 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		await session.setModelTemporary(profileMain);
 
 		expect(session.model?.provider).toBe("anthropic");
-		expect(session.model?.id).toBe("claude-opus-4-8");
+		expect(session.model?.id).toBe("claude-opus-5");
 		// Resume still restores the explicit base default, not the transient model.
 		expect(session.sessionManager.buildSessionContext().models.default).toBe("openai-codex/gpt-5.5");
 	});
@@ -107,7 +107,7 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		// activation already recorded as the session default before throwing.
 		const base = modelRegistry.find("openai-codex", "gpt-5.5");
 		const transient = modelRegistry.find("anthropic", "claude-sonnet-4-6");
-		const profileMain = modelRegistry.find("anthropic", "claude-opus-4-8");
+		const profileMain = modelRegistry.find("anthropic", "claude-opus-5");
 		if (!base || !transient || !profileMain) {
 			throw new Error("Expected codex gpt-5.5 + anthropic sonnet/opus models to exist");
 		}
@@ -131,7 +131,7 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		});
 		expect(prepared.previousModel?.id).toBe("claude-sonnet-4-6");
 		expect(prepared.previousSessionDefaultModel).toBe("openai-codex/gpt-5.5");
-		expect(prepared.defaultModel?.id).toBe("claude-opus-4-8");
+		expect(prepared.defaultModel?.id).toBe("claude-opus-5");
 
 		// Force the activation to fail AFTER the profile main model is recorded as
 		// the session default: the agent-model-override step throws.
@@ -167,10 +167,10 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		// Simulate a profile-activated configured chain [A, B].
 		session.setConfiguredModelChain(
 			"default",
-			["anthropic/claude-opus-4-8", "openai-codex/gpt-5.5"],
+			["anthropic/claude-opus-5", "openai-codex/gpt-5.5"],
 			"profile-activation",
 		);
-		expect(session.getConfiguredModelChain("default")).toEqual(["anthropic/claude-opus-4-8", "openai-codex/gpt-5.5"]);
+		expect(session.getConfiguredModelChain("default")).toEqual(["anthropic/claude-opus-5", "openai-codex/gpt-5.5"]);
 
 		// Explicit user selection of C supersedes the stale chain: resume and
 		// snapshots must follow the latest choice, without the old tail.

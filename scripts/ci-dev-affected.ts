@@ -772,6 +772,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	if (paths.some(isWorkflowOrScriptPath)) {
 		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
 		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts"]);
+		add(tasks, "workflow-permissions", "Workflow permission policy regression", ["bun", "test", "scripts/check-workflow-permissions.test.ts", "scripts/release-policy.test.ts"]);
 		if (paths.some(isWorkflowPath)) {
 			add(tasks, "workflow-yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
 		}
@@ -783,7 +784,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 // PR-mode targeted planner. For each changed path it emits the smallest safe set
 // of tasks instead of the broad affected suite:
 //   - docs/changelog-only -> nothing expensive
-//   - workflow / CI harness scripts -> yaml-parse + ci-selftest + ci-dry-run
+//   - workflow / CI harness scripts -> yaml-parse + ci-selftest + ci-dry-run + permission check
 //   - a changed test file -> run exactly that test file (test:<path>)
 //   - a source file with a directly-named test -> run that test file only
 //   - a source file with no mapped test -> owning package check + relevant smoke
@@ -802,6 +803,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 	const fullWorkspace = relevant.some(isFullWorkspacePath) && !isRootPackageReleaseHarnessOnly(relevant);
 	let needCiSelftest = false;
 	let needYamlParse = false;
+	let needPermissionCheck = false;
 
 	if (fullWorkspace) {
 		add(tasks, "root-check", "Root TypeScript/tooling check", ["bun", "run", "ci:check:full"]);
@@ -814,10 +816,12 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		if (isWorkflowPath(changedPath)) {
 			needYamlParse = true;
 			needCiSelftest = true;
+			needPermissionCheck = true;
 			continue;
 		}
 		if (isCiHarnessScriptPath(changedPath)) {
 			needCiSelftest = true;
+			needPermissionCheck = true;
 			continue;
 		}
 		if (isRustPath(changedPath)) {
@@ -902,6 +906,9 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 	}
 	if (needYamlParse) {
 		add(tasks, "yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
+	}
+	if (needPermissionCheck) {
+		add(tasks, "workflow-permissions", "Workflow permission policy regression", ["bun", "test", "scripts/check-workflow-permissions.test.ts", "scripts/release-policy.test.ts"]);
 	}
 
 	ensureNativeBuild(tasks);
@@ -1004,7 +1011,7 @@ function isTestFilePath(changedPath: string): boolean {
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
-	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts";
+	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts";
 }
 
 
@@ -1405,7 +1412,9 @@ function isWorkflowHarnessPath(changedPath: string): boolean {
 		changedPath === "scripts/ci-dev-affected.ts" ||
 		changedPath === "scripts/ci-dev-affected.test.ts" ||
 		changedPath === "scripts/dev-ci-guard-topology.test.ts" ||
-		changedPath === "scripts/check-workflow-yaml.ts"
+		changedPath === "scripts/check-workflow-yaml.ts" ||
+		changedPath === "scripts/check-workflow-permissions.ts" ||
+		changedPath === "scripts/check-workflow-permissions.test.ts"
 	);
 }
 

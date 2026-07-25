@@ -41,6 +41,24 @@ function mockFs(
 	} = {},
 ): { fs: NotificationServiceFs; unlinked: string[]; created: string[]; store: Map<string, string> } {
 	const store = new Map(Object.entries(files));
+	for (const [file, value] of [...store]) {
+		if (!file.endsWith("telegram-daemon.state.json")) continue;
+		const state = JSON.parse(value) as Record<string, unknown>;
+		if (typeof state.pid !== "number" || typeof state.incarnation !== "string" || typeof state.ownerId !== "string")
+			continue;
+		const lock = file.replace("telegram-daemon.state.json", "telegram-daemon.lock");
+		if (!store.has(lock))
+			store.set(
+				lock,
+				JSON.stringify({
+					pid: state.pid,
+					incarnation: state.incarnation,
+					ownerId: state.ownerId,
+					acquisitionId: state.acquisitionId ?? state.ownerId,
+					startedAt: state.startedAt,
+				}),
+			);
+	}
 	const revisions = new Map<string, number>([...store.keys()].map(file => [file, 1]));
 	const unlinked: string[] = [];
 	const created: string[] = [];
@@ -125,7 +143,9 @@ function mockFs(
 function daemonStateJson(over: Record<string, unknown>): string {
 	return JSON.stringify({
 		pid: 4242,
+		incarnation: "linux:100",
 		ownerId: "owner-a",
+		acquisitionId: "owner-a",
 		tokenFingerprint: tokenFingerprint(TOKEN),
 		chatId: "12345",
 		startedAt: 0,
@@ -220,6 +240,23 @@ describe("notification-service health", () => {
 		expect(report.daemon.alive).toBe(false);
 		expect(report.overall).toBe("warn");
 		expect(report.checks.find(c => c.name === "daemon")?.detail).toContain("recovery");
+	});
+
+	test("corrupt daemon state degrades to a health warning", async () => {
+		const { fs, store } = mockFs({});
+		store.set(statePath, '{"pid":1000');
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: () => true },
+		});
+		expect(report.daemon.present).toBe(false);
+		expect(report.overall).toBe("warn");
+		expect(report.checks.find(check => check.name === "daemon")).toEqual({
+			name: "daemon",
+			level: "warn",
+			detail: "daemon ownership record is corrupt or unreadable",
+		});
 	});
 
 	test("a live daemon owning a different identity is flagged", async () => {
@@ -447,12 +484,12 @@ describe("notification-service health", () => {
 			});
 			expect(report.daemon.generation).toBeUndefined();
 			expect(report.daemon.generationRelation).toBe("unknown");
-			expect(report.daemon.heartbeatFresh).toBe(true);
-			expect(report.overall).toBe("ok");
+			expect(report.daemon.heartbeatFresh).toBe(false);
+			expect(report.overall).toBe("warn");
 		}
 	});
 
-	test("accepts finite timestamp floats and clamps future heartbeat age for display", async () => {
+	test("reports stopped modern owners without freshness when no stable owner tag exists", async () => {
 		const { fs } = mockFs({
 			[statePath]: daemonStateJson({
 				pid: 1000,
@@ -467,13 +504,13 @@ describe("notification-service health", () => {
 			stateRoot: "/tmp/gjc-none",
 			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
 		});
-		expect(report.daemon.heartbeatAt).toBe(1_500.5);
-		expect(report.daemon.heartbeatAgeMs).toBe(0);
-		expect(report.daemon.heartbeatFresh).toBe(true);
+		expect(report.daemon.heartbeatAt).toBeUndefined();
+		expect(report.daemon.heartbeatAgeMs).toBeUndefined();
+		expect(report.daemon.heartbeatFresh).toBe(false);
 		expect(report.daemon.stopped).toBe(true);
 	});
 
-	test("rejects malformed identity metadata before matching and keeps its warning semantics", async () => {
+	test("treats malformed modern owner identity metadata as stale", async () => {
 		const { fs } = mockFs({
 			[statePath]: daemonStateJson({
 				pid: 1000,
@@ -491,9 +528,7 @@ describe("notification-service health", () => {
 		});
 		expect(report.daemon.identityMatches).toBe(false);
 		expect(report.overall).toBe("warn");
-		expect(report.checks.find(check => check.name === "daemon")?.detail).toBe(
-			"a live daemon owns a different bot token or chat id",
-		);
+		expect(report.checks.find(check => check.name === "daemon")?.detail).toBe("daemon pid 1000 heartbeat is stale");
 	});
 
 	test("rejects malformed required daemon ownership metadata before liveness checks", async () => {

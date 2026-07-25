@@ -275,9 +275,11 @@ export interface ToolSession {
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "0-Main", "0-AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
+	getToolByName?: (name: string) => AgentTool | undefined;
+	/** Look up a registered tool with the session's execution guards applied. */
+	getToolForExecution?: (name: string) => AgentTool | undefined;
 	/** Purge undelivered queued custom messages matching the predicate. Returns counts. */
 	purgeQueuedCustomMessages?: (predicate: (message: CustomMessage) => boolean) => PurgeQueuedCustomMessagesResult;
-	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Agent registry for IRC routing across live sessions. */
 	agentRegistry?: AgentRegistry;
 	/** Optional restricted bash command prefixes for read-only role agents and constrained modes. */

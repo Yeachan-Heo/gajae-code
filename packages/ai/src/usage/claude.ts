@@ -17,6 +17,13 @@ const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ATTEMPTS = 3;
 const BASE_RETRY_DELAY_MS = 500;
+/**
+ * Ceiling for a server-supplied `Retry-After`. Matches `OPENAI_RETRY_DELAY_CAP_MS`
+ * and `fetchWithRetry`'s `DEFAULT_MAX_DELAY_MS`. Without it a hostile or
+ * misconfigured endpoint stalls the usage fetch for as long as it likes
+ * (`Retry-After: 86400` previously produced a 24h sleep).
+ */
+const MAX_RETRY_DELAY_MS = 60_000;
 
 const CLAUDE_HEADERS = {
 	accept: "application/json, text/plain, */*",
@@ -140,13 +147,23 @@ function isAbortError(error: unknown, signal?: AbortSignal): boolean {
 	return error.name === "AbortError" || error.name === "TimeoutError";
 }
 
+/**
+ * Honour the server hint but never exceed `MAX_RETRY_DELAY_MS`, and never
+ * return a negative/non-finite delay. Keeps the sleep bounded so an abort has
+ * an upper bound to fire within.
+ */
+function clampRetryDelay(baseline: number, hintMs: number): number {
+	const hint = Number.isFinite(hintMs) ? Math.max(0, hintMs) : 0;
+	return Math.min(Math.max(baseline, hint), MAX_RETRY_DELAY_MS);
+}
+
 function retryDelayMs(attempt: number, retryAfter: string | null): number {
 	const baseline = BASE_RETRY_DELAY_MS * 2 ** attempt;
 	if (!retryAfter?.trim()) return baseline;
 	const seconds = Number.parseFloat(retryAfter);
-	if (Number.isFinite(seconds)) return Math.max(baseline, Math.max(0, seconds * 1000));
+	if (Number.isFinite(seconds)) return clampRetryDelay(baseline, seconds * 1000);
 	const dateDelay = Date.parse(retryAfter) - Date.now();
-	return Number.isFinite(dateDelay) ? Math.max(baseline, Math.max(0, dateDelay)) : baseline;
+	return Number.isFinite(dateDelay) ? clampRetryDelay(baseline, dateDelay) : baseline;
 }
 
 async function waitBeforeRetry(

@@ -31,7 +31,7 @@ import {
 	releaseDaemonTransitionLock,
 	sanitizeDiagnostic,
 } from "./notification-service";
-import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
+import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION, SERVING_EPOCH } from "./telegram-daemon-contract";
 import {
 	type DaemonProcessReference,
 	type TelegramDaemonControlDeps,
@@ -39,7 +39,7 @@ import {
 } from "./telegram-daemon-control";
 import { type TelegramSetupPreflight, withTelegramSetupLease } from "./telegram-setup";
 
-export { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION } from "./telegram-daemon-contract";
+export { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION, SERVING_EPOCH } from "./telegram-daemon-contract";
 
 import {
 	buildButtonGrid,
@@ -132,6 +132,8 @@ export interface DaemonState {
 	 * notification wire protocol version. Absent on pre-generation state.
 	 */
 	generation?: number;
+	/** Lifecycle-serving compatibility epoch; absent pre-epoch records are epoch 1. */
+	servingEpoch?: number;
 	stoppedAt?: number;
 }
 export interface TelegramDaemonFs {
@@ -241,6 +243,18 @@ const RELOAD_FRESHNESS_WAIT_MS = 15_000;
 const RELOAD_CONTROLLER_GRACEFUL_MS = 8_000;
 const RELOAD_CONTROLLER_KILL_MS = 3_000;
 const RELOAD_RESERVATION_HEADROOM_MS = 10_000;
+const ROOTS_REGISTRATION_LOCK_RETRY_DELAY_MS = 100;
+const ROOTS_REGISTRATION_LOCK_HEADROOM_MS = 5_000;
+const ROOTS_REGISTRATION_LOCK_RETRIES =
+	Math.ceil(
+		(RELOAD_CONTROLLER_GRACEFUL_MS + RELOAD_CONTROLLER_KILL_MS + ROOTS_REGISTRATION_LOCK_HEADROOM_MS) /
+			ROOTS_REGISTRATION_LOCK_RETRY_DELAY_MS,
+	) + 1;
+const ROOTS_REGISTRATION_LOCK_OPTIONS = {
+	staleMs: 10_000,
+	retries: ROOTS_REGISTRATION_LOCK_RETRIES,
+	retryDelayMs: ROOTS_REGISTRATION_LOCK_RETRY_DELAY_MS,
+};
 
 /**
  * File-lock options whose acquisition budget covers the full reload-reservation
@@ -656,6 +670,162 @@ function ownershipLockMatchesState(lock: OwnershipLockRead, state: DaemonState |
 	);
 }
 
+type OwnerHeartbeatSidecar = {
+	pid: number;
+	incarnation: string;
+	ownerId: string;
+	acquisitionId: string;
+	heartbeatAt: number;
+};
+
+function ownerTagFromState(
+	state: DaemonState | undefined,
+): Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | undefined {
+	if (
+		!state ||
+		!hasSafeDaemonStateShape(state) ||
+		state.stoppedAt !== undefined ||
+		!state.ownerId ||
+		!state.acquisitionId
+	)
+		return undefined;
+	return {
+		pid: state.pid,
+		incarnation: state.incarnation,
+		ownerId: state.ownerId,
+		acquisitionId: state.acquisitionId,
+	};
+}
+
+function sidecarMatchesOwnerTag(
+	sidecar: OwnerHeartbeatSidecar | undefined,
+	tag: Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | undefined,
+): sidecar is OwnerHeartbeatSidecar {
+	return Boolean(
+		sidecar &&
+			tag &&
+			validDaemonPid(sidecar.pid) &&
+			isProcessIncarnation(sidecar.incarnation) &&
+			typeof sidecar.ownerId === "string" &&
+			typeof sidecar.acquisitionId === "string" &&
+			Number.isSafeInteger(sidecar.heartbeatAt) &&
+			sidecar.pid === tag.pid &&
+			sidecar.incarnation === tag.incarnation &&
+			sidecar.ownerId === tag.ownerId &&
+			sidecar.acquisitionId === tag.acquisitionId,
+	);
+}
+
+/**
+ * A corrupt, truncated, or otherwise unreadable sidecar must never break a
+ * freshness read: the sidecar is advisory-only, so any read/parse failure
+ * degrades to "no sidecar" (state-floor freshness), never a throw.
+ */
+async function readSidecarLenient(fsImpl: TelegramDaemonFs, file: string): Promise<OwnerHeartbeatSidecar | undefined> {
+	try {
+		const parsed: unknown = JSON.parse(await fsImpl.readFile(file, "utf8"));
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+			? (parsed as OwnerHeartbeatSidecar)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export interface OwnerFreshnessSnapshot {
+	ownerTag: Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | null;
+	effectiveHeartbeatAt: number | undefined;
+	legacyEmbedded: boolean;
+	state: DaemonState | undefined;
+}
+
+export async function readOwnerFreshnessSnapshot(input: {
+	settings: Settings;
+	fs?: TelegramDaemonFs;
+}): Promise<OwnerFreshnessSnapshot> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	const state = await readJson<DaemonState>(fsImpl, paths.state);
+	const legacyEmbedded = Boolean(
+		state && (isGenerationAbsentParentDaemonState(state) || isGeneration3ReleaseDaemonState(state)),
+	);
+	const tag = ownerTagFromState(state);
+	const lock = await readOwnershipLock(fsImpl, paths.lock);
+	const ownerTag = tag && ownershipLockMatchesState(lock, state) ? tag : null;
+	if (legacyEmbedded) return { ownerTag, effectiveHeartbeatAt: state?.heartbeatAt, legacyEmbedded, state };
+	const sidecar = await readSidecarLenient(fsImpl, paths.heartbeat);
+	const rereadState = await readJson<DaemonState>(fsImpl, paths.state);
+	const rereadLock = await readOwnershipLock(fsImpl, paths.lock);
+	const rereadTag = ownerTagFromState(rereadState);
+	const stableTag = rereadTag && ownershipLockMatchesState(rereadLock, rereadState) ? rereadTag : null;
+	const stable =
+		ownerTag && stableTag && sidecarMatchesOwnerTag({ ...ownerTag, heartbeatAt: 0 }, stableTag) ? stableTag : null;
+	const effectiveHeartbeatAt = stable
+		? sidecarMatchesOwnerTag(sidecar, stable)
+			? Math.max(rereadState?.heartbeatAt ?? 0, sidecar.heartbeatAt)
+			: rereadState?.heartbeatAt
+		: undefined;
+	return {
+		ownerTag: stable,
+		effectiveHeartbeatAt,
+		legacyEmbedded: false,
+		state: rereadState,
+	};
+}
+
+/** Marker-free steady heartbeat renewal. The final lock reread fences a stale writer. */
+export async function renewOwnerHeartbeatSidecar(input: {
+	settings: Settings;
+	ownerId: string;
+	acquisitionId?: string;
+	fs?: TelegramDaemonFs;
+	now?: () => number;
+	pid?: number;
+	pidIncarnation?: (pid: number) => string | undefined;
+}): Promise<boolean> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	const state = await readJson<DaemonState>(fsImpl, paths.state);
+	const pid = input.pid ?? state?.pid;
+	const incarnation = (input.pidIncarnation ?? defaultPidIncarnation)(pid ?? 0);
+	const acquisitionId = input.acquisitionId ?? input.ownerId;
+	if (
+		!state ||
+		!validDaemonPid(pid) ||
+		!isProcessIncarnation(incarnation) ||
+		state.pid !== pid ||
+		state.incarnation !== incarnation ||
+		state.ownerId !== input.ownerId ||
+		state.acquisitionId !== acquisitionId ||
+		state.stoppedAt !== undefined
+	)
+		return false;
+	const sidecar: OwnerHeartbeatSidecar = {
+		pid,
+		incarnation,
+		ownerId: input.ownerId,
+		acquisitionId,
+		heartbeatAt: (input.now ?? Date.now)(),
+	};
+	const tmp = `${paths.heartbeat}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+	await fsImpl.writeFile(tmp, `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o600 });
+	await fsImpl.chmod(tmp, 0o600).catch(() => undefined);
+	const lock = await readOwnershipLock(fsImpl, paths.lock);
+	if (!ownershipLockMatchesState(lock, state)) {
+		await fsImpl.unlink(tmp).catch(() => undefined);
+		return false;
+	}
+	// Revalidate the exact lock after the temporary sidecar exists so a stale
+	// writer cannot publish after ownership moved during its write.
+	const finalLock = await readOwnershipLock(fsImpl, paths.lock);
+	if (!ownershipLockMatchesState(finalLock, state)) {
+		await fsImpl.unlink(tmp).catch(() => undefined);
+		return false;
+	}
+	await fsImpl.rename(tmp, paths.heartbeat);
+	return true;
+}
+
 function ownershipLockMatchesStoppedState(
 	lock: OwnershipLockRead,
 	state: unknown,
@@ -800,23 +970,29 @@ async function ownershipLockIsReclaimable(input: {
 	);
 }
 
-interface NotificationRootRegistration {
+export interface NotificationRootRegistration {
 	root?: string;
 	managed?: boolean;
+	token?: string;
 }
 
-async function readNotificationRootRegistration(input: {
+export async function readNotificationRootRegistration(input: {
 	settings: Settings;
 	sessionId: string;
 	fs?: TelegramDaemonFs;
 }): Promise<NotificationRootRegistration> {
 	const fsImpl = input.fs ?? nodeFs;
-	const current = await readJson<{ sessions?: Record<string, string>; managedRoots?: string[] }>(
-		fsImpl,
-		daemonPaths(input.settings.getAgentDir()).roots,
-	);
+	const current = await readJson<{
+		sessions?: Record<string, string>;
+		managedRoots?: string[];
+		registrationTokens?: Record<string, string>;
+	}>(fsImpl, daemonPaths(input.settings.getAgentDir()).roots);
 	const root = current?.sessions?.[input.sessionId];
-	return { root, managed: root !== undefined && current?.managedRoots?.includes(root) === true };
+	return {
+		root,
+		managed: root !== undefined && current?.managedRoots?.includes(root) === true,
+		token: current?.registrationTokens?.[input.sessionId],
+	};
 }
 
 /** Restore a session root only if this ensure operation still owns its registration. */
@@ -824,6 +1000,8 @@ async function restoreNotificationRootRegistration(input: {
 	settings: Settings;
 	sessionId: string;
 	registeredRoot: string;
+	/** Token minted by this operation's own registration; a newer replacement registration's token fences the rollback. */
+	registeredToken?: string;
 	previous: NotificationRootRegistration;
 	fs?: TelegramDaemonFs;
 }): Promise<void> {
@@ -834,14 +1012,24 @@ async function restoreNotificationRootRegistration(input: {
 		paths.roots,
 		async () => {
 			const current =
-				(await readJson<{ roots?: string[]; managedRoots?: string[]; sessions?: Record<string, string> }>(
-					fsImpl,
-					paths.roots,
-				)) ?? {};
+				(await readJson<{
+					roots?: string[];
+					managedRoots?: string[];
+					sessions?: Record<string, string>;
+					registrationTokens?: Record<string, string>;
+				}>(fsImpl, paths.roots)) ?? {};
 			const sessions = { ...(current.sessions ?? {}) };
 			if (sessions[input.sessionId] !== input.registeredRoot) return;
+			if (
+				current.registrationTokens?.[input.sessionId] !== undefined &&
+				current.registrationTokens[input.sessionId] !== input.registeredToken
+			)
+				return;
+			const registrationTokens = { ...(current.registrationTokens ?? {}) };
 			if (input.previous.root) sessions[input.sessionId] = input.previous.root;
 			else delete sessions[input.sessionId];
+			if (input.previous.token !== undefined) registrationTokens[input.sessionId] = input.previous.token;
+			else delete registrationTokens[input.sessionId];
 			const referencedRoots = new Set(Object.values(sessions));
 			const roots = new Set(current.roots ?? []);
 			const managedRoots = new Set(current.managedRoots ?? []);
@@ -859,10 +1047,17 @@ async function restoreNotificationRootRegistration(input: {
 				roots: Array.from(roots).sort(),
 				managedRoots: Array.from(managedRoots).sort(),
 				sessions,
+				registrationTokens,
 			});
 		},
 		{ staleMs: 10_000 },
 	);
+}
+
+export interface RegisterNotificationRootResult {
+	root: string;
+	/** Per-registration ownership token fencing a stale same-session cleanup from deleting a live replacement registration. */
+	token: string;
 }
 
 export async function registerNotificationRoot(input: {
@@ -870,22 +1065,26 @@ export async function registerNotificationRoot(input: {
 	cwd: string;
 	sessionId: string;
 	fs?: TelegramDaemonFs;
-}): Promise<string> {
+}): Promise<RegisterNotificationRootResult> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	await ensureDir(fsImpl, paths.dir);
 	const root = notificationRootForCwd(input.cwd);
+	const token = crypto.randomUUID();
 	await withFileLock(
 		paths.roots,
 		async () => {
 			const current =
-				(await readJson<{ roots?: string[]; managedRoots?: string[]; sessions?: Record<string, string> }>(
-					fsImpl,
-					paths.roots,
-				)) ?? {};
+				(await readJson<{
+					roots?: string[];
+					managedRoots?: string[];
+					sessions?: Record<string, string>;
+					registrationTokens?: Record<string, string>;
+				}>(fsImpl, paths.roots)) ?? {};
 			const roots = new Set(current.roots ?? []);
 			const managedRoots = new Set(current.managedRoots ?? []);
 			const sessions = { ...(current.sessions ?? {}) };
+			const registrationTokens = { ...(current.registrationTokens ?? {}) };
 			const previousRoot = sessions[input.sessionId];
 			const rootAlreadyPresent = roots.has(root);
 			roots.add(root);
@@ -893,6 +1092,7 @@ export async function registerNotificationRoot(input: {
 			// survive a later session rollback or unregister.
 			if (!rootAlreadyPresent) managedRoots.add(root);
 			sessions[input.sessionId] = root;
+			registrationTokens[input.sessionId] = token;
 			if (previousRoot && previousRoot !== root && managedRoots.has(previousRoot)) {
 				const previousStillReferenced = Object.values(sessions).includes(previousRoot);
 				if (!previousStillReferenced) {
@@ -905,16 +1105,19 @@ export async function registerNotificationRoot(input: {
 				roots: Array.from(roots).sort(),
 				managedRoots: Array.from(managedRoots).sort(),
 				sessions,
+				registrationTokens,
 			});
 		},
-		{ staleMs: 10_000 },
+		ROOTS_REGISTRATION_LOCK_OPTIONS,
 	);
-	return root;
+	return { root, token };
 }
 
 export interface UnregisterNotificationRootResult {
 	root: string;
 	remainingRoots: number;
+	/** Opaque fingerprint of the exact registry written by this successful unregister. */
+	registryFingerprint?: string;
 }
 
 /** Remove one session's Telegram scan root without disturbing other live session roots. */
@@ -923,20 +1126,19 @@ export async function unregisterNotificationRoot(input: {
 	cwd: string;
 	sessionId: string;
 	fs?: TelegramDaemonFs;
+	/** Ownership token minted by this runtime's own registration; a stale cleanup presenting an older token never deletes a replacement registration. */
+	registrationToken?: string;
 }): Promise<UnregisterNotificationRootResult> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
 	const root = notificationRootForCwd(input.cwd);
 	await ensureDir(fsImpl, paths.dir);
 	let remainingRoots = 0;
+	let registryFingerprint: string | undefined;
 	await withFileLock(
 		paths.roots,
 		async () => {
-			const current = await readJson<{
-				roots?: string[];
-				managedRoots?: string[];
-				sessions?: Record<string, string>;
-			}>(fsImpl, paths.roots);
+			const current = await readJson<NotificationRootsRegistry>(fsImpl, paths.roots);
 			if (!current) return;
 			const sessions = { ...(current.sessions ?? {}) };
 			// A stale cleanup from a previous registration must not remove a newer
@@ -945,7 +1147,19 @@ export async function unregisterNotificationRoot(input: {
 				remainingRoots = (current.roots ?? []).length;
 				return;
 			}
+			// Same sessionId + same cwd re-registration records an identical root, so
+			// the root match alone cannot distinguish a replaced registration. Any
+			// token-bearing registration requires the caller to present that exact token;
+			// only genuinely legacy token-less rows retain root-match cleanup behavior.
+			const recordedToken = current.registrationTokens?.[input.sessionId];
+			if (recordedToken !== undefined && recordedToken !== input.registrationToken) {
+				logger.warn("notifications: fenced stale Telegram root unregister against a live replacement registration");
+				remainingRoots = (current.roots ?? []).length;
+				return;
+			}
 			delete sessions[input.sessionId];
+			const registrationTokens = { ...(current.registrationTokens ?? {}) };
+			delete registrationTokens[input.sessionId];
 			const rootStillReferenced = Object.values(sessions).includes(root);
 			const managedRoots = new Set(current.managedRoots ?? []);
 			const roots = (current.roots ?? []).filter(
@@ -953,16 +1167,46 @@ export async function unregisterNotificationRoot(input: {
 			);
 			if (!rootStillReferenced) managedRoots.delete(root);
 			remainingRoots = roots.length;
-			await writeJsonAtomic(fsImpl, paths.roots, {
+			const nextRegistry: NotificationRootsRegistry = {
 				version: 1,
 				roots: Array.from(new Set(roots)).sort(),
 				managedRoots: Array.from(managedRoots).sort(),
 				sessions,
-			});
+				registrationTokens,
+			};
+			await writeJsonAtomic(fsImpl, paths.roots, nextRegistry);
+			registryFingerprint = notificationRootRegistryFingerprint(nextRegistry);
 		},
 		{ staleMs: 10_000 },
 	);
-	return { root, remainingRoots };
+	return registryFingerprint === undefined ? { root, remainingRoots } : { root, remainingRoots, registryFingerprint };
+}
+
+/** Run an action while the roots registry lock excludes any registration or unregister. */
+export async function withNotificationRootRegistryFence(input: {
+	settings: Settings;
+	registryFingerprint: string;
+	action: () => Promise<void>;
+	fs?: TelegramDaemonFs;
+}): Promise<boolean> {
+	const fsImpl = input.fs ?? nodeFs;
+	const paths = daemonPaths(input.settings.getAgentDir());
+	await ensureDir(fsImpl, paths.dir);
+	return await withFileLock(
+		paths.roots,
+		async () => {
+			const current = await readJson<NotificationRootsRegistry>(fsImpl, paths.roots);
+			if (
+				!current ||
+				(current.roots ?? []).length !== 0 ||
+				notificationRootRegistryFingerprint(current) !== input.registryFingerprint
+			)
+				return false;
+			await input.action();
+			return true;
+		},
+		{ staleMs: 10_000 },
+	);
 }
 
 function notificationRootForCwd(cwd: string): string {
@@ -998,7 +1242,31 @@ type NotificationRootsRegistry = {
 	roots?: string[];
 	managedRoots?: string[];
 	sessions?: Record<string, string>;
+	registrationTokens?: Record<string, string>;
 };
+
+function notificationRootRegistryFingerprint(registry: NotificationRootsRegistry): string {
+	return crypto
+		.createHash("sha256")
+		.update(
+			JSON.stringify({
+				version: registry.version,
+				roots: Array.from(new Set(registry.roots ?? [])).sort(),
+				managedRoots: Array.from(new Set(registry.managedRoots ?? [])).sort(),
+				sessions: Object.fromEntries(
+					Object.entries(registry.sessions ?? {}).sort(([left], [right]) =>
+						left < right ? -1 : left > right ? 1 : 0,
+					),
+				),
+				registrationTokens: Object.fromEntries(
+					Object.entries(registry.registrationTokens ?? {}).sort(([left], [right]) =>
+						left < right ? -1 : left > right ? 1 : 0,
+					),
+				),
+			}),
+		)
+		.digest("hex");
+}
 
 /**
  * Drop permanently missing scan roots from the durable registry under the roots
@@ -1022,6 +1290,7 @@ export async function pruneMissingNotificationRoots(input: {
 			const roots = [...(current.roots ?? [])];
 			const managedRoots = new Set(current.managedRoots ?? []);
 			const sessions = { ...(current.sessions ?? {}) };
+			const registrationTokens = { ...(current.registrationTokens ?? {}) };
 			const candidateSet = input.candidates ? new Set(input.candidates) : undefined;
 			const survivors: string[] = [];
 			for (const root of roots) {
@@ -1052,7 +1321,10 @@ export async function pruneMissingNotificationRoots(input: {
 					pruned.push(root);
 					managedRoots.delete(root);
 					for (const [sessionId, mapped] of Object.entries(sessions)) {
-						if (mapped === root) delete sessions[sessionId];
+						if (mapped === root) {
+							delete sessions[sessionId];
+							delete registrationTokens[sessionId];
+						}
 					}
 				}
 			}
@@ -1063,6 +1335,7 @@ export async function pruneMissingNotificationRoots(input: {
 				roots: Array.from(new Set(survivors)).sort(),
 				managedRoots: Array.from(managedRoots).sort(),
 				sessions,
+				registrationTokens,
 			});
 		},
 		{ staleMs: 10_000 },
@@ -1220,7 +1493,9 @@ export function hasSafeDaemonStateShape(state: unknown): state is DaemonState {
 			candidate.version === DAEMON_VERSION &&
 			(candidate.generation === undefined ||
 				(Number.isSafeInteger(candidate.generation) && (candidate.generation as number) > 0)) &&
-			(candidate.stoppedAt === undefined || Number.isSafeInteger(candidate.stoppedAt)),
+			(candidate.stoppedAt === undefined || Number.isSafeInteger(candidate.stoppedAt)) &&
+			(candidate.servingEpoch === undefined ||
+				(Number.isSafeInteger(candidate.servingEpoch) && (candidate.servingEpoch as number) > 0)),
 	);
 }
 
@@ -1421,6 +1696,7 @@ async function legacyParentHandoffDecision(input: {
 > {
 	const { state } = input;
 	if (!input.pidAlive(state.pid)) return undefined;
+	if (state.generation !== 3) return { acquired: false, attached: false, blocked: true };
 	if (!ownerIdentityMatches(state, input.tokenFingerprint, input.chatId))
 		return { acquired: false, attached: false, blocked: true };
 	const incarnation = input.pidIncarnation(state.pid);
@@ -1522,12 +1798,7 @@ function isRecognizedLegacyGeneration(generation: number | undefined): boolean {
 	return generation === undefined || generation === 3;
 }
 
-/**
- * A predecessor is reloadable only when it has the complete modern ownership
- * proof. Generation is absent from the first fully-provenanced modern records,
- * so it is an incompatible predecessor too; parent-format records remain
- * excluded because they lack this ownership proof.
- */
+/** True when a modern owner carries complete ready-state provenance. */
 function hasFullModernOwnerProvenance(
 	state: DaemonState | undefined,
 	pidIncarnation?: (pid: number) => string | undefined,
@@ -1539,19 +1810,6 @@ function hasFullModernOwnerProvenance(
 			typeof state.acquisitionId === "string" &&
 			state.acquisitionId.length > 0 &&
 			ownerProvenanceMatches(state, pidIncarnation),
-	);
-}
-
-function isFullModernPredecessor(
-	state: DaemonState | undefined,
-	pidIncarnation?: (pid: number) => string | undefined,
-): boolean {
-	return Boolean(
-		hasFullModernOwnerProvenance(state, pidIncarnation) &&
-			(state?.generation === undefined ||
-				(Number.isSafeInteger(state?.generation) &&
-					(state?.generation as number) > 0 &&
-					(state?.generation as number) < DAEMON_GENERATION)),
 	);
 }
 
@@ -1628,14 +1886,17 @@ export function isFreshLiveOwner(input: {
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
+	effectiveHeartbeatAt?: number;
 }): boolean {
 	const { state } = input;
+	const heartbeatAt = Object.hasOwn(input, "effectiveHeartbeatAt") ? input.effectiveHeartbeatAt : state?.heartbeatAt;
 	return Boolean(
 		state &&
+			heartbeatAt !== undefined &&
 			hasSafeDaemonStateShape(state) &&
 			state.stoppedAt === undefined &&
 			ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
-			input.now - state.heartbeatAt <= HEARTBEAT_TTL_MS &&
+			input.now - heartbeatAt <= HEARTBEAT_TTL_MS &&
 			input.pidAlive(state.pid) &&
 			ownerProvenanceMatches(state, input.pidIncarnation),
 	);
@@ -1649,6 +1910,7 @@ export function isCurrentCompatibleOwner(input: {
 	chatId: string;
 	pidAlive: (pid: number) => boolean;
 	pidIncarnation?: (pid: number) => string | undefined;
+	effectiveHeartbeatAt?: number;
 }): boolean {
 	const state = input.state;
 	return Boolean(
@@ -1656,8 +1918,7 @@ export function isCurrentCompatibleOwner(input: {
 			state?.ownershipPhase === "ready" &&
 			typeof state.acquisitionId === "string" &&
 			state.acquisitionId.length > 0 &&
-			Number.isSafeInteger(state.generation) &&
-			(state.generation as number) >= DAEMON_GENERATION,
+			(state.servingEpoch === undefined ? 1 : state.servingEpoch) >= SERVING_EPOCH,
 	);
 }
 
@@ -1701,14 +1962,14 @@ export async function acquireDaemonOwnership(input: {
 		input.ownerId ?? input.randomId?.() ?? `${pid}-${now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 	const roots = input.roots ?? (await readJson<{ roots?: string[] }>(fsImpl, paths.roots))?.roots ?? [];
 
-	// A fresh, identity-matching live owner running an OLDER generation than this
-	// build cannot serve our newer wire frames; signal a reload instead of a
-	// silent attach. Newer/equal generations attach as before (no downgrade).
+	// Generation is inventory-only: a lower servingEpoch triggers convergence,
+	// while same-epoch cross-generation owners attach.
 	const attachDecision = (
-		state: DaemonState | undefined,
+		snapshot: OwnerFreshnessSnapshot,
 	):
 		| { acquired: false; attached: boolean; blocked?: boolean; provisional?: boolean; reloadRequired?: boolean }
 		| undefined => {
+		const state = snapshot.state;
 		if (state && !hasSafeDaemonStateShape(state)) {
 			const malformed = state as Partial<DaemonState>;
 			if (
@@ -1741,6 +2002,7 @@ export async function acquireDaemonOwnership(input: {
 				chatId: input.chatId,
 				pidAlive,
 				pidIncarnation,
+				effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 			})
 		)
 			return { acquired: false, attached: true };
@@ -1755,8 +2017,17 @@ export async function acquireDaemonOwnership(input: {
 				chatId: input.chatId,
 				pidAlive,
 				pidIncarnation,
+				effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 			}) &&
-			(state.version !== DAEMON_VERSION || isFullModernPredecessor(state, pidIncarnation))
+			(state.version !== DAEMON_VERSION ||
+				((state.servingEpoch === undefined ? 1 : state.servingEpoch) < SERVING_EPOCH &&
+					isSignalableMatchingOwner({
+						state,
+						tokenFingerprint: input.tokenFingerprint,
+						chatId: input.chatId,
+						pidAlive,
+						pidIncarnation,
+					})))
 		)
 			return { acquired: false, attached: false, reloadRequired: true };
 		return { acquired: false, attached: false, provisional: true };
@@ -1800,7 +2071,8 @@ export async function acquireDaemonOwnership(input: {
 	const transition = await acquireTransitionLock({ fs: fsImpl, path: paths.steal, pidAlive, pidIncarnation });
 	if (!transition) return { acquired: false, attached: false, provisional: true };
 	try {
-		const rechecked = await readJson<DaemonState>(fsImpl, paths.state);
+		const recheckedSnapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: fsImpl });
+		const rechecked = recheckedSnapshot.state;
 		const recheckedLock = await readOwnershipLock(fsImpl, paths.lock);
 		const recheckedForeignOwner = classifyForeignLiveOwner({
 			state: rechecked,
@@ -1826,7 +2098,7 @@ export async function acquireDaemonOwnership(input: {
 			})
 		)
 			return { acquired: false, attached: false, blocked: true };
-		const recheckedDecision = isLegacyParentDaemonState(rechecked) ? undefined : attachDecision(rechecked);
+		const recheckedDecision = isLegacyParentDaemonState(rechecked) ? undefined : attachDecision(recheckedSnapshot);
 		if (
 			recheckedDecision &&
 			(recheckedDecision.attached ||
@@ -1923,6 +2195,7 @@ export async function acquireDaemonOwnership(input: {
 			roots,
 			version: DAEMON_VERSION,
 			generation: DAEMON_GENERATION,
+			servingEpoch: SERVING_EPOCH,
 		} satisfies DaemonState);
 		if (
 			!(await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition })) ||
@@ -2022,17 +2295,20 @@ export async function renewDaemonHeartbeat(input: {
 				})))
 		)
 			return false;
+		const heartbeatAt = (input.now ?? Date.now)();
+		const boundState: DaemonState = {
+			...state,
+			// Preserve the source launcher PID so concurrent ensures can recognize
+			// this bound child as its successor while it is still provisional.
+			launcherPid: state.pid,
+			pid,
+			incarnation,
+			ownershipPhase: "provisional",
+			heartbeatAt,
+			servingEpoch: SERVING_EPOCH,
+		};
 		try {
-			await writeJsonAtomic(fsImpl, paths.state, {
-				...state,
-				// Preserve the source launcher PID so concurrent ensures can recognize
-				// this ready PID as its child rather than excluding it as the launcher.
-				launcherPid: state.pid,
-				pid,
-				incarnation,
-				ownershipPhase: "ready",
-				heartbeatAt: (input.now ?? Date.now)(),
-			});
+			await writeJsonAtomic(fsImpl, paths.state, boundState);
 		} catch {
 			if (expectedLock && reboundLock)
 				await rollbackOwnershipLockRebind({
@@ -2046,7 +2322,49 @@ export async function renewDaemonHeartbeat(input: {
 				});
 			return false;
 		}
-		return true;
+		const retireBoundOwnership = async (): Promise<void> => {
+			const lock = await readOwnershipLock(fsImpl, paths.lock);
+			if (!ownershipLockMatchesState(lock, boundState)) return;
+			await writeJsonAtomic(fsImpl, paths.state, {
+				...boundState,
+				ownershipPhase: "retired",
+				stoppedAt: (input.now ?? Date.now)(),
+			}).catch(() => undefined);
+			if (await transitionLockIsHeldByCaller({ fs: fsImpl, path: paths.steal, lock: transition }))
+				await unlinkOwnershipLockExactly(fsImpl, paths.lock, lock);
+		};
+		// The durable sidecar must exist and match the rebound ownership lock before
+		// any observer can see ownershipPhase:"ready". A provisional state may be
+		// fresh, but readiness waiters categorically refuse to attach to it.
+		let sidecarRenewed = false;
+		try {
+			sidecarRenewed = await renewOwnerHeartbeatSidecar({
+				settings: input.settings,
+				ownerId: input.ownerId,
+				acquisitionId,
+				fs: fsImpl,
+				now: () => heartbeatAt,
+				pid,
+				pidIncarnation: input.pidIncarnation,
+			});
+		} catch {
+			sidecarRenewed = false;
+		}
+		if (!sidecarRenewed) {
+			logger.warn(
+				"notifications: Telegram daemon initial heartbeat sidecar proof failed; retiring provisional ownership",
+			);
+			await retireBoundOwnership();
+			return false;
+		}
+		try {
+			await writeJsonAtomic(fsImpl, paths.state, { ...boundState, ownershipPhase: "ready" });
+			return true;
+		} catch {
+			logger.warn("notifications: Telegram daemon ready publication failed after sidecar proof; retiring ownership");
+			await retireBoundOwnership();
+			return false;
+		}
 	} finally {
 		await releaseDaemonTransitionLock({ fs: fsImpl, path: paths.steal, lock: transition });
 	}
@@ -2225,7 +2543,7 @@ async function bindProvisionalDaemonPid(input: {
 	}
 }
 
-/** Wait for a matching current-generation daemon to publish a ready state. */
+/** Wait for a matching compatible owner to publish a ready state. Readiness is serving-epoch gated (same-epoch cross-generation owners attach, per isCurrentCompatibleOwner); generation is inventory-only here. Mutation paths still require exact current-generation equality. */
 export async function waitForTelegramDaemonReady(input: {
 	settings: Settings;
 	ownerId?: string;
@@ -2251,12 +2569,13 @@ export async function waitForTelegramDaemonReady(input: {
 	const deadline = now() + timeoutMs;
 	const maxPolls = Math.ceil(timeoutMs / waitStepMs);
 	for (let poll = 0; poll <= maxPolls; poll++) {
-		const state = await readDaemonState(input.settings, input.fs);
+		const snapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: input.fs });
+		const state = snapshot.state;
 		if (
 			(!input.ownerId || state?.ownerId === input.ownerId) &&
 			(!input.acquisitionId || state?.acquisitionId === input.acquisitionId) &&
 			state?.ownershipPhase === "ready" &&
-			state.generation === DAEMON_GENERATION &&
+			Number.isSafeInteger(state.generation) &&
 			ownerIdentityMatches(state, input.tokenFingerprint, input.chatId) &&
 			ownerProvenanceMatches(state, pidIncarnation) &&
 			pidAlive(state.pid) &&
@@ -2270,6 +2589,7 @@ export async function waitForTelegramDaemonReady(input: {
 				chatId: input.chatId,
 				pidAlive,
 				pidIncarnation,
+				effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 			})
 		)
 			return true;
@@ -2339,7 +2659,8 @@ export async function confirmTelegramDaemonSpawn(input: {
 		sleep: input.sleep,
 	});
 	if (retired) return false;
-	const state = await readDaemonState(input.settings, input.fs);
+	const snapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: input.fs });
+	const state = snapshot.state;
 	if (
 		hasExactChildPid &&
 		isCurrentCompatibleOwner({
@@ -2349,6 +2670,7 @@ export async function confirmTelegramDaemonSpawn(input: {
 			chatId: input.chatId,
 			pidAlive: input.pidAlive ?? defaultPidAlive,
 			pidIncarnation: input.pidIncarnation ?? defaultPidIncarnation,
+			effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 		}) &&
 		(state?.ownerId !== input.spawned.acquisition.ownerId ||
 			state.acquisitionId !== input.spawned.acquisition.acquisitionId ||
@@ -2812,8 +3134,15 @@ export async function reclaimDeadDaemonOwner(input: {
  * Ensure a configured daemon owns this session root, preserving ownership safety
  * while exposing whether a #2028 generation handoff was required.
  */
-export async function ensureTelegramDaemonRunningDetailed(
-	input: { settings: Settings; cwd: string; sessionId: string },
+async function ensureTelegramDaemonRunningDetailedOnce(
+	input: {
+		settings: Settings;
+		cwd: string;
+		sessionId: string;
+		registerRoot?: boolean;
+		/** Receives each registration this ensure operation minted so the caller can fence its own later cleanup. */
+		onRegistered?: (registration: RegisterNotificationRootResult) => void;
+	},
 	deps: TelegramDaemonDeps = {},
 ): Promise<EnsureTelegramDaemonDetailedResult> {
 	const cfg = getNotificationConfig(input.settings);
@@ -2919,7 +3248,12 @@ export async function ensureTelegramDaemonRunningDetailed(
 	}
 	if (spawned.result === "attached" && spawned.reloadRequired) {
 		const previous = await readNotificationRootRegistration({ ...input, fs: deps.fs });
-		await registerNotificationRoot({ ...input, fs: deps.fs });
+		let registeredToken: string | undefined;
+		if (input.registerRoot !== false) {
+			const registered = await registerNotificationRoot({ ...input, fs: deps.fs });
+			registeredToken = registered.token;
+			input.onRegistered?.(registered);
+		}
 		const fsImpl = deps.fs ?? nodeFs;
 		const now = deps.now ?? Date.now;
 		const pidAlive = deps.pidAlive ?? defaultPidAlive;
@@ -2958,22 +3292,28 @@ export async function ensureTelegramDaemonRunningDetailed(
 					// Iteration-capped so a frozen `now` cannot spin forever.
 					const maxWaits = Math.ceil(waitBudgetMs / waitStepMs);
 					for (let waits = 0; waits <= maxWaits; waits++) {
-						const state = await readDaemonState(input.settings, fsImpl);
+						const snapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: fsImpl });
+						const state = snapshot.state;
 						const t = now();
 						if (
-							isFreshLiveOwner({
+							isCurrentCompatibleOwner({
 								state,
 								now: t,
 								tokenFingerprint: fp,
 								chatId: cfg.chatId,
 								pidAlive,
 								pidIncarnation,
+								effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 							})
 						)
 							return "attached" as const;
 						if (t >= deadline) break;
 						await sleep(waitStepMs);
 					}
+					// Keep the reservation after a failed reload so concurrent ensures do not
+					// repeatedly signal the same incompatible predecessor. Surface the failed
+					// convergence; the next ensure after cooldown expiry retries the reload.
+					return "blocked_identity" as const;
 				}
 				await writeJsonAtomic(fsImpl, reloadAttemptPath, {
 					lastReloadAt: reloadNow,
@@ -2991,11 +3331,23 @@ export async function ensureTelegramDaemonRunningDetailed(
 			}),
 		);
 		if (reloadResult === "attached") return "attached";
+		if (reloadResult === "blocked_identity") {
+			await restoreNotificationRootRegistration({
+				settings: input.settings,
+				sessionId: input.sessionId,
+				registeredRoot: root,
+				registeredToken,
+				previous,
+				fs: deps.fs,
+			});
+			return "blocked_identity";
+		}
 		if (reloadResult !== "reloaded") {
 			await restoreNotificationRootRegistration({
 				settings: input.settings,
 				sessionId: input.sessionId,
 				registeredRoot: root,
+				registeredToken,
 				previous,
 				fs: deps.fs,
 			});
@@ -3004,7 +3356,10 @@ export async function ensureTelegramDaemonRunningDetailed(
 		return "reloaded";
 	}
 	if (spawned.result !== "owner_spawned") {
-		await registerNotificationRoot({ ...input, fs: deps.fs });
+		if (input.registerRoot !== false) {
+			const registered = await registerNotificationRoot({ ...input, fs: deps.fs });
+			input.onRegistered?.(registered);
+		}
 		return "attached";
 	}
 	if (
@@ -3023,10 +3378,52 @@ export async function ensureTelegramDaemonRunningDetailed(
 			timeoutMs: deps.readinessTimeoutMs,
 		})
 	) {
-		await registerNotificationRoot({ ...input, fs: deps.fs });
+		if (input.registerRoot !== false) {
+			const registered = await registerNotificationRoot({ ...input, fs: deps.fs });
+			input.onRegistered?.(registered);
+		}
 		return "spawned";
 	}
 	throw new Error("Telegram daemon did not become ready after spawning");
+}
+
+/**
+ * Ensure a configured daemon owns this session root, preserving ownership safety
+ * while exposing whether a #2028 generation handoff was required.
+ */
+export async function ensureTelegramDaemonRunningDetailed(
+	input: {
+		settings: Settings;
+		cwd: string;
+		sessionId: string;
+		registerRoot?: boolean;
+		/** Receives each registration this ensure operation minted so the caller can fence its own later cleanup. */
+		onRegistered?: (registration: RegisterNotificationRootResult) => void;
+	},
+	deps: TelegramDaemonDeps = {},
+): Promise<EnsureTelegramDaemonDetailedResult> {
+	const result = await ensureTelegramDaemonRunningDetailedOnce(input, deps);
+	if (input.registerRoot === false || (result !== "attached" && result !== "spawned")) return result;
+
+	const cfg = getNotificationConfig(input.settings);
+	if (!isTelegramConfigured(cfg)) return "disabled";
+	const ownerIsCurrent = async (): Promise<boolean> => {
+		const snapshot = await readOwnerFreshnessSnapshot({ settings: input.settings, fs: deps.fs });
+		return isCurrentCompatibleOwner({
+			state: snapshot.state,
+			now: (deps.now ?? Date.now)(),
+			tokenFingerprint: tokenFingerprint(cfg.botToken),
+			chatId: cfg.chatId,
+			pidAlive: deps.pidAlive ?? defaultPidAlive,
+			pidIncarnation: deps.pidIncarnation ?? defaultPidIncarnation,
+			effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
+		});
+	};
+	if (await ownerIsCurrent()) return result;
+
+	const converged = await ensureTelegramDaemonRunningDetailedOnce({ ...input, registerRoot: false }, deps);
+	if (converged === "disabled" || converged === "blocked_identity") return converged;
+	return (await ownerIsCurrent()) ? converged : "blocked_identity";
 }
 
 /**
@@ -3196,7 +3593,7 @@ export type TelegramPollResult =
 export interface TelegramUpdatePollerOptions {
 	botApi: BotApi;
 	runtime: NotificationOperatorRuntime;
-	backoff: OperatorBackoffPolicy;
+	backoff: { next(): number; reset(): void };
 	processUpdate: (update: unknown) => Promise<TelegramUpdateOutcome>;
 	health?: TelegramPollHealth;
 }
@@ -3255,6 +3652,20 @@ export class TelegramPollHealth {
 			previousStatus,
 			suppressedCount,
 		});
+	}
+}
+
+class JitteredPollConflictBackoff {
+	#currentMs = 0;
+
+	next(): number {
+		if (this.#currentMs === 0) this.#currentMs = POLL_BACKOFF_MS;
+		else this.#currentMs = Math.min(this.#currentMs * (1.5 + Math.random() * 0.5), 10_000);
+		return this.#currentMs;
+	}
+
+	reset(): void {
+		this.#currentMs = 0;
 	}
 }
 
@@ -3518,6 +3929,35 @@ type SelectedAckOutcome =
 	| { status: "unknown"; reason: "transport_ambiguous" | "shutdown" };
 type BtwQueuedDeliveryOutcome = "accepted" | "not_delivered" | "uncertain" | "stale" | "partial_accepted";
 
+type BotApiCallOutcome =
+	| { kind: "accepted" }
+	| { kind: "rejected" }
+	| { kind: "retryable"; retryAfterMs: number }
+	| { kind: "unknown" };
+
+interface BotApiCallResult {
+	response: unknown;
+	outcome: BotApiCallOutcome;
+}
+
+function classifyBotApiCallOutcome(response: unknown, cooldownSuppressed = false): BotApiCallOutcome {
+	if (cooldownSuppressed) return { kind: "retryable", retryAfterMs: 0 };
+	if (!response || typeof response !== "object") return { kind: "unknown" };
+	const body = response as {
+		ok?: unknown;
+		error_code?: unknown;
+		parameters?: { retry_after?: unknown };
+	};
+	if (body.ok === false && body.error_code === 429) {
+		const retryAfter = body.parameters?.retry_after;
+		const seconds = typeof retryAfter === "number" && Number.isFinite(retryAfter) ? retryAfter : 30;
+		return { kind: "retryable", retryAfterMs: Math.min(3600, Math.max(1, seconds)) * 1_000 };
+	}
+	if (body.ok === true) return { kind: "accepted" };
+	if (body.ok === false) return { kind: "rejected" };
+	return { kind: "unknown" };
+}
+
 interface BtwQueuedDelivery {
 	pending: PendingBtwTurn;
 	body: Record<string, unknown>;
@@ -3658,7 +4098,7 @@ export class TelegramNotificationDaemon {
 
 	private readonly runtime: NotificationOperatorRuntime;
 	private readonly sessionRouter: OperatorEventRouter<SessionSocket>;
-	private readonly pollConflictBackoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 5_000 });
+	private readonly pollConflictBackoff = new JitteredPollConflictBackoff();
 	private readonly loopBackoff = new OperatorBackoffPolicy({ initialMs: 250, maxMs: 4_000 });
 	private running = false;
 	/** Once set, a concurrent startup await can never restore a running daemon. */
@@ -3698,6 +4138,9 @@ export class TelegramNotificationDaemon {
 	private readonly pool: RateLimitPool<TelegramQueuePayload>;
 	private readonly poller: TelegramUpdatePoller;
 	private readonly dispatchState = new TelegramEventDispatchState();
+	/** Bot-wide flood-control window; inbound polling remains eligible during it. */
+	private botCooldownUntil = 0;
+	private warnedBotCooldownUntil = 0;
 	/** Original markdown of rich messages we sent (chat+message_id), for restoring reply context on inbound replies. */
 	private readonly replyStore: ReplySentStore;
 	/** Per-session debounce + monotonic draft-id state for opt-in draft streaming. */
@@ -4116,8 +4559,8 @@ export class TelegramNotificationDaemon {
 
 	private async refreshBotIdentity(): Promise<void> {
 		try {
-			const response = (await this.botApi.call("getMe", {})) as { result?: { username?: unknown } };
-			const username = response.result?.username;
+			const response = (await this.botApi.call("getMe", {})) as { result?: { username?: unknown } } | undefined;
+			const username = response?.result?.username;
 			this.botUsername =
 				typeof username === "string" && username.trim() ? username.trim().replace(/^@/, "") : undefined;
 		} catch {
@@ -4128,6 +4571,47 @@ export class TelegramNotificationDaemon {
 	/** Map a lifecycle response/error to a user-facing message (G010 surfacing). */
 	private formatLifecycleResponse(r: SessionLifecycleResponse, verb: LifecycleCommandVerb): string {
 		return formatLifecycleOutcome(r, verb);
+	}
+
+	private async callBotApi(
+		rawBotApi: BotApi,
+		method: string,
+		body: unknown,
+		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
+	): Promise<BotApiCallResult> {
+		const now = this.opts.now?.() ?? Date.now();
+		if (method !== "getUpdates" && now < this.botCooldownUntil) {
+			if (this.warnedBotCooldownUntil !== this.botCooldownUntil) {
+				this.warnedBotCooldownUntil = this.botCooldownUntil;
+				logger.warn("notifications: Telegram Bot API flood-control cooldown suppressing outbound calls");
+			}
+			const outcome = classifyBotApiCallOutcome(undefined, true);
+			return { response: undefined, outcome };
+		}
+		const response = await this.effects.call(rawBotApi, method, body, callOpts);
+		const outcome = classifyBotApiCallOutcome(response);
+		if (outcome.kind === "retryable")
+			this.botCooldownUntil = Math.max(
+				this.botCooldownUntil,
+				(this.opts.now?.() ?? Date.now()) + outcome.retryAfterMs,
+			);
+		return { response, outcome };
+	}
+
+	private readonly callBotApiClassified: (
+		method: string,
+		body: unknown,
+		callOpts?: { signal?: AbortSignal; noRetry?: boolean },
+	) => Promise<BotApiCallResult>;
+
+	private botApiWithOutcomeCollector(outcomes: BotApiCallOutcome[]): BotApi {
+		return {
+			call: async (method, body, callOpts) => {
+				const result = await this.callBotApiClassified(method, body, callOpts);
+				outcomes.push(result.outcome);
+				return result.response;
+			},
+		};
 	}
 
 	constructor(private readonly opts: TelegramDaemonOptions) {
@@ -4142,8 +4626,9 @@ export class TelegramNotificationDaemon {
 				fetchImpl: opts.fetchImpl,
 				setTimeoutImpl: opts.setTimeoutImpl,
 			});
+		this.callBotApiClassified = (method, body, callOpts) => this.callBotApi(rawBotApi, method, body, callOpts);
 		this.botApi = {
-			call: (method, body, callOpts) => this.effects.call(rawBotApi, method, body, callOpts),
+			call: async (method, body, callOpts) => (await this.callBotApiClassified(method, body, callOpts)).response,
 		};
 		this.runtime = new NotificationOperatorRuntime({
 			now: opts.now,
@@ -5868,13 +6353,20 @@ export class TelegramNotificationDaemon {
 		let acceptedTopicId: string | undefined;
 		let acceptedTopicCompensated = false;
 		let acceptedTopicDeleteAttempted = false;
+		let creationSuppressed = false;
 		try {
 			const rec = await this.topics.getOrCreateTopic(
 				sessionId,
 				async () => {
 					if (capturedCreationLease && !this.#leaseTokenAllows(capturedCreationLease))
 						throw new Error("topic authority was revoked during creation");
-					const res = await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name });
+					const res = (await this.botApi.call("createForumTopic", { chat_id: this.opts.chatId, name })) as
+						| { result?: { message_thread_id?: unknown } }
+						| undefined;
+					if (res === undefined) {
+						creationSuppressed = true;
+						return undefined;
+					}
 					if (isThreadedModeCapabilityRefusal(res)) throw new ThreadedModeCapabilityRefusal();
 					const response = res as {
 						ok?: unknown;
@@ -5958,7 +6450,7 @@ export class TelegramNotificationDaemon {
 			}
 			return rec.topicId;
 		} catch (err) {
-			if (err instanceof ThreadedModeCapabilityRefusal) return undefined;
+			if (creationSuppressed || err instanceof ThreadedModeCapabilityRefusal) return undefined;
 			if (
 				acceptedTopicId &&
 				!acceptedTopicCompensated &&
@@ -6496,14 +6988,32 @@ export class TelegramNotificationDaemon {
 					continue;
 				}
 				try {
-					const response = await this.botApi.call("sendMessage", btwDelivery.body, {
+					const { outcome } = await this.callBotApiClassified("sendMessage", btwDelivery.body, {
 						noRetry: true,
 						signal: btwDelivery.signal,
 					});
-					const accepted = response && typeof response === "object" && (response as { ok?: unknown }).ok === true;
-					const rejected = response && typeof response === "object" && (response as { ok?: unknown }).ok === false;
-					btwDelivery.finish(accepted ? "accepted" : rejected ? "not_delivered" : "uncertain");
-					this.pool.settle(item.itemId!, accepted ? "accepted" : rejected ? "rejected" : "ambiguous");
+					if (outcome.kind === "retryable") {
+						this.submitPool({
+							sessionId: item.sessionId,
+							lane: item.lane,
+							coalesceKey: item.coalesceKey,
+							deadlineAt: item.deadlineAt,
+							payload: item.payload,
+						});
+						this.pool.settle(item.itemId!, "ambiguous");
+						continue;
+					}
+					btwDelivery.finish(
+						outcome.kind === "accepted"
+							? "accepted"
+							: outcome.kind === "rejected"
+								? "not_delivered"
+								: "uncertain",
+					);
+					this.pool.settle(
+						item.itemId!,
+						outcome.kind === "accepted" ? "accepted" : outcome.kind === "rejected" ? "rejected" : "ambiguous",
+					);
 				} catch {
 					btwDelivery.finish("uncertain");
 					this.pool.settle(item.itemId!, "ambiguous");
@@ -6549,7 +7059,7 @@ export class TelegramNotificationDaemon {
 						this.pool.settle(item.itemId!, "rejected");
 						continue;
 					}
-					const response = (await this.botApi.call(
+					const { response, outcome } = await this.callBotApiClassified(
 						"sendMessage",
 						{
 							chat_id: this.opts.chatId,
@@ -6557,9 +7067,28 @@ export class TelegramNotificationDaemon {
 							text: "Selected!",
 						},
 						{ signal: controller.signal, noRetry: true },
-					)) as { ok?: unknown; result?: { message_id?: unknown } };
-					const messageId = response.result?.message_id;
-					const delivered = response.ok === true && typeof messageId === "number";
+					);
+					if (outcome.kind === "retryable") {
+						this.pool.settle(item.itemId!, "ambiguous");
+						if (this.effects.stopping) {
+							this.finishSelectedAck(selectedAck, { status: "unknown", reason: "shutdown" });
+						} else {
+							const retry = this.pool.submit({
+								sessionId: item.sessionId,
+								lane: item.lane,
+								coalesceKey: item.coalesceKey,
+								deadlineAt: item.deadlineAt,
+								payload: item.payload,
+							});
+							selectedAck.itemId = retry.itemId;
+							selectedAck.state = "queued";
+							selectedAck.controller = undefined;
+						}
+						continue;
+					}
+					const typedResponse = response as { ok?: unknown; result?: { message_id?: unknown } } | undefined;
+					const messageId = typedResponse?.result?.message_id;
+					const delivered = typedResponse?.ok === true && typeof messageId === "number";
 					this.finishSelectedAck(
 						selectedAck,
 						delivered ? { status: "delivered", messageId } : { status: "failed", reason: "telegram_rejected" },
@@ -6605,6 +7134,8 @@ export class TelegramNotificationDaemon {
 				this.pool.settle(item.itemId!, "removed");
 				continue;
 			}
+			const itemOutcomes: BotApiCallOutcome[] = [];
+			const itemBotApi = this.botApiWithOutcomeCollector(itemOutcomes);
 			let disposition: "accepted" | "ambiguous" | "rejected" = "accepted";
 			try {
 				// Draft streaming (opt-in, off by default): stream a live turn frame as a
@@ -6643,7 +7174,7 @@ export class TelegramNotificationDaemon {
 				}
 				if (send.method === "sendPhoto" && send.photoBase64) {
 					// Real photo upload (the default botApi multiparts base64 -> file).
-					await this.botApi.call("sendPhoto", {
+					await itemBotApi.call("sendPhoto", {
 						chat_id: this.opts.chatId,
 						...threadField,
 						photo: send.photoBase64,
@@ -6652,7 +7183,7 @@ export class TelegramNotificationDaemon {
 						parse_mode: TELEGRAM_PARSE_MODE,
 					});
 				} else if (send.method === "sendDocument" && send.documentBase64) {
-					await this.botApi.call("sendDocument", {
+					await itemBotApi.call("sendDocument", {
 						chat_id: this.opts.chatId,
 						...threadField,
 						document: send.documentBase64,
@@ -6682,7 +7213,7 @@ export class TelegramNotificationDaemon {
 								(topicLease && !this.topicLeaseIsCurrent(topicLease))
 							)
 								return;
-							await this.botApi.call("sendMessage", {
+							await itemBotApi.call("sendMessage", {
 								chat_id: this.opts.chatId,
 								...threadField,
 								text: chunks[0]!,
@@ -6712,7 +7243,7 @@ export class TelegramNotificationDaemon {
 							}
 						};
 						const richMessageId = await deliverRichWithFallback(
-							this.botApi,
+							itemBotApi,
 							{ chat_id: this.opts.chatId, ...threadField },
 							send,
 							AbortSignal.any([this.#deliveryAbort.signal, AbortSignal.timeout(30_000)]),
@@ -6746,13 +7277,13 @@ export class TelegramNotificationDaemon {
 									(topicLease && !this.topicLeaseIsCurrent(topicLease))
 								)
 									return;
-								const res = (await this.botApi.call("editMessageText", {
+								const res = (await itemBotApi.call("editMessageText", {
 									chat_id: this.opts.chatId,
 									message_id: existingId,
 									text: chunks[0],
 									parse_mode: TELEGRAM_PARSE_MODE,
 								})) as { ok?: boolean; description?: string } | null;
-								edited = res?.ok !== false || /not modified/i.test(String(res?.description ?? ""));
+								edited = res?.ok === true || /not modified/i.test(String(res?.description ?? ""));
 							} catch {
 								edited = false;
 							}
@@ -6762,7 +7293,7 @@ export class TelegramNotificationDaemon {
 								(!socketLease || this.#leaseTokenAllows(socketLease)) &&
 								(!topicLease || this.topicLeaseIsCurrent(topicLease))
 							) {
-								const res = (await this.botApi.call("sendMessage", {
+								const res = (await itemBotApi.call("sendMessage", {
 									chat_id: this.opts.chatId,
 									...threadField,
 									text: chunks[0]!,
@@ -6778,7 +7309,7 @@ export class TelegramNotificationDaemon {
 								(topicLease && !this.topicLeaseIsCurrent(topicLease))
 							)
 								return;
-							const res = (await this.botApi.call("sendMessage", {
+							const res = (await itemBotApi.call("sendMessage", {
 								chat_id: this.opts.chatId,
 								...threadField,
 								text: chunks[0]!,
@@ -6826,6 +7357,23 @@ export class TelegramNotificationDaemon {
 				disposition = "ambiguous";
 				if (item.payload.toolActivity?.phase === "started") this.toolActivityAmbiguous = true;
 			} finally {
+				const retryable = itemOutcomes.some(outcome => outcome.kind === "retryable");
+				const accepted = itemOutcomes.some(outcome => outcome.kind === "accepted");
+				const rejected = itemOutcomes.some(outcome => outcome.kind === "rejected");
+				if (retryable) {
+					if (!accepted) {
+						this.submitPool({
+							sessionId: item.sessionId,
+							lane: item.lane,
+							coalesceKey: item.coalesceKey,
+							deadlineAt: item.deadlineAt,
+							payload: item.payload,
+						});
+					}
+					disposition = "ambiguous";
+				} else if (disposition === "accepted" && !accepted && rejected) {
+					disposition = "rejected";
+				}
 				this.pool.settle(item.itemId!, disposition);
 				// A terminal tool frame owns the end of this coalescing key even when both
 				// edit and fallback delivery fail. Retaining the old message id would leak
@@ -6920,6 +7468,7 @@ export class TelegramNotificationDaemon {
 				ok?: unknown;
 				result?: { type?: unknown };
 			};
+			if (res === undefined) return "indeterminate";
 			if (res?.ok !== true) {
 				logger.warn("notifications: getChat privacy check indeterminate (non-success response)");
 				return "indeterminate";
@@ -6982,12 +7531,10 @@ export class TelegramNotificationDaemon {
 		this.runtime.stopInterval("telegram-flush");
 	}
 	private async renewOwnershipHeartbeat(): Promise<boolean> {
-		return renewDaemonHeartbeat({
+		return renewOwnerHeartbeatSidecar({
 			settings: this.opts.settings,
 			ownerId: this.opts.ownerId,
 			acquisitionId: this.opts.ownerId,
-			tokenFingerprint: tokenFingerprint(this.opts.botToken),
-			chatId: this.opts.chatId,
 			fs: this.fsImpl,
 			now: this.opts.now,
 			pid: this.opts.pid ?? process.pid,
@@ -7145,7 +7692,7 @@ export class TelegramNotificationDaemon {
 				parse_mode: TELEGRAM_PARSE_MODE,
 				reply_markup: { inline_keyboard },
 			});
-			if (response && typeof response === "object" && (response as { ok?: unknown }).ok === false) {
+			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
 				for (const alias of aliases) this.#modelChoiceAliases.delete(alias);
 				logger.warn("notifications: failed to send model selection keyboard");
 				return false;
@@ -7726,7 +8273,7 @@ export class TelegramNotificationDaemon {
 			// returns the last chunk's message_id (the reply-routable message).
 			const sendHtmlChunks = async (): Promise<number | undefined> => {
 				const chunks = splitTelegramHtml(rendered.text);
-				let result: { result?: { message_id?: number } } = {};
+				let result: { result?: { message_id?: number } } | undefined;
 				for (let i = 0; i < chunks.length; i++) {
 					if (!this.#leaseTokenAllows(socketLease) || (topicLease && !this.topicLeaseIsCurrent(topicLease)))
 						return undefined;
@@ -7736,9 +8283,10 @@ export class TelegramNotificationDaemon {
 						text: chunks[i]!,
 						parse_mode: TELEGRAM_PARSE_MODE,
 						...(i === chunks.length - 1 && inline_keyboard.length ? { reply_markup: { inline_keyboard } } : {}),
-					})) as { result?: { message_id?: number } };
+					})) as { result?: { message_id?: number } } | undefined;
+					if (result === undefined) return undefined;
 				}
-				return result.result?.message_id;
+				return result?.result?.message_id;
 			};
 			const kind = msg.kind === "idle" ? "idle" : "ask";
 			if (this.opts.rich?.enabled !== false) {
@@ -8582,12 +9130,10 @@ export class TelegramNotificationDaemon {
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
 				if (
-					!(await renewDaemonHeartbeat({
+					!(await renewOwnerHeartbeatSidecar({
 						settings: this.opts.settings,
 						ownerId: this.opts.ownerId,
 						acquisitionId: this.opts.ownerId,
-						tokenFingerprint: tokenFingerprint(this.opts.botToken),
-						chatId: this.opts.chatId,
 						fs: this.fsImpl,
 						now: this.opts.now,
 						pid: this.opts.pid ?? process.pid,
@@ -8629,6 +9175,11 @@ export class TelegramNotificationDaemon {
 				await this.runtime.sleep(10);
 			}
 		} finally {
+			this.running = false;
+			this.runtime.stop();
+			this.stopOwnershipHeartbeatTimer();
+			const heartbeatJoined = await this.runtime.joinExclusive("telegram-owner-heartbeat", BTW_SHUTDOWN_JOIN_MS);
+			if (!heartbeatJoined) logger.warn("heartbeat join timed out; retaining daemon ownership (release aborted)");
 			// A contender must not mutate durable owner state while unwinding startup.
 			if (ownershipProved) {
 				let toolShutdownError: unknown;
@@ -8644,8 +9195,6 @@ export class TelegramNotificationDaemon {
 					if (toolShutdownError) throw toolShutdownError;
 					await this.#drainBtwTurns();
 					await this.toolTerminalizationChain;
-					this.runtime.stop();
-					this.stopOwnershipHeartbeatTimer();
 					this.stopFlushTimer();
 					this.stopScanTimer();
 					this.stopTypingTimer();
@@ -8670,7 +9219,7 @@ export class TelegramNotificationDaemon {
 					deadline.promise,
 				]);
 				clearTimeout(deadlineTimer);
-				const quiesced = completed && (await this.effects.join(BTW_SHUTDOWN_JOIN_MS));
+				const quiesced = completed && heartbeatJoined && (await this.effects.join(BTW_SHUTDOWN_JOIN_MS));
 				if (!quiesced || !persisted) {
 					logger.warn("notifications: shutdown was not durably quiesced; retaining daemon ownership");
 				} else {

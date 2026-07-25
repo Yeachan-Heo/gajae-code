@@ -28,7 +28,7 @@ const model = (provider: string, id: string, minLevel = Effort.Low): Model =>
 	}) as Model;
 
 const codexModel = model("openai-codex", "gpt-5.5", Effort.Low);
-const anthropicModel = model("anthropic", "claude-opus-4-8");
+const anthropicModel = model("anthropic", "claude-opus-5");
 const minimaxModel = model("minimax-code", "minimax-v3");
 const noSuffixModel = model("provider-a", "default");
 
@@ -38,7 +38,7 @@ const builtinCodexModels = [
 	model("openai-codex", "gpt-5.6-sol", Effort.Low),
 ];
 const builtinComboModels = [
-	model("anthropic", "claude-opus-4-8", Effort.Low),
+	model("anthropic", "claude-opus-5", Effort.Low),
 	model("anthropic", "claude-fable-5", Effort.Low),
 	model("anthropic", "claude-sonnet-5"),
 	model("opencode-go", "deepseek-v4-pro"),
@@ -64,7 +64,7 @@ const codexEco: ModelProfileDefinition = {
 const combo: ModelProfileDefinition = {
 	name: "opus-codex",
 	requiredProviders: ["anthropic", "openai-codex"],
-	modelMapping: { default: "anthropic/claude-opus-4-8:xhigh", executor: "openai-codex/gpt-5.5:low" },
+	modelMapping: { default: "anthropic/claude-opus-5:xhigh", executor: "openai-codex/gpt-5.5:low" },
 	source: "builtin",
 };
 const comboOpencode: ModelProfileDefinition = {

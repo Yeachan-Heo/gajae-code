@@ -74,7 +74,7 @@ export class NotificationOperatorRuntime {
 	#stopRequested = false;
 	#activeAbort: AbortController | undefined;
 	#intervals = new Map<string, OperatorIntervalHandle>();
-	#exclusive = new Set<string>();
+	#exclusive = new Map<string, Promise<void>>();
 
 	#deps: NotificationOperatorTimerDeps;
 
@@ -130,7 +130,7 @@ export class NotificationOperatorRuntime {
 
 	stopInterval(name: string): void {
 		const timer = this.#intervals.get(name);
-		if (!timer) return;
+		if (timer === undefined) return;
 		const clearIntervalImpl = this.#deps.clearIntervalImpl ?? clearInterval;
 		clearIntervalImpl(timer);
 		this.#intervals.delete(name);
@@ -142,12 +142,38 @@ export class NotificationOperatorRuntime {
 
 	async runExclusive(name: string, fn: () => Promise<void>): Promise<void> {
 		if (this.#exclusive.has(name)) return;
-		this.#exclusive.add(name);
+		const completion = Promise.withResolvers<void>();
+		this.#exclusive.set(name, completion.promise);
 		try {
-			await fn();
+			try {
+				void fn().then(completion.resolve, completion.reject);
+			} catch (error) {
+				completion.reject(error);
+			}
+			await completion.promise;
 		} finally {
-			this.#exclusive.delete(name);
+			if (this.#exclusive.get(name) === completion.promise) this.#exclusive.delete(name);
 		}
+	}
+
+	async joinExclusive(name: string, timeoutMs: number): Promise<boolean> {
+		const completion = this.#exclusive.get(name);
+		if (!completion) return true;
+		const setTimeoutImpl = this.#deps.setTimeoutImpl ?? setTimeout;
+		const clearTimeoutImpl = this.#deps.clearTimeoutImpl ?? clearTimeout;
+		const { promise, resolve } = Promise.withResolvers<boolean>();
+		const timer = setTimeoutImpl(() => resolve(false), timeoutMs);
+		void completion.then(
+			() => {
+				clearTimeoutImpl(timer);
+				resolve(true);
+			},
+			() => {
+				clearTimeoutImpl(timer);
+				resolve(true);
+			},
+		);
+		return await promise;
 	}
 
 	sleep(ms: number, signal?: AbortSignal): Promise<void> {

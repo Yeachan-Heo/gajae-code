@@ -102,8 +102,10 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 		const before = liveOwnedProcessCount();
 		const tmp = `/tmp/gjc-process-lifecycle-${process.pid}-${Date.now()}`;
 		const owner = spawnOwnedProcess(
-			["sh", "-c", `trap 'echo term >> ${tmp}; exit 0' TERM; echo up > ${tmp}; while :; do sleep 1; done`],
-			{ name: "redteam-concurrent-dispose", gracefulMs: 500 },
+			// `sh` runs a TERM trap only after the current foreground command returns, so the
+			// polling interval must stay well under `gracefulMs` or SIGKILL beats the handler.
+			["sh", "-c", `trap 'echo term >> ${tmp}; exit 0' TERM; echo up > ${tmp}; while :; do sleep 0.05; done`],
+			{ name: "redteam-concurrent-dispose", gracefulMs: 2_000 },
 		);
 		try {
 			await waitForAsync(() => fileContains(tmp, "up"), 2_000, "child readiness marker");
@@ -118,6 +120,14 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 			const exit = await owner.awaitExit({ timeoutMs: 2_000 });
 			expect(exit.exited).toBe(true);
 			await waitFor(() => liveOwnedProcessCount() === before, 2_000, "live count baseline after concurrent dispose");
+			// The child's TERM trap appends the marker asynchronously, so awaitExit can
+			// return before that write lands under shard load. Poll for the single
+			// terminating signal instead of sampling the file once.
+			await waitForAsync(
+				async () => (await Bun.file(tmp).text()).split("\n").filter(line => line === "term").length === 1,
+				2_000,
+				"single term marker after concurrent dispose",
+			);
 			const marker = await Bun.file(tmp).text();
 			expect(marker.split("\n").filter(line => line === "term")).toHaveLength(1);
 		} finally {

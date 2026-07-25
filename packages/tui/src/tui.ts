@@ -38,6 +38,15 @@ const SEGMENT_RESET = "\x1b[0m";
  * diffing so `#previousLines` mirrors what was actually written.
  */
 const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
+const MOUSE_SELECTION_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function stripTerminalControls(text: string): string {
+	return Bun.stripANSI(text)
+		.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/gu, "")
+		.replace(/\x1b[P_^X][\s\S]*?\x1b\\/gu, "")
+		.replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])/gu, "")
+		.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/gu, "");
+}
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
@@ -46,7 +55,7 @@ type InputListener = (data: string) => InputListenerResult;
  * Component interface - all components must implement this
  */
 export type MouseEvent = {
-	kind: "wheel" | "click";
+	kind: "wheel" | "click" | "drag" | "release";
 	direction?: -1 | 1;
 	button?: 0;
 	/** Terminal cell coordinates, one-based. */
@@ -66,7 +75,12 @@ type OverlayMouseBounds = {
 	termHeight: number;
 };
 
-/** Parse xterm SGR mouse reports. Drag and button-release reports are ignored. */
+type MouseSelectionPoint = {
+	line: number;
+	column: number;
+};
+
+/** Parse xterm SGR mouse reports for wheel, left-click, drag, and release events. */
 export function parseSgrMouseEvent(data: string): MouseEvent | undefined {
 	const match = data.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/);
 	if (!match) return undefined;
@@ -76,11 +90,17 @@ export function parseSgrMouseEvent(data: string): MouseEvent | undefined {
 	const terminator = match[4];
 	if (![button, x, y].every(Number.isSafeInteger) || x < 1 || y < 1) return undefined;
 
-	if (button & 32 || terminator === "m") return undefined;
-	if (button === 64) return { kind: "wheel", direction: -1, x, y };
-	if (button === 65) return { kind: "wheel", direction: 1, x, y };
-	if (button === 0) return { kind: "click", button, x, y };
-	return undefined;
+	const baseButton = button & 3;
+	if (button & 64) {
+		if (terminator !== "M") return undefined;
+		if (baseButton === 0) return { kind: "wheel", direction: -1, x, y };
+		if (baseButton === 1) return { kind: "wheel", direction: 1, x, y };
+		return undefined;
+	}
+	if (baseButton !== 0) return undefined;
+	if (terminator === "m") return { kind: "release", button: 0, x, y };
+	if (button & 32) return { kind: "drag", button: 0, x, y };
+	return { kind: "click", button: 0, x, y };
 }
 
 export interface Component {
@@ -671,6 +691,9 @@ export class TUI extends Container {
 	#terminalUnavailable = false;
 	#bottomPinnedComponent: Component | null = null;
 	#pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
+	#mouseSelectionStart: MouseSelectionPoint | null = null;
+	#mouseSelectionEnd: MouseSelectionPoint | null = null;
+	#mouseSelectionDragged = false;
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -720,7 +743,10 @@ export class TUI extends Container {
 	constructor(
 		terminal: Terminal,
 		showHardwareCursor?: boolean,
-		private readonly options: { enableMouse?: boolean } = {},
+		private readonly options: {
+			enableMouse?: boolean;
+			copySelection?: (text: string) => void | Promise<void>;
+		} = {},
 	) {
 		super();
 		this.terminal = terminal;
@@ -1491,8 +1517,11 @@ export class TUI extends Container {
 		if (mouse) {
 			// Coordinates outside the current terminal cannot name a visible cell.
 			if (mouse.x > this.terminal.columns || mouse.y > this.terminal.rows) return;
-			if (mouse.kind === "wheel") this.scrollViewportPages(mouse.direction!);
-			else {
+			if (mouse.kind === "wheel") {
+				this.#clearMouseSelection();
+				this.scrollViewportPages(mouse.direction!);
+			} else if (mouse.kind === "click") {
+				this.#beginMouseSelection(mouse);
 				const focusedOverlay = this.overlayStack.find(o => o.component === this.#focusedComponent);
 				if (focusedOverlay) {
 					if (!this.#isOverlayVisible(focusedOverlay)) {
@@ -1518,6 +1547,10 @@ export class TUI extends Container {
 						localY: mouse.y - bounds.row,
 					});
 				} else this.#focusedComponent?.handleMouse?.(mouse);
+			} else if (mouse.kind === "drag") {
+				this.#updateMouseSelection(mouse);
+			} else {
+				this.#finishMouseSelection(mouse);
 			}
 			this.requestRender(false, "mouse");
 			return;
@@ -1560,6 +1593,124 @@ export class TUI extends Container {
 			this.#focusedComponent.handleInput(data);
 			this.requestRender(false, "input");
 		}
+	}
+
+	#mouseSelectionPoint(mouse: MouseEvent): MouseSelectionPoint {
+		return {
+			line: this.#viewportTopRow + mouse.y - 1,
+			column: mouse.x - 1,
+		};
+	}
+
+	#beginMouseSelection(mouse: MouseEvent): void {
+		if (!this.options.copySelection) return;
+		const point = this.#mouseSelectionPoint(mouse);
+		this.#mouseSelectionStart = point;
+		this.#mouseSelectionEnd = point;
+		this.#mouseSelectionDragged = false;
+	}
+
+	#updateMouseSelection(mouse: MouseEvent): void {
+		if (this.#mouseSelectionStart === null) return;
+		this.#mouseSelectionEnd = this.#mouseSelectionPoint(mouse);
+		this.#mouseSelectionDragged = true;
+	}
+
+	#finishMouseSelection(mouse: MouseEvent): void {
+		if (this.#mouseSelectionStart === null) return;
+		this.#mouseSelectionEnd = this.#mouseSelectionPoint(mouse);
+		if (!this.#mouseSelectionDragged || !this.options.copySelection) {
+			this.#clearMouseSelection();
+			return;
+		}
+		const text = this.#extractMouseSelection();
+		if (!text) {
+			this.#clearMouseSelection();
+			return;
+		}
+		try {
+			const result = this.options.copySelection(text);
+			if (result) void result.catch(() => {});
+		} catch {
+			// Clipboard failures are reported by the host callback and must not break terminal input.
+		}
+	}
+
+	#clearMouseSelection(): void {
+		this.#mouseSelectionStart = null;
+		this.#mouseSelectionEnd = null;
+		this.#mouseSelectionDragged = false;
+	}
+
+	#orderedMouseSelection(): { start: MouseSelectionPoint; end: MouseSelectionPoint } | null {
+		const start = this.#mouseSelectionStart;
+		const end = this.#mouseSelectionEnd;
+		if (start === null || end === null) return null;
+		if (start.line < end.line || (start.line === end.line && start.column <= end.column)) return { start, end };
+		return { start: end, end: start };
+	}
+
+	#mouseSelectionColumns(line: number, text: string): { start: number; end: number } | null {
+		const selection = this.#orderedMouseSelection();
+		if (selection === null || line < selection.start.line || line > selection.end.line) return null;
+		const lineWidth = visibleWidth(text);
+		let start = line === selection.start.line ? selection.start.column : 0;
+		let end = line === selection.end.line ? selection.end.column + 1 : lineWidth;
+		start = Math.max(0, Math.min(lineWidth, start));
+		end = Math.max(0, Math.min(lineWidth, end));
+
+		let column = 0;
+		for (const part of MOUSE_SELECTION_SEGMENTER.segment(text)) {
+			const next = column + Math.max(1, visibleWidth(part.segment));
+			if (column < start && start < next) start = column;
+			if (column < end && end < next) end = next;
+			column = next;
+		}
+		return { start, end };
+	}
+
+	#extractMouseSelection(): string {
+		const selection = this.#orderedMouseSelection();
+		if (selection === null) return "";
+		const selected: string[] = [];
+		for (let lineIndex = selection.start.line; lineIndex <= selection.end.line; lineIndex++) {
+			const line = this.#previousLines[lineIndex];
+			if (line === undefined || TERMINAL.isImageLine(line)) {
+				selected.push("");
+				continue;
+			}
+			const plain = stripTerminalControls(line);
+			const columns = this.#mouseSelectionColumns(lineIndex, plain);
+			if (columns === null || columns.end <= columns.start) {
+				selected.push("");
+				continue;
+			}
+			selected.push(sliceByColumn(plain, columns.start, columns.end - columns.start, false));
+		}
+		return selected.join("\n");
+	}
+
+	#applyMouseSelection(lines: string[]): string[] {
+		if (!this.#mouseSelectionDragged) return lines;
+		const selection = this.#orderedMouseSelection();
+		if (selection === null) return lines;
+		const highlighted = lines;
+		for (let lineIndex = selection.start.line; lineIndex <= selection.end.line; lineIndex++) {
+			const line = highlighted[lineIndex];
+			if (line === undefined || TERMINAL.isImageLine(line)) continue;
+			const plain = stripTerminalControls(line);
+			const width = visibleWidth(plain);
+			const columns = this.#mouseSelectionColumns(lineIndex, plain);
+			if (columns === null || columns.end <= columns.start) continue;
+			const before = sliceByColumn(line, 0, columns.start, false);
+			const selected = sliceByColumn(line, columns.start, columns.end - columns.start, false).replace(
+				/\x1b\[[0-9;]*m/gu,
+				control => `${control}\x1b[7m`,
+			);
+			const after = sliceByColumn(line, columns.end, Math.max(0, width - columns.end), false);
+			highlighted[lineIndex] = `${before}\x1b[7m${selected}\x1b[27m${after}`;
+		}
+		return highlighted;
 	}
 
 	#consumeCellSizeResponse(data: string): boolean {
@@ -2179,6 +2330,8 @@ export class TUI extends Container {
 		// Extract cursor position (marker must be found before diff comparison)
 		const cursorPos = this.#extractCursorPosition(newLines, height);
 		this.#lastCursorPosition = cursorPos;
+
+		newLines = this.#applyMouseSelection(newLines);
 
 		// Terminate every non-image line so #previousLines mirrors emitted bytes
 		// (closes SGR + OSC 8 hyperlink state). Must run after cursor extraction

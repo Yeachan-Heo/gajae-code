@@ -77,14 +77,16 @@ class SessionPool:
         if ent is None or ent.warmed:
             return False
         from . import safety
-        ok, _reason = safety.classify_url(root_url, safety.allow_private_default())
+        allow_private = safety.allow_private_default()
+        ok, _reason = safety.classify_url(root_url, allow_private)
         if not ok:
             ent.warmed = True   # don't retry a blocked root
             return False
         ent.warmed = True  # mark first to avoid duplicate warmups under race
         def _do_get(u):
             return ent.session.get(u, timeout=timeout, allow_redirects=False)
-        resp, err = self._fetch_following(_do_get, root_url, allow_private, DEFAULT_MAX_REDIRECTS, ent)
+        resp, err = self._fetch_following(_do_get, root_url, allow_private,
+                                          safety.DEFAULT_MAX_REDIRECTS, ent)
         return resp is not None and err is None
 
     def inject_cookies(self, host: str, impersonate: str,
@@ -120,6 +122,15 @@ class SessionPool:
         """GET via the pooled session (cookie + connection reuse), with an SSRF
         guard: the initial URL and EVERY redirect hop are validated against the
         private/loopback/link-local/metadata block-list before being fetched.
+
+        SECURITY NOTE: This is a resolver-level (pre-connect) check only. It is
+        NOT transport-bound DNS validation — a TOCTOU gap exists between
+        resolution and connection (DNS rebinding), and redirect-to-private
+        authority changes after the initial check are only caught at the next
+        hop boundary. The TypeScript bridge disables the real engine for this
+        reason; this Python guard is a defense-in-depth layer, not equivalent
+        protection against DNS rebinding or redirect-to-private attacks.
+
         Falls back to a one-shot get if no session could be created."""
         from . import safety
         if allow_private is None:

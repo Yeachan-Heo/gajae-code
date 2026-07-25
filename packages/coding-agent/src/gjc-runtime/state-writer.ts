@@ -298,7 +298,7 @@ export function workflowEnvelopeContentSha256(value: unknown): string {
 		.update(JSON.stringify(canonicalizeJson(withoutReceiptChecksum(value))))
 		.digest("hex");
 }
-function isNativeDeepInterviewV1(value: Record<string, unknown>): boolean {
+export function isNativeDeepInterviewV1(value: Record<string, unknown>): boolean {
 	if (value.skill !== "deep-interview") return false;
 	return value.schema_version === 1 || (isPlainObject(value.state) && value.state.schema_version === 1);
 }

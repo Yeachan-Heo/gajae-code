@@ -54,6 +54,11 @@ URL_ALLOWLIST = {
     "www.google.com", "google.com",
     # Generic HTTP test endpoint for infrastructure / transport tests.
     "httpbin.org",
+    # WAF vendor challenge domains — product artifacts used in detectors,
+    # NOT target-site biases. Any site running Arkose Labs serves these.
+    "funcaptcha.com", "api.funcaptcha.com",
+    # Jina Reader — generic headless-Chrome rendering service (infra endpoint).
+    "r.jina.ai", "jina.ai",
 }
 
 # Files / dirs that must be clean.

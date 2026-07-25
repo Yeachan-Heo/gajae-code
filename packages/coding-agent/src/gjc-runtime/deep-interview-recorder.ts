@@ -101,6 +101,21 @@ export interface TransitionValidationResult {
 // Pure helpers: records
 // =============================================================================
 
+/**
+ * `deepInterview.dimension` is agent-supplied free text on post-topology asks, but the persisted
+ * envelope only accepts canonical dimension ids. Fold obvious case/label variants down, and drop
+ * anything unrecognized rather than persisting a value the validator rejects.
+ */
+function canonicalDimension(value: string | undefined): string | undefined {
+	if (value === undefined) return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "topology") return "topology";
+	for (const dimension of ["goal", "constraints", "criteria", "context"]) {
+		if (normalized === dimension || normalized.startsWith(`${dimension} `)) return dimension;
+	}
+	return undefined;
+}
+
 export function buildAnswerShell(
 	input: DeepInterviewAnswerInput,
 	now: string = new Date().toISOString(),
@@ -116,7 +131,7 @@ export function buildAnswerShell(
 		selected_options: input.selectedOptions,
 		custom_input: input.customInput,
 		component: input.component,
-		dimension: input.dimension,
+		dimension: canonicalDimension(input.dimension),
 		ambiguity_at_ask: input.ambiguity,
 		lifecycle: "answered",
 		answered_at: now,

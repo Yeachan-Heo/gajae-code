@@ -281,14 +281,54 @@ function applyCodexPricingFallback(models: readonly Model[]): Model[] {
 	});
 }
 
-// Catalog sources occasionally omit image input for Claude Opus 4.8 variants
+// Catalog sources occasionally omit image input for recent Claude Opus variants
 // (e.g. kilo/venice "-fast" entries) even though every Claude Opus model is
 // vision-capable. Correct those so capability advertising stays consistent
 // across providers. Runs after the dynamic merge so it survives regeneration.
+//
+// The list is an explicit allowlist of reviewed generations rather than a
+// `claude-opus-*` prefix match: a future generation must be reviewed before we
+// assert capabilities for it. `claude-opus-vision.test.ts` imports this list and
+// fails when the catalog bundles a newer Opus generation than any declared here.
+export const VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS: readonly number[] = [4.8, 5];
+
+/**
+ * Known separator-less generation aliases. Upstream normally writes
+ * `claude-opus-4-5`, but a few catalogs collapse it to `claude-opus-45`. This is
+ * an explicit list so a future two-digit major (`claude-opus-10`) is read as
+ * generation 10 rather than silently as 1.0.
+ */
+const COMPACT_CLAUDE_OPUS_ALIASES: Readonly<Record<string, number>> = {
+	"41": 4.1,
+	"45": 4.5,
+	"46": 4.6,
+	"47": 4.7,
+	"48": 4.8,
+};
+
+/**
+ * Extract the Claude Opus generation from a model id, ignoring provider
+ * prefixes, region prefixes, and trailing aliases or date suffixes:
+ * `claude-opus-4-8` and `anthropic.claude-opus-4-8` -> 4.8, `claude-opus-5-fast`
+ * -> 5, `claude-opus-45` -> 4.5, `claude-opus-4-20250514` -> 4,
+ * `claude-opus-10` -> 10. Returns undefined when the id is not a Claude Opus
+ * model.
+ */
+export function claudeOpusGeneration(modelId: string): number | undefined {
+	const match = modelId
+		.toLowerCase()
+		.replace(/\./g, "-")
+		.match(/claude-opus-(\d+)(?:-(\d)(?![\d]))?/);
+	if (!match) return undefined;
+	const [, major, minor] = match;
+	if (minor !== undefined) return Number(major) + Number(minor) / 10;
+	return COMPACT_CLAUDE_OPUS_ALIASES[major] ?? Number(major);
+}
+
 function applyClaudeOpusVisionCorrections(models: readonly Model[]): Model[] {
 	return models.map(model => {
-		const normalizedId = model.id.toLowerCase().replace(/\./g, "-");
-		if (!normalizedId.includes("claude-opus-4-8")) {
+		const generation = claudeOpusGeneration(model.id);
+		if (generation === undefined || !VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS.includes(generation)) {
 			return model;
 		}
 		if (model.input.includes("image")) {

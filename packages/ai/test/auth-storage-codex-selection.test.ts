@@ -103,6 +103,16 @@ function createCredential(accountId: string, email: string): OAuthCredentials {
 	};
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(10);
+	}
+
+	throw new Error("Timed out waiting for condition");
+}
+
 describe("AuthStorage codex oauth ranking", () => {
 	let tempDir = "";
 	let store: AuthCredentialStore | null = null;
@@ -390,6 +400,114 @@ describe("AuthStorage codex oauth ranking", () => {
 
 		expect(apiKey).toBe("api-acct-first");
 		expect(elapsedMs).toBeLessThan(100);
+	});
+
+	test("does not re-await a shared usage request after the ranking deadline", async () => {
+		if (!store) throw new Error("test setup failed");
+		vi.useFakeTimers();
+		const usageGate = Promise.withResolvers<UsageReport | null>();
+		let usageCalls = 0;
+		let apiKeyPromise: Promise<string | undefined> | undefined;
+		const stalledAuthStorage = new AuthStorage(store, {
+			usageProviderResolver: provider =>
+				provider === "openai-codex"
+					? ({
+							id: "openai-codex",
+							async fetchUsage() {
+								usageCalls += 1;
+								return usageGate.promise;
+							},
+						} satisfies UsageProvider)
+					: undefined,
+			usageRequestTimeoutMs: 1000,
+		});
+
+		await stalledAuthStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-first", "first@example.com") },
+			{ type: "oauth", ...createCredential("acct-second", "second@example.com") },
+		]);
+
+		try {
+			apiKeyPromise = stalledAuthStorage.getApiKey("openai-codex", "session-ranking-deadline");
+			for (let attempt = 0; attempt < 20 && usageCalls < 2; attempt += 1) {
+				await Promise.resolve();
+			}
+			expect(usageCalls).toBe(2);
+			vi.advanceTimersByTime(5000);
+			await Promise.resolve();
+			vi.useRealTimers();
+			const outcome = await Promise.race([apiKeyPromise, Bun.sleep(100).then(() => "still-pending" as const)]);
+
+			expect(outcome).toBe("api-acct-first");
+			expect(usageCalls).toBe(2);
+		} finally {
+			usageGate.resolve(null);
+			vi.useRealTimers();
+			if (apiKeyPromise) await Promise.allSettled([apiKeyPromise]);
+			await stalledAuthStorage.fetchUsageReports();
+		}
+	});
+
+	test("aborts an oauth selection caller without cancelling shared usage work", async () => {
+		if (!store) throw new Error("test setup failed");
+		const usageGates = new Map<string, PromiseWithResolvers<UsageReport | null>>();
+		let usageCalls = 0;
+		const sharedAuthStorage = new AuthStorage(store, {
+			usageProviderResolver: provider =>
+				provider === "openai-codex"
+					? ({
+							id: "openai-codex",
+							async fetchUsage(params) {
+								usageCalls += 1;
+								const accountId = params.credential.accountId;
+								if (!accountId) return null;
+								const gate = Promise.withResolvers<UsageReport | null>();
+								usageGates.set(accountId, gate);
+								return gate.promise;
+							},
+						} satisfies UsageProvider)
+					: undefined,
+			usageRequestTimeoutMs: 30_000,
+		});
+		await sharedAuthStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-first", "first@example.com") },
+			{ type: "oauth", ...createCredential("acct-second", "second@example.com") },
+		]);
+
+		const controller = new AbortController();
+		const selection = sharedAuthStorage.getApiKey("openai-codex", "session-cancelled", {
+			signal: controller.signal,
+		});
+		const selectionOutcome = selection.then(
+			() => "resolved" as const,
+			() => "rejected" as const,
+		);
+		let peer: Promise<UsageReport[] | null> | undefined;
+		try {
+			await waitFor(() => usageCalls === 2);
+			peer = sharedAuthStorage.fetchUsageReports();
+
+			controller.abort();
+			const outcome = await Promise.race([selectionOutcome, Bun.sleep(100).then(() => "pending" as const)]);
+			for (const [accountId, gate] of usageGates) {
+				gate.resolve(
+					createCodexUsageReport({
+						accountId,
+						primary: { usedFraction: 0.1, resetInMs: HOUR_MS },
+						secondary: { usedFraction: 0.2, resetInMs: WEEK_MS },
+					}),
+				);
+			}
+			const peerReports = await peer;
+
+			expect(outcome).toBe("rejected");
+			expect(peerReports).toHaveLength(2);
+			expect(usageCalls).toBe(2);
+		} finally {
+			controller.abort();
+			for (const gate of usageGates.values()) gate.resolve(null);
+			await Promise.allSettled(peer ? [selection, peer] : [selection]);
+		}
 	});
 
 	test("sorts 3 accounts by weekly drain rate", async () => {

@@ -8,7 +8,7 @@ import {
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "@gajae-code/natives";
-import { pathIsWithin } from "@gajae-code/utils";
+import { logger, pathIsWithin } from "@gajae-code/utils";
 import type { ResumeSessionIdentity } from "../session-manager";
 import {
 	FileSessionStorage,
@@ -2789,7 +2789,10 @@ function validateCandidateForScope(scope: ManagedScope, candidate: ManagedCandid
 }
 
 /** Resume tombstoned cleanup under its original operation lease without restoring retired candidates. */
-export async function reconcileManagedTombstones(scope: ManagedScope): Promise<void> {
+export async function reconcileManagedTombstones(
+	scope: ManagedScope,
+	expectedCandidate?: ManagedCandidate,
+): Promise<void> {
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_TOMBSTONES_DIRECTORY);
 	for (const name of fs.readdirSync(directory)) {
 		const tombstone = path.join(directory, name);
@@ -2807,135 +2810,148 @@ export async function reconcileManagedTombstones(scope: ManagedScope): Promise<v
 			for (const target of lockedTargets) {
 				lock.assertOwned();
 				if (cleanupCompleted(scope, tombstone, target)) continue;
-				const pending = pendingCleanupReceipt(scope, tombstone, target);
-				const observedPending = pending ? probePlannedCleanupDetach(target, pending) : undefined;
 				try {
-					fs.lstatSync(target.path);
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-						if (!observedPending) continue;
-						if (
-							cleanupArtifactsRemoved(scope, tombstone, target, observedPending.attempt) &&
-							cleanupRootsAbsent(tombstone, target, observedPending)
-						) {
-							fsyncManagedParent(target.path);
-							await publishCleanupCompleted(scope, tombstone, target, lock);
-							continue;
-						}
-					} else throw error;
-				}
-				const verified = observedPending ? target : validateCandidateForScope(scope, target);
-				if (!verified || !sameCandidate(verified, target)) throw new Error("source_changed");
-				const discoveredDetach =
-					!!observedPending &&
-					(observedPending.detachedArtifactsPath !== pending?.detachedArtifactsPath ||
-						observedPending.detachedTranscriptPath !== pending?.detachedTranscriptPath);
-				const active =
-					discoveredDetach || (observedPending && requiresFreshCleanupPlan(observedPending))
-						? nextCleanupReceipt(target, observedPending)
-						: (observedPending ?? nextCleanupReceipt(target, undefined));
-				if (!observedPending || discoveredDetach || requiresFreshCleanupPlan(observedPending))
-					await publishCleanupPending(scope, tombstone, active, lock);
-				let deletion = await new FileSessionStorage().deleteSessionVerified({
-					sessionsRoot: scope.sessionsRoot,
-					transcriptPath: target.path,
-					sessionId: target.sessionId,
-					cwd: target.cwd,
-					transcriptIdentity: target.identity,
-					expectedArtifactsIdentity: active.expectedArtifactsIdentity,
-					expectedArtifactsTree: active.expectedArtifactsTree,
-					detachedArtifactsPath:
-						active.detachedArtifactsPath ??
-						observedPending?.detachedArtifactsPath ??
-						(fs.existsSync(active.plannedArtifactsPath) ? active.plannedArtifactsPath : undefined),
-					detachedTranscriptPath:
-						active.detachedTranscriptPath ??
-						observedPending?.detachedTranscriptPath ??
-						(pending && fs.existsSync(pending.plannedTranscriptPath)
-							? pending.plannedTranscriptPath
-							: undefined) ??
-						(fs.existsSync(active.plannedTranscriptPath) ? active.plannedTranscriptPath : undefined),
-					retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
-					retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
-					retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
-					retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
-					retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
-					retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
-					plannedArtifactsPath: active.plannedArtifactsPath,
-					plannedTranscriptPath: active.plannedTranscriptPath,
-					...(cleanupArtifactsRemoved(scope, tombstone, target, pending?.attempt ?? active.attempt)
-						? { artifactsRemoved: true as const }
-						: {}),
-				});
-				if (deletion.kind === "artifacts_removed") {
-					await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
-					deletion = await new FileSessionStorage().deleteSessionVerified({
+					const pending = pendingCleanupReceipt(scope, tombstone, target);
+					const observedPending = pending ? probePlannedCleanupDetach(target, pending) : undefined;
+					try {
+						fs.lstatSync(target.path);
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+							if (!observedPending) continue;
+							if (
+								cleanupArtifactsRemoved(scope, tombstone, target, observedPending.attempt) &&
+								cleanupRootsAbsent(tombstone, target, observedPending)
+							) {
+								fsyncManagedParent(target.path);
+								await publishCleanupCompleted(scope, tombstone, target, lock);
+								continue;
+							}
+						} else throw error;
+					}
+					const verified = observedPending ? target : validateCandidateForScope(scope, target);
+					if (!verified || !sameCandidate(verified, target)) throw new Error("source_changed");
+					const discoveredDetach =
+						!!observedPending &&
+						(observedPending.detachedArtifactsPath !== pending?.detachedArtifactsPath ||
+							observedPending.detachedTranscriptPath !== pending?.detachedTranscriptPath);
+					const active =
+						discoveredDetach || (observedPending && requiresFreshCleanupPlan(observedPending))
+							? nextCleanupReceipt(target, observedPending)
+							: (observedPending ?? nextCleanupReceipt(target, undefined));
+					if (!observedPending || discoveredDetach || requiresFreshCleanupPlan(observedPending))
+						await publishCleanupPending(scope, tombstone, active, lock);
+					let deletion = await new FileSessionStorage().deleteSessionVerified({
 						sessionsRoot: scope.sessionsRoot,
 						transcriptPath: target.path,
 						sessionId: target.sessionId,
 						cwd: target.cwd,
 						transcriptIdentity: target.identity,
-						plannedArtifactsPath: active.plannedArtifactsPath,
-						plannedTranscriptPath: active.plannedTranscriptPath,
-						detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
-
+						expectedArtifactsIdentity: active.expectedArtifactsIdentity,
+						expectedArtifactsTree: active.expectedArtifactsTree,
+						detachedArtifactsPath:
+							active.detachedArtifactsPath ??
+							observedPending?.detachedArtifactsPath ??
+							(fs.existsSync(active.plannedArtifactsPath) ? active.plannedArtifactsPath : undefined),
+						detachedTranscriptPath:
+							active.detachedTranscriptPath ??
+							observedPending?.detachedTranscriptPath ??
+							(pending && fs.existsSync(pending.plannedTranscriptPath)
+								? pending.plannedTranscriptPath
+								: undefined) ??
+							(fs.existsSync(active.plannedTranscriptPath) ? active.plannedTranscriptPath : undefined),
 						retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
 						retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
 						retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
 						retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
 						retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
 						retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
-						artifactsRemoved: true,
+						plannedArtifactsPath: active.plannedArtifactsPath,
+						plannedTranscriptPath: active.plannedTranscriptPath,
+						...(cleanupArtifactsRemoved(scope, tombstone, target, pending?.attempt ?? active.attempt)
+							? { artifactsRemoved: true as const }
+							: {}),
+					});
+					if (deletion.kind === "artifacts_removed") {
+						await publishCleanupArtifactsRemoved(scope, tombstone, active, lock);
+						deletion = await new FileSessionStorage().deleteSessionVerified({
+							sessionsRoot: scope.sessionsRoot,
+							transcriptPath: target.path,
+							sessionId: target.sessionId,
+							cwd: target.cwd,
+							transcriptIdentity: target.identity,
+							plannedArtifactsPath: active.plannedArtifactsPath,
+							plannedTranscriptPath: active.plannedTranscriptPath,
+							detachedTranscriptPath: active.detachedTranscriptPath ?? observedPending?.detachedTranscriptPath,
+
+							retainedArtifactsSuccessorPath: active.retainedArtifactsSuccessorPath,
+							retainedArtifactsPlaceholderPath: active.retainedArtifactsPlaceholderPath,
+							retainedArtifactsUnknownPath: active.retainedArtifactsUnknownPath,
+							retainedTranscriptSuccessorPath: active.retainedTranscriptSuccessorPath,
+							retainedTranscriptPlaceholderPath: active.retainedTranscriptPlaceholderPath,
+							retainedTranscriptUnknownPath: active.retainedTranscriptUnknownPath,
+							artifactsRemoved: true,
+						});
+					}
+					if (deletion.kind === "cleanup_pending") {
+						const retry = nextCleanupReceipt(target, active);
+						await publishCleanupPending(
+							scope,
+							tombstone,
+							{
+								...retry,
+								expectedArtifactsIdentity:
+									deletion.phase === "artifacts"
+										? deletion.artifactsIdentity
+										: active.expectedArtifactsIdentity,
+								expectedArtifactsTree:
+									deletion.phase === "artifacts" ? deletion.artifactsTree : active.expectedArtifactsTree,
+								detachedArtifactsPath:
+									deletion.phase === "artifacts"
+										? deletion.detachedArtifactsPath
+										: active.detachedArtifactsPath,
+								detachedTranscriptPath:
+									deletion.phase === "transcript"
+										? deletion.detachedTranscriptPath
+										: active.detachedTranscriptPath,
+								retainedArtifactsSuccessorPath:
+									deletion.phase === "artifacts"
+										? deletion.retainedSuccessorPath
+										: active.retainedArtifactsSuccessorPath,
+								retainedArtifactsPlaceholderPath:
+									deletion.phase === "artifacts"
+										? deletion.retainedPlaceholderPath
+										: active.retainedArtifactsPlaceholderPath,
+								retainedArtifactsUnknownPath:
+									deletion.phase === "artifacts"
+										? deletion.retainedUnknownPath
+										: active.retainedArtifactsUnknownPath,
+								retainedTranscriptSuccessorPath:
+									deletion.phase === "transcript"
+										? deletion.retainedSuccessorPath
+										: active.retainedTranscriptSuccessorPath,
+								retainedTranscriptPlaceholderPath:
+									deletion.phase === "transcript"
+										? deletion.retainedPlaceholderPath
+										: active.retainedTranscriptPlaceholderPath,
+								retainedTranscriptUnknownPath:
+									deletion.phase === "transcript"
+										? deletion.retainedUnknownPath
+										: active.retainedTranscriptUnknownPath,
+							},
+							lock,
+						);
+						continue;
+					}
+					fsyncManagedParent(target.path);
+					await publishCleanupCompleted(scope, tombstone, target, lock);
+				} catch (error) {
+					if (!expectedCandidate || target.sessionId === expectedCandidate.sessionId) throw error;
+					logger.warn("Tombstone reconciliation failed for one target; will retry on a future scope open", {
+						tombstone,
+						sessionId: target.sessionId,
+						error: String(error),
 					});
 				}
-				if (deletion.kind === "cleanup_pending") {
-					const retry = nextCleanupReceipt(target, active);
-					await publishCleanupPending(
-						scope,
-						tombstone,
-						{
-							...retry,
-							expectedArtifactsIdentity:
-								deletion.phase === "artifacts" ? deletion.artifactsIdentity : active.expectedArtifactsIdentity,
-							expectedArtifactsTree:
-								deletion.phase === "artifacts" ? deletion.artifactsTree : active.expectedArtifactsTree,
-							detachedArtifactsPath:
-								deletion.phase === "artifacts" ? deletion.detachedArtifactsPath : active.detachedArtifactsPath,
-							detachedTranscriptPath:
-								deletion.phase === "transcript"
-									? deletion.detachedTranscriptPath
-									: active.detachedTranscriptPath,
-							retainedArtifactsSuccessorPath:
-								deletion.phase === "artifacts"
-									? deletion.retainedSuccessorPath
-									: active.retainedArtifactsSuccessorPath,
-							retainedArtifactsPlaceholderPath:
-								deletion.phase === "artifacts"
-									? deletion.retainedPlaceholderPath
-									: active.retainedArtifactsPlaceholderPath,
-							retainedArtifactsUnknownPath:
-								deletion.phase === "artifacts"
-									? deletion.retainedUnknownPath
-									: active.retainedArtifactsUnknownPath,
-							retainedTranscriptSuccessorPath:
-								deletion.phase === "transcript"
-									? deletion.retainedSuccessorPath
-									: active.retainedTranscriptSuccessorPath,
-							retainedTranscriptPlaceholderPath:
-								deletion.phase === "transcript"
-									? deletion.retainedPlaceholderPath
-									: active.retainedTranscriptPlaceholderPath,
-							retainedTranscriptUnknownPath:
-								deletion.phase === "transcript"
-									? deletion.retainedUnknownPath
-									: active.retainedTranscriptUnknownPath,
-						},
-						lock,
-					);
-					continue;
-				}
-				fsyncManagedParent(target.path);
-				await publishCleanupCompleted(scope, tombstone, target, lock);
 			}
 		} finally {
 			if (lock) await lock.release().catch(() => undefined);
@@ -2962,7 +2978,7 @@ export async function prepareManagedSessionScopeForWrite(
 		ensureManagedDirectory(path.join(internal, MANAGED_LOCKS_DIRECTORY), root, policy);
 		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
-		await reconcileManagedTombstones(scope);
+		await reconcileManagedTombstones(scope, expectedCandidate);
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;

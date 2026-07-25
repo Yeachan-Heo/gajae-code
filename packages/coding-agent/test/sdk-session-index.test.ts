@@ -314,6 +314,34 @@ describe("SDK session index", () => {
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
+	it("accepts EBADF when closing a successfully written and synced append handle", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-close-ebadf-"));
+		const index = await new SessionIndex(dir).open();
+		const log = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const open = fs.open.bind(fs);
+		let injected = false;
+		const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			const handle = await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
+			if (!injected && path.resolve(file) === path.resolve(log) && rest[0] === "a") {
+				injected = true;
+				const close = handle.close.bind(handle);
+				(handle as unknown as { close: () => Promise<void> }).close = async () => {
+					await close();
+					throw Object.assign(new Error("EBADF"), { code: "EBADF" });
+				};
+			}
+			return handle;
+		}) as typeof fs.open);
+		try {
+			await index.append(event("close-ebadf"));
+		} finally {
+			spy.mockRestore();
+		}
+		expect(injected).toBe(true);
+		expect((await new SessionIndex(dir).open()).listSessions().sessions.map(session => session.sessionId)).toEqual([
+			"close-ebadf",
+		]);
+	});
 	it("holds refresh at a filesystem barrier while queued replay, append, and snapshot preserve monotonic state", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-mutation-race-"));
 		const index = await new SessionIndex(dir).open();

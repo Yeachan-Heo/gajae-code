@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
-import { type AssistantMessage, Effort, type Model } from "@gajae-code/ai";
+import { type AssistantMessage, type AssistantMessageEvent, Effort, type Model } from "@gajae-code/ai";
 import { kNoAuth } from "../../src/config/model-registry";
 
 import { Settings } from "../../src/config/settings";
@@ -12,7 +12,8 @@ import type { AgentSession, AgentSessionEvent, ForkContextSeed, PromptOptions } 
 import type { AuthStorage } from "../../src/session/auth-storage";
 import { runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
 
-import type { AgentDefinition } from "../../src/task/types";
+import { type AgentDefinition, type AgentProgress, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../../src/task/types";
+
 import { EventBus } from "../../src/utils/event-bus";
 
 function createAssistantStopMessage(text: string): AssistantMessage {
@@ -57,6 +58,9 @@ function createMockSession(
 		state,
 		agent: { state: { systemPrompt: ["test"] } },
 		model: options?.model,
+		get messages() {
+			return state.messages;
+		},
 		extensionRunner: undefined,
 		sessionManager: {
 			appendSessionInit: () => {},
@@ -206,6 +210,363 @@ describe("runSubprocess yield reminders", () => {
 				scope: "subagent",
 			}),
 		]);
+	});
+
+	it("clears provider retry state on the first recovered assistant event", async () => {
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		const disposeProgressListener = eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			const progress = (payload as { progress: AgentProgress }).progress;
+			progressUpdates.push({ event: currentEvent, progress: structuredClone(progress) });
+		});
+
+		const session = createMockSession(({ emit, state }) => {
+			const recovered = { ...createAssistantStopMessage("recovered"), provider: "test", model: "mock" };
+
+			currentEvent = "auto_retry_start";
+			emit({
+				type: "auto_retry_start",
+				attempt: 1,
+				maxAttempts: 3,
+				delayMs: 10_000,
+				errorMessage: "provider stream stalled",
+			});
+			state.messages.push(recovered);
+			currentEvent = "message_start";
+			emit({ type: "message_start", message: recovered });
+			currentEvent = "auto_retry_end";
+			emit({ type: "auto_retry_end", success: true, attempt: 1 });
+			currentEvent = "tool_execution_end";
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-recovered-retry",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { recovered: true } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-retry-recovered-event",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+
+		const retryStartIndex = progressUpdates.findIndex(update => update.event === "auto_retry_start");
+		const recoveredIndex = progressUpdates.findIndex(update => update.event === "message_start");
+		const retryEndIndex = progressUpdates.findIndex(update => update.event === "auto_retry_end");
+		expect(retryStartIndex).toBeGreaterThanOrEqual(0);
+		expect(progressUpdates[retryStartIndex]?.progress.retryState).toMatchObject({
+			attempt: 1,
+			kind: "provider_error",
+		});
+		expect(recoveredIndex).toBeGreaterThan(retryStartIndex);
+		expect(retryEndIndex).toBeGreaterThan(recoveredIndex);
+		expect(progressUpdates[recoveredIndex]?.progress.retryState).toBeUndefined();
+		expect(result.exitCode).toBe(0);
+		disposeProgressListener();
+	});
+
+	it("only clears retries on qualifying provider activity and starts each retry with the latest fallback provider", async () => {
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		const disposeProgressListener = eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			progressUpdates.push({
+				event: currentEvent,
+				progress: structuredClone((payload as { progress: AgentProgress }).progress),
+			});
+		});
+
+		const session = createMockSession(({ emit, state }) => {
+			const assistant = { ...createAssistantStopMessage("streaming"), provider: "test", model: "mock" };
+			const baseline = {
+				...assistant,
+				content: [{ type: "text" as const, text: "baseline" }],
+				timestamp: assistant.timestamp - 1_000,
+			};
+			const errored = { ...assistant, stopReason: "error" as const, errorMessage: "upstream failed" };
+			const update = (assistantMessageEvent: AssistantMessageEvent) =>
+				emit({ type: "message_update", message: { ...assistant }, assistantMessageEvent });
+			const retry = (attempt: number) =>
+				emit({
+					type: "auto_retry_start",
+					attempt,
+					maxAttempts: 3,
+					delayMs: 10_000,
+					errorMessage: "provider stream stalled",
+				});
+			const flush = () => emit({ type: "agent_end", messages: [], stopReason: "completed" });
+			state.messages.push(baseline);
+
+			currentEvent = "retry-1";
+			retry(1);
+			currentEvent = "baseline-replay-update";
+			emit({
+				type: "message_update",
+				message: { ...baseline },
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "replay", partial: { ...baseline } },
+			});
+			flush();
+			currentEvent = "errored-assistant-start";
+			emit({ type: "message_start", message: errored });
+			flush();
+			currentEvent = "aborted-assistant-start";
+			emit({ type: "message_start", message: { ...assistant, stopReason: "aborted" } });
+			flush();
+			currentEvent = "user-start";
+			emit({ type: "message_start", message: { role: "user", content: "control", timestamp: Date.now() } });
+			flush();
+			currentEvent = "control-update";
+			update({
+				type: "toolChoiceIncapability",
+				api: "openai-responses",
+				provider: "test",
+				model: "mock",
+				requestedLevel: "required",
+				resolvedLevel: "none",
+				reason: "unsupported",
+				registryKey: "test/mock",
+			});
+			flush();
+			currentEvent = "error-update";
+			update({ type: "error", reason: "error", error: errored });
+			flush();
+			currentEvent = "malformed-update";
+			emit({
+				type: "message_update",
+				message: assistant,
+				assistantMessageEvent: { type: "text_delta" } as unknown as AssistantMessageEvent,
+			});
+			flush();
+			currentEvent = "missing-update";
+			emit({
+				type: "message_update",
+				message: { ...assistant },
+				assistantMessageEvent: undefined,
+			} as unknown as AgentSessionEvent);
+			flush();
+			currentEvent = "qualifying-update";
+			update({ type: "text_delta", contentIndex: 0, delta: "ok", partial: assistant });
+			currentEvent = "delayed-end";
+			emit({ type: "auto_retry_end", success: true, attempt: 1 });
+			currentEvent = "fallback-one";
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-one",
+				from: "test/mock",
+				to: "first/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 1,
+				chainLength: 3,
+				attemptsUsed: 1,
+			});
+			currentEvent = "fallback-two";
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-two",
+				from: "first/model",
+				to: "final/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 2,
+				chainLength: 3,
+				attemptsUsed: 2,
+			});
+			currentEvent = "retry-2";
+			retry(2);
+			currentEvent = "qualifying-start";
+			emit({ type: "message_start", message: { ...assistant, provider: "final", model: "model" } });
+			currentEvent = "tool_execution_end";
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "retry-qualification",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: {} },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-retry-qualification",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+		const states = (event: string) =>
+			progressUpdates.filter(update => update.event === event).map(update => update.progress);
+		for (const event of [
+			"errored-assistant-start",
+			"aborted-assistant-start",
+			"user-start",
+			"baseline-replay-update",
+			"control-update",
+			"error-update",
+			"malformed-update",
+			"missing-update",
+		]) {
+			expect(states(event).at(-1)?.retryState).toMatchObject({ attempt: 1, provider: "test" });
+		}
+		expect(states("qualifying-update").at(-1)?.retryState).toBeUndefined();
+		expect(states("delayed-end").at(-1)?.retryState).toBeUndefined();
+		expect(states("retry-2").at(-1)?.retryState).toMatchObject({ attempt: 2, provider: "final" });
+		expect(states("qualifying-start").at(-1)?.retryState).toBeUndefined();
+		expect(result.exitCode).toBe(0);
+		disposeProgressListener();
+	});
+
+	it("attributes fallback retries to the switched model provider", async () => {
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			const progress = (payload as { progress: AgentProgress }).progress;
+			progressUpdates.push({ event: currentEvent, progress });
+		});
+
+		const session = createMockSession(({ emit, state }) => {
+			const failedProviderMessage = {
+				...createAssistantStopMessage("primary response"),
+				provider: "primary",
+				model: "model",
+			};
+			state.messages.push(failedProviderMessage);
+
+			currentEvent = "message_end";
+			emit({ type: "message_end", message: failedProviderMessage });
+			currentEvent = "model_fallback_switched";
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-provider-attribution",
+				from: "primary/model",
+				to: "fallback/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 1,
+				chainLength: 2,
+				attemptsUsed: 1,
+			});
+			currentEvent = "auto_retry_start";
+			emit({
+				type: "auto_retry_start",
+				attempt: 1,
+				maxAttempts: 3,
+				delayMs: 10_000,
+				errorMessage: "provider rate limit",
+			});
+			currentEvent = "auto_retry_end";
+			emit({ type: "auto_retry_end", success: true, attempt: 1 });
+			currentEvent = "tool_execution_end";
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fallback-retry",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { provider: "fallback" } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-provider-attribution",
+			eventBus,
+		});
+
+		const retryStart = progressUpdates.find(update => update.event === "auto_retry_start");
+		expect(retryStart?.progress.retryState?.provider).toBe("fallback");
+		expect(result.exitCode).toBe(0);
+	});
+
+	it("does not count synthesized terminal message ends as provider progress", async () => {
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			progressUpdates.push({
+				event: currentEvent,
+				progress: structuredClone((payload as { progress: AgentProgress }).progress),
+			});
+		});
+		const session = createMockSession(({ emit }) => {
+			const terminal = {
+				...createAssistantStopMessage("terminal failure"),
+				provider: "test",
+				model: "mock",
+				stopReason: "error" as const,
+				errorMessage: "provider failed",
+			};
+			currentEvent = "retry-1";
+			emit({
+				type: "auto_retry_start",
+				attempt: 1,
+				maxAttempts: 3,
+				delayMs: 1_000,
+				errorMessage: "provider failed",
+			});
+			currentEvent = "terminal-start";
+			emit({ type: "message_start", message: terminal });
+			currentEvent = "terminal-end";
+			emit({ type: "message_end", message: terminal });
+			currentEvent = "cancelled-agent-end";
+			emit({ type: "agent_end", messages: [terminal], stopReason: "cancelled" });
+			currentEvent = "failed-end";
+			emit({ type: "auto_retry_end", success: false, attempt: 1, finalError: "provider failed" });
+			currentEvent = "retry-2";
+			emit({
+				type: "auto_retry_start",
+				attempt: 2,
+				maxAttempts: 3,
+				delayMs: 1_000,
+				errorMessage: "provider failed again",
+			});
+			currentEvent = "tool_execution_end";
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "terminal-progress-guard",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: {} },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-terminal-progress-guard",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+		const secondRetry = progressUpdates.find(update => update.event === "retry-2")?.progress.retryState;
+		const cancelledRetry = progressUpdates.find(update => update.event === "cancelled-agent-end")?.progress
+			.retryState;
+		expect(cancelledRetry).toMatchObject({ attempt: 1, provider: "test" });
+		expect(secondRetry).toMatchObject({ attempt: 2, provider: "test" });
+		expect(secondRetry?.lastProviderProgressAtMs).toBeUndefined();
+		expect(result.exitCode).toBe(0);
 	});
 
 	it("waits for session_start extension user messages before prompting the subagent", async () => {

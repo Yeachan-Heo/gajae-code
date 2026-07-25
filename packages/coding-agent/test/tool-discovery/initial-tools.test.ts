@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
 import { type GoalModeState, GoalRuntime } from "../../src/goals";
 import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
+import { createAgentSession } from "../../src/sdk/session";
 import type { ToolSession } from "../../src/tools/index";
 import {
 	AskTool,
@@ -193,6 +197,29 @@ describe("built-in tool loadMode annotations", () => {
 		}
 		expect(missing).toEqual([]);
 	});
+});
+
+describe("alwaysActiveToolNames keeps discoverable coordination tools loaded", () => {
+	async function tempDir(): Promise<string> {
+		return await fs.mkdtemp(path.join(os.tmpdir(), "gjc-always-active-"));
+	}
+
+	it("hides irc from a subagent-style session by default and forces it active when requested", async () => {
+		const cwd = await tempDir();
+		const agentDir = await tempDir();
+
+		// No `toolNames`: this is the executor/generic-subagent path, which inherits the
+		// full builtin set. With tools.discoveryMode="all" (the default), `irc` is
+		// loadMode "discoverable" and must therefore be hidden behind search_tool_bm25.
+		const hidden = await createAgentSession({ cwd, agentDir });
+		expect(hidden.session.getActiveToolNames()).not.toContain("irc");
+
+		const forced = await createAgentSession({ cwd, agentDir, alwaysActiveToolNames: ["irc"] });
+		expect(forced.session.getActiveToolNames()).toContain("irc");
+
+		// Forcing one tool active must not drag the rest of the discoverable set in.
+		expect(forced.session.getActiveToolNames()).not.toContain("browser");
+	}, 60_000);
 });
 
 describe("computeEssentialBuiltinNames", () => {

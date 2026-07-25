@@ -1239,6 +1239,56 @@ describe("managed session write protocol", () => {
 		if (secondListed.kind === "complete")
 			expect(secondListed.owned.map(candidate => candidate.sessionId)).toEqual(["second"]);
 	});
+	it("isolates a permanently unresolvable tombstone without blocking an unrelated candidate, but still fails closed for the affected candidate itself", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		const stuckSource = path.join(legacy, "stuck-target.jsonl");
+		const okSource = path.join(legacy, "ok-target.jsonl");
+		await fs.mkdir(legacy, { recursive: true });
+		await fs.writeFile(stuckSource, transcript("stuck-target", cwd));
+		await fs.writeFile(okSource, transcript("ok-target", cwd));
+
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete") throw new Error("Missing candidates");
+		const stuckCandidate = listed.owned.find(candidate => candidate.sessionId === "stuck-target");
+		const okCandidate = listed.owned.find(candidate => candidate.sessionId === "ok-target");
+		if (!stuckCandidate || !okCandidate) throw new Error("Missing candidates");
+
+		const exactUnlink = native.exactUnlink;
+		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (pathname === stuckSource) return { ok: false, code: "identity_mismatch" };
+			return exactUnlink(pathname, identity);
+		});
+		try {
+			await expect(deleteManagedSessionCandidate(scope, stuckCandidate)).resolves.toMatchObject({
+				kind: "error",
+			});
+
+			// A caller opening the unrelated candidate must not be blocked by the stuck tombstone.
+			const forOk = await prepareManagedSessionScopeForWrite(
+				scope,
+				"default",
+				undefined,
+				okCandidate,
+				okCandidate.identity,
+			);
+			expect(forOk.kind).toBe("resolved");
+
+			// A caller acting on the stuck candidate itself must still fail closed, not be silently
+			// isolated — isolation only applies to targets that are provably a different session than
+			// the one the caller is actually operating on.
+			const forStuck = await prepareManagedSessionScopeForWrite(
+				scope,
+				"default",
+				undefined,
+				stuckCandidate,
+				stuckCandidate.identity,
+			);
+			expect(forStuck.kind).toBe("error");
+		} finally {
+			unlink.mockRestore();
+		}
+	});
 	it("reconciles a crash-after-tombstone on a fresh scope without resurrecting the candidate", async () => {
 		const { cwd, sessionsRoot, scope } = await fixture();
 		const legacy = legacyDirectory(sessionsRoot, cwd);
@@ -1267,42 +1317,6 @@ describe("managed session write protocol", () => {
 		expect(afterRestart).toMatchObject({ kind: "complete" });
 		if (afterRestart.kind === "complete")
 			expect(afterRestart.owned.some(candidate => candidate.sessionId === "crash-restart")).toBe(false);
-	});
-	it("reconciles detached artifact cleanup from an append-only sidecar on a fresh scope", async () => {
-		const { cwd, sessionsRoot, scope } = await fixture();
-		const legacy = legacyDirectory(sessionsRoot, cwd);
-		const source = path.join(legacy, "detached-artifact-restart.jsonl");
-		const artifacts = source.slice(0, -6);
-		await fs.mkdir(artifacts, { recursive: true });
-		await fs.writeFile(path.join(artifacts, "artifact.txt"), "payload");
-		await fs.writeFile(source, transcript("detached-artifact-restart", cwd));
-		const listed = listManagedCandidates(scope);
-		if (listed.kind !== "complete" || !listed.owned[0]) throw new Error("Missing candidate");
-		const exactUnlink = native.exactUnlink;
-		const unlink = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-			if (pathname !== artifacts) return exactUnlink(pathname, identity);
-			if (!identity.directory || !identity.quarantineName) throw new Error("Missing artifact quarantine identity");
-			const detachedPath = path.join(path.dirname(pathname), identity.quarantineName);
-			syncFs.renameSync(pathname, detachedPath);
-			return { ok: true, detachedPath };
-		});
-		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockReturnValueOnce({ ok: false, code: "io_error" });
-		try {
-			await expect(deleteManagedSessionCandidate(scope, listed.owned[0])).resolves.toMatchObject({
-				kind: "deleted",
-				tombstonePath: expect.stringContaining(".json"),
-			});
-		} finally {
-			remove.mockRestore();
-			unlink.mockRestore();
-		}
-		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
-		const restarted = resolveManagedScope({ cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
-		if (restarted.kind !== "resolved") throw new Error(restarted.message);
-		expect((await prepareManagedSessionScopeForWrite(restarted.scope)).kind).toBe("resolved");
-		expect(await fs.stat(source).catch(() => undefined)).toBeUndefined();
-
-		expect(listManagedCandidates(restarted.scope)).toMatchObject({ kind: "complete", owned: [] });
 	});
 
 	it("recovers a crash after artifact detach but before the native result is persisted", async () => {

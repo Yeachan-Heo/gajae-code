@@ -21,7 +21,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { tokenFingerprint } from "./config";
-import { type DaemonState, daemonPaths, isFreshLiveOwner } from "./telegram-daemon";
+import { isFreshLiveOwner, readOwnerFreshnessSnapshot } from "./telegram-daemon";
 import { runTelegramReferenceClient } from "./telegram-reference";
 
 interface CliArgs {
@@ -134,17 +134,9 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
-function readDaemonState(): DaemonState | undefined {
-	try {
-		const raw = fs.readFileSync(daemonPaths(getAgentDir()).state, "utf8");
-		return JSON.parse(raw) as DaemonState;
-	} catch {
-		return undefined;
-	}
-}
-
-function activeDaemonOwnsToken(input: { botToken: string; chatId: string }): boolean {
-	const state = readDaemonState();
+async function activeDaemonOwnsToken(input: { botToken: string; chatId: string }): Promise<boolean> {
+	const snapshot = await readOwnerFreshnessSnapshot({ settings: { getAgentDir } as never });
+	const state = snapshot.state;
 	if (!state) return false;
 	return isFreshLiveOwner({
 		state,
@@ -152,6 +144,7 @@ function activeDaemonOwnsToken(input: { botToken: string; chatId: string }): boo
 		tokenFingerprint: tokenFingerprint(input.botToken),
 		chatId: input.chatId,
 		pidAlive,
+		effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 	});
 }
 
@@ -176,7 +169,7 @@ async function main(): Promise<void> {
 	}
 
 	const chatId = args.chatId ?? process.env.GJC_TG_CHAT_ID ?? (await resolveChatId(botToken, apiBase));
-	if (!args.force && activeDaemonOwnsToken({ botToken, chatId })) {
+	if (!args.force && (await activeDaemonOwnsToken({ botToken, chatId }))) {
 		process.stderr.write(
 			"an active gjc notifications daemon already owns this bot token; running a second poller will cause Telegram 409 conflicts. Re-run with --force to override.\n",
 		);

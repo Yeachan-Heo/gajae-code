@@ -9,7 +9,7 @@ Built-in role assignments are product judgments. The selected TypeScript edit ev
 - **Eco**: `terra:low` default, `luna:low` executor, `luna:high` planner, `terra:xhigh` critic, and `terra:high` architect.
 - **Medium**: `sol:low` default, `terra:low` executor, `terra:high` planner, `sol:xhigh` critic, and `sol:high` architect.
 - **Pro**: `sol:medium` default, `terra:medium` executor, `sol:high` planner, `sol:max` critic, and `sol:xhigh` architect.
-- **Combos**: `opus-codex` uses the Medium Codex executor, critic, and architect roles, with the durable `anthropic/claude-sonnet-5` planner override; `codex-opencodego` uses Medium Codex default and architect roles; and `fable-opus-codex` uses Pro Codex executor and architect roles with `anthropic/claude-opus-4-8:medium` as planner.
+- **Combos**: `opus-codex` uses the Medium Codex executor, critic, and architect roles, with the durable `anthropic/claude-sonnet-5` planner override; `codex-opencodego` uses Medium Codex default and architect roles; and `fable-opus-codex` uses Pro Codex executor and architect roles with `anthropic/claude-opus-5:medium` as planner.
 
 The edit benchmark does not measure default-agent interpretation, orchestration, explanation, or routing, and it does not measure planner, architect, or critic work. Those non-executor assignments are product judgments, not benchmark findings.
 
@@ -119,9 +119,9 @@ The selected-task data show that Luna xhigh used more reported tokens than Luna 
 | `codex-eco` | `openai-codex/gpt-5.6-terra:low` | `openai-codex/gpt-5.6-luna:low` | `openai-codex/gpt-5.6-luna:high` | `openai-codex/gpt-5.6-terra:xhigh` | `openai-codex/gpt-5.6-terra:high` |
 | `codex-medium` | `openai-codex/gpt-5.6-sol:low` | `openai-codex/gpt-5.6-terra:low` | `openai-codex/gpt-5.6-terra:high` | `openai-codex/gpt-5.6-sol:xhigh` | `openai-codex/gpt-5.6-sol:high` |
 | `codex-pro` | `openai-codex/gpt-5.6-sol:medium` | `openai-codex/gpt-5.6-terra:medium` | `openai-codex/gpt-5.6-sol:high` | `openai-codex/gpt-5.6-sol:max` | `openai-codex/gpt-5.6-sol:xhigh` |
-| `opus-codex` | `anthropic/claude-opus-4-8:xhigh` | `openai-codex/gpt-5.6-terra:low` | `anthropic/claude-sonnet-5` | `openai-codex/gpt-5.6-sol:xhigh` | `openai-codex/gpt-5.6-sol:high` |
+| `opus-codex` | `anthropic/claude-opus-5:xhigh` | `openai-codex/gpt-5.6-terra:low` | `anthropic/claude-sonnet-5` | `openai-codex/gpt-5.6-sol:xhigh` | `openai-codex/gpt-5.6-sol:high` |
 | `codex-opencodego` | `openai-codex/gpt-5.6-sol:low` | `opencode-go/deepseek-v4-pro` | `opencode-go/kimi-k2.6` | `opencode-go/mimo-v2.5-pro` | `openai-codex/gpt-5.6-sol:high` |
-| `fable-opus-codex` | `anthropic/claude-fable-5:high` | `openai-codex/gpt-5.6-terra:medium` | `anthropic/claude-opus-4-8:medium` | `anthropic/claude-opus-4-8:high` | `openai-codex/gpt-5.6-sol:xhigh` |
+| `fable-opus-codex` | `anthropic/claude-fable-5:high` | `openai-codex/gpt-5.6-terra:medium` | `anthropic/claude-opus-5:medium` | `anthropic/claude-opus-5:high` | `openai-codex/gpt-5.6-sol:xhigh` |
 
 ## Limitations
 

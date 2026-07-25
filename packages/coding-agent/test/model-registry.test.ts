@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -156,6 +156,40 @@ describe("ModelRegistry", () => {
 			}
 		};
 	}
+
+	test("forwards caller cancellation through model and provider key lookups", async () => {
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const model = registry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+		const controller = new AbortController();
+		const credentialSelector = { kind: "email" as const, value: "worker@example.com" };
+		const getApiKey = vi.spyOn(authStorage, "getApiKey").mockResolvedValue("test-key");
+
+		try {
+			await registry.getApiKey(model, "model-session", {
+				credentialSelector,
+				signal: controller.signal,
+			});
+			await registry.getApiKeyForProvider("anthropic", "provider-session", "https://proxy.example.com", {
+				credentialSelector,
+				signal: controller.signal,
+			});
+
+			expect(getApiKey).toHaveBeenNthCalledWith(1, "anthropic", "model-session", {
+				baseUrl: model.baseUrl,
+				modelId: model.id,
+				credentialSelector,
+				signal: controller.signal,
+			});
+			expect(getApiKey).toHaveBeenNthCalledWith(2, "anthropic", "provider-session", {
+				baseUrl: "https://proxy.example.com",
+				credentialSelector,
+				signal: controller.signal,
+			});
+		} finally {
+			getApiKey.mockRestore();
+		}
+	});
 
 	function mockOpenAiCompatibleModels(url: string, modelIds: string[]) {
 		return hookFetch(input => {
@@ -492,7 +526,7 @@ describe("ModelRegistry", () => {
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const opusVariants = registry.getCanonicalVariants("claude-opus-4-8");
+			const opusVariants = registry.getCanonicalVariants("claude-opus-5");
 			const haikuVariants = registry.getCanonicalVariants("claude-haiku-4-5");
 
 			expect(opusVariants.some(variant => variant.selector === "demo/anthropic/claude-opus-latest")).toBe(true);

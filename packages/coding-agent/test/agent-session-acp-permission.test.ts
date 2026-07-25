@@ -23,6 +23,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { callSessionTool } from "../src/eval/js/tool-bridge";
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -62,6 +63,13 @@ function makeToolSession(bridge: ClientBridge): ToolSession {
 	} as unknown as ToolSession;
 }
 
+function makeExecutionToolSession(agentSession: AgentSession): ToolSession {
+	return {
+		getToolByName: (name: string) => agentSession.getToolByName(name),
+		getToolForExecution: (name: string) => agentSession.getToolForExecution(name),
+	} as unknown as ToolSession;
+}
+
 /** Build a minimal ClientBridge whose requestPermission resolves to the given outcome. */
 function makeBridge(outcome: ClientBridgePermissionOutcome): ClientBridge {
 	return {
@@ -72,7 +80,11 @@ function makeBridge(outcome: ClientBridgePermissionOutcome): ClientBridge {
 	};
 }
 
-async function createSession(tools: AgentTool[], bridge?: ClientBridge): Promise<AgentSession> {
+async function createSession(
+	tools: AgentTool[],
+	bridge?: ClientBridge,
+	permissionMode: "allow" | "prompt" = "prompt",
+): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
 
@@ -100,7 +112,7 @@ async function createSession(tools: AgentTool[], bridge?: ClientBridge): Promise
 	});
 
 	// Session default is `allow`; ACP registers a prompt bridge alongside prompt mode (see acp-agent).
-	sess.setSdkPermissionMode("prompt");
+	sess.setSdkPermissionMode(permissionMode);
 	if (bridge) sess.setClientBridge(bridge);
 	return sess;
 }
@@ -730,6 +742,184 @@ it("setClientBridge wraps tools that were already active", async () => {
 	await wrappedBash!.execute("call-1", { command: "echo hi" }, undefined, undefined as never, undefined as never);
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("eval allow_once requests execution permission before running", async () => {
+	const evalTool = makeFakeTool("eval");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall, options, _signal) {
+			requests.push(toolCall);
+			expect(options.map(option => option.optionId)).toEqual([
+				"allow_once",
+				"allow_always",
+				"reject_once",
+				"reject_always",
+			]);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	session = await createSession([evalTool], bridge);
+	await session.setActiveToolsByName(["eval"]);
+	const wrappedEval = session.agent.state.tools.find(tool => tool.name === "eval");
+
+	await wrappedEval!.execute(
+		"call-eval-allow",
+		{ cells: [{ language: "js", code: "1 + 1", title: "Calculate" }] },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(requests).toEqual([
+		expect.objectContaining({
+			toolCallId: "call-eval-allow",
+			toolName: "eval",
+			title: "Calculate",
+			kind: "execute",
+			status: "pending",
+		}),
+	]);
+	expect(evalTool.executeCalls).toBe(1);
+});
+
+it("eval reject_once does not execute", async () => {
+	const evalTool = makeFakeTool("eval");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_once", kind: "reject_once" });
+	session = await createSession([evalTool], bridge);
+	await session.setActiveToolsByName(["eval"]);
+	const wrappedEval = session.agent.state.tools.find(tool => tool.name === "eval");
+
+	await expect(
+		wrappedEval!.execute(
+			"call-eval-reject",
+			{ cells: [{ language: "py", code: "print(1)" }] },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/rejected by user/);
+	expect(evalTool.executeCalls).toBe(0);
+});
+
+it("eval allow_always is reused for later eval calls", async () => {
+	const evalTool = makeFakeTool("eval");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_always", kind: "allow_always" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	session = await createSession([evalTool], bridge);
+	await session.setActiveToolsByName(["eval"]);
+	const wrappedEval = session.agent.state.tools.find(tool => tool.name === "eval");
+
+	await wrappedEval!.execute(
+		"call-eval-always-1",
+		{ cells: [{ language: "js", code: "1" }] },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+	await wrappedEval!.execute(
+		"call-eval-always-2",
+		{ cells: [{ language: "py", code: "2" }] },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(evalTool.executeCalls).toBe(2);
+});
+
+it("eval cancelled and unknown permission outcomes fail closed", async () => {
+	for (const outcome of [
+		{ outcome: "cancelled" as const },
+		{ outcome: "selected" as const, optionId: "allow_typo" },
+	]) {
+		const evalTool = makeFakeTool("eval");
+		const bridge = makeBridge(outcome);
+		session = await createSession([evalTool], bridge);
+		await session.setActiveToolsByName(["eval"]);
+		const wrappedEval = session.agent.state.tools.find(tool => tool.name === "eval");
+
+		await expect(
+			wrappedEval!.execute(
+				"call-eval-fail-closed",
+				{ cells: [{ language: "js", code: "1" }] },
+				undefined,
+				undefined as never,
+				undefined as never,
+			),
+		).rejects.toThrow(outcome.outcome === "cancelled" ? /cancelled/ : /unknown option ID/);
+		expect(evalTool.executeCalls).toBe(0);
+		await session.dispose();
+		session = undefined;
+	}
+});
+
+it("nested eval tool calls use the prepared permission-wrapped dispatch", async () => {
+	const bashTool = makeFakeTool("bash");
+	let nestedSession: AgentSession | undefined;
+	let evalExecuteCalls = 0;
+	const evalTool = {
+		...makeFakeTool("eval"),
+		async execute() {
+			evalExecuteCalls++;
+			await callSessionTool(
+				"bash",
+				{ command: "echo nested" },
+				{ session: makeExecutionToolSession(nestedSession!) },
+			);
+			return { content: [{ type: "text" as const, text: "ok" }] };
+		},
+	};
+	const requestedTools: string[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall, _options, _signal) {
+			requestedTools.push(toolCall.toolName);
+			if (toolCall.toolName === "eval") {
+				return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+			}
+			return { outcome: "selected", optionId: "reject_once", kind: "reject_once" };
+		},
+	};
+	nestedSession = await createSession([evalTool, bashTool], bridge);
+	session = nestedSession;
+	await session.setActiveToolsByName(["eval"]);
+	const wrappedEval = session.agent.state.tools.find(tool => tool.name === "eval");
+
+	await expect(
+		wrappedEval!.execute(
+			"call-eval-nested",
+			{ cells: [{ language: "js", code: "await tools.bash(...)" }] },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow(/rejected by user/);
+	expect(requestedTools).toEqual(["eval", "bash"]);
+	expect(evalExecuteCalls).toBe(1);
+	expect(bashTool.executeCalls).toBe(0);
+});
+
+it("non-ACP eval and nested dispatch preserve execution without permission prompts", async () => {
+	const evalTool = makeFakeTool("eval");
+	const bashTool = makeFakeTool("bash");
+	session = await createSession([evalTool, bashTool], undefined, "allow");
+	await session.setActiveToolsByName(["eval"]);
+	const wrappedEval = session.agent.state.tools.find(tool => tool.name === "eval");
+
+	await wrappedEval!.execute(
+		"call-eval-local",
+		{ cells: [{ language: "js", code: "1" }] },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+	await callSessionTool("bash", { command: "echo local" }, { session: makeExecutionToolSession(session) });
+
+	expect(evalTool.executeCalls).toBe(1);
 	expect(bashTool.executeCalls).toBe(1);
 });
 

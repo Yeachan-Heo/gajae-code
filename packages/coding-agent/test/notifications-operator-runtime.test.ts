@@ -64,6 +64,20 @@ describe("notification operator runtime core", () => {
 		expect(intervals.size).toBe(0);
 	});
 
+	test("synchronous exclusive failure releases the name for a successor", async () => {
+		const runtime = new NotificationOperatorRuntime();
+		await expect(
+			runtime.runExclusive("scan", () => {
+				throw new Error("sync failure");
+			}),
+		).rejects.toThrow("sync failure");
+		let secondRan = false;
+		await runtime.runExclusive("scan", async () => {
+			secondRan = true;
+		});
+		expect(secondRan).toBe(true);
+	});
+
 	test("shares bounded backoff semantics independently of Telegram", () => {
 		const backoff = new OperatorBackoffPolicy({ initialMs: 500, maxMs: 2_000 });
 		expect([backoff.next(), backoff.next(), backoff.next(), backoff.next()]).toEqual([500, 1_000, 2_000, 2_000]);
@@ -93,5 +107,48 @@ describe("notification operator runtime core", () => {
 		expect(await router.dispatch({ prefix: "session" }, { type: "activity", state: "busy" })).toBe(true);
 		expect(await router.dispatch({ prefix: "session" }, { type: "unknown" })).toBe(false);
 		expect(seen).toEqual(["session:busy"]);
+	});
+	test("joins tracked exclusive work without consulting an injectable clock", async () => {
+		let release: (() => void) | undefined;
+		const runtime = new NotificationOperatorRuntime({ now: () => 0 });
+		const work = runtime.runExclusive(
+			"heartbeat",
+			() =>
+				new Promise<void>(resolve => {
+					release = resolve;
+				}),
+		);
+		const joined = runtime.joinExclusive("heartbeat", 1_000);
+		release?.();
+		expect(await joined).toBe(true);
+		await work;
+	});
+
+	test("times out joining exclusive work using a real timer even with a frozen clock", async () => {
+		let release: (() => void) | undefined;
+		const runtime = new NotificationOperatorRuntime({ now: () => 0 });
+		const work = runtime.runExclusive(
+			"heartbeat",
+			() =>
+				new Promise<void>(resolve => {
+					release = resolve;
+				}),
+		);
+		expect(await runtime.joinExclusive("heartbeat", 1)).toBe(false);
+		release?.();
+		await work;
+	});
+
+	test("stops zero-valued interval handles", () => {
+		const cleared: unknown[] = [];
+		const runtime = new NotificationOperatorRuntime({
+			setIntervalImpl: (() => 0) as unknown as typeof setInterval,
+			clearIntervalImpl: timer => {
+				cleared.push(timer);
+			},
+		});
+		runtime.startInterval("heartbeat", 1_000, () => {});
+		runtime.stopInterval("heartbeat");
+		expect(cleared).toEqual([0]);
 	});
 });

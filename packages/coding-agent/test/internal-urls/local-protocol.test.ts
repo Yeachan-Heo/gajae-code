@@ -395,28 +395,6 @@ describe("LocalProtocolHandler", () => {
 		});
 	});
 
-	it("resolves local:// paths synchronously when the marker is left in cleanup_pending from a prior process", async () => {
-		// A migration that lands its data but fails to retire the old legacy
-		// source (see "migrates verified legacy artifacts/local content into
-		// external scratch exactly once", above) persists the marker as
-		// "cleanup_pending\n" — a state the async reader already treats as a
-		// completed migration. If a *new* process later resolves a local://
-		// URL for the same session before ever awaiting the async gate, it
-		// hits the sync fast path (initializeLocalRootSyncWhenLegacyAbsent)
-		// directly against that on-disk marker, with no in-memory cache entry
-		// to short-circuit the read. That path must agree with the async
-		// reader instead of failing closed with "Unsafe local:// migration
-		// marker" on a state that is, in fact, safe.
-		const sessionId = `cleanup-pending-sync-${crypto.randomUUID()}`;
-		await withLocalRoot(sessionId, async root => {
-			await fs.writeFile(path.join(root, ".gjc-local-legacy-migrated-v1"), "cleanup_pending\n", {
-				mode: 0o600,
-			});
-			const options = { getSessionId: () => sessionId, getArtifactsDir: () => null };
-			expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
-		});
-	});
-
 	it("resolves a stable external path before initialization", async () => {
 		const options = {
 			getSessionId: () => "session/fallback",
@@ -427,6 +405,44 @@ describe("LocalProtocolHandler", () => {
 		expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
 		await initializeLocalRoot(options);
 		expect(resolveLocalUrlToPath("local://memo.txt", options)).toBe(path.join(root, "memo.txt"));
+	});
+
+	it("resolves against a cleanup_pending root the async gate already settled", async () => {
+		// The async gate treats `cleanup_pending` as settled: entries are installed and
+		// content-verified, only legacy-source retirement is outstanding. The sync
+		// resolver used to reject that same marker as unsafe, so a session whose
+		// migration ended in `cleanup_pending` failed closed on every local:// read.
+		await withTempDir(async artifactsDir => {
+			const sessionId = `cleanup-pending-sync-${path.basename(artifactsDir)}`;
+			await withLocalRoot(sessionId, async localRoot => {
+				await Bun.write(path.join(localRoot, "carried.json"), '{"carried":true}');
+				await fs.writeFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "cleanup_pending\n", {
+					mode: 0o600,
+				});
+
+				const options = localOptions(sessionId, artifactsDir);
+				expect(resolveLocalUrlToPath("local://carried.json", options)).toBe(path.join(localRoot, "carried.json"));
+				// Idempotent: a second resolution must not rewrite or reject the marker.
+				expect(resolveLocalUrlToPath("local://", options)).toBe(localRoot);
+				expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe(
+					"cleanup_pending\n",
+				);
+			});
+		});
+	});
+
+	it("still rejects an unrecognized migration marker value", async () => {
+		await withTempDir(async artifactsDir => {
+			const sessionId = `unsafe-marker-sync-${path.basename(artifactsDir)}`;
+			await withLocalRoot(sessionId, async localRoot => {
+				await fs.writeFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "definitely-not-a-state\n", {
+					mode: 0o600,
+				});
+				expect(() => resolveLocalUrlToPath("local://memo.txt", localOptions(sessionId, artifactsDir))).toThrow(
+					"Unsafe local:// migration marker",
+				);
+			});
+		});
 	});
 
 	it("blocks symlink escapes outside local root", async () => {

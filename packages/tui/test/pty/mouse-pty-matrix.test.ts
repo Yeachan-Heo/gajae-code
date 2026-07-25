@@ -85,7 +85,7 @@ describe.skipIf(!enabled || process.platform === "win32")("mouse PTY matrix", ()
 		const { terminal, output } = launchFixture({ PTY_FIXTURE_MOUSE: "1" });
 		try {
 			await waitForOutput(output, "PTY_FIXTURE_READY");
-			expect(output()).toContain("\x1b[?1000h");
+			expect(output()).toContain("\x1b[?1002h");
 			expect(output()).toContain("\x1b[?1006h");
 		} finally {
 			terminal.kill();
@@ -99,6 +99,7 @@ describe.skipIf(!enabled || process.platform === "win32")("mouse PTY matrix", ()
 			terminal.write("__exit__\r");
 			await waitForOutput(output, "PTY_FIXTURE_STOPPED");
 			expect(output()).toContain("\x1b[?1000l");
+			expect(output()).toContain("\x1b[?1002l");
 			expect(output()).toContain("\x1b[?1006l");
 		} finally {
 			terminal.kill();
@@ -112,18 +113,19 @@ describe.skipIf(!enabled || process.platform === "win32")("mouse PTY matrix", ()
 			terminal.kill("SIGTERM");
 			await waitForOutput(output, "PTY_FIXTURE_STOPPED");
 			expect(output()).toContain("\x1b[?1000l");
+			expect(output()).toContain("\x1b[?1002l");
 			expect(output()).toContain("\x1b[?1006l");
 		} finally {
 			terminal.kill();
 		}
 	});
 
-	test("emits no SGR mouse enable bytes under a multiplexer", async () => {
+	test("emits SGR mouse enable bytes under a multiplexer", async () => {
 		const { terminal, output } = launchFixture({ PTY_FIXTURE_MOUSE: "1", TMUX: "1" });
 		try {
 			await waitForOutput(output, "PTY_FIXTURE_READY");
-			expect(output()).not.toContain("\x1b[?1000h");
-			expect(output()).not.toContain("\x1b[?1006h");
+			expect(output()).toContain("\x1b[?1002h");
+			expect(output()).toContain("\x1b[?1006h");
 		} finally {
 			terminal.kill();
 		}

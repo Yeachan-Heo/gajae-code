@@ -17,6 +17,7 @@ import { type DeepInterviewRepairResult, runDeepInterviewRepairCommand } from ".
 import { canonicalDeepInterviewJson, validateDeepInterviewV1Envelope } from "./deep-interview-state";
 import { modeStatePath } from "./session-layout";
 import {
+	isNativeDeepInterviewV1,
 	readExistingStateForMutation,
 	transformGuardedWorkflowEnvelopeAtomic,
 	verifyWorkflowEnvelopeReceiptValue,
@@ -295,7 +296,7 @@ async function revision(cwd: string, session: string): Promise<{ revision: numbe
 	if (receipt === "receipt-missing") throw new Error("DI_RECEIPT_MISSING");
 	if (receipt === "checksum-mismatch") throw new Error("DI_RECEIPT_CHECKSUM_MISMATCH");
 	try {
-		if (receipt === "native-valid") validateDeepInterviewV1Envelope(observed.value);
+		if (isNativeDeepInterviewV1(observed.value)) validateDeepInterviewV1Envelope(observed.value);
 	} catch {
 		throw new Error("DI_STATE_SCHEMA_INVALID");
 	}

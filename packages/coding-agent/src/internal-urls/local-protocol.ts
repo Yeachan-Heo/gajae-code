@@ -147,6 +147,17 @@ const MAX_LEGACY_LOCAL_BYTES = 64 * 1024 * 1024;
 
 type LegacyMigrationState = "complete" | "cleanup_pending";
 
+/**
+ * Marker values that mean legacy migration has settled for this root and the
+ * synchronous resolver may proceed. `cleanup_pending` counts: the entries are
+ * installed and content-verified, and only retirement of the legacy source is
+ * outstanding. Must stay in sync with {@link readMigrationMarker}, which the
+ * async gate uses to decide the same question.
+ */
+function isSettledMigrationMarkerValue(value: string): boolean {
+	return value === "verified\n" || value === "absent\n" || value === "cleanup_pending\n";
+}
+
 interface LegacyEntrySnapshot {
 	readonly relativePath: string;
 	readonly dev: bigint;
@@ -540,15 +551,12 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Unsafe local:// root");
 	const marker = path.join(localRoot, LEGACY_MIGRATION_MARKER);
 	try {
-		const value = fsSync.readFileSync(marker, "utf8");
-		// "cleanup_pending" means the migrated data already landed in localRoot and is
-		// safe to resolve paths against; only retiring the old legacy source directory
-		// (a separate, non-blocking step retried elsewhere) is still outstanding. The
-		// async reader (readMigrationMarker, above) already treats it as a completed
-		// migration for this same reason — this sync gate must agree, or a legacy
-		// migration that reached this exact, safe state on a prior run permanently
-		// fails path resolution on every later run.
-		if (value !== "verified\n" && value !== "absent\n" && value !== "cleanup_pending\n")
+		// Accept exactly the marker states the async gate treats as settled. A
+		// `cleanup_pending` marker means the entries are fully installed and verified
+		// and only retirement of the legacy source is outstanding, so resolution is
+		// safe; rejecting it here made the sync resolver fail closed on a root the
+		// async gate had already completed.
+		if (!isSettledMigrationMarkerValue(fsSync.readFileSync(marker, "utf8")))
 			throw new Error("Unsafe local:// migration marker");
 		initializedLocalRoots.add(localRoot);
 		return;
@@ -566,7 +574,10 @@ function initializeLocalRootSyncWhenLegacyAbsent(options: LocalProtocolOptions, 
 		fsSync.writeFileSync(marker, "absent\n", { mode: 0o600, flag: "wx" });
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		if (fsSync.readFileSync(marker, "utf8") !== "absent\n") throw new Error("Unsafe local:// migration marker");
+		// A concurrent initializer won the exclusive create. Any settled marker state
+		// it wrote is authoritative; only an unrecognized value is unsafe.
+		if (!isSettledMigrationMarkerValue(fsSync.readFileSync(marker, "utf8")))
+			throw new Error("Unsafe local:// migration marker");
 	}
 	initializedLocalRoots.add(localRoot);
 }

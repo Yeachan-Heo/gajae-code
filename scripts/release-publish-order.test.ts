@@ -438,10 +438,11 @@ describe("native release binary coverage", () => {
 		const binaries = workflowJob(workflow, "binaries");
 		const publish = workflowJob(workflow, "publish");
 
-		// Tag-only jobs are self-contained: no dependency on a separate main CI run.
-		for (const job of [native, binaries, publish]) {
-			expect(job).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') }}");
+		// Native and binary builds also run in the tag rehearsal; publish remains tag-only.
+		for (const job of [native, binaries]) {
+			expect(job).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') }}");
 		}
+		expect(publish).toContain("if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}");
 		expect(workflow).not.toContain("release_source_verify");
 		expect(workflow).not.toContain("verify exact source SHA passed a successful main CI run");
 

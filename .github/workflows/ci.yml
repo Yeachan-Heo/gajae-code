@@ -6,13 +6,23 @@ on:
       tags: ["v*"]
    pull_request:
       branches: [main]
+   workflow_dispatch:
+      inputs:
+         rehearsal:
+            description: "Rehearsal mode: run the exact tag build/verify graph (native -> binaries) with publish excluded, or the non-tag main graph."
+            required: true
+            type: choice
+            options: [tag-build-verify, main-nontag]
 
+# Least privilege by default: only `publish` needs write, and it declares its
+# own job-level `contents: write` override. This keeps rehearsal dispatches
+# (and every build/verify job) on a read-scoped GITHUB_TOKEN.
 permissions:
-   contents: write
+   contents: read
 
 concurrency:
    # Release tags never cancel; ordinary CI is cancellable per ref.
-   group: ci-${{ github.ref }}
+   group: ci-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.rehearsal || 'event' }}
    cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
@@ -21,7 +31,7 @@ jobs:
    # These never run on tags — a tag is cut from an already-green main.
    # ---------------------------------------------------------------------------
    check:
-      if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') }}
       runs-on: ubuntu-22.04
       timeout-minutes: 20
       steps:
@@ -49,7 +59,7 @@ jobs:
    # keeps the stable branch-protection status name.
    # ---------------------------------------------------------------------------
    main_plan:
-      if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') }}
       runs-on: ubuntu-22.04
       timeout-minutes: 10
       env:
@@ -71,7 +81,7 @@ jobs:
            run: bun scripts/ci-dev-affected.ts --matrix-json
 
    main_native:
-      if: ${{ !startsWith(github.ref, 'refs/tags/v') && needs.main_plan.outputs.has_native == 'true' }}
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') && needs.main_plan.outputs.has_native == 'true' }}
       needs: [main_plan]
       runs-on: ubuntu-22.04
       timeout-minutes: 30
@@ -113,7 +123,7 @@ jobs:
    main_python_matrix:
       name: Python SDK / ${{ matrix.python-version }}
       needs: [main_plan, main_native]
-      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && needs.main_plan.outputs.has_python == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') && needs.main_plan.outputs.has_python == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
       runs-on: ubuntu-22.04
       timeout-minutes: 30
       strategy:
@@ -143,7 +153,7 @@ jobs:
 
    main_shards:
       name: test-shard / ${{ matrix.key }}
-      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && needs.main_plan.outputs.has_tasks == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') && needs.main_plan.outputs.has_tasks == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
       needs: [main_plan, main_native]
       runs-on: ubuntu-22.04
       timeout-minutes: ${{ matrix.rust && 90 || 60 }}
@@ -197,7 +207,7 @@ jobs:
 
    # Branch protection must keep requiring this stable aggregate status.
    test:
-      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') }}
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag') }}
       needs: [main_plan, main_native, main_python_matrix, main_shards]
       runs-on: ubuntu-22.04
       timeout-minutes: 5
@@ -215,12 +225,12 @@ jobs:
               test "$shards" = success
 
    # ---------------------------------------------------------------------------
-   # Tag (vX.Y.Z) only: build native addons for every published platform,
-   # build the standalone binaries, then publish to npm and cut the GitHub
-   # Release. Self-contained — no dependency on a separate main CI run.
+   # Tag (vX.Y.Z) graph: build native addons for every published platform, then
+   # build the standalone binaries. The tag-only publish job then publishes to npm
+   # and cuts the GitHub Release; rehearsals stop after binary verification.
    # ---------------------------------------------------------------------------
    native:
-      if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') }}
       timeout-minutes: 90
       runs-on: ${{ matrix.os }}
       strategy:
@@ -246,7 +256,7 @@ jobs:
               save_cache: "true"
 
    binaries:
-      if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') }}
       needs: [native]
       timeout-minutes: 60
       runs-on: ${{ matrix.os }}
@@ -306,7 +316,7 @@ jobs:
               path: ${{ matrix.binary_path }}
 
    publish:
-      if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}
       needs: [native, binaries]
       timeout-minutes: 45
       runs-on: ubuntu-22.04
