@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -73,6 +73,24 @@ describe("AuthStorage api-key usage-limit fallback", () => {
 		authStorage.setRuntimeCredentialSelector("zai", { kind: "id", value: String(selected.id) });
 
 		expect(await authStorage.peekApiKey("zai")).toBeUndefined();
+	});
+	it("fingerprints OAuth credential expiry", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		const now = new Date("2026-07-25T00:00:00.000Z");
+		const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now.getTime());
+		try {
+			await authStorage.set("zai", [
+				{ type: "oauth", access: "oauth-access", refresh: "oauth-refresh", expires: now.getTime() + 1_000 },
+			]);
+			const beforeExpiry = authStorage.getProviderEvidenceGeneration("zai");
+
+			nowSpy.mockReturnValue(now.getTime() + 1_001);
+
+			expect(authStorage.getProviderEvidenceGeneration("zai")).not.toBe(beforeExpiry);
+		} finally {
+			nowSpy.mockRestore();
+		}
 	});
 	it("fingerprints dynamically resolved stored API keys", async () => {
 		if (!authStorage) throw new Error("test setup failed");

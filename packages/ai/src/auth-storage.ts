@@ -937,7 +937,11 @@ export class AuthStorage {
 					}`,
 			)
 			.join("\u0001");
-		return `${this.getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}`;
+		const storedOAuthFingerprint = credentials
+			.filter((credential): credential is Extract<AuthCredential, { type: "oauth" }> => credential.type === "oauth")
+			.map(credential => `${credential.expires}\u0000${credential.expires > Date.now() ? "usable" : "expired"}`)
+			.join("\u0001");
+		return `${this.getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}`;
 	}
 	onGenerationChanged(listener: (generation: number) => void): () => void {
 		this.#generationListeners.add(listener);
